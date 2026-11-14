@@ -2272,7 +2272,6 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         ttbr0,
         page,
         control,
-        terminal_checkpoint,
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
@@ -2363,6 +2362,8 @@ pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockC
     ttbr0: u64,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
+    syndrome: (u64, u64),
+    ingress_empty: bool,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
     deliver: impl FnOnce(
         &mut super::native_process_runtime::NativeProcessEntry<
@@ -2374,32 +2375,33 @@ pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockC
         >,
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
 ) -> Result<Action, super::native_process_runtime::NativeProcessError> {
-    let Some(admission) = arm_signal_return_gate(source, task, page, control, 0, 0, true) else {
+    let (esr, x0) = syndrome;
+    let Some(admission) =
+        arm_signal_return_gate(source, task, page, control, esr, x0, ingress_empty)
+    else {
         return Ok(Action::Served);
     };
-    let (action, checkpoint) = arm_signal_user_return_admitted_entry(
-        source, task, native, ttbr0, page, control, admission, service, deliver,
+    let (action, terminal_owed) = arm_signal_user_return_admitted_entry(
+        source, task, native, ttbr0, page, control, service, deliver,
     )?;
-    if control.host_exit_requested()
-        || control
-            .host_birth_identity()
-            .is_some_and(|birth| page.host_birth_requested(birth))
-    {
-        assert!(checkpoint, "terminal request must survive the return gate");
-    }
+    assert!(
+        admission || !terminal_owed,
+        "terminal request must survive the return gate"
+    );
     Ok(action)
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[allow(clippy::too_many_arguments)]
-fn arm_signal_user_return_admitted_entry<X: super::aarch64_process::ForkStockCrossing>(
+pub(super) fn arm_signal_user_return_admitted_entry<
+    X: super::aarch64_process::ForkStockCrossing,
+>(
     source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
     task: &'static CurrentTask,
     native: &carrick_sched_core::ThreadCtx,
     ttbr0: u64,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
-    admission: bool,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
     deliver: impl FnOnce(
         &mut super::native_process_runtime::NativeProcessEntry<
@@ -2411,8 +2413,20 @@ fn arm_signal_user_return_admitted_entry<X: super::aarch64_process::ForkStockCro
         >,
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
 ) -> Result<(Action, bool), super::native_process_runtime::NativeProcessError> {
-    let delivered = super::aarch64_process::with_process_entry(
-        source, task, native, ttbr0, page, control, service, deliver,
+    // The owner reports whether this return owed the closing group's
+    // terminal checkpoint, read before delivery can consume that request.
+    let (delivered, terminal_owed) = super::aarch64_process::with_process_entry(
+        source,
+        task,
+        native,
+        ttbr0,
+        page,
+        control,
+        service,
+        |process| {
+            let owed = control.host_exit_requested();
+            (deliver(process), owed)
+        },
     )?;
     Ok((
         match delivered {
@@ -2422,7 +2436,7 @@ fn arm_signal_user_return_admitted_entry<X: super::aarch64_process::ForkStockCro
             Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
             Some(_) => invalid_completion(NativeInvariant::EntryBinding),
         },
-        admission,
+        terminal_owed,
     ))
 }
 

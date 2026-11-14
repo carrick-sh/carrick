@@ -680,6 +680,8 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
             ttbr0,
             fixture.page,
             fixture.control,
+            (frame.esr, frame.x[0]),
+            true,
             service,
             |process| {
                 crate::arm_signal::deliver_on_user_return_at(
@@ -1143,6 +1145,8 @@ fn signal_stack_real_fault_forces_sigsegv_with_oracle_si_code_128() {
             ttbr0,
             fixture.page,
             fixture.control,
+            (frame.esr, frame.x[0]),
+            true,
             &mut service,
             |process| {
                 crate::arm_signal::deliver_on_user_return_at(
@@ -1601,6 +1605,8 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                             ttbr0,
                             mapper_page,
                             peer_control,
+                            (map_frame.esr, map_frame.x[0]),
+                            true,
                             &mut sibling_service,
                             |process| {
                                 crate::arm_signal::deliver_on_user_return_at(
@@ -1656,6 +1662,8 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                                         ttbr0,
                                         mapper_page,
                                         peer_control,
+                                        (unmap_frame.esr, unmap_frame.x[0]),
+                                        true,
                                         &mut sibling_service,
                                         |process| {
                                             crate::arm_signal::deliver_on_user_return_at(
@@ -1809,6 +1817,8 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                     ttbr0,
                     fixture.page,
                     fixture.control,
+                    (frame.esr, frame.x[0]),
+                    true,
                     &mut service,
                     |process| {
                         crate::arm_signal::deliver_on_user_return_at(

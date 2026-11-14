@@ -87,6 +87,14 @@ fn serial_host_arm_group_close_checkpoints_running_and_parked_siblings() {
     deferred_control_handback(true, true);
 }
 
+/// An unregistered host-born sibling switched in at EL0 has no ring owner to
+/// register with after the gate closes. Its user return stays on the host
+/// route: the host's control kick forwards it and its record is handed back.
+#[test]
+fn serial_host_arm_group_close_running_unregistered_sibling_leaves_through_host() {
+    deferred_control_handback(false, true);
+}
+
 fn deferred_control_handback(registered: bool, checkpoint: bool) {
     use carrick_el1_abi::Lifecycle;
     let (kernel, root) = bootstrap(41);
@@ -291,21 +299,17 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
             member.thread().key().serial.raw(),
             control,
         );
-        assert_eq!(
-            crate::dispatch::arm_signal_return_gate(
-                BornInZoneSource {
-                    zone: fixture.zone,
-                    slot
-                },
-                &fixture.task,
-                page,
-                control,
-                0,
-                0,
-                true,
-            ),
-            Some(true),
-            "closed group must enter the terminal checkpoint"
+        let gate = crate::dispatch::arm_signal_return_gate(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            &fixture.task,
+            page,
+            control,
+            0,
+            0,
+            true,
         );
         let mut sibling_service = Aarch64NativeProcessService::with_crossing(
             &fixture.task,
@@ -315,8 +319,12 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
             NonZeroU64::MIN,
             TestStockCrossing::new(&[]),
         );
-        let mut return_frame = carrick_el1_abi::TrapFrame::default();
-        let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+        let mut return_frame = carrick_el1_abi::TrapFrame {
+            elr: 0x401000,
+            slot: u64::from(slot.raw()),
+            ..Default::default()
+        };
+        let stack = carrick_test_support::GuestUserBuffer::zeroed(4096);
         let action = crate::dispatch::arm_signal_user_return_entry(
             BornInZoneSource {
                 zone: fixture.zone,
@@ -327,23 +335,31 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
             fixture_ttbr0(fixture),
             page,
             control,
+            (0, 0),
+            true,
             &mut sibling_service,
             |process| {
-                crate::signal_delivery::deliver_signal_on_syscall_return(
+                crate::arm_signal::deliver_on_user_return_at(
                     &fixture.task,
                     control,
                     process,
                     &mut return_frame,
-                    zerocopy::IntoBytes::as_bytes(&fp),
-                    &mut ArmWaitSignalMachine {
-                        user_sp: UserVa::new(0),
-                        backend: ArmWaitSignalBackend,
-                    },
+                    |_, _| stack.va_at(stack.len()),
                 )
             },
         )
-        .unwrap();
-        assert_eq!(action, carrick_el1_abi::Action::Idle);
+        .unwrap_or_else(|error| panic!("closing member user return refused: {error:?}"));
+        assert_eq!(
+            gate,
+            registered.then_some(true),
+            "only a registered switched-in member enters the ring terminal checkpoint"
+        );
+        if registered {
+            assert_eq!(action, carrick_el1_abi::Action::Idle);
+        } else {
+            assert_eq!(action, carrick_el1_abi::Action::Served);
+            assert_eq!(fixture.zone.slot(slot).current(), Some(record.id));
+        }
         run_as_leader(fixture);
     }
 
@@ -364,7 +380,48 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
             scheduler.wake_control(member.thread().key()).unwrap();
         }
     });
-    if !registered {
+    if !registered && checkpoint {
+        // The control wake found its target held by EL1 and kicked the slot.
+        // The kick IRQ at EL0 forwards (the closed gate's Host venue), and
+        // the vCPU loop hands the switched-in record back to its host owner.
+        let member = members[0];
+        run_as(
+            fixture,
+            member.thread().key().tid.raw(),
+            1,
+            member.thread().key().serial.raw(),
+            member.thread().control_slot(),
+        );
+        let mut cpu = crate::sched::FakeCpu::default();
+        cpu.pending.push_back(carrick_el1_abi::GIC_KICK_INTID);
+        let counters = carrick_el1_abi::Counters::new();
+        let mut irq = carrick_el1_abi::TrapFrame {
+            elr: 0x401000,
+            slot: u64::from(slot.raw()),
+            ..Default::default()
+        };
+        assert_eq!(
+            (crate::sched::Sched {
+                handoff: None,
+                zone: fixture.zone,
+                slot,
+                task: &fixture.task,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+                counters: &counters,
+            })
+            .interrupt(&mut irq, 0),
+            carrick_el1_abi::Action::Forward
+        );
+        assert_eq!(
+            fixture.zone.handback_current(slot, record.id),
+            CurrentHandback::HandedBack
+        );
+        carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+            scheduler.publish_zone_handback(record);
+        });
+        run_as_leader(fixture);
+    } else if !registered {
         let member = members[0];
         run_as(
             fixture,
@@ -524,6 +581,313 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
     assert_eq!(
         service.crossing.root_exit_status.load(Ordering::Acquire),
         status
+    );
+    scheduler.close();
+}
+
+/// A registered host-cloned sibling computing on its own executor has no
+/// switched zone record: its home record is free and host-loaded. Returning
+/// to user after the leader's `exit_group(5)`, it must not claim that free
+/// record for the ring. It returns, the host's control kick forwards it at
+/// the next IRQ, and the host retires the exact thread.
+#[test]
+fn serial_host_arm_group_close_entryless_host_loaded_member_leaves_through_host() {
+    entryless_host_loaded_member_leaves_through_host(EntrylessReturn::AfterClose);
+}
+
+/// The member enters `FUTEX_WAIT_PRIVATE` after the close's one-shot member
+/// interrupt scan. Its park record is fresh: the native registry has never
+/// seen it, and no close interrupt will target it. The bucket-held probe
+/// must still see the member's published terminal request and refuse the
+/// park with `-EINTR`, so the close wake is never parked away.
+#[test]
+fn serial_host_arm_futex_wait_after_group_close_scan_returns_eintr() {
+    entryless_host_loaded_member_leaves_through_host(EntrylessReturn::FutexAfterScan);
+}
+
+/// The vector's return gate admits the member while its group is still
+/// open (a signal is pending), and the group closes before admission runs
+/// delivery. Delivery then reaches the terminal owner, which reports host
+/// custody. With no switched record that custody is the executor's own: the
+/// member returns to user rather than yielding its free home record.
+#[test]
+fn serial_host_arm_close_between_gate_and_delivery_keeps_host_custody() {
+    entryless_host_loaded_member_leaves_through_host(EntrylessReturn::GateBeforeClose);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum EntrylessReturn {
+    AfterClose,
+    FutexAfterScan,
+    GateBeforeClose,
+}
+
+fn entryless_host_loaded_member_leaves_through_host(mode: EntrylessReturn) {
+    use crate::sched::LinuxSchedEntry as _;
+    let (kernel, root) = bootstrap(41);
+    let root = Box::leak(Box::new(root));
+    root.thread().set_affinity(carrick_hal::CpuAffinity::all(2));
+    let page = Box::leak(Box::new(root.lifecycle_page()));
+    let page = &**page;
+    let fixture = Box::leak(Box::new(Fixture::with_identity(
+        0x10000,
+        asid(1),
+        page,
+        root.thread().control_slot(),
+        ThreadIdentity {
+            tid: root.thread().key().tid.raw() as u64,
+            serial: root.thread().key().serial.raw(),
+            mm: root.shared().mm().id().raw(),
+            file_table: root.resources().files().id().raw(),
+            generation: root.task().key().serial.raw(),
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 3,
+            lifecycle_page: page as *const _ as u64,
+            control_slot: root.thread().control_slot() as *const _ as u64,
+        },
+    )));
+    let mut root_service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut root_service,
+            |_| (),
+        )
+        .unwrap();
+    let member = clone_thread(root, 42);
+    let control = member.thread().control_slot();
+    assert!(control.publish_visible_tid(member.thread().key().tid.raw() as u32));
+    assert_eq!(control.entry(), None, "host clone control");
+    let slot = SlotId::new(1);
+    fixture.zone.drive(slot, 2);
+    fixture
+        .zone
+        .publish_slot(slot, fixture.leader.mm, Some(1), 3);
+    fixture.zone.enter_guest(slot);
+    fixture.zone.install_space(slot, fixture.leader.mm).unwrap();
+    let as_member = || {
+        run_as(
+            fixture,
+            member.thread().key().tid.raw(),
+            root.task().key().serial.raw(),
+            member.thread().key().serial.raw(),
+            control,
+        )
+    };
+    as_member();
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    // Its first native entry admits it as a signal owner; it keeps running
+    // host-loaded with no zone record switched in on its slot.
+    fixture
+        .enter(control, fixture_ttbr0(fixture), &mut service, |_| ())
+        .unwrap();
+    assert!(control.native_signal_owner());
+    assert_eq!(fixture.zone.slot(slot).current(), None);
+    let scheduler = Arc::new(Scheduler::new(kernel.clone()));
+    let executor = scheduler
+        .register_executor(Arc::new(Kick::default()))
+        .unwrap();
+    publish(member, 0x700);
+    scheduler.make_runnable(member.thread().key()).unwrap();
+    let running = scheduler.try_take(&executor).unwrap().unwrap();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot,
+    };
+    if mode == EntrylessReturn::GateBeforeClose {
+        // Open group, pending signal ingress: the vector admits the return.
+        assert_eq!(
+            crate::dispatch::arm_signal_return_gate(
+                source,
+                &fixture.task,
+                page,
+                control,
+                0,
+                0,
+                false,
+            ),
+            Some(false)
+        );
+    }
+
+    run_as_leader(fixture);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 5;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut root_service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert!(control.host_exit_requested());
+    assert_eq!(fixture.zone.slot(slot).current(), None);
+
+    as_member();
+    let (mut esr, mut x0) = (0, 0);
+    if mode == EntrylessReturn::FutexAfterScan {
+        let word = carrick_test_support::GuestUserBuffer::from_value(0u32);
+        let mut wait = carrick_el1_abi::TrapFrame {
+            esr: 0x5600_0000,
+            elr: 0x401004,
+            slot: u64::from(slot.raw()),
+            ..Default::default()
+        };
+        wait.x[8] = crate::sched::SYS_FUTEX as u64;
+        wait.x[0] = word.arg();
+        wait.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
+        let parks = fixture.zone.counters.el1_parks.load(Ordering::Relaxed);
+        let counters = carrick_el1_abi::Counters::new();
+        let mut cpu = crate::sched::FakeCpu::default();
+        let served = (crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .serve_futex(&mut wait);
+        assert_eq!(
+            served,
+            Some(crate::sched::Served::Returned { switched: false }),
+            "a published group close must refuse the futex park"
+        );
+        assert_eq!(
+            wait.x[0],
+            carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+        );
+        assert_eq!(
+            fixture.zone.counters.el1_parks.load(Ordering::Relaxed),
+            parks
+        );
+        assert_eq!(fixture.zone.slot(slot).current(), None);
+        (esr, x0) = (wait.esr, wait.x[0]);
+    }
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(4096);
+    let mut return_frame = carrick_el1_abi::TrapFrame {
+        esr,
+        elr: 0x401004,
+        slot: u64::from(slot.raw()),
+        ..Default::default()
+    };
+    return_frame.x[0] = x0;
+    let action = if mode == EntrylessReturn::GateBeforeClose {
+        // The vector's admitted half, after its gate already said yes.
+        let (action, terminal_owed) = crate::dispatch::arm_signal_user_return_admitted_entry(
+            source,
+            &fixture.task,
+            &ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            page,
+            control,
+            &mut service,
+            |process| {
+                crate::arm_signal::deliver_on_user_return_at(
+                    &fixture.task,
+                    control,
+                    process,
+                    &mut return_frame,
+                    |_, _| stack.va_at(stack.len()),
+                )
+            },
+        )
+        .unwrap_or_else(|error| panic!("closing member user return refused: {error:?}"));
+        assert!(terminal_owed);
+        action
+    } else {
+        let gate = crate::dispatch::arm_signal_return_gate(
+            source,
+            &fixture.task,
+            page,
+            control,
+            esr,
+            x0,
+            true,
+        );
+        let action = crate::dispatch::arm_signal_user_return_entry(
+            source,
+            &fixture.task,
+            &ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            page,
+            control,
+            (esr, x0),
+            true,
+            &mut service,
+            |process| {
+                crate::arm_signal::deliver_on_user_return_at(
+                    &fixture.task,
+                    control,
+                    process,
+                    &mut return_frame,
+                    |_, _| stack.va_at(stack.len()),
+                )
+            },
+        )
+        .unwrap_or_else(|error| panic!("closing member user return refused: {error:?}"));
+        assert_eq!(gate, None, "no switched record for the ring to yield");
+        action
+    };
+    assert_eq!(action, carrick_el1_abi::Action::Served);
+    assert_eq!(fixture.zone.slot(slot).current(), None);
+
+    // The host wake batch kicks the executor running this exact thread. Its
+    // control quantum survives until that executor next settles it.
+    carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+        scheduler.wake_control(member.thread().key()).unwrap();
+    });
+    let mut cpu = crate::sched::FakeCpu::default();
+    cpu.pending.push_back(carrick_el1_abi::GIC_KICK_INTID);
+    let counters = carrick_el1_abi::Counters::new();
+    let mut irq = carrick_el1_abi::TrapFrame {
+        elr: 0x401000,
+        slot: u64::from(slot.raw()),
+        ..Default::default()
+    };
+    assert_eq!(
+        (crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .interrupt(&mut irq, 0),
+        carrick_el1_abi::Action::Forward,
+        "the kick leaves through the host with the member loaded"
+    );
+    // The executor retires the exact thread on the host and publishes its
+    // receipt, as the runtime's exit path does.
+    fixture.zone.leave_guest(slot, &ShortLockSpin);
+    kernel.exit_thread(member, None).unwrap();
+    let birth =
+        carrick_kernel::kernel::host_birth_identity(member.task().key(), member.thread().key())
+            .unwrap();
+    page.publish_exact_host_retirement(control, birth.retirement());
+    scheduler.settle_exited(running).unwrap();
+    assert!(!member.exact_thread_is_live());
+    assert_eq!(carrick_el1_abi::Lifecycle::live(page), 0);
+    assert!(matches!(
+        wake_closing_root(fixture, &mut root_service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(root_service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(
+        root_service
+            .crossing
+            .root_exit_status
+            .load(Ordering::Acquire),
+        5
     );
     scheduler.close();
 }

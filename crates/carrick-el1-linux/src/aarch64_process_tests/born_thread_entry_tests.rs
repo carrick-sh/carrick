@@ -7,12 +7,12 @@ use super::*;
 
 /// Production ARM CPU for the switch-in: registered vs unregistered resume is
 /// chosen by `resume_production_with`, exactly as `HardwareCpu` chooses it.
-struct ProductionResumeCpu<'a> {
+struct ProductionResumeCpu<'a, X: ForkStockCrossing = TestStockCrossing> {
     inner: crate::sched::FakeCpu,
-    service: &'a mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    service: &'a mut Aarch64NativeProcessService<'static, X>,
 }
 
-impl crate::sched::ThreadCpu for ProductionResumeCpu<'_> {
+impl<X: ForkStockCrossing> crate::sched::ThreadCpu for ProductionResumeCpu<'_, X> {
     fn save(
         &mut self,
         frame: &carrick_el1_abi::TrapFrame,
@@ -443,6 +443,8 @@ fn signal_checkpoint(
         ttbr0,
         fixture.page,
         fixture.control,
+        (frame.esr, frame.x[0]),
+        true,
         &mut service,
         |process| {
             super::super::arm_signal::deliver_on_user_return_at(
@@ -1942,9 +1944,21 @@ impl MultiSlotEnv {
             NonZeroU64::MIN,
             TestStockCrossing::new(&[]),
         );
+        self.switch_in_with(slot, cpu, &mut service)
+    }
+
+    /// [`Self::switch_in`] through a caller's service, whose crossing
+    /// observes the selected record's host crossings.
+    fn switch_in_with<X: ForkStockCrossing>(
+        self,
+        slot: SlotId,
+        cpu: &mut crate::sched::FakeCpu,
+        service: &mut Aarch64NativeProcessService<'static, X>,
+    ) -> carrick_el1_abi::Action {
+        let task = &self.tasks[slot.index()];
         let mut switch = ProductionResumeCpu {
             inner: core::mem::take(cpu),
-            service: &mut service,
+            service,
         };
         let counters = carrick_el1_abi::Counters::new();
         let mut handoff = None;
@@ -2328,6 +2342,11 @@ fn setup_native_owned_ring_birth_before_first_entry() -> NativeOwnedTwoThreadHar
     }
 }
 
+/// A native fork child's leader calls `exit_group(5)` while two ring-born
+/// siblings run at EL0 on other vCPUs. Each sibling's interrupted user return
+/// reaches the terminal owner through the vector's gate and delivery and
+/// retires in ring. The last retirement wakes the leader, whose resume
+/// completes the group's exit, and the parent's `wait4` reaps status 5.
 #[test]
 fn arm_ring_born_sibling_returns_through_closed_group_checkpoint() {
     let mut h = setup_native_owned_ring_birth_before_first_entry();
@@ -2368,21 +2387,140 @@ fn arm_ring_born_sibling_returns_through_closed_group_checkpoint() {
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
     assert_eq!(h.env.fixture.zone.slot(slot).current(), Some(h.born_record));
-    let task = &h.env.tasks[slot.index()];
-    assert_eq!(
-        crate::dispatch::arm_signal_return_gate(
-            BornInZoneSource {
-                zone: h.env.fixture.zone,
-                slot,
-            },
+    // Both running members reach the terminal owner at their interrupted
+    // user return through the vector's shared gate and delivery.
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
+    for (member_slot, control, cpu) in [
+        (slot, h.born_control, &mut born_cpu),
+        (SlotId::new(1), h.sibling_control, &mut h.sibling_cpu),
+    ] {
+        let task: &'static CurrentTask = &h.env.tasks[member_slot.index()];
+        let source = BornInZoneSource {
+            zone: h.env.fixture.zone,
+            slot: member_slot,
+        };
+        let record = h.env.fixture.zone.slot(member_slot).current().unwrap();
+        assert!(h.env.fixture.zone.record(record).is_native_owned());
+        assert_eq!(
+            crate::dispatch::arm_signal_return_gate(
+                source,
+                task,
+                h.target_page,
+                control,
+                0,
+                0,
+                true,
+            ),
+            Some(true),
+        );
+        settle_boundary(task);
+        let mut service = h.env.service(member_slot);
+        let mut frame = carrick_el1_abi::TrapFrame {
+            slot: u64::from(member_slot.raw()),
+            elr: 0x40_1000,
+            ..Default::default()
+        };
+        // SAFETY: `member_slot` exclusively owns its OnCpu record.
+        let native = unsafe { h.env.fixture.zone.record(record).ctx_mut().native };
+        let action = crate::dispatch::arm_signal_user_return_entry(
+            source,
             task,
+            &native,
+            cpu.ttbr.0,
             h.target_page,
-            h.born_control,
-            0,
-            0,
+            control,
+            (0, 0),
             true,
-        ),
-        Some(true),
+            &mut service,
+            |process| {
+                crate::arm_signal::deliver_on_user_return_at(
+                    task,
+                    control,
+                    process,
+                    &mut frame,
+                    |_, _| stack.va_at(stack.len()),
+                )
+            },
+        )
+        .unwrap_or_else(|error| panic!("ring-born terminal return refused: {error:?}"));
+        assert_eq!(action, carrick_el1_abi::Action::Idle);
+        assert_eq!(h.env.fixture.zone.slot(member_slot).current(), None);
+        assert!(
+            h.env
+                .fixture
+                .zone
+                .live(h.env.fixture.zone.record_ref(record))
+                .is_none()
+        );
+        crate::dispatch::native_service_idle(h.env.fixture.zone, member_slot, cpu);
+    }
+    assert_eq!(carrick_el1_abi::Lifecycle::live(h.target_page), 0);
+    // The last member's retirement woke the closing leader on a sibling vCPU;
+    // its resume completes the group's exit and leaves no thread loaded.
+    let woken_on = SlotId::new(1);
+    assert_eq!(h.env.fixture.zone.slot(woken_on).queued(), 1);
+    // That vCPU first settles the retired sibling's host-work boundary.
+    settle_boundary(&h.env.tasks[woken_on.index()]);
+    // The host's child-retire crossing authenticates the exact leader.
+    let leader_record = h.env.fixture.zone.runnable_head(woken_on).unwrap();
+    // SAFETY: the queued leader record retains its saved process context.
+    let leader_address = unsafe { *h.env.fixture.zone.record(leader_record).ctx_mut() }
+        .address_context()
+        .expect("leader address context");
+    *h.env.crossing.zone.lock().unwrap() = Some(h.env.fixture.zone);
+    *h.env.crossing.child.lock().unwrap() = Some((
+        super::super::common_entry::execution_binding(&h.env.tasks[0]),
+        leader_address,
+    ));
+    let mut leader_service = h.env.service(woken_on);
+    assert_eq!(
+        h.env
+            .switch_in_with(woken_on, &mut h.sibling_cpu, &mut leader_service),
+        carrick_el1_abi::Action::Idle
+    );
+    assert_eq!(h.env.fixture.zone.slot(woken_on).current(), None);
+    // The parent's wait4 reaps the group with its exact exit status.
+    let f = h.env.fixture;
+    let root_slot = slot;
+    let root_cpu = host_load(
+        h.env,
+        root_slot,
+        f.leader.tid,
+        f.leader.generation,
+        f.leader.serial,
+        f.control,
+        1,
+    );
+    let status = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+    let mut root_service = h.env.service(root_slot);
+    let reaped = super::super::aarch64_process::with_process_entry(
+        BornInZoneSource {
+            zone: f.zone,
+            slot: root_slot,
+        },
+        &h.env.tasks[root_slot.index()],
+        &ThreadCtx::ZERO,
+        root_cpu.ttbr.0,
+        f.page,
+        f.control,
+        &mut root_service,
+        |process| {
+            process.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::from(h.target_pid)),
+                status.va(),
+                LinuxWaitOptions::WNOHANG,
+                UserVa::new(0),
+            )
+        },
+    )
+    .unwrap();
+    let LifecycleOutcome::Returned { result, .. } = reaped else {
+        panic!("WNOHANG wait4 of an exited group must not park");
+    };
+    assert_eq!(result.raw(), i64::from(h.target_pid));
+    assert_eq!(
+        status.get::<i32>(0),
+        LinuxWaitStatus::from_wait_encoding(5 << 8).raw()
     );
 }
 
@@ -4138,6 +4276,8 @@ fn env_signal_checkpoint(
         cpu.ttbr.0,
         env.fixture.page,
         control,
+        (frame.esr, frame.x[0]),
+        true,
         &mut service,
         |process| {
             super::super::arm_signal::deliver_on_user_return_at(
