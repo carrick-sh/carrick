@@ -104,6 +104,19 @@ verification, the signed evidence and landing.
 The current routing table is the output of `worker quota .route`; treat this
 paragraph as the principle and that command as the source.
 
+## Deploying worker tooling
+
+A conductor or worker-template change is gate tooling, so it gets a
+**known-answer run on a real worker VM** before it's deployed, not only unit
+tests against a fake hypervisor. That run exercises every path the change
+touches end to end: token refresh, `worker salvage` (both director salvage and
+the worker's own auto-salvage) and the push. On 2026-11-13, agy-director#44's
+host side was deployed after green unit tests, and two salvage regressions
+followed: `systemd-run` expanding `${...}` in the scripts, and the root push
+failing authentication. Three VMs' work was stranded until a manual guest-agent
+bundle recovered it. Deploy the host side and the template together when they
+share a protocol, and keep the previous build and template as the rollback.
+
 ## Board status
 
 - **Board status follows every transition** on org project 1 ("Carrick shared
