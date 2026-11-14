@@ -9,7 +9,7 @@ is needed to publish the result.
 The production ARM copy path can return NotYet before the owner refuses
 preparation with EFAULT. The two-live-thread VM-free owner-wait fixture covers
 that refusal through production dispatch. The x86 production fixture covers
-a genuine atomic word-copy fault through the native futex owner. Existing
+an atomic word NotYet followed by an owner EFAULT through the native futex owner. Existing
 owner-wait tests retain suspension and synchronous redispatch coverage.
 
 Reuse main's #2272 bounded sampler and Node fixtures unchanged. This PR does
@@ -39,3 +39,22 @@ installing their result does not add a native host checkpoint. Explicit owed
 work is still honored. The existing mapping-owner and fork-child EINVAL
 witnesses exposed an unintended Served-to-WithWork change during verification;
 they retain their exact Served assertions after the venue distinction.
+
+### Synchronous futex preparation redispatch (#2299 review)
+
+`kernel.futex.contention` also covers preparation that settles before owner
+wait enrollment. A `Redispatch` is not a completed futex return: both ISAs
+must preserve all input registers and rewind their syscall instruction once.
+The shared futex lifecycle lowering owns this decision for ARM mapping refusal
+and x86 native futex outcomes. ARM copy preparation retains its existing rewind;
+it does not go through the new lowering a second time.
+
+The VM-free ARM binding `futex_mapping_synchronous_redispatch_rewinds_syscall`
+uses two live threads and the production native mapping owner, with the observed
+owner released before enrollment. The x86 production-forward binding uses the
+native input owner to supply a missing atomic word synchronously. Before correction,
+ARM retained PC 0x4004 and x86 retained PC 0x4002 rather than 0x4000. Both bindings
+require replay with unchanged arguments; ARM also requires zero operand loads
+and zero scheduler parks. The x86 NotYet-to-EFAULT control requires the recorded
+original word address and numeric result -14 / errno 14. These are VM-free
+production-dispatch witnesses, not signed Node population evidence.
