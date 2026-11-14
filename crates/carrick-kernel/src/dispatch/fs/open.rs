@@ -341,6 +341,7 @@ impl<'a> FsView<'a> {
         let _ = lookup.fast_path();
         let path = match lookup.target {
             LookupTarget::OpenOutcome(outcome) => return Ok(outcome),
+            LookupTarget::OwnerBusy(busy) => return Ok(busy.into_owner_wait()),
             LookupTarget::Resolved(path) => path,
             LookupTarget::Stat(_) => lookup.resolved_path,
         };
@@ -500,6 +501,7 @@ impl<'a> FsView<'a> {
             VfsOpenAttempt::Errno(errno) => {
                 return Ok(DispatchOutcome::errno(errno));
             }
+            VfsOpenAttempt::OwnerBusy(busy) => return Ok(busy.into_owner_wait()),
             VfsOpenAttempt::FallThrough => {}
         }
 
@@ -1593,6 +1595,7 @@ impl<'a> FsView<'a> {
                     m.vfs,
                     &m.full_path,
                     &ctx,
+                    None,
                     path,
                     access,
                     flags,
@@ -1749,15 +1752,21 @@ impl<'a> FsView<'a> {
         // /proc and other synthetic mounts render address-space state. Hold
         // alias exclusion across the complete snapshot so it cannot describe
         // stale VMA metadata while a host replacement is installing.
+        // A busy memory owner renders nothing that reaches the guest: the
+        // open installs no descriptor and reruns (see `open_vfs_handle`).
+        let memory_busy = std::cell::Cell::new(None);
         let mem_provider = || {
             let mem = self.mem_snapshot();
-            let address_space_regions = mem.proc_regions();
+            let memory = mem.proc_memory().unwrap_or_else(|busy| {
+                memory_busy.set(Some(busy));
+                super::mem::anonymous::ProcMemory::default()
+            });
             carrick_vfs::OpenContextMemorySnapshot {
                 auxv: std::borrow::Cow::Owned(mem.linux_auxv_image.clone()),
-                address_space_regions: address_space_regions.map(std::borrow::Cow::Owned),
-                locked_memory: std::borrow::Cow::Owned(mem.locked_view().into_owned()),
-                brk_current: mem.program_break(),
-                mmap_next: mem.arena_high_water(),
+                address_space_regions: memory.regions.map(std::borrow::Cow::Owned),
+                locked_memory: std::borrow::Cow::Owned(memory.locked),
+                brk_current: memory.brk_current,
+                mmap_next: memory.mmap_next,
                 heap_base: mem.layout.heap_base,
             }
         };
@@ -1800,6 +1809,7 @@ impl<'a> FsView<'a> {
             m.vfs,
             &m.full_path,
             &ctx,
+            Some(&memory_busy),
             path,
             access,
             flags,
@@ -1816,6 +1826,7 @@ impl<'a> FsView<'a> {
         vfs: &dyn carrick_vfs::Vfs,
         full_path: &str,
         ctx: &carrick_vfs::OpenContext<'_>,
+        memory_busy: Option<&std::cell::Cell<Option<super::mem::ObservationBusy>>>,
         path: &str,
         access: u64,
         flags: u64,
@@ -1835,7 +1846,17 @@ impl<'a> FsView<'a> {
             nofollow: open_flags.contains(LinuxOpenFlags::NOFOLLOW),
             mode: create_mode,
         };
-        let handle = match vfs.open(full_path, vfs_flags, ctx) {
+        let opened = vfs.open(full_path, vfs_flags, ctx);
+        // The render observed a busy memory owner: whatever it produced is
+        // not an answer. Install nothing; the open reruns on the release.
+        if let Some(busy) = memory_busy.and_then(std::cell::Cell::take) {
+            if let Ok(carrick_vfs::VfsHandle::HostFd { host_fd, .. }) = opened {
+                // SAFETY: the mount just opened this fd for this call alone.
+                unsafe { libc::close(host_fd) };
+            }
+            return VfsOpenAttempt::OwnerBusy(busy);
+        }
+        let handle = match opened {
             Ok(h) => h,
             Err(errno) if errno == LINUX_ENOSYS => {
                 return VfsOpenAttempt::FallThrough;

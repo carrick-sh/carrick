@@ -622,7 +622,10 @@ impl<'a> FsView<'a> {
         if !crate::vfs::may_be_synthetic_virtual_path(path) {
             return None;
         }
-        let proc_ctx = self.synthetic_proc_context(context);
+        let proc_ctx = match self.synthetic_proc_context(context) {
+            Ok(proc_ctx) => proc_ctx,
+            Err(busy) => return Some(busy.into_owner_wait()),
+        };
         if crate::vfs::is_synthetic_virtual_file(path, &proc_ctx) {
             return Some(synthetic_readonly_access_for_path(path, mode));
         }

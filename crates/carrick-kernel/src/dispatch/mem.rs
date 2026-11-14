@@ -66,7 +66,7 @@ pub(crate) mod anonymous;
 mod settled;
 pub(crate) use self::anonymous::RootAliasProposal;
 pub mod el1_reservations;
-pub use el1_reservations::{ReservationBusy, RootAccessRefusal};
+pub use el1_reservations::{ObservationBusy, ReservationBusy, RootAccessRefusal};
 mod native_successor;
 pub use self::native_successor::NativeSuccessorImage;
 mod host_backing;

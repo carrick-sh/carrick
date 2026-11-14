@@ -354,6 +354,26 @@ pub(in crate::dispatch) fn carried_flags(vma: &SemanticVma) -> ReservationNodeFl
     flags
 }
 
+/// A root mapping whose Linux row the root renders itself: anonymous
+/// memory, or a private file mapping it retains.
+fn root_rendered_mapping(mapping: &Mapping) -> bool {
+    mapping.anonymous
+        || (mapping.host_backing.is_some()
+            && mapping
+                .flags
+                .contains(ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE)))
+}
+
+/// What a `/proc` render reads from the MM's memory owner
+/// ([`MemState::proc_memory`]).
+#[derive(Clone, Debug, Default)]
+pub(in crate::dispatch) struct ProcMemory {
+    pub regions: Option<Vec<ProcMapsEntry>>,
+    pub locked: Vec<carrick_vfs::GuestMemoryRange>,
+    pub brk_current: u64,
+    pub mmap_next: u64,
+}
+
 fn guest_range(start: u64, end: u64) -> Option<carrick_vfs::GuestMemoryRange> {
     carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
 }
@@ -606,18 +626,76 @@ impl MemState {
         match &self.anonymous {
             AnonymousAuthority::HostSetup(arena) => arena.mmap_next,
             AnonymousAuthority::Delegated(delegated) => {
-                let base = self.layout.mmap_base;
-                let end = base.saturating_add(self.layout.mmap_size);
+                let (base, end) = self.arena_bounds();
                 // One descent to the highest node, not a walk of the arena.
-                delegated
+                let last = delegated
                     .root
                     .with_root(|model| Ok(model.last_mapping_within(reservation_range(base, end)?)))
                     .unwrap_or_else(|refusal| {
                         broken_root("an arena high-water observation", refusal)
-                    })
-                    .map_or(base, |mapping| mapping.range.end().min(end))
+                    });
+                self.high_water_from(last)
             }
         }
+    }
+
+    fn arena_bounds(&self) -> (u64, u64) {
+        let base = self.layout.mmap_base;
+        (base, base.saturating_add(self.layout.mmap_size))
+    }
+
+    /// The arena high-water mark the root's highest arena node implies.
+    fn high_water_from(&self, last: Option<Mapping>) -> u64 {
+        let (base, end) = self.arena_bounds();
+        last.map_or(base, |mapping| mapping.range.end().min(end))
+    }
+
+    /// Every committed root mapping, in one root acquisition. `context`
+    /// names the observation in the broken-root fatal: a caller of this runs
+    /// under the MM permit and host queue, which exclude every contender.
+    fn all_root_mappings(root: &DelegatedRoot, context: &str) -> Vec<Mapping> {
+        let mut mappings = Vec::new();
+        root.with_root(|model| model.observe_mappings(&mut |mapping| mappings.push(mapping)))
+            .unwrap_or_else(|refusal| broken_root(context, refusal));
+        mappings
+    }
+
+    /// Everything a `/proc` render reads from this MM's memory owner, in one
+    /// root acquisition. A render runs in an ordinary syscall, which does not
+    /// pause this MM's EL1 threads, so one of them can hold the root. That is
+    /// "not now": the holder's [`ObservationBusy`] goes back to the syscall,
+    /// which parks on the holder's release and reruns (#2276: the Go
+    /// telemetry sidecar died on "refused a lock observation: Busy"). Only a
+    /// broken invariant is fatal here.
+    pub(in crate::dispatch) fn proc_memory(&self) -> Result<ProcMemory, ObservationBusy> {
+        let Some(root) = self.delegated_root() else {
+            return Ok(ProcMemory {
+                regions: self.proc_regions_from(None),
+                locked: self.locked_from(None),
+                brk_current: self.program_break(),
+                mmap_next: self.arena_high_water(),
+            });
+        };
+        let (base, end) = self.arena_bounds();
+        let mut mappings = Vec::new();
+        let observed = root.with_root(|model| {
+            model.observe_mappings(&mut |mapping| mappings.push(mapping))?;
+            Ok((
+                model.brk_current(),
+                model.last_mapping_within(reservation_range(base, end)?),
+            ))
+        });
+        let (brk_current, last) = match observed {
+            Ok(observed) => observed,
+            Err(RootAccessRefusal::Busy(busy)) => return Err(ObservationBusy(busy)),
+            Err(refusal) => broken_root("a /proc memory observation", refusal),
+        };
+        Ok(ProcMemory {
+            regions: self.proc_regions_from(Some(&mappings)),
+            locked: self.locked_from(Some(&mappings)),
+            brk_current,
+            mmap_next: self.high_water_from(last),
+        })
     }
 
     /// Return unused byte custody after owner publication. No placement or
@@ -694,12 +772,7 @@ impl MemState {
         let mut mappings = Vec::new();
         root.with_root(|model| {
             model.observe_mappings(&mut |mapping| {
-                if mapping.anonymous
-                    || (mapping.host_backing.is_some()
-                        && mapping.flags.contains(
-                            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
-                        ))
-                {
+                if root_rendered_mapping(&mapping) {
                     mappings.push(mapping);
                 }
             })
@@ -715,8 +788,10 @@ impl MemState {
     /// once delegated the root's anonymous rows merged in exactly once. The
     /// root owns the heap and describes it itself, so the hidden heap backing
     /// row is not rendered beside it; the host rows never describe root-owned
-    /// memory (only carrick's hidden backing rows may enclose it).
-    pub(in crate::dispatch) fn proc_regions(&self) -> Option<Vec<ProcMapsEntry>> {
+    /// memory (only carrick's hidden backing rows may enclose it). `root` is
+    /// the root's observed mappings, `None` before delegation
+    /// ([`Self::proc_memory`] observes them).
+    fn proc_regions_from(&self, root: Option<&[Mapping]>) -> Option<Vec<ProcMapsEntry>> {
         let host = || {
             // The hidden mmap arena, shared aperture and private overlay are
             // carrick's backing reservations, not Linux VMAs: they are `rwx`
@@ -739,11 +814,16 @@ impl MemState {
             }
             regions
         };
-        if self.delegated_root().is_none() {
+        let Some(mappings) = root else {
             return host();
-        }
+        };
         if self.owner_rows_exclusive {
-            return Some(self.owner_observed_rows().iter().map(proc_row).collect());
+            return Some(
+                mappings
+                    .iter()
+                    .map(|mapping| proc_row(&self.owner_observed_row(mapping)))
+                    .collect(),
+            );
         }
         let layout = self.layout;
         let mut host_rows: Vec<ProcMapsEntry> = self
@@ -755,8 +835,11 @@ impl MemState {
             .cloned()
             .collect();
         host_rows.sort_by_key(|row| row.start);
-        let root_rows: Vec<ProcMapsEntry> =
-            self.root_anonymous_rows().iter().map(proc_row).collect();
+        let root_rows: Vec<ProcMapsEntry> = mappings
+            .iter()
+            .filter(|mapping| root_rendered_mapping(mapping))
+            .map(|mapping| proc_row(&self.owner_observed_row(mapping)))
+            .collect();
         if host_rows.is_empty() && root_rows.is_empty() {
             return host();
         }
@@ -931,23 +1014,22 @@ impl MemState {
         let Some(root) = self.delegated_root() else {
             return Cow::Borrowed(&self.locked_ranges);
         };
+        Cow::Owned(self.locked_from(Some(&Self::all_root_mappings(root, "a lock observation"))))
+    }
+
+    /// [`Self::locked_view`] from the root's observed mappings (`None`
+    /// before delegation).
+    fn locked_from(&self, root: Option<&[Mapping]>) -> Vec<carrick_vfs::GuestMemoryRange> {
         let mut ranges = self.locked_ranges.clone();
-        root.with_root(|model| {
-            model.observe_mappings(&mut |mapping| {
-                if (mapping.anonymous
-                    || (mapping.host_backing.is_some()
-                        && mapping.flags.contains(
-                            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
-                        )))
-                    && mapping.flags.contains(ReservationNodeFlags::LOCKED)
-                    && let Some(range) = guest_range(mapping.range.start(), mapping.range.end())
-                {
-                    super::locked_ranges_insert(&mut ranges, range);
-                }
-            })
-        })
-        .unwrap_or_else(|refusal| broken_root("a lock observation", refusal));
-        Cow::Owned(ranges)
+        for mapping in root.into_iter().flatten() {
+            if root_rendered_mapping(mapping)
+                && mapping.flags.contains(ReservationNodeFlags::LOCKED)
+                && let Some(range) = guest_range(mapping.range.start(), mapping.range.end())
+            {
+                super::locked_ranges_insert(&mut ranges, range);
+            }
+        }
+        ranges
     }
 
     /// Bytes this MM holds locked: the host lock table plus the root's

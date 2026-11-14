@@ -6893,7 +6893,7 @@ mod ipc_set_tests {
                 let r = Arc::clone(&running);
                 handles.push(std::thread::spawn(move || {
                     while r.load(Ordering::Relaxed) {
-                        let proc = d.synthetic_proc_context(&context);
+                        let proc = d.synthetic_proc_context(&context).unwrap();
                         assert!(proc.sysvipc_shm.contains("key"));
                         assert!(proc.sysvipc_sem.contains("key"));
                         assert!(proc.sysvipc_msg.contains("key"));

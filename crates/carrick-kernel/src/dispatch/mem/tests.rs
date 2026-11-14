@@ -8092,7 +8092,7 @@ fn proc_regions_hides_the_mmap_arena_reservation_on_the_host_setup_lane() {
     );
     mem.dynamic_maps.push(guest.clone());
 
-    let regions = mem.proc_regions().expect("regions");
+    let regions = mem.proc_memory().unwrap().regions.expect("regions");
     let in_arena: Vec<_> = regions
         .iter()
         .filter(|r| r.start >= layout.mmap_base && r.start < layout.mmap_base + layout.mmap_size)
