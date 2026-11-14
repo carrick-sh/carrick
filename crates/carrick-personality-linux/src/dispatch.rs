@@ -1095,6 +1095,10 @@ pub enum OutputOperand {
     Buffer { ptr: u8, len: u8, max: u64 },
     /// An epoll event array with a signed int count and ISA-specific stride.
     EpollEvents { ptr: u8, count: u8 },
+    /// The calling ISA's struct stat record, including private x86 aliases.
+    StatRecord { ptr: u8 },
+    /// clock_nanosleep writes a remainder only for relative sleeps.
+    RelativeSleepRemainder { ptr: u8, flags: u8 },
 }
 
 /// `PATH_MAX`: the longest path `getcwd` and `readlinkat` produce.
@@ -1119,6 +1123,20 @@ impl OperandSpec {
     pub const fn output_operand(self) -> OutputOperand {
         use crate::crossing::AllowedHostCrossing as C;
         match self.crossing {
+            C::Read | C::Pread64 | C::Getdents64 => OutputOperand::Buffer {
+                ptr: 1,
+                len: 2,
+                max: u64::MAX,
+            },
+            C::Fstat => OutputOperand::StatRecord { ptr: 1 },
+            C::Newfstatat => OutputOperand::StatRecord { ptr: 2 },
+            C::Sendfile => OutputOperand::Records(&[(2, 8)]),
+            C::TimerfdSettime => OutputOperand::Records(&[(3, 32)]),
+            C::TimerfdGettime => OutputOperand::Record { ptr: 1, bytes: 32 },
+            C::ClockGetres | C::Nanosleep => OutputOperand::Records(&[(1, 16)]),
+            C::ClockNanosleep => OutputOperand::RelativeSleepRemainder { ptr: 3, flags: 1 },
+            C::Times => OutputOperand::Records(&[(0, 32)]),
+            C::Socketpair => OutputOperand::Record { ptr: 3, bytes: 8 },
             C::Getrandom => OutputOperand::Buffer {
                 ptr: 0,
                 len: 1,
@@ -1178,23 +1196,17 @@ impl OperandSpec {
             | C::Fchownat
             | C::Fchown
             | C::Openat
-            | C::Getdents64
             | C::Lseek
-            | C::Read
             | C::Write
             | C::Readv
             | C::Writev
-            | C::Pread64
             | C::Pwrite64
             | C::Preadv
             | C::Pwritev
-            | C::Sendfile
             | C::Pselect6
             | C::Vmsplice
             | C::Splice
             | C::Tee
-            | C::Newfstatat
-            | C::Fstat
             | C::Sync
             | C::Fsync
             | C::Fdatasync
@@ -1215,7 +1227,6 @@ impl OperandSpec {
             | C::Faccessat2
             | C::Fchmodat2
             | C::Socket
-            | C::Socketpair
             | C::Bind
             | C::Listen
             | C::Accept
@@ -1232,11 +1243,7 @@ impl OperandSpec {
             | C::Accept4
             | C::Recvmmsg
             | C::Sendmmsg
-            | C::Nanosleep
             | C::ClockGettime
-            | C::ClockGetres
-            | C::ClockNanosleep
-            | C::Times
             | C::EpollCtl
             | C::Dup
             | C::Dup3
@@ -1245,8 +1252,6 @@ impl OperandSpec {
             | C::Close
             | C::Signalfd4
             | C::TimerfdCreate
-            | C::TimerfdSettime
-            | C::TimerfdGettime
             | C::CloseRange
             | C::Readahead
             | C::Fadvise64
@@ -1269,6 +1274,23 @@ impl OperandSpec {
             OutputOperand::Record { ptr, bytes } => Some((args[ptr as usize], bytes)),
             OutputOperand::Buffer { ptr, len, max } => {
                 Some((args[ptr as usize], args[len as usize].min(max)))
+            }
+            OutputOperand::StatRecord { ptr } => Some((
+                args[ptr as usize],
+                match isa {
+                    carrick_guest_arch::GuestIsa::Aarch64 => {
+                        core::mem::size_of::<carrick_syscall_abi::LinuxStat>() as u64
+                    }
+                    carrick_guest_arch::GuestIsa::X86_64 => {
+                        core::mem::size_of::<carrick_syscall_abi::LinuxX8664Stat>() as u64
+                    }
+                },
+            )),
+            OutputOperand::RelativeSleepRemainder { ptr, flags } => {
+                let address = args[ptr as usize];
+                (args[flags as usize] & carrick_syscall_abi::LINUX_TIMER_ABSTIME == 0
+                    && address != 0)
+                    .then_some((address, 16))
             }
             OutputOperand::EpollEvents { ptr, count } => {
                 let stride = match isa {
