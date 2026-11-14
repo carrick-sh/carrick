@@ -366,7 +366,7 @@ fn root_rendered_mapping(mapping: &Mapping) -> bool {
 
 /// What a `/proc` render reads from the MM's memory owner
 /// ([`MemState::proc_memory`]).
-#[derive(Clone, Debug, Default)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::default::Default)]
 pub(in crate::dispatch) struct ProcMemory {
     pub regions: Option<Vec<ProcMapsEntry>>,
     pub locked: Vec<carrick_vfs::GuestMemoryRange>,
