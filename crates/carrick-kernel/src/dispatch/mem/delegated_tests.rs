@@ -6997,6 +6997,40 @@ fn delegated_live_leaf_reconciliation_survives_busy_root() {
     );
 }
 
+/// #2276, the Go telemetry sidecar's stop on #2278: "delegated anonymous
+/// root refused a lock observation: Busy". A syscall that renders `/proc`
+/// is ordinary: it does not pause this MM's EL1 threads, so one of them can
+/// hold the root. Contention is "not now": each production entry commits
+/// nothing, returns the holder's owner wait, and reruns to success. Busy
+/// once, then success.
+#[test]
+fn proc_renders_park_on_a_held_root_then_succeed() {
+    use carrick_abi::syscall::nr;
+    const PATH: u64 = 0x1_0000;
+    const STATBUF: u64 = 0x1_1000;
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = crate::dispatch::LinearMemory::new(PATH, vec![0; 0x4000]);
+    memory.write_bytes(PATH, b"/proc/self/status\0").unwrap();
+    let at_fdcwd = carrick_abi::LINUX_AT_FDCWD as u64;
+    for (number, args) in [
+        (nr::FACCESSAT.raw(), [at_fdcwd, PATH, 0, 0, 0, 0]),
+        (nr::NEWFSTATAT.raw(), [at_fdcwd, PATH, STATBUF, 0, 0, 0]),
+        (nr::OPENAT.raw(), [at_fdcwd, PATH, 0, 0, 0, 0]),
+    ] {
+        let busy = root.with_held_root_refusal(|| call(&mut dispatcher, &mut memory, number, args));
+        assert!(
+            matches!(busy, DispatchOutcome::OwnerMemoryWait { committed: 0, .. }),
+            "syscall {number}: a held root parks the call, got {busy:?}"
+        );
+        let done = call(&mut dispatcher, &mut memory, number, args);
+        assert!(
+            matches!(done, DispatchOutcome::Returned { value } if value >= 0),
+            "syscall {number}: the rerun succeeds, got {done:?}"
+        );
+    }
+}
+
 #[test]
 fn busy_root_reports_the_exact_holder_and_preprobe_owner_wait() {
     use carrick_el1::memory::reservations::RootHolder;
