@@ -376,6 +376,122 @@ fn episode<C: ProcessContext + 'static, B: carrick_mmu_core::owner_mmu::OwnerFor
     FUTEX_MAPPING.with(|slot| slot.set(None));
 }
 
+/// #2306: a Busy mapping probe is "not now". The futex keeps its exact
+/// syscall in the owner-service continuation and reruns after the carrier
+/// settles, never ending the run (the former run failure) or returning EAGAIN.
+fn busy_once_episode<C: ProcessContext + 'static, B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
+    make: impl Fn(AddressContext<RootGpa>) -> C,
+) {
+    let fixture = Fixture::<C>::new::<B>(&make);
+    let zone = fixture.zone;
+    assert!(zone.mark_native_owned(fixture.record.id));
+    let mut service = Physical {
+        zone,
+        page: fixture.page,
+        controls: core::slice::from_ref(fixture.control),
+        copies: Vec::new(),
+        tid_words: BTreeMap::new(),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        waker_slot: carrick_sched_core::SlotId::new(0),
+        on_signal_clock: None,
+    };
+    FUTEX_MAPPING.with(|slot| slot.set(Some(Err(NativeProcessError::Busy))));
+    let source = BornInZoneSource {
+        zone,
+        slot: fixture.slot,
+    };
+    let saved = make(fixture.address);
+    let mut copy = Copy {
+        refuse_word: false,
+        loads: 0,
+        word: 0,
+    };
+    let call = FutexCall {
+        args: [0x1000, 0, 0, 0, 0, 0],
+    };
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.native_futex(call, &mut copy),
+            Some(LifecycleOutcome::Transferred { .. })
+        ));
+        assert_eq!(
+            entry.take_run_failure(),
+            None,
+            "a Busy mapping probe is not now, never a run failure"
+        );
+        assert!(
+            entry.take_handoff_receipt().is_some(),
+            "must release execution capacity"
+        );
+    }
+    assert!(zone.slot(fixture.slot).current().is_none());
+    assert_eq!(copy.loads, 0, "no word is read before the mapping admits");
+    FUTEX_MAPPING.with(|slot| slot.set(Some(Ok(true))));
+    assert!(matches!(
+        super::complete_carrier_work(zone, fixture.task, fixture.slot, fixture.record),
+        carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
+    ));
+    assert_eq!(
+        zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { *zone.record(fixture.record.id).ctx_mut() };
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::RetrySyscall)
+    ));
+    // The rerun admits the mapping and parks on the unchanged word.
+    assert!(matches!(
+        entry.native_futex(call, &mut copy),
+        Some(LifecycleOutcome::Transferred { .. })
+    ));
+    assert!(entry.take_run_failure().is_none());
+    assert!(entry.take_handoff_receipt().is_some());
+    assert_eq!(copy.loads, 1);
+    FUTEX_MAPPING.with(|slot| slot.set(None));
+}
+
+#[test]
+fn native_futex_mapping_busy_once_then_waits_x86() {
+    busy_once_episode::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(words);
+}
+#[test]
+fn native_futex_mapping_busy_once_then_waits_aarch64() {
+    busy_once_episode::<
+        carrick_sched_core::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
 fn arm_words(address: AddressContext<RootGpa>) -> carrick_sched_core::Aarch64ParkedContext {
     carrick_sched_core::Aarch64ParkedContext::from_parts(carrick_el1_abi::ThreadCtx::ZERO, address)
 }
