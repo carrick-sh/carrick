@@ -474,7 +474,9 @@ fn test_arm_fork_geometry_and_cow_lifecycle() {
         "parent private leaf has NON_GLOBAL"
     );
 
-    // L2 private block:
+    // L2 private block: the live parent now points at a fresh L3 table.  Every
+    // split leaf carries the COW authority; keeping those bits on the block
+    // would make owner copyout reject the valid mapping.
     let block_edit = scratch
         .edits
         .iter()
@@ -482,20 +484,28 @@ fn test_arm_fork_geometry_and_cow_lifecycle() {
         .expect("private block edit recorded");
     assert_eq!(block_edit.before, original_block);
     assert_eq!(
-        block_edit.after & AP_RO,
-        AP_RO,
-        "parent private block armed read-only"
+        block_edit.after & TYPE_TABLE_OR_PAGE,
+        TYPE_TABLE_OR_PAGE,
+        "parent private block replaced by an L3 table"
     );
-    assert_ne!(
-        block_edit.after & SW_EL1_COW,
-        0,
-        "parent private block has SW_EL1_COW"
+    let parent_l3 = block_edit.after & Aarch64Mmu::ADDRESS_MASK;
+    assert!(
+        req.parent_tables.contains(parent_l3),
+        "split parent table belongs to the admitted parent arena"
     );
-    assert_ne!(
-        block_edit.after & NON_GLOBAL,
-        0,
-        "parent private block has NON_GLOBAL"
-    );
+    let parent_offset = ((parent_l3 - req.parent_tables.base) / 8) as usize;
+    for index in [0, 511] {
+        let leaf = scratch.parent[parent_offset + index];
+        let original = Aarch64Mmu::split(original_block, 2, index).unwrap();
+        assert_eq!(
+            leaf & Aarch64Mmu::ADDRESS_MASK,
+            original & Aarch64Mmu::ADDRESS_MASK,
+            "split leaf {index} preserves its output frame"
+        );
+        assert_eq!(leaf & AP_RO, AP_RO, "split leaf {index} is read-only");
+        assert_ne!(leaf & SW_EL1_COW, 0, "split leaf {index} is COW-armed");
+        assert_ne!(leaf & NON_GLOBAL, 0, "split leaf {index} is ASID-scoped");
+    }
 
     // Assert shared leaf is NOT edited in parent
     assert!(
