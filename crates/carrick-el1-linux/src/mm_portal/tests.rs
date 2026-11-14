@@ -3212,6 +3212,12 @@ fn fork_child_write_preparation_mode(prepare_first: bool, race_drain: bool) {
                 }
                 Ok(())
             }
+            fn reclaim_retired_holders(
+                &mut self,
+                _: &carrick_sched_core::ExcludedEditor<'_>,
+            ) -> Result<(), ()> {
+                Ok(()) // This COW-ordering schedule has no retired fork holder.
+            }
             fn settle_owed_returns(
                 &mut self,
                 excluded: &carrick_sched_core::ExcludedEditor<'_>,

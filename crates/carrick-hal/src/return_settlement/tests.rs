@@ -800,6 +800,13 @@ impl ExclusionSettlement for Ordered {
         }
         Ok(())
     }
+    fn reclaim_retired_holders(
+        &mut self,
+        _: &carrick_sched_core::ExcludedEditor<'_>,
+    ) -> Result<(), &'static str> {
+        self.steps.push("quarantine");
+        Ok(())
+    }
     fn settle_owed_returns(
         &mut self,
         excluded: &carrick_sched_core::ExcludedEditor<'_>,
@@ -819,7 +826,7 @@ fn an_exclusion_settles_cow_completions_before_owed_returns() {
     let excluded = spaces.unpublished(MM).unwrap();
     let mut venue = Ordered::default();
     assert_eq!(settle_cow_then_returns(&mut venue, &excluded), Ok(MM));
-    assert_eq!(venue.steps, ["cow", "returns"]);
+    assert_eq!(venue.steps, ["cow", "quarantine", "returns"]);
     let mut failed = Ordered {
         cow_fails: true,
         ..Ordered::default()

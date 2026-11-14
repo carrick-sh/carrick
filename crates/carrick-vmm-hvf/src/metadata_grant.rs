@@ -185,7 +185,7 @@ fn service_terminal_operation(
                 &mut stock,
                 &mut ledger,
                 region,
-                cpu,
+                zone,
                 execution,
             ) {
                 Ok(count) => [METADATA_GRANT_SUCCESS, count as u64, 0, 0],
@@ -1665,7 +1665,7 @@ fn reclaim_fork_stock(
     stock: &mut crate::fork_stock::ForkStockHostCustody,
     ledger: &mut impl carrick_hal::fork_stock::ForkTableLedger,
     region: RetainedAbiRegion<'_>,
-    cpu: carrick_guest_arch::CpuId,
+    zone: &carrick_el1_abi::ZoneTables,
     execution: carrick_hal::fork_stock::ReclaimExecution,
 ) -> Result<usize, carrick_hal::fork_stock::ForkStockServiceError> {
     use carrick_hal::fork_stock::{ForkStockServiceError, SlotAbsence};
@@ -1675,7 +1675,6 @@ fn reclaim_fork_stock(
     let inventory = stock
         .inventory()
         .ok_or(ForkStockServiceError::OccupancyUnavailable)?;
-    let (_, zone) = stopped_records(region, cpu).ok_or(ForkStockServiceError::StaleExecution)?;
     let pointer = region
         .record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
             carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
@@ -1778,8 +1777,18 @@ pub(crate) fn service_native_fork_stock(
             else {
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
-            if reclaim_fork_stock(custody, &mut stock, &mut ledger, region, cpu, active.into())
-                .is_err()
+            let Some((_, zone)) = stopped_records(region, cpu) else {
+                return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+            };
+            if reclaim_fork_stock(
+                custody,
+                &mut stock,
+                &mut ledger,
+                region,
+                zone,
+                active.into(),
+            )
+            .is_err()
             {
                 exchange.refuse(ForkStockRefusal::Inventory);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);

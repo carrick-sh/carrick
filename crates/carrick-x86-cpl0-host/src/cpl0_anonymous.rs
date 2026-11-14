@@ -915,9 +915,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     /// reclaim, before any of the child's stock can be reissued, the child's
     /// carrier state is released (frame inventory, COW residency, CR3 and
     /// aliases, private memslots); a refused release keeps it quarantined.
-    fn drain_fork_quarantine(&mut self, execution: GrantExecution) -> Result<(), TrapError> {
-        let active = ReservationMm::new(execution.binding.mm.raw())
-            .ok_or_else(|| fail("fork quarantine active MM"))?;
+    fn drain_fork_quarantine(&mut self, active: ReservationMm) -> Result<(), TrapError> {
+        if !self.fork_stock.has_quarantine() {
+            return Ok(());
+        }
         let zone = retained_cow_zone(&self.ram)?;
         // `CPL0_CPU_COUNT` has one definition (`cpl0_entry.rs`), compiled
         // into the guest by `#[path]`; the guest drain scans the same slots.
@@ -1022,7 +1023,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     ) -> Result<Option<GuestArchBinding>, TrapError> {
         use carrick_el1_abi::ForkStockExchange;
         let execution = self.physical_execution(lease)?;
-        self.drain_fork_quarantine(execution)?;
+        self.drain_fork_quarantine(
+            ReservationMm::new(execution.binding.mm.raw())
+                .ok_or_else(|| fail("fork quarantine active MM"))?,
+        )?;
         let address = lease.io.get_gpr(X86Reg::Rax)?;
         let (_, tag) =
             unsafe { self.read_stack_record::<u64, I>(lease, execution.context, address) }?;

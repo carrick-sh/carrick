@@ -57,3 +57,6 @@ zerocopy.workspace = true
 # tids (carrick-runtime's Serialize-derived outcomes) keep their wire shape.
 serde.workspace = true
 parking_lot.workspace = true
+
+[dev-dependencies]
+carrick-test-support = { path = "../carrick-test-support" }

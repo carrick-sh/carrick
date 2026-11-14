@@ -4277,6 +4277,12 @@ mod tests {
                 self.both_excluded.wait();
                 Ok(())
             }
+            fn reclaim_retired_holders(
+                &mut self,
+                _: &carrick_sched_core::ExcludedEditor<'_>,
+            ) -> Result<(), ()> {
+                Ok(()) // No retired fork holders in this schedule.
+            }
             fn settle_owed_returns(
                 &mut self,
                 excluded: &carrick_sched_core::ExcludedEditor<'_>,
