@@ -128,6 +128,27 @@ server. The three root witnesses stay red until root exec lands. The crossing
 allowlist must flip in a separately labelled commit with its server and
 director review. No early errno-only flip is allowed.
 
+## Parked exec and signals (#2273)
+
+Linux `execve(2)` and `signal(7)` govern the signal boundary: a pending caught
+SIGUSR1 outlives the parked service, then the successor's reset-to-default
+disposition terminates it; SIG_IGN persists through exec and the successor
+exits normally. A default-terminate SIGTERM ends the child and reaps the
+outstanding ticket without waiting for its fork-stock holder. The native Linux
+oracle recorded SIGUSR1, normal exit 7, and SIGTERM respectively with a
+pending signal across exec. The x86 KVM production witness keeps a second live
+child holding stock and observes an actual successor-table refusal in every
+case. It also retains the SIGKILL control.
+
+The red KVM witness (`2273-round4-red4`) showed caught SIGUSR1 returning the
+saved syscall number RAX=59 to the old image (its negated exit was 197);
+SIGTERM waited until the holder's five-second bound ended. The fixed KVM
+witness (`2273-round4-fix2`) passed all six focused child-exec cases. The
+shared service excludes exec from ordinary signal interruption
+and lets only a deliverable default-terminate signal cancel it. Fatal signal
+work drives a host probe of the parked ticket. An error while probing preserves
+all unprocessed parked execs.
+
 ## Stack adoption
 
 The staged successor imports a PRIVATE|GROWSDOWN stack before admission,
