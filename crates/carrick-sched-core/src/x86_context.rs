@@ -26,6 +26,18 @@ pub struct ParkedContextWords {
 
 pub const X86_XSAVE_BYTES: usize = 832;
 
+/// Fresh x87/SSE state for a new x86 user image. XSTATE_BV marks both legacy
+/// components present so XRSTOR loads these control words from the image.
+const fn initial_user_xsave() -> [u8; X86_XSAVE_BYTES] {
+    let mut xsave = [0; X86_XSAVE_BYTES];
+    xsave[0] = 0x7f; // FCW = 0x037f (all x87 exceptions masked).
+    xsave[1] = 0x03;
+    xsave[24] = 0x80; // MXCSR = 0x1f80 (all SIMD exceptions masked).
+    xsave[25] = 0x1f;
+    xsave[512] = 0x03; // XSTATE_BV: x87 | SSE; AVX remains initial.
+    xsave
+}
+
 /// User 64-bit code selector in the CPL0 GDT.
 const USER_CODE_SELECTOR: u64 = 0x23;
 /// User data selector in the CPL0 GDT.
@@ -98,7 +110,7 @@ impl ParkedContextWords {
 
     /// The first user entry of a fresh image: `rip`/`rsp` under the
     /// supervisor GDT's 64-bit user selectors, interrupts enabled, with zero
-    /// segment bases and an empty extended-state save area. The caller holds
+    /// segment bases and initial x87/SSE state. The caller holds
     /// the record's claim while publishing this typed owner.
     pub fn user_entry(address: AddressContext<RootGpa>, rip: u64, rsp: u64) -> Self {
         let mut frame = [0; 20];
@@ -107,7 +119,7 @@ impl ParkedContextWords {
         frame[17] = USER_ENTRY_FLAGS;
         frame[18] = rsp;
         frame[19] = USER_DATA_SELECTOR;
-        Self::from_parts(frame, address, 0, 0, [0; X86_XSAVE_BYTES])
+        Self::from_parts(frame, address, 0, 0, initial_user_xsave())
     }
 
     /// Whether `rip`/`rsp` can be a first user entry: canonical lower-half
@@ -265,7 +277,9 @@ mod user_entry_tests {
             words.frame[17]
         ));
         assert_eq!((words.fs_base, words.gs_base), (0, 0));
-        assert!(words.xsave.iter().all(|byte| *byte == 0));
+        assert_eq!(&words.xsave[0..2], &0x037fu16.to_le_bytes());
+        assert_eq!(&words.xsave[24..28], &0x1f80u32.to_le_bytes());
+        assert_eq!(words.xsave[512], 3);
         assert!(ParkedContextWords::valid_user_entry(0x40_1000, 0x7fff_f000));
         assert!(!ParkedContextWords::valid_user_entry(0, 0x7fff_f000));
         assert!(!ParkedContextWords::valid_user_entry(1 << 47, 0x7fff_f000));
