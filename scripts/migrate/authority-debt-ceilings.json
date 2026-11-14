@@ -34150,7 +34150,7 @@
     {
       "family": "k1_inspect_misc",
       "operation": "epoll_wake_registry",
-      "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::epoll_create1",
+      "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::epoll_description",
       "lane": "shared",
       "ceiling": 1
     },

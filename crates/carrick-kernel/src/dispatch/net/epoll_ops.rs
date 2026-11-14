@@ -438,9 +438,9 @@ fn zone_epoll_ctl(
     member: &super::epoll_zone::ZoneMember,
     operation: u64,
     fd: i32,
-    event: impl FnOnce() -> Result<LinuxEpollEvent, DispatchOutcome>,
+    event: impl FnOnce() -> Result<LinuxEpollEvent, Box<DispatchOutcome>>,
     in_host_half: impl FnOnce() -> bool,
-) -> Result<super::epoll_zone::ZoneCtl, DispatchOutcome> {
+) -> Result<super::epoll_zone::ZoneCtl, Box<DispatchOutcome>> {
     use super::epoll_zone::ZoneCtl;
     Ok(match operation {
         LINUX_EPOLL_CTL_ADD => {
@@ -456,11 +456,40 @@ fn zone_epoll_ctl(
             zone.modify(fd, member.file_key, event.events, event.data)
         }
         LINUX_EPOLL_CTL_DEL => zone.delete(fd, member.file_key),
-        _ => return Err(DispatchOutcome::errno(LINUX_EINVAL)),
+        _ => return Err(Box::new(DispatchOutcome::errno(LINUX_EINVAL))),
     })
 }
 
+/// The zone record a new epoll description stands on.
+enum EpollRecord {
+    /// A fresh record from this authority (none: every item in the host half).
+    New(Option<Arc<crate::el1_ipc::HostIpc>>),
+    /// A ring-created record, held through the ring's own OFD (#1671).
+    Adopt {
+        owner: Arc<crate::el1_ipc::HostIpc>,
+        object: carrick_el1_abi::ipc::IpcObjectHandle,
+        lifetime: crate::el1_ipc::HostDescription,
+    },
+}
+
 impl<'a> NetView<'a> {
+    /// An epoll description wired to this file table's in-memory wake
+    /// registry, over a new or an adopted zone record.
+    fn epoll_description(
+        &self,
+        record: EpollRecord,
+    ) -> Result<OpenDescription, carrick_abi::LinuxErrno> {
+        let registry = Arc::clone(self.captured_file_table().epoll_wake_registry());
+        match record {
+            EpollRecord::New(owner) => new_epoll_description(registry, owner),
+            EpollRecord::Adopt {
+                owner,
+                object,
+                lifetime,
+            } => adopted_epoll_description(registry, owner, object, lifetime),
+        }
+    }
+
     /// The epoll `epfd` names, adopting a ring-created one (#1671).
     ///
     /// A run root's `epoll_create1` is served in ring: its record and OFD
@@ -493,10 +522,14 @@ impl<'a> NetView<'a> {
         } else {
             0
         };
-        let description =
-            adopted_epoll_description(Arc::clone(files.epoll_wake_registry()), owner, object, held)
-                .ok()?;
-        let open_file = OpenFile::from_open_description_with_common(
+        let description = self
+            .epoll_description(EpollRecord::Adopt {
+                owner,
+                object,
+                lifetime: held,
+            })
+            .ok()?;
+        let open_file = crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
             Arc::new(RwLock::new(description)),
             Arc::new(crate::kernel::DescriptionCommon::new(0)),
             fd_flags,
@@ -4586,10 +4619,9 @@ impl<'a> NetView<'a> {
             if flags & !LINUX_EPOLL_CLOEXEC != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let description = match new_epoll_description(
-                Arc::clone(this.captured_file_table().epoll_wake_registry()),
+            let description = match this.epoll_description(EpollRecord::New(
                 cx.kernel.kernel().ipc().ok(),
-            ) {
+            )) {
                 Ok(description) => description,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
@@ -4649,8 +4681,10 @@ impl<'a> NetView<'a> {
             let epoll_description = Arc::clone(&open_file.description);
             let read_event = || {
                 read_epoll_event(memory, event_address, cx.guest_abi()).map_err(|error| {
-                    DispatchOutcome::from_owner_memory_error(error)
-                        .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))
+                    Box::new(
+                        DispatchOutcome::from_owner_memory_error(error)
+                            .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT)),
+                    )
                 })
             };
             if let Some(member) = ring_member {
@@ -4667,7 +4701,7 @@ impl<'a> NetView<'a> {
                 let zone_result =
                     match zone_epoll_ctl(&zone, &member, operation, fd, read_event, || false) {
                         Ok(result) => result,
-                        Err(outcome) => return Ok(outcome),
+                        Err(outcome) => return Ok(*outcome),
                     };
                 return Ok(match zone_result {
                     ZoneCtl::Done => {
@@ -4731,7 +4765,7 @@ impl<'a> NetView<'a> {
                 let zone_result =
                     match zone_epoll_ctl(zone, member, operation, fd, read_event, in_host_half) {
                         Ok(result) => result,
-                        Err(outcome) => return Ok(outcome),
+                        Err(outcome) => return Ok(*outcome),
                     };
                 match zone_result {
                     ZoneCtl::Done => {
