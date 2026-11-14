@@ -1390,6 +1390,9 @@ pub struct CowRun {
     pub len: u64,
     pub compound_offset: u64,
     pub executable: bool,
+    /// Unlinked tables the repoint needs to split the armed large page
+    /// covering the run: 0 for a 4 KiB leaf, 1 for 2 MiB, 2 for 1 GiB.
+    pub split_tables: usize,
 }
 
 /// Classify one CPL3 COW write through the live PML4. The exact-MM editor
@@ -1411,9 +1414,14 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     if leaf.descriptor & WRITE != 0 {
         return Err(CowClass::AlreadyWritable);
     }
-    if leaf.size != PAGE {
-        return Err(CowClass::Unmapped);
-    }
+    // An armed large page resolves on its first write by splitting exactly
+    // the covering entry inside the repoint (#2276); the run is one page.
+    let split_tables = match leaf.size {
+        PAGE => 0,
+        size if size == LeafSize::Block2M.bytes() => 1,
+        size if size == LeafSize::Block1G.bytes() => 2,
+        _ => return Err(CowClass::Unmapped),
+    };
     if leaf.descriptor & COW == 0 {
         return Err(CowClass::NotCowArmed);
     }
@@ -1431,6 +1439,7 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
         // A host COW grant is one 16 KiB compound on both ISAs.
         compound_offset: old_ipa.raw() & (16 * 1024 - 1),
         executable: leaf.executable,
+        split_tables,
     })
 }
 

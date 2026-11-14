@@ -4143,6 +4143,7 @@ mod tests {
                     len: PT_PAGE,
                     old_ipa: SubstrateGpa(IPA),
                     executable: false,
+                    split_tables: 0,
                 })
             );
             assert_eq!(
@@ -4152,6 +4153,7 @@ mod tests {
                     len: PT_PAGE,
                     old_ipa: SubstrateGpa(IPA + PT_PAGE),
                     executable: true,
+                    split_tables: 0,
                 })
             );
             applied(run(

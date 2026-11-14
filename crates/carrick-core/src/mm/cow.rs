@@ -33,6 +33,9 @@ pub struct GuestCowRun {
     pub old_ipa: u64,
     pub compound_offset: u64,
     pub executable: bool,
+    /// Tables the repoint links to split the armed block covering the run;
+    /// 0 for a page run (#2276).
+    pub split_tables: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,11 +54,17 @@ pub struct CowRepointOp {
     pub old_ipa: u64,
     pub new_ipa: u64,
     pub backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity,
+    /// The claimed grant's split tables, offered to the repoint.
+    pub tables: carrick_core_abi::CowSplitTables,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CowRepointOutcome {
-    Applied { flush_required: bool },
+    /// `tables_linked` is the prefix of the offered tables now in the graph.
+    Applied {
+        flush_required: bool,
+        tables_linked: u8,
+    },
     Refused,
     RolledBack,
     Indeterminate,
@@ -210,7 +219,7 @@ where
         }
     };
 
-    let Some(grant) = pool.claim(mm_key) else {
+    let Some(grant) = pool.claim(mm_key, run.split_tables) else {
         pool.note_declined(CowDecline::PoolEmpty);
         return Ok(GuestCowOutcome::Declined(CowDecline::PoolEmpty));
     };
@@ -232,6 +241,7 @@ where
         old_ipa: run.old_ipa,
         new_ipa,
         backing: grant.backing,
+        tables: grant.tables,
     };
 
     if !B::plan_cow_repoint(words, root.raw(), op) {
@@ -257,7 +267,10 @@ where
     }
 
     match B::execute_cow_repoint(words, root.raw(), op) {
-        CowRepointOutcome::Applied { flush_required } => {
+        CowRepointOutcome::Applied {
+            flush_required,
+            tables_linked,
+        } => {
             if flush_required {
                 invalidate_asid();
             }
@@ -288,6 +301,7 @@ where
                 span_len: run.len,
                 old_ipa: run.old_ipa,
                 new_ipa,
+                tables_linked,
             };
             if !pool.complete(&completion) {
                 return Err(CowError::Internal);
