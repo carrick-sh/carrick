@@ -46,6 +46,8 @@ pub enum Commands {
     WorkflowPatches,
     #[command(about = "Compile all recipe lanes once and run their test binaries")]
     TestBatch(crate::test_batch::TestBatchArgs),
+    /// List every test CI compiled for a recipe (and test lanes) as a per-head manifest.
+    TestList(crate::test_list::TestListArgs),
     /// Run just-test selections for changed crates and reverse dependencies.
     TestTouched(crate::test_touched::TestTouchedArgs),
     #[command(about = "Run each lib test of one package in its own process")]
@@ -552,6 +554,10 @@ where
         Commands::TestTouched(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::test_touched::run(&root, args).map_err(|e| CliError::TestShards(e.to_string()))
+        }
+        Commands::TestList(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::test_list::run(&root, args).map_err(|e| CliError::TestShards(e.to_string()))
         }
         Commands::TestBatch(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));

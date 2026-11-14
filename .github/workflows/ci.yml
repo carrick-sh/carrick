@@ -887,7 +887,133 @@ jobs:
       - name: Kernel semantics on x86_64 Linux
         if: ${{ !cancelled() }}
         run: just test-kernel-semantics
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just ci-cache-finish
 
+  x86-test-list:
+    needs: [changes, xtask-build, xtask-tests-build]
+    # Only the director's enqueue-stage ISA-witness check reads its artifact (#2328 item 4); it runs beside
+    # the gates, and ci-ok doesn't need it, so it never lengthens the landing path.
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+    steps:
+      # The PR head itself, not the merge ref: the list names the head (test-list refuses any other checkout).
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/install-tools
+        with:
+          tools: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
+      - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: ${{ github.job }}-debug-v2
+          cache-workspace-crates: "true"
+          cache-targets: false
+          save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
+      - name: Install per-user compiler cache
+        uses: ./.github/actions/install-tools
+        with:
+          tools: sccache
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
+      - name: Download xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Configure xtask artifact
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
+      - name: Download xtask test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-tests-linux-x64
+          path: ${{ runner.temp }}/xtask-tests
+      - name: Configure xtask test artifact
+        run: |
+          tar -xzf "$RUNNER_TEMP/xtask-tests/xtask-tests.tar.gz"
+          echo "CARRICK_XTASK_TEST_MANIFEST=$GITHUB_WORKSPACE/target/test-batch.json" >> "$GITHUB_ENV"
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
+      - name: Compiler cache fallback without sccache
+        run: just check-build-cache
+      - name: Identify the runner image for the apt cache
+        id: runner-image
+        if: ${{ !cancelled() }}
+        run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Restore cross toolchain packages
+        if: ${{ !cancelled() }}
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-cross
+          key: apt-ci-install-linux-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}
+          restore-keys: apt-ci-install-linux-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-
+      - name: Install Linux C cross toolchain
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
+        run: just ci-install-linux-cross
+      # Saved even when the download timed out, so a throttled mirror's
+      # progress carries to the next run; only a complete set takes the key.
+      - name: Choose the cross toolchain package cache key
+        id: apt-cross-key
+        if: ${{ !cancelled() }}
+        run: |
+          if [[ -f "$RUNNER_TEMP/apt-cross/complete" ]]; then
+            echo "key=apt-ci-install-linux-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "key=apt-ci-install-linux-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save cross toolchain packages
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-cross
+          key: ${{ steps.apt-cross-key.outputs.key }}
+      # Ground truth for ISA witnesses (#2328 item 4): every test this job's
+      # selection compiles, per head; land-when-green.sh reads it before enqueueing.
+      - name: List the compiled tests (x86, test)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: just xtask test-list --head "$HEAD" --isa x86 --recipe test --lane kvm --out "target/test-list-x86-host.json"
+      - name: Upload the test list
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-list-x86-host-${{ github.event.pull_request.head.sha }}
+          path: target/test-list-x86-host.json
+          if-no-files-found: error
+          retention-days: 14
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just ci-cache-finish
@@ -1443,6 +1569,23 @@ jobs:
       - name: Unit tests shard A (host test lanes)
         if: ${{ !cancelled() }}
         run: just lease carrick just ci-macos-test test-shard-a
+      # Ground truth for ISA witnesses (#2328 item 4): every test this job's
+      # selection compiles, per head; land-when-green.sh reads it before enqueueing.
+      - name: List the compiled tests (arm, test-shard-a)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        # The job tested the merge ref; the list names the PR head, so the script checks that commit out
+        # (the tests above have finished) and test-list refuses any other checkout.
+        run: just lease carrick scripts/ci/test-list-at-head.sh --isa arm --recipe test-shard-a --lane signed-hvf --lane signed-cli --out "target/test-list-arm-a.json"
+      - name: Upload the test list
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-list-arm-a-${{ github.event.pull_request.head.sha }}
+          path: target/test-list-arm-a.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Compiler cache statistics
         if: ${{ always() }}
@@ -1525,6 +1668,23 @@ jobs:
       - name: Unit tests shard B (workspace + mm-owner + CLI + host + VFS + kernel + runtime + HVF + EL1)
         if: ${{ !cancelled() }}
         run: just lease carrick just ci-macos-test test-shard-b
+      # Ground truth for ISA witnesses (#2328 item 4): every test this job's
+      # selection compiles, per head; land-when-green.sh reads it before enqueueing.
+      - name: List the compiled tests (arm, test-shard-b)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        # The job tested the merge ref; the list names the PR head, so the script checks that commit out
+        # (the tests above have finished) and test-list refuses any other checkout.
+        run: just lease carrick scripts/ci/test-list-at-head.sh --isa arm --recipe test-shard-b --out "target/test-list-arm-b.json"
+      - name: Upload the test list
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-list-arm-b-${{ github.event.pull_request.head.sha }}
+          path: target/test-list-arm-b.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Compiler cache statistics
         if: ${{ always() }}
