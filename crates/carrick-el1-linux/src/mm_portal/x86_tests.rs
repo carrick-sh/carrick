@@ -378,24 +378,44 @@ fn x86_pending_brk_maintenance_scrubs_private_grant_and_keeps_leaf_invalid() {
 
 #[test]
 fn x86_owner_fork_arms_private_parent_and_restores_on_abort() {
+    for huge in [false, true] {
+        x86_owner_fork_arm_and_abort(huge);
+    }
+}
+
+fn x86_owner_fork_arm_and_abort(huge: bool) {
     use carrick_el1_abi::{
         PortalForkRequest, PortalForkTableArena, PortalOperation, ReservationMm,
     };
-    use carrick_mmu_core::x86::descriptor_txn::{COW, MAY_WRITE, NX};
+    use carrick_mmu_core::live_descriptor_words::LiveDescriptorWords as _;
+    use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, COW, HUGE, MAY_WRITE, NX};
+    const HUGE_PAGES: usize = 512;
     let mut region = Region::new();
     region.add_bank();
     let spaces = AddressSpaces::new();
-    let parent = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let parent = admit(
+        &region,
+        &spaces,
+        77,
+        ROOT,
+        if huge { HUGE_PAGES } else { 1 },
+        0,
+    );
     let view = nodes(&region);
     let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view)
         .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
     let parent_tables = Tables::new(ROOT, IPA, 1);
-    for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
+    for (entry, offset) in [(0, 4096), (513, 8192)] {
         parent_tables.words[entry]
             .store((ROOT + offset) | PRESENT | WRITE | USER, Ordering::Release);
     }
-    let original = IPA | PRESENT | WRITE | USER | MAY_WRITE | NX;
-    parent_tables.words[1536].store(original, Ordering::Release);
+    let original = if huge {
+        IPA | PRESENT | WRITE | USER | HUGE | MAY_WRITE | NX
+    } else {
+        parent_tables.words[1024].store(ROOT + 12288 | PRESENT | WRITE | USER, Ordering::Release);
+        IPA | PRESENT | WRITE | USER | MAY_WRITE | NX
+    };
+    parent_tables.words[if huge { 1024 } else { 1536 }].store(original, Ordering::Release);
     let child = Tables::new(ROOT + 0x100000, 0, 0);
     let supply = Tables::new(ROOT + 0x200000, 0, 0);
     for arena in [&child, &supply] {
@@ -433,13 +453,37 @@ fn x86_owner_fork_arms_private_parent_and_restores_on_abort() {
     let scratch = ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap();
     let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
     let mut unpublished = portal.publish_fork(plan, &words, 0).unwrap();
-    let parent_leaf = parent_tables.words[1536].load(Ordering::Acquire);
-    let child_leaf = child.words[1536].load(Ordering::Acquire);
+    let (parent_leaf, child_leaf) = if huge {
+        assert_ne!(
+            unpublished.completion().parent_tables_used,
+            0,
+            "a private x86 large page must split in the live parent"
+        );
+        assert_ne!(
+            unpublished.completion().child_tables_used,
+            0,
+            "the child must inherit page-granular COW leaves"
+        );
+        let parent_table = parent_tables.words[1024].load(Ordering::Acquire) & ADDRESS;
+        let child_table = child.words[1024].load(Ordering::Acquire) & ADDRESS;
+        (
+            words.load(parent_table).unwrap(),
+            words.load(child_table).unwrap(),
+        )
+    } else {
+        (
+            parent_tables.words[1536].load(Ordering::Acquire),
+            child.words[1536].load(Ordering::Acquire),
+        )
+    };
     assert_eq!(parent_leaf & (COW | MAY_WRITE | WRITE), COW | MAY_WRITE);
     assert_eq!(child_leaf & (COW | MAY_WRITE | WRITE), COW | MAY_WRITE);
     assert!(spaces.grant(child_index, 78).is_none());
     unpublished.abort(&portal, &words, 0).unwrap();
-    assert_eq!(parent_tables.words[1536].load(Ordering::Acquire), original);
+    assert_eq!(
+        parent_tables.words[if huge { 1024 } else { 1536 }].load(Ordering::Acquire),
+        original
+    );
     assert!(
         !region
             .table()
