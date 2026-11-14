@@ -1120,16 +1120,42 @@ pub fn settle_losing_zone_current<C: carrick_core_abi::EntryContext>(
     source: carrick_core_abi::BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
 ) -> Option<LosingMemberSettlement<C>> {
-    let _pin = crate::lifecycle::MemberControlCustody::retain(member).ok()?;
-    crate::entry::prepare_handoff(binding, source, record)?;
+    settle_losing_zone_current_before_release(member, binding, source, record, || {
+        Ok::<(), core::convert::Infallible>(())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Keep the member pin across the release decision and physical detachment.
+/// The callback is called only when retirement is authorized, immediately
+/// before `retire_current` publishes its exact receipt.
+pub fn settle_losing_zone_current_before_release<C, E>(
+    member: &dyn MemberControl,
+    binding: ExecutionBinding,
+    source: carrick_core_abi::BornInZoneSource<'_, C>,
+    record: carrick_sched_core::RecordId,
+    before_release: impl FnOnce() -> Result<(), E>,
+) -> Result<Option<LosingMemberSettlement<C>>, E>
+where
+    C: carrick_core_abi::EntryContext,
+{
+    let Some(_pin) = crate::lifecycle::MemberControlCustody::retain(member).ok() else {
+        return Ok(None);
+    };
+    if crate::entry::prepare_handoff(binding, source, record).is_none() {
+        return Ok(None);
+    }
     if member.exit_custody().zone_terminal()
         || crate::lifecycle::recorded_member_exit_kind(member, member.member_entry())
             == MemberExitKind::InZone
         || member.host_retirement().is_some()
     {
-        crate::entry::retire_current(binding, source, record).map(LosingMemberSettlement::Released)
+        before_release()?;
+        Ok(crate::entry::retire_current(binding, source, record)
+            .map(LosingMemberSettlement::Released))
     } else {
-        Some(LosingMemberSettlement::HostCustody)
+        Ok(Some(LosingMemberSettlement::HostCustody))
     }
 }
 

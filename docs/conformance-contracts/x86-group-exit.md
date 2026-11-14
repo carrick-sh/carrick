@@ -40,3 +40,13 @@ production KVM pool. Native x86 execution is a fixture sanity check; it does
 not replace the project's native-arm64 Docker authority or signed ARM gate.
 The parked-fault witness remains with #2263 until that work lands. Its COW
 pause and retry implementation is outside this change.
+
+The ARM EL0 return binding also drives the production venue and no-signal
+gate. A host-loaded member whose entry venue becomes Host after closure, and
+a member holding a native-owned record, both owe the terminal checkpoint;
+neither may return an interrupted futex result to user space. The losing
+exit-group binding holds a host retirement reservation across a second
+member's close. HostCustody must retain its installed translation and live
+record; exact release vacates translation before publishing the retirement
+receipt. These are structural invariants as well as the parent's wait4 status
+claim.

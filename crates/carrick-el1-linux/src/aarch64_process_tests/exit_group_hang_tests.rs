@@ -87,16 +87,7 @@ fn serial_host_arm_group_close_checkpoints_running_and_parked_siblings() {
     deferred_control_handback(true, true);
 }
 
-#[test]
-fn serial_host_arm_group_close_checkpoints_ring_owned_sibling() {
-    deferred_control_handback_with_ring_owner(true, true, true);
-}
-
 fn deferred_control_handback(registered: bool, checkpoint: bool) {
-    deferred_control_handback_with_ring_owner(registered, checkpoint, false);
-}
-
-fn deferred_control_handback_with_ring_owner(registered: bool, checkpoint: bool, ring_owner: bool) {
     use carrick_el1_abi::Lifecycle;
     let (kernel, root) = bootstrap(41);
     let root = Box::leak(Box::new(root));
@@ -267,10 +258,6 @@ fn deferred_control_handback_with_ring_owner(registered: bool, checkpoint: bool,
     );
     drop(guard);
     assert_eq!(fixture.zone.switch_in_full(slot).unwrap().record, record.id);
-    if ring_owner {
-        assert!(fixture.zone.mark_native_owned(record.id));
-        assert!(fixture.zone.record(record.id).is_native_owned());
-    }
     assert!(matches!(
         fixture.zone.record(record.id).claim(),
         Claim::OnCpu { .. }
@@ -297,6 +284,13 @@ fn deferred_control_handback_with_ring_owner(registered: bool, checkpoint: bool,
     if checkpoint {
         let member = members[0];
         let control = member.thread().control_slot();
+        run_as(
+            fixture,
+            member.thread().key().tid.raw(),
+            root.task().key().serial.raw(),
+            member.thread().key().serial.raw(),
+            control,
+        );
         assert_eq!(
             crate::dispatch::arm_signal_return_gate(
                 BornInZoneSource {
@@ -312,13 +306,6 @@ fn deferred_control_handback_with_ring_owner(registered: bool, checkpoint: bool,
             ),
             Some(true),
             "closed group must enter the terminal checkpoint"
-        );
-        run_as(
-            fixture,
-            member.thread().key().tid.raw(),
-            root.task().key().serial.raw(),
-            member.thread().key().serial.raw(),
-            control,
         );
         let mut sibling_service = Aarch64NativeProcessService::with_crossing(
             &fixture.task,

@@ -7122,15 +7122,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         };
         if !is_owner {
             drop(guard);
-            // Every caller that entered the closing group must detach its
-            // physical translation before its exact record can be retired.
-            self.service.vacate_terminal_space(self.source)?;
-            match carrick_core::terminal::settle_losing_zone_current(
+            // The host may still own this live member. Keep its installed
+            // translation until the neutral owner licenses exact release;
+            // then detach before the retirement receipt becomes visible.
+            match carrick_core::terminal::settle_losing_zone_current_before_release(
                 self.control,
                 self.binding,
                 self.source,
                 record,
-            )
+                || self.service.vacate_terminal_space(self.source),
+            )?
             .ok_or(NativeProcessError::Quarantined)?
             {
                 carrick_core::terminal::LosingMemberSettlement::HostCustody => {
