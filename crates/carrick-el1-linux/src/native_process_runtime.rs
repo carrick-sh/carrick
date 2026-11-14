@@ -6712,6 +6712,32 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.control.host_exit_requested() && self.pending_close_status().is_some()
     }
 
+    /// Settle `HostCustody` at an EL0 return checkpoint. A switched-in zone
+    /// record yields to its exact host owner. A host-loaded member with no
+    /// switched record is already its executor's: it returns to user, and
+    /// the host retires it at that executor's next host-work boundary. It
+    /// never claims its free home record for the ring.
+    pub(crate) fn user_return_host_custody(
+        &mut self,
+    ) -> carrick_personality_linux::dispatch::CompletionRoute {
+        use carrick_personality_linux::dispatch::CompletionRoute;
+        let lane = self.source.zone.slot(self.source.slot);
+        match lane.current() {
+            Some(current) if current == self.record.id => {
+                if self.yield_terminal_host_custody() {
+                    CompletionRoute::Suspended
+                } else {
+                    CompletionRoute::InvalidCompletion
+                }
+            }
+            None if lane.host_record() == Some(self.record.id) => {
+                self.current.linux.mark_pending_host_work();
+                CompletionRoute::Served
+            }
+            _ => CompletionRoute::InvalidCompletion,
+        }
+    }
+
     pub(crate) fn yield_terminal_host_custody(&mut self) -> bool {
         self.handoff = carrick_core::entry::yield_current_to_host(
             self.binding,

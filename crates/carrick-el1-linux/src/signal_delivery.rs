@@ -66,9 +66,7 @@ where
                 progress: carrick_core::Served::Idle,
                 ..
             } => CompletionRoute::Suspended,
-            LifecycleOutcome::HostCustody if process.yield_terminal_host_custody() => {
-                CompletionRoute::Suspended
-            }
+            LifecycleOutcome::HostCustody => process.user_return_host_custody(),
             _ => CompletionRoute::InvalidCompletion,
         });
     }
@@ -142,13 +140,7 @@ where
                 }
                 return if let policy::Delivery::Terminate { .. } = policy::default_delivery(sig) {
                     Some(match process.exit_with_signal(sig) {
-                        Ok(LifecycleOutcome::HostCustody) => {
-                            if process.yield_terminal_host_custody() {
-                                CompletionRoute::Suspended
-                            } else {
-                                CompletionRoute::InvalidCompletion
-                            }
-                        }
+                        Ok(LifecycleOutcome::HostCustody) => process.user_return_host_custody(),
                         Ok(_) => CompletionRoute::Suspended,
                         Err(NativeProcessError::GroupExitCustody) => {
                             machine.group_exit_custody(task)
@@ -375,13 +367,7 @@ where
     }
     if original == Signal::SEGV {
         return Some(match process.exit_with_signal(Signal::SEGV) {
-            Ok(LifecycleOutcome::HostCustody) => {
-                if process.yield_terminal_host_custody() {
-                    CompletionRoute::Suspended
-                } else {
-                    CompletionRoute::InvalidCompletion
-                }
-            }
+            Ok(LifecycleOutcome::HostCustody) => process.user_return_host_custody(),
             Ok(_) => CompletionRoute::Suspended,
             Err(NativeProcessError::GroupExitCustody) => machine.group_exit_custody(task),
             Err(_) => CompletionRoute::InvalidCompletion,
