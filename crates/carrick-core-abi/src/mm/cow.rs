@@ -144,6 +144,69 @@ impl CowGrantCompletion {
     }
 }
 
+/// Put one MM's unsettled completions in the order their moves happened, as
+/// far as settlement needs it: a completion that moved a page out of an
+/// earlier completion's replacement settles after it (fork, COW, fork, COW
+/// of the same page). Slot order alone settled the later move first and
+/// split out a replacement the earlier completion still had to name (#1801).
+/// Settlement validates every completion against the live graph, so an
+/// inconsistent batch still refuses rather than being reordered into one.
+pub fn order_cow_settlement(completions: &mut [CowGrantCompletion]) {
+    let moved_from = |later: &CowGrantCompletion, earlier: &CowGrantCompletion| {
+        later.old_ipa & !(COW_GRANT_SIZE - 1) == earlier.grant.physical_ipa
+            && later.span_va < earlier.span_va.saturating_add(earlier.span_len)
+            && earlier.span_va < later.span_va.saturating_add(later.span_len)
+    };
+    for settled in 0..completions.len() {
+        // The first remaining completion that moves nothing another remaining
+        // completion produced. A cycle is impossible for fresh grants; if a
+        // corrupt batch had one, keep slot order and let validation refuse.
+        let next = (settled..completions.len())
+            .find(|&candidate| {
+                !(settled..completions.len()).any(|other| {
+                    other != candidate && moved_from(&completions[candidate], &completions[other])
+                })
+            })
+            .unwrap_or(settled);
+        completions[settled..=next].rotate_right(1);
+    }
+}
+
+/// The output page `va` of `completion` must have in the live graph, given
+/// the completions that settle after it in the same batch: each one that
+/// moved the page again from the output so far carries it on.
+#[must_use]
+pub fn cow_settled_output(
+    completion: &CowGrantCompletion,
+    later: &[CowGrantCompletion],
+    va: u64,
+) -> u64 {
+    let mut output = completion.new_ipa + (va - completion.span_va);
+    for next in later {
+        if (next.span_va..next.span_va.saturating_add(next.span_len)).contains(&va)
+            && next.old_ipa + (va - next.span_va) == output
+        {
+            output = next.new_ipa + (va - next.span_va);
+        }
+    }
+    output
+}
+
+/// Whether a completion that settles later in the batch still moves pages
+/// out of `completion`'s old compound, so settling `completion` must keep
+/// that compound's inventory for it (#1801: two runs of one compound in one
+/// batch left the second with "no exact inventory coverage").
+#[must_use]
+pub fn cow_old_compound_still_named(
+    completion: &CowGrantCompletion,
+    later: &[CowGrantCompletion],
+) -> bool {
+    let compound = completion.old_ipa & !(COW_GRANT_SIZE - 1);
+    later
+        .iter()
+        .any(|next| next.old_ipa & !(COW_GRANT_SIZE - 1) == compound)
+}
+
 /// Why EL1 left a COW write fault to the host. Indexes
 /// the grant venue's decline counters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +254,72 @@ pub trait CowGrantVenue {
 /// The adapter owns the exclusive lease and its execution-lane affinity.
 pub trait ServiceCopyWindowLease {
     fn base(&self) -> u64;
+}
+
+#[cfg(test)]
+mod settlement_order_tests {
+    use super::*;
+    use core::num::NonZeroU64;
+
+    fn completion(
+        slot: usize,
+        grant: u64,
+        span: (u64, u64),
+        old: u64,
+        new: u64,
+    ) -> CowGrantCompletion {
+        let one = NonZeroU64::MIN;
+        CowGrantCompletion {
+            purpose: CowGrantPurpose::UserWrite,
+            grant: CowGrant {
+                slot,
+                epoch: 8,
+                mm_key: 7,
+                physical_ipa: grant,
+                backing: BackingIdentity {
+                    frame_id: one,
+                    mapping_id: one,
+                    owner_generation: one,
+                    inventory_revision: one,
+                },
+                tables: CowSplitTables::NONE,
+            },
+            span_va: span.0,
+            span_len: span.1,
+            old_ipa: old,
+            new_ipa: new,
+            tables_linked: 0,
+        }
+    }
+
+    /// #1801, the sidecar shape: fork, COW, fork, COW of the same granule
+    /// in one settlement batch. The second move is in a lower slot; it must
+    /// settle after the first, and the first validates through it.
+    #[test]
+    fn a_repeated_move_settles_after_the_move_it_continues() {
+        let first = completion(9, 0x8_0000, (0x40_0000, 0x4000), 0x1_0000, 0x8_0000);
+        let second = completion(2, 0x9_0000, (0x40_0000, 0x4000), 0x8_0000, 0x9_0000);
+        let mut batch = [second, first];
+        order_cow_settlement(&mut batch);
+        assert_eq!(batch, [first, second]);
+        assert_eq!(cow_settled_output(&first, &batch[1..], 0x40_1000), 0x9_1000);
+        assert_eq!(cow_settled_output(&second, &[], 0x40_1000), 0x9_1000);
+        assert!(!cow_old_compound_still_named(&first, &batch[1..]));
+    }
+
+    /// #1801, the CPython shape: two runs of one old compound complete in
+    /// one batch. The first must keep the compound for the second.
+    #[test]
+    fn two_runs_of_one_compound_keep_it_until_the_last_settles() {
+        let lower = completion(3, 0x8_0000, (0x40_0000, 0x1000), 0x1_0000, 0x8_0000);
+        let upper = completion(1, 0x9_0000, (0x40_2000, 0x2000), 0x1_2000, 0x9_2000);
+        let mut batch = [upper, lower];
+        order_cow_settlement(&mut batch);
+        assert_eq!(batch, [upper, lower], "independent moves keep slot order");
+        assert!(cow_old_compound_still_named(&upper, &batch[1..]));
+        assert!(!cow_old_compound_still_named(&lower, &[]));
+        assert_eq!(cow_settled_output(&upper, &batch[1..], 0x40_3000), 0x9_3000);
+    }
 }
 
 // Literal wire layout captured from 3fd7862be on a 64-bit host.

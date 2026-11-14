@@ -384,7 +384,8 @@ mod guest_cow;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use guest_cow::CarrierGuestCowSettlement;
 pub(crate) use guest_cow::{
-    allocate_grant_compound, allocate_grant_extent, refill_guest_cow_pool, settle_cow_completions,
+    allocate_grant_compound, allocate_grant_extent, guest_cow_fault_split, refill_guest_cow_pool,
+    settle_cow_completions,
 };
 mod memory_protection;
 pub(crate) use self::memory_protection::*;

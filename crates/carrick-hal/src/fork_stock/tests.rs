@@ -401,6 +401,105 @@ fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
     assert_eq!(stock.table_stock().len(), 40);
 }
 
+/// #2276: a live child's COW grant carries split tables from fork stock.
+/// Settlement keeps exactly the prefix its repoint linked as child table
+/// custody and returns the rest once; an unpublished grant returns all of
+/// them; a child that retires with a published grant absorbs its tables as
+/// possibly linked, and reclaim clears them before they are reused.
+#[test]
+fn native_cow_split_tables_settle_their_linked_prefix_exactly_once() {
+    use carrick_el1_abi::{CowGrant, CowGrantCompletion, CowGrantPurpose, CowSplitTables};
+
+    let mut stock = stock(UntaggedRoots, 40, 2);
+    let first = loan(&mut stock, parent(), 312, 1, 1).unwrap();
+    commit(&mut stock, parent(), first, 1, 0).unwrap();
+    let child = child_of(first, 46);
+    let owner = stock.child_owner(first.request.child_mm).unwrap();
+    let before = stock.table_stock().len();
+    let tables = stock
+        .reserve_native_cow_split_tables(&mut NoTableLedger, owner, child.context.root, 0x8_0000, 2)
+        .unwrap();
+    assert_eq!(tables.len(), 2);
+    assert_eq!(stock.table_stock().len(), before - 2);
+    assert_eq!(
+        stock.reserve_native_cow_split_tables(
+            &mut NoTableLedger,
+            owner,
+            child.context.root,
+            0x8_0000,
+            1
+        ),
+        Err(ForkStockServiceError::InvalidRecord),
+        "one grant carries one reservation"
+    );
+    assert_eq!(stock.table_stock().len(), before - 2);
+    let one = NonZeroU64::MIN;
+    let completion = CowGrantCompletion {
+        purpose: CowGrantPurpose::UserWrite,
+        grant: CowGrant {
+            slot: 0,
+            epoch: 8,
+            mm_key: first.request.child_mm.raw(),
+            physical_ipa: 0x8_0000,
+            backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                frame_id: one,
+                mapping_id: one,
+                owner_generation: one,
+                inventory_revision: one,
+            },
+            tables,
+        },
+        span_va: 0x40_0000,
+        span_len: 0x4000,
+        old_ipa: 0x1_0000,
+        new_ipa: 0x8_0000,
+        tables_linked: 1,
+    };
+    stock
+        .settle_native_cow_split_tables(&mut NoTableLedger, owner, &completion)
+        .unwrap();
+    assert_eq!(
+        stock.table_stock().len(),
+        before - 1,
+        "the unlinked table returns"
+    );
+    assert_eq!(
+        stock.settle_native_cow_split_tables(&mut NoTableLedger, owner, &completion),
+        Err(ForkStockServiceError::InvalidRecord),
+        "settled exactly once"
+    );
+    stock
+        .reserve_native_cow_split_tables(&mut NoTableLedger, owner, child.context.root, 0x9_0000, 1)
+        .unwrap();
+    stock
+        .cancel_native_cow_split_tables(&mut NoTableLedger, owner, 0x9_0000)
+        .unwrap();
+    assert_eq!(
+        stock.table_stock().len(),
+        before - 1,
+        "an unpublished grant returns all"
+    );
+    let published = stock
+        .reserve_native_cow_split_tables(&mut NoTableLedger, owner, child.context.root, 0xa_0000, 1)
+        .unwrap();
+    assert_eq!(
+        published,
+        CowSplitTables::new(published.as_slice()).unwrap()
+    );
+    retire(&mut stock, child).unwrap();
+    assert!(stock.pending_cow_tables.is_empty());
+    let clear = RefCell::new(Vec::new());
+    assert_eq!(reclaim(&mut stock, |_| true, &clear), 1);
+    assert!(
+        published
+            .as_slice()
+            .iter()
+            .all(|table| clear.borrow().contains(&page(*table))),
+        "a possibly linked split table is cleared before reuse"
+    );
+    assert_eq!(stock.table_stock().len(), 40);
+}
+
 #[test]
 fn exec_replacement_rejects_stale_predecessor_incarnation() {
     let mut stock = stock(UntaggedRoots, 4, 1);
