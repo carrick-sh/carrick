@@ -1034,7 +1034,7 @@ impl OperandSpec {
             | C::ClockGetres
             | C::ClockNanosleep
             | C::Times
-            | C::ClockGettime
+            | C::Gettimeofday
             | C::Getrandom
             | C::InotifyInit1
             | C::TimerfdCreate
@@ -1193,6 +1193,7 @@ impl OperandSpec {
             | C::Recvmmsg
             | C::Sendmmsg
             | C::Nanosleep
+            | C::ClockGettime
             | C::ClockGetres
             | C::ClockNanosleep
             | C::Times
