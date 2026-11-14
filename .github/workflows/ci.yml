@@ -903,8 +903,10 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
+      # The PR head itself, not the merge ref: the list names the head (test-list refuses any other checkout).
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
       - uses: ./.github/actions/install-tools
         with:
@@ -1573,7 +1575,9 @@ jobs:
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         env:
           HEAD: ${{ github.event.pull_request.head.sha }}
-        run: just lease carrick just xtask test-list --head "$HEAD" --isa arm --recipe test-shard-a --lane signed-hvf --lane signed-cli --out "target/test-list-arm-a.json"
+        # The job tested the merge ref; the list names the PR head, so the script checks that commit out
+        # (the tests above have finished) and test-list refuses any other checkout.
+        run: just lease carrick scripts/ci/test-list-at-head.sh --isa arm --recipe test-shard-a --lane signed-hvf --lane signed-cli --out "target/test-list-arm-a.json"
       - name: Upload the test list
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         uses: actions/upload-artifact@v4
@@ -1670,7 +1674,9 @@ jobs:
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         env:
           HEAD: ${{ github.event.pull_request.head.sha }}
-        run: just lease carrick just xtask test-list --head "$HEAD" --isa arm --recipe test-shard-b --out "target/test-list-arm-b.json"
+        # The job tested the merge ref; the list names the PR head, so the script checks that commit out
+        # (the tests above have finished) and test-list refuses any other checkout.
+        run: just lease carrick scripts/ci/test-list-at-head.sh --isa arm --recipe test-shard-b --out "target/test-list-arm-b.json"
       - name: Upload the test list
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         uses: actions/upload-artifact@v4
