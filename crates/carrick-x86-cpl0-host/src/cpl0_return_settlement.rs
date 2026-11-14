@@ -667,6 +667,23 @@ impl OwedReturnHolderHold {
     }
 }
 
+/// Hold every live slot's lock, as a scheduler on another CPU holds one.
+/// Bounded: a guest holder keeps a slot lock only briefly.
+#[cfg(feature = "test-support")]
+fn hold_live_slots(
+    zone: &X86Cpl0Zone,
+) -> Result<Vec<carrick_sched_core::SlotGuard<'_, carrick_sched_core::ParkedContextWords>>, TrapError>
+{
+    (0..carrick_sched_core::ZONE_SLOTS)
+        .map(|index| carrick_sched_core::SlotId::new(index as u8))
+        .filter(|&slot| zone.slot(slot).is_live())
+        .map(|slot| {
+            zone.slot_lock(slot, &carrick_sched_core::BoundedSpin(1 << 24))
+                .ok_or_else(|| fail("fixture slot lock"))
+        })
+        .collect()
+}
+
 /// The releasing side of an [`OwedReturnHolderHold`], for a host fixture
 /// thread: it reads the held holders' `Editor` queues and releases.
 #[cfg(feature = "test-support")]
@@ -713,6 +730,33 @@ impl<M: CarrierMemoryIo> OwedReturnHolderRelease<M> {
     /// revision advances, as a ring editor's release does). Returns how
     /// many were released.
     pub fn release(&self) -> Result<usize, TrapError> {
+        self.release_by(Waker::Host, false)
+    }
+
+    /// [`Self::release`] while every live slot's lock is held across
+    /// the queue drain, as another CPU's scheduler holds one: the drain's
+    /// one-shot placement finds no slot, so each waiter is handed back to
+    /// the release's host delivery (#2337's host-boundary wake). The locks
+    /// are dropped before that delivery runs.
+    pub fn release_with_slots_contended(&self) -> Result<usize, TrapError> {
+        self.release_by(Waker::Host, true)
+    }
+
+    /// [`Self::release`], with the queue's notification naming EL1 on
+    /// `slot` as its publisher: the waker word a host drain delivers when
+    /// it drains a release that slot's EL1 published (#2337). Its woken
+    /// records are queued on that slot, the own-slot wake effects a host
+    /// delivery must hand to the slot's executor.
+    pub fn release_published_by_slot(&self, slot: u8) -> Result<usize, TrapError> {
+        self.release_by(
+            Waker::El1 {
+                slot: carrick_sched_core::SlotId::new(slot),
+            },
+            false,
+        )
+    }
+
+    fn release_by(&self, waker: Waker, contend_slots: bool) -> Result<usize, TrapError> {
         let zone = retained_cow_zone(&self.ram)?;
         let held = {
             let mut state = self
@@ -724,6 +768,11 @@ impl<M: CarrierMemoryIo> OwedReturnHolderRelease<M> {
             state.held.clone()
         };
         for &(index, mm) in &held {
+            let contended = std::cell::RefCell::new(if contend_slots {
+                hold_live_slots(zone)?
+            } else {
+                Vec::new()
+            });
             if !zone
                 .spaces
                 .fixture_release_editor(index, FIXTURE_HOLDER_EDITOR)
@@ -745,10 +794,13 @@ impl<M: CarrierMemoryIo> OwedReturnHolderRelease<M> {
                             owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
                 '_,
                 carrick_sched_core::ParkedContextWords,
-            >| wake.deliver(zone, waker, owned);
+            >| {
+                contended.borrow_mut().clear();
+                wake.deliver(zone, waker, owned)
+            };
             SpaceReleaseVenue {
                 zone,
-                waker: Waker::Host,
+                waker,
                 deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
                     &delivery,
                 ),

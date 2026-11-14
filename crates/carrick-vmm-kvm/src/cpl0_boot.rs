@@ -355,6 +355,16 @@ impl FixtureOwedReturnHolderHold {
     pub fn release(&self) -> Result<usize, TrapError> {
         self.release.release()
     }
+    /// [`Self::release`], delivering it as a release EL1 on `slot`
+    /// published: its waiters queue on that slot's own run queue (#2337).
+    pub fn release_published_by_slot(&self, slot: u8) -> Result<usize, TrapError> {
+        self.release.release_published_by_slot(slot)
+    }
+    /// [`Self::release`] with every live slot's lock held across
+    /// the queue drain: its waiters are handed back to the host (#2337).
+    pub fn release_with_slots_contended(&self) -> Result<usize, TrapError> {
+        self.release.release_with_slots_contended()
+    }
 }
 
 impl Cpl0Carrier {

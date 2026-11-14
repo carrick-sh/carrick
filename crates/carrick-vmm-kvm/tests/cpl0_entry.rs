@@ -4341,20 +4341,51 @@ fn production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation() {
     assert_eq!(outcome.run.terminating_signal, None);
 }
 
+/// How a fault-crossing witness's held editor is released.
+#[derive(Clone, Copy)]
+enum HeldEditorRelease {
+    /// By the fixture thread, through the carrier's host wake.
+    Host,
+    /// By the fixture thread, with every CPU's slot lock held across the
+    /// queue drain: the waiters are handed back to the host delivery.
+    SlotsContended,
+    /// By the fixture thread, delivering a release EL1 on slot 0 published:
+    /// the woken records queue on slot 0 (#2337's own-slot wake).
+    PublishedBySlot0,
+}
+
 /// Exercise the real exclusion, then release its editor only after a real
 /// Editor wait is enrolled. Reuse #2250's editor hold/release fixture.
 fn owner_crossing_busy_witness(
     crossing: carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing,
 ) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    owner_crossing_busy_witness_on(
+        crossing,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        HeldEditorRelease::Host,
+    )
+}
+
+fn owner_crossing_busy_witness_on(
+    crossing: carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing,
+    affinity: u64,
+    how: HeldEditorRelease,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let elf = kvm_pool_fixture::assemble_fixture("native_concurrent_cow_faults.S", &[]);
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = kvm_pool_fixture::try_run_pool_fixture_with(&elf, 128, |carrier| {
-            held_tx
-                .send(carrier.fixture_hold_fault_editor(crossing))
-                .unwrap();
-        })
+        let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+        let result = kvm_pool_fixture::try_run_program_with_root_affinity(
+            &program,
+            128,
+            affinity,
+            |carrier| {
+                held_tx
+                    .send(carrier.fixture_hold_fault_editor(crossing))
+                    .unwrap();
+            },
+        )
         .map_err(|error| error.to_string());
         tx.send(result).unwrap();
     });
@@ -4382,14 +4413,21 @@ fn owner_crossing_busy_witness(
         }
         std::thread::yield_now();
     };
-    let released = hold.release();
+    let released = match how {
+        HeldEditorRelease::Host => hold.release(),
+        HeldEditorRelease::SlotsContended => hold.release_with_slots_contended(),
+        HeldEditorRelease::PublishedBySlot0 => hold.release_published_by_slot(0),
+    };
+    // A failed delivery drops its waiters: report it, not the lost wake.
+    if early_result.is_none() {
+        assert_eq!(released.expect("publish exact Editor release"), 1);
+    }
     let result = early_result.unwrap_or_else(|| rx.recv_timeout(bound).expect("fault resumed"));
     assert!(
         enrolled,
         "Busy must enroll before release: {:?}",
         result.as_ref().err()
     );
-    assert_eq!(released.expect("publish exact Editor release"), 1);
     let outcome = result.expect("Busy is not a fatal carrier fault");
     assert_eq!(outcome.run.exit_code, 7, "{:?}", outcome.run);
     assert_eq!(outcome.run.terminating_signal, None);
@@ -4428,6 +4466,37 @@ fn production_cow_settlement_exclusion_busy_once_then_success() {
 fn production_prepare_planning_exclusion_busy_once_then_success() {
     owner_crossing_busy_witness(
         carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::PreparePlanning,
+    );
+}
+
+/// #2337: a host release can deliver a release EL1 published (the queue's
+/// notification names an EL1 slot's waker). With every member on CPU 0, the
+/// fork child's first COW write parks on the held editor and slot 0 idles;
+/// slot 0's EL1 is the release's waker, so the waiter is queued on slot 0's
+/// own run queue. The
+/// host delivery must kick slot 0 so the waiters rerun their writes, never
+/// fail the release (`host COW release produced guest-own wake effects`).
+#[test]
+fn production_host_release_delivers_an_own_slot_wake() {
+    owner_crossing_busy_witness_on(
+        carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::CowSupply,
+        ROOT_AFFINITY_CPU0,
+        HeldEditorRelease::PublishedBySlot0,
+    );
+}
+
+/// #2337: a host release whose queue drain finds every CPU's slot lock
+/// held (another CPU's scheduler holds one) cannot place its waiter in the
+/// guest, so it hands the waiter back to the release's host delivery (a
+/// host-boundary wake). The carrier must place it on an execution owner and
+/// rerun its write, never fail the release (`native COW release produced
+/// unsupported host-home completion custody`).
+#[test]
+fn production_host_release_hands_back_a_waiter_it_could_not_place() {
+    owner_crossing_busy_witness_on(
+        carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::CowSupply,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        HeldEditorRelease::SlotsContended,
     );
 }
 
