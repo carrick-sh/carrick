@@ -3740,12 +3740,10 @@ fn fork_reservation_refusal_from_concurrent_munmap_rolls_back_without_quarantine
         .enter(source, &fixture.task, parked, &mut service)
         .unwrap();
     let refused = entry.fork(ProcessForkChildTid::NONE);
-    assert!(
-        matches!(
-            refused,
-            LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::Busy.errno()
-        ),
-        "munmap-during-fork reservation refusal must roll back to a counted EAGAIN failure"
+    assert_eq!(
+        super::native_process_runtime::host_test_support::outcome_kind(&refused),
+        "Transferred",
+        "a munmap-during-fork inventory refusal rolls back and retains the fork, never EAGAIN"
     );
     assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
     assert_eq!(crossing.settlements_reserved.load(Ordering::Acquire), 1);

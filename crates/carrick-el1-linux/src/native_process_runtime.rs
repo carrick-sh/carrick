@@ -11593,26 +11593,46 @@ mod tests {
             assert!(zone.requeue_preempted(slot, parent_record).is_queued());
             activate(&runtime, source, &task, child_key);
             let child_words = runtime.task_binding(child_key).unwrap().words;
+            let contended = child_copy_error == Some(NativeProcessError::Busy);
             let mut child = runtime
                 .enter(source, &task, child_words, &mut service)
                 .unwrap();
+            if contended {
+                // Busy once is "not now" (#2306): the child, which has run no
+                // EL0 instruction, keeps its pending store and leaves through
+                // its owner checkpoint instead of dropping CLONE_CHILD_SETTID.
+                assert!(matches!(
+                    child.resume_checkpoint(|_| Ok(None)),
+                    Ok(NativeResume::Left(None))
+                ));
+                assert_eq!(child.service.tid_words[&(child_mm, tid_va.raw())], 0xaaaa);
+                assert!(child.service.tid_writes.is_empty());
+                child.service.child_copy_error = None;
+                drop(child);
+                // The parent was queued first; run it, then reselect the child.
+                assert_eq!(zone.switch_in_full(slot).unwrap().record, parent_record);
+                assert!(zone.requeue_preempted(slot, parent_record).is_queued());
+                activate(&runtime, source, &task, child_key);
+                let child_record = runtime.task_binding(child_key).unwrap().record;
+                // SAFETY: the child's record was selected just above.
+                let child_words = unsafe { runtime.record_binding(child_record) }
+                    .unwrap()
+                    .words;
+                child = runtime
+                    .enter(source, &task, child_words, &mut service)
+                    .unwrap();
+            }
             assert!(matches!(
                 child.resume_checkpoint(|_| Ok(None)),
                 Ok(NativeResume::NoPending)
             ));
+            let stored = child_copy_error.is_none() || contended;
             assert_eq!(child.service.tid_words[&(1, tid_va.raw())], 0xaaaa);
             assert_eq!(
                 child.service.tid_words[&(child_mm, tid_va.raw())],
-                if child_copy_error.is_some() {
-                    0xaaaa
-                } else {
-                    42
-                }
+                if stored { 42 } else { 0xaaaa }
             );
-            assert_eq!(
-                child.service.tid_writes.len(),
-                usize::from(child_copy_error.is_none())
-            );
+            assert_eq!(child.service.tid_writes.len(), usize::from(stored));
             child.service.child_copy_error = None;
             assert_eq!(child.control.clear_child_tid(), tid_va.raw());
             // The exit's shared wake releases a shared-private join waiter.
@@ -11649,10 +11669,54 @@ mod tests {
                 zone.record(waiter).claim(),
                 carrick_sched_core::Claim::Parked { .. }
             ));
-            assert!(matches!(
-                child.exit_group(0),
-                LifecycleOutcome::Transferred { .. }
-            ));
+            if contended {
+                // The exit's CLONE_CHILD_CLEARTID store meets Busy once too.
+                // "Not now" (#2306): the close custody and the pending tid
+                // stay retained, nothing is woken, and the exit reruns from
+                // its owner checkpoint instead of dropping the store.
+                child.service.child_copy_error = Some(NativeProcessError::Busy);
+                child.service.child_copy_error_at = Some(tid_va.raw());
+                assert!(matches!(
+                    child.exit_group(0),
+                    LifecycleOutcome::Transferred { .. }
+                ));
+                assert!(child.take_run_failure().is_none());
+                assert_eq!(child.service.tid_words[&(child_mm, tid_va.raw())], 42);
+                assert_eq!(child.service.tid_wakes, 0);
+                assert_eq!(child.control.clear_child_tid(), tid_va.raw());
+                assert!(runtime.graph.lock().pending.has_exit(&child_key));
+                assert!(matches!(
+                    zone.record(waiter).claim(),
+                    carrick_sched_core::Claim::Parked { .. }
+                ));
+                child.service.child_copy_error = None;
+                child.service.child_copy_error_at = None;
+                drop(child);
+                let child_record = runtime.task_binding(child_key).unwrap().record;
+                loop {
+                    let selected = zone.switch_in_full(slot).unwrap().record;
+                    if selected == child_record.id {
+                        break;
+                    }
+                    assert!(zone.requeue_preempted(slot, selected).is_queued());
+                }
+                // SAFETY: the child's record was selected just above.
+                let child_words = unsafe { runtime.record_binding(child_record) }
+                    .unwrap()
+                    .words;
+                child = runtime
+                    .enter(source, &task, child_words, &mut service)
+                    .unwrap();
+                assert!(matches!(
+                    child.resume_checkpoint(|_| Ok(None)),
+                    Ok(NativeResume::Left(None))
+                ));
+            } else {
+                assert!(matches!(
+                    child.exit_group(0),
+                    LifecycleOutcome::Transferred { .. }
+                ));
+            }
             assert_eq!(child.service.tid_words[&(child_mm, tid_va.raw())], 0);
             assert_eq!(
                 child.service.tid_writes.last(),
@@ -18314,10 +18378,11 @@ mod tests {
         // 3. Injected failure at commit_mm
         entry.service.fail_commit = true;
         let outcome5 = entry.fork(ProcessForkChildTid::NONE);
-        assert!(matches!(
-            outcome5,
-            LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::Busy.errno()
-        ));
+        assert_eq!(
+            super::host_test_support::outcome_kind(&outcome5),
+            "Transferred",
+            "a Busy commit rolls back and retains the fork, never EAGAIN"
+        );
         assert_eq!(entry.service.abort_count, 3);
         assert!(!entry.service.loan_in_flight);
         entry.service.fail_commit = false;
