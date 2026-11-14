@@ -996,8 +996,8 @@ pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
         &self,
         _context: &crate::kernel::KernelContext,
         _path: &str,
-    ) -> bool {
-        false
+    ) -> Result<bool, super::mem::ObservationBusy> {
+        Ok(false)
     }
     fn complete_wait_fd_authority(
         &self,
@@ -1142,7 +1142,7 @@ impl FsCrossSubsystem for SyscallDispatcher {
         &self,
         context: &crate::kernel::KernelContext,
         path: &str,
-    ) -> bool {
+    ) -> Result<bool, super::mem::ObservationBusy> {
         self.is_synthetic_virtual_path(context, path)
     }
     fn complete_wait_fd_authority(

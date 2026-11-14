@@ -9317,7 +9317,7 @@ fn synthetic_proc_snapshot_and_in_process_fork_do_not_deadlock() {
                 .expect("announce completed process snapshot");
             resume.recv().expect("resume MM snapshot");
         });
-        assert_eq!(proc.task_comm, "exe");
+        assert_eq!(proc.unwrap().task_comm, "exe");
     });
 
     let mut proc_acquirer = None;
