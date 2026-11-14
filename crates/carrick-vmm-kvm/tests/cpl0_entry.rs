@@ -1203,6 +1203,93 @@ fn production_user_fault_editor_busy_once_parks_and_reruns() {
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }
 
+/// #2263 review P0: a syscall's staged user copy meets the MM editor held by
+/// another owner. `write(1, buf, 16)` gathers from a fresh, never-touched
+/// page, so staging asks the owner fault path to supply it while the editor
+/// is held. Contention is "not now": the call parks on the editor's release
+/// once and reruns whole, writing all 16 bytes. It is never EFAULT or a
+/// short write. A wrong result exits with the write's own return value.
+#[test]
+fn production_staged_copy_editor_busy_once_parks_and_reruns() {
+    const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
+    const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    // mmap(NULL, two pages, PROT_NONE, PRIVATE|ANONYMOUS, -1, 0), retain in r12.
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x2000),
+        (&[0x48, 0xba], 0),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0x89, 0xc4]); // mov r12,rax
+    // mmap(r12, one page, RW, FIXED|PRIVATE|ANONYMOUS, -1, 0) == r12.
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi,r12
+    for (register, value) in [
+        (&[0x48, 0xbe][..], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x32),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x4c, 0x39, 0xe0, 0x0f, 0x85]); // cmp rax,r12; jne
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_EDITOR_BUSY_ONCE);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+    // write(1, r12, 16): the gather's first read meets the held editor.
+    append_mov(&mut code, &[0x48, 0xbf], 1);
+    code.extend_from_slice(&[0x4c, 0x89, 0xe6]); // mov rsi,r12
+    append_mov(&mut code, &[0x48, 0xba], 16);
+    append_mov(&mut code, &[0x48, 0xb8], 1);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    // cmp rax,16; je over the exit(rax) below.
+    let mut wrong = vec![0x48, 0x89, 0xc7]; // mov rdi,rax
+    append_mov(&mut wrong, &[0x48, 0xb8], 231);
+    wrong.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    code.extend_from_slice(&[0x48, 0x83, 0xf8, 0x10, 0x74, wrong.len() as u8]);
+    code.extend_from_slice(&wrong);
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 1);
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+
+    let outcome = try_run_instrumented_pool_fixture(&production_probe_elf(&code), 32)
+        .unwrap_or_else(|failure| panic!("a held editor refused the staged copy: {failure}"));
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "the write must rerun whole after one editor park (EFAULT exits 242, a \
+         short write its count): {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
 /// The root and every member it forks or clones may run only on CPU 0.
 const ROOT_AFFINITY_CPU0: u64 = 1;
 
