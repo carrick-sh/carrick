@@ -206,13 +206,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
                     .run_failed(carrick_core_abi::NativeRunFailureReason::NativeStale),
             );
         }
-        if self
-            .entry
-            .runtime
-            .registry
-            .lock()
-            .is_some_and(|registry| registry.futex_interrupt_pending(zone, self.entry.record))
-        {
+        if self.entry.runtime.registry.lock().is_some_and(|registry| {
+            registry.futex_interrupt_pending(zone, self.entry.record, self.entry.binding)
+        }) {
             zone.withdraw_guest_park(&guard, record);
             return Some(returned(carrick_syscall_abi::LINUX_EINTR.guest_retval()));
         }
