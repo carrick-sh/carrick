@@ -583,6 +583,188 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
     scheduler.close();
 }
 
+/// A registered host-cloned sibling computing on its own executor has no
+/// switched zone record: its home record is free and host-loaded. Returning
+/// to user after the leader's `exit_group(5)`, it must not claim that free
+/// record for the ring. It returns, the host's control kick forwards it at
+/// the next IRQ, and the host retires the exact thread.
+#[test]
+fn serial_host_arm_group_close_entryless_host_loaded_member_leaves_through_host() {
+    let (kernel, root) = bootstrap(41);
+    let root = Box::leak(Box::new(root));
+    root.thread().set_affinity(carrick_hal::CpuAffinity::all(2));
+    let page = Box::leak(Box::new(root.lifecycle_page()));
+    let page = &**page;
+    let fixture = Box::leak(Box::new(Fixture::with_identity(
+        0x10000,
+        asid(1),
+        page,
+        root.thread().control_slot(),
+        ThreadIdentity {
+            tid: root.thread().key().tid.raw() as u64,
+            serial: root.thread().key().serial.raw(),
+            mm: root.shared().mm().id().raw(),
+            file_table: root.resources().files().id().raw(),
+            generation: root.task().key().serial.raw(),
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 3,
+            lifecycle_page: page as *const _ as u64,
+            control_slot: root.thread().control_slot() as *const _ as u64,
+        },
+    )));
+    let mut root_service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut root_service,
+            |_| (),
+        )
+        .unwrap();
+    let member = clone_thread(root, 42);
+    let control = member.thread().control_slot();
+    assert!(control.publish_visible_tid(member.thread().key().tid.raw() as u32));
+    assert_eq!(control.entry(), None, "host clone control");
+    let slot = SlotId::new(1);
+    fixture.zone.drive(slot, 2);
+    fixture
+        .zone
+        .publish_slot(slot, fixture.leader.mm, Some(1), 3);
+    fixture.zone.enter_guest(slot);
+    fixture.zone.install_space(slot, fixture.leader.mm).unwrap();
+    let as_member = || {
+        run_as(
+            fixture,
+            member.thread().key().tid.raw(),
+            root.task().key().serial.raw(),
+            member.thread().key().serial.raw(),
+            control,
+        )
+    };
+    as_member();
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    // Its first native entry admits it as a signal owner; it keeps running
+    // host-loaded with no zone record switched in on its slot.
+    fixture
+        .enter(control, fixture_ttbr0(fixture), &mut service, |_| ())
+        .unwrap();
+    assert!(control.native_signal_owner());
+    assert_eq!(fixture.zone.slot(slot).current(), None);
+    let scheduler = Arc::new(Scheduler::new(kernel.clone()));
+    let executor = scheduler
+        .register_executor(Arc::new(Kick::default()))
+        .unwrap();
+    publish(member, 0x700);
+    scheduler.make_runnable(member.thread().key()).unwrap();
+    let running = scheduler.try_take(&executor).unwrap().unwrap();
+
+    run_as_leader(fixture);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 5;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut root_service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert!(control.host_exit_requested());
+    assert_eq!(fixture.zone.slot(slot).current(), None);
+
+    as_member();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot,
+    };
+    let gate =
+        crate::dispatch::arm_signal_return_gate(source, &fixture.task, page, control, 0, 0, true);
+    let mut return_frame = carrick_el1_abi::TrapFrame::default();
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let action = crate::dispatch::arm_signal_user_return_entry(
+        source,
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        page,
+        control,
+        &mut service,
+        |process| {
+            crate::signal_delivery::deliver_signal_on_syscall_return(
+                &fixture.task,
+                control,
+                process,
+                &mut return_frame,
+                zerocopy::IntoBytes::as_bytes(&fp),
+                &mut ArmWaitSignalMachine {
+                    user_sp: UserVa::new(0),
+                    backend: ArmWaitSignalBackend,
+                },
+            )
+        },
+    )
+    .unwrap_or_else(|error| panic!("closing member user return refused: {error:?}"));
+    assert_eq!(gate, None, "no switched record for the ring to yield");
+    assert_eq!(action, carrick_el1_abi::Action::Served);
+    assert_eq!(fixture.zone.slot(slot).current(), None);
+
+    // The host wake batch kicks the executor running this exact thread. Its
+    // control quantum survives until that executor next settles it.
+    carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+        scheduler.wake_control(member.thread().key()).unwrap();
+    });
+    let mut cpu = crate::sched::FakeCpu::default();
+    cpu.pending.push_back(carrick_el1_abi::GIC_KICK_INTID);
+    let counters = carrick_el1_abi::Counters::new();
+    let mut irq = carrick_el1_abi::TrapFrame {
+        elr: 0x401000,
+        slot: u64::from(slot.raw()),
+        ..Default::default()
+    };
+    assert_eq!(
+        (crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .interrupt(&mut irq, 0),
+        carrick_el1_abi::Action::Forward,
+        "the kick leaves through the host with the member loaded"
+    );
+    // The executor retires the exact thread on the host and publishes its
+    // receipt, as the runtime's exit path does.
+    fixture.zone.leave_guest(slot, &ShortLockSpin);
+    kernel.exit_thread(member, None).unwrap();
+    let birth =
+        carrick_kernel::kernel::host_birth_identity(member.task().key(), member.thread().key())
+            .unwrap();
+    page.publish_exact_host_retirement(control, birth.retirement());
+    scheduler.settle_exited(running).unwrap();
+    assert!(!member.exact_thread_is_live());
+    assert_eq!(carrick_el1_abi::Lifecycle::live(page), 0);
+    assert!(matches!(
+        wake_closing_root(fixture, &mut root_service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(root_service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(
+        root_service
+            .crossing
+            .root_exit_status
+            .load(Ordering::Acquire),
+        5
+    );
+    scheduler.close();
+}
+
 #[test]
 fn serial_host_adopted_fault_checkpoint_transfers_terminal_custody() {
     use crate::native_process_runtime::NativeResume;
