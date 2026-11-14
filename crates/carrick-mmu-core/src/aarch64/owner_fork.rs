@@ -179,6 +179,7 @@ impl OwnerForkMmu for Aarch64Mmu {
     }
 
     fn arm_private(word: u64, level: usize, va: UserVa) -> Result<u64, OwnerMmuRefusal> {
+        let word = crate::aarch64::adopt_host_block_as_el1_private(word, level);
         crate::aarch64::terminal_rule_edit(
             true,
             crate::aarch64::TerminalRule::fork_arm(true),
@@ -188,6 +189,13 @@ impl OwnerForkMmu for Aarch64Mmu {
         )
         .map(|changed| changed.unwrap_or(word))
         .map_err(|_| OwnerMmuRefusal::Unreachable)
+    }
+
+    fn split_table_word(output: FrameGpa, _leaf: u64) -> u64 {
+        // The descriptor executor's own split link: no APTable, XNTable or
+        // PXNTable restriction. The leaf's upper bits (software tags, PBHA)
+        // mean something else in a table descriptor.
+        (output.raw() & Self::ADDRESS_MASK) | 3
     }
 
     fn needs_break_before_make(before: u64, after: u64, level: usize) -> bool {
