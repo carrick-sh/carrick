@@ -1602,6 +1602,21 @@ fn arm_vfork_live_child_keeps_sibling_clock_copyout_writable() {
         "the sibling must run while the vfork caller and child remain live"
     );
 
+    struct ResetValidatorAccess;
+    impl Drop for ResetValidatorAccess {
+        fn drop(&mut self) {
+            carrick_el1::substrate::file::TEST_VALIDATOR_ACCESS.with(|hook| {
+                *hook.borrow_mut() = None;
+            });
+        }
+    }
+    let _reset_validator_access = ResetValidatorAccess;
+    carrick_el1::substrate::file::TEST_VALIDATOR_ACCESS.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|address, _, access| {
+            access != carrick_guest_arch::Access::Write || address.raw() != VA
+        }));
+    });
+
     let mut clock = carrick_el1_abi::TrapFrame::default();
     clock.esr = 0x15 << 26;
     clock.x[8] = carrick_abi::syscall::nr::CLOCK_GETTIME.raw();
