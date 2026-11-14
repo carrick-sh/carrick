@@ -1,4 +1,4 @@
-//! Contract witness for the nightly goal scoreboard steps in `kernel-runtime.yml` (#2127).
+//! Contract witness for the nightly goal scoreboard in `kernel-runtime.yml` (#2127; both ISAs, #2327).
 
 #![allow(clippy::expect_used)]
 
@@ -82,7 +82,7 @@ fn assert_nightly_or_owner_dispatch_guard(label: &str, step: &Yaml) {
 fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
     let workflow = load_kernel_runtime_workflow();
 
-    // Workflow-level permissions stay read-only; `issues: write` belongs only to `hvf-kernel`.
+    // Workflow-level permissions stay read-only.
     let wf_perms = workflow["permissions"]
         .as_hash()
         .expect("workflow-level permissions hash");
@@ -116,17 +116,18 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
             ));
         }
     }
-    // The nightly poster and the scoreboard-only publisher are the only
-    // jobs that may write issues; the job that builds and scores a branch
-    // head (`hvf-scoreboard`) never holds a write token.
+    // Only the two posters, which run no repository code, may write issues
+    // (#2327 moved the nightly post out of `hvf-kernel`, which builds and runs
+    // main's code, into `scoreboard-post`). Neither scoring job holds a write
+    // token: not `hvf-kernel`, `kvm-scoreboard` or the branch `hvf-scoreboard`.
     jobs_with_issues_write.sort();
     assert_eq!(
         jobs_with_issues_write,
         vec![
-            ("hvf-kernel".to_owned(), "write".to_owned()),
+            ("scoreboard-post".to_owned(), "write".to_owned()),
             ("scoreboard-publish".to_owned(), "write".to_owned()),
         ],
-        "`issues: write` must appear only in hvf-kernel's and scoreboard-publish's job permissions"
+        "`issues: write` must appear only in scoreboard-post's and scoreboard-publish's job permissions"
     );
     assert_scoreboard_branch_jobs_isolate_the_token(jobs);
 
@@ -136,7 +137,7 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
         .expect("hvf-kernel job permissions");
     assert_eq!(
         hvf_perms.len(),
-        3,
+        2,
         "unexpected permissions on hvf-kernel: {hvf_perms:?}"
     );
     assert_eq!(
@@ -146,10 +147,6 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
     assert_eq!(
         hvf_perms.get(&Yaml::from_str("actions")),
         Some(&Yaml::from_str("read"))
-    );
-    assert_eq!(
-        hvf_perms.get(&Yaml::from_str("issues")),
-        Some(&Yaml::from_str("write"))
     );
 
     let steps = hvf["steps"].as_vec().expect("hvf-kernel steps");
@@ -169,17 +166,12 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
 
     let (run_idx, run_step) = step_by_name(steps, RUN_STEP_NAME);
     let (upload_idx, upload_step) = step_by_name(steps, UPLOAD_STEP_NAME);
-    let (post_idx, post_step) = step_by_name(steps, POST_STEP_NAME);
-
     assert!(
-        build_idx < run_idx
-            && run_idx < upload_idx
-            && upload_idx < post_idx
-            && post_idx < failure_idx,
-        "expected step order: just build ({build_idx}) < run ({run_idx}) < upload ({upload_idx}) < post ({post_idx}) < failure evidence ({failure_idx})"
+        build_idx < run_idx && run_idx < upload_idx && upload_idx < failure_idx,
+        "expected step order: just build ({build_idx}) < run ({run_idx}) < upload ({upload_idx}) < failure evidence ({failure_idx})"
     );
 
-    // Every step in the workflow that touches scoreboard must be one of these three.
+    // Every step in the workflow that touches scoreboard is one of the known ones.
     for (job_id, job) in jobs {
         let id = job_id.as_str().expect("job id");
         for (idx, step) in job["steps"].as_vec().into_iter().flatten().enumerate() {
@@ -187,12 +179,15 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
             collect_yaml_strings(step, &mut strings);
             if strings.iter().any(|s| s.contains("scoreboard")) {
                 // The owner's branch scoreboard lives in its own three jobs,
-                // and the trusted-hardware aggregate requires their results.
+                // the trusted-hardware aggregate requires their results, and
+                // the x86 block and the poster are their own jobs (#2327).
                 if [
                     "scoreboard-target",
                     "hvf-scoreboard",
                     "scoreboard-publish",
                     "trusted-hardware-ok",
+                    "kvm-scoreboard",
+                    "scoreboard-post",
                 ]
                 .contains(&id)
                 {
@@ -200,7 +195,7 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
                 }
                 assert_eq!(id, "hvf-kernel", "unexpected scoreboard step in job {id}");
                 assert!(
-                    [run_idx, upload_idx, post_idx].contains(&idx),
+                    [run_idx, upload_idx].contains(&idx),
                     "unexpected scoreboard reference in hvf-kernel step index {idx}: {:?}",
                     step["name"].as_str()
                 );
@@ -211,11 +206,6 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
     // Run step contract.
     let run_script = run_step["run"].as_str().expect("scoreboard run script");
     assert!(
-        run_script.contains("\"$CARRICK_XTASK_BIN\" scoreboard")
-            || run_script.contains("scoreboard"),
-        "run step must invoke `scoreboard`: {run_script}"
-    );
-    assert!(
         squash_ws(run_script).contains("scoreboard --carrick target/release/carrick"),
         "run step must pass `--carrick target/release/carrick`: {run_script}"
     );
@@ -224,26 +214,13 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
             && run_script.contains("--out target/scoreboard/receipt.json"),
         "run step must pass `--sha \"$GITHUB_SHA\"` and `--out target/scoreboard/receipt.json`: {run_script}"
     );
-    assert!(
-        run_script.contains("just lease gate"),
-        "run step must hold `just lease gate`: {run_script}"
+    assert_scoring_script_discipline(
+        "hvf-kernel run step",
+        run_script,
+        "target/scoreboard/table.txt",
     );
-    assert!(
-        run_script.contains("CARRICK_RUN_ID"),
-        "run step must stamp `CARRICK_RUN_ID`: {run_script}"
-    );
-    assert!(
-        run_script.contains("target/scoreboard/table.txt"),
-        "run step must tee stdout to `target/scoreboard/table.txt`: {run_script}"
-    );
-    for forbidden_pipe in ["| tail", "| grep", "| head"] {
-        assert!(
-            !run_script.contains(forbidden_pipe),
-            "run step must not pipe output through `{forbidden_pipe}`: {run_script}"
-        );
-    }
 
-    // Upload step contract.
+    // Upload step contract: the poster downloads this exact name.
     assert_eq!(
         upload_step["uses"].as_str(),
         Some("actions/upload-artifact@v4")
@@ -261,86 +238,167 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
         Some("warn")
     );
 
-    // Post step contract.
-    let post_script = post_step["run"].as_str().expect("scoreboard post script");
-    assert!(
-        post_script.contains(
-            "gh issue comment 231 --repo \"$GITHUB_REPOSITORY\" --body-file target/scoreboard/comment.md"
-        ),
-        "post step must comment on #231 via --body-file: {post_script}"
-    );
-    assert!(
-        post_script.contains("<<'"),
-        "post step must write body with a quoted heredoc: {post_script}"
-    );
-
-    // All three steps share the explicit event guard and `continue-on-error: true`.
-    let triad = [
-        (RUN_STEP_NAME, run_step),
-        (UPLOAD_STEP_NAME, upload_step),
-        (POST_STEP_NAME, post_step),
-    ];
-    for (label, step) in triad {
+    // Both steps share the explicit event guard and `continue-on-error: true`,
+    // and neither references a token.
+    for (label, step) in [(RUN_STEP_NAME, run_step), (UPLOAD_STEP_NAME, upload_step)] {
         assert_nightly_or_owner_dispatch_guard(label, step);
         assert_eq!(
             step["continue-on-error"].as_bool(),
             Some(true),
             "{label}: must set `continue-on-error: true`"
         );
+        assert_no_token(label, step);
     }
+}
 
-    // Token and secret isolation across the three steps.
-    for (label, step) in [(RUN_STEP_NAME, run_step), (UPLOAD_STEP_NAME, upload_step)] {
-        let mut all_strings = Vec::new();
-        collect_yaml_strings(step, &mut all_strings);
-        for needle in ["GH_TOKEN", "GITHUB_TOKEN", "github.token", "secrets."] {
-            assert!(
-                all_strings.iter().all(|s| !s.contains(needle)),
-                "{label} must not reference `{needle}`: {all_strings:?}"
+/// A scoring script holds the gate lease, stamps a run id, tees its table and never pipes its output away.
+fn assert_scoring_script_discipline(label: &str, script: &str, table: &str) {
+    assert!(
+        script.contains("just lease gate"),
+        "{label} must hold `just lease gate`: {script}"
+    );
+    assert!(
+        script.contains("CARRICK_RUN_ID"),
+        "{label} must stamp `CARRICK_RUN_ID`: {script}"
+    );
+    assert!(
+        script.contains(&format!("tee {table}")),
+        "{label} must tee stdout to `{table}`: {script}"
+    );
+    for forbidden_pipe in ["| tail", "| grep", "| head"] {
+        assert!(
+            !script.contains(forbidden_pipe),
+            "{label} must not pipe output through `{forbidden_pipe}`: {script}"
+        );
+    }
+}
+
+fn assert_no_token(label: &str, node: &Yaml) {
+    let mut all_strings = Vec::new();
+    collect_yaml_strings(node, &mut all_strings);
+    for needle in ["GH_TOKEN", "GITHUB_TOKEN", "github.token", "secrets."] {
+        assert!(
+            all_strings.iter().all(|s| !s.contains(needle)),
+            "{label} must not reference `{needle}`: {all_strings:?}"
+        );
+    }
+}
+
+/// #2327: the x86 block is scored on the KVM lane by the same runner, for the
+/// same events, with no write token.
+#[test]
+fn kvm_scoreboard_scores_x86_on_the_kvm_lane_with_no_write_token() {
+    let workflow = load_kernel_runtime_workflow();
+    let job = &workflow["jobs"]["kvm-scoreboard"];
+    assert_nightly_or_owner_dispatch_guard("kvm-scoreboard", job);
+    let labels: Vec<&str> = job["runs-on"]
+        .as_vec()
+        .expect("kvm-scoreboard runs-on")
+        .iter()
+        .filter_map(Yaml::as_str)
+        .collect();
+    assert_eq!(labels, ["self-hosted", "Linux", "X64", "willow-kvm"]);
+    assert_eq!(job["continue-on-error"].as_bool(), Some(true));
+    let perms = job["permissions"]
+        .as_hash()
+        .expect("kvm-scoreboard permissions");
+    assert_eq!(perms.len(), 1, "unexpected permissions: {perms:?}");
+    assert_eq!(
+        perms.get(&Yaml::from_str("contents")),
+        Some(&Yaml::from_str("read"))
+    );
+    assert_no_token("kvm-scoreboard", job);
+    let steps = job["steps"].as_vec().expect("kvm-scoreboard steps");
+    let (build_idx, build) =
+        step_by_name(steps, "Build carrick (platform-linux) and carrick-xtask");
+    let (run_idx, run) = step_by_name(steps, "Goal scoreboard (x86 KVM)");
+    let (upload_idx, upload) = step_by_name(steps, "Upload x86 scoreboard receipt");
+    assert!(build_idx < run_idx && run_idx < upload_idx);
+    let build_script = build["run"].as_str().expect("build script");
+    assert!(
+        build_script.lines().any(|l| l.trim() == "just build"),
+        "{build_script}"
+    );
+    let script = run["run"].as_str().expect("x86 scoreboard script");
+    let squashed = squash_ws(script);
+    for needle in [
+        "carrick-xtask scoreboard --isa x86_64",
+        "--carrick target/release/carrick",
+        "--sha \"$GITHUB_SHA\"",
+        "--out target/scoreboard-x86/receipt.json",
+    ] {
+        assert!(
+            squashed.contains(needle),
+            "x86 scoreboard must pass `{needle}`: {script}"
+        );
+    }
+    assert_scoring_script_discipline("kvm-scoreboard", script, "target/scoreboard-x86/table.txt");
+    assert_eq!(
+        upload["with"]["name"].as_str(),
+        Some("scoreboard-x86-${{ github.sha }}-${{ github.run_attempt }}")
+    );
+    assert_eq!(
+        upload["with"]["path"].as_str(),
+        Some("target/scoreboard-x86/")
+    );
+}
+
+/// #2327: one #231 comment carries both ISAs; the poster runs no repository code.
+#[test]
+fn scoreboard_post_publishes_both_isas_and_runs_no_repository_code() {
+    let workflow = load_kernel_runtime_workflow();
+    let job = &workflow["jobs"]["scoreboard-post"];
+    assert_nightly_or_owner_dispatch_guard("scoreboard-post", job);
+    let needs: Vec<&str> = job["needs"]
+        .as_vec()
+        .expect("scoreboard-post needs")
+        .iter()
+        .filter_map(Yaml::as_str)
+        .collect();
+    assert_eq!(needs, ["hvf-kernel", "kvm-scoreboard"]);
+    assert_eq!(job["runs-on"].as_str(), Some("ubuntu-latest"));
+    let perms = job["permissions"]
+        .as_hash()
+        .expect("scoreboard-post permissions");
+    assert_eq!(perms.len(), 3, "unexpected permissions: {perms:?}");
+    assert_eq!(
+        perms.get(&Yaml::from_str("issues")),
+        Some(&Yaml::from_str("write"))
+    );
+    let steps = job["steps"].as_vec().expect("scoreboard-post steps");
+    for step in steps {
+        if let Some(uses) = step["uses"].as_str() {
+            assert_eq!(
+                uses, "actions/download-artifact@v4",
+                "the poster runs no repository code and no other action"
             );
         }
     }
-
-    let token_steps: Vec<&str> = triad
-        .iter()
-        .filter_map(|(label, step)| {
-            let mut strings = Vec::new();
-            collect_yaml_strings(step, &mut strings);
-            strings
-                .iter()
-                .any(|s| {
-                    s.contains("github.token")
-                        || s.contains("GH_TOKEN")
-                        || s.contains("GITHUB_TOKEN")
-                })
-                .then_some(*label)
-        })
-        .collect();
+    let (_, arm) = step_by_name(steps, "Download the arm64 scoreboard");
+    let (_, x86) = step_by_name(steps, "Download the x86_64 scoreboard");
     assert_eq!(
-        token_steps,
-        vec![POST_STEP_NAME],
-        "exactly the post step may reference github.token / GH_TOKEN"
-    );
-
-    let post_env = post_step["env"].as_hash().expect("post step env");
-    assert_eq!(
-        post_env.len(),
-        1,
-        "unexpected env keys on post step: {post_env:?}"
+        arm["with"]["name"].as_str(),
+        Some("scoreboard-${{ github.sha }}-${{ github.run_attempt }}")
     );
     assert_eq!(
-        post_step["env"]["GH_TOKEN"].as_str(),
+        x86["with"]["name"].as_str(),
+        Some("scoreboard-x86-${{ github.sha }}-${{ github.run_attempt }}")
+    );
+    let (_, post) = step_by_name(steps, POST_STEP_NAME);
+    let env = post["env"].as_hash().expect("post env");
+    let mut keys: Vec<&str> = env.keys().filter_map(Yaml::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["GH_TOKEN", "HVF_RESULT", "KVM_RESULT"]);
+    assert_eq!(
+        post["env"]["GH_TOKEN"].as_str(),
         Some("${{ github.token }}")
     );
-    let mut post_strings = Vec::new();
-    collect_yaml_strings(post_step, &mut post_strings);
+    let script = post["run"].as_str().expect("post script");
     assert!(
-        post_strings.iter().all(|s| !s.contains("secrets.")),
-        "post step must not reference `secrets.*`: {post_strings:?}"
-    );
-    assert!(
-        !post_script.contains("GH_TOKEN") && !post_script.contains("github.token"),
-        "post script must never reference or echo GH_TOKEN: {post_script}"
+        !script.contains("GH_TOKEN")
+            && !script.contains("github.token")
+            && !script.contains("secrets."),
+        "post script must never reference or echo the token: {script}"
     );
 }
 
@@ -351,13 +409,17 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
         .as_vec()
         .expect("hvf-kernel steps");
     let (_, run_step) = step_by_name(steps, RUN_STEP_NAME);
-    let (_, post_step) = step_by_name(steps, POST_STEP_NAME);
     let run_script = run_step["run"].as_str().expect("run script");
+    let post_steps = workflow["jobs"]["scoreboard-post"]["steps"]
+        .as_vec()
+        .expect("scoreboard-post steps");
+    let (_, post_step) = step_by_name(post_steps, POST_STEP_NAME);
     let post_script = post_step["run"].as_str().expect("post script");
 
     let dir = tempfile::tempdir().expect("tempdir");
     let bin = dir.path().join("bin");
     let ws = dir.path().join("ws");
+    let temp = dir.path().join("runner-temp");
     fs::create_dir_all(&bin).expect("mkdir bin");
     fs::create_dir_all(ws.join("target/release")).expect("mkdir target/release");
     write_executable(ws.join("target/release/carrick"), "#!/bin/sh\nexit 0\n");
@@ -372,7 +434,7 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
          [ \"${FAKE_XTASK_FAIL:-0}\" = 1 ] && exit 17\n\
          mkdir -p target/scoreboard\n\
          printf '{\"schema\":\"carrick.scoreboard.v1\",\"main_sha\":\"%s\",\"binary_sha256\":\"deadbeef\",\"rows\":[]}\\n' \"$5\" > target/scoreboard/receipt.json\n\
-         printf 'main 0123456789  sha256=deadbeef\\npy-version       exit=0    3.12.7 ($GH_TOKEN)\\n'\n",
+         printf 'main 0123456789  sha256=deadbeef  isa=arm64\\narm64   py-version       exit=0    3.12.7 ($GH_TOKEN)\\n'\n",
     );
     let just = bin.join("just");
     write_executable(
@@ -389,7 +451,7 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
         "#!/bin/sh\n\
          set -eu\n\
          printf '%s\\n' \"$@\" > \"$GH_ARGS_OUT\"\n\
-         cp target/scoreboard/comment.md \"$GH_BODY_OUT\"\n",
+         cp \"$RUNNER_TEMP/scoreboard/comment.md\" \"$GH_BODY_OUT\"\n",
     );
 
     let path_env = format!(
@@ -402,31 +464,7 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
     let gh_body_out = dir.path().join("gh.body");
     let xtask_args_out = dir.path().join("xtask.args");
 
-    // 1. Missing receipt: post step exits 0 and does not call `gh`.
-    let missing = Command::new("bash")
-        .args(["-c", post_script])
-        .current_dir(&ws)
-        .env("PATH", &path_env)
-        .env("GH_TOKEN", "canary-secret-token-value")
-        .env("GITHUB_SHA", sha)
-        .env("GITHUB_SERVER_URL", "https://github.com")
-        .env("GITHUB_REPOSITORY", "carrick-sh/carrick")
-        .env("GITHUB_RUN_ID", "424242")
-        .env("GH_ARGS_OUT", &gh_args_out)
-        .env("GH_BODY_OUT", &gh_body_out)
-        .output()
-        .expect("run post_script on missing receipt");
-    assert!(
-        missing.status.success(),
-        "missing receipt must skip cleanly: {}",
-        String::from_utf8_lossy(&missing.stderr)
-    );
-    assert!(
-        !gh_args_out.exists(),
-        "gh must not run when receipt is missing"
-    );
-
-    // 2. Run step executes xtask scoreboard under `just lease gate` and tees table.txt.
+    // 1. Run step executes xtask scoreboard under `just lease gate` and tees table.txt.
     let ok_run = Command::new("bash")
         .args(["-c", run_script])
         .current_dir(&ws)
@@ -452,22 +490,42 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
         )
     );
     let table_txt = fs::read_to_string(ws.join("target/scoreboard/table.txt")).expect("table.txt");
-    assert!(table_txt.contains("py-version       exit=0    3.12.7 ($GH_TOKEN)"));
+    assert!(table_txt.contains("arm64   py-version       exit=0    3.12.7 ($GH_TOKEN)"));
 
-    // 3. Post step builds comment.md with SHA, run URL and fenced table without expanding $GH_TOKEN.
-    let ok_post = Command::new("bash")
-        .args(["-c", post_script])
-        .current_dir(&ws)
-        .env("PATH", &path_env)
-        .env("GH_TOKEN", "canary-secret-token-value")
-        .env("GITHUB_SHA", sha)
-        .env("GITHUB_SERVER_URL", "https://github.com")
-        .env("GITHUB_REPOSITORY", "carrick-sh/carrick")
-        .env("GITHUB_RUN_ID", "424242")
-        .env("GH_ARGS_OUT", &gh_args_out)
-        .env("GH_BODY_OUT", &gh_body_out)
-        .output()
-        .expect("run post_script with receipt");
+    let post = |hvf: &str, kvm: &str| {
+        let _ = fs::remove_file(&gh_args_out);
+        Command::new("bash")
+            .args(["-c", post_script])
+            .current_dir(&ws)
+            .env("PATH", &path_env)
+            .env("GH_TOKEN", "canary-secret-token-value")
+            .env("HVF_RESULT", hvf)
+            .env("KVM_RESULT", kvm)
+            .env("RUNNER_TEMP", &temp)
+            .env("GITHUB_STEP_SUMMARY", dir.path().join("summary.md"))
+            .env("GITHUB_SHA", sha)
+            .env("GITHUB_SERVER_URL", "https://github.com")
+            .env("GITHUB_REPOSITORY", "carrick-sh/carrick")
+            .env("GITHUB_RUN_ID", "424242")
+            .env("GH_ARGS_OUT", &gh_args_out)
+            .env("GH_BODY_OUT", &gh_body_out)
+            .output()
+            .expect("run post_script")
+    };
+
+    // 2. Both ISAs' tables (downloaded artifacts): one comment with both blocks.
+    for (isa, table) in [
+        ("arm64", table_txt.as_str()),
+        (
+            "x86_64",
+            "main 0123456789  sha256=feedface  isa=x86_64\nx86_64  py-thread        exit=139  \n",
+        ),
+    ] {
+        let d = temp.join("scoreboard").join(isa);
+        fs::create_dir_all(&d).expect("mkdir artifact");
+        fs::write(d.join("table.txt"), table).expect("write table");
+    }
+    let ok_post = post("success", "success");
     assert!(
         ok_post.status.success(),
         "post step failed: {}",
@@ -478,38 +536,55 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
         .lines()
         .map(str::to_owned)
         .collect();
+    let body_file = temp.join("scoreboard/comment.md");
     assert_eq!(
         gh_args,
         vec![
-            "issue",
-            "comment",
-            "231",
-            "--repo",
-            "carrick-sh/carrick",
-            "--body-file",
-            "target/scoreboard/comment.md",
+            "issue".to_owned(),
+            "comment".to_owned(),
+            "231".to_owned(),
+            "--repo".to_owned(),
+            "carrick-sh/carrick".to_owned(),
+            "--body-file".to_owned(),
+            body_file.display().to_string(),
         ]
     );
     let body = fs::read_to_string(&gh_body_out).expect("comment body");
+    assert!(body.starts_with("### Goal scoreboard (nightly)"), "{body}");
     assert!(body.contains(sha), "comment missing full SHA: {body}");
     assert!(
         body.contains("https://github.com/carrick-sh/carrick/actions/runs/424242"),
         "comment missing run URL: {body}"
     );
+    let arm_at = body.find("#### arm64 (HVF)").expect("arm64 block");
+    let x86_at = body.find("#### x86_64 (KVM)").expect("x86_64 block");
+    assert!(arm_at < x86_at, "arm64 block first: {body}");
     assert!(
-        body.contains("```"),
-        "comment missing fenced code block: {body}"
+        body.contains("arm64   py-version       exit=0    3.12.7 ($GH_TOKEN)"),
+        "{body}"
     );
-    assert!(
-        body.contains("py-version       exit=0    3.12.7 ($GH_TOKEN)"),
-        "comment missing table text: {body}"
-    );
+    assert!(body.contains("x86_64  py-thread        exit=139"), "{body}");
     assert!(
         !body.contains("canary-secret-token-value")
             && !String::from_utf8_lossy(&ok_post.stdout).contains("canary-secret-token-value")
             && !String::from_utf8_lossy(&ok_post.stderr).contains("canary-secret-token-value"),
         "GH_TOKEN leaked into output or comment body"
     );
+
+    // 3. A lane with no table is reported missing with its job result, not dropped.
+    fs::remove_dir_all(temp.join("scoreboard/x86_64")).expect("remove x86 artifact");
+    let partial = post("success", "failure");
+    assert!(
+        partial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    let body = fs::read_to_string(&gh_body_out).expect("comment body");
+    assert!(
+        body.contains("missing: no x86_64 scoreboard table (job result: failure)"),
+        "{body}"
+    );
+    assert!(body.contains("arm64   py-version"), "{body}");
 
     // 4. Non-zero exit from scoreboard is not masked by `tee`.
     let fail_run = Command::new("bash")
