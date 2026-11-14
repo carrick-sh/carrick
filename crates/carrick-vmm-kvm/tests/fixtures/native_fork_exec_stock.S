@@ -15,13 +15,13 @@ _start:
     mov $57, %eax
     syscall
     test %eax, %eax
-    js failure
+    js fork_failure
     jz holder
     mov %eax, %r12d
     mov $57, %eax
     syscall
     test %eax, %eax
-    js failure
+    js fork_failure
     jz exec_child
     mov %eax, %r13d
     lea ready(%rip), %rdi
@@ -31,7 +31,7 @@ _start:
     mov $128, %eax
     syscall
     cmp $10, %eax
-    jne failure
+    jne signal_failure
     /* One bounded wait gives the child time to cross into Exec service. */
     lea release_signal(%rip), %rdi
     xor %esi, %esi
@@ -105,7 +105,7 @@ holder:
     mov $128, %eax
     syscall
     cmp $12, %eax
-    jne failure
+    jne signal_failure
     xor %edi, %edi
     jmp exit
 exec_child:
@@ -127,6 +127,12 @@ exec_child:
     jmp exit
 failure:
     mov $91, %edi
+    jmp exit
+fork_failure:
+    mov $92, %edi
+    jmp exit
+signal_failure:
+    mov $93, %edi
 exit:
     mov $231, %eax
     syscall

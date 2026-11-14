@@ -541,6 +541,7 @@ fn native_fork_child_exec_wakes_after_stock_holder_retires() {
     let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
     let elf = native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define]);
     let outcome = run_exec_fixture_with_stock_pressure(&elf, &marker, 256);
+    assert_eq!(outcome.run.exit_code, 0, "stock holder handshake must finish");
     assert!(
         outcome.physical.fork_stock_counters().expect("stock census").successor_table_refusals > 0,
         "the live exec must actually park for fork stock"
@@ -563,6 +564,7 @@ fn native_fork_child_exec_killed_while_parked_is_reaped() {
         &[&define, "-DCANCEL_PARKED"],
     );
     let outcome = run_exec_fixture_with_stock_pressure(&elf, &marker, 256);
+    assert_eq!(outcome.run.exit_code, 0, "stock holder handshake must finish");
     assert!(
         outcome.physical.fork_stock_counters().expect("stock census").successor_table_refusals > 0,
         "the killed exec must actually park for fork stock"
@@ -626,7 +628,7 @@ fn run_exec_fixture_with_stock_pressure(
             // Leave capacity for the two fork children and one fewer table
             // than their exec successor needs. The first child's retirement
             // must return its own tables to satisfy that exec.
-            let left = demand.tables + 3;
+            let left = demand.tables + 13;
             *held.lock().unwrap() = Some(
                 carrier.fixture_hold_fork_stock(left).expect("hold excess stock"),
             );
