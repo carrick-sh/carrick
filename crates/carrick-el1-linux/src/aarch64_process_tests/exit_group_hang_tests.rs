@@ -87,6 +87,14 @@ fn serial_host_arm_group_close_checkpoints_running_and_parked_siblings() {
     deferred_control_handback(true, true);
 }
 
+/// An unregistered host-born sibling switched in at EL0 has no ring owner to
+/// register with after the gate closes. Its user return stays on the host
+/// route: the host's control kick forwards it and its record is handed back.
+#[test]
+fn serial_host_arm_group_close_running_unregistered_sibling_leaves_through_host() {
+    deferred_control_handback(false, true);
+}
+
 fn deferred_control_handback(registered: bool, checkpoint: bool) {
     use carrick_el1_abi::Lifecycle;
     let (kernel, root) = bootstrap(41);
@@ -291,21 +299,17 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
             member.thread().key().serial.raw(),
             control,
         );
-        assert_eq!(
-            crate::dispatch::arm_signal_return_gate(
-                BornInZoneSource {
-                    zone: fixture.zone,
-                    slot
-                },
-                &fixture.task,
-                page,
-                control,
-                0,
-                0,
-                true,
-            ),
-            Some(true),
-            "closed group must enter the terminal checkpoint"
+        let gate = crate::dispatch::arm_signal_return_gate(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            &fixture.task,
+            page,
+            control,
+            0,
+            0,
+            true,
         );
         let mut sibling_service = Aarch64NativeProcessService::with_crossing(
             &fixture.task,
@@ -342,8 +346,18 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
                 )
             },
         )
-        .unwrap();
-        assert_eq!(action, carrick_el1_abi::Action::Idle);
+        .unwrap_or_else(|error| panic!("closing member user return refused: {error:?}"));
+        assert_eq!(
+            gate,
+            registered.then_some(true),
+            "only a registered switched-in member enters the ring terminal checkpoint"
+        );
+        if registered {
+            assert_eq!(action, carrick_el1_abi::Action::Idle);
+        } else {
+            assert_eq!(action, carrick_el1_abi::Action::Served);
+            assert_eq!(fixture.zone.slot(slot).current(), Some(record.id));
+        }
         run_as_leader(fixture);
     }
 
@@ -364,7 +378,48 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
             scheduler.wake_control(member.thread().key()).unwrap();
         }
     });
-    if !registered {
+    if !registered && checkpoint {
+        // The control wake found its target held by EL1 and kicked the slot.
+        // The kick IRQ at EL0 forwards (the closed gate's Host venue), and
+        // the vCPU loop hands the switched-in record back to its host owner.
+        let member = members[0];
+        run_as(
+            fixture,
+            member.thread().key().tid.raw(),
+            1,
+            member.thread().key().serial.raw(),
+            member.thread().control_slot(),
+        );
+        let mut cpu = crate::sched::FakeCpu::default();
+        cpu.pending.push_back(carrick_el1_abi::GIC_KICK_INTID);
+        let counters = carrick_el1_abi::Counters::new();
+        let mut irq = carrick_el1_abi::TrapFrame {
+            elr: 0x401000,
+            slot: u64::from(slot.raw()),
+            ..Default::default()
+        };
+        assert_eq!(
+            (crate::sched::Sched {
+                handoff: None,
+                zone: fixture.zone,
+                slot,
+                task: &fixture.task,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+                counters: &counters,
+            })
+            .interrupt(&mut irq, 0),
+            carrick_el1_abi::Action::Forward
+        );
+        assert_eq!(
+            fixture.zone.handback_current(slot, record.id),
+            CurrentHandback::HandedBack
+        );
+        carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+            scheduler.publish_zone_handback(record);
+        });
+        run_as_leader(fixture);
+    } else if !registered {
         let member = members[0];
         run_as(
             fixture,
