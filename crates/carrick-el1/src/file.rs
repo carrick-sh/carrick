@@ -21,11 +21,6 @@ std::thread_local! {
     /// Host fixture projection of live guest permissions (no host MMU at EL1).
     pub static TEST_USER_ACCESS: std::cell::RefCell<Option<TestUserAccess>> =
         const { std::cell::RefCell::new(None) };
-    /// Host fixture projection of stage-1 access checks. Guarded-copy tests
-    /// use `TEST_USER_ACCESS`; this separate hook lets a production validator
-    /// observe a COW permission fault before any copy runs.
-    pub static TEST_VALIDATOR_ACCESS: std::cell::RefCell<Option<TestUserAccess>> =
-        const { std::cell::RefCell::new(None) };
     pub static SIMULATE_COPY_FAULT: core::sync::atomic::AtomicBool =
         const { core::sync::atomic::AtomicBool::new(false) };
     pub static SIMULATE_COPYOUT_FAULT: core::sync::atomic::AtomicBool =
@@ -255,32 +250,9 @@ fn valid_lower_half_range(user_va: u64, len: usize) -> bool {
 pub struct HardwareValidator;
 
 #[cfg(not(target_os = "none"))]
-fn host_validator_access(user_va: u64, len: usize, access: carrick_guest_arch::Access) -> bool {
-    #[cfg(any(test, feature = "host-test"))]
-    {
-        TEST_VALIDATOR_ACCESS.with(|hook| {
-            hook.borrow().as_ref().is_none_or(|check| {
-                check(
-                    carrick_guest_arch::UserVa::new(user_va),
-                    carrick_guest_arch::GuestLen::new(len as u64),
-                    access,
-                )
-            })
-        })
-    }
-    #[cfg(not(any(test, feature = "host-test")))]
-    {
-        let _ = (user_va, len, access);
-        true
-    }
-}
-
-#[cfg(not(target_os = "none"))]
 impl MemoryValidator for HardwareValidator {
     fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
-        if valid_lower_half_range(user_va, len)
-            && host_validator_access(user_va, len, carrick_guest_arch::Access::Write)
-        {
+        if valid_lower_half_range(user_va, len) {
             len
         } else {
             0
@@ -288,9 +260,7 @@ impl MemoryValidator for HardwareValidator {
     }
 
     fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
-        if valid_lower_half_range(user_va, len)
-            && host_validator_access(user_va, len, carrick_guest_arch::Access::Read)
-        {
+        if valid_lower_half_range(user_va, len) {
             len
         } else {
             0
