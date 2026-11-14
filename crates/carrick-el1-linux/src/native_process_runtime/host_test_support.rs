@@ -48,7 +48,7 @@ std::thread_local! {
 }
 
 /// Refuse the next Physical fork preparations, in order.
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn fail_prepare_mm(errors: &[NativeProcessError]) {
     PREPARE_MM_ERRORS.with(|queue| *queue.borrow_mut() = errors.iter().copied().collect());
 }
@@ -11482,7 +11482,8 @@ fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
 #[path = "tests/futex_contention.rs"]
 mod futex_contention;
 
-#[cfg(test)]
+// The signal-copy refusal script, like the native suite, is off macOS.
+#[cfg(all(test, not(target_os = "macos")))]
 #[path = "tests/contention_not_now.rs"]
 mod contention_not_now;
 
