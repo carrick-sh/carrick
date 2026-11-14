@@ -204,7 +204,6 @@ jobs:
     permissions:
       contents: read
       actions: read
-      issues: write
     steps:
       # Disk admission and the checkout build both need the root-owned lease
       # supervisor. There is deliberately no unleased fallback: measuring free
@@ -437,43 +436,6 @@ jobs:
           name: scoreboard-${{ github.sha }}-${{ github.run_attempt }}
           path: target/scoreboard/
           if-no-files-found: warn
-
-      - name: "Post scoreboard to #231"
-        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if [ ! -s target/scoreboard/receipt.json ]; then
-            echo "scoreboard receipt missing at target/scoreboard/receipt.json; skipping #231 comment"
-            exit 0
-          fi
-          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          {
-            printf '### Goal scoreboard (nightly)\n\n'
-            printf 'Commit: %s ([workflow run](%s))\n\n' "$GITHUB_SHA" "$run_url"
-            cat <<'EOF'
-          ```text
-          EOF
-            if [ -s target/scoreboard/table.txt ]; then
-              cat target/scoreboard/table.txt
-            else
-              python3 - <<'PYTHON'
-          import json
-          with open("target/scoreboard/receipt.json", encoding="utf-8") as f:
-              r = json.load(f)
-          print(f"main {r['main_sha'][:10]}  sha256={r['binary_sha256'][:16]}")
-          for row in r.get("rows", []):
-              out = row.get("first_stdout_line", "")[:60]
-              print(f"{row['name']:<16} exit={row['exit_code']:<4} {out}")
-          PYTHON
-            fi
-            cat <<'EOF'
-          ```
-          EOF
-          } > target/scoreboard/comment.md
-          gh issue comment 231 --repo "$GITHUB_REPOSITORY" --body-file target/scoreboard/comment.md
 
       - name: Upload signed failure evidence
         if: ${{ failure() || steps.signed-receipt.outputs.failed == 'true' }}
@@ -914,6 +876,146 @@ jobs:
           name: kvm-logs-${{ github.sha }}-${{ github.run_attempt }}
           path: target/el1-gate/
           if-no-files-found: ignore
+
+  # x86 rows on the main scoreboard (owner, 2026-11-14, #231; #2327): the same
+  # rows through the same `carrick-xtask scoreboard` runner, on the x86 KVM
+  # lane, for the same main commit and on the same events as the HVF nightly
+  # scoreboard. It only produces a receipt; `scoreboard-post` publishes both
+  # ISAs in one #231 comment. It never gates anything.
+  kvm-scoreboard:
+    name: KVM · x86 scoreboard (nightly)
+    if: >-
+      ${{ !cancelled() && vars.CARRICK_SELF_HOSTED_KVM == 'true' && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'schedule' ||
+           (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) }}
+    runs-on: [self-hosted, Linux, X64, willow-kvm]
+    continue-on-error: true
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify KVM host
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          test -c /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
+      - name: Install just
+        uses: ./.github/actions/install-tools
+        with:
+          tools: just
+
+      - name: Install per-user compiler cache
+        uses: ./.github/actions/install-tools
+        with:
+          tools: sccache
+      - name: Install x86 image and fixture targets
+        run: rustup target add x86_64-unknown-none x86_64-unknown-linux-musl
+
+      - name: Build carrick (platform-linux) and carrick-xtask
+        run: |
+          set -euo pipefail
+          just build
+          cargo build --release --locked -p carrick-xtask
+          test -x target/release/carrick
+          test -x target/release/carrick-xtask
+
+      - name: Goal scoreboard (x86 KVM)
+        run: |
+          set -euo pipefail
+          rm -rf target/scoreboard-x86
+          mkdir -p target/scoreboard-x86
+          export CARRICK_RUN_ID="scoreboard-x86-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          just lease gate target/release/carrick-xtask scoreboard --isa x86_64 \
+            --carrick target/release/carrick \
+            --sha "$GITHUB_SHA" \
+            --out target/scoreboard-x86/receipt.json \
+            | tee target/scoreboard-x86/table.txt
+          test -s target/scoreboard-x86/receipt.json
+          test -s target/scoreboard-x86/table.txt
+
+      - name: Upload x86 scoreboard receipt
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: scoreboard-x86-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/scoreboard-x86/
+          if-no-files-found: warn
+
+  # Publishes the nightly scoreboard: one #231 comment with an `arm64` (HVF)
+  # and an `x86_64` (KVM) block (#2327). It runs no repository code (no
+  # checkout) and holds the only issues-write token of the nightly path. A
+  # lane that produced no table is reported as missing with its job result,
+  # never silently dropped. Each table line leads with its ISA column, so
+  # `director/scoreboard-rows.sh` (carrick-sh/agy-director) reads both blocks.
+  scoreboard-post:
+    name: "Scoreboard · post both ISAs to #231"
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'schedule' ||
+           (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) &&
+          (needs.hvf-kernel.result != 'skipped' || needs.kvm-scoreboard.result != 'skipped') }}
+    needs: [hvf-kernel, kvm-scoreboard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - name: Download the arm64 scoreboard
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: scoreboard-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/scoreboard/arm64
+
+      - name: Download the x86_64 scoreboard
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: scoreboard-x86-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/scoreboard/x86_64
+
+      - name: "Post scoreboard to #231"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HVF_RESULT: ${{ needs.hvf-kernel.result }}
+          KVM_RESULT: ${{ needs.kvm-scoreboard.result }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/scoreboard"
+          mkdir -p "$d"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          block() { # block <isa> <lane label> <job result>
+            printf '#### %s (%s)\n\n' "$1" "$2"
+            if [ -s "$d/$1/table.txt" ]; then
+              printf '```text\n'
+              cat "$d/$1/table.txt"
+              printf '```\n\n'
+            else
+              printf 'missing: no %s scoreboard table (job result: %s)\n\n' "$1" "$3"
+            fi
+          }
+          {
+            printf '### Goal scoreboard (nightly)\n\n'
+            printf 'Commit: %s ([workflow run](%s))\n\n' "$GITHUB_SHA" "$run_url"
+            block arm64 HVF "$HVF_RESULT"
+            block x86_64 KVM "$KVM_RESULT"
+          } > "$d/comment.md"
+          cat "$d/comment.md" >> "$GITHUB_STEP_SUMMARY"
+          gh issue comment 231 --repo "$GITHUB_REPOSITORY" --body-file "$d/comment.md"
 
   # carrick-el1-linux's native-process tests are `not(target_os = "macos")`
   # (macOS refuses their EL1 metadata window), so no macOS shard runs them
