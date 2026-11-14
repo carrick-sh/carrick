@@ -6,7 +6,7 @@ use carrick_el1_abi::{
 };
 use carrick_sched_core::{
     IDLE_SPIN_NS, PREEMPT_SLICE_NS, ShortLockSpin, SwitchedIn, WakeEffects, WakeMechanics,
-    WakerQueue,
+    WakerQueue, YieldTurn,
 };
 use core::sync::atomic::Ordering;
 
@@ -610,7 +610,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// by this EL1 zone. Save the caller's zero result before switching: the
     /// frame after the switch belongs to the sibling's suspended syscall.
     pub fn yield_queued(&mut self, frame: &mut TrapFrame) -> Option<Served> {
-        if self.zone.runnable_head(self.slot).is_none()
+        if self.zone.yield_turn(self.slot) == YieldTurn::Keep
             || self.task.linux.has_pending_host_work()
             || self.task.lifecycle_refs().is_some_and(|(page, control)| {
                 page.pending().load().0 != 0 || control.pending().load().0 != 0

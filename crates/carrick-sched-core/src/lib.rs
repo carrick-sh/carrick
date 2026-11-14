@@ -1941,6 +1941,27 @@ impl Requeue {
     }
 }
 
+/// What a guest `sched_yield` owes the CPU its caller runs on (#2354).
+///
+/// Linux gives the CPU to a runnable thread queued behind the yielder, so a
+/// yield is a turn boundary whenever its slot's run queue has a runnable
+/// head. Every ISA's yield asks [`ZoneTables::yield_turn`]; only the save
+/// and switch that follow a [`Self::Rotate`] are ISA mechanics.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum YieldTurn {
+    /// Nothing runnable waits on the slot: the caller keeps the CPU.
+    Keep,
+    /// A runnable thread waits on the slot: the caller goes to the tail of
+    /// the run queue (a preempted requeue) and the head runs.
+    Rotate,
+}
+
 /// The outcome of a host claim.
 #[derive(
     ::core::clone::Clone,
@@ -4115,6 +4136,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             cursor = rec.next.load(Ordering::Acquire);
         }
         None
+    }
+
+    /// What a guest `sched_yield` on `slot` owes its caller ([`YieldTurn`]).
+    pub fn yield_turn(&self, slot: SlotId) -> YieldTurn {
+        if self.runnable_head(slot).is_some() {
+            YieldTurn::Rotate
+        } else {
+            YieldTurn::Keep
+        }
     }
 
     /// Whether the thread at the head of `slot`'s run queue needs its
