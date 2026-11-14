@@ -261,6 +261,7 @@ impl PendingService<'_> {
             && self.copyout.is_none()
             && !self.copyin
             && !self.adapter
+            && !matches!(self.request.operation, ServiceOperation::Exec { .. })
             && !matches!(self.request.operation, ServiceOperation::CarrierWork { .. })
     }
 }
@@ -494,14 +495,33 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             }
             return Ok(());
         }
-        let pending = self
-            .graph
-            .lock()
-            .service_wait(&record)
-            .filter(|pending| {
-                pending.signal_interruptible() || pending.claim.cancellation().is_some()
-            })
-            .map(|pending| (pending.request, pending.control.clone(), pending.adapter));
+        let pending = {
+            let graph = self.graph.lock();
+            graph
+                .service_wait(&record)
+                .filter(|pending| {
+                    if pending.signal_interruptible() || pending.claim.cancellation().is_some() {
+                        return true;
+                    }
+                    if !matches!(pending.request.operation, ServiceOperation::Exec { .. }) {
+                        return false;
+                    }
+                    let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                        carrick_signal_core::SignalSet::from_bits(pending.control.blocked().0),
+                    );
+                    graph.owner.tasks().values().any(|row| {
+                        let resources = row.native().resources();
+                        resources
+                            .members
+                            .iter()
+                            .any(|member| member.record == record)
+                            && resources
+                                .signals()
+                                .has_default_terminating_deliverable(record, blocked)
+                    })
+                })
+                .map(|pending| (pending.request, pending.control.clone(), pending.adapter))
+        };
         let Some((request, control, adapter)) = pending else {
             // Scalar IPC has a retained adapter token, not a host-service cell.
             // Its queue owns cancellation and the existing deferred handback.
@@ -2168,13 +2188,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ),
             &|_| {},
             || {
-                let interruptible = self
-                    .runtime
-                    .graph
-                    .lock()
-                    .service_wait(&self.record)
-                    .is_some_and(PendingService::signal_interruptible);
-                if ((interruptible && self.signal_interrupts_current())
+                let (interruptible, exec) =
+                    self.runtime.graph.lock().service_wait(&self.record).map_or(
+                        (false, false),
+                        |pending| {
+                            (
+                                pending.signal_interruptible(),
+                                matches!(pending.request.operation, ServiceOperation::Exec { .. }),
+                            )
+                        },
+                    );
+                if (((interruptible && self.signal_interrupts_current())
+                    || (exec && self.default_terminating_signal_interrupts_current()))
                     || self.runtime.graph.lock().pending.has_exit(&self.key))
                     && let Err(error) = self.control.service.cancel(request.identity)
                 {
@@ -2421,12 +2446,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     zone.object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
                         crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
                     })?;
-                let (interruptible, output_cancelled) =
+                let (interruptible, exec, output_cancelled) =
                     self.runtime.graph.lock().service_wait(&self.record).map_or(
-                        (true, false),
+                        (true, false, false),
                         |pending| {
                             (
                                 pending.signal_interruptible(),
+                                matches!(pending.request.operation, ServiceOperation::Exec { .. }),
                                 (pending.copyout.is_some() || pending.copyin)
                                     && pending.claim.cancellation().is_some(),
                             )
@@ -2434,6 +2460,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     );
                 if output_cancelled
                     || (interruptible && self.signal_interrupts_current())
+                    || (exec && self.default_terminating_signal_interrupts_current())
                     || self.runtime.graph.lock().pending.has_exit(&self.key)
                 {
                     self.control

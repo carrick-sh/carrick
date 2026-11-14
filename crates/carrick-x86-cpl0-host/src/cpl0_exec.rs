@@ -1095,32 +1095,40 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         &mut self,
         cpu: carrick_guest_arch::CpuId,
     ) -> Result<(), TrapError> {
-        for parked in core::mem::take(&mut self.parked_execs) {
-            if parked
-                .pending
-                .ticket
-                .cancellation_requested()
-                .map_err(|_| fail("parked native exec ticket changed"))?
-            {
-                let anonymous_owner::native_service::PendingNativeExec { ticket, key, .. } =
-                    *parked.pending;
-                self.acknowledge_native_exec(cpu, key, || {
-                    ticket
-                        .complete(false)
-                        .map_err(|_| fail("parked native exec cancellation acknowledgment"))
-                })?;
-                continue;
-            }
-            if !parked.woken.load(std::sync::atomic::Ordering::Acquire) {
-                self.parked_execs.push(parked);
-                continue;
-            }
-            match parked.parked.probe(&self.fork_stock) {
-                Ok(request) => self.stage_and_seal(cpu, parked.pending, request)?,
-                Err(still) => self.parked_execs.push(ParkedNativeExec {
-                    parked: still,
-                    ..parked
-                }),
+        let mut remaining = core::mem::take(&mut self.parked_execs).into_iter();
+        while let Some(parked) = remaining.next() {
+            let result = (|| {
+                if parked
+                    .pending
+                    .ticket
+                    .cancellation_requested()
+                    .map_err(|_| fail("parked native exec ticket changed"))?
+                {
+                    let anonymous_owner::native_service::PendingNativeExec { ticket, key, .. } =
+                        *parked.pending;
+                    self.acknowledge_native_exec(cpu, key, || {
+                        ticket
+                            .complete(false)
+                            .map_err(|_| fail("parked native exec cancellation acknowledgment"))
+                    })?;
+                    return Ok(());
+                }
+                if !parked.woken.load(std::sync::atomic::Ordering::Acquire) {
+                    self.parked_execs.push(parked);
+                    return Ok(());
+                }
+                match parked.parked.probe(&self.fork_stock) {
+                    Ok(request) => self.stage_and_seal(cpu, parked.pending, request)?,
+                    Err(still) => self.parked_execs.push(ParkedNativeExec {
+                        parked: still,
+                        ..parked
+                    }),
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.parked_execs.extend(remaining);
+                return Err(error);
             }
         }
         Ok(())
