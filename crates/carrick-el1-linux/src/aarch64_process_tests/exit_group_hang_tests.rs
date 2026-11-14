@@ -592,6 +592,19 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
 /// the next IRQ, and the host retires the exact thread.
 #[test]
 fn serial_host_arm_group_close_entryless_host_loaded_member_leaves_through_host() {
+    entryless_host_loaded_member_leaves_through_host(0);
+}
+
+/// The host's owner-cancel checkpoint (`esr` 0xfffc) still admits a native
+/// signal owner after the gate closes. Its terminal resume reports host
+/// custody, which for a member with no switched record is its executor's
+/// own: it returns to user rather than yielding a free record.
+#[test]
+fn serial_host_arm_owner_cancel_entryless_member_keeps_host_custody() {
+    entryless_host_loaded_member_leaves_through_host(0xfffc);
+}
+
+fn entryless_host_loaded_member_leaves_through_host(esr: u64) {
     let (kernel, root) = bootstrap(41);
     let root = Box::leak(Box::new(root));
     root.thread().set_affinity(carrick_hal::CpuAffinity::all(2));
@@ -684,7 +697,7 @@ fn serial_host_arm_group_close_entryless_host_loaded_member_leaves_through_host(
         slot,
     };
     let gate =
-        crate::dispatch::arm_signal_return_gate(source, &fixture.task, page, control, 0, 0, true);
+        crate::dispatch::arm_signal_return_gate(source, &fixture.task, page, control, esr, 0, true);
     let mut return_frame = carrick_el1_abi::TrapFrame::default();
     let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     let action = crate::dispatch::arm_signal_user_return_entry(
@@ -694,7 +707,7 @@ fn serial_host_arm_group_close_entryless_host_loaded_member_leaves_through_host(
         fixture_ttbr0(fixture),
         page,
         control,
-        (0, 0),
+        (esr, 0),
         true,
         &mut service,
         |process| {
@@ -712,7 +725,11 @@ fn serial_host_arm_group_close_entryless_host_loaded_member_leaves_through_host(
         },
     )
     .unwrap_or_else(|error| panic!("closing member user return refused: {error:?}"));
-    assert_eq!(gate, None, "no switched record for the ring to yield");
+    assert_eq!(
+        gate,
+        (esr == 0xfffc).then_some(true),
+        "only the owner-cancel checkpoint admits a member with no switched record"
+    );
     assert_eq!(action, carrick_el1_abi::Action::Served);
     assert_eq!(fixture.zone.slot(slot).current(), None);
 
