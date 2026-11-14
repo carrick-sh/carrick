@@ -174,8 +174,9 @@ mod test_support {
     /// The member that armed the next post-supply Busy (#2332): only its
     /// own fault takes it. A fork child's first COW fault on the other vCPU
     /// would otherwise take a held Busy no one releases.
-    static POST_SUPPLY_BUSY: carrick_el1::lock::SpinLock<Option<carrick_core_abi::ExecutionBinding>> =
-        carrick_el1::lock::SpinLock::new(None);
+    static POST_SUPPLY_BUSY: carrick_el1::lock::SpinLock<
+        Option<carrick_core_abi::ExecutionBinding>,
+    > = carrick_el1::lock::SpinLock::new(None);
 
     /// Arm the next post-supply Busy for the member running on `binding`.
     fn arm_post_supply_busy(
