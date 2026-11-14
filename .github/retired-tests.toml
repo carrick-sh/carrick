@@ -35,3 +35,15 @@ test = "cpl0_initial_mm::in_zone_child_pipe_write_without_ipc_execution_is_count
 reason = "#1671: an in-zone child's pipe write on x86 CPL0 is now served through the shared IPC owner instead of returning a counted ENOSYS, so the refusal witness became a witness that the write is served (9968c4138)."
 replaced_by = "cpl0_initial_mm::in_zone_child_pipe_write_uses_shared_ipc_execution"
 pr = 2153
+
+[[retired]]
+test = "x86_production_forward::x86_child_exec_is_staged_then_counted_enosys"
+reason = "#2273: x86 fork-child exec now serves the staged payload through the native owner, so the counted-ENOSYS witness became a payload-staging and fault witness."
+replaced_by = "x86_production_forward::x86_child_exec_stages_its_payload_or_faults"
+pr = 2273
+
+[[retired]]
+test = "carrick_el1_linux::native_process_runtime::host_test_support::x86_native_exec_completion_stages_the_fork_child_and_refuses_the_root"
+reason = "#2273: native exec completion now claims the x86 fork child for service instead of only staging it; root exec remains refused."
+replaced_by = "carrick_el1_linux::native_process_runtime::host_test_support::x86_native_exec_completion_claims_the_fork_child_and_refuses_the_root"
+pr = 2273
