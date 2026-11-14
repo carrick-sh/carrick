@@ -1032,7 +1032,13 @@ pub fn crossing_output_stage(
         HostCrossingSet::X86 => AllowedHostCrossing::from_canonical_x86(canonical),
         HostCrossingSet::Aarch64 => AllowedHostCrossing::from_canonical_aarch64(canonical),
     }?;
-    for (address, length) in crossing.operand_spec().output_ranges(args) {
+    for (address, length) in crossing.operand_spec().output_ranges(
+        args,
+        match set {
+            HostCrossingSet::Aarch64 => carrick_guest_arch::GuestIsa::Aarch64,
+            HostCrossingSet::X86 => carrick_guest_arch::GuestIsa::X86_64,
+        },
+    ) {
         let covered = writable(address, usize::try_from(length).ok()?) as u64;
         if covered < length {
             return Some(HostFileStage::PrepareOutput {

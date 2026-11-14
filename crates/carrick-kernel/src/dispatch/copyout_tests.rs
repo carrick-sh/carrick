@@ -264,7 +264,10 @@ fn statx_waits_for_an_owner_refused_copyout_instead_of_efault() {
     assert_eq!(retried, DispatchOutcome::Returned { value: 0 });
     let declared: Vec<_> = carrick_personality_linux::crossing::AllowedHostCrossing::Statx
         .operand_spec()
-        .output_ranges(&[read_fd as u64, PATH, LINUX_AT_EMPTY_PATH, 0, OUT, 0])
+        .output_ranges(
+            &[read_fd as u64, PATH, LINUX_AT_EMPTY_PATH, 0, OUT, 0],
+            carrick_guest_arch::GuestIsa::Aarch64,
+        )
         .collect();
     let actual: Vec<_> = g
         .memory
@@ -338,7 +341,7 @@ fn arm_host_gettimeofday_copyout_matches_both_declared_records() {
             .collect();
         let declared: Vec<_> = AllowedHostCrossing::Gettimeofday
             .operand_spec()
-            .output_ranges(&args)
+            .output_ranges(&args, carrick_guest_arch::GuestIsa::Aarch64)
             .collect();
         assert_eq!(
             actual, declared,
@@ -1877,50 +1880,63 @@ fn retained_poll_sparse_output_keeps_prefix_across_owner_supply_and_physical() {
 
 #[test]
 fn copy_file_range_prepares_both_offsets_before_file_effect() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("input"), b"direct-output").unwrap();
-    std::fs::write(dir.path().join("output"), b"").unwrap();
-    let mut g = Guest::new();
-    g.dispatcher.set_fs_backend(Box::new(
-        carrick_vfs::fs_backend::HostFsBackend::from_path(dir.path()).unwrap(),
-    ));
-    g.seed_path("/input");
-    let input = g.ok(nr::OPENAT.raw(), [LINUX_AT_FDCWD as u64, PATH, 0, 0, 0, 0]);
-    g.seed_path("/output");
-    let output = g.ok(nr::OPENAT.raw(), [LINUX_AT_FDCWD as u64, PATH, 2, 0, 0, 0]);
-    g.memory.seed(OUT, &0u64.to_ne_bytes());
-    g.memory.seed(OUT2, &0u64.to_ne_bytes());
-    g.memory.commits.clear();
-    let args = [input as u64, OUT, output as u64, OUT2, 13, 0];
-    let wait = g.memory.refuse_next();
-    assert_eq!(
-        g.call(nr::COPY_FILE_RANGE.raw(), args),
-        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
-    );
-    assert_eq!(std::fs::read(dir.path().join("output")).unwrap(), b"");
-    assert!(g.memory.commits.is_empty());
-    assert_eq!(g.ok(nr::COPY_FILE_RANGE.raw(), args), 13);
-    assert_eq!(
-        std::fs::read(dir.path().join("output")).unwrap(),
-        b"direct-output"
-    );
-    for address in [OUT, OUT2] {
+    for (input_offset, output_offset) in [(OUT, OUT2), (OUT, 0), (0, OUT2), (OUT, OUT)] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("input"), b"direct-output").unwrap();
+        std::fs::write(dir.path().join("output"), b"").unwrap();
+        let mut g = Guest::new();
+        g.dispatcher.set_fs_backend(Box::new(
+            carrick_vfs::fs_backend::HostFsBackend::from_path(dir.path()).unwrap(),
+        ));
+        g.seed_path("/input");
+        let input = g.ok(nr::OPENAT.raw(), [LINUX_AT_FDCWD as u64, PATH, 0, 0, 0, 0]);
+        g.seed_path("/output");
+        let output = g.ok(nr::OPENAT.raw(), [LINUX_AT_FDCWD as u64, PATH, 2, 0, 0, 0]);
+        g.memory.seed(OUT, &0u64.to_ne_bytes());
+        g.memory.seed(OUT2, &0u64.to_ne_bytes());
+        g.memory.commits.clear();
+        let args = [
+            input as u64,
+            input_offset,
+            output as u64,
+            output_offset,
+            13,
+            0,
+        ];
+        let wait = g.memory.refuse_next();
         assert_eq!(
-            g.memory.read_bytes(address, 8).unwrap(),
-            13u64.to_ne_bytes()
+            g.call(nr::COPY_FILE_RANGE.raw(), args),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
         );
+        assert_eq!(std::fs::read(dir.path().join("output")).unwrap(), b"");
+        assert!(g.memory.commits.is_empty());
+        assert_eq!(g.ok(nr::COPY_FILE_RANGE.raw(), args), 13);
+        assert_eq!(
+            std::fs::read(dir.path().join("output")).unwrap(),
+            b"direct-output"
+        );
+        for address in [input_offset, output_offset]
+            .into_iter()
+            .filter(|address| *address != 0)
+        {
+            assert_eq!(
+                g.memory.read_bytes(address, 8).unwrap(),
+                13u64.to_ne_bytes()
+            );
+        }
+        let declared: Vec<_> =
+            carrick_personality_linux::crossing::AllowedHostCrossing::CopyFileRange
+                .operand_spec()
+                .output_ranges(&args, carrick_guest_arch::GuestIsa::Aarch64)
+                .collect();
+        let actual: Vec<_> = g
+            .memory
+            .commits
+            .iter()
+            .map(|(address, bytes)| (*address, bytes.len() as u64))
+            .collect();
+        assert_eq!(actual, declared);
     }
-    let declared: Vec<_> = carrick_personality_linux::crossing::AllowedHostCrossing::CopyFileRange
-        .operand_spec()
-        .output_ranges(&args)
-        .collect();
-    let actual: Vec<_> = g
-        .memory
-        .commits
-        .iter()
-        .map(|(address, bytes)| (*address, bytes.len() as u64))
-        .collect();
-    assert_eq!(actual, declared);
 }
 
 #[test]
@@ -1933,7 +1949,7 @@ fn arm_host_entropy_copyout_matches_declared_range() {
     );
     let declared: Vec<_> = carrick_personality_linux::crossing::AllowedHostCrossing::Getrandom
         .operand_spec()
-        .output_ranges(&args)
+        .output_ranges(&args, carrick_guest_arch::GuestIsa::Aarch64)
         .collect();
     let actual: Vec<_> = g
         .memory
@@ -1974,7 +1990,10 @@ fn arm_host_epoll_copyout_matches_declared_event_records() {
             g.refused_then_retried(number, args, &[(OUT, 16)]),
             DispatchOutcome::Returned { value: 1 }
         );
-        let declared: Vec<_> = crossing.operand_spec().output_ranges(&args).collect();
+        let declared: Vec<_> = crossing
+            .operand_spec()
+            .output_ranges(&args, carrick_guest_arch::GuestIsa::Aarch64)
+            .collect();
         let actual: Vec<_> = g
             .memory
             .commits

@@ -634,6 +634,7 @@ surfaces = [
   { path = "crates/carrick-kernel/src/dispatch/fs/rw.rs", contract = "kernel.copyout.owner-refusal" },
   { path = "crates/carrick-kernel/src/dispatch/fs/rw.rs", contract = "kernel.fs.lseek-sparse" },
   { path = "crates/carrick-kernel/src/dispatch/fs/rw.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/sendfile.rs", contract = "kernel.el1.arm-ring-first-crossing" },
   { path = "crates/carrick-kernel/src/dispatch/fs/stat.rs", contract = "kernel.copyout.owner-refusal" },
   { path = "crates/carrick-kernel/src/dispatch/fs/tests.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-kernel/src/dispatch/fs/tests.rs", contract = "kernel.fs.directory-copyout" },

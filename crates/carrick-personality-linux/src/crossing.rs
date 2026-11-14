@@ -585,7 +585,7 @@ mod tests {
     }
 
     /// Decrease-only count ratchet for undeclared ABI outputs; see #2300.
-    const UNDECLARED_OUTPUT_ARGUMENT_CEILING: usize = 50;
+    const UNDECLARED_OUTPUT_ARGUMENT_CEILING: usize = 44;
 
     /// The ABI, not a second list of crossing ordinals, defines which user
     /// pointers can be written. Report the entire missing population at once.
@@ -602,7 +602,9 @@ mod tests {
             };
             let declared = match crossing.operand_spec().output_operand() {
                 OutputOperand::None => std::vec::Vec::new(),
-                OutputOperand::Record { ptr, .. } | OutputOperand::Buffer { ptr, .. } => {
+                OutputOperand::Record { ptr, .. }
+                | OutputOperand::Buffer { ptr, .. }
+                | OutputOperand::EpollEvents { ptr, .. } => {
                     std::vec![ptr]
                 }
                 OutputOperand::Records(records) => records.iter().map(|&(ptr, _)| ptr).collect(),
@@ -649,8 +651,8 @@ mod tests {
             .collect();
         declared.sort_unstable();
         // getcwd, statfs, fstatfs, readlinkat, getxattr, lgetxattr, listxattr,
-        // llistxattr.
-        assert_eq!(declared, [8, 9, 11, 12, 17, 43, 44, 78]);
+        // llistxattr, epoll_pwait, statx.
+        assert_eq!(declared, [8, 9, 11, 12, 17, 22, 43, 44, 78, 291]);
         let spec = AllowedHostCrossing::Readlinkat.operand_spec();
         // A buffer is prepared across every page of the bound: the result
         // may land on either side of a boundary. The bound is the longest
