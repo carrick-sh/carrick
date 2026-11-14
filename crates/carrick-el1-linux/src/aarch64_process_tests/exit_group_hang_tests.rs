@@ -803,20 +803,16 @@ fn entryless_host_loaded_member_leaves_through_host(mode: EntrylessReturn) {
         assert!(terminal_owed);
         action
     } else {
-        assert_eq!(
-            crate::dispatch::arm_signal_return_gate(
-                source,
-                &fixture.task,
-                page,
-                control,
-                esr,
-                x0,
-                true,
-            ),
-            None,
-            "no switched record for the ring to yield"
+        let gate = crate::dispatch::arm_signal_return_gate(
+            source,
+            &fixture.task,
+            page,
+            control,
+            esr,
+            x0,
+            true,
         );
-        crate::dispatch::arm_signal_user_return_entry(
+        let action = crate::dispatch::arm_signal_user_return_entry(
             source,
             &fixture.task,
             &ThreadCtx::ZERO,
@@ -836,7 +832,9 @@ fn entryless_host_loaded_member_leaves_through_host(mode: EntrylessReturn) {
                 )
             },
         )
-        .unwrap_or_else(|error| panic!("closing member user return refused: {error:?}"))
+        .unwrap_or_else(|error| panic!("closing member user return refused: {error:?}"));
+        assert_eq!(gate, None, "no switched record for the ring to yield");
+        action
     };
     assert_eq!(action, carrick_el1_abi::Action::Served);
     assert_eq!(fixture.zone.slot(slot).current(), None);
