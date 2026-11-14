@@ -378,6 +378,10 @@ struct TestForeignCowAuthority {
     allow_quiesce: bool,
     serial: std::sync::atomic::AtomicU64,
     published: parking_lot::Mutex<Option<(carrick_hal::MappingId, carrick_hal::FrameId, Gpa, u64)>>,
+    /// Every frame grant applied and not yet unmapped or rolled back. As in
+    /// the Kernel's inventory, each stays exact-live on its own: a batch of
+    /// guest COW grants is several live mappings, not the newest one.
+    granted: parking_lot::Mutex<Vec<(carrick_hal::MappingId, carrick_hal::FrameId, Gpa, u64)>>,
 }
 
 impl TestForeignCowAuthority {
@@ -400,6 +404,7 @@ impl TestForeignCowAuthority {
                 installed.snapshot.mm.get().saturating_mul(1_000),
             ),
             published: parking_lot::Mutex::new(None),
+            granted: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -479,6 +484,9 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
             .iter()
             .copied()
             .find(|(_, frame, _, _)| *frame != self.old_frame);
+        self.granted
+            .lock()
+            .retain(|(mapping, _, _, _)| !removed.contains(mapping));
         let mut live = self.live.write();
         live.mapping_ids
             .retain(|mapping| !removed.contains(mapping));
@@ -552,6 +560,9 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
                 .ok_or_else(|| std::io::Error::other("test frame grant has no live owner"))?;
         let receipt = self.apply_with_receipt(commit)?;
         assert!(receipt.authorizes(mapping, frame));
+        self.granted
+            .lock()
+            .push((mapping, frame, gpa, length.raw()));
         Ok((receipt, generation))
     }
 
@@ -565,6 +576,9 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
             .take()
             .ok_or_else(|| std::io::Error::other("no test grant to roll back"))?;
         assert!(receipt.authorizes(mapping, frame));
+        self.granted
+            .lock()
+            .retain(|(granted, _, _, _)| *granted != mapping);
         let mut live = self.live.write();
         assert_eq!(receipt.mm(), live.mm);
         live.mapping_ids.retain(|id| *id != mapping);
@@ -645,11 +659,8 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
         gpa: Gpa,
         length: carrick_hal::FrameLength,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self
-            .published
-            .lock()
-            .as_ref()
-            .is_some_and(|published| *published == (mapping, frame, gpa, length.raw())))
+        let exact = (mapping, frame, gpa, length.raw());
+        Ok(self.published.lock().as_ref() == Some(&exact) || self.granted.lock().contains(&exact))
     }
 
     fn frame_mapping_count(
@@ -6048,6 +6059,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
         allow_quiesce: true,
         serial: std::sync::atomic::AtomicU64::new(871_000),
         published: parking_lot::Mutex::new(None),
+        granted: parking_lot::Mutex::new(Vec::new()),
     });
     child_state.bind_cow_runtime(MmCowRuntimeBinding {
         authority: cow_authority.clone(),
