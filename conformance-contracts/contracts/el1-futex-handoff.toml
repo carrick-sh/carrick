@@ -43,6 +43,7 @@ vm_free = [
   "carrick-sched-core::tests::interrupt_parked_futex_rechecks_claim_after_futex_enrollment (sender waits on the held bucket and observes subsequent park publication; exact errno 4 and zero leftover entries)",
   "carrick-el1-linux::aarch64_process_tests::tgkill_during_futex_enrollment_returns_eintr (two live registered threads, production tgkill after production futex enqueue and before publication; EINTR, zero park/entry/timer; VM-free only)",
   "carrick-el1-linux::sched::tests",
+  "carrick-el1-linux::sched::tests::production_futex_wait_switch_keeps_successor_result_separate_from_wait_result (two live threads, production entry; successor write result 28, original op 393 result zero, two parks and two switches; attribution control only)",
   "carrick-el1-linux::sched::tests::{cancelled_on_cpu_thread_is_not_stranded_by_repark,signal_requested_on_cpu_is_not_lost_by_repark}",
   "carrick-kernel-example::scheduler_handoff::self_affinity_change_requires_migration_before_return",
   "carrick-kernel::el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record (test-only observation extension: source-hashed retired-delivery publication count at 1/8/32, enforced by kernel.el1.deferred-handback-identity; no new guest scheduling, live-path cost or signed acceptance)",

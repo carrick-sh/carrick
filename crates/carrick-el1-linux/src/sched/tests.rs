@@ -362,6 +362,88 @@ fn a_futex_handoff_switches_threads_in_guest_and_preserves_state() {
     );
 }
 
+/// #2288 lead control: the result after a futex parks belongs to the selected
+/// successor. A saved write result of 28 must survive that selection, while
+/// the original op 393 still returns zero when it is subsequently woken.
+#[test]
+fn production_futex_wait_switch_keeps_successor_result_separate_from_wait_result() {
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let tasks = [
+        CurrentTask::new(),
+        CurrentTask::new(),
+        CurrentTask::new(),
+        task_for(101),
+    ];
+    host_publish(&zone, SLOT, MM, None, 0);
+    let successor = zone.alloc_record(identity(202)).unwrap();
+    let mut saved = thread_ctx(0xB, uaddr);
+    saved.x[0] = 28;
+    saved.x[8] = crate::ipc::SYS_WRITE as u64;
+    // SAFETY: the new record is unpublished and exclusively owned here.
+    unsafe {
+        *zone.record(successor).ctx_mut() =
+            Aarch64ParkedContext::from_register(saved, TTBR_MM, MM, 1);
+    }
+    assert!(zone.requeue_preempted(SLOT, successor).is_queued());
+    let counters = counters();
+    let names = InotifyNameCache::new();
+    let operation = carrick_personality_linux::sched::FUTEX_WAIT_BITSET_PRIVATE_REALTIME;
+    let (mut frame, mut cpu) = live(0xA, uaddr, operation, 0);
+    frame.x[5] = u32::MAX as u64;
+    let run = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
+        crate::dispatch::dispatch_syscall_with_regions(
+            frame,
+            counters,
+            &tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            Some(crate::dispatch::Zone {
+                tables: &zone,
+                cpu,
+                user: &HardwareUserWord,
+            }),
+            |_| core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
+    let waiter = zone.slot(SLOT).host_record().unwrap();
+    assert!(matches!(zone.record(waiter).claim(), Claim::Parked { .. }));
+    assert_eq!(zone.slot(SLOT).current(), Some(successor));
+    assert_eq!(
+        tasks[SLOT.index()].execution.task.load(Ordering::Relaxed),
+        202
+    );
+    assert_eq!(
+        frame.x[8],
+        crate::ipc::SYS_WRITE as u64,
+        "the selected frame is the successor's write"
+    );
+    assert_eq!(frame.x[0], 28, "28 is the successor's saved result");
+    assert_eq!(frame.elr, saved.pc);
+
+    // The successor wakes the actual waiter, then parks itself.
+    set_op(&mut frame, uaddr, FUTEX_WAKE_PRIVATE, 1);
+    assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
+    assert_eq!(frame.x[0], 1, "only the waker receives the wake count");
+    set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
+    assert_eq!(zone.slot(SLOT).current(), Some(waiter));
+    assert_eq!(
+        tasks[SLOT.index()].execution.task.load(Ordering::Relaxed),
+        101
+    );
+    assert_eq!(frame.x[8], SYS_FUTEX as u64);
+    assert_eq!(frame.x[1], operation);
+    assert_eq!(frame.x[0], 0, "the original wait receives neither 28 nor 1");
+    assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 2);
+    assert_eq!(zone.counters.el1_switches.load(Ordering::Relaxed), 2);
+}
+
 /// Negative control: a switch that does not save FP/SIMD is caught.
 #[test]
 fn a_switch_without_fpsimd_save_is_detected() {
