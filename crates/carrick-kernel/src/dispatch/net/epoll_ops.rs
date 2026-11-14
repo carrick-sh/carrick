@@ -47,6 +47,54 @@ fn new_epoll_description(
     wake_registry: crate::dispatch::EpollWakeRegistry,
     owner: Option<Arc<crate::el1_ipc::HostIpc>>,
 ) -> Result<OpenDescription, carrick_abi::LinuxErrno> {
+    // A refusal (the `CARRICK_EL1_EPOLL=0` hatch, no IPC authority, full
+    // stores) keeps every item in the host half; EL1 forwards its waits.
+    let object = super::epoll_zone::admit(owner);
+    epoll_description_with(
+        wake_registry,
+        object.ok(),
+        |owner, object, kqueue, queue| {
+            super::epoll_zone::ZoneEpoll::create(owner, object, kqueue, queue).ok()
+        },
+    )
+}
+
+/// The host half of a ring-created epoll (#1671): a description over the
+/// record the ring built, holding the ring's OFD through `lifetime`.
+fn adopted_epoll_description(
+    wake_registry: crate::dispatch::EpollWakeRegistry,
+    owner: Arc<crate::el1_ipc::HostIpc>,
+    object: carrick_el1_abi::ipc::IpcObjectHandle,
+    lifetime: crate::el1_ipc::HostDescription,
+) -> Result<OpenDescription, carrick_abi::LinuxErrno> {
+    let mut lifetime = Some(lifetime);
+    epoll_description_with(
+        wake_registry,
+        Some((owner, object)),
+        |owner, object, kqueue, queue| {
+            let lifetime = lifetime.take()?;
+            Some(super::epoll_zone::ZoneEpoll::adopt(
+                owner, object, lifetime, kqueue, queue,
+            ))
+        },
+    )
+}
+
+/// An epoll description over `record` (none: every item in the host half),
+/// whose zone half `bind` builds from the description's wake channels.
+fn epoll_description_with(
+    wake_registry: crate::dispatch::EpollWakeRegistry,
+    record: Option<(
+        Arc<crate::el1_ipc::HostIpc>,
+        carrick_el1_abi::ipc::IpcObjectHandle,
+    )>,
+    bind: impl FnOnce(
+        &Arc<crate::el1_ipc::HostIpc>,
+        carrick_el1_abi::ipc::IpcObjectHandle,
+        std::sync::Weak<crate::dispatch::EpollKqueue>,
+        std::sync::Weak<crate::kernel::WaitQueue>,
+    ) -> Option<Arc<super::epoll_zone::ZoneEpoll>>,
+) -> Result<OpenDescription, carrick_abi::LinuxErrno> {
     // The readiness backend is an EventMultiplexer: kqueue-backed on macOS,
     // epoll-backed on Linux. The user-wake channel `register_user(0)` is the
     // in-memory wake: `wake_parked` triggers it when an in-memory member's
@@ -56,25 +104,20 @@ fn new_epoll_description(
         crate::event_mux::make_event_multiplexer().map_err(|_| crate::linux_abi::LINUX_EMFILE)?;
     let _ = mux.register_user(0);
     let kqueue = Arc::new(crate::dispatch::EpollKqueue::new(mux, wake_registry));
-    // A refusal (the `CARRICK_EL1_EPOLL=0` hatch, no IPC authority, full
-    // stores) keeps every item in the host half; EL1 forwards its waits.
-    let object = super::epoll_zone::admit(owner);
-    let wait_queue = Arc::new(match &object {
-        Ok((owner, object)) => crate::kernel::WaitQueue::with_subscription(
+    let wait_queue = Arc::new(match &record {
+        Some((owner, object)) => crate::kernel::WaitQueue::with_subscription(
             super::epoll_zone::ZoneEpoll::queue_subscription(Arc::clone(owner), *object),
         ),
-        Err(_) => crate::kernel::WaitQueue::new(),
+        None => crate::kernel::WaitQueue::new(),
     });
-    let zone = object
-        .and_then(|(owner, object)| {
-            super::epoll_zone::ZoneEpoll::create(
-                &owner,
-                object,
-                Arc::downgrade(&kqueue),
-                Arc::downgrade(&wait_queue),
-            )
-        })
-        .ok();
+    let zone = record.and_then(|(owner, object)| {
+        bind(
+            &owner,
+            object,
+            Arc::downgrade(&kqueue),
+            Arc::downgrade(&wait_queue),
+        )
+    });
     Ok(OpenDescription::Epoll {
         interest: HashMap::new(),
         synthetic_interest_count: 0,
@@ -387,7 +430,135 @@ struct EpollPwaitWaitArgs {
     sig_mask: carrick_abi::WaitSigMask,
 }
 
+/// One zone-half `epoll_ctl` (contract `kernel.el1.epoll-zone`). `event` is
+/// read for ADD and MOD only; `in_host_half` names an ADD whose exact
+/// (fd, file) pair the description's host half already holds.
+fn zone_epoll_ctl(
+    zone: &super::epoll_zone::ZoneEpoll,
+    member: &super::epoll_zone::ZoneMember,
+    operation: u64,
+    fd: i32,
+    event: impl FnOnce() -> Result<LinuxEpollEvent, Box<DispatchOutcome>>,
+    in_host_half: impl FnOnce() -> bool,
+) -> Result<super::epoll_zone::ZoneCtl, Box<DispatchOutcome>> {
+    use super::epoll_zone::ZoneCtl;
+    Ok(match operation {
+        LINUX_EPOLL_CTL_ADD => {
+            let event = event()?;
+            if in_host_half() {
+                ZoneCtl::Exists
+            } else {
+                zone.add(member, fd, event.events, event.data)
+            }
+        }
+        LINUX_EPOLL_CTL_MOD => {
+            let event = event()?;
+            zone.modify(fd, member.file_key, event.events, event.data)
+        }
+        LINUX_EPOLL_CTL_DEL => zone.delete(fd, member.file_key),
+        _ => return Err(Box::new(DispatchOutcome::errno(LINUX_EINVAL))),
+    })
+}
+
+/// The zone record a new epoll description stands on.
+enum EpollRecord {
+    /// A fresh record from this authority (none: every item in the host half).
+    New(Option<Arc<crate::el1_ipc::HostIpc>>),
+    /// A ring-created record, held through the ring's own OFD (#1671).
+    Adopt {
+        owner: Arc<crate::el1_ipc::HostIpc>,
+        object: carrick_el1_abi::ipc::IpcObjectHandle,
+        lifetime: crate::el1_ipc::HostDescription,
+    },
+}
+
 impl<'a> NetView<'a> {
+    /// An epoll description wired to this file table's in-memory wake
+    /// registry, over a new or an adopted zone record.
+    fn epoll_description(
+        &self,
+        record: EpollRecord,
+    ) -> Result<OpenDescription, carrick_abi::LinuxErrno> {
+        let registry = Arc::clone(self.captured_file_table().epoll_wake_registry());
+        match record {
+            EpollRecord::New(owner) => new_epoll_description(registry, owner),
+            EpollRecord::Adopt {
+                owner,
+                object,
+                lifetime,
+            } => adopted_epoll_description(registry, owner, object, lifetime),
+        }
+    }
+
+    /// The epoll `epfd` names, adopting a ring-created one (#1671).
+    ///
+    /// A run root's `epoll_create1` is served in ring: its record and OFD
+    /// live only in the root's published table, and the host has no
+    /// description for the item's host half (`kernel.el1.epoll-zone`). EL1
+    /// forwards `epoll_ctl` exactly when a member is host-backed (a socket),
+    /// so here the host takes the record: one description over it, holding
+    /// the ring's OFD, installed at `epfd` and published as a host-backed
+    /// hold. From then on the root's calls on `epfd` (waits, close, dup) all
+    /// reach this one owner, as the root's other host-backed fds do (#1410).
+    fn epoll_open_file(&self, epfd: i32) -> Option<OpenFile> {
+        if let Some(open_file) = self.open_file(epfd) {
+            return Some(open_file);
+        }
+        let files = self.captured_file_table();
+        // The exact claim keeps every other admission off this number
+        // while the ring's description is replaced.
+        let reservation = files.reserve_exact_target(epfd, self.nofile_limit()).ok()?;
+        let crate::kernel::RingDescription {
+            owner,
+            held,
+            backing: carrick_el1_abi::ipc::IpcBacking::Epoll { object },
+            cloexec,
+        } = files.ipc_ring_description(epfd)?
+        else {
+            return None;
+        };
+        let fd_flags = if cloexec {
+            crate::linux_abi::LINUX_FD_CLOEXEC
+        } else {
+            0
+        };
+        let description = self
+            .epoll_description(EpollRecord::Adopt {
+                owner,
+                object,
+                lifetime: held,
+            })
+            .ok()?;
+        let open_file = crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
+            Arc::new(RwLock::new(description)),
+            Arc::new(crate::kernel::DescriptionCommon::new(0)),
+            fd_flags,
+        );
+        // An exact replacement commits the caller's functional reference.
+        let description = Arc::clone(&open_file.description);
+        description.retain_fd_ref();
+        if reservation.commit(open_file).is_err() {
+            description.release_fd_ref();
+            return None;
+        }
+        self.open_file(epfd)
+    }
+
+    /// A ring-created zone member `fd` names in the caller's published
+    /// table (a run root's ring pipe end or eventfd, which the host table
+    /// does not hold), keyed by its OFD as EL1 keys it (#1671).
+    fn ring_zone_member(&self, fd: i32) -> Option<super::epoll_zone::ZoneMember> {
+        let ring = self.captured_file_table().ipc_ring_description(fd)?;
+        let (object, kind) = carrick_el1_abi::ipc::epoll::EpollMember::of_backing(ring.backing)?;
+        let file_key = ring.held.flags().ofd_key()?;
+        Some(super::epoll_zone::ZoneMember {
+            owner: ring.owner,
+            object,
+            kind,
+            file_key,
+        })
+    }
+
     fn fd_is_epollable(&self, fd: i32) -> bool {
         let Some(open_file) = self.open_file(fd) else {
             return false;
@@ -4448,10 +4619,9 @@ impl<'a> NetView<'a> {
             if flags & !LINUX_EPOLL_CLOEXEC != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let description = match new_epoll_description(
-                Arc::clone(this.captured_file_table().epoll_wake_registry()),
+            let description = match this.epoll_description(EpollRecord::New(
                 cx.kernel.kernel().ipc().ok(),
-            ) {
+            )) {
                 Ok(description) => description,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
@@ -4487,14 +4657,21 @@ impl<'a> NetView<'a> {
             let event_address = event.0;
             // A bad target fd is EBADF; a target equal to the epoll fd itself is
             // EINVAL (an epoll instance can't monitor itself). (LTP epoll_ctl02.)
-            if !this.fd_is_valid(fd) {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
+            // A run root's ring pipe end or eventfd is a zone member the host
+            // table does not hold (#1671): its item lives in the record only.
+            let ring_member = if this.fd_is_valid(fd) {
+                None
+            } else {
+                match this.ring_zone_member(fd) {
+                    Some(member) => Some(member),
+                    None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+                }
+            };
             if epfd == fd {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
-            let Some(open_file) = this.open_file(epfd) else {
+            let Some(open_file) = this.epoll_open_file(epfd) else {
                 return Ok(DispatchOutcome::errno(if this.fd_is_valid(epfd) {
                     LINUX_EINVAL
                 } else {
@@ -4502,6 +4679,43 @@ impl<'a> NetView<'a> {
                 }));
             };
             let epoll_description = Arc::clone(&open_file.description);
+            let read_event = || {
+                read_epoll_event(memory, event_address, cx.guest_abi()).map_err(|error| {
+                    Box::new(
+                        DispatchOutcome::from_owner_memory_error(error)
+                            .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT)),
+                    )
+                })
+            };
+            if let Some(member) = ring_member {
+                use super::epoll_zone::ZoneCtl;
+                let zone = epoll_description
+                    .inspect_kind(|open| match open {
+                        OpenDescription::Epoll { zone, .. } => zone.clone(),
+                        _ => None,
+                    })
+                    .flatten();
+                let Some(zone) = zone.filter(|zone| zone.belongs_to(&member.owner)) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                let zone_result =
+                    match zone_epoll_ctl(&zone, &member, operation, fd, read_event, || false) {
+                        Ok(result) => result,
+                        Err(outcome) => return Ok(*outcome),
+                    };
+                return Ok(match zone_result {
+                    ZoneCtl::Done => {
+                        crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);
+                        DispatchOutcome::Returned { value: 0 }
+                    }
+                    ZoneCtl::Exists => DispatchOutcome::errno(LINUX_EEXIST),
+                    ZoneCtl::Invalid => DispatchOutcome::errno(LINUX_EINVAL),
+                    ZoneCtl::NotFound => DispatchOutcome::errno(LINUX_ENOENT),
+                    // The host half cannot watch a member it holds no
+                    // description for: no room for the item.
+                    ZoneCtl::HostHalf(_) => DispatchOutcome::errno(carrick_abi::LINUX_ENOMEM),
+                });
+            }
             let Some(target_file) = this.open_file(fd) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
@@ -4534,45 +4748,25 @@ impl<'a> NetView<'a> {
                 && zone.belongs_to(&member.owner)
             {
                 use super::epoll_zone::ZoneCtl;
-                let zone_result = match operation {
-                    LINUX_EPOLL_CTL_ADD => {
-                        let event = match read_epoll_event(memory, event_address, cx.guest_abi()) {
-                            Ok(event) => event,
-                            Err(error) => return Ok(DispatchOutcome::from_owner_memory_error(error)
-                                .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
-                        };
-                        // The exact (fd, file) already lives in the host half
-                        // (a placement refusal earlier): one item per pair.
-                        let in_host_half = epoll_description
-                            .inspect_kind(|open| match open {
-                                OpenDescription::Epoll { interest, .. } => {
-                                    interest.get(&fd).is_some_and(|slot| {
-                                        epoll_slot_names_current_file(
-                                            slot,
-                                            &target_file.description,
-                                        )
-                                    })
-                                }
-                                _ => false,
-                            })
-                            .unwrap_or(false);
-                        if in_host_half {
-                            ZoneCtl::Exists
-                        } else {
-                            zone.add(member, fd, event.events, event.data)
-                        }
-                    }
-                    LINUX_EPOLL_CTL_MOD => {
-                        let event = match read_epoll_event(memory, event_address, cx.guest_abi()) {
-                            Ok(event) => event,
-                            Err(error) => return Ok(DispatchOutcome::from_owner_memory_error(error)
-                                .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
-                        };
-                        zone.modify(fd, member.file_key, event.events, event.data)
-                    }
-                    LINUX_EPOLL_CTL_DEL => zone.delete(fd, member.file_key),
-                    _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                // The exact (fd, file) already lives in the host half (a
+                // placement refusal earlier): one item per pair.
+                let in_host_half = || {
+                    epoll_description
+                        .inspect_kind(|open| match open {
+                            OpenDescription::Epoll { interest, .. } => {
+                                interest.get(&fd).is_some_and(|slot| {
+                                    epoll_slot_names_current_file(slot, &target_file.description)
+                                })
+                            }
+                            _ => false,
+                        })
+                        .unwrap_or(false)
                 };
+                let zone_result =
+                    match zone_epoll_ctl(zone, member, operation, fd, read_event, in_host_half) {
+                        Ok(result) => result,
+                        Err(outcome) => return Ok(*outcome),
+                    };
                 match zone_result {
                     ZoneCtl::Done => {
                         crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);

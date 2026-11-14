@@ -5093,14 +5093,23 @@ impl<
                     Err(error) => return map_fd_error(error),
                 };
                 let result = (|| {
-                    let Some(IpcBacking::Epoll { object: epoll }) =
-                        IpcBacking::decode(edesc.backing)
-                    else {
+                    let member_fd = Fd(self.frame.argument(2).unwrap_or(0) as i32);
+                    let epoll = match IpcBacking::decode(edesc.backing) {
+                        Some(IpcBacking::Epoll { object }) => object,
+                        // A ring pipe end or eventfd is no epoll (#1671): the
+                        // host holds no description for it to refuse.
+                        Some(IpcBacking::Pipe { .. } | IpcBacking::EventFd { .. }) => {
+                            return match authority.get(table, member_fd) {
+                                Err(error) => map_fd_error(error),
+                                Ok(_) => FamilyCompletion::Complete(
+                                    carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                                ),
+                            };
+                        }
                         // Host epolls retain their existing service; this
                         // adapter owns only the shared zone representation.
-                        return FamilyCompletion::Forward;
+                        Some(IpcBacking::Host(_)) | None => return FamilyCompletion::Forward,
                     };
-                    let member_fd = Fd(self.frame.argument(2).unwrap_or(0) as i32);
                     if member_fd == old {
                         return FamilyCompletion::Complete(
                             carrick_syscall_abi::LINUX_EINVAL.guest_retval(),

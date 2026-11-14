@@ -17648,16 +17648,17 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: Namespac
     assert_ne!(next_child.serial, child.serial, "reuse starts a new task");
 }
 
-#[test]
-fn arm_root_host_backed_descriptors_keep_one_owner() {
-    use carrick_abi::{
-        LINUX_AT_FDCWD, LINUX_F_DUPFD, LINUX_F_GETFL, LINUX_F_GETLK, LINUX_F_SETFL, LINUX_F_SETLK,
-        LINUX_F_WRLCK, LINUX_O_APPEND, LINUX_O_CREAT, LINUX_O_NONBLOCK, LINUX_O_TRUNC,
-        LINUX_O_WRONLY, LinuxFlock64,
-    };
+/// The run root on the production ARM dispatch, with a real host
+/// dispatcher behind every call the ring forwards. `body` gets the root's
+/// syscall entry; the run's stdout comes back beside its result.
+#[cfg(test)]
+fn with_arm_root_host_dispatch<R>(
+    body: impl FnOnce(
+        &mut dyn FnMut(u64, [u64; 6]) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+    ) -> R,
+) -> (R, Vec<u8>) {
     use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
     use carrick_personality_linux::dispatch::CompletionRoute;
-    use carrick_test_support::GuestUserBuffer;
     use std::sync::Arc;
 
     struct HostPointerMemory;
@@ -17792,119 +17793,137 @@ fn arm_root_host_backed_descriptors_keep_one_owner() {
         (route, ret)
     };
 
-    // The run root's host-opened descriptions keep the host FileTable as their
-    // one owner (#1410 review P0-1..P0-4): its redirect reaches its own
-    // writes, close releases the host fd, and fcntl reports and changes the
-    // host description, including record locks the ring does not serve.
-    let tmp = GuestUserBuffer::from_bytes(b"/tmp\0");
-    let (_, made) = call_root(34, [LINUX_AT_FDCWD, tmp.arg(), 0o777, 0, 0, 0]);
-    assert!(made == 0 || made == -17, "mkdir /tmp: {made}");
-    let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-1410-redirect-target\0");
-    // Reads the redirect target back through a fresh root descriptor.
-    let read_target = |call_root: &mut dyn FnMut(u64, [u64; 6]) -> (CompletionRoute, i64)| {
-        let (_, fd) = call_root(56, [LINUX_AT_FDCWD, path.arg(), 0, 0, 0, 0]);
-        if fd < 0 {
-            return format!("<reopen failed: {fd}>").into_bytes();
-        }
-        let buf = GuestUserBuffer::zeroed(64);
-        let (_, n) = call_root(63, [fd as u64, buf.arg(), 64, 0, 0, 0]);
-        call_root(57, [fd as u64, 0, 0, 0, 0, 0]);
-        if n < 0 {
-            return format!("<read failed: {n}>").into_bytes();
-        }
-        buf.as_bytes()[..n as usize].to_vec()
+    let result = body(&mut call_root);
+    (result, dispatcher.stdout())
+}
+
+#[test]
+fn arm_root_host_backed_descriptors_keep_one_owner() {
+    use carrick_abi::{
+        LINUX_AT_FDCWD, LINUX_F_DUPFD, LINUX_F_GETFL, LINUX_F_GETLK, LINUX_F_SETFL, LINUX_F_SETLK,
+        LINUX_F_WRLCK, LINUX_O_APPEND, LINUX_O_CREAT, LINUX_O_NONBLOCK, LINUX_O_TRUNC,
+        LINUX_O_WRONLY, LinuxFlock64,
     };
-    let (_, file_fd) = call_root(
-        56,
-        [
-            LINUX_AT_FDCWD,
-            path.arg(),
-            LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_TRUNC,
-            0o600,
-            0,
-            0,
-        ],
-    );
-    assert_eq!(file_fd, 3);
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
 
-    // Every observation is checked, so a regression reports each broken
-    // owner rule at once instead of the first.
-    let mut mismatches = Vec::new();
-    let mut expect = |what: &str, got: i64, want: i64| {
-        if got != want {
-            mismatches.push(format!("{what}: got {got}, want {want}"));
-        }
-    };
+    let ((contents, final_contents, mut mismatches), stdout) =
+        with_arm_root_host_dispatch(|call_root| {
+            // The run root's host-opened descriptions keep the host FileTable as their
+            // one owner (#1410 review P0-1..P0-4): its redirect reaches its own
+            // writes, close releases the host fd, and fcntl reports and changes the
+            // host description, including record locks the ring does not serve.
+            let tmp = GuestUserBuffer::from_bytes(b"/tmp\0");
+            let (_, made) = call_root(34, [LINUX_AT_FDCWD, tmp.arg(), 0o777, 0, 0, 0]);
+            assert!(made == 0 || made == -17, "mkdir /tmp: {made}");
+            let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-1410-redirect-target\0");
+            // Reads the redirect target back through a fresh root descriptor.
+            let read_target =
+                |call_root: &mut dyn FnMut(u64, [u64; 6]) -> (CompletionRoute, i64)| {
+                    let (_, fd) = call_root(56, [LINUX_AT_FDCWD, path.arg(), 0, 0, 0, 0]);
+                    if fd < 0 {
+                        return format!("<reopen failed: {fd}>").into_bytes();
+                    }
+                    let buf = GuestUserBuffer::zeroed(64);
+                    let (_, n) = call_root(63, [fd as u64, buf.arg(), 64, 0, 0, 0]);
+                    call_root(57, [fd as u64, 0, 0, 0, 0, 0]);
+                    if n < 0 {
+                        return format!("<read failed: {n}>").into_bytes();
+                    }
+                    buf.as_bytes()[..n as usize].to_vec()
+                };
+            let (_, file_fd) = call_root(
+                56,
+                [
+                    LINUX_AT_FDCWD,
+                    path.arg(),
+                    LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_TRUNC,
+                    0o600,
+                    0,
+                    0,
+                ],
+            );
+            assert_eq!(file_fd, 3);
 
-    // P0-4: F_GETFL reports the host description's access mode.
-    expect(
-        "F_GETFL on an O_WRONLY host file",
-        call_root(25, [3, LINUX_F_GETFL, 0, 0, 0, 0]).1,
-        LINUX_O_WRONLY as i64,
-    );
+            // Every observation is checked, so a regression reports each broken
+            // owner rule at once instead of the first.
+            let mut mismatches = Vec::new();
+            let mut expect = |what: &str, got: i64, want: i64| {
+                if got != want {
+                    mismatches.push(format!("{what}: got {got}, want {want}"));
+                }
+            };
 
-    // P0-3: record locks on a host file are served, as on main.
-    let lock = GuestUserBuffer::from_value(LinuxFlock64 {
-        l_type: LINUX_F_WRLCK as i16,
-        ..Default::default()
-    });
-    expect(
-        "F_GETLK on a host file",
-        call_root(25, [3, LINUX_F_GETLK, lock.arg(), 0, 0, 0]).1,
-        0,
-    );
-    expect(
-        "F_SETLK on a host file",
-        call_root(25, [3, LINUX_F_SETLK, lock.arg(), 0, 0, 0]).1,
-        0,
-    );
+            // P0-4: F_GETFL reports the host description's access mode.
+            expect(
+                "F_GETFL on an O_WRONLY host file",
+                call_root(25, [3, LINUX_F_GETFL, 0, 0, 0, 0]).1,
+                LINUX_O_WRONLY as i64,
+            );
 
-    // P0-1: the shell's save/redirect/restore reaches the root's own write.
-    expect(
-        "fcntl(1, F_DUPFD, 10)",
-        call_root(25, [1, LINUX_F_DUPFD, 10, 0, 0, 0]).1,
-        10,
-    );
-    expect("dup3(3, 1)", call_root(24, [3, 1, 0, 0, 0, 0]).1, 1);
-    let redirected = GuestUserBuffer::from_bytes(b"redirected\n");
-    expect(
-        "redirected write(1)",
-        call_root(64, [1, redirected.arg(), 11, 0, 0, 0]).1,
-        11,
-    );
-    expect("dup3(10, 1)", call_root(24, [10, 1, 0, 0, 0, 0]).1, 1);
-    expect("close(10)", call_root(57, [10, 0, 0, 0, 0, 0]).1, 0);
-    let restored = GuestUserBuffer::from_bytes(b"restored\n");
-    expect(
-        "restored write(1)",
-        call_root(64, [1, restored.arg(), 9, 0, 0, 0]).1,
-        9,
-    );
-    let contents = read_target(&mut call_root);
+            // P0-3: record locks on a host file are served, as on main.
+            let lock = GuestUserBuffer::from_value(LinuxFlock64 {
+                l_type: LINUX_F_WRLCK as i16,
+                ..Default::default()
+            });
+            expect(
+                "F_GETLK on a host file",
+                call_root(25, [3, LINUX_F_GETLK, lock.arg(), 0, 0, 0]).1,
+                0,
+            );
+            expect(
+                "F_SETLK on a host file",
+                call_root(25, [3, LINUX_F_SETLK, lock.arg(), 0, 0, 0]).1,
+                0,
+            );
 
-    // P0-4: F_SETFL reaches the host description.
-    let append_nonblock = LINUX_O_APPEND | LINUX_O_NONBLOCK;
-    expect(
-        "F_SETFL O_APPEND|O_NONBLOCK",
-        call_root(25, [3, LINUX_F_SETFL, append_nonblock, 0, 0, 0]).1,
-        0,
-    );
-    expect(
-        "F_GETFL after F_SETFL",
-        call_root(25, [3, LINUX_F_GETFL, 0, 0, 0, 0]).1,
-        (LINUX_O_WRONLY | append_nonblock) as i64,
-    );
+            // P0-1: the shell's save/redirect/restore reaches the root's own write.
+            expect(
+                "fcntl(1, F_DUPFD, 10)",
+                call_root(25, [1, LINUX_F_DUPFD, 10, 0, 0, 0]).1,
+                10,
+            );
+            expect("dup3(3, 1)", call_root(24, [3, 1, 0, 0, 0, 0]).1, 1);
+            let redirected = GuestUserBuffer::from_bytes(b"redirected\n");
+            expect(
+                "redirected write(1)",
+                call_root(64, [1, redirected.arg(), 11, 0, 0, 0]).1,
+                11,
+            );
+            expect("dup3(10, 1)", call_root(24, [10, 1, 0, 0, 0, 0]).1, 1);
+            expect("close(10)", call_root(57, [10, 0, 0, 0, 0, 0]).1, 0);
+            let restored = GuestUserBuffer::from_bytes(b"restored\n");
+            expect(
+                "restored write(1)",
+                call_root(64, [1, restored.arg(), 9, 0, 0, 0]).1,
+                9,
+            );
+            let contents = read_target(&mut *call_root);
 
-    // P0-2: close releases the host fd; a later write is EBADF.
-    expect("close(3)", call_root(57, [3, 0, 0, 0, 0, 0]).1, 0);
-    let late = GuestUserBuffer::from_bytes(b"late\n");
-    expect(
-        "write(3) after close",
-        call_root(64, [3, late.arg(), 5, 0, 0, 0]).1,
-        carrick_syscall_abi::LINUX_EBADF.guest_retval(),
-    );
-    let final_contents = read_target(&mut call_root);
-    let stdout = dispatcher.stdout();
+            // P0-4: F_SETFL reaches the host description.
+            let append_nonblock = LINUX_O_APPEND | LINUX_O_NONBLOCK;
+            expect(
+                "F_SETFL O_APPEND|O_NONBLOCK",
+                call_root(25, [3, LINUX_F_SETFL, append_nonblock, 0, 0, 0]).1,
+                0,
+            );
+            expect(
+                "F_GETFL after F_SETFL",
+                call_root(25, [3, LINUX_F_GETFL, 0, 0, 0, 0]).1,
+                (LINUX_O_WRONLY | append_nonblock) as i64,
+            );
+
+            // P0-2: close releases the host fd; a later write is EBADF.
+            expect("close(3)", call_root(57, [3, 0, 0, 0, 0, 0]).1, 0);
+            let late = GuestUserBuffer::from_bytes(b"late\n");
+            expect(
+                "write(3) after close",
+                call_root(64, [3, late.arg(), 5, 0, 0, 0]).1,
+                carrick_syscall_abi::LINUX_EBADF.guest_retval(),
+            );
+            let final_contents = read_target(&mut *call_root);
+            (contents, final_contents, mismatches)
+        });
     for (what, got, want) in [
         ("target after restore", contents, &b"redirected\n"[..]),
         ("target after close", final_contents, &b"redirected\n"[..]),
@@ -17921,6 +17940,225 @@ fn arm_root_host_backed_descriptors_keep_one_owner() {
     assert!(
         mismatches.is_empty(),
         "root host-backed descriptors left their one owner:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// #1671: Node's `child_process.execSync` aborted in libuv's `uv__io_poll`
+/// (`assert(errno == EEXIST)`). The run root's `epoll_create1` is a ring
+/// constructor, the child's stdio pipes are host `socketpair` ends, and the
+/// ring forwards `epoll_ctl` of a host-backed member, to a host that had no
+/// description for the ring's epoll: `EPOLL_CTL_ADD` returned -9 (EBADF).
+/// The libuv spawn loop's shape: a ring signal pipe and a host socket in one
+/// ring epoll, re-added (EEXIST, then MOD), waited on, deleted and closed.
+#[test]
+fn arm_root_ring_epoll_takes_a_host_socket_member() {
+    use carrick_abi::{
+        LINUX_AF_UNIX, LINUX_EEXIST, LINUX_ENOENT, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL,
+        LINUX_EPOLL_CTL_MOD, LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_O_CLOEXEC, LINUX_O_NONBLOCK,
+        LINUX_SOCK_CLOEXEC, LINUX_SOCK_STREAM,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_syscall_abi::{LINUX_EBADF, LINUX_EINVAL};
+    use carrick_test_support::GuestUserBuffer;
+
+    const PIPE_COOKIE: u64 = 0x1671_0000_0000_0001;
+    const SOCKET_COOKIE: u64 = 0x1671_0000_0000_0002;
+    const WRITER_COOKIE: u64 = 0x1671_0000_0000_0003;
+    // The aarch64 `struct epoll_event`: events, padding, data.
+    let event = |events: u32, data: u64| {
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&events.to_ne_bytes());
+        bytes[8..].copy_from_slice(&data.to_ne_bytes());
+        GuestUserBuffer::from_bytes(&bytes)
+    };
+    let pair_of = |buffer: &GuestUserBuffer| {
+        let bytes = buffer.as_bytes();
+        [
+            i32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64,
+            i32::from_ne_bytes(bytes[4..8].try_into().unwrap()) as u64,
+        ]
+    };
+    let ((mismatches, reported), _) = with_arm_root_host_dispatch(|call_root| {
+        let mut mismatches = Vec::new();
+        let mut expect = |what: &str, got: i64, want: i64| {
+            if got != want {
+                mismatches.push(format!("{what}: got {got}, want {want}"));
+            }
+        };
+        let ctl = sys::EPOLL_CTL.raw();
+        let (route, epoll) = call_root(sys::EPOLL_CREATE1.raw(), [LINUX_O_CLOEXEC, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            route,
+            CompletionRoute::Served,
+            "the root's epoll_create1 is a ring constructor"
+        );
+        assert!(epoll >= 0, "epoll_create1: {epoll}");
+        let epoll = epoll as u64;
+        // uv_spawn's stdio pipe: a host AF_UNIX socketpair.
+        let sockets = GuestUserBuffer::zeroed(8);
+        let (route, made) = call_root(
+            sys::SOCKETPAIR.raw(),
+            [
+                LINUX_AF_UNIX as u64,
+                (LINUX_SOCK_STREAM | LINUX_SOCK_CLOEXEC) as u64,
+                0,
+                sockets.arg(),
+                0,
+                0,
+            ],
+        );
+        assert_eq!((route, made), (CompletionRoute::Forward, 0), "socketpair");
+        let [parent, child] = pair_of(&sockets);
+        // The loop's signal pipe: a ring pipe.
+        let pipe = GuestUserBuffer::zeroed(8);
+        let (route, made) = call_root(
+            sys::PIPE2.raw(),
+            [pipe.arg(), LINUX_O_CLOEXEC | LINUX_O_NONBLOCK, 0, 0, 0, 0],
+        );
+        assert_eq!((route, made), (CompletionRoute::Served, 0), "pipe2");
+        let [reader, writer] = pair_of(&pipe);
+
+        let pipe_in = event(LINUX_EPOLLIN, PIPE_COOKIE);
+        let socket_in = event(LINUX_EPOLLIN, SOCKET_COOKIE);
+        expect(
+            "ADD the ring pipe",
+            call_root(
+                ctl,
+                [epoll, LINUX_EPOLL_CTL_ADD, reader, pipe_in.arg(), 0, 0],
+            )
+            .1,
+            0,
+        );
+        expect(
+            "ADD the host socket",
+            call_root(
+                ctl,
+                [epoll, LINUX_EPOLL_CTL_ADD, parent, socket_in.arg(), 0, 0],
+            )
+            .1,
+            0,
+        );
+        // libuv's recovery path: ADD of a watched fd is EEXIST, then MOD.
+        expect(
+            "ADD the host socket again",
+            call_root(
+                ctl,
+                [epoll, LINUX_EPOLL_CTL_ADD, parent, socket_in.arg(), 0, 0],
+            )
+            .1,
+            LINUX_EEXIST.guest_retval(),
+        );
+        expect(
+            "MOD the host socket",
+            call_root(
+                ctl,
+                [epoll, LINUX_EPOLL_CTL_MOD, parent, socket_in.arg(), 0, 0],
+            )
+            .1,
+            0,
+        );
+        // Zone members after the host half: the same record, the same set.
+        expect(
+            "ADD the ring pipe again",
+            call_root(
+                ctl,
+                [epoll, LINUX_EPOLL_CTL_ADD, reader, pipe_in.arg(), 0, 0],
+            )
+            .1,
+            LINUX_EEXIST.guest_retval(),
+        );
+        let writer_out = event(LINUX_EPOLLOUT, WRITER_COOKIE);
+        expect(
+            "ADD the ring pipe's writer",
+            call_root(
+                ctl,
+                [epoll, LINUX_EPOLL_CTL_ADD, writer, writer_out.arg(), 0, 0],
+            )
+            .1,
+            0,
+        );
+
+        let events = GuestUserBuffer::zeroed(16 * 4);
+        let pwait = sys::EPOLL_PWAIT.raw();
+        let mut reported = Vec::new();
+        let mut harvest = |call_root: &mut dyn FnMut(u64, [u64; 6]) -> (CompletionRoute, i64)| {
+            let (_, ready) = call_root(pwait, [epoll, events.arg(), 4, 0, 0, 8]);
+            let cookies: Vec<u64> = (0..ready.max(0) as usize)
+                .map(|n| {
+                    u64::from_ne_bytes(
+                        events.as_bytes()[n * 16 + 8..n * 16 + 16]
+                            .try_into()
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            reported.push((ready, cookies));
+        };
+        // The writer is ready from the start; then the child writes.
+        harvest(&mut *call_root);
+        let output = GuestUserBuffer::from_bytes(b"child-ok\n");
+        expect(
+            "child write",
+            call_root(sys::WRITE.raw(), [child, output.arg(), 9, 0, 0, 0]).1,
+            9,
+        );
+        harvest(&mut *call_root);
+
+        expect(
+            "DEL the host socket",
+            call_root(ctl, [epoll, LINUX_EPOLL_CTL_DEL, parent, 0, 0, 0]).1,
+            0,
+        );
+        expect(
+            "DEL the host socket again",
+            call_root(ctl, [epoll, LINUX_EPOLL_CTL_DEL, parent, 0, 0, 0]).1,
+            LINUX_ENOENT.guest_retval(),
+        );
+        // A ring pipe is not an epoll: EINVAL, as Linux, not the host's EBADF.
+        expect(
+            "ADD to a ring pipe as the epoll",
+            call_root(
+                ctl,
+                [reader, LINUX_EPOLL_CTL_ADD, parent, socket_in.arg(), 0, 0],
+            )
+            .1,
+            LINUX_EINVAL.guest_retval(),
+        );
+        expect(
+            "close the epoll",
+            call_root(sys::CLOSE.raw(), [epoll, 0, 0, 0, 0, 0]).1,
+            0,
+        );
+        expect(
+            "ADD to the closed epoll",
+            call_root(
+                ctl,
+                [epoll, LINUX_EPOLL_CTL_ADD, parent, socket_in.arg(), 0, 0],
+            )
+            .1,
+            LINUX_EBADF.guest_retval(),
+        );
+        (mismatches, reported)
+    });
+    let mut mismatches = mismatches;
+    let want = vec![
+        (1, vec![WRITER_COOKIE]),
+        (2, vec![SOCKET_COOKIE, WRITER_COOKIE]),
+    ];
+    let mut sorted = reported.clone();
+    for (_, cookies) in &mut sorted {
+        cookies.sort_unstable();
+    }
+    if sorted != want {
+        mismatches.push(format!(
+            "epoll_pwait reports: got {reported:x?}, want {want:x?}"
+        ));
+    }
+    assert!(
+        mismatches.is_empty(),
+        "a ring epoll's host member left libuv's contract:\n{}",
         mismatches.join("\n")
     );
 }
