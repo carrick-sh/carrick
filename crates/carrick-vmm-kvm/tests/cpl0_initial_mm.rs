@@ -609,6 +609,20 @@ fn native_fork_child_exec_default_terminate_while_parked() {
     parked_exec_signal_witness("-DTERM_PARKED", b"");
 }
 
+/// A pending caught SIGUSR1 has a lower number than fatal SIGTERM. The
+/// cancelled exec must end the group without calling the old-image handler.
+#[test]
+fn native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked() {
+    parked_exec_signal_witness("-DTWO_SIGNALS_PARKED", b"");
+}
+
+/// A real sibling can consume group-directed SIGTERM while the exec caller
+/// remains parked. Its group exit must retire the caller without RAX=59.
+#[test]
+fn native_fork_child_exec_sibling_fatal_signal_retires_parked_caller() {
+    parked_exec_signal_witness("-DTWO_THREAD_TERM_PARKED", b"S\n");
+}
+
 fn parked_exec_signal_witness(flag: &str, stdout: &[u8]) {
     let directory = tempfile::tempdir().expect("successor directory");
     let successor = directory.path().join("successor");
@@ -624,7 +638,10 @@ fn parked_exec_signal_witness(flag: &str, stdout: &[u8]) {
             .expect("stock census")
             .successor_table_refusals
             > 0,
-        "the signal must reach a parked exec"
+        "the signal must reach a parked exec: exit={}, stdout={:?}, stderr={:?}",
+        outcome.run.exit_code,
+        outcome.run.stdout,
+        outcome.run.stderr
     );
     assert_eq!(outcome.run.exit_code, 0, "parked signal/wait4 result");
     assert_eq!(outcome.run.stdout, stdout, "successor execution marker");

@@ -4,7 +4,7 @@
 .global _start
 .text
 _start:
-#if defined(CAUGHT_PARKED) || defined(IGNORED_PARKED)
+#if defined(CAUGHT_PARKED) || defined(IGNORED_PARKED) || defined(TWO_SIGNALS_PARKED)
     lea signal_action(%rip), %rsi
     mov $10, %edi
     xor %edx, %edx
@@ -49,9 +49,17 @@ _start:
     mov $8, %r10d
     mov $128, %eax
     syscall
-#if defined(CANCEL_PARKED) || defined(TERM_PARKED) || defined(CAUGHT_PARKED) || defined(IGNORED_PARKED)
+#if defined(CANCEL_PARKED) || defined(TERM_PARKED) || defined(CAUGHT_PARKED) || defined(IGNORED_PARKED) || defined(TWO_SIGNALS_PARKED) || defined(TWO_THREAD_TERM_PARKED)
     mov %r13d, %edi
-#ifdef TERM_PARKED
+#ifdef TWO_SIGNALS_PARKED
+    mov $10, %esi
+    mov $62, %eax
+    syscall
+    test %eax, %eax
+    jnz failure
+#endif
+    mov %r13d, %edi
+#if defined(TERM_PARKED) || defined(TWO_SIGNALS_PARKED) || defined(TWO_THREAD_TERM_PARKED)
     mov $15, %esi
 #elif defined(CAUGHT_PARKED) || defined(IGNORED_PARKED)
     mov $10, %esi
@@ -86,10 +94,10 @@ _start:
     syscall
     cmp %r13d, %eax
     jne wait_child_failure
-#if defined(CANCEL_PARKED) || defined(TERM_PARKED) || defined(CAUGHT_PARKED)
+#if defined(CANCEL_PARKED) || defined(TERM_PARKED) || defined(CAUGHT_PARKED) || defined(TWO_SIGNALS_PARKED) || defined(TWO_THREAD_TERM_PARKED)
     mov exec_status(%rip), %eax
     and $127, %eax
-#ifdef TERM_PARKED
+#if defined(TERM_PARKED) || defined(TWO_SIGNALS_PARKED) || defined(TWO_THREAD_TERM_PARKED)
     cmp $15, %eax
 #elif defined(CAUGHT_PARKED)
     cmp $10, %eax
@@ -97,7 +105,7 @@ _start:
     cmp $9, %eax
 #endif
     jne signal_status_failure
-#if defined(CANCEL_PARKED) || defined(TERM_PARKED)
+#if defined(CANCEL_PARKED) || defined(TERM_PARKED) || defined(TWO_SIGNALS_PARKED) || defined(TWO_THREAD_TERM_PARKED)
     /* The holder must still be alive when wait4 of the killed exec returns. */
     mov %r12d, %edi
     lea holder_status(%rip), %rsi
@@ -113,7 +121,7 @@ _start:
     test %eax, %eax
     jnz failure
 #endif
-#if defined(CANCEL_PARKED) || defined(TERM_PARKED)
+#if defined(CANCEL_PARKED) || defined(TERM_PARKED) || defined(TWO_SIGNALS_PARKED) || defined(TWO_THREAD_TERM_PARKED)
     mov %r12d, %edi
     mov $12, %esi
     mov $62, %eax
@@ -151,7 +159,26 @@ exec_child:
     syscall
     test %eax, %eax
     jnz failure
-#if defined(CAUGHT_PARKED) || defined(IGNORED_PARKED)
+#ifdef TWO_THREAD_TERM_PARKED
+    mov $0x50f00, %edi
+    lea thread_stack_top(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    mov $56, %eax
+    syscall
+    test %eax, %eax
+    js clone_failure
+    jz sibling
+wait_sibling_ready:
+    cmpl $1, sibling_ready(%rip)
+    je sibling_ready_for_exec
+    mov $24, %eax
+    syscall
+    jmp wait_sibling_ready
+sibling_ready_for_exec:
+#endif
+#if defined(CAUGHT_PARKED) || defined(IGNORED_PARKED) || defined(TWO_SIGNALS_PARKED)
     /* Leave SIGUSR2 blocked for the holder handshake, but allow SIGUSR1
      * to reach the parked exec service. */
     mov $14, %eax
@@ -168,9 +195,51 @@ exec_child:
     xor %edx, %edx
     mov $59, %eax
     syscall
+#ifdef TWO_THREAD_TERM_PARKED
+    mov %eax, %r14d
+    mov $1, %eax
+    mov $1, %edi
+    lea old_exec_return_marker(%rip), %rsi
+    mov $2, %edx
+    syscall
+    mov %r14d, %eax
+#endif
     neg %eax
     mov %eax, %edi
     jmp exit
+#ifdef TWO_THREAD_TERM_PARKED
+sibling:
+    mov $14, %eax
+    xor %esi, %esi
+    lea term_mask(%rip), %rsi
+    mov $0, %edi
+    xor %edx, %edx
+    mov $8, %r10d
+    syscall
+    test %eax, %eax
+    jnz clone_failure
+    movl $1, sibling_ready(%rip)
+    lea term_mask(%rip), %rdi
+    xor %esi, %esi
+    lea long_bound(%rip), %rdx
+    mov $8, %r10d
+    mov $128, %eax
+    syscall
+    cmp $15, %eax
+    jne clone_failure
+    mov $1, %eax
+    mov $1, %edi
+    lea sibling_consumed_marker(%rip), %rsi
+    mov $2, %edx
+    syscall
+    xor %edi, %edi
+    mov $60, %eax
+    syscall
+    ud2
+clone_failure:
+    mov $95, %edi
+    jmp exit
+#endif
 failure:
     mov $91, %edi
     jmp exit
@@ -216,10 +285,10 @@ successor: .asciz SUCCESSOR_PATH
 .balign 8
 argv: .quad successor, 0
 blocked: .quad (1 << 9) | (1 << 11)
-#if defined(CAUGHT_PARKED) || defined(IGNORED_PARKED)
+#if defined(CAUGHT_PARKED) || defined(IGNORED_PARKED) || defined(TWO_SIGNALS_PARKED)
 .balign 8
 signal_action:
-#ifdef CAUGHT_PARKED
+#if defined(CAUGHT_PARKED) || defined(TWO_SIGNALS_PARKED)
     .quad caught_handler, 0x04000000, signal_restorer, 0
 #else
     .quad 1, 0, 0, 0
@@ -233,12 +302,37 @@ long_bound: .quad 5, 0
 .balign 4
 exec_status: .space 4
 holder_status: .space 4
-#ifdef CAUGHT_PARKED
+#if defined(CAUGHT_PARKED) || defined(TWO_SIGNALS_PARKED)
 .text
 caught_handler:
+#ifdef TWO_SIGNALS_PARKED
+    mov $1, %eax
+    mov $1, %edi
+    lea old_handler_marker(%rip), %rsi
+    mov $2, %edx
+    syscall
+#endif
     ret
 signal_restorer:
     mov $15, %eax
     syscall
     ud2
+#endif
+#ifdef TWO_SIGNALS_PARKED
+.section .rodata
+old_handler_marker: .ascii "H\n"
+#endif
+#ifdef TWO_THREAD_TERM_PARKED
+.section .rodata
+old_exec_return_marker: .ascii "R\n"
+sibling_consumed_marker: .ascii "S\n"
+term_mask: .quad (1 << 14)
+#endif
+#ifdef TWO_THREAD_TERM_PARKED
+.section .bss
+.balign 16
+thread_stack: .space 16384
+thread_stack_top:
+.balign 4
+sibling_ready: .space 4
 #endif
