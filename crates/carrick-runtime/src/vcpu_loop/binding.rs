@@ -11257,7 +11257,7 @@ mod tests {
             let used = |key: u64, n: u64| {
                 let ipa = GRANT_BASE + n * COW_GRANT_SIZE;
                 pool.publish(key, ipa, backing(n + 1)).unwrap();
-                let grant = pool.claim(key).unwrap();
+                let grant = pool.claim(key, 0).unwrap();
                 assert!(pool.complete(&CowGrantCompletion {
                     purpose: CowGrantPurpose::UserWrite,
                     grant,
@@ -11265,6 +11265,7 @@ mod tests {
                     span_len: COW_GRANT_SIZE,
                     old_ipa: 0x80_0000_0000 + n * COW_GRANT_SIZE,
                     new_ipa: grant.physical_ipa,
+                    tables_linked: 0,
                 }));
             };
             for n in 0..COW_GRANT_PROBES as u64 {
