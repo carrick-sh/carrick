@@ -7134,6 +7134,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok_or(NativeProcessError::Quarantined)?
             {
                 carrick_core::terminal::LosingMemberSettlement::HostCustody => {
+                    self.source.zone.release_space(self.source.slot);
                     return Ok(Some(LifecycleOutcome::HostCustody));
                 }
                 carrick_core::terminal::LosingMemberSettlement::Released(receipt) => {
