@@ -528,7 +528,7 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
     // The x86 receipt carries a failing row's key stderr line (#2327: exit code and key stderr per row).
     fs::write(
         temp.join("scoreboard/x86_64/receipt.json"),
-        r#"{"rows":[{"name":"py-version","key_stderr_line":""},{"name":"py-thread","key_stderr_line":"carrick: guest killed by SIGSEGV $(echo injected)"}]}"#,
+        r#"{"rows":[{"name":"py-version","passed":true,"key_stderr_line":"carrick: image pulling"},{"name":"py-fork","passed":false,"key_stderr_line":""},{"name":"py-thread","passed":false,"key_stderr_line":"carrick: guest killed by SIGSEGV $(echo injected)"}]}"#,
     )
     .expect("write x86 receipt");
     let ok_post = post("success", "success");
