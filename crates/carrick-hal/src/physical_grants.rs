@@ -780,11 +780,14 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
     }
     /// Retain the inventory receipt and backing before publishing READY. The
     /// exclusion keeps the ring from observing a partly admitted batch.
+    /// `tables` are the split tables the fork owner reserved for this grant
+    /// (#2276), or none; only a block repoint claims a grant that has them.
     pub fn publish_cow(
         &mut self,
         unpublished: UnpublishedPhysicalGrant<R>,
         pool: &carrick_el1_abi::CowGrantPool,
         excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        tables: carrick_el1_abi::CowSplitTables,
     ) -> Result<(), TrapError>
     where
         R: Send + 'static,
@@ -797,7 +800,11 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
             || staged.grants.len() != 1
             || staged.length.raw() != carrick_el1_abi::COW_GRANT_SIZE
             || staged.permissions != COW_GRANT_PERMISSIONS
-            || pool.ready(excluded.key()).count() >= Self::REFILL_GRANTS
+            || pool
+                .ready(excluded.key())
+                .filter(|ready| ready.tables.is_empty() == tables.is_empty())
+                .count()
+                >= Self::REFILL_GRANTS
         {
             unpublished.abort_inventory()?;
             return Err(fail());
@@ -814,7 +821,7 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
             published: None,
         });
         let published = pool
-            .publish(excluded.key(), grant.gpa.raw(), grant.identity)
+            .publish_with_tables(excluded.key(), grant.gpa.raw(), grant.identity, tables)
             .ok_or_else(fail)?;
         entry.published = Some(published);
         Ok(())
@@ -825,11 +832,13 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
     /// descriptor: a later MAP_FIXED or unmap may already have replaced it.
     /// This owner authenticates retained physical custody and completes the
     /// pool record exactly once; no backend descriptor verdict is accepted.
+    /// Returns the settled completions: the fork owner settles the split
+    /// tables of any that carried them.
     pub fn settle(
         &mut self,
         pool: &carrick_el1_abi::CowGrantPool,
         excluded: &carrick_sched_core::ExcludedEditor<'_>,
-    ) -> Result<usize, TrapError> {
+    ) -> Result<Vec<carrick_el1_abi::CowGrantCompletion>, TrapError> {
         let fail = || TrapError::Hypervisor("native USED physical receipt mismatch".into());
         if self.failed
             || excluded.key() != self.owner.native_mm.raw().get()
@@ -837,7 +846,7 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
         {
             return Err(fail());
         }
-        let mut count = 0;
+        let mut settled = Vec::new();
         for completion in pool.completions(excluded) {
             if !completion.is_well_formed() {
                 return Err(fail());
@@ -858,9 +867,9 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
                 return Err(fail());
             }
             entry.published = None;
-            count += 1;
+            settled.push(completion);
         }
-        Ok(count)
+        Ok(settled)
     }
 }
 
