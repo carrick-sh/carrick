@@ -16637,6 +16637,7 @@ fn futex_mapping_synchronous_redispatch_rewinds_syscall() {
     );
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum FutexOwnerRefusal {
     Copy,
