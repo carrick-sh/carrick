@@ -1413,16 +1413,6 @@ pub(super) struct NativeServiceBegin {
     service_wait: Option<carrick_core_abi::PortalOwnerWait>,
 }
 
-#[cfg(test)]
-impl NativeServiceBegin {
-    pub(super) fn is_fault_operation(&self) -> bool {
-        matches!(
-            self.operation,
-            Some(carrick_core_abi::service::ServiceOperation::Fault(_))
-        )
-    }
-}
-
 /// What staging decided for one owned native syscall or exception exit.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(super) enum NativeServiceDecision {
