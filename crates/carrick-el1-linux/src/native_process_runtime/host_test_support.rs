@@ -3266,11 +3266,23 @@ fn park_anonymous_sibling(
     fixture: &NativeSignalFixture,
     sibling: &ExecSibling,
 ) -> carrick_sched_core::object_wait::ObjectWaitKey {
+    park_anonymous_sibling_on(
+        fixture,
+        sibling,
+        carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+    )
+}
+
+#[cfg(test)]
+fn park_anonymous_sibling_on(
+    fixture: &NativeSignalFixture,
+    sibling: &ExecSibling,
+    cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
+) -> carrick_sched_core::object_wait::ObjectWaitKey {
     use carrick_core::wait::{
         EditWaitOutcome, ObjectParkRequest, coordinate_anonymous_edit_wait, park_object_record,
     };
     use carrick_sched_core::object_wait::ObjectWaitError;
-    use carrick_sched_core::spaces::notification::SpaceWaitCause;
 
     assert!(fixture.zone.mark_native_owned(sibling.record.id));
     let space = fixture.zone.space_entry(NonZeroU64::MIN).unwrap();
@@ -3284,11 +3296,11 @@ fn park_anonymous_sibling(
         )
         .unwrap();
     let notifications = space.notifications(NonZeroU64::MIN).unwrap();
-    let key = notifications.key(SpaceWaitCause::Editor);
+    let key = notifications.key(cause);
     let outcome = coordinate_anonymous_edit_wait(
         &notifications,
         None,
-        || Some(Some(SpaceWaitCause::Editor)),
+        || Some(Some(cause)),
         |key, snapshot, operation| {
             let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, operation, None);
             let parked = park_object_record(
@@ -3357,6 +3369,236 @@ fn park_anonymous_sibling(
         carrick_sched_core::Claim::Parked { .. }
     ));
     key
+}
+
+#[cfg(test)]
+#[test]
+fn settlement_doorbell_failure_and_exit_group_preserve_single_flight() {
+    use carrick_core_abi::{
+        ReservationMm, ReservationRange, SettlementClaim, SettlementDoorbellAnswer,
+        SettlementDoorbellReply,
+    };
+    use carrick_el1::memory::reservations::{Layout, SharedReservations};
+    use carrick_hal::return_settlement::{SettlementDoorbellService, service_settlement_doorbell};
+    use carrick_sched_core::spaces::notification::{SpaceReleaseVenue, SpaceWaitCause};
+    use std::cell::Cell;
+
+    struct Doorbell<'a> {
+        table: &'a SharedReservations,
+        zone: &'a ZoneTables<ParkedContextWords>,
+        index: usize,
+        calls: usize,
+        releases: usize,
+        body: &'a mut dyn FnMut() -> Result<SettlementDoorbellAnswer, &'static str>,
+    }
+    impl SettlementDoorbellService for Doorbell<'_> {
+        type Error = &'static str;
+        fn settle(&mut self, mm: ReservationMm) -> Result<SettlementDoorbellAnswer, &'static str> {
+            self.calls += 1;
+            assert!(
+                self.table
+                    .lock(self.index, mm)
+                    .unwrap()
+                    .claim_return_settlement(1)
+                    .is_none(),
+                "no takeover during service"
+            );
+            (self.body)()
+        }
+        fn release(
+            &mut self,
+            mm: ReservationMm,
+            claim: SettlementClaim,
+        ) -> Result<(), &'static str> {
+            if self.table.release_return_settlement(claim) {
+                self.releases += 1;
+                if let Some(source) = self
+                    .zone
+                    .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+                    .and_then(|entry| entry.live_notifications().ok())
+                {
+                    fn deliver(
+                        zone: &ZoneTables<ParkedContextWords>,
+                        _: carrick_sched_core::Waker,
+                        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                            '_,
+                            ParkedContextWords,
+                        >,
+                    ) {
+                        crate::sched::object_wait::deliver_host_completion(zone, effects);
+                    }
+                    SpaceReleaseVenue {
+                        zone: self.zone,
+                        waker: carrick_sched_core::Waker::Host,
+                        deliver:
+                            carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                                deliver,
+                            ),
+                    }
+                    .publish(source.reserve(SpaceWaitCause::Reservations));
+                }
+            }
+            Ok(())
+        }
+    }
+    for group_exit in [false, true] {
+        let fixture = native_exec_fixture();
+        let sibling = add_signal_sibling(&fixture, None, false);
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        // SAFETY: this aligned, zeroed region owns the complete production
+        // reservation table for the entire decoded-doorbell schedule.
+        let table = unsafe {
+            &*region
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_RESERVATIONS_OFFSET as usize)
+                .cast::<SharedReservations>()
+        };
+        let mm = ReservationMm::new(1).unwrap();
+        let index = fixture.zone.spaces.find(mm.raw()).unwrap().index();
+        let layout = Layout {
+            heap: ReservationRange::new(0x1000, 0x100000).unwrap(),
+            arena: ReservationRange::new(0x100000, 0x1000000).unwrap(),
+            brk: 0x1000,
+            address_limit: u64::MAX,
+            data_limit: u64::MAX,
+            external_address_bytes: 0,
+            external_data_bytes: 0,
+        };
+        table.publish(index, mm, layout).unwrap();
+        table.lock(index, mm).unwrap().finish_import().unwrap();
+        let claim = table
+            .lock(index, mm)
+            .unwrap()
+            .claim_return_settlement(0)
+            .unwrap();
+        let waiter = if group_exit {
+            None
+        } else {
+            Some(park_anonymous_sibling_on(
+                &fixture,
+                &sibling,
+                SpaceWaitCause::Reservations,
+            ))
+        };
+        let fail_once = Cell::new(!group_exit);
+        let mut body = || {
+            if group_exit {
+                // Another live thread publishes the claimant's real group
+                // terminal decision while the carrier entry owns its claim.
+                let mut physical = fixture.service();
+                physical.waker_slot = sibling.slot;
+                let mut entry = fixture
+                    .runtime
+                    .enter_registered(
+                        fixture.registry,
+                        BornInZoneSource {
+                            zone: fixture.zone,
+                            slot: sibling.slot,
+                        },
+                        sibling.task,
+                        fixture.address,
+                        &words(fixture.address),
+                        &mut physical,
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    entry.exit_group(23),
+                    LifecycleOutcome::Transferred { .. }
+                ));
+                assert!(entry.take_run_failure().is_none());
+                assert!(fixture.control.host_exit_requested());
+                assert!(fixture.page.exit_wait().is_some());
+            }
+            if fail_once.replace(false) {
+                Err("injected doorbell service failure")
+            } else {
+                Ok(SettlementDoorbellReply::Settled.into())
+            }
+        };
+        let mut doorbell = Doorbell {
+            table,
+            zone: fixture.zone,
+            index,
+            calls: 0,
+            releases: 0,
+            body: &mut body,
+        };
+        let answer = service_settlement_doorbell(&mut doorbell, mm, claim, true);
+        assert_eq!(doorbell.releases, 1, "the actual carrier epilogue ran once");
+        assert!(!table.lock(index, mm).unwrap().return_settlement_claimed());
+        if let Some(key) = waiter {
+            assert_eq!(answer, Err("injected doorbell service failure"));
+            assert_eq!(
+                fixture
+                    .zone
+                    .object_queue_census(key.index())
+                    .unwrap()
+                    .waiters,
+                0
+            );
+            assert!(!matches!(
+                fixture.zone.record(sibling.record.id).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ));
+            assert!(
+                fixture
+                    .zone
+                    .record(sibling.record.id)
+                    .has_object_operation(),
+                "the next refuser retains its original operation"
+            );
+            let next = table
+                .lock(index, mm)
+                .unwrap()
+                .claim_return_settlement(1)
+                .unwrap();
+            // A late duplicate from the failed crossing cannot release the
+            // next driver's exact claim or publish another wake.
+            let source = fixture
+                .zone
+                .space_entry(NonZeroU64::MIN)
+                .unwrap()
+                .live_notifications()
+                .unwrap();
+            let before = source.observe(SpaceWaitCause::Reservations);
+            service_settlement_doorbell(&mut doorbell, mm, claim, false).unwrap();
+            assert_eq!(source.observe(SpaceWaitCause::Reservations), before);
+            assert!(table.lock(index, mm).unwrap().return_settlement_claimed());
+            assert_eq!(
+                service_settlement_doorbell(&mut doorbell, mm, next, true),
+                Ok(SettlementDoorbellReply::Settled.into())
+            );
+            assert_eq!((doorbell.calls, doorbell.releases), (2, 2));
+        } else {
+            assert_eq!(answer, Ok(SettlementDoorbellReply::Settled.into()));
+            assert_eq!(
+                doorbell.calls, 1,
+                "terminal publication never starts a second driver"
+            );
+            table.lock(index, mm).unwrap().retire().unwrap();
+            let successor = ReservationMm::new(2).unwrap();
+            table.publish(index, successor, layout).unwrap();
+            table
+                .lock(index, successor)
+                .unwrap()
+                .finish_import()
+                .unwrap();
+            let next = table
+                .lock(index, successor)
+                .unwrap()
+                .claim_return_settlement(0)
+                .unwrap();
+            service_settlement_doorbell(&mut doorbell, mm, claim, false).unwrap();
+            assert_eq!((doorbell.calls, doorbell.releases), (1, 1));
+            assert!(
+                table
+                    .lock(index, successor)
+                    .unwrap()
+                    .return_settlement_claimed()
+            );
+            assert!(table.release_return_settlement(next));
+        }
+    }
 }
 
 #[cfg(test)]
