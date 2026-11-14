@@ -412,7 +412,7 @@ fn x86_owner_fork_arm_and_abort(huge: bool) {
     let original = if huge {
         IPA | PRESENT | WRITE | USER | HUGE | MAY_WRITE | NX
     } else {
-        parent_tables.words[1024].store(ROOT + 12288 | PRESENT | WRITE | USER, Ordering::Release);
+        parent_tables.words[1024].store((ROOT + 12288) | PRESENT | WRITE | USER, Ordering::Release);
         IPA | PRESENT | WRITE | USER | MAY_WRITE | NX
     };
     parent_tables.words[if huge { 1024 } else { 1536 }].store(original, Ordering::Release);
