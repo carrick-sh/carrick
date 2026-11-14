@@ -22,6 +22,31 @@ verification, the signed evidence and landing.
 
   (`ctb` was retired on 2026-11-09, so only `hz` remains.)
 
+- **About four lanes, each aimed at a scoreboard row; Opus on hard work**
+  (owner, 2026-11-14, #231). A lane is one issue, with its author and
+  review VMs. `worker start` refuses a fifth lane on a host with exit 75,
+  "lane cap reached" (`lanes` in `limits.json`). Every brief says
+  `Lane class: hard` (shared kernel, mm, fork, signal, lifecycle),
+  `mechanical` or `review`. `worker start` refuses a hard brief unless a
+  Claude Opus model authors it; `--allow-fallback` overrides that, is
+  logged, and is used only after the shepherd's documented wait.
+- **Evidence before review** (owner, 2026-11-14, #231). A lane aimed at a
+  row puts `Row: <row>` in its brief. The round isn't done until the row's
+  real evidence ran on the PR's current head: a paired signed m4 run for
+  ARM, a KVM row repro for x86. Its counts go in the result's
+  `row_evidence`. A shepherd starts a review only when
+  `row-evidence-check.sh` prints `ROW-EVIDENCE: pass`. Go round 3's
+  no-op fix and the Node "result 28" lead each cost a review cycle before
+  the signed run showed it.
+- **Shepherds land; the director audits** (owner, 2026-11-14, #231). When a
+  review worker approves the PR's current head, the host-side shepherd
+  publishes the review with `publish-review.sh` and runs `landing-check.sh`.
+  Only when its last line reads `LANDING-CHECK: pass` does the shepherd run
+  `gh pr ready` and `director-watch add land`. Worker VMs still can't mark a
+  PR ready (the template's guest `gh` guard). The `worker-shepherd` agent
+  and the `conductor-workers` skill in carrick-sh/agy-director follow these
+  rules; the tooling backlog is #2328 (`director-tooling`).
+
 - **One owner per syscall family and mechanism; check before starting a
   lane** (a lane is one worker's assigned issue). This puts "Search before
   writing" into practice. Duplicated lanes come from starting work on fresh

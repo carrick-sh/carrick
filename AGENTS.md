@@ -228,6 +228,12 @@ skills `carrick-trace` and `carrick-lldb`.
   result, a crash or hang, data loss, a security hole, a broken invariant, or
   a missing witness for the PR's own claim. P1s and P2s become linked
   `follow-up` issues. A P1 escalates only on evidence that it blocks landing.
+- **A lane aimed at a scoreboard row shows that row's evidence before
+  review** (owner, 2026-11-14): a paired signed m4 run (ARM) or a KVM row
+  repro (x86) on the PR's current head, recorded in the result's
+  `row_evidence`. `row-evidence-check.sh` gates the review. Lane caps,
+  lane classes and shepherd landing:
+  [`docs/director-playbook.md`](docs/director-playbook.md#directing-workers-is-reviewing-diffs-not-reading-reports).
 - **Flaky or crash fixes land on population evidence:** 10 runs, base vs head,
   one signed artifact each, plus a signed A/B showing the crash gone.
 - **Land through the merge queue.** The required checks are `ci-ok` and
