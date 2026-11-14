@@ -1576,48 +1576,6 @@ fn arm_vfork_while_sibling_parked_in_wait4_suspends_parent_until_release() {
     );
 }
 
-/// #2300: the second optional gettimeofday output must be prepared even
-/// when the first record is already writable. Enter through the live native
-/// process dispatcher, then use its production service capture.
-#[test]
-fn arm_gettimeofday_second_output_retains_owner_preparation() {
-    let mut harness = ProductionProcessHarness::new();
-    let mut cpu = crate::sched::FakeCpu::default();
-    let mut frame = carrick_el1_abi::TrapFrame {
-        esr: 0x15 << 26,
-        ..Default::default()
-    };
-    frame.x[8] = carrick_abi::syscall::nr::GETTIMEOFDAY.raw();
-    frame.x[0] = VA + 4096;
-    frame.x[1] = VA;
-    assert_eq!(
-        harness.call_current(&mut frame, &mut cpu),
-        carrick_personality_linux::dispatch::CompletionRoute::Forward
-    );
-    struct SecondOutput;
-    impl crate::file::MemoryValidator for SecondOutput {
-        fn writable_bytes(&self, address: u64, len: usize) -> usize {
-            if address == VA { 0 } else { len }
-        }
-        fn readable_bytes(&self, _: u64, len: usize) -> usize {
-            len
-        }
-    }
-    let decision = super::super::dispatch::native_service_decision(
-        &mut frame,
-        harness.task,
-        carrick_el1_abi::Action::Forward,
-        None,
-        &carrick_el1_abi::Counters::new(),
-        || super::super::native_process_runtime::NativeThreadGroupOwner::ForkChild,
-        |frame| super::super::dispatch::native_crossing_output_stage(frame, &SecondOutput),
-    );
-    let super::super::dispatch::NativeServiceDecision::Begin(begin) = decision else {
-        panic!("second gettimeofday output must retain an owner fault")
-    };
-    assert!(begin.is_fault_operation());
-}
-
 /// #2071 witness 5: a child exits between the first waiter parking and the
 /// second waiter parking (while the first waiter's continuation row is still
 /// retained before its resume checkpoint runs, and across channel generation

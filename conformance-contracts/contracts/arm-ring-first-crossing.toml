@@ -11,11 +11,11 @@ fixture = "fixtures/linux-aarch64-hello/src/ring_first.rs"
 scale_points = [1]
 structural_budgets = []
 rationale = """
-#2300 adds optional gettimeofday timeval/timezone preparation to the shared
-crossing venue. It checks at most two fixed records without allocating a
-range array or making a host call before preparation. The native-process
-witness proves second-record owner-fault selection; completed physical
-supply and host copyout remain unverified and are not claimed by this binding.
+#2300 declares both optional gettimeofday records and compares them with the
+real host-root SyscallDispatcher copyout. The host venue prepares both records
+through copyout::prepare independently of crossing metadata. NativeProcess
+crossings have no ARM host executor and must retain their refusal path without
+preparing outputs. No signed physical supply or host copyout is claimed here.
 
 The owner accepts ENOSYS for unported guest authority calls under the strict
 ARM switch. A refused getuid has exactly one refusal and zero forwarded calls;
@@ -47,8 +47,6 @@ changing either live policy.
 
 [bindings]
 vm_free = [
-  "carrick-personality-linux::crossing::tests::all_crossings_declare_abi_output_arguments",
-  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_gettimeofday_second_output_retains_owner_preparation",
   "carrick-el1-linux::production_x86_family_absences_obey_crossings_without_user_memory",
   "carrick-personality-linux::dispatch::service_owner_tests::service_owner_agrees_with_tsv_crossings_and_retains_wired_families",
   "carrick-personality-linux::dispatch::service_owner_tests::temporary_crossings_are_owed_to_ring",
@@ -64,6 +62,8 @@ vm_free = [
   "carrick-personality-linux::dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier",
   "carrick-vmm-hvf::hatch::tests::aperture_configuration_preserves_service_copy_slot_zero",
   "carrick-vmm-hvf::hatch::tests::carrier_admission_rejects_conflicting_ring_policy_without_changing_it",
+  "carrick-personality-linux::crossing::tests::all_crossings_declare_abi_output_arguments",
+  "carrick-kernel::dispatch::copyout_tests::arm_host_gettimeofday_copyout_matches_both_declared_records",
 ]
 embed = [
   "carrick-embed::arm_ring_first_strict_glibc_loader_witness",
