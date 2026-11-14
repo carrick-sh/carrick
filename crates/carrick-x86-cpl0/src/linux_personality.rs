@@ -1466,6 +1466,7 @@ impl Personality for LinuxPersonality {
                 // the bytes gathered before it, as Linux's user copy does.
                 let mut retry = false;
                 let mut crosses = false;
+                let mut parked = false;
                 let stage = match stage.fault() {
                     Some((address, access)) => {
                         match supply_syscall_fault(binding, task, counters, slot, address, access) {
@@ -1473,18 +1474,27 @@ impl Personality for LinuxPersonality {
                                 retry = true;
                                 None
                             }
+                            // MM contention is "not now", never a refusal:
+                            // park the unchanged call on the cause's release
+                            // through the FaultRetry wait a user #PF takes,
+                            // and rerun it whole from its `syscall`.
+                            UserFaultSupply::Contended(cause) => {
+                                use carrick_guest_arch::ProcessContext;
+                                let mut rerun = words;
+                                rerun.restart_syscall();
+                                rerun.set_syscall_return(call.native.raw());
+                                match anonymous::park_contended_fault(task, slot, cause, &rerun) {
+                                    anonymous::ContendedFault::Parked => parked = true,
+                                    anonymous::ContendedFault::Rerun => retry = true,
+                                    // The caller's own live MM refused the
+                                    // wait: a broken invariant, as on #PF.
+                                    anonymous::ContendedFault::Refused => fatal_boot(),
+                                }
+                                None
+                            }
                             // The owner refused or could not supply the
                             // access (no reservation names it): never a
                             // carrier abort.
-                            // Cancelled with its reason: this stage cannot
-                            // park and replay its call yet, so a contended
-                            // staged copy keeps the refusal it had (#2141
-                            // follow-up).
-                            UserFaultSupply::Contended(cancelled) => {
-                                let _: carrick_sched_core::spaces::notification::SpaceWaitCause =
-                                    cancelled;
-                                Some(stage.refused())
-                            }
                             UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
                                 Some(stage.refused())
                             }
@@ -1555,7 +1565,9 @@ impl Personality for LinuxPersonality {
                         Some(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
                     }
                 };
-                route = if retry {
+                route = if parked {
+                    CompletionRoute::Suspended
+                } else if retry {
                     // Rewind to the `syscall` instruction with the original
                     // number, exactly as a restarted call re-enters.
                     frame.rax = call.native.raw();
