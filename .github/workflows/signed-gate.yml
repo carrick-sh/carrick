@@ -383,7 +383,9 @@ jobs:
           shopt -s nullglob
           bundles=("$RUNNER_TEMP"/signed-fixtures/*.tar.gz)
           test "${#bundles[@]}" -eq 1
-          cargo run --locked -p carrick-xtask -- signed-gate prepare-reuse-upload \
+          xtask=(cargo run --locked -p carrick-xtask --)
+          if [[ "${{ steps.prebuilt.outcome }}" == success ]]; then xtask=("$CARRICK_XTASK_PREBUILT"); fi
+          "${xtask[@]}" signed-gate prepare-reuse-upload \
             --request "$RUNNER_TEMP/request/request.json" \
             --results "$RUNNER_TEMP/signed-result" \
             --fixture-bundle "${bundles[0]}" \
