@@ -294,6 +294,11 @@ pub enum Watched {
 }
 
 /// The watch loop over injected reads, clock (seconds since the watch began), sleep and cancel.
+///
+/// The watchdog job exists only for a routed gate and starts with the gate's own `needs`, so the
+/// gate has `limit_secs` from the watch's start to be seen started or finished. Anything else at the
+/// deadline (still queued, not listed, unresolved labels, a failing API) cancels: an observation
+/// that can't confirm a start never ends the watch (#2341 re-review).
 pub fn watch_with(
     mut read: impl FnMut() -> Option<Value>,
     mut clock: impl FnMut() -> u64,
@@ -301,34 +306,28 @@ pub fn watch_with(
     mut cancel: impl FnMut() -> Result<(), String>,
     limit_secs: u64,
 ) -> Result<Watched, String> {
-    let mut queued_since: Option<u64> = None;
+    let since = clock();
+    let mut last = String::from("the gate was never listed");
     loop {
         match watch_decision(read().as_ref()) {
             Watch::Done(why) => return Ok(Watched::Left(why)),
             Watch::Queued(label) => {
-                let since = *queued_since.get_or_insert_with(&mut clock);
-                if clock().saturating_sub(since) >= limit_secs {
-                    // Last look: a runner may have taken it since the previous poll.
-                    if !matches!(watch_decision(read().as_ref()), Watch::Queued(_)) {
-                        return Ok(Watched::Left(format!(
-                            "the gate on {label} started at the deadline"
-                        )));
-                    }
-                    cancel()?;
-                    return Ok(Watched::Cancelled(format!(
-                        "the gate waited {} min for {label}, which no runner is serving; cancelled the run so \
-                         the group fails now and the re-queued group routes to the shared label",
-                        limit_secs / 60
-                    )));
-                }
+                last = format!("the gate stayed queued for {label}, which no runner is serving")
             }
-            Watch::Wait => {
-                // The gate's prerequisites have finished when this job runs, so a gate GitHub never
-                // lists (or a jobs API that keeps failing) for an hour ends the watch.
-                if queued_since.is_none() && clock() > 3600 {
-                    return Ok(Watched::Left("no routed gate listed after 60 min".into()));
-                }
+            Watch::Wait => {}
+        }
+        if clock().saturating_sub(since) >= limit_secs {
+            // Last look: a runner may have taken it since the previous poll. Only a confirmed
+            // start (or end) spares the run.
+            if let Watch::Done(why) = watch_decision(read().as_ref()) {
+                return Ok(Watched::Left(format!("{why} at the deadline")));
             }
+            cancel()?;
+            return Ok(Watched::Cancelled(format!(
+                "{last} after {} min; cancelled the run so the group fails now and the re-queued group \
+                 routes to the shared label",
+                limit_secs / 60
+            )));
         }
         sleep();
     }
@@ -770,28 +769,53 @@ mod tests {
         (outcome, polls.get(), cancelled.get())
     }
 
+    fn routed_queued() -> Value {
+        json!({"name": "gate", "status": "queued", "started_at": null,
+            "labels": ["self-hosted", "macOS", "ARM64", "carrick-signed-gate-carrick-m4"]})
+    }
+
     #[test]
-    fn a_routed_gate_queued_after_a_long_prerequisite_wait_is_still_cancelled() {
-        // #2341 re-review: prerequisites took 45 min; then the gate queued on a Mac that's gone.
-        let routed = json!({"name": "gate", "status": "queued", "started_at": null,
-            "labels": ["self-hosted", "macOS", "ARM64", "carrick-signed-gate-carrick-m4"]});
-        let (outcome, polls, cancelled) = run_watch(|poll| (poll >= 45).then(|| routed.clone()));
+    fn a_routed_gate_that_never_starts_is_cancelled_at_the_limit() {
+        let (outcome, polls, cancelled) = run_watch(|_| Some(routed_queued()));
         assert!(matches!(outcome, Ok(Watched::Cancelled(_))), "{outcome:?}");
         assert!(cancelled);
-        // Counted from first seen queued (poll 45), not from the watch's start.
-        assert!(polls >= 45 + 20, "{polls}");
+        assert!((20..=22).contains(&polls), "{polls}");
+    }
+
+    #[test]
+    fn unknown_observations_never_end_the_watch_without_acting() {
+        // #2341 re-review: a failed read at the confirmation, unresolved labels, a gate never
+        // listed, or a failing API all end in a cancel at the limit, never a silent exit.
+        let unresolved = json!({"name": "gate", "status": "queued", "labels": []});
+        for (label, script) in [
+            (
+                "failed confirmation read",
+                Box::new(|poll: u64| (poll != 20).then(routed_queued))
+                    as Box<dyn Fn(u64) -> Option<Value>>,
+            ),
+            (
+                "unresolved labels",
+                Box::new(move |_| Some(unresolved.clone())),
+            ),
+            ("never listed", Box::new(|_| None)),
+        ] {
+            let (outcome, _, cancelled) = run_watch(script);
+            assert!(
+                matches!(outcome, Ok(Watched::Cancelled(_))),
+                "{label}: {outcome:?}"
+            );
+            assert!(cancelled, "{label}");
+        }
     }
 
     #[test]
     fn a_gate_that_starts_at_the_deadline_is_not_cancelled() {
-        let queued = json!({"name": "gate", "status": "queued", "started_at": null,
-            "labels": ["carrick-signed-gate-carrick-m4"]});
         let running = json!({"name": "gate", "status": "in_progress", "started_at": "2026-11-14T18:00:00Z",
             "labels": ["carrick-signed-gate-carrick-m4"]});
         // Queued through the deadline poll; running on the final re-read.
         let (outcome, _, cancelled) = run_watch(|poll| {
-            Some(if poll <= 20 {
-                queued.clone()
+            Some(if poll < 20 {
+                routed_queued()
             } else {
                 running.clone()
             })
@@ -801,14 +825,18 @@ mod tests {
             "{outcome:?}"
         );
         assert!(!cancelled);
-        // A shared-label gate and a gate that never appears end the watch without cancelling.
+        // A gate that starts before the limit, or runs on the shared label, ends the watch.
+        assert!(matches!(
+            run_watch(|poll| Some(if poll < 5 {
+                routed_queued()
+            } else {
+                running.clone()
+            })),
+            (Ok(Watched::Left(_)), _, false)
+        ));
         let shared = json!({"name": "gate", "status": "queued", "labels": SHARED_LABELS});
         assert!(matches!(
             run_watch(|_| Some(shared.clone())),
-            (Ok(Watched::Left(_)), _, false)
-        ));
-        assert!(matches!(
-            run_watch(|_| None),
             (Ok(Watched::Left(_)), _, false)
         ));
     }
