@@ -2465,14 +2465,23 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
     /// The caller holds the wait bucket. Signal senders release graph custody
     /// before acquiring that bucket; selection retains the canonical signal
     /// queue lock, so a sender cannot miss enrollment and this pending probe.
-    pub(crate) fn futex_interrupt_pending(&self, zone: &ZoneTables<C>, record: RecordRef) -> bool {
+    pub(crate) fn futex_interrupt_pending(
+        &self,
+        zone: &ZoneTables<C>,
+        record: RecordRef,
+        binding: ExecutionBinding,
+    ) -> bool {
         let state = self.state.lock();
         let Some(member) = state
             .records
             .get(&Self::record_key(zone, record))
             .and_then(|key| state.members.get(key))
         else {
-            return false;
+            // A host-loaded member parks on a fresh home record that this
+            // index never saw, so no close interrupt can target it. Find the
+            // exact executing member through the live member index instead.
+            return Self::binding_members(&state, zone, binding)
+                .any(|member| member.control.host_exit_requested());
         };
         // Closing may race the interval after enrollment but before park
         // publication. The member interrupt cannot claim that record yet;
@@ -2622,27 +2631,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             return None;
         }
         let carrier = core::ptr::from_ref(zone).addr();
-        let observed_task = NativeThreadIdentity::from_binding(event.binding()).ok()?;
-        let start = NativeExecutionKey {
-            carrier,
-            task: observed_task,
-            thread_generation: event.binding().thread_generation.raw(),
-            mm: 0,
-            root: 0,
-            address_generation: 0,
-        };
-        let end = NativeExecutionKey {
-            carrier,
-            task: observed_task,
-            thread_generation: event.binding().thread_generation.raw(),
-            mm: u64::MAX,
-            root: u64::MAX,
-            address_generation: u64::MAX,
-        };
-        if state
-            .members
-            .range(start..=end)
-            .any(|(_, member)| member.process != target_process)
+        NativeThreadIdentity::from_binding(event.binding()).ok()?;
+        if Self::binding_members(state, zone, event.binding())
+            .any(|member| member.process != target_process)
         {
             return None;
         }
@@ -2661,6 +2652,36 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             }
         }
         fallback
+    }
+
+    /// Every registered incarnation of the exact thread `binding` executes on
+    /// this carrier, across its MM and root rehomes.
+    fn binding_members<'s>(
+        state: &'s NativeRegistryState<'a, M, C>,
+        zone: &ZoneTables<C>,
+        binding: ExecutionBinding,
+    ) -> impl Iterator<Item = &'s NativeOwnerMember<'a, M, C>> {
+        let carrier = core::ptr::from_ref(zone).addr();
+        NativeThreadIdentity::from_binding(binding)
+            .ok()
+            .into_iter()
+            .flat_map(move |task| {
+                let start = NativeExecutionKey {
+                    carrier,
+                    task,
+                    thread_generation: binding.thread_generation.raw(),
+                    mm: 0,
+                    root: 0,
+                    address_generation: 0,
+                };
+                let end = NativeExecutionKey {
+                    mm: u64::MAX,
+                    root: u64::MAX,
+                    address_generation: u64::MAX,
+                    ..start
+                };
+                state.members.range(start..=end).map(|(_, member)| member)
+            })
     }
 
     /// Resolve one ingress event through the exact live member index. A tid,
