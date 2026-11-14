@@ -4302,6 +4302,70 @@ fn production_prepare_planning_exclusion_busy_once_then_success() {
     );
 }
 
+/// Run an instrumented fixture in a bounded child test process, so a lost
+/// wake fails rather than hangs, and require exit 7.
+fn bounded_instrumented_fixture_witness(test: &str, fixture: &str, legend: &str) {
+    const CHILD: &str = "CARRICK_BOUNDED_FIXTURE_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "60"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test)
+            .output()
+            .expect("bounded fixture witness");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = kvm_pool_fixture::assemble_fixture(fixture, &[]);
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 128)
+        .map_err(|failure| failure.to_string())
+        .expect("MM contention was a carrier fault");
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "{legend}: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// A signal arrives for a thread parked on its contended user fault
+/// (FaultRetry). After the release the fault resumes with the signal
+/// pending: the handler runs once before the store reruns, and the rerun
+/// completes with its RAX canary and byte intact. No wake value becomes a
+/// result.
+#[test]
+fn production_signal_for_a_parked_user_fault_runs_before_its_rerun() {
+    bounded_instrumented_fixture_witness(
+        "production_signal_for_a_parked_user_fault_runs_before_its_rerun",
+        "native_parked_fault_signal.S",
+        "91 a failed check, 92 a clobbered RAX canary, 93 a missing park, \
+         94 a handler that had not run exactly once before the store",
+    );
+}
+
+/// #2226 cause B: a second thread's first stack and TLS touch, on the vCPU
+/// its spinning main thread leaves idle, meets a held MM editor. The touch
+/// parks once and reruns; it is never `kernel fault policy refused`.
+#[test]
+fn production_idle_peer_thread_first_touch_parks_on_a_held_editor() {
+    bounded_instrumented_fixture_witness(
+        "production_idle_peer_thread_first_touch_parks_on_a_held_editor",
+        "native_idle_peer_first_touch.S",
+        "91 a failed check, 93 a touch that never parked, 95 a worker that \
+         never ran beside its spinning main thread",
+    );
+}
+
 #[test]
 fn production_two_threads_of_forked_mm_fault_cow_concurrently() {
     let elf = kvm_pool_fixture::assemble_fixture("native_concurrent_cow_faults.S", &[]);
