@@ -74,15 +74,20 @@ fn clone_thread(root: &KernelContext, tid: i32) -> &'static KernelContext {
 
 #[test]
 fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
-    deferred_control_handback(true);
+    deferred_control_handback(true, false);
 }
 
 #[test]
 fn serial_host_arm_exit_group_unregistered_sibling_wakes_parked_host() {
-    deferred_control_handback(false);
+    deferred_control_handback(false, false);
 }
 
-fn deferred_control_handback(registered: bool) {
+#[test]
+fn serial_host_arm_group_close_checkpoints_running_and_parked_siblings() {
+    deferred_control_handback(true, true);
+}
+
+fn deferred_control_handback(registered: bool, checkpoint: bool) {
     use carrick_el1_abi::Lifecycle;
     let (kernel, root) = bootstrap(41);
     let root = Box::leak(Box::new(root));
@@ -259,7 +264,8 @@ fn deferred_control_handback(registered: bool) {
     ));
     // The third live thread closes the process on a different CPU.
     let mut frame = carrick_el1_abi::TrapFrame::default();
-    frame.x[0] = 42;
+    let status = if checkpoint { 5 } else { 42 };
+    frame.x[0] = status;
     frame.x[8] = 94;
     assert_eq!(
         arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
@@ -274,6 +280,56 @@ fn deferred_control_handback(registered: bool) {
                 .host_birth_identity()
                 .is_some_and(|birth| page.host_birth_requested(birth))
     }));
+
+    if checkpoint {
+        let member = members[0];
+        let control = member.thread().control_slot();
+        run_as(
+            fixture,
+            member.thread().key().tid.raw(),
+            root.task().key().serial.raw(),
+            member.thread().key().serial.raw(),
+            control,
+        );
+        let mut sibling_service = Aarch64NativeProcessService::with_crossing(
+            &fixture.task,
+            slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            TestStockCrossing::new(&[]),
+        );
+        let mut return_frame = carrick_el1_abi::TrapFrame::default();
+        let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+        let action = crate::dispatch::arm_signal_user_return_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            &fixture.task,
+            &ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            page,
+            control,
+            &mut sibling_service,
+            |process| {
+                crate::signal_delivery::deliver_signal_on_syscall_return(
+                    &fixture.task,
+                    control,
+                    process,
+                    &mut return_frame,
+                    zerocopy::IntoBytes::as_bytes(&fp),
+                    &mut ArmWaitSignalMachine {
+                        user_sp: UserVa::new(0),
+                        backend: ArmWaitSignalBackend,
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(action, carrick_el1_abi::Action::Idle);
+        run_as_leader(fixture);
+    }
 
     struct ClearAperture;
     impl Drop for ClearAperture {
@@ -333,7 +389,7 @@ fn deferred_control_handback(registered: bool) {
             fixture.zone.live(record).map(|r| r.claim())
         );
     }
-    if registered {
+    if registered && !checkpoint {
         let (tx, rx) = mpsc::channel();
         // The stopped executor's normal reconciliation. Old Cancelled intent
         // retires this plain futex record and emits no handback at all.
@@ -451,7 +507,7 @@ fn deferred_control_handback(registered: bool) {
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
     assert_eq!(
         service.crossing.root_exit_status.load(Ordering::Acquire),
-        42
+        status
     );
     scheduler.close();
 }
