@@ -17,6 +17,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub mod reuse;
+pub mod route;
 pub use reuse::{
     BaseReuseKey, ReuseExecutionContext, ReuseMissReason, ReuseSealMetadata,
     compute_base_reuse_key, trusted_reuse_run,
@@ -84,6 +85,15 @@ pub enum SignedGateAction {
         fixture_bundle: PathBuf,
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Choose the gate job's runner (#2335): the Mac that sealed the merge base's
+    /// reusable receipt, else the shared label. Writes `runs_on=<json>` to
+    /// `$GITHUB_OUTPUT`; never fails on a lookup.
+    Route {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long, env = "GITHUB_OUTPUT")]
+        github_output: Option<PathBuf>,
     },
     /// Run the merge base and the candidate on macOS, each in a new detached
     /// worktree, under one exclusive host lease and one fixture bundle.
@@ -2002,6 +2012,10 @@ pub fn run(root: &Path, args: SignedGateArgs) -> Result<(), ReceiptError> {
             fixture_bundle,
             output,
         } => reuse::reuse_lookup(root, &request, &fixture_bundle, &output),
+        SignedGateAction::Route {
+            request,
+            github_output,
+        } => route::route(root, &request, github_output.as_deref()),
         SignedGateAction::Execute {
             request,
             output,
