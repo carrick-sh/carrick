@@ -183,6 +183,81 @@ impl Guest {
         (install(left), install(right))
     }
 
+    fn assert_last_record_declared(
+        &self,
+        crossing: carrick_personality_linux::crossing::AllowedHostCrossing,
+        args: [u64; 6],
+    ) {
+        let actual = self
+            .memory
+            .commits
+            .last()
+            .expect("production copyout committed");
+        let declared: Vec<_> = crossing
+            .operand_spec()
+            .output_ranges(&args, carrick_guest_arch::GuestIsa::Aarch64)
+            .collect();
+        assert_eq!(declared, [(actual.0, actual.1.len() as u64)]);
+    }
+
+    fn assert_committed_prefix_declared(
+        &self,
+        crossing: carrick_personality_linux::crossing::AllowedHostCrossing,
+        args: [u64; 6],
+        expected: usize,
+    ) {
+        let declared: Vec<_> = crossing
+            .operand_spec()
+            .output_ranges(&args, carrick_guest_arch::GuestIsa::Aarch64)
+            .collect();
+        assert_eq!(declared.len(), 1, "one direct byte-count bound");
+        let (base, capacity) = declared[0];
+        let mut next = base;
+        for (address, bytes) in &self.memory.commits {
+            assert_eq!(*address, next);
+            next += bytes.len() as u64;
+            assert!(next <= base + capacity);
+        }
+        assert_eq!(next - base, expected as u64);
+    }
+
+    fn finish_owner_output_refusal(
+        &mut self,
+        number: u64,
+        args: [u64; 6],
+        address: u64,
+        length: usize,
+    ) -> DispatchOutcome {
+        let wait = self.memory.refuse_next();
+        let refused = self.call(number, args);
+        assert!(self.memory.commits.is_empty());
+        assert_eq!(
+            self.memory.read_bytes(address, length).unwrap(),
+            vec![FILL; length]
+        );
+        match refused {
+            DispatchOutcome::OwnerMemoryWait {
+                wait: actual,
+                committed: 0,
+            } => {
+                assert_eq!(actual, wait);
+                self.call(number, args)
+            }
+            DispatchOutcome::OutputSuspended(pending) => {
+                assert_eq!(
+                    pending.wait(),
+                    &carrick_guest_mem::MemoryReadWait::Owner(wait)
+                );
+                let context = self.dispatcher.capture_one_task_context().unwrap();
+                let mm = self.lease.as_ref().unwrap().task_state_authority().unwrap();
+                pending
+                    .resume(&context, &mut self.memory, mm, &self.dispatcher.fs_view())
+                    .unwrap()
+            }
+            other => panic!("production output must retain its owner refusal: {other:?}"),
+        }
+    }
+
     fn seed_path(&mut self, path: &str) {
         self.memory.seed(PATH, format!("{path}\0").as_bytes());
     }
@@ -227,6 +302,10 @@ fn fstat_waits_for_an_owner_refused_copyout_instead_of_efault() {
             .unwrap(),
     );
     assert_eq!(mode & carrick_abi::LINUX_S_IFMT, carrick_abi::LINUX_S_IFIFO);
+    g.assert_last_record_declared(
+        carrick_personality_linux::crossing::AllowedHostCrossing::Fstat,
+        [read_fd as u64, OUT, 0, 0, 0, 0],
+    );
 }
 
 #[test]
@@ -248,6 +327,10 @@ fn newfstatat_waits_for_an_owner_refused_copyout_instead_of_efault() {
             .unwrap(),
     );
     assert_eq!(mode & carrick_abi::LINUX_S_IFMT, carrick_abi::LINUX_S_IFDIR);
+    g.assert_last_record_declared(
+        carrick_personality_linux::crossing::AllowedHostCrossing::Newfstatat,
+        [LINUX_AT_FDCWD, PATH, OUT, 0, 0, 0],
+    );
 }
 
 #[test]
@@ -400,6 +483,10 @@ fn socketpair_waits_for_an_owner_refused_copyout_instead_of_efault() {
         let guest_fd = i32::from_ne_bytes(chunk.try_into().unwrap());
         assert!(g.dispatcher.host_fd_for_poll(guest_fd).is_some());
     }
+    g.assert_last_record_declared(
+        carrick_personality_linux::crossing::AllowedHostCrossing::Socketpair,
+        args,
+    );
 }
 
 #[test]
@@ -458,6 +545,17 @@ fn time_and_resource_records_wait_for_an_owner_refused_copyout() {
         let DispatchOutcome::Returned { value: returned } = retried else {
             panic!("syscall {number} retry: {retried:?}");
         };
+        if let Some(crossing) = match number {
+            n if n == nr::TIMES.raw() => {
+                Some(carrick_personality_linux::crossing::AllowedHostCrossing::Times)
+            }
+            n if n == nr::CLOCK_GETRES.raw() => {
+                Some(carrick_personality_linux::crossing::AllowedHostCrossing::ClockGetres)
+            }
+            _ => None,
+        } {
+            g.assert_last_record_declared(crossing, args);
+        }
         if let Some(value) = value {
             assert_eq!(returned, value, "syscall {number}");
         }
@@ -2003,5 +2101,174 @@ fn arm_host_epoll_copyout_matches_declared_event_records() {
         assert_eq!(actual, declared);
         assert_eq!(g.memory.read_bytes(OUT, 16).unwrap(), event);
         assert_eq!(g.memory.read_bytes(OUT + 16, 8).unwrap(), [FILL; 8]);
+    }
+}
+
+#[test]
+fn direct_read_and_pread_bounds_match_production_copyout() {
+    use carrick_personality_linux::crossing::AllowedHostCrossing as C;
+    let lower = tempfile::tempdir().unwrap();
+    std::fs::write(lower.path().join("data"), b"abcdefghi").unwrap();
+    let mut g = Guest::new();
+    g.dispatcher.set_rootfs_layer(
+        carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap(),
+    );
+    g.seed_path("/data");
+    let fd = g.ok(nr::OPENAT.raw(), [LINUX_AT_FDCWD, PATH, 0, 0, 0, 0]);
+    for (number, crossing, offset, expected) in [
+        (nr::READ.raw(), C::Read, 0, b"abcd"),
+        (nr::PREAD64.raw(), C::Pread64, 2, b"cdef"),
+    ] {
+        g.memory.commits.clear();
+        g.memory.seed(OUT, &[FILL; 8]);
+        let args = [fd as u64, OUT, 4, offset, 0, 0];
+        assert_eq!(
+            g.finish_owner_output_refusal(number, args, OUT, 4),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        assert_eq!(g.memory.read_bytes(OUT, 4).unwrap(), expected);
+        g.assert_committed_prefix_declared(crossing, args, 4);
+    }
+}
+
+#[test]
+fn direct_directory_bound_matches_retained_production_copyout() {
+    let (mut g, _lower, fd) = directory_guest();
+    g.memory.commits.clear();
+    let args = [fd as u64, OUT, 512, 0, 0, 0];
+    let outcome = g.finish_owner_output_refusal(nr::GETDENTS64.raw(), args, OUT, 512);
+    let DispatchOutcome::Returned { value } = outcome else {
+        panic!("directory output: {outcome:?}");
+    };
+    assert!(value > 0);
+    g.assert_committed_prefix_declared(
+        carrick_personality_linux::crossing::AllowedHostCrossing::Getdents64,
+        args,
+        value as usize,
+    );
+    assert_eq!(&g.memory.commits[0].1[19..21], b".\0");
+}
+
+#[test]
+fn timerfd_records_match_production_copyouts() {
+    use carrick_personality_linux::crossing::AllowedHostCrossing as C;
+    let mut g = Guest::new();
+    let fd = g.ok(nr::TIMERFD_CREATE.raw(), [1, 0, 0, 0, 0, 0]);
+    g.memory.seed(PATH, &[0; 32]);
+    for (number, crossing, args) in [
+        (
+            nr::TIMERFD_SETTIME.raw(),
+            C::TimerfdSettime,
+            [fd as u64, 0, PATH, OUT, 0, 0],
+        ),
+        (
+            nr::TIMERFD_GETTIME.raw(),
+            C::TimerfdGettime,
+            [fd as u64, OUT, 0, 0, 0, 0],
+        ),
+    ] {
+        g.memory.commits.clear();
+        g.memory.seed(OUT, &[FILL; 32]);
+        assert_eq!(
+            g.refused_then_retried(number, args, &[(OUT, 32)]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(g.memory.read_bytes(OUT, 32).unwrap(), [0; 32]);
+        g.assert_last_record_declared(crossing, args);
+    }
+}
+
+#[test]
+fn direct_sendfile_offset_matches_prepared_host_copyout() {
+    use carrick_personality_linux::crossing::AllowedHostCrossing as C;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("input"), b"offset").unwrap();
+    std::fs::write(dir.path().join("output"), b"").unwrap();
+    let mut g = Guest::new();
+    g.dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(dir.path()).unwrap(),
+    ));
+    g.seed_path("/input");
+    let input = g.ok(nr::OPENAT.raw(), [LINUX_AT_FDCWD, PATH, 0, 0, 0, 0]);
+    g.seed_path("/output");
+    let output = g.ok(nr::OPENAT.raw(), [LINUX_AT_FDCWD, PATH, 2, 0, 0, 0]);
+    g.memory.seed(OUT, &0u64.to_ne_bytes());
+    g.memory.commits.clear();
+    let args = [output as u64, input as u64, OUT, 6, 0, 0];
+    // The offset is in/out and initially zero, so its page is readable before
+    // the output permission is requested. Keep that input on owner refusal.
+    let wait = g.memory.refuse_next();
+    let outcome = g.call(nr::SENDFILE.raw(), args);
+    assert_eq!(
+        outcome,
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+    );
+    assert_eq!(std::fs::read(dir.path().join("output")).unwrap(), b"");
+    assert_eq!(g.ok(nr::SENDFILE.raw(), args), 6);
+    assert_eq!(std::fs::read(dir.path().join("output")).unwrap(), b"offset");
+    assert_eq!(g.memory.read_bytes(OUT, 8).unwrap(), 6u64.to_ne_bytes());
+    g.assert_last_record_declared(C::Sendfile, args);
+}
+
+#[test]
+fn sleep_remainder_declarations_match_captured_dispatch_and_completion() {
+    use carrick_abi::KernelAbi;
+    use carrick_personality_linux::crossing::AllowedHostCrossing as C;
+    for (number, crossing, args) in [
+        (nr::NANOSLEEP.raw(), C::Nanosleep, [PATH, OUT, 0, 0, 0, 0]),
+        (
+            nr::CLOCK_NANOSLEEP.raw(),
+            C::ClockNanosleep,
+            [1, 0, PATH, OUT, 0, 0],
+        ),
+    ] {
+        let mut g = Guest::new();
+        g.memory
+            .seed(PATH, carrick_abi::LinuxTimespec::new(1, 0).abi_bytes());
+        let DispatchOutcome::WaitOnSleep {
+            duration: _,
+            remaining: Some(remaining),
+        } = g.call(number, args)
+        else {
+            panic!("production sleep capture");
+        };
+        assert_eq!(remaining.0, OUT);
+        let context = g.dispatcher.capture_one_task_context().unwrap();
+        let mm = g.lease.as_ref().unwrap().task_state_authority().unwrap();
+        let range = crate::kernel::continuation::GuestOutputRange::new(
+            carrick_guest_mem::GuestVa::new(remaining.0),
+            16,
+            context.shared().mm_id(),
+            mm.1,
+        )
+        .unwrap();
+        let completion = crate::kernel::continuation::ContinuationCompletion::InterruptedSleep {
+            remaining: Some((range, std::time::Duration::from_millis(750))),
+        };
+        g.memory.refuse_next();
+        let Some(DispatchOutcome::OutputSuspended(pending)) =
+            crate::kernel::continuation::fold_continuation_completion(
+                completion,
+                &g.dispatcher,
+                &context,
+                &mut g.memory,
+                mm,
+            )
+            .unwrap()
+        else {
+            panic!("interrupted sleep must retain output");
+        };
+        assert!(g.memory.commits.is_empty());
+        assert_eq!(
+            pending
+                .resume(&context, &mut g.memory, mm, &g.dispatcher.fs_view())
+                .unwrap(),
+            DispatchOutcome::errno(carrick_abi::LINUX_EINTR)
+        );
+        assert_eq!(
+            g.memory.read_bytes(OUT, 16).unwrap(),
+            carrick_abi::LinuxTimespec::new(0, 750_000_000).abi_bytes()
+        );
+        g.assert_last_record_declared(crossing, args);
     }
 }

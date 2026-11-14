@@ -56,3 +56,33 @@ committed bytes and epoll's exact mask/payload. The KVM fixture exercises real
 untouched statx and packed epoll output pages; these existing native venues
 already passed before the declaration change. This is not evidence that
 ARM NativeProcess can execute these refused crossings.
+
+The remaining fixed-record/byte-count census family has thirteen arguments:
+read, pread64, getdents64, sendfile, fstat, newfstatat, timerfd_settime,
+timerfd_gettime, clock_getres, times, socketpair, nanosleep, clock_nanosleep.
+The host-root dispatcher owns their ARM copyout; sleeps capture the actual
+production sleep request and fold interrupted completion without a real
+wait. Absolute clock_nanosleep has no remainder range. On x86, direct file
+buffers and private stat layouts use native host-file staging. The other
+operations gain no x86 host crossing or new executor from a declaration.
+The KVM file mode uses distinct untouched anonymous pages and validates
+read/pread payloads, both x86 stat modes, and the expected directory name.
+
+clock_gettime remains #2278-owned. preadv2/readv/preadv/vmsplice are indirect;
+pselect6 and splice have multiple outputs; socket length-dependent buffers,
+message headers and command-selected ioctl/fcntl outputs are separate shapes.
+mincore's output length is a derived page count rather than a byte-count
+argument, so it remains outside this fixed-record/byte-count slice.
+
+Additional Linux man-page authority:
+
+- https://man7.org/linux/man-pages/man2/read.2.html
+- https://man7.org/linux/man-pages/man2/stat.2.html
+- https://man7.org/linux/man-pages/man2/getdents.2.html
+- https://man7.org/linux/man-pages/man2/sendfile.2.html
+- https://man7.org/linux/man-pages/man2/timerfd_create.2.html
+- https://man7.org/linux/man-pages/man2/clock_getres.2.html
+- https://man7.org/linux/man-pages/man2/times.2.html
+- https://man7.org/linux/man-pages/man2/socketpair.2.html
+- https://man7.org/linux/man-pages/man2/nanosleep.2.html
+- https://man7.org/linux/man-pages/man2/clock_nanosleep.2.html
