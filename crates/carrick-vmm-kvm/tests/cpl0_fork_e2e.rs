@@ -91,6 +91,19 @@ fn fork_wait_elf_with_nonblocking_probe() -> Vec<u8> {
 
 #[test]
 fn static_elf_fork_child_cow_wait_and_parent_exit_seven() {
+    assert_shared_owner_fork_entry();
+}
+
+/// The production-entry half of #2276's ISA-neutral owner-fork change.  The
+/// x86 descriptor witness covers the large-page split itself; this real KVM
+/// carrier proves the shared fork owner still enters through CPL0, resolves a
+/// child COW write, waits, and retires without a semantic host exit.
+#[test]
+fn shared_owner_fork_runs_through_x86_cpl0_kvm_entry() {
+    assert_shared_owner_fork_entry();
+}
+
+fn assert_shared_owner_fork_entry() {
     let elf = fork_wait_elf();
     let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
     let plan = prepare_x86_elf(&program).expect("shared static ELF plan");
