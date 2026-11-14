@@ -238,6 +238,9 @@ pub fn decode_user_page_fault(
     })
 }
 pub const OBSERVE_CPL0_UACCESS_SHOOTDOWN: u64 = u64::MAX - 12;
+/// Fixture request for the shared COW owner's first write into an armed
+/// private 2 MiB user page (#2276).
+pub const OBSERVE_SHARED_LARGE_COW_FAULT: u64 = u64::MAX - 13;
 /// Supervisor direct-window base mapping low physical RAM into the upper half.
 pub const DIRECT_VA: u64 = carrick_el1_abi::X86_CPL0_DIRECT_VA;
 /// Retained KVM fixture page-table window; the root is its first page.
