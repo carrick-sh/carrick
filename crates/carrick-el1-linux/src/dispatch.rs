@@ -2267,7 +2267,15 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         }
         return Action::Served;
     }
-    if !fatal_owner_cancel && !carrick_el1_abi::Lifecycle::gate(page).serves_ring() {
+    // Closing admission still owes a running member its terminal checkpoint.
+    // The lifecycle owner, not the admission gate, decides whether it retires.
+    let terminal_checkpoint = control.zone_record().is_some_and(|record| {
+        super::aarch64_process::registry().signal_checkpoint_needed(zone, record)
+    });
+    if !fatal_owner_cancel
+        && !carrick_el1_abi::Lifecycle::gate(page).serves_ring()
+        && !terminal_checkpoint
+    {
         return Action::Served;
     }
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };
@@ -2276,9 +2284,8 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
             && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
         && !control.has_in_zone_standard_signal()
         && carrick_el1::isa::signal_ingress_guest().is_empty()
-        && control.zone_record().is_some_and(|record| {
-            !super::aarch64_process::registry().signal_checkpoint_needed(zone, record)
-        })
+        && control.zone_record().is_some()
+        && !terminal_checkpoint
     {
         return Action::Served;
     }

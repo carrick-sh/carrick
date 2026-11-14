@@ -6707,6 +6707,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .flatten()
     }
 
+    pub(crate) fn yield_terminal_host_custody(&mut self) -> bool {
+        self.handoff = carrick_core::entry::yield_current_to_host(
+            self.binding,
+            self.source,
+            self.record.id,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        );
+        if self.handoff.is_some() {
+            self.current.linux.mark_pending_host_work();
+        }
+        self.handoff.is_some()
+    }
+
     fn pending_close_status(&self) -> Option<carrick_sched_core::process::TerminationStatus> {
         self.runtime
             .graph
@@ -6735,18 +6748,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         match outcome {
             LifecycleOutcome::HostCustody => {
                 // An adopted host member retires on its exact host owner.
-                self.handoff = carrick_core::entry::yield_current_to_host(
-                    self.binding,
-                    self.source,
-                    self.record.id,
-                    &|owned| {
-                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                    },
-                );
-                if self.handoff.is_none() {
+                if !self.yield_terminal_host_custody() {
                     return Err(NativeProcessError::Quarantined);
                 }
-                self.current.linux.mark_pending_host_work();
                 Ok(NativeResume::Left(None))
             }
             LifecycleOutcome::Transferred {
@@ -7118,6 +7122,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         };
         if !is_owner {
             drop(guard);
+            // Every caller that entered the closing group must detach its
+            // physical translation before its exact record can be retired.
+            self.service.vacate_terminal_space(self.source)?;
             match carrick_core::terminal::settle_losing_zone_current(
                 self.control,
                 self.binding,
@@ -7130,6 +7137,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return Ok(Some(LifecycleOutcome::HostCustody));
                 }
                 carrick_core::terminal::LosingMemberSettlement::Released(receipt) => {
+                    self.source.zone.release_space(self.source.slot);
                     self.current
                         .linux
                         .mark_native_terminal_work(self.source.slot);

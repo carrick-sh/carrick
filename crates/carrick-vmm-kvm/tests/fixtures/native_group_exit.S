@@ -40,6 +40,13 @@ wait_ready:
 terminate:
 #ifdef COMPUTING_WORKER
     movl $1, go(%rip)
+wait_computing:
+    cmpl $1, computing(%rip)
+    je computing_ready
+    mov $24, %eax
+    syscall
+    jmp wait_computing
+computing_ready:
 #endif
     mov $5, %edi
     jmp exit
@@ -53,6 +60,7 @@ worker_loop:
     syscall
     jmp worker_loop
 compute:
+    movl $1, computing(%rip)
     pause
     jmp compute
 #endif
@@ -78,6 +86,7 @@ exit:
 status: .space 8
 ready: .space 8
 go: .space 8
+computing: .space 8
 parent_tid: .space 8
 child_tid: .space 8
 tls: .space 256
