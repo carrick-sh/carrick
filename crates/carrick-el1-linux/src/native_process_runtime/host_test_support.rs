@@ -428,6 +428,9 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         address: UserVa,
         status: LinuxWaitStatus,
     ) -> Result<(), NativeProcessError> {
+        if let Some(error) = self.child_copy_error {
+            return Err(error);
+        }
         if self.refuse_copy {
             return Err(NativeProcessError::Fault);
         };
@@ -12175,4 +12178,119 @@ fn host_request_during_wait4_park_yields_then_reparks() {
 #[test]
 fn host_request_during_vfork_park_yields_then_reparks() {
     host_request_during_child_wait_park(true);
+}
+
+#[cfg(test)]
+#[test]
+fn wait4_status_owner_wait_retains_zombie_until_release() {
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let (_, address, saved) = capacity.select().unwrap();
+    let child_pid = fixture.task.visible_pid().unwrap();
+    let mut service = fixture.service();
+    {
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+    }
+    let (_, address, saved) = capacity.select().unwrap();
+    let handle = service.service_mm_handle(&address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    space
+        .admit_notifications(
+            handle.incarnation(),
+            &carrick_sched_core::BoundedSpin(0),
+            &|effects| {
+                let _ = effects.defer_handbacks();
+            },
+        )
+        .unwrap();
+    let observed = space
+        .notifications(handle.incarnation())
+        .unwrap()
+        .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    access.raise(space.index());
+    // SAFETY: the fixture holds this exact MM gate through enrollment.
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Gate,
+            observed.revision(),
+        )
+    };
+    service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
+    {
+        let mut parent = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                parent.resume_owned_continuation(),
+                Some(LifecycleOutcome::Transferred { .. })
+            ),
+            "owner contention must release execution, never return EFAULT"
+        );
+        assert!(parent.take_handoff_receipt().is_some());
+    }
+    assert!(service.copies.is_empty());
+    assert!(fixture.task.service_notice.take().unwrap().is_none());
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    service.child_copy_error = None;
+    access.lower(space.index());
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut parent = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        parent.resume_checkpoint(|_| Ok(None)).unwrap(),
+        NativeResume::RetrySyscall
+    ));
+    assert!(matches!(parent.wait4(
+        ProcessWaitPid::from_syscall_argument(u64::MAX), UserVa::new(0x1000),
+        LinuxWaitOptions::empty(), UserVa::new(0),
+    ), LifecycleOutcome::Returned { result, .. } if result.raw() == i64::from(child_pid)));
+    drop(parent);
+    assert_eq!(service.copies, vec![LinuxWaitStatus::exited(7)]);
 }
