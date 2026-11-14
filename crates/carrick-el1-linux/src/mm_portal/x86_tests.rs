@@ -169,6 +169,7 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86RetiredOwner {
         match execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome {
             DescriptorOutcome::Applied { .. } => CowRepointOutcome::Applied {
                 flush_required: false,
+                tables_linked: 0,
             },
             DescriptorOutcome::Refused(_) => CowRepointOutcome::Refused,
             DescriptorOutcome::RolledBack(_) => CowRepointOutcome::RolledBack,

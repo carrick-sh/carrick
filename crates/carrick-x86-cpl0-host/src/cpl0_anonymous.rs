@@ -3235,6 +3235,7 @@ mod custody_tests {
                 owner_generation: NonZeroU64::new(3).unwrap(),
                 inventory_revision: NonZeroU64::new(4).unwrap(),
             },
+            tables: Default::default(),
         };
         let source = FrameGpa::new(0x21000);
         let receipt = CowGrantCompletion {
@@ -3244,6 +3245,7 @@ mod custody_tests {
             span_len: 4096,
             old_ipa: source.raw(),
             new_ipa: 0x11000,
+            tables_linked: 0,
         };
         assert!(exact_cow_receipt(grant, 0x401000, source, &receipt));
         let mut wrong = receipt;

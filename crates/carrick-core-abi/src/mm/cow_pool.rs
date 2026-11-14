@@ -35,6 +35,7 @@
 
 pub use crate::{
     COW_DECLINE_REASONS, COW_GRANT_SIZE, CowDecline, CowGrant, CowGrantCompletion, CowGrantPurpose,
+    CowSplitTables,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
 use carrick_sched_core::ExcludedEditor;
@@ -46,7 +47,7 @@ pub const COW_GRANT_POOL_SLOTS: usize = 1024;
 /// Probe chain length for one MM's records.
 pub const COW_GRANT_PROBES: usize = 64;
 /// Protocol revision, included in each image ABI layout identity.
-pub const COW_GRANT_PROTOCOL_VERSION: u64 = 2;
+pub const COW_GRANT_PROTOCOL_VERSION: u64 = 3;
 
 const EMPTY: u64 = 0;
 const WRITING: u64 = 1;
@@ -73,6 +74,10 @@ pub struct CowGrantRecord {
     old_ipa: AtomicU64,
     new_ipa: AtomicU64,
     purpose: AtomicU64,
+    /// Split tables published with the grant (0 = none), then how many the
+    /// repoint linked.
+    tables: [AtomicU64; crate::COW_GRANT_MAX_SPLIT_TABLES],
+    tables_linked: AtomicU64,
 }
 
 impl CowGrantRecord {
@@ -90,11 +95,19 @@ impl CowGrantRecord {
             old_ipa: AtomicU64::new(0),
             new_ipa: AtomicU64::new(0),
             purpose: AtomicU64::new(0),
+            tables: [const { AtomicU64::new(0) }; crate::COW_GRANT_MAX_SPLIT_TABLES],
+            tables_linked: AtomicU64::new(0),
         }
     }
 
     fn grant(&self, slot: usize, word: u64) -> Option<CowGrant> {
         let nz = |cell: &AtomicU64| NonZeroU64::new(cell.load(Ordering::Relaxed));
+        let pages = self
+            .tables
+            .each_ref()
+            .map(|cell| cell.load(Ordering::Relaxed));
+        let count = pages.iter().take_while(|&&page| page != 0).count();
+        let tables = CowSplitTables::new(&pages[..count])?;
         Some(CowGrant {
             slot,
             epoch: word & !STATE_MASK,
@@ -106,6 +119,7 @@ impl CowGrantRecord {
                 owner_generation: nz(&self.owner_generation)?,
                 inventory_revision: nz(&self.inventory_revision)?,
             },
+            tables,
         })
     }
 }
@@ -156,6 +170,19 @@ impl CowGrantPool {
         physical_ipa: u64,
         backing: BackingIdentity,
     ) -> Option<CowGrant> {
+        self.publish_with_tables(mm_key, physical_ipa, backing, CowSplitTables::NONE)
+    }
+
+    /// [`Self::publish`] a grant that also carries `tables`, unlinked table
+    /// pages the host reserved from this MM's table allocator for the split
+    /// of an armed block. Only a repoint that needs them claims it.
+    pub fn publish_with_tables(
+        &self,
+        mm_key: u64,
+        physical_ipa: u64,
+        backing: BackingIdentity,
+        tables: CowSplitTables,
+    ) -> Option<CowGrant> {
         if mm_key == 0 || physical_ipa == 0 || !physical_ipa.is_multiple_of(COW_GRANT_SIZE) {
             return None;
         }
@@ -196,8 +223,15 @@ impl CowGrantPool {
                 &record.span_len,
                 &record.old_ipa,
                 &record.new_ipa,
+                &record.tables_linked,
             ] {
                 cell.store(0, Ordering::Relaxed);
+            }
+            for (index, cell) in record.tables.iter().enumerate() {
+                cell.store(
+                    tables.as_slice().get(index).copied().unwrap_or(0),
+                    Ordering::Relaxed,
+                );
             }
             let ready = (writing & !STATE_MASK) | READY;
             record.state.store(ready, Ordering::Release);
@@ -207,13 +241,15 @@ impl CowGrantPool {
                 mm_key,
                 physical_ipa,
                 backing,
+                tables,
             });
         }
         None
     }
 
-    /// EL1, holding `mm_key`'s editor: take one ready grant of this MM.
-    pub fn claim(&self, mm_key: u64) -> Option<CowGrant> {
+    /// EL1, holding `mm_key`'s editor: take one ready grant of this MM that
+    /// [`CowGrant::serves`] a repoint linking `split_tables` tables.
+    pub fn claim(&self, mm_key: u64, split_tables: usize) -> Option<CowGrant> {
         if mm_key == 0 {
             return None;
         }
@@ -227,6 +263,9 @@ impl CowGrantPool {
             let Some(grant) = record.grant(slot, word) else {
                 continue;
             };
+            if !grant.serves(split_tables) {
+                continue;
+            }
             if record
                 .state
                 .compare_exchange(
@@ -292,6 +331,9 @@ impl CowGrantPool {
             .store(completion.span_len, Ordering::Relaxed);
         record.old_ipa.store(completion.old_ipa, Ordering::Relaxed);
         record.new_ipa.store(completion.new_ipa, Ordering::Relaxed);
+        record
+            .tables_linked
+            .store(u64::from(completion.tables_linked), Ordering::Relaxed);
         if record
             .state
             .compare_exchange(
@@ -366,6 +408,10 @@ impl CowGrantPool {
                             span_len: record.span_len.load(Ordering::Relaxed),
                             old_ipa: record.old_ipa.load(Ordering::Relaxed),
                             new_ipa: record.new_ipa.load(Ordering::Relaxed),
+                            tables_linked: u8::try_from(
+                                record.tables_linked.load(Ordering::Relaxed),
+                            )
+                            .unwrap_or(u8::MAX),
                         });
                     }
                     None
@@ -499,8 +545,8 @@ pub trait CowGrantSettlement: Send + Sync {
 }
 
 impl crate::CowGrantVenue for CowGrantPool {
-    fn claim(&self, mm_key: u64) -> Option<CowGrant> {
-        self.claim(mm_key)
+    fn claim(&self, mm_key: u64, split_tables: usize) -> Option<CowGrant> {
+        self.claim(mm_key, split_tables)
     }
     fn abandon(&self, grant: &CowGrant) -> bool {
         self.abandon(grant)
@@ -552,7 +598,57 @@ mod tests {
             span_len: 0x3000,
             old_ipa: 0x9_0000_1000,
             new_ipa: grant.physical_ipa + 0x1000,
+            tables_linked: 0,
         }
+    }
+
+    /// #2276: a block's split tables travel with exactly one grant. A page
+    /// repoint never spends them, a block repoint never takes a grant that
+    /// cannot split it, and the completion names the linked prefix so the
+    /// host takes back exactly the rest.
+    #[test]
+    fn split_tables_travel_with_one_grant_and_only_a_block_spends_them() {
+        let spaces = carrick_sched_core::AddressSpaces::new();
+        let seven = excluded(&spaces, 7);
+        let pool = CowGrantPool::new();
+        let plain = pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
+        assert!(plain.tables.is_empty());
+        assert!(
+            pool.claim(7, 1).is_none(),
+            "a table-less grant cannot split a block"
+        );
+        let tables = CowSplitTables::new(&[0x7_0000_1000, 0x7_0000_2000]).unwrap();
+        let split = pool
+            .publish_with_tables(7, 0x8_0000_8000, backing(20), tables)
+            .unwrap();
+        assert_eq!(split.tables, tables);
+        assert_eq!(pool.ready(7).filter(|grant| grant.serves(2)).count(), 1);
+        let page = pool.claim(7, 0).unwrap();
+        assert_eq!(page, plain, "a page repoint takes only a table-less grant");
+        assert!(pool.claim(7, 0).is_none());
+        let block = pool.claim(7, 1).unwrap();
+        assert_eq!(block, split);
+        let done = CowGrantCompletion {
+            tables_linked: 1,
+            new_ipa: block.physical_ipa + 0x1000,
+            ..completion(block)
+        };
+        assert!(done.is_well_formed());
+        assert_eq!(done.unused_tables(), &[0x7_0000_2000]);
+        assert!(
+            !CowGrantCompletion {
+                tables_linked: 3,
+                ..done
+            }
+            .is_well_formed(),
+            "a repoint cannot link more tables than its grant carried"
+        );
+        assert!(pool.complete(&done));
+        assert_eq!(pool.completions(&seven).collect::<Vec<_>>(), vec![done]);
+        assert!(pool.finish(&seven, &block));
+        assert!(CowSplitTables::new(&[0x1000, 0x1000]).is_none());
+        assert!(CowSplitTables::new(&[0x1001]).is_none());
+        assert!(CowSplitTables::new(&[0x1000, 0x2000, 0x3000]).is_none());
     }
 
     #[test]
@@ -563,11 +659,14 @@ mod tests {
         let pool = CowGrantPool::new();
         let published = pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
         assert_eq!(pool.ready(7).collect::<Vec<_>>(), vec![published]);
-        assert!(pool.claim(8).is_none(), "another MM never takes this grant");
-        let claimed = pool.claim(7).unwrap();
+        assert!(
+            pool.claim(8, 0).is_none(),
+            "another MM never takes this grant"
+        );
+        let claimed = pool.claim(7, 0).unwrap();
         assert_eq!(claimed, published);
         assert!(
-            pool.claim(7).is_none(),
+            pool.claim(7, 0).is_none(),
             "one owner: a claimed grant is gone"
         );
         assert!(pool.claimed_by(&seven));
@@ -600,11 +699,11 @@ mod tests {
         let spaces = carrick_sched_core::AddressSpaces::new();
         let pool = CowGrantPool::new();
         let grant = pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-        let claimed = pool.claim(7).unwrap();
+        let claimed = pool.claim(7, 0).unwrap();
         assert!(pool.abandon(&claimed));
         assert!(!pool.abandon(&claimed));
         assert!(pool.revoke(&excluded(&spaces, 7), &grant));
-        assert!(pool.claim(7).is_none());
+        assert!(pool.claim(7, 0).is_none());
         assert_eq!(pool.ready(7).count(), 0);
     }
 
@@ -622,7 +721,7 @@ mod tests {
             !pool.revoke(&seven, &first),
             "the old epoch names no live grant"
         );
-        let claimed = pool.claim(7).unwrap();
+        let claimed = pool.claim(7, 0).unwrap();
         assert_eq!(claimed.backing, backing(20));
         assert!(pool.complete(&completion(claimed)));
         assert!(!pool.finish(&seven, &first));
@@ -633,7 +732,7 @@ mod tests {
     fn a_completion_must_describe_one_compound_at_the_old_offset() {
         let pool = CowGrantPool::new();
         pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-        let claimed = pool.claim(7).unwrap();
+        let claimed = pool.claim(7, 0).unwrap();
         let mut bad = completion(claimed);
         bad.new_ipa = claimed.physical_ipa + 0x2000; // offset differs from old
         assert!(!pool.complete(&bad));
@@ -671,7 +770,7 @@ mod tests {
         pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
         pool.publish(7, 0x8_0000_8000, backing(20)).unwrap();
         pool.publish(8, 0x8_0000_c000, backing(30)).unwrap();
-        let used = pool.claim(7).unwrap();
+        let used = pool.claim(7, 0).unwrap();
         assert!(pool.complete(&completion(used)));
         assert_eq!(pool.release_mm(&excluded(&spaces, 7)), 2);
         assert_eq!(pool.ready(7).count(), 0);
@@ -684,7 +783,7 @@ mod tests {
         let spaces = carrick_sched_core::AddressSpaces::new();
         let pool = CowGrantPool::new();
         pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-        let claimed = pool.claim(7).unwrap();
+        let claimed = pool.claim(7, 0).unwrap();
         assert!(!pool.has_completions_for(7), "a claim is not a completion");
         assert!(pool.complete(&completion(claimed)));
         assert!(pool.has_completions_for(7));
@@ -698,7 +797,7 @@ mod tests {
         for field in 0..3 {
             let pool = CowGrantPool::new();
             pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-            let claimed = pool.claim(7).unwrap();
+            let claimed = pool.claim(7, 0).unwrap();
             let mut wrong = claimed;
             match field {
                 0 => wrong.mm_key = 8,
@@ -730,7 +829,7 @@ mod tests {
             !pool.revoke(&seven, &wrong),
             "wrong backing revoked a live record"
         );
-        let claimed = pool.claim(7).unwrap();
+        let claimed = pool.claim(7, 0).unwrap();
         assert!(pool.complete(&completion(claimed)));
         assert!(
             !pool.finish(&seven, &wrong),
@@ -765,7 +864,7 @@ mod tests {
     fn overflowed_completion_span_is_refused_without_panicking() {
         let pool = CowGrantPool::new();
         pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-        let claimed = pool.claim(7).unwrap();
+        let claimed = pool.claim(7, 0).unwrap();
         let mut bad = completion(claimed);
         bad.span_len = !4095;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.complete(&bad)));
@@ -820,6 +919,8 @@ mod layout_manifest {
                      old_ipa: _,
                      new_ipa: _,
                      purpose: _,
+                     tables: _,
+                     tables_linked: _,
                  }: CowGrantRecord| {};
         field!(CowGrantRecord, state, AtomicU64, 0, 8, 8);
         field!(CowGrantRecord, mm_key, AtomicU64, 8, 8, 8);
@@ -833,6 +934,15 @@ mod layout_manifest {
         field!(CowGrantRecord, old_ipa, AtomicU64, 72, 8, 8);
         field!(CowGrantRecord, new_ipa, AtomicU64, 80, 8, 8);
         field!(CowGrantRecord, purpose, AtomicU64, 88, 8, 8);
+        field!(
+            CowGrantRecord,
+            tables,
+            [AtomicU64; crate::COW_GRANT_MAX_SPLIT_TABLES],
+            96,
+            16,
+            8
+        );
+        field!(CowGrantRecord, tables_linked, AtomicU64, 112, 8, 8);
     }
 
     #[test]

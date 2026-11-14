@@ -42,6 +42,7 @@ impl carrick_core::mm::cow::OwnerCowMmu for Aarch64CowMmu {
                     old_ipa: run.old_ipa.raw(),
                     compound_offset: run.compound_offset(),
                     executable: run.executable,
+                    split_tables: run.split_tables,
                 },
             ),
             Err(GuestCowClass::AlreadyWritable) => {
@@ -90,8 +91,10 @@ impl carrick_core::mm::cow::OwnerCowMmu for Aarch64CowMmu {
             new_ipa: SubstrateGpa(op.new_ipa),
             backing: op.backing,
         };
+        // A repoint inside an armed block splits it with the grant's tables
+        // (#2276); otherwise the repoint links nothing.
         match plan_descriptor_op(words, SubstrateGpa(root), desc_op) {
-            Ok(plan) => plan.table_grants == 0,
+            Ok(plan) => plan.table_grants <= op.tables.len(),
             _ => false,
         }
     }
@@ -148,17 +151,19 @@ impl carrick_core::mm::cow::OwnerCowMmu for Aarch64CowMmu {
             new_ipa: SubstrateGpa(op.new_ipa),
             backing: op.backing,
         };
+        let mut pages = [SubstrateGpa(0); carrick_el1_abi::COW_GRANT_MAX_SPLIT_TABLES];
+        for (page, table) in pages.iter_mut().zip(op.tables.as_slice()) {
+            *page = SubstrateGpa(*table);
+        }
+        let Some(tables) = TableGrants::new(&pages[..op.tables.len()]) else {
+            return carrick_core::mm::cow::CowRepointOutcome::Refused;
+        };
         let mut journal = InlineJournal::new();
-        match execute_descriptor_op(
-            words,
-            SubstrateGpa(root),
-            desc_op,
-            &TableGrants::NONE,
-            &mut journal,
-        ) {
+        match execute_descriptor_op(words, SubstrateGpa(root), desc_op, &tables, &mut journal) {
             DescriptorOutcome::Applied(applied) => {
                 carrick_core::mm::cow::CowRepointOutcome::Applied {
                     flush_required: applied.flush_required,
+                    tables_linked: applied.tables_linked,
                 }
             }
             DescriptorOutcome::Refused(_) => carrick_core::mm::cow::CowRepointOutcome::Refused,
@@ -201,6 +206,20 @@ pub fn resolve_guest_cow<
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub struct X86CowMmu;
 
+/// The grant's split tables as x86 table roots, in the order offered.
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+fn x86_split_tables(
+    tables: carrick_el1_abi::CowSplitTables,
+) -> Option<[carrick_guest_arch::RootGpa; carrick_el1_abi::COW_GRANT_MAX_SPLIT_TABLES]> {
+    use carrick_guest_arch::{FrameGpa, RootGpa};
+    let mut roots =
+        [RootGpa::page_aligned(FrameGpa::new(4096))?; carrick_el1_abi::COW_GRANT_MAX_SPLIT_TABLES];
+    for (root, page) in roots.iter_mut().zip(tables.as_slice()) {
+        *root = RootGpa::page_aligned(FrameGpa::new(*page))?;
+    }
+    Some(roots)
+}
+
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
     const CARRIER_MAINT_ROOT_BASE: u64 = 0;
@@ -227,6 +246,7 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
                 old_ipa: run.old_ipa.raw(),
                 compound_offset: run.compound_offset,
                 executable: run.executable,
+                split_tables: run.split_tables,
             }),
             Err(CowClass::AlreadyWritable) => CowClassifyOutcome::AlreadyWritable,
             Err(reason) => CowClassifyOutcome::Declined(match reason {
@@ -261,6 +281,9 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
         else {
             return false;
         };
+        let Some(tables) = x86_split_tables(op.tables) else {
+            return false;
+        };
         let txn = DescriptorTxn {
             id: DescriptorTxnId { mm_key, generation },
             root,
@@ -270,7 +293,7 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
                 new: FrameGpa::new(op.new_ipa),
                 backing: op.backing,
             },
-            tables: &[],
+            tables: &tables[..op.tables.len()],
         };
         if plan_descriptor_txn(words, &txn, root).is_err() {
             return false;
@@ -332,6 +355,9 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
         ) else {
             return CowRepointOutcome::Refused;
         };
+        let Some(tables) = x86_split_tables(op.tables) else {
+            return CowRepointOutcome::Refused;
+        };
         let txn = DescriptorTxn {
             id: DescriptorTxnId { mm_key, generation },
             root,
@@ -341,13 +367,14 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
                 new: FrameGpa::new(op.new_ipa),
                 backing: op.backing,
             },
-            tables: &[],
+            tables: &tables[..op.tables.len()],
         };
         match execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome {
-            DescriptorOutcome::Applied { .. } => CowRepointOutcome::Applied {
+            DescriptorOutcome::Applied { tables_linked, .. } => CowRepointOutcome::Applied {
                 // The supplied words acknowledge their exact-root drain before
                 // the shared descriptor executor returns an Applied receipt.
                 flush_required: false,
+                tables_linked: u8::try_from(tables_linked).unwrap_or(u8::MAX),
             },
             DescriptorOutcome::Refused(_) => CowRepointOutcome::Refused,
             DescriptorOutcome::RolledBack(_) => CowRepointOutcome::RolledBack,
@@ -528,7 +555,7 @@ mod tests {
         drop(lease);
         drop(table.try_claim(slot).unwrap());
         assert!(
-            pool.claim(MM).is_some(),
+            pool.claim(MM, 0).is_some(),
             "failed copy returns its physical grant"
         );
     }
@@ -794,6 +821,7 @@ mod tests {
             span_len: 4 * 4096,
             old_ipa: OLD,
             new_ipa: GRANT,
+            tables_linked: 0,
         };
         assert_eq!(outcome, GuestCowOutcome::Resolved(expected));
         for lane in 0..4 {
@@ -858,6 +886,7 @@ mod tests {
                 span_len: 3 * 4096,
                 old_ipa: OLD + 4096,
                 new_ipa: GRANT + 4096,
+                tables_linked: 0,
             })
         );
         assert_eq!(
@@ -1351,12 +1380,14 @@ mod x86_cow_tests {
                     owner_generation: id,
                     inventory_revision: id,
                 },
+                tables: Default::default(),
             },
         );
         assert_eq!(
             outcome,
             CowRepointOutcome::Applied {
-                flush_required: false
+                flush_required: false,
+                tables_linked: 0,
             }
         );
         assert_eq!(
@@ -1375,6 +1406,105 @@ mod x86_cow_tests {
             Ok(FrameGpa::new(DESTINATION))
         );
     }
+    /// #2276: owner fork arms a private 2 MiB page in place. Its first COW
+    /// write is the owner's: classification names one page and one split
+    /// table, a table-less repoint refuses before storing, and the repoint
+    /// with the grant's table splits exactly that PDE (directory attributes
+    /// only, no NX) and moves only the written page.
+    #[test]
+    fn x86_cow_splits_an_armed_large_page_with_the_grant_table() {
+        use carrick_core::mm::cow::{CowClassifyOutcome, CowRepointOp, CowRepointOutcome};
+        use carrick_core_abi::CowSplitTables;
+        use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
+        use carrick_mmu_core::x86::descriptor_txn::{
+            Access, BackingIdentity, COW, FaultClass, HUGE, MAY_WRITE, NX, PRIVATE, USER,
+            translate, translate_leaf,
+        };
+        use core::num::NonZeroU64;
+        const LARGE: u64 = 0x4200000;
+        const TABLE: u64 = ROOT + 0x10_0000;
+        let words = Words::new();
+        let va = 0x4060_0000;
+        let far = va + 0x1_2345;
+        let armed = LARGE | PRESENT | USER | NX | HUGE | COW | PRIVATE | MAY_WRITE;
+        words.image.borrow_mut().extend([
+            (ROOT, (ROOT + 4096) | PRESENT | WRITE | USER),
+            (
+                ROOT + 4096 + ((va >> 30) & 511) * 8,
+                (ROOT + 8192) | PRESENT | WRITE | USER,
+            ),
+            (ROOT + 8192 + ((va >> 21) & 511) * 8, armed),
+        ]);
+        let root = RootGpa::page_aligned(FrameGpa::new(ROOT)).unwrap();
+        // The MM's private copy window, as the host provisions it.
+        let window = |page: u64| RootGpa::page_aligned(FrameGpa::new(ROOT + page * 4096)).unwrap();
+        carrick_mmu_core::x86::copy_window::provision_cow_copy_window(
+            &words,
+            root,
+            [window(32), window(33), window(34)],
+        )
+        .unwrap();
+        let CowClassifyOutcome::Armed(run) =
+            X86CowMmu::classify_cow_write(&words, ROOT, far, false)
+        else {
+            panic!("an armed large page is the owner's COW")
+        };
+        assert_eq!(
+            (run.va, run.len, run.split_tables),
+            (va + 0x1_2000, 4096, 1)
+        );
+        assert_eq!(run.old_ipa, LARGE + 0x1_2000);
+        let id = NonZeroU64::new(1).unwrap();
+        let op = |tables| CowRepointOp {
+            mm_key: 77,
+            grant_epoch: 1,
+            va: run.va,
+            len: run.len,
+            old_ipa: run.old_ipa,
+            new_ipa: DESTINATION,
+            backing: BackingIdentity {
+                frame_id: id,
+                mapping_id: id,
+                owner_generation: id,
+                inventory_revision: id,
+            },
+            tables,
+        };
+        assert!(!X86CowMmu::plan_cow_repoint(
+            &words,
+            ROOT,
+            op(CowSplitTables::NONE)
+        ));
+        let tables = CowSplitTables::new(&[TABLE]).unwrap();
+        assert!(X86CowMmu::plan_cow_repoint(&words, ROOT, op(tables)));
+        assert_eq!(
+            X86CowMmu::execute_cow_repoint(&words, ROOT, op(tables)),
+            CowRepointOutcome::Applied {
+                flush_required: false,
+                tables_linked: 1,
+            }
+        );
+        assert_eq!(
+            words.load(ROOT + 8192 + ((va >> 21) & 511) * 8).unwrap(),
+            TABLE | PRESENT | WRITE | USER,
+            "the split directory entry restricts nothing"
+        );
+        assert_eq!(
+            translate(&words, root, UserVa::new(far), Access::Write, true),
+            Ok(FrameGpa::new(DESTINATION + 0x345))
+        );
+        let neighbour = UserVa::new(va + 0x10_0000);
+        assert_eq!(
+            translate(&words, root, neighbour, Access::Read, true),
+            Ok(FrameGpa::new(LARGE + 0x10_0000))
+        );
+        assert_eq!(
+            translate_leaf(&words, root, neighbour, Access::Write, true).map(|leaf| leaf.output),
+            Err(FaultClass::CowWrite),
+            "every unmoved page stays COW-armed"
+        );
+    }
+
     #[test]
     fn x86_cow_refuses_wrong_or_nonwritable_copy_aliases_without_copying() {
         use carrick_core::mm::cow::CowRepointOutcome;
