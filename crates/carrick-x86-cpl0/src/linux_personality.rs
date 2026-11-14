@@ -768,7 +768,7 @@ fn park_contended_user_fault(
         }
         anonymous::ContendedFault::Rerun => 0,
         // A broken invariant of the faulting task's own MM, never contention.
-        anonymous::ContendedFault::Refused(_) => 9,
+        anonymous::ContendedFault::Refused => 9,
     }
 }
 
@@ -1489,9 +1489,8 @@ impl Personality for LinuxPersonality {
                                     // Not now, never fatal: rerun the call.
                                     anonymous::ContendedFault::Rerun => retry = true,
                                     // The caller's own live MM refused the
-                                    // wait (Stale or Invalid): a broken
-                                    // invariant, as on #PF.
-                                    anonymous::ContendedFault::Refused(_) => fatal_boot(),
+                                    // wait: a broken invariant, as on #PF.
+                                    anonymous::ContendedFault::Refused => fatal_boot(),
                                 }
                                 None
                             }

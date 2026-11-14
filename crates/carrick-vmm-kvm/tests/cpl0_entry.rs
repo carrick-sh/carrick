@@ -4393,6 +4393,7 @@ fn owner_crossing_busy_witness(
     crossing: carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing,
 ) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     owner_crossing_busy_witness_on(
+        "native_concurrent_cow_faults.S",
         crossing,
         kvm_pool_fixture::ROOT_AFFINITY_ANY,
         HeldEditorRelease::Host,
@@ -4400,11 +4401,12 @@ fn owner_crossing_busy_witness(
 }
 
 fn owner_crossing_busy_witness_on(
+    fixture: &str,
     crossing: carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing,
     affinity: u64,
     how: HeldEditorRelease,
 ) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
-    let elf = kvm_pool_fixture::assemble_fixture("native_concurrent_cow_faults.S", &[]);
+    let elf = kvm_pool_fixture::assemble_fixture(fixture, &[]);
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -4503,15 +4505,16 @@ fn production_prepare_planning_exclusion_busy_once_then_success() {
 }
 
 /// #2337: a host release can deliver a release EL1 published (the queue's
-/// notification names an EL1 slot's waker). With every member on CPU 0, the
-/// fork child's first COW write parks on the held editor and slot 0 idles;
-/// slot 0's EL1 is the release's waker, so the waiter is queued on slot 0's
-/// own run queue. The
-/// host delivery must kick slot 0 so the waiters rerun their writes, never
-/// fail the release (`host COW release produced guest-own wake effects`).
+/// notification names an EL1 slot's waker). `native_fork_child_cow_write.S`
+/// runs on CPU 0 only: the fork child's COW write parks on the held editor
+/// and slot 0 idles. Slot 0's EL1 is the release's waker, so the waiter is
+/// queued on slot 0's own run queue. The host delivery must kick slot 0 so
+/// the write reruns, never fail the release (`host COW release produced
+/// guest-own wake effects`).
 #[test]
 fn production_host_release_delivers_an_own_slot_wake() {
     owner_crossing_busy_witness_on(
+        "native_fork_child_cow_write.S",
         carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::CowSupply,
         ROOT_AFFINITY_CPU0,
         HeldEditorRelease::PublishedBySlot0,
@@ -4527,6 +4530,7 @@ fn production_host_release_delivers_an_own_slot_wake() {
 #[test]
 fn production_host_release_hands_back_a_waiter_it_could_not_place() {
     owner_crossing_busy_witness_on(
+        "native_concurrent_cow_faults.S",
         carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::CowSupply,
         kvm_pool_fixture::ROOT_AFFINITY_ANY,
         HeldEditorRelease::SlotsContended,

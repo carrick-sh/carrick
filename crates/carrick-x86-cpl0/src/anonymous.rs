@@ -716,30 +716,20 @@ pub(super) enum ContendedFault {
     /// wait queue was busy. Rerun the access, which probes once more and
     /// parks if the cause is still held. Never fatal.
     Rerun,
-    /// A broken invariant: the caller's own live MM cannot carry the wait.
-    Refused(FaultParkRefusal),
+    /// A broken invariant, never contention: the caller's own live MM, its
+    /// space entry or notification source retired (`Stale`), or the wait's
+    /// identity is invalid (a cause the fault owner never contends on, a
+    /// record already holding an operation, an exhausted queue identity).
+    Refused,
 }
 
-/// Why a contended access's own live MM refused its wait. Contention is
-/// never one of these: it parks or reruns ([`ContendedFault::Rerun`]).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FaultParkRefusal {
-    /// The MM, its space entry or its notification source retired, or the
-    /// waiting record left the slot.
-    Stale,
-    /// A cause the fault owner never contends on, a record already holding
-    /// an operation, or an exhausted queue identity.
-    Invalid,
-}
-
-impl FaultParkRefusal {
-    fn of_park(error: ObjectWaitError) -> Option<Self> {
-        match error {
-            // Contention, or a revision that moved: not now.
-            ObjectWaitError::Busy | ObjectWaitError::Changed => None,
-            ObjectWaitError::Stale => Some(Self::Stale),
-            ObjectWaitError::Occupied | ObjectWaitError::Exhausted => Some(Self::Invalid),
-        }
+/// Whether a refused park is "not now" (contention, or a revision that
+/// moved), as opposed to a broken invariant. Exhaustive, so a new refusal
+/// must be classified here.
+fn park_refusal_is_not_now(error: ObjectWaitError) -> bool {
+    match error {
+        ObjectWaitError::Busy | ObjectWaitError::Changed => true,
+        ObjectWaitError::Stale | ObjectWaitError::Occupied | ObjectWaitError::Exhausted => false,
     }
 }
 
@@ -763,49 +753,41 @@ pub(super) fn park_contended_fault(
     use carrick_sched_core::spaces::EditAdmissionRefusal;
     // The fault owner contends only on its root, editor and gate. The probe
     // below observes exactly these; any other cause would never re-probe.
-    use FaultParkRefusal::{Invalid, Stale};
     if !matches!(
         cause,
         SpaceWaitCause::Reservations | SpaceWaitCause::Editor | SpaceWaitCause::Gate
     ) {
-        return ContendedFault::Refused(Invalid);
+        return ContendedFault::Refused;
     }
     let source = carrick_x86_carrier::native_execution::source(slot);
     let zone = source.zone;
     let Some(mm) = carrick_el1_abi::ReservationMm::new(task.mm.key.load(Ordering::Acquire)) else {
-        return ContendedFault::Refused(Invalid);
+        return ContendedFault::Refused;
     };
     let Some(lease) = NonZeroU64::new(mm.raw())
         .and_then(|key| zone.space_entry(key))
         .and_then(|entry| entry.live_notifications().ok())
     else {
-        return ContendedFault::Refused(Stale);
+        return ContendedFault::Refused;
     };
     let table = shared_x86_cpl0_guest();
-    let Some(index) = zone.spaces.find(mm.raw()) else {
-        return ContendedFault::Refused(Stale);
-    };
-    let Some(owner) = NonZeroU64::new(slot.index() as u64 + 1) else {
-        return ContendedFault::Refused(Invalid);
+    let (Some(index), Some(owner)) = (
+        zone.spaces.find(mm.raw()),
+        NonZeroU64::new(slot.index() as u64 + 1),
+    ) else {
+        return ContendedFault::Refused;
     };
     if !table.admitted(index.index(), mm) {
-        return ContendedFault::Refused(Stale);
+        return ContendedFault::Refused;
     }
     let access = space_access(zone, slot, crate::native_process::release);
-    /// The refusal the shared coordinator folds into `Refused`, typed per
-    /// probe-and-park attempt.
-    #[derive(Clone, Copy)]
-    enum ParkVerdict {
-        NotNow,
-        Invariant(FaultParkRefusal),
-    }
-    let verdict = core::cell::Cell::new(ParkVerdict::Invariant(Invalid));
+    // Whether the coordinator's last `Refused` was "not now": a refused
+    // probe, snapshot or token is never contention.
+    let not_now = core::cell::Cell::new(false);
     let outcome = coordinate_fault_retry_wait(
         &lease,
         || {
-            // A refused snapshot or token after this probe is an invalid
-            // identity; the probe and the park type their own refusals.
-            verdict.set(ParkVerdict::Invariant(Invalid));
+            not_now.set(false);
             match table.lock_in(access, index.index(), mm, slot.index() as u32) {
                 Ok(root) => drop(root),
                 Err(carrick_el1::memory::reservations::Refusal::Busy) => {
@@ -824,10 +806,7 @@ pub(super) fn park_contended_fault(
                 }
                 Err(EditAdmissionRefusal::Editor) => Some(Some(SpaceWaitCause::Editor)),
                 Err(EditAdmissionRefusal::Gate) => Some(Some(SpaceWaitCause::Gate)),
-                Err(EditAdmissionRefusal::Stale) => {
-                    verdict.set(ParkVerdict::Invariant(Stale));
-                    None
-                }
+                Err(EditAdmissionRefusal::Stale) => None,
             }
         },
         |key, snapshot, token| {
@@ -880,10 +859,7 @@ pub(super) fn park_contended_fault(
                 }
                 // Not now: the coordinator re-probes a moved revision; a
                 // busy queue reruns the access.
-                verdict.set(
-                    FaultParkRefusal::of_park(*error)
-                        .map_or(ParkVerdict::NotNow, ParkVerdict::Invariant),
-                );
+                not_now.set(park_refusal_is_not_now(*error));
             }
             result
         },
@@ -895,11 +871,8 @@ pub(super) fn park_contended_fault(
             ContendedFault::Parked
         }
         EditWaitOutcome::NoConflict | EditWaitOutcome::StaleToken => ContendedFault::Rerun,
-        EditWaitOutcome::Refused if !lease.is_live() => ContendedFault::Refused(Stale),
-        EditWaitOutcome::Refused => match verdict.get() {
-            ParkVerdict::NotNow => ContendedFault::Rerun,
-            ParkVerdict::Invariant(invariant) => ContendedFault::Refused(invariant),
-        },
+        EditWaitOutcome::Refused if not_now.get() && lease.is_live() => ContendedFault::Rerun,
+        EditWaitOutcome::Refused => ContendedFault::Refused,
     }
 }
 
