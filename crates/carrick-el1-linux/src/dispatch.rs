@@ -1198,6 +1198,32 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
     stage_native_host_file(call, task, validator, &mut namespace)
 }
 
+/// Stage output for a descriptor-free host crossing before consulting the IPC
+/// namespace. Calls decoded by the host-file venue keep its existing staging.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn native_crossing_output_stage<V: file::MemoryValidator>(
+    frame: &TrapFrame,
+    validator: &V,
+) -> Option<carrick_personality_linux::native_host_file::HostFileStage> {
+    use carrick_personality_linux::native_host_file::HostFileCall;
+    if (frame.esr >> 26) & 0x3f != 0x15 {
+        return None;
+    }
+    let canonical = carrick_syscall_abi::CanonicalNr::new(frame.x[8]);
+    let args = [
+        frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+    ];
+    if HostFileCall::decode(canonical, &args).is_some() {
+        return None;
+    }
+    carrick_personality_linux::native_host_file::crossing_output_stage(
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+        canonical,
+        &args,
+        |address, length| file::MemoryValidator::writable_bytes(validator, address, length),
+    )
+}
+
 /// The byte sources the caller's reservation owner retired, for the
 /// carrier to release with this private-mapping request.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -1423,6 +1449,16 @@ pub(super) struct NativeServiceBegin {
     retry_exec_stage: bool,
     stage_prefix: Option<alloc::boxed::Box<[u8]>>,
     service_wait: Option<carrick_core_abi::PortalOwnerWait>,
+}
+
+#[cfg(test)]
+impl NativeServiceBegin {
+    pub(super) fn is_fault_operation(&self) -> bool {
+        matches!(
+            self.operation,
+            Some(carrick_core_abi::service::ServiceOperation::Fault(_))
+        )
+    }
 }
 
 /// What staging decided for one owned native syscall or exception exit.
@@ -1820,6 +1856,9 @@ fn arm_native_service_exit(
         counters,
         || arm_thread_group_owner(zone, task, page),
         |frame| {
+            if let Some(stage) = native_crossing_output_stage(frame, &file::HardwareValidator) {
+                return Some(stage);
+            }
             let venue = ipc::guest_venue(frame.slot as u32)?;
             let table = ipc::native_table(&venue, task)?;
             let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
