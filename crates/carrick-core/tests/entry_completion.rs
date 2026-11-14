@@ -1593,6 +1593,411 @@ fn deliver_holder_release(
     let _ = effects.deliver_handbacks(&mut |_| {});
 }
 
+/// A real carrier-stock loan survives root FINISH. Exercise the production
+/// settlement refusal, scheduler ticket/revision protocol and original fixed
+/// mapping replay, including a loan release in the enrollment gap. Backing
+/// and descriptor effects are recorded by this VM-free venue.
+#[test]
+fn fork_loan_outliving_finish_wakes_and_serves_the_original_mapping() {
+    use carrick_core::mm::reservation::{NoRootWait, RootReleaseVenue};
+    use carrick_core_abi::{
+        Decision, OwedReturnRetirement, Placement, Refusal, ReservationBackingReceipt,
+        ReservationCompletion, ReservationMm, ReservationProtection, ReservationRange,
+        ReturnJournal, ReturnSettlementRequest, SettlementDoorbellReply,
+    };
+    use carrick_el1::memory::reservations::{
+        Layout, NativeReservationGeometry, SharedReservations,
+    };
+    use carrick_guest_arch::{
+        AddressContext, ContextGeneration, CpuId, FrameGpa, KernelVa, MmGeneration, RootGpa,
+    };
+    use carrick_hal::fork_stock::{
+        ForkControlCapacity, ForkStock, GrantExecution, NoTableLedger, UntaggedRoots,
+    };
+    use carrick_hal::return_settlement::{
+        CowSettled, ExclusionSettlement, ReturnJournalAccess, SettlementLock, doorbell_reply,
+        settle_cow_then_returns, settle_ring_owned_returns,
+    };
+    use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
+    use std::cell::{Cell, RefCell};
+    use std::num::NonZeroU64;
+    type Venue<'a> = RootReleaseVenue<
+        'a,
+        carrick_personality_linux::mm::LinuxReservationPolicy,
+        NativeReservationGeometry,
+    >;
+    struct Journal<'a>(Venue<'a>, usize, ReservationMm);
+    impl ReturnJournalAccess for Journal<'_> {
+        type Error = Refusal;
+        fn with_journal<R>(
+            &self,
+            step: impl FnOnce(&mut dyn ReturnJournal) -> Result<R, Refusal>,
+        ) -> Result<R, Refusal> {
+            step(&mut self.0.lock_returns(self.1, self.2)?)
+        }
+    }
+    struct Backing<'a>(&'a Cell<(usize, usize)>);
+    impl OwedReturnRetirement for Backing<'_> {
+        type Prepared = usize;
+        type Error = ();
+        fn prepare(&mut self, request: &ReturnSettlementRequest) -> Result<usize, ()> {
+            let pages = request
+                .iter()
+                .map(|owed| owed.range.len() as usize / 4096)
+                .sum();
+            let (retired, applied) = self.0.get();
+            self.0.set((retired + pages, applied));
+            Ok(pages)
+        }
+        fn apply(&mut self, pages: usize) {
+            let (retired, applied) = self.0.get();
+            self.0.set((retired, applied + pages));
+        }
+    }
+    struct Settlement<'a> {
+        journal: Journal<'a>,
+        stock: &'a RefCell<ForkStock<UntaggedRoots>>,
+        lock: &'a SettlementLock,
+        backing: Backing<'a>,
+    }
+    impl ExclusionSettlement for Settlement<'_> {
+        type Error = ();
+        type Returns = SettlementDoorbellReply;
+        fn settle_cow_completions(
+            &mut self,
+            _: &carrick_sched_core::ExcludedEditor<'_>,
+        ) -> Result<(), ()> {
+            Ok(()) // This schedule has no outstanding COW completion.
+        }
+        fn settle_owed_returns(
+            &mut self,
+            excluded: &carrick_sched_core::ExcludedEditor<'_>,
+            cow: &CowSettled<'_>,
+        ) -> Result<SettlementDoorbellReply, ()> {
+            let guard = self.lock.lock(excluded);
+            let loan = self.stock.borrow().loan_names(self.journal.2);
+            Ok(doorbell_reply(&settle_ring_owned_returns(
+                excluded,
+                cow,
+                &guard,
+                loan,
+                &self.journal,
+                &mut self.backing,
+            ))
+            .unwrap())
+        }
+    }
+
+    for during_enrollment in [false, true] {
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        assert!(core::mem::size_of::<ZoneTables>() <= carrick_el1_abi::EL1_ZONE_SIZE as usize);
+        // SAFETY: the aligned zero-valid ABI records share this owned region,
+        // at their production offsets, for the entire schedule.
+        let (table, zone) = unsafe {
+            (
+                &*region
+                    .as_ptr()
+                    .add(carrick_el1_abi::EL1_RESERVATIONS_OFFSET as usize)
+                    .cast::<SharedReservations>(),
+                &*region
+                    .as_ptr()
+                    .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                    .cast::<ZoneTables>(),
+            )
+        };
+        let mm = ReservationMm::new(301).unwrap();
+        let slot = SlotId::new(0);
+        let index = zone
+            .spaces
+            .publish_closed(mm.raw(), 0x1000, 0x1000)
+            .unwrap();
+        let release = SpaceReleaseVenue {
+            zone,
+            waker: carrick_sched_core::Waker::Host,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                deliver_holder_release,
+            ),
+        };
+        let venue = Venue::new(table, release).unwrap();
+        let target = ReservationRange::new(0x100000, 0x101000).unwrap();
+        table
+            .publish(
+                index.index(),
+                mm,
+                Layout {
+                    heap: ReservationRange::new(0x1000, 0x100000).unwrap(),
+                    arena: ReservationRange::new(0x100000, 0x1000000).unwrap(),
+                    brk: 0x1000,
+                    address_limit: u64::MAX,
+                    data_limit: u64::MAX,
+                    external_address_bytes: 0,
+                    external_data_bytes: 0,
+                },
+            )
+            .unwrap();
+        {
+            let mut root = venue.lock(index.index(), mm, &NoRootWait).unwrap();
+            root.import(target, ReservationProtection::READ_WRITE, true)
+                .unwrap();
+            root.finish_import().unwrap();
+        }
+        let access = SpaceAccess::notified(release);
+        access.open(index);
+        let source = zone
+            .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+            .unwrap()
+            .live_notifications()
+            .unwrap();
+        let page = |pa| RootGpa::page_aligned(FrameGpa::new(pa)).unwrap();
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(41),
+            generation: SnapshotGeneration::from_raw(11),
+            mm: EntryMmKey::from_raw(mm.raw()),
+            thread_generation: EntryThreadGeneration::from_raw(101),
+        };
+        let execution = GrantExecution::new(
+            CpuId::new(0),
+            binding,
+            AddressContext {
+                root: page(0x1000),
+                mm: MmGeneration::new(NonZeroU64::new(mm.raw()).unwrap()),
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            },
+        );
+        let mut stock = ForkStock::new(
+            NonZeroU64::new(7).unwrap(),
+            ForkControlCapacity::unused(0x1_0000_0000),
+            UntaggedRoots,
+        );
+        let base = carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE;
+        stock
+            .install(
+                (0..4).map(|n| page(0x200000 + n * 4096)).collect(),
+                vec![
+                    carrick_el1_abi::ForkLifecycleLoan::new_for_base(
+                        base,
+                        KernelVa::new(base + 0x4000),
+                        KernelVa::new(base + 0x5000),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+        let request = carrick_el1_abi::ForkStockRequest {
+            binding,
+            context: execution.context,
+            operation: carrick_el1_abi::PortalOperation {
+                carrier: NonZeroU64::new(7).unwrap(),
+                mm,
+                incarnation: NonZeroU64::MIN,
+                sequence: NonZeroU64::new(2).unwrap(),
+            },
+            parent_generation: venue
+                .lock(index.index(), mm, &NoRootWait)
+                .unwrap()
+                .generation(),
+            child_mm: ReservationMm::new(302).unwrap(),
+            child_bytes: 8192,
+            parent_bytes: 4096,
+        };
+        let mut exchange = carrick_el1_abi::ForkStockExchange::new(request).unwrap();
+        let loan = stock
+            .loan(&mut NoTableLedger, execution, &mut exchange, |_| true)
+            .unwrap();
+        venue
+            .lock(index.index(), mm, &NoRootWait)
+            .unwrap()
+            .begin_fork_publication(loan.request)
+            .unwrap();
+        let finish_before = source.observe(SpaceWaitCause::PendingEdit);
+        venue
+            .lock(index.index(), mm, &NoRootWait)
+            .unwrap()
+            .finish_fork_publication(loan.request.operation)
+            .unwrap();
+        assert_ne!(source.observe(SpaceWaitCause::PendingEdit), finish_before);
+        assert!(
+            !venue
+                .lock(index.index(), mm, &NoRootWait)
+                .unwrap()
+                .fork_pending()
+        );
+        assert!(
+            stock.loan_names(mm),
+            "FINISH must not settle the carrier loan"
+        );
+        {
+            let mut root = venue.lock(index.index(), mm, &NoRootWait).unwrap();
+            let Decision::Work(request) = root.munmap(target).unwrap() else {
+                panic!("resident return")
+            };
+            let owed = root.reserve_return(target).unwrap();
+            // SAFETY: the VM-free backing venue models this exact retired leaf.
+            let receipt = unsafe {
+                ReservationCompletion::after_descriptor_and_backing_commit(
+                    request,
+                    ReservationBackingReceipt {
+                        receipt: request.sequence.raw(),
+                        granted_bytes: 0,
+                        returned_bytes: 0,
+                    },
+                )
+            }
+            .unwrap();
+            root.complete_deferring_return(receipt, owed).unwrap();
+        }
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, mm.raw(), None, 0);
+        let here = ExecutionSlot::zone(slot);
+        zone.occupancy.vacate_any(here);
+        assert!(zone.occupancy.replace(here, 0, mm.raw()));
+        zone.enter_guest(slot);
+        let record = zone
+            .current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid: 41,
+                    serial: 101,
+                    mm: mm.raw(),
+                    file_table: 5,
+                    generation: 11,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                },
+            )
+            .unwrap();
+        let stock = RefCell::new(stock);
+        let lock = SettlementLock::new();
+        let counts = Cell::new((0, 0));
+        let drivers = Cell::new(0);
+        let mut probe = || {
+            let mut root = venue.lock(index.index(), mm, &NoRootWait).unwrap();
+            assert_eq!(
+                root.mmap(
+                    Placement::Fixed(target.start()),
+                    target.len(),
+                    ReservationProtection::READ_WRITE
+                ),
+                Err(Refusal::Busy)
+            );
+            let claim = root.claim_return_settlement(u32::from(slot.raw())).unwrap();
+            drop(root);
+            let exclusion = access.try_exclude_editor(index, mm.raw()).unwrap();
+            let reply = settle_cow_then_returns(
+                &mut Settlement {
+                    journal: Journal(venue, index.index(), mm),
+                    stock: &stock,
+                    lock: &lock,
+                    backing: Backing(&counts),
+                },
+                exclusion.proof(),
+            )
+            .unwrap();
+            drop(exclusion);
+            assert!(table.release_return_settlement(claim));
+            release.publish(source.reserve(SpaceWaitCause::Reservations));
+            drivers.set(drivers.get() + 1);
+            Some(match reply {
+                SettlementDoorbellReply::ForkLoanPending => Some(SpaceWaitCause::PendingEdit),
+                SettlementDoorbellReply::Settled => None,
+                _ => panic!("unexpected settlement reply: {reply:?}"),
+            })
+        };
+        let finish_loan = || {
+            let mut abort = carrick_el1_abi::ForkStockSettlement::abort(loan);
+            stock
+                .borrow_mut()
+                .settle(
+                    &mut NoTableLedger,
+                    execution,
+                    &mut abort,
+                    |_| true,
+                    |_| true,
+                    |_| true,
+                )
+                .unwrap();
+            assert!(!stock.borrow().loan_names(mm));
+            release.publish(source.reserve(SpaceWaitCause::PendingEdit));
+        };
+        let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+            let _ = effects.deliver_handbacks(&mut |_| {});
+        };
+        let pending = source.key(SpaceWaitCause::PendingEdit);
+        let outcome =
+            coordinate_anonymous_edit_wait(&source, None, &mut probe, |key, snapshot, token| {
+                assert_eq!(key, pending);
+                assert_eq!(counts.get(), (0, 0), "a pending loan settles no frame");
+                if during_enrollment {
+                    finish_loan();
+                }
+                park_object_record(
+                    zone,
+                    slot,
+                    ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None),
+                    &complete,
+                    || Ok((record, false)),
+                )
+            });
+        if during_enrollment {
+            assert!(matches!(outcome, EditWaitOutcome::NoConflict));
+        } else {
+            assert!(matches!(outcome, EditWaitOutcome::Parked(_)));
+            assert!(matches!(
+                zone.record(record).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ));
+            assert!(stock.borrow().loan_names(mm));
+            finish_loan();
+            assert!(!matches!(
+                zone.record(record).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ));
+            assert_eq!(zone.switch_in(slot), Some(record));
+            let resumed = OperationToken::anonymous_edit(pending).unwrap();
+            let replay: EditWaitOutcome<()> =
+                coordinate_anonymous_edit_wait(&source, Some(resumed), &mut probe, |_, _, _| {
+                    panic!("settled loan must not repark")
+                });
+            assert_eq!(replay, EditWaitOutcome::NoConflict);
+        }
+        let mut root = venue.lock(index.index(), mm, &NoRootWait).unwrap();
+        let Decision::Work(request) = root
+            .mmap(
+                Placement::Fixed(target.start()),
+                target.len(),
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap()
+        else {
+            panic!("original mapping replay")
+        };
+        assert_eq!(request.range, target);
+        // SAFETY: the recording venue has committed this exact replacement.
+        let receipt = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        assert_eq!(root.complete(receipt).unwrap(), target.start());
+        drop(root);
+        assert_eq!(drivers.get(), 2, "refuse once, then settle once");
+        assert_eq!(counts.get(), (1, 1));
+        assert_eq!(
+            carrick_core::wait::complete_anonymous_edit_replay(zone, slot, mm.raw()).unwrap(),
+            !during_enrollment
+        );
+        assert!(!carrick_core::wait::complete_anonymous_edit_replay(zone, slot, mm.raw()).unwrap());
+    }
+}
+
 /// Retirement in the gap between a carrier's refusal and enrollment must
 /// invalidate the old wait authority. Exercise the production coordinator
 /// and notification retirement, then force reuse of the same physical entry.
