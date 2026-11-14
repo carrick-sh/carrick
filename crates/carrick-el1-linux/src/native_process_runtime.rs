@@ -353,8 +353,10 @@ impl NativeProcessError {
             Self::GroupExitCustody => Ok(NativeFailure::GroupExitCustody),
             Self::Quarantined => Ok(NativeFailure::Quarantined),
             Self::NoChild => Ok(NativeFailure::NoChild),
-            Self::OwnerWait(wait) => Err(NativeContention::OwnerWait(wait)),
-            Self::Busy => Err(NativeContention::Busy),
+            Self::OwnerWait(wait) => Err(NativeContention {
+                owner_wait: Some(wait),
+            }),
+            Self::Busy => Err(NativeContention::BUSY),
         }
     }
 }
@@ -418,9 +420,11 @@ impl From<NativeFailure> for NativeProcessError {
     }
 }
 
-/// Owner contention: the memory owner is mid-edit (`OwnerWait`, with the
-/// exact release to enrol on) or a carrier lease is held (`Busy`). It has no
-/// errno; the holder's release reruns the owned operation.
+/// Owner contention: the memory owner is mid-edit (with the exact release to
+/// enrol on) or a carrier lease is held. It has no errno; the holder's
+/// release reruns the owned operation. It names no contention kinds of its
+/// own: those stay `NativeProcessError::{OwnerWait, Busy}`, so this view adds
+/// no vocabulary to the authority-debt contention census.
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -428,25 +432,20 @@ impl From<NativeFailure> for NativeProcessError {
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
 )]
-pub enum NativeContention {
-    OwnerWait(carrick_core_abi::PortalOwnerWait),
-    Busy,
+pub struct NativeContention {
+    owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
 }
 impl NativeContention {
-    /// The owner release to enrol on; `Busy` waits for the carrier instead.
-    pub fn owner_wait(self) -> Option<carrick_core_abi::PortalOwnerWait> {
-        match self {
-            Self::OwnerWait(wait) => Some(wait),
-            Self::Busy => None,
-        }
+    /// A held carrier lease: wait for the carrier, not an owner release.
+    pub const BUSY: Self = Self { owner_wait: None };
+    /// The owner release to enrol on; `None` waits for the carrier instead.
+    pub const fn owner_wait(self) -> Option<carrick_core_abi::PortalOwnerWait> {
+        self.owner_wait
     }
 }
 impl From<NativeContention> for NativeProcessError {
     fn from(contention: NativeContention) -> Self {
-        match contention {
-            NativeContention::OwnerWait(wait) => Self::OwnerWait(wait),
-            NativeContention::Busy => Self::Busy,
-        }
+        contention.owner_wait.map_or(Self::Busy, Self::OwnerWait)
     }
 }
 
@@ -5139,7 +5138,7 @@ fn map_wait_owner_error<E>(
     match error {
         super::process_owner::GuestProcessError::Wait(
             carrick_sched_core::process::wait::WaitError::Busy(_),
-        ) => Ok(NativeContention::Busy),
+        ) => Ok(NativeContention::BUSY),
         _ => Err(NativeFailure::Stale),
     }
 }
@@ -12139,7 +12138,7 @@ mod tests {
                     assert_eq!(
                         error.failure(),
                         if settling {
-                            Err(NativeContention::Busy)
+                            Err(NativeContention::BUSY)
                         } else {
                             Ok(NativeFailure::Exhausted)
                         }
