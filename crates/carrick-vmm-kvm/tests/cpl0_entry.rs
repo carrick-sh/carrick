@@ -1327,7 +1327,8 @@ fn staged_copy_editor_busy_witness(release_in_park_window: bool) {
     code[path_reference..path_reference + 4].copy_from_slice(&delta.to_le_bytes());
 
     let outcome = try_run_instrumented_pool_fixture(&production_probe_elf(&code), 32)
-        .unwrap_or_else(|failure| panic!("a held editor refused the staged copy: {failure}"));
+        .map_err(|failure| failure.to_string())
+        .expect("a held editor refused the staged copy");
     assert_eq!(
         outcome.run.exit_code,
         7,
