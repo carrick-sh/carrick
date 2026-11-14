@@ -127,7 +127,7 @@ pub use objects::{
 #[allow(unused_imports)]
 pub(crate) use objects::{
     DescriptionCommon, FileDescriptionBacking, NO_READINESS_CONTEXT, NoReadinessContext,
-    ReadinessContext,
+    ReadinessContext, RingDescription,
 };
 #[allow(unused_imports)]
 pub use objects::{
