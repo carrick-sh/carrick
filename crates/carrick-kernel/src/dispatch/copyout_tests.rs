@@ -303,6 +303,37 @@ fn gettimeofday_waits_for_an_owner_refused_copyout_instead_of_efault() {
         "UTC timezone"
     );
 }
+
+/// The ARM host root reaches SyscallDispatcher, not the NativeProcess service
+/// exit. Compare its real copyout with the crossing declaration, including the
+/// second optional record; the declaration is metadata, not this venue's preparer.
+#[test]
+fn arm_host_gettimeofday_copyout_matches_both_declared_records() {
+    use carrick_personality_linux::crossing::AllowedHostCrossing;
+    let mut g = Guest::new();
+    for args in [[OUT, OUT2, 0, 0, 0, 0], [0, OUT2, 0, 0, 0, 0]] {
+        g.memory.commits.clear();
+        let retried = g.refused_then_retried(nr::GETTIMEOFDAY.raw(), args, &[(OUT2, 8)]);
+        assert_eq!(retried, DispatchOutcome::Returned { value: 0 });
+        let actual: Vec<_> = g
+            .memory
+            .commits
+            .iter()
+            .map(|(address, bytes)| (*address, bytes.len() as u64))
+            .collect();
+        let declared: Vec<_> = AllowedHostCrossing::Gettimeofday
+            .operand_spec()
+            .output_ranges(&args)
+            .collect();
+        assert_eq!(
+            actual, declared,
+            "host copyout must match every declared record"
+        );
+        assert_eq!(g.memory.read_bytes(OUT2, 8).unwrap(), [0; 8]);
+        g.memory.seed(OUT2, &[FILL; 8]);
+    }
+}
+
 fn socketpair(g: &mut Guest) -> (i32, i32) {
     assert_eq!(
         g.ok(
