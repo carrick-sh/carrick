@@ -115,17 +115,17 @@ fn run_go_suite_under_load(workdir: &str, binary: &str, run: &str) {
     let _guest = common::guest_lock();
     let _load = LoadCarriers::start();
     for round in 0..ROUNDS {
-        let result = ContainerBuilder::from_image(GO_IMAGE)
-            .image_store(ImageStore::default_for_user())
-            .pull_policy(PullPolicy::Missing)
-            .workdir(workdir)
-            .command([binary, "-test.short", "-test.run", run])
-            .run_blocking()
-            .unwrap_or_else(|error| {
-                panic!(
-                    "round {round}: {binary} carrier failed under concurrent carrier load: {error}"
-                )
-            });
+        let result = ContainerBuilder::from_image(carrick_embed::testing::require_dev_registry(
+            GO_IMAGE,
+        ))
+        .image_store(ImageStore::default_for_user())
+        .pull_policy(PullPolicy::Missing)
+        .workdir(workdir)
+        .command([binary, "-test.short", "-test.run", run])
+        .run_blocking()
+        .unwrap_or_else(|error| {
+            panic!("round {round}: {binary} carrier failed under concurrent carrier load: {error}")
+        });
         assert!(
             result.signal.is_none() && result.exit_code == 0,
             "round {round}: {binary} exit_code={} signal={:?}\nstderr tail: {}",

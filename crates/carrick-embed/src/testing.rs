@@ -31,6 +31,43 @@ pub fn carrier_snapshot(
     carrier.snapshot()
 }
 
+/// The exit status a test process uses to say it needs a developer registry
+/// the host doesn't have (#1448). `scripts/lib/test-signed-run.sh` turns it,
+/// with [`DEV_REGISTRY_MARKER`], into a named `test-signed: NOT-RUN` row:
+/// counted and failing, never a silent pass.
+pub const DEV_REGISTRY_NOT_RUN_EXIT: i32 = 77;
+/// The stderr line [`require_dev_registry`] prints before that exit.
+pub const DEV_REGISTRY_MARKER: &str = "test-signed: needs developer registry";
+
+/// The registry host of an image served by a developer registry on this
+/// machine (`localhost:5050/ltp:arm64` -> `localhost:5050`), else `None`.
+pub fn dev_registry_host(image: &str) -> Option<&str> {
+    let host = image.split('/').next()?;
+    (image.contains('/') && (host.starts_with("localhost:") || host.starts_with("127.0.0.1:")))
+        .then_some(host)
+}
+
+/// For an image from a developer registry (`localhost:5005`, `:5050`), check
+/// the registry answers; when it doesn't, print [`DEV_REGISTRY_MARKER`] and
+/// exit [`DEV_REGISTRY_NOT_RUN_EXIT`], so the signed runner reports this test
+/// NOT-RUN by name (#1448: the signed runners have no such registry, and
+/// these tests failed in 0.2 s as product failures). Returns `image`.
+pub fn require_dev_registry(image: &str) -> &str {
+    if let Some(host) = dev_registry_host(image) {
+        use std::net::ToSocketAddrs;
+        let reachable = host.to_socket_addrs().is_ok_and(|mut addrs| {
+            addrs.any(|addr| {
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
+            })
+        });
+        if !reachable {
+            eprintln!("{DEV_REGISTRY_MARKER} {host} ({image})");
+            std::process::exit(DEV_REGISTRY_NOT_RUN_EXIT);
+        }
+    }
+    image
+}
+
 /// One image, many commands: each [`Self::run`] builds a fresh
 /// [`ContainerBuilder`] with captured stdio, so tests read the guest's bytes
 /// from the returned [`ContainerResult`].
@@ -85,9 +122,13 @@ impl std::fmt::Debug for TestContainer {
 }
 
 impl TestContainer {
+    /// An image from a developer registry is checked first
+    /// ([`require_dev_registry`]).
     pub fn new(image: impl Into<String>) -> Self {
+        let image = image.into();
+        require_dev_registry(&image);
         Self {
-            image: image.into(),
+            image,
             env: Vec::new(),
             workdir: None,
             user: None,
@@ -531,6 +572,33 @@ mod tests {
             compat: CompatReport::default(),
             terminal_reason: None,
         }
+    }
+
+    #[test]
+    fn developer_registry_images_are_recognised_by_their_host() {
+        // #1448: these images come from a developer registry the signed runners lack.
+        assert_eq!(
+            dev_registry_host("localhost:5050/ltp:arm64"),
+            Some("localhost:5050")
+        );
+        assert_eq!(
+            dev_registry_host("localhost:5005/carrick-go-conformance:1.24"),
+            Some("localhost:5005")
+        );
+        assert_eq!(
+            dev_registry_host("127.0.0.1:5050/x@sha256:ab"),
+            Some("127.0.0.1:5050")
+        );
+        for image in [
+            "ubuntu:24.04",
+            "docker.io/library/ubuntu:24.04",
+            "localhost:5050",
+            "",
+        ] {
+            assert_eq!(dev_registry_host(image), None, "{image}");
+        }
+        // An image from a public registry is returned untouched, without a network check.
+        assert_eq!(require_dev_registry("ubuntu:24.04"), "ubuntu:24.04");
     }
 
     #[test]

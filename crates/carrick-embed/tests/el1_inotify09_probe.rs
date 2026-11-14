@@ -20,10 +20,12 @@ fn el1_inotify09_probe() {
     // post-mortem) and reaped instead of waiting out LTP's own timeout.
     let watchdog = common::Watchdog::start(std::time::Duration::from_secs(60));
     let result = common::run_or_fail(
-        ContainerBuilder::from_image("localhost:5050/ltp:arm64")
-            .pull_policy(PullPolicy::Missing)
-            .command(["/bin/sh", "-c", "/opt/ltp/testcases/bin/inotify09"])
-            .run_blocking(),
+        ContainerBuilder::from_image(carrick_embed::testing::require_dev_registry(
+            "localhost:5050/ltp:arm64",
+        ))
+        .pull_policy(PullPolicy::Missing)
+        .command(["/bin/sh", "-c", "/opt/ltp/testcases/bin/inotify09"])
+        .run_blocking(),
     );
     let wall = start.elapsed();
     watchdog.disarm();
