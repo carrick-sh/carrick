@@ -1411,7 +1411,7 @@ fn native_host_file_return(
 /// A staged native service request, ready for its owner to publish.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(super) struct NativeServiceBegin {
-    operation: Option<carrick_core_abi::service::ServiceOperation>,
+    pub(super) operation: Option<carrick_core_abi::service::ServiceOperation>,
     exec_payload: Option<alloc::boxed::Box<[u8]>>,
     host_file: Option<alloc::boxed::Box<StagedHostFile>>,
     entropy: Option<(
@@ -1939,7 +1939,19 @@ pub(super) fn native_service_user_return(
             frame.x[0] = result.raw() as u64;
             checkpoint(frame)
         }
-        _ => invalid_completion(NativeInvariant::EntryBinding),
+        // The service settled before it parked: a supply the carrier
+        // acknowledged ahead of the park probe, a cancelled host-file call
+        // with no effect, or a retained map source. Re-enter the SVC with
+        // every original argument, as the scheduler's owner replay does.
+        NativeResume::RetrySyscall => {
+            frame.elr = frame.elr.wrapping_sub(carrick_guest_arch::AARCH64_SVC_LEN);
+            checkpoint(frame)
+        }
+        // Only a resumed checkpoint names a saved SVC, and a departure parks
+        // through `native_service_idle`; neither reaches this live return.
+        NativeResume::RetrySavedSyscall | NativeResume::Left(_) | NativeResume::Invalid => {
+            invalid_completion(NativeInvariant::EntryBinding)
+        }
     }
 }
 
