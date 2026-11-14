@@ -1665,6 +1665,20 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         .map_err(|error| fail(error.to_string()))
     }
 
+    #[cfg(feature = "test-support")]
+    fn hold_fault_editor(
+        &self,
+        crossing: super::FaultExclusionCrossing,
+        zone: &X86Cpl0Zone,
+        mm: carrick_el1_abi::ReservationMm,
+    ) {
+        if let Some((armed, hold)) = &self.fixture_fault_hold
+            && *armed == crossing
+        {
+            hold.claim_once(zone, &[mm]);
+        }
+    }
+
     fn supply_cow_grant(
         &mut self,
         index: usize,
@@ -1690,6 +1704,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             '_,
             carrick_sched_core::ParkedContextWords,
         >| wake.deliver(zone, waker, owned);
+        #[cfg(feature = "test-support")]
+        self.hold_fault_editor(
+            super::FaultExclusionCrossing::CowSupply,
+            zone,
+            window.operation.mm,
+        );
         let pause = self.settled_pause_or_fail(
             SpaceReleaseVenue {
                 zone,
@@ -1831,6 +1851,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             '_,
             carrick_sched_core::ParkedContextWords,
         >| wake.deliver(zone, waker, owned);
+        #[cfg(feature = "test-support")]
+        self.hold_fault_editor(
+            super::FaultExclusionCrossing::CowSettlement,
+            zone,
+            carrick_el1_abi::ReservationMm::new(execution.context.mm.raw().get())
+                .ok_or_else(|| fail("fixture fault MM"))?,
+        );
         let pause = self.settled_pause_or_fail(
             SpaceReleaseVenue {
                 zone,
@@ -2506,6 +2533,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 '_,
                 carrick_sched_core::ParkedContextWords,
             >| wake.deliver(zone, waker, owned);
+            #[cfg(feature = "test-support")]
+            self.hold_fault_editor(
+                super::FaultExclusionCrossing::PreparePlanning,
+                zone,
+                window.operation.mm,
+            );
             let pause = self.settled_pause_or_fail(
                 SpaceReleaseVenue {
                     zone,
