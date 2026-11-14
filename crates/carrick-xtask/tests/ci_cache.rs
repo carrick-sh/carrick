@@ -165,7 +165,7 @@ fn cross_toolchain_installs_restore_their_package_cache_first() {
             );
         }
     }
-    assert_eq!(installs, 4, "every cross toolchain install is cached");
+    assert_eq!(installs, 5, "every cross toolchain install is cached");
 }
 
 #[test]
