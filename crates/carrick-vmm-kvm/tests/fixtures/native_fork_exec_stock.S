@@ -4,6 +4,16 @@
 .global _start
 .text
 _start:
+#if defined(CAUGHT_PARKED) || defined(IGNORED_PARKED)
+    lea signal_action(%rip), %rsi
+    mov $10, %edi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax
+    syscall
+    test %eax, %eax
+    jnz failure
+#endif
     mov $14, %eax
     xor %edi, %edi
     lea blocked(%rip), %rsi
@@ -39,11 +49,27 @@ _start:
     mov $8, %r10d
     mov $128, %eax
     syscall
-#ifdef CANCEL_PARKED
+#if defined(CANCEL_PARKED) || defined(TERM_PARKED) || defined(CAUGHT_PARKED) || defined(IGNORED_PARKED)
     mov %r13d, %edi
+#ifdef TERM_PARKED
+    mov $15, %esi
+#elif defined(CAUGHT_PARKED) || defined(IGNORED_PARKED)
+    mov $10, %esi
+#else
     mov $9, %esi
+#endif
     mov $62, %eax
     syscall
+    test %eax, %eax
+    jnz failure
+#if defined(CAUGHT_PARKED) || defined(IGNORED_PARKED)
+    mov %r12d, %edi
+    mov $12, %esi
+    mov $62, %eax
+    syscall
+    test %eax, %eax
+    jnz failure
+#endif
 #else
     mov %r12d, %edi
     mov $12, %esi
@@ -59,12 +85,19 @@ _start:
     mov $61, %eax
     syscall
     cmp %r13d, %eax
-    jne failure
-#ifdef CANCEL_PARKED
+    jne wait_child_failure
+#if defined(CANCEL_PARKED) || defined(TERM_PARKED) || defined(CAUGHT_PARKED)
     mov exec_status(%rip), %eax
     and $127, %eax
+#ifdef TERM_PARKED
+    cmp $15, %eax
+#elif defined(CAUGHT_PARKED)
+    cmp $10, %eax
+#else
     cmp $9, %eax
-    jne failure
+#endif
+    jne signal_status_failure
+#if defined(CANCEL_PARKED) || defined(TERM_PARKED)
     /* The holder must still be alive when wait4 of the killed exec returns. */
     mov %r12d, %edi
     lea holder_status(%rip), %rsi
@@ -73,13 +106,14 @@ _start:
     mov $61, %eax
     syscall
     test %eax, %eax
-    jnz failure
+    jnz holder_liveness_failure
+#endif
 #else
     mov exec_status(%rip), %eax
     test %eax, %eax
     jnz failure
 #endif
-#ifdef CANCEL_PARKED
+#if defined(CANCEL_PARKED) || defined(TERM_PARKED)
     mov %r12d, %edi
     mov $12, %esi
     mov $62, %eax
@@ -117,6 +151,18 @@ exec_child:
     syscall
     test %eax, %eax
     jnz failure
+#if defined(CAUGHT_PARKED) || defined(IGNORED_PARKED)
+    /* Leave SIGUSR2 blocked for the holder handshake, but allow SIGUSR1
+     * to reach the parked exec service. */
+    mov $14, %eax
+    mov $2, %edi
+    lea release_signal(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    syscall
+    test %eax, %eax
+    jnz failure
+#endif
     lea successor(%rip), %rdi
     lea argv(%rip), %rsi
     xor %edx, %edx
@@ -127,6 +173,34 @@ exec_child:
     jmp exit
 failure:
     mov $91, %edi
+    jmp exit
+wait_child_failure:
+    mov $94, %edi
+    jmp exit
+signal_status_failure:
+    mov exec_status(%rip), %edi
+    mov %edi, %eax
+    and $127, %eax
+    test %eax, %eax
+    jz exited_status
+    mov %eax, %edi
+    add $128, %edi
+    jmp exit
+exited_status:
+    shr $8, %edi
+    jmp exit
+holder_liveness_failure:
+    cmp $-10, %eax
+    je holder_echild
+    test %eax, %eax
+    js holder_other_errno
+    mov $96, %edi
+    jmp exit
+holder_echild:
+    mov $97, %edi
+    jmp exit
+holder_other_errno:
+    mov $98, %edi
     jmp exit
 fork_failure:
     mov $92, %edi
@@ -142,6 +216,15 @@ successor: .asciz SUCCESSOR_PATH
 .balign 8
 argv: .quad successor, 0
 blocked: .quad (1 << 9) | (1 << 11)
+#if defined(CAUGHT_PARKED) || defined(IGNORED_PARKED)
+.balign 8
+signal_action:
+#ifdef CAUGHT_PARKED
+    .quad caught_handler, 0x04000000, signal_restorer, 0
+#else
+    .quad 1, 0, 0, 0
+#endif
+#endif
 ready: .quad (1 << 9)
 release_signal: .quad (1 << 11)
 short_bound: .quad 0, 100000000
@@ -150,3 +233,12 @@ long_bound: .quad 5, 0
 .balign 4
 exec_status: .space 4
 holder_status: .space 4
+#ifdef CAUGHT_PARKED
+.text
+caught_handler:
+    ret
+signal_restorer:
+    mov $15, %eax
+    syscall
+    ud2
+#endif
