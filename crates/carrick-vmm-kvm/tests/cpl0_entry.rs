@@ -1349,6 +1349,19 @@ fn post_supply_busy_witness(test: &str, flag: &str, affinity: u64) {
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }
 
+/// #2332: a held post-supply Busy belongs to the member that armed it. The
+/// root arms it and never faults; its fork child's own COW write on the
+/// other vCPU must not take it, or the child parks on a synthetic holder no
+/// one releases and both vCPUs halt (the witness's 1-in-15 hang).
+#[test]
+fn production_post_supply_busy_lands_only_on_its_arming_member() {
+    post_supply_busy_witness(
+        "production_post_supply_busy_lands_only_on_its_arming_member",
+        "-DPOST_SUPPLY_FOREIGN_FAULT",
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+    );
+}
+
 /// P0 1: the root's COW write is Busy after its COW supply, on two vCPUs
 /// with a second live member (its fork child, which takes its own COW
 /// grant). The parked write reruns, wherever it is rescheduled, and keeps

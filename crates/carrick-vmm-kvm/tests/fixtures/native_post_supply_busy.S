@@ -21,6 +21,12 @@
  *   POST_SUPPLY_PREPARE    the root's first touch of fresh anonymous memory
  *                          parks after its Prepare supply; its fork child
  *                          is a second live member touching its own memory
+ *   POST_SUPPLY_FOREIGN_FAULT
+ *                          #2332: the root arms a held post-supply Busy and
+ *                          never faults; its fork child's own COW write
+ *                          must not take it (it would park on a holder no
+ *                          one releases). The root reaps the child without
+ *                          touching memory, then the census must be 0
  */
 #define INJECT_POST_SUPPLY_BUSY_ONCE -464 /* 0x...fe30 */
 #define INJECT_POST_SUPPLY_CENSUS -463    /* 0x...fe31 */
@@ -34,6 +40,33 @@
 _start:
     /* Commit the private .data page before fork, so a later write is COW. */
     movb $1, cow_page(%rip)
+#if defined(POST_SUPPLY_FOREIGN_FAULT)
+    /* Arm before fork; from here the root writes no memory. */
+    mov $INJECT_POST_SUPPLY_BUSY_HELD, %rax
+    syscall
+    test %rax, %rax
+    jnz failure
+    mov $57, %eax
+    syscall
+    test %eax, %eax
+    js failure
+    jz child
+    /* wait4(child, NULL, 0, NULL): no status copy, so no root fault. */
+    mov %eax, %edi
+    xor %esi, %esi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    test %rax, %rax
+    js failure
+    mov $INJECT_POST_SUPPLY_CENSUS, %rax
+    syscall
+    test %rax, %rax
+    jnz census_failure
+    mov $7, %edi
+    jmp exit
+#endif
 #if defined(POST_SUPPLY_PREPARE)
     /* mmap(NULL, 1 MiB, RW, PRIVATE|ANONYMOUS, -1, 0), untouched. */
     xor %edi, %edi
@@ -87,7 +120,15 @@ _start:
     jmp exit
 
 child:
-#if defined(POST_SUPPLY_COW)
+#if defined(POST_SUPPLY_FOREIGN_FAULT)
+    /* This member's own COW write (its first, after fork). */
+    lea cow_page(%rip), %rbx
+    movb $0x33, 8(%rbx)
+    cmpb $0x33, 8(%rbx)
+    jne failure
+    mov $CHILD_STATUS, %edi
+    jmp exit
+#elif defined(POST_SUPPLY_COW)
     /* Yield until the root's COW write met its held post-supply Busy, so
      * this second member's own COW grant lands while the root's fault is
      * parked (on the root's CPU when both are pinned to CPU 0). */
