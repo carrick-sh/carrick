@@ -188,7 +188,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn vacate_terminal_space(
         &mut self,
         source: carrick_el1_abi::BornInZoneSource<'a, C>,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeFailure> {
         let _ = source;
         #[cfg(test)]
         TERMINAL_VACATES.with(|count| count.set(count.get() + 1));
@@ -221,7 +221,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn cancel_exec_successor(
         &self,
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeFailure> {
         EXEC_CANCELLATIONS.with(|receipts| receipts.borrow_mut().push(receipt.raw().get()));
         Ok(())
     }
@@ -364,17 +364,17 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn service_mm_handle(
         &self,
         mm: &Self::Mm,
-    ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+    ) -> Result<carrick_core_abi::El1MmHandle, NativeFailure> {
         self.zone
             .spaces
             .find(mm.mm.raw().get())
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(NativeFailure::Stale)?;
         // SAFETY: this test venue owns these never-reused synthetic MM roots.
         Ok(unsafe {
             carrick_core_abi::El1MmHandle::from_admitted_owner(
                 NonZeroU64::MIN,
                 carrick_core_abi::ReservationMm::new(mm.mm.raw().get())
-                    .ok_or(NativeProcessError::Stale)?,
+                    .ok_or(NativeFailure::Stale)?,
                 NonZeroU64::MIN,
             )
         })
@@ -626,23 +626,18 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn signal_deadline(
         &mut self,
         nanos: u64,
-    ) -> Result<carrick_guest_arch::Deadline, NativeProcessError> {
+    ) -> Result<carrick_guest_arch::Deadline, NativeFailure> {
         Ok(carrick_guest_arch::Deadline(
             carrick_guest_arch::CounterTick::new(1000 + nanos),
         ))
     }
     /// One tick per nanosecond, matching `signal_deadline` above.
-    fn signal_frequency(
-        &mut self,
-    ) -> Result<carrick_guest_arch::CounterFrequency, NativeProcessError> {
+    fn signal_frequency(&mut self) -> Result<carrick_guest_arch::CounterFrequency, NativeFailure> {
         Ok(carrick_guest_arch::CounterFrequency::new(
-            NonZeroU64::new(1_000_000_000).ok_or(NativeProcessError::Invalid)?,
+            NonZeroU64::new(1_000_000_000).ok_or(NativeFailure::Invalid)?,
         ))
     }
-    fn arm_signal_timer(
-        &mut self,
-        _: carrick_guest_arch::Deadline,
-    ) -> Result<(), NativeProcessError> {
+    fn arm_signal_timer(&mut self, _: carrick_guest_arch::Deadline) -> Result<(), NativeFailure> {
         Ok(())
     }
     fn counter_frequency(
@@ -652,7 +647,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             1000,
         ))
     }
-    fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
+    fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeFailure> {
         if let Some(mut hook) = self.on_signal_clock.take() {
             hook();
         }

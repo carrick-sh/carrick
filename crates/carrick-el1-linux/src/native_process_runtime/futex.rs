@@ -294,28 +294,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         else {
             return Ok(false);
         };
-        match self.service.futex_shared_private(&mm, address) {
+        match self
+            .service
+            .futex_shared_private(&mm, address)
+            .map_err(NativeProcessError::failure)
+        {
             Ok(admitted) => Ok(admitted),
-            Err(NativeProcessError::OwnerWait(wait)) => {
+            // Contention is "not now" (#2306): keep the relative wait and
+            // rerun the exact syscall after the owner releases (OwnerWait)
+            // or the carrier settles (Busy).
+            Err(Err(contention)) => {
                 if let Some(retained) = retained {
                     self.retain_relative_futex_wait(retained);
                 }
-                Err(self
-                    .retry_guest_input(
-                        carrick_core_abi::service::ServiceOperation::CarrierWork {
-                            entry: OwnerEntry::Syscall,
-                            demand: carrick_core_abi::service::CarrierDemand::Work,
-                        },
-                        None,
-                        Some(wait),
-                    )
-                    .unwrap_or_else(|error| self.run_failed(error.run_failure_reason())))
+                // A synchronous release redispatches the exact syscall, as a
+                // retained owner wait always has here.
+                Err(match self.retain_syscall(contention) {
+                    Ok(outcome) => outcome.unwrap_or(LifecycleOutcome::Redispatch),
+                    Err(failure) => self.run_failed(failure.run_failure_reason()),
+                })
             }
-            // A live portal always observes its Reservations source before
-            // the root probe, so mapping contention cannot reach here as a
-            // bare `Busy`. Treat it as the invariant break it is instead of
-            // adding a waitless checkpoint-retry second path.
-            Err(error) => Err(self.run_failed(error.run_failure_reason())),
+            Err(Ok(failure)) => Err(self.run_failed(failure.run_failure_reason())),
         }
     }
 

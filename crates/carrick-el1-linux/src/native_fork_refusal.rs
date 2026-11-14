@@ -36,6 +36,11 @@ pub enum NativeForkStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeForkCause {
     Busy,
+    /// A terminal close or host authority (`GateState::Closed`,
+    /// `GateState::HostOnly`) shut ring births for this parent. No release
+    /// reopens them, so it is no contention: a closing caller retires at its
+    /// user return, and a host-only parent keeps today's EAGAIN.
+    GateShut,
     Mm(MmError),
     Reservation(Refusal),
     Fork(ForkError),
@@ -74,6 +79,14 @@ impl NativeForkRefusal {
         use carrick_el1_abi::ForkStockRefusal as R;
         match self.cause {
             NativeForkCause::Busy => E::Busy,
+            // Today's EAGAIN answer, as a refusal rather than "not now".
+            NativeForkCause::GateShut => E::Exhausted,
+            // Owner contention keeps its release to enrol on (#2306); it is
+            // never the fault answer of a refused owner operation.
+            NativeForkCause::Mm(MmError::Wait(wait)) => E::OwnerWait(wait),
+            NativeForkCause::Mm(MmError::Busy)
+            | NativeForkCause::Reservation(Refusal::Busy | Refusal::PreparedConflict)
+            | NativeForkCause::Fork(ForkError::Busy) => E::Busy,
             NativeForkCause::StockReservation(R::Invalid) => E::Invalid,
             NativeForkCause::StockReservation(R::Stale) => E::Stale,
             NativeForkCause::StockReservation(R::Capacity) => E::Exhausted,
@@ -96,7 +109,8 @@ pub fn refused(
     super::native_process_runtime::NativeProcessError::ForkRefused(refusal)
 }
 
-/// Preserve the existing EAGAIN policy while retaining the exact refusing site.
+/// Contention at an exact refusing site: the caller retains the fork and
+/// reruns it, it never reaches the guest as EAGAIN (#2306).
 pub fn busy(stage: NativeForkStage) -> super::native_process_runtime::NativeProcessError {
     refused(stage, NativeForkCause::Busy)
 }
@@ -153,11 +167,16 @@ fn observe_process_error_with(
         error,
         super::native_process_runtime::NativeProcessError::ForkRefused(_)
     ) {
-        observe(format_args!(
-            "ProcessNative::fork error={error:?}; errno={}; run_failure={:?}",
-            error.errno(),
-            error.run_failure_reason()
-        ));
+        match error.failure() {
+            Ok(failure) => observe(format_args!(
+                "ProcessNative::fork error={error:?}; errno={}; run_failure={:?}",
+                failure.errno(),
+                failure.run_failure_reason()
+            )),
+            Err(contention) => observe(format_args!(
+                "ProcessNative::fork error={error:?}; not now={contention:?}"
+            )),
+        }
     }
     error
 }
@@ -183,7 +202,7 @@ use super::native_diagnostic::emit;
 
 #[cfg(test)]
 mod tests {
-    use super::super::native_process_runtime::NativeProcessError;
+    use super::super::native_process_runtime::{NativeContention, NativeProcessError};
     use super::*;
 
     #[test]
@@ -197,7 +216,6 @@ mod tests {
             (E::Fault, -14, R::NativeFault),
             (E::Unsupported, -38, R::NativeUnsupported),
             (E::GroupExitCustody, -38, R::X86GroupExitCustody),
-            (E::Busy, -11, R::NativeBusy),
             (E::Quarantined, -5, R::NativeQuarantined),
             (E::NoChild, -10, R::NativeNoChild),
         ] {
@@ -206,14 +224,24 @@ mod tests {
                 core::fmt::write(&mut diagnostic, arguments).unwrap();
             });
             assert_eq!(observed, error);
-            assert_eq!(observed.errno(), errno);
-            assert_eq!(observed.run_failure_reason(), reason);
+            let failure = observed.failure().unwrap();
+            assert_eq!(failure.errno(), errno);
+            assert_eq!(failure.run_failure_reason(), reason);
             assert_eq!(observe_process_error(error), error);
             let expected = std::format!(
                 "ProcessNative::fork error={error:?}; errno={errno}; run_failure={reason:?}"
             );
             assert_eq!(diagnostic.message(), Some(expected.as_str()));
         }
+        let mut diagnostic = carrick_el1_abi::NativeDiagnostic::new();
+        let observed = observe_process_error_with(E::Busy, |arguments| {
+            core::fmt::write(&mut diagnostic, arguments).unwrap();
+        });
+        assert_eq!(observed.failure(), Err(NativeContention::Busy));
+        assert_eq!(
+            diagnostic.message(),
+            Some("ProcessNative::fork error=Busy; not now=Busy")
+        );
     }
 
     #[test]
@@ -229,8 +257,7 @@ mod tests {
             let error = refused(NativeForkStage::Reserve, cause);
             let observed = observe_process_error_with(error, |_| panic!("duplicate refusal"));
             assert_eq!(observed, error);
-            assert_eq!(observed.errno(), error.errno());
-            assert_eq!(observed.run_failure_reason(), error.run_failure_reason());
+            assert_eq!(observed.failure(), error.failure());
         }
     }
 
@@ -265,13 +292,13 @@ mod tests {
                 cause: NativeForkCause::Fork(ForkError::Core),
             })
         );
-        assert_eq!(error.errno(), -14);
+        assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-14));
         assert_ne!(error, refused(NativeForkStage::Prepare, ForkError::Core));
         assert_ne!(error, refused(NativeForkStage::Census, ForkError::Stale));
     }
 
     #[test]
-    fn parent_gate_refusal_preserves_observed_state_and_busy_policy() {
+    fn parent_gate_refusal_preserves_observed_state_as_contention() {
         use carrick_el1_abi::GateState;
         for observed in [
             GateState::Open,
@@ -289,11 +316,8 @@ mod tests {
                     cause: NativeForkCause::Busy,
                 })
             );
-            assert_eq!(error.errno(), -11);
-            assert_eq!(
-                error.run_failure_reason(),
-                carrick_core_abi::NativeRunFailureReason::NativeBusy
-            );
+            // A closing or forking gate is "not now", never EAGAIN.
+            assert_eq!(error.failure(), Err(NativeContention::Busy));
             let NativeProcessError::ForkRefused(refusal) = error else {
                 unreachable!()
             };
@@ -303,6 +327,14 @@ mod tests {
                 "NativeForkRefusal {{ stage: ParentLifecycleGate {{ observed: {observed:?} }}, cause: Busy }}"
             );
             assert_eq!(diagnostic.message(), Some(expected.as_str()));
+        }
+        // No release reopens a shut gate: a refusal, not contention.
+        for observed in [GateState::Closed, GateState::HostOnly] {
+            let shut = refused(
+                NativeForkStage::ParentLifecycleGate { observed },
+                NativeForkCause::GateShut,
+            );
+            assert_eq!(shut.failure().map(|failure| failure.errno()), Ok(-11));
         }
     }
 
@@ -319,8 +351,7 @@ mod tests {
                 NativeForkStage::Reserve,
                 NativeForkCause::StockReservation(reply),
             );
-            assert_eq!(diagnostic.errno(), error.errno());
-            assert_eq!(diagnostic.run_failure_reason(), error.run_failure_reason());
+            assert_eq!(diagnostic.failure(), error.failure());
         }
     }
 }

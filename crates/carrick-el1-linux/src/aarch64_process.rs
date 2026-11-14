@@ -34,7 +34,7 @@ use super::native_fork_refusal::{NativeForkStage, refused};
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 use super::native_process_runtime::NativeResume;
 use super::native_process_runtime::{
-    ExecSuccessorSlot, FallibleBox, NativeExecSuccessor, NativeForkPreparation,
+    ExecSuccessorSlot, FallibleBox, NativeExecSuccessor, NativeFailure, NativeForkPreparation,
     NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
     NativeProcessService,
 };
@@ -787,7 +787,7 @@ where
                     },
                 )
                 .map_err(|_| NativeProcessError::Fault)?;
-            Ok(deliver(process))
+            Ok::<_, NativeProcessError>(deliver(process))
         },
     )??;
     if control
@@ -1741,7 +1741,7 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
         u32::from(self.slot.raw())
     }
 
-    fn portal(&self) -> Result<Portal<'_>, NativeProcessError> {
+    fn portal(&self) -> Result<Portal<'_>, NativeFailure> {
         Ok(carrick_core::mm::transaction::MmPortal::for_zone(
             self.carrier,
             self.roots,
@@ -1781,7 +1781,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     fn cancel_exec_successor(
         &self,
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeFailure> {
         crate::exec_successor::cancel_prepared_exec(receipt, |record| {
             self.crossing
                 .cross_exec_cancel(record, u64::from(self.worker()))
@@ -2016,16 +2016,13 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
     }
 
-    fn service_mm_handle(
-        &self,
-        mm: &Mm,
-    ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+    fn service_mm_handle(&self, mm: &Mm) -> Result<carrick_core_abi::El1MmHandle, NativeFailure> {
         self.portal()?
             .admitted_handle(
-                ReservationMm::new(mm.mm.raw().get()).ok_or(NativeProcessError::Stale)?,
+                ReservationMm::new(mm.mm.raw().get()).ok_or(NativeFailure::Stale)?,
                 u32::from(self.slot.raw()),
             )
-            .map_err(|_| NativeProcessError::Stale)
+            .map_err(|_| NativeFailure::Stale)
     }
 
     fn futex_shared_private(
@@ -2122,25 +2119,16 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .try_reserve_exact(capacity)
             .map_err(|_| NativeProcessError::Exhausted)?;
         let (operation, generation, count, layout) = {
-            let index = owner
-                .spaces
-                .find(mm.raw())
-                .ok_or(NativeProcessError::Stale)?;
-            let access = owner
-                .space_access(self.worker())
+            let handle = owner
+                .admitted_handle(mm, self.worker())
                 .map_err(|e| refused(NativeForkStage::SpaceAccess, e))?;
-            let _editor = access
-                .try_begin_edit(
-                    index,
-                    mm.raw(),
-                    NonZeroU64::new(u64::from(self.worker()) + 1)
-                        .ok_or(NativeProcessError::Stale)?,
-                )
-                .ok_or_else(|| {
-                    super::native_fork_refusal::busy(NativeForkStage::ParentSpaceEdit)
-                })?;
+            // A held editor or root is the holder's release to enrol on
+            // (`MmError::Wait`), never a bare retry (#2306).
+            let _editor = owner
+                .editor_for(handle, self.worker())
+                .map_err(|e| refused(NativeForkStage::ParentSpaceEdit, e))?;
             let mut root = owner
-                .root(mm, self.worker())
+                .root_for(handle, self.worker())
                 .map_err(|e| refused(NativeForkStage::ParentRoot, e))?;
             if !root.fork_ready() {
                 return Err(super::native_fork_refusal::busy(
@@ -2464,12 +2452,15 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         &mut self,
         mut prepared: Self::PreparedMm,
     ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
-        let result = self.portal().and_then(|owner| {
-            prepared
-                .child
-                .commit(&owner, self.worker())
-                .map_err(|e| refused(NativeForkStage::Commit, e))
-        });
+        let result = self
+            .portal()
+            .map_err(NativeProcessError::from)
+            .and_then(|owner| {
+                prepared
+                    .child
+                    .commit(&owner, self.worker())
+                    .map_err(|e| refused(NativeForkStage::Commit, e))
+            });
         match result {
             Ok(_) => Ok(Born {
                 admitted: prepared.admitted,
@@ -2484,7 +2475,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     ) -> Result<(), (NativeProcessError, Self::PreparedMm)> {
         let owner = match self.portal() {
             Ok(owner) => owner,
-            Err(e) => return Err((e, prepared)),
+            Err(e) => return Err((e.into(), prepared)),
         };
         if let Err(e) = prepared
             .child
@@ -2542,15 +2533,15 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     fn vacate_terminal_space(
         &mut self,
         source: BornInZoneSource<'a, Aarch64ParkedContext>,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeFailure> {
         if !core::ptr::eq(source.zone, self.zone) || source.slot != self.slot {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeFailure::Stale);
         }
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let idle = self.zone.spaces.idle_ttbr();
             if idle == 0 {
-                return Err(NativeProcessError::Quarantined);
+                return Err(NativeFailure::Quarantined);
             }
             crate::sched::ThreadCpu::set_translation(&mut crate::sched::HardwareCpu, idle, idle);
         }

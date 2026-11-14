@@ -441,7 +441,10 @@ impl<
             )
         }))
     }
-    pub(crate) fn editor_for(
+    /// Take the exact admitted MM's editor. A held editor or closed gate
+    /// returns [`MmError::Wait`] carrying the observed release, so the caller
+    /// enrols on the holder instead of retrying a bare `Busy`.
+    pub fn editor_for(
         &self,
         handle: El1MmHandle,
         slot: u32,

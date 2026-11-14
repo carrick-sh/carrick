@@ -1,8 +1,8 @@
 //! One native process signal selection and handler-publication owner for both ISAs.
 
 use super::native_process_runtime::{
-    NativeProcessEntry, NativeProcessError, NativeProcessService, PendingSignalDelivery,
-    SignalCopyDeferral,
+    NativeFailure, NativeProcessEntry, NativeProcessError, NativeProcessService,
+    PendingSignalDelivery, SignalCopyDeferral,
 };
 use carrick_el1_abi::{BlockedMask, CurrentTask};
 use carrick_guest_arch::{ProcessContext, UserVa};
@@ -142,9 +142,7 @@ where
                     Some(match process.exit_with_signal(sig) {
                         Ok(LifecycleOutcome::HostCustody) => process.user_return_host_custody(),
                         Ok(_) => CompletionRoute::Suspended,
-                        Err(NativeProcessError::GroupExitCustody) => {
-                            machine.group_exit_custody(task)
-                        }
+                        Err(NativeFailure::GroupExitCustody) => machine.group_exit_custody(task),
                         Err(_) => CompletionRoute::InvalidCompletion,
                     })
                 } else {
@@ -369,7 +367,7 @@ where
         return Some(match process.exit_with_signal(Signal::SEGV) {
             Ok(LifecycleOutcome::HostCustody) => process.user_return_host_custody(),
             Ok(_) => CompletionRoute::Suspended,
-            Err(NativeProcessError::GroupExitCustody) => machine.group_exit_custody(task),
+            Err(NativeFailure::GroupExitCustody) => machine.group_exit_custody(task),
             Err(_) => CompletionRoute::InvalidCompletion,
         });
     }

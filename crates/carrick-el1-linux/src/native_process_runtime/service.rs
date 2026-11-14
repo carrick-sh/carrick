@@ -17,7 +17,7 @@ pub(super) fn bind_member_service<C: ProcessContext>(
     thread: carrick_core_abi::EntryThreadGeneration,
     control: &ThreadControlSlot,
     mm: carrick_el1_abi::El1MmHandle,
-) -> Result<(), NativeProcessError> {
+) -> Result<(), NativeFailure> {
     bind_member_service_queue(zone, record)?;
     control.bind_zone_record(record);
     control
@@ -35,8 +35,8 @@ pub(super) fn bind_member_service<C: ProcessContext>(
 fn bind_member_service_queue<C: ProcessContext>(
     zone: &ZoneTables<C>,
     record: RecordRef,
-) -> Result<(), NativeProcessError> {
-    let wait = ObjectWaitKey::native_service(record).ok_or(NativeProcessError::Stale)?;
+) -> Result<(), NativeFailure> {
+    let wait = ObjectWaitKey::native_service(record).ok_or(NativeFailure::Stale)?;
     if zone
         .object_wait(wait, &carrick_sched_core::ShortLockSpin, &|owned| {
             crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
@@ -48,7 +48,7 @@ fn bind_member_service_queue<C: ProcessContext>(
     zone.bind_object_wait(wait, &carrick_sched_core::ShortLockSpin, &|owned| {
         crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
     })
-    .map_err(|_| NativeProcessError::Quarantined)
+    .map_err(|_| NativeFailure::Quarantined)
 }
 
 fn native_exception_signal(
@@ -451,7 +451,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         record: RecordRef,
         slot: SlotId,
         service: &mut S,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeFailure> {
         let member = self.zone.record(record.id);
         if let Some(census) = member.object_wait_census()
             && census.is_anonymous_edit()
@@ -555,7 +555,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     carrick_sched_core::object_wait::ObjectWaitError::Stale
                     | carrick_sched_core::object_wait::ObjectWaitError::Occupied,
                 ) => return Ok(()),
-                Err(_) => return Err(NativeProcessError::Quarantined),
+                Err(_) => return Err(NativeFailure::Quarantined),
             };
             let owned = queue.wake_owner_operation(record, &operation, slot, Handback::Signal);
             drop(queue);
@@ -564,13 +564,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             }
             return Ok(());
         };
-        let key = ObjectWaitKey::native_service(record).ok_or(NativeProcessError::Stale)?;
+        let key = ObjectWaitKey::native_service(record).ok_or(NativeFailure::Stale)?;
         let guard = self
             .zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
                 crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
             })
-            .map_err(|_| NativeProcessError::Quarantined)?;
+            .map_err(|_| NativeFailure::Quarantined)?;
         // Completion may have consumed the captured request before this
         // queue lock was acquired. A signal targets the member, not an old
         // service sequence; never cancel its replacement or fail the run.
@@ -600,7 +600,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 request.identity.birth.mm,
                 wait,
             )
-            .map_err(|_| NativeProcessError::Stale)?;
+            .map_err(|_| NativeFailure::Stale)?;
             let completion =
                 |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
                     crate::sched::object_wait::deliver_completion(self.zone, slot, owned);
@@ -612,7 +612,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     &carrick_sched_core::ShortLockSpin,
                     &completion,
                 )
-                .map_err(|_| NativeProcessError::Stale)?;
+                .map_err(|_| NativeFailure::Stale)?;
             // Recheck after queue admission: a completed wait may already have
             // moved to its successor. Cancellation remains sticky in the cell.
             if self
@@ -626,12 +626,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                         .zone
                         .record(record.id)
                         .object_wait_census()
-                        .ok_or(NativeProcessError::Stale)?;
+                        .ok_or(NativeFailure::Stale)?;
                     OperationToken::new(census.operation, census.operation_generation)
                 } else {
                     OperationToken::new(u64::from(record.id.raw()), request.identity.sequence.get())
                 }
-                .ok_or(NativeProcessError::Stale)?;
+                .ok_or(NativeFailure::Stale)?;
                 let owned = queue.wake_owner_operation(record, &operation, slot, Handback::Resumed);
                 drop(queue);
                 if let Some(owned) = owned {
@@ -644,7 +644,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         } else {
             guard
                 .notify_object(slot, &mut effects)
-                .map_err(|_| NativeProcessError::Quarantined)?;
+                .map_err(|_| NativeFailure::Quarantined)?;
             drop(guard);
         }
         service.wake_effects(effects);
@@ -659,7 +659,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub(super) fn release_service_claim(
         &mut self,
         claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeFailure> {
         claim.acknowledge(|notification| {
             if let Some(notification) = notification {
                 publish_terminal_notification(
@@ -879,15 +879,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // user result or fresh syscall may replace the retained token.
                 self.yield_service_checkpoint()?
             }
-            Err(
-                error @ (NativeProcessError::Fault
-                | NativeProcessError::Unsupported
-                | NativeProcessError::NoChild),
-            ) => {
-                self.adapter_ready = None;
-                NativeResume::Returned(
-                    self.retire_adapter_result(SyscallResult::new(error.errno()))?,
-                )
+            Err(NativeProcessError::Fault) => self.retire_adapter_failure(NativeFailure::Fault)?,
+            Err(NativeProcessError::Unsupported) => {
+                self.retire_adapter_failure(NativeFailure::Unsupported)?
+            }
+            Err(NativeProcessError::NoChild) => {
+                self.retire_adapter_failure(NativeFailure::NoChild)?
             }
         };
         if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
@@ -899,6 +896,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Ok(result);
         }
         Ok(result)
+    }
+
+    #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+    fn retire_adapter_failure(
+        &mut self,
+        failure: NativeFailure,
+    ) -> Result<NativeResume, NativeProcessError> {
+        self.adapter_ready = None;
+        Ok(NativeResume::Returned(self.retire_adapter_result(
+            SyscallResult::new(failure.errno()),
+        )?))
     }
 
     /// Intake may capture backing, but never waits for another guest. The
@@ -1839,7 +1847,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .bound_birth(self.key, self.binding.thread_generation, self.record)
                         .map_err(service_protocol_error)?
                 }
-                Err(error) => return Err(service_protocol_error(error)),
+                Err(error) => return Err(service_protocol_error(error).into()),
             };
         self.service_phase = NativeServicePhase::Unspecified;
         let exec_successor = matches!(operation, ServiceOperation::Exec { .. })
@@ -1914,7 +1922,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.control
                     .service
                     .begin_owner_wait(birth, self.binding.generation, operation, wait)
-                    .map_err(service_protocol_error)
+                    .map_err(|error| service_protocol_error(error).into())
             } else {
                 self.control
                     .service
@@ -1925,7 +1933,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         fault_sequence,
                         reply.as_ref().map(PendingServiceReply::address),
                     )
-                    .map_err(service_protocol_error)
+                    .map_err(|error| service_protocol_error(error).into())
             }
         };
         let request = match published {
@@ -2047,7 +2055,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .remove_service_wait(&self.record)
                     .ok_or(NativeProcessError::Quarantined)?;
                 self.release_service_claim(pending.claim)?;
-                return Err(error);
+                return Err(error.into());
             }
         }
         #[cfg(test)]
@@ -2186,7 +2194,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             if let ServiceResult::Wait(wait) = result {
                                 let mut graph = self.runtime.graph.lock();
                                 let Some(pending) = graph.service_wait_mut(&self.record) else {
-                                    failure = Some(NativeProcessError::Stale);
+                                    failure = Some(NativeFailure::Stale);
                                     return Err(ObjectWaitError::Stale);
                                 };
                                 pending.wait = Some(wait);
@@ -2228,7 +2236,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     self.retain_record_operation(operation)?;
                 }
                 if host_contended {
-                    return self.yield_service_checkpoint_as(entry);
+                    return Ok(self.yield_service_checkpoint_as(entry)?);
                 }
                 if error != ObjectWaitError::Changed && failure.is_none() {
                     return Err(NativeProcessError::Quarantined);
@@ -2237,10 +2245,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         };
         if let Some(error) = failure {
-            return Err(error);
+            return Err(error.into());
         }
         if deferred {
-            return self.yield_service_checkpoint();
+            return Ok(self.yield_service_checkpoint()?);
         }
         if let Some(result) = completion {
             return match result {
@@ -2278,7 +2286,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// A supply that won before enrollment is ready work, not a reason to
     /// finish under the IPC dispatch stack. The exact record keeps its token.
     #[inline(never)]
-    pub(super) fn yield_service_checkpoint(&mut self) -> Result<NativeResume, NativeProcessError> {
+    pub(super) fn yield_service_checkpoint(&mut self) -> Result<NativeResume, NativeFailure> {
         self.yield_service_checkpoint_as(OwnerEntry::Syscall)
     }
 
@@ -2291,14 +2299,41 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
 
-    /// Leave through the owner checkpoint that resumes `entry`'s service.
-    #[inline(never)]
-    fn yield_service_checkpoint_as(
+    /// Contention is "not now" (#2306): keep this running member's owner
+    /// continuation for `entry` and leave through its run queue, whose next
+    /// selection reruns the owner checkpoint. A retained object operation
+    /// leaves with it; without one, the record is requeued exactly as a host
+    /// request on a refused park is (#1467).
+    pub(super) fn yield_owner_checkpoint(
         &mut self,
         entry: OwnerEntry,
-    ) -> Result<NativeResume, NativeProcessError> {
+    ) -> Result<NativeResume, NativeFailure> {
+        if self
+            .source
+            .zone
+            .record(self.record.id)
+            .has_object_operation()
+        {
+            return self.yield_service_checkpoint_as(entry);
+        }
+        // SAFETY: this admitted lane still owns this exact OnCpu record.
+        unsafe {
+            let record = self.source.zone.record(self.record.id);
+            *record.ctx_mut() = *self.words;
+            record.publish_owner_continuation(entry);
+        }
+        self.yield_retained_wait(self.record.id)?;
+        Ok(NativeResume::Left(None))
+    }
+
+    /// Leave through the owner checkpoint that resumes `entry`'s service.
+    #[inline(never)]
+    pub(super) fn yield_service_checkpoint_as(
+        &mut self,
+        entry: OwnerEntry,
+    ) -> Result<NativeResume, NativeFailure> {
         let start = carrick_core::entry::prepare_handoff(self.binding, self.source, self.record.id)
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(NativeFailure::Stale)?;
         // SAFETY: this exact admitted record is still held by this lane.
         unsafe {
             let record = self.source.zone.record(self.record.id);
@@ -2314,7 +2349,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .zone
                     .requeue_preempted(self.source.slot, self.record.id);
                 if !requeue.is_queued() {
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(NativeFailure::Quarantined);
                 }
                 self.source.zone.clear_current(self.source.slot);
                 self.yield_receipt_race();
@@ -2326,14 +2361,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     &carrick_sched_core::ShortLockSpin,
                 );
                 if release != carrick_sched_core::CurrentRelease::Requeued {
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(NativeFailure::Quarantined);
                 }
                 // From here the queued record may already be the host's (#1467):
                 // the requeue itself, not a later claim read, is the publication.
                 self.yield_receipt_race();
                 carrick_core::entry::publish_handoff_yield(start, release)
             };
-        self.handoff = Some(receipt.ok_or(NativeProcessError::Quarantined)?);
+        self.handoff = Some(receipt.ok_or(NativeFailure::Quarantined)?);
         Ok(NativeResume::Left(None))
     }
 
@@ -2458,7 +2493,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // Host contention, as in `park_service` (#1467): the retained
                 // owner wait resumes at this record's next owner entry.
                 self.retain_record_operation(operation)?;
-                self.yield_service_checkpoint()
+                Ok(self.yield_service_checkpoint()?)
             }
             Err((_, operation)) => {
                 self.restore_preparation_operation(operation)?;
@@ -2504,24 +2539,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         service_rebind: carrick_core_abi::service::PreparedServiceRebind<'_>,
         comm: [u8; 16],
         validated: Box<ValidatedExecSuccessor<'a>>,
-    ) -> Result<(), NativeProcessError> {
-        let registry = self
-            .runtime
-            .registry
-            .lock()
-            .ok_or(NativeProcessError::Stale)?;
+    ) -> Result<(), NativeFailure> {
+        let registry = self.runtime.registry.lock().ok_or(NativeFailure::Stale)?;
         let mut state = registry.state.lock();
         let record = self.source.zone.record(self.record.id);
         let old_key = *state
             .records
             .get(&validated.record_key)
             .filter(|key| **key == validated.old_key)
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(NativeFailure::Stale)?;
         let old_member = state
             .members
             .get(&old_key)
             .cloned()
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(NativeFailure::Stale)?;
         if old_member.process != self.key
             || old_member.record != self.record
             || old_member.address != self.caller_address
@@ -2531,25 +2562,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             || record.identity() != validated.old_record_identity
             || self.control.visible_tid() != Some(self.calling_tid)
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeFailure::Stale);
         }
         let leader = self.key.id;
         let next_generation = validated
             .new_key
             .task
             .issued()
-            .ok_or(NativeProcessError::Stale)?
+            .ok_or(NativeFailure::Stale)?
             .generation;
         if old_key != validated.new_key && state.members.contains_key(&validated.new_key) {
-            return Err(NativeProcessError::Busy);
+            return Err(NativeFailure::Stale);
         }
         let mut graph = self.runtime.graph.lock();
         let row = graph
             .owner
             .task_mut(self.key)
-            .map_err(|_| NativeProcessError::Stale)?;
+            .map_err(|_| NativeFailure::Stale)?;
         if row.metadata().namespace_pid != validated.leader_tid {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeFailure::Stale);
         }
         let caller = row
             .threads
@@ -2557,9 +2588,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .iter()
             .find(|thread| thread.tid == self.calling_tid)
             .cloned()
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(NativeFailure::Stale)?;
         if caller.credentials != validated.caller_credentials {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeFailure::Stale);
         }
         {
             let resources = row.native_mut().resources_mut();
@@ -2569,19 +2600,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 || !core::ptr::eq(resources.page, validated.page)
                 || resources.file_table != validated.file_table
             {
-                return Err(NativeProcessError::Busy);
+                return Err(NativeFailure::Stale);
             }
         }
         let (old_group, keys) = state
             .by_process
             .get(&(old_key.carrier, self.key))
             .cloned()
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(NativeFailure::Stale)?;
         if old_group != validated.old_group
             || keys.as_slice() != [old_key]
             || !state.groups.contains_key(&validated.old_group)
         {
-            return Err(NativeProcessError::Busy);
+            return Err(NativeFailure::Stale);
         }
         let mut member = old_member.clone();
 
@@ -2678,24 +2709,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn validate_exec_successor(
         &self,
         address: AddressContext<RootGpa>,
-    ) -> Result<Box<ValidatedExecSuccessor<'a>>, NativeProcessError> {
-        let registry = self
-            .runtime
-            .registry
-            .lock()
-            .ok_or(NativeProcessError::Stale)?;
+    ) -> Result<Box<ValidatedExecSuccessor<'a>>, NativeFailure> {
+        let registry = self.runtime.registry.lock().ok_or(NativeFailure::Stale)?;
         let state = registry.state.lock();
         let record_key = NativeProcessRegistry::<M, C>::record_key(self.source.zone, self.record);
-        let old_key = *state
-            .records
-            .get(&record_key)
-            .ok_or(NativeProcessError::Stale)?;
-        let old_member = state
-            .members
-            .get(&old_key)
-            .ok_or(NativeProcessError::Stale)?;
+        let old_key = *state.records.get(&record_key).ok_or(NativeFailure::Stale)?;
+        let old_member = state.members.get(&old_key).ok_or(NativeFailure::Stale)?;
         if old_member.process != self.key || old_member.record != self.record {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeFailure::Stale);
         }
         let next_generation = old_key
             .task
@@ -2703,7 +2724,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .and_then(|issued| issued.generation.raw().checked_add(1))
             .filter(|generation| *generation != 0)
             .map(carrick_core_abi::SnapshotGeneration::from_raw)
-            .ok_or(NativeProcessError::Exhausted)?;
+            .ok_or(NativeFailure::Exhausted)?;
         let new_key = NativeExecutionKey {
             carrier: old_key.carrier,
             task: NativeThreadIdentity::Issued(IssuedExecution {
@@ -2716,23 +2737,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             address_generation: address.generation.raw().get(),
         };
         if old_key != new_key && state.members.contains_key(&new_key) {
-            return Err(NativeProcessError::Busy);
+            return Err(NativeFailure::Stale);
         }
         let (old_group, keys) = state
             .by_process
             .get(&(old_key.carrier, self.key))
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(NativeFailure::Stale)?;
         if keys.as_slice() != [old_key]
             || self.control.visible_tid() != Some(self.calling_tid)
             || self.source.zone.record(self.record.id).identity().tid != self.calling_tid as u64
         {
-            return Err(NativeProcessError::Busy);
+            return Err(NativeFailure::Stale);
         }
         let graph = self.runtime.graph.lock();
         let row = graph
             .owner
             .task(self.key)
-            .map_err(|_| NativeProcessError::Stale)?;
+            .map_err(|_| NativeFailure::Stale)?;
         let resources = row.native().resources();
         if resources.members.len() != 1
             || resources.members[0].record != self.record
@@ -2743,7 +2764,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .iter()
                 .all(|thread| thread.tid != self.calling_tid)
         {
-            return Err(NativeProcessError::Busy);
+            return Err(NativeFailure::Stale);
         }
         let leader_tid = row.metadata().namespace_pid;
         let caller_credentials = row
@@ -2751,7 +2772,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .threads
             .iter()
             .find(|thread| thread.tid == self.calling_tid)
-            .ok_or(NativeProcessError::Stale)?
+            .ok_or(NativeFailure::Stale)?
             .credentials
             .clone();
         let new_group = NativeProcessRegistry::<M, C>::group_key(
@@ -2811,7 +2832,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if self.handoff.is_some() {
             NativeResume::Left(None)
         } else {
-            let _ = self.run_failed(NativeProcessError::Quarantined.run_failure_reason());
+            let _ = self.run_failed(NativeFailure::Quarantined.run_failure_reason());
             NativeResume::Left(None)
         }
     }
@@ -2859,8 +2880,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> NativeResume {
         let cancelled = self.service.cancel_exec_successor(receipt);
         let released = self.release_service_claim(claim);
-        if let Err(error) = cancelled.and(released) {
-            let _ = self.run_failed(error.run_failure_reason());
+        if let Err(failure) = cancelled.and(released) {
+            let _ = self.run_failed(failure.run_failure_reason());
             return NativeResume::Left(None);
         }
         self.exec_past_no_return()
@@ -3784,16 +3805,16 @@ fn entropy_copy_fault(committed: usize) -> NativeResume {
     })
 }
 
-pub(super) fn service_protocol_error(error: ServiceError) -> NativeProcessError {
+pub(super) fn service_protocol_error(error: ServiceError) -> NativeFailure {
     match error {
         // All callers either own the exact executing member before transport
         // publication, or hold its native-service queue. The transport takes
         // that same queue for claim and acknowledgment. Expected not-ready
         // consumption is handled before this mapper; a failed transition here
         // means duplicate/mismatched custody, not a releasable resource.
-        ServiceError::Busy => NativeProcessError::Quarantined,
-        ServiceError::Stale => NativeProcessError::Stale,
-        ServiceError::Exhausted => NativeProcessError::Exhausted,
+        ServiceError::Busy => NativeFailure::Quarantined,
+        ServiceError::Stale => NativeFailure::Stale,
+        ServiceError::Exhausted => NativeFailure::Exhausted,
     }
 }
 
