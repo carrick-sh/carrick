@@ -1,3 +1,7 @@
+# #2306: errno and run-failure conversion moves to NativeFailure; owner
+# contention (NativeContention) parks, retains its syscall or yields at the
+# owner checkpoint. Witnesses are bound below; this contract's settlement,
+# cancellation and budgets are unchanged.
 # #1093 S4c slice a: `native_process_runtime/host_test_support.rs` adds dual-ISA
 # post-no-return exec SIGSEGV and lost-race witnesses bound under
 # process.exec.custody. No change to this contract's guest semantics, bindings
@@ -61,6 +65,9 @@ rationale = "Owner waits are killable-only: handled signals and stops never comp
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::native_process_runtime::host_test_support::contention_not_now::{fork_preparation_busy_once_then_forks_x86,fork_preparation_busy_once_then_forks_aarch64,waitid_nohang_siginfo_busy_once_then_returns_zero_x86,waitid_nohang_siginfo_busy_once_then_returns_zero_aarch64,sigtimedwait_resumed_siginfo_busy_once_keeps_the_taken_signal_x86,sigtimedwait_resumed_siginfo_busy_once_keeps_the_taken_signal_aarch64,host_request_during_sleep_park_yields_then_reparks_x86,host_request_during_sleep_park_yields_then_reparks_aarch64,host_request_during_semop_park_yields_then_reparks_x86,host_request_during_semop_park_yields_then_reparks_aarch64,two_live_threads_park_their_own_semop_x86,two_live_threads_park_their_own_semop_aarch64} (#2306: contention once at the production venue keeps the operation and then completes; never EAGAIN, EFAULT or a run failure)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::futex_contention::{native_futex_mapping_busy_once_then_waits_x86,native_futex_mapping_busy_once_then_waits_aarch64} (#2306: a Busy futex mapping probe reruns the syscall instead of ending the run)",
+  "carrick-el1-linux::native_process_runtime::tests::process_clone_child_tid_lives_in_child_mm_and_clears_on_exit (#2306: a Busy CLONE_CHILD_SETTID or exit CLONE_CHILD_CLEARTID store is kept and stored after its owner checkpoint, never dropped)",
   "carrick-el1-linux::native_process_runtime::host_test_support::wait4_rusage_owner_wait_retains_reaped_answer_until_release",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_futex_atomic_owner_retry_keeps_deadline_and_key_scope",
   "carrick-el1-linux::native_process_runtime::host_test_support::wait4_status_owner_wait_retains_zombie_until_release",
@@ -165,6 +172,7 @@ vm_free = [
 ]
 
 embed = [
+  "carrick-vmm-kvm::cpl0_entry::{production_fork_editor_busy_once_then_forks,production_waitid_nohang_siginfo_busy_once_returns_zero,production_clone_settid_busy_once_then_stores} (#2306: real KVM CPL0 test image; a held parent editor at fork preparation, a Busy WNOHANG siginfo copy and a Busy child-tid store each complete after one contention, never EAGAIN or a dropped store)",
   "carrick-vmm-kvm::cpl0_entry::{production_wait4_status_editor_busy_once_parks_then_reaps,production_wait4_status_copy_busy_once_then_reaps,production_wait4_rusage_editor_busy_once_parks_then_writes,production_wait4_rusage_copy_busy_once_retains_the_reaped_answer} (#2321: real KVM CPL0 test image; a production fork child is a zombie before the wait4 output write is contended once, by an editor owner or a Busy copy; the caller reaps it once with pid, status and rusage, never EFAULT or EAGAIN)",
   "carrick-embed::el1_host_copyout::root_signal_copy::root_sigprocmask_reads_untouched_readonly_file_mapping (#1677: root in-ring signal set first-reads an untouched readonly file mapping; old/new/restored mask and no forwarding)",
   "carrick-embed::el1_sched::el1_prepared_fork_poll_arguments_touched_after_fork (#1877 diagnostic control; signed verification pending)",

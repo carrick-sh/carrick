@@ -295,3 +295,22 @@ MM Gate after child exit, requires a transfer with no physical notice, then
 releases it and requires one rusage output and ECHILD on a subsequent wait.
 It was red on d5ab1fd1f at the transfer assertion. This does not establish the
 remaining generic converter audit or resolve the separate loaded birth stall.
+
+Owner contention has no errno (#2306). `NativeProcessError::failure()`
+separates `NativeContention` (an owner wait or Busy) from `NativeFailure`, the
+only type with `errno()` and `run_failure_reason()`. A lifecycle call that has
+committed nothing (fork, and wait4/waitid before any child is consumed) keeps
+its exact syscall in the owner-service continuation (`retry_guest_input`):
+an owner wait enrols on that owner's release, Busy waits for the carrier to
+settle, and a release before enrolment reruns in place. Fork preparation takes
+the parent editor and root through `editor_for` and `root_for`, so a held one
+is a wait on its release. A signal or IPC park refused by a host request keeps
+its wait and yields, as child waits do (#1467); IPC continuations are keyed per
+thread. A resumed sigtimedwait keeps its taken signal and siginfo in the
+copyout owner. CLONE_CHILD_SETTID and the exit CLONE_CHILD_CLEARTID store leave
+through the owner checkpoint and store on the rerun. The VM-free
+`contention_not_now` witnesses (both contexts), the futex and child-tid
+witnesses and the x86 CPL0 `production_fork_editor_busy_once_then_forks`,
+`production_waitid_nohang_siginfo_busy_once_returns_zero` and
+`production_clone_settid_busy_once_then_stores` were red on main (EAGAIN,
+EFAULT, a NativeBusy run failure or a dropped store) and pass with the fix.
