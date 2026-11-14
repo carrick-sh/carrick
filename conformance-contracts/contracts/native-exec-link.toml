@@ -1,3 +1,7 @@
+# #2306: wait_query parks pre-reap status-copy OwnerWait via the existing
+# owner-service continuation. The host fixture gains a status-copy refusal
+# and a real fork/exit/wait witness under kernel.memory.owner-wait.
+# This family's contract expectations, bindings and budgets are unchanged.
 schema_version = 1
 id = "process.exec.native-exe-link"
 title = "Native exec successors read their own executable link"

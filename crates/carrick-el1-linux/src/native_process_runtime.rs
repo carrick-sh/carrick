@@ -5399,7 +5399,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 }
                             }
                         }
-                    })?;
+                    });
+                    let copied = match copied {
+                        Ok(copied) => copied,
+                        Err(NativeProcessError::OwnerWait(wait)) => {
+                            // No zombie has been consumed. Retain the exact
+                            // member's syscall in the existing owner-service
+                            // continuation, then rescan after its MM releases.
+                            return self.retry_guest_input(
+                                carrick_core_abi::service::ServiceOperation::CarrierWork {
+                                    entry: OwnerEntry::Syscall,
+                                    demand: carrick_core_abi::service::CarrierDemand::Work,
+                                },
+                                None,
+                                Some(wait),
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if matches!(output, PendingWaitOutput::WaitId { nowait: true }) {
                         return Ok(returned(0));
                     }

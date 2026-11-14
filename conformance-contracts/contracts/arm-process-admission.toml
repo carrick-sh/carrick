@@ -1,3 +1,7 @@
+# #2306: wait_query parks pre-reap status-copy OwnerWait via the existing
+# owner-service continuation. The host fixture gains a status-copy refusal
+# and a real fork/exit/wait witness under kernel.memory.owner-wait.
+# This family's contract expectations, bindings and budgets are unchanged.
 # #1093 S4c slice a: `native_process_runtime/host_test_support.rs` adds dual-ISA
 # post-no-return exec SIGSEGV and lost-race witnesses bound under
 # process.exec.custody. No change to this contract's guest semantics, bindings
