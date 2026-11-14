@@ -127,7 +127,7 @@ pub const fn output_arguments_for_aarch64(number: u64) -> Option<&'static [u8]> 
         78 | 79 => Some(&[2]),
         291 => Some(&[4]), // statx
         // Scalar, vector and indirect file I/O.
-        63 | 65 | 67 | 69 | 286 => Some(&[1]),
+        63 | 65 | 67 | 69 | 75 | 286 => Some(&[1]),
         71 => Some(&[2]),          // sendfile updates off_t
         72 => Some(&[1, 2, 3, 4]), // pselect6 includes remaining timeout
         76 => Some(&[1, 3]),       // splice updates both offsets
@@ -164,7 +164,6 @@ pub const fn output_arguments_for_aarch64(number: u64) -> Option<&'static [u8]> 
         | 68
         | 70
         | 74
-        | 75
         | 77
         | 81..=85
         | 88

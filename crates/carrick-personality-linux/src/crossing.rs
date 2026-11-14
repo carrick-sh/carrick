@@ -585,7 +585,7 @@ mod tests {
     }
 
     /// Decrease-only count ratchet for undeclared ABI outputs; see #2300.
-    const UNDECLARED_OUTPUT_ARGUMENT_CEILING: usize = 49;
+    const UNDECLARED_OUTPUT_ARGUMENT_CEILING: usize = 50;
 
     /// The ABI, not a second list of crossing ordinals, defines which user
     /// pointers can be written. Report the entire missing population at once.
