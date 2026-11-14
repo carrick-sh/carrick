@@ -16508,45 +16508,50 @@ fn signal_setup_nonresident_input(nr: u64) {
 
 #[test]
 fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
-    futex_owner_wait_episode(false, false, false, None, false, false);
+    futex_owner_wait_episode(false, false, false, None, false, false, false);
 }
 
 #[test]
 fn futex_relative_deadline_survives_owner_wait_with_two_live_threads() {
-    futex_owner_wait_episode(true, false, false, None, false, false);
+    futex_owner_wait_episode(true, false, false, None, false, false, false);
 }
 
 #[test]
 fn futex_relative_deadline_survives_synchronous_owner_redispatch_with_two_live_threads() {
-    futex_owner_wait_episode(true, true, false, None, false, false);
+    futex_owner_wait_episode(true, true, false, None, false, false, false);
 }
 
 #[test]
 fn futex_cancelled_owner_wait_releases_deadline_before_next_wait() {
-    futex_owner_wait_episode(true, false, true, None, false, false);
+    futex_owner_wait_episode(true, false, true, None, false, false, false);
 }
 
 #[test]
 fn futex_owner_deadline_is_discarded_before_an_unrelated_syscall() {
-    futex_owner_wait_episode(true, false, false, Some(172), false, false);
+    futex_owner_wait_episode(true, false, false, Some(172), false, false, false);
 }
 
 #[test]
 fn futex_owner_deadline_is_discarded_before_an_unserved_futex() {
-    futex_owner_wait_episode(true, false, false, Some(98), false, false);
+    futex_owner_wait_episode(true, false, false, Some(98), false, false, false);
 }
 
 #[test]
 fn futex_caught_signal_releases_owner_deadline_before_handler_wait() {
-    futex_owner_wait_episode(true, false, false, None, true, false);
+    futex_owner_wait_episode(true, false, false, None, true, false, false);
 }
 
 #[test]
 fn futex_signal_during_owner_park_interrupts_then_starts_fresh_handler_wait() {
-    futex_owner_wait_episode(true, false, false, None, true, true);
+    futex_owner_wait_episode(true, false, false, None, true, true, false);
 }
 
 #[cfg(test)]
+#[test]
+fn futex_copy_not_yet_owner_fault_publishes_efault() {
+    futex_owner_wait_episode(false, false, false, None, false, false, true);
+}
+
 fn futex_owner_wait_episode(
     timed: bool,
     synchronous: bool,
@@ -16554,6 +16559,7 @@ fn futex_owner_wait_episode(
     intervening: Option<u64>,
     caught_signal: bool,
     signal_during_owner: bool,
+    fault: bool,
 ) {
     use crate::native_process_runtime::host_test_support::Physical;
     use crate::sched::{LinuxSchedEntry, UserWord};
@@ -16668,7 +16674,11 @@ fn futex_owner_wait_episode(
             observed.revision(),
         )
     };
-    service.prepare_copy_error = (!synchronous).then_some(NativeProcessError::OwnerWait(wait));
+    service.prepare_copy_error = if fault {
+        Some(NativeProcessError::Fault)
+    } else {
+        (!synchronous).then_some(NativeProcessError::OwnerWait(wait))
+    };
     let word = Word {
         missing: core::cell::Cell::new(true),
         value: core::cell::Cell::new(0x12345678),
@@ -16744,6 +16754,27 @@ fn futex_owner_wait_episode(
             None,
             |_| core::ptr::null_mut(),
         );
+        if fault {
+            assert!(matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork
+            ));
+            assert_eq!(
+                frame.x[0] as i64, -14,
+                "copy refusal must replace uaddr with EFAULT"
+            );
+            assert_eq!(word.reads.get(), 1);
+            assert_eq!(fixture.page.live(), 2);
+            assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 0);
+            let mut diagnostic = String::new();
+            counters.write_futex_errors(&mut diagnostic).unwrap();
+            assert!(diagnostic.contains("result=-14 errno=14"), "{diagnostic}");
+            assert!(
+                diagnostic.contains(&format!("address={VA:#x}")),
+                "{diagnostic}"
+            );
+            return;
+        }
         assert_eq!(
             route,
             if synchronous {

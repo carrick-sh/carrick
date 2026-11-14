@@ -451,7 +451,7 @@ fn production_futex_wait_switch_keeps_successor_result_separate_from_wait_result
     assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 2);
     assert_eq!(zone.counters.el1_switches.load(Ordering::Relaxed), 2);
     let mut rows = std::string::String::new();
-    counters.write_syscall_frames(&mut rows).unwrap();
+    counters.write_futex_errors(&mut rows).unwrap();
     assert!(!rows.contains("futex-error sample="), "{rows}");
 
     // An invalid wait really returns EINVAL to this task. Capture must retain
@@ -461,7 +461,7 @@ fn production_futex_wait_switch_keeps_successor_result_separate_from_wait_result
     assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
     assert_eq!(frame.x[0] as i64, -22);
     rows.clear();
-    counters.write_syscall_frames(&mut rows).unwrap();
+    counters.write_futex_errors(&mut rows).unwrap();
     assert!(rows.contains("futex-error sample="), "{rows}");
     assert!(rows.contains("op=393"), "{rows}");
     assert!(rows.contains("result=-22"), "{rows}");

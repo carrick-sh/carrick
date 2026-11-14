@@ -40,6 +40,8 @@ rationale = "EL1 increment 1b. Before it, every FUTEX_WAIT/FUTEX_WAKE handoff be
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::futex_copy_not_yet_owner_fault_publishes_efault (two live threads; production ARM entry, unavailable word and owner refusal publish EFAULT; no park or extra word read)",
+  "carrick-el1-linux::x86_production_forward::x86_clone_child_serves_stdout_stat_write_and_own_redirect (production CPL0 entry and native owner publish EFAULT on atomic copy fault)",
   "carrick-sched-core::tests::interrupt_parked_futex_rechecks_claim_after_futex_enrollment (sender waits on the held bucket and observes subsequent park publication; exact errno 4 and zero leftover entries)",
   "carrick-el1-linux::aarch64_process_tests::tgkill_during_futex_enrollment_returns_eintr (two live registered threads, production tgkill after production futex enqueue and before publication; EINTR, zero park/entry/timer; VM-free only)",
   "carrick-el1-linux::sched::tests",

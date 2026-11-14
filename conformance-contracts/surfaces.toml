@@ -876,6 +876,7 @@ surfaces = [
   { path = "crates/carrick-personality-linux/src/crossing.rs", contract = "kernel.el1.arm-ring-first-crossing" },
   { path = "crates/carrick-personality-linux/src/dispatch.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-personality-linux/src/dispatch.rs", contract = "kernel.el1.epoll-zone" },
+  { path = "crates/carrick-personality-linux/src/dispatch.rs", contract = "kernel.el1.futex-handoff" },
   { path = "crates/carrick-personality-linux/src/dispatch.rs", contract = "kernel.native.entropy" },
   { path = "crates/carrick-personality-linux/src/dispatch.rs", contract = "process.exec.native-exe-link" },
   { path = "crates/carrick-personality-linux/src/entry.rs", contract = "core.entry.completion" },
