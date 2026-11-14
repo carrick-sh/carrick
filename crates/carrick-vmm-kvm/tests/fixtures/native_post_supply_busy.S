@@ -21,6 +21,11 @@
  *   POST_SUPPLY_PREPARE    the root's first touch of fresh anonymous memory
  *                          parks after its Prepare supply; its fork child
  *                          is a second live member touching its own memory
+ *   POST_SUPPLY_PEER_RELEASE
+ *                          as POST_SUPPLY_PREPARE, but the root's synthetic
+ *                          holder is released by the other vCPU's
+ *                          scheduler, whose task is the fork child (another
+ *                          MM): the release must still name the root's MM
  *   POST_SUPPLY_FOREIGN_FAULT
  *                          #2332: the root arms a held post-supply Busy and
  *                          never faults; its fork child's own COW write
@@ -33,6 +38,7 @@
 #define INJECT_POST_SUPPLY_BUSY_HELD -462 /* 0x...fe32 */
 #define INJECT_RELEASE_POST_SUPPLY_HOLD -461 /* 0x...fe33 */
 #define INJECT_POST_SUPPLY_PARKED -458 /* 0x...fe36 */
+#define INJECT_PEER_IDLE_RELEASE_ONCE -488 /* 0x...fe18 */
 #define CANARY 0x1122334455667788
 #define CHILD_STATUS 5
 #define WORKER_STATUS 6
@@ -68,7 +74,7 @@ _start:
     mov $7, %edi
     jmp exit
 #endif
-#if defined(POST_SUPPLY_PREPARE)
+#if defined(POST_SUPPLY_PREPARE) || defined(POST_SUPPLY_PEER_RELEASE)
     /* mmap(NULL, 1 MiB, RW, PRIVATE|ANONYMOUS, -1, 0), untouched. */
     xor %edi, %edi
     mov $0x100000, %esi
@@ -88,9 +94,16 @@ _start:
     js failure
     jz child
     mov %eax, %r12d
-#if defined(POST_SUPPLY_COW) || defined(POST_SUPPLY_PREPARE)
+#if defined(POST_SUPPLY_COW) || defined(POST_SUPPLY_PREPARE) || defined(POST_SUPPLY_PEER_RELEASE)
 #if defined(POST_SUPPLY_COW)
     lea cow_page(%rip), %rbx
+#endif
+#if defined(POST_SUPPLY_PEER_RELEASE)
+    /* The root's own scheduler defers the synthetic release to CPU 1's. */
+    mov $INJECT_PEER_IDLE_RELEASE_ONCE, %rax
+    syscall
+    test %rax, %rax
+    jnz failure
 #endif
     call faulting_store
     mov $INJECT_POST_SUPPLY_CENSUS, %rax
@@ -149,6 +162,17 @@ child:
     syscall
     cmp $1, %rax
     jne failure
+    mov $CHILD_STATUS, %edi
+    jmp exit
+#elif defined(POST_SUPPLY_PEER_RELEASE)
+    /* Run this member on its vCPU while the root parks: that vCPU's
+     * scheduler, whose task is this member, releases the root's holder. */
+    mov $200, %r13d
+1:
+    mov $24, %eax
+    syscall
+    dec %r13d
+    jnz 1b
     mov $CHILD_STATUS, %edi
     jmp exit
 #elif defined(POST_SUPPLY_PREPARE)

@@ -1349,6 +1349,19 @@ fn post_supply_busy_witness(test: &str, flag: &str, affinity: u64) {
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }
 
+/// #2332: the root's post-supply Busy is released by the other vCPU's
+/// scheduler while that vCPU's task is the fork child, another MM. The
+/// release must wake the root on its own MM's Editor queue, never publish
+/// on the releasing task's MM (a lost wake: both vCPUs halt).
+#[test]
+fn production_post_supply_release_from_another_mm_wakes_its_waiter() {
+    post_supply_busy_witness(
+        "production_post_supply_release_from_another_mm_wakes_its_waiter",
+        "-DPOST_SUPPLY_PEER_RELEASE",
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+    );
+}
+
 /// #2332: a held post-supply Busy belongs to the member that armed it. The
 /// root arms it and never faults; its fork child's own COW write on the
 /// other vCPU must not take it, or the child parks on a synthetic holder no
