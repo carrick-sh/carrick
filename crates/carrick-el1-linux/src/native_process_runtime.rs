@@ -6335,7 +6335,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .has_deliverable(self.record, blocked)
     }
 
-    fn default_terminating_signal_interrupts_current(&self) -> bool {
+    fn latch_default_terminating_exec_signal(&self) -> bool {
         let graph = self.runtime.graph.lock();
         let Ok(row) = graph.owner.task(self.key) else {
             return false;
@@ -6343,10 +6343,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
             carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
         );
-        row.native()
+        let fatal = row
+            .native()
             .resources()
             .signals()
-            .has_default_terminating_deliverable(self.record, blocked)
+            .default_terminating_deliverable(self.record, blocked);
+        if let Some(signal) = fatal
+            && let Some(pending) = graph.service_wait(&self.record)
+        {
+            let _ = pending.exec_fatal_signal.compare_exchange(
+                0,
+                signal.number() as u8,
+                core::sync::atomic::Ordering::Release,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        fatal.is_some()
     }
 
     fn ipc_env(

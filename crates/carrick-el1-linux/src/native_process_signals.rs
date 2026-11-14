@@ -548,6 +548,15 @@ impl<'a, T> NativeProcessSignals<'a, T> {
         tid: carrick_sched_core::RecordRef,
         blocked: SigBlockMask,
     ) -> bool {
+        self.default_terminating_deliverable(tid, blocked).is_some()
+    }
+    /// Preserve the fatal signal selected at service cancellation even when
+    /// another member consumes the pending entry before its ACK arrives.
+    pub fn default_terminating_deliverable(
+        &self,
+        tid: carrick_sched_core::RecordRef,
+        blocked: SigBlockMask,
+    ) -> Option<Signal> {
         let resources = self.resources.lock();
         let present = resources
             .inbox
@@ -565,11 +574,11 @@ impl<'a, T> NativeProcessSignals<'a, T> {
                     carrick_signal_core::policy::Delivery::Terminate { .. }
                 )
             {
-                return true;
+                return Some(signal);
             }
             selected = selected.without(signal);
         }
-        false
+        None
     }
     /// Arm `hook` to run after the next deliverable check that finds nothing.
     #[cfg(all(test, not(target_os = "macos")))]
