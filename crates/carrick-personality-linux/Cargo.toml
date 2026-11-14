@@ -23,6 +23,7 @@ host-test = []
 workspace = true
 
 [dev-dependencies]
+carrick-abi = { path = "../carrick-abi" }
 carrick-x86 = { path = "../carrick-x86" }
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 carrick-el1-linux = { path = "../carrick-el1-linux", features = ["host-test"] }
