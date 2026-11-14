@@ -730,10 +730,10 @@ fn x2_shared_fork_cow() {
         0,
         "parent split entry must preserve USER permission"
     );
-    assert_ne!(
+    assert_eq!(
         parent_edit.after & NX,
         0,
-        "parent split entry must preserve NX permission"
+        "parent split entry restricts nothing; its leaves keep NX (#2276)"
     );
     assert_eq!(
         parent_edit.after & (COW | MAY_WRITE | PREPARED),
@@ -845,6 +845,9 @@ impl carrick_mmu_core::owner_mmu::OwnerForkMmu for RelocatedControlMmu {
     }
     fn table_word(output: FrameGpa, inherited: Option<u64>) -> u64 {
         X86Mmu::table_word(output, inherited)
+    }
+    fn split_table_word(output: FrameGpa, leaf: u64) -> u64 {
+        X86Mmu::split_table_word(output, leaf)
     }
     fn is_user(word: u64) -> bool {
         X86Mmu::is_user(word)

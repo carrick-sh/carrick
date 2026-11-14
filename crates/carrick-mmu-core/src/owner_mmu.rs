@@ -58,7 +58,14 @@ pub trait OwnerForkMmu: OwnerMmu {
         child_control: FrameGpa,
     ) -> Result<FrameGpa, OwnerMmuRefusal>;
     fn is_table(word: u64, level: usize) -> bool;
+    /// Copy a table pointer to `output`, keeping its table attributes.
     fn table_word(output: FrameGpa, inherited: Option<u64>) -> u64;
+    /// Link a table that replaces the split `leaf`. The new leaves carry the
+    /// leaf's permissions; the table descriptor restricts nothing more than
+    /// its privilege level. Leaf bits mean other things at a table level
+    /// (#2276: AArch64 bit 59 is PXNTable, and an x86 leaf's NX or missing
+    /// WRITE would restrict every page under it).
+    fn split_table_word(output: FrameGpa, leaf: u64) -> u64;
     fn is_user(word: u64) -> bool;
     fn is_retired(word: u64) -> bool;
     fn is_absent_unowned(word: u64) -> bool;
