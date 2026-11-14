@@ -9964,6 +9964,11 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
                     );
                     assert_eq!(fixture.zone.counters.el1_wakes.load(Ordering::Acquire), 0);
                     assert!(fixture.zone.live(record2).is_none());
+                    assert_eq!(
+                        fixture.zone.installed_space(slot2),
+                        0,
+                        "losing exit_group caller must release its physical slot"
+                    );
                     assert_eq!(service2.crossing.root_exits.load(Ordering::Acquire), 0);
                     run_as_leader(fixture);
                 }));

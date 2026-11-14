@@ -66,7 +66,9 @@ where
                 progress: carrick_core::Served::Idle,
                 ..
             } => CompletionRoute::Suspended,
-            LifecycleOutcome::HostCustody => machine.group_exit_custody(task),
+            LifecycleOutcome::HostCustody if process.yield_terminal_host_custody() => {
+                CompletionRoute::Suspended
+            }
             _ => CompletionRoute::InvalidCompletion,
         });
     }
