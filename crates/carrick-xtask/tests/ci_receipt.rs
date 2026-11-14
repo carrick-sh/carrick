@@ -1288,6 +1288,84 @@ fn write_source(root: &Path, path: &str, source: &str) {
     std::fs::write(file, source).unwrap();
 }
 
+/// An el1-native receipt (host phase, `el1-native` profile) whose one step ran `started`.
+fn el1_native_receipt(started: &[&str]) -> AcceptReceipt {
+    let mut s = step("el1-native-tests", true, &[]);
+    s.started_tests = started.iter().map(|t| (*t).to_owned()).collect();
+    s.finished_binaries = vec!["carrick_el1_linux".into()];
+    let mut r = receipt(vec![s]);
+    r.phase = "host".into();
+    r.profile = "el1-native".into();
+    r
+}
+
+/// A carrick-el1-linux tree with one lib test and one integration target.
+fn write_el1_linux_tree(root: &Path, lib_source: &str, integration_source: &str) {
+    write_source(
+        root,
+        "crates/carrick-el1-linux/Cargo.toml",
+        "[package]\nname = \"carrick-el1-linux\"\nversion = \"0.1.0\"\n",
+    );
+    write_source(root, "crates/carrick-el1-linux/src/lib.rs", lib_source);
+    write_source(
+        root,
+        "crates/carrick-el1-linux/tests/x86_production_forward.rs",
+        integration_source,
+    );
+}
+
+#[test]
+fn an_integration_target_retirement_is_not_checked_in_the_el1_native_receipt() {
+    // #2273 (2026-11-14): the renamed test lives in carrick-el1-linux's
+    // `tests/x86_production_forward.rs`, which the el1-native job never runs;
+    // neither the base nor the candidate el1-native receipt has it.
+    let dir = tempfile::tempdir().unwrap();
+    let (base, cand) = (dir.path().join("base"), dir.path().join("cand"));
+    write_el1_linux_tree(
+        &base,
+        "#[test] fn lib_ok() {}",
+        "#[test] fn x86_child_exec_is_staged_then_counted_enosys() {}",
+    );
+    write_el1_linux_tree(
+        &cand,
+        "#[test] fn lib_ok() {}",
+        "#[test] fn x86_child_exec_stages_its_payload_or_faults() {}",
+    );
+    let r = el1_native_receipt(&["carrick_el1_linux::lib_ok"]);
+    let entry = retirement(
+        "x86_production_forward::x86_child_exec_is_staged_then_counted_enosys",
+        Some("x86_production_forward::x86_child_exec_stages_its_payload_or_faults"),
+    );
+    let result = diff_with_retired(&r, &r, &[entry], &base, &cand);
+    assert!(result.is_ok(), "{result:?}");
+    assert!(result.unwrap().new.is_empty());
+}
+
+#[test]
+fn a_lib_test_retirement_still_needs_its_replacement_in_the_el1_native_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, cand) = (dir.path().join("base"), dir.path().join("cand"));
+    write_el1_linux_tree(&base, "#[test] fn old_lib() {}", "");
+    write_el1_linux_tree(&cand, "#[test] fn new_lib() {}", "");
+    let entry = retirement(
+        "carrick_el1_linux::old_lib",
+        Some("carrick_el1_linux::new_lib"),
+    );
+    let err = diff_with_retired(
+        &el1_native_receipt(&["carrick_el1_linux::old_lib"]),
+        &el1_native_receipt(&["carrick_el1_linux::unrelated"]),
+        &[entry],
+        &base,
+        &cand,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("did not start in candidate receipt"),
+        "{err}"
+    );
+}
+
 #[test]
 fn retirement_cannot_excuse_another_binary_with_a_matching_suffix() {
     let dir = tempfile::tempdir().unwrap();
