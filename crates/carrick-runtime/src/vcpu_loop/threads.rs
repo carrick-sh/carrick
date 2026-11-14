@@ -1634,11 +1634,7 @@ impl KernelState {
         let mut woken = 0;
         for thread in context.task().threads() {
             let control = thread.control_slot();
-            if !(control.host_exit_requested()
-                || control
-                    .host_birth_identity()
-                    .is_some_and(|identity| page.host_birth_requested(identity)))
-            {
+            if !control.terminal_requested(&page) {
                 continue;
             }
             if thread.execution_state().generation().is_none() {

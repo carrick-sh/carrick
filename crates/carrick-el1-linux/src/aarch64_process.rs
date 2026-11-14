@@ -361,12 +361,7 @@ fn resume_unregistered(
     };
     let cancelled_on_slot = rec.is_cancelled()
         || (!rec.has_adapter_operation()
-            && lifecycle.is_some_and(|(page, control)| {
-                control.host_exit_requested()
-                    || control
-                        .host_birth_identity()
-                        .is_some_and(|birth| page.host_birth_requested(birth))
-            }));
+            && lifecycle.is_some_and(|(page, control)| control.terminal_requested(page)));
     // SAFETY: this exact record is selected by the execution owner.
     unsafe {
         rec.consume_metadata_operation();
