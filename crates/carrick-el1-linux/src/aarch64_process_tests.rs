@@ -17671,6 +17671,66 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: Namespac
     assert_ne!(next_child.serial, child.serial, "reuse starts a new task");
 }
 
+/// A native child's forwarded call as the carrier serves it: the ring's
+/// host-file stage for the child's own table, served by the run's host
+/// dispatcher, its output copied back. `None`: the venue stages nothing.
+/// A carrier refusal is the ring's ENOSYS.
+#[cfg(test)]
+fn serve_child_host_file(
+    frame: &carrick_el1_abi::TrapFrame,
+    task: &CurrentTask,
+    venue: &crate::ipc::IpcVenue<'_>,
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+) -> Option<i64> {
+    use carrick_core_abi::service::ServiceOrigin;
+    use carrick_personality_linux::native_host_file::HostFileStage;
+    let table = crate::ipc::native_table(venue, task)
+        .expect("a fork child owns a published ring descriptor table");
+    let stage = crate::dispatch::native_host_file_stage(
+        frame,
+        task,
+        &crate::file::HardwareValidator,
+        table,
+        ServiceOrigin::Descendant,
+        |fd| crate::ipc::native_descriptor(venue, table, fd),
+        &mut |_| 0,
+    )?;
+    Some(match stage {
+        HostFileStage::Request { record, output, .. } => {
+            // The production carrier stamps the writer's RLIMIT_FSIZE
+            // (`service.rs`); an unstamped write reads as a finite 0.
+            let mut record = record.into_vec();
+            carrick_personality_linux::native_host_file::stamp_write_file_size_limit::<()>(
+                &mut record,
+                || Ok(u64::MAX),
+            )
+            .unwrap();
+            match dispatcher.serve_native_host_file(&mut record, None) {
+                Ok(_) => {
+                    let parsed = carrick_core_abi::host_file::reply(&record)
+                        .expect("served host-file record must contain a valid reply");
+                    if let Some(out) = output
+                        && !parsed.output.is_empty()
+                    {
+                        // SAFETY: the output names a live GuestUserBuffer.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                out.address as *mut u8,
+                                parsed.output.len(),
+                            )
+                        };
+                        dst.copy_from_slice(parsed.output);
+                    }
+                    parsed.result
+                }
+                Err(_) => carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+            }
+        }
+        HostFileStage::Returned(result) => result.raw(),
+        other => panic!("unexpected child stage: {other:?}"),
+    })
+}
+
 /// The run root on the production ARM dispatch, with a real host
 /// dispatcher behind every call the ring forwards. `body` gets the root's
 /// syscall entry; the run's stdout comes back beside its result.
@@ -17678,6 +17738,44 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: Namespac
 fn with_arm_root_host_dispatch<R>(
     body: impl FnOnce(
         &mut dyn FnMut(u64, [u64; 6]) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+    ) -> R,
+) -> (R, Vec<u8>) {
+    with_arm_process_host_dispatch(|call| body(&mut |nr, args| call(ArmCaller::Root, nr, args)))
+}
+
+/// [`with_arm_process_host_dispatch`]'s pseudo call: switch to the caller
+/// and return the result its wake left for its parked call (`i64::MIN` for
+/// a caller that resumes with its registers as they were).
+#[cfg(test)]
+const ARM_RESUME: u64 = u64::MAX;
+
+/// [`with_arm_process_host_dispatch`]'s answer for a forwarded call the
+/// host would block in (`DispatchOutcome::WaitOnFds`): the harness has no
+/// carrier waiter to run it.
+#[cfg(test)]
+const ARM_HOST_WAITS: i64 = i64::MIN + 1;
+
+/// Which task of [`with_arm_process_host_dispatch`]'s run makes a call.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArmCaller {
+    Root,
+    /// A ring child the root's `clone` returned this pid for.
+    Child(u32),
+}
+
+/// [`with_arm_root_host_dispatch`] with the root's ring children: a root
+/// `clone` admits the root through production fork, and a child's call runs
+/// the production child entry, its host-backed descriptors staged to the
+/// same host dispatcher the carrier serves them through.
+#[cfg(test)]
+fn with_arm_process_host_dispatch<R>(
+    body: impl FnOnce(
+        &mut dyn FnMut(
+            ArmCaller,
+            u64,
+            [u64; 6],
+        ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
     ) -> R,
 ) -> (R, Vec<u8>) {
     use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
@@ -17757,7 +17855,53 @@ fn with_arm_root_host_dispatch<R>(
     let mut host_mem = HostPointerMemory;
     let reporter = carrick_kernel::compat::CompatReporter::default();
 
-    let mut call_root = |nr: u64, args: [u64; 6]| -> (CompletionRoute, i64) {
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let root_key = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    // The root's first `clone` admits it into the production registry.
+    let mut runtime = None;
+    // `None`: the slot's running record is not yet a registered binding.
+    let mut active = Some(ArmCaller::Root);
+    let mut cpu = crate::sched::FakeCpu::default();
+
+    let mut call = |caller: ArmCaller, nr: u64, args: [u64; 6]| -> (CompletionRoute, i64) {
+        if nr == ARM_RESUME && active == Some(caller) {
+            return (CompletionRoute::Served, i64::MIN);
+        }
+        if active != Some(caller) {
+            let runtime: &std::sync::Arc<NativeProcessRuntime<'_, _, _>> = runtime
+                .as_ref()
+                .expect("a child exists only after the root's clone");
+            let key = match caller {
+                ArmCaller::Root => root_key,
+                ArmCaller::Child(pid) => runtime
+                    .namespace_child_key(root_key, pid)
+                    .unwrap_or_else(|| panic!("no live child {pid}")),
+            };
+            let binding = runtime.task_binding(key).unwrap();
+            // Only the selected caller is queued: a parked caller left on the
+            // run queue would be the next dispatch's switch target.
+            let _ = fixture
+                .zone
+                .requeue_preempted(source.slot, binding.record.id);
+            let claim = fixture.zone.record(binding.record.id).claim();
+            if nr == ARM_RESUME && !matches!(claim, carrick_sched_core::Claim::Queued { .. }) {
+                // Still parked: nothing woke it.
+                return (CompletionRoute::Suspended, 0);
+            }
+            let selected = activate_target(source, &fixture.task, &binding);
+            assert_eq!(selected.record, binding.record.id, "{caller:?} selected");
+            active = Some(caller);
+            if nr == ARM_RESUME {
+                let result = selected.result.map_or(i64::MIN, |result| result as i64);
+                return (CompletionRoute::Served, result);
+            }
+        }
         let mut frame = carrick_el1_abi::TrapFrame {
             esr: 0x15 << 26,
             elr: 0x4000,
@@ -17766,8 +17910,8 @@ fn with_arm_root_host_dispatch<R>(
         };
         frame.x[..6].copy_from_slice(&args);
         frame.x[8] = nr;
-        let route =
-            super::dispatch::dispatch_arm_syscall_with_native_process(
+        let ArmCaller::Child(pid) = caller else {
+            let route = super::dispatch::dispatch_arm_syscall_with_native_process(
                 &mut frame,
                 &counters,
                 core::slice::from_ref(&fixture.task),
@@ -17776,13 +17920,11 @@ fn with_arm_root_host_dispatch<R>(
                 crossing.open_table(),
                 &[],
                 &cache,
-                None::<
-                    crate::dispatch::Zone<
-                        '_,
-                        crate::sched::FakeCpu,
-                        crate::sched::HardwareUserWord,
-                    >,
-                >,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
                 Some(&venue),
                 Some(fixture),
                 fixture.page,
@@ -17793,30 +17935,116 @@ fn with_arm_root_host_dispatch<R>(
                 |_| core::ptr::null_mut(),
             )
             .unwrap();
-        let ret = if route == CompletionRoute::Forward {
-            match dispatcher
-                .dispatch(
-                    &context,
-                    carrick_kernel::dispatch::SyscallRequest::new(
-                        nr,
-                        carrick_kernel::compat::SyscallArgs(args),
-                    ),
-                    &mut host_mem,
-                    &reporter,
-                )
-                .unwrap()
-            {
-                carrick_kernel::dispatch::DispatchOutcome::Returned { value } => value,
-                carrick_kernel::dispatch::DispatchOutcome::Errno { errno } => errno.guest_retval(),
-                other => panic!("unexpected host dispatch outcome for nr={nr}: {other:?}"),
+            if route == CompletionRoute::Suspended {
+                // Parked: no record runs until a switch selects one.
+                active = None;
+                return (route, frame.x[0] as i64);
             }
-        } else {
-            frame.x[0] as i64
+            // The carrier's boundary: it settles the host work the call
+            // announced, and forwards a call served-with-forward-work.
+            let mut forward = route == CompletionRoute::Forward;
+            if route == CompletionRoute::WithWork {
+                if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+                    work.settled();
+                }
+                if let Some(
+                    carrick_personality_linux::abi::entry::ServedBoundary::ForwardOriginal {
+                        ..
+                    },
+                ) = fixture.task.linux.take_served_boundary()
+                {
+                    forward = true;
+                }
+                if nr == 220 {
+                    active = None;
+                    runtime.get_or_insert_with(|| {
+                        registry()
+                            .for_entry(source, &fixture.task, fixture.address)
+                            .expect("clone admitted the root into the production registry")
+                    });
+                }
+            }
+            let ret = if forward {
+                match dispatcher
+                    .dispatch(
+                        &context,
+                        carrick_kernel::dispatch::SyscallRequest::new(
+                            nr,
+                            carrick_kernel::compat::SyscallArgs(args),
+                        ),
+                        &mut host_mem,
+                        &reporter,
+                    )
+                    .unwrap()
+                {
+                    carrick_kernel::dispatch::DispatchOutcome::Returned { value } => value,
+                    carrick_kernel::dispatch::DispatchOutcome::Errno { errno } => {
+                        errno.guest_retval()
+                    }
+                    carrick_kernel::dispatch::DispatchOutcome::WaitOnFds { .. } => ARM_HOST_WAITS,
+                    other => panic!("unexpected host dispatch outcome for nr={nr}: {other:?}"),
+                }
+            } else {
+                frame.x[0] as i64
+            };
+            return (route, ret);
         };
+        let runtime = runtime.as_ref().unwrap();
+        let binding = runtime
+            .task_binding(runtime.namespace_child_key(root_key, pid).unwrap())
+            .unwrap();
+        let saved = unsafe { runtime.record_binding(binding.record) }
+            .unwrap()
+            .words;
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                binding.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            crossing.fd_map(),
+            &[],
+            crossing.open_table(),
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            Some(&venue),
+            None,
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        drop(entry);
+        if route == CompletionRoute::Suspended {
+            active = None;
+        }
+        if route != CompletionRoute::Forward {
+            return (route, frame.x[0] as i64);
+        }
+        // A child has no host fallback: a forward is the native host-file
+        // venue's request, or nothing (a counted ENOSYS).
+        let ret = serve_child_host_file(&frame, &fixture.task, &venue, &dispatcher)
+            .unwrap_or(carrick_syscall_abi::LINUX_ENOSYS.guest_retval());
         (route, ret)
     };
 
-    let result = body(&mut call_root);
+    let result = body(&mut call);
+    if let Some(runtime) = &runtime {
+        registry().unregister_root_for_test(runtime);
+    }
     (result, dispatcher.stdout())
 }
 
@@ -18186,17 +18414,379 @@ fn arm_root_ring_epoll_takes_a_host_socket_member() {
     );
 }
 
+/// The aarch64 `struct epoll_event` (events, padding, data) and the fd
+/// pair a `pipe2` or `socketpair` writes, for the #1671 spawn witnesses.
+#[cfg(test)]
+fn epoll_event_buffer(events: u32, data: u64) -> carrick_test_support::GuestUserBuffer {
+    let mut bytes = [0u8; 16];
+    bytes[..4].copy_from_slice(&events.to_ne_bytes());
+    bytes[8..].copy_from_slice(&data.to_ne_bytes());
+    carrick_test_support::GuestUserBuffer::from_bytes(&bytes)
+}
+
+#[cfg(test)]
+fn fd_pair_of(buffer: &carrick_test_support::GuestUserBuffer) -> [u64; 2] {
+    let bytes = buffer.as_bytes();
+    [
+        i32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64,
+        i32::from_ne_bytes(bytes[4..8].try_into().unwrap()) as u64,
+    ]
+}
+
+/// The root's half of libuv's `uv_spawn` with a piped stdout: a host
+/// AF_UNIX `socketpair` (the child's end close-on-exec), then `fork`.
+#[cfg(test)]
+fn arm_root_spawn_socketpair(
+    call: &mut dyn FnMut(
+        ArmCaller,
+        u64,
+        [u64; 6],
+    ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+) -> [u64; 2] {
+    use carrick_abi::{LINUX_AF_UNIX, LINUX_SOCK_CLOEXEC, LINUX_SOCK_STREAM};
+    use carrick_personality_linux::crossing::nr as sys;
+    let sockets = carrick_test_support::GuestUserBuffer::zeroed(8);
+    let (_, made) = call(
+        ArmCaller::Root,
+        sys::SOCKETPAIR.raw(),
+        [
+            LINUX_AF_UNIX as u64,
+            (LINUX_SOCK_STREAM | LINUX_SOCK_CLOEXEC) as u64,
+            0,
+            sockets.arg(),
+            0,
+            0,
+        ],
+    );
+    assert_eq!(made, 0, "socketpair");
+    fd_pair_of(&sockets)
+}
+
+/// #1671 round 2: after #2338's host half, `execSync('echo child-ok')`
+/// exits 1 with empty stdout and stderr. libuv gives the child the far end
+/// of a host AF_UNIX `socketpair` as fd 1; `/bin/sh`'s `echo` writes it, and
+/// the native host-file venue refuses a write to a socket description
+/// (`write_description_from_carrier` serves files only), so the child sees
+/// ENOSYS on its stdout and its stderr, and exits 1.
+#[test]
+#[ignore = "#2361: a native child's write to an inherited host AF_UNIX socket is refused"]
+fn arm_root_fork_child_writes_its_socket_stdout() {
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (mismatches, _) = with_arm_process_host_dispatch(|call| {
+        let mut mismatches = Vec::new();
+        let [parent, child_end] = arm_root_spawn_socketpair(call);
+        let (route, pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid} ({route:?})");
+        let child = ArmCaller::Child(pid as u32);
+        let (_, moved) = call(child, sys::DUP3.raw(), [child_end, 1, 0, 0, 0, 0]);
+        assert_eq!(moved, 1, "child dup3(socket, 1)");
+        let output = GuestUserBuffer::from_bytes(b"child-ok\n");
+        let (route, wrote) = call(child, sys::WRITE.raw(), [1, output.arg(), 9, 0, 0, 0]);
+        if wrote != 9 {
+            mismatches.push(format!(
+                "child write(1) to its socket: got {wrote} ({route:?}), want 9"
+            ));
+        }
+        let got = GuestUserBuffer::zeroed(16);
+        let (_, n) = call(
+            ArmCaller::Root,
+            sys::READ.raw(),
+            [parent, got.arg(), 16, 0, 0, 0],
+        );
+        let read = got.as_bytes()[..n.clamp(0, 16) as usize].to_vec();
+        if read != b"child-ok\n" {
+            let n = if n == ARM_HOST_WAITS {
+                "would wait".into()
+            } else {
+                n.to_string()
+            };
+            mismatches.push(format!(
+                "parent read of the child's output: got {n} {:?}",
+                String::from_utf8_lossy(&read)
+            ));
+        }
+        mismatches
+    });
+    assert!(
+        mismatches.is_empty(),
+        "the child's stdout socket left Linux's contract:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// #1671 round 2, a hypothesis for the `uv__io_poll` EINTR abort that
+/// follows the failed `execSync`: libuv forks with every loop's epoll open,
+/// and exec's close-on-exec sweep in the child closes its copies. Linux:
+/// the descriptions live on in the parent. The spawn loop's epoll (adopted
+/// by the host for its socket member, #2338) and the main loop's ring-only
+/// epoll both keep reporting to the parent after the child's sweep.
+#[test]
+fn arm_root_fork_child_sweep_keeps_the_parents_loop_epolls() {
+    use ArmCaller::Root;
+    use carrick_abi::{LINUX_EPOLL_CTL_ADD, LINUX_EPOLLIN, LINUX_O_CLOEXEC, LINUX_O_NONBLOCK};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
+
+    const PIPE_COOKIE: u64 = 0x1671_0000_0000_0011;
+    const SOCKET_COOKIE: u64 = 0x1671_0000_0000_0012;
+    const ASYNC_COOKIE: u64 = 0x1671_0000_0000_0013;
+    let (mismatches, _) = with_arm_process_host_dispatch(|call| {
+        let mismatches = core::cell::RefCell::new(Vec::new());
+        let expect = |what: &str, got: (CompletionRoute, i64), want: i64| {
+            if got.1 != want {
+                mismatches
+                    .borrow_mut()
+                    .push(format!("{what}: got {} ({:?}), want {want}", got.1, got.0));
+            }
+        };
+        let ctl = sys::EPOLL_CTL.raw();
+        let create_epoll =
+            |call: &mut dyn FnMut(ArmCaller, u64, [u64; 6]) -> (CompletionRoute, i64)| {
+                let (_, epoll) = call(
+                    Root,
+                    sys::EPOLL_CREATE1.raw(),
+                    [LINUX_O_CLOEXEC, 0, 0, 0, 0, 0],
+                );
+                assert!(epoll >= 0, "epoll_create1: {epoll}");
+                epoll as u64
+            };
+        // The spawn loop: a ring signal pipe and the parent's socket end.
+        let spawn_loop = create_epoll(call);
+        let [parent, child_end] = arm_root_spawn_socketpair(call);
+        let pipe = GuestUserBuffer::zeroed(8);
+        let (_, made) = call(
+            Root,
+            sys::PIPE2.raw(),
+            [pipe.arg(), LINUX_O_CLOEXEC | LINUX_O_NONBLOCK, 0, 0, 0, 0],
+        );
+        assert_eq!(made, 0, "pipe2");
+        let [reader, writer] = fd_pair_of(&pipe);
+        let pipe_in = epoll_event_buffer(LINUX_EPOLLIN, PIPE_COOKIE);
+        let socket_in = epoll_event_buffer(LINUX_EPOLLIN, SOCKET_COOKIE);
+        expect(
+            "ADD the ring pipe",
+            call(
+                Root,
+                ctl,
+                [spawn_loop, LINUX_EPOLL_CTL_ADD, reader, pipe_in.arg(), 0, 0],
+            ),
+            0,
+        );
+        expect(
+            "ADD the host socket",
+            call(
+                Root,
+                ctl,
+                [
+                    spawn_loop,
+                    LINUX_EPOLL_CTL_ADD,
+                    parent,
+                    socket_in.arg(),
+                    0,
+                    0,
+                ],
+            ),
+            0,
+        );
+        // The main loop stays ring-only: an eventfd (uv_async).
+        let main_loop = create_epoll(call);
+        let (_, async_fd) = call(
+            Root,
+            sys::EVENTFD2.raw(),
+            [0, LINUX_O_CLOEXEC | LINUX_O_NONBLOCK, 0, 0, 0, 0],
+        );
+        assert!(async_fd >= 0, "eventfd2: {async_fd}");
+        let async_fd = async_fd as u64;
+        let async_in = epoll_event_buffer(LINUX_EPOLLIN, ASYNC_COOKIE);
+        expect(
+            "ADD the main loop's eventfd",
+            call(
+                Root,
+                ctl,
+                [
+                    main_loop,
+                    LINUX_EPOLL_CTL_ADD,
+                    async_fd,
+                    async_in.arg(),
+                    0,
+                    0,
+                ],
+            ),
+            0,
+        );
+
+        let (route, pid) = call(Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid} ({route:?})");
+        let child = ArmCaller::Child(pid as u32);
+        expect(
+            "child dup3(socket, 1)",
+            call(child, sys::DUP3.raw(), [child_end, 1, 0, 0, 0, 0]),
+            1,
+        );
+        // exec's close-on-exec sweep of the loops' descriptors.
+        for (what, fd) in [
+            ("spawn loop epoll", spawn_loop),
+            ("socket", parent),
+            ("socket child end", child_end),
+            ("pipe reader", reader),
+            ("pipe writer", writer),
+            ("main loop epoll", main_loop),
+            ("main loop eventfd", async_fd),
+        ] {
+            expect(
+                &format!("child close({what})"),
+                call(child, sys::CLOSE.raw(), [fd, 0, 0, 0, 0, 0]),
+                0,
+            );
+        }
+
+        let events = GuestUserBuffer::zeroed(16 * 4);
+        let harvest = |call: &mut dyn FnMut(ArmCaller, u64, [u64; 6]) -> (CompletionRoute, i64),
+                       epoll: u64| {
+            let (route, ready) = call(
+                Root,
+                sys::EPOLL_PWAIT.raw(),
+                [epoll, events.arg(), 4, 0, 0, 8],
+            );
+            let mut cookies: Vec<u64> = (0..ready.max(0) as usize)
+                .map(|n| {
+                    u64::from_ne_bytes(
+                        events.as_bytes()[n * 16 + 8..n * 16 + 16]
+                            .try_into()
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            cookies.sort_unstable();
+            (route, ready, cookies)
+        };
+        let signal = GuestUserBuffer::from_bytes(b"s");
+        expect(
+            "parent signal-pipe write",
+            call(Root, sys::WRITE.raw(), [writer, signal.arg(), 1, 0, 0, 0]),
+            1,
+        );
+        let (route, ready, cookies) = harvest(call, spawn_loop);
+        if (ready, &cookies[..]) != (1, &[PIPE_COOKIE][..]) {
+            mismatches.borrow_mut().push(format!(
+                "parent spawn-loop epoll_pwait: got {ready} {cookies:x?} ({route:?}), want the pipe"
+            ));
+        }
+        let one = GuestUserBuffer::from_value(1u64);
+        expect(
+            "parent uv_async_send",
+            call(Root, sys::WRITE.raw(), [async_fd, one.arg(), 8, 0, 0, 0]),
+            8,
+        );
+        let (route, ready, cookies) = harvest(call, main_loop);
+        if (ready, &cookies[..]) != (1, &[ASYNC_COOKIE][..]) {
+            mismatches.borrow_mut().push(format!(
+                "parent main-loop epoll_pwait: got {ready} {cookies:x?} ({route:?}), want the eventfd"
+            ));
+        }
+        mismatches.into_inner()
+    });
+    assert!(
+        mismatches.is_empty(),
+        "a fork child's exec sweep reached the parent's loops:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// #1671 round 2, a hypothesis for the `uv__io_poll` EINTR abort: Node's
+/// platform thread parks in its loop's ring epoll while the main thread's
+/// `execSync` forks, and the child's exec sweep closes its inherited copies
+/// of that epoll and its eventfd. Linux: the parent's wait is untouched (the
+/// descriptions live on in the parent); no close wakes it.
+#[test]
+fn arm_root_fork_child_close_keeps_the_parents_parked_epoll_wait() {
+    use carrick_abi::{LINUX_EPOLL_CTL_ADD, LINUX_EPOLLIN, LINUX_O_CLOEXEC, LINUX_O_NONBLOCK};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
+
+    const ASYNC_COOKIE: u64 = 0x1671_0000_0000_0021;
+    let (mismatches, _) = with_arm_process_host_dispatch(|call| {
+        use ArmCaller::Root;
+        let mut mismatches = Vec::new();
+        let (_, epoll) = call(
+            Root,
+            sys::EPOLL_CREATE1.raw(),
+            [LINUX_O_CLOEXEC, 0, 0, 0, 0, 0],
+        );
+        assert!(epoll >= 0, "epoll_create1: {epoll}");
+        let epoll = epoll as u64;
+        let (_, async_fd) = call(
+            Root,
+            sys::EVENTFD2.raw(),
+            [0, LINUX_O_CLOEXEC | LINUX_O_NONBLOCK, 0, 0, 0, 0],
+        );
+        assert!(async_fd >= 0, "eventfd2: {async_fd}");
+        let async_fd = async_fd as u64;
+        let async_in = epoll_event_buffer(LINUX_EPOLLIN, ASYNC_COOKIE);
+        let (_, added) = call(
+            Root,
+            sys::EPOLL_CTL.raw(),
+            [epoll, LINUX_EPOLL_CTL_ADD, async_fd, async_in.arg(), 0, 0],
+        );
+        assert_eq!(added, 0, "ADD the eventfd");
+        let (route, pid) = call(Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid} ({route:?})");
+        let child = ArmCaller::Child(pid as u32);
+
+        let events = GuestUserBuffer::zeroed(16 * 4);
+        let (route, _) = call(
+            Root,
+            sys::EPOLL_PWAIT.raw(),
+            [epoll, events.arg(), 4, u64::MAX, 0, 8],
+        );
+        assert_eq!(route, CompletionRoute::Suspended, "the parent's wait parks");
+        // Each step of the child's life leaves the parent's wait parked:
+        // `ARM_RESUME` finds it still waiting.
+        let mut still_parked = |what: &str, nr: u64, args: [u64; 6], want: i64| {
+            let got = call(child, nr, args);
+            if got.1 != want {
+                mismatches.push(format!("{what}: got {} ({:?}), want {want}", got.1, got.0));
+            }
+            let resumed = call(Root, ARM_RESUME, [0; 6]);
+            if resumed != (CompletionRoute::Suspended, 0) {
+                mismatches.push(format!(
+                    "after {what}, the parent's wait returned {resumed:?}"
+                ));
+            }
+        };
+        still_parked(
+            "child close(epoll)",
+            sys::CLOSE.raw(),
+            [epoll, 0, 0, 0, 0, 0],
+            0,
+        );
+        still_parked(
+            "child close(eventfd)",
+            sys::CLOSE.raw(),
+            [async_fd, 0, 0, 0, 0, 0],
+            0,
+        );
+        mismatches
+    });
+    assert!(
+        mismatches.is_empty(),
+        "a fork child's close reached the parent's epoll wait:\n{}",
+        mismatches.join("\n")
+    );
+}
+
 #[test]
 fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
     use carrick_abi::{
         LINUX_AT_FDCWD, LINUX_F_DUPFD, LINUX_O_CREAT, LINUX_O_TRUNC, LINUX_O_WRONLY, LinuxStat,
     };
-    use carrick_core_abi::service::ServiceOrigin;
     use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
     use carrick_personality_linux::dispatch::CompletionRoute;
-    use carrick_personality_linux::native_host_file::{
-        DescriptionAccess, HostFileStage, NativeDescriptor,
-    };
+    use carrick_personality_linux::native_host_file::{DescriptionAccess, NativeDescriptor};
     use carrick_test_support::GuestUserBuffer;
     use std::sync::Arc;
 
@@ -18451,48 +19041,8 @@ fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
             CompletionRoute::Forward,
             "child syscall {nr} must decline in-ring pipe family to stage host-file request"
         );
-        let stage = crate::dispatch::native_host_file_stage(
-            &frame,
-            &fixture.task,
-            &crate::file::HardwareValidator,
-            child_table,
-            ServiceOrigin::Descendant,
-            |fd| crate::ipc::native_descriptor(&venue, child_table, fd),
-            &mut |_| 0,
-        );
-        match stage {
-            Some(HostFileStage::Request { record, output, .. }) => {
-                // The production carrier stamps the writer's RLIMIT_FSIZE
-                // (`service.rs`); an unstamped write reads as a finite 0.
-                let mut record = record.into_vec();
-                carrick_personality_linux::native_host_file::stamp_write_file_size_limit::<()>(
-                    &mut record,
-                    || Ok(u64::MAX),
-                )
-                .unwrap();
-                match dispatcher.serve_native_host_file(&mut record, None) {
-                    Ok(_) => {
-                        let parsed = carrick_core_abi::host_file::reply(&record)
-                            .expect("served host-file record must contain a valid reply");
-                        if let Some(out) = output
-                            && !parsed.output.is_empty()
-                        {
-                            let dst = unsafe {
-                                core::slice::from_raw_parts_mut(
-                                    out.address as *mut u8,
-                                    parsed.output.len(),
-                                )
-                            };
-                            dst.copy_from_slice(parsed.output);
-                        }
-                        parsed.result
-                    }
-                    Err(_) => carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
-                }
-            }
-            Some(HostFileStage::Returned(res)) => res.raw(),
-            other => panic!("unexpected child stage for nr={nr}: {other:?}"),
-        }
+        serve_child_host_file(&frame, &fixture.task, &venue, &dispatcher)
+            .unwrap_or_else(|| panic!("child syscall {nr} staged nothing"))
     };
 
     let stat_buf = GuestUserBuffer::zeroed(core::mem::size_of::<LinuxStat>());
