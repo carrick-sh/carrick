@@ -628,6 +628,16 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_clock_gettime_declares_its_timespec_output() {
+        assert_eq!(
+            AllowedHostCrossing::ClockGettime
+                .operand_spec()
+                .output_range(&[1, 0x2000, 0, 0, 0, 0]),
+            Some((0x2000, 16))
+        );
+    }
+
+    #[test]
     fn test_x86_crossings_exact() {
         assert_eq!(
             HOST_CROSSINGS

@@ -1085,6 +1085,7 @@ impl OperandSpec {
     pub const fn output_operand(self) -> OutputOperand {
         use crate::crossing::AllowedHostCrossing as C;
         match self.crossing {
+            C::ClockGettime => OutputOperand::Record { ptr: 1, bytes: 16 },
             C::Getcwd => OutputOperand::Buffer {
                 ptr: 0,
                 len: 1,
