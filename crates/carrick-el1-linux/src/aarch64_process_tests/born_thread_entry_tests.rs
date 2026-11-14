@@ -717,24 +717,29 @@ fn arm_host_issued_root_thread_vfork_stays_suspended_until_its_child_exits() {
         vfork.x[0] as i64,
         fixture.zone.record(caller_record).claim(),
     );
-    let child = match fixture.zone.slot(fixture.slot).current() {
-        Some(current) if current != caller_record => current,
-        _ => {
-            let child = fixture
+    let child = fixture
+        .zone
+        .slot(fixture.slot)
+        .current()
+        .filter(|&current| current != caller_record)
+        .or_else(|| fixture.zone.runnable_head(fixture.slot))
+        .expect("the vfork child is runnable");
+    if fixture.zone.slot(fixture.slot).current() == Some(child) {
+        assert!(
+            fixture
                 .zone
-                .runnable_head(fixture.slot)
-                .expect("the vfork child is queued");
-            fixture.zone.clear_current(fixture.slot);
-            fixture.zone.publish_slot(fixture.slot, 0, None, 0);
-            task.mm.key.store(0, Ordering::Release);
-            let mut frame = carrick_el1_abi::TrapFrame::default();
-            assert_eq!(
-                switch_in(fixture, task, &mut cpu, &mut frame),
-                carrick_el1_abi::Action::Served
-            );
-            child
-        }
-    };
+                .requeue_preempted(fixture.slot, child)
+                .is_queued()
+        );
+        fixture.zone.clear_current(fixture.slot);
+    }
+    fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+    task.mm.key.store(0, Ordering::Release);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        switch_in(fixture, task, &mut cpu, &mut frame),
+        carrick_el1_abi::Action::Served
+    );
     assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
     let child_identity = fixture.zone.record(child).identity();
     // SAFETY: the child owner retains its lifecycle and control.
@@ -770,7 +775,7 @@ fn arm_host_issued_root_thread_vfork_stays_suspended_until_its_child_exits() {
     .expect("the child's rt_sigprocmask admits through its owner");
     assert_eq!(mask.x[0], 0, "rt_sigprocmask(SIG_BLOCK, NULL, old)");
     assert_ne!(
-        stack.get::<u64>(2048 - 64),
+        stack.get::<u64>((2048 - 64) / core::mem::size_of::<u64>()),
         u64::MAX,
         "the child wrote its old mask into the caller's stack page"
     );
