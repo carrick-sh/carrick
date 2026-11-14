@@ -1421,10 +1421,11 @@ fn arm_vfork_custody_commits_while_a_sibling_pauses_the_parent_space() {
         id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
         serial: TaskSerial::from_raw_u64(11).unwrap(),
     };
-    assert!(matches!(outcome, LifecycleOutcome::Transferred { .. }));
-    let child_key = runtime
-        .namespace_child_key(parent_key, 42)
-        .expect("the suspended root retains its exact vfork child");
+    let child_pid = match outcome {
+        LifecycleOutcome::Returned { result, .. } => result.raw() as u32,
+        _ => panic!("vfork parent must observe its born child"),
+    };
+    let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
     assert!(runtime.task_binding(parent_key).is_some());
     assert!(runtime.task_binding(child_key).is_some());
 }
