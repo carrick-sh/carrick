@@ -17651,6 +17651,7 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: Namespac
 /// The run root on the production ARM dispatch, with a real host
 /// dispatcher behind every call the ring forwards. `body` gets the root's
 /// syscall entry; the run's stdout comes back beside its result.
+#[cfg(test)]
 fn with_arm_root_host_dispatch<R>(
     body: impl FnOnce(
         &mut dyn FnMut(u64, [u64; 6]) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
