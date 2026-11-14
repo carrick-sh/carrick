@@ -66,6 +66,7 @@ vm_free = [
   "carrick-kernel::dispatch::copyout_contention_tests::statx_path_copyin_waits_for_live_sibling_editor_and_bad_path_faults",
   "carrick-kernel::dispatch::copyout_contention_tests::x86_stat_paths_copyin_wait_for_live_sibling_editor",
   "carrick-kernel::dispatch::copyout_tests::clock_gettime_waits_for_an_owner_refused_copyout_instead_of_efault",
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_vfork_live_child_keeps_sibling_clock_copyout_writable",
   "carrick-kernel::dispatch::copyout_tests::fstat_waits_for_an_owner_refused_copyout_instead_of_efault",
   "carrick-kernel::dispatch::copyout_tests::getsockname_and_getpeername_wait_for_an_owner_refused_copyout",
   "carrick-kernel::dispatch::copyout_tests::gettimeofday_waits_for_an_owner_refused_copyout_instead_of_efault",
