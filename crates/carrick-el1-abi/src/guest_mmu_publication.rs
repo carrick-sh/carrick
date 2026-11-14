@@ -236,6 +236,7 @@ mod tests {
             mm_key: 77,
             physical_ipa: 0x10000,
             backing,
+            tables: Default::default(),
         };
         let completion = crate::CowGrantCompletion {
             purpose: crate::CowGrantPurpose::UserWrite,
@@ -244,6 +245,7 @@ mod tests {
             span_len: 4096,
             old_ipa: 0x21000,
             new_ipa: 0x11000,
+            tables_linked: 0,
         };
         let txn = DescriptorTxn {
             id: DescriptorTxnId {
