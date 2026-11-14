@@ -110,6 +110,27 @@ _start:
     add %rax, %rsi
     jmp .Lentry
 .Lfound:
+#elif defined(DIRECT_STDIO)
+    /* Delegated fd 0 crosses to the host dispatcher, not native file staging. */
+    xor %eax, %eax
+    xor %edi, %edi
+    mov %r12, %rsi
+    mov $4, %edx
+    syscall
+    cmp $4, %rax
+    jne fail
+    cmpl $0x65726964, (%r12)
+    jne fail
+    mov $17, %eax
+    xor %edi, %edi
+    lea 4096(%r12), %rsi
+    mov $4, %edx
+    mov $7, %r10d
+    syscall
+    cmp $4, %rax
+    jne fail
+    cmpl $0x676e6172, 4096(%r12)
+    jne fail
 #else
     /* eventfd2(1, EFD_NONBLOCK), then epoll_create1(0). */
     mov $290, %eax

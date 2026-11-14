@@ -24,7 +24,6 @@
   "error-collapse:crates/carrick-kernel/src/dispatch/fs/open.rs": 2,
   "error-collapse:crates/carrick-kernel/src/dispatch/fs/pipe.rs": 1,
   "error-collapse:crates/carrick-kernel/src/dispatch/fs/rw.rs": 11,
-  "error-collapse:crates/carrick-kernel/src/dispatch/fs/sendfile.rs": 4,
   "error-collapse:crates/carrick-kernel/src/dispatch/fs/stat.rs": 7,
   "error-collapse:crates/carrick-kernel/src/dispatch/fs/transfer.rs": 3,
   "error-collapse:crates/carrick-kernel/src/dispatch/fs/xattr.rs": 1,

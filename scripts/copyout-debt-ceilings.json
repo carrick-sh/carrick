@@ -18,10 +18,6 @@
       "ceiling": 6
     },
     {
-      "path": "crates/carrick-kernel/src/dispatch/fs/sendfile.rs",
-      "ceiling": 4
-    },
-    {
       "path": "crates/carrick-kernel/src/dispatch/fs/transfer.rs",
       "ceiling": 3
     },

@@ -376,6 +376,20 @@ impl<'a> FsView<'a> {
             }
 
             let mut offset = this.sendfile_offset(in_fd.0, offset_address, memory)??;
+            let offset_output = match crate::dispatch::copyout::prepare(cx.kernel, memory, [
+                crate::dispatch::copyout::UserSlot::optional(offset_address, 8),
+            ]) {
+                Ok(output) => output,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            if offset_address != 0 && offset_output.secured_capacity(0) < 8 {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            let _effect = match crate::dispatch::copyout::admit_effect(cx.kernel) {
+                Ok(effect) => effect,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+
 
             // Darwin-native fast path: a regular file -> socket uses macOS
             // sendfile(2) (BSD-style, in-kernel, zero-copy). It honors socket
@@ -402,7 +416,7 @@ impl<'a> FsView<'a> {
                 let sent = rc.max(0) as usize;
                 let advance_and_return = |offset: usize,
                                           sent: usize,
-                                          memory: &mut dyn CurrentMmMemory|
+                                          output: crate::dispatch::copyout::PreparedCopyout<'_, _, 1>|
                  -> Result<DispatchOutcome, DispatchError> {
                     let new_off = offset.saturating_add(sent);
                     if offset_address == 0 {
@@ -415,21 +429,19 @@ impl<'a> FsView<'a> {
                         if positioned >= 0 {
                             this.record_host_file_absolute_offset(in_fd.0, positioned);
                         }
-                    } else if memory
-                        .write_bytes(offset_address, &(new_off as u64).to_ne_bytes())
-                        .is_err()
-                    {
+                    }
+                    if output.commit([&(new_off as u64).to_ne_bytes()]).is_err() {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                     Ok(DispatchOutcome::returned_len_or_errno(sent))
                 };
                 match (rc as i64).host_syscall_errno() {
-                    Ok(_) => return advance_and_return(offset, sent, memory),
+                    Ok(_) => return advance_and_return(offset, sent, offset_output),
                     Err(e) if e == LINUX_EAGAIN => {
                         if sent > 0 {
                             // Partial transfer before the socket filled: report it
                             // (Go advances and loops).
-                            return advance_and_return(offset, sent, memory);
+                            return advance_and_return(offset, sent, offset_output);
                         }
                         return Ok(if this.io_is_nonblocking(out_fd.0, 0) {
                             DispatchOutcome::errno(LINUX_EAGAIN)
@@ -534,10 +546,8 @@ impl<'a> FsView<'a> {
                         _ => {}
                     }
                 }
-            } else if memory
-                .write_bytes(offset_address, &(offset as u64).to_ne_bytes())
-                .is_err()
-            {
+            }
+            if offset_output.commit([&(offset as u64).to_ne_bytes()]).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
 

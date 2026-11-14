@@ -86,3 +86,16 @@ Additional Linux man-page authority:
 - https://man7.org/linux/man-pages/man2/socketpair.2.html
 - https://man7.org/linux/man-pages/man2/nanosleep.2.html
 - https://man7.org/linux/man-pages/man2/clock_nanosleep.2.html
+
+The second implementation step lowers the ceiling by another thirteen, from
+44 to 31 (nineteen arguments retired in total). sendfile had the same raw
+offset-write defect as copy_file_range; both its socket and buffered paths
+now retain a typed prepared output before effects. All four old raw offset
+writes and their error-collapse debt entries are retired.
+
+The delegated-stdio KVM mode reaches genuine read/pread host crossings into
+two untouched pages. Forward counters record two entries per operation: one
+prepares and rewinds, the next crosses. Bounded host strace confirmed exactly
+one real read and one pread with the expected payloads; the counter is not a
+count of host effects. Other KVM modes cover existing native file staging and
+ring epoll output separately. No ARM NativeProcess executor is introduced.

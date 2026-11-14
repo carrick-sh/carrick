@@ -4183,6 +4183,7 @@ fn serial_host_direct_output_venues_supply_untouched_pages() {
                 vec!["-DSTATX_OUTPUT"],
                 vec![],
                 vec!["-DDIRECT_FILES", &file_define, &dir_define],
+                vec!["-DDIRECT_STDIO"],
             ] {
                 let elf = native_exit_fixture_with_flags("native_direct_outputs.S", &flags);
                 let oracle = dir.path().join("oracle");
@@ -4190,6 +4191,7 @@ fn serial_host_direct_output_venues_supply_untouched_pages() {
                 let native = std::process::Command::new("timeout")
                     .arg("10")
                     .arg(&oracle)
+                    .stdin(std::fs::File::open(&file).expect("native stdin payload"))
                     .output()
                     .expect("native control");
                 assert!(native.status.success(), "{flags:?}: {native:?}");
@@ -4198,6 +4200,38 @@ fn serial_host_direct_output_venues_supply_untouched_pages() {
                     carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
                         .expect("host files"),
                 ));
+                let stdio_crossing = flags.contains(&"-DDIRECT_STDIO");
+                if stdio_crossing {
+                    // Seed the carrier's fd 0 through the same production
+                    // open/dup/close path as shell redirection, before boot.
+                    let root = dispatcher.capture_one_task_context().expect("stdio root");
+                    let mut path_bytes = file.as_os_str().as_encoded_bytes().to_vec();
+                    path_bytes.push(0);
+                    let mut memory =
+                        carrick_kernel::dispatch::LinearMemory::new(0x4000, path_bytes);
+                    let mut call = |number, args| {
+                        let outcome = dispatcher
+                            .dispatch(
+                                &root,
+                                carrick_kernel::dispatch::SyscallRequest::new(
+                                    number,
+                                    carrick_kernel::compat::SyscallArgs::from(args),
+                                ),
+                                &mut memory,
+                                &carrick_kernel::compat::CompatReporter::default(),
+                            )
+                            .expect("stdio setup");
+                        let carrick_kernel::dispatch::DispatchOutcome::Returned { value } = outcome
+                        else {
+                            panic!("stdio setup outcome: {outcome:?}");
+                        };
+                        value
+                    };
+                    let fd = call(56, [(-100_i64) as u64, 0x4000, 0, 0, 0, 0]);
+                    assert!(fd >= 3);
+                    assert_eq!(call(24, [fd as u64, 0, 0, 0, 0, 0]), 0);
+                    assert_eq!(call(57, [fd as u64, 0, 0, 0, 0, 0]), 0);
+                }
                 let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None)
                     .expect("direct output program");
                 let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
@@ -4210,6 +4244,22 @@ fn serial_host_direct_output_venues_supply_untouched_pages() {
                 .expect("production direct output runtime");
                 assert_eq!(outcome.run.exit_code, 0, "{flags:?}: {:?}", outcome.run);
                 assert!(!outcome.run.trap_limit_hit);
+                if stdio_crossing {
+                    let counters = outcome
+                        .physical
+                        .syscall_counters()
+                        .expect("crossing counters");
+                    // Forwarded counts entry attempts before native staging:
+                    // one supplies the untouched page and rewinds, the next
+                    // crosses. Bounded host tracing verifies one actual I/O.
+                    for ordinal in [63, 67] {
+                        assert_eq!(
+                            counters.forwarded[ordinal].load(std::sync::atomic::Ordering::Acquire),
+                            2,
+                            "one preparation entry and one crossing entry: {ordinal}"
+                        );
+                    }
+                }
             }
         },
     );
