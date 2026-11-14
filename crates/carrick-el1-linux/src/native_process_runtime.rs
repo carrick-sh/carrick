@@ -9087,7 +9087,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             *self.source.zone.record(self.record.id).ctx_mut() = *self.words;
         }
     }
-    fn fork(&mut self, child_tid: ProcessForkChildTid) -> LifecycleOutcome {
+    fn fork(&mut self, mut child_tid: ProcessForkChildTid) -> LifecycleOutcome {
+        // A suspended parent is woken by the child's in-ring release, which
+        // an EL1 waker can place only for a native-owned record. A
+        // host-loaded caller (the root's host thread) is not placeable from
+        // the child's slot, and the carrier admits such wakes only from a
+        // terminal child, so its suspension could outlive the child's exec.
+        // The child is a copy-on-write fork, so suspension only orders
+        // execution: such a caller returns the pid at once instead.
+        if child_tid.parent == ProcessForkParent::SuspendedUntilExecOrExit
+            && !self.source.zone.record(self.record.id).is_native_owned()
+        {
+            child_tid.parent = ProcessForkParent::Runs;
+        }
         match self.fork_owned(child_tid) {
             Ok(pid) if child_tid.parent == ProcessForkParent::SuspendedUntilExecOrExit => {
                 match self.vfork_suspend(pid) {
@@ -15544,14 +15556,12 @@ mod tests {
     /// clone's stack in its own copy-on-write MM. A native-owned parent
     /// stays parked until the child releases it, by exec admission or by
     /// exit; only then does its clone return the pid, and wait4 still reaps
-    /// the child's exact status. Host-loaded callers use the same retained
-    /// owner continuation; their host request takes the record after wake.
+    /// the child's exact status. A host-loaded parent, which the child's
+    /// release could not place, returns the pid at once instead of parking.
     #[test]
     fn vfork_parent_stays_suspended_until_child_execs_or_exits() {
         const CHILD_STACK: u64 = 0x7ffe_f000;
-        for (exec_first, host_loaded) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
+        for (exec_first, host_loaded) in [(false, false), (true, false), (false, true)] {
             let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
             // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
             let zone = unsafe {
@@ -15650,65 +15660,37 @@ mod tests {
                 (r.address, r.record, r.channel.clone().unwrap())
             };
             if host_loaded {
-                let (parent_address, parent_record, channel) = resources(root);
-                assert!(!zone.record(parent_record.id).is_native_owned());
+                // The fixture root is the host-loaded record of its executor,
+                // never native-owned: no EL1 waker on the child's slot can
+                // place it, so its vfork returns the pid at once.
+                assert!(!zone.record(resources(root).1.id).is_native_owned());
                 let mut entry = runtime
-                    .enter(source, &task, words(parent_address), &mut service)
+                    .enter(source, &task, words(address), &mut service)
                     .unwrap();
                 assert!(
                     !entry.owns_descriptor_namespace(),
                     "borrowed host record keeps host mutation custody"
                 );
-                assert!(matches!(
-                    entry.fork(ProcessForkChildTid::vfork(UserVa::new(CHILD_STACK))),
-                    LifecycleOutcome::Transferred {
-                        progress: carrick_core::Served::Idle,
-                        ..
-                    }
-                ));
-                assert_eq!(entry.take_run_failure(), None);
-                assert!(entry.take_handoff_receipt().is_some());
-                drop(entry);
-                let (child, child_pid) = {
-                    let graph = runtime.graph.lock();
-                    let (&child, &owner) = graph.vfork_parents.iter().next().expect("release row");
-                    assert_eq!(owner, root);
-                    let row = graph.owner.task(child).unwrap();
-                    let resources = row.native().resources();
-                    // SAFETY: the queued child record is only read here.
-                    let ctx = unsafe { *zone.record(resources.record.id).ctx_mut() };
-                    assert_eq!(ctx.frame[18], CHILD_STACK, "child runs on clone's stack");
-                    assert_eq!(ctx.frame[10], 0, "the child's clone returns zero");
-                    (child, row.metadata().namespace_pid)
-                };
-                let before = channel.generation.generation();
-                activate(&runtime, source, &task, child);
-                let (child_address, _, _) = resources(child);
-                let mut entry = runtime
-                    .enter(source, &task, words(child_address), &mut service)
-                    .unwrap();
-                if exec_first {
-                    entry.release_vfork_parent().unwrap();
-                    assert_eq!(channel.generation.generation().raw(), before.raw() + 1);
-                }
-                assert!(matches!(
-                    entry.exit_group(23),
-                    LifecycleOutcome::Transferred { .. }
-                ));
-                assert_eq!(entry.take_run_failure(), None);
-                assert!(entry.take_handoff_receipt().is_some());
-                drop(entry);
-                assert!(runtime.graph.lock().vfork_parents.is_empty());
-                assert!(channel.generation.generation().raw() > before.raw());
-                activate(&runtime, source, &task, root);
-                let mut entry = runtime
-                    .enter(source, &task, words(parent_address), &mut service)
-                    .unwrap();
-                let Some(LifecycleOutcome::Returned { result, .. }) = entry.resume_pending_wait()
+                let LifecycleOutcome::Returned { result, .. } =
+                    entry.fork(ProcessForkChildTid::vfork(UserVa::new(CHILD_STACK)))
                 else {
-                    panic!("released host-loaded vfork parent must return from clone")
+                    panic!("a host-loaded vfork parent must not park on an unplaceable release")
                 };
-                assert_eq!(result.raw(), i64::from(child_pid));
+                assert!(result.raw() > 0);
+                assert_eq!(entry.take_run_failure(), None);
+                drop(entry);
+                let graph = runtime.graph.lock();
+                assert!(graph.vfork_parents.is_empty());
+                assert!(!graph.pending.contains_key(&root));
+                let child = graph
+                    .owner
+                    .namespace_child_key(root, result.raw() as u32)
+                    .unwrap()
+                    .unwrap();
+                let record = graph.owner.task(child).unwrap().native().resources().record;
+                // SAFETY: the queued child record is only read here.
+                let ctx = unsafe { *zone.record(record.id).ctx_mut() };
+                assert_eq!(ctx.frame[18], CHILD_STACK, "child runs on clone's stack");
                 continue;
             }
             // The root forks the native-owned process that will vfork, then

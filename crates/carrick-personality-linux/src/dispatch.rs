@@ -1118,7 +1118,6 @@ impl OperandSpec {
         use crate::crossing::AllowedHostCrossing as C;
         match self.crossing {
             C::Gettimeofday => OutputOperand::Records(&[(0, 16), (1, 8)]),
-            C::ClockGettime => OutputOperand::Record { ptr: 1, bytes: 16 },
             C::Getcwd => OutputOperand::Buffer {
                 ptr: 0,
                 len: 1,
