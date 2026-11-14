@@ -3800,7 +3800,7 @@ fn fork_reserve_refusal_retains_diagnostic_stage_and_retryable_errno() {
         )
         .expect_err("reservation refusal must stop preparation");
     // Pool inventory is "not now", never EAGAIN (#2306).
-    assert_eq!(error.failure(), Err(NativeContention::Busy));
+    assert_eq!(error.failure(), Err(NativeContention::BUSY));
     let NativeProcessError::ForkRefused(refusal) = error else {
         panic!("Reserve refusal lost its diagnostic stage: {error:?}");
     };
@@ -3847,11 +3847,14 @@ fn native_fork_busy_diagnostic_names_parent_space_editor() {
         .expect_err("an outstanding editor must retain its exclusion");
     drop(editor);
     // The fork enrols on the editor's release, never retries a bare Busy.
-    assert!(matches!(
-        error.failure(),
-        Err(NativeContention::OwnerWait(wait))
-            if wait.cause() == carrick_core_abi::PortalWaitCause::Editor
-    ));
+    assert_eq!(
+        error
+            .failure()
+            .err()
+            .and_then(NativeContention::owner_wait)
+            .map(|wait| wait.cause()),
+        Some(carrick_core_abi::PortalWaitCause::Editor)
+    );
     assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 0);
     let NativeProcessError::ForkRefused(refusal) = error else {
         panic!("space edit refusal lost its site: {error:?}");
@@ -3891,7 +3894,7 @@ fn native_fork_busy_diagnostic_names_unsettled_parent_fork() {
         )
         .expect_err("a prepared fork must retain parent publication custody");
     service.abort_mm(prepared).unwrap();
-    assert_eq!(error.failure(), Err(NativeContention::Busy));
+    assert_eq!(error.failure(), Err(NativeContention::BUSY));
     assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
     assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 1);
     let NativeProcessError::ForkRefused(refusal) = error else {

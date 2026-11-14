@@ -173,9 +173,7 @@ fn observe_process_error_with(
                 failure.errno(),
                 failure.run_failure_reason()
             )),
-            Err(contention) => observe(format_args!(
-                "ProcessNative::fork error={error:?}; not now={contention:?}"
-            )),
+            Err(_) => observe(format_args!("ProcessNative::fork error={error:?}; not now")),
         }
     }
     error
@@ -237,10 +235,10 @@ mod tests {
         let observed = observe_process_error_with(E::Busy, |arguments| {
             core::fmt::write(&mut diagnostic, arguments).unwrap();
         });
-        assert_eq!(observed.failure(), Err(NativeContention::Busy));
+        assert_eq!(observed.failure(), Err(NativeContention::BUSY));
         assert_eq!(
             diagnostic.message(),
-            Some("ProcessNative::fork error=Busy; not now=Busy")
+            Some("ProcessNative::fork error=Busy; not now")
         );
     }
 
@@ -317,7 +315,7 @@ mod tests {
                 })
             );
             // A closing or forking gate is "not now", never EAGAIN.
-            assert_eq!(error.failure(), Err(NativeContention::Busy));
+            assert_eq!(error.failure(), Err(NativeContention::BUSY));
             let NativeProcessError::ForkRefused(refusal) = error else {
                 unreachable!()
             };
