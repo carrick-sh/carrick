@@ -1577,11 +1577,12 @@ fn arm_vfork_while_sibling_parked_in_wait4_suspends_parent_until_release() {
 }
 
 /// #2276: a host-loaded root's zero-stack vfork leaves a child live while a
-/// host-born sibling crosses for `clock_gettime`.  The fork owner must split
-/// the root's private L2 block so the real owner-copyout path can resolve COW
-/// and commit the sibling's timespec instead of returning EFAULT.  This joins
-/// the production ARM entry to the production reservation and descriptor
-/// owners; no validator projection stands in for the live page tables.
+/// host-born sibling crosses for `clock_gettime` into the root's armed
+/// private L2 block.  The real owner-copyout path must resolve that COW, its
+/// repoint splitting the block with the grant's one table, and commit the
+/// sibling's timespec instead of returning EFAULT.  This joins the production
+/// ARM entry to the production reservation and descriptor owners; no
+/// validator projection stands in for the live page tables.
 #[test]
 fn arm_host_root_vfork_child_keeps_sibling_block_copyout_completable() {
     use carrick_core::mm::transaction::{SelectionVenues, UserWriteRequest, UserWriteVenue};
@@ -1684,7 +1685,9 @@ fn arm_host_root_vfork_child_keeps_sibling_block_copyout_completable() {
     let pool = carrick_el1_abi::CowGrantPool::new();
     let replacement_ipa = crate::mm_portal::test_support::IPA + 0x400000;
     let nz = |value| NonZeroU64::new(value).unwrap();
-    pool.publish(
+    // The host supplies the grant the first write into an armed block
+    // needs: one replacement compound and one table for the block's split.
+    pool.publish_with_tables(
         handle.mm().raw(),
         replacement_ipa,
         BackingIdentity {
@@ -1693,6 +1696,7 @@ fn arm_host_root_vfork_child_keeps_sibling_block_copyout_completable() {
             owner_generation: nz(73),
             inventory_revision: nz(74),
         },
+        carrick_el1_abi::CowSplitTables::new(&[0x2c000]).unwrap(),
     )
     .unwrap();
     let residency = crate::mm_portal::test_support::residency();
