@@ -759,7 +759,6 @@ fn run_exec_fixture_with_stock_pressure(
 
 /// #2142: root exec must replace the production CPL0 image, not return ENOSYS.
 #[test]
-#[ignore = "#2142 root exec: not served by #2273"]
 fn production_root_exec_replaces_image_and_runs_static_successor() {
     let dir = tempfile::tempdir().expect("exec fixture directory");
     let successor = dir.path().join("successor");
@@ -777,7 +776,6 @@ fn production_root_exec_replaces_image_and_runs_static_successor() {
 /// #2142: execve(2) of a missing path fails with ENOENT and the caller keeps
 /// running its old image, which exits with that errno.
 #[test]
-#[ignore = "#2142 root exec: not served by #2273"]
 fn production_root_exec_of_a_missing_path_is_enoent() {
     let dir = tempfile::tempdir().expect("exec fixture directory");
     let outcome = run_root_exec(&dir.path().join("absent"));
@@ -791,7 +789,6 @@ fn production_root_exec_of_a_missing_path_is_enoent() {
 /// #2142: execve(2) of an executable file in no recognized format fails with
 /// ENOEXEC and the caller keeps running its old image.
 #[test]
-#[ignore = "#2142 root exec: not served by #2273"]
 fn production_root_exec_of_a_non_elf_file_is_enoexec() {
     let dir = tempfile::tempdir().expect("exec fixture directory");
     let text = dir.path().join("text");
