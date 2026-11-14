@@ -2034,6 +2034,11 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         );
         if native_nr == 202 && synchronous {
             assert_eq!(
+                route,
+                CompletionRoute::Served,
+                "native preparation must be admitted"
+            );
+            assert_eq!(
                 frame.pc, 0x4000,
                 "synchronous futex preparation must re-execute syscall"
             );
@@ -2243,10 +2248,10 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         "{diagnostic}"
     );
 
-    // The native owner supplies missing timeout bytes synchronously. Return
+    // The native owner supplies the missing atomic word synchronously. Return
     // through the production dispatcher must replay, preserving every operand.
     service.prepare_synchronously = true;
-    let (route, _) = call_x86(&env, &child, &mut service, 202, [0x2000, 128, 1, 1, 0, 0]);
+    let (route, _) = call_x86(&env, &child, &mut service, 202, [0x2000, 128, 1, 0, 0, 0]);
     assert_eq!(route, CompletionRoute::Served);
     service.prepare_synchronously = false;
 

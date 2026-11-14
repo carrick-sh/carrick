@@ -16508,53 +16508,140 @@ fn signal_setup_nonresident_input(nr: u64) {
 
 #[test]
 fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
-    futex_owner_wait_episode(false, false, false, None, false, false, false, false);
+    futex_owner_wait_episode(
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        FutexOwnerRefusal::Copy,
+    );
 }
 
 #[test]
 fn futex_relative_deadline_survives_owner_wait_with_two_live_threads() {
-    futex_owner_wait_episode(true, false, false, None, false, false, false, false);
+    futex_owner_wait_episode(
+        true,
+        false,
+        false,
+        None,
+        false,
+        false,
+        FutexOwnerRefusal::Copy,
+    );
 }
 
 #[test]
 fn futex_relative_deadline_survives_synchronous_owner_redispatch_with_two_live_threads() {
-    futex_owner_wait_episode(true, true, false, None, false, false, false, false);
+    futex_owner_wait_episode(
+        true,
+        true,
+        false,
+        None,
+        false,
+        false,
+        FutexOwnerRefusal::Copy,
+    );
 }
 
 #[test]
 fn futex_cancelled_owner_wait_releases_deadline_before_next_wait() {
-    futex_owner_wait_episode(true, false, true, None, false, false, false, false);
+    futex_owner_wait_episode(
+        true,
+        false,
+        true,
+        None,
+        false,
+        false,
+        FutexOwnerRefusal::Copy,
+    );
 }
 
 #[test]
 fn futex_owner_deadline_is_discarded_before_an_unrelated_syscall() {
-    futex_owner_wait_episode(true, false, false, Some(172), false, false, false, false);
+    futex_owner_wait_episode(
+        true,
+        false,
+        false,
+        Some(172),
+        false,
+        false,
+        FutexOwnerRefusal::Copy,
+    );
 }
 
 #[test]
 fn futex_owner_deadline_is_discarded_before_an_unserved_futex() {
-    futex_owner_wait_episode(true, false, false, Some(98), false, false, false, false);
+    futex_owner_wait_episode(
+        true,
+        false,
+        false,
+        Some(98),
+        false,
+        false,
+        FutexOwnerRefusal::Copy,
+    );
 }
 
 #[test]
 fn futex_caught_signal_releases_owner_deadline_before_handler_wait() {
-    futex_owner_wait_episode(true, false, false, None, true, false, false, false);
+    futex_owner_wait_episode(
+        true,
+        false,
+        false,
+        None,
+        true,
+        false,
+        FutexOwnerRefusal::Copy,
+    );
 }
 
 #[test]
 fn futex_signal_during_owner_park_interrupts_then_starts_fresh_handler_wait() {
-    futex_owner_wait_episode(true, false, false, None, true, true, false, false);
+    futex_owner_wait_episode(
+        true,
+        false,
+        false,
+        None,
+        true,
+        true,
+        FutexOwnerRefusal::Copy,
+    );
 }
 
 #[cfg(test)]
 #[test]
 fn futex_copy_not_yet_owner_fault_publishes_efault() {
-    futex_owner_wait_episode(false, false, false, None, false, false, true, false);
+    futex_owner_wait_episode(
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        FutexOwnerRefusal::CopyFault,
+    );
 }
 
 #[test]
 fn futex_mapping_synchronous_redispatch_rewinds_syscall() {
-    futex_owner_wait_episode(false, true, false, None, false, false, false, true);
+    futex_owner_wait_episode(
+        false,
+        true,
+        false,
+        None,
+        false,
+        false,
+        FutexOwnerRefusal::Mapping,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum FutexOwnerRefusal {
+    Copy,
+    CopyFault,
+    Mapping,
 }
 
 #[cfg(test)]
@@ -16565,8 +16652,7 @@ fn futex_owner_wait_episode(
     intervening: Option<u64>,
     caught_signal: bool,
     signal_during_owner: bool,
-    fault: bool,
-    mapping: bool,
+    refusal: FutexOwnerRefusal,
 ) {
     use crate::native_process_runtime::host_test_support::Physical;
     use crate::sched::{LinuxSchedEntry, UserWord};
@@ -16591,6 +16677,8 @@ fn futex_owner_wait_episode(
             }
         }
     }
+    let fault = matches!(refusal, FutexOwnerRefusal::CopyFault);
+    let mapping = matches!(refusal, FutexOwnerRefusal::Mapping);
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -16775,7 +16863,8 @@ fn futex_owner_wait_episode(
                 .with(|slot| slot.set(None));
             assert_eq!(route, CompletionRoute::Served);
             assert_eq!(frame.elr, 0x4000, "redispatch must re-execute SVC");
-            assert_eq!(frame.x[0], VA);
+            assert_eq!(&frame.x[..6], &[VA, 0, 0x12345678, 0, 0, 0]);
+            assert_eq!(frame.x[8], crate::sched::SYS_FUTEX as u64);
             assert_eq!(word.reads.get(), 0);
             assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 0);
             return;

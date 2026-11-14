@@ -42,6 +42,18 @@ pub enum PollSignalMask {
 
 use carrick_personality_linux::native_host_file::ppoll_timeout_ms;
 
+/// Futex owner preparation can finish synchronously without a syscall result.
+/// Preserve the input registers and re-enter the ISA's syscall instruction.
+fn futex_lifecycle_effect(
+    frame: &mut impl GuestDispatchFrame,
+    outcome: &lifecycle::LifecycleOutcome,
+) -> FamilyCompletion {
+    if matches!(outcome, lifecycle::LifecycleOutcome::Redispatch) {
+        frame.restart_syscall();
+    }
+    lifecycle::lifecycle_effect(outcome)
+}
+
 pub trait GuestDispatchFrame: SyscallFrame {
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal;
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet;
@@ -3680,7 +3692,7 @@ impl<
                 let Some(outcome) = process.native_futex(call, &mut copy) else {
                     return FamilyCompletion::Forward;
                 };
-                return lifecycle::lifecycle_effect(&outcome);
+                return futex_lifecycle_effect(self.frame, &outcome);
             }
             let mut operation = self
                 .process
@@ -3722,7 +3734,7 @@ impl<
                 let disposition = match served {
                     Ok(served) => served.map_or(ipc::IpcServed::Forward, ipc::IpcServed::from),
                     Err(sched::FutexRefusal::Mapping(outcome)) => {
-                        return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+                        return futex_lifecycle_effect(self.frame, &outcome);
                     }
                     Err(sched::FutexRefusal::Copy(carrick_core::user_copy::CopyOutcome::Fault)) => {
                         return FamilyCompletion::Complete(
