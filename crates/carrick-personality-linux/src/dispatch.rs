@@ -631,7 +631,22 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::NativeService => FamilyCompletion::NativeService,
         Family::NativeHostFile => pending.native_host_file(),
         Family::Signal(_) | Family::Sleep(_) => FamilyCompletion::Forward,
-        Family::Futex => pending.futex(),
+        Family::Futex => {
+            let original = pending.original_argument0();
+            let completion = pending.futex();
+            returned = match completion {
+                FamilyCompletion::Complete(value)
+                | FamilyCompletion::CompleteWithWork(value)
+                | FamilyCompletion::AccountedComplete(value)
+                | FamilyCompletion::CommitOwed(value) => {
+                    Some((SyscallResult::new(value), original))
+                }
+                // A switched frame belongs to the successor; suspension and
+                // redispatch retain the caller's original arguments.
+                _ => None,
+            };
+            completion
+        }
         Family::InotifyAdd => pending.inotify_add(),
         Family::InotifyRemove => pending.inotify_remove(),
         Family::FileSeek => pending.file_seek(),

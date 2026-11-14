@@ -404,6 +404,7 @@ fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser)
     let name_cache = InotifyNameCache::new();
     let ordinal = frame.x[8];
     let mut native = super::El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         frame,
         counters: &w.counters,
@@ -463,6 +464,7 @@ fn serve_directly_with_process<P: for<'ipc> ProcessNative<'ipc>>(
     let name_cache = InotifyNameCache::new();
     let ordinal = frame.x[8];
     let mut native = super::El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         frame,
         counters: &w.counters,
@@ -1829,6 +1831,7 @@ fn process_native_hooks_require_every_execution_identity_component() {
         };
         let names = InotifyNameCache::new();
         let mut native = super::El1PendingFamilies {
+            futex_argument0: None,
             handoff: None,
             lifecycle_user: None,
             frame: &mut frame,
@@ -1960,6 +1963,7 @@ fn x86_split_result_does_not_read_argument_zero() {
     let tasks = [CurrentTask::new()];
     let cache = InotifyNameCache::new();
     let pending = El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         lifecycle_user: None,
         frame: &mut frame,
@@ -2057,6 +2061,7 @@ fn clone_uses_the_exact_stamped_dispatch_identity() {
     frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
     let names = InotifyNameCache::new();
     let mut native = super::El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         lifecycle_user: None,
         frame: &mut frame,
@@ -2144,6 +2149,7 @@ fn clone_refuses_missing_dispatch_identity_without_registering() {
     frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
     let names = InotifyNameCache::new();
     let mut native = super::El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         lifecycle_user: None,
         frame: &mut frame,
@@ -2245,6 +2251,7 @@ fn clone_missing_nonleader_identity_cannot_inherit_leader() {
     frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
     let names = InotifyNameCache::new();
     let mut native = super::El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         lifecycle_user: None,
         frame: &mut frame,
@@ -2350,6 +2357,7 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
     frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
     let names = InotifyNameCache::new();
     let mut native = super::El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         lifecycle_user: None,
         frame: &mut frame,
@@ -2747,6 +2755,7 @@ fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
     frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
     let names = InotifyNameCache::new();
     let mut native = super::El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         lifecycle_user: None,
         frame: &mut frame,
@@ -2892,6 +2901,7 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
     frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
     let names = InotifyNameCache::new();
     let mut native = super::El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         lifecycle_user: None,
         frame: &mut frame,
@@ -2939,6 +2949,7 @@ fn birth_record_refusal_retains_the_claim_for_rollback() {
     let names = InotifyNameCache::new();
     let mut native: super::El1PendingFamilies<'_, '_, _, FakeCpu, HardwareUserWord> =
         super::El1PendingFamilies {
+            futex_argument0: None,
             handoff: None,
             lifecycle_user: None,
             frame: &mut frame,
@@ -3145,6 +3156,7 @@ fn clone_terminal_failure_witness(mode: u8) {
     frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
     let names = InotifyNameCache::new();
     let mut native = super::El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         lifecycle_user: None,
         frame: &mut frame,
@@ -3269,6 +3281,7 @@ fn native_exit_group_leaves_the_woken_successor_to_the_scheduler() {
     };
     let names = InotifyNameCache::new();
     let mut native = super::El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         lifecycle_user: None,
         frame: &mut frame,
@@ -3541,6 +3554,7 @@ fn native_cross_page_copy_without_owner_returns_fault() {
     let tasks = [CurrentTask::new()];
     let cache = InotifyNameCache::new();
     let mut pending = El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         lifecycle_user: None,
         frame: &mut frame,

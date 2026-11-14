@@ -678,6 +678,7 @@ fn clear_tid_stopped_join_driver<C, B>(
                 _,
                 C,
             > = crate::dispatch::El1PendingFamilies {
+                futex_argument0: None,
                 handoff: None,
                 lifecycle_user: None,
                 frame: &mut ExitFrame(isa),
