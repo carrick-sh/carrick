@@ -747,11 +747,13 @@ mod fork_cow {
                     owner_generation: NonZeroU64::new(1).unwrap(),
                     inventory_revision: NonZeroU64::new(1).unwrap(),
                 },
+                tables: Default::default(),
             },
             span_va: 0,
             span_len: 4096,
             old_ipa: leaf_pa,
             new_ipa,
+            tables_linked: 0,
         };
         assert!(cow_completion.is_well_formed());
         unpublished
