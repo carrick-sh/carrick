@@ -4130,6 +4130,45 @@ fn production_exclusion_settles_an_outstanding_cow_before_its_retired_leaf() {
     );
 }
 
+/// One second of this host's TSC, which a KVM guest reads unscaled.
+fn tsc_ticks_per_second() -> u64 {
+    // SAFETY: RDTSC has no memory effects; x86_64 Linux enables it at CPL3.
+    let start = unsafe { core::arch::x86_64::_rdtsc() };
+    let clock = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // SAFETY: as above.
+    let ticks = unsafe { core::arch::x86_64::_rdtsc() } - start;
+    (u128::from(ticks) * 1_000_000_000 / clock.elapsed().as_nanos()) as u64
+}
+
+/// #2354: three threads on two guest CPUs (the root pinned to CPU 0) take
+/// turns, each making no call but `sched_yield` until the turn is its own.
+/// Linux runs a runnable sibling queued behind a yielder on its CPU; the
+/// fixture fails a turn not taken within one second (of the TSC).
+#[test]
+fn production_sched_yield_hands_the_cpu_to_a_queued_sibling() {
+    let bound = format!("-DBOUND_TICKS={}", tsc_ticks_per_second());
+    let elf = native_exit_fixture_with_flags("native_yield_sibling_progress.S", &[&bound]);
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .args(["10", "taskset", "-c", "0"])
+        .arg(&oracle)
+        .output()
+        .expect("Linux oracle");
+    assert_eq!(native.status.code(), Some(0), "native Linux oracle");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
+        .unwrap_or_else(|error| panic!("yield turns: {error:?}"));
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "91: the root waited 1 s for its turn behind a yielder; 92: a clone did; \
+         93: a clone's exit was not observed (see native_yield_sibling_progress.S): {:?}",
+        outcome.run
+    );
+}
+
 /// A full journal held by exited children must reclaim their fork quarantine
 /// without depending on another fork to drive the existing reclaim path.
 #[test]
