@@ -136,6 +136,41 @@ mod tests {
     }
 
     #[test]
+    fn same_run_cannot_replace_a_live_checkout_or_its_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let first = GateCheckout::acquire(root.path(), "same-1").unwrap();
+        let lock = root.path().join("same-1.lock");
+        let inode = fs::metadata(&lock).unwrap().ino();
+        fs::write(first.path().join("sentinel"), b"live").unwrap();
+        assert!(GateCheckout::acquire(root.path(), "same-1").is_err());
+        assert!(first.path().join("sentinel").exists());
+        drop(first);
+        // A crash during allocation can leave an empty directory too.
+        fs::create_dir(root.path().join("same-1")).unwrap();
+        let second = GateCheckout::acquire(root.path(), "same-1").unwrap();
+        assert!(second.path().exists());
+        assert_eq!(fs::metadata(lock).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn refuses_path_escape_and_symlink_authority() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        assert!(GateCheckout::acquire(root.path(), "../escape").is_err());
+        let outside = tempfile::tempdir().unwrap();
+        let alias = root.path().join("alias");
+        symlink(outside.path(), &alias).unwrap();
+        assert!(GateCheckout::acquire(&alias, "run-1").is_err());
+        symlink(
+            outside.path().join("must-not-create"),
+            root.path().join("run-1.lock"),
+        )
+        .unwrap();
+        assert!(GateCheckout::acquire(root.path(), "run-1").is_err());
+        assert!(!outside.path().join("must-not-create").exists());
+    }
+
+    #[test]
     fn killed_checkout_is_reaped_but_live_checkout_is_kept() {
         let root = tempfile::tempdir().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())

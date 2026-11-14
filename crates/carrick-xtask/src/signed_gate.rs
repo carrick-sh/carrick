@@ -1547,21 +1547,24 @@ fn execute_one(
         bundle,
         candidate_probes,
     } = fixtures;
-    fetch_with_retry(
-        || run_checked("git", ["fetch", "--no-tags", "origin", commit], Some(root)),
-        std::thread::sleep,
-    )?;
     let temp = checkout::GateCheckout::acquire(
         &std::env::temp_dir().join("carrick-gate"),
         &checkout::run_name(),
     )
     .map_err(|e| fail(e.to_string()))?;
+    fetch_with_retry(
+        || run_checked("git", ["fetch", "--no-tags", "origin", commit], Some(root)),
+        std::thread::sleep,
+    )?;
     let tree = temp.path().join("checkout");
     checked(
         "git",
         &[
             "worktree",
             "add",
+            // The previous owner may have died before removing git metadata.
+            // Our per-run lock authorizes reusing this now-missing path.
+            "--force",
             "--detach",
             &tree.to_string_lossy(),
             commit,
