@@ -1133,6 +1133,23 @@ pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, 
     Ok(out)
 }
 
+/// The test binary name of a package's library target: `[lib] name`, else the
+/// package name with `-` as `_` (how libtest names a crate's lib tests).
+fn lib_bin_name(manifest: &toml::Value) -> Option<String> {
+    manifest
+        .get("lib")
+        .and_then(|l| l.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            manifest
+                .get("package")
+                .and_then(|p| p.get("name"))
+                .and_then(toml::Value::as_str)
+                .map(|name| name.replace('-', "_"))
+        })
+}
+
 fn binary_runs_in_receipt_lane(
     tree_root: &Path,
     bin: &str,
@@ -1149,7 +1166,11 @@ fn binary_runs_in_receipt_lane(
         let runs = match lane {
             "kvm" => receipt.profile == "kvm",
             "signed-hvf" | "signed-cli" => receipt.phase == "signed",
-            // An el1-native receipt runs only carrick-el1-linux's lib tests.
+            // An el1-native receipt runs only carrick-el1-linux's lib tests: the
+            // binary named for the crate's library, never one of its integration
+            // targets (#2273: `tests/x86_production_forward.rs` is a host-lane
+            // target the el1-native job never runs, so a retirement inside it
+            // demanded a replacement that receipt could never contain).
             "host" | "integration" => {
                 receipt.phase == "host"
                     && match receipt.profile.as_str() {
@@ -1160,6 +1181,7 @@ fn binary_runs_in_receipt_lane(
                                 .and_then(|p| p.get("name"))
                                 .and_then(toml::Value::as_str)
                                 == Some("carrick-el1-linux")
+                                && lib_bin_name(&manifest).as_deref() == Some(bin)
                         }
                         _ => true,
                     }
