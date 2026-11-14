@@ -1774,6 +1774,7 @@ impl NativeServiceCapacityFixture {
         Self::from_fixture_rusage(fixture, children, rusage)
     }
 
+    #[cfg(test)]
     fn from_fixture(fixture: NativeSignalFixture, children: usize) -> Self {
         Self::from_fixture_rusage(fixture, children, UserVa::new(0))
     }
