@@ -2328,6 +2328,64 @@ fn setup_native_owned_ring_birth_before_first_entry() -> NativeOwnedTwoThreadHar
     }
 }
 
+#[test]
+fn arm_ring_born_sibling_returns_through_closed_group_checkpoint() {
+    let mut h = setup_native_owned_ring_birth_before_first_entry();
+    let slot = SlotId::new(3);
+    h.env.init_guest_slot(slot);
+    let mut born_cpu = crate::sched::FakeCpu::default();
+    assert_eq!(
+        h.env.switch_in(slot, &mut born_cpu),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(h.env.fixture.zone.slot(slot).current(), Some(h.born_record));
+    assert!(h.env.fixture.zone.record(h.born_record).is_native_owned());
+    let counters = carrick_el1_abi::Counters::new();
+    let mut gettid = carrick_el1_abi::TrapFrame::default();
+    gettid.x[8] = 178;
+    h.env.call(
+        slot,
+        h.target_page,
+        h.born_control,
+        &counters,
+        &mut gettid,
+        &mut born_cpu,
+    );
+    assert_eq!(gettid.x[0] as u32, h.born_tid);
+
+    let mut exit = carrick_el1_abi::TrapFrame::default();
+    exit.x[8] = 94;
+    exit.x[0] = 5;
+    assert_eq!(
+        h.env.call(
+            SlotId::new(0),
+            h.target_page,
+            h.leader_control,
+            &counters,
+            &mut exit,
+            &mut h.leader_cpu,
+        ),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert_eq!(h.env.fixture.zone.slot(slot).current(), Some(h.born_record));
+    let task = &h.env.tasks[slot.index()];
+    assert_eq!(
+        crate::dispatch::arm_signal_return_gate(
+            BornInZoneSource {
+                zone: h.env.fixture.zone,
+                slot,
+            },
+            task,
+            h.target_page,
+            h.born_control,
+            0,
+            0,
+            true,
+        ),
+        Some(true),
+    );
+}
+
 fn publish_host_born_sibling_only(
     fixture: &'static Fixture,
     visible_tid: u32,
