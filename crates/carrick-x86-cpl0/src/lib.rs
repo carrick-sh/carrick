@@ -87,8 +87,9 @@ mod test_support {
     /// Release a held birth from its waiter's own call; 0 also when the
     /// waiter's park already released it.
     pub const INJECT_RELEASE_HELD_BIRTH: u64 = 0xffff_ffff_ffff_fe21;
-    /// The next owner fault's application step is Busy once (#2141): after
-    /// its physical supply crossing returns, before the guest applies it.
+    /// The calling member's next owner fault's application step is Busy
+    /// once (#2141): after its physical supply crossing returns, before the
+    /// guest applies it. Another member's fault never takes it (#2332).
     /// The synthetic editor holder releases once the faulting member parks.
     pub const INJECT_POST_SUPPLY_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe30;
     /// Post-supply Busies injected so far: COW supplies in the high 32 bits,
@@ -99,8 +100,12 @@ mod test_support {
     /// [`INJECT_RELEASE_POST_SUPPLY_HOLD`].
     pub const INJECT_POST_SUPPLY_BUSY_HELD: u64 = 0xffff_ffff_ffff_fe32;
     /// Release a held post-supply holder from another member: publish the
-    /// held MM's Editor release once its waiter has parked. 1 if released.
+    /// held MM's Editor release, as a real holder's drop does, whether or
+    /// not its waiter has parked yet. 1 if released.
     pub const INJECT_RELEASE_POST_SUPPLY_HOLD: u64 = 0xffff_ffff_ffff_fe33;
+    /// 1 once a member parked on an injected contention and no release has
+    /// taken that park yet: a fixture orders its release after the park.
+    pub const INJECT_POST_SUPPLY_PARKED: u64 = 0xffff_ffff_ffff_fe36;
     /// The next scheduler install of an address space meets its gate raised
     /// once (#2295), between the record's switch-in and the install, as a
     /// host exclusion on another vCPU raises it. The holder lowers it, with
@@ -166,8 +171,25 @@ mod test_support {
         INSTALL_GATE_CENSUS.fetch_add(1, Ordering::AcqRel);
     }
 
-    static POST_SUPPLY_BUSY: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
+    /// The member that armed the next post-supply Busy (#2332): only its
+    /// own fault takes it. A fork child's first COW fault on the other vCPU
+    /// would otherwise take a held Busy no one releases.
+    static POST_SUPPLY_BUSY: carrick_el1::lock::SpinLock<Option<carrick_core_abi::ExecutionBinding>> =
+        carrick_el1::lock::SpinLock::new(None);
+
+    /// Arm the next post-supply Busy for the member running on `binding`.
+    fn arm_post_supply_busy(
+        binding: &carrick_el1::isa::x86::context::native::CpuBinding,
+    ) -> Option<u64> {
+        // SAFETY: dispatch runs on the CPU that owns this task binding.
+        let task = unsafe { &*(binding.task_address as *const carrick_el1_abi::CurrentTask) };
+        let mut armed = POST_SUPPLY_BUSY.lock();
+        if armed.is_some() {
+            return None;
+        }
+        *armed = Some(carrick_el1_linux::common_entry::execution_binding(task));
+        Some(0)
+    }
     static POST_SUPPLY_HOLD: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
@@ -181,8 +203,13 @@ mod test_support {
     /// Called once an owner fault's supply crossing returned: hold this
     /// MM's editor (only this MM's) for the application step that follows,
     /// if armed.
-    pub fn hold_editor_after_supply(mm: u64, cow: bool) {
-        if !POST_SUPPLY_BUSY.swap(false, Ordering::AcqRel) {
+    pub fn hold_editor_after_supply(task: &carrick_el1_abi::CurrentTask, mm: u64, cow: bool) {
+        let binding = carrick_el1_linux::common_entry::execution_binding(task);
+        if POST_SUPPLY_BUSY
+            .lock()
+            .take_if(|armed| *armed == binding)
+            .is_none()
+        {
             return;
         }
         if !carrick_sched_core::spaces::inject_editor_busy_once_for(mm) {
@@ -330,6 +357,10 @@ mod test_support {
 
     pub fn take_edit_park() -> bool {
         EDIT_PARK_PUBLISHED.swap(false, Ordering::AcqRel)
+    }
+
+    fn edit_park_published() -> bool {
+        EDIT_PARK_PUBLISHED.load(Ordering::Acquire)
     }
 
     static REPLAY_SETTLEMENT_REFUSAL: core::sync::atomic::AtomicBool =
@@ -557,19 +588,18 @@ mod test_support {
                     });
                 Some(0)
             }
-            INJECT_POST_SUPPLY_BUSY_ONCE => {
-                (!POST_SUPPLY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)
-            }
+            INJECT_POST_SUPPLY_BUSY_ONCE => arm_post_supply_busy(binding),
             INJECT_INSTALL_GATE_ONCE => {
                 (!INSTALL_GATE_ARMED.swap(true, Ordering::AcqRel)).then_some(0)
             }
             INJECT_INSTALL_GATE_CENSUS => Some(INSTALL_GATE_CENSUS.load(Ordering::Acquire)),
             INJECT_POST_SUPPLY_CENSUS => Some(POST_SUPPLY_CENSUS.load(Ordering::Acquire)),
+            INJECT_POST_SUPPLY_PARKED => Some(u64::from(edit_park_published())),
             INJECT_POST_SUPPLY_BUSY_HELD => {
                 if POST_SUPPLY_HOLD.swap(true, Ordering::AcqRel) {
                     return None;
                 }
-                (!POST_SUPPLY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)
+                arm_post_supply_busy(binding)
             }
             INJECT_RELEASE_POST_SUPPLY_HOLD => {
                 let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(

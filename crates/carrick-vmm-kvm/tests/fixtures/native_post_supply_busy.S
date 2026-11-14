@@ -32,6 +32,7 @@
 #define INJECT_POST_SUPPLY_CENSUS -463    /* 0x...fe31 */
 #define INJECT_POST_SUPPLY_BUSY_HELD -462 /* 0x...fe32 */
 #define INJECT_RELEASE_POST_SUPPLY_HOLD -461 /* 0x...fe33 */
+#define INJECT_POST_SUPPLY_PARKED -458 /* 0x...fe36 */
 #define CANARY 0x1122334455667788
 #define CHILD_STATUS 5
 #define WORKER_STATUS 6
@@ -140,6 +141,9 @@ child:
     jne failure
     cmpb $1, (%rbx)
     jne failure
+    /* The hold census rises before the root parks: wait for its park, so
+     * this witness is the park-and-rerun, not a release that beat it. */
+    call await_root_park
     /* Only now release the root's holder: its fault reruns. */
     mov $INJECT_RELEASE_POST_SUPPLY_HOLD, %rax
     syscall
@@ -231,6 +235,22 @@ await_post_supply_busy:
     test %rax, %rax
     jz 1b
     ret
+
+#if defined(POST_SUPPLY_COW)
+/* sched_yield until the root's held fault published its park (bounded). */
+await_root_park:
+    mov $1000, %r13d
+1:
+    dec %r13d
+    jz census_failure
+    mov $24, %eax
+    syscall
+    mov $INJECT_POST_SUPPLY_PARKED, %rax
+    syscall
+    test %rax, %rax
+    jz 1b
+    ret
+#endif
 
 wait_child:
     mov %r12d, %edi

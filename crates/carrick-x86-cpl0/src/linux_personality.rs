@@ -929,7 +929,7 @@ fn supply_user_fault(
                 return refused;
             }
             #[cfg(feature = "test-support")]
-            crate::test_support::hold_editor_after_supply(mm_key, true);
+            crate::test_support::hold_editor_after_supply(task, mm_key, true);
             let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
             let mut cow = carrick_el1_linux::cow_resolver::X86CowResolver {
                 words: &words,
@@ -985,7 +985,7 @@ fn supply_user_fault(
                 return refused;
             }
             #[cfg(feature = "test-support")]
-            crate::test_support::hold_editor_after_supply(mm_key, false);
+            crate::test_support::hold_editor_after_supply(task, mm_key, false);
             let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
                 return UserFaultSupply::Unresolved(9);
             };

@@ -121,16 +121,17 @@ pub(super) fn release_injected_edit_wait(
     venue.publish(notifications.reserve(cause));
 }
 
-/// Release a held synthetic editor holder of its own MM, once its waiter
-/// published its park: the Editor release a real holder's drop publishes.
+/// Release a held synthetic editor holder of its own MM: the Editor release
+/// a real holder's drop publishes. Like that drop, it never waits for or
+/// depends on its waiter: one that has not enrolled yet observes the
+/// release and reruns (#2332).
 #[cfg(feature = "test-support")]
 pub(super) fn release_held_editor(source: BornInZoneSource<'static, ParkedContextWords>) -> bool {
     let mm = carrick_sched_core::spaces::injected_editor_busy_key();
-    if !crate::test_support::take_edit_park()
-        || !carrick_sched_core::spaces::release_injected_editor_busy()
-    {
+    if !carrick_sched_core::spaces::release_injected_editor_hold() {
         return false;
     }
+    let _ = crate::test_support::take_edit_park();
     let Some(notifications) = NonZeroU64::new(mm)
         .and_then(|mm| source.zone.space_entry(mm))
         .and_then(|entry| entry.live_notifications().ok())

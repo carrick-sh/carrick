@@ -91,6 +91,13 @@ pub fn release_injected_editor_busy() -> bool {
         .is_ok()
 }
 
+/// Drop an armed or refusing injected holder as a real holder's drop does:
+/// whether or not a waiter met it or enrolled yet. False if none was held.
+#[cfg(feature = "test-support")]
+pub fn release_injected_editor_hold() -> bool {
+    INJECT_EDITOR_BUSY.swap(0, Ordering::AcqRel) != 0
+}
+
 /// Entries in the table: the address spaces the host has published at once.
 /// A full table leaves an MM unpublished, so its threads reach a vCPU
 /// through their executors, as before this step.
