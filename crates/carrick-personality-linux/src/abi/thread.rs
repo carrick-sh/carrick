@@ -1075,6 +1075,16 @@ impl ThreadControlSlot {
             .store(identity.thread().raw(), Ordering::Release);
     }
 
+    /// A closing group has requested this exact member's terminal exit: its
+    /// published host-exit request or, for an unregistered host birth, the
+    /// page's cancellation of that birth.
+    pub fn terminal_requested(&self, page: &ThreadLifecyclePage) -> bool {
+        self.host_exit_requested()
+            || self
+                .host_birth_identity()
+                .is_some_and(|birth| page.host_birth_requested(birth))
+    }
+
     pub fn host_birth_identity(&self) -> Option<carrick_core::terminal::ThreadBirthIdentity> {
         let thread = self.birth_thread.load(Ordering::Acquire);
         carrick_core::terminal::ThreadBirthIdentity::from_parts(

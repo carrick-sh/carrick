@@ -4706,14 +4706,10 @@ where
                     .service_kernel_context
                     .as_ref()
                     .is_some_and(|context| {
-                        (context.thread().control_slot().host_exit_requested()
-                            || context
-                                .thread()
-                                .control_slot()
-                                .host_birth_identity()
-                                .is_some_and(|identity| {
-                                    context.lifecycle_page().host_birth_requested(identity)
-                                }))
+                        context
+                            .thread()
+                            .control_slot()
+                            .terminal_requested(&context.lifecycle_page())
                             && carrick_el1_abi::Lifecycle::process_exit_custody(
                                 &*context.lifecycle_page(),
                             )
