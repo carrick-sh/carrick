@@ -1603,6 +1603,7 @@ fn arm_vfork_live_child_keeps_sibling_clock_copyout_writable() {
     );
 
     let mut clock = carrick_el1_abi::TrapFrame::default();
+    clock.esr = 0x15 << 26;
     clock.x[8] = carrick_abi::syscall::nr::CLOCK_GETTIME.raw();
     clock.x[0] = 1;
     clock.x[1] = VA;
