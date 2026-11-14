@@ -67,7 +67,9 @@ pub fn require_dev_registry(image: &str) -> &str {
         });
         if !reachable {
             let line = format!("{DEV_REGISTRY_MARKER} {host} ({image})");
-            let _ = writeln!(std::io::stderr().lock(), "\n{line}");
+            let _ = std::io::stderr()
+                .lock()
+                .write_all(format!("\n{line}\n").as_bytes());
             panic!("\n{line}");
         }
     }
