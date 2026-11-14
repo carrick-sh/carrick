@@ -1593,6 +1593,132 @@ fn deliver_holder_release(
     let _ = effects.deliver_handbacks(&mut |_| {});
 }
 
+/// Retirement in the gap between a carrier's refusal and enrollment must
+/// invalidate the old wait authority. Exercise the production coordinator
+/// and notification retirement, then force reuse of the same physical entry.
+/// This reduces the notification boundary; it does not execute exit_group.
+#[test]
+fn retiring_holder_during_enrollment_cannot_touch_a_recycled_entry() {
+    use carrick_core::wait::coordinate_holder_release_wait;
+    use carrick_core_abi::{HolderRefusal, HolderWait, ReservationMm};
+    use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
+    use std::num::NonZeroU64;
+
+    for refusal in [
+        HolderRefusal::Editor,
+        HolderRefusal::Reservations,
+        HolderRefusal::ForkLoanPending,
+    ] {
+        let zone = zone();
+        let mm = 78;
+        let successor = mm + carrick_sched_core::spaces::ADDRESS_SPACES as u64;
+        let index = zone.spaces.publish_closed(mm, 0x7000, 0x7000).unwrap();
+        let entry = zone.space_entry(NonZeroU64::new(mm).unwrap()).unwrap();
+        let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+            let _ = effects.deliver_handbacks(&mut |_| {});
+        };
+        entry
+            .admit_notifications(
+                NonZeroU64::MIN,
+                &carrick_sched_core::BoundedSpin(0),
+                &complete,
+            )
+            .unwrap();
+        let venue = SpaceReleaseVenue {
+            zone: &zone,
+            waker: carrick_sched_core::Waker::Host,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                deliver_holder_release,
+            ),
+        };
+        let access = SpaceAccess::notified(venue);
+        access.open(index);
+        let mut editor = (refusal == HolderRefusal::Editor)
+            .then(|| access.try_begin_edit(index, mm, NonZeroU64::MIN).unwrap());
+        let wait = {
+            let source = entry.live_notifications().unwrap();
+            HolderWait::new(
+                ReservationMm::new(mm).unwrap(),
+                refusal,
+                source.observe(refusal.cause()).revision(),
+            )
+        };
+        let mut attempts = 0;
+        let outcome: EditWaitOutcome<()> =
+            coordinate_holder_release_wait(&zone, wait, |_, _, token, still| {
+                attempts += 1;
+                drop(editor.take());
+                zone.spaces.close(index);
+                access.retire_entry(index).unwrap();
+                assert!(!still(), "retirement invalidates the enrollment probe");
+                assert_eq!(
+                    zone.spaces.key(index),
+                    mm,
+                    "the coordinator retains its source"
+                );
+                Err((
+                    carrick_sched_core::object_wait::ObjectWaitError::Changed,
+                    token,
+                ))
+            });
+        assert_eq!(attempts, 1);
+        assert_eq!(outcome, EditWaitOutcome::NoConflict);
+        assert!(zone.spaces.find(mm).is_none());
+
+        let recycled = zone
+            .spaces
+            .publish_closed(successor, 0x9000, 0x9000)
+            .unwrap();
+        assert_eq!(recycled, index, "exercise reuse, not another table entry");
+        let next = zone
+            .space_entry(NonZeroU64::new(successor).unwrap())
+            .unwrap();
+        next.admit_notifications(
+            NonZeroU64::new(2).unwrap(),
+            &carrick_sched_core::BoundedSpin(0),
+            &complete,
+        )
+        .unwrap();
+        let next_source = next.live_notifications().unwrap();
+        let before = next_source.observe(refusal.cause());
+        let gate = zone.spaces.gate(recycled);
+        assert_ne!(gate, 0, "the successor remains closed");
+        assert!(matches!(
+            access.try_exclude_editor(index, mm),
+            Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Stale)
+        ));
+        assert_eq!(zone.spaces.gate(recycled), gate);
+        let stale: EditWaitOutcome<()> =
+            coordinate_holder_release_wait(&zone, wait, |_, _, _, _| {
+                panic!("a retired holder cannot enroll on its successor")
+            });
+        assert_eq!(stale, EditWaitOutcome::NoConflict);
+        assert_eq!(zone.spaces.key(recycled), successor);
+        assert_eq!(zone.spaces.gate(recycled), gate);
+        assert_eq!(next_source.observe(refusal.cause()), before);
+        assert_eq!(
+            zone.object_queue_census(next_source.key(refusal.cause()).index())
+                .unwrap()
+                .waiters,
+            0
+        );
+        // The drain's successful exclusion retains the same source custody:
+        // retirement cannot recycle its index before its final gate release.
+        let exclusion = access.try_exclude_editor(recycled, successor).unwrap();
+        drop(next_source);
+        access.retire_entry(recycled).unwrap();
+        assert_eq!(zone.spaces.key(recycled), successor);
+        drop(exclusion);
+        assert!(zone.spaces.find(successor).is_none());
+        let third = successor + carrick_sched_core::spaces::ADDRESS_SPACES as u64;
+        assert_eq!(
+            zone.spaces.publish_closed(third, 0xb000, 0xb000).unwrap(),
+            recycled
+        );
+        assert_eq!(zone.spaces.gate(recycled), gate);
+    }
+}
+
 /// #1482 P0-1, Busy once, then success, on the ring's production entry: a
 /// full owed-return table's waiter enrols on the busy holder's exact
 /// `Editor` release (never its own MM's queue), probes the holder's editor

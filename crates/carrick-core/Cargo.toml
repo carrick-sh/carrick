@@ -23,6 +23,7 @@ carrick-sched-core = { path = "../carrick-sched-core" }
 zerocopy.workspace = true
 
 [dev-dependencies]
+carrick-hal = { path = "../carrick-hal" }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 parking_lot.workspace = true
