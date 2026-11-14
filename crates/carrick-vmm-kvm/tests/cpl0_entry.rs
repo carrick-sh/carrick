@@ -4366,6 +4366,21 @@ fn production_idle_peer_thread_first_touch_parks_on_a_held_editor() {
     );
 }
 
+/// #2295: another vCPU's host exclusion raises the gate of the address
+/// space a switched-in record is about to install. The install is refused
+/// once, "not now": the record keeps its owned futex result, and runs once
+/// the holder lowers the gate. It is never a carrier fault at
+/// `native_execution::schedule`.
+#[test]
+fn production_install_refused_by_a_raised_gate_busy_once_then_success() {
+    bounded_instrumented_fixture_witness(
+        "production_install_refused_by_a_raised_gate_busy_once_then_success",
+        "native_install_gate_once.S",
+        "91 a failed check, 92 a lost or wrong futex result, 93 an install \
+         not refused exactly once",
+    );
+}
+
 #[test]
 fn production_two_threads_of_forked_mm_fault_cow_concurrently() {
     let elf = kvm_pool_fixture::assemble_fixture("native_concurrent_cow_faults.S", &[]);
