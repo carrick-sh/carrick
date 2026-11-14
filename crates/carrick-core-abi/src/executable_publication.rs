@@ -103,7 +103,7 @@ mod tests {
             },
         )
         .unwrap();
-        let grant = pool.claim(7).unwrap();
+        let grant = pool.claim(7, 0).unwrap();
         assert!(pool.authenticates_claimed(&grant));
         let slot = PortalExecutableSlot::new();
         let request = PortalExecutablePublication {
@@ -163,7 +163,7 @@ mod layout_manifest {
                 size_of::<PortalExecutablePublication>(),
                 align_of::<PortalExecutablePublication>()
             ),
-            (80, 8)
+            (104, 8)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |PortalExecutablePublication {
@@ -171,9 +171,9 @@ mod layout_manifest {
                      ipa: _,
                      len: _,
                  }: PortalExecutablePublication| {};
-        field!(PortalExecutablePublication, grant, CowGrant, 0, 64, 8);
-        field!(PortalExecutablePublication, ipa, u64, 64, 8, 8);
-        field!(PortalExecutablePublication, len, u64, 72, 8, 8);
+        field!(PortalExecutablePublication, grant, CowGrant, 0, 88, 8);
+        field!(PortalExecutablePublication, ipa, u64, 88, 8, 8);
+        field!(PortalExecutablePublication, len, u64, 96, 8, 8);
     }
 
     #[test]
@@ -183,7 +183,7 @@ mod layout_manifest {
                 size_of::<PortalExecutableSlot>(),
                 align_of::<PortalExecutableSlot>()
             ),
-            (88, 8)
+            (112, 8)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |PortalExecutableSlot {
@@ -196,7 +196,7 @@ mod layout_manifest {
             request,
             UnsafeCell<Option<PortalExecutablePublication>>,
             8,
-            80,
+            104,
             8
         );
     }

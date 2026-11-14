@@ -241,7 +241,7 @@ mod layout_manifest {
     fn mm_portal_slots() {
         assert_eq!(
             (size_of::<MmPortalSlots>(), align_of::<MmPortalSlots>()),
-            (251968, 64)
+            (258112, 64)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |MmPortalSlots {
@@ -257,14 +257,14 @@ mod layout_manifest {
             executable,
             [carrick_core_abi::PortalExecutableSlot; crate::EL1_STACK_SLOTS as usize],
             8,
-            22528,
+            28672,
             8
         );
         field!(
             MmPortalSlots,
             forks,
             [crate::PortalForkSlot; crate::EL1_STACK_SLOTS as usize],
-            22592,
+            28736,
             49152,
             64
         );
@@ -272,7 +272,7 @@ mod layout_manifest {
             MmPortalSlots,
             grants,
             [crate::PortalGrantSlot; crate::EL1_STACK_SLOTS as usize],
-            71744,
+            77888,
             131072,
             64
         );
@@ -280,7 +280,7 @@ mod layout_manifest {
             MmPortalSlots,
             slots,
             [PortalTransferSlot; crate::EL1_STACK_SLOTS as usize],
-            202816,
+            208960,
             49152,
             64
         );
