@@ -159,6 +159,24 @@ sibling consume SIGTERM while the exec service is cancelled; it records `R\n`
 if the old image resumes. On the same head, `2273-red-b8` exited 197, the
 negation of saved syscall number 59, rather than being reaped as signaled.
 
+The native Linux oracle (`native_exec_signal_oracle.c`) installs a seccomp
+user-notification listener that holds the real `execve` syscall in the kernel.
+With caught SIGUSR1 then default-fatal SIGTERM, Linux reports a SIGTERM wait
+status and zero old-image bytes. With a real sibling receiving SIGTERM while
+the caller's `execve` is held, Linux again reports SIGTERM and zero old-image
+bytes. The KVM sibling reduction uses `rt_sigtimedwait` to consume the first
+SIGTERM after cancellation was selected, exposing the otherwise unreachable
+`NoPending` handback. Its pre-fix exit 197 proves the signal had been removed
+before the old image resumed. The green check requires no old-image marker and
+the Linux SIGTERM wait status; the sibling's `S\n` marker proves it ran before
+the parked exec. One fatal-signal choice is retained through the service ACK;
+completion uses the existing group-exit path, with no extra wait or poll.
+The focused KVM run `2273-green-final` passed all eight child-exec rows with
+the native oracle enabled. The Linux oracle reported
+`signaled=1 signal=15 old_image_bytes=0` for both the one-thread and two-thread
+seccomp-held `execve` cases. The sender and target were pinned to one allowed
+CPU so the two signal publications occurred before the target ran.
+
 ## Stack adoption
 
 The staged successor imports a PRIVATE|GROWSDOWN stack before admission,
