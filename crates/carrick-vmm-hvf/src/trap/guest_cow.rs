@@ -58,6 +58,7 @@ pub(crate) fn provision_guest_cow_grants(
     custody: &std::sync::Arc<CarrierVmCustody>,
     pool: &CowGrantPool,
     count: usize,
+    split_tables: usize,
 ) -> Result<usize, TrapError> {
     let runtime =
         state.cow_runtime.read().clone().ok_or_else(|| {
@@ -104,10 +105,34 @@ pub(crate) fn provision_guest_cow_grants(
             owner_rollback,
         )?;
         let backing = grant.backing()?;
-        if pool.publish(mm.get(), new_physical_ipa, backing).is_none() {
+        // An armed block's first write links these tables when its repoint
+        // splits the block (#2276); settlement takes back the rest.
+        let tables = if split_tables == 0 {
+            carrick_el1_abi::CowSplitTables::NONE
+        } else {
+            let reserved = state
+                .page_tables_authority()
+                .reserve_cow_split_tables(split_tables)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("reserve guest COW split tables: {error:?}"))
+                })?;
+            carrick_el1_abi::CowSplitTables::new(reserved.as_slice()).ok_or_else(|| {
+                TrapError::Hypervisor("guest COW split tables exceed one grant".to_owned())
+            })?
+        };
+        if pool
+            .publish_with_tables(mm.get(), new_physical_ipa, backing, tables)
+            .is_none()
+        {
             // Dropping the armed grant rolls back the kernel mapping, the
             // inventory extent and the new owner.
             drop(grant);
+            state
+                .page_tables_authority()
+                .release_cow_split_tables(tables.as_slice())
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("release guest COW split tables: {error:?}"))
+                })?;
             break;
         }
         // Published: the grant is now one of the MM's inventory extents.
@@ -161,35 +186,54 @@ pub(crate) fn refill_guest_cow_pool(
     else {
         return Ok(false);
     };
-    let armed = tables
-        .with_manager(|manager| {
-            let (level, leaf) =
-                carrick_mmu_core::aarch64::terminal_entry(manager.debug_walk(fault_va));
-            carrick_mmu_core::aarch64::descriptor_txn::guest_cow::is_guest_cow_write_leaf(
-                level, leaf,
-            )
-        })
-        .unwrap_or(false);
-    if !armed || pool.ready(mm).next().is_some() || !published(mm) {
+    let Some(split_tables) = guest_cow_fault_split(state, fault_va) else {
+        return Ok(false);
+    };
+    if pool.ready(mm).any(|grant| grant.serves(split_tables)) || !published(mm) {
         return Ok(false);
     }
-    let batch = state
-        .guest_cow_batch
-        .load(std::sync::atomic::Ordering::Relaxed);
+    // An armed block's first write needs exactly one grant carrying its
+    // split tables; pages refill the MM's elastic batch.
+    let batch = if split_tables == 0 {
+        state
+            .guest_cow_batch
+            .load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        1
+    };
     // A grant that cannot be made (no frame, a full kernel reservation)
     // leaves this fault to the host COW path; grants already published stay.
-    let provisioned = match provision_guest_cow_grants(state, custody, pool, batch) {
+    let provisioned = match provision_guest_cow_grants(state, custody, pool, batch, split_tables) {
         Ok(provisioned) => provisioned,
         Err(error) => {
             tracing::debug!(target: "carrick::guest_cow", %error, "guest COW refill failed");
             0
         }
     };
-    state.guest_cow_batch.store(
-        next_guest_cow_batch(batch),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    if split_tables == 0 {
+        state.guest_cow_batch.store(
+            next_guest_cow_batch(batch),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     Ok(provisioned > 0)
+}
+
+/// Tables the first EL1 COW write at `fault_va` must link, when the live
+/// terminal there is an EL1-private, COW-armed, Linux-writable page or
+/// block; `None` when the fault is not EL1's guest COW (#2276).
+pub(crate) fn guest_cow_fault_split(state: &MmAccessState, fault_va: u64) -> Option<usize> {
+    use carrick_mmu_core::aarch64::descriptor_txn::guest_cow::{
+        is_guest_cow_write_leaf, split_tables_for_level,
+    };
+    state
+        .page_tables_authority()
+        .with_manager(|manager| {
+            let (level, leaf) =
+                carrick_mmu_core::aarch64::terminal_entry(manager.debug_walk(fault_va));
+            is_guest_cow_write_leaf(level, leaf).then(|| split_tables_for_level(level))
+        })
+        .flatten()
 }
 
 impl CarrierVmCustody {
@@ -313,10 +357,11 @@ pub(crate) fn settle_guest_cow_completions(
             "an EL1 COW grant is still claimed while its MM's editor is excluded"
         );
     }
-    let completions: Vec<CowGrantCompletion> = pool.completions(excluded).collect();
+    let mut completions: Vec<CowGrantCompletion> = pool.completions(excluded).collect();
     if completions.is_empty() {
         return 0;
     }
+    carrick_el1_abi::order_cow_settlement(&mut completions);
     let runtime = state.cow_runtime.read().clone().unwrap_or_else(|| {
         carrick_fatal!(
             "hvpatch::guest_cow",
@@ -331,8 +376,9 @@ pub(crate) fn settle_guest_cow_completions(
             runtime.identity.mm
         );
     }
-    for completion in &completions {
-        settle_one(state, custody, &runtime, completion).unwrap_or_else(|error| {
+    for (index, completion) in completions.iter().enumerate() {
+        let later = &completions[index + 1..];
+        settle_one(state, custody, &runtime, completion, later).unwrap_or_else(|error| {
             carrick_fatal!(
                 "hvpatch::guest_cow",
                 "settle EL1 COW of span 0x{:x}+0x{:x} (grant 0x{:x}): {error}",
@@ -352,11 +398,15 @@ pub(crate) fn settle_guest_cow_completions(
     completions.len()
 }
 
+/// Settle one completion. `later` are the completions of the same batch that
+/// settle after it ([`carrick_el1_abi::order_cow_settlement`]): one may have
+/// moved this completion's pages on again, or still need its old compound.
 pub(crate) fn settle_one(
     state: &MmAccessState,
     custody: &std::sync::Arc<CarrierVmCustody>,
     runtime: &MmCowRuntimeBinding,
     completion: &CowGrantCompletion,
+    later: &[CowGrantCompletion],
 ) -> Result<(), TrapError> {
     const PAGE: u64 = 0x1000;
     let refuse = |what: &str| Err(TrapError::Hypervisor(what.to_owned()));
@@ -393,13 +443,15 @@ pub(crate) fn settle_one(
             })
             .ok_or_else(|| TrapError::Hypervisor("grant owner is not live".to_owned()))?;
 
-    // EL1's repoint is what the live graph holds for every page of the span.
+    // EL1's repoint is what the live graph holds for every page of the span,
+    // unless a later completion of this batch moved the page on again.
     let tables = state.page_tables_authority();
     tables
         .with_manager(|manager| {
             (0..completion.span_len / PAGE).all(|index| {
-                manager.translate_retained_output(completion.span_va + index * PAGE)
-                    == Some(completion.new_ipa + index * PAGE)
+                let va = completion.span_va + index * PAGE;
+                manager.translate_retained_output(va)
+                    == Some(carrick_el1_abi::cow_settled_output(completion, later, va))
             })
         })
         .filter(|live| *live)
@@ -492,17 +544,18 @@ pub(crate) fn settle_one(
         runtime.container_root,
         old_physical_ipa,
     );
-    let retain_old_compound = tables
-        .with_manager(|manager| {
-            cow_source_has_retained_projection(
-                span,
-                old_ipa,
-                old_physical_ipa,
-                &retention_aliases,
-                |va| manager.translate_retained_output(va),
-            )
-        })
-        .ok_or_else(|| TrapError::Hypervisor("page tables are absent".to_owned()))?;
+    let retain_old_compound = carrick_el1_abi::cow_old_compound_still_named(completion, later)
+        || tables
+            .with_manager(|manager| {
+                cow_source_has_retained_projection(
+                    span,
+                    old_ipa,
+                    old_physical_ipa,
+                    &retention_aliases,
+                    |va| manager.translate_retained_output(va),
+                )
+            })
+            .ok_or_else(|| TrapError::Hypervisor("page tables are absent".to_owned()))?;
     let CowInventorySplitShape {
         old_key,
         old,
@@ -614,6 +667,11 @@ pub(crate) fn settle_one(
     }
     state.supersede_cow_receipts(span.va, span.len as u64);
     state.cow_armed.lock().disarm(span);
+    // The repoint's linked split tables are now live tables of this image;
+    // the rest of the grant's reservation returns to its allocator.
+    tables
+        .release_cow_split_tables(completion.unused_tables())
+        .map_err(|error| TrapError::Hypervisor(format!("release split tables: {error:?}")))?;
     Ok(())
 }
 

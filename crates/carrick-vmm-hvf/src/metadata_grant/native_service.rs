@@ -603,28 +603,30 @@ impl NativeService {
         }
         let root = stock.owner.child_root(handle.mm()).ok_or_else(|| stale())?;
         let inventory = stock.inventory().ok_or_else(|| stale())?;
-        let physical = stock
-            .owner
-            .child_physical_mut(handle.mm(), root)
-            .ok_or_else(|| stale())?;
+        settle_native_cow_grants(&custody, &mut stock, handle, root, pool, exclusion.proof())?;
+        // A first write into an armed block needs one grant carrying its split
+        // tables (#2276); a page write refills table-less grants.
+        let split_tables = native_cow_fault_split(&custody, root, window.fault_page).unwrap_or(0);
+        let refill = if pool
+            .ready(handle.mm().raw())
+            .any(|grant| grant.serves(split_tables))
+        {
+            0
+        } else if split_tables == 0 {
+            carrick_hal::physical_grants::NativePhysicalGrants::<
+                crate::fork_stock::NativeFrameBacking,
+            >::REFILL_GRANTS
+        } else {
+            1
+        };
         let owner = carrick_hal::GuestFrameOwner {
             native_mm: carrick_guest_arch::MmGeneration::new(
                 core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(|| stale())?,
             ),
             root_generation: carrick_guest_arch::ContextGeneration::new(handle.incarnation()),
         };
-        let grants = physical
-            .supplied
-            .get_or_insert_with(|| carrick_hal::physical_grants::NativePhysicalGrants::new(owner));
-        if grants.owner() != owner || grants.failed() || physical.rollback.failed() {
-            return Err(stale());
-        }
-        grants.settle(pool, exclusion.proof())?;
-        if pool.ready(handle.mm().raw()).next().is_none() {
-            for _ in 0..carrick_hal::physical_grants::NativePhysicalGrants::<
-                crate::fork_stock::NativeFrameBacking,
-            >::REFILL_GRANTS
-            {
+        {
+            for _ in 0..refill {
                 let (_, ipa, generation) = crate::trap::allocate_grant_compound(
                     &custody,
                     crate::trap::hvf_mem_perms(carrick_hal::physical_grants::COW_GRANT_PERMISSIONS),
@@ -640,7 +642,31 @@ impl NativeService {
                     .native_frame_backings
                     .lock()
                     .insert((ipa, generation), Arc::downgrade(&retained));
-                let staged =
+                let tables = if split_tables == 0 {
+                    carrick_el1_abi::CowSplitTables::NONE
+                } else {
+                    stock
+                        .owner
+                        .reserve_native_cow_split_tables(
+                            &mut crate::fork_stock::fork_table_accounting(&custody),
+                            handle,
+                            root,
+                            ipa,
+                            split_tables,
+                        )
+                        .map_err(|_| stale())?
+                };
+                let physical = stock
+                    .owner
+                    .child_physical_mut(handle.mm(), root)
+                    .ok_or_else(|| stale())?;
+                let grants = physical.supplied.get_or_insert_with(|| {
+                    carrick_hal::physical_grants::NativePhysicalGrants::new(owner)
+                });
+                if grants.owner() != owner || grants.failed() || physical.rollback.failed() {
+                    return Err(stale());
+                }
+                let published =
                     carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
                         Arc::clone(&physical.rollback),
                         Arc::clone(&inventory),
@@ -649,11 +675,33 @@ impl NativeService {
                         carrick_el1_abi::COW_GRANT_SIZE,
                         owner,
                         carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
-                    )?;
-                grants.publish_cow(staged.with_backing(retained), pool, exclusion.proof())?;
+                    )
+                    .and_then(|staged| {
+                        grants.publish_cow(
+                            staged.with_backing(retained),
+                            pool,
+                            exclusion.proof(),
+                            tables,
+                        )
+                    });
+                if let Err(error) = published {
+                    if !tables.is_empty() {
+                        stock
+                            .owner
+                            .cancel_native_cow_split_tables(
+                                &mut crate::fork_stock::fork_table_accounting(&custody),
+                                handle,
+                                ipa,
+                            )
+                            .map_err(|_| stale())?;
+                    }
+                    return Err(error);
+                }
             }
         }
-        let supplied = pool.ready(window.operation.mm.raw()).next().is_some();
+        let supplied = pool
+            .ready(window.operation.mm.raw())
+            .any(|grant| grant.serves(split_tables));
         drop(stock);
         drop(exclusion);
         drop(source);
@@ -1635,18 +1683,72 @@ pub(crate) fn settle_native_cow(
     let Some(root) = stock.owner.child_root(mm) else {
         return Ok(None);
     };
+    let owner = stock.owner.child_owner(mm).ok_or_else(|| stale())?;
+    settle_native_cow_grants(custody, &mut stock, owner, root, pool, excluded).map(Some)
+}
+
+/// Settle one live child's USED grants under its exclusion, then the split
+/// tables their repoints linked (#2276): the linked prefix joins the child's
+/// table custody and the rest returns to fork stock.
+fn settle_native_cow_grants(
+    custody: &crate::trap::CarrierVmCustody,
+    stock: &mut crate::fork_stock::ForkStockHostCustody,
+    owner: carrick_el1_abi::El1MmHandle,
+    root: carrick_guest_arch::RootGpa,
+    pool: &carrick_el1_abi::CowGrantPool,
+    excluded: &carrick_sched_core::ExcludedEditor<'_>,
+) -> Result<usize, TrapError> {
     let physical = stock
         .owner
-        .child_physical_mut(mm, root)
+        .child_physical_mut(owner.mm(), root)
         .ok_or_else(|| stale())?;
     let Some(grants) = &mut physical.supplied else {
-        return if pool.has_completions_for(mm.raw()) {
+        return if pool.has_completions_for(owner.mm().raw()) {
             Err(stale())
         } else {
-            Ok(Some(0))
+            Ok(0)
         };
     };
-    grants.settle(pool, excluded).map(Some)
+    let settled = grants.settle(pool, excluded)?;
+    for completion in &settled {
+        stock
+            .owner
+            .settle_native_cow_split_tables(
+                &mut crate::fork_stock::fork_table_accounting(custody),
+                owner,
+                completion,
+            )
+            .map_err(|_| stale())?;
+    }
+    Ok(settled.len())
+}
+
+/// Tables the first EL1 COW write at `va` in a live child must link: the
+/// live terminal is an EL1-private, COW-armed, Linux-writable page or block.
+fn native_cow_fault_split(
+    custody: &crate::trap::CarrierVmCustody,
+    root: carrick_guest_arch::RootGpa,
+    va: u64,
+) -> Option<usize> {
+    use carrick_mmu_core::aarch64::descriptor_txn::guest_cow::{
+        is_guest_cow_write_leaf, split_tables_for_level,
+    };
+    let mut table = root.address().raw();
+    for (level, shift) in [39u64, 30, 21, 12].into_iter().enumerate() {
+        let pointer = crate::fork_stock::ForkStockHostCustody::physical_ptr::<AtomicU64>(
+            custody,
+            carrick_guest_arch::FrameGpa::new(table + ((va >> shift) & 511) * 8),
+        )
+        .ok()?;
+        // SAFETY: retained stock tables and exact owner exclusion, atomic word.
+        let descriptor = unsafe { &*pointer }.load(Ordering::Acquire);
+        if level == 3 || descriptor & 3 != 3 {
+            return is_guest_cow_write_leaf(level, descriptor)
+                .then(|| split_tables_for_level(level));
+        }
+        table = descriptor & 0x0000_ffff_ffff_f000;
+    }
+    None
 }
 
 /// Consume the exact reply-slot receipt while the native child still owns its

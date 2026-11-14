@@ -12798,7 +12798,7 @@ mod guest_cow {
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
 
         assert_eq!(
-            provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap(),
+            provision_guest_cow_grants(&child.state, &custody, pool, 1, 0).unwrap(),
             1
         );
         let grant = pool.ready(mm).next().expect("published grant");
@@ -12923,7 +12923,7 @@ mod guest_cow {
         let (mut child, pool) = forked_guest_child(746, 0x9a01_3300_0000, 0x9b01_3300_0000);
         let mm = child.snapshot.mm.get();
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
-        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        provision_guest_cow_grants(&child.state, &custody, pool, 1, 0).unwrap();
         let grant = pool.ready(mm).next().unwrap();
         child
             .owners
@@ -12966,7 +12966,7 @@ mod guest_cow {
             authority.old_frame_mappings = mappings;
             child.state.cow_runtime.write().as_mut().unwrap().authority = Arc::new(authority);
             let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
-            provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+            provision_guest_cow_grants(&child.state, &custody, pool, 1, 0).unwrap();
             let grant = pool.ready(child.snapshot.mm.get()).next().unwrap();
             child
                 .owners
@@ -13229,7 +13229,7 @@ mod guest_cow {
             forked_guest_child_with(751, 0x9a01_3700_0000, 0x9b01_3700_0000, true);
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
         let mm = child.snapshot.mm.get();
-        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        provision_guest_cow_grants(&child.state, &custody, pool, 1, 0).unwrap();
         let grant = pool.ready(mm).next().unwrap();
         child
             .owners
@@ -13244,7 +13244,7 @@ mod guest_cow {
         let excluded = spaces.unpublished(mm).unwrap();
         let completion = pool.completions(&excluded).next().unwrap();
         let runtime = child.state.cow_runtime.read().clone().unwrap();
-        crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion)
+        crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion, &[])
             .expect("settlement derives the source's write intent from the leaf");
         assert!(child.state.cow_armed.lock().span_for(TEST_VA).is_none());
         let replacement = alias_registry()
@@ -13280,7 +13280,7 @@ mod guest_cow {
         }
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
         let mm = child.snapshot.mm.get();
-        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        provision_guest_cow_grants(&child.state, &custody, pool, 1, 0).unwrap();
         let grant = pool.ready(mm).next().unwrap();
         child
             .owners
@@ -13300,7 +13300,7 @@ mod guest_cow {
         let mut wrong_mm = completion;
         wrong_mm.grant.mm_key += 1;
         assert!(
-            crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &wrong_mm)
+            crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &wrong_mm, &[])
                 .is_err()
         );
         let mut wrong_output = completion;
@@ -13309,20 +13309,26 @@ mod guest_cow {
         wrong_output.new_ipa += 4096;
         assert!(wrong_output.is_well_formed());
         assert!(
-            crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &wrong_output)
-                .is_err()
+            crate::trap::guest_cow::settle_one(
+                &child.state,
+                &custody,
+                &runtime,
+                &wrong_output,
+                &[]
+            )
+            .is_err()
         );
         let word = leaf_word(root, TEST_VA);
         // SAFETY: the fixture owns the live table storage under its lock.
         unsafe { word.write_volatile(leaves[0] & !PRIVATE) };
         assert!(
-            crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion)
+            crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion, &[])
                 .is_err(),
             "a leaf outside private owner authority is not a physical handoff"
         );
         // SAFETY: restore the fixture's completed EL1 descriptor.
         unsafe { word.write_volatile(leaves[0]) };
-        crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion)
+        crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion, &[])
             .expect("owner COW completion needs no host semantic arm map");
         let replacement = alias_registry()
             .lock()
@@ -13362,7 +13368,7 @@ mod guest_cow {
         child.state.cow_armed.lock().restore(Vec::new());
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
         let mm = child.snapshot.mm.get();
-        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        provision_guest_cow_grants(&child.state, &custody, pool, 1, 0).unwrap();
         let grant = pool.ready(mm).next().unwrap();
         child
             .owners
@@ -13407,7 +13413,7 @@ mod guest_cow {
         let excluded = spaces.unpublished(mm).unwrap();
         let completion = pool.completions(&excluded).next().unwrap();
         let runtime = child.state.cow_runtime.read().clone().unwrap();
-        crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion)
+        crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion, &[])
             .expect("physical settlement preserves later owner edits");
         let alias = alias_registry()
             .lock()
@@ -13443,6 +13449,86 @@ mod guest_cow {
     fn settlement_preserves_later_owner_fork_arm() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         settle_after_owner_edit(812, 0x9a01_3a00_0000, 0x9b01_3a00_0000, true);
+    }
+
+    /// #1801, the Go telemetry sidecar's stop ("settle EL1 COW of span ...:
+    /// live leaves do not name the grant"): fork, COW, fork again, COW the
+    /// same granule again, all before a host exclusion settles anything. The
+    /// production settlement owner must order the two moves and validate the
+    /// first through the second, in one batch, whatever their slot order.
+    #[test]
+    fn a_repeated_cow_of_one_granule_settles_in_one_batch() {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants, TerminalEdit,
+            execute_descriptor_op,
+        };
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external = ExternalAliasStateRestore::capture();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (mut child, pool) = forked_guest_child(813, 0x9a01_3b00_0000, 0x9b01_3b00_0000);
+        child.state.cow_armed.lock().restore(Vec::new());
+        let root = child.owners.0[0].0;
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let mm = child.snapshot.mm.get();
+        provision_guest_cow_grants(&child.state, &custody, pool, 2, 0).unwrap();
+        for grant in pool.ready(mm).collect::<Vec<_>>() {
+            child
+                .owners
+                .0
+                .push((grant.physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+        }
+        let GuestCowOutcome::Resolved(first) = el1_write_fault(&child, pool, TEST_VA + 8) else {
+            panic!("first COW resolves in EL1")
+        };
+        // A later fork re-arms the granule, now on the first replacement.
+        let words = unsafe {
+            PrimaryTableWords::new(
+                model_owner_host(root).cast(),
+                root,
+                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                &Maintenance,
+            )
+        }
+        .unwrap();
+        assert!(matches!(
+            execute_descriptor_op(
+                &words,
+                SubstrateGpa(root),
+                DescriptorOp::Terminal {
+                    span: PageSpan::new(TEST_VA, CowArmedRanges::COMPOUND_SIZE),
+                    edit: TerminalEdit::fork_arm(false, false, false, true, 0, 0),
+                },
+                &TableGrants::NONE,
+                &mut InlineJournal::new(),
+            ),
+            DescriptorOutcome::Applied(_)
+        ));
+        let GuestCowOutcome::Resolved(second) = el1_write_fault(&child, pool, TEST_VA + 8) else {
+            panic!("the repeated COW resolves in EL1")
+        };
+        assert_eq!(second.old_ipa, first.new_ipa);
+        let spaces = AddressSpaces::new();
+        let excluded = spaces.unpublished(mm).unwrap();
+        assert_eq!(pool.completions(&excluded).count(), 2);
+        assert_eq!(
+            crate::trap::guest_cow::settle_guest_cow_completions(
+                &child.state,
+                &custody,
+                pool,
+                &excluded
+            ),
+            2
+        );
+        assert_eq!(pool.completions(&excluded).count(), 0);
+        let alias = alias_registry()
+            .lock()
+            .newest_matching_for_process(
+                Some(old_key_root(&child)),
+                ContainerRootToken::ROOT,
+                |alias| alias.start == TEST_VA,
+            )
+            .expect("settled physical alias");
+        assert_eq!(alias.physical_ipa, second.grant.physical_ipa);
     }
 
     /// The initial process carves its sparse mmap arena and apertures with
@@ -13656,8 +13742,14 @@ mod guest_cow {
             .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Host);
         let before = format!("{:?}", *child.state.frame_inventory.ledger.lock());
         assert!(
-            provision_guest_cow_grants(&child.state, legacy_test_carrier_vm_custody_arc(), pool, 4)
-                .is_err()
+            provision_guest_cow_grants(
+                &child.state,
+                legacy_test_carrier_vm_custody_arc(),
+                pool,
+                4,
+                0
+            )
+            .is_err()
         );
         assert_eq!(pool.ready(child.snapshot.mm.get()).count(), 0);
         assert_eq!(
@@ -14262,7 +14354,7 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
     .unwrap();
 
     let pool = carrick_el1_abi::CowGrantPool::new();
-    assert!(context.refill_transfer_cow_in(&pool).unwrap());
+    assert!(context.refill_transfer_cow_in(&pool, None).unwrap());
     let grants = pool.ready(mm.raw()).collect::<Vec<_>>();
     assert_eq!(grants.len(), 1);
     assert!(pool.ready(mm.raw() + 1).next().is_none());
@@ -14285,7 +14377,7 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
         extent.stage2_owner.generation,
         grant.backing.owner_generation.get()
     );
-    assert!(context.refill_transfer_cow_in(&pool).unwrap());
+    assert!(context.refill_transfer_cow_in(&pool, None).unwrap());
     assert_eq!(
         pool.ready(mm.raw()).collect::<Vec<_>>(),
         grants,

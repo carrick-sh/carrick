@@ -1105,6 +1105,12 @@ struct PendingNativeDescriptorTables {
     txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
 }
 
+#[derive(Debug)]
+struct PendingNativeCowTables {
+    mm: ReservationMm,
+    pages: Vec<RootGpa>,
+}
+
 impl NativeDescriptorTableReservation {
     /// The descriptor executor's bounded table-grant record.
     pub fn descriptor_tables(&self) -> carrick_mmu_core::aarch64::descriptor_txn::TableGrants {
@@ -1150,6 +1156,9 @@ pub struct ForkStock<T: ChildAddressTags, C = ()> {
     /// Submitted native backing transactions awaiting their exact EL1 receipt.
     /// Unused grants are not terminal child custody and return to stock here.
     pending_descriptor_tables: BTreeMap<(MmKey, u64), PendingNativeDescriptorTables>,
+    /// Split tables published with one live child's COW grant (keyed by the
+    /// grant's IPA) until settlement learns how many its repoint linked.
+    pending_cow_tables: BTreeMap<(MmKey, u64), PendingNativeCowTables>,
     /// Quarantined children; `true` once their carrier release succeeded,
     /// so a later reclaim never releases the same MM twice.
     quarantine: BTreeMap<MmKey, QuarantinedChild>,
@@ -1176,6 +1185,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             exec_predecessors: BTreeMap::new(),
             committed_tables: BTreeMap::new(),
             pending_descriptor_tables: BTreeMap::new(),
+            pending_cow_tables: BTreeMap::new(),
             quarantine: BTreeMap::new(),
             last_refusal: None,
             tags,
@@ -1233,6 +1243,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             || !self.exec_predecessors.is_empty()
             || !self.committed_tables.is_empty()
             || !self.pending_descriptor_tables.is_empty()
+            || !self.pending_cow_tables.is_empty()
             || self.pending.iter().any(Option::is_some)
         {
             return Err(ForkStockServiceError::InvalidRecord);
@@ -1476,6 +1487,104 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         Ok(())
     }
 
+    /// Reserve the split tables one live child's COW grant at `grant_ipa`
+    /// carries for the first write into an armed block (#2276). They stay
+    /// pending on that grant until [`Self::settle_native_cow_split_tables`]
+    /// (or [`Self::cancel_native_cow_split_tables`] when the grant was never
+    /// published); a retiring child absorbs them as possibly linked.
+    pub fn reserve_native_cow_split_tables(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+        grant_ipa: u64,
+        count: usize,
+    ) -> Result<carrick_el1_abi::CowSplitTables, ForkStockServiceError> {
+        let reservation = self.reserve_native_descriptor_tables(ledger, owner, root, count)?;
+        let pending_key = (reservation.key, grant_ipa);
+        let raw: Vec<u64> = reservation
+            .pages
+            .iter()
+            .map(|page| page.address().raw())
+            .collect();
+        let Some(tables) = carrick_el1_abi::CowSplitTables::new(&raw)
+            .filter(|_| !self.pending_cow_tables.contains_key(&pending_key))
+        else {
+            self.cancel_native_descriptor_tables(ledger, reservation);
+            return Err(ForkStockServiceError::InvalidRecord);
+        };
+        self.pending_cow_tables.insert(
+            pending_key,
+            PendingNativeCowTables {
+                mm: reservation.mm,
+                pages: reservation.pages,
+            },
+        );
+        Ok(tables)
+    }
+
+    /// Return the split tables of a grant that was never published.
+    pub fn cancel_native_cow_split_tables(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        owner: carrick_el1_abi::El1MmHandle,
+        grant_ipa: u64,
+    ) -> Result<(), ForkStockServiceError> {
+        self.release_native_cow_split_tables(ledger, owner, grant_ipa, 0)
+    }
+
+    /// Settle a completed grant's split tables: the prefix its repoint linked
+    /// joins the child's table custody, the rest returns to stock once.
+    pub fn settle_native_cow_split_tables(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        owner: carrick_el1_abi::El1MmHandle,
+        completion: &carrick_el1_abi::CowGrantCompletion,
+    ) -> Result<(), ForkStockServiceError> {
+        if completion.grant.tables.is_empty() {
+            return Ok(());
+        }
+        self.release_native_cow_split_tables(
+            ledger,
+            owner,
+            completion.grant.physical_ipa,
+            usize::from(completion.tables_linked),
+        )
+    }
+
+    fn release_native_cow_split_tables(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        owner: carrick_el1_abi::El1MmHandle,
+        grant_ipa: u64,
+        linked: usize,
+    ) -> Result<(), ForkStockServiceError> {
+        let key = MmKey::of(owner.mm()).ok_or(ForkStockServiceError::StaleExecution)?;
+        if self.child_owner(owner.mm()) != Some(owner) {
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        let mut pending = self
+            .pending_cow_tables
+            .remove(&(key, grant_ipa))
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
+        if linked > pending.pages.len() {
+            self.pending_cow_tables.insert((key, grant_ipa), pending);
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        let unused = pending.pages.split_off(linked);
+        if !pending.pages.is_empty() {
+            self.committed_tables
+                .entry(key)
+                .or_default()
+                .extend(pending.pages);
+        }
+        for page in &unused {
+            ledger.give_back(*page, pending.mm);
+        }
+        self.tables.extend(unused);
+        Ok(())
+    }
+
     /// Authenticate one inherited prepared-page request against the live
     /// fork owner. Backends provide only generation-pinned frame storage;
     /// this owner chooses and retains the one-page publication transaction.
@@ -1666,6 +1775,18 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         let mut pending_pages = Vec::new();
         for pending_key in pending {
             if let Some(pending) = self.pending_descriptor_tables.remove(&pending_key) {
+                pending_pages.extend(pending.pages);
+            }
+        }
+        // A published COW grant's split tables may be linked too.
+        let cow: Vec<_> = self
+            .pending_cow_tables
+            .keys()
+            .filter(|(pending, _)| *pending == key)
+            .copied()
+            .collect();
+        for pending_key in cow {
+            if let Some(pending) = self.pending_cow_tables.remove(&pending_key) {
                 pending_pages.extend(pending.pages);
             }
         }
@@ -2028,6 +2149,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             || !self.children.is_empty()
             || !self.committed_tables.is_empty()
             || !self.pending_descriptor_tables.is_empty()
+            || !self.pending_cow_tables.is_empty()
             || self.pending.iter().any(Option::is_some)
         {
             return Err(ForkStockServiceError::InvalidRecord);
