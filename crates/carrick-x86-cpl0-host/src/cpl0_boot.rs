@@ -42,6 +42,15 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
+/// The three user-fault exclusion crossings exercised by real editor holds.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaultExclusionCrossing {
+    CowSupply,
+    CowSettlement,
+    PreparePlanning,
+}
+
 pub const RAM_SIZE: usize = 16 * 1024 * 1024;
 pub const META_GPA: u64 = carrick_core_abi::X86_CPL0_METADATA_GPA;
 pub const META_LEN: u64 = 0x10_0000;
@@ -3077,6 +3086,11 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     /// Fixture-held editors of a full owed-return table's holders (#1482).
     #[cfg(feature = "test-support")]
     fixture_holder_hold: Option<Arc<anonymous_owner::OwedReturnHolderHold>>,
+    #[cfg(feature = "test-support")]
+    fixture_fault_hold: Option<(
+        FaultExclusionCrossing,
+        Arc<anonymous_owner::OwedReturnHolderHold>,
+    )>,
     root_exit_crossings: u64,
     child_retire_crossings: u64,
     run_failure_crossings: u64,
@@ -4496,6 +4510,8 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             return_settlement_counters: Default::default(),
             #[cfg(feature = "test-support")]
             fixture_holder_hold: None,
+            #[cfg(feature = "test-support")]
+            fixture_fault_hold: None,
             root_exit_crossings: 0,
             child_retire_crossings: 0,
             run_failure_crossings: 0,
@@ -4523,6 +4539,20 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     ) -> anonymous_owner::OwedReturnHolderRelease<M> {
         let hold = anonymous_owner::OwedReturnHolderHold::armed();
         self.0.fixture_holder_hold = Some(Arc::clone(&hold));
+        anonymous_owner::OwedReturnHolderRelease::new(
+            hold,
+            Arc::clone(&self.0.ram),
+            self.0._vm.clone_vm(),
+        )
+    }
+    /// Reuse the owed-return fixture's exact-MM editor hold/release venue.
+    #[cfg(feature = "test-support")]
+    pub fn fixture_hold_fault_editor(
+        &mut self,
+        crossing: FaultExclusionCrossing,
+    ) -> anonymous_owner::OwedReturnHolderRelease<M> {
+        let hold = anonymous_owner::OwedReturnHolderHold::armed();
+        self.0.fixture_fault_hold = Some((crossing, Arc::clone(&hold)));
         anonymous_owner::OwedReturnHolderRelease::new(
             hold,
             Arc::clone(&self.0.ram),

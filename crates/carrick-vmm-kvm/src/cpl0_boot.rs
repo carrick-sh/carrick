@@ -369,6 +369,17 @@ impl Cpl0Carrier {
         }
     }
 
+    /// Hold the selected production fault crossing's real editor until release.
+    #[cfg(feature = "test-fixtures")]
+    pub fn fixture_hold_fault_editor(
+        &mut self,
+        crossing: carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing,
+    ) -> FixtureOwedReturnHolderHold {
+        FixtureOwedReturnHolderHold {
+            release: self.custody.fixture_hold_fault_editor(crossing),
+        }
+    }
+
     fn initial_mm_key(&self) -> u64 {
         self.custody
             .initial_task()
