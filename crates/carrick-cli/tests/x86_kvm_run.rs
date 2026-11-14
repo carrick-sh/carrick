@@ -2346,6 +2346,14 @@ fn mounted_static_x86_forked_child_stdout_matches_native_while_parent_waits() {
     compare_mounted_assembly_with_native("x86_forked_child_stdout.S", b"E");
 }
 
+/// #2276: the root's vfork(2) suspends it until its child exits, on the
+/// production x86 lane, through the shared process venue
+/// (`NativeProcessEntry::fork`). Two live processes order their stdout.
+#[test]
+fn mounted_static_x86_vfork_parent_waits_for_its_child_like_native() {
+    compare_mounted_assembly_with_native("x86_vfork_suspend.S", b"CP\n");
+}
+
 #[test]
 fn mounted_static_x86_signal_thread_identity_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_thread_identity.S", b"T\n");
