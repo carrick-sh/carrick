@@ -540,7 +540,7 @@ fn native_fork_child_exec_wakes_after_stock_holder_retires() {
     carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
     let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
     let elf = native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define]);
-    let outcome = run_exec_fixture(&elf, 256);
+    let outcome = run_exec_fixture_with_stock_pressure(&elf, &marker, 256);
     assert!(
         outcome.physical.fork_stock_counters().expect("stock census").successor_table_refusals > 0,
         "the live exec must actually park for fork stock"
@@ -562,7 +562,7 @@ fn native_fork_child_exec_killed_while_parked_is_reaped() {
         "native_fork_exec_stock.S",
         &[&define, "-DCANCEL_PARKED"],
     );
-    let outcome = run_exec_fixture(&elf, 256);
+    let outcome = run_exec_fixture_with_stock_pressure(&elf, &marker, 256);
     assert!(
         outcome.physical.fork_stock_counters().expect("stock census").successor_table_refusals > 0,
         "the killed exec must actually park for fork stock"
@@ -597,6 +597,46 @@ fn run_exec_fixture(
     )
     .map_err(|failure| failure.error)
     .expect("production CPL0 root exec")
+}
+
+fn run_exec_fixture_with_stock_pressure(
+    elf: &[u8],
+    successor: &[u8],
+    max_exits: usize,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    use carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage;
+    let program = carrick_mem::elf::ElfProgram::load(successor, 62, &|_| None)
+        .expect("successor ELF");
+    let demand = X86ExecImage::from_program(&program, vec![b"/successor".to_vec()], vec![])
+        .expect("successor demand")
+        .demand();
+    let caller = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None)
+        .expect("exec caller ELF");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let held = std::sync::Mutex::new(None);
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &caller,
+        max_exits,
+        ROOT_AFFINITY_LOADED,
+        |carrier| {
+            // Leave capacity for the two fork children and one fewer table
+            // than their exec successor needs. The first child's retirement
+            // must return its own tables to satisfy that exec.
+            let left = demand.tables + 7;
+            *held.lock().unwrap() = Some(
+                carrier.fixture_hold_fork_stock(left).expect("hold excess stock"),
+            );
+        },
+        dispatcher,
+    )
+    .map_err(|failure| failure.error)
+    .expect("stock-contended production exec");
+    drop(held);
+    outcome
 }
 
 /// #2142: root exec must replace the production CPL0 image, not return ENOSYS.
