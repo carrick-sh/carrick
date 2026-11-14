@@ -541,12 +541,23 @@ fn native_fork_child_exec_wakes_after_stock_holder_retires() {
     let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
     let elf = native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define]);
     let outcome = run_exec_fixture_with_stock_pressure(&elf, &marker, 256);
-    assert_eq!(outcome.run.exit_code, 0, "stock holder handshake must finish");
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "stock holder handshake must finish"
+    );
     assert!(
-        outcome.physical.fork_stock_counters().expect("stock census").successor_table_refusals > 0,
+        outcome
+            .physical
+            .fork_stock_counters()
+            .expect("stock census")
+            .successor_table_refusals
+            > 0,
         "the live exec must actually park for fork stock"
     );
-    assert_eq!(outcome.run.exit_code, 0, "parked exec must wake after stock return");
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "parked exec must wake after stock return"
+    );
     assert_eq!(outcome.run.stdout, b"X\n");
 }
 
@@ -559,14 +570,20 @@ fn native_fork_child_exec_killed_while_parked_is_reaped() {
     let marker = native_exit_fixture("native_exec_stock_successor.S");
     carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
     let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
-    let elf = native_exit_fixture_with_flags(
-        "native_fork_exec_stock.S",
-        &[&define, "-DCANCEL_PARKED"],
-    );
+    let elf =
+        native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define, "-DCANCEL_PARKED"]);
     let outcome = run_exec_fixture_with_stock_pressure(&elf, &marker, 256);
-    assert_eq!(outcome.run.exit_code, 0, "stock holder handshake must finish");
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "stock holder handshake must finish"
+    );
     assert!(
-        outcome.physical.fork_stock_counters().expect("stock census").successor_table_refusals > 0,
+        outcome
+            .physical
+            .fork_stock_counters()
+            .expect("stock census")
+            .successor_table_refusals
+            > 0,
         "the killed exec must actually park for fork stock"
     );
     assert_eq!(outcome.run.exit_code, 0, "wait4 must reap the parked child");
@@ -607,13 +624,12 @@ fn run_exec_fixture_with_stock_pressure(
     max_exits: usize,
 ) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     use carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage;
-    let program = carrick_mem::elf::ElfProgram::load(successor, 62, &|_| None)
-        .expect("successor ELF");
+    let program =
+        carrick_mem::elf::ElfProgram::load(successor, 62, &|_| None).expect("successor ELF");
     let demand = X86ExecImage::from_program(&program, vec![b"/successor".to_vec()], vec![])
         .expect("successor demand")
         .demand();
-    let caller = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None)
-        .expect("exec caller ELF");
+    let caller = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("exec caller ELF");
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     dispatcher.set_fs_backend(Box::new(
         carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
@@ -630,7 +646,9 @@ fn run_exec_fixture_with_stock_pressure(
             // must return its own tables to satisfy that exec.
             let left = demand.tables + 13;
             *held.lock().unwrap() = Some(
-                carrier.fixture_hold_fork_stock(left).expect("hold excess stock"),
+                carrier
+                    .fixture_hold_fork_stock(left)
+                    .expect("hold excess stock"),
             );
         },
         dispatcher,
