@@ -5500,8 +5500,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 // Linux consumes the child before copying rusage.
                                 // A bad rusage address reports EFAULT after reap,
                                 // while a status-copy refusal above retains it.
-                                self.service
-                                    .copy_signal_bytes(&mm, rusage, usage.abi_bytes())?;
+                                // The child is already consumed. Retain its
+                                // answer and output cursor in the existing
+                                // copyout owner; a syscall retry would reap twice.
+                                let result = self.finish_copyout(service::OwnedCopyout {
+                                    data: service::CopyoutData::Bytes {
+                                        address: rusage,
+                                        bytes: usage.abi_bytes().to_vec(),
+                                    },
+                                    offset: 0,
+                                    result: SyscallResult::new(i64::from(zombie.namespace_pid)),
+                                    prefix_on_fault: false,
+                                    effect: None,
+                                });
+                                drop(consumed);
+                                return Ok(self.finish_output_outcome(result));
                             }
                             i64::from(zombie.namespace_pid)
                         }

@@ -12362,7 +12362,11 @@ fn wait4_rusage_owner_wait_retains_reaped_answer_until_release() {
             observed.revision(),
         )
     };
-    SIGNAL_COPY_ERRORS.with(|errors| errors.borrow_mut().push_back(NativeProcessError::OwnerWait(wait)));
+    SIGNAL_COPY_ERRORS.with(|errors| {
+        errors
+            .borrow_mut()
+            .push_back(NativeProcessError::OwnerWait(wait))
+    });
     {
         let mut parent = fixture
             .runtime
@@ -12421,5 +12425,8 @@ fn wait4_rusage_owner_wait_retains_reaped_answer_until_release() {
     let copies = take_signal_copies();
     assert_eq!(copies.len(), 1);
     assert_eq!(copies[0].0, UserVa::new(0x2000));
-    assert_eq!(copies[0].1.len(), core::mem::size_of::<carrick_abi::LinuxRusage>());
+    assert_eq!(
+        copies[0].1.len(),
+        core::mem::size_of::<carrick_abi::LinuxRusage>()
+    );
 }
