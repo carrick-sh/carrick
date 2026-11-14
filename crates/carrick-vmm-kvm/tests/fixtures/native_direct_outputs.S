@@ -4,7 +4,7 @@
 _start:
     mov $9, %eax
     xor %edi, %edi
-    mov $8192, %esi
+    mov $32768, %esi
     mov $3, %edx
     mov $0x22, %r10d
     mov $-1, %r8
@@ -27,6 +27,89 @@ _start:
     and $0xf000, %eax
     cmp $0x4000, %eax
     jne fail
+#elif defined(DIRECT_FILES)
+    /* Each destination is a different, previously untouched anonymous page. */
+    mov $262, %eax
+    mov $-100, %rdi
+    lea file_path(%rip), %rsi
+    lea 4096(%r12), %rdx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    jne fail
+    mov 4096+24(%r12), %eax
+    and $0xf000, %eax
+    cmp $0x8000, %eax
+    jne fail
+    mov $257, %eax
+    mov $-100, %rdi
+    lea file_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js fail
+    mov %eax, %r13d
+    mov $5, %eax
+    mov %r13d, %edi
+    lea 8192(%r12), %rsi
+    syscall
+    test %rax, %rax
+    jne fail
+    mov 8192+24(%r12), %eax
+    and $0xf000, %eax
+    cmp $0x8000, %eax
+    jne fail
+    xor %eax, %eax
+    mov %r13d, %edi
+    lea 12288(%r12), %rsi
+    mov $4, %edx
+    syscall
+    cmp $4, %rax
+    jne fail
+    cmpl $0x65726964, 12288(%r12) /* "dire" */
+    jne fail
+    mov $17, %eax
+    mov %r13d, %edi
+    lea 16384(%r12), %rsi
+    mov $4, %edx
+    mov $7, %r10d
+    syscall
+    cmp $4, %rax
+    jne fail
+    cmpl $0x676e6172, 16384(%r12) /* "rang" */
+    jne fail
+    mov $257, %eax
+    mov $-100, %rdi
+    lea directory_path(%rip), %rsi
+    mov $0x10000, %edx
+    xor %r10d, %r10d
+    syscall
+    test %rax, %rax
+    js fail
+    mov %eax, %edi
+    mov $217, %eax
+    lea 20480(%r12), %rsi
+    mov $1024, %edx
+    syscall
+    test %rax, %rax
+    jle fail
+    lea 20480(%r12), %rsi
+    lea (%rsi,%rax), %rdi
+.Lentry:
+    cmp %rdi, %rsi
+    jae fail
+    movzwl 16(%rsi), %eax
+    cmp $24, %eax
+    jb fail
+    cmpl $0x61746164, 19(%rsi) /* "data" */
+    jne .Lnext
+    cmpb $0, 23(%rsi)
+    je .Lfound
+.Lnext:
+    add %rax, %rsi
+    jmp .Lentry
+.Lfound:
 #else
     /* eventfd2(1, EFD_NONBLOCK), then epoll_create1(0). */
     mov $290, %eax
@@ -76,6 +159,10 @@ done:
     ud2
 .section .rodata
 path: .asciz "/"
+#ifdef DIRECT_FILES
+file_path: .asciz FILE_PATH
+directory_path: .asciz DIR_PATH
+#endif
 event:
     .long 1
     .quad 0x123456789abcdef

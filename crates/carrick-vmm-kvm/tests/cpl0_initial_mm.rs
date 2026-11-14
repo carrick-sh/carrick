@@ -4174,9 +4174,17 @@ fn serial_host_direct_output_venues_supply_untouched_pages() {
     bounded_witness(
         "serial_host_direct_output_venues_supply_untouched_pages",
         || {
-            for flags in [&["-DSTATX_OUTPUT"][..], &[][..]] {
-                let elf = native_exit_fixture_with_flags("native_direct_outputs.S", flags);
-                let dir = tempfile::tempdir().expect("native direct output control");
+            let dir = tempfile::tempdir().expect("native direct output control");
+            let file = dir.path().join("data");
+            std::fs::write(&file, b"direct-range-outputs").expect("file output payload");
+            let file_define = format!("-DFILE_PATH=\"{}\"", file.display());
+            let dir_define = format!("-DDIR_PATH=\"{}\"", dir.path().display());
+            for flags in [
+                vec!["-DSTATX_OUTPUT"],
+                vec![],
+                vec!["-DDIRECT_FILES", &file_define, &dir_define],
+            ] {
+                let elf = native_exit_fixture_with_flags("native_direct_outputs.S", &flags);
                 let oracle = dir.path().join("oracle");
                 carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
                 let native = std::process::Command::new("timeout")
@@ -4185,7 +4193,21 @@ fn serial_host_direct_output_venues_supply_untouched_pages() {
                     .output()
                     .expect("native control");
                 assert!(native.status.success(), "{flags:?}: {native:?}");
-                let outcome = run_pool_fixture(&elf, 128);
+                let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+                dispatcher.set_fs_backend(Box::new(
+                    carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+                        .expect("host files"),
+                ));
+                let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None)
+                    .expect("direct output program");
+                let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+                    &program,
+                    128,
+                    ROOT_AFFINITY_LOADED,
+                    |_| {},
+                    dispatcher,
+                )
+                .expect("production direct output runtime");
                 assert_eq!(outcome.run.exit_code, 0, "{flags:?}: {:?}", outcome.run);
                 assert!(!outcome.run.trap_limit_hit);
             }

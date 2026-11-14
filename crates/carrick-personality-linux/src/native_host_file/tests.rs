@@ -1684,3 +1684,74 @@ fn epoll_crossing_array_uses_signed_count_and_exact_isa_stride() {
         }
     }
 }
+
+#[test]
+fn remaining_direct_crossings_prepare_fixed_and_byte_count_outputs() {
+    use crate::crossing::{HostCrossingSet, nr};
+    let out = BASE + 4096;
+    for set in [HostCrossingSet::Aarch64, HostCrossingSet::X86] {
+        for (canonical, args, bytes) in [
+            (nr::READ, [3, out, 32, 0, 0, 0], 32),
+            (nr::PREAD64, [3, out, 32, 0, 0, 0], 32),
+            (nr::GETDENTS64, [3, out, 32, 0, 0, 0], 32),
+            (nr::SENDFILE, [4, 3, out, 32, 0, 0], 8),
+            (nr::FSTAT, [3, out, 0, 0, 0, 0], 128),
+            (nr::NEWFSTATAT, [3, BASE, out, 0, 0, 0], 128),
+            (nr::TIMERFD_SETTIME, [3, 0, BASE, out, 0, 0], 32),
+            (nr::TIMERFD_GETTIME, [3, out, 0, 0, 0, 0], 32),
+            (nr::CLOCK_GETRES, [1, out, 0, 0, 0, 0], 16),
+            (nr::TIMES, [out, 0, 0, 0, 0, 0], 32),
+            (nr::SOCKETPAIR, [1, 1, 0, out, 0, 0], 8),
+            (nr::NANOSLEEP, [BASE, out, 0, 0, 0, 0], 16),
+            (nr::CLOCK_NANOSLEEP, [1, 0, BASE, out, 0, 0], 16),
+        ] {
+            if !set.is_allowed(canonical) {
+                continue;
+            }
+            let mut visited = Vec::new();
+            assert_eq!(
+                crossing_output_stage(set, canonical, &args, |address, length| {
+                    visited.push((address, length));
+                    length
+                }),
+                None
+            );
+            assert_eq!(visited, [(out, bytes)], "{set:?} {canonical:?}");
+            assert_eq!(
+                crossing_output_stage(set, canonical, &args, |_, _| 0),
+                Some(HostFileStage::PrepareOutput { address: out })
+            );
+        }
+    }
+    for (canonical, args) in [
+        (
+            carrick_syscall_abi::CanonicalNr::new(carrick_syscall_abi::CARRICK_PRIVATE_X86_FSTAT),
+            [3, out, 0, 0, 0, 0],
+        ),
+        (
+            carrick_syscall_abi::CanonicalNr::new(
+                carrick_syscall_abi::CARRICK_PRIVATE_X86_NEWFSTATAT,
+            ),
+            [3, BASE, out, 0, 0, 0],
+        ),
+    ] {
+        let mut visited = Vec::new();
+        assert_eq!(
+            crossing_output_stage(HostCrossingSet::X86, canonical, &args, |address, length| {
+                visited.push((address, length));
+                length
+            }),
+            None
+        );
+        assert_eq!(visited, [(out, 144)]);
+    }
+    assert_eq!(
+        crossing_output_stage(
+            HostCrossingSet::Aarch64,
+            nr::CLOCK_NANOSLEEP,
+            &[1, 1, BASE, out, 0, 0],
+            |_, _| panic!("absolute sleeps have no remainder")
+        ),
+        None
+    );
+}
