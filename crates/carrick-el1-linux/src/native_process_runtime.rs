@@ -6702,9 +6702,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// A running member reaches the same terminal owner at its interrupted
     /// user return as a queued member does at scheduler selection.
     pub(crate) fn resume_terminal_user_return(&mut self) -> Option<LifecycleOutcome> {
-        (self.control.host_exit_requested() && self.pending_close_status().is_some())
+        self.terminal_user_return_owed()
             .then(|| self.resume_pending_lifecycle())
             .flatten()
+    }
+
+    /// This member's closing group owes its terminal owner this user return.
+    pub(crate) fn terminal_user_return_owed(&self) -> bool {
+        self.control.host_exit_requested() && self.pending_close_status().is_some()
     }
 
     pub(crate) fn yield_terminal_host_custody(&mut self) -> bool {

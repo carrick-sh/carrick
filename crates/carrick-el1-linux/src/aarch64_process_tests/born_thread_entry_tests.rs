@@ -443,6 +443,8 @@ fn signal_checkpoint(
         ttbr0,
         fixture.page,
         fixture.control,
+        (frame.esr, frame.x[0]),
+        true,
         &mut service,
         |process| {
             super::super::arm_signal::deliver_on_user_return_at(
@@ -4138,6 +4140,8 @@ fn env_signal_checkpoint(
         cpu.ttbr.0,
         env.fixture.page,
         control,
+        (frame.esr, frame.x[0]),
+        true,
         &mut service,
         |process| {
             super::super::arm_signal::deliver_on_user_return_at(

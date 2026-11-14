@@ -331,6 +331,8 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
             fixture_ttbr0(fixture),
             page,
             control,
+            (0, 0),
+            true,
             &mut sibling_service,
             |process| {
                 crate::signal_delivery::deliver_signal_on_syscall_return(
@@ -692,6 +694,8 @@ fn serial_host_arm_group_close_entryless_host_loaded_member_leaves_through_host(
         fixture_ttbr0(fixture),
         page,
         control,
+        (0, 0),
+        true,
         &mut service,
         |process| {
             crate::signal_delivery::deliver_signal_on_syscall_return(
