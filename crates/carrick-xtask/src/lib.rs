@@ -51,6 +51,7 @@ pub mod terminal_custody;
 pub mod test_batch;
 pub mod test_isolated;
 pub mod test_lanes;
+pub mod test_list;
 pub mod test_shards;
 pub mod test_touched;
 pub mod trusted_steps;
