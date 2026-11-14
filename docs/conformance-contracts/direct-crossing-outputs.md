@@ -39,3 +39,20 @@ ISA's record stride and signed int count. Nullable copy offsets are omitted
 independently. Runtime supply and completed copyout acceptance must be
 reported separately from preparation selection; a passing selection test
 alone cannot establish live guest acceptance.
+
+The declarations close six output-argument gaps (getrandom, statx, both copy
+offsets, and the two epoll variants), lowering the census ceiling from 50 to
+44 in the implementation commit. The host-root copy_file_range path now
+secures both optional offset words with the existing `copyout::prepare`
+mechanism before writing the destination file or updating either cursor.
+Its red production witness returned EFAULT on an owner refusal; after the fix
+it returns the owner wait with no file or offset effect, then copies the
+exact payload and commits both advanced offsets on redispatch. Null input
+and output offsets are exercised independently.
+
+The ARM host-root entropy and epoll witnesses compare committed ranges with
+their declarations, check owner refusal before output, and verify entropy's
+committed bytes and epoll's exact mask/payload. The KVM fixture exercises real
+untouched statx and packed epoll output pages; these existing native venues
+already passed before the declaration change. This is not evidence that
+ARM NativeProcess can execute these refused crossings.

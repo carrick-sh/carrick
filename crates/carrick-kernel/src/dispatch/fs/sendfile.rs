@@ -609,6 +609,25 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
 
+            // Read both in/out words before borrowing memory for the shared
+            // output permit. Refusal must precede pwrite or any fd cursor move.
+            let out_off = if off_out_addr == 0 { 0 } else { read_u64(memory, off_out_addr)? };
+            let offsets = match crate::dispatch::copyout::prepare(cx.kernel, memory, [
+                crate::dispatch::copyout::UserSlot::optional(off_in_addr, 8),
+                crate::dispatch::copyout::UserSlot::optional(off_out_addr, 8),
+            ]) {
+                Ok(offsets) => offsets,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            if (off_in_addr != 0 && offsets.secured_capacity(0) < 8)
+                || (off_out_addr != 0 && offsets.secured_capacity(1) < 8) {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            let _effect = match crate::dispatch::copyout::admit_effect(cx.kernel) {
+                Ok(effect) => effect,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+
             // Write side. off_out == NULL → write at out_fd's current position
             // (the common case: cat to a pipe/stdout). Non-NULL → pwrite at the
             // given offset on a real host fd and advance *off_out.
@@ -623,7 +642,6 @@ impl<'a> FsView<'a> {
                 };
                 usize::try_from(value).unwrap_or(0)
             } else {
-                let out_off = read_u64(memory, off_out_addr)?;
                 let host_fd = match this.open_file(out_fd.0).as_ref() {
                     Some(of) => match crate::kernel::FileDescription::read_for_io(&of.description).as_deref() {
                         Some(OpenDescription::HostFile {
@@ -648,17 +666,10 @@ impl<'a> FsView<'a> {
                         out_off as libc::off_t,
                     )
                 };
-                let n = match n.host_syscall_errno() {
+                match n.host_syscall_errno() {
                     Ok(value) => value as usize,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                };
-                if memory
-                    .write_bytes(off_out_addr, &(out_off + n as u64).to_ne_bytes())
-                    .is_err()
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
-                n
             };
 
             // Advance the input offset (pointer or the fd's own position).
@@ -682,10 +693,11 @@ impl<'a> FsView<'a> {
                         _ => {}
                     }
                 }
-            } else if memory
-                .write_bytes(off_in_addr, &(new_in as u64).to_ne_bytes())
-                .is_err()
-            {
+            }
+            if offsets.commit([
+                &(new_in as u64).to_ne_bytes(),
+                &out_off.saturating_add(written as u64).to_ne_bytes(),
+            ]).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
 

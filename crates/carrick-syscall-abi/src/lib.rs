@@ -5,6 +5,11 @@ use bitflags::bitflags;
 
 mod capability;
 mod errno;
+/// Linux epoll_event wire strides; x86_64 packs the u64 payload at byte four.
+pub const LINUX_AARCH64_EPOLL_EVENT_BYTES: u64 = 16;
+/// Packed Linux x86_64 epoll_event wire stride.
+pub const LINUX_X8664_EPOLL_EVENT_BYTES: u64 = 12;
+
 pub mod ipc;
 mod stat;
 pub use stat::{

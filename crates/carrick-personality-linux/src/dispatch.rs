@@ -1093,6 +1093,8 @@ pub enum OutputOperand {
     /// length is not known before the effect, so the ring prepares every page
     /// of the bound, as far as the owner can supply them.
     Buffer { ptr: u8, len: u8, max: u64 },
+    /// An epoll event array with a signed int count and ISA-specific stride.
+    EpollEvents { ptr: u8, count: u8 },
 }
 
 /// `PATH_MAX`: the longest path `getcwd` and `readlinkat` produce.
@@ -1117,6 +1119,17 @@ impl OperandSpec {
     pub const fn output_operand(self) -> OutputOperand {
         use crate::crossing::AllowedHostCrossing as C;
         match self.crossing {
+            C::Getrandom => OutputOperand::Buffer {
+                ptr: 0,
+                len: 1,
+                max: u64::MAX,
+            },
+            C::Statx => OutputOperand::Record {
+                ptr: 4,
+                bytes: core::mem::size_of::<carrick_syscall_abi::LinuxStatx>() as u64,
+            },
+            C::CopyFileRange => OutputOperand::Records(&[(1, 8), (3, 8)]),
+            C::EpollPwait | C::EpollPwait2 => OutputOperand::EpollEvents { ptr: 1, count: 2 },
             C::Gettimeofday => OutputOperand::Records(&[(0, 16), (1, 8)]),
             C::Getcwd => OutputOperand::Buffer {
                 ptr: 0,
@@ -1196,10 +1209,8 @@ impl OperandSpec {
             | C::Syncfs
             | C::Renameat2
             | C::Mlock2
-            | C::CopyFileRange
             | C::Preadv2
             | C::Pwritev2
-            | C::Statx
             | C::Openat2
             | C::Faccessat2
             | C::Fchmodat2
@@ -1226,9 +1237,7 @@ impl OperandSpec {
             | C::ClockGetres
             | C::ClockNanosleep
             | C::Times
-            | C::Getrandom
             | C::EpollCtl
-            | C::EpollPwait
             | C::Dup
             | C::Dup3
             | C::Fcntl
@@ -1239,7 +1248,6 @@ impl OperandSpec {
             | C::TimerfdSettime
             | C::TimerfdGettime
             | C::CloseRange
-            | C::EpollPwait2
             | C::Readahead
             | C::Fadvise64
             | C::Execveat
@@ -1252,11 +1260,30 @@ impl OperandSpec {
 
     /// All direct output ranges, in declaration order. Optional records with
     /// a null pointer are absent. This iterator allocates no guest-stack array.
-    pub fn output_ranges(self, args: &[u64; 6]) -> impl Iterator<Item = (u64, u64)> + '_ {
+    pub fn output_ranges(
+        self,
+        args: &[u64; 6],
+        isa: carrick_guest_arch::GuestIsa,
+    ) -> impl Iterator<Item = (u64, u64)> + '_ {
         let direct = match self.output_operand() {
             OutputOperand::Record { ptr, bytes } => Some((args[ptr as usize], bytes)),
             OutputOperand::Buffer { ptr, len, max } => {
                 Some((args[ptr as usize], args[len as usize].min(max)))
+            }
+            OutputOperand::EpollEvents { ptr, count } => {
+                let stride = match isa {
+                    carrick_guest_arch::GuestIsa::Aarch64 => {
+                        carrick_syscall_abi::LINUX_AARCH64_EPOLL_EVENT_BYTES
+                    }
+                    carrick_guest_arch::GuestIsa::X86_64 => {
+                        carrick_syscall_abi::LINUX_X8664_EPOLL_EVENT_BYTES
+                    }
+                };
+                let count = args[count as usize] as i32;
+                // epoll rejects nonpositive counts and counts exceeding the
+                // signed-int byte limit. Do not prepare invalid requests.
+                (count > 0 && count as u64 <= i32::MAX as u64 / stride)
+                    .then_some((args[ptr as usize], (count.max(0) as u64) * stride))
             }
             OutputOperand::None | OutputOperand::Records(_) => None,
         };
@@ -1277,7 +1304,8 @@ impl OperandSpec {
     /// to cover every operand of a multi-output crossing.
     #[cfg(test)]
     pub(crate) fn output_range(self, args: &[u64; 6]) -> Option<(u64, u64)> {
-        self.output_ranges(args).next()
+        self.output_ranges(args, carrick_guest_arch::GuestIsa::Aarch64)
+            .next()
     }
 }
 
