@@ -55,6 +55,87 @@ impl crate::file::MemoryValidator for ReadableBelow {
     }
 }
 
+/// The shipping ARM decision and begin bodies for the prefix write: stage it,
+/// take the owner-fault path for its unmapped page, then begin and settle the
+/// request exactly as the bare-metal wrapper's process-entry closure does.
+fn begin_prefix_write<X: ForkStockCrossing>(
+    entry: &mut super::super::native_process_runtime::NativeProcessEntry<
+        '_,
+        'static,
+        super::super::aarch64_process::Mm,
+        Aarch64ParkedContext,
+        Aarch64NativeProcessService<'static, X>,
+    >,
+    task: &CurrentTask,
+    native: &ThreadCtx,
+    slot: carrick_sched_core::SlotId,
+    unmapped: u64,
+) -> (
+    Option<carrick_core_abi::service::ServiceOperation>,
+    Result<
+        super::super::native_process_runtime::NativeResume,
+        super::super::native_process_runtime::NativeProcessError,
+    >,
+) {
+    use carrick_personality_linux::native_host_file::{DescriptionAccess, NativeDescriptor};
+    let mut stage_frame = carrick_el1_abi::TrapFrame {
+        x: native.x,
+        elr: native.pc,
+        esr: 0x15 << 26,
+        slot: u64::from(slot.raw()),
+        ..Default::default()
+    };
+    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+    let decision = super::super::dispatch::native_service_decision(
+        &mut stage_frame,
+        task,
+        carrick_el1_abi::Action::Forward,
+        None,
+        counters,
+        || super::super::native_process_runtime::NativeThreadGroupOwner::ForkChild,
+        |frame| {
+            super::super::dispatch::native_host_file_stage(
+                frame,
+                task,
+                &ReadableBelow(unmapped),
+                [5, 1, 0],
+                carrick_core_abi::service::ServiceOrigin::Descendant,
+                |fd| {
+                    assert_eq!(fd, 1);
+                    Some(NativeDescriptor::HostBacked {
+                        access: DescriptionAccess::WriteOnly,
+                    })
+                },
+                &mut |_| panic!("a write releases no mapping sources"),
+            )
+        },
+    );
+    let begin = match decision {
+        super::super::dispatch::NativeServiceDecision::Begin(begin) => begin,
+        super::super::dispatch::NativeServiceDecision::Reply(result) => {
+            panic!("the ring answered {result} instead of publishing a fault request")
+        }
+        super::super::dispatch::NativeServiceDecision::Action(action) => {
+            panic!("the ring finished with {action:?} instead of a fault request")
+        }
+        super::super::dispatch::NativeServiceDecision::Decline => {
+            panic!("an unmapped write tail must publish an owner-fault request")
+        }
+    };
+    let operation = begin.operation;
+    let result = super::super::dispatch::begin_native_service(
+        entry,
+        native.x[8],
+        begin,
+        None,
+        counters,
+        counters,
+        || None,
+    )
+    .0;
+    (operation, result)
+}
+
 fn fork_child_service_ack(
     stdout: bool,
     root_exit: bool,
@@ -243,58 +324,6 @@ fn fork_child_service_ack(
         &mut service,
         |entry| {
             let result = if prefix {
-                use carrick_personality_linux::native_host_file::{
-                    DescriptionAccess, NativeDescriptor,
-                };
-                let mut stage_frame = carrick_el1_abi::TrapFrame {
-                    x: saved.native.x,
-                    elr: saved.native.pc,
-                    esr: 0x15 << 26,
-                    slot: u64::from(fixture.slot.raw()),
-                    ..Default::default()
-                };
-                let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
-                // The shipping decision body: stage the write, take the
-                // owner-fault path for the unmapped page, retain the prefix.
-                let decision = super::super::dispatch::native_service_decision(
-                    &mut stage_frame,
-                    task,
-                    carrick_el1_abi::Action::Forward,
-                    None,
-                    counters,
-                    || super::super::native_process_runtime::NativeThreadGroupOwner::ForkChild,
-                    |frame| {
-                        super::super::dispatch::native_host_file_stage(
-                            frame,
-                            task,
-                            &ReadableBelow(prefix_unmapped),
-                            [5, 1, 0],
-                            carrick_core_abi::service::ServiceOrigin::Descendant,
-                            |fd| {
-                                assert_eq!(fd, 1);
-                                Some(NativeDescriptor::HostBacked {
-                                    access: DescriptionAccess::WriteOnly,
-                                })
-                            },
-                            &mut |_| panic!("a write releases no mapping sources"),
-                        )
-                    },
-                );
-                let begin = match decision {
-                    super::super::dispatch::NativeServiceDecision::Begin(begin) => {
-                        operation = begin.operation;
-                        begin
-                    }
-                    super::super::dispatch::NativeServiceDecision::Reply(result) => {
-                        panic!("the ring answered {result} instead of publishing a fault request")
-                    }
-                    super::super::dispatch::NativeServiceDecision::Action(action) => {
-                        panic!("the ring finished with {action:?} instead of a fault request")
-                    }
-                    super::super::dispatch::NativeServiceDecision::Decline => {
-                        panic!("an unmapped write tail must publish an owner-fault request")
-                    }
-                };
                 if inline_supply {
                     // The carrier serves the supply on another vCPU before
                     // this one reaches its park probe.
@@ -322,18 +351,10 @@ fn fork_child_service_ack(
                         }),
                     );
                 }
-                // Begins and settles the request exactly as the bare-metal
-                // wrapper's process-entry closure does.
-                super::super::dispatch::begin_native_service(
-                    entry,
-                    saved.native.x[8],
-                    begin,
-                    None,
-                    counters,
-                    counters,
-                    || None,
-                )
-                .0
+                let (staged, result) =
+                    begin_prefix_write(entry, task, &saved.native, fixture.slot, prefix_unmapped);
+                operation = staged;
+                result
             } else if stdout {
                 use carrick_personality_linux::native_host_file::{
                     DescriptionAccess, HostFileStage, NativeDescriptor,
@@ -439,6 +460,32 @@ fn fork_child_service_ack(
             returned,
             Some((saved.native.pc - 4, saved.native.x)),
             "the user return re-enters the SVC with every original argument"
+        );
+        // The restarted SVC is an ordinary admitted call: it stages again and
+        // parks its fresh owner-fault request, with no stale service state.
+        let rerun = with_process_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            task,
+            &saved.native,
+            child_ttbr.0,
+            child_page,
+            child_control,
+            &mut service,
+            |entry| begin_prefix_write(entry, task, &saved.native, fixture.slot, prefix_unmapped).1,
+        )
+        .unwrap();
+        assert!(matches!(
+            rerun,
+            Ok(super::super::native_process_runtime::NativeResume::Left(
+                None
+            ))
+        ));
+        assert!(
+            task.service_notice.take().unwrap().is_some(),
+            "the rerun publishes its own request"
         );
         return;
     }
