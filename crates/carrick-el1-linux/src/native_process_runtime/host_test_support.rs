@@ -12274,12 +12274,11 @@ fn wait4_status_owner_wait_retains_zombie_until_release() {
             .unwrap();
         assert!(
             matches!(
-                parent.resume_owned_continuation(),
-                Some(LifecycleOutcome::Transferred { .. })
+                parent.resume_checkpoint(|_| Ok(None)),
+                Ok(NativeResume::Left(None))
             ),
             "owner contention must release execution, never return EFAULT"
         );
-        assert!(parent.take_handoff_receipt().is_some());
     }
     assert!(service.copies.is_empty());
     assert!(fixture.task.service_notice.take().unwrap().is_none());
@@ -12326,7 +12325,30 @@ fn wait4_rusage_owner_wait_retains_reaped_answer_until_release() {
         zone: fixture.zone,
         slot: fixture.slot,
     };
-    let (_, address, saved) = capacity.select().unwrap();
+    let (record, address, saved) = capacity.select().unwrap();
+    // Non-zero accounting: the retained answer must carry the child's usage.
+    let child = fixture
+        .registry
+        .state
+        .lock()
+        .members
+        .values()
+        .find(|member| member.record == record)
+        .unwrap()
+        .process;
+    fixture
+        .runtime
+        .graph
+        .lock()
+        .owner
+        .task_mut(child)
+        .unwrap()
+        .native_mut()
+        .resources_mut()
+        .usage = TaskRusage {
+        user_time: Duration::from_micros(1_250_000),
+        system_time: Duration::from_micros(2_500_000),
+    };
     let child_pid = fixture.task.visible_pid().unwrap();
     let mut service = fixture.service();
     {
@@ -12394,12 +12416,11 @@ fn wait4_rusage_owner_wait_retains_reaped_answer_until_release() {
             .unwrap();
         assert!(
             matches!(
-                parent.resume_owned_continuation(),
-                Some(LifecycleOutcome::Transferred { .. })
+                parent.resume_checkpoint(|_| Ok(None)),
+                Ok(NativeResume::Left(None))
             ),
             "owner contention must release execution, never return EFAULT"
         );
-        assert!(parent.take_handoff_receipt().is_some());
     }
     assert_eq!(service.copies, vec![LinuxWaitStatus::exited(7)]);
     assert!(take_signal_copies().is_empty());
@@ -12438,9 +12459,10 @@ fn wait4_rusage_owner_wait_retains_reaped_answer_until_release() {
     let copies = take_signal_copies();
     assert_eq!(copies.len(), 1);
     assert_eq!(copies[0].0, UserVa::new(0x2000));
+    use carrick_abi::KernelAbi;
     assert_eq!(
-        copies[0].1.len(),
-        core::mem::size_of::<carrick_abi::LinuxRusage>()
+        copies[0].1,
+        carrick_abi::LinuxRusage::from_accounting(1_250_000, 2_500_000, 0, 0).abi_bytes()
     );
 }
 
