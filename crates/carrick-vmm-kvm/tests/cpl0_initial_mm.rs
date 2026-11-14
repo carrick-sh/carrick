@@ -4120,4 +4120,12 @@ fn production_exclusion_settles_an_outstanding_cow_before_its_retired_leaf() {
         "see native_cow_retire_race.S for the failed step: {:?}",
         outcome.run
     );
+    let counts = outcome
+        .physical
+        .return_settlement_counters()
+        .expect("settlement counts");
+    assert_eq!(
+        counts.extents, 1,
+        "the competing COW and retirement exclusions acknowledge the one owed range once: {counts:?}"
+    );
 }

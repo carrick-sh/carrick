@@ -4207,6 +4207,157 @@ mod tests {
         );
         assert_eq!(owed_rows(&successor), vec![reused]);
     }
+    /// Two host exclusions may overlap even though guest editors cannot.
+    /// Reduce the drain/retirement race to their shared settlement entry:
+    /// real root journal, overlapping MM exclusions and settlement lock,
+    /// a recording backing adapter. Carrier exit_group is not modeled.
+    #[test]
+    fn overlapping_drain_and_retirement_settle_each_owed_frame_once() {
+        use carrick_hal::return_settlement::{
+            CowSettled, ExclusionSettlement, ReturnJournalAccess, SettlementLock,
+            settle_cow_then_returns, settle_ring_owned_returns,
+        };
+        use std::collections::BTreeMap;
+        use std::sync::{Barrier, Mutex};
+
+        struct Journal<'a>(&'a SharedReservations, ReservationMm);
+        impl ReturnJournalAccess for Journal<'_> {
+            type Error = Refusal;
+            fn with_journal<R>(
+                &self,
+                step: impl FnOnce(&mut dyn ReturnJournal) -> Result<R, Refusal>,
+            ) -> Result<R, Refusal> {
+                step(&mut self.0.lock(0, self.1)?)
+            }
+        }
+        #[derive(Default)]
+        struct Counts {
+            retired: BTreeMap<u64, usize>,
+            applied: BTreeMap<u64, usize>,
+        }
+        struct Physical<'a>(&'a Mutex<Counts>);
+        impl OwedReturnRetirement for Physical<'_> {
+            type Prepared = Vec<u64>;
+            type Error = ();
+            fn prepare(&mut self, request: &ReturnSettlementRequest) -> Result<Vec<u64>, ()> {
+                let mut frames = Vec::new();
+                let mut counts = self.0.lock().unwrap();
+                for owed in request.iter() {
+                    for address in (owed.range.start()..owed.range.end()).step_by(4096) {
+                        // The fixture's backing is deliberately non-identity.
+                        let frame = 0x800000 + (address - 0x100000);
+                        *counts.retired.entry(frame).or_default() += 1;
+                        frames.push(frame);
+                    }
+                }
+                Ok(frames)
+            }
+            fn apply(&mut self, frames: Vec<u64>) {
+                let mut counts = self.0.lock().unwrap();
+                for frame in frames {
+                    *counts.applied.entry(frame).or_default() += 1;
+                }
+            }
+        }
+        struct Venue<'a> {
+            journal: Journal<'a>,
+            lock: &'a SettlementLock,
+            both_excluded: &'a Barrier,
+            physical: Physical<'a>,
+        }
+        impl ExclusionSettlement for Venue<'_> {
+            type Error = ();
+            type Returns = usize;
+            fn settle_cow_completions(
+                &mut self,
+                _: &carrick_sched_core::ExcludedEditor<'_>,
+            ) -> Result<(), ()> {
+                // Neither contender can take the settlement lock before
+                // both have obtained their actual MM exclusions.
+                self.both_excluded.wait();
+                Ok(())
+            }
+            fn settle_owed_returns(
+                &mut self,
+                excluded: &carrick_sched_core::ExcludedEditor<'_>,
+                cow: &CowSettled<'_>,
+            ) -> Result<usize, ()> {
+                let guard = self.lock.lock(excluded);
+                let outcome = settle_ring_owned_returns(
+                    excluded,
+                    cow,
+                    &guard,
+                    false,
+                    &self.journal,
+                    &mut self.physical,
+                )
+                .unwrap();
+                let SettlementOutcome::Settled(receipt) = outcome else {
+                    panic!("live root without a loan must settle");
+                };
+                Ok(receipt.freed)
+            }
+        }
+
+        let table = table();
+        let mm = ReservationMm::new(1482).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let owed = range(0x100000, 0x103000);
+        {
+            let mut root = table.lock(0, mm).unwrap();
+            root.finish_import().unwrap();
+            let decision = root
+                .mmap(
+                    Placement::Fixed(owed.start()),
+                    owed.len(),
+                    ReservationProtection::READ_WRITE,
+                )
+                .unwrap();
+            complete(&mut root, decision);
+            retire_owed(&mut root, owed);
+        }
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let index = spaces.publish_closed(mm.raw(), 0x7000, 0x7000).unwrap();
+        let gate = spaces.gate(index);
+        let lock = SettlementLock::new();
+        let both_excluded = Barrier::new(2);
+        let counts = Mutex::new(Counts::default());
+        let run = || {
+            let excluded = spaces.raise_and_wait_for_editor(index, || panic!("no guest editor"));
+            let result = settle_cow_then_returns(
+                &mut Venue {
+                    journal: Journal(&table, mm),
+                    lock: &lock,
+                    both_excluded: &both_excluded,
+                    physical: Physical(&counts),
+                },
+                &excluded,
+            )
+            .unwrap();
+            spaces.lower(index);
+            result
+        };
+        let freed = std::thread::scope(|scope| {
+            let drain = scope.spawn(&run);
+            let retirement = scope.spawn(&run);
+            drain.join().unwrap() + retirement.join().unwrap()
+        });
+        assert_eq!(freed, 1, "the actual journal slot is acknowledged once");
+        assert!(owed_rows(&table.lock(0, mm).unwrap()).is_empty());
+        assert_eq!(
+            spaces.gate(index),
+            gate,
+            "both exclusions lower exactly once"
+        );
+        let counts = counts.lock().unwrap();
+        let expected = (owed.start()..owed.end())
+            .step_by(4096)
+            .map(|address| (0x800000 + (address - 0x100000), 1))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(counts.retired, expected);
+        assert_eq!(counts.applied, expected);
+    }
+
     /// #1482: the settlement doorbell is single flight per root. One claim
     /// at a time per root, taken under its guard; only the exact held word
     /// releases it, and every claim and release advances its epoch, so a

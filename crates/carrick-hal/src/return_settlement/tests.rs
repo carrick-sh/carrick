@@ -536,6 +536,7 @@ fn every_native_exclusion_site_settles_owed_returns() {
         ("carrick-sched-core/src/spaces/notification.rs", None),
         // This ratchet names the primitive it searches for.
         ("carrick-hal/src/return_settlement/tests.rs", None),
+        ("carrick-core/tests/entry_completion.rs", None),
         (
             "carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs",
             None,
@@ -804,7 +805,6 @@ fn a_cow_proof_for_another_mm_settles_no_return() {
     let mut backend = Backend::default();
     let other = spaces.unpublished(MM + 1).unwrap();
     let cow = CowSettled::for_test(&other);
-    drop(other);
     let excluded = spaces.unpublished(MM).unwrap();
     let guard = lock.lock(&excluded);
     assert_eq!(
