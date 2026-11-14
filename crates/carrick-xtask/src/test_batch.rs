@@ -31,11 +31,11 @@ pub struct TestBatchArgs {
 }
 
 pub(crate) struct Lane {
-    record: Vec<String>,
+    pub(crate) record: Vec<String>,
     pub(crate) packages: BTreeSet<String>,
     pub(crate) targets: BTreeSet<(String, String)>,
     features: BTreeSet<String>,
-    harness: Vec<String>,
+    pub(crate) harness: Vec<String>,
     pub(crate) doc: bool,
     implicit_doc: bool,
     no_run: bool,
@@ -293,49 +293,7 @@ fn execute_selected(
     if lanes.is_empty() {
         return Err("batch selected no tests".into());
     }
-    let mut packages = BTreeSet::new();
-    let mut features = BTreeSet::new();
-    let mut targets = BTreeSet::new();
-    for lane in lanes.iter().filter(|l| !l.doc) {
-        packages.extend(lane.packages.iter().cloned());
-        targets.extend(lane.targets.iter().cloned());
-        if !lane.no_default {
-            for pkg in meta["packages"].as_array().ok_or("missing packages")? {
-                let name = pkg["name"].as_str().ok_or("missing name")?;
-                if lane.packages.contains(name) && pkg["features"].get("default").is_some() {
-                    features.insert(format!("{name}/default"));
-                }
-            }
-        }
-        if lane.all_features {
-            for pkg in meta["packages"].as_array().ok_or("missing packages")? {
-                let name = pkg["name"].as_str().ok_or("missing name")?;
-                if lane.packages.contains(name) {
-                    for feature in pkg["features"]
-                        .as_object()
-                        .ok_or("missing features")?
-                        .keys()
-                    {
-                        features.insert(format!("{name}/{feature}"));
-                    }
-                }
-            }
-        }
-        // Bare features are package scoped before unifying the package set.
-        for feature in &lane.features {
-            if feature.contains('/') {
-                features.insert(feature.clone());
-            } else {
-                for pkg in meta["packages"].as_array().ok_or("missing packages")? {
-                    let name = pkg["name"].as_str().ok_or("missing name")?;
-                    if lane.packages.contains(name) && pkg["features"].get(feature).is_some() {
-                        features.insert(format!("{name}/{feature}"));
-                    }
-                }
-            }
-        }
-    }
-    let no_default = lanes.iter().any(|l| l.no_default);
+    let (packages, features, targets, no_default) = selection(&lanes, &meta)?;
     let binaries = if let Some(manifest) = imported {
         if lanes.iter().any(|l| l.doc || l.implicit_doc) {
             return Err("cannot import rustdoc lanes".into());
@@ -506,6 +464,62 @@ fn execute_selected(
     Ok(())
 }
 
+/// One compile unit's Cargo selection: packages, package-scoped features, test targets and
+/// whether default features are off (shared by running and by `test-list`).
+pub(crate) type Selection = (
+    BTreeSet<String>,
+    BTreeSet<String>,
+    BTreeSet<(String, String)>,
+    bool,
+);
+
+pub(crate) fn selection(lanes: &[Lane], meta: &Value) -> Result<Selection> {
+    let mut packages = BTreeSet::new();
+    let mut features = BTreeSet::new();
+    let mut targets = BTreeSet::new();
+    for lane in lanes.iter().filter(|l| !l.doc) {
+        packages.extend(lane.packages.iter().cloned());
+        targets.extend(lane.targets.iter().cloned());
+        if !lane.no_default {
+            for pkg in meta["packages"].as_array().ok_or("missing packages")? {
+                let name = pkg["name"].as_str().ok_or("missing name")?;
+                if lane.packages.contains(name) && pkg["features"].get("default").is_some() {
+                    features.insert(format!("{name}/default"));
+                }
+            }
+        }
+        if lane.all_features {
+            for pkg in meta["packages"].as_array().ok_or("missing packages")? {
+                let name = pkg["name"].as_str().ok_or("missing name")?;
+                if lane.packages.contains(name) {
+                    for feature in pkg["features"]
+                        .as_object()
+                        .ok_or("missing features")?
+                        .keys()
+                    {
+                        features.insert(format!("{name}/{feature}"));
+                    }
+                }
+            }
+        }
+        // Bare features are package scoped before unifying the package set.
+        for feature in &lane.features {
+            if feature.contains('/') {
+                features.insert(feature.clone());
+            } else {
+                for pkg in meta["packages"].as_array().ok_or("missing packages")? {
+                    let name = pkg["name"].as_str().ok_or("missing name")?;
+                    if lane.packages.contains(name) && pkg["features"].get(feature).is_some() {
+                        features.insert(format!("{name}/{feature}"));
+                    }
+                }
+            }
+        }
+    }
+    let no_default = lanes.iter().any(|l| l.no_default);
+    Ok((packages, features, targets, no_default))
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct BatchArtifact {
     root: PathBuf,
@@ -521,8 +535,8 @@ struct ArtifactBinary {
     path: PathBuf,
 }
 
-type Binaries = BTreeMap<(String, String), PathBuf>;
-fn compile(
+pub(crate) type Binaries = BTreeMap<(String, String), PathBuf>;
+pub(crate) fn compile(
     root: &Path,
     lanes: &[Lane],
     meta: &Value,
