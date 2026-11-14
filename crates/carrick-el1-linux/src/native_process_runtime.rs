@@ -5440,17 +5440,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     });
                     let copied = match copied {
                         Ok(copied) => copied,
-                        Err(NativeProcessError::OwnerWait(wait)) => {
+                        Err(
+                            error @ (NativeProcessError::OwnerWait(_) | NativeProcessError::Busy),
+                        ) => {
                             // No zombie has been consumed. Retain the exact
                             // member's syscall in the existing owner-service
-                            // continuation, then rescan after its MM releases.
+                            // continuation, then rescan after its MM releases
+                            // (OwnerWait) or the carrier settles (Busy).
+                            let wait = match error {
+                                NativeProcessError::OwnerWait(wait) => Some(wait),
+                                _ => None,
+                            };
                             match self.retry_guest_input(
                                 carrick_core_abi::service::ServiceOperation::CarrierWork {
                                     entry: OwnerEntry::Syscall,
                                     demand: carrick_core_abi::service::CarrierDemand::Work,
                                 },
                                 None,
-                                Some(wait),
+                                wait,
                             )? {
                                 // The owner released before enrolment. Neither
                                 // an owned continuation nor a direct syscall
