@@ -30,11 +30,45 @@ const TIMEOUT_EXIT: i32 = 128 + libc::SIGALRM;
 /// Grace between the bound's SIGTERM and a SIGKILL of a row that ignores it.
 const KILL_GRACE: Duration = Duration::from_secs(5);
 
+/// The guest ISA a scoreboard block measures (#2327: x86 rows on main beside ARM).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Isa {
+    /// AArch64 guests (the HVF lane on macOS); `carrick run` with no platform.
+    #[default]
+    #[value(name = "arm64")]
+    Arm64,
+    /// x86_64 guests (the KVM lane); `carrick run --platform linux/amd64`.
+    #[value(name = "x86_64")]
+    #[serde(rename = "x86_64")]
+    X86_64,
+}
+
+impl Isa {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Arm64 => "arm64",
+            Self::X86_64 => "x86_64",
+        }
+    }
+
+    /// The `carrick run` arguments that select this ISA's image variant.
+    fn platform_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Arm64 => &[],
+            Self::X86_64 => &["--platform", "linux/amd64"],
+        }
+    }
+}
+
 #[derive(clap::Args, Debug)]
 pub struct ScoreboardArgs {
-    /// The signed carrick binary to score.
+    /// The carrick binary to score (signed on macOS).
     #[arg(long)]
     pub carrick: PathBuf,
+    /// The guest ISA to score: `arm64` (default) or `x86_64`.
+    #[arg(long, value_enum, default_value_t = Isa::Arm64)]
+    pub isa: Isa,
     /// Comma-separated row names to run (default: all rows).
     #[arg(long, value_delimiter = ',')]
     pub rows: Vec<String>,
@@ -164,6 +198,9 @@ pub fn select_rows(names: &[String]) -> Result<Vec<&'static Row>, ScoreboardErro
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowResult {
+    /// The guest ISA the row ran on (absent in receipts before #2327: arm64).
+    #[serde(default)]
+    pub isa: Isa,
     pub name: String,
     pub exit_code: i32,
     pub timed_out: bool,
@@ -175,6 +212,9 @@ pub struct RowResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Receipt {
     pub schema: String,
+    /// The guest ISA of every row (absent in receipts before #2327: arm64).
+    #[serde(default)]
+    pub isa: Isa,
     pub main_sha: String,
     pub binary_sha256: String,
     pub rows: Vec<RowResult>,
@@ -204,6 +244,7 @@ pub fn row_result(
     stderr: &str,
 ) -> RowResult {
     RowResult {
+        isa: Isa::Arm64,
         name: name.to_string(),
         exit_code,
         timed_out,
@@ -213,10 +254,17 @@ pub fn row_result(
     }
 }
 
-/// The script's `printf "%-16s exit=%-4s %s"`: stdout newlines to spaces, cut to 60.
+/// One machine-readable row: `<isa> <name> exit=<code> <first stdout line>`, the ISA column first so a
+/// comment carrying both blocks parses row by row (#2327); stdout is cut to 60 characters.
 pub fn table_line(r: &RowResult) -> String {
     let joined: String = r.first_stdout_line.chars().take(60).collect();
-    format!("{:<16} exit={:<4} {}", r.name, r.exit_code, joined)
+    format!(
+        "{:<7} {:<16} exit={:<4} {}",
+        r.isa.as_str(),
+        r.name,
+        r.exit_code,
+        joined
+    )
 }
 
 pub fn render_table(rows: &[RowResult]) -> String {
@@ -253,6 +301,7 @@ fn read_lossy(path: &Path) -> String {
 
 struct Runner<'a> {
     carrick: &'a Path,
+    isa: Isa,
     evidence: &'a Path,
     bound: Duration,
     reaper: &'a Path,
@@ -266,7 +315,9 @@ impl Runner<'_> {
         let stdout = File::create(&out_path).map_err(io_err(&out_path))?;
         let stderr = File::create(&err_path).map_err(io_err(&err_path))?;
         let mut child = Command::new(self.carrick)
-            .args(["run", "--rm", "-w", "/tmp", row.image])
+            .arg("run")
+            .args(self.isa.platform_args())
+            .args(["--rm", "-w", "/tmp", row.image])
             .args(row.command)
             .env("CARRICK_RUN_ID", &run_id)
             .stdin(Stdio::null())
@@ -323,6 +374,7 @@ impl Runner<'_> {
         if timed_out {
             result.exit_code = TIMEOUT_EXIT;
         }
+        result.isa = self.isa;
         Ok(result)
     }
 }
@@ -447,12 +499,18 @@ pub fn run(
         .unwrap_or_else(|| root.join("scripts/sudo/kill.sh"));
     let runner = Runner {
         carrick: &args.carrick,
+        isa: args.isa,
         evidence: &evidence,
         bound: Duration::from_secs(args.bound_secs),
         reaper: &reaper,
     };
     let short: String = sha.chars().take(10).collect();
-    let _ = writeln!(writer, "main {short}  sha256={}", &binary_sha256[..16]);
+    let _ = writeln!(
+        writer,
+        "main {short}  sha256={}  isa={}",
+        &binary_sha256[..16],
+        args.isa.as_str()
+    );
     let mut results = Vec::new();
     for row in rows {
         let result = runner.run(row)?;
@@ -461,6 +519,7 @@ pub fn run(
     }
     let receipt = Receipt {
         schema: SCHEMA.to_string(),
+        isa: args.isa,
         main_sha: sha,
         binary_sha256,
         rows: results,
@@ -522,17 +581,35 @@ mod tests {
 
     #[test]
     fn table_line_pads_and_truncates() {
-        let r = row_result("py-fork", 0, false, &"a".repeat(80), "");
+        let mut r = row_result("py-fork", 0, false, &"a".repeat(80), "");
         assert_eq!(
             table_line(&r),
-            format!("py-fork          exit=0    {}", "a".repeat(60))
+            format!("arm64   py-fork          exit=0    {}", "a".repeat(60))
         );
+        r.isa = Isa::X86_64;
+        assert!(table_line(&r).starts_with("x86_64  py-fork          exit=0"));
+    }
+
+    #[test]
+    fn receipts_before_the_isa_field_read_as_arm64() {
+        let old = r#"{"schema":"carrick.scoreboard.v1","main_sha":"a","binary_sha256":"b",
+            "rows":[{"name":"py-fork","exit_code":0,"timed_out":false,"passed":true,
+            "first_stdout_line":"","key_stderr_line":""}]}"#;
+        let r: Receipt = serde_json::from_str(old).unwrap_or_else(|_| std::process::abort());
+        assert_eq!((r.isa, r.rows[0].isa), (Isa::Arm64, Isa::Arm64));
+        let text = render_receipt(&Receipt {
+            isa: Isa::X86_64,
+            ..r
+        })
+        .unwrap_or_default();
+        assert!(text.contains("\"isa\": \"x86_64\""), "{text}");
     }
 
     #[test]
     fn receipt_round_trips() {
         let receipt = Receipt {
             schema: SCHEMA.into(),
+            isa: Isa::Arm64,
             main_sha: "abc".into(),
             binary_sha256: "def".into(),
             rows: vec![row_result("go-version", 0, false, "go1.23\n", "")],
@@ -540,6 +617,7 @@ mod tests {
         let text = render_receipt(&receipt).unwrap_or_default();
         let back: Receipt = serde_json::from_str(&text).unwrap_or_else(|_| Receipt {
             schema: String::new(),
+            isa: Isa::X86_64,
             main_sha: String::new(),
             binary_sha256: String::new(),
             rows: vec![],
@@ -574,6 +652,7 @@ mod tests {
         let (carrick, reaper, out) = fixture(dir.path());
         let args = ScoreboardArgs {
             carrick,
+            isa: Isa::Arm64,
             rows: vec![
                 "py-version".into(),
                 "node-version".into(),
@@ -605,7 +684,8 @@ mod tests {
         assert_eq!(receipt.rows[1].key_stderr_line, "node: bad");
         let table = String::from_utf8_lossy(&table).into_owned();
         assert!(table.starts_with("main 0123456789  sha256="));
-        assert!(table.contains("node-version     exit=3    v22"));
+        assert!(table.lines().next().unwrap_or("").ends_with("  isa=arm64"));
+        assert!(table.contains("arm64   node-version     exit=3    v22"));
         let log = read_lossy(&dir.path().join("carrick.log"));
         assert_eq!(
             log.lines().collect::<Vec<_>>(),
@@ -626,6 +706,53 @@ mod tests {
             serde_json::from_str(&read_lossy(&out)).unwrap_or_else(|_| std::process::abort());
         assert_eq!(on_disk.main_sha, "0123456789abcdef");
         assert_eq!(on_disk.binary_sha256.len(), 64);
+    }
+
+    #[test]
+    fn an_x86_scoreboard_runs_every_row_on_linux_amd64_and_labels_it() {
+        // #2327: the x86 KVM block runs the same rows through the same runner.
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let carrick = dir.path().join("carrick");
+        write_executable_mode(
+            &carrick,
+            "#!/bin/sh\necho \"$*\" >> \"$0.log\"\necho ok\n",
+            0o755,
+        );
+        let reaper = dir.path().join("reap");
+        write_executable_mode(&reaper, "#!/bin/sh\nexit 0\n", 0o755);
+        let out = dir.path().join("receipt.json");
+        let args = ScoreboardArgs {
+            carrick,
+            isa: Isa::X86_64,
+            rows: vec!["py-version".into(), "go-version".into()],
+            out: out.clone(),
+            sha: Some("0123456789abcdef".into()),
+            evidence: None,
+            bound_secs: 5,
+            reaper: Some(reaper),
+        };
+        let mut table = Vec::new();
+        let receipt = run(dir.path(), args, &mut table).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(receipt.isa, Isa::X86_64);
+        assert!(receipt.rows.iter().all(|r| r.isa == Isa::X86_64));
+        let log = read_lossy(&dir.path().join("carrick.log"));
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            [
+                format!(
+                    "run --platform linux/amd64 --rm -w /tmp {PY} python3 -c import sys; print(sys.version.split()[0])"
+                ),
+                format!("run --platform linux/amd64 --rm -w /tmp {GO} go version"),
+            ]
+        );
+        let table = String::from_utf8_lossy(&table).into_owned();
+        assert!(table.lines().next().unwrap_or("").ends_with("  isa=x86_64"));
+        assert!(
+            table.contains("x86_64  go-version       exit=0    ok"),
+            "{table}"
+        );
+        let on_disk = read_lossy(&out);
+        assert!(on_disk.contains("\"isa\": \"x86_64\""), "{on_disk}");
     }
 
     fn alive(pid: libc::pid_t) -> bool {
@@ -652,6 +779,7 @@ mod tests {
         write_executable_mode(&reaper, "#!/bin/sh\necho \"$1\" >> \"$0.log\"\n", 0o755);
         let args = ScoreboardArgs {
             carrick,
+            isa: Isa::Arm64,
             rows: vec!["go-version".into()],
             out: dir.path().join("receipt.json"),
             sha: Some("abc".into()),
