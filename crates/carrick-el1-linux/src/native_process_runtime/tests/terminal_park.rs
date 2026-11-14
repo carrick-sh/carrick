@@ -448,6 +448,11 @@ fn losing_exit_group_keeps_host_reserved_membership_and_live_record() {
         Some(sibling.record.id)
     );
     assert!(fixture.zone.live(sibling.record).is_some());
+    let installed = fixture.zone.installed_space(sibling.slot);
+    assert_ne!(
+        installed, 0,
+        "the switched-in sibling runs in its process space"
+    );
     let saved = words(fixture.address);
     let mut service = fixture.service();
     let mut owner = fixture
@@ -507,6 +512,11 @@ fn losing_exit_group_keeps_host_reserved_membership_and_live_record() {
         0,
         "host custody must keep the installed process translation live"
     );
+    assert_eq!(
+        fixture.zone.installed_space(sibling.slot),
+        installed,
+        "host custody keeps the slot's space occupancy with its translation"
+    );
     assert_eq!(page.live(), 0);
     assert!(
         host.commit_zone_retirement(&carrick_core::lifecycle::RegistryWriteHeld::for_test())
@@ -526,6 +536,11 @@ fn losing_exit_group_keeps_host_reserved_membership_and_live_record() {
     ));
     assert!(fixture.zone.live(sibling.record).is_none());
     assert_eq!(super::super::host_test_support::take_terminal_vacates(), 1);
+    assert_eq!(
+        fixture.zone.installed_space(sibling.slot),
+        0,
+        "the released member's slot holds no process space"
+    );
     assert_eq!(page.live(), 0);
 }
 
