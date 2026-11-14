@@ -2420,6 +2420,33 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         capture
     }
 
+    /// Bound reusable capacity while real guest children retain their tables.
+    #[cfg(feature = "test-support")]
+    pub fn fixture_limit_exec_stock(
+        &self,
+        left: usize,
+    ) -> Result<carrick_hal::fork_stock::SuccessorTables, TrapError> {
+        let mut custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let count = custody.fork_stock.table_stock().len().saturating_sub(left);
+        custody
+            .fork_stock
+            .reserve_successor_tables(count)
+            .map_err(|error| fail(format!("fixture exec stock: {error:?}")))
+    }
+
+    /// Outstanding physical exec continuations, not merely stock reservations.
+    #[cfg(feature = "test-support")]
+    pub fn fixture_parked_exec_count(&self) -> Result<usize, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.parked_execs.len())
+    }
+
     /// Place an already runnable fixture task using the real claim/run queues.
     /// Both CPUs must be stopped. Parked waiters are deliberately refused.
     pub fn fixture_place_native_thread(

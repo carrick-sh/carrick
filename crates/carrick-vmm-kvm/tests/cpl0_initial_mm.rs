@@ -529,6 +529,193 @@ fn native_fork_child_execs_while_parent_keeps_running() {
     assert!(outcome.run.stderr.is_empty());
 }
 
+/// The witness runs real guest records over NATIVE_SERVICE_PORT. Capacity
+/// is bounded only after two children own stock; the holder's retirement,
+/// rather than a fixture return, must make the exec runnable.
+#[test]
+fn native_fork_child_exec_wakes_after_live_stock_holder_retires() {
+    native_exec_stock_witness(false);
+}
+
+#[test]
+fn native_fork_child_exec_killed_while_parked_is_reaped_before_stock_release() {
+    native_exec_stock_witness(true);
+}
+
+fn with_exec_stock_deadline<R>(run: impl FnOnce(&std::sync::atomic::AtomicBool) -> R) -> R {
+    use carrick_hal::VcpuKick;
+    let kick = carrick_vmm_kvm::KvmKickHandle::for_current_thread();
+    let expired = std::sync::atomic::AtomicBool::new(false);
+    let (done, receive) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let expiry = &expired;
+        scope.spawn(move || {
+            if matches!(
+                receive.recv_timeout(std::time::Duration::from_secs(10)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                expiry.store(true, std::sync::atomic::Ordering::Release);
+                kick.kick();
+            }
+        });
+        let result = run(&expired);
+        let _ = done.send(());
+        result
+    })
+}
+
+fn native_exec_stock_witness(kill: bool) {
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    use carrick_vmm_kvm::cpl0_boot::exec_service::X86ExecImage;
+    let flags = if kill { vec!["-DKILL_PARKED"] } else { vec![] };
+    let elf = native_exit_fixture_with_flags("native_exec_stock.S", &flags);
+    let successor = native_exit_fixture("native_exec_stock_successor.S");
+    let load = || {
+        let program = carrick_mem::elf::ElfProgram::load(&successor, 62, &|_| None).unwrap();
+        X86ExecImage::from_program(&program, vec![b"/stock-successor".to_vec()], vec![])
+    };
+    let demand = load().unwrap().demand().tables;
+    let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
+    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let mut parent = factory.claim(0).unwrap();
+    let mut peer = factory.claim(1).unwrap();
+    let task = root.binding().task();
+    parent.cpu_mut().load(root).unwrap();
+    let holder_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let exec_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 2);
+    run_to_marker(&mut parent, task, 1, &factory);
+    factory
+        .fixture_pin_native_thread(holder_tid, carrick_guest_arch::CpuId::new(0))
+        .unwrap();
+    run_to_marker(&mut parent, task, 2, &factory);
+    factory
+        .fixture_pin_native_thread(exec_tid, carrick_guest_arch::CpuId::new(1))
+        .unwrap();
+    assert!(matches!(factory.fixture_native_wait_state(exec_tid).unwrap().0,
+        carrick_sched_core::Claim::Queued { slot, .. } if slot.raw() == 1),
+        "exec child must be queued on peer before entry");
+    assert!(!matches!(factory.fixture_native_wait_state(holder_tid).unwrap().0,
+        carrick_sched_core::Claim::Free), "holder still owns its stock");
+    let _capacity_bound = factory.fixture_limit_exec_stock(demand - 1).unwrap();
+    with_exec_stock_deadline(|expired| {
+        for _ in 0..128 {
+            let exit = peer.fixture_run_idle_peer().unwrap_or_else(|error| { let state = factory.capture_physical_state(); panic!("{error:?}: {} {:?}", state.zone_census, state.vcpus) });
+            assert!(
+                !expired.load(std::sync::atomic::Ordering::Acquire),
+                "exec staging deadline"
+            );
+            if matches!(exit, CarrierRunExit::Kick) {
+                continue;
+            }
+            assert!(
+                peer.service_idle_peer_doorbell_with_host_file(
+                    &exit,
+                    |_, _| {},
+                    &mut |_, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
+                    &mut |_| load(),
+                )
+                .unwrap()
+                .is_none()
+            );
+            if factory.fixture_parked_exec_count().unwrap() == 1 {
+                break;
+            }
+        }
+    });
+    assert_eq!(
+        factory.fixture_parked_exec_count().unwrap(),
+        1,
+        "real physical ticket must park"
+    );
+    run_until_wait_enrolled(&mut peer, task, &factory, exec_tid, true);
+    assert_eq!(
+        factory.fixture_parked_exec_count().unwrap(),
+        1,
+        "ring enrollment retains the ticket"
+    );
+    std::thread::scope(|scope| {
+        let root_run = scope.spawn(|| {
+            with_exec_stock_deadline(|expired| {
+                use carrick_guest_mem::GuestMemory;
+                let mut killed_reaped = !kill;
+                for _ in 0..256 {
+                    let exit = parent.fixture_run_loaded(task).unwrap().exit;
+                    assert!(
+                        !expired.load(std::sync::atomic::Ordering::Acquire),
+                        "parent wait4 deadline"
+                    );
+                    match exit {
+                        CarrierRunExit::Kick => {}
+                        CarrierRunExit::SyscallTrap => {
+                            let (marker, token) = parent
+                                .capture_forward(task, |venue, frame| {
+                                    assert_eq!(frame.rax, 1);
+                                    Ok(venue.read_bytes_raw(frame.rsi, 1).unwrap()[0])
+                                })
+                                .unwrap();
+                            parent.complete_forward(task, token, 1).unwrap();
+                            if marker == 3 {
+                                assert!(kill);
+                                assert_eq!(
+                                    factory.fixture_parked_exec_count().unwrap(),
+                                    0,
+                                    "cancelled ticket acknowledged before holder release"
+                                );
+                                killed_reaped = true;
+                            } else {
+                                assert_eq!(marker, 4);
+                                assert!(killed_reaped);
+                                return;
+                            }
+                        }
+                        _ => assert!(
+                            parent
+                                .service_physical_doorbell(task, &exit, |_, _| {})
+                                .unwrap()
+                                .is_none()
+                        ),
+                    }
+                }
+                panic!("parent crossing budget");
+            })
+        });
+        with_exec_stock_deadline(|expired| {
+            for _ in 0..256 {
+                let exit = peer.fixture_run_idle_peer().unwrap_or_else(|error| { let state = factory.capture_physical_state(); panic!("{error:?}: {} {:?}", state.zone_census, state.vcpus) });
+                assert!(
+                    !expired.load(std::sync::atomic::Ordering::Acquire),
+                    "parked exec wake deadline"
+                );
+                if matches!(exit, CarrierRunExit::Kick) {
+                    continue;
+                }
+                let retired = matches!(
+                    exit,
+                    CarrierRunExit::PhysicalDoorbell {
+                        port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+                        ..
+                    }
+                );
+                assert!(
+                    peer.service_idle_peer_doorbell_with_host_file(
+                        &exit,
+                        |_, _| {},
+                        &mut |_, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
+                        &mut |_| load(),
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+                if retired {
+                    return;
+                }
+            }
+            panic!("exec crossing budget");
+        });
+        root_run.join().unwrap();
+    });
+}
+
 /// Run the production CPL0 root, which execs `path` and exits with the
 /// refused errno (38 is ENOSYS) if `execve` returns.
 fn run_root_exec(path: &std::path::Path) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
@@ -630,6 +817,7 @@ fn native_exit_workers(
     )
     .expect("real KVM");
     let issued = dispatcher.capture_one_task_context().expect("issued root");
+    issued.thread().set_affinity(carrick_hal::CpuAffinity::all(2));
     issued
         .resources()
         .files()
