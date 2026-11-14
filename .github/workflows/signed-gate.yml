@@ -36,6 +36,7 @@ jobs:
       base: ${{ steps.request.outputs.base }}
       main: ${{ steps.request.outputs.main }}
       xtask_key: ${{ steps.xtask.outputs.key }}
+      gate_runs_on: ${{ steps.route.outputs.runs_on }}
     steps:
       - name: Refuse unauthorized actors before checking out code
         env:
@@ -81,6 +82,20 @@ jobs:
         run: >-
           "$RUNNER_TEMP/xtask-prebuilt/carrick-xtask" signed-gate prepare
           --event "$GITHUB_EVENT_PATH" --output "$RUNNER_TEMP/request"
+      # Route the gate to the Mac that sealed the merge base's reusable receipt
+      # (#2335): a receipt is reusable only on the Mac that ran it, and with two
+      # gate Macs a group on the other one re-ran its base in full. Trusted main
+      # code reads the base's published seals; any doubt, or a failure of this
+      # step, is the shared label, exactly as before.
+      - name: Route the gate to the Mac holding the base receipt
+        id: route
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! "$RUNNER_TEMP/xtask-prebuilt/carrick-xtask" signed-gate route \
+              --request "$RUNNER_TEMP/request/request.json"; then
+            echo 'runs_on=["self-hosted","macOS","ARM64","carrick-signed-gate"]' >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: signed-request-${{ github.run_attempt }}
@@ -193,9 +208,38 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  # Recovery for a routed gate whose Mac went away (#2335): GitHub can't move
+  # a queued job, so this cancels the run when the routed gate hasn't started
+  # within 20 min. The group fails fast (instead of GitHub's 24 h queue limit),
+  # and the never-started job sends the re-queued group to the shared label.
+  gate-watchdog:
+    # The gate's own needs: it starts when the gate can, so prerequisites
+    # never count against the 20 minutes.
+    needs: [authorize, base-fixtures, candidate-probes]
+    if: contains(needs.authorize.outputs.gate_runs_on, 'carrick-signed-gate-')
+    runs-on: ubuntu-latest
+    # Past the gate's own 240-min timeout: the deadline restarts while its Mac runs another gate.
+    timeout-minutes: 300
+    permissions:
+      actions: write
+    steps:
+      - name: Download the prebuilt carrick-xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: carrick-xtask-${{ needs.authorize.outputs.xtask_key }}
+          path: ${{ runner.temp }}/xtask-prebuilt
+      - name: Cancel the run if the routed gate never starts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask-prebuilt/carrick-xtask"
+          "$RUNNER_TEMP/xtask-prebuilt/carrick-xtask" signed-gate watchdog --run-id "$GITHUB_RUN_ID"
+
   gate:
     needs: [authorize, base-fixtures, candidate-probes]
-    runs-on: [self-hosted, macOS, ARM64, carrick-signed-gate]
+    # `authorize` routes to the Mac that sealed the base's receipt (#2335),
+    # else the shared label; every gate Mac keeps the shared label.
+    runs-on: ${{ fromJSON(needs.authorize.outputs.gate_runs_on || '["self-hosted","macOS","ARM64","carrick-signed-gate"]') }}
     # Paired execution (#1884): the merge base and then the candidate run on
     # this one Mac, each about 22-35 min (60 min worst observed), under one
     # gate lease whose acquisition may wait up to an hour. 2 x 60 + 60 = 180.
