@@ -36,6 +36,12 @@ pub const RUNNERS_FILE: &str = ".github/signed-gate-runners.txt";
 pub const LIVE_WINDOW_SECS: u64 = 12 * 3600;
 /// A gate job queued this long on a per-Mac label means that label isn't being served.
 pub const STRANDED_AFTER_SECS: u64 = 15 * 60;
+/// How many times the watchdog asks GitHub to cancel before leaving the run to the independent
+/// reaper (agy-director's stale-group reaper cancels a merge-group run whose routed gate sits
+/// queued, from outside Actions, so a dead or failing watchdog can't strand the gate).
+pub const CANCEL_ATTEMPTS: u32 = 10;
+/// Every `gh` call the watchdog makes is bounded, so a hung subprocess can't outlast the deadline.
+pub const GH_CALL_SECS: &str = "60";
 /// How long `watchdog` lets a routed gate wait for its Mac, from first seeing it queued, before
 /// cancelling the run.
 pub const WATCHDOG_SECS: u64 = 20 * 60;
@@ -251,23 +257,34 @@ pub fn watchdog(run_id: u64, limit_secs: u64, poll_secs: u64) -> Result<(), supe
     let started = std::time::Instant::now();
     let outcome = watch_with(
         || {
-            super::api(&format!(
-                "repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"
-            ))
+            let endpoint = format!("repos/{repo}/actions/runs/{run_id}/jobs?per_page=100");
+            super::checked(
+                "timeout",
+                &[GH_CALL_SECS, "gh", "api", "--method", "GET", &endpoint],
+                None,
+            )
             .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .and_then(|v| v["jobs"].as_array().cloned())
             .and_then(|jobs| jobs.into_iter().find(|job| job["name"] == "gate"))
         },
         || started.elapsed().as_secs(),
         || std::thread::sleep(std::time::Duration::from_secs(poll_secs.max(1))),
         || {
+            let run = run_id.to_string();
             super::checked(
-                "gh",
-                &["run", "cancel", &run_id.to_string(), "--repo", repo],
+                "timeout",
+                &[GH_CALL_SECS, "gh", "run", "cancel", &run, "--repo", repo],
                 None,
             )
             .map(drop)
             .map_err(|e| e.to_string())
+        },
+        |label| {
+            let runner = label
+                .strip_prefix("carrick-signed-gate-")
+                .unwrap_or_default();
+            gate_jobs_in_progress(repo, run_id).is_some_and(|jobs| runner_busy(runner, &jobs))
         },
         limit_secs,
     );
@@ -282,6 +299,50 @@ pub fn watchdog(run_id: u64, limit_secs: u64, poll_secs: u64) -> Result<(), supe
         }
         Err(e) => Err(super::fail(e)),
     }
+}
+
+/// Whether `runner` is executing a `gate` job among `jobs` (jobs-API rows).
+pub fn runner_busy(runner: &str, jobs: &[Value]) -> bool {
+    !runner.is_empty()
+        && jobs.iter().any(|job| {
+            job["name"] == "gate" && job["status"] == "in_progress" && job["runner_name"] == runner
+        })
+}
+
+/// The `gate` jobs of the other in-progress signed-gate runs; `None` when GitHub can't be read
+/// (then the watch treats the Mac as free and keeps its deadline).
+fn gate_jobs_in_progress(repo: &str, own_run: u64) -> Option<Vec<Value>> {
+    let get = |endpoint: &str| -> Option<Value> {
+        super::checked(
+            "timeout",
+            &[GH_CALL_SECS, "gh", "api", "--method", "GET", endpoint],
+            None,
+        )
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+    };
+    let runs = get(&format!(
+        "repos/{repo}/actions/workflows/signed-gate.yml/runs?status=in_progress&per_page=20"
+    ))?;
+    let mut jobs = Vec::new();
+    for id in runs["workflow_runs"]
+        .as_array()?
+        .iter()
+        .filter_map(|run| run["id"].as_u64())
+    {
+        if id == own_run {
+            continue;
+        }
+        let listed = get(&format!("repos/{repo}/actions/runs/{id}/jobs?per_page=100"))?;
+        jobs.extend(
+            listed["jobs"]
+                .as_array()?
+                .iter()
+                .filter(|job| job["name"] == "gate")
+                .cloned(),
+        );
+    }
+    Some(jobs)
 }
 
 /// How a watch ended.
@@ -304,14 +365,20 @@ pub fn watch_with(
     mut clock: impl FnMut() -> u64,
     mut sleep: impl FnMut(),
     mut cancel: impl FnMut() -> Result<(), String>,
+    mut busy: impl FnMut(&str) -> bool,
     limit_secs: u64,
 ) -> Result<Watched, String> {
-    let since = clock();
+    let mut since = clock();
     let mut last = String::from("the gate was never listed");
     loop {
         match watch_decision(read().as_ref()) {
             Watch::Done(why) => return Ok(Watched::Left(why)),
             Watch::Queued(label) => {
+                // Its Mac running another gate is contention, not stranding (#67 review): the
+                // limit restarts, so it runs from when that Mac is free.
+                if busy(&label) {
+                    since = clock();
+                }
                 last = format!("the gate stayed queued for {label}, which no runner is serving")
             }
             Watch::Wait => {}
@@ -322,7 +389,17 @@ pub fn watch_with(
             if let Watch::Done(why) = watch_decision(read().as_ref()) {
                 return Ok(Watched::Left(format!("{why} at the deadline")));
             }
-            cancel()?;
+            // Retry a refused or failed cancel; past the attempts the independent reaper owns it.
+            let mut attempt = 1;
+            while let Err(e) = cancel() {
+                if attempt >= CANCEL_ATTEMPTS {
+                    return Err(format!(
+                        "{last}; cancelling the run failed {attempt} times ({e}): the stale-group reaper takes it from here"
+                    ));
+                }
+                attempt += 1;
+                sleep();
+            }
             return Ok(Watched::Cancelled(format!(
                 "{last} after {} min; cancelled the run so the group fails now and the re-queued group \
                  routes to the shared label",
@@ -764,6 +841,7 @@ mod tests {
                 cancelled.set(true);
                 Ok(())
             },
+            |_| false,
             WATCHDOG_SECS,
         );
         (outcome, polls.get(), cancelled.get())
@@ -806,6 +884,116 @@ mod tests {
             );
             assert!(cancelled, "{label}");
         }
+    }
+
+    #[test]
+    fn a_refused_cancel_is_retried_until_it_lands() {
+        let attempts = std::cell::Cell::new(0u32);
+        let polls = std::cell::Cell::new(0u64);
+        let outcome = watch_with(
+            || {
+                polls.set(polls.get() + 1);
+                Some(routed_queued())
+            },
+            || polls.get() * 60,
+            || {},
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    Err("HTTP 502".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| false,
+            WATCHDOG_SECS,
+        );
+        assert!(matches!(outcome, Ok(Watched::Cancelled(_))), "{outcome:?}");
+        assert_eq!(attempts.get(), 3);
+        // A cancel that never lands is an error naming the hand-off, after every attempt.
+        let attempts = std::cell::Cell::new(0u32);
+        let polls = std::cell::Cell::new(0u64);
+        let outcome = watch_with(
+            || {
+                polls.set(polls.get() + 1);
+                Some(routed_queued())
+            },
+            || polls.get() * 60,
+            || {},
+            || {
+                attempts.set(attempts.get() + 1);
+                Err("HTTP 502".into())
+            },
+            |_| false,
+            WATCHDOG_SECS,
+        );
+        assert!(
+            matches!(outcome, Err(ref e) if e.contains("stale-group reaper")),
+            "{outcome:?}"
+        );
+        assert_eq!(attempts.get(), CANCEL_ATTEMPTS);
+    }
+
+    #[test]
+    fn a_gate_queued_behind_another_gate_on_its_mac_is_not_cancelled() {
+        // #67 review: a healthy Mac busy with another gate for 40 min looks like an unserved one.
+        let polls = std::cell::Cell::new(0u64);
+        let running = json!({"name": "gate", "status": "in_progress", "started_at": "2026-11-14T18:00:00Z",
+            "labels": ["carrick-signed-gate-carrick-m4"]});
+        let cancelled = std::cell::Cell::new(false);
+        let outcome = watch_with(
+            || {
+                polls.set(polls.get() + 1);
+                // Queued for 55 min, then the Mac takes it.
+                Some(if polls.get() < 55 {
+                    routed_queued()
+                } else {
+                    running.clone()
+                })
+            },
+            || polls.get() * 60,
+            || {},
+            || {
+                cancelled.set(true);
+                Ok(())
+            },
+            // The Mac runs another gate for the first 40 min.
+            |label| label == "carrick-signed-gate-carrick-m4" && polls.get() <= 40,
+            WATCHDOG_SECS,
+        );
+        assert!(matches!(outcome, Ok(Watched::Left(_))), "{outcome:?}");
+        assert!(!cancelled.get());
+        // Once that Mac is free, the limit runs from then: 20 min later the gate is cancelled.
+        let polls = std::cell::Cell::new(0u64);
+        let outcome = watch_with(
+            || {
+                polls.set(polls.get() + 1);
+                Some(routed_queued())
+            },
+            || polls.get() * 60,
+            || {},
+            || Ok(()),
+            |_| polls.get() <= 40,
+            WATCHDOG_SECS,
+        );
+        assert!(matches!(outcome, Ok(Watched::Cancelled(_))), "{outcome:?}");
+        assert!((60..=62).contains(&polls.get()), "{}", polls.get());
+        let job = |runner: &str, status: &str| json!({"name": "gate", "status": status, "runner_name": runner});
+        assert!(runner_busy(
+            "carrick-m4",
+            &[
+                job("cloudmac-gate", "in_progress"),
+                job("carrick-m4", "in_progress")
+            ]
+        ));
+        assert!(!runner_busy(
+            "carrick-m4",
+            &[
+                job("carrick-m4", "completed"),
+                job("cloudmac-gate", "in_progress")
+            ]
+        ));
+        assert!(!runner_busy("", &[job("", "in_progress")]));
     }
 
     #[test]
