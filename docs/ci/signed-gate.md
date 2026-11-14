@@ -285,6 +285,27 @@ into a fresh detached worktree and removes the worktree and its target
 directory after copying logs. Runner operators must still treat approved PR code as code executing
 on that machine.
 
+## Cancelled checkout recovery (#2302)
+
+The executor allocates its build checkout under
+`$TMPDIR/carrick-gate/<GITHUB_RUN_ID>-<GITHUB_RUN_ATTEMPT>/checkout`
+(the manual fallback uses the executor PID). Before allocation it removes
+prior run directories whose permanent sidecar file lock can be acquired.
+A live gate holds its lock before creating the directory and through normal
+removal, so another gate leaves it alone. SIGKILL releases the lock in the
+kernel; the next executor start reclaims the abandoned directory. No age or
+process-name heuristic authorizes deletion. Lock files are never unlinked.
+The root is owned by the runner user and may not be group/other writable.
+
+Normal worktree removal and drop-time directory cleanup remain in place.
+A startup cleanup error fails execution; a drop-time removal failure leaves
+the directory discoverable for the next start. The existing host lease
+continues to contain and clean up supervised build/guest processes.
+This recovery does not search legacy anonymous `.tmp*/checkout` paths;
+operators must handle those separately after verifying they are unused.
+Deployment and a real cancelled-job known-answer on both gate Macs remain
+director operations.
+
 ## Evidence and verdict
 
 `accept` performs its own signed build before testing and records the exact
