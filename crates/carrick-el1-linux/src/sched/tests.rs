@@ -367,7 +367,15 @@ fn a_futex_handoff_switches_threads_in_guest_and_preserves_state() {
 /// the original op 393 still returns zero when it is subsequently woken.
 #[test]
 fn production_futex_wait_switch_keeps_successor_result_separate_from_wait_result() {
-    let zone = zone();
+    let region = carrick_test_support::TestEl1Region::zeroed();
+    // SAFETY: TestEl1Region owns aligned, zero-valid ABI storage through every
+    // dispatch below; the zone's fixed offset and extent are ABI-checked.
+    let zone = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+            .cast::<ZoneTables>()
+    };
     let word = AtomicU32::new(0);
     let uaddr = word.as_ptr() as u64;
     let tasks = [
@@ -376,7 +384,7 @@ fn production_futex_wait_switch_keeps_successor_result_separate_from_wait_result
         CurrentTask::new(),
         task_for(101),
     ];
-    host_publish(&zone, SLOT, MM, None, 0);
+    host_publish(zone, SLOT, MM, None, 0);
     let successor = zone.alloc_record(identity(202)).unwrap();
     let mut saved = thread_ctx(0xB, uaddr);
     saved.x[0] = 28;
@@ -403,7 +411,7 @@ fn production_futex_wait_switch_keeps_successor_result_separate_from_wait_result
             &[],
             &names,
             Some(crate::dispatch::Zone {
-                tables: &zone,
+                tables: zone,
                 cpu,
                 user: &HardwareUserWord,
             }),
