@@ -56,10 +56,25 @@ pub fn schedule(slot: SlotId) -> ! {
                 source.zone,
                 state.address.mm.raw().get(),
             );
-            source
+            if source
                 .zone
                 .install_space(slot, state.address.mm.raw().get())
-                .unwrap_or_else(|| fatal_boot());
+                .is_none()
+            {
+                // Not now (#2295): another vCPU's host exclusion raised the
+                // space's gate after the switch-in's open-gate hint. Nothing
+                // of the record ran here, so it goes back to the head of the
+                // queue with its claim, handback, result and operation as
+                // they were, and runs on a later pass once the holder's
+                // lowering reopens the gate. The vCPU returns to the
+                // maintenance root, so the cleared occupancy word never
+                // names a root this vCPU still runs.
+                leave_space(source);
+                if !source.zone.unswitch(slot, selected.record) {
+                    fatal_boot();
+                }
+                continue;
+            }
             settle_current_work(current);
             current.set(
                 carrick_el1_abi::El1TaskId::from_linux_tid(
