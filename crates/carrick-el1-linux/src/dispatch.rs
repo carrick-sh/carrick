@@ -1411,7 +1411,7 @@ fn native_host_file_return(
 /// A staged native service request, ready for its owner to publish.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(super) struct NativeServiceBegin {
-    operation: Option<carrick_core_abi::service::ServiceOperation>,
+    pub(super) operation: Option<carrick_core_abi::service::ServiceOperation>,
     exec_payload: Option<alloc::boxed::Box<[u8]>>,
     host_file: Option<alloc::boxed::Box<StagedHostFile>>,
     entropy: Option<(

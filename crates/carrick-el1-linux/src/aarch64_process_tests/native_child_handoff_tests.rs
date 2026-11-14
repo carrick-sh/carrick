@@ -3,22 +3,22 @@ use super::*;
 
 #[test]
 fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
-    fork_child_service_ack(false, false, false, false);
+    fork_child_service_ack(false, false, false, false, false);
 }
 
 #[test]
 fn arm_native_fork_child_stdout_service_keeps_exact_entry() {
-    fork_child_service_ack(true, false, false, false);
+    fork_child_service_ack(true, false, false, false, false);
 }
 
 #[test]
 fn arm_native_fork_child_stdout_retains_capability_after_root_exit_publication() {
-    fork_child_service_ack(true, true, false, false);
+    fork_child_service_ack(true, true, false, false, false);
 }
 
 #[test]
 fn arm_native_fork_tree_releases_capability_after_last_exit() {
-    fork_child_service_ack(true, true, true, false);
+    fork_child_service_ack(true, true, true, false, false);
 }
 
 /// #1335/#1954: a fork child's `write` to its inherited host-backed stdout
@@ -28,7 +28,17 @@ fn arm_native_fork_tree_releases_capability_after_last_exit() {
 /// (`native_service_decision`, `begin_native_service`), not a re-staging.
 #[test]
 fn arm_native_fork_child_write_keeps_readable_prefix_before_unmapped_page() {
-    fork_child_service_ack(true, false, false, true);
+    fork_child_service_ack(true, false, false, true, false);
+}
+
+/// go-hello's `entry_binding` stop (#2242): a fork child's write stages
+/// through an owner fault, and the carrier supplies the page before the
+/// child's park probe. The service settles inline as a restart of the SVC;
+/// the shipping ARM user return must re-enter the SVC with every original
+/// argument, not fail-stop on `EntryBinding`.
+#[test]
+fn arm_native_fork_child_pre_park_supply_restarts_svc() {
+    fork_child_service_ack(true, false, false, true, true);
 }
 
 const PREFIX_BYTES: &[u8; 16] = b"0123456789abcdef";
@@ -45,7 +55,13 @@ impl crate::file::MemoryValidator for ReadableBelow {
     }
 }
 
-fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool, prefix: bool) {
+fn fork_child_service_ack(
+    stdout: bool,
+    root_exit: bool,
+    child_exit: bool,
+    prefix: bool,
+    inline_supply: bool,
+) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
@@ -213,6 +229,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool, prefi
     }
     let child_ttbr = cpu.ttbr;
     assert_eq!(fixture.zone.installed_space(fixture.slot), identity.mm);
+    let mut operation = None;
     let result = with_process_entry(
         BornInZoneSource {
             zone: fixture.zone,
@@ -264,7 +281,10 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool, prefi
                     },
                 );
                 let begin = match decision {
-                    super::super::dispatch::NativeServiceDecision::Begin(begin) => begin,
+                    super::super::dispatch::NativeServiceDecision::Begin(begin) => {
+                        operation = begin.operation;
+                        begin
+                    }
                     super::super::dispatch::NativeServiceDecision::Reply(result) => {
                         panic!("the ring answered {result} instead of publishing a fault request")
                     }
@@ -275,6 +295,33 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool, prefi
                         panic!("an unmapped write tail must publish an owner-fault request")
                     }
                 };
+                if inline_supply {
+                    // The carrier serves the supply on another vCPU before
+                    // this one reaches its park probe.
+                    let control = child_control;
+                    crate::native_process_runtime::host_test_support::set_service_published_hook(
+                        Arc::as_ptr(&owner) as usize,
+                        Box::new(move || {
+                            let selector = task.service_notice.take().unwrap().unwrap();
+                            // SAFETY: the published request names this exact
+                            // child record and control.
+                            let ticket = unsafe {
+                                carrick_core_abi::service::ServiceCell::claim_notice(
+                                    &control.service,
+                                    selector,
+                                    NonZeroU64::MIN,
+                                    identity,
+                                )
+                            }
+                            .unwrap();
+                            assert!(matches!(
+                                ticket.request().operation,
+                                carrick_core_abi::service::ServiceOperation::Fault(_)
+                            ));
+                            assert!(ticket.complete(true).is_ok(), "supply the page");
+                        }),
+                    );
+                }
                 // Begins and settles the request exactly as the bare-metal
                 // wrapper's process-entry closure does.
                 super::super::dispatch::begin_native_service(
@@ -361,6 +408,40 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool, prefi
         },
     )
     .unwrap();
+    if inline_supply {
+        assert!(
+            matches!(
+                result,
+                super::super::native_process_runtime::NativeResume::RetrySyscall
+            ),
+            "a pre-park supply settles inline as an SVC restart"
+        );
+        // The trap words the shipping SVC entry hands to the user return.
+        let mut frame = carrick_el1_abi::TrapFrame {
+            x: saved.native.x,
+            elr: saved.native.pc,
+            esr: 0x56000000,
+            slot: u64::from(fixture.slot.raw()),
+            ..Default::default()
+        };
+        let mut returned = None;
+        let action = super::super::dispatch::native_service_user_return(
+            &mut frame,
+            operation,
+            result,
+            |frame| {
+                returned = Some((frame.elr, frame.x));
+                carrick_el1_abi::Action::Served
+            },
+        );
+        assert_eq!(action, carrick_el1_abi::Action::Served);
+        assert_eq!(
+            returned,
+            Some((saved.native.pc - 4, saved.native.x)),
+            "the user return re-enters the SVC with every original argument"
+        );
+        return;
+    }
     assert!(matches!(
         result,
         super::super::native_process_runtime::NativeResume::Left(None)
