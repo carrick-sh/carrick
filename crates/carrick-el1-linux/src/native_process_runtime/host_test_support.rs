@@ -7,6 +7,11 @@ use carrick_sched_core::ParkedContextWords;
 #[cfg(test)]
 std::thread_local! {
     static FUTEX_MAPPING: core::cell::Cell<Option<Result<bool, NativeProcessError>>> = const { core::cell::Cell::new(None) };
+    static TERMINAL_VACATES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+pub(super) fn take_terminal_vacates() -> usize {
+    TERMINAL_VACATES.with(|count| count.replace(0))
 }
 
 std::thread_local! {
@@ -161,6 +166,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         source: carrick_el1_abi::BornInZoneSource<'a, C>,
     ) -> Result<(), NativeProcessError> {
         let _ = source;
+        TERMINAL_VACATES.with(|count| count.set(count.get() + 1));
         Ok(())
     }
 

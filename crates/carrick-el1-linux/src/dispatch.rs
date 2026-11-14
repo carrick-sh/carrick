@@ -2241,37 +2241,20 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         invalid_completion(NativeInvariant::EntryBinding)
     };
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
-    let venue = carrick_el1::substrate::sched::NativeEntryVenue::select_with_lifecycle(
-        zone, slot, task, page, control,
-    );
-    // Fatal cancellation drains an already owned wait after admission closes.
-    // It does not admit new SignalOwner execution through a closed gate.
-    if venue == carrick_el1::substrate::sched::NativeEntryVenue::Host
-        && !(fatal_owner_cancel && control.native_signal_owner())
-    {
-        if fatal_owner_cancel {
-            invalid_completion(NativeInvariant::EntryBinding)
-        }
-        return Action::Served;
-    }
-    // Closing admission still owes a running member its terminal checkpoint.
-    // The lifecycle owner, not the admission gate, decides whether it retires.
-    let Some(terminal_checkpoint) =
-        arm_signal_return_admission(zone, page, control, fatal_owner_cancel)
-    else {
-        return Action::Served;
-    };
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };
-    if frame.esr != 0xfffc
-        && !(frame.esr == 0xfffe
-            && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
-        && !control.has_in_zone_standard_signal()
-        && carrick_el1::isa::signal_ingress_guest().is_empty()
-        && control.zone_record().is_some()
-        && !terminal_checkpoint
-    {
-        return Action::Served;
-    }
+    let terminal_checkpoint = match arm_signal_return_gate(
+        source,
+        task,
+        page,
+        control,
+        frame.esr,
+        frame.x[0],
+        carrick_el1::isa::signal_ingress_guest().is_empty(),
+    ) {
+        Some(checkpoint) => checkpoint,
+        None if fatal_owner_cancel => invalid_completion(NativeInvariant::EntryBinding),
+        None => return Action::Served,
+    };
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
     sched::ThreadCpu::save(
         &mut sched::HardwareCpu,
@@ -2282,14 +2265,14 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
-    let action = arm_signal_user_return_admitted_entry(
+    let (action, _) = arm_signal_user_return_admitted_entry(
         source,
         task,
         &saved.native,
         ttbr0,
         page,
         control,
-        Some(terminal_checkpoint),
+        terminal_checkpoint,
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
@@ -2319,6 +2302,46 @@ pub(super) fn arm_signal_return_admission(
         .then_some(needed)
 }
 
+/// The complete non-hardware EL0 return gate, shared by the vector and its
+/// VM-free witness. `None` means that no signal or terminal work is owed.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn arm_signal_return_gate(
+    source: carrick_el1_abi::BornInZoneSource<'_, carrick_el1_abi::Aarch64ParkedContext>,
+    task: &CurrentTask,
+    page: &carrick_el1_abi::ThreadLifecyclePage,
+    control: &carrick_el1_abi::ThreadControlSlot,
+    esr: u64,
+    x0: u64,
+    ingress_empty: bool,
+) -> Option<bool> {
+    let fatal_owner_cancel = esr == 0xfffc;
+    let venue = carrick_el1::substrate::sched::NativeEntryVenue::select_with_lifecycle(
+        source.zone,
+        source.slot,
+        task,
+        page,
+        control,
+    );
+    if venue == carrick_el1::substrate::sched::NativeEntryVenue::Host
+        && !(fatal_owner_cancel && control.native_signal_owner())
+    {
+        return None;
+    }
+    let terminal_checkpoint =
+        arm_signal_return_admission(source.zone, page, control, fatal_owner_cancel)?;
+    if !fatal_owner_cancel
+        && !(esr == 0xfffe && x0 == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
+        && !control.has_in_zone_standard_signal()
+        && ingress_empty
+        && control.zone_record().is_some()
+        && !terminal_checkpoint
+    {
+        return None;
+    }
+    Some(terminal_checkpoint)
+}
+
 /// The signal checkpoint's process admission and delivery, shared by the EL1
 /// vector and the VM-free witnesses. A refused admission is returned to the
 /// caller: the vector's fatal names its kind (#1958).
@@ -2342,10 +2365,14 @@ pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockC
         >,
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
 ) -> Result<Action, super::native_process_runtime::NativeProcessError> {
-    let admission = arm_signal_return_admission(source.zone, page, control, false);
-    arm_signal_user_return_admitted_entry(
+    let Some(admission) = arm_signal_return_gate(source, task, page, control, 0, 0, true) else {
+        return Ok(Action::Served);
+    };
+    let (action, checkpoint) = arm_signal_user_return_admitted_entry(
         source, task, native, ttbr0, page, control, admission, service, deliver,
-    )
+    )?;
+    debug_assert_eq!(checkpoint, admission);
+    Ok(action)
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -2357,7 +2384,7 @@ fn arm_signal_user_return_admitted_entry<X: super::aarch64_process::ForkStockCro
     ttbr0: u64,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
-    admission: Option<bool>,
+    admission: bool,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
     deliver: impl FnOnce(
         &mut super::native_process_runtime::NativeProcessEntry<
@@ -2368,18 +2395,20 @@ fn arm_signal_user_return_admitted_entry<X: super::aarch64_process::ForkStockCro
             super::aarch64_process::Aarch64NativeProcessService<'static, X>,
         >,
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
-) -> Result<Action, super::native_process_runtime::NativeProcessError> {
-    if admission.is_none() {
-        return Ok(Action::Served);
-    }
+) -> Result<(Action, bool), super::native_process_runtime::NativeProcessError> {
     let delivered = super::aarch64_process::with_process_entry(
         source, task, native, ttbr0, page, control, service, deliver,
     )?;
-    Ok(match delivered {
-        None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
-        Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
-        Some(_) => invalid_completion(NativeInvariant::EntryBinding),
-    })
+    Ok((
+        match delivered {
+            None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => {
+                Action::Served
+            }
+            Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
+            Some(_) => invalid_completion(NativeInvariant::EntryBinding),
+        },
+        admission,
+    ))
 }
 
 /// [`dispatch_irq`] with explicitly supplied tables (EL1 and host tests).
