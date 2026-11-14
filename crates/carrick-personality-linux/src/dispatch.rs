@@ -1149,7 +1149,6 @@ impl OperandSpec {
             C::CopyFileRange => OutputOperand::Records(&[(1, 8), (3, 8)]),
             C::EpollPwait | C::EpollPwait2 => OutputOperand::EpollEvents { ptr: 1, count: 2 },
             C::Gettimeofday => OutputOperand::Records(&[(0, 16), (1, 8)]),
-            C::ClockGettime => OutputOperand::Record { ptr: 1, bytes: 16 },
             C::Getcwd => OutputOperand::Buffer {
                 ptr: 0,
                 len: 1,
