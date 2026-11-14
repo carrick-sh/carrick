@@ -474,9 +474,8 @@ fn test_arm_fork_geometry_and_cow_lifecycle() {
         "parent private leaf has NON_GLOBAL"
     );
 
-    // L2 private block: the live parent now points at a fresh L3 table.  Every
-    // split leaf carries the COW authority; keeping those bits on the block
-    // would make owner copyout reject the valid mapping.
+    // L2 private block: armed in place, at block granularity. Its first COW
+    // write splits it; fork links no table for it (#2276).
     let block_edit = scratch
         .edits
         .iter()
@@ -485,27 +484,29 @@ fn test_arm_fork_geometry_and_cow_lifecycle() {
     assert_eq!(block_edit.before, original_block);
     assert_eq!(
         block_edit.after & TYPE_TABLE_OR_PAGE,
-        TYPE_TABLE_OR_PAGE,
-        "parent private block replaced by an L3 table"
+        0b01,
+        "parent private block stays a block"
     );
-    let parent_l3 = block_edit.after & Aarch64Mmu::ADDRESS_MASK;
-    assert!(
-        req.parent_tables.contains(parent_l3),
-        "split parent table belongs to the admitted parent arena"
+    assert_eq!(
+        block_edit.after & AP_RO,
+        AP_RO,
+        "parent private block armed read-only"
     );
-    let parent_offset = ((parent_l3 - req.parent_tables.base) / 8) as usize;
-    for index in [0, 511] {
-        let leaf = scratch.parent[parent_offset + index];
-        let original = Aarch64Mmu::split(original_block, 2, index).unwrap();
-        assert_eq!(
-            leaf & Aarch64Mmu::ADDRESS_MASK,
-            original & Aarch64Mmu::ADDRESS_MASK,
-            "split leaf {index} preserves its output frame"
-        );
-        assert_eq!(leaf & AP_RO, AP_RO, "split leaf {index} is read-only");
-        assert_ne!(leaf & SW_EL1_COW, 0, "split leaf {index} is COW-armed");
-        assert_ne!(leaf & NON_GLOBAL, 0, "split leaf {index} is ASID-scoped");
-    }
+    assert_ne!(
+        block_edit.after & SW_EL1_COW,
+        0,
+        "parent private block has SW_EL1_COW"
+    );
+    assert_ne!(
+        block_edit.after & SW_EL1_PRIVATE,
+        0,
+        "parent private block keeps EL1-private authority"
+    );
+    assert_ne!(
+        block_edit.after & NON_GLOBAL,
+        0,
+        "parent private block has NON_GLOBAL"
+    );
 
     // Assert shared leaf is NOT edited in parent
     assert!(
@@ -680,6 +681,87 @@ fn test_arm_fork_break_before_make_on_block_split() {
             "BBM rollback must restore parent memory bit-for-bit at {addr:#x}"
         );
     }
+}
+
+/// #2276 P0-1: a block fork must split (a mixed policy) links its new
+/// tables with table attributes only. Leaf upper bits mean other things in
+/// a table descriptor: leaf bit 59 is PXNTable, and APTable/XNTable would
+/// restrict every page under the table.
+#[test]
+fn arm_fork_split_tables_never_inherit_leaf_upper_bits() {
+    const PBHA0: u64 = 1 << 59;
+    let req = sample_arm_request(1);
+    let mem = TestMemory::new();
+    let [root_pa, l1_pa, l2_pa] = [0x10_0000, 0x10_1000, 0x10_2000];
+    mem.store(root_pa, l1_pa | TYPE_TABLE_OR_PAGE);
+    mem.store(l1_pa, l2_pa | TYPE_TABLE_OR_PAGE);
+    mem.store(l2_pa, 0x70_0000 | USER_BLOCK_FLAGS | UXN | PBHA0);
+    let mappings = vec![Mapping {
+        range: ReservationRange::new(0x1_0000, 0x1_0000 + 4096).unwrap(),
+        protection: ReservationProtection::READ_WRITE,
+        anonymous: true,
+        flags: ReservationNodeFlags::PRIVATE,
+        generation: ReservationGeneration::new(1).unwrap(),
+        host_backing: None,
+    }];
+    let mut census = ForkCensus {
+        child: 0,
+        parent: 0,
+        live: 0,
+        custody: 0,
+    };
+    census_table::<Aarch64Mmu, _, _>(
+        &LinuxForkPolicy,
+        &mem,
+        &mappings,
+        root_pa,
+        0,
+        0,
+        &mut census,
+    )
+    .unwrap();
+    let mut scratch = ForkScratch::bounded(
+        req,
+        mappings.len(),
+        census.child,
+        census.parent,
+        census.live,
+        census.custody,
+    )
+    .unwrap();
+    scratch.mappings = mappings;
+    copy_table::<Aarch64Mmu, _, _>(
+        &LinuxForkPolicy,
+        &mem,
+        req,
+        &mut scratch,
+        ForkTableCursor {
+            table: root_pa,
+            level: 0,
+            base: 0,
+            child_offset: 0,
+        },
+    )
+    .unwrap();
+    let parent = scratch
+        .edits
+        .iter()
+        .find(|edit| edit.pa == l2_pa)
+        .expect("parent edit for the split block")
+        .after;
+    assert_eq!(
+        parent & !Aarch64Mmu::ADDRESS_MASK,
+        TYPE_TABLE_OR_PAGE,
+        "parent split table descriptor: {parent:#x}"
+    );
+    // The child's L2 table is its third (root, L1, L2); entry 0 is the split.
+    let child = scratch.child[2 * 512];
+    assert!(Aarch64Mmu::is_table(child, 2));
+    assert_eq!(
+        child & !Aarch64Mmu::ADDRESS_MASK,
+        TYPE_TABLE_OR_PAGE,
+        "child split table descriptor: {child:#x}"
+    );
 }
 
 #[test]
