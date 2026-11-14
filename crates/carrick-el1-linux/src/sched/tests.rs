@@ -450,6 +450,22 @@ fn production_futex_wait_switch_keeps_successor_result_separate_from_wait_result
     assert_eq!(frame.x[0], 0, "the original wait receives neither 28 nor 1");
     assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 2);
     assert_eq!(zone.counters.el1_switches.load(Ordering::Relaxed), 2);
+    let mut rows = std::string::String::new();
+    counters.write_syscall_frames(&mut rows).unwrap();
+    assert!(!rows.contains("futex-error sample="), "{rows}");
+
+    // An invalid wait really returns EINVAL to this task. Capture must retain
+    // its address before x0 is replaced and must not invent successor rows.
+    set_op(&mut frame, uaddr, operation, 0);
+    frame.x[5] = 0;
+    assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
+    assert_eq!(frame.x[0] as i64, -22);
+    rows.clear();
+    counters.write_syscall_frames(&mut rows).unwrap();
+    assert!(rows.contains("futex-error sample="), "{rows}");
+    assert!(rows.contains("op=393"), "{rows}");
+    assert!(rows.contains("result=-22"), "{rows}");
+    assert!(rows.contains(&std::format!("address={uaddr:#x}")), "{rows}");
 }
 
 /// Negative control: a switch that does not save FP/SIMD is caught.
