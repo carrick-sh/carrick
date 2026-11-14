@@ -4338,8 +4338,8 @@ mod tests {
             result
         };
         let freed = std::thread::scope(|scope| {
-            let drain = scope.spawn(&run);
-            let retirement = scope.spawn(&run);
+            let drain = scope.spawn(run);
+            let retirement = scope.spawn(run);
             drain.join().unwrap() + retirement.join().unwrap()
         });
         assert_eq!(freed, 1, "the actual journal slot is acknowledged once");
