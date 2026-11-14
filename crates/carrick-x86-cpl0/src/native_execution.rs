@@ -33,6 +33,8 @@ pub fn schedule(slot: SlotId) -> ! {
         if crate::test_support::peer_release_pending(slot) {
             crate::anonymous::release_injected_edit_wait(source, current);
         }
+        #[cfg(feature = "test-support")]
+        crate::test_support::lower_injected_install_gate(source);
         expire_signal_timer(slot);
         if let Some(selected) = source.zone.switch_in_full(slot) {
             source.zone.leave_idle(slot);
@@ -49,6 +51,11 @@ pub fn schedule(slot: SlotId) -> ! {
             if source.zone.installed_space(slot) != state.address.mm.raw().get() {
                 leave_space(source);
             }
+            #[cfg(feature = "test-support")]
+            crate::test_support::raise_gate_before_install(
+                source.zone,
+                state.address.mm.raw().get(),
+            );
             source
                 .zone
                 .install_space(slot, state.address.mm.raw().get())

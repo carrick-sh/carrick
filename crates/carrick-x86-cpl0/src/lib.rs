@@ -101,6 +101,56 @@ mod test_support {
     /// Release a held post-supply holder from another member: publish the
     /// held MM's Editor release once its waiter has parked. 1 if released.
     pub const INJECT_RELEASE_POST_SUPPLY_HOLD: u64 = 0xffff_ffff_ffff_fe33;
+    /// The next scheduler install of an address space meets its gate raised
+    /// once (#2295), between the record's switch-in and the install, as a
+    /// host exclusion on another vCPU raises it. The holder lowers it, with
+    /// its Gate release, on the refused slot's next scheduler pass.
+    pub const INJECT_INSTALL_GATE_ONCE: u64 = 0xffff_ffff_ffff_fe34;
+    /// Injected install gates: raised in the high 32 bits, lowered in the
+    /// low 32 bits.
+    pub const INJECT_INSTALL_GATE_CENSUS: u64 = 0xffff_ffff_ffff_fe35;
+    static INSTALL_GATE_ARMED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    /// The raised space's index plus one, or 0.
+    static INSTALL_GATE_RAISED: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+    static INSTALL_GATE_CENSUS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    /// Called after a record's switch-in, before its space is installed:
+    /// raise that space's gate, if armed.
+    pub fn raise_gate_before_install(
+        zone: &carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>,
+        mm: u64,
+    ) {
+        if !INSTALL_GATE_ARMED.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let Some(index) = zone.spaces.find(mm) else {
+            carrick_x86_carrier::entry::fatal_boot();
+        };
+        zone.spaces.raise(index);
+        INSTALL_GATE_RAISED.store(index.index() + 1, Ordering::Release);
+        INSTALL_GATE_CENSUS.fetch_add(1 << 32, Ordering::AcqRel);
+    }
+
+    /// Called on each scheduler pass: the holder lowers an injected gate
+    /// through the production release, which publishes its Gate release.
+    pub fn lower_injected_install_gate(
+        source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+    ) {
+        let raised = INSTALL_GATE_RAISED.swap(0, Ordering::AcqRel);
+        let Some(index) = raised
+            .checked_sub(1)
+            .and_then(carrick_sched_core::spaces::SpaceIndex::from_index)
+        else {
+            return;
+        };
+        carrick_core::wait::space_access(source.zone, source.slot, crate::native_process::release)
+            .lower(index);
+        INSTALL_GATE_CENSUS.fetch_add(1, Ordering::AcqRel);
+    }
+
     static POST_SUPPLY_BUSY: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
     static POST_SUPPLY_HOLD: core::sync::atomic::AtomicBool =
@@ -495,6 +545,10 @@ mod test_support {
             INJECT_POST_SUPPLY_BUSY_ONCE => {
                 (!POST_SUPPLY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)
             }
+            INJECT_INSTALL_GATE_ONCE => {
+                (!INSTALL_GATE_ARMED.swap(true, Ordering::AcqRel)).then_some(0)
+            }
+            INJECT_INSTALL_GATE_CENSUS => Some(INSTALL_GATE_CENSUS.load(Ordering::Acquire)),
             INJECT_POST_SUPPLY_CENSUS => Some(POST_SUPPLY_CENSUS.load(Ordering::Acquire)),
             INJECT_POST_SUPPLY_BUSY_HELD => {
                 if POST_SUPPLY_HOLD.swap(true, Ordering::AcqRel) {
