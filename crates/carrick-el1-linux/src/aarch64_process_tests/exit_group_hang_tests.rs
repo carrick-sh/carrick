@@ -592,7 +592,17 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
 /// the next IRQ, and the host retires the exact thread.
 #[test]
 fn serial_host_arm_group_close_entryless_host_loaded_member_leaves_through_host() {
-    entryless_host_loaded_member_leaves_through_host(0);
+    entryless_host_loaded_member_leaves_through_host(0, false);
+}
+
+/// The member enters `FUTEX_WAIT_PRIVATE` after the close's one-shot member
+/// interrupt scan. Its park record is fresh: the native registry has never
+/// seen it, and no close interrupt will target it. The bucket-held probe
+/// must still see the member's published terminal request and refuse the
+/// park with `-EINTR`, so the close wake is never parked away.
+#[test]
+fn serial_host_arm_futex_wait_after_group_close_scan_returns_eintr() {
+    entryless_host_loaded_member_leaves_through_host(0, true);
 }
 
 /// The host's owner-cancel checkpoint (`esr` 0xfffc) still admits a native
@@ -601,10 +611,11 @@ fn serial_host_arm_group_close_entryless_host_loaded_member_leaves_through_host(
 /// own: it returns to user rather than yielding a free record.
 #[test]
 fn serial_host_arm_owner_cancel_entryless_member_keeps_host_custody() {
-    entryless_host_loaded_member_leaves_through_host(0xfffc);
+    entryless_host_loaded_member_leaves_through_host(0xfffc, false);
 }
 
-fn entryless_host_loaded_member_leaves_through_host(esr: u64) {
+fn entryless_host_loaded_member_leaves_through_host(esr: u64, futex_wait: bool) {
+    use crate::sched::LinuxSchedEntry as _;
     let (kernel, root) = bootstrap(41);
     let root = Box::leak(Box::new(root));
     root.thread().set_affinity(carrick_hal::CpuAffinity::all(2));
@@ -692,12 +703,60 @@ fn entryless_host_loaded_member_leaves_through_host(esr: u64) {
     assert_eq!(fixture.zone.slot(slot).current(), None);
 
     as_member();
+    let (mut esr, mut x0) = (esr, 0);
+    if futex_wait {
+        let word = carrick_test_support::GuestUserBuffer::from_value(0u32);
+        let mut wait = carrick_el1_abi::TrapFrame {
+            esr: 0x5600_0000,
+            elr: 0x401004,
+            slot: u64::from(slot.raw()),
+            ..Default::default()
+        };
+        wait.x[8] = crate::sched::SYS_FUTEX as u64;
+        wait.x[0] = word.arg();
+        wait.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
+        let parks = fixture.zone.counters.el1_parks.load(Ordering::Relaxed);
+        let counters = carrick_el1_abi::Counters::new();
+        let mut cpu = crate::sched::FakeCpu::default();
+        let served = (crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .serve_futex(&mut wait);
+        assert_eq!(
+            served,
+            Some(crate::sched::Served::Returned { switched: false }),
+            "a published group close must refuse the futex park"
+        );
+        assert_eq!(
+            wait.x[0],
+            carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+        );
+        assert_eq!(
+            fixture.zone.counters.el1_parks.load(Ordering::Relaxed),
+            parks
+        );
+        assert_eq!(fixture.zone.slot(slot).current(), None);
+        (esr, x0) = (wait.esr, wait.x[0]);
+    }
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot,
     };
-    let gate =
-        crate::dispatch::arm_signal_return_gate(source, &fixture.task, page, control, esr, 0, true);
+    let gate = crate::dispatch::arm_signal_return_gate(
+        source,
+        &fixture.task,
+        page,
+        control,
+        esr,
+        x0,
+        true,
+    );
     let mut return_frame = carrick_el1_abi::TrapFrame::default();
     let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     let action = crate::dispatch::arm_signal_user_return_entry(
@@ -707,7 +766,7 @@ fn entryless_host_loaded_member_leaves_through_host(esr: u64) {
         fixture_ttbr0(fixture),
         page,
         control,
-        (esr, 0),
+        (esr, x0),
         true,
         &mut service,
         |process| {
