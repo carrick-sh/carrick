@@ -142,7 +142,9 @@ fn native_exclusion_reclaims_a_full_table_of_exited_fork_holders() {
     for index in 0..8 {
         stock
             .owner
-            .provide_arm_control_capacity(0x5000_0000 + index * 0x10000)
+            .provide_arm_control_capacity(
+                0x5000_0000 + index * carrick_el1_abi::AARCH64_KERNEL_CONTROL_SIZE,
+            )
             .unwrap();
         let parent = test_execution(41, 0, 301);
         let child_mm = 302 + index;
