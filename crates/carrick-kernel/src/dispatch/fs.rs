@@ -1233,7 +1233,7 @@ impl<'a> FsView<'a> {
     pub(super) fn synthetic_proc_context(
         &self,
         context: &crate::kernel::KernelContext,
-    ) -> crate::vfs::SyntheticProcContext {
+    ) -> Result<crate::vfs::SyntheticProcContext, super::mem::ObservationBusy> {
         self.synthetic_proc_context_observed(context, || {})
     }
 
@@ -1242,7 +1242,7 @@ impl<'a> FsView<'a> {
         &self,
         context: &crate::kernel::KernelContext,
         after_proc_snapshot: impl FnOnce(),
-    ) -> crate::vfs::SyntheticProcContext {
+    ) -> Result<crate::vfs::SyntheticProcContext, super::mem::ObservationBusy> {
         let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks(context);
         let (sig_ignored, sig_caught, sig_shdpnd) =
             (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw());
@@ -1262,10 +1262,7 @@ impl<'a> FsView<'a> {
         let network_model = context.task().net_ns().view().as_ref().clone();
         after_proc_snapshot();
         let mem = self.mem_snapshot();
-        let brk_current = mem.program_break();
-        let mmap_next = mem.arena_high_water();
-        let address_space_regions = mem.proc_regions();
-        let locked_memory = mem.locked_view().into_owned();
+        let memory = mem.proc_memory()?;
         let creds = self.cred_snapshot();
         let groups = self.current_groups();
         let oom_score_adj = hvpatch_process
@@ -1314,7 +1311,7 @@ impl<'a> FsView<'a> {
                 })
                 .collect()
         });
-        crate::vfs::SyntheticProcContext {
+        Ok(crate::vfs::SyntheticProcContext {
             executable_path,
             argv,
             task_comm,
@@ -1327,10 +1324,10 @@ impl<'a> FsView<'a> {
             network_model: Some(network_model),
             runtime_endpoint_container: Some(context.container().id()),
             auxv: mem.linux_auxv_image,
-            address_space_regions,
-            locked_memory,
-            brk_current,
-            mmap_next,
+            address_space_regions: memory.regions,
+            locked_memory: memory.locked,
+            brk_current: memory.brk_current,
+            mmap_next: memory.mmap_next,
             heap_base: mem.layout.heap_base,
             native_guest_va: self.page_geometry().native_geometry().is_some(),
             ruid: creds.ruid,
@@ -1352,15 +1349,27 @@ impl<'a> FsView<'a> {
             sysvipc_shm: self.sysvipc_shm_table(),
             sysvipc_sem: self.sysvipc_sem_table(),
             sysvipc_msg: self.sysvipc_msg_table(),
-        }
+        })
     }
 
     pub(super) fn is_synthetic_virtual_path(
         &self,
         context: &crate::kernel::KernelContext,
         path: &str,
-    ) -> bool {
+    ) -> Result<bool, super::mem::ObservationBusy> {
         self.cross.is_synthetic_virtual_path(context, path)
+    }
+
+    /// [`Self::is_synthetic_virtual_path`] for a caller that may have no task
+    /// view: a native caller has no caller-relative synthetic tree.
+    pub(super) fn is_task_synthetic_path(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        path: &str,
+    ) -> Result<bool, super::mem::ObservationBusy> {
+        context.map_or(Ok(false), |context| {
+            self.is_synthetic_virtual_path(context, path)
+        })
     }
 
     pub(super) fn read_exec_file_head(&self, path: &str, max: usize) -> Option<Vec<u8>> {
@@ -1644,7 +1653,9 @@ impl<'a> FsView<'a> {
         if self.mutation_path_needs_task(context, &resolved) {
             return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
         }
-        if context.is_some_and(|context| self.is_synthetic_virtual_path(context, &resolved)) {
+        if let Some(context) = context
+            && self.is_synthetic_virtual_path(context, &resolved)?
+        {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
         // Layered metadata (overlay/disk first, then rootfs) — not rootfs-only,
@@ -3184,7 +3195,7 @@ impl SyscallDispatcher {
         dirfd: u64,
         path: &str,
         flags: u64,
-    ) -> Result<StatRecord, LinuxErrno> {
+    ) -> Result<StatRecord, DispatchError> {
         self.fs_view().path_stat_record(context, dirfd, path, flags)
     }
 

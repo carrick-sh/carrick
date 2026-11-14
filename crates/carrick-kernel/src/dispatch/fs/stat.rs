@@ -271,19 +271,21 @@ impl<'a> FsView<'a> {
         dirfd: u64,
         path: &str,
         flags: u64,
-    ) -> Result<StatRecord, LinuxErrno> {
+    ) -> Result<StatRecord, DispatchError> {
         self.path_stat_record_for(Some(context), dirfd, path, flags)
     }
 
     /// `context` is `None` for a native (ring-owned) caller, whose
-    /// caller-relative synthetic `/proc` answers are unrouted (ENOSYS).
+    /// caller-relative synthetic `/proc` answers are unrouted (ENOSYS). A
+    /// synthetic answer whose memory owner is busy returns
+    /// [`DispatchError::ObservationBusy`]: the syscall parks and reruns.
     pub(in crate::dispatch) fn path_stat_record_for(
         &self,
         context: Option<&crate::kernel::KernelContext>,
         dirfd: u64,
         path: &str,
         flags: u64,
-    ) -> Result<StatRecord, LinuxErrno> {
+    ) -> Result<StatRecord, DispatchError> {
         let at_flags = carrick_abi::LinuxAtFlags::from_bits_retain(flags);
         let mut lookup = self.lookup_path(dirfd, path, at_flags, LookupIntent::Stat { context })?;
         // A file the zone owns has host metadata that predates its in-zone
@@ -590,7 +592,7 @@ impl<'a> FsView<'a> {
             };
             match this.path_stat_record(cx.kernel, dirfd, &path, flags) {
                 Ok(record) => Ok(write_stat_record(cx.kernel, memory, statbuf, &record)),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                Err(error) => Err(error),
             }
 
         }
@@ -606,7 +608,7 @@ impl<'a> FsView<'a> {
             };
             match this.path_stat_record(cx.kernel, LINUX_AT_FDCWD, &path, 0) {
                 Ok(record) => Ok(write_x8664_stat_record(cx.kernel, memory, statbuf, &record)),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                Err(error) => Err(error),
             }
 
         }
@@ -638,7 +640,7 @@ impl<'a> FsView<'a> {
                 LINUX_AT_SYMLINK_NOFOLLOW,
             ) {
                 Ok(record) => Ok(write_x8664_stat_record(cx.kernel, memory, statbuf, &record)),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                Err(error) => Err(error),
             }
 
         }
@@ -662,7 +664,7 @@ impl<'a> FsView<'a> {
             };
             match this.path_stat_record(cx.kernel, dirfd, &path, flags) {
                 Ok(record) => Ok(write_x8664_stat_record(cx.kernel, memory, statbuf, &record)),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                Err(error) => Err(error),
             }
 
         }
@@ -715,7 +717,7 @@ impl<'a> FsView<'a> {
             let _ = lookup.resolved_path();
             match lookup.into_stat() {
                 Ok(record) => Ok(write_statx_record(cx.kernel, memory, statxbuf, &record)),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                Err(error) => Err(error),
             }
 
         }
@@ -763,10 +765,7 @@ impl<'a> FsView<'a> {
                 } else {
                     LINUX_AT_SYMLINK_NOFOLLOW
                 };
-                match this.path_stat_record(cx.kernel, dirfd, &path, stat_flags) {
-                    Ok(record) => record,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                }
+                this.path_stat_record(cx.kernel, dirfd, &path, stat_flags)?
             };
 
             // Identity-only handles can cover synthetic filesystems and never

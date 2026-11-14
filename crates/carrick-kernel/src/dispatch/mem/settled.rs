@@ -178,7 +178,9 @@ mod tests {
     fn rows(authority: &MemAuthority) -> Vec<(u64, u64, bool, bool)> {
         authority
             .lock()
-            .proc_regions()
+            .proc_memory()
+            .unwrap()
+            .regions
             .unwrap_or_default()
             .into_iter()
             .filter(|row| row.start >= BASE && row.start < BASE + PAGES * PAGE)

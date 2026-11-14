@@ -230,7 +230,9 @@ fn native_chdir_lookup(fs: &super::FsView<'_>, path: &str) -> Served {
     };
     let record = match fs.path_stat_record_for(None, LINUX_AT_FDCWD, &target, 0) {
         Ok(record) => record,
-        Err(errno) => return Served::errno(errno),
+        Err(super::DispatchError::Errno(errno)) => return Served::errno(errno),
+        // A native caller has no caller-relative synthetic answer to wait on.
+        Err(_) => return Served::Refused,
     };
     let mut reply = native_stat_bytes(HostFileOp::Newfstatat, &record);
     reply.extend_from_slice(target.as_bytes());
@@ -1009,8 +1011,13 @@ impl SyscallDispatcher {
                 match fs.path_stat_record_for(None, LINUX_AT_FDCWD, path, flags) {
                     Ok(record) => Served::Reply(0, native_stat_bytes(header.op, &record)),
                     // A caller-relative synthetic answer: unrouted.
-                    Err(errno) if errno == carrick_abi::LINUX_ENOSYS => Served::Refused,
-                    Err(errno) => Served::errno(errno),
+                    Err(super::DispatchError::Errno(errno))
+                        if errno == carrick_abi::LINUX_ENOSYS =>
+                    {
+                        Served::Refused
+                    }
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
                 }
             }
             HostFileOp::Openat => {

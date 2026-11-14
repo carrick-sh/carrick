@@ -490,6 +490,7 @@ fn proc_rows(dispatcher: &SyscallDispatcher) -> Vec<ProcMapsEntry> {
     let context = dispatcher.capture_one_task_context().unwrap();
     let mut rows = dispatcher
         .synthetic_proc_context(&context)
+        .unwrap()
         .address_space_regions
         .unwrap_or_default();
     rows.sort_by_key(|row| row.start);
@@ -2369,6 +2370,7 @@ fn locked_memory(dispatcher: &SyscallDispatcher) -> Vec<(u64, u64)> {
     let context = dispatcher.capture_one_task_context().unwrap();
     dispatcher
         .synthetic_proc_context(&context)
+        .unwrap()
         .locked_memory
         .iter()
         .map(|range| (range.start().raw(), range.end().raw()))
@@ -4021,7 +4023,13 @@ fn delegated_proc_maps_omits_hidden_arena_backing() {
             ReservationProtection::READ_WRITE,
         )
         .unwrap();
-    let rows = dispatcher.mem().lock().proc_regions().unwrap();
+    let rows = dispatcher
+        .mem()
+        .lock()
+        .proc_memory()
+        .unwrap()
+        .regions
+        .unwrap();
     assert_eq!(rows.len(), 1, "only Linux VMAs belong in proc maps");
     assert_eq!((rows[0].start, rows[0].end), (start, start + 2 * PAGE));
     assert!(rows[0].read && rows[0].write && !rows[0].execute);
