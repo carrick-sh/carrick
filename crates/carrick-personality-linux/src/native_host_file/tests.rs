@@ -1600,3 +1600,87 @@ fn crossing_preparation_visits_each_optional_gettimeofday_record() {
         None
     );
 }
+
+/// Production crossing preparation, including untouched destinations and the
+/// second nullable copy_file_range offset. This does not execute a host effect.
+#[test]
+fn direct_range_crossings_prepare_every_output_before_host_effect() {
+    use crate::crossing::{HostCrossingSet, nr};
+    let out = BASE + 4096;
+    for set in [HostCrossingSet::Aarch64, HostCrossingSet::X86] {
+        let event_bytes = if set == HostCrossingSet::X86 { 12 } else { 16 };
+        for (canonical, args, expected) in [
+            (nr::GETRANDOM, [out, 32, 0, 0, 0, 0], vec![(out, 32)]),
+            (nr::STATX, [3, BASE, 0, 0, out, 0], vec![(out, 256)]),
+            (
+                nr::COPY_FILE_RANGE,
+                [3, out, 4, out + 4096, 32, 0],
+                vec![(out, 8), (out + 4096, 8)],
+            ),
+            (nr::COPY_FILE_RANGE, [3, 0, 4, out, 32, 0], vec![(out, 8)]),
+            (
+                nr::EPOLL_PWAIT2,
+                [3, out, 2, 0, 0, 0],
+                vec![(out, 2 * event_bytes)],
+            ),
+            (
+                nr::EPOLL_PWAIT,
+                [3, out, 2, 0, 0, 0],
+                vec![(out, 2 * event_bytes)],
+            ),
+        ] {
+            if !set.is_allowed(canonical) {
+                continue;
+            }
+            let mut visited = Vec::new();
+            assert_eq!(
+                crossing_output_stage(set, canonical, &args, |address, length| {
+                    visited.push((address, length));
+                    length
+                }),
+                None
+            );
+            assert_eq!(visited, expected, "{set:?} {canonical:?}");
+            for &(untouched, _) in &expected {
+                assert_eq!(
+                    crossing_output_stage(set, canonical, &args, |address, length| {
+                        if address == untouched { 0 } else { length }
+                    }),
+                    Some(HostFileStage::PrepareOutput { address: untouched }),
+                    "{set:?} {canonical:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn epoll_crossing_array_uses_signed_count_and_exact_isa_stride() {
+    use crate::crossing::{HostCrossingSet, nr};
+    for (set, stride) in [
+        (HostCrossingSet::Aarch64, 16u64),
+        (HostCrossingSet::X86, 12),
+    ] {
+        let out = BASE + 4096 - stride;
+        assert_eq!(
+            crossing_output_stage(
+                set,
+                nr::EPOLL_PWAIT,
+                &[3, out, 1, 0, 0, 0],
+                |address, length| (BASE + 4096 - address).min(length as u64) as usize
+            ),
+            None
+        );
+        for count in [0, u32::MAX as u64, i32::MAX as u64] {
+            assert_eq!(
+                crossing_output_stage(
+                    set,
+                    nr::EPOLL_PWAIT,
+                    &[3, out, count, 0, 0, 0],
+                    |_, _| panic!("invalid event count must not prepare memory")
+                ),
+                None
+            );
+        }
+    }
+}

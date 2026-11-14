@@ -4167,3 +4167,28 @@ fn production_full_owed_return_table_reclaims_exited_fork_holders() {
         "no empty-progress Retiring rerun"
     );
 }
+
+/// Real production venues, not ARM NativeProcess refusal or a test preparer.
+#[test]
+fn serial_host_direct_output_venues_supply_untouched_pages() {
+    bounded_witness(
+        "serial_host_direct_output_venues_supply_untouched_pages",
+        || {
+            for flags in [&["-DSTATX_OUTPUT"][..], &[][..]] {
+                let elf = native_exit_fixture_with_flags("native_direct_outputs.S", flags);
+                let dir = tempfile::tempdir().expect("native direct output control");
+                let oracle = dir.path().join("oracle");
+                carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+                let native = std::process::Command::new("timeout")
+                    .arg("10")
+                    .arg(&oracle)
+                    .output()
+                    .expect("native control");
+                assert!(native.status.success(), "{flags:?}: {native:?}");
+                let outcome = run_pool_fixture(&elf, 128);
+                assert_eq!(outcome.run.exit_code, 0, "{flags:?}: {:?}", outcome.run);
+                assert!(!outcome.run.trap_limit_hit);
+            }
+        },
+    );
+}

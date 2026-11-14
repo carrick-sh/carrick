@@ -345,6 +345,17 @@ mod tests {
     }
 
     #[test]
+    fn direct_range_x86_crossings_prepare_untouched_pages() {
+        let out = 0x7000_1000;
+        let args = [3, out, 2, 0, 0, 0];
+        assert_eq!(
+            stage_output(&Untouched, 281, args),
+            Some(HostFileStage::PrepareOutput { address: out })
+        );
+        assert_eq!(stage_output(&Resident, 281, args), None);
+    }
+
+    #[test]
     fn a_crossing_output_is_made_writable_before_the_effect() {
         // x86_64 statfs 137, readlinkat 267, getxattr 191, mkdirat 258.
         let (path, out) = (0x7000_0000u64, 0x7000_1000u64);

@@ -63,6 +63,11 @@ vm_free = [
   "carrick-vmm-hvf::hatch::tests::aperture_configuration_preserves_service_copy_slot_zero",
   "carrick-vmm-hvf::hatch::tests::carrier_admission_rejects_conflicting_ring_policy_without_changing_it",
   "carrick-personality-linux::crossing::tests::all_crossings_declare_abi_output_arguments",
+  "carrick-personality-linux::native_host_file::tests::direct_range_crossings_prepare_every_output_before_host_effect",
+  "carrick-x86-cpl0::native_stage::tests::direct_range_x86_crossings_prepare_untouched_pages",
+  "carrick-vmm-kvm::cpl0_initial_mm::serial_host_direct_output_venues_supply_untouched_pages",
+  "carrick-kernel::dispatch::copyout_tests::statx_waits_for_an_owner_refused_copyout_instead_of_efault",
+  "carrick-kernel::dispatch::copyout_tests::copy_file_range_prepares_both_offsets_before_file_effect",
   "carrick-kernel::dispatch::copyout_tests::arm_host_gettimeofday_copyout_matches_both_declared_records",
 ]
 embed = [
