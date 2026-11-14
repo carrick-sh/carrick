@@ -12,7 +12,8 @@
  * Exit 0: every turn was taken. 91: the root waited out the bound for its
  * turn; 92: a worker waited out the bound for its turn (it exits 0 with the
  * result in its shared word); 93: a worker's exit was not observed within
- * the bound; 81: mmap failed; 100 + n: clone failed with errno n.
+ * the bound (or worker 2 waited it out for worker 1's); 81: mmap failed;
+ * 100 + n: clone failed with errno n.
  */
 #define THREADS 3
 #define HOPS 64
@@ -23,11 +24,11 @@
 .global _start
 .text
 _start:
-    /* Shared pages: +0x00 and +0x04 the workers' CLEARTID words, +0x08 u32
-     * turn, +0x0c and +0x10 the workers' results; worker 1's stack below
-     * +0x2000, worker 2's below +0x3000. */
+    /* Shared pages: +0x08 u32 turn, +0x0c and +0x10 the workers' results;
+     * worker 1's stack below +0x2000, worker 2's below +0x3000; +0x3000 and
+     * +0x3004 the workers' CLEARTID words. */
     xor %edi, %edi
-    mov $0x3000, %esi
+    mov $0x4000, %esi
     mov $3, %edx
     mov $0x22, %r10d
     mov $-1, %r8
@@ -42,6 +43,7 @@ _start:
     movl $0, 0x08(%r12)
     movl $0, 0x1000(%r12)
     movl $0, 0x2000(%r12)
+    movl $0, 0x3000(%r12)
 
     mov $1, %ebx
     lea 0x1ff0(%r12), %rsi
@@ -60,8 +62,8 @@ root_done:
     /* Join both workers by their CLEARTID words. */
     call stamp_start
 join_loop:
-    mov (%r12), %eax
-    or 0x04(%r12), %eax
+    mov 0x3000(%r12), %eax
+    or 0x3004(%r12), %eax
     jz joined
     mov $24, %eax               /* sched_yield */
     syscall
@@ -77,11 +79,11 @@ joined:
 
 /* Clone worker %ebx on the stack at %rsi:
  * clone(CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|
- * CHILD_CLEARTID, stack, &tid[k-1], &tid[k-1], 0). The worker keeps %ebx
- * and %r12. */
+ * CHILD_CLEARTID, stack, &tid, &tid, 0), its tid word at +0x2ffc + 4 * k.
+ * The worker keeps %ebx and %r12. */
 spawn:
     mov $0x00350f00, %edi
-    lea -4(%r12,%rbx,4), %rdx
+    lea 0x2ffc(%r12,%rbx,4), %rdx
     mov %rdx, %r10
     xor %r8d, %r8d
     mov $56, %eax
@@ -94,8 +96,23 @@ spawn:
 worker:
     call take_turns
     test %eax, %eax
-    jz worker_exit
+    jz worker_done
     movl $92, 0x08(%r12,%rbx,4)
+worker_done:
+    /* Worker 2 exits only once worker 1 has: two siblings' raw exits at
+     * once are #2359's, not this witness's. */
+    cmp $2, %ebx
+    jne worker_exit
+    call stamp_start
+exit_wait:
+    cmpl $0, 0x3000(%r12)
+    je worker_exit
+    mov $24, %eax               /* sched_yield */
+    syscall
+    call elapsed_over
+    test %eax, %eax
+    jz exit_wait
+    movl $93, 0x10(%r12)
 worker_exit:
     xor %edi, %edi
     mov $60, %eax
