@@ -4470,6 +4470,98 @@ fn sole_member_exec_closes_admission_before_adopting_successor() {
     assert!(fixture.page.cancel_host_birth_claim(host_birth).is_some());
 }
 
+/// #2235: a process's record names its task key; its threads see their
+/// namespace-visible tids. A carrier whose task keys are not namespace pids
+/// (the x86 KVM run issues host-scale keys, its children see pid 2, ...)
+/// still execs: the sole-member check compares the record against the
+/// entry's own task key, never against a visible tid in another domain.
+#[cfg(test)]
+#[test]
+fn exec_succeeds_when_task_keys_are_not_namespace_tids() {
+    let fixture = NativeSignalFixture::new_with_context::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        ExecutionBinding {
+            task: carrick_core_abi::EntryTaskKey::from_raw(198_057),
+            generation: carrick_core_abi::SnapshotGeneration::from_raw(11),
+            mm: carrick_core_abi::EntryMmKey::from_raw(1),
+            thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(101),
+        },
+        carrick_core_abi::EntryTaskKey::from_raw(198_057),
+        carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(11).unwrap()),
+        words,
+    );
+    // The namespace view: the process and its thread are pid 2.
+    fixture.task.publish_visible_pid(2);
+    // SAFETY: the fixture's sole member; nothing else reads its slot yet.
+    unsafe { fixture.control.promote_exec_identity_owned(2) };
+    {
+        let mut graph = fixture.runtime.graph.lock();
+        let key = graph.owner.tasks().values().next().unwrap().key();
+        let row = graph.owner.task_mut(key).unwrap();
+        row.metadata_mut().namespace_pid = 2;
+        for thread in &mut row.threads.threads {
+            thread.tid = 2;
+        }
+    }
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_service(
+                test_exec_payload(b"/bin/static"),
+                None,
+                NativeServiceCall::new(
+                    carrick_guest_arch::NativeOrdinal::new(221),
+                    &carrick_el1_abi::Counters::new()
+                )
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let successor_mm =
+        publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 67, 0x9a_0000);
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::NoPending)
+    ));
+    assert!(entry.take_run_failure().is_none());
+    assert_eq!(
+        fixture.task.mm.key.load(Ordering::Acquire),
+        successor_mm.raw(),
+        "the exec committed its successor rather than killing the caller"
+    );
+}
+
 #[cfg(test)]
 fn exec_closes_over_predecessor_gate(gate: carrick_el1_abi::GateState) {
     let fixture = native_exec_fixture();
@@ -11759,13 +11851,13 @@ impl crate::file::MemoryValidator for ResidentUser {
 
 /// The x86 CPL0 `NativeService` completion arm's production body, driven with
 /// an admitted native fork child and the registered root: a child's
-/// `execve`/`execveat` takes native-service staging and settles with a counted
-/// ENOSYS, a root's takes the fallback counted refusal, and neither is
-/// forwarded to the host.
+/// `execve`/`execveat` is the native exec service's (#2235) and never settles
+/// here, a root's takes the counted refusal, and neither is forwarded.
 #[test]
 #[cfg(test)]
-fn x86_native_exec_completion_stages_the_fork_child_and_refuses_the_root() {
-    use crate::dispatch::{NativeServiceSettlement, settle_unwired_native_service};
+fn x86_native_exec_completion_claims_the_fork_child_and_refuses_the_root() {
+    use crate::dispatch::{native_exec_claimed, settle_unwired_native_service};
+    use crate::native_process_runtime::NativeThreadGroupOwner as Owner;
     use carrick_guest_arch::NativeOrdinal;
     let capacity = NativeServiceCapacityFixture::new(1);
     let (child, _, _) = capacity.select().unwrap();
@@ -11773,21 +11865,17 @@ fn x86_native_exec_completion_stages_the_fork_child_and_refuses_the_root() {
     let root = fixture.record;
     assert!(fixture.registry.record_is_fork_child(fixture.zone, child));
     assert!(!fixture.registry.record_is_fork_child(fixture.zone, root));
+    let owner = |record| {
+        if fixture.registry.record_is_fork_child(fixture.zone, record) {
+            Owner::ForkChild
+        } else {
+            Owner::Root
+        }
+    };
+    assert!(native_exec_claimed(|| owner(child)));
+    assert!(!native_exec_claimed(|| owner(root)));
 
-    let path = b"/bin/static\0";
-    let arg = b"static\0";
-    let env = b"A=B\0";
-    let argv: [u64; 2] = [arg.as_ptr() as u64, 0];
-    let envp: [u64; 2] = [env.as_ptr() as u64, 0];
-    let (path, argv, envp) = (
-        path.as_ptr() as u64,
-        argv.as_ptr() as u64,
-        envp.as_ptr() as u64,
-    );
-    for (native, canonical, args) in [
-        (59, 221, [path, argv, envp, 0, 0, 0]),
-        (322, 281, [(-100i64) as u64, path, argv, envp, 0, 0]),
-    ] {
+    for (native, canonical) in [(59, 221), (322, 281)] {
         // The x86 route table hands this exec to the native service; without
         // that arm the call is refused before any completion runs.
         assert_eq!(
@@ -11795,37 +11883,17 @@ fn x86_native_exec_completion_stages_the_fork_child_and_refuses_the_root() {
             carrick_personality_linux::dispatch::Family::NativeService,
             "native {native}: x86 routes exec to the native service"
         );
-        let ordinal = NativeOrdinal::new(native);
         let bucket = native as usize;
-        let settle = |record, counters: &carrick_el1_abi::Counters| {
+        let counters = carrick_el1_abi::Counters::new();
+        assert_eq!(
             settle_unwired_native_service(
                 fixture.registry,
                 fixture.zone,
-                Some(record),
-                canonical,
-                args,
-                ordinal,
-                fixture.task,
-                &ResidentUser,
-                counters,
-            )
-        };
-
-        let counters = carrick_el1_abi::Counters::new();
-        assert_eq!(
-            settle(child, &counters),
-            NativeServiceSettlement::ExecStaged(-38),
-            "native {native}: a fork child's exec stages and settles"
-        );
-        assert_eq!(counters.refused[bucket].load(Ordering::Relaxed), 1);
-        assert_eq!(counters.refused_child[bucket].load(Ordering::Relaxed), 1);
-        assert_eq!(counters.forwarded[bucket].load(Ordering::Relaxed), 0);
-        assert_eq!(counters.venue_refused[bucket].load(Ordering::Relaxed), 0);
-
-        let counters = carrick_el1_abi::Counters::new();
-        assert_eq!(
-            settle(root, &counters),
-            NativeServiceSettlement::Refused(-38),
+                Some(root),
+                NativeOrdinal::new(native),
+                &counters,
+            ),
+            -38,
             "native {native}: a root's exec keeps the counted refusal"
         );
         assert_eq!(counters.refused[bucket].load(Ordering::Relaxed), 1);

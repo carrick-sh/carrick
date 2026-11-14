@@ -739,6 +739,83 @@ pub enum UserFaultSupply {
 
 /// Supply a syscall's staged user access through the same owner fault path
 /// as the #PF entry, so a non-resident buffer is faulted in, never EFAULT.
+/// Stage and begin a claimed native exec. A staging fault is supplied through
+/// the owner fault path and the exact syscall is re-entered; a refused supply
+/// is EFAULT, and a staging errno is returned as is.
+fn native_exec_call(
+    process: &mut carrick_el1_linux::native_process_runtime::NativeProcessEntry<
+        '_,
+        'static,
+        native_process::Mm,
+        carrick_sched_core::ParkedContextWords,
+        native_process::Service,
+    >,
+    frame: &mut NativeFrame,
+    binding: &CpuBinding,
+    task: &CurrentTask,
+    slot: carrick_sched_core::SlotId,
+    request: carrick_el1_linux::exec_stage::ExecStageRequest,
+    ordinal: carrick_guest_arch::NativeOrdinal,
+) -> CompletionRoute {
+    use carrick_el1_linux::dispatch::NativeExecStage;
+    use carrick_el1_linux::native_process_runtime::{NativeResume, NativeServiceCall};
+    // SAFETY: the admitted CPU binding retains the initialized counter
+    // region for the entire native service continuation.
+    let counters: &'static Counters = unsafe { &*(binding.counters_address as *const Counters) };
+    let staged = carrick_el1_linux::dispatch::native_exec_stage_request(
+        task,
+        &carrick_el1_linux::file::HardwareValidator,
+        request,
+    );
+    let payload = match staged {
+        Some(NativeExecStage::Payload(payload)) => payload,
+        Some(NativeExecStage::Failed(errno)) => {
+            frame.rax = errno.guest_retval() as u64;
+            return CompletionRoute::Served;
+        }
+        Some(NativeExecStage::Fault(fault)) => {
+            return match supply_syscall_fault(
+                binding,
+                task,
+                counters,
+                slot,
+                fault.address.raw(),
+                fault.access,
+            ) {
+                UserFaultSupply::Served => {
+                    // Rewind to the `syscall` instruction with the original
+                    // number, exactly as a restarted call re-enters.
+                    frame.rax = ordinal.raw();
+                    frame.rcx = frame.rcx.checked_sub(2).unwrap_or_else(|| fatal_boot());
+                    CompletionRoute::Served
+                }
+                UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
+                    frame.rax = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
+                    CompletionRoute::Served
+                }
+            };
+        }
+        None => fatal_boot(),
+    };
+    let table = carrick_el1_linux::ipc::guest_venue(u32::from(slot.raw()))
+        .and_then(|venue| carrick_el1_linux::ipc::native_exec_table(venue.tables, task));
+    match process.begin_exec_call(payload, table, NativeServiceCall::new(ordinal, counters)) {
+        Ok(NativeResume::Left(None)) => {
+            // The ring owner took the call: its replacement or errno is now
+            // the owner's, and the census records the call as ring-served.
+            if let Some(served) = counters.served.get(ordinal.raw() as usize) {
+                served.fetch_add(1, Ordering::Relaxed);
+            }
+            CompletionRoute::Suspended
+        }
+        Ok(NativeResume::Returned(result)) => {
+            frame.rax = result.raw() as u64;
+            CompletionRoute::Served
+        }
+        _ => fatal_boot(),
+    }
+}
+
 fn supply_syscall_fault(
     binding: &CpuBinding,
     task: &CurrentTask,
@@ -1281,6 +1358,28 @@ impl Personality for LinuxPersonality {
                     _ => fatal_boot(),
                 };
             }
+            // A fork child's execve/execveat is the native exec service's
+            // (#2235): stage its arguments exactly as ARM's owned entry
+            // does, then hand the payload to the shared owner, which parks
+            // until the carrier has prepared and sealed the successor.
+            if route == CompletionRoute::NativeService
+                && carrick_el1_linux::dispatch::native_exec_claimed(|| process.thread_group_owner())
+                && let Some(request) =
+                    carrick_el1_linux::exec_stage::ExecStageRequest::from_canonical(
+                        call.canonical.raw(),
+                        call.args,
+                    )
+            {
+                route = native_exec_call(
+                    &mut process,
+                    frame,
+                    binding,
+                    task,
+                    slot,
+                    request,
+                    carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                );
+            }
             if let Some(venue) = anonymous.as_mut()
                 && venue.take_retry()
             {
@@ -1459,8 +1558,8 @@ impl Personality for LinuxPersonality {
             // Entropy has been staged above. Any other unwired native service
             // fails closed with a counted refusal.
             CompletionRoute::NativeService => {
-                // A fork child's exec stages (no x86 successor hooks until
-                // #1093 S3/S4); everything else is the counted refusal.
+                // A fork child's exec was handed to the native exec service
+                // above; everything else is the counted refusal.
                 frame.rax = carrick_el1_linux::dispatch::settle_unwired_native_service(
                     native_process::registry(),
                     source.zone,
@@ -1469,14 +1568,9 @@ impl Personality for LinuxPersonality {
                         .slot(slot)
                         .current()
                         .map(|r| source.zone.record_ref(r)),
-                    call.canonical.raw(),
-                    call.args,
                     carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
-                    task,
-                    &carrick_el1_linux::file::HardwareValidator,
                     counters,
-                )
-                .retval() as u64;
+                ) as u64;
                 ControlFlow::Return(())
             }
             CompletionRoute::Forward | CompletionRoute::HostCustody => {

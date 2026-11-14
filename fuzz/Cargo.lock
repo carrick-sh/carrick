@@ -833,6 +833,7 @@ dependencies = [
  "carrick-mmu-core",
  "carrick-sched-core",
  "carrick-x86",
+ "getrandom 0.3.4",
  "libc",
  "static_assertions",
 ]

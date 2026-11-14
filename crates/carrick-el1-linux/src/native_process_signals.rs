@@ -540,6 +540,46 @@ impl<'a, T> NativeProcessSignals<'a, T> {
         }
         deliverable
     }
+    /// A default-action termination may end a retained internal service.
+    /// Caught signals stay pending through exec even though they interrupt
+    /// ordinary user waits; ignored and blocked signals cannot cancel it.
+    pub fn has_default_terminating_deliverable(
+        &self,
+        tid: carrick_sched_core::RecordRef,
+        blocked: SigBlockMask,
+    ) -> bool {
+        self.default_terminating_deliverable(tid, blocked).is_some()
+    }
+    /// Preserve the fatal signal selected at service cancellation even when
+    /// another member consumes the pending entry before its ACK arrives.
+    pub fn default_terminating_deliverable(
+        &self,
+        tid: carrick_sched_core::RecordRef,
+        blocked: SigBlockMask,
+    ) -> Option<Signal> {
+        let resources = self.resources.lock();
+        let present = resources
+            .inbox
+            .pending()
+            .present()
+            .union(resources.thread_pending_set(tid));
+        let mut selected = blocked.select(present);
+        while let Some(number) = selected.lowest() {
+            let Some(signal) = Signal::from_number(number) else {
+                break;
+            };
+            if resources.actions.action(signal).disposition == Disposition::Default
+                && matches!(
+                    carrick_signal_core::policy::default_delivery(signal),
+                    carrick_signal_core::policy::Delivery::Terminate { .. }
+                )
+            {
+                return Some(signal);
+            }
+            selected = selected.without(signal);
+        }
+        None
+    }
     /// Arm `hook` to run after the next deliverable check that finds nothing.
     #[cfg(all(test, not(target_os = "macos")))]
     pub(crate) fn after_next_empty_check(&self, hook: EmptyCheckHook<'a, T>) {

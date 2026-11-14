@@ -153,23 +153,52 @@ pub fn with_cow_copy_aliases<W, R>(
 where
     W: LiveDescriptorWords + ?Sized,
 {
+    if source == destination {
+        return Err(DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking));
+    }
+    with_copy_window_frames(words, root, Some(source), Some(destination), copy)
+}
+
+/// The same exact-MM pair as [`with_cow_copy_aliases`], with either leaf
+/// optional: the read-only first leaf maps `source`, the writable second
+/// maps `destination`. An exec successor's build reads staged inputs and
+/// writes its unpublished frames through it, one page at a time, with no
+/// other supervisor alias of either frame. `effect` receives both window
+/// addresses; it must touch only the leaves it asked for.
+pub fn with_copy_window_frames<W, R>(
+    words: &W,
+    root: RootGpa,
+    source: Option<FrameGpa>,
+    destination: Option<FrameGpa>,
+    effect: impl FnOnce(u64, u64) -> R,
+) -> Result<R, DescriptorOutcome>
+where
+    W: LiveDescriptorWords + ?Sized,
+{
     let refused = DescriptorOutcome::Refused;
     let pair = pair(words, root).map_err(refused)?;
-    if !frame_valid(source)
-        || !frame_valid(destination)
-        || source == destination
-        || pair.tables.contains(&source.raw())
-        || pair.tables.contains(&destination.raw())
-    {
+    if source.is_none() && destination.is_none() {
         return Err(refused(DescriptorRefusal::WrongBacking));
     }
-    let edits = [
-        (pair.addresses[0], source.raw() | PRESENT | NX | ACCESSED),
-        (
+    for frame in source.into_iter().chain(destination) {
+        if !frame_valid(frame) || pair.tables.contains(&frame.raw()) {
+            return Err(refused(DescriptorRefusal::WrongBacking));
+        }
+    }
+    let mut edits = [(0, 0); 2];
+    let mut count = 0;
+    if let Some(source) = source {
+        edits[count] = (pair.addresses[0], source.raw() | PRESENT | NX | ACCESSED);
+        count += 1;
+    }
+    if let Some(destination) = destination {
+        edits[count] = (
             pair.addresses[1],
             destination.raw() | PRESENT | WRITE | NX | ACCESSED | DIRTY,
-        ),
-    ];
+        );
+        count += 1;
+    }
+    let edits = &edits[..count];
     for (index, &(address, after)) in edits.iter().enumerate() {
         if words.compare_exchange(address, 0, after) != Ok(true) {
             return Err(if restore(words, &edits[..index]) {
@@ -181,8 +210,8 @@ where
     }
     words.publish_barrier();
     words.invalidate_range(COW_COPY_WINDOW_BASE, COW_COPY_WINDOW_LEN);
-    let result = copy(COW_COPY_WINDOW_BASE, COW_COPY_WINDOW_BASE + 4096);
-    if !restore(words, &edits) {
+    let result = effect(COW_COPY_WINDOW_BASE, COW_COPY_WINDOW_BASE + 4096);
+    if !restore(words, edits) {
         return Err(DescriptorOutcome::Indeterminate(
             DescriptorRefusal::Contended,
         ));
@@ -345,5 +374,53 @@ mod tests {
                 assert_eq!((words.read(0x4000), words.read(0x4008)), (0, 0));
             }
         }
+    }
+
+    /// An exec build maps one leaf at a time: a read-only source alone, or
+    /// a writable destination alone. Each is restored and drained before
+    /// the call returns, and the other leaf is never touched.
+    #[test]
+    fn a_single_leaf_maps_only_the_frame_it_names() {
+        let words = Words::new();
+        provision_cow_copy_window(&words, root(0x1000), tables()).unwrap();
+        words.drains.set(0);
+        with_copy_window_frames(
+            &words,
+            root(0x1000),
+            Some(FrameGpa::new(0x100000)),
+            None,
+            |_, _| {
+                assert_eq!(words.read(0x4000), 0x100000 | PRESENT | NX | ACCESSED);
+                assert_eq!(words.read(0x4008), 0);
+            },
+        )
+        .unwrap();
+        with_copy_window_frames(
+            &words,
+            root(0x1000),
+            None,
+            Some(FrameGpa::new(0x2_0000_0000)),
+            |_, _| {
+                assert_eq!(words.read(0x4000), 0);
+                assert_eq!(
+                    words.read(0x4008),
+                    0x2_0000_0000 | PRESENT | WRITE | NX | ACCESSED | DIRTY
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!((words.read(0x4000), words.read(0x4008)), (0, 0));
+        assert_eq!(words.drains.get(), 4);
+        assert!(with_copy_window_frames(&words, root(0x1000), None, None, |_, _| ()).is_err());
+        assert!(
+            with_copy_window_frames(
+                &words,
+                root(0x1000),
+                Some(tables()[2].address()),
+                None,
+                |_, _| ()
+            )
+            .is_err()
+        );
     }
 }

@@ -240,6 +240,9 @@ pub(super) struct PendingService<'a> {
     entropy_preparation: Option<EntropyPreparation>,
     stage_prefix: Option<RefusedStagePrefix<'a>>,
     fault_reply_cancelling: bool,
+    /// Zero until the group's first default-fatal signal cancels this exec.
+    /// The queue entry may be consumed by a sibling before the service ACK.
+    pub(super) exec_fatal_signal: core::sync::atomic::AtomicU8,
     clock_sample: Option<PendingClockSample>,
     copyout: Option<Box<OwnedCopyout<'a>>>,
     copyin: bool,
@@ -261,6 +264,7 @@ impl PendingService<'_> {
             && self.copyout.is_none()
             && !self.copyin
             && !self.adapter
+            && !matches!(self.request.operation, ServiceOperation::Exec { .. })
             && !matches!(self.request.operation, ServiceOperation::CarrierWork { .. })
     }
 }
@@ -494,14 +498,44 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             }
             return Ok(());
         }
-        let pending = self
-            .graph
-            .lock()
-            .service_wait(&record)
-            .filter(|pending| {
-                pending.signal_interruptible() || pending.claim.cancellation().is_some()
-            })
-            .map(|pending| (pending.request, pending.control.clone(), pending.adapter));
+        let pending = {
+            let graph = self.graph.lock();
+            graph
+                .service_wait(&record)
+                .filter(|pending| {
+                    if !matches!(pending.request.operation, ServiceOperation::Exec { .. }) {
+                        return pending.signal_interruptible()
+                            || pending.claim.cancellation().is_some();
+                    }
+                    let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                        carrick_signal_core::SignalSet::from_bits(pending.control.blocked().0),
+                    );
+                    let fatal = graph.owner.tasks().values().any(|row| {
+                        let resources = row.native().resources();
+                        let fatal = resources
+                            .members
+                            .iter()
+                            .any(|member| member.record == record)
+                            .then(|| {
+                                resources
+                                    .signals()
+                                    .default_terminating_deliverable(record, blocked)
+                            })
+                            .flatten();
+                        if let Some(signal) = fatal {
+                            let _ = pending.exec_fatal_signal.compare_exchange(
+                                0,
+                                signal.number() as u8,
+                                core::sync::atomic::Ordering::Release,
+                                core::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        fatal.is_some()
+                    });
+                    fatal || pending.claim.cancellation().is_some()
+                })
+                .map(|pending| (pending.request, pending.control.clone(), pending.adapter))
+        };
         let Some((request, control, adapter)) = pending else {
             // Scalar IPC has a retained adapter token, not a host-service cell.
             // Its queue owns cancellation and the existing deferred handback.
@@ -1245,6 +1279,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceCompletion::Inline,
         )
     }
+    /// Begin a staged exec through the same owner on every ISA, for an entry
+    /// whose service settles inline (x86): the copyout drain and handoff
+    /// receipt are this call's, as for [`Self::begin_host_file_call`].
+    pub fn begin_exec_call(
+        &mut self,
+        payload: Box<[u8]>,
+        table: Option<[u64; 3]>,
+        call: NativeServiceCall<'_>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let result = self.begin_exec_service(payload, table, call);
+        let result = self.drain_copyout(result);
+        self.finish_service_handoff(result)
+    }
     /// Keep a carrier-retained private-mapping source for this record:
     /// `key` names the exact `mmap` retry that consumes it.
     fn stash_map_source(
@@ -1975,6 +2022,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 entropy_preparation,
                 stage_prefix,
                 fault_reply_cancelling: false,
+                exec_fatal_signal: core::sync::atomic::AtomicU8::new(0),
                 clock_sample,
                 copyout,
                 copyin,
@@ -2155,13 +2203,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ),
             &|_| {},
             || {
-                let interruptible = self
-                    .runtime
-                    .graph
-                    .lock()
-                    .service_wait(&self.record)
-                    .is_some_and(PendingService::signal_interruptible);
-                if ((interruptible && self.signal_interrupts_current())
+                let (interruptible, exec) =
+                    self.runtime.graph.lock().service_wait(&self.record).map_or(
+                        (false, false),
+                        |pending| {
+                            (
+                                pending.signal_interruptible(),
+                                matches!(pending.request.operation, ServiceOperation::Exec { .. }),
+                            )
+                        },
+                    );
+                if (((interruptible && self.signal_interrupts_current())
+                    || (exec && self.latch_default_terminating_exec_signal()))
                     || self.runtime.graph.lock().pending.has_exit(&self.key))
                     && let Err(error) = self.control.service.cancel(request.identity)
                 {
@@ -2408,12 +2461,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     zone.object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
                         crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
                     })?;
-                let (interruptible, output_cancelled) =
+                let (interruptible, exec, output_cancelled) =
                     self.runtime.graph.lock().service_wait(&self.record).map_or(
-                        (true, false),
+                        (true, false, false),
                         |pending| {
                             (
                                 pending.signal_interruptible(),
+                                matches!(pending.request.operation, ServiceOperation::Exec { .. }),
                                 (pending.copyout.is_some() || pending.copyin)
                                     && pending.claim.cancellation().is_some(),
                             )
@@ -2421,6 +2475,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     );
                 if output_cancelled
                     || (interruptible && self.signal_interrupts_current())
+                    || (exec && self.latch_default_terminating_exec_signal())
                     || self.runtime.graph.lock().pending.has_exit(&self.key)
                 {
                     self.control
@@ -2724,7 +2779,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok_or(NativeProcessError::Stale)?;
         if keys.as_slice() != [old_key]
             || self.control.visible_tid() != Some(self.calling_tid)
-            || self.source.zone.record(self.record.id).identity().tid != self.calling_tid as u64
+            // The record names its task key, the entry's own binding task;
+            // the calling tid is the namespace view, another domain.
+            || self.source.zone.record(self.record.id).identity().tid != self.binding.task.raw()
         {
             return Err(NativeProcessError::Busy);
         }
@@ -3225,6 +3282,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         if pending.fault_reply_cancelling {
             result = ServiceResult::Cancelled;
+        }
+        if matches!(request.operation, ServiceOperation::Exec { .. })
+            && result == ServiceResult::Cancelled
+        {
+            // The cancellation choice belongs to the group, not the next
+            // lowest-numbered signal taken by this old-image member. Its
+            // original fatal signal remains authoritative after another
+            // thread consumes the pending entry.
+            let group_closing = self.runtime.graph.lock().pending.has_exit(&self.key)
+                || matches!(
+                    pending.claim.cancellation(),
+                    Some(
+                        carrick_core::terminal::ProcessCancellation::FatalSignal
+                            | carrick_core::terminal::ProcessCancellation::GroupExit
+                    )
+                );
+            let fatal = carrick_signal_core::policy::Signal::from_number(
+                pending
+                    .exec_fatal_signal
+                    .load(core::sync::atomic::Ordering::Acquire) as i32,
+            );
+            self.discard_rerun_answers();
+            self.release_service_claim(pending.claim)?;
+            if group_closing {
+                return Ok(self.retire_lost_exec_race());
+            }
+            if let Some(signal) = fatal
+                && self.exit_with_signal(signal).is_ok()
+            {
+                return Ok(NativeResume::Left(None));
+            }
+            return Ok(self.retire_lost_exec_race());
         }
         if exiting {
             self.discard_rerun_answers();
@@ -3736,9 +3825,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     )))
                 }
                 (ServiceOperation::Exec { .. }, ServiceResult::Cancelled) => {
-                    // An exec cancellation is published only by process closing.
-                    // The caller is being retired and must never observe EINTR.
-                    Ok(NativeResume::NoPending)
+                    // Cancelled execs retire above before an old-image return.
+                    Err(NativeProcessError::Quarantined)
                 }
             }
         })();
