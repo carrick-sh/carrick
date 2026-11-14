@@ -290,6 +290,14 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn enqueue_thread(&mut self, _record: RecordRef) -> BornEnqueue {
         BornEnqueue::Refused
     }
+    /// `sched_yield` whose slot owes a runnable sibling the CPU
+    /// ([`carrick_sched_core::YieldTurn::Rotate`]): the owner saves the
+    /// caller's completed syscall (result 0) and requeues it at the tail,
+    /// and the execution lane runs the head. `None`: the owner kept the
+    /// caller, which completes the yield in place.
+    fn native_yield(&mut self) -> Option<LifecycleOutcome> {
+        None
+    }
     fn wake_thread_join(&mut self, _mm: carrick_core_abi::EntryMmKey, _address: UserVa) -> bool {
         false
     }

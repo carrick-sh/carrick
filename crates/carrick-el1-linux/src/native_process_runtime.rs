@@ -9135,6 +9135,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         }
         queued.into()
     }
+    fn native_yield(&mut self) -> Option<LifecycleOutcome> {
+        let (zone, slot) = (self.source.zone, self.source.slot);
+        if zone.yield_turn(slot) == carrick_sched_core::YieldTurn::Keep {
+            return None;
+        }
+        let record = self.record.id;
+        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)?;
+        // SAFETY: the prepared handoff owns this exact running record until
+        // the requeue below publishes it with its completed yield.
+        unsafe {
+            *zone.record(record).ctx_mut() = self.words.with_syscall_return(0);
+        }
+        let requeue = zone.requeue_preempted(slot, record);
+        let Some(receipt) = carrick_core::entry::publish_handoff_yield(start, requeue) else {
+            return Some(self.run_failed(carrick_core_abi::NativeRunFailureReason::NativeStale));
+        };
+        self.handoff = Some(receipt);
+        Some(LifecycleOutcome::Transferred {
+            progress: carrick_core::Served::Idle,
+            result: SyscallResult::new(0),
+        })
+    }
     fn wake_thread_join(&mut self, mm: carrick_core_abi::EntryMmKey, address: UserVa) -> bool {
         if mm != self.binding.mm {
             return false;

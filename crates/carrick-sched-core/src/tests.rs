@@ -1734,6 +1734,28 @@ fn a_preempted_thread_resumes_without_a_result() {
     assert_eq!(zone.record(b).handback(), Some(Handback::Resumed));
 }
 
+/// #2354: a guest `sched_yield` is a turn boundary exactly while a runnable
+/// thread waits on the caller's slot. Two live threads on one slot take
+/// turns by yields alone, each yield requeueing its caller at the tail and
+/// switching the head in (the x86 owner's order; ARM switches first).
+#[test]
+fn a_yield_hands_the_slot_to_a_queued_sibling_and_back() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let a = zone.current_or_new(SLOT, identity(1)).unwrap();
+    assert_eq!(zone.yield_turn(SLOT), YieldTurn::Keep, "nothing waits");
+    let b = park(&zone, 2, 0x1000);
+    let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
+    for (yielder, next) in [(a, b), (b, a), (a, b)] {
+        assert_eq!(zone.yield_turn(SLOT), YieldTurn::Rotate);
+        assert!(zone.requeue_preempted(SLOT, yielder).is_queued());
+        assert_eq!(zone.switch_in(SLOT), Some(next));
+        assert_eq!(zone.slot(SLOT).current(), Some(next));
+        assert_eq!(zone.runnable_head(SLOT), Some(yielder));
+    }
+    assert_eq!(zone.counters.el1_preemptions.load(Ordering::Relaxed), 3);
+}
+
 /// A tick moves a queued floating thread to an idle slot instead of making
 /// it wait for the running one.
 #[test]
