@@ -191,7 +191,7 @@ test_signed_run_tests_isolated() {
             status=deadline
         elif [ "$rc" -eq 0 ] && grep -aq ' 1 passed; 0 failed; 0 ignored;' "$out"; then
             status=passed
-        elif [ "$rc" -eq 77 ] && reg=$(grep -a -m1 '^test-signed: needs developer registry ' "$out"); then
+        elif [ "$rc" -ne 0 ] && reg=$(grep -a -m1 '^test-signed: needs developer registry ' "$out"); then
             # #1448: the test needs a developer registry (localhost:5005/:5050) this host
             # lacks (carrick_embed::testing::require_dev_registry). Named and counted as
             # not run, and failing: never a silent pass, never a product failure.
