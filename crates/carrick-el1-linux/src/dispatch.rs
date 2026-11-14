@@ -2308,9 +2308,13 @@ pub(super) fn arm_signal_return_admission(
     control: &carrick_el1_abi::ThreadControlSlot,
     fatal_owner_cancel: bool,
 ) -> Option<bool> {
-    let needed = control.zone_record().is_some_and(|record| {
-        super::aarch64_process::registry().signal_checkpoint_needed(zone, record)
-    });
+    let needed = control.host_exit_requested()
+        || control
+            .host_birth_identity()
+            .is_some_and(|birth| page.host_birth_requested(birth))
+        || control.zone_record().is_some_and(|record| {
+            super::aarch64_process::registry().signal_checkpoint_needed(zone, record)
+        });
     (fatal_owner_cancel || carrick_el1_abi::Lifecycle::gate(page).serves_ring() || needed)
         .then_some(needed)
 }
@@ -2336,13 +2340,18 @@ pub(super) fn arm_signal_return_gate(
         page,
         control,
     );
+    // An already closing member retains terminal execution authority even if
+    // the ordinary entry venue has fallen back to Host after admission closed.
+    let terminal_checkpoint =
+        arm_signal_return_admission(source.zone, page, control, fatal_owner_cancel)?;
     if venue == carrick_el1::substrate::sched::NativeEntryVenue::Host
         && !(fatal_owner_cancel && control.native_signal_owner())
+        && !(terminal_checkpoint
+            && task.owns_lifecycle_page(page)
+            && task.owns_control_slot(control))
     {
         return None;
     }
-    let terminal_checkpoint =
-        arm_signal_return_admission(source.zone, page, control, fatal_owner_cancel)?;
     if !fatal_owner_cancel
         && !(esr == 0xfffe && x0 == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
         && !control.has_in_zone_standard_signal()
@@ -2384,7 +2393,13 @@ pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockC
     let (action, checkpoint) = arm_signal_user_return_admitted_entry(
         source, task, native, ttbr0, page, control, admission, service, deliver,
     )?;
-    debug_assert_eq!(checkpoint, admission);
+    if control.host_exit_requested()
+        || control
+            .host_birth_identity()
+            .is_some_and(|birth| page.host_birth_requested(birth))
+    {
+        assert!(checkpoint, "terminal request must survive the return gate");
+    }
     Ok(action)
 }
 

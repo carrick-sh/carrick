@@ -7,6 +7,7 @@ use super::native_process_runtime::{
 use carrick_el1_abi::{BlockedMask, CurrentTask};
 use carrick_guest_arch::{ProcessContext, UserVa};
 use carrick_personality_linux::dispatch::CompletionRoute;
+use carrick_personality_linux::lifecycle::LifecycleOutcome;
 use carrick_personality_linux::signal::{ProcessSignals, SignalBackend, SignalFrameSetup};
 use carrick_signal_core::policy::{self, SigBlockMask, Signal};
 
@@ -60,7 +61,6 @@ where
         return None;
     }
     if let Some(outcome) = process.resume_terminal_user_return() {
-        use carrick_personality_linux::lifecycle::LifecycleOutcome;
         return Some(match outcome {
             LifecycleOutcome::Transferred {
                 progress: carrick_core::Served::Idle,
@@ -142,6 +142,13 @@ where
                 }
                 return if let policy::Delivery::Terminate { .. } = policy::default_delivery(sig) {
                     Some(match process.exit_with_signal(sig) {
+                        Ok(LifecycleOutcome::HostCustody) => {
+                            if process.yield_terminal_host_custody() {
+                                CompletionRoute::Suspended
+                            } else {
+                                CompletionRoute::InvalidCompletion
+                            }
+                        }
                         Ok(_) => CompletionRoute::Suspended,
                         Err(NativeProcessError::GroupExitCustody) => {
                             machine.group_exit_custody(task)
@@ -368,6 +375,13 @@ where
     }
     if original == Signal::SEGV {
         return Some(match process.exit_with_signal(Signal::SEGV) {
+            Ok(LifecycleOutcome::HostCustody) => {
+                if process.yield_terminal_host_custody() {
+                    CompletionRoute::Suspended
+                } else {
+                    CompletionRoute::InvalidCompletion
+                }
+            }
             Ok(_) => CompletionRoute::Suspended,
             Err(NativeProcessError::GroupExitCustody) => machine.group_exit_custody(task),
             Err(_) => CompletionRoute::InvalidCompletion,
