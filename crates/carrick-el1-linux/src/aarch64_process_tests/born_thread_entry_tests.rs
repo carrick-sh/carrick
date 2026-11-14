@@ -1576,6 +1576,47 @@ fn arm_vfork_while_sibling_parked_in_wait4_suspends_parent_until_release() {
     );
 }
 
+/// #2276: Go starts its telemetry sidecar with a zero-stack
+/// `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` while its sysmon thread remains
+/// runnable. The live child must not make that sibling's ordinary output to
+/// the shared parent's memory look like a bad user pointer.
+#[test]
+fn arm_vfork_live_child_keeps_sibling_clock_copyout_writable() {
+    let mut harness = ProductionProcessHarness::new();
+    let mut cpu = crate::sched::FakeCpu::default();
+    let sibling_stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
+    let (_sibling_tid, sibling) = harness.spawn_thread(&sibling_stack, &mut cpu);
+
+    let mut vfork = carrick_el1_abi::TrapFrame::default();
+    vfork.x[8] = 220;
+    vfork.x[0] = 0x4111;
+    vfork.x[1] = 0;
+    harness.call_current(&mut vfork, &mut cpu);
+    assert!(matches!(
+        harness.fixture.zone.record(harness.parent_record).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(sibling),
+        "the sibling must run while the vfork caller and child remain live"
+    );
+
+    let mut clock = carrick_el1_abi::TrapFrame::default();
+    clock.x[8] = carrick_abi::syscall::nr::CLOCK_GETTIME.raw();
+    clock.x[0] = 1;
+    clock.x[1] = VA;
+    let route = harness.call_current(&mut clock, &mut cpu);
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::NativeService,
+        "a sibling clock_gettime output must enter the retained owner-fault service before the host crossing: x0={} current={:?}",
+        clock.x[0] as i64,
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+    );
+    assert_ne!(clock.x[0] as i64, -14, "owner preparation is never EFAULT");
+}
+
 /// #2071 witness 5: a child exits between the first waiter parking and the
 /// second waiter parking (while the first waiter's continuation row is still
 /// retained before its resume checkpoint runs, and across channel generation

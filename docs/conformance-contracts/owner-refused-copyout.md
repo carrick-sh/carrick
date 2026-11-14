@@ -1,5 +1,18 @@
 # Exact physical grant completion
 
+### Live shared-MM vfork child (#2276)
+
+`arm_vfork_live_child_keeps_sibling_clock_copyout_writable` enters through the
+production AArch64 SVC dispatcher with two live threads. One thread starts a
+zero-stack `CLONE_VM | CLONE_VFORK` child and remains suspended while the
+sibling calls `clock_gettime` into its own mapped memory. The host crossing
+must first retain the existing owner-fault preparation; the shared-MM child's
+live COW publication cannot turn valid sibling output into `EFAULT`.
+
+This VM-free binding covers declaration and owner-side admission before the
+crossing. Signed HVF remains the production proof for the host copy venue and
+the Go telemetry sidecar.
+
 `kernel.mm.copyout-owner-gate` also covers the interval between physical
 alias publication and its EL1 descriptor receipt. An exact live provisional
 owner is a completion dependency, not a permanent supply refusal. A contender
