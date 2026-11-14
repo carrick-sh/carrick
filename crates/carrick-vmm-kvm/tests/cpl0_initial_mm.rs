@@ -536,11 +536,15 @@ fn native_fork_child_execs_while_parent_keeps_running() {
 fn native_fork_child_exec_wakes_after_stock_holder_retires() {
     let directory = tempfile::tempdir().expect("successor directory");
     let successor = directory.path().join("successor");
-    let marker = native_exit_fixture("native_exec_marker.S");
+    let marker = native_exit_fixture("native_exec_stock_successor.S");
     carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
     let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
     let elf = native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define]);
     let outcome = run_exec_fixture(&elf, 256);
+    assert!(
+        outcome.physical.fork_stock_counters().successor_table_refusals > 0,
+        "the live exec must actually park for fork stock"
+    );
     assert_eq!(outcome.run.exit_code, 0, "parked exec must wake after stock return");
     assert_eq!(outcome.run.stdout, b"X\n");
 }
@@ -551,7 +555,7 @@ fn native_fork_child_exec_wakes_after_stock_holder_retires() {
 fn native_fork_child_exec_killed_while_parked_is_reaped() {
     let directory = tempfile::tempdir().expect("successor directory");
     let successor = directory.path().join("successor");
-    let marker = native_exit_fixture("native_exec_marker.S");
+    let marker = native_exit_fixture("native_exec_stock_successor.S");
     carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
     let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
     let elf = native_exit_fixture_with_flags(
@@ -559,6 +563,10 @@ fn native_fork_child_exec_killed_while_parked_is_reaped() {
         &[&define, "-DCANCEL_PARKED"],
     );
     let outcome = run_exec_fixture(&elf, 256);
+    assert!(
+        outcome.physical.fork_stock_counters().successor_table_refusals > 0,
+        "the killed exec must actually park for fork stock"
+    );
     assert_eq!(outcome.run.exit_code, 0, "wait4 must reap the parked child");
 }
 
