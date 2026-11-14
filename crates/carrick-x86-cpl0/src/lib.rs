@@ -114,6 +114,26 @@ mod test_support {
     /// Injected install gates: raised in the high 32 bits, lowered in the
     /// low 32 bits.
     pub const INJECT_INSTALL_GATE_CENSUS: u64 = 0xffff_ffff_ffff_fe35;
+    /// The next contended fault's holder releases between the fault's
+    /// probe and its park (#2263): the park's recheck sees the release, the
+    /// probe finds no conflict, and the access reruns without a park.
+    pub const INJECT_RELEASE_IN_PARK_WINDOW_ONCE: u64 = 0xffff_ffff_ffff_fe37;
+    /// Holder releases injected in a fault's park window.
+    pub const INJECT_RELEASE_IN_PARK_WINDOW_CENSUS: u64 = 0xffff_ffff_ffff_fe38;
+    static RELEASE_IN_PARK_WINDOW: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    static RELEASE_IN_PARK_WINDOW_CENSUS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    /// Whether this fault park's holder releases in its window (once).
+    pub fn take_release_in_park_window() -> bool {
+        let armed = RELEASE_IN_PARK_WINDOW.swap(false, Ordering::AcqRel);
+        if armed {
+            RELEASE_IN_PARK_WINDOW_CENSUS.fetch_add(1, Ordering::AcqRel);
+        }
+        armed
+    }
+
     static INSTALL_GATE_ARMED: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
     /// The raised space's index plus one, or 0.
@@ -594,6 +614,12 @@ mod test_support {
                 (!INSTALL_GATE_ARMED.swap(true, Ordering::AcqRel)).then_some(0)
             }
             INJECT_INSTALL_GATE_CENSUS => Some(INSTALL_GATE_CENSUS.load(Ordering::Acquire)),
+            INJECT_RELEASE_IN_PARK_WINDOW_ONCE => {
+                (!RELEASE_IN_PARK_WINDOW.swap(true, Ordering::AcqRel)).then_some(0)
+            }
+            INJECT_RELEASE_IN_PARK_WINDOW_CENSUS => {
+                Some(RELEASE_IN_PARK_WINDOW_CENSUS.load(Ordering::Acquire))
+            }
             INJECT_POST_SUPPLY_CENSUS => Some(POST_SUPPLY_CENSUS.load(Ordering::Acquire)),
             INJECT_POST_SUPPLY_PARKED => Some(u64::from(edit_park_published())),
             INJECT_POST_SUPPLY_BUSY_HELD => {

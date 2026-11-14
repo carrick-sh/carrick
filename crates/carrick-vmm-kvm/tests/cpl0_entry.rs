@@ -1212,8 +1212,26 @@ fn production_user_fault_editor_busy_once_parks_and_reruns() {
 /// wrong result exits with the write's own return value.
 #[test]
 fn production_staged_copy_editor_busy_once_parks_and_reruns() {
+    staged_copy_editor_busy_witness(false);
+}
+
+/// The staged copy's holder releases in the window between the call's
+/// contention probe and its park, as a real holder's drop can. The park's
+/// recheck refuses it: that refusal is "not now", never a broken
+/// invariant, so the call reruns whole without parking (no carrier fault)
+/// and writes all 16 bytes.
+#[test]
+fn production_staged_copy_release_in_park_window_reruns() {
+    staged_copy_editor_busy_witness(true);
+}
+
+/// `release_in_park_window`: the holder releases before the park enrolls,
+/// so the call reruns without a park; otherwise it parks exactly once.
+fn staged_copy_editor_busy_witness(release_in_park_window: bool) {
     const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
     const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+    const INJECT_RELEASE_IN_PARK_WINDOW_ONCE: u64 = 0xffff_ffff_ffff_fe37;
+    const INJECT_RELEASE_IN_PARK_WINDOW_CENSUS: u64 = 0xffff_ffff_ffff_fe38;
 
     let mut code = Vec::new();
     let mut failures = Vec::new();
@@ -1262,6 +1280,11 @@ fn production_staged_copy_editor_busy_once_parks_and_reruns() {
     append_mov(&mut code, &[0x48, 0xb8], INJECT_EDITOR_BUSY_ONCE);
     code.extend_from_slice(&[0x0f, 0x05]);
     append_result_check(&mut code, &mut failures, 0);
+    if release_in_park_window {
+        append_mov(&mut code, &[0x48, 0xb8], INJECT_RELEASE_IN_PARK_WINDOW_ONCE);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        append_result_check(&mut code, &mut failures, 0);
+    }
     // write(r13, r12, 16): the gather's first read meets the held editor.
     code.extend_from_slice(&[0x4c, 0x89, 0xef]); // mov rdi,r13
     code.extend_from_slice(&[0x4c, 0x89, 0xe6]); // mov rsi,r12
@@ -1276,7 +1299,17 @@ fn production_staged_copy_editor_busy_once_parks_and_reruns() {
     code.extend_from_slice(&wrong);
     append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
     code.extend_from_slice(&[0x0f, 0x05]);
-    append_result_check(&mut code, &mut failures, 1);
+    append_result_check(&mut code, &mut failures, i8::from(!release_in_park_window));
+    if release_in_park_window {
+        // The one armed window release ran, in this call's park.
+        append_mov(
+            &mut code,
+            &[0x48, 0xb8],
+            INJECT_RELEASE_IN_PARK_WINDOW_CENSUS,
+        );
+        code.extend_from_slice(&[0x0f, 0x05]);
+        append_result_check(&mut code, &mut failures, 1);
+    }
     append_mov(&mut code, &[0x48, 0xbf], 7);
     append_mov(&mut code, &[0x48, 0xb8], 231);
     code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);

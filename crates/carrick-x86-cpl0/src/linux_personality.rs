@@ -767,7 +767,8 @@ fn park_contended_user_fault(
             native_execution::schedule(prep.slot)
         }
         anonymous::ContendedFault::Rerun => 0,
-        anonymous::ContendedFault::Refused => 9,
+        // A broken invariant of the faulting task's own MM, never contention.
+        anonymous::ContendedFault::Refused(_) => 9,
     }
 }
 
@@ -1485,10 +1486,12 @@ impl Personality for LinuxPersonality {
                                 rerun.set_syscall_return(call.native.raw());
                                 match anonymous::park_contended_fault(task, slot, cause, &rerun) {
                                     anonymous::ContendedFault::Parked => parked = true,
+                                    // Not now, never fatal: rerun the call.
                                     anonymous::ContendedFault::Rerun => retry = true,
                                     // The caller's own live MM refused the
-                                    // wait: a broken invariant, as on #PF.
-                                    anonymous::ContendedFault::Refused => fatal_boot(),
+                                    // wait (Stale or Invalid): a broken
+                                    // invariant, as on #PF.
+                                    anonymous::ContendedFault::Refused(_) => fatal_boot(),
                                 }
                                 None
                             }

@@ -706,14 +706,41 @@ impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
     }
 }
 
-/// What a user #PF that met MM contention does next (#2141).
+/// What a user access that met MM contention does next (#2141): a user #PF
+/// or a staged syscall copy.
 pub(super) enum ContendedFault {
     /// Parked on the cause's release; the caller leaves for the scheduler.
     Parked,
-    /// The contention ended before a park published: rerun the access.
+    /// Not now: the contention ended before a park published (the holder
+    /// released in the park's window, so its recheck refused it), or the
+    /// wait queue was busy. Rerun the access, which probes once more and
+    /// parks if the cause is still held. Never fatal.
     Rerun,
-    /// No live MM source can carry the wait.
-    Refused,
+    /// A broken invariant: the caller's own live MM cannot carry the wait.
+    Refused(FaultParkRefusal),
+}
+
+/// Why a contended access's own live MM refused its wait. Contention is
+/// never one of these: it parks or reruns ([`ContendedFault::Rerun`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FaultParkRefusal {
+    /// The MM, its space entry or its notification source retired, or the
+    /// waiting record left the slot.
+    Stale,
+    /// A cause the fault owner never contends on, a record already holding
+    /// an operation, or an exhausted queue identity.
+    Invalid,
+}
+
+impl FaultParkRefusal {
+    fn of_park(error: ObjectWaitError) -> Option<Self> {
+        match error {
+            // Contention, or a revision that moved: not now.
+            ObjectWaitError::Busy | ObjectWaitError::Changed => None,
+            ObjectWaitError::Stale => Some(Self::Stale),
+            ObjectWaitError::Occupied | ObjectWaitError::Exhausted => Some(Self::Invalid),
+        }
+    }
 }
 
 /// Park a user #PF refused by MM contention on that cause's release, through
@@ -736,37 +763,49 @@ pub(super) fn park_contended_fault(
     use carrick_sched_core::spaces::EditAdmissionRefusal;
     // The fault owner contends only on its root, editor and gate. The probe
     // below observes exactly these; any other cause would never re-probe.
+    use FaultParkRefusal::{Invalid, Stale};
     if !matches!(
         cause,
         SpaceWaitCause::Reservations | SpaceWaitCause::Editor | SpaceWaitCause::Gate
     ) {
-        return ContendedFault::Refused;
+        return ContendedFault::Refused(Invalid);
     }
     let source = carrick_x86_carrier::native_execution::source(slot);
     let zone = source.zone;
     let Some(mm) = carrick_el1_abi::ReservationMm::new(task.mm.key.load(Ordering::Acquire)) else {
-        return ContendedFault::Refused;
+        return ContendedFault::Refused(Invalid);
     };
     let Some(lease) = NonZeroU64::new(mm.raw())
         .and_then(|key| zone.space_entry(key))
         .and_then(|entry| entry.live_notifications().ok())
     else {
-        return ContendedFault::Refused;
+        return ContendedFault::Refused(Stale);
     };
     let table = shared_x86_cpl0_guest();
-    let (Some(index), Some(owner)) = (
-        zone.spaces.find(mm.raw()),
-        NonZeroU64::new(slot.index() as u64 + 1),
-    ) else {
-        return ContendedFault::Refused;
+    let Some(index) = zone.spaces.find(mm.raw()) else {
+        return ContendedFault::Refused(Stale);
+    };
+    let Some(owner) = NonZeroU64::new(slot.index() as u64 + 1) else {
+        return ContendedFault::Refused(Invalid);
     };
     if !table.admitted(index.index(), mm) {
-        return ContendedFault::Refused;
+        return ContendedFault::Refused(Stale);
     }
     let access = space_access(zone, slot, crate::native_process::release);
+    /// The refusal the shared coordinator folds into `Refused`, typed per
+    /// probe-and-park attempt.
+    #[derive(Clone, Copy)]
+    enum ParkVerdict {
+        NotNow,
+        Invariant(FaultParkRefusal),
+    }
+    let verdict = core::cell::Cell::new(ParkVerdict::Invariant(Invalid));
     let outcome = coordinate_fault_retry_wait(
         &lease,
         || {
+            // A refused snapshot or token after this probe is an invalid
+            // identity; the probe and the park type their own refusals.
+            verdict.set(ParkVerdict::Invariant(Invalid));
             match table.lock_in(access, index.index(), mm, slot.index() as u32) {
                 Ok(root) => drop(root),
                 Err(carrick_el1::memory::reservations::Refusal::Busy) => {
@@ -785,10 +824,29 @@ pub(super) fn park_contended_fault(
                 }
                 Err(EditAdmissionRefusal::Editor) => Some(Some(SpaceWaitCause::Editor)),
                 Err(EditAdmissionRefusal::Gate) => Some(Some(SpaceWaitCause::Gate)),
-                Err(EditAdmissionRefusal::Stale) => None,
+                Err(EditAdmissionRefusal::Stale) => {
+                    verdict.set(ParkVerdict::Invariant(Stale));
+                    None
+                }
             }
         },
         |key, snapshot, token| {
+            #[cfg(feature = "test-support")]
+            if crate::test_support::take_release_in_park_window()
+                && carrick_sched_core::spaces::release_injected_editor_hold()
+            {
+                // The holder's drop in this window publishes its release,
+                // as a real holder's does, before this park enrolls.
+                let _ = crate::test_support::take_edit_park();
+                carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+                    zone,
+                    waker: carrick_sched_core::Waker::El1 { slot },
+                    deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                        crate::native_process::release,
+                    ),
+                }
+                .publish(lease.reserve(SpaceWaitCause::Editor));
+            }
             let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
             let mut replaced = None;
             let result = park_object_record_rechecked(
@@ -815,11 +873,17 @@ pub(super) fn park_contended_fault(
                     })
                 },
             );
-            if result.is_err()
-                && let Some((record, previous)) = replaced
-            {
-                // SAFETY: a failed park leaves the same current slot owning this record.
-                *unsafe { zone.record(record).ctx_mut() } = previous;
+            if let Err((error, _)) = &result {
+                if let Some((record, previous)) = replaced {
+                    // SAFETY: a failed park leaves the same current slot owning this record.
+                    *unsafe { zone.record(record).ctx_mut() } = previous;
+                }
+                // Not now: the coordinator re-probes a moved revision; a
+                // busy queue reruns the access.
+                verdict.set(
+                    FaultParkRefusal::of_park(*error)
+                        .map_or(ParkVerdict::NotNow, ParkVerdict::Invariant),
+                );
             }
             result
         },
@@ -831,7 +895,11 @@ pub(super) fn park_contended_fault(
             ContendedFault::Parked
         }
         EditWaitOutcome::NoConflict | EditWaitOutcome::StaleToken => ContendedFault::Rerun,
-        EditWaitOutcome::Refused => ContendedFault::Refused,
+        EditWaitOutcome::Refused if !lease.is_live() => ContendedFault::Refused(Stale),
+        EditWaitOutcome::Refused => match verdict.get() {
+            ParkVerdict::NotNow => ContendedFault::Rerun,
+            ParkVerdict::Invariant(invariant) => ContendedFault::Refused(invariant),
+        },
     }
 }
 
