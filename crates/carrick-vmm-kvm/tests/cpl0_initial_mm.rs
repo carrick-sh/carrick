@@ -529,6 +529,39 @@ fn native_fork_child_execs_while_parent_keeps_running() {
     assert!(outcome.run.stderr.is_empty());
 }
 
+/// A second live child holds fork-stock tables while this child's production
+/// NATIVE_SERVICE_PORT exec parks. Retirement returns the tables and must
+/// resume the exact parked record through its scheduler object queue.
+#[test]
+fn native_fork_child_exec_wakes_after_stock_holder_retires() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = native_exit_fixture("native_exec_marker.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define]);
+    let outcome = run_exec_fixture(&elf, 256);
+    assert_eq!(outcome.run.exit_code, 0, "parked exec must wake after stock return");
+    assert_eq!(outcome.run.stdout, b"X\n");
+}
+
+/// SIGKILL must acknowledge a parked exec's service ticket even when its
+/// stock holder remains live. The parent's wait4 must collect the killed child.
+#[test]
+fn native_fork_child_exec_killed_while_parked_is_reaped() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = native_exit_fixture("native_exec_marker.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags(
+        "native_fork_exec_stock.S",
+        &[&define, "-DCANCEL_PARKED"],
+    );
+    let outcome = run_exec_fixture(&elf, 256);
+    assert_eq!(outcome.run.exit_code, 0, "wait4 must reap the parked child");
+}
+
 /// Run the production CPL0 root, which execs `path` and exits with the
 /// refused errno (38 is ENOSYS) if `execve` returns.
 fn run_root_exec(path: &std::path::Path) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
