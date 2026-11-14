@@ -36,7 +36,8 @@ pub const RUNNERS_FILE: &str = ".github/signed-gate-runners.txt";
 pub const LIVE_WINDOW_SECS: u64 = 12 * 3600;
 /// A gate job queued this long on a per-Mac label means that label isn't being served.
 pub const STRANDED_AFTER_SECS: u64 = 15 * 60;
-/// How long `watchdog` lets a routed gate wait for its Mac before cancelling the run.
+/// How long `watchdog` lets a routed gate wait for its Mac, from first seeing it queued, before
+/// cancelling the run.
 pub const WATCHDOG_SECS: u64 = 20 * 60;
 
 /// `secs` since the Unix epoch as GitHub's `YYYY-MM-DDTHH:MM:SSZ`, so timestamps compare as strings.
@@ -203,89 +204,133 @@ pub fn decide(
     Route::Shared(last)
 }
 
-/// What the watchdog does about a run's `gate` job.
+/// What the watchdog sees of a run's `gate` job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Watch {
     /// Nothing to watch: it started, ended, or runs on the shared label.
     Done(String),
-    /// A routed gate is still queued, within the limit.
+    /// Not listed yet, or its labels aren't resolved: keep looking (never read as shared).
     Wait,
-    /// A routed gate waited past the limit: cancel the run.
-    Cancel(String),
+    /// Routed to this per-Mac label and still queued, not started.
+    Queued(String),
 }
 
-/// The watchdog's decision for `gate` (a jobs-API row, or `None` before GitHub lists it).
-pub fn watch_decision(gate: Option<&Value>, now: u64, limit_secs: u64) -> Watch {
+/// Classify `gate` (a jobs-API row, or `None` before GitHub lists it).
+pub fn watch_decision(gate: Option<&Value>) -> Watch {
     let Some(job) = gate else {
         return Watch::Wait;
     };
-    let routed = job["labels"].as_array().and_then(|labels| {
-        labels
-            .iter()
-            .filter_map(Value::as_str)
-            .find(|l| l.starts_with("carrick-signed-gate-"))
-            .map(str::to_owned)
-    });
-    let Some(label) = routed else {
+    let labels: Vec<&str> = job["labels"]
+        .as_array()
+        .map(|labels| labels.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if labels.is_empty() {
+        return Watch::Wait;
+    }
+    let Some(label) = labels
+        .iter()
+        .find(|l| l.starts_with("carrick-signed-gate-"))
+        .map(|l| (*l).to_owned())
+    else {
         return Watch::Done("the gate runs on the shared label".into());
     };
     if job["status"] != "queued" || job["started_at"].as_str().is_some() {
-        return Watch::Done(format!("the gate on {label} has started"));
+        return Watch::Done(format!("the gate on {label} has started or ended"));
     }
-    let deadline = iso_utc(now.saturating_sub(limit_secs));
-    match job["created_at"].as_str() {
-        Some(created) if created < deadline.as_str() => Watch::Cancel(format!(
-            "the gate has waited over {} min for {label}, which no runner is serving; cancelling the run so the \
-             group fails now and the re-queued group routes to the shared label",
-            limit_secs / 60
-        )),
-        _ => Watch::Wait,
-    }
+    Watch::Queued(label)
 }
 
-/// `signed-gate watchdog`: watch run `run_id`'s `gate` job; cancel the run when a routed gate hasn't
-/// started within `limit_secs`. Exits non-zero after cancelling.
+/// `signed-gate watchdog`: watch run `run_id`'s `gate` job; cancel the run when a gate routed to a
+/// per-Mac label stays queued for `limit_secs` from the moment this watch first sees it queued (the
+/// workflow starts this job with the gate's own `needs`, so prerequisites never count against the
+/// limit). The job is re-read just before cancelling; a gate a runner takes between that read and
+/// the cancel is lost to a race GitHub's API can't close, which costs that one attempt, never a
+/// verdict. Exits non-zero after cancelling.
 pub fn watchdog(run_id: u64, limit_secs: u64, poll_secs: u64) -> Result<(), super::ReceiptError> {
     let repo = crate::ci_scaler::REPOSITORY;
     let started = std::time::Instant::now();
-    loop {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let jobs = super::api(&format!(
-            "repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"
-        ));
-        let gate = jobs
-            .as_ref()
+    let outcome = watch_with(
+        || {
+            super::api(&format!(
+                "repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"
+            ))
             .ok()
             .and_then(|v| v["jobs"].as_array().cloned())
-            .and_then(|jobs| jobs.into_iter().find(|job| job["name"] == "gate"));
-        match watch_decision(gate.as_ref(), now, limit_secs) {
-            Watch::Done(why) => {
-                eprintln!("signed-gate watchdog: {why}");
-                return Ok(());
-            }
-            Watch::Cancel(why) => {
-                eprintln!("signed-gate watchdog: {why}");
-                super::checked(
-                    "gh",
-                    &["run", "cancel", &run_id.to_string(), "--repo", repo],
-                    None,
-                )?;
-                return Err(super::fail(why));
-            }
-            Watch::Wait => {}
+            .and_then(|jobs| jobs.into_iter().find(|job| job["name"] == "gate"))
+        },
+        || started.elapsed().as_secs(),
+        || std::thread::sleep(std::time::Duration::from_secs(poll_secs.max(1))),
+        || {
+            super::checked(
+                "gh",
+                &["run", "cancel", &run_id.to_string(), "--repo", repo],
+                None,
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())
+        },
+        limit_secs,
+    );
+    match outcome {
+        Ok(Watched::Left(why)) => {
+            eprintln!("signed-gate watchdog: {why}");
+            Ok(())
         }
-        // A gate GitHub never lists, or a jobs API that keeps failing, ends the watch too.
-        if started.elapsed().as_secs() > limit_secs + 600 {
-            eprintln!(
-                "signed-gate watchdog: no routed gate to watch after {} min; stopping",
-                started.elapsed().as_secs() / 60
-            );
-            return Ok(());
+        Ok(Watched::Cancelled(why)) => {
+            eprintln!("signed-gate watchdog: {why}");
+            Err(super::fail(why))
         }
-        std::thread::sleep(std::time::Duration::from_secs(poll_secs.max(1)));
+        Err(e) => Err(super::fail(e)),
+    }
+}
+
+/// How a watch ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Watched {
+    /// Nothing to cancel.
+    Left(String),
+    /// The run was cancelled.
+    Cancelled(String),
+}
+
+/// The watch loop over injected reads, clock (seconds since the watch began), sleep and cancel.
+pub fn watch_with(
+    mut read: impl FnMut() -> Option<Value>,
+    mut clock: impl FnMut() -> u64,
+    mut sleep: impl FnMut(),
+    mut cancel: impl FnMut() -> Result<(), String>,
+    limit_secs: u64,
+) -> Result<Watched, String> {
+    let mut queued_since: Option<u64> = None;
+    loop {
+        match watch_decision(read().as_ref()) {
+            Watch::Done(why) => return Ok(Watched::Left(why)),
+            Watch::Queued(label) => {
+                let since = *queued_since.get_or_insert_with(&mut clock);
+                if clock().saturating_sub(since) >= limit_secs {
+                    // Last look: a runner may have taken it since the previous poll.
+                    if !matches!(watch_decision(read().as_ref()), Watch::Queued(_)) {
+                        return Ok(Watched::Left(format!(
+                            "the gate on {label} started at the deadline"
+                        )));
+                    }
+                    cancel()?;
+                    return Ok(Watched::Cancelled(format!(
+                        "the gate waited {} min for {label}, which no runner is serving; cancelled the run so \
+                         the group fails now and the re-queued group routes to the shared label",
+                        limit_secs / 60
+                    )));
+                }
+            }
+            Watch::Wait => {
+                // The gate's prerequisites have finished when this job runs, so a gate GitHub never
+                // lists (or a jobs API that keeps failing) for an hour ends the watch.
+                if queued_since.is_none() && clock() > 3600 {
+                    return Ok(Watched::Left("no routed gate listed after 60 min".into()));
+                }
+            }
+        }
+        sleep();
     }
 }
 
@@ -668,50 +713,103 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdog_cancels_only_a_routed_gate_past_its_limit() {
-        let now = 1_794_700_000;
-        let gate = |labels: &[&str], status: &str, started: Option<u64>, created: u64| {
-            json!({"name": "gate", "status": status, "labels": labels,
-                "started_at": started.map(iso_utc), "created_at": iso_utc(created)})
-        };
+    fn the_watchdog_watches_only_a_routed_queued_gate() {
+        let gate = |labels: &[&str], status: &str, started: Option<&str>| json!({"name": "gate", "status": status, "labels": labels, "started_at": started});
         let routed = [
             "self-hosted",
             "macOS",
             "ARM64",
             "carrick-signed-gate-carrick-m4",
         ];
-        assert_eq!(watch_decision(None, now, WATCHDOG_SECS), Watch::Wait);
-        assert!(matches!(
-            watch_decision(
-                Some(&gate(&SHARED_LABELS, "queued", None, now - 3600)),
-                now,
-                WATCHDOG_SECS
-            ),
-            Watch::Done(_)
-        ));
-        assert!(matches!(
-            watch_decision(
-                Some(&gate(&routed, "in_progress", Some(now - 60), now - 3600)),
-                now,
-                WATCHDOG_SECS
-            ),
-            Watch::Done(_)
-        ));
+        // Not listed yet, or labels unresolved: keep looking, never read as shared (#2341 re-review).
+        assert_eq!(watch_decision(None), Watch::Wait);
         assert_eq!(
-            watch_decision(
-                Some(&gate(&routed, "queued", None, now - 600)),
-                now,
-                WATCHDOG_SECS
-            ),
+            watch_decision(Some(&gate(&[], "queued", None))),
             Watch::Wait
         );
         assert!(matches!(
-            watch_decision(
-                Some(&gate(&routed, "queued", None, now - 1500)),
-                now,
-                WATCHDOG_SECS
-            ),
-            Watch::Cancel(_)
+            watch_decision(Some(&gate(&SHARED_LABELS, "queued", None))),
+            Watch::Done(_)
+        ));
+        assert!(matches!(
+            watch_decision(Some(&gate(
+                &routed,
+                "in_progress",
+                Some("2026-11-14T18:00:00Z")
+            ))),
+            Watch::Done(_)
+        ));
+        assert!(matches!(
+            watch_decision(Some(&gate(&routed, "completed", None))),
+            Watch::Done(_)
+        ));
+        assert_eq!(
+            watch_decision(Some(&gate(&routed, "queued", None))),
+            Watch::Queued("carrick-signed-gate-carrick-m4".into())
+        );
+    }
+
+    /// A fake watch: `script(poll)` is the gate row at each poll; the clock advances 60 s per sleep.
+    fn run_watch(script: impl Fn(u64) -> Option<Value>) -> (Result<Watched, String>, u64, bool) {
+        let polls = std::cell::Cell::new(0u64);
+        let cancelled = std::cell::Cell::new(false);
+        let outcome = watch_with(
+            || {
+                let row = script(polls.get());
+                polls.set(polls.get() + 1);
+                row
+            },
+            || polls.get() * 60,
+            || {},
+            || {
+                cancelled.set(true);
+                Ok(())
+            },
+            WATCHDOG_SECS,
+        );
+        (outcome, polls.get(), cancelled.get())
+    }
+
+    #[test]
+    fn a_routed_gate_queued_after_a_long_prerequisite_wait_is_still_cancelled() {
+        // #2341 re-review: prerequisites took 45 min; then the gate queued on a Mac that's gone.
+        let routed = json!({"name": "gate", "status": "queued", "started_at": null,
+            "labels": ["self-hosted", "macOS", "ARM64", "carrick-signed-gate-carrick-m4"]});
+        let (outcome, polls, cancelled) = run_watch(|poll| (poll >= 45).then(|| routed.clone()));
+        assert!(matches!(outcome, Ok(Watched::Cancelled(_))), "{outcome:?}");
+        assert!(cancelled);
+        // Counted from first seen queued (poll 45), not from the watch's start.
+        assert!(polls >= 45 + 20, "{polls}");
+    }
+
+    #[test]
+    fn a_gate_that_starts_at_the_deadline_is_not_cancelled() {
+        let queued = json!({"name": "gate", "status": "queued", "started_at": null,
+            "labels": ["carrick-signed-gate-carrick-m4"]});
+        let running = json!({"name": "gate", "status": "in_progress", "started_at": "2026-11-14T18:00:00Z",
+            "labels": ["carrick-signed-gate-carrick-m4"]});
+        // Queued through the deadline poll; running on the final re-read.
+        let (outcome, _, cancelled) = run_watch(|poll| {
+            Some(if poll <= 20 {
+                queued.clone()
+            } else {
+                running.clone()
+            })
+        });
+        assert!(
+            matches!(outcome, Ok(Watched::Left(ref why)) if why.contains("at the deadline")),
+            "{outcome:?}"
+        );
+        assert!(!cancelled);
+        // A shared-label gate and a gate that never appears end the watch without cancelling.
+        let shared = json!({"name": "gate", "status": "queued", "labels": SHARED_LABELS});
+        assert!(matches!(
+            run_watch(|_| Some(shared.clone())),
+            (Ok(Watched::Left(_)), _, false)
+        ));
+        assert!(matches!(
+            run_watch(|_| None),
+            (Ok(Watched::Left(_)), _, false)
         ));
     }
 
