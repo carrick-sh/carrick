@@ -90,17 +90,17 @@ mod test_support {
     /// The next owner fault's application step is Busy once (#2141): after
     /// its physical supply crossing returns, before the guest applies it.
     /// The synthetic editor holder releases once the faulting member parks.
-    pub const INJECT_POST_SUPPLY_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe22;
+    pub const INJECT_POST_SUPPLY_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe30;
     /// Post-supply Busies injected so far: COW supplies in the high 32 bits,
     /// Prepare supplies in the low 32 bits.
-    pub const INJECT_POST_SUPPLY_CENSUS: u64 = 0xffff_ffff_ffff_fe23;
+    pub const INJECT_POST_SUPPLY_CENSUS: u64 = 0xffff_ffff_ffff_fe31;
     /// As [`INJECT_POST_SUPPLY_BUSY_ONCE`], but the synthetic holder stays
     /// held after the faulting member parks, until another member's
     /// [`INJECT_RELEASE_POST_SUPPLY_HOLD`].
-    pub const INJECT_POST_SUPPLY_BUSY_HELD: u64 = 0xffff_ffff_ffff_fe24;
+    pub const INJECT_POST_SUPPLY_BUSY_HELD: u64 = 0xffff_ffff_ffff_fe32;
     /// Release a held post-supply holder from another member: publish the
     /// held MM's Editor release once its waiter has parked. 1 if released.
-    pub const INJECT_RELEASE_POST_SUPPLY_HOLD: u64 = 0xffff_ffff_ffff_fe25;
+    pub const INJECT_RELEASE_POST_SUPPLY_HOLD: u64 = 0xffff_ffff_ffff_fe33;
     static POST_SUPPLY_BUSY: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
     static POST_SUPPLY_HOLD: core::sync::atomic::AtomicBool =
