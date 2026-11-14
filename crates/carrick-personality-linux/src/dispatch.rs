@@ -471,6 +471,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
                     LifecycleOutcome::Transferred { .. } => None,
                 };
                 FamilyRun {
+                    return_venue: ReturnVenue::Native,
                     completion: crate::lifecycle::lifecycle_effect(&outcome),
                     returned,
                     forward_reason: ForwardReason::FamilyFallback,
@@ -484,12 +485,14 @@ fn serve_family<'a, C: EntryContext + 'a>(
             .and_then(|native| crate::identity::invoke(call, native))
             .map_or(
                 FamilyRun {
+                    return_venue: ReturnVenue::Native,
                     completion: FamilyCompletion::Forward,
                     returned: None,
                     // An absent/unported owner must still enter crossing policy.
                     forward_reason: ForwardReason::Unported,
                 },
                 |result| FamilyRun {
+                    return_venue: ReturnVenue::Native,
                     completion: FamilyCompletion::Complete(result.raw()),
                     returned: Some((result, original)),
                     forward_reason: ForwardReason::FamilyFallback,
@@ -503,12 +506,14 @@ fn serve_family<'a, C: EntryContext + 'a>(
             .and_then(|native| crate::sysinfo::invoke(call, native))
             .map_or(
                 FamilyRun {
+                    return_venue: ReturnVenue::Native,
                     completion: FamilyCompletion::Forward,
                     returned: None,
                     // An absent/unported owner must still enter crossing policy.
                     forward_reason: ForwardReason::Unported,
                 },
                 |result| FamilyRun {
+                    return_venue: ReturnVenue::Native,
                     completion: FamilyCompletion::Complete(result.raw()),
                     returned: Some((result, original)),
                     forward_reason: ForwardReason::FamilyFallback,
@@ -519,6 +524,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
         let original = pending.original_argument0();
         let Some(native) = pending.ipc_native() else {
             return FamilyRun {
+                return_venue: ReturnVenue::Native,
                 completion: FamilyCompletion::Forward,
                 returned: None,
                 forward_reason: ForwardReason::Unported,
@@ -533,6 +539,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
             crate::ipc::IpcOutcome::Suspended => (FamilyCompletion::Suspended, None),
         };
         return FamilyRun {
+            return_venue: ReturnVenue::Native,
             completion,
             returned,
             forward_reason: ForwardReason::FamilyFallback,
@@ -552,6 +559,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
                     | crate::signal::SignalOutcome::Restored => None,
                 };
                 FamilyRun {
+                    return_venue: ReturnVenue::Native,
                     completion: crate::signal::signal_effect(&outcome),
                     returned,
                     forward_reason: ForwardReason::FamilyFallback,
@@ -573,6 +581,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
                     | crate::signal::SignalOutcome::Restored => None,
                 };
                 FamilyRun {
+                    return_venue: ReturnVenue::Native,
                     completion: crate::signal::signal_effect(&outcome),
                     returned,
                     forward_reason: ForwardReason::FamilyFallback,
@@ -684,6 +693,11 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Unported => FamilyCompletion::Forward,
     };
     FamilyRun {
+        return_venue: if family == Family::Futex {
+            ReturnVenue::InZone
+        } else {
+            ReturnVenue::Native
+        },
         completion,
         returned,
         forward_reason: if family == Family::Unported
@@ -1378,7 +1392,14 @@ pub enum ForwardReason {
     FamilyFallback,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReturnVenue {
+    Native,
+    InZone,
+}
+
 struct FamilyRun {
+    return_venue: ReturnVenue,
     forward_reason: ForwardReason,
     completion: FamilyCompletion,
     returned: Option<(SyscallResult, u64)>,
@@ -1386,6 +1407,7 @@ struct FamilyRun {
 impl From<FamilyCompletion> for FamilyRun {
     fn from(completion: FamilyCompletion) -> Self {
         Self {
+            return_venue: ReturnVenue::Native,
             completion,
             returned: None,
             forward_reason: ForwardReason::FamilyFallback,
@@ -1492,7 +1514,11 @@ fn finish<'a, C: EntryContext + 'a>(
         && pending.host_work()
         && pending.crossing_set() == crate::crossing::HostCrossingSet::Aarch64
         && result == FamilyCompletion::Forward;
-    let route = if replay || (run.returned.is_some() && pending.return_requires_host_boundary()) {
+    let route = if replay
+        || (run.returned.is_some()
+            && run.return_venue == ReturnVenue::Native
+            && pending.return_requires_host_boundary())
+    {
         CompletionRoute::WithWork
     } else {
         completion_route(result, pending.host_work())
@@ -1586,6 +1612,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
             ordinal,
             original_argument0,
             FamilyRun {
+                return_venue: ReturnVenue::Native,
                 completion: crate::lifecycle::lifecycle_effect(&outcome),
                 returned,
                 forward_reason: ForwardReason::FamilyFallback,
@@ -1675,6 +1702,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
             ordinal,
             original_argument0,
             FamilyRun {
+                return_venue: ReturnVenue::Native,
                 completion: FamilyCompletion::Forward,
                 returned: None,
                 forward_reason: if family == Family::Unported {
