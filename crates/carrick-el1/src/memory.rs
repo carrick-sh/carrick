@@ -3582,8 +3582,9 @@ mod tests {
             assert!(owed_returns(&root(&spaces, &table, &task)).is_empty());
         }
 
+        // Keep the historical receipt identity while asserting ring settlement.
         #[test]
-        fn delegated_owed_return_needs_settlement_until_ack_then_completes() {
+        fn delegated_owed_return_forwards_until_ack_then_completes() {
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
             let task = mm(&spaces, &table, 17, true);
             let mut lazy = Editor::over(RangeBacking::Empty);
@@ -3660,8 +3661,9 @@ mod tests {
             );
         }
 
+        // Keep the historical receipt identity while asserting ring settlement.
         #[test]
-        fn delegated_full_return_journal_settles_before_the_next_resident_retirement() {
+        fn delegated_full_return_journal_forwards_the_next_resident_retirement() {
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
             let task = mm(&spaces, &table, 17, true);
             let mut lazy = Editor::over(RangeBacking::Empty);
