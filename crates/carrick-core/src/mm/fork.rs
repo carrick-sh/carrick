@@ -774,7 +774,7 @@ pub fn census_entry<
     let structural = B::control_window()
         .is_some_and(|(start, end)| va < end.raw() && va.saturating_add(span) > start.raw());
     let selected = policy::<B, P>(policy_provider, mappings, va, span, descriptor)?;
-    if (structural || selected == Policy::Mixed) && level < 3 {
+    if (structural || selected == Policy::Mixed || selected == Policy::Private) && level < 3 {
         count.child = count.child.checked_add(512).ok_or(ForkError::NoMemory)?;
         if !structural {
             count.parent = count.parent.checked_add(512).ok_or(ForkError::NoMemory)?;
@@ -967,7 +967,7 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
         return Ok((descriptor, descriptor));
     }
     let policy = policy::<B, P>(policy_provider, &scratch.mappings, va, span, descriptor)?;
-    if policy == Policy::Mixed {
+    if policy == Policy::Mixed || (policy == Policy::Private && level < 3) {
         if level == 3 {
             return Err(ForkError::Core);
         }
@@ -990,7 +990,7 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
             parent_changed |= updated != original;
         }
         return Ok((
-            if parent_changed {
+            if parent_changed || policy == Policy::Private {
                 B::table_word(
                     FrameGpa::new(request.parent_tables.base + parent as u64 * 8),
                     Some(descriptor),
