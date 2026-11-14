@@ -184,10 +184,46 @@ fn list_unit(
     Ok(())
 }
 
+/// A justfile variable's value (`just --evaluate`), so lane features have one authority.
+fn just_variable(root: &Path, name: &str) -> Result<String> {
+    let out = Command::new("just")
+        .args(["--evaluate", name])
+        .current_dir(root)
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "just --evaluate {name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if value.contains("UNSUPPORTED") {
+        return Err(format!("{name} is {value} on this host").into());
+    }
+    Ok(value)
+}
+
 pub fn run(root: &Path, args: TestListArgs) -> Result<()> {
     let root = root.canonicalize()?;
     if !matches!(args.isa.as_str(), "arm" | "x86") {
         return Err(format!("--isa must be arm or x86, not {}", args.isa).into());
+    }
+    // The manifest names the commit it lists: refuse to label a different checkout (#2344 review: PR CI checks
+    // out the merge ref by default, which can hold tests the PR head doesn't).
+    let checked_out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&root)
+        .output()?;
+    let checked_out = String::from_utf8_lossy(&checked_out.stdout)
+        .trim()
+        .to_owned();
+    if checked_out != args.head {
+        return Err(format!(
+            "--head {} is not the checkout ({checked_out}); check out the head before listing",
+            args.head
+        )
+        .into());
     }
     let meta = metadata(&root)?;
     let (resolved, errors) = crate::test_lanes::resolve(&meta);
@@ -221,25 +257,43 @@ pub fn run(root: &Path, args: TestListArgs) -> Result<()> {
             list_unit(&root, &meta, lanes, &lane_of, args.jobs, &mut listed)?;
         }
     }
+    // Lane targets, compiled the way their gate compiles them: a derived lane (`kvm`) through
+    // `test-lanes args` with this host's platform features (the justfile's `_platform_features`, which
+    // `just test-kvm` uses); a signed lane, whose gate runs on macOS with package defaults, per package.
+    let platform_features = just_variable(&root, "_platform_features")?;
     for lane in &args.lane {
-        if crate::test_lanes::lane_of(lane).is_none() {
+        let Some(declared) = crate::test_lanes::lane_of(lane) else {
             return Err(format!("unknown test lane {lane}").into());
-        }
+        };
+        let selections: Vec<String> = match declared.gate {
+            crate::test_lanes::Gate::Derived(_) => {
+                crate::test_lanes::lane_args(&resolved, lane, &platform_features)
+                    .map_err(|e| format!("test-lanes args --lane {lane}: {e:?}"))?
+            }
+            _ => {
+                let mut by_package: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+                for t in resolved.iter().filter(|t| &t.lane == lane) {
+                    by_package.entry(&t.package).or_default().push(&t.target);
+                }
+                by_package
+                    .into_iter()
+                    .map(|(package, targets)| {
+                        let tests: Vec<String> =
+                            targets.iter().map(|t| format!("--test {t}")).collect();
+                        format!("-p {package} {}", tests.join(" "))
+                    })
+                    .collect()
+            }
+        };
         let root_str = root.to_string_lossy().into_owned();
-        for target in resolved.iter().filter(|t| &t.lane == lane) {
-            let record: Vec<String> = [
-                "",
-                "",
-                &root_str,
-                "test",
-                "-p",
-                &target.package,
-                "--test",
-                &target.target,
-            ]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
+        for selection in selections {
+            let mut record: Vec<String> = vec![
+                String::new(),
+                String::new(),
+                root_str.clone(),
+                "test".into(),
+            ];
+            record.extend(selection.split_whitespace().map(str::to_owned));
             let lanes = vec![parse(record, &meta)?];
             list_unit(&root, &meta, &lanes, &lane_of, args.jobs, &mut listed)?;
         }
