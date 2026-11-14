@@ -1863,9 +1863,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         execution: GrantExecution,
         address: u64,
     ) -> Result<(), TrapError> {
-        let position = self.cow_published.iter().position(|(published, page)| {
-            published.context == execution.context && *page == address & !4095
-        }).ok_or_else(|| fail("owner COW exact completed receipt absent"))?;
+        let position = self
+            .cow_published
+            .iter()
+            .position(|(published, page)| {
+                published.context == execution.context && *page == address & !4095
+            })
+            .ok_or_else(|| fail("owner COW exact completed receipt absent"))?;
         self.cow_published.swap_remove(position);
         Ok(())
     }
@@ -1882,7 +1886,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 continue;
             }
             let grant = pending.grant;
-            let receipt = self.cow_pool()?.completions(excluded)
+            let receipt = self
+                .cow_pool()?
+                .completions(excluded)
                 .find(|receipt| receipt.grant == grant);
             if let Some(receipt) = receipt {
                 self.publish_cow_completion(position, excluded, receipt)?;
@@ -1985,7 +1991,8 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             return Err(fail("owner COW completion changed after settlement"));
         }
         let _retained = pending.handle;
-        self.cow_published.push((execution, pending.window.fault_page));
+        self.cow_published
+            .push((execution, pending.window.fault_page));
         Ok(())
     }
 
@@ -2096,10 +2103,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             }
             return self.service_return_settlement(lease, execution);
         }
-        let fresh_selection = self.grant_portal()?.grant(index)
+        let fresh_selection = self
+            .grant_portal()?
+            .grant(index)
             .ok_or_else(|| fail("owner grant slot"))?;
-        if fresh_selection.pending_cow_fault_selection(mm.get(), far).is_none()
-            && fresh_selection.pending_fault_selection(mm.get(), far).is_none()
+        if fresh_selection
+            .pending_cow_fault_selection(mm.get(), far)
+            .is_none()
+            && fresh_selection
+                .pending_fault_selection(mm.get(), far)
+                .is_none()
             && self.cow_published.iter().any(|(published, page)| {
                 published.context == execution.context && *page == far & !4095
             })
@@ -2170,14 +2183,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             '_,
             carrick_sched_core::ParkedContextWords,
         >| wake.deliver(zone, waker, owned);
-        let access = SpaceAccess::notified(SpaceReleaseVenue {
+        let release = SpaceReleaseVenue {
             zone,
             waker: Waker::Host,
             deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
                 &delivery,
             ),
-        });
-        let Ok(pause) = CowPause::try_new(access, mm) else {
+        };
+        let Ok((pause, _)) = self.settled_pause(release, mm)? else {
             wake.finish()?;
             return Ok(None);
         };

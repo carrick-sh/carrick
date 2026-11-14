@@ -22,10 +22,10 @@
  *                          parks after its Prepare supply; its fork child
  *                          is a second live member touching its own memory
  */
-#define INJECT_POST_SUPPLY_BUSY_ONCE -478 /* 0x...fe22 */
-#define INJECT_POST_SUPPLY_CENSUS -477    /* 0x...fe23 */
-#define INJECT_POST_SUPPLY_BUSY_HELD -476 /* 0x...fe24 */
-#define INJECT_RELEASE_POST_SUPPLY_HOLD -475 /* 0x...fe25 */
+#define INJECT_POST_SUPPLY_BUSY_ONCE -464 /* 0x...fe30 */
+#define INJECT_POST_SUPPLY_CENSUS -463    /* 0x...fe31 */
+#define INJECT_POST_SUPPLY_BUSY_HELD -462 /* 0x...fe32 */
+#define INJECT_RELEASE_POST_SUPPLY_HOLD -461 /* 0x...fe33 */
 #define CANARY 0x1122334455667788
 #define CHILD_STATUS 5
 #define WORKER_STATUS 6
