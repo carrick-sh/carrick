@@ -96,6 +96,14 @@ and `Cpl0TaskBindingDirectory::replace_exec` (`cpl0.rs:1901`). No x86
 
 ## Witnesses
 
+The fork-child exec successor's x86 initial FP state is FCW `0x037f` and
+MXCSR `0x1f80`. The native Linux x86-64 oracle, built from
+`native_exec_marker.S` with `cc -nostdlib -static -no-pie`, passes `fnstcw`,
+`stmxcsr`, and an inexact `1.0/3.0` SSE `divsd`, prints `X`, and exits 0.
+The production KVM `native_fork_child_execs_static_successor` binding runs
+that same successor after fork and exec. The control-word checks precede the
+inexact division so an unmasked FP exception cannot be mistaken for success.
+
 The static-child and three root cases reuse closed drafts #2149 and #2146.
 The child retains its original 32-exit budget; the root cases retain 128.
 The new `native_fork_child_execs_while_parent_keeps_running` blocks SIGUSR1
