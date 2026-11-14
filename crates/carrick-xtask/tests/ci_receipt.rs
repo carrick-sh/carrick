@@ -834,6 +834,28 @@ test-signed: FAIL /w/target/release/deps/el1_b-2222222222222222
 }
 
 #[test]
+fn a_not_run_test_is_never_forgiven_behind_an_allowlisted_failure() {
+    // #2355 review: a NOT-RUN row (a missing developer registry here) must fail the el1 step
+    // even when the only FAILED test is allowlisted and every binary finished.
+    let log = "\
+test-signed: running /w/target/release/deps/el1_a-1111111111111111 el1_ (2 test(s), one process each)
+test el1_known_red ... FAILED
+test-signed: NOT-RUN /w/target/release/deps/el1_a-1111111111111111 el1_needs_registry (needs developer registry localhost:5050)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test-signed: finished /w/target/release/deps/el1_a-1111111111111111 (2 test(s))
+";
+    let allowlist = vec!["el1_known_red".to_string()];
+    let (cmp, passed, error) = evaluate_el1_step(Some(1), log, &allowlist);
+    assert!(cmp.unexpected_failures.is_empty(), "{cmp:?}");
+    assert!(!passed, "a not-run test must fail the step");
+    assert!(
+        error
+            .unwrap()
+            .contains("el1 not-run tests: el1_a::el1_needs_registry")
+    );
+}
+
+#[test]
 fn empty_itemization_with_test_result_failed_is_a_parse_error_that_fails_the_gate() {
     let log = "\
 test-signed: running /w/target/release/deps/el1_broken-abcdef0123456789 el1_ --nocapture

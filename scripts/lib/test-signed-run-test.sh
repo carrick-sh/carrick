@@ -32,6 +32,8 @@ case "$name" in
     aborts) kill -9 $$ ;;
     hangs) exec sleep 30 ;;
     empty) echo 'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out;' ;;
+    needsreg) printf 'running 1 test\ntest needsreg ... \ntest-signed: needs developer registry localhost:5050 (localhost:5050/ltp:arm64)\n' >&2; exit 101 ;;
+    exits77) exit 77 ;;
     *) printf 'running 1 test\ntest %s ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out;\n' "$name" ;;
 esac
 FAKE
@@ -98,6 +100,22 @@ for name in one two; do
         exit 1
     fi
 done
+
+# 3b. #1448: a test that needs a missing developer registry (its marker on its own
+#     line, after libtest's `test name ... ` prefix) is a named NOT-RUN with its
+#     reason, failing the run; an exit without the marker is a failure.
+test_deadline_secs=5 binary_deadline_secs=0
+run_case needsreg after exits77
+[ "$failed" = 1 ]
+[ "$(status_of needsreg)" = not-run ]
+[ "$(status_of after)" = passed ]
+[ "$(status_of exits77)" = failed ]
+grep -Fq "test-signed: NOT-RUN $fake needsreg (needs developer registry localhost:5050)" "$root/log"
+if grep -Fxq 'test needsreg ... FAILED' "$root/log"; then
+    echo "a registry NOT-RUN was reported FAILED" >&2
+    exit 1
+fi
+grep -Fxq 'test exits77 ... FAILED' "$root/log"
 
 # 4. All passing: no failure.
 test_deadline_secs=5 binary_deadline_secs=0

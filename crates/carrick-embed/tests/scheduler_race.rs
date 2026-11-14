@@ -35,19 +35,20 @@ fn go_types_survives_exec_exit_jitter() {
         ],
         2_000,
     ));
-    let result = ContainerBuilder::from_image(GO_IMAGE)
-        .image_store(ImageStore::default_for_user())
-        .pull_policy(PullPolicy::Missing)
-        .workdir("/usr/local/go/src/go/types")
-        .command([
-            "/conformance/go_types.test",
-            "-test.run",
-            "TestCheck|TestMapping|TestIssue",
-            "-test.short",
-        ])
-        .interceptor(Arc::clone(&jitter) as Arc<dyn SyscallInterceptor>)
-        .run_blocking()
-        .expect("container ran to completion without a carrier abort");
+    let result =
+        ContainerBuilder::from_image(carrick_embed::testing::require_dev_registry(GO_IMAGE))
+            .image_store(ImageStore::default_for_user())
+            .pull_policy(PullPolicy::Missing)
+            .workdir("/usr/local/go/src/go/types")
+            .command([
+                "/conformance/go_types.test",
+                "-test.run",
+                "TestCheck|TestMapping|TestIssue",
+                "-test.short",
+            ])
+            .interceptor(Arc::clone(&jitter) as Arc<dyn SyscallInterceptor>)
+            .run_blocking()
+            .expect("container ran to completion without a carrier abort");
     assert!(
         jitter.matched() > 100,
         "jitter never engaged: {} matching syscalls",
@@ -94,19 +95,21 @@ fn go_types_exit_publishes_every_process_job() {
     std::thread::Builder::new()
         .name("carrick-exit-bound".to_owned())
         .spawn(move || {
-            let outcome = ContainerBuilder::from_image(GO_IMAGE)
-                .image_store(ImageStore::default_for_user())
-                .pull_policy(PullPolicy::Missing)
-                .workdir("/usr/local/go/src/go/types")
-                .command([
-                    "/conformance/go_types.test",
-                    "-test.run",
-                    "TestCheck|TestMapping",
-                    "-test.short",
-                ])
-                .interceptor(run_jitter as Arc<dyn SyscallInterceptor>)
-                .run_blocking()
-                .map(|result| (result.exit_code, result.signal));
+            let outcome = ContainerBuilder::from_image(
+                carrick_embed::testing::require_dev_registry(GO_IMAGE),
+            )
+            .image_store(ImageStore::default_for_user())
+            .pull_policy(PullPolicy::Missing)
+            .workdir("/usr/local/go/src/go/types")
+            .command([
+                "/conformance/go_types.test",
+                "-test.run",
+                "TestCheck|TestMapping",
+                "-test.short",
+            ])
+            .interceptor(run_jitter as Arc<dyn SyscallInterceptor>)
+            .run_blocking()
+            .map(|result| (result.exit_code, result.signal));
             let _ = sender.send(outcome);
         })
         .expect("spawn the bounded exit-storm run");
@@ -151,21 +154,24 @@ fn go_types_survives_an_adversarial_scheduling_policy() {
             carrick_kernel::kernel::scheduler::default_guest_cpu_count(),
             seed,
         ));
-        let result = ContainerBuilder::from_image(GO_IMAGE)
-            .image_store(ImageStore::default_for_user())
-            .pull_policy(PullPolicy::Missing)
-            .workdir("/usr/local/go/src/go/types")
-            .command([
-                "/conformance/go_types.test",
-                "-test.run",
-                "TestCheck|TestMapping",
-                "-test.short",
-            ])
-            .scheduler(Arc::clone(&policy) as Arc<dyn carrick_embed::SchedulingPolicy>)
-            .run_blocking()
-            .unwrap_or_else(|error| {
-                panic!("seed {seed:#x}: container aborted under the adversarial policy: {error}")
-            });
+        let result =
+            ContainerBuilder::from_image(carrick_embed::testing::require_dev_registry(GO_IMAGE))
+                .image_store(ImageStore::default_for_user())
+                .pull_policy(PullPolicy::Missing)
+                .workdir("/usr/local/go/src/go/types")
+                .command([
+                    "/conformance/go_types.test",
+                    "-test.run",
+                    "TestCheck|TestMapping",
+                    "-test.short",
+                ])
+                .scheduler(Arc::clone(&policy) as Arc<dyn carrick_embed::SchedulingPolicy>)
+                .run_blocking()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "seed {seed:#x}: container aborted under the adversarial policy: {error}"
+                    )
+                });
         assert!(
             policy.decisions() > 100,
             "seed {seed:#x}: the policy was installed but barely consulted ({} decisions)",

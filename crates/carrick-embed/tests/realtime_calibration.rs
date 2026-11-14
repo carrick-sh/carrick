@@ -19,13 +19,14 @@ fn realtime_calibration_survives_sibling_exec() {
              /opt/ltp/testcases/bin/clock_gettime04 || status=1; i=$((i+1)); done; \
              wait \"$churn\" || status=1; exit \"$status\""
         );
-        let result = ContainerBuilder::from_image(IMAGE)
-            .pull_policy(PullPolicy::Missing)
-            .command(["/bin/sh", "-c", &script])
-            .stdout(StdioConfig::Captured)
-            .stderr(StdioConfig::Captured)
-            .run_blocking()
-            .expect("signed LTP fixture must execute; entitlement/setup errors are failures");
+        let result =
+            ContainerBuilder::from_image(carrick_embed::testing::require_dev_registry(IMAGE))
+                .pull_policy(PullPolicy::Missing)
+                .command(["/bin/sh", "-c", &script])
+                .stdout(StdioConfig::Captured)
+                .stderr(StdioConfig::Captured)
+                .run_blocking()
+                .expect("signed LTP fixture must execute; entitlement/setup errors are failures");
         let transcript = format!("{}{}", result.stdout_utf8(), result.stderr_utf8());
         assert!(result.success(), "scale={scale}: {transcript}");
         assert_eq!(

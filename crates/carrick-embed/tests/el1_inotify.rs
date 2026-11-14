@@ -269,10 +269,12 @@ fn el1_inotify09_contract() {
         carrick_kernel::el1_delegation::reset_delegation_counts();
         let start = std::time::Instant::now();
         let result = common::run_or_fail(
-            ContainerBuilder::from_image("localhost:5050/ltp:arm64")
-                .pull_policy(PullPolicy::Missing)
-                .command(["/bin/sh", "-c", "/opt/ltp/testcases/bin/inotify09"])
-                .run_blocking(),
+            ContainerBuilder::from_image(carrick_embed::testing::require_dev_registry(
+                "localhost:5050/ltp:arm64",
+            ))
+            .pull_policy(PullPolicy::Missing)
+            .command(["/bin/sh", "-c", "/opt/ltp/testcases/bin/inotify09"])
+            .run_blocking(),
         );
         let wall = start.elapsed();
         let counters = read_el1_counters().expect("EL1 counters should be populated");
