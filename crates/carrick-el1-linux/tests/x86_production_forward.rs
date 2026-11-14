@@ -1920,6 +1920,9 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
                     value: &mut u32,
                 ) -> carrick_core::user_copy::CopyOutcome {
                     self.loads.set(self.loads.get() + 1);
+                    if address.raw() == 0x2000 {
+                        return carrick_core::user_copy::CopyOutcome::Fault;
+                    }
                     self.inner.atomic_load_u32(address, value)
                 }
             }
@@ -2194,6 +2197,14 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         assert!(sample.contains("op=393"), "{sample}");
         assert!(sample.contains("result=-22 errno=22"), "{sample}");
     }
+
+    // Same immediate copy-fault shape as ARM: the real native futex owner
+    // settles the failure, and production completion must publish -EFAULT.
+    let before_loads = loads.get();
+    let (route, result) = call_x86(&env, &child, &mut service, 202, [0x2000, 128, 1, 0, 0, 0]);
+    assert_eq!(route, CompletionRoute::Served);
+    assert_eq!(result, -14, "copy fault must replace the syscall register");
+    assert_eq!(loads.get(), before_loads + 1);
 
     // Child stats fd 1 (statx AT_EMPTY_PATH) and writes fd 1.
     let empty = GuestUserBuffer::from_bytes(b"\0");
