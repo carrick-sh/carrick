@@ -5,12 +5,18 @@
 schema_version = 1
 id = "kernel.el1.arm-ring-first-crossing"
 title = "Ring-first refusal preserves ISA policy, family work and completion transport"
-guest_surfaces = ["syscall:fstat", "syscall:newfstatat", "syscall:openat", "syscall:faccessat", "syscall:getuid", "syscall:getpid", "syscall:clock_gettime", "syscall:exit", "syscall:exit_group", "syscall:mmap", "syscall:clone", "syscall:wait4", "syscall:rt_sigreturn", "vmm:hvf", "entry:x86"]
-semantic_authority = ["man 2 _exit", "man 2 exit_group", "man 2 mmap", "man 2 waitpid", "https://man7.org/linux/man-pages/man2/signalfd.2.html", "docs/design/arm-ring-first-flip.md"]
+guest_surfaces = ["syscall:fstat", "syscall:newfstatat", "syscall:openat", "syscall:faccessat", "syscall:getuid", "syscall:getpid", "syscall:clock_gettime", "syscall:gettimeofday", "syscall:exit", "syscall:exit_group", "syscall:mmap", "syscall:clone", "syscall:wait4", "syscall:rt_sigreturn", "vmm:hvf", "entry:x86"]
+semantic_authority = ["man 2 gettimeofday", "man 2 _exit", "man 2 exit_group", "man 2 mmap", "man 2 waitpid", "https://man7.org/linux/man-pages/man2/signalfd.2.html", "docs/design/arm-ring-first-flip.md"]
 fixture = "fixtures/linux-aarch64-hello/src/ring_first.rs"
 scale_points = [1]
 structural_budgets = []
 rationale = """
+#2300 adds optional gettimeofday timeval/timezone preparation to the shared
+crossing venue. It checks at most two fixed records without allocating a
+range array or making a host call before preparation. The native-process
+witness proves second-record owner-fault selection; completed physical
+supply and host copyout remain unverified and are not claimed by this binding.
+
 The owner accepts ENOSYS for unported guest authority calls under the strict
 ARM switch. A refused getuid has exactly one refusal and zero forwarded calls;
 with the exact =0 hatch it has zero refusals and one forwarded call. Terminal
@@ -41,8 +47,8 @@ changing either live policy.
 
 [bindings]
 vm_free = [
-  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_gettimeofday_second_output_retains_owner_preparation",
   "carrick-personality-linux::crossing::tests::all_crossings_declare_abi_output_arguments",
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_gettimeofday_second_output_retains_owner_preparation",
   "carrick-el1-linux::production_x86_family_absences_obey_crossings_without_user_memory",
   "carrick-personality-linux::dispatch::service_owner_tests::service_owner_agrees_with_tsv_crossings_and_retains_wired_families",
   "carrick-personality-linux::dispatch::service_owner_tests::temporary_crossings_are_owed_to_ring",
