@@ -130,15 +130,30 @@ mod test_support {
             carrick_x86_carrier::entry::fatal_boot();
         };
         zone.spaces.raise(index);
+        INSTALL_GATE_PASSES.store(2, Ordering::Release);
         INSTALL_GATE_RAISED.store(index.index() + 1, Ordering::Release);
         INSTALL_GATE_CENSUS.fetch_add(1 << 32, Ordering::AcqRel);
     }
 
-    /// Called on each scheduler pass: the holder lowers an injected gate
-    /// through the production release, which publishes its Gate release.
+    /// Scheduler passes left before the holder lowers an injected gate.
+    static INSTALL_GATE_PASSES: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// Called on each scheduler pass: on the second pass after the refusal
+    /// (the first sees the refused record queued behind the raised gate),
+    /// the holder lowers the injected gate through the production release,
+    /// which publishes its Gate release.
     pub fn lower_injected_install_gate(
         source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
     ) {
+        if INSTALL_GATE_RAISED.load(Ordering::Acquire) == 0
+            || INSTALL_GATE_PASSES
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok_and(|left| left > 1)
+        {
+            return;
+        }
         let raised = INSTALL_GATE_RAISED.swap(0, Ordering::AcqRel);
         let Some(index) = raised
             .checked_sub(1)
