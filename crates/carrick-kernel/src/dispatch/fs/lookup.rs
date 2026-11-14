@@ -52,6 +52,9 @@ pub(in crate::dispatch) enum LookupTarget {
     Resolved(String),
     Stat(StatRecord),
     OpenOutcome(DispatchOutcome),
+    /// A synthetic `/proc` answer needs the MM's memory owner, which another
+    /// execution of this MM holds: the syscall parks and reruns.
+    OwnerBusy(crate::dispatch::mem::ObservationBusy),
 }
 
 /// Result of a unified path resolution.
@@ -63,11 +66,21 @@ pub(in crate::dispatch) struct PathLookup {
 
 impl PathLookup {
     /// Extracts the resolved [`StatRecord`], or returns `Err(ENOENT)` if the lookup
-    /// was not for a stat intent or did not yield a stat record.
-    pub(in crate::dispatch) fn into_stat(self) -> Result<StatRecord, LinuxErrno> {
+    /// was not for a stat intent or did not yield a stat record. A busy memory
+    /// owner is not an answer: it returns the caller's park-and-rerun.
+    pub(in crate::dispatch) fn into_stat(self) -> Result<StatRecord, DispatchError> {
         match self.target {
             LookupTarget::Stat(record) => Ok(record),
-            _ => Err(LINUX_ENOENT),
+            LookupTarget::OwnerBusy(busy) => Err(busy.into()),
+            _ => Err(LINUX_ENOENT.into()),
+        }
+    }
+
+    fn owner_busy(resolved_path: String, busy: crate::dispatch::mem::ObservationBusy) -> Self {
+        Self {
+            resolved_path,
+            fast_path: FastPathKind::None,
+            target: LookupTarget::OwnerBusy(busy),
         }
     }
 
@@ -496,11 +509,17 @@ impl<'a> FsView<'a> {
                         if proc_ns_link(&resolved).is_some()
                             || (resolved.starts_with("/proc/")
                                 && resolved.contains("/ns/")
-                                && crate::vfs::proc::proc_ns_link_type_with_context(
-                                    &resolved,
-                                    &self.synthetic_proc_context(context),
-                                )
-                                .is_some())
+                                && match self.synthetic_proc_context(context) {
+                                    Ok(proc_ctx) => {
+                                        crate::vfs::proc::proc_ns_link_type_with_context(
+                                            &resolved, &proc_ctx,
+                                        )
+                                        .is_some()
+                                    }
+                                    Err(busy) => {
+                                        return Ok(PathLookup::owner_busy(resolved, busy));
+                                    }
+                                })
                         {
                             return Ok(PathLookup {
                                 resolved_path: resolved.clone(),
@@ -535,7 +554,12 @@ impl<'a> FsView<'a> {
 
                         match proc_self_magic_link(&resolved, visible_self) {
                             Some("exe") => {
-                                let proc_ctx = self.synthetic_proc_context(context);
+                                let proc_ctx = match self.synthetic_proc_context(context) {
+                                    Ok(proc_ctx) => proc_ctx,
+                                    Err(busy) => {
+                                        return Ok(PathLookup::owner_busy(resolved, busy));
+                                    }
+                                };
                                 let exe = proc_ctx.executable_path;
                                 if exe.starts_with("/proc/") {
                                     resolved
@@ -646,7 +670,10 @@ impl<'a> FsView<'a> {
                     let Some(context) = context else {
                         return Err(carrick_abi::LINUX_ENOSYS);
                     };
-                    let proc_ctx = self.synthetic_proc_context(context);
+                    let proc_ctx = match self.synthetic_proc_context(context) {
+                        Ok(proc_ctx) => proc_ctx,
+                        Err(busy) => return Ok(PathLookup::owner_busy(resolved, busy)),
+                    };
                     if let Some(contents) = crate::vfs::proc::synthetic_file(&resolved, &proc_ctx) {
                         return Ok(PathLookup {
                             resolved_path: resolved.clone(),

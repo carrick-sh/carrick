@@ -444,7 +444,10 @@ mod delegated {
         let guest = base + 2 * LINUX_PAGE_SIZE + 0x20;
         assert_eq!(root.guest_brk(guest), guest);
         assert_eq!(
-            dispatcher.synthetic_proc_context(&context).brk_current,
+            dispatcher
+                .synthetic_proc_context(&context)
+                .unwrap()
+                .brk_current,
             guest,
             "/proc [heap] end comes from the root"
         );

@@ -592,10 +592,10 @@ impl<'a> FsView<'a> {
         {
             return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
         }
-        if context.is_some_and(|context| {
-            self.is_synthetic_virtual_path(context, &resolved_old)
-                || self.is_synthetic_virtual_path(context, &resolved_new)
-        }) {
+        if let Some(context) = context
+            && (self.is_synthetic_virtual_path(context, &resolved_old)?
+                || self.is_synthetic_virtual_path(context, &resolved_new)?)
+        {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
         // RENAME_EXCHANGE: atomically swap two EXISTING entries. Both must
@@ -897,7 +897,9 @@ impl<'a> FsView<'a> {
                 _ => {}
             }
         }
-        if context.is_some_and(|context| self.is_synthetic_virtual_path(context, &resolved)) {
+        if let Some(context) = context
+            && self.is_synthetic_virtual_path(context, &resolved)?
+        {
             return Ok(DispatchOutcome::errno(LINUX_EEXIST));
         }
         if let Some(m) = self.fs.vfs_mounts.resolve(&resolved) {
@@ -1043,14 +1045,16 @@ impl<'a> FsView<'a> {
             // Vfs asks the host process table, which cannot see a Linux process
             // that is a thread of this carrier. Guarded on the path shape
             // because assembling the proc context is expensive.
-            let peer_ns_target = (path.starts_with("/proc/") && path.contains("/ns/"))
-                .then(|| {
-                    crate::vfs::proc::proc_ns_link_target_with_context(
-                        &path,
-                        &this.synthetic_proc_context(cx.kernel),
-                    )
-                })
-                .flatten();
+            let peer_ns_target = if path.starts_with("/proc/") && path.contains("/ns/") {
+                match this.synthetic_proc_context(cx.kernel) {
+                    Ok(proc_ctx) => {
+                        crate::vfs::proc::proc_ns_link_target_with_context(&path, &proc_ctx)
+                    }
+                    Err(busy) => return Ok(busy.into_owner_wait()),
+                }
+            } else {
+                None
+            };
             let visible_self = proc_visible_self(cx.kernel);
             let target = if let Some(t) = peer_ns_target {
                 t
@@ -1135,7 +1139,7 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
             let resolved = this.resolve_at_path(dirfd, &path)?;
-            if this.is_synthetic_virtual_path(cx.kernel, &resolved) {
+            if this.is_synthetic_virtual_path(cx.kernel, &resolved)? {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
             }
             // Existence check must consult the layered view (overlay/disk
@@ -1371,10 +1375,8 @@ impl<'a> FsView<'a> {
                 if flags & LINUX_AT_SYMLINK_FOLLOW == 0
                     && this.fs.vfs_mounts.resolve(&source).is_none()
                     && this.fs.vfs_mounts.resolve(&target).is_none()
-                    && !context
-                        .is_some_and(|context| this.is_synthetic_virtual_path(context, &source))
-                    && !context
-                        .is_some_and(|context| this.is_synthetic_virtual_path(context, &target))
+                    && !this.is_task_synthetic_path(context, &source)?
+                    && !this.is_task_synthetic_path(context, &target)?
                 {
                     let result =
                         this.fs
@@ -1407,7 +1409,7 @@ impl<'a> FsView<'a> {
             carrick_observability::probes::fs_op("path-role", "dispatcher-source", 0);
             let source_metadata = this.layered_metadata(&resolved).ok();
             source_kind = source_metadata.as_ref().map(|metadata| metadata.kind);
-            let exists = context.is_some_and(|context| this.is_synthetic_virtual_path(context, &resolved))
+            let exists = this.is_task_synthetic_path(context, &resolved)?
                         || source_metadata.is_some()
                         || this.fs.vfs_mounts.resolve(&resolved).is_some_and(|m| m.vfs.lookup(&m.full_path).is_ok())
                         // An anon fd's magic symlink has no layered metadata; its
@@ -1435,7 +1437,7 @@ impl<'a> FsView<'a> {
             return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
         }
         carrick_observability::probes::fs_op("path-role", "dispatcher-target", 0);
-        if context.is_some_and(|context| this.is_synthetic_virtual_path(context, &resolved_new))
+        if this.is_task_synthetic_path(context, &resolved_new)?
             || this.layered_metadata(&resolved_new).is_ok()
         {
             return Ok(DispatchOutcome::errno(LINUX_EEXIST));
@@ -1525,7 +1527,7 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
             }
             (None, None) => {
-                if context.is_some_and(|context| this.is_synthetic_virtual_path(context, &src)) {
+                if this.is_task_synthetic_path(context, &src)? {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
                 }
             }
@@ -1571,7 +1573,7 @@ impl<'a> FsView<'a> {
         if this.mutation_path_needs_task(context, &resolved_link) {
             return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
         }
-        if context.is_some_and(|context| this.is_synthetic_virtual_path(context, &resolved_link)) {
+        if this.is_task_synthetic_path(context, &resolved_link)? {
             return Ok(DispatchOutcome::errno(LINUX_EEXIST));
         }
         // If the link path already exists (anywhere in the layered
@@ -1726,7 +1728,7 @@ impl<'a> FsView<'a> {
             }
         }
         // Synthetic /proc /sys paths can't be unlinked.
-        if context.is_some_and(|context| this.is_synthetic_virtual_path(context, &resolved)) {
+        if this.is_task_synthetic_path(context, &resolved)? {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
         use carrick_vfs::Vfs as _;
