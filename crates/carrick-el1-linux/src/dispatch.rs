@@ -2339,13 +2339,13 @@ pub(super) fn arm_signal_return_gate(
     {
         return None;
     }
-    if !fatal_owner_cancel
-        && !(esr == 0xfffe && x0 == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
-        && !control.has_in_zone_standard_signal()
-        && ingress_empty
-        && control.zone_record().is_some()
-        && !terminal_checkpoint
-    {
+    let checkpoint_work = fatal_owner_cancel
+        || (esr == 0xfffe && x0 == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
+        || control.has_in_zone_standard_signal()
+        || !ingress_empty
+        || control.zone_record().is_none()
+        || terminal_checkpoint;
+    if !checkpoint_work {
         return None;
     }
     Some(terminal_checkpoint)
