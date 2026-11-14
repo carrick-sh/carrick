@@ -589,6 +589,47 @@ fn native_fork_child_exec_killed_while_parked_is_reaped() {
     assert_eq!(outcome.run.exit_code, 0, "wait4 must reap the parked child");
 }
 
+/// A caught signal cannot cancel the outstanding exec service. Its old
+/// handler is reset by exec, so SIGUSR1 terminates the successor image.
+#[test]
+fn native_fork_child_exec_caught_signal_while_parked() {
+    parked_exec_signal_witness("-DCAUGHT_PARKED", b"X\n");
+}
+
+/// SIG_IGN survives exec: the successor must write its marker and exit zero.
+#[test]
+fn native_fork_child_exec_ignored_signal_while_parked() {
+    parked_exec_signal_witness("-DIGNORED_PARKED", b"X\n");
+}
+
+/// A default-terminate signal cancels the service and reaps the child even
+/// while its stock holder is still alive.
+#[test]
+fn native_fork_child_exec_default_terminate_while_parked() {
+    parked_exec_signal_witness("-DTERM_PARKED", b"");
+}
+
+fn parked_exec_signal_witness(flag: &str, stdout: &[u8]) {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = native_exit_fixture("native_exec_stock_successor.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define, flag]);
+    let outcome = run_exec_fixture_with_stock_pressure(&elf, &marker, 256);
+    assert!(
+        outcome
+            .physical
+            .fork_stock_counters()
+            .expect("stock census")
+            .successor_table_refusals
+            > 0,
+        "the signal must reach a parked exec"
+    );
+    assert_eq!(outcome.run.exit_code, 0, "parked signal/wait4 result");
+    assert_eq!(outcome.run.stdout, stdout, "successor execution marker");
+}
+
 /// Run the production CPL0 root, which execs `path` and exits with the
 /// refused errno (38 is ENOSYS) if `execve` returns.
 fn run_root_exec(path: &std::path::Path) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
