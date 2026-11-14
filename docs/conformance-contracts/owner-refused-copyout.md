@@ -1,17 +1,23 @@
 # Exact physical grant completion
 
-### Live shared-MM vfork child (#2276)
+### Block-backed copyout with a live vfork child (#2276)
 
-`arm_vfork_live_child_keeps_sibling_clock_copyout_writable` enters through the
-production AArch64 SVC dispatcher with two live threads. One thread starts a
-zero-stack `CLONE_VM | CLONE_VFORK` child and remains suspended while the
-sibling calls `clock_gettime` into its own mapped memory. The host crossing
-must first retain the existing owner-fault preparation; the shared-MM child's
-live COW publication cannot turn valid sibling output into `EFAULT`.
+`arm_host_root_vfork_child_keeps_sibling_block_copyout_completable` enters
+through the production AArch64 SVC adapter as a host-loaded root and a
+host-born sibling. The root starts a zero-stack `CLONE_VM | CLONE_VFORK`
+child; the existing host-loaded policy returns the child PID immediately, so
+the child remains live while the sibling crosses for `clock_gettime`. The
+witness then uses that MM's real reservation owner and fork-armed page tables
+to resolve COW and commit the exact 16-byte timespec with result zero.
 
-This VM-free binding covers declaration and owner-side admission before the
-crossing. Signed HVF remains the production proof for the host copy venue and
-the Go telemetry sidecar.
+The shared owner-fork walker now descends every private non-leaf terminal
+through its existing split path before arming COW. This turns an AArch64 L2
+block or x86 large page into page-sized private leaves accepted by the common
+owner-copyout classifier. It is one bounded walk over the mapping, with no
+polling, retry loop, host round trip or second copyout path. The paired ARM
+and x86 descriptor witnesses cover publication and abort restoration; the
+real KVM CPL0 witness covers the ISA-neutral production entry. Signed HVF
+remains the production proof for the Go telemetry sidecar.
 
 `kernel.mm.copyout-owner-gate` also covers the interval between physical
 alias publication and its EL1 descriptor receipt. An exact live provisional
