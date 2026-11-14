@@ -17173,6 +17173,7 @@ mod tests {
             _,
             ParkedContextWords,
         > = super::super::dispatch::El1PendingFamilies {
+            futex_argument0: None,
             handoff: None,
             lifecycle_user: Some(&mut copy),
             frame: &mut frame,

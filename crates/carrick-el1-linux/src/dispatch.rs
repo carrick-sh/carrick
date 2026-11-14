@@ -2626,6 +2626,7 @@ where
         );
     }
     let mut pending = El1PendingFamilies {
+        futex_argument0: None,
         handoff: None,
         #[cfg(test)]
         lifecycle_user: None,
@@ -2990,6 +2991,7 @@ pub struct El1PendingFamilies<
         Option<carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>>,
     #[cfg(test)]
     pub(super) lifecycle_user: Option<&'a mut dyn file::UserCopy>,
+    pub(super) futex_argument0: Option<carrick_guest_arch::UserVa>,
     pub(super) frame: &'a mut G,
     pub(super) counters: &'a Counters,
     pub(super) current_tasks: &'a [CurrentTask],
@@ -3537,10 +3539,21 @@ impl<
                     == carrick_personality_linux::lifecycle::SYS_GETPID as u64)
     }
     fn install_result(&mut self, result: SyscallResult) {
-        // Continuation results and strict crossing refusals bypass the family.
-        // Observe before installing the result, while arg0 is still the operand.
-        if self.frame.canonical_ordinal().raw() == carrick_syscall_abi::nr::FUTEX.raw() {
-            let arguments = core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0));
+        let arguments = (self.frame.canonical_ordinal().raw()
+            == carrick_syscall_abi::nr::FUTEX.raw())
+        .then(|| {
+            let mut arguments = core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0));
+            arguments[0] = self
+                .futex_argument0
+                .take()
+                .map_or(arguments[0], |address| address.raw());
+            arguments
+        });
+        self.frame
+            .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
+        // Observe the register actually installed by authenticated completion,
+        // never a completion enum belonging to a switched-away caller.
+        if let Some(arguments) = arguments {
             let binding = self
                 .current_tasks
                 .get(self.frame.task_index())
@@ -3548,15 +3561,12 @@ impl<
             let pc = self.frame.arm_frame_ref().map_or(0, |frame| frame.elr);
             self.counters.record_futex_error(
                 arguments,
-                result.raw(),
+                self.frame.result().0 as i64,
                 pc,
                 self.frame.task_index() as u64,
                 binding,
             );
         }
-
-        self.frame
-            .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
     }
     fn ring_first_strict(&self) -> bool {
         self.frame.crossing_strict(|| {
@@ -3645,14 +3655,10 @@ impl<
         Some(self)
     }
     fn futex(&mut self) -> FamilyCompletion {
-        let arguments = core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0));
-        let binding = self
-            .current_tasks
-            .get(self.frame.task_index())
-            .map(crate::common_entry::execution_binding);
-        let pc = self.frame.arm_frame_ref().map_or(0, |frame| frame.elr);
-        let slot = self.frame.task_index() as u64;
-        let completion = (|| {
+        self.futex_argument0 = Some(carrick_guest_arch::UserVa::new(
+            self.frame.argument(0).unwrap_or(0),
+        ));
+        (|| {
             if !self.frame.arm_scheduler() {
                 let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
                     return FamilyCompletion::Forward;
@@ -3674,14 +3680,6 @@ impl<
                 let Some(outcome) = process.native_futex(call, &mut copy) else {
                     return FamilyCompletion::Forward;
                 };
-                // The futex family publishes an immediate result in its frame,
-                // as ARM's `serve_futex_operation` writes x0: the shared
-                // completion installs none for it. Without this an x86
-                // FUTEX_WAKE returned its own syscall number (202).
-                if let lifecycle::LifecycleOutcome::Returned { result, .. } = &outcome {
-                    self.frame
-                        .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
-                }
                 return lifecycle::lifecycle_effect(&outcome);
             }
             let mut operation = self
@@ -3764,20 +3762,7 @@ impl<
             }
 
             FamilyCompletion::Forward
-        })();
-        let result = match completion {
-            FamilyCompletion::Complete(result)
-            | FamilyCompletion::CompleteWithWork(result)
-            | FamilyCompletion::Switched(result)
-            | FamilyCompletion::SwitchedWithWork(result)
-            | FamilyCompletion::AccountedComplete(result) => Some(result),
-            _ => None,
-        };
-        if let (Some(result), Some(binding)) = (result, binding) {
-            self.counters
-                .record_futex_error(arguments, result, pc, slot, Some(binding));
-        }
-        completion
+        })()
     }
     #[cfg(feature = "allocator-test-control")]
     fn allocator_control(&mut self) -> FamilyCompletion {
@@ -6057,6 +6042,7 @@ mod tests {
         );
         frame.esr = 0;
         let mut pending = El1PendingFamilies {
+            futex_argument0: None,
             handoff: None,
             lifecycle_user: None,
             frame: &mut frame,
@@ -7118,6 +7104,7 @@ mod tests {
                 frame.x[0] = 0xfeed;
                 frame.x[8] = 178;
                 let mut pending = El1PendingFamilies {
+                    futex_argument0: None,
                     handoff: None,
                     #[cfg(test)]
                     lifecycle_user: None,
@@ -7295,6 +7282,7 @@ mod tests {
                         frame.x[8] = 98;
                         frame.elr = 0x4000;
                         let mut pending = El1PendingFamilies {
+                            futex_argument0: None,
                             handoff: None,
                             #[cfg(test)]
                             lifecycle_user: None,
@@ -7594,6 +7582,7 @@ mod tests {
         let tasks = [CurrentTask::new()];
         let mut frame = TrapFrame::default();
         let mut pending = El1PendingFamilies {
+            futex_argument0: None,
             handoff: None,
             #[cfg(test)]
             lifecycle_user: None,
