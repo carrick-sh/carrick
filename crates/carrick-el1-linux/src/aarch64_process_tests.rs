@@ -9944,6 +9944,16 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
                         &mut *(service2_address
                             as *mut Aarch64NativeProcessService<'static, TestStockCrossing>)
                     };
+                    assert_eq!(
+                        super::dispatch::arm_signal_return_admission(
+                            fixture.zone,
+                            fixture.page,
+                            control2,
+                            false,
+                        ),
+                        Some(true),
+                        "a closed gate still owes the sibling its group-exit checkpoint"
+                    );
                     run_as(fixture, 42, 12, 102, control2);
                     let mut sibling2_exit_frame = carrick_el1_abi::TrapFrame::default();
                     sibling2_exit_frame.x[0] = 9;

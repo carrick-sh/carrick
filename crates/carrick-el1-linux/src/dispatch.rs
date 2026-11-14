@@ -2269,15 +2269,11 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     }
     // Closing admission still owes a running member its terminal checkpoint.
     // The lifecycle owner, not the admission gate, decides whether it retires.
-    let terminal_checkpoint = control.zone_record().is_some_and(|record| {
-        super::aarch64_process::registry().signal_checkpoint_needed(zone, record)
-    });
-    if !fatal_owner_cancel
-        && !carrick_el1_abi::Lifecycle::gate(page).serves_ring()
-        && !terminal_checkpoint
-    {
+    let Some(terminal_checkpoint) =
+        arm_signal_return_admission(zone, page, control, fatal_owner_cancel)
+    else {
         return Action::Served;
-    }
+    };
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };
     if frame.esr != 0xfffc
         && !(frame.esr == 0xfffe
@@ -2299,13 +2295,14 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
-    let action = arm_signal_user_return_entry(
+    let action = arm_signal_user_return_admitted_entry(
         source,
         task,
         &saved.native,
         ttbr0,
         page,
         control,
+        Some(terminal_checkpoint),
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
@@ -2318,10 +2315,27 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     }
 }
 
+/// Decide whether an EL0 return owes the shared native signal and terminal
+/// owner a checkpoint. A closed admission gate cannot suppress an already
+/// requested group exit.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn arm_signal_return_admission(
+    zone: &ZoneTables,
+    page: &carrick_el1_abi::ThreadLifecyclePage,
+    control: &carrick_el1_abi::ThreadControlSlot,
+    fatal_owner_cancel: bool,
+) -> Option<bool> {
+    let needed = control.zone_record().is_some_and(|record| {
+        super::aarch64_process::registry().signal_checkpoint_needed(zone, record)
+    });
+    (fatal_owner_cancel || carrick_el1_abi::Lifecycle::gate(page).serves_ring() || needed)
+        .then_some(needed)
+}
+
 /// The signal checkpoint's process admission and delivery, shared by the EL1
 /// vector and the VM-free witnesses. A refused admission is returned to the
 /// caller: the vector's fatal names its kind (#1958).
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockCrossing>(
     source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
@@ -2341,6 +2355,36 @@ pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockC
         >,
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
 ) -> Result<Action, super::native_process_runtime::NativeProcessError> {
+    let admission = arm_signal_return_admission(source.zone, page, control, false);
+    arm_signal_user_return_admitted_entry(
+        source, task, native, ttbr0, page, control, admission, service, deliver,
+    )
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[allow(clippy::too_many_arguments)]
+fn arm_signal_user_return_admitted_entry<X: super::aarch64_process::ForkStockCrossing>(
+    source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static carrick_el1_abi::ThreadLifecyclePage,
+    control: &'static carrick_el1_abi::ThreadControlSlot,
+    admission: Option<bool>,
+    service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+    deliver: impl FnOnce(
+        &mut super::native_process_runtime::NativeProcessEntry<
+            '_,
+            'static,
+            super::aarch64_process::Mm,
+            carrick_el1_abi::Aarch64ParkedContext,
+            super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+        >,
+    ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
+) -> Result<Action, super::native_process_runtime::NativeProcessError> {
+    if admission.is_none() {
+        return Ok(Action::Served);
+    }
     let delivered = super::aarch64_process::with_process_entry(
         source, task, native, ttbr0, page, control, service, deliver,
     )?;
