@@ -5444,14 +5444,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             // No zombie has been consumed. Retain the exact
                             // member's syscall in the existing owner-service
                             // continuation, then rescan after its MM releases.
-                            return self.retry_guest_input(
+                            match self.retry_guest_input(
                                 carrick_core_abi::service::ServiceOperation::CarrierWork {
                                     entry: OwnerEntry::Syscall,
                                     demand: carrick_core_abi::service::CarrierDemand::Work,
                                 },
                                 None,
                                 Some(wait),
-                            );
+                            )? {
+                                // The owner released before enrolment. Neither
+                                // an owned continuation nor a direct syscall
+                                // entry restarts on redispatch: rescan here.
+                                LifecycleOutcome::Redispatch => continue,
+                                outcome => return Ok(outcome),
+                            }
                         }
                         Err(error) => return Err(error),
                     };
