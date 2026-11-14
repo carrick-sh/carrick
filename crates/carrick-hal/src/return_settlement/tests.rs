@@ -602,11 +602,14 @@ fn every_native_exclusion_site_settles_owed_returns() {
     for (file, settlement) in SITES {
         if let Some(settlement) = settlement {
             let source = std::fs::read_to_string(crates.join(file)).unwrap();
-            let exclusion = source.find("try_exclude_editor(").unwrap();
-            assert!(
-                source[exclusion..].contains(settlement),
-                "{file} excludes an editor without settling owed returns after it"
-            );
+            let mut exclusions = source.match_indices("try_exclude_editor(").peekable();
+            while let Some((exclusion, _)) = exclusions.next() {
+                let end = exclusions.peek().map_or(source.len(), |(next, _)| *next);
+                assert!(
+                    source[exclusion..end].contains(settlement),
+                    "{file} excludes an editor at byte {exclusion} without settling owed returns after it"
+                );
+            }
         }
     }
 }

@@ -530,6 +530,7 @@ surfaces = [
   { path = "crates/carrick-hal/src/fork_stock.rs", contract = "kernel.scheduler.runnable-progress" },
   { path = "crates/carrick-hal/src/fork_stock.rs", contract = "process.exec.native-exe-link" },
   { path = "crates/carrick-hal/src/fork_stock.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-hal/src/fork_stock/tests.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-hal/src/fork_stock/tests.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-hal/src/fork_stock/tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-hal/src/fork_stock/tests.rs", contract = "kernel.mm.private-file-fixed-replacement" },
@@ -1220,6 +1221,7 @@ surfaces = [
   { path = "crates/carrick-vmm-hvf/src/fork_stock.rs", contract = "process.exec.native-exe-link" },
   { path = "crates/carrick-vmm-hvf/src/fork_stock.rs", contract = "process.native.arm-admission" },
   { path = "crates/carrick-vmm-hvf/src/fork_stock.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-vmm-hvf/src/fork_stock/tests/owed_returns.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.el1.gic" },
   { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.el1.guest-run-queue" },
   # Explicit host diagnostics. No guest policy or ABI is defined here.
@@ -1390,6 +1392,7 @@ surfaces = [
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_loader_reopen.S", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_owed_return_gib.S", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_owed_return_retired_holders.S", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-vmm-kvm/tests/fixtures/native_owed_return_table_full.S", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_pipe2.S", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_pipe_child_write.S", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_pipe_poll_wake.S", contract = "kernel.el1.epoll-zone" },

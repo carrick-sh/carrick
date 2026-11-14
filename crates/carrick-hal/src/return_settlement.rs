@@ -235,7 +235,7 @@ impl CowSettled<'_> {
     }
 }
 
-/// A venue's two settlements under one exclusion of an MM's editor.
+/// A venue's COW, retired-holder reclaim and owed-return steps under one exclusion.
 pub trait ExclusionSettlement {
     type Error;
     /// What the venue's owed-return step answered.
@@ -264,8 +264,9 @@ pub trait ExclusionSettlement {
 }
 
 /// The one sequence every exclusion obtained for settlement runs, on every
-/// venue (#1482 P0-3): the excluded MM's outstanding COW completions, then
-/// its owed returns. A failed COW step settles no return.
+/// venue (#1482): the excluded MM's outstanding COW completions, retired fork
+/// holders through the existing quarantine drain, then its owed returns. A
+/// failed step settles no return.
 pub fn settle_cow_then_returns<V: ExclusionSettlement>(
     venue: &mut V,
     excluded: &carrick_sched_core::ExcludedEditor<'_>,

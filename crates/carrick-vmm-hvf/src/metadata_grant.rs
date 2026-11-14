@@ -1656,8 +1656,8 @@ fn retain_fork_custody_rows(
     Ok(retained)
 }
 
-/// Apply the neutral stock owner's verdicts in either a live loan venue or
-/// an authenticated terminal maintenance-root venue. This supplies mechanics;
+/// Apply the neutral stock owner's verdicts in a live loan, an authenticated
+/// terminal maintenance-root, or a settlement-exclusion venue. This supplies mechanics;
 /// release-once, hygiene, tag retirement and pin disposal stay with ForkStock.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn reclaim_fork_stock(
