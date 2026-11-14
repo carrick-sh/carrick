@@ -645,7 +645,7 @@ fn run_exec_fixture_with_stock_pressure(
             // than their exec successor needs. The first child's retirement
             // must return its own tables to satisfy that exec.
             let left = demand.tables + 13;
-            *held.lock().unwrap() = Some(
+            *held.lock().expect("held stock slot") = Some(
                 carrier
                     .fixture_hold_fork_stock(left)
                     .expect("hold excess stock"),
