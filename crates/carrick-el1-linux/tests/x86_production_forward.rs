@@ -1288,6 +1288,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         fd_map: [FdMapSlot; FD_MAP_CAPACITY],
         opens: [DelegatedOpenFile; 16],
         next_root_page: u64,
+        prepare_synchronously: bool,
     }
 
     fn context_words(address: AddressContext<RootGpa>) -> ParkedContextWords {
@@ -1322,12 +1323,18 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
             _: &Self::Mm,
             request: carrick_core::user_copy::GuestCopyRequest,
         ) -> Result<(), NativeProcessError> {
-            // This fixture has only resident user buffers. The deliberate
-            // unreadable timeout must reach its exact-MM input owner.
-            assert_eq!(request.address.raw(), 1);
-            assert_eq!(request.len.raw(), 16);
+            // Deliberately unreadable timeout and atomic-word inputs must
+            // reach their exact-MM owner.
+            assert!(matches!(
+                (request.address.raw(), request.len.raw()),
+                (1, 16) | (0x2000, 4)
+            ));
             assert_eq!(request.access, carrick_guest_arch::Access::Read);
-            Err(NativeProcessError::Fault)
+            if self.prepare_synchronously {
+                Ok(())
+            } else {
+                Err(NativeProcessError::Fault)
+            }
         }
 
         fn prepare_mm(
@@ -1446,6 +1453,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     }
 
     struct Cpl0Frame<'a> {
+        pc: u64,
         call: carrick_personality_linux::entry::CanonicalCall,
         rax: u64,
         slot: SlotId,
@@ -1480,6 +1488,9 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     }
 
     impl dispatch::GuestDispatchFrame for Cpl0Frame<'_> {
+        fn restart_syscall(&mut self) {
+            self.pc -= 2;
+        }
         fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
             self.call.native
         }
@@ -1755,6 +1766,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         fd_map: [const { FdMapSlot::new() }; FD_MAP_CAPACITY],
         opens: [const { DelegatedOpenFile::new() }; 16],
         next_root_page: 0x2000,
+        prepare_synchronously: false,
     });
     admit_stdio(
         &service.fd_map,
@@ -1921,7 +1933,13 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
                 ) -> carrick_core::user_copy::CopyOutcome {
                     self.loads.set(self.loads.get() + 1);
                     if address.raw() == 0x2000 {
-                        return carrick_core::user_copy::CopyOutcome::Fault;
+                        return carrick_core::user_copy::CopyOutcome::NotYet(
+                            carrick_core::user_copy::GuestCopyRequest {
+                                address,
+                                len: carrick_guest_arch::GuestLen::new(4),
+                                access: carrick_guest_arch::Access::Read,
+                            },
+                        );
                     }
                     self.inner.atomic_load_u32(address, value)
                 }
@@ -1952,6 +1970,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         native_nr: u64,
         args: [u64; 6],
     ) -> (CompletionRoute, i64) {
+        let synchronous = service.prepare_synchronously;
         let fd_map_ptr = &service.fd_map[..] as *const [FdMapSlot];
         let opens_ptr = &service.opens[..] as *const [DelegatedOpenFile];
         let mut entry = caller.registered.map(move |r| {
@@ -1970,6 +1989,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         // `service`, which outlives this call and is not reallocated.
         let (fd_map, opens) = unsafe { (&*fd_map_ptr, &*opens_ptr) };
         let mut frame = Cpl0Frame {
+            pc: 0x4002,
             call: decode_x86_64(native_nr, args, 0x7fff_0000),
             rax: native_nr,
             slot: caller.slot,
@@ -2012,6 +2032,14 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
             None,
             |_| core::ptr::null_mut(),
         );
+        if native_nr == 202 && synchronous {
+            assert_eq!(
+                frame.pc, 0x4000,
+                "synchronous futex preparation must re-execute syscall"
+            );
+            assert_eq!(frame.rax, 202);
+            assert_eq!(frame.call.args, args);
+        }
         let staged = frame.staged.take();
         let rax = frame.rax as i64;
         drop(entry);
@@ -2198,13 +2226,29 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         assert!(sample.contains("result=-22 errno=22"), "{sample}");
     }
 
-    // Same immediate copy-fault shape as ARM: the real native futex owner
-    // settles the failure, and production completion must publish -EFAULT.
+    // Same NotYet-to-owner-fault shape as ARM: the native futex owner
+    // settles preparation, and production completion must publish -EFAULT.
     let before_loads = loads.get();
     let (route, result) = call_x86(&env, &child, &mut service, 202, [0x2000, 128, 1, 0, 0, 0]);
     assert_eq!(route, CompletionRoute::Served);
     assert_eq!(result, -14, "copy fault must replace the syscall register");
     assert_eq!(loads.get(), before_loads + 1);
+
+    let mut diagnostic = String::new();
+    counters.write_futex_errors(&mut diagnostic).unwrap();
+    assert!(
+        diagnostic
+            .lines()
+            .any(|line| line.contains("address=0x2000") && line.contains("result=-14 errno=14")),
+        "{diagnostic}"
+    );
+
+    // The native owner supplies missing timeout bytes synchronously. Return
+    // through the production dispatcher must replay, preserving every operand.
+    service.prepare_synchronously = true;
+    let (route, _) = call_x86(&env, &child, &mut service, 202, [0x2000, 128, 1, 1, 0, 0]);
+    assert_eq!(route, CompletionRoute::Served);
+    service.prepare_synchronously = false;
 
     // Child stats fd 1 (statx AT_EMPTY_PATH) and writes fd 1.
     let empty = GuestUserBuffer::from_bytes(b"\0");

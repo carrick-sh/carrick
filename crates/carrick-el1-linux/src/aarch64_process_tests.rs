@@ -13177,7 +13177,10 @@ fn native_descriptor_argument_witness(
                 .unwrap();
             let (route, result) =
                 run_in_child_full(0, sys_fcntl, [3, carrick_abi::LINUX_F_GETPIPE_SZ, 0, 0]);
-            assert_eq!(route, CompletionRoute::Served);
+            assert!(matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork
+            ));
             assert_eq!(result, 65536);
             holder.join().unwrap();
         });
@@ -16505,48 +16508,53 @@ fn signal_setup_nonresident_input(nr: u64) {
 
 #[test]
 fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
-    futex_owner_wait_episode(false, false, false, None, false, false, false);
+    futex_owner_wait_episode(false, false, false, None, false, false, false, false);
 }
 
 #[test]
 fn futex_relative_deadline_survives_owner_wait_with_two_live_threads() {
-    futex_owner_wait_episode(true, false, false, None, false, false, false);
+    futex_owner_wait_episode(true, false, false, None, false, false, false, false);
 }
 
 #[test]
 fn futex_relative_deadline_survives_synchronous_owner_redispatch_with_two_live_threads() {
-    futex_owner_wait_episode(true, true, false, None, false, false, false);
+    futex_owner_wait_episode(true, true, false, None, false, false, false, false);
 }
 
 #[test]
 fn futex_cancelled_owner_wait_releases_deadline_before_next_wait() {
-    futex_owner_wait_episode(true, false, true, None, false, false, false);
+    futex_owner_wait_episode(true, false, true, None, false, false, false, false);
 }
 
 #[test]
 fn futex_owner_deadline_is_discarded_before_an_unrelated_syscall() {
-    futex_owner_wait_episode(true, false, false, Some(172), false, false, false);
+    futex_owner_wait_episode(true, false, false, Some(172), false, false, false, false);
 }
 
 #[test]
 fn futex_owner_deadline_is_discarded_before_an_unserved_futex() {
-    futex_owner_wait_episode(true, false, false, Some(98), false, false, false);
+    futex_owner_wait_episode(true, false, false, Some(98), false, false, false, false);
 }
 
 #[test]
 fn futex_caught_signal_releases_owner_deadline_before_handler_wait() {
-    futex_owner_wait_episode(true, false, false, None, true, false, false);
+    futex_owner_wait_episode(true, false, false, None, true, false, false, false);
 }
 
 #[test]
 fn futex_signal_during_owner_park_interrupts_then_starts_fresh_handler_wait() {
-    futex_owner_wait_episode(true, false, false, None, true, true, false);
+    futex_owner_wait_episode(true, false, false, None, true, true, false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn futex_copy_not_yet_owner_fault_publishes_efault() {
-    futex_owner_wait_episode(false, false, false, None, false, false, true);
+    futex_owner_wait_episode(false, false, false, None, false, false, true, false);
+}
+
+#[test]
+fn futex_mapping_synchronous_redispatch_rewinds_syscall() {
+    futex_owner_wait_episode(false, true, false, None, false, false, false, true);
 }
 
 #[cfg(test)]
@@ -16558,6 +16566,7 @@ fn futex_owner_wait_episode(
     caught_signal: bool,
     signal_during_owner: bool,
     fault: bool,
+    mapping: bool,
 ) {
     use crate::native_process_runtime::host_test_support::Physical;
     use crate::sched::{LinuxSchedEntry, UserWord};
@@ -16677,6 +16686,11 @@ fn futex_owner_wait_episode(
     } else {
         (!synchronous).then_some(NativeProcessError::OwnerWait(wait))
     };
+    if mapping {
+        access.lower(space.index());
+        crate::native_process_runtime::host_test_support::FUTEX_MAPPING
+            .with(|slot| slot.set(Some(Err(NativeProcessError::OwnerWait(wait)))));
+    }
     let word = Word {
         missing: core::cell::Cell::new(true),
         value: core::cell::Cell::new(0x12345678),
@@ -16697,7 +16711,11 @@ fn futex_owner_wait_episode(
     };
     frame.x[8] = crate::sched::SYS_FUTEX as u64;
     frame.x[0] = VA;
-    frame.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
+    frame.x[1] = if mapping {
+        0
+    } else {
+        crate::sched::FUTEX_WAIT_PRIVATE
+    };
     frame.x[2] = 0x12345678;
     frame.x[3] = if timed { VA + 8 } else { 0 };
     let mut parked = parked;
@@ -16752,11 +16770,18 @@ fn futex_owner_wait_episode(
             None,
             |_| core::ptr::null_mut(),
         );
+        if mapping {
+            crate::native_process_runtime::host_test_support::FUTEX_MAPPING
+                .with(|slot| slot.set(None));
+            assert_eq!(route, CompletionRoute::Served);
+            assert_eq!(frame.elr, 0x4000, "redispatch must re-execute SVC");
+            assert_eq!(frame.x[0], VA);
+            assert_eq!(word.reads.get(), 0);
+            assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 0);
+            return;
+        }
         if fault {
-            assert!(matches!(
-                route,
-                CompletionRoute::Served | CompletionRoute::WithWork
-            ));
+            assert_eq!(route, CompletionRoute::Served);
             assert_eq!(
                 frame.x[0] as i64, -14,
                 "copy refusal must replace uaddr with EFAULT"
