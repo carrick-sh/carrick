@@ -48,3 +48,11 @@ fn fork_child_exit_group_retires_computing_worker() {
         "fork_child_exit_group_retires_computing_worker",
     );
 }
+
+#[test]
+fn fork_child_worker_exit_group_retires_entryless_leader() {
+    group_exit(
+        &["-DWORKER_EXITS"],
+        "fork_child_worker_exit_group_retires_entryless_leader",
+    );
+}

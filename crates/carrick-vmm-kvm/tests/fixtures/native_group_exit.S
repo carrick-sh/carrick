@@ -38,6 +38,12 @@ wait_ready:
     syscall
     jmp wait_ready
 terminate:
+#ifdef WORKER_EXITS
+    movl $1, go(%rip)
+leader_compute:
+    pause
+    jmp leader_compute
+#endif
 #ifdef COMPUTING_WORKER
     movl $1, go(%rip)
 wait_computing:
@@ -52,6 +58,17 @@ computing_ready:
     jmp exit
 worker:
     movl $1, ready(%rip)
+#ifdef WORKER_EXITS
+worker_wait_go:
+    cmpl $1, go(%rip)
+    je worker_exit_group
+    mov $24, %eax
+    syscall
+    jmp worker_wait_go
+worker_exit_group:
+    mov $5, %edi
+    jmp exit
+#endif
 worker_loop:
 #ifdef COMPUTING_WORKER
     cmpl $1, go(%rip)
