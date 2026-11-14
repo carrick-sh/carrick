@@ -310,13 +310,24 @@ pub fn leave_user_page_fault(binding: &CpuBinding) {
     binding.fault_active.store(0, Ordering::Release);
 }
 
-pub fn cross_owner_grant(cpu: carrick_guest_arch::CpuId, address: UserVa) {
-    // SAFETY: this CPU owns the retained selection/completion slot. The
-    // host authenticates CPU, MM, root and selected address before grant.
+/// Cross to the carrier for the selected `address`. `None`: the carrier
+/// wrote no valid answer, a broken protocol the caller refuses.
+pub fn cross_owner_grant(
+    cpu: carrick_guest_arch::CpuId,
+    address: UserVa,
+) -> Option<carrick_el1::isa::x86::context::native::OwnerGrantReply> {
+    use carrick_el1::isa::x86::context::native::OwnerGrantReply;
+    let mut reply = OwnerGrantReply::UNANSWERED;
+    // SAFETY: this CPU owns the retained selection/completion slot and the
+    // reply word on its stack until the synchronous exit returns. The host
+    // authenticates CPU, MM, root and selected address before grant.
     unsafe {
         core::arch::asm!("out dx, eax", in("dx") OWNER_GRANT_PORT,
-            in("eax") cpu.raw(), in("rdi") address.raw(), options(nostack));
+            in("eax") cpu.raw(), in("rdi") address.raw(),
+            in("rsi") core::ptr::from_mut(&mut reply) as u64, options(nostack));
     }
+    // SAFETY: the carrier wrote the word while this lane was stopped.
+    OwnerGrantReply::decode(unsafe { core::ptr::read_volatile(&raw const reply) })
 }
 
 /// Ring the owed-return settlement doorbell on the owner-grant port: the

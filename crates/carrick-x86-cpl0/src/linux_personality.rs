@@ -888,10 +888,16 @@ fn supply_user_fault(
         if cow.completion.is_some() {
             #[cfg(feature = "test-support")]
             crate::test_support::hold_armed_cow_settle();
-            cross_owner_grant(
+            // A held editor defers the MM-owned completion to the MM's next
+            // exclusion; the access is already served either way.
+            if cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
-            );
+            )
+            .is_none()
+            {
+                return UserFaultSupply::Unresolved(9);
+            }
         }
         return UserFaultSupply::Served;
     }
@@ -913,10 +919,15 @@ fn supply_user_fault(
             UserFaultSupply::Unresolved(9)
         }
         OwnerFaultSupplyOutcome::CowSelected => {
-            cross_owner_grant(
-                carrick_guest_arch::CpuId::new(binding.cpu_slot),
+            if let Err(refused) = cross_selected_supply(
+                portal,
+                binding.cpu_slot,
+                mm_key,
                 fault.address,
-            );
+                SelectedSupply::Cow,
+            ) {
+                return refused;
+            }
             #[cfg(feature = "test-support")]
             crate::test_support::hold_editor_after_supply(mm_key, true);
             let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
@@ -955,17 +966,24 @@ fn supply_user_fault(
             }
             #[cfg(feature = "test-support")]
             crate::test_support::hold_armed_cow_settle();
-            cross_owner_grant(
+            match cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
-            );
-            UserFaultSupply::Served
+            ) {
+                Some(_) => UserFaultSupply::Served,
+                None => UserFaultSupply::Unresolved(9),
+            }
         }
         OwnerFaultSupplyOutcome::Selected => {
-            cross_owner_grant(
-                carrick_guest_arch::CpuId::new(binding.cpu_slot),
+            if let Err(refused) = cross_selected_supply(
+                portal,
+                binding.cpu_slot,
+                mm_key,
                 fault.address,
-            );
+                SelectedSupply::Backing,
+            ) {
+                return refused;
+            }
             #[cfg(feature = "test-support")]
             crate::test_support::hold_editor_after_supply(mm_key, false);
             let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
@@ -994,12 +1012,12 @@ fn supply_user_fault(
             // now" (#2141): cross without applying, so the carrier withdraws
             // the exact supplied submission and this CPU keeps no grant, then
             // wait on the cause and rerun the access, which selects afresh.
-            let withdraw = |cause| {
-                cross_owner_grant(
-                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
-                    fault.address,
-                );
-                UserFaultSupply::Contended(cause)
+            let withdraw = |cause| match cross_owner_grant(
+                carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                fault.address,
+            ) {
+                Some(_) => UserFaultSupply::Contended(cause),
+                None => UserFaultSupply::Unresolved(9),
             };
             let mut root =
                 match roots.lock_in(spaces, index.index(), window.operation.mm, binding.cpu_slot) {
@@ -1043,16 +1061,66 @@ fn supply_user_fault(
                     carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
                 )
             });
-            cross_owner_grant(
+            let settled = cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
-            );
-            if applied {
+            )
+            .is_some();
+            if applied && settled {
                 UserFaultSupply::Served
             } else {
                 UserFaultSupply::Unresolved(9)
             }
         }
+    }
+}
+
+/// Which demand a selected owner fault published in its CPU's grant slot.
+#[derive(Clone, Copy)]
+enum SelectedSupply {
+    Cow,
+    Backing,
+}
+
+/// Cross for the supply this CPU's slot selected. A carrier that met a held
+/// MM editor answers `EditorBusy` and changed nothing (#2141): withdraw the
+/// exact selection, so this CPU keeps no grant while the fault waits, and
+/// name the cause. The rerun selects afresh.
+fn cross_selected_supply(
+    portal: &carrick_el1_abi::MmPortalSlots,
+    cpu_slot: u32,
+    mm: u64,
+    address: UserVa,
+    supply: SelectedSupply,
+) -> Result<(), UserFaultSupply> {
+    use carrick_el1::isa::x86::context::native::OwnerGrantReply;
+    match cross_owner_grant(carrick_guest_arch::CpuId::new(cpu_slot), address) {
+        Some(OwnerGrantReply::Done) => Ok(()),
+        Some(OwnerGrantReply::EditorBusy) => {
+            let slot = portal
+                .grant(cpu_slot as usize)
+                .ok_or(UserFaultSupply::Unresolved(9))?;
+            let withdrawn = match supply {
+                SelectedSupply::Cow => slot
+                    .pending_cow_fault_selection(mm, address.raw())
+                    .is_some_and(|(generation, window)| {
+                        slot.cancel_cow_fault_selection(window, generation)
+                    }),
+                SelectedSupply::Backing => {
+                    slot.pending_fault_selection(mm, address.raw()).is_some_and(
+                        |(generation, window)| slot.cancel_fault_selection(window, generation),
+                    )
+                }
+            };
+            Err(if withdrawn {
+                UserFaultSupply::Contended(
+                    carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+                )
+            } else {
+                UserFaultSupply::Unresolved(9)
+            })
+        }
+        None => Err(UserFaultSupply::Unresolved(9)),
     }
 }
 

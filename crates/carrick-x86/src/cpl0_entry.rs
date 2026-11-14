@@ -196,6 +196,38 @@ pub const OWNER_GRANT_PORT: u16 = 0xd1;
 /// non-user address instead of a selected one, and RSI the ring-owned
 /// `ReturnSettlementDoorbell` record the carrier answers.
 pub const OWNER_GRANT_SETTLE_RETURNS: u64 = 0x8000_0000_0000_5e77;
+
+/// The carrier's answer to an owner-grant crossing at a selected address
+/// (#2141). RSI names one `u64` on the crossing CPU's kernel stack; the
+/// carrier writes this word there before the lane resumes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum OwnerGrantReply {
+    /// The crossing ran: supplied, settled or withdrawn as selected.
+    Done = 1,
+    /// An EL1 editor held the MM, so the carrier could not exclude it. The
+    /// selection and every physical journal are unchanged: "not now". The
+    /// lane cancels its own selection, waits for the Editor release and
+    /// reruns the access, which selects afresh.
+    EditorBusy = 2,
+}
+
+impl OwnerGrantReply {
+    /// The word a lane stores before crossing: no carrier answer yet.
+    pub const UNANSWERED: u64 = 0;
+
+    pub const fn word(self) -> u64 {
+        self as u64
+    }
+
+    pub const fn decode(word: u64) -> Option<Self> {
+        match word {
+            1 => Some(Self::Done),
+            2 => Some(Self::EditorBusy),
+            _ => None,
+        }
+    }
+}
 /// Fixture observation only, outside Linux semantic serving.
 pub const OBSERVE_NATIVE: u64 = u64::MAX;
 /// Fixture observation of the shared kernel's active MMU root.

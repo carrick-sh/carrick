@@ -4214,7 +4214,9 @@ fn production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation() {
 
 /// Exercise the real exclusion, then release its editor only after a real
 /// Editor wait is enrolled. Reuse #2250's editor hold/release fixture.
-fn owner_crossing_busy_witness(crossing: carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing) {
+fn owner_crossing_busy_witness(
+    crossing: carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let elf = kvm_pool_fixture::assemble_fixture("native_concurrent_cow_faults.S", &[]);
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -4263,8 +4265,12 @@ fn owner_crossing_busy_witness(crossing: carrick_x86_cpl0_host::cpl0_boot::Fault
     assert_eq!(outcome.run.exit_code, 7, "{:?}", outcome.run);
     assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+    outcome
 }
 
+/// The selected fault's COW supply crossing meets the held editor: the
+/// carrier answers EditorBusy, the lane withdraws its selection, parks on
+/// the Editor release and reruns the write, which selects afresh.
 #[test]
 fn production_cow_supply_exclusion_busy_once_then_success() {
     owner_crossing_busy_witness(
@@ -4272,13 +4278,23 @@ fn production_cow_supply_exclusion_busy_once_then_success() {
     );
 }
 
+/// The applied COW's settlement crossing meets the held editor: the write
+/// is served, its completion stays the MM's and the MM's next exclusion
+/// publishes it. The lane waits for nothing; the Editor wait the witness
+/// observes is a sibling's later fault on the held MM.
 #[test]
 fn production_cow_settlement_exclusion_busy_once_then_success() {
-    owner_crossing_busy_witness(
+    let outcome = owner_crossing_busy_witness(
         carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::CowSettlement,
     );
+    let counts = outcome.physical.return_settlement_counters().unwrap();
+    // The held settlement defers; a sibling's later settlement may meet
+    // that sibling-held editor too.
+    assert!(counts.deferred_cow_completions >= 1, "{counts:?}");
 }
 
+/// The selected first touch's Prepare crossing meets the held editor before
+/// any backing is staged: EditorBusy, then the same park and rerun.
 #[test]
 fn production_prepare_planning_exclusion_busy_once_then_success() {
     owner_crossing_busy_witness(
