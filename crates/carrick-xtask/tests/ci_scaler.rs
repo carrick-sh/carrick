@@ -1763,6 +1763,8 @@ fn cloudmac_ci_macos_runner_jobs_serialize_builds_and_tests_under_carrick_lease(
     assert_eq!(
         macos_runner_jobs,
         vec![
+            // #2328 item 4: the PR-only arm test list, under the same carrick lease.
+            "arm-test-list",
             "macos-authority",
             "macos-build",
             "macos-clippy",
