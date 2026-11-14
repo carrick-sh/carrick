@@ -1558,3 +1558,45 @@ fn a_decoded_call_the_venue_does_not_admit_keeps_its_crossing_output_stage() {
         Ok(HostFileCall::Openat { .. })
     ));
 }
+
+#[test]
+fn crossing_preparation_visits_each_optional_gettimeofday_record() {
+    use crate::crossing::HostCrossingSet;
+    let args = [BASE, BASE + 4096, 0, 0, 0, 0];
+    let mut visited = Vec::new();
+    let stage = crossing_output_stage(
+        HostCrossingSet::Aarch64,
+        crate::crossing::nr::GETTIMEOFDAY,
+        &args,
+        |address, length| {
+            visited.push((address, length));
+            if address == BASE { length } else { 0 }
+        },
+    );
+    assert_eq!(visited, [(BASE, 16), (BASE + 4096, 8)]);
+    assert_eq!(
+        stage,
+        Some(HostFileStage::PrepareOutput {
+            address: BASE + 4096
+        })
+    );
+    // Null timeval is legal; it must not hide an untouched timezone record.
+    assert_eq!(
+        crossing_output_stage(
+            HostCrossingSet::Aarch64,
+            crate::crossing::nr::GETTIMEOFDAY,
+            &[0, BASE, 0, 0, 0, 0],
+            |_, _| 0,
+        ),
+        Some(HostFileStage::PrepareOutput { address: BASE })
+    );
+    assert_eq!(
+        crossing_output_stage(
+            HostCrossingSet::Aarch64,
+            crate::crossing::nr::GETTIMEOFDAY,
+            &[0; 6],
+            |_, _| panic!("absent outputs must not probe guest memory"),
+        ),
+        None
+    );
+}

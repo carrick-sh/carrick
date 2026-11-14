@@ -1025,18 +1025,22 @@ pub fn crossing_output_stage(
     set: crate::crossing::HostCrossingSet,
     canonical: CanonicalNr,
     args: &[u64; 6],
-    writable: impl FnOnce(u64, usize) -> usize,
+    mut writable: impl FnMut(u64, usize) -> usize,
 ) -> Option<HostFileStage> {
     use crate::crossing::{AllowedHostCrossing, HostCrossingSet};
     let crossing = match set {
         HostCrossingSet::X86 => AllowedHostCrossing::from_canonical_x86(canonical),
         HostCrossingSet::Aarch64 => AllowedHostCrossing::from_canonical_aarch64(canonical),
     }?;
-    let (address, length) = crossing.operand_spec().output_range(args)?;
-    let covered = writable(address, usize::try_from(length).ok()?) as u64;
-    (covered < length).then_some(HostFileStage::PrepareOutput {
-        address: address.wrapping_add(covered),
-    })
+    for (address, length) in crossing.operand_spec().output_ranges(args) {
+        let covered = writable(address, usize::try_from(length).ok()?) as u64;
+        if covered < length {
+            return Some(HostFileStage::PrepareOutput {
+                address: address.wrapping_add(covered),
+            });
+        }
+    }
+    None
 }
 
 /// Decode and admit a call for `origin`'s CPL0 venue. `Err` keeps the call
@@ -1051,7 +1055,7 @@ pub fn admit_or_cross(
     args: &[u64; 6],
     origin: ServiceOrigin,
     delegated: impl FnOnce(i32) -> bool,
-    writable: impl FnOnce(u64, usize) -> usize,
+    writable: impl FnMut(u64, usize) -> usize,
 ) -> Result<HostFileCall, Option<HostFileStage>> {
     match HostFileCall::decode(canonical, args) {
         Some(call) if call.admitted_for(origin, delegated) => Ok(call),

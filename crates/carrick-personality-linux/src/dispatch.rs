@@ -1063,7 +1063,7 @@ impl OperandSpec {
             | C::ClockGetres
             | C::ClockNanosleep
             | C::Times
-            | C::Gettimeofday
+            | C::ClockGettime
             | C::Getrandom
             | C::InotifyInit1
             | C::TimerfdCreate
@@ -1085,6 +1085,8 @@ pub enum OutputOperand {
     None,
     /// A fixed-size record at argument `ptr`.
     Record { ptr: u8, bytes: u64 },
+    /// Several optional fixed-size ABI records, prepared in argument order.
+    Records(&'static [(u8, u64)]),
     /// At most the count in argument `len`, at argument `ptr`, and never more
     /// than `max` bytes (the longest result the call can produce). The result
     /// length is not known before the effect, so the ring prepares every page
@@ -1114,6 +1116,7 @@ impl OperandSpec {
     pub const fn output_operand(self) -> OutputOperand {
         use crate::crossing::AllowedHostCrossing as C;
         match self.crossing {
+            C::Gettimeofday => OutputOperand::Records(&[(0, 16), (1, 8)]),
             C::Getcwd => OutputOperand::Buffer {
                 ptr: 0,
                 len: 1,
@@ -1135,23 +1138,143 @@ impl OperandSpec {
                 len: 2,
                 max: OUTPUT_XATTR_MAX,
             },
-            _ => OutputOperand::None,
+            C::Setxattr
+            | C::Lsetxattr
+            | C::Fsetxattr
+            | C::Removexattr
+            | C::Lremovexattr
+            | C::Fremovexattr
+            | C::Ioctl
+            | C::Flock
+            | C::Mknodat
+            | C::Mkdirat
+            | C::Unlinkat
+            | C::Symlinkat
+            | C::Linkat
+            | C::Renameat
+            | C::Truncate
+            | C::Ftruncate
+            | C::Fallocate
+            | C::Faccessat
+            | C::Chdir
+            | C::Fchdir
+            | C::Chroot
+            | C::Fchmod
+            | C::Fchmodat
+            | C::Fchownat
+            | C::Fchown
+            | C::Openat
+            | C::Getdents64
+            | C::Lseek
+            | C::Read
+            | C::Write
+            | C::Readv
+            | C::Writev
+            | C::Pread64
+            | C::Pwrite64
+            | C::Preadv
+            | C::Pwritev
+            | C::Sendfile
+            | C::Pselect6
+            | C::Vmsplice
+            | C::Splice
+            | C::Tee
+            | C::Newfstatat
+            | C::Fstat
+            | C::Sync
+            | C::Fsync
+            | C::Fdatasync
+            | C::SyncFileRange
+            | C::Utimensat
+            | C::Execve
+            | C::Msync
+            | C::Mlock
+            | C::Munlock
+            | C::Mincore
+            | C::Madvise
+            | C::Syncfs
+            | C::Renameat2
+            | C::Mlock2
+            | C::CopyFileRange
+            | C::Preadv2
+            | C::Pwritev2
+            | C::Statx
+            | C::Openat2
+            | C::Faccessat2
+            | C::Fchmodat2
+            | C::Socket
+            | C::Socketpair
+            | C::Bind
+            | C::Listen
+            | C::Accept
+            | C::Connect
+            | C::Getsockname
+            | C::Getpeername
+            | C::Sendto
+            | C::Recvfrom
+            | C::Setsockopt
+            | C::Getsockopt
+            | C::Shutdown
+            | C::Sendmsg
+            | C::Recvmsg
+            | C::Accept4
+            | C::Recvmmsg
+            | C::Sendmmsg
+            | C::Nanosleep
+            | C::ClockGetres
+            | C::ClockNanosleep
+            | C::Times
+            | C::Getrandom
+            | C::EpollCtl
+            | C::EpollPwait
+            | C::Dup
+            | C::Dup3
+            | C::Fcntl
+            | C::InotifyInit1
+            | C::Close
+            | C::Signalfd4
+            | C::TimerfdCreate
+            | C::TimerfdSettime
+            | C::TimerfdGettime
+            | C::CloseRange
+            | C::EpollPwait2
+            | C::Readahead
+            | C::Fadvise64
+            | C::Execveat
+            | C::Mlockall
+            | C::Munlockall
+            | C::Exit
+            | C::ExitGroup => OutputOperand::None,
         }
     }
 
-    /// The guest range to make writable before the crossing runs, as
-    /// `(address, length)`; `None` when it writes nothing there. A result
-    /// shorter than the range still copies out, so a page past what the owner
-    /// can supply is not an error here.
-    pub fn output_range(self, args: &[u64; 6]) -> Option<(u64, u64)> {
-        let (address, length) = match self.output_operand() {
-            OutputOperand::None => return None,
-            OutputOperand::Record { ptr, bytes } => (args[ptr as usize], bytes),
+    /// All direct output ranges, in declaration order. Optional records with
+    /// a null pointer are absent. This iterator allocates no guest-stack array.
+    pub fn output_ranges(self, args: &[u64; 6]) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let direct = match self.output_operand() {
+            OutputOperand::Record { ptr, bytes } => Some((args[ptr as usize], bytes)),
             OutputOperand::Buffer { ptr, len, max } => {
-                (args[ptr as usize], args[len as usize].min(max))
+                Some((args[ptr as usize], args[len as usize].min(max)))
             }
+            OutputOperand::None | OutputOperand::Records(_) => None,
         };
-        (length != 0).then_some((address, length))
+        let records = match self.output_operand() {
+            OutputOperand::Records(records) => records,
+            _ => &[],
+        };
+        direct
+            .into_iter()
+            .chain(records.iter().filter_map(|&(ptr, bytes)| {
+                let address = args[ptr as usize];
+                (address != 0).then_some((address, bytes))
+            }))
+            .filter(|&(_, bytes)| bytes != 0)
+    }
+
+    /// The first direct output range. Preparation must use `output_ranges`
+    /// to cover every operand of a multi-output crossing.
+    pub fn output_range(self, args: &[u64; 6]) -> Option<(u64, u64)> {
+        self.output_ranges(args).next()
     }
 }
 
