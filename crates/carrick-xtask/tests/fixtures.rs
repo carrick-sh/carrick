@@ -1867,6 +1867,7 @@ case "$1" in
         "$FIXTURE_TEST_XTASK" fixtures verify || exit $?
         "$FIXTURE_TEST_XTASK" host-lease --mode gate -- true || exit $?
         printf '%s\n' "$1" >> "$FIXTURE_TEST_EXECUTIONS"
+        if [ "$1" = test-embed ] && [ -e "$FIXTURE_TEST_EXECUTIONS.fail-embed" ]; then exit 7; fi
         ;;
     *) exec "$FIXTURE_TEST_JUST" --justfile "$FIXTURE_TEST_JUSTFILE" --working-directory "$PWD" "$@" ;;
 esac
@@ -2030,6 +2031,24 @@ esac
         "failed cleanup must fail the signed workflow"
     );
     fs::write(&cleanup_script, cleanup_bytes).unwrap();
+    // #1448: a red test-embed still runs conformance-probes, then fails the step.
+    fs::write(p.scratch.path().join("executions.fail-embed"), b"").unwrap();
+    fs::write(&executions, b"").unwrap();
+    let out = run(signed["run"].as_str().unwrap());
+    assert!(
+        !out.status.success(),
+        "a failed test-embed must fail the step"
+    );
+    assert_eq!(
+        fs::read_to_string(&executions).unwrap(),
+        "build\ntest-embed\nconformance-probes\n",
+        "conformance-probes must run after a failed test-embed"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("test-embed exited 7; conformance-probes exited 0")
+    );
+    fs::remove_file(p.scratch.path().join("executions.fail-embed")).unwrap();
     // A new checkout cannot consume an artifact built from different fixture
     // inputs; admission is by input identity, not by commit.
     commit(
