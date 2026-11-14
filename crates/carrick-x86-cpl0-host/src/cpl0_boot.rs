@@ -1799,6 +1799,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     Ok((None, None, None))
                 }
                 WORK_PORT => {
+                    if let Ok(execution) = custody.physical_execution(&lease) {
+                        custody.drain_fork_quarantine(execution)?;
+                    } else if let Some(maintenance) = custody.maintenance_root {
+                        let live = RootGpa::page_aligned(FrameGpa::new(lease.io.get_gpr(X86Reg::Cr3)?))
+                            .ok_or_else(|| fail("work root alignment"))?;
+                        if let Some(venue) = carrick_hal::fork_stock::ReclaimExecution::maintenance_root(live, maintenance) {
+                            custody.drain_fork_quarantine_in(venue)?;
+                        }
+                    }
+                    custody.probe_parked_execs(lease.cpu)?;
                     work_flags = Some(take_production_work_boundary(custody.task(lease.cpu))?);
                     Ok((None, None, None))
                 }
@@ -2200,6 +2210,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     Ok((None, None, None))
                 }
                 Some(ProductionPort::Work) => {
+                    if let Ok(execution) = custody.physical_execution(&lease) {
+                        custody.drain_fork_quarantine(execution)?;
+                    } else if let Some(maintenance) = custody.maintenance_root {
+                        let live = RootGpa::page_aligned(FrameGpa::new(lease.io.get_gpr(X86Reg::Cr3)?))
+                            .ok_or_else(|| fail("work root alignment"))?;
+                        if let Some(venue) = carrick_hal::fork_stock::ReclaimExecution::maintenance_root(live, maintenance) {
+                            custody.drain_fork_quarantine_in(venue)?;
+                        }
+                    }
+                    custody.probe_parked_execs(lease.cpu)?;
                     work_flags = Some(take_production_work_boundary(custody.task(slot))?);
                     Ok((None, None, None))
                 }

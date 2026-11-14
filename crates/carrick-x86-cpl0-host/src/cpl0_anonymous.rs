@@ -922,13 +922,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     ) -> Result<(), TrapError> {
         let active = ReservationMm::new(execution.binding.mm.raw())
             .ok_or_else(|| fail("fork quarantine active MM"))?;
-        self.drain_fork_quarantine_in(active)
+        self.drain_fork_quarantine_in(active.into())
     }
 
-    pub(super) fn drain_fork_quarantine_in(&mut self, active: ReservationMm) -> Result<(), TrapError> {
-        if !self.fork_stock.has_quarantine() {
-            return Ok(());
-        }
+    pub(super) fn drain_fork_quarantine_in(
+        &mut self,
+        venue: carrick_hal::fork_stock::ReclaimExecution,
+    ) -> Result<(), TrapError> {
         let zone = retained_cow_zone(&self.ram)?;
         // `CPL0_CPU_COUNT` has one definition (`cpl0_entry.rs`), compiled
         // into the guest by `#[path]`; the guest drain scans the same slots.
@@ -946,7 +946,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         self.fork_stock
             .reclaim(
                 &mut NoTableLedger,
-                active,
+                venue,
                 |mm| SlotAbsence::scan(mm, installed.iter().copied()),
                 |tables| {
                     let mut memory = memory.borrow_mut();
@@ -1022,7 +1022,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         self._vm
             .write(physical, bytes)
-            .map_err(|e| fail(e.to_string()))
+            .map_err(|e| fail(e.to_string()))?;
+        self.drain_fork_quarantine(execution)?;
+        self.probe_parked_execs(lease.cpu)
     }
 
     /// Counters of the shared fork stock (loans, counted refusals, returns).
