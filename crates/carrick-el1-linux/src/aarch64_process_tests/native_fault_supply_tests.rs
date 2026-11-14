@@ -2508,7 +2508,12 @@ fn composed_native_supply_with_prepared(
             physical_generation,
         );
         physical_grants
-            .publish_cow(staged.with_backing(retained), pool, exclusion.proof())
+            .publish_cow(
+                staged.with_backing(retained),
+                pool,
+                exclusion.proof(),
+                carrick_el1_abi::CowSplitTables::NONE,
+            )
             .unwrap();
     }
     assert_eq!(pool.ready(identity.mm).count(), 2, "bounded first refill");
