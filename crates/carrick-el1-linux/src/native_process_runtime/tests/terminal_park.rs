@@ -434,6 +434,7 @@ fn losing_exit_group_keeps_host_reserved_membership_and_live_record() {
     use super::super::PendingCloseOperation;
     use carrick_sched_core::object_wait::OwnerEntry;
     let fixture = native_exec_fixture();
+    let _ = super::super::host_test_support::take_terminal_vacates();
     let sibling = add_service_sibling(&fixture, None);
     assert_eq!(fixture.page.live(), 2);
     assert!(
@@ -501,6 +502,11 @@ fn losing_exit_group_keeps_host_reserved_membership_and_live_record() {
         Some(LifecycleOutcome::HostCustody)
     ));
     assert!(fixture.zone.live(sibling.record).is_some());
+    assert_eq!(
+        super::super::host_test_support::take_terminal_vacates(),
+        0,
+        "host custody must keep the installed process translation live"
+    );
     assert_eq!(page.live(), 0);
     assert!(
         host.commit_zone_retirement(&carrick_core::lifecycle::RegistryWriteHeld::for_test())
@@ -519,6 +525,7 @@ fn losing_exit_group_keeps_host_reserved_membership_and_live_record() {
         Some(LifecycleOutcome::Transferred { .. })
     ));
     assert!(fixture.zone.live(sibling.record).is_none());
+    assert_eq!(super::super::host_test_support::take_terminal_vacates(), 1);
     assert_eq!(page.live(), 0);
 }
 
