@@ -788,6 +788,15 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vmsplice_read_end_has_the_same_output_root_as_readv() {
+        assert_eq!(output_arguments_for_aarch64(75), Some(&[1][..]));
+        assert_eq!(
+            output_arguments_for_aarch64(75),
+            output_arguments_for_aarch64(65)
+        );
+    }
+
     use super::*;
 
     #[test]
