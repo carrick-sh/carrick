@@ -864,6 +864,9 @@ enum VfsOpenAttempt {
     Installed(fs::InstalledFd),
     Errno(LinuxErrno),
     FallThrough,
+    /// The synthetic render needed the MM's memory owner, which another
+    /// execution holds; nothing was installed, and the open parks and reruns.
+    OwnerBusy(mem::ObservationBusy),
 }
 
 /// Execution-backend owner of the vCPU wake after asynchronous signal
@@ -2976,7 +2979,7 @@ impl SyscallDispatcher {
     fn synthetic_proc_context(
         &self,
         context: &crate::kernel::KernelContext,
-    ) -> crate::vfs::SyntheticProcContext {
+    ) -> Result<crate::vfs::SyntheticProcContext, mem::ObservationBusy> {
         self.synthetic_proc_context_observed(context, || {})
     }
 
@@ -2987,16 +2990,16 @@ impl SyscallDispatcher {
         &self,
         context: &crate::kernel::KernelContext,
         path: &str,
-    ) -> bool {
-        crate::vfs::may_be_synthetic_virtual_path(path)
-            && crate::vfs::is_synthetic_virtual_file(path, &self.synthetic_proc_context(context))
+    ) -> Result<bool, mem::ObservationBusy> {
+        Ok(crate::vfs::may_be_synthetic_virtual_path(path)
+            && crate::vfs::is_synthetic_virtual_file(path, &self.synthetic_proc_context(context)?))
     }
 
     fn synthetic_proc_context_observed(
         &self,
         context: &crate::kernel::KernelContext,
         after_proc_snapshot: impl FnOnce(),
-    ) -> crate::vfs::SyntheticProcContext {
+    ) -> Result<crate::vfs::SyntheticProcContext, mem::ObservationBusy> {
         // /proc/<pid>/status renders hex words; escape the typed sets at the
         // render boundary.
         let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks(context);
@@ -3023,10 +3026,7 @@ impl SyscallDispatcher {
         let network_model = context.task().net_ns().view().as_ref().clone();
         after_proc_snapshot();
         let mem = self.mem_snapshot();
-        let brk_current = mem.program_break();
-        let mmap_next = mem.arena_high_water();
-        let address_space_regions = mem.proc_regions();
-        let locked_memory = mem.locked_view().into_owned();
+        let memory = mem.proc_memory()?;
         let creds = self.cred_snapshot();
         let groups = self.current_groups();
         // Per-process OOM bias comes from the kernel graph, the only authority
@@ -3082,7 +3082,7 @@ impl SyscallDispatcher {
                 })
                 .collect()
         });
-        crate::vfs::SyntheticProcContext {
+        Ok(crate::vfs::SyntheticProcContext {
             executable_path,
             argv,
             task_comm,
@@ -3095,10 +3095,10 @@ impl SyscallDispatcher {
             network_model: Some(network_model),
             runtime_endpoint_container: Some(context.container().id()),
             auxv: mem.linux_auxv_image,
-            address_space_regions,
-            locked_memory,
-            brk_current,
-            mmap_next,
+            address_space_regions: memory.regions,
+            locked_memory: memory.locked,
+            brk_current: memory.brk_current,
+            mmap_next: memory.mmap_next,
             heap_base: mem.layout.heap_base,
             native_guest_va: self.page_geometry().native_geometry().is_some(),
             ruid: creds.ruid,
@@ -3120,7 +3120,7 @@ impl SyscallDispatcher {
             sysvipc_shm: self.sysvipc_shm_table(),
             sysvipc_sem: self.sysvipc_sem_table(),
             sysvipc_msg: self.sysvipc_msg_table(),
-        }
+        })
     }
 }
 

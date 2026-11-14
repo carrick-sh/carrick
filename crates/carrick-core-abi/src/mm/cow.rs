@@ -4,6 +4,66 @@ use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
 pub const COW_GRANT_SIZE: u64 = 16 * 1024;
 const PAGE: u64 = 4096;
 
+/// Most split tables one grant carries: the first write into an armed
+/// L1 block links one L2 and one L3 table.
+pub const COW_GRANT_MAX_SPLIT_TABLES: usize = 2;
+
+/// Unlinked stage-1 table pages the host (the only table allocator) reserved
+/// with one grant, so the repoint of an armed block can split it (#2276).
+/// The repoint links a prefix, in walk order; the host takes back the rest
+/// when it settles the completion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CowSplitTables {
+    pages: [u64; COW_GRANT_MAX_SPLIT_TABLES],
+    len: u8,
+}
+
+impl CowSplitTables {
+    pub const NONE: Self = Self {
+        pages: [0; COW_GRANT_MAX_SPLIT_TABLES],
+        len: 0,
+    };
+
+    /// Page-aligned, nonzero, distinct pages; at most
+    /// [`COW_GRANT_MAX_SPLIT_TABLES`].
+    #[must_use]
+    pub fn new(pages: &[u64]) -> Option<Self> {
+        if pages.len() > COW_GRANT_MAX_SPLIT_TABLES
+            || pages
+                .iter()
+                .any(|&page| page == 0 || !page.is_multiple_of(PAGE))
+            || (pages.len() == 2 && pages[0] == pages[1])
+        {
+            return None;
+        }
+        let mut tables = Self::NONE;
+        tables.pages[..pages.len()].copy_from_slice(pages);
+        tables.len = pages.len() as u8;
+        Some(tables)
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u64] {
+        &self.pages[..usize::from(self.len)]
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The pages a repoint that linked `linked` of them left unlinked.
+    #[must_use]
+    pub fn unused_after(&self, linked: u8) -> &[u64] {
+        &self.as_slice()[usize::from(linked).min(self.len())..]
+    }
+}
+
 /// One ready grant as EL1 claimed it, or as the host published it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CowGrant {
@@ -14,6 +74,22 @@ pub struct CowGrant {
     /// 16 KiB-aligned IPA of the replacement compound.
     pub physical_ipa: u64,
     pub backing: BackingIdentity,
+    /// Tables for splitting an armed block, or none.
+    pub tables: CowSplitTables,
+}
+
+impl CowGrant {
+    /// Whether this grant serves a repoint that must link `split_tables`
+    /// tables. A page repoint takes only a table-less grant, so a block's
+    /// tables are never spent on a page.
+    #[must_use]
+    pub fn serves(&self, split_tables: usize) -> bool {
+        if split_tables == 0 {
+            self.tables.is_empty()
+        } else {
+            self.tables.len() >= split_tables
+        }
+    }
 }
 
 /// Which owner operation licensed the physical replacement.
@@ -37,6 +113,8 @@ pub struct CowGrantCompletion {
     pub span_len: u64,
     pub old_ipa: u64,
     pub new_ipa: u64,
+    /// The prefix of `grant.tables` the repoint linked into the live graph.
+    pub tables_linked: u8,
 }
 
 impl CowGrantCompletion {
@@ -56,7 +134,77 @@ impl CowGrantCompletion {
                 .is_some_and(|end| end <= COW_GRANT_SIZE)
             && (self.old_ipa & (COW_GRANT_SIZE - 1)) == offset
             && self.span_va.checked_add(self.span_len).is_some()
+            && usize::from(self.tables_linked) <= self.grant.tables.len()
     }
+
+    /// The grant's tables the repoint did not link: the host's to take back.
+    #[must_use]
+    pub fn unused_tables(&self) -> &[u64] {
+        self.grant.tables.unused_after(self.tables_linked)
+    }
+}
+
+/// Put one MM's unsettled completions in the order their moves happened, as
+/// far as settlement needs it: a completion that moved a page out of an
+/// earlier completion's replacement settles after it (fork, COW, fork, COW
+/// of the same page). Slot order alone settled the later move first and
+/// split out a replacement the earlier completion still had to name (#1801).
+/// Settlement validates every completion against the live graph, so an
+/// inconsistent batch still refuses rather than being reordered into one.
+pub fn order_cow_settlement(completions: &mut [CowGrantCompletion]) {
+    let moved_from = |later: &CowGrantCompletion, earlier: &CowGrantCompletion| {
+        later.old_ipa & !(COW_GRANT_SIZE - 1) == earlier.grant.physical_ipa
+            && later.span_va < earlier.span_va.saturating_add(earlier.span_len)
+            && earlier.span_va < later.span_va.saturating_add(later.span_len)
+    };
+    for settled in 0..completions.len() {
+        // The first remaining completion that moves nothing another remaining
+        // completion produced. A cycle is impossible for fresh grants; if a
+        // corrupt batch had one, keep slot order and let validation refuse.
+        let next = (settled..completions.len())
+            .find(|&candidate| {
+                !(settled..completions.len()).any(|other| {
+                    other != candidate && moved_from(&completions[candidate], &completions[other])
+                })
+            })
+            .unwrap_or(settled);
+        completions[settled..=next].rotate_right(1);
+    }
+}
+
+/// The output page `va` of `completion` must have in the live graph, given
+/// the completions that settle after it in the same batch: each one that
+/// moved the page again from the output so far carries it on.
+#[must_use]
+pub fn cow_settled_output(
+    completion: &CowGrantCompletion,
+    later: &[CowGrantCompletion],
+    va: u64,
+) -> u64 {
+    let mut output = completion.new_ipa + (va - completion.span_va);
+    for next in later {
+        if (next.span_va..next.span_va.saturating_add(next.span_len)).contains(&va)
+            && next.old_ipa + (va - next.span_va) == output
+        {
+            output = next.new_ipa + (va - next.span_va);
+        }
+    }
+    output
+}
+
+/// Whether a completion that settles later in the batch still moves pages
+/// out of `completion`'s old compound, so settling `completion` must keep
+/// that compound's inventory for it (#1801: two runs of one compound in one
+/// batch left the second with "no exact inventory coverage").
+#[must_use]
+pub fn cow_old_compound_still_named(
+    completion: &CowGrantCompletion,
+    later: &[CowGrantCompletion],
+) -> bool {
+    let compound = completion.old_ipa & !(COW_GRANT_SIZE - 1);
+    later
+        .iter()
+        .any(|next| next.old_ipa & !(COW_GRANT_SIZE - 1) == compound)
 }
 
 /// Why EL1 left a COW write fault to the host. Indexes
@@ -64,7 +212,7 @@ impl CowGrantCompletion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum CowDecline {
-    /// No valid L3 page: nothing mapped, an invalid leaf, or a block terminal.
+    /// No valid terminal: nothing mapped, or an invalid leaf or block.
     Unmapped = 0,
     /// A valid page that is not COW-armed (untagged backend leaf, or a
     /// private page `mprotect`ed read-only).
@@ -76,7 +224,8 @@ pub enum CowDecline {
     NoWriteIntent = 3,
     /// The table walk left the reachable primary arena.
     Unreachable = 4,
-    /// No grant for this MM was ready.
+    /// No ready grant of this MM serves the run (none at all, or none
+    /// carrying the tables an armed block's split needs).
     PoolEmpty = 5,
     /// Another EL1 editor held the MM, or a host pause closed its gate.
     EditorBusy = 6,
@@ -94,7 +243,8 @@ pub const COW_DECLINE_REASONS: usize = 9;
 /// Borrowed access to the existing exact-identity COW pool. No pool state or
 /// custody is owned by this interface; the adapter retains the original owner.
 pub trait CowGrantVenue {
-    fn claim(&self, mm_key: u64) -> Option<CowGrant>;
+    /// A ready grant of `mm_key` that [`CowGrant::serves`] `split_tables`.
+    fn claim(&self, mm_key: u64, split_tables: usize) -> Option<CowGrant>;
     fn abandon(&self, grant: &CowGrant) -> bool;
     fn complete(&self, completion: &CowGrantCompletion) -> bool;
     fn note_declined(&self, reason: CowDecline);
@@ -104,6 +254,72 @@ pub trait CowGrantVenue {
 /// The adapter owns the exclusive lease and its execution-lane affinity.
 pub trait ServiceCopyWindowLease {
     fn base(&self) -> u64;
+}
+
+#[cfg(test)]
+mod settlement_order_tests {
+    use super::*;
+    use core::num::NonZeroU64;
+
+    fn completion(
+        slot: usize,
+        grant: u64,
+        span: (u64, u64),
+        old: u64,
+        new: u64,
+    ) -> CowGrantCompletion {
+        let one = NonZeroU64::MIN;
+        CowGrantCompletion {
+            purpose: CowGrantPurpose::UserWrite,
+            grant: CowGrant {
+                slot,
+                epoch: 8,
+                mm_key: 7,
+                physical_ipa: grant,
+                backing: BackingIdentity {
+                    frame_id: one,
+                    mapping_id: one,
+                    owner_generation: one,
+                    inventory_revision: one,
+                },
+                tables: CowSplitTables::NONE,
+            },
+            span_va: span.0,
+            span_len: span.1,
+            old_ipa: old,
+            new_ipa: new,
+            tables_linked: 0,
+        }
+    }
+
+    /// #1801, the sidecar shape: fork, COW, fork, COW of the same granule
+    /// in one settlement batch. The second move is in a lower slot; it must
+    /// settle after the first, and the first validates through it.
+    #[test]
+    fn a_repeated_move_settles_after_the_move_it_continues() {
+        let first = completion(9, 0x8_0000, (0x40_0000, 0x4000), 0x1_0000, 0x8_0000);
+        let second = completion(2, 0x9_0000, (0x40_0000, 0x4000), 0x8_0000, 0x9_0000);
+        let mut batch = [second, first];
+        order_cow_settlement(&mut batch);
+        assert_eq!(batch, [first, second]);
+        assert_eq!(cow_settled_output(&first, &batch[1..], 0x40_1000), 0x9_1000);
+        assert_eq!(cow_settled_output(&second, &[], 0x40_1000), 0x9_1000);
+        assert!(!cow_old_compound_still_named(&first, &batch[1..]));
+    }
+
+    /// #1801, the CPython shape: two runs of one old compound complete in
+    /// one batch. The first must keep the compound for the second.
+    #[test]
+    fn two_runs_of_one_compound_keep_it_until_the_last_settles() {
+        let lower = completion(3, 0x8_0000, (0x40_0000, 0x1000), 0x1_0000, 0x8_0000);
+        let upper = completion(1, 0x9_0000, (0x40_2000, 0x2000), 0x1_2000, 0x9_2000);
+        let mut batch = [upper, lower];
+        order_cow_settlement(&mut batch);
+        assert_eq!(batch, [upper, lower], "independent moves keep slot order");
+        assert!(cow_old_compound_still_named(&upper, &batch[1..]));
+        assert!(!cow_old_compound_still_named(&lower, &[]));
+        assert_eq!(cow_settled_output(&upper, &batch[1..], 0x40_3000), 0x9_3000);
+    }
 }
 
 // Literal wire layout captured from 3fd7862be on a 64-bit host.
@@ -133,7 +349,7 @@ mod layout_manifest {
 
     #[test]
     fn cow_grant() {
-        assert_eq!((size_of::<CowGrant>(), align_of::<CowGrant>()), (64, 8));
+        assert_eq!((size_of::<CowGrant>(), align_of::<CowGrant>()), (88, 8));
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |CowGrant {
                      slot: _,
@@ -141,12 +357,14 @@ mod layout_manifest {
                      mm_key: _,
                      physical_ipa: _,
                      backing: _,
+                     tables: _,
                  }: CowGrant| {};
         field!(CowGrant, slot, usize, 32, 8, 8);
         field!(CowGrant, epoch, u64, 40, 8, 8);
         field!(CowGrant, mm_key, u64, 48, 8, 8);
         field!(CowGrant, physical_ipa, u64, 56, 8, 8);
         field!(CowGrant, backing, BackingIdentity, 0, 32, 8);
+        field!(CowGrant, tables, CowSplitTables, 64, 24, 8);
     }
 
     #[test]
@@ -156,7 +374,7 @@ mod layout_manifest {
                 size_of::<CowGrantCompletion>(),
                 align_of::<CowGrantCompletion>()
             ),
-            (104, 8)
+            (136, 8)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |CowGrantCompletion {
@@ -166,12 +384,14 @@ mod layout_manifest {
                      span_len: _,
                      old_ipa: _,
                      new_ipa: _,
+                     tables_linked: _,
                  }: CowGrantCompletion| {};
         field!(CowGrantCompletion, purpose, CowGrantPurpose, 0, 8, 8);
-        field!(CowGrantCompletion, grant, CowGrant, 8, 64, 8);
-        field!(CowGrantCompletion, span_va, u64, 72, 8, 8);
-        field!(CowGrantCompletion, span_len, u64, 80, 8, 8);
-        field!(CowGrantCompletion, old_ipa, u64, 88, 8, 8);
-        field!(CowGrantCompletion, new_ipa, u64, 96, 8, 8);
+        field!(CowGrantCompletion, grant, CowGrant, 8, 88, 8);
+        field!(CowGrantCompletion, span_va, u64, 96, 8, 8);
+        field!(CowGrantCompletion, span_len, u64, 104, 8, 8);
+        field!(CowGrantCompletion, old_ipa, u64, 112, 8, 8);
+        field!(CowGrantCompletion, new_ipa, u64, 120, 8, 8);
+        field!(CowGrantCompletion, tables_linked, u8, 128, 1, 1);
     }
 }

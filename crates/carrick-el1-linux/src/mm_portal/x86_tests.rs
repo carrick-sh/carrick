@@ -169,6 +169,7 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86RetiredOwner {
         match execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome {
             DescriptorOutcome::Applied { .. } => CowRepointOutcome::Applied {
                 flush_required: false,
+                tables_linked: 0,
             },
             DescriptorOutcome::Refused(_) => CowRepointOutcome::Refused,
             DescriptorOutcome::RolledBack(_) => CowRepointOutcome::RolledBack,
@@ -378,24 +379,55 @@ fn x86_pending_brk_maintenance_scrubs_private_grant_and_keeps_leaf_invalid() {
 
 #[test]
 fn x86_owner_fork_arms_private_parent_and_restores_on_abort() {
+    for shape in [
+        X86ForkLeaf::Page,
+        X86ForkLeaf::Large,
+        X86ForkLeaf::MixedLarge,
+    ] {
+        x86_owner_fork_arm_and_abort(shape);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum X86ForkLeaf {
+    /// One private 4 KiB page.
+    Page,
+    /// A wholly private 2 MiB page: armed in place, no table (#2276).
+    Large,
+    /// A read-only, NX 2 MiB page only partly private: fork must split it,
+    /// and the split directory entries carry directory attributes, never
+    /// the leaf's NX or missing WRITE (#2276 P0-1).
+    MixedLarge,
+}
+
+fn x86_owner_fork_arm_and_abort(shape: X86ForkLeaf) {
     use carrick_el1_abi::{
         PortalForkRequest, PortalForkTableArena, PortalOperation, ReservationMm,
     };
-    use carrick_mmu_core::x86::descriptor_txn::{COW, MAY_WRITE, NX};
+    use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, COW, HUGE, MAY_WRITE};
     let mut region = Region::new();
     region.add_bank();
     let spaces = AddressSpaces::new();
-    let parent = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let pages = if shape == X86ForkLeaf::Large { 512 } else { 1 };
+    let parent = admit(&region, &spaces, 77, ROOT, pages, 0);
     let view = nodes(&region);
     let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view)
         .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
     let parent_tables = Tables::new(ROOT, IPA, 1);
-    for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
+    for (entry, offset) in [(0, 4096), (513, 8192)] {
         parent_tables.words[entry]
             .store((ROOT + offset) | PRESENT | WRITE | USER, Ordering::Release);
     }
-    let original = IPA | PRESENT | WRITE | USER | MAY_WRITE | NX;
-    parent_tables.words[1536].store(original, Ordering::Release);
+    let (slot, original) = match shape {
+        X86ForkLeaf::Page => {
+            parent_tables.words[1024]
+                .store((ROOT + 12288) | PRESENT | WRITE | USER, Ordering::Release);
+            (1536, IPA | PRESENT | WRITE | USER | MAY_WRITE | NX)
+        }
+        X86ForkLeaf::Large => (1024, IPA | PRESENT | WRITE | USER | HUGE | MAY_WRITE | NX),
+        X86ForkLeaf::MixedLarge => (1024, IPA | PRESENT | USER | HUGE | NX),
+    };
+    parent_tables.words[slot].store(original, Ordering::Release);
     let child = Tables::new(ROOT + 0x100000, 0, 0);
     let supply = Tables::new(ROOT + 0x200000, 0, 0);
     for arena in [&child, &supply] {
@@ -433,13 +465,36 @@ fn x86_owner_fork_arms_private_parent_and_restores_on_abort() {
     let scratch = ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap();
     let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
     let mut unpublished = portal.publish_fork(plan, &words, 0).unwrap();
-    let parent_leaf = parent_tables.words[1536].load(Ordering::Acquire);
-    let child_leaf = child.words[1536].load(Ordering::Acquire);
-    assert_eq!(parent_leaf & (COW | MAY_WRITE | WRITE), COW | MAY_WRITE);
-    assert_eq!(child_leaf & (COW | MAY_WRITE | WRITE), COW | MAY_WRITE);
+    if shape != X86ForkLeaf::MixedLarge {
+        assert_eq!(unpublished.completion().parent_tables_used, 0, "{shape:?}");
+    }
+    if shape == X86ForkLeaf::MixedLarge {
+        let directory = child.words[1024].load(Ordering::Acquire);
+        assert_eq!(
+            directory & !ADDRESS,
+            PRESENT | WRITE | USER,
+            "the child's split directory entry restricts nothing: {directory:#x}"
+        );
+        assert_eq!(
+            parent_tables.words[1024].load(Ordering::Acquire),
+            original,
+            "an unchanged read-only parent keeps its large page"
+        );
+    } else {
+        let parent_leaf = parent_tables.words[slot].load(Ordering::Acquire);
+        let child_leaf = child.words[slot].load(Ordering::Acquire);
+        for leaf in [parent_leaf, child_leaf] {
+            assert_eq!(
+                leaf & (COW | MAY_WRITE | WRITE),
+                COW | MAY_WRITE,
+                "{shape:?}"
+            );
+            assert_eq!(leaf & HUGE, original & HUGE, "armed in place: {shape:?}");
+        }
+    }
     assert!(spaces.grant(child_index, 78).is_none());
     unpublished.abort(&portal, &words, 0).unwrap();
-    assert_eq!(parent_tables.words[1536].load(Ordering::Acquire), original);
+    assert_eq!(parent_tables.words[slot].load(Ordering::Acquire), original);
     assert!(
         !region
             .table()

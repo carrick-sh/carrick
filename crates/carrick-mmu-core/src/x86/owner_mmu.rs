@@ -88,6 +88,12 @@ impl OwnerForkMmu for X86Mmu {
     fn arm_private(word: u64, _: usize, _: UserVa) -> Result<u64, OwnerMmuRefusal> {
         arm_cow_terminal(word).map_err(|_| OwnerMmuRefusal::Unreachable)
     }
+    fn split_table_word(output: FrameGpa, leaf: u64) -> u64 {
+        // The descriptor planner's own split link for a user page: the new
+        // leaves carry the large page's permissions and the directory entry
+        // restricts nothing. A supervisor page's directory stays supervisor.
+        output.raw() | PRESENT | WRITE | (leaf & USER)
+    }
     fn needs_break_before_make(_: u64, _: u64, _: usize) -> bool {
         false
     }

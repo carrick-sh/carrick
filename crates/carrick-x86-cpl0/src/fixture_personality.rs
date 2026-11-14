@@ -10,7 +10,7 @@ use carrick_el1::isa::x86::context::native::{
     OBSERVE_CPL0_UACCESS_SHOOTDOWN, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
     OBSERVE_FORK_TABLE_WINDOW, OBSERVE_INITIAL_MM, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT,
     OBSERVE_NATIVE, OBSERVE_PORTAL_WINDOW, OBSERVE_RETIRE_REPOINT, OBSERVE_SHARED_COW_FAULT,
-    OBSERVE_SHARED_PREPARED_FAULT,
+    OBSERVE_SHARED_LARGE_COW_FAULT, OBSERVE_SHARED_PREPARED_FAULT,
 };
 use carrick_el1::isa::x86::context::scheduler::XsaveArea;
 use carrick_el1_abi::{Counters, CurrentTask};
@@ -53,6 +53,15 @@ fn fixture_edit(
     sequence: core::num::NonZeroU64,
     operation: carrick_guest_arch::EditOperation,
 ) -> Result<carrick_mmu_core::x86::descriptor_txn::DescriptorReceipt, carrick_el1::isa::ArchError> {
+    fixture_edit_range(va, 4096, sequence, operation)
+}
+
+fn fixture_edit_range(
+    va: u64,
+    len: u64,
+    sequence: core::num::NonZeroU64,
+    operation: carrick_guest_arch::EditOperation,
+) -> Result<carrick_mmu_core::x86::descriptor_txn::DescriptorReceipt, carrick_el1::isa::ArchError> {
     use carrick_guest_arch::{
         EditIntent, EditOwner, FrameGpa, GuestLen, KernelVa, MmuEditArch, RootGpa, TableWindow,
         UserRange, UserVa,
@@ -75,7 +84,7 @@ fn fixture_edit(
     // SAFETY: this fixture runs one vCPU at a time with the retained
     // root, so each sequential native descriptor edit is exclusive.
     let owner = unsafe { EditOwner::issue(root, mm_key, sequence) };
-    let range = UserRange::checked(UserVa::new(va), GuestLen::new(4096))
+    let range = UserRange::checked(UserVa::new(va), GuestLen::new(len))
         .ok_or(carrick_el1::isa::ArchError::Unbound)?;
     let intent = EditIntent::checked(owner, range, operation, &[])
         .ok_or(carrick_el1::isa::ArchError::Unbound)?;
@@ -273,6 +282,7 @@ pub enum FixtureCall {
     ObserveDescriptorPreparePublish,
     ObserveSharedPreparedFault,
     ObserveSharedCowFault,
+    ObserveSharedLargeCowFault,
     ObserveAllocator,
     ObserveUserAccessWitness,
     ObserveCpl0UaccessShootdown,
@@ -326,6 +336,9 @@ impl PersonalityAbi<carrick_el1::isa::x86::Kernel> for FixturePersonality {
         }
         if rax == OBSERVE_SHARED_COW_FAULT {
             return Ok(FixtureCall::ObserveSharedCowFault);
+        }
+        if rax == OBSERVE_SHARED_LARGE_COW_FAULT {
+            return Ok(FixtureCall::ObserveSharedLargeCowFault);
         }
         if rax == OBSERVE_ALLOCATOR {
             return Ok(FixtureCall::ObserveAllocator);
@@ -1034,6 +1047,10 @@ impl Personality for FixturePersonality {
                 unsafe { rust_alloc::alloc::dealloc(ptr, layout) };
                 ControlFlow::Return(())
             }
+            FixtureCall::ObserveSharedLargeCowFault => {
+                frame.rax = u64::from(shared_large_cow_fault(counters, task));
+                ControlFlow::Return(())
+            }
             FixtureCall::ObserveAllocator => {
                 let layout = match core::alloc::Layout::from_size_align(128, 64) {
                     Ok(layout) => layout,
@@ -1309,4 +1326,174 @@ impl Personality for FixturePersonality {
         // SAFETY: calling extern witness function to retain in linked fixture image.
         let _ = unsafe { carrick_x86_fixture_dispatch_witness() };
     }
+}
+
+/// #2276 on real KVM memory: owner fork arms a private 2 MiB user page in
+/// place, and its first write is the shared COW owner's. The production x86
+/// fault entry claims a grant carrying one split table; the repoint splits
+/// exactly that PDE (directory attributes only), copies only the written
+/// page, and every other page stays COW-armed on the large frame.
+fn shared_large_cow_fault(counters: &Counters, task: &CurrentTask) -> bool {
+    use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
+    use carrick_el1::fault::{GrantMailboxes, dispatch_x86_fault_with_prepared};
+    use carrick_el1_abi::{Action, CowSplitTables};
+    use carrick_el1_linux::cow_resolver::X86CowResolver;
+    use carrick_guest_arch::{
+        Access, EditBacking, EditLeafSize, EditOperation, EditPermissions, FaultInfo, FrameGpa,
+        GuestLen,
+    };
+    use carrick_mmu_core::live_descriptor_words::LiveDescriptorWords;
+    use carrick_mmu_core::x86::descriptor_txn::{
+        ADDRESS, BackingIdentity, COW, DescriptorOutcome, HUGE, PRESENT, USER, WRITE,
+    };
+
+    // A 2 MiB-aligned user VA beside the fixture's pages, its 2 MiB-aligned
+    // frame, a fresh table page from the fixture arena, and a free compound.
+    const VA: u64 = 0x20_0000;
+    const LARGE: u64 = 0x40_0000;
+    const TABLE: u64 = 0xd2_8000;
+    const GRANT: u64 = 0xd1_c000;
+    const FAR: u64 = VA + 0x1_2345;
+    let one = core::num::NonZeroU64::MIN;
+    let edit_backing = EditBacking {
+        frame_id: one,
+        mapping_id: one,
+        owner_generation: one,
+        inventory_revision: one,
+    };
+    let map = fixture_edit_range(
+        VA,
+        1 << 21,
+        one,
+        EditOperation::Map {
+            output: FrameGpa::new(LARGE),
+            permissions: EditPermissions {
+                readable: true,
+                writable: true,
+                executable: false,
+                user: true,
+            },
+            size: EditLeafSize::Block2M,
+            resident: true,
+            backing: edit_backing,
+        },
+    );
+    let arm = fixture_edit_range(
+        VA,
+        1 << 21,
+        core::num::NonZeroU64::new(2).unwrap_or(one),
+        EditOperation::ArmCow {
+            kernel_only: false,
+            executable: false,
+            adopt_private: false,
+            asid_scoped: false,
+            excluded_ipa: FrameGpa::new(0),
+            excluded_len: GuestLen::new(0),
+        },
+    );
+    if !matches!(map, Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. }))
+        || !matches!(arm, Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. }))
+    {
+        return false;
+    }
+    let words = fixture_initial_words();
+    let root = 0x60_0000;
+    let directory = |va: u64| -> Option<u64> {
+        let mut table = root;
+        for shift in [39, 30] {
+            table = words.load(table + ((va >> shift) & 511) * 8).ok()? & ADDRESS;
+        }
+        Some(table + ((va >> 21) & 511) * 8)
+    };
+    let Some(pde) = directory(VA) else {
+        return false;
+    };
+    let armed = words.load(pde).unwrap_or(0);
+    if armed & (HUGE | COW | WRITE) != HUGE | COW {
+        return false;
+    }
+    // SAFETY: the supervisor direct window maps the fixture's RAM; this
+    // fixture excludes the sibling vCPU.
+    unsafe {
+        ((DIRECT_VA + LARGE + 0x1_2345) as *mut u8).write_volatile(0x5a);
+        ((DIRECT_VA + LARGE + 0x10_0000) as *mut u8).write_volatile(0xa5);
+        core::ptr::write_bytes((DIRECT_VA + TABLE) as *mut u8, 0, 4096);
+    }
+    let mm = task.mm.key.load(Ordering::Acquire);
+    let backing = BackingIdentity {
+        frame_id: one,
+        mapping_id: one,
+        owner_generation: one,
+        inventory_revision: one,
+    };
+    let Some(tables) = CowSplitTables::new(&[TABLE]) else {
+        return false;
+    };
+    if SHARED_COW_POOL
+        .publish_with_tables(mm, GRANT, backing, tables)
+        .is_none()
+    {
+        return false;
+    }
+    // SAFETY: the boot owner published this supervisor-only zone and retains
+    // it across the exact CPU's space-edit transaction.
+    let zone = unsafe { &*(lifecycle::LIFECYCLE_ZONE as *const carrick_sched_core::ZoneTables) };
+    let layout = core::alloc::Layout::new::<carrick_el1_abi::FrameGrantResidencyTable>();
+    // SAFETY: the global allocator returns an aligned block of this layout;
+    // this fixture owns it exclusively until deallocated below.
+    let ptr = unsafe { rust_alloc::alloc::alloc(layout) };
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: ptr is aligned, writable storage for the whole table.
+    let residency = unsafe {
+        let table = ptr.cast::<carrick_el1_abi::FrameGrantResidencyTable>();
+        carrick_el1_abi::FrameGrantResidencyTable::init_in_place(table);
+        &*table
+    };
+    let mut cow = X86CowResolver {
+        words: &words,
+        pool: &SHARED_COW_POOL,
+        residency,
+        completion: None,
+    };
+    let action = dispatch_x86_fault_with_prepared(
+        carrick_guest_arch::CpuId::new(0),
+        FaultInfo {
+            address: UserVa::new(FAR),
+            access: Access::Write,
+            present: true,
+        },
+        counters,
+        task,
+        carrick_el1::substrate::sched::object_wait::space_access(
+            zone,
+            carrick_sched_core::SlotId::new(0),
+        ),
+        GrantMailboxes::own(&SHARED_FAULT_MAILBOX),
+        None::<carrick_el1::fault::PreparedFaultPath<'_, NoopPreparedResolver>>,
+        &mut cow,
+    );
+    let leaf = |va: u64| -> u64 {
+        directory(va)
+            .and_then(|pde| words.load(pde).ok())
+            .and_then(|pde| words.load((pde & ADDRESS) + ((va >> 12) & 511) * 8).ok())
+            .unwrap_or(0)
+    };
+    let written = leaf(FAR);
+    let neighbour = leaf(VA + 0x10_0000);
+    // SAFETY: the replacement compound stays mapped in the direct window.
+    let copied = unsafe { ((DIRECT_VA + GRANT + 0x2345) as *const u8).read_volatile() } == 0x5a;
+    let split = words.load(pde).unwrap_or(0);
+    // SAFETY: the fixture's table is no longer borrowed and ptr came from
+    // this exact allocation layout.
+    unsafe { rust_alloc::alloc::dealloc(ptr, layout) };
+    action == Action::Served
+        && copied
+        && cow.completion.is_some_and(|done| {
+            done.tables_linked == 1 && done.span_va == VA + 0x1_2000 && done.span_len == 4096
+        })
+        && split == TABLE | PRESENT | WRITE | USER
+        && written & (ADDRESS | WRITE | COW) == (GRANT + 0x2000) | WRITE
+        && neighbour & (ADDRESS | WRITE | COW) == (LARGE + 0x10_0000) | COW
 }

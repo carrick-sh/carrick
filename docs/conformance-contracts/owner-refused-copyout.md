@@ -1,5 +1,32 @@
 # Exact physical grant completion
 
+### Block-backed copyout with a live vfork child (#2276)
+
+`arm_host_root_vfork_child_keeps_sibling_block_copyout_completable` enters
+through the production AArch64 SVC adapter as a host-loaded root and a
+host-born sibling. The root starts a zero-stack `CLONE_VM | CLONE_VFORK`
+child; the existing host-loaded policy returns the child PID immediately, so
+the child remains live while the sibling crosses for `clock_gettime`. The
+witness then uses that MM's real reservation owner and fork-armed page tables
+to resolve COW and commit the exact 16-byte timespec with result zero.
+
+Owner fork keeps a wholly private block intact and arms it in place: one
+live edit and one custody record per block, with no fork-time table work
+(`owner_fork_private_blocks_arm_in_place_without_table_work`,
+`owner_fork_one_gib_private_block_forks_without_table_work`). The
+copyout classifier accepts the armed EL1-private block, so the copyout
+selects the existing COW supply crossing instead of EFAULT. The supply
+publishes a grant that carries the block's split tables (one for 2 MiB, two
+for 1 GiB), reserved from the host's own table allocator. The COW owner's
+repoint splits exactly the covering block inside the descriptor executor and
+copies only the written granule. A later write into the same block splits
+nothing. This is one split per touched block, not a walk over mapped memory
+(#2276 round 5; the kernel.el1.fork-cow witnesses cover the split and its
+abort). A `/proc` render that observes the MM's memory owner while an EL1
+thread holds it parks on the holder's release with nothing committed
+(`proc_renders_park_on_a_held_root_then_succeed`). Signed HVF remains the
+production proof for the Go telemetry sidecar.
+
 `kernel.mm.copyout-owner-gate` also covers the interval between physical
 alias publication and its EL1 descriptor receipt. An exact live provisional
 owner is a completion dependency, not a permanent supply refusal. A contender

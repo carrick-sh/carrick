@@ -109,7 +109,7 @@ impl BackingMaintenance<'_> {
             return Ok(BackingMaintenanceProgress::Complete { next });
         };
         let mm = self.request.handle().mm().raw();
-        let Some(grant) = venue.pool.claim(mm) else {
+        let Some(grant) = venue.pool.claim(mm, 0) else {
             return Ok(BackingMaintenanceProgress::Supply);
         };
         // Keep the old compound offset for the existing exact COW settlement.
@@ -169,6 +169,7 @@ impl BackingMaintenance<'_> {
                         span_len: 4096,
                         old_ipa,
                         new_ipa,
+                        tables_linked: 0,
                     }),
                     "maintenance lost exact physical completion"
                 );
@@ -224,7 +225,7 @@ impl BackingMaintenance<'_> {
             return Ok(BackingMaintenanceProgress::Complete { next });
         };
         let mm = self.request.handle().mm().raw();
-        let Some(grant) = venue.pool.claim(mm) else {
+        let Some(grant) = venue.pool.claim(mm, 0) else {
             return Ok(BackingMaintenanceProgress::Supply);
         };
         let new_ipa = grant.physical_ipa + (old_ipa & (carrick_el1_abi::COW_GRANT_SIZE - 1));
@@ -236,6 +237,7 @@ impl BackingMaintenance<'_> {
             old_ipa,
             new_ipa,
             backing: grant.backing,
+            tables: grant.tables,
         };
         let refuse = || {
             if !venue.pool.abandon(&grant) {
@@ -260,6 +262,7 @@ impl BackingMaintenance<'_> {
         match B::execute_cow_repoint(venue.words, venue.root.raw(), op) {
             CowRepointOutcome::Applied {
                 flush_required: false,
+                tables_linked: 0,
             } => {
                 if !venue.pool.complete(&CowGrantCompletion {
                     purpose: carrick_el1_abi::CowGrantPurpose::RetiredBacking,
@@ -268,15 +271,13 @@ impl BackingMaintenance<'_> {
                     span_len: 4096,
                     old_ipa,
                     new_ipa,
+                    tables_linked: 0,
                 }) {
                     return Err(fatal());
                 }
                 Ok(BackingMaintenanceProgress::Complete { next })
             }
-            CowRepointOutcome::Applied {
-                flush_required: true,
-            }
-            | CowRepointOutcome::Indeterminate => Err(fatal()),
+            CowRepointOutcome::Applied { .. } | CowRepointOutcome::Indeterminate => Err(fatal()),
             CowRepointOutcome::Refused | CowRepointOutcome::RolledBack => refuse(),
         }
     }

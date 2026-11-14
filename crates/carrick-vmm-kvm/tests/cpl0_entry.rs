@@ -18,7 +18,7 @@ use carrick_x86::cpl0_entry::{
     OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
     OBSERVE_FORK_TABLE_WINDOW, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE,
     OBSERVE_PORTAL_WINDOW, OBSERVE_RETIRE_REPOINT, OBSERVE_SHARED_COW_FAULT,
-    OBSERVE_SHARED_PREPARED_FAULT,
+    OBSERVE_SHARED_LARGE_COW_FAULT, OBSERVE_SHARED_PREPARED_FAULT,
 };
 use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
@@ -2005,6 +2005,29 @@ fn shared_kernel_x86_cow_copies_and_repoints_through_intent() {
     assert_ne!(leaf & 2, 0, "replacement is writable");
     assert_eq!(leaf & (1 << 10), 0, "COW flag is cleared");
     assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0xd1_5000);
+}
+
+/// #2276 P0-3, on a real KVM carrier: the fixture maps a private 2 MiB user
+/// page and arms it in place, as owner fork does. Its first write enters the
+/// production x86 fault path, whose shared COW owner splits only that page
+/// with the grant's one table and copies only the written page.
+#[test]
+fn shared_kernel_x86_cow_splits_an_armed_large_page_on_first_write() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_SHARED_LARGE_COW_FAULT.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("KVM image");
+    assert_eq!(
+        carrier
+            .observe(0)
+            .expect("shared x86 large-page COW path")
+            .result,
+        1
+    );
 }
 
 #[test]

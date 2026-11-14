@@ -747,11 +747,13 @@ mod fork_cow {
                     owner_generation: NonZeroU64::new(1).unwrap(),
                     inventory_revision: NonZeroU64::new(1).unwrap(),
                 },
+                tables: Default::default(),
             },
             span_va: 0,
             span_len: 4096,
             old_ipa: leaf_pa,
             new_ipa,
+            tables_linked: 0,
         };
         assert!(cow_completion.is_well_formed());
         unpublished
@@ -1005,10 +1007,10 @@ mod fork_cow {
             0,
             "parent split entry must preserve USER permission"
         );
-        assert_ne!(
+        assert_eq!(
             parent_edit.after & NX,
             0,
-            "parent split entry must preserve NX permission"
+            "parent split entry restricts nothing; its leaves keep NX (#2276)"
         );
         assert_eq!(
             parent_edit.after & (COW | MAY_WRITE | PREPARED),
@@ -1041,10 +1043,10 @@ mod fork_cow {
             0,
             "child split entry must preserve USER permission"
         );
-        assert_ne!(
+        assert_eq!(
             child_l2_desc & NX,
             0,
-            "child split entry must preserve NX permission"
+            "child split entry restricts nothing; its leaves keep NX (#2276)"
         );
         assert_eq!(
             child_l2_desc & (COW | MAY_WRITE | PREPARED),
@@ -1120,6 +1122,9 @@ mod fork_cow {
         }
         fn table_word(output: FrameGpa, inherited: Option<u64>) -> u64 {
             X86Mmu::table_word(output, inherited)
+        }
+        fn split_table_word(output: FrameGpa, leaf: u64) -> u64 {
+            X86Mmu::split_table_word(output, leaf)
         }
         fn is_user(word: u64) -> bool {
             X86Mmu::is_user(word)
@@ -1242,7 +1247,8 @@ mod fork_cow {
         assert_eq!(parent, descriptor);
         assert_eq!(
             child,
-            (request.child_tables.base + 4096) | PRESENT | WRITE | NX
+            (request.child_tables.base + 4096) | PRESENT | WRITE,
+            "a supervisor split directory stays supervisor and never takes NX"
         );
         assert_eq!(scratch.child_used, 1024);
         assert_eq!(scratch.parent_used, 0);

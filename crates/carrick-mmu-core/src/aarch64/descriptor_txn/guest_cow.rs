@@ -16,16 +16,22 @@
 //! untagged, or map another compound keep their current output; the host's
 //! settlement sees them as retained siblings of the old compound.
 //!
+//! An armed EL1-private *block* (a wholly private L1/L2 terminal that owner
+//! fork armed in place) is resolved the same way, on its first write: the
+//! run is the fault page's 16 KiB granule of the block's virtual split, and
+//! the repoint splits exactly the covering block through the descriptor
+//! executor with host-granted tables ([`GuestCowRun::split_tables`]). Later
+//! writes in that block find L3 leaves and split nothing (#2276).
+//!
 //! Anything else is not EL1's to resolve and is forwarded: an untagged
-//! backend leaf (its permissions live in host metadata), a block terminal
-//! (resolving it needs a table split), a kernel-only leaf, and an armed page
-//! whose Linux write intent is clear (a genuine protection fault the host
-//! delivers as `SIGSEGV`).
+//! backend leaf (its permissions live in host metadata), a kernel-only leaf,
+//! and an armed page whose Linux write intent is clear (a genuine protection
+//! fault the host delivers as `SIGSEGV`).
 
 use super::{
-    AP_MASK, AP_RW, DescriptorRefusal, LeafAccess, LiveDescriptorWords, PA_MASK_4KIB, PT_PAGE,
-    SW_EL1_MAY_WRITE, SW_EL1_PRIVATE, SubstrateGpa, TYPE_BITS, TYPE_TABLE_OR_PAGE, UXN, VALID,
-    el1_cow, terminal_descriptor_permits_el0,
+    AP_MASK, AP_RW, DescriptorRefusal, LeafAccess, LiveDescriptorWords, PA_MASK_1GIB, PA_MASK_2MIB,
+    PA_MASK_4KIB, PT_PAGE, SW_EL1_MAY_WRITE, SW_EL1_PRIVATE, SubstrateGpa, TYPE_BITS, TYPE_BLOCK,
+    TYPE_TABLE_OR_PAGE, UXN, VALID, el1_cow, terminal_descriptor_permits_el0,
 };
 
 /// Bytes of the host COW compound a run stays inside.
@@ -41,6 +47,10 @@ pub struct GuestCowRun {
     /// Output of the run's first page in the old compound.
     pub old_ipa: SubstrateGpa,
     pub executable: bool,
+    /// Unlinked table pages the repoint needs to split the armed block that
+    /// covers the run: 0 for an L3 leaf, 1 for an L2 block, 2 for an L1
+    /// block. The repoint consumes them in walk order.
+    pub split_tables: usize,
 }
 
 impl GuestCowRun {
@@ -67,8 +77,7 @@ pub enum GuestCowClass {
 /// Why a leaf is not one EL1 resolves as fork COW, in test order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuestCowNotArmed {
-    /// No valid L3 page: nothing mapped, an invalid leaf, or a block terminal
-    /// above L3.
+    /// No valid terminal: nothing mapped, or an invalid leaf or block.
     Unmapped,
     /// A valid page that is not COW-armed (an untagged backend leaf, or a
     /// private page `mprotect`ed read-only).
@@ -85,6 +94,29 @@ pub enum GuestCowNotArmed {
     Executable,
 }
 
+/// The terminal mapping `va` and its level, or `None` when nothing valid
+/// leads to one (an empty or invalid entry above it).
+fn terminal<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: SubstrateGpa,
+    va: u64,
+) -> Result<Option<(usize, u64)>, DescriptorRefusal> {
+    let mut table = root.raw();
+    for (level, shift) in [39, 30, 21].into_iter().enumerate() {
+        let descriptor = words.load(table + ((va >> shift) & 511) * 8)?;
+        if descriptor & VALID == 0 {
+            return Ok(None);
+        }
+        if descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+            return Ok((level > 0).then_some((level, descriptor)));
+        }
+        table = descriptor & PA_MASK_4KIB;
+    }
+    words
+        .load(table + ((va >> 12) & 511) * 8)
+        .map(|leaf| Some((3, leaf)))
+}
+
 /// The L3 leaf mapping `va`, or `None` when a level above is not a table
 /// (a block terminal, or nothing mapped).
 fn l3_leaf<W: LiveDescriptorWords + ?Sized>(
@@ -92,15 +124,7 @@ fn l3_leaf<W: LiveDescriptorWords + ?Sized>(
     root: SubstrateGpa,
     va: u64,
 ) -> Result<Option<u64>, DescriptorRefusal> {
-    let mut table = root.raw();
-    for shift in [39, 30, 21] {
-        let descriptor = words.load(table + ((va >> shift) & 511) * 8)?;
-        if descriptor & VALID == 0 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
-            return Ok(None);
-        }
-        table = descriptor & PA_MASK_4KIB;
-    }
-    words.load(table + ((va >> 12) & 511) * 8).map(Some)
+    Ok(terminal(words, root, va)?.and_then(|(level, leaf)| (level == 3).then_some(leaf)))
 }
 
 /// A leaf this run may move: valid 4 KiB page, EL1-private, COW-armed.
@@ -109,14 +133,27 @@ fn armed_page(leaf: u64) -> bool {
 }
 
 /// Whether the terminal `descriptor` at `level` is a leaf EL1 resolves as
-/// fork COW: a valid 4 KiB page, EL1-private, COW-armed and Linux-writable.
+/// fork COW: a valid 4 KiB page, or a valid L1/L2 block, that is EL1-private,
+/// COW-armed and Linux-writable.
 #[must_use]
 pub fn is_guest_cow_write_leaf(level: usize, descriptor: u64) -> bool {
-    level == 3
-        && armed_page(descriptor)
+    let terminal = match level {
+        3 => TYPE_TABLE_OR_PAGE,
+        1 | 2 => TYPE_BLOCK,
+        _ => return false,
+    };
+    descriptor & TYPE_BITS == terminal
+        && el1_cow(descriptor)
         && descriptor & SW_EL1_PRIVATE != 0
         && descriptor & SW_EL1_MAY_WRITE != 0
         && descriptor & AP_MASK != AP_RW
+}
+
+/// Table pages the first repoint inside an armed terminal at `level` links:
+/// one per level between it and L3.
+#[must_use]
+pub const fn split_tables_for_level(level: usize) -> usize {
+    3usize.saturating_sub(level)
 }
 
 /// Classify an EL0 write permission fault at `far` against the live graph at
@@ -130,7 +167,7 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     executable_publication: bool,
 ) -> Result<GuestCowRun, GuestCowClass> {
     let page = far & !(PT_PAGE - 1);
-    let leaf = l3_leaf(words, root, page)
+    let (level, leaf) = terminal(words, root, page)
         .map_err(GuestCowClass::Unreachable)?
         .ok_or(GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped))?;
     if terminal_descriptor_permits_el0(leaf, LeafAccess::Write) {
@@ -142,17 +179,35 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     if leaf & SW_EL1_PRIVATE == 0 {
         return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotEl1Private));
     }
-    if !armed_page(leaf) {
+    if !el1_cow(leaf) {
         return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed));
     }
     if leaf & SW_EL1_MAY_WRITE == 0 {
         return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NoWriteIntent));
     }
-    if !is_guest_cow_write_leaf(3, leaf) {
+    if !is_guest_cow_write_leaf(level, leaf) {
         return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed));
     }
     if leaf & UXN == 0 && !executable_publication {
         return Err(GuestCowClass::NotArmed(GuestCowNotArmed::Executable));
+    }
+    let granule = page & !(GUEST_COW_COMPOUND - 1);
+    if level < 3 {
+        // The block's virtual split maps every page of the fault's granule
+        // onto consecutive outputs of one compound: blocks are at least
+        // 2 MiB aligned in both VA and output. The whole granule moves.
+        let (mask, span) = if level == 1 {
+            (PA_MASK_1GIB, 1u64 << 30)
+        } else {
+            (PA_MASK_2MIB, 1u64 << 21)
+        };
+        return Ok(GuestCowRun {
+            va: granule,
+            len: GUEST_COW_COMPOUND,
+            old_ipa: SubstrateGpa((leaf & mask) + (granule & (span - 1))),
+            executable: leaf & UXN == 0,
+            split_tables: split_tables_for_level(level),
+        });
     }
     let output = leaf & PA_MASK_4KIB;
     let compound = output & !(GUEST_COW_COMPOUND - 1);
@@ -160,7 +215,6 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     let lanes = GUEST_COW_COMPOUND / PT_PAGE;
     // The host arms and settles COW per 16 KiB VA granule; a run never
     // leaves the fault page's granule, whatever the physical layout.
-    let granule = page & !(GUEST_COW_COMPOUND - 1);
     let moves = |index: u64| -> Result<bool, GuestCowClass> {
         // Lane `index` of the compound, at the VA the fault page's offset
         // implies. Wrapping never happens: lanes stay inside one compound.
@@ -191,6 +245,7 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
         len: (last - first + 1) * PT_PAGE,
         executable: leaf & UXN == 0,
         old_ipa: SubstrateGpa(compound + first * PT_PAGE),
+        split_tables: 0,
     })
 }
 
@@ -274,6 +329,7 @@ mod tests {
                 va: VA + PT_PAGE,
                 len: PT_PAGE,
                 old_ipa: SubstrateGpa(OLD + PT_PAGE),
+                split_tables: 0,
             })
         );
     }
@@ -292,6 +348,7 @@ mod tests {
                 va: VA,
                 len: 4 * PT_PAGE,
                 old_ipa: SubstrateGpa(OLD),
+                split_tables: 0,
             }
         );
         assert_eq!(run.compound_offset(), 0);
@@ -319,6 +376,7 @@ mod tests {
                 va: VA + PT_PAGE,
                 len: 2 * PT_PAGE,
                 old_ipa: SubstrateGpa(OLD),
+                split_tables: 0,
             }
         );
     }
@@ -339,6 +397,7 @@ mod tests {
                 va: VA + PT_PAGE,
                 len: 2 * PT_PAGE,
                 old_ipa: SubstrateGpa(OLD + PT_PAGE),
+                split_tables: 0,
             }
         );
         assert_eq!(run.compound_offset(), PT_PAGE);
@@ -360,6 +419,7 @@ mod tests {
                 va: VA + 2 * PT_PAGE,
                 len: 2 * PT_PAGE,
                 old_ipa: SubstrateGpa(OLD),
+                split_tables: 0,
             }
         );
         let run =
@@ -371,6 +431,7 @@ mod tests {
                 va: VA + 4 * PT_PAGE,
                 len: 2 * PT_PAGE,
                 old_ipa: SubstrateGpa(OLD + 2 * PT_PAGE),
+                split_tables: 0,
             }
         );
     }
@@ -401,12 +462,70 @@ mod tests {
             classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 0x10_0000, false),
             Err(GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped))
         );
-        // A block terminal above L3 needs a split: not EL1's.
+        // An untagged backend block stays the host's.
         words.set(0x3000 + ((VA >> 21) & 511) * 8, OLD | 1 | AF);
+        assert_eq!(
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA, false),
+            Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotEl1Private))
+        );
+        // An invalid block is nothing mapped.
+        words.set(0x3000 + ((VA >> 21) & 511) * 8, armed(OLD, true) & !3);
         assert_eq!(
             classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA, false),
             Err(GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped))
         );
+        // An armed private block whose Linux write intent is clear is a real
+        // protection fault, exactly as for a page.
+        words.set(
+            0x3000 + ((VA >> 21) & 511) * 8,
+            (armed(OLD, false) & !3) | 1,
+        );
+        assert_eq!(
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA, false),
+            Err(GuestCowClass::NotArmed(GuestCowNotArmed::NoWriteIntent))
+        );
+    }
+
+    /// #2276: owner fork arms a wholly private block in place. Its first
+    /// write is EL1's: the run is the fault granule of the block's virtual
+    /// split, and the repoint must link one table per level below it.
+    #[test]
+    fn an_armed_private_block_moves_the_fault_granule_and_names_its_split() {
+        const BLOCK_2M: u64 = 0x9_4020_0000;
+        let words = Words::new();
+        let l2 = 0x3000 + ((VA >> 21) & 511) * 8;
+        words.set(l2, (armed(BLOCK_2M, true) & !3) | 1);
+        let far = VA + 0x1_6abc;
+        let run = classify_guest_cow_write(&words, SubstrateGpa(ROOT), far, false).unwrap();
+        assert_eq!(
+            run,
+            GuestCowRun {
+                executable: false,
+                va: VA + 0x1_4000,
+                len: GUEST_COW_COMPOUND,
+                old_ipa: SubstrateGpa(BLOCK_2M + 0x1_4000),
+                split_tables: 1,
+            }
+        );
+        assert!(is_guest_cow_write_leaf(2, words.load(l2).unwrap()));
+        assert!(!is_guest_cow_write_leaf(3, words.load(l2).unwrap()));
+
+        const BLOCK_1G: u64 = 0x9_8000_0000;
+        let l1 = 0x2000 + ((VA >> 30) & 511) * 8;
+        words.set(l1, (armed(BLOCK_1G, true) & !3) | 1);
+        let far = VA + 0x2345_6789;
+        let run = classify_guest_cow_write(&words, SubstrateGpa(ROOT), far, false).unwrap();
+        assert_eq!(
+            run,
+            GuestCowRun {
+                executable: false,
+                va: VA + 0x2345_4000,
+                len: GUEST_COW_COMPOUND,
+                old_ipa: SubstrateGpa(BLOCK_1G + 0x2345_4000),
+                split_tables: 2,
+            }
+        );
+        assert!(is_guest_cow_write_leaf(1, words.load(l1).unwrap()));
     }
 
     #[test]

@@ -490,6 +490,7 @@ fn proc_rows(dispatcher: &SyscallDispatcher) -> Vec<ProcMapsEntry> {
     let context = dispatcher.capture_one_task_context().unwrap();
     let mut rows = dispatcher
         .synthetic_proc_context(&context)
+        .unwrap()
         .address_space_regions
         .unwrap_or_default();
     rows.sort_by_key(|row| row.start);
@@ -2369,6 +2370,7 @@ fn locked_memory(dispatcher: &SyscallDispatcher) -> Vec<(u64, u64)> {
     let context = dispatcher.capture_one_task_context().unwrap();
     dispatcher
         .synthetic_proc_context(&context)
+        .unwrap()
         .locked_memory
         .iter()
         .map(|range| (range.start().raw(), range.end().raw()))
@@ -4021,7 +4023,13 @@ fn delegated_proc_maps_omits_hidden_arena_backing() {
             ReservationProtection::READ_WRITE,
         )
         .unwrap();
-    let rows = dispatcher.mem().lock().proc_regions().unwrap();
+    let rows = dispatcher
+        .mem()
+        .lock()
+        .proc_memory()
+        .unwrap()
+        .regions
+        .unwrap();
     assert_eq!(rows.len(), 1, "only Linux VMAs belong in proc maps");
     assert_eq!((rows[0].start, rows[0].end), (start, start + 2 * PAGE));
     assert!(rows[0].read && rows[0].write && !rows[0].execute);
@@ -6995,6 +7003,40 @@ fn delegated_live_leaf_reconciliation_survives_busy_root() {
             .resident
             .contains(base, ResidencyOwner::Root(incarnation))
     );
+}
+
+/// #2276, the Go telemetry sidecar's stop on #2278: "delegated anonymous
+/// root refused a lock observation: Busy". A syscall that renders `/proc`
+/// is ordinary: it does not pause this MM's EL1 threads, so one of them can
+/// hold the root. Contention is "not now": each production entry commits
+/// nothing, returns the holder's owner wait, and reruns to success. Busy
+/// once, then success.
+#[test]
+fn proc_renders_park_on_a_held_root_then_succeed() {
+    use carrick_abi::syscall::nr;
+    const PATH: u64 = 0x1_0000;
+    const STATBUF: u64 = 0x1_1000;
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = crate::dispatch::LinearMemory::new(PATH, vec![0; 0x4000]);
+    memory.write_bytes(PATH, b"/proc/self/status\0").unwrap();
+    let at_fdcwd = carrick_abi::LINUX_AT_FDCWD as u64;
+    for (number, args) in [
+        (nr::FACCESSAT.raw(), [at_fdcwd, PATH, 0, 0, 0, 0]),
+        (nr::NEWFSTATAT.raw(), [at_fdcwd, PATH, STATBUF, 0, 0, 0]),
+        (nr::OPENAT.raw(), [at_fdcwd, PATH, 0, 0, 0, 0]),
+    ] {
+        let busy = root.with_held_root_refusal(|| call(&mut dispatcher, &mut memory, number, args));
+        assert!(
+            matches!(busy, DispatchOutcome::OwnerMemoryWait { committed: 0, .. }),
+            "syscall {number}: a held root parks the call, got {busy:?}"
+        );
+        let done = call(&mut dispatcher, &mut memory, number, args);
+        assert!(
+            matches!(done, DispatchOutcome::Returned { value } if value >= 0),
+            "syscall {number}: the rerun succeeds, got {done:?}"
+        );
+    }
 }
 
 #[test]

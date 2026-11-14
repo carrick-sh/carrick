@@ -354,7 +354,7 @@ impl TransferCustody for UserTransferCustody {
             target,
             window,
         )?;
-        context.refill_transfer_cow()
+        context.refill_transfer_cow(Some(window.fault_page))
     }
     fn finish_maintenance(
         &self,
@@ -394,7 +394,7 @@ impl TransferCustody for UserTransferCustody {
             target,
             request,
         )?
-        .refill_transfer_cow()
+        .refill_transfer_cow(None)
     }
     fn retain(
         &self,

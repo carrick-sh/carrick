@@ -157,7 +157,7 @@ impl<'a> FsView<'a> {
         // AT_SYMLINK_NOFOLLOW stays unmodeled on the disk-authoritative backend;
         // a dangling/failed follow falls back to the link path unchanged.)
         let resolved = self.canonicalize_following(&resolved).unwrap_or(resolved);
-        if self.is_synthetic_virtual_path(context, &resolved) {
+        if self.is_synthetic_virtual_path(context, &resolved)? {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if let Err(errno) = self.layered_metadata(&resolved) {
@@ -520,7 +520,7 @@ impl<'a> FsView<'a> {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => {
-                    if this.is_synthetic_virtual_path(cx.kernel, &resolved)
+                    if this.is_synthetic_virtual_path(cx.kernel, &resolved)?
                     {
                         Ok(DispatchOutcome::Returned { value: 0 })
                     } else {
@@ -683,7 +683,9 @@ impl<'a> FsView<'a> {
         match exists {
             Ok(_) => {}
             Err(errno) => {
-                if context.is_some_and(|context| this.is_synthetic_virtual_path(context, &path)) {
+                if let Some(context) = context
+                    && this.is_synthetic_virtual_path(context, &path)?
+                {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 crate::probes::fs_op("utimensat:meta_err", &path, errno.get());

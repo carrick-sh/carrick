@@ -588,7 +588,24 @@ impl<B: OwnerForkMmu> UnpublishedChild<B> {
             && B::is_writable_user(terminal);
         for (level, (pa, live)) in path[..depth].iter().copied().enumerate() {
             if let Some(entry) = self.scratch.edits.iter_mut().find(|entry| entry.pa == pa) {
-                if live != entry.after {
+                if live != entry.after && level < 3 {
+                    // The parent's write took the first COW of a block this
+                    // fork armed in place, and that repoint split the block
+                    // (#2276). Abort keeps the live table: restoring the
+                    // block would drop the copied page.
+                    let span = 1u64 << SHIFTS[level];
+                    let block = entry.after & B::ADDRESS_MASK & !(span - 1);
+                    if !owned
+                        || B::is_table(entry.after, level)
+                        || !B::is_table(live, level)
+                        || !(block..block + span).contains(&old_ipa)
+                    {
+                        return Err(ForkError::Stale);
+                    }
+                    entry.after = live;
+                    entry.before = live;
+                    entry.bbm_len = 0;
+                } else if live != entry.after {
                     if level != 3 || !owned || entry.after & B::ADDRESS_MASK != old_ipa {
                         return Err(ForkError::Stale);
                     }
@@ -774,6 +791,9 @@ pub fn census_entry<
     let structural = B::control_window()
         .is_some_and(|(start, end)| va < end.raw() && va.saturating_add(span) > start.raw());
     let selected = policy::<B, P>(policy_provider, mappings, va, span, descriptor)?;
+    // A wholly private block is armed in place (one custody record, no
+    // table): its first COW write splits it (#2276). Only a block the
+    // policy cannot express whole is split here.
     if (structural || selected == Policy::Mixed) && level < 3 {
         count.child = count.child.checked_add(512).ok_or(ForkError::NoMemory)?;
         if !structural {
@@ -923,9 +943,9 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
         }
         return Ok((
             descriptor,
-            B::table_word(
+            B::split_table_word(
                 FrameGpa::new(request.child_tables.base + child as u64 * 8),
-                Some(descriptor),
+                descriptor,
             ),
         ));
     }
@@ -991,16 +1011,16 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
         }
         return Ok((
             if parent_changed {
-                B::table_word(
+                B::split_table_word(
                     FrameGpa::new(request.parent_tables.base + parent as u64 * 8),
-                    Some(descriptor),
+                    descriptor,
                 )
             } else {
                 descriptor
             },
-            B::table_word(
+            B::split_table_word(
                 FrameGpa::new(request.child_tables.base + child as u64 * 8),
-                Some(descriptor),
+                descriptor,
             ),
         ));
     }
