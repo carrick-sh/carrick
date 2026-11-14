@@ -588,24 +588,7 @@ impl<B: OwnerForkMmu> UnpublishedChild<B> {
             && B::is_writable_user(terminal);
         for (level, (pa, live)) in path[..depth].iter().copied().enumerate() {
             if let Some(entry) = self.scratch.edits.iter_mut().find(|entry| entry.pa == pa) {
-                if live != entry.after && level < 3 {
-                    // The parent's write took the first COW of a block this
-                    // fork armed in place, and that repoint split the block
-                    // (#2276). Abort keeps the live table: restoring the
-                    // block would drop the copied page.
-                    let span = 1u64 << SHIFTS[level];
-                    let block = entry.after & B::ADDRESS_MASK & !(span - 1);
-                    if !owned
-                        || B::is_table(entry.after, level)
-                        || !B::is_table(live, level)
-                        || !(block..block + span).contains(&old_ipa)
-                    {
-                        return Err(ForkError::Stale);
-                    }
-                    entry.after = live;
-                    entry.before = live;
-                    entry.bbm_len = 0;
-                } else if live != entry.after {
+                if live != entry.after {
                     if level != 3 || !owned || entry.after & B::ADDRESS_MASK != old_ipa {
                         return Err(ForkError::Stale);
                     }
@@ -943,9 +926,9 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
         }
         return Ok((
             descriptor,
-            B::split_table_word(
+            B::table_word(
                 FrameGpa::new(request.child_tables.base + child as u64 * 8),
-                descriptor,
+                Some(descriptor),
             ),
         ));
     }
@@ -1011,16 +994,16 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
         }
         return Ok((
             if parent_changed {
-                B::split_table_word(
+                B::table_word(
                     FrameGpa::new(request.parent_tables.base + parent as u64 * 8),
-                    descriptor,
+                    Some(descriptor),
                 )
             } else {
                 descriptor
             },
-            B::split_table_word(
+            B::table_word(
                 FrameGpa::new(request.child_tables.base + child as u64 * 8),
-                descriptor,
+                Some(descriptor),
             ),
         ));
     }

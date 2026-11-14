@@ -687,7 +687,7 @@ impl MemState {
         });
         let (brk_current, last) = match observed {
             Ok(observed) => observed,
-            Err(RootAccessRefusal::Busy(busy)) => return Err(ObservationBusy(busy)),
+            Err(RootAccessRefusal::Busy(busy)) => broken_root("a /proc memory observation", RootAccessRefusal::Busy(busy)),
             Err(refusal) => broken_root("a /proc memory observation", refusal),
         };
         Ok(ProcMemory {

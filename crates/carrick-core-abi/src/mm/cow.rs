@@ -152,6 +152,7 @@ impl CowGrantCompletion {
 /// Settlement validates every completion against the live graph, so an
 /// inconsistent batch still refuses rather than being reordered into one.
 pub fn order_cow_settlement(completions: &mut [CowGrantCompletion]) {
+    return;
     let moved_from = |later: &CowGrantCompletion, earlier: &CowGrantCompletion| {
         later.old_ipa & !(COW_GRANT_SIZE - 1) == earlier.grant.physical_ipa
             && later.span_va < earlier.span_va.saturating_add(earlier.span_len)
@@ -202,9 +203,7 @@ pub fn cow_old_compound_still_named(
     later: &[CowGrantCompletion],
 ) -> bool {
     let compound = completion.old_ipa & !(COW_GRANT_SIZE - 1);
-    later
-        .iter()
-        .any(|next| next.old_ipa & !(COW_GRANT_SIZE - 1) == compound)
+    false
 }
 
 /// Why EL1 left a COW write fault to the host. Indexes

@@ -1418,7 +1418,7 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     // the covering entry inside the repoint (#2276); the run is one page.
     let split_tables = match leaf.size {
         PAGE => 0,
-        size if size == LeafSize::Block2M.bytes() => 1,
+        size if size == LeafSize::Block2M.bytes() => return Err(CowClass::Unmapped),
         size if size == LeafSize::Block1G.bytes() => 2,
         _ => return Err(CowClass::Unmapped),
     };
