@@ -9,7 +9,8 @@ the director does. The binding rules every agent follows stay in
 ## Directing workers is reviewing diffs, not reading reports
 
 Workers code in worker VMs; the director owns runtime fixes, live
-verification, the signed evidence and landing.
+verification and the signed evidence. Host-side shepherds land reviewed PRs
+and the director audits them (owner, 2026-11-14; see below).
 
 
 - **The director starts workers as VMs** (owner, 2026-11-07): the
@@ -33,16 +34,22 @@ verification, the signed evidence and landing.
 - **Evidence before review** (owner, 2026-11-14, #231). A lane aimed at a
   row puts `Row: <row>` in its brief. The round isn't done until the row's
   real evidence ran on the PR's current head: a paired signed m4 run for
-  ARM, a KVM row repro for x86. Its counts go in the result's
-  `row_evidence`. A shepherd starts a review only when
-  `row-evidence-check.sh` prints `ROW-EVIDENCE: pass`. Go round 3's
+  ARM, a KVM row repro for x86. A KVM repro's counts go in the worker
+  result's `row_evidence`; a worker VM can't run the signed m4 run, so for
+  ARM the shepherd runs it and writes the same object to its own evidence
+  file. A shepherd starts a review only when `row-evidence-check.sh` prints
+  `ROW-EVIDENCE: pass` for one of the two, at the current head. `worker
+  start` adds this instruction to every author brief with a `Row:` line. Go round 3's
   no-op fix and the Node "result 28" lead each cost a review cycle before
   the signed run showed it.
 - **Shepherds land; the director audits** (owner, 2026-11-14, #231). When a
   review worker approves the PR's current head, the host-side shepherd
   publishes the review with `publish-review.sh` and runs `landing-check.sh`.
-  Only when its last line reads `LANDING-CHECK: pass` does the shepherd run
-  `gh pr ready` and `director-watch add land`. Worker VMs still can't mark a
+  Only when its last line reads `LANDING-CHECK: pass` (with or without
+  `advisory=...`, the known false positives the script names itself) does
+  the shepherd run `gh pr ready` and `director-watch add land`; a `fail` or
+  a missing line blocks it. The land watch enqueues only on a fresh `pass`
+  for the head it enqueues. Worker VMs still can't mark a
   PR ready (the template's guest `gh` guard). The `worker-shepherd` agent
   and the `conductor-workers` skill in carrick-sh/agy-director follow these
   rules; the tooling backlog is #2328 (`director-tooling`).
