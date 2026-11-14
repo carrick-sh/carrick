@@ -1625,11 +1625,28 @@ fn arm_vfork_live_child_keeps_sibling_clock_copyout_writable() {
     let route = harness.call_current(&mut clock, &mut cpu);
     assert_eq!(
         route,
-        carrick_personality_linux::dispatch::CompletionRoute::NativeService,
-        "a sibling clock_gettime output must enter the retained owner-fault service before the host crossing: x0={} current={:?}",
-        clock.x[0] as i64,
-        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        "clock_gettime reaches the native crossing capture"
     );
+    let counters = carrick_el1_abi::Counters::new();
+    let decision = super::super::dispatch::native_service_decision(
+        &mut clock,
+        harness.task,
+        carrick_el1_abi::Action::Forward,
+        None,
+        &counters,
+        || super::super::native_process_runtime::NativeThreadGroupOwner::ForkChild,
+        |frame| {
+            super::super::dispatch::native_crossing_output_stage(
+                frame,
+                &crate::file::HardwareValidator,
+            )
+        },
+    );
+    let super::super::dispatch::NativeServiceDecision::Begin(begin) = decision else {
+        panic!("the production crossing capture must retain an owner fault")
+    };
+    assert!(begin.is_fault_operation());
     assert_ne!(clock.x[0] as i64, -14, "owner preparation is never EFAULT");
 }
 
