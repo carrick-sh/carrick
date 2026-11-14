@@ -301,22 +301,18 @@ fn retained_cow_zone(ram: &GuestRam) -> Result<&X86Cpl0Zone, TrapError> {
     Ok(unsafe { &*ptr.cast::<X86Cpl0Zone>() })
 }
 
-struct HostCowWake<'a, M: CarrierMemoryIo> {
-    routes: &'a PublishedApicIds,
-    vm: Arc<M>,
-    error: std::cell::RefCell<Option<TrapError>>,
+/// The wake delivery of a host MM release (an exclusion's Gate/Editor
+/// release, a settlement claim's): the carrier's own zone sink, through the
+/// one host-side carrier delivery. A waiter the release's drain could not
+/// place in the guest is handed back to its execution owner, and a slot an
+/// EL1 publication queued on is rescheduled, never refused (#2337).
+struct HostCowWake<M: CarrierMemoryIo> {
+    sink: CarrierZoneWakeSink<M>,
 }
-impl<'a, M: CarrierMemoryIo> HostCowWake<'a, M> {
-    fn new(ram: &'a GuestRam, vm: Arc<M>) -> Result<Self, TrapError> {
-        let pointer = ram
-            .host_ptr(META_GPA + ROUTES_OFFSET, size_of::<PublishedApicIds>())
-            .ok_or_else(|| fail("owner COW retained APIC routes"))?;
-        // SAFETY: bootstrap initialized this retained aligned atomic record.
-        let routes = unsafe { &*pointer.cast::<PublishedApicIds>() };
+impl<M: CarrierMemoryIo> HostCowWake<M> {
+    fn new(ram: &Arc<GuestRam>, vm: Arc<M>) -> Result<Self, TrapError> {
         Ok(Self {
-            routes,
-            vm,
-            error: std::cell::RefCell::new(None),
+            sink: CarrierZoneWakeSink::new(ram, vm)?,
         })
     }
     fn deliver(
@@ -328,25 +324,24 @@ impl<'a, M: CarrierMemoryIo> HostCowWake<'a, M> {
             carrick_sched_core::ParkedContextWords,
         >,
     ) {
-        let (_, effects) = owned.deliver_handbacks(&mut |_| {
-            self.error.borrow_mut().get_or_insert_with(|| {
-                fail("native COW release produced unsupported host-home completion custody")
-            });
-        });
-        if effects.owes_host_boundary() || effects.queued_own {
-            self.error
-                .borrow_mut()
-                .get_or_insert_with(|| fail("host COW release produced guest-own wake effects"));
-        }
-        for slot in effects.sgi_slots() {
-            if let Err(error) = signal_resched(self.routes, &*self.vm, slot) {
-                self.error.borrow_mut().get_or_insert(error);
-            }
-        }
+        carrick_sched_core::complete_carrier_object_wake(&self.sink, owned);
     }
+    /// A reschedule the release owed but could not deliver is a broken
+    /// invariant: its record stays queued behind a CPU that may never wake.
     fn finish(&self) -> Result<(), TrapError> {
-        self.error.borrow_mut().take().map_or(Ok(()), Err)
+        use carrick_sched_core::CarrierZoneWake as _;
+        self.sink.take_undelivered().map_or(Ok(()), |undelivered| {
+            Err(fail(format!("host MM release wake: {}", undelivered.0)))
+        })
     }
+}
+
+fn retained_apic_routes(ram: &GuestRam) -> Result<&PublishedApicIds, TrapError> {
+    let pointer = ram
+        .host_ptr(META_GPA + ROUTES_OFFSET, size_of::<PublishedApicIds>())
+        .ok_or_else(|| fail("owner COW retained APIC routes"))?;
+    // SAFETY: bootstrap initialized this retained aligned atomic record.
+    Ok(unsafe { &*pointer.cast::<PublishedApicIds>() })
 }
 
 /// The x86 ISA mechanic of a host reschedule: an APIC MSI carrying the
@@ -389,6 +384,17 @@ struct CarrierZoneWakeSink<M: CarrierMemoryIo> {
     /// The first reschedule this carrier could not deliver since the host
     /// IPC owner last asked ([`carrick_sched_core::CarrierZoneWake::take_undelivered`]).
     resched_fault: std::sync::Mutex<Option<carrick_sched_core::WakeUndelivered>>,
+}
+impl<M: CarrierMemoryIo> CarrierZoneWakeSink<M> {
+    fn new(ram: &Arc<GuestRam>, vm: Arc<M>) -> Result<Self, TrapError> {
+        Ok(Self {
+            zone: std::ptr::NonNull::from(retained_cow_zone(ram)?),
+            routes: std::ptr::NonNull::from(retained_apic_routes(ram)?),
+            _ram: Arc::clone(ram),
+            vm,
+            resched_fault: std::sync::Mutex::new(None),
+        })
+    }
 }
 // SAFETY: both pointers name retained, aligned, atomic-only records inside
 // `_ram`, which this sink keeps alive; they are only read through shared
@@ -439,16 +445,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         Arc<dyn carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>>,
         TrapError,
     > {
-        let zone = std::ptr::NonNull::from(retained_cow_zone(&self.ram)?);
-        let routes =
-            std::ptr::NonNull::from(HostCowWake::new(&self.ram, self._vm.clone_vm())?.routes);
-        Ok(Arc::new(CarrierZoneWakeSink {
-            _ram: Arc::clone(&self.ram),
-            zone,
-            routes,
-            vm: self._vm.clone_vm(),
-            resched_fault: std::sync::Mutex::new(None),
-        }))
+        Ok(Arc::new(CarrierZoneWakeSink::new(
+            &self.ram,
+            self._vm.clone_vm(),
+        )?))
     }
 }
 fn retained_reservations(ram: &GuestRam) -> Result<&X86Cpl0Reservations, TrapError> {

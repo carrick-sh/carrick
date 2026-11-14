@@ -2228,6 +2228,67 @@ pub trait CarrierZoneWake<C: Copy + Send + Sync + zerocopy::FromZeros>: Send + S
 #[derive(Debug)]
 pub struct WakeUndelivered(pub &'static str);
 
+/// Deliver an object wake's effects to a carrier-scoped zone from a host
+/// thread: there is no stopped CPU to defer to, so detached records go
+/// straight back to their native ring owner ([`hand_back_in_carrier`]),
+/// and each slot the wake queued on, including an EL1 waker's own slot
+/// when the host drained its publication, gets its reschedule. The one
+/// host-side carrier delivery: the host IPC owner and the x86 carrier's
+/// own MM releases both use it (#2031, #2337).
+pub fn complete_carrier_object_wake<C: Copy + Send + Sync + zerocopy::FromZeros>(
+    carrier: &dyn CarrierZoneWake<C>,
+    owned: object_wait::OwnedObjectWakeEffects<'_, C>,
+) {
+    let zone = owned.zone();
+    let (waker, effects) =
+        owned.deliver_handbacks(&mut |record| hand_back_in_carrier(carrier, record));
+    let own = match waker {
+        Waker::El1 { slot } => Some(slot),
+        Waker::Host => None,
+    };
+    for slot in effects
+        .sgi_slots()
+        .chain(own.filter(|_| effects.queued_own || effects.misplaced))
+    {
+        zone.owe_resched(slot);
+        carrier.resched(slot);
+    }
+}
+
+/// A record a carrier-zone wake handed to the host (no guest slot could
+/// take it: every eligible CPU was stopped, e.g. the one serving the exit
+/// whose drain woke it, or its slot lock was held). A native thread has no
+/// host continuation, so its readiness completion is retained on its
+/// owner's queue ([`ZoneTables::place_host_handback`]); a stopped driver
+/// takes it on entry.
+pub fn hand_back_in_carrier<C: Copy + Send + Sync + zerocopy::FromZeros>(
+    carrier: &dyn CarrierZoneWake<C>,
+    record: RecordRef,
+) {
+    let zone = carrier.zone();
+    // Refused: the record retired between publication and handback, or
+    // another owner (its exit, a signal) settled it. Nothing is left to
+    // deliver.
+    let Some(handback) = zone.place_host_handback(record) else {
+        return;
+    };
+    let NativePlacement::Placed(placement) = handback.placement else {
+        return;
+    };
+    if placement.resched {
+        carrier.resched(placement.slot);
+    }
+    if !zone.slot(placement.slot).is_live() && handback.homeless {
+        for index in 0..ZONE_SLOTS {
+            let slot = SlotId::new(index as u8);
+            if zone.slot(slot).is_live() && zone.record_allows_slot(record.id, slot) {
+                zone.owe_resched(slot);
+                carrier.resched(slot);
+            }
+        }
+    }
+}
+
 /// Terminal release owns both alternatives until the scheduler decides.
 /// `rollback` runs only after the OnCpu-to-Queued CAS succeeds, under the
 /// slot lock and before queue publication. It must use lock-free atomics only:

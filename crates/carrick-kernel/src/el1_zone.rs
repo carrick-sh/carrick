@@ -85,7 +85,7 @@ impl ObjectWakeDelivery {
             collect_object_wake(
                 carrier.zone(),
                 &CarrierLockWait(carrier),
-                &|owned| complete_carrier_object_wake(carrier, owned),
+                &|owned| carrick_sched_core::complete_carrier_object_wake(carrier, owned),
                 wake,
                 handed,
                 len,
@@ -113,7 +113,7 @@ impl ObjectWakeDelivery {
             // SAFETY: collect initialized precisely this prefix.
             let record = unsafe { record.assume_init() };
             match carrier {
-                Some(carrier) => hand_back_in_carrier(carrier, record),
+                Some(carrier) => carrick_sched_core::hand_back_in_carrier(carrier, record),
                 None => publish_handback(record),
             }
         }
@@ -207,67 +207,11 @@ impl LockWait<carrick_sched_core::ParkedContextWords> for CarrierLockWait<'_> {
             carrick_sched_core::ParkedContextWords,
         >,
     ) {
-        complete_carrier_object_wake(self.0, owned);
+        carrick_sched_core::complete_carrier_object_wake(self.0, owned);
     }
 
     fn wait(&self, attempt: u32) -> bool {
         <HostLockWait as LockWait>::wait(&HostLockWait, attempt)
-    }
-}
-
-/// [`complete_object_wake`] for a carrier zone, on a host thread: there is
-/// no stopped CPU to defer to, so completed records go straight back to
-/// their native ring owner ([`hand_back_in_carrier`]).
-fn complete_carrier_object_wake(
-    carrier: CarrierZoneRef<'_>,
-    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-        '_,
-        carrick_sched_core::ParkedContextWords,
-    >,
-) {
-    let zone = owned.zone();
-    let (waker, effects) =
-        owned.deliver_handbacks(&mut |record| hand_back_in_carrier(carrier, record));
-    let own = match waker {
-        carrick_sched_core::Waker::El1 { slot } => Some(slot),
-        carrick_sched_core::Waker::Host => None,
-    };
-    for slot in effects
-        .sgi_slots()
-        .chain(own.filter(|_| effects.queued_own || effects.misplaced))
-    {
-        zone.owe_resched(slot);
-        carrier.resched(slot);
-    }
-}
-
-/// A record a carrier-zone wake handed to the host (no guest slot could
-/// take it: every eligible CPU was stopped, e.g. the one serving the exit
-/// whose drain woke it). A native thread has no host continuation, so its
-/// readiness completion is retained on its owner's queue, exactly like
-/// [`route_native_handback_in_zone`]; a stopped driver takes it on entry.
-fn hand_back_in_carrier(carrier: CarrierZoneRef<'_>, record: RecordRef) {
-    let zone = carrier.zone();
-    // Refused: the record retired between publication and handback, or
-    // another owner (its exit, a signal) settled it. Nothing is left to
-    // deliver.
-    let Some(handback) = zone.place_host_handback(record) else {
-        return;
-    };
-    let carrick_sched_core::NativePlacement::Placed(placement) = handback.placement else {
-        return;
-    };
-    if placement.resched {
-        carrier.resched(placement.slot);
-    }
-    if !zone.slot(placement.slot).is_live() && handback.homeless {
-        for index in 0..carrick_sched_core::ZONE_SLOTS {
-            let slot = SlotId::new(index as u8);
-            if zone.slot(slot).is_live() && zone.record_allows_slot(record.id, slot) {
-                zone.owe_resched(slot);
-                carrier.resched(slot);
-            }
-        }
     }
 }
 
