@@ -1576,6 +1576,238 @@ fn arm_vfork_while_sibling_parked_in_wait4_suspends_parent_until_release() {
     );
 }
 
+/// #2276: a host-loaded root's zero-stack vfork leaves a child live while a
+/// host-born sibling crosses for `clock_gettime`.  The fork owner must split
+/// the root's private L2 block so the real owner-copyout path can resolve COW
+/// and commit the sibling's timespec instead of returning EFAULT.  This joins
+/// the production ARM entry to the production reservation and descriptor
+/// owners; no validator projection stands in for the live page tables.
+#[test]
+fn arm_host_root_vfork_child_keeps_sibling_block_copyout_completable() {
+    use carrick_core::mm::transaction::{SelectionVenues, UserWriteRequest, UserWriteVenue};
+    use carrick_core::mm::transfer::ValidatedChunk;
+    use carrick_el1::fault::{CowResolution, CowResolver, NoopPreparedResolver};
+    use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
+
+    const BLOCK_LEN: u64 = 2 * 1024 * 1024;
+    const OUTPUT: u64 = VA + 0x2d_ed0;
+    let fixture = Box::leak(Box::new(Fixture::with_private_anonymous(
+        0x10000,
+        asid(1),
+        carrick_el1_abi::ReservationRange::new(VA + 8192, VA + BLOCK_LEN).unwrap(),
+    )));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    fixture.tables.words[1024].store(
+        (crate::mm_portal::test_support::IPA & !0x1f_ffff)
+            | (crate::mm_portal::test_support::RW & !2),
+        Ordering::Release,
+    );
+    let copy_base = carrick_el1_abi::EL1_COW_COPY_BASE;
+    let copy_indices = carrick_mmu_core::aarch64::indices(copy_base);
+    fixture.tables.words[512 + copy_indices[1]].store(0x14000 | 3, Ordering::Release);
+    fixture.tables.words[2048 + copy_indices[2]].store(0x15000 | 3, Ordering::Release);
+    for page in 0..2 {
+        fixture.tables.words[2560 + copy_indices[3] + page]
+            .store(copy_base + page as u64 * 4096, Ordering::Release);
+    }
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[
+            0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+        ]),
+    )
+    .with_words(words);
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let mut cpu = crate::sched::FakeCpu::default();
+    let mut vfork = carrick_el1_abi::TrapFrame::default();
+    vfork.x[8] = 220;
+    vfork.x[0] = 0x4111;
+    let route = arm_call_with_cpu(fixture, fixture.control, &mut service, &mut vfork, &mut cpu)
+        .expect("host-loaded root vfork enters through the production adapter");
+    let child_pid = vfork.x[0] as i64;
+    assert!(child_pid > 0, "vfork failed through {route:?}: {child_pid}");
+    let child_record = (0..carrick_sched_core::ZONE_RECORDS as u32)
+        .filter_map(RecordId::from_raw)
+        .find(|&record| fixture.zone.record(record).identity().tid == child_pid as u64)
+        .expect("the vfork child remains represented in the kernel graph");
+
+    let sibling = host_born_sibling(fixture, 52);
+    let mut first = carrick_el1_abi::TrapFrame::default();
+    first.x[8] = 178;
+    arm_call_with_cpu(fixture, sibling, &mut service, &mut first, &mut cpu).unwrap();
+    assert_eq!(first.x[0], 52);
+    assert!(
+        !fixture
+            .zone
+            .record(sibling.zone_record().unwrap().id)
+            .is_native_owned(),
+        "the sibling is a host-loaded root thread"
+    );
+    let mut clock = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        ..Default::default()
+    };
+    clock.x[8] = carrick_abi::syscall::nr::CLOCK_GETTIME.raw();
+    clock.x[0] = 1;
+    clock.x[1] = OUTPUT;
+    assert_eq!(
+        arm_call_with_cpu(fixture, sibling, &mut service, &mut clock, &mut cpu).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        "the host-loaded sibling reaches the real host crossing"
+    );
+
+    let handle = crate::cow_resolver::admitted_fault_mm_handle(
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        fixture.slot,
+        &fixture.task,
+    )
+    .expect("the sibling retains its admitted MM");
+    let portal = crate::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    );
+    let pool = carrick_el1_abi::CowGrantPool::new();
+    let replacement_ipa = crate::mm_portal::test_support::IPA + 0x400000;
+    let nz = |value| NonZeroU64::new(value).unwrap();
+    pool.publish(
+        handle.mm().raw(),
+        replacement_ipa,
+        BackingIdentity {
+            frame_id: nz(71),
+            mapping_id: nz(72),
+            owner_generation: nz(73),
+            inventory_revision: nz(74),
+        },
+    )
+    .unwrap();
+    let residency = crate::mm_portal::test_support::residency();
+
+    struct ResolveBlockCow<'a, W> {
+        words: &'a W,
+        root: u64,
+        pool: &'a carrick_el1_abi::CowGrantPool,
+        residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+    }
+    impl<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResolver
+        for ResolveBlockCow<'_, W>
+    {
+        fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
+            panic!("the owner must consume the typed COW result")
+        }
+        fn resolve_cow_outcome(&mut self, root: u64, mm: u64, address: u64) -> CowResolution {
+            assert_eq!(
+                root & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
+                self.root
+            );
+            let outcome = carrick_el1::cow::resolve_guest_cow(
+                &carrick_el1::cow::GuestCowVenue {
+                    words: self.words,
+                    root: carrick_mmu_core::aarch64::SubstrateGpa(self.root),
+                    pool: self.pool,
+                    residency: self.residency,
+                    copy_window: carrick_el1::cow::CowCopyWindow::target(
+                        self.words,
+                        carrick_mmu_core::aarch64::SubstrateGpa(self.root),
+                    ),
+                    publish_executable: None,
+                },
+                mm,
+                address,
+                |_, _| {},
+                || {},
+            );
+            carrick_el1::fault::handle_cow_outcome(outcome, &mut None)
+        }
+    }
+    struct ClockOutput<'a, W> {
+        cow: ResolveBlockCow<'a, W>,
+        prepared: NoopPreparedResolver,
+        handle: carrick_el1_abi::El1MmHandle,
+        copied: [u8; 16],
+    }
+    impl<'a, W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords>
+        UserWriteVenue<carrick_el1_abi::Aarch64ParkedContext> for ClockOutput<'a, W>
+    {
+        type Prepared = NoopPreparedResolver;
+        type Cow = ResolveBlockCow<'a, W>;
+        type Error = ();
+        fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
+            let residency = self.cow.residency;
+            SelectionVenues {
+                prepared: &mut self.prepared,
+                cow: &mut self.cow,
+                residency,
+                slot: 0,
+            }
+        }
+        fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+            Ok(())
+        }
+        fn supply_cow(&mut self, _: carrick_el1_abi::PortalGrantWindow) -> Result<(), ()> {
+            panic!("the exact replacement grant was published before the crossing")
+        }
+        fn copy(
+            &mut self,
+            fence: &ValidatedChunk<'_, carrick_el1_abi::Aarch64ParkedContext>,
+            bytes: &[u8],
+        ) -> bool {
+            assert_eq!(fence.selected().handle(), self.handle);
+            self.copied[..bytes.len()].copy_from_slice(bytes);
+            true
+        }
+    }
+    let timespec = [0x5a; 16];
+    let mut output = ClockOutput {
+        cow: ResolveBlockCow {
+            words,
+            root: fixture.address.root.address().raw(),
+            pool: &pool,
+            residency: &residency,
+        },
+        prepared: NoopPreparedResolver,
+        handle,
+        copied: [0; 16],
+    };
+    let result = portal
+        .write_user_bytes(
+            UserWriteRequest {
+                handle,
+                address: carrick_guest_arch::UserVa::new(OUTPUT),
+                bytes: &timespec,
+                slot: carrick_guest_arch::SlotId::new(0),
+            },
+            words,
+            &mut output,
+        )
+        .map(|()| 0i64)
+        .unwrap_or(-14);
+    assert_eq!(
+        result, 0,
+        "clock copyout must not become -EFAULT or -ENOSYS"
+    );
+    assert_eq!(output.copied, timespec);
+    assert_eq!(
+        fixture.zone.record(child_record).identity().tid,
+        child_pid as u64,
+        "the vfork child stays live throughout the sibling crossing"
+    );
+}
+
 /// #2071 witness 5: a child exits between the first waiter parking and the
 /// second waiter parking (while the first waiter's continuation row is still
 /// retained before its resume checkpoint runs, and across channel generation

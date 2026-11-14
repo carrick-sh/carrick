@@ -66,7 +66,9 @@ vm_free = [
   "carrick-kernel::dispatch::copyout_contention_tests::statx_path_copyin_waits_for_live_sibling_editor_and_bad_path_faults",
   "carrick-kernel::dispatch::copyout_contention_tests::x86_stat_paths_copyin_wait_for_live_sibling_editor",
   "carrick-kernel::dispatch::copyout_tests::clock_gettime_waits_for_an_owner_refused_copyout_instead_of_efault",
-  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_vfork_live_child_keeps_sibling_clock_copyout_writable",
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_host_root_vfork_child_keeps_sibling_block_copyout_completable (#2276: production ARM root and host-born sibling entry, live vfork child, real L2 fork-COW state, owner resolution, and exact 16-byte completion with result zero)",
+  "carrick-el1-linux::mm_portal::tests::owner_fork_private_block_copyout_selects_cow_supply_instead_of_efault (#2276: AArch64 private L2 block splits to L3 leaves before owner copyout classification)",
+  "carrick-el1-linux::mm_portal::x86_tests::x86_owner_fork_arms_private_parent_and_restores_on_abort (#2276: the shared owner splits an x86 private large page and abort restores the exact original mapping)",
   "carrick-kernel::dispatch::copyout_tests::fstat_waits_for_an_owner_refused_copyout_instead_of_efault",
   "carrick-kernel::dispatch::copyout_tests::getsockname_and_getpeername_wait_for_an_owner_refused_copyout",
   "carrick-kernel::dispatch::copyout_tests::gettimeofday_waits_for_an_owner_refused_copyout_instead_of_efault",
@@ -148,6 +150,7 @@ vm_free = [
 ]
 
 [bindings.unresolved]
+kvm = "Executing x86 production-entry binding: carrick-vmm-kvm::cpl0_fork_e2e::shared_owner_fork_runs_through_x86_cpl0_kvm_entry. The real KVM carrier completes fork, child COW, wait and retirement with zero semantic host exits; the contract evaluator has no registered KVM observation layer."
 embed_structural = "Signed two-live-thread witnesses (el1_sched_sock_pingpong_stepper_without_hold, #695 control) are director-owned; this slice ran no VM."
 remaining_sites = "Remaining direct user-memory writes in dispatch/ are enumerated by the exact copyout-debt ledger and checked by xtask copyout-debt."
 clone_tid = "VM-free two-live-thread Gate witness secures both CLONE_PARENT_SETTID/CHILD_SETTID outputs before publication. Signed el1_ipc_pairs_blocking and el1_ipc_mixed_venue_roundtrips remain director-owned (#898); this Linux worker cannot establish their verdicts."
