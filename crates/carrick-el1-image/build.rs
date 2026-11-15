@@ -36,6 +36,18 @@ pub(crate) fn get_sysroot(cargo: &Path) -> Result<String, String> {
     Ok(sysroot.to_owned())
 }
 
+/// The workspace profile for the nested image build (`Cargo.toml`): release
+/// with one codegen unit per crate, which keeps the loaded image inside
+/// `EL1_IMAGE_SIZE` (#691).
+pub(crate) const EL1_PROFILE: &str = "el1-image";
+
+/// Where the nested build leaves `carrick-el1` and its dep-info.
+pub(crate) fn el1_artifact_dir(el1_target_dir: &Path) -> PathBuf {
+    el1_target_dir
+        .join("aarch64-unknown-none-softfloat")
+        .join(EL1_PROFILE)
+}
+
 fn find_sysroot_tool(tool: &str, sysroot: &str, host: &str) -> PathBuf {
     let sysroot_path = Path::new(sysroot)
         .join("lib/rustlib")
@@ -308,7 +320,7 @@ fn main() {
     let el1_target_dir = Path::new(&out_dir).join("el1-target");
 
     // Build the carrick-el1 image binary (owned by carrick-el1-linux) for
-    // aarch64-unknown-none-softfloat --release
+    // aarch64-unknown-none-softfloat under the workspace `el1-image` profile.
     let mut build_cmd = Command::new(&cargo);
     build_cmd
         .arg("build")
@@ -317,7 +329,8 @@ fn main() {
         .arg("carrick-el1-linux")
         .arg("--target")
         .arg("aarch64-unknown-none-softfloat")
-        .arg("--release")
+        .arg("--profile")
+        .arg(EL1_PROFILE)
         .arg("--target-dir")
         .arg(&el1_target_dir);
 
@@ -338,7 +351,8 @@ fn main() {
         );
     }
 
-    let elf_path = el1_target_dir.join("aarch64-unknown-none-softfloat/release/carrick-el1");
+    let el1_out_dir = el1_artifact_dir(&el1_target_dir);
+    let elf_path = el1_out_dir.join("carrick-el1");
     let bin_path = Path::new(&out_dir).join("carrick-el1.bin");
 
     // Verify that no FP/SIMD instructions or register references exist in the ELF
@@ -375,7 +389,7 @@ fn main() {
     // reported by rustc/Cargo, plus each closure crate's `Cargo.toml`, `src`
     // directory, and (when present) `build.rs` and `link.ld`, alongside
     // `frame_budget.rs`, `../carrick-el1-linux/link.ld`, and `../../Cargo.lock`.
-    let depfile_path = el1_target_dir.join("aarch64-unknown-none-softfloat/release/carrick-el1.d");
+    let depfile_path = el1_out_dir.join("carrick-el1.d");
     let depfile_text = read_depfile(&depfile_path).unwrap_or_else(|error| panic!("{error}"));
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir

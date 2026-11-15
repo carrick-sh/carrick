@@ -324,7 +324,7 @@ fn derived_watch_list_matches_real_el1_depfile_and_rejects_omitted_crate() {
     let workspace = workspace_root();
     let out_dir = Path::new(env!("OUT_DIR"));
     let depfile_path =
-        out_dir.join("el1-target/aarch64-unknown-none-softfloat/release/carrick-el1.d");
+        image_build::el1_artifact_dir(&out_dir.join("el1-target")).join("carrick-el1.d");
     let depfile_text = std::fs::read_to_string(&depfile_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", depfile_path.display()));
     let derived = image_build::derive_watch_list(

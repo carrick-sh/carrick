@@ -125,6 +125,15 @@ debug = true
 # runtime binary itself stays lean.
 split-debuginfo = "packed"
 
+# The nested EL1 image build (`carrick-el1-image/build.rs`). One codegen unit
+# per crate stops LLVM emitting a private copy of every generic instance in
+# each of up to 16 partitions, about 110 KB of the 1.5 MiB loaded image
+# (#691). Speed settings, overflow checks and debuginfo stay release's;
+# `opt-level = "s"` was measured and rejected for speed (#801).
+[profile.el1-image]
+inherits = "release"
+codegen-units = 1
+
 [workspace.dependencies]
 carrick-fatal = { path = "crates/carrick-fatal" }
 arc-swap = "1.7.1"
