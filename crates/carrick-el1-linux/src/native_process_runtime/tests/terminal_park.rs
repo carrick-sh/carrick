@@ -714,3 +714,136 @@ fn refused_losing_exit_after_vacate_leaves_no_installed_space() {
         "a vacated root must not leave the slot's occupancy naming the process space: {outcome:?}"
     );
 }
+
+/// #2374: a closing group interrupts every member record (#2298). A
+/// host-loaded member parked on its home record in an EL1 futex wait is woken
+/// with `EINTR` and selected again on its home slot, while its host job stays
+/// loaded on that vCPU. Retiring that home record in the ring vacates the
+/// vCPU to the maintenance root and clears the slot's host record; the host's
+/// zone reconciliation then accepts the vacated slot under the exit request
+/// and serves the job's in-flight syscall over the maintenance root. Its next
+/// zone save names ASID 0 and the reload is refused ("HVPatch task projection
+/// ASID 1 does not match CPU TTBR pair 0x2d001f8000/0x2d001f8000").
+///
+/// Model of the host's save, from what the ring leaves: while the home record
+/// is the slot's host record, settlement rewrites the job's roots from its own
+/// stage-1 lease; once the ring cleared it, the job keeps the live roots,
+/// which name the maintenance root (ASID 0) if the ring vacated them.
+#[cfg(test)]
+#[test]
+fn closing_interrupt_hands_a_loaded_members_home_record_to_its_host() {
+    use super::super::PendingCloseOperation;
+    use carrick_sched_core::object_wait::OwnerEntry;
+    const PROCESS_ASID: u16 = 1;
+    const MAINTENANCE_ASID: u16 = 0;
+    const FUTEX: u64 = 0x7000;
+    let fixture = native_exec_fixture();
+    let _ = super::super::host_test_support::take_terminal_vacates();
+    let sibling = add_service_sibling(&fixture, None);
+    assert_eq!(fixture.page.live(), 2);
+    // The sibling is host-loaded: its record is its slot's host home, running
+    // in its process space, with nothing switched in.
+    assert_eq!(fixture.zone.slot(sibling.slot).current(), None);
+    assert_eq!(
+        fixture.zone.slot(sibling.slot).host_record(),
+        Some(sibling.record.id)
+    );
+    // EL1 serves its futex wait by parking that home record.
+    {
+        let guard = fixture.zone.short_lock(
+            carrick_sched_core::ZoneTables::<carrick_sched_core::ParkedContextWords>::bucket_of_with_context(
+                1, FUTEX,
+            ),
+            &carrick_sched_core::ShortLockSpin,
+        );
+        let seq = fixture.zone.next_seq(sibling.record.id);
+        fixture
+            .zone
+            .enqueue(&guard, sibling.record.id, seq, 1, FUTEX, u32::MAX, 0)
+            .unwrap();
+        fixture.zone.publish_park(sibling.record.id, seq);
+    }
+
+    let saved = words(fixture.address);
+    let mut service = fixture.service();
+    let mut owner = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    owner
+        .begin_closing(PendingCloseOperation::Exit {
+            status: LinuxWaitStatus::exited(0),
+            entry: OwnerEntry::Syscall,
+        })
+        .unwrap();
+    assert_eq!(owner.take_run_failure(), None);
+    drop(owner);
+    assert!(sibling.control.host_exit_requested());
+
+    // The interrupted waiter is runnable again on its home slot, where its
+    // host job is still loaded.
+    assert_eq!(
+        fixture.zone.switch_in(sibling.slot),
+        Some(sibling.record.id),
+        "the closing interrupt must wake the parked home record"
+    );
+    let mut sibling_service = fixture.service();
+    let mut member = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling.slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+    let resumed = match member.resume_checkpoint(|_| Ok(None)) {
+        Ok(NativeResume::Left(None)) => "left",
+        Ok(NativeResume::Left(Some(_))) => "root exit",
+        Ok(NativeResume::NoPending) => "no pending",
+        Ok(_) => "resumed",
+        Err(_) => "run failure",
+    };
+    let run_failure = member.take_run_failure();
+    drop(member);
+    assert_eq!(run_failure, None, "{resumed}");
+    assert_eq!(resumed, "left", "the member leaves the ring");
+
+    let vacated = super::super::host_test_support::take_terminal_vacates() != 0;
+    let host_settles_own_roots =
+        fixture.zone.slot(sibling.slot).host_record() == Some(sibling.record.id);
+    let saved_asid = if host_settles_own_roots || !vacated {
+        PROCESS_ASID
+    } else {
+        MAINTENANCE_ASID
+    };
+    assert_eq!(
+        saved_asid,
+        PROCESS_ASID,
+        "the host job saves this thread over the maintenance root: vacated={vacated} \
+         host_record={:?}",
+        fixture.zone.slot(sibling.slot).host_record()
+    );
+    // Its host owner retires it: the record is handed back live, not freed.
+    assert!(fixture.zone.live(sibling.record).is_some());
+    assert!(matches!(
+        fixture.zone.record(sibling.record.id).claim(),
+        carrick_sched_core::Claim::Host { .. }
+    ));
+    assert_eq!(fixture.page.live(), 1, "only the owner's unit was consumed");
+}
