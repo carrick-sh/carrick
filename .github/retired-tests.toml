@@ -59,3 +59,9 @@ test = "carrick_el1_linux::aarch64_process_tests::arm_glibc_pthread_join_robust_
 reason = "#2109: a registered robust list no longer declines a raw exit to host custody, so the #2124 host-retirement wake witness now reaches host custody through a pending-signal decline, and a twin witnesses the robust exit retiring in ring and waking the join itself."
 replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_glibc_pthread_join_host_retirement_wake_meets_ring_wait"
 pr = 2182
+
+[[retired]]
+test = "carrick_el1_linux::aarch64_process_tests::arm_raw_exit_decline_after_membership_reservation_restores_live"
+reason = "#2359: a refused clear-tid copy-out on raw exit is now \"not now\" (the exit restores membership and reruns in ring through the owner-input wait) instead of declining to HostCustody, so the decline witness was renamed for the refused-copy contract it now asserts (8787221ef)."
+replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_raw_exit_refused_copy_after_membership_reservation_restores_live"
+pr = 2367

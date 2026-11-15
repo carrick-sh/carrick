@@ -138,3 +138,8 @@ fn x5_linux_clone_exit() {
 fn x5_exit_requeued_after_wake_wakes_once() {
     lifecycle::x5_exit_requeued_after_wake_wakes_once();
 }
+
+#[test]
+fn x5_clone_tid_copy_not_yet_reruns() {
+    lifecycle::x5_clone_tid_copy_not_yet_reruns();
+}
