@@ -18224,7 +18224,7 @@ fn arm_root_ring_epoll_takes_a_host_socket_member() {
     use carrick_abi::{
         LINUX_AF_UNIX, LINUX_EEXIST, LINUX_ENOENT, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL,
         LINUX_EPOLL_CTL_MOD, LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_O_CLOEXEC, LINUX_O_NONBLOCK,
-        LINUX_SOCK_CLOEXEC, LINUX_SOCK_STREAM,
+        LINUX_SOCK_CLOEXEC, LINUX_SOCK_DGRAM,
     };
     use carrick_personality_linux::crossing::nr as sys;
     use carrick_personality_linux::dispatch::CompletionRoute;
@@ -18264,13 +18264,15 @@ fn arm_root_ring_epoll_takes_a_host_socket_member() {
         );
         assert!(epoll >= 0, "epoll_create1: {epoll}");
         let epoll = epoll as u64;
-        // uv_spawn's stdio pipe: a host AF_UNIX socketpair.
+        // A host member: an AF_UNIX datagram socketpair (uv_spawn's stream
+        // pair is a ring object since #2361; a datagram pair stays the
+        // host's).
         let sockets = GuestUserBuffer::zeroed(8);
         let (route, made) = call_root(
             sys::SOCKETPAIR.raw(),
             [
                 LINUX_AF_UNIX as u64,
-                (LINUX_SOCK_STREAM | LINUX_SOCK_CLOEXEC) as u64,
+                (LINUX_SOCK_DGRAM | LINUX_SOCK_CLOEXEC) as u64,
                 0,
                 sockets.arg(),
                 0,
@@ -18450,8 +18452,8 @@ fn fd_pair_of(buffer: &carrick_test_support::GuestUserBuffer) -> [u64; 2] {
     ]
 }
 
-/// The root's half of libuv's `uv_spawn` with a piped stdout: a host
-/// AF_UNIX `socketpair` (the child's end close-on-exec), then `fork`.
+/// The root's half of libuv's `uv_spawn` with a piped stdout: an AF_UNIX
+/// stream `socketpair` (the child's end close-on-exec), then `fork`.
 #[cfg(test)]
 fn arm_root_spawn_socketpair(
     call: &mut dyn FnMut(
@@ -18460,7 +18462,33 @@ fn arm_root_spawn_socketpair(
         [u64; 6],
     ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
 ) -> [u64; 2] {
-    use carrick_abi::{LINUX_AF_UNIX, LINUX_SOCK_CLOEXEC, LINUX_SOCK_STREAM};
+    arm_root_socketpair(call, carrick_abi::LINUX_SOCK_STREAM as u32)
+}
+
+/// A host-backed epoll member for the #2338 adoption witnesses: an AF_UNIX
+/// datagram `socketpair`, which stays the host's (a stream pair is the
+/// ring's since #2361).
+#[cfg(test)]
+fn arm_root_host_socketpair(
+    call: &mut dyn FnMut(
+        ArmCaller,
+        u64,
+        [u64; 6],
+    ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+) -> [u64; 2] {
+    arm_root_socketpair(call, carrick_abi::LINUX_SOCK_DGRAM as u32)
+}
+
+#[cfg(test)]
+fn arm_root_socketpair(
+    call: &mut dyn FnMut(
+        ArmCaller,
+        u64,
+        [u64; 6],
+    ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+    kind: u32,
+) -> [u64; 2] {
+    use carrick_abi::{LINUX_AF_UNIX, LINUX_SOCK_CLOEXEC};
     use carrick_personality_linux::crossing::nr as sys;
     let sockets = carrick_test_support::GuestUserBuffer::zeroed(8);
     let (_, made) = call(
@@ -18468,7 +18496,7 @@ fn arm_root_spawn_socketpair(
         sys::SOCKETPAIR.raw(),
         [
             LINUX_AF_UNIX as u64,
-            (LINUX_SOCK_STREAM | LINUX_SOCK_CLOEXEC) as u64,
+            u64::from(kind | LINUX_SOCK_CLOEXEC as u32),
             0,
             sockets.arg(),
             0,
@@ -18551,7 +18579,7 @@ fn arm_root_ring_epoll_aliases_share_one_host_half() {
         let (_, high) = call(Root, sys::FCNTL.raw(), [epoll, LINUX_F_DUPFD, 20, 0, 0, 0]);
         assert!(high >= 20, "F_DUPFD: {high}");
         let high = high as u64;
-        let [parent, child] = arm_root_spawn_socketpair(call);
+        let [parent, child] = arm_root_host_socketpair(call);
         let socket_in = epoll_event_buffer(LINUX_EPOLLIN, SOCKET_COOKIE);
 
         expect(
@@ -18676,7 +18704,7 @@ fn arm_root_ring_epoll_adoption_beside_a_sibling_exact_claim() {
         let (_, alias) = call(Root, sys::DUP.raw(), [epoll, 0, 0, 0, 0, 0]);
         assert!(alias >= 0, "dup: {alias}");
         let alias = alias as u64;
-        let [parent, child] = arm_root_spawn_socketpair(call);
+        let [parent, child] = arm_root_host_socketpair(call);
         let socket_in = epoll_event_buffer(LINUX_EPOLLIN, SOCKET_COOKIE);
 
         let claim = files
@@ -18730,7 +18758,6 @@ fn arm_root_ring_epoll_adoption_beside_a_sibling_exact_claim() {
 /// (`write_description_from_carrier` serves files only), so the child sees
 /// ENOSYS on its stdout and its stderr, and exits 1.
 #[test]
-#[ignore = "#2361: a native child's write to an inherited host AF_UNIX socket is refused"]
 fn arm_root_fork_child_writes_its_socket_stdout() {
     use carrick_personality_linux::crossing::nr as sys;
     use carrick_test_support::GuestUserBuffer;
@@ -18777,6 +18804,537 @@ fn arm_root_fork_child_writes_its_socket_stdout() {
     );
 }
 
+/// The calls of the #2361 witnesses, each checked: a mismatch reports
+/// every broken rule at once instead of the first.
+#[cfg(test)]
+struct ArmExpect(std::cell::RefCell<Vec<String>>);
+
+#[cfg(test)]
+impl ArmExpect {
+    fn new() -> Self {
+        Self(std::cell::RefCell::new(Vec::new()))
+    }
+    fn result(
+        &self,
+        what: &str,
+        got: (carrick_personality_linux::dispatch::CompletionRoute, i64),
+        want: i64,
+    ) {
+        if got.1 != want {
+            self.0
+                .borrow_mut()
+                .push(format!("{what}: got {} ({:?}), want {want}", got.1, got.0));
+        }
+    }
+    /// `got` must be `want`, answered in ring (never a host forward).
+    fn served(
+        &self,
+        what: &str,
+        got: (carrick_personality_linux::dispatch::CompletionRoute, i64),
+        want: i64,
+    ) {
+        use carrick_personality_linux::dispatch::CompletionRoute;
+        if got != (CompletionRoute::Served, want) {
+            self.0.borrow_mut().push(format!(
+                "{what}: got {} ({:?}), want {want} served in ring",
+                got.1, got.0
+            ));
+        }
+    }
+    fn bytes(&self, what: &str, got: &[u8], want: &[u8]) {
+        if got != want {
+            self.0.borrow_mut().push(format!(
+                "{what}: got {:?}, want {:?}",
+                String::from_utf8_lossy(got),
+                String::from_utf8_lossy(want)
+            ));
+        }
+    }
+    fn assert_empty(self, contract: &str) {
+        let mismatches = self.0.into_inner();
+        assert!(
+            mismatches.is_empty(),
+            "{contract}:\n{}",
+            mismatches.join("\n")
+        );
+    }
+}
+
+/// #2361: `socketpair(AF_UNIX, SOCK_STREAM)` is a ring object. The run
+/// root's pair is served in ring: two descriptors, bytes both ways, the
+/// socket's metadata (`fstat` S_IFSOCK, `getsockopt` type and domain,
+/// unnamed `getsockname`/`getpeername`), and EOF and EPIPE once the peer
+/// closes. Nothing reaches the host: a host socket would be unreachable
+/// from the root's ring children (#2361).
+#[test]
+fn arm_root_socketpair_is_a_ring_stream_pair() {
+    use ArmCaller::Root;
+    use carrick_abi::{
+        LINUX_AF_UNIX, LINUX_EPIPE, LINUX_ESPIPE, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_FD_CLOEXEC,
+        LINUX_FIONREAD, LINUX_O_RDWR, LINUX_SO_DOMAIN, LINUX_SO_ERROR, LINUX_SO_PROTOCOL,
+        LINUX_SO_TYPE, LINUX_SOCK_CLOEXEC, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (expect, _) = with_arm_process_host_dispatch(|call| {
+        let expect = ArmExpect::new();
+        let sockets = GuestUserBuffer::zeroed(8);
+        expect.served(
+            "socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC)",
+            call(
+                Root,
+                sys::SOCKETPAIR.raw(),
+                [
+                    LINUX_AF_UNIX as u64,
+                    (LINUX_SOCK_STREAM | LINUX_SOCK_CLOEXEC) as u64,
+                    0,
+                    sockets.arg(),
+                    0,
+                    0,
+                ],
+            ),
+            0,
+        );
+        let [first, second] = fd_pair_of(&sockets);
+        assert_ne!(first, second, "two descriptors");
+        for (what, from, to, bytes) in [
+            ("first to second", first, second, &b"ping"[..]),
+            ("second to first", second, first, &b"pong!"[..]),
+        ] {
+            let out = GuestUserBuffer::from_bytes(bytes);
+            expect.served(
+                &format!("write {what}"),
+                call(
+                    Root,
+                    sys::WRITE.raw(),
+                    [from, out.arg(), bytes.len() as u64, 0, 0, 0],
+                ),
+                bytes.len() as i64,
+            );
+            let count = GuestUserBuffer::zeroed(4);
+            expect.served(
+                &format!("FIONREAD {what}"),
+                call(
+                    Root,
+                    sys::IOCTL.raw(),
+                    [to, LINUX_FIONREAD, count.arg(), 0, 0, 0],
+                ),
+                0,
+            );
+            expect.bytes(
+                &format!("FIONREAD count {what}"),
+                count.as_bytes(),
+                &(bytes.len() as i32).to_ne_bytes(),
+            );
+            let got = GuestUserBuffer::zeroed(16);
+            let read = call(Root, sys::READ.raw(), [to, got.arg(), 16, 0, 0, 0]);
+            expect.served(&format!("read {what}"), read, bytes.len() as i64);
+            expect.bytes(
+                &format!("bytes {what}"),
+                &got.as_bytes()[..read.1.clamp(0, 16) as usize],
+                bytes,
+            );
+        }
+        expect.served(
+            "F_GETFL",
+            call(Root, sys::FCNTL.raw(), [first, LINUX_F_GETFL, 0, 0, 0, 0]),
+            LINUX_O_RDWR as i64,
+        );
+        expect.served(
+            "F_GETFD",
+            call(Root, sys::FCNTL.raw(), [first, LINUX_F_GETFD, 0, 0, 0, 0]),
+            LINUX_FD_CLOEXEC as i64,
+        );
+        let stat = GuestUserBuffer::zeroed(128);
+        expect.served(
+            "fstat",
+            call(Root, sys::FSTAT.raw(), [first, stat.arg(), 0, 0, 0, 0]),
+            0,
+        );
+        let mode = u32::from_ne_bytes(stat.as_bytes()[16..20].try_into().unwrap());
+        if mode & 0o170000 != carrick_syscall_abi::LINUX_S_IFSOCK {
+            expect
+                .0
+                .borrow_mut()
+                .push(format!("fstat st_mode: {mode:o}"));
+        }
+        expect.served(
+            "lseek",
+            call(Root, sys::LSEEK.raw(), [first, 0, 0, 0, 0, 0]),
+            LINUX_ESPIPE.guest_retval(),
+        );
+        for (what, option, want) in [
+            ("SO_TYPE", LINUX_SO_TYPE, LINUX_SOCK_STREAM),
+            ("SO_DOMAIN", LINUX_SO_DOMAIN, LINUX_AF_UNIX),
+            ("SO_PROTOCOL", LINUX_SO_PROTOCOL, 0),
+            ("SO_ERROR", LINUX_SO_ERROR, 0),
+        ] {
+            let value = GuestUserBuffer::zeroed(4);
+            let len = GuestUserBuffer::from_value(4u32);
+            expect.served(
+                &format!("getsockopt({what})"),
+                call(
+                    Root,
+                    sys::GETSOCKOPT.raw(),
+                    [
+                        second,
+                        LINUX_SOL_SOCKET as u64,
+                        option as u64,
+                        value.arg(),
+                        len.arg(),
+                        0,
+                    ],
+                ),
+                0,
+            );
+            expect.bytes(
+                &format!("getsockopt({what}) value"),
+                value.as_bytes(),
+                &want.to_ne_bytes(),
+            );
+        }
+        for (what, nr) in [
+            ("getsockname", sys::GETSOCKNAME),
+            ("getpeername", sys::GETPEERNAME),
+        ] {
+            let address = GuestUserBuffer::from_bytes(&[0xa5; 16]);
+            let len = GuestUserBuffer::from_value(16u32);
+            expect.served(
+                what,
+                call(Root, nr.raw(), [first, address.arg(), len.arg(), 0, 0, 0]),
+                0,
+            );
+            // An unnamed socket: just its family, `sizeof(sa_family_t)`.
+            expect.bytes(
+                &format!("{what} length"),
+                len.as_bytes(),
+                &2u32.to_ne_bytes(),
+            );
+            expect.bytes(
+                &format!("{what} family"),
+                &address.as_bytes()[..2],
+                &(LINUX_AF_UNIX as u16).to_ne_bytes(),
+            );
+        }
+        expect.served(
+            "close the second end",
+            call(Root, sys::CLOSE.raw(), [second, 0, 0, 0, 0, 0]),
+            0,
+        );
+        let got = GuestUserBuffer::zeroed(4);
+        expect.served(
+            "read after the peer closed (EOF)",
+            call(Root, sys::READ.raw(), [first, got.arg(), 4, 0, 0, 0]),
+            0,
+        );
+        let late = GuestUserBuffer::from_bytes(b"late");
+        expect.result(
+            "write after the peer closed (EPIPE)",
+            call(Root, sys::WRITE.raw(), [first, late.arg(), 4, 0, 0, 0]),
+            LINUX_EPIPE.guest_retval(),
+        );
+        expect.served(
+            "close the first end",
+            call(Root, sys::CLOSE.raw(), [first, 0, 0, 0, 0, 0]),
+            0,
+        );
+        expect
+    });
+    expect.assert_empty("a ring AF_UNIX stream pair left Linux's contract");
+}
+
+/// #2361: SOCK_NONBLOCK sets the pair's status flag (an empty read is
+/// EAGAIN, as libuv's loop expects); FIONBIO changes it, as libuv's
+/// `uv__nonblock` does; `shutdown(SHUT_WR)` gives the peer EOF after the
+/// bytes already sent and this end EPIPE; FIONREAD counts unread bytes.
+#[test]
+fn arm_root_socketpair_nonblock_and_shutdown() {
+    use ArmCaller::Root;
+    use carrick_abi::{
+        LINUX_AF_UNIX, LINUX_EAGAIN, LINUX_EINVAL, LINUX_EPIPE, LINUX_F_GETFL, LINUX_FIONBIO,
+        LINUX_O_NONBLOCK, LINUX_O_RDWR, LINUX_SHUT_WR, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK,
+        LINUX_SOCK_STREAM,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (expect, _) = with_arm_process_host_dispatch(|call| {
+        let expect = ArmExpect::new();
+        let sockets = GuestUserBuffer::zeroed(8);
+        expect.served(
+            "socketpair(SOCK_NONBLOCK)",
+            call(
+                Root,
+                sys::SOCKETPAIR.raw(),
+                [
+                    LINUX_AF_UNIX as u64,
+                    (LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC) as u64,
+                    0,
+                    sockets.arg(),
+                    0,
+                    0,
+                ],
+            ),
+            0,
+        );
+        let [first, second] = fd_pair_of(&sockets);
+        let got = GuestUserBuffer::zeroed(16);
+        expect.served(
+            "empty nonblocking read",
+            call(Root, sys::READ.raw(), [first, got.arg(), 16, 0, 0, 0]),
+            LINUX_EAGAIN.guest_retval(),
+        );
+        expect.served(
+            "F_GETFL",
+            call(Root, sys::FCNTL.raw(), [first, LINUX_F_GETFL, 0, 0, 0, 0]),
+            (LINUX_O_RDWR | LINUX_O_NONBLOCK) as i64,
+        );
+        let off = GuestUserBuffer::from_value(0i32);
+        expect.served(
+            "FIONBIO 0",
+            call(
+                Root,
+                sys::IOCTL.raw(),
+                [second, LINUX_FIONBIO, off.arg(), 0, 0, 0],
+            ),
+            0,
+        );
+        expect.served(
+            "F_GETFL after FIONBIO 0",
+            call(Root, sys::FCNTL.raw(), [second, LINUX_F_GETFL, 0, 0, 0, 0]),
+            LINUX_O_RDWR as i64,
+        );
+        let out = GuestUserBuffer::from_bytes(b"tail");
+        expect.served(
+            "write before shutdown",
+            call(Root, sys::WRITE.raw(), [second, out.arg(), 4, 0, 0, 0]),
+            4,
+        );
+        expect.served(
+            "shutdown(SHUT_WR)",
+            call(
+                Root,
+                sys::SHUTDOWN.raw(),
+                [second, LINUX_SHUT_WR as u64, 0, 0, 0, 0],
+            ),
+            0,
+        );
+        expect.served(
+            "shutdown(how = 3)",
+            call(Root, sys::SHUTDOWN.raw(), [second, 3, 0, 0, 0, 0]),
+            LINUX_EINVAL.guest_retval(),
+        );
+        let read = call(Root, sys::READ.raw(), [first, got.arg(), 16, 0, 0, 0]);
+        expect.served("read the bytes sent before shutdown", read, 4);
+        expect.bytes("bytes", &got.as_bytes()[..4], b"tail");
+        expect.served(
+            "read after the peer's SHUT_WR (EOF)",
+            call(Root, sys::READ.raw(), [first, got.arg(), 16, 0, 0, 0]),
+            0,
+        );
+        expect.result(
+            "write after this end's SHUT_WR (EPIPE)",
+            call(Root, sys::WRITE.raw(), [second, out.arg(), 4, 0, 0, 0]),
+            LINUX_EPIPE.guest_retval(),
+        );
+        let back = GuestUserBuffer::from_bytes(b"back");
+        expect.served(
+            "the other direction still flows",
+            call(Root, sys::WRITE.raw(), [first, back.arg(), 4, 0, 0, 0]),
+            4,
+        );
+        expect.served(
+            "read the other direction",
+            call(Root, sys::READ.raw(), [second, got.arg(), 16, 0, 0, 0]),
+            4,
+        );
+        for fd in [first, second] {
+            expect.served(
+                "close",
+                call(Root, sys::CLOSE.raw(), [fd, 0, 0, 0, 0, 0]),
+                0,
+            );
+        }
+        expect
+    });
+    expect.assert_empty("a ring stream pair's flags and shutdown left Linux's contract");
+}
+
+/// #2361: libuv's spawn loop on a ring stream pair: both ends ADD to the
+/// root's ring epoll as pure ring members (no host adoption), report
+/// EPOLLIN once the peer writes and EPOLLRDHUP once it shuts its writes,
+/// and DEL like any member.
+#[test]
+fn arm_root_socketpair_ends_are_ring_epoll_members() {
+    use ArmCaller::Root;
+    use carrick_abi::{
+        LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLLIN, LINUX_EPOLLRDHUP, LINUX_O_CLOEXEC,
+        LINUX_SHUT_WR,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    const PARENT_COOKIE: u64 = 0x2361_0000_0000_0001;
+    const CHILD_COOKIE: u64 = 0x2361_0000_0000_0002;
+    let (expect, _) = with_arm_process_host_dispatch(|call| {
+        let expect = ArmExpect::new();
+        let (_, epoll) = call(
+            Root,
+            sys::EPOLL_CREATE1.raw(),
+            [LINUX_O_CLOEXEC, 0, 0, 0, 0, 0],
+        );
+        assert!(epoll >= 0, "epoll_create1: {epoll}");
+        let epoll = epoll as u64;
+        let [parent, child] = arm_root_spawn_socketpair(call);
+        let ctl = sys::EPOLL_CTL.raw();
+        let watch = (LINUX_EPOLLIN | LINUX_EPOLLRDHUP) as u32;
+        let parent_in = epoll_event_buffer(watch, PARENT_COOKIE);
+        let child_in = epoll_event_buffer(watch, CHILD_COOKIE);
+        for (what, fd, event) in [("parent", parent, &parent_in), ("child", child, &child_in)] {
+            expect.served(
+                &format!("ADD the {what} end"),
+                call(
+                    Root,
+                    ctl,
+                    [epoll, LINUX_EPOLL_CTL_ADD, fd, event.arg(), 0, 0],
+                ),
+                0,
+            );
+        }
+        let got = arm_root_poll_now(call, epoll);
+        if got != (0, vec![]) {
+            expect
+                .0
+                .borrow_mut()
+                .push(format!("wait before any write: got {got:x?}"));
+        }
+        let output = GuestUserBuffer::from_bytes(b"child-ok\n");
+        expect.served(
+            "the child's end writes",
+            call(Root, sys::WRITE.raw(), [child, output.arg(), 9, 0, 0, 0]),
+            9,
+        );
+        let got = arm_root_poll_now(call, epoll);
+        if got != (1, vec![PARENT_COOKIE]) {
+            expect
+                .0
+                .borrow_mut()
+                .push(format!("wait after the child's write: got {got:x?}"));
+        }
+        let events = GuestUserBuffer::zeroed(16 * 4);
+        expect.served(
+            "the wait is the ring's",
+            call(
+                Root,
+                sys::EPOLL_PWAIT.raw(),
+                [epoll, events.arg(), 4, 0, 0, 8],
+            ),
+            1,
+        );
+        expect.served(
+            "the child's end shuts its writes",
+            call(
+                Root,
+                sys::SHUTDOWN.raw(),
+                [child, LINUX_SHUT_WR as u64, 0, 0, 0, 0],
+            ),
+            0,
+        );
+        let got = GuestUserBuffer::zeroed(16);
+        expect.served(
+            "the parent drains",
+            call(Root, sys::READ.raw(), [parent, got.arg(), 16, 0, 0, 0]),
+            9,
+        );
+        expect.served(
+            "the wait reports the peer's shutdown",
+            call(
+                Root,
+                sys::EPOLL_PWAIT.raw(),
+                [epoll, events.arg(), 4, 0, 0, 8],
+            ),
+            1,
+        );
+        let reported = u32::from_ne_bytes(events.as_bytes()[..4].try_into().unwrap());
+        let cookie = u64::from_ne_bytes(events.as_bytes()[8..16].try_into().unwrap());
+        if (reported, cookie) != (watch, PARENT_COOKIE) {
+            expect.0.borrow_mut().push(format!(
+                "after the peer's SHUT_WR: got {reported:#x} for {cookie:#x}, want IN|RDHUP for the parent"
+            ));
+        }
+        for (what, fd) in [("parent", parent), ("child", child)] {
+            expect.served(
+                &format!("DEL the {what} end"),
+                call(Root, ctl, [epoll, LINUX_EPOLL_CTL_DEL, fd, 0, 0, 0]),
+                0,
+            );
+        }
+        expect
+    });
+    expect.assert_empty("a ring stream pair left the ring epoll's member contract");
+}
+
+/// #2361: a guest wait on a ring stream end releases execution capacity.
+/// A ring fork child's read of its empty end parks as an owned operation
+/// (the call is Suspended, no worker holds it); the parent's write wakes
+/// it with the bytes, and the parent's close then gives the child EOF.
+#[test]
+fn arm_root_fork_child_parks_on_its_empty_socket_until_the_parent_writes() {
+    use ArmCaller::Root;
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (expect, _) = with_arm_process_host_dispatch(|call| {
+        let expect = ArmExpect::new();
+        let [parent, child_end] = arm_root_spawn_socketpair(call);
+        let (route, pid) = call(Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid} ({route:?})");
+        let child = ArmCaller::Child(pid as u32);
+        expect.served(
+            "the child closes the parent's end",
+            call(child, sys::CLOSE.raw(), [parent, 0, 0, 0, 0, 0]),
+            0,
+        );
+        let got = GuestUserBuffer::zeroed(16);
+        let parked = call(child, sys::READ.raw(), [child_end, got.arg(), 16, 0, 0, 0]);
+        if parked.0 != CompletionRoute::Suspended {
+            expect.0.borrow_mut().push(format!(
+                "the child's read of its empty end: got {parked:?}, want Suspended"
+            ));
+        }
+        let input = GuestUserBuffer::from_bytes(b"input");
+        expect.served(
+            "the parent writes",
+            call(Root, sys::WRITE.raw(), [parent, input.arg(), 5, 0, 0, 0]),
+            5,
+        );
+        if parked.0 == CompletionRoute::Suspended {
+            // The woken child re-enters its read with its registers as they
+            // were; its owned operation completes it.
+            let mut resumed = call(child, ARM_RESUME, [0; 6]);
+            if resumed.1 == i64::MIN {
+                resumed = call(child, sys::READ.raw(), [child_end, got.arg(), 16, 0, 0, 0]);
+            }
+            expect.result("the child's read resumes", resumed, 5);
+            expect.bytes("the child's bytes", &got.as_bytes()[..5], b"input");
+        }
+        expect.served(
+            "the parent closes its end",
+            call(Root, sys::CLOSE.raw(), [parent, 0, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "the child reads EOF",
+            call(child, sys::READ.raw(), [child_end, got.arg(), 16, 0, 0, 0]),
+            0,
+        );
+        expect
+    });
+    expect.assert_empty("a ring stream wait left the owned-continuation contract");
+}
+
 /// #1671 round 2, a hypothesis for the `uv__io_poll` EINTR abort that
 /// follows the failed `execSync`: libuv forks with every loop's epoll open,
 /// and exec's close-on-exec sweep in the child closes its copies. Linux:
@@ -18816,7 +19374,7 @@ fn arm_root_fork_child_sweep_keeps_the_parents_loop_epolls() {
             };
         // The spawn loop: a ring signal pipe and the parent's socket end.
         let spawn_loop = create_epoll(call);
-        let [parent, child_end] = arm_root_spawn_socketpair(call);
+        let [parent, child_end] = arm_root_host_socketpair(call);
         let pipe = GuestUserBuffer::zeroed(8);
         let (_, made) = call(
             Root,
