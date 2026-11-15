@@ -17749,6 +17749,13 @@ fn with_arm_root_host_dispatch<R>(
 #[cfg(test)]
 const ARM_RESUME: u64 = u64::MAX;
 
+/// [`with_arm_process_host_dispatch`]'s pseudo call: the caller's next
+/// call that parks finds host work pending, so its park leaves for the
+/// carrier boundary at once rather than selecting another record (the
+/// harness has no other runnable record to switch to).
+#[cfg(test)]
+const ARM_LEAVE_ON_PARK: u64 = u64::MAX - 1;
+
 /// [`with_arm_process_host_dispatch`]'s answer for a forwarded call the
 /// host would block in (`DispatchOutcome::WaitOnFds`): the harness has no
 /// carrier waiter to run it.
@@ -17850,6 +17857,13 @@ fn with_arm_process_host_files<R>(
     let pages: Vec<_> = (0..16).map(|n| 0x20000 + n * 0x1000).collect();
     let mut crossing = Box::new(TestStockCrossing::new(&pages));
     crossing.ipc = Some((Arc::clone(owner), map));
+    // A ring child's lifecycle page and control slot live in the EL1
+    // metadata window, as production places them: the identity a child's
+    // entry publishes then matches its record's (#2361: its IPC transfers
+    // take their owned operations by that identity).
+    let metadata_scope = MetadataScope::new(fixture);
+    crossing.metadata_in_el1_window = true;
+    crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     let crossing: &'static TestStockCrossing = Box::leak(crossing);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
     let tables: &'static _ = Box::leak(Box::new(crate::ipc::MapTables(map)));
@@ -17886,9 +17900,14 @@ fn with_arm_process_host_files<R>(
     let mut active = Some(ArmCaller::Root);
     let mut cpu = crate::sched::FakeCpu::default();
 
+    let mut leave_on_park = false;
     let mut call = |caller: ArmCaller, nr: u64, args: [u64; 6]| -> (CompletionRoute, i64) {
         if nr == ARM_RESUME && active == Some(caller) {
             return (CompletionRoute::Served, i64::MIN);
+        }
+        if nr == ARM_LEAVE_ON_PARK {
+            leave_on_park = true;
+            return (CompletionRoute::Served, 0);
         }
         if active != Some(caller) {
             let runtime: &std::sync::Arc<NativeProcessRuntime<'_, _, _>> = runtime
@@ -18004,6 +18023,13 @@ fn with_arm_process_host_files<R>(
             } else {
                 frame.x[0] as i64
             };
+            // A call the host answered reports Forward, whatever boundary
+            // (served-with-forward-work) sent it there.
+            let route = if forward {
+                CompletionRoute::Forward
+            } else {
+                route
+            };
             return (route, ret);
         };
         let runtime = runtime.as_ref().unwrap();
@@ -18023,6 +18049,10 @@ fn with_arm_process_host_files<R>(
                 &mut service,
             )
             .unwrap();
+        let boundary = core::mem::take(&mut leave_on_park);
+        if boundary {
+            fixture.task.linux.mark_pending_host_work();
+        }
         let route = crate::dispatch::dispatch_syscall_with_native(
             &mut frame,
             &counters,
@@ -18045,6 +18075,9 @@ fn with_arm_process_host_files<R>(
             |_| core::ptr::null_mut(),
         );
         drop(entry);
+        if boundary && let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+            work.settled();
+        }
         if route == CompletionRoute::Suspended {
             active = None;
         }
@@ -18062,6 +18095,7 @@ fn with_arm_process_host_files<R>(
     if let Some(runtime) = &runtime {
         registry().unregister_root_for_test(runtime);
     }
+    drop(metadata_scope);
     (result, dispatcher.stdout())
 }
 
@@ -18826,7 +18860,9 @@ impl ArmExpect {
                 .push(format!("{what}: got {} ({:?}), want {want}", got.1, got.0));
         }
     }
-    /// `got` must be `want`, answered in ring (never a host forward).
+    /// `got` must be `want`, answered in ring (never a host forward). A
+    /// run root's descriptor calls complete with host bookkeeping owed
+    /// (`WithWork`), as its ring pipe's do.
     fn served(
         &self,
         what: &str,
@@ -18834,7 +18870,7 @@ impl ArmExpect {
         want: i64,
     ) {
         use carrick_personality_linux::dispatch::CompletionRoute;
-        if got != (CompletionRoute::Served, want) {
+        if !matches!(got.0, CompletionRoute::Served | CompletionRoute::WithWork) || got.1 != want {
             self.0.borrow_mut().push(format!(
                 "{what}: got {} ({:?}), want {want} served in ring",
                 got.1, got.0
@@ -19275,6 +19311,161 @@ fn arm_root_socketpair_ends_are_ring_epoll_members() {
     expect.assert_empty("a ring stream pair left the ring epoll's member contract");
 }
 
+/// #2361: `send`/`recv` without addresses are a ring stream end's write
+/// and read, with `MSG_DONTWAIT`, `MSG_PEEK` and `MSG_NOSIGNAL`; an
+/// unnamed peer's source address has length 0; a destination on a
+/// connected stream is EISCONN. A connected pair cannot listen, accept or
+/// connect again (EINVAL, EINVAL, EISCONN). What the ring does not carry
+/// is refused in ring, never forwarded: ancillary-data calls (`sendmsg`,
+/// `recvmsg`) and binding a path are EOPNOTSUPP, socket options
+/// ENOPROTOOPT; and a ring pipe is no socket (ENOTSOCK).
+#[test]
+fn arm_root_socketpair_send_recv_and_refusals() {
+    use ArmCaller::Root;
+    use carrick_abi::{
+        LINUX_EAGAIN, LINUX_EINVAL, LINUX_EISCONN, LINUX_ENOPROTOOPT, LINUX_ENOTSOCK, LINUX_EPIPE,
+        LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_MSG_PEEK, LINUX_SO_SNDBUF, LINUX_SOL_SOCKET,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_syscall_abi::LINUX_EOPNOTSUPP;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (expect, _) = with_arm_process_host_dispatch(|call| {
+        let expect = ArmExpect::new();
+        let [first, second] = arm_root_spawn_socketpair(call);
+        let got = GuestUserBuffer::zeroed(16);
+        expect.served(
+            "recv(MSG_DONTWAIT) of an empty end",
+            call(
+                Root,
+                sys::RECVFROM.raw(),
+                [first, got.arg(), 16, LINUX_MSG_DONTWAIT as u64, 0, 0],
+            ),
+            LINUX_EAGAIN.guest_retval(),
+        );
+        let out = GuestUserBuffer::from_bytes(b"send");
+        expect.served(
+            "send",
+            call(Root, sys::SENDTO.raw(), [second, out.arg(), 4, 0, 0, 0]),
+            4,
+        );
+        expect.served(
+            "recv(MSG_PEEK)",
+            call(
+                Root,
+                sys::RECVFROM.raw(),
+                [first, got.arg(), 16, LINUX_MSG_PEEK as u64, 0, 0],
+            ),
+            4,
+        );
+        let source = GuestUserBuffer::from_bytes(&[0xa5; 16]);
+        let source_len = GuestUserBuffer::from_value(16u32);
+        expect.served(
+            "recvfrom with a source address",
+            call(
+                Root,
+                sys::RECVFROM.raw(),
+                [first, got.arg(), 16, 0, source.arg(), source_len.arg()],
+            ),
+            4,
+        );
+        expect.bytes("received", &got.as_bytes()[..4], b"send");
+        expect.bytes(
+            "an unnamed peer's address length",
+            source_len.as_bytes(),
+            &0u32.to_ne_bytes(),
+        );
+        let destination = GuestUserBuffer::from_bytes(&[1, 0, b'x', 0]);
+        expect.served(
+            "sendto a destination on a connected stream",
+            call(
+                Root,
+                sys::SENDTO.raw(),
+                [second, out.arg(), 4, 0, destination.arg(), 4],
+            ),
+            LINUX_EISCONN.guest_retval(),
+        );
+        let header = GuestUserBuffer::zeroed(56);
+        for (what, nr) in [("sendmsg", sys::SENDMSG), ("recvmsg", sys::RECVMSG)] {
+            expect.served(
+                what,
+                call(Root, nr.raw(), [first, header.arg(), 0, 0, 0, 0]),
+                LINUX_EOPNOTSUPP.guest_retval(),
+            );
+        }
+        expect.served(
+            "bind",
+            call(
+                Root,
+                sys::BIND.raw(),
+                [first, destination.arg(), 4, 0, 0, 0],
+            ),
+            LINUX_EOPNOTSUPP.guest_retval(),
+        );
+        expect.served(
+            "listen",
+            call(Root, sys::LISTEN.raw(), [first, 1, 0, 0, 0, 0]),
+            LINUX_EINVAL.guest_retval(),
+        );
+        expect.served(
+            "accept4",
+            call(Root, sys::ACCEPT4.raw(), [first, 0, 0, 0, 0, 0]),
+            LINUX_EINVAL.guest_retval(),
+        );
+        expect.served(
+            "connect",
+            call(
+                Root,
+                sys::CONNECT.raw(),
+                [first, destination.arg(), 4, 0, 0, 0],
+            ),
+            LINUX_EISCONN.guest_retval(),
+        );
+        let value = GuestUserBuffer::from_value(1i32);
+        expect.served(
+            "setsockopt",
+            call(
+                Root,
+                sys::SETSOCKOPT.raw(),
+                [
+                    first,
+                    LINUX_SOL_SOCKET as u64,
+                    LINUX_SO_SNDBUF as u64,
+                    value.arg(),
+                    4,
+                    0,
+                ],
+            ),
+            LINUX_ENOPROTOOPT.guest_retval(),
+        );
+        let pipe = GuestUserBuffer::zeroed(8);
+        let (_, made) = call(Root, sys::PIPE2.raw(), [pipe.arg(), 0, 0, 0, 0, 0]);
+        assert_eq!(made, 0, "pipe2");
+        let [_, writer] = fd_pair_of(&pipe);
+        expect.served(
+            "send on a ring pipe",
+            call(Root, sys::SENDTO.raw(), [writer, out.arg(), 4, 0, 0, 0]),
+            LINUX_ENOTSOCK.guest_retval(),
+        );
+        expect.served(
+            "close the first end",
+            call(Root, sys::CLOSE.raw(), [first, 0, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "send(MSG_NOSIGNAL) after the peer closed",
+            call(
+                Root,
+                sys::SENDTO.raw(),
+                [second, out.arg(), 4, LINUX_MSG_NOSIGNAL as u64, 0, 0],
+            ),
+            LINUX_EPIPE.guest_retval(),
+        );
+        expect
+    });
+    expect.assert_empty("a ring stream end's send, receive and refusals left Linux's contract");
+}
+
 /// #2361: a guest wait on a ring stream end releases execution capacity.
 /// A ring fork child's read of its empty end parks as an owned operation
 /// (the call is Suspended, no worker holds it); the parent's write wakes
@@ -19298,6 +19489,7 @@ fn arm_root_fork_child_parks_on_its_empty_socket_until_the_parent_writes() {
             0,
         );
         let got = GuestUserBuffer::zeroed(16);
+        call(child, ARM_LEAVE_ON_PARK, [0; 6]);
         let parked = call(child, sys::READ.raw(), [child_end, got.arg(), 16, 0, 0, 0]);
         if parked.0 != CompletionRoute::Suspended {
             expect.0.borrow_mut().push(format!(

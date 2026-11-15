@@ -2745,3 +2745,145 @@ fn x86_epoll_ctl_on_a_ring_non_epoll_fd_is_served_einval() {
     assert_eq!(isa_unsupported.load(Ordering::Relaxed), 0);
     drop(held);
 }
+
+/// #2361: a ring stream pair's end answers its socket calls in ring on x86
+/// too, through the CPL0 entry and the shared IPC venue (x86 has no socket
+/// crossing: before #2361 each was a counted ENOSYS). `getsockopt` reports
+/// an AF_UNIX stream, `getsockname` an unnamed address, `shutdown(SHUT_WR)`
+/// is served, and `sendmsg` is refused in ring with EOPNOTSUPP (the ring
+/// carries no ancillary data).
+#[test]
+fn x86_socket_calls_on_a_ring_stream_end_are_served() {
+    use carrick_el1_abi::ipc::{IpcBacking, StreamEnd, fd};
+    use carrick_el1_linux::ipc::{IpcVenue, MapTables};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
+    use std::sync::Arc;
+
+    let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+    let table = HostTable::create(Arc::clone(&owner), 64, 8).unwrap();
+    let object = owner
+        .region()
+        .create_stream(&carrick_sched_core::ShortLockSpin)
+        .unwrap();
+    let mut held = Vec::new();
+    for (number, end) in [(3, StreamEnd::First), (4, StreamEnd::Second)] {
+        let description = owner
+            .admit_description(fd::Description::new(
+                IpcBacking::Stream { object, end }.encode(),
+                fd::AccessMode::ReadWrite,
+                fd::StatusFlags::default(),
+            ))
+            .unwrap();
+        description
+            .install(table.id(), fd::Fd(number), false)
+            .unwrap();
+        held.push(description);
+    }
+    let region = carrick_test_support::TestEl1Region::zeroed();
+    // SAFETY: TestEl1Region provides ABI-aligned zeroed storage for this map.
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    map.publish_owned(7, table.id().to_raw()).unwrap();
+    let tables = MapTables(map);
+    let venue = IpcVenue {
+        region: owner.region(),
+        tables: &tables,
+    };
+    let task = CurrentTask::new();
+    task.set(
+        El1TaskId::from_linux_tid(41),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        7,
+    );
+    let counters = Counters::new();
+    let names = InotifyNameCache::new();
+    let isa_unsupported = AtomicU64::new(0);
+    let call = |nr: u64, args: [u64; 6]| {
+        let decoded = decode_x86_64(nr, args, 0x7fff_0000);
+        let mut frame = X86Frame {
+            native: decoded.native,
+            canonical: decoded.canonical,
+            args,
+            rax: nr,
+            isa_unsupported: &isa_unsupported,
+        };
+        let route = dispatch::dispatch_syscall_with_native::<
+            _,
+            NoCpu,
+            sched::HardwareUserWord,
+            _,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            None,
+            Some(&venue),
+            None,
+            None,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        (route, frame.rax as i64)
+    };
+    // x86_64: getsockopt 55, getsockname 51, shutdown 48, sendmsg 46.
+    let value = GuestUserBuffer::zeroed(4);
+    let length = GuestUserBuffer::from_value(4u32);
+    assert_eq!(
+        call(55, [3, 1, 3, value.arg(), length.arg(), 0]),
+        (CompletionRoute::Served, 0),
+        "getsockopt(SOL_SOCKET, SO_TYPE)"
+    );
+    assert_eq!(value.as_bytes(), &1i32.to_ne_bytes(), "SOCK_STREAM");
+    let address = GuestUserBuffer::zeroed(16);
+    let address_len = GuestUserBuffer::from_value(16u32);
+    assert_eq!(
+        call(51, [4, address.arg(), address_len.arg(), 0, 0, 0]),
+        (CompletionRoute::Served, 0),
+        "getsockname"
+    );
+    assert_eq!(address_len.as_bytes(), &2u32.to_ne_bytes());
+    assert_eq!(&address.as_bytes()[..2], &1u16.to_ne_bytes(), "AF_UNIX");
+    assert_eq!(
+        call(48, [4, 1, 0, 0, 0, 0]),
+        (CompletionRoute::Served, 0),
+        "shutdown(SHUT_WR)"
+    );
+    {
+        let mut guard = owner
+            .region()
+            .lock(object, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        assert_eq!(
+            guard
+                .stream_lane(StreamEnd::Second)
+                .unwrap()
+                .references(carrick_el1_abi::ipc::pipe::End::Writer),
+            0,
+            "the second end's writes are shut"
+        );
+    }
+    let header = GuestUserBuffer::zeroed(56);
+    assert_eq!(
+        call(46, [3, header.arg(), 0, 0, 0, 0]),
+        (
+            CompletionRoute::Served,
+            carrick_syscall_abi::LINUX_EOPNOTSUPP.guest_retval()
+        ),
+        "sendmsg is refused in ring"
+    );
+    assert_eq!(isa_unsupported.load(Ordering::Relaxed), 0);
+    drop(held);
+}
