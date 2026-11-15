@@ -3168,14 +3168,23 @@ impl<
                 let Some(venue) = self.ipc else {
                     return false;
                 };
+                // The close-on-exec flag is the table's, whatever the object.
+                let cloexec = canonical == carrick_personality_linux::crossing::nr::IOCTL
+                    && matches!(
+                        self.frame.argument(1),
+                        Some(carrick_abi::LINUX_FIOCLEX | carrick_abi::LINUX_FIONCLEX)
+                    );
                 return match venue.region.fd(NativeFdWait).get(
                     carrick_fd_core::TableId::from_raw(raw),
                     carrick_fd_core::Fd(self.frame.argument(0).unwrap_or(0) as i32),
                 ) {
-                    Ok(description) => matches!(
-                        carrick_el1_abi::ipc::IpcBacking::decode(description.backing),
-                        Some(carrick_el1_abi::ipc::IpcBacking::Pipe { .. })
-                    ),
+                    Ok(description) => {
+                        cloexec
+                            || matches!(
+                                carrick_el1_abi::ipc::IpcBacking::decode(description.backing),
+                                Some(carrick_el1_abi::ipc::IpcBacking::Pipe { .. })
+                            )
+                    }
                     Err(carrick_fd_core::Error::BadFd) => true,
                     Err(_) => false,
                 };
@@ -4709,6 +4718,21 @@ impl<
         if at && fd.0 == LINUX_AT_FDCWD as i32 {
             return FamilyCompletion::Forward;
         }
+        // Linux serves FIOCLEX and FIONCLEX for every open file before the
+        // object's own ioctl: they set the descriptor's close-on-exec flag,
+        // which the ring's table owns. An O_PATH descriptor admits no ioctl.
+        if ordinal == nr::IOCTL && matches!(arg, LINUX_FIOCLEX | LINUX_FIONCLEX) {
+            return match authority.getfl(table, fd) {
+                Ok((carrick_el1_abi::ipc::fd::AccessMode::Path, _)) => {
+                    FamilyCompletion::Complete(carrick_abi::LINUX_EBADF.guest_retval())
+                }
+                Ok(_) => {
+                    let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
+                    self.set_owned_cloexec(venue, table, file_table, fd, arg == LINUX_FIOCLEX)
+                }
+                Err(error) => map_fd_error(error),
+            };
+        }
         // Import scalar input before admitting an owned metadata operation.
         // A refused page uses the existing exact-MM copy wait and redispatch;
         // no description, object guard or output has been retained yet.
@@ -4864,11 +4888,6 @@ impl<
                             return map_fd_error(e);
                         }
                     }
-                    LINUX_FIOCLEX | LINUX_FIONCLEX => {
-                        if let Err(e) = authority.setfd(table, fd, arg == LINUX_FIOCLEX) {
-                            return map_fd_error(e);
-                        }
-                    }
                     _ => return FamilyCompletion::Complete(LINUX_ENOTTY.guest_retval()),
                 }
                 return FamilyCompletion::Complete(0);
@@ -4899,6 +4918,35 @@ impl<
             );
         }
         result
+    }
+
+    /// The close-on-exec flag of a ring-owned descriptor, for `F_SETFD` and
+    /// `FIOCLEX`/`FIONCLEX`: it belongs to the ring's descriptor table,
+    /// whatever object the description names (a pipe, or a host file the
+    /// carrier opened for a staged `openat`).
+    fn set_owned_cloexec(
+        &self,
+        venue: &ipc::IpcVenue<'_>,
+        table: carrick_el1_abi::ipc::fd::TableId,
+        file_table: u64,
+        fd: carrick_el1_abi::ipc::fd::Fd,
+        cloexec: bool,
+    ) -> FamilyCompletion {
+        if let Err(err) = venue.region.fd(NativeFdWait).setfd(table, fd, cloexec) {
+            return map_fd_error(err);
+        }
+        if let Some((_, index)) = fd_map_lookup(self.fd_map, file_table, fd.0) {
+            if cloexec {
+                self.fd_map[index]
+                    .fd_flags
+                    .fetch_or(super::file_table::GUEST_FD_CLOEXEC, Ordering::Release);
+            } else {
+                self.fd_map[index]
+                    .fd_flags
+                    .fetch_and(!super::file_table::GUEST_FD_CLOEXEC, Ordering::Release);
+            }
+        }
+        FamilyCompletion::Complete(0)
     }
 
     #[inline(never)]
@@ -5445,26 +5493,13 @@ impl<
                             Err(err) => map_fd_error(err),
                         }
                     }
-                    carrick_abi::LINUX_F_SETFD => {
-                        let cloexec = arg & carrick_abi::LINUX_FD_CLOEXEC != 0;
-                        if let Err(err) = venue.region.fd(NativeFdWait).setfd(table, old, cloexec) {
-                            return map_fd_error(err);
-                        }
-                        if let Some((_, index)) = fd_map_lookup(self.fd_map, file_table, old.0) {
-                            if cloexec {
-                                self.fd_map[index].fd_flags.fetch_or(
-                                    super::file_table::GUEST_FD_CLOEXEC,
-                                    Ordering::Release,
-                                );
-                            } else {
-                                self.fd_map[index].fd_flags.fetch_and(
-                                    !super::file_table::GUEST_FD_CLOEXEC,
-                                    Ordering::Release,
-                                );
-                            }
-                        }
-                        FamilyCompletion::Complete(0)
-                    }
+                    carrick_abi::LINUX_F_SETFD => self.set_owned_cloexec(
+                        venue,
+                        table,
+                        file_table,
+                        old,
+                        arg & carrick_abi::LINUX_FD_CLOEXEC != 0,
+                    ),
                     carrick_abi::LINUX_F_GETFL => {
                         match venue.region.fd(NativeFdWait).getfl(table, old) {
                             Ok((access, flags)) => {
