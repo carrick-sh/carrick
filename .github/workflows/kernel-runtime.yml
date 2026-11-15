@@ -885,6 +885,10 @@ jobs:
     timeout-minutes: 75
     permissions:
       contents: read
+    # `uploaded` only when a non-empty table reached the artifact store (#2393): under
+    # continue-on-error, needs.kvm-scoreboard.result reads `success` even when this job fails or is lost.
+    outputs:
+      table: ${{ steps.table-marker.outputs.table }}
     steps:
       - uses: actions/checkout@v4
 
@@ -938,6 +942,7 @@ jobs:
           test -s target/scoreboard-x86/table.txt
 
       - name: Upload x86 scoreboard receipt
+        id: upload-table
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
@@ -945,11 +950,17 @@ jobs:
           path: target/scoreboard-x86/
           if-no-files-found: warn
 
+      - name: Record that a table was uploaded
+        id: table-marker
+        if: ${{ !cancelled() && steps.upload-table.outcome == 'success' }}
+        run: |
+          if [ -s target/scoreboard-x86/table.txt ]; then echo table=uploaded >> "$GITHUB_OUTPUT"; fi
+
   # Publishes the nightly scoreboard: one #231 comment with an `arm64` (HVF)
   # and an `x86_64` (KVM) block (#2327). It runs no repository code (no
   # checkout) and holds the only issues-write token of the nightly path. A
-  # lane that produced no table is reported as missing with its job result,
-  # never silently dropped. Each table line leads with its ISA column, so
+  # lane that produced no table is reported as missing with the job's own
+  # conclusion and link from the Actions API (#2393), never silently dropped. Each table line leads with its ISA column, so
   # `director/scoreboard-rows.sh` (carrick-sh/agy-director) reads both blocks.
   # The nightly scoreboard (#2347): its own job and budget. It used to be a
   # step at the end of hvf-kernel, sharing that job's 180 min with signed
@@ -972,6 +983,9 @@ jobs:
     permissions:
       contents: read
       actions: read
+    # `uploaded` only when a non-empty table reached the artifact store (#2393).
+    outputs:
+      table: ${{ steps.table-marker.outputs.table }}
     steps:
       - name: Verify installed host-lease supervisor
         run: |
@@ -1027,6 +1041,7 @@ jobs:
           test -s target/scoreboard/table.txt
 
       - name: Upload scoreboard receipt
+        id: upload-table
         if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -1034,6 +1049,12 @@ jobs:
           name: scoreboard-${{ github.sha }}-${{ github.run_attempt }}
           path: target/scoreboard/
           if-no-files-found: warn
+
+      - name: Record that a table was uploaded
+        id: table-marker
+        if: ${{ !cancelled() && steps.upload-table.outcome == 'success' }}
+        run: |
+          if [ -s target/scoreboard/table.txt ]; then echo table=uploaded >> "$GITHUB_OUTPUT"; fi
 
   scoreboard-post:
     name: "Scoreboard · post both ISAs to #231"
@@ -1069,12 +1090,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HVF_RESULT: ${{ needs.hvf-scoreboard-nightly.result }}
           KVM_RESULT: ${{ needs.kvm-scoreboard.result }}
+          HVF_TABLE: ${{ needs.hvf-scoreboard-nightly.outputs.table }}
+          KVM_TABLE: ${{ needs.kvm-scoreboard.outputs.table }}
         run: |
           set -euo pipefail
           d="$RUNNER_TEMP/scoreboard"
           mkdir -p "$d"
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          block() { # block <isa> <lane label> <job result>
+          # The lane job's own conclusion and link, from the Actions API (#2393): `needs.<job>.result`
+          # reads `success` for a continue-on-error job that failed or whose runner was lost.
+          jobs_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+            --paginate --jq '.jobs[] | {name, conclusion, status, html_url}' 2>/dev/null || true)
+          lane_job() { # lane_job <job name>: "<conclusion or status> (<link>)", or "unknown"
+            local j
+            j=$(printf '%s\n' "$jobs_json" | jq -rs --arg n "$1" \
+              'map(select(.name == $n)) | last | select(. != null) | "\(.conclusion // .status) (\(.html_url))"' 2>/dev/null || true)
+            printf '%s' "${j:-unknown}"
+          }
+          block() { # block <isa> <lane label> <needs result> <table marker> <job name>
             printf '#### %s (%s)\n\n' "$1" "$2"
             if [ -s "$d/$1/table.txt" ]; then
               printf '```text\n'
@@ -1085,15 +1118,19 @@ jobs:
                   "\(.name): \(.key_stderr_line)"' "$d/$1/receipt.json" 2>/dev/null) && [ -n "$keys" ]; then
                 printf 'Key stderr:\n\n```stderr\n%s\n```\n\n' "$keys"
               fi
+            elif [ "$4" = uploaded ]; then
+              printf 'missing: the %s job uploaded a table, but it could not be downloaded (job: %s)\n\n' "$1" "$(lane_job "$5")"
+            elif [ "$3" = skipped ]; then
+              printf 'missing: the %s job did not run (skipped)\n\n' "$1"
             else
-              printf 'missing: no %s scoreboard table (job result: %s)\n\n' "$1" "$3"
+              printf 'missing: the %s job produced no table: it failed or its runner was lost (job: %s)\n\n' "$1" "$(lane_job "$5")"
             fi
           }
           {
             printf '### Goal scoreboard (nightly)\n\n'
             printf 'Commit: %s ([workflow run](%s))\n\n' "$GITHUB_SHA" "$run_url"
-            block arm64 HVF "$HVF_RESULT"
-            block x86_64 KVM "$KVM_RESULT"
+            block arm64 HVF "$HVF_RESULT" "$HVF_TABLE" "HVF · goal scoreboard (nightly)"
+            block x86_64 KVM "$KVM_RESULT" "$KVM_TABLE" "KVM · x86 scoreboard (nightly)"
           } > "$d/comment.md"
           cat "$d/comment.md" >> "$GITHUB_STEP_SUMMARY"
           gh issue comment 231 --repo "$GITHUB_REPOSITORY" --body-file "$d/comment.md"
