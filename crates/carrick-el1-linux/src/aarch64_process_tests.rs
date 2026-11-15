@@ -17979,10 +17979,15 @@ fn with_arm_process_host_files<R>(
     // A ring child's lifecycle page and control slot live in the EL1
     // metadata window, as production places them: the identity a child's
     // entry publishes then matches its record's (#2361: its IPC transfers
-    // take their owned operations by that identity).
-    let metadata_scope = MetadataScope::new(fixture);
-    crossing.metadata_in_el1_window = true;
-    crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
+    // take their owned operations by that identity). macOS refuses user
+    // memory at the window, so there a child's IPC transfer is not run.
+    #[cfg(not(target_os = "macos"))]
+    let metadata_scope = {
+        let scope = MetadataScope::new(fixture);
+        crossing.metadata_in_el1_window = true;
+        crossing.metadata_allocations = Arc::clone(&scope.allocations);
+        scope
+    };
     let crossing: &'static TestStockCrossing = Box::leak(crossing);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
     let tables: &'static _ = Box::leak(Box::new(crate::ipc::MapTables(map)));
@@ -18232,6 +18237,7 @@ fn with_arm_process_host_files<R>(
     if let Some(runtime) = &runtime {
         registry().unregister_root_for_test(runtime);
     }
+    #[cfg(not(target_os = "macos"))]
     drop(metadata_scope);
     (result, dispatcher.stdout())
 }
@@ -19381,6 +19387,9 @@ fn arm_root_ring_epoll_adoption_beside_a_sibling_exact_claim() {
 /// the native host-file venue refuses a write to a socket description
 /// (`write_description_from_carrier` serves files only), so the child sees
 /// ENOSYS on its stdout and its stderr, and exits 1.
+// A ring child's IPC transfer needs its metadata in the EL1 window, which
+// macOS refuses (see `serial_host_native_fork_two_children_...`): Linux runs it.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn arm_root_fork_child_writes_its_socket_stdout() {
     use carrick_personality_linux::crossing::nr as sys;
@@ -20060,6 +20069,8 @@ fn arm_root_socketpair_send_recv_and_refusals() {
 /// A ring fork child's read of its empty end parks as an owned operation
 /// (the call is Suspended, no worker holds it); the parent's write wakes
 /// it with the bytes, and the parent's close then gives the child EOF.
+// Linux only, as `arm_root_fork_child_writes_its_socket_stdout`.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn arm_root_fork_child_parks_on_its_empty_socket_until_the_parent_writes() {
     use ArmCaller::Root;
