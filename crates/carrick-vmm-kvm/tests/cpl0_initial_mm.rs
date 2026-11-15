@@ -2626,7 +2626,8 @@ fn production_sibling_raw_exits_clear_tid_under_editor_contention() {
 fn production_raw_exit_clear_tid_busy_once_reruns_in_ring() {
     let elf =
         native_exit_fixture_with_flags("native_sibling_raw_exit.S", &["-DOWNED_COPY_BUSY_ONCE"]);
-    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
+    // The injection hooks live only in the test-support image.
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
         .expect("a Busy clear-tid copy-out reruns in ring");
     assert_eq!(
         (outcome.run.exit_code, outcome.run.terminating_signal),
