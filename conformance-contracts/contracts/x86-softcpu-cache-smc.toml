@@ -37,7 +37,7 @@ vm_free = [
 ]
 [bindings.unresolved]
 embed_structural = "Soft carrier integration remains #671; this fixture executes production SoftCpu blocks on native x86_64."
-docker = "Instruction semantics are checked directly against native x86_64; Docker is unavailable on this worker."
+docker = "Instruction semantics are checked directly against native x86_64. Soft-carrier Docker differential remains unresolved pending #671; no Docker/native ratio is claimed by this fixture."
 
 [runtime_ratio]
 maximum = 2.0
