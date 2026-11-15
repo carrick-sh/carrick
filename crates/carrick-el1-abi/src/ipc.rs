@@ -134,9 +134,10 @@ pub const IPC_PIPE_PAGE_SIZE: usize = 4096;
 /// Alignment of every pool extent (a pipe ring starts on a guest page).
 pub const IPC_POOL_ALIGN: u64 = IPC_PIPE_PAGE_SIZE as u64;
 const IPC_DESCRIPTOR_STORAGE_NODES: usize = (crate::EL1_IPC_POOL_SPAN / IPC_POOL_ALIGN) as usize;
-/// Region magic: "CRKIPC" + ABI version 7 (operation-owned poll waits and
-/// vector input receipts alongside elastic object/description stores).
-pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x07");
+/// Region magic: "CRKIPC" + ABI version 8 (ring stream socket pairs,
+/// after operation-owned poll waits and vector input receipts alongside
+/// elastic object/description stores).
+pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x08");
 const IPC_READY: u64 = 1;
 /// Leaf words of the owed-host-wake index: one bit per object.
 const HOST_WAKE_LEAF_WORDS: usize = IPC_MAX_OBJECTS / 64;
@@ -297,6 +298,32 @@ pub enum IpcBacking {
     Epoll {
         object: IpcObjectHandle,
     },
+    /// One end of a connected `AF_UNIX` `SOCK_STREAM` pair
+    /// ([`IpcObjectKind::Stream`]): it writes the lane named by `end` and
+    /// reads its peer's.
+    Stream {
+        object: IpcObjectHandle,
+        end: StreamEnd,
+    },
+}
+
+/// One end of a ring stream socket pair. Each end writes one byte lane of
+/// the pair's object, its own, and reads the other end's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamEnd {
+    /// `socketpair`'s `sv[0]`.
+    First,
+    /// `socketpair`'s `sv[1]`.
+    Second,
+}
+impl StreamEnd {
+    /// The other end of the pair.
+    pub const fn peer(self) -> Self {
+        match self {
+            Self::First => Self::Second,
+            Self::Second => Self::First,
+        }
+    }
 }
 
 const TAG_SHIFT: u32 = 61;
@@ -304,14 +331,16 @@ const TAG_HOST: u64 = 1;
 const TAG_PIPE: u64 = 2;
 const TAG_EVENTFD: u64 = 3;
 const TAG_EPOLL: u64 = 4;
+const TAG_STREAM: u64 = 5;
 const END_WRITER: u64 = 1 << 60;
 const INDEX_SHIFT: u32 = 32;
 const INDEX_BITS: u64 = (1 << 28) - 1;
 
 impl IpcBacking {
-    /// Bits 63..61 tag (1 host, 2 pipe, 3 eventfd, 4 epoll); host: bits
-    /// 60..0 token;
-    /// object: bit 60 pipe writer end, bits 59..32 index, 31..0 generation.
+    /// Bits 63..61 tag (1 host, 2 pipe, 3 eventfd, 4 epoll, 5 stream);
+    /// host: bits 60..0 token;
+    /// object: bit 60 pipe writer end or stream second end, bits 59..32
+    /// index, 31..0 generation.
     pub const fn encode(self) -> BackingToken {
         BackingToken(match self {
             Self::Host(token) => (TAG_HOST << TAG_SHIFT) | token.0,
@@ -324,6 +353,13 @@ impl IpcBacking {
             }
             Self::EventFd { object } => (TAG_EVENTFD << TAG_SHIFT) | object_bits(object),
             Self::Epoll { object } => (TAG_EPOLL << TAG_SHIFT) | object_bits(object),
+            Self::Stream { object, end } => {
+                let end = match end {
+                    StreamEnd::First => 0,
+                    StreamEnd::Second => END_WRITER,
+                };
+                (TAG_STREAM << TAG_SHIFT) | end | object_bits(object)
+            }
         })
     }
     /// `None` for any token this ABI never encodes (fails closed).
@@ -348,6 +384,14 @@ impl IpcBacking {
             }),
             TAG_EVENTFD if raw & END_WRITER == 0 => Some(Self::EventFd { object }),
             TAG_EPOLL if raw & END_WRITER == 0 => Some(Self::Epoll { object }),
+            TAG_STREAM => Some(Self::Stream {
+                object,
+                end: if raw & END_WRITER != 0 {
+                    StreamEnd::Second
+                } else {
+                    StreamEnd::First
+                },
+            }),
             _ => None,
         }
     }
@@ -365,11 +409,21 @@ pub enum IpcObjectKind {
     Pipe,
     EventFd,
     Epoll,
+    /// A connected `AF_UNIX` `SOCK_STREAM` pair: two pipe lanes under one
+    /// lock, one written by each [`StreamEnd`].
+    Stream,
 }
 const KIND_FREE: u32 = 0;
 const KIND_PIPE: u32 = 1;
 const KIND_EVENTFD: u32 = 2;
 const KIND_EPOLL: u32 = 3;
+const KIND_STREAM: u32 = 4;
+
+/// Bytes one lane of a ring stream pair holds: half a stock ring, so one
+/// stocked ring backs both lanes without a host exit. (Linux sizes a
+/// stream socket by `SO_SNDBUF`; the bytes it buffers before a writer
+/// blocks are not part of its contract.)
+pub const IPC_STREAM_LANE_BYTES: usize = IPC_STOCK_RING_BYTES as usize / 2;
 
 /// A pipe's pool storage: `ring_bytes` of ring (guest-page multiple) followed
 /// by `pages` [`Page`] metadata entries, starting at pool `offset`
@@ -397,11 +451,36 @@ impl IpcPipeStorage {
 
 /// The object's state; which part is meaningful follows `kind`.
 #[repr(C)]
-#[derive(Debug)]
 pub struct IpcObjectState {
+    /// A pipe, or a stream pair's [`StreamEnd::First`] lane.
     pub pipe: PipeRecord,
-    pub eventfd: EventFd,
-    pub epoll: epoll::EpollState,
+    /// What the kind keeps beside `pipe`.
+    kind_state: IpcKindState,
+}
+impl core::fmt::Debug for IpcObjectState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IpcObjectState")
+            .field("pipe", &self.pipe)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The kind-dependent rest of an object's state. A stream pair's second
+/// lane overlays the counters only a single-object kind uses, so the pair
+/// costs no record space.
+#[repr(C)]
+union IpcKindState {
+    /// An eventfd's counter or an epoll's state.
+    counters: IpcCounterState,
+    /// A stream pair's [`StreamEnd::Second`] lane.
+    stream_second: PipeRecord,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IpcCounterState {
+    eventfd: EventFd,
+    epoll: epoll::EpollState,
 }
 
 /// One pipe or eventfd, shared by host and EL1. Every field is written only
@@ -624,13 +703,17 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::offset_of!(IpcDirectory, ring_stock) as u64,
     core::mem::offset_of!(IpcObjectRecord, epoll_link) as u64,
     core::mem::size_of::<epoll::EpollState>() as u64,
-    core::mem::offset_of!(IpcObjectState, epoll) as u64,
+    (core::mem::offset_of!(IpcObjectState, kind_state)
+        + core::mem::offset_of!(IpcCounterState, epoll)) as u64,
     core::mem::offset_of!(IpcDirectory, free_epoll_items) as u64,
     IPC_EPOLL_ITEMS_OFFSET as u64,
     epoll::IPC_EPOLL_ITEMS as u64,
     core::mem::size_of::<epoll::IpcEpollItem>() as u64,
     TAG_EPOLL,
     KIND_EPOLL as u64,
+    TAG_STREAM,
+    KIND_STREAM as u64,
+    core::mem::size_of::<IpcKindState>() as u64,
 ];
 
 /// FNV-1a over `LAYOUT_FACTS` and the fd core's layout facts. Written into
@@ -681,6 +764,52 @@ pub enum IpcOpKind {
     /// The operation pins the inherited description and retains the original
     /// pollfd bytes and absolute deadline across the readiness park.
     PollWait = 6,
+    /// A read by a stream pair's [`StreamEnd::First`]: it drains the
+    /// second end's lane.
+    StreamFirstRead = 7,
+    /// A write by a stream pair's [`StreamEnd::First`] into its own lane.
+    StreamFirstWrite = 8,
+    /// A read by a stream pair's [`StreamEnd::Second`].
+    StreamSecondRead = 9,
+    /// A write by a stream pair's [`StreamEnd::Second`].
+    StreamSecondWrite = 10,
+}
+
+impl IpcOpKind {
+    /// The transfer `end` of a stream pair makes.
+    pub const fn stream(end: StreamEnd, reading: bool) -> Self {
+        match (end, reading) {
+            (StreamEnd::First, true) => Self::StreamFirstRead,
+            (StreamEnd::First, false) => Self::StreamFirstWrite,
+            (StreamEnd::Second, true) => Self::StreamSecondRead,
+            (StreamEnd::Second, false) => Self::StreamSecondWrite,
+        }
+    }
+    /// The stream end making this transfer, and whether it reads.
+    pub const fn stream_end(self) -> Option<(StreamEnd, bool)> {
+        match self {
+            Self::StreamFirstRead => Some((StreamEnd::First, true)),
+            Self::StreamFirstWrite => Some((StreamEnd::First, false)),
+            Self::StreamSecondRead => Some((StreamEnd::Second, true)),
+            Self::StreamSecondWrite => Some((StreamEnd::Second, false)),
+            _ => None,
+        }
+    }
+    /// A byte-stream read (a pipe's or a stream end's): it may complete
+    /// with a delivered prefix, and its bytes scatter like a pipe read's.
+    pub const fn reads_bytes(self) -> bool {
+        matches!(
+            self,
+            Self::PipeRead | Self::StreamFirstRead | Self::StreamSecondRead
+        )
+    }
+    /// A byte-stream write (a pipe's or a stream end's).
+    pub const fn writes_bytes(self) -> bool {
+        matches!(
+            self,
+            Self::PipeWrite | Self::StreamFirstWrite | Self::StreamSecondWrite
+        )
+    }
 }
 
 /// Exact task key of the operation's owner (venue-defined, generation-bearing).
@@ -1655,6 +1784,7 @@ impl<'a> IpcRegion<'a> {
                 KIND_PIPE => "pipe",
                 KIND_EVENTFD => "eventfd",
                 KIND_EPOLL => "epoll",
+                KIND_STREAM => "stream",
                 KIND_FREE => "free",
                 _ => "?",
             },
@@ -1703,6 +1833,22 @@ impl<'a> IpcRegion<'a> {
                 ),
                 Err(e) => writeln!(out, " pipe={e:?}"),
             },
+            Some(IpcObjectKind::Stream) => {
+                for end in [StreamEnd::First, StreamEnd::Second] {
+                    match guard.stream_lane(end) {
+                        Ok(p) => write!(
+                            out,
+                            " {end:?}: unread={} capacity={} readers={} writers={}",
+                            p.unread_bytes(),
+                            p.capacity(),
+                            p.references(End::Reader),
+                            p.references(End::Writer),
+                        )?,
+                        Err(e) => write!(out, " {end:?}={e:?}")?,
+                    }
+                }
+                writeln!(out)
+            }
             Some(IpcObjectKind::EventFd) => match guard.eventfd() {
                 Ok(e) => writeln!(out, " counter={} mode={:?}", e.value(), e.mode()),
                 Err(e) => writeln!(out, " eventfd={e:?}"),
@@ -1857,8 +2003,67 @@ impl<'a> IpcRegion<'a> {
         let (index, record) = self.pop_object()?;
         let guard = self.lock_fresh(index, record, wait)?;
         // SAFETY: the object lock is held and the record is unpublished.
-        unsafe { (*record.state.get()).eventfd = EventFd::new(initial, mode) };
+        unsafe { (*record.state.get()).kind_state.counters.eventfd = EventFd::new(initial, mode) };
         Ok(guard.publish_kind(KIND_EVENTFD))
+    }
+
+    /// Create a connected stream socket pair: two lanes of
+    /// [`IPC_STREAM_LANE_BYTES`], each with its writer end and its reader
+    /// (the other end) referenced once. As for a pipe, either venue creates
+    /// it without allocating; a retained extent large enough for both lanes
+    /// backs it at once, otherwise its first write supplies one
+    /// ([`IpcObjectGuard::ensure_stream_storage`]).
+    pub fn create_stream<W: LockWait>(&self, wait: &W) -> Result<IpcObjectHandle, IpcError> {
+        let fresh = PipeRecord::unbacked(IPC_PIPE_PAGE_SIZE, IPC_STREAM_LANE_BYTES)
+            .map_err(IpcError::Object)?;
+        let (index, record) = self.pop_object()?;
+        let mut guard = self.lock_fresh(index, record, wait)?;
+        // SAFETY: the object lock is held and the record is unpublished.
+        unsafe {
+            let state = &mut *record.state.get();
+            state.pipe = fresh;
+            state.kind_state.stream_second = fresh;
+        }
+        if guard.stream_storage_fits()
+            && let Err(error) = guard.init_stream_lanes()
+        {
+            drop(guard);
+            push(&self.dir.free_objects, index as usize, &record.next_free);
+            return Err(error);
+        }
+        Ok(guard.publish_kind(KIND_STREAM))
+    }
+
+    /// `shutdown(2)` of one stream end: drop the lane references that end
+    /// still holds for the directions `how` closes (its own lane's writer
+    /// for SHUT_WR, its peer lane's reader for SHUT_RD). The references are
+    /// the shutdown state, so a repeated shutdown and the final close drop
+    /// only what remains. Deliver the returned wake after unlocking.
+    pub fn shutdown_stream<W: LockWait>(
+        &self,
+        object: IpcObjectHandle,
+        end: StreamEnd,
+        read: bool,
+        write: bool,
+        wait: &W,
+    ) -> Result<IpcWake, IpcError> {
+        let mut guard = self.lock(object, wait)?;
+        let mut changed = false;
+        for (lane, side, due) in [(end, End::Writer, write), (end.peer(), End::Reader, read)] {
+            if !due {
+                continue;
+            }
+            let mut pipe = guard.stream_lane(lane)?;
+            if pipe.references(side) == 0 {
+                continue;
+            }
+            pipe.release(side).result.map_err(IpcError::Object)?;
+            changed = true;
+        }
+        Ok(guard.publish(WakeSet {
+            readers: changed,
+            writers: changed,
+        }))
     }
 
     /// Release the backing of a description whose final hold just went
@@ -1910,6 +2115,41 @@ impl<'a> IpcRegion<'a> {
             IpcBacking::Epoll { object } => {
                 self.epoll_destroy(object, wait)?;
                 Ok(IpcReleased::Epoll)
+            }
+            IpcBacking::Stream { object, end } => {
+                let mut guard = self.lock(object, wait)?;
+                // The end's description is its only holder: it drops what
+                // it still references of its own lane (writer) and its
+                // peer's (reader); a shutdown dropped the rest.
+                let held = [(end, End::Writer), (end.peer(), End::Reader)];
+                let mut remaining = 0;
+                for lane in [StreamEnd::First, StreamEnd::Second] {
+                    let pipe = guard.stream_lane(lane)?;
+                    remaining += pipe.references(End::Reader) + pipe.references(End::Writer);
+                }
+                let mut releasing = 0;
+                for (lane, side) in held {
+                    releasing += guard.stream_lane(lane)?.references(side);
+                }
+                let gone = remaining == releasing;
+                if gone {
+                    // Before any effect: a refused detach changes nothing.
+                    guard.detach_all_member_items(wait)?;
+                }
+                for (lane, side) in held {
+                    let mut pipe = guard.stream_lane(lane)?;
+                    if pipe.references(side) != 0 {
+                        pipe.release(side).result.map_err(IpcError::Object)?;
+                    }
+                }
+                let wake = guard.publish(WakeSet {
+                    readers: true,
+                    writers: true,
+                });
+                if gone {
+                    guard.free();
+                }
+                Ok(IpcReleased::Object { wake, freed: gone })
             }
         }
     }
@@ -2242,6 +2482,7 @@ impl<'a> IpcObjectGuard<'a> {
             KIND_PIPE => Some(IpcObjectKind::Pipe),
             KIND_EVENTFD => Some(IpcObjectKind::EventFd),
             KIND_EPOLL => Some(IpcObjectKind::Epoll),
+            KIND_STREAM => Some(IpcObjectKind::Stream),
             _ => None,
         }
     }
@@ -2318,6 +2559,162 @@ impl<'a> IpcObjectGuard<'a> {
         }
         let (state, bytes, slots) = self.pipe_parts()?;
         Pipe::attach(&mut state.pipe, bytes, slots).map_err(|_| IpcError::Corrupt)
+    }
+
+    /// Whether this record's extent holds both lanes of a stream pair: each
+    /// lane takes half of its ring bytes and half of its page metadata.
+    fn stream_storage_fits(&self) -> bool {
+        let s = self.storage();
+        let lane = IPC_STREAM_LANE_BYTES as u64;
+        s.ring_bytes / 2 >= lane && s.pages / 2 >= lane / IPC_PIPE_PAGE_SIZE as u64
+    }
+
+    /// The lane `writer` writes, as a pipe view over its record and its half
+    /// of the extent (an unbacked view before the extent fits both lanes).
+    pub fn stream_lane(
+        &mut self,
+        writer: StreamEnd,
+    ) -> Result<Pipe<'_, &mut PipeRecord>, IpcError> {
+        if self.kind() != Some(IpcObjectKind::Stream) {
+            return Err(IpcError::WrongKind);
+        }
+        let backed = self.stream_storage_fits();
+        let s = self.storage();
+        // SAFETY: the object lock is held (exclusive state access).
+        let state = unsafe { &mut *self.record.state.get() };
+        // SAFETY: a stream's kind state is its second lane.
+        let record = match writer {
+            StreamEnd::First => &mut state.pipe,
+            StreamEnd::Second => unsafe { &mut state.kind_state.stream_second },
+        };
+        if !backed {
+            return Pipe::attach(record, &mut [], &mut []).map_err(|_| IpcError::Corrupt);
+        }
+        let (bytes, slots) = self.stream_lane_storage(s, writer)?;
+        Pipe::attach(record, bytes, slots).map_err(|_| IpcError::Corrupt)
+    }
+
+    /// One lane's half of `s`: lane [`StreamEnd::First`] the lower halves
+    /// of the ring and of the page metadata, [`StreamEnd::Second`] the upper.
+    fn stream_lane_storage(
+        &self,
+        s: IpcPipeStorage,
+        writer: StreamEnd,
+    ) -> Result<(&'a mut [u8], &'a mut [Page]), IpcError> {
+        let base = self
+            .region
+            .ring_range(s.offset, s.footprint())
+            .filter(|_| s.ring_bytes != 0)
+            .ok_or(IpcError::BadStorage)?;
+        let ring = (s.ring_bytes / 2) as usize & !(IPC_PIPE_PAGE_SIZE - 1);
+        let pages = (s.pages / 2) as usize;
+        let lane = match writer {
+            StreamEnd::First => 0,
+            StreamEnd::Second => 1,
+        };
+        // SAFETY: the caller holds the object lock; the range is
+        // authenticated in bounds and owned by this object; the two lanes'
+        // halves are disjoint, and the metadata follows the whole ring at
+        // a 4-byte-aligned offset.
+        unsafe {
+            Ok((
+                core::slice::from_raw_parts_mut(base.add(lane * ring), ring),
+                core::slice::from_raw_parts_mut(
+                    (base.add(s.ring_bytes as usize) as *mut Page).add(lane * pages),
+                    pages,
+                ),
+            ))
+        }
+    }
+
+    /// Give both lanes the extent they now fit in (create, or a supplied
+    /// replacement): each holds no byte yet, so nothing moves.
+    fn init_stream_lanes(&mut self) -> Result<(), IpcError> {
+        let s = self.storage();
+        for writer in [StreamEnd::First, StreamEnd::Second] {
+            let (bytes, slots) = self.stream_lane_storage(s, writer)?;
+            // SAFETY: the object lock is held (exclusive state access).
+            let state = unsafe { &mut *self.record.state.get() };
+            // SAFETY: a stream's kind state is its second lane.
+            let record = match writer {
+                StreamEnd::First => &mut state.pipe,
+                StreamEnd::Second => unsafe { &mut state.kind_state.stream_second },
+            };
+            if record.used != 0 || record.unread != 0 {
+                return Err(IpcError::Corrupt);
+            }
+            Pipe::attach(record, &mut [], &mut [])
+                .map_err(|_| IpcError::Corrupt)?
+                .replace_storage(bytes, slots)
+                .map_err(IpcError::Object)?;
+        }
+        Ok(())
+    }
+
+    /// The stream counterpart of [`Self::ensure_pipe_storage`], for a write
+    /// by `writer`: give an unbacked pair one extent for both lanes, from
+    /// the ring stock or the shared extent allocator. `false` when the write
+    /// is EPIPE (its lane has no reader) and no ring was spent.
+    pub fn ensure_stream_storage(&mut self, writer: StreamEnd) -> Result<bool, IpcError> {
+        if self.stream_storage_fits() {
+            return Ok(true);
+        }
+        if self.stream_lane(writer)?.references(End::Reader) == 0 {
+            return Ok(false);
+        }
+        // A stock ring needs no allocation; as for a pipe, it is taken only
+        // when no retained extent awaits reclamation.
+        let stocked = (self.storage() == IpcPipeStorage::default())
+            .then(|| self.region.take_stock_ring())
+            .flatten();
+        let from_stock = stocked.is_some();
+        let mut storage = match stocked {
+            Some(ring) => ring,
+            None => self.region.provision_pipe_storage(
+                2 * IPC_STREAM_LANE_BYTES as u64,
+                2 * (IPC_STREAM_LANE_BYTES / IPC_PIPE_PAGE_SIZE) as u64,
+                &carrick_sched_core::ShortLockSpin,
+            )?,
+        };
+        let result = self.provide_stream_storage(&mut storage);
+        if storage != IpcPipeStorage::default() {
+            // The replaced extent, or the refused supply: a refused stock
+            // ring goes back to the stock, anything else to the allocator.
+            let restocked =
+                from_stock && result.is_err() && self.region.stock_ring(storage).is_ok();
+            if !restocked {
+                self.region
+                    .reclaim_pipe_storage(&mut storage, &carrick_sched_core::ShortLockSpin)?;
+            }
+        }
+        result.map(|()| true)
+    }
+
+    /// Install `storage` as an unbacked pair's extent; on success `storage`
+    /// receives the extent it replaces (possibly empty) for reclamation.
+    fn provide_stream_storage(&mut self, storage: &mut IpcPipeStorage) -> Result<(), IpcError> {
+        let old = self.storage();
+        let new = *storage;
+        if new.ring_bytes == 0
+            || !new.ring_bytes.is_multiple_of(IPC_PIPE_PAGE_SIZE as u64)
+            || self
+                .region
+                .ring_range(new.offset, new.footprint())
+                .is_none()
+        {
+            return Err(IpcError::BadStorage);
+        }
+        self.set_storage(new)?;
+        if !self.stream_storage_fits() {
+            self.set_storage(old)?;
+            return Err(IpcError::BadStorage);
+        }
+        if let Err(error) = self.init_stream_lanes() {
+            self.set_storage(old)?;
+            return Err(error);
+        }
+        *storage = old;
+        Ok(())
     }
 
     /// One lazy backing supplier for both venues. Stock is a cache of the
@@ -2457,7 +2854,7 @@ impl<'a> IpcObjectGuard<'a> {
             return Err(IpcError::WrongKind);
         }
         // SAFETY: the object lock is held.
-        Ok(unsafe { &mut (*self.record.state.get()).eventfd })
+        Ok(unsafe { &mut (*self.record.state.get()).kind_state.counters.eventfd })
     }
     /// Publish a state change: advance the sequences named by `wake`
     /// (Release, under this lock) and owe the host a notification if it has
