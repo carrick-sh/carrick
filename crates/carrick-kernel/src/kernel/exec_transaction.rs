@@ -278,7 +278,7 @@ pub trait RootExecVenue {
 
 /// [`begin`]'s value: the Kernel preparation and the venue's reserved
 /// replacement custody.
-#[must_use = "dropping a begun exec kills the process"]
+#[must_use = "dropping a begun exec releases its reservations and frame custody (a `PreparedExec` also resumes the drained siblings) and kills nothing; the caller owes the terminal path"]
 pub struct ExecBegun<P, Envelope> {
     // Field order is drop order: the envelope abandons the reserved frame
     // custody before the Kernel preparation rolls back.
@@ -294,7 +294,7 @@ impl<P: PreparedRootExec, Envelope> ExecBegun<P, Envelope> {
 
 /// [`stage`]'s value: the begun exec with the successor's identity, signal
 /// reset and `/proc` generation written.
-#[must_use = "dropping a staged exec kills the process"]
+#[must_use = "dropping a staged exec releases its reservations and frame custody (a `PreparedExec` also resumes the drained siblings) and kills nothing; the caller owes the terminal path"]
 pub struct ExecStaged<P, Envelope> {
     dispatch_mm: PreparedDispatchMmExec,
     signal_reset: SignalReset,
@@ -305,7 +305,7 @@ pub struct ExecStaged<P, Envelope> {
 /// [`arm`]'s value: the successor image installed and its MM published,
 /// awaiting [`settle`]. When the venue's `Replaced` and `Envelope` own their
 /// custody, this owns the whole continuation.
-#[must_use = "dropping an armed exec kills the process"]
+#[must_use = "dropping an armed exec releases its replacement custody and kills nothing; the caller owes the terminal path"]
 pub struct ExecArmed<Replaced, Envelope> {
     old_files: Arc<FileTable>,
     dispatch_mm: PreparedDispatchMmExec,
