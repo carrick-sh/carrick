@@ -219,7 +219,8 @@ skills `carrick-trace` and `carrick-lldb`.
 
 - **A worker's result is a claim.** Re-verify it from the PR's diff and
   evidence, and grep the diff for out-of-fence changes. A verdict counts only
-  as a published review on the current head.
+  as a published review on the current head, or on an earlier head when each
+  commit is patch-identical and CI is green (owner, 2026-11-14).
 - **Large or shared-kernel PRs get a published independent review** before
   landing, and every fix round gets a confirming re-review. A zero-finding
   review of a large change finished in minutes counts as unreviewed until a
@@ -255,9 +256,7 @@ skills `carrick-trace` and `carrick-lldb`.
 ## Where to look next
 
 - Commands: [`justfile`](justfile) (signing recipes are marked).
-- Director operations (workers, routing, sessions, runners):
-  [`docs/director-playbook.md`](docs/director-playbook.md).
+- Director operations: [`docs/director-playbook.md`](docs/director-playbook.md).
 - Architecture: `docs/architecture-overview.md`, `docs/hal.md`,
   `docs/syscalls-emulation-map.md`.
-- Gates and runners: `docs/ci/signed-gate.md`, `docs/ci/mac-hvf-runner.md`,
-  `docs/build-maintenance.md`.
+- Gates and runners: `docs/ci/`, `docs/build-maintenance.md`.
