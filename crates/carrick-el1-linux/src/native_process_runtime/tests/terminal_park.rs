@@ -735,15 +735,35 @@ fn refused_losing_exit_after_vacate_leaves_no_installed_space() {
 /// is the slot's host record, settlement rewrites the job's roots from its own
 /// stage-1 lease; once the ring cleared it, the job keeps the live roots,
 /// which name the maintenance root (ASID 0) if the ring vacated them.
+///
+/// The owner is shared: the witness runs on the x86 CPL0 context and MMU and
+/// on the AArch64 context and MMU.
 #[cfg(test)]
 #[test]
 fn closing_interrupt_hands_a_loaded_members_home_record_to_its_host() {
+    closing_interrupt_home_record_for::<
+        carrick_sched_core::ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+    closing_interrupt_home_record_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(super::arm_words);
+}
+
+#[cfg(test)]
+fn closing_interrupt_home_record_for<
+    C: carrick_guest_arch::ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(super::super::AddressContext<super::super::RootGpa>) -> C,
+) {
     use super::super::PendingCloseOperation;
     use carrick_sched_core::object_wait::OwnerEntry;
     const PROCESS_ASID: u16 = 1;
     const MAINTENANCE_ASID: u16 = 0;
     const FUTEX: u64 = 0x7000;
-    let fixture = native_exec_fixture();
+    let fixture = super::native_exec_fixture_for::<C, B>(make_words);
     let _ = super::super::host_test_support::take_terminal_vacates();
     let sibling = add_service_sibling(&fixture, None);
     assert_eq!(fixture.page.live(), 2);
@@ -757,9 +777,7 @@ fn closing_interrupt_hands_a_loaded_members_home_record_to_its_host() {
     // EL1 serves its futex wait by parking that home record.
     {
         let guard = fixture.zone.short_lock(
-            carrick_sched_core::ZoneTables::<carrick_sched_core::ParkedContextWords>::bucket_of_with_context(
-                1, FUTEX,
-            ),
+            carrick_sched_core::ZoneTables::<C>::bucket_of_with_context(1, FUTEX),
             &carrick_sched_core::ShortLockSpin,
         );
         let seq = fixture.zone.next_seq(sibling.record.id);
@@ -770,7 +788,7 @@ fn closing_interrupt_hands_a_loaded_members_home_record_to_its_host() {
         fixture.zone.publish_park(sibling.record.id, seq);
     }
 
-    let saved = words(fixture.address);
+    let saved = make_words(fixture.address);
     let mut service = fixture.service();
     let mut owner = fixture
         .runtime
