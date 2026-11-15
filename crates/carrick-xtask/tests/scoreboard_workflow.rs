@@ -424,7 +424,16 @@ fn scoreboard_post_publishes_both_isas_and_runs_no_repository_code() {
     let env = post["env"].as_hash().expect("post env");
     let mut keys: Vec<&str> = env.keys().filter_map(Yaml::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["GH_TOKEN", "HVF_RESULT", "KVM_RESULT"]);
+    assert_eq!(
+        keys,
+        [
+            "GH_TOKEN",
+            "HVF_RESULT",
+            "HVF_TABLE",
+            "KVM_RESULT",
+            "KVM_TABLE"
+        ]
+    );
     assert_eq!(
         post["env"]["GH_TOKEN"].as_str(),
         Some("${{ github.token }}")
@@ -486,6 +495,7 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
         &gh,
         "#!/bin/sh\n\
          set -eu\n\
+         if [ \"$1\" = api ]; then [ -n \"${FAKE_JOBS:-}\" ] && printf '%s\\n' \"$FAKE_JOBS\"; exit 0; fi\n\
          printf '%s\\n' \"$@\" > \"$GH_ARGS_OUT\"\n\
          cp \"$RUNNER_TEMP/scoreboard/comment.md\" \"$GH_BODY_OUT\"\n",
     );
@@ -528,6 +538,12 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
     let table_txt = fs::read_to_string(ws.join("target/scoreboard/table.txt")).expect("table.txt");
     assert!(table_txt.contains("arm64   py-version       exit=0    3.12.7 ($GH_TOKEN)"));
 
+    // The lane jobs as the Actions API lists them (`--jq` already applied): the x86 job failed (#2393).
+    let fake_jobs = concat!(
+        r#"{"name":"HVF · goal scoreboard (nightly)","conclusion":"success","status":"completed","html_url":"https://github.com/carrick-sh/carrick/actions/runs/424242/job/1"}"#,
+        "\n",
+        r#"{"name":"KVM · x86 scoreboard (nightly)","conclusion":"failure","status":"completed","html_url":"https://github.com/carrick-sh/carrick/actions/runs/424242/job/2"}"#,
+    );
     let post = |hvf: &str, kvm: &str| {
         let _ = fs::remove_file(&gh_args_out);
         Command::new("bash")
@@ -543,6 +559,10 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
             .env("GITHUB_SERVER_URL", "https://github.com")
             .env("GITHUB_REPOSITORY", "carrick-sh/carrick")
             .env("GITHUB_RUN_ID", "424242")
+            .env("GITHUB_RUN_ATTEMPT", "1")
+            .env("HVF_TABLE", "uploaded")
+            .env("KVM_TABLE", "")
+            .env("FAKE_JOBS", fake_jobs)
             .env("GH_ARGS_OUT", &gh_args_out)
             .env("GH_BODY_OUT", &gh_body_out)
             .output()
@@ -623,9 +643,11 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
         "GH_TOKEN leaked into output or comment body"
     );
 
-    // 3. A lane with no table is reported missing with its job result, not dropped.
+    // 3. A lane with no table is reported missing with its job's real conclusion and link, not
+    // dropped. #2393: `needs.kvm-scoreboard.result` reads `success` (continue-on-error) though the job
+    // failed; the post used to print "job result: success".
     fs::remove_dir_all(temp.join("scoreboard/x86_64")).expect("remove x86 artifact");
-    let partial = post("success", "failure");
+    let partial = post("success", "success");
     assert!(
         partial.status.success(),
         "{}",
@@ -633,7 +655,10 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
     );
     let body = fs::read_to_string(&gh_body_out).expect("comment body");
     assert!(
-        body.contains("missing: no x86_64 scoreboard table (job result: failure)"),
+        body.contains(
+            "missing: the x86_64 job produced no table: it failed or its runner was lost \
+             (job: failure (https://github.com/carrick-sh/carrick/actions/runs/424242/job/2))"
+        ) && !body.contains("success"),
         "{body}"
     );
     assert!(body.contains("arm64   py-version"), "{body}");

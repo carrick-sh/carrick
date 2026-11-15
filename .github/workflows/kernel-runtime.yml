@@ -1099,7 +1099,7 @@ jobs:
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           # The lane job's own conclusion and link, from the Actions API (#2393): `needs.<job>.result`
           # reads `success` for a continue-on-error job that failed or whose runner was lost.
-          jobs_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+          jobs_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/${GITHUB_RUN_ATTEMPT:-1}/jobs" \
             --paginate --jq '.jobs[] | {name, conclusion, status, html_url}' 2>/dev/null || true)
           lane_job() { # lane_job <job name>: "<conclusion or status> (<link>)", or "unknown"
             local j
@@ -1129,8 +1129,8 @@ jobs:
           {
             printf '### Goal scoreboard (nightly)\n\n'
             printf 'Commit: %s ([workflow run](%s))\n\n' "$GITHUB_SHA" "$run_url"
-            block arm64 HVF "$HVF_RESULT" "$HVF_TABLE" "HVF · goal scoreboard (nightly)"
-            block x86_64 KVM "$KVM_RESULT" "$KVM_TABLE" "KVM · x86 scoreboard (nightly)"
+            block arm64 HVF "$HVF_RESULT" "${HVF_TABLE:-}" "HVF · goal scoreboard (nightly)"
+            block x86_64 KVM "$KVM_RESULT" "${KVM_TABLE:-}" "KVM · x86 scoreboard (nightly)"
           } > "$d/comment.md"
           cat "$d/comment.md" >> "$GITHUB_STEP_SUMMARY"
           gh issue comment 231 --repo "$GITHUB_REPOSITORY" --body-file "$d/comment.md"
