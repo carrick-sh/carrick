@@ -5,9 +5,9 @@
 # it never declines to the host, which has no task for a clone thread.
 # Witnesses are bound below; semantics and work budgets are unchanged.
 # #2359 round 4: a thread clone whose CLONE_PARENT_SETTID/CLONE_CHILD_SETTID
-# word is refused "not now" (the preimage read or a copy-out) backs out
-# every uncommitted effect, waits through the same owner-input continuation
-# and reruns in ring; it never answers EFAULT or forwards for contention.
+# copy-out is refused "not now" backs out every uncommitted effect, waits
+# through the same owner-input continuation and reruns in ring; it never
+# answers EFAULT for contention. A refused preimage read still forwards.
 # #2306: wait_query parks pre-reap status-copy OwnerWait via the existing
 # owner-service continuation. The host fixture gains a status-copy refusal
 # and a real fork/exit/wait witness under kernel.memory.owner-wait.
@@ -162,7 +162,7 @@ vm_free = [
   "carrick-runtime::vcpu_loop::executor::tests::{serial_host_process_exit_retires_abi_born_sibling_before_direct_load,serial_host_group_close_retires_abi_born_sibling_during_direct_load,serial_host_missing_abi_born_sibling_without_terminal_intent_fails_closed} (actual ABI birth and retained control, queued process-exit cancellation and native terminal release during a held load; zero retired-member guest entries, one terminal settlement, all workers joined; absence without terminal intent remains fatal)",
   "carrick-el1-linux::aarch64_process_tests::exit_group_hang_tests::serial_host_arm_exit_group_unregistered_sibling_wakes_parked_host (production exit_group, enrolled exact record retirement, nonperiodic waits, real host receipts and one Closing wake)",
   "carrick-el1-linux::aarch64_process_tests::arm_unregistered_host_cancel_commits_terminal_intent_before_record_release (Busy once then successful native release)",
-  "carrick-personality-linux::x86_wave2::x5_clone_tid_copy_not_yet_reruns (#2359 round 4: shared clone policy, ARM and x86 contexts; a not-now parent-word write, child-word write or preimage read waits once on the word's owner with nothing claimed or written, and the rerun publishes both words; red as a forwarded clone before)",
+  "carrick-personality-linux::x86_wave2::x5_clone_tid_copy_not_yet_reruns (#2359 round 4: shared clone policy, ARM and x86 contexts; a not-now parent-word or child-word write backs the clone out, waits once on the word's owner with nothing claimed or left written, and the rerun publishes both words; red as a forwarded clone before)",
   "carrick-personality-linux::x86_wave2::x5_exit_requeued_after_wake_wakes_once (real requeue visibility, one clear/wake, and preservation of a newer set_tid_address)",
   "carrick-core::entry_completion::losing_requeue_cas_keeps_membership_and_admission_for_commit (real member/admission ownership across a lost scheduler claim CAS)",
   "carrick-core::entry_completion::pool_cancellation_refuses_record_release_before_terminal_gate",
