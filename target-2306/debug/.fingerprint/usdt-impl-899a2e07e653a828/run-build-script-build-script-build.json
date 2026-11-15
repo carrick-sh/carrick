@@ -1,0 +1,1 @@
+{"rustc":16696009966390864400,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[8680877546672728026,"build_script_build",false,10988439322089736556]],"local":[{"RerunIfChanged":{"output":"debug/build/usdt-impl-899a2e07e653a828/output","paths":["build.rs"]}}],"rustflags":["-C","force-frame-pointers=yes"],"config":0,"compile_kind":0}

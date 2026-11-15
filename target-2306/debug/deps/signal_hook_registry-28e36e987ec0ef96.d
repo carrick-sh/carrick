@@ -1,0 +1,9 @@
+/var/lib/carrick-conductor/repo/target-2306/debug/deps/signal_hook_registry-28e36e987ec0ef96.d: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/var/lib/carrick-conductor/repo/target-2306/debug/deps/libsignal_hook_registry-28e36e987ec0ef96.rlib: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/var/lib/carrick-conductor/repo/target-2306/debug/deps/libsignal_hook_registry-28e36e987ec0ef96.rmeta: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs:
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs:
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs:

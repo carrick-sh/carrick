@@ -1,0 +1,6 @@
+cargo:rerun-if-changed=build.rs
+cargo:rustc-check-cfg=cfg(usdt_backend_noop)
+cargo:rustc-check-cfg=cfg(usdt_backend_stapsdt)
+cargo:rustc-check-cfg=cfg(usdt_backend_linker)
+cargo:rustc-check-cfg=cfg(usdt_backend_standard)
+cargo:rustc-cfg=usdt_backend_stapsdt

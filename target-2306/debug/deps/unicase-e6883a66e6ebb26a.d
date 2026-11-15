@@ -1,0 +1,10 @@
+/var/lib/carrick-conductor/repo/target-2306/debug/deps/unicase-e6883a66e6ebb26a.d: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/ascii.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/unicode/mod.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/unicode/map.rs
+
+/var/lib/carrick-conductor/repo/target-2306/debug/deps/libunicase-e6883a66e6ebb26a.rlib: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/ascii.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/unicode/mod.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/unicode/map.rs
+
+/var/lib/carrick-conductor/repo/target-2306/debug/deps/libunicase-e6883a66e6ebb26a.rmeta: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/ascii.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/unicode/mod.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/unicode/map.rs
+
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/lib.rs:
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/ascii.rs:
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/unicode/mod.rs:
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicase-2.9.0/src/unicode/map.rs:

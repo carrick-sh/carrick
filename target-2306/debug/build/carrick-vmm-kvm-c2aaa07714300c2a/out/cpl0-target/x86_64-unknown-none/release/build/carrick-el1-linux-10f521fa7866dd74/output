@@ -1,0 +1,2 @@
+cargo:rustc-link-arg=-T/var/lib/carrick-conductor/repo/crates/carrick-el1-linux/link.ld
+cargo:rerun-if-changed=link.ld
