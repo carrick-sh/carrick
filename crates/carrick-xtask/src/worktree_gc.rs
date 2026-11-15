@@ -251,7 +251,7 @@ fn writable_dirs(path: &Path) -> Result<(), GcError> {
     Ok(())
 }
 
-fn removal_paths_are_direct(registered: &Path, given: &Path) -> bool {
+pub(crate) fn removal_paths_are_direct(registered: &Path, given: &Path) -> bool {
     [registered, given].into_iter().all(|path| {
         std::fs::symlink_metadata(path)
             .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
