@@ -5377,3 +5377,35 @@ fn advertised_sse2_pcmpgtb_uses_signed_lanes() {
         ]
     );
 }
+
+#[test]
+fn unchanged_loop_walks_once_at_three_scales() {
+    for blocks in [64, 512, 4096] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[0xeb, 0xfe]);
+        for _ in 0..blocks {
+            assert_eq!(
+                cpu.step_block(&mut mem).unwrap(),
+                SoftCpuExit::Continue { next_rip: va }
+            );
+        }
+        assert_eq!(
+            cpu.context().walker.stats().walks,
+            1,
+            "{blocks} executed blocks"
+        );
+    }
+}
+/// Timing fixture only: no structural assertions or native/Docker ratio claim.
+#[test]
+#[ignore = "run explicitly in release mode for paired base/candidate measurement"]
+fn translation_cache_loop_timing() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x48, 0xff, 0xc0, 0xeb, 0xfb]);
+    let start = std::time::Instant::now();
+    for _ in 0..20_000 {
+        std::hint::black_box(cpu.step_block(&mut mem).unwrap());
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(cpu.context().gpr[reg::RAX], 20_000);
+    assert_eq!(cpu.context().rip, va);
+    println!("loop_ns={}", elapsed.as_nanos());
+}
