@@ -405,12 +405,20 @@ impl SyscallDispatcher {
             // not served rather than altered.
             let path = std::str::from_utf8(path).map_err(|_| NativeHostFileRefusal)?;
             let capacity = view.output_capacity();
-            if header.op == HostFileOp::Fchdir {
+            if matches!(
+                header.op,
+                HostFileOp::Fchdir | HostFileOp::Fchmod | HostFileOp::Fchown
+            ) {
+                // A descriptor call with the caller's authority: no path.
                 if !path.is_empty() {
                     return Err(NativeHostFileRefusal);
                 }
                 super::resources::with_native_fs_scope(&authority, || {
-                    self.serve_native_fchdir(owner, table, header)
+                    if header.op == HostFileOp::Fchdir {
+                        self.serve_native_fchdir(owner, table, header)
+                    } else {
+                        self.serve_native_descriptor_attr(owner, table, header)
+                    }
                 })
                 .ok_or(NativeHostFileRefusal)?
             } else if path.is_empty() {
@@ -774,7 +782,11 @@ impl SyscallDispatcher {
             | HostFileOp::Renameat
             | HostFileOp::Fchdir
             | HostFileOp::Poll
-            | HostFileOp::Readlinkat => Served::Refused,
+            | HostFileOp::Readlinkat
+            | HostFileOp::Fchmod
+            | HostFileOp::Fchown
+            | HostFileOp::Fchmodat
+            | HostFileOp::Fchownat => Served::Refused,
         }
     }
 
@@ -793,29 +805,81 @@ impl SyscallDispatcher {
         header: HostFileHeader,
     ) -> Served {
         let fs = self.fs_view();
-        let lookup = |description: &Arc<crate::kernel::FileDescription>| {
-            let target = match fs.fchdir_target(description) {
-                Ok(target) => target,
-                Err(errno) => return Served::errno(errno),
-            };
-            let record = match fs.description_stat_record(description, None) {
-                Ok(record) => record,
-                Err(errno) => return Served::errno(errno),
-            };
-            let mut reply = native_stat_bytes(HostFileOp::Newfstatat, &record);
-            reply.extend_from_slice(target.as_bytes());
-            Served::Reply(0, reply)
-        };
+        self.with_native_description(
+            owner,
+            table,
+            header,
+            || Served::errno(carrick_abi::LINUX_ENOTDIR),
+            |description| {
+                let target = match fs.fchdir_target(description) {
+                    Ok(target) => target,
+                    Err(errno) => return Served::errno(errno),
+                };
+                let record = match fs.description_stat_record(description, None) {
+                    Ok(record) => record,
+                    Err(errno) => return Served::errno(errno),
+                };
+                let mut reply = native_stat_bytes(HostFileOp::Newfstatat, &record);
+                reply.extend_from_slice(target.as_bytes());
+                Served::Reply(0, reply)
+            },
+        )
+    }
+
+    /// A ring task's `fchmod` or `fchown` ([`HostFileOp::Fchmod`],
+    /// [`HostFileOp::Fchown`]) of the description its descriptor names,
+    /// pinned in its ring table now: the host task's own cores
+    /// ([`super::FsView::chmod_description`],
+    /// [`super::FsView::chown_description`]) under the caller's access
+    /// context, whose credentials decide EPERM. The ring refused an O_PATH
+    /// `fchmod`. The implicit stdio streams have no file behind them and
+    /// accept the call, as the host task's fd path does.
+    fn serve_native_descriptor_attr(
+        &self,
+        owner: &Arc<HostIpc>,
+        table: fd::TableId,
+        header: HostFileHeader,
+    ) -> Served {
+        let fs = self.fs_view();
+        self.with_native_description(
+            owner,
+            table,
+            header,
+            || Served::value(0),
+            |description| {
+                served_mutation(if header.op == HostFileOp::Fchmod {
+                    fs.chmod_description(None, None, description, header.args[0])
+                } else {
+                    let (uid, gid) = super::FsView::chown_id_args(header.args[0], header.args[1]);
+                    fs.chown_description(None, description, uid, gid)
+                })
+            },
+        )
+    }
+
+    /// Serve `header`'s descriptor, pinned in the caller's ring table now,
+    /// as the open description it names: `stdio` for one of the run's
+    /// implicit stdio streams, `served` for a description this venue holds.
+    /// Any other resource is refused, never guessed; a closed descriptor is
+    /// EBADF.
+    fn with_native_description(
+        &self,
+        owner: &Arc<HostIpc>,
+        table: fd::TableId,
+        header: HostFileHeader,
+        stdio: impl FnOnce() -> Served,
+        served: impl FnOnce(&Arc<crate::kernel::FileDescription>) -> Served,
+    ) -> Served {
         match owner.with_pinned_host_resource(table, fd::Fd(header.fd), |resource| {
             if resource.downcast_ref::<ImplicitHostStdio>().is_some() {
-                return Served::errno(carrick_abi::LINUX_ENOTDIR);
+                return stdio();
             }
             if let Some(file) = resource.downcast_ref::<NativeOpenFile>() {
-                return lookup(&file.description);
+                return served(&file.description);
             }
             if let Some(hold) = resource.downcast_ref::<crate::kernel::objects::IpcPhysicalHold>() {
                 return match hold.retain_io() {
-                    Some(lease) => lookup(lease.description()),
+                    Some(lease) => served(lease.description()),
                     None => Served::Refused,
                 };
             }
@@ -864,6 +928,24 @@ impl SyscallDispatcher {
                         target_tid: None,
                     },
                 ) {
+                    Ok(outcome) => served_mutation(outcome),
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
+                }
+            }
+            HostFileOp::Fchmodat | HostFileOp::Fchownat => {
+                let flags = u64::from(header.flags);
+                if flags & !carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+                    return Served::errno(carrick_abi::LINUX_EINVAL);
+                }
+                let nofollow = flags != 0;
+                let served = if header.op == HostFileOp::Fchmodat {
+                    fs.chmod_path(None, LINUX_AT_FDCWD, path, header.args[0], nofollow)
+                } else {
+                    let (uid, gid) = super::FsView::chown_id_args(header.args[0], header.args[1]);
+                    fs.chown_path(None, LINUX_AT_FDCWD, path, uid, gid, nofollow)
+                };
+                match served {
                     Ok(outcome) => served_mutation(outcome),
                     Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
                     Err(_) => Served::Refused,
@@ -1370,6 +1452,36 @@ mod tests {
             }
         }
 
+        /// The same caller as an unprivileged user whose every uid and gid
+        /// is `id`.
+        fn as_user(&self, dispatcher: &SyscallDispatcher, id: u32) -> Self {
+            let (uid, gid) = (carrick_abi::NsUid::new(id), carrick_abi::NsGid::new(id));
+            let credentials_id = dispatcher
+                .kernel_binding
+                .read()
+                .kernel()
+                .object_ids()
+                .credentials_id()
+                .unwrap();
+            Self {
+                credentials: Arc::new(crate::kernel::Credentials::from_values(
+                    crate::kernel::CredentialsValues {
+                        id: credentials_id,
+                        ruid: uid,
+                        euid: uid,
+                        suid: uid,
+                        rgid: gid,
+                        egid: gid,
+                        sgid: gid,
+                        fsuid: uid,
+                        fsgid: gid,
+                        umask: 0o022,
+                    },
+                )),
+                ..self.clone()
+            }
+        }
+
         /// The record as the ring stages it: a path record leads its input
         /// with the caller's encoded access context.
         fn stamp(&self, bytes: &mut Vec<u8>) {
@@ -1762,28 +1874,7 @@ mod tests {
             let sealed = fixture.venue_open(&tmp, b"sealed", DIRECTORY, 0);
             assert!(sealed >= 0, "{upper:?}: open sealed: {sealed}");
             assert_eq!(fchdir(&tmp, sealed), Ok("/tmp/sealed".to_owned()));
-            let mut user = tmp.clone();
-            user.credentials = Arc::new(crate::kernel::Credentials::from_values(
-                crate::kernel::CredentialsValues {
-                    id: fixture
-                        .dispatcher
-                        .kernel_binding
-                        .read()
-                        .kernel()
-                        .object_ids()
-                        .credentials_id()
-                        .unwrap(),
-                    ruid: carrick_abi::NsUid::new(4321),
-                    euid: carrick_abi::NsUid::new(4321),
-                    suid: carrick_abi::NsUid::new(4321),
-                    rgid: carrick_abi::NsGid::new(4321),
-                    egid: carrick_abi::NsGid::new(4321),
-                    sgid: carrick_abi::NsGid::new(4321),
-                    fsuid: carrick_abi::NsUid::new(4321),
-                    fsgid: carrick_abi::NsGid::new(4321),
-                    umask: 0o022,
-                },
-            ));
+            let user = tmp.as_user(&fixture.dispatcher, 4321);
             // The shared lookup re-stats through the host upper; an
             // in-memory upper's directory is not re-checked, exactly as for
             // the host task's own fchdir (followup-2206-fchdir-memory-dac).
@@ -2200,6 +2291,73 @@ mod tests {
                 fixture.owner.release(released.backing).unwrap();
             }
             assert_eq!(resize(file, 1), -9);
+        }
+    }
+
+    /// #231 (apt's `chown`/`chmod` warnings): a ring child's `fchmod`,
+    /// `fchown`, `fchmodat` and `fchownat` are the host task's cores under
+    /// the child's own credentials, carried in its access context: root may
+    /// give a file away, an unprivileged caller may not (EPERM), and -1 is
+    /// always allowed. A closed descriptor is EBADF, a missing path ENOENT,
+    /// a contended or in-zone resource never guessed.
+    #[test]
+    fn native_child_chmod_chown_dispatch_with_the_callers_credentials() {
+        let unchanged = u64::from(u32::MAX);
+        for upper in [Upper::Memory, Upper::Host] {
+            let fixture = mutation_child(upper);
+            let root = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+            let other = root.as_user(&fixture.dispatcher, 65534);
+            let file = fixture.venue_open(&root, b"attr", CREATE, 0o644);
+            assert!(file >= 0, "{upper:?}: create: {file}");
+            let fchmod = |caller: &CallerAccess, fd: i64, mode| {
+                fixture.child_call(caller, 52, [fd as u64, mode, 0, 0, 0, 0], &[])
+            };
+            let fchown = |caller: &CallerAccess, fd: i64, uid, gid| {
+                fixture.child_call(caller, 55, [fd as u64, uid, gid, 0, 0, 0], &[])
+            };
+            let chmodat = |caller: &CallerAccess, path: &[u8], mode| {
+                fixture.child_call(caller, 53, [FDCWD as u64, 0, mode, 0, 0, 0], &[(1, path)])
+            };
+            let chownat = |caller: &CallerAccess, path: &[u8], uid, gid, flags| {
+                fixture.child_call(
+                    caller,
+                    54,
+                    [FDCWD as u64, 0, uid, gid, flags, 0],
+                    &[(1, path)],
+                )
+            };
+            assert_eq!(fchmod(&root, file, 0o640), 0, "{upper:?}");
+            assert_eq!(chmodat(&root, b"attr", 0o600), 0, "{upper:?}");
+            assert_eq!(fchown(&root, file, 4321, 4321), 0, "{upper:?}");
+            assert_eq!(
+                chownat(
+                    &root,
+                    b"attr",
+                    0,
+                    unchanged,
+                    carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW
+                ),
+                0,
+                "{upper:?}"
+            );
+            let eperm = carrick_abi::LINUX_EPERM.guest_retval();
+            assert_eq!(fchown(&other, file, 0, unchanged), eperm, "{upper:?}");
+            assert_eq!(
+                chownat(&other, b"attr", 0, unchanged, 0),
+                eperm,
+                "{upper:?}"
+            );
+            assert_eq!(
+                chownat(&other, b"attr", unchanged, 0, 0),
+                eperm,
+                "{upper:?}"
+            );
+            assert_eq!(fchown(&other, file, unchanged, unchanged), 0, "{upper:?}");
+            assert_eq!(fchmod(&root, 999, 0o600), -9);
+            assert_eq!(fchown(&root, 999, unchanged, unchanged), -9);
+            assert_eq!(chmodat(&root, b"missing", 0o600), -2);
+            assert_eq!(chownat(&root, b"missing", unchanged, unchanged, 0), -2);
+            assert_eq!(chownat(&root, b"attr", 0, 0, 0x200), -22);
         }
     }
 
@@ -3631,8 +3789,8 @@ mod tests {
                 [FDCWD as u64, 0, 0o640, 0, 0, 0],
                 &[(1, b"b.txt")]
             ),
-            -38,
-            "chmod remains outside this slice"
+            0,
+            "chmod is served by the child's venue (#231)"
         );
     }
 
