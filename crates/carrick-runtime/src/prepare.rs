@@ -395,6 +395,7 @@ pub fn witness_kvm_exec_retarget(
         .prepare_exec_with_registry_id(
             &root_context,
             carrick_hal::ThreadId::synthetic_for_tests(root_context.thread().key().tid.raw()),
+            kernel.issue_exec_mm().map_err(configuration)?,
             None,
         )
         .map_err(configuration)?;
