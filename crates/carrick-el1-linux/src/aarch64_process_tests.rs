@@ -7377,6 +7377,7 @@ fn arm_shared_futex_wake_does_not_release_a_private_waiter() {
 }
 
 /// How the joined thread's raw `exit` leaves in the pthread_join witnesses.
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JoinedExit {
     /// A thread-directed pending signal declines the exit to host custody:
@@ -7403,6 +7404,7 @@ fn arm_glibc_pthread_join_robust_exit_in_ring_wakes_ring_wait() {
     glibc_pthread_join_meets_ring_wait(JoinedExit::RobustInRing);
 }
 
+#[cfg(test)]
 fn glibc_pthread_join_meets_ring_wait(how: JoinedExit) {
     // The joined CLEARTID word lives in private anonymous memory (glibc's
     // thread descriptor sits in the mmap'd thread stack).
