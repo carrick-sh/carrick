@@ -70,6 +70,21 @@ round:
     movabs $((ROUNDS << 32) | ROUNDS), %rcx
     cmp %rcx, %rax
     je 8f
+#ifdef DIAG_CENSUS
+    /* DIAGNOSTIC: equal counts exit 100 + refusals - 32; else 200 + refusals - reruns. */
+    mov %rax, %rcx
+    shr $32, %rcx
+    mov %eax, %edx
+    cmp %edx, %ecx
+    jne 7f
+    lea 68(%rcx), %rdi
+    mov $231, %eax
+    syscall
+7:  sub %edx, %ecx
+    lea 200(%rcx), %rdi
+    mov $231, %eax
+    syscall
+#endif
     mov $3, %edi
     mov $231, %eax
     syscall

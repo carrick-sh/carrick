@@ -1556,9 +1556,32 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             let slot = carrick_guest_arch::CpuId::new(1);
             Ok(ForwardVenue::new(&mut custody, StoppedCpuLease { cpu: slot, io })?.execution)
         })?;
-        drop(custody);
         let binding = self.cpu.registered_task_binding(execution.context.root)?;
-        execution.authenticate(binding, "idle peer forward binding mismatch")?;
+        if let Err(error) = execution.authenticate(binding, "idle peer forward binding mismatch") {
+            // DIAGNOSTIC ONLY (#2367 round 4): name the guest's lifecycle declines.
+            let mut declines = String::new();
+            for cpu in 0..2u32 {
+                let cpu = carrick_guest_arch::CpuId::new(cpu);
+                if let Ok(pointer) = custody.native_service_pointer(
+                    execution.context,
+                    carrick_guest_arch::KernelVa::new(custody.binding(cpu).counters_address),
+                    size_of::<carrick_el1_abi::Counters>(),
+                    align_of::<carrick_el1_abi::Counters>(),
+                ) {
+                    let counters = unsafe { &*pointer.cast::<carrick_el1_abi::Counters>() };
+                    for (index, count) in counters.lifecycle_declines.iter().enumerate() {
+                        let count = count.load(core::sync::atomic::Ordering::Relaxed);
+                        if count != 0 {
+                            declines.push_str(&format!(" cpu{}:{}={}", cpu.raw(), index, count));
+                        }
+                    }
+                } else {
+                    declines.push_str(" counters-unreadable");
+                }
+            }
+            return Err(fail(format!("{error} DIAG declines:{declines}")));
+        }
+        drop(custody);
         Ok(binding.task())
     }
 

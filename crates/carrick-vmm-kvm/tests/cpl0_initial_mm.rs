@@ -4747,3 +4747,34 @@ fn serial_host_direct_output_venues_supply_untouched_pages() {
         },
     );
 }
+
+/// DIAGNOSTIC ONLY (#2367 round 4): the lone clone fixture with no injection.
+#[test]
+fn diag_clone_parent_tid_no_inject() {
+    let elf = native_exit_fixture("native_clone_parent_tid_busy.S");
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .expect("a lone clone and raw exit retire in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
+/// DIAGNOSTIC ONLY (#2367 round 4): busy-once census encoded in the exit code.
+#[test]
+fn diag_busy_once_census() {
+    let elf = native_exit_fixture_with_flags(
+        "native_sibling_raw_exit.S",
+        &["-DOWNED_COPY_BUSY_ONCE", "-DDIAG_CENSUS"],
+    );
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .expect("a Busy clear-tid copy-out reruns in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}

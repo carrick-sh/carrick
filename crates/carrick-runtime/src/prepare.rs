@@ -255,12 +255,27 @@ pub fn try_run_prepared_kvm_pool(
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
 ) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
+    // DIAGNOSTIC ONLY (#2367 round 4): one endpoint per libtest thread.
+    let debug_server = (|| {
+        let context = dispatcher.capture_one_task_context().ok()?;
+        let name = std::thread::current().name()?.replace("::", "-");
+        let run_id = format!("d-{}", &name[name.len().saturating_sub(60)..]);
+        let physical_debug = Arc::new(KvmPhysicalDebug::default());
+        let provider: Arc<dyn carrick_kernel::kernel::debug::PhysicalCaptureProvider> =
+            Arc::clone(&physical_debug) as _;
+        let server = carrick_kernel::kernel::KernelDebugServer::install(
+            Arc::clone(context.kernel()),
+            &run_id,
+            Some(provider),
+        )?;
+        Some((server, physical_debug))
+    })();
     run_prepared_kvm_pool_with_debug(
         machine,
         root_context,
         dispatcher,
         max_traps,
-        None,
+        debug_server,
         #[cfg(feature = "kvm-pool-test-control")]
         None,
         None,
