@@ -47,3 +47,9 @@ test = "carrick_el1_linux::native_process_runtime::host_test_support::x86_native
 reason = "#2273: native exec completion now claims the x86 fork child for service instead of only staging it; root exec remains refused."
 replaced_by = "carrick_el1_linux::native_process_runtime::host_test_support::x86_native_exec_completion_claims_the_fork_child_and_refuses_the_root"
 pr = 2273
+
+[[retired]]
+test = "carrick_el1_linux::aarch64_process_tests::arm_two_live_threads_robust_exit_routes_host_custody_without_abort"
+reason = "#2109: a registered robust list is no longer a reason for a non-last thread's raw exit to leave the ring (no lane walks the list, and a ring-born thread has no host task to take the exit), so the host-custody witness became a witness that the exit retires in ring."
+replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_two_live_threads_robust_exit_retires_in_ring"
+pr = 2182
