@@ -5166,12 +5166,12 @@ fn birth_reserved_by_sibling<E>(
     error: &super::process_owner::GuestProcessError<E>,
     caller: TaskKey,
 ) -> bool {
-    matches!(
-        error,
+    match error {
         super::process_owner::GuestProcessError::Reservation(
             carrick_sched_core::process::exit::TaskSetError::Busy(task),
-        ) if *task == caller.id
-    )
+        ) => *task == caller.id,
+        _ => false,
+    }
 }
 /// One step of a child wait refused by a sibling's birth reservation.
 enum ContendedWait {
