@@ -53,3 +53,9 @@ test = "carrick_el1_linux::native_fork_refusal::tests::parent_gate_refusal_prese
 reason = "#2306: contention at the parent gate now parks via NativeContention instead of returning an errno, so the Busy-policy errno witness was replaced by one that asserts the observed state is preserved as contention."
 replaced_by = "carrick_el1_linux::native_fork_refusal::tests::parent_gate_refusal_preserves_observed_state_as_contention"
 pr = 2353
+
+[[retired]]
+test = "carrick_el1_linux::aarch64_process_tests::arm_raw_exit_decline_after_membership_reservation_restores_live"
+reason = "#2359: a refused clear-tid copy-out on raw exit is now \"not now\" (the exit restores membership and reruns in ring through the owner-input wait) instead of declining to HostCustody, so the decline witness was renamed for the refused-copy contract it now asserts (8787221ef)."
+replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_raw_exit_refused_copy_after_membership_reservation_restores_live"
+pr = 2367
