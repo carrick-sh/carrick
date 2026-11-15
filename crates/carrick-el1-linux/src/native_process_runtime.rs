@@ -1467,6 +1467,9 @@ enum ContinuationPark {
 enum PendingChildContinuation {
     Wait(PendingWait),
     Vfork(PendingVfork),
+    /// A fork parked on a sibling's birth reservation release. Its owned
+    /// operation is the saved clone SVC itself, which reruns on resume.
+    Fork,
 }
 
 enum PendingContinuation {
@@ -5156,6 +5159,20 @@ fn wait_reserved_by_sibling_birth<E>(
         ) if *task == caller.id
     )
 }
+/// Whether a birth reservation refused only because a sibling's in-flight
+/// birth already holds `caller`'s own task: its owner publishes the caller's
+/// channel after release (`fork_owned`).
+fn birth_reserved_by_sibling<E>(
+    error: &super::process_owner::GuestProcessError<E>,
+    caller: TaskKey,
+) -> bool {
+    matches!(
+        error,
+        super::process_owner::GuestProcessError::Reservation(
+            carrick_sched_core::process::exit::TaskSetError::Busy(task),
+        ) if *task == caller.id
+    )
+}
 /// One step of a child wait refused by a sibling's birth reservation.
 enum ContendedWait {
     Rescan,
@@ -5751,6 +5768,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }),
         })
     }
+    /// A sibling's in-flight birth holds this process's topology reservation.
+    /// Keep the clone owned: park on the process channel that the birth
+    /// owner publishes after its release (`fork_owned`), then rerun the
+    /// exact SVC. `None` means the release already published: rerun now.
+    /// Linux serializes forks on its own locks and never fails one for
+    /// this, so a signal does not interrupt the short park either.
+    #[inline(never)]
+    fn park_contended_fork(
+        &mut self,
+        observed: TaskWakeGeneration,
+    ) -> Result<Option<LifecycleOutcome>, NativeFailure> {
+        let channel = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeFailure::Stale)?
+            .native()
+            .resources()
+            .channel
+            .clone()
+            .ok_or(NativeFailure::Stale)?;
+        match self.park_continuation(&channel, observed, PendingChildContinuation::Fork)? {
+            ContinuationPark::Rescan => Ok(None),
+            ContinuationPark::Parked => Ok(Some(LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            })),
+            ContinuationPark::Interrupted => Err(NativeFailure::Stale),
+        }
+    }
     /// Suspend a vfork(2) parent after its child is published (clone(2):
     /// "the calling process is suspended until the child releases its
     /// virtual memory resources, i.e., until the child calls execve or
@@ -6313,6 +6362,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         Err(error) => self.fail(error),
                     })
                 }
+                // A contended fork's owned operation is its saved clone SVC:
+                // the execution lane re-enters it with every argument.
+                PendingChildContinuation::Fork => Some(LifecycleOutcome::Redispatch),
             };
         }
         let pending = {
@@ -6374,7 +6426,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeFailure::Stale);
             }
         }
-        if self.signal_interrupts_current() {
+        if !matches!(continuation, PendingChildContinuation::Fork)
+            && self.signal_interrupts_current()
+        {
             // The clone already succeeded: a vfork parent is never restarted.
             if matches!(continuation, PendingChildContinuation::Vfork(_)) {
                 return Ok(ContinuationPark::Interrupted);
@@ -7363,6 +7417,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 resumed => Ok(resumed),
             },
             Some(LifecycleOutcome::Returned { result, .. }) => Ok(NativeResume::Returned(result)),
+            // A contended fork reruns its saved clone SVC.
+            Some(LifecycleOutcome::Redispatch) => Ok(syscall_retry),
             Some(LifecycleOutcome::HostCustody) => {
                 // An adopted host member has no pool entry to retire in the
                 // ring. Its cancelled fault has completed, but its exact host
@@ -8364,6 +8420,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     fn fork_owned(&mut self, child_tid: ProcessForkChildTid) -> Result<u32, NativeProcessError> {
         let forked = self.fork_reserved(child_tid);
+        // A fork contended by a sibling's birth reserved nothing, and its
+        // enrolment must survive until that sibling's release publishes it.
+        if super::native_fork_refusal::sibling_birth(&forked).is_some() {
+            return forked;
+        }
         // Every path through the birth has released or rolled back its
         // reservation by now.
         self.release_birth_waiters()?;
@@ -8568,10 +8629,29 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 namespace,
                 claims: vec![(number, ClaimKind::Thread)],
             };
-            let permit = graph
-                .owner
-                .reserve_birth(snapshot, snapshot, transaction)
-                .map_err(|_| busy(NativeForkStage::BirthReservation))?;
+            let permit = match graph.owner.reserve_birth(snapshot, snapshot, transaction) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let channel = graph
+                        .owner
+                        .task(self.key)
+                        .ok()
+                        .and_then(|row| row.native().resources().channel.clone());
+                    return Err(match channel {
+                        // A sibling's birth holds this process's reservation
+                        // (#2095's contention, met by a second fork). Enrol
+                        // on its release under the guard that observed it.
+                        Some(channel) if birth_reserved_by_sibling(&error, self.key) => {
+                            graph.birth_waiters.insert(self.key);
+                            super::native_fork_refusal::contended(
+                                NativeForkStage::BirthReservation,
+                                channel.generation.generation(),
+                            )
+                        }
+                        _ => busy(NativeForkStage::BirthReservation),
+                    });
+                }
+            };
             (
                 snapshot,
                 permit,
@@ -9518,7 +9598,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             child_tid.parent = ProcessForkParent::Runs;
         }
         let pid = loop {
-            let error = match self.fork_owned(child_tid) {
+            let forked = self.fork_owned(child_tid);
+            // A sibling's birth holds the reservation and this fork enrolled
+            // on its release: park on that release, not on carrier work.
+            if let Some(observed) = super::native_fork_refusal::sibling_birth(&forked) {
+                match self.park_contended_fork(observed) {
+                    // The release already published: rerun at once.
+                    Ok(None) => continue,
+                    Ok(Some(outcome)) => return outcome,
+                    Err(failure) => return self.fail(failure),
+                }
+            }
+            let error = match forked {
                 Ok(pid) => break pid,
                 Err(error) => super::native_fork_refusal::observe_process_error(error),
             };
