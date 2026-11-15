@@ -1872,3 +1872,46 @@ fn stream_shutdown_drops_only_the_references_an_end_still_holds() {
         assert!(matches!(released, IpcReleased::Object { freed: f, .. } if f == freed));
     }
 }
+
+/// #2361: a close drops the same lane references as a full shutdown. Both
+/// ends shut both directions, then one closes: the pair lives on for the
+/// other end's description (its reads are EOF, it polls HUP) until that
+/// end closes too.
+#[test]
+fn stream_pair_outlives_a_close_after_both_ends_shut_everything() {
+    use epoll::{EpollMember, events};
+    let fx = fixture(1 << 22);
+    let object = fx.region.create_stream(&Spin).unwrap();
+    for end in [StreamEnd::First, StreamEnd::Second] {
+        fx.region
+            .shutdown_stream(object, end, true, true, &Spin)
+            .unwrap();
+    }
+    let first = IpcBacking::Stream {
+        object,
+        end: StreamEnd::First,
+    }
+    .encode();
+    let released = fx.region.release_backing(first, &Spin).unwrap();
+    assert!(matches!(released, IpcReleased::Object { freed: false, .. }));
+    {
+        let mut g = fx.region.lock(object, &Spin).expect("the second end lives");
+        assert!(g.stream_end_closed(StreamEnd::First).unwrap());
+        assert!(!g.stream_end_closed(StreamEnd::Second).unwrap());
+        assert_ne!(
+            g.member_level(EpollMember::StreamSecond).unwrap() & events::HUP,
+            0
+        );
+    }
+    let second = IpcBacking::Stream {
+        object,
+        end: StreamEnd::Second,
+    }
+    .encode();
+    let released = fx.region.release_backing(second, &Spin).unwrap();
+    assert!(matches!(released, IpcReleased::Object { freed: true, .. }));
+    assert!(matches!(
+        fx.region.lock(object, &Spin),
+        Err(IpcError::Stale)
+    ));
+}

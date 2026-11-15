@@ -833,10 +833,12 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
     let object = IpcObjectHandle::from_raw(op.object);
     let nonblock = {
         let pin = OfdPin::from_raw(op.pin);
-        let flags = region
-            .fd(HostIpcWait)
-            .pinned(&pin)
-            .map(|d| d.flags.nonblock);
+        let flags = region.fd(HostIpcWait).pinned(&pin).map(|d| {
+            d.flags.nonblock
+                || op
+                    .call
+                    .contains(carrick_el1_abi::ipc::IpcCallFlags::DONT_WAIT)
+        });
         op.pin = pin.into_raw();
         flags.map_err(IpcError::Fd)?
     };
@@ -1025,7 +1027,9 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
                 } else {
                     errno(LINUX_EPIPE)
                 },
-                sigpipe: true,
+                sigpipe: !op
+                    .call
+                    .contains(carrick_el1_abi::ipc::IpcCallFlags::NO_SIGNAL),
             });
         }
         StepStatus::Fault if written > 0 && op.kind.reads_bytes() => written,
