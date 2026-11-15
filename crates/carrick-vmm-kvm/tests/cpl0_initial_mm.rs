@@ -4641,3 +4641,114 @@ fn serial_host_direct_output_venues_supply_untouched_pages() {
         },
     );
 }
+
+/// DIAGNOSTIC ONLY (#2367 round 4): the sibling raw-exit barrier with a
+/// manual join (no CLONE_CHILD_CLEARTID), so no exit reaches a clear-tid copy-out.
+#[test]
+fn diag_sibling_raw_exits_manual_join() {
+    let elf = native_exit_fixture_with_flags("native_sibling_manual_join.S", &["-DMANUAL_JOIN"]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
+        .expect("sibling raw exits retire in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
+/// DIAGNOSTIC ONLY (#2367 round 4): the same manual join on either CPU.
+#[test]
+fn diag_sibling_raw_exits_manual_join_any_cpu() {
+    let elf = native_exit_fixture_with_flags("native_sibling_manual_join.S", &["-DMANUAL_JOIN"]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, 3)
+        .expect("sibling raw exits retire in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
+/// #2359 round 4: a thread clone's `CLONE_PARENT_SETTID` copy-out refused
+/// Busy once (`INJECT_OWNED_COPY_BUSY_ONCE`) is "not now": the clone keeps its
+/// call and reruns in ring, and the parent sees the child's tid in its word.
+/// Before, the refusal returned EFAULT (exit 114) from a clone that had
+/// created no thread, and a joiner of that thread waited forever.
+#[test]
+fn production_clone_parent_tid_busy_once_reruns_in_ring() {
+    let oracle = native_exit_fixture("native_clone_parent_tid_busy.S");
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let path = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&path, &oracle, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&path)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "native Linux oracle: {:?}",
+        native.status
+    );
+    let elf = native_exit_fixture_with_flags("native_clone_parent_tid_busy.S", &["-DINJECT"]);
+    // The injection hooks live only in the test-support image.
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .expect("a Busy parent-tid copy-out reruns the clone in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
+/// DIAGNOSTIC ONLY (#2367 round 4): manual join on either CPU, clone failure exits 100 + errno.
+#[test]
+fn diag_manual_join_check_clone_any_cpu() {
+    let elf = native_exit_fixture_with_flags(
+        "native_sibling_manual_join.S",
+        &["-DMANUAL_JOIN", "-DCHECK_CLONE"],
+    );
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, 3)
+        .expect("sibling raw exits retire in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
+/// DIAGNOSTIC ONLY (#2367 round 4): manual join on CPU 0, clone failure exits 100 + errno.
+#[test]
+fn diag_manual_join_check_clone_loaded() {
+    let elf = native_exit_fixture_with_flags(
+        "native_sibling_manual_join.S",
+        &["-DMANUAL_JOIN", "-DCHECK_CLONE"],
+    );
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
+        .expect("sibling raw exits retire in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
+/// DIAGNOSTIC ONLY (#2367 round 4): the lone clone fixture with no injection.
+#[test]
+fn diag_clone_parent_tid_no_inject() {
+    let elf = native_exit_fixture("native_clone_parent_tid_busy.S");
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .expect("a lone clone and raw exit retire in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
