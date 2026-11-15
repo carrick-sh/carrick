@@ -5218,6 +5218,16 @@ fn fork_while_sibling_holds_birth_reservation(vfork: bool) {
         // SAFETY: the harness leaks its fixture for the life of the test.
         let fixture: &'static Fixture = unsafe { &*(fixture_address as *const Fixture) };
         let mut clone = sibling_clone();
+        // The vector saves the trapped SVC frame as B's words, which its
+        // park retains for the rerun.
+        // SAFETY: B is vCPU 1's current record; this lane owns its context.
+        let words = unsafe { fixture.zone.record(sibling).ctx_mut() };
+        crate::sched::ThreadCpu::save(
+            &mut second.cpu,
+            &clone,
+            words,
+            crate::sched::CpuExitCause::Svc,
+        );
         second.call_current(fixture, &mut clone);
         let parked = matches!(
             fixture.zone.record(sibling).claim(),
@@ -5251,37 +5261,46 @@ fn fork_while_sibling_holds_birth_reservation(vfork: bool) {
     );
 
     // A's release woke B. It resumes at its exact SVC with every argument.
-    let spare: Vec<RootGpa> = core::mem::take(
-        &mut *harness
-            .dispatch_service
-            .crossing
-            .grant_tables
-            .lock()
-            .unwrap(),
-    );
-    *second
-        .dispatch_service
-        .crossing
-        .grant_tables
-        .lock()
-        .unwrap() = spare;
-    if fixture.zone.slot(second.slot).queued() == 0 {
-        // Woken onto vCPU 0's queue: vCPU 1 steals it, as an idle vCPU does.
-        assert!(fixture.zone.slot(slot0).queued() > 0, "B was never woken");
-    }
     let mut resumed = carrick_el1_abi::TrapFrame::default();
-    loop {
+    let woken_on_second = fixture.zone.slot(second.slot).queued() > 0;
+    if woken_on_second {
         assert_eq!(
             second.switch_next(fixture, &mut resumed),
             carrick_el1_abi::Action::Served
         );
-        let now = fixture.zone.slot(second.slot).current().unwrap();
-        if now == sibling {
-            break;
+        assert_eq!(fixture.zone.slot(second.slot).current(), Some(sibling));
+        // The rerun forks through vCPU 1's services: hand them the spare
+        // loan stock that A's crossing left.
+        let spare: Vec<RootGpa> = core::mem::take(
+            &mut *harness
+                .dispatch_service
+                .crossing
+                .grant_tables
+                .lock()
+                .unwrap(),
+        );
+        *second
+            .dispatch_service
+            .crossing
+            .grant_tables
+            .lock()
+            .unwrap() = spare;
+    } else {
+        let current = fixture.zone.slot(slot0).current().unwrap();
+        if current != sibling {
+            assert!(fixture.zone.requeue_preempted(slot0, current).is_queued());
+            loop {
+                assert_eq!(
+                    harness.switch_next(&mut cpu, &mut resumed),
+                    carrick_el1_abi::Action::Served
+                );
+                let now = fixture.zone.slot(slot0).current().unwrap();
+                if now == sibling {
+                    break;
+                }
+                assert!(fixture.zone.requeue_preempted(slot0, now).is_queued());
+            }
         }
-        assert!(fixture.zone.requeue_preempted(second.slot, now).is_queued());
-        // Hand the other runnable record back to vCPU 0.
-        let _ = fixture.zone.slot(second.slot).current();
     }
     let expected = sibling_clone();
     assert_eq!(resumed.elr, 0x40_0004, "B re-enters its clone SVC");
@@ -5291,7 +5310,11 @@ fn fork_while_sibling_holds_birth_reservation(vfork: bool) {
 
     // The rerun SVC forks.
     resumed.elr = 0x40_0008;
-    second.call_current(fixture, &mut resumed);
+    if woken_on_second {
+        second.call_current(fixture, &mut resumed);
+    } else {
+        harness.call_current(&mut resumed, &mut cpu);
+    }
     if vfork {
         assert!(
             matches!(
