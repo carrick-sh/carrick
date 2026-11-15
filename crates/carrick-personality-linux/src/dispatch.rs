@@ -741,6 +741,10 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         nr if nr == crate::crossing::nr::READLINKAT.raw() => Family::NativeHostFile,
         63 | 65 => Family::Read,
         64 | 66 => Family::Write,
+        // A ring stream end's datagram-less send and receive are its write
+        // and read (#2361); a host socket's decline crosses as before.
+        nr if nr == crate::crossing::nr::RECVFROM.raw() => Family::Read,
+        nr if nr == crate::crossing::nr::SENDTO.raw() => Family::Write,
         20 | 21 => Family::Descriptor,
         22 | 441 => Family::EpollWait,
         62 => Family::FileSeek,
@@ -1404,6 +1408,33 @@ pub const fn descriptor_ordinal(ordinal: CanonicalNr) -> bool {
             | nr::EPOLL_CTL
             | nr::PIPE2
             | nr::EVENTFD2
+            | nr::SOCKETPAIR
+    ) || stream_socket_ordinal(ordinal)
+}
+
+/// The socket calls a ring stream pair's end answers in ring (#2361): its
+/// metadata, shutdown and options, and an explicit refusal for what a
+/// connected pair cannot do or the ring does not carry yet. The ring
+/// serves them only on a ring stream end; any other descriptor keeps its
+/// crossing.
+pub const fn stream_socket_ordinal(ordinal: CanonicalNr) -> bool {
+    use crate::crossing::nr;
+    matches!(
+        owner_ordinal(ordinal),
+        nr::BIND
+            | nr::LISTEN
+            | nr::ACCEPT
+            | nr::ACCEPT4
+            | nr::CONNECT
+            | nr::GETSOCKNAME
+            | nr::GETPEERNAME
+            | nr::SETSOCKOPT
+            | nr::GETSOCKOPT
+            | nr::SHUTDOWN
+            | nr::SENDMSG
+            | nr::RECVMSG
+            | nr::SENDMMSG
+            | nr::RECVMMSG
     )
 }
 
@@ -1900,12 +1931,11 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         return finish(ordinal, original_argument0, result, pending, completion);
     }
     // File fallback follows the IPC authority's explicit decline, never a
-    // retained operation's handback or completion.
+    // retained operation's handback or completion. Only the scalar calls
+    // have one: a socket's send or receive is no file write or read.
     result = match family {
-        Family::Read if ordinal != crate::crossing::nr::READV.raw() => pending.file_read().into(),
-        Family::Write if ordinal != crate::crossing::nr::WRITEV.raw() => {
-            pending.file_write().into()
-        }
+        Family::Read if ordinal == crate::crossing::nr::READ.raw() => pending.file_read().into(),
+        Family::Write if ordinal == crate::crossing::nr::WRITE.raw() => pending.file_write().into(),
         _ => result,
     };
     finish(ordinal, original_argument0, result, pending, completion)
