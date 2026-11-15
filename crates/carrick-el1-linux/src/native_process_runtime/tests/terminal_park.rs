@@ -839,11 +839,12 @@ fn closing_interrupt_hands_a_loaded_members_home_record_to_its_host() {
          host_record={:?}",
         fixture.zone.slot(sibling.slot).host_record()
     );
-    // Its host owner retires it: the record is handed back live, not freed.
-    assert!(fixture.zone.live(sibling.record).is_some());
-    assert!(matches!(
-        fixture.zone.record(sibling.record.id).claim(),
-        carrick_sched_core::Claim::Host { .. }
-    ));
+    // Its host owner retires it: the live record is handed back to the
+    // executor that still holds the thread, not freed in the ring.
+    assert_eq!(
+        fixture.zone.take_service_head(sibling.slot),
+        Some(sibling.record),
+        "the home record waits for its own executor"
+    );
     assert_eq!(fixture.page.live(), 1, "only the owner's unit was consumed");
 }

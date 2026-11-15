@@ -6954,7 +6954,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_core::terminal::Live,
         >::admitted(identity)
         .begin();
-        let Some(entry) = entry else {
+        // A home record switched back in on its own slot is the thread of the
+        // host job still loaded on this vCPU (#2374). Retiring it here would
+        // leave that job's vCPU on the maintenance root with no host record,
+        // and the job would go on serving its in-flight call over ASID 0. Its
+        // executor retires it, exactly as an entryless member.
+        let lane = self.source.zone.slot(self.source.slot);
+        let loaded_home =
+            lane.current() == Some(self.record.id) && lane.host_record() == Some(self.record.id);
+        let Some(entry) = entry.filter(|_| !loaded_home) else {
             if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
                 return Err(NativeProcessError::Stale);
             }
