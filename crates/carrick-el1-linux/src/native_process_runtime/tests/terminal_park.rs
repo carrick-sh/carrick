@@ -731,10 +731,8 @@ fn refused_losing_exit_after_vacate_leaves_no_installed_space() {
 /// zone save names ASID 0 and the reload is refused ("HVPatch task projection
 /// ASID 1 does not match CPU TTBR pair 0x2d001f8000/0x2d001f8000").
 ///
-/// Model of the host's save, from what the ring leaves: while the home record
-/// is the slot's host record, settlement rewrites the job's roots from its own
-/// stage-1 lease; once the ring cleared it, the job keeps the live roots,
-/// which name the maintenance root (ASID 0) if the ring vacated them.
+/// The host's save is [`host_saved_ttbr_pair`], checked by the load
+/// preflight's predicate ([`preflight_task_projection`]).
 ///
 /// The owner is shared: the witness runs on the x86 CPL0 context and MMU and
 /// on the AArch64 context and MMU.
@@ -760,8 +758,6 @@ fn closing_interrupt_home_record_for<
 ) {
     use super::super::PendingCloseOperation;
     use carrick_sched_core::object_wait::OwnerEntry;
-    const PROCESS_ASID: u16 = 1;
-    const MAINTENANCE_ASID: u16 = 0;
     const FUTEX: u64 = 0x7000;
     let fixture = super::native_exec_fixture_for::<C, B>(make_words);
     let _ = super::super::host_test_support::take_terminal_vacates();
@@ -849,18 +845,17 @@ fn closing_interrupt_home_record_for<
     assert_eq!(resumed, "left", "the member leaves the ring");
 
     let vacated = super::super::host_test_support::take_terminal_vacates() != 0;
-    let host_settles_own_roots =
-        fixture.zone.slot(sibling.slot).host_record() == Some(sibling.record.id);
-    let saved_asid = if host_settles_own_roots || !vacated {
-        PROCESS_ASID
-    } else {
-        MAINTENANCE_ASID
-    };
+    let saved = host_saved_ttbr_pair(
+        fixture.zone,
+        sibling.slot,
+        sibling.record.id,
+        vacated,
+        fixture.address,
+    );
     assert_eq!(
-        saved_asid,
-        PROCESS_ASID,
-        "the host job saves this thread over the maintenance root: vacated={vacated} \
-         host_record={:?}",
+        preflight_task_projection(saved, fixture.address),
+        Ok(()),
+        "vacated={vacated} host_record={:?}",
         fixture.zone.slot(sibling.slot).host_record()
     );
     // Its host owner retires it: the live record is handed back to the
@@ -871,4 +866,215 @@ fn closing_interrupt_home_record_for<
         "the home record waits for its own executor"
     );
     assert_eq!(fixture.page.live(), 1, "only the owner's unit was consumed");
+}
+
+/// #2374, the running member's route: the closing group's pair of futex
+/// handoff threads (`el1_sched_exit_group_with_parked_threads`, tids 2/3)
+/// keeps returning from ring-served futex calls. A host-loaded member running
+/// directly on its executor's vCPU has no record switched in; its call runs on
+/// the fresh home record the ring allocated for it (`current == None`,
+/// `host_record == record`). At that call's return the closing request is
+/// owed (`resume_terminal_user_return`). Retiring that home record in the
+/// ring vacates the vCPU to the maintenance root and releases the home
+/// (`release_host_home`), so the host reconciles `(None, None)` over a
+/// vacated slot, accepts it under the exit request, and the job's next save
+/// names ASID 0 ("HVPatch task projection ASID 2 does not match CPU TTBR pair
+/// 0x2d001f8000/0x2d001f8000"). As for an entryless member, the host job owns
+/// that thread: it returns with host work owed and keeps its own roots.
+///
+/// Driven through the production syscall-return checkpoint both ISAs call
+/// (`deliver_signal_on_syscall_return`), on the x86 CPL0 context and MMU and
+/// on the AArch64 context and MMU.
+#[cfg(test)]
+#[test]
+fn closing_user_return_keeps_a_running_members_home_for_its_host() {
+    closing_user_return_home_for::<
+        carrick_sched_core::ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+    closing_user_return_home_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(super::arm_words);
+}
+
+#[cfg(test)]
+fn closing_user_return_home_for<
+    C: carrick_guest_arch::ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(super::super::AddressContext<super::super::RootGpa>) -> C,
+) {
+    use super::super::PendingCloseOperation;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_sched_core::object_wait::OwnerEntry;
+    let fixture = super::native_exec_fixture_for::<C, B>(make_words);
+    let _ = super::super::host_test_support::take_terminal_vacates();
+    let sibling = add_service_sibling(&fixture, None);
+    assert_eq!(fixture.page.live(), 2);
+    assert!(sibling.control.entry().is_some(), "a ring-born member");
+    // Host-loaded and running: its ring-served call holds its home record,
+    // with nothing switched in.
+    assert_eq!(fixture.zone.slot(sibling.slot).current(), None);
+    assert_eq!(
+        fixture.zone.slot(sibling.slot).host_record(),
+        Some(sibling.record.id)
+    );
+
+    let saved = make_words(fixture.address);
+    let mut service = fixture.service();
+    let mut owner = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    owner
+        .begin_closing(PendingCloseOperation::Exit {
+            status: LinuxWaitStatus::exited(0),
+            entry: OwnerEntry::Syscall,
+        })
+        .unwrap();
+    assert_eq!(owner.take_run_failure(), None);
+    drop(owner);
+    assert!(sibling.control.host_exit_requested());
+
+    let mut sibling_service = fixture.service();
+    let mut member = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling.slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let route = crate::signal_delivery::deliver_signal_on_syscall_return(
+        sibling.task,
+        sibling.control,
+        &mut member,
+        &mut frame,
+        zerocopy::IntoBytes::as_bytes(&fp),
+        &mut TerminalReturnMachine(super::HostArmBackend),
+    );
+    let run_failure = member.take_run_failure();
+    drop(member);
+    assert_eq!(run_failure, None, "{route:?}");
+
+    let vacated = super::super::host_test_support::take_terminal_vacates() != 0;
+    let saved = host_saved_ttbr_pair(
+        fixture.zone,
+        sibling.slot,
+        sibling.record.id,
+        vacated,
+        fixture.address,
+    );
+    assert_eq!(
+        preflight_task_projection(saved, fixture.address),
+        Ok(()),
+        "route={route:?} vacated={vacated} host_record={:?}",
+        fixture.zone.slot(sibling.slot).host_record()
+    );
+    // It returns to user with its executor's host work owed; the ring
+    // retired nothing of it.
+    assert_eq!(route, Some(CompletionRoute::Served));
+    assert!(sibling.task.linux.has_pending_host_work());
+    assert_eq!(fixture.page.live(), 1, "only the owner's unit was consumed");
+}
+
+/// The process ASID the stage-1 lease of the fixture's address space names.
+#[cfg(test)]
+const PROCESS_ASID: u16 = 1;
+/// The carrier maintenance root of the signed #2374 failures (ASID 0).
+#[cfg(test)]
+const MAINTENANCE_TTBR: u64 = 0x2d_001f_8000;
+
+#[cfg(test)]
+fn process_ttbr(address: super::super::AddressContext<super::super::RootGpa>) -> u64 {
+    (u64::from(PROCESS_ASID) << 48) | address.root.address().raw()
+}
+
+/// The TTBR pair the host executor saves for the job loaded on `slot` once
+/// the ring returns, by `reconcile_zone_exit`'s rule (carrick-runtime
+/// `vcpu_loop/zone.rs`): while the slot's host record names the job's thread,
+/// it settles against its own stage-1 lease (`with_own_roots`); with no host
+/// record left the exit is the job's own, and an ordinary save (the lazy
+/// `Resident` flush, a zone-park snapshot) takes the vCPU's live roots, the
+/// maintenance root if the ring vacated them.
+#[cfg(test)]
+fn host_saved_ttbr_pair<C: carrick_guest_arch::ProcessContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
+    slot: carrick_el1_abi::SlotId,
+    record: carrick_sched_core::RecordId,
+    vacated: bool,
+    address: super::super::AddressContext<super::super::RootGpa>,
+) -> (u64, u64) {
+    if zone.slot(slot).host_record() == Some(record) || !vacated {
+        (process_ttbr(address), process_ttbr(address))
+    } else {
+        (MAINTENANCE_TTBR, MAINTENANCE_TTBR)
+    }
+}
+
+/// The load preflight's predicate (`validate_task_only_runtime_projection`,
+/// carrick-vmm-hvf): one root for both halves, tagged with the process ASID,
+/// and the process's own root.
+#[cfg(test)]
+fn preflight_task_projection(
+    (ttbr0, ttbr1): (u64, u64),
+    address: super::super::AddressContext<super::super::RootGpa>,
+) -> Result<(), String> {
+    const ROOT_MASK: u64 = (1 << 48) - 1;
+    if ttbr0 != ttbr1 || (ttbr0 >> 48) as u16 != PROCESS_ASID {
+        return Err(format!(
+            "HVPatch task projection ASID {PROCESS_ASID} does not match CPU TTBR pair \
+             0x{ttbr0:x}/0x{ttbr1:x}"
+        ));
+    }
+    if ttbr0 & ROOT_MASK != address.root.address().raw() {
+        return Err(format!(
+            "projection root does not match CPU TTBR 0x{ttbr0:x}"
+        ));
+    }
+    Ok(())
+}
+
+/// The syscall-return checkpoint's ISA half; the closing request is taken
+/// before any of it runs.
+#[cfg(test)]
+struct TerminalReturnMachine(super::HostArmBackend);
+
+#[cfg(test)]
+impl<C> crate::signal_delivery::SignalMachine<C> for TerminalReturnMachine {
+    type Backend = super::HostArmBackend;
+    fn backend(&mut self) -> &mut Self::Backend {
+        &mut self.0
+    }
+    fn user_sp(&self, _: &carrick_el1_abi::TrapFrame) -> carrick_guest_arch::UserVa {
+        carrick_guest_arch::UserVa::new(0x40_0000)
+    }
+    fn restart(&self, _: &mut carrick_el1_abi::TrapFrame, _: &C) -> bool {
+        false
+    }
+    fn group_exit_custody(
+        &self,
+        _: &carrick_el1_abi::CurrentTask,
+    ) -> carrick_personality_linux::dispatch::CompletionRoute {
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    }
 }
