@@ -6955,17 +6955,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_core::terminal::Live,
         >::admitted(identity)
         .begin();
-        // A home record switched back in on its own slot with only the close
-        // request pending (no owned continuation) is the thread of the host
-        // job still loaded on this vCPU (#2374). Retiring it here would leave
-        // that job's vCPU on the maintenance root with no host record, and the
-        // job would go on running over ASID 0. Its executor retires it,
-        // exactly as an entryless member. An owned continuation (a cancelled
-        // service, an exec loser) keeps its in-ring terminal checkpoint.
+        // A home record with only the close request pending (no owned
+        // continuation) is the thread of the host job still loaded on this
+        // vCPU (#2374): switched back in on its own slot, or running there
+        // with nothing switched in (a ring-served call of the loaded thread).
+        // Retiring it here would leave that job's vCPU on the maintenance
+        // root with no host record, and the job would go on running over
+        // ASID 0. Its executor retires it, exactly as an entryless member. An
+        // owned continuation (a cancelled service, an exec loser) keeps its
+        // in-ring terminal checkpoint.
         let lane = self.source.zone.slot(self.source.slot);
         let loaded_home = requested_only
-            && lane.current() == Some(self.record.id)
-            && lane.host_record() == Some(self.record.id);
+            && lane.host_record() == Some(self.record.id)
+            && lane
+                .current()
+                .is_none_or(|current| current == self.record.id);
         let Some(entry) = entry.filter(|_| !loaded_home) else {
             if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
                 return Err(NativeProcessError::Stale);

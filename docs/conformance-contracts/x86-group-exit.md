@@ -37,10 +37,13 @@ in an EL1 wait. That record is selected again on its home slot while its host
 job is still loaded on the vCPU, so it is not the ring's to retire (#2374):
 retiring it vacated the vCPU and cleared the slot's host record, and the job
 then served its in-flight call over the maintenance root and saved ASID-0
-roots that the next load refused. `retire_closing_member` routes such a
-switched-in home record to its host, as it does an entryless member: the
-record is yielded back to its executor (`Handback::Control`), which retires
-the thread with its own translation.
+roots that the next load refused. The same holds for a host-loaded member running on
+its executor's vCPU, with nothing switched in, whose ring-served call returns
+after the close: its call runs on the fresh home record the ring allocated
+for it. `retire_closing_member` routes either home record to its host, as it
+does an entryless member. A switched-in record is yielded back to its executor
+(`Handback::Control`); a running member returns with its executor's host work
+owed. The host retires the thread with its own translation.
 
 The KVM `cpl0_group_exit` binding forks a child with two live members. Its worker
 waits on a private futex, repeatedly calls `sched_yield`, or computes without
