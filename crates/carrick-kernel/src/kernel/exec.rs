@@ -335,7 +335,6 @@ impl Kernel {
             issued,
             failpoint,
             transaction,
-            context.revision,
         )?;
         Ok((prepared, context))
     }
@@ -372,7 +371,7 @@ impl Kernel {
             return Err(ExecError::ForeignContext);
         }
         let transaction = self.object_ids().transaction_id()?;
-        let revision = {
+        {
             let mut state = self.registry().settled().write();
             let record = state
                 .tasks
@@ -390,7 +389,6 @@ impl Kernel {
             {
                 return Err(ExecError::ForeignContext);
             }
-            let revision = record.revision;
             if state.reservations.contains_key(&context.task.key().id) {
                 return Err(ExecError::TaskBusy);
             }
@@ -398,8 +396,7 @@ impl Kernel {
                 context.task.key().id,
                 TaskGraphReservation::exclusive(transaction),
             );
-            revision
-        };
+        }
         self.prepare_exec_after_reservation(
             context,
             backend,
@@ -407,7 +404,6 @@ impl Kernel {
             issued,
             failpoint,
             transaction,
-            revision,
         )
     }
 
@@ -419,7 +415,6 @@ impl Kernel {
         issued: IssuedExecMm,
         failpoint: Option<KernelFailpoint>,
         transaction: KernelTransactionId,
-        _revision: TaskRevision,
     ) -> Result<PreparedExec, ExecError> {
         let reservation = ExecReservation {
             kernel: self.clone(),
