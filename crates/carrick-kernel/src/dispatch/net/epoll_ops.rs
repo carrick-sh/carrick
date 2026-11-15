@@ -496,52 +496,105 @@ impl<'a> NetView<'a> {
     /// live only in the root's published table, and the host has no
     /// description for the item's host half (`kernel.el1.epoll-zone`). EL1
     /// forwards `epoll_ctl` exactly when a member is host-backed (a socket),
-    /// so here the host takes the record: one description over it, holding
-    /// the ring's OFD, installed at `epfd` and published as a host-backed
-    /// hold. From then on the root's calls on `epfd` (waits, close, dup) all
-    /// reach this one owner, as the root's other host-backed fds do (#1410).
+    /// and a wait once the record has host items, so here the host takes
+    /// the record: one description over it, holding the ring's OFD.
+    ///
+    /// Adoption follows the OFD, not the slot. Every copy of the ring epoll
+    /// in this table (`dup`, `dup3`, `F_DUPFD`, made in ring before the
+    /// first host member) is the same open file description, so the one
+    /// host description is installed at each and published as a host-backed
+    /// hold: the copies share one host interest map and one wake owner, and
+    /// the epoll lives while any of them is open. From then on the root's
+    /// calls on any copy (waits, ctl, close, dup) reach that one owner, as
+    /// the root's other host-backed fds do (#1410). A copy that still names
+    /// the ring OFD (made while an adoption ran) finds the same description
+    /// here, by its record.
+    ///
+    /// A sibling's exact claim on a copy (a host `dup2`/`dup3` onto it, in
+    /// flight) is never this call's errno or wait: that claim replaces the
+    /// slot itself, so this call orders before it and leaves the slot to
+    /// the claim, serving on the record's description.
     fn epoll_open_file(&self, epfd: i32) -> Option<OpenFile> {
+        use carrick_el1_abi::ipc::IpcBacking;
         if let Some(open_file) = self.open_file(epfd) {
             return Some(open_file);
         }
         let files = self.captured_file_table();
-        // The exact claim keeps every other admission off this number
-        // while the ring's description is replaced.
-        let reservation = files.reserve_exact_target(epfd, self.nofile_limit()).ok()?;
+        let _adoption = files.lock_epoll_adoption();
+        // An adoption through another copy installed it here meanwhile.
+        if let Some(open_file) = self.open_file(epfd) {
+            return Some(open_file);
+        }
+        let (ring, copies) = files.ipc_ring_epoll_copies(epfd)?;
         let crate::kernel::RingDescription {
             owner,
             held,
-            backing: carrick_el1_abi::ipc::IpcBacking::Epoll { object },
+            backing: IpcBacking::Epoll { object },
             cloexec,
-        } = files.ipc_ring_description(epfd)?
+        } = ring
         else {
             return None;
         };
-        let fd_flags = if cloexec {
-            crate::linux_abi::LINUX_FD_CLOEXEC
-        } else {
-            0
+        let fd_flags = |cloexec: bool| {
+            if cloexec {
+                crate::linux_abi::LINUX_FD_CLOEXEC
+            } else {
+                0
+            }
         };
-        let description = self
-            .epoll_description(EpollRecord::Adopt {
-                owner,
-                object,
-                lifetime: held,
+        let adopted = files
+            .read_open_files()
+            .values()
+            .find(|slot| {
+                slot.description
+                    .inspect_kind(|open| {
+                        matches!(
+                            open,
+                            OpenDescription::Epoll { zone: Some(zone), .. }
+                                if zone.is_record(&owner, object)
+                        )
+                    })
+                    .unwrap_or(false)
             })
-            .ok()?;
-        let open_file = crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
-            Arc::new(RwLock::new(description)),
-            Arc::new(crate::kernel::DescriptionCommon::new(0)),
-            fd_flags,
-        );
-        // An exact replacement commits the caller's functional reference.
-        let description = Arc::clone(&open_file.description);
-        description.retain_fd_ref();
-        if reservation.commit(open_file).is_err() {
-            description.release_fd_ref();
-            return None;
+            .map(|slot| Arc::clone(&slot.description));
+        let description = match adopted {
+            Some(description) => description,
+            None => {
+                let description = self
+                    .epoll_description(EpollRecord::Adopt {
+                        owner,
+                        object,
+                        lifetime: held,
+                    })
+                    .ok()?;
+                crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
+                    Arc::new(RwLock::new(description)),
+                    Arc::new(crate::kernel::DescriptionCommon::new(0)),
+                    fd_flags(cloexec),
+                )
+                .description
+            }
+        };
+        for copy in copies {
+            // A refused claim is a sibling's: its commit replaces this slot.
+            let Ok(reservation) = files.reserve_exact_target(copy, self.nofile_limit()) else {
+                continue;
+            };
+            // Under the claim, the copy still names this record.
+            let Some(ring) = files.ipc_ring_description(copy).filter(|ring| {
+                matches!(ring.backing, IpcBacking::Epoll { object: named } if named == object)
+            }) else {
+                continue;
+            };
+            // An exact replacement commits the caller's functional reference.
+            description.retain_fd_ref();
+            let open_file = OpenFile::new(Arc::clone(&description), fd_flags(ring.cloexec));
+            if reservation.commit(open_file).is_err() {
+                description.release_fd_ref();
+            }
         }
         self.open_file(epfd)
+            .or_else(|| Some(OpenFile::new(description, fd_flags(cloexec))))
     }
 
     /// A ring-created zone member `fd` names in the caller's published
@@ -5175,6 +5228,12 @@ impl<'a> NetView<'a> {
 
             let files = this.captured_file_table();
             let open_file = files.read_open_files().get(&epfd).cloned();
+            // A run root's ring epoll copy whose record the host holds a
+            // host half for (#1671): EL1 forwards its waits here.
+            let open_file = match open_file {
+                Some(open_file) => Some(open_file),
+                None => this.epoll_open_file(epfd),
+            };
             crate::probes::epoll_lookup(|| {
                 let (slot_generation, file_description_id, lookup_kind) = match &open_file {
                     Some(open_file) => (
@@ -5281,6 +5340,12 @@ impl<'a> NetView<'a> {
             };
             let files = this.captured_file_table();
             let open_file = files.read_open_files().get(&epfd).cloned();
+            // A run root's ring epoll copy whose record the host holds a
+            // host half for (#1671): EL1 forwards its waits here.
+            let open_file = match open_file {
+                Some(open_file) => Some(open_file),
+                None => this.epoll_open_file(epfd),
+            };
             crate::probes::epoll_lookup(|| {
                 let (slot_generation, file_description_id, lookup_kind) = match &open_file {
                     Some(open_file) => (
