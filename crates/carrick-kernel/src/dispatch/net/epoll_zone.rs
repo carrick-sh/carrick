@@ -216,6 +216,12 @@ impl ZoneEpoll {
         Arc::ptr_eq(&self.owner, owner)
     }
 
+    /// Whether this live description is the host half of `object`'s record
+    /// in `owner` (#1671): every copy of a ring epoll shares that one.
+    pub(crate) fn is_record(&self, owner: &Arc<HostIpc>, object: IpcObjectHandle) -> bool {
+        self.belongs_to(owner) && self.object == object && self.lifetime.lock().is_some()
+    }
+
     /// The subscription a description wait queue takes while a parent
     /// epoll or poll waiter is enrolled on it.
     pub(crate) fn queue_subscription(

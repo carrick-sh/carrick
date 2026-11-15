@@ -482,13 +482,48 @@ impl FileTable {
     /// slot's exact OFD, its backing and the slot's close-on-exec. `None`
     /// when the slot is empty, unpublished, or host-backed (the host's own).
     pub(crate) fn ipc_ring_description(&self, number: i32) -> Option<RingDescription> {
-        let (owner, table) = {
-            let ipc = self.ipc.lock();
-            let Some(Ok(binding)) = &*ipc else {
-                return None;
-            };
-            (Arc::clone(&binding.owner), binding.table.id())
+        let (owner, table) = self.ipc_owner_table()?;
+        Self::ring_description_in(owner, table, number).map(|(ring, _)| ring)
+    }
+
+    /// The ring-created epoll a published slot names, and every slot of this
+    /// table naming that same open file description (`number` among them):
+    /// a run root's `dup`, `dup3` and `F_DUPFD` copies made in ring (#1671).
+    /// An epoll record is only ever its one OFD's backing, so the copies are
+    /// the slots whose description has that backing.
+    pub(crate) fn ipc_ring_epoll_copies(&self, number: i32) -> Option<(RingDescription, Vec<i32>)> {
+        let (owner, table) = self.ipc_owner_table()?;
+        let (ring, backing) = Self::ring_description_in(owner, table, number)?;
+        if !matches!(ring.backing, IpcBacking::Epoll { .. }) {
+            return None;
+        }
+        let region = ring.owner.region();
+        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let capacity = authority.backing_capacity(table).ok()?;
+        let copies = (0..capacity)
+            .filter_map(|slot| i32::try_from(slot).ok())
+            .filter(|&slot| {
+                authority
+                    .get(table, fd::Fd(slot))
+                    .is_ok_and(|description| description.backing == backing)
+            })
+            .collect();
+        Some((ring, copies))
+    }
+
+    fn ipc_owner_table(&self) -> Option<(Arc<HostIpc>, fd::TableId)> {
+        let ipc = self.ipc.lock();
+        let Some(Ok(binding)) = &*ipc else {
+            return None;
         };
+        Some((Arc::clone(&binding.owner), binding.table.id()))
+    }
+
+    fn ring_description_in(
+        owner: Arc<HostIpc>,
+        table: fd::TableId,
+        number: i32,
+    ) -> Option<(RingDescription, fd::BackingToken)> {
         let (held, description) = owner.retain_description(table, fd::Fd(number)).ok()?;
         let backing = IpcBacking::decode(description.backing)?;
         if matches!(backing, IpcBacking::Host(_)) {
@@ -499,12 +534,15 @@ impl FileTable {
             .fd(crate::el1_zone::HostLockWait)
             .getfd(table, fd::Fd(number))
             .ok()?;
-        Some(RingDescription {
-            owner,
-            held,
-            backing,
-            cloexec,
-        })
+        Some((
+            RingDescription {
+                owner,
+                held,
+                backing,
+                cloexec,
+            },
+            description.backing,
+        ))
     }
 
     pub(crate) fn ipc_fd_flags(
