@@ -2618,6 +2618,25 @@ fn production_sibling_raw_exits_clear_tid_under_editor_contention() {
     );
 }
 
+/// #2359, the owner-wait branch: each round's first clear-tid copy-out finds
+/// the MM editor held (`INJECT_EDITOR_BUSY_ONCE` holds it until the waiter
+/// parks). The exit enrols on the holder's release, parks, and reruns in
+/// ring once the holder releases; the fixture checks the zone parked at least
+/// once per round (exit 4 otherwise).
+#[test]
+fn production_raw_exit_clear_tid_editor_wait_parks_and_reruns() {
+    let elf = native_exit_fixture_with_flags("native_sibling_raw_exit.S", &["-DEDITOR_BUSY_ONCE"]);
+    // The injection hooks live only in the test-support image.
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .expect("a clear-tid copy-out parks on the editor and reruns in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
 /// #2359, "Busy once, then success": each round's first clear-tid copy-out
 /// is refused Busy once (`INJECT_OWNED_COPY_BUSY_ONCE`). The exit keeps its
 /// owned call and reruns; the fixture checks that every refusal was followed
