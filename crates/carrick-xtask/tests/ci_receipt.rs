@@ -835,12 +835,12 @@ test-signed: FAIL /w/target/release/deps/el1_b-2222222222222222
 
 #[test]
 fn a_not_run_test_is_never_forgiven_behind_an_allowlisted_failure() {
-    // #2355 review: a NOT-RUN row (a missing developer registry here) must fail the el1 step
+    // #2355 review: a NOT-RUN row (a spent budget here) must fail the el1 step
     // even when the only FAILED test is allowlisted and every binary finished.
     let log = "\
 test-signed: running /w/target/release/deps/el1_a-1111111111111111 el1_ (2 test(s), one process each)
 test el1_known_red ... FAILED
-test-signed: NOT-RUN /w/target/release/deps/el1_a-1111111111111111 el1_needs_registry (needs developer registry localhost:5050)
+test-signed: NOT-RUN /w/target/release/deps/el1_a-1111111111111111 el1_needs_registry (binary budget of 30s spent)
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
 test-signed: finished /w/target/release/deps/el1_a-1111111111111111 (2 test(s))
 ";
@@ -852,6 +852,46 @@ test-signed: finished /w/target/release/deps/el1_a-1111111111111111 (2 test(s))
         error
             .unwrap()
             .contains("el1 not-run tests: el1_a::el1_needs_registry")
+    );
+}
+
+#[test]
+fn a_developer_registry_not_run_is_a_started_failure_not_a_gap() {
+    // #2355's merge group (2026-11-15): the gate read the registry NOT-RUN rows as an interrupted
+    // candidate (`step el1-embed interrupted before 2 test(s) ran`, started 96 -> 94) and ejected it.
+    // The row is a typed failure of a test that started: it stays in the population and fails the step.
+    let log = "\
+test-signed: running /w/target/release/deps/el1_a-1111111111111111 el1_ (2 test(s), one process each)
+test el1_runs ... ok
+test-signed: NOT-RUN /w/target/release/deps/el1_a-1111111111111111 el1_needs_registry (needs developer registry localhost:5050)
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test-signed: finished /w/target/release/deps/el1_a-1111111111111111 (2 test(s))
+";
+    let (cmp, passed, error) = evaluate_el1_step(Some(1), log, &[]);
+    assert!(!passed, "a registry NOT-RUN still fails the step");
+    assert!(
+        cmp.unexpected_failures
+            .iter()
+            .any(|t| t.contains("el1_needs_registry")),
+        "{cmp:?} {error:?}"
+    );
+    let parsed = carrick_xtask::accept::parse_test_log(log);
+    assert!(
+        parsed.not_run_tests.is_empty(),
+        "{:?}",
+        parsed.not_run_tests
+    );
+    assert!(
+        parsed
+            .started_tests
+            .iter()
+            .any(|t| t == "el1_a::el1_needs_registry")
+    );
+    assert!(
+        parsed
+            .failed_tests
+            .iter()
+            .any(|t| t == "el1_a::el1_needs_registry")
     );
 }
 
