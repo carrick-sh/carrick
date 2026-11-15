@@ -1,5 +1,6 @@
 //! Level 0 `SoftCpu` execution engine and executable code-buffer management.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::ptr::NonNull;
 
 use carrick_softmmu::{ExtentTable, InventoryTerminal, SoftRequester, SoftSeatError};
@@ -162,6 +163,15 @@ impl Drop for JitCodeBuffer {
     }
 }
 
+const TRANSLATION_CACHE_CAPACITY: usize = 1024;
+type BlockKey = (u64, (usize, usize, bool));
+
+struct CachedBlock {
+    plan: std::sync::Arc<PlannedBlock>,
+    _code: JitCodeBuffer,
+    entry: crate::mmu::HostVa,
+}
+
 /// Level 0 x86_64 soft vCPU.
 ///
 /// Raw plans contain native bytes and are not an externally callable execution API.
@@ -176,8 +186,13 @@ impl Drop for JitCodeBuffer {
 /// ```
 pub struct SoftCpu {
     ctx: Box<SoftCpuContext>,
+    #[cfg(test)]
     jit: JitCodeBuffer,
     cpuid: Box<dyn CpuidAuthority>,
+    translations: u64,
+    emissions: u64,
+    blocks: BTreeMap<BlockKey, CachedBlock>,
+    block_order: VecDeque<BlockKey>,
     pub max_block_insns: usize,
     pub max_block_span: usize,
 }
@@ -382,8 +397,13 @@ impl SoftCpu {
         ctx.lapic.set_apic_id(cpuid.apic_id());
         Ok(Self {
             ctx: Box::new(ctx),
+            #[cfg(test)]
             jit: JitCodeBuffer::new(DEFAULT_JIT_CAPACITY).ok_or(SoftCpuNewError::Jit)?,
             cpuid,
+            translations: 0,
+            emissions: 0,
+            blocks: BTreeMap::new(),
+            block_order: VecDeque::new(),
             max_block_insns: 64,
             max_block_span: 4096,
         })
@@ -411,6 +431,10 @@ impl SoftCpu {
         self.ctx.lzcnt = cpuid.cpuid(0x8000_0001, 0).ecx & (1 << 5) != 0;
         self.ctx.bmi1 = cpuid.cpuid(7, 0).ebx & (1 << 3) != 0;
         self.ctx.lapic.set_apic_id(cpuid.apic_id());
+        // Planning admits x87, CX16 and baseline encodings against this view.
+        // Cached plans must not retain either admission or refusal across a change.
+        self.blocks.clear();
+        self.block_order.clear();
         self.cpuid = cpuid;
         Ok(())
     }
@@ -466,6 +490,21 @@ impl SoftCpu {
     /// Mutate architectural state between blocks.
     pub fn context_mut(&mut self) -> &mut SoftCpuContext {
         &mut self.ctx
+    }
+
+    /// Actual instruction-fetch page-table walks; data walks are excluded.
+    pub fn code_walk_count(&self) -> u64 {
+        self.ctx.walker.stats().code_walks
+    }
+
+    /// Native blocks emitted on translation misses.
+    pub fn emission_count(&self) -> u64 {
+        self.emissions
+    }
+
+    /// Blocks planned from instruction bytes on translation misses.
+    pub fn translation_count(&self) -> u64 {
+        self.translations
     }
 
     fn raise(&mut self, exc: X86Exception) -> Result<SoftCpuExit, EmitError> {
@@ -529,7 +568,35 @@ impl SoftCpu {
             }
         }
 
-        match plan_block_from_memory(rip, max_i, max_s, &mut self.ctx, mem) {
+        let limits = (
+            max_i,
+            max_s,
+            (self.ctx.rflags & ((1 << 8) | (1 << 16))) != 0
+                || self.ctx.interrupt_shadow
+                || (self.ctx.dr[7] & 0xff) != 0
+                || (self.ctx.cr0 & 0xc) != 0,
+        );
+        // Re-authenticate execute permission and physical identity through the live
+        // TLB. Retirement/shootdown invalidates that TLB; writes bump frame code
+        // generation. No guest pointer or mapping authority is cached here.
+        let key = (rip, limits);
+        let cached = self
+            .blocks
+            .get(&key)
+            .filter(|b| {
+                b.plan
+                    .code_pages
+                    .iter()
+                    .all(|page| crate::mmu::code_page_matches(&mut self.ctx, mem, page))
+            })
+            .map(|b| (b.plan.clone(), b.entry));
+        let planned = if let Some(b) = &cached {
+            Ok(b.0.clone())
+        } else {
+            self.translations += 1;
+            plan_block_from_memory(rip, max_i, max_s, &mut self.ctx, mem).map(std::sync::Arc::new)
+        };
+        match planned {
             Ok(b) => {
                 let single_step = self.ctx.rflags & (1 << 8) != 0;
                 let had_sti_shadow = self.ctx.interrupt_shadow;
@@ -541,7 +608,51 @@ impl SoftCpu {
                         ..
                     }
                 );
-                let result = self.execute_planned_block(&b, mem)?;
+                let entry = if let Some((_, entry)) = cached {
+                    entry
+                } else {
+                    let emitted = emit_block(&b)?;
+                    self.emissions += 1;
+                    if emitted.code.len() > DEFAULT_JIT_CAPACITY {
+                        return Err(EmitError::EncodeFailed {
+                            va: rip,
+                            detail: "translated block exceeds JIT buffer capacity".to_string(),
+                        });
+                    }
+                    let mut code = JitCodeBuffer::new(emitted.code.len()).ok_or_else(|| {
+                        EmitError::EncodeFailed {
+                            va: rip,
+                            detail: "translation cache allocation failed".to_string(),
+                        }
+                    })?;
+                    let entry =
+                        code.publish(&emitted.code)
+                            .ok_or_else(|| EmitError::EncodeFailed {
+                                va: rip,
+                                detail: "translation cache publication failed".to_string(),
+                            })?;
+                    // Replace stale incarnations under the same key. FIFO eviction
+                    // removes one RX owner between blocks, never the whole hot set.
+                    if !self.blocks.contains_key(&key) {
+                        if self.blocks.len() == TRANSLATION_CACHE_CAPACITY
+                            && let Some(oldest) = self.block_order.pop_front()
+                        {
+                            self.blocks.remove(&oldest);
+                        }
+                        self.block_order.push_back(key);
+                    }
+                    let entry = crate::mmu::HostVa::new(entry as usize);
+                    self.blocks.insert(
+                        key,
+                        CachedBlock {
+                            plan: b.clone(),
+                            _code: code,
+                            entry,
+                        },
+                    );
+                    entry
+                };
+                let result = self.execute_block_at(&b, mem, entry)?;
                 if had_sti_shadow {
                     self.ctx.interrupt_shadow = false;
                 }
@@ -568,10 +679,28 @@ impl SoftCpu {
     }
 
     /// Execute only plans produced by this crate: raw bytes must agree with decoded metadata.
+    #[cfg(test)]
     pub(crate) fn execute_planned_block<M: SoftMmuMemory>(
         &mut self,
         planned: &PlannedBlock,
         mem: &mut M,
+    ) -> Result<SoftCpuExit, EmitError> {
+        let emitted = emit_block(planned)?;
+        let entry = self
+            .jit
+            .publish(&emitted.code)
+            .ok_or_else(|| EmitError::EncodeFailed {
+                va: planned.start,
+                detail: "test translation publication failed".to_string(),
+            })?;
+        self.execute_block_at(planned, mem, crate::mmu::HostVa::new(entry as usize))
+    }
+
+    fn execute_block_at<M: SoftMmuMemory>(
+        &mut self,
+        planned: &PlannedBlock,
+        mem: &mut M,
+        exec_addr: crate::mmu::HostVa,
     ) -> Result<SoftCpuExit, EmitError> {
         if (self.ctx.cr0 & 0xc) != 0
             && let Some(first) = planned.insns.first()
@@ -593,17 +722,8 @@ impl SoftCpu {
         // Secure all host executable resources before any guest instruction runs.
         crate::context::prepare_gateway(planned.start)?;
         self.ctx.prepare_block(planned)?;
-        let emitted = emit_block(planned)?;
-        let exec_addr = self
-            .jit
-            .publish(&emitted.code)
-            .ok_or_else(|| EmitError::EncodeFailed {
-                va: planned.start,
-                detail: "translated block exceeds JIT buffer capacity".to_string(),
-            })?;
-
-        // SAFETY: entry belongs to this CPU's freshly published translated block.
-        let raw_exit = unsafe { self.ctx.execute(mem, exec_addr, planned) }?;
+        // SAFETY: entry belongs to an RX buffer owned by this CPU for this call.
+        let raw_exit = unsafe { self.ctx.execute(mem, exec_addr.raw() as u64, planned) }?;
 
         self.ctx.fxsave.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
         self.ctx.sync_tlb_tag_bits();
