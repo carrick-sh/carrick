@@ -2585,6 +2585,77 @@ fn production_brk_regrows_over_its_released_pages() {
     );
 }
 
+/// #2359: two clone threads of the root raw-exit at the same moment on the
+/// two CPUs. Each clears its child-tid word through the MM owner while its
+/// sibling's exit can hold that MM's editor. Contention is "not now": the
+/// exit keeps its owned call, waits on the editor's release and reruns in
+/// ring. Before, the exit declined to the host, which has no task for a
+/// clone thread, and the carrier stopped with a forward binding mismatch.
+#[test]
+fn production_sibling_raw_exits_clear_tid_under_editor_contention() {
+    let elf = native_exit_fixture("native_sibling_raw_exit.S");
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .args(["10", "taskset", "-c", "0,1"])
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "native Linux oracle: {:?}",
+        native.status
+    );
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
+        .expect("sibling raw exits retire in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
+/// #2359, the owner-wait branch: each round's first clear-tid copy-out finds
+/// the MM editor held (`INJECT_EDITOR_BUSY_ONCE` holds it until the waiter
+/// parks). The exit enrols on the holder's release, parks, and reruns in
+/// ring once the holder releases; the fixture checks the zone parked at least
+/// once per round (exit 4 otherwise).
+#[test]
+fn production_raw_exit_clear_tid_editor_wait_parks_and_reruns() {
+    let elf = native_exit_fixture_with_flags("native_sibling_raw_exit.S", &["-DEDITOR_BUSY_ONCE"]);
+    // The injection hooks live only in the test-support image.
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .expect("a clear-tid copy-out parks on the editor and reruns in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
+/// #2359, "Busy once, then success": each round's first clear-tid copy-out
+/// is refused Busy once (`INJECT_OWNED_COPY_BUSY_ONCE`). The exit keeps its
+/// owned call and reruns; the fixture checks that every refusal was followed
+/// by a completed copy (exit 3 otherwise).
+#[test]
+fn production_raw_exit_clear_tid_busy_once_reruns_in_ring() {
+    let elf =
+        native_exit_fixture_with_flags("native_sibling_raw_exit.S", &["-DOWNED_COPY_BUSY_ONCE"]);
+    // The injection hooks live only in the test-support image.
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .expect("a Busy clear-tid copy-out reruns in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
 /// #1482 item 1: every exclusion settles owed returns. A brk shrink journals
 /// an owed return; a fresh page's first touch then crosses to the carrier for
 /// its backing, whose exclusion of the MM's editor settles that return. The
