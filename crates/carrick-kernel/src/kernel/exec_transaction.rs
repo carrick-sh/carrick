@@ -1,21 +1,43 @@
 //! The root exec transaction: one ISA-neutral order for replacing a process
 //! image, generic over the venue that owns the vCPU and its memory (#2142).
 //!
-//! The driver walks one typestate path, `Drained` -> `Prepared` -> `Armed` ->
-//! `Installed` -> `Replaced` -> `Committed` -> published, and owns the neutral
-//! steps between the venue hooks: the executable identity and binfmt argv, the
-//! per-thread signal-state reset, the `/proc/self/{maps,auxv}` generation, SysV shm
-//! detach, close-on-exec, the `/proc/self/exe` exec mark and the ptrace exec
-//! stop. Everything that touches a register frame, a page-table format, a
-//! stage-2 or ring MM, or venue-held thread state is a [`RootExecVenue`] hook.
-//! The credential commit happens inside the venue's [`RootExecVenue::commit`],
-//! through [`crate::kernel::Kernel::commit_exec_transition`].
+//! The transaction runs in four phases, each a free function over a
+//! [`RootExecVenue`]:
+//!
+//! - [`begin`]: `Drained` -> [`ExecBegun`], the Kernel preparation and the
+//!   venue's reserved replacement custody;
+//! - [`stage`]: [`ExecBegun`] -> [`ExecStaged`], the executable identity and
+//!   binfmt argv, the signal reset ([`SignalReset`]) and the
+//!   `/proc/self/{maps,auxv}` generation;
+//! - [`arm`]: [`ExecStaged`] -> [`ExecArmed`], the venue's MM transaction
+//!   across the no-return arm, the image install and MM publication;
+//! - [`settle`]: [`ExecArmed`] -> published, the credential and task-graph
+//!   commit, SysV shm detach, close-on-exec, the `/proc/self/exe` exec mark
+//!   and the ptrace exec stop.
+//!
+//! [`drive_root_exec`] composes all four in one call (HVF). The phase values
+//! are generic over the venue's associated types, so a venue whose types own
+//! their custody can hold an [`ExecArmed`] between two crossings (x86: from
+//! the adopt crossing to the settle crossing) while HVF keeps borrowing its
+//! frame-inventory envelope. Everything that touches a register frame, a
+//! page-table format, a stage-2 or ring MM, or venue-held thread state is a
+//! [`RootExecVenue`] hook. The credential commit happens inside the venue's
+//! [`RootExecVenue::commit`], through
+//! [`crate::kernel::Kernel::commit_exec_transition`].
 //!
 //! The order here is the HVF/HVPatch order it was moved from
 //! (`carrick-runtime` `drive_execve`), unchanged: the signal reset and the
-//! `/proc` generation precede the MM transaction, and every step after
-//! [`ImageReplacement::arm_no_return`] that fails kills the process instead of
-//! returning an errno.
+//! `/proc` generation precede the MM transaction.
+//!
+//! Once [`begin`] starts, the process either becomes the successor or dies
+//! past the point of no return: no phase returns an errno to the caller
+//! ([`ExecTerminal`]). Every recoverable exec errno (ENOENT, ENOEXEC, EACCES
+//! and E2BIG from the loader, ENOMEM from a carrier's stock) is decided
+//! before a venue enters [`begin`]. Dropping a phase value on the terminal
+//! path releases resources (the exec reservation, the drained siblings, the
+//! staged MM authority) and restores nothing of the predecessor: the
+//! identity, binfmt, signal reset and `/proc` generation that [`stage`]
+//! wrote stay written.
 //!
 //! Lock order, for every venue: clone admission closed, the MM-generation
 //! reservation, the sibling drain (nothing held across it), the registry write
@@ -37,29 +59,40 @@ use crate::kernel::{FileTable, KernelContext, MmId};
 use crate::memory::AddressSpace;
 use crate::run_result::RuntimeError;
 
-/// The exec syscall's final answer when the driver stops early: `Ok(None)`
-/// leaves the caller running, `Ok(Some(_))` terminates the process (a kill
-/// after the point of no return), and `Err` is a runtime fault.
-pub struct ExecExit<O>(Result<Option<O>, RuntimeError>);
+/// A phase's stop: `Ok(_)` is the process killed past the point of no
+/// return with the venue's outcome, `Err` a runtime fault. There is no
+/// errno: a stopped phase never leaves the caller running.
+pub struct ExecTerminal<O>(Result<O, RuntimeError>);
 
-impl<O> ExecExit<O> {
-    pub const fn new(result: Result<Option<O>, RuntimeError>) -> Self {
+impl<O> ExecTerminal<O> {
+    pub const fn new(result: Result<O, RuntimeError>) -> Self {
         Self(result)
     }
 
-    pub fn into_result(self) -> Result<Option<O>, RuntimeError> {
+    pub fn into_result(self) -> Result<O, RuntimeError> {
         self.0
     }
 }
 
-impl<O> From<RuntimeError> for ExecExit<O> {
+impl<O> From<RuntimeError> for ExecTerminal<O> {
     fn from(error: RuntimeError) -> Self {
         Self(Err(error))
     }
 }
 
-/// One driver step: continue with `T`, or stop with the syscall's answer.
-pub type ExecStep<T, O> = Result<T, ExecExit<O>>;
+/// One phase step: continue with `T`, or stop the process.
+pub type ExecStep<T, O> = Result<T, ExecTerminal<O>>;
+
+/// Who resets the caller's signal state for the successor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalReset {
+    /// The venue reset it during [`stage`].
+    Done,
+    /// The ring resets it in its own exec commit, after [`arm`] returns. The
+    /// obligation rides in [`ExecArmed`] until a ring commit receipt
+    /// discharges it; [`settle`] refuses an undischarged one.
+    RingOwed,
+}
 
 /// Proof that the caller's siblings are gone and clone admission is closed.
 /// The driver starts here; nothing is held across the drain.
@@ -114,7 +147,8 @@ impl PreparedRootExec for crate::kernel::PreparedExec {
 /// The hooks that run inside the venue's MM transaction, between the
 /// no-return arm and MM publication.
 pub trait ImageReplacement<V: RootExecVenue + ?Sized> {
-    /// Cross the point of no return: from here, failure kills the process.
+    /// Cross the venue's no-return cut: from here the predecessor image is
+    /// gone, not merely unreachable.
     fn arm_no_return(
         &mut self,
         prepared: V::Prepared,
@@ -164,7 +198,11 @@ pub trait RootExecVenue {
         &mut self,
         verdict: ExecPastNoReturn,
         cause: &str,
-    ) -> ExecExit<Self::Outcome>;
+    ) -> ExecTerminal<Self::Outcome>;
+
+    /// Reset the caller's per-thread signal state for the successor, or say
+    /// that the ring owes that reset.
+    fn reset_exec_signals(&mut self) -> SignalReset;
 
     /// `Drained` -> `Prepared`: prepare the Kernel exec and reserve the
     /// replacement MM's custody.
@@ -238,9 +276,54 @@ pub trait RootExecVenue {
     ) -> ExecStep<(), Self::Outcome>;
 }
 
-/// Run one root exec from `Drained` to a published successor. `Ok(None)` is a
-/// replaced image; `Ok(Some(_))` is a process killed past the point of no
-/// return. Callers box-pin this future.
+/// [`begin`]'s value: the Kernel preparation and the venue's reserved
+/// replacement custody.
+#[must_use = "dropping a begun exec kills the process"]
+pub struct ExecBegun<P, Envelope> {
+    // Field order is drop order: the envelope abandons the reserved frame
+    // custody before the Kernel preparation rolls back.
+    envelope: Envelope,
+    prepared: P,
+}
+
+impl<P: PreparedRootExec, Envelope> ExecBegun<P, Envelope> {
+    pub fn replacement_mm_id(&self) -> MmId {
+        self.prepared.replacement_mm_id()
+    }
+}
+
+/// [`stage`]'s value: the begun exec with the successor's identity, signal
+/// reset and `/proc` generation written.
+#[must_use = "dropping a staged exec kills the process"]
+pub struct ExecStaged<P, Envelope> {
+    dispatch_mm: PreparedDispatchMmExec,
+    signal_reset: SignalReset,
+    envelope: Envelope,
+    prepared: P,
+}
+
+/// [`arm`]'s value: the successor image installed and its MM published,
+/// awaiting [`settle`]. When the venue's `Replaced` and `Envelope` own their
+/// custody, this owns the whole continuation.
+#[must_use = "dropping an armed exec kills the process"]
+pub struct ExecArmed<Replaced, Envelope> {
+    old_files: Arc<FileTable>,
+    dispatch_mm: PreparedDispatchMmExec,
+    signal_reset: SignalReset,
+    engine_replace_started: Instant,
+    replaced: Replaced,
+    envelope: Envelope,
+}
+
+impl<Replaced, Envelope> ExecArmed<Replaced, Envelope> {
+    pub const fn signal_reset(&self) -> SignalReset {
+        self.signal_reset
+    }
+}
+
+/// Run one root exec from `Drained` to a published successor, all four
+/// phases in one call. `Ok(None)` is a replaced image; `Ok(Some(_))` is a
+/// process killed past the point of no return. Callers box-pin this future.
 pub async fn drive_root_exec<V: RootExecVenue>(
     venue: &mut V,
     drained: Drained,
@@ -248,7 +331,7 @@ pub async fn drive_root_exec<V: RootExecVenue>(
 ) -> Result<Option<V::Outcome>, RuntimeError> {
     match run(venue, drained, identity) {
         Ok(()) => Ok(None),
-        Err(exit) => exit.into_result(),
+        Err(terminal) => terminal.into_result().map(Some),
     }
 }
 
@@ -257,13 +340,34 @@ fn run<V: RootExecVenue>(
     drained: Drained,
     identity: ExecImageIdentity,
 ) -> ExecStep<(), V::Outcome> {
+    let begun = begin(venue, drained)?;
+    let staged = stage(venue, begun, identity)?;
+    let armed = arm(venue, staged)?;
+    settle(venue, armed)
+}
+
+/// `Drained` -> [`ExecBegun`]: prepare the Kernel exec and reserve the
+/// replacement MM's custody. Kernel preparation follows the sibling drain
+/// but precedes every destructive image, CLOEXEC and proc-state mutation.
+pub fn begin<V: RootExecVenue>(
+    venue: &mut V,
+    drained: Drained,
+) -> ExecStep<ExecBegun<V::Prepared, V::Envelope>, V::Outcome> {
     venue.record_stage(HvpatchExecRuntimeStagePhase::SiblingDrain, drained.started);
-    // Kernel preparation follows the sibling drain but precedes every
-    // destructive image, CLOEXEC and proc-state mutation. Dropping
-    // `_envelope` abandons the reserved frame custody before dropping
-    // `prepared` rolls the Kernel preparation back.
-    let (mut prepared, _envelope) = venue.prepare_mm()?;
-    let replacement_mm_id = prepared.replacement_mm_id();
+    let (prepared, envelope) = venue.prepare_mm()?;
+    Ok(ExecBegun { envelope, prepared })
+}
+
+/// [`ExecBegun`] -> [`ExecStaged`]: publish the successor's identity and
+/// binfmt argv, reset its signal state, and stage its `/proc` generation.
+pub fn stage<V: RootExecVenue>(
+    venue: &mut V,
+    begun: ExecBegun<V::Prepared, V::Envelope>,
+    identity: ExecImageIdentity,
+) -> ExecStep<ExecStaged<V::Prepared, V::Envelope>, V::Outcome> {
+    // Held whole, so a stop below drops it in field order.
+    let mut begun = begun;
+    let replacement_mm_id = begun.replacement_mm_id();
     let proc_state_started = Instant::now();
     let ExecImageIdentity {
         path,
@@ -282,36 +386,84 @@ fn run<V: RootExecVenue>(
     if let Some(argv) = binfmt_argv {
         venue.dispatcher().enter_binfmt(&argv);
     }
-    venue
-        .dispatcher()
-        .reset_signal_handlers_on_execve(venue.exec_context());
+    let signal_reset = venue.reset_exec_signals();
     // Reset + refresh /proc/self/maps and /proc/self/auxv under one
     // dispatcher memory-authority generation. The historical MM retains the
     // pre-staging snapshot, but records this deliberate source revision so
     // commit can reject any later mutation.
-    let mut dispatch_mm = Some(apply_exec_image_proc_state(
-        venue.dispatcher(),
-        replacement_mm_id,
-        venue.image(),
-    ));
-    if let Err(error) = prepared.acknowledge_staged_vma_revision() {
+    let dispatch_mm =
+        apply_exec_image_proc_state(venue.dispatcher(), replacement_mm_id, venue.image());
+    if let Err(error) = begun.prepared.acknowledge_staged_vma_revision() {
         return Err(venue.fail_past_no_return(
             ExecPastNoReturn,
             &format!("acknowledge staged exec VMA revision: {error}"),
         ));
     }
     venue.record_stage(HvpatchExecRuntimeStagePhase::ProcState, proc_state_started);
+    Ok(ExecStaged {
+        dispatch_mm,
+        signal_reset,
+        envelope: begun.envelope,
+        prepared: begun.prepared,
+    })
+}
 
+/// [`ExecStaged`] -> [`ExecArmed`]: inside the venue's MM transaction, cross
+/// the no-return arm, install the successor image and publish its MM.
+pub fn arm<V: RootExecVenue>(
+    venue: &mut V,
+    staged: ExecStaged<V::Prepared, V::Envelope>,
+) -> ExecStep<ExecArmed<V::Replaced, V::Envelope>, V::Outcome> {
+    let ExecStaged {
+        envelope,
+        dispatch_mm,
+        signal_reset,
+        prepared,
+    } = staged;
     let old_files = prepared.old_file_table();
     let topology_lock_started = Instant::now();
     let (replaced, engine_replace_started) =
         venue.replace_image(prepared, topology_lock_started, |transaction, prepared| {
             let engine_replace_started = Instant::now();
-            let armed = transaction.arm_no_return(prepared, dispatch_mm.as_ref())?;
+            let armed = transaction.arm_no_return(prepared, Some(&dispatch_mm))?;
             let installed = transaction.install_image(armed)?;
             let replaced = transaction.publish_mm(installed)?;
             Ok((replaced, engine_replace_started))
         })?;
+    Ok(ExecArmed {
+        old_files,
+        dispatch_mm,
+        signal_reset,
+        engine_replace_started,
+        replaced,
+        envelope,
+    })
+}
+
+/// [`ExecArmed`] -> published: commit the Kernel successor, close the old
+/// image's descriptors, and publish the runnable successor.
+pub fn settle<V: RootExecVenue>(
+    venue: &mut V,
+    armed: ExecArmed<V::Replaced, V::Envelope>,
+) -> ExecStep<(), V::Outcome> {
+    let ExecArmed {
+        envelope: _envelope,
+        replaced,
+        engine_replace_started,
+        signal_reset,
+        dispatch_mm,
+        old_files,
+    } = armed;
+    if signal_reset == SignalReset::RingOwed {
+        // Only a ring commit receipt discharges a ring-owed reset (#2142
+        // R3). Without one, the successor would run with the predecessor's
+        // caught handlers.
+        return Err(venue.fail_past_no_return(
+            ExecPastNoReturn,
+            "exec settle without a ring commit receipt for the owed signal reset",
+        ));
+    }
+    let mut dispatch_mm = Some(dispatch_mm);
     let (committed_context, mut committed) = venue.commit(replaced, &mut dispatch_mm)?;
     venue.adopt_successor_context(&committed_context)?;
     // Linux detaches every SysV shared-memory mapping only after exec has
