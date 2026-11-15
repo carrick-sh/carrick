@@ -3907,6 +3907,105 @@ fn serial_host_fork_child_reads_its_inherited_ring_descriptors() {
     );
 }
 
+/// One `native_file_metadata.S` report: (exit code, step bytes, nonzero
+/// refusal counters as (x86 nr, count)). `oracle` runs the fixture natively.
+type FileMetadataReport = (i32, Vec<u8>, Vec<(usize, u64)>);
+
+/// Run one `native_file_metadata.S` mode natively and on the production
+/// CPL0 path, each against its own fresh file and lock path. Returns
+/// (native report, carrick report).
+fn file_metadata_run(flags: &[&str]) -> (FileMetadataReport, FileMetadataReport) {
+    let dir = tempfile::tempdir().expect("file metadata directory");
+    let run = |name: &str, native: bool| -> FileMetadataReport {
+        let path = dir.path().join(format!("{name}-script"));
+        std::fs::write(&path, b"#!/usr/local/bin/python3.12\n").expect("script file");
+        let lock = dir.path().join(format!("{name}-lock"));
+        let file = format!("-DFILE_PATH=\"{}\"", path.display());
+        let lock = format!("-DLOCK_PATH=\"{}\"", lock.display());
+        let mut all = vec![file.as_str(), lock.as_str()];
+        all.extend_from_slice(flags);
+        let elf = native_exit_fixture_with_flags("native_file_metadata.S", &all);
+        if native {
+            let oracle = dir.path().join(format!("{name}-oracle"));
+            carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+            let out = std::process::Command::new("timeout")
+                .arg("10")
+                .arg(&oracle)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("bounded native file metadata oracle");
+            return (out.status.code().unwrap_or(-1), out.stdout, Vec::new());
+        }
+        let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+        dispatcher.set_fs_backend(Box::new(
+            carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+                .expect("host filesystem"),
+        ));
+        let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF");
+        let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+            &program,
+            128,
+            ROOT_AFFINITY_LOADED,
+            |_| {},
+            dispatcher,
+        )
+        .expect("file metadata production runtime");
+        assert!(!outcome.run.trap_limit_hit, "{:?}", outcome.run);
+        let counters = outcome
+            .physical
+            .syscall_counters()
+            .expect("stopped counters");
+        let refused = counters
+            .refused
+            .iter()
+            .enumerate()
+            .map(|(nr, counter)| (nr, counter.load(std::sync::atomic::Ordering::Acquire)))
+            .filter(|(_, count)| *count != 0)
+            .collect();
+        (outcome.run.exit_code, outcome.run.stdout.clone(), refused)
+    };
+    (run("native", true), run("carrick", false))
+}
+
+/// Steps 1-5 of `native_file_metadata.S` (open, FIOCLEX, F_GETFD, FIONCLEX,
+/// F_GETFD) and whether any `ioctl` (x86 16) was refused.
+fn cloexec_steps(report: &FileMetadataReport) -> (i32, Vec<u8>, bool) {
+    (
+        report.0,
+        report.1.get(..5).unwrap_or(&report.1).to_vec(),
+        report.2.iter().any(|(nr, _)| *nr == 16),
+    )
+}
+
+/// #231 parity (pip): CPython `fopen`s the script and marks it close-on-exec
+/// with `ioctl(fd, FIOCLEX)`. The run root's file is a ring descriptor; red
+/// on main: both ioctls were counted ENOSYS (steps 2 and 4 byte 38), and
+/// `pip` died with "can't open file ...: [Errno 38]". The remaining steps
+/// (fchmod, fchown, record locks, flock) are the reported follow-up census.
+#[test]
+fn serial_host_root_ioctl_cloexec_on_a_ring_file_matches_native() {
+    let (native, carrick) = file_metadata_run(&[]);
+    assert_eq!(native.0, 0, "native oracle: {native:?}");
+    assert_eq!(
+        cloexec_steps(&carrick),
+        cloexec_steps(&native),
+        "(exit, steps 1-5 errno or F_GETFD value, ioctl refused); full census: {carrick:?}"
+    );
+}
+
+/// #231 parity (pip): the same calls in a fork child, whose descriptor
+/// namespace is the ring's.
+#[test]
+fn serial_host_fork_child_ioctl_cloexec_on_a_ring_file_matches_native() {
+    let (native, carrick) = file_metadata_run(&["-DCHILD"]);
+    assert_eq!(native.0, 0, "native oracle: {native:?}");
+    assert_eq!(
+        cloexec_steps(&carrick),
+        cloexec_steps(&native),
+        "(exit, steps 1-5 errno or F_GETFD value, ioctl refused); full census: {carrick:?}"
+    );
+}
+
 /// Run `test` in a separate `timeout`-bounded process: a parked guest need
 /// not consume the pool's exit budget, so a lost wake must not hang CI.
 fn bounded_witness(test: &str, witness: impl FnOnce()) {
