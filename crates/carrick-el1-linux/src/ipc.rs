@@ -47,9 +47,9 @@ pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
-    IpcBacking, IpcError, IpcEventValue, IpcHandback, IpcLockHolder, IpcMmKey, IpcObjectHandle,
-    IpcOpKind, IpcOpToken, IpcOperation, IpcRegion, IpcReleased, IpcTaskKey, IpcUserVa, OfdPin,
-    RawOfdPin, RawTableId, WriteProgress,
+    IpcBacking, IpcCallFlags, IpcError, IpcEventValue, IpcHandback, IpcLockHolder, IpcMmKey,
+    IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation, IpcRegion, IpcReleased, IpcTaskKey,
+    IpcUserVa, OfdPin, RawOfdPin, RawTableId, WriteProgress,
 };
 use carrick_el1_abi::ipc_tables::IpcTableMap;
 use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, IpcLeave};
@@ -63,10 +63,14 @@ mod linux {
     pub const SYS_WRITE: usize = 64;
     pub const SYS_READV: usize = carrick_personality_linux::crossing::nr::READV.raw() as usize;
     pub const SYS_WRITEV: usize = carrick_personality_linux::crossing::nr::WRITEV.raw() as usize;
+    pub const SYS_SENDTO: usize = carrick_personality_linux::crossing::nr::SENDTO.raw() as usize;
+    pub const SYS_RECVFROM: usize =
+        carrick_personality_linux::crossing::nr::RECVFROM.raw() as usize;
     pub const EBADF: i64 = -9;
     pub const EAGAIN: i64 = -11;
     pub const EINVAL: i64 = -22;
     pub const EPIPE: i64 = -32;
+    pub const ENOTSOCK: i64 = -88;
     /// Largest byte count one read/write transfers (`MAX_RW_COUNT`).
     pub const MAX_RW_COUNT: u64 = 0x7fff_f000;
     /// eventfd reads and writes move one native-endian u64.
@@ -465,6 +469,8 @@ pub fn serve_ipc_with_signals<E: IpcExecution, M: UserCopy>(
         && nr != SYS_WRITE
         && nr != linux::SYS_READV
         && nr != linux::SYS_WRITEV
+        && nr != linux::SYS_SENDTO
+        && nr != linux::SYS_RECVFROM
         && !matches!(nr, SYS_EPOLL_PWAIT | SYS_EPOLL_PWAIT2)
     {
         return (IpcServed::Forward, false);
@@ -1037,6 +1043,83 @@ pub fn admit_operation_wait<'a, C: carrick_el1_abi::EntryContext>(
     }
 }
 
+/// Why a stream socket call is answered before admission.
+enum StreamCallRefusal {
+    /// Its flags or address arguments are refused (send(2), recv(2)).
+    Errno(i64),
+    /// Its address-length word is not readable yet: the existing owner
+    /// resolves the page (or EFAULT) before any effect.
+    CopyIn,
+}
+
+/// The per-call flags of `sendto`/`recvfrom` on a ring stream end, decided
+/// before any effect. A connected stream takes no destination: one is
+/// EISCONN (send(2)). Its peer is unnamed, so a requested source address
+/// has length 0 (recv(2)); that length is written here, before the
+/// transfer. The ring carries no out-of-band or ancillary data: flags
+/// asking for them are EOPNOTSUPP.
+fn stream_call<M: UserCopy>(
+    frame: &impl GuestDispatchFrame,
+    reading: bool,
+    user: &mut M,
+) -> Result<IpcCallFlags, StreamCallRefusal> {
+    use carrick_abi::{
+        LINUX_MSG_CMSG_CLOEXEC, LINUX_MSG_DONTWAIT, LINUX_MSG_MORE, LINUX_MSG_NOSIGNAL,
+        LINUX_MSG_PEEK, LINUX_MSG_WAITALL,
+    };
+    let flags = argument_word(frame, 3) as u32 as i32;
+    let address = argument_word(frame, 4);
+    let length = argument_word(frame, 5);
+    let allowed = if reading {
+        LINUX_MSG_DONTWAIT | LINUX_MSG_PEEK | LINUX_MSG_WAITALL | LINUX_MSG_CMSG_CLOEXEC
+    } else {
+        LINUX_MSG_DONTWAIT | LINUX_MSG_NOSIGNAL | LINUX_MSG_MORE
+    };
+    if flags & !allowed != 0 {
+        return Err(StreamCallRefusal::Errno(
+            carrick_syscall_abi::LINUX_EOPNOTSUPP.guest_retval(),
+        ));
+    }
+    let mut call = IpcCallFlags::NONE;
+    for (bit, flag) in [
+        (LINUX_MSG_DONTWAIT, IpcCallFlags::DONT_WAIT),
+        (LINUX_MSG_NOSIGNAL, IpcCallFlags::NO_SIGNAL),
+        (LINUX_MSG_PEEK, IpcCallFlags::PEEK),
+        (LINUX_MSG_WAITALL, IpcCallFlags::WAIT_ALL),
+    ] {
+        if flags & bit != 0 {
+            call = call.union(flag);
+        }
+    }
+    if address == 0 {
+        return Ok(call);
+    }
+    if !reading {
+        // `addrlen` is an int: negative or past `sockaddr_storage` is
+        // EINVAL; zero names no destination.
+        return match length as u32 as i32 {
+            0 => Ok(call),
+            1..=128 => Err(StreamCallRefusal::Errno(
+                carrick_abi::LINUX_EISCONN.guest_retval(),
+            )),
+            _ => Err(StreamCallRefusal::Errno(linux::EINVAL)),
+        };
+    }
+    let mut word = [0u8; 4];
+    if PrefixCopy::new(user).copy_in(&mut word, length) != word.len() {
+        return Err(StreamCallRefusal::CopyIn);
+    }
+    if i32::from_ne_bytes(word) < 0 {
+        return Err(StreamCallRefusal::Errno(linux::EINVAL));
+    }
+    if PrefixCopy::new(user).copy_out(length, &0u32.to_ne_bytes()) != word.len() {
+        return Err(StreamCallRefusal::Errno(
+            carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+        ));
+    }
+    Ok(call)
+}
+
 /// Decode a fresh call and take ownership of it, before any effect.
 fn admit<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
@@ -1051,17 +1134,40 @@ fn admit<E: IpcExecution, M: UserCopy>(
     };
     let table = TableId::from_raw(table);
     let fd = Fd(argument_word(frame, 0) as i32);
-    let reading = matches!(ordinal(frame), SYS_READ | linux::SYS_READV);
+    let reading = matches!(
+        ordinal(frame),
+        SYS_READ | linux::SYS_READV | linux::SYS_RECVFROM
+    );
+    let socket_call = matches!(ordinal(frame), linux::SYS_SENDTO | linux::SYS_RECVFROM);
     let fda = region.fd(EL1_WAIT);
     // A snapshot first (no retention): host-backed descriptions are never
     // pinned in EL1, so EL1 never holds a hold it could not release.
     match fda.get(table, fd) {
+        // send/recv name a socket: a ring pipe, eventfd or epoll is none
+        // (ENOTSOCK); a host description keeps its crossing.
+        Ok(snapshot) if socket_call => match IpcBacking::decode(snapshot.backing) {
+            Some(IpcBacking::Stream { .. }) => {}
+            Some(IpcBacking::Host(_)) | None => return Admission::Forward,
+            Some(_) => return Admission::Immediate(linux::ENOTSOCK),
+        },
         Ok(snapshot) if op_kind(snapshot.backing, reading).is_some() => {}
         Ok(_) => return Admission::Forward,
         Err(FdError::BadFd) => return Admission::Immediate(linux::EBADF),
         Err(FdError::Contended) => return refuse(sched, IpcLeave::TableContended),
         Err(_) => return refuse(sched, IpcLeave::TableRefused),
     }
+    let call = if socket_call {
+        match stream_call(frame, reading, user) {
+            Ok(call) => call,
+            Err(StreamCallRefusal::Errno(errno)) => return Admission::Immediate(errno),
+            Err(StreamCallRefusal::CopyIn) => {
+                let _ = refuse(sched, IpcLeave::CopyInFault);
+                return Admission::CopyInFault;
+            }
+        }
+    } else {
+        IpcCallFlags::NONE
+    };
     let operation = |pin: RawOfdPin| IpcOperation {
         pin,
         task: task_key(task),
@@ -1069,6 +1175,7 @@ fn admit<E: IpcExecution, M: UserCopy>(
         buf: IpcUserVa(argument_word(frame, 1)),
         orig_x0: argument_word(frame, 0),
         nr: frame.native_number().raw() as u32,
+        call,
         ..IpcOperation::EMPTY
     };
     let (pin, desc) = match fda.pin(table, fd) {
@@ -1271,7 +1378,10 @@ fn run<E: IpcExecution, M: UserCopy>(
         let previous_prepared_offset = prepared_offset.take();
         let nonblock = {
             let pin = OfdPin::from_raw(op.pin);
-            let flags = region.fd(EL1_WAIT).pinned(&pin).map(|d| d.flags.nonblock);
+            let flags = region
+                .fd(EL1_WAIT)
+                .pinned(&pin)
+                .map(|d| d.flags.nonblock || op.call.contains(IpcCallFlags::DONT_WAIT));
             op.pin = pin.into_raw();
             match flags {
                 Ok(nonblock) => nonblock,
@@ -1590,7 +1700,13 @@ fn run<E: IpcExecution, M: UserCopy>(
             // A reader may have committed a prefix before an owner wait.
             // If a peer drained the rest meanwhile, Linux returns that prefix
             // rather than parking again (and EOF must preserve it too).
-            StepStatus::Blocked(_) if op.kind.reads_bytes() && written > 0 => written as i64,
+            StepStatus::Blocked(_)
+                if op.kind.reads_bytes()
+                    && written > 0
+                    && !op.call.contains(IpcCallFlags::WAIT_ALL) =>
+            {
+                written as i64
+            }
             StepStatus::Blocked(_) if nonblock => {
                 if written > 0 {
                     written as i64
@@ -1662,7 +1778,9 @@ fn run<E: IpcExecution, M: UserCopy>(
                     }
                 }
             }
-            StepStatus::Broken if native_signals => {
+            // MSG_NOSIGNAL: EPIPE (or the delivered prefix) and no signal,
+            // in any venue.
+            StepStatus::Broken if native_signals || op.call.contains(IpcCallFlags::NO_SIGNAL) => {
                 let result = if written > 0 {
                     written as i64
                 } else {
@@ -1670,7 +1788,10 @@ fn run<E: IpcExecution, M: UserCopy>(
                 };
                 finish(sched, token, region);
                 set_result(frame, result as u64);
-                return (IpcServed::Returned { switched: false }, true);
+                return (
+                    IpcServed::Returned { switched: false },
+                    !op.call.contains(IpcCallFlags::NO_SIGNAL),
+                );
             }
             StepStatus::Broken if written == 0 && !resumed => {
                 // No effect yet: the host re-runs the call (EPIPE + SIGPIPE).
