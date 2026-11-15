@@ -71,6 +71,7 @@ struct ApicTestMemory {
     _backing: Vec<std::sync::atomic::AtomicU64>,
     placement: LinearPlacement,
     extents: ExtentTable,
+    code_frames: Vec<carrick_softcpu_x86::AuthenticatedGpa>,
     mmio: MmioHoles,
     next_gpa: u64,
 }
@@ -92,6 +93,7 @@ impl ApicTestMemory {
             _backing: backing,
             placement,
             extents,
+            code_frames: Vec::new(),
             mmio,
             next_gpa: FIRST_FREE_GPA,
         };
@@ -189,6 +191,12 @@ impl ApicTestMemory {
         }
     }
     fn write_gpa(&mut self, gpa: u64, bytes: &[u8]) {
+        // Host fixture writes participate in the same frame-generation protocol
+        // as guest writes; direct backing mutation cannot retain translations.
+        for &frame in &self.code_frames {
+            self.extents.on_code_page_write(frame, &mut []).unwrap();
+        }
+
         assert!(gpa as usize + bytes.len() <= self.placement.span_bytes() as usize);
         // SAFETY: CPU is parked and the fixture exclusively owns the allocation.
         unsafe {
@@ -208,6 +216,16 @@ unsafe impl SoftMmuMemory for ApicTestMemory {
     }
     fn extents(&self) -> &ExtentTable {
         &self.extents
+    }
+    fn mark_code_page(
+        &mut self,
+        frame: carrick_softcpu_x86::AuthenticatedGpa,
+        tlbs: &mut [&mut carrick_softcpu_x86::SoftTlb],
+    ) -> u64 {
+        if !self.code_frames.contains(&frame) {
+            self.code_frames.push(frame);
+        }
+        self.extents.mark_code_page(frame, tlbs)
     }
     fn extents_mut(&mut self) -> &mut ExtentTable {
         &mut self.extents

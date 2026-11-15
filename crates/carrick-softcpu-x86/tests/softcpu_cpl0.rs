@@ -53,6 +53,7 @@ struct Cpl0TestMemory {
     _backing: Vec<AtomicU64>,
     placement: LinearPlacement,
     extents: ExtentTable,
+    code_frames: Vec<carrick_softcpu_x86::AuthenticatedGpa>,
     next_gpa: u64,
 }
 
@@ -80,6 +81,7 @@ impl Cpl0TestMemory {
             _backing: backing,
             placement,
             extents,
+            code_frames: Vec::new(),
             next_gpa: SOFT_TLB_PAGE_SIZE,
         }
     }
@@ -103,6 +105,12 @@ impl Cpl0TestMemory {
     }
 
     fn write_gpa(&mut self, gpa: u64, src: &[u8]) {
+        // Host fixture writes participate in the same frame-generation protocol
+        // as guest writes; direct backing mutation cannot retain translations.
+        for &frame in &self.code_frames {
+            self.extents.on_code_page_write(frame, &mut []).unwrap();
+        }
+
         assert!((gpa as usize) + src.len() <= Self::POOL_BYTES as usize);
         let dst = (self.placement.base_host_addr() + gpa as usize) as *mut u8;
         // SAFETY: `[gpa, gpa + src.len())` lies inside `[0, POOL_BYTES)`.
@@ -168,6 +176,16 @@ unsafe impl SoftMmuMemory for Cpl0TestMemory {
     }
     fn extents(&self) -> &ExtentTable {
         &self.extents
+    }
+    fn mark_code_page(
+        &mut self,
+        frame: carrick_softcpu_x86::AuthenticatedGpa,
+        tlbs: &mut [&mut carrick_softcpu_x86::SoftTlb],
+    ) -> u64 {
+        if !self.code_frames.contains(&frame) {
+            self.code_frames.push(frame);
+        }
+        self.extents.mark_code_page(frame, tlbs)
     }
     fn extents_mut(&mut self) -> &mut ExtentTable {
         &mut self.extents

@@ -159,3 +159,19 @@ fn disabled_feature_behavior_and_size() {
     assert!(scope.add(WorkMetric::KernelDispatches, 1).is_ok());
     assert_eq!(scope.snapshot().unwrap_err(), WorkMeterError::Disabled);
 }
+
+#[cfg(feature = "conformance-metrics")]
+#[test]
+fn translation_metrics_do_not_alias_existing_work_units() {
+    let meter = WorkMeter::default();
+    let scope = meter.new_scope();
+    for (index, metric) in WorkMetric::ALL.into_iter().enumerate() {
+        scope.add(metric, index as u64 + 1).unwrap();
+    }
+    let encoded = serde_json::to_vec(&scope.snapshot().unwrap()).unwrap();
+    let decoded: carrick_observability::work_meter::WorkSnapshot =
+        serde_json::from_slice(&encoded).unwrap();
+    for (index, metric) in WorkMetric::ALL.into_iter().enumerate() {
+        assert_eq!(decoded.get(metric), Some(index as u64 + 1));
+    }
+}
