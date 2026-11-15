@@ -416,7 +416,7 @@ impl Kernel {
         context: &KernelContext,
         backend: Option<Arc<dyn MmBackend>>,
         replacement_registry_id: Option<ThreadId>,
-        _issued: IssuedExecMm,
+        issued: IssuedExecMm,
         failpoint: Option<KernelFailpoint>,
         transaction: KernelTransactionId,
         _revision: TaskRevision,
@@ -429,6 +429,7 @@ impl Kernel {
             birth_admission: None,
         };
         let mut guard = ExecOperationGuard::new(reservation);
+        let mm_id = self.claim_issued_exec_mm(issued)?;
         let admission = super::thread_ledger::BirthAdmissionGuard::acquire(context.task())
             .map_err(|_| ExecError::TaskBusy)?;
         if let Some(reservation) = guard.reservation_mut() {
@@ -470,7 +471,6 @@ impl Kernel {
         // Only the validated caller supplies exec survivors. K1 gives the new
         // image, staged file table, and caught-handler reset fresh identities;
         // fs context, credentials, and pending signals retain caller identity.
-        let mm_id = self.object_ids().mm_id()?;
         let mm = Arc::new(match backend {
             Some(backend) => Mm::with_backend(mm_id, backend),
             None => Mm::new_reference(mm_id),
@@ -509,6 +509,23 @@ impl Kernel {
             replacement,
             thread_set,
         })
+    }
+
+    /// The replacement MM identity `issued` names, if this Kernel issued it
+    /// and no live task's MM holds it.
+    fn claim_issued_exec_mm(&self, issued: IssuedExecMm) -> Result<MmId, ExecError> {
+        if !Arc::ptr_eq(&issued.domain, self.domain()) {
+            return Err(ExecError::ForeignExecMm);
+        }
+        let state = self.registry().settled().read();
+        if state
+            .tasks
+            .values()
+            .any(|record| record.task.shared().mm().id() == issued.mm)
+        {
+            return Err(ExecError::LiveExecMm(issued.mm));
+        }
+        Ok(issued.mm)
     }
 
     pub fn commit_exec(
