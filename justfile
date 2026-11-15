@@ -393,9 +393,11 @@ deny:
 # Fail if free disk is below the floor; warn in the band above it.
 # Self-hosted CI runners: before a build, remove this runner's own Cargo target
 # dir when its volume is below the floor (cloudmac's per-runner target filled the
-# 56 GB volume twice on 2026-11-14/15). Never touches another runner's tree.
+# 56 GB volume twice on 2026-11-14/15; cloudmac-ci and cloudmac-ci-2 share it). The
+# default floor is 30 GiB: #2387's own run hit ENOSPC in arm-test-list starting from
+# 21 GiB free. Never touches another runner's tree.
 ci-reclaim-target:
-    {{_xtask}} ci-reclaim-target --floor-gib "${CARRICK_CI_RECLAIM_FLOOR_GIB:-15}"
+    {{_xtask}} ci-reclaim-target --floor-gib "${CARRICK_CI_RECLAIM_FLOOR_GIB:-30}"
 
 check-disk:
     #!/usr/bin/env bash

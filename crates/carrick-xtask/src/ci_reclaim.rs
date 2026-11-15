@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(clap::Args, Debug)]
 pub struct ReclaimArgs {
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = 30)]
     pub floor_gib: u64,
 }
 
