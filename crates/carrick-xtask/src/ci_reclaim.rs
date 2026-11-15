@@ -12,9 +12,6 @@ use std::path::{Path, PathBuf};
 
 #[derive(clap::Args, Debug)]
 pub struct ReclaimArgs {
-    /// The runner's own Cargo target dir; it must be inside `$GITHUB_WORKSPACE`.
-    #[arg(long, default_value = "target")]
-    pub target_dir: PathBuf,
     #[arg(long, default_value_t = 15)]
     pub floor_gib: u64,
 }
@@ -36,35 +33,37 @@ fn reclaim_needed(free_gib: u64, floor_gib: u64) -> bool {
     free_gib < floor_gib
 }
 
-/// Why the target dir must not be removed, if it mustn't: it is outside this
-/// runner's workspace (never another runner's tree), or a Cargo build in it
-/// holds its lock (a build dir's `.cargo-lock`, flock-held by Cargo).
-fn reclaim_refusal(target: &Path, workspace: &Path) -> io::Result<Option<String>> {
-    let target = match target.canonicalize() {
-        Ok(path) => path,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(Some("there is no target dir".into()));
-        }
-        Err(error) => return Err(error),
-    };
+/// Remove `<workspace>/target`, the runner's own build output, unless a Cargo build holds any lock in it.
+/// The locks (`CargoLocks::claim`: every `.cargo-lock` under target/, cross targets included) are held
+/// until the removal finishes, so no build in this tree starts or continues meanwhile; the path must be the
+/// canonical, symlink-free one before and immediately at removal (`removal_paths_are_direct`), and that same
+/// canonical path is what is removed (#ci-reclaim review). Returns why it was kept, if it was.
+fn reclaim(workspace: &Path) -> io::Result<Option<String>> {
     let workspace = workspace.canonicalize()?;
-    if target == workspace || !target.starts_with(&workspace) {
+    let target = workspace.join("target");
+    if !target.exists() {
+        return Ok(Some("there is no target dir".into()));
+    }
+    let direct = || crate::worktree_gc::removal_paths_are_direct(&target, &target);
+    if !direct() {
         return Ok(Some(format!(
-            "{} is not inside this runner's workspace {}",
-            target.display(),
-            workspace.display()
+            "{} is a symlink or not its canonical path",
+            target.display()
         )));
     }
-    for entry in std::fs::read_dir(&target)? {
-        let lock = entry?.path().join(".cargo-lock");
-        let Ok(file) = std::fs::File::open(&lock) else {
-            continue;
-        };
-        // SAFETY: file is open; the probe lock is released when it closes.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Ok(Some(format!("a Cargo build holds {}", lock.display())));
-        }
+    let locks = crate::worktree_admission::CargoLocks::claim(&workspace)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let Some(locks) = locks else {
+        return Ok(Some(format!(
+            "a Cargo build holds a lock under {}",
+            target.display()
+        )));
+    };
+    if !direct() {
+        return Ok(Some(format!("{} changed before removal", target.display())));
     }
+    std::fs::remove_dir_all(&target)?;
+    drop(locks);
     Ok(None)
 }
 
@@ -74,34 +73,25 @@ pub fn run(args: &ReclaimArgs) -> io::Result<()> {
         .ok_or_else(|| {
             io::Error::other("ci-reclaim-target runs only on a CI runner ($GITHUB_WORKSPACE unset)")
         })?;
-    let target = if args.target_dir.is_absolute() {
-        args.target_dir.clone()
-    } else {
-        workspace.join(&args.target_dir)
-    };
     let free = available_gib(&workspace)?;
     if !reclaim_needed(free, args.floor_gib) {
         println!(
-            "ci-reclaim-target: {free} GiB free (floor {} GiB); keeping {}",
-            args.floor_gib,
-            target.display()
-        );
-        return Ok(());
-    }
-    if let Some(why) = reclaim_refusal(&target, &workspace)? {
-        println!(
-            "ci-reclaim-target: {free} GiB free (floor {} GiB), but not removing: {why}",
+            "ci-reclaim-target: {free} GiB free (floor {} GiB); keeping target/",
             args.floor_gib
         );
         return Ok(());
     }
-    std::fs::remove_dir_all(&target)?;
-    let after = available_gib(&workspace)?;
-    println!(
-        "ci-reclaim-target: {free} GiB free was below the floor ({} GiB); removed {} ({after} GiB free now)",
-        args.floor_gib,
-        target.display()
-    );
+    match reclaim(&workspace)? {
+        Some(why) => println!(
+            "ci-reclaim-target: {free} GiB free is below the floor ({} GiB), but SKIPPED: {why}",
+            args.floor_gib
+        ),
+        None => println!(
+            "ci-reclaim-target: {free} GiB free was below the floor ({} GiB); removed target/ ({} GiB free now)",
+            args.floor_gib,
+            available_gib(&workspace)?
+        ),
+    }
     Ok(())
 }
 
@@ -125,55 +115,52 @@ mod tests {
     }
 
     #[test]
-    fn only_this_runners_own_unlocked_target_is_reclaimable() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("runner-a/_work/carrick/carrick");
-        let target = workspace.join("target");
-        std::fs::create_dir_all(target.join("debug")).unwrap();
-        std::fs::write(target.join("debug/.cargo-lock"), "").unwrap();
-        assert_eq!(reclaim_refusal(&target, &workspace).unwrap(), None);
-        // Another runner's tree, the workspace itself, and a symlink out of the workspace are refused.
-        let other = root.path().join("runner-b/_work/carrick/carrick/target");
-        std::fs::create_dir_all(&other).unwrap();
+    fn the_runners_own_unlocked_target_is_removed() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join("target/debug")).unwrap();
+        std::fs::write(ws.path().join("target/debug/.cargo-lock"), "").unwrap();
+        assert_eq!(reclaim(ws.path()).unwrap(), None);
+        assert!(!ws.path().join("target").exists());
         assert!(
-            reclaim_refusal(&other, &workspace)
-                .unwrap()
-                .unwrap()
-                .contains("not inside")
-        );
-        assert!(
-            reclaim_refusal(&workspace, &workspace)
-                .unwrap()
-                .unwrap()
-                .contains("not inside")
-        );
-        let escape = workspace.join("escape");
-        std::os::unix::fs::symlink(&other, &escape).unwrap();
-        assert!(
-            reclaim_refusal(&escape, &workspace)
-                .unwrap()
-                .unwrap()
-                .contains("not inside")
-        );
-        // A build holding Cargo's lock in it.
-        let held = std::fs::File::open(target.join("debug/.cargo-lock")).unwrap();
-        // SAFETY: held is open.
-        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
-        assert!(
-            reclaim_refusal(&target, &workspace)
-                .unwrap()
-                .unwrap()
-                .contains("holds")
-        );
-        drop(held);
-        assert_eq!(reclaim_refusal(&target, &workspace).unwrap(), None);
-        // No target dir at all.
-        std::fs::remove_dir_all(&target).unwrap();
-        assert!(
-            reclaim_refusal(&target, &workspace)
+            reclaim(ws.path())
                 .unwrap()
                 .unwrap()
                 .contains("no target dir")
         );
+    }
+
+    #[test]
+    fn a_held_build_lock_anywhere_under_target_keeps_it() {
+        // #ci-reclaim review P0: a cross build locks target/<triple>/debug/.cargo-lock, one level deeper.
+        for lock in [
+            "target/debug/.cargo-lock",
+            "target/aarch64-unknown-linux-musl/debug/.cargo-lock",
+        ] {
+            let ws = tempfile::tempdir().unwrap();
+            let path = ws.path().join(lock);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+            let held = std::fs::File::open(&path).unwrap();
+            // SAFETY: held is open.
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+            assert!(
+                reclaim(ws.path())
+                    .unwrap()
+                    .unwrap()
+                    .contains("holds a lock"),
+                "{lock}"
+            );
+            assert!(path.exists(), "{lock}");
+        }
+    }
+
+    #[test]
+    fn a_symlinked_target_is_never_followed() {
+        let ws = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("keep"), "another runner's file").unwrap();
+        std::os::unix::fs::symlink(other.path(), ws.path().join("target")).unwrap();
+        assert!(reclaim(ws.path()).unwrap().unwrap().contains("symlink"));
+        assert!(other.path().join("keep").exists());
     }
 }

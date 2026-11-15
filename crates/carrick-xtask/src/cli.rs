@@ -524,7 +524,7 @@ where
         }
         Commands::CiReclaimTarget(args) => {
             crate::ci_reclaim::run(&args).map_err(|source| CliError::Io {
-                path: args.target_dir.clone(),
+                path: PathBuf::from("target"),
                 source,
             })?;
             Ok(())
