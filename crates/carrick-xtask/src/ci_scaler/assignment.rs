@@ -1065,11 +1065,78 @@ mod tests {
             Assignment::Busy
         );
         assert!(!dir.path().join("draining").exists());
-        drop(hook); // exit/timeout releases protection even with the request present
+        // Exit/timeout releases protection even with the request present. Release
+        // it the way that holds in a test binary that forks: an flock belongs to
+        // the open file description, and another test's fork (before its exec)
+        // copies this fd, so a bare drop can leave the lock held by that child
+        // (#2370). LOCK_UN releases the description for every copy.
+        release_hook(hook);
         assert_eq!(
             super::super::quiesce_guest(dir.path()).unwrap(),
             Assignment::Unassigned
         );
+    }
+
+    /// Release a modelled hook's lifetime lock, then close it (#2370).
+    fn release_hook(hook: File) {
+        use std::os::fd::AsRawFd;
+        assert_eq!(unsafe { libc::flock(hook.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(hook);
+    }
+
+    /// The #2370 mechanism, made deterministic: a forked child holding an
+    /// inherited copy of the hook's fd (what another test's spawn does in its
+    /// fork-to-exec window) keeps the lock after the parent's drop, so a test
+    /// that only drops reads `Busy`. Releasing with LOCK_UN reads `Unassigned`
+    /// while the child still holds its copy.
+    #[test]
+    fn ci_scaler_a_forked_copy_of_the_hook_fd_does_not_keep_a_released_lock() {
+        use std::os::fd::AsRawFd;
+        for unlock in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("admission.lock"), "").unwrap();
+            std::fs::write(
+                dir.path().join("assignment.json"),
+                serde_json::to_vec(&run_b()).unwrap(),
+            )
+            .unwrap();
+            let hook = File::open(dir.path().join("assignment.json")).unwrap();
+            assert_eq!(unsafe { libc::flock(hook.as_raw_fd(), libc::LOCK_EX) }, 0);
+            let mut gate = [0; 2];
+            assert_eq!(unsafe { libc::pipe(gate.as_mut_ptr()) }, 0);
+            // SAFETY: the child calls only async-signal-safe functions (read,
+            // _exit) and touches no Rust state.
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0);
+            if child == 0 {
+                unsafe {
+                    let mut byte = 0u8;
+                    libc::close(gate[1]);
+                    libc::read(gate[0], (&raw mut byte).cast(), 1);
+                    libc::_exit(0);
+                }
+            }
+            unsafe { libc::close(gate[0]) };
+            if unlock {
+                release_hook(hook);
+            } else {
+                drop(hook);
+            }
+            let seen = super::super::quiesce_guest(dir.path()).unwrap();
+            unsafe {
+                libc::write(gate[1], [1u8].as_ptr().cast(), 1);
+                libc::close(gate[1]);
+                let mut status = 0;
+                libc::waitpid(child, &raw mut status, 0);
+            }
+            let want = if unlock {
+                Assignment::Unassigned
+            } else {
+                Assignment::Busy
+            };
+            assert_eq!(seen, want, "unlock={unlock}");
+            let _ = std::fs::remove_file(dir.path().join("draining"));
+        }
     }
 
     #[test]
