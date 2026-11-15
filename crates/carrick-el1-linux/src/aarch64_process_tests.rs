@@ -19207,15 +19207,16 @@ fn arm_root_socketpair_nonblock_and_shutdown() {
 }
 
 /// #2361: libuv's spawn loop on a ring stream pair: both ends ADD to the
-/// root's ring epoll as pure ring members (no host adoption), report
+/// root's ring epoll as pure ring members (no host adoption; a second ADD
+/// is EEXIST, libuv's `uv__io_poll` assertion), report
 /// EPOLLIN once the peer writes and EPOLLRDHUP once it shuts its writes,
 /// and DEL like any member.
 #[test]
 fn arm_root_socketpair_ends_are_ring_epoll_members() {
     use ArmCaller::Root;
     use carrick_abi::{
-        LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLLIN, LINUX_EPOLLRDHUP, LINUX_O_CLOEXEC,
-        LINUX_SHUT_WR,
+        LINUX_EEXIST, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLLIN, LINUX_EPOLLRDHUP,
+        LINUX_O_CLOEXEC, LINUX_SHUT_WR,
     };
     use carrick_personality_linux::crossing::nr as sys;
     use carrick_test_support::GuestUserBuffer;
@@ -19245,6 +19246,19 @@ fn arm_root_socketpair_ends_are_ring_epoll_members() {
                     [epoll, LINUX_EPOLL_CTL_ADD, fd, event.arg(), 0, 0],
                 ),
                 0,
+            );
+        }
+        // libuv's `uv__io_poll` asserts `errno == EEXIST` on a re-ADD: a ring
+        // member is present to the ring epoll, with no host adoption.
+        for (what, fd, event) in [("parent", parent, &parent_in), ("child", child, &child_in)] {
+            expect.served(
+                &format!("a second ADD of the {what} end"),
+                call(
+                    Root,
+                    ctl,
+                    [epoll, LINUX_EPOLL_CTL_ADD, fd, event.arg(), 0, 0],
+                ),
+                LINUX_EEXIST.guest_retval(),
             );
         }
         let got = arm_root_poll_now(call, epoll);
