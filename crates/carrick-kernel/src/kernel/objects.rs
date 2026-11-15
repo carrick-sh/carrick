@@ -2665,6 +2665,10 @@ pub struct FileTable {
     functional_refs_active: AtomicBool,
     revision: ObjectRevision,
     slot_subscriptions: Arc<FileSlotSubscriptions>,
+    /// Orders host adoptions of ring epolls in this table (#1671): one
+    /// adoption finds or builds an epoll's host description and installs
+    /// it at every copy before the next looks.
+    epoll_adoption: Mutex<()>,
 }
 
 enum TableCopyPurpose {
@@ -2695,6 +2699,7 @@ impl FileTable {
             functional_refs_active: AtomicBool::new(true),
             revision: ObjectRevision::new(),
             slot_subscriptions: Arc::new(FileSlotSubscriptions::default()),
+            epoll_adoption: Mutex::new(()),
         }
     }
 
@@ -2759,6 +2764,7 @@ impl FileTable {
             functional_refs_active: AtomicBool::new(true),
             revision: ObjectRevision::new(),
             slot_subscriptions: Arc::new(FileSlotSubscriptions::default()),
+            epoll_adoption: Mutex::new(()),
         }
     }
 
@@ -3437,6 +3443,13 @@ impl FileTable {
 
     pub(crate) fn write_epoll_fds(&self) -> FileTableRwWriteGuard<'_, BTreeSet<i32>> {
         self.rw_write(&self.epoll_fds)
+    }
+
+    /// Held across one host adoption of a ring epoll
+    /// ([`Self::ipc_ring_epoll_copies`]). A short host section: it takes no
+    /// guest wait and never parks.
+    pub(crate) fn lock_epoll_adoption(&self) -> MutexGuard<'_, ()> {
+        self.epoll_adoption.lock()
     }
 
     pub(crate) fn epoll_wake_registry(&self) -> &crate::dispatch::EpollWakeRegistry {
