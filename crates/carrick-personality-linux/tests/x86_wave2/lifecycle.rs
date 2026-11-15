@@ -116,8 +116,8 @@ struct Turn<'a> {
     current: Option<RecordRef>,
     words: [u32; 2],
     fail_copy: Option<u64>,
-    /// The next copy at this address is refused "not now" once.
-    not_yet: Option<u64>,
+    /// The next copy at this address and access is refused "not now" once.
+    not_yet: Option<(u64, carrick_guest_arch::Access)>,
     /// Guest-copy waits the policy asked the memory owner for.
     waited: Vec<carrick_core::user_copy::GuestCopyRequest>,
     wakes: u64,
@@ -179,7 +179,7 @@ impl<'a> Turn<'a> {
 }
 impl UserCopy for Turn<'_> {
     fn copy_in(&mut self, dst: &mut [u8], address: UserVa) -> carrick_core::user_copy::CopyOutcome {
-        if self.not_yet == Some(address.raw()) {
+        if self.not_yet == Some((address.raw(), carrick_guest_arch::Access::Read)) {
             self.not_yet = None;
             return carrick_core::user_copy::CopyOutcome::NotYet(
                 carrick_core::user_copy::GuestCopyRequest {
@@ -205,7 +205,7 @@ impl UserCopy for Turn<'_> {
             self.fail_copy = None;
             return carrick_core::user_copy::CopyOutcome::Fault;
         }
-        if self.not_yet == Some(address.raw()) {
+        if self.not_yet == Some((address.raw(), carrick_guest_arch::Access::Write)) {
             self.not_yet = None;
             return carrick_core::user_copy::CopyOutcome::NotYet(
                 carrick_core::user_copy::GuestCopyRequest {
@@ -741,7 +741,7 @@ pub fn x5_clone_tid_copy_not_yet_reruns() {
                 )
                 .unwrap();
             let args = [FLAGS, 0xdead0000, 0x1000, 0x77770000, 0x1004, 0];
-            turn.not_yet = Some(address);
+            turn.not_yet = Some((address, access));
             let route = turn.syscall(220, args);
             assert_ne!(
                 route,
