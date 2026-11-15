@@ -19222,7 +19222,7 @@ fn arm_root_socketpair_ends_are_ring_epoll_members() {
         let epoll = epoll as u64;
         let [parent, child] = arm_root_spawn_socketpair(call);
         let ctl = sys::EPOLL_CTL.raw();
-        let watch = (LINUX_EPOLLIN | LINUX_EPOLLRDHUP) as u32;
+        let watch = LINUX_EPOLLIN | LINUX_EPOLLRDHUP;
         let parent_in = epoll_event_buffer(watch, PARENT_COOKIE);
         let child_in = epoll_event_buffer(watch, CHILD_COOKIE);
         for (what, fd, event) in [("parent", parent, &parent_in), ("child", child, &child_in)] {
