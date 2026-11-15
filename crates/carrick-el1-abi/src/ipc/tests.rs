@@ -232,6 +232,14 @@ fn el1_ipc_backing_tokens_roundtrip_and_reject_unknown_tags() {
         },
         IpcBacking::EventFd { object },
         IpcBacking::Epoll { object },
+        IpcBacking::Stream {
+            object,
+            end: StreamEnd::First,
+        },
+        IpcBacking::Stream {
+            object,
+            end: StreamEnd::Second,
+        },
         IpcBacking::Host(HostResourceToken::new(HostResourceToken::MAX).unwrap()),
         IpcBacking::Host(HostResourceToken::new(1).unwrap()),
     ] {
@@ -239,7 +247,7 @@ fn el1_ipc_backing_tokens_roundtrip_and_reject_unknown_tags() {
     }
     for bad in [
         0,
-        5 << 61,
+        6 << 61,
         7 << 61,
         (3 << 61) | (1 << 60),
         (4 << 61) | (1 << 60),
@@ -1694,3 +1702,173 @@ fn object_growth_observation_excludes_the_segment_still_being_linked() {
 }
 
 mod lock_release;
+
+/// #2361: a ring stream pair is one object with two lanes. Each end
+/// writes its own lane and reads its peer's; a stocked ring backs both
+/// lanes at the first write; levels follow `poll(2)` for a connected
+/// `AF_UNIX` stream; the pair is freed exactly when both ends are gone.
+#[test]
+fn stream_pair_lanes_carry_each_direction_and_free_with_both_ends() {
+    use epoll::{EpollMember, events};
+    let fx = fixture(1 << 22);
+    let object = fx.region.create_stream(&Spin).unwrap();
+    let stocked = fx.pipe_storage();
+    fx.region.stock_ring(stocked).unwrap();
+    {
+        let mut g = fx.region.lock(object, &Spin).unwrap();
+        assert_eq!(g.kind(), Some(IpcObjectKind::Stream));
+        assert!(!g.stream_lane(StreamEnd::First).unwrap().is_backed());
+        assert_eq!(g.storage(), IpcPipeStorage::default());
+        assert!(g.ensure_stream_storage(StreamEnd::First).unwrap());
+        assert_eq!(g.storage(), stocked, "one stocked ring backs both lanes");
+        for end in [StreamEnd::First, StreamEnd::Second] {
+            let lane = g.stream_lane(end).unwrap();
+            assert!(lane.is_backed());
+            assert_eq!(lane.capacity(), IPC_STREAM_LANE_BYTES);
+        }
+        assert_eq!(
+            g.stream_lane(StreamEnd::First)
+                .unwrap()
+                .try_write(b"first->second")
+                .result,
+            Ok(13)
+        );
+        assert_eq!(
+            g.stream_lane(StreamEnd::Second)
+                .unwrap()
+                .try_write(b"back")
+                .result,
+            Ok(4)
+        );
+        let out = events::OUT | events::WRNORM | events::WRBAND;
+        let readable = events::IN | events::RDNORM;
+        assert_eq!(
+            g.member_level(EpollMember::StreamSecond).unwrap(),
+            readable | out
+        );
+        let mut buf = [0u8; 32];
+        assert_eq!(
+            g.stream_lane(StreamEnd::First)
+                .unwrap()
+                .try_read(&mut buf)
+                .result,
+            Ok(13)
+        );
+        assert_eq!(&buf[..13], b"first->second");
+        assert_eq!(g.member_level(EpollMember::StreamSecond).unwrap(), out);
+        assert_eq!(
+            g.member_level(EpollMember::StreamFirst).unwrap(),
+            readable | out
+        );
+    }
+    let IpcReleased::Object { wake, freed } = fx
+        .region
+        .release_backing(
+            IpcBacking::Stream {
+                object,
+                end: StreamEnd::Second,
+            }
+            .encode(),
+            &Spin,
+        )
+        .unwrap()
+    else {
+        panic!("a stream end releases its object endpoint");
+    };
+    assert!(!freed && wake.readers && wake.writers);
+    {
+        let mut g = fx.region.lock(object, &Spin).unwrap();
+        // The peer is gone: its unread bytes stay readable, then EOF;
+        // HUP and RDHUP; a write would be EPIPE, so it polls writable.
+        assert_eq!(
+            g.member_level(EpollMember::StreamFirst).unwrap(),
+            events::IN
+                | events::RDNORM
+                | events::RDHUP
+                | events::HUP
+                | events::OUT
+                | events::WRNORM
+                | events::WRBAND
+        );
+        assert_eq!(
+            g.stream_lane(StreamEnd::First)
+                .unwrap()
+                .try_write(b"x")
+                .result,
+            Err(pipe::Error::BrokenPipe)
+        );
+    }
+    let IpcReleased::Object { freed, .. } = fx
+        .region
+        .release_backing(
+            IpcBacking::Stream {
+                object,
+                end: StreamEnd::First,
+            }
+            .encode(),
+            &Spin,
+        )
+        .unwrap()
+    else {
+        panic!("a stream end releases its object endpoint");
+    };
+    assert!(freed, "the last end frees the pair");
+    assert!(matches!(
+        fx.region.lock(object, &Spin),
+        Err(IpcError::Stale)
+    ));
+}
+
+/// #2361: `shutdown(2)` drops an end's lane references; they are the
+/// shutdown state, so a second shutdown and the final close drop only
+/// what remains, and a half-shut pair reports RDHUP without HUP.
+#[test]
+fn stream_shutdown_drops_only_the_references_an_end_still_holds() {
+    use epoll::{EpollMember, events};
+    let fx = fixture(1 << 22);
+    let object = fx.region.create_stream(&Spin).unwrap();
+    for _ in 0..2 {
+        let wake = fx
+            .region
+            .shutdown_stream(object, StreamEnd::First, false, true, &Spin)
+            .unwrap();
+        assert_eq!(wake.object, object);
+    }
+    {
+        let mut g = fx.region.lock(object, &Spin).unwrap();
+        assert_eq!(
+            g.stream_lane(StreamEnd::First)
+                .unwrap()
+                .references(End::Writer),
+            0
+        );
+        assert_eq!(
+            g.member_level(EpollMember::StreamSecond).unwrap(),
+            events::IN
+                | events::RDNORM
+                | events::RDHUP
+                | events::OUT
+                | events::WRNORM
+                | events::WRBAND,
+            "the peer's reads end; its writes do not"
+        );
+    }
+    fx.region
+        .shutdown_stream(object, StreamEnd::First, true, false, &Spin)
+        .unwrap();
+    {
+        let mut g = fx.region.lock(object, &Spin).unwrap();
+        assert_ne!(
+            g.member_level(EpollMember::StreamFirst).unwrap() & events::HUP,
+            0,
+            "both of its directions are shut"
+        );
+    }
+    for (end, freed) in [(StreamEnd::First, false), (StreamEnd::Second, true)] {
+        let released = fx
+            .region
+            .release_backing(IpcBacking::Stream { object, end }.encode(), &Spin)
+            .unwrap();
+        assert!(matches!(released, IpcReleased::Object { freed: f, .. } if f == freed));
+    }
+}
