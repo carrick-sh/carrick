@@ -92,6 +92,46 @@ pub struct HostLease {
     socket: PathBuf,
     path: PathBuf,
     mode: HostLeaseMode,
+    /// This thread's count of direct shared leases on `path` (#2378 review).
+    _shared: Option<SharedHold>,
+}
+
+thread_local! {
+    /// Direct shared leases each thread holds, by lock path. A thread that already
+    /// holds one passes the turnstile for its next shared request: queueing it
+    /// behind a writer that waits for this thread's own first lease would
+    /// deadlock (#2378 review). Threads of one process are still separate holders.
+    static HELD_SHARED: std::cell::RefCell<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// One direct shared lease counted for the thread that acquired it.
+struct SharedHold(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl SharedHold {
+    fn count(path: &Path) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        HELD_SHARED.with(|held| {
+            std::sync::Arc::clone(held.borrow_mut().entry(path.to_path_buf()).or_default())
+        })
+    }
+}
+impl Drop for SharedHold {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The turnstile held LOCK_EX by a queued exclusive request: unlocked on every
+/// exit (grant, timeout, error, panic). LOCK_UN releases the description even
+/// when a fork has copied the fd before its exec, where a bare close would not
+/// (#2378 review).
+struct TurnstileHold<'a>(&'a OwnedFd, bool);
+impl Drop for TurnstileHold<'_> {
+    fn drop(&mut self) {
+        if self.1 {
+            // SAFETY: the fd is open for the guard's lifetime.
+            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -660,15 +700,21 @@ impl HostLease {
             source,
         };
 
+        let held_shared = (!exclusive).then(|| SharedHold::count(path));
+        let reentrant = held_shared
+            .as_ref()
+            .is_some_and(|n| n.load(std::sync::atomic::Ordering::SeqCst) > 0);
         let start = Instant::now();
         let mut waited = false;
-        let mut queued = false;
+        let mut queued = TurnstileHold(&turnstile, false);
         loop {
             let acquired = if exclusive {
-                if !queued {
-                    queued = flock_nb(&turnstile, libc::LOCK_EX).map_err(io_error)?;
+                if !queued.1 {
+                    queued.1 = flock_nb(&turnstile, libc::LOCK_EX).map_err(io_error)?;
                 }
-                queued && flock_nb(&fd, libc::LOCK_EX).map_err(io_error)?
+                queued.1 && flock_nb(&fd, libc::LOCK_EX).map_err(io_error)?
+            } else if reentrant {
+                flock_nb(&fd, libc::LOCK_SH).map_err(io_error)?
             } else if flock_nb(&turnstile, libc::LOCK_SH).map_err(io_error)? {
                 let got = flock_nb(&fd, libc::LOCK_SH);
                 unlock(&turnstile);
@@ -709,15 +755,21 @@ impl HostLease {
             }
         }
         // Granted: let the next request through the turnstile.
-        unlock(&turnstile);
+        drop(queued);
         drop(turnstile);
         eprintln!("host-lease: acquired {mode} at {}", path.display());
 
         let fd = OwnedFileLock::from_locked(std::fs::File::from(fd));
-        Self::serve(path, mode, fd, scope).map_err(|source| HostLeaseError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+        let mut lease =
+            Self::serve(path, mode, fd, scope).map_err(|source| HostLeaseError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if let Some(count) = held_shared {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            lease._shared = Some(SharedHold(count));
+        }
+        Ok(lease)
     }
 
     fn serve(
@@ -816,6 +868,7 @@ impl HostLease {
             socket,
             path: path.to_path_buf(),
             mode,
+            _shared: None,
         })
     }
 
@@ -889,6 +942,7 @@ impl HostLease {
             socket: socket.to_path_buf(),
             path: path.to_path_buf(),
             mode: identity.mode,
+            _shared: None,
         })
     }
 
@@ -1025,57 +1079,223 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    /// #2375: an exclusive request is granted within about one shared-holder
-    /// lifetime under a continuous stream of overlapping shared holders, at
-    /// the production acquisition entry. Three shared holders, staggered by a
-    /// third of their hold, reacquire as soon as they release, so the lock is
-    /// never free: a writer that only polls the lock starves until its limit.
+    /// True while some exclusive request holds `lock`'s turnstile (it is queued).
+    fn writer_queued(lock: &Path) -> bool {
+        let probe = open_lock_file(&turnstile_path(lock)).unwrap();
+        // SAFETY: probe is open.
+        if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) };
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Wait (hang-guarded) until `cond` holds.
+    fn until(what: &str, mut cond: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "never saw {what}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A shared holder on its own thread: it signals once it holds, then holds
+    /// until told to release.
+    fn shared_holder(
+        lock: &std::sync::Arc<PathBuf>,
+        order: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (
+        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (lock, order) = (std::sync::Arc::clone(lock), std::sync::Arc::clone(order));
+        let join = std::thread::spawn(move || {
+            let lease = HostLease::acquire_path_with_limit(
+                &lock,
+                HostLeaseMode::Carrick,
+                Duration::from_secs(20),
+            )
+            .unwrap();
+            held_tx
+                .send(order.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+                .unwrap();
+            let _ = release_rx.recv();
+            drop(lease);
+        });
+        (held_rx, release_tx, join)
+    }
+
+    /// #2375: under a continuous stream of shared holders, where each next
+    /// holder is admitted BEFORE the previous one releases (so the lock is
+    /// never free), an exclusive request is granted after the holder already
+    /// in releases, ahead of the next shared request. On main the stream never
+    /// leaves a gap, and the writer starves until its limit. Overlap and
+    /// ordering are established by coordination; time is only a hang guard.
     #[test]
-    fn exclusive_request_is_granted_within_one_shared_lifetime_under_a_shared_stream() {
+    fn exclusive_request_is_granted_ahead_of_a_continuous_shared_stream() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        const HOLD: Duration = Duration::from_millis(300);
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let lock = Arc::new(dir.path().join("host.lock"));
-        let stop = Arc::new(AtomicBool::new(false));
-        let readers: Vec<_> = (0..3u32)
-            .map(|i| {
-                let (lock, stop) = (Arc::clone(&lock), Arc::clone(&stop));
-                std::thread::spawn(move || {
-                    std::thread::sleep(HOLD / 3 * i);
-                    let mut held = 0u32;
-                    while !stop.load(Ordering::SeqCst) {
-                        let lease = HostLease::acquire_path_with_limit(
-                            &lock,
-                            HostLeaseMode::Carrick,
-                            Duration::from_secs(30),
-                        )
-                        .unwrap();
-                        std::thread::sleep(HOLD);
-                        drop(lease);
-                        held += 1;
-                    }
-                    held
-                })
+        let order = Arc::new(AtomicUsize::new(0));
+        let (held, mut release, mut join) = shared_holder(&lock, &order);
+        held.recv().unwrap();
+        let writer = {
+            let (lock, order) = (Arc::clone(&lock), Arc::clone(&order));
+            std::thread::spawn(move || {
+                let lease = HostLease::acquire_path_with_limit(
+                    &lock,
+                    HostLeaseMode::Gate,
+                    Duration::from_secs(5),
+                );
+                let at = order.fetch_add(1, Ordering::SeqCst);
+                (lease.is_ok(), at)
             })
-            .collect();
-        // Let the stream reach steady state (all three overlapping).
-        std::thread::sleep(HOLD * 2);
-        let asked = Instant::now();
-        let writer =
-            HostLease::acquire_path_with_limit(&lock, HostLeaseMode::Gate, Duration::from_secs(5));
-        let waited = asked.elapsed();
-        stop.store(true, Ordering::SeqCst);
-        let granted = writer.is_ok();
-        drop(writer);
-        let held: u32 = readers.into_iter().map(|r| r.join().unwrap()).sum();
-        assert!(held >= 6, "the shared stream ran ({held} holds)");
-        assert!(granted, "the exclusive request starved for {waited:?}");
-        // One shared lifetime, plus the 100 ms poll and scheduling slack.
+        };
+        let mut handoffs = 0u32;
+        let next_at = loop {
+            // Admit the next shared holder while the current one still holds.
+            let (next_held, next_release, next_join) = shared_holder(&lock, &order);
+            let mut next_at = None;
+            until("the next holder or a queued writer", || {
+                next_at = next_held.try_recv().ok();
+                next_at.is_some() || writer_queued(&lock) || writer.is_finished()
+            });
+            let _ = release.send(());
+            join.join().unwrap();
+            (release, join) = (next_release, next_join);
+            match next_at {
+                // Overlapped handoff: the stream goes on (what starves a polling writer).
+                Some(_) if !writer.is_finished() => handoffs += 1,
+                Some(at) => break at,
+                // The writer is queued: the next holder waits behind it.
+                None => break next_held.recv().unwrap(),
+            }
+        };
+        let _ = release.send(());
+        join.join().unwrap();
+        let (granted, writer_at) = writer.join().unwrap();
         assert!(
-            waited < HOLD * 3,
-            "exclusive granted after {waited:?}, more than one shared lifetime ({HOLD:?}) plus slack"
+            granted,
+            "the exclusive request starved ({handoffs} overlapped shared handoffs)"
         );
+        assert!(
+            writer_at < next_at,
+            "a shared holder ({next_at}) got in ahead of the queued exclusive request ({writer_at})"
+        );
+    }
+
+    /// #2378 review P0: a queued exclusive request that gives up (timeout)
+    /// while an unrelated fork holds a copy of the turnstile fd must still
+    /// release the turnstile, or every later request blocks.
+    #[test]
+    fn an_abandoned_queue_slot_is_released_even_with_a_forked_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = std::sync::Arc::new(dir.path().join("host.lock"));
+        let shared = HostLease::acquire_path(&lock, HostLeaseMode::Carrick).unwrap();
+        let writer = {
+            let lock = std::sync::Arc::clone(&lock);
+            std::thread::spawn(move || {
+                matches!(
+                    HostLease::acquire_path_with_limit(
+                        &lock,
+                        HostLeaseMode::Gate,
+                        Duration::from_millis(1500)
+                    ),
+                    Err(HostLeaseError::Timeout { .. })
+                )
+            })
+        };
+        until("the queued writer", || writer_queued(&lock));
+        let turnstile = {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(turnstile_path(&lock)).unwrap();
+            (meta.dev(), meta.ino())
+        };
+        let mut gate = [0; 2];
+        assert_eq!(unsafe { libc::pipe(gate.as_mut_ptr()) }, 0);
+        // SAFETY: the child calls only async-signal-safe functions (fstat,
+        // close, read, _exit). It keeps only its copy of the queued writer's
+        // turnstile fd and its pipe end, closing every other inherited fd so
+        // it never holds another test's pipes or sockets open.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe {
+                for fd in 3..4096 {
+                    if fd == gate[0] {
+                        continue;
+                    }
+                    let mut st: libc::stat = std::mem::zeroed();
+                    let keep = libc::fstat(fd, &raw mut st) == 0
+                        && st.st_dev as u64 == turnstile.0
+                        && st.st_ino as u64 == turnstile.1;
+                    if !keep {
+                        libc::close(fd);
+                    }
+                }
+                let mut byte = 0u8;
+                libc::read(gate[0], (&raw mut byte).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(gate[0]) };
+        assert!(writer.join().unwrap(), "the writer should have timed out");
+        drop(shared);
+        let after = HostLease::acquire_path_with_limit(
+            &lock,
+            HostLeaseMode::Carrick,
+            Duration::from_secs(1),
+        );
+        unsafe {
+            libc::write(gate[1], [1u8].as_ptr().cast(), 1);
+            libc::close(gate[1]);
+            let mut status = 0;
+            libc::waitpid(child, &raw mut status, 0);
+        }
+        assert!(
+            after.is_ok(),
+            "the abandoned turnstile still blocks new requests"
+        );
+    }
+
+    /// #2378 review P0: a thread holding a direct shared lease that asks for
+    /// another must not queue behind a writer that waits for its first one.
+    #[test]
+    fn a_thread_holding_a_shared_lease_reenters_past_a_queued_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = std::sync::Arc::new(dir.path().join("host.lock"));
+        let first = HostLease::acquire_path(&lock, HostLeaseMode::Carrick).unwrap();
+        let writer = {
+            let lock = std::sync::Arc::clone(&lock);
+            std::thread::spawn(move || {
+                HostLease::acquire_path_with_limit(
+                    &lock,
+                    HostLeaseMode::Gate,
+                    Duration::from_secs(5),
+                )
+                .is_ok()
+            })
+        };
+        until("the queued writer", || writer_queued(&lock));
+        let again = HostLease::acquire_path_with_limit(
+            &lock,
+            HostLeaseMode::Carrick,
+            Duration::from_secs(1),
+        );
+        assert!(
+            again.is_ok(),
+            "the re-entrant shared request deadlocked behind the writer"
+        );
+        drop((first, again));
+        assert!(writer.join().unwrap());
     }
 
     /// #2375 review: a planted symlink or a non-regular file at the lock or the
