@@ -9,6 +9,7 @@ pub mod authority_source;
 pub mod board;
 pub mod ci_changes;
 pub mod ci_receipt;
+pub mod ci_reclaim;
 pub mod ci_scaler;
 pub mod claims;
 pub mod cli;

@@ -26,6 +26,10 @@ pub enum Commands {
     CompilerCacheStart,
     /// Check free space only after exclusive host admission.
     CheckDisk(crate::host_lease::DiskArgs),
+    #[command(
+        about = "On a CI runner, remove its own Cargo target dir when the volume is below the floor"
+    )]
+    CiReclaimTarget(crate::ci_reclaim::ReclaimArgs),
     #[command(about = "Acquire and renew CAS leases over refs/claims/*")]
     Claims(crate::claims::ClaimsArgs),
     /// Repeat a signed test and capture the first selected failure (macOS).
@@ -516,6 +520,13 @@ where
         Commands::StressCapture(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::stress_capture::run(&root, args)?;
+            Ok(())
+        }
+        Commands::CiReclaimTarget(args) => {
+            crate::ci_reclaim::run(&args).map_err(|source| CliError::Io {
+                path: args.target_dir.clone(),
+                source,
+            })?;
             Ok(())
         }
         Commands::CheckDisk(args) => {
