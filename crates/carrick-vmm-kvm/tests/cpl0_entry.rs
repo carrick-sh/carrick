@@ -4126,6 +4126,33 @@ fn production_fork_editor_busy_once_then_forks() {
     );
 }
 
+/// #2306 on x86 CPL0: the reservation root is held once while a production
+/// fork counts the parent's mappings. That acquisition is Busy, not a fault:
+/// fork keeps its syscall, reruns, and the parent gets the child's pid and
+/// reaps it, never EFAULT (114) or EAGAIN (111).
+#[test]
+fn production_fork_census_root_busy_once_then_forks() {
+    bounded_contention_witness(
+        "production_fork_census_root_busy_once_then_forks",
+        "native_not_now_contention.S",
+        &["-DFORK_CENSUS_ROOT=1"],
+        "fork mapping-census root contention",
+    );
+}
+
+/// #2306 on x86 CPL0: as above with the root held once while the fork
+/// commits the child's MM. The prepared child is aborted and the fork
+/// reruns to success, never EFAULT (114).
+#[test]
+fn production_fork_commit_root_busy_once_then_forks() {
+    bounded_contention_witness(
+        "production_fork_commit_root_busy_once_then_forks",
+        "native_not_now_contention.S",
+        &["-DFORK_COMMIT_ROOT=1"],
+        "fork child-commit root contention",
+    );
+}
+
 /// #2306 on x86 CPL0: waitid(WNOHANG) with a live production fork child.
 /// Its empty siginfo copy is Busy once; nothing was consumed, so the call
 /// reruns and answers 0 with the zeroed siginfo, never EAGAIN (111).

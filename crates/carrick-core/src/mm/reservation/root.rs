@@ -870,6 +870,49 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         )
     }
 
+    /// Test images only: take `mm`'s root lock word as `holder`, as a
+    /// sibling's critical section does, so the next acquisition meets a real
+    /// held root. No waiter enrols on it ([`NoRootWait`] gives up at once),
+    /// so [`Self::release_test_hold`] needs no release notification.
+    #[cfg(feature = "test-support")]
+    pub fn hold_for_test(&self, index: usize, mm: ReservationMm, holder: RootHolder) -> bool {
+        let Some(root) = self.roots.get(index) else {
+            return false;
+        };
+        if root.key.load(Ordering::Acquire) != mm.raw() {
+            return false;
+        }
+        let required = root.locked.load(Ordering::Acquire) & ROOT_NOTIFICATION_REQUIRED;
+        root.locked
+            .compare_exchange(
+                required,
+                holder.word() | required,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Release a [`Self::hold_for_test`] hold. False when `holder` does not
+    /// hold the root.
+    #[cfg(feature = "test-support")]
+    pub fn release_test_hold(&self, index: usize, holder: RootHolder) -> bool {
+        let Some(root) = self.roots.get(index) else {
+            return false;
+        };
+        let held = root.locked.load(Ordering::Acquire);
+        held & !ROOT_NOTIFICATION_REQUIRED == holder.word()
+            && root
+                .locked
+                .compare_exchange(
+                    held,
+                    held & ROOT_NOTIFICATION_REQUIRED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+    }
+
     /// The root EL1 on vCPU slot `slot` holds, read without any guard: the
     /// host asks at an exit that slot took from inside the EL1 image, which
     /// must never leave a root held (an EL1 critical section is resumed to

@@ -847,7 +847,26 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         let _ = drain_retired_spaces(&owner, self.worker());
         let mm = ReservationMm::new(parent.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
         let live = anonymous::live_words(mm).ok_or(NativeProcessError::Stale)?;
-        let capacity = owner.fork_mapping_count(mm, self.worker()).map_err(error)?;
+        #[cfg(feature = "test-support")]
+        let held = owner.spaces.find(mm.raw()).map(|index| {
+            let index = index.index();
+            let site = crate::test_support::ForkRootSite::Census;
+            (
+                index,
+                crate::test_support::hold_fork_root(site, owner.roots, index, mm),
+            )
+        });
+        let capacity = owner.fork_mapping_count(mm, self.worker());
+        #[cfg(feature = "test-support")]
+        if let Some((index, held)) = held {
+            crate::test_support::release_fork_root(
+                held,
+                owner.roots,
+                index,
+                matches!(capacity, Err(carrick_core::mm::transaction::MmError::Busy)),
+            );
+        }
+        let capacity = capacity.map_err(error)?;
         let mut mappings = Vec::new();
         mappings
             .try_reserve_exact(capacity)
@@ -994,7 +1013,31 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     ) -> Result<Box<Born>, (NativeProcessError, Prepared)> {
         let result = portal()
             .map_err(NativeProcessError::from)
-            .and_then(|owner| p.child.commit(&owner, self.worker()).map_err(error));
+            .and_then(|owner| {
+                #[cfg(feature = "test-support")]
+                let held = {
+                    let parent = p.child.completion().request.operation.mm;
+                    owner.spaces.find(parent.raw()).map(|index| {
+                        let index = index.index();
+                        let site = crate::test_support::ForkRootSite::Commit;
+                        (
+                            index,
+                            crate::test_support::hold_fork_root(site, owner.roots, index, parent),
+                        )
+                    })
+                };
+                let committed = p.child.commit(&owner, self.worker());
+                #[cfg(feature = "test-support")]
+                if let Some((index, held)) = held {
+                    crate::test_support::release_fork_root(
+                        held,
+                        owner.roots,
+                        index,
+                        matches!(committed, Err(carrick_core::mm::transaction::MmError::Busy)),
+                    );
+                }
+                committed.map_err(error)
+            });
         match result {
             Ok(_) => Ok(Box::new(Born {
                 prepared: p,

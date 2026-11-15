@@ -4,6 +4,10 @@
  * (111 = EAGAIN, 114 = EFAULT); 90..96 a wrong answer.
  *   FORK_EDITOR    the parent's space editor is held once at fork
  *                  preparation: fork reruns and returns the child's pid
+ *   FORK_CENSUS_ROOT  the reservation root is held once while fork counts
+ *                  the parent's mappings: fork reruns, returns the child's
+ *                  pid, and exactly one acquisition was refused
+ *   FORK_COMMIT_ROOT  as above, while fork commits the child's MM
  *   WAITID_BUSY    waitid(P_ALL, WEXITED|WNOHANG) with a live child: its
  *                  empty siginfo copy is Busy once; the call reruns and
  *                  answers 0 with a zeroed siginfo
@@ -14,6 +18,9 @@
 #define INJECT_EDITOR_BUSY_ONCE -495     /* 0x...fe11 */
 #define INJECT_OWNED_COPY_BUSY_ONCE -485 /* 0x...fe1b */
 #define INJECT_OWNED_COPY_CENSUS -484    /* 0x...fe1c */
+#define INJECT_FORK_CENSUS_ROOT_HELD_ONCE -473 /* 0x...fe27 */
+#define INJECT_FORK_COMMIT_ROOT_HELD_ONCE -472 /* 0x...fe28 */
+#define INJECT_FORK_ROOT_HOLD_CENSUS -471      /* 0x...fe29 */
 #define SIGCHLD 17
 #define CLONE_CHILD_SETTID 0x01000000
 .global _start
@@ -26,6 +33,21 @@ _start:
     movl $-1, info+16(%rip)
 #if defined(FORK_EDITOR)
     mov $INJECT_EDITOR_BUSY_ONCE, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_inject
+    mov $57, %eax
+    syscall
+    test %rax, %rax
+    js errno_exit
+    jz exit_child
+    mov %rax, %r12
+#elif defined(FORK_CENSUS_ROOT) || defined(FORK_COMMIT_ROOT)
+#if defined(FORK_CENSUS_ROOT)
+    mov $INJECT_FORK_CENSUS_ROOT_HELD_ONCE, %rax
+#else
+    mov $INJECT_FORK_COMMIT_ROOT_HELD_ONCE, %rax
+#endif
     syscall
     test %rax, %rax
     jnz fail_inject
@@ -91,7 +113,7 @@ _start:
     jz settid_child
     mov %rax, %r12
 #else
-#error "FORK_EDITOR, WAITID_BUSY or SETTID_BUSY"
+#error "FORK_EDITOR, FORK_CENSUS_ROOT, FORK_COMMIT_ROOT, WAITID_BUSY or SETTID_BUSY"
 #endif
     /* wait4(child, &status, 0, NULL) */
     mov %r12, %rdi
@@ -124,6 +146,14 @@ _start:
     cmp $1, %rax
     jne fail_census
     mov $7, %edi
+#elif defined(FORK_CENSUS_ROOT) || defined(FORK_COMMIT_ROOT)
+    /* The child exited 7; the hold refused exactly one acquisition. */
+    cmp $7, %edi
+    jne exit
+    mov $INJECT_FORK_ROOT_HOLD_CENSUS, %rax
+    syscall
+    cmp $1, %rax
+    jne fail_census
 #endif
     jmp exit
 #endif

@@ -110,6 +110,62 @@ mod test_support {
     /// The calling member's CPU slot, so the fixture can keep the held
     /// member off its poller's CPU.
     pub const INJECT_CURRENT_CPU: u64 = 0xffff_ffff_ffff_fe26;
+    /// The next native fork's parent-mapping census finds the parent's
+    /// reservation root held by another holder, who releases it when that
+    /// acquisition returns (#2306).
+    pub const INJECT_FORK_CENSUS_ROOT_HELD_ONCE: u64 = 0xffff_ffff_ffff_fe27;
+    /// As above, at the next native fork's child commit.
+    pub const INJECT_FORK_COMMIT_ROOT_HELD_ONCE: u64 = 0xffff_ffff_ffff_fe28;
+    /// Fork acquisitions refused by an injected root hold.
+    pub const INJECT_FORK_ROOT_HOLD_CENSUS: u64 = 0xffff_ffff_ffff_fe29;
+    /// A fork MM acquisition an injected root hold can refuse.
+    #[derive(Clone, Copy)]
+    pub enum ForkRootSite {
+        Census = 1,
+        Commit = 2,
+    }
+    static FORK_ROOT_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    static FORK_ROOT_REFUSALS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    /// The holder an injected fork root hold names: no CPU of this zone.
+    const FORK_ROOT_HOLDER: carrick_core::mm::reservation::RootHolder =
+        carrick_core::mm::reservation::RootHolder::El1Slot(u32::MAX - 2);
+
+    /// Hold the real reservation root at `index` (`mm`'s) across the next
+    /// acquisition at `site` when the fixture armed it. True when held.
+    pub fn hold_fork_root(
+        site: ForkRootSite,
+        roots: &carrick_el1::memory::reservations::X86Cpl0Reservations,
+        index: usize,
+        mm: carrick_el1_abi::ReservationMm,
+    ) -> bool {
+        FORK_ROOT_HOLD
+            .compare_exchange(site as u8, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && (roots.hold_for_test(index, mm, FORK_ROOT_HOLDER)
+                || carrick_x86_carrier::entry::fatal_boot())
+    }
+
+    /// The held acquisition returned: the holder releases the root. A hold
+    /// the holder no longer owns fails the run rather than leak.
+    pub fn release_fork_root(
+        held: bool,
+        roots: &carrick_el1::memory::reservations::X86Cpl0Reservations,
+        index: usize,
+        refused_busy: bool,
+    ) {
+        if !held {
+            return;
+        }
+        if !roots.release_test_hold(index, FORK_ROOT_HOLDER) {
+            carrick_x86_carrier::entry::fatal_boot();
+        }
+        if refused_busy {
+            FORK_ROOT_REFUSALS.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     static COW_SETTLE_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     static COW_SETTLE_TIMED_OUT: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
@@ -431,6 +487,18 @@ mod test_support {
                     .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot());
                 Some(0)
             }
+            INJECT_FORK_CENSUS_ROOT_HELD_ONCE | INJECT_FORK_COMMIT_ROOT_HELD_ONCE => {
+                let site = if native == INJECT_FORK_CENSUS_ROOT_HELD_ONCE {
+                    ForkRootSite::Census
+                } else {
+                    ForkRootSite::Commit
+                };
+                FORK_ROOT_HOLD
+                    .compare_exchange(0, site as u8, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                    .then_some(0)
+            }
+            INJECT_FORK_ROOT_HOLD_CENSUS => Some(FORK_ROOT_REFUSALS.load(Ordering::Acquire)),
             INJECT_CURRENT_CPU => Some(u64::from(binding.cpu_slot)),
             INJECT_COW_SETTLE_TIMED_OUT => {
                 Some(u64::from(COW_SETTLE_TIMED_OUT.load(Ordering::Acquire)))
