@@ -18548,11 +18548,7 @@ fn arm_root_ring_epoll_aliases_share_one_host_half() {
         let (_, alias) = call(Root, sys::DUP.raw(), [epoll, 0, 0, 0, 0, 0]);
         assert!(alias >= 0, "dup: {alias}");
         let alias = alias as u64;
-        let (_, high) = call(
-            Root,
-            sys::FCNTL.raw(),
-            [epoll, LINUX_F_DUPFD as u64, 20, 0, 0, 0],
-        );
+        let (_, high) = call(Root, sys::FCNTL.raw(), [epoll, LINUX_F_DUPFD, 20, 0, 0, 0]);
         assert!(high >= 20, "F_DUPFD: {high}");
         let high = high as u64;
         let [parent, child] = arm_root_spawn_socketpair(call);
