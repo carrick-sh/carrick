@@ -2880,7 +2880,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     /// Publish the already-installed successor through the graph, registry,
     /// scheduler record and current-task projection as one owned cutover.
-    /// Every fallible validation is complete before this is called.
+    /// Every fallible validation is complete before this is called. Returns
+    /// the exec obligations its stores completed, which the settlement
+    /// carries to the carrier's exec owner.
     #[inline(never)]
     fn commit_exec_successor(
         &mut self,
@@ -2888,7 +2890,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         service_rebind: carrick_core_abi::service::PreparedServiceRebind<'_>,
         comm: [u8; 16],
         validated: Box<ValidatedExecSuccessor<'a>>,
-    ) -> Result<(), NativeFailure> {
+    ) -> Result<carrick_el1_abi::ExecCommitEffects, NativeFailure> {
+        use carrick_el1_abi::ExecCommitEffects;
         let registry = self.runtime.registry.lock().ok_or(NativeFailure::Stale)?;
         let mut state = registry.state.lock();
         let record = self.source.zone.record(self.record.id);
@@ -2973,8 +2976,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         resources.address = successor.address;
         resources.interrupted_child_waits.clear();
         resources.pending_signal_deliveries.clear();
+        let mut effects = ExecCommitEffects::DELIVERIES_CLEARED;
         resources.pending_child_tid = None;
         resources.signals.reset_for_exec_survivor(self.record);
+        effects = effects.with(ExecCommitEffects::SIGNALS_RESET);
         resources.members[0].thread = validated.new_key.task;
         *row.context_mut() = *successor.words;
         row.threads = GuestThreads {
@@ -3013,10 +3018,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.control
                 .promote_exec_identity_owned(validated.leader_tid);
         }
+        effects = effects.with(ExecCommitEffects::LEADER_PROMOTED);
         self.control.set_robust_list(0, 0);
         self.control.set_clear_child_tid(0);
+        effects = effects.with(ExecCommitEffects::ROBUST_CLEARED);
         self.control
             .write_altstack(carrick_personality_linux::abi::thread::AltStack::DISABLED);
+        effects = effects.with(ExecCommitEffects::ALTSTACK_DISABLED);
         let mut new_record_identity = validated.old_record_identity;
         new_record_identity.tid = leader.raw() as u64;
         new_record_identity.mm = successor.address.mm.raw().get();
@@ -3048,7 +3056,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.calling_tid = validated.leader_tid;
         self.caller_address = successor.address;
         self.words = successor.words;
-        Ok(())
+        Ok(effects)
     }
 
     /// Prove every fallible graph and scheduler condition before the consuming
@@ -3383,14 +3391,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.current.linux.mark_pending_host_work();
         }
 
-        if self
+        let settled = self
             .commit_exec_successor(successor, service_rebind, comm, validated)
-            .is_err()
-            || self
-                .service
-                .finish_exec_successor(predecessor, successor_address)
-                .is_err()
-        {
+            .map_err(NativeProcessError::from)
+            .and_then(|effects| {
+                self.service
+                    .finish_exec_successor(predecessor, successor_address, effects)
+            });
+        if settled.is_err() {
             let _ = self.release_service_claim(pending.claim);
             return Ok(self.exec_past_no_return());
         }

@@ -398,13 +398,11 @@ impl CarrierVmCustodyState {
     }
 }
 
-/// One prepared image retained by its exact carrier-issued adoption receipt.
+/// The carrier's exec owner (#2305): the neutral owner the x86 carrier
+/// shares, over HVF's prepared successors. HVF never parks a request.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-type RetainedNativeExecPreparation = (
-    carrick_core_abi::service::ExecAdoptionReceipt,
-    carrick_core_abi::service::ServiceIdentity,
-    crate::trap::PreparedNativeExecSuccessor,
-);
+pub(crate) type NativeExecOwner =
+    carrick_hal::exec_owner::ExecPreparations<crate::trap::PreparedNativeExecSuccessor>;
 
 /// Carrier-owned VM lifecycle authority.
 ///
@@ -471,11 +469,12 @@ pub struct CarrierVmCustody {
     pub(crate) native_root_replies:
         parking_lot::Mutex<crate::metadata_grant::NativeRootReplyLedger>,
     pub(crate) native_root_waits: crate::metadata_grant::NativeRootWaitLedger,
-    pub(crate) native_exec_preparations: parking_lot::Mutex<Vec<RetainedNativeExecPreparation>>,
+    /// Exec receipts reserved at claim, the prepared successors keyed by
+    /// them, and the adopted execs awaiting settlement.
+    pub(crate) native_exec_preparations: parking_lot::Mutex<NativeExecOwner>,
     pub(crate) native_exec_predecessors: parking_lot::Mutex<
         Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<carrick_hal::asid::AsidGeneration>>,
     >,
-    pub(crate) native_exec_receipt_sequence: std::sync::atomic::AtomicU64,
     pub(crate) guest_capture: std::sync::Arc<crate::guest_capture::GuestCapture>,
 }
 
@@ -494,33 +493,57 @@ impl CarrierVmCustody {
         self.native_exec_services.install(capability, service)
     }
 
-    pub(crate) fn reserve_native_exec_receipt(
+    /// Reserve the receipt for the ring's exec request `identity` asked for
+    /// `successor`, before any preparation runs.
+    pub(crate) fn claim_native_exec(
         &self,
-    ) -> Result<carrick_core_abi::service::ExecAdoptionReceipt, ()> {
-        let raw = self
-            .native_exec_receipt_sequence
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |current| current.checked_add(1),
-            )
-            .map_err(|_| ())?
-            .checked_add(1)
-            .and_then(core::num::NonZeroU64::new)
-            .and_then(carrick_core_abi::service::ExecAdoptionReceipt::checked)
-            .ok_or(())?;
-        Ok(raw)
-    }
-
-    pub(crate) fn retain_native_exec_preparation(
-        &self,
-        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
         identity: carrick_core_abi::service::ServiceIdentity,
-        prepared: crate::trap::PreparedNativeExecSuccessor,
-    ) {
+        successor: carrick_el1_abi::ReservationMm,
+        root_generation: core::num::NonZeroU64,
+    ) -> Result<
+        carrick_core_abi::service::ExecAdoptionReceipt,
+        carrick_hal::exec_owner::ExecOwnerError,
+    > {
         self.native_exec_preparations
             .lock()
-            .push((receipt, identity, prepared));
+            .claim(identity, successor, root_generation)
+            .map(|claim| claim.receipt())
+    }
+
+    /// Stage the claimed row's prepared successor and seal it: the manifest
+    /// carries the receipt reserved at claim. A refusal retires the row.
+    pub(crate) fn seal_native_exec_preparation(
+        &self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        prepared: crate::trap::PreparedNativeExecSuccessor,
+    ) -> Result<(), ()> {
+        let mut owner = self.native_exec_preparations.lock();
+        let sealed = match owner.stage(receipt, prepared) {
+            Ok(()) => owner.seal(receipt).is_ok(),
+            Err((_, prepared)) => {
+                drop(owner);
+                drop(prepared);
+                return Err(());
+            }
+        };
+        if sealed {
+            return Ok(());
+        }
+        let retired = owner.retire(receipt, carrick_hal::exec_owner::ExecRetireReason::Refused);
+        drop(owner);
+        drop(retired);
+        Err(())
+    }
+
+    /// Retire the unadopted row `receipt` for `reason`, dropping what it
+    /// held outside the owner's lock.
+    pub(crate) fn retire_native_exec(
+        &self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        reason: carrick_hal::exec_owner::ExecRetireReason,
+    ) -> bool {
+        let retired = self.native_exec_preparations.lock().retire(receipt, reason);
+        retired.is_ok()
     }
 
     pub(crate) fn take_native_exec_preparation(
@@ -532,24 +555,15 @@ impl CarrierVmCustody {
         crate::trap::PreparedNativeExecSuccessor,
         carrick_core_abi::service::ExecSuccessorManifestView,
     )> {
-        let mut retained = self.native_exec_preparations.lock();
-        let index = retained
-            .iter()
-            .position(|(candidate, _, _)| *candidate == receipt)?;
-        let (_, identity, _) = &retained[index];
-        let view = manifest.open(*identity, receipt)?;
-        let birth = identity.birth;
-        if birth.process.id.raw() as u64 != execution.binding.task.raw()
-            || identity.execution != execution.binding.generation
-            || birth.thread != execution.binding.thread_generation
-            || birth.mm.carrier() != self.transfer_carrier
-            || birth.mm.mm().raw() != execution.binding.mm.raw()
-            || birth.mm.incarnation().get() != execution.context.generation.raw().get()
-        {
+        let mut owner = self.native_exec_preparations.lock();
+        let (claim, _) = owner.sealed(receipt)?;
+        let view = manifest.open(claim.identity(), receipt)?;
+        if !claim.names_execution(self.transfer_carrier, execution) {
             return None;
         }
-        let (_, _, prepared) = retained.swap_remove(index);
-        Some((prepared, view))
+        let predecessor = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())?;
+        let adoption = owner.adopt(receipt, predecessor).ok()?;
+        Some((adoption.data, view))
     }
 
     pub(crate) fn validate_native_exec_preparation(
@@ -558,18 +572,10 @@ impl CarrierVmCustody {
         manifest: &carrick_core_abi::service::ExecSuccessorManifest,
         execution: carrick_hal::fork_stock::GrantExecution,
     ) -> Option<carrick_core_abi::service::ExecSuccessorManifestView> {
-        let retained = self.native_exec_preparations.lock();
-        let (_, identity, prepared) = retained
-            .iter()
-            .find(|(candidate, _, _)| *candidate == receipt)?;
-        let view = manifest.open(*identity, receipt)?;
-        let birth = identity.birth;
-        if birth.process.id.raw() as u64 != execution.binding.task.raw()
-            || identity.execution != execution.binding.generation
-            || birth.thread != execution.binding.thread_generation
-            || birth.mm.carrier() != self.transfer_carrier
-            || birth.mm.mm().raw() != execution.binding.mm.raw()
-            || birth.mm.incarnation().get() != execution.context.generation.raw().get()
+        let owner = self.native_exec_preparations.lock();
+        let (claim, prepared) = owner.sealed(receipt)?;
+        let view = manifest.open(claim.identity(), receipt)?;
+        if !claim.names_execution(self.transfer_carrier, execution)
             || prepared.root() != view.root
             || prepared.entry() != view.entry.raw()
             || prepared.stack_pointer() != view.stack_pointer.raw()
@@ -584,19 +590,45 @@ impl CarrierVmCustody {
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
         execution: carrick_hal::fork_stock::GrantExecution,
     ) -> bool {
-        let mut retained = self.native_exec_preparations.lock();
-        let Some(index) = retained.iter().position(|(candidate, identity, _)| {
-            *candidate == receipt
-                && identity.birth.mm.carrier() == self.transfer_carrier
-                && identity.birth.mm.mm().raw() == execution.binding.mm.raw()
-                && identity.birth.mm.incarnation().get() == execution.context.generation.raw().get()
-        }) else {
+        let mut owner = self.native_exec_preparations.lock();
+        if !owner
+            .sealed(receipt)
+            .is_some_and(|(claim, _)| claim.predecessor_is(self.transfer_carrier, execution))
+        {
+            return false;
+        }
+        let Ok((prepared, _, _)) = owner.cancel(receipt) else {
             return false;
         };
-        let (_, _, prepared) = retained.swap_remove(index);
-        drop(retained);
+        drop(owner);
         drop(prepared);
         true
+    }
+
+    /// Route the ring's settlement through the exec owner. Every HVF lane
+    /// holds the root's custody, so a root settlement is never handed back.
+    pub(crate) fn route_native_exec_settlement(
+        &self,
+        predecessor: carrick_el1_abi::ReservationMm,
+        successor: carrick_el1_abi::ReservationMm,
+        effects: carrick_el1_abi::ExecCommitEffects,
+    ) -> Option<carrick_hal::exec_owner::SettledExec> {
+        use carrick_hal::exec_owner::{ExecSettleLane, ExecSettlement};
+        match self.native_exec_preparations.lock().settle(
+            predecessor,
+            successor,
+            effects,
+            ExecSettleLane::RootCustody,
+        ) {
+            Ok(ExecSettlement::Child(settled)) => Some(settled),
+            Ok(ExecSettlement::Root(root)) => Some(root.consume()),
+            Ok(ExecSettlement::NotHere) | Err(_) => None,
+        }
+    }
+
+    /// What this carrier's exec owner reserved, sealed and retired.
+    pub fn exec_owner_census(&self) -> carrick_hal::exec_owner::ExecOwnerCensus {
+        self.native_exec_preparations.lock().census()
     }
 }
 
@@ -820,9 +852,8 @@ impl CarrierVmCustody {
             ),
             native_root_replies: parking_lot::Mutex::new(Default::default()),
             native_root_waits: Default::default(),
-            native_exec_preparations: parking_lot::Mutex::new(Vec::new()),
+            native_exec_preparations: parking_lot::Mutex::new(NativeExecOwner::default()),
             native_exec_predecessors: parking_lot::Mutex::new(Vec::new()),
-            native_exec_receipt_sequence: std::sync::atomic::AtomicU64::new(0),
             guest_capture: std::sync::Arc::new(crate::guest_capture::GuestCapture::new()),
         }
     }

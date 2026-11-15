@@ -43,6 +43,7 @@ pub(crate) trait X86ExecMachine {
         &self,
         predecessor: ReservationMm,
         successor: ReservationMm,
+        effects: carrick_el1_abi::ExecCommitEffects,
     ) -> Result<(), NativeProcessError>;
     /// CR3 onto the carrier's maintenance root, so no process root is live
     /// while the slot's occupancy changes. False: the carrier has none.
@@ -198,7 +199,12 @@ where
     /// successor's. The consuming adoption was the point of no return, so a
     /// refusal here is terminal (`Quarantined`). CR3 stays on the maintenance
     /// root across the switch; the settling crossing loads the successor's.
-    pub(crate) fn finish(&self, predecessor: Mm, successor: Mm) -> Result<(), NativeProcessError> {
+    pub(crate) fn finish(
+        &self,
+        predecessor: Mm,
+        successor: Mm,
+        effects: carrick_el1_abi::ExecCommitEffects,
+    ) -> Result<(), NativeProcessError> {
         let predecessor_mm = ReservationMm::new(predecessor.mm.raw().get())
             .ok_or(NativeProcessError::Quarantined)?;
         let successor_mm =
@@ -240,7 +246,8 @@ where
         let _ = self
             .retired
             .drain_portal(&self.portal(), self.zone, self.cpus, self.worker());
-        self.machine.cross_settle(predecessor_mm, successor_mm)
+        self.machine
+            .cross_settle(predecessor_mm, successor_mm, effects)
     }
 }
 
@@ -338,6 +345,7 @@ mod tests {
             &self,
             _: ReservationMm,
             _: ReservationMm,
+            _: carrick_el1_abi::ExecCommitEffects,
         ) -> Result<(), NativeProcessError> {
             self.settles.set(self.settles.get() + 1);
             Ok(())
@@ -556,7 +564,12 @@ mod tests {
             mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(PREDECESSOR).unwrap()),
             generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
         };
-        exec.finish(predecessor, adopted.address).unwrap();
+        exec.finish(
+            predecessor,
+            adopted.address,
+            carrick_el1_abi::ExecCommitEffects::COMPLETE,
+        )
+        .unwrap();
         assert_eq!(fixture.zone().installed_space(fixture.slot), SUCCESSOR);
         assert!(fixture.zone().spaces.is_open(SUCCESSOR));
         assert!(!fixture.zone().spaces.is_open(PREDECESSOR));

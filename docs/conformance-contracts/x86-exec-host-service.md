@@ -44,11 +44,15 @@ red, and no work budget changes.
      table is the sealed root;
    - then the data frames under boot's `InitialInventory`.
 
-   The preparation is retained in the carrier custody until slice d adopts
-   or cancels it. `release_x86_exec` returns an unused one whole.
+   The preparation is staged on its row of the carrier's exec owner
+   (`carrick_hal::exec_owner::ExecPreparations`, #2305), keyed by the
+   receipt reserved when the ring's ticket was claimed, until the adoption
+   consumes it or a cancellation returns it. `release_x86_exec` returns an
+   unused one whole.
 4. **Not now**. When the stock cannot grant the tables, the service aborts
-   the import and keeps nothing reserved. `ParkedX86Exec` keeps the owned
-   operation and the `StockRelease` it observed before the refusal. In the
+   the import and keeps nothing reserved. `StockParked` keeps the owned
+   operation and the `StockRelease` it observed before the refusal, and the
+   exec owner parks the claimed row (its receipt kept) on it. In the
    same fork-stock phase that refused, the caller's `StockReleaseWake` is
    enrolled on that release (`ForkStock::enrol_release`), and only then
    probed once: a return that already landed is delivered at enrolment.

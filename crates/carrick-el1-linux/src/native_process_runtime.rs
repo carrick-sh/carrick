@@ -574,6 +574,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         &self,
         _predecessor: AddressContext<RootGpa>,
         _successor: AddressContext<RootGpa>,
+        _effects: carrick_el1_abi::ExecCommitEffects,
     ) -> Result<(), NativeProcessError> {
         Err(NativeProcessError::Unsupported)
     }

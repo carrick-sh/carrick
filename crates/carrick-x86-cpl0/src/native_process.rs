@@ -245,8 +245,10 @@ impl X86ExecMachine for ServiceExecMachine {
         &self,
         predecessor: ReservationMm,
         successor: ReservationMm,
+        effects: carrick_el1_abi::ExecCommitEffects,
     ) -> Result<(), NativeProcessError> {
-        let mut settlement = carrick_el1_abi::NativeExecSettlement::new(predecessor, successor);
+        let mut settlement =
+            carrick_el1_abi::NativeExecSettlement::new(predecessor, successor, effects);
         Self::cross(
             carrick_el1_abi::GRANT_OP_EXEC_SETTLE,
             &raw mut settlement as u64,
@@ -649,8 +651,10 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         &self,
         predecessor: Mm,
         successor: Mm,
+        effects: carrick_el1_abi::ExecCommitEffects,
     ) -> Result<(), NativeProcessError> {
-        self.exec_successor()?.finish(predecessor, successor)
+        self.exec_successor()?
+            .finish(predecessor, successor, effects)
     }
     fn exec_fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
         self.file_tables().map_or(&[], |files| files.fd_map())

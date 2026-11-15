@@ -1062,9 +1062,10 @@ pub trait ForkStockCrossing {
         &self,
         predecessor: ReservationMm,
         successor: ReservationMm,
+        effects: carrick_el1_abi::ExecCommitEffects,
         cpu: u64,
     ) -> Result<(), NativeProcessError> {
-        let _ = (predecessor, successor, cpu);
+        let _ = (predecessor, successor, effects, cpu);
         Err(NativeProcessError::Unsupported)
     }
     fn cross_wait_channel_wake(
@@ -1109,9 +1110,10 @@ impl<T: ForkStockCrossing> ForkStockCrossing for &T {
         &self,
         predecessor: ReservationMm,
         successor: ReservationMm,
+        effects: carrick_el1_abi::ExecCommitEffects,
         cpu: u64,
     ) -> Result<(), NativeProcessError> {
-        (**self).cross_exec_settle(predecessor, successor, cpu)
+        (**self).cross_exec_settle(predecessor, successor, effects, cpu)
     }
     fn cross_cow_supply(&self, address: UserVa, cpu: u64) -> Result<(), NativeProcessError> {
         (**self).cross_cow_supply(address, cpu)
@@ -1187,6 +1189,7 @@ impl ForkStockCrossing for HvcForkStockCrossing {
         &self,
         predecessor: ReservationMm,
         successor: ReservationMm,
+        effects: carrick_el1_abi::ExecCommitEffects,
         cpu: u64,
     ) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -1195,12 +1198,13 @@ impl ForkStockCrossing for HvcForkStockCrossing {
                 predecessor.raw(),
                 successor.raw(),
                 cpu,
+                effects.bits(),
             )
             .map_err(|_| NativeProcessError::Stale)
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
-            let _ = (predecessor, successor, cpu);
+            let _ = (predecessor, successor, effects, cpu);
             Err(NativeProcessError::Unsupported)
         }
     }
@@ -1820,6 +1824,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         &self,
         predecessor: AddressContext<RootGpa>,
         successor: AddressContext<RootGpa>,
+        effects: carrick_el1_abi::ExecCommitEffects,
     ) -> Result<(), NativeProcessError> {
         let predecessor_mm = ReservationMm::new(predecessor.mm.raw().get())
             .ok_or(NativeProcessError::Quarantined)?;
@@ -1888,8 +1893,12 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 )
                 .map_err(|_| NativeProcessError::Quarantined)?;
         }
-        self.crossing
-            .cross_exec_settle(predecessor_mm, successor_mm, u64::from(self.worker()))
+        self.crossing.cross_exec_settle(
+            predecessor_mm,
+            successor_mm,
+            effects,
+            u64::from(self.worker()),
+        )
     }
     fn exec_ipc_binding(
         &self,

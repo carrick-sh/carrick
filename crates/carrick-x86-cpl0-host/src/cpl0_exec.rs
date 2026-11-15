@@ -10,10 +10,16 @@
 //! Contention is "not now", never an errno: when the stock cannot grant the
 //! tables because a holder (a pending fork, a live child) has them, nothing
 //! stays reserved, and the owned operation is kept with the stock release
-//! it observed ([`ParkedX86Exec`]). The caller's wake is enrolled on that
+//! it observed ([`StockParked`]). The caller's wake is enrolled on that
 //! release under the same stock phase that refused, before its one probe;
 //! the holder's table return delivers it, and one probe then hands the
 //! operation back to rerun.
+//!
+//! The preparations, their receipts (reserved when the ring's ticket is
+//! claimed), the parked rows and the settlement route belong to the neutral
+//! exec owner ([`carrick_hal::exec_owner::ExecPreparations`], #2305), the
+//! same owner the HVF carrier uses. This module keeps x86's mechanics: the
+//! image, the reserved tables and frames, the CPL0 build and its replay.
 //!
 //! The service takes the host's exec lock order
 //! ([`carrick_hal::exec_lock_order::ExecCrossingOrder`]): preparations, then
@@ -23,7 +29,7 @@ use super::*;
 use carrick_abi::{LINUX_E2BIG, LINUX_ENOEXEC, LINUX_ENOMEM, LINUX_ENOSYS, LinuxErrno};
 use carrick_core_abi::service::{
     ExecAdoptionReceipt, ExecArgumentCharge, ExecBuildSource, ExecSuccessorBacking,
-    ExecSuccessorEntry, ServiceIdentity,
+    ExecSuccessorEntry,
 };
 use carrick_core_abi::successor_image::{ImageRow, ImageStack};
 use carrick_el1::isa::x86_initial_mm::{
@@ -34,15 +40,17 @@ use carrick_el1::memory::reservations::{
 };
 use carrick_guest_arch::{ExecutionGeneration, TaskIdentity, TaskSerial};
 use carrick_hal::exec_lock_order::{Exclusive, ExecCrossingOrder};
+use carrick_hal::exec_owner::{
+    ExecParkWake, ExecPreparations, ExecRetained, ExecRetireReason, ExecSettleLane,
+    ExecSettleRefusal, ExecSettlement, ParkedProbe, StockParked,
+};
 use carrick_hal::fork_stock::GrantExecution;
 use carrick_hal::fork_stock::{
-    ChildAddressTags, ForkStock, ForkStockServiceError, StockRelease, StockReleaseWake,
-    SuccessorTables,
+    ChildAddressTags, ForkStock, ForkStockServiceError, StockReleaseWake, SuccessorTables,
 };
 use carrick_hal::guest_arch_binding::GuestArchBinding;
 use carrick_mem::elf::{ElfProgram, SegmentPerms};
 use carrick_mem::x86_initial_image::{X86InitialImage, X86InitialRegion, prepare_x86_elf};
-use std::collections::BTreeMap;
 
 /// One page-rounded PT_LOAD region holding its own initialized bytes.
 #[derive(::core::fmt::Debug)]
@@ -312,8 +320,9 @@ pub trait X86ExecFrames {
     fn clear_tables(&mut self, tables: &[RootGpa]) -> Result<(), TrapError>;
 }
 
-/// A successor's reserved carrier resources, retained from before the arm
-/// until slice d's adoption consumes them or its cancellation returns them.
+/// A successor's reserved carrier resources: the staged data of one row of
+/// the carrier's exec owner, from before the arm until the adoption consumes
+/// them or a cancellation returns them.
 #[derive(::core::fmt::Debug)]
 pub struct X86ExecPreparation<D> {
     request: X86ExecRequest,
@@ -326,9 +335,6 @@ pub struct X86ExecPreparation<D> {
     build: D,
     build_source: ExecBuildSource,
     encoded: Vec<u8>,
-    /// The sealed service identity and receipt, once the manifest is
-    /// published; only that exact receipt adopts or cancels this successor.
-    sealed: Option<(ServiceIdentity, ExecAdoptionReceipt)>,
 }
 
 impl<D: X86ExecData> X86ExecPreparation<D> {
@@ -362,120 +368,18 @@ impl<D: X86ExecData> X86ExecPreparation<D> {
             self.build_source,
         ))
     }
-
-    pub fn sealed(&self) -> Option<(ServiceIdentity, ExecAdoptionReceipt)> {
-        self.sealed
-    }
-}
-
-impl<D> core::fmt::Debug for X86ExecPreparations<D> {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter
-            .debug_struct("X86ExecPreparations")
-            .field("successors", &self.prepared.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
-/// The carrier's retained exec preparations, one per closed successor.
-pub struct X86ExecPreparations<D> {
-    prepared: BTreeMap<u64, X86ExecPreparation<D>>,
-}
-
-impl<D> Default for X86ExecPreparations<D> {
-    fn default() -> Self {
-        Self {
-            prepared: BTreeMap::new(),
-        }
-    }
-}
-
-impl<D: X86ExecData> X86ExecPreparations<D> {
-    pub fn get(&self, successor: ReservationMm) -> Option<&X86ExecPreparation<D>> {
-        self.prepared.get(&successor.raw())
-    }
-
-    pub fn len(&self) -> usize {
-        self.prepared.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.prepared.is_empty()
-    }
-
-    /// Take a preparation out of custody (adoption or cancellation).
-    pub fn take(&mut self, successor: ReservationMm) -> Option<X86ExecPreparation<D>> {
-        self.prepared.remove(&successor.raw())
-    }
-
-    /// Bind the published manifest's identity and receipt to `successor`'s
-    /// preparation, once. False when it is absent or already sealed.
-    pub fn seal(
-        &mut self,
-        successor: ReservationMm,
-        identity: ServiceIdentity,
-        receipt: ExecAdoptionReceipt,
-    ) -> bool {
-        match self.prepared.get_mut(&successor.raw()) {
-            Some(preparation) if preparation.sealed.is_none() => {
-                preparation.sealed = Some((identity, receipt));
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// The successor whose sealed preparation `receipt` names.
-    pub fn sealed_by(&self, receipt: ExecAdoptionReceipt) -> Option<ReservationMm> {
-        self.prepared.iter().find_map(|(successor, preparation)| {
-            preparation
-                .sealed
-                .is_some_and(|(_, sealed)| sealed == receipt)
-                .then(|| ReservationMm::new(*successor))
-                .flatten()
-        })
-    }
-}
-
-/// Not now: an exec whose tables a holder has. Owns the operation and the
-/// stock release it observed before the refused reservation; the wake
-/// [`stage_x86_exec`] was given is enrolled on that release, so the
-/// holder's return (or one that already landed) wakes it exactly once.
-#[derive(::core::fmt::Debug)]
-#[must_use]
-pub struct ParkedX86Exec {
-    request: X86ExecRequest,
-    observed: StockRelease,
-}
-
-impl ParkedX86Exec {
-    /// Probe once, after the enrolled wake: the operation back to rerun if
-    /// the holder has returned tables since the refusal, else still parked.
-    pub fn probe<T: ChildAddressTags, C>(
-        self,
-        stock: &ForkStock<T, C>,
-    ) -> Result<X86ExecRequest, Self> {
-        if stock.released_since(self.observed) {
-            Ok(self.request)
-        } else {
-            Err(self)
-        }
-    }
-
-    pub fn successor(&self) -> ReservationMm {
-        self.request.successor
-    }
 }
 
 /// The service's answer before the arm.
 #[derive(::core::fmt::Debug)]
 #[must_use]
 pub enum X86ExecStage {
-    /// Reserved, imported and retained; seal the manifest from
-    /// [`X86ExecPreparation::seal`].
+    /// Reserved, imported and staged on the claimed row; seal the manifest
+    /// from [`X86ExecPreparation::seal`].
     Staged(ExecSuccessorBacking, ExecSuccessorEntry, ExecBuildSource),
-    /// Not now; see [`ParkedX86Exec`]. Nothing is reserved.
-    Parked(ParkedX86Exec),
+    /// Not now; see [`StockParked`]. Nothing is reserved, and the claimed
+    /// row keeps its receipt.
+    Parked(StockParked<X86ExecRequest>),
     /// A pre-arm refusal the exec returns (the predecessor runs on), with
     /// nothing reserved. The successor's root refused its rows: ENOMEM, as
     /// the AArch64 service answers the same refusal.
@@ -570,19 +474,20 @@ fn root_fault(refusal: Refusal) -> TrapError {
     fail(format!("exec successor root custody: {refusal:?}"))
 }
 
-/// Stage `request` on the stopped `cpu`: check its successor is not already
-/// prepared, import its rows into the closed successor root, reserve its
-/// exact tables from the fork stock, then stage its data frames, and retain
-/// the result in `preparations`. When a holder has the stock, `wake` is
-/// enrolled on its release ([`ParkedX86Exec`]); it is dropped otherwise.
-/// A Busy root is a broken invariant, not contention: the successor is
-/// closed, and its only other owner (the ring's successor slot) is parked
-/// in this very service call.
+/// Stage `request` on the stopped `cpu` for the claimed row `receipt`:
+/// check the row asked for this successor and no row has staged it, import
+/// its rows into the closed successor root, reserve its exact tables from
+/// the fork stock, then stage its data frames, and stage the result on the
+/// row. When a holder has the stock, `wake` is enrolled on its release
+/// ([`StockParked`]); it is dropped otherwise. A Busy root is a broken
+/// invariant, not contention: the successor is closed, and its only other
+/// owner (the ring's successor slot) is parked in this very service call.
 #[allow(clippy::too_many_arguments)]
-pub fn stage_x86_exec<T, C, F>(
+pub fn stage_x86_exec<T, C, F, P, A>(
     cpu: carrick_guest_arch::CpuId,
+    receipt: ExecAdoptionReceipt,
     request: X86ExecRequest,
-    preparations: &mut X86ExecPreparations<F::Data>,
+    preparations: &mut ExecPreparations<X86ExecPreparation<F::Data>, P, A>,
     stock: &mut ForkStock<T, C>,
     frames: &mut F,
     roots: &X86Cpl0Reservations,
@@ -605,7 +510,7 @@ where
     let observed = stock.table_release();
     let (released, admitted) =
         ExecCrossingOrder::on_stopped(cpu, Exclusive(&mut *preparations), Exclusive(&mut *stock))
-            .preparations(|preparations| preparations.get(request.successor).is_none());
+            .preparations(|preparations| preparations.stageable(receipt, request.successor));
     if !admitted {
         return Err(fail("exec successor already prepared"));
     }
@@ -629,7 +534,7 @@ where
         Ok(tables) => tables,
         Err(ForkStockServiceError::SuccessorTableCapacity) => {
             root.abort().map_err(root_fault)?;
-            return Ok(X86ExecStage::Parked(ParkedX86Exec { request, observed }));
+            return Ok(X86ExecStage::Parked(StockParked::new(request, observed)));
         }
         Err(error) => {
             root.abort().map_err(root_fault)?;
@@ -667,14 +572,13 @@ where
         build,
         build_source,
         encoded,
-        sealed: None,
     };
     let (backing, entry, build_source) = preparation
         .seal()
         .ok_or_else(|| fail("exec successor without a root table"))?;
     preparations
-        .prepared
-        .insert(preparation.request.successor.raw(), preparation);
+        .stage(receipt, preparation)
+        .map_err(|(error, _)| fail(format!("exec successor staging: {error:?}")))?;
     Ok(X86ExecStage::Staged(backing, entry, build_source))
 }
 
@@ -947,10 +851,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         })
     }
 
-    /// The host Exec service on the stopped `cpu`; see [`stage_x86_exec`].
+    /// The host Exec service on the stopped `cpu` for the claimed row
+    /// `receipt`; see [`stage_x86_exec`].
     pub(crate) fn stage_native_exec(
         &mut self,
         cpu: carrick_guest_arch::CpuId,
+        receipt: ExecAdoptionReceipt,
         request: X86ExecRequest,
         wake: StockReleaseWake,
         random: [u8; 16],
@@ -965,8 +871,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         stage_x86_exec(
             cpu,
+            receipt,
             request,
-            &mut self.exec_preparations,
+            &mut self.exec_owner,
             &mut self.fork_stock,
             &mut frames,
             roots,
@@ -976,15 +883,20 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         )
     }
 
-    /// Return the unused preparation of `successor`; see [`release_x86_exec`].
+    /// Retire the row `receipt` for `reason` and return its unused
+    /// preparation; see [`release_x86_exec`].
     pub(crate) fn release_native_exec(
         &mut self,
-        successor: ReservationMm,
+        receipt: ExecAdoptionReceipt,
+        reason: ExecRetireReason,
     ) -> Result<X86ExecRequest, TrapError> {
-        let preparation = self
-            .exec_preparations
-            .take(successor)
-            .ok_or_else(|| fail("exec successor not prepared"))?;
+        let retired = self
+            .exec_owner
+            .retire(receipt, reason)
+            .map_err(|error| fail(format!("exec successor retirement: {error:?}")))?;
+        let ExecRetained::Staged(preparation) = retired.held else {
+            return Err(fail("exec successor not prepared"));
+        };
         let ram = Arc::clone(&self.ram);
         let (roots, zone) = Self::exec_tables(&ram)?;
         let mut frames = CarrierExecFrames {
@@ -997,14 +909,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     }
 }
 
-/// A parked exec's continuation: the claimed request whose ticket stays
-/// outstanding, the stock release it observed, and the wake its enrolment
-/// set when a holder returned tables.
-pub(in crate::cpl0_boot) struct ParkedNativeExec {
-    pending: Box<anonymous_owner::native_service::PendingNativeExec>,
-    parked: ParkedX86Exec,
-    woken: Arc<std::sync::atomic::AtomicBool>,
-}
+/// What a parked row of the carrier's exec owner resumes with: the claimed
+/// request whose ticket stays outstanding, and its checked image.
+pub(in crate::cpl0_boot) type NativeExecContinuation = (
+    Box<anonymous_owner::native_service::PendingNativeExec>,
+    X86ExecRequest,
+);
+
+/// The carrier's exec owner: the neutral owner over x86's staged successors.
+pub(in crate::cpl0_boot) type X86ExecOwner =
+    ExecPreparations<X86ExecPreparation<CarrierExecData>, NativeExecContinuation>;
 
 /// What one [`carrick_el1_abi::NATIVE_EXEC_PORT`] crossing settled. A
 /// settlement moves the stopped task's registered CR3 from the predecessor's
@@ -1064,71 +978,56 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         pending: Box<anonymous_owner::native_service::PendingNativeExec>,
         request: X86ExecRequest,
     ) -> Result<(), TrapError> {
-        let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let wake = {
-            let woken = Arc::clone(&woken);
-            StockReleaseWake::new(move || woken.store(true, std::sync::atomic::Ordering::Release))
-        };
+        let (woken, wake) = ExecParkWake::new();
         let mut random = [0_u8; 16];
         getrandom::fill(&mut random).map_err(|error| fail(format!("exec random: {error}")))?;
-        match self.stage_native_exec(cpu, request, wake, random)? {
+        let receipt = pending.receipt;
+        match self.stage_native_exec(cpu, receipt, request, wake, random)? {
             X86ExecStage::Staged(backing, entry, build) => {
                 self.seal_native_exec(cpu, pending, backing, entry, build)
             }
             X86ExecStage::Parked(parked) => {
                 // The ticket stays outstanding: the ring's continuation is
                 // parked on it until the rerun seals or refuses.
-                self.parked_execs.push(ParkedNativeExec {
-                    pending,
-                    parked,
-                    woken,
-                });
-                Ok(())
+                self.exec_owner
+                    .park(receipt, parked.map(|request| (pending, request)), woken)
+                    .map_err(|(error, _)| fail(format!("native exec park: {error:?}")))
             }
             X86ExecStage::Refused(errno) => self.fail_native_exec(cpu, pending, errno),
         }
     }
 
-    /// Probe each parked exec whose enrolled release fired, once, and rerun
-    /// its staging. Called after every crossing that can return stock tables.
+    /// Probe each parked exec once: a cancelled one is acknowledged and
+    /// retires; one whose enrolled release fired and found returned tables
+    /// reruns its staging. Called after every crossing that can return stock
+    /// tables.
     pub(in crate::cpl0_boot) fn probe_parked_execs(
         &mut self,
         cpu: carrick_guest_arch::CpuId,
     ) -> Result<(), TrapError> {
-        let mut remaining = core::mem::take(&mut self.parked_execs).into_iter();
-        while let Some(parked) = remaining.next() {
-            let result = (|| {
-                if parked
-                    .pending
-                    .ticket
-                    .cancellation_requested()
-                    .map_err(|_| fail("parked native exec ticket changed"))?
-                {
+        for receipt in self.exec_owner.parked() {
+            let probe =
+                self.exec_owner
+                    .probe_parked(receipt, &self.fork_stock, |(pending, _)| {
+                        pending
+                            .ticket
+                            .cancellation_requested()
+                            .map_err(|_| fail("parked native exec ticket changed"))
+                    })?;
+            match probe {
+                ParkedProbe::Absent | ParkedProbe::Still => {}
+                ParkedProbe::Cancelled((pending, _), _) => {
                     let anonymous_owner::native_service::PendingNativeExec { ticket, key, .. } =
-                        *parked.pending;
+                        *pending;
                     self.acknowledge_native_exec(cpu, key, || {
                         ticket
                             .complete(false)
                             .map_err(|_| fail("parked native exec cancellation acknowledgment"))
                     })?;
-                    return Ok(());
                 }
-                if !parked.woken.load(std::sync::atomic::Ordering::Acquire) {
-                    self.parked_execs.push(parked);
-                    return Ok(());
+                ParkedProbe::Rerun(_, (pending, request)) => {
+                    self.stage_and_seal(cpu, pending, request)?
                 }
-                match parked.parked.probe(&self.fork_stock) {
-                    Ok(request) => self.stage_and_seal(cpu, parked.pending, request)?,
-                    Err(still) => self.parked_execs.push(ParkedNativeExec {
-                        parked: still,
-                        ..parked
-                    }),
-                }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                self.parked_execs.extend(remaining);
-                return Err(error);
             }
         }
         Ok(())
@@ -1199,6 +1098,15 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }
         let failure = carrick_core_abi::service::ServiceFailureCode::new(errno.get() as u32)
             .ok_or_else(|| fail("native exec failure code"))?;
+        // Refused before the seal: the row retires and nothing past it was
+        // owed.
+        let retired = self
+            .exec_owner
+            .retire(pending.receipt, ExecRetireReason::Refused)
+            .map_err(|error| fail(format!("native exec refusal: {error:?}")))?;
+        if !matches!(retired.held, ExecRetained::Claimed) {
+            return Err(fail("native exec refused with a staged successor"));
+        }
         let anonymous_owner::native_service::PendingNativeExec { ticket, key, .. } = *pending;
         self.acknowledge_native_exec(cpu, key, || {
             ticket
@@ -1207,9 +1115,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         })
     }
 
-    /// Seal the staged successor's manifest with a fresh receipt and the
-    /// build extent, then publish it on the exact ticket. A ring that
-    /// cancelled meanwhile gets no manifest, and the preparation returns.
+    /// Seal the staged successor's manifest with the receipt its row
+    /// reserved at claim and the build extent, then publish it on the exact
+    /// ticket. A ring that cancelled meanwhile gets no manifest, and the
+    /// preparation returns.
     fn seal_native_exec(
         &mut self,
         cpu: carrick_guest_arch::CpuId,
@@ -1219,13 +1128,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         build: ExecBuildSource,
     ) -> Result<(), TrapError> {
         let identity = pending.ticket.request().identity;
-        self.exec_receipts = self
-            .exec_receipts
-            .checked_add(1)
-            .ok_or_else(|| fail("exec receipts exhausted"))?;
-        let receipt = NonZeroU64::new(self.exec_receipts)
-            .and_then(ExecAdoptionReceipt::checked)
-            .ok_or_else(|| fail("exec receipt"))?;
+        let receipt = pending.receipt;
         let pointer = self.native_service_pointer(
             pending.execution.context,
             pending.manifest,
@@ -1244,13 +1147,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 })
             })
             .ok_or_else(|| fail("native exec manifest seal"))?;
-        if !self
-            .exec_preparations
-            .seal(pending.successor, identity, receipt)
-        {
-            return Err(fail("native exec preparation already sealed"));
+        let claim = self
+            .exec_owner
+            .seal(receipt)
+            .map_err(|error| fail(format!("native exec preparation seal: {error:?}")))?;
+        if claim.identity() != identity || claim.successor() != pending.successor {
+            return Err(fail("native exec preparation sealed for another request"));
         }
-        let successor = pending.successor;
         let anonymous_owner::native_service::PendingNativeExec { ticket, key, .. } = *pending;
         let mut cancelled = false;
         self.acknowledge_native_exec(cpu, key, || {
@@ -1273,15 +1176,17 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             }
         })?;
         if cancelled {
-            self.release_native_exec(successor)?;
+            self.release_native_exec(receipt, ExecRetireReason::PublishCancelled)?;
         }
         Ok(())
     }
 
-    /// One [`carrick_el1_abi::NATIVE_EXEC_PORT`] crossing on the stopped CPU.
+    /// One [`carrick_el1_abi::NATIVE_EXEC_PORT`] crossing on the stopped CPU
+    /// of `lane`.
     pub(in crate::cpl0_boot) fn service_native_exec<I: CarrierCpuIo>(
         &mut self,
         lease: &StoppedCpuLease<'_, I>,
+        lane: ExecSettleLane,
     ) -> Result<NativeExecCrossing, TrapError> {
         let operation = lease.io.get_gpr(X86Reg::Rdi)?;
         let address = lease.io.get_gpr(X86Reg::Rax)?;
@@ -1294,7 +1199,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 self.cancel_native_exec(lease, address)?;
                 NativeExecCrossing::Answered
             }
-            carrick_el1_abi::GRANT_OP_EXEC_SETTLE => self.settle_native_exec(lease, address)?,
+            carrick_el1_abi::GRANT_OP_EXEC_SETTLE => {
+                self.settle_native_exec(lease, address, lane)?
+            }
             _ => return Err(fail("native exec crossing operation")),
         };
         self.probe_parked_execs(lease.cpu)?;
@@ -1348,18 +1255,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         manifest_address: carrick_guest_arch::KernelVa,
     ) -> Result<bool, TrapError> {
         use carrick_el1::isa::x86_exec_build::read_exec_build_results;
-        let Some(successor) = self.exec_preparations.sealed_by(receipt) else {
+        let Some((claim, preparation)) = self.exec_owner.sealed(receipt) else {
             return Ok(false);
         };
-        let Some(preparation) = self.exec_preparations.get(successor) else {
-            return Ok(false);
-        };
-        let Some((identity, _)) = preparation.sealed() else {
-            return Ok(false);
-        };
-        if identity.birth.mm.mm().raw() != execution.binding.mm.raw() {
+        if !claim.names_execution(self.fork_stock.carrier(), execution) {
             return Ok(false);
         }
+        let identity = claim.identity();
+        let successor = claim.successor();
+        let predecessor = ReservationMm::new(execution.binding.mm.raw())
+            .ok_or_else(|| fail("exec predecessor MM"))?;
         let pointer = self.native_service_pointer(
             execution.context,
             manifest_address,
@@ -1412,10 +1317,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }
         // The point of no return: the ring's crossing record accepts below,
         // and every step from here is the carrier's own invariant.
-        let preparation = self
-            .exec_preparations
-            .take(successor)
-            .ok_or_else(|| fail("exec preparation vanished"))?;
+        let adoption = self
+            .exec_owner
+            .adopt(receipt, predecessor)
+            .map_err(|error| fail(format!("exec preparation adoption: {error:?}")))?;
+        if adoption.mm.successor() != successor {
+            return Err(fail("exec adoption named another successor"));
+        }
+        let preparation = adoption.data;
         let X86ExecPreparation {
             request,
             tables,
@@ -1570,23 +1479,17 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let receipt = record
             .request()
             .ok_or_else(|| fail("native exec cancellation record"))?;
-        let successor = self
-            .exec_preparations
-            .sealed_by(receipt)
-            .filter(|successor| {
-                self.exec_preparations
-                    .get(*successor)
-                    .and_then(X86ExecPreparation::sealed)
-                    .is_some_and(|(identity, _)| {
-                        identity.birth.mm.mm().raw() == execution.binding.mm.raw()
-                    })
-            });
-        let accepted = match successor {
-            Some(successor) => {
-                let preparation = self
-                    .exec_preparations
-                    .take(successor)
-                    .ok_or_else(|| fail("exec preparation vanished"))?;
+        let carrier = self.fork_stock.carrier();
+        let owned = self
+            .exec_owner
+            .sealed(receipt)
+            .is_some_and(|(claim, _)| claim.predecessor_is(carrier, execution));
+        let accepted = match owned {
+            true => {
+                let (preparation, _, _) = self
+                    .exec_owner
+                    .cancel(receipt)
+                    .map_err(|error| fail(format!("exec preparation cancel: {error:?}")))?;
                 let mut frames = CarrierExecFrames {
                     vm: &mut self._vm,
                     next: &mut self.anonymous_next_gpa,
@@ -1596,7 +1499,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 cancel_x86_exec(preparation, &mut self.fork_stock, &mut frames)?;
                 record.accept()
             }
-            None => record.refuse(),
+            false => record.refuse(),
         };
         if !accepted {
             return Err(fail("native exec cancellation reply"));
@@ -1614,13 +1517,17 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     }
 
     /// The ring switched its slot to the successor and parked this CPU on
-    /// the maintenance root. Register the successor as the stopped task's
-    /// translation, then release the predecessor's stock and physical
-    /// custody (or defer that release to the next quarantine drain).
+    /// the maintenance root. The exec owner routes the settlement first: a
+    /// root exec on a `lane` without the root's custody is refused before
+    /// anything changes, and a short commit-effects word is refused. Then
+    /// register the successor as the stopped task's translation, and release
+    /// the predecessor's stock and physical custody (or defer that release
+    /// to the next quarantine drain).
     fn settle_native_exec<I: CarrierCpuIo>(
         &mut self,
         lease: &StoppedCpuLease<'_, I>,
         address: u64,
+        lane: ExecSettleLane,
     ) -> Result<NativeExecCrossing, TrapError> {
         let live = RootGpa::page_aligned(FrameGpa::new(lease.io.get_gpr(X86Reg::Cr3)? & !0xfff))
             .ok_or_else(|| fail("exec settlement root alignment"))?;
@@ -1645,13 +1552,32 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 lease, stack, address,
             )
         }?;
-        let (predecessor, successor) = record
+        let (predecessor, successor, effects) = record
             .request()
             .ok_or_else(|| fail("native exec settlement record"))?;
-        let known = successor.raw() == mm.get()
-            && self.exec_predecessors.iter().any(|receipt| {
-                receipt.predecessor() == predecessor && receipt.successor() == successor
-            });
+        let held = self.exec_predecessors.iter().any(|receipt| {
+            receipt.predecessor() == predecessor && receipt.successor() == successor
+        });
+        let route = if successor.raw() == mm.get() {
+            self.exec_owner
+                .settle(predecessor, successor, effects, lane)
+        } else {
+            Err(ExecSettleRefusal::Unknown)
+        };
+        let known = match route {
+            Ok(ExecSettlement::Child(_)) if held => true,
+            Ok(ExecSettlement::Child(_)) => {
+                return Err(fail("exec settlement without its predecessor custody"));
+            }
+            // A root settlement has no consumer until #2142's root custody
+            // move; production refuses root exec before its ticket.
+            Ok(ExecSettlement::Root(_)) => {
+                return Err(fail("root exec settlement has no custody consumer"));
+            }
+            // Handed back unchanged; the ring's handback is #2142 R3's.
+            Ok(ExecSettlement::NotHere) => false,
+            Err(_) => false,
+        };
         let predecessor_root = NonZeroU64::new(predecessor.raw())
             .and_then(|mm| self._vm.root(mm))
             .map(|context| context.root);
@@ -1741,31 +1667,36 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
 }
 
 impl<M: CarrierMemoryIo> BootstrapCustody<M> {
-    /// The host Exec service on the stopped `cpu` (#1093 S4c slice c);
-    /// `wake` is enrolled on the stock's release if the exec parks.
+    /// The host Exec service on the stopped `cpu` (#1093 S4c slice c) for
+    /// the claimed row `receipt`; `wake` is enrolled on the stock's release
+    /// if the exec parks.
     pub fn stage_native_exec(
         &mut self,
         cpu: carrick_guest_arch::CpuId,
+        receipt: ExecAdoptionReceipt,
         request: X86ExecRequest,
         wake: StockReleaseWake,
         random: [u8; 16],
     ) -> Result<X86ExecStage, TrapError> {
-        self.0.stage_native_exec(cpu, request, wake, random)
+        self.0
+            .stage_native_exec(cpu, receipt, request, wake, random)
     }
 
     /// Probe a woken parked exec once against this carrier's fork stock.
     pub fn probe_parked_exec(
         &self,
-        parked: ParkedX86Exec,
-    ) -> Result<X86ExecRequest, ParkedX86Exec> {
+        parked: StockParked<X86ExecRequest>,
+    ) -> Result<X86ExecRequest, StockParked<X86ExecRequest>> {
         parked.probe(&self.0.fork_stock)
     }
 
+    /// Refuse the unsealed row `receipt` and return its preparation whole.
     pub fn release_native_exec(
         &mut self,
-        successor: ReservationMm,
+        receipt: ExecAdoptionReceipt,
     ) -> Result<X86ExecRequest, TrapError> {
-        self.0.release_native_exec(successor)
+        self.0
+            .release_native_exec(receipt, ExecRetireReason::Refused)
     }
 
     /// The reserved tables and data grants of a retained preparation.
@@ -1773,7 +1704,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
         &self,
         successor: ReservationMm,
     ) -> Option<(Vec<RootGpa>, Vec<X86InitialBootGrant>)> {
-        let preparation = self.0.exec_preparations.get(successor)?;
+        let (_, preparation) = self.0.exec_owner.staged_for(successor)?;
         Some((
             preparation.tables().to_vec(),
             preparation.data().grants().to_vec(),
@@ -1826,6 +1757,52 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
         .locked(|model| Ok(NonZeroU64::new(model.incarnation().raw())))
         .map_err(root_fault)?
         .ok_or_else(|| fail("successor root generation"))
+    }
+
+    /// Claim an exec for `successor` as the ring's ticket would, on behalf
+    /// of a synthetic descendant of this carrier, reserving its receipt.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_claim_exec(
+        &mut self,
+        successor: ReservationMm,
+        root_generation: NonZeroU64,
+    ) -> Result<ExecAdoptionReceipt, TrapError> {
+        use carrick_core_abi::service::{ServiceBirth, ServiceIdentity, ServiceOrigin};
+        use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
+        let one = NonZeroU64::MIN;
+        let identity = ServiceIdentity {
+            birth: ServiceBirth {
+                origin: ServiceOrigin::Descendant,
+                process: TaskKey {
+                    id: TaskId::from_registry_allocation(
+                        core::num::NonZeroI32::MIN.saturating_abs(),
+                    ),
+                    serial: TaskSerial::from_registry_allocation(one),
+                },
+                thread: carrick_core_abi::EntryThreadGeneration::from_raw(1),
+                record: carrick_sched_core::RecordRef {
+                    id: carrick_sched_core::RecordId::from_raw(1)
+                        .ok_or_else(|| fail("fixture record"))?,
+                    incarnation: 1,
+                },
+                // SAFETY: a fixture identity naming the successor's own MM; it
+                // authorizes no memory operation and no ring ticket names it.
+                mm: unsafe {
+                    carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                        self.0.fork_stock.carrier(),
+                        successor,
+                        root_generation,
+                    )
+                },
+            },
+            execution: carrick_core_abi::SnapshotGeneration::from_raw(1),
+            sequence: one,
+        };
+        self.0
+            .exec_owner
+            .claim(identity, successor, root_generation)
+            .map(|claim| claim.receipt())
+            .map_err(|error| fail(format!("fixture exec claim: {error:?}")))
     }
 
     /// Hold all but `left` stock tables, as a live holder (a pending fork,

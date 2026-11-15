@@ -2599,12 +2599,14 @@ impl Cpl0Carrier {
 
 /// The host Exec service (#1093 S4c slice c) on this stopped carrier.
 impl Cpl0Carrier {
-    /// Stage an exec successor on stopped `cpu`: reserve its fork-stock
-    /// tables and data frames and import its rows before the arm. If a
-    /// holder has the stock, `wake` is enrolled on its release.
+    /// Stage an exec successor for the claimed row `receipt` on stopped
+    /// `cpu`: reserve its fork-stock tables and data frames and import its
+    /// rows before the arm. If a holder has the stock, `wake` is enrolled on
+    /// its release.
     pub fn stage_exec_successor(
         &mut self,
         cpu: usize,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
         request: carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecRequest,
         wake: carrick_hal::fork_stock::StockReleaseWake,
     ) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecStage, TrapError> {
@@ -2614,27 +2616,36 @@ impl Cpl0Carrier {
             .ok_or_else(|| fail("exec service CPU"))?;
         let mut random = [0_u8; 16];
         getrandom::fill(&mut random).map_err(|error| fail(format!("exec random: {error}")))?;
-        self.custody
-            .stage_native_exec(carrick_guest_arch::CpuId::new(cpu), request, wake, random)
+        self.custody.stage_native_exec(
+            carrick_guest_arch::CpuId::new(cpu),
+            receipt,
+            request,
+            wake,
+            random,
+        )
     }
 
     /// Probe a woken parked exec once against this carrier's fork stock.
     pub fn probe_parked_exec(
         &self,
-        parked: carrick_x86_cpl0_host::cpl0_boot::exec_service::ParkedX86Exec,
+        parked: carrick_hal::exec_owner::StockParked<
+            carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecRequest,
+        >,
     ) -> Result<
         carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecRequest,
-        carrick_x86_cpl0_host::cpl0_boot::exec_service::ParkedX86Exec,
+        carrick_hal::exec_owner::StockParked<
+            carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecRequest,
+        >,
     > {
         self.custody.probe_parked_exec(parked)
     }
 
-    /// Return the unused preparation of `successor` whole.
+    /// Refuse the unsealed row `receipt` and return its preparation whole.
     pub fn release_exec_successor(
         &mut self,
-        successor: ReservationMm,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
     ) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecRequest, TrapError> {
-        self.custody.release_native_exec(successor)
+        self.custody.release_native_exec(receipt)
     }
 
     /// The tables and data grants a retained preparation holds.
@@ -2653,6 +2664,17 @@ impl Cpl0Carrier {
     /// Waiters enrolled on the fork stock's release and not yet woken.
     pub fn fork_stock_release_waiters(&self) -> usize {
         self.custody.fork_stock_release_waiters()
+    }
+
+    /// Claim an exec for `successor` as the ring's ticket would, reserving
+    /// its receipt in the carrier's exec owner.
+    #[cfg(feature = "test-fixtures")]
+    pub fn fixture_claim_exec(
+        &mut self,
+        successor: ReservationMm,
+        root_generation: NonZeroU64,
+    ) -> Result<carrick_core_abi::service::ExecAdoptionReceipt, TrapError> {
+        self.custody.fixture_claim_exec(successor, root_generation)
     }
 
     /// Publish the closed successor root the ring publishes before an exec.

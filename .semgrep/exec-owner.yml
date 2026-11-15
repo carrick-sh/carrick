@@ -1,0 +1,74 @@
+rules:
+  # ── One neutral exec owner (#2305) ─────────────────────────────────────────
+  # The x86 CPL0 host and the HVF carrier each kept their own exec receipt
+  # counter, preparation table and parked-ticket state; #2305 moved them into
+  # `carrick_hal::exec_owner::ExecPreparations`, which both carriers use. A
+  # carrier that mints a receipt or probes a stock release itself is growing
+  # a second exec owner.
+  - id: carrick-exec-owner-one-receipt-allocator
+    languages: [rust]
+    severity: ERROR
+    message: |
+      A carrier mints exec adoption receipts only through its exec owner
+      (`carrick_hal::exec_owner::ExecPreparations::claim`, which reserves the
+      receipt when the ring's ticket is claimed). A carrier-local
+      `ExecAdoptionReceipt::checked` is a second allocator (#2305).
+    paths:
+      include:
+        - "**/carrick-vmm-*/**"
+        - "**/carrick-x86-cpl0-host/**"
+        - "**/carrick-runtime/**"
+    pattern-regex: '\bExecAdoptionReceipt::checked\b'
+
+  - id: carrick-exec-owner-no-carrier-park-state
+    languages: [rust]
+    severity: ERROR
+    message: |
+      A parked exec's state machine (its stock release, wake and rerun) is
+      the exec owner's: park the row with `ExecPreparations::park` and probe
+      it with `ExecPreparations::probe_parked`. A carrier-local
+      `released_since` probe is a second parked-ticket state machine (#2305).
+    paths:
+      include:
+        - "**/carrick-vmm-*/**"
+        - "**/carrick-x86-cpl0-host/**"
+        - "**/carrick-runtime/**"
+      exclude:
+        - "**/tests/**"
+        - "**/tests.rs"
+    pattern: $STOCK.released_since(...)
+
+  # #2142's approved design: one exec names one MM. The carrier's exec owner
+  # authenticates the ring-issued successor MM at adoption
+  # (`AuthenticatedExecMm`), and Kernel preparation takes it through exactly
+  # one public entry. A second function taking an `IssuedExecMm` from its
+  # caller is a second issuance path (a P0 for the PR that adds it).
+  - id: carrick-issued-exec-mm-one-taker
+    languages: [rust]
+    severity: ERROR
+    message: |
+      Only `Kernel::prepare_exec_with_registry_id` takes an `IssuedExecMm`
+      from its caller, and only the Kernel exec module's private preparation
+      chain passes it on. Take the issued MM through that entry (#2142,
+      #2305).
+    paths:
+      exclude:
+        - "**/carrick-kernel/src/kernel/exec.rs"
+    pattern-either:
+      - pattern: |
+          fn $F(..., $P: IssuedExecMm, ...) -> $R { ... }
+      - pattern: |
+          fn $F(..., $P: IssuedExecMm, ...) { ... }
+
+  - id: carrick-issued-exec-mm-one-public-taker
+    languages: [rust]
+    severity: ERROR
+    message: |
+      `Kernel::prepare_exec_with_registry_id` is the one public function that
+      takes an `IssuedExecMm` from its caller (#2142, #2305).
+    paths:
+      include:
+        - "**/carrick-kernel/src/kernel/exec.rs"
+    # Semgrep's Rust patterns do not separate `pub fn` from `fn`; the
+    # private preparation chain stays allowed, so match the signature text.
+    pattern-regex: 'pub fn (?!prepare_exec_with_registry_id\b)\w+\s*(<[^>]*>)?\s*\([^)]*:\s*IssuedExecMm\b'

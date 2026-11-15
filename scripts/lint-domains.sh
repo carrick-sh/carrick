@@ -37,6 +37,7 @@ export OTEL_SDK_DISABLED=true
 
 checked_configs=(
     .semgrep/typed-domains.yml
+    .semgrep/exec-owner.yml
     .semgrep/host-authority-escape-hatches.yml
 )
 for checked_config in "${checked_configs[@]}"; do
@@ -47,6 +48,7 @@ for checked_config in "${checked_configs[@]}"; do
 done
 
 "$semgrep_bin" --test --config .semgrep/typed-domains.yml .semgrep/tests/contention.rs
+"$semgrep_bin" --test --config .semgrep/exec-owner.yml .semgrep/tests/exec-owner.rs
 "$semgrep_bin" --config .semgrep/ crates/ --severity ERROR --error --quiet
 # Semgrep skips `tests/` directories by default, and this rule is about tests.
 "$semgrep_bin" --test --config .semgrep/test-executables.yml .semgrep/tests/test-executables.rs

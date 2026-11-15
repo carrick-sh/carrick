@@ -215,11 +215,70 @@ impl NativeExecCancellation {
     }
 }
 
+/// What the ring's exec commit completed, carried to the carrier's
+/// settlement: word 4 of [`NativeExecSettlement`] on x86, X4 of
+/// [`GRANT_OP_EXEC_SETTLE`] on AArch64. The ring sets each bit from the
+/// store it completed, after the commit returns and before the settlement
+/// crossing; the carrier's exec owner discharges the adoption's owed signal
+/// reset only on [`Self::COMPLETE`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExecCommitEffects(u64);
+
+impl ExecCommitEffects {
+    /// Caught dispositions reset to `SIG_DFL` (ignored ones kept).
+    pub const SIGNALS_RESET: Self = Self(1 << 0);
+    /// Pending signal deliveries of the old image dropped.
+    pub const DELIVERIES_CLEARED: Self = Self(1 << 1);
+    /// The alternate signal stack disabled.
+    pub const ALTSTACK_DISABLED: Self = Self(1 << 2);
+    /// The robust list and `clear_child_tid` cleared.
+    pub const ROBUST_CLEARED: Self = Self(1 << 3);
+    /// The caller promoted to the thread-group leader's identity.
+    pub const LEADER_PROMOTED: Self = Self(1 << 4);
+    /// Every exec obligation.
+    pub const COMPLETE: Self = Self(0x1f);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn is_complete(self) -> bool {
+        self.contains(Self::COMPLETE)
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// The word a settlement carried; `None` for a bit no obligation names.
+    pub const fn from_bits(bits: u64) -> Option<Self> {
+        if bits & !Self::COMPLETE.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+}
+
 /// One synchronous settlement of an adopted exec's predecessor (the x86
 /// transport of [`GRANT_OP_EXEC_SETTLE`]; AArch64 passes the same two MMs
-/// in registers). The ring sends it once its slot has switched to the
-/// successor; the carrier then releases the predecessor's stock and
-/// physical custody, or defers that release to its next quarantine drain.
+/// and the commit effects in registers). The ring sends it once its slot
+/// has switched to the successor, with the [`ExecCommitEffects`] its
+/// commit completed in word 4; the carrier then releases the predecessor's
+/// stock and physical custody, or defers that release to its next
+/// quarantine drain.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct NativeExecSettlement {
@@ -233,14 +292,18 @@ impl NativeExecSettlement {
     const REFUSED: u64 = 2;
     const CONSUMED: u64 = 3;
 
-    pub fn new(predecessor: ReservationMm, successor: ReservationMm) -> Self {
+    pub fn new(
+        predecessor: ReservationMm,
+        successor: ReservationMm,
+        effects: ExecCommitEffects,
+    ) -> Self {
         Self {
             words: [
                 Self::MAGIC,
                 predecessor.raw(),
                 successor.raw(),
                 Self::PENDING,
-                0,
+                effects.bits(),
                 0,
                 0,
                 0,
@@ -248,14 +311,16 @@ impl NativeExecSettlement {
         }
     }
 
-    /// Carrier: the unanswered request's predecessor and successor MMs.
-    pub fn request(&self) -> Option<(ReservationMm, ReservationMm)> {
+    /// Carrier: the unanswered request's predecessor and successor MMs and
+    /// the ring's commit effects.
+    pub fn request(&self) -> Option<(ReservationMm, ReservationMm, ExecCommitEffects)> {
         if self.words[0] != Self::MAGIC || self.words[3] != Self::PENDING {
             return None;
         }
         Some((
             ReservationMm::new(self.words[1])?,
             ReservationMm::new(self.words[2])?,
+            ExecCommitEffects::from_bits(self.words[4])?,
         ))
     }
 

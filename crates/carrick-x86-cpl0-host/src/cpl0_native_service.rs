@@ -34,6 +34,9 @@ pub(in crate::cpl0_boot) struct PendingNativeExec {
     pub(in crate::cpl0_boot) ticket: ServiceTicket<Cpl0ServicePin>,
     pub(in crate::cpl0_boot) execution: GrantExecution,
     pub(in crate::cpl0_boot) key: ObjectWaitKey,
+    /// The receipt the carrier's exec owner reserved for this request at
+    /// claim; it names the row through any park until the seal reuses it.
+    pub(in crate::cpl0_boot) receipt: carrick_core_abi::service::ExecAdoptionReceipt,
     /// The ring's proposed manifest, authenticated in retained storage.
     pub(in crate::cpl0_boot) manifest: KernelVa,
     pub(in crate::cpl0_boot) successor: carrick_el1_abi::ReservationMm,
@@ -290,10 +293,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 let (successor, root_generation) = proposed
                     .proposal(ticket.request().identity)
                     .ok_or_else(|| fail("native exec manifest proposal"))?;
+                let receipt = self
+                    .exec_owner
+                    .claim(ticket.request().identity, successor, root_generation)
+                    .map_err(|error| fail(format!("native exec claim: {error:?}")))?
+                    .receipt();
                 return Ok(NativeNoticeStep::Exec(Box::new(PendingNativeExec {
                     ticket,
                     execution,
                     key,
+                    receipt,
                     manifest,
                     successor,
                     root_generation,
