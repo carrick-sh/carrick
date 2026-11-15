@@ -420,3 +420,33 @@ impl LinuxPipeIdentity {
         }
     }
 }
+
+/// Identity of one end of a ring stream socket pair: the pair's object
+/// incarnation and which end. Each end is its own socket, so the two ends
+/// report distinct inode numbers; every alias of one end reports its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxSocketIdentity {
+    index: u32,
+    generation: u32,
+    second: bool,
+}
+impl LinuxSocketIdentity {
+    /// `index` is an object index, below 2^31.
+    pub const fn new(index: u32, generation: u32, second: bool) -> Self {
+        Self {
+            index,
+            generation,
+            second,
+        }
+    }
+    /// A socket inode: `S_IFSOCK` with every permission bit, as sockfs
+    /// reports one.
+    pub const fn stat_fields(self) -> LinuxStatFields {
+        LinuxStatFields {
+            ino: ((self.generation as u64) << 32)
+                | ((self.second as u64) << 31)
+                | (self.index as u64 & 0x7fff_ffff),
+            ..LinuxStatFields::synthetic(b"socket:[carrick]", LINUX_S_IFSOCK | 0o777)
+        }
+    }
+}
