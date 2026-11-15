@@ -4004,7 +4004,10 @@ fn ring_file_fixture_run(
     flags: &[&str],
     defines: impl Fn(&std::path::Path, &str) -> Vec<String>,
 ) -> (FileMetadataReport, FileMetadataReport) {
-    let dir = tempfile::tempdir().expect("ring file fixture directory");
+    // Under `/tmp`, whose ancestors anyone may search: a fixture that drops
+    // its uid still resolves its files (`$TMPDIR` may sit below a 0700
+    // directory only the oracle's user may search).
+    let dir = tempfile::tempdir_in("/tmp").expect("ring file fixture directory");
     let run = |name: &str, native: bool| -> FileMetadataReport {
         let defines = defines(dir.path(), name);
         let mut all: Vec<&str> = defines.iter().map(String::as_str).collect();
@@ -4092,10 +4095,14 @@ fn serial_host_fork_child_ioctl_cloexec_on_a_ring_file_matches_native() {
 }
 
 /// Run one `native_file_attr.S` mode natively and on the production CPL0
-/// path, each against its own fresh mode-0644 file.
+/// path, each against its own fresh mode-0644 file. The directory is
+/// searchable by anyone, so a caller that dropped to uid 65534 still
+/// resolves the file (the oracle's user owns it either way).
 fn file_attr_run(flags: &[&str]) -> (FileMetadataReport, FileMetadataReport) {
     ring_file_fixture_run("native_file_attr.S", flags, |dir, name| {
         use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+            .expect("searchable fixture directory");
         let path = dir.join(format!("{name}-file"));
         std::fs::write(&path, b"apt status\n").expect("attribute file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
@@ -4114,13 +4121,14 @@ fn file_attr_run(flags: &[&str]) -> (FileMetadataReport, FileMetadataReport) {
     })
 }
 
-/// A `native_file_attr.S` report as (exit, every step byte, the chmod and
-/// chown family's refusal counters: x86 chmod 90, fchmod 91, chown 92,
-/// fchown 93, lchown 94, fchownat 260, fchmodat 268, fchmodat2 452).
-fn attr_steps(report: &FileMetadataReport) -> (i32, Vec<u8>, Vec<(usize, u64)>) {
+/// A `native_file_attr.S` report as (exit, the first `steps` step bytes,
+/// the chmod and chown family's refusal counters: x86 chmod 90, fchmod 91,
+/// chown 92, fchown 93, lchown 94, fchownat 260, fchmodat 268, fchmodat2
+/// 452).
+fn attr_steps(report: &FileMetadataReport, steps: usize) -> (i32, Vec<u8>, Vec<(usize, u64)>) {
     (
         report.0,
-        report.1.clone(),
+        report.1.get(..steps).unwrap_or(&report.1).to_vec(),
         report
             .2
             .iter()
@@ -4132,16 +4140,20 @@ fn attr_steps(report: &FileMetadataReport) -> (i32, Vec<u8>, Vec<(usize, u64)>) 
 
 /// #231 parity (apt): `fchmod`/`fchown` of the run root's ring file, its
 /// path `fchmodat`/`fchownat` (and the legacy x86 `chmod`/`chown`/`lchown`),
-/// and their EBADF, ENOENT, EOPNOTSUPP and EPERM answers, against the native
+/// and their EBADF, ENOENT and EOPNOTSUPP answers, against the native
 /// oracle. Red on main: the ring-file calls and the legacy numbers were
-/// counted ENOSYS.
+/// counted ENOSYS. Steps 19-20 (EPERM after the root drops to uid 65534)
+/// are not compared here: the run root's filesystem calls are served under
+/// its host task's credentials, which its ring `setresuid` does not reach
+/// (root resource authority transfer, #1861). The fork child, whose
+/// credentials the ring owns, covers EPERM.
 #[test]
 fn serial_host_root_chmod_chown_on_ring_files_matches_native() {
     let (native, carrick) = file_attr_run(&[]);
     assert_eq!(native.0, 0, "native oracle: {native:?}");
     assert_eq!(
-        attr_steps(&carrick),
-        attr_steps(&native),
+        attr_steps(&carrick, 18),
+        attr_steps(&native, 18),
         "(exit, step bytes, chmod/chown refusals); full report: {carrick:?}"
     );
 }
@@ -4154,8 +4166,8 @@ fn serial_host_fork_child_chmod_chown_on_ring_files_matches_native() {
     let (native, carrick) = file_attr_run(&["-DCHILD"]);
     assert_eq!(native.0, 0, "native oracle: {native:?}");
     assert_eq!(
-        attr_steps(&carrick),
-        attr_steps(&native),
+        attr_steps(&carrick, usize::MAX),
+        attr_steps(&native, usize::MAX),
         "(exit, step bytes, chmod/chown refusals); full report: {carrick:?}"
     );
 }
