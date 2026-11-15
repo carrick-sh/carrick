@@ -5,7 +5,7 @@
  * to clear, then starts the next round. Native Linux exits 0.
  *
  * -DOWNED_COPY_BUSY_ONCE: worker 1 also arms the test image's
- * INJECT_OWNED_COPY_BUSY_ONCE before the barrier, so one clear-tid copy-out
+ * INJECT_OWNED_COPY_BUSY_ONCE after the barrier, so one clear-tid copy-out
  * per round is refused Busy once. The root then reads the injected-copy
  * census: every refusal must be followed by a completed rerun of the copy.
  * Exit 3: the census differs.
@@ -71,19 +71,21 @@ spawn:
     jz worker
     ret
 worker:
-#ifdef OWNED_COPY_BUSY_ONCE
-    cmp $1, %ebx
-    jne 9f
-    movabs $INJECT_OWNED_COPY_BUSY_ONCE, %rax
-    syscall
-9:
-#endif
     lock incl 0x20(%r12)
 7:  cmpl $2, 0x20(%r12)
     je wexit
     pause
     jmp 7b
 wexit:
+#ifdef OWNED_COPY_BUSY_ONCE
+    /* Both workers are past their births: the next exact-MM write is a
+     * clear-tid copy-out, not the root's clone output. */
+    cmp $1, %ebx
+    jne 9f
+    movabs $INJECT_OWNED_COPY_BUSY_ONCE, %rax
+    syscall
+9:
+#endif
     xor %edi, %edi
     mov $60, %eax
     syscall
