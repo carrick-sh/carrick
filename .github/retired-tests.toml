@@ -53,3 +53,9 @@ test = "carrick_el1_linux::aarch64_process_tests::arm_two_live_threads_robust_ex
 reason = "#2109: a registered robust list is no longer a reason for a non-last thread's raw exit to leave the ring (no lane walks the list, and a ring-born thread has no host task to take the exit), so the host-custody witness became a witness that the exit retires in ring."
 replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_two_live_threads_robust_exit_retires_in_ring"
 pr = 2182
+
+[[retired]]
+test = "carrick_el1_linux::aarch64_process_tests::arm_glibc_pthread_join_robust_host_wake_meets_ring_wait"
+reason = "#2109: a registered robust list no longer declines a raw exit to host custody, so the #2124 host-retirement wake witness now reaches host custody through a pending-signal decline, and a twin witnesses the robust exit retiring in ring and waking the join itself."
+replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_glibc_pthread_join_host_retirement_wake_meets_ring_wait"
+pr = 2182

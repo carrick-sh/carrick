@@ -7299,9 +7299,34 @@ fn arm_shared_futex_wake_does_not_release_a_private_waiter() {
     );
 }
 
-// Robust-list exit plus host queue completion of an in-ring join.
+/// How the joined thread's raw `exit` leaves in the pthread_join witnesses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinedExit {
+    /// A thread-directed pending signal declines the exit to host custody:
+    /// the host's retirement clears the CLEARTID word and wakes the join.
+    HostRetirement,
+    /// glibc's robust list is registered and the exit retires in ring, whose
+    /// own clear-child-tid wake releases the join (#2109).
+    RobustInRing,
+}
+
+// Host queue completion of an in-ring join (#2124): a raw exit that leaves for
+// host custody, whose retirement's clear-child-tid wake must meet the
+// in-ring waiter's key. Before #2109 the robust list was the decline that
+// took glibc's exit there; a pending signal still does.
 #[test]
-fn arm_glibc_pthread_join_robust_host_wake_meets_ring_wait() {
+fn arm_glibc_pthread_join_host_retirement_wake_meets_ring_wait() {
+    glibc_pthread_join_meets_ring_wait(JoinedExit::HostRetirement);
+}
+
+/// #2109: glibc's robust-registered thread exit retires in ring, and its
+/// clear-child-tid wake releases the in-ring join.
+#[test]
+fn arm_glibc_pthread_join_robust_exit_in_ring_wakes_ring_wait() {
+    glibc_pthread_join_meets_ring_wait(JoinedExit::RobustInRing);
+}
+
+fn glibc_pthread_join_meets_ring_wait(how: JoinedExit) {
     // The joined CLEARTID word lives in private anonymous memory (glibc's
     // thread descriptor sits in the mmap'd thread stack).
     let words = Box::leak(Box::new(carrick_test_support::GuestUserBuffer::zeroed(
@@ -7354,6 +7379,7 @@ fn arm_glibc_pthread_join_robust_host_wake_meets_ring_wait() {
 
     run_as(fixture, 42, 12, 102, control);
     control.set_clear_child_tid(tid_word);
+    // glibc's thread start registers its robust list.
     let mut robust = carrick_el1_abi::TrapFrame::default();
     robust.x[8] = 99;
     robust.x[0] = tid_word + 0x100;
@@ -7361,28 +7387,46 @@ fn arm_glibc_pthread_join_robust_host_wake_meets_ring_wait() {
     arm_call_with_cpu(fixture, control, &mut service, &mut robust, &mut cpu).unwrap();
     assert_eq!(robust.x[0], 0);
     assert_ne!(control.robust_list().0, 0);
+    if how == JoinedExit::HostRetirement {
+        let _ = control
+            .carrier_pending()
+            .post_then_read_blocked(carrick_el1_abi::PendingSignals(1 << 9), control);
+    }
     let mut exit = carrick_el1_abi::TrapFrame::default();
     exit.x[8] = 93;
-    assert_eq!(
-        arm_call_with_cpu(fixture, control, &mut service, &mut exit, &mut cpu).unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::HostCustody,
-    );
-    // Host retirement's clear-child-tid copyout and raw-address queue wake.
-    words.set::<u32>(0, 0);
-    let wake = carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
-        carrick_kernel::el1_zone::FutexQueueAuthority::of_mm(
-            carrick_kernel::kernel::MmId::from_raw_u64(1).unwrap(),
-        )
-        .wake_child_tid(&carrick_kernel::thread::FutexTable::new(), tid_word)
-    });
-    assert_eq!(
-        wake.count, 1,
-        "host retirement must meet the in-ring join key"
-    );
-    assert!(
-        wake.handed.is_empty(),
-        "native completion keeps ring custody"
-    );
+    let route = arm_call_with_cpu(fixture, control, &mut service, &mut exit, &mut cpu).unwrap();
+    match how {
+        JoinedExit::HostRetirement => {
+            assert_eq!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::HostCustody,
+            );
+            // Host retirement's clear-child-tid copyout and raw-address queue wake.
+            words.set::<u32>(0, 0);
+            let wake = carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+                carrick_kernel::el1_zone::FutexQueueAuthority::of_mm(
+                    carrick_kernel::kernel::MmId::from_raw_u64(1).unwrap(),
+                )
+                .wake_child_tid(&carrick_kernel::thread::FutexTable::new(), tid_word)
+            });
+            assert_eq!(
+                wake.count, 1,
+                "host retirement must meet the in-ring join key"
+            );
+            assert!(
+                wake.handed.is_empty(),
+                "native completion keeps ring custody"
+            );
+        }
+        JoinedExit::RobustInRing => {
+            assert_eq!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+                "a registered robust list is no reason to leave the ring"
+            );
+            assert!(!control.host_exit_requested());
+        }
+    }
     assert_eq!(words.get::<u32>(0), 0, "exit cleared the CLEARTID word");
     assert!(
         matches!(
