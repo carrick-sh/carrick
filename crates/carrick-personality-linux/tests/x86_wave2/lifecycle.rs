@@ -116,6 +116,10 @@ struct Turn<'a> {
     current: Option<RecordRef>,
     words: [u32; 2],
     fail_copy: Option<u64>,
+    /// The next copy at this address and access is refused "not now" once.
+    not_yet: Option<(u64, carrick_guest_arch::Access)>,
+    /// Guest-copy waits the policy asked the memory owner for.
+    waited: Vec<carrick_core::user_copy::GuestCopyRequest>,
     wakes: u64,
     adopted: bool,
     fail_release: bool,
@@ -143,6 +147,8 @@ impl<'a> Turn<'a> {
             current: None,
             words: [71, 72],
             fail_copy: None,
+            not_yet: None,
+            waited: Vec::new(),
             wakes: 0,
             adopted: false,
             fail_release: false,
@@ -173,6 +179,16 @@ impl<'a> Turn<'a> {
 }
 impl UserCopy for Turn<'_> {
     fn copy_in(&mut self, dst: &mut [u8], address: UserVa) -> carrick_core::user_copy::CopyOutcome {
+        if self.not_yet == Some((address.raw(), carrick_guest_arch::Access::Read)) {
+            self.not_yet = None;
+            return carrick_core::user_copy::CopyOutcome::NotYet(
+                carrick_core::user_copy::GuestCopyRequest {
+                    address,
+                    len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                    access: carrick_guest_arch::Access::Read,
+                },
+            );
+        }
         let index = match address.raw() {
             0x1000 => 0,
             0x1004 => 1,
@@ -189,6 +205,16 @@ impl UserCopy for Turn<'_> {
             self.fail_copy = None;
             return carrick_core::user_copy::CopyOutcome::Fault;
         }
+        if self.not_yet == Some((address.raw(), carrick_guest_arch::Access::Write)) {
+            self.not_yet = None;
+            return carrick_core::user_copy::CopyOutcome::NotYet(
+                carrick_core::user_copy::GuestCopyRequest {
+                    address,
+                    len: carrick_guest_arch::GuestLen::new(src.len() as u64),
+                    access: carrick_guest_arch::Access::Write,
+                },
+            );
+        }
         let index = match address.raw() {
             0x1000 => 0,
             0x1004 => 1,
@@ -203,12 +229,13 @@ impl UserCopy for Turn<'_> {
     }
 }
 impl<'a> LifecycleNative<'a> for Turn<'a> {
-    #[allow(clippy::panic)]
+    /// The owner supplies the word at once: the call reruns.
     fn wait_guest_copy(
         &mut self,
-        _: carrick_core::user_copy::GuestCopyRequest,
+        request: carrick_core::user_copy::GuestCopyRequest,
     ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
-        panic!("eager test venue cannot suspend guest memory")
+        self.waited.push(request);
+        carrick_personality_linux::lifecycle::LifecycleOutcome::Redispatch
     }
     #[allow(clippy::panic)]
     fn finish_signal_output(
@@ -678,5 +705,70 @@ pub fn x5_exit_requeued_after_wake_wakes_once() {
         a.slots[1].set_clear_child_tid(0x2000);
         assert_eq!(a.slots[1].clear_child_tid(), 0x2000);
         assert!(!a.slots[1].child_tid_cleared_in_zone_at(0x1004));
+    }
+}
+
+/// #2359 round 4: a thread clone whose tid copyout is refused "not now"
+/// (the word's memory owner is busy, as when a sibling's exit holds the MM
+/// editor) keeps its call. The clone backs out (nothing claimed, every
+/// written word restored), waits for the word's owner and reruns, and the
+/// rerun publishes both words. Before, the refusal answered EFAULT (or
+/// forwarded) from a clone that created no thread. A refused preimage read
+/// still forwards, as `arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication`
+/// requires.
+pub fn x5_clone_tid_copy_not_yet_reruns() {
+    for x86 in [false, true] {
+        // The parent word's copyout, and the child word's copyout after the
+        // parent word was written.
+        for (address, access) in [
+            (0x1000, carrick_guest_arch::Access::Write),
+            (0x1004, carrick_guest_arch::Access::Write),
+        ] {
+            let a = Process::new(7);
+            let mut turn = Turn::new(&a, x86);
+            let entry = a
+                .page
+                .stock(
+                    0,
+                    EntryIdentity {
+                        tid: 50,
+                        visible_tid: 7,
+                        thread_serial: 5050,
+                        birth: carrick_core_abi::entry::BirthSerial::of_task(
+                            carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+                        ),
+                        uid_credit: 1,
+                    },
+                )
+                .unwrap();
+            let args = [FLAGS, 0xdead0000, 0x1000, 0x77770000, 0x1004, 0];
+            turn.not_yet = Some((address, access));
+            let route = turn.syscall(220, args);
+            assert_ne!(
+                route,
+                dispatch::CompletionRoute::Forward,
+                "a refused tid copy is not now, never the host's clone"
+            );
+            assert_eq!(
+                turn.waited
+                    .iter()
+                    .map(|request| (request.address.raw(), request.access))
+                    .collect::<Vec<_>>(),
+                [(address, access)],
+                "the clone waited for the refused word's owner"
+            );
+            assert_eq!(turn.words, [71, 72], "nothing written or restored");
+            assert!(turn.child.is_none(), "no thread was born");
+            assert_eq!(a.page.live(), 1);
+            assert_eq!(
+                a.page.state(0),
+                Some((entry.generation(), EntryState::Reserved))
+            );
+            // The rerun finds the word ready and the thread is born in ring.
+            assert_eq!(turn.syscall(220, args), dispatch::CompletionRoute::Served);
+            assert_eq!(turn.words, [7, 7]);
+            assert!(turn.child.is_some());
+            assert_eq!(turn.waited.len(), 1);
+        }
     }
 }
