@@ -47,3 +47,9 @@ test = "carrick_el1_linux::native_process_runtime::host_test_support::x86_native
 reason = "#2273: native exec completion now claims the x86 fork child for service instead of only staging it; root exec remains refused."
 replaced_by = "carrick_el1_linux::native_process_runtime::host_test_support::x86_native_exec_completion_claims_the_fork_child_and_refuses_the_root"
 pr = 2273
+
+[[retired]]
+test = "carrick_el1_linux::native_fork_refusal::tests::parent_gate_refusal_preserves_observed_state_and_busy_policy"
+reason = "#2306: contention at the parent gate now parks via NativeContention instead of returning an errno, so the Busy-policy errno witness was replaced by one that asserts the observed state is preserved as contention."
+replaced_by = "carrick_el1_linux::native_fork_refusal::tests::parent_gate_refusal_preserves_observed_state_as_contention"
+pr = 2353
