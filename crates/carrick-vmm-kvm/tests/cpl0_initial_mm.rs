@@ -1048,8 +1048,11 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     let stock = carrier.fork_table_stock();
     assert!(stock >= demand.tables, "boot left the stock {stock} tables");
 
+    let receipt = carrier
+        .fixture_claim_exec(successor, root_generation)
+        .expect("claim");
     let X86ExecStage::Staged(backing, entry, _) = carrier
-        .stage_exec_successor(0, request(), StockReleaseWake::new(|| {}))
+        .stage_exec_successor(0, receipt, request(), StockReleaseWake::new(|| {}))
         .expect("service")
     else {
         panic!("the stock grants the successor");
@@ -1061,7 +1064,7 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     assert_eq!(entry.entry, request().image.entry().entry);
     assert_eq!(carrier.fork_table_stock(), stock - demand.tables);
     carrier
-        .release_exec_successor(successor)
+        .release_exec_successor(receipt)
         .expect("unused preparation returns");
     assert_eq!(carrier.fork_table_stock(), stock);
     assert!(carrier.exec_reservation(successor).is_none());
@@ -1073,8 +1076,11 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     let wake = StockReleaseWake::new(move || {
         let _ = woken.try_send(());
     });
+    let receipt = carrier
+        .fixture_claim_exec(successor, root_generation)
+        .expect("claim");
     let X86ExecStage::Parked(parked) = carrier
-        .stage_exec_successor(0, request(), wake)
+        .stage_exec_successor(0, receipt, request(), wake)
         .expect("service")
     else {
         panic!("a holder has the stock: not now");
@@ -1098,7 +1104,7 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     let rerun = carrier.probe_parked_exec(parked).expect("released");
     assert!(matches!(
         carrier
-            .stage_exec_successor(0, rerun, StockReleaseWake::new(|| {}))
+            .stage_exec_successor(0, receipt, rerun, StockReleaseWake::new(|| {}))
             .expect("service"),
         X86ExecStage::Staged(..)
     ));

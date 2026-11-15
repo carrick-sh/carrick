@@ -131,7 +131,40 @@ struct Fixture {
     region: Region,
     stock: ForkStock<UntaggedRoots>,
     frames: TestFrames,
-    preparations: X86ExecPreparations<TestData>,
+    preparations: ExecPreparations<X86ExecPreparation<TestData>, X86ExecRequest>,
+    receipt: Option<ExecAdoptionReceipt>,
+}
+
+/// The ring's exec request of a fork child on this carrier, as its ticket
+/// names it.
+fn child_identity() -> carrick_core_abi::service::ServiceIdentity {
+    use carrick_core_abi::service::{ServiceBirth, ServiceIdentity, ServiceOrigin};
+    use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
+    ServiceIdentity {
+        birth: ServiceBirth {
+            origin: ServiceOrigin::Descendant,
+            process: TaskKey {
+                id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(2).unwrap()),
+                serial: TaskSerial::from_registry_allocation(NonZeroU64::MIN),
+            },
+            thread: EntryThreadGeneration::from_raw(1),
+            record: carrick_sched_core::RecordRef {
+                id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+                incarnation: 1,
+            },
+            // SAFETY: a synthetic predecessor identity for this fixture; it
+            // authorizes no memory operation.
+            mm: unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    CARRIER,
+                    ReservationMm::new(3).unwrap(),
+                    NonZeroU64::MIN,
+                )
+            },
+        },
+        execution: SnapshotGeneration::from_raw(1),
+        sequence: NonZeroU64::MIN,
+    }
 }
 
 impl Fixture {
@@ -185,8 +218,29 @@ impl Fixture {
             region,
             stock,
             frames: TestFrames::new(),
-            preparations: X86ExecPreparations::default(),
+            preparations: ExecPreparations::default(),
+            receipt: None,
         }
+    }
+
+    /// The live claimed row, or a new claim reserving its receipt.
+    fn claimed(&mut self) -> ExecAdoptionReceipt {
+        if let Some(receipt) = self.receipt
+            && self.preparations.claim_of(receipt).is_some()
+        {
+            return receipt;
+        }
+        let receipt = self
+            .preparations
+            .claim(
+                child_identity(),
+                ReservationMm::new(SUCCESSOR).unwrap(),
+                ROOT_GENERATION,
+            )
+            .unwrap()
+            .receipt();
+        self.receipt = Some(receipt);
+        receipt
     }
 
     fn stage(&mut self, request: X86ExecRequest) -> X86ExecStage {
@@ -194,8 +248,10 @@ impl Fixture {
     }
 
     fn stage_waking(&mut self, request: X86ExecRequest, wake: StockReleaseWake) -> X86ExecStage {
+        let receipt = self.claimed();
         stage_x86_exec(
             CpuId::new(0),
+            receipt,
             request,
             &mut self.preparations,
             &mut self.stock,
@@ -341,7 +397,7 @@ fn exec_service_stages_a_static_successor() {
         panic!("a static successor with stock to spare stages");
     };
     let successor = ReservationMm::new(SUCCESSOR).unwrap();
-    let preparation = fixture.preparations.get(successor).unwrap();
+    let (_, preparation) = fixture.preparations.staged_for(successor).unwrap();
     assert_eq!(preparation.tables().len(), 9);
     assert_eq!(fixture.stock.table_stock().len(), 16 - 9);
     assert_eq!(
@@ -370,7 +426,15 @@ fn exec_service_stages_a_static_successor() {
     assert_eq!(fixture.imported(), 0x3000 + INITIAL_STACK_RESERVATION);
 
     // An unused preparation returns whole.
-    let preparation = fixture.preparations.take(successor).unwrap();
+    let receipt = fixture.receipt.unwrap();
+    let ExecRetained::Staged(preparation) = fixture
+        .preparations
+        .retire(receipt, ExecRetireReason::Refused)
+        .unwrap()
+        .held
+    else {
+        panic!("the staged row holds its preparation");
+    };
     release_x86_exec(
         preparation,
         &mut fixture.stock,
@@ -507,19 +571,21 @@ fn a_pending_fork_parks_the_exec_until_its_release_wakes_it_then_stages() {
         .unwrap();
     assert_eq!(fixture.stock.table_stock().len(), 7);
 
-    let (woken, wakes) = std::sync::mpsc::sync_channel(1);
-    let wake = StockReleaseWake::new(move || {
-        let _ = woken.try_send(());
-    });
+    // The carrier's owner parks the claimed row on the stock's release: the
+    // row keeps the receipt reserved at claim.
+    let receipt = fixture.claimed();
+    let (woken, wake) = ExecParkWake::new();
     let X86ExecStage::Parked(parked) =
         fixture.stage_waking(request(image(argv(), vec![]).unwrap()), wake)
     else {
         panic!("the fork holds the tables: not now");
     };
+    fixture.preparations.park(receipt, parked, woken).unwrap();
     // Nothing is reserved while the exec waits.
     assert_eq!(fixture.stock.table_stock().len(), 7);
     assert_eq!(fixture.stock.counters().successor_table_refusals, 1);
-    assert!(fixture.preparations.is_empty());
+    assert!(fixture.preparations.staged(receipt).is_none());
+    assert_eq!(fixture.preparations.parked(), vec![receipt]);
     assert_eq!(fixture.frames.mapped(), 0);
     assert_eq!(fixture.imported(), 0, "the import was aborted");
     assert_eq!(
@@ -527,7 +593,14 @@ fn a_pending_fork_parks_the_exec_until_its_release_wakes_it_then_stages() {
         1,
         "enrolled on the holder's release"
     );
-    assert!(wakes.try_recv().is_err(), "nothing has returned yet");
+    let never_cancelled = |_: &X86ExecRequest| Ok::<_, ()>(false);
+    assert!(matches!(
+        fixture
+            .preparations
+            .probe_parked(receipt, &fixture.stock, never_cancelled)
+            .unwrap(),
+        ParkedProbe::Still
+    ));
 
     let stock = &mut fixture.stock;
     std::thread::scope(|scope| {
@@ -544,20 +617,43 @@ fn a_pending_fork_parks_the_exec_until_its_release_wakes_it_then_stages() {
                 )
                 .unwrap();
         });
-        wakes
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the fork's abort wakes the enrolled exec");
     });
     assert_eq!(fixture.stock.release_waiters(), 0, "woken once");
-    let rerun = parked.probe(&fixture.stock).unwrap();
+    let ParkedProbe::Rerun(claim, rerun) = fixture
+        .preparations
+        .probe_parked(receipt, &fixture.stock, never_cancelled)
+        .unwrap()
+    else {
+        panic!("the fork's abort reruns the parked exec");
+    };
+    assert_eq!(claim.receipt(), receipt);
     let X86ExecStage::Staged(backing, _, _) = fixture.stage(rerun) else {
         panic!("the released stock grants the rerun");
     };
     let successor = ReservationMm::new(SUCCESSOR).unwrap();
     assert_eq!(
         backing.root,
-        fixture.preparations.get(successor).unwrap().tables()[0]
+        fixture.preparations.staged(receipt).unwrap().tables()[0]
     );
     assert_eq!(fixture.stock.table_stock().len(), 1);
+    // The seal reuses the receipt reserved before the park.
+    assert_eq!(
+        fixture.preparations.seal(receipt).unwrap().receipt(),
+        receipt
+    );
+    assert_eq!(
+        fixture
+            .preparations
+            .staged_for(successor)
+            .unwrap()
+            .0
+            .receipt(),
+        receipt
+    );
+    let census = fixture.preparations.census();
+    assert_eq!(
+        (census.reserved, census.parked, census.reruns, census.sealed),
+        (1, 1, 1, 1)
+    );
     assert_eq!(fixture.stock.counters().successor_table_refusals, 1);
 }

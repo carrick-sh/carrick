@@ -28,6 +28,15 @@ std::thread_local! {
     static EXEC_CANCELLATIONS: std::cell::RefCell<Vec<u64>> = const {
         std::cell::RefCell::new(Vec::new())
     };
+    static EXEC_SETTLE_EFFECTS: std::cell::RefCell<Vec<carrick_el1_abi::ExecCommitEffects>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// The commit effects each exec settlement carried, in order (#2305).
+#[cfg(test)]
+pub(super) fn take_exec_settle_effects() -> Vec<carrick_el1_abi::ExecCommitEffects> {
+    EXEC_SETTLE_EFFECTS.with(|effects| core::mem::take(&mut *effects.borrow_mut()))
 }
 
 // One-shot wait-status copy refusals, consumed before `child_copy_error`.
@@ -263,7 +272,9 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         &self,
         predecessor: AddressContext<RootGpa>,
         successor: AddressContext<RootGpa>,
+        effects: carrick_el1_abi::ExecCommitEffects,
     ) -> Result<(), NativeProcessError> {
+        EXEC_SETTLE_EFFECTS.with(|recorded| recorded.borrow_mut().push(effects));
         let old = self
             .zone
             .spaces
@@ -4673,6 +4684,12 @@ fn exec_succeeds_when_task_keys_are_not_namespace_tids() {
         fixture.task.mm.key.load(Ordering::Acquire),
         successor_mm.raw(),
         "the exec committed its successor rather than killing the caller"
+    );
+    // #2305: the settlement carries every obligation the commit completed,
+    // which is what discharges the adoption's owed signal reset.
+    assert_eq!(
+        take_exec_settle_effects(),
+        vec![carrick_el1_abi::ExecCommitEffects::COMPLETE]
     );
 }
 

@@ -292,6 +292,14 @@ fn service_terminal_operation(
     {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     }
+    // An adopted exec whose successor retires before its settlement leaves
+    // the exec owner unsettled.
+    if let Some(successor) = successor_mm {
+        custody
+            .native_exec_preparations
+            .lock()
+            .abandon_settling(successor);
+    }
     if custody
         .fork_stock
         .lock()
@@ -2298,6 +2306,8 @@ fn service_native_exec_cancel(
 
 /// Release the exact predecessor retained by native exec after the ring has
 /// removed its reservation owner and switched every slot to the successor.
+/// The exec owner routes the settlement first, and refuses it unless the
+/// ring's commit `effects_raw` completed every exec obligation.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
 fn service_native_exec_settle(
@@ -2308,6 +2318,7 @@ fn service_native_exec_settle(
     predecessor_raw: u64,
     successor_raw: u64,
     claimed_cpu: u64,
+    effects_raw: u64,
     ttbr0: u64,
 ) -> [u64; 4] {
     let denied = [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
@@ -2318,6 +2329,9 @@ fn service_native_exec_settle(
         return denied;
     };
     let Some(successor) = carrick_el1_abi::ReservationMm::new(successor_raw) else {
+        return denied;
+    };
+    let Some(effects) = carrick_el1_abi::ExecCommitEffects::from_bits(effects_raw) else {
         return denied;
     };
     let Some(execution) = stopped_execution(region, cpu, ttbr0) else {
@@ -2340,6 +2354,12 @@ fn service_native_exec_settle(
     let Some(receipt) = receipt else {
         return denied;
     };
+    if custody
+        .route_native_exec_settlement(predecessor, successor, effects)
+        .is_none()
+    {
+        return denied;
+    }
     if settle_native_exec_predecessor(custody, region, zone, receipt) {
         [METADATA_GRANT_SUCCESS, 0, 0, 0]
     } else {
@@ -2448,8 +2468,13 @@ pub(crate) fn handle_metadata_grant_trap(
         let ttbr0 = vcpu
             .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
             .map_err(|e| TrapError::Hypervisor(format!("read exec successor root: {e}")))?;
+        let effects = vcpu.get_reg(Reg::X4).map_err(|e| {
+            TrapError::Hypervisor(format!("failed to read X4 for exec settlement: {e}"))
+        })?;
         if let Some(region) = region {
-            service_native_exec_settle(custody, generation, region, cpu, arg1, arg2, arg3, ttbr0)
+            service_native_exec_settle(
+                custody, generation, region, cpu, arg1, arg2, arg3, effects, ttbr0,
+            )
         } else {
             [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
         }
@@ -3040,8 +3065,16 @@ mod tests {
             execution: carrick_core_abi::SnapshotGeneration::from_raw(11),
             sequence: NonZeroU64::MIN,
         };
-        let receipt = custody.reserve_native_exec_receipt().unwrap();
-        custody.retain_native_exec_preparation(receipt, identity, prepared);
+        let receipt = custody
+            .claim_native_exec(
+                identity,
+                carrick_el1_abi::ReservationMm::new(6).unwrap(),
+                NonZeroU64::new(78).unwrap(),
+            )
+            .unwrap();
+        custody
+            .seal_native_exec_preparation(receipt, prepared)
+            .unwrap();
         assert_eq!(
             custody.native_exec_preparations.lock().len(),
             preparation_baseline + 1
@@ -3081,6 +3114,18 @@ mod tests {
         assert_eq!(
             custody.native_exec_preparations.lock().len(),
             preparation_baseline
+        );
+        // #2305: the HVF carrier's exec owner is the neutral one: the
+        // receipt was reserved at claim, sealed, and retired as cancelled.
+        let census = custody.exec_owner_census();
+        assert_eq!(
+            (
+                census.reserved,
+                census.sealed,
+                census.cancelled,
+                census.retired()
+            ),
+            (1, 1, 1, 1)
         );
         assert_eq!(custody.native_frame_backings.lock().len(), frame_baseline);
         assert_eq!(live_executable.strong_count(), 0);

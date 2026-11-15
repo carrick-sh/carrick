@@ -2103,7 +2103,11 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
     // notification source. The test crossing deliberately refuses only the
     // final host settlement, after the real gate and install transitions.
     assert_eq!(
-        service.finish_exec_successor(fixture.address, successor.address),
+        service.finish_exec_successor(
+            fixture.address,
+            successor.address,
+            carrick_el1_abi::ExecCommitEffects::COMPLETE,
+        ),
         Err(NativeProcessError::Unsupported),
     );
     assert!(

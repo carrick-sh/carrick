@@ -298,9 +298,15 @@ pub fn cross_hvc_exec_adopt(record_gpa: u64, cpu: u64) -> Result<(), ()> {
 
 /// Settle the predecessor after the stopped execution has switched to its
 /// successor MM. The carrier authenticates both identities against its
-/// retained one-shot predecessor receipt.
+/// retained one-shot predecessor receipt, and checks `effects`, the ring's
+/// completed `ExecCommitEffects` word.
 #[allow(clippy::result_unit_err)]
-pub fn cross_hvc_exec_settle(predecessor: u64, successor: u64, cpu: u64) -> Result<(), ()> {
+pub fn cross_hvc_exec_settle(
+    predecessor: u64,
+    successor: u64,
+    cpu: u64,
+    effects: u64,
+) -> Result<(), ()> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status = carrick_el1_abi::GRANT_OP_EXEC_SETTLE;
@@ -309,7 +315,7 @@ pub fn cross_hvc_exec_settle(predecessor: u64, successor: u64, cpu: u64) -> Resu
         unsafe {
             core::arch::asm!("hvc #6", inout("x0") status,
                 inlateout("x1") predecessor => _, inlateout("x2") successor => _,
-                inlateout("x3") cpu => _, options(nostack));
+                inlateout("x3") cpu => _, inlateout("x4") effects => _, options(nostack));
         }
         (status == carrick_el1_abi::METADATA_GRANT_SUCCESS)
             .then_some(())
@@ -317,7 +323,7 @@ pub fn cross_hvc_exec_settle(predecessor: u64, successor: u64, cpu: u64) -> Resu
     }
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
     {
-        let _ = (predecessor, successor, cpu);
+        let _ = (predecessor, successor, cpu, effects);
         Err(())
     }
 }

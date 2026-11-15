@@ -1013,6 +1013,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let execution = GrantExecution::new(lease.cpu, binding, context);
         // Refusal is recorded in the reply word and counted by the stock.
         let _ = self.fork_stock.retire_child(execution, &mut record);
+        // An adopted exec whose successor retires before its settlement
+        // leaves the exec owner unsettled.
+        if let Some(successor) = ReservationMm::new(binding.mm.raw()) {
+            self.exec_owner.abandon_settling(successor);
+        }
         // SAFETY: the record is a fully initialized array of eight u64 words.
         let bytes = unsafe {
             std::slice::from_raw_parts(
@@ -1034,11 +1039,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
 
     /// What this carrier's exec owner reserved, sealed and retired.
     pub fn exec_owner_census(&self) -> carrick_hal::exec_owner::ExecOwnerCensus {
-        carrick_hal::exec_owner::ExecOwnerCensus {
-            reserved: self.exec_receipts,
-            sealed: self.exec_receipts,
-            ..Default::default()
-        }
+        self.exec_owner.census()
     }
 
     pub fn service_fork_stock<I: CarrierCpuIo>(

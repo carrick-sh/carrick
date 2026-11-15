@@ -342,9 +342,10 @@ impl NativeService {
     }
 
     /// Resolve and run the retained exec service selected by the authenticated
-    /// request. Preparation performs all fallible file and loader work before
-    /// publishing `Supplied`; the result remains carrier-owned by exact
-    /// birth/MM/execution/sequence.
+    /// request. The carrier's exec owner reserves the request's receipt at
+    /// claim, before any preparation. Preparation performs all fallible file
+    /// and loader work before publishing `Supplied`; the result remains
+    /// carrier-owned by that receipt and the exact birth/MM/execution/sequence.
     pub fn prepare_exec(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let request = self.request();
         let (capability, payload) = match request.operation {
@@ -365,9 +366,28 @@ impl NativeService {
             }
             _ => return Err(stale()),
         };
+        let receipt =
+            match self
+                .custody
+                .claim_native_exec(request.identity, successor_mm, root_generation)
+            {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    return self.finish_exec_failure(
+                        ServiceFailureCode::new(11).unwrap_or(ServiceFailureCode::MINIMUM),
+                    );
+                }
+            };
+        let refuse = |this: Self, failure: ServiceFailureCode| {
+            // Refused before the seal: the row retires and nothing past it
+            // was owed.
+            this.custody
+                .retire_native_exec(receipt, carrick_hal::exec_owner::ExecRetireReason::Refused);
+            this.finish_exec_failure(failure)
+        };
         let service = match self.custody.native_exec_services.resolve(capability) {
             Ok(service) => service,
-            Err(unrouted) => return self.finish_exec_failure(unrouted),
+            Err(unrouted) => return refuse(self, unrouted),
         };
         match service.prepare(request, payload, successor_mm) {
             Ok(prepared) => {
@@ -377,19 +397,27 @@ impl NativeService {
                 ) {
                     Ok(prepared) => prepared,
                     Err(_) => {
-                        return self.finish_exec_failure(
+                        return refuse(
+                            self,
                             ServiceFailureCode::new(12).unwrap_or(ServiceFailureCode::MINIMUM),
                         );
                     }
                 };
-                self.publish_exec_prepared(successor_mm, root_generation, manifest, prepared)
+                self.publish_exec_prepared(
+                    receipt,
+                    successor_mm,
+                    root_generation,
+                    manifest,
+                    prepared,
+                )
             }
-            Err(failure) => self.finish_exec_failure(failure),
+            Err(failure) => refuse(self, failure),
         }
     }
 
     fn publish_exec_prepared(
         self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
         successor_mm: carrick_el1_abi::ReservationMm,
         root_generation: core::num::NonZeroU64,
         manifest: core::ptr::NonNull<carrick_core_abi::service::ExecSuccessorManifest>,
@@ -397,48 +425,53 @@ impl NativeService {
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let identity = self.request().identity;
         let custody = Arc::clone(&self.custody);
-        let receipt = match custody.reserve_native_exec_receipt() {
-            Ok(receipt) => receipt,
-            Err(()) => {
-                drop(prepared);
-                return self.finish_exec_failure(
-                    ServiceFailureCode::new(11).unwrap_or(ServiceFailureCode::MINIMUM),
-                );
-            }
-        };
         let asid = prepared.prepared_asid();
-        let sealed = unsafe { manifest.as_ref() }
-            .seal(
-                identity,
-                receipt,
-                carrick_core_abi::service::ExecSuccessorBacking {
-                    root: prepared.root(),
-                    asid: asid.asid(),
-                    asid_generation: core::num::NonZeroU64::new(asid.generation())
-                        .ok_or_else(|| stale())?,
-                },
-                carrick_core_abi::service::ExecSuccessorEntry {
-                    entry: carrick_guest_arch::UserVa::new(prepared.entry()),
-                    stack_pointer: carrick_guest_arch::UserVa::new(prepared.stack_pointer()),
-                },
-            )
-            .ok_or_else(|| stale())?;
-        if sealed.open(identity, receipt).is_none_or(|view| {
-            view.successor_mm != successor_mm || view.root_generation != root_generation
-        }) {
+        let sealed = core::num::NonZeroU64::new(asid.generation())
+            .and_then(|asid_generation| {
+                // SAFETY: intake pinned the complete aligned ring-owned reply;
+                // the request completion has not yet released it.
+                unsafe { manifest.as_ref() }.seal(
+                    identity,
+                    receipt,
+                    carrick_core_abi::service::ExecSuccessorBacking {
+                        root: prepared.root(),
+                        asid: asid.asid(),
+                        asid_generation,
+                    },
+                    carrick_core_abi::service::ExecSuccessorEntry {
+                        entry: carrick_guest_arch::UserVa::new(prepared.entry()),
+                        stack_pointer: carrick_guest_arch::UserVa::new(prepared.stack_pointer()),
+                    },
+                )
+            })
+            .filter(|sealed| {
+                sealed.open(identity, receipt).is_some_and(|view| {
+                    view.successor_mm == successor_mm && view.root_generation == root_generation
+                })
+            });
+        let Some(sealed) = sealed else {
+            drop(prepared);
+            custody.retire_native_exec(receipt, carrick_hal::exec_owner::ExecRetireReason::Refused);
+            return Err(stale());
+        };
+        // The owner holds the sealed row before the ring can see its
+        // manifest, so an adoption always finds it.
+        if custody
+            .seal_native_exec_preparation(receipt, prepared)
+            .is_err()
+        {
             return Err(stale());
         }
         let census = self.census;
         let request = self.request();
         self.finish_exec_ticket(|ticket| {
-            match ticket.publish_exec_prepared(receipt, prepared, |receipt, prepared| {
-                custody.retain_native_exec_preparation(receipt, identity, prepared);
+            match ticket.publish_exec_prepared(receipt, (), |_, ()| {
                 // SAFETY: the exact ticket retains this pinned, aligned reply
                 // until the release-store completion below.
                 unsafe { manifest.as_ptr().write(sealed) };
             }) {
                 Ok(()) => Ok(()),
-                Err((_, ticket, prepared)) => {
+                Err((_, ticket, ())) => {
                     if let carrick_core_abi::service::ServiceOperation::Exec { payload, .. } =
                         request.operation
                     {
@@ -449,7 +482,10 @@ impl NativeService {
                             carrick_el1_abi::RefusalVenue::Carrier,
                         );
                     }
-                    drop(prepared);
+                    custody.retire_native_exec(
+                        receipt,
+                        carrick_hal::exec_owner::ExecRetireReason::PublishCancelled,
+                    );
                     ticket.complete(false).map_err(|_| stale())
                 }
             }

@@ -2105,7 +2105,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 }
                 carrick_el1_abi::NATIVE_EXEC_PORT => {
                     if let exec_service::NativeExecCrossing::Settled { successor, predecessor } =
-                        custody.service_native_exec(&lease)?
+                        custody.service_native_exec(&lease, carrick_hal::exec_owner::ExecSettleLane::Peer)?
                     {
                         exec_rebind = Some((successor, predecessor));
                     }
@@ -2520,7 +2520,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 }
                 Some(ProductionPort::NativeExec) => {
                     if let exec_service::NativeExecCrossing::Settled { successor, predecessor } =
-                        custody.service_native_exec(&lease)?
+                        custody.service_native_exec(&lease, carrick_hal::exec_owner::ExecSettleLane::RootCustody)?
                     {
                         exec_rebind = Some((successor, predecessor));
                     }
@@ -3321,9 +3321,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
     }
 
     /// The exec owner's census observed through the production carrier.
-    pub fn exec_owner_census(
-        &self,
-    ) -> Result<carrick_hal::exec_owner::ExecOwnerCensus, TrapError> {
+    pub fn exec_owner_census(&self) -> Result<carrick_hal::exec_owner::ExecOwnerCensus, TrapError> {
         let custody = self
             .custody
             .lock()
@@ -3542,12 +3540,10 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     )>,
     maintenance_root: Option<RootGpa>,
     anonymous_next_gpa: FrameGpa,
-    /// Exec successors reserved before their arm (#1093 S4c slice c).
-    exec_preparations: exec_service::X86ExecPreparations<exec_service::CarrierExecData>,
-    /// Exec requests parked on the fork stock's release, tickets outstanding.
-    parked_execs: Vec<exec_service::ParkedNativeExec>,
-    /// The last exec adoption receipt this carrier issued.
-    exec_receipts: u64,
+    /// The carrier's exec owner (#2305): its receipts, reserved at claim,
+    /// the successors staged before their arm, the requests parked on the
+    /// fork stock's release, and the adopted execs awaiting settlement.
+    exec_owner: exec_service::X86ExecOwner,
     /// Adopted execs whose predecessor custody awaits its settlement.
     exec_predecessors: Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<()>>,
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
@@ -4971,9 +4967,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             fork_stock,
             maintenance_root: None,
             anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
-            exec_preparations: exec_service::X86ExecPreparations::default(),
-            parked_execs: Vec::new(),
-            exec_receipts: 0,
+            exec_owner: exec_service::X86ExecOwner::default(),
             exec_predecessors: Vec::new(),
             anonymous_pending: [None, None],
             cow_published: [None, None],
