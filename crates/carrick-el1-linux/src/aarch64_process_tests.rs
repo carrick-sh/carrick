@@ -7082,7 +7082,7 @@ fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
 }
 
 #[test]
-fn arm_raw_exit_decline_after_membership_reservation_restores_live() {
+fn arm_raw_exit_refused_copy_after_membership_reservation_restores_live() {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let (control, record) = imported_thread_with_identity(fixture, |_| {});
@@ -7100,8 +7100,9 @@ fn arm_raw_exit_decline_after_membership_reservation_restores_live() {
         fixture.zone.switch_in_full(fixture.slot).unwrap().record,
         record.id
     );
-    // A failed clear_child_tid copy is checked only after the nonfinal
-    // membership reservation. The host must still see both page memberships.
+    // A refused clear_child_tid copy is checked only after the nonfinal
+    // membership reservation. The exit keeps its call (#2359), and the page
+    // must still see both memberships until it reruns.
     let mut child_tid = 42_u32;
     control.set_clear_child_tid((&raw mut child_tid).addr() as u64);
     let live = fixture.page.live();
@@ -7113,15 +7114,88 @@ fn arm_raw_exit_decline_after_membership_reservation_restores_live() {
     let route = arm_call(fixture, control, &mut service, &mut frame);
     super::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
     let route = route.unwrap();
-    assert_eq!(
+    assert_ne!(
         route,
         carrick_personality_linux::dispatch::CompletionRoute::HostCustody
     );
+    assert_ne!(
+        frame.x[0] as i64,
+        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+        "an exit never returns EFAULT"
+    );
+    assert_eq!(frame.x[8], 93, "the rerun is the same exit");
     assert_eq!(fixture.page.live(), live);
     assert_eq!(child_tid, 42);
     fixture.zone.clear_current(fixture.slot);
     assert_eq!(fixture.page.state(entry.index()), state);
     assert!(leader_sees_thread(fixture, &mut service, 42));
+}
+
+/// #2359 on ARM: a clone thread's raw `exit` whose clear-child-tid copy-out
+/// is refused "not now" (the word's page is not yet writable through the
+/// hardware copy; the owner can make it so) keeps its owned call. Its
+/// membership and admission are restored, the owner prepares the word for
+/// writing, and the exit reruns in ring, where it clears the word. Before,
+/// the refusal declined to `HostCustody`: a ring-born member has no host
+/// task to take that exit.
+#[test]
+fn arm_raw_exit_refused_clear_tid_copy_reruns_in_ring() {
+    use carrick_el1_abi::Lifecycle;
+    let words = Box::leak(Box::new(carrick_test_support::GuestUserBuffer::zeroed(
+        0x4000,
+    )));
+    let tid_word = words.arg();
+    let fixture = Box::leak(Box::new(Fixture::with_private_anonymous(
+        0x10000,
+        asid(1),
+        carrick_el1_abi::ReservationRange::new(tid_word, tid_word + 0x4000).unwrap(),
+    )));
+    let (control, record) = imported_thread_with_identity(fixture, |_| {});
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    run_as(fixture, 42, 12, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    words.set::<u32>(0, 42);
+    control.set_clear_child_tid(tid_word);
+    let live = fixture.page.live();
+    let entry = control.entry().unwrap();
+    let state = fixture.page.state(entry.index());
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 93;
+    super::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+    let route = arm_call(fixture, control, &mut service, &mut frame);
+    super::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+    let route = route.unwrap();
+    assert_ne!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::HostCustody,
+        "a refused clear-tid copy-out is not now, never a host exit"
+    );
+    // Nothing was committed: the call reruns from a live member.
+    assert_eq!(words.get::<u32>(0), 42);
+    assert_eq!(fixture.page.live(), live);
+    assert_eq!(fixture.page.state(entry.index()), state);
+    assert_eq!(frame.x[8], 93, "the rerun is the same exit");
+
+    // The rerun finds the word writable and retires the thread in ring.
+    let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
+    assert_ne!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::HostCustody
+    );
+    assert_eq!(words.get::<u32>(0), 0, "exit cleared the CLEARTID word");
+    assert_eq!(fixture.page.live(), live - 1);
+    assert!(!leader_sees_thread(fixture, &mut service, 42));
 }
 
 /// glibc's `pthread_join` (#2124), on the production AArch64 entry with the
