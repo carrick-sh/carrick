@@ -1249,14 +1249,20 @@ struct TidOutput {
 }
 
 impl TidOutput {
-    fn capture(address: u64, user: &mut (impl UserCopy + ?Sized)) -> Option<Option<Self>> {
+    /// `Err` is the refused read: a fault, or "not now" with what the
+    /// word's memory owner must supply first.
+    fn capture(
+        address: u64,
+        user: &mut (impl UserCopy + ?Sized),
+    ) -> Result<Option<Self>, CopyOutcome> {
         if address == 0 {
-            return Some(None);
+            return Ok(None);
         }
         let mut preimage = [0u8; 4];
-        user.copy_in(&mut preimage, UserVa::new(address))
-            .is_done()
-            .then_some(Some(Self { address, preimage }))
+        match user.copy_in(&mut preimage, UserVa::new(address)) {
+            CopyOutcome::Done => Ok(Some(Self { address, preimage })),
+            refused => Err(refused),
+        }
     }
 }
 
@@ -1264,33 +1270,36 @@ impl TidOutput {
 /// together, exactly as the host lane does: the parent word first, then the
 /// child word; if either copyout fails, every written word gets its preimage
 /// back (and the host lane then answers the forwarded clone, EFAULT included).
+/// A copyout refused "not now" backs out the same way, then the clone waits
+/// for the word's owner and reruns (#2359).
 struct TidOutputs {
     parent: Option<TidOutput>,
     child: Option<TidOutput>,
 }
 
 impl TidOutputs {
-    fn publish(&self, visible_tid: u32, user: &mut (impl UserCopy + ?Sized)) -> bool {
+    fn publish(&self, visible_tid: u32, user: &mut (impl UserCopy + ?Sized)) -> CopyOutcome {
         let bytes = visible_tid.to_le_bytes();
         let Some(parent) = &self.parent else {
             return self.publish_child(&bytes, user);
         };
-        if !user.copy_out(UserVa::new(parent.address), &bytes).is_done() {
-            return false;
+        let written = user.copy_out(UserVa::new(parent.address), &bytes);
+        if !written.is_done() {
+            return written;
         }
-        if self.publish_child(&bytes, user) {
-            return true;
+        let child = self.publish_child(&bytes, user);
+        if !child.is_done() {
+            let _ = user
+                .copy_out(UserVa::new(parent.address), &parent.preimage)
+                .is_done();
         }
-        let _ = user
-            .copy_out(UserVa::new(parent.address), &parent.preimage)
-            .is_done();
-        false
+        child
     }
 
-    fn publish_child(&self, bytes: &[u8; 4], user: &mut (impl UserCopy + ?Sized)) -> bool {
-        self.child
-            .as_ref()
-            .is_none_or(|child| user.copy_out(UserVa::new(child.address), bytes).is_done())
+    fn publish_child(&self, bytes: &[u8; 4], user: &mut (impl UserCopy + ?Sized)) -> CopyOutcome {
+        self.child.as_ref().map_or(CopyOutcome::Done, |child| {
+            user.copy_out(UserVa::new(child.address), bytes)
+        })
     }
 
     fn rollback(&self, user: &mut (impl UserCopy + ?Sized)) {
@@ -1335,9 +1344,22 @@ fn serve_clone<'a>(
     }
     let flag = |bit: u64, address: u64| if flags & bit != 0 { address } else { 0 };
     let clear_child_tid = flag(CLONE_CHILD_CLEARTID, child_tid);
-    let outputs = TidOutputs {
-        parent: TidOutput::capture(flag(CLONE_PARENT_SETTID, parent_tid), native)?,
-        child: TidOutput::capture(flag(CLONE_CHILD_SETTID, child_tid), native)?,
+    let captured =
+        TidOutput::capture(flag(CLONE_PARENT_SETTID, parent_tid), native).and_then(|parent| {
+            TidOutput::capture(flag(CLONE_CHILD_SETTID, child_tid), native)
+                .map(|child| TidOutputs { parent, child })
+        });
+    let outputs = match captured {
+        Ok(outputs) => outputs,
+        // Nothing is claimed or written yet: wait for the word's owner and
+        // rerun. A real fault keeps the host lane's answer.
+        Err(CopyOutcome::NotYet(request)) => {
+            return match native.wait_guest_copy(request) {
+                LifecycleOutcome::Returned { .. } => None,
+                waiting => Some(waiting),
+            };
+        }
+        Err(_) => return None,
     };
 
     let state = native.task_state()?;
@@ -1475,7 +1497,8 @@ fn serve_clone<'a>(
     if managed && !native.retain_native_birth(record, child_slot) {
         native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
     }
-    if !outputs.publish(identity.visible_tid, native) {
+    let published = outputs.publish(identity.visible_tid, native);
+    if !published.is_done() {
         if managed && !native.release_native_birth(record, child_slot) {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
@@ -1485,6 +1508,19 @@ fn serve_clone<'a>(
         }
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
+        // "Not now" (#2359): the word's memory owner is busy (a sibling's
+        // exit can hold the MM editor) or the page is not yet backed. The
+        // clone is fully backed out, so it keeps its call: the owner makes
+        // the word writable, or parks this thread on its holder's release,
+        // and the clone reruns in ring. Before, the refusal returned EFAULT
+        // from a clone that created no thread.
+        if let CopyOutcome::NotYet(request) = published {
+            match native.wait_guest_copy(request) {
+                // The owner found a real fault: answer it as one.
+                LifecycleOutcome::Returned { .. } => {}
+                waiting => return Some(waiting),
+            }
         }
         return managed.then(|| {
             returned(
