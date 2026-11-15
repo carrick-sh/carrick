@@ -6,7 +6,6 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -98,6 +97,7 @@ pub fn run(args: &ReclaimArgs) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn reclaim_happens_only_below_the_floor() {
