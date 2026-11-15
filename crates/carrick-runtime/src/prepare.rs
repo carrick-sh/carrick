@@ -255,12 +255,14 @@ pub fn try_run_prepared_kvm_pool(
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
 ) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
+    // LOCAL DIAGNOSTIC (#2367 round 3): serve `carrick debug capture`.
+    let debug_server = install_kvm_debug_server(&dispatcher);
     run_prepared_kvm_pool_with_debug(
         machine,
         root_context,
         dispatcher,
         max_traps,
-        None,
+        debug_server,
         #[cfg(feature = "kvm-pool-test-control")]
         None,
         None,
