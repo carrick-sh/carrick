@@ -455,6 +455,51 @@ fn read_validation_identity_until(
     }
 }
 
+/// The lock file's sibling that orders exclusive requests ahead of new shared ones (#2375).
+fn turnstile_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".turnstile");
+    PathBuf::from(name)
+}
+
+/// Open (creating 0666) a host lock file; inherit only explicitly.
+fn open_lock_file(path: &Path) -> Result<OwnedFd, HostLeaseError> {
+    let path_str = path.to_str().ok_or_else(|| HostLeaseError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8"),
+    })?;
+    let c_path = CString::new(path_str).map_err(|e| HostLeaseError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, e),
+    })?;
+
+    // Open or create the lock file with mode 0666; inherit only explicitly.
+    // SAFETY: c_path is a valid null-terminated C string.
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+            0o666,
+        )
+    };
+    if fd < 0 {
+        return Err(HostLeaseError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::last_os_error(),
+        });
+    }
+
+    // Try setting 0666 permissions in case the creator had a restrictive umask.
+    // If the file was created by another user, fchmod may return EPERM; ignore it.
+    // SAFETY: fd is an open file descriptor.
+    unsafe {
+        libc::fchmod(fd, 0o666);
+    }
+    // SAFETY: uniquely owned CLOEXEC descriptor, including error paths.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    Ok(fd)
+}
+
 impl HostLease {
     /// Claim an idle host directly, without waiting or inherited admission.
     pub fn try_exclusive(path: &Path) -> Result<Option<Self>, HostLeaseError> {
@@ -538,39 +583,7 @@ impl HostLease {
         scope: Option<OwnedFd>,
         wait: impl FnMut(Duration) -> io::Result<bool>,
     ) -> Result<Self, HostLeaseError> {
-        let path_str = path.to_str().ok_or_else(|| HostLeaseError::Io {
-            path: path.to_path_buf(),
-            source: io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8"),
-        })?;
-        let c_path = CString::new(path_str).map_err(|e| HostLeaseError::Io {
-            path: path.to_path_buf(),
-            source: io::Error::new(io::ErrorKind::InvalidInput, e),
-        })?;
-
-        // Open or create the lock file with mode 0666; inherit only explicitly.
-        // SAFETY: c_path is a valid null-terminated C string.
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
-                0o666,
-            )
-        };
-        if fd < 0 {
-            return Err(HostLeaseError::Io {
-                path: path.to_path_buf(),
-                source: io::Error::last_os_error(),
-            });
-        }
-
-        // Try setting 0666 permissions in case the creator had a restrictive umask.
-        // If the file was created by another user, fchmod may return EPERM; ignore it.
-        // SAFETY: fd is an open file descriptor.
-        unsafe {
-            libc::fchmod(fd, 0o666);
-        }
-        // SAFETY: uniquely owned CLOEXEC descriptor, including error paths.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = open_lock_file(path)?;
         Self::acquire_fd_with_wait(path, mode, limit, scope, wait, fd)
     }
 
@@ -582,27 +595,57 @@ impl HostLease {
         mut wait: impl FnMut(Duration) -> io::Result<bool>,
         fd: OwnedFd,
     ) -> Result<Self, HostLeaseError> {
-        let op = match mode {
-            HostLeaseMode::Carrick => libc::LOCK_SH,
-            HostLeaseMode::Docker | HostLeaseMode::Gate => libc::LOCK_EX,
+        let exclusive = match mode {
+            HostLeaseMode::Carrick => false,
+            HostLeaseMode::Docker | HostLeaseMode::Gate => true,
+        };
+        // Writer preference (#2375): a continuous stream of overlapping shared
+        // holders never leaves the main lock free, so an exclusive request that
+        // only polls it starves (3 h on carrick-m4, 2026-11-15). Every request
+        // passes the turnstile first. An exclusive request holds it LOCK_EX for
+        // its whole wait, so no new shared holder gets in; one that holds it
+        // only for its single non-blocking attempt never waits while holding
+        // it. Holders already in finish normally (no preemption), and the
+        // order is always turnstile then lock, never an upgrade.
+        let turnstile = open_lock_file(&turnstile_path(path))?;
+        let flock_nb = |fd: &OwnedFd, op: libc::c_int| -> io::Result<bool> {
+            // SAFETY: fd is a valid open file descriptor.
+            if unsafe { libc::flock(fd.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+                return Ok(true);
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) | Some(libc::EWOULDBLOCK) => Ok(false),
+                _ => Err(err),
+            }
+        };
+        let unlock = |fd: &OwnedFd| {
+            // SAFETY: fd is a valid open file descriptor.
+            unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_UN) };
+        };
+        let io_error = |source: io::Error| HostLeaseError::Io {
+            path: path.to_path_buf(),
+            source,
         };
 
         let start = Instant::now();
         let mut waited = false;
+        let mut queued = false;
         loop {
-            // SAFETY: fd is a valid open file descriptor.
-            if unsafe { libc::flock(fd.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+            let acquired = if exclusive {
+                if !queued {
+                    queued = flock_nb(&turnstile, libc::LOCK_EX).map_err(io_error)?;
+                }
+                queued && flock_nb(&fd, libc::LOCK_EX).map_err(io_error)?
+            } else if flock_nb(&turnstile, libc::LOCK_SH).map_err(io_error)? {
+                let got = flock_nb(&fd, libc::LOCK_SH);
+                unlock(&turnstile);
+                got.map_err(io_error)?
+            } else {
+                false
+            };
+            if acquired {
                 break;
-            }
-            let err = io::Error::last_os_error();
-            if !matches!(
-                err.raw_os_error(),
-                Some(libc::EINTR) | Some(libc::EWOULDBLOCK)
-            ) {
-                return Err(HostLeaseError::Io {
-                    path: path.to_path_buf(),
-                    source: err,
-                });
             }
             if !waited {
                 eprintln!(
@@ -633,6 +676,9 @@ impl HostLease {
                 });
             }
         }
+        // Granted: let the next request through the turnstile.
+        unlock(&turnstile);
+        drop(turnstile);
         eprintln!("host-lease: acquired {mode} at {}", path.display());
 
         let fd = OwnedFileLock::from_locked(std::fs::File::from(fd));
@@ -946,6 +992,92 @@ pub fn check_disk(root: &Path, args: DiskArgs) -> Result<(), HostLeaseError> {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// #2375: an exclusive request is granted within about one shared-holder
+    /// lifetime under a continuous stream of overlapping shared holders, at
+    /// the production acquisition entry. Three shared holders, staggered by a
+    /// third of their hold, reacquire as soon as they release, so the lock is
+    /// never free: a writer that only polls the lock starves until its limit.
+    #[test]
+    fn exclusive_request_is_granted_within_one_shared_lifetime_under_a_shared_stream() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const HOLD: Duration = Duration::from_millis(300);
+        let dir = tempfile::tempdir().unwrap();
+        let lock = Arc::new(dir.path().join("host.lock"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3u32)
+            .map(|i| {
+                let (lock, stop) = (Arc::clone(&lock), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    std::thread::sleep(HOLD / 3 * i);
+                    let mut held = 0u32;
+                    while !stop.load(Ordering::SeqCst) {
+                        let lease = HostLease::acquire_path_with_limit(
+                            &lock,
+                            HostLeaseMode::Carrick,
+                            Duration::from_secs(30),
+                        )
+                        .unwrap();
+                        std::thread::sleep(HOLD);
+                        drop(lease);
+                        held += 1;
+                    }
+                    held
+                })
+            })
+            .collect();
+        // Let the stream reach steady state (all three overlapping).
+        std::thread::sleep(HOLD * 2);
+        let asked = Instant::now();
+        let writer =
+            HostLease::acquire_path_with_limit(&lock, HostLeaseMode::Gate, Duration::from_secs(5));
+        let waited = asked.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        let granted = writer.is_ok();
+        drop(writer);
+        let held: u32 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(held >= 6, "the shared stream ran ({held} holds)");
+        assert!(granted, "the exclusive request starved for {waited:?}");
+        // One shared lifetime, plus the 100 ms poll and scheduling slack.
+        assert!(
+            waited < HOLD * 3,
+            "exclusive granted after {waited:?}, more than one shared lifetime ({HOLD:?}) plus slack"
+        );
+    }
+
+    /// No preemption, and shared holders resume after the writer releases.
+    #[test]
+    fn a_waiting_exclusive_request_never_preempts_a_shared_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("host.lock");
+        let shared = HostLease::acquire_path(&lock, HostLeaseMode::Carrick).unwrap();
+        // A queued writer times out while the shared holder keeps its lease...
+        assert!(matches!(
+            HostLease::acquire_path_with_limit(
+                &lock,
+                HostLeaseMode::Gate,
+                Duration::from_millis(300)
+            ),
+            Err(HostLeaseError::Timeout { .. })
+        ));
+        // ...and its abandoned queue slot doesn't block new shared holders.
+        let second = HostLease::acquire_path_with_limit(
+            &lock,
+            HostLeaseMode::Carrick,
+            Duration::from_millis(300),
+        );
+        assert!(second.is_ok());
+        drop((shared, second));
+        assert!(
+            HostLease::acquire_path_with_limit(
+                &lock,
+                HostLeaseMode::Gate,
+                Duration::from_millis(300)
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn closed_admission_refuses_later_nested_request() {
