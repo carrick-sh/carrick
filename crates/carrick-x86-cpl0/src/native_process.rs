@@ -19,6 +19,7 @@ use carrick_el1_abi::{
 };
 use carrick_el1_linux::mm_portal::production::GuestMetadataPin;
 use carrick_el1_linux::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
+use carrick_el1_linux::native_fork_refusal::{NativeForkStage, busy, refused};
 use carrick_el1_linux::native_process_runtime::{
     ExecSuccessorSlot, NativeExecSuccessor, NativeFailure, NativeForkPreparation,
     NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
@@ -357,22 +358,9 @@ fn portal() -> Result<Portal, NativeFailure> {
         zone: Some(zone),
     })
 }
-fn error(_: impl core::fmt::Debug) -> NativeProcessError {
-    NativeProcessError::Fault
-}
-
-/// Owner contention at fork preparation is "not now" (#2306): an observed
-/// release to enrol on, or a bare Busy. Every other owner refusal keeps its
-/// fault answer.
-fn fork_owner_error(error: carrick_core::mm::transaction::MmError) -> NativeProcessError {
-    use carrick_core::mm::transaction::MmError;
-    match error {
-        MmError::Wait(wait) => NativeProcessError::OwnerWait(wait),
-        MmError::Busy => NativeProcessError::Busy,
-        _ => NativeProcessError::Fault,
-    }
-}
-
+// Every fork MM refusal keeps its stage and owner cause as the shared
+// `NativeForkRefusal` until errno encoding, as on AArch64: owner contention
+// stays "not now" and is never answered as a fault (#2306).
 pub(super) struct Prepared {
     loan: ForkStockLoan,
     child: UnpublishedEl1Child<X86Mmu>,
@@ -462,7 +450,7 @@ impl Service {
         owner
             .roots
             .publish(index.index(), loan.request.child_mm, layout)
-            .map_err(|e| free(error(e)))?;
+            .map_err(|e| free(refused(NativeForkStage::PublishRoot, e)))?;
         let scratch = ForkScratch::bounded(
             loan.request,
             mapping_count,
@@ -471,10 +459,10 @@ impl Service {
             count.live,
             count.custody,
         )
-        .map_err(|e| free(error(e)))?;
+        .map_err(|e| free(refused(NativeForkStage::Scratch, e)))?;
         let plan = owner
             .prepare_fork(loan.request, scratch, live, self.worker())
-            .map_err(|e| free(error(e)))?;
+            .map_err(|e| free(refused(NativeForkStage::Prepare, e)))?;
         let mut custody = Vec::new();
         custody
             .try_reserve_exact(plan.custody().len())
@@ -492,7 +480,11 @@ impl Service {
                 if matches!(e, carrick_core::mm::transaction::MmError::Core) {
                     return Err(NativeProcessError::Quarantined);
                 }
-                return Err(abandon_loan(&loan, Some(live), error(e)));
+                return Err(abandon_loan(
+                    &loan,
+                    Some(live),
+                    refused(NativeForkStage::Publish, e),
+                ));
             }
         };
         let abort_published = |child: &mut UnpublishedEl1Child<X86Mmu>, err: NativeProcessError| {
@@ -586,7 +578,9 @@ fn abort_child(
     words: &InitialWords,
     loan: &ForkStockLoan,
 ) -> Result<(), NativeProcessError> {
-    child.abort(owner, words, worker).map_err(error)?;
+    child
+        .abort(owner, words, worker)
+        .map_err(|e| refused(NativeForkStage::Abort, e))?;
     let index = owner
         .spaces
         .find(child.completion().child.mm().raw())
@@ -866,23 +860,25 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 matches!(capacity, Err(carrick_core::mm::transaction::MmError::Busy)),
             );
         }
-        let capacity = capacity.map_err(error)?;
+        let capacity = capacity.map_err(|e| refused(NativeForkStage::MappingCount, e))?;
         let mut mappings = Vec::new();
         mappings
             .try_reserve_exact(capacity)
             .map_err(|_| NativeProcessError::Exhausted)?;
         let (operation, generation, count, layout) = {
-            let handle = owner.admitted_handle(mm, self.worker()).map_err(error)?;
+            let handle = owner
+                .admitted_handle(mm, self.worker())
+                .map_err(|e| refused(NativeForkStage::SpaceAccess, e))?;
             // A held editor or root is the holder's release to enrol on
             // (`MmError::Wait`), never a bare retry (#2306).
             let _editor = owner
                 .editor_for(handle, self.worker())
-                .map_err(fork_owner_error)?;
+                .map_err(|e| refused(NativeForkStage::ParentSpaceEdit, e))?;
             let mut root = owner
                 .root_for(handle, self.worker())
-                .map_err(fork_owner_error)?;
+                .map_err(|e| refused(NativeForkStage::ParentRoot, e))?;
             if !root.fork_ready() {
-                return Err(NativeProcessError::Busy);
+                return Err(busy(NativeForkStage::ParentForkReady));
             }
             let mut full = false;
             root.observe_mappings(&mut |mapping| {
@@ -892,7 +888,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                     mappings.push(mapping);
                 }
             })
-            .map_err(error)?;
+            .map_err(|e| refused(NativeForkStage::ObserveMappings, e))?;
             if full {
                 return Err(NativeProcessError::Exhausted);
             }
@@ -901,7 +897,9 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 mm,
                 incarnation: NonZeroU64::new(root.incarnation().raw())
                     .ok_or(NativeProcessError::Stale)?,
-                sequence: root.next_transfer_sequence().map_err(error)?,
+                sequence: root
+                    .next_transfer_sequence()
+                    .map_err(|e| refused(NativeForkStage::TransferSequence, e))?,
             };
             let mut count = ForkCensus {
                 child: 0,
@@ -927,7 +925,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 0,
                 &mut count,
             )
-            .map_err(error)?;
+            .map_err(|e| refused(NativeForkStage::Census, e))?;
             (operation, root.generation(), count, root.layout())
         };
         let request = ForkStockRequest {
@@ -1036,7 +1034,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                         matches!(committed, Err(carrick_core::mm::transaction::MmError::Busy)),
                     );
                 }
-                committed.map_err(error)
+                committed.map_err(|e| refused(NativeForkStage::Commit, e))
             });
         match result {
             Ok(_) => Ok(Box::new(Born {
@@ -1367,7 +1365,7 @@ fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<B
     };
     let access = match owner.space_access(worker) {
         Ok(access) => access,
-        Err(e) => return Err((error(e), born)),
+        Err(e) => return Err((refused(NativeForkStage::OpenChildSpace, e), born)),
     };
     access.open(index);
     Ok(())

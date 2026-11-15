@@ -118,7 +118,10 @@ impl Service {
         bytes: Option<&[u8]>,
         access: carrick_guest_arch::Access,
     ) -> Result<(), NativeProcessError> {
-        if carrick_el1::isa::x86::hardware_live_root().map_err(error)? != mm.root {
+        // Reading the live root is a CPU fact, not owner contention.
+        let live = carrick_el1::isa::x86::hardware_live_root()
+            .map_err(|_: carrick_el1::isa::ArchError| NativeProcessError::Fault)?;
+        if live != mm.root {
             return Err(NativeProcessError::Stale);
         }
         let owner = portal()?;

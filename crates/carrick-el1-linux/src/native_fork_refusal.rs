@@ -295,6 +295,26 @@ mod tests {
         assert_ne!(error, refused(NativeForkStage::Census, ForkError::Stale));
     }
 
+    /// A held reservation root at the mapping census or the child commit
+    /// is contention on every ISA venue, never the fault answer (#2306).
+    #[test]
+    fn held_root_at_census_or_commit_is_contention() {
+        for stage in [NativeForkStage::MappingCount, NativeForkStage::Commit] {
+            for cause in [
+                NativeForkCause::Mm(MmError::Busy),
+                NativeForkCause::Reservation(Refusal::Busy),
+            ] {
+                assert_eq!(refused(stage, cause).failure(), Err(NativeContention::BUSY));
+            }
+            assert_eq!(
+                refused(stage, MmError::Fault)
+                    .failure()
+                    .map(|failure| failure.errno()),
+                Ok(-14)
+            );
+        }
+    }
+
     #[test]
     fn parent_gate_refusal_preserves_observed_state_as_contention() {
         use carrick_el1_abi::GateState;
