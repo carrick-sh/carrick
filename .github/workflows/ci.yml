@@ -1274,6 +1274,9 @@ jobs:
             exit 75
           fi
           echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+      - name: Reclaim this runner's target dir when its volume is low
+        if: needs.changes.outputs.macos_runner != '"macos-15"'
+        run: just ci-reclaim-target
       - name: Configure persisted compiler cache
         id: compiler-cache
         env:
@@ -1363,6 +1366,9 @@ jobs:
             exit 75
           fi
           echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+      - name: Reclaim this runner's target dir when its volume is low
+        if: needs.changes.outputs.macos_runner != '"macos-15"'
+        run: just ci-reclaim-target
       - name: Configure persisted compiler cache
         id: compiler-cache
         env:
@@ -1445,6 +1451,9 @@ jobs:
             exit 75
           fi
           echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+      - name: Reclaim this runner's target dir when its volume is low
+        if: needs.changes.outputs.macos_runner != '"macos-15"'
+        run: just ci-reclaim-target
       - name: Configure persisted compiler cache
         id: compiler-cache
         env:
@@ -1532,6 +1541,9 @@ jobs:
             exit 75
           fi
           echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+      - name: Reclaim this runner's target dir when its volume is low
+        if: needs.changes.outputs.macos_runner != '"macos-15"'
+        run: just ci-reclaim-target
       - name: Configure persisted compiler cache
         id: compiler-cache
         env:
@@ -1614,6 +1626,9 @@ jobs:
             exit 75
           fi
           echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+      - name: Reclaim this runner's target dir when its volume is low
+        if: needs.changes.outputs.macos_runner != '"macos-15"'
+        run: just ci-reclaim-target
       - name: Configure persisted compiler cache
         id: compiler-cache
         env:
@@ -1706,6 +1721,9 @@ jobs:
             exit 75
           fi
           echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+      - name: Reclaim this runner's target dir when its volume is low
+        if: needs.changes.outputs.macos_runner != '"macos-15"'
+        run: just ci-reclaim-target
       - name: Configure persisted compiler cache
         id: compiler-cache
         env:
@@ -1796,6 +1814,9 @@ jobs:
             exit 75
           fi
           echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+      - name: Reclaim this runner's target dir when its volume is low
+        if: needs.changes.outputs.macos_runner != '"macos-15"'
+        run: just ci-reclaim-target
       - name: Configure persisted compiler cache
         id: compiler-cache
         env:
