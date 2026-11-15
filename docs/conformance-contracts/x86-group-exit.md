@@ -20,8 +20,13 @@ service, interrupts a single-entry futex wait, or requests rescheduling of the
 CPU holding the exact record. The syscall and interrupted user-return
 checkpoints enter the existing `resume_pending_lifecycle` /
 `retire_closing_member` transaction. Before the member receipt becomes
-observable, the neutral owner requires `vacate_terminal_space`: each ISA moves
-to its maintenance translation and releases installed-space occupancy. This
+observable, the neutral owner's `TerminalSpaceLeave` calls the ISA's
+`vacate_terminal_space`, which moves to its maintenance translation. The
+installed-space occupancy word keeps naming the space during the release
+attempt, because the release authenticates the record against it. It is
+cleared once that attempt returns, whatever the release decided. A refused
+release (a #685 requeue of a pending object operation) therefore never leaves
+the word naming the space over the maintenance root (#1100, #2374). This
 orders the physical detachment before the group owner may retire the root,
 including when the sibling's next boundary owes host work. The same ordering
 applies to a raw exit racing group close. ISA-specific code supplies only the
