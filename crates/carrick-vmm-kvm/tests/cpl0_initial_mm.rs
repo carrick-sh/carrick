@@ -2618,6 +2618,21 @@ fn production_sibling_raw_exits_clear_tid_under_editor_contention() {
     );
 }
 
+/// LOCAL COMPARISON ONLY (#2367 round 3): the same fixture, but each worker
+/// clears and wakes its own join word, so its raw exit has no clear-tid copy.
+#[test]
+fn production_sibling_raw_exits_self_clear_futex_join() {
+    let elf = native_exit_fixture_with_flags("native_sibling_raw_exit.S", &["-DSELF_CLEAR"]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
+        .expect("self-clear sibling raw exits");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
 /// #2359, the owner-wait branch: each round's first clear-tid copy-out finds
 /// the MM editor held (`INJECT_EDITOR_BUSY_ONCE` holds it until the waiter
 /// parks). The exit enrols on the holder's release, parks, and reruns in

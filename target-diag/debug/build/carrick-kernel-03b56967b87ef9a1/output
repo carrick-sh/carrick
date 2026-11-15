@@ -1,0 +1,3 @@
+cargo::rustc-check-cfg=cfg(carrick_bsd)
+cargo::rustc-check-cfg=cfg(carrick_linux)
+cargo::rustc-cfg=carrick_linux

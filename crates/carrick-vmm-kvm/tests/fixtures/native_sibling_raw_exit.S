@@ -100,7 +100,11 @@ join:
     jmp join
 1:  ret
 spawn:
+#ifdef SELF_CLEAR
+    mov $0x00150f00, %edi
+#else
     mov $0x00350f00, %edi
+#endif
     lea 0x2ffc(%r12,%rbx,4), %rdx
     mov %rdx, %r10
     xor %r8d, %r8d
@@ -145,6 +149,14 @@ wexit:
     movabs $INJECT_EDITOR_BUSY_ONCE, %rax
     syscall
 9:
+#endif
+#ifdef SELF_CLEAR
+    lea 0x2ffc(%r12,%rbx,4), %rdi
+    movl $0, (%rdi)
+    mov $1, %esi /* FUTEX_WAKE, shared like the join wait */
+    mov $1, %edx
+    mov $202, %eax
+    syscall
 #endif
     xor %edi, %edi
     mov $60, %eax
