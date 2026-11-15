@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use carrick_xtask::ci_changes::{
-    CiChangesOutputs, El1NativeClosure, PathClass, ReferencedDocs, child_lookup_allowed,
-    classify_path, evaluate_changes, evaluate_changes_with_closure, path_affects_el1_native,
-    scan_script_or_workflow,
+    CiChangesOutputs, El1NativeClosure, PathClass, ReferencedDocs, child_from_pulls,
+    child_lookup_allowed, classify_path, evaluate_changes, evaluate_changes_with_closure,
+    path_affects_el1_native, scan_script_or_workflow,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -615,10 +615,10 @@ fn stack_layer_detection_and_ci_results_gating() {
     let bin_dir = tempfile::tempdir().expect("mock gh bin dir");
     let summary_file = repo.dir.path().join("step_summary.md");
 
-    // 2a. Lower layer (child PR #610 open against work/layer-1)
+    // 2a. Lower layer (ready child PR #610 open against work/layer-1; a draft child is not one)
     let path_with_child = write_mock_gh(
         bin_dir.path(),
-        "#!/usr/bin/env bash\nprintf '[{\"number\":610,\"state\":\"open\",\"base\":{\"ref\":\"work/layer-1\"}}]\\n'\n",
+        "#!/usr/bin/env bash\nprintf '[{\"number\":610,\"state\":\"open\",\"draft\":false,\"base\":{\"ref\":\"work/layer-1\"}}]\\n'\n",
     );
     let _ = fs::remove_file(&summary_file);
     let out_lower = repo.run_ci_changes_with_env(
@@ -1435,4 +1435,35 @@ fn starved_jobs_cli_classifies_without_excusing_execution_failures() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("incomplete jobs response"));
+}
+
+#[test]
+fn only_a_ready_upper_layer_makes_its_base_a_lower_layer() {
+    // 2026-11-14: draft upper layers (#2343, #2342) skipped the ready bottoms' heavy jobs,
+    // and land-when-green parked #2273 and #2278.
+    let pr = |number: u64, draft: serde_json::Value| {
+        serde_json::json!({"number": number, "state": "open", "draft": draft,
+            "base": {"ref": "fix/bottom"}})
+    };
+    let listing = serde_json::json!([pr(2343, serde_json::json!(true))]);
+    assert_eq!(
+        child_from_pulls(&listing, "fix/bottom").unwrap(),
+        None,
+        "a draft keeps the full suite"
+    );
+    let listing = serde_json::json!([
+        pr(2343, serde_json::json!(true)),
+        pr(2350, serde_json::json!(false))
+    ]);
+    assert_eq!(
+        child_from_pulls(&listing, "fix/bottom").unwrap(),
+        Some(2350),
+        "a ready one skips it"
+    );
+    let listing = serde_json::json!([pr(2343, serde_json::Value::Null)]);
+    assert_eq!(
+        child_from_pulls(&listing, "fix/bottom").unwrap(),
+        None,
+        "unknown draft state counts as draft"
+    );
 }
