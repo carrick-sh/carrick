@@ -1185,7 +1185,9 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             .begin_prepared_exit_effects(task, topology, permit, self.effects)
             .map_err(GuestProcessError::Exit)?;
         let adopter = topology.adopter();
-        let record = *registry
+        // Move fields out of the boxed record in place, never a copy of the
+        // whole record in this retained frame.
+        let record = registry
             .tasks
             .remove(&task.id)
             .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(task)))

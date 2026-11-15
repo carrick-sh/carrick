@@ -612,7 +612,11 @@ pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
 
 /// [`dispatch_fault_with_prepared`] after serving host descriptor
 /// transactions for the faulting MM.
+///
+/// Never inlined: the resolver's own frame stays live while a declined fault
+/// delivers its signal, so this body's locals must not join it.
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 pub fn dispatch_fault_with_descriptor_txns<'supply, P, C, X>(
     frame: &mut TrapFrame,
     counters: &Counters,
