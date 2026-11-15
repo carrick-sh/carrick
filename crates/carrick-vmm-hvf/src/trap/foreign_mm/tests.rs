@@ -415,6 +415,26 @@ impl TestForeignCowAuthority {
         )
         .expect("foreign COW test identity")
     }
+
+    /// Forget one applied frame grant, as the Kernel does when it unmaps or
+    /// rolls it back: it leaves the live grants, the newest publication when
+    /// it is that grant, and the live mapping set. Other grants stay live.
+    fn retire_grant(&self, mapping: carrick_hal::MappingId) {
+        self.granted
+            .lock()
+            .retain(|(granted, _, _, _)| *granted != mapping);
+        let mut published = self.published.lock();
+        if published.is_some_and(|(newest, _, _, _)| newest == mapping) {
+            *published = None;
+        }
+        drop(published);
+        self.live.write().mapping_ids.retain(|id| *id != mapping);
+    }
+
+    /// No frame grant is left: none outstanding and no newest publication.
+    fn holds_no_grant(&self) -> bool {
+        self.published.lock().is_none() && self.granted.lock().is_empty()
+    }
 }
 
 impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
@@ -570,18 +590,24 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
         &self,
         receipt: &carrick_hal::FrameInventoryApplyReceipt,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let (mapping, frame, _, _) = self
-            .published
-            .lock()
-            .take()
-            .ok_or_else(|| std::io::Error::other("no test grant to roll back"))?;
-        assert!(receipt.authorizes(mapping, frame));
-        self.granted
-            .lock()
-            .retain(|(granted, _, _, _)| *granted != mapping);
+        // As in the Kernel, the receipt names the grant: several may be
+        // outstanding, and the newest publication need not be this one.
+        let authorized =
+            |(mapping, frame, _, _): &(carrick_hal::MappingId, carrick_hal::FrameId, Gpa, u64)| {
+                receipt.authorizes(*mapping, *frame)
+            };
+        let granted = self.granted.lock().iter().copied().find(authorized);
+        let (mapping, _, _, _) = match granted {
+            Some(granted) => granted,
+            None => self
+                .published
+                .lock()
+                .filter(authorized)
+                .ok_or_else(|| std::io::Error::other("no test grant matches the receipt"))?,
+        };
+        assert_eq!(receipt.mm(), self.live.read().mm);
+        self.retire_grant(mapping);
         let mut live = self.live.write();
-        assert_eq!(receipt.mm(), live.mm);
-        live.mapping_ids.retain(|id| *id != mapping);
         live.frame_inventory_revision =
             carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
                 live.frame_inventory_revision.raw_for_probe() + 1,
@@ -633,10 +659,12 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
+        let exact = (mapping, frame, gpa, length.raw());
         let live = self.live.read();
         if live.frame_inventory_revision.raw_for_probe() != inventory_revision
             || !live.mapping_ids.contains(&mapping)
-            || self.published.lock().as_ref() != Some(&(mapping, frame, gpa, length.raw()))
+            || (self.published.lock().as_ref() != Some(&exact)
+                && !self.granted.lock().contains(&exact))
         {
             return Err(Box::new(std::io::Error::other(
                 "test attestation: mapping not live at revision",
@@ -1505,7 +1533,7 @@ fn guest_owned_foreign_cow_refusal_before_submission_rolls_back_every_stage() {
             live_before.mapping_ids,
             "phase {phase}: the kernel grant must be rolled back"
         );
-        assert!(authority.published.lock().is_none(), "phase {phase}");
+        assert!(authority.holds_no_grant(), "phase {phase}");
         assert_eq!(
             alias_registry().lock().ordered(),
             aliases_before,
@@ -1600,7 +1628,7 @@ fn guest_owned_foreign_cow_el1_refusal_rolls_back_every_stage() {
             live_before.mapping_ids,
             "{outcome:?}: the kernel grant must be rolled back"
         );
-        assert!(authority.published.lock().is_none(), "{outcome:?}");
+        assert!(authority.holds_no_grant(), "{outcome:?}");
         assert_eq!(
             alias_registry().lock().ordered(),
             aliases_before,
@@ -1660,7 +1688,7 @@ fn guest_owned_foreign_cow_refuses_a_retiring_target_before_borrowing_its_ttbr0(
     ));
     assert_eq!(foreign_cow_fingerprint(&installed), before);
     assert_eq!(*installed.live.0.read(), live_before);
-    assert!(authority.published.lock().is_none());
+    assert!(authority.holds_no_grant());
     assert_eq!(lending.caller.as_ref().unwrap().drains, 0);
     assert!(
         !lending
@@ -2100,7 +2128,7 @@ fn guest_sparse_plan_refusal_returns_grant_without_retiring_predecessor() {
     assert_eq!(foreign_cow_fingerprint(&installed), before);
     assert_eq!(alias_registry().lock().ordered(), aliases);
     assert_eq!(installed.live.0.read().mapping_ids, mappings);
-    assert!(authority.published.lock().is_none());
+    assert!(authority.holds_no_grant());
 }
 
 #[test]
@@ -12414,7 +12442,7 @@ fn guest_retained_reuse_without_driving_vcpu_refuses_before_allocation() {
     );
     assert!(published.borrow().is_empty());
     assert_eq!(owner_keys(), owners_before, "no replacement owner");
-    assert!(fixture.authority.published.lock().is_none(), "no grant");
+    assert!(fixture.authority.holds_no_grant(), "no grant");
     assert_eq!(
         inventory_fingerprint(&fixture.installed.state.frame_inventory.ledger.lock()),
         inventory_before
@@ -12481,7 +12509,7 @@ fn guest_retained_reuse_plan_refusal_rolls_back_grant_and_owner() {
     );
     assert!(published.borrow().is_empty(), "nothing reached EL1");
     assert!(
-        fixture.authority.published.lock().is_none(),
+        fixture.authority.holds_no_grant(),
         "kernel grant rolled back"
     );
     assert_eq!(owner_keys(), owners_before, "replacement owner rolled back");
@@ -12537,7 +12565,7 @@ fn guest_retained_reuse_el1_refusal_rolls_back_grant_and_owner() {
     assert!(error.to_string().contains("did not apply"), "{error}");
     assert_eq!(published.borrow().len(), 1, "EL1 answered one submission");
     assert!(
-        fixture.authority.published.lock().is_none(),
+        fixture.authority.holds_no_grant(),
         "kernel grant rolled back"
     );
     assert_eq!(owner_keys(), owners_before, "replacement owner rolled back");
@@ -13972,14 +14000,11 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
         successor.start = start;
         successor.size = 4096;
         if retired != 0 {
-            let published = authority.published.lock().take().unwrap();
+            // The Kernel retired the grant: it is no longer exact-live.
+            let published = authority.published.lock().unwrap();
             assert_eq!(published.0.raw(), backing.mapping_id.get());
             assert_eq!(published.1.raw(), backing.frame_id.get());
-            authority
-                .live
-                .write()
-                .mapping_ids
-                .retain(|mapping| mapping.raw() != backing.mapping_id.get());
+            authority.retire_grant(published.0);
             alias_registry()
                 .lock()
                 .remove_exact_values_in_batch(&[alias]);
