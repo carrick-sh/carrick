@@ -5170,9 +5170,13 @@ impl<
                     let member_fd = Fd(self.frame.argument(2).unwrap_or(0) as i32);
                     let epoll = match IpcBacking::decode(edesc.backing) {
                         Some(IpcBacking::Epoll { object }) => object,
-                        // A ring pipe end or eventfd is no epoll (#1671): the
-                        // host holds no description for it to refuse.
-                        Some(IpcBacking::Pipe { .. } | IpcBacking::EventFd { .. }) => {
+                        // A ring pipe end, eventfd or stream end is no epoll
+                        // (#1671): the host holds no description to refuse.
+                        Some(
+                            IpcBacking::Pipe { .. }
+                            | IpcBacking::EventFd { .. }
+                            | IpcBacking::Stream { .. },
+                        ) => {
                             return match authority.get(table, member_fd) {
                                 Err(error) => map_fd_error(error),
                                 Ok(_) => FamilyCompletion::Complete(

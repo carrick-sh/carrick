@@ -222,12 +222,74 @@ pub fn transfer_with_io<U: UserCopy>(
                 Err(e) => blocked_or(e)?,
             }
         }
+        IpcOpKind::StreamFirstRead | IpcOpKind::StreamSecondRead => {
+            let Some((end, _)) = op.kind.stream_end() else {
+                return Err(IpcError::Corrupt);
+            };
+            let mut p = guard.stream_lane(end.peer())?;
+            // This end shut its reads: what its peer sent before stays
+            // readable, then reads end as at EOF (shutdown(2) SHUT_RD).
+            let shut = p.references(pipe::End::Reader) == 0 && p.unread_bytes() == 0;
+            let base = op.progress.written;
+            let mut at = 0u64;
+            let step = if shut {
+                None
+            } else {
+                Some(p.read_with(op.progress.remaining(), |chunk| {
+                    let n = output(copy, base.wrapping_add(at), chunk);
+                    at += n as u64;
+                    n
+                }))
+            };
+            owe_stream(&mut owe, step.map(|step| step.wake));
+            match step.map(|step| step.result) {
+                None | Some(Ok(0)) => StepStatus::EndOfFile,
+                Some(Ok(n)) => {
+                    op.progress.written += n as u64;
+                    StepStatus::Complete
+                }
+                Some(Err(e)) => blocked_or(e)?,
+            }
+        }
+        IpcOpKind::StreamFirstWrite | IpcOpKind::StreamSecondWrite => {
+            let Some((end, _)) = op.kind.stream_end() else {
+                return Err(IpcError::Corrupt);
+            };
+            // After this end's SHUT_WR, a write is EPIPE (and SIGPIPE).
+            if guard.stream_lane(end)?.references(pipe::End::Writer) == 0 {
+                StepStatus::Broken
+            } else {
+                guard.ensure_stream_storage(end)?;
+                let mut p = guard.stream_lane(end)?;
+                loop {
+                    let step =
+                        p.write_progress(&mut op.progress, |at, dst| input(copy, at as u64, dst));
+                    owe_stream(&mut owe, Some(step.wake));
+                    match step.result {
+                        Ok(_) if op.progress.is_complete() => break StepStatus::Complete,
+                        Ok(_) => continue,
+                        Err(e) => break blocked_or(e)?,
+                    }
+                }
+            }
+        }
         // An epoll wait moves no bytes: it is never transferred.
         IpcOpKind::None | IpcOpKind::EpollWait | IpcOpKind::PollWait => {
             return Err(IpcError::Corrupt);
         }
     };
     Ok((status, wake))
+}
+
+/// A stream pair's two ends share the object's two wait lanes, so a change
+/// to either lane is owed to both: a waiter rechecks its own end's level.
+fn owe_stream(owe: &mut impl FnMut(WakeSet), wake: Option<WakeSet>) {
+    if wake.is_some_and(|w| w.readers || w.writers) {
+        owe(WakeSet {
+            readers: true,
+            writers: true,
+        });
+    }
 }
 
 fn blocked_or(e: pipe::Error) -> Result<StepStatus, IpcError> {

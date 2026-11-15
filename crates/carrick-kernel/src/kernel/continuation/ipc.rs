@@ -842,7 +842,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
     };
     let vectored = region.has_vectors(&token)?;
     let owner_output = memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner;
-    let output = if vectored && op.kind == IpcOpKind::PipeRead && owner_output {
+    let output = if vectored && op.kind.reads_bytes() && owner_output {
         use crate::dispatch::copyout::{self, UserSlot};
         let mut slots = Vec::new();
         region
@@ -868,7 +868,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
             outputs: vec![Vec::new(); count],
             slot: 0,
         }
-    } else if matches!(op.kind, IpcOpKind::PipeRead | IpcOpKind::EventFdRead)
+    } else if (op.kind.reads_bytes() || op.kind == IpcOpKind::EventFdRead)
         && memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
     {
         use crate::dispatch::copyout::{self, UserSlot};
@@ -912,7 +912,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
         prefetch: Vec::new(),
         pending: Vec::new(),
     };
-    if op.kind == IpcOpKind::PipeWrite {
+    if op.kind.writes_bytes() {
         let length = (op.progress.remaining() as u64).min(HOST_STEP_BYTES);
         if vectored {
             // Gather the imported source before acquiring the pipe lock. The
@@ -1028,7 +1028,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
                 sigpipe: true,
             });
         }
-        StepStatus::Fault if written > 0 && op.kind == IpcOpKind::PipeRead => written,
+        StepStatus::Fault if written > 0 && op.kind.reads_bytes() => written,
         StepStatus::Fault if written > 0 => written,
         StepStatus::Fault => errno(LINUX_EFAULT),
     };

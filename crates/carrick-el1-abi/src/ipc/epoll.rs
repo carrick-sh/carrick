@@ -126,6 +126,11 @@ pub enum EpollMember {
     EventFd = 1,
     PipeReader = 2,
     PipeWriter = 3,
+    /// A stream pair's [`StreamEnd::First`]: readable from the second
+    /// end's lane, writable into its own.
+    StreamFirst = 4,
+    /// A stream pair's [`StreamEnd::Second`].
+    StreamSecond = 5,
 }
 impl EpollMember {
     const fn from_raw(raw: u32) -> Option<Self> {
@@ -133,7 +138,17 @@ impl EpollMember {
             1 => Some(Self::EventFd),
             2 => Some(Self::PipeReader),
             3 => Some(Self::PipeWriter),
+            4 => Some(Self::StreamFirst),
+            5 => Some(Self::StreamSecond),
             _ => None,
+        }
+    }
+    /// The stream end this member watches.
+    pub const fn stream_end(self) -> Option<StreamEnd> {
+        match self {
+            Self::StreamFirst => Some(StreamEnd::First),
+            Self::StreamSecond => Some(StreamEnd::Second),
+            Self::EventFd | Self::PipeReader | Self::PipeWriter => None,
         }
     }
     /// The member a description's backing names, if it is an IPC object.
@@ -148,6 +163,14 @@ impl EpollMember {
                 object,
                 end: End::Writer,
             } => Some((object, Self::PipeWriter)),
+            IpcBacking::Stream {
+                object,
+                end: StreamEnd::First,
+            } => Some((object, Self::StreamFirst)),
+            IpcBacking::Stream {
+                object,
+                end: StreamEnd::Second,
+            } => Some((object, Self::StreamSecond)),
             IpcBacking::Host(_) | IpcBacking::Epoll { .. } => None,
         }
     }
@@ -155,7 +178,9 @@ impl EpollMember {
 
 /// An epoll object's state (under its lock).
 #[repr(C)]
-#[derive(::core::fmt::Debug, ::core::default::Default)]
+#[derive(
+    ::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::default::Default,
+)]
 pub struct EpollState {
     /// First item of the interest list (item number, 0 none).
     interest_head: u32,
@@ -410,7 +435,7 @@ impl<'a> IpcRegion<'a> {
         let guard = self.lock_fresh(index, record, wait)?;
         record.epoll_link.store(0, Ordering::Relaxed);
         // SAFETY: the object lock is held and the record is unpublished.
-        unsafe { (*record.state.get()).epoll = EpollState::default() };
+        unsafe { (*record.state.get()).kind_state.counters.epoll = EpollState::default() };
         Ok(guard.publish_kind(KIND_EPOLL))
     }
 
@@ -1055,7 +1080,7 @@ impl<'a> IpcObjectGuard<'a> {
             return Err(IpcError::WrongKind);
         }
         // SAFETY: the object lock is held.
-        Ok(unsafe { &mut (*self.record.state.get()).epoll })
+        Ok(unsafe { &mut (*self.record.state.get()).kind_state.counters.epoll })
     }
 
     /// Move the lock-free stack (newest first) to the ordered list's tail
@@ -1083,7 +1108,7 @@ impl<'a> IpcObjectGuard<'a> {
         };
         item.ready_next.store(0, Ordering::Relaxed);
         // SAFETY: the object lock is held; the kind was checked by the caller.
-        let state = unsafe { &mut (*self.record.state.get()).epoll };
+        let state = unsafe { &mut (*self.record.state.get()).kind_state.counters.epoll };
         match self.region.item(state.ready_tail) {
             Some(tail) => tail.ready_next.store(number, Ordering::Relaxed),
             None => state.ready_head = number,
@@ -1096,7 +1121,7 @@ impl<'a> IpcObjectGuard<'a> {
             return;
         };
         // SAFETY: the object lock is held; the kind was checked by the caller.
-        let state = unsafe { &mut (*self.record.state.get()).epoll };
+        let state = unsafe { &mut (*self.record.state.get()).kind_state.counters.epoll };
         item.ready_next.store(state.ready_head, Ordering::Relaxed);
         state.ready_head = number;
         if state.ready_tail == 0 {
@@ -1106,7 +1131,7 @@ impl<'a> IpcObjectGuard<'a> {
 
     fn pop_ready(&mut self) -> Option<u32> {
         // SAFETY: the object lock is held; the kind was checked by the caller.
-        let state = unsafe { &mut (*self.record.state.get()).epoll };
+        let state = unsafe { &mut (*self.record.state.get()).kind_state.counters.epoll };
         let number = state.ready_head;
         let item = self.region.item(number)?;
         state.ready_head = item.ready_next.load(Ordering::Relaxed);
@@ -1120,7 +1145,7 @@ impl<'a> IpcObjectGuard<'a> {
     fn find_item(&mut self, fd: i32, file_key: u64) -> Option<u32> {
         // SAFETY: the object lock is held; the kind was checked by the caller.
         let state = unsafe { &*self.record.state.get() };
-        let mut cursor = state.epoll.interest_head;
+        let mut cursor = unsafe { state.kind_state.counters.epoll.interest_head };
         while let Some(item) = self.region.item(cursor) {
             if item.fd.load(Ordering::Relaxed) == fd as u32
                 && item.file_key.load(Ordering::Relaxed) == file_key
@@ -1139,7 +1164,7 @@ impl<'a> IpcObjectGuard<'a> {
             return;
         };
         // SAFETY: the object lock is held; the kind was checked by the caller.
-        let state = unsafe { &mut (*self.record.state.get()).epoll };
+        let state = unsafe { &mut (*self.record.state.get()).kind_state.counters.epoll };
         let prev = item.interest_prev.load(Ordering::Relaxed);
         let next = item.interest_next.load(Ordering::Relaxed);
         match self.region.item(prev) {
@@ -1233,6 +1258,10 @@ impl<'a> IpcObjectGuard<'a> {
             EpollMember::EventFd => self.eventfd()?.readiness(),
             EpollMember::PipeReader => self.pipe()?.readiness(End::Reader),
             EpollMember::PipeWriter => self.pipe()?.readiness(End::Writer),
+            EpollMember::StreamFirst | EpollMember::StreamSecond => {
+                let end = kind.stream_end().ok_or(IpcError::Corrupt)?;
+                return self.stream_level(end);
+            }
         };
         let mut level = 0;
         if readiness.readable {
@@ -1260,6 +1289,47 @@ impl<'a> IpcObjectGuard<'a> {
         Ok(level)
     }
 
+    /// A connected stream end's level, as `poll(2)` reports an `AF_UNIX`
+    /// stream socket: readable with bytes from its peer; RDHUP and readable
+    /// once it receives no more (the peer shut its writes or closed, or
+    /// this end shut its reads); HUP once both directions are shut; and
+    /// writable while its own lane has room or no reader drains it (a
+    /// write then fails with EPIPE).
+    pub fn stream_level(&mut self, end: StreamEnd) -> Result<u32, IpcError> {
+        let (rx_unread, rx_shut) = {
+            let rx = self.stream_lane(end.peer())?;
+            (
+                rx.unread_bytes() != 0,
+                rx.references(End::Reader) == 0 || rx.references(End::Writer) == 0,
+            )
+        };
+        let (tx_room, tx_shut) = {
+            let tx = self.stream_lane(end)?;
+            (
+                tx.readiness(End::Writer).writable,
+                (
+                    tx.references(End::Writer) == 0,
+                    tx.references(End::Reader) == 0,
+                ),
+            )
+        };
+        let (own_write_shut, peer_gone) = tx_shut;
+        let mut level = 0;
+        if rx_unread || rx_shut {
+            level |= events::IN | events::RDNORM;
+        }
+        if rx_shut {
+            level |= events::RDHUP;
+        }
+        if rx_shut && (own_write_shut || peer_gone) {
+            level |= events::HUP;
+        }
+        if tx_room || peer_gone {
+            level |= events::OUT | events::WRNORM | events::WRBAND;
+        }
+        Ok(level)
+    }
+
     /// Under this member's lock, from [`IpcObjectGuard::publish`]: queue
     /// every item interested in the published side on its epoll's
     /// lock-free stack. Returns the epolls to notify and whether any of
@@ -1275,6 +1345,10 @@ impl<'a> IpcObjectGuard<'a> {
             let interested = match EpollMember::from_raw(item.member_kind.load(Ordering::Relaxed)) {
                 Some(EpollMember::PipeReader) => wake.readers,
                 Some(EpollMember::PipeWriter) => wake.writers,
+                // Either lane of a pair moves both ends' levels.
+                Some(EpollMember::StreamFirst | EpollMember::StreamSecond) => {
+                    wake.readers || wake.writers
+                }
                 Some(EpollMember::EventFd) => {
                     (wake.readers && requested & events::READ_SIDE != 0)
                         || (wake.writers && requested & events::WRITE_SIDE != 0)

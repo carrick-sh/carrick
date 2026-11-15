@@ -4935,6 +4935,11 @@ pub const LINUX_SOCKET_TYPE_SUPPORTED_MASK: u64 = LinuxSocketTypeFlags::SUPPORTE
     | LINUX_SOCK_RDM as u64
     | LINUX_SOCK_SEQPACKET as u64;
 
+/// `shutdown(2)` directions.
+pub const LINUX_SHUT_RD: i32 = 0;
+pub const LINUX_SHUT_WR: i32 = 1;
+pub const LINUX_SHUT_RDWR: i32 = 2;
+
 pub const LINUX_MSG_OOB: i32 = 0x0001;
 pub const LINUX_MSG_PEEK: i32 = 0x0002;
 pub const LINUX_MSG_DONTROUTE: i32 = 0x0004;
