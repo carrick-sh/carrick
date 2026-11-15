@@ -314,3 +314,10 @@ witnesses and the x86 CPL0 `production_fork_editor_busy_once_then_forks`,
 `production_waitid_nohang_siginfo_busy_once_returns_zero` and
 `production_clone_settid_busy_once_then_stores` were red on main (EAGAIN,
 EFAULT, a NativeBusy run failure or a dropped store) and pass with the fix.
+Both ISA fork venues keep every MM refusal as the shared `NativeForkRefusal`,
+so a reservation root held at the mapping census or the child commit is
+contention, not EFAULT: the x86 CPL0
+`production_fork_census_root_busy_once_then_forks` and
+`production_fork_commit_root_busy_once_then_forks` hold the real root lock
+word once and were red (fork returned -14) before the x86 venue lost its
+venue-local Fault mapper.
