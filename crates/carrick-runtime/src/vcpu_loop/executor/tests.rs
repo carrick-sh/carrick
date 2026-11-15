@@ -2422,7 +2422,12 @@ fn kvm_exec_replacement_rebinds_root_to_successor_and_retires_predecessor() {
         .expect("running generation authority");
 
     let prepared = kernel
-        .prepare_exec_with_registry_id(&context, ThreadId::synthetic_for_tests(114_142), None)
+        .prepare_exec_with_registry_id(
+            &context,
+            ThreadId::synthetic_for_tests(114_142),
+            kernel.issue_exec_mm().unwrap(),
+            None,
+        )
         .unwrap();
     let old_lease = running.take_lease();
     context.thread().exit_from_executor(old_lease).unwrap();
@@ -4716,7 +4721,12 @@ fn exec_replacement_keeps_worker_identity_and_swaps_thread_mm_asid_binding() {
         .expect("running generation authority");
 
     let prepared = kernel
-        .prepare_exec_with_registry_id(&context, ThreadId::synthetic_for_tests(114_016), None)
+        .prepare_exec_with_registry_id(
+            &context,
+            ThreadId::synthetic_for_tests(114_016),
+            kernel.issue_exec_mm().unwrap(),
+            None,
+        )
         .unwrap();
     let old_lease = running.take_lease();
     context.thread().exit_from_executor(old_lease).unwrap();

@@ -92,7 +92,7 @@ pub use debug::{
     KernelDebugTable, ServerError as KernelDebugServerError, UnknownTable as UnknownKernelTable,
     fetch as kernel_debug_fetch, kernel_debug_abort,
 };
-pub use exec::{ExecError, ExecPrepareError, PreparedExec};
+pub use exec::{ExecError, ExecPrepareError, IssuedExecMm, PreparedExec};
 pub use fd_ceiling::FdCeilingAuthority;
 pub use frame_inventory::{
     ExactMappingRow, FrameInventoryAuthority, FrameInventoryError, FrameInventoryReserveError,

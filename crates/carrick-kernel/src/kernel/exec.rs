@@ -70,6 +70,26 @@ impl carrick_sched_core::process::exec::ExecSiblingDrain for ExecDrain {
     }
 }
 
+/// The replacement MM identity issued for exactly one exec (#2142).
+///
+/// The exec transaction installs this identity instead of minting its own,
+/// so a carrier that issues the successor MM from the zone word it shares
+/// with this Kernel (`IdRegistry::mm_id`) and the Kernel graph name one MM.
+/// It is not `Clone`: one issue backs at most one preparation. Preparation
+/// refuses an issue from another Kernel, and an identity a live task's MM
+/// already holds.
+#[derive(Debug)]
+pub struct IssuedExecMm {
+    domain: Arc<super::core::KernelDomain>,
+    mm: MmId,
+}
+
+impl IssuedExecMm {
+    pub const fn mm_id(&self) -> MmId {
+        self.mm
+    }
+}
+
 /// Fully prepared exec replacement. Dropping it resumes stopped siblings and
 /// releases the operation reservation without changing the published graph.
 pub struct PreparedExec {
@@ -217,12 +237,32 @@ impl std::fmt::Debug for PreparedExec {
 }
 
 impl Kernel {
+    /// Issue one exec's replacement MM identity from this Kernel's MM source.
+    pub fn issue_exec_mm(&self) -> Result<IssuedExecMm, ExecError> {
+        Ok(IssuedExecMm {
+            domain: Arc::clone(self.domain()),
+            mm: self.object_ids().mm_id()?,
+        })
+    }
+
+    /// Name an MM identity a carrier issued from the zone word this Kernel
+    /// shares. Production authenticates that issue with the sealed exec
+    /// receipt (#2142 R2); until then only tests name one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn carrier_issued_exec_mm_for_tests(&self, mm: MmId) -> IssuedExecMm {
+        IssuedExecMm {
+            domain: Arc::clone(self.domain()),
+            mm,
+        }
+    }
+
     pub fn prepare_exec(
         self: &Arc<Self>,
         context: &KernelContext,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedExec, ExecError> {
-        self.prepare_exec_with_optional_backend(context, None, None, failpoint)
+        let issued = self.issue_exec_mm()?;
+        self.prepare_exec_with_optional_backend(context, None, None, issued, failpoint)
     }
 
     /// Prepare exec with a concrete replacement address-space backend.
@@ -237,7 +277,8 @@ impl Kernel {
         backend: Arc<dyn MmBackend>,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedExec, ExecError> {
-        self.prepare_exec_with_optional_backend(context, Some(backend), None, failpoint)
+        let issued = self.issue_exec_mm()?;
+        self.prepare_exec_with_optional_backend(context, Some(backend), None, issued, failpoint)
     }
 
     /// Select the current caller from an exact task binding and reserve exec in
@@ -258,6 +299,7 @@ impl Kernel {
             return Err(ExecError::ForeignContext);
         }
         let transaction = self.object_ids().transaction_id()?;
+        let issued = self.issue_exec_mm()?;
         let context = {
             let mut state = self.registry().settled().write();
             let (task, thread, shared, resources, revision) = {
@@ -290,6 +332,7 @@ impl Kernel {
             &context,
             Some(backend),
             None,
+            issued,
             failpoint,
             transaction,
             context.revision,
@@ -300,14 +343,16 @@ impl Kernel {
     /// Prepare an exec whose surviving host runner is re-keyed while the Linux
     /// caller is promoted to the thread-group leader. Native x86 uses this
     /// because its backend `ThreadId` follows the post-exec host-thread key;
-    /// Linux identity remains the task leader allocated by the Kernel.
+    /// Linux identity remains the task leader allocated by the Kernel, and
+    /// the replacement MM is the one `issued` names.
     pub fn prepare_exec_with_registry_id(
         self: &Arc<Self>,
         context: &KernelContext,
         registry_id: ThreadId,
+        issued: IssuedExecMm,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedExec, ExecError> {
-        self.prepare_exec_with_optional_backend(context, None, Some(registry_id), failpoint)
+        self.prepare_exec_with_optional_backend(context, None, Some(registry_id), issued, failpoint)
     }
 
     fn prepare_exec_with_optional_backend(
@@ -315,6 +360,7 @@ impl Kernel {
         context: &KernelContext,
         backend: Option<Arc<dyn MmBackend>>,
         replacement_registry_id: Option<ThreadId>,
+        issued: IssuedExecMm,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedExec, ExecError> {
         self.sweep_retired_threads();
@@ -358,6 +404,7 @@ impl Kernel {
             context,
             backend,
             replacement_registry_id,
+            issued,
             failpoint,
             transaction,
             revision,
@@ -369,6 +416,7 @@ impl Kernel {
         context: &KernelContext,
         backend: Option<Arc<dyn MmBackend>>,
         replacement_registry_id: Option<ThreadId>,
+        _issued: IssuedExecMm,
         failpoint: Option<KernelFailpoint>,
         transaction: KernelTransactionId,
         _revision: TaskRevision,
@@ -793,6 +841,10 @@ pub enum ExecError {
     RetiredThreadCapacity(usize),
     #[error("injected exec failure at {0:?}")]
     Injected(KernelFailpoint),
+    #[error("issued exec MM belongs to another Kernel")]
+    ForeignExecMm,
+    #[error("issued exec MM {0:?} is already a live task's MM")]
+    LiveExecMm(MmId),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -905,7 +957,9 @@ impl ExecPrepareError {
                 ExecError::ForeignContext
                 | ExecError::ForeignPreparation
                 | ExecError::WrongTask
-                | ExecError::LeaderClaimMissing => LINUX_EINVAL,
+                | ExecError::LeaderClaimMissing
+                | ExecError::ForeignExecMm
+                | ExecError::LiveExecMm(_) => LINUX_EINVAL,
                 ExecError::Injected(_) => LINUX_EIO,
             },
             Self::InvalidHostPid(_) => LINUX_EINVAL,
@@ -1479,7 +1533,12 @@ mod tests {
         wait_for_progress(&progress, 0);
         let replacement_registry_id = ThreadId::synthetic_for_tests(602);
         let prepared = kernel
-            .prepare_exec_with_registry_id(&sibling, replacement_registry_id, None)
+            .prepare_exec_with_registry_id(
+                &sibling,
+                replacement_registry_id,
+                kernel.issue_exec_mm().unwrap(),
+                None,
+            )
             .expect("prepare exec");
         let committed = kernel.commit_exec(prepared, None).expect("commit exec");
         runner.join().expect("old leader terminated");
@@ -1753,6 +1812,61 @@ mod tests {
 
         quit.store(true, Ordering::Release);
         runner.join().expect("resumed runner exits normally");
+    }
+
+    /// #2142 R1: one exec names one MM. The preparation installs the MM the
+    /// caller issued (on x86, the ring's), never a second one of its own.
+    #[test]
+    fn exec_installs_the_issued_mm_and_mints_no_second_one() {
+        let (kernel, context) = bootstrap(670);
+        let issued = kernel.issue_exec_mm().expect("issue exec MM");
+        let issued_mm = issued.mm_id();
+
+        let prepared = kernel
+            .prepare_exec_with_registry_id(
+                &context,
+                ThreadId::synthetic_for_tests(671),
+                issued,
+                None,
+            )
+            .expect("prepare exec");
+        assert_eq!(prepared.replacement_mm_id(), issued_mm);
+        let committed = kernel.commit_exec(prepared, None).expect("commit exec");
+
+        assert_eq!(committed.shared.mm().id(), issued_mm);
+    }
+
+    #[test]
+    fn exec_refuses_a_foreign_or_live_issued_mm_and_keeps_no_reservation() {
+        let (kernel, context) = bootstrap(680);
+        let (other, _) = bootstrap(680);
+        let refused = |issued| {
+            kernel.prepare_exec_with_registry_id(
+                &context,
+                ThreadId::synthetic_for_tests(681),
+                issued,
+                None,
+            )
+        };
+
+        assert!(matches!(
+            refused(other.issue_exec_mm().expect("foreign issue")),
+            Err(ExecError::ForeignExecMm)
+        ));
+        let live = context.shared.mm().id();
+        assert!(matches!(
+            refused(kernel.carrier_issued_exec_mm_for_tests(live)),
+            Err(ExecError::LiveExecMm(mm)) if mm == live
+        ));
+
+        kernel
+            .reserve_task_operation(context.task.key().id)
+            .expect("a refused issue leaves no exec reservation");
+        let current = kernel
+            .context(context.task.key().id, context.thread.key().tid)
+            .expect("caller unchanged");
+        assert_eq!(current.revision, context.revision);
+        assert!(Arc::ptr_eq(&current.shared, &context.shared));
     }
 
     #[test]
