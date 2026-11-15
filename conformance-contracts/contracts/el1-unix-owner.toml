@@ -1,3 +1,10 @@
+# #2361: an AF_UNIX SOCK_STREAM socketpair is a ring object (one IPC object,
+# two pipe-core lanes) for the run root and its native children on ARM and
+# x86. Its bytes live in the shared IPC region, never in a host socket queue.
+# The bindings below witness the pair on the production ARM entry (root and
+# ring fork child), the x86 CPL0 entry and the KVM production carrier.
+# SOCK_DGRAM, SOCK_SEQPACKET, ancillary data (SCM_RIGHTS), bind and the
+# path registry remain outside the ring and are refused there.
 schema_version = 1
 id = "kernel.el1.unix-owner"
 title = "Guest AF_UNIX queues and address registries have one owner"
@@ -11,6 +18,17 @@ structural_budgets = []
 [bindings]
 vm_free = [
   "carrick-kernel::dispatch::net::unix_pure::tests::{red_until_step3_m4_stream_payloads_live_in_host_socket_state,m4_equal_address_bytes_are_isolated_by_registry_owner,socketpair_stream_round_trip,abstract_namespace_bind_connect,dgram_socket_round_trip,unix_stream_local_shut_rd_poll_mask_epollrdhup,unix_stream_final_close_keeps_existing_epipe_semantics}",
+  "carrick-el1-linux::aarch64_process_tests::arm_root_fork_child_writes_its_socket_stdout",
+  "carrick-el1-linux::aarch64_process_tests::arm_root_fork_child_parks_on_its_empty_socket_until_the_parent_writes",
+  "carrick-el1-linux::aarch64_process_tests::arm_root_socketpair_is_a_ring_stream_pair",
+  "carrick-el1-linux::aarch64_process_tests::arm_root_socketpair_nonblock_and_shutdown",
+  "carrick-el1-linux::aarch64_process_tests::arm_root_socketpair_ends_are_ring_epoll_members",
+  "carrick-el1-linux::aarch64_process_tests::arm_root_socketpair_send_recv_and_refusals",
+  "carrick-el1-linux::x86_production_forward::x86_socket_calls_on_a_ring_stream_end_are_served",
+  "carrick-el1-abi::ipc::tests::{stream_pair_lanes_carry_each_direction_and_free_with_both_ends,stream_shutdown_drops_only_the_references_an_end_still_holds,stream_pair_outlives_a_close_after_both_ends_shut_everything}",
+]
+embed = [
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::zone_socketpair_child_write_parent_read_moves_exact_byte",
 ]
 
 [bindings.unresolved]
