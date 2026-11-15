@@ -49,6 +49,14 @@ pub enum NativeForkCause {
         status: u64,
         reply: Option<carrick_el1_abi::ForkStockRefusal>,
     },
+    /// A sibling's in-flight birth holds this process's topology
+    /// reservation. The refusing section enrolled the process on its
+    /// release (`Graph::birth_waiters`) and sampled the process channel's
+    /// generation here, under that same guard. Contention, never an errno:
+    /// the fork parks on that channel and reruns.
+    SiblingBirth {
+        observed: carrick_sched_core::process::wait::TaskWakeGeneration,
+    },
 }
 
 impl From<MmError> for NativeForkCause {
@@ -78,7 +86,7 @@ impl NativeForkRefusal {
         use super::native_process_runtime::NativeProcessError as E;
         use carrick_el1_abi::ForkStockRefusal as R;
         match self.cause {
-            NativeForkCause::Busy => E::Busy,
+            NativeForkCause::Busy | NativeForkCause::SiblingBirth { .. } => E::Busy,
             // Today's EAGAIN answer, as a refusal rather than "not now".
             NativeForkCause::GateShut => E::Exhausted,
             // Owner contention keeps its release to enrol on (#2306); it is
@@ -107,6 +115,34 @@ pub fn refused(
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     emit(format_args!("{refusal:?}"));
     super::native_process_runtime::NativeProcessError::ForkRefused(refusal)
+}
+
+/// A sibling's birth holds the reservation; the caller already enrolled on
+/// its release and sampled `observed` under the refusing guard. Not a
+/// refusal: no diagnostic, and the fork parks instead of failing.
+pub fn contended(
+    stage: NativeForkStage,
+    observed: carrick_sched_core::process::wait::TaskWakeGeneration,
+) -> super::native_process_runtime::NativeProcessError {
+    super::native_process_runtime::NativeProcessError::ForkRefused(NativeForkRefusal {
+        stage,
+        cause: NativeForkCause::SiblingBirth { observed },
+    })
+}
+
+/// The generation a [`contended`] fork enrolled at, if `error` is one.
+pub fn sibling_birth(
+    error: &Result<u32, super::native_process_runtime::NativeProcessError>,
+) -> Option<carrick_sched_core::process::wait::TaskWakeGeneration> {
+    match error {
+        Err(super::native_process_runtime::NativeProcessError::ForkRefused(
+            NativeForkRefusal {
+                cause: NativeForkCause::SiblingBirth { observed },
+                ..
+            },
+        )) => Some(*observed),
+        _ => None,
+    }
 }
 
 /// Contention at an exact refusing site: the caller retains the fork and

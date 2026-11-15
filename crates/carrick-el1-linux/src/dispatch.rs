@@ -3135,7 +3135,12 @@ impl<
             let _ = process.take_relative_futex_wait();
         }
         process.scope_rerun_answers_to_entry();
-        process.resume_owned_continuation()
+        match process.resume_owned_continuation() {
+            // A contended fork's continuation is this very clone SVC: it
+            // consumed its retained row and is served afresh below.
+            Some(lifecycle::LifecycleOutcome::Redispatch) => None,
+            outcome => outcome,
+        }
     }
     fn may_serve_poll(&self) -> bool {
         self.frame.may_serve_poll()
