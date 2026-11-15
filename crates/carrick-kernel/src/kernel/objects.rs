@@ -2667,8 +2667,9 @@ pub struct FileTable {
     slot_subscriptions: Arc<FileSlotSubscriptions>,
     /// Orders host adoptions of ring epolls in this table (#1671): one
     /// adoption finds or builds an epoll's host description and installs
-    /// it at every copy before the next looks.
-    epoll_adoption: Mutex<()>,
+    /// it at every copy before the next looks. Holds the descriptions
+    /// adopted so far, live while any slot does.
+    epoll_adoption: Mutex<Vec<std::sync::Weak<FileDescription>>>,
 }
 
 enum TableCopyPurpose {
@@ -2699,7 +2700,7 @@ impl FileTable {
             functional_refs_active: AtomicBool::new(true),
             revision: ObjectRevision::new(),
             slot_subscriptions: Arc::new(FileSlotSubscriptions::default()),
-            epoll_adoption: Mutex::new(()),
+            epoll_adoption: Mutex::new(Vec::new()),
         }
     }
 
@@ -2764,7 +2765,7 @@ impl FileTable {
             functional_refs_active: AtomicBool::new(true),
             revision: ObjectRevision::new(),
             slot_subscriptions: Arc::new(FileSlotSubscriptions::default()),
-            epoll_adoption: Mutex::new(()),
+            epoll_adoption: Mutex::new(Vec::new()),
         }
     }
 
@@ -3445,11 +3446,16 @@ impl FileTable {
         self.rw_write(&self.epoll_fds)
     }
 
-    /// Held across one host adoption of a ring epoll
-    /// ([`Self::ipc_ring_epoll_copies`]). A short host section: it takes no
-    /// guest wait and never parks.
-    pub(crate) fn lock_epoll_adoption(&self) -> MutexGuard<'_, ()> {
-        self.epoll_adoption.lock()
+    /// Run one host adoption of a ring epoll
+    /// ([`Self::ipc_ring_epoll_copies`]) ordered against this table's
+    /// others. A short host section: it takes no guest wait and never parks.
+    pub(crate) fn with_epoll_adoption<R>(
+        &self,
+        adopt: impl FnOnce(&mut Vec<std::sync::Weak<FileDescription>>) -> R,
+    ) -> R {
+        let mut adopted = self.epoll_adoption.lock();
+        adopted.retain(|description| description.strong_count() > 0);
+        adopt(&mut adopted)
     }
 
     pub(crate) fn epoll_wake_registry(&self) -> &crate::dispatch::EpollWakeRegistry {

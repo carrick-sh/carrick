@@ -515,12 +515,22 @@ impl<'a> NetView<'a> {
     /// slot itself, so this call orders before it and leaves the slot to
     /// the claim, serving on the record's description.
     fn epoll_open_file(&self, epfd: i32) -> Option<OpenFile> {
-        use carrick_el1_abi::ipc::IpcBacking;
         if let Some(open_file) = self.open_file(epfd) {
             return Some(open_file);
         }
+        self.captured_file_table()
+            .with_epoll_adoption(|adopted| self.adopt_ring_epoll(epfd, adopted))
+    }
+
+    /// [`Self::epoll_open_file`]'s adoption, ordered against the table's
+    /// other adoptions; `adopted` holds the host descriptions they built.
+    fn adopt_ring_epoll(
+        &self,
+        epfd: i32,
+        adopted: &mut Vec<std::sync::Weak<crate::kernel::FileDescription>>,
+    ) -> Option<OpenFile> {
+        use carrick_el1_abi::ipc::IpcBacking;
         let files = self.captured_file_table();
-        let _adoption = files.lock_epoll_adoption();
         // An adoption through another copy installed it here meanwhile.
         if let Some(open_file) = self.open_file(epfd) {
             return Some(open_file);
@@ -542,11 +552,11 @@ impl<'a> NetView<'a> {
                 0
             }
         };
-        let adopted = files
-            .read_open_files()
-            .values()
-            .find(|slot| {
-                slot.description
+        let existing = adopted
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .find(|description| {
+                description
                     .inspect_kind(|open| {
                         matches!(
                             open,
@@ -555,9 +565,8 @@ impl<'a> NetView<'a> {
                         )
                     })
                     .unwrap_or(false)
-            })
-            .map(|slot| Arc::clone(&slot.description));
-        let description = match adopted {
+            });
+        let description = match existing {
             Some(description) => description,
             None => {
                 let description = self
@@ -567,12 +576,15 @@ impl<'a> NetView<'a> {
                         lifetime: held,
                     })
                     .ok()?;
-                crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
-                    Arc::new(RwLock::new(description)),
-                    Arc::new(crate::kernel::DescriptionCommon::new(0)),
-                    fd_flags(cloexec),
-                )
-                .description
+                let description =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
+                        Arc::new(RwLock::new(description)),
+                        Arc::new(crate::kernel::DescriptionCommon::new(0)),
+                        fd_flags(cloexec),
+                    )
+                    .description;
+                adopted.push(Arc::downgrade(&description));
+                description
             }
         };
         for copy in copies {
@@ -588,13 +600,20 @@ impl<'a> NetView<'a> {
             };
             // An exact replacement commits the caller's functional reference.
             description.retain_fd_ref();
-            let open_file = OpenFile::new(Arc::clone(&description), fd_flags(ring.cloexec));
+            let open_file = crate::dispatch::fd_table::OpenFile::new(
+                Arc::clone(&description),
+                fd_flags(ring.cloexec),
+            );
             if reservation.commit(open_file).is_err() {
                 description.release_fd_ref();
             }
         }
-        self.open_file(epfd)
-            .or_else(|| Some(OpenFile::new(description, fd_flags(cloexec))))
+        self.open_file(epfd).or_else(|| {
+            Some(crate::dispatch::fd_table::OpenFile::new(
+                description,
+                fd_flags(cloexec),
+            ))
+        })
     }
 
     /// A ring-created zone member `fd` names in the caller's published
