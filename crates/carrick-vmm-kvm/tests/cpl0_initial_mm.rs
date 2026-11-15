@@ -3198,6 +3198,36 @@ fn zone_pipe_child_write_parent_read_moves_exact_byte() {
     );
 }
 
+/// #2361: `socketpair(AF_UNIX, SOCK_STREAM)` is a ring object on x86 too,
+/// through the production CPL0 lane and the shared IPC venue: a forked
+/// child writes its inherited end and the live parent reads the byte on
+/// the other end. Before #2361 the x86 socketpair was a counted ENOSYS
+/// (no x86 socket crossing): the fixture exited 90.
+#[test]
+fn zone_socketpair_child_write_parent_read_moves_exact_byte() {
+    let elf = native_exit_fixture_with_flags(
+        "native_pipe_child_write.S",
+        &["-DREAD_CHILD", "-DSOCKETPAIR"],
+    );
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| panic!("socketpair child write parent read: {}", failure.error));
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "socketpair (90), child write (errno) or parent read (92)"
+    );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    for ordinal in [63, 64, 199] {
+        assert_eq!(
+            counters.forwarded[ordinal].load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "ordinal {ordinal} is served in ring"
+        );
+    }
+}
+
 #[test]
 fn zone_epoll_legacy_wait_blocks_until_child_pipe_write() {
     assert_zone_epoll_pipe_wake(&["-DUSE_EPOLL", "-DUSE_LEGACY_EPOLL"]);

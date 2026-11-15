@@ -2,10 +2,18 @@
  * IPC execution custody. The parent reaps the child and exits with
  * the child's status. Child exit 0 = the write returned 1; otherwise the
  * child exits with the negated errno its write returned (38 = ENOSYS).
- * 90 pipe2 failed, 91 fork/wait failed. */
+ * 90 pipe2 failed, 91 fork/wait failed. With SOCKETPAIR (#2361) the pair
+ * is socketpair(AF_UNIX, SOCK_STREAM, 0) instead: 90 is its failure. */
 .global _start
 .text
 _start:
+#ifdef SOCKETPAIR
+    mov $1, %edi                   /* AF_UNIX */
+    mov $1, %esi                   /* SOCK_STREAM */
+    xor %edx, %edx
+    lea fds(%rip), %r10
+    mov $53, %eax                  /* socketpair(AF_UNIX, SOCK_STREAM, 0, fds) */
+#else
     lea fds(%rip), %rdi
 #ifdef EXEC_STATUS
     mov $0x80000, %esi
@@ -13,6 +21,7 @@ _start:
     xor %esi, %esi
 #endif
     mov $293, %eax                 /* pipe2(fds, 0) */
+#endif
     syscall
     test %rax, %rax
     jnz fail_pipe
