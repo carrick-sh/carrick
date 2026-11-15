@@ -611,8 +611,9 @@ fn compiler_cache_env_selects_r2_only_for_credentialed_hosted_runners() {
     assert_eq!(
         env,
         format!(
-            "SCCACHE_DIR={}\nSCCACHE_CACHE_SIZE=15G\nSCCACHE_SERVER_UDS={build_socket}\n",
+            "SCCACHE_DIR={}\nSCCACHE_CACHE_SIZE=15G\nSCCACHE_SERVER_UDS={build_socket}\nSCCACHE_ERROR_LOG={}.log\n",
             dir.display(),
+            build_socket.strip_suffix(".sock").unwrap(),
         )
     );
     let prefix = temp_cache
@@ -1080,6 +1081,51 @@ fn local_compiler_cache_start_replaces_only_a_stale_socket() {
     );
     // No socket: a server starts.
     start("--start-server\n");
+}
+
+/// The job server alone logs (to SCCACHE_ERROR_LOG): two sccache hangs on carrick-m4 on 2026-11-15
+/// left nothing to read. Clients never get a level, which would make every rustc call log to stderr.
+#[test]
+fn local_compiler_cache_server_alone_gets_a_log_level() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("calls");
+    let fake = dir.path().join("sccache");
+    carrick_test_support::executable::write_executable(
+        &fake,
+        format!(
+            "#!/bin/sh\necho \"$1 level=${{SCCACHE_LOG:-none}}\" >> {}\n",
+            log.display()
+        ),
+    );
+    let start = |error_log: Option<&std::path::Path>| {
+        let _ = std::fs::remove_file(&log);
+        let socket = dir.path().join("job.sock");
+        let _ = std::fs::remove_file(&socket);
+        let mut command =
+            std::process::Command::new(root.join("scripts/ci/compiler-cache-start-local.sh"));
+        command
+            .env("CARRICK_SCCACHE_BIN", &fake)
+            .env("SCCACHE_SERVER_UDS", &socket)
+            .env("CARRICK_XTASK_BIN", env!("CARGO_BIN_EXE_carrick-xtask"))
+            .env_remove("SCCACHE_LOG")
+            .env_remove("SCCACHE_ERROR_LOG");
+        if let Some(path) = error_log {
+            command.env("SCCACHE_ERROR_LOG", path);
+        }
+        let out = command.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(&log).unwrap()
+    };
+    assert_eq!(
+        start(Some(&dir.path().join("job.log"))),
+        "--start-server level=info\n"
+    );
+    assert_eq!(start(None), "--start-server level=none\n");
 }
 
 /// Two callers must share one server even when the first start is still binding.

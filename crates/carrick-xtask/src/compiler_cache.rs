@@ -54,12 +54,16 @@ pub(crate) fn start() -> io::Result<()> {
     // sccache 0.18 commands::run_server_process waits for ServerStartup::Ok;
     // server::start_server sends it only after binding the listener. Keep this
     // synchronous command under the lock so the next caller sees a bound socket.
-    if !Command::new(bin)
+    let mut server = Command::new(bin);
+    server
         .env("SCCACHE_IDLE_TIMEOUT", "0")
-        .arg("--start-server")
-        .status()?
-        .success()
-    {
+        .arg("--start-server");
+    // The level goes to the server alone. Set job-wide, every rustc wrapper call would also log to
+    // its stderr, so it isn't exported; the server sends its log to SCCACHE_ERROR_LOG.
+    if std::env::var_os("SCCACHE_ERROR_LOG").is_some_and(|log| !log.is_empty()) {
+        server.env("SCCACHE_LOG", "info");
+    }
+    if !server.status()?.success() {
         return Err(io::Error::other("sccache server startup failed"));
     }
     Ok(())

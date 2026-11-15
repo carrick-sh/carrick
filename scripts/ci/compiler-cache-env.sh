@@ -73,6 +73,10 @@ if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
         fi
         echo "SCCACHE_CACHE_SIZE=$cache_size"
         echo "SCCACHE_SERVER_UDS=$socket"
+        # The job server's own log, beside its socket: sccache hung twice on carrick-m4 on 2026-11-15
+        # with nothing to read afterwards. Only the server writes it (xtask compiler-cache-start
+        # sets its level); `just ci-cache-finish` prints it into the job log and removes it.
+        echo "SCCACHE_ERROR_LOG=${socket%.sock}.log"
     } >> "$GITHUB_ENV"
     echo "backend=local" >> "$GITHUB_OUTPUT"
     echo "compiler cache: family=$family backend=local ($dir, runner is ${RUNNER_ENVIRONMENT:-unknown})"
