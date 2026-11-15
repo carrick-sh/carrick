@@ -703,12 +703,18 @@ https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/futex/futex.go
 The futex(2) manual's description of PRIVATE as an optimization does not promise
 interoperation between those two operation kinds.
 
-`arm_glibc_pthread_join_robust_host_wake_meets_ring_wait` uses production ARM
-syscall dispatch with the scheduler active, calls `set_robust_list` (99), parks
-a joiner with op 265, verifies the child's raw exit enters host custody, then
-applies the production host `FutexQueueAuthority::wake_child_tid` API after the
-clear-word copyout. Before repair, that wake finds zero waiters instead of one.
-This is a VM-free custody-boundary witness, not a signed runtime retirement demo.
+`arm_glibc_pthread_join_host_retirement_wake_meets_ring_wait` (named
+`arm_glibc_pthread_join_robust_host_wake_meets_ring_wait` before #2109) uses
+production ARM syscall dispatch with the scheduler active, calls
+`set_robust_list` (99), parks a joiner with op 265, and verifies that the
+child's raw exit enters host custody. Since #2109 a registered robust list no
+longer declines the exit, so a thread-directed pending signal does. The witness
+then applies the production host `FutexQueueAuthority::wake_child_tid` API after
+the clear-word copyout. Before repair, that wake finds zero waiters instead of
+one. This is a VM-free custody-boundary witness, not a signed runtime
+retirement demo. Its twin, `arm_glibc_pthread_join_robust_exit_in_ring_wakes_ring_wait`,
+retires the robust-registered exit in ring, and that exit's own clear-child-tid
+wake releases the joiner.
 
 The bounded CPL0 lifecycle carrier also selects shared keys for shared waits
 inside its existing eagerly backed private RAM aperture. It reuses
