@@ -1261,7 +1261,8 @@ impl TidOutput {
         let mut preimage = [0u8; 4];
         match user.copy_in(&mut preimage, UserVa::new(address)) {
             CopyOutcome::Done => Ok(Some(Self { address, preimage })),
-            refused => Err(refused),
+            CopyOutcome::Fault => Err(CopyOutcome::Fault),
+            CopyOutcome::NotYet(request) => Err(CopyOutcome::NotYet(request)),
         }
     }
 }
