@@ -582,3 +582,135 @@ fn retiring_host_issued_sibling_refuses_tgkill_with_esrch() {
         Err(carrick_syscall_abi::LINUX_ESRCH),
     );
 }
+
+/// #2374: a losing exit_group member switched in at the SVC of its pending
+/// object operation is vacated to the maintenance root, then its release is
+/// refused (`CurrentRelease::Requeued`, #685). Its vCPU no longer runs the
+/// process root, so the slot's occupancy word must not name that space
+/// either (#1100): the host settles a requeued thread with the live TTBRs
+/// whenever the word still names its own space, and the next load of that
+/// state names ASID 0 against an ASID-tagged projection.
+#[cfg(test)]
+#[test]
+fn refused_losing_exit_after_vacate_leaves_no_installed_space() {
+    use super::super::PendingCloseOperation;
+    use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken, OwnerEntry};
+    let fixture = native_exec_fixture();
+    let _ = super::super::host_test_support::take_terminal_vacates();
+    let sibling = add_service_sibling(&fixture, None);
+    assert_eq!(fixture.page.live(), 2);
+    let deliver = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, _>| {
+        let _ = owned.into_parts();
+    };
+    let key = ObjectWaitKey::new(9, 1).unwrap();
+    fixture
+        .zone
+        .bind_object_wait(key, &carrick_sched_core::ShortLockSpin, &deliver)
+        .unwrap();
+    {
+        let guard = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &deliver)
+            .unwrap();
+        guard
+            .park(
+                guard.snapshot(),
+                sibling.record.id,
+                OperationToken::new(42, 9).unwrap(),
+            )
+            .unwrap();
+    }
+    fixture.zone.clear_current(sibling.slot);
+    {
+        let guard = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &deliver)
+            .unwrap();
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        assert_eq!(
+            guard
+                .notify_object(sibling.slot, &mut effects)
+                .unwrap()
+                .queued,
+            1
+        );
+    }
+    assert_eq!(
+        fixture.zone.switch_in(sibling.slot),
+        Some(sibling.record.id)
+    );
+    assert!(
+        fixture
+            .zone
+            .record(sibling.record.id)
+            .has_object_operation()
+    );
+    assert_ne!(
+        fixture.zone.installed_space(sibling.slot),
+        0,
+        "the switched-in sibling runs in its process space"
+    );
+    let saved = words(fixture.address);
+    let mut service = fixture.service();
+    let mut owner = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    owner
+        .begin_closing(PendingCloseOperation::Exit {
+            status: LinuxWaitStatus::exited(0),
+            entry: OwnerEntry::Syscall,
+        })
+        .unwrap();
+    let mut sibling_service = fixture.service();
+    let mut loser = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling.slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+    let outcome = match loser.exit_group(9) {
+        LifecycleOutcome::Redispatch => "redispatch",
+        LifecycleOutcome::HostCustody => "host custody",
+        LifecycleOutcome::Returned { .. } => "returned",
+        LifecycleOutcome::Transferred { .. } => "transferred",
+    };
+    assert!(
+        fixture.zone.live(sibling.record).is_some(),
+        "the requeued record keeps its pending operation: {outcome:?}"
+    );
+    assert!(
+        fixture
+            .zone
+            .record(sibling.record.id)
+            .has_object_operation()
+    );
+    let vacates = super::super::host_test_support::take_terminal_vacates();
+    assert_eq!(
+        vacates, 1,
+        "the losing member left its process root: {outcome:?}"
+    );
+    assert_eq!(
+        fixture.zone.installed_space(sibling.slot),
+        0,
+        "a vacated root must not leave the slot's occupancy naming the process space: {outcome:?}"
+    );
+}
