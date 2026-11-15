@@ -1755,3 +1755,180 @@ fn remaining_direct_crossings_prepare_fixed_and_byte_count_outputs() {
         None
     );
 }
+
+/// #231 (apt's chmod/chown): `fchmod`/`fchown` of a host-backed descriptor
+/// and a path's `fchmodat`/`fchmodat2`/`fchownat` stage the four
+/// metadata-mutation records, each carrying the caller's access context
+/// (its credentials decide EPERM). `fchmodat`'s fourth register is ignored,
+/// as Linux ignores it; `chown`'s -1 owner and group keep their 32-bit
+/// spelling.
+#[test]
+fn chmod_and_chown_stage_their_records_with_the_callers_authority() {
+    let mut user = memory(b"source\0");
+    let at = LINUX_AT_FDCWD as u64;
+    let unchanged = u64::MAX;
+    let nofollow = carrick_syscall_abi::LINUX_AT_SYMLINK_NOFOLLOW;
+    for (number, args, op, fd, flags, words, input) in [
+        (
+            52,
+            [3, 0o104755, 0, 0, 0, 0],
+            HostFileOp::Fchmod,
+            3,
+            0,
+            [0o4755, 0, 0, 0],
+            b"".as_slice(),
+        ),
+        (
+            55,
+            [1, unchanged, 7, 0, 0, 0],
+            HostFileOp::Fchown,
+            1,
+            0,
+            [u64::from(u32::MAX), 7, 0, 0],
+            b"".as_slice(),
+        ),
+        (
+            53,
+            [at, BASE, 0o644, nofollow, 0, 0],
+            HostFileOp::Fchmodat,
+            LINUX_AT_FDCWD,
+            0,
+            [0o644, 0, 0, 0],
+            b"source".as_slice(),
+        ),
+        (
+            452,
+            [at, BASE, 0o600, nofollow, 0, 0],
+            HostFileOp::Fchmodat,
+            LINUX_AT_FDCWD,
+            nofollow as u32,
+            [0o600, 0, 0, 0],
+            b"source".as_slice(),
+        ),
+        (
+            54,
+            [at, BASE, 0, unchanged, nofollow, 0],
+            HostFileOp::Fchownat,
+            LINUX_AT_FDCWD,
+            nofollow as u32,
+            [0, u64::from(u32::MAX), 0, 0],
+            b"source".as_slice(),
+        ),
+    ] {
+        let call = HostFileCall::decode(CanonicalNr::new(number), &args).unwrap();
+        let (mut bytes, output, resolves_path) = request(run(call, &mut user));
+        assert_eq!(output, None);
+        assert!(resolves_path, "{op:?} carries the caller's access context");
+        let view = HostFileRequestView::parse(&mut bytes).unwrap();
+        let header = view.header();
+        assert_eq!(
+            (
+                header.op,
+                header.fd,
+                header.flags,
+                header.args,
+                header.table
+            ),
+            (op, fd, flags, words, TABLE)
+        );
+        assert_eq!(view.input(), input);
+        // The path calls are the child's mutation venue; the descriptor
+        // calls follow the descriptor, also for the run root.
+        assert_eq!(
+            call.uses_child_mutation_venue(),
+            matches!(op, HostFileOp::Fchmodat | HostFileOp::Fchownat)
+        );
+        assert!(call.admitted_for(ServiceOrigin::Descendant, |_| false));
+        assert_eq!(
+            call.admitted_for(ServiceOrigin::Initial, |_| false),
+            matches!(op, HostFileOp::Fchmod | HostFileOp::Fchown)
+        );
+        assert!(!call.admitted_for(ServiceOrigin::Initial, |_| true));
+    }
+}
+
+/// The ring answers what Linux answers before any file is touched: EBADF
+/// for a closed descriptor and for `fchmod`/`fchown` of an O_PATH one,
+/// EINVAL for an unknown `fchmodat2`/`fchownat` flag, ENOENT for an empty
+/// path. `fchownat(fd, "", AT_EMPTY_PATH)` is the descriptor's own chown,
+/// which an O_PATH descriptor allows. An in-zone object keeps its route.
+#[test]
+fn chmod_and_chown_answer_linux_errors_in_ring() {
+    let mut user = memory(b"\0");
+    let ebadf = returned(carrick_syscall_abi::LINUX_EBADF);
+    let path_fd = |fd: i32| {
+        Some(match fd {
+            5 => NativeDescriptor::HostBacked {
+                access: DescriptionAccess::Path,
+            },
+            other => return caller(other),
+        })
+    };
+    let mut staged = |call: HostFileCall, user: &mut Memory| {
+        let mut resolve = path_fd;
+        let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+        stage(
+            call,
+            &mut NativeNamespace {
+                table: TABLE,
+                resolve: &mut resolve,
+                releases: &mut releases,
+            },
+            user,
+        )
+    };
+    for fd in [999, 5] {
+        assert_eq!(
+            staged(HostFileCall::Fchmod { fd, mode: 0 }, &mut user),
+            ebadf
+        );
+        let chown = HostFileCall::Fchown {
+            fd,
+            owner: 0,
+            group: 0,
+        };
+        assert_eq!(staged(chown, &mut user), ebadf);
+    }
+    assert_eq!(
+        staged(HostFileCall::Fchmod { fd: 0, mode: 0 }, &mut user),
+        None
+    );
+    let einval = returned(carrick_syscall_abi::LINUX_EINVAL);
+    let chmodat = |path, flags| HostFileCall::Fchmodat {
+        dirfd: LINUX_AT_FDCWD,
+        path,
+        mode: 0o600,
+        flags,
+    };
+    let chownat = |dirfd, flags| HostFileCall::Fchownat {
+        dirfd,
+        path: BASE,
+        owner: 0,
+        group: 0,
+        flags,
+    };
+    assert_eq!(staged(chmodat(u64::MAX, 0x200), &mut user), einval);
+    assert_eq!(staged(chownat(LINUX_AT_FDCWD, 0x200), &mut user), einval);
+    assert_eq!(
+        staged(chmodat(BASE, 0), &mut user),
+        returned(carrick_syscall_abi::LINUX_ENOENT)
+    );
+    assert_eq!(
+        staged(chownat(LINUX_AT_FDCWD, 0), &mut user),
+        returned(carrick_syscall_abi::LINUX_ENOENT)
+    );
+    let empty = u64::from(LINUX_AT_EMPTY_PATH);
+    let (mut bytes, _, _) = request(staged(chownat(5, empty), &mut user));
+    let view = HostFileRequestView::parse(&mut bytes).unwrap();
+    assert_eq!(
+        (view.header().op, view.header().fd),
+        (HostFileOp::Fchown, 5)
+    );
+    let (mut bytes, _, _) = request(staged(chownat(LINUX_AT_FDCWD, empty), &mut user));
+    let view = HostFileRequestView::parse(&mut bytes).unwrap();
+    assert_eq!(
+        (view.header().op, view.input()),
+        (HostFileOp::Fchownat, &b"."[..])
+    );
+    assert_eq!(staged(chownat(999, empty), &mut user), ebadf);
+}

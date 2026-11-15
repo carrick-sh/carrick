@@ -1217,6 +1217,17 @@ impl X8664GuestArch {
                 args: [args[0], 0, 0, 0, 0, 0],
             });
         }
+        if let Some((number, args)) =
+            carrick_abi::syscall_x86_64::normalize_legacy_attr(x86_number, args)
+        {
+            return SyscallNorm::Plain(RawSyscall {
+                current_guest_sp: None,
+                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: NativeNr(x86_number),
+                number,
+                args,
+            });
+        }
         if x86_number == X86_NR_ACCESS {
             let (number, args) = carrick_abi::syscall_x86_64::normalize_access(args);
             return SyscallNorm::Plain(RawSyscall {
@@ -1808,6 +1819,31 @@ mod normalize_tests {
                 assert_eq!(rs.args, [carrick_abi::LINUX_AT_FDCWD, 0x1000, 4, 0, 0, 0]);
             }
             _ => panic!("access must be Plain"),
+        }
+    }
+
+    #[test]
+    fn legacy_chmod_chown_lchown_normalize_to_their_at_forms() {
+        // chmod(path, mode), chown(path, uid, gid) and lchown(path, uid, gid)
+        // are fchmodat/fchownat of AT_FDCWD; lchown adds AT_SYMLINK_NOFOLLOW.
+        let at = carrick_abi::LINUX_AT_FDCWD;
+        let nofollow = carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW;
+        for (native, number, args) in [
+            (90, 53, [at, 0x1000, 0o755, 0, 0, 0]),
+            (92, 54, [at, 0x1000, 0o755, 7, 0, 0]),
+            (94, 54, [at, 0x1000, 0o755, 7, nofollow, 0]),
+        ] {
+            match X8664GuestArch::normalize_syscall(&frame(
+                native,
+                [0x1000, 0o755, 7, 0xAA, 0xBB, 0],
+            )) {
+                SyscallNorm::Plain(rs) => {
+                    assert_eq!(rs.number.raw(), number, "x86 {native}");
+                    assert_eq!(rs.args, args, "x86 {native}");
+                    assert_eq!(rs.native_number.0, native);
+                }
+                _ => panic!("x86 {native} must be Plain"),
+            }
         }
     }
 

@@ -477,12 +477,46 @@ mod tests {
     }
 
     #[test]
+    fn fchmod_and_fchown_follow_their_descriptor_for_the_root_too() {
+        // #231: fchmod (x86 91) and fchown (93) of the root's ring-held file
+        // were not x86 crossings and had no ring stage, so they were a
+        // counted ENOSYS. They follow the descriptor as ftruncate does; with
+        // no x86 crossing behind them, a descriptor absent from the ring
+        // namespace is the ring's EBADF.
+        use carrick_personality_linux::entry::SyscallResult;
+        for (nr, args) in [(91, [3, 0o640, 0, 0, 0, 0]), (93, [3, 0, 0, 0, 0, 0])] {
+            for origin in [INITIAL, CHILD] {
+                assert!(
+                    matches!(
+                        stage(nr, args, origin, host()),
+                        Some(HostFileStage::Request {
+                            resolves_path: true,
+                            ..
+                        })
+                    ),
+                    "{nr} {origin:?}"
+                );
+            }
+            assert_eq!(
+                stage(nr, args, INITIAL, Some(NativeDescriptor::Absent)),
+                Some(HostFileStage::Returned(SyscallResult::from_errno(
+                    carrick_syscall_abi::LINUX_EBADF
+                ))),
+                "{nr}"
+            );
+            assert_eq!(stage_delegated(nr, args, INITIAL, true), None, "{nr}");
+        }
+    }
+
+    #[test]
     fn mutations_are_descendant_only() {
         // x86_64 numbers: mkdirat 258, unlinkat 263, renameat2 316,
-        // truncate 76, ftruncate 77, symlinkat 266, linkat 265, utimensat 280.
+        // truncate 76, ftruncate 77, symlinkat 266, linkat 265, utimensat 280,
+        // fchmodat 268, fchmodat2 452, fchownat 260, and the legacy chmod 90,
+        // chown 92 and lchown 94 they normalize from.
         let path = *b"/x\0";
         let p = path.as_ptr() as u64;
-        let cases: [(&str, u64, [u64; 6]); 7] = [
+        let cases: [(&str, u64, [u64; 6]); 13] = [
             ("mkdirat", 258, [!99u64, p, 0o755, 0, 0, 0]),
             ("unlinkat", 263, [!99u64, p, 0, 0, 0, 0]),
             ("symlinkat", 266, [p, !99u64, p, 0, 0, 0]),
@@ -490,6 +524,12 @@ mod tests {
             ("renameat2", 316, [!99u64, p, !99u64, p, 0, 0]),
             ("utimensat", 280, [!99u64, p, 0, 0, 0, 0]),
             ("truncate", 76, [p, 0, 0, 0, 0, 0]),
+            ("fchmodat", 268, [!99u64, p, 0o644, 0, 0, 0]),
+            ("fchmodat2", 452, [!99u64, p, 0o644, 0x100, 0, 0]),
+            ("fchownat", 260, [!99u64, p, 0, 0, 0x100, 0]),
+            ("chmod", 90, [p, 0o644, 0, 0, 0, 0]),
+            ("chown", 92, [p, 0, 0, 0, 0, 0]),
+            ("lchown", 94, [p, 0, 0, 0, 0, 0]),
         ];
         for (name, nr, args) in cases {
             assert!(

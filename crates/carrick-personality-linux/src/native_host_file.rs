@@ -168,6 +168,30 @@ pub enum HostFileCall {
         fd: i32,
         length: u64,
     },
+    Fchmod {
+        fd: i32,
+        mode: u64,
+    },
+    Fchown {
+        fd: i32,
+        owner: u64,
+        group: u64,
+    },
+    /// `fchmodat` (whose `flags` Linux ignores, decoded as 0) or
+    /// `fchmodat2`.
+    Fchmodat {
+        dirfd: i32,
+        path: u64,
+        mode: u64,
+        flags: u64,
+    },
+    Fchownat {
+        dirfd: i32,
+        path: u64,
+        owner: u64,
+        group: u64,
+        flags: u64,
+    },
     Faccessat {
         dirfd: i32,
         path: u64,
@@ -287,6 +311,8 @@ impl HostFileCall {
                 | Self::Utimensat { .. }
                 | Self::Truncate { .. }
                 | Self::Ftruncate { .. }
+                | Self::Fchmodat { .. }
+                | Self::Fchownat { .. }
         )
     }
 
@@ -302,16 +328,23 @@ impl HostFileCall {
     ///   host route, which owns the terminal and blocking-read semantics.
     ///   `writev` has no host route, so it is staged for every descriptor.
     /// - Path mutations stay child-scoped: the initial task keeps its host
-    ///   route. `ftruncate` names a descriptor, so it follows the descriptor:
-    ///   one the root's `openat` installed lives in the ring namespace and the
-    ///   host task has nothing under its number (#2157 B1).
+    ///   route. `ftruncate`, `fchmod` and `fchown` name a descriptor, so they
+    ///   follow the descriptor: one the root's `openat` installed lives in
+    ///   the ring namespace and the host task has nothing under its number
+    ///   (#2157 B1, #231).
     /// - `readlinkat` is not staged here: the root's keeps its host crossing,
     ///   and a descendant's is the native file family's (#1862).
     pub fn admitted_for(self, origin: ServiceOrigin, delegated: impl FnOnce(i32) -> bool) -> bool {
         match self {
             Self::Chdir { .. } => origin != ServiceOrigin::Initial,
-            Self::Ftruncate { fd, .. } if origin == ServiceOrigin::Initial => !delegated(fd),
+            Self::Ftruncate { fd, .. } | Self::Fchmod { fd, .. } | Self::Fchown { fd, .. }
+                if origin == ServiceOrigin::Initial =>
+            {
+                !delegated(fd)
+            }
             call if call.uses_child_mutation_venue() => origin != ServiceOrigin::Initial,
+            // A descendant's descriptor lives in its ring namespace.
+            Self::Fchmod { .. } | Self::Fchown { .. } => true,
             Self::Openat { .. }
             | Self::Faccessat { .. }
             | Self::Statx { .. }
@@ -382,6 +415,27 @@ impl HostFileCall {
             c if c == nr::FTRUNCATE => Self::Ftruncate {
                 fd,
                 length: args[1],
+            },
+            c if c == nr::FCHMOD => Self::Fchmod { fd, mode: args[1] },
+            c if c == nr::FCHOWN => Self::Fchown {
+                fd,
+                owner: args[1],
+                group: args[2],
+            },
+            // fchmodat takes three arguments: Linux ignores the fourth
+            // register, which glibc may leave holding AT_SYMLINK_NOFOLLOW.
+            c if c == nr::FCHMODAT || c == nr::FCHMODAT2 => Self::Fchmodat {
+                dirfd: fd,
+                path: args[1],
+                mode: args[2],
+                flags: if c == nr::FCHMODAT { 0 } else { args[3] },
+            },
+            c if c == nr::FCHOWNAT => Self::Fchownat {
+                dirfd: fd,
+                path: args[1],
+                owner: args[2],
+                group: args[3],
+                flags: args[4],
             },
             c if c == nr::UTIMENSAT => Self::Utimensat {
                 dirfd: fd,
@@ -733,6 +787,15 @@ fn copy_path(user: &mut dyn HostFileUser, address: u64) -> Path {
             None => return Path::Stage(errno(carrick_syscall_abi::LINUX_EFAULT)),
         };
     }
+}
+
+/// The mode bits `chmod` applies: permissions, set-id and sticky.
+const CHMOD_MODE_BITS: u64 = 0o7777;
+
+/// `chown`'s owner and group words as a record's scalar arguments: each a
+/// Linux `uid_t`/`gid_t`, `u32::MAX` (-1) for unchanged.
+fn chown_ids(owner: u64, group: u64) -> [u64; 4] {
+    [u64::from(owner as u32), u64::from(group as u32), 0, 0]
 }
 
 struct Staging<'n, 'u> {
@@ -1173,6 +1236,103 @@ fn stage_call(
                     staging.request(HostFileOp::Ftruncate, fd, 0, [length, 0, 0, 0], &[], None)
                 }
             }
+        }
+        HostFileCall::Fchmod { fd, mode } => match staging.descriptor(fd)? {
+            NativeDescriptor::Absent
+            | NativeDescriptor::HostBacked {
+                access: DescriptionAccess::Path,
+            } => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { .. } => staging.request(
+                HostFileOp::Fchmod,
+                fd,
+                0,
+                [mode & CHMOD_MODE_BITS, 0, 0, 0],
+                &[],
+                None,
+            ),
+            // An in-zone object's inode mode keeps its route.
+            NativeDescriptor::InZone(_) => return None,
+        },
+        HostFileCall::Fchown { fd, owner, group } => match staging.descriptor(fd)? {
+            NativeDescriptor::Absent
+            | NativeDescriptor::HostBacked {
+                access: DescriptionAccess::Path,
+            } => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { .. } => staging.request(
+                HostFileOp::Fchown,
+                fd,
+                0,
+                chown_ids(owner, group),
+                &[],
+                None,
+            ),
+            NativeDescriptor::InZone(_) => return None,
+        },
+        HostFileCall::Fchmodat {
+            dirfd,
+            path,
+            mode,
+            flags,
+        } => {
+            if flags & !carrick_syscall_abi::LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+                return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+            }
+            let path = match staging.path_input(user, dirfd, path)? {
+                Ok(path) => path,
+                Err(stage) => return Some(stage),
+            };
+            staging.request(
+                HostFileOp::Fchmodat,
+                LINUX_AT_FDCWD,
+                flags as u32,
+                [mode & CHMOD_MODE_BITS, 0, 0, 0],
+                &path,
+                None,
+            )
+        }
+        HostFileCall::Fchownat {
+            dirfd,
+            path,
+            owner,
+            group,
+            flags,
+        } => {
+            let empty_path = u64::from(LINUX_AT_EMPTY_PATH);
+            if flags & !(carrick_syscall_abi::LINUX_AT_SYMLINK_NOFOLLOW | empty_path) != 0 {
+                return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+            }
+            let ids = chown_ids(owner, group);
+            let path = match copy_path(user, path) {
+                Path::Bytes(path) => path,
+                Path::Stage(stage) => return Some(stage),
+            };
+            // `AT_EMPTY_PATH` with an empty path names `dirfd` itself, which
+            // may be an O_PATH descriptor (chown(2)), or the cwd.
+            if path.is_empty() && flags & empty_path != 0 && dirfd != LINUX_AT_FDCWD {
+                return Some(match staging.descriptor(dirfd)? {
+                    NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+                    NativeDescriptor::HostBacked { .. } => {
+                        staging.request(HostFileOp::Fchown, dirfd, 0, ids, &[], None)
+                    }
+                    NativeDescriptor::InZone(_) => return None,
+                });
+            }
+            let path = match path.as_slice() {
+                b"" if flags & empty_path != 0 => b".".to_vec(),
+                b"" => return Some(errno(carrick_syscall_abi::LINUX_ENOENT)),
+                _ => path,
+            };
+            if let Some(answer) = staging.path_base(dirfd, &path)? {
+                return Some(answer);
+            }
+            staging.request(
+                HostFileOp::Fchownat,
+                LINUX_AT_FDCWD,
+                (flags & carrick_syscall_abi::LINUX_AT_SYMLINK_NOFOLLOW) as u32,
+                ids,
+                &path,
+                None,
+            )
         }
         HostFileCall::Utimensat {
             dirfd,

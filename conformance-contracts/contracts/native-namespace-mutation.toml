@@ -11,11 +11,14 @@
 # native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable
 # under process.native.arm-admission; the full VM-free native suite passes.
 # No additional signed, Docker or runtime-ratio evidence is claimed here.
+# #231: round 3 serves chmod and chown (fchmod, fchown, fchmodat,
+# fchmodat2, fchownat, and x86's legacy chmod/chown/lchown) through the same
+# venue and cores; see docs/conformance-contracts/native-namespace-mutation.md.
 schema_version = 1
 id = "kernel.native.namespace-mutation"
 title = "Native descendants retain ownership of host namespace mutations"
-guest_surfaces = ["syscall:mkdirat", "syscall:unlinkat", "syscall:renameat", "syscall:renameat2", "syscall:symlinkat", "syscall:linkat", "syscall:utimensat", "syscall:truncate", "syscall:ftruncate", "syscall:readlinkat", "syscall:fchmodat"]
-semantic_authority = ["man 2 mkdirat", "man 2 unlinkat", "man 2 renameat", "man 2 renameat2", "man 2 symlinkat", "man 2 linkat", "man 2 utimensat", "man 2 truncate", "man 2 readlinkat", "man 2 fchmodat"]
+guest_surfaces = ["syscall:mkdirat", "syscall:unlinkat", "syscall:renameat", "syscall:renameat2", "syscall:symlinkat", "syscall:linkat", "syscall:utimensat", "syscall:truncate", "syscall:ftruncate", "syscall:readlinkat", "syscall:fchmodat", "syscall:fchmodat2", "syscall:fchmod", "syscall:fchownat", "syscall:fchown"]
+semantic_authority = ["man 2 mkdirat", "man 2 unlinkat", "man 2 renameat", "man 2 renameat2", "man 2 symlinkat", "man 2 linkat", "man 2 utimensat", "man 2 truncate", "man 2 readlinkat", "man 2 fchmodat", "man 2 chmod", "man 2 chown"]
 fixture = "unit:native_namespace_mutation_baseline_two_live_children"
 scale_points = [1, 2]
 structural_budgets = []
@@ -37,6 +40,13 @@ The existing host-relative-dirfd boundary, watched/synthetic refusals and
 root timestamp best-effort behavior are preserved. Readlink and fchmodat
 are not added by this round. Staging copy budgets bind under
 kernel.native.host-file-venue; signed service settlement remains unproved.
+Round 3 (#231) adds chmod and chown: fchmod/fchown of a ring file follow the
+descriptor for every task, path fchmodat/fchmodat2/fchownat are the
+descendant's, and x86 legacy chmod/chown/lchown normalize to the *at forms.
+The records carry the caller's access context, whose credentials decide
+EPERM. Witnesses compare against the native oracle on x86 KVM and Linux's
+documented answers on ARM, red first. A run root's EPERM after its ring
+setresuid stays with #1861 (root credentials are its host task's).
 """
 
 [bindings]
@@ -52,10 +62,16 @@ vm_free = [
   "carrick-kernel::dispatch::native_files::tests::native_child_truncate_dispatch_preserves_resize_access_and_errno_matrix",
   "carrick-kernel::dispatch::native_files::tests::native_child_rename_dispatch_preserves_moves_noreplace_and_errno_matrix",
   "carrick-kernel::dispatch::native_files::tests::native_child_rename_refuses_directory_and_memory_name_publication_before_effects",
+  "carrick-kernel::dispatch::native_files::tests::native_child_chmod_chown_dispatch_with_the_callers_credentials (root gives away, an unprivileged caller gets EPERM, -1 always allowed)",
+  "carrick-el1-linux::aarch64_process_tests::arm_fork_child_chmod_chown_on_ring_files (production ARM dispatch; red: every call -38)",
+  "carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_chmod_chown_on_ring_files_matches_native",
+  "carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_chmod_chown_on_ring_files_matches_native",
+  "carrick-personality-linux::native_host_file::tests::chmod_and_chown_stage_their_records_with_the_callers_authority",
+  "carrick-personality-linux::native_host_file::tests::chmod_and_chown_answer_linux_errors_in_ring",
 ]
 
 [bindings.unresolved]
-semantics = "The old no-IPC fixture remains a refusal census. New public-venue bindings prove each round-2 family's production core after compiled red-first failures. Whole service-notice cancellation/replay settlement, readlink, fchmodat, directory/memory rename publication and finite-limit SIGXFSZ/EFBIG semantics remain open."
+semantics = "The old no-IPC fixture remains a refusal census. New public-venue bindings prove each round-2 family's production core after compiled red-first failures. Whole service-notice cancellation/replay settlement, readlink, directory/memory rename publication and finite-limit SIGXFSZ/EFBIG semantics remain open."
 exec_successor = "The successful exec binding uses the shared VM-free x86 process owner and production dispatcher with an ARM syscall frame; real ELF execution and ARM hardware MM installation remain signed evidence."
 embed = "Director Mac reference: fork-child mkdirat, unlinkat, renameat, symlinkat, readlinkat and fchmodat return ENOSYS; statx, getdents64, openat O_CREAT and write work. This worker has not repeated the signed observation."
 embed_structural = "No registered signed WorkObservation binding measures namespace mutation work yet. The VM-free refusal census is a defect baseline, not signed structural evidence; exact-artifact signed population and venue attribution remain director-owned."

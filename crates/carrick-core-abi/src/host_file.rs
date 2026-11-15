@@ -90,6 +90,20 @@ pub enum HostFileOp {
     Fchdir = 22,
     /// Read the staged link path into the bounded output, without a NUL.
     Readlinkat = 23,
+    /// `fchmod` of a host-backed descriptor (`args[0]` mode). The input is
+    /// the caller's [`AccessContext`] alone: only the file's owner (or a
+    /// privileged caller) may change its mode.
+    Fchmod = 24,
+    /// `fchown` of a host-backed descriptor (`args[0]` owner, `args[1]`
+    /// group, each `u32::MAX` for unchanged). The input is the caller's
+    /// [`AccessContext`] alone, whose credentials decide EPERM.
+    Fchown = 25,
+    /// `fchmodat`/`fchmodat2` of the staged path (`args[0]` mode; `flags`
+    /// may carry `AT_SYMLINK_NOFOLLOW`, from `fchmodat2` only).
+    Fchmodat = 26,
+    /// `fchownat` of the staged path (`args[0]` owner, `args[1]` group as
+    /// for [`HostFileOp::Fchown`]; `flags` may carry `AT_SYMLINK_NOFOLLOW`).
+    Fchownat = 27,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -218,14 +232,20 @@ impl HostFileOp {
             21 => Self::Renameat,
             22 => Self::Fchdir,
             23 => Self::Readlinkat,
+            24 => Self::Fchmod,
+            25 => Self::Fchown,
+            26 => Self::Fchmodat,
+            27 => Self::Fchownat,
             _ => return None,
         })
     }
 
-    /// Whether the operation resolves a path, or checks the caller's access
-    /// to a directory ([`HostFileOp::Fchdir`]). Its input then leads with
-    /// the caller's [`AccessContext`] (credentials, umask, cwd, root),
-    /// followed by the path, if any.
+    /// Whether the operation resolves a path, or acts on a descriptor with
+    /// the caller's own authority: [`HostFileOp::Fchdir`] checks its access
+    /// to a directory, [`HostFileOp::Fchmod`] and [`HostFileOp::Fchown`]
+    /// its ownership and privilege. Its input then leads with the caller's
+    /// [`AccessContext`] (credentials, umask, cwd, root), followed by the
+    /// path, if any.
     pub const fn resolves_path(self) -> bool {
         matches!(
             self,
@@ -242,6 +262,10 @@ impl HostFileOp {
                 | Self::Renameat
                 | Self::Fchdir
                 | Self::Readlinkat
+                | Self::Fchmod
+                | Self::Fchown
+                | Self::Fchmodat
+                | Self::Fchownat
         )
     }
 }

@@ -116,6 +116,36 @@ pub fn normalize_access(args: [u64; 6]) -> (crate::CanonicalNr, [u64; 6]) {
     )
 }
 
+/// Normalize the legacy x86 path `chmod` (90), `chown` (92) and `lchown`
+/// (94) to the asm-generic `fchmodat`/`fchownat` of `AT_FDCWD`; `lchown` is
+/// `fchownat` with `AT_SYMLINK_NOFOLLOW` (chown(2)). `None` for every other
+/// number. Both ring admission and host dispatch consume this exact operand
+/// shape.
+pub fn normalize_legacy_attr(
+    native: u64,
+    args: [u64; 6],
+) -> Option<(crate::CanonicalNr, [u64; 6])> {
+    const FCHMODAT: crate::CanonicalNr = crate::CanonicalNr(53);
+    const FCHOWNAT: crate::CanonicalNr = crate::CanonicalNr(54);
+    let at = crate::LINUX_AT_FDCWD;
+    Some(match native {
+        90 => (FCHMODAT, [at, args[0], args[1], 0, 0, 0]),
+        92 => (FCHOWNAT, [at, args[0], args[1], args[2], 0, 0]),
+        94 => (
+            FCHOWNAT,
+            [
+                at,
+                args[0],
+                args[1],
+                args[2],
+                crate::LINUX_AT_SYMLINK_NOFOLLOW,
+                0,
+            ],
+        ),
+        _ => return None,
+    })
+}
+
 /// The full x86_64 syscall table — the WHOLE x86_64 Linux ABI (numbers 0..454).
 ///
 /// Sources for x86_64 numbers (cited per-entry in inline comments):
@@ -337,14 +367,16 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=88 symlink: LEGACY (asm-generic has symlinkat=36) → LEFT OUT.
     // x86_64=89 readlink: LEGACY (asm-generic has readlinkat=78) → normalized
     // in x8664_arch::normalize_syscall as readlinkat(AT_FDCWD, path, buf, size).
-    // x86_64=90 chmod: LEGACY (asm-generic has fchmodat=53) → LEFT OUT.
+    // x86_64=90 chmod: LEGACY (asm-generic has fchmodat=53). Normalized in
+    // normalize_legacy_attr by both ring entry and x8664_arch::normalize_syscall.
     // x86_64=91 fchmod → canonical fchmod=52 (SAME name+shape)
     direct(91, "fchmod", 52),
-    // x86_64=92 chown: LEGACY (asm-generic has fchownat=54) → LEFT OUT.
+    // x86_64=92 chown: LEGACY (asm-generic has fchownat=54). Normalized in
+    // normalize_legacy_attr.
     // x86_64=93 fchown → canonical fchown=55 (SAME name+shape)
     direct(93, "fchown", 55),
-    // x86_64=94 lchown: LEGACY (asm-generic has fchownat=54 w/ AT_SYMLINK_NOFOLLOW)
-    // → LEFT OUT. (see deferred block)
+    // x86_64=94 lchown: LEGACY (asm-generic has fchownat=54 w/ AT_SYMLINK_NOFOLLOW).
+    // Normalized in normalize_legacy_attr.
     // x86_64=95 umask → canonical umask=166 (SAME name+shape)
     direct(95, "umask", 166),
     // x86_64=96 gettimeofday → canonical gettimeofday=169 (SAME name+shape)
@@ -896,9 +928,6 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     //   86  link        → linkat(37):     prepend AT_FDCWD to both; flags=0
     //   87  unlink      → unlinkat(35):   prepend AT_FDCWD; flags=0
     //   88  symlink     → symlinkat(36):  insert AT_FDCWD before newpath
-    //   90  chmod       → fchmodat(53):   prepend AT_FDCWD; append flags=0
-    //   92  chown       → fchownat(54):   prepend AT_FDCWD; append flags=0
-    //   94  lchown      → fchownat(54):   prepend AT_FDCWD; flags=AT_SYMLINK_NOFOLLOW
     //   132 utime       → utimensat(88):  utimbuf→timespec[2]; prepend AT_FDCWD
     //   133 mknod       → mknodat(33):    prepend AT_FDCWD
     //   201 time        → (no successor):  asm-generic libc uses clock_gettime/gettimeofday
@@ -916,7 +945,9 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // epoll_pwait(…, NULL, 0); 213 epoll_create → epoll_create1(0); 253
     // inotify_init → inotify_init1(0); 282 signalfd → signalfd4(…, 0); 284
     // eventfd → eventfd2(…, 0). (Each was an ENOSYS that TBROK'd a whole test
-    // family at setup.)
+    // family at setup.) normalize_legacy_attr (ring entry and normalize_syscall):
+    // 90 chmod → fchmodat(AT_FDCWD, …); 92 chown → fchownat(AT_FDCWD, …, 0); 94
+    // lchown → fchownat(AT_FDCWD, …, AT_SYMLINK_NOFOLLOW).
     // Also LEFT OUT (no asm-generic equivalent AT ALL → honest -ENOSYS, NOT a
     // shim candidate): 134 uselib, 136 ustat,
     // 139 sysfs, 154 modify_ldt, 156 _sysctl, 172 iopl, 173 ioperm,

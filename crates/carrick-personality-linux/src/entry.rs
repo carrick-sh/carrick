@@ -16,7 +16,12 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
     if native == 56 {
         args.swap(3, 4);
     }
-    let canonical = if native == 21 {
+    let legacy_attr = carrick_syscall_abi::syscall_x86_64::normalize_legacy_attr(native, args);
+    let canonical = if let Some((canonical, normalized)) = legacy_attr {
+        // Legacy chmod/chown/lchown are fchmodat/fchownat of AT_FDCWD.
+        args = normalized;
+        canonical.raw()
+    } else if native == 21 {
         // Legacy access has no asm-generic ordinal or matching argument shape.
         let (canonical, normalized) = carrick_syscall_abi::syscall_x86_64::normalize_access(args);
         args = normalized;
@@ -163,6 +168,34 @@ mod decode_tests {
         assert_eq!(call.canonical, crate::crossing::nr::FACCESSAT);
         assert_eq!(call.args, [(-100_i64) as u64, 0x1234, 4, 0, 0, 0]);
         assert_eq!(call.native.raw(), 21);
+    }
+
+    #[test]
+    fn x86_legacy_chmod_chown_lchown_normalize_to_their_at_forms() {
+        let at = (-100_i64) as u64;
+        let nofollow = carrick_syscall_abi::LINUX_AT_SYMLINK_NOFOLLOW;
+        for (native, canonical, args) in [
+            (
+                90,
+                crate::crossing::nr::FCHMODAT,
+                [at, 0x1234, 0o755, 0, 0, 0],
+            ),
+            (
+                92,
+                crate::crossing::nr::FCHOWNAT,
+                [at, 0x1234, 0o755, 7, 0, 0],
+            ),
+            (
+                94,
+                crate::crossing::nr::FCHOWNAT,
+                [at, 0x1234, 0o755, 7, nofollow, 0],
+            ),
+        ] {
+            let call = decode_x86_64(native, [0x1234, 0o755, 7, 92, 93, 94], 0x8000);
+            assert_eq!(call.canonical.raw(), canonical.raw(), "x86 {native}");
+            assert_eq!(call.args, args, "x86 {native}");
+            assert_eq!(call.native.raw(), native);
+        }
     }
 
     #[test]
