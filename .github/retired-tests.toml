@@ -59,3 +59,9 @@ test = "carrick_el1_linux::aarch64_process_tests::arm_raw_exit_decline_after_mem
 reason = "#2359: a refused clear-tid copy-out on raw exit is now \"not now\" (the exit restores membership and reruns in ring through the owner-input wait) instead of declining to HostCustody, so the decline witness was renamed for the refused-copy contract it now asserts (8787221ef)."
 replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_raw_exit_refused_copy_after_membership_reservation_restores_live"
 pr = 2367
+
+[[retired]]
+test = "carrick_el1_linux::aarch64_process_tests::arm_two_live_threads_robust_exit_routes_host_custody_without_abort"
+reason = "#2109: a registered robust list is no longer a reason for a non-last thread's raw exit to leave the ring (no lane walks the list, and a ring-born thread has no host task to take the exit), so the host-custody witness became a witness that the exit retires in ring."
+replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_two_live_threads_robust_exit_retires_in_ring"
+pr = 2182
