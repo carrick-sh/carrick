@@ -202,3 +202,10 @@ main time was 198.943 ms; candidate time was 5.032 ms; median paired
 candidate/main ratio was 0.02453. Concurrent build/test load was present,
 so this **suggests** roughly 41x faster execution for this narrow fixture.
 It is not a Docker/native, quiet-host or ecosystem throughput verdict.
+
+The broader `test-touched` gate also caught the newer v3 fixture bypassing the
+host-write protocol: nine instruction-family tests reused stale bytes after
+raw fixture copies. That fixture now calls `write_host_bytes`; all fourteen
+v3 tests pass. The retained futex replay receipt also required three explicit
+zero-valued soft-CPU metrics to preserve its exact work-snapshot comparison.
+Its schedule, result and every existing counter remain unchanged.

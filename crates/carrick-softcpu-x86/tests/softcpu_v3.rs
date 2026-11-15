@@ -49,14 +49,12 @@ impl Memory {
     }
     fn write(&mut self, offset: usize, data: &[u8]) {
         assert!(offset + data.len() <= 4096);
-        // SAFETY: destination is the mapped data page, disjoint from page tables.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                (self.placement.base_host_addr() + 0x4000 + offset) as *mut u8,
-                data.len(),
-            );
-        }
+        self.write_host_bytes(
+            FrameGpa::new(0x4000 + offset as u64),
+            OwnerGeneration::FIRST,
+            data,
+        )
+        .unwrap();
     }
 }
 // SAFETY: owned initialized aligned storage remains alive and stationary;
