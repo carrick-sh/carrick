@@ -1,5 +1,42 @@
 # Native namespace mutations (#1335, #1933)
 
+## Round 3: chmod and chown (#231)
+
+apt warned `chown ... (38)` and `chmod 0755 ... (38)`. Linux authority:
+chmod(2) and chown(2). Four wire operations (24-27) extend the record:
+`Fchmod` and `Fchown` of a host-backed descriptor, `Fchmodat` and
+`Fchownat` of a staged path. All four lead their input with the caller's
+access context: only the owner or a privileged caller may change a mode,
+and only a privileged caller may give a file away, so the credentials that
+decide EPERM are the caller's own (its ring task row), never the carrier's.
+
+- `fchmod`/`fchown` follow the descriptor, as `ftruncate` does: a ring
+  file's call is staged for the run root too (a delegated stdio stream keeps
+  its host route). The ring answers EBADF for a closed descriptor and for an
+  O_PATH one; an in-zone object keeps its route.
+- `fchmodat`/`fchmodat2`/`fchownat` are the descendant's mutation venue; the
+  run root keeps its host-task route. `fchmodat` ignores its fourth register
+  as Linux does; `fchmodat2` and `fchownat` refuse unknown flags with EINVAL.
+  `fchownat(fd, "", AT_EMPTY_PATH)` is the descriptor's own chown.
+- x86 legacy `chmod` (90), `chown` (92) and `lchown` (94) normalize to the
+  `*at` forms in one place (`normalize_legacy_attr`), used by the ring entry,
+  the HAL host route and the root's forward classifier. The crossing
+  allowlist is unchanged: they cross as the existing `fchmodat`/`fchownat`.
+- The carrier serves them through the host task's own cores, moved out of
+  the syscall wrappers (`chmod_description`, `chown_description`,
+  `chmod_path`, `chown_path`). Watched and synthetic paths refuse before
+  effects, as round 2's mutations do.
+
+Witnesses, red first on #2401's head: `native_file_attr.S` (20 steps)
+against the native oracle on the production x86 KVM path, root and fork
+child; `arm_fork_child_chmod_chown_on_ring_files` on the production ARM
+dispatch; a carrier matrix with root and unprivileged callers.
+
+Boundary: a run root's filesystem calls are served under its host task's
+credentials, which its ring `setresuid` does not reach, so the root's EPERM
+after dropping privilege is not compared (#1861 owns root resource authority
+transfer). Record locks and `flock` on ring files are a separate mechanism.
+
 ## Round 2: shared mutation cores
 
 Native descendants now stage mkdirat, unlinkat/rmdir, symlinkat, linkat,
@@ -48,7 +85,7 @@ refused rather than approximating per-task SIGXFSZ/EFBIG. Memory path truncate
 retains EROFS; descriptor resize retains access, seals and sparse-data behavior.
 Rootfs timestamp failures deliberately retain the root wrapper's best-effort
 success (mount failures still propagate); this inherited Linux divergence needs
-separate follow-up. Readlink belongs to #1900; fchmodat is not served by this round.
+separate follow-up. Readlink belongs to #1900; fchmodat is served by round 3.
 CPL0's existing staging-Fault refusal rather than supply/retry is also unchanged.
 
 The director still owns signed artifact identity, Mac execution, full mutation

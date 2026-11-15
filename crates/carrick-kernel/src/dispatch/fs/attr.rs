@@ -137,27 +137,50 @@ impl<'a> FsView<'a> {
         }
     }
 
-    /// the two callers, so it stays in the syscall wrappers.
-    fn chmod_at(
+    /// `chmod` of a path: the `fchmodat`/`fchmodat2` body, shared by the
+    /// syscalls (`context` is the caller's) and a ring task's staged
+    /// [`carrick_core_abi::host_file::HostFileOp::Fchmodat`] (`None`: the
+    /// carrier's native scope supplies the caller's credentials, and a path
+    /// that needs a task's notification or synthetic view is ENOSYS, which
+    /// the venue refuses). `nofollow` is `fchmodat2`'s validated
+    /// `AT_SYMLINK_NOFOLLOW`.
+    pub(in crate::dispatch) fn chmod_path(
         &self,
-        context: &crate::kernel::KernelContext,
+        context: Option<&crate::kernel::KernelContext>,
         dirfd: u64,
-        pathname: u64,
+        path: &str,
         mode: u64,
-        memory: &impl CurrentMmMemory,
+        nofollow: bool,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let path = read_guest_c_string(memory, pathname)?;
         if path.is_empty() {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
-        let resolved = self.resolve_at_path(dirfd, &path)?;
+        let resolved = self.resolve_at_path(dirfd, path)?;
+        // Linux cannot change a SYMLINK's mode — no filesystem it ships
+        // implements it — so `fchmodat2(..., AT_SYMLINK_NOFOLLOW)` on a
+        // symlink is EOPNOTSUPP. On anything else the flag is a no-op,
+        // because there is no link to avoid following. Treating the flag
+        // as purely advisory instead silently chmod'd the link's TARGET,
+        // which is the one thing the caller asked not to happen (Go's
+        // `TestFchmodat`, measured against the Docker oracle:
+        // `fchmodat2(symlink, AT_SYMLINK_NOFOLLOW)` = -1/EOPNOTSUPP there
+        // and 0 here).
+        if nofollow
+            && self
+                .layered_lstat(&resolved)
+                .is_ok_and(|md| md.kind == RootFsEntryKind::Symlink)
+        {
+            return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        }
         // chmod(2) FOLLOWS a final symlink — it changes the TARGET's mode, not
         // the link's (test_posix.test_chmod_dir_symlink). resolve_at_path stops
-        // at the link itself, so dereference it here. (fchmodat2's advisory
-        // AT_SYMLINK_NOFOLLOW stays unmodeled on the disk-authoritative backend;
-        // a dangling/failed follow falls back to the link path unchanged.)
+        // at the link itself, so dereference it here. A dangling/failed follow
+        // falls back to the link path unchanged.
         let resolved = self.canonicalize_following(&resolved).unwrap_or(resolved);
-        if self.is_synthetic_virtual_path(context, &resolved)? {
+        if self.mutation_path_needs_task(context, &resolved) {
+            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+        }
+        if self.is_task_synthetic_path(context, &resolved)? {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if let Err(errno) = self.layered_metadata(&resolved) {
@@ -170,8 +193,7 @@ impl<'a> FsView<'a> {
         if let Some(m) = self.fs.vfs_mounts.resolve(&resolved) {
             return match m.vfs.chmod(&m.full_path, mode) {
                 Ok(()) => {
-                    self.inotify_attrib(&resolved);
-                    self.dnotify_attrib(context, &resolved);
+                    self.notify_attrib(context, None, &resolved);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -179,11 +201,25 @@ impl<'a> FsView<'a> {
         }
         match self.fs.rootfs_vfs.set_mode(&resolved, mode) {
             Ok(()) | Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {
-                self.inotify_attrib(&resolved);
-                self.dnotify_attrib(context, &resolved);
+                self.notify_attrib(context, None, &resolved);
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             Err(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+        }
+    }
+
+    /// inotify and dnotify `IN_ATTRIB` for a metadata change of `path`. A
+    /// carrier-served change (`context` `None`) reaches here only for a path
+    /// no watch covers ([`Self::mutation_path_needs_task`]).
+    fn notify_attrib(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        target_tid: Option<crate::thread::ThreadId>,
+        path: &str,
+    ) {
+        self.inotify_attrib(path);
+        if let Some(context) = context {
+            self.dnotify_attrib_for_tid(context, path, target_tid);
         }
     }
 
@@ -213,6 +249,14 @@ impl<'a> FsView<'a> {
             return mode & !S_ISGID;
         }
         mode
+    }
+
+    /// `chown`'s owner and group arguments, each `None` for -1 (unchanged).
+    pub(in crate::dispatch) fn chown_id_args(
+        owner: u64,
+        group: u64,
+    ) -> (Option<carrick_abi::NsUid>, Option<carrick_abi::NsGid>) {
+        (Self::chown_uid_arg(owner), Self::chown_gid_arg(group))
     }
 
     fn chown_uid_arg(arg: u64) -> Option<carrick_abi::NsUid> {
@@ -308,25 +352,43 @@ impl<'a> FsView<'a> {
         uid: Option<carrick_abi::NsUid>,
         gid: Option<carrick_abi::NsGid>,
     ) -> DispatchOutcome {
-        let (path, raw_host_fd) = self
-            .open_file(fd)
-            .and_then(|of| {
-                match crate::kernel::FileDescription::inspect(&of.description).as_deref() {
-                    Some(OpenDescription::HostFile {
-                        metadata, host_fd, ..
-                    }) => Some((
-                        Some(metadata.path.to_string_lossy().into_owned()),
-                        Some(host_fd.raw()),
-                    )),
-                    Some(
-                        OpenDescription::File { metadata, .. }
-                        | OpenDescription::Directory { metadata, .. },
-                    ) => Some((Some(metadata.path.to_string_lossy().into_owned()), None)),
-                    _ => None,
-                }
-            })
-            .unwrap_or((None, None));
+        match self.open_file(fd) {
+            Some(of) => self.chown_description(Some(context), &of.description, uid, gid),
+            None => DispatchOutcome::Returned { value: 0 },
+        }
+    }
+
+    /// `chown` of an open description: the `fchown` body, shared by the
+    /// syscalls and a ring task's staged
+    /// [`carrick_core_abi::host_file::HostFileOp::Fchown`] (`context` as
+    /// [`Self::chmod_path`]'s). A description with no file behind it (a
+    /// pipe, socket or stdio stream) accepts the call as Linux's in-memory
+    /// inodes do.
+    pub(in crate::dispatch) fn chown_description(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        description: &Arc<crate::kernel::FileDescription>,
+        uid: Option<carrick_abi::NsUid>,
+        gid: Option<carrick_abi::NsGid>,
+    ) -> DispatchOutcome {
+        let (path, raw_host_fd) =
+            match crate::kernel::FileDescription::inspect(description).as_deref() {
+                Some(OpenDescription::HostFile {
+                    metadata, host_fd, ..
+                }) => (
+                    Some(metadata.path.to_string_lossy().into_owned()),
+                    Some(host_fd.raw()),
+                ),
+                Some(
+                    OpenDescription::File { metadata, .. }
+                    | OpenDescription::Directory { metadata, .. },
+                ) => (Some(metadata.path.to_string_lossy().into_owned()), None),
+                _ => (None, None),
+            };
         if let Some(path) = path {
+            if self.mutation_path_needs_task(context, &path) {
+                return DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS);
+            }
             if let Some(errno) = self.chown_permission_errno(uid, gid) {
                 return DispatchOutcome::errno(errno);
             }
@@ -338,12 +400,159 @@ impl<'a> FsView<'a> {
                 let _ = self.fs.rootfs_vfs.set_owner(&path, uid, gid);
             }
             self.clear_setid_on_chown(&path);
-            self.dnotify_attrib(context, &path);
+            if let Some(context) = context {
+                self.dnotify_attrib(context, &path);
+            }
         }
         if let Some(raw_fd) = raw_host_fd {
             self.fs.rootfs_vfs.fset_owner(raw_fd, uid, gid);
         }
         DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// `chmod` of an open description: the `fchmod` body, shared by the
+    /// syscall and a ring task's staged
+    /// [`carrick_core_abi::host_file::HostFileOp::Fchmod`] (`context` as
+    /// [`Self::chmod_path`]'s; `target_tid` is the dnotify signal target).
+    /// The caller has refused an O_PATH description. A description with no
+    /// file behind it accepts the call.
+    pub(in crate::dispatch) fn chmod_description(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        target_tid: Option<crate::thread::ThreadId>,
+        description: &Arc<crate::kernel::FileDescription>,
+        mode: u64,
+    ) -> DispatchOutcome {
+        let mode = (mode & 0o7777) as u32;
+        // Resolve the description to its path and route through the
+        // backend's set_mode, so the guest-visible mode lands in the carrick
+        // mode xattr (what fstat reports) — not just the real fd's mode,
+        // which could be the forced-owner-accessible value. Previously this
+        // called libc::fchmod directly, so fstat kept reporting the stale
+        // creation-time mode.
+        let path = match crate::kernel::FileDescription::inspect(description).as_deref() {
+            Some(
+                OpenDescription::HostFile { metadata, .. }
+                | OpenDescription::File { metadata, .. }
+                | OpenDescription::Directory { metadata, .. },
+            ) => metadata.path.to_string_lossy().into_owned(),
+            _ => return DispatchOutcome::Returned { value: 0 },
+        };
+        if self.mutation_path_needs_task(context, &path) {
+            return DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS);
+        }
+        if let Some(errno) = self.chmod_permission_errno(&path) {
+            return DispatchOutcome::errno(errno);
+        }
+        let mode = self.maybe_clear_setgid(&path, mode);
+        if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
+            if let Err(errno) = m.vfs.chmod(&m.full_path, mode) {
+                return DispatchOutcome::errno(errno);
+            }
+        } else {
+            let _ = self.fs.rootfs_vfs.set_mode(&path, mode);
+        }
+        // Refresh THIS description's cached metadata so a subsequent fstat
+        // on it sees the new mode. A Directory/File fstat reads the cached
+        // metadata (only HostFile re-reads the live xattr), so without this
+        // an fchmod(dirfd)+fstat(dirfd) reported the stale open-time mode
+        // (LTP fchmod04/05). metadata.mode holds the permission bits; the
+        // type comes from `kind`.
+        if let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) {
+            match &mut *open {
+                OpenDescription::Directory { metadata, .. } => {
+                    metadata.mode = mode;
+                }
+                OpenDescription::File { metadata, base, .. } => {
+                    metadata.mode = mode;
+                    base.update_exec_source_mode(mode);
+                }
+                OpenDescription::HostFile {
+                    host_fd, metadata, ..
+                } => {
+                    metadata.mode = mode;
+                    self.fs.rootfs_vfs.fset_mode(host_fd.raw(), mode);
+                }
+                _ => {}
+            }
+        }
+        // IN_ATTRIB: chmod is a metadata change.
+        self.notify_attrib(context, target_tid, &path);
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// `chown` of a path: the `fchownat` body for a non-empty path, shared
+    /// by the syscall and a ring task's staged
+    /// [`carrick_core_abi::host_file::HostFileOp::Fchownat`] (`context` as
+    /// [`Self::chmod_path`]'s).
+    pub(in crate::dispatch) fn chown_path(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        dirfd: u64,
+        path: &str,
+        uid: Option<carrick_abi::NsUid>,
+        gid: Option<carrick_abi::NsGid>,
+        nofollow: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if path.is_empty() {
+            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+        }
+        let resolved = self.resolve_at_path(dirfd, path)?;
+        if self.mutation_path_needs_task(context, &resolved) {
+            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+        }
+        if let Some(m) = self.fs.vfs_mounts.resolve(&resolved) {
+            let lookup = if nofollow {
+                m.vfs.lookup_nofollow(&m.full_path)
+            } else {
+                m.vfs.lookup(&m.full_path)
+            };
+            if let Err(errno) = lookup {
+                return Ok(DispatchOutcome::errno(errno));
+            }
+            if let Some(errno) = self.chown_permission_errno(uid, gid) {
+                return Ok(DispatchOutcome::errno(errno));
+            }
+            return match m.vfs.chown(&m.full_path, uid, gid, nofollow) {
+                Ok(()) => {
+                    self.clear_setid_on_chown(&resolved);
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            };
+        }
+        // Layered presence check: overlay first (tombstones become ENOENT),
+        // synthetic /proc and /sys are no-op success, rootfs is no-op
+        // success (tmpfs semantics). Record the guest-visible owner on the
+        // backend (durably, via xattr on --fs host) so a later stat reports it.
+        let lookup = if nofollow {
+            self.layered_lstat(&resolved).map(|_| ())
+        } else {
+            self.layered_metadata(&resolved).map(|_| ())
+        };
+        match lookup {
+            Ok(()) => {
+                if let Some(errno) = self.chown_permission_errno(uid, gid) {
+                    return Ok(DispatchOutcome::errno(errno));
+                }
+                let target_path = if nofollow {
+                    resolved.clone()
+                } else {
+                    self.canonicalize_following(&resolved)
+                        .unwrap_or_else(|_| resolved.clone())
+                };
+                let _ = self.fs.rootfs_vfs.set_owner(&target_path, uid, gid);
+                self.clear_setid_on_chown(&target_path);
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            Err(errno) => {
+                if self.is_task_synthetic_path(context, &resolved)? {
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                } else {
+                    Ok(DispatchOutcome::errno(errno))
+                }
+            }
+        }
     }
 
     define_syscall! {
@@ -356,63 +565,15 @@ impl<'a> FsView<'a> {
             if this.fd_is_o_path(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
-            let mode = (mode & 0o7777) as u32;
-            // Resolve the fd to its path and route through the backend's set_mode,
-            // so the guest-visible mode lands in the carrick mode xattr (what
-            // fstat reports) — not just the real fd's mode, which could be the
-            // forced-owner-accessible value. Previously this called libc::fchmod
-            // directly, so fstat kept reporting the stale creation-time mode.
-            let path = this
-                .open_file(fd.0)
-                .and_then(|of| match crate::kernel::FileDescription::inspect(&of.description).as_deref() {
-                    Some(
-                        OpenDescription::HostFile { metadata, .. }
-                        | OpenDescription::File { metadata, .. }
-                        | OpenDescription::Directory { metadata, .. },
-                    ) => Some(metadata.path.to_string_lossy().into_owned()),
-                    _ => None,
-                });
-            if let Some(path) = path {
-                if let Some(errno) = this.chmod_permission_errno(&path) {
-                    return Ok(DispatchOutcome::errno(errno));
-                }
-                let mode = this.maybe_clear_setgid(&path, mode);
-                if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
-                    if let Err(errno) = m.vfs.chmod(&m.full_path, mode) {
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                } else {
-                    let _ = this.fs.rootfs_vfs.set_mode(&path, mode);
-                }
-                // Refresh THIS fd's cached metadata so a subsequent fstat on it
-                // sees the new mode. A Directory/File fstat reads the cached
-                // metadata (only HostFile re-reads the live xattr), so without
-                // this an fchmod(dirfd)+fstat(dirfd) reported the stale
-                // open-time mode (LTP fchmod04/05). metadata.mode holds the
-                // permission bits; the type comes from `kind`.
-                if let Some(of) = this.open_file(fd.0) {
-                    if let Some(mut open) = crate::kernel::FileDescription::write_for_io(&of.description) {
-                        match &mut *open {
-                            OpenDescription::Directory { metadata, .. } => {
-                                metadata.mode = mode;
-                            }
-                            OpenDescription::File { metadata, base, .. } => {
-                                metadata.mode = mode;
-                                base.update_exec_source_mode(mode);
-                            }
-                            OpenDescription::HostFile { host_fd, metadata, .. } => {
-                                metadata.mode = mode;
-                                this.fs.rootfs_vfs.fset_mode(host_fd.raw(), mode);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                // inotify IN_ATTRIB (chmod is a metadata change).
-                this.inotify_attrib(&path);
-                this.dnotify_attrib_for_tid(cx.kernel, &path, Some(cx.tid()));
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(match this.open_file(fd.0) {
+                Some(of) => this.chmod_description(
+                    Some(cx.kernel),
+                    Some(cx.tid()),
+                    &of.description,
+                    mode,
+                ),
+                None => DispatchOutcome::Returned { value: 0 },
+            })
         }
 
         fn fchown(this, cx, fd: Fd, owner: u64, group: u64) {
@@ -454,80 +615,15 @@ impl<'a> FsView<'a> {
                 let gid = Self::chown_gid_arg(group);
                 return Ok(this.fchown_by_fd(cx.kernel, dirfd as i32, uid, gid));
             }
-            let uid = Self::chown_uid_arg(owner);
-            let gid = Self::chown_gid_arg(group);
-            let resolved = this.resolve_at_path(dirfd, &path)?;
             let nofollow = at_flags.contains(carrick_abi::LinuxAtFlags::SYMLINK_NOFOLLOW);
-            if this.fs.vfs_mounts.resolve(&resolved).is_some() {
-                let lookup = {
-                    if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
-                        if nofollow {
-                            m.vfs.lookup_nofollow(&m.full_path)
-                        } else {
-                            m.vfs.lookup(&m.full_path)
-                        }
-                    } else {
-                        Err(LINUX_ENOENT)
-                    }
-                };
-                if let Err(errno) = lookup {
-                    return Ok(DispatchOutcome::errno(errno));
-                }
-                if let Some(errno) = this.chown_permission_errno(uid, gid) {
-                    return Ok(DispatchOutcome::errno(errno));
-                }
-                let result = {
-                    if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
-                        m.vfs.chown(&m.full_path, uid, gid, nofollow)
-                    } else {
-                        Err(LINUX_ENOENT)
-                    }
-                };
-                return match result {
-                    Ok(()) => {
-                        this.clear_setid_on_chown(&resolved);
-                        Ok(DispatchOutcome::Returned { value: 0 })
-                    }
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                };
-            }
-            // Layered presence check: overlay first (tombstones become ENOENT),
-            // synthetic /proc and /sys are no-op success, rootfs is no-op
-            // success (tmpfs semantics). Record the guest-visible owner on the
-            // backend (durably, via xattr on --fs host) so a later stat reports it.
-            let lookup = if nofollow {
-                this.layered_lstat(&resolved).map(|_| ())
-            } else {
-                this.layered_metadata(&resolved).map(|_| ())
-            };
-            match lookup {
-                Ok(_) => {
-                    if let Some(errno) = this.chown_permission_errno(uid, gid) {
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                    let target_path = if nofollow {
-                        resolved.clone()
-                    } else {
-                        this.canonicalize_following(&resolved)
-                            .unwrap_or_else(|_| resolved.clone())
-                    };
-                    let _ = this.fs.rootfs_vfs.set_owner(
-                        &target_path,
-                        uid,
-                        gid,
-                    );
-                    this.clear_setid_on_chown(&target_path);
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
-                Err(errno) => {
-                    if this.is_synthetic_virtual_path(cx.kernel, &resolved)?
-                    {
-                        Ok(DispatchOutcome::Returned { value: 0 })
-                    } else {
-                        Ok(DispatchOutcome::errno(errno))
-                    }
-                }
-            }
+            this.chown_path(
+                Some(cx.kernel),
+                dirfd,
+                &path,
+                Self::chown_uid_arg(owner),
+                Self::chown_gid_arg(group),
+                nofollow,
+            )
         }
 
         fn fchmodat(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64, flags: u64) {
@@ -540,7 +636,8 @@ impl<'a> FsView<'a> {
             // ("chmod 0644 of file … failed - 201::URIDone"). Only fchmodat2 (452)
             // validates the flags.
             let _ = flags;
-            this.chmod_at(cx.kernel, dirfd, pathname.0, mode, &*cx.memory)
+            let path = read_guest_c_string(&*cx.memory, pathname.0)?;
+            this.chmod_path(Some(cx.kernel), dirfd, &path, mode, false)
         }
 
         fn fchmodat2(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64, flags: u64) {
@@ -549,28 +646,14 @@ impl<'a> FsView<'a> {
             if flags & !LINUX_AT_SYMLINK_NOFOLLOW != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
-                // Linux cannot change a SYMLINK's mode — no filesystem it ships
-                // implements it — so `fchmodat2(..., AT_SYMLINK_NOFOLLOW)` on a
-                // symlink is EOPNOTSUPP. On anything else the flag is a no-op,
-                // because there is no link to avoid following. Treating the flag
-                // as purely advisory instead silently chmod'd the link's TARGET,
-                // which is the one thing the caller asked not to happen (Go's
-                // `TestFchmodat`, measured against the Docker oracle:
-                // `fchmodat2(symlink, AT_SYMLINK_NOFOLLOW)` = -1/EOPNOTSUPP there
-                // and 0 here).
-                let path = read_guest_c_string(&*cx.memory, pathname.0)?;
-                if !path.is_empty() {
-                    let resolved = this.resolve_at_path(dirfd, &path)?;
-                    if this
-                        .layered_lstat(&resolved)
-                        .is_ok_and(|md| md.kind == RootFsEntryKind::Symlink)
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
-                    }
-                }
-            }
-            this.chmod_at(cx.kernel, dirfd, pathname.0, mode, &*cx.memory)
+            let path = read_guest_c_string(&*cx.memory, pathname.0)?;
+            this.chmod_path(
+                Some(cx.kernel),
+                dirfd,
+                &path,
+                mode,
+                flags & LINUX_AT_SYMLINK_NOFOLLOW != 0,
+            )
         }
 
         fn utimensat(this, cx, dirfd: u64, pathname: GuestPtr, times: GuestPtr, flags: u64) {
