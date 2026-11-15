@@ -1004,11 +1004,8 @@ pub fn invoke<'a>(
                 native.record_decline(LifecycleDecline::ExitScheduler);
                 return None;
             }
-            if let Some((progress, result)) = serve_exit(thread, native) {
-                Some(LifecycleOutcome::Transferred {
-                    progress,
-                    result: SyscallResult::new(result),
-                })
+            if let Some(outcome) = serve_exit(thread, native) {
+                Some(outcome)
             } else {
                 let binding = native.binding()?;
                 let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
@@ -1568,11 +1565,12 @@ fn serve_clone<'a>(
 }
 
 /// `exit(status)` of a non-leader thread that EL1 switched in, when it is
-/// not the last thread: `Some` with how the vCPU goes on.
+/// not the last thread: `Some` with how the vCPU goes on, either the exit
+/// itself or the owner's wait before it reruns.
 fn serve_exit<'a>(
     thread: LifecycleThread<'a>,
     native: &mut dyn LifecycleNative<'a>,
-) -> Option<(Served, i64)> {
+) -> Option<LifecycleOutcome> {
     let (page, slot) = (thread.page, thread.slot);
     macro_rules! decline {
         ($reason:expr) => {{
@@ -1667,9 +1665,29 @@ fn serve_exit<'a>(
     let clear_child_tid = slot.clear_child_tid();
     if clear_child_tid != 0 {
         let status = native.result();
-        let copied = native
-            .copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR)
-            .is_done();
+        let copied = match native.copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR) {
+            CopyOutcome::Done => true,
+            CopyOutcome::Fault => false,
+            CopyOutcome::NotYet(request) => {
+                // "Not now" (#2359): the word's memory owner is busy (a
+                // sibling's exit holds the MM editor) or the page is not
+                // yet backed. Nothing is committed, so restore the exit's
+                // admission and membership and keep the call: the owner
+                // makes the word writable, or parks this thread on its
+                // holder's release, and the exit reruns in ring. A clone
+                // thread has no host task to take the exit instead.
+                native.set_result(status);
+                drop(admission);
+                drop(membership);
+                return match native.wait_guest_copy(request) {
+                    // The owner found a real fault: the host lane keeps it.
+                    LifecycleOutcome::Returned { .. } => {
+                        decline!(LifecycleDecline::ExitClearTidCopyout)
+                    }
+                    waiting => Some(waiting),
+                };
+            }
+        };
         let woken =
             copied && native.wake_child_tid(EntryMmKey::from_raw(mm), UserVa::new(clear_child_tid));
         if !woken {
@@ -1700,13 +1718,14 @@ fn serve_exit<'a>(
     }
     membership.publish();
     native.thread_exited(custody.into_verdict(page));
-    if !record.unadopted {
+    let (progress, result) = if record.unadopted {
+        native.run_next(SyscallResult::new(crate::sched::ETIMEDOUT_RESULT as i64))
+    } else {
         // The retained runtime consumes this exact terminal handoff; another
         // guest task must not execute on the exiting job's host lease.
-        return Some((Served::Idle, 0));
-    }
-    Some(native.run_next(SyscallResult::new(crate::sched::ETIMEDOUT_RESULT as i64)))
-        .map(|(served, result)| (served, result.raw()))
+        (Served::Idle, SyscallResult::new(0))
+    };
+    Some(LifecycleOutcome::Transferred { progress, result })
 }
 
 #[cfg(test)]
