@@ -398,6 +398,13 @@ pub fn native_descriptor(
             )),
             IpcBacking::EventFd { .. } => NativeDescriptor::InZone(InZoneKind::EventFd),
             IpcBacking::Epoll { .. } => NativeDescriptor::InZone(InZoneKind::Epoll),
+            IpcBacking::Stream { object, end } => {
+                NativeDescriptor::InZone(InZoneKind::Stream(carrick_abi::LinuxSocketIdentity::new(
+                    object.index(),
+                    object.generation(),
+                    end == carrick_el1_abi::ipc::StreamEnd::Second,
+                )))
+            }
         }),
         Err(FdError::BadFd) => Some(NativeDescriptor::Absent),
         Err(_) => None,
@@ -833,6 +840,8 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
                 WaitFor::Writable
             }
             EpollMember::EventFd => WaitFor::Readable,
+            // Every change to a stream pair wakes both of its lanes.
+            EpollMember::StreamFirst | EpollMember::StreamSecond => WaitFor::Readable,
         };
         let mut guard = match region.lock(object, &EL1_WAIT) {
             Ok(guard) => guard,
@@ -971,6 +980,7 @@ fn op_kind(
         IpcBacking::Pipe { object, .. } => Some((IpcOpKind::PipeWrite, object)),
         IpcBacking::EventFd { object } if reading => Some((IpcOpKind::EventFdRead, object)),
         IpcBacking::EventFd { object } => Some((IpcOpKind::EventFdWrite, object)),
+        IpcBacking::Stream { object, end } => Some((IpcOpKind::stream(end, reading), object)),
         IpcBacking::Host(_) | IpcBacking::Epoll { .. } => None,
     }
 }
@@ -1100,7 +1110,7 @@ fn admit<E: IpcExecution, M: UserCopy>(
         AccessMode::Path => false,
     };
     let vectored = matches!(ordinal(frame), linux::SYS_READV | linux::SYS_WRITEV);
-    if vectored && !matches!(kind, IpcOpKind::PipeRead | IpcOpKind::PipeWrite) {
+    if vectored && !(kind.reads_bytes() || kind.writes_bytes()) {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Forward;
     }
@@ -1580,9 +1590,7 @@ fn run<E: IpcExecution, M: UserCopy>(
             // A reader may have committed a prefix before an owner wait.
             // If a peer drained the rest meanwhile, Linux returns that prefix
             // rather than parking again (and EOF must preserve it too).
-            StepStatus::Blocked(_) if op.kind == IpcOpKind::PipeRead && written > 0 => {
-                written as i64
-            }
+            StepStatus::Blocked(_) if op.kind.reads_bytes() && written > 0 => written as i64,
             StepStatus::Blocked(_) if nonblock => {
                 if written > 0 {
                     written as i64
@@ -1702,7 +1710,7 @@ fn run<E: IpcExecution, M: UserCopy>(
             // Only a delivered prefix can complete short. A resumed read
             // with no progress still owns its byte and description; a copy
             // refusal must be resolved by that continuation, never as EOF.
-            StepStatus::Fault if op.kind == IpcOpKind::PipeRead && written > 0 => written as i64,
+            StepStatus::Fault if op.kind.reads_bytes() && written > 0 => written as i64,
             StepStatus::Fault => {
                 return (
                     match bail(
