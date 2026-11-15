@@ -125,3 +125,24 @@ Linux 6.12.115 syscall check also accepts NULL, but is not the ARM oracle.
 The `at_empty_path_{arm,x86}_null_{pipe,bad_fd}` witnesses require the
 production dispatcher to skip the NULL guest-memory read and return either
 FIFO metadata or EBADF(9). NULL without `AT_EMPTY_PATH` remains unchanged.
+
+## Close-on-exec ioctl on every ring description (#231)
+
+ioctl(2) lists `FIOCLEX` and `FIONCLEX` as requests on the descriptor
+itself, served for any open file; an `O_PATH` descriptor admits no ioctl
+and is refused with EBADF(9). The flag belongs to the ring's descriptor
+table, so the same owner serves it for a pipe and for a ring description
+that names a host file (one the carrier opened for a staged `openat`).
+Before this change only pipes were admitted to the descriptor family; a
+host-file description fell to the host crossing, whose operand resolver
+answers a ring descriptor with a counted ENOSYS. CPython's `_Py_fopen_obj`
+issues `FIOCLEX` after every `fopen`, so `pip` failed to open its own
+script.
+
+`set_owned_cloexec` is the one writer of the flag for `F_SETFD`,
+`FIOCLEX` and `FIONCLEX`, and keeps the fd-map close-on-exec mirror. No
+host descriptor operation is added. Witnesses, red before the fix:
+`cpl0_initial_mm.rs::serial_host_{root,fork_child}_ioctl_cloexec_on_a_ring_file_matches_native`
+(x86, against the native oracle) and
+`aarch64_process_tests.rs::arm_fork_child_ioctl_cloexec_on_a_ring_file`
+(ARM production dispatch, including the `O_PATH` refusal).
