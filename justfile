@@ -160,6 +160,15 @@ ci-cache-finish:
         fi
         rm -f -- "$socket"
     fi
+    # This job's server log (compiler-cache-env.sh): into the job log, collapsed, then gone, since a
+    # persistent runner keeps $RUNNER_TEMP between jobs.
+    log="${SCCACHE_ERROR_LOG:-}"
+    if [ -n "$log" ] && [ -s "$log" ]; then
+        echo "::group::sccache server log ($(wc -l < "$log" | tr -d ' ') lines, last 500)"
+        tail -n 500 -- "$log"
+        echo "::endgroup::"
+    fi
+    if [ -n "$log" ]; then rm -f -- "$log"; fi
 
 # Run the Carrick xtask maintenance tool.
 [positional-arguments]
