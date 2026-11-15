@@ -7195,7 +7195,12 @@ mod tests {
         let predecessor = running.binding;
         let old_token = predecessor.token();
         let prepared = kernel
-            .prepare_exec_with_registry_id(&first, ThreadId::synthetic_for_tests(21_074), None)
+            .prepare_exec_with_registry_id(
+                &first,
+                ThreadId::synthetic_for_tests(21_074),
+                kernel.issue_exec_mm().unwrap(),
+                None,
+            )
             .unwrap();
         let old_lease = running.take_lease();
         first.thread().exit_from_executor(old_lease).unwrap();
@@ -7254,7 +7259,12 @@ mod tests {
         scheduler.make_runnable(first.thread().key()).unwrap();
         let mut running = scheduler.take(&registration).unwrap();
         let prepared = kernel
-            .prepare_exec_with_registry_id(&first, ThreadId::synthetic_for_tests(31_075), None)
+            .prepare_exec_with_registry_id(
+                &first,
+                ThreadId::synthetic_for_tests(31_075),
+                kernel.issue_exec_mm().unwrap(),
+                None,
+            )
             .unwrap();
         let old_lease = running.take_lease();
         first.thread().exit_from_executor(old_lease).unwrap();
@@ -7317,7 +7327,12 @@ mod tests {
         scheduler.make_runnable(first.thread().key()).unwrap();
         let mut running = scheduler.take(&registration).unwrap();
         let prepared = kernel
-            .prepare_exec_with_registry_id(&first, ThreadId::synthetic_for_tests(21_075), None)
+            .prepare_exec_with_registry_id(
+                &first,
+                ThreadId::synthetic_for_tests(21_075),
+                kernel.issue_exec_mm().unwrap(),
+                None,
+            )
             .unwrap();
         let old_lease = running.take_lease();
         first.thread().exit_from_executor(old_lease).unwrap();
