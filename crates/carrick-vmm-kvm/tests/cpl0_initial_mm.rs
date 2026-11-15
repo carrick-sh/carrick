@@ -3984,16 +3984,32 @@ type FileMetadataReport = (i32, Vec<u8>, Vec<(usize, u64)>);
 /// CPL0 path, each against its own fresh file and lock path. Returns
 /// (native report, carrick report).
 fn file_metadata_run(flags: &[&str]) -> (FileMetadataReport, FileMetadataReport) {
-    let dir = tempfile::tempdir().expect("file metadata directory");
-    let run = |name: &str, native: bool| -> FileMetadataReport {
-        let path = dir.path().join(format!("{name}-script"));
+    ring_file_fixture_run("native_file_metadata.S", flags, |dir, name| {
+        let path = dir.join(format!("{name}-script"));
         std::fs::write(&path, b"#!/usr/local/bin/python3.12\n").expect("script file");
-        let lock = dir.path().join(format!("{name}-lock"));
-        let file = format!("-DFILE_PATH=\"{}\"", path.display());
-        let lock = format!("-DLOCK_PATH=\"{}\"", lock.display());
-        let mut all = vec![file.as_str(), lock.as_str()];
+        let lock = dir.join(format!("{name}-lock"));
+        vec![
+            format!("-DFILE_PATH=\"{}\"", path.display()),
+            format!("-DLOCK_PATH=\"{}\"", lock.display()),
+        ]
+    })
+}
+
+/// Run one mode of a ring-file fixture natively and on the production CPL0
+/// path. `defines(dir, name)` prepares that run's own files in `dir` and
+/// returns the fixture's path defines. Returns (native report, carrick
+/// report).
+fn ring_file_fixture_run(
+    fixture: &str,
+    flags: &[&str],
+    defines: impl Fn(&std::path::Path, &str) -> Vec<String>,
+) -> (FileMetadataReport, FileMetadataReport) {
+    let dir = tempfile::tempdir().expect("ring file fixture directory");
+    let run = |name: &str, native: bool| -> FileMetadataReport {
+        let defines = defines(dir.path(), name);
+        let mut all: Vec<&str> = defines.iter().map(String::as_str).collect();
         all.extend_from_slice(flags);
-        let elf = native_exit_fixture_with_flags("native_file_metadata.S", &all);
+        let elf = native_exit_fixture_with_flags(fixture, &all);
         if native {
             let oracle = dir.path().join(format!("{name}-oracle"));
             carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
@@ -4002,7 +4018,7 @@ fn file_metadata_run(flags: &[&str]) -> (FileMetadataReport, FileMetadataReport)
                 .arg(&oracle)
                 .stdin(std::process::Stdio::null())
                 .output()
-                .expect("bounded native file metadata oracle");
+                .expect("bounded native ring file oracle");
             return (out.status.code().unwrap_or(-1), out.stdout, Vec::new());
         }
         let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
@@ -4018,7 +4034,7 @@ fn file_metadata_run(flags: &[&str]) -> (FileMetadataReport, FileMetadataReport)
             |_| {},
             dispatcher,
         )
-        .expect("file metadata production runtime");
+        .expect("ring file production runtime");
         assert!(!outcome.run.trap_limit_hit, "{:?}", outcome.run);
         let counters = outcome
             .physical
@@ -4072,6 +4088,75 @@ fn serial_host_fork_child_ioctl_cloexec_on_a_ring_file_matches_native() {
         cloexec_steps(&carrick),
         cloexec_steps(&native),
         "(exit, steps 1-5 errno or F_GETFD value, ioctl refused); full census: {carrick:?}"
+    );
+}
+
+/// Run one `native_file_attr.S` mode natively and on the production CPL0
+/// path, each against its own fresh mode-0644 file.
+fn file_attr_run(flags: &[&str]) -> (FileMetadataReport, FileMetadataReport) {
+    ring_file_fixture_run("native_file_attr.S", flags, |dir, name| {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(format!("{name}-file"));
+        std::fs::write(&path, b"apt status\n").expect("attribute file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("file mode 0644");
+        vec![
+            format!("-DFILE_PATH=\"{}\"", path.display()),
+            format!(
+                "-DLINK_PATH=\"{}\"",
+                dir.join(format!("{name}-link")).display()
+            ),
+            format!(
+                "-DMISSING_PATH=\"{}\"",
+                dir.join(format!("{name}-missing")).display()
+            ),
+        ]
+    })
+}
+
+/// A `native_file_attr.S` report as (exit, every step byte, the chmod and
+/// chown family's refusal counters: x86 chmod 90, fchmod 91, chown 92,
+/// fchown 93, lchown 94, fchownat 260, fchmodat 268, fchmodat2 452).
+fn attr_steps(report: &FileMetadataReport) -> (i32, Vec<u8>, Vec<(usize, u64)>) {
+    (
+        report.0,
+        report.1.clone(),
+        report
+            .2
+            .iter()
+            .copied()
+            .filter(|(nr, _)| matches!(nr, 90..=94 | 260 | 268 | 452))
+            .collect(),
+    )
+}
+
+/// #231 parity (apt): `fchmod`/`fchown` of the run root's ring file, its
+/// path `fchmodat`/`fchownat` (and the legacy x86 `chmod`/`chown`/`lchown`),
+/// and their EBADF, ENOENT, EOPNOTSUPP and EPERM answers, against the native
+/// oracle. Red on main: the ring-file calls and the legacy numbers were
+/// counted ENOSYS.
+#[test]
+fn serial_host_root_chmod_chown_on_ring_files_matches_native() {
+    let (native, carrick) = file_attr_run(&[]);
+    assert_eq!(native.0, 0, "native oracle: {native:?}");
+    assert_eq!(
+        attr_steps(&carrick),
+        attr_steps(&native),
+        "(exit, step bytes, chmod/chown refusals); full report: {carrick:?}"
+    );
+}
+
+/// #231 parity (apt): the same calls in a fork child, whose descriptors and
+/// path calls are the ring's. apt's `chown ... (38)` and `chmod 0755 ...
+/// (38)` were this child's `fchownat`/`fchmodat`, unclaimed on main.
+#[test]
+fn serial_host_fork_child_chmod_chown_on_ring_files_matches_native() {
+    let (native, carrick) = file_attr_run(&["-DCHILD"]);
+    assert_eq!(native.0, 0, "native oracle: {native:?}");
+    assert_eq!(
+        attr_steps(&carrick),
+        attr_steps(&native),
+        "(exit, step bytes, chmod/chown refusals); full report: {carrick:?}"
     );
 }
 
