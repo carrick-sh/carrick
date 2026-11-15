@@ -417,7 +417,13 @@ const KIND_FREE: u32 = 0;
 const KIND_PIPE: u32 = 1;
 const KIND_EVENTFD: u32 = 2;
 const KIND_EPOLL: u32 = 3;
+/// A stream pair's kind word also records which end has closed: a close
+/// drops the same lane references as a full shutdown, so the references
+/// alone cannot tell whether the other end's description still lives.
+/// Every value is [`IpcObjectKind::Stream`]; it changes under the lock.
 const KIND_STREAM: u32 = 4;
+const KIND_STREAM_FIRST_CLOSED: u32 = 5;
+const KIND_STREAM_SECOND_CLOSED: u32 = 6;
 
 /// Bytes one lane of a ring stream pair holds: half a stock ring, so one
 /// stocked ring backs both lanes without a host exit. (Linux sizes a
@@ -713,6 +719,8 @@ const LAYOUT_FACTS: &[u64] = &[
     KIND_EPOLL as u64,
     TAG_STREAM,
     KIND_STREAM as u64,
+    KIND_STREAM_FIRST_CLOSED as u64,
+    KIND_STREAM_SECOND_CLOSED as u64,
     core::mem::size_of::<IpcKindState>() as u64,
 ];
 
@@ -837,7 +845,9 @@ pub struct IpcUserVa(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IpcOperation {
     pub kind: IpcOpKind,
-    pub nonblock: u32,
+    /// A socket call's own flags (`send`/`recv` `MSG_*`), kept across a
+    /// park like the rest of the call; empty for read and write.
+    pub call: IpcCallFlags,
     pub pin: RawOfdPin,
     pub object: RawIpcObject,
     pub task: IpcTaskKey,
@@ -862,6 +872,33 @@ pub struct IpcOperation {
     /// (`CNTVCT_EL0`), kept across wakes so a re-parked wait sleeps only its
     /// remaining time. Unused by transfer operations.
     pub deadline: IpcCounterDeadline,
+}
+
+/// The per-call flags of a stream socket transfer (`sendto`/`recvfrom`):
+/// what the call's `MSG_*` flags change about one transfer, beside the
+/// description's own status flags.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IpcCallFlags(u32);
+
+impl IpcCallFlags {
+    pub const NONE: Self = Self(0);
+    /// `MSG_DONTWAIT`: this call never blocks.
+    pub const DONT_WAIT: Self = Self(1);
+    /// `MSG_NOSIGNAL`: EPIPE without SIGPIPE.
+    pub const NO_SIGNAL: Self = Self(1 << 1);
+    /// `MSG_PEEK`: copy without consuming.
+    pub const PEEK: Self = Self(1 << 2);
+    /// `MSG_WAITALL`: a read completes only with every byte requested
+    /// (or at EOF, a signal or an error).
+    pub const WAIT_ALL: Self = Self(1 << 3);
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
 }
 
 /// An absolute deadline on the guest virtual counter (`CNTVCT_EL0`), or
@@ -922,7 +959,7 @@ pub struct IpcEventValue(pub u64);
 impl IpcOperation {
     pub const EMPTY: Self = Self {
         kind: IpcOpKind::None,
-        nonblock: 0,
+        call: IpcCallFlags::NONE,
         pin: RawOfdPin {
             authority: 0,
             index: 0,
@@ -1785,6 +1822,8 @@ impl<'a> IpcRegion<'a> {
                 KIND_EVENTFD => "eventfd",
                 KIND_EPOLL => "epoll",
                 KIND_STREAM => "stream",
+                KIND_STREAM_FIRST_CLOSED => "stream(first closed)",
+                KIND_STREAM_SECOND_CLOSED => "stream(second closed)",
                 KIND_FREE => "free",
                 _ => "?",
             },
@@ -2120,18 +2159,13 @@ impl<'a> IpcRegion<'a> {
                 let mut guard = self.lock(object, wait)?;
                 // The end's description is its only holder: it drops what
                 // it still references of its own lane (writer) and its
-                // peer's (reader); a shutdown dropped the rest.
+                // peer's (reader); a shutdown dropped the rest. The pair is
+                // gone with its second end to close.
                 let held = [(end, End::Writer), (end.peer(), End::Reader)];
-                let mut remaining = 0;
-                for lane in [StreamEnd::First, StreamEnd::Second] {
-                    let pipe = guard.stream_lane(lane)?;
-                    remaining += pipe.references(End::Reader) + pipe.references(End::Writer);
+                let gone = guard.stream_end_closed(end.peer())?;
+                if guard.stream_end_closed(end)? {
+                    return Err(IpcError::Corrupt);
                 }
-                let mut releasing = 0;
-                for (lane, side) in held {
-                    releasing += guard.stream_lane(lane)?.references(side);
-                }
-                let gone = remaining == releasing;
                 if gone {
                     // Before any effect: a refused detach changes nothing.
                     guard.detach_all_member_items(wait)?;
@@ -2141,6 +2175,15 @@ impl<'a> IpcRegion<'a> {
                     if pipe.references(side) != 0 {
                         pipe.release(side).result.map_err(IpcError::Object)?;
                     }
+                }
+                if !gone {
+                    guard.record.kind.store(
+                        match end {
+                            StreamEnd::First => KIND_STREAM_FIRST_CLOSED,
+                            StreamEnd::Second => KIND_STREAM_SECOND_CLOSED,
+                        },
+                        Ordering::Release,
+                    );
                 }
                 let wake = guard.publish(WakeSet {
                     readers: true,
@@ -2482,7 +2525,9 @@ impl<'a> IpcObjectGuard<'a> {
             KIND_PIPE => Some(IpcObjectKind::Pipe),
             KIND_EVENTFD => Some(IpcObjectKind::EventFd),
             KIND_EPOLL => Some(IpcObjectKind::Epoll),
-            KIND_STREAM => Some(IpcObjectKind::Stream),
+            KIND_STREAM | KIND_STREAM_FIRST_CLOSED | KIND_STREAM_SECOND_CLOSED => {
+                Some(IpcObjectKind::Stream)
+            }
             _ => None,
         }
     }
@@ -2559,6 +2604,17 @@ impl<'a> IpcObjectGuard<'a> {
         }
         let (state, bytes, slots) = self.pipe_parts()?;
         Pipe::attach(&mut state.pipe, bytes, slots).map_err(|_| IpcError::Corrupt)
+    }
+
+    /// Whether a stream pair's `end` has closed (its description's final
+    /// release); its peer may still be open.
+    pub fn stream_end_closed(&self, end: StreamEnd) -> Result<bool, IpcError> {
+        match (self.record.kind.load(Ordering::Relaxed), end) {
+            (KIND_STREAM, _) => Ok(false),
+            (KIND_STREAM_FIRST_CLOSED, end) => Ok(end == StreamEnd::First),
+            (KIND_STREAM_SECOND_CLOSED, end) => Ok(end == StreamEnd::Second),
+            _ => Err(IpcError::WrongKind),
+        }
     }
 
     /// Whether this record's extent holds both lanes of a stream pair: each

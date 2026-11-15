@@ -7,7 +7,8 @@
 use crate::substrate::file::UserCopy;
 use carrick_el1_abi::ipc::pipe::{self, WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
-    IpcError, IpcObjectGuard, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation, RawIpcOpToken,
+    IpcCallFlags, IpcError, IpcObjectGuard, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation,
+    RawIpcOpToken,
 };
 use carrick_sched_core::object_wait::{ObjectWaitKey, OperationKind, OperationToken};
 
@@ -232,23 +233,37 @@ pub fn transfer_with_io<U: UserCopy>(
             let shut = p.references(pipe::End::Reader) == 0 && p.unread_bytes() == 0;
             let base = op.progress.written;
             let mut at = 0u64;
-            let step = if shut {
-                None
-            } else {
-                Some(p.read_with(op.progress.remaining(), |chunk| {
-                    let n = output(copy, base.wrapping_add(at), chunk);
-                    at += n as u64;
-                    n
-                }))
+            let mut deliver = |chunk: &[u8]| {
+                let n = output(copy, base.wrapping_add(at), chunk);
+                at += n as u64;
+                n
             };
-            owe_stream(&mut owe, step.map(|step| step.wake));
-            match step.map(|step| step.result) {
-                None | Some(Ok(0)) => StepStatus::EndOfFile,
-                Some(Ok(n)) => {
+            let result = if shut {
+                Ok(0)
+            } else if op.call.contains(IpcCallFlags::PEEK) {
+                // MSG_PEEK copies without consuming: nothing changes.
+                p.peek_with(op.progress.remaining(), &mut deliver)
+            } else {
+                let step = p.read_with(op.progress.remaining(), &mut deliver);
+                owe_stream(&mut owe, Some(step.wake));
+                step.result
+            };
+            match result {
+                Ok(0) => StepStatus::EndOfFile,
+                Ok(n) => {
                     op.progress.written += n as u64;
-                    StepStatus::Complete
+                    // MSG_WAITALL waits for the rest (a peek never does).
+                    if op.call.contains(IpcCallFlags::WAIT_ALL)
+                        && !op.call.contains(IpcCallFlags::PEEK)
+                        && !op.progress.is_complete()
+                        && p.references(pipe::End::Writer) != 0
+                    {
+                        StepStatus::Blocked(WaitFor::Readable)
+                    } else {
+                        StepStatus::Complete
+                    }
                 }
-                Some(Err(e)) => blocked_or(e)?,
+                Err(e) => blocked_or(e)?,
             }
         }
         IpcOpKind::StreamFirstWrite | IpcOpKind::StreamSecondWrite => {
