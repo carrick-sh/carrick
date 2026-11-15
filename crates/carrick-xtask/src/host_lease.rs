@@ -66,6 +66,10 @@ pub enum HostLeaseError {
     },
     #[error("no command specified to run under host-lease")]
     EmptyCommand,
+    /// A lock path that isn't a plain regular file (a planted symlink, a FIFO, a
+    /// directory): refused, never followed or widened (#2375 review).
+    #[error("host-lease: refusing lock file '{path}': {reason}")]
+    UnsafeLockFile { path: PathBuf, reason: &'static str },
     #[error(
         "host-lease: failed waiting for {mode} at '{path}' after {limit:?} (HOST_LEASE_WAIT_LIMIT); no command was run"
     )]
@@ -473,30 +477,58 @@ fn open_lock_file(path: &Path) -> Result<OwnedFd, HostLeaseError> {
         source: io::Error::new(io::ErrorKind::InvalidInput, e),
     })?;
 
-    // Open or create the lock file with mode 0666; inherit only explicitly.
+    // Open or create the lock file with mode 0666; inherit only explicitly. The
+    // lock and its turnstile live in a shared /tmp on multi-account Macs, so
+    // never follow a symlink, never take a controlling terminal, and accept only
+    // a regular file (#2375 review).
     // SAFETY: c_path is a valid null-terminated C string.
     let fd = unsafe {
         libc::open(
             c_path.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY,
             0o666,
         )
     };
     if fd < 0 {
+        let source = io::Error::last_os_error();
+        if source.raw_os_error() == Some(libc::ELOOP) {
+            return Err(HostLeaseError::UnsafeLockFile {
+                path: path.to_path_buf(),
+                reason: "it is a symbolic link",
+            });
+        }
+        return Err(HostLeaseError::Io {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    // SAFETY: uniquely owned CLOEXEC descriptor, including error paths.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: an all-zero stat is a valid out-buffer for fstat.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is open and st is a valid out-pointer.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &raw mut st) } != 0 {
         return Err(HostLeaseError::Io {
             path: path.to_path_buf(),
             source: io::Error::last_os_error(),
         });
     }
-
-    // Try setting 0666 permissions in case the creator had a restrictive umask.
-    // If the file was created by another user, fchmod may return EPERM; ignore it.
-    // SAFETY: fd is an open file descriptor.
-    unsafe {
-        libc::fchmod(fd, 0o666);
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(HostLeaseError::UnsafeLockFile {
+            path: path.to_path_buf(),
+            reason: "it is not a regular file",
+        });
     }
-    // SAFETY: uniquely owned CLOEXEC descriptor, including error paths.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // Widen to 0666 (other accounts must share the lock) only a file this
+    // account owns, i.e. one it created under a restrictive umask; never
+    // someone else's.
+    // SAFETY: geteuid has no preconditions.
+    if st.st_uid == unsafe { libc::geteuid() } {
+        // SAFETY: fd is an open file descriptor.
+        unsafe {
+            libc::fchmod(fd.as_raw_fd(), 0o666);
+        }
+    }
     Ok(fd)
 }
 
@@ -1043,6 +1075,70 @@ mod tests {
         assert!(
             waited < HOLD * 3,
             "exclusive granted after {waited:?}, more than one shared lifetime ({HOLD:?}) plus slack"
+        );
+    }
+
+    /// #2375 review: a planted symlink or a non-regular file at the lock or the
+    /// turnstile path is refused, never followed or chmodded.
+    #[test]
+    fn a_symlink_or_non_regular_lock_or_turnstile_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // A symlink at the turnstile path, beside a fine lock.
+        let lock = dir.path().join("host.lock");
+        std::os::unix::fs::symlink(&victim, turnstile_path(&lock)).unwrap();
+        let refused =
+            HostLease::acquire_path_with_limit(&lock, HostLeaseMode::Gate, Duration::ZERO);
+        assert!(
+            matches!(
+                refused,
+                Err(HostLeaseError::UnsafeLockFile {
+                    reason: "it is a symbolic link",
+                    ..
+                })
+            ),
+            "{:?}",
+            refused.err()
+        );
+        // ...and at the lock path itself.
+        let lock2 = dir.path().join("host2.lock");
+        std::os::unix::fs::symlink(&victim, &lock2).unwrap();
+        assert!(matches!(
+            HostLease::acquire_path_with_limit(&lock2, HostLeaseMode::Carrick, Duration::ZERO),
+            Err(HostLeaseError::UnsafeLockFile { .. })
+        ));
+        // The victim was never widened.
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A directory at the lock path is not a regular file.
+        let lock3 = dir.path().join("host3.lock");
+        std::fs::create_dir(&lock3).unwrap();
+        assert!(matches!(
+            HostLease::acquire_path_with_limit(&lock3, HostLeaseMode::Carrick, Duration::ZERO),
+            Err(HostLeaseError::UnsafeLockFile { .. }) | Err(HostLeaseError::Io { .. })
+        ));
+        // A plain file this account creates still works, at 0666.
+        let lock4 = dir.path().join("host4.lock");
+        drop(
+            HostLease::acquire_path_with_limit(&lock4, HostLeaseMode::Carrick, Duration::ZERO)
+                .unwrap(),
+        );
+        assert_eq!(
+            std::fs::metadata(&lock4).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
+        assert_eq!(
+            std::fs::metadata(turnstile_path(&lock4))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o666
         );
     }
 
