@@ -815,6 +815,19 @@ pub fn parse_test_log(log: &str) -> ParsedTestLog {
                 && is_valid_test_name(name)
             {
                 let qualified = qualify_test(&binary_stem_from_path(exe), name);
+                // A missing developer registry is a typed FAILURE of a test that started, not an
+                // interruption: the signed gate reads not-run tests as an incomplete candidate
+                // (`receipt_gaps`) and dropped them from the started population (94<96), which
+                // ejected #2355's merge group on 2026-11-15. It stays failed, so it is never
+                // forgiven, and the gate compares it with the base's own run of that test. A budget
+                // NOT-RUN is still an interruption.
+                if rest.contains("(needs developer registry ") {
+                    if failed_tests.insert(qualified.clone()) {
+                        current_run_itemized_count += 1;
+                    }
+                    started_tests.insert(qualified);
+                    continue;
+                }
                 if failed_tests.remove(&qualified) {
                     current_run_itemized_count = current_run_itemized_count.saturating_sub(1);
                 }
