@@ -1113,8 +1113,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceCompletion::RetrySyscall,
         )
     }
-    /// Supply readable memory for a guest-copy input, then
-    /// retry the exact SVC before any setup effect. A refused supply becomes
+    /// Supply the memory a refused guest copy needs (readable for an input,
+    /// writable for an output), then retry the exact SVC before any effect. A refused supply becomes
     /// `EFAULT` from the copy rather than a user data-abort signal.
     pub(super) fn prepare_guest_input(
         &mut self,
@@ -1139,7 +1139,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .resources()
             .mm
             .clone();
-        let (operation, sequence, wait) = match self.service.prepare_owned_read(&mm, request) {
+        // A refused output (a thread exit's clear-child-tid word, #2359) is
+        // prepared for the access its rerun needs: a page made only
+        // readable would refuse the same write again.
+        let prepared = if request.access == carrick_guest_arch::Access::Write {
+            self.service.prepare_owned_write(
+                &mm,
+                carrick_core::mm::transaction::CopyoutRequest {
+                    address: request.address,
+                    len: request.len,
+                },
+            )
+        } else {
+            self.service.prepare_owned_read(&mm, request)
+        };
+        let (operation, sequence, wait) = match prepared {
             Ok(()) => return Ok(LifecycleOutcome::Redispatch),
             Err(NativeProcessError::Fault) => {
                 observe(InputPreparationRefusal::Fault);
