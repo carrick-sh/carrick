@@ -17778,6 +17778,23 @@ fn with_arm_process_host_dispatch<R>(
         ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
     ) -> R,
 ) -> (R, Vec<u8>) {
+    with_arm_process_host_files(|call, _| body(call))
+}
+
+/// [`with_arm_process_host_dispatch`] that also hands `body` the root's
+/// host file table, for a witness that plays a concurrent host operation
+/// (a sibling's exact slot claim) between the root's calls.
+#[cfg(test)]
+fn with_arm_process_host_files<R>(
+    body: impl FnOnce(
+        &mut dyn FnMut(
+            ArmCaller,
+            u64,
+            [u64; 6],
+        ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+        &std::sync::Arc<carrick_kernel::kernel::FileTable>,
+    ) -> R,
+) -> (R, Vec<u8>) {
     use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
     use carrick_personality_linux::dispatch::CompletionRoute;
     use std::sync::Arc;
@@ -18041,7 +18058,7 @@ fn with_arm_process_host_dispatch<R>(
         (route, ret)
     };
 
-    let result = body(&mut call);
+    let result = body(&mut call, &files);
     if let Some(runtime) = &runtime {
         registry().unregister_root_for_test(runtime);
     }
@@ -18460,6 +18477,254 @@ fn arm_root_spawn_socketpair(
     );
     assert_eq!(made, 0, "socketpair");
     fd_pair_of(&sockets)
+}
+
+/// A zero-timeout `epoll_pwait` through `epfd`: its result and the cookies
+/// it reported, for the #1671 alias witnesses.
+#[cfg(test)]
+fn arm_root_poll_now(
+    call: &mut dyn FnMut(
+        ArmCaller,
+        u64,
+        [u64; 6],
+    ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+    epfd: u64,
+) -> (i64, Vec<u64>) {
+    use carrick_personality_linux::crossing::nr as sys;
+    let events = carrick_test_support::GuestUserBuffer::zeroed(16 * 4);
+    let (_, ready) = call(
+        ArmCaller::Root,
+        sys::EPOLL_PWAIT.raw(),
+        [epfd, events.arg(), 4, 0, 0, 8],
+    );
+    let cookies = (0..ready.clamp(0, 4) as usize)
+        .map(|n| {
+            u64::from_ne_bytes(
+                events.as_bytes()[n * 16 + 8..n * 16 + 16]
+                    .try_into()
+                    .unwrap(),
+            )
+        })
+        .collect();
+    (ready, cookies)
+}
+
+/// #1671 (#2338 review P0-1): an epoll's aliases made before the host took
+/// its host half are the same open file description. Linux: a `dup` or
+/// `F_DUPFD` copy names the one epoll, so a socket ADDed through the
+/// original is MODed, waited for and DELeted through either copy, and the
+/// epoll lives on while any copy is open, whichever closes first.
+#[test]
+fn arm_root_ring_epoll_aliases_share_one_host_half() {
+    use ArmCaller::Root;
+    use carrick_abi::{
+        LINUX_EEXIST, LINUX_ENOENT, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD,
+        LINUX_EPOLLIN, LINUX_F_DUPFD, LINUX_O_CLOEXEC,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
+
+    const SOCKET_COOKIE: u64 = 0x1671_0000_0000_00a1;
+    let (mismatches, _) = with_arm_process_host_dispatch(|call| {
+        let mismatches = std::cell::RefCell::new(Vec::new());
+        let expect = |what: &str, got: (CompletionRoute, i64), want: i64| {
+            if got.1 != want {
+                mismatches
+                    .borrow_mut()
+                    .push(format!("{what}: got {got:?}, want {want}"));
+            }
+        };
+        let ctl = sys::EPOLL_CTL.raw();
+        let (route, epoll) = call(
+            Root,
+            sys::EPOLL_CREATE1.raw(),
+            [LINUX_O_CLOEXEC, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(route, CompletionRoute::Served, "a ring epoll");
+        assert!(epoll >= 0, "epoll_create1: {epoll}");
+        let epoll = epoll as u64;
+        // Both copies exist before any host member: the ring's own OFD.
+        let (_, alias) = call(Root, sys::DUP.raw(), [epoll, 0, 0, 0, 0, 0]);
+        assert!(alias >= 0, "dup: {alias}");
+        let alias = alias as u64;
+        let (_, high) = call(
+            Root,
+            sys::FCNTL.raw(),
+            [epoll, LINUX_F_DUPFD as u64, 20, 0, 0, 0],
+        );
+        assert!(high >= 20, "F_DUPFD: {high}");
+        let high = high as u64;
+        let [parent, child] = arm_root_spawn_socketpair(call);
+        let socket_in = epoll_event_buffer(LINUX_EPOLLIN, SOCKET_COOKIE);
+
+        expect(
+            "ADD the host socket through the original",
+            call(
+                Root,
+                ctl,
+                [epoll, LINUX_EPOLL_CTL_ADD, parent, socket_in.arg(), 0, 0],
+            ),
+            0,
+        );
+        let (ready, _) = arm_root_poll_now(call, alias);
+        expect(
+            "zero-timeout wait through the dup",
+            (CompletionRoute::Forward, ready),
+            0,
+        );
+        expect(
+            "MOD the socket through the dup",
+            call(
+                Root,
+                ctl,
+                [alias, LINUX_EPOLL_CTL_MOD, parent, socket_in.arg(), 0, 0],
+            ),
+            0,
+        );
+        expect(
+            "MOD the socket through the F_DUPFD copy",
+            call(
+                Root,
+                ctl,
+                [high, LINUX_EPOLL_CTL_MOD, parent, socket_in.arg(), 0, 0],
+            ),
+            0,
+        );
+        expect(
+            "ADD the socket again through the dup",
+            call(
+                Root,
+                ctl,
+                [alias, LINUX_EPOLL_CTL_ADD, parent, socket_in.arg(), 0, 0],
+            ),
+            LINUX_EEXIST.guest_retval(),
+        );
+        let output = GuestUserBuffer::from_bytes(b"child-ok\n");
+        expect(
+            "the child's end writes",
+            call(Root, sys::WRITE.raw(), [child, output.arg(), 9, 0, 0, 0]),
+            9,
+        );
+        expect(
+            "close the original",
+            call(Root, sys::CLOSE.raw(), [epoll, 0, 0, 0, 0, 0]),
+            0,
+        );
+        let got = arm_root_poll_now(call, alias);
+        if got != (1, vec![SOCKET_COOKIE]) {
+            mismatches.borrow_mut().push(format!(
+                "wait through the dup after the original closed: got {got:x?}"
+            ));
+        }
+        expect(
+            "close the dup",
+            call(Root, sys::CLOSE.raw(), [alias, 0, 0, 0, 0, 0]),
+            0,
+        );
+        let got = arm_root_poll_now(call, high);
+        if got != (1, vec![SOCKET_COOKIE]) {
+            mismatches
+                .borrow_mut()
+                .push(format!("wait through the last copy: got {got:x?}"));
+        }
+        expect(
+            "DEL the socket through the last copy",
+            call(Root, ctl, [high, LINUX_EPOLL_CTL_DEL, parent, 0, 0, 0]),
+            0,
+        );
+        expect(
+            "DEL the socket again",
+            call(Root, ctl, [high, LINUX_EPOLL_CTL_DEL, parent, 0, 0, 0]),
+            LINUX_ENOENT.guest_retval(),
+        );
+        mismatches.into_inner()
+    });
+    assert!(
+        mismatches.is_empty(),
+        "an epoll's copies left Linux's one-description contract:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// #1671 (#2338 review P0-2): contention is never an errno. A sibling's
+/// exact claim on the epoll's slot (a `dup2` onto it, mid-flight in the
+/// host) is held while the root ADDs a socket through that slot. Linux
+/// orders the two calls; neither fails because the other is running. The
+/// ADD lands on the one host half (the dup sees it), and once the claim is
+/// released the slot reaches that same host half.
+#[test]
+fn arm_root_ring_epoll_adoption_beside_a_sibling_exact_claim() {
+    use ArmCaller::Root;
+    use carrick_abi::{LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_MOD, LINUX_EPOLLIN, LINUX_O_CLOEXEC};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
+
+    const SOCKET_COOKIE: u64 = 0x1671_0000_0000_00b1;
+    let (mismatches, _) = with_arm_process_host_files(|call, files| {
+        let mut mismatches = Vec::new();
+        let mut expect = |what: &str, got: (CompletionRoute, i64), want: i64| {
+            if got.1 != want {
+                mismatches.push(format!("{what}: got {got:?}, want {want}"));
+            }
+        };
+        let ctl = sys::EPOLL_CTL.raw();
+        let (_, epoll) = call(
+            Root,
+            sys::EPOLL_CREATE1.raw(),
+            [LINUX_O_CLOEXEC, 0, 0, 0, 0, 0],
+        );
+        assert!(epoll >= 0, "epoll_create1: {epoll}");
+        let epoll = epoll as u64;
+        let (_, alias) = call(Root, sys::DUP.raw(), [epoll, 0, 0, 0, 0, 0]);
+        assert!(alias >= 0, "dup: {alias}");
+        let alias = alias as u64;
+        let [parent, child] = arm_root_spawn_socketpair(call);
+        let socket_in = epoll_event_buffer(LINUX_EPOLLIN, SOCKET_COOKIE);
+
+        let claim = files
+            .reserve_exact_target(epoll as i32, 1024)
+            .expect("the sibling's exact claim");
+        expect(
+            "ADD the host socket while a sibling claims the epoll's slot",
+            call(
+                Root,
+                ctl,
+                [epoll, LINUX_EPOLL_CTL_ADD, parent, socket_in.arg(), 0, 0],
+            ),
+            0,
+        );
+        expect(
+            "MOD the socket through the dup",
+            call(
+                Root,
+                ctl,
+                [alias, LINUX_EPOLL_CTL_MOD, parent, socket_in.arg(), 0, 0],
+            ),
+            0,
+        );
+        // The sibling's dup2 fails late and releases its claim.
+        drop(claim);
+        let output = GuestUserBuffer::from_bytes(b"child-ok\n");
+        expect(
+            "the child's end writes",
+            call(Root, sys::WRITE.raw(), [child, output.arg(), 9, 0, 0, 0]),
+            9,
+        );
+        for (what, epfd) in [("the claimed slot", epoll), ("the dup", alias)] {
+            let got = arm_root_poll_now(call, epfd);
+            if got != (1, vec![SOCKET_COOKIE]) {
+                mismatches.push(format!("wait through {what}: got {got:x?}"));
+            }
+        }
+        mismatches
+    });
+    assert!(
+        mismatches.is_empty(),
+        "a sibling's slot claim surfaced as the guest's errno:\n{}",
+        mismatches.join("\n")
+    );
 }
 
 /// #1671 round 2: after #2338's host half, `execSync('echo child-ok')`
