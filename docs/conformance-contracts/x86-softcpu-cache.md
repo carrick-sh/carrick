@@ -132,3 +132,73 @@ Final focused validation passed 181 regular tests and 16 doc tests. Both
 the pre-push hook, Linux cross-check and native KVM compile-check passed.
 Docker and HVF are unavailable here. No KVM guest gate or signed promotion ran;
 whole-workspace lint-domains and test-kernel remain CI responsibilities.
+
+## Revival on current main (#616, supersedes #1491)
+
+The independent-review follow-ups are tracked by
+[seam #2397](https://github.com/carrick-sh/carrick/issues/2397), a blocking
+dependency of #671, and [flaky #2398](https://github.com/carrick-sh/carrick/issues/2398)
+for the Rosetta-only population reported in the review. Activation still drops
+`PendingRetirement`; it publishes debt but does not wait for running peers.
+The interleaved shared-inventory witnesses cannot prove parallel coherence.
+
+The revived production-entry witness `unchanged_loop_walks_once_at_three_scales`
+failed on current main at 64 executed blocks: 64 walks against one allowed.
+The restored loop contract separately bounds decodes, emissions and execute
+walks at 64, 512 and 4,096 executions. Main's SIMD/x87 admission paths and
+witnesses are retained. The initial port failed the existing
+`x87_cx16_and_fisttp_obey_installed_view` and
+`advertised_baseline_faults_and_feature_revocation` tests deterministically:
+plans retained admission/refusal across a CPUID-view change. The setter now
+invalidates cached plans and FIFO keys after successful host qualification.
+
+### Native x86 Linux revival evidence
+
+Twenty full `cargo test -p carrick-softcpu-x86 --test softcpu_level0` runs
+used default test threads, in four concurrent processes. Every run passed
+119 tests, with zero failures and two explicitly ignored timing fixtures.
+There were no discarded or repeated final-population runs. Failure sets:
+
+| Run | Exit | Failure set |
+| --- | --- | --- |
+| 1 | 0 | `[]` |
+| 2 | 0 | `[]` |
+| 3 | 0 | `[]` |
+| 4 | 0 | `[]` |
+| 5 | 0 | `[]` |
+| 6 | 0 | `[]` |
+| 7 | 0 | `[]` |
+| 8 | 0 | `[]` |
+| 9 | 0 | `[]` |
+| 10 | 0 | `[]` |
+| 11 | 0 | `[]` |
+| 12 | 0 | `[]` |
+| 13 | 0 | `[]` |
+| 14 | 0 | `[]` |
+| 15 | 0 | `[]` |
+| 16 | 0 | `[]` |
+| 17 | 0 | `[]` |
+| 18 | 0 | `[]` |
+| 19 | 0 | `[]` |
+| 20 | 0 | `[]` |
+
+The initial uncorrected port separately failed the same two CPUID-change
+witnesses in both observed suites (117 passed, two failed). It is retained as
+red integration evidence, rather than included in the corrected population.
+No non-deterministic native x86 failure reproduced in these twenty runs.
+This does not attribute Rosetta's defect or prove parallel shared-inventory
+coherence.
+
+All fifteen Rosetta-fidelity failures identified by #1486 pass on this native
+host: the eleven AVX cases (including the library native-leaf witness),
+`exact_denormal_results_fault_when_underflow_is_unmasked`,
+`scalar_cmpsd_reports_guest_invalid_operation`,
+`sse_exceptions_and_reserved_mxcsr_bits_are_guest_faults`, and
+`legacy_save_image_matches_native_x87_formats`.
+
+Twenty alternating release pairs executed the same 20,000-increment loop
+through `step_block`, checking final RAX and RIP in every process. Median
+main time was 198.943 ms; candidate time was 5.032 ms; median paired
+candidate/main ratio was 0.02453. Concurrent build/test load was present,
+so this **suggests** roughly 41x faster execution for this narrow fixture.
+It is not a Docker/native, quiet-host or ecosystem throughput verdict.
