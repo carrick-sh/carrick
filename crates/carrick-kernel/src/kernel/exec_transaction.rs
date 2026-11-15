@@ -305,7 +305,7 @@ pub struct ExecStaged<P, Envelope> {
 /// [`arm`]'s value: the successor image installed and its MM published,
 /// awaiting [`settle`]. When the venue's `Replaced` and `Envelope` own their
 /// custody, this owns the whole continuation.
-#[must_use = "dropping an armed exec releases its replacement custody and kills nothing; the caller owes the terminal path"]
+#[must_use = "dropping an armed exec releases its replacement custody but does not terminate the calling process; the caller owes the terminal path. Past the no-return arm, a `Replaced` that owns the `PreparedExec` terminates the retained predecessor siblings on drop"]
 pub struct ExecArmed<Replaced, Envelope> {
     old_files: Arc<FileTable>,
     dispatch_mm: PreparedDispatchMmExec,
