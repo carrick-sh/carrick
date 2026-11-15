@@ -1249,21 +1249,14 @@ struct TidOutput {
 }
 
 impl TidOutput {
-    /// `Err` is the refused read: a fault, or "not now" with what the
-    /// word's memory owner must supply first.
-    fn capture(
-        address: u64,
-        user: &mut (impl UserCopy + ?Sized),
-    ) -> Result<Option<Self>, CopyOutcome> {
+    fn capture(address: u64, user: &mut (impl UserCopy + ?Sized)) -> Option<Option<Self>> {
         if address == 0 {
-            return Ok(None);
+            return Some(None);
         }
         let mut preimage = [0u8; 4];
-        match user.copy_in(&mut preimage, UserVa::new(address)) {
-            CopyOutcome::Done => Ok(Some(Self { address, preimage })),
-            CopyOutcome::Fault => Err(CopyOutcome::Fault),
-            CopyOutcome::NotYet(request) => Err(CopyOutcome::NotYet(request)),
-        }
+        user.copy_in(&mut preimage, UserVa::new(address))
+            .is_done()
+            .then_some(Some(Self { address, preimage }))
     }
 }
 
@@ -1345,22 +1338,9 @@ fn serve_clone<'a>(
     }
     let flag = |bit: u64, address: u64| if flags & bit != 0 { address } else { 0 };
     let clear_child_tid = flag(CLONE_CHILD_CLEARTID, child_tid);
-    let captured =
-        TidOutput::capture(flag(CLONE_PARENT_SETTID, parent_tid), native).and_then(|parent| {
-            TidOutput::capture(flag(CLONE_CHILD_SETTID, child_tid), native)
-                .map(|child| TidOutputs { parent, child })
-        });
-    let outputs = match captured {
-        Ok(outputs) => outputs,
-        // Nothing is claimed or written yet: wait for the word's owner and
-        // rerun. A real fault keeps the host lane's answer.
-        Err(CopyOutcome::NotYet(request)) => {
-            return match native.wait_guest_copy(request) {
-                LifecycleOutcome::Returned { .. } => None,
-                waiting => Some(waiting),
-            };
-        }
-        Err(_) => return None,
+    let outputs = TidOutputs {
+        parent: TidOutput::capture(flag(CLONE_PARENT_SETTID, parent_tid), native)?,
+        child: TidOutput::capture(flag(CLONE_CHILD_SETTID, child_tid), native)?,
     };
 
     let state = native.task_state()?;
