@@ -87,10 +87,12 @@ tar.workspace = true
 carrick-vmm-hvf = { path = "../carrick-vmm-hvf", features = ["metadata-grant-test-support"] }
 
 # The conformance-metrics contract targets (#2348) build only with that
-# feature; `just test-embed` runs them in their own pass
-# (`just test-embed-contracts`), which supplies the feature, the source
-# identity and the observation paths. A plain pass never builds them, so they
-# never fail on a missing feature.
+# feature, so `just test-embed` never builds them and they never fail on a
+# missing feature. They are the signed half of an investigation procedure
+# (docs/investigation-evidence-enforcement.md: a digest-pinned
+# CARRICK_WRITE_SEEK_IMAGE / CARRICK_INOTIFY_HOTPATH_IMAGE, the `writeseek`
+# probe binaries, a source identity and a Docker phase), so their lane is
+# `manual` below.
 [[test]]
 name = "write_seek_contract"
 path = "tests/write_seek_contract.rs"
@@ -105,3 +107,5 @@ required-features = ["conformance-metrics"]
 [package.metadata.carrick.test-lanes]
 "*" = "signed-hvf"
 harness_diagnostics = "host"
+write_seek_contract = { lane = "manual", reason = "investigation procedure: needs a digest-pinned CARRICK_WRITE_SEEK_IMAGE, the writeseek probe binaries and a Docker phase (docs/investigation-evidence-enforcement.md); no gate provides them" }
+inotify_hotpath_contract = { lane = "manual", reason = "investigation procedure: needs a digest-pinned CARRICK_INOTIFY_HOTPATH_IMAGE and its probe binaries (docs/investigation-evidence-enforcement.md); no gate provides them" }
