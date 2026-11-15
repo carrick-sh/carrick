@@ -900,6 +900,12 @@ impl Cpl0Carrier {
         self.custody.fork_stock_counters()
     }
 
+    /// The exec owner's census: receipts reserved at claim, sealed, retired
+    /// by reason, and settlements with their commit effects.
+    pub fn exec_owner_census(&self) -> carrick_hal::exec_owner::ExecOwnerCensus {
+        self.custody.exec_owner_census()
+    }
+
     pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 5] {
         self.custody.physical_crossing_counts()
     }

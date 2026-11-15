@@ -482,6 +482,25 @@ fn native_fork_child_execs_static_successor() {
     assert_eq!(outcome.run.exit_code, 0, "child exec returned errno");
     assert_eq!(outcome.run.stdout, b"X\n");
     assert!(outcome.run.stderr.is_empty());
+    // #2305: one receipt, reserved at claim, sealed, adopted and settled with
+    // the ring's complete commit effects, which discharge the signal reset.
+    let census = outcome
+        .physical
+        .exec_owner_census()
+        .expect("exec owner census");
+    assert_eq!(
+        (
+            census.reserved,
+            census.sealed,
+            census.adopted,
+            census.retired(),
+            census.settled,
+            census.signal_resets_discharged,
+            census.short_effects,
+        ),
+        (1, 1, 1, 1, 1, 1, 0),
+        "exec owner census: {census:?}"
+    );
 }
 
 /// #2235: a child's exec refused before the arm returns execve(2)'s errno
@@ -501,6 +520,23 @@ fn native_fork_child_exec_refusals_return_their_errno_to_the_old_image() {
             (outcome.run.exit_code, outcome.run.stdout.as_slice()),
             (errno, b"".as_slice()),
             "{}: the child's exec returns {errno}; 38 is ENOSYS",
+            path.display()
+        );
+        // #2305: the loader's refusal retires the receipt reserved at claim,
+        // unsealed; nothing else was owed.
+        let census = outcome
+            .physical
+            .exec_owner_census()
+            .expect("exec owner census");
+        assert_eq!(
+            (
+                census.reserved,
+                census.sealed,
+                census.refused,
+                census.retired()
+            ),
+            (1, 0, 1, 1),
+            "{}: exec owner census: {census:?}",
             path.display()
         );
     }
@@ -559,6 +595,25 @@ fn native_fork_child_exec_wakes_after_stock_holder_retires() {
         "parked exec must wake after stock return"
     );
     assert_eq!(outcome.run.stdout, b"X\n");
+    // #2305: the receipt is reserved once, at claim, and the rerun seals
+    // with it: a park neither mints nor drops one.
+    let census = outcome
+        .physical
+        .exec_owner_census()
+        .expect("exec owner census");
+    assert!(census.parked > 0 && census.reruns > 0, "{census:?}");
+    assert_eq!(
+        (
+            census.reserved,
+            census.sealed,
+            census.adopted,
+            census.retired(),
+            census.settled,
+            census.signal_resets_discharged,
+        ),
+        (1, 1, 1, 1, 1, 1),
+        "exec owner census: {census:?}"
+    );
 }
 
 /// SIGKILL must acknowledge a parked exec's service ticket even when its
@@ -587,6 +642,23 @@ fn native_fork_child_exec_killed_while_parked_is_reaped() {
         "the killed exec must actually park for fork stock"
     );
     assert_eq!(outcome.run.exit_code, 0, "wait4 must reap the parked child");
+    // #2305: the parked row already held its receipt; the ring's
+    // cancellation retires it unsealed, so nothing Kernel-side was owed.
+    let census = outcome
+        .physical
+        .exec_owner_census()
+        .expect("exec owner census");
+    assert_eq!(
+        (
+            census.reserved,
+            census.sealed,
+            census.park_cancelled,
+            census.retired(),
+            census.settled,
+        ),
+        (1, 0, 1, 1, 0),
+        "exec owner census: {census:?}"
+    );
 }
 
 /// A caught signal cannot cancel the outstanding exec service. Its old

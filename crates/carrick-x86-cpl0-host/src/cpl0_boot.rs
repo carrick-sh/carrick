@@ -3320,6 +3320,17 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(custody.fork_stock_counters())
     }
 
+    /// The exec owner's census observed through the production carrier.
+    pub fn exec_owner_census(
+        &self,
+    ) -> Result<carrick_hal::exec_owner::ExecOwnerCensus, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.exec_owner_census())
+    }
+
     /// Settlement work observed through the production carrier.
     pub fn return_settlement_counters(
         &self,
@@ -5133,6 +5144,9 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     }
     pub fn fork_stock_counters(&self) -> carrick_hal::fork_stock::ForkStockCounters {
         self.0.fork_stock_counters()
+    }
+    pub fn exec_owner_census(&self) -> carrick_hal::exec_owner::ExecOwnerCensus {
+        self.0.exec_owner_census()
     }
     pub fn anonymous_private_pages(&self) -> u64 {
         self.0.private_anonymous_witness.private_pages()
