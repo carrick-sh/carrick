@@ -7003,7 +7003,7 @@ fn arm_host_born_sibling_refuses_stale_or_foreign_binding() {
 }
 
 #[test]
-fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
+fn arm_two_live_threads_robust_exit_retires_in_ring() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let (control, record) = imported_thread_with_identity(fixture, |_| {});
     let mut service = fixture.process_service();
@@ -7020,7 +7020,7 @@ fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
         fixture.zone.switch_in_full(fixture.slot).unwrap().record,
         record.id
     );
-    // Every glibc/musl thread registers a robust list at start.
+    // Every glibc thread registers a robust list at start.
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[0] = 0x2000;
     frame.x[1] = 24;
@@ -7032,51 +7032,21 @@ fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
     );
     assert_eq!(frame.x[0], 0);
     assert_eq!(control.robust_list().0, 0x2000);
-    // The in-ring exit declines (no robust-list walker here) with a live
-    // sibling: the host walks the list and retires the thread.
+    // No lane walks a robust list yet, so it is no reason to leave the ring
+    // (#2109): with a live sibling the raw exit retires only this thread, in
+    // ring, exactly as an exit without a list does.
     frame.x = [0; 31];
     frame.x[8] = 93;
     let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
     assert_eq!(
         route,
-        carrick_personality_linux::dispatch::CompletionRoute::HostCustody
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
-    assert_eq!(
-        arm_route_action(fixture, route, &mut frame),
-        carrick_el1_abi::Action::HostCustody
-    );
-    assert_eq!(frame.x[0], 0, "never rewritten to -ENOSYS");
-    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
-    assert!(registry().for_record(fixture.zone, record).is_some());
-    assert!(control.host_exit_requested());
-    fixture.zone.clear_current(fixture.slot);
-    assert!(leader_sees_thread(fixture, &mut service, 42));
-    let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
-        carrick_core_abi::entry::EntryTaskKey::from_raw(42),
-        carrick_core_abi::entry::BirthSerial::of_task(
-            carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
-        ),
-        carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
-    )
-    .unwrap();
-    carrick_el1_abi::Lifecycle::reserve_nonfinal_exit(fixture.page)
-        .unwrap()
-        .publish();
-    fixture
-        .page
-        .publish_exact_host_retirement(control, receipt.retirement());
+    assert!(!control.host_exit_requested());
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
+    assert!(registry().for_record(fixture.zone, record).is_none());
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
     run_as_leader(fixture);
-    registry()
-        .for_entry(
-            BornInZoneSource {
-                zone: fixture.zone,
-                slot: fixture.slot,
-            },
-            &fixture.task,
-            fixture.address,
-        )
-        .unwrap();
-    fixture.zone.free_record(record.id);
     assert!(!leader_sees_thread(fixture, &mut service, 42));
     assert!(leader_sees_thread(fixture, &mut service, 41));
 }
@@ -7329,9 +7299,36 @@ fn arm_shared_futex_wake_does_not_release_a_private_waiter() {
     );
 }
 
-// Robust-list exit plus host queue completion of an in-ring join.
+/// How the joined thread's raw `exit` leaves in the pthread_join witnesses.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinedExit {
+    /// A thread-directed pending signal declines the exit to host custody:
+    /// the host's retirement clears the CLEARTID word and wakes the join.
+    HostRetirement,
+    /// glibc's robust list is registered and the exit retires in ring, whose
+    /// own clear-child-tid wake releases the join (#2109).
+    RobustInRing,
+}
+
+// Host queue completion of an in-ring join (#2124): a raw exit that leaves for
+// host custody, whose retirement's clear-child-tid wake must meet the
+// in-ring waiter's key. Before #2109 the robust list was the decline that
+// took glibc's exit there; a pending signal still does.
 #[test]
-fn arm_glibc_pthread_join_robust_host_wake_meets_ring_wait() {
+fn arm_glibc_pthread_join_host_retirement_wake_meets_ring_wait() {
+    glibc_pthread_join_meets_ring_wait(JoinedExit::HostRetirement);
+}
+
+/// #2109: glibc's robust-registered thread exit retires in ring, and its
+/// clear-child-tid wake releases the in-ring join.
+#[test]
+fn arm_glibc_pthread_join_robust_exit_in_ring_wakes_ring_wait() {
+    glibc_pthread_join_meets_ring_wait(JoinedExit::RobustInRing);
+}
+
+#[cfg(test)]
+fn glibc_pthread_join_meets_ring_wait(how: JoinedExit) {
     // The joined CLEARTID word lives in private anonymous memory (glibc's
     // thread descriptor sits in the mmap'd thread stack).
     let words = Box::leak(Box::new(carrick_test_support::GuestUserBuffer::zeroed(
@@ -7384,6 +7381,7 @@ fn arm_glibc_pthread_join_robust_host_wake_meets_ring_wait() {
 
     run_as(fixture, 42, 12, 102, control);
     control.set_clear_child_tid(tid_word);
+    // glibc's thread start registers its robust list.
     let mut robust = carrick_el1_abi::TrapFrame::default();
     robust.x[8] = 99;
     robust.x[0] = tid_word + 0x100;
@@ -7391,28 +7389,46 @@ fn arm_glibc_pthread_join_robust_host_wake_meets_ring_wait() {
     arm_call_with_cpu(fixture, control, &mut service, &mut robust, &mut cpu).unwrap();
     assert_eq!(robust.x[0], 0);
     assert_ne!(control.robust_list().0, 0);
+    if how == JoinedExit::HostRetirement {
+        let _ = control
+            .carrier_pending()
+            .post_then_read_blocked(carrick_el1_abi::PendingSignals(1 << 9), control);
+    }
     let mut exit = carrick_el1_abi::TrapFrame::default();
     exit.x[8] = 93;
-    assert_eq!(
-        arm_call_with_cpu(fixture, control, &mut service, &mut exit, &mut cpu).unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::HostCustody,
-    );
-    // Host retirement's clear-child-tid copyout and raw-address queue wake.
-    words.set::<u32>(0, 0);
-    let wake = carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
-        carrick_kernel::el1_zone::FutexQueueAuthority::of_mm(
-            carrick_kernel::kernel::MmId::from_raw_u64(1).unwrap(),
-        )
-        .wake_child_tid(&carrick_kernel::thread::FutexTable::new(), tid_word)
-    });
-    assert_eq!(
-        wake.count, 1,
-        "host retirement must meet the in-ring join key"
-    );
-    assert!(
-        wake.handed.is_empty(),
-        "native completion keeps ring custody"
-    );
+    let route = arm_call_with_cpu(fixture, control, &mut service, &mut exit, &mut cpu).unwrap();
+    match how {
+        JoinedExit::HostRetirement => {
+            assert_eq!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::HostCustody,
+            );
+            // Host retirement's clear-child-tid copyout and raw-address queue wake.
+            words.set::<u32>(0, 0);
+            let wake = carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+                carrick_kernel::el1_zone::FutexQueueAuthority::of_mm(
+                    carrick_kernel::kernel::MmId::from_raw_u64(1).unwrap(),
+                )
+                .wake_child_tid(&carrick_kernel::thread::FutexTable::new(), tid_word)
+            });
+            assert_eq!(
+                wake.count, 1,
+                "host retirement must meet the in-ring join key"
+            );
+            assert!(
+                wake.handed.is_empty(),
+                "native completion keeps ring custody"
+            );
+        }
+        JoinedExit::RobustInRing => {
+            assert_eq!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+                "a registered robust list is no reason to leave the ring"
+            );
+            assert!(!control.host_exit_requested());
+        }
+    }
     assert_eq!(words.get::<u32>(0), 0, "exit cleared the CLEARTID word");
     assert!(
         matches!(
