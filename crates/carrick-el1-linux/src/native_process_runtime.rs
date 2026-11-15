@@ -6821,7 +6821,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if (continuation || (self.control.host_exit_requested() && !record.has_adapter_operation()))
             && let Some(status) = self.pending_close_status()
         {
-            return Some(match self.retire_closing_member(status) {
+            return Some(match self.retire_closing_member(status, !continuation) {
                 Ok(outcome) => outcome,
                 Err(error) => self.run_failed(error.run_failure_reason()),
             });
@@ -6908,7 +6908,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let status = self
             .pending_close_status()
             .ok_or(NativeProcessError::Quarantined)?;
-        let outcome = self.retire_closing_member(status)?;
+        let outcome = self.retire_closing_member(status, false)?;
         match outcome {
             LifecycleOutcome::HostCustody => {
                 // An adopted host member retires on its exact host owner.
@@ -6933,6 +6933,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn retire_closing_member(
         &mut self,
         status: carrick_sched_core::process::TerminationStatus,
+        requested_only: bool,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
         self.discard_rerun_answers();
         let page = self
@@ -6954,14 +6955,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_core::terminal::Live,
         >::admitted(identity)
         .begin();
-        // A home record switched back in on its own slot is the thread of the
-        // host job still loaded on this vCPU (#2374). Retiring it here would
-        // leave that job's vCPU on the maintenance root with no host record,
-        // and the job would go on serving its in-flight call over ASID 0. Its
-        // executor retires it, exactly as an entryless member.
+        // A home record switched back in on its own slot with only the close
+        // request pending (no owned continuation) is the thread of the host
+        // job still loaded on this vCPU (#2374). Retiring it here would leave
+        // that job's vCPU on the maintenance root with no host record, and the
+        // job would go on running over ASID 0. Its executor retires it,
+        // exactly as an entryless member. An owned continuation (a cancelled
+        // service, an exec loser) keeps its in-ring terminal checkpoint.
         let lane = self.source.zone.slot(self.source.slot);
-        let loaded_home =
-            lane.current() == Some(self.record.id) && lane.host_record() == Some(self.record.id);
+        let loaded_home = requested_only
+            && lane.current() == Some(self.record.id)
+            && lane.host_record() == Some(self.record.id);
         let Some(entry) = entry.filter(|_| !loaded_home) else {
             if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
                 return Err(NativeProcessError::Stale);
