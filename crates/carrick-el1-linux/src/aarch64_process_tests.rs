@@ -17694,7 +17694,30 @@ fn serve_child_host_file(
         &mut |_| 0,
     )?;
     Some(match stage {
-        HostFileStage::Request { record, output, .. } => {
+        HostFileStage::Request {
+            record,
+            output,
+            resolves_path,
+            ..
+        } => {
+            // The production service stamps a path call's access context
+            // from the caller's task row (`service.rs`): here a root child
+            // whose cwd is `/`.
+            let record = if resolves_path {
+                use carrick_personality_linux::identity::TaskCredentials;
+                use carrick_personality_linux::task_fs::{TaskFs, TaskPath};
+                let fs = TaskFs {
+                    cwd: TaskPath::root_directory(),
+                    root: None,
+                };
+                let mut access = Vec::new();
+                fs.encode_access(&TaskCredentials::ROOT, 0o022, &mut access)
+                    .unwrap();
+                carrick_personality_linux::native_host_file::stamp_access_context(&record, &access)
+                    .expect("a root context and test path fit one record")
+            } else {
+                record
+            };
             // The production carrier stamps the writer's RLIMIT_FSIZE
             // (`service.rs`); an unstamped write reads as a finite 0.
             let mut record = record.into_vec();
@@ -18206,6 +18229,107 @@ fn arm_root_host_backed_descriptors_keep_one_owner() {
     assert!(
         mismatches.is_empty(),
         "root host-backed descriptors left their one owner:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// #231 parity (pip): CPython opens a script with `fopen` and then marks it
+/// close-on-exec with `ioctl(fd, FIOCLEX)`. A fork child's file is a ring
+/// descriptor the carrier opened for its staged `openat`; on main the ioctl
+/// fell to the host crossing, whose operand resolver answered the ring
+/// descriptor with a counted ENOSYS, and `pip` died with "can't open file
+/// '/usr/local/bin/pip': [Errno 38]". Linux sets the flag for any open file
+/// and refuses an O_PATH descriptor with EBADF.
+#[test]
+fn arm_fork_child_ioctl_cloexec_on_a_ring_file() {
+    use carrick_abi::{
+        LINUX_AT_FDCWD, LINUX_F_GETFD, LINUX_FIOCLEX, LINUX_FIONCLEX, LINUX_O_CREAT, LINUX_O_PATH,
+        LINUX_O_WRONLY,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (mismatches, _) = with_arm_process_host_dispatch(|call| {
+        let mut mismatches = Vec::new();
+        let tmp = GuestUserBuffer::from_bytes(b"/tmp\0");
+        let (_, made) = call(
+            ArmCaller::Root,
+            sys::MKDIRAT.raw(),
+            [LINUX_AT_FDCWD, tmp.arg(), 0o777, 0, 0, 0],
+        );
+        assert!(made == 0 || made == -17, "mkdir /tmp: {made}");
+        let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-231-pip-script\0");
+        let (_, created) = call(
+            ArmCaller::Root,
+            sys::OPENAT.raw(),
+            [
+                LINUX_AT_FDCWD,
+                path.arg(),
+                LINUX_O_WRONLY | LINUX_O_CREAT,
+                0o755,
+                0,
+                0,
+            ],
+        );
+        assert!(created >= 0, "create the script: {created}");
+        call(
+            ArmCaller::Root,
+            sys::CLOSE.raw(),
+            [created as u64, 0, 0, 0, 0, 0],
+        );
+        let (route, pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid} ({route:?})");
+        let child = ArmCaller::Child(pid as u32);
+        let mut expect = |what: &str, got: i64, want: i64| {
+            if got != want {
+                mismatches.push(format!("{what}: got {got}, want {want}"));
+            }
+        };
+        let (route, fd) = call(
+            child,
+            sys::OPENAT.raw(),
+            [LINUX_AT_FDCWD, path.arg(), 0, 0, 0, 0],
+        );
+        assert!(fd >= 0, "child open of the script: {fd} ({route:?})");
+        let fd = fd as u64;
+        let ioctl = sys::IOCTL.raw();
+        let fcntl = sys::FCNTL.raw();
+        expect(
+            "FIOCLEX",
+            call(child, ioctl, [fd, LINUX_FIOCLEX, 0, 0, 0, 0]).1,
+            0,
+        );
+        expect(
+            "F_GETFD after FIOCLEX",
+            call(child, fcntl, [fd, LINUX_F_GETFD, 0, 0, 0, 0]).1,
+            1,
+        );
+        expect(
+            "FIONCLEX",
+            call(child, ioctl, [fd, LINUX_FIONCLEX, 0, 0, 0, 0]).1,
+            0,
+        );
+        expect(
+            "F_GETFD after FIONCLEX",
+            call(child, fcntl, [fd, LINUX_F_GETFD, 0, 0, 0, 0]).1,
+            0,
+        );
+        let (_, path_fd) = call(
+            child,
+            sys::OPENAT.raw(),
+            [LINUX_AT_FDCWD, path.arg(), LINUX_O_PATH, 0, 0, 0],
+        );
+        assert!(path_fd >= 0, "child O_PATH open: {path_fd}");
+        expect(
+            "FIOCLEX on an O_PATH descriptor",
+            call(child, ioctl, [path_fd as u64, LINUX_FIOCLEX, 0, 0, 0, 0]).1,
+            carrick_abi::LINUX_EBADF.guest_retval(),
+        );
+        mismatches
+    });
+    assert!(
+        mismatches.is_empty(),
+        "a ring file's close-on-exec ioctl left Linux's contract:\n{}",
         mismatches.join("\n")
     );
 }
