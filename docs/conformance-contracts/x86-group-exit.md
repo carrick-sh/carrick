@@ -26,11 +26,21 @@ installed-space occupancy word keeps naming the space during the release
 attempt, because the release authenticates the record against it. It is
 cleared once that attempt returns, whatever the release decided. A refused
 release (a #685 requeue of a pending object operation) therefore never leaves
-the word naming the space over the maintenance root (#1100, #2374). This
+the word naming the space over the maintenance root (#1100). This
 orders the physical detachment before the group owner may retire the root,
 including when the sibling's next boundary owes host work. The same ordering
 applies to a raw exit racing group close. ISA-specific code supplies only the
 existing translation, wake/kick and register mechanics.
+
+The interruption also reaches a host-loaded member parked on its home record
+in an EL1 wait. That record is selected again on its home slot while its host
+job is still loaded on the vCPU, so it is not the ring's to retire (#2374):
+retiring it vacated the vCPU and cleared the slot's host record, and the job
+then served its in-flight call over the maintenance root and saved ASID-0
+roots that the next load refused. `retire_closing_member` routes such a
+switched-in home record to its host, as it does an entryless member: the
+record is yielded back to its executor (`Handback::Control`), which retires
+the thread with its own translation.
 
 The KVM `cpl0_group_exit` binding forks a child with two live members. Its worker
 waits on a private futex, repeatedly calls `sched_yield`, or computes without

@@ -583,13 +583,13 @@ fn retiring_host_issued_sibling_refuses_tgkill_with_esrch() {
     );
 }
 
-/// #2374: a losing exit_group member switched in at the SVC of its pending
-/// object operation is vacated to the maintenance root, then its release is
-/// refused (`CurrentRelease::Requeued`, #685). Its vCPU no longer runs the
-/// process root, so the slot's occupancy word must not name that space
-/// either (#1100): the host settles a requeued thread with the live TTBRs
-/// whenever the word still names its own space, and the next load of that
-/// state names ASID 0 against an ASID-tagged projection.
+/// Occupancy invariant only (#1100): a losing exit_group member switched in
+/// at the SVC of its pending object operation is vacated to the maintenance
+/// root, then its release is refused (`CurrentRelease::Requeued`, #685). Its
+/// vCPU no longer runs the process root, so the slot's occupancy word must
+/// not name that space either. The refusal itself still fails the run closed
+/// (`NativeQuarantined`), so this is not the route of #2374's signed failures:
+/// that is `closing_interrupt_hands_a_loaded_members_home_record_to_its_host`.
 #[cfg(test)]
 #[test]
 fn refused_losing_exit_after_vacate_leaves_no_installed_space() {
@@ -693,6 +693,12 @@ fn refused_losing_exit_after_vacate_leaves_no_installed_space() {
         LifecycleOutcome::Returned { .. } => "returned",
         LifecycleOutcome::Transferred { .. } => "transferred",
     };
+    // The refused release is a broken invariant: the run fails closed.
+    assert_eq!(
+        loser.take_run_failure(),
+        Some(carrick_core_abi::NativeRunFailureReason::NativeQuarantined),
+        "{outcome}"
+    );
     assert!(
         fixture.zone.live(sibling.record).is_some(),
         "the requeued record keeps its pending operation: {outcome:?}"
