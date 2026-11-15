@@ -7102,9 +7102,11 @@ fn arm_raw_exit_refused_copy_after_membership_reservation_restores_live() {
     );
     // A refused clear_child_tid copy is checked only after the nonfinal
     // membership reservation. The exit keeps its call (#2359), and the page
-    // must still see both memberships until it reruns.
-    let mut child_tid = 42_u32;
-    control.set_clear_child_tid((&raw mut child_tid).addr() as u64);
+    // must still see both memberships until it reruns. The word is guest
+    // user memory: a host stack address lies above the guest ceiling on an
+    // ARM64 Linux host and would refuse as a real fault.
+    let child_tid = carrick_test_support::GuestUserValue::new(42_u32);
+    control.set_clear_child_tid(child_tid.arg());
     let live = fixture.page.live();
     let entry = control.entry().unwrap();
     let state = fixture.page.state(entry.index());
@@ -7125,7 +7127,7 @@ fn arm_raw_exit_refused_copy_after_membership_reservation_restores_live() {
     );
     assert_eq!(frame.x[8], 93, "the rerun is the same exit");
     assert_eq!(fixture.page.live(), live);
-    assert_eq!(child_tid, 42);
+    assert_eq!(child_tid.get(), 42);
     fixture.zone.clear_current(fixture.slot);
     assert_eq!(fixture.page.state(entry.index()), state);
     assert!(leader_sees_thread(fixture, &mut service, 42));
