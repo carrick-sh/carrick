@@ -70,6 +70,20 @@ round:
     movabs $((ROUNDS << 32) | ROUNDS), %rcx
     cmp %rcx, %rax
     je 8f
+#ifdef DIAG_CENSUS
+    mov %rax, %rcx
+    shr $32, %rcx
+    mov %eax, %edx
+    cmp %edx, %ecx
+    jne 7f
+    lea 68(%rcx), %rdi
+    mov $231, %eax
+    syscall
+7:  sub %edx, %ecx
+    lea 200(%rcx), %rdi
+    mov $231, %eax
+    syscall
+#endif
     mov $3, %edi
     mov $231, %eax
     syscall
@@ -106,6 +120,16 @@ spawn:
     xor %r8d, %r8d
     mov $56, %eax
     syscall
+#ifdef CHECK_CLONE
+    /* DIAGNOSTIC: a failed clone exits with 100 + its errno. */
+    test %rax, %rax
+    jns 6f
+    neg %rax
+    lea 100(%rax), %rdi
+    mov $231, %eax
+    syscall
+6:
+#endif
     test %rax, %rax
     jz worker
     ret
