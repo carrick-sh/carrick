@@ -2076,6 +2076,8 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         Ok(RootFsSeed::from_record(&record))
     }
 
+    // The fork frame gate charges this frame by name.
+    #[inline(never)]
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,
@@ -2742,6 +2744,8 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     fn request_ingress_producer_boundary(&mut self) {
         self.task.linux.mark_pending_host_work();
     }
+    // The fork frame gate charges this frame by name.
+    #[inline(never)]
     fn fork_fd_table(
         &mut self,
         parent_table: u64,

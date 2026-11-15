@@ -5194,6 +5194,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// EL1 on idle `thief`: take a queued thread it may run from another
     /// slot's run queue (never a home record, which must run on its home) and
     /// switch it in. Takes the victim's lock only (never two slot locks).
+    ///
+    /// Never inlined: the idle loop's frame stays live beneath every resumed
+    /// thread, and this search returns before the selected thread runs.
+    #[inline(never)]
     pub fn steal(&self, thief: SlotId) -> Option<SwitchedIn> {
         for (word_index, word) in self.queued_map.iter().enumerate() {
             let mut bits = word.load(Ordering::Acquire);
