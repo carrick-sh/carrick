@@ -6,12 +6,17 @@ semantic_authority = ["Native macOS/Linux flock exclusion and process exit readi
 fixture = "native:lease-runner-death; native:nested-admission; native:two-checkouts"
 scale_points = [1, 2]
 structural_budgets = []
-rationale = "This native tooling contract exercises commands and fork-without-exec test children holding zero flock descriptors. Outer caller death and supervisor TERM/INT/HUP cancel direct and nested work before exclusion releases. Linux subreaping also covers detached descendants closing inherited descriptors; Darwin covers descendants retaining their session or scope writer. Darwin checks incarnation before each signal and uses native exit watches, but PID-only kill has a residual final query-to-signal reuse window. SIGKILL of the sole supervisor and Darwin detached close-all-fds descendants are explicit non-goals, pinned by failing ignored tests. Cleanup has one five-second deadline across cancellation, child waits, scope EOF and Darwin reaping. Errors or expiry return a typed failed-run error and release the lease; they do not confer acceptance or guarantee containment. Linux waitpid(-1) through ECHILD is reaping authority even without procfs children support, bounded to at most two missing-children reads across cleanup rather than a wall-clock verdict deadline. Permission-denied helpers can exit naturally within that deadline; cancellation never SIGSTOPs them. Nested admission owns the authenticated scope writer. Identical commands in other checkouts must finish normally. These are native integration/model assertions, not guest syscall claims or guest timing budgets."
+rationale = "This native tooling contract exercises commands and fork-without-exec test children holding zero flock descriptors. Outer caller death and supervisor TERM/INT/HUP cancel direct and nested work before exclusion releases. Linux subreaping also covers detached descendants closing inherited descriptors; Darwin covers descendants retaining their session or scope writer. Darwin checks incarnation before each signal and uses native exit watches, but PID-only kill has a residual final query-to-signal reuse window. SIGKILL of the sole supervisor and Darwin detached close-all-fds descendants are explicit non-goals, pinned by failing ignored tests. Cleanup has one five-second deadline across cancellation, child waits, scope EOF and Darwin reaping. Errors or expiry return a typed failed-run error and release the lease; they do not confer acceptance or guarantee containment. Linux waitpid(-1) through ECHILD is reaping authority even without procfs children support, bounded to at most two missing-children reads across cleanup rather than a wall-clock verdict deadline. Permission-denied helpers can exit naturally within that deadline; cancellation never SIGSTOPs them. Nested admission owns the authenticated scope writer. Identical commands in other checkouts must finish normally. Exclusion is writer-preferring (#2375): an exclusive request queues on the `<lock>.turnstile` sibling and is granted after the shared holders already in release, ahead of later shared requests, with no preemption; the turnstile is released on every exit, including when a fork holds a copy, and a thread re-entering its own shared lease (by file identity) never queues behind a writer waiting for it. Both lock files are opened without following symlinks, must be regular files, and are widened to 0666 only when this account owns them. These are native integration/model assertions, not guest syscall claims or guest timing budgets."
 
 [bindings]
 vm_free = [
-  "carrick-xtask::tests::host_lease::runner_death_cancels_workload_before_releasing_exclusion",
+  "carrick-xtask::host_lease::tests::a_shared_holder_reenters_through_another_spelling_of_the_lock",
+  "carrick-xtask::host_lease::tests::a_symlink_or_non_regular_lock_or_turnstile_is_refused",
+  "carrick-xtask::host_lease::tests::a_thread_holding_a_shared_lease_reenters_past_a_queued_writer",
+  "carrick-xtask::host_lease::tests::a_waiting_exclusive_request_never_preempts_a_shared_holder",
   "carrick-xtask::host_lease::tests::account_handoff_lets_a_stripped_process_reuse_the_holders_lease",
+  "carrick-xtask::host_lease::tests::an_abandoned_queue_slot_is_released_even_with_a_forked_copy",
+  "carrick-xtask::host_lease::tests::exclusive_request_is_granted_ahead_of_a_continuous_shared_stream",
   "carrick-xtask::host_lease::tests::nested_validation_never_owns_or_downgrades_gate",
   "carrick-xtask::lease_supervisor::cleanup_tests::expired_cleanup_deadline_cannot_block_on_lifetime_writer",
   "carrick-xtask::lease_supervisor::cleanup_tests::permanent_cleanup_error_returns_instead_of_retaining_forever",
@@ -28,6 +33,7 @@ vm_free = [
   "carrick-xtask::tests::host_lease::nested_admission_requires_the_supervisor_scope_writer",
   "carrick-xtask::tests::host_lease::runner_death_cancels_detached_nested_workload_before_releasing_exclusion",
   "carrick-xtask::tests::host_lease::runner_death_cancels_nested_workload_before_releasing_exclusion",
+  "carrick-xtask::tests::host_lease::runner_death_cancels_workload_before_releasing_exclusion",
   "carrick-xtask::tests::host_lease::supervisor_sighup_cancels_before_releasing_exclusion",
   "carrick-xtask::tests::host_lease::supervisor_sigint_cancels_before_releasing_exclusion",
   "carrick-xtask::tests::host_lease::supervisor_sigterm_cancels_before_releasing_exclusion",
