@@ -396,8 +396,22 @@ deny:
 # 56 GB volume twice on 2026-11-14/15; cloudmac-ci and cloudmac-ci-2 share it). The
 # default floor is 30 GiB: #2387's own run hit ENOSPC in arm-test-list starting from
 # 21 GiB free. Never touches another runner's tree.
+# It never compiles through the compiler cache (a full disk is what breaks sccache: #2387's
+# arm-test-list failed `rustc -vV` through it), and a failed reclaim warns and exits 0, so it
+# never fails the job it protects. The prebuilt root-owned xtask is used when it has the command.
 ci-reclaim-target:
-    {{_xtask}} ci-reclaim-target --floor-gib "${CARRICK_CI_RECLAIM_FLOOR_GIB:-30}"
+    #!/usr/bin/env bash
+    set -uo pipefail
+    floor="${CARRICK_CI_RECLAIM_FLOOR_GIB:-30}"
+    x=/usr/local/bin/carrick-xtask
+    if [ -x "$x" ] && "$x" ci-reclaim-target --help >/dev/null 2>&1; then
+        cmd=("$x")
+    else
+        cmd=(env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER cargo --locked --config 'build.rustc-wrapper=""' run --locked -p carrick-xtask --)
+    fi
+    if ! "${cmd[@]}" ci-reclaim-target --floor-gib "$floor"; then
+        echo "::warning title=ci-reclaim-target failed::the target reclaim did not run; continuing (see the lines above)"
+    fi
 
 check-disk:
     #!/usr/bin/env bash
