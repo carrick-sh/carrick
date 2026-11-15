@@ -448,6 +448,46 @@ pub enum FaultReplyDisposition {
     Cancel,
 }
 
+/// A terminal member's leave of its process space, the two halves of every
+/// EL1 leave (#1100): the ISA moves the CPU to its maintenance translation,
+/// then the slot's occupancy word stops naming the space. The word stays
+/// across the release attempt, which authenticates the record against it,
+/// and is cleared on drop once the root has left, whatever the release
+/// decided. A refused release (a #685 requeue of a pending object operation)
+/// must not leave the word naming the space over the maintenance root: the
+/// host settles that thread with its live roots while the word names its own
+/// space, and the next load names ASID 0 (#2374).
+struct TerminalSpaceLeave<'a, C: ProcessContext> {
+    source: BornInZoneSource<'a, C>,
+    left: bool,
+}
+
+impl<'a, C: ProcessContext> TerminalSpaceLeave<'a, C> {
+    fn new(source: BornInZoneSource<'a, C>) -> Self {
+        Self {
+            source,
+            left: false,
+        }
+    }
+
+    fn leave<S: NativeProcessService<'a, C> + ?Sized>(
+        &mut self,
+        service: &mut S,
+    ) -> Result<(), NativeProcessError> {
+        service.vacate_terminal_space(self.source)?;
+        self.left = true;
+        Ok(())
+    }
+}
+
+impl<C: ProcessContext> Drop for TerminalSpaceLeave<'_, C> {
+    fn drop(&mut self) {
+        if self.left {
+            self.source.zone.release_space(self.source.slot);
+        }
+    }
+}
+
 /// Physical crossings are outside graph guards. commit_mm is only the final
 /// guest-core root publication; preparation has already performed descriptor
 /// work. A failed settlement retains the closed child and never queues it.
@@ -572,7 +612,8 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     );
     fn quarantine_born(&mut self, born: Self::Born);
     /// Detach the executing CPU from its process translation before a member
-    /// receipt can permit another CPU to retire that process's root.
+    /// receipt can permit another CPU to retire that process's root. Only
+    /// the ISA mechanic: [`TerminalSpaceLeave`] owns the slot's occupancy.
     fn vacate_terminal_space(
         &mut self,
         source: BornInZoneSource<'a, C>,
@@ -6943,17 +6984,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             Err(_) => return Err(NativeProcessError::Quarantined),
         };
-        self.service.vacate_terminal_space(self.source)?;
-        let receipt = custody
-            .retire_zone_current(
-                self.control,
-                &mut membership,
-                self.binding,
-                self.source,
-                self.record.id,
-            )
-            .map_err(|_| NativeProcessError::Quarantined)?;
-        self.source.zone.release_space(self.source.slot);
+        let mut space = TerminalSpaceLeave::new(self.source);
+        space.leave(&mut *self.service)?;
+        let receipt = custody.retire_zone_current(
+            self.control,
+            &mut membership,
+            self.binding,
+            self.source,
+            self.record.id,
+        );
+        drop(space);
+        let receipt = receipt.map_err(|_| NativeProcessError::Quarantined)?;
         carrick_core::lifecycle::retire_cancelled_pool_member(
             page,
             entry,
@@ -7248,15 +7289,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // The host may still own this live member. Keep its installed
             // translation until the neutral owner licenses exact release;
             // then detach before the retirement receipt becomes visible.
-            match carrick_core::terminal::settle_losing_zone_current_before_release(
+            let mut space = TerminalSpaceLeave::new(self.source);
+            let settled = carrick_core::terminal::settle_losing_zone_current_before_release(
                 self.control,
                 self.binding,
                 self.source,
                 record,
-                || self.service.vacate_terminal_space(self.source),
-            )?
-            .ok_or(NativeProcessError::Quarantined)?
-            {
+                || space.leave(&mut *self.service),
+            );
+            drop(space);
+            match settled?.ok_or(NativeProcessError::Quarantined)? {
                 carrick_core::terminal::LosingMemberSettlement::HostCustody => {
                     // The host still owns a live record and may call this
                     // settlement again. Its slot remains reserved until the
@@ -7264,7 +7306,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return Ok(Some(LifecycleOutcome::HostCustody));
                 }
                 carrick_core::terminal::LosingMemberSettlement::Released(receipt) => {
-                    self.source.zone.release_space(self.source.slot);
                     self.current
                         .linux
                         .mark_native_terminal_work(self.source.slot);
@@ -9214,16 +9255,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         if record != self.record || self.handoff.is_some() {
             return false;
         }
-        if let Err(error) = self.service.vacate_terminal_space(self.source) {
+        let mut space = TerminalSpaceLeave::new(self.source);
+        if let Err(error) = space.leave(&mut *self.service) {
             self.run_failure = Some(error.run_failure_reason());
             return false;
         }
         self.handoff = retirement
             .retire_current(self.binding, self.source, record.id)
             .ok();
-        if self.handoff.is_some() {
-            self.source.zone.release_space(self.source.slot);
-        }
+        drop(space);
         self.handoff.is_some()
     }
     fn binding(&self) -> ExecutionBinding {
