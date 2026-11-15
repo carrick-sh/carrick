@@ -16,10 +16,10 @@ tools truncate long files, and an unread rule doesn't bind. Depth lives in
 2. **Never strip or trim debuginfo, and never link with `lld`.** `lld` drops
    `__DATA,__dof_carrick`, so `carrick trace` fires nothing. Keep Apple `ld64`;
    check with `otool -l target/release/carrick | grep dof`.
-3. **Never `git stash`.** The stash is shared across worktrees. Never run
-   `git add -A`, which commits the `conformance-probes/target` symlink. Never
-   `git merge --ff-only` inside a worktree. Never use `--no-verify` without
-   owner approval recorded on the PR. The standing exception is
+3. **Never `git stash`,** including `--autostash`: it's shared across
+   worktrees. Never run `git add -A`, which commits the
+   `conformance-probes/target` symlink. Never `git merge --ff-only` inside a
+   worktree. Never use `--no-verify` without owner approval on the PR, except
    `worker salvage` pushes to `salvage/*` (owner, 2026-11-08).
 4. **Clean room.** Never read GPL, LGPL or other copyleft source: Linux, QEMU,
    Wine. Use man pages, specs and the Docker oracle. Permissive prior art
