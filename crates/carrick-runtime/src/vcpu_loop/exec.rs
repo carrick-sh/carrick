@@ -15,7 +15,7 @@ use super::*;
 
 use carrick_fatal::carrick_fatal;
 use carrick_kernel::kernel::exec_transaction::{
-    ExecExit, ExecStep, ImageReplacement, RootExecVenue,
+    ExecStep, ExecTerminal, ImageReplacement, RootExecVenue, SignalReset,
 };
 
 #[expect(
@@ -1763,16 +1763,13 @@ where
         kernel: &Kernel,
         engine: &mut E,
         cause: &str,
-    ) -> ExecExit<VcpuLoopOutcome> {
-        ExecExit::new(
-            ThreadRuntimeState::<E>::exec_failed_past_no_return(
-                kernel,
-                engine,
-                carrick_signal_core::policy::ExecPastNoReturn,
-                cause,
-            )
-            .map(Some),
-        )
+    ) -> ExecTerminal<VcpuLoopOutcome> {
+        ExecTerminal::new(ThreadRuntimeState::<E>::exec_failed_past_no_return(
+            kernel,
+            engine,
+            carrick_signal_core::policy::ExecPastNoReturn,
+            cause,
+        ))
     }
 }
 
@@ -1784,16 +1781,13 @@ where
         kernel: &Kernel,
         engine: &mut E,
         cause: &str,
-    ) -> ExecExit<VcpuLoopOutcome> {
-        ExecExit::new(
-            ThreadRuntimeState::<E>::exec_failed_past_no_return(
-                kernel,
-                engine,
-                carrick_signal_core::policy::ExecPastNoReturn,
-                cause,
-            )
-            .map(Some),
-        )
+    ) -> ExecTerminal<VcpuLoopOutcome> {
+        ExecTerminal::new(ThreadRuntimeState::<E>::exec_failed_past_no_return(
+            kernel,
+            engine,
+            carrick_signal_core::policy::ExecPastNoReturn,
+            cause,
+        ))
     }
 }
 
@@ -1847,16 +1841,22 @@ where
         &mut self,
         verdict: carrick_kernel::kernel::exec_transaction::ExecPastNoReturn,
         cause: &str,
-    ) -> ExecExit<VcpuLoopOutcome> {
-        ExecExit::new(
-            ThreadRuntimeState::<E>::exec_failed_past_no_return(
-                self.kernel,
-                self.engine,
-                verdict,
-                cause,
-            )
-            .map(Some),
-        )
+    ) -> ExecTerminal<VcpuLoopOutcome> {
+        ExecTerminal::new(ThreadRuntimeState::<E>::exec_failed_past_no_return(
+            self.kernel,
+            self.engine,
+            verdict,
+            cause,
+        ))
+    }
+
+    /// HVF's caller signal state lives in the dispatcher, which resets it
+    /// here, at the point the driver has always reset it.
+    fn reset_exec_signals(&mut self) -> SignalReset {
+        self.kernel
+            .dispatcher
+            .reset_signal_handlers_on_execve(self.exec_context());
+        SignalReset::Done
     }
 
     fn prepare_mm(&mut self) -> ExecStep<(RuntimePreparedExec, Self::Envelope), VcpuLoopOutcome> {

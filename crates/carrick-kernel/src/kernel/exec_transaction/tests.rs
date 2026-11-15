@@ -6,6 +6,7 @@ use std::task::{Context, Poll, Waker};
 
 use super::*;
 use crate::kernel::PreparedExec;
+use crate::kernel::operations::KernelFailpoint;
 
 const ALTSTACK: carrick_abi::LinuxSigaltstack = carrick_abi::LinuxSigaltstack {
     ss_sp: 0x4000,
@@ -20,6 +21,8 @@ struct RecordingVenue {
     context: KernelContext,
     steps: RefCell<Vec<String>>,
     fail_at: Option<&'static str>,
+    kernel_failpoint: Option<KernelFailpoint>,
+    signal_reset: SignalReset,
 }
 
 struct RecordingTransaction<'a> {
@@ -46,6 +49,8 @@ impl RecordingVenue {
             context,
             steps: RefCell::new(Vec::new()),
             fail_at,
+            kernel_failpoint: None,
+            signal_reset: SignalReset::Done,
         }
     }
 
@@ -59,9 +64,11 @@ impl RecordingVenue {
     fn proc_state_published(&self) -> bool {
         let env_published = self.dispatcher.current_exec_env() == [b"STEP=exec".to_vec()];
         let signals_reset = self.context.thread().altstack().is_none();
+        let venue_resets = self.signal_reset == SignalReset::Done;
         assert_eq!(
-            env_published, signals_reset,
-            "proc state publishes as one step"
+            env_published && venue_resets,
+            signals_reset,
+            "proc state publishes as one step, and a ring-owed reset is left to the ring"
         );
         env_published
     }
@@ -69,7 +76,7 @@ impl RecordingVenue {
 
 fn record_failure(fail_at: Option<&'static str>, step: &str) -> ExecStep<(), String> {
     if fail_at == Some(step) {
-        return Err(ExecExit::new(Ok(Some(format!("{step} failed")))));
+        return Err(ExecTerminal::new(Ok(format!("{step} failed"))));
     }
     Ok(())
 }
@@ -155,11 +162,23 @@ impl RootExecVenue for RecordingVenue {
         self.steps.borrow_mut().push(format!("stage:{phase:?}"));
     }
 
-    fn fail_past_no_return(&mut self, verdict: ExecPastNoReturn, cause: &str) -> ExecExit<String> {
+    fn fail_past_no_return(
+        &mut self,
+        verdict: ExecPastNoReturn,
+        cause: &str,
+    ) -> ExecTerminal<String> {
         self.steps
             .borrow_mut()
             .push(format!("fail_past_no_return:{}", verdict.signal().number()));
-        ExecExit::new(Ok(Some(cause.to_owned())))
+        ExecTerminal::new(Ok(cause.to_owned()))
+    }
+
+    fn reset_exec_signals(&mut self) -> SignalReset {
+        if self.signal_reset == SignalReset::Done {
+            self.dispatcher
+                .reset_signal_handlers_on_execve(&self.context);
+        }
+        self.signal_reset
     }
 
     fn prepare_mm(&mut self) -> ExecStep<(RecordingPreparedExec, ()), String> {
@@ -168,10 +187,21 @@ impl RootExecVenue for RecordingVenue {
             "Kernel preparation precedes proc-state mutation"
         );
         self.record("prepare_mm")?;
-        let prepared = self
-            .dispatcher
-            .prepare_one_task_kernel_exec(&self.context)
-            .expect("prepare one-task exec");
+        // The production Kernel preparation; its failpoints are the
+        // pre-arm failures under test.
+        let prepared = match self
+            .context
+            .kernel()
+            .prepare_exec(&self.context, self.kernel_failpoint)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(self.fail_past_no_return(
+                    ExecPastNoReturn,
+                    &format!("prepare authoritative Kernel exec: {error}"),
+                ));
+            }
+        };
         Ok((
             RecordingPreparedExec {
                 inner: prepared,
@@ -259,8 +289,8 @@ impl RootExecVenue for RecordingVenue {
     }
 }
 
-fn drive(venue: &mut RecordingVenue) -> Result<Option<String>, RuntimeError> {
-    let identity = ExecImageIdentity {
+fn identity() -> ExecImageIdentity {
+    ExecImageIdentity {
         path: "/bin/tool".to_owned(),
         argv: vec!["tool".to_owned()],
         env: vec![b"STEP=exec".to_vec()],
@@ -271,11 +301,14 @@ fn drive(venue: &mut RecordingVenue) -> Result<Option<String>, RuntimeError> {
         .expect("host exec source"),
         binfmt_argv: None,
         command_line: "tool".to_owned(),
-    };
+    }
+}
+
+fn drive(venue: &mut RecordingVenue) -> Result<Option<String>, RuntimeError> {
     let mut future = Box::pin(drive_root_exec(
         venue,
         Drained::new(Instant::now()),
-        identity,
+        identity(),
     ));
     match future
         .as_mut()
@@ -290,39 +323,69 @@ fn steps(venue: &RecordingVenue) -> Vec<String> {
     venue.steps.borrow().clone()
 }
 
+const HVPATCH_ORDER: [&str; 21] = [
+    "stage:SiblingDrain",
+    "prepare_mm",
+    "stage:ProcState",
+    "replace_image",
+    "stage:TopologyLock",
+    "arm_no_return",
+    "install_image",
+    "publish_mm",
+    "settle_inventory",
+    "commit",
+    "adopt_successor_context",
+    "load_successor_mm",
+    "entry_state",
+    "bind_successor_memory",
+    "stage:EngineReplace",
+    "stage:CloseCloexec",
+    "rebind_identity",
+    "verify_image",
+    "stamp_port",
+    "stage:Publication",
+    "publish_replacement",
+];
+
 #[test]
 fn driver_runs_the_hvpatch_order_with_neutral_steps_between_venue_hooks() {
     let mut venue = RecordingVenue::new(None);
 
     assert!(matches!(drive(&mut venue), Ok(None)));
 
-    assert_eq!(
-        steps(&venue),
-        [
-            "stage:SiblingDrain",
-            "prepare_mm",
-            "stage:ProcState",
-            "replace_image",
-            "stage:TopologyLock",
-            "arm_no_return",
-            "install_image",
-            "publish_mm",
-            "settle_inventory",
-            "commit",
-            "adopt_successor_context",
-            "load_successor_mm",
-            "entry_state",
-            "bind_successor_memory",
-            "stage:EngineReplace",
-            "stage:CloseCloexec",
-            "rebind_identity",
-            "verify_image",
-            "stamp_port",
-            "stage:Publication",
-            "publish_replacement",
-        ]
-    );
+    assert_eq!(steps(&venue), HVPATCH_ORDER);
     assert!(venue.proc_state_published());
+}
+
+/// #2142 R1: the four phases, driven one at a time, run exactly the order
+/// `drive_root_exec` runs, and the armed exec is an owned value a venue can
+/// hold between two crossings (x86: adopt, then settle).
+#[test]
+fn phases_driven_one_at_a_time_run_the_driver_order_and_the_armed_exec_is_owned() {
+    fn hold<T: 'static>(value: T) -> Box<dyn std::any::Any> {
+        Box::new(value)
+    }
+    let mut venue = RecordingVenue::new(None);
+    let replacement = {
+        let begun = begin(&mut venue, Drained::new(Instant::now())).unwrap_or_else(|_| panic!());
+        let replacement = begun.replacement_mm_id();
+        let staged = stage(&mut venue, begun, identity()).unwrap_or_else(|_| panic!());
+        let armed = arm(&mut venue, staged).unwrap_or_else(|_| panic!());
+        assert_eq!(armed.signal_reset(), SignalReset::Done);
+        let held = hold(armed);
+        assert!(
+            !steps(&venue).iter().any(|step| step == "commit"),
+            "arm commits nothing"
+        );
+        let armed = held
+            .downcast::<ExecArmed<PreparedExec, ()>>()
+            .expect("the held armed exec");
+        assert!(settle(&mut venue, *armed).is_ok());
+        replacement
+    };
+
+    assert_eq!(steps(&venue), HVPATCH_ORDER);
+    assert_eq!(venue.context.shared().mm().id(), replacement);
 }
 
 #[test]
@@ -354,6 +417,77 @@ fn staged_vma_revision_failure_kills_past_no_return_with_sigsegv() {
     assert_eq!(
         steps(&venue),
         ["stage:SiblingDrain", "prepare_mm", "fail_past_no_return:11"]
+    );
+}
+
+/// #2142 R1, P0 3: a Kernel preparation failure after the seal is terminal.
+/// The process dies with `ExecPastNoReturn` (SIGSEGV), the identity and
+/// `/proc` state are never staged, and the exec reservation is released.
+#[test]
+fn every_kernel_preparation_failure_kills_past_no_return_and_releases_the_reservation() {
+    for point in [
+        KernelFailpoint::AfterReserve,
+        KernelFailpoint::AfterObjects,
+        KernelFailpoint::AfterBackendPrepare,
+    ] {
+        let mut venue = RecordingVenue::new(None);
+        venue.kernel_failpoint = Some(point);
+        let revision = venue.context.revision();
+
+        let outcome = drive(&mut venue).expect("a kill, not a runtime fault");
+
+        assert_eq!(
+            outcome,
+            Some(format!(
+                "prepare authoritative Kernel exec: {}",
+                crate::kernel::ExecError::Injected(point)
+            ))
+        );
+        assert_eq!(
+            steps(&venue),
+            ["stage:SiblingDrain", "prepare_mm", "fail_past_no_return:11"],
+            "{point:?}"
+        );
+        assert!(!venue.proc_state_published(), "{point:?}");
+        let kernel = venue.context.kernel();
+        drop(
+            kernel
+                .reserve_task_operation(venue.context.task().key().id)
+                .unwrap_or_else(|error| panic!("{point:?} left a reservation: {error:?}")),
+        );
+        let current = kernel
+            .context(
+                venue.context.task().key().id,
+                venue.context.thread().key().tid,
+            )
+            .expect("caller still published");
+        assert_eq!(current.revision(), revision, "{point:?}");
+    }
+}
+
+/// #2142 R1, P0 2: a ring-owed signal reset that no ring commit receipt
+/// discharged stops the exec at `settle`, before the Kernel commit, and the
+/// venue never reset the caller's handlers itself.
+#[test]
+fn settle_refuses_an_undischarged_ring_owed_signal_reset_before_commit() {
+    let mut venue = RecordingVenue::new(None);
+    venue.signal_reset = SignalReset::RingOwed;
+
+    let outcome = drive(&mut venue).expect("a kill, not a runtime fault");
+
+    assert_eq!(
+        outcome.as_deref(),
+        Some("exec settle without a ring commit receipt for the owed signal reset")
+    );
+    let steps = steps(&venue);
+    assert_eq!(
+        steps[steps.len() - 3..],
+        ["publish_mm", "settle_inventory", "fail_past_no_return:11"]
+    );
+    assert!(!steps.iter().any(|step| step == "commit"));
+    assert!(
+        venue.context.thread().altstack().is_some(),
+        "the venue left the reset to the ring"
     );
 }
 
