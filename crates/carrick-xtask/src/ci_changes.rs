@@ -894,6 +894,18 @@ pub fn lookup_child_pr(repo: &str, head_ref: &str) -> Result<Option<u64>, CiChan
             "parse gh api repos/{repo}/pulls response: {source}"
         ))
     })?;
+    child_from_pulls(&value, head_ref)
+}
+
+/// The lowest open, **ready** PR based on `head_ref` in a `pulls` listing. A
+/// draft upper layer doesn't run the full suite for the stack, so it never
+/// makes its base a lower layer: 2026-11-14, the drafts #2343 and #2342 kept
+/// the ready #2273 and #2278 off their heavy jobs, and land-when-green parked
+/// both.
+pub fn child_from_pulls(
+    value: &serde_json::Value,
+    head_ref: &str,
+) -> Result<Option<u64>, CiChangesError> {
     let prs = value.as_array().ok_or_else(|| {
         CiChangesError::Git("gh api pulls response is not a JSON array".to_string())
     })?;
@@ -903,6 +915,10 @@ pub fn lookup_child_pr(repo: &str, head_ref: &str) -> Result<Option<u64>, CiChan
             continue;
         }
         if pr["base"]["ref"].as_str().is_some_and(|r| r != head_ref) {
+            continue;
+        }
+        // Unknown draft state counts as draft: the bottom keeps its full suite.
+        if pr["draft"].as_bool() != Some(false) {
             continue;
         }
         let number = pr["number"].as_u64().ok_or_else(|| {
