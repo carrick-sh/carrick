@@ -708,20 +708,21 @@ pub fn x5_exit_requeued_after_wake_wakes_once() {
     }
 }
 
-/// #2359 round 4: a thread clone whose tid word is refused "not now" (its
-/// memory owner is busy, as when a sibling's exit holds the MM editor) keeps
-/// its call. Nothing is claimed or written; the clone waits for the word's
-/// owner and reruns, and the rerun publishes both words. Before, a refused
-/// tid copyout answered EFAULT (or forwarded) from a clone that created no
-/// thread, and a refused preimage read forwarded the clone.
+/// #2359 round 4: a thread clone whose tid copyout is refused "not now"
+/// (the word's memory owner is busy, as when a sibling's exit holds the MM
+/// editor) keeps its call. The clone backs out (nothing claimed, every
+/// written word restored), waits for the word's owner and reruns, and the
+/// rerun publishes both words. Before, the refusal answered EFAULT (or
+/// forwarded) from a clone that created no thread. A refused preimage read
+/// still forwards, as `arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication`
+/// requires.
 pub fn x5_clone_tid_copy_not_yet_reruns() {
     for x86 in [false, true] {
-        // The parent word's copyout, the child word's copyout (after the
-        // parent word was written), and the parent word's preimage read.
+        // The parent word's copyout, and the child word's copyout after the
+        // parent word was written.
         for (address, access) in [
             (0x1000, carrick_guest_arch::Access::Write),
             (0x1004, carrick_guest_arch::Access::Write),
-            (0x1000, carrick_guest_arch::Access::Read),
         ] {
             let a = Process::new(7);
             let mut turn = Turn::new(&a, x86);
