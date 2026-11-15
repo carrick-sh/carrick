@@ -1032,6 +1032,15 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         self.fork_stock.counters()
     }
 
+    /// What this carrier's exec owner reserved, sealed and retired.
+    pub fn exec_owner_census(&self) -> carrick_hal::exec_owner::ExecOwnerCensus {
+        carrick_hal::exec_owner::ExecOwnerCensus {
+            reserved: self.exec_receipts,
+            sealed: self.exec_receipts,
+            ..Default::default()
+        }
+    }
+
     pub fn service_fork_stock<I: CarrierCpuIo>(
         &mut self,
         lease: &StoppedCpuLease<'_, I>,
