@@ -101,7 +101,7 @@ vm_free = [
 
 [bindings.unresolved]
 embed_structural = "Soft-CPU CPL0 ring, carrier, and CLI integration land in slices #582-#584; slice #581 validates Level 0 DBT VM-free over SoftMmuMemory and differentially against the host x86_64 CPU."
-docker = "Docker is unavailable on the x86 worker; differential testing runs the identical x86_64 instruction blocks directly on the host x86_64 CPU."
+docker = "Differential testing runs the identical x86_64 instruction blocks directly on the host x86_64 CPU. Soft-carrier Docker differential remains unresolved pending #671."
 
 [runtime_ratio]
 maximum = 2.0
