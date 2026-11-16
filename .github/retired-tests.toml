@@ -4488,3 +4488,9 @@ reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into th
 replaced_by = "main::sentinel_decode::sentinel_slot_materialises_sentinel_gpa_and_stores"
 pr = 2411
 
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_x86_cow_splits_an_armed_large_page_on_first_write"
+reason = "#2408: consolidated carrick-vmm-kvm integration tests into the single main test binary; include the witness added on main while slice 1 was in flight."
+replaced_by = "main::cpl0_entry::shared_kernel_x86_cow_splits_an_armed_large_page_on_first_write"
+pr = 2411
