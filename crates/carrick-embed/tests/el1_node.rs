@@ -40,7 +40,6 @@ fn el1_node_version() {
 }
 
 #[test]
-#[ignore = "red on main: spawnSync /bin/sh ENOSYS then uv__io_poll (#1671, ARM Node lane next stop); run with --include-ignored"]
 fn el1_node_child() {
     assert_eq!(
         node("console.log(require('child_process').execSync('echo child-ok').toString().trim())"),
