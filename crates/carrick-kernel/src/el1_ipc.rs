@@ -557,9 +557,7 @@ pub struct HostIpc {
     /// process-global zone is absent (x86 CPL0, #2031). Bound once by the
     /// carrier that maps this region.
     carrier_zone: std::sync::OnceLock<crate::el1_zone::CarrierZone>,
-    /// The readiness watch over host objects native members wait on (#231),
-    /// started at the first such wait.
-    host_readiness: Mutex<Option<crate::host_readiness::HostReadinessWatch>>,
+    /// The deadlines of native members' poll waits (#231).
     poll_deadlines: crate::host_readiness::PollDeadlines,
 }
 impl std::fmt::Debug for HostIpc {
@@ -636,7 +634,6 @@ impl HostIpc {
             growth: Mutex::new(IpcGrowth::default()),
             ceiling,
             carrier_zone: std::sync::OnceLock::new(),
-            host_readiness: Mutex::new(None),
             poll_deadlines: crate::host_readiness::PollDeadlines::default(),
         };
         let identity = NEXT_REGION
@@ -1399,44 +1396,28 @@ impl HostIpc {
     }
 
     /// Replace `record`'s host-readiness wait with one on `interests`, and
-    /// `deadline` if given: the first to fire notifies its queue. `false`
-    /// when the watch cannot be started or a descriptor cannot be retained:
-    /// the caller refuses the wait.
+    /// `deadline` if given, in `reactor`: the first to fire notifies its
+    /// queue in this region's carrier zone. `false` when no reactor serves
+    /// the kernel or a descriptor cannot be retained: the caller refuses the
+    /// wait.
     pub(crate) fn watch_host_ready(
         &self,
+        reactor: &crate::host_readiness::HostReadinessReactor,
         record: carrick_el1_abi::RecordRef,
         interests: &[crate::host_readiness::HostReadinessInterest<'_>],
         deadline: Option<std::time::Instant>,
     ) -> bool {
-        let mut watch = self.host_readiness.lock();
-        if watch.is_none() {
-            match crate::host_readiness::HostReadinessWatch::start() {
-                Ok(started) => *watch = Some(started),
-                Err(_) => return false,
-            }
-        }
-        watch.as_ref().is_some_and(|watch| {
-            watch
-                .enrol(
-                    record,
-                    interests,
-                    deadline,
-                    self.carrier_zone.get().cloned(),
-                )
-                .is_ok()
-        })
+        reactor.watch(
+            record,
+            interests,
+            deadline,
+            self.carrier_zone.get().cloned(),
+        )
     }
 
     /// The deadlines of native members' poll waits.
     pub(crate) fn poll_deadlines(&self) -> &crate::host_readiness::PollDeadlines {
         &self.poll_deadlines
-    }
-
-    /// Drop every readiness enrolment of `source` (its last descriptor closed).
-    pub(crate) fn forget_host_ready(&self, source: crate::host_readiness::HostReadinessSource) {
-        if let Some(watch) = self.host_readiness.lock().as_ref() {
-            watch.forget(source);
-        }
     }
 
     #[cfg(feature = "test-support")]

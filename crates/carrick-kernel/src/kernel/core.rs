@@ -617,6 +617,9 @@ pub struct Kernel {
     host_signal: Arc<dyn HostSignalBridge>,
     work_scope: RwLock<Option<carrick_observability::work_meter::WorkScope>>,
     pub(crate) native_owner_waits: Arc<super::continuation::readiness::NativeOwnerWaitRegistry>,
+    /// The carrier wait reactor serving native members' host-readiness
+    /// waits (#231), bound by the executor pool's wait service.
+    host_readiness: Arc<crate::host_readiness::HostReadinessReactor>,
 }
 
 /// A fully constructed container-init graph that is still invisible to the
@@ -1384,6 +1387,12 @@ impl Kernel {
     pub fn schedule_hooks(&self) -> &super::schedule::Hooks {
         &self.schedule_hooks
     }
+    /// The carrier wait reactor serving this kernel's native members'
+    /// host-readiness waits (#231).
+    pub(crate) fn host_readiness(&self) -> &Arc<crate::host_readiness::HostReadinessReactor> {
+        &self.host_readiness
+    }
+
     pub(crate) fn existing_ipc(&self) -> Option<Arc<crate::el1_ipc::HostIpc>> {
         self.ipc.lock().clone()
     }
@@ -1630,6 +1639,7 @@ impl Kernel {
             unpublished_jobs: AtomicUsize::new(0),
             work_scope: RwLock::new(None),
             native_owner_waits: Arc::default(),
+            host_readiness: Arc::default(),
         });
         kernel.registry().thread_ledger().bind_kernel(&kernel);
         container.bind_kernel(&kernel);

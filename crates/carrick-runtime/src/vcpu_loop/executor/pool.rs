@@ -641,9 +641,13 @@ pub(crate) struct PoolControl {
 
 impl PoolControl {
     fn new(workers: usize, scheduler: Arc<Scheduler>) -> Self {
+        let wait_service = carrick_kernel::kernel::continuation::CarrierWaitService::new(scheduler);
+        // Native members' host-socket waits share this one carrier reactor
+        // (#231): no second readiness thread.
+        wait_service.serve_host_readiness();
         Self {
             usable_workers: std::sync::atomic::AtomicUsize::new(workers),
-            wait_service: carrick_kernel::kernel::continuation::CarrierWaitService::new(scheduler),
+            wait_service,
             shutdown_begun: Mutex::new(false),
             shutdown_changed: parking_lot::Condvar::new(),
         }

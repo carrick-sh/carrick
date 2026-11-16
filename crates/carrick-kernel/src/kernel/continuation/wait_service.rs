@@ -329,6 +329,10 @@ fn membership_inputs(
 pub struct CarrierWaitState {
     pub(super) entries: BTreeMap<ContinuationId, RegistrationEntry>,
     pub(super) reactor_work: ReactorWorkSet,
+    /// Native members' host-readiness waits (#231), polled by this same
+    /// reactor: a native member has no continuation, only a ring record to
+    /// notify.
+    pub(crate) host_ready: crate::host_readiness::HostReadyWaits,
     #[cfg(test)]
     pub(super) last_prepared: Option<ContinuationWakeToken>,
 }
@@ -831,6 +835,9 @@ impl CarrierWaitServiceInner {
         REACTOR_OF.with(|of| of.set(weak.as_ptr().addr()));
         enum FdSource {
             Ready(ContinuationWakeToken),
+            /// A native member's host-readiness wait (#231), by its key and
+            /// the serial of the wait the poll set was built from.
+            HostReady(crate::host_readiness::HostReadyKey, u64),
             BlockingWrite(
                 ContinuationWakeToken,
                 Arc<Mutex<BlockingWrite>>,
@@ -900,6 +907,17 @@ impl CarrierWaitServiceInner {
                         _ => {}
                     }
                 }
+                // Native members' host-readiness waits: every row is polled
+                // or carries only a deadline.
+                let mut host_ready = Vec::new();
+                state
+                    .host_ready
+                    .poll_set(&mut pollfds, &mut host_ready, &mut nearest_deadline);
+                sources.extend(
+                    host_ready
+                        .into_iter()
+                        .map(|(key, serial)| FdSource::HostReady(key, serial)),
+                );
                 // A record lock has no readiness fd: it is retried on a tick, so
                 // its presence alone bounds the poll timeout.
                 if !state.reactor_work.record_locks.is_empty() {
@@ -984,8 +1002,18 @@ impl CarrierWaitServiceInner {
                 }
             }
             if result < 0 {
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    // A host refusal of the wait itself: every native member
+                    // reruns its call once and re-enrols, rather than wait
+                    // unseen.
+                    let woken = inner.state.lock().host_ready.take_all();
+                    for wait in woken {
+                        wait.notify();
+                    }
+                }
                 continue;
             }
+            let mut host_ready_fired = Vec::new();
             for (pollfd, source) in pollfds.iter().skip(1).zip(sources) {
                 if pollfd.revents == 0 {
                     continue;
@@ -993,6 +1021,9 @@ impl CarrierWaitServiceInner {
                 match source {
                     FdSource::Ready(token) => {
                         inner.publish_event(token, ContinuationEvent::Ready);
+                    }
+                    FdSource::HostReady(key, serial) => {
+                        host_ready_fired.push((key, serial));
                     }
                     FdSource::BlockingWrite(token, write, completion, gate, host_signal) => {
                         #[cfg(test)]
@@ -1032,6 +1063,17 @@ impl CarrierWaitServiceInner {
                 }
             }
             let now = Instant::now();
+            // A member is notified once, for whichever of its descriptors
+            // fired or its deadline, outside the state lock; a wait replaced
+            // since the poll set was built has a new serial and stays.
+            let host_ready_woken = inner
+                .state
+                .lock()
+                .host_ready
+                .take_woken(&host_ready_fired, now);
+            for wait in host_ready_woken {
+                wait.notify();
+            }
             let expired = {
                 let state = inner.state.lock();
                 state
@@ -1080,6 +1122,23 @@ impl CarrierWaitServiceInner {
                 }
             }
         }
+    }
+}
+
+impl crate::host_readiness::HostReadyTable for CarrierWaitServiceInner {
+    fn change_host_ready_waits(
+        &self,
+        change: &mut dyn FnMut(&mut crate::host_readiness::HostReadyWaits) -> bool,
+    ) {
+        let changed = change(&mut self.state.lock().host_ready);
+        if changed {
+            self.nudge_reactor();
+        }
+    }
+
+    #[cfg(test)]
+    fn host_ready_waits(&self) -> usize {
+        self.state.lock().host_ready.len()
     }
 }
 
@@ -1173,6 +1232,14 @@ impl CarrierWaitService {
             })?;
         *inner.reactor.lock() = Some(handle);
         Ok(Self { inner })
+    }
+
+    /// Serve this wait service's kernel's native host-readiness waits (#231)
+    /// from its reactor: the executor pool's service binds itself once it
+    /// starts, so a native member's socket wait shares the run root's one
+    /// carrier reactor.
+    pub fn serve_host_readiness(&self) {
+        self.inner.scheduler.kernel().host_readiness().bind(self);
     }
 
     pub fn set_work_scope(&self, scope: carrick_observability::work_meter::WorkScope) {
