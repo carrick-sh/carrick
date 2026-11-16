@@ -6,6 +6,12 @@
 mod kvm_pool_fixture;
 
 fn group_exit(flags: &[&str], test: &str) {
+    group_exit_with_status(flags, test, 0);
+}
+
+/// `expected` is the run's exit code: the root's own status, or 0 when the
+/// root parent reaped and checked the child's status itself.
+fn group_exit_with_status(flags: &[&str], test: &str, expected: i32) {
     if std::env::var_os("CARRICK_GROUP_EXIT_CHILD").is_none() {
         let output = std::process::Command::new("timeout")
             .args(["--signal=KILL", "60"])
@@ -25,7 +31,10 @@ fn group_exit(flags: &[&str], test: &str) {
     }
     let elf = kvm_pool_fixture::assemble_fixture("native_group_exit.S", flags);
     let outcome = kvm_pool_fixture::run_pool_fixture(&elf, 256);
-    assert_eq!(outcome.run.exit_code, 0, "parent must reap status 5");
+    assert_eq!(
+        outcome.run.exit_code, expected,
+        "the group must end with its exact status"
+    );
 }
 
 #[test]
@@ -54,5 +63,27 @@ fn fork_child_worker_exit_group_retires_entryless_leader() {
     group_exit(
         &["-DWORKER_EXITS"],
         "fork_child_worker_exit_group_retires_entryless_leader",
+    );
+}
+
+/// #2420: a worker can exit the group while the leader is parked in a futex
+/// wait, not only while it computes.
+#[test]
+fn fork_child_worker_exit_group_retires_parked_leader() {
+    group_exit(
+        &["-DWORKER_EXITS", "-DLEADER_PARKED"],
+        "fork_child_worker_exit_group_retires_parked_leader",
+    );
+}
+
+/// #2420 (node after a V8 fatal): the root's leader aborts with
+/// `tgkill(self, SIGABRT)` while its worker is parked in a futex wait. The
+/// group dies and the run ends with 128 + SIGABRT.
+#[test]
+fn root_leader_abort_ends_run_with_sigabrt_status() {
+    group_exit_with_status(
+        &["-DABORT_SIGNAL", "-DROOT_ABORT"],
+        "root_leader_abort_ends_run_with_sigabrt_status",
+        128 + 6,
     );
 }
