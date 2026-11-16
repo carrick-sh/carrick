@@ -7060,6 +7060,49 @@ mod tests {
         );
     }
 
+    /// #231: a fork child's `socket(AF_INET, SOCK_STREAM, 0)` is a real host
+    /// network crossing. ARM's production staging route for an owned native
+    /// SVC stages it as a host-file venue request in the caller's own table;
+    /// it never falls through to the unclaimed-call refusal. Red on main:
+    /// staging declined it and `native_unstaged_exit` answered counted
+    /// ENOSYS.
+    #[test]
+    fn native_host_file_stage_stages_a_fork_childs_inet_socket() {
+        use carrick_personality_linux::native_host_file::HostFileStage;
+        struct Resident;
+        impl file::MemoryValidator for Resident {
+            fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+            fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+        }
+        let task = CurrentTask::new();
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            ..TrapFrame::default()
+        };
+        frame.x[8] = 198;
+        frame.x[0] = 2; // AF_INET
+        frame.x[1] = 1; // SOCK_STREAM
+        let table = [3, 4, 5];
+        let staged = native_host_file_stage(
+            &frame,
+            &task,
+            &Resident,
+            table,
+            carrick_core_abi::service::ServiceOrigin::Descendant,
+            |_| panic!("socket names no descriptor"),
+            &mut |_| 0,
+        );
+        let Some(HostFileStage::Request { mut record, .. }) = staged else {
+            panic!("a fork child's inet socket crosses to the host network: {staged:?}");
+        };
+        let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut record).unwrap();
+        assert_eq!(view.header().table, table);
+    }
+
     /// #1954: an ARM `write`/`writev` whose buffer is readable for 16 bytes
     /// and then unmapped stages the readable prefix behind a supply of the
     /// exact unmapped page, so a refused supply writes 16 bytes (Linux's
