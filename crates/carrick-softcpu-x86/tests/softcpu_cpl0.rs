@@ -1531,3 +1531,13 @@ fn softmachine_vcpus_execute_the_shared_cpuid_contract() {
         }
     }
 }
+
+#[test]
+fn shared_view_refuses_unadvertised_xsave_extensions_before_memory() {
+    for bytes in [&[0x0f, 0xae, 0x37][..], &[0x0f, 0xc7, 0x27]] {
+        let (mut cpu, mut mem, _) = setup_cpl0_cpu(bytes, Box::new(GuestCpuidView::default()));
+        cpu.context_mut().cr4 |= 1 << 18;
+        cpu.context_mut().gpr[reg::RDI] = 0xdead0000;
+        step_exc(&mut cpu, &mut mem, ud(CODE_VA));
+    }
+}
