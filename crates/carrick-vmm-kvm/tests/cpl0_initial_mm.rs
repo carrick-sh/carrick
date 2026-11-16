@@ -5461,6 +5461,130 @@ fn native_child_inet_calls_run_under_the_childs_own_identity() {
     );
 }
 
+/// #2414 review P0-1: a forked native child's transfers keep their whole
+/// extent across host-file records. A 65000-byte UDP datagram is sent and
+/// received whole; a 100000-byte one is EMSGSIZE and transmits nothing; a
+/// short receive buffer truncates a datagram and discards its rest; a
+/// blocking 409600-byte TCP send into a small receive window returns its
+/// full count; a 200000-byte MSG_WAITALL receive returns its full count.
+/// The child exits 128 + the mask of failed checks (see
+/// native_child_inet.S). Red before the fix: the record cap clipped each
+/// transfer to 61440 bytes.
+#[test]
+fn native_child_inet_transfers_keep_their_whole_extent() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp peer");
+    let udp_port = udp.local_addr().expect("bound address").port();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp peer");
+    let tcp_port = tcp.local_addr().expect("bound address").port();
+    // A small receive window: the guest's blocking send fills it and waits
+    // for the peer to drain it.
+    let window: libc::c_int = 8192;
+    // SAFETY: a live socket and a correctly sized option value.
+    let set = unsafe {
+        libc::setsockopt(
+            tcp.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&raw const window).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(set, 0, "small receive window");
+    let udp_peer = std::thread::spawn(move || {
+        udp.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .expect("peer read timeout");
+        let mut sizes = Vec::new();
+        let mut datagram = vec![0u8; 70_000];
+        let from = loop {
+            let (len, from) = udp.recv_from(&mut datagram).expect("guest datagram");
+            sizes.push(len);
+            if len == 1 {
+                break from;
+            }
+        };
+        udp.send_to(&[b'A'; 65_000], from).expect("large answer");
+        udp.send_to(&[b'C'; 3_000], from).expect("truncated answer");
+        sizes
+    });
+    let tcp_peer = std::thread::spawn(move || {
+        let (mut stream, _) = tcp.accept().expect("guest connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("peer read timeout");
+        // Let the guest's send fill the window before draining it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut received = 0;
+        let mut chunk = [0u8; 4096];
+        while received < 409_600 {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => received += read,
+            }
+        }
+        // The MSG_WAITALL receive waits across these slices.
+        for _ in 0..4 {
+            if stream.write_all(&[b'B'; 50_000]).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let mut rest = Vec::new();
+        let _ = stream.read_to_end(&mut rest);
+        received
+    });
+    let defines = [
+        "-DTCP_PORT=0".to_owned(),
+        "-DUDP_PORT=0".to_owned(),
+        "-DTCP_NB_PORT=0".to_owned(),
+        format!("-DXFER_TCP_PORT={}", tcp_port.swap_bytes()),
+        format!("-DXFER_UDP_PORT={}", udp_port.swap_bytes()),
+    ];
+    let defines: Vec<&str> = defines.iter().map(String::as_str).collect();
+    let elf = native_exit_fixture_with_flags("native_child_inet.S", &defines);
+    let outcome = run_exec_fixture(&elf, 256);
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "child transfer checks (128 + failed-check mask, or a stage; see native_child_inet.S): {:?}",
+        outcome.run
+    );
+    assert_eq!(
+        udp_peer.join().expect("udp peer"),
+        [65_000, 1],
+        "the 65000-byte datagram arrived whole, nothing of the 100000-byte one"
+    );
+    assert_eq!(
+        tcp_peer.join().expect("tcp peer"),
+        409_600,
+        "the blocking send delivered its whole buffer"
+    );
+}
+
+/// #2414 review P0-2: a poll a forked native child issues again after an
+/// interrupted one waits its own timeout. `poll(u, POLLIN, 1000)` on a UDP
+/// socket nothing arrives on is interrupted by SIGUSR1 (EINTR, its handler
+/// ran), and after 800 ms more the same poll waits ~1000 ms and returns 0.
+/// Red before the fix: the signal's cancellation of the host-readiness wait
+/// failed the run, and the re-issued poll inherited the interrupted call's
+/// expired deadline.
+#[test]
+fn native_child_inet_repoll_after_eintr_waits_its_own_timeout() {
+    let defines = [
+        "-DTCP_PORT=0",
+        "-DUDP_PORT=0",
+        "-DTCP_NB_PORT=0",
+        "-DREPOLL",
+    ];
+    let elf = native_exit_fixture_with_flags("native_child_inet.S", &defines);
+    let outcome = run_exec_fixture(&elf, 256);
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "child re-poll checks (128 + failed-check mask, or a stage; see native_child_inet.S): {:?}",
+        outcome.run
+    );
+}
+
 /// #231: a forked native child's blocking AF_INET/AF_INET6 TCP and UDP
 /// sockets cross to the host network: socket, setsockopt, connect,
 /// getsockopt(SO_ERROR), getpeername, send, recv (MSG_WAITALL), shutdown,
