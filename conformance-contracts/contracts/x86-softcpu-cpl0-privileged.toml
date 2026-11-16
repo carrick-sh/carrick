@@ -31,6 +31,11 @@ rationale = "Each TLB-invalidating privileged operation (every `MOV CR3` write i
 
 [bindings]
 vm_free = [
+  "carrick-softcpu-x86::softcpu_cpl0::issue1272_dr7_unsupported_conditions_fail_closed",
+  "carrick-softcpu-x86::softcpu_cpl0::issue1272_icebp_preserves_dr6_status",
+  "carrick-softcpu-x86::softcpu_cpl0::issue1272_pushfq_clears_rf_in_image",
+  "carrick-softcpu-x86::softcpu_cpl0::issue1272_popf_updates_if_at_permitted_iopl",
+
   "carrick-softcpu-x86::softcpu_cpl0::cpl0_fixture_boot_sequence_on_softmachine_matches_kvm_state",
   "carrick-softcpu-x86::softcpu_cpl0::faulting_iretq_and_idt_preserve_gdt_accessed_bit_and_cpuid_tsc_are_consistent",
   "carrick-softcpu-x86::softcpu_cpl0::hlt_invlpg_and_cpuid_view_enforce_sdm_contracts",
