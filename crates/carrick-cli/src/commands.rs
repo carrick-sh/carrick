@@ -918,6 +918,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             DebugCommand::ExecStampCensus { input, workload_ns } => {
                 crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?
             }
+            DebugCommand::A64Census { input } => {
+                crate::args::debug_a64_census::run(input.as_deref())?;
+            }
             DebugCommand::El1Census {
                 inputs,
                 limit,
