@@ -30,6 +30,8 @@ pub fn schedule(slot: SlotId) -> ! {
     settle_current_work(current);
     loop {
         #[cfg(feature = "test-support")]
+        crate::test_support::hold_idle_scan(slot);
+        #[cfg(feature = "test-support")]
         if crate::test_support::peer_release_pending(slot) {
             crate::anonymous::release_injected_edit_wait(source, current);
         }
@@ -224,6 +226,8 @@ pub fn schedule(slot: SlotId) -> ! {
                 continue;
             }
             carrick_x86_carrier::native_execution::migrate(slot);
+            #[cfg(feature = "test-support")]
+            crate::test_support::release_idle_scan(slot);
             match unsafe { context::resume_parked(words, state.address) } {
                 Ok(never) => match never {},
                 Err(_) => fatal_boot(),

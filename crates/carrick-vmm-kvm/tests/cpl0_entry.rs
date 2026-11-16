@@ -4051,6 +4051,24 @@ fn production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation() {
     assert_eq!(outcome.run.terminating_signal, None);
 }
 
+/// #2306 on x86 CPL0: the interleaving four host CPU hogs produce in the
+/// witness above, made deterministic. The other CPU is woken from its idle
+/// sleep and its scan for work is held until this CPU's migration at the
+/// worker's switch-in has found no idle CPU, so the preempted leader stays
+/// queued here behind the polling worker. The other CPU's idle scan must
+/// take it before sleeping: the leader then forks, the worker parks in
+/// wait4 and reaps the zombie. A stranded leader never forks, and the
+/// bounded child times out.
+#[test]
+fn production_idle_cpu_takes_a_leader_stranded_behind_a_polling_worker() {
+    bounded_contention_witness(
+        "production_idle_cpu_takes_a_leader_stranded_behind_a_polling_worker",
+        "native_wait_birth_contention.S",
+        &["-DPEER_SCANS_AFTER_MIGRATION=1"],
+        "held fork with the leader stranded behind its polling worker",
+    );
+}
+
 /// #2321 on x86 CPL0: blocking wait4 on a production fork child that is
 /// already a zombie, with the pre-reap status copy contended once. An editor
 /// holder parks the caller once on the existing owner wait; a Busy copy is
