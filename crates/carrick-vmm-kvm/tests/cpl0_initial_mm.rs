@@ -4747,3 +4747,50 @@ fn serial_host_direct_output_venues_supply_untouched_pages() {
         },
     );
 }
+
+/// Run `native_robust_raw_exit.S` (with `flags`) on native Linux and through
+/// the production KVM pool; both must exit 0.
+fn robust_raw_exit_witness(flags: &[&str]) {
+    let elf = native_exit_fixture_with_flags("native_robust_raw_exit.S", flags);
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .args(["10", "taskset", "-c", "0,1"])
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "native Linux oracle: {:?}",
+        native.status
+    );
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
+        .expect("a robust-registered clone thread's raw exit retires in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
+/// #2109: glibc registers a robust list for every thread. A clone thread
+/// (`CLONE_CHILD_CLEARTID`, as glibc) runs `set_robust_list` and then a raw
+/// `exit` while the root stays live, and the root joins it on its CLEARTID
+/// word. No lane walks the list, so it is no reason to leave the ring. Before,
+/// the exit declined to host custody, the host had no task for a clone
+/// thread, and the carrier stopped with a forward binding mismatch.
+#[test]
+fn production_robust_registered_clone_raw_exit_retires_in_ring() {
+    robust_raw_exit_witness(&[]);
+}
+
+/// #2109, two live threads: a robust-registered sibling stays live on a gate
+/// while the first worker's raw exit retires, then exits raw in turn.
+#[test]
+fn production_robust_raw_exit_with_a_live_sibling_retires_in_ring() {
+    robust_raw_exit_witness(&["-DTWO_LIVE"]);
+}
+
