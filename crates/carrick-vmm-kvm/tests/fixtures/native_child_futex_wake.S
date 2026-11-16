@@ -4,6 +4,10 @@
  * Writes are host rendezvous points; no fixture completes a guest
  * lifecycle.
  */
+/* The instrumented image's query for the calling member's CPU slot. */
+#define INJECT_CURRENT_CPU 0xfffffffffffffe26
+/* The waiter's sched_yield calls before it runs on CPU 0. */
+#define YIELD_BOUND 0x10000
 #ifndef SPIN_TICKS
 #define SPIN_TICKS 100000000
 #endif
@@ -47,8 +51,23 @@ child:
     test %rax, %rax
     jz thread
     js failure
-    /* The waiter. The host has moved it to CPU 0, the only CPU it may
-     * run on, while the new thread is stopped on CPU 1. */
+    /* The waiter. CPU 1 may run it before the new thread's marker (the
+     * new thread's slice ends there): until the host has moved it to
+     * CPU 0, the only CPU it may then run on, while the new thread is
+     * stopped on CPU 1, it hands CPU 1 back. Parking there would leave
+     * it on CPU 1. */
+    mov $YIELD_BOUND, %r13d
+await_cpu0:
+    mov $INJECT_CURRENT_CPU, %rax
+    syscall
+    test %rax, %rax
+    jz on_cpu0
+    dec %r13d
+    jz failure_cpu
+    mov $24, %eax
+    syscall
+    jmp await_cpu0
+on_cpu0:
     movl $1, ready(%rip)
     /* FUTEX_WAIT_PRIVATE on go == 0. */
     lea go(%rip), %rdi
@@ -105,6 +124,9 @@ failure_wait:
     jmp exit
 failure_ready:
     mov $94, %edi
+    jmp exit
+failure_cpu:
+    mov $95, %edi
     jmp exit
 failure_wake:
     /* 100 + the wake's result, mod 256 (a result left as the syscall

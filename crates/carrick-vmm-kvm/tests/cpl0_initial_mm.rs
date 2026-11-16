@@ -815,6 +815,19 @@ fn native_exit_workers(
     carrick_el1_abi::El1TaskId,
     carrick_kernel::dispatch::SyscallDispatcher,
 ) {
+    native_exit_workers_on(elf, None)
+}
+
+/// As [`native_exit_workers`], on the instrumented build of the production
+/// entry (`CARRICK_X86_CPL0_TEST_IMAGE`) when `entry` names it.
+fn native_exit_workers_on(
+    elf: &[u8],
+    entry: Option<&[u8]>,
+) -> (
+    carrick_vmm_kvm::cpl0_boot::ProductionWorkerParts,
+    carrick_el1_abi::El1TaskId,
+    carrick_kernel::dispatch::SyscallDispatcher,
+) {
     let program = carrick_mem::elf::ElfProgram::load(elf, ELF_X86_64_MACHINE, &|_| None)
         .expect("ELF program");
     let image = prepare_x86_elf(&program).expect("static ELF");
@@ -822,11 +835,11 @@ fn native_exit_workers(
     // Match production preparation: native descriptor owners require the
     // shared IPC window and this exact root table's publication.
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
-    let mut carrier = Cpl0Carrier::boot_production(
-        physical_inventory(),
-        extent,
-        carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher),
-    )
+    let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher);
+    let mut carrier = match entry {
+        None => Cpl0Carrier::boot_production(physical_inventory(), extent, ipc),
+        Some(entry) => Cpl0Carrier::boot_production_image(physical_inventory(), entry, extent, ipc),
+    }
     .expect("real KVM");
     let issued = dispatcher.capture_one_task_context().expect("issued root");
     issued
@@ -1264,7 +1277,11 @@ fn native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there() {
     use carrick_sched_core::Claim;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     let elf = native_exit_fixture("native_child_futex_wake.S");
-    let (parts, root_tid, dispatcher) = native_exit_workers(&elf);
+    // The instrumented image answers the waiter's INJECT_CURRENT_CPU.
+    let (parts, root_tid, dispatcher) = native_exit_workers_on(
+        &elf,
+        Some(include_bytes!(env!("CARRICK_X86_CPL0_TEST_IMAGE"))),
+    );
     let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
     let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let (cpu0, cpu1) = (
@@ -1277,7 +1294,9 @@ fn native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there() {
     parent.cpu_mut().load(root).expect("load root");
     run_to_marker(&mut parent, task, 1, &factory);
     // CPU 1 runs the child's real thread birth. The new thread (the waker)
-    // runs first and stops at its marker with the main thread queued.
+    // runs first and stops at its marker with the main thread queued. Its
+    // slices end on the way (it spins for many), so CPU 1 runs the main
+    // thread meanwhile, which yields CPU 1 back until it runs on CPU 0.
     factory
         .fixture_pin_native_thread(child_tid, cpu1)
         .expect("child on CPU 1");
