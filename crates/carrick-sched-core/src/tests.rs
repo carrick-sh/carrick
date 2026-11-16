@@ -2081,6 +2081,63 @@ fn a_slice_ends_only_while_a_thread_waits_behind_the_running_one() {
     assert_eq!(zone.slice_end(SLOT, 2_000, 50), None);
 }
 
+/// #2306: a peer migrates its run queue while this slot is between its
+/// wake and its next scan, so the migration finds no idle slot and the
+/// queued thread stays behind the peer's running one. The idle scan every
+/// ISA runs before it sleeps takes it; a scan of its own queue alone, the
+/// x86 scheduler's before #2306, finds nothing and would sleep past it.
+#[test]
+fn an_idle_scan_takes_a_thread_its_peers_migration_left_queued() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    let running = zone.alloc_record(identity(40)).unwrap();
+    let stranded = zone.alloc_record(identity(41)).unwrap();
+    assert!(zone.requeue_preempted(SLOT, running).is_queued());
+    assert!(zone.requeue_preempted(SLOT, stranded).is_queued());
+    assert_eq!(zone.switch_in_full(SLOT).map(|s| s.record), Some(running));
+    // OTHER is in the guest but not idle (woken, not yet scanning).
+    let mut effects = WakeEffects::default();
+    assert_eq!(zone.migrate_queued(SLOT, &mut effects), 0);
+    assert_eq!(effects, WakeEffects::default());
+    assert_eq!(zone.switch_in_full(OTHER), None, "its own queue is empty");
+    let taken = zone.take_idle_work(OTHER).unwrap();
+    assert_eq!(taken.record, stranded);
+    assert_eq!(
+        zone.record(stranded).claim(),
+        Claim::OnCpu {
+            slot: OTHER,
+            seq: 1
+        }
+    );
+    assert_eq!(zone.slot(SLOT).queued(), 0);
+    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 1);
+}
+
+/// #2306, the other order: the slot published itself idle before a peer's
+/// migration read the idle map, so the migration placed the thread on the
+/// slot's own queue, whose sleep is then refused until its scan takes it.
+#[test]
+fn a_migration_after_an_idle_scan_published_places_the_thread_there() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    let running = zone.alloc_record(identity(40)).unwrap();
+    assert!(zone.requeue_preempted(SLOT, running).is_queued());
+    assert_eq!(zone.switch_in_full(SLOT).map(|s| s.record), Some(running));
+    assert_eq!(zone.take_idle_work(OTHER), None, "nothing to take yet");
+    let late = zone.alloc_record(identity(42)).unwrap();
+    assert!(zone.requeue_preempted(SLOT, late).is_queued());
+    let mut effects = WakeEffects::default();
+    assert_eq!(zone.migrate_queued(SLOT, &mut effects), 1);
+    assert!(
+        !zone.enter_idle(OTHER, true),
+        "a queued thread refuses sleep"
+    );
+    assert_eq!(zone.take_idle_work(OTHER).map(|s| s.record), Some(late));
+    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 0);
+}
+
 /// Stealing never takes a home record or a record needing the thief's host
 /// executor. Such a move would wake an idle vCPU only to exit immediately.
 #[test]
