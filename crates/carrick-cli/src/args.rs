@@ -29,6 +29,9 @@
 //!   `trap-capabilities`, `debug`, `volume`) have no docker analogue; they exist
 //!   for conformance fixtures and operator debugging.
 
+#[path = "debug_a64_census.rs"]
+pub(crate) mod debug_a64_census;
+
 use std::path::PathBuf;
 
 use carrick_kernel::run_state::DEFAULT_MAX_TRAPS;
@@ -1079,6 +1082,12 @@ pub(crate) enum DebugCommand {
         /// artifact. Omit to write the same bytes to stdout.
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+    /// Static A64 encoding census (slice 0a; no guest execution).
+    A64Census {
+        /// Linked AArch64 ELF. Without a path, scan embedded flat bytes
+        /// conservatively (includes data and cannot establish code closure).
+        input: Option<PathBuf>,
     },
     /// Rank EL1 census files (written by runs with
     /// `CARRICK_EL1_CENSUS=<directory>`) by host syscall CPU: for each
