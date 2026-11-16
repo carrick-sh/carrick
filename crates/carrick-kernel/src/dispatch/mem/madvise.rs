@@ -702,7 +702,7 @@ impl<'a> MemView<'a> {
                             this.mark_vma_dispatch(&mut host_alias_dispatch);
                             // An admitted MM returns pages to the root node's
                             // retained source; host setup restores bytes.
-                            if this.discard_owner_private_file_segment(cx.memory, segment)? {
+                            if this.discard_owner_private_segment(cx.memory, segment)? {
                                 continue;
                             }
                             if let Err(errno) = this.discard_private_file_segment(cx.memory, segment) {
@@ -722,8 +722,16 @@ impl<'a> MemView<'a> {
                                         segment.start, segment_len);
                                 }
                             };
-                            if !discarded && cx.memory.zero_backing(segment.start, segment_len).is_err() {
-                                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                            if !discarded {
+                                // An admitted MM's owner refuses generic
+                                // zero_backing; its node keeps the range and
+                                // supplies a zero page on the next touch.
+                                if this.discard_owner_private_segment(cx.memory, segment)? {
+                                    continue;
+                                }
+                                if cx.memory.zero_backing(segment.start, segment_len).is_err() {
+                                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                                }
                             }
                         }
                         if step.action == Action::DiscardPrivateAnonymous {
