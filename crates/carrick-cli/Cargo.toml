@@ -69,6 +69,9 @@ debug-portable = [
 debug-all = ["debug-portable", "trace-hvf", "debug-stats"]
 
 [dependencies]
+carrick-softcpu-aarch64 = { path = "../carrick-softcpu-aarch64" }
+carrick-el1-image = { path = "../carrick-el1-image" }
+carrick-mem = { path = "../carrick-mem" }
 carrick-embed = { path = "../carrick-embed", default-features = false }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 carrick-runtime = { path = "../carrick-runtime", default-features = false }

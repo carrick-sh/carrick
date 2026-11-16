@@ -92,6 +92,7 @@ lifecycle semantics.
 | `carrick-el1` | Carrick guest EL1 runtime: neutral mechanisms compiled into AArch64 EL1 and x86_64 CPL0 images. Its `fault.rs`/`memory.rs` still name Linux policy (#673 layer 3). |
 | `carrick-el1-linux` | Linux personality client of `carrick-el1` (syscall dispatch, process owner, mm portal, signals) and the AArch64 EL1 image binary. |
 | `carrick-el1-image` | Precompiled in-guest EL1 kernel binary image embedded into the host runtime. |
+| `carrick-softcpu-aarch64` | Hand-authored, fail-closed A64 static instruction classifier for the EL1 census; no CPU execution. |
 | `carrick-softcpu-x86` | Level 0 same-ISA copy-through dynamic binary translation engine for x86_64: `iced-x86` classifier, basic-block planner, control-flow resolver, inline soft-TLB probes over `SoftMmuMemory`, per-CPU page-crossing bounce buffer, and typed `#PF`/`#UD`/`#GP`/`#DE`/syscall/sensitive-op exit protocol without host signals or guest VA aliasing. |
 | `carrick-vmm-bhyve` | FreeBSD/bhyve backend; x86_64 lane through the shared x86 engine plus bhyve-specific host/VMM glue. |
 | `carrick-vmm-hvf` | macOS Hypervisor.framework backend; mature AArch64 stage-1/stage-2 projection, vCPU execution and coordination, fault/syscall exits, and observability probes. |
