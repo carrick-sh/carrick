@@ -1234,9 +1234,13 @@ fn admit<E: IpcExecution, M: UserCopy>(
         argument_word(frame, 2).min(linux::MAX_RW_COUNT)
     };
     let eventfd = matches!(kind, IpcOpKind::EventFdRead | IpcOpKind::EventFdWrite);
+    // A zero-length pipe write or read is 0 at once; a stream end's
+    // zero-length write still checks its socket's state (EPIPE after the
+    // peer closed or a shutdown, send(2)), so it runs as a transfer.
+    let stream_write = kind.writes_bytes() && kind.stream_end().is_some();
     let immediate = if !permitted {
         Some(linux::EBADF)
-    } else if !eventfd && count == 0 {
+    } else if !eventfd && !stream_write && count == 0 {
         Some(0)
     } else if eventfd && count < linux::EVENTFD_WORD {
         Some(linux::EINVAL)
