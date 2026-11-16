@@ -84,6 +84,9 @@ enum Step {
     Preempt,
     Exit,
     FailRun,
+    /// A run failure with a backend's exact text, as the HVF native service
+    /// kills a worker (#2420).
+    FailRunWith(&'static str),
     PanicRun,
     LoseLease,
     Invalid,
@@ -1381,6 +1384,7 @@ impl PersistentExecutor for FakeExecutor {
                 Ok(ExecutorExit::Exited)
             }
             Step::FailRun => Err(TrapError::Hypervisor("injected run failure".to_owned())),
+            Step::FailRunWith(error) => Err(TrapError::Hypervisor(error.to_owned())),
             Step::PanicRun => panic!("injected executor panic"),
             Step::LoseLease => {
                 let lease = submission
@@ -5001,6 +5005,73 @@ fn a_reaped_yield_publishes_the_process_job_it_would_have_stranded() {
         "a settlement whose target was reaped must publish the process job it owns; \
          nothing else can",
     );
+}
+
+/// #2420: an executor worker's death ends the run. The dead worker's
+/// sibling stays parked, so the graph census still calls the carrier live and
+/// no liveness verdict fires; before the executor-death verdict the run's
+/// supervised wait parked for the life of the process (go-hello and go-real
+/// hung to the harness timeout after `executor worker died`). Both death texts
+/// seen on HVF are injected through the real worker and the real wait.
+#[test]
+fn executor_worker_death_ends_the_supervised_run_wait() {
+    let deaths = [
+        "hypervisor operation failed: native service custody mismatch at \
+         crates/carrick-vmm-hvf/src/metadata_grant/native_service.rs:1489:34",
+        "hypervisor operation failed: native owed return of MM",
+    ];
+    for (offset, death) in deaths.into_iter().enumerate() {
+        let offset = i32::try_from(offset).expect("small offset");
+        let (kernel, root) = bootstrap(14_760 + offset);
+        // Never runnable: the census keeps one live task, as a worker parked
+        // in a futex wait does.
+        let _parked = sibling(&kernel, &root, 14_860 + offset);
+        let scheduler = Arc::new(single_cpu_scheduler(Arc::clone(&kernel)));
+        let factory = Arc::new(FakeFactory::default());
+        factory.install(&root, FakeBinding::new(760, [Step::FailRunWith(death)]));
+        let generation = publish(&root, 760);
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        drop(enqueue_root(&scheduler, &root, generation));
+
+        // The run's container job: nothing the dead worker owned will ever
+        // publish it.
+        let job = crate::vcpu_loop::HvpatchLoopResult::pending();
+        let liveness = crate::vcpu_loop::outcome::ProcessGraphLiveness {
+            kernel: Some(Arc::downgrade(&kernel)),
+            scheduler: Some(Arc::clone(&scheduler)),
+            recorded: Arc::default(),
+            fixed_census: None,
+            poll: Duration::from_millis(10),
+            confirm: crate::vcpu_loop::outcome::LIVENESS_CONFIRM,
+        };
+        let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = ended_tx.send(job.wait_supervised(&liveness));
+        });
+        // Bounded by the harness, never by the product: a red run fails here
+        // instead of hanging the suite.
+        let ended = ended_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("an executor death must end the run's wait, not park it");
+        let error = ended.expect_err("a dead executor's run ends with an error");
+        let text = error.to_string();
+        assert!(
+            matches!(
+                error,
+                carrick_kernel::run_result::RuntimeError::KernelAborted { .. }
+            ),
+            "the death is a carrier-terminal abort: {text}"
+        );
+        assert!(
+            text.contains("executor worker died index=0") && text.contains(death),
+            "the run's error names the worker and its exact death: {text}"
+        );
+
+        let shutdown = pool
+            .shutdown()
+            .expect_err("the worker failure stays visible at shutdown");
+        assert!(shutdown.to_string().contains(death));
+    }
 }
 
 #[test]
