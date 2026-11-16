@@ -4,6 +4,9 @@
  * Writes are host rendezvous points; no fixture completes a guest
  * lifecycle.
  */
+#ifndef SPIN_TICKS
+#define SPIN_TICKS 100000000
+#endif
 .global _start
 .text
 _start:
@@ -59,6 +62,20 @@ child:
     mov $19, %edi
     jmp exit
 thread:
+    /* Run for many preemption slices first (SPIN_TICKS of the TSC), so
+     * CPU 1 rotates to the main thread before this marker. */
+    rdtsc
+    shl $32, %rdx
+    or %rdx, %rax
+    mov %rax, %r13
+spin:
+    pause
+    rdtsc
+    shl $32, %rdx
+    or %rdx, %rax
+    sub %r13, %rax
+    cmp $SPIN_TICKS, %rax
+    jb spin
     /* Stop CPU 1 with the main thread queued behind this one. */
     movb $2, marker_byte(%rip)
     call marker
