@@ -56,7 +56,7 @@ fn command_rejects_reserved_code_excludes_literals_and_is_deterministic() -> any
     std::fs::write(&path, fixture())?;
     let invoke = || {
         Command::new(env!("CARGO_BIN_EXE_carrick"))
-            .args(["debug", "a64-census"])
+            .args(["debug", "a64-census", "--strict"])
             .arg(&path)
             .output()
     };
@@ -64,6 +64,12 @@ fn command_rejects_reserved_code_excludes_literals_and_is_deterministic() -> any
     let second = invoke()?;
     assert_eq!(first.status.code(), Some(1));
     assert_eq!(first.stdout, second.stdout);
+    let measurement = Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .args(["debug", "a64-census"])
+        .arg(&path)
+        .output()?;
+    assert_eq!(measurement.status.code(), Some(0));
+    assert_eq!(measurement.stdout, first.stdout);
     let report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
     let unknown = report["unknown"]
         .as_array()
