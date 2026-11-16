@@ -1864,7 +1864,7 @@ fn chmod_and_chown_answer_linux_errors_in_ring() {
             other => return caller(other),
         })
     };
-    let mut staged = |call: HostFileCall, user: &mut Memory| {
+    let staged = |call: HostFileCall, user: &mut Memory| {
         let mut resolve = path_fd;
         let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
         stage(

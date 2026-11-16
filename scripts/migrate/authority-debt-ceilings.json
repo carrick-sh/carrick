@@ -34290,14 +34290,14 @@
     {
       "family": "k1_inspect_misc",
       "operation": "inspect",
-      "owner": "carrick_kernel::dispatch::fs::attr::FsView<'a>::fchmod",
+      "owner": "carrick_kernel::dispatch::fs::attr::FsView<'a>::chmod_description",
       "lane": "shared",
       "ceiling": 1
     },
     {
       "family": "k1_inspect_misc",
       "operation": "inspect",
-      "owner": "carrick_kernel::dispatch::fs::attr::FsView<'a>::fchown_by_fd",
+      "owner": "carrick_kernel::dispatch::fs::attr::FsView<'a>::chown_description",
       "lane": "shared",
       "ceiling": 1
     },
@@ -34808,7 +34808,7 @@
     {
       "family": "k1_inspect_misc",
       "operation": "write_for_io",
-      "owner": "carrick_kernel::dispatch::fs::attr::FsView<'a>::fchmod",
+      "owner": "carrick_kernel::dispatch::fs::attr::FsView<'a>::chmod_description",
       "lane": "shared",
       "ceiling": 1
     },
