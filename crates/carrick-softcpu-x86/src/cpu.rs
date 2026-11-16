@@ -536,6 +536,7 @@ impl SoftCpu {
     ) -> Result<SoftCpuExit, EmitError> {
         self.ctx.pending_exception = None;
         self.ctx.icebp_trap = false;
+        self.ctx.debug_register_fault = false;
         self.ctx.halted = false;
         let _ = self.ctx.poll_apic_timer();
         crate::context::prepare_gateway(self.ctx.rip)?;
