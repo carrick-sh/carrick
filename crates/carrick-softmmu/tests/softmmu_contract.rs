@@ -1736,3 +1736,51 @@ fn two_thread_invlpg_eviction_and_cr3_root_switch_flush_match_hardware()
     });
     Ok(())
 }
+
+/// Measure in a child so concurrent tests cannot hide growth by freeing memory.
+#[cfg(target_os = "linux")]
+#[test]
+fn largest_fixture_keeps_untouched_pages_nonresident() {
+    const CHILD: &str = "CARRICK_SOFTMMU_RSS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "largest_fixture_keeps_untouched_pages_nonresident",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated fixture RSS witness failed: {status}"
+        );
+        return;
+    }
+    fn resident_kib() -> usize {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")
+                    .map(|rss| rss.split_whitespace().next().unwrap().parse().unwrap())
+            })
+            .expect("Linux exposes VmRSS")
+    }
+    let before = resident_kib();
+    let mem = VecGuestMemory::with_holes(2 * (1u64 << 30), MmioHoles::empty()).unwrap();
+    let shared = mem.clone();
+    for gpa in [0, (1u64 << 30), 2 * (1u64 << 30) - 8] {
+        assert_eq!(mem.get(gpa, 0), 0);
+        mem.set(gpa, 0, 42);
+        assert_eq!(shared.get(gpa, 0), 42);
+    }
+    let growth = resident_kib().saturating_sub(before);
+    println!("2 GiB fixture resident growth: {growth} KiB (limit 65536 KiB)");
+    assert!(
+        growth < 64 * 1024,
+        "untouched fixture pages became resident: {growth} KiB"
+    );
+    std::hint::black_box(&shared);
+}
