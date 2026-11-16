@@ -418,6 +418,7 @@ fn emulate_mov_dr(
     if (ctx.dr[7] & DR7_GD) != 0 {
         ctx.dr[6] |= DR6_BD;
         ctx.dr[7] &= !DR7_GD;
+        ctx.debug_register_fault = true;
         return Err(X86Exception::debug(va));
     }
 

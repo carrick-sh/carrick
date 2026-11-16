@@ -471,6 +471,7 @@ pub struct SoftCpuContext {
     /// (Intel SDM Vol. 3A §6.8.3).
     pub interrupt_shadow: bool,
     pub(crate) icebp_trap: bool,
+    pub(crate) debug_register_fault: bool,
     pub(crate) lapic_mmio_offset: u16,
     pub(crate) lapic_mmio_size: u8,
 }
@@ -627,6 +628,7 @@ impl SoftCpuContext {
             halted_rip: 0,
             interrupt_shadow: false,
             icebp_trap: false,
+            debug_register_fault: false,
             lapic_mmio_offset: 0,
             lapic_mmio_size: 0,
         };

@@ -1074,7 +1074,7 @@ fn idt_vector_de_delivers_frame_rsp0_ist_and_iretq_resume() {
         Frame40 {
             rip: USER_CODE_VA + 9,
             cs: 0x2b,
-            rflags: RFLAGS_IF | (1 << 6) | (1 << 2) | 0x2,
+            rflags: RFLAGS_RF | RFLAGS_IF | (1 << 6) | (1 << 2) | 0x2,
             rsp: USER_STACK_VA + 0xff0,
             ss: 0x23,
         }
@@ -1198,7 +1198,7 @@ fn idt_vector_db_delivers_tf_dr0_rf_and_icebp_through_idt() {
         rig.read_frame40(rig.rsp0_frame, 0xfc8).rip,
         USER_CODE_VA + 1
     );
-    assert_eq!(rig.machine.context().dr[6] & (1 << 14), 1 << 14);
+    assert_eq!(rig.machine.context().dr[6] & (1 << 14), 0);
 
     // With gate 1 P=0, ICEBP raises #NP with EXT=0 (`(1 << 3) | 0x2`, NOT `| 0x1`) and RIP = USER_CODE_VA!
     rig.set_gate(1, IdtTestRig::stub_va(1), 0x08, 0, 0x0e, 0, false);
@@ -1223,7 +1223,7 @@ fn idt_vector_ud_delivers_frame_rsp0_ist_and_iretq_resume() {
         Frame40 {
             rip: USER_CODE_VA,
             cs: 0x2b,
-            rflags: RFLAGS_IF | 0x2,
+            rflags: RFLAGS_RF | RFLAGS_IF | 0x2,
             rsp: USER_STACK_VA + 0xff0,
             ss: 0x23,
         }
@@ -1262,7 +1262,7 @@ fn idt_vector_gp_delivers_zero_and_selector_error_codes_rsp0_and_ist() {
             error_code: 0,
             rip: USER_CODE_VA,
             cs: 0x2b,
-            rflags: RFLAGS_IF | 0x2,
+            rflags: RFLAGS_RF | RFLAGS_IF | 0x2,
             rsp: USER_STACK_VA + 0xff0,
             ss: 0x23,
         }
@@ -1310,7 +1310,7 @@ fn idt_vector_pf_delivers_cr2_all_five_error_bits_rsp0_ist_and_pte_fixup() {
             error_code: u64::from(PF_ERR_PRESENT | PF_ERR_WRITE | PF_ERR_USER),
             rip: USER_CODE_VA,
             cs: 0x2b,
-            rflags: RFLAGS_IF | 0x2,
+            rflags: RFLAGS_RF | RFLAGS_IF | 0x2,
             rsp: USER_STACK_VA + 0xff0,
             ss: 0x23,
         }
@@ -1601,4 +1601,41 @@ fn issue1272_fault_frames_set_rf() {
             RFLAGS_RF
         );
     }
+}
+
+#[test]
+fn issue1272_rf_distinguishes_pf_gd_and_instruction_breakpoint() {
+    let mut rig = IdtTestRig::new();
+    rig.write_user_code(&[0x48, 0x8b, 0x00]); // mov rax,[rax] -> #PF
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_RF);
+    rig.machine.context_mut().gpr[reg::RAX] = 0;
+    assert_eq!(rig.run_to_vec_port(), 14);
+    assert_eq!(
+        rig.read_frame48(rig.rsp0_frame, 0xfc0).rflags & RFLAGS_RF,
+        RFLAGS_RF
+    );
+
+    let mut rig = IdtTestRig::new();
+    rig.write_kernel_code(&[0x0f, 0x21, 0xc0]); // mov rax,dr0 -> GD #DB
+    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().dr[7] = 0x2400;
+    assert_eq!(rig.run_to_vec_port(), 1);
+    let rsp = rig.machine.context().gpr[reg::RSP];
+    let saved = rig
+        .machine
+        .mem()
+        .read_u64(rig.stack_frame.raw() + (rsp & 0xfff) + 16);
+    assert_eq!(saved & RFLAGS_RF, RFLAGS_RF);
+
+    let mut rig = IdtTestRig::new();
+    rig.write_user_code(&[0x90]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().dr[0] = USER_CODE_VA;
+    rig.machine.context_mut().dr[7] = 0x401;
+    rig.machine.context_mut().dr[6] |= 1 << 13; // stale BD must not classify this #DB as GD
+    assert_eq!(rig.run_to_vec_port(), 1);
+    assert_eq!(
+        rig.read_frame40(rig.rsp0_frame, 0xfc8).rflags & RFLAGS_RF,
+        0
+    );
 }

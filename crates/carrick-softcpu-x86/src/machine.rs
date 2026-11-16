@@ -427,9 +427,7 @@ fn deliver_exception_with_escalation<M: SoftMmuMemory>(
         // SDM Vol. 3B §17.3.1.1: faults save RF=1, except instruction
         // breakpoints. A GD #DB is a fault; TF and INT1 are traps.
         let fault_rf = match current.vector {
-            X86ExceptionVector::Debug => {
-                !icebp && current.rip == ctx.exit_insn_va && ctx.dr[6] & (1 << 13) != 0
-            }
+            X86ExceptionVector::Debug => ctx.debug_register_fault,
             X86ExceptionVector::DivideError
             | X86ExceptionVector::BoundRangeExceeded
             | X86ExceptionVector::InvalidOpcode
@@ -444,6 +442,7 @@ fn deliver_exception_with_escalation<M: SoftMmuMemory>(
             | X86ExceptionVector::SimdFloatingPoint => true,
             _ => false,
         };
+        ctx.debug_register_fault = false;
         match deliver_idt_vector(
             ctx,
             mem,
