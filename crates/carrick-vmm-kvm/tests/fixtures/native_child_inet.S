@@ -28,6 +28,35 @@
  *   identity: setresuid(1000, 1000, 1000), then socket(AF_INET, SOCK_RAW,
  *        IPPROTO_ICMP) is EPERM (the child holds no CAP_NET_RAW, whatever
  *        the run root holds), while an unprivileged TCP socket still opens.
+ *
+ * With XFER_TCP_PORT and XFER_UDP_PORT the child instead checks transfers
+ * larger than one host-file record (#2414 review P0-1), against a UDP peer
+ * that reads datagrams until a 1-byte marker, then answers a 65000-byte
+ * datagram of 'A' and a 3000-byte one, and a TCP peer (small receive
+ * window) that drains 409600 bytes, then sends 200000 bytes of 'B' in
+ * slices:
+ *   bit 0: sendto of a 65000-byte UDP datagram returns 65000;
+ *   bit 1: sendto of a 100000-byte UDP datagram is EMSGSIZE (90), and the
+ *        peer sees no part of it (it checks the datagrams it read);
+ *   bit 2: recvfrom of the 65000-byte datagram into a 65000-byte buffer
+ *        returns 65000, its last byte 'A';
+ *   bit 3: recvfrom of the 3000-byte datagram into 16 bytes returns 16 and
+ *        the rest is discarded (the next MSG_DONTWAIT recv is EAGAIN);
+ *   bit 4: a blocking TCP send of 409600 bytes returns 409600;
+ *   bit 5: recvfrom(MSG_WAITALL) of 200000 bytes returns 200000, its last
+ *        byte 'B'.
+ *
+ * With REPOLL the child instead checks that a poll issued again after an
+ * interrupted one waits its own timeout (#2414 review P0-2), on a UDP
+ * socket nothing arrives on:
+ *   bit 0: poll(u, POLLIN, 1000), interrupted by SIGUSR1 (a grandchild's
+ *        kill after 300 ms; the handler has no SA_RESTART), is EINTR and
+ *        the handler ran once;
+ *   bit 1: after 800 ms more (the interrupted call's deadline passed), the
+ *        same poll waits its own full timeout (>= 900 ms) and returns 0.
+ *
+ * In both modes every check runs; the child exits 128 + the mask of failed
+ * bits (0 when all pass), or the stage number of a step the checks rely on.
  * The root reaps the child and exits with its status. Child exit 0 = every
  * step returned what Linux returns; a step that returned something else
  * exits with its stage number, or 100 + stage when it returned ENOSYS (38).
@@ -50,6 +79,18 @@
 #define SYS_RT_SIGACTION 13
 #define SYS_RT_SIGRETURN 15
 #define SYS_SETRESUID 117
+#define SYS_NANOSLEEP 35
+#define SYS_KILL 62
+#define SYS_GETPPID 110
+#define SYS_CLOCK_GETTIME 228
+#define SYS_EXIT 60
+
+/* Record `mask` in xfails unless %rax == value; continue either way. */
+#define CHECK(mask, value)   \
+    cmp $value, %rax;        \
+    je 1f;                   \
+    orl $mask, xfails(%rip); \
+1:
 
 /* Fail unless %rax == value. */
 #define EXPECT(stage, value) \
@@ -79,6 +120,12 @@ _start:
 child:
 #ifdef ID_PORT
     jmp identity
+#endif
+#ifdef XFER_TCP_PORT
+    jmp transfer
+#endif
+#ifdef REPOLL
+    jmp repoll
 #endif
     /* TCP over IPv4. */
     mov $2, %edi                   /* socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, 0) */
@@ -511,6 +558,246 @@ sigpipe_restorer:
     ud2
 #endif
 
+#ifdef XFER_TCP_PORT
+transfer:
+    mov $2, %edi                   /* socket(AF_INET, SOCK_DGRAM, 0) */
+    mov $2, %esi
+    xor %edx, %edx
+    mov $SYS_SOCKET, %eax
+    syscall
+    mov $71, %r15d
+    test %rax, %rax
+    js fail
+    mov %rax, %r13
+
+    mov %r13, %rdi                 /* sendto(u, huge, 65000, 0, &peer, 16) */
+    lea huge(%rip), %rsi
+    mov $65000, %edx
+    xor %r10d, %r10d
+    lea xfer_udp_addr(%rip), %r8
+    mov $16, %r9d
+    mov $SYS_SENDTO, %eax
+    syscall
+    CHECK(1, 65000)
+
+    mov %r13, %rdi                 /* sendto(u, huge, 100000, ...): EMSGSIZE */
+    lea huge(%rip), %rsi
+    mov $100000, %edx
+    xor %r10d, %r10d
+    lea xfer_udp_addr(%rip), %r8
+    mov $16, %r9d
+    mov $SYS_SENDTO, %eax
+    syscall
+    CHECK(2, -90)
+
+    mov %r13, %rdi                 /* sendto(u, "q", 1, ...): the marker */
+    lea query(%rip), %rsi
+    mov $1, %edx
+    xor %r10d, %r10d
+    lea xfer_udp_addr(%rip), %r8
+    mov $16, %r9d
+    mov $SYS_SENDTO, %eax
+    syscall
+    EXPECT(72, 1)
+
+    mov %r13, %rdi                 /* recvfrom(u, huge, 65000, 0, NULL, NULL) */
+    lea huge(%rip), %rsi
+    mov $65000, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $SYS_RECVFROM, %eax
+    syscall
+    CHECK(4, 65000)
+    movzbl huge+64999(%rip), %eax
+    CHECK(4, 'A')
+
+    mov %r13, %rdi                 /* recvfrom(u, buffer, 16, 0): truncated */
+    lea buffer(%rip), %rsi
+    mov $16, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $SYS_RECVFROM, %eax
+    syscall
+    CHECK(8, 16)
+    mov %r13, %rdi                 /* recvfrom(u, buffer, 16, MSG_DONTWAIT) */
+    lea buffer(%rip), %rsi
+    mov $16, %edx
+    mov $0x40, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $SYS_RECVFROM, %eax
+    syscall
+    CHECK(8, -11)
+
+    mov $2, %edi                   /* socket(AF_INET, SOCK_STREAM, 0) */
+    mov $1, %esi
+    xor %edx, %edx
+    mov $SYS_SOCKET, %eax
+    syscall
+    mov $78, %r15d
+    test %rax, %rax
+    js fail
+    mov %rax, %r12
+    mov %r12, %rdi                 /* connect(s, &xfer_tcp_addr, 16) */
+    lea xfer_tcp_addr(%rip), %rsi
+    mov $16, %edx
+    mov $SYS_CONNECT, %eax
+    syscall
+    EXPECT(79, 0)
+
+    mov %r12, %rdi                 /* sendto(s, huge, 409600, 0, NULL, 0) */
+    lea huge(%rip), %rsi
+    mov $409600, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $SYS_SENDTO, %eax
+    syscall
+    CHECK(16, 409600)
+
+    mov %r12, %rdi                 /* recvfrom(s, huge, 200000, MSG_WAITALL) */
+    lea huge(%rip), %rsi
+    mov $200000, %edx
+    mov $0x100, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $SYS_RECVFROM, %eax
+    syscall
+    CHECK(32, 200000)
+    movzbl huge+199999(%rip), %eax
+    CHECK(32, 'B')
+
+    mov %r12, %rdi
+    mov $SYS_CLOSE, %eax
+    syscall
+    EXPECT(80, 0)
+
+    movl xfails(%rip), %edi
+    test %edi, %edi
+    jz exit
+    or $128, %edi
+    jmp exit
+
+#endif
+
+#ifdef REPOLL
+repoll:
+    mov $10, %edi                  /* rt_sigaction(SIGUSR1, &act, NULL, 8) */
+    lea usr1_act(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $SYS_RT_SIGACTION, %eax
+    syscall
+    EXPECT(81, 0)
+    mov $2, %edi                   /* socket(AF_INET, SOCK_DGRAM, 0): nothing arrives */
+    mov $2, %esi
+    xor %edx, %edx
+    mov $SYS_SOCKET, %eax
+    syscall
+    mov $82, %r15d
+    test %rax, %rax
+    js fail
+    mov %rax, %r13
+
+    /* An interrupted poll's deadline is its own: the same poll, issued
+     * again after that deadline passed, waits its own full timeout. */
+    mov $SYS_FORK, %eax
+    syscall
+    mov $73, %r15d
+    test %rax, %rax
+    js fail
+    jnz 2f
+    lea usr1_delay(%rip), %rdi     /* grandchild: sleep 300 ms, then kill */
+    xor %esi, %esi
+    mov $SYS_NANOSLEEP, %eax
+    syscall
+    mov $SYS_GETPPID, %eax
+    syscall
+    mov %rax, %rdi
+    mov $10, %esi
+    mov $SYS_KILL, %eax
+    syscall
+    xor %edi, %edi
+    mov $SYS_EXIT, %eax
+    syscall
+    ud2
+2:
+    mov %rax, %rbx
+    mov %r13d, pollfd(%rip)        /* poll(u, POLLIN, 1000): EINTR */
+    movw $1, pollfd+4(%rip)
+    movw $0, pollfd+6(%rip)
+    lea pollfd(%rip), %rdi
+    mov $1, %esi
+    mov $1000, %edx
+    mov $SYS_POLL, %eax
+    syscall
+    CHECK(1, -4)
+    movslq usr1_count(%rip), %rax  /* the handler ran once */
+    CHECK(1, 1)
+    mov %rbx, %rdi                 /* wait4(grandchild, &status, 0, NULL) */
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $SYS_WAIT4, %eax
+    syscall
+    mov $74, %r15d
+    cmp %rbx, %rax
+    jne fail
+    lea poll_rest(%rip), %rdi      /* nanosleep(800 ms): its deadline passes */
+    xor %esi, %esi
+    mov $SYS_NANOSLEEP, %eax
+    syscall
+    EXPECT(75, 0)
+    mov $1, %edi                   /* clock_gettime(CLOCK_MONOTONIC, &before) */
+    lea before(%rip), %rsi
+    mov $SYS_CLOCK_GETTIME, %eax
+    syscall
+    EXPECT(76, 0)
+    movw $0, pollfd+6(%rip)        /* the same poll(u, POLLIN, 1000): 0 */
+    lea pollfd(%rip), %rdi
+    mov $1, %esi
+    mov $1000, %edx
+    mov $SYS_POLL, %eax
+    syscall
+    CHECK(2, 0)
+    mov $1, %edi                   /* clock_gettime(CLOCK_MONOTONIC, &after) */
+    lea after(%rip), %rsi
+    mov $SYS_CLOCK_GETTIME, %eax
+    syscall
+    EXPECT(77, 0)
+    mov after(%rip), %rax          /* elapsed ms >= 900 */
+    sub before(%rip), %rax
+    imul $1000, %rax, %rcx
+    mov after+8(%rip), %rax
+    sub before+8(%rip), %rax
+    cqo
+    mov $1000000, %r8
+    idiv %r8
+    add %rcx, %rax
+    cmp $900, %rax
+    jge 3f
+    orl $2, xfails(%rip)
+3:
+
+    movl xfails(%rip), %edi
+    test %edi, %edi
+    jz exit
+    or $128, %edi
+    jmp exit
+#endif
+
+#if defined(XFER_TCP_PORT) || defined(REPOLL)
+usr1_handler:
+    incl usr1_count(%rip)
+    ret
+usr1_restorer:
+    mov $SYS_RT_SIGRETURN, %eax
+    syscall
+    ud2
+#endif
+
 fail:
     mov %r15d, %edi
     cmp $-38, %rax
@@ -545,6 +832,37 @@ pipes:
 .align 8
 big:
     .zero 100000
+#endif
+#ifdef XFER_TCP_PORT
+xfer_tcp_addr:
+    .short 2
+    .short XFER_TCP_PORT
+    .byte 127, 0, 0, 1
+    .quad 0
+xfer_udp_addr:
+    .short 2
+    .short XFER_UDP_PORT
+    .byte 127, 0, 0, 1
+    .quad 0
+#endif
+#if defined(XFER_TCP_PORT) || defined(REPOLL)
+usr1_act:
+    .quad usr1_handler             /* sa_handler */
+    .quad 0x04000000               /* sa_flags: SA_RESTORER, no SA_RESTART */
+    .quad usr1_restorer            /* sa_restorer */
+    .quad 0                        /* sa_mask */
+usr1_delay:
+    .quad 0, 300000000             /* 300 ms */
+poll_rest:
+    .quad 0, 800000000             /* 800 ms */
+before:
+    .quad 0, 0
+after:
+    .quad 0, 0
+usr1_count:
+    .long 0
+xfails:
+    .long 0
 #endif
 tcp_addr:
     .short 2
@@ -595,3 +913,9 @@ status:
 .align 8
 pollfd:
     .zero 8
+#ifdef XFER_TCP_PORT
+.bss
+.align 4096
+huge:
+    .zero 409600
+#endif
