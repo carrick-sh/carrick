@@ -296,9 +296,11 @@ impl carrick_sched_core::WakeMechanics for WakeCpu<'_> {
         #[cfg(not(target_os = "none"))]
         0
     }
-    /// x86 CPL0 has no run-queue slice timer (its timer vector serves
-    /// signal timers only): a thread queued on the waker's own slot is a
-    /// reschedule kick to that slot.
+    /// A thread queued on the waker's own slot is a reschedule kick to that
+    /// slot: its interrupt rotates the running thread at once. The thread
+    /// that rotation queues behind the next one waits for the slice
+    /// deadline the CPU arms when it resumes that one (the shared
+    /// `ZoneTables::slice_end`, #2306).
     fn arm_slice_timer(&mut self) {
         let slot = self.waker;
         carrick_sched_core::WakeMechanics::send_resched(self, slot);

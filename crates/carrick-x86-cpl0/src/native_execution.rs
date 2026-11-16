@@ -35,7 +35,7 @@ pub fn schedule(slot: SlotId) -> ! {
         if crate::test_support::peer_release_pending(slot) {
             crate::anonymous::release_injected_edit_wait(source, current);
         }
-        expire_signal_timer(slot);
+        expire_timers(slot, false);
         if let Some(selected) = source.zone.switch_in_full(slot) {
             source.zone.leave_idle(slot);
             let record = source.zone.record_ref(selected.record);
@@ -228,6 +228,7 @@ pub fn schedule(slot: SlotId) -> ! {
             carrick_x86_carrier::native_execution::migrate(slot);
             #[cfg(feature = "test-support")]
             crate::test_support::release_idle_scan(slot);
+            arm_slice(source.zone, slot);
             match unsafe { context::resume_parked(words, state.address) } {
                 Ok(never) => match never {},
                 Err(_) => fatal_boot(),
@@ -265,7 +266,22 @@ fn settle_current_work(current: &carrick_el1_abi::CurrentTask) {
 }
 
 /// Consume the shared timer claim; hardware only supplies a counter interrupt.
+/// A thread running on `slot` keeps its slice deadline armed alongside.
 pub fn expire_signal_timer(slot: SlotId) {
+    expire_timers(slot, running_on(slot));
+}
+
+/// Whether a thread runs on `slot` (not its idle loop, which publishes
+/// itself idle before it halts).
+fn running_on(slot: SlotId) -> bool {
+    carrick_x86_carrier::native_execution::source(slot)
+        .zone
+        .slot(slot)
+        .state()
+        == carrick_sched_core::SlotState::Running
+}
+
+fn expire_timers(slot: SlotId, running: bool) {
     use carrick_guest_arch::{CounterTick, Deadline, InterruptBackend};
     if !native_process::is_admitted() {
         return;
@@ -273,25 +289,76 @@ pub fn expire_signal_timer(slot: SlotId) {
     let zone = carrick_x86_carrier::native_execution::source(slot).zone;
     let mut backend = x86::X86Backend;
     let now = backend.counter().unwrap_or_else(|_| fatal_boot());
-    let retry_ticks = backend
+    let retry_ticks = ticks(&mut backend, TIMER_RETRY_NS);
+    let deadline = zone.expire_timer_and_rearm(
+        slot,
+        now.raw(),
+        carrick_personality_linux::sched::ETIMEDOUT_RESULT,
+        retry_ticks,
+        &|owned| {
+            carrick_el1::substrate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        },
+    );
+    let deadline = if running {
+        with_slice(&mut backend, zone, slot, now.raw(), deadline)
+    } else {
+        deadline
+    };
+    backend
+        .arm_timer(deadline.map(|ticks| Deadline(CounterTick::new(ticks))))
+        .unwrap_or_else(|_| fatal_boot());
+}
+
+/// A thread is about to resume on `slot`: start its slice when others wait
+/// behind it, and arm the CPU's timer for the earlier of the slot's timed
+/// park and that slice's end (the shared slice policy, #2360). Any
+/// user-origin interrupt with a runnable head rotates the running thread
+/// ([`crate::linux_personality::signal_irq_return`]); without this deadline
+/// a thread that never parks, such as a syscall poller, keeps the queued
+/// one off this CPU indefinitely (#2306).
+fn arm_slice(zone: &'static carrick_el1::memory::reservations::X86Cpl0Zone, slot: SlotId) {
+    use carrick_guest_arch::{CounterTick, Deadline, InterruptBackend};
+    if zone.slot(slot).queued() == 0 {
+        return;
+    }
+    let mut backend = x86::X86Backend;
+    let now = backend.counter().unwrap_or_else(|_| fatal_boot()).raw();
+    zone.slot(slot).restart_slice(now);
+    let deadline = with_slice(&mut backend, zone, slot, now, zone.timer_deadline(slot));
+    backend
+        .arm_timer(deadline.map(|ticks| Deadline(CounterTick::new(ticks))))
+        .unwrap_or_else(|_| fatal_boot());
+}
+
+/// `deadline`, or the running thread's slice end when that is earlier. A
+/// slice already over (its interrupt was taken where it could not rotate)
+/// is retried shortly rather than at once.
+fn with_slice(
+    backend: &mut x86::X86Backend,
+    zone: &carrick_el1::memory::reservations::X86Cpl0Zone,
+    slot: SlotId,
+    now: u64,
+    deadline: Option<u64>,
+) -> Option<u64> {
+    let slice_ticks = ticks(backend, carrick_sched_core::PREEMPT_SLICE_NS);
+    let Some(mut slice_end) = zone.slice_end(slot, now, slice_ticks) else {
+        return deadline;
+    };
+    if slice_end <= now {
+        slice_end = now.saturating_add(ticks(backend, TIMER_RETRY_NS));
+    }
+    Some(deadline.map_or(slice_end, |deadline| deadline.min(slice_end)))
+}
+
+/// A retried deadline: one millisecond.
+const TIMER_RETRY_NS: u64 = 1_000_000;
+
+fn ticks(backend: &mut x86::X86Backend, ns: u64) -> u64 {
+    use carrick_guest_arch::InterruptBackend;
+    let hz = backend
         .frequency()
         .unwrap_or_else(|_| fatal_boot())
         .raw()
-        .get()
-        / 1000;
-    let deadline = zone
-        .expire_timer_and_rearm(
-            slot,
-            now.raw(),
-            carrick_personality_linux::sched::ETIMEDOUT_RESULT,
-            retry_ticks,
-            &|owned| {
-                carrick_el1::substrate::sched::object_wait::deliver_host_completion(
-                    owned.zone(),
-                    owned,
-                )
-            },
-        )
-        .map(|ticks| Deadline(CounterTick::new(ticks)));
-    backend.arm_timer(deadline).unwrap_or_else(|_| fatal_boot());
+        .get();
+    u64::try_from(u128::from(hz) * u128::from(ns) / 1_000_000_000).unwrap_or(u64::MAX)
 }

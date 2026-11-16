@@ -1147,13 +1147,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let (zone, slot) = (self.zone, self.slot);
         let s = zone.slot(slot);
         let mut want = zone.timer_deadline(slot);
-        if running && s.queued() != 0 {
-            let mut since = s.queued_since();
-            if since == 0 {
-                since = self.cpu.now();
-                s.restart_slice(since);
-            }
-            let slice_end = since.saturating_add(self.ticks(PREEMPT_SLICE_NS));
+        if running
+            && let Some(slice_end) =
+                zone.slice_end(slot, self.cpu.now(), self.ticks(PREEMPT_SLICE_NS))
+        {
             want = Some(want.map_or(slice_end, |deadline| deadline.min(slice_end)));
         }
         // Nothing to time: a timer still armed fires once, finds nothing to
