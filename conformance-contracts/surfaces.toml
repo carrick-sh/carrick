@@ -35,6 +35,7 @@ surfaces = [
   { path = "crates/carrick-abi/src/lib.rs", contract = "kernel.el1.arm-ring-first-crossing" },
   { path = "crates/carrick-abi/src/lib.rs", contract = "kernel.native.entropy" },
   { path = "crates/carrick-abi/src/x86_syscall_crosscheck.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-cli/src/debug_a64_census.rs", contracts = [] },
   { path = "crates/carrick-cli/tests/fixtures/x86_entrypoint_argv.S", contract = "runtime.image-entrypoint" },
   { path = "crates/carrick-cli/tests/fixtures/x86_fork_prepared_cow_write.S", contract = "kernel.el1.fault-entry" },
   { path = "crates/carrick-cli/tests/x86_kvm_run.rs", contract = "diagnostics.syscall-refusal" },
@@ -1129,7 +1130,6 @@ surfaces = [
   { path = "crates/carrick-signal-linux/src/lib.rs", contract = "kernel.el1.signal-delivery-owner" },
   # Static diagnostics only: no guest execution or advertised CPU semantics.
   { path = "crates/carrick-softcpu-aarch64/src/lib.rs", contracts = [] },
-  { path = "crates/carrick-cli/src/debug_a64_census.rs", contracts = [] },
   { path = "crates/carrick-softcpu-x86/examples/scan_unsupported.rs", contracts = [] },
   { path = "crates/carrick-softcpu-x86/src/apic.rs", contract = "x86.softcpu.apic-timer" },
   { path = "crates/carrick-softcpu-x86/src/avx.rs", contract = "x86.softcpu.level0" },
