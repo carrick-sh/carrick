@@ -7,10 +7,9 @@
  *           Linux result and the values it writes to the stat buffers match.
  *           Expected stdout "F\n", exit 7.
  *   CHILD   a forked child, whose cwd the root's fork seeded (#2155): the
- *           child mutation venue serves truncate and newfstatat against that
- *           cwd (ENOENT on the absent file, no host effect, which the parent
- *           proves); fchmodat has no child route and is a counted ENOSYS in
- *           ring; a closed descriptor is EBADF. */
+ *           child mutation venue serves fchmodat (#231), truncate and
+ *           newfstatat against that cwd (ENOENT on the absent file, no host
+ *           effect, which the parent proves); a closed descriptor is EBADF. */
 #include "x86_b1_common.h"
 
 .equ SYS_openat, 257
@@ -77,7 +76,7 @@ child_script:
     PATH %rsi, file
     mov $0600, %edx
     SYS SYS_fchmodat
-    EXPECT 11, -ENOSYS
+    EXPECT 11, -2
     PATH %rdi, file
     mov $1, %esi
     SYS SYS_truncate
