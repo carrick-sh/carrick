@@ -82,8 +82,25 @@ fn root_gpa(raw: u64) -> RootGpa {
     RootGpa::page_aligned(FrameGpa::new(raw)).expect("4 KiB-aligned root GPA")
 }
 
+/// Own a fixed atomic slice without writing every untouched guest page.
+fn zeroed_atomic_words(len: usize) -> Box<[AtomicU64]> {
+    let layout = std::alloc::Layout::array::<AtomicU64>(len).unwrap();
+    assert!(layout.size() > 0, "guest backing is nonempty");
+    // SAFETY: layout is nonzero and fits isize. AtomicU64 has the same size
+    // and bit validity as u64, so zeroed, suitably aligned storage contains
+    // valid zero atomics without per-word writes. No references exist yet.
+    let raw = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<AtomicU64>();
+    if raw.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    // SAFETY: raw owns len initialized AtomicU64s from the global allocator.
+    // Box assumes sole ownership and deallocates using this same array layout;
+    // the enclosing Arc shares that owner, never separate owning raw pointers.
+    unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(raw, len)) }
+}
+
 struct VecGuestMemory {
-    backing: Arc<Vec<AtomicU64>>,
+    backing: Arc<Box<[AtomicU64]>>,
     aligned_word_offset: usize,
     placement: LinearPlacement,
     extents: ExtentTable,
@@ -116,8 +133,7 @@ impl VecGuestMemory {
     ) -> Result<Self, PlacementError> {
         let word_len = usize::try_from(backing_bytes.max(placement_span_bytes)).unwrap() / 8;
         let total_words = word_len + (PAGE_SIZE_4K as usize) / 8;
-        let mut backing = Vec::with_capacity(total_words);
-        backing.resize_with(total_words, || AtomicU64::new(0));
+        let backing = zeroed_atomic_words(total_words);
         let raw_base = backing.as_ptr() as usize;
         let mask = PAGE_OFFSET_MASK_4K as usize;
         let aligned_base = (raw_base + mask) & !mask;
