@@ -252,11 +252,14 @@ pub fn transfer_with_io<U: UserCopy>(
                 Ok(0) => StepStatus::EndOfFile,
                 Ok(n) => {
                     op.progress.written += n as u64;
-                    // MSG_WAITALL waits for the rest (a peek never does).
+                    // MSG_WAITALL waits for the rest (a peek never does),
+                    // unless no more can come: the peer stopped writing, or
+                    // this end shut its reads (the prefix is the result).
                     if op.call.contains(IpcCallFlags::WAIT_ALL)
                         && !op.call.contains(IpcCallFlags::PEEK)
                         && !op.progress.is_complete()
                         && p.references(pipe::End::Writer) != 0
+                        && p.references(pipe::End::Reader) != 0
                     {
                         StepStatus::Blocked(WaitFor::Readable)
                     } else {
