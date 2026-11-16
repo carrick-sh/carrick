@@ -19795,8 +19795,8 @@ fn arm_root_socketpair_nonblock_and_shutdown() {
 fn arm_root_socketpair_ends_are_ring_epoll_members() {
     use ArmCaller::Root;
     use carrick_abi::{
-        LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLLIN, LINUX_EPOLLRDHUP, LINUX_O_CLOEXEC,
-        LINUX_SHUT_WR,
+        LINUX_EEXIST, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLLIN, LINUX_EPOLLRDHUP,
+        LINUX_O_CLOEXEC, LINUX_SHUT_WR,
     };
     use carrick_personality_linux::crossing::nr as sys;
     use carrick_test_support::GuestUserBuffer;
@@ -19814,7 +19814,7 @@ fn arm_root_socketpair_ends_are_ring_epoll_members() {
         let epoll = epoll as u64;
         let [parent, child] = arm_root_spawn_socketpair(call);
         let ctl = sys::EPOLL_CTL.raw();
-        let watch = (LINUX_EPOLLIN | LINUX_EPOLLRDHUP) as u32;
+        let watch = LINUX_EPOLLIN | LINUX_EPOLLRDHUP;
         let parent_in = epoll_event_buffer(watch, PARENT_COOKIE);
         let child_in = epoll_event_buffer(watch, CHILD_COOKIE);
         for (what, fd, event) in [("parent", parent, &parent_in), ("child", child, &child_in)] {
@@ -19826,6 +19826,19 @@ fn arm_root_socketpair_ends_are_ring_epoll_members() {
                     [epoll, LINUX_EPOLL_CTL_ADD, fd, event.arg(), 0, 0],
                 ),
                 0,
+            );
+        }
+        // libuv's `uv__io_poll` asserts `errno == EEXIST` on a re-ADD: a ring
+        // member is present to the ring epoll, with no host adoption.
+        for (what, fd, event) in [("parent", parent, &parent_in), ("child", child, &child_in)] {
+            expect.served(
+                &format!("a second ADD of the {what} end"),
+                call(
+                    Root,
+                    ctl,
+                    [epoll, LINUX_EPOLL_CTL_ADD, fd, event.arg(), 0, 0],
+                ),
+                LINUX_EEXIST.guest_retval(),
             );
         }
         let got = arm_root_poll_now(call, epoll);
@@ -20898,4 +20911,77 @@ fn arm_two_live_processes_dup_and_close_isolate_tables() {
     );
 
     registry().unregister_root_for_test(&runtime);
+}
+
+#[test]
+fn arm_root_socketpair_end_fioclex_sets_and_clears_cloexec() {
+    use ArmCaller::Root;
+    use carrick_abi::{
+        LINUX_AF_UNIX, LINUX_F_GETFD, LINUX_FD_CLOEXEC, LINUX_FIOCLEX, LINUX_FIONCLEX,
+        LINUX_SOCK_STREAM,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (expect, _) = with_arm_process_host_dispatch(|call| {
+        let expect = ArmExpect::new();
+        let sockets = GuestUserBuffer::zeroed(8);
+        expect.served(
+            "socketpair without SOCK_CLOEXEC",
+            call(
+                Root,
+                sys::SOCKETPAIR.raw(),
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64,
+                    0,
+                    sockets.arg(),
+                    0,
+                    0,
+                ],
+            ),
+            0,
+        );
+        let [first, second] = fd_pair_of(&sockets);
+        let (ioctl, fcntl) = (sys::IOCTL.raw(), sys::FCNTL.raw());
+        expect.served(
+            "F_GETFD before FIOCLEX",
+            call(Root, fcntl, [first, LINUX_F_GETFD, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "FIOCLEX",
+            call(Root, ioctl, [first, LINUX_FIOCLEX, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "F_GETFD after FIOCLEX",
+            call(Root, fcntl, [first, LINUX_F_GETFD, 0, 0, 0, 0]),
+            LINUX_FD_CLOEXEC as i64,
+        );
+        expect.served(
+            "the peer end's F_GETFD",
+            call(Root, fcntl, [second, LINUX_F_GETFD, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "FIONCLEX",
+            call(Root, ioctl, [first, LINUX_FIONCLEX, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "F_GETFD after FIONCLEX",
+            call(Root, fcntl, [first, LINUX_F_GETFD, 0, 0, 0, 0]),
+            0,
+        );
+        for fd in [first, second] {
+            expect.served(
+                "close",
+                call(Root, sys::CLOSE.raw(), [fd, 0, 0, 0, 0, 0]),
+                0,
+            );
+        }
+        expect
+    });
+    expect.assert_empty("FIOCLEX/FIONCLEX on a ring stream end left Linux's contract");
 }
