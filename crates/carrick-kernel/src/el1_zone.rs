@@ -271,6 +271,122 @@ fn hand_back_in_carrier(carrier: CarrierZoneRef<'_>, record: RecordRef) {
     }
 }
 
+/// Sample a native member's host-readiness queue
+/// ([`carrick_sched_core::object_wait::ObjectWaitKey::native_host_ready`])
+/// before a non-blocking probe of a host object, binding the queue to the
+/// member's record incarnation on first use. The member parks with this
+/// revision when the probe finds the object not ready, so a readiness
+/// notification published after the sample reruns it at once. `None` when
+/// no zone serves the member or its queue is contended or retired.
+pub(crate) fn host_ready_revision(carrier: Option<&CarrierZone>, record: RecordRef) -> Option<u64> {
+    let key = carrick_sched_core::object_wait::ObjectWaitKey::native_host_ready(record)?;
+    fn sample<C: carrick_el1_abi::EntryContext>(
+        zone: &carrick_sched_core::ZoneTables<C>,
+        key: carrick_sched_core::object_wait::ObjectWaitKey,
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
+    ) -> Option<u64> {
+        let observe = || {
+            zone.object_wait(key, wait, completion)
+                .map(|queue| queue.snapshot().revision())
+        };
+        match observe() {
+            Ok(revision) => Some(revision),
+            Err(carrick_sched_core::object_wait::ObjectWaitError::Stale) => {
+                // First use by this record incarnation. A concurrent binder
+                // wins the same generation; either way the next observe sees it.
+                let _ = zone.bind_object_wait(key, wait, completion);
+                observe().ok()
+            }
+            Err(_) => None,
+        }
+    }
+    if let Some(zone) = zone() {
+        sample(zone, key, &HostLockWait, &|owned| {
+            complete_object_wake(owned.zone(), owned)
+        })
+    } else {
+        let carrier = carrier?;
+        sample(
+            carrier.zone(),
+            key,
+            &CarrierLockWait(carrier.as_ref()),
+            &|owned| complete_carrier_object_wake(carrier.as_ref(), owned),
+        )
+    }
+}
+
+/// Publish a host object's readiness to the member waiting on it: notify
+/// its host-readiness queue from a host thread and deliver the wake (the
+/// member reruns its call). A member that is not waiting (its queue
+/// retired, rebound or empty) is not affected beyond the epoch bump that
+/// makes a pending park rerun.
+pub(crate) fn notify_host_ready(carrier: Option<&CarrierZone>, record: RecordRef) {
+    let Some(key) = carrick_sched_core::object_wait::ObjectWaitKey::native_host_ready(record)
+    else {
+        return;
+    };
+    fn notify<C: carrick_el1_abi::EntryContext>(
+        zone: &carrick_sched_core::ZoneTables<C>,
+        key: carrick_sched_core::object_wait::ObjectWaitKey,
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
+        delivery: &mut ObjectWakeDelivery,
+    ) {
+        let Ok(queue) = zone.object_wait(key, wait, completion) else {
+            return;
+        };
+        let ObjectWakeDelivery {
+            handed, len, slots, ..
+        } = delivery;
+        queue
+            .notify_object_host(
+                &mut |record| {
+                    let Some(target) = handed.get_mut(*len) else {
+                        carrick_fatal::carrick_fatal!(
+                            "host_ready::wake",
+                            "duplicate host readiness waiter delivery"
+                        );
+                    };
+                    target.write(record);
+                    *len += 1;
+                },
+                &mut |placed| {
+                    if placed.resched {
+                        let index = usize::from(placed.slot.raw());
+                        slots[index / 64] |= 1 << (index % 64);
+                    }
+                },
+            )
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!(
+                    "host_ready::wake",
+                    "host readiness wake ownership failed"
+                )
+            });
+    }
+    let mut delivery = Box::new(ObjectWakeDelivery::for_carrier(carrier.cloned()));
+    if let Some(zone) = zone() {
+        notify(
+            zone,
+            key,
+            &HostLockWait,
+            &|owned| complete_object_wake(owned.zone(), owned),
+            &mut delivery,
+        );
+    } else if let Some(carrier) = carrier {
+        delivery.collected_in_carrier = true;
+        notify(
+            carrier.zone(),
+            key,
+            &CarrierLockWait(carrier.as_ref()),
+            &|owned| complete_carrier_object_wake(carrier.as_ref(), owned),
+            &mut delivery,
+        );
+    }
+    delivery.deliver();
+}
+
 /// Metadata readiness uses the same record-owned waits as IPC, with a
 /// separately admitted queue and a typed token that IPC cannot construct.
 #[derive(Debug)]

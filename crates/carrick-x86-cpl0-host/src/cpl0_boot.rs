@@ -1692,7 +1692,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         self.service_idle_peer_doorbell_with_host_file(
             exit,
             on_work,
-            &mut |_, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
+            &mut |_, _, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
             &mut refuse_native_exec,
         )
     }
@@ -1856,6 +1856,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         if let Some(mut pending) = pending_file {
             let served = host_file(
                 pending.ticket.request().identity.birth.origin,
+                pending.ticket.request().identity.birth.record,
                 &mut pending.record,
             );
             let mut custody = self
@@ -2104,7 +2105,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             task,
             exit,
             on_work,
-            &mut |_, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
+            &mut |_, _, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
             &mut refuse_native_exec,
         )
     }
@@ -2267,6 +2268,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         if let Some(mut pending) = pending_file {
             let served = host_file(
                 pending.ticket.request().identity.birth.origin,
+                pending.ticket.request().identity.birth.record,
                 &mut pending.record,
             );
             let mut custody = self
@@ -2298,11 +2300,15 @@ fn refuse_native_exec(_: &[u8]) -> Result<exec_service::X86ExecImage, carrick_ab
 }
 
 /// Host-file handler invoked with physical custody and CPU-I/O borrows released.
+/// Serves one native host-file record for the requesting member (its birth
+/// origin and zone record), writing the reply in place or answering a
+/// host-readiness wait.
 pub type NativeHostFileService<'a> = dyn FnMut(
         carrick_core_abi::service::ServiceOrigin,
+        carrick_el1_abi::RecordRef,
         &mut [u8],
     ) -> Result<
-        Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+        carrick_hal::fork_stock::NativeHostFileReply,
         carrick_hal::fork_stock::NativeHostFileRefused,
     > + 'a;
 

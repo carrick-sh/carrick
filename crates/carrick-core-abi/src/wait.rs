@@ -204,7 +204,11 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
             PortalWaitCause::PendingEdit => SpaceWaitCause::PendingEdit,
             PortalWaitCause::Gate => SpaceWaitCause::Gate,
             PortalWaitCause::Metadata => SpaceWaitCause::Metadata,
-            PortalWaitCause::ReservationPool => return Err(ObjectWaitError::Stale),
+            // Neither is an MM resource cause: the reservation pool has its
+            // own queue, and a host readiness wait parks on the member's.
+            PortalWaitCause::ReservationPool | PortalWaitCause::HostReadiness => {
+                return Err(ObjectWaitError::Stale);
+            }
         };
         let entry = zone
             .space_entry(
@@ -396,6 +400,41 @@ impl ObjectParkRequest {
             operation,
             deadline: None,
         }
+    }
+    /// A member's park on its own host-readiness queue
+    /// ([`crate::PortalWaitCause::HostReadiness`]). The carrier sampled the
+    /// receipt's revision from this exact queue before the non-blocking probe
+    /// that found its host object not ready, so a readiness notification
+    /// published after that sample makes this park rerun at once. A receipt
+    /// of another cause or a record without an incarnation returns the
+    /// operation.
+    pub fn host_readiness_owner(
+        record: carrick_sched_core::RecordRef,
+        receipt: crate::PortalOwnerWait,
+        operation: OperationToken,
+        deadline: Option<u64>,
+    ) -> Result<Self, OperationToken> {
+        if receipt.cause() != crate::PortalWaitCause::HostReadiness {
+            return Err(operation);
+        }
+        let Some(key) = ObjectWaitKey::native_host_ready(record) else {
+            return Err(operation);
+        };
+        // SAFETY: the record names this exact member queue, and the carrier
+        // sampled the receipt's revision from it before its failed probe.
+        let snapshot = unsafe {
+            carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_owner_state_lock(
+                key,
+                receipt.revision(),
+            )
+        };
+        Ok(Self {
+            key,
+            snapshot: Some(snapshot.observed()),
+            owner_entry: Some(carrick_sched_core::object_wait::OwnerEntry::Exception),
+            operation,
+            deadline,
+        })
     }
     pub const fn observed(&self) -> Option<ObjectWaitSnapshot> {
         self.snapshot

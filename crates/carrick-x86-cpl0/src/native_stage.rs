@@ -27,6 +27,7 @@ where
     let canonical = carrick_syscall_abi::CanonicalNr::new(call.canonical.raw());
     let decoded = match admit_or_cross(
         HostCrossingSet::X86,
+        call.native,
         canonical,
         &call.args,
         origin,

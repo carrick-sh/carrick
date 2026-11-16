@@ -430,7 +430,9 @@ impl<
             Wire::PendingEdit => Cause::PendingEdit,
             Wire::Gate => Cause::Gate,
             Wire::Metadata => Cause::Metadata,
-            Wire::ReservationPool => return Err(MmError::Invalid),
+            // Not MM resources: the pool has its own queue, and a host
+            // readiness wait is observed on the waiting member's queue.
+            Wire::ReservationPool | Wire::HostReadiness => return Err(MmError::Invalid),
         };
         // SAFETY: exact live source authenticated above; caller probes afterward.
         Ok(Some(unsafe {

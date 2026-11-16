@@ -433,68 +433,10 @@ impl<'a> NetView<'a> {
         if let Some(errno) = canonical_socket_errno(family, base_type, protocol) {
             return DispatchOutcome::errno(errno);
         }
-        let host_family = match linux_to_host_af(family) {
-            Ok(f) => f,
+        let host_fd = match create_host_socket(family, base_type, protocol) {
+            Ok(host_fd) => host_fd,
             Err(errno) => return DispatchOutcome::errno(errno),
         };
-        let host_type = host_socktype_backing(family, base_type);
-        // macOS has no UDPLITE protocol, so back IPPROTO_UDPLITE with a plain UDP
-        // socket (proto 0 → UDP for SOCK_DGRAM). UDPLITE's datagram send/recv is
-        // UDP-identical; only the checksum-coverage sockopts differ, accepted as
-        // no-ops below. The guest is LINUX python, whose test_socket runs the
-        // whole UDPLITE suite (native-macOS python skips it — IPPROTO_UDPLITE
-        // undefined there); pass-through socket() returned EPROTONOSUPPORT and
-        // ERRORed every UDPLITE test at setUp.
-        // macOS has no SCTP either. A guest SCTP SOCK_STREAM is a reliable,
-        // ordered byte stream to ONE peer, which is what a TCP socket already
-        // provides — the same substitution UDPLITE gets below, and the same shape
-        // as backing a guest AF_UNIX SEQPACKET with a host SOCK_STREAM. The guest
-        // protocol is recorded unchanged in the OpenDescription, so `SO_PROTOCOL`
-        // still reports SCTP.
-        //
-        // Deliberately NOT extended to SOCK_SEQPACKET: that is message-oriented
-        // and multi-streamed, and TCP cannot reconstruct its boundaries. It stays
-        // EPROTONOSUPPORT rather than pretending.
-        let host_protocol = if protocol == LINUX_IPPROTO_SCTP && base_type == LINUX_SOCK_STREAM
-            || protocol == LINUX_IPPROTO_UDPLITE
-            || cfg!(carrick_bsd)
-                && matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
-                && base_type == LINUX_SOCK_RAW
-        {
-            0
-        } else {
-            protocol
-        };
-        let host_fd = match (unsafe { libc::socket(host_family, host_type, host_protocol) })
-            .host_syscall_errno()
-        {
-            Ok(value) => value,
-            // FreeBSD has no Linux-style datagram ICMP ping socket. Keep a real
-            // nonblocking UDP fd as the poll/close carrier; loopback echo
-            // request/reply semantics are synthesized at sendto/recvfrom below.
-            Err(errno)
-                if errno == linux_errno::EPROTONOSUPPORT
-                    && family == LINUX_AF_INET
-                    && base_type == LINUX_SOCK_DGRAM
-                    && protocol == LINUX_IPPROTO_ICMP =>
-            {
-                match (unsafe { libc::socket(host_family, host_type, 0) }).host_syscall_errno() {
-                    Ok(value) => value,
-                    Err(errno) => return DispatchOutcome::errno(errno),
-                }
-            }
-            Err(errno) => return DispatchOutcome::errno(errno),
-        };
-        // The host fd is always nonblocking; Carrick preserves the guest's
-        // blocking mode in Linux-visible status_flags and waits outside the
-        // dispatcher lock when a blocking operation would block.
-        set_host_nonblocking(host_fd);
-        // Give stream sockets a Linux-sized host backing buffer so guest
-        // non-blocking copy/splice loops do not churn on macOS' small defaults.
-        if let Err(errno) = widen_stream_socket_buffers(host_fd, family, base_type) {
-            unsafe { libc::close(host_fd) };
-            return DispatchOutcome::errno(errno);
-        }
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let open_file =
@@ -2048,6 +1990,75 @@ mod icmp_ping_tests {
         );
         unsafe { libc::close(blocker) };
     }
+}
+
+/// Create the host socket backing a guest `(family, base_type, protocol)`
+/// socket (`base_type` without `SOCK_NONBLOCK`/`SOCK_CLOEXEC`), validated
+/// and backed exactly as a guest `socket(2)` is: the one constructor the
+/// dispatcher's sockets and the native network venue's share. The host fd
+/// is always nonblocking; the caller owns it.
+pub(in crate::dispatch) fn create_host_socket(
+    family: i32,
+    base_type: i32,
+    protocol: i32,
+) -> Result<i32, LinuxErrno> {
+    let host_family = linux_to_host_af(family)?;
+    let host_type = host_socktype_backing(family, base_type);
+    // macOS has no UDPLITE protocol, so back IPPROTO_UDPLITE with a plain UDP
+    // socket (proto 0 → UDP for SOCK_DGRAM). UDPLITE's datagram send/recv is
+    // UDP-identical; only the checksum-coverage sockopts differ, accepted as
+    // no-ops below. The guest is LINUX python, whose test_socket runs the
+    // whole UDPLITE suite (native-macOS python skips it — IPPROTO_UDPLITE
+    // undefined there); pass-through socket() returned EPROTONOSUPPORT and
+    // ERRORed every UDPLITE test at setUp.
+    // macOS has no SCTP either. A guest SCTP SOCK_STREAM is a reliable,
+    // ordered byte stream to ONE peer, which is what a TCP socket already
+    // provides — the same substitution UDPLITE gets below, and the same shape
+    // as backing a guest AF_UNIX SEQPACKET with a host SOCK_STREAM. The guest
+    // protocol is recorded unchanged in the OpenDescription, so `SO_PROTOCOL`
+    // still reports SCTP.
+    //
+    // Deliberately NOT extended to SOCK_SEQPACKET: that is message-oriented
+    // and multi-streamed, and TCP cannot reconstruct its boundaries. It stays
+    // EPROTONOSUPPORT rather than pretending.
+    let host_protocol = if protocol == LINUX_IPPROTO_SCTP && base_type == LINUX_SOCK_STREAM
+        || protocol == LINUX_IPPROTO_UDPLITE
+        || cfg!(carrick_bsd)
+            && matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
+            && base_type == LINUX_SOCK_RAW
+    {
+        0
+    } else {
+        protocol
+    };
+    let host_fd = match (unsafe { libc::socket(host_family, host_type, host_protocol) })
+        .host_syscall_errno()
+    {
+        Ok(value) => value,
+        // FreeBSD has no Linux-style datagram ICMP ping socket. Keep a real
+        // nonblocking UDP fd as the poll/close carrier; loopback echo
+        // request/reply semantics are synthesized at sendto/recvfrom below.
+        Err(errno)
+            if errno == linux_errno::EPROTONOSUPPORT
+                && family == LINUX_AF_INET
+                && base_type == LINUX_SOCK_DGRAM
+                && protocol == LINUX_IPPROTO_ICMP =>
+        {
+            (unsafe { libc::socket(host_family, host_type, 0) }).host_syscall_errno()?
+        }
+        Err(errno) => return Err(errno),
+    };
+    // The host fd is always nonblocking; Carrick preserves the guest's
+    // blocking mode in Linux-visible status_flags and waits outside the
+    // dispatcher lock when a blocking operation would block.
+    set_host_nonblocking(host_fd);
+    // Give stream sockets a Linux-sized host backing buffer so guest
+    // non-blocking copy/splice loops do not churn on macOS' small defaults.
+    if let Err(errno) = widen_stream_socket_buffers(host_fd, family, base_type) {
+        unsafe { libc::close(host_fd) };
+        return Err(errno);
+    }
+    Ok(host_fd)
 }
 
 impl<'a> NetView<'a> {
