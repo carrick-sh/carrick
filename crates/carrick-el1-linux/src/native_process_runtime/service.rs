@@ -1408,6 +1408,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         } else {
             record
         };
+        // A socket call runs under the caller's own identity (#231): its
+        // task, pid and credentials, carried in the record.
+        let record =
+            if carrick_core_abi::host_file::request_parts(&record).is_some_and(|(header, _, _)| {
+                header.op == carrick_core_abi::host_file::HostFileOp::NetSyscall
+            }) {
+                let caller = match self.caller_net() {
+                    Ok(caller) => caller,
+                    Err(errno) => {
+                        return Ok(NativeResume::Returned(SyscallResult::from_errno(errno)));
+                    }
+                };
+                carrick_personality_linux::native_host_file::stamp_net_caller(&record, &caller)
+                    .ok_or(NativeProcessError::Invalid)?
+            } else {
+                record
+            };
         let mut record = record;
         carrick_personality_linux::native_host_file::stamp_write_file_size_limit(
             &mut record,
@@ -1663,6 +1680,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             CallerAccessFailure(SyscallResult::from_errno(errno))
         })
+    }
+
+    /// The caller of a socket call (#231): its task key, its pid as its pid
+    /// namespace sees it, and its calling thread's credentials, from its own
+    /// task row.
+    fn caller_net(
+        &self,
+    ) -> Result<carrick_core_abi::host_file::NetCaller, carrick_syscall_abi::LinuxErrno> {
+        let graph = self.runtime.graph.lock();
+        let stale = carrick_syscall_abi::LINUX_ESRCH;
+        let task = graph.owner.task(self.key).map_err(|_| stale)?;
+        let credentials = task.credentials_for(self.calling_tid).map_err(|_| stale)?;
+        carrick_personality_linux::native_host_file::net_caller(
+            self.key,
+            task.metadata().namespace_pid,
+            credentials,
+        )
+        .ok_or(stale)
     }
 
     fn encode_caller_access(&self) -> Result<Vec<u8>, carrick_syscall_abi::LinuxErrno> {

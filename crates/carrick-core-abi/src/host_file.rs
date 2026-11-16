@@ -299,6 +299,89 @@ impl<'a> NetCall<'a> {
     }
 }
 
+/// The calling member of one [`HostFileOp::NetSyscall`] record (#231): the
+/// identity Linux's socket calls consult (capabilities for a raw socket, the
+/// credentials and pid a socket records), from the member's own ring task
+/// row. The ring stamps it ahead of the [`NetCall`]; the carrier runs the
+/// call under it, never under the run root's identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetCaller {
+    /// The member's ring task.
+    pub task: carrick_sched_core::process::TaskKey,
+    /// The member's pid as its own pid namespace sees it (`getpid(2)`).
+    pub ns_pid: core::num::NonZeroU32,
+    pub ids: AccessIds,
+    /// The member's effective capability set (Linux capability bits).
+    pub cap_effective: u64,
+}
+
+/// Encoded bytes of a [`NetCaller`].
+pub const NET_CALLER_BYTES: usize = 4 + 4 + 8 + 8 * 4 + 8;
+
+/// Largest data range one [`HostFileOp::NetSyscall`] stages (a `send`'s
+/// bytes or a `recv`'s buffer): one record's chunk less the caller, call
+/// and segment framing and the socket address that may travel with it.
+pub const NET_TRANSFER_MAX_BYTES: usize = HOST_FILE_CHUNK_BYTES - 4096;
+
+impl NetCaller {
+    pub fn encode(&self) -> [u8; NET_CALLER_BYTES] {
+        let mut out = [0u8; NET_CALLER_BYTES];
+        out[0..4].copy_from_slice(&self.task.id.raw().to_le_bytes());
+        out[4..8].copy_from_slice(&self.ns_pid.get().to_le_bytes());
+        out[8..16].copy_from_slice(&self.task.serial.raw().to_le_bytes());
+        let ids = [
+            self.ids.ruid,
+            self.ids.euid,
+            self.ids.suid,
+            self.ids.fsuid,
+            self.ids.rgid,
+            self.ids.egid,
+            self.ids.sgid,
+            self.ids.fsgid,
+        ];
+        for (index, id) in ids.iter().enumerate() {
+            out[16 + index * 4..20 + index * 4].copy_from_slice(&id.to_le_bytes());
+        }
+        out[48..56].copy_from_slice(&self.cap_effective.to_le_bytes());
+        out
+    }
+
+    /// Split a stamped [`HostFileOp::NetSyscall`] input into its caller and
+    /// the [`NetCall`] bytes. `None` for an unstamped or malformed input.
+    pub fn split(input: &[u8]) -> Option<(Self, &[u8])> {
+        let (head, call) = input.split_at_checked(NET_CALLER_BYTES)?;
+        let id = core::num::NonZeroI32::new(i32::from_le_bytes(head[0..4].try_into().ok()?))?;
+        if id.get() < 0 {
+            return None;
+        }
+        let task = carrick_sched_core::process::TaskKey {
+            id: carrick_sched_core::process::TaskId::from_registry_allocation(id),
+            serial: carrick_sched_core::process::TaskSerial::from_raw_u64(read_u64(head, 8)?)?,
+        };
+        let ns_pid = core::num::NonZeroU32::new(read_u32(head, 4)?)?;
+        let id = |index: usize| read_u32(head, 16 + index * 4);
+        let ids = AccessIds {
+            ruid: id(0)?,
+            euid: id(1)?,
+            suid: id(2)?,
+            fsuid: id(3)?,
+            rgid: id(4)?,
+            egid: id(5)?,
+            sgid: id(6)?,
+            fsgid: id(7)?,
+        };
+        Some((
+            Self {
+                task,
+                ns_pid,
+                ids,
+                cap_effective: read_u64(head, 48)?,
+            },
+            call,
+        ))
+    }
+}
+
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
 pub const POLLFD_BYTES: usize = 8;
 /// Timestamp request flag distinguishing NULL times from two explicit NOWs.
@@ -990,6 +1073,78 @@ mod tests {
         );
         // A written record is never served a second time.
         assert!(HostFileRequestView::parse(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn a_net_caller_round_trips_ahead_of_its_call() {
+        let caller = NetCaller {
+            task: carrick_sched_core::process::TaskKey {
+                id: carrick_sched_core::process::TaskId::from_registry_allocation(
+                    core::num::NonZeroI32::new(41).unwrap(),
+                ),
+                serial: carrick_sched_core::process::TaskSerial::from_raw_u64(9).unwrap(),
+            },
+            ns_pid: core::num::NonZeroU32::new(7).unwrap(),
+            ids: AccessIds {
+                ruid: 1000,
+                euid: 1001,
+                suid: 1002,
+                fsuid: 1003,
+                rgid: 2000,
+                egid: 2001,
+                sgid: 2002,
+                fsgid: 2003,
+            },
+            cap_effective: 1 << 13,
+        };
+        let call = NetCall::encode(41, [2, 3, 0, 0, 0, 0], &[], &[]).unwrap();
+        let mut input = caller.encode().to_vec();
+        input.extend_from_slice(&call);
+        let (decoded, rest) = NetCaller::split(&input).unwrap();
+        assert_eq!(decoded, caller);
+        assert_eq!(NetCall::decode(rest).unwrap().args[..2], [2, 3]);
+        // An unstamped call is not a caller.
+        assert!(NetCaller::split(&call).is_none());
+        // The largest staged transfer, its address and framing fit a record.
+        let data = alloc::vec![0u8; NET_TRANSFER_MAX_BYTES];
+        let address = [0u8; 128];
+        let segments = [
+            NetSegment {
+                address: 0x1000,
+                len: NET_TRANSFER_MAX_BYTES as u32,
+                input: true,
+                output: false,
+            },
+            NetSegment {
+                address: 0x2000,
+                len: 128,
+                input: true,
+                output: false,
+            },
+        ];
+        let send = NetCall::encode(44, [0; 6], &segments, &[&data, &address]).unwrap();
+        assert!(NET_CALLER_BYTES + send.len() <= HOST_FILE_CHUNK_BYTES);
+        let recv = [
+            NetSegment {
+                address: 0x1000,
+                len: NET_TRANSFER_MAX_BYTES as u32,
+                input: false,
+                output: true,
+            },
+            NetSegment {
+                address: 0x2000,
+                len: 4,
+                input: true,
+                output: true,
+            },
+            NetSegment {
+                address: 0x3000,
+                len: 128,
+                input: false,
+                output: true,
+            },
+        ];
+        assert!(NetCall::output_capacity(&recv) <= HOST_FILE_CHUNK_BYTES);
     }
 
     #[test]

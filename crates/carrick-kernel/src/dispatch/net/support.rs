@@ -2102,8 +2102,14 @@ pub(in crate::dispatch) fn validate_and_extract_scm_credentials(
     creds: &crate::kernel::Credentials,
 ) -> Result<Option<SocketPeerCred>, carrick_abi::LinuxErrno> {
     if let Some(cred) = parse_linux_scm_credentials(control) {
-        let task_id = u32::try_from(kernel.task().key().id.raw()).unwrap_or(0);
-        let caller_pid = crate::namespace::pid::ns_self_pid_for(kernel, task_id) as i32;
+        let caller_pid = match crate::dispatch::resources::native_net_caller() {
+            // A native member's call (#231) sends as the member.
+            Some(caller) => caller.pid().0,
+            None => {
+                let task_id = u32::try_from(kernel.task().key().id.raw()).unwrap_or(0);
+                crate::namespace::pid::ns_self_pid_for(kernel, task_id) as i32
+            }
+        };
         if cred.pid.0 != caller_pid
             && !crate::dispatch::creds::has_effective_capability(
                 kernel,

@@ -14,12 +14,15 @@
 //! stays with its ring owner.
 
 use super::{
-    Access, HOST_FILE_CHUNK_BYTES, HostFileOp, HostFileOutput, HostFileStage, HostFileUser,
-    NativeDescriptor, OutputLayout, Staging, errno, gather_user,
+    Access, HostFileOp, HostFileOutput, HostFileStage, HostFileUser, NativeDescriptor,
+    OutputLayout, Staging, errno, gather_user,
 };
 use crate::abi::entry::SyscallResult;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
-use carrick_core_abi::host_file::{NetCall, NetSegment};
+use carrick_core_abi::host_file::{
+    self, NET_TRANSFER_MAX_BYTES, NetCall, NetCaller, NetSegment, record_len,
+};
 use carrick_syscall_abi::CanonicalNr;
 
 /// Largest socket address a call reads or writes (Linux
@@ -215,9 +218,9 @@ pub(super) fn stage(
                 plan.address_result(user, args[1], args[2])?;
             }
         } else if c == nr::SENDTO {
-            // A transfer crosses at most one record's chunk: a larger send
-            // returns the short count of that chunk.
-            let len = (args[2] as usize).min(HOST_FILE_CHUNK_BYTES);
+            // A transfer crosses at most one record's data range: a larger
+            // send returns the short count of that range.
+            let len = (args[2] as usize).min(NET_TRANSFER_MAX_BYTES);
             args[2] = len as u64;
             if len > 0 {
                 plan.read(user, args[1], len, false)?;
@@ -232,7 +235,7 @@ pub(super) fn stage(
                 }
             }
         } else if c == nr::RECVFROM {
-            let len = (args[2] as usize).min(HOST_FILE_CHUNK_BYTES);
+            let len = (args[2] as usize).min(NET_TRANSFER_MAX_BYTES);
             args[2] = len as u64;
             if len > 0 {
                 plan.write(user, args[1], len)?;
@@ -302,11 +305,63 @@ pub(super) fn complete(
     reply: &[u8],
     copy_out: &mut dyn FnMut(u64, &[u8]) -> bool,
 ) -> Option<SyscallResult> {
-    let call = NetCall::decode(input)?;
+    let call = staged_call(input)?;
     for (address, bytes) in NetCall::decode_written(call.segments(), reply)? {
         if !bytes.is_empty() && !copy_out(address, bytes) {
             return Some(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT));
         }
     }
     Some(SyscallResult::new(result))
+}
+
+/// The calling member of a socket call, from its own ring task row: its
+/// task, its pid as its pid namespace sees it, and its credentials. `None`
+/// for a pid of 0, which no live process has.
+pub fn net_caller(
+    task: carrick_sched_core::process::TaskKey,
+    ns_pid: u32,
+    credentials: &crate::identity::TaskCredentials,
+) -> Option<NetCaller> {
+    Some(NetCaller {
+        task,
+        ns_pid: core::num::NonZeroU32::new(ns_pid)?,
+        ids: host_file::AccessIds {
+            ruid: credentials.ruid.raw(),
+            euid: credentials.euid.raw(),
+            suid: credentials.suid.raw(),
+            fsuid: credentials.fsuid.raw(),
+            rgid: credentials.rgid.raw(),
+            egid: credentials.egid.raw(),
+            sgid: credentials.sgid.raw(),
+            fsgid: credentials.fsgid.raw(),
+        },
+        cap_effective: credentials.cap_effective.bits(),
+    })
+}
+
+/// Re-stage a socket call's record with its caller leading the input: the
+/// carrier runs the call under the caller's own identity, which only the
+/// ring owner holds. Any other record is returned as staged. `None` when
+/// the record is not a well-formed unserved request or the caller and call
+/// do not fit one record.
+pub fn stamp_net_caller(record: &[u8], caller: &NetCaller) -> Option<Box<[u8]>> {
+    let (header, input, output_cap) = host_file::request_parts(record)?;
+    if header.op != HostFileOp::NetSyscall {
+        return Some(record.into());
+    }
+    let mut staged = Vec::new();
+    staged
+        .try_reserve_exact(host_file::NET_CALLER_BYTES + input.len())
+        .ok()?;
+    staged.extend_from_slice(&caller.encode());
+    staged.extend_from_slice(input);
+    let len = record_len(staged.len(), output_cap)?;
+    let mut restaged = alloc::vec![0u8; len].into_boxed_slice();
+    host_file::encode(&mut restaged, header, &staged, output_cap).ok()?;
+    Some(restaged)
+}
+
+/// The call of a stamped socket record's input.
+pub(super) fn staged_call(input: &[u8]) -> Option<NetCall<'_>> {
+    NetCall::decode(NetCaller::split(input)?.1)
 }

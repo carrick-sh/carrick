@@ -5807,6 +5807,210 @@ fn native_child_fchdir_completion_moves_only_the_childs_cwd() {
     assert_eq!(cwd(root_key), parent_cwd);
 }
 
+/// #231, director ruling D2: a native child's socket call runs under the
+/// child's own identity, never the run root's. The child drops to uid 1000
+/// (losing every capability) in its own task row; its
+/// `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` is staged and published by the
+/// production ring service with the child's own caller stamped in the
+/// record (its task, pid, ids and empty capability set), and the run's real
+/// carrier dispatcher serves the published record: EPERM, as Linux refuses
+/// a raw socket without CAP_NET_RAW. Red before the caller identity: the
+/// record carried no caller and the carrier ran the call under the run
+/// root's capabilities (on a Linux host whose own ping sockets are refused,
+/// that root call is EPERM too, so the stamp is the red here).
+#[cfg(test)]
+#[test]
+fn native_child_socket_call_runs_under_the_childs_own_identity() {
+    use carrick_core_abi::host_file::HostFileRequestView;
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    use carrick_personality_linux::native_host_file::{
+        HostFileCall, HostFileStage, NativeNamespace, SocketCall,
+    };
+    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let (record, address, words) = capacity.select().unwrap();
+    // SAFETY: the real fork publication retained this live child's record.
+    let child_key = unsafe { fixture.runtime.record_binding(record) }
+        .unwrap()
+        .key;
+    {
+        let mut graph = fixture.runtime.graph.lock();
+        let task = graph.owner.task_mut(child_key).unwrap();
+        let tid = task.metadata().namespace_pid;
+        let credentials = task.credentials_for_mut(tid).unwrap();
+        credentials.set_uid(1000).unwrap();
+        assert!(
+            credentials.cap_effective.is_empty(),
+            "uid 1000 holds no capability"
+        );
+    }
+
+    let raw = SocketCall::decode(
+        carrick_personality_linux::crossing::nr::SOCKET,
+        &[2, 3, 1, 0, 0, 0],
+    )
+    .expect("an inet socket is a host network call");
+    let mut resolve = |_| None;
+    let mut releases = |_: &mut [carrick_core_abi::host_file::MapSourceReply]| 0;
+    let Some(HostFileStage::Request {
+        record: staged,
+        output,
+        resolves_path,
+        map,
+        chdir,
+    }) = crate::dispatch::stage_native_host_file(
+        HostFileCall::Socket(raw),
+        fixture.task,
+        &ResidentUser,
+        &mut NativeNamespace {
+            table: [1, 1, 1],
+            resolve: &mut resolve,
+            releases: &mut releases,
+        },
+    )
+    else {
+        panic!("a child's raw inet socket crosses to the carrier");
+    };
+    let mut service = fixture.service();
+    let mut child = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &words,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        child.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::NoPending)
+    ));
+    assert!(matches!(
+        child.begin_host_file_service(
+            staged,
+            output,
+            resolves_path,
+            map,
+            chdir,
+            NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(41), counters)
+        ),
+        Ok(NativeResume::Left(None))
+    ));
+    assert!(child.take_handoff_receipt().is_some());
+    drop(child);
+
+    // The carrier claims the published request and serves it with the run's
+    // own dispatcher, whose root task holds every capability.
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let identity = fixture.zone.record(record.id).identity();
+    // SAFETY: the real native owner retains this exact control allocation.
+    let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+    let wait_key = carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap();
+    let ticket = {
+        let _queue = fixture
+            .zone
+            .object_wait(wait_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+        // SAFETY: the service queue authenticates the notice and excludes
+        // cancellation.
+        unsafe { ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, identity) }
+            .unwrap()
+    };
+    let ServiceOperation::HostFile { payload, .. } = ticket.request().operation else {
+        panic!("host file notice expected")
+    };
+    // SAFETY: the ticket retains the request box; no ring execution can
+    // mutate it.
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            payload.ring_storage().raw() as *mut u8,
+            payload.length().raw() as usize,
+        )
+    };
+    let (_, input, _) = carrick_core_abi::host_file::request_parts(bytes).unwrap();
+    let (caller, _) = carrick_core_abi::host_file::NetCaller::split(input)
+        .expect("the ring stamps a socket call with its caller");
+    let child_pid = fixture
+        .runtime
+        .graph
+        .lock()
+        .owner
+        .task(child_key)
+        .unwrap()
+        .metadata()
+        .namespace_pid;
+    assert_eq!(
+        caller.task, child_key,
+        "the caller is the child, not the root"
+    );
+    assert_eq!(caller.ns_pid.get(), child_pid);
+    assert_eq!((caller.ids.ruid, caller.ids.euid), (1000, 1000));
+    assert_eq!(caller.cap_effective, 0);
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    root.kernel().ipc().unwrap();
+    assert_ne!(
+        root.task().caps().effective & (1 << 13),
+        0,
+        "the run root holds CAP_NET_RAW"
+    );
+    let mut served = bytes.to_vec();
+    dispatcher
+        .serve_native_host_file(&mut served, None)
+        .expect("the carrier serves a child's socket call");
+    let result = carrick_core_abi::host_file::reply(&served).unwrap().result;
+    assert_eq!(
+        result,
+        carrick_syscall_abi::LINUX_EPERM.guest_retval(),
+        "a child without CAP_NET_RAW gets EPERM, whatever the run root holds"
+    );
+    HostFileRequestView::parse(bytes)
+        .unwrap()
+        .reply(result, &[])
+        .unwrap();
+    {
+        let queue = fixture
+            .zone
+            .object_wait(wait_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+        assert!(ticket.complete(true).is_ok());
+        queue
+            .notify_object(fixture.slot, &mut WakeEffects::default())
+            .unwrap();
+    }
+
+    let (resumed, address, words) = capacity.select().unwrap();
+    assert_eq!(resumed, record);
+    let mut service = fixture.service();
+    let mut child = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &words,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        child.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::Returned(result))
+            if result.raw() == carrick_syscall_abi::LINUX_EPERM.guest_retval()
+    ));
+}
+
 #[cfg(test)]
 #[test]
 fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
