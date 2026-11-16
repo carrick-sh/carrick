@@ -18426,6 +18426,228 @@ fn arm_fork_child_ioctl_cloexec_on_a_ring_file() {
     );
 }
 
+/// #231 parity (apt): apt's `chown ... (38: Function not implemented)` and
+/// `chmod 0755 ... (38)`. A fork child's `fchmod`/`fchown` name a ring file
+/// the carrier opened for its staged `openat`, and its path
+/// `fchmodat`/`fchmodat2`/`fchownat` were unclaimed by the ring's host-file
+/// venue: on main every one was a counted ENOSYS. Linux (chmod(2),
+/// chown(2)): the mode and owner change on the file, `fchmod` of an O_PATH
+/// descriptor is EBADF, `AT_SYMLINK_NOFOLLOW` of a non-link changes the
+/// file itself, and a missing path is ENOENT. (This harness's backend has
+/// no symlinks; the x86 oracle witness covers lchown of a link and
+/// `fchmodat2`'s EOPNOTSUPP on one.)
+#[test]
+fn arm_fork_child_chmod_chown_on_ring_files() {
+    use carrick_abi::{
+        LINUX_AT_FDCWD, LINUX_AT_SYMLINK_NOFOLLOW, LINUX_O_CREAT, LINUX_O_PATH, LINUX_O_RDWR,
+        LINUX_O_WRONLY,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let errno = |errno: carrick_abi::LinuxErrno| errno.guest_retval();
+    let (mismatches, _) = with_arm_process_host_dispatch(|call| {
+        let mut mismatches = Vec::new();
+        let tmp = GuestUserBuffer::from_bytes(b"/tmp\0");
+        let (_, made) = call(
+            ArmCaller::Root,
+            sys::MKDIRAT.raw(),
+            [LINUX_AT_FDCWD, tmp.arg(), 0o777, 0, 0, 0],
+        );
+        assert!(made == 0 || made == -17, "mkdir /tmp: {made}");
+        let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-231-apt-attr\0");
+        let missing = GuestUserBuffer::from_bytes(b"/tmp/carrick-231-apt-attr-missing\0");
+        let (_, created) = call(
+            ArmCaller::Root,
+            sys::OPENAT.raw(),
+            [
+                LINUX_AT_FDCWD,
+                path.arg(),
+                LINUX_O_WRONLY | LINUX_O_CREAT,
+                0o644,
+                0,
+                0,
+            ],
+        );
+        assert!(created >= 0, "create the file: {created}");
+        call(
+            ArmCaller::Root,
+            sys::CLOSE.raw(),
+            [created as u64, 0, 0, 0, 0, 0],
+        );
+        let (route, pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid} ({route:?})");
+        let child = ArmCaller::Child(pid as u32);
+        let mut expect = |what: &str, got: i64, want: i64| {
+            if got != want {
+                mismatches.push(format!("{what}: got {got}, want {want}"));
+            }
+        };
+        let (route, fd) = call(
+            child,
+            sys::OPENAT.raw(),
+            [LINUX_AT_FDCWD, path.arg(), LINUX_O_RDWR, 0, 0, 0],
+        );
+        assert!(fd >= 0, "child open of the file: {fd} ({route:?})");
+        let fd = fd as u64;
+        // aarch64 `struct stat`: st_mode is the u32 at byte 16.
+        let stat = GuestUserBuffer::zeroed(128);
+        let group_other = |stat: &GuestUserBuffer| {
+            i64::from(u32::from_le_bytes(stat.as_bytes()[16..20].try_into().unwrap()) & 0o77)
+        };
+        expect(
+            "fchmod(fd, 0640)",
+            call(child, sys::FCHMOD.raw(), [fd, 0o640, 0, 0, 0, 0]).1,
+            0,
+        );
+        let (_, statted) = call(child, sys::FSTAT.raw(), [fd, stat.arg(), 0, 0, 0, 0]);
+        expect("fstat after fchmod", statted, 0);
+        expect("fstat mode & 077 after fchmod", group_other(&stat), 0o40);
+        expect(
+            "fchown(fd, -1, -1)",
+            call(
+                child,
+                sys::FCHOWN.raw(),
+                [fd, u32::MAX as u64, u32::MAX as u64, 0, 0, 0],
+            )
+            .1,
+            0,
+        );
+        expect(
+            "fchmodat(path, 0600)",
+            call(
+                child,
+                sys::FCHMODAT.raw(),
+                [LINUX_AT_FDCWD, path.arg(), 0o600, 0, 0, 0],
+            )
+            .1,
+            0,
+        );
+        let (_, statted) = call(
+            child,
+            sys::NEWFSTATAT.raw(),
+            [LINUX_AT_FDCWD, path.arg(), stat.arg(), 0, 0, 0],
+        );
+        expect("newfstatat after fchmodat", statted, 0);
+        expect("stat mode & 077 after fchmodat", group_other(&stat), 0);
+        expect(
+            "fchownat(path, -1, -1, AT_SYMLINK_NOFOLLOW)",
+            call(
+                child,
+                sys::FCHOWNAT.raw(),
+                [
+                    LINUX_AT_FDCWD,
+                    path.arg(),
+                    u32::MAX as u64,
+                    u32::MAX as u64,
+                    LINUX_AT_SYMLINK_NOFOLLOW,
+                    0,
+                ],
+            )
+            .1,
+            0,
+        );
+        expect(
+            "fchmodat2(path, 0604, AT_SYMLINK_NOFOLLOW)",
+            call(
+                child,
+                sys::FCHMODAT2.raw(),
+                [
+                    LINUX_AT_FDCWD,
+                    path.arg(),
+                    0o604,
+                    LINUX_AT_SYMLINK_NOFOLLOW,
+                    0,
+                    0,
+                ],
+            )
+            .1,
+            0,
+        );
+        let (_, statted) = call(
+            child,
+            sys::NEWFSTATAT.raw(),
+            [LINUX_AT_FDCWD, path.arg(), stat.arg(), 0, 0, 0],
+        );
+        expect("newfstatat after fchmodat2", statted, 0);
+        expect("stat mode & 077 after fchmodat2", group_other(&stat), 0o04);
+        expect(
+            "fchmodat2(path, 0600, unknown flag)",
+            call(
+                child,
+                sys::FCHMODAT2.raw(),
+                [LINUX_AT_FDCWD, path.arg(), 0o600, 0x200, 0, 0],
+            )
+            .1,
+            errno(carrick_abi::LINUX_EINVAL),
+        );
+        expect(
+            "fchmodat(missing)",
+            call(
+                child,
+                sys::FCHMODAT.raw(),
+                [LINUX_AT_FDCWD, missing.arg(), 0o600, 0, 0, 0],
+            )
+            .1,
+            errno(carrick_abi::LINUX_ENOENT),
+        );
+        expect(
+            "fchownat(missing)",
+            call(
+                child,
+                sys::FCHOWNAT.raw(),
+                [
+                    LINUX_AT_FDCWD,
+                    missing.arg(),
+                    u32::MAX as u64,
+                    u32::MAX as u64,
+                    0,
+                    0,
+                ],
+            )
+            .1,
+            errno(carrick_abi::LINUX_ENOENT),
+        );
+        expect(
+            "fchmod(999)",
+            call(child, sys::FCHMOD.raw(), [999, 0o600, 0, 0, 0, 0]).1,
+            errno(carrick_abi::LINUX_EBADF),
+        );
+        expect(
+            "fchown(999)",
+            call(
+                child,
+                sys::FCHOWN.raw(),
+                [999, u32::MAX as u64, u32::MAX as u64, 0, 0, 0],
+            )
+            .1,
+            errno(carrick_abi::LINUX_EBADF),
+        );
+        let (_, path_fd) = call(
+            child,
+            sys::OPENAT.raw(),
+            [LINUX_AT_FDCWD, path.arg(), LINUX_O_PATH, 0, 0, 0],
+        );
+        assert!(path_fd >= 0, "child O_PATH open: {path_fd}");
+        expect(
+            "fchmod of an O_PATH descriptor",
+            call(
+                child,
+                sys::FCHMOD.raw(),
+                [path_fd as u64, 0o600, 0, 0, 0, 0],
+            )
+            .1,
+            errno(carrick_abi::LINUX_EBADF),
+        );
+        mismatches
+    });
+    assert!(
+        mismatches.is_empty(),
+        "a fork child's chmod/chown left Linux's contract:\n{}",
+        mismatches.join("\n")
+    );
+}
+
 /// #1671: Node's `child_process.execSync` aborted in libuv's `uv__io_poll`
 /// (`assert(errno == EEXIST)`). The run root's `epoll_create1` is a ring
 /// constructor, the child's stdio pipes are host `socketpair` ends, and the
