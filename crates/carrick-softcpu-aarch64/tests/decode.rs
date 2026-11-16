@@ -78,3 +78,154 @@ fn neighboring_unallocated_leaves() {
         assert_eq!(classify(word), A64Class::Unknown, "{word:08x}");
     }
 }
+
+#[test]
+fn operands_preserve_width_registers_and_operation() {
+    use carrick_softcpu_aarch64::{Decoded, Shift, Unary, Width, decode};
+    for (sf, width) in [(0, Width::W32), (1 << 31, Width::X64)] {
+        for (opcode, expected) in [
+            (8, Shift::Lsl),
+            (9, Shift::Lsr),
+            (10, Shift::Asr),
+            (11, Shift::Ror),
+        ] {
+            for number in 0..32 {
+                let word = sf
+                    | 0x1ac00000
+                    | (opcode << 10)
+                    | (number << 16)
+                    | (((number + 1) % 32) << 5)
+                    | ((number + 2) % 32);
+                let Some(Decoded::VariableShift {
+                    width: got,
+                    op,
+                    rm,
+                    rn,
+                    rd,
+                }) = decode(word)
+                else {
+                    panic!("{word:08x}")
+                };
+                assert_eq!((got, op), (width, expected));
+                assert_eq!(
+                    (rm.number(), rn.number(), rd.number()),
+                    (
+                        number as u8,
+                        ((number + 1) % 32) as u8,
+                        ((number + 2) % 32) as u8
+                    )
+                );
+            }
+        }
+        for (opcode, expected) in [
+            (0, Unary::Rbit),
+            (1, Unary::Rev16),
+            (2, Unary::Rev32),
+            (3, Unary::Rev64),
+            (4, Unary::Clz),
+            (5, Unary::Cls),
+        ] {
+            for number in 0..32 {
+                let word = sf | 0x5ac00000 | (opcode << 10) | (number << 5) | (31 - number);
+                if sf == 0 && opcode == 3 {
+                    assert_eq!(decode(word), None);
+                    continue;
+                }
+                let Some(Decoded::OneSource {
+                    width: got,
+                    op,
+                    rn,
+                    rd,
+                }) = decode(word)
+                else {
+                    panic!("{word:08x}")
+                };
+                assert_eq!(
+                    (got, op, rn.number(), rd.number()),
+                    (width, expected, number as u8, (31 - number) as u8)
+                );
+            }
+        }
+    }
+    for immediate in 0..=u16::MAX {
+        let Some(Decoded::Breakpoint { immediate: got }) =
+            decode(0xd4200000 | (u32::from(immediate) << 5))
+        else {
+            panic!()
+        };
+        assert_eq!(got.value(), immediate);
+    }
+    for option in 0..16 {
+        let Some(Decoded::ClearExclusive { option: got }) = decode(0xd503305f | (option << 8))
+        else {
+            panic!()
+        };
+        assert_eq!(u32::from(got.value()), option);
+    }
+}
+
+#[test]
+fn sys_operands_and_reserved_namespace() {
+    use carrick_softcpu_aarch64::{Decoded, Shareability, TlbOperation, Translation, decode};
+    let forms = [
+        (0, 8, 0, Translation::S1E1R),
+        (0, 8, 1, Translation::S1E1W),
+        (0, 8, 2, Translation::S1E0R),
+        (0, 8, 3, Translation::S1E0W),
+        (4, 8, 0, Translation::S1E2R),
+        (4, 8, 1, Translation::S1E2W),
+        (4, 8, 4, Translation::S12E1R),
+        (4, 8, 5, Translation::S12E1W),
+        (4, 8, 6, Translation::S12E0R),
+        (4, 8, 7, Translation::S12E0W),
+        (6, 8, 0, Translation::S1E3R),
+        (6, 8, 1, Translation::S1E3W),
+        (0, 9, 0, Translation::S1E1Rp),
+        (0, 9, 1, Translation::S1E1Wp),
+    ];
+    for op1 in 0..8 {
+        for crm in 0..16 {
+            for op2 in 0..8 {
+                for rt in [0, 1, 30, 31] {
+                    let word = 0xd5087000 | (op1 << 16) | (crm << 8) | (op2 << 5) | rt;
+                    let expected = forms
+                        .iter()
+                        .find(|&&(a, b, c, _)| (a, b, c) == (op1, crm, op2));
+                    match (decode(word), expected) {
+                        (Some(Decoded::AddressTranslate { op, xt }), Some(&(_, _, _, want))) => {
+                            assert_eq!(op, want);
+                            assert_eq!(u32::from(xt.number()), rt);
+                        }
+                        (None, None) => {}
+                        other => panic!("{word:08x}: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+    for (crm, scope) in [
+        (3, Shareability::InnerShareable),
+        (7, Shareability::NonShareable),
+    ] {
+        for (op2, op) in [
+            (1, TlbOperation::Vae1),
+            (2, TlbOperation::Aside1),
+            (3, TlbOperation::Vaae1),
+            (5, TlbOperation::Vale1),
+            (7, TlbOperation::Vaale1),
+        ] {
+            for rt in 0..32 {
+                let word = 0xd5088000 | (crm << 8) | (op2 << 5) | rt;
+                let Some(Decoded::TlbInvalidate {
+                    op: got,
+                    scope: got_scope,
+                    xt,
+                }) = decode(word)
+                else {
+                    panic!("{word:08x}")
+                };
+                assert_eq!((got, got_scope, u32::from(xt.number())), (op, scope, rt));
+            }
+        }
+    }
+}
