@@ -1555,3 +1555,75 @@ fn shared_view_refuses_unadvertised_xsave_extensions_before_memory() {
         step_exc(&mut cpu, &mut mem, ud(CODE_VA));
     }
 }
+
+// Intel SDM Vol. 3B §18.2.4: R/W and LEN select breakpoint conditions.
+#[test]
+fn issue1272_dr7_unsupported_conditions_fail_closed() {
+    for slot in 0..4 {
+        for condition in 1u64..16 {
+            let (mut cpu, mut mem, _) =
+                setup_cpl0_cpu(&[0x0f, 0x23, 0xf8], Box::new(GuestCpuidView::default()));
+            let before = cpu.context().dr[7];
+            step_rax_gp(
+                &mut cpu,
+                &mut mem,
+                CODE_VA,
+                (condition << (16 + slot * 4)) | (1 << (slot * 2)),
+                0,
+            );
+            assert_eq!(cpu.context().dr[7], before);
+        }
+    }
+}
+
+// Intel SDM Vol. 3B §18.3.1: INT1 has no DR6 status bit.
+#[test]
+fn issue1272_icebp_preserves_dr6_status() {
+    for status in [0xffff_0ff0, 0xffff_6ff5] {
+        let (mut cpu, mut mem, _) = setup_cpl0_cpu(&[0xf1], Box::new(GuestCpuidView::default()));
+        cpu.context_mut().dr[6] = status;
+        step_exc(&mut cpu, &mut mem, X86Exception::debug(CODE_VA + 1));
+        assert_eq!(cpu.context().dr[6], status);
+    }
+}
+
+// Intel SDM Vol. 2B PUSHF/POPF: RF/VM cleared in image; IF follows old IOPL.
+#[test]
+fn issue1272_pushfq_clears_rf_in_image() {
+    let (mut cpu, mut mem, _) = setup_cpl0_cpu(
+        &[0x9c, 0x58, 0x0f, 0x23, 0xc3],
+        Box::new(GuestCpuidView::default()),
+    );
+    cpu.context_mut().rflags = 0x10002;
+    // Native POP consumes the guest PUSHF image; MOV DR0 ends the block.
+    step_ok(&mut cpu, &mut mem, CODE_VA + 1);
+    step_ok(&mut cpu, &mut mem, CODE_VA + 5);
+    assert_eq!(cpu.context().gpr[reg::RAX], 2);
+}
+
+#[test]
+fn issue1272_popf_updates_if_at_permitted_iopl() {
+    for bytes in [&[0x9d][..], &[0x66, 0x9d][..]] {
+        for iopl in 0..=3u64 {
+            for old_if in [0, 1 << 9] {
+                let (mut cpu, mut mem, _) = setup_cpl0_cpu(&[], Box::new(GuestCpuidView::default()));
+                let code = mem.map_page(USER_CODE_VA, Perms::USER_RX);
+                mem.write_gpa(code.raw(), bytes);
+                let stack = mem.map_page(0x0080_0000, Perms::USER_RW);
+                mem.write_gpa(
+                    stack.raw(),
+                    &(0x3002u64 | (old_if ^ (1 << 9))).to_le_bytes(),
+                );
+                enter_cpl3(cpu.context_mut(), USER_CODE_VA);
+                cpu.context_mut().gpr[reg::RSP] = 0x0080_0000;
+                cpu.context_mut().rflags = 2 | (iopl << 12) | old_if;
+                step_ok(&mut cpu, &mut mem, USER_CODE_VA + bytes.len() as u64);
+                assert_eq!(
+                    cpu.context().rflags & (1 << 9),
+                    if iopl == 3 { old_if ^ (1 << 9) } else { old_if }
+                );
+                assert_eq!((cpu.context().rflags >> 12) & 3, iopl);
+            }
+        }
+    }
+}

@@ -1587,3 +1587,18 @@ fn non_canonical_ist_rsp_raises_ss_with_ext() {
     assert_eq!(ss.error_code, 1);
     assert_eq!(ss.rip, CODE_VA);
 }
+
+// SDM Vol. 3B §18.3.1.1: faults save RF=1, instruction #DB is the exception.
+#[test]
+fn issue1272_fault_frames_set_rf() {
+    for flags in [RFLAGS_IF, RFLAGS_IF | RFLAGS_RF] {
+        let mut rig = IdtTestRig::new();
+        rig.write_user_code(&[0x0f, 0x0b]); // UD2
+        rig.enter_cpl3(USER_CODE_VA, flags);
+        assert_eq!(rig.run_to_vec_port(), 6);
+        assert_eq!(
+            rig.read_frame40(rig.rsp0_frame, 0xfc8).rflags & RFLAGS_RF,
+            RFLAGS_RF
+        );
+    }
+}

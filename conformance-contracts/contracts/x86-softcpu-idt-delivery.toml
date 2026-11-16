@@ -36,6 +36,8 @@ rationale = "Delivering an exception through a 64-bit IDT gate issues zero impli
 
 [bindings]
 vm_free = [
+  "carrick-softcpu-x86::softcpu_idt_delivery::issue1272_fault_frames_set_rf",
+
   "carrick-softcpu-x86::softcpu_idt_delivery::idt_error_code_presence_and_pf_cr2_bits_match_sdm",
   "carrick-softcpu-x86::softcpu_idt_delivery::idt_gate_types_present_and_dpl_checks_match_sdm",
   "carrick-softcpu-x86::softcpu_idt_delivery::idt_ist_rsp0_stack_switch_alignment_and_frame_layout_match_sdm",
