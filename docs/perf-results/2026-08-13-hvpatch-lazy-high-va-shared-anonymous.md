@@ -269,7 +269,7 @@ FAILED: left 0, right 1
 RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf alias_registry_partial_unmap_preserves_exact_live_fragments -- --nocapture
 FAILED: left 0, right 2
 
-cargo test -p carrick-cli --test trace_profile hvpatch_alias_sharing_ -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::hvpatch_alias_sharing_ -- --nocapture
 FAILED: hvpatch_alias_sharing_trace_fails_closed asserted that `walks = 0;` was absent
 ```
 
@@ -289,7 +289,7 @@ RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib
 RUST_TEST_THREADS=1 cargo test -p carrick-runtime shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily -- --nocapture
 1 passed; 0 failed
 
-cargo test -p carrick-cli --test trace_profile hvpatch_alias_sharing_ -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::hvpatch_alias_sharing_ -- --nocapture
 2 passed; 0 failed
 ```
 
@@ -449,7 +449,7 @@ RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib
 RUST_TEST_THREADS=1 cargo test -p carrick-runtime shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily -- --nocapture
 1 passed; 0 failed
 
-cargo test -p carrick-cli --test trace_profile hvpatch_alias_sharing_ -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::hvpatch_alias_sharing_ -- --nocapture
 2 passed; 0 failed
 ```
 

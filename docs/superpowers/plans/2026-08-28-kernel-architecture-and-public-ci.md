@@ -344,7 +344,7 @@ Append:
           cargo build --locked --release -p carrick-x86-cpl0 --target x86_64-unknown-none
 
       - name: x86 CPL0 entry smoke
-        run: cargo test --locked -p carrick-vmm-kvm --test cpl0_entry
+        run: cargo test --locked -p carrick-vmm-kvm --test main cpl0_entry::
 ```
 
 - [ ] **Step 5: Perform a static security and proof-boundary review**

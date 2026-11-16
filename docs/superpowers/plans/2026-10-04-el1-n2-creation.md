@@ -368,7 +368,7 @@ GPL implementations.
   not the red. Reuse existing signed/next probes for guest execution.
 - **Impact:** none; this stops misattribution and provides the comparison base.
 - **Accept:** `cargo test -p carrick-el1 -p carrick-el1-abi -p carrick-sched-core`;
-  `cargo test -p carrick-kernel-example --test n2_creation`; signed
+  `cargo test -p carrick-kernel-example --test main n2_creation::`; signed
   `just test-embed el1_fork_cow_resolves_in_guest --nocapture` retains expected
   pre-change failure, not an acceptance pass. Common host checks below.
 
@@ -449,7 +449,7 @@ red-first proof for N2. Foreground verification of **commit 1 alone**, before
 applying the branch-only red commit:
 
 ```text
-cargo test -p carrick-kernel-example --test n2_creation
+cargo test -p carrick-kernel-example --test main n2_creation::
   exit 0: 3 passed, 0 failed, 0 ignored
 cargo test -p carrick-el1 --test n2_creation_owner
   exit 0: 2 passed, 0 failed, 0 ignored
@@ -784,8 +784,7 @@ Signed TRACECLONE/seccomp, real register capture, MM projection and runtime
 vfork return remain director-owned; this prep claims no HVF/Docker acceptance.
 
 Local verification: `cargo test -p carrick-sched-core` (96 passed),
-`cargo test -p carrick-kernel-example --test n2_task_lifecycle --test
-n2_task_transactions` (12 passed, four documented budget reds ignored),
+`cargo test -p carrick-kernel-example --test main n2_task_` (12 passed, four documented budget reds ignored),
 `just test-kernel`, scoped Clippy for both changed crates and `just fmt-check`
 exit zero. Explicit budget-red execution exits 101 as recorded above.
 Workspace `just clippy` produces the same 518 runtime diagnostics on this

@@ -64,7 +64,7 @@ Require `dsr-fork.d` to emit sampled and incomplete rows named
 
 ```bash
 cargo test -p carrick-observability dsr_probe_abi --lib -- --nocapture
-cargo test -p carrick-cli --test trace_profile \
+cargo test -p carrick-cli --test integration trace_profile:: \
   fork_profile_pairs_repair_reset_and_first_prepare_latency -- --nocapture
 ```
 
@@ -113,7 +113,7 @@ pairs at `END`.
 
 ```bash
 cargo test -p carrick-observability dsr_probe_abi --lib -- --nocapture
-cargo test -p carrick-cli --test trace_profile -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile:: -- --nocapture
 cargo test -p carrick-runtime \
   native16k_dsr_exec_protection_preserves_linux_syscall_words --lib -- --nocapture
 cargo clippy -p carrick-observability -p carrick-runtime -p carrick-cli \

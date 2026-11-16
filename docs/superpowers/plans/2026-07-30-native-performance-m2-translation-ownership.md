@@ -834,7 +834,7 @@ exit. Corrupt each independently:
 - [ ] **Step 2: Run and prove red**
 
 ```bash
-cargo test -p carrick-cli --test trace_profile dsrprof2 -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::dsrprof2 -- --nocapture
 ```
 
 - [ ] **Step 3: Add launch-time process-birth qualification**
@@ -911,7 +911,7 @@ Reject mixed streams before publication.
 - [ ] **Step 7: Run focused tests and commit**
 
 ```bash
-cargo test -p carrick-cli --test trace_profile dsrprof2 -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::dsrprof2 -- --nocapture
 cargo test -p carrick-cli trace_profile -- --nocapture
 just fmt
 git diff --check
@@ -956,7 +956,7 @@ every kernel sample.
 - [ ] **Step 2: Run and prove red**
 
 ```bash
-cargo test -p carrick-cli --test trace_profile native_wall_kernel_state_v2
+cargo test -p carrick-cli --test integration trace_profile::native_wall_kernel_state_v2
 ```
 
 - [ ] **Step 3: Fold balanced entry state into `native-wall.d`**
@@ -988,7 +988,7 @@ no accepted summary when any invariant fails.
 - [ ] **Step 5: Run focused tests and commit**
 
 ```bash
-cargo test -p carrick-cli --test trace_profile native_wall -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::native_wall -- --nocapture
 cargo test -p carrick-cli trace_profile -- --nocapture
 just fmt
 git diff --check
@@ -1194,7 +1194,7 @@ Co-Authored-By: Codex <codex@openai.com>"
 ```bash
 cargo test -p carrick-observability translated_range -- --nocapture
 cargo test -p carrick-dsr-aarch64 translated_range -- --nocapture
-cargo test -p carrick-cli --test trace_profile native_wall -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::native_wall -- --nocapture
 python3 -m unittest \
   scripts/perf/test_native_wall_attribution.py \
   scripts/perf/test_native_wall_capture.py -v

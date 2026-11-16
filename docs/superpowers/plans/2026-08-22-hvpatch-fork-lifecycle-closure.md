@@ -438,7 +438,7 @@ git commit -am "docs: correct recipes naming the retired native backend"
 sed -n '230,240p' justfile
 ```
 
-`just test` runs `-p carrick-cli --bin carrick`; `test-integration` runs only `--test trace_profile`.
+`just test` runs `-p carrick-cli --bin carrick`; `test-integration` runs only `--test integration trace_profile::`.
 
 - [ ] **Step 2: For each suite, either add it to `test-integration` or delete it.** A suite that needs a guest or Docker must NOT be added — say so in the commit body and delete it instead.
 

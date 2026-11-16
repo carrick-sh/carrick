@@ -2,7 +2,6 @@
 //! Internal admission contention cannot manufacture EAGAIN; a wake cannot
 //! disappear between predicate check and enrollment; reused queue identities
 //! must never complete an old operation. No guest instructions are executed.
-#![cfg(debug_assertions)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use carrick_abi::{LinuxCloneFlags, syscall::nr};
@@ -559,9 +558,9 @@ fn run_setresuid(schedule: &Schedule, scale: u64) -> Result<ScheduleReceipt, Str
 #[test]
 fn retained_setid_birth_seed0_replays_fixed_and_preserves_historical_drift() {
     let fixed: ScheduleReceipt =
-        serde_json::from_str(include_str!("fixtures/setid-birth-seed0-fixed.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/setid-birth-seed0-fixed.json")).unwrap();
     let historical: ScheduleReceipt =
-        serde_json::from_str(include_str!("fixtures/setid-birth-seed0-prefx.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/setid-birth-seed0-prefx.json")).unwrap();
     assert_eq!(historical.seed, 0);
     assert_eq!(historical.decisions.len(), 4);
     assert!(historical.result.contains("LinuxErrno(11)"));

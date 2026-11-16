@@ -12,11 +12,9 @@
 //! 3. `XGETBV(0)` returns `0x7` (`x87 | SSE | AVX`) and `AVX2` (`vpcmpeqd ymm0` / `vpmovmskb`),
 //!    `BMI1` (`blsi`), `BMI2` (`pdep`), `LZCNT`, `POPCNT`, and `MOVBE` execute natively.
 
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-#[path = "common/physical_inventory.rs"]
-mod physical_inventory;
+use crate::physical_inventory;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -24,7 +22,6 @@ use std::process::Command;
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::OBSERVE_NATIVE;
 use carrick_x86::{CpuidRegs, GuestCpuidView, XCR0_X86_64_V3_MASK};
-use physical_inventory::physical_inventory;
 
 const PROBED_LEAVES: &[(u32, u32)] = &[
     (0x0000_0000, 0),

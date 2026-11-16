@@ -7,6 +7,7 @@
 //! timed sample is one engine process at a time; reps are carrick THEN docker.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "../perf_support/mod.rs"]
 mod perf_support;
 
 use perf_support::backend_pair::{

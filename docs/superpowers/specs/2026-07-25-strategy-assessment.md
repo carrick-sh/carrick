@@ -44,7 +44,7 @@ measured Go compiler/import performance blocker"* **[V]**. Nothing automated obs
 guest in this audit: `just ci` ran no guest, and the two guest CI jobs
 (`hvf-conformance` and the former AArch64 smoke lane) were dormant behind
 unset repo variables **[V]**. The AArch64 recipe is now retired; current
-x86 entry smoke uses `cargo test -p carrick-vmm-kvm --test cpl0_entry` on
+x86 entry smoke uses `cargo test -p carrick-vmm-kvm --test main cpl0_entry::` on
 a Linux x86_64 host with real KVM and a built CPL0 image.
 
 Breadth is thinner than the crate list implies. The native capability table

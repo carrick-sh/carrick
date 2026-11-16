@@ -100,8 +100,8 @@ vm_free = [
 ]
 embed = [
   "carrick-embed::futex_contention_contract",
-  "carrick-vmm-kvm::cpl0_entry::production_clone_thread_runs_and_exits_without_ending_parent (production native shared-on-private handshake and clear-tid join)",
-  "carrick-vmm-kvm::cpl0_entry::production_native_futex_timeout_returns_etimedout (sole production native wait, exact errno 110, no counted refusal)",
+  "carrick-vmm-kvm::main::cpl0_entry::production_clone_thread_runs_and_exits_without_ending_parent (production native shared-on-private handshake and clear-tid join)",
+  "carrick-vmm-kvm::main::cpl0_entry::production_native_futex_timeout_returns_etimedout (sole production native wait, exact errno 110, no counted refusal)",
 ]
 docker = [
   "probe:futexpingpong",

@@ -218,12 +218,12 @@ This profile is specific to the pinned LTP population, not arbitrary inotify
 tests. A matching population is not a semantic verdict; inspect TPASS separately.
 
 The new CLI integration check failed red because the old CLI did not expose the
-profile. Final `cargo test --release -p carrick-cli --test trace_profile` passes
+profile. Final `cargo test --release -p carrick-cli --test integration trace_profile::` passes
 all26 tests, including the real full-run count fixture and16 malformed/incomplete
 variants. The suite already runs in the project recipes; no unexecuted in-file
 test module was added.
 
-Scoped `cargo clippy --release -p carrick-cli --bin carrick --test trace_profile
+Scoped `cargo clippy --release -p carrick-cli --bin carrick --test integration
 --no-deps -- -D warnings` passes. The broader invocation fails on six preexisting
 manual_is_multiple_of diagnostics in carrick-aarch64's anonymous_discard.rs and
 engine.rs. Both source hashes still match the pre-experiment snapshot; those

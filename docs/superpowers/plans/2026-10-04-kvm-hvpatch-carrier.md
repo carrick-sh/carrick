@@ -364,7 +364,7 @@ with its owner. N1's cursor and production MM changes are outside this hand-off.
   witnesses through the same entry; no first-call dependency on that work.
 - [ ] Accept: `cargo build --release -p carrick-x86-cpl0 --target x86_64-unknown-none`;
   `cargo test -p carrick-el1 --lib`;
-  `CARRICK_RUN_ID=kvm-m2 cargo test -p carrick-vmm-kvm --test cpl0_entry`.
+  `CARRICK_RUN_ID=kvm-m2 cargo test -p carrick-vmm-kvm --test main cpl0_entry::`.
 
 ### M3 — N1 owner through x86 MMU/fault/backing hooks
 
@@ -389,7 +389,7 @@ accepted landing. No shared runtime, task graph or private cursor/permit model.
   `kernel.el1.stage1-publication`, `kernel.mm.address-space-occupancy`,
   `kernel.mm.pt-pause-drain-acknowledgement`, fork/exec stage1-image.
 - [ ] Accept: `cargo test -p carrick-el1 -p carrick-mmu-core --lib`;
-  `CARRICK_RUN_ID=kvm-m3 cargo test -p carrick-vmm-kvm --test carrier_memory`.
+  `CARRICK_RUN_ID=kvm-m3 cargo test -p carrick-vmm-kvm --test main carrier_memory::`.
 
 #### M3 preparation handoff to the accepted N1 owner
 
@@ -571,7 +571,7 @@ N1/N2 slices. No new scheduler/pipe/futex implementation or shared runtime.
   `kernel.scheduler.host-wait-handoff`, `kernel.scheduler.runnable-progress`,
   `kernel.signal.lease-gap`, `kernel.mm.executor-admission`.
 - [ ] Accept: `cargo test -p carrick-el1 -p carrick-sched-core -p carrick-fd-core -p carrick-pipe-core --lib`;
-  `CARRICK_RUN_ID=kvm-m4 cargo test -p carrick-vmm-kvm --test cpl0_progress`.
+  `CARRICK_RUN_ID=kvm-m4 cargo test -p carrick-vmm-kvm --test main cpl0_progress::`.
 
 #### M4 preparation handoff (2026-10-04, x86 only)
 
@@ -704,7 +704,7 @@ N2's multi-landing policy work is a dependency, not hidden inside this landing.
 - [ ] Contracts: N2 `kernel.el1.creation-native-path`, thread-lifecycle,
   signal-delivery-owner, `kernel.fork.{mappings,filetable,stage1-image}`,
   `kernel.exec.stage1-image`, child-rusage/child-exit-notification-lifecycle.
-- [ ] Accept: `cargo test -p carrick-kernel-example --test n2_creation`;
+- [ ] Accept: `cargo test -p carrick-kernel-example --test main n2_creation::`;
   `CARRICK_RUN_ID=kvm-m6 cargo test -p carrick-vmm-kvm --test carrier_oci`;
   `cargo build --release -p carrick-cli --no-default-features --features platform-linux`;
   `CARRICK_RUN_ID=kvm-m6-shell target/release/carrick run --platform linux/amd64 ubuntu:24.04 -- /bin/sh -c 'echo ok'`.
@@ -732,7 +732,7 @@ or performance budget relaxation. Unaccepted workloads remain explicitly open.
   `just accept --phase kvm --receipt target/kvm-carrier-accept.json`;
   proposed `just kvm-carrier-smoke`; `just conformance-probes` with executing
   KVM routing. Existing
-  `cargo test -p carrick-vmm-kvm --test cpl0_entry` proves executing x86
+  `cargo test -p carrick-vmm-kvm --test main cpl0_entry::` proves executing x86
   entry bindings; it does not prove the full OCI carrier admission.
   Native-x86 Docker authority/timing is a **separate serial director phase**,
   unavailable in this no-Docker task. A failed ratio is unfinished correctness.
@@ -777,7 +777,7 @@ All output is under `target/kvm-carrier-plan/`; no production source changed.
 ```sh
 cargo build -p carrick-cli --no-default-features --features platform-linux > target/kvm-carrier-plan/build-linux.log 2>&1
 cargo test -p carrick-x86 -p carrick-vmm-kvm --lib > target/kvm-carrier-plan/x86-kvm-tests.log 2>&1
-cargo test -p carrick-kernel-example --test contracts > target/kvm-carrier-plan/kernel-contracts.log 2>&1
+cargo test -p carrick-kernel-example --test main contracts:: > target/kvm-carrier-plan/kernel-contracts.log 2>&1
 cargo test -p carrick-el1 -p carrick-sched-core -p carrick-fd-core -p carrick-pipe-core --lib > target/kvm-carrier-plan/neutral-kernel-tests.log 2>&1
 cargo build -p carrick-el1 --bin carrick-el1 --target aarch64-unknown-none-softfloat --release > target/kvm-carrier-plan/el1-arm-build.log 2>&1
 cargo test -p carrick-runtime --no-default-features --features platform-linux --lib vcpu_loop::executor::tests:: > target/kvm-carrier-plan/executor-tests.log 2>&1

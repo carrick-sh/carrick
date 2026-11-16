@@ -125,7 +125,7 @@ its foreground children exited, so cleanup output alone is not its proof.
 | `just test-kernel` (after repair) | 109 EL1 ABI + 32 fd-core pass; kernel **2300 pass / 8 fail / 1 ignored**, 138 filtered; exit 101 |
 | `cargo test -p carrick-x86` | **39 pass**, no failures; exit 0 |
 | `CARRICK_RUN_ID=x86-kvm-health-20261004-kvm-tests cargo test -p carrick-vmm-kvm -- --nocapture` | 19 library pass; live M0/M1 pass, musl M2 fail; exit 101 |
-| `cargo test -p carrick-vmm-kvm --test sentinel_decode` | 2 pass; exit 0 (not reached by preceding failing invocation) |
+| `cargo test -p carrick-vmm-kvm --test main sentinel_decode::` | 2 pass; exit 0 (not reached by preceding failing invocation) |
 | `cargo test -p carrick-vmm-kvm --doc` | 0 doctests; exit 0 |
 | `just test-kernel-semantics` | Fails at socket-close target; exit 101 |
 | `cargo test -p carrick-kernel-example --tests --no-fail-fast` | Complete inventory: **265 pass / 1 fail**, no ignores; exit 101 |
@@ -185,5 +185,5 @@ would not implement it. Acceptance needs two-live-process and exhausted-pool
 contracts plus real OCI execution. No carrier/recycle stress, ARM64/HVF runtime
 gate, Docker oracle, full `just ci`, or overhead ratio is claimed here.
 
-Current x86 entry smoke uses `cargo test -p carrick-vmm-kvm --test cpl0_entry`
+Current x86 entry smoke uses `cargo test -p carrick-vmm-kvm --test main cpl0_entry::`
 on a Linux x86_64 host with real `/dev/kvm` and a built CPL0 image.

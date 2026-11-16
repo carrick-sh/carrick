@@ -1,4 +1,5 @@
-#[path = "../src/namespace_work_profile.rs"]
+#[allow(clippy::module_inception)]
+#[path = "../../src/namespace_work_profile.rs"]
 mod namespace_work_profile;
 
 #[test]

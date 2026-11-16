@@ -119,7 +119,7 @@ answer is a distribution over ~20 guest ops, not a mechanism.
 | typed analyzer pattern | `carrick debug jit-shape-census` → canonical schema `carrick.jit-shape-census.v3`, plus `jit-shape-compare` under a "determinant-locked exact-arithmetic contract" | `crates/carrick-cli/src/debug_jit_shape.rs`, `args.rs:990-1010` |
 | owner join | `carrick debug alloc-owner-census` — strict join of allocation-owner fragments to a **complete** NATIVEPERF export, with named failures for a missing/extra process epoch | `crates/carrick-cli/src/debug_alloc_owner.rs` |
 | capture driver shape | quiet-host preflight receipt per arm (settled loadavg, `pgrep -x yes == 0`, no stray `carrick:`), `CARRICK_RUN_ID` stamped, `scripts/sudo/kill.sh` after each, refuses to run dirty | the deleted `scripts/perf/live-arena-attribution-capture.sh`, recoverable at `git show 1cb06de6^:scripts/perf/live-arena-attribution-capture.sh` |
-| the gate that runs these tests | `cargo test -p carrick-cli --test trace_profile` was added to `just test-integration` on 2026-08-06; `just test`'s `--lib --bins` reaches carrick-cli's in-file `mod tests` | `justfile:132-166`, `:188-218` |
+| the gate that runs these tests | `cargo test -p carrick-cli --test integration trace_profile::` was added to `just test-integration` on 2026-08-06; `just test`'s `--lib --bins` reaches carrick-cli's in-file `mod tests` | `justfile:132-166`, `:188-218` |
 
 **Design with these, not beside them.** Nothing below invents a second parser,
 a second scoping idiom, or a second authority mechanism.

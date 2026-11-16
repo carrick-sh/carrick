@@ -65,7 +65,7 @@ vm_free = [
 embed = [
   "carrick-embed::smoke_signed::smoke_terminal_census_precedes_pool_shutdown_for_two_carriers",
   "carrick-conformance-next::generic_probe_shard_0",
-  "carrick-vmm-kvm::cpl0_shared_entry::production_cpl0_refuses_non_allowlisted_forwards_with_enosys (KVM root census; does not qualify the AArch64 child mkdirat witness)",
+  "carrick-vmm-kvm::main::cpl0_shared_entry::production_cpl0_refuses_non_allowlisted_forwards_with_enosys (KVM root census; does not qualify the AArch64 child mkdirat witness)",
 ]
 docker = [
   "scripts/bpftrace/oracle-served.bt",

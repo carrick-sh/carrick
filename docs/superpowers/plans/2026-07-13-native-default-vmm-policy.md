@@ -187,7 +187,7 @@ In `page_profile.rs`, replace the HVF-named tests with:
 Run and confirm RED:
 
 ```sh
-cargo test -p carrick-cli --test cli exec_backend -- --nocapture
+cargo test -p carrick-cli --test integration cli::exec_backend -- --nocapture
 cargo test -p carrick-runtime page_profile --lib -- --nocapture
 ```
 
@@ -219,7 +219,7 @@ explicit `--exec-backend vmm`. Do not catch these errors in `runtime.rs` or
 - [ ] **Step 4: Run focused compile and tests**
 
 ```sh
-cargo test -p carrick-cli --test cli exec_backend -- --nocapture
+cargo test -p carrick-cli --test integration cli::exec_backend -- --nocapture
 cargo test -p carrick-engine --lib
 cargo test -p carrick-runtime page_profile --lib -- --nocapture
 cargo check -p carrick-cli
@@ -336,7 +336,7 @@ Run and confirm RED:
 
 ```sh
 cargo test -p carrick-conformance lane -- --nocapture
-cargo test -p carrick-cli --test perf_runner backend -- --nocapture
+cargo test -p carrick-cli --test conformance perf_runner::backend -- --nocapture
 ```
 
 - [ ] **Step 2: Implement one VMM argv inserter**
@@ -350,7 +350,7 @@ intentionally exercise HVF to pass `vmm`.
 
 ```sh
 cargo test -p carrick-conformance --lib
-cargo test -p carrick-cli --test perf_runner backend -- --nocapture
+cargo test -p carrick-cli --test conformance perf_runner::backend -- --nocapture
 cargo test -p carrick-cli --test conformance lane_allowed_for_backend -- --nocapture
 ```
 

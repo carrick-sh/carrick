@@ -100,7 +100,7 @@ The minimum checks for this branch shape are:
 
 ```sh
 cargo metadata --no-deps --format-version=1
-cargo test -p carrick-cli --test perf_runner cases -- --nocapture
+cargo test -p carrick-cli --test conformance perf_runner::perf_support::cases -- --nocapture
 cargo test -p carrick-runtime --test integration futex_wake_returns_count_and_advances_table -- --nocapture
 cargo test -p carrick-vmm-hvf futex -- --nocapture
 cargo test -p carrick-runtime --test integration writev -- --nocapture

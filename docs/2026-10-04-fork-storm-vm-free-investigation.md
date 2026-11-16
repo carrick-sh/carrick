@@ -239,7 +239,7 @@ witness at the implicated seam and correct its authority.
 
 ## Verification on this Linux VM
 
-- `cargo test -p carrick-kernel-example --test fork_clone_orderings -- --nocapture`:
+- `cargo test -p carrick-kernel-example --test main fork_clone_orderings:: -- --nocapture`:
   seven tests, eight forced schedules pass on the unchanged base kernel.
   There is no red/green claim.
 - `cargo test -p carrick-kernel-example --tests`: the new tests and earlier

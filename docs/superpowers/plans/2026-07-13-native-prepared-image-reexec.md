@@ -464,7 +464,7 @@ Run:
 
 ```bash
 cargo test -p carrick-runtime --lib native_exec_capsule::tests -- --nocapture
-cargo test -p carrick-cli --test cli native_self_reexec -- --nocapture
+cargo test -p carrick-cli --test integration cli::native_self_reexec -- --nocapture
 cargo clippy -p carrick-runtime -p carrick-cli --all-targets -- -D warnings
 ```
 
@@ -759,7 +759,7 @@ Run:
 
 ```bash
 cargo test -p carrick-observability dsr_cache_lifecycle -- --nocapture
-cargo test -p carrick-cli --test trace_profile -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile:: -- --nocapture
 ```
 
 Expected: absent ordinals and sample parsers fail.
@@ -780,7 +780,7 @@ Run:
 
 ```bash
 cargo test -p carrick-observability dsr_cache_lifecycle -- --nocapture
-cargo test -p carrick-cli --test trace_profile -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile:: -- --nocapture
 cargo test -p carrick-cli trace_profile -- --nocapture
 rg -n 'prepared-(build|validate|map)' scripts/dtrace/dsr-fork.d \
   crates/carrick-cli/src/trace_profile.rs

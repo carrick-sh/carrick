@@ -1,10 +1,8 @@
 //! Real KVM proof that production CPL0 dispatches a Linux lifecycle call
 //! inside the shared family before its physical root-exit notification.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::expect_used)]
 
-#[path = "common/kvm_pool_fixture.rs"]
-mod kvm_pool_fixture;
+use crate::kvm_pool_fixture;
 use carrick_vmm_kvm::cpl0_boot::PhysicalCrossingFamily;
 use kvm_pool_fixture::run_pool_fixture;
 

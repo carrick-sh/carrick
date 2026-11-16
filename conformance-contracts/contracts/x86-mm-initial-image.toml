@@ -17,7 +17,7 @@ semantic_authority = [
   "ELF gABI Program Interpreter and x86-64 psABI process initialization: enter PT_INTERP at its entry; AT_BASE identifies its load bias while AT_ENTRY, AT_PHDR and AT_PHNUM describe the executable",
   "The exact static x86_64 exit_group(7) ELF enters at e_entry and terminates with status 7",
 ]
-fixture = "carrick-el1::isa::x86::initial_mm::tests; carrick-vmm-kvm::cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven; production_enters_pt_interp_instead_of_executable_entry"
+fixture = "carrick-el1::isa::x86::initial_mm::tests; carrick-vmm-kvm::main::cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven; production_enters_pt_interp_instead_of_executable_entry"
 scale_points = [1, 2, 3]
 structural_budgets = []
 rationale = """
@@ -60,9 +60,9 @@ vm_free = [
   "carrick-x86-cpl0-host::cpl0_boot::initial_reply_tests::corrupted_guest_reply_cannot_change_host_grant_or_stack_geometry",
 ]
 embed = [
-  "carrick-vmm-kvm::cpl0_initial_mm::production_initial_image_spans_more_than_one_edit_table_budget",
-  "KVM-only carrier fixture: carrick-vmm-kvm::cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven",
-  "carrick-vmm-kvm::cpl0_initial_mm::production_enters_pt_interp_instead_of_executable_entry",
+  "carrick-vmm-kvm::main::cpl0_initial_mm::production_initial_image_spans_more_than_one_edit_table_budget",
+  "KVM-only carrier fixture: carrick-vmm-kvm::main::cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven",
+  "carrick-vmm-kvm::main::cpl0_initial_mm::production_enters_pt_interp_instead_of_executable_entry",
   "carrick-vmm-kvm::cpl0_boot::cpl0_layout_tests::production_boot_refuses_stale_layout_before_entry",
   "carrick-vmm-kvm::cpl0_boot::cpl0_layout_tests::file_region_published_before_guest_entry",
 ]

@@ -360,7 +360,7 @@ Run:
 
 ```sh
 RUSTC_WRAPPER= cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
-RUSTC_WRAPPER= cargo test -p carrick-kernel-example --test contracts
+RUSTC_WRAPPER= cargo test -p carrick-kernel-example --test main contracts::
 CARRICK_TEST_SIGNED_FEATURES=conformance-metrics just test-embed hvpatch_portal_contract_budget --exact --nocapture
 ```
 

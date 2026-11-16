@@ -503,7 +503,7 @@ Tests (write all, then run; expected results per `man 2 wait4`, `man 2 waitid`, 
     assert!(run.completions().iter().any(|c| c.label == "getppid" && c.result == Ok(1)));
 }
 ```
-Add `sys::waitid(idtype, id, options)` (`Out(128)` siginfo, rusage 0) and `sys::prctl(option, arg2)` to `sys.rs`. Run: `cargo test -p carrick-kernel-example --test semantics wait::`. Commit per green batch: `git commit -m "test(kernel-example): wait, zombie, reparent and autoreap semantics across two processes"`; a red test gets its defect fix (commit `fix(kernel): …` with the test named in Verified) or its `#[ignore = "defect: …"]` and a ledger entry.
+Add `sys::waitid(idtype, id, options)` (`Out(128)` siginfo, rusage 0) and `sys::prctl(option, arg2)` to `sys.rs`. Run: `cargo test -p carrick-kernel-example --test main semantics::wait::`. Commit per green batch: `git commit -m "test(kernel-example): wait, zombie, reparent and autoreap semantics across two processes"`; a red test gets its defect fix (commit `fix(kernel): …` with the test named in Verified) or its `#[ignore = "defect: …"]` and a ledger entry.
 
 ### Task 6: process groups, sessions and group signals
 

@@ -25,7 +25,7 @@ Files: create `crates/carrick-kernel-example/tests/ptrace_wait.rs`; modify the p
 - [x] Preserve the same scan-time precheck across stop-before-enrollment and stop-after-enrollment; assert the returned stop status and detach behavior.
 - [x] Fix the parent-only validation using exact tracer ownership; avoid numeric-ID relookup across authority snapshots. Review lifecycle race implications before accepting the implementation.
 - [x] Preserve typed ptrace-stop provenance through event consumption, the wait receipt, and waitid rendering. Native Docker returns CLD_TRAPPED (4), while ordinary job-control stops return CLD_STOPPED (5). Signed baseline diagnostic `conf-66293` reports 5 and fails; Docker reports 4 and passes. Add both controls rather than encoding Carrick's old answer in a test.
-- [x] Run `RUSTC_WRAPPER= cargo test -p carrick-kernel-example --test ptrace_wait`, `RUSTC_WRAPPER= just test-kernel`, and formatting. Review and commit the bounded change.
+- [x] Run `RUSTC_WRAPPER= cargo test -p carrick-kernel-example --test main ptrace_wait::`, `RUSTC_WRAPPER= just test-kernel`, and formatting. Review and commit the bounded change.
 
 ## Task 2: Integration and signed evidence
 
