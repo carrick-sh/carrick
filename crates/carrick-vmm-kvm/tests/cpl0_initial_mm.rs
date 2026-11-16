@@ -5098,7 +5098,7 @@ impl InetPeers {
             let (mut stream, _) = listener.accept().expect("guest connect");
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-                .unwrap();
+                .expect("peer read timeout");
             let mut ping = [0u8; 4];
             stream.read_exact(&mut ping).expect("guest ping");
             assert_eq!(&ping, b"ping");
@@ -5115,11 +5115,17 @@ impl InetPeers {
         // The non-blocking dialer's peer only accepts.
         let tcp_nb = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp listener");
         let mut defines = vec![
-            format!("-DTCP_PORT={}", wire(tcp.local_addr().unwrap().port())),
-            format!("-DUDP_PORT={}", wire(udp.local_addr().unwrap().port())),
+            format!(
+                "-DTCP_PORT={}",
+                wire(tcp.local_addr().expect("bound address").port())
+            ),
+            format!(
+                "-DUDP_PORT={}",
+                wire(udp.local_addr().expect("bound address").port())
+            ),
             format!(
                 "-DTCP_NB_PORT={}",
-                wire(tcp_nb.local_addr().unwrap().port())
+                wire(tcp_nb.local_addr().expect("bound address").port())
             ),
         ];
         Self::tcp(tcp);
@@ -5135,7 +5141,7 @@ impl InetPeers {
         if let Ok(tcp6) = std::net::TcpListener::bind("[::1]:0") {
             defines.push(format!(
                 "-DTCP6_PORT={}",
-                wire(tcp6.local_addr().unwrap().port())
+                wire(tcp6.local_addr().expect("bound address").port())
             ));
             Self::tcp(tcp6);
         }
@@ -5157,12 +5163,12 @@ impl InetPeers {
 fn native_child_inet_calls_run_under_the_childs_own_identity() {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("identity peer");
-    let port = listener.local_addr().unwrap().port();
+    let port = listener.local_addr().expect("bound address").port();
     let peer = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("guest connect");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-            .unwrap();
+            .expect("peer read timeout");
         stream.write_all(&[0x5a; 70_000]).expect("peer data");
         let mut received = Vec::new();
         let _ = stream.read_to_end(&mut received);

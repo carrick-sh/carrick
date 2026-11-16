@@ -315,8 +315,20 @@ pub struct NetCaller {
     pub cap_effective: u64,
 }
 
+/// Little-endian wire layout of a [`NetCaller`].
+#[derive(zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[repr(C)]
+struct NetCallerWire {
+    task_id: zerocopy::little_endian::I32,
+    ns_pid: zerocopy::little_endian::U32,
+    task_serial: zerocopy::little_endian::U64,
+    /// ruid, euid, suid, fsuid, rgid, egid, sgid, fsgid.
+    ids: [zerocopy::little_endian::U32; 8],
+    cap_effective: zerocopy::little_endian::U64,
+}
+
 /// Encoded bytes of a [`NetCaller`].
-pub const NET_CALLER_BYTES: usize = 4 + 4 + 8 + 8 * 4 + 8;
+pub const NET_CALLER_BYTES: usize = core::mem::size_of::<NetCallerWire>();
 
 /// Largest data range one [`HostFileOp::NetSyscall`] stages (a `send`'s
 /// bytes or a `recv`'s buffer): one record's chunk less the caller, call
@@ -325,57 +337,48 @@ pub const NET_TRANSFER_MAX_BYTES: usize = HOST_FILE_CHUNK_BYTES - 4096;
 
 impl NetCaller {
     pub fn encode(&self) -> [u8; NET_CALLER_BYTES] {
-        let mut out = [0u8; NET_CALLER_BYTES];
-        out[0..4].copy_from_slice(&self.task.id.raw().to_le_bytes());
-        out[4..8].copy_from_slice(&self.ns_pid.get().to_le_bytes());
-        out[8..16].copy_from_slice(&self.task.serial.raw().to_le_bytes());
-        let ids = [
-            self.ids.ruid,
-            self.ids.euid,
-            self.ids.suid,
-            self.ids.fsuid,
-            self.ids.rgid,
-            self.ids.egid,
-            self.ids.sgid,
-            self.ids.fsgid,
-        ];
-        for (index, id) in ids.iter().enumerate() {
-            out[16 + index * 4..20 + index * 4].copy_from_slice(&id.to_le_bytes());
-        }
-        out[48..56].copy_from_slice(&self.cap_effective.to_le_bytes());
-        out
+        let ids = self.ids;
+        let wire = NetCallerWire {
+            task_id: self.task.id.raw().into(),
+            ns_pid: self.ns_pid.get().into(),
+            task_serial: self.task.serial.raw().into(),
+            ids: [
+                ids.ruid, ids.euid, ids.suid, ids.fsuid, ids.rgid, ids.egid, ids.sgid, ids.fsgid,
+            ]
+            .map(Into::into),
+            cap_effective: self.cap_effective.into(),
+        };
+        let mut bytes = [0u8; NET_CALLER_BYTES];
+        bytes.copy_from_slice(zerocopy::IntoBytes::as_bytes(&wire));
+        bytes
     }
 
     /// Split a stamped [`HostFileOp::NetSyscall`] input into its caller and
     /// the [`NetCall`] bytes. `None` for an unstamped or malformed input.
     pub fn split(input: &[u8]) -> Option<(Self, &[u8])> {
         let (head, call) = input.split_at_checked(NET_CALLER_BYTES)?;
-        let id = core::num::NonZeroI32::new(i32::from_le_bytes(head[0..4].try_into().ok()?))?;
-        if id.get() < 0 {
-            return None;
-        }
+        let wire = <NetCallerWire as zerocopy::FromBytes>::read_from_bytes(head).ok()?;
+        let id = core::num::NonZeroI32::new(wire.task_id.get()).filter(|id| id.get() > 0)?;
         let task = carrick_sched_core::process::TaskKey {
             id: carrick_sched_core::process::TaskId::from_registry_allocation(id),
-            serial: carrick_sched_core::process::TaskSerial::from_raw_u64(read_u64(head, 8)?)?,
+            serial: carrick_sched_core::process::TaskSerial::from_raw_u64(wire.task_serial.get())?,
         };
-        let ns_pid = core::num::NonZeroU32::new(read_u32(head, 4)?)?;
-        let id = |index: usize| read_u32(head, 16 + index * 4);
-        let ids = AccessIds {
-            ruid: id(0)?,
-            euid: id(1)?,
-            suid: id(2)?,
-            fsuid: id(3)?,
-            rgid: id(4)?,
-            egid: id(5)?,
-            sgid: id(6)?,
-            fsgid: id(7)?,
-        };
+        let [ruid, euid, suid, fsuid, rgid, egid, sgid, fsgid] = wire.ids.map(|id| id.get());
         Some((
             Self {
                 task,
-                ns_pid,
-                ids,
-                cap_effective: read_u64(head, 48)?,
+                ns_pid: core::num::NonZeroU32::new(wire.ns_pid.get())?,
+                ids: AccessIds {
+                    ruid,
+                    euid,
+                    suid,
+                    fsuid,
+                    rgid,
+                    egid,
+                    sgid,
+                    fsgid,
+                },
+                cap_effective: wire.cap_effective.get(),
             },
             call,
         ))
