@@ -347,23 +347,25 @@ impl carrick_hal::native_exec::NativeExecHostService<carrick_vmm_hvf::trap::Gues
 
     fn serve_host_file(
         &self,
-        _request: carrick_core_abi::service::ServiceRequest,
+        request: carrick_core_abi::service::ServiceRequest,
         record: &mut [u8],
         executable: Option<std::sync::Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
     ) -> Result<
-        Option<std::sync::Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+        carrick_hal::fork_stock::NativeHostFileReply,
         carrick_hal::fork_stock::NativeHostFileRefused,
     > {
         // The request identity was authenticated by the service cell; the
         // record names the caller's own ring table, pinned at service time.
+        // A call that would block waits on the requesting member's own
+        // host-readiness queue.
         let run = self
             .run
             .get()
             .and_then(std::sync::Weak::upgrade)
             .ok_or(carrick_hal::fork_stock::NativeHostFileRefused)?;
         run.dispatcher
-            .serve_native_host_file(record, executable)
-            .map(|served| served.retained_source)
+            .serve_native_host_file_for(record, executable, request.identity.birth.record)
+            .map(carrick_kernel::dispatch::native_files::NativeHostFileServed::into_reply)
             .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)
     }
 

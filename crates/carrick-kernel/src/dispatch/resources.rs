@@ -403,6 +403,20 @@ pub(crate) fn with_active_context<R>(
     })
 }
 
+/// Run one native network call (#231) against `context`'s resources with
+/// `files` as its descriptor table: the caller's socket, alone, under the
+/// number the call names. Credentials, namespaces and limits stay those of
+/// `context`; no descriptor of `context`'s own table is visible.
+pub(super) fn with_native_net_scope<R>(
+    context: &crate::kernel::KernelContext,
+    files: Arc<crate::kernel::FileTable>,
+    operation: impl FnOnce() -> R,
+) -> R {
+    let mut resources = CapturedResources::from_context(context);
+    resources.files_override = Some(files);
+    with_resource_scope(resources, context, operation)
+}
+
 #[cfg(test)]
 pub(super) fn with_resources<R>(resources: CapturedResources, operation: impl FnOnce() -> R) -> R {
     with_resource_scope(resources, std::ptr::null(), operation)

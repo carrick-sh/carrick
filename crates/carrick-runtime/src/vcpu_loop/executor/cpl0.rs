@@ -2297,12 +2297,13 @@ fn native_host_file_server<'a>(
     resources: &'a carrick_kernel::dispatch::resources::HostRootResources,
 ) -> impl FnMut(
     carrick_core_abi::service::ServiceOrigin,
+    carrick_el1_abi::RecordRef,
     &mut [u8],
 ) -> Result<
-    Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+    carrick_hal::fork_stock::NativeHostFileReply,
     carrick_hal::fork_stock::NativeHostFileRefused,
 > + 'a {
-    move |origin, record| {
+    move |origin, requester, record| {
         let dispatcher = dispatcher
             .lock()
             .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
@@ -2311,11 +2312,11 @@ fn native_host_file_server<'a>(
                 dispatcher.serve_host_root_file(resources, record)
             }
             carrick_core_abi::service::ServiceOrigin::Descendant => {
-                dispatcher.serve_native_host_file(record, None)
+                dispatcher.serve_native_host_file_for(record, None, requester)
             }
         };
         result
-            .map(|served| served.retained_source)
+            .map(carrick_kernel::dispatch::native_files::NativeHostFileServed::into_reply)
             .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)
     }
 }
