@@ -33,7 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --release -p carrick-x86-cpl0 --target x86_64-unknown-none 2>&1 | tee pilot-logs/image-build.log
-          cargo test --locked -p carrick-vmm-kvm --test cpl0_entry -- --nocapture 2>&1 | tee pilot-logs/cpl0-entry.log
+          cargo test --locked -p carrick-vmm-kvm --test main cpl0_entry:: -- --nocapture 2>&1 | tee pilot-logs/cpl0-entry.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
