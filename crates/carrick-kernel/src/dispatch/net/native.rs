@@ -15,16 +15,17 @@
 //! (`socket`, `accept`) leaves the scratch table for the caller's own ring
 //! namespace. A call that would block answers an owner wait on the member's
 //! host-readiness queue, sampled before the call, and the host descriptor is
-//! enrolled with the carrier's readiness watch; the member reruns the call
+//! enrolled with the carrier's one wait reactor; the member reruns the call
 //! when it is ready.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use carrick_core_abi::host_file::{HostFileHeader, NetCall, NetSegment};
 use carrick_el1_abi::ipc::fd;
 
 use crate::dispatch::{DispatchOutcome, SyscallDispatcher};
 use crate::el1_ipc::{HostIpc, InstallHostDescriptionError, PinnedHostResourceError};
+use crate::host_readiness::HostReadinessReactor;
 
 /// The number the caller's socket has in its call's scratch table. The
 /// caller's own number never leaves its ring namespace.
@@ -36,16 +37,21 @@ const NATIVE_SOCKET_FD: i32 = 3;
 pub(in crate::dispatch) struct NativeNetFile {
     description: parking_lot::Mutex<Arc<crate::kernel::FileDescription>>,
     token: crate::host_readiness::HostReadinessToken,
-    owner: Weak<HostIpc>,
+    /// The reactor this socket's waits enrol in, which forgets them when the
+    /// ring releases the socket.
+    readiness: Arc<HostReadinessReactor>,
 }
 
 impl NativeNetFile {
-    fn new(description: Arc<crate::kernel::FileDescription>, owner: &Arc<HostIpc>) -> Self {
+    fn new(
+        description: Arc<crate::kernel::FileDescription>,
+        readiness: Arc<HostReadinessReactor>,
+    ) -> Self {
         description.retain_fd_ref();
         Self {
             description: parking_lot::Mutex::new(description),
             token: crate::host_readiness::HostReadinessToken::new(),
-            owner: Arc::downgrade(owner),
+            readiness,
         }
     }
 
@@ -53,7 +59,7 @@ impl NativeNetFile {
         Arc::clone(&self.description.lock())
     }
 
-    /// The readiness-watch identity of this socket's enrolments.
+    /// The readiness identity of this socket's enrolments.
     pub(in crate::dispatch) fn source(&self) -> crate::host_readiness::HostReadinessSource {
         self.token.source()
     }
@@ -75,9 +81,7 @@ impl NativeNetFile {
 impl Drop for NativeNetFile {
     fn drop(&mut self) {
         // The ring released the last descriptor naming this socket.
-        if let Some(owner) = self.owner.upgrade() {
-            owner.forget_host_ready(self.token.source());
-        }
+        self.readiness.forget(self.token.source());
         self.description.get_mut().release_fd_ref();
     }
 }
@@ -336,12 +340,13 @@ impl SyscallDispatcher {
                             source: socket.source(),
                             // SAFETY: the scratch slot and the ring's
                             // descriptor retain this description's host fd
-                            // until the watch holds its own duplicate.
+                            // until the reactor holds its own duplicate.
                             fd: unsafe { std::os::fd::BorrowedFd::borrow_raw(wait.fd()) },
                             events: wait.events(),
                         })
                         .collect();
-                    if owner.watch_host_ready(record, &interests, None) {
+                    let reactor = Arc::clone(self.kernel_binding.read().kernel().host_readiness());
+                    if owner.watch_host_ready(&reactor, record, &interests, None) {
                         NetServed::Wait(revision)
                     } else {
                         NetServed::Refused
@@ -502,7 +507,10 @@ impl SyscallDispatcher {
         };
         match owner.install_host_description(
             table,
-            Box::new(NativeNetFile::new(slot.description(), owner)),
+            Box::new(NativeNetFile::new(
+                slot.description(),
+                Arc::clone(self.kernel_binding.read().kernel().host_readiness()),
+            )),
             fd::AccessMode::ReadWrite,
             flags,
             slot.close_on_exec(),

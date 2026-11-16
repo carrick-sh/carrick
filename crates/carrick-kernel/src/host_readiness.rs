@@ -1,41 +1,38 @@
-//! The carrier's readiness watch over host objects a native member waits on
-//! (#231). A host network socket is a real host object, so its readiness is
-//! a host crossing: when a native call on one would block, the carrier
-//! sampled the member's host-readiness queue before its non-blocking probe,
-//! enrols the host descriptors here and answers the member's service with an
-//! owner wait on that queue. When the host reports a descriptor ready, or a
-//! poll's deadline passes, this watch notifies the queue and the member
-//! reruns its call once. Nothing polls, and a member's execution capacity is
-//! released while it waits.
+//! Host readiness of the host objects a native member waits on (#231).
+//!
+//! A host network socket is a real host object, so its readiness is a host
+//! crossing: when a native call on one would block, the carrier sampled the
+//! member's host-readiness queue before its non-blocking probe, enrols the
+//! host descriptors with the carrier's one wait reactor (the
+//! [`CarrierWaitService`](crate::kernel::continuation::CarrierWaitService)
+//! that also serves the run root's host-fd waits) and answers the member's
+//! service with an owner wait on that queue. When the host reports a
+//! descriptor ready, or a poll's deadline passes, the reactor notifies the
+//! queue and the member reruns its call once. Nothing polls, no second
+//! reactor thread exists, and a member's execution capacity is released
+//! while it waits.
 //!
 //! A member waits in at most one call, so its enrolments are that call's: a
-//! new wait replaces them, and they are dropped once notified. The watch
-//! thread blocks in `poll(2)` on the enrolled descriptors and its own control
-//! pipe, which carries only enrolment and shutdown changes. Enrolments hold
-//! their own duplicate of the host descriptor and are dropped by their source
-//! when the guest's last descriptor closes, so a closed socket never lingers
-//! here.
+//! new wait replaces them, and they are dropped once notified. Enrolments
+//! hold their own duplicate of the host descriptor and are dropped by their
+//! source when the guest's last descriptor closes, so a closed socket never
+//! lingers in the reactor's poll set.
 
-use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
 use crate::el1_zone::CarrierZone;
+use crate::kernel::continuation::CarrierWaitService;
 
 /// The identity of one enrolled host object, so its source can drop its
 /// enrolments when the object closes: the address of a token the source
 /// owns for its whole life ([`HostReadinessToken`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct HostReadinessSource(usize);
-
-impl HostReadinessSource {
-    /// A deadline alone, which no source forgets.
-    const DEADLINE: Self = Self(0);
-}
 
 /// A host object's readiness identity, held for the object's life.
 #[derive(Debug)]
@@ -59,270 +56,229 @@ pub(crate) struct HostReadinessInterest<'a> {
     pub(crate) events: i16,
 }
 
-struct Enrolment {
-    source: HostReadinessSource,
-    /// `None`: the member's deadline alone.
-    fd: Option<OwnedFd>,
-    events: i16,
+/// The member a host-readiness wait notifies: its ring record, exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct HostReadyKey {
+    record: u32,
+    incarnation: u64,
+}
+
+impl HostReadyKey {
+    fn of(record: carrick_el1_abi::RecordRef) -> Self {
+        Self {
+            record: record.id.raw(),
+            incarnation: record.incarnation,
+        }
+    }
+}
+
+/// One member's enrolled wait in the reactor: the host descriptors it waits
+/// on (each the reactor's own duplicate) and its deadline, if any.
+pub(crate) struct HostReadyWait {
     record: carrick_el1_abi::RecordRef,
+    /// Distinguishes this wait from a later one of the same member, so a
+    /// readiness the reactor saw for a replaced wait notifies nobody.
+    serial: u64,
+    interests: Vec<(HostReadinessSource, OwnedFd, i16)>,
     deadline: Option<Instant>,
     carrier: Option<CarrierZone>,
 }
 
-struct Shared {
-    enrolments: Mutex<Vec<Enrolment>>,
-    control: OwnedFd,
-    shutdown: AtomicBool,
-}
-
-impl Shared {
-    fn wake(&self) {
-        let byte = 1u8;
-        // A full control pipe already holds a pending wake.
-        let _ = unsafe { libc::write(self.control.as_raw_fd(), (&byte as *const u8).cast(), 1) };
+impl std::fmt::Debug for HostReadyWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostReadyWait")
+            .field("record", &self.record)
+            .field("serial", &self.serial)
+            .field("interests", &self.interests.len())
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
     }
 }
 
-/// One carrier's watch. Dropping it stops the thread.
-pub(crate) struct HostReadinessWatch {
-    shared: Arc<Shared>,
-    thread: Option<std::thread::JoinHandle<()>>,
+impl HostReadyWait {
+    /// Publish this wait's readiness to its member: the member reruns its
+    /// call once.
+    pub(crate) fn notify(self) {
+        crate::el1_zone::notify_host_ready(self.carrier.as_ref(), self.record);
+    }
 }
 
-impl std::fmt::Debug for HostReadinessWatch {
+/// The reactor's table of native members' host-readiness waits, held under
+/// the wait service's state lock. Every row contributes pollfds (or only a
+/// deadline), so a reactor cycle visits exactly the rows it polls.
+#[derive(Debug, Default)]
+pub(crate) struct HostReadyWaits {
+    waits: BTreeMap<HostReadyKey, HostReadyWait>,
+    next_serial: u64,
+}
+
+impl HostReadyWaits {
+    /// Replace `record`'s wait.
+    fn enrol(
+        &mut self,
+        record: carrick_el1_abi::RecordRef,
+        interests: Vec<(HostReadinessSource, OwnedFd, i16)>,
+        deadline: Option<Instant>,
+        carrier: Option<CarrierZone>,
+    ) {
+        self.next_serial = self.next_serial.wrapping_add(1);
+        self.waits.insert(
+            HostReadyKey::of(record),
+            HostReadyWait {
+                record,
+                serial: self.next_serial,
+                interests,
+                deadline,
+                carrier,
+            },
+        );
+    }
+
+    /// Drop every wait on `source` (its last guest descriptor closed).
+    /// `true` when one was dropped.
+    fn forget(&mut self, source: HostReadinessSource) -> bool {
+        let before = self.waits.len();
+        self.waits
+            .retain(|_, wait| !wait.interests.iter().any(|(held, _, _)| *held == source));
+        self.waits.len() != before
+    }
+
+    /// Append this table's pollfds and their owners, and fold its nearest
+    /// deadline into `nearest`.
+    pub(crate) fn poll_set(
+        &self,
+        pollfds: &mut Vec<libc::pollfd>,
+        owners: &mut Vec<(HostReadyKey, u64)>,
+        nearest: &mut Option<Instant>,
+    ) {
+        for (key, wait) in &self.waits {
+            for (_, fd, events) in &wait.interests {
+                pollfds.push(libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: *events,
+                    revents: 0,
+                });
+                owners.push((*key, wait.serial));
+            }
+            if let Some(deadline) = wait.deadline {
+                *nearest = Some(nearest.map_or(deadline, |current| current.min(deadline)));
+            }
+        }
+    }
+
+    /// Take the waits that `fired` (by key and serial) or whose deadline
+    /// passed by `now`. Each member is taken once.
+    pub(crate) fn take_woken(
+        &mut self,
+        fired: &[(HostReadyKey, u64)],
+        now: Instant,
+    ) -> Vec<HostReadyWait> {
+        let keys: Vec<HostReadyKey> = self
+            .waits
+            .iter()
+            .filter(|(key, wait)| {
+                fired.contains(&(**key, wait.serial))
+                    || wait.deadline.is_some_and(|deadline| deadline <= now)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        keys.iter()
+            .filter_map(|key| self.waits.remove(key))
+            .collect()
+    }
+
+    /// Take every wait (the host refused the reactor's poll itself).
+    pub(crate) fn take_all(&mut self) -> Vec<HostReadyWait> {
+        std::mem::take(&mut self.waits).into_values().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.waits.len()
+    }
+}
+
+/// A kernel's route to the carrier wait reactor that serves its native
+/// members' host-readiness waits. The executor pool's wait service binds
+/// itself here when it starts ([`CarrierWaitService::serve_host_readiness`]);
+/// without a live one a wait is refused, never left unobserved.
+#[derive(Default)]
+pub(crate) struct HostReadinessReactor {
+    /// Type-erased: the wait service owns the scheduler, which owns the
+    /// kernel that holds this route.
+    service: Mutex<Option<Weak<dyn HostReadyTable>>>,
+}
+
+impl std::fmt::Debug for HostReadinessReactor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostReadinessWatch")
-            .field("enrolled", &self.shared.enrolments.lock().len())
+        f.debug_struct("HostReadinessReactor")
+            .field("bound", &self.service().is_some())
             .finish()
     }
 }
 
-fn pipe_pair() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [-1; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: pipe(2) returned two fresh descriptors this function owns.
-    let pair = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    for fd in [&pair.0, &pair.1] {
-        let raw = fd.as_raw_fd();
-        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
-        let fd_flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
-        if flags < 0
-            || fd_flags < 0
-            || unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-            || unsafe { libc::fcntl(raw, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(pair)
+/// The wait reactor's host-readiness table (#231).
+pub(crate) trait HostReadyTable: Send + Sync {
+    /// Change the table and, when `change` reports a change, wake the
+    /// reactor to rebuild its poll set.
+    fn change_host_ready_waits(&self, change: &mut dyn FnMut(&mut HostReadyWaits) -> bool);
+    #[cfg(test)]
+    fn host_ready_waits(&self) -> usize;
 }
 
-impl HostReadinessWatch {
-    pub(crate) fn start() -> std::io::Result<Self> {
-        let (read, write) = pipe_pair()?;
-        let shared = Arc::new(Shared {
-            enrolments: Mutex::new(Vec::new()),
-            control: write,
-            shutdown: AtomicBool::new(false),
-        });
-        let watcher = Arc::clone(&shared);
-        let thread = std::thread::Builder::new()
-            .name("carrick-host-ready".into())
-            .spawn(move || run(&watcher, &read))?;
-        Ok(Self {
-            shared,
-            thread: Some(thread),
-        })
+impl HostReadinessReactor {
+    pub(crate) fn bind(&self, service: &CarrierWaitService) {
+        let inner: Arc<dyn HostReadyTable> = service.inner.clone();
+        *self.service.lock() = Some(Arc::downgrade(&inner));
     }
 
-    /// Replace `record`'s wait with one on `interests` (each descriptor
-    /// duplicated here) and, if given, `deadline`: the first to report its
-    /// events, or the deadline, notifies `record`'s host-readiness queue.
-    pub(crate) fn enrol(
+    fn service(&self) -> Option<Arc<dyn HostReadyTable>> {
+        self.service.lock().as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Replace `record`'s host-readiness wait with one on `interests` (each
+    /// descriptor duplicated for the reactor) and, if given, `deadline`: the
+    /// first to report its events, or the deadline, notifies `record`'s
+    /// host-readiness queue. `false` when no reactor serves this kernel or
+    /// a descriptor cannot be retained: the caller refuses the wait.
+    pub(crate) fn watch(
         &self,
         record: carrick_el1_abi::RecordRef,
         interests: &[HostReadinessInterest<'_>],
         deadline: Option<Instant>,
         carrier: Option<CarrierZone>,
-    ) -> std::io::Result<()> {
-        let mut enrolled = Vec::with_capacity(interests.len().max(1));
+    ) -> bool {
+        let Some(service) = self.service() else {
+            return false;
+        };
+        let mut held = Vec::with_capacity(interests.len());
         for interest in interests {
-            enrolled.push(Enrolment {
-                source: interest.source,
-                fd: Some(interest.fd.try_clone_to_owned()?),
-                events: interest.events,
-                record,
-                deadline,
-                carrier: carrier.clone(),
-            });
+            let Ok(fd) = interest.fd.try_clone_to_owned() else {
+                return false;
+            };
+            held.push((interest.source, fd, interest.events));
         }
-        if enrolled.is_empty() {
-            enrolled.push(Enrolment {
-                source: HostReadinessSource::DEADLINE,
-                fd: None,
-                events: 0,
-                record,
-                deadline,
-                carrier,
-            });
-        }
-        {
-            let mut enrolments = self.shared.enrolments.lock();
-            enrolments.retain(|held| held.record != record);
-            enrolments.extend(enrolled);
-        }
-        self.shared.wake();
-        Ok(())
+        let mut enrolment = Some((held, carrier));
+        service.change_host_ready_waits(&mut |waits| {
+            if let Some((held, carrier)) = enrolment.take() {
+                waits.enrol(record, held, deadline, carrier);
+            }
+            true
+        });
+        true
     }
 
-    /// Drop every enrolment of `source` (its last guest descriptor closed).
+    /// Drop every host-readiness wait on `source`.
     pub(crate) fn forget(&self, source: HostReadinessSource) {
-        let mut enrolments = self.shared.enrolments.lock();
-        let before = enrolments.len();
-        enrolments.retain(|held| held.source != source);
-        if enrolments.len() != before {
-            drop(enrolments);
-            self.shared.wake();
+        if let Some(service) = self.service() {
+            service.change_host_ready_waits(&mut |waits| waits.forget(source));
         }
     }
 
     #[cfg(test)]
     pub(crate) fn enrolled(&self) -> usize {
-        self.shared.enrolments.lock().len()
-    }
-}
-
-impl Drop for HostReadinessWatch {
-    fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::Release);
-        self.shared.wake();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn drain(control: &OwnedFd) {
-    let mut buffer = [0u8; 64];
-    while unsafe {
-        libc::read(
-            control.as_raw_fd(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-        )
-    } > 0
-    {}
-}
-
-/// Milliseconds until `deadline`, rounded up so a wake is never early.
-fn poll_timeout(deadline: Option<Instant>, now: Instant) -> i32 {
-    match deadline {
-        None => -1,
-        Some(deadline) => {
-            let left = deadline.saturating_duration_since(now);
-            let ms = left.as_micros().div_ceil(1000);
-            ms.min(i32::MAX as u128) as i32
-        }
-    }
-}
-
-fn run(shared: &Shared, control: &OwnedFd) {
-    let mut pollfds = Vec::new();
-    // The enrolment each polled entry (after the control pipe) came from.
-    let mut polled = Vec::new();
-    loop {
-        if shared.shutdown.load(Ordering::Acquire) {
-            return;
-        }
-        pollfds.clear();
-        polled.clear();
-        pollfds.push(libc::pollfd {
-            fd: control.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        let nearest = {
-            let enrolments = shared.enrolments.lock();
-            for held in enrolments.iter() {
-                if let Some(fd) = &held.fd {
-                    pollfds.push(libc::pollfd {
-                        fd: fd.as_raw_fd(),
-                        events: held.events,
-                        revents: 0,
-                    });
-                    polled.push((held.record, fd.as_raw_fd()));
-                }
-            }
-            enrolments.iter().filter_map(|held| held.deadline).min()
-        };
-        let ready = unsafe {
-            libc::poll(
-                pollfds.as_mut_ptr(),
-                pollfds.len() as libc::nfds_t,
-                poll_timeout(nearest, Instant::now()),
-            )
-        };
-        if ready < 0 {
-            // EINTR, or a host refusal of the wait itself: every member
-            // reruns its call once and re-enrols, rather than wait unseen.
-            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                let woken = std::mem::take(&mut *shared.enrolments.lock());
-                notify_once(woken);
-            }
-            continue;
-        }
-        if pollfds[0].revents != 0 {
-            drain(control);
-        }
-        let fired: Vec<(carrick_el1_abi::RecordRef, i32)> = pollfds[1..]
-            .iter()
-            .zip(&polled)
-            .filter(|(entry, _)| entry.revents != 0)
-            .map(|(_, polled)| *polled)
-            .collect();
-        let now = Instant::now();
-        // A member is notified once, for whichever of its interests fired
-        // or its deadline; all of its enrolments go with it. An enrolment
-        // replaced since the scan carries a different duplicate descriptor.
-        let woken: Vec<Enrolment> = {
-            let mut enrolments = shared.enrolments.lock();
-            let mut records: Vec<carrick_el1_abi::RecordRef> = Vec::new();
-            for held in enrolments.iter() {
-                let fd_fired = held
-                    .fd
-                    .as_ref()
-                    .is_some_and(|fd| fired.contains(&(held.record, fd.as_raw_fd())));
-                let expired = held.deadline.is_some_and(|deadline| deadline <= now);
-                if (fd_fired || expired) && !records.contains(&held.record) {
-                    records.push(held.record);
-                }
-            }
-            let mut woken = Vec::new();
-            let mut index = 0;
-            while index < enrolments.len() {
-                if records.contains(&enrolments[index].record) {
-                    woken.push(enrolments.swap_remove(index));
-                } else {
-                    index += 1;
-                }
-            }
-            woken
-        };
-        notify_once(woken);
-    }
-}
-
-/// Notify each member of `woken` once.
-fn notify_once(woken: Vec<Enrolment>) {
-    let mut notified: Vec<carrick_el1_abi::RecordRef> = Vec::new();
-    for held in woken {
-        if notified.contains(&held.record) {
-            continue;
-        }
-        notified.push(held.record);
-        crate::el1_zone::notify_host_ready(held.carrier.as_ref(), held.record);
+        self.service()
+            .map_or(0, |service| service.host_ready_waits())
     }
 }
 
@@ -368,6 +324,7 @@ impl PollDeadlines {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
 
     fn record(id: u32) -> carrick_el1_abi::RecordRef {
         carrick_el1_abi::RecordRef {
@@ -376,11 +333,27 @@ mod tests {
         }
     }
 
-    /// Bounded: the watch thread drops a fired member's enrolments.
-    fn settles(watch: &HostReadinessWatch, enrolled: usize) -> bool {
+    fn pipe_pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe(2) returned two fresh descriptors this test owns.
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    /// The kernel's pool wait service, bound as its host-readiness reactor.
+    fn reactor(pid: i32) -> (HostReadinessReactor, CarrierWaitService) {
+        let (kernel, _) = crate::kernel::continuation::test_support::bootstrap(pid);
+        let service = CarrierWaitService::new(Arc::new(crate::kernel::Scheduler::new(kernel)));
+        let reactor = HostReadinessReactor::default();
+        reactor.bind(&service);
+        (reactor, service)
+    }
+
+    /// Bounded: the reactor drops a fired member's wait.
+    fn settles(reactor: &HostReadinessReactor, enrolled: usize) -> bool {
         let until = Instant::now() + Duration::from_secs(10);
         while Instant::now() < until {
-            if watch.enrolled() == enrolled {
+            if reactor.enrolled() == enrolled {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -390,8 +363,9 @@ mod tests {
 
     #[test]
     fn a_ready_descriptor_fires_its_member_once_and_a_new_wait_replaces_the_old() {
-        let watch = HostReadinessWatch::start().unwrap();
-        let (read, write) = pipe_pair().unwrap();
+        let (reactor, service) = reactor(15_901);
+        let polls = service.reactor_poll_calls();
+        let (read, write) = pipe_pair();
         let token = HostReadinessToken::new();
         let source = token.source();
         let interest = |events| HostReadinessInterest {
@@ -399,55 +373,61 @@ mod tests {
             fd: std::os::fd::AsFd::as_fd(&read),
             events,
         };
-        watch
-            .enrol(record(1), &[interest(libc::POLLIN)], None, None)
-            .unwrap();
-        // The member's next wait replaces its first: one enrolment.
-        watch
-            .enrol(record(1), &[interest(libc::POLLIN)], None, None)
-            .unwrap();
-        assert_eq!(watch.enrolled(), 1);
-        // Not ready: the enrolment stays.
+        assert!(reactor.watch(record(1), &[interest(libc::POLLIN)], None, None));
+        // The member's next wait replaces its first: one wait.
+        assert!(reactor.watch(record(1), &[interest(libc::POLLIN)], None, None));
+        assert_eq!(reactor.enrolled(), 1);
+        // Not ready: the wait stays.
         std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(watch.enrolled(), 1);
+        assert_eq!(reactor.enrolled(), 1);
         assert_eq!(
             unsafe { libc::write(write.as_raw_fd(), b"x".as_ptr().cast(), 1) },
             1
         );
-        assert!(settles(&watch, 0), "a ready descriptor notifies its member");
+        assert!(
+            settles(&reactor, 0),
+            "a ready descriptor notifies its member"
+        );
+        // The carrier's one wait reactor observed it: no second thread.
+        assert!(service.reactor_poll_calls() > polls);
     }
 
     #[test]
     fn a_deadline_fires_without_a_descriptor_and_a_closed_source_is_forgotten() {
-        let watch = HostReadinessWatch::start().unwrap();
-        watch
-            .enrol(
-                record(2),
-                &[],
-                Some(Instant::now() + Duration::from_millis(5)),
-                None,
-            )
-            .unwrap();
-        assert!(settles(&watch, 0), "the deadline notifies its member");
+        let (reactor, _service) = reactor(15_902);
+        assert!(reactor.watch(
+            record(2),
+            &[],
+            Some(Instant::now() + Duration::from_millis(5)),
+            None,
+        ));
+        assert!(settles(&reactor, 0), "the deadline notifies its member");
 
-        let (read, _write) = pipe_pair().unwrap();
+        let (read, _write) = pipe_pair();
         let token = HostReadinessToken::new();
         let source = token.source();
-        watch
-            .enrol(
-                record(3),
-                &[HostReadinessInterest {
-                    source,
-                    fd: std::os::fd::AsFd::as_fd(&read),
-                    events: libc::POLLIN,
-                }],
-                None,
-                None,
-            )
-            .unwrap();
-        assert_eq!(watch.enrolled(), 1);
-        watch.forget(source);
-        assert_eq!(watch.enrolled(), 0);
+        assert!(reactor.watch(
+            record(3),
+            &[HostReadinessInterest {
+                source,
+                fd: std::os::fd::AsFd::as_fd(&read),
+                events: libc::POLLIN,
+            }],
+            None,
+            None,
+        ));
+        assert_eq!(reactor.enrolled(), 1);
+        reactor.forget(source);
+        assert_eq!(reactor.enrolled(), 0);
+    }
+
+    #[test]
+    fn a_kernel_without_a_live_reactor_refuses_the_wait() {
+        let reactor = HostReadinessReactor::default();
+        assert!(!reactor.watch(record(4), &[], None, None));
+        let (bound, service) = self::reactor(15_903);
+        drop(service);
+        assert!(!bound.watch(record(4), &[], None, None));
     }
 
     #[test]
