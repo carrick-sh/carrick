@@ -198,6 +198,10 @@
     {
       "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
       "issue": 1852
+    },
+    {
+      "owner": "carrick_cli::args::debug_a64_census::run",
+      "issue": 2412
     }
   ],
   "terminal_custody": []
