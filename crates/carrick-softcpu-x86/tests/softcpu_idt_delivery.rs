@@ -1639,3 +1639,70 @@ fn issue1272_rf_distinguishes_pf_gd_and_instruction_breakpoint() {
         0
     );
 }
+
+#[test]
+fn issue1272_int3_frame_clears_incoming_rf() {
+    for gate_type in [0x0e, 0x0f] {
+        let mut rig = IdtTestRig::new();
+        rig.set_gate(3, IdtTestRig::stub_va(3), 0x08, 0, gate_type, 3, true);
+        rig.write_user_code(&[0xcc]);
+        rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_RF);
+        assert_eq!(rig.run_to_vec_port(), 3);
+        let frame = rig.read_frame40(rig.rsp0_frame, 0xfc8);
+        assert_eq!(frame.rip, USER_CODE_VA + 1);
+        assert_eq!(frame.rflags & RFLAGS_RF, 0);
+    }
+}
+
+#[test]
+fn issue1272_int_n_frame_clears_incoming_rf() {
+    for gate_type in [0x0e, 0x0f] {
+        let mut rig = IdtTestRig::new();
+        rig.set_gate(0x81, IdtTestRig::stub_va(0x81), 0x08, 0, gate_type, 3, true);
+        rig.write_user_code(&[0xcd, 0x81]);
+        rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_RF);
+        assert_eq!(rig.run_to_vec_port(), 0x81);
+        let frame = rig.read_frame40(rig.rsp0_frame, 0xfc8);
+        assert_eq!(frame.rip, USER_CODE_VA + 2);
+        assert_eq!(frame.rflags & RFLAGS_RF, 0);
+    }
+}
+
+#[test]
+fn issue1272_debug_trap_frames_clear_incoming_rf() {
+    for (bytes, flags) in [(&[0x90][..], RFLAGS_TF), (&[0xf1][..], 0)] {
+        let mut rig = IdtTestRig::new();
+        rig.write_user_code(bytes);
+        rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_RF | flags);
+        assert_eq!(rig.run_to_vec_port(), 1);
+        let frame = rig.read_frame40(rig.rsp0_frame, 0xfc8);
+        assert_eq!(frame.rip, USER_CODE_VA + 1);
+        assert_eq!(frame.rflags & RFLAGS_RF, 0);
+    }
+}
+
+#[test]
+fn issue1272_external_interrupt_frame_clears_incoming_rf() {
+    let mut rig = IdtTestRig::new();
+    rig.write_user_code(&[0x90]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_RF);
+    rig.machine.context_mut().lapic_mmio_write(0xf0, &0x1ffu32.to_le_bytes());
+    rig.machine.inject_interrupt(0x81);
+    assert_eq!(rig.run_to_vec_port(), 0x81);
+    let frame = rig.read_frame40(rig.rsp0_frame, 0xfc8);
+    assert_eq!(frame.rip, USER_CODE_VA); // accepted before NOP retires
+    assert_eq!(frame.rflags & RFLAGS_RF, 0);
+}
+
+#[test]
+fn issue1272_double_fault_frame_clears_incoming_rf() {
+    let mut rig = IdtTestRig::new();
+    rig.set_gate(8, IdtTestRig::stub_va(8), 0x08, 1, 0x0e, 0, true);
+    rig.machine.mem_mut().unmap_page(RSP0_VA);
+    rig.machine.context_mut().flush_tlb();
+    rig.write_user_code(&[0x48, 0x8b, 0x00]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_RF);
+    rig.machine.context_mut().gpr[reg::RAX] = 0;
+    assert_eq!(rig.run_to_vec_port(), 8);
+    assert_eq!(rig.read_frame48(rig.ist1_frame, 0xfc0).rflags & RFLAGS_RF, 0);
+}

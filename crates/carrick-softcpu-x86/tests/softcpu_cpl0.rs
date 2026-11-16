@@ -1628,3 +1628,20 @@ fn issue1272_popf_updates_if_at_permitted_iopl() {
         }
     }
 }
+
+#[test]
+fn issue1272_pushf_16_and_64_clear_rf_and_vm_in_image() {
+    // The production decoder supports long mode only: PUSHFD has no encoding.
+    for (bytes, width) in [(&[0x66, 0x9c][..], 2u64), (&[0x9c][..], 8)] {
+        let (mut cpu, mut mem, _) =
+            setup_cpl0_cpu(bytes, Box::new(GuestCpuidView::default()));
+        cpu.context_mut().rflags = 2 | (1 << 16) | (1 << 17) | (1 << 9);
+        step_ok(&mut cpu, &mut mem, CODE_VA + bytes.len() as u64);
+        assert_eq!(cpu.context().gpr[reg::RSP], STACK_VA + 0x800 - width);
+        let stack = translate_va(cpu.context_mut(), &mut mem, STACK_VA + 0x800 - width, SoftAccessKind::Read).unwrap();
+        let image = mem.read_gpa((stack as usize - mem.placement().base_host_addr()) as u64, width as usize);
+        let mut value = [0u8; 8];
+        value[..width as usize].copy_from_slice(&image);
+        assert_eq!(u64::from_le_bytes(value), 0x202);
+    }
+}
