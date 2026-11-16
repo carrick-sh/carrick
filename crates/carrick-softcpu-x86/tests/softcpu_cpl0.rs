@@ -1606,7 +1606,8 @@ fn issue1272_popf_updates_if_at_permitted_iopl() {
     for bytes in [&[0x9d][..], &[0x66, 0x9d][..]] {
         for iopl in 0..=3u64 {
             for old_if in [0, 1 << 9] {
-                let (mut cpu, mut mem, _) = setup_cpl0_cpu(&[], Box::new(GuestCpuidView::default()));
+                let (mut cpu, mut mem, _) =
+                    setup_cpl0_cpu(&[], Box::new(GuestCpuidView::default()));
                 let code = mem.map_page(USER_CODE_VA, Perms::USER_RX);
                 mem.write_gpa(code.raw(), bytes);
                 let stack = mem.map_page(0x0080_0000, Perms::USER_RW);
