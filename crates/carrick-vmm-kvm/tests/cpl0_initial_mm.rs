@@ -4097,8 +4097,11 @@ fn serial_host_fork_child_ioctl_cloexec_on_a_ring_file_matches_native() {
 /// Run one `native_file_attr.S` mode natively and on the production CPL0
 /// path, each against its own fresh mode-0644 file. The directory is
 /// searchable by anyone, so a caller that dropped to uid 65534 still
-/// resolves the file (the oracle's user owns it either way).
+/// resolves the file (the oracle's user owns it either way). A root caller
+/// takes the oracle's egid and one other of its groups, so the group
+/// changes after the drop are the ones the oracle may make.
 fn file_attr_run(flags: &[&str]) -> (FileMetadataReport, FileMetadataReport) {
+    let (drop_gid, alt_gid) = oracle_groups();
     ring_file_fixture_run("native_file_attr.S", flags, |dir, name| {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
@@ -4107,6 +4110,10 @@ fn file_attr_run(flags: &[&str]) -> (FileMetadataReport, FileMetadataReport) {
         std::fs::write(&path, b"apt status\n").expect("attribute file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("file mode 0644");
+        let nosearch = dir.join(format!("{name}-nosearch"));
+        std::fs::create_dir(&nosearch).expect("no-search directory");
+        std::fs::set_permissions(&nosearch, std::fs::Permissions::from_mode(0o600))
+            .expect("no-search directory mode 0600");
         vec![
             format!("-DFILE_PATH=\"{}\"", path.display()),
             format!(
@@ -4117,8 +4124,28 @@ fn file_attr_run(flags: &[&str]) -> (FileMetadataReport, FileMetadataReport) {
                 "-DMISSING_PATH=\"{}\"",
                 dir.join(format!("{name}-missing")).display()
             ),
+            format!("-DNOTDIR_PATH=\"{}/x\"", path.display()),
+            format!("-DNOSEARCH_PATH=\"{}/x\"", nosearch.display()),
+            format!("-DDROP_GID={drop_gid}"),
+            format!("-DALT_GID={alt_gid}"),
         ]
     })
+}
+
+/// The oracle user's egid and another group it is in (its egid again when
+/// it has none other than root's).
+fn oracle_groups() -> (u32, u32) {
+    // SAFETY: getegid and getgroups write only into the sized buffer.
+    let egid = unsafe { libc::getegid() };
+    let mut groups = [0 as libc::gid_t; 256];
+    let count = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+    assert!(count >= 0, "getgroups: {}", std::io::Error::last_os_error());
+    let alt = groups[..count as usize]
+        .iter()
+        .copied()
+        .find(|&gid| gid != egid && gid != 0)
+        .unwrap_or(egid);
+    (egid, alt)
 }
 
 /// A `native_file_attr.S` report as (exit, the first `steps` step bytes,
@@ -4140,10 +4167,11 @@ fn attr_steps(report: &FileMetadataReport, steps: usize) -> (i32, Vec<u8>, Vec<(
 
 /// #231 parity (apt): `fchmod`/`fchown` of the run root's ring file, its
 /// path `fchmodat`/`fchownat` (and the legacy x86 `chmod`/`chown`/`lchown`),
-/// and their EBADF, ENOENT and EOPNOTSUPP answers, against the native
-/// oracle. Red on main: the ring-file calls and the legacy numbers were
-/// counted ENOSYS. Steps 19-20 (EPERM after the root drops to uid 65534)
-/// are not compared here: the run root's filesystem calls are served under
+/// their EBADF, ENOENT and EOPNOTSUPP answers, and the legacy calls'
+/// ENOENT, ENOTDIR, EFAULT and ENAMETOOLONG, against the native oracle.
+/// Red on main: the ring-file calls and the legacy numbers were counted
+/// ENOSYS. Steps 31-50 (ownership and EPERM/EACCES after the root drops to
+/// uid 65534) are not compared here: the run root's filesystem calls are served under
 /// its host task's credentials, which its ring `setresuid` does not reach
 /// (root resource authority transfer, #1861). The fork child, whose
 /// credentials the ring owns, covers EPERM.
@@ -4152,15 +4180,20 @@ fn serial_host_root_chmod_chown_on_ring_files_matches_native() {
     let (native, carrick) = file_attr_run(&[]);
     assert_eq!(native.0, 0, "native oracle: {native:?}");
     assert_eq!(
-        attr_steps(&carrick, 18),
-        attr_steps(&native, 18),
+        attr_steps(&carrick, 30),
+        attr_steps(&native, 30),
         "(exit, step bytes, chmod/chown refusals); full report: {carrick:?}"
     );
 }
 
 /// #231 parity (apt): the same calls in a fork child, whose descriptors and
 /// path calls are the ring's. apt's `chown ... (38)` and `chmod 0755 ...
-/// (38)` were this child's `fchownat`/`fchmodat`, unclaimed on main.
+/// (38)` were this child's `fchownat`/`fchmodat`, unclaimed on main. After
+/// the child drops to uid 65534 it still owns the file and the link:
+/// chown(2) lets it "change" the uid to its own and the group to one it is
+/// in (steps 31-39, EPERM on the PR's first head), lchown changes the link
+/// and chown the file it names, and a non-owner or a foreign uid or group
+/// is EPERM; a directory it may not search is EACCES.
 #[test]
 fn serial_host_fork_child_chmod_chown_on_ring_files_matches_native() {
     let (native, carrick) = file_attr_run(&["-DCHILD"]);
