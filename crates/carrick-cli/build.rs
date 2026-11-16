@@ -15,20 +15,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Static census provenance must not spawn a compiler from the product.
-    let compiler =
-        std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-            .arg("--version")
-            .output()
-            .unwrap_or_else(|error| panic!("compiler version: {error}"));
-    assert!(compiler.status.success(), "compiler version query failed");
-    let compiler = String::from_utf8(compiler.stdout)
-        .unwrap_or_else(|error| panic!("compiler version UTF-8: {error}"));
-    println!(
-        "cargo:rustc-env=CARRICK_CENSUS_COMPILER={}",
-        compiler.trim()
-    );
-
     // `CARGO_CFG_TARGET_OS` is the OS being compiled FOR (not the host).
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let feat = |name: &str| std::env::var_os(name).is_some();
