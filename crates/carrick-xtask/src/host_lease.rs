@@ -71,7 +71,7 @@ pub enum HostLeaseError {
     #[error("host-lease: refusing lock file '{path}': {reason}")]
     UnsafeLockFile { path: PathBuf, reason: &'static str },
     #[error(
-        "host-lease: failed waiting for {mode} at '{path}' after {limit:?} (HOST_LEASE_WAIT_LIMIT); no command was run"
+        "host-lease: failed waiting for {mode} at '{path}' after {limit:?} (HOST_LEASE_WAIT_LIMIT or {WAIT_LIMIT_ENV}); no command was run"
     )]
     Timeout {
         path: PathBuf,
@@ -82,6 +82,44 @@ pub enum HostLeaseError {
     Inherited(String),
     #[error("host load check failed: {0}")]
     Load(#[from] crate::host_load::HostLoadError),
+    /// A malformed or out-of-range `CARRICK_HOST_LEASE_WAIT_SECS`: refused,
+    /// never silently replaced by the default (#2403).
+    #[error(
+        "host-lease: {WAIT_LIMIT_ENV}={value:?} is not a whole number of seconds in 1..={max}; no command was run"
+    )]
+    InvalidWaitLimit { value: String, max: u64 },
+}
+
+/// Overrides [`HOST_LEASE_WAIT_LIMIT`] for one lease runner. A merge group's
+/// macOS jobs set it above their own Signed gate's guest phase, which holds
+/// the exclusive `gate` lease for 40-80 min on the same Mac (#2403).
+pub const WAIT_LIMIT_ENV: &str = "CARRICK_HOST_LEASE_WAIT_SECS";
+/// The longest wait a caller may ask for: past this a holder is wedged, not busy.
+pub const MAX_WAIT_LIMIT_SECS: u64 = 6 * 60 * 60;
+
+/// The lease wait limit: [`HOST_LEASE_WAIT_LIMIT`], or [`WAIT_LIMIT_ENV`]'s value.
+fn wait_limit(value: Option<&std::ffi::OsStr>) -> Result<Duration, HostLeaseError> {
+    // Unset or empty (a workflow expression's "no override") keeps the default.
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(HOST_LEASE_WAIT_LIMIT);
+    };
+    let invalid = || HostLeaseError::InvalidWaitLimit {
+        value: value.to_string_lossy().into_owned(),
+        max: MAX_WAIT_LIMIT_SECS,
+    };
+    let secs: u64 = value
+        .to_str()
+        .ok_or_else(invalid)?
+        .parse()
+        .map_err(|_| invalid())?;
+    if secs == 0 || secs > MAX_WAIT_LIMIT_SECS {
+        return Err(invalid());
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+fn env_wait_limit() -> Result<Duration, HostLeaseError> {
+    wait_limit(std::env::var_os(WAIT_LIMIT_ENV).as_deref())
 }
 
 pub struct HostLease {
@@ -609,7 +647,7 @@ impl HostLease {
                 "obsolete fd handoff; restart the outer lease runner".into(),
             ));
         }
-        Self::acquire_path_with_wait(&path, mode, HOST_LEASE_WAIT_LIMIT, None, |duration| {
+        Self::acquire_path_with_wait(&path, mode, env_wait_limit()?, None, |duration| {
             std::thread::sleep(duration);
             Ok(false)
         })
@@ -655,7 +693,7 @@ impl HostLease {
         Self::acquire_path_with_wait(
             &path,
             mode,
-            HOST_LEASE_WAIT_LIMIT,
+            env_wait_limit()?,
             Some(scope.try_clone().map_err(HostLeaseError::ChildWait)?),
             wait,
         )
@@ -1097,6 +1135,36 @@ pub fn check_disk(root: &Path, args: DiskArgs) -> Result<(), HostLeaseError> {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// #2403: a merge group's macOS jobs wait longer than their own gate's
+    /// guest phase only through an explicit, bounded override.
+    #[test]
+    fn wait_limit_defaults_and_accepts_only_bounded_whole_seconds() {
+        use std::ffi::OsStr;
+        assert_eq!(wait_limit(None).unwrap(), HOST_LEASE_WAIT_LIMIT);
+        assert_eq!(
+            wait_limit(Some(OsStr::new(""))).unwrap(),
+            HOST_LEASE_WAIT_LIMIT,
+            "an empty value is the workflow's no-override"
+        );
+        assert_eq!(
+            wait_limit(Some(OsStr::new("7200"))).unwrap(),
+            Duration::from_secs(7200)
+        );
+        assert_eq!(
+            wait_limit(Some(OsStr::new("21600"))).unwrap(),
+            Duration::from_secs(MAX_WAIT_LIMIT_SECS)
+        );
+        for bad in ["0", "-5", "1.5", "2h", "21601", " 60"] {
+            assert!(
+                matches!(
+                    wait_limit(Some(OsStr::new(bad))),
+                    Err(HostLeaseError::InvalidWaitLimit { .. })
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+    }
 
     /// True while some exclusive request holds `lock`'s turnstile (it is queued).
     fn writer_queued(lock: &Path) -> bool {

@@ -533,7 +533,11 @@ Moved from `AGENTS.md` (#2118), updated for later decisions.
   runners (a non-admin `ci` user on carrick-m4 and on cloudmac; #650), forks on hosted
   `macos-15`. Merge groups run `macos-build`, `macos-clippy` and
   `macos-authority` as skew and compiler-authority checks on the self-hosted
-  `carrick-macos-queue` runners (#1976). The HVF lane of `kernel-runtime.yml`
+  `carrick-macos-queue` runners (#1976). Two of those runners, `cloudmac-ci-2`
+  and `carrick-m4-ci-2`, carry only that label, so PR jobs can't occupy them
+  (#2403). The group's own Signed gate holds the Mac's exclusive `gate` lease
+  for its guest phase, so these jobs set `CARRICK_HOST_LEASE_WAIT_SECS=7200`
+  and wait it out instead of being cancelled at the default 60 min. The HVF lane of `kernel-runtime.yml`
   is nightly (#2060) and on owner dispatch. Since 137a177a22 (2026-10-11),
   `ci.yml` has no push trigger. The nightly schedule reruns the full suite on
   hosted macOS. The signed gate stays on cloudmac. Land on a failure-set diff
