@@ -256,6 +256,17 @@ where
                 existing.push_str(&message);
             }
         }
+        // The worker is gone for the rest of the carrier, and so is anything
+        // only it could finish: its siblings would park forever. The death is
+        // the carrier's terminal verdict (#2420), published before this
+        // worker parks so every run wait ends with its exact cause.
+        if let Some(error) = &failure {
+            scheduler.publish_executor_death(carrick_kernel::kernel::ExecutorDeath {
+                executor: executor_id,
+                worker: index,
+                error: error.clone(),
+            });
+        }
         control.wait_for_shutdown();
     }
     if let Some(destroy_error) = destroy_and_unregister(

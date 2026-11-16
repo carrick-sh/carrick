@@ -212,6 +212,40 @@ pub trait ExecutorKick: Send + Sync + std::fmt::Debug {
     fn parking_spare(&self) {}
 }
 
+/// An executor worker that died after its pool published it (#2420).
+///
+/// A dead worker shrinks the pool, and any task it held, or whose state was
+/// owed back to it, can never run again: its siblings stay parked and the
+/// run waits forever. The death is therefore a terminal verdict for the
+/// whole carrier, owned here by the neutral scheduler. Each backend's run
+/// wait applies it: it ends the run with this error instead of waiting on
+/// guest work no executor will finish.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutorDeath {
+    pub executor: ExecutorId,
+    /// The worker's pool slot, as `executor worker died index=N` names it.
+    pub worker: usize,
+    /// The worker's own failure, verbatim.
+    pub error: String,
+}
+
+impl std::fmt::Display for ExecutorDeath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "executor worker died index={} executor={} error={}",
+            self.worker,
+            self.executor.raw(),
+            self.error
+        )
+    }
+}
+
+/// A backend's run wait, told of the carrier's executor death once.
+pub trait ExecutorDeathObserver: Send + Sync {
+    fn executor_died(&self, death: &ExecutorDeath);
+}
+
 pub trait DiscardRecorder: Send + Sync {
     fn record_discard(
         &self,
@@ -3647,6 +3681,12 @@ struct PendingWake {
     _admission: WakeAdmission,
 }
 
+#[derive(Default)]
+struct ExecutorDeathVerdict {
+    death: Option<ExecutorDeath>,
+    observers: Vec<Arc<dyn ExecutorDeathObserver>>,
+}
+
 pub struct Scheduler {
     kernel: Arc<Kernel>,
     queue: RunQueue,
@@ -3659,6 +3699,9 @@ pub struct Scheduler {
     generation_transition: Mutex<()>,
     generation_observer: Mutex<Option<Arc<dyn SchedulerGenerationObserver>>>,
     discard_recorder: Mutex<Option<Arc<dyn DiscardRecorder>>>,
+    /// The first executor death, the carrier's terminal verdict, and the
+    /// run waits that apply it.
+    executor_death: Mutex<ExecutorDeathVerdict>,
     #[cfg(test)]
     continuation_settlement_barriers:
         Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
@@ -3726,6 +3769,7 @@ impl Scheduler {
             generation_transition: Mutex::new(()),
             generation_observer: Mutex::new(None),
             discard_recorder: Mutex::new(None),
+            executor_death: Mutex::new(ExecutorDeathVerdict::default()),
             #[cfg(test)]
             continuation_settlement_barriers: Mutex::new(None),
         }
@@ -3745,6 +3789,44 @@ impl Scheduler {
 
     pub fn install_discard_recorder(&self, recorder: Arc<dyn DiscardRecorder>) {
         *self.discard_recorder.lock() = Some(recorder);
+    }
+
+    /// Record an executor worker's death as the carrier's terminal verdict
+    /// and tell every run wait. The first death is the verdict; a later one
+    /// returns false and changes nothing. Executors are poked so none stays
+    /// parked behind the verdict.
+    pub fn publish_executor_death(&self, death: ExecutorDeath) -> bool {
+        let observers = {
+            let mut verdict = self.executor_death.lock();
+            if verdict.death.is_some() {
+                return false;
+            }
+            verdict.death = Some(death.clone());
+            verdict.observers.clone()
+        };
+        self.poke_executor_control();
+        for observer in observers {
+            observer.executor_died(&death);
+        }
+        true
+    }
+
+    /// The carrier's executor death, if one happened.
+    pub fn executor_death(&self) -> Option<ExecutorDeath> {
+        self.executor_death.lock().death.clone()
+    }
+
+    /// Enrol a run wait on the executor-death verdict. One that is already
+    /// recorded is delivered now, so a late wait never misses it.
+    pub fn observe_executor_death(&self, observer: Arc<dyn ExecutorDeathObserver>) {
+        let recorded = {
+            let mut verdict = self.executor_death.lock();
+            verdict.observers.push(Arc::clone(&observer));
+            verdict.death.clone()
+        };
+        if let Some(death) = recorded {
+            observer.executor_died(&death);
+        }
     }
 
     pub fn install_generation_observer(
@@ -9969,6 +10051,54 @@ mod tests {
             "the executor is unbound, so its next claim is not refused as busy"
         );
         assert_eq!(scheduler.queued_len(), 0);
+    }
+
+    /// #2420: the first executor death is the carrier's verdict, every run
+    /// wait hears it exactly once, and a wait enrolled after the death still
+    /// hears it.
+    #[test]
+    fn executor_death_is_one_verdict_delivered_to_early_and_late_waits() {
+        #[derive(Default)]
+        struct Heard(parking_lot::Mutex<Vec<String>>);
+        impl super::ExecutorDeathObserver for Heard {
+            fn executor_died(&self, death: &super::ExecutorDeath) {
+                self.0.lock().push(death.to_string());
+            }
+        }
+        let (kernel, _root) = bootstrap(12_411);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        let early = Arc::new(Heard::default());
+        scheduler
+            .observe_executor_death(Arc::clone(&early) as Arc<dyn super::ExecutorDeathObserver>);
+        assert!(scheduler.executor_death().is_none());
+
+        let death = super::ExecutorDeath {
+            executor: executor.id(),
+            worker: 3,
+            error: "native owed return of MM".to_owned(),
+        };
+        assert!(scheduler.publish_executor_death(death.clone()));
+        assert!(
+            !scheduler.publish_executor_death(super::ExecutorDeath {
+                error: "a later death".to_owned(),
+                ..death.clone()
+            }),
+            "the first death is the verdict"
+        );
+        let late = Arc::new(Heard::default());
+        scheduler
+            .observe_executor_death(Arc::clone(&late) as Arc<dyn super::ExecutorDeathObserver>);
+
+        assert_eq!(scheduler.executor_death(), Some(death.clone()));
+        let expected = format!(
+            "executor worker died index=3 executor={} error=native owed return of MM",
+            executor.id().raw()
+        );
+        assert_eq!(*early.0.lock(), vec![expected.clone()]);
+        assert_eq!(*late.0.lock(), vec![expected]);
     }
 
     #[test]

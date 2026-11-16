@@ -314,6 +314,11 @@ impl ProcessGraphLiveness {
         self.recorded.lock().as_ref().map(KernelAbortRecord::error)
     }
 
+    /// The scheduler's executor-death verdict, if an executor died.
+    pub(crate) fn executor_death(&self) -> Option<carrick_kernel::kernel::ExecutorDeath> {
+        self.scheduler.as_ref()?.executor_death()
+    }
+
     /// How long a census whose only liveness is an executor claim must hold
     /// unchanged before it is a verdict. See [`LIVENESS_CLAIM_STALL_WINDOWS`].
     pub(crate) fn claim_stall(&self) -> std::time::Duration {
@@ -467,6 +472,14 @@ impl HvpatchLoopResult {
             // own `shutdown_wait` on jobs whose guest tasks are still running.
             if let Some(recorded) = liveness.recorded() {
                 return Err(recorded);
+            }
+            // An executor death is carrier-terminal too. The graph still
+            // looks live (the dead worker's siblings are parked, not gone),
+            // so no census verdict would ever fire for it (#2420).
+            if let Some(death) = liveness.executor_death() {
+                return Err(liveness.abort(
+                    carrick_kernel::kernel::debug::AbortReason::executor_died(&death),
+                ));
             }
             // An operator's `carrick debug abort --run-id` is latched by the
             // debug server and executed HERE, through the same sink, so a

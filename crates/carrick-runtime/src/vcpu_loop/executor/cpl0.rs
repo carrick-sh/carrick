@@ -294,6 +294,26 @@ pub(crate) struct Cpl0PersistentExecutorConfig<M: CarrierCpuIo, Mem: CarrierMemo
     pub(crate) loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
 }
 
+/// The CPL0 run's completion, applying the scheduler's executor-death
+/// verdict: the run ends with the dead worker's error.
+pub(crate) struct Cpl0ExecutorDeathCompletion {
+    completed: mpsc::Sender<Result<InitialProcessExit, String>>,
+}
+
+impl Cpl0ExecutorDeathCompletion {
+    pub(crate) const fn new(completed: mpsc::Sender<Result<InitialProcessExit, String>>) -> Self {
+        Self { completed }
+    }
+}
+
+impl carrick_kernel::kernel::ExecutorDeathObserver for Cpl0ExecutorDeathCompletion {
+    fn executor_died(&self, death: &carrick_kernel::kernel::ExecutorDeath) {
+        // The receiver takes the first completion only: a guest exit that
+        // already ended the run stays the run's result.
+        let _ = self.completed.send(Err(death.to_string()));
+    }
+}
+
 /// Loaded-lane pre-entry hook for test control; it receives the backend kick
 /// handle armed for the loaded task's next guest entry.
 #[cfg(feature = "kvm-pool-test-control")]
