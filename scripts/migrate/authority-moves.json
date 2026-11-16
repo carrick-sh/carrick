@@ -7,6 +7,16 @@
       "issue": 1852
     },
     {
+      "from": "carrick_kernel::dispatch::fs::attr::FsView<'a>::fchmod",
+      "to": "carrick_kernel::dispatch::fs::attr::FsView<'a>::chmod_description",
+      "issue": 231
+    },
+    {
+      "from": "carrick_kernel::dispatch::fs::attr::FsView<'a>::fchown_by_fd",
+      "to": "carrick_kernel::dispatch::fs::attr::FsView<'a>::chown_description",
+      "issue": 231
+    },
+    {
       "from": "carrick_kernel::dispatch::fs::mount::FsView<'a>::fchdir",
       "to": "carrick_kernel::dispatch::fs::mount::FsView<'a>::fchdir_target",
       "issue": 2206
