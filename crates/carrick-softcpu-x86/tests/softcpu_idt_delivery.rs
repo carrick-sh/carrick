@@ -1686,7 +1686,9 @@ fn issue1272_external_interrupt_frame_clears_incoming_rf() {
     let mut rig = IdtTestRig::new();
     rig.write_user_code(&[0x90]);
     rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_RF);
-    rig.machine.context_mut().lapic_mmio_write(0xf0, &0x1ffu32.to_le_bytes());
+    rig.machine
+        .context_mut()
+        .lapic_mmio_write(0xf0, &0x1ffu32.to_le_bytes());
     rig.machine.inject_interrupt(0x81);
     assert_eq!(rig.run_to_vec_port(), 0x81);
     let frame = rig.read_frame40(rig.rsp0_frame, 0xfc8);
@@ -1704,5 +1706,8 @@ fn issue1272_double_fault_frame_clears_incoming_rf() {
     rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_RF);
     rig.machine.context_mut().gpr[reg::RAX] = 0;
     assert_eq!(rig.run_to_vec_port(), 8);
-    assert_eq!(rig.read_frame48(rig.ist1_frame, 0xfc0).rflags & RFLAGS_RF, 0);
+    assert_eq!(
+        rig.read_frame48(rig.ist1_frame, 0xfc0).rflags & RFLAGS_RF,
+        0
+    );
 }
