@@ -269,6 +269,8 @@ host_crossings! {
     Faccessat2 = nr::FACCESSAT2, true, Permanent;
     Fchmodat2 = nr::FCHMODAT2, true, Permanent;
     Socket = nr::SOCKET, false, Permanent;
+    // An AF_UNIX stream pair is the ring's (#2361); datagram, seqpacket and
+    // non-AF_UNIX pairs still cross until the ring carries message lanes.
     Socketpair = nr::SOCKETPAIR, false, Temporary;
     Bind = nr::BIND, false, Permanent;
     Listen = nr::LISTEN, false, Permanent;
