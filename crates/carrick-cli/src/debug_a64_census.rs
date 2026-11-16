@@ -1,5 +1,5 @@
-//! Static A64 census. JSON goes to stdout even when unknown encodings fail
-//! the command. ELF mapping symbols are authoritative; flat-image mode is
+//! Static A64 measurement. JSON goes to stdout; --strict additionally rejects
+//! unknown encodings. ELF mapping symbols are authoritative; flat-image mode is
 //! explicitly conservative because it cannot distinguish literal data.
 use anyhow::{Context, Result, ensure};
 use carrick_softcpu_aarch64::{A64Class, classify};
@@ -19,9 +19,34 @@ fn sha(bytes: &[u8]) -> String {
 struct Census {
     producers: BTreeSet<String>,
     counts: BTreeMap<String, u64>,
+    gaps: BTreeMap<String, u64>,
     registers: BTreeMap<String, u64>,
     unknown: Vec<Value>,
     spans: Vec<Value>,
+}
+
+/// Diagnostic causes for Unknown words, from the DDI0487 encoding index
+/// (data processing register and system subgroups). These labels never promote
+/// an unknown to a recognized instruction or claim operand validity.
+fn unknown_cause(word: u32) -> &'static str {
+    if matches!(
+        word & 0x7fe0fc00,
+        0x1ac02000 | 0x1ac02400 | 0x1ac02800 | 0x1ac02c00
+    ) {
+        "variable_shifts"
+    } else if matches!(word & 0x7ffffc00, 0x5ac00000 | 0x5ac01000) {
+        "clz_rbit"
+    } else if matches!(word & 0xffffffe0, 0xd5087840 | 0xd5087860) {
+        "at"
+    } else if word & 0xffe0001f == 0xd4200000 {
+        "brk"
+    } else if word & 0xfffff0ff == 0xd503305f {
+        "clrex"
+    } else if word & 0xfff80000 == 0xd5080000 && (word >> 12) & 15 == 8 {
+        "tlbi"
+    } else {
+        "others"
+    }
 }
 
 fn register_name(fields: (u8, u8, u8, u8, u8)) -> &'static str {
@@ -90,7 +115,9 @@ impl Census {
             };
             *self.counts.entry(class_name).or_default() += 1;
             if class == A64Class::Unknown {
-                self.unknown.push(json!({"span":name,"address":address + i as u64 * 4,"encoding":format!("0x{word:08x}")}));
+                let cause = unknown_cause(word);
+                *self.gaps.entry(cause.to_owned()).or_default() += 1;
+                self.unknown.push(json!({"span":name,"address":address + i as u64 * 4,"encoding":format!("0x{word:08x}"),"cause":cause}));
             }
         }
         Ok(())
@@ -208,11 +235,23 @@ impl Census {
         Ok(())
     }
     fn report(&self, input: &[u8], mode: &str) -> Value {
+        let mut gaps = self.gaps.clone();
+        for cause in [
+            "variable_shifts",
+            "clz_rbit",
+            "at",
+            "brk",
+            "clrex",
+            "tlbi",
+            "others",
+        ] {
+            gaps.entry(cause.to_owned()).or_default();
+        }
         json!({"schema":"carrick.a64-census.v1", "tool_version":env!("CARGO_PKG_VERSION"),
             "classifier":"hand-authored-a64-v1", "compiler_producers":self.producers, "producer_source":"ELF .comment when present; flat bytes have no producer metadata",
             "scope":"EL1 plus loader; EL0 fixture closure is slice 0b", "input_mode":mode,
             "input_sha256":sha(input), "spans":self.spans,"counts":self.counts,
-            "system_registers":self.registers,"unknown_count":self.unknown.len(),"unknown":self.unknown})
+            "system_registers":self.registers,"gap_counts":gaps,"unknown_count":self.unknown.len(),"unknown":self.unknown})
     }
     fn finish(&self) -> Result<()> {
         ensure!(
@@ -224,7 +263,7 @@ impl Census {
     }
 }
 
-pub(crate) fn run(input: Option<&Path>) -> Result<()> {
+pub(crate) fn run(input: Option<&Path>, strict: bool) -> Result<()> {
     let mut census = Census::default();
     let bytes = if let Some(path) = input {
         std::fs::read(path).with_context(|| format!("read {}", path.display()))?
@@ -278,7 +317,10 @@ pub(crate) fn run(input: Option<&Path>) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&census.report(&bytes, mode))?
     );
-    census.finish()
+    if strict {
+        census.finish()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

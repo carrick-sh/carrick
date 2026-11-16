@@ -1088,6 +1088,9 @@ pub(crate) enum DebugCommand {
         /// Linked AArch64 ELF. Without a path, scan embedded flat bytes
         /// conservatively (includes data and cannot establish code closure).
         input: Option<PathBuf>,
+        /// Fail with exit 1 if any declared executable word is unknown.
+        #[arg(long)]
+        strict: bool,
     },
     /// Rank EL1 census files (written by runs with
     /// `CARRICK_EL1_CENSUS=<directory>`) by host syscall CPU: for each
