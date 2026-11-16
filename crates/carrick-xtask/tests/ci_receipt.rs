@@ -1915,6 +1915,272 @@ fn retirement_refuses_opaque_item_macros_and_unscanned_target_paths() {
     }
 }
 
+/// #2408/#2411: three crates whose integration targets are consolidated into
+/// one `main` binary each (the same bare binary name in every crate), with the
+/// old `<bin>::<test>` mapped to `main::<bin>::<test>`. The base sources carry
+/// item macros the scanner cannot prove harmless (a bare `thread_local!`, a
+/// test-generating `macro_rules!`, and a cfg'd `compile_error!` in another
+/// target), as carrick-kernel-example and carrick-cli do on main.
+fn write_consolidation_trees(base: &Path, cand: &Path) {
+    let example = "crates/carrick-kernel-example";
+    let cli = "crates/carrick-cli";
+    let kvm = "crates/carrick-vmm-kvm";
+    let modules = [
+        (
+            example,
+            "admission_interleavings",
+            "#[test] fn admitted_wait() {}\n",
+        ),
+        (
+            example,
+            "native_execution_scope",
+            "thread_local! { static ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }\n#[test] fn scoped_allocation() {}\n",
+        ),
+        (
+            example,
+            "n2_task_lifecycle",
+            "macro_rules! binding { ($n:ident) => { #[test] fn $n() {} }; }\nbinding!(wnohang_two_parents);\n",
+        ),
+        (cli, "build", "#[test] fn build_help_lists_flags() {}\n"),
+        (kvm, "carrier_cpu", "#[test] fn rejects_wrong_task() {}\n"),
+    ];
+    for root in [base, cand] {
+        write_source(
+            root,
+            &format!("{example}/Cargo.toml"),
+            "[package]\nname = \"carrick-kernel-example\"\n[lib]\nname = \"carrick_kernel_example\"\npath = \"src/lib.rs\"\n",
+        );
+        write_source(
+            root,
+            &format!("{example}/src/lib.rs"),
+            "#[test] fn lib_ok() {}\n",
+        );
+        write_source(
+            root,
+            &format!("{cli}/Cargo.toml"),
+            "[package]\nname = \"carrick-cli\"\n[[bin]]\nname = \"carrick\"\npath = \"src/main.rs\"\n[package.metadata.carrick.test-lanes]\nintegration = \"integration\"\n",
+        );
+        write_source(
+            root,
+            &format!("{cli}/src/main.rs"),
+            "#[cfg(all(feature = \"a\", feature = \"b\"))]\ncompile_error!(\"pick one\");\nfn main() {}\n",
+        );
+        write_source(
+            root,
+            &format!("{cli}/tests/integration/main.rs"),
+            "#[test] fn kept_cli() {}\n",
+        );
+        write_source(
+            root,
+            &format!("{kvm}/Cargo.toml"),
+            "[package]\nname = \"carrick-vmm-kvm\"\n[package.metadata.carrick.test-lanes]\n\"*\" = \"kvm\"\n",
+        );
+        write_source(
+            root,
+            &format!("{kvm}/tests/live_kvm.rs"),
+            "#[test] fn kept_kvm() {}\n",
+        );
+    }
+    let mut mains: std::collections::BTreeMap<&str, String> = Default::default();
+    for (krate, module, source) in modules {
+        write_source(base, &format!("{krate}/tests/{module}.rs"), source);
+        write_source(cand, &format!("{krate}/tests/main/{module}.rs"), source);
+        mains
+            .entry(krate)
+            .or_default()
+            .push_str(&format!("mod {module};\n"));
+    }
+    for (krate, main) in mains {
+        write_source(cand, &format!("{krate}/tests/main/main.rs"), &main);
+    }
+}
+
+const CONSOLIDATED_KVM: [&str; 1] = ["carrier_cpu::rejects_wrong_task"];
+const CONSOLIDATED_HOST: [&str; 4] = [
+    "admission_interleavings::admitted_wait",
+    "native_execution_scope::scoped_allocation",
+    "n2_task_lifecycle::wnohang_two_parents",
+    "build::build_help_lists_flags",
+];
+
+fn consolidation_entries(skip: Option<&str>) -> Vec<carrick_xtask::ci_receipt::RetiredTest> {
+    CONSOLIDATED_KVM
+        .iter()
+        .chain(&CONSOLIDATED_HOST)
+        .filter(|test| Some(**test) != skip)
+        .map(|test| retirement(test, Some(&format!("main::{test}"))))
+        .collect()
+}
+
+/// A receipt whose one step started `started` and finished every binary they
+/// name; `kvm` selects the KVM lane's receipt, else a no-docker host receipt.
+fn lane_receipt(kvm: bool, started: &[String]) -> AcceptReceipt {
+    let mut s = step(if kvm { "kvm-tests" } else { "host-tests" }, true, &[]);
+    s.started_tests = started.to_vec();
+    s.finished_binaries = started
+        .iter()
+        .map(|t| t.split_once("::").unwrap().0.to_owned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut r = receipt(vec![s]);
+    r.phase = "host".into();
+    r.profile = if kvm { "kvm" } else { "no-docker" }.into();
+    r
+}
+
+fn consolidation_receipts(kvm: bool, consolidated: &[&str]) -> (AcceptReceipt, AcceptReceipt) {
+    let kept: &[&str] = if kvm {
+        &["live_kvm::kept_kvm"]
+    } else {
+        &["carrick_kernel_example::lib_ok", "integration::kept_cli"]
+    };
+    let base: Vec<String> = consolidated
+        .iter()
+        .chain(kept)
+        .map(|t| (*t).to_owned())
+        .collect();
+    let cand: Vec<String> = consolidated
+        .iter()
+        .map(|t| format!("main::{t}"))
+        .chain(kept.iter().map(|t| (*t).to_owned()))
+        .collect();
+    (lane_receipt(kvm, &base), lane_receipt(kvm, &cand))
+}
+
+#[test]
+fn a_consolidated_binary_retires_its_old_binaries_in_each_crates_own_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, cand) = (dir.path().join("base"), dir.path().join("cand"));
+    write_consolidation_trees(&base, &cand);
+    let entries = consolidation_entries(None);
+    for (kvm, consolidated) in [
+        (true, &CONSOLIDATED_KVM[..]),
+        (false, &CONSOLIDATED_HOST[..]),
+    ] {
+        let (base_receipt, cand_receipt) = consolidation_receipts(kvm, consolidated);
+        let result = diff_with_retired(&base_receipt, &cand_receipt, &entries, &base, &cand)
+            .unwrap_or_else(|error| panic!("kvm={kvm}: {error}"));
+        assert!(result.new.is_empty(), "kvm={kvm}: {result:?}");
+        assert!(result.warnings.is_empty(), "kvm={kvm}: {result:?}");
+    }
+}
+
+#[test]
+fn a_consolidated_binary_with_an_unmapped_test_still_reads_missing_and_unfinished() {
+    // Known answer: the cli `build` test moved into `main` with no mapping,
+    // so its old identity is missing and its old binary unfinished.
+    let dir = tempfile::tempdir().unwrap();
+    let (base, cand) = (dir.path().join("base"), dir.path().join("cand"));
+    write_consolidation_trees(&base, &cand);
+    let entries = consolidation_entries(Some("build::build_help_lists_flags"));
+    let (base_receipt, cand_receipt) = consolidation_receipts(false, &CONSOLIDATED_HOST);
+    let result = diff_with_retired(&base_receipt, &cand_receipt, &entries, &base, &cand).unwrap();
+    assert_eq!(
+        result.new,
+        ["missing:build::build_help_lists_flags", "unfinished:build"],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_consolidated_binary_whose_replacement_did_not_start_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, cand) = (dir.path().join("base"), dir.path().join("cand"));
+    write_consolidation_trees(&base, &cand);
+    let (base_receipt, mut cand_receipt) = consolidation_receipts(false, &CONSOLIDATED_HOST);
+    cand_receipt.steps[0]
+        .started_tests
+        .retain(|t| t != "main::admission_interleavings::admitted_wait");
+    let error = diff_with_retired(
+        &base_receipt,
+        &cand_receipt,
+        &consolidation_entries(None),
+        &base,
+        &cand,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("replacement test 'main::admission_interleavings::admitted_wait'")
+            && error.contains("did not start in candidate receipt"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_binary_with_an_unretired_test_stays_unfinished() {
+    // Every listed test is mapped, but the old binary also ran a test with no
+    // [[retired]] entry: the binary is not retired, so it stays unfinished.
+    let dir = tempfile::tempdir().unwrap();
+    let (base, cand) = (dir.path().join("base"), dir.path().join("cand"));
+    write_consolidation_trees(&base, &cand);
+    let (mut base_receipt, cand_receipt) = consolidation_receipts(true, &CONSOLIDATED_KVM);
+    base_receipt.steps[0]
+        .started_tests
+        .push("carrier_cpu::unmapped".into());
+    let result = diff_with_retired(
+        &base_receipt,
+        &cand_receipt,
+        &consolidation_entries(None),
+        &base,
+        &cand,
+    )
+    .unwrap();
+    assert_eq!(
+        result.new,
+        ["missing:carrier_cpu::unmapped", "unfinished:carrier_cpu"],
+        "{result:?}"
+    );
+}
+
+#[test]
+fn base_presence_is_scoped_to_the_retired_binarys_own_target() {
+    // `admission_interleavings` resolves on its own, so a declaration for a
+    // test it never had is stale, whatever its sibling targets contain.
+    let dir = tempfile::tempdir().unwrap();
+    let (base, cand) = (dir.path().join("base"), dir.path().join("cand"));
+    write_consolidation_trees(&base, &cand);
+    let (base_receipt, cand_receipt) = consolidation_receipts(false, &CONSOLIDATED_HOST);
+    let mut entries = consolidation_entries(None);
+    entries.push(retirement(
+        "admission_interleavings::never_existed",
+        Some("main::admission_interleavings::never_existed"),
+    ));
+    let result = diff_with_retired(&base_receipt, &cand_receipt, &entries, &base, &cand).unwrap();
+    assert!(result.new.is_empty(), "{result:?}");
+    assert_eq!(result.warnings.len(), 1, "{result:?}");
+    assert!(
+        result.warnings[0].contains("admission_interleavings::never_existed"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn candidate_presence_still_refuses_an_unresolved_generator() {
+    // The base-side relaxation must not reach the candidate: a retained old
+    // target whose crate still holds a test-generating macro is refused.
+    let dir = tempfile::tempdir().unwrap();
+    let (base, cand) = (dir.path().join("base"), dir.path().join("cand"));
+    write_consolidation_trees(&base, &cand);
+    write_source(
+        &cand,
+        "crates/carrick-kernel-example/tests/admission_interleavings.rs",
+        "",
+    );
+    let (base_receipt, cand_receipt) = consolidation_receipts(false, &CONSOLIDATED_HOST);
+    let error = diff_with_retired(
+        &base_receipt,
+        &cand_receipt,
+        &consolidation_entries(None),
+        &base,
+        &cand,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("cannot resolve"), "{error}");
+}
+
 mod ancestor_selection {
     use super::*;
     use carrick_xtask::ci_receipt::{MainCommit, ReceiptError, select_baseline};
