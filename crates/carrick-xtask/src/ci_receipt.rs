@@ -795,12 +795,48 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
 /// Module paths are conservatively over-approximated: a same-named test in
 /// another module prevents retirement rather than excusing a missing test.
 pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<bool, ReceiptError> {
+    match crate_test_presence(tree_root, bin, test_path, None, false)? {
+        TestPresence::Present => Ok(true),
+        TestPresence::Absent => Ok(false),
+        TestPresence::Unresolved(reason) => Err(ReceiptError::Retired(reason)),
+    }
+}
+
+/// What a source scan proves about one `<bin>::<test>`.
+#[derive(Debug, PartialEq, Eq)]
+enum TestPresence {
+    Present,
+    Absent,
+    /// A source the scanner cannot resolve could define it.
+    Unresolved(String),
+}
+
+/// `tree_has_test` over every source of each crate that could own `bin`.
+/// With `scope`, only crates in it (by `crate_identities`) count. With
+/// `targets_only`, only crates that still have a cargo target named `bin`
+/// count: a leftover `tests/<bin>/` module directory with no `main.rs`
+/// builds no binary.
+fn crate_test_presence(
+    tree_root: &Path,
+    bin: &str,
+    test_path: &str,
+    scope: Option<&BTreeSet<String>>,
+    targets_only: bool,
+) -> Result<TestPresence, ReceiptError> {
     use syn::visit::Visit;
     let fn_name = test_path.rsplit("::").next().unwrap_or(test_path);
     let mut scan = TestSourceScan::default();
     for crate_dir in candidate_crate_dirs(tree_root)? {
         let manifest = crate_manifest(&crate_dir)?;
         if !crate_matches_bin(&crate_dir, &manifest, bin)? {
+            continue;
+        }
+        if scope.is_some_and(|scope| {
+            crate_identities(tree_root, &crate_dir, &manifest).is_disjoint(scope)
+        }) {
+            continue;
+        }
+        if targets_only && !crate_has_target(&crate_dir, &manifest, bin)? {
             continue;
         }
         check_target_paths(&crate_dir, &manifest)?;
@@ -817,14 +853,179 @@ pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<boo
             scan.crate_root = crate_dir.clone();
             scan.visit_file(&syntax);
             if let Some(reason) = scan.unresolved {
-                return Err(ReceiptError::Retired(format!(
+                return Ok(TestPresence::Unresolved(format!(
                     "cannot resolve {reason} in '{}'; retirement of {bin}::{test_path} refused",
                     file.display()
                 )));
             }
         }
     }
-    Ok(scan.tests.contains(fn_name))
+    Ok(if scan.tests.contains(fn_name) {
+        TestPresence::Present
+    } else {
+        TestPresence::Absent
+    })
+}
+
+/// The test binary of a package's library, or of a manifest-less crate
+/// directory, as `crate_targets` names it.
+fn package_bin_name(crate_dir: &Path, manifest: &toml::Value) -> String {
+    lib_bin_name(manifest).unwrap_or_else(|| {
+        crate_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .replace('-', "_")
+    })
+}
+
+/// Whether the crate builds a cargo target named `bin`.
+fn crate_has_target(
+    crate_dir: &Path,
+    manifest: &toml::Value,
+    bin: &str,
+) -> Result<bool, ReceiptError> {
+    let package_bin = package_bin_name(crate_dir, manifest);
+    Ok(crate_targets(crate_dir, manifest, &package_bin)?
+        .iter()
+        .any(|target| target.name == bin))
+}
+
+/// A crate's identities across the base and candidate trees: its
+/// tree-relative directory and its package name. A crate is the same in both
+/// trees when either survives, so a moved or newly-manifested crate is still
+/// recognised.
+fn crate_identities(
+    tree_root: &Path,
+    crate_dir: &Path,
+    manifest: &toml::Value,
+) -> BTreeSet<String> {
+    let directory = crate_dir.strip_prefix(tree_root).unwrap_or(crate_dir);
+    let package = manifest
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(toml::Value::as_str);
+    [format!("dir:{}", directory.display())]
+        .into_iter()
+        .chain(package.map(|name| format!("package:{name}")))
+        .collect()
+}
+
+/// Parse and scan every `.rs` file of one crate, keyed by canonical path, in
+/// read order. Each scan keeps its own unresolved generator, if any.
+fn scan_crate_sources(
+    crate_dir: &Path,
+    manifest: &toml::Value,
+) -> Result<Vec<(PathBuf, PathBuf, TestSourceScan)>, ReceiptError> {
+    use syn::visit::Visit;
+    let mut files = Vec::new();
+    let explicit_targets = explicit_target_paths(manifest);
+    collect_rs_files(crate_dir, &explicit_targets, crate_dir, &mut files)?;
+    let scanned: BTreeSet<PathBuf> = files.iter().filter_map(|f| f.canonicalize().ok()).collect();
+    let mut out = Vec::new();
+    for file in files {
+        let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
+        let syntax = syn::parse_file(&source).map_err(|e| {
+            ReceiptError::Retired(format!("cannot parse '{}': {e}", file.display()))
+        })?;
+        let mut scan = TestSourceScan {
+            scanned: scanned.clone(),
+            crate_root: crate_dir.to_path_buf(),
+            file_dir: file.parent().map(Path::to_path_buf).unwrap_or_default(),
+            ..Default::default()
+        };
+        scan.visit_file(&syntax);
+        let canonical = file.canonicalize().unwrap_or_else(|_| file.clone());
+        out.push((file, canonical, scan));
+    }
+    Ok(out)
+}
+
+/// Where one `<bin>::<test>` lives in a tree.
+struct LocatedTest {
+    presence: TestPresence,
+    /// `crate_identities` of the crates whose `bin` target has a same-named
+    /// test. `None` when no target scan found one: then every crate that
+    /// could define `bin` may own it.
+    owners: Option<BTreeSet<String>>,
+    /// `owners`, else the identities of every crate that defines `bin`: the
+    /// crates whose lanes the test could have run in.
+    lane_owners: BTreeSet<String>,
+}
+
+/// Locate `<bin>::<test>` in the cargo target named `bin` of each crate that
+/// defines one: only the files that target's `mod` tree reaches can hold its
+/// tests, so a generator in a sibling target (another test binary, or the
+/// crate's `main.rs`) cannot. A crate that may own `bin` without a target
+/// of that name falls back to the whole-crate scan of `tree_has_test`.
+fn locate_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<LocatedTest, ReceiptError> {
+    let fn_name = test_path.rsplit("::").next().unwrap_or(test_path);
+    let mut defining = BTreeSet::new();
+    let mut owners = BTreeSet::new();
+    let mut unresolved = None;
+    let mut whole_crate = false;
+    for crate_dir in candidate_crate_dirs(tree_root)? {
+        let manifest = crate_manifest(&crate_dir)?;
+        if !crate_matches_bin(&crate_dir, &manifest, bin)? {
+            continue;
+        }
+        check_target_paths(&crate_dir, &manifest)?;
+        let identities = crate_identities(tree_root, &crate_dir, &manifest);
+        defining.extend(identities.iter().cloned());
+        let package_bin = package_bin_name(&crate_dir, &manifest);
+        let roots: Vec<Target> = crate_targets(&crate_dir, &manifest, &package_bin)?
+            .into_iter()
+            .filter(|target| target.name == bin)
+            .collect();
+        if roots.is_empty() {
+            whole_crate = true;
+            continue;
+        }
+        let scans: BTreeMap<PathBuf, TestSourceScan> = scan_crate_sources(&crate_dir, &manifest)?
+            .into_iter()
+            .map(|(_, canonical, scan)| (canonical, scan))
+            .collect();
+        let mut inventory = CrateTestInventory::default();
+        for root in roots {
+            attribute_module_file(
+                &root.root,
+                &[],
+                true,
+                &scans,
+                bin,
+                "",
+                &mut inventory,
+                &mut Vec::new(),
+            );
+        }
+        if inventory
+            .tests
+            .keys()
+            .any(|(_, path)| path.rsplit("::").next() == Some(fn_name))
+        {
+            owners.extend(identities);
+        }
+        if let Some(reason) = inventory.unresolved {
+            unresolved.get_or_insert(format!(
+                "cannot resolve {reason}; retirement of {bin}::{test_path} refused"
+            ));
+        }
+    }
+    let presence = if whole_crate {
+        crate_test_presence(tree_root, bin, test_path, None, false)?
+    } else if !owners.is_empty() {
+        TestPresence::Present
+    } else if let Some(reason) = unresolved {
+        TestPresence::Unresolved(reason)
+    } else {
+        TestPresence::Absent
+    };
+    let owners = (!whole_crate && !owners.is_empty()).then_some(owners);
+    Ok(LocatedTest {
+        presence,
+        lane_owners: owners.clone().unwrap_or(defining),
+        owners,
+    })
 }
 
 /// The `[package.metadata.carrick.test-lanes]` lane of one test binary; a
@@ -999,6 +1200,11 @@ fn attribute_module_file(
     if stack.contains(&canonical) {
         return;
     }
+    if let Some(reason) = scan.unresolved {
+        inventory
+            .unresolved
+            .get_or_insert_with(|| format!("{reason} in '{}'", file.display()));
+    }
     stack.push(canonical.clone());
     for relative in &scan.test_paths {
         let mut path = prefix.to_vec();
@@ -1064,7 +1270,6 @@ fn attribute_module_file(
 /// `binary_runs_in_receipt_lane`. A test is keyed by the cargo target whose
 /// `mod` tree contains it and its module path inside that target.
 pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, ReceiptError> {
-    use syn::visit::Visit;
     let mut out = Vec::new();
     for crate_dir in candidate_crate_dirs(tree_root)? {
         let manifest = crate_manifest(&crate_dir)?;
@@ -1084,24 +1289,8 @@ pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, 
             crate_name,
             ..Default::default()
         };
-        let mut files = Vec::new();
-        let explicit_targets = explicit_target_paths(&manifest);
-        collect_rs_files(&crate_dir, &explicit_targets, &crate_dir, &mut files)?;
-        let scanned: BTreeSet<PathBuf> =
-            files.iter().filter_map(|f| f.canonicalize().ok()).collect();
         let mut scans = BTreeMap::new();
-        for file in files {
-            let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
-            let syntax = syn::parse_file(&source).map_err(|e| {
-                ReceiptError::Retired(format!("cannot parse '{}': {e}", file.display()))
-            })?;
-            let mut scan = TestSourceScan {
-                scanned: scanned.clone(),
-                crate_root: crate_dir.clone(),
-                file_dir: file.parent().map(Path::to_path_buf).unwrap_or_default(),
-                ..Default::default()
-            };
-            scan.visit_file(&syntax);
+        for (file, canonical, mut scan) in scan_crate_sources(&crate_dir, &manifest)? {
             // Unlike `tree_has_test`, an inventory has no proof of absence to
             // protect: a generator can only hide tests, so keep scanning and
             // report it.
@@ -1111,9 +1300,7 @@ pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, 
                     format!("{reason} in {}", relative.display())
                 });
             }
-            if let Ok(canonical) = file.canonicalize() {
-                scans.insert(canonical, scan);
-            }
+            scans.insert(canonical, scan);
         }
         for target in crate_targets(&crate_dir, &manifest, &package_bin)? {
             let lane = declared_lane(&manifest, &target.name).to_string();
@@ -1150,18 +1337,33 @@ fn lib_bin_name(manifest: &toml::Value) -> Option<String> {
         })
 }
 
+/// Whether any crate that could define `bin` runs it in `receipt`'s lane.
+/// With `owners`, a bare binary name several crates share (`main`,
+/// `integration`) is judged only in the owners' lanes, when any of them
+/// still defines it.
 fn binary_runs_in_receipt_lane(
     tree_root: &Path,
     bin: &str,
     receipt: &AcceptReceipt,
+    owners: Option<&BTreeSet<String>>,
 ) -> Result<bool, ReceiptError> {
-    let mut found = false;
+    let mut defining = Vec::new();
     for crate_dir in candidate_crate_dirs(tree_root)? {
         let manifest = crate_manifest(&crate_dir)?;
-        if !crate_matches_bin(&crate_dir, &manifest, bin)? {
-            continue;
+        if crate_matches_bin(&crate_dir, &manifest, bin)? {
+            let identities = crate_identities(tree_root, &crate_dir, &manifest);
+            defining.push((identities, manifest));
         }
-        found = true;
+    }
+    if let Some(owners) = owners
+        && defining
+            .iter()
+            .any(|(identities, _)| !identities.is_disjoint(owners))
+    {
+        defining.retain(|(identities, _)| !identities.is_disjoint(owners));
+    }
+    let found = !defining.is_empty();
+    for (_, manifest) in defining {
         let lane = declared_lane(&manifest, bin);
         let runs = match lane {
             "kvm" => receipt.profile == "kvm",
@@ -1409,10 +1611,18 @@ pub fn diff_with_retired(
         })
     };
     let mut verified_retired: Vec<(&str, &str)> = Vec::with_capacity(retired.len());
+    // Verified retirements whose replacement started in the candidate, with
+    // the crates that could have owned them.
+    let mut replaced: Vec<(&str, &str, BTreeSet<String>)> = Vec::new();
     let mut warnings = Vec::new();
     for entry in retired {
         let (bin, test_path) = split_qualified_test(&entry.test, "test")?;
-        if !tree_has_test(base_tree, bin, test_path)? {
+        // Base presence only decides whether a declaration is stale. A base
+        // source the scanner cannot resolve cannot prove it stale, so the
+        // entry is verified in full like a present test: the candidate checks
+        // below still refuse any source that could keep it alive.
+        let base_test = locate_test(base_tree, bin, test_path)?;
+        if base_test.presence == TestPresence::Absent {
             warnings.push(format!(
                 "stale retired-test declaration '{}': test is already absent in base source (PR #{}); remove the entry",
                 entry.test, entry.pr
@@ -1420,10 +1630,10 @@ pub fn diff_with_retired(
             continue;
         }
         if ((has_started(baseline, bin, test_path)
-            || binary_runs_in_receipt_lane(base_tree, bin, baseline)?)
+            || binary_runs_in_receipt_lane(base_tree, bin, baseline, None)?)
             && has_failed(baseline, bin, test_path))
             || ((has_started(candidate, bin, test_path)
-                || binary_runs_in_receipt_lane(candidate_tree, bin, candidate)?)
+                || binary_runs_in_receipt_lane(candidate_tree, bin, candidate, None)?)
                 && has_failed(candidate, bin, test_path))
         {
             return Err(ReceiptError::Retired(format!(
@@ -1431,11 +1641,26 @@ pub fn diff_with_retired(
                 entry.test, entry.pr
             )));
         }
-        if tree_has_test(candidate_tree, bin, test_path)? {
-            return Err(ReceiptError::Retired(format!(
-                "retired test '{}' still exists in candidate source (PR #{})",
-                entry.test, entry.pr
-            )));
+        // A binary name several crates share (`scheduler_affinity` in a test
+        // crate and a probe crate) names one population per crate: once the
+        // base sources place the test, only its owners' sources can keep it,
+        // and only while they still build a `bin` target. Each such crate is
+        // still scanned whole, refusing any generator.
+        match crate_test_presence(
+            candidate_tree,
+            bin,
+            test_path,
+            base_test.owners.as_ref(),
+            true,
+        )? {
+            TestPresence::Absent => {}
+            TestPresence::Present => {
+                return Err(ReceiptError::Retired(format!(
+                    "retired test '{}' still exists in candidate source (PR #{})",
+                    entry.test, entry.pr
+                )));
+            }
+            TestPresence::Unresolved(reason) => return Err(ReceiptError::Retired(reason)),
         }
         if let Some(replaced_by) = &entry.replaced_by {
             let (repl_bin, repl_test) = split_qualified_test(replaced_by, "replaced_by")?;
@@ -1445,14 +1670,33 @@ pub fn diff_with_retired(
                     entry.test, entry.pr
                 )));
             }
+            // The replacement runs in the lane of the crate that owned the
+            // retired test, not of every crate sharing its binary name. A
+            // base binary that finished without starting the test never
+            // built it in this receipt (a cfg-gated or ignored test), so
+            // the lane owes no replacement for it.
+            let base_ran_without = baseline
+                .steps
+                .iter()
+                .any(|s| s.finished_binaries.iter().any(|b| b == bin))
+                && !has_started(baseline, bin, test_path);
             if (has_started(baseline, bin, test_path)
-                || binary_runs_in_receipt_lane(candidate_tree, repl_bin, candidate)?)
+                || (!base_ran_without
+                    && binary_runs_in_receipt_lane(
+                        candidate_tree,
+                        repl_bin,
+                        candidate,
+                        Some(&base_test.lane_owners),
+                    )?))
                 && !has_started(candidate, repl_bin, repl_test)
             {
                 return Err(ReceiptError::Retired(format!(
                     "replacement test '{replaced_by}' for retired test '{}' did not start in candidate receipt (PR #{})",
                     entry.test, entry.pr
                 )));
+            }
+            if has_started(candidate, repl_bin, repl_test) {
+                replaced.push((bin, test_path, base_test.lane_owners.clone()));
             }
         }
         verified_retired.push((bin, test_path));
@@ -1514,7 +1758,9 @@ pub fn diff_with_retired(
             .flat_map(|s| s.finished_binaries.iter().map(String::as_str))
             .collect();
         for bin in &base_step.finished_binaries {
-            if !cand_finished.contains(bin.as_str()) {
+            if !cand_finished.contains(bin.as_str())
+                && !binary_retired(bin, base_step, candidate, &replaced, candidate_tree)?
+            {
                 next.insert(format!("unfinished:{bin}"));
             }
         }
@@ -1580,6 +1826,59 @@ pub fn diff_with_retired(
             .collect(),
         warnings,
     })
+}
+
+/// Whether base binary `bin` is retired rather than unfinished: every test
+/// it started in `base_step` is a verified retirement whose replacement
+/// started in the candidate, nothing of it runs in the candidate receipt,
+/// and no crate that owned those tests still defines it. A binary with any
+/// other test, or none, stays unfinished.
+fn binary_retired(
+    bin: &str,
+    base_step: &crate::accept::StepResult,
+    candidate: &AcceptReceipt,
+    replaced: &[(&str, &str, BTreeSet<String>)],
+    candidate_tree: &Path,
+) -> Result<bool, ReceiptError> {
+    let in_bin = |test: &String| {
+        test.strip_prefix(bin)
+            .is_some_and(|rest| rest.starts_with("::"))
+    };
+    let mut tests = base_step
+        .started_tests
+        .iter()
+        .filter(|t| in_bin(t))
+        .peekable();
+    if replaced.is_empty() || candidate_tree.as_os_str().is_empty() || tests.peek().is_none() {
+        return Ok(false);
+    }
+    let mut owners = BTreeSet::new();
+    for test in tests {
+        let Some((_, _, test_owners)) = replaced
+            .iter()
+            .find(|(b, path, _)| receipt_test_matches(test, b, path))
+        else {
+            return Ok(false);
+        };
+        owners.extend(test_owners.iter().cloned());
+    }
+    let still_runs = candidate.steps.iter().any(|step| {
+        step.unfinished_binaries.iter().any(|b| b == bin) || step.started_tests.iter().any(in_bin)
+    });
+    if still_runs {
+        return Ok(false);
+    }
+    // Another crate's binary of the same name is another population.
+    for crate_dir in candidate_crate_dirs(candidate_tree)? {
+        let manifest = crate_manifest(&crate_dir)?;
+        if crate_matches_bin(&crate_dir, &manifest, bin)?
+            && crate_has_target(&crate_dir, &manifest, bin)?
+            && !crate_identities(candidate_tree, &crate_dir, &manifest).is_disjoint(&owners)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub fn load(path: &Path) -> Result<AcceptReceipt, ReceiptError> {

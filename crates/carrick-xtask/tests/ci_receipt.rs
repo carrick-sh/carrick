@@ -1920,7 +1920,10 @@ fn retirement_refuses_opaque_item_macros_and_unscanned_target_paths() {
 /// old `<bin>::<test>` mapped to `main::<bin>::<test>`. The base sources carry
 /// item macros the scanner cannot prove harmless (a bare `thread_local!`, a
 /// test-generating `macro_rules!`, and a cfg'd `compile_error!` in another
-/// target), as carrick-kernel-example and carrick-cli do on main.
+/// target), as carrick-kernel-example and carrick-cli do on main. An old
+/// binary name is shared too: carrick-conformance-next keeps its own
+/// `scheduler_affinity` target, whose `include!` of build output the
+/// scanner cannot resolve.
 fn write_consolidation_trees(base: &Path, cand: &Path) {
     let example = "crates/carrick-kernel-example";
     let cli = "crates/carrick-cli";
@@ -1929,7 +1932,7 @@ fn write_consolidation_trees(base: &Path, cand: &Path) {
         (
             example,
             "admission_interleavings",
-            "#[test] fn admitted_wait() {}\n",
+            "#[test] fn admitted_wait() {}\n#[cfg(target_os = \"macos\")]\n#[test] fn macos_only_wait() {}\n",
         ),
         (
             example,
@@ -1940,6 +1943,11 @@ fn write_consolidation_trees(base: &Path, cand: &Path) {
             example,
             "n2_task_lifecycle",
             "macro_rules! binding { ($n:ident) => { #[test] fn $n() {} }; }\nbinding!(wnohang_two_parents);\n",
+        ),
+        (
+            example,
+            "scheduler_affinity",
+            "#[test] fn affinity_errors_leave_masks() {}\n",
         ),
         (cli, "build", "#[test] fn build_help_lists_flags() {}\n"),
         (kvm, "carrier_cpu", "#[test] fn rejects_wrong_task() {}\n"),
@@ -1980,6 +1988,22 @@ fn write_consolidation_trees(base: &Path, cand: &Path) {
             &format!("{kvm}/tests/live_kvm.rs"),
             "#[test] fn kept_kvm() {}\n",
         );
+        let probes = "crates/carrick-conformance-next";
+        write_source(
+            root,
+            &format!("{probes}/Cargo.toml"),
+            "[package]\nname = \"carrick-conformance-next\"\n[package.metadata.carrick.test-lanes]\n\"*\" = \"signed-hvf\"\n",
+        );
+        write_source(
+            root,
+            &format!("{probes}/tests/scheduler_affinity.rs"),
+            "mod common;\n#[test] fn probe_affinity() {}\n",
+        );
+        write_source(
+            root,
+            &format!("{probes}/tests/common/mod.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/shard_arrays.rs\"));\n",
+        );
     }
     let mut mains: std::collections::BTreeMap<&str, String> = Default::default();
     for (krate, module, source) in modules {
@@ -1993,20 +2017,32 @@ fn write_consolidation_trees(base: &Path, cand: &Path) {
     for (krate, main) in mains {
         write_source(cand, &format!("{krate}/tests/main/main.rs"), &main);
     }
+    // An old binary's name left as a module directory (no `main.rs`), like
+    // carrick-kernel-example's `tests/semantics/`, builds no binary.
+    write_source(
+        cand,
+        &format!("{example}/tests/n2_task_lifecycle/mod.rs"),
+        "pub fn helper() {}\n",
+    );
 }
 
 const CONSOLIDATED_KVM: [&str; 1] = ["carrier_cpu::rejects_wrong_task"];
-const CONSOLIDATED_HOST: [&str; 4] = [
+const CONSOLIDATED_HOST: [&str; 5] = [
     "admission_interleavings::admitted_wait",
+    "scheduler_affinity::affinity_errors_leave_masks",
     "native_execution_scope::scoped_allocation",
     "n2_task_lifecycle::wnohang_two_parents",
     "build::build_help_lists_flags",
 ];
 
+/// Mapped, but cfg-gated off the receipt's platform: no receipt starts it.
+const CFG_GATED: &str = "admission_interleavings::macos_only_wait";
+
 fn consolidation_entries(skip: Option<&str>) -> Vec<carrick_xtask::ci_receipt::RetiredTest> {
     CONSOLIDATED_KVM
         .iter()
         .chain(&CONSOLIDATED_HOST)
+        .chain(&[CFG_GATED])
         .filter(|test| Some(**test) != skip)
         .map(|test| retirement(test, Some(&format!("main::{test}"))))
         .collect()
@@ -2131,6 +2167,31 @@ fn a_binary_with_an_unretired_test_stays_unfinished() {
         result.new,
         ["missing:carrier_cpu::unmapped", "unfinished:carrier_cpu"],
         "{result:?}"
+    );
+}
+
+#[test]
+fn a_replacement_is_owed_unless_the_base_binary_finished_without_the_test() {
+    // The base binary finished without starting a cfg-gated test, so this
+    // lane never built it and owes no replacement. Without that evidence
+    // (the binary absent from the base receipt) the replacement is owed.
+    let dir = tempfile::tempdir().unwrap();
+    let (base, cand) = (dir.path().join("base"), dir.path().join("cand"));
+    write_consolidation_trees(&base, &cand);
+    let entries = vec![retirement(CFG_GATED, Some(&format!("main::{CFG_GATED}")))];
+    let (base_receipt, cand_receipt) = consolidation_receipts(false, &CONSOLIDATED_HOST);
+    let result = diff_with_retired(&base_receipt, &cand_receipt, &entries, &base, &cand);
+    assert!(result.is_ok(), "{result:?}");
+    let mut unfinished_base = base_receipt.clone();
+    unfinished_base.steps[0]
+        .finished_binaries
+        .retain(|b| b != "admission_interleavings");
+    let error = diff_with_retired(&unfinished_base, &cand_receipt, &entries, &base, &cand)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("did not start in candidate receipt"),
+        "{error}"
     );
 }
 
