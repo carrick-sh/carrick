@@ -10,8 +10,9 @@
  *
  * With -DPEER_SCANS_AFTER_MIGRATION (#2306), the other CPU is woken and
  * its idle scan held until this CPU's migration at the worker's switch-in
- * has run: that migration finds no idle CPU, and the leader stays queued
- * here behind the polling worker until the other CPU's scan takes it.
+ * has run: that migration finds no idle CPU, and the leader, this CPU's
+ * home thread, stays queued here behind the polling worker until the
+ * worker's slice ends.
  *
  * Exit 7: the worker reaped the zombie. 100 + n: the worker's wait4 failed
  * with errno n (111 = EAGAIN); 150 + n and 200 + n: the first or the held

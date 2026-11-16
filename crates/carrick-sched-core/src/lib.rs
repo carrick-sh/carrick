@@ -4767,6 +4767,27 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         transfer.publish()
     }
 
+    /// The end of the running thread's slice on `slot` while a thread waits
+    /// on its run queue, in the caller's counter ticks; `None` with nothing
+    /// queued. A wait not yet stamped (queued from another vCPU) starts at
+    /// `now`. The one slice policy every ISA's timer programs
+    /// ([`PREEMPT_SLICE_NS`] converted to `slice_ticks`): a thread queued
+    /// behind a running one that never parks (a syscall poller) gets its
+    /// turn when the slice ends, never only when some other interrupt
+    /// arrives (#2360, #2306).
+    pub fn slice_end(&self, slot: SlotId, now: u64, slice_ticks: u64) -> Option<u64> {
+        let s = self.slot(slot);
+        if s.queued() == 0 {
+            return None;
+        }
+        let mut since = s.queued_since();
+        if since == 0 {
+            since = now;
+            s.restart_slice(now);
+        }
+        Some(since.saturating_add(slice_ticks))
+    }
+
     /// Earliest live deadline, pruning cancelled or completed park leases.
     pub fn timer_deadline(&self, slot: SlotId) -> Option<u64> {
         self.timers

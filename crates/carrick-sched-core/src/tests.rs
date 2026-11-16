@@ -2055,6 +2055,32 @@ fn host_placement_respects_address_spaces_and_owes_resched_sgis() {
     );
 }
 
+/// #2306/#2360: the one slice policy every ISA's timer programs. Nothing
+/// queued: no slice. A thread queued from another vCPU (no stamp yet)
+/// starts the wait now; a stamped wait keeps its start, so a slice already
+/// over reads as past, for the caller to take at once.
+#[test]
+fn a_slice_ends_only_while_a_thread_waits_behind_the_running_one() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    assert_eq!(zone.slice_end(SLOT, 1_000, 50), None);
+    let running = zone.alloc_record(identity(40)).unwrap();
+    let waiting = zone.alloc_record(identity(41)).unwrap();
+    assert!(zone.requeue_preempted(SLOT, running).is_queued());
+    assert!(zone.requeue_preempted(SLOT, waiting).is_queued());
+    assert_eq!(zone.switch_in_full(SLOT).map(|s| s.record), Some(running));
+    assert_eq!(zone.slot(SLOT).queued_since(), 0);
+    assert_eq!(zone.slice_end(SLOT, 1_000, 50), Some(1_050));
+    assert_eq!(zone.slot(SLOT).queued_since(), 1_000);
+    assert_eq!(
+        zone.slice_end(SLOT, 2_000, 50),
+        Some(1_050),
+        "a stamped wait keeps its start"
+    );
+    assert_eq!(zone.switch_in_full(SLOT).map(|s| s.record), Some(waiting));
+    assert_eq!(zone.slice_end(SLOT, 2_000, 50), None);
+}
+
 /// Stealing never takes a home record or a record needing the thief's host
 /// executor. Such a move would wake an idle vCPU only to exit immediately.
 #[test]
