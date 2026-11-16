@@ -226,8 +226,6 @@ pub fn schedule(slot: SlotId) -> ! {
                 continue;
             }
             carrick_x86_carrier::native_execution::migrate(slot);
-            #[cfg(feature = "test-support")]
-            crate::test_support::release_idle_scan(slot);
             arm_slice(source.zone, slot);
             match unsafe { context::resume_parked(words, state.address) } {
                 Ok(never) => match never {},
