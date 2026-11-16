@@ -40,7 +40,7 @@ pub const LINUX_AT_EMPTY_PATH: u32 = 0x1000;
 const IOVEC_BYTES: usize = 16;
 
 mod socket;
-pub use socket::SocketCall;
+pub use socket::{SocketCall, net_caller, stamp_net_caller};
 const PAGE_BYTES: u64 = 4096;
 
 /// Access mode of the open description a descriptor names.
@@ -2133,7 +2133,7 @@ pub fn sigpipe_on_epipe(record: &[u8]) -> bool {
         return true;
     }
     op == Some(HostFileOp::NetSyscall as u16)
-        && host_file::NetCall::decode(input).is_some_and(|call| {
+        && socket::staged_call(input).is_some_and(|call| {
             call.canonical == crate::crossing::nr::SENDTO.raw()
                 && call.args[3] & LINUX_MSG_NOSIGNAL == 0
         })

@@ -46,10 +46,16 @@ fn current_task_default_send_cred(
     creds: &crate::kernel::Credentials,
     context: &crate::kernel::KernelContext,
 ) -> SocketPeerCred {
-    let task_id = u32::try_from(context.task().key().id.raw()).unwrap_or(0);
-    let pid = crate::namespace::pid::ns_self_pid_for(context, task_id);
+    let pid = match crate::dispatch::resources::native_net_caller() {
+        // A native member's call (#231) sends as the member.
+        Some(caller) => caller.pid(),
+        None => {
+            let task_id = u32::try_from(context.task().key().id.raw()).unwrap_or(0);
+            crate::dispatch::NsPid(crate::namespace::pid::ns_self_pid_for(context, task_id) as i32)
+        }
+    };
     SocketPeerCred {
-        pid: crate::dispatch::NsPid(pid as i32),
+        pid,
         uid: creds.ruid,
         gid: creds.rgid,
     }

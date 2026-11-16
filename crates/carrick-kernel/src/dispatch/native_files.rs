@@ -1820,6 +1820,95 @@ mod tests {
             Err(NativeHostFileRefusal),
             "an unstamped socket call never runs as the run root"
         );
+
+        // The run root holds CAP_NET_RAW; a stamped caller without it is
+        // refused a raw socket before any host object exists.
+        let root = fixture.dispatcher.capture_one_task_context().unwrap();
+        assert_ne!(root.task().caps().effective & (1 << 13), 0);
+        let caller = |cap_effective: u64| {
+            let mut input = host_file::NetCaller {
+                task: root.task().key(),
+                ns_pid: std::num::NonZeroU32::new(7).unwrap(),
+                ids: host_file::AccessIds {
+                    ruid: 1000,
+                    euid: 1000,
+                    suid: 1000,
+                    fsuid: 1000,
+                    rgid: 1000,
+                    egid: 1000,
+                    sgid: 1000,
+                    fsgid: 1000,
+                },
+                cap_effective,
+            }
+            .encode()
+            .to_vec();
+            input.extend_from_slice(
+                &host_file::NetCall::encode(
+                    carrick_abi::syscall::nr::SOCKET.raw(),
+                    [2, 3, 1, 0, 0, 0],
+                    &[],
+                    &[],
+                )
+                .unwrap(),
+            );
+            record(fixture.table, HostFileOp::NetSyscall, -1, [0; 4], &input, 0)
+        };
+        assert_eq!(
+            fixture.result(None, caller(0)).0,
+            carrick_abi::LINUX_EPERM.guest_retval()
+        );
+    }
+
+    /// #231: inside a native member's network call every identity read
+    /// answers the member's stamped caller, never the borrowed root
+    /// context's, including scopes nested in the call.
+    #[test]
+    fn a_native_net_scope_answers_the_callers_identity() {
+        let dispatcher = SyscallDispatcher::new();
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let binding = dispatcher.kernel_binding.read();
+        let ids = binding.kernel().object_ids();
+        let caller = Arc::new(
+            super::super::net::native::NativeNetCaller::for_test(
+                &host_file::NetCaller {
+                    task: root.task().key(),
+                    ns_pid: std::num::NonZeroU32::new(4242).unwrap(),
+                    ids: host_file::AccessIds {
+                        ruid: 1000,
+                        euid: 1001,
+                        suid: 1000,
+                        fsuid: 1001,
+                        rgid: 2000,
+                        egid: 2001,
+                        sgid: 2000,
+                        fsgid: 2001,
+                    },
+                    cap_effective: 0,
+                },
+                ids,
+            )
+            .unwrap(),
+        );
+        drop(binding);
+        let files = root.resources().files();
+        let seen = super::super::resources::with_native_net_scope(&root, files, caller, || {
+            let outer = (
+                dispatcher.identity_pid(),
+                dispatcher.cred_snapshot().euid.raw(),
+                super::super::creds::has_effective_capability(&root, 13),
+            );
+            let nested = super::super::resources::with_captured_resources(&root, || {
+                (
+                    dispatcher.identity_pid(),
+                    dispatcher.cred_snapshot().euid.raw(),
+                )
+            });
+            (outer, nested)
+        });
+        assert_eq!(seen, ((4242, 1001, false), (4242, 1001)));
+        // Outside the scope the root answers for itself.
+        assert!(super::super::creds::has_effective_capability(&root, 13));
     }
 
     #[test]
