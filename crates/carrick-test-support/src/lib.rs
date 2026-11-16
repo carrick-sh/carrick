@@ -18,7 +18,7 @@
 //!
 //! It is a separate crate, rather than a `#[cfg(test)]` module, for one reason:
 //! the same fixture builders are consumed from MULTIPLE crates' test targets
-//! (`carrick-cli/tests/cli.rs`, `carrick-runtime/tests/...`), and a test-only
+//! (`carrick-cli/tests/integration/cli.rs`, `carrick-runtime/tests/...`), and a test-only
 //! module can't be shared across crate boundaries. Pulling them here also keeps
 //! the dev-dependencies they need (`tar`, `flate2`) out of the production crates'
 //! graphs. Because it is test-only support, `clippy::unwrap_used` is allowed

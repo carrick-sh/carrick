@@ -652,12 +652,10 @@ _test-unit-workspace *ARGS:
         # the included workspace crates that would be skipped by `--lib` alone.
         # Note: `carrick-cli` is excluded from this command and run separately
         # below with serialized execution and an explicit 8 MiB stack budget.
-        # NOT added: carrick-cli's `tests/` integration targets. `cli.rs` and
-        # `fs_backend_flag.rs` drive the cargo-built binary via assert_cmd and
-        # run no guest (adding `--test cli --test fs_backend_flag` here is a
-        # follow-up; the recipe body is unchanged in this commit). The others
-        # (`conformance.rs`, `perf_runner.rs`, `trace_profile.rs`) shell out to the
-        # SIGNED `target/release/carrick` and run real guests or dtrace. This recipe
+        # NOT added: carrick-cli's `tests/` integration targets. `tests/integration/`
+        # (`cli.rs`, `fs_backend_flag.rs`, `trace_profile.rs`) runs in `test-integration`;
+        # `tests/conformance.rs` (`signed-cli`, including `perf_runner.rs`) shells out to the
+        # SIGNED `target/release/carrick` and runs real guests. This recipe
         # is defined as the tests that do NOT need the HVF runtime or Docker;
         # those belong to a guest-capable lane (`just conformance*`,
         # `cargo test -p carrick-cli --test <name>`).
@@ -917,16 +915,10 @@ test-integration:
         # `PreparedRun::execute(self)` single-use contract is a compile_fail
         # doctest; `just test`'s `--lib --bins` never runs doctests.
         {{_admit}} {{_cargo}} test -p carrick-runtime --doc prepare
-        # `carrick-cli`'s trace_profile suite: the D-program contracts and the
-        # DSRPROF1/DSRPROF2 stream parsers. It ran in NO gate until 2026-08-06
-        # -- `just test`'s `--lib --bins` reaches carrick-cli's in-file tests
-        # but never its `tests/` directory, and this recipe listed only the
-        # runtime/engine/image suites. Same house trap the `--bins` comment in
-        # `test` describes. It needs no HVF, guest, or Docker: every case
-        # parses fixtures or asserts on argument validation.
-        {{_admit}} {{_cargo}} test -p carrick-cli --test trace_profile
-        {{_admit}} {{_cargo}} test -p carrick-cli --test fs_backend_flag
-        {{_admit}} {{_cargo}} test -p carrick-cli --test cli
+        # `carrick-cli`'s consolidated `integration` suite (`trace_profile`,
+        # `fs_backend_flag`, `cli`): D-program contracts, DSRPROF1/DSRPROF2
+        # stream parsers, and CLI/flag assertions. Needs no HVF, guest, or Docker.
+        {{_admit}} {{_cargo}} test -p carrick-cli --test integration
         {{_admit}} {{_cargo}} test -p carrick-engine
         {{_admit}} {{_cargo}} test -p carrick-image
         # carrick-conformance-next's shard consistency tests (materialized
@@ -952,9 +944,7 @@ test-integration:
     {{_admit}} {{_cargo}} test -p carrick-kernel --test integration
     {{_admit}} {{_cargo}} test -p carrick-kernel --test io_blocking_guard
     {{_admit}} {{_cargo}} test -p carrick-runtime {{_platform_features}} --test syscall_process
-    {{_admit}} {{_cargo}} test -p carrick-cli {{_platform_features}} --test trace_profile
-    {{_admit}} {{_cargo}} test -p carrick-cli {{_platform_features}} --test fs_backend_flag
-    {{_admit}} {{_cargo}} test -p carrick-cli {{_platform_features}} --test cli
+    {{_admit}} {{_cargo}} test -p carrick-cli {{_platform_features}} --test integration
     # syscall-shim belongs to the runtime dependency, not the engine API.
     {{_admit}} {{_cargo}} test -p carrick-engine {{replace(_platform_features, "syscall-shim", "carrick-runtime/syscall-shim")}}
     {{_admit}} {{_cargo}} test -p carrick-image
@@ -1100,13 +1090,13 @@ conformance-probes: build
         env -u CARRICK_TEST_TARGET {{_lease_runner}} host-lease --mode carrick -- ./scripts/test-signed.sh carrick-conformance-next case_ --include-ignored --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-dedicated-signed-artifacts.jsonl
-        {{_admit}} {{_cargo}} test -p carrick-cli --test conformance_cli_contract \
-          conformance_default_run_contract -- --exact --nocapture
+        {{_admit}} {{_cargo}} test -p carrick-cli --test conformance \
+          conformance_cli_contract::conformance_default_run_contract -- --exact --nocapture
         retained_filter="$(paste -sd, scripts/conformance/retained-generic-probes.txt)"
         CARRICK_PROBE_LANE=arm64 CARRICK_PROBE_FILTER="$retained_filter" \
-          {{_admit}} {{_cargo}} test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
+          {{_admit}} {{_cargo}} test -p carrick-cli --test conformance {{_platform_features}} -- --skip conformance_cli_contract:: --skip perf_runner:: --nocapture
     else
-        {{_admit}} {{_cargo}} test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
+        {{_admit}} {{_cargo}} test -p carrick-cli --test conformance {{_platform_features}} -- --skip conformance_cli_contract:: --skip perf_runner:: --nocapture
     fi
 
 # Verify the frozen 2,127-suite discovery surface against the current clean

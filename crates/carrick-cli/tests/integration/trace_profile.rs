@@ -13,8 +13,8 @@ fn cli() -> Command {
 /// every time the D program is edited, so a literal would make the fixture
 /// silently stale — and "stale fixture" and "rejected stream" would become
 /// indistinguishable, which is the exact failure this profile exists to avoid.
-const AMP1_FIXTURE: &str = include_str!("fixtures/amp1-valid.raw");
-const AMP1_PROGRAM: &str = include_str!("../../../scripts/dtrace/native-amplification.d");
+const AMP1_FIXTURE: &str = include_str!("../fixtures/amp1-valid.raw");
+const AMP1_PROGRAM: &str = include_str!("../../../../scripts/dtrace/native-amplification.d");
 
 fn amp1_program_sha256() -> String {
     use sha2::{Digest, Sha256};
@@ -34,7 +34,7 @@ const AMP1_TARGET_ARGV_SHA256: &str =
     "3333333333333333333333333333333333333333333333333333333333333333";
 
 const HVP_CARRIER_LOW_RATE_PROGRAM: &str =
-    include_str!("../../../scripts/dtrace/hvpatch-carrier-cpu-low-rate.d");
+    include_str!("../../../../scripts/dtrace/hvpatch-carrier-cpu-low-rate.d");
 
 fn carrier_low_rate_program_sha256() -> String {
     use sha2::{Digest, Sha256};
@@ -45,7 +45,7 @@ fn carrier_low_rate_program_sha256() -> String {
 }
 
 const HVP_CARRIER_CPU_ATTR_PROGRAM: &str =
-    include_str!("../../../scripts/dtrace/hvpatch-carrier-cpu-attribution.d");
+    include_str!("../../../../scripts/dtrace/hvpatch-carrier-cpu-attribution.d");
 
 fn carrier_cpu_attr_program_sha256() -> String {
     use sha2::{Digest, Sha256};
@@ -1202,11 +1202,11 @@ fn completed_inotify_profile_is_listed() {
         .stdout(contains("hvpatch-inotify09-population"));
 }
 
-#[path = "../src/hvpatch_inotify_population_profile.rs"]
+#[path = "../../src/hvpatch_inotify_population_profile.rs"]
 mod hvpatch_inotify_population_profile;
 
 fn completed_inotify_stream() -> String {
-    include_str!("fixtures/inotify09-population-complete.raw").replace(
+    include_str!("../fixtures/inotify09-population-complete.raw").replace(
         "@PROGRAM_SHA256@",
         &hvpatch_inotify_population_profile::program_sha256(),
     )

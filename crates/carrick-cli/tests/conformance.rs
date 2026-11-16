@@ -5137,3 +5137,8 @@ fn failure_record_assembly() {
         record.contains("  line 1:\n    - carrick: <TIMEOUT after 45s>\n    + linux:   ok=true\n")
     );
 }
+
+#[path = "signed_cli/conformance_cli_contract.rs"]
+mod conformance_cli_contract;
+#[path = "signed_cli/perf_runner.rs"]
+mod perf_runner;
