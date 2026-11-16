@@ -758,7 +758,7 @@ fn native_exec_call(
     ordinal: carrick_guest_arch::NativeOrdinal,
 ) -> CompletionRoute {
     use carrick_el1_linux::dispatch::NativeExecStage;
-    use carrick_el1_linux::native_process_runtime::{NativeResume, NativeServiceCall};
+    use carrick_el1_linux::native_process_runtime::NativeServiceCall;
     // SAFETY: the admitted CPU binding retains the initialized counter
     // region for the entire native service continuation.
     let counters: &'static Counters = unsafe { &*(binding.counters_address as *const Counters) };
@@ -783,10 +783,7 @@ fn native_exec_call(
                 fault.access,
             ) {
                 UserFaultSupply::Served => {
-                    // Rewind to the `syscall` instruction with the original
-                    // number, exactly as a restarted call re-enters.
-                    frame.rax = ordinal.raw();
-                    frame.rcx = frame.rcx.checked_sub(2).unwrap_or_else(|| fatal_boot());
+                    restart_native_syscall(frame, ordinal);
                     CompletionRoute::Served
                 }
                 UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
@@ -799,8 +796,12 @@ fn native_exec_call(
     };
     let table = carrick_el1_linux::ipc::guest_venue(u32::from(slot.raw()))
         .and_then(|venue| carrick_el1_linux::ipc::native_exec_table(venue.tables, task));
-    match process.begin_exec_call(payload, table, NativeServiceCall::new(ordinal, counters)) {
-        Ok(NativeResume::Left(None)) => {
+    match inline_service(process.begin_exec_call(
+        payload,
+        table,
+        NativeServiceCall::new(ordinal, counters),
+    )) {
+        InlineService::Suspended => {
             // The ring owner took the call: its replacement or errno is now
             // the owner's, and the census records the call as ring-served.
             if let Some(served) = counters.served.get(ordinal.raw() as usize) {
@@ -808,12 +809,63 @@ fn native_exec_call(
             }
             CompletionRoute::Suspended
         }
-        Ok(NativeResume::Returned(result)) => {
-            frame.rax = result.raw() as u64;
+        InlineService::Returned(result) => {
+            frame.rax = result as u64;
             CompletionRoute::Served
         }
-        _ => fatal_boot(),
+        InlineService::Restart => {
+            restart_native_syscall(frame, ordinal);
+            CompletionRoute::Served
+        }
     }
+}
+
+/// How this entry completes a call whose shared service began inline.
+enum InlineService {
+    /// The service parked: the member left this CPU.
+    Suspended,
+    /// The service settled with this syscall result.
+    Returned(i64),
+    /// The service settled before it parked with no effect (an owner wait
+    /// released ahead of its park, a cancelled host-file call, a retained
+    /// map source): re-enter the call with its original arguments.
+    Restart,
+}
+
+/// The inline result of a shared `begin_*_call` owner (#2416). The owner is
+/// ISA-neutral; ARM's SVC user return accepts the same `RetrySyscall`
+/// (#2342), and the resumed checkpoint replays it in `native_execution`.
+fn inline_service(
+    result: Result<
+        carrick_el1_linux::native_process_runtime::NativeResume,
+        carrick_el1_linux::native_process_runtime::NativeProcessError,
+    >,
+) -> InlineService {
+    use carrick_el1_linux::native_process_runtime::NativeResume;
+    match result {
+        Ok(NativeResume::Left(None)) => InlineService::Suspended,
+        Ok(NativeResume::Returned(result)) => InlineService::Returned(result.raw()),
+        Ok(NativeResume::RetrySyscall) => InlineService::Restart,
+        // Only a resumed checkpoint names a saved syscall or a pending
+        // completion, and a root exit leaves through its own owner.
+        Ok(
+            NativeResume::NoPending
+            | NativeResume::RetrySavedSyscall
+            | NativeResume::Left(Some(_))
+            | NativeResume::Invalid,
+        )
+        | Err(_) => fatal_boot(),
+    }
+}
+
+/// The x86 mechanic of a restart: rewind RCX to this call's `SYSCALL` and
+/// restore its number in RAX; every argument register is still the call's.
+fn restart_native_syscall(frame: &mut NativeFrame, native: carrick_guest_arch::NativeOrdinal) {
+    frame.rax = native.raw();
+    frame.rcx = frame
+        .rcx
+        .checked_sub(carrick_guest_arch::X86_64_SYSCALL_LEN)
+        .unwrap_or_else(|| fatal_boot());
 }
 
 fn supply_syscall_fault(
@@ -1343,19 +1395,25 @@ impl Personality for LinuxPersonality {
                 && call.canonical.raw() == carrick_personality_linux::crossing::nr::GETRANDOM.raw()
             {
                 use carrick_el1_linux::native_process_runtime::{
-                    NativeEntropyArgs, NativeEntropyFlags, NativeResume,
+                    NativeEntropyArgs, NativeEntropyFlags,
                 };
-                route = match process.begin_entropy_call(NativeEntropyArgs {
+                route = match inline_service(process.begin_entropy_call(NativeEntropyArgs {
                     address: carrick_guest_arch::UserVa::new(call.args[0]),
                     length: carrick_guest_arch::GuestLen::new(call.args[1]),
                     flags: NativeEntropyFlags::from_bits_retain(call.args[2] as u32),
-                }) {
-                    Ok(NativeResume::Left(None)) => CompletionRoute::Suspended,
-                    Ok(NativeResume::Returned(result)) => {
-                        frame.rax = result.raw() as u64;
+                })) {
+                    InlineService::Suspended => CompletionRoute::Suspended,
+                    InlineService::Returned(result) => {
+                        frame.rax = result as u64;
                         CompletionRoute::Served
                     }
-                    _ => fatal_boot(),
+                    InlineService::Restart => {
+                        restart_native_syscall(
+                            frame,
+                            carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                        );
+                        CompletionRoute::Served
+                    }
                 };
             }
             // A fork child's execve/execveat is the native exec service's
@@ -1383,8 +1441,10 @@ impl Personality for LinuxPersonality {
             if let Some(venue) = anonymous.as_mut()
                 && venue.take_retry()
             {
-                frame.rcx = frame.rcx.checked_sub(2).unwrap_or_else(|| fatal_boot());
-                frame.rax = venue.original_syscall_number();
+                restart_native_syscall(
+                    frame,
+                    carrick_guest_arch::NativeOrdinal::new(venue.original_syscall_number()),
+                );
             }
             // Staged ahead of the crossing table by the dispatch owner, so a
             // call the strict x86 set refuses (writev) still reaches the
@@ -1392,7 +1452,7 @@ impl Personality for LinuxPersonality {
             if route == CompletionRoute::Forward
                 && let Some(stage) = staged
             {
-                use carrick_el1_linux::native_process_runtime::{NativeResume, NativeServiceCall};
+                use carrick_el1_linux::native_process_runtime::NativeServiceCall;
                 // SAFETY: the admitted CPU binding retains the initialized counter
                 // region for the entire native service continuation.
                 let counters: &'static Counters =
@@ -1432,7 +1492,7 @@ impl Personality for LinuxPersonality {
                         map,
                         chdir,
                     }) => {
-                        match process.begin_host_file_call(
+                        match inline_service(process.begin_host_file_call(
                             record,
                             output,
                             resolves_path,
@@ -1442,10 +1502,13 @@ impl Personality for LinuxPersonality {
                                 carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
                                 counters,
                             ),
-                        ) {
-                            Ok(NativeResume::Left(None)) => None,
-                            Ok(NativeResume::Returned(result)) => Some(result.raw()),
-                            _ => fatal_boot(),
+                        )) {
+                            InlineService::Suspended => None,
+                            InlineService::Returned(result) => Some(result),
+                            InlineService::Restart => {
+                                retry = true;
+                                None
+                            }
                         }
                     }
                     Some(HostFileStage::Returned(result)) => Some(result.raw()),
@@ -1487,10 +1550,10 @@ impl Personality for LinuxPersonality {
                     }
                 };
                 route = if retry {
-                    // Rewind to the `syscall` instruction with the original
-                    // number, exactly as a restarted call re-enters.
-                    frame.rax = call.native.raw();
-                    frame.rcx = frame.rcx.checked_sub(2).unwrap_or_else(|| fatal_boot());
+                    restart_native_syscall(
+                        frame,
+                        carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                    );
                     CompletionRoute::Served
                 } else if crosses {
                     route
