@@ -8,6 +8,11 @@
  * Worker: poll INJECT_BIRTH_HELD; wait4(zombie) must reap it with
  * status 5 << 8 once the fork releases its reservation.
  *
+ * With -DPEER_SCANS_AFTER_MIGRATION (#2306), the other CPU is woken and
+ * its idle scan held until this CPU's migration at the worker's switch-in
+ * has run: that migration finds no idle CPU, and the leader stays queued
+ * here behind the polling worker until the other CPU's scan takes it.
+ *
  * Exit 7: the worker reaped the zombie. 100 + n: the worker's wait4 failed
  * with errno n (111 = EAGAIN); 150 + n and 200 + n: the first or the held
  * fork failed with errno n. Other codes name a failed setup step.
@@ -15,6 +20,8 @@
 #define INJECT_HOLD_NEXT_BIRTH    0xfffffffffffffe1f
 #define INJECT_BIRTH_HELD         0xfffffffffffffe20
 #define INJECT_RELEASE_HELD_BIRTH 0xfffffffffffffe21
+#define INJECT_PEER_SCANS_AFTER_MIGRATION 0xfffffffffffffe2a
+#define INJECT_PEER_SCAN_HELD     0xfffffffffffffe2b
 #define POLL_LIMIT                0x10000000
 
 .global _start
@@ -69,6 +76,24 @@ _start:
     syscall
     test %rax, %rax
     jnz fail_arm
+
+#ifdef PEER_SCANS_AFTER_MIGRATION
+    mov $INJECT_PEER_SCANS_AFTER_MIGRATION, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_arm
+    mov $POLL_LIMIT, %r13
+scan_held_loop:
+    mov $INJECT_PEER_SCAN_HELD, %rax
+    syscall
+    cmp $1, %rax
+    je scan_held
+    dec %r13
+    jz fail_ready
+    pause
+    jmp scan_held_loop
+scan_held:
+#endif
 
     /* Worker thread (CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS|
      * PARENT_SETTID|CHILD_CLEARTID). */
