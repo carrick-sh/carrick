@@ -42,6 +42,23 @@ pub struct NativeHostFileRefusal;
 #[derive(Default)]
 pub struct NativeHostFileServed {
     pub retained_source: Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+    /// The request would block on a host object (#231): no reply was
+    /// written, and the transport answers the requesting member an owner
+    /// wait on its host-readiness queue from this sampled revision
+    /// ([`carrick_core_abi::PortalWaitCause::HostReadiness`]).
+    pub host_ready_wait: Option<u64>,
+}
+
+impl NativeHostFileServed {
+    /// The transport's answer for this served record.
+    pub fn into_reply(self) -> carrick_hal::fork_stock::NativeHostFileReply {
+        match self.host_ready_wait {
+            Some(revision) => {
+                carrick_hal::fork_stock::NativeHostFileReply::HostReadyWait { revision }
+            }
+            None => carrick_hal::fork_stock::NativeHostFileReply::Replied(self.retained_source),
+        }
+    }
 }
 
 fn native_descriptor_exec_source_in(
@@ -199,6 +216,12 @@ impl NativeOpenSink {
     }
 }
 
+/// A native poll's answer: served now, or a host-readiness wait.
+enum NativePoll {
+    Served(Served),
+    Wait(u64),
+}
+
 enum Served {
     Reply(i64, Vec<u8>),
     Source(
@@ -306,6 +329,22 @@ impl SyscallDispatcher {
         self.serve_native_host_file_in(&owner, record, executable)
     }
 
+    /// [`Self::serve_native_host_file`] for an authenticated requesting
+    /// member, `waiter`: a host network call that would block answers an
+    /// owner wait on its host-readiness queue
+    /// ([`NativeHostFileServed::host_ready_wait`]) instead of a refusal.
+    pub fn serve_native_host_file_for(
+        &self,
+        record: &mut [u8],
+        executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
+        waiter: carrick_el1_abi::RecordRef,
+    ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
+        let Some(owner) = self.kernel_binding.read().kernel().existing_ipc() else {
+            return Err(NativeHostFileRefusal);
+        };
+        self.serve_native_host_file_with_authority(&owner, record, None, executable, Some(waiter))
+    }
+
     /// Serve a request whose authenticated member retains host-root resources.
     /// Descriptor allocation still belongs exclusively to the ring namespace.
     pub fn serve_host_root_file(
@@ -332,7 +371,7 @@ impl SyscallDispatcher {
             )
         })
         .unwrap_or_else(|never| match never {});
-        self.serve_native_host_file_with_authority(&owner, record, Some(&resources), None)
+        self.serve_native_host_file_with_authority(&owner, record, Some(&resources), None, None)
     }
 
     /// The transient filesystem authority of one path crossing, built from
@@ -381,7 +420,7 @@ impl SyscallDispatcher {
         record: &mut [u8],
         executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
-        self.serve_native_host_file_with_authority(owner, record, None, executable)
+        self.serve_native_host_file_with_authority(owner, record, None, executable, None)
     }
 
     fn serve_native_host_file_with_authority(
@@ -390,6 +429,7 @@ impl SyscallDispatcher {
         record: &mut [u8],
         host_root: Option<&super::resources::HostRootResourceSnapshot>,
         executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
+        waiter: Option<carrick_el1_abi::RecordRef>,
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
         let view = HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefusal)?;
         let header = view.header();
@@ -451,7 +491,50 @@ impl SyscallDispatcher {
                 .ok_or(NativeHostFileRefusal)?
             }
         } else if header.op == HostFileOp::Poll {
-            self.serve_native_poll(owner, table, header, view.input(), view.output_capacity())
+            match self.serve_native_poll(
+                owner,
+                table,
+                header,
+                view.input(),
+                view.output_capacity(),
+                waiter,
+            ) {
+                NativePoll::Served(served) => served,
+                NativePoll::Wait(revision) => {
+                    return Ok(NativeHostFileServed {
+                        retained_source: None,
+                        host_ready_wait: Some(revision),
+                    });
+                }
+            }
+        } else if header.op == HostFileOp::NetSyscall {
+            match self.serve_native_net_call(owner, table, header, view.input(), waiter) {
+                super::net::native::NetServed::Reply(result, output) => {
+                    Served::Reply(result, output)
+                }
+                super::net::native::NetServed::Wait(revision) => {
+                    return Ok(NativeHostFileServed {
+                        retained_source: None,
+                        host_ready_wait: Some(revision),
+                    });
+                }
+                super::net::native::NetServed::Refused => Served::Refused,
+            }
+        } else if let Some(served) =
+            self.serve_native_socket_record(owner, table, header, &view, waiter)
+        {
+            match served {
+                super::net::native::NetServed::Reply(result, output) => {
+                    Served::Reply(result, output)
+                }
+                super::net::native::NetServed::Wait(revision) => {
+                    return Ok(NativeHostFileServed {
+                        retained_source: None,
+                        host_ready_wait: Some(revision),
+                    });
+                }
+                super::net::native::NetServed::Refused => Served::Refused,
+            }
         } else {
             match owner.with_pinned_host_resource(table, fd::Fd(header.fd), |resource| {
                 match host_root.and_then(|root| self.host_root_projection(root, header, resource)) {
@@ -485,7 +568,45 @@ impl SyscallDispatcher {
         };
         view.reply(result, &output)
             .map_err(|_| NativeHostFileRefusal)?;
-        Ok(NativeHostFileServed { retained_source })
+        Ok(NativeHostFileServed {
+            retained_source,
+            host_ready_wait: None,
+        })
+    }
+
+    /// A `read`, `write` or `fstat` record whose descriptor is a native host
+    /// network socket: the socket's own call (#231). `None` for any other
+    /// record or descriptor, which keeps its file route.
+    fn serve_native_socket_record(
+        &self,
+        owner: &Arc<HostIpc>,
+        table: fd::TableId,
+        header: HostFileHeader,
+        view: &HostFileRequestView<'_>,
+        waiter: Option<carrick_el1_abi::RecordRef>,
+    ) -> Option<super::net::native::NetServed> {
+        if !matches!(
+            header.op,
+            HostFileOp::Read | HostFileOp::Write | HostFileOp::Fstat
+        ) {
+            return None;
+        }
+        owner
+            .with_pinned_host_description(table, fd::Fd(header.fd), |resource, flags| {
+                let socket = resource.downcast_ref::<super::net::native::NativeNetFile>()?;
+                self.serve_native_socket_file_op(
+                    owner,
+                    table,
+                    header,
+                    socket,
+                    flags.nonblock,
+                    view.input(),
+                    view.output_capacity(),
+                    waiter,
+                )
+            })
+            .ok()
+            .flatten()
     }
 
     /// The run root's own host-table description behind a projected ring
@@ -564,17 +685,22 @@ impl SyscallDispatcher {
         }
     }
 
-    /// A non-blocking readiness snapshot of a native `ppoll` set
-    /// ([`HostFileOp::Poll`]). Each live entry is pinned in the caller's
-    /// table now, as Linux resolves each descriptor during the scan, and
-    /// observed through the same readiness the dispatcher reports for that
-    /// resource to a host-served task (implicit stdio streams and venue-opened
-    /// descriptions). An absent descriptor is `POLLNVAL`. An in-zone member,
-    /// a contended table or a resource this venue does not observe refuses
-    /// the whole set: a partial answer would misreport its ready count. The
-    /// carrier never waits: an empty snapshot for a caller that would wait
-    /// is refused, so the ring never reports a fake timeout (#1051 owns the
-    /// blocking wait).
+    /// A readiness snapshot of a native `ppoll` set ([`HostFileOp::Poll`]).
+    /// Each live entry is pinned in the caller's table now, as Linux resolves
+    /// each descriptor during the scan, and observed through the same
+    /// readiness the dispatcher reports for that resource to a host-served
+    /// task (implicit stdio streams, venue-opened descriptions and host
+    /// network sockets). An absent descriptor is `POLLNVAL`. An in-zone
+    /// member, a contended table or a resource this venue does not observe
+    /// refuses the whole set: a partial answer would misreport its ready
+    /// count.
+    ///
+    /// An empty snapshot for a caller that would wait waits on `waiter`'s
+    /// host-readiness queue (#231), sampled before the scan, for the set's
+    /// host objects, or until the call's deadline, fixed by its first empty
+    /// snapshot; at the deadline the answer is 0, as Linux times out. With
+    /// no waiter, or a member the watch cannot observe, the set is refused,
+    /// never answered with a fake timeout.
     ///
     /// Divergence from Linux: a zero-timeout scan that finds nothing ready
     /// while an unblocked signal is pending returns 0 here, where Linux
@@ -588,19 +714,26 @@ impl SyscallDispatcher {
         header: HostFileHeader,
         input: &[u8],
         capacity: usize,
-    ) -> Served {
+        waiter: Option<carrick_el1_abi::RecordRef>,
+    ) -> NativePoll {
         use carrick_core_abi::host_file::{POLLFD_BYTES, PollWait};
         let may_wait = match PollWait::from_raw(header.args[0]) {
             Some(PollWait::Snapshot) => false,
             Some(PollWait::MayWait) => true,
-            None => return Served::Refused,
+            None => return NativePoll::Served(Served::Refused),
         };
         if input.is_empty() || !input.len().is_multiple_of(POLLFD_BYTES) || capacity != input.len()
         {
-            return Served::Refused;
+            return NativePoll::Served(Served::Refused);
         }
+        // Sample before the scan: a readiness notification after this point
+        // reruns the member's park at once.
+        let revision = waiter
+            .filter(|_| may_wait)
+            .and_then(|record| owner.host_ready_revision(record));
         let mut output = input.to_vec();
         let mut ready = 0i64;
+        let mut interests = Vec::new();
         for entry in output.chunks_exact_mut(POLLFD_BYTES) {
             let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             let events = i16::from_le_bytes([entry[4], entry[5]]);
@@ -608,7 +741,11 @@ impl SyscallDispatcher {
                 0
             } else {
                 match owner.with_pinned_host_resource(table, fd::Fd(fd), |resource| {
-                    self.native_resource_poll_events(resource, events)
+                    let revents = self.native_resource_poll_events(resource, events)?;
+                    if revents == 0 && revision.is_some() {
+                        interests.push(self.native_resource_poll_interest(resource, events)?);
+                    }
+                    Some(revents)
                 }) {
                     Ok(Some(revents)) => {
                         revents
@@ -621,17 +758,80 @@ impl SyscallDispatcher {
                     Ok(None)
                     | Err(PinnedHostResourceError::InZone | PinnedHostResourceError::Unavailable) =>
                     {
-                        return Served::Refused;
+                        return NativePoll::Served(Served::Refused);
                     }
                 }
             };
             entry[6..8].copy_from_slice(&revents.to_le_bytes());
             ready += i64::from(revents != 0);
         }
-        if ready == 0 && may_wait {
-            return Served::Refused;
+        if ready != 0 || !may_wait {
+            if let Some(record) = waiter {
+                owner.poll_deadlines().clear(record);
+            }
+            return NativePoll::Served(Served::Reply(ready, output));
         }
-        Served::Reply(ready, output)
+        let (Some(record), Some(revision)) = (waiter, revision) else {
+            return NativePoll::Served(Served::Refused);
+        };
+        let timeout_ms = header.args[1] as i64;
+        let deadline = (timeout_ms >= 0).then(|| {
+            let fingerprint = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                input.hash(&mut hasher);
+                timeout_ms.hash(&mut hasher);
+                hasher.finish()
+            };
+            owner.poll_deadlines().deadline(
+                record,
+                fingerprint,
+                std::time::Duration::from_millis(timeout_ms as u64),
+            )
+        });
+        if deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
+            // The call's own deadline passed with nothing ready: Linux's
+            // timeout, with no revents.
+            owner.poll_deadlines().clear(record);
+            return NativePoll::Served(Served::Reply(0, output));
+        }
+        let interests: Vec<_> = interests
+            .iter()
+            .map(
+                |(source, fd, events)| crate::host_readiness::HostReadinessInterest {
+                    source: *source,
+                    fd: std::os::fd::AsFd::as_fd(fd),
+                    events: *events,
+                },
+            )
+            .collect();
+        if owner.watch_host_ready(record, &interests, deadline) {
+            NativePoll::Wait(revision)
+        } else {
+            NativePoll::Served(Served::Refused)
+        }
+    }
+
+    /// The host descriptor a native poll waits on for one resource it found
+    /// not ready: its own duplicate, so the descriptor outlives the pin.
+    /// `None` for a resource whose readiness the watch cannot observe.
+    fn native_resource_poll_interest(
+        &self,
+        resource: &HostResource,
+        events: i16,
+    ) -> Option<(
+        crate::host_readiness::HostReadinessSource,
+        std::os::fd::OwnedFd,
+        i16,
+    )> {
+        use std::os::fd::BorrowedFd;
+        let socket = resource.downcast_ref::<super::net::native::NativeNetFile>()?;
+        let host = super::net::NetView::description_host_fd_for_poll(&socket.description())?;
+        // SAFETY: the pinned description retains its host fd for this scan.
+        let fd = unsafe { BorrowedFd::borrow_raw(host.get()) }
+            .try_clone_to_owned()
+            .ok()?;
+        Some((socket.source(), fd, super::net::host_poll_interest(events)))
     }
 
     /// Linux poll readiness of one pinned host resource, or `None` for a
@@ -642,6 +842,9 @@ impl SyscallDispatcher {
         }
         if let Some(file) = resource.downcast_ref::<NativeOpenFile>() {
             return Some(self.description_poll_ready_events(&file.description, events));
+        }
+        if let Some(socket) = resource.downcast_ref::<super::net::native::NativeNetFile>() {
+            return Some(self.description_poll_ready_events(&socket.description(), events));
         }
         None
     }
@@ -804,7 +1007,8 @@ impl SyscallDispatcher {
             | HostFileOp::Fchmod
             | HostFileOp::Fchown
             | HostFileOp::Fchmodat
-            | HostFileOp::Fchownat => Served::Refused,
+            | HostFileOp::Fchownat
+            | HostFileOp::NetSyscall => Served::Refused,
         }
     }
 

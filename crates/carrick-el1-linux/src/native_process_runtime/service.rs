@@ -259,6 +259,13 @@ pub(super) struct PendingService<'a> {
 impl PendingService<'_> {
     /// A caught signal interrupts a guest wait, not an internal obligation
     /// that must finish before its committed context can return to user code.
+    /// The service parked on its member's host-readiness queue (#231): no
+    /// reply exists, and the call reruns or reports its interruption.
+    fn waited_on_host_readiness(&self) -> bool {
+        self.wait
+            .is_some_and(|wait| wait.cause() == carrick_core_abi::PortalWaitCause::HostReadiness)
+    }
+
     fn signal_interruptible(&self) -> bool {
         self.clock_sample.is_none()
             && self.copyout.is_none()
@@ -2488,17 +2495,44 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.service_phase = NativeServicePhase::Park;
         use carrick_sched_core::object_wait::ObjectWaitError;
         let zone = self.source.zone;
-        let enrollment = carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
-            zone,
-            request.identity.birth.mm,
-            wait,
-        )
-        .map_err(|_| NativeProcessError::Stale)?;
+        // A host-readiness wait (#231) parks on the member's own queue, which
+        // its carrier sampled before the probe; every other cause is an MM
+        // resource's.
+        let enrollment = if wait.cause() == carrick_core_abi::PortalWaitCause::HostReadiness {
+            if wait.handle() != request.identity.birth.mm {
+                return Err(NativeProcessError::Stale);
+            }
+            None
+        } else {
+            Some(
+                carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
+                    zone,
+                    request.identity.birth.mm,
+                    wait,
+                )
+                .map_err(|_| NativeProcessError::Stale)?,
+            )
+        };
         let operation = self.take_preparation_operation(request)?;
+        let park = match &enrollment {
+            Some(enrollment) => enrollment.owner_request(operation),
+            None => match carrick_core_abi::wait::ObjectParkRequest::host_readiness_owner(
+                self.record,
+                wait,
+                operation,
+                None,
+            ) {
+                Ok(park) => park,
+                Err(operation) => {
+                    self.restore_preparation_operation(operation)?;
+                    return Err(NativeProcessError::Stale);
+                }
+            },
+        };
         let parked = carrick_core::wait::park_object_record(
             zone,
             self.source.slot,
-            enrollment.owner_request(operation),
+            park,
             &|owned| {
                 crate::sched::object_wait::deliver_completion(zone, self.source.slot, owned);
             },
@@ -2532,7 +2566,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .cancel(request.identity)
                         .map_err(|_| ObjectWaitError::Stale)?;
                 }
-                if !enrollment.is_live()
+                if !enrollment
+                    .as_ref()
+                    .is_none_or(|enrollment| enrollment.is_live())
                     || self
                         .control
                         .service
@@ -3831,6 +3867,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             &mut copy_out,
                         ),
                     ))
+                }
+                (ServiceOperation::HostFile { .. }, ServiceResult::Supplied)
+                    if pending.waited_on_host_readiness() =>
+                {
+                    // The host object the call would have blocked on became
+                    // ready (#231): rerun the exact call, which probes once.
+                    Ok(NativeResume::RetrySyscall)
+                }
+                (ServiceOperation::HostFile { .. }, ServiceResult::Cancelled)
+                    if pending.waited_on_host_readiness() =>
+                {
+                    // A signal interrupted the wait before any effect: Linux's
+                    // blocking socket call reports EINTR (restarted under
+                    // SA_RESTART by the shared return policy).
+                    Ok(NativeResume::Returned(SyscallResult::from_errno(
+                        carrick_syscall_abi::LINUX_EINTR,
+                    )))
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Supplied) => {
                     // Supplied without a reply is a transport violation.

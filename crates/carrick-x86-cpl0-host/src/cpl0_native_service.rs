@@ -388,7 +388,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         lease: &StoppedCpuLease<'_, I>,
         pending: PendingNativeHostFile,
         served: Result<
-            Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+            carrick_hal::fork_stock::NativeHostFileReply,
             carrick_hal::fork_stock::NativeHostFileRefused,
         >,
     ) -> Result<(), TrapError> {
@@ -401,8 +401,15 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             pending.record.len(),
             1,
         )?;
+        let owner_wait = served
+            .as_ref()
+            .ok()
+            .and_then(|reply| reply.owner_wait(pending.ticket.request().identity.birth.mm));
         match &served {
-            Ok(None) => {
+            // No reply was written: the member waits on its host-readiness
+            // queue and reruns the call.
+            Ok(carrick_hal::fork_stock::NativeHostFileReply::HostReadyWait { .. }) => {}
+            Ok(carrick_hal::fork_stock::NativeHostFileReply::Replied(None)) => {
                 let physical = kernel_pod_physical(
                     &self.kernel_pod_storage,
                     pending.address,
@@ -414,7 +421,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     .write(physical, &pending.record)
                     .map_err(|error| fail(error.to_string()))?;
             }
-            Ok(Some(_)) => return Err(fail("unexpected native host file source")),
+            Ok(carrick_hal::fork_stock::NativeHostFileReply::Replied(Some(_))) => {
+                return Err(fail("unexpected native host file source"));
+            }
             Err(_) => {
                 let pointer = self.native_service_pointer(
                     pending.execution.context,
@@ -451,10 +460,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let _queue = zone
             .object_wait(pending.key, &carrick_sched_core::ShortLockSpin, &completion)
             .map_err(|_| fail("native host file acknowledgment queue"))?;
-        pending
-            .ticket
-            .complete(served.is_ok())
-            .map_err(|_| fail("native host file acknowledgment"))?;
+        match owner_wait {
+            Some(wait) => pending
+                .ticket
+                .complete_wait(wait)
+                .map_err(|_| fail("native host file wait acknowledgment"))?,
+            None => pending
+                .ticket
+                .complete(served.is_ok())
+                .map_err(|_| fail("native host file acknowledgment"))?,
+        }
         Ok(())
     }
 }

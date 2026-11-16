@@ -55,7 +55,10 @@ pub enum HostFileOp {
     /// entry); the reply is that array with `revents` filled and the ready
     /// count as the result. `args[0]` is a [`PollWait`] word: for
     /// [`PollWait::Snapshot`] (a zero timeout) the empty snapshot is the
-    /// answer; for [`PollWait::MayWait`] the carrier, which never blocks,
+    /// answer; for [`PollWait::MayWait`] the caller waits on its
+    /// host-readiness queue for the set's host objects, or until `args[1]`
+    /// milliseconds (as `i64`; negative: no timeout) after its first empty
+    /// snapshot, when the answer is 0 (#231). A carrier that cannot wait
     /// refuses an empty snapshot (counted ENOSYS) and writes no `revents`.
     /// The header `fd` is unused (`-1`); each entry is pinned in the
     /// caller's table.
@@ -104,6 +107,196 @@ pub enum HostFileOp {
     /// `fchownat` of the staged path (`args[0]` owner, `args[1]` group as
     /// for [`HostFileOp::Fchown`]; `flags` may carry `AT_SYMLINK_NOFOLLOW`).
     Fchownat = 27,
+    /// One call of the host network socket family (#231), served by the
+    /// carrier's one socket implementation on the caller's own descriptors.
+    /// The input is a [`NetCall`]: the canonical syscall, its arguments and
+    /// the user memory the ring staged for it; the output is the staged
+    /// output segments' written extents ([`NetCall::encode_written`]). The
+    /// header `fd` is the descriptor argument (`-1` for `socket`).
+    NetSyscall = 28,
+}
+
+/// A staged user-memory range of a [`HostFileOp::NetSyscall`] record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetSegment {
+    pub address: u64,
+    pub len: u32,
+    /// The call reads the range: its bytes are staged in the record.
+    pub input: bool,
+    /// The call may write the range: the reply carries its written extent.
+    pub output: bool,
+}
+
+/// Largest staged bytes of one segment.
+pub const NET_SEGMENT_MAX_BYTES: usize = HOST_FILE_CHUNK_BYTES;
+/// Most segments one call stages.
+pub const NET_SEGMENTS_MAX: usize = 4;
+const NET_CALL_FIXED_BYTES: usize = 8 + 6 * 8 + 4;
+const NET_SEGMENT_BYTES: usize = 16;
+const NET_SEGMENT_INPUT: u32 = 1;
+const NET_SEGMENT_OUTPUT: u32 = 2;
+
+/// A [`HostFileOp::NetSyscall`] request: the canonical syscall number, its
+/// six argument words, and the user ranges it may touch. The ring stages
+/// exactly the ranges Linux's call reads or writes; any other user access
+/// faults as Linux's would.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetCall<'a> {
+    pub canonical: u64,
+    pub args: [u64; 6],
+    segments: alloc::vec::Vec<NetSegment>,
+    bytes: &'a [u8],
+}
+
+impl<'a> NetCall<'a> {
+    /// Encode a request input. `inputs` holds each input segment's staged
+    /// bytes, in segment order.
+    pub fn encode(
+        canonical: u64,
+        args: [u64; 6],
+        segments: &[NetSegment],
+        inputs: &[&[u8]],
+    ) -> Option<alloc::vec::Vec<u8>> {
+        if segments.len() > NET_SEGMENTS_MAX {
+            return None;
+        }
+        let mut out = alloc::vec::Vec::new();
+        out.extend_from_slice(&canonical.to_le_bytes());
+        for arg in args {
+            out.extend_from_slice(&arg.to_le_bytes());
+        }
+        out.extend_from_slice(&(segments.len() as u32).to_le_bytes());
+        let mut staged = inputs.iter();
+        let mut payload = alloc::vec::Vec::new();
+        for segment in segments {
+            if segment.len as usize > NET_SEGMENT_MAX_BYTES {
+                return None;
+            }
+            out.extend_from_slice(&segment.address.to_le_bytes());
+            out.extend_from_slice(&segment.len.to_le_bytes());
+            let flags = (u32::from(segment.input) * NET_SEGMENT_INPUT)
+                | (u32::from(segment.output) * NET_SEGMENT_OUTPUT);
+            out.extend_from_slice(&flags.to_le_bytes());
+            if segment.input {
+                let bytes = staged.next()?;
+                if bytes.len() != segment.len as usize {
+                    return None;
+                }
+                payload.extend_from_slice(bytes);
+            }
+        }
+        if staged.next().is_some() {
+            return None;
+        }
+        out.extend_from_slice(&payload);
+        Some(out)
+    }
+
+    pub fn decode(input: &'a [u8]) -> Option<Self> {
+        let canonical = read_u64(input, 0)?;
+        let mut args = [0u64; 6];
+        for (index, arg) in args.iter_mut().enumerate() {
+            *arg = read_u64(input, 8 + index * 8)?;
+        }
+        let count = read_u32(input, 56)? as usize;
+        if count > NET_SEGMENTS_MAX {
+            return None;
+        }
+        let mut segments = alloc::vec::Vec::with_capacity(count);
+        let mut staged = 0usize;
+        for index in 0..count {
+            let at = NET_CALL_FIXED_BYTES + index * NET_SEGMENT_BYTES;
+            let flags = read_u32(input, at + 12)?;
+            if flags & !(NET_SEGMENT_INPUT | NET_SEGMENT_OUTPUT) != 0 {
+                return None;
+            }
+            let segment = NetSegment {
+                address: read_u64(input, at)?,
+                len: read_u32(input, at + 8)?,
+                input: flags & NET_SEGMENT_INPUT != 0,
+                output: flags & NET_SEGMENT_OUTPUT != 0,
+            };
+            if segment.len as usize > NET_SEGMENT_MAX_BYTES {
+                return None;
+            }
+            if segment.input {
+                staged = staged.checked_add(segment.len as usize)?;
+            }
+            segments.push(segment);
+        }
+        let start = NET_CALL_FIXED_BYTES + count * NET_SEGMENT_BYTES;
+        let bytes = input.get(start..)?;
+        if bytes.len() != staged {
+            return None;
+        }
+        Some(Self {
+            canonical,
+            args,
+            segments,
+            bytes,
+        })
+    }
+
+    pub fn segments(&self) -> &[NetSegment] {
+        &self.segments
+    }
+
+    /// Each segment with its staged bytes (`None` for an output-only one).
+    pub fn staged(&self) -> impl Iterator<Item = (NetSegment, Option<&'a [u8]>)> + '_ {
+        let mut cursor = 0usize;
+        self.segments.iter().map(move |segment| {
+            if segment.input {
+                let bytes = &self.bytes[cursor..cursor + segment.len as usize];
+                cursor += segment.len as usize;
+                (*segment, Some(bytes))
+            } else {
+                (*segment, None)
+            }
+        })
+    }
+
+    /// The reply area a request with `segments` needs.
+    pub fn output_capacity(segments: &[NetSegment]) -> usize {
+        segments
+            .iter()
+            .filter(|segment| segment.output)
+            .map(|segment| 8 + segment.len as usize)
+            .sum()
+    }
+
+    /// Encode the written extent `[start, end)` of each output segment, in
+    /// segment order, as the reply output.
+    pub fn encode_written(extents: &[(u32, &[u8])]) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec::Vec::new();
+        for (start, bytes) in extents {
+            out.extend_from_slice(&start.to_le_bytes());
+            out.extend_from_slice(&(*start + bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        out
+    }
+
+    /// Decode a reply output against the request's segments: each output
+    /// segment's written `(address, bytes)`, in segment order. `None` for a
+    /// reply that writes outside its segment.
+    pub fn decode_written<'r>(
+        segments: &[NetSegment],
+        reply: &'r [u8],
+    ) -> Option<alloc::vec::Vec<(u64, &'r [u8])>> {
+        let mut out = alloc::vec::Vec::new();
+        let mut cursor = 0usize;
+        for segment in segments.iter().filter(|segment| segment.output) {
+            let start = read_u32(reply, cursor)?;
+            let end = read_u32(reply, cursor + 4)?;
+            if start > end || end > segment.len {
+                return None;
+            }
+            let bytes = reply.get(cursor + 8..cursor + 8 + (end - start) as usize)?;
+            cursor += 8 + bytes.len();
+            out.push((segment.address.checked_add(u64::from(start))?, bytes));
+        }
+        (cursor == reply.len()).then_some(out)
+    }
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -236,6 +429,7 @@ impl HostFileOp {
             25 => Self::Fchown,
             26 => Self::Fchmodat,
             27 => Self::Fchownat,
+            28 => Self::NetSyscall,
             _ => return None,
         })
     }
@@ -488,6 +682,20 @@ pub fn reply(bytes: &[u8]) -> Option<HostFileReply<'_>> {
         result,
         output: &bytes[start..start + output_len],
     })
+}
+
+/// The staged input of a record whose reply was written: a reply's
+/// meaning can depend on the request it answers ([`NetCall`]).
+pub fn replied_input(bytes: &[u8]) -> Option<&[u8]> {
+    if read_u32(bytes, 0)? != MAGIC || read_u32(bytes, STATE)? != REPLY_WRITTEN {
+        return None;
+    }
+    let input_len = read_u32(bytes, INPUT_LEN)? as usize;
+    let output_cap = read_u32(bytes, OUTPUT_CAP)? as usize;
+    if record_len(input_len, output_cap)? != bytes.len() {
+        return None;
+    }
+    bytes.get(HOST_FILE_HEADER_BYTES..HOST_FILE_HEADER_BYTES + input_len)
 }
 
 /// The caller's own filesystem access context, carried by value in every
@@ -782,6 +990,53 @@ mod tests {
         );
         // A written record is never served a second time.
         assert!(HostFileRequestView::parse(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn net_call_round_trips_segments_and_written_extents() {
+        let segments = [
+            NetSegment {
+                address: 0x1000,
+                len: 4,
+                input: true,
+                output: true,
+            },
+            NetSegment {
+                address: 0x2000,
+                len: 16,
+                input: false,
+                output: true,
+            },
+            NetSegment {
+                address: 0x3000,
+                len: 2,
+                input: true,
+                output: false,
+            },
+        ];
+        let input =
+            NetCall::encode(207, [3, 4, 5, 6, 7, 8], &segments, &[b"\x10\0\0\0", b"ab"]).unwrap();
+        let call = NetCall::decode(&input).unwrap();
+        assert_eq!((call.canonical, call.args), (207, [3, 4, 5, 6, 7, 8]));
+        assert_eq!(call.segments(), segments);
+        let staged: alloc::vec::Vec<_> = call.staged().map(|(_, bytes)| bytes).collect();
+        assert_eq!(staged, [Some(&b"\x10\0\0\0"[..]), None, Some(&b"ab"[..])]);
+        assert_eq!(NetCall::output_capacity(&segments), 8 + 4 + 8 + 16);
+        // Mismatched staged inputs are refused.
+        assert!(NetCall::encode(207, [0; 6], &segments, &[b"ab"]).is_none());
+        assert!(NetCall::decode(&input[..input.len() - 1]).is_none());
+
+        let reply = NetCall::encode_written(&[(0, b"\x08\0\0\0"), (0, b"12345678")]);
+        assert_eq!(
+            NetCall::decode_written(&segments, &reply).unwrap(),
+            [(0x1000, &b"\x08\0\0\0"[..]), (0x2000, &b"12345678"[..])]
+        );
+        // An extent past its segment, or a trailing byte, is refused.
+        let past = NetCall::encode_written(&[(2, b"123"), (0, b"")]);
+        assert!(NetCall::decode_written(&segments, &past).is_none());
+        let mut trailing = reply.clone();
+        trailing.push(0);
+        assert!(NetCall::decode_written(&segments, &trailing).is_none());
     }
 
     #[test]

@@ -270,10 +270,18 @@ impl NativeService {
         };
         let served = service.serve_host_file(request, record.bytes_mut(), executable);
         match served {
-            Ok(None) => {
+            Ok(reply @ carrick_hal::fork_stock::NativeHostFileReply::HostReadyWait { .. }) => {
+                // No reply was written: the member waits on its own
+                // host-readiness queue and reruns the call (#231).
+                let wait = reply
+                    .owner_wait(request.identity.birth.mm)
+                    .ok_or_else(stale)?;
+                self.finish_exec_ticket(|ticket| ticket.complete_wait(wait).map_err(|_| stale()))
+            }
+            Ok(carrick_hal::fork_stock::NativeHostFileReply::Replied(None)) => {
                 self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()))
             }
-            Ok(Some(source)) => {
+            Ok(carrick_hal::fork_stock::NativeHostFileReply::Replied(Some(source))) => {
                 // The reply names this source: it must be the caller's exact
                 // MM's before the ring can map it, or nothing is supplied.
                 let identity = source.identity();

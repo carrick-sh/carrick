@@ -3909,20 +3909,6 @@ pub const LINUX_IOV_MAX: usize = 1024;
 /// Linux's conventional maximum aggregate argv+env payload for `execve(2)`.
 pub const LINUX_ARG_MAX: usize = 2 * 1024 * 1024;
 pub const LINUX_OPEN_HOW_SIZE: u64 = core::mem::size_of::<LinuxOpenHow>() as u64;
-/// Linux AF_* values for the families we support. Linux constants happen
-/// to overlap with macOS's only for AF_UNSPEC / AF_UNIX / AF_INET — the
-/// AF_INET6 numeric value differs (Linux: 10, macOS: 30).
-pub const LINUX_AF_UNSPEC: i32 = 0;
-pub const LINUX_AF_UNIX: i32 = 1;
-pub const LINUX_AF_INET: i32 = 2;
-pub const LINUX_AF_INET6: i32 = 10;
-pub const LINUX_AF_NETLINK: i32 = 16;
-pub const LINUX_AF_PACKET: i32 = 17;
-pub const LINUX_SOCK_STREAM: i32 = 1;
-pub const LINUX_SOCK_DGRAM: i32 = 2;
-pub const LINUX_SOCK_RAW: i32 = 3;
-pub const LINUX_SOCK_RDM: i32 = 4;
-pub const LINUX_SOCK_SEQPACKET: i32 = 5;
 
 pub const LINUX_CLONE_VM: u64 = 0x0000_0100;
 pub const LINUX_CLONE_FS: u64 = 0x0000_0200;

@@ -1522,6 +1522,7 @@ fn a_decoded_call_the_venue_does_not_admit_keeps_its_crossing_output_stage() {
         assert_eq!(
             admit_or_cross(
                 HostCrossingSet::X86,
+                carrick_guest_arch::NativeOrdinal::new(267),
                 crate::crossing::nr::READLINKAT,
                 &args,
                 origin,
@@ -1536,6 +1537,7 @@ fn a_decoded_call_the_venue_does_not_admit_keeps_its_crossing_output_stage() {
     assert_eq!(
         admit_or_cross(
             HostCrossingSet::X86,
+            carrick_guest_arch::NativeOrdinal::new(267),
             crate::crossing::nr::READLINKAT,
             &args,
             ServiceOrigin::Initial,
@@ -1549,6 +1551,7 @@ fn a_decoded_call_the_venue_does_not_admit_keeps_its_crossing_output_stage() {
     assert!(matches!(
         admit_or_cross(
             HostCrossingSet::X86,
+            carrick_guest_arch::NativeOrdinal::new(257),
             crate::crossing::nr::OPENAT,
             &openat,
             ServiceOrigin::Initial,
