@@ -5082,3 +5082,90 @@ fn serial_host_direct_output_venues_supply_untouched_pages() {
         },
     );
 }
+
+/// Loopback peers for `native_child_inet.S`: a TCP listener that answers
+/// "ping" with "pong" and closes after the client's EOF, and a UDP responder
+/// that answers each datagram with "a". Each serves one exchange on its own
+/// thread; the ports are the fixture's network-order `-D` values.
+struct InetPeers {
+    defines: Vec<String>,
+}
+
+impl InetPeers {
+    fn tcp(listener: std::net::TcpListener) {
+        use std::io::{Read, Write};
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("guest connect");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                .unwrap();
+            let mut ping = [0u8; 4];
+            stream.read_exact(&mut ping).expect("guest ping");
+            assert_eq!(&ping, b"ping");
+            stream.write_all(b"pong").expect("pong");
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).expect("guest shutdown");
+        });
+    }
+
+    fn start() -> Self {
+        let wire = |port: u16| port.swap_bytes().to_string();
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp listener");
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp responder");
+        let mut defines = vec![
+            format!("-DTCP_PORT={}", wire(tcp.local_addr().unwrap().port())),
+            format!("-DUDP_PORT={}", wire(udp.local_addr().unwrap().port())),
+        ];
+        Self::tcp(tcp);
+        std::thread::spawn(move || {
+            let mut query = [0u8; 16];
+            let (_, from) = udp.recv_from(&mut query).expect("guest query");
+            udp.send_to(b"a", from).expect("answer");
+        });
+        // IPv6 loopback when the host has it.
+        if let Ok(tcp6) = std::net::TcpListener::bind("[::1]:0") {
+            defines.push(format!(
+                "-DTCP6_PORT={}",
+                wire(tcp6.local_addr().unwrap().port())
+            ));
+            Self::tcp(tcp6);
+        }
+        Self { defines }
+    }
+}
+
+/// #231: a forked native child's blocking AF_INET/AF_INET6 TCP and UDP
+/// sockets cross to the host network: socket, setsockopt, connect,
+/// getsockopt(SO_ERROR), getpeername, send, recv (MSG_WAITALL), shutdown,
+/// recv EOF and close against a loopback listener, then a DNS-style UDP
+/// sendto/recvfrom/getsockname, then TCP over `::1`. Red on main: the
+/// child's `socket` was a counted ENOSYS (exit 101).
+#[test]
+fn native_child_inet_tcp_and_udp_cross_to_the_host_network() {
+    let peers = InetPeers::start();
+    let defines: Vec<&str> = peers.defines.iter().map(String::as_str).collect();
+    let elf = native_exit_fixture_with_flags("native_child_inet.S", &defines);
+    let outcome = run_exec_fixture(&elf, 256);
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "child inet stage (100 + stage = ENOSYS; see native_child_inet.S): {:?}",
+        outcome.run
+    );
+}
+
+/// #231: the x86 run root's own inet sockets take the same native venue
+/// (its descriptors live in its ring namespace, #1714). Red on main: the
+/// root's `socket` was refused by the x86 crossing set (exit 101).
+#[test]
+fn native_root_inet_tcp_and_udp_cross_to_the_host_network() {
+    let peers = InetPeers::start();
+    let mut defines: Vec<&str> = peers.defines.iter().map(String::as_str).collect();
+    defines.push("-DIN_ROOT");
+    let elf = native_exit_fixture_with_flags("native_child_inet.S", &defines);
+    let outcome = run_exec_fixture(&elf, 256);
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "root inet stage (100 + stage = ENOSYS; see native_child_inet.S): {:?}",
+        outcome.run.exit_code
+    );
+}
