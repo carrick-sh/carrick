@@ -306,22 +306,39 @@ impl<'a> FsView<'a> {
         }
     }
 
+    /// chown(2) permission, under the caller's own credentials: only a
+    /// privileged process (`CAP_CHOWN`, modeled with the other file
+    /// capabilities as fsuid 0, [`Self::dac_identity`]) changes an owner. The
+    /// file's owner may leave the uid as it is (-1, or its own uid again) and
+    /// set the group to one it is in (its fsgid or a supplementary group).
+    /// Any other explicit uid or gid is EPERM; -1 for both changes nothing
+    /// and is never refused. `owner` is the file's (uid, gid) as stat reports
+    /// it; when the backend tracks no owner the caller is taken as the
+    /// owner, as [`Self::chmod_permission_errno`] does, so it still may
+    /// neither give the file away nor pick a foreign group.
     fn chown_permission_errno(
         &self,
+        owner: Option<(carrick_abi::NsUid, carrick_abi::NsGid)>,
         uid: Option<carrick_abi::NsUid>,
         gid: Option<carrick_abi::NsGid>,
     ) -> Option<LinuxErrno> {
-        let creds = self.cred_snapshot();
-        if creds.euid.is_root() {
+        if uid.is_none() && gid.is_none() {
             return None;
         }
-        if uid.is_some() {
-            return Some(LINUX_EPERM);
+        let creds = self.cred_snapshot();
+        if creds.fsuid.is_root() {
+            return None;
         }
-        if gid.is_some_and(|gid| gid != creds.egid) {
-            return Some(LINUX_EPERM);
-        }
-        None
+        let (owner_uid, owner_gid) = match owner {
+            Some((owner_uid, owner_gid)) => (owner_uid, Some(owner_gid)),
+            None => (creds.fsuid, None),
+        };
+        let permitted = owner_uid == creds.fsuid
+            && uid.is_none_or(|uid| uid == owner_uid)
+            && gid.is_none_or(|gid| {
+                Some(gid) == owner_gid || gid == creds.fsgid || self.current_groups().contains(&gid)
+            });
+        (!permitted).then_some(LINUX_EPERM)
     }
 
     /// chmod(2)/fchmod(2) permission: only the file owner or a process with
@@ -389,10 +406,21 @@ impl<'a> FsView<'a> {
             if self.mutation_path_needs_task(context, &path) {
                 return DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS);
             }
-            if let Some(errno) = self.chown_permission_errno(uid, gid) {
+            let mount = self.fs.vfs_mounts.resolve(&path);
+            let owner = match (&mount, raw_host_fd) {
+                (Some(m), _) => m.vfs.lookup(&m.full_path).ok().map(|md| {
+                    (
+                        carrick_abi::NsUid::new(md.uid),
+                        carrick_abi::NsGid::new(md.gid),
+                    )
+                }),
+                (None, Some(raw_fd)) => Some(self.fs.rootfs_vfs.fget_owner(raw_fd)),
+                (None, None) => self.fs.rootfs_vfs.overlay.get_owner(&path),
+            };
+            if let Some(errno) = self.chown_permission_errno(owner, uid, gid) {
                 return DispatchOutcome::errno(errno);
             }
-            if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
+            if let Some(m) = mount {
                 if let Err(errno) = m.vfs.chown(&m.full_path, uid, gid, false) {
                     return DispatchOutcome::errno(errno);
                 }
@@ -507,10 +535,14 @@ impl<'a> FsView<'a> {
             } else {
                 m.vfs.lookup(&m.full_path)
             };
-            if let Err(errno) = lookup {
-                return Ok(DispatchOutcome::errno(errno));
-            }
-            if let Some(errno) = self.chown_permission_errno(uid, gid) {
+            let owner = match lookup {
+                Ok(metadata) => (
+                    carrick_abi::NsUid::new(metadata.uid),
+                    carrick_abi::NsGid::new(metadata.gid),
+                ),
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            if let Some(errno) = self.chown_permission_errno(Some(owner), uid, gid) {
                 return Ok(DispatchOutcome::errno(errno));
             }
             return match m.vfs.chown(&m.full_path, uid, gid, nofollow) {
@@ -532,15 +564,16 @@ impl<'a> FsView<'a> {
         };
         match lookup {
             Ok(()) => {
-                if let Some(errno) = self.chown_permission_errno(uid, gid) {
-                    return Ok(DispatchOutcome::errno(errno));
-                }
                 let target_path = if nofollow {
                     resolved.clone()
                 } else {
                     self.canonicalize_following(&resolved)
                         .unwrap_or_else(|_| resolved.clone())
                 };
+                let owner = self.fs.rootfs_vfs.overlay.get_owner(&target_path);
+                if let Some(errno) = self.chown_permission_errno(owner, uid, gid) {
+                    return Ok(DispatchOutcome::errno(errno));
+                }
                 let _ = self.fs.rootfs_vfs.set_owner(&target_path, uid, gid);
                 self.clear_setid_on_chown(&target_path);
                 Ok(DispatchOutcome::Returned { value: 0 })
