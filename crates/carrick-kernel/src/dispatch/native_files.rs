@@ -1982,6 +1982,124 @@ mod tests {
         );
     }
 
+    /// #2414, director ruling Q3: `read(2)`, `write(2)` and `fstat(2)` of a
+    /// native socket reach the carrier as Read/Write/Fstat records, which
+    /// carry no caller. Their handlers run under an identity that is never
+    /// root and holds no capability, even though the run root they borrow
+    /// resources from is root with every capability: each identity read in
+    /// the handler's scope answers the overflow ids, pid 0 and an empty
+    /// capability set.
+    #[test]
+    fn a_native_socket_read_write_and_fstat_run_as_no_one_never_the_root() {
+        let fixture = fixture();
+        let root = fixture.dispatcher.capture_one_task_context().unwrap();
+        assert_eq!(fixture.dispatcher.cred_snapshot().euid.raw(), 0);
+        assert_ne!(root.task().caps().effective & (1 << 13), 0);
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let port = peer.local_addr().unwrap().port();
+        let stamped = |fd: i32, call: Vec<u8>| {
+            let mut input = host_file::NetCaller {
+                task: root.task().key(),
+                ns_pid: std::num::NonZeroU32::new(7).unwrap(),
+                ids: host_file::AccessIds {
+                    ruid: 1000,
+                    euid: 1000,
+                    suid: 1000,
+                    fsuid: 1000,
+                    rgid: 1000,
+                    egid: 1000,
+                    sgid: 1000,
+                    fsgid: 1000,
+                },
+                cap_effective: 0,
+            }
+            .encode()
+            .to_vec();
+            input.extend_from_slice(&call);
+            let segments = host_file::NetCall::decode(&call).unwrap();
+            let output = host_file::NetCall::output_capacity(segments.segments());
+            record(
+                fixture.table,
+                HostFileOp::NetSyscall,
+                fd,
+                [0; 4],
+                &input,
+                output,
+            )
+        };
+        let socket = host_file::NetCall::encode(
+            carrick_abi::syscall::nr::SOCKET.raw(),
+            [2, 2, 0, 0, 0, 0],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (fd, _) = fixture.result(None, stamped(-1, socket));
+        assert!(fd >= 0, "a UDP socket: {fd}");
+        let mut address = [0u8; 16];
+        address[..2].copy_from_slice(&2u16.to_le_bytes());
+        address[2..4].copy_from_slice(&port.to_be_bytes());
+        address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        let connect = host_file::NetCall::encode(
+            carrick_abi::syscall::nr::CONNECT.raw(),
+            [fd as u64, 0x20_0000, 16, 0, 0, 0],
+            &[host_file::NetSegment {
+                address: 0x20_0000,
+                len: 16,
+                input: true,
+                output: false,
+            }],
+            &[&address],
+        )
+        .unwrap();
+        assert_eq!(fixture.result(None, stamped(fd as i32, connect)).0, 0);
+        let stamped_calls = super::super::net::native::observed_caller::take();
+        assert!(
+            !stamped_calls.is_empty() && stamped_calls.iter().all(|seen| seen.euid == 1000),
+            "the stamped calls ran as their caller: {stamped_calls:?}"
+        );
+
+        let fd = fd as i32;
+        let write = record(fixture.table, HostFileOp::Write, fd, [0; 4], b"ping", 0);
+        assert_eq!(fixture.result(None, write).0, 4);
+        let mut datagram = [0u8; 16];
+        let (len, from) = peer.recv_from(&mut datagram).unwrap();
+        assert_eq!(&datagram[..len], b"ping");
+        peer.send_to(b"pong", from).unwrap();
+        let read = record(fixture.table, HostFileOp::Read, fd, [0; 4], &[], 16);
+        assert_eq!(fixture.result(None, read), (4, b"pong".to_vec()));
+        let fstat = record(
+            fixture.table,
+            HostFileOp::Fstat,
+            fd,
+            [0; 4],
+            &[],
+            carrick_personality_linux::native_host_file::LINUX_STAT_BYTES,
+        );
+        assert_eq!(fixture.result(None, fstat).0, 0);
+
+        const OVERFLOW: u32 = 65_534;
+        let no_one = super::super::net::native::observed_caller::Seen {
+            pid: 0,
+            ruid: OVERFLOW,
+            euid: OVERFLOW,
+            suid: OVERFLOW,
+            fsuid: OVERFLOW,
+            egid: OVERFLOW,
+            capabilities: 0,
+        };
+        assert_eq!(
+            super::super::net::native::observed_caller::take(),
+            [no_one; 3],
+            "write, read and fstat each ran as no one, never the root"
+        );
+        // Outside the calls the run root is still root with its capabilities.
+        assert_eq!(fixture.dispatcher.cred_snapshot().euid.raw(), 0);
+        assert!(super::super::creds::has_effective_capability(&root, 13));
+    }
+
     /// #231: inside a native member's network call every identity read
     /// answers the member's stamped caller, never the borrowed root
     /// context's, including scopes nested in the call.

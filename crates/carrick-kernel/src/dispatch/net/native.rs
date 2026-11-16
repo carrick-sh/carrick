@@ -188,6 +188,56 @@ impl NativeNetCaller {
     }
 }
 
+/// What each native network handler's scope answers for its caller's
+/// identity, recorded on the serving thread as the handler starts: a
+/// witness reads what the production scope answers, not a constructor.
+#[cfg(test)]
+pub(in crate::dispatch) mod observed_caller {
+    use std::cell::RefCell;
+
+    /// The identity reads one handler's scope answered.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::dispatch) struct Seen {
+        pub(in crate::dispatch) pid: u32,
+        pub(in crate::dispatch) ruid: u32,
+        pub(in crate::dispatch) euid: u32,
+        pub(in crate::dispatch) suid: u32,
+        pub(in crate::dispatch) fsuid: u32,
+        pub(in crate::dispatch) egid: u32,
+        /// The capabilities `has_effective_capability` grants, as a mask.
+        pub(in crate::dispatch) capabilities: u64,
+    }
+
+    thread_local! {
+        static SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(
+        dispatcher: &crate::dispatch::SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+    ) {
+        let credentials = dispatcher.cred_snapshot();
+        let capabilities = (0..64)
+            .filter(|&cap| crate::dispatch::creds::has_effective_capability(context, cap))
+            .fold(0_u64, |mask, cap| mask | 1 << cap);
+        let seen = Seen {
+            pid: dispatcher.identity_pid(),
+            ruid: credentials.ruid.raw(),
+            euid: credentials.euid.raw(),
+            suid: credentials.suid.raw(),
+            fsuid: credentials.fsuid.raw(),
+            egid: credentials.egid.raw(),
+            capabilities,
+        };
+        SEEN.with(|seen_list| seen_list.borrow_mut().push(seen));
+    }
+
+    /// The scopes this thread's handlers answered since the last take.
+    pub(in crate::dispatch) fn take() -> Vec<Seen> {
+        SEEN.with(|seen| std::mem::take(&mut *seen.borrow_mut()))
+    }
+}
+
 /// Staged user memory of one call: exactly the ranges the ring staged.
 /// Any other access faults, as the caller's own memory would for a range
 /// Linux's call does not touch. Writes record each range's written extent.
@@ -681,7 +731,11 @@ impl SyscallDispatcher {
             context,
             Arc::clone(scratch),
             Arc::clone(caller),
-            || handler(self, &mut cx),
+            || {
+                #[cfg(test)]
+                observed_caller::record(self, context);
+                handler(self, &mut cx)
+            },
         ) {
             Ok(outcome) => Ran::Outcome(outcome),
             Err(_) => Ran::Refused,
