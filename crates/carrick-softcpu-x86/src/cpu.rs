@@ -814,7 +814,7 @@ impl SoftCpu {
                 match op {
                     SensitiveOp::Icebp => {
                         self.ctx.icebp_trap = true;
-                        self.ctx.dr[6] = (self.ctx.dr[6] & !0xf) | (1 << 14) | 0xffff_0ff0;
+                        // SDM Vol. 3B §17.3.1: INT1 does not modify DR6.
                         self.ctx.dr[7] &= !(1 << 13);
                         self.ctx.rflags &= !(1 << 16);
                         self.raise(X86Exception::debug(resume))

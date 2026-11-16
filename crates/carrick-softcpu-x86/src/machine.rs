@@ -243,7 +243,7 @@ fn deliver_external_interrupt<M: SoftMmuMemory>(
     vector: u8,
 ) -> Option<SoftMachineExit> {
     let rip = ctx.rip;
-    match deliver_idt_vector(ctx, mem, vector, rip, rip, None, false, true) {
+    match deliver_idt_vector(ctx, mem, vector, rip, rip, None, false, true, false) {
         Ok(()) => None,
         Err(fault) => deliver_exception_with_escalation(ctx, mem, fault),
     }
@@ -294,7 +294,7 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
             next_rip,
         } => {
             let ctx = cpu.context_mut();
-            match deliver_idt_vector(ctx, mem, vector, rip, next_rip, None, true, false) {
+            match deliver_idt_vector(ctx, mem, vector, rip, next_rip, None, true, false, false) {
                 Ok(()) => None,
                 Err(fault) => deliver_exception_with_escalation(ctx, mem, fault),
             }
@@ -424,6 +424,26 @@ fn deliver_exception_with_escalation<M: SoftMmuMemory>(
         } else {
             None
         };
+        // SDM Vol. 3B §17.3.1.1: faults save RF=1, except instruction
+        // breakpoints. A GD #DB is a fault; TF and INT1 are traps.
+        let fault_rf = match current.vector {
+            X86ExceptionVector::Debug => {
+                !icebp && current.rip == ctx.exit_insn_va && ctx.dr[6] & (1 << 13) != 0
+            }
+            X86ExceptionVector::DivideError
+            | X86ExceptionVector::BoundRangeExceeded
+            | X86ExceptionVector::InvalidOpcode
+            | X86ExceptionVector::DeviceNotAvailable
+            | X86ExceptionVector::InvalidTss
+            | X86ExceptionVector::SegmentNotPresent
+            | X86ExceptionVector::StackSegmentFault
+            | X86ExceptionVector::GeneralProtection
+            | X86ExceptionVector::PageFault
+            | X86ExceptionVector::X87FloatingPoint
+            | X86ExceptionVector::AlignmentCheck
+            | X86ExceptionVector::SimdFloatingPoint => true,
+            _ => false,
+        };
         match deliver_idt_vector(
             ctx,
             mem,
@@ -433,6 +453,7 @@ fn deliver_exception_with_escalation<M: SoftMmuMemory>(
             arch_error_code,
             check_dpl,
             external_event,
+            fault_rf,
         ) {
             Ok(()) => return None,
             Err(secondary) => {
@@ -470,6 +491,7 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     error_code: Option<u32>,
     check_dpl: bool,
     external_event: bool,
+    fault_rf: bool,
 ) -> Result<(), X86Exception> {
     let ext = u32::from(external_event);
     let gate_err = (u32::from(vector) << 3) | 0x2 | ext;
@@ -541,7 +563,7 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     let old_rsp = ctx.gpr[reg::RSP];
     let old_ss = ctx.ss.selector;
     let old_cs = ctx.cs.selector;
-    let old_rflags = (ctx.rflags & 0x003c_7fd7) | 0x2;
+    let old_rflags = (ctx.rflags & 0x003d_7fd7) | 0x2 | if fault_rf { RFLAGS_RF } else { 0 };
 
     let raw_target_rsp = if ist != 0 {
         read_tss_stack_ptr(ctx, mem, fault_va, 36 + (u64::from(ist) - 1) * 8, ext)?
