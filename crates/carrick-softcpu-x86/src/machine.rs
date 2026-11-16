@@ -562,7 +562,9 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     let old_rsp = ctx.gpr[reg::RSP];
     let old_ss = ctx.ss.selector;
     let old_cs = ctx.cs.selector;
-    let old_rflags = (ctx.rflags & 0x003d_7fd7) | 0x2 | if fault_rf { RFLAGS_RF } else { 0 };
+    // Event images never inherit RF; only the classified fault may set it.
+    // This also covers APIC delivery before retirement and #DF escalation.
+    let old_rflags = (ctx.rflags & 0x003c_7fd7) | 0x2 | if fault_rf { RFLAGS_RF } else { 0 };
 
     let raw_target_rsp = if ist != 0 {
         read_tss_stack_ptr(ctx, mem, fault_va, 36 + (u64::from(ist) - 1) * 8, ext)?
