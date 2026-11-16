@@ -4747,3 +4747,40 @@ fn serial_host_direct_output_venues_supply_untouched_pages() {
         },
     );
 }
+
+// ---- #2182 evidence harness (uncommitted) ----
+fn evidence_run(flags: &[&str]) {
+    let elf = native_exit_fixture_with_flags("native_robust_raw_exit_evidence.S", flags);
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .args(["10", "taskset", "-c", "0,1"])
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(native.status.code(), Some(0), "native Linux oracle: {:?}", native.status);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
+        .expect("evidence run retires in ring");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
+#[test]
+fn evidence_robust_two_live() {
+    evidence_run(&["-DTWO_LIVE"]);
+}
+
+#[test]
+fn evidence_no_robust_two_live() {
+    evidence_run(&["-DTWO_LIVE", "-DNO_ROBUST"]);
+}
+
+#[test]
+fn evidence_untouched_parent_settid_no_robust() {
+    evidence_run(&["-DUNTOUCHED", "-DNO_ROBUST"]);
+}
