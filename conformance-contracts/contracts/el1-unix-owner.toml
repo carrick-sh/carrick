@@ -24,11 +24,14 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_root_socketpair_nonblock_and_shutdown",
   "carrick-el1-linux::aarch64_process_tests::arm_root_socketpair_ends_are_ring_epoll_members",
   "carrick-el1-linux::aarch64_process_tests::arm_root_socketpair_send_recv_and_refusals",
+  "carrick-el1-linux::aarch64_process_tests::arm_root_socketpair_end_fioclex_sets_and_clears_cloexec",
   "carrick-el1-linux::x86_production_forward::x86_socket_calls_on_a_ring_stream_end_are_served",
+  "carrick-el1-linux::x86_production_forward::x86_fioclex_on_a_ring_stream_end_sets_and_clears_cloexec",
   "carrick-el1-abi::ipc::tests::{stream_pair_lanes_carry_each_direction_and_free_with_both_ends,stream_shutdown_drops_only_the_references_an_end_still_holds,stream_pair_outlives_a_close_after_both_ends_shut_everything}",
 ]
 embed = [
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::zone_socketpair_child_write_parent_read_moves_exact_byte",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::zone_socketpair_end_fioclex_sets_and_clears_cloexec",
 ]
 
 [bindings.unresolved]

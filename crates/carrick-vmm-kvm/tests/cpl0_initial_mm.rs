@@ -3380,6 +3380,36 @@ fn zone_socketpair_child_write_parent_read_moves_exact_byte() {
     }
 }
 
+/// #2361 on #2401's ring-wide FIOCLEX/FIONCLEX, through the production
+/// CPL0 lane: a ring stream end is a ring description like any other, so
+/// `ioctl(FIOCLEX)` and `ioctl(FIONCLEX)` on it set and clear its
+/// close-on-exec flag in ring (`F_GETFD` reads it back) before the pair
+/// carries the child's byte.
+#[test]
+fn zone_socketpair_end_fioclex_sets_and_clears_cloexec() {
+    let elf = native_exit_fixture_with_flags(
+        "native_pipe_child_write.S",
+        &["-DREAD_CHILD", "-DSOCKETPAIR", "-DSOCKET_FIOCLEX"],
+    );
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| panic!("socketpair FIOCLEX: {}", failure.error));
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "socketpair (90), FIOCLEX/FIONCLEX/F_GETFD (93), child write (errno) or parent read (92)"
+    );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    for ordinal in [25, 29, 199] {
+        assert_eq!(
+            counters.forwarded[ordinal].load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "ordinal {ordinal} is served in ring"
+        );
+    }
+}
+
 #[test]
 fn zone_epoll_legacy_wait_blocks_until_child_pipe_write() {
     assert_zone_epoll_pipe_wake(&["-DUSE_EPOLL", "-DUSE_LEGACY_EPOLL"]);
