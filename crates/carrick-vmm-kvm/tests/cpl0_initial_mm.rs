@@ -3433,6 +3433,36 @@ fn zone_socketpair_end_fioclex_sets_and_clears_cloexec() {
     }
 }
 
+/// #2385 review P0-1 and P0-2 on x86, through the production CPL0 lane and
+/// the shared IPC venue: the shared stream read stops MSG_WAITALL at this
+/// end's SHUT_RD and returns the buffered prefix (native Linux: 3, then 0),
+/// and the shared zero-length write checks the stream's state (EPIPE after
+/// the peer closed, MSG_NOSIGNAL) while a pipe's stays 0.
+#[test]
+fn zone_socketpair_terminal_receive_and_zero_length_write_states() {
+    let elf = native_exit_fixture_with_flags(
+        "native_pipe_child_write.S",
+        &["-DSOCKETPAIR", "-DSOCKET_TERMINAL"],
+    );
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| panic!("socketpair terminal states: {}", failure.error));
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "socketpair (90), WAITALL after SHUT_RD (94) or zero-length write (95)"
+    );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    for ordinal in [64, 199, 206, 207, 210] {
+        assert_eq!(
+            counters.forwarded[ordinal].load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "ordinal {ordinal} is served in ring"
+        );
+    }
+}
+
 #[test]
 fn zone_epoll_legacy_wait_blocks_until_child_pipe_write() {
     assert_zone_epoll_pipe_wake(&["-DUSE_EPOLL", "-DUSE_LEGACY_EPOLL"]);
