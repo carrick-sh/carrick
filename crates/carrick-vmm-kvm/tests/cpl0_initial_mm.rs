@@ -5418,7 +5418,7 @@ impl InetPeers {
 /// #231, director ruling D2: a forked native child's socket calls are its
 /// own, never the run root's. Its blocking TCP socket's SO_PEERCRED is
 /// Linux's `{0, -1, -1}`, a recv into a 64 KiB buffer returns data, a
-/// 100000-byte send returns the first slice's short count, a send after
+/// 100000-byte blocking send returns 100000, a send after
 /// `shutdown(SHUT_WR)` raises the child's own SIGPIPE with EPIPE (none with
 /// `MSG_NOSIGNAL`, and `write` raises it too), and once it drops to uid
 /// 1000 `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` is EPERM while a TCP
@@ -5455,9 +5455,9 @@ fn native_child_inet_calls_run_under_the_childs_own_identity() {
         outcome.run
     );
     let received = peer.join().expect("identity peer");
-    assert!(
-        (1..=61_440).contains(&received),
-        "the 100000-byte send delivered its short count: {received}"
+    assert_eq!(
+        received, 100_000,
+        "the 100000-byte blocking send delivered its whole buffer"
     );
 }
 
@@ -5563,11 +5563,13 @@ fn native_child_inet_transfers_keep_their_whole_extent() {
 
 /// #2414 review P0-2: a poll a forked native child issues again after an
 /// interrupted one waits its own timeout. `poll(u, POLLIN, 1000)` on a UDP
-/// socket nothing arrives on is interrupted by SIGUSR1 (EINTR, its handler
-/// ran), and after 800 ms more the same poll waits ~1000 ms and returns 0.
-/// Red before the fix: the signal's cancellation of the host-readiness wait
-/// failed the run, and the re-issued poll inherited the interrupted call's
-/// expired deadline.
+/// socket nothing has arrived on is interrupted by SIGUSR1 (EINTR, its
+/// handler ran); 800 ms later, past the interrupted call's deadline, the
+/// same poll still waits for a datagram a grandchild sends after 500 ms
+/// (1, POLLIN). Red before the fix: the signal's cancellation of the
+/// host-readiness wait was refused (Stale), which failed the run; and the
+/// re-issued poll inherited the interrupted call's spent deadline and
+/// returned 0 at once.
 #[test]
 fn native_child_inet_repoll_after_eintr_waits_its_own_timeout() {
     let defines = [

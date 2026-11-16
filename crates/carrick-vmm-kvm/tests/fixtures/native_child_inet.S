@@ -21,8 +21,8 @@
  *        getsockopt(SO_PEERCRED) is Linux's {0, -1, -1} for TCP (the Docker
  *        oracle's answer; never the run root's identity), a recv into a
  *        64 KiB buffer returns data (one record carries it), a 100000-byte
- *        blocking send returns a short count of at most one record's data
- *        range (the known first-slice divergence), and after
+ *        blocking send returns 100000 (the ring continues it across
+ *        records), and after
  *        shutdown(SHUT_WR) send raises the child's own SIGPIPE with EPIPE,
  *        send(MSG_NOSIGNAL) returns EPIPE without it, and write raises it;
  *   identity: setresuid(1000, 1000, 1000), then socket(AF_INET, SOCK_RAW,
@@ -53,7 +53,12 @@
  *        kill after 300 ms; the handler has no SA_RESTART), is EINTR and
  *        the handler ran once;
  *   bit 1: after 800 ms more (the interrupted call's deadline passed), the
- *        same poll waits its own full timeout (>= 900 ms) and returns 0.
+ *        same poll waits its own 1000 ms timeout: a datagram a grandchild
+ *        sends u after 500 ms ends it (1, POLLIN), where a poll that kept
+ *        the interrupted call's spent deadline returns 0 at once;
+ *   bit 2: a blocking recvfrom(u) interrupted by SIGUSR2, whose handler has
+ *        SA_RESTART, restarts and receives the datagram a grandchild sends
+ *        300 ms after the signal (1, and the handler ran).
  *
  * In both modes every check runs; the child exits 128 + the mask of failed
  * bits (0 when all pass), or the stage number of a step the checks rely on.
@@ -82,7 +87,7 @@
 #define SYS_NANOSLEEP 35
 #define SYS_KILL 62
 #define SYS_GETPPID 110
-#define SYS_CLOCK_GETTIME 228
+#define SYS_BIND 49
 #define SYS_EXIT 60
 
 /* Record `mask` in xfails unless %rax == value; continue either way. */
@@ -469,11 +474,7 @@ identity:
     xor %r9d, %r9d
     mov $SYS_SENDTO, %eax
     syscall
-    mov $49, %r15d
-    test %rax, %rax
-    jle fail
-    cmp $61440, %rax               /* short: at most one record's range */
-    jg fail
+    EXPECT(49, 100000)             /* the whole buffer (#2414 review P0-1) */
 
     mov %r12, %rdi                 /* shutdown(s, SHUT_WR) */
     mov $1, %esi
@@ -700,6 +701,19 @@ repoll:
     test %rax, %rax
     js fail
     mov %rax, %r13
+    mov %r13, %rdi                 /* bind(u, 127.0.0.1:0, 16) */
+    lea self_addr(%rip), %rsi
+    mov $16, %edx
+    mov $SYS_BIND, %eax
+    syscall
+    EXPECT(83, 0)
+    movl $16, addrlen(%rip)        /* getsockname(u, &self_addr, &len) */
+    mov %r13, %rdi
+    lea self_addr(%rip), %rsi
+    lea addrlen(%rip), %rdx
+    mov $SYS_GETSOCKNAME, %eax
+    syscall
+    EXPECT(84, 0)
 
     /* An interrupted poll's deadline is its own: the same poll, issued
      * again after that deadline passed, waits its own full timeout. */
@@ -750,36 +764,128 @@ repoll:
     mov $SYS_NANOSLEEP, %eax
     syscall
     EXPECT(75, 0)
-    mov $1, %edi                   /* clock_gettime(CLOCK_MONOTONIC, &before) */
-    lea before(%rip), %rsi
-    mov $SYS_CLOCK_GETTIME, %eax
+
+    /* The same poll again: a grandchild sends u a datagram after 500 ms,
+     * which a poll waiting its own 1000 ms timeout sees (1, POLLIN); one
+     * that inherited the interrupted call's spent deadline returns 0 at
+     * once. */
+    mov $SYS_FORK, %eax
     syscall
-    EXPECT(76, 0)
-    movw $0, pollfd+6(%rip)        /* the same poll(u, POLLIN, 1000): 0 */
+    mov $76, %r15d
+    test %rax, %rax
+    js fail
+    jnz 4f
+    lea send_delay(%rip), %rdi     /* grandchild: sleep 500 ms, then send */
+    xor %esi, %esi
+    mov $SYS_NANOSLEEP, %eax
+    syscall
+    mov %r13, %rdi                 /* sendto(u, "q", 1, 0, &self_addr, 16) */
+    lea query(%rip), %rsi
+    mov $1, %edx
+    xor %r10d, %r10d
+    lea self_addr(%rip), %r8
+    mov $16, %r9d
+    mov $SYS_SENDTO, %eax
+    syscall
+    xor %edi, %edi
+    mov $SYS_EXIT, %eax
+    syscall
+    ud2
+4:
+    mov %rax, %rbx
+    movw $0, pollfd+6(%rip)        /* the same poll(u, POLLIN, 1000): 1 */
     lea pollfd(%rip), %rdi
     mov $1, %esi
     mov $1000, %edx
     mov $SYS_POLL, %eax
     syscall
-    CHECK(2, 0)
-    mov $1, %edi                   /* clock_gettime(CLOCK_MONOTONIC, &after) */
-    lea after(%rip), %rsi
-    mov $SYS_CLOCK_GETTIME, %eax
+    CHECK(2, 1)
+    movzwl pollfd+6(%rip), %eax
+    CHECK(2, 1)
+    mov %rbx, %rdi                 /* wait4(grandchild, &status, 0, NULL) */
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $SYS_WAIT4, %eax
     syscall
-    EXPECT(77, 0)
-    mov after(%rip), %rax          /* elapsed ms >= 900 */
-    sub before(%rip), %rax
-    imul $1000, %rax, %rcx
-    mov after+8(%rip), %rax
-    sub before+8(%rip), %rax
-    cqo
-    mov $1000000, %r8
-    idiv %r8
-    add %rcx, %rax
-    cmp $900, %rax
-    jge 3f
-    orl $2, xfails(%rip)
-3:
+    mov $77, %r15d
+    cmp %rbx, %rax
+    jne fail
+
+    /* A blocking recv interrupted by a handler with SA_RESTART restarts:
+     * drain the poll's datagram, then a grandchild raises SIGUSR2 after
+     * 300 ms and sends u a datagram 300 ms later, which the restarted recv
+     * receives. */
+    mov %r13, %rdi                 /* recvfrom(u, buf, 16, MSG_DONTWAIT): the poll's */
+    lea buffer(%rip), %rsi
+    mov $16, %edx
+    mov $0x40, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $SYS_RECVFROM, %eax
+    syscall
+    EXPECT(78, 1)
+    mov $12, %edi                  /* rt_sigaction(SIGUSR2, &restart_act, NULL, 8) */
+    lea restart_act(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $SYS_RT_SIGACTION, %eax
+    syscall
+    EXPECT(79, 0)
+    mov $SYS_FORK, %eax
+    syscall
+    mov $80, %r15d
+    test %rax, %rax
+    js fail
+    jnz 5f
+    lea usr1_delay(%rip), %rdi     /* grandchild: 300 ms, SIGUSR2, 300 ms, send */
+    xor %esi, %esi
+    mov $SYS_NANOSLEEP, %eax
+    syscall
+    mov $SYS_GETPPID, %eax
+    syscall
+    mov %rax, %rdi
+    mov $12, %esi
+    mov $SYS_KILL, %eax
+    syscall
+    lea usr1_delay(%rip), %rdi
+    xor %esi, %esi
+    mov $SYS_NANOSLEEP, %eax
+    syscall
+    mov %r13, %rdi
+    lea query(%rip), %rsi
+    mov $1, %edx
+    xor %r10d, %r10d
+    lea self_addr(%rip), %r8
+    mov $16, %r9d
+    mov $SYS_SENDTO, %eax
+    syscall
+    xor %edi, %edi
+    mov $SYS_EXIT, %eax
+    syscall
+    ud2
+5:
+    mov %rax, %rbx
+    mov %r13, %rdi                 /* recvfrom(u, buf, 16, 0): restarted, 1 */
+    lea buffer(%rip), %rsi
+    mov $16, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $SYS_RECVFROM, %eax
+    syscall
+    CHECK(4, 1)
+    movslq usr1_count(%rip), %rax  /* the SIGUSR2 handler ran */
+    CHECK(4, 2)
+    mov %rbx, %rdi                 /* wait4(grandchild, &status, 0, NULL) */
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $SYS_WAIT4, %eax
+    syscall
+    mov $85, %r15d
+    cmp %rbx, %rax
+    jne fail
 
     movl xfails(%rip), %edi
     test %edi, %edi
@@ -851,14 +957,22 @@ usr1_act:
     .quad 0x04000000               /* sa_flags: SA_RESTORER, no SA_RESTART */
     .quad usr1_restorer            /* sa_restorer */
     .quad 0                        /* sa_mask */
+restart_act:
+    .quad usr1_handler             /* sa_handler */
+    .quad 0x14000000               /* sa_flags: SA_RESTORER | SA_RESTART */
+    .quad usr1_restorer            /* sa_restorer */
+    .quad 0                        /* sa_mask */
 usr1_delay:
     .quad 0, 300000000             /* 300 ms */
 poll_rest:
     .quad 0, 800000000             /* 800 ms */
-before:
-    .quad 0, 0
-after:
-    .quad 0, 0
+send_delay:
+    .quad 0, 500000000             /* 500 ms */
+self_addr:
+    .short 2
+    .short 0
+    .byte 127, 0, 0, 1
+    .quad 0
 usr1_count:
     .long 0
 xfails:
