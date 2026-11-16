@@ -6,7 +6,10 @@ use carrick_softcpu_aarch64::{A64Class, classify};
 use goblin::elf::{Elf, header, section_header, sym};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -14,6 +17,7 @@ fn sha(bytes: &[u8]) -> String {
 
 #[derive(Default)]
 struct Census {
+    producers: BTreeSet<String>,
     counts: BTreeMap<String, u64>,
     registers: BTreeMap<String, u64>,
     unknown: Vec<Value>,
@@ -97,6 +101,29 @@ impl Census {
             elf.header.e_machine == header::EM_AARCH64 && elf.little_endian,
             "requires little-endian AArch64 ELF"
         );
+        // Producer provenance comes from the input, never from spawning a
+        // compiler or reading host environment state. Flat bytes lack this.
+        for section in &elf.section_headers {
+            if elf.shdr_strtab.get_at(section.sh_name) == Some(".comment") {
+                let start = usize::try_from(section.sh_offset)?;
+                let end = start
+                    .checked_add(usize::try_from(section.sh_size)?)
+                    .context("producer section overflow")?;
+                for producer in bytes
+                    .get(start..end)
+                    .context("truncated producer section")?
+                    .split(|b| *b == 0)
+                {
+                    if !producer.is_empty() {
+                        self.producers.insert(
+                            std::str::from_utf8(producer)
+                                .context("non-UTF8 producer string")?
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
         let mut executable = 0;
         for (index, section) in elf.section_headers.iter().enumerate() {
             if section.sh_flags & u64::from(section_header::SHF_EXECINSTR) == 0
@@ -180,9 +207,9 @@ impl Census {
         ensure!(executable != 0, "no executable sections");
         Ok(())
     }
-    fn report(&self, input: &[u8], mode: &str, compiler: &str) -> Value {
+    fn report(&self, input: &[u8], mode: &str) -> Value {
         json!({"schema":"carrick.a64-census.v1", "tool_version":env!("CARGO_PKG_VERSION"),
-            "classifier":"hand-authored-a64-v1", "compiler":compiler,
+            "classifier":"hand-authored-a64-v1", "compiler_producers":self.producers, "producer_source":"ELF .comment when present; flat bytes have no producer metadata",
             "scope":"EL1 plus loader; EL0 fixture closure is slice 0b", "input_mode":mode,
             "input_sha256":sha(input), "spans":self.spans,"counts":self.counts,
             "system_registers":self.registers,"unknown_count":self.unknown.len(),"unknown":self.unknown})
@@ -249,11 +276,7 @@ pub(crate) fn run(input: Option<&Path>) -> Result<()> {
     }
     println!(
         "{}",
-        serde_json::to_string_pretty(&census.report(
-            &bytes,
-            mode,
-            env!("CARRICK_CENSUS_COMPILER")
-        ))?
+        serde_json::to_string_pretty(&census.report(&bytes, mode))?
     );
     census.finish()
 }
@@ -271,12 +294,12 @@ mod tests {
         let mut census = Census::default();
         census.span("negative", 0x1000, &bytes)?;
         assert!(census.finish().is_err());
-        let a = serde_json::to_vec_pretty(&census.report(&bytes, "test", "test"))?;
+        let a = serde_json::to_vec_pretty(&census.report(&bytes, "test"))?;
         let mut second = Census::default();
         second.span("negative", 0x1000, &bytes)?;
         assert_eq!(
             a,
-            serde_json::to_vec_pretty(&second.report(&bytes, "test", "test"))?
+            serde_json::to_vec_pretty(&second.report(&bytes, "test"))?
         );
         assert_eq!(census.unknown[0]["address"], 0x1004);
         assert_eq!(census.unknown[0]["encoding"], "0xffffffff");
