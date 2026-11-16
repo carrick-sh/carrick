@@ -290,7 +290,11 @@ pub(super) fn run_two_vcpu_fixture_on_softmachine() -> TwoVcpuFixtureOutcome {
                           stack_gpa: u64,
                           cluster: Arc<ApicCluster>|
      -> SoftMachine<SharedTwoVcpuSoftMemory> {
-        let cpuid = Box::new(Cpl0CpuidView::with_tsc_deadline(apic_id, 1_000_000_000));
+        let cpuid = Box::new(
+            GuestCpuidView::default()
+                .with_apic_id(apic_id)
+                .with_tsc(carrick_x86::TscCrystalRatio::from_hz(1_000_000_000u64)),
+        );
         let mut machine = SoftMachine::new(mem, cpuid).expect("SoftMachine::new");
         machine.attach_apic_cluster(cluster);
         machine.set_hlt_wait_timeout(Some(Duration::from_secs(2)));

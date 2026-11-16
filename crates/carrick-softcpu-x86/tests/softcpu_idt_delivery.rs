@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_softcpu_x86::{
-    Cpl0CpuidView, DescriptorTablePtr, ExtentRecord, ExtentTable, FrameGpa, LinearPlacement,
+    DescriptorTablePtr, ExtentRecord, ExtentTable, FrameGpa, GuestCpuidView, LinearPlacement,
     MmioHoles, OwnerGeneration, PF_ERR_INSTR, PF_ERR_PRESENT, PF_ERR_RSVD, PF_ERR_USER,
     PF_ERR_WRITE, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK, SOFT_TLB_PAGE_SIZE,
     SoftAccessKind, SoftCpuContext, SoftMachine, SoftMachineExit, SoftMmuMemory, SoftSegment,
@@ -365,10 +365,7 @@ impl IdtTestRig {
         mem.write_gpa(tss_frame.raw() + 44, &(IST2_VA + 0xff0).to_le_bytes());
         mem.write_gpa(tss_frame.raw() + 84, &(IST7_VA + 0xff8).to_le_bytes());
 
-        let cpuid = Cpl0CpuidView {
-            max_phy_addr: 48,
-            ..Default::default()
-        };
+        let cpuid = GuestCpuidView::default();
         let mut machine = SoftMachine::new(mem, Box::new(cpuid)).unwrap();
         {
             let ctx = machine.context_mut();

@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::x8664_arch::X8664GuestArch;
 use carrick_softcpu_x86::{
-    Cpl0CpuidView, CpuidAuthority, CpuidRegs, DEFAULT_IA32_APIC_BASE, DEFAULT_IA32_PAT,
-    DescriptorTablePtr, EFER_LMA, EFER_LME, EFER_NXE, EFER_SCE, ExtentRecord, ExtentTable,
-    FrameGpa, Level0CpuidView, LinearPlacement, MSR_IA32_APIC_BASE, MSR_IA32_CSTAR, MSR_IA32_EFER,
-    MSR_IA32_FMASK, MSR_IA32_FS_BASE, MSR_IA32_GS_BASE, MSR_IA32_KERNEL_GS_BASE, MSR_IA32_LSTAR,
+    CpuidAuthority, CpuidRegs, DEFAULT_IA32_APIC_BASE, DEFAULT_IA32_PAT, DescriptorTablePtr,
+    EFER_LMA, EFER_LME, EFER_NXE, EFER_SCE, ExtentRecord, ExtentTable, FrameGpa, GuestCpuidView,
+    LinearPlacement, MSR_IA32_APIC_BASE, MSR_IA32_CSTAR, MSR_IA32_EFER, MSR_IA32_FMASK,
+    MSR_IA32_FS_BASE, MSR_IA32_GS_BASE, MSR_IA32_KERNEL_GS_BASE, MSR_IA32_LSTAR,
     MSR_IA32_MISC_ENABLE, MSR_IA32_PAT, MSR_IA32_STAR, MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE,
     MmioHoles, MsrCapabilities, MsrError, MsrFile, MsrIndex, OwnerGeneration, PF_ERR_PRESENT,
     PF_ERR_USER, PF_ERR_WRITE, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK,
@@ -259,7 +259,7 @@ fn read_ok(cpu: &mut SoftCpu, mem: &mut Cpl0TestMemory, va: u64) {
 }
 
 fn assert_cpl3_exc(insn: &[u8], rcx: u64, exc: X86Exception) {
-    let (mut cpu, mut mem, _) = setup_cpl0_cpu(insn, Box::new(Cpl0CpuidView::default()));
+    let (mut cpu, mut mem, _) = setup_cpl0_cpu(insn, Box::new(GuestCpuidView::default()));
     let user_code = mem.map_page(USER_CODE_VA, Perms::USER_RX);
     mem.write_gpa(user_code.raw(), insn);
     enter_cpl3(cpu.context_mut(), USER_CODE_VA);
@@ -349,7 +349,7 @@ fn msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths() {
     }
 
     let (mut cpu, mut mem, _) =
-        setup_cpl0_cpu(b"\x0f\x30\x0f\x32", Box::new(Cpl0CpuidView::default()));
+        setup_cpl0_cpu(b"\x0f\x30\x0f\x32", Box::new(GuestCpuidView::default()));
     let set_gp = Err(MsrError::GeneralProtection);
     assert_eq!(cpu.context_mut().set_fs_base(NON_CANON), set_gp);
     assert_eq!(cpu.context_mut().set_gs_base(NON_CANON), set_gp);
@@ -382,13 +382,8 @@ fn msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths() {
         (0x89ab_cdef, 0x0123_4567)
     );
 
-    let (mut dl_cpu, mut dl_mem, _) = setup_cpl0_cpu(
-        b"\x0f\x30\x0f\x32",
-        Box::new(Cpl0CpuidView {
-            tsc_deadline: true,
-            ..Default::default()
-        }),
-    );
+    let (mut dl_cpu, mut dl_mem, _) =
+        setup_cpl0_cpu(b"\x0f\x30\x0f\x32", Box::new(GuestCpuidView::default()));
     dl_cpu.context_mut().lapic_mmio_write(
         carrick_softcpu_x86::LAPIC_LVT_TIMER_OFFSET,
         &(carrick_softcpu_x86::LAPIC_LVT_TIMER_MODE_TSC_DEADLINE | 0xef).to_le_bytes(),
@@ -447,7 +442,11 @@ fn mov_cr_and_mov_dr_enforce_sdm_semantics_tlb_flushes_and_fault_ordering() {
 
     let (mut cpu, mut mem, _) = setup_cpl0_cpu(
         &[0x0F, 0x22, 0xC0, 0x0F, 0x20, 0xC0],
-        Box::new(Cpl0CpuidView::new(0, 0)),
+        Box::new(
+            GuestCpuidView::default()
+                .with_apic_id(0)
+                .with_tsc(carrick_x86::TscCrystalRatio::from_hz(0u64)),
+        ),
     );
     for bad_cr0 in [
         0x8005_0033 | (1u64 << 32),
@@ -464,10 +463,7 @@ fn mov_cr_and_mov_dr_enforce_sdm_semantics_tlb_flushes_and_fault_ordering() {
     step_ok(&mut cpu, &mut mem, CODE_VA + 6);
     assert_eq!(cpu.context().gpr[reg::RAX], 0x8001_0033);
 
-    let view = Cpl0CpuidView {
-        max_phy_addr: 40,
-        ..Default::default()
-    };
+    let view = GuestCpuidView::default().with_max_phy_addr(40).unwrap();
     let code = [
         0x0F, 0x22, 0xD0, 0x0F, 0x20, 0xD0, 0x44, 0x0F, 0x22, 0xC0, 0x44, 0x0F, 0x20, 0xC0, 0x0F,
         0x22, 0xE0, 0x0F, 0x22, 0xD8, 0x0F, 0x20, 0xD8, 0x0F, 0x31,
@@ -522,7 +518,7 @@ fn mov_cr_and_mov_dr_enforce_sdm_semantics_tlb_flushes_and_fault_ordering() {
     let dr_code = [
         0x0F, 0x23, 0xE0, 0x0F, 0x21, 0xF0, 0x0F, 0x23, 0xF8, 0x0F, 0x23, 0xC0,
     ];
-    let (mut cpu, mut mem, _) = setup_cpl0_cpu(&dr_code, Box::new(Cpl0CpuidView::default()));
+    let (mut cpu, mut mem, _) = setup_cpl0_cpu(&dr_code, Box::new(GuestCpuidView::default()));
     let user_dr4 = mem.map_page(USER_CODE_VA, Perms::USER_RX);
     mem.write_gpa(user_dr4.raw(), &[0x0F, 0x21, 0xE0]);
     cpu.context_mut().cr4 |= 1 << 3;
@@ -578,7 +574,7 @@ fn lgdt_lidt_ltr_and_swapgs_enforce_descriptor_and_gs_semantics() {
         0x66, 0x0F, 0x01, 0x17, 0x0F, 0x01, 0x1F, 0x0F, 0x00, 0xD8, 0x48, 0x0F, 0x00, 0xC8, 0x0F,
         0x01, 0xF8, 0x65, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
     ];
-    let (mut cpu, mut mem, data_frame) = setup_cpl0_cpu(&code, Box::new(Cpl0CpuidView::default()));
+    let (mut cpu, mut mem, data_frame) = setup_cpl0_cpu(&code, Box::new(GuestCpuidView::default()));
 
     write_dt_ptr(&mut mem, data_frame.raw(), 0x3f, NON_CANON);
     cpu.context_mut().gpr[reg::RDI] = DATA_VA;
@@ -663,7 +659,7 @@ fn lgdt_lidt_ltr_and_swapgs_enforce_descriptor_and_gs_semantics() {
 #[test]
 fn sysret_and_iretq_enforce_privilege_transitions_and_fault_paths() {
     let code = [0x48, 0x0F, 0x07, 0x0F, 0x07, 0x48, 0xCF];
-    let (mut cpu, mut mem, data_frame) = setup_cpl0_cpu(&code, Box::new(Cpl0CpuidView::default()));
+    let (mut cpu, mut mem, data_frame) = setup_cpl0_cpu(&code, Box::new(GuestCpuidView::default()));
     let user_page = mem.map_page(USER_CODE_VA, Perms::USER_RX);
     mem.write_gpa(user_page.raw(), &[0x90, 0x48, 0xCF]);
 
@@ -841,7 +837,7 @@ fn hlt_invlpg_and_cpuid_view_enforce_sdm_contracts() {
     step_exc(&mut cpu, &mut mem, gp(USER_CODE_VA + 3, 0));
 
     let code = b"\x0f\x22\xe0\x0f\xa2\x0f\x01\x3f\x48\x8b\x07\xf4";
-    let (mut cpu, mut mem, data_frame) = setup_cpl0_cpu(code, Box::new(Level0CpuidView));
+    let (mut cpu, mut mem, data_frame) = setup_cpl0_cpu(code, Box::new(GuestCpuidView::default()));
     for bad in [
         b"\xf0\xf4".as_slice(),
         b"\xf0\x0f\x01\x3f",
@@ -1084,8 +1080,15 @@ fn cpl0_fixture_boot_sequence_on_softmachine_matches_kvm_state() {
     cpl0_boot.extend_from_slice(&[0x50, 0x31, 0xC0, 0x48, 0xCF]);
     mem.write_gpa(boot_code_va, &cpl0_boot);
 
-    let mut machine =
-        SoftMachine::new(mem, Box::new(Cpl0CpuidView::new(0, 2_000_000_000))).unwrap();
+    let mut machine = SoftMachine::new(
+        mem,
+        Box::new(
+            GuestCpuidView::default()
+                .with_apic_id(0)
+                .with_tsc(carrick_x86::TscCrystalRatio::from_hz(2_000_000_000u64)),
+        ),
+    )
+    .unwrap();
     let ctx = machine.context_mut();
     enter_cpl0(ctx, boot_code_va);
     (ctx.cr0, ctx.cr3, ctx.cr4) = (0x8000_0011, layout.pml4_base, 0x20);
@@ -1184,7 +1187,7 @@ fn mov_cr3_pcide_noflush_isolates_two_roots() {
     mem.write_gpa(frame_b.raw(), &0xaaaa_bbbb_cccc_ddddu64.to_le_bytes());
     mem.map_at_root(root_b.raw(), DATA_VA, frame_b, Perms::KERNEL_RW);
 
-    let mut machine = SoftMachine::new(mem, Box::new(Cpl0CpuidView::default())).unwrap();
+    let mut machine = SoftMachine::new(mem, Box::new(GuestCpuidView::default())).unwrap();
     let ctx = machine.context_mut();
     enter_cpl0(ctx, CODE_VA);
     ctx.gpr[reg::RAX] = 0x0036_06f0; // CR4.PCIDE = 1
@@ -1216,7 +1219,7 @@ fn idt_gate64(handler: u64, cs: u16, ist: u8, dpl: u8, present: bool) -> [u8; 16
 #[test]
 fn idt_delivery_enforces_sdm_double_fault_classes() {
     let (mut cpu, mut mem, data_frame) =
-        setup_cpl0_cpu(&[0x0F, 0x0B], Box::new(Cpl0CpuidView::default()));
+        setup_cpl0_cpu(&[0x0F, 0x0B], Box::new(GuestCpuidView::default()));
     let code_gpa = translate_va(cpu.context_mut(), &mut mem, CODE_VA, SoftAccessKind::Read).unwrap()
         as usize
         - mem.placement().base_host_addr();
@@ -1365,7 +1368,7 @@ fn idt_delivery_enforces_sdm_double_fault_classes() {
 
 #[test]
 fn faulting_iretq_and_idt_preserve_gdt_accessed_bit_and_cpuid_tsc_are_consistent() {
-    let cpl0_view = Cpl0CpuidView::default();
+    let cpl0_view = GuestCpuidView::default();
     let leaf1 = cpl0_view.cpuid(1, 0);
     assert_eq!(
         leaf1.edx & ((1 << 9) | (1 << 11)),
@@ -1397,7 +1400,7 @@ fn faulting_iretq_and_idt_preserve_gdt_accessed_bit_and_cpuid_tsc_are_consistent
     // Unaccessed (A=0) GDT descriptors: 0x08=kcode(A=0), 0x10=kdata(A=0), 0x18=udata(A=0), 0x20=ucode(A=0).
     let (mut cpu, mut mem, data_frame) = setup_cpl0_cpu(
         &[0x48, 0xCF, 0x0F, 0x0B],
-        Box::new(Cpl0CpuidView::default()),
+        Box::new(GuestCpuidView::default()),
     );
     let user_page = mem.map_page(USER_CODE_VA, Perms::USER_RX);
     mem.write_gpa(user_page.raw(), &[0x90]);
@@ -1479,11 +1482,19 @@ fn softmachine_vcpus_execute_the_shared_cpuid_contract() {
             .with_tsc(carrick_x86::TscCrystalRatio::from_hz(hz));
         let (_, mem, _) = setup_cpl0_cpu(
             &[0x0f, 0xa2],
-            Box::new(Cpl0CpuidView::with_tsc_deadline(apic_id, hz as u32)),
+            Box::new(
+                GuestCpuidView::default()
+                    .with_apic_id(apic_id)
+                    .with_tsc(carrick_x86::TscCrystalRatio::from_hz(u64::from(hz as u32))),
+            ),
         );
         let mut machine = SoftMachine::new(
             mem,
-            Box::new(Cpl0CpuidView::with_tsc_deadline(apic_id, hz as u32)),
+            Box::new(
+                GuestCpuidView::default()
+                    .with_apic_id(apic_id)
+                    .with_tsc(carrick_x86::TscCrystalRatio::from_hz(u64::from(hz as u32))),
+            ),
         )
         .unwrap();
         enter_cpl0(machine.context_mut(), CODE_VA);

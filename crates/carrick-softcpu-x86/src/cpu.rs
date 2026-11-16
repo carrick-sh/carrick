@@ -6,13 +6,14 @@ use std::ptr::NonNull;
 use carrick_softmmu::{ExtentTable, InventoryTerminal, SoftRequester, SoftSeatError};
 use iced_x86::{Instruction, Mnemonic};
 
+use crate::GuestCpuidView;
 use crate::block::{BlockExit, BlockFetchFault, PlannedBlock, plan_block_from_memory};
 use crate::cflow::{compute_effective_va, resolve_cflow};
 use crate::context::{
     EXIT_REASON_CFLOW, EXIT_REASON_CONTINUE, EXIT_REASON_RESTART, EXIT_REASON_SENSITIVE,
     EXIT_REASON_SYSCALL, GUEST_MXCSR_MASK, SoftCpuContext, X86Exception, X86ExceptionVector, reg,
 };
-use crate::cpuid::{CpuidAuthority, Level0CpuidView};
+use crate::cpuid::CpuidAuthority;
 use crate::decode::SensitiveOp;
 use crate::emit::{EmitError, emit_block};
 use crate::mmu::{
@@ -374,9 +375,9 @@ fn qualify_native_cpuid(cpuid: &dyn CpuidAuthority) -> Result<(), SoftCpuNewErro
 
 impl SoftCpu {
     /// Create a new [`SoftCpu`] initialized for 64-bit user mode (`CPL = 3`),
-    /// seated in `extents`' invalidation domain and parked, using [`Level0CpuidView`].
+    /// seated in `extents`' invalidation domain and parked, using [`GuestCpuidView`].
     pub fn new(extents: &ExtentTable) -> Result<Self, SoftCpuNewError> {
-        Self::with_cpuid_view(extents, Box::new(Level0CpuidView))
+        Self::with_cpuid_view(extents, Box::new(GuestCpuidView::default()))
     }
 
     /// Create a new [`SoftCpu`] configured with a custom [`CpuidAuthority`].
@@ -1391,7 +1392,10 @@ mod cpuid_admission_tests {
                 replaced,
                 Err(SoftCpuNewError::UnsupportedHostFeature(feature))
             );
-            assert_eq!(cpu.cpuid_view().cpuid(1, 0), Level0CpuidView.cpuid(1, 0));
+            assert_eq!(
+                cpu.cpuid_view().cpuid(1, 0),
+                GuestCpuidView::default().cpuid(1, 0)
+            );
             assert_eq!(cpu.context().tsc_hz, crate::cpuid::DEFAULT_TSC_HZ);
         }
     }
