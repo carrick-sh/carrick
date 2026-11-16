@@ -524,6 +524,20 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     ) -> Result<(), NativeProcessError> {
         self.copy_owned_bytes(mm, address, bytes)
     }
+    /// A continued socket send's next bytes: the host fixture's user memory
+    /// reads as each byte's address, low byte first, so a test can tell
+    /// which range a record staged.
+    fn copy_syscall_input(
+        &mut self,
+        _mm: &Self::Mm,
+        address: UserVa,
+        bytes: &mut [u8],
+    ) -> Result<(), NativeProcessError> {
+        for (offset, byte) in bytes.iter_mut().enumerate() {
+            *byte = address.raw().wrapping_add(offset as u64) as u8;
+        }
+        Ok(())
+    }
     fn copy_owned_bytes(
         &mut self,
         mm: &Self::Mm,
@@ -6009,6 +6023,491 @@ fn native_child_socket_call_runs_under_the_childs_own_identity() {
         Ok(NativeResume::Returned(result))
             if result.raw() == carrick_syscall_abi::LINUX_EPERM.guest_retval()
     ));
+}
+
+/// A native child's host-file call that the carrier answered with a wait on
+/// the child's host-readiness queue (#231), staged and published by the
+/// production ring service: the claimed ticket, its record and the queue
+/// revision the carrier sampled.
+#[cfg(test)]
+struct HostReadyWaitFixture {
+    counters: &'static carrick_el1_abi::Counters,
+    capacity: NativeServiceCapacityFixture,
+    /// The child its slot last selected.
+    loaded: core::cell::RefCell<Option<(RecordRef, AddressContext<RootGpa>, ParkedContextWords)>>,
+}
+
+#[cfg(test)]
+impl HostReadyWaitFixture {
+    fn new() -> Self {
+        Self {
+            counters: Box::leak(Box::new(carrick_el1_abi::Counters::new())),
+            capacity: NativeServiceCapacityFixture::new(1),
+            loaded: core::cell::RefCell::new(None),
+        }
+    }
+
+    /// Select the child, enter it and hand it `run`.
+    fn enter<R>(
+        &self,
+        run: impl FnOnce(
+            &mut NativeProcessEntry<
+                '_,
+                'static,
+                AddressContext<RootGpa>,
+                ParkedContextWords,
+                Physical<'static, ParkedContextWords>,
+            >,
+        ) -> R,
+    ) -> (RecordRef, R) {
+        let selected = self.capacity.select().unwrap();
+        let record = selected.0;
+        *self.loaded.borrow_mut() = Some(selected);
+        (record, self.enter_loaded(run))
+    }
+
+    /// Enter the child its slot still runs (its last call returned) and
+    /// hand it `run`.
+    fn enter_loaded<R>(
+        &self,
+        run: impl FnOnce(
+            &mut NativeProcessEntry<
+                '_,
+                'static,
+                AddressContext<RootGpa>,
+                ParkedContextWords,
+                Physical<'static, ParkedContextWords>,
+            >,
+        ) -> R,
+    ) -> R {
+        let fixture = &self.capacity.fixture;
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        let (_, address, words) = self.loaded.borrow().unwrap();
+        let mut service = fixture.service();
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &words,
+                &mut service,
+            )
+            .unwrap();
+        run(&mut child)
+    }
+
+    /// Claim the host-file request the child published, under its service
+    /// queue, and answer it with `answer` (the carrier's transport).
+    fn serve(
+        &self,
+        record: RecordRef,
+        answer: impl FnOnce(
+            &mut [u8],
+            carrick_core_abi::service::ServiceTicket<
+                &'static carrick_core_abi::service::ServiceCell,
+            >,
+        ),
+    ) {
+        use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+        let fixture = &self.capacity.fixture;
+        let notice = fixture.task.service_notice.take().unwrap().unwrap();
+        let identity = fixture.zone.record(record.id).identity();
+        // SAFETY: the real native owner retains this exact control allocation.
+        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+        let wait_key =
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(wait_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+        // SAFETY: the service queue authenticates the notice and excludes
+        // cancellation.
+        let ticket = unsafe {
+            ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, identity)
+        }
+        .unwrap();
+        let ServiceOperation::HostFile { payload, .. } = ticket.request().operation else {
+            panic!("host file notice expected")
+        };
+        // SAFETY: the ticket retains the request box; no ring execution can
+        // mutate it.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                payload.ring_storage().raw() as *mut u8,
+                payload.length().raw() as usize,
+            )
+        };
+        answer(bytes, ticket);
+        queue
+            .notify_object(fixture.slot, &mut WakeEffects::default())
+            .unwrap();
+    }
+
+    /// Sample the child's host-readiness queue, as the carrier does before
+    /// its non-blocking probe.
+    fn ready_revision(&self, record: RecordRef) -> u64 {
+        let fixture = &self.capacity.fixture;
+        let key =
+            carrick_sched_core::object_wait::ObjectWaitKey::native_host_ready(record).unwrap();
+        let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            ParkedContextWords,
+        >| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        };
+        let _ = fixture
+            .zone
+            .bind_object_wait(key, &carrick_sched_core::ShortLockSpin, &completion);
+        fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &completion)
+            .unwrap()
+            .snapshot()
+            .revision()
+    }
+
+    /// Publish the readiness of the host object the child waits on, as the
+    /// carrier's reactor does.
+    fn notify_ready(&self, record: RecordRef) {
+        let fixture = &self.capacity.fixture;
+        let key =
+            carrick_sched_core::object_wait::ObjectWaitKey::native_host_ready(record).unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+        queue
+            .notify_object(fixture.slot, &mut WakeEffects::default())
+            .unwrap();
+    }
+
+    /// Stage `call` as the child's and begin its host-file service: the
+    /// child's first call (`loaded` false: its slot selects it first), or
+    /// its next one after the last returned.
+    fn begin(
+        &self,
+        call: carrick_personality_linux::native_host_file::HostFileCall,
+        ordinal: u64,
+        loaded: bool,
+    ) -> RecordRef {
+        use carrick_personality_linux::native_host_file::{HostFileStage, NativeNamespace};
+        let fixture = &self.capacity.fixture;
+        let host =
+            |_| {
+                Some(carrick_personality_linux::native_host_file::NativeDescriptor::HostBacked {
+                access: carrick_personality_linux::native_host_file::DescriptionAccess::ReadWrite,
+            })
+            };
+        let mut resolve = host;
+        let mut releases = |_: &mut [carrick_core_abi::host_file::MapSourceReply]| 0;
+        let Some(HostFileStage::Request {
+            record: staged,
+            output,
+            resolves_path,
+            map,
+            chdir,
+        }) = crate::dispatch::stage_native_host_file(
+            call,
+            fixture.task,
+            &ResidentUser,
+            &mut NativeNamespace {
+                table: [1, 1, 1],
+                resolve: &mut resolve,
+                releases: &mut releases,
+            },
+        )
+        else {
+            panic!("the child's call crosses to the carrier");
+        };
+        let counters = self.counters;
+        let begin = |child: &mut NativeProcessEntry<
+            '_,
+            'static,
+            AddressContext<RootGpa>,
+            ParkedContextWords,
+            Physical<'static, ParkedContextWords>,
+        >| {
+            if !loaded {
+                assert!(matches!(
+                    child.resume_checkpoint(|_| Ok(None)),
+                    Ok(NativeResume::NoPending)
+                ));
+            }
+            assert!(matches!(
+                child.begin_host_file_service(
+                    staged,
+                    output,
+                    resolves_path,
+                    map,
+                    chdir,
+                    NativeServiceCall::new(
+                        carrick_guest_arch::NativeOrdinal::new(ordinal),
+                        counters
+                    )
+                ),
+                Ok(NativeResume::Left(None))
+            ));
+            assert!(child.take_handoff_receipt().is_some());
+        };
+        if loaded {
+            self.enter_loaded(begin);
+            self.loaded.borrow().unwrap().0
+        } else {
+            self.enter(begin).0
+        }
+    }
+
+    /// Answer the child's published request with a wait on its
+    /// host-readiness queue and let the child park on it. The request's
+    /// record bytes, as published.
+    fn answer_wait(&self, record: RecordRef) -> Vec<u8> {
+        let revision = self.ready_revision(record);
+        let mut published = Vec::new();
+        self.serve(record, |bytes, ticket| {
+            published = bytes.to_vec();
+            let wait = carrick_core_abi::PortalOwnerWait::host_readiness(
+                ticket.request().identity.birth.mm,
+                revision,
+            );
+            assert!(ticket.complete_wait(wait).is_ok());
+        });
+        let (resumed, parked) = self.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+        assert_eq!(resumed, record);
+        assert!(
+            matches!(parked, Ok(NativeResume::Left(None))),
+            "the child parks on its host-readiness queue"
+        );
+        published
+    }
+}
+
+/// #2414 review: a signal interrupts a native child's host-readiness wait
+/// (#231). The production ring service stages the child's blocking
+/// `recvfrom`, the carrier answers a wait on the child's host-readiness
+/// queue, the child parks on it, and the signal's service cancellation
+/// wakes it from that queue: the call answers EINTR, and, having moved
+/// nothing, is retained for the shared signal policy, which restarts it
+/// under SA_RESTART on either ISA. Red before the fix: the cancellation
+/// looked the wait up as an MM resource wait, which a host-readiness wait
+/// is not, and refused it (Stale), which fails the run on both ISAs.
+#[cfg(test)]
+#[test]
+fn a_signal_interrupts_a_native_childs_host_readiness_wait_with_eintr() {
+    use carrick_personality_linux::native_host_file::{HostFileCall, SocketCall};
+    let buffer = Box::leak(Box::new([0u8; 16]));
+    let wait = HostReadyWaitFixture::new();
+    let call = SocketCall::decode(
+        carrick_personality_linux::crossing::nr::RECVFROM,
+        &[3, buffer.as_ptr() as u64, 16, 0, 0, 0],
+    )
+    .unwrap();
+    let record = wait.begin(HostFileCall::Socket(call), 207, false);
+    wait.answer_wait(record);
+    let fixture = &wait.capacity.fixture;
+    let mut service = fixture.service();
+    fixture
+        .runtime
+        .cancel_service(record, fixture.slot, &mut service)
+        .expect("a signal cancels a host-readiness wait");
+    let (resumed, (answer, retained)) = wait.enter(|child| {
+        let answer = child.resume_checkpoint(|_| Ok(None));
+        (answer, child.take_interrupted_child_wait().is_some())
+    });
+    assert_eq!(resumed, record);
+    assert!(
+        matches!(
+            answer,
+            Ok(NativeResume::Returned(result))
+                if result.raw() == carrick_syscall_abi::LINUX_EINTR.guest_retval()
+        ),
+        "the interrupted call answers EINTR"
+    );
+    assert!(
+        retained,
+        "an interrupted recvfrom is retained for its SA_RESTART restart"
+    );
+}
+
+/// #2414 review P0-1: a native child's blocking stream send keeps its whole
+/// extent across records, in the production ring service shared by both
+/// ISAs. The child's 200000-byte `sendto` crosses its first 65536 bytes;
+/// the carrier moves them all on a blocking stream socket, then only 1000
+/// of the next record (the host's send buffer was full), then answers a
+/// wait (the next record would block); the ring continues each time from
+/// the byte after the last one moved, publishing the same record again once
+/// the socket is writable, and copies each record's bytes from the caller's
+/// memory, until the call answers all 200000. Red before the fix: staging
+/// clipped the call to 61440 bytes and the first record's count was the
+/// call's answer.
+#[cfg(test)]
+#[test]
+fn a_native_childs_blocking_send_continues_across_records_to_its_full_count() {
+    use carrick_core_abi::host_file::{
+        HostFileRequestView, NetCall, NetTransferFacts, replied_input, request_parts,
+    };
+    use carrick_personality_linux::native_host_file::{HostFileCall, SocketCall};
+    const LEN: usize = 200_000;
+    let buffer: &'static [u8] = Box::leak(vec![7u8; LEN].into_boxed_slice());
+    let base = buffer.as_ptr() as u64;
+    let wait = HostReadyWaitFixture::new();
+    let call = SocketCall::decode(
+        carrick_personality_linux::crossing::nr::SENDTO,
+        &[3, base, LEN as u64, 0, 0, 0],
+    )
+    .unwrap();
+    let record = wait.begin(HostFileCall::Socket(call), 206, false);
+    let stream = NetTransferFacts {
+        stream: true,
+        blocking: true,
+    };
+    // Serve the child's published record with `moved` bytes, and return
+    // its call's (address, length, staged bytes).
+    let serve = |moved: i64| {
+        let mut seen = None;
+        wait.serve(record, |bytes, ticket| {
+            let (_, input, _) = request_parts(bytes).unwrap();
+            let (_, call) = carrick_core_abi::host_file::NetCaller::split(input).unwrap();
+            let call = NetCall::decode(call).unwrap();
+            let data = call.staged().next().and_then(|(_, data)| data).unwrap();
+            seen = Some((call.args[1], call.args[2], data.len(), data[0]));
+            HostFileRequestView::parse(bytes)
+                .unwrap()
+                .reply(moved, &NetCall::encode_written(stream, &[]))
+                .unwrap();
+            assert!(replied_input(bytes).is_some());
+            assert!(ticket.complete(true).is_ok());
+        });
+        seen.unwrap()
+    };
+    let resume = || {
+        let (resumed, answer) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+        assert_eq!(resumed, record);
+        answer
+    };
+    // The first record stages 65536 bytes of the caller's buffer and the
+    // call's whole length.
+    assert_eq!(serve(65_536), (base, LEN as u64, 65_536, 7));
+    assert!(matches!(resume(), Ok(NativeResume::Left(None))));
+    // The next record continues from the byte after the last one moved: the
+    // fixture's memory reads as each byte's address (`copy_syscall_input`).
+    let next = base + 65_536;
+    assert_eq!(
+        serve(1_000),
+        (next, (LEN - 65_536) as u64, 65_536, next as u8)
+    );
+    assert!(matches!(resume(), Ok(NativeResume::Left(None))));
+    // That record would block: the child waits on its host-readiness
+    // queue, then publishes the same record again.
+    let next = next + 1_000;
+    let revision = wait.ready_revision(record);
+    let mut waited = None;
+    wait.serve(record, |bytes, ticket| {
+        waited = Some(bytes.to_vec());
+        let wait = carrick_core_abi::PortalOwnerWait::host_readiness(
+            ticket.request().identity.birth.mm,
+            revision,
+        );
+        assert!(ticket.complete_wait(wait).is_ok());
+    });
+    assert!(matches!(resume(), Ok(NativeResume::Left(None))));
+    wait.notify_ready(record);
+    assert!(matches!(resume(), Ok(NativeResume::Left(None))));
+    let left = (LEN - 66_536) as u64;
+    assert_eq!(serve(65_536), (next, left, 65_536, next as u8));
+    assert!(matches!(resume(), Ok(NativeResume::Left(None))));
+    let (next, left) = (next + 65_536, left - 65_536);
+    assert_eq!(serve(65_536), (next, left, 65_536, next as u8));
+    assert!(matches!(resume(), Ok(NativeResume::Left(None))));
+    let (next, left) = (next + 65_536, left - 65_536);
+    assert_eq!(serve(left as i64), (next, left, left as usize, next as u8));
+    assert!(
+        matches!(resume(), Ok(NativeResume::Returned(result)) if result.raw() == LEN as i64),
+        "the blocking send answers its whole buffer"
+    );
+    let waited = waited.unwrap();
+    let (_, input, _) = request_parts(&waited).unwrap();
+    assert!(input.len() > 65_536, "the waited record staged its range");
+}
+
+/// #2414 review P0-2: a native child's poll keeps one ring serial for the
+/// whole call and a new call gets a new one, so the carrier keys each
+/// call's own deadline. The production ring service stamps the child's
+/// poll record with its serial; when the host object becomes ready the
+/// child publishes the same record again (the same set and serial), never
+/// a restaged call; and an identical poll issued after the first was
+/// interrupted carries a new serial. Red before the fix: a poll record
+/// carried no serial, and the carrier keyed the deadline on the set and
+/// timeout, which an identical re-issued poll shares.
+#[cfg(test)]
+#[test]
+fn a_native_childs_poll_keeps_one_serial_per_call_and_a_new_call_a_new_one() {
+    use carrick_core_abi::host_file::{HostCallSerial, POLL_CALL_SERIAL_ARG, request_parts};
+    use carrick_personality_linux::native_host_file::HostFileCall;
+    let pollfd = Box::leak(Box::new([3u8, 0, 0, 0, 1, 0, 0, 0]));
+    let poll = HostFileCall::Ppoll {
+        fds: pollfd.as_ptr() as u64,
+        nfds: 1,
+        timeout: 0,
+        sigmask: 0,
+    };
+    let serial = |bytes: &[u8]| {
+        let (header, input, _) = request_parts(bytes).unwrap();
+        (
+            HostCallSerial::from_raw(header.args[POLL_CALL_SERIAL_ARG]),
+            input.to_vec(),
+        )
+    };
+    let wait = HostReadyWaitFixture::new();
+    let record = wait.begin(poll, 73, false);
+    let (first, set) = serial(&wait.answer_wait(record));
+    assert!(first.is_some(), "the ring stamps the poll call's serial");
+
+    // The host object became ready: the child publishes the same call's
+    // record again.
+    wait.notify_ready(record);
+    let (resumed, published) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+    assert_eq!(resumed, record);
+    assert!(matches!(published, Ok(NativeResume::Left(None))));
+    let again = serial(&wait.answer_wait(record));
+    assert_eq!(
+        again,
+        (first, set.clone()),
+        "the same call keeps its record and serial"
+    );
+
+    // A signal interrupts it; the identical poll issued again is a new call.
+    let fixture = &wait.capacity.fixture;
+    let mut service = fixture.service();
+    fixture
+        .runtime
+        .cancel_service(record, fixture.slot, &mut service)
+        .unwrap();
+    let (_, (answer, retained)) = wait.enter(|child| {
+        let answer = child.resume_checkpoint(|_| Ok(None));
+        (answer, child.take_interrupted_child_wait().is_some())
+    });
+    assert!(matches!(
+        answer,
+        Ok(NativeResume::Returned(result))
+            if result.raw() == carrick_syscall_abi::LINUX_EINTR.guest_retval()
+    ));
+    assert!(!retained, "Linux never restarts an interrupted poll");
+    let record = wait.begin(poll, 73, true);
+    let (next, next_set) = serial(&wait.answer_wait(record));
+    assert_eq!(next_set, set, "the identical set and timeout");
+    assert!(
+        next.is_some() && next != first,
+        "a new call has a new serial"
+    );
 }
 
 #[cfg(test)]

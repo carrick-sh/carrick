@@ -222,8 +222,9 @@ impl StagedMemory {
         })
     }
 
-    /// The written extent of each output range, in segment order.
-    fn written(&self) -> Vec<u8> {
+    /// The call's `facts` and the written extent of each output range, in
+    /// segment order.
+    fn written(&self, facts: carrick_core_abi::host_file::NetTransferFacts) -> Vec<u8> {
         let extents: Vec<(u32, &[u8])> = self
             .segments
             .iter()
@@ -233,7 +234,7 @@ impl StagedMemory {
                 None => (0, &held.bytes[..0]),
             })
             .collect();
-        NetCall::encode_written(&extents)
+        NetCall::encode_written(facts, &extents)
     }
 }
 
@@ -276,6 +277,68 @@ impl carrick_guest_mem::GuestMemory for StagedMemory {
 }
 
 impl carrick_guest_mem::CurrentMmMemory for StagedMemory {}
+
+/// The Linux type of a native socket's description (`SOCK_STREAM`,
+/// `SOCK_DGRAM`, ...), whatever backs it.
+fn native_socket_type(socket: &NativeNetFile) -> Option<i32> {
+    use crate::dispatch::fd_table::OpenDescription;
+    socket
+        .description()
+        .inspect_kind(|open| match open {
+            OpenDescription::HostSocket { type_, .. } => Some(*type_ & 0xf),
+            OpenDescription::InMemorySocket { socket, .. } => Some(socket.socket_type),
+            _ => None,
+        })
+        .flatten()
+}
+
+/// Fit a `send` or `recv` to the range its record staged (#2414 review
+/// P0-1). The record keeps the call's whole extent in `args[2]` and stages
+/// at most one record's range of it at `args[1]`, a range every inet
+/// datagram fits:
+/// - a stream transfer moves at most that range, and the ring continues
+///   it with the call's next record;
+/// - a receive's datagram fits the range whole, so the range is its buffer;
+/// - a datagram send larger than the range is larger than any datagram the
+///   socket can carry (an IP datagram's length is 16 bits): EMSGSIZE, and
+///   nothing is transmitted.
+///
+/// `Some` is the call's answer before any handler runs.
+fn native_transfer_extent(
+    call: &NetCall<'_>,
+    socket: Option<&NativeNetFile>,
+    args: &mut [u64; 6],
+) -> Option<NetServed> {
+    use carrick_abi::syscall::nr;
+    let send = call.canonical == nr::SENDTO.raw();
+    if !send && call.canonical != nr::RECVFROM.raw() {
+        return None;
+    }
+    let range = call
+        .segments()
+        .first()
+        .filter(|segment| segment.address == call.args[1])
+        .map_or(0, |segment| u64::from(segment.len));
+    if args[2] <= range {
+        return None;
+    }
+    if send {
+        match socket.and_then(native_socket_type) {
+            Some(carrick_abi::LINUX_SOCK_STREAM) => {}
+            Some(carrick_abi::LINUX_SOCK_DGRAM | carrick_abi::LINUX_SOCK_RAW) => {
+                return Some(NetServed::Reply(
+                    carrick_abi::LINUX_EMSGSIZE.guest_retval(),
+                    Vec::new(),
+                ));
+            }
+            // A message larger than one record on another socket type
+            // has no exact answer here: a counted ENOSYS, never a guess.
+            _ => return Some(NetServed::Refused),
+        }
+    }
+    args[2] = range;
+    None
+}
 
 /// One served network call.
 pub(in crate::dispatch) enum NetServed {
@@ -376,8 +439,20 @@ impl SyscallDispatcher {
         else {
             return NetServed::Refused;
         };
-        let scratch = Arc::new(crate::kernel::FileTable::new(scratch_id));
         let mut args = call.args;
+        if let Some(answer) =
+            native_transfer_extent(call, socket.map(|(socket, _)| socket), &mut args)
+        {
+            return answer;
+        }
+        // What the ring's transfer continuation needs of this socket.
+        let facts = carrick_core_abi::host_file::NetTransferFacts {
+            stream: socket.and_then(|(socket, _)| native_socket_type(socket))
+                == Some(carrick_abi::LINUX_SOCK_STREAM),
+            blocking: socket.is_some_and(|(_, nonblock)| !nonblock)
+                && args[3] & carrick_abi::LINUX_MSG_DONTWAIT as u64 == 0,
+        };
+        let scratch = Arc::new(crate::kernel::FileTable::new(scratch_id));
         if let Some((socket, nonblock)) = socket {
             let description = socket.description();
             // The guest's O_NONBLOCK lives in its ring description, which
@@ -442,9 +517,9 @@ impl SyscallDispatcher {
                 {
                     Some((_, slot)) => {
                         let reply = self.install_native_socket(owner, table, slot);
-                        NetServed::Reply(reply, memory.written())
+                        NetServed::Reply(reply, memory.written(facts))
                     }
-                    None => NetServed::Reply(value as i64, memory.written()),
+                    None => NetServed::Reply(value as i64, memory.written(facts)),
                 }
             }
             Ran::Outcome(DispatchOutcome::Errno { errno }) => {
@@ -565,7 +640,7 @@ impl SyscallDispatcher {
             ) {
                 NetServed::Reply(result, framed) if result >= 0 => {
                     let output = NetCall::decode_written(call.segments(), &framed)
-                        .and_then(|written| written.into_iter().next())
+                        .and_then(|(_, written)| written.into_iter().next())
                         .map_or_else(Vec::new, |(_, bytes)| bytes.to_vec());
                     NetServed::Reply(result, output)
                 }

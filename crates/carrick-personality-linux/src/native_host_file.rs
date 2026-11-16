@@ -40,7 +40,10 @@ pub const LINUX_AT_EMPTY_PATH: u32 = 0x1000;
 const IOVEC_BYTES: usize = 16;
 
 mod socket;
-pub use socket::{SocketCall, net_caller, stamp_net_caller};
+pub use socket::{
+    NetTransfer, NetTransferStep, SocketCall, is_net_transfer, net_caller, net_transfer_record,
+    net_transfer_step, stamp_net_caller,
+};
 const PAGE_BYTES: u64 = 4096;
 
 /// Access mode of the open description a descriptor names.
@@ -604,6 +607,21 @@ pub trait HostFileUser {
     fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool;
     /// Contiguous bytes from `dst` that user mode can write now.
     fn writable(&mut self, dst: u64, len: usize) -> usize;
+    /// Contiguous bytes from `src` that user mode can read now: one probe
+    /// byte per page, without staging the range.
+    fn readable(&mut self, src: u64, len: usize) -> usize {
+        let mut done = 0;
+        while done < len {
+            let Some(address) = src.checked_add(done as u64) else {
+                return done;
+            };
+            if !self.copy_in(&mut [0u8], address) {
+                return done;
+            }
+            done += ((PAGE_BYTES - address % PAGE_BYTES) as usize).min(len - done);
+        }
+        len
+    }
 }
 
 /// User output the ring copies back after the carrier replies.
@@ -2165,6 +2183,55 @@ pub fn stamp_write_file_size_limit<E>(
     args[index] = soft_limit()?;
     view.set_args(args);
     Ok(())
+}
+
+/// The same request as `record` with its reply cleared, for the ring to
+/// publish again once the host object its call would have blocked on is
+/// ready (#2414): the record made no effect, and its staged input, header
+/// and stamps are the call's own. `None` for a malformed record.
+pub fn request_again(record: &[u8]) -> Option<Box<[u8]>> {
+    let (header, input, output_cap) = host_file::request_parts(record)?;
+    let mut again = vec![0u8; record_len(input.len(), output_cap)?].into_boxed_slice();
+    host_file::encode(&mut again, header, input, output_cap).ok()?;
+    Some(again)
+}
+
+/// Whether Linux restarts `record`'s call under `SA_RESTART` when a signal
+/// interrupts it before any effect (signal(7)): a socket call, a read or a
+/// write of a slow object, never a poll. The canonical number is the
+/// record's own, whatever the caller's ISA.
+pub fn restarts_after_interrupt(record: &[u8]) -> bool {
+    let Some((header, input, _)) = host_file::request_parts(record) else {
+        return false;
+    };
+    let canonical = match header.op {
+        HostFileOp::NetSyscall => match socket::staged_call(input) {
+            Some(call) => call.canonical,
+            None => return false,
+        },
+        HostFileOp::Read => crate::crossing::nr::READ.raw(),
+        HostFileOp::Write => crate::crossing::nr::WRITE.raw(),
+        _ => return false,
+    };
+    carrick_signal_core::is_native_restartable_syscall(canonical)
+}
+
+/// Stamp a staged `Poll` record with its call's ring serial (#2414 review
+/// P0-2): the carrier keys the call's deadline on it, so a record the ring
+/// publishes again for the same call keeps the call's deadline and a new
+/// call starts its own. Any other record is left as staged. `false` for a
+/// malformed record.
+pub fn stamp_poll_call(record: &mut [u8], serial: host_file::HostCallSerial) -> bool {
+    let Ok(mut view) = host_file::HostFileRequestView::parse(record) else {
+        return false;
+    };
+    if view.header().op != HostFileOp::Poll {
+        return true;
+    }
+    let mut args = view.header().args;
+    args[host_file::POLL_CALL_SERIAL_ARG] = serial.raw();
+    view.set_args(args);
+    true
 }
 
 #[cfg(test)]

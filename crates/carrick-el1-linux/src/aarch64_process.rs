@@ -2717,6 +2717,32 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             Err(NativeProcessError::Fault)
         }
     }
+    fn copy_syscall_input(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        bytes: &mut [u8],
+    ) -> Result<(), NativeProcessError> {
+        if self.task.mm.key.load(Ordering::Acquire) != mm.mm.raw().get() {
+            return Err(NativeProcessError::Stale);
+        }
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
+            if ttbr0 & AARCH64_ROOT_ADDRESS_MASK != mm.root.address().raw() {
+                return Err(NativeProcessError::Stale);
+            }
+        }
+        let mut copy = crate::file::ValidatedCopy {
+            task: self.task,
+            validator: &crate::file::HardwareValidator,
+        };
+        if crate::file::UserCopy::copy_in(&mut copy, bytes, address.raw()) {
+            Ok(())
+        } else {
+            Err(NativeProcessError::Fault)
+        }
+    }
     fn copy_siginfo(
         &mut self,
         mm: &Self::Mm,

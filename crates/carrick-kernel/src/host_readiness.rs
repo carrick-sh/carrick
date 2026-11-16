@@ -282,12 +282,16 @@ impl HostReadinessReactor {
     }
 }
 
-/// A member's poll deadline (#231): fixed by its first empty snapshot of one
-/// exact poll call, so the call's reruns after a wake keep the deadline Linux
-/// would have, and an identical later call starts afresh once it answered.
+/// A member's poll deadline (#231), keyed by the member and the poll call's
+/// ring serial (#2414 review P0-2). The call's first empty snapshot fixes
+/// it; every record the ring publishes again for the same call after a
+/// readiness wake carries the same serial and keeps it, as Linux keeps one
+/// call's timeout across its wakes. A new call, including one issued again
+/// after an interruption, carries a new serial and starts its own deadline,
+/// which replaces the old call's: a deadline lives no longer than its call.
 #[derive(Debug, Default)]
 pub(crate) struct PollDeadlines {
-    held: Mutex<HashMap<(u32, u64), (u64, Instant)>>,
+    held: Mutex<HashMap<(u32, u64), (carrick_core_abi::host_file::HostCallSerial, Instant)>>,
 }
 
 impl PollDeadlines {
@@ -295,11 +299,11 @@ impl PollDeadlines {
         (record.id.raw(), record.incarnation)
     }
 
-    /// The deadline of `record`'s poll call `fingerprint` with `timeout`.
+    /// The deadline of `record`'s poll call `call` with `timeout`.
     pub(crate) fn deadline(
         &self,
         record: carrick_el1_abi::RecordRef,
-        fingerprint: u64,
+        call: carrick_core_abi::host_file::HostCallSerial,
         timeout: Duration,
     ) -> Instant {
         let mut held = self.held.lock();
@@ -308,9 +312,9 @@ impl PollDeadlines {
         held.retain(|_, (_, deadline)| *deadline + Duration::from_secs(60) > now);
         let entry = held
             .entry(Self::key(record))
-            .or_insert((fingerprint, now + timeout));
-        if entry.0 != fingerprint {
-            *entry = (fingerprint, now + timeout);
+            .or_insert((call, now + timeout));
+        if entry.0 != call {
+            *entry = (call, now + timeout);
         }
         entry.1
     }
@@ -432,19 +436,41 @@ mod tests {
 
     #[test]
     fn a_poll_deadline_is_fixed_by_its_first_wait_and_spent_when_answered() {
+        let call = |raw| carrick_core_abi::host_file::HostCallSerial::from_raw(raw).unwrap();
         let deadlines = PollDeadlines::default();
-        let first = deadlines.deadline(record(4), 11, Duration::from_secs(30));
-        // The same call's rerun keeps its deadline.
+        let first = deadlines.deadline(record(4), call(11), Duration::from_secs(30));
+        // The same call's record, published again after a wake, keeps its
+        // deadline.
         assert_eq!(
-            deadlines.deadline(record(4), 11, Duration::from_secs(30)),
+            deadlines.deadline(record(4), call(11), Duration::from_secs(30)),
             first
         );
         // Another call starts afresh.
         assert_ne!(
-            deadlines.deadline(record(4), 12, Duration::from_secs(60)),
+            deadlines.deadline(record(4), call(12), Duration::from_secs(60)),
             first
         );
         deadlines.clear(record(4));
-        assert!(deadlines.deadline(record(4), 11, Duration::from_secs(30)) >= first);
+        assert!(deadlines.deadline(record(4), call(11), Duration::from_secs(30)) >= first);
+    }
+
+    /// #2414 review P0-2: an identical poll issued again after an
+    /// interrupted one (the same set and timeout, a new ring serial) waits
+    /// its own full timeout, never the interrupted call's spent deadline.
+    #[test]
+    fn an_identical_poll_after_an_interrupted_one_starts_its_own_deadline() {
+        let call = |raw| carrick_core_abi::host_file::HostCallSerial::from_raw(raw).unwrap();
+        let deadlines = PollDeadlines::default();
+        let interrupted = deadlines.deadline(record(5), call(21), Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            interrupted <= Instant::now(),
+            "the interrupted call's deadline passed"
+        );
+        let again = deadlines.deadline(record(5), call(22), Duration::from_secs(30));
+        assert!(
+            again > Instant::now() + Duration::from_secs(29),
+            "the new call waits its own timeout"
+        );
     }
 }
