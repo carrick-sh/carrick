@@ -1182,21 +1182,25 @@ impl GuestMemory for LinearMemory {
 
 impl CurrentMmMemory for LinearMemory {}
 
-/// Why an admitted MM's retained private file range lost its frames.
+/// Why an admitted MM's private root node range lost its frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrivateFileRetirement {
+pub enum OwnerRetirement {
     /// `MADV_DONTNEED` returned the pages to the node's retained source.
-    Discard,
+    FileDiscard,
+    /// `MADV_DONTNEED` of a private anonymous node: its next touch is a
+    /// fresh zero page from the owner.
+    AnonymousDiscard,
     /// In-place `mremap` growth cleared predecessor backing under the
     /// extension before the node's source supplies it.
-    Growth,
+    FileGrowth,
 }
 
-impl std::fmt::Display for PrivateFileRetirement {
+impl std::fmt::Display for OwnerRetirement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Discard => "discard",
-            Self::Growth => "mremap growth",
+            Self::FileDiscard => "private file discard",
+            Self::AnonymousDiscard => "private anonymous discard",
+            Self::FileGrowth => "private file mremap growth",
         })
     }
 }
@@ -1212,15 +1216,13 @@ pub enum DispatchError {
     MemoryPreparation(String),
     #[error("file mmap attempted to reacquire its own owner gate: {0:?}")]
     MmapSelfHeldOwnerGate(carrick_el1_abi::PortalOwnerWait),
-    /// Retiring a private file node's frames (a discard, or the predecessor
-    /// backing under an in-place growth) failed after its translation edit
-    /// began: the old owner can be neither trusted nor restored, so the run
-    /// must stop rather than answer the guest.
-    #[error(
-        "private file {operation} retirement is indeterminate at {address:#x}+{len:#x}: {error}"
-    )]
-    PrivateFileRetirementIndeterminate {
-        operation: PrivateFileRetirement,
+    /// Retiring a private root node's frames (a discard, or the predecessor
+    /// backing under an in-place file growth) failed after its translation
+    /// edit began: the old owner can be neither trusted nor restored, so the
+    /// run must stop rather than answer the guest.
+    #[error("{operation} retirement is indeterminate at {address:#x}+{len:#x}: {error}")]
+    OwnerRetirementIndeterminate {
+        operation: OwnerRetirement,
         address: u64,
         len: u64,
         error: carrick_guest_mem::MemoryError,

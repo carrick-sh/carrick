@@ -1098,24 +1098,49 @@ impl<'a> MemView<'a> {
         snapshot_private_mmap_description(description, offset, length, self.linux_page_size())
     }
 
-    /// Discard an admitted MM's private file pages back to their root
-    /// node's retained source. The owner refuses every byte transfer while
-    /// this mutation holds the MM's gate, and needs none: retiring the
-    /// private frames leaves the node, its protection and its source, so the
-    /// next touch supplies the file's current bytes at the node's offset,
-    /// exactly as the first touch did. `false` when any page of `segment` is
-    /// not such a node (host setup restores its own bytes below).
-    pub(crate) fn discard_owner_private_file_segment(
+    /// Discard an admitted MM's private root pages without moving a byte.
+    /// The owner refuses every byte transfer while this mutation holds the
+    /// MM's gate (and generic `zero_backing` outright), and needs none:
+    /// retiring the private frames leaves the node and its protection, so
+    /// the next touch is supplied by the owner exactly as the first touch
+    /// was. A retained file node supplies the file's current bytes at its
+    /// offset (`FileDiscard`); a plain private anonymous node a fresh zero
+    /// page (`AnonymousDiscard`). `false` when any page of `segment` is not
+    /// a node of the segment's class: the caller keeps its host-setup path.
+    pub(crate) fn discard_owner_private_segment(
         &self,
         memory: &mut impl CurrentMmMemory,
         segment: &MadviseCoveredSegment,
     ) -> Result<bool, DispatchError> {
+        use crate::dispatch::outcome::OwnerRetirement;
+        use carrick_el1_abi::ReservationNodeFlags;
+        use carrick_personality_linux::mm::madvise::{Class, Segment};
+        let operation = match segment.class() {
+            Class::PrivateFile => OwnerRetirement::FileDiscard,
+            Class::PrivateAnonymous => OwnerRetirement::AnonymousDiscard,
+            Class::Shared | Class::Special => return Ok(false),
+        };
         let Some(root) = self.mem().lock().delegated_root().cloned() else {
             return Ok(false);
         };
+        let owned = |node: &carrick_el1::memory::reservations::Mapping| match operation {
+            OwnerRetirement::FileDiscard | OwnerRetirement::FileGrowth => {
+                !node.anonymous && node.host_backing.is_some()
+            }
+            OwnerRetirement::AnonymousDiscard => {
+                node.anonymous
+                    && node.host_backing.is_none()
+                    && node.flags.contains(ReservationNodeFlags::ANONYMOUS_PRIVATE)
+                    && !node.flags.intersects(
+                        ReservationNodeFlags::FILE
+                            .union(ReservationNodeFlags::SHARED_ANONYMOUS)
+                            .union(ReservationNodeFlags::IMAGE),
+                    )
+            }
+        };
         let mut cursor = segment.start;
         for node in MemState::root_mappings(&root, segment.start, segment.end) {
-            if node.anonymous || node.host_backing.is_none() || node.range.start() > cursor {
+            if !owned(&node) || node.range.start() > cursor {
                 return Ok(false);
             }
             cursor = cursor.max(node.range.end());
@@ -1124,27 +1149,23 @@ impl<'a> MemView<'a> {
             return Ok(false);
         }
         let len = segment.end - segment.start;
-        self.retire_owner_private_file_range(
-            memory,
-            segment.start,
-            len,
-            crate::dispatch::outcome::PrivateFileRetirement::Discard,
-        )?;
+        self.retire_owner_private_range(memory, segment.start, len, operation)?;
         self.mark_range_nonresident(segment.start, len);
         Ok(true)
     }
 
     /// Retire the frames under `[start, start + len)` of an admitted MM's
-    /// retained private file node, so its next touch faults to the owner
-    /// and reads the node's source. The root decides these pages: the host
-    /// keeps no fact for them and arms no new-mapping publication, since
-    /// nothing is published here.
-    pub(crate) fn retire_owner_private_file_range(
+    /// private root node (a retained file node, or plain private anonymous),
+    /// so its next touch faults to the owner, which supplies the node's
+    /// source or a zero page. The root decides these pages: the host keeps
+    /// no fact for them and arms no new-mapping publication, since nothing
+    /// is published here.
+    pub(crate) fn retire_owner_private_range(
         &self,
         memory: &mut impl CurrentMmMemory,
         start: u64,
         len: u64,
-        operation: crate::dispatch::outcome::PrivateFileRetirement,
+        operation: crate::dispatch::outcome::OwnerRetirement,
     ) -> Result<(), DispatchError> {
         let length = usize::try_from(len).map_err(|_| LINUX_ENOMEM)?;
         match memory.retire_mapping(GuestVa::new(start), length) {
@@ -1155,7 +1176,7 @@ impl<'a> MemView<'a> {
                 return Err(DispatchError::Errno(LINUX_ENOMEM));
             }
             Err(carrick_guest_mem::MappingRetirementError::Indeterminate(error)) => {
-                return Err(DispatchError::PrivateFileRetirementIndeterminate {
+                return Err(DispatchError::OwnerRetirementIndeterminate {
                     operation,
                     address: start,
                     len,

@@ -2749,11 +2749,11 @@ impl MemView<'_> {
             // the owner on first touch. Publishing host protection here would
             // install zero-filled leaves the guest reads instead, so only
             // predecessor backing under the extension is retired.
-            match self.retire_owner_private_file_range(
+            match self.retire_owner_private_range(
                 memory,
                 extension.start(),
                 extension.len(),
-                crate::dispatch::outcome::PrivateFileRetirement::Growth,
+                crate::dispatch::outcome::OwnerRetirement::FileGrowth,
             ) {
                 Ok(()) => {}
                 Err(DispatchError::Errno(errno)) => return Ok(DispatchOutcome::errno(errno)),
