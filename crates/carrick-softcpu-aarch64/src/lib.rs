@@ -1,4 +1,4 @@
-//! Conservative, hand-authored A64 instruction census, not a decoder or CPU.
+//! Conservative, hand-authored A64 instruction census and partial operand decoder, not a CPU.
 //! Source: Arm ARM DDI0487, A64 instruction set encoding, "Index by
 //! encoding" (Data Processing -- Immediate/Register, Loads and Stores,
 //! Branches, Exception Generating and System, Data Processing -- SIMD/FP).
@@ -7,6 +7,9 @@
 //! remain Unknown. Membership does not imply that execution is implemented.
 #![no_std]
 #![forbid(unsafe_code)]
+
+mod decode;
+pub use decode::*;
 
 /// MRS/MSR encoding fields, preserving the architectural namespace exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -32,6 +35,13 @@ impl SystemRegister {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum A64Class {
     Unknown,
+    VariableShift,
+    CountLeadingBits,
+    ReverseBits,
+    Breakpoint,
+    ClearExclusive,
+    AddressTranslate,
+    TlbInvalidate,
     Arithmetic,
     Logical,
     Bitfield,
@@ -79,6 +89,20 @@ pub fn classify(w: u32) -> A64Class {
         MoveWide, Mrs, Msr, Multiply, PairLoadStore, Pstate, Return, ScalarLoadStore, Sev,
         SimdFpCompute, SimdFpLoadStore, Svc, Tlbi, Unknown, Wfe, Wfi,
     };
+    if let Some(decoded) = decode(w) {
+        return match decoded {
+            Decoded::VariableShift { .. } => A64Class::VariableShift,
+            Decoded::OneSource {
+                op: Unary::Clz | Unary::Cls,
+                ..
+            } => A64Class::CountLeadingBits,
+            Decoded::OneSource { .. } => A64Class::ReverseBits,
+            Decoded::Breakpoint { .. } => A64Class::Breakpoint,
+            Decoded::ClearExclusive { .. } => A64Class::ClearExclusive,
+            Decoded::AddressTranslate { .. } => A64Class::AddressTranslate,
+            Decoded::TlbInvalidate { .. } => A64Class::TlbInvalidate,
+        };
+    }
     // Branches, Exception Generating and System: exception generation,
     // unconditional branch (register/immediate), compare/test/conditional.
     if w & 0xffe0001f == 0xd4000001 {
@@ -133,9 +157,7 @@ pub fn classify(w: u32) -> A64Class {
     }
     // SYS: bounded EL1 maintenance operations actually used by the carrier.
     // Unknown SYS/SYSL operations are never promoted to maintenance classes.
-    if matches!(w, 0xd508831f | 0xd508871f)
-        || matches!(w & 0xffffffe0, 0xd5088340 | 0xd5088350 | 0xd5088320)
-    {
+    if matches!(w, 0xd508831f | 0xd508871f) {
         return Tlbi;
     }
     if matches!(

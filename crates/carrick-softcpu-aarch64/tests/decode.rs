@@ -73,7 +73,7 @@ fn neighboring_unallocated_leaves() {
     for word in [
         0x5ac00c00, 0xdac08000, 0xdac10000, 0xdac01800, 0x1ac03000, 0x3ac02000, 0x5ac02000,
         0xd4200001, 0xd503305e, 0xd503307f, 0xd5087880, 0xd5097800, 0xd50c7840, 0xd5087940,
-        0xd5088220, 0xd5098720, 0xd5088780, 0xd5088760,
+        0xd5088220, 0xd5098720, 0xd5088780, 0xd50887c0,
     ] {
         assert_eq!(classify(word), A64Class::Unknown, "{word:08x}");
     }
