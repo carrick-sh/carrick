@@ -11,6 +11,8 @@ pub const LINUX_AARCH64_EPOLL_EVENT_BYTES: u64 = 16;
 pub const LINUX_X8664_EPOLL_EVENT_BYTES: u64 = 12;
 
 pub mod ipc;
+mod net;
+pub use net::*;
 mod stat;
 pub use stat::{
     LINUX_PAGE_SIZE, LINUX_S_IFBLK, LINUX_S_IFCHR, LINUX_S_IFDIR, LINUX_S_IFIFO, LINUX_S_IFLNK,

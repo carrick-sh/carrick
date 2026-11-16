@@ -39,6 +39,41 @@ use crate::asid::{AsidAllocator, AsidError, AsidGeneration};
 )]
 pub struct NativeHostFileRefused;
 
+/// A retained service's answer to one native host-file request.
+pub enum NativeHostFileReply {
+    /// The reply is written in the record. A private-mapping record also
+    /// hands over its retained byte source, which the carrier registers for
+    /// the caller's MM before acknowledging.
+    Replied(Option<std::sync::Arc<dyn HostBackingRetention>>),
+    /// No reply was written: the request would block on a host object
+    /// (#231). The transport acknowledges an owner wait on the requesting
+    /// member's host-readiness queue from this revision, sampled before the
+    /// probe ([`carrick_core_abi::PortalWaitCause::HostReadiness`]).
+    HostReadyWait { revision: u64 },
+}
+
+impl NativeHostFileReply {
+    /// The owner wait the transport acknowledges for `requester`, or `None`
+    /// for a written reply.
+    pub fn owner_wait(
+        &self,
+        requester: carrick_core_abi::El1MmHandle,
+    ) -> Option<carrick_core_abi::PortalOwnerWait> {
+        match self {
+            Self::Replied(_) => None,
+            // SAFETY: the service sampled `revision` from the requesting
+            // member's own host-readiness queue before its failed probe.
+            Self::HostReadyWait { revision } => Some(unsafe {
+                carrick_core_abi::PortalOwnerWait::from_owner(
+                    requester,
+                    carrick_core_abi::PortalWaitCause::HostReadiness,
+                    *revision,
+                )
+            }),
+        }
+    }
+}
+
 /// Strong custody of an opaque byte source, independent of its original MM.
 /// The implementing source owner authenticates the handle and generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use carrick_core_abi::service::{ExecCapabilityId, ServiceFailureCode, ServiceRequest};
 
-use crate::fork_stock::{ExecutableIdentity, HostBackingRetention, NativeHostFileRefused};
+use crate::fork_stock::{
+    ExecutableIdentity, HostBackingRetention, NativeHostFileRefused, NativeHostFileReply,
+};
 
 /// Counted ENOSYS for an exec request whose capability names no live service.
 pub const UNROUTED_EXEC: ServiceFailureCode = match ServiceFailureCode::new(38) {
@@ -35,13 +37,15 @@ pub trait NativeExecHostService<Plan: Send + 'static>:
     /// carrier registers for the caller's MM before acknowledging. A
     /// readlink record receives the caller MM's retained `executable`, or
     /// `None` when that MM's custody holds none; the service then refuses
-    /// an executable-link lookup.
+    /// an executable-link lookup. A request that would block on a host
+    /// object answers [`NativeHostFileReply::HostReadyWait`] for the
+    /// requesting member and writes no reply.
     fn serve_host_file(
         &self,
         request: ServiceRequest,
         record: &mut [u8],
         executable: Option<Arc<dyn ExecutableIdentity>>,
-    ) -> Result<Option<Arc<dyn HostBackingRetention>>, NativeHostFileRefused>;
+    ) -> Result<NativeHostFileReply, NativeHostFileRefused>;
 
     /// Serve the root fork seed crossing: write the host-served root's live
     /// cwd and root into `record` once ([`carrick_core_abi::service::RootForkSeed::serve`]).
@@ -211,7 +215,7 @@ mod native_exec_service_registration_tests {
             _request: ServiceRequest,
             _record: &mut [u8],
             _executable: Option<Arc<dyn ExecutableIdentity>>,
-        ) -> Result<Option<Arc<dyn HostBackingRetention>>, NativeHostFileRefused> {
+        ) -> Result<NativeHostFileReply, NativeHostFileRefused> {
             Err(NativeHostFileRefused)
         }
 

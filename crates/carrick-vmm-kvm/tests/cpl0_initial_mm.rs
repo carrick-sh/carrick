@@ -1292,13 +1292,13 @@ fn native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there() {
             peer.service_idle_peer_doorbell_with_host_file(
                 &exit,
                 |_, _| {},
-                &mut |origin, record| {
+                &mut |origin, _, record| {
                     assert_eq!(origin, carrick_core_abi::service::ServiceOrigin::Descendant);
                     let served = dispatcher
                         .serve_native_host_file(record, None)
                         .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
                     marker = true;
-                    Ok(served.retained_source)
+                    Ok(served.into_reply())
                 },
                 &mut |_| Err(carrick_abi::LINUX_ENOSYS),
             )
@@ -2025,13 +2025,13 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
             peer.service_idle_peer_doorbell_with_host_file(
                 &exit,
                 |_, _| {},
-                &mut |origin, record| {
+                &mut |origin, _, record| {
                     assert_eq!(origin, carrick_core_abi::service::ServiceOrigin::Descendant);
                     let served = dispatcher
                         .serve_native_host_file(record, None)
                         .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
                     served_marker = true;
-                    Ok(served.retained_source)
+                    Ok(served.into_reply())
                 },
                 &mut |_| Err(carrick_abi::LINUX_ENOSYS),
             )
@@ -4876,11 +4876,20 @@ impl InetPeers {
         let wire = |port: u16| port.swap_bytes().to_string();
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp listener");
         let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp responder");
+        // The non-blocking dialer's peer only accepts.
+        let tcp_nb = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp listener");
         let mut defines = vec![
             format!("-DTCP_PORT={}", wire(tcp.local_addr().unwrap().port())),
             format!("-DUDP_PORT={}", wire(udp.local_addr().unwrap().port())),
+            format!(
+                "-DTCP_NB_PORT={}",
+                wire(tcp_nb.local_addr().unwrap().port())
+            ),
         ];
         Self::tcp(tcp);
+        std::thread::spawn(move || {
+            let _ = tcp_nb.accept();
+        });
         std::thread::spawn(move || {
             let mut query = [0u8; 16];
             let (_, from) = udp.recv_from(&mut query).expect("guest query");
@@ -4901,8 +4910,11 @@ impl InetPeers {
 /// #231: a forked native child's blocking AF_INET/AF_INET6 TCP and UDP
 /// sockets cross to the host network: socket, setsockopt, connect,
 /// getsockopt(SO_ERROR), getpeername, send, recv (MSG_WAITALL), shutdown,
-/// recv EOF and close against a loopback listener, then a DNS-style UDP
-/// sendto/recvfrom/getsockname, then TCP over `::1`. Red on main: the
+/// recv EOF and close against a loopback listener; a DNS-style UDP
+/// sendto, poll(POLLIN) until the answer, recvfrom, getsockname and a poll
+/// that times out; a non-blocking connect completed through poll(POLLOUT)
+/// and getsockopt(SO_ERROR); then TCP over `::1`. The blocking calls and
+/// polls wait on the member's host-readiness queue. Red on main: the
 /// child's `socket` was a counted ENOSYS (exit 101).
 #[test]
 fn native_child_inet_tcp_and_udp_cross_to_the_host_network() {
@@ -4914,22 +4926,5 @@ fn native_child_inet_tcp_and_udp_cross_to_the_host_network() {
         outcome.run.exit_code, 0,
         "child inet stage (100 + stage = ENOSYS; see native_child_inet.S): {:?}",
         outcome.run
-    );
-}
-
-/// #231: the x86 run root's own inet sockets take the same native venue
-/// (its descriptors live in its ring namespace, #1714). Red on main: the
-/// root's `socket` was refused by the x86 crossing set (exit 101).
-#[test]
-fn native_root_inet_tcp_and_udp_cross_to_the_host_network() {
-    let peers = InetPeers::start();
-    let mut defines: Vec<&str> = peers.defines.iter().map(String::as_str).collect();
-    defines.push("-DIN_ROOT");
-    let elf = native_exit_fixture_with_flags("native_child_inet.S", &defines);
-    let outcome = run_exec_fixture(&elf, 256);
-    assert_eq!(
-        outcome.run.exit_code, 0,
-        "root inet stage (100 + stage = ENOSYS; see native_child_inet.S): {:?}",
-        outcome.run.exit_code
     );
 }

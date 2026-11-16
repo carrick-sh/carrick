@@ -1593,6 +1593,8 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// IPC data-object and descriptor-table locks have independent sources.
     ipc_lock_release_waits:
         [object_wait::ObjectQueue; object_wait::ipc_release::IPC_LOCK_RELEASE_QUEUES],
+    /// A native member's host-object readiness waits (host network sockets).
+    native_host_ready_waits: [object_wait::ObjectQueue; ZONE_RECORDS],
     /// Saved host enrollment attempts handed back by the actual queue release.
     object_admission_handbacks:
         [completion_queue::CompletionQueue; object_wait::OBJECT_WAIT_QUEUES],

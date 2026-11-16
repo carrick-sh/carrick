@@ -70,6 +70,11 @@ pub enum PortalWaitCause {
     Gate = 4,
     Metadata = 5,
     ReservationPool = 6,
+    /// A host object the requesting member's service found not ready (a
+    /// host network socket). Its producer is the carrier's host readiness
+    /// watch, and its queue is the member's own
+    /// (`ObjectWaitKey::native_host_ready`), not an MM resource's.
+    HostReadiness = 7,
 }
 impl PortalWaitCause {
     pub const fn encode(self) -> u64 {
@@ -83,6 +88,7 @@ impl PortalWaitCause {
             4 => Some(Self::Gate),
             5 => Some(Self::Metadata),
             6 => Some(Self::ReservationPool),
+            7 => Some(Self::HostReadiness),
             _ => None,
         }
     }
@@ -357,6 +363,7 @@ pub const MM_TRANSFER_LAYOUT_HASH: u64 = {
         3u64,
         MM_PORTAL_PROTOCOL,
         PortalWaitCause::ReservationPool as u64,
+        PortalWaitCause::HostReadiness as u64,
         PREPARED,
         SUSPENDED,
         core::mem::size_of::<PortalTransferSlot>() as u64,

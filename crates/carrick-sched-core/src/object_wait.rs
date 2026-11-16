@@ -39,8 +39,9 @@ const DELEGATED_FILE_WAIT_BASE: usize = ORIGINAL_OBJECT_WAIT_QUEUES + EXTRA_CAUS
 const NATIVE_SERVICE_WAIT_BASE: usize = DELEGATED_FILE_WAIT_BASE + DELEGATED_FILE_WAIT_QUEUES;
 const MEMBER_RELEASE_WAIT_BASE: usize = NATIVE_SERVICE_WAIT_BASE + ZONE_RECORDS;
 const IPC_LOCK_RELEASE_WAIT_BASE: usize = MEMBER_RELEASE_WAIT_BASE + ZONE_RECORDS;
-pub const OBJECT_WAIT_QUEUES: usize =
+const NATIVE_HOST_READY_WAIT_BASE: usize =
     IPC_LOCK_RELEASE_WAIT_BASE + ipc_release::IPC_LOCK_RELEASE_QUEUES;
+pub const OBJECT_WAIT_QUEUES: usize = NATIVE_HOST_READY_WAIT_BASE + ZONE_RECORDS;
 
 // Every producer owns one disjoint index range. Keep this a compile-time gate
 // so adding a queue cannot silently alias another owner or its generation.
@@ -59,7 +60,8 @@ const _: () = {
         (DELEGATED_FILE_WAIT_BASE, NATIVE_SERVICE_WAIT_BASE),
         (NATIVE_SERVICE_WAIT_BASE, MEMBER_RELEASE_WAIT_BASE),
         (MEMBER_RELEASE_WAIT_BASE, IPC_LOCK_RELEASE_WAIT_BASE),
-        (IPC_LOCK_RELEASE_WAIT_BASE, OBJECT_WAIT_QUEUES),
+        (IPC_LOCK_RELEASE_WAIT_BASE, NATIVE_HOST_READY_WAIT_BASE),
+        (NATIVE_HOST_READY_WAIT_BASE, OBJECT_WAIT_QUEUES),
     ];
     let mut i = 0;
     while i < domains.len() {
@@ -80,7 +82,7 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 17;
+pub const OBJECT_WAIT_PROTOCOL: u64 = 18;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
@@ -117,6 +119,8 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
         ipc_release::IPC_LOCK_RELEASE_QUEUES as u64,
         core::mem::offset_of!(crate::ZoneTables, ipc_lock_release_waits) as u64,
         core::mem::offset_of!(crate::ZoneTables, member_release_waits) as u64,
+        NATIVE_HOST_READY_WAIT_BASE as u64,
+        core::mem::offset_of!(crate::ZoneTables, native_host_ready_waits) as u64,
         crate::spaces::SPACE_NOTIFICATION_LAYOUT_HASH,
         core::mem::size_of::<ObjectQueue>() as u64,
         core::mem::offset_of!(ObjectQueue, generation) as u64,
@@ -259,6 +263,20 @@ impl ObjectWaitKey {
         }
         Some(Self {
             index: (NATIVE_SERVICE_WAIT_BASE + record.id.raw() as usize) as u32,
+            generation: record.incarnation,
+        })
+    }
+
+    /// One native member's wait for a host object's readiness (a host
+    /// network socket's): the carrier samples it before its non-blocking
+    /// probe and its readiness producer notifies it. Record-scoped like
+    /// [`Self::native_service`]; the record incarnation separates reuse.
+    pub const fn native_host_ready(record: RecordRef) -> Option<Self> {
+        if record.incarnation == 0 {
+            return None;
+        }
+        Some(Self {
+            index: (NATIVE_HOST_READY_WAIT_BASE + record.id.raw() as usize) as u32,
             generation: record.incarnation,
         })
     }
@@ -1987,8 +2005,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             &self.native_service_waits[index - NATIVE_SERVICE_WAIT_BASE]
         } else if index < IPC_LOCK_RELEASE_WAIT_BASE {
             &self.member_release_waits[index - MEMBER_RELEASE_WAIT_BASE]
-        } else {
+        } else if index < NATIVE_HOST_READY_WAIT_BASE {
             &self.ipc_lock_release_waits[index - IPC_LOCK_RELEASE_WAIT_BASE]
+        } else {
+            &self.native_host_ready_waits[index - NATIVE_HOST_READY_WAIT_BASE]
         }
     }
 
@@ -4063,9 +4083,14 @@ mod host_tests {
             16
         );
         assert_eq!(
-            core::mem::offset_of!(ZoneTables, object_admission_handbacks),
+            core::mem::offset_of!(ZoneTables, native_host_ready_waits),
             core::mem::offset_of!(ZoneTables, ipc_lock_release_waits)
                 + core::mem::size_of::<ObjectQueue>() * ipc_release::IPC_LOCK_RELEASE_QUEUES
+        );
+        assert_eq!(
+            core::mem::offset_of!(ZoneTables, object_admission_handbacks),
+            core::mem::offset_of!(ZoneTables, native_host_ready_waits)
+                + core::mem::size_of::<ObjectQueue>() * crate::ZONE_RECORDS
         );
         assert_eq!(
             core::mem::offset_of!(ZoneTables, delegated_host_pending)

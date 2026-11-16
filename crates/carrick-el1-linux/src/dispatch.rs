@@ -1185,9 +1185,7 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
             frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
         ],
     )?;
-    if origin == carrick_core_abi::service::ServiceOrigin::Initial
-        && call.uses_child_mutation_venue()
-    {
+    if origin == carrick_core_abi::service::ServiceOrigin::Initial && call.child_venue_only() {
         return None;
     }
     let mut namespace = NativeNamespace {
@@ -1869,11 +1867,22 @@ pub(super) fn native_service_user_return(
             // Only an interrupted, uncommitted crossing may request restart.
             // Reuse the authenticated ARM return marker: FAR retains original
             // arg0 while the result word carries EINTR into shared policy.
+            let interrupted = match operation {
+                Some(carrick_core_abi::service::ServiceOperation::Crossing { ordinal }) => {
+                    Some(ordinal)
+                }
+                // A host network call interrupted while it waited on its
+                // host object (#231).
+                Some(carrick_core_abi::service::ServiceOperation::HostFile { payload, .. }) => {
+                    Some(payload.ordinal())
+                }
+                _ => None,
+            };
             if result.raw() == carrick_syscall_abi::LINUX_EINTR.guest_retval()
-                && matches!(operation,
-                    Some(carrick_core_abi::service::ServiceOperation::Crossing { ordinal })
-                    if ordinal.raw() == frame.x[8]
-                        && carrick_signal_core::is_native_restartable_syscall(ordinal.raw()))
+                && interrupted.is_some_and(|ordinal| {
+                    ordinal.raw() == frame.x[8]
+                        && carrick_signal_core::is_native_restartable_syscall(ordinal.raw())
+                })
             {
                 frame.far = frame.x[0];
                 frame.esr = 0xfffe;
@@ -6570,6 +6579,42 @@ mod tests {
         };
         let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut record).unwrap();
         assert_eq!(view.header().table, table);
+        assert_eq!(
+            view.header().op,
+            carrick_core_abi::host_file::HostFileOp::NetSyscall
+        );
+        let call = carrick_core_abi::host_file::NetCall::decode(view.input()).unwrap();
+        assert_eq!(call.canonical, 198);
+        assert_eq!(call.args[..3], [2, 1, 0]);
+        assert!(call.segments().is_empty(), "socket stages no user memory");
+        // The run root keeps its host route: its host-task descriptors are
+        // the host dispatcher's.
+        assert_eq!(
+            native_host_file_stage(
+                &frame,
+                &task,
+                &Resident,
+                table,
+                carrick_core_abi::service::ServiceOrigin::Initial,
+                |_| panic!("socket names no descriptor"),
+                &mut |_| 0,
+            ),
+            None
+        );
+        // AF_UNIX keeps its ring owner: it is not a host network socket.
+        frame.x[0] = 1;
+        assert_eq!(
+            native_host_file_stage(
+                &frame,
+                &task,
+                &Resident,
+                table,
+                carrick_core_abi::service::ServiceOrigin::Descendant,
+                |_| panic!("socket names no descriptor"),
+                &mut |_| 0,
+            ),
+            None
+        );
     }
 
     /// #1954: an ARM `write`/`writev` whose buffer is readable for 16 bytes

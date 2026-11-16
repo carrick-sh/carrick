@@ -8,13 +8,15 @@
  *   TCP: socket, setsockopt(TCP_NODELAY), connect, getsockopt(SO_ERROR),
  *        getpeername, send "ping", recv "pong" (MSG_WAITALL),
  *        shutdown(SHUT_WR), recv EOF, close;
- *   UDP: socket, sendto, recvfrom (with source address), getsockname;
+ *   UDP: socket, sendto, poll(POLLIN) until the answer, recvfrom (with
+ *        source address), getsockname, then a poll that times out;
+ *   non-blocking TCP: socket(SOCK_NONBLOCK), connect (EINPROGRESS),
+ *        poll(POLLOUT), getsockopt(SO_ERROR), close, against TCP_NB_PORT;
  *   TCP6: socket, connect [::1], send "ping", recv "pong".
  * The root reaps the child and exits with its status. Child exit 0 = every
  * step returned what Linux returns; a step that returned something else
  * exits with its stage number, or 100 + stage when it returned ENOSYS (38).
- * 91: fork or wait failed. With IN_ROOT the run root itself runs the
- * child's steps and exits with their status. */
+ * 91: fork or wait failed. */
 #define SYS_CLOSE 3
 #define SYS_SOCKET 41
 #define SYS_CONNECT 42
@@ -28,6 +30,7 @@
 #define SYS_FORK 57
 #define SYS_WAIT4 61
 #define SYS_EXIT_GROUP 231
+#define SYS_POLL 7
 
 /* Fail unless %rax == value. */
 #define EXPECT(stage, value) \
@@ -38,9 +41,6 @@
 .global _start
 .text
 _start:
-#ifdef IN_ROOT
-    jmp child
-#endif
     mov $SYS_FORK, %eax
     syscall
     test %eax, %eax
@@ -177,6 +177,21 @@ child:
     syscall
     EXPECT(15, 1)
 
+    /* The resolver's wait: poll(u, POLLIN, 5 s) until the answer arrives. */
+    mov %r13d, pollfd(%rip)
+    movw $1, pollfd+4(%rip)
+    movw $0, pollfd+6(%rip)
+    lea pollfd(%rip), %rdi
+    mov $1, %esi
+    mov $5000, %edx
+    mov $SYS_POLL, %eax
+    syscall
+    EXPECT(26, 1)
+    movzwl pollfd+6(%rip), %eax
+    cmp $1, %eax                   /* revents == POLLIN */
+    mov $27, %r15d
+    jne fail
+
     movl $16, addrlen(%rip)        /* recvfrom(u, buf, 16, 0, &peer, &len) */
     mov %r13, %rdi
     lea buffer(%rip), %rsi
@@ -209,6 +224,66 @@ child:
     jne fail
     cmpw $0, peer+2(%rip)
     je fail
+
+    /* Nothing more arrives: poll(u, POLLIN, 50 ms) times out with 0. */
+    movw $0, pollfd+6(%rip)
+    lea pollfd(%rip), %rdi
+    mov $1, %esi
+    mov $50, %edx
+    mov $SYS_POLL, %eax
+    syscall
+    EXPECT(28, 0)
+    cmpw $0, pollfd+6(%rip)
+    mov $29, %r15d
+    jne fail
+
+    /* A non-blocking connect completes through poll(POLLOUT) and
+     * getsockopt(SO_ERROR), as Python's and Go's dialers do. */
+    mov $2, %edi                   /* socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, 0) */
+    mov $0x801, %esi
+    xor %edx, %edx
+    mov $SYS_SOCKET, %eax
+    syscall
+    mov $30, %r15d
+    test %rax, %rax
+    js fail
+    mov %rax, %rbx
+    mov %rbx, %rdi                 /* connect: 0 or EINPROGRESS */
+    lea tcp_nb_addr(%rip), %rsi
+    mov $16, %edx
+    mov $SYS_CONNECT, %eax
+    syscall
+    mov $31, %r15d
+    test %rax, %rax
+    jz 1f
+    cmp $-115, %rax
+    jne fail
+1:
+    mov %ebx, pollfd(%rip)         /* poll(s, POLLOUT, 5 s) */
+    movw $4, pollfd+4(%rip)
+    movw $0, pollfd+6(%rip)
+    lea pollfd(%rip), %rdi
+    mov $1, %esi
+    mov $5000, %edx
+    mov $SYS_POLL, %eax
+    syscall
+    EXPECT(32, 1)
+    movl $4, optlen(%rip)          /* getsockopt(s, SOL_SOCKET, SO_ERROR) == 0 */
+    movl $-1, optval(%rip)
+    mov %rbx, %rdi
+    mov $1, %esi
+    mov $4, %edx
+    lea optval(%rip), %r10
+    lea optlen(%rip), %r8
+    mov $SYS_GETSOCKOPT, %eax
+    syscall
+    EXPECT(33, 0)
+    movslq optval(%rip), %rax
+    EXPECT(34, 0)
+    mov %rbx, %rdi
+    mov $SYS_CLOSE, %eax
+    syscall
+    EXPECT(35, 0)
 
 #ifdef TCP6_PORT
     /* TCP over IPv6 loopback. */
@@ -282,6 +357,11 @@ udp_addr:
     .short UDP_PORT
     .byte 127, 0, 0, 1
     .quad 0
+tcp_nb_addr:
+    .short 2
+    .short TCP_NB_PORT
+    .byte 127, 0, 0, 1
+    .quad 0
 #ifdef TCP6_PORT
 tcp6_addr:
     .short 10
@@ -313,3 +393,6 @@ buffer:
     .zero 32
 status:
     .long 0
+.align 8
+pollfd:
+    .zero 8

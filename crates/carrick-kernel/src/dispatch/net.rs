@@ -101,7 +101,7 @@ use carrick_abi::LinuxPollEvents;
 use carrick_abi::syscall::nr;
 use carrick_vfs::errno::HostSyscallResult as _;
 
-fn host_poll_interest(requested: i16) -> i16 {
+pub(in crate::dispatch) fn host_poll_interest(requested: i16) -> i16 {
     let mut host = 0;
     for (linux, native) in [
         (LINUX_POLLIN, libc::POLLIN),
@@ -331,6 +331,7 @@ pub(crate) mod epoll_zone;
 use epoll_ops::epoll_kqueue_for_wake_test;
 pub(in crate::dispatch) use epoll_ops::{IoRearm, WriteRearm};
 pub(super) mod lifecycle;
+pub(super) mod native;
 pub(super) use lifecycle::{host_stream_socket_is_connected, host_stream_socket_rdhup};
 pub(super) mod netlink;
 pub(crate) mod packet;

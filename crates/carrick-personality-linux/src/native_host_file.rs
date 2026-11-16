@@ -38,6 +38,9 @@ pub const LINUX_AT_FDCWD: i32 = -100;
 /// Linux `AT_EMPTY_PATH`.
 pub const LINUX_AT_EMPTY_PATH: u32 = 0x1000;
 const IOVEC_BYTES: usize = 16;
+
+mod socket;
+pub use socket::SocketCall;
 const PAGE_BYTES: u64 = 4096;
 
 /// Access mode of the open description a descriptor names.
@@ -235,6 +238,17 @@ pub enum HostFileCall {
         timeout: u64,
         sigmask: u64,
     },
+    /// x86_64 `poll(2)` ([`HostFileCall::decode_native`]):
+    /// [`HostFileCall::Ppoll`] with an int millisecond timeout (negative:
+    /// none) and no signal mask.
+    Poll {
+        fds: u64,
+        nfds: u64,
+        timeout_ms: i32,
+    },
+    /// The host network socket family (#231): AF_INET and AF_INET6 sockets
+    /// are host objects, and every call on one crosses.
+    Socket(SocketCall),
 }
 
 /// The exact arguments of a private file `mmap`. The carrier retains the
@@ -290,6 +304,13 @@ impl HostFileCall {
         )
     }
 
+    /// Calls only a native child stages: the initial task keeps its existing
+    /// host route for them (its host-task namespace mutations, and its host
+    /// network sockets).
+    pub const fn child_venue_only(self) -> bool {
+        self.uses_child_mutation_venue() || matches!(self, Self::Socket(_))
+    }
+
     /// Whether the CPL0 venue stages this decoded call for `origin`.
     /// `delegated(fd)` says whether the carrier's file table delegates `fd` to
     /// a host object (the run's stdio streams).
@@ -307,11 +328,17 @@ impl HostFileCall {
     ///   host task has nothing under its number (#2157 B1).
     /// - `readlinkat` is not staged here: the root's keeps its host crossing,
     ///   and a descendant's is the native file family's (#1862).
+    /// - A child's host network calls and its polls of host objects are
+    ///   staged (#231); the initial task keeps its routes for both.
     pub fn admitted_for(self, origin: ServiceOrigin, delegated: impl FnOnce(i32) -> bool) -> bool {
         match self {
             Self::Chdir { .. } => origin != ServiceOrigin::Initial,
+            // A child's set of host objects (its host network sockets) waits
+            // on its host-readiness queue (#231); the initial task's polls
+            // keep their route.
+            Self::Ppoll { .. } | Self::Poll { .. } => origin != ServiceOrigin::Initial,
             Self::Ftruncate { fd, .. } if origin == ServiceOrigin::Initial => !delegated(fd),
-            call if call.uses_child_mutation_venue() => origin != ServiceOrigin::Initial,
+            call if call.child_venue_only() => origin != ServiceOrigin::Initial,
             Self::Openat { .. }
             | Self::Faccessat { .. }
             | Self::Statx { .. }
@@ -328,6 +355,28 @@ impl HostFileCall {
             | Self::Lseek { fd, .. } => !delegated(fd),
             _ => false,
         }
+    }
+
+    /// [`Self::decode`] of an ISA's native call. x86_64 `poll(2)` shares
+    /// canonical `ppoll`'s number but passes an int millisecond timeout
+    /// where `ppoll` passes a timespec pointer, so its native number alone
+    /// tells the two apart.
+    pub fn decode_native(
+        isa: carrick_guest_arch::GuestIsa,
+        native: carrick_guest_arch::NativeOrdinal,
+        canonical: CanonicalNr,
+        args: &[u64; 6],
+    ) -> Option<Self> {
+        if isa == carrick_guest_arch::GuestIsa::X86_64
+            && native.raw() == carrick_syscall_abi::syscall_x86_64::X86_POLL.raw()
+        {
+            return Some(Self::Poll {
+                fds: args[0],
+                nfds: args[1],
+                timeout_ms: args[2] as i32,
+            });
+        }
+        Self::decode(canonical, args)
     }
 
     /// Decode a canonical syscall the venue may serve. `None` for every
@@ -485,7 +534,7 @@ impl HostFileCall {
             {
                 Self::MapPrivate(NativeMapKey::of(args))
             }
-            _ => return None,
+            _ => return SocketCall::decode(canonical, args).map(Self::Socket),
         })
     }
 }
@@ -521,6 +570,9 @@ pub enum OutputLayout {
     /// An asm-generic `struct stat` reply the caller reads as x86_64's
     /// 144-byte `struct stat` (`fstat`/`newfstatat` on x86_64).
     X8664Stat,
+    /// A network call's written extents, copied back to each user range its
+    /// record's segment table names; `len` is the reply capacity.
+    Net,
 }
 
 impl HostFileOutput {
@@ -549,7 +601,7 @@ impl HostFileOutput {
     /// whatever the caller's encoding.
     pub const fn reply_capacity(self) -> usize {
         match self.layout {
-            OutputLayout::Bytes => self.len,
+            OutputLayout::Bytes | OutputLayout::Net => self.len,
             OutputLayout::X8664Stat => LINUX_STAT_BYTES,
         }
     }
@@ -561,6 +613,8 @@ impl HostFileOutput {
             OutputLayout::Bytes => {
                 (reply.len() <= self.len).then_some(alloc::borrow::Cow::Borrowed(reply))
             }
+            // Completed per staged range by `socket::complete`.
+            OutputLayout::Net => None,
             OutputLayout::X8664Stat => {
                 let stat =
                     <carrick_syscall_abi::LinuxStat as zerocopy::FromBytes>::read_from_bytes(reply)
@@ -1003,6 +1057,7 @@ pub fn stage(
         ..
     }
     | HostFileStage::InRingReply { output, .. } = &staged
+        && output.layout != OutputLayout::Net
     {
         let writable = user.writable(output.address, output.len);
         if writable < output.len {
@@ -1057,13 +1112,18 @@ pub fn crossing_output_stage(
 /// decodes but never admits, #2201).
 pub fn admit_or_cross(
     set: crate::crossing::HostCrossingSet,
+    native: carrick_guest_arch::NativeOrdinal,
     canonical: CanonicalNr,
     args: &[u64; 6],
     origin: ServiceOrigin,
     delegated: impl FnOnce(i32) -> bool,
     writable: impl FnMut(u64, usize) -> usize,
 ) -> Result<HostFileCall, Option<HostFileStage>> {
-    match HostFileCall::decode(canonical, args) {
+    let isa = match set {
+        crate::crossing::HostCrossingSet::Aarch64 => carrick_guest_arch::GuestIsa::Aarch64,
+        crate::crossing::HostCrossingSet::X86 => carrick_guest_arch::GuestIsa::X86_64,
+    };
+    match HostFileCall::decode_native(isa, native, canonical, args) {
         Some(call) if call.admitted_for(origin, delegated) => Ok(call),
         _ => Err(crossing_output_stage(set, canonical, args, writable)),
     }
@@ -1636,7 +1696,37 @@ fn stage_call(
             nfds,
             timeout,
             sigmask,
-        } => return stage_ppoll(&mut staging, user, fds, nfds, timeout, sigmask),
+        } => {
+            if sigmask != 0 {
+                return None;
+            }
+            let timeout_ms = if timeout == 0 {
+                -1
+            } else {
+                let mut spec = [0u8; 16];
+                if !user.copy_in(&mut spec, timeout) {
+                    return Some(HostFileStage::Fault {
+                        address: timeout,
+                        access: Access::Read,
+                    });
+                }
+                let seconds = i64::from_le_bytes(spec[..8].try_into().unwrap_or([0; 8]));
+                let nanoseconds = i64::from_le_bytes(spec[8..].try_into().unwrap_or([0; 8]));
+                match ppoll_timeout_ms(seconds, nanoseconds) {
+                    Ok(milliseconds) => milliseconds,
+                    Err(errno) => {
+                        return Some(HostFileStage::Returned(SyscallResult::from_errno(errno)));
+                    }
+                }
+            };
+            return stage_ppoll(&mut staging, user, fds, nfds, timeout_ms);
+        }
+        HostFileCall::Poll {
+            fds,
+            nfds,
+            timeout_ms,
+        } => return stage_ppoll(&mut staging, user, fds, nfds, timeout_ms.max(-1)),
+        HostFileCall::Socket(call) => return socket::stage(call, &mut staging, user),
         HostFileCall::Chdir { path } => {
             let path = match copy_path(user, path) {
                 Path::Bytes(path) => path,
@@ -1715,8 +1805,10 @@ pub fn ppoll_timeout_ms(seconds: i64, nanoseconds: i64) -> Result<i32, LinuxErrn
 /// - a signal mask, an in-zone member (a mixed set) or a set larger than
 ///   one record keeps its route (`None`, counted ENOSYS): answering part
 ///   of a set would misreport its one ready count;
-/// - the carrier never blocks: with a non-zero timeout an empty snapshot
-///   is refused, never reported as a timeout.
+/// - a caller that would wait (a non-zero timeout) on an empty snapshot
+///   waits on its own host-readiness queue for the set's host objects, or
+///   until its timeout (#231); a carrier without that wait refuses it,
+///   never reporting a fake timeout.
 ///
 /// Divergence from Linux: a zero-timeout set with nothing ready returns 0
 /// even while an unblocked signal is pending, where Linux returns EINTR;
@@ -1726,30 +1818,16 @@ fn stage_ppoll(
     user: &mut dyn HostFileUser,
     fds: u64,
     nfds: u64,
-    timeout: u64,
-    sigmask: u64,
+    timeout_ms: i32,
 ) -> Option<HostFileStage> {
     use host_file::{POLLFD_BYTES, PollWait};
-    if sigmask != 0 || nfds == 0 || nfds > (HOST_FILE_CHUNK_BYTES / POLLFD_BYTES) as u64 {
+    if nfds == 0 || nfds > (HOST_FILE_CHUNK_BYTES / POLLFD_BYTES) as u64 {
         return None;
     }
-    let wait = if timeout == 0 {
-        PollWait::MayWait
+    let wait = if timeout_ms == 0 {
+        PollWait::Snapshot
     } else {
-        let mut spec = [0u8; 16];
-        if !user.copy_in(&mut spec, timeout) {
-            return Some(HostFileStage::Fault {
-                address: timeout,
-                access: Access::Read,
-            });
-        }
-        let seconds = i64::from_le_bytes(spec[..8].try_into().unwrap_or([0; 8]));
-        let nanoseconds = i64::from_le_bytes(spec[8..].try_into().unwrap_or([0; 8]));
-        match ppoll_timeout_ms(seconds, nanoseconds) {
-            Ok(0) => PollWait::Snapshot,
-            Ok(_) => PollWait::MayWait,
-            Err(errno) => return Some(HostFileStage::Returned(SyscallResult::from_errno(errno))),
-        }
+        PollWait::MayWait
     };
     let len = nfds as usize * POLLFD_BYTES;
     let mut entries = vec![0u8; len];
@@ -1780,7 +1858,7 @@ fn stage_ppoll(
         HostFileOp::Poll,
         -1,
         0,
-        [wait.raw(), 0, 0, 0],
+        [wait.raw(), i64::from(timeout_ms) as u64, 0, 0],
         &entries,
         Some(HostFileOutput::bytes(fds, len)),
     ))
@@ -1852,6 +1930,13 @@ pub fn complete(
     };
     if reply.result < 0 {
         return SyscallResult::new(reply.result);
+    }
+    if let Some(output) = output
+        && output.layout == OutputLayout::Net
+    {
+        return host_file::replied_input(record)
+            .and_then(|input| socket::complete(reply.result, input, reply.output, copy_out))
+            .unwrap_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO));
     }
     if let Some(output) = output {
         let Some(bytes) = output.encode(reply.output) else {
