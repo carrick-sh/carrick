@@ -101,12 +101,35 @@ pub(super) fn release_injected_edit_wait(
     if crate::test_support::take_caught_signal_on_park() {
         crate::native_process::inject_caught_signal_on_park(source, task);
     }
+    publish_injected_release(source, task, cause);
+}
+
+/// Test images: the synthetic editor holder releases right after its
+/// refusal, before the refused member enrolls on the owner wait (#2416).
+/// True when the editor was held and its release was published.
+#[cfg(feature = "test-support")]
+pub(super) fn release_injected_editor_now(
+    source: BornInZoneSource<'static, ParkedContextWords>,
+    task: &'static CurrentTask,
+) -> bool {
+    carrick_sched_core::spaces::release_injected_editor_busy()
+        && publish_injected_release(source, task, SpaceWaitCause::Editor)
+}
+
+/// Publish the synthetic holder's release on `task`'s MM, as a real holder's
+/// release does.
+#[cfg(feature = "test-support")]
+fn publish_injected_release(
+    source: BornInZoneSource<'static, ParkedContextWords>,
+    task: &'static CurrentTask,
+    cause: SpaceWaitCause,
+) -> bool {
     let mm = task.mm.key.load(Ordering::Acquire);
     let Some(notifications) = NonZeroU64::new(mm)
         .and_then(|mm| source.zone.space_entry(mm))
         .and_then(|entry| entry.live_notifications().ok())
     else {
-        return;
+        return false;
     };
     let venue = carrick_sched_core::spaces::notification::SpaceReleaseVenue {
         zone: source.zone,
@@ -116,6 +139,7 @@ pub(super) fn release_injected_edit_wait(
         ),
     };
     venue.publish(notifications.reserve(cause));
+    true
 }
 
 impl X86AnonymousVenue<'_> {
