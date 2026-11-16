@@ -4222,3 +4222,20 @@ fn production_clone_settid_busy_once_then_stores() {
         "CLONE_CHILD_SETTID contention",
     );
 }
+
+/// #2416, the x86 counterpart of #2342's
+/// `arm_native_fork_child_pre_park_supply_restarts_svc`: a production fork
+/// child's getrandom into a COW page finds its space editor held, and the
+/// holder releases it before the child enrolls on the owner wait. The
+/// pre-park supply settles inline, so `begin_entropy_call` returns
+/// `RetrySyscall` to the CPL0 entry, which must re-enter the `syscall` with
+/// its arguments: getrandom then returns 8 and the child exits 7.
+#[test]
+fn production_child_getrandom_owner_wait_settled_before_park_restarts_syscall() {
+    bounded_contention_witness(
+        "production_child_getrandom_owner_wait_settled_before_park_restarts_syscall",
+        "native_not_now_contention.S",
+        &["-DENTROPY_SETTLED_BEFORE_PARK=1"],
+        "getrandom owner wait settled before its park",
+    );
+}

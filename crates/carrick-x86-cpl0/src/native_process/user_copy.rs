@@ -160,6 +160,8 @@ impl Service {
                 completion: None,
             },
         };
+        #[cfg(feature = "test-support")]
+        let held = crate::test_support::hold_editor_for_early_release(self.task);
         let result = if let Some(bytes) = bytes {
             owner.write_user_bytes(
                 UserWriteRequest {
@@ -194,6 +196,18 @@ impl Service {
                 &mut venue,
             )
         };
+        #[cfg(feature = "test-support")]
+        crate::test_support::release_editor_before_park(
+            held,
+            matches!(
+                result,
+                Err(UserWriteError::Owner(
+                    carrick_core::mm::transaction::MmError::Wait(_)
+                ))
+            ),
+            carrick_x86_carrier::native_execution::source(self.slot),
+            self.task,
+        );
         result.map_err(NativeProcessError::from_user_write)
     }
 }
