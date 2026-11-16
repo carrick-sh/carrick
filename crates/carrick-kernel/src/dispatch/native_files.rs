@@ -681,7 +681,7 @@ impl SyscallDispatcher {
     /// host-readiness queue (#231), sampled before the scan, for the set's
     /// host objects, or until the call's deadline, fixed by its first empty
     /// snapshot; at the deadline the answer is 0, as Linux times out. With
-    /// no waiter, or a member the watch cannot observe, the set is refused,
+    /// no waiter, or a member the reactor cannot observe, the set is refused,
     /// never answered with a fake timeout.
     ///
     /// Divergence from Linux: a zero-timeout scan that finds nothing ready
@@ -787,7 +787,8 @@ impl SyscallDispatcher {
                 },
             )
             .collect();
-        if owner.watch_host_ready(record, &interests, deadline) {
+        let reactor = Arc::clone(self.kernel_binding.read().kernel().host_readiness());
+        if owner.watch_host_ready(&reactor, record, &interests, deadline) {
             NativePoll::Wait(revision)
         } else {
             NativePoll::Served(Served::Refused)
@@ -796,7 +797,7 @@ impl SyscallDispatcher {
 
     /// The host descriptor a native poll waits on for one resource it found
     /// not ready: its own duplicate, so the descriptor outlives the pin.
-    /// `None` for a resource whose readiness the watch cannot observe.
+    /// `None` for a resource whose readiness the reactor cannot observe.
     fn native_resource_poll_interest(
         &self,
         resource: &HostResource,
