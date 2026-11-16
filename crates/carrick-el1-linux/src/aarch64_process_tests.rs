@@ -21001,3 +21001,36 @@ fn arm_two_live_processes_dup_and_close_isolate_tables() {
 
     registry().unregister_root_for_test(&runtime);
 }
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn review2385_waitall_after_shut_rd_returns_buffered_prefix() {
+    use ArmCaller::Root;
+    use carrick_personality_linux::crossing::nr as sys;
+    
+    use carrick_test_support::GuestUserBuffer;
+    with_arm_process_host_dispatch(|call| {
+        let [first, second] = arm_root_spawn_socketpair(call);
+        let out = GuestUserBuffer::from_bytes(b"abc");
+        let got = GuestUserBuffer::zeroed(6);
+        assert_eq!(call(Root, sys::WRITE.raw(), [second, out.arg(), 3, 0, 0, 0]).1, 3);
+        assert_eq!(call(Root, sys::SHUTDOWN.raw(), [first, 0, 0, 0, 0, 0]).1, 0);
+        call(Root, ARM_LEAVE_ON_PARK, [0; 6]);
+        assert_eq!(call(Root, sys::RECVFROM.raw(), [first, got.arg(), 6, carrick_abi::LINUX_MSG_WAITALL as u64, 0, 0]).1, 3);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn review2385_zero_write_after_peer_close_is_epipe() {
+    use ArmCaller::Root;
+    use carrick_personality_linux::crossing::nr as sys;
+    
+    use carrick_test_support::GuestUserBuffer;
+    with_arm_process_host_dispatch(|call| {
+        let [first, second] = arm_root_spawn_socketpair(call);
+        let buf = GuestUserBuffer::zeroed(1);
+        assert_eq!(call(Root, sys::CLOSE.raw(), [second, 0, 0, 0, 0, 0]).1, 0);
+        assert_eq!(call(Root, sys::SENDTO.raw(), [first, buf.arg(), 0, carrick_abi::LINUX_MSG_NOSIGNAL as u64, 0, 0]).1, -32);
+    });
+}
