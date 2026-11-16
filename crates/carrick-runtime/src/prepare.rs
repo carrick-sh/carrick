@@ -628,6 +628,11 @@ fn assemble_kvm_root_pool(
         Arc::clone(&binding),
     )?;
     let (completed_tx, completed) = std::sync::mpsc::channel();
+    // The run's completion also answers the scheduler's executor-death
+    // verdict: a dead worker ends this run, never parks it (#2420).
+    scheduler.observe_executor_death(Arc::new(executor::cpl0::Cpl0ExecutorDeathCompletion::new(
+        completed_tx.clone(),
+    )));
     let (max_loaded_exits, max_idle_exits) = lane_exit_budgets.unwrap_or((max_traps, max_traps));
     let factory = Arc::new(executor::cpl0::Cpl0PersistentExecutorFactory::new(
         executor::cpl0::Cpl0PersistentExecutorConfig {

@@ -174,6 +174,14 @@ pub enum AbortReason {
         execution_state: String,
         kernel_view: String,
     },
+    /// An executor worker died after its pool published it (#2420): the
+    /// scheduler's carrier-terminal `ExecutorDeath` verdict. `error` is the
+    /// worker's own failure text, so the abort names what killed it.
+    ExecutorDied {
+        worker: usize,
+        executor: u32,
+        error: String,
+    },
 }
 
 /// Which step of the HVPatch alias install refused. Ordered as the arm runs.
@@ -198,6 +206,15 @@ pub enum HvpatchAliasInstallSite {
 }
 
 impl AbortReason {
+    /// The abort that applies the scheduler's executor-death verdict.
+    pub fn executor_died(death: &crate::kernel::ExecutorDeath) -> Self {
+        Self::ExecutorDied {
+            worker: death.worker,
+            executor: death.executor.raw(),
+            error: death.error.clone(),
+        }
+    }
+
     /// One line for a `Display`/log/error message.
     pub fn summary(&self) -> String {
         match self {
@@ -285,6 +302,11 @@ impl AbortReason {
                  {successor} was rejected while the kernel graph still calls it reachable \
                  (execution state {execution_state}; registry view: {kernel_view})"
             ),
+            Self::ExecutorDied {
+                worker,
+                executor,
+                error,
+            } => format!("executor worker died index={worker} executor={executor} error={error}"),
         }
     }
 }
