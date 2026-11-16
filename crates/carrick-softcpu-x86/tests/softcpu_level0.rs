@@ -366,6 +366,42 @@ fn retired_fixtures_run_over_soft_memory() {
     }
 }
 
+// Synthetic revocation fixture: remove families from the shared profile to
+// witness admission/cache invalidation, never install another production profile.
+struct RevokedFeatures;
+impl carrick_softcpu_x86::CpuidAuthority for RevokedFeatures {
+    fn cpuid(&self, leaf: u32, subleaf: u32) -> carrick_softcpu_x86::CpuidRegs {
+        let mut r = carrick_softcpu_x86::GuestCpuidView::default().cpuid(leaf, subleaf);
+        match (leaf, subleaf) {
+            (1, _) => {
+                r.ecx &= !((1 << 0)
+                    | (1 << 1)
+                    | (1 << 9)
+                    | (1 << 12)
+                    | (1 << 13)
+                    | (1 << 19)
+                    | (1 << 20)
+                    | (1 << 22)
+                    | (1 << 23)
+                    | (1 << 25)
+                    | (1 << 28)
+                    | (1 << 29));
+                r.edx &= !((1 << 0) | (1 << 19) | (1 << 23));
+            }
+            (7, 0) => r.ebx &= !((1 << 3) | (1 << 5) | (1 << 8)),
+            (0xd, 0) => {
+                r.eax &= !4;
+                r.ebx = 576;
+                r.ecx = 576;
+            }
+            (0xd, 2) => r = carrick_softcpu_x86::CpuidRegs::ZERO,
+            (0x8000_0001, _) => r.ecx &= !(1 << 5),
+            _ => {}
+        }
+        r
+    }
+}
+
 fn setup_snippet(code: &[u8]) -> (SoftCpu, TestSoftMmuMemory, u64) {
     let (code_va, stack_va) = (0x0040_0000u64, 0x0080_0000u64);
     let mut mem = TestSoftMmuMemory::new();
@@ -1390,12 +1426,9 @@ fn ignored_legacy_segment_prefixes_execute_in_long_mode() {
 
 #[test]
 fn unsupported_ymm_state_is_neither_advertised_nor_executed() {
-    use carrick_softcpu_x86::{CpuidAuthority, GuestCpuidView};
+    use carrick_softcpu_x86::CpuidAuthority;
 
-    let views: [Box<dyn CpuidAuthority>; 2] = [
-        Box::new(carrick_softcpu_x86::GuestCpuidView::default()),
-        Box::new(carrick_softcpu_x86::GuestCpuidView::default()),
-    ];
+    let views: [Box<dyn CpuidAuthority>; 1] = [Box::new(RevokedFeatures)];
     for view in views {
         let (_, mut mem, va) = setup_snippet(&[]);
         let mut cpu = SoftCpu::with_cpuid_view(mem.extents(), view).unwrap();
@@ -1598,6 +1631,8 @@ fn sse_exceptions_and_reserved_mxcsr_bits_are_guest_faults() {
     step_ok(&mut cpu, &mut mem, gp(va));
 }
 
+// Proves XSAVE masks and refusal of compaction under the shared view.
+// Keep the gated name until ci-receipt resolves macro-generated tests (#2438).
 #[test]
 fn xsave_masks_and_compacted_headers_control_restore() {
     let (mut cpu, mut mem, va) = setup_snippet(&[0x0f, 0xae, 0x27]); // xsave [rdi]
@@ -1618,11 +1653,9 @@ fn xsave_masks_and_compacted_headers_control_restore() {
     mem.write_direct(va, &[0x0f, 0xc7, 0x27]); // xsavec
     cpu.context_mut().rip = va;
     cpu.context_mut().gpr[reg::RAX] = 2;
-    cpu.step_block(&mut mem).unwrap();
-    assert_eq!(
-        &mem.read_direct(addr + 520, 8).unwrap(),
-        &((1u64 << 63) | 2).to_le_bytes()
-    );
+    let before = mem.read_direct(addr, 576).unwrap();
+    step_ok(&mut cpu, &mut mem, ud(va));
+    assert_eq!(mem.read_direct(addr, 576).unwrap(), before);
     mem.write_direct(va, &[0x0f, 0xae, 0x2f]); // xrstor
     mem.write_direct(addr + 520, &1u64.to_le_bytes()); // reserved standard XCOMP_BV
     cpu.context_mut().rip = va;
@@ -1898,7 +1931,7 @@ fn unavailable_features_raise_ud_and_cpuid_matches_the_layer() {
     let (mut cpu, mut mem, _) = setup_snippet(&[0x0f, 0xa2]);
     cpu.context_mut().gpr[reg::RAX] = 1;
     cpu.step_block(&mut mem).unwrap();
-    assert_eq!(cpu.context().gpr[reg::RDX] & ((1 << 24) | 1), 1 << 24);
+    assert_eq!(cpu.context().gpr[reg::RDX] & ((1 << 24) | 1), (1 << 24) | 1);
     assert_eq!(
         cpu.context().gpr[reg::RCX] & ((1 << 26) | (1 << 27)),
         (1 << 26) | (1 << 27)
@@ -1907,9 +1940,10 @@ fn unavailable_features_raise_ud_and_cpuid_matches_the_layer() {
         cpu.context().cr4 & ((1 << 9) | (1 << 18)),
         (1 << 9) | (1 << 18)
     );
-    // EM must remain clear for SSE data operations; x87 is absent independently.
+    // EM remains clear; the shared view advertises x87 as well as SSE.
     assert_eq!(cpu.context().cr0 & (1 << 2), 0);
-    let (mut cpu, mut mem, va) = setup_snippet(&[0xd8, 0xc1]); // x87 arithmetic remains absent
+    let (mut cpu, mut mem, va) = setup_snippet(&[0xd8, 0xc1]);
+    cpu.set_cpuid_view(Box::new(RevokedFeatures)).unwrap();
     step_ok(&mut cpu, &mut mem, ud(va));
 }
 
@@ -2035,6 +2069,10 @@ fn xsave_header_faults_are_write_faults() {
                 mem.map_range(base + 4096, 4096, PagePerms::USER_RO);
             }
             cpu.context_mut().gpr[reg::RDI] = base + 4096 - 512;
+            if bytes != [0x0f, 0xae, 0x27] {
+                step_ok(&mut cpu, &mut mem, ud(va));
+                continue;
+            }
             step_ok(
                 &mut cpu,
                 &mut mem,
@@ -3749,6 +3787,7 @@ fn legacy_probe_tzcnt_without_bmi1_is_bsf() {
         let native = oracle.gprs[0];
         let zero = (oracle.flags >> 6) & 1;
         let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0x48, 0x0f, 0xbc, 0xc1, 0x0f, 0x05]);
+        cpu.set_cpuid_view(Box::new(RevokedFeatures)).unwrap();
         cpu.context_mut().gpr[reg::RCX] = input;
         cpu.context_mut().gpr[reg::RAX] = 0x1234;
         step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
@@ -3861,8 +3900,7 @@ fn legacy_probe_tzcnt_bmi1_follows_guest_cpuid() {
             assert_eq!(cpu.context().rflags & 0x41, flags & 0x41);
         }
         // Replacing the authority switches the same decoded encoding to BSF.
-        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::GuestCpuidView::default()))
-            .unwrap();
+        cpu.set_cpuid_view(Box::new(RevokedFeatures)).unwrap();
         cpu.context_mut().rip = va;
         step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
         assert_eq!((cpu.context().rflags >> 6) & 1, u64::from(input == 0));
@@ -3996,6 +4034,7 @@ fn legacy_extended_families_match_native() {
 fn legacy_lzcnt_without_feature_is_bsr() {
     for input in [0u64, 1, 2, 1 << 63] {
         let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0x48, 0x0f, 0xbd, 0xc1, 0x0f, 0x05]);
+        cpu.set_cpuid_view(Box::new(RevokedFeatures)).unwrap();
         cpu.context_mut().gpr[reg::RCX] = input;
         step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
         assert_eq!((cpu.context().rflags >> 6) & 1, u64::from(input == 0));
@@ -4129,8 +4168,7 @@ fn legacy_extended_all_encodings_match_native_and_guest_admission() {
             }
             // The identical executable bytes must refuse before memory access
             // or register mutation when the installed view lacks the family.
-            cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::GuestCpuidView::default()))
-                .unwrap();
+            cpu.set_cpuid_view(Box::new(RevokedFeatures)).unwrap();
             cpu.context_mut().rip = va;
             cpu.context_mut().gpr[reg::RDI] = 0x1234_0000;
             let before = cpu.context().gpr;
@@ -4175,8 +4213,7 @@ fn legacy_extended_faults_and_unadvertised_extensions() {
         }
         assert_eq!(cpu.context().fxsave.0, before);
     }
-    // These #1469 extensions are absent from the admitted main and remain
-    // refused here, rather than executing because the host supports them.
+    // Explicitly revoke the shared profile extensions: host support must not bypass admission.
     for bytes in [
         &[0xc4, 0xe2, 0xf8, 0xf2, 0xc1][..], // andn (BMI1)
         &[0x0f, 0x38, 0xf0, 0x07],           // movbe
@@ -4184,6 +4221,7 @@ fn legacy_extended_faults_and_unadvertised_extensions() {
         &[0x66, 0x0f, 0x3a, 0x44, 0xc1, 0],  // pclmulqdq
     ] {
         let (mut cpu, mut mem, va) = setup_snippet(bytes);
+        cpu.set_cpuid_view(Box::new(RevokedFeatures)).unwrap();
         step_ok(&mut cpu, &mut mem, ud(va));
     }
 }
@@ -4898,8 +4936,9 @@ impl carrick_softcpu_x86::CpuidAuthority for X87Features {
         use carrick_softcpu_x86::GuestCpuidView;
         let mut r = GuestCpuidView::default().cpuid(leaf, subleaf);
         if leaf == 1 {
-            r.edx |= u32::from(self.fpu);
-            r.ecx |= (u32::from(self.cx16) << 13) | u32::from(self.sse3);
+            r.edx = (r.edx & !1) | u32::from(self.fpu);
+            r.ecx =
+                (r.ecx & !((1 << 13) | 1)) | (u32::from(self.cx16) << 13) | u32::from(self.sse3);
         }
         r
     }
@@ -4913,6 +4952,7 @@ fn x87_cx16_and_fisttp_obey_installed_view() {
         &[0xdb, 0x0f],
     ] {
         let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0x0f, 0x05]].concat());
+        cpu.set_cpuid_view(Box::new(RevokedFeatures)).unwrap();
         // Invalid memory must not win over missing feature #UD.
         cpu.context_mut().gpr[reg::RDI] = 0xdead0001;
         let before = cpu.context().fxsave.0;
@@ -4941,8 +4981,7 @@ fn x87_cx16_and_fisttp_obey_installed_view() {
             &mut mem,
             sys(va + bytes.len() as u64, va + bytes.len() as u64 + 2),
         );
-        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::GuestCpuidView::default()))
-            .unwrap();
+        cpu.set_cpuid_view(Box::new(RevokedFeatures)).unwrap();
         cpu.context_mut().rip = va;
         let before = cpu.context().fxsave.0;
         step_ok(&mut cpu, &mut mem, ud(va));
@@ -5173,8 +5212,7 @@ fn advertised_baseline_faults_and_feature_revocation() {
             &mut mem,
             sys(va + bytes.len() as u64, va + bytes.len() as u64 + 2),
         );
-        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::GuestCpuidView::default()))
-            .unwrap();
+        cpu.set_cpuid_view(Box::new(RevokedFeatures)).unwrap();
         cpu.context_mut().rip = va;
         cpu.context_mut().gpr[reg::RDI] = 0xdead0000;
         let before = cpu.context().fxsave.0;
@@ -5188,7 +5226,7 @@ fn advertised_baseline_faults_and_feature_revocation() {
 // are fixture inputs, never accepted faults standing in for execution.
 #[test]
 fn advertised_bit_allowlist_executes_through_step_block() {
-    use carrick_softcpu_x86::{CpuidAuthority, GuestCpuidView};
+    use carrick_softcpu_x86::CpuidAuthority;
     // (leaf, subleaf, output register, bit, instruction, ECX input)
     type Witness = (u32, u32, usize, u32, &'static [u8], u64);
     let witnesses: &[Witness] = &[
@@ -5240,15 +5278,8 @@ fn advertised_bit_allowlist_executes_through_step_block() {
         (0x80000001, 0, 3, 29, &[0x48, 0x89, 0xc0], 0),
         (0x80000007, 0, 3, 8, &[0x0f, 0x31], 0),
     ];
-    let shared = std::env::var_os("CARRICK_CPUID_WITNESS_SHARED").is_some();
-    let views: Vec<Box<dyn CpuidAuthority>> = if shared {
-        vec![Box::new(carrick_x86::GuestCpuidView::default())]
-    } else {
-        vec![
-            Box::new(carrick_softcpu_x86::GuestCpuidView::default()),
-            Box::new(carrick_softcpu_x86::GuestCpuidView::default()),
-        ]
-    };
+    let views: Vec<Box<dyn CpuidAuthority>> =
+        vec![Box::new(carrick_softcpu_x86::GuestCpuidView::default())];
     let mut failures = Vec::new();
     for view in views {
         for (leaf, sub, register) in [

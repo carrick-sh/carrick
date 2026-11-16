@@ -915,6 +915,15 @@ impl SoftCpu {
                     | SensitiveOp::Xsavec
                     | SensitiveOp::Fxrstor
                     | SensitiveOp::Xrstor => {
+                        let advertised = match op {
+                            SensitiveOp::Xsaveopt => self.cpuid.cpuid(0xd, 1).eax & 1 != 0,
+                            SensitiveOp::Xsavec => self.cpuid.cpuid(0xd, 1).eax & 2 != 0,
+                            SensitiveOp::Xsave | SensitiveOp::Xrstor => self.cpuid.supports_xsave(),
+                            _ => true,
+                        };
+                        if !advertised {
+                            return self.raise(X86Exception::invalid_opcode(va));
+                        }
                         if let Err(exc) = emulate_xstate(&mut self.ctx, mem, raw, op, va) {
                             return self.raise(exc);
                         }
