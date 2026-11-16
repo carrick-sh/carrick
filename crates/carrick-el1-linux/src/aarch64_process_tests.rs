@@ -20156,6 +20156,319 @@ fn arm_root_socketpair_send_recv_and_refusals() {
     expect.assert_empty("a ring stream end's send, receive and refusals left Linux's contract");
 }
 
+/// #2385 review P0-1: MSG_WAITALL stops at a terminal receive state. Once
+/// this end has shut its reads (shutdown(2) SHUT_RD), what the peer sent
+/// before stays readable, and a WAITALL read returns that prefix at once
+/// rather than waiting for bytes no write may add: native Linux returns 3
+/// and "abc" for a 6-byte WAITALL read, then 0. A read of the empty
+/// shut end is 0 too, never a wait.
+#[test]
+fn arm_root_socketpair_waitall_after_shut_rd_returns_buffered_prefix() {
+    use ArmCaller::Root;
+    use carrick_abi::{LINUX_MSG_WAITALL, LINUX_SHUT_RD};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (expect, _) = with_arm_process_host_dispatch(|call| {
+        let expect = ArmExpect::new();
+        let [first, second] = arm_root_spawn_socketpair(call);
+        let out = GuestUserBuffer::from_bytes(b"abc");
+        expect.served(
+            "the peer writes",
+            call(Root, sys::WRITE.raw(), [second, out.arg(), 3, 0, 0, 0]),
+            3,
+        );
+        expect.served(
+            "shutdown(SHUT_RD)",
+            call(
+                Root,
+                sys::SHUTDOWN.raw(),
+                [first, LINUX_SHUT_RD as u64, 0, 0, 0, 0],
+            ),
+            0,
+        );
+        let got = GuestUserBuffer::zeroed(6);
+        let waitall = [first, got.arg(), 6, LINUX_MSG_WAITALL as u64, 0, 0];
+        let read = call(Root, sys::RECVFROM.raw(), waitall);
+        expect.served("recv(MSG_WAITALL) after SHUT_RD", read, 3);
+        expect.bytes(
+            "the buffered prefix",
+            &got.as_bytes()[..read.1.clamp(0, 6) as usize],
+            b"abc",
+        );
+        expect.served(
+            "recv(MSG_WAITALL) of the drained shut end",
+            call(Root, sys::RECVFROM.raw(), waitall),
+            0,
+        );
+        expect.served(
+            "read of the drained shut end",
+            call(Root, sys::READ.raw(), [first, got.arg(), 6, 0, 0, 0]),
+            0,
+        );
+        for fd in [first, second] {
+            expect.served(
+                "close",
+                call(Root, sys::CLOSE.raw(), [fd, 0, 0, 0, 0, 0]),
+                0,
+            );
+        }
+        expect
+    });
+    expect.assert_empty("MSG_WAITALL after SHUT_RD left Linux's contract");
+}
+
+/// #2385 review P0-1, the sibling terminal states of a stream read: a
+/// MSG_WAITALL read returns the delivered prefix once the peer has closed
+/// or shut its writes (EOF follows), and a WAITALL read of an empty end
+/// that shut its reads is 0 at once. Native Linux: 3, 0; 3, 0; 0.
+#[test]
+fn arm_root_socketpair_waitall_stops_at_eof_and_empty_shut_rd() {
+    use ArmCaller::Root;
+    use carrick_abi::{LINUX_MSG_WAITALL, LINUX_SHUT_RD, LINUX_SHUT_WR};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (expect, _) = with_arm_process_host_dispatch(|call| {
+        let expect = ArmExpect::new();
+        let got = GuestUserBuffer::zeroed(6);
+        let out = GuestUserBuffer::from_bytes(b"abc");
+        for (what, close_peer) in [("the peer closed", true), ("the peer's SHUT_WR", false)] {
+            let [first, second] = arm_root_spawn_socketpair(call);
+            expect.served(
+                &format!("the peer writes ({what})"),
+                call(Root, sys::WRITE.raw(), [second, out.arg(), 3, 0, 0, 0]),
+                3,
+            );
+            let ended = if close_peer {
+                call(Root, sys::CLOSE.raw(), [second, 0, 0, 0, 0, 0])
+            } else {
+                call(
+                    Root,
+                    sys::SHUTDOWN.raw(),
+                    [second, LINUX_SHUT_WR as u64, 0, 0, 0, 0],
+                )
+            };
+            expect.served(what, ended, 0);
+            let waitall = [first, got.arg(), 6, LINUX_MSG_WAITALL as u64, 0, 0];
+            let read = call(Root, sys::RECVFROM.raw(), waitall);
+            expect.served(&format!("recv(MSG_WAITALL) after {what}"), read, 3);
+            expect.bytes(
+                &format!("the prefix after {what}"),
+                &got.as_bytes()[..read.1.clamp(0, 6) as usize],
+                b"abc",
+            );
+            expect.served(
+                &format!("recv(MSG_WAITALL) at EOF after {what}"),
+                call(Root, sys::RECVFROM.raw(), waitall),
+                0,
+            );
+            let open: &[u64] = if close_peer {
+                &[first]
+            } else {
+                &[first, second]
+            };
+            for &fd in open {
+                expect.served(
+                    "close",
+                    call(Root, sys::CLOSE.raw(), [fd, 0, 0, 0, 0, 0]),
+                    0,
+                );
+            }
+        }
+        let [first, second] = arm_root_spawn_socketpair(call);
+        expect.served(
+            "shutdown(SHUT_RD) of an empty end",
+            call(
+                Root,
+                sys::SHUTDOWN.raw(),
+                [first, LINUX_SHUT_RD as u64, 0, 0, 0, 0],
+            ),
+            0,
+        );
+        expect.served(
+            "recv(MSG_WAITALL) of an empty shut end",
+            call(
+                Root,
+                sys::RECVFROM.raw(),
+                [first, got.arg(), 6, LINUX_MSG_WAITALL as u64, 0, 0],
+            ),
+            0,
+        );
+        for fd in [first, second] {
+            expect.served(
+                "close",
+                call(Root, sys::CLOSE.raw(), [fd, 0, 0, 0, 0, 0]),
+                0,
+            );
+        }
+        expect
+    });
+    expect.assert_empty("MSG_WAITALL at a terminal receive state left Linux's contract");
+}
+
+/// #2385 review P0-2: a zero-length write to a stream socket still checks
+/// the socket's state (send(2)): after the peer closed, after the peer's
+/// SHUT_RD, or after this end's SHUT_WR it is EPIPE, `sendto` with
+/// MSG_NOSIGNAL and `write(fd, buf, 0)` alike; while the peer still reads
+/// it is 0, even with the lane full, and so after the peer's SHUT_WR. A
+/// pipe's zero-length write stays 0, even with its reader gone (pipe(7)).
+/// Native Linux gives exactly these results.
+#[test]
+fn arm_root_socketpair_zero_length_write_checks_the_stream_state() {
+    use ArmCaller::Root;
+    use carrick_abi::{
+        LINUX_EPIPE, LINUX_MSG_DONTWAIT, LINUX_MSG_NOSIGNAL, LINUX_SHUT_RD, LINUX_SHUT_WR,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (expect, _) = with_arm_process_host_dispatch(|call| {
+        let expect = ArmExpect::new();
+        let buf = GuestUserBuffer::from_bytes(b"x");
+        let pipe = GuestUserBuffer::zeroed(8);
+        let (_, made) = call(Root, sys::PIPE2.raw(), [pipe.arg(), 0, 0, 0, 0, 0]);
+        assert_eq!(made, 0, "pipe2");
+        let [reader, writer] = fd_pair_of(&pipe);
+        expect.served(
+            "a pipe's zero-length write",
+            call(Root, sys::WRITE.raw(), [writer, buf.arg(), 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "close the pipe's reader",
+            call(Root, sys::CLOSE.raw(), [reader, 0, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "a pipe's zero-length write without a reader",
+            call(Root, sys::WRITE.raw(), [writer, buf.arg(), 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "close the pipe's writer",
+            call(Root, sys::CLOSE.raw(), [writer, 0, 0, 0, 0, 0]),
+            0,
+        );
+        let nosignal = LINUX_MSG_NOSIGNAL as u64;
+        let zero_send = |fd: u64| [fd, buf.arg(), 0, nosignal, 0, 0];
+
+        let [first, second] = arm_root_spawn_socketpair(call);
+        expect.served(
+            "a zero-length send while the peer reads",
+            call(Root, sys::SENDTO.raw(), zero_send(first)),
+            0,
+        );
+        // Fill the first end's lane: a zero-length write never waits.
+        let fill = GuestUserBuffer::zeroed(carrick_el1_abi::ipc::IPC_STREAM_LANE_BYTES);
+        let (_, filled) = call(
+            Root,
+            sys::SENDTO.raw(),
+            [
+                first,
+                fill.arg(),
+                fill.as_bytes().len() as u64,
+                LINUX_MSG_DONTWAIT as u64,
+                0,
+                0,
+            ],
+        );
+        assert!(filled > 0, "fill the lane: {filled}");
+        expect.served(
+            "a zero-length write to a full lane",
+            call(Root, sys::WRITE.raw(), [first, buf.arg(), 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "the peer's SHUT_WR",
+            call(
+                Root,
+                sys::SHUTDOWN.raw(),
+                [second, LINUX_SHUT_WR as u64, 0, 0, 0, 0],
+            ),
+            0,
+        );
+        expect.served(
+            "a zero-length send after the peer's SHUT_WR",
+            call(Root, sys::SENDTO.raw(), zero_send(first)),
+            0,
+        );
+        expect.served(
+            "the peer's SHUT_RD",
+            call(
+                Root,
+                sys::SHUTDOWN.raw(),
+                [second, LINUX_SHUT_RD as u64, 0, 0, 0, 0],
+            ),
+            0,
+        );
+        expect.served(
+            "a zero-length send after the peer's SHUT_RD",
+            call(Root, sys::SENDTO.raw(), zero_send(first)),
+            LINUX_EPIPE.guest_retval(),
+        );
+        for fd in [first, second] {
+            expect.served(
+                "close",
+                call(Root, sys::CLOSE.raw(), [fd, 0, 0, 0, 0, 0]),
+                0,
+            );
+        }
+
+        let [first, second] = arm_root_spawn_socketpair(call);
+        expect.served(
+            "this end's SHUT_WR",
+            call(
+                Root,
+                sys::SHUTDOWN.raw(),
+                [first, LINUX_SHUT_WR as u64, 0, 0, 0, 0],
+            ),
+            0,
+        );
+        expect.served(
+            "a zero-length send after this end's SHUT_WR",
+            call(Root, sys::SENDTO.raw(), zero_send(first)),
+            LINUX_EPIPE.guest_retval(),
+        );
+        expect.served(
+            "close the peer",
+            call(Root, sys::CLOSE.raw(), [second, 0, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "close",
+            call(Root, sys::CLOSE.raw(), [first, 0, 0, 0, 0, 0]),
+            0,
+        );
+
+        let [first, second] = arm_root_spawn_socketpair(call);
+        expect.served(
+            "close the peer",
+            call(Root, sys::CLOSE.raw(), [second, 0, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "sendto(fd, buf, 0, MSG_NOSIGNAL) after the peer closed",
+            call(Root, sys::SENDTO.raw(), zero_send(first)),
+            LINUX_EPIPE.guest_retval(),
+        );
+        // write(2) has no MSG_NOSIGNAL: EPIPE comes with SIGPIPE, which
+        // may be delivered off the ring, as for a non-empty write.
+        expect.result(
+            "write(fd, buf, 0) after the peer closed",
+            call(Root, sys::WRITE.raw(), [first, buf.arg(), 0, 0, 0, 0]),
+            LINUX_EPIPE.guest_retval(),
+        );
+        expect.served(
+            "close",
+            call(Root, sys::CLOSE.raw(), [first, 0, 0, 0, 0, 0]),
+            0,
+        );
+        expect
+    });
+    expect.assert_empty("a zero-length stream write left Linux's contract");
+}
+
 /// #2361: a guest wait on a ring stream end releases execution capacity.
 /// A ring fork child's read of its empty end parks as an owned operation
 /// (the call is Suspended, no worker holds it); the parent's write wakes
