@@ -3926,45 +3926,57 @@ fn file_metadata_run(flags: &[&str]) -> (FileMetadataReport, FileMetadataReport)
         all.extend_from_slice(flags);
         let elf = native_exit_fixture_with_flags("native_file_metadata.S", &all);
         if native {
-            let oracle = dir.path().join(format!("{name}-oracle"));
-            carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
-            let out = std::process::Command::new("timeout")
-                .arg("10")
-                .arg(&oracle)
-                .stdin(std::process::Stdio::null())
-                .output()
-                .expect("bounded native file metadata oracle");
-            return (out.status.code().unwrap_or(-1), out.stdout, Vec::new());
+            native_file_report(dir.path(), name, &elf)
+        } else {
+            production_file_report(&elf)
         }
-        let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
-        dispatcher.set_fs_backend(Box::new(
-            carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
-                .expect("host filesystem"),
-        ));
-        let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF");
-        let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
-            &program,
-            128,
-            ROOT_AFFINITY_LOADED,
-            |_| {},
-            dispatcher,
-        )
-        .expect("file metadata production runtime");
-        assert!(!outcome.run.trap_limit_hit, "{:?}", outcome.run);
-        let counters = outcome
-            .physical
-            .syscall_counters()
-            .expect("stopped counters");
-        let refused = counters
-            .refused
-            .iter()
-            .enumerate()
-            .map(|(nr, counter)| (nr, counter.load(std::sync::atomic::Ordering::Acquire)))
-            .filter(|(_, count)| *count != 0)
-            .collect();
-        (outcome.run.exit_code, outcome.run.stdout.clone(), refused)
     };
     (run("native", true), run("carrick", false))
+}
+
+/// Run a file fixture natively as the oracle, bounded.
+fn native_file_report(dir: &std::path::Path, name: &str, elf: &[u8]) -> FileMetadataReport {
+    let oracle = dir.join(format!("{name}-oracle"));
+    carrick_test_support::executable::write_executable_mode(&oracle, elf, 0o700);
+    let out = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("bounded native file oracle");
+    (out.status.code().unwrap_or(-1), out.stdout, Vec::new())
+}
+
+/// Run a file fixture on the production CPL0 path against the host
+/// filesystem, reporting its exit, stdout and nonzero refusal counters.
+fn production_file_report(elf: &[u8]) -> FileMetadataReport {
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF");
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        128,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .expect("file fixture production runtime");
+    assert!(!outcome.run.trap_limit_hit, "{:?}", outcome.run);
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let refused = counters
+        .refused
+        .iter()
+        .enumerate()
+        .map(|(nr, counter)| (nr, counter.load(std::sync::atomic::Ordering::Acquire)))
+        .filter(|(_, count)| *count != 0)
+        .collect();
+    (outcome.run.exit_code, outcome.run.stdout.clone(), refused)
 }
 
 /// Steps 1-5 of `native_file_metadata.S` (open, FIOCLEX, F_GETFD, FIONCLEX,
@@ -4003,6 +4015,43 @@ fn serial_host_fork_child_ioctl_cloexec_on_a_ring_file_matches_native() {
         cloexec_steps(&carrick),
         cloexec_steps(&native),
         "(exit, steps 1-5 errno or F_GETFD value, ioctl refused); full census: {carrick:?}"
+    );
+}
+
+/// #231 parity (apt's lock files): the run root and its fork child contend
+/// POSIX record locks and `flock(2)` on one host file, in one lock table.
+/// `native_record_lock.S` covers cross-process F_SETLK refusal, F_GETLK's
+/// holder and `l_pid`, a child F_SETLKW parked until the root unlocks,
+/// release on close of any fd of the file and at exit, and flock conflict
+/// between open file descriptions until the holder's last close. Red on
+/// main: the fork child's fcntl(F_SETLK) and flock on a ring descriptor were
+/// a counted ENOSYS.
+#[test]
+fn serial_host_root_and_fork_child_contend_record_locks_and_flock() {
+    bounded_witness(
+        "serial_host_root_and_fork_child_contend_record_locks_and_flock",
+        || {
+            let dir = tempfile::tempdir().expect("record lock directory");
+            let run = |name: &str, native: bool| -> FileMetadataReport {
+                let lock = dir.path().join(format!("{name}-lock"));
+                let lock = format!("-DLOCK_PATH=\"{}\"", lock.display());
+                let elf = native_exit_fixture_with_flags("native_record_lock.S", &[&lock]);
+                if native {
+                    native_file_report(dir.path(), name, &elf)
+                } else {
+                    production_file_report(&elf)
+                }
+            };
+            let native = run("native", true);
+            assert_eq!(native.0, 0, "native oracle: {native:?}");
+            assert_eq!(native.1.len(), 34, "native oracle: {native:?}");
+            let carrick = run("carrick", false);
+            assert_eq!(
+                (carrick.0, &carrick.1, &carrick.2),
+                (native.0, &native.1, &Vec::new()),
+                "(exit, child then parent step bytes, refused counters)"
+            );
+        },
     );
 }
 
