@@ -4588,6 +4588,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// that may take them (at a tick, before preempting). Returns how many
     /// moved; their SGIs go to `effects`.
     pub fn migrate_queued(&self, slot: SlotId, effects: &mut WakeEffects) -> usize {
+        // The queueing half of the idle scan's pair ([`Self::take_idle_work`]):
+        // the threads queued here are visible before the idle map is read.
+        fence(Ordering::SeqCst);
         let mut moved = 0;
         let len = self.slot(slot).queued();
         for _ in 0..len {
@@ -5240,6 +5243,24 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         s.affinity.store(source.raw_host(), Ordering::Relaxed);
         s.affinity_source
             .store(source.encoded_guest(), Ordering::Release);
+    }
+
+    /// An idle vCPU's scan for work, the one every ISA's idle scheduler
+    /// runs before it sleeps: publish `slot` idle, then take the head of its
+    /// own run queue or steal another slot's queued thread.
+    ///
+    /// Publishing first closes the lost wake with a migrating or waking
+    /// peer (#2306): the peer queues a thread, then reads `idle_map`
+    /// ([`Self::migrate_queued`], `find_idle`); this scan sets the slot's
+    /// idle bit, then reads the run queues. One side sees the other: either
+    /// the peer placed the thread on this slot (whose [`Self::enter_idle`]
+    /// then refuses to sleep), or this scan steals it. A slot that scanned
+    /// only its own queue slept past a thread a peer's migration left
+    /// queued behind a thread that would not yield its CPU.
+    pub fn take_idle_work(&self, slot: SlotId) -> Option<SwitchedIn> {
+        self.enter_idle(slot, false);
+        fence(Ordering::SeqCst);
+        self.switch_in_full(slot).or_else(|| self.steal(slot))
     }
 
     /// EL1 on idle `thief`: take a queued thread it may run from another

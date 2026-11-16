@@ -824,7 +824,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             let _ = zone.expire_timer(slot, now, timeout_result, &|owned| {
                 crate::substrate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
             });
-            if let Some(switched) = zone.switch_in_full(slot).or_else(|| zone.steal(slot)) {
+            if let Some(switched) = zone.take_idle_work(slot) {
                 zone.leave_idle(slot);
                 match self.load(frame, switched) {
                     LoadResult::Running => return Served::Returned { switched: true },

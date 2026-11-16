@@ -36,7 +36,7 @@ pub fn schedule(slot: SlotId) -> ! {
             crate::anonymous::release_injected_edit_wait(source, current);
         }
         expire_timers(slot, false);
-        if let Some(selected) = source.zone.switch_in_full(slot) {
+        if let Some(selected) = source.zone.take_idle_work(slot) {
             source.zone.leave_idle(slot);
             let record = source.zone.record_ref(selected.record);
             let runtime = native_process::runtime_for_record(source.zone, record);
