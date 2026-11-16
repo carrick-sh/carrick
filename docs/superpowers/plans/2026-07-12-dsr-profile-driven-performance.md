@@ -858,7 +858,7 @@ Extend ABI uniqueness tests and require `dsr-fork.d` to emit samples named
 
 ```bash
 cargo test -p carrick-observability dsr_probe_abi --lib -- --nocapture
-cargo test -p carrick-cli --test trace_profile fork_profile -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::fork_profile -- --nocapture
 ```
 
 Expected: new enum variants and sample names are absent.
@@ -881,7 +881,7 @@ total and verify the sum of subphase durations does not exceed the outer
 ```bash
 cargo test -p carrick-observability dsr_probe_abi --lib -- --nocapture
 cargo test -p carrick-cli --bin carrick trace_profile::tests:: -- --nocapture
-cargo test -p carrick-cli --test trace_profile -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile:: -- --nocapture
 just build
 ```
 

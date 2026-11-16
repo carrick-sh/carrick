@@ -14,7 +14,7 @@ Ranked by durability × silent-regression-likelihood × blast-radius. The first 
 The original proposal was a self-hosted Linux lane with real `/dev/kvm`
 running the former AArch64 smoke fixture. That 1:1 smoke recipe is retired.
 The current x86 entry binding is
-`cargo test -p carrick-vmm-kvm --test cpl0_entry`, after building
+`cargo test -p carrick-vmm-kvm --test main cpl0_entry::`, after building
 `carrick-x86-cpl0` for `x86_64-unknown-none`. It requires a Linux x86_64 KVM
 host and proves CPL0 entry contracts. Full guest workload conformance and
 Apple-Silicon HVF acceptance remain separate gates.

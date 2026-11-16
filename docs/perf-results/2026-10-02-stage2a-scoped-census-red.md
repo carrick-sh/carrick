@@ -94,7 +94,7 @@ not interchangeable with this exhaustive host syscall census.
 `CARGO_BUILD_JOBS=3 RUSTC_WRAPPER= just test-kernel`, `just test`, and
 `just clippy` passed. `just fmt-check` and `git diff --check` passed.
 After making the archive helper propagate construction errors for clippy,
-`cargo test -p carrick-kernel-example --test namespace_two_process -- --nocapture`
+`cargo test -p carrick-kernel-example --test main namespace_two_process:: -- --nocapture`
 passed again (both matrix tests). Logs are `/tmp/stage2a-matrix-{test-kernel,
 test,clippy-final2,final,fmt-check}.log`.
 

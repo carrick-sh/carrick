@@ -113,7 +113,7 @@ completion, and cleanup on failure.
 - [ ] **Step 2: Run and prove red**
 
 ```bash
-cargo test -p carrick-cli --test cli native_fault_abi_fixture -- --nocapture
+cargo test -p carrick-cli --test integration cli::native_fault_abi_fixture -- --nocapture
 ```
 
 Expected: the hidden subcommand and dispatcher do not exist.
@@ -250,7 +250,7 @@ its bytes are actually available. Task 1 cannot hash or publish authority for
 - [ ] **Step 8: Run focused tests and commit**
 
 ```bash
-cargo test -p carrick-cli --test cli native_fault_abi_fixture -- --nocapture
+cargo test -p carrick-cli --test integration cli::native_fault_abi_fixture -- --nocapture
 python3 -m unittest scripts/perf/test_native_fault_qualify.py -v
 just fmt
 git diff --check
@@ -536,7 +536,7 @@ Under `DSRPROF2`, cover:
 - [ ] **Step 3: Run and prove red**
 
 ```bash
-cargo test -p carrick-cli --test trace_profile native_faults -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::native_faults -- --nocapture
 cargo test -p carrick-cli trace_profile::tests::native_fault -- --nocapture
 ```
 
@@ -613,9 +613,9 @@ and `zfod`.
 - [ ] **Step 7: Run focused tests and commit**
 
 ```bash
-cargo test -p carrick-cli --test trace_profile native_faults -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::native_faults -- --nocapture
 cargo test -p carrick-cli trace_profile::tests::native_fault -- --nocapture
-cargo test -p carrick-cli --test cli native_fault -- --nocapture
+cargo test -p carrick-cli --test integration cli::native_fault -- --nocapture
 just fmt
 git diff --check
 git add scripts/dtrace/native-faults.d \
@@ -1023,7 +1023,7 @@ the qualification/coverage gate.
 ```bash
 cargo test -p carrick-observability native_fault -- --nocapture
 cargo test -p carrick-dsr-aarch64 native_mapping_catalog -- --nocapture
-cargo test -p carrick-cli --test trace_profile native_faults -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::native_faults -- --nocapture
 python3 -m unittest \
   scripts/perf/test_native_fault_qualify.py \
   scripts/perf/test_native_fault_attribution.py -v

@@ -548,7 +548,7 @@ summary.
 - [x] **Step 7: Verify and commit**
 
 ```bash
-cargo test -p carrick-cli --test trace_profile --no-fail-fast
+cargo test -p carrick-cli --test integration trace_profile:: --no-fail-fast
 cargo test -p carrick-cli --bin carrick trace_profile
 cargo clippy -p carrick-cli -p carrick-runtime --all-targets -- -D warnings
 just fmt-check

@@ -600,7 +600,7 @@
   ```bash
   cargo test -p carrick-dsr profile -- --nocapture
   cargo test -p carrick-observability --lib -- --nocapture
-  cargo test -p carrick-cli --test trace_profile dsr_live_arena -- --nocapture
+  cargo test -p carrick-cli --test integration trace_profile::dsr_live_arena -- --nocapture
   python3 -m py_compile scripts/carrick_lldb.py
   cargo fmt --all -- --check
   ```

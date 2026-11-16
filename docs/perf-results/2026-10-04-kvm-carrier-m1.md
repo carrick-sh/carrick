@@ -60,7 +60,7 @@ Logs: `target/kvm-carrier-m1/{red-x86,red-arm,mutation-root,mutation-tls,mutatio
 | `cargo test -p carrick-guest-arch` | PASS: 1 unit, 1 private-seal compile-fail doctest |
 | `cargo test -p carrick-el1 -p carrick-x86 --lib` | PASS: 185 EL1, 39 x86 |
 | `cargo test -p carrick-vmm-kvm --lib` | PASS: 24 |
-| `cargo test -p carrick-vmm-kvm --test carrier_cpu` | PASS: required /dev/kvm, full hardware readback A/B/A, 1 test |
+| `cargo test -p carrick-vmm-kvm --test main carrier_cpu::` | PASS: required /dev/kvm, full hardware readback A/B/A, 1 test |
 | `cargo test -p carrick-hal --lib` | PASS: 150 |
 | `just fmt-check` | PASS |
 | `cargo clippy -p carrick-guest-arch -p carrick-hal -p carrick-x86 -p carrick-vmm-kvm -p carrick-el1 --all-targets --no-deps -- -D warnings` | PASS; pre-existing Linux config diagnostic for unreachable libc::proc_listallpids remains |

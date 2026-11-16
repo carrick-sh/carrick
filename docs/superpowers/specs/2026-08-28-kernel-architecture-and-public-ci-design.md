@@ -158,7 +158,7 @@ The runner labels are `[self-hosted, linux, x64, kvm, carrick-kvm]`. The job is
 nightly/manual, gated by its existing repository variable, and fails before
 building unless usable `/dev/kvm` is present on Linux x86_64. It builds
 `carrick-x86-cpl0` for `x86_64-unknown-none`, then runs
-`cargo test -p carrick-vmm-kvm --test cpl0_entry`. Its claim is limited to
+`cargo test -p carrick-vmm-kvm --test main cpl0_entry::`. Its claim is limited to
 executing CPL0 entry bindings and must not be presented as full OCI or
 macOS/HVF conformance.
 

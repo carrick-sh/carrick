@@ -5958,7 +5958,7 @@ rather than in Carrick code, record that and rely on CI's `cross-check-linux`
 job for that closure; an error in Carrick code is a STOP. Run
 `just check-freebsd` when the FreeBSD cross toolchain variables are exported
 (the recipe's comment names them), and
-`cargo test -p carrick-vmm-kvm --test cpl0_entry` on a Linux x86_64 host with
+`cargo test -p carrick-vmm-kvm --test main cpl0_entry::` on a Linux x86_64 host with
 real `/dev/kvm` and a built CPL0 image; record each gate not run in Task 13's
 "gates not run". The EL1 image,
 its IRQ entry, the vector window and `gic.rs` are HVF-only

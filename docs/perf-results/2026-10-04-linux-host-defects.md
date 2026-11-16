@@ -63,7 +63,7 @@ Focused verification, after each corresponding red witness:
 
 ```sh
 cargo test -p carrick-kernel --lib --features test-support lseek_data_and_hole_across_backends
-cargo test -p carrick-kernel-example --test socket_close
+cargo test -p carrick-kernel-example --test main socket_close::
 cargo test -p carrick-kernel --lib --features test-support epoll_et_ -- --skip serial_host
 RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support serial_host::epoll_et_repolls_host_level_when_mux_misses_wake
 cargo test -p carrick-kernel --lib --features test-support readonly_host_fd_cannot_carry_a_writable_shared_file_mapping

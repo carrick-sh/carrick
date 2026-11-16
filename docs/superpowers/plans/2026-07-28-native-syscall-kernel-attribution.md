@@ -803,7 +803,7 @@ Add source-contract tests that require:
 Run:
 
 ```bash
-cargo test -p carrick-cli --test trace_profile native_wall_joined_script_contract -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::native_wall_joined_script_contract -- --nocapture
 ```
 
 Expected: the source-contract test fails against the current D program.
@@ -916,7 +916,7 @@ format. Stop immediately after compile; this is not live proof.
 Run:
 
 ```bash
-cargo test -p carrick-cli --test trace_profile -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile:: -- --nocapture
 cargo test -p carrick-cli trace_profile -- --nocapture
 just fmt
 git diff --check

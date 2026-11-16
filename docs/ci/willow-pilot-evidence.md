@@ -51,7 +51,7 @@ actual assignment:
   Fresh machine ID: `fb4489f6eb6744b1939bd95570e2d734`.
 - `cargo build --locked --release -p carrick-x86-cpl0 --target x86_64-unknown-none`
   succeeded, followed by
-  `cargo test --locked -p carrick-vmm-kvm --test cpl0_entry -- --nocapture`:
+  `cargo test --locked -p carrick-vmm-kvm --test main cpl0_entry:: -- --nocapture`:
   **2 passed, 0 failed, 0 ignored**. Both tests boot a real KVM carrier:
   `two_live_tasks_serve_robust_lists_without_host_forwards` and
   `entry_and_return_kicks_never_republish_or_recomplete`.

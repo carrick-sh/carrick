@@ -271,7 +271,7 @@ semantic + complete structural observations; no ignored/inverted reds.
 - **Red:** retained seed-5 fd-pin scenario on `b4baca05c`; wrong runnable-set,
   generation/fixture and trailing-trace mutation controls fail replay. Existing
   unscheduled semantics continue to run. This is real red #1, already shown.
-- **Accept:** `cargo test -p carrick-kernel-example --test schedule_replay`;
+- **Accept:** `cargo test -p carrick-kernel-example --test main schedule_replay::`;
   `just test-kernel-semantics`; `just check-layering`; common gates below.
 - **Waits:** no N1 runtime work. Green fd ownership assertion waits for
   `work/fork-fdpin`; do not land an expected Unsupported as a conformant result.
@@ -293,7 +293,7 @@ semantic + complete structural observations; no ignored/inverted reds.
 - **Budgets:** one birth/publication, no credential update redispatch while
   admitted waiting, no stale entry/completion; wake work scales only with
   affected waiters at 1/8/32. Reduced ordering/epoch mutations fail Loom models.
-- **Accept:** `cargo test -p carrick-kernel-example --test admission_interleavings`;
+- **Accept:** `cargo test -p carrick-kernel-example --test main admission_interleavings::`;
   `cargo test -p carrick-sched-core -p carrick-fd-core -p carrick-pipe-core`;
   dedicated bounded Loom recipe added here; `just test-kernel`; common gates.
 - **Waits:** setid-churn fix/source handoff; sched-core/EL1-ABI edits wait for

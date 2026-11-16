@@ -153,7 +153,7 @@ Run:
 cargo test -p carrick-spec native_code_mode --lib
 cargo test -p carrick-runtime native16k_plan_has_no_instruction_vehicle_policy --lib
 cargo test -p carrick-runtime carrick_owned_exit_is_not_brk_transport --lib
-cargo test -p carrick-cli --test cli native_code_mode_flag_is_not_public_policy -- --nocapture
+cargo test -p carrick-cli --test integration cli::native_code_mode_flag_is_not_public_policy -- --nocapture
 scripts/build-probes.sh
 scripts/build-signed.sh
 scripts/run-probe.sh nativebrk
@@ -275,7 +275,7 @@ is not a private host transport.
 cargo test -p carrick-spec --lib
 cargo test -p carrick-engine --lib
 cargo test -p carrick-runtime --lib
-cargo test -p carrick-cli --test cli native_code_mode_flag_is_not_public_policy -- --nocapture
+cargo test -p carrick-cli --test integration cli::native_code_mode_flag_is_not_public_policy -- --nocapture
 cargo clippy -p carrick-spec -p carrick-engine -p carrick-runtime -p carrick-cli --all-targets -- -D warnings
 scripts/build-probes.sh
 scripts/build-signed.sh
@@ -401,7 +401,7 @@ fn comparison_rejects_artifact_mismatch() {
 - [ ] **Step 2: Verify red**
 
 ```bash
-cargo test -p carrick-cli --test perf_runner backend_pair -- --nocapture
+cargo test -p carrick-cli --test conformance perf_runner::backend_pair -- --nocapture
 ```
 
 Expected: compile failure because the backend-pair model does not exist.
@@ -458,9 +458,9 @@ Test one object per line and replacement of the destination only after success.
 - [ ] **Step 5: Verify and commit**
 
 ```bash
-cargo test -p carrick-cli --test perf_runner backend_pair -- --nocapture
+cargo test -p carrick-cli --test conformance perf_runner::backend_pair -- --nocapture
 cargo test -p carrick-cli --test dsr_trace_overhead bootstrap_ratio -- --nocapture
-cargo clippy -p carrick-cli --test perf_runner --test dsr_trace_overhead -- -D warnings
+cargo clippy -p carrick-cli --test conformance --test dsr_trace_overhead -- -D warnings
 git add crates/carrick-cli/src/perf_stats.rs crates/carrick-cli/tests/perf_support
 git commit -m "test(perf): add backend-pair evidence model" -m "Add typed backend identities, fixed ABBA order, artifact checks, seeded bootstrap comparisons, and atomic JSONL with no performance pass field.
 
@@ -511,8 +511,8 @@ fn collector_runs_native_hvf_hvf_native() {
 - [ ] **Step 2: Verify red**
 
 ```bash
-cargo test -p carrick-cli --test perf_runner native_and_hvf_use_the_same_direct_elf_artifact -- --nocapture
-cargo test -p carrick-cli --test perf_runner collector_runs_native_hvf_hvf_native -- --nocapture
+cargo test -p carrick-cli --test conformance perf_runner::native_and_hvf_use_the_same_direct_elf_artifact -- --nocapture
+cargo test -p carrick-cli --test conformance perf_runner::collector_runs_native_hvf_hvf_native -- --nocapture
 ```
 
 Expected: missing invocation and collector functions.
@@ -570,7 +570,7 @@ The script builds signed Carrick/probes and runs only the ignored backend report
 - [ ] **Step 6: Verify and commit**
 
 ```bash
-cargo test -p carrick-cli --test perf_runner backend_pair -- --nocapture
+cargo test -p carrick-cli --test conformance perf_runner::backend_pair -- --nocapture
 just build
 CARRICK_PERF_FILTER=trap_floor just bench-backends quick
 git add crates/carrick-cli/tests/perf_support crates/carrick-cli/tests/perf_runner.rs \
@@ -618,8 +618,8 @@ fn v8_pair_uses_one_immutable_image_digest() {
 - [ ] **Step 2: Verify red**
 
 ```bash
-cargo test -p carrick-cli --test perf_runner backend_pair_contains_required_process_cases -- --nocapture
-cargo test -p carrick-cli --test perf_runner v8_pair_uses_one_immutable_image_digest -- --nocapture
+cargo test -p carrick-cli --test conformance perf_runner::backend_pair_contains_required_process_cases -- --nocapture
+cargo test -p carrick-cli --test conformance perf_runner::v8_pair_uses_one_immutable_image_digest -- --nocapture
 ```
 
 - [ ] **Step 3: Register process shapes**

@@ -365,7 +365,7 @@ Run:
 
 ```bash
 cargo test -p carrick-cli --bin carrick trace_profile
-cargo test -p carrick-cli --test trace_profile
+cargo test -p carrick-cli --test integration trace_profile::
 just fmt-check
 git diff --check
 ```
@@ -2291,7 +2291,7 @@ Run:
 
 ```bash
 cargo test -p carrick-cli --bin carrick trace_profile
-cargo test -p carrick-cli --test trace_profile
+cargo test -p carrick-cli --test integration trace_profile::
 python3 -m unittest scripts.perf.test_native_wall_attribution -v
 python3 -m unittest scripts.perf.test_native_kernel_capture -v
 just fmt-check

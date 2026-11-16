@@ -582,7 +582,7 @@ otool -l target/release/carrick | rg '__dof_carrick'
 cargo test -p carrick-cli --test conformance native_low_et_exec_runs_through_biased_dsr -- --nocapture
 cargo test -p carrick-cli --test conformance native16k_mprotect_exec_permissions_match_linux -- --nocapture
 CARRICK_EXEC_BACKEND=native CARRICK_NATIVE_PAGE_PROFILE=native16k scripts/run-probe.sh nativebrk
-cargo test -p carrick-cli --test perf_runner direct_ -- --nocapture
+cargo test -p carrick-cli --test conformance perf_runner::direct_ -- --nocapture
 ```
 
 Expected: signed low `ET_EXEC`, JIT rewrite, guest BRK semantics, and direct PIE guards pass.

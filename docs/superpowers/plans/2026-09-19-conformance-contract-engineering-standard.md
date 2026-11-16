@@ -669,7 +669,7 @@ fn unrelated_futex_population_does_not_increase_target_queue_visits() {
 - [ ] **Step 2: Run the focused test and capture red evidence**
 
 ```bash
-RUSTC_WRAPPER= cargo test -p carrick-kernel-example --test contracts futex_contention_contract_is_semantically_exact_and_linear -- --exact --nocapture
+RUSTC_WRAPPER= cargo test -p carrick-kernel-example --test main contracts::futex_contention_contract_is_semantically_exact_and_linear -- --exact --nocapture
 ```
 
 Expected: compile failure because `futex_contention_contract` and `RunReport::work_snapshot` do not exist. Preserve this transcript as the framework red-first receipt.
@@ -700,7 +700,7 @@ Build the same handshake-driven waiter script used by existing semantics tests, 
 Under `#[cfg(test)]`, add a fault-injection option to the scenario binding—not production futex code—that records one extra `FutexQueueVisits` per target waiter. Run:
 
 ```bash
-CARRICK_CONTRACT_FAULT=extra-futex-visit RUSTC_WRAPPER= cargo test -p carrick-kernel-example --test contracts futex_structural_red_control -- --exact --nocapture
+CARRICK_CONTRACT_FAULT=extra-futex-visit RUSTC_WRAPPER= cargo test -p carrick-kernel-example --test main contracts::futex_structural_red_control -- --exact --nocapture
 ```
 
 Expected: test passes only when it observes `ScalingViolation` at the smallest affected scale. Remove any environment-dependent production behavior; the red-control hook stays test-only and is itself tested as inactive by default.
@@ -708,7 +708,7 @@ Expected: test passes only when it observes `ScalingViolation` at the smallest a
 - [ ] **Step 6: Run the complete VM-free gates**
 
 ```bash
-RUSTC_WRAPPER= cargo test -p carrick-kernel-example --test contracts -- --nocapture
+RUSTC_WRAPPER= cargo test -p carrick-kernel-example --test main contracts:: -- --nocapture
 RUSTC_WRAPPER= just test-kernel
 RUSTC_WRAPPER= cargo clippy -p carrick-kernel-example -p carrick-kernel --all-targets -- -D warnings
 ```

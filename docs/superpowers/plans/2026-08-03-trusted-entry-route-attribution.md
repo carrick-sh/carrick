@@ -399,7 +399,7 @@ Pin `trusted-route` parsing, the bundled script hash, `requires_runtime_profile(
 Run:
 
 ```bash
-cargo test -p carrick-cli --test trace_profile trusted_route -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::trusted_route -- --nocapture
 ```
 
 Expected: tests fail because the profile and receipt parser do not exist.
@@ -419,7 +419,7 @@ When `--profile trusted-route --summary-jsonl FILE` is used, atomically write on
 Run:
 
 ```bash
-cargo test -p carrick-cli --test trace_profile trusted_route -- --nocapture
+cargo test -p carrick-cli --test integration trace_profile::trusted_route -- --nocapture
 cargo test -p carrick-cli --bin carrick trace_profile -- --nocapture
 ```
 
@@ -596,7 +596,7 @@ Run:
 cargo test -p carrick-dsr-aarch64
 RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib
 cargo test -p carrick-cli --bin carrick
-cargo test -p carrick-cli --test trace_profile
+cargo test -p carrick-cli --test integration trace_profile::
 ```
 
 Expected: all focused suites pass serially where required.
