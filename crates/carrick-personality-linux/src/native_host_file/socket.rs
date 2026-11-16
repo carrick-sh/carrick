@@ -9,6 +9,14 @@
 //! call reads and declares the ranges it may write, and completion copies
 //! back only the extents the carrier's call wrote.
 //!
+//! A `send` or `recv` keeps its caller's whole extent (#2414 review P0-1).
+//! One record stages at most [`NET_TRANSFER_MAX_BYTES`] of its data, which
+//! every inet datagram fits, so a datagram is always one transfer: the
+//! carrier answers EMSGSIZE for a larger datagram send before it transmits
+//! anything. A stream transfer larger than one record continues record by
+//! record in the ring's owned continuation ([`NetTransfer`]), which keeps
+//! the bytes already moved and the call's completion authority.
+//!
 //! AF_UNIX and every other family keep their own route: a `socket` call of
 //! another domain is not decoded here, and a call on an in-zone descriptor
 //! stays with its ring owner.
@@ -30,6 +38,13 @@ use carrick_syscall_abi::CanonicalNr;
 const SOCKET_ADDRESS_MAX: usize = 128;
 /// Largest option value staged for `getsockopt`/`setsockopt`.
 const SOCKET_OPTION_MAX: usize = 4096;
+/// Largest byte count one `send` or `recv` moves: Linux clamps a larger
+/// length to `INT_MAX`.
+const TRANSFER_LEN_MAX: u64 = i32::MAX as u64;
+/// Linux `MSG_PEEK`.
+const LINUX_MSG_PEEK: u64 = 0x2;
+/// Linux `MSG_WAITALL`.
+const LINUX_MSG_WAITALL: u64 = 0x100;
 
 /// A decoded call of the host network family: its canonical number and
 /// argument words. Pointers in them are still untrusted user addresses.
@@ -151,6 +166,25 @@ impl Plan {
         Ok(())
     }
 
+    /// Prove the rest of a transfer's extent, past its first record's
+    /// range, readable now: the continuation's later records copy it in
+    /// without a fault supply of their own.
+    fn readable(
+        &self,
+        user: &mut dyn HostFileUser,
+        address: u64,
+        len: usize,
+    ) -> Result<(), HostFileStage> {
+        let readable = user.readable(address, len);
+        if readable < len {
+            return Err(HostFileStage::Fault {
+                address: address.saturating_add(readable as u64),
+                access: Access::Read,
+            });
+        }
+        Ok(())
+    }
+
     /// A value-result socket address (`accept`, `getsockname`, `recvfrom`):
     /// the `socklen_t` the call reads and rewrites, and the address bytes it
     /// may write. Linux reads the length first; a negative one is EINVAL.
@@ -218,12 +252,17 @@ pub(super) fn stage(
                 plan.address_result(user, args[1], args[2])?;
             }
         } else if c == nr::SENDTO {
-            // A transfer crosses at most one record's data range: a larger
-            // send returns the short count of that range.
-            let len = (args[2] as usize).min(NET_TRANSFER_MAX_BYTES);
-            args[2] = len as u64;
-            if len > 0 {
-                plan.read(user, args[1], len, false)?;
+            // The call keeps its whole extent in `args[2]`; this record
+            // stages its first range. A stream send continues in the ring
+            // (`NetTransfer`), whose later records copy in the rest, proven
+            // readable now; the carrier refuses a datagram larger than the
+            // range with EMSGSIZE.
+            args[2] = args[2].min(TRANSFER_LEN_MAX);
+            let len = args[2] as usize;
+            let first = len.min(NET_TRANSFER_MAX_BYTES);
+            if first > 0 {
+                plan.read(user, args[1], first, false)?;
+                plan.readable(user, args[1].saturating_add(first as u64), len - first)?;
             }
             if args[4] != 0 {
                 let alen = args[5] as i32;
@@ -235,10 +274,18 @@ pub(super) fn stage(
                 }
             }
         } else if c == nr::RECVFROM {
-            let len = (args[2] as usize).min(NET_TRANSFER_MAX_BYTES);
-            args[2] = len as u64;
-            if len > 0 {
-                plan.write(user, args[1], len)?;
+            // The call keeps its whole extent in `args[2]`; this record
+            // receives into its first range, which holds any datagram. A
+            // MSG_WAITALL stream receive continues in the ring
+            // (`NetTransfer`) into the rest, proven writable now.
+            args[2] = args[2].min(TRANSFER_LEN_MAX);
+            let len = args[2] as usize;
+            let first = len.min(NET_TRANSFER_MAX_BYTES);
+            if first > 0 {
+                plan.write(user, args[1], first)?;
+                if args[3] & LINUX_MSG_WAITALL != 0 && args[3] & LINUX_MSG_PEEK == 0 {
+                    plan.writable(user, args[1].saturating_add(first as u64), len - first)?;
+                }
             }
             if args[4] != 0 {
                 plan.address_result(user, args[4], args[5])?;
@@ -306,7 +353,7 @@ pub(super) fn complete(
     copy_out: &mut dyn FnMut(u64, &[u8]) -> bool,
 ) -> Option<SyscallResult> {
     let call = staged_call(input)?;
-    for (address, bytes) in NetCall::decode_written(call.segments(), reply)? {
+    for (address, bytes) in NetCall::decode_written(call.segments(), reply)?.1 {
         if !bytes.is_empty() && !copy_out(address, bytes) {
             return Some(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT));
         }
@@ -364,4 +411,206 @@ pub fn stamp_net_caller(record: &[u8], caller: &NetCaller) -> Option<Box<[u8]>> 
 /// The call of a stamped socket record's input.
 pub(super) fn staged_call(input: &[u8]) -> Option<NetCall<'_>> {
     NetCall::decode(NetCaller::split(input)?.1)
+}
+
+/// A `send` or `recv` in progress across records (#2414 review P0-1): the
+/// ring's owned continuation of one call, which keeps the bytes its earlier
+/// records moved. Linux's blocking stream send completes its whole buffer,
+/// and a MSG_WAITALL stream receive fills its whole buffer, unless a signal,
+/// an error or the end of the stream stops them: then the call returns the
+/// bytes already moved, and an error only when none moved.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetTransfer {
+    done: u64,
+}
+
+impl NetTransfer {
+    /// The bytes the call's earlier records moved.
+    pub const fn done(self) -> u64 {
+        self.done
+    }
+
+    /// The call's answer once it stops: the bytes moved, or `result` (an
+    /// interruption or error) when none moved.
+    pub fn stopped(self, result: SyscallResult) -> SyscallResult {
+        if self.done == 0 {
+            result
+        } else {
+            SyscallResult::new(self.done as i64)
+        }
+    }
+}
+
+/// What a served socket record's call does next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetTransferStep {
+    /// The call's result.
+    Complete(SyscallResult),
+    /// The call continues with its next record over `len` bytes at
+    /// `address` ([`net_transfer_record`]); a send's bytes are copied in
+    /// from there first.
+    Next {
+        transfer: NetTransfer,
+        address: u64,
+        len: usize,
+        send: bool,
+    },
+}
+
+/// Whether the served `record` is a socket `send` or `recv`, whose
+/// completion is the ring's transfer continuation ([`net_transfer_step`]).
+pub fn is_net_transfer(record: &[u8]) -> bool {
+    use crate::crossing::nr;
+    host_file::replied_parts(record).is_some_and(|(header, input, _)| {
+        header.op == HostFileOp::NetSyscall
+            && staged_call(input).is_some_and(|call| {
+                call.canonical == nr::SENDTO.raw() || call.canonical == nr::RECVFROM.raw()
+            })
+    })
+}
+
+/// The next step of the socket transfer whose record (`record`, served,
+/// its user output already copied back) answered `chunk`. `interrupted`: a
+/// signal cancelled the service, so the call stops with what it moved.
+/// `None` for a record that is not a `send` or `recv`.
+///
+/// The call continues, from the byte after the last one moved, only while
+/// it moved bytes and has more to move, never past a signal, and:
+/// - a send on a stream socket: a blocking one until it moved them all (a
+///   short record means the host's send buffer was full: the next record
+///   waits for room); a non-blocking one while each record moves its whole
+///   range (the next one moves what fits, or nothing);
+/// - a MSG_WAITALL receive on a blocking stream socket, never a peek;
+/// - never a datagram, which one record always holds whole.
+pub fn net_transfer_step(
+    record: &[u8],
+    chunk: SyscallResult,
+    transfer: NetTransfer,
+    interrupted: bool,
+) -> Option<NetTransferStep> {
+    use crate::crossing::nr;
+    let (header, input, _) = host_file::replied_parts(record)?;
+    if header.op != HostFileOp::NetSyscall {
+        return None;
+    }
+    let call = staged_call(input)?;
+    let send = call.canonical == nr::SENDTO.raw();
+    if !send && call.canonical != nr::RECVFROM.raw() {
+        return None;
+    }
+    let moved = match u64::try_from(chunk.raw()) {
+        Ok(moved) => moved,
+        Err(_) => return Some(NetTransferStep::Complete(transfer.stopped(chunk))),
+    };
+    let done = NetTransfer {
+        done: transfer.done.saturating_add(moved),
+    };
+    let complete = Some(NetTransferStep::Complete(SyscallResult::new(
+        done.done as i64,
+    )));
+    // The facts lead the reply output of every served record.
+    let facts = host_file::reply(record)
+        .and_then(|reply| NetCall::decode_written(call.segments(), reply.output))
+        .map_or_else(Default::default, |(facts, _)| facts);
+    // The record's own range: the call's next bytes (`args[1]`), at most
+    // one record's worth of the `args[2]` the call still has to move.
+    let range = call
+        .segments()
+        .first()
+        .filter(|segment| segment.address == call.args[1])
+        .map_or(0, |segment| u64::from(segment.len));
+    let flags = call.args[3];
+    let continues = !interrupted
+        && facts.stream
+        && moved > 0
+        && moved <= range
+        && call.args[2] > moved
+        && if send {
+            facts.blocking || moved == range
+        } else {
+            facts.blocking && flags & LINUX_MSG_WAITALL != 0 && flags & LINUX_MSG_PEEK == 0
+        };
+    if !continues {
+        return complete;
+    }
+    let left = call.args[2] - moved;
+    Some(NetTransferStep::Next {
+        transfer: done,
+        address: call.args[1].checked_add(moved)?,
+        len: (left as usize).min(NET_TRANSFER_MAX_BYTES),
+        send,
+    })
+}
+
+/// The next record of the socket transfer whose previous record is
+/// `record`: the same caller, descriptor and flags over the call's next
+/// `len` bytes at `address` (a send's `bytes`, a receive's buffer), with
+/// the bytes the call still has to move. The destination address of a
+/// stream send's first record does not repeat. `None` for a record that is
+/// not a `send` or `recv`, or bytes that do not match `len`.
+pub fn net_transfer_record(
+    record: &[u8],
+    address: u64,
+    len: usize,
+    bytes: Option<&[u8]>,
+) -> Option<(Box<[u8]>, HostFileOutput)> {
+    use crate::crossing::nr;
+    let (header, input, _) = host_file::replied_parts(record)?;
+    if header.op != HostFileOp::NetSyscall {
+        return None;
+    }
+    let (caller, call) = NetCaller::split(input)?;
+    let call = NetCall::decode(call)?;
+    let send = call.canonical == nr::SENDTO.raw();
+    if (!send && call.canonical != nr::RECVFROM.raw())
+        || bytes.is_some() != send
+        || bytes.is_some_and(|bytes| bytes.len() != len)
+        || len == 0
+        || len > NET_TRANSFER_MAX_BYTES
+    {
+        return None;
+    }
+    let range = call
+        .segments()
+        .first()
+        .filter(|segment| segment.address == call.args[1])
+        .map_or(0, |segment| u64::from(segment.len));
+    let moved = address.checked_sub(call.args[1])?;
+    if moved == 0 || moved > range {
+        return None;
+    }
+    let left = call.args[2].checked_sub(moved)?;
+    let segments = [NetSegment {
+        address,
+        len: len as u32,
+        input: send,
+        output: !send,
+    }];
+    let inputs: &[&[u8]] = match bytes {
+        Some(bytes) => &[bytes],
+        None => &[],
+    };
+    let encoded = NetCall::encode(
+        call.canonical,
+        [call.args[0], address, left, call.args[3], 0, 0],
+        &segments,
+        inputs,
+    )?;
+    let mut staged = Vec::new();
+    staged
+        .try_reserve_exact(host_file::NET_CALLER_BYTES + encoded.len())
+        .ok()?;
+    staged.extend_from_slice(&caller.encode());
+    staged.extend_from_slice(&encoded);
+    let output_cap = NetCall::output_capacity(&segments);
+    let mut next = alloc::vec![0u8; record_len(staged.len(), output_cap)?].into_boxed_slice();
+    host_file::encode(&mut next, header, &staged, output_cap).ok()?;
+    Some((
+        next,
+        HostFileOutput {
+            address: 0,
+            len: output_cap,
+            layout: OutputLayout::Net,
+        },
+    ))
 }

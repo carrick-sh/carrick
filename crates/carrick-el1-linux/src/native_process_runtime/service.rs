@@ -135,6 +135,19 @@ struct PendingHostFile<'a> {
     /// A chdir lookup: completion stores the named directory as the
     /// caller's cwd.
     chdir: bool,
+    /// The bytes a socket `send`/`recv` moved in its earlier records: the
+    /// call's owned continuation across records (#2414).
+    transfer: carrick_personality_linux::native_host_file::NetTransfer,
+}
+
+/// What a host-file service does after its record's completion, when the
+/// call is not answered from that record alone (#2414).
+enum HostFileContinuation<'a> {
+    /// Publish the call's next record: its own record again after a
+    /// host-readiness wake, or a socket transfer's next range.
+    Publish(PendingHostFile<'a>),
+    /// The call's answer.
+    Returned(SyscallResult),
 }
 
 /// Ring-owned input of a typed service, retained until completion ACK.
@@ -636,24 +649,42 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let mut effects = WakeEffects::default();
         if let Some(wait) = wait {
             drop(guard);
-            let enrollment = carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
-                self.zone,
-                request.identity.birth.mm,
-                wait,
-            )
-            .map_err(|_| NativeFailure::Stale)?;
+            // The queue the owner wait parked on: a host-readiness wait
+            // (#231) parks on the member's own queue, every other cause on
+            // its MM resource's (`park_owner_wait`).
+            let key = if wait.cause() == carrick_core_abi::PortalWaitCause::HostReadiness {
+                if wait.handle() != request.identity.birth.mm {
+                    return Err(NativeFailure::Stale);
+                }
+                ObjectWaitKey::native_host_ready(record).ok_or(NativeFailure::Stale)?
+            } else {
+                carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
+                    self.zone,
+                    request.identity.birth.mm,
+                    wait,
+                )
+                .map_err(|_| NativeFailure::Stale)?
+                .key()
+            };
             let completion =
                 |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
                     crate::sched::object_wait::deliver_completion(self.zone, slot, owned);
                 };
-            let queue = self
-                .zone
-                .object_wait_with_completion(
-                    enrollment.key(),
+            // An MM resource queue runs its own completion; a member's
+            // host-readiness queue is a plain object queue.
+            let queue = if self.zone.completion_enabled(key) {
+                self.zone.object_wait_with_completion(
+                    key,
                     &carrick_sched_core::ShortLockSpin,
                     &completion,
                 )
-                .map_err(|_| NativeFailure::Stale)?;
+            } else {
+                self.zone
+                    .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })
+            }
+            .map_err(|_| NativeFailure::Stale)?;
             // Recheck after queue admission: a completed wait may already have
             // moved to its successor. Cancellation remains sticky in the cell.
             if self
@@ -1430,7 +1461,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             &mut record,
             || self.caller_file_size_soft_limit(),
         )?;
+        // A poll call's ring serial, new at the call's own entry: the
+        // carrier keys the call's deadline on it (#2414).
+        if carrick_core_abi::host_file::request_parts(&record).is_some_and(|(header, _, _)| {
+            header.op == carrick_core_abi::host_file::HostFileOp::Poll
+        }) && !carrick_personality_linux::native_host_file::stamp_poll_call(
+            &mut record,
+            self.next_host_call_serial(),
+        ) {
+            return Err(NativeProcessError::Invalid);
+        }
         self.publish_host_file(record, output, map, chdir, call)
+    }
+
+    /// A new host call's ring serial: unique within this runtime.
+    fn next_host_call_serial(&self) -> carrick_core_abi::host_file::HostCallSerial {
+        let raw = self
+            .runtime
+            .host_call_serials
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        carrick_core_abi::host_file::HostCallSerial::new(
+            NonZeroU64::new(raw).unwrap_or(NonZeroU64::MIN),
+        )
     }
 
     fn host_root_retains_filesystem(&self) -> bool {
@@ -1493,6 +1545,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok_or(NativeProcessError::Invalid)?
             .0
             .op;
+        self.publish_pending_host_file(PendingHostFile {
+            call,
+            operation,
+            record,
+            output,
+            map,
+            chdir,
+            transfer: Default::default(),
+        })
+    }
+
+    /// Publish one record of a host-file call, with the call's retained
+    /// continuation state.
+    fn publish_pending_host_file(
+        &mut self,
+        file: PendingHostFile<'a>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let record = &file.record;
+        let call = file.call;
         self.service_phase = NativeServicePhase::Capability;
         let capability = self
             .runtime
@@ -1511,16 +1582,123 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             },
             None,
             None,
-            ServicePayload::HostFile(PendingHostFile {
-                call,
-                operation,
-                record,
-                output,
-                map,
-                chdir,
-            }),
+            ServicePayload::HostFile(file),
             ServiceCompletion::Inline,
         )
+    }
+
+    /// The next step of a host-file call whose record's service completed
+    /// (`Supplied` or `Cancelled`), when that record alone does not answer
+    /// it (#2414). `None` keeps the record's own completion.
+    /// - A record that waited on its member's host-readiness queue made no
+    ///   effect. Once the host object is ready, the call publishes its own
+    ///   record again: the same staged input (Linux reads a poll set and a
+    ///   send's bytes once per call), its poll serial and its transfer,
+    ///   which keep the call's deadline and the bytes it already moved. A
+    ///   signal that interrupted the wait answers EINTR, or the bytes the
+    ///   call already moved.
+    /// - A socket transfer's record copies its received bytes back, then
+    ///   the call continues with its next range or answers the bytes moved
+    ///   ([`carrick_personality_linux::native_host_file::net_transfer_step`]).
+    #[inline(never)]
+    fn continue_host_file(
+        &mut self,
+        pending: &mut PendingService<'a>,
+        result: ServiceResult,
+    ) -> Result<Option<HostFileContinuation<'a>>, NativeProcessError> {
+        use carrick_personality_linux::native_host_file::{self as venue, NetTransferStep};
+        let waited = pending.waited_on_host_readiness();
+        let Some(file) = pending.host_file.as_ref() else {
+            return Ok(None);
+        };
+        if carrick_core_abi::host_file::reply(&file.record).is_none() {
+            if !waited {
+                return Ok(None);
+            }
+            return Ok(Some(match result {
+                ServiceResult::Supplied => {
+                    let mut file = pending.host_file.take().ok_or(NativeProcessError::Stale)?;
+                    file.record =
+                        venue::request_again(&file.record).ok_or(NativeProcessError::Invalid)?;
+                    HostFileContinuation::Publish(file)
+                }
+                // Linux's interrupted blocking socket call or poll: EINTR, or
+                // the bytes it already moved. One that moved nothing and
+                // that Linux restarts (a socket call, a read or write; never
+                // a poll) is retained for the shared signal policy, which
+                // restarts it under SA_RESTART on either ISA.
+                _ => {
+                    if file.transfer.done() == 0 && venue::restarts_after_interrupt(&file.record) {
+                        self.retain_interrupted_syscall()
+                            .map_err(NativeProcessError::from)?;
+                    }
+                    HostFileContinuation::Returned(
+                        file.transfer
+                            .stopped(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EINTR)),
+                    )
+                }
+            }));
+        }
+        if !venue::is_net_transfer(&file.record) {
+            return Ok(None);
+        }
+        let mut copy_out = |address: u64, bytes: &[u8]| {
+            self.copy_syscall_output(carrick_guest_arch::UserVa::new(address), bytes)
+                .is_ok()
+        };
+        let chunk = venue::complete(&file.record, file.output, &mut copy_out);
+        let step = venue::net_transfer_step(
+            &file.record,
+            chunk,
+            file.transfer,
+            result == ServiceResult::Cancelled,
+        )
+        .ok_or(NativeProcessError::Invalid)?;
+        let (transfer, address, len, send) = match step {
+            NetTransferStep::Complete(answer) => {
+                // Linux raises SIGPIPE only for a send that moved nothing.
+                if answer.raw() == carrick_syscall_abi::LINUX_EPIPE.guest_retval()
+                    && venue::sigpipe_on_epipe(&file.record)
+                {
+                    carrick_personality_linux::signal::ProcessSignals::raise_sigpipe(self);
+                }
+                return Ok(Some(HostFileContinuation::Returned(answer)));
+            }
+            NetTransferStep::Next {
+                transfer,
+                address,
+                len,
+                send,
+            } => (transfer, address, len, send),
+        };
+        let bytes = if send {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(len)
+                .map_err(|_| NativeProcessError::Exhausted)?;
+            bytes.resize(len, 0);
+            match self.copy_syscall_input(carrick_guest_arch::UserVa::new(address), &mut bytes) {
+                Ok(()) => Some(bytes),
+                // A sibling unmapped the rest of the buffer since staging:
+                // the call answers what it moved, as Linux's send does.
+                Err(NativeProcessError::Fault | NativeProcessError::Unsupported) => {
+                    return Ok(Some(HostFileContinuation::Returned(SyscallResult::new(
+                        transfer.done() as i64,
+                    ))));
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let (record, output) =
+            venue::net_transfer_record(&file.record, address, len, bytes.as_deref())
+                .ok_or(NativeProcessError::Invalid)?;
+        let mut file = pending.host_file.take().ok_or(NativeProcessError::Stale)?;
+        file.record = record;
+        file.output = Some(output);
+        file.transfer = transfer;
+        Ok(Some(HostFileContinuation::Publish(file)))
     }
     fn finish_service_handoff(
         &mut self,
@@ -3606,6 +3784,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 prefix.call,
             );
         }
+        if matches!(request.operation, ServiceOperation::HostFile { .. })
+            && matches!(result, ServiceResult::Supplied | ServiceResult::Cancelled)
+            && let Some(next) = self.continue_host_file(&mut pending, result)?
+        {
+            self.release_service_claim(pending.claim)?;
+            return match next {
+                HostFileContinuation::Publish(file) => self.publish_pending_host_file(file),
+                HostFileContinuation::Returned(result) => Ok(NativeResume::Returned(result)),
+            };
+        }
         let mut output = pending.copyout.take();
         if matches!(request.operation, ServiceOperation::HostFile { .. })
             && matches!(result, ServiceResult::Supplied | ServiceResult::Cancelled)
@@ -3906,23 +4094,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         carrick_personality_linux::signal::ProcessSignals::raise_sigpipe(self);
                     }
                     Ok(NativeResume::Returned(result))
-                }
-                (ServiceOperation::HostFile { .. }, ServiceResult::Supplied)
-                    if pending.waited_on_host_readiness() =>
-                {
-                    // The host object the call would have blocked on became
-                    // ready (#231): rerun the exact call, which probes once.
-                    Ok(NativeResume::RetrySyscall)
-                }
-                (ServiceOperation::HostFile { .. }, ServiceResult::Cancelled)
-                    if pending.waited_on_host_readiness() =>
-                {
-                    // A signal interrupted the wait before any effect: Linux's
-                    // blocking socket call reports EINTR (restarted under
-                    // SA_RESTART by the shared return policy).
-                    Ok(NativeResume::Returned(SyscallResult::from_errno(
-                        carrick_syscall_abi::LINUX_EINTR,
-                    )))
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Supplied) => {
                     // Supplied without a reply is a transport violation.

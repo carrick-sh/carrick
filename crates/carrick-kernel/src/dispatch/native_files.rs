@@ -775,17 +775,17 @@ impl SyscallDispatcher {
             return NativePoll::Served(Served::Refused);
         };
         let timeout_ms = header.args[1] as i64;
+        // The call's own deadline, keyed on its ring serial: the same call's
+        // records share it, a new call starts its own (#2414 review P0-2).
+        let Some(call) = carrick_core_abi::host_file::HostCallSerial::from_raw(
+            header.args[carrick_core_abi::host_file::POLL_CALL_SERIAL_ARG],
+        ) else {
+            return NativePoll::Served(Served::Refused);
+        };
         let deadline = (timeout_ms >= 0).then(|| {
-            let fingerprint = {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                input.hash(&mut hasher);
-                timeout_ms.hash(&mut hasher);
-                hasher.finish()
-            };
             owner.poll_deadlines().deadline(
                 record,
-                fingerprint,
+                call,
                 std::time::Duration::from_millis(timeout_ms as u64),
             )
         });
@@ -1857,6 +1857,128 @@ mod tests {
         assert_eq!(
             fixture.result(None, caller(0)).0,
             carrick_abi::LINUX_EPERM.guest_retval()
+        );
+    }
+
+    /// #2414 review P0-1: a native datagram send is one transfer. A record
+    /// carries the call's whole length and stages at most one record's range
+    /// of it, which every inet datagram fits: the carrier sends a 65000-byte
+    /// UDP datagram whole, and answers a 100000-byte one EMSGSIZE before it
+    /// transmits anything, as Linux does (the Docker oracle: EMSGSIZE, 90).
+    /// Each reply leads with the socket's facts for the ring's transfer
+    /// continuation. Red before the fix: the ring clipped the call to the
+    /// record's range, and the carrier sent that prefix as a datagram.
+    #[test]
+    fn a_native_datagram_send_is_one_transfer_or_emsgsize() {
+        let fixture = fixture();
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let port = peer.local_addr().unwrap().port();
+        let root = fixture.dispatcher.capture_one_task_context().unwrap();
+        let stamped = |fd: i32, call: Vec<u8>| {
+            let mut input = host_file::NetCaller {
+                task: root.task().key(),
+                ns_pid: std::num::NonZeroU32::new(7).unwrap(),
+                ids: host_file::AccessIds {
+                    ruid: 1000,
+                    euid: 1000,
+                    suid: 1000,
+                    fsuid: 1000,
+                    rgid: 1000,
+                    egid: 1000,
+                    sgid: 1000,
+                    fsgid: 1000,
+                },
+                cap_effective: 0,
+            }
+            .encode()
+            .to_vec();
+            input.extend_from_slice(&call);
+            let segments = host_file::NetCall::decode(&call).unwrap();
+            let output = host_file::NetCall::output_capacity(segments.segments());
+            record(
+                fixture.table,
+                HostFileOp::NetSyscall,
+                fd,
+                [0; 4],
+                &input,
+                output,
+            )
+        };
+        let socket = host_file::NetCall::encode(
+            carrick_abi::syscall::nr::SOCKET.raw(),
+            [2, 2, 0, 0, 0, 0],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (fd, _) = fixture.result(None, stamped(-1, socket));
+        assert!(fd >= 0, "a UDP socket: {fd}");
+        let mut address = [0u8; 16];
+        address[..2].copy_from_slice(&2u16.to_le_bytes());
+        address[2..4].copy_from_slice(&port.to_be_bytes());
+        address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        let send = |len: usize| {
+            let staged = len.min(host_file::NET_TRANSFER_MAX_BYTES);
+            let data = vec![0x41u8; staged];
+            let segments = [
+                host_file::NetSegment {
+                    address: 0x10_0000,
+                    len: staged as u32,
+                    input: true,
+                    output: false,
+                },
+                host_file::NetSegment {
+                    address: 0x20_0000,
+                    len: 16,
+                    input: true,
+                    output: false,
+                },
+            ];
+            let call = host_file::NetCall::encode(
+                carrick_abi::syscall::nr::SENDTO.raw(),
+                [fd as u64, 0x10_0000, len as u64, 0, 0x20_0000, 16],
+                &segments,
+                &[&data, &address],
+            )
+            .unwrap();
+            let (result, output) = fixture.result(None, stamped(fd as i32, call.clone()));
+            let decoded = host_file::NetCall::decode(&call).unwrap();
+            let facts = (result >= 0).then(|| {
+                host_file::NetCall::decode_written(decoded.segments(), &output)
+                    .unwrap()
+                    .0
+            });
+            (result, facts)
+        };
+        let mut datagram = vec![0u8; 70_000];
+        assert_eq!(
+            send(100_000),
+            (carrick_abi::LINUX_EMSGSIZE.guest_retval(), None),
+            "a datagram larger than any record is EMSGSIZE"
+        );
+        assert_eq!(
+            peer.recv(&mut datagram).map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "and transmits nothing"
+        );
+        assert_eq!(
+            send(65_000),
+            (
+                65_000,
+                Some(host_file::NetTransferFacts {
+                    stream: false,
+                    blocking: true,
+                })
+            )
+        );
+        peer.set_nonblocking(false).unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        assert_eq!(
+            peer.recv(&mut datagram).map_err(|error| error.kind()),
+            Ok(65_000),
+            "the datagram arrives whole"
         );
     }
 
