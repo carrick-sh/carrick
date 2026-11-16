@@ -2,11 +2,8 @@
 //! No host callback answers clone, futex wait/wake, clear or exit. Host only
 //! stocks issued identities and folds completed retirements while CPUs stop.
 //! This bounded context fixture does not qualify production-pool exhaustion.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#[path = "common/physical_inventory.rs"]
-mod physical_inventory;
-use physical_inventory::physical_inventory;
+use crate::physical_inventory;
 
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::OBSERVE_NATIVE;

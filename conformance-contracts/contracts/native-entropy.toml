@@ -61,14 +61,14 @@ vm_free = [
   "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
 ]
 embed = [
-  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_default_returns_eight_bytes",
-  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_nonblock_returns_eight_bytes",
-  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_root_getrandom_returns_eight_bytes",
-  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_root_getrandom_lazy_output_returns_eight_bytes",
-  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_readonly_returns_efault",
-  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_cow_preserves_parent",
-  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_lazy_output_returns_eight_bytes",
-  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_boundary_returns_accessible_prefix",
+  "KVM production carrier: carrick-vmm-kvm::main::cpl0_initial_mm::serial_host_native_child_getrandom_default_returns_eight_bytes",
+  "KVM production carrier: carrick-vmm-kvm::main::cpl0_initial_mm::serial_host_native_child_getrandom_nonblock_returns_eight_bytes",
+  "KVM production carrier: carrick-vmm-kvm::main::cpl0_initial_mm::serial_host_native_root_getrandom_returns_eight_bytes",
+  "KVM production carrier: carrick-vmm-kvm::main::cpl0_initial_mm::serial_host_native_root_getrandom_lazy_output_returns_eight_bytes",
+  "KVM production carrier: carrick-vmm-kvm::main::cpl0_initial_mm::serial_host_native_child_getrandom_readonly_returns_efault",
+  "KVM production carrier: carrick-vmm-kvm::main::cpl0_initial_mm::serial_host_native_child_getrandom_cow_preserves_parent",
+  "KVM production carrier: carrick-vmm-kvm::main::cpl0_initial_mm::serial_host_native_child_getrandom_lazy_output_returns_eight_bytes",
+  "KVM production carrier: carrick-vmm-kvm::main::cpl0_initial_mm::serial_host_native_child_getrandom_boundary_returns_accessible_prefix",
   "carrick-vmm-kvm::cpl0_boot::cpl0_layout_tests::production_boot_refuses_stale_layout_before_entry",
 ]
 

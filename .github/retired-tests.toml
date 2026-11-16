@@ -27,13 +27,13 @@ pr = 1894
 [[retired]]
 test = "cpl0_initial_mm::in_zone_child_host_read_is_refused_not_served_under_root_context"
 reason = "#2157 B0: an x86 fork child's unstaged crossing is now answered in ring with a counted ENOSYS, like ARM, instead of being refused for its host task context, so the witness was renamed for what it proves (d79573dd4)."
-replaced_by = "cpl0_initial_mm::in_zone_child_host_read_is_counted_enosys_not_served_under_root_context"
+replaced_by = "main::cpl0_initial_mm::in_zone_child_host_read_is_counted_enosys_not_served_under_root_context"
 pr = 2167
 
 [[retired]]
 test = "cpl0_initial_mm::in_zone_child_pipe_write_without_ipc_execution_is_counted_enosys_in_ring"
 reason = "#1671: an in-zone child's pipe write on x86 CPL0 is now served through the shared IPC owner instead of returning a counted ENOSYS, so the refusal witness became a witness that the write is served (9968c4138)."
-replaced_by = "cpl0_initial_mm::in_zone_child_pipe_write_uses_shared_ipc_execution"
+replaced_by = "main::cpl0_initial_mm::in_zone_child_pipe_write_uses_shared_ipc_execution"
 pr = 2153
 
 [[retired]]
@@ -2966,5 +2966,1525 @@ pr = 2411
 test = "trace_profile::trace_profile_keeps_raw_and_summary_outputs_distinct"
 reason = "#2408: consolidated carrick-cli integration tests into one test binary per gate lane (integration)."
 replaced_by = "integration::trace_profile::trace_profile_keeps_raw_and_summary_outputs_distinct"
+pr = 2411
+
+# #2408 Slice 1: carrick-vmm-kvm kvm-lane integration tests consolidated into `main`.
+
+[[retired]]
+test = "carrier_cpu::running_boundary_rejects_wrong_task_before_entering_kvm"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::carrier_cpu::running_boundary_rejects_wrong_task_before_entering_kvm"
+pr = 2411
+
+[[retired]]
+test = "carrier_cpu::stopped_kvm_cpu_roundtrips_two_complete_task_images"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::carrier_cpu::stopped_kvm_cpu_roundtrips_two_complete_task_images"
+pr = 2411
+
+[[retired]]
+test = "carrier_memory::cow_write_fault_breaks_to_private_bytes_without_changing_the_sibling"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::carrier_memory::cow_write_fault_breaks_to_private_bytes_without_changing_the_sibling"
+pr = 2411
+
+[[retired]]
+test = "carrier_memory::first_touch_faults_then_retries_on_private_backing"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::carrier_memory::first_touch_faults_then_retries_on_private_backing"
+pr = 2411
+
+[[retired]]
+test = "carrier_memory::nx_and_readonly_violations_report_user_instruction_and_write_faults"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::carrier_memory::nx_and_readonly_violations_report_user_instruction_and_write_faults"
+pr = 2411
+
+[[retired]]
+test = "carrier_memory::retired_guest_leaf_keeps_old_frame_until_owner_settlement"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::carrier_memory::retired_guest_leaf_keeps_old_frame_until_owner_settlement"
+pr = 2411
+
+[[retired]]
+test = "carrier_memory::revoke_drains_loaded_translation_and_rejects_recycled_slot_edges"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::carrier_memory::revoke_drains_loaded_translation_and_rejects_recycled_slot_edges"
+pr = 2411
+
+[[retired]]
+test = "carrier_memory::shared_revoke_requires_both_alias_unlinks_and_both_exact_context_drains"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::carrier_memory::shared_revoke_requires_both_alias_unlinks_and_both_exact_context_drains"
+pr = 2411
+
+[[retired]]
+test = "carrier_memory::two_live_mms_map_identical_vas_to_private_bytes_and_share_only_explicit_edges"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::carrier_memory::two_live_mms_map_identical_vas_to_private_bytes_and_share_only_explicit_edges"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::cpl0_forward_port_returns_host_result_through_shared_entry"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::cpl0_forward_port_returns_host_result_through_shared_entry"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::cpl0_rechecks_host_modified_return_frame_before_iret"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::cpl0_rechecks_host_modified_return_frame_before_iret"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::cpl0_supervisor_stub_is_rx_while_tables_and_idt_are_rw_nx"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::cpl0_supervisor_stub_is_rx_while_tables_and_idt_are_rw_nx"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::entry_and_return_kicks_never_republish_or_recomplete"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::entry_and_return_kicks_never_republish_or_recomplete"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::file_region_guest_closes_record_beyond_fifteen"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::file_region_guest_closes_record_beyond_fifteen"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::file_region_guest_refuses_foreign_publication"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::file_region_guest_refuses_foreign_publication"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::file_region_guest_refuses_retired_publication"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::file_region_guest_refuses_retired_publication"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::file_region_guest_refuses_unpublished_binding"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::file_region_guest_refuses_unpublished_binding"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::file_region_guest_stdio_parity_and_two_carrier_independence"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::file_region_guest_stdio_parity_and_two_carrier_independence"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::forwarded_call_completes_before_pending_kick_work_exit"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::forwarded_call_completes_before_pending_kick_work_exit"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_anonymous_caught_signal_returns_and_reexecutes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_anonymous_caught_signal_returns_and_reexecutes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_anonymous_contention_then_metadata_provisions_without_second_park"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_anonymous_contention_then_metadata_provisions_without_second_park"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_anonymous_editor_busy_once_parks_and_completes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_anonymous_editor_busy_once_parks_and_completes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_anonymous_failed_replay_settlement_is_fatal_not_efault"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_anonymous_failed_replay_settlement_is_fatal_not_efault"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_anonymous_metadata_required_provisions_without_park"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_anonymous_metadata_required_provisions_without_park"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_anonymous_prepared_conflict_once_parks_and_completes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_anonymous_prepared_conflict_once_parks_and_completes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_anonymous_protect_and_partial_unmap_stay_in_ring"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_anonymous_protect_and_partial_unmap_stay_in_ring"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_anonymous_release_to_idle_peer_preserves_wake"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_anonymous_release_to_idle_peer_preserves_wake"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_anonymous_root_busy_once_parks_and_completes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_anonymous_root_busy_once_parks_and_completes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_clone_settid_busy_once_then_stores"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_clone_settid_busy_once_then_stores"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_clone_thread_runs_and_exits_without_ending_parent"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_clone_thread_runs_and_exits_without_ending_parent"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_cpl0_boot_requires_smep_and_smap_on_both_cpus"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_cpl0_boot_requires_smep_and_smap_on_both_cpus"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_cpl0_boot_retains_separate_supervisor_and_initial_extents"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_cpl0_boot_retains_separate_supervisor_and_initial_extents"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_fork_census_root_busy_once_then_forks"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_fork_census_root_busy_once_then_forks"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_fork_commit_root_busy_once_then_forks"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_fork_commit_root_busy_once_then_forks"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_fork_editor_busy_once_then_forks"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_fork_editor_busy_once_then_forks"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_futex_synchronous_results_replace_rax"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_futex_synchronous_results_replace_rax"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_glibc_pthread_join_futex_is_served_in_ring"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_glibc_pthread_join_futex_is_served_in_ring"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_image_has_no_anonymous_injection_statics"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_image_has_no_anonymous_injection_statics"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_image_refuses_anonymous_injection_ordinals"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_image_refuses_anonymous_injection_ordinals"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_image_rejects_fixture_syscalls"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_image_rejects_fixture_syscalls"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_interrupt_boot_serves_an_ordinary_syscall"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_interrupt_boot_serves_an_ordinary_syscall"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_kill_nonleader_tid_kicks_every_eligible_member"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_kill_nonleader_tid_kicks_every_eligible_member"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_kill_probe_resolves_a_live_nonleader_tid"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_kill_probe_resolves_a_live_nonleader_tid"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_native_futex_timeout_returns_etimedout"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_native_futex_timeout_returns_etimedout"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_pipe_metadata_stays_in_the_ring_namespace"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_pipe_metadata_stays_in_the_ring_namespace"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_root_exec_retargets_the_loaded_kvm_executor"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_root_exec_retargets_the_loaded_kvm_executor"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_signal_frame_busy_once_retains_and_delivers_once"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_signal_frame_busy_once_retains_and_delivers_once"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_signal_frame_owner_wait_parks_and_delivers_once"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_signal_frame_owner_wait_parks_and_delivers_once"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_signal_frame_real_fault_delivers_sigsegv_si_kernel"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_signal_frame_real_fault_delivers_sigsegv_si_kernel"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_two_threads_blocking_wait4_reap_distinct_children"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_two_threads_blocking_wait4_reap_distinct_children"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_wait4_rusage_copy_busy_once_retains_the_reaped_answer"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_wait4_rusage_copy_busy_once_retains_the_reaped_answer"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_wait4_rusage_editor_busy_once_parks_then_writes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_wait4_rusage_editor_busy_once_parks_then_writes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_wait4_status_copy_busy_once_then_reaps"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_wait4_status_copy_busy_once_then_reaps"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_wait4_status_editor_busy_once_parks_then_reaps"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_wait4_status_editor_busy_once_parks_then_reaps"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::production_waitid_nohang_siginfo_busy_once_returns_zero"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::production_waitid_nohang_siginfo_busy_once_returns_zero"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::serial_host_native_child_sleep_deadline_crossing_between_checks_returns_zero"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::serial_host_native_child_sleep_deadline_crossing_between_checks_returns_zero"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::serial_host_native_child_sleep_eintr_retains_a_busy_remainder"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::serial_host_native_child_sleep_eintr_retains_a_busy_remainder"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::serial_host_native_child_sleep_eintr_writes_a_cow_remainder"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::serial_host_native_child_sleep_eintr_writes_a_cow_remainder"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::serial_host_native_child_sleep_eintr_writes_a_lazy_remainder"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::serial_host_native_child_sleep_eintr_writes_a_lazy_remainder"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::serial_host_native_child_sleep_eintr_writes_the_remainder"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::serial_host_native_child_sleep_eintr_writes_the_remainder"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_allocator_serves_two_live_cpl0_tasks"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_allocator_serves_two_live_cpl0_tasks"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_context_stack_slot_and_thread_cpu"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_context_stack_slot_and_thread_cpu"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_drain_receipt_requires_the_live_root"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_drain_receipt_requires_the_live_root"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_fork_table_window_checks_each_granted_arena"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_fork_table_window_checks_each_granted_arena"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_frequency_uses_published_kvm_binding"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_frequency_uses_published_kvm_binding"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_interrupt_leaves"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_interrupt_leaves"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_mmu_reports_live_cr3_root"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_mmu_reports_live_cr3_root"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_peer_apic_queues_wake_for_runnable_cpu"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_peer_apic_queues_wake_for_runnable_cpu"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_portal_window_uses_live_upper_direct_root"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_portal_window_uses_live_upper_direct_root"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_retired_page_repoints_without_user_publication"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_retired_page_repoints_without_user_publication"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_scheduler_ack_uses_spurious_sentinel"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_scheduler_ack_uses_spurious_sentinel"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_scheduler_routes_reschedule_to_peer_apic"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_scheduler_routes_reschedule_to_peer_apic"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_transport_yield_and_fatal"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_transport_yield_and_fatal"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_user_access_recovers_from_bad_va"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_user_access_recovers_from_bad_va"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_user_access_restores_smap_ac"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_user_access_restores_smap_ac"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_x86_cow_copies_and_repoints_through_intent"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_x86_cow_copies_and_repoints_through_intent"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_x86_descriptor_protects_a_user_page"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_x86_descriptor_protects_a_user_page"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_x86_fault_settles_prepared_grant_in_guest"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_x86_fault_settles_prepared_grant_in_guest"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::shared_kernel_x86_prepares_then_publishes_a_user_page"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::shared_kernel_x86_prepares_then_publishes_a_user_page"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::stopped_cpl0_cpu_drops_stale_translation_before_cpl0_access"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::stopped_cpl0_cpu_drops_stale_translation_before_cpl0_access"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::stopped_cpl3_cpu_drops_a_retired_translation_before_its_next_load"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::stopped_cpl3_cpu_drops_a_retired_translation_before_its_next_load"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::stopped_cpl3_cpu_receives_a_queued_host_kick"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::stopped_cpl3_cpu_receives_a_queued_host_kick"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::two_live_cpus_complete_mutual_root_shootdowns"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::two_live_cpus_complete_mutual_root_shootdowns"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::two_live_tasks_register_full_width_heads_without_dereferencing"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::two_live_tasks_register_full_width_heads_without_dereferencing"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::two_live_tasks_reject_length_with_high_bits_preserving_both_heads"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::two_live_tasks_reject_length_with_high_bits_preserving_both_heads"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::two_live_tasks_serve_robust_lists_without_host_forwards"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::two_live_tasks_serve_robust_lists_without_host_forwards"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::two_running_vcpus_drop_stale_translation_on_shootdown"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::two_running_vcpus_drop_stale_translation_on_shootdown"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::two_running_vcpus_fault_before_shootdown_ipi_acknowledges_in_guest"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::two_running_vcpus_fault_before_shootdown_ipi_acknowledges_in_guest"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::two_running_vcpus_stopped_with_debt_settles_on_reentry"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::two_running_vcpus_stopped_with_debt_settles_on_reentry"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::user_access_walks_the_second_live_root"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::user_access_walks_the_second_live_root"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::x1_boot_shared_substrate"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::x1_boot_shared_substrate"
+pr = 2411
+
+[[retired]]
+test = "cpl0_entry::x4_linux_common_entry"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_entry::x4_linux_common_entry"
+pr = 2411
+
+[[retired]]
+test = "cpl0_exit_drain_wake::child_exit_closing_last_reader_wakes_parked_writer_with_epipe"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_exit_drain_wake::child_exit_closing_last_reader_wakes_parked_writer_with_epipe"
+pr = 2411
+
+[[retired]]
+test = "cpl0_exit_drain_wake::child_exit_closing_last_writer_wakes_parked_poll"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_exit_drain_wake::child_exit_closing_last_writer_wakes_parked_poll"
+pr = 2411
+
+[[retired]]
+test = "cpl0_exit_drain_wake::child_exit_closing_last_writer_wakes_parked_ppoll"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_exit_drain_wake::child_exit_closing_last_writer_wakes_parked_ppoll"
+pr = 2411
+
+[[retired]]
+test = "cpl0_exit_drain_wake::child_exit_closing_last_writer_wakes_parked_reader_to_eof"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_exit_drain_wake::child_exit_closing_last_writer_wakes_parked_reader_to_eof"
+pr = 2411
+
+[[retired]]
+test = "cpl0_exit_drain_wake::child_exit_wakes_poll_parked_on_idle_peer_cpu"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_exit_drain_wake::child_exit_wakes_poll_parked_on_idle_peer_cpu"
+pr = 2411
+
+[[retired]]
+test = "cpl0_exit_drain_wake::child_exit_wakes_ppoll_parked_on_idle_peer_cpu"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_exit_drain_wake::child_exit_wakes_ppoll_parked_on_idle_peer_cpu"
+pr = 2411
+
+[[retired]]
+test = "cpl0_exit_drain_wake::failed_resched_msi_is_a_carrier_error_not_a_hang"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_exit_drain_wake::failed_resched_msi_is_a_carrier_error_not_a_hang"
+pr = 2411
+
+[[retired]]
+test = "cpl0_fork_e2e::exhausted_fork_spaces_return_eagain_without_host_forwarding"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_fork_e2e::exhausted_fork_spaces_return_eagain_without_host_forwarding"
+pr = 2411
+
+[[retired]]
+test = "cpl0_fork_e2e::exhausted_wait_entries_leave_record_capacity_unchanged"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_fork_e2e::exhausted_wait_entries_leave_record_capacity_unchanged"
+pr = 2411
+
+[[retired]]
+test = "cpl0_fork_e2e::second_fixture_fork_returns_eagain_before_any_mutation"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_fork_e2e::second_fixture_fork_returns_eagain_before_any_mutation"
+pr = 2411
+
+[[retired]]
+test = "cpl0_fork_e2e::static_elf_fork_child_cow_wait_and_parent_exit_seven"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_fork_e2e::static_elf_fork_child_cow_wait_and_parent_exit_seven"
+pr = 2411
+
+[[retired]]
+test = "cpl0_fork_e2e::static_elf_wait4_wnohang_reap_then_echild"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_fork_e2e::static_elf_wait4_wnohang_reap_then_echild"
+pr = 2411
+
+[[retired]]
+test = "cpl0_fork_e2e::user_cow_fault_clears_poisoned_xsave_header"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_fork_e2e::user_cow_fault_clears_poisoned_xsave_header"
+pr = 2411
+
+[[retired]]
+test = "cpl0_fork_e2e::wait4_without_an_admitted_child_returns_echild"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_fork_e2e::wait4_without_an_admitted_child_returns_echild"
+pr = 2411
+
+[[retired]]
+test = "cpl0_fork_e2e::wait4_writes_status_before_unwritable_rusage_efault"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_fork_e2e::wait4_writes_status_before_unwritable_rusage_efault"
+pr = 2411
+
+[[retired]]
+test = "cpl0_fork_e2e::wait4_zeroes_the_full_rusage_record"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_fork_e2e::wait4_zeroes_the_full_rusage_record"
+pr = 2411
+
+[[retired]]
+test = "cpl0_fork_e2e::wait_any_parks_with_the_issued_child_pid_result"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_fork_e2e::wait_any_parks_with_the_issued_child_pid_result"
+pr = 2411
+
+[[retired]]
+test = "cpl0_group_exit::fork_child_exit_group_retires_computing_worker"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_group_exit::fork_child_exit_group_retires_computing_worker"
+pr = 2411
+
+[[retired]]
+test = "cpl0_group_exit::fork_child_exit_group_retires_futex_worker"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_group_exit::fork_child_exit_group_retires_futex_worker"
+pr = 2411
+
+[[retired]]
+test = "cpl0_group_exit::fork_child_exit_group_retires_runnable_worker"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_group_exit::fork_child_exit_group_retires_runnable_worker"
+pr = 2411
+
+[[retired]]
+test = "cpl0_group_exit::fork_child_worker_exit_group_retires_entryless_leader"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_group_exit::fork_child_worker_exit_group_retires_entryless_leader"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::block_then_user_page_fault_terminates_with_sigsegv_in_ring"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::block_then_user_page_fault_terminates_with_sigsegv_in_ring"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::child_born_on_idle_peer_can_fault_and_retire_on_root_executor"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::child_born_on_idle_peer_can_fault_and_retire_on_root_executor"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::crossing_operand_absent_fd_is_ebadf"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::crossing_operand_absent_fd_is_ebadf"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::crossing_operand_duplicated_stdin_reads_through_its_binding"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::crossing_operand_duplicated_stdin_reads_through_its_binding"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::crossing_operand_host_backed_fd_passes_to_the_host"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::crossing_operand_host_backed_fd_passes_to_the_host"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::crossing_operand_in_zone_fd_is_answered_in_ring"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::crossing_operand_in_zone_fd_is_answered_in_ring"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::crossing_operand_stdio_host_object_writes_through_its_binding"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::crossing_operand_stdio_host_object_writes_through_its_binding"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::explicit_initial_process_kick_preempts_and_resumes_under_pool"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::explicit_initial_process_kick_preempts_and_resumes_under_pool"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::file_region_guest_fork_dup_and_child_retirement_preserve_parent"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::file_region_guest_fork_dup_and_child_retirement_preserve_parent"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::idle_lane_exit_budget_failure_completes_the_run"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::idle_lane_exit_budget_failure_completes_the_run"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::idle_peer_syscall_trap_hands_task_back_to_host_and_delivers_stdout"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::idle_peer_syscall_trap_hands_task_back_to_host_and_delivers_stdout"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::in_zone_child_blocking_wait_is_refused_before_any_token"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::in_zone_child_blocking_wait_is_refused_before_any_token"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::in_zone_child_exit_is_reaped_by_parent_not_published_as_run_exit"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::in_zone_child_exit_is_reaped_by_parent_not_published_as_run_exit"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::in_zone_child_host_read_is_counted_enosys_not_served_under_root_context"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::in_zone_child_host_read_is_counted_enosys_not_served_under_root_context"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::in_zone_child_pipe2_and_unfaulted_cow_read_matches_native_oracle"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::in_zone_child_pipe2_and_unfaulted_cow_read_matches_native_oracle"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::in_zone_child_pipe_write_uses_shared_ipc_execution"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::in_zone_child_pipe_write_uses_shared_ipc_execution"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::in_zone_child_stdout_write_resolves_through_childs_own_table"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::in_zone_child_stdout_write_resolves_through_childs_own_table"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::initial_root_uses_issued_thread_and_file_table_identity"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::initial_root_uses_issued_thread_and_file_table_identity"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::initial_write_returns_prefix_or_efault_without_aborting_carrier"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::initial_write_returns_prefix_or_efault_without_aborting_carrier"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::loaded_lane_child_syscall_trap_hands_task_back_to_host_and_delivers_stdout"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::loaded_lane_child_syscall_trap_hands_task_back_to_host_and_delivers_stdout"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::loaded_lane_shutdown_kick_between_check_and_entry_is_sticky"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::loaded_lane_shutdown_kick_between_check_and_entry_is_sticky"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_exit_wake_to_a_busy_home_queues_the_parent_at_home"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_exit_wake_to_a_busy_home_queues_the_parent_at_home"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_fork_child_exec_caught_signal_while_parked"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_fork_child_exec_caught_signal_while_parked"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_fork_child_exec_default_terminate_while_parked"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_fork_child_exec_default_terminate_while_parked"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_fork_child_exec_ignored_signal_while_parked"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_fork_child_exec_ignored_signal_while_parked"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_fork_child_exec_killed_while_parked_is_reaped"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_fork_child_exec_killed_while_parked_is_reaped"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_fork_child_exec_refusals_return_their_errno_to_the_old_image"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_fork_child_exec_refusals_return_their_errno_to_the_old_image"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_fork_child_exec_sibling_fatal_signal_retires_parked_caller"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_fork_child_exec_sibling_fatal_signal_retires_parked_caller"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_fork_child_exec_wakes_after_stock_holder_retires"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_fork_child_exec_wakes_after_stock_holder_retires"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_fork_child_execs_static_successor"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_fork_child_execs_static_successor"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_fork_child_execs_while_parent_keeps_running"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_fork_child_execs_while_parent_keeps_running"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_kill_wake_to_a_busy_home_queues_the_parent_at_home"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_kill_wake_to_a_busy_home_queues_the_parent_at_home"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_nocldwait_blocks_until_every_child_mm_retires"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_nocldwait_blocks_until_every_child_mm_retires"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_pipe2_takes_no_readiness_lane_lock_held_by_a_previous_incarnation"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_pipe2_takes_no_readiness_lane_lock_held_by_a_previous_incarnation"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_runtime_wait_wakes_once_only_after_real_mm_retirement"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_runtime_wait_wakes_once_only_after_real_mm_retirement"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::native_sigign_blocks_until_every_child_mm_retires"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::native_sigign_blocks_until_every_child_mm_retires"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::private_file_child_first_touch_after_parent_unmap"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::private_file_child_first_touch_after_parent_unmap"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::private_file_page_beyond_eof_delivers_sigbus"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::private_file_page_beyond_eof_delivers_sigbus"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::private_file_path_only_mapping_returns_ebadf"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::private_file_path_only_mapping_returns_ebadf"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::private_file_read_only_faults_in_source_bytes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::private_file_read_only_faults_in_source_bytes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::private_file_source_limit_returns_enomem"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::private_file_source_limit_returns_enomem"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::private_file_write_only_mapping_returns_eacces"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::private_file_write_only_mapping_returns_eacces"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::private_file_write_preserves_source_bytes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::private_file_write_preserves_source_bytes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_boot_binds_both_kvm_local_apics"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_boot_binds_both_kvm_local_apics"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_bootstrap_stack_prefix_accepts_user_writes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_bootstrap_stack_prefix_accepts_user_writes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_brk_regrows_over_its_released_pages"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_brk_regrows_over_its_released_pages"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_clone_parent_tid_busy_once_reruns_in_ring"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_clone_parent_tid_busy_once_reruns_in_ring"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_enters_pt_interp_instead_of_executable_entry"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_enters_pt_interp_instead_of_executable_entry"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_exclusion_settles_an_outstanding_cow_before_its_retired_leaf"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_exclusion_settles_an_outstanding_cow_before_its_retired_leaf"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_exclusion_settles_owed_returns_before_the_doorbell_is_needed"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_exclusion_settles_owed_returns_before_the_doorbell_is_needed"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_exec_service_stages_parks_and_reruns_a_successor"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_exec_service_stages_parks_and_reruns_a_successor"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_extent_cannot_alias_kernel_metadata"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_extent_cannot_alias_kernel_metadata"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_full_owed_return_table_parks_on_its_busy_holder_until_release"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_full_owed_return_table_parks_on_its_busy_holder_until_release"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_full_owed_return_table_reclaims_exited_fork_holders"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_full_owed_return_table_reclaims_exited_fork_holders"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_gib_owed_extent_settles_one_chunk_per_pause_in_one_doorbell"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_gib_owed_extent_settles_one_chunk_per_pause_in_one_doorbell"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_initial_image_spans_more_than_one_edit_table_budget"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_initial_image_spans_more_than_one_edit_table_budget"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_initial_mm_admits_one_shared_reservation_root"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_initial_mm_admits_one_shared_reservation_root"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_initial_stack_grows_below_the_built_pages"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_initial_stack_grows_below_the_built_pages"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_irq_entry_retains_each_native_vector_from_live_user_mode"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_irq_entry_retains_each_native_vector_from_live_user_mode"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_raw_exit_clear_tid_busy_once_reruns_in_ring"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_raw_exit_clear_tid_busy_once_reruns_in_ring"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_raw_exit_clear_tid_editor_wait_parks_and_reruns"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_raw_exit_clear_tid_editor_wait_parks_and_reruns"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_root_exec_of_a_missing_path_is_enoent"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_root_exec_of_a_missing_path_is_enoent"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_root_exec_of_a_non_elf_file_is_enoexec"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_root_exec_of_a_non_elf_file_is_enoexec"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_root_exec_replaces_image_and_runs_static_successor"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_root_exec_replaces_image_and_runs_static_successor"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_sched_yield_hands_the_cpu_to_a_queued_sibling"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_sched_yield_hands_the_cpu_to_a_queued_sibling"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_sibling_raw_exits_clear_tid_under_editor_contention"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_sibling_raw_exits_clear_tid_under_editor_contention"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_static_pie_loads_above_low_stack_and_exits_seven"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_static_pie_loads_above_low_stack_and_exits_seven"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::production_user_page_fault_terminates_with_sigsegv_in_ring"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::production_user_page_fault_terminates_with_sigsegv_in_ring"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::root_fcntl_redirect_restore_preserves_one_description_owner"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::root_fcntl_redirect_restore_preserves_one_description_owner"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_direct_output_venues_supply_untouched_pages"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_direct_output_venues_supply_untouched_pages"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_fork_child_ioctl_cloexec_on_a_ring_file_matches_native"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_fork_child_ioctl_cloexec_on_a_ring_file_matches_native"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_fork_child_reads_its_inherited_ring_descriptors"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_fork_child_reads_its_inherited_ring_descriptors"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_fork_cwd_is_inherited_and_isolated"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_fork_cwd_is_inherited_and_isolated"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_initial_write_without_ring_table_keeps_stdout_route"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_initial_write_without_ring_table_keeps_stdout_route"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_loader_open_close_reopen_uses_one_native_descriptor_namespace"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_loader_open_close_reopen_uses_one_native_descriptor_namespace"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_loader_open_survives_colliding_publication"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_loader_open_survives_colliding_publication"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_absolute_clock_nanosleep_is_refused"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_absolute_clock_nanosleep_is_refused"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_clock_nanosleep_clocks_and_flags_match_linux"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_clock_nanosleep_clocks_and_flags_match_linux"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_getrandom_boundary_returns_accessible_prefix"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_getrandom_boundary_returns_accessible_prefix"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_getrandom_cow_preserves_parent"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_getrandom_cow_preserves_parent"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_getrandom_default_returns_eight_bytes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_getrandom_default_returns_eight_bytes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_getrandom_lazy_output_returns_eight_bytes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_getrandom_lazy_output_returns_eight_bytes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_getrandom_nonblock_returns_eight_bytes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_getrandom_nonblock_returns_eight_bytes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_getrandom_readonly_returns_efault"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_getrandom_readonly_returns_efault"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_nanosleep_returns_zero"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_nanosleep_returns_zero"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_readlink_exe_is_a_counted_refusal"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_readlink_exe_is_a_counted_refusal"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_write_from_untouched_page_supplies_zeros"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_write_from_untouched_page_supplies_zeros"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_write_prefix_before_unmapped_page_is_short"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_write_prefix_before_unmapped_page_is_short"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_writev_reaches_redirected_host_file"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_writev_reaches_redirected_host_file"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_zero_nanosleep_returns_zero"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_child_zero_nanosleep_returns_zero"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_root_getrandom_lazy_output_returns_eight_bytes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_root_getrandom_lazy_output_returns_eight_bytes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_root_getrandom_returns_eight_bytes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_native_root_getrandom_returns_eight_bytes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_root_bad_descriptor_on_ring_served_calls_is_ebadf"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_root_bad_descriptor_on_ring_served_calls_is_ebadf"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_root_cwd_and_relative_open_agree"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_root_cwd_and_relative_open_agree"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_root_getdents64_lists_a_ring_directory"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_root_getdents64_lists_a_ring_directory"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_root_ioctl_cloexec_on_a_ring_file_matches_native"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_root_ioctl_cloexec_on_a_ring_file_matches_native"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_root_loader_reads_stats_and_protects_through_the_ring"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_root_loader_reads_stats_and_protects_through_the_ring"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_two_live_processes_keep_distinct_cwds"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::serial_host_two_live_processes_keep_distinct_cwds"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::two_live_children_unstaged_crossings_are_counted_enosys_and_root_is_served"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::two_live_children_unstaged_crossings_are_counted_enosys_and_root_is_served"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::work_port_services_bound_tasks_on_loaded_and_idle_peer_lanes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::work_port_services_bound_tasks_on_loaded_and_idle_peer_lanes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::x86_cpl0_poll_and_ppoll_write_only_writable_revents_page"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::x86_cpl0_poll_and_ppoll_write_only_writable_revents_page"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::x86_cpl0_poll_preserves_fields_changed_during_host_wait"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::x86_cpl0_poll_preserves_fields_changed_during_host_wait"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_epoll_legacy_wait_blocks_until_child_pipe_write"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_epoll_legacy_wait_blocks_until_child_pipe_write"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_epoll_pwait2_bad_timeout_returns_input_owner_fault"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_epoll_pwait2_bad_timeout_returns_input_owner_fault"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_epoll_pwait_blocks_until_child_pipe_write"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_epoll_pwait_blocks_until_child_pipe_write"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_epoll_pwait_copy_out_into_an_untouched_page_stays_in_ring"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_epoll_pwait_copy_out_into_an_untouched_page_stays_in_ring"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_exec_status_pipe_reports_child_exec_failure_then_eof"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_exec_status_pipe_reports_child_exec_failure_then_eof"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_child_poll_wakes_on_parent_write_within_five_seconds"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_child_poll_wakes_on_parent_write_within_five_seconds"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_child_write_parent_read_moves_exact_byte"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_child_write_parent_read_moves_exact_byte"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_poll_blocks_until_last_writer_closes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_poll_blocks_until_last_writer_closes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_poll_blocks_until_peer_write_and_preserves_pollfd"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_poll_blocks_until_peer_write_and_preserves_pollfd"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_poll_finite_timeout_expires"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_poll_finite_timeout_expires"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_poll_finite_timeout_writer_close_wins"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_poll_finite_timeout_writer_close_wins"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_poll_loaded_affinity_parks_before_last_writer_closes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_poll_loaded_affinity_parks_before_last_writer_closes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_poll_zero_timeout_returns_immediately"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_poll_zero_timeout_returns_immediately"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_ppoll_blocks_until_last_writer_closes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_ppoll_blocks_until_last_writer_closes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_ppoll_blocks_until_peer_write_and_preserves_pollfd"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_ppoll_blocks_until_peer_write_and_preserves_pollfd"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_ppoll_finite_timeout_expires"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_ppoll_finite_timeout_expires"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_ppoll_finite_timeout_writer_close_wins"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_ppoll_finite_timeout_writer_close_wins"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_ppoll_loaded_affinity_parks_before_last_writer_closes"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_ppoll_loaded_affinity_parks_before_last_writer_closes"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_ppoll_zero_timeout_returns_immediately"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_ppoll_zero_timeout_returns_immediately"
+pr = 2411
+
+[[retired]]
+test = "cpl0_initial_mm::zone_pipe_readv_scatters_child_bytes_through_shared_owner"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_initial_mm::zone_pipe_readv_scatters_child_bytes_through_shared_owner"
+pr = 2411
+
+[[retired]]
+test = "cpl0_lifecycle::x5_shared_clone_exit"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_lifecycle::x5_shared_clone_exit"
+pr = 2411
+
+[[retired]]
+test = "cpl0_lifecycle::x5_timed_join_wait_is_woken_in_ring_and_releases_its_timer"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_lifecycle::x5_timed_join_wait_is_woken_in_ring_and_releases_its_timer"
+pr = 2411
+
+[[retired]]
+test = "cpl0_progress::entry_kick_and_timer_preempt_two_private_contexts"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_progress::entry_kick_and_timer_preempt_two_private_contexts"
+pr = 2411
+
+[[retired]]
+test = "cpl0_progress::return_kick_and_timer_preempt_two_private_contexts"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_progress::return_kick_and_timer_preempt_two_private_contexts"
+pr = 2411
+
+[[retired]]
+test = "cpl0_shared_entry::production_cpl0_refuses_non_allowlisted_forwards_with_enosys"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_shared_entry::production_cpl0_refuses_non_allowlisted_forwards_with_enosys"
+pr = 2411
+
+[[retired]]
+test = "cpl0_shared_entry::production_file_region_stdio_dup_parity"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_shared_entry::production_file_region_stdio_dup_parity"
+pr = 2411
+
+[[retired]]
+test = "cpl0_shared_entry::production_sigprocmask_uses_shared_lifecycle_family"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpl0_shared_entry::production_sigprocmask_uses_shared_lifecycle_family"
+pr = 2411
+
+[[retired]]
+test = "cpuid_v3_kvm::kvm_cpl0_guest_sees_pinned_x86_64_v3_profile"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpuid_v3_kvm::kvm_cpl0_guest_sees_pinned_x86_64_v3_profile"
+pr = 2411
+
+[[retired]]
+test = "cpuid_v3_kvm::kvm_run_elf_guest_sees_pinned_x86_64_v3_cpuid_and_executes_v3_isa"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::cpuid_v3_kvm::kvm_run_elf_guest_sees_pinned_x86_64_v3_cpuid_and_executes_v3_isa"
+pr = 2411
+
+[[retired]]
+test = "detached_composition_root::detached_example_composition_root_packages_and_boots_under_kvm"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::detached_composition_root::detached_example_composition_root_packages_and_boots_under_kvm"
+pr = 2411
+
+[[retired]]
+test = "live_vcpu_x86::test_m01_syscall_round_trip"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::live_vcpu_x86::test_m01_syscall_round_trip"
+pr = 2411
+
+[[retired]]
+test = "live_vcpu_x86::test_m2_musl_static_hello"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::live_vcpu_x86::test_m2_musl_static_hello"
+pr = 2411
+
+[[retired]]
+test = "sentinel_decode::reused_page_tables_have_valid_l0_root"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::sentinel_decode::reused_page_tables_have_valid_l0_root"
+pr = 2411
+
+[[retired]]
+test = "sentinel_decode::sentinel_slot_materialises_sentinel_gpa_and_stores"
+reason = "#2408: consolidated carrick-vmm-kvm kvm-lane integration tests into the single main test binary."
+replaced_by = "main::sentinel_decode::sentinel_slot_materialises_sentinel_gpa_and_stores"
 pr = 2411
 

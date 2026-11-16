@@ -1,11 +1,9 @@
 //! Live KVM witness: a static x86 ELF enters through the shared CPL0 MM owner.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::expect_used, clippy::panic)]
 
+use crate::kvm_pool_fixture;
 use carrick_mem::x86_initial_image::prepare_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialTaskBinding};
-#[path = "common/kvm_pool_fixture.rs"]
-mod kvm_pool_fixture;
 use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
 use kvm_pool_fixture::{physical_inventory, run_pool_fixture, run_pool_fixture_with};
 use std::path::PathBuf;
@@ -256,12 +254,13 @@ fn serial_host_native_child_readlink_exe_is_a_counted_refusal() {
     const TEST: &str = "serial_host_native_child_readlink_exe_is_a_counted_refusal";
     const CHILD: &str = "CARRICK_READLINK_WITNESS_CHILD";
     if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+        let exact = format!("cpl0_initial_mm::{TEST}");
         let output = std::process::Command::new("timeout")
             .args(["--kill-after=1", "10"])
             .arg(std::env::current_exe().expect("current test executable"))
             .args([
                 "--exact",
-                TEST,
+                &exact,
                 "--include-ignored",
                 "--nocapture",
                 "--test-threads=1",
@@ -327,12 +326,13 @@ fn native_child_sleep_witness_with_exit(test: &str, fixture: &str, flags: &[&str
     // wake must fail, never hang CI.
     const CHILD: &str = "CARRICK_SLEEP_WITNESS_CHILD";
     if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let exact = format!("cpl0_initial_mm::{test}");
         let output = std::process::Command::new("timeout")
             .args(["--kill-after=1", "10"])
             .arg(std::env::current_exe().expect("current test executable"))
             .args([
                 "--exact",
-                test,
+                &exact,
                 "--include-ignored",
                 "--nocapture",
                 "--test-threads=1",
@@ -367,10 +367,11 @@ fn native_child_entropy_witness(test: &str, flags: &[&str]) {
     // timeout owns that process group; KVM workers are threads in that process.
     const CHILD: &str = "CARRICK_ENTROPY_WITNESS_CHILD";
     if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let exact = format!("cpl0_initial_mm::{test}");
         let output = std::process::Command::new("timeout")
             .args(["--kill-after=1", "10"])
             .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
             .env(CHILD, test)
             .output()
             .expect("bounded native entropy witness");
@@ -4014,10 +4015,11 @@ fn bounded_witness(test: &str, witness: impl FnOnce()) {
         witness();
         return;
     }
+    let exact = format!("cpl0_initial_mm::{test}");
     let output = std::process::Command::new("timeout")
         .args(["--kill-after=1", "30"])
         .arg(std::env::current_exe().expect("current test executable"))
-        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
         .env(CHILD, test)
         .output()
         .expect("bounded redirect witness");

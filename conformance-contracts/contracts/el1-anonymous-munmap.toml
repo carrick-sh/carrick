@@ -37,4 +37,4 @@ docker = [
 ]
 
 [bindings.unresolved]
-kvm = "Executing x86 binding: carrick-vmm-kvm::cpl0_entry::production_anonymous_protect_and_partial_unmap_stay_in_ring. Requires real KVM; the contract evaluator has no registered KVM observation layer."
+kvm = "Executing x86 binding: carrick-vmm-kvm::main::cpl0_entry::production_anonymous_protect_and_partial_unmap_stay_in_ring. Requires real KVM; the contract evaluator has no registered KVM observation layer."

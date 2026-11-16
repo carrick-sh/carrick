@@ -92,7 +92,7 @@ vm_free = [
 
 [bindings.unresolved]
 native_exit_scope = "The native EL1 exit binding proves only lifecycle completion: a committed exit_group returns Transferred with exactly one handoff receipt and no run failure while its selected parent generation retires on a peer CPU, and the adopter's parked wait4 continuation resumes exactly once with that parent's pid. It does not cover set_robust_list, unknown ordinals or the x86 entry token."
-embed_structural = "The x86 production binding is carrick-vmm-kvm::cpl0_entry::x4_linux_common_entry; the unchanged-ARM signed embed binding is director-owned."
+embed_structural = "The x86 production binding is carrick-vmm-kvm::main::cpl0_entry::x4_linux_common_entry; the unchanged-ARM signed embed binding is director-owned."
 docker = "Native Linux oracle qualification remains director-owned; this extraction preserves the existing set_robust_list result mapping."
 
 [[structural_budgets]]

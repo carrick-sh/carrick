@@ -1,12 +1,9 @@
 //! Verifies that an arbitrary external / detached composition root crate
 //! (representing an out-of-tree / non-Linux test personality) can be packaged
 //! via `carrick_xtask::guest_image::package_guest_image` and boots under KVM.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-#[path = "common/physical_inventory.rs"]
-mod physical_inventory;
-use physical_inventory::physical_inventory;
+use crate::physical_inventory;
 
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_xtask::guest_image::{GuestImageBuildConfig, GuestTargetArch, package_guest_image};

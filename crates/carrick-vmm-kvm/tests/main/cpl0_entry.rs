@@ -5,15 +5,13 @@
 //! Budgets: one entry/completion per call, one publication per success,
 //! zero semantic host forwards. Control observation/kicks are separate.
 //! Missing KVM or an image is a failure; no Docker, retries or timing claims.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::needless_range_loop)]
 
+use crate::kvm_pool_fixture;
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_mmu_core::x86::descriptor_txn::Access;
 use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables};
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
-#[path = "common/kvm_pool_fixture.rs"]
-mod kvm_pool_fixture;
 use carrick_x86::cpl0_entry::{
     OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
     OBSERVE_FORK_TABLE_WINDOW, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE,
@@ -1254,12 +1252,13 @@ fn instrumented_sleep_witness(test: &str, flags: &[&str]) {
     // Bounded in a child test process: a lost wake must fail, never hang CI.
     const CHILD: &str = "CARRICK_SLEEP_WITNESS_CHILD";
     if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let exact = format!("cpl0_entry::{test}");
         let output = std::process::Command::new("timeout")
             .args(["--kill-after=1", "20"])
             .arg(std::env::current_exe().expect("current test executable"))
             .args([
                 "--exact",
-                test,
+                &exact,
                 "--include-ignored",
                 "--nocapture",
                 "--test-threads=1",
@@ -3765,10 +3764,11 @@ fn production_two_threads_blocking_wait4_reap_distinct_children() {
     const CHILD_ENV: &str = "CARRICK_WAIT4_TWO_THREADS_CHILD";
     const TEST_NAME: &str = "production_two_threads_blocking_wait4_reap_distinct_children";
     if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new(TEST_NAME)) {
+        let exact = format!("cpl0_entry::{TEST_NAME}");
         let output = std::process::Command::new("timeout")
             .args(["--kill-after=1", "20"])
             .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
             .env(CHILD_ENV, TEST_NAME)
             .output()
             .expect("bounded x86 wait4 witness");
@@ -4023,10 +4023,11 @@ fn production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation() {
     const TEST_NAME: &str =
         "production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation";
     if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new(TEST_NAME)) {
+        let exact = format!("cpl0_entry::{TEST_NAME}");
         let output = std::process::Command::new("timeout")
             .args(["--kill-after=1", "30"])
             .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
             .env(CHILD_ENV, TEST_NAME)
             .output()
             .expect("bounded x86 birth contention witness");
@@ -4106,10 +4107,11 @@ fn instrumented_wait4_output_witness(test: &str, flags: &[&str]) {
 fn bounded_contention_witness(test: &str, fixture: &str, flags: &[&str], what: &str) {
     const CHILD: &str = "CARRICK_CONTENTION_WITNESS_CHILD";
     if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let exact = format!("cpl0_entry::{test}");
         let output = std::process::Command::new("timeout")
             .args(["--kill-after=1", "20"])
             .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
             .env(CHILD, test)
             .output()
             .expect("bounded contention witness");

@@ -1,10 +1,7 @@
 //! Static ELF fork/wait/COW witness through the shared CPL0 kernel.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::expect_used)]
 
-#[path = "common/physical_inventory.rs"]
-mod physical_inventory;
-use physical_inventory::physical_inventory;
+use crate::physical_inventory;
 
 use carrick_mem::x86_initial_image::prepare_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;

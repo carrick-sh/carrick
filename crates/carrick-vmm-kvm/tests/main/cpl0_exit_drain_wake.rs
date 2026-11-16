@@ -6,12 +6,9 @@
 //! release must wake the parent parked on the pipe lane in the carrier's
 //! zone (EOF for a reader, EPIPE plus SIGPIPE for a writer), including when
 //! the parent sits idle on the other CPU of the carrier.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::expect_used, clippy::panic)]
 
-#[path = "common/kvm_pool_fixture.rs"]
-#[allow(dead_code)] // each test file uses a subset of the shared fixture
-mod kvm_pool_fixture;
+use crate::kvm_pool_fixture;
 
 /// Only CPU 0 (the loaded lane) schedules the root and its children.
 const ROOT_AFFINITY_LOADED: u64 = 1;
@@ -70,7 +67,7 @@ fn failed_resched_msi_is_a_carrier_error_not_a_hang() {
         .arg(std::env::current_exe().expect("test executable"))
         .args([
             "--exact",
-            "failed_resched_msi_is_a_carrier_error_not_a_hang",
+            "cpl0_exit_drain_wake::failed_resched_msi_is_a_carrier_error_not_a_hang",
             "--nocapture",
             "--test-threads=1",
         ])

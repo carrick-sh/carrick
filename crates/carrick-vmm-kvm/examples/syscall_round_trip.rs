@@ -50,7 +50,7 @@ mod benchmark {
     }
 
     fn fixture() -> Result<Fixture, Box<dyn Error>> {
-        // Same one-segment ET_EXEC shape as tests/live_vcpu_x86.rs. Fields
+        // Same one-segment ET_EXEC shape as tests/main/live_vcpu_x86.rs. Fields
         // follow the System V ELF64 ABI; the existing loader owns interpretation.
         let code = guest_blob();
         let mut elf = vec![0_u8; 120];

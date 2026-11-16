@@ -57,10 +57,10 @@ vm_free = [
   "carrick-el1-linux::x86_production_forward::x86_clone_child_serves_stdout_stat_write_and_own_redirect (production CPL0 frame, ring epoll and eventfd creation, ADD, packed event copyout, read/write and pwait/pwait2 readiness)",
 ]
 embed = [
-  "carrick-vmm-kvm::cpl0_initial_mm::zone_epoll_legacy_wait_blocks_until_child_pipe_write (production CPL0 legacy 232, unused registers discarded, two live processes, exact readiness cookie, no forwarding or refusal)",
+  "carrick-vmm-kvm::main::cpl0_initial_mm::zone_epoll_legacy_wait_blocks_until_child_pipe_write (production CPL0 legacy 232, unused registers discarded, two live processes, exact readiness cookie, no forwarding or refusal)",
   "carrick-embed::el1_sched::el1_epoll_eventfd_pingpong_stays_in_guest",
-  "carrick-vmm-kvm::cpl0_initial_mm::zone_epoll_pwait_blocks_until_child_pipe_write (production CPL0 guest execution; epoll_create1, pipe ADD, parent pwait(-1), child write, packed readiness cookie, no epoll forwarding or ring refusals)",
-  "carrick-vmm-kvm::cpl0_initial_mm::zone_epoll_pwait2_bad_timeout_returns_input_owner_fault (production CPL0 guest execution with a real unmapped timeout; EFAULT reaches rax, no forwarding or ring refusal)",
+  "carrick-vmm-kvm::main::cpl0_initial_mm::zone_epoll_pwait_blocks_until_child_pipe_write (production CPL0 guest execution; epoll_create1, pipe ADD, parent pwait(-1), child write, packed readiness cookie, no epoll forwarding or ring refusals)",
+  "carrick-vmm-kvm::main::cpl0_initial_mm::zone_epoll_pwait2_bad_timeout_returns_input_owner_fault (production CPL0 guest execution with a real unmapped timeout; EFAULT reaches rax, no forwarding or ring refusal)",
 ]
 docker = [
   "probe:epollzonepingpong|epollzonetrigger|epollzonetimeout|epollzoneeintr|epollzoneclose|epollzonemixed|epollzonesigmask",

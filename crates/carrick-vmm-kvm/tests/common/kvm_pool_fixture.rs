@@ -2,7 +2,7 @@ use carrick_mem::x86_initial_image::prepare_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialTaskBinding};
 
 #[path = "physical_inventory.rs"]
-mod physical_inventory;
+pub(crate) mod physical_inventory;
 pub(crate) use physical_inventory::physical_inventory;
 
 pub fn run_pool_fixture(

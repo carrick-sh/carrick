@@ -67,17 +67,17 @@ vm_free = [
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest",
-  "carrick-vmm-kvm::cpl0_initial_mm::production_full_owed_return_table_parks_on_its_busy_holder_until_release (#1482: 64 slots, eight busy holders, one doorbell and one park until release; zero reruns while held)",
-  "carrick-vmm-kvm::cpl0_initial_mm::production_full_owed_return_table_reclaims_exited_fork_holders (#1482 P0-1: 64 owed-return slots held by eight killed and reaped fork children, no later fork; the parent's retirement must reclaim quarantine and finish within the existing exit budget; native Linux exits zero)",
-  "carrick-vmm-kvm::cpl0_entry::production_anonymous_release_to_idle_peer_preserves_wake (real KVM pool, ordered remote synthetic holder release; one park, zero handbacks/forwards, exact exit 7)",
-  "carrick-vmm-kvm::cpl0_initial_mm::production_brk_regrows_over_its_released_pages (#2217/#1482, real KVM pool, red on main with exit 3: a brk shrink then regrowth over the released pages is served with exactly one settlement doorbell and zero-filled pages)",
-  "carrick-vmm-kvm::cpl0_initial_mm::production_exclusion_settles_owed_returns_before_the_doorbell_is_needed (#1482 item 1, real KVM pool: a first-touch backing grant's exclusion settles the shrink's owed return, so the regrowth needs no doorbell)",
-  "carrick-vmm-kvm::cpl0_initial_mm::production_exclusion_settles_an_outstanding_cow_before_its_retired_leaf (#1482 P0-3, real KVM pool: a sibling retires a COW replacement while its completion is held; the next exclusion settles COW before clearing the retired leaf and acknowledges the one owed range exactly once)",
-  "carrick-vmm-kvm::cpl0_initial_mm::production_gib_owed_extent_settles_one_chunk_per_pause_in_one_doorbell (#1482 P0-2: production x86 carrier, a merged GiB owed range, exactly one doorbell, maximum 512 pages per editor exclusion)",
+  "carrick-vmm-kvm::main::cpl0_initial_mm::production_full_owed_return_table_parks_on_its_busy_holder_until_release (#1482: 64 slots, eight busy holders, one doorbell and one park until release; zero reruns while held)",
+  "carrick-vmm-kvm::main::cpl0_initial_mm::production_full_owed_return_table_reclaims_exited_fork_holders (#1482 P0-1: 64 owed-return slots held by eight killed and reaped fork children, no later fork; the parent's retirement must reclaim quarantine and finish within the existing exit budget; native Linux exits zero)",
+  "carrick-vmm-kvm::main::cpl0_entry::production_anonymous_release_to_idle_peer_preserves_wake (real KVM pool, ordered remote synthetic holder release; one park, zero handbacks/forwards, exact exit 7)",
+  "carrick-vmm-kvm::main::cpl0_initial_mm::production_brk_regrows_over_its_released_pages (#2217/#1482, real KVM pool, red on main with exit 3: a brk shrink then regrowth over the released pages is served with exactly one settlement doorbell and zero-filled pages)",
+  "carrick-vmm-kvm::main::cpl0_initial_mm::production_exclusion_settles_owed_returns_before_the_doorbell_is_needed (#1482 item 1, real KVM pool: a first-touch backing grant's exclusion settles the shrink's owed return, so the regrowth needs no doorbell)",
+  "carrick-vmm-kvm::main::cpl0_initial_mm::production_exclusion_settles_an_outstanding_cow_before_its_retired_leaf (#1482 P0-3, real KVM pool: a sibling retires a COW replacement while its completion is held; the next exclusion settles COW before clearing the retired leaf and acknowledges the one owed range exactly once)",
+  "carrick-vmm-kvm::main::cpl0_initial_mm::production_gib_owed_extent_settles_one_chunk_per_pause_in_one_doorbell (#1482 P0-2: production x86 carrier, a merged GiB owed range, exactly one doorbell, maximum 512 pages per editor exclusion)",
 ]
 
 [bindings.unresolved]
-kvm = "Executing x86 binding: carrick-vmm-kvm::cpl0_entry::production_anonymous_protect_and_partial_unmap_stay_in_ring. Requires real KVM; the contract evaluator has no registered KVM observation layer."
+kvm = "Executing x86 binding: carrick-vmm-kvm::main::cpl0_entry::production_anonymous_protect_and_partial_unmap_stay_in_ring. Requires real KVM; the contract evaluator has no registered KVM observation layer."
 docker = "Native arm64 Docker differential verification for multi-scale anonymous reservations; automated same-source binding remains open."
 embed_structural = "Not yet a registered WorkObservation binding: the signed test (`el1_anonymous_reservations_stay_in_guest`) asserts, outside the contract evaluator, served mmap >= count, served brk >= 2, forwarded mmap/brk equal across scales and an exit slope below 0.125 exits per added reservation (a fractional per-unit slope is not expressible in the integer affine budget schema). Intent: assert guest-served mmap and brk counters cover every reservation, forwarded mmap/brk counts identical across 64, 256 and 1024 operations, and incremental host-exit slope < 0.125 exits per reservation."
 production = "Migrate production brk and mmap dispatch handlers from unconditional Forward to authoritative EL1 service backed by the shared reservation authority."

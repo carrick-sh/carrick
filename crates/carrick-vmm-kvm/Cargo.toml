@@ -103,4 +103,3 @@ zerocopy.workspace = true
 [package.metadata.carrick.test-lanes]
 "*" = "kvm"
 cpl0_image_inputs = "host"
-cpl0_shared_entry = "kvm"

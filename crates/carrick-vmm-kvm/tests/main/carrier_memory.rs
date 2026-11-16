@@ -2,7 +2,6 @@
 //! drain. Intel SDM page-fault P/W/U/I bits plus Linux mmap/mprotect/fork
 //! semantics. These are hardware fixtures, not N1 or OCI acceptance.
 //! No Docker, absent-KVM skips, retries, or timing claims.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::panic)]
 use carrick_mmu_core::x86::descriptor_txn::{DescriptorOp, PAGE, PageSpan, Permissions};
 use carrick_vmm_kvm::carrier_memory::fixture::{DATA_VA, MemoryWitness, Observation};

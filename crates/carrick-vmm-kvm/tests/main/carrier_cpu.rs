@@ -1,6 +1,5 @@
 //! Required KVM readback gate, separate from VM-free library tests.
 //! Missing /dev/kvm is a failure. No guest instruction or KVM_RUN is issued.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used)]
 use carrick_hal::guest_arch_binding::{GuestArchBinding, core_arch::*};
 use carrick_hal::threaded::{X86_TASK_RESUME_MAGIC, X86_TASK_RESUME_PAYLOAD_LEN};

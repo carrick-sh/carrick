@@ -8,10 +8,9 @@
 //!
 //! Run on an x86_64 Linux host with /dev/kvm (e.g. Ubuntu 24.04):
 //! ```
-//! cargo test -p carrick-vmm-kvm --test live_vcpu_x86 -- --nocapture
+//! cargo test -p carrick-vmm-kvm --test main live_vcpu_x86:: -- --nocapture
 //! ```
 
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 // Integration tests legitimately use expect() to fail fast on unexpected
 // test-infrastructure errors (e.g. missing binary path components).
 #![allow(clippy::expect_used)]
@@ -291,7 +290,8 @@ fn test_m2_musl_static_hello() {
     );
 
     // oracle.expected is a plain text file (no trailing newline added by git).
-    let expected = include_bytes!("../../carrick-vmm-bhyve/fixtures/hello-x86_64/oracle.expected");
+    let expected =
+        include_bytes!("../../../carrick-vmm-bhyve/fixtures/hello-x86_64/oracle.expected");
     assert_eq!(
         out.stdout,
         expected,

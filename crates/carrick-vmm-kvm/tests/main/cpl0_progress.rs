@@ -2,11 +2,8 @@
 //! kernel.vcpu.kick-el0-boundary. One vCPU, two shared scheduler records,
 //! private CR3s at the same VA, syscall-free compute, real LAPIC preemption.
 //! No KVM/image skips, Docker, retries, host task waits or timing claims.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-#[path = "common/physical_inventory.rs"]
-mod physical_inventory;
-use physical_inventory::physical_inventory;
+use crate::physical_inventory;
 
 use carrick_vmm_kvm::carrier_interrupts::{KickBoundary, SECOND_ROOT, witness};
 use carrick_x86::cpl0_scheduler::*;
