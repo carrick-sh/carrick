@@ -5143,6 +5143,52 @@ impl InetPeers {
     }
 }
 
+/// #231, director ruling D2: a forked native child's socket calls are its
+/// own, never the run root's. Its blocking TCP socket's SO_PEERCRED is
+/// Linux's `{0, -1, -1}`, a recv into a 64 KiB buffer returns data, a
+/// 100000-byte send returns the first slice's short count, a send after
+/// `shutdown(SHUT_WR)` raises the child's own SIGPIPE with EPIPE (none with
+/// `MSG_NOSIGNAL`, and `write` raises it too), and once it drops to uid
+/// 1000 `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` is EPERM while a TCP
+/// socket still opens. Red before the caller identity: the raw socket ran
+/// under the run root's capabilities and reached the host (EACCES here,
+/// exit 59), and a 64 KiB recv did not fit one record (EINVAL, exit 48).
+#[test]
+fn native_child_inet_calls_run_under_the_childs_own_identity() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("identity peer");
+    let port = listener.local_addr().unwrap().port();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("guest connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        stream.write_all(&[0x5a; 70_000]).expect("peer data");
+        let mut received = Vec::new();
+        let _ = stream.read_to_end(&mut received);
+        received.len()
+    });
+    let defines = [
+        "-DTCP_PORT=0".to_owned(),
+        "-DUDP_PORT=0".to_owned(),
+        "-DTCP_NB_PORT=0".to_owned(),
+        format!("-DID_PORT={}", port.swap_bytes()),
+    ];
+    let defines: Vec<&str> = defines.iter().map(String::as_str).collect();
+    let elf = native_exit_fixture_with_flags("native_child_inet.S", &defines);
+    let outcome = run_exec_fixture(&elf, 256);
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "child identity stage (100 + stage = ENOSYS; see native_child_inet.S): {:?}",
+        outcome.run
+    );
+    let received = peer.join().expect("identity peer");
+    assert!(
+        (1..=61_440).contains(&received),
+        "the 100000-byte send delivered its short count: {received}"
+    );
+}
+
 /// #231: a forked native child's blocking AF_INET/AF_INET6 TCP and UDP
 /// sockets cross to the host network: socket, setsockopt, connect,
 /// getsockopt(SO_ERROR), getpeername, send, recv (MSG_WAITALL), shutdown,

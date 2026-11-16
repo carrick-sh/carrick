@@ -1774,6 +1774,36 @@ mod tests {
         }
     }
 
+    /// #231, director ruling D2: a native socket call runs under its own
+    /// caller's identity, which its ring stamps in the record. A record
+    /// without one is refused (the ring's counted ENOSYS), never run under
+    /// the run root's identity. Red before the caller stamp: the carrier ran
+    /// it as the run root and created the socket.
+    #[test]
+    fn an_unstamped_native_socket_call_is_refused_never_run_as_the_root() {
+        let fixture = fixture();
+        let socket = host_file::NetCall::encode(
+            carrick_abi::syscall::nr::SOCKET.raw(),
+            [2, 2, 0, 0, 0, 0],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut unstamped = record(
+            fixture.table,
+            HostFileOp::NetSyscall,
+            -1,
+            [0; 4],
+            &socket,
+            0,
+        );
+        assert_eq!(
+            fixture.serve(None, &mut unstamped),
+            Err(NativeHostFileRefusal),
+            "an unstamped socket call never runs as the run root"
+        );
+    }
+
     #[test]
     fn native_stdout_write_reaches_the_runs_stdio_route() {
         let fixture = fixture();
