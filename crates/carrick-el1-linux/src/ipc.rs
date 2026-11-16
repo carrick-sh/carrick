@@ -252,7 +252,7 @@ pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
     use carrick_el1_abi::ipc::fd::DeferredRelease;
     match release {
         DeferredRelease::None => Ok(()),
-        DeferredRelease::Deferred => {
+        DeferredRelease::Deferred(_) => {
             task.linux.mark_pending_host_work();
             Ok(())
         }

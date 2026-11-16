@@ -17982,6 +17982,19 @@ fn with_arm_process_host_files<R>(
     // `None`: the slot's running record is not yet a registered binding.
     let mut active = Some(ArmCaller::Root);
     let mut cpu = crate::sched::FakeCpu::default();
+    // Children resolved so far: a later pid may be one's own fork child.
+    let mut known_children: Vec<TaskKey> = Vec::new();
+    let mut resolve_child =
+        |runtime: &std::sync::Arc<NativeProcessRuntime<'_, _, _>>, pid: u32| -> TaskKey {
+            let key = core::iter::once(root_key)
+                .chain(known_children.iter().copied())
+                .find_map(|parent| runtime.namespace_child_key(parent, pid))
+                .unwrap_or_else(|| panic!("no live child {pid}"));
+            if !known_children.contains(&key) {
+                known_children.push(key);
+            }
+            key
+        };
 
     let mut call = |caller: ArmCaller, nr: u64, args: [u64; 6]| -> (CompletionRoute, i64) {
         if nr == ARM_RESUME && active == Some(caller) {
@@ -17993,9 +18006,7 @@ fn with_arm_process_host_files<R>(
                 .expect("a child exists only after the root's clone");
             let key = match caller {
                 ArmCaller::Root => root_key,
-                ArmCaller::Child(pid) => runtime
-                    .namespace_child_key(root_key, pid)
-                    .unwrap_or_else(|| panic!("no live child {pid}")),
+                ArmCaller::Child(pid) => resolve_child(runtime, pid),
             };
             let binding = runtime.task_binding(key).unwrap();
             // Only the selected caller is queued: a parked caller left on the
@@ -18104,9 +18115,7 @@ fn with_arm_process_host_files<R>(
             return (route, ret);
         };
         let runtime = runtime.as_ref().unwrap();
-        let binding = runtime
-            .task_binding(runtime.namespace_child_key(root_key, pid).unwrap())
-            .unwrap();
+        let binding = runtime.task_binding(resolve_child(runtime, pid)).unwrap();
         let saved = unsafe { runtime.record_binding(binding.record) }
             .unwrap()
             .words;
@@ -18406,6 +18415,203 @@ fn arm_fork_child_ioctl_cloexec_on_a_ring_file() {
     assert!(
         mismatches.is_empty(),
         "a ring file's close-on-exec ioctl left Linux's contract:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// #231 parity (apt and dpkg): two fork children contend for one file's
+/// POSIX record lock and flock(2) lock in the ring's one lock table. apt
+/// opens `/var/lib/apt/lists/lock` with `O_CREAT|O_RDWR|O_NOFOLLOW` and
+/// takes a whole-file write lock with `fcntl(F_SETLK)`; dpkg takes flock.
+/// On main every fcntl lock command and flock on a ring descriptor was a
+/// counted ENOSYS. Linux (fcntl(2), flock(2)): another process's lock
+/// refuses F_SETLK with EAGAIN and F_GETLK reports it with its holder's
+/// PID; a close of ANY descriptor naming the file releases the closer's
+/// record locks; F_SETLKW and a blocking flock wait, releasing the CPU,
+/// until the holder lets go; a flock belongs to its open file description;
+/// exit releases every lock the process held.
+#[test]
+fn arm_fork_children_contend_record_locks_and_flock_in_the_ring() {
+    use carrick_abi::{
+        LINUX_AT_FDCWD, LINUX_F_GETLK, LINUX_F_RDLCK, LINUX_F_SETLK, LINUX_F_SETLKW,
+        LINUX_F_UNLCK, LINUX_F_WRLCK, LINUX_LOCK_EX, LINUX_LOCK_NB, LINUX_LOCK_SH, LINUX_LOCK_UN,
+        LINUX_O_CREAT, LINUX_O_NOFOLLOW, LINUX_O_RDWR, LinuxFlock64,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
+
+    let eagain = carrick_syscall_abi::LINUX_EAGAIN.guest_retval();
+    let (mismatches, _) = with_arm_process_host_dispatch(|call| {
+        let mismatches = core::cell::RefCell::new(Vec::new());
+        let tmp = GuestUserBuffer::from_bytes(b"/tmp\0");
+        let (_, made) = call(
+            ArmCaller::Root,
+            sys::MKDIRAT.raw(),
+            [LINUX_AT_FDCWD, tmp.arg(), 0o777, 0, 0, 0],
+        );
+        assert!(made == 0 || made == -17, "mkdir /tmp: {made}");
+        let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-231-apt-lists-lock\0");
+        let (route, pid_a) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid_a > 0, "first clone: {pid_a} ({route:?})");
+        let a = ArmCaller::Child(pid_a as u32);
+        // The harness admits one root fork; the second process is A's child.
+        let (route, pid_b) = call(a, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid_b > 0, "A's clone: {pid_b} ({route:?})");
+        let b = ArmCaller::Child(pid_b as u32);
+        let expect = |what: &str, got: (CompletionRoute, i64), want: i64| {
+            if got.1 != want {
+                mismatches.borrow_mut().push(format!("{what}: got {} ({:?}), want {want}", got.1, got.0));
+            }
+        };
+        let open = |call: &mut dyn FnMut(ArmCaller, u64, [u64; 6]) -> (CompletionRoute, i64),
+                    who: ArmCaller| {
+            let (route, fd) = call(
+                who,
+                sys::OPENAT.raw(),
+                [
+                    LINUX_AT_FDCWD,
+                    path.arg(),
+                    LINUX_O_RDWR | LINUX_O_CREAT | LINUX_O_NOFOLLOW,
+                    0o640,
+                    0,
+                    0,
+                ],
+            );
+            assert!(fd >= 0, "{who:?} open of the lock file: {fd} ({route:?})");
+            fd as u64
+        };
+        let flock = |l_type: i32| {
+            GuestUserBuffer::from_value(LinuxFlock64 {
+                l_type: l_type as i16,
+                ..Default::default()
+            })
+        };
+        let fcntl = sys::FCNTL.raw();
+        let fd_a = open(call, a);
+        let fd_b = open(call, b);
+        let write = flock(LINUX_F_WRLCK);
+        expect(
+            "A F_SETLK write lock",
+            call(a, fcntl, [fd_a, LINUX_F_SETLK, write.arg(), 0, 0, 0]),
+            0,
+        );
+        expect(
+            "B F_SETLK against A",
+            call(b, fcntl, [fd_b, LINUX_F_SETLK, write.arg(), 0, 0, 0]),
+            eagain,
+        );
+        let query = flock(LINUX_F_WRLCK);
+        expect(
+            "B F_GETLK",
+            call(b, fcntl, [fd_b, LINUX_F_GETLK, query.arg(), 0, 0, 0]),
+            0,
+        );
+        let reported = query.values::<LinuxFlock64>()[0];
+        let (l_type, l_pid, l_len) = (reported.l_type, reported.l_pid, reported.l_len);
+        if (i32::from(l_type), i64::from(l_pid), l_len) != (LINUX_F_WRLCK, pid_a, 0) {
+            mismatches.borrow_mut().push(format!(
+                "B F_GETLK reported type {l_type} pid {l_pid} len {l_len}, want A's whole-file write lock ({pid_a})"
+            ));
+        }
+        // A close of another descriptor of the file releases A's lock.
+        let other_a = open(call, a);
+        expect(
+            "A close of another fd of the file",
+            call(a, sys::CLOSE.raw(), [other_a, 0, 0, 0, 0, 0]),
+            0,
+        );
+        let query = flock(LINUX_F_WRLCK);
+        call(b, fcntl, [fd_b, LINUX_F_GETLK, query.arg(), 0, 0, 0]);
+        let after_close = query.values::<LinuxFlock64>()[0].l_type;
+        if i32::from(after_close) != LINUX_F_UNLCK {
+            mismatches.borrow_mut().push(format!(
+                "F_GETLK after A's close reported type {after_close}, want F_UNLCK"
+            ));
+        }
+        expect(
+            "B F_SETLK after A's close",
+            call(b, fcntl, [fd_b, LINUX_F_SETLK, write.arg(), 0, 0, 0]),
+            0,
+        );
+        // F_SETLKW parks A until B unlocks, then the rerun takes the lock.
+        let parked = call(a, fcntl, [fd_a, LINUX_F_SETLKW, write.arg(), 0, 0, 0]);
+        if parked.0 != CompletionRoute::Suspended {
+            mismatches.borrow_mut().push(format!("A F_SETLKW against B did not park: {parked:?}"));
+        } else {
+            let still = call(a, ARM_RESUME, [0; 6]);
+            if still != (CompletionRoute::Suspended, 0) {
+                mismatches.borrow_mut().push(format!("A F_SETLKW woke with B's lock held: {still:?}"));
+            }
+            let unlock = flock(LINUX_F_UNLCK);
+            expect(
+                "B F_SETLK unlock",
+                call(b, fcntl, [fd_b, LINUX_F_SETLK, unlock.arg(), 0, 0, 0]),
+                0,
+            );
+            let woken = call(a, ARM_RESUME, [0; 6]);
+            if woken.0 != CompletionRoute::Served {
+                mismatches.borrow_mut().push(format!("B's unlock did not wake A: {woken:?}"));
+            }
+            expect(
+                "A F_SETLKW rerun",
+                call(a, fcntl, [fd_a, LINUX_F_SETLKW, write.arg(), 0, 0, 0]),
+                0,
+            );
+        }
+        let read = flock(LINUX_F_RDLCK);
+        expect(
+            "B F_SETLK read lock against A's write lock",
+            call(b, fcntl, [fd_b, LINUX_F_SETLK, read.arg(), 0, 0, 0]),
+            eagain,
+        );
+        // flock(2) belongs to the open file description, apart from fcntl.
+        let flock_nr = sys::FLOCK.raw();
+        expect(
+            "A flock LOCK_EX|LOCK_NB",
+            call(a, flock_nr, [fd_a, LINUX_LOCK_EX | LINUX_LOCK_NB, 0, 0, 0, 0]),
+            0,
+        );
+        expect(
+            "B flock LOCK_SH|LOCK_NB against A",
+            call(b, flock_nr, [fd_b, LINUX_LOCK_SH | LINUX_LOCK_NB, 0, 0, 0, 0]),
+            eagain,
+        );
+        let parked = call(b, flock_nr, [fd_b, LINUX_LOCK_SH, 0, 0, 0, 0]);
+        if parked.0 != CompletionRoute::Suspended {
+            mismatches.borrow_mut().push(format!("B blocking flock did not park: {parked:?}"));
+        } else {
+            expect(
+                "A flock LOCK_UN",
+                call(a, flock_nr, [fd_a, LINUX_LOCK_UN, 0, 0, 0, 0]),
+                0,
+            );
+            let woken = call(b, ARM_RESUME, [0; 6]);
+            if woken.0 != CompletionRoute::Served {
+                mismatches.borrow_mut().push(format!("A's LOCK_UN did not wake B: {woken:?}"));
+            }
+            expect(
+                "B blocking flock rerun",
+                call(b, flock_nr, [fd_b, LINUX_LOCK_SH, 0, 0, 0, 0]),
+                0,
+            );
+        }
+        // A's exit releases its record lock.
+        call(
+            a,
+            carrick_syscall_abi::nr::EXIT_GROUP.raw(),
+            [0, 0, 0, 0, 0, 0],
+        );
+        expect(
+            "B F_SETLK after A's exit",
+            call(b, fcntl, [fd_b, LINUX_F_SETLK, write.arg(), 0, 0, 0]),
+            0,
+        );
+        mismatches.into_inner()
+    });
+    assert!(
+        mismatches.is_empty(),
+        "ring record locks and flock left Linux's contract:\n{}",
         mismatches.join("\n")
     );
 }

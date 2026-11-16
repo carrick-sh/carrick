@@ -18,6 +18,7 @@ use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub mod exec;
 pub mod handle;
+pub mod record_lock;
 pub mod reservation;
 pub mod storage;
 
@@ -184,7 +185,9 @@ impl CloseEffects {
 pub enum DeferredRelease {
     None,
     Now(Description),
-    Deferred,
+    /// The final hold of this exact description; its physical release
+    /// waits on the retirement queue. Its OFD and flock(2) locks end here.
+    Deferred(OfdKey),
 }
 
 /// Exact identity of one open file description incarnation. Copyable:
@@ -388,6 +391,12 @@ pub trait SlotBacking {
     /// it must not reenter this authority.
     fn cover_descriptor(&self, fd: usize) -> bool;
     fn object(&self, _index: usize) -> Option<&handle::ObjectRecord> {
+        None
+    }
+    /// The [`record_lock::OfdIdentityRecord`] parallel to OFD record
+    /// `index`. A venue without file identities omits it: its descriptions
+    /// are never stamped, so no lock names their file.
+    fn ofd_identity(&self, _index: usize) -> Option<&record_lock::OfdIdentityRecord> {
         None
     }
 }
@@ -1153,6 +1162,14 @@ pub struct Authority<'a, B: SlotBacking, W: LockWait, const T: usize> {
     pub(crate) wait: W,
 }
 
+impl<B: SlotBacking, W: LockWait, const T: usize> record_lock::LockOwners
+    for Authority<'_, B, W, T>
+{
+    fn live(&self, owner: record_lock::LockOwner) -> bool {
+        self.lock_owner_live(owner)
+    }
+}
+
 /// An authenticated slot-table mutation scope. Drop releases its one table
 /// lock; no host types or storage references escape. Keep the scope strictly
 /// around descriptor mutation, never user copy, I/O, service or suspension.
@@ -1443,6 +1460,9 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             Ordering::Relaxed,
         );
         ofd.close_effects.store(0, Ordering::Relaxed);
+        if let Some(identity) = self.backing.ofd_identity(index as usize) {
+            identity.clear();
+        }
         ofd.holds.store(REF, Ordering::Release);
         Ok(index)
     }
@@ -1581,13 +1601,17 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         if current != amount {
             return Ok(DeferredRelease::None);
         }
+        let released_generation = ofd.generation.load(Ordering::Acquire);
         let released = self.snapshot(index)?;
         if release_here(released) {
             self.free_ofd(index)?;
             Ok(DeferredRelease::Now(released))
         } else {
             push(&self.core.retired_ofds, index as usize, &ofd.next_free);
-            Ok(DeferredRelease::Deferred)
+            Ok(DeferredRelease::Deferred(OfdKey {
+                index,
+                generation: released_generation,
+            }))
         }
     }
 
@@ -1678,6 +1702,20 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         description: Description,
         cloexec: bool,
     ) -> Result<Fd, Error> {
+        self.open_identified(table, min, description, None, cloexec)
+    }
+
+    /// [`Self::open`] of a file whose [`record_lock::FileIdentity`] the
+    /// venue knows: the description is stamped before any descriptor names
+    /// it, so every lock taken through it finds its file.
+    pub fn open_identified(
+        &self,
+        table: TableId,
+        min: Fd,
+        description: Description,
+        identity: Option<record_lock::FileIdentity>,
+        cloexec: bool,
+    ) -> Result<Fd, Error> {
         if min.0 < 0 {
             return Err(Error::InvalidArgument);
         }
@@ -1685,8 +1723,52 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         let fd = t.allocate(min.0 as usize)?;
         let covered = self.cover(fd)?;
         let ofd = self.alloc_ofd(description)?;
+        if let (Some(identity), Some(record)) =
+            (identity, self.backing.ofd_identity(ofd as usize))
+        {
+            record.stamp(identity);
+        }
         t.storage.install(covered, Entry { ofd, cloexec });
         Ok(Fd(fd as i32))
+    }
+
+    /// The file `fd` names, when its description was opened with an
+    /// identity. Lock-free like [`Self::get`].
+    pub fn file_identity(
+        &self,
+        table: TableId,
+        fd: Fd,
+    ) -> Result<Option<record_lock::FileIdentity>, Error> {
+        let mut attempt: u32 = 0;
+        loop {
+            let (record, seq, storage) = self.read_table(table)?;
+            let entry = Self::slot(&storage, fd);
+            let identity = entry.map(|entry| {
+                self.backing
+                    .ofd_identity(entry.ofd as usize)
+                    .and_then(record_lock::OfdIdentityRecord::identity)
+            });
+            if Self::slot(&storage, fd) == entry && record.unchanged_since(seq) {
+                return identity.ok_or(Error::BadFd);
+            }
+            attempt = attempt.saturating_add(1);
+            if !self.wait.wait(attempt) {
+                return Err(Error::Contended);
+            }
+        }
+    }
+
+    /// The file a pinned description names, when it was opened with an
+    /// identity ([`Self::open_identified`]).
+    pub fn pinned_identity(
+        &self,
+        pin: &OfdPin,
+    ) -> Result<Option<record_lock::FileIdentity>, Error> {
+        self.check_pin(pin)?;
+        Ok(self
+            .backing
+            .ofd_identity(pin.key.index as usize)
+            .and_then(record_lock::OfdIdentityRecord::identity))
     }
     /// O(1) read-only snapshot, taking no lock (see [`TableRecord`]); it
     /// retains nothing. `Contended` only while a writer keeps changing the
@@ -2523,6 +2605,25 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     ) -> Result<DeferredRelease, Error> {
         self.check_pin(&pin)?;
         self.drop_hold_filtered(pin.key.index, PIN, release_here)
+    }
+
+    /// Whether a lock owner still exists: a table still published under its
+    /// generation, or a description with a reference or pin left.
+    fn lock_owner_live(&self, owner: record_lock::LockOwner) -> bool {
+        match owner {
+            record_lock::LockOwner::Table { index, generation } => {
+                self.core.tables.get(index as usize).is_some_and(|table| {
+                    let state = table.state.load(Ordering::Acquire);
+                    table.generation.load(Ordering::Acquire) == generation
+                        && state != TABLE_FREE
+                        && state != TABLE_RETIRED
+                })
+            }
+            record_lock::LockOwner::Description(key) => self.ofd(key.index).is_ok_and(|ofd| {
+                ofd.generation.load(Ordering::Acquire) == key.generation
+                    && ofd.holds.load(Ordering::Acquire) != 0
+            }),
+        }
     }
 
     /// Descriptor references and pins of a pinned description.

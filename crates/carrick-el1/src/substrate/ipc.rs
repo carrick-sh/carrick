@@ -222,8 +222,8 @@ pub fn transfer_with_io<U: UserCopy>(
                 Err(e) => blocked_or(e)?,
             }
         }
-        // An epoll wait moves no bytes: it is never transferred.
-        IpcOpKind::None | IpcOpKind::EpollWait | IpcOpKind::PollWait => {
+        // A readiness or lock wait moves no bytes: it is never transferred.
+        IpcOpKind::None | IpcOpKind::EpollWait | IpcOpKind::PollWait | IpcOpKind::FileLockWait => {
             return Err(IpcError::Corrupt);
         }
     };
