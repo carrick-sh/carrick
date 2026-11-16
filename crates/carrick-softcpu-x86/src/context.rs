@@ -1543,7 +1543,8 @@ fn step_complex_inner(
             write_int(
                 ctx,
                 new_rsp,
-                (ctx.rflags & 0x0025_7fd5) | 0x2,
+                // SDM Vol. 2B PUSHF: the saved image clears RF and VM.
+                (ctx.rflags & 0x0024_7fd5) | 0x2,
                 width,
                 insn_va,
             )?;
@@ -1554,12 +1555,18 @@ fn step_complex_inner(
             let is_64 = insn.mnemonic() == Mnemonic::Popfq;
             let (width, old_rsp) = (if is_64 { 8 } else { 2 }, ctx.gpr[reg::RSP]);
             let popped = read_int(ctx, old_rsp, width, insn_va)?;
-            let mask: u64 = match (is_64, ctx.cpl == 0) {
+            let mut mask: u64 = match (is_64, ctx.cpl == 0) {
                 (true, true) => 0x0025_7fd5,
                 (true, false) => 0x0024_0dd5,
                 (false, true) => 0x7fd5,
                 (false, false) => 0x0dd5,
             };
+            // SDM Vol. 2B POPF: IF is writable iff CPL <= the *old* IOPL.
+            if u64::from(ctx.cpl) <= ((ctx.rflags >> 12) & 3) {
+                mask |= 1 << 9;
+            } else {
+                mask &= !(1 << 9);
+            }
             ctx.rflags = ((ctx.rflags & !mask) | (popped & mask) | 0x2) & !(1 << 16);
             ctx.sync_tlb_tag_bits();
             ctx.gpr[reg::RSP] = old_rsp.wrapping_add(width as u64);

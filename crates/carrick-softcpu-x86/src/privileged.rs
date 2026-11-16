@@ -443,6 +443,13 @@ fn emulate_mov_dr(
                 if (val >> 32) != 0 {
                     return Err(X86Exception::general_protection(va, 0));
                 }
+                // SDM Vol. 3B §17.2.4 defines R/Wn and LENn. This lane
+                // implements only one-byte instruction breakpoints. Refuse all
+                // other configurations with #GP(0), including disabled slots,
+                // so a later enable cannot silently arm an ignored condition.
+                if val & 0xffff_0000 != 0 {
+                    return Err(X86Exception::general_protection(va, 0));
+                }
                 ctx.dr[7] = (val & DR7_WRITABLE_MASK) | DR7_FIXED_ONES;
             }
             _ => return Err(X86Exception::invalid_opcode(va)),
