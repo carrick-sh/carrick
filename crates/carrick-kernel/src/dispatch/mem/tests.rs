@@ -77,6 +77,9 @@ pub struct CountingMmapMemory {
     pub(crate) owner_gate: Cell<Option<carrick_el1_abi::PortalOwnerWait>>,
     pub(crate) defer_anon: bool,
     pub(crate) discard_anon: bool,
+    /// An owner-admitted engine: generic `zero_backing` refuses, as
+    /// `carrick-aarch64`'s does once the MM's protections have an owner.
+    pub(crate) owner_refuses_zero_backing: bool,
     pub(crate) fail_protect_non_zero: Cell<bool>,
     fail_protect_zero: Cell<bool>,
     concurrent_exec_protection: bool,
@@ -146,6 +149,7 @@ impl CountingMmapMemory {
             owner_gate: Cell::new(None),
             defer_anon: false,
             discard_anon: false,
+            owner_refuses_zero_backing: false,
             fail_protect_non_zero: Cell::new(false),
             fail_protect_zero: Cell::new(false),
             concurrent_exec_protection: false,
@@ -386,6 +390,9 @@ impl GuestMemory for CountingMmapMemory {
     }
 
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        if self.owner_refuses_zero_backing {
+            return Err(MemoryError::Unsupported);
+        }
         let offset = self.range_offset(address, len)?;
         self.zero_backing_calls
             .set(self.zero_backing_calls.get() + 1);
