@@ -30349,6 +30349,62 @@
     {
       "family": "host_substrate",
       "operation": "std::thread::Builder::new",
+      "owner": "carrick_kernel::host_readiness::HostReadinessWatch::start",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_substrate",
+      "operation": "std::thread::Builder::new",
+      "owner": "carrick_kernel::host_readiness::HostReadinessWatch::start",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_substrate",
+      "operation": "std::thread::Builder::new",
+      "owner": "carrick_kernel::host_readiness::HostReadinessWatch::start",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_substrate",
+      "operation": "std::thread::Builder::new",
+      "owner": "carrick_kernel::host_readiness::HostReadinessWatch::start",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_substrate",
+      "operation": "std::thread::Builder::new",
+      "owner": "carrick_kernel::host_readiness::HostReadinessWatch::start",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_substrate",
+      "operation": "std::thread::Builder::new",
+      "owner": "carrick_kernel::host_readiness::HostReadinessWatch::start",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_substrate",
+      "operation": "std::thread::Builder::new",
+      "owner": "carrick_kernel::host_readiness::HostReadinessWatch::start",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_substrate",
+      "operation": "std::thread::Builder::new",
+      "owner": "carrick_kernel::host_readiness::HostReadinessWatch::start",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_substrate",
+      "operation": "std::thread::Builder::new",
       "owner": "carrick_kernel::kernel::carrier_process::<ProcessTimerDelivery as carrick_hal::TimerDelivery>::arm_itimer",
       "lane": "freebsd_cli",
       "ceiling": 1
