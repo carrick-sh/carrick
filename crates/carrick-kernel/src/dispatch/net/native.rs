@@ -86,6 +86,108 @@ impl Drop for NativeNetFile {
     }
 }
 
+/// The identity one native network call runs under (#231): the calling
+/// member's own, as its ring stamped it in the record. Every credential,
+/// capability and pid read of the call answers these, never the identity of
+/// the context whose resources the call borrows.
+pub(in crate::dispatch) struct NativeNetCaller {
+    /// The member's ring task; `None` for an unstamped socket transfer
+    /// ([`NativeNetCaller::unstamped`]).
+    task: Option<carrick_sched_core::process::TaskKey>,
+    pid: crate::dispatch::NsPid,
+    credentials: Arc<crate::kernel::Credentials>,
+    cap_effective: u64,
+}
+
+impl std::fmt::Debug for NativeNetCaller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeNetCaller")
+            .field("task", &self.task)
+            .field("pid", &self.pid)
+            .field("euid", &self.credentials.euid)
+            .field("cap_effective", &format_args!("{:#x}", self.cap_effective))
+            .finish()
+    }
+}
+
+impl NativeNetCaller {
+    fn stamped(
+        caller: &carrick_core_abi::host_file::NetCaller,
+        ids: &crate::kernel::ObjectIdRegistry,
+    ) -> Option<Self> {
+        let id = caller.ids;
+        Some(Self {
+            task: Some(caller.task),
+            pid: crate::dispatch::NsPid(i32::try_from(caller.ns_pid.get()).ok()?),
+            credentials: Arc::new(crate::kernel::Credentials::from_values(
+                crate::kernel::CredentialsValues {
+                    id: ids.credentials_id().ok()?,
+                    ruid: carrick_abi::NsUid::new(id.ruid),
+                    euid: carrick_abi::NsUid::new(id.euid),
+                    suid: carrick_abi::NsUid::new(id.suid),
+                    rgid: carrick_abi::NsGid::new(id.rgid),
+                    egid: carrick_abi::NsGid::new(id.egid),
+                    sgid: carrick_abi::NsGid::new(id.sgid),
+                    fsuid: carrick_abi::NsUid::new(id.fsuid),
+                    fsgid: carrick_abi::NsGid::new(id.fsgid),
+                    umask: 0o022,
+                },
+            )),
+            cap_effective: caller.cap_effective,
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::dispatch) fn for_test(
+        caller: &carrick_core_abi::host_file::NetCaller,
+        ids: &crate::kernel::ObjectIdRegistry,
+    ) -> Option<Self> {
+        Self::stamped(caller, ids)
+    }
+
+    /// `read(2)`, `write(2)` and `fstat(2)` of a socket descriptor, whose
+    /// records carry no caller (the ring stages them before it knows the
+    /// descriptor is a socket). On an inet socket Linux's calls consult no
+    /// caller identity (no ancillary data, no capability check); were one
+    /// read, it answers the overflow ids with no capability and no pid,
+    /// never the run root's.
+    fn unstamped(ids: &crate::kernel::ObjectIdRegistry) -> Option<Self> {
+        const OVERFLOW: u32 = 65_534;
+        Some(Self {
+            task: None,
+            pid: crate::dispatch::NsPid(0),
+            credentials: Arc::new(crate::kernel::Credentials::from_values(
+                crate::kernel::CredentialsValues {
+                    id: ids.credentials_id().ok()?,
+                    ruid: carrick_abi::NsUid::new(OVERFLOW),
+                    euid: carrick_abi::NsUid::new(OVERFLOW),
+                    suid: carrick_abi::NsUid::new(OVERFLOW),
+                    rgid: carrick_abi::NsGid::new(OVERFLOW),
+                    egid: carrick_abi::NsGid::new(OVERFLOW),
+                    sgid: carrick_abi::NsGid::new(OVERFLOW),
+                    fsuid: carrick_abi::NsUid::new(OVERFLOW),
+                    fsgid: carrick_abi::NsGid::new(OVERFLOW),
+                    umask: 0o022,
+                },
+            )),
+            cap_effective: 0,
+        })
+    }
+
+    pub(in crate::dispatch) fn credentials(&self) -> Arc<crate::kernel::Credentials> {
+        Arc::clone(&self.credentials)
+    }
+
+    /// The caller's pid as its own pid namespace sees it.
+    pub(in crate::dispatch) fn pid(&self) -> crate::dispatch::NsPid {
+        self.pid
+    }
+
+    pub(in crate::dispatch) fn has_capability(&self, capability: u32) -> bool {
+        self.cap_effective & (1_u64 << capability) != 0
+    }
+}
+
 /// Staged user memory of one call: exactly the ranges the ring staged.
 /// Any other access faults, as the caller's own memory would for a range
 /// Linux's call does not touch. Writes record each range's written extent.
@@ -204,14 +306,25 @@ impl SyscallDispatcher {
         input: &[u8],
         waiter: Option<carrick_el1_abi::RecordRef>,
     ) -> NetServed {
-        let Some(call) = NetCall::decode(input) else {
+        // The ring stamps every socket call with its caller; an unstamped
+        // one is refused, never run under the run root's identity.
+        let Some((caller, call)) = carrick_core_abi::host_file::NetCaller::split(input) else {
             return NetServed::Refused;
         };
+        let Some(call) = NetCall::decode(call) else {
+            return NetServed::Refused;
+        };
+        let Some(caller) =
+            NativeNetCaller::stamped(&caller, self.kernel_binding.read().kernel().object_ids())
+        else {
+            return NetServed::Refused;
+        };
+        let caller = Arc::new(caller);
         // Sample before the call's own probe: a readiness notification after
         // this point reruns the member's park at once.
         let revision = waiter.and_then(|record| owner.host_ready_revision(record));
         if header.fd < 0 {
-            return self.run_native_net_call(owner, table, &call, None, waiter, revision);
+            return self.run_native_net_call(owner, table, &call, &caller, None, waiter, revision);
         }
         match owner.with_pinned_host_description(table, fd::Fd(header.fd), |resource, flags| {
             let Some(socket) = resource.downcast_ref::<NativeNetFile>() else {
@@ -222,6 +335,7 @@ impl SyscallDispatcher {
                 owner,
                 table,
                 &call,
+                &caller,
                 Some((socket, flags.nonblock)),
                 waiter,
                 revision,
@@ -243,10 +357,13 @@ impl SyscallDispatcher {
         owner: &Arc<HostIpc>,
         table: fd::TableId,
         call: &NetCall<'_>,
+        caller: &Arc<NativeNetCaller>,
         socket: Option<(&NativeNetFile, bool)>,
         waiter: Option<carrick_el1_abi::RecordRef>,
         revision: Option<u64>,
     ) -> NetServed {
+        // The handlers borrow the run's container and network namespace
+        // through this context; its identity never answers (`caller`).
         let Ok(context) = self.capture_one_task_context() else {
             return NetServed::Refused;
         };
@@ -293,8 +410,14 @@ impl SyscallDispatcher {
             args[3] |= carrick_abi::LINUX_MSG_NOSIGNAL as u64;
         }
         let mut memory = StagedMemory::new(call);
-        let ran =
-            self.run_native_net_handler(&context, &scratch, call.canonical, args, &mut memory);
+        let ran = self.run_native_net_handler(
+            &context,
+            &scratch,
+            caller,
+            call.canonical,
+            args,
+            &mut memory,
+        );
         // The socket's description may have been replaced in the scratch
         // table (an in-zone loopback pair); every other slot is a socket the
         // call created, which moves to the caller's ring namespace.
@@ -427,11 +550,15 @@ impl SyscallDispatcher {
         let encoded = NetCall::encode(canonical, args, &[segment], staged.as_slice())?;
         let call = NetCall::decode(&encoded)?;
         let revision = waiter.and_then(|record| owner.host_ready_revision(record));
+        let caller = Arc::new(NativeNetCaller::unstamped(
+            self.kernel_binding.read().kernel().object_ids(),
+        )?);
         Some(
             match self.run_native_net_call(
                 owner,
                 table,
                 &call,
+                &caller,
                 Some((socket, nonblock)),
                 waiter,
                 revision,
@@ -452,6 +579,7 @@ impl SyscallDispatcher {
         &self,
         context: &crate::kernel::KernelContext,
         scratch: &Arc<crate::kernel::FileTable>,
+        caller: &Arc<NativeNetCaller>,
         canonical: u64,
         args: [u64; 6],
         memory: &mut StagedMemory,
@@ -477,6 +605,7 @@ impl SyscallDispatcher {
         match crate::dispatch::resources::with_native_net_scope(
             context,
             Arc::clone(scratch),
+            Arc::clone(caller),
             || handler(self, &mut cx),
         ) {
             Ok(outcome) => Ran::Outcome(outcome),

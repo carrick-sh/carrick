@@ -26,6 +26,10 @@ pub(super) struct CapturedResources {
     /// write them (`prlimit(pid, …)`), so a reader that still consulted the
     /// dispatcher's private copy would not see a limit another process had set.
     task: crate::kernel::TaskRef,
+    /// A native member's network call (#231): the member's own identity,
+    /// which every identity read in this scope answers instead of the
+    /// borrowed context's.
+    native_caller: Option<Arc<super::net::native::NativeNetCaller>>,
 }
 
 impl CapturedResources {
@@ -38,11 +42,15 @@ impl CapturedResources {
             files_override: None,
             shared: Arc::clone(context.shared()),
             task: Arc::clone(context.task()),
+            native_caller: None,
         }
     }
 
     pub(super) fn credentials(&self) -> Arc<crate::kernel::Credentials> {
-        self.resources.credentials()
+        match &self.native_caller {
+            Some(caller) => caller.credentials(),
+            None => self.resources.credentials(),
+        }
     }
 
     pub(super) fn fs_context(&self) -> Arc<crate::kernel::FsContext> {
@@ -405,16 +413,31 @@ pub(crate) fn with_active_context<R>(
 
 /// Run one native network call (#231) against `context`'s resources with
 /// `files` as its descriptor table: the caller's socket, alone, under the
-/// number the call names. Credentials, namespaces and limits stay those of
-/// `context`; no descriptor of `context`'s own table is visible.
+/// number the call names. The caller's identity is `caller`'s: every
+/// credential, capability and pid read in the scope answers the native
+/// member's own, never `context`'s. Namespaces and the container stay
+/// `context`'s (one run shares them); no descriptor of `context`'s own
+/// table is visible.
 pub(super) fn with_native_net_scope<R>(
     context: &crate::kernel::KernelContext,
     files: Arc<crate::kernel::FileTable>,
+    caller: Arc<super::net::native::NativeNetCaller>,
     operation: impl FnOnce() -> R,
 ) -> R {
     let mut resources = CapturedResources::from_context(context);
     resources.files_override = Some(files);
+    resources.native_caller = Some(caller);
     with_resource_scope(resources, context, operation)
+}
+
+/// The native member whose network call this scope runs (#231), if any.
+pub(super) fn native_net_caller() -> Option<Arc<super::net::native::NativeNetCaller>> {
+    CAPTURED_RESOURCES.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .and_then(|resources| resources.native_caller.clone())
+    })
 }
 
 #[cfg(test)]
@@ -455,6 +478,11 @@ fn with_resource_scope<R>(
         }
     }
 
+    if resources.native_caller.is_none() {
+        // A scope nested in a native member's network call keeps that
+        // member's identity: the run root's never answers for it.
+        resources.native_caller = native_net_caller();
+    }
     let previous = ACTIVE_CONTEXT.with(|active| active.replace(context));
     CAPTURED_RESOURCES.with(|stack| stack.borrow_mut().push(resources));
     let _restore = Restore { context: previous };

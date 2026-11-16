@@ -378,6 +378,11 @@ impl SyscallDispatcher {
     /// This is the only correct source for a guest-visible "my pid" field
     /// (`si_pid`, SysV `msg_lspid`/`msg_lrpid`/`shm_cpid`/`shm_lpid`, …).
     pub(crate) fn identity_pid(&self) -> u32 {
+        // A native member's network call (#231) is the member's, not the
+        // borrowed context's.
+        if let Some(caller) = super::resources::native_net_caller() {
+            return caller.pid().0 as u32;
+        }
         if let Some(pid) = crate::dispatch::resources::with_active_context(|context| {
             let task_id = u32::try_from(context.task().key().id.raw()).unwrap_or(0);
             crate::namespace::pid::ns_self_pid_for(context, task_id)
@@ -1773,6 +1778,11 @@ pub(super) fn has_effective_capability(
     kernel: &crate::kernel::KernelContext,
     capability: u32,
 ) -> bool {
+    // A native member's network call (#231) holds the member's own
+    // capabilities, not the borrowed context's.
+    if let Some(caller) = super::resources::native_net_caller() {
+        return caller.has_capability(capability);
+    }
     kernel.task().caps().effective & (1_u64 << capability) != 0
 }
 
