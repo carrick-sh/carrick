@@ -1246,6 +1246,33 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             Err(NativeProcessError::Fault)
         }
     }
+    /// A continued socket send's next bytes (#2414) from the caller's own
+    /// MM. Staging already proved the whole range readable, so this is the
+    /// validated user copy staging uses; a range unmapped since faults.
+    fn copy_syscall_input(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        bytes: &mut [u8],
+    ) -> Result<(), NativeProcessError> {
+        let live = ReservationMm::new(mm.mm.raw().get())
+            .and_then(anonymous::live_words)
+            .and_then(|words| words.context);
+        if self.task.mm.key.load(Ordering::Acquire) != mm.mm.raw().get()
+            || live.is_none_or(|context| context.root != mm.root)
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        let mut copy = carrick_el1_linux::file::ValidatedCopy {
+            task: self.task,
+            validator: &carrick_el1_linux::file::HardwareValidator,
+        };
+        if carrick_el1_linux::file::UserCopy::copy_in(&mut copy, bytes, address.raw()) {
+            Ok(())
+        } else {
+            Err(NativeProcessError::Fault)
+        }
+    }
     fn copy_siginfo(
         &mut self,
         mm: &Self::Mm,

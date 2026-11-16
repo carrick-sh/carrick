@@ -25,8 +25,13 @@ its one non-blocking probe, enrols the host fd with its one wait reactor
 (the CarrierWaitService that serves the run root's host-fd waits; no second
 readiness thread) and answers an owner wait. The reactor notifies the queue
 once the host reports
-readiness (or a poll's deadline passes) and the member reruns the call once.
-A signal cancels the wait as EINTR. AF_UNIX and in-zone descriptors keep
+readiness (or a poll's deadline passes) and the member publishes the call's
+own record again (its staged input, poll serial and transfer progress),
+which probes once. A signal cancels the wait from the member's own queue as
+EINTR; a socket call, read or write that moved nothing is retained for the
+shared signal policy, which restarts it under SA_RESTART on both ISAs (a
+poll never is). A poll's deadline is keyed on the member and the call's
+ring serial, which a re-issued identical poll does not share. AF_UNIX and in-zone descriptors keep
 their ring owners; the run root keeps its existing routes.
 
 The call is the caller's own (director ruling D2): the ring stamps every
@@ -35,9 +40,17 @@ pid namespace sees it, its ids and effective capabilities), and the carrier
 runs the handler in a scope where every credential, capability and pid read
 answers the member's, never the run root's. An unstamped socket record is
 refused. SIGPIPE is the caller's own: the carrier always sends with
-MSG_NOSIGNAL and the ring raises SIGPIPE on its EPIPE. One record carries
-at most NET_TRANSFER_MAX_BYTES of a send or recv (60 KiB), so a larger
-blocking send returns a short count (a known first-slice divergence).
+MSG_NOSIGNAL and the ring raises SIGPIPE on an EPIPE that moved nothing.
+
+A send or recv keeps its caller's whole extent (#2414 review P0-1). One
+record stages at most NET_TRANSFER_MAX_BYTES (64 KiB) of its data, which
+every inet datagram fits: a datagram is one transfer, and the carrier
+answers EMSGSIZE for a larger datagram send before transmitting anything.
+The reply leads with the socket's NetTransferFacts (stream, blocking), and
+the ring's owned continuation moves a stream transfer record by record from
+the byte after the last one moved: a blocking send to its full count, a
+MSG_WAITALL receive on a blocking stream until its buffer is full or the
+stream ends; a signal or error after progress answers the bytes moved.
 """
 
 [bindings]
@@ -52,10 +65,20 @@ vm_free = [
   "carrick-kernel::dispatch::native_files::tests::an_unstamped_native_socket_call_is_refused_never_run_as_the_root",
   "carrick-kernel::dispatch::native_files::tests::a_native_net_scope_answers_the_callers_identity",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_child_socket_call_runs_under_the_childs_own_identity",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_signal_interrupts_a_native_childs_host_readiness_wait_with_eintr",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_native_childs_poll_keeps_one_serial_per_call_and_a_new_call_a_new_one",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_native_childs_blocking_send_continues_across_records_to_its_full_count",
+  "carrick-kernel::host_readiness::tests::an_identical_poll_after_an_interrupted_one_starts_its_own_deadline",
+  "carrick-kernel::dispatch::native_files::tests::a_native_datagram_send_is_one_transfer_or_emsgsize",
+  "carrick-personality-linux::native_host_file::tests::a_socket_send_keeps_its_whole_extent_across_records",
+  "carrick-personality-linux::native_host_file::tests::a_socket_receive_continues_only_for_msg_waitall_on_a_blocking_stream",
+  "carrick-personality-linux::native_host_file::tests::a_socket_send_proves_its_whole_extent_readable_and_holds_a_datagram",
 ]
 embed = [
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_tcp_and_udp_cross_to_the_host_network (fork child: blocking TCP connect/send/recv/shutdown/EOF, UDP sendto + poll + recvfrom, poll timeout, non-blocking connect + poll(POLLOUT) + SO_ERROR, TCP over ::1)",
-  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_calls_run_under_the_childs_own_identity (fork child: TCP SO_PEERCRED {0,-1,-1}, 64 KiB recv, short 100000-byte send, SIGPIPE on EPIPE / none with MSG_NOSIGNAL / write raises it, setresuid(1000) then raw ICMP socket EPERM and TCP socket still opens)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_calls_run_under_the_childs_own_identity (fork child: TCP SO_PEERCRED {0,-1,-1}, 64 KiB recv, a 100000-byte blocking send returns 100000, SIGPIPE on EPIPE / none with MSG_NOSIGNAL / write raises it, setresuid(1000) then raw ICMP socket EPERM and TCP socket still opens)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_transfers_keep_their_whole_extent (fork child: 65000-byte UDP send and recv whole, 100000-byte UDP send EMSGSIZE with nothing transmitted, a short recv buffer truncates a datagram and discards its rest, a 409600-byte blocking TCP send into a small window returns 409600, a 200000-byte MSG_WAITALL recv returns 200000)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_repoll_after_eintr_waits_its_own_timeout (fork child: a SIGUSR1-interrupted poll is EINTR; the same poll after its deadline passed waits its own timeout; a blocking recvfrom interrupted under SA_RESTART restarts and receives)",
 ]
 
 [bindings.unresolved]

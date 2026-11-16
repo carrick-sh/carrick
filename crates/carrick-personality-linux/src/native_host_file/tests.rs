@@ -1935,3 +1935,324 @@ fn chmod_and_chown_answer_linux_errors_in_ring() {
     );
     assert_eq!(staged(chownat(999, empty), &mut user), ebadf);
 }
+
+/// A host network socket descriptor (#231): fd 1 is host-backed.
+const SOCKET_FD: u64 = 1;
+
+/// Stage a socket call and stamp its caller, as the ring's service does.
+fn socket_record(user: &mut Memory, canonical: CanonicalNr, args: [u64; 6]) -> Box<[u8]> {
+    let call = SocketCall::decode(canonical, &args).expect("a socket call");
+    let (record, output, _) = request(run(HostFileCall::Socket(call), user));
+    assert_eq!(output.map(|output| output.layout), Some(OutputLayout::Net));
+    stamp_net_caller(
+        &record,
+        &host_file::NetCaller {
+            task: carrick_sched_core::process::TaskKey {
+                id: carrick_sched_core::process::TaskId::from_registry_allocation(
+                    core::num::NonZeroI32::new(5).unwrap(),
+                ),
+                serial: carrick_sched_core::process::TaskSerial::from_raw_u64(3).unwrap(),
+            },
+            ns_pid: core::num::NonZeroU32::new(5).unwrap(),
+            ids: host_file::AccessIds {
+                ruid: 1000,
+                euid: 1000,
+                suid: 1000,
+                fsuid: 1000,
+                rgid: 1000,
+                egid: 1000,
+                sgid: 1000,
+                fsgid: 1000,
+            },
+            cap_effective: 0,
+        },
+    )
+    .expect("the caller fits the record")
+}
+
+/// The carrier's reply to a socket record: `result`, the socket's facts and
+/// no written extent beyond each output segment's empty one.
+fn serve_socket(record: &mut [u8], result: i64, facts: host_file::NetTransferFacts) {
+    let (_, input, _) = host_file::request_parts(record).unwrap();
+    let call = socket::staged_call(input).unwrap();
+    let empty: Vec<(u32, &[u8])> = call
+        .segments()
+        .iter()
+        .filter(|segment| segment.output)
+        .map(|_| (0, &[][..]))
+        .collect();
+    let output = if result < 0 {
+        Vec::new()
+    } else {
+        host_file::NetCall::encode_written(facts, &empty)
+    };
+    HostFileRequestView::parse(record)
+        .unwrap()
+        .reply(result, &output)
+        .unwrap();
+}
+
+const STREAM: host_file::NetTransferFacts = host_file::NetTransferFacts {
+    stream: true,
+    blocking: true,
+};
+
+/// #2414 review P0-1: a send keeps its caller's whole extent. Its first
+/// record stages one record's range and the call's length, and the ring's
+/// continuation moves the rest record by record: a blocking stream send
+/// continues past a short record (the host's send buffer was full) until
+/// every byte moved, from the byte after the last one moved. A non-blocking
+/// one stops at a short record, a datagram never continues, a signal stops
+/// the call with what it moved, and an error answers the bytes moved, or
+/// itself when none moved. Red before the fix: staging clipped the call to
+/// 61440 bytes and nothing continued it.
+#[test]
+fn a_socket_send_keeps_its_whole_extent_across_records() {
+    use crate::native_host_file::socket::NetTransferStep;
+    const LEN: usize = 200_000;
+    let mut user = memory(&vec![7u8; LEN]);
+    let first = socket_record(
+        &mut user,
+        crate::crossing::nr::SENDTO,
+        [SOCKET_FD, BASE, LEN as u64, 0, 0, 0],
+    );
+    let (_, input, _) = host_file::request_parts(&first).unwrap();
+    let call = socket::staged_call(input).unwrap();
+    assert_eq!(call.args[2], LEN as u64, "the call keeps its whole length");
+    assert_eq!(
+        call.segments()[0].len as usize,
+        host_file::NET_TRANSFER_MAX_BYTES
+    );
+
+    let step = |record: &[u8], result: i64, done: NetTransfer, interrupted: bool| {
+        net_transfer_step(record, SyscallResult::new(result), done, interrupted).unwrap()
+    };
+    // A blocking stream send whose first record moved its whole range.
+    let mut served = first.clone();
+    serve_socket(&mut served, 65_536, STREAM);
+    let NetTransferStep::Next {
+        transfer,
+        address,
+        len,
+        send: true,
+    } = step(&served, 65_536, NetTransfer::default(), false)
+    else {
+        panic!("a blocking stream send continues")
+    };
+    assert_eq!(
+        (transfer.done(), address, len),
+        (65_536, BASE + 65_536, 65_536)
+    );
+    let (second, output) =
+        net_transfer_record(&served, address, len, Some(&vec![7u8; len])).unwrap();
+    assert_eq!(output.layout, OutputLayout::Net);
+    let (_, input, _) = host_file::request_parts(&second).unwrap();
+    let (caller, _) = host_file::NetCaller::split(input).unwrap();
+    assert_eq!(caller.ids.euid, 1000, "the caller stays the call's");
+    let call = socket::staged_call(input).unwrap();
+    assert_eq!(
+        call.args,
+        [SOCKET_FD, BASE + 65_536, (LEN - 65_536) as u64, 0, 0, 0]
+    );
+    // A short record (a full send buffer) continues from its last byte.
+    let mut short = second.clone();
+    serve_socket(&mut short, 1_000, STREAM);
+    let NetTransferStep::Next {
+        transfer, address, ..
+    } = step(&short, 1_000, transfer, false)
+    else {
+        panic!("a blocking stream send continues past a short record")
+    };
+    assert_eq!((transfer.done(), address), (66_536, BASE + 66_536));
+    // ... but a non-blocking one returns what moved.
+    let nonblocking = host_file::NetTransferFacts {
+        stream: true,
+        blocking: false,
+    };
+    let mut short = second.clone();
+    serve_socket(&mut short, 1_000, nonblocking);
+    assert_eq!(
+        step(&short, 1_000, transfer, false),
+        NetTransferStep::Complete(SyscallResult::new(66_536 + 1_000))
+    );
+    // A signal stops the call with what it moved.
+    let mut interrupted = second.clone();
+    serve_socket(&mut interrupted, 65_536, STREAM);
+    assert_eq!(
+        step(&interrupted, 65_536, transfer, true),
+        NetTransferStep::Complete(SyscallResult::new(66_536 + 65_536))
+    );
+    // An error after progress answers the progress; before it, the error.
+    let epipe = carrick_syscall_abi::LINUX_EPIPE.guest_retval();
+    let mut failed = second.clone();
+    serve_socket(&mut failed, epipe, STREAM);
+    assert_eq!(
+        step(&failed, epipe, transfer, false),
+        NetTransferStep::Complete(SyscallResult::new(66_536))
+    );
+    let mut failed = first.clone();
+    serve_socket(&mut failed, epipe, STREAM);
+    assert_eq!(
+        step(&failed, epipe, NetTransfer::default(), false),
+        NetTransferStep::Complete(SyscallResult::new(epipe))
+    );
+    // A datagram is one record: it never continues.
+    let datagram = host_file::NetTransferFacts {
+        stream: false,
+        blocking: true,
+    };
+    let mut sent = first.clone();
+    serve_socket(&mut sent, 65_536, datagram);
+    assert_eq!(
+        step(&sent, 65_536, NetTransfer::default(), false),
+        NetTransferStep::Complete(SyscallResult::new(65_536))
+    );
+    // A transfer's next record never repeats or skips a byte.
+    assert!(net_transfer_record(&served, BASE, len, Some(&vec![7u8; len])).is_none());
+    assert!(net_transfer_record(&served, BASE + 65_537, len, Some(&vec![7u8; len])).is_none());
+}
+
+/// #2414 review P0-1: a receive keeps its caller's whole extent. Its first
+/// record holds any datagram whole; a MSG_WAITALL receive on a blocking
+/// stream socket continues until its buffer is full, the stream ends (a
+/// record of 0) or a signal stops it; a plain receive, a peek and a
+/// non-blocking MSG_WAITALL answer their first record. The rest of a
+/// MSG_WAITALL buffer is proven writable before the first record crosses.
+#[test]
+fn a_socket_receive_continues_only_for_msg_waitall_on_a_blocking_stream() {
+    use crate::native_host_file::socket::NetTransferStep;
+    const LEN: usize = 200_000;
+    const WAITALL: u64 = 0x100;
+    let mut user = memory(&vec![0u8; LEN]);
+    let waitall = socket_record(
+        &mut user,
+        crate::crossing::nr::RECVFROM,
+        [SOCKET_FD, BASE, LEN as u64, WAITALL, 0, 0],
+    );
+    let step = |record: &[u8], result: i64, facts| {
+        let mut served = record.to_vec();
+        serve_socket(&mut served, result, facts);
+        net_transfer_step(
+            &served,
+            SyscallResult::new(result),
+            NetTransfer::default(),
+            false,
+        )
+        .unwrap()
+    };
+    let NetTransferStep::Next {
+        transfer,
+        address,
+        len,
+        send: false,
+    } = step(&waitall, 40_000, STREAM)
+    else {
+        panic!("a blocking MSG_WAITALL stream receive continues")
+    };
+    assert_eq!(
+        (transfer.done(), address, len),
+        (40_000, BASE + 40_000, 65_536)
+    );
+    let mut served = waitall.to_vec();
+    serve_socket(&mut served, 40_000, STREAM);
+    let (next, output) = net_transfer_record(&served, address, len, None).unwrap();
+    let (_, input, _) = host_file::request_parts(&next).unwrap();
+    let call = socket::staged_call(input).unwrap();
+    assert_eq!(
+        call.args,
+        [
+            SOCKET_FD,
+            BASE + 40_000,
+            (LEN - 40_000) as u64,
+            WAITALL,
+            0,
+            0
+        ]
+    );
+    assert!(call.segments()[0].output && !call.segments()[0].input);
+    assert_eq!(
+        output.len,
+        host_file::NetCall::output_capacity(call.segments())
+    );
+    // The end of the stream ends the call.
+    assert_eq!(
+        step(&waitall, 0, STREAM),
+        NetTransferStep::Complete(SyscallResult::new(0))
+    );
+    // Non-blocking, a datagram, a plain receive and a peek answer at once.
+    for (flags, facts) in [
+        (
+            WAITALL,
+            host_file::NetTransferFacts {
+                stream: true,
+                blocking: false,
+            },
+        ),
+        (
+            WAITALL,
+            host_file::NetTransferFacts {
+                stream: false,
+                blocking: true,
+            },
+        ),
+        (0, STREAM),
+        (WAITALL | 0x2, STREAM),
+    ] {
+        let record = socket_record(
+            &mut user,
+            crate::crossing::nr::RECVFROM,
+            [SOCKET_FD, BASE, LEN as u64, flags, 0, 0],
+        );
+        assert_eq!(
+            step(&record, 40_000, facts),
+            NetTransferStep::Complete(SyscallResult::new(40_000)),
+            "flags {flags:#x}, {facts:?}"
+        );
+    }
+    // A MSG_WAITALL buffer that is not all writable faults before anything
+    // is received: the ring supplies it first.
+    let mut short = memory(&vec![0u8; 70_000]);
+    let call = SocketCall::decode(
+        crate::crossing::nr::RECVFROM,
+        &[SOCKET_FD, BASE, LEN as u64, WAITALL, 0, 0],
+    )
+    .unwrap();
+    assert!(matches!(
+        run(HostFileCall::Socket(call), &mut short),
+        Some(HostFileStage::Fault {
+            access: Access::Write,
+            ..
+        })
+    ));
+}
+
+/// #2414 review P0-1: a send's whole extent is proven readable before its
+/// first record crosses, so the continuation's later records copy it in
+/// without a fault of their own; a datagram's single record carries all of
+/// a 65000-byte datagram.
+#[test]
+fn a_socket_send_proves_its_whole_extent_readable_and_holds_a_datagram() {
+    let mut short = memory(&vec![0u8; 70_000]);
+    let call = SocketCall::decode(
+        crate::crossing::nr::SENDTO,
+        &[SOCKET_FD, BASE, 200_000, 0, 0, 0],
+    )
+    .unwrap();
+    assert!(matches!(
+        run(HostFileCall::Socket(call), &mut short),
+        Some(HostFileStage::Fault {
+            address,
+            access: Access::Read,
+        }) if address == BASE + 73_728
+    ));
+    let mut user = memory(&vec![1u8; 65_000]);
+    let record = socket_record(
+        &mut user,
+        crate::crossing::nr::SENDTO,
+        [SOCKET_FD, BASE, 65_000, 0, 0, 0],
+    );
+    let (_, input, _) = host_file::request_parts(&record).unwrap();
+    let call = socket::staged_call(input).unwrap();
+    assert_eq!(call.args[2], 65_000);
+    assert_eq!(call.segments()[0].len, 65_000);
+}

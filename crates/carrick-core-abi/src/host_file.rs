@@ -255,19 +255,25 @@ impl<'a> NetCall<'a> {
         })
     }
 
-    /// The reply area a request with `segments` needs.
+    /// The reply area a request with `segments` needs: the call's
+    /// [`NetTransferFacts`], then each output segment's written extent.
     pub fn output_capacity(segments: &[NetSegment]) -> usize {
-        segments
-            .iter()
-            .filter(|segment| segment.output)
-            .map(|segment| 8 + segment.len as usize)
-            .sum()
+        NET_TRANSFER_FACTS_BYTES
+            + segments
+                .iter()
+                .filter(|segment| segment.output)
+                .map(|segment| 8 + segment.len as usize)
+                .sum::<usize>()
     }
 
-    /// Encode the written extent `[start, end)` of each output segment, in
-    /// segment order, as the reply output.
-    pub fn encode_written(extents: &[(u32, &[u8])]) -> alloc::vec::Vec<u8> {
+    /// Encode the call's `facts` and the written extent `[start, end)` of
+    /// each output segment, in segment order, as the reply output.
+    pub fn encode_written(
+        facts: NetTransferFacts,
+        extents: &[(u32, &[u8])],
+    ) -> alloc::vec::Vec<u8> {
         let mut out = alloc::vec::Vec::new();
+        out.extend_from_slice(&facts.raw().to_le_bytes());
         for (start, bytes) in extents {
             out.extend_from_slice(&start.to_le_bytes());
             out.extend_from_slice(&(*start + bytes.len() as u32).to_le_bytes());
@@ -276,15 +282,17 @@ impl<'a> NetCall<'a> {
         out
     }
 
-    /// Decode a reply output against the request's segments: each output
-    /// segment's written `(address, bytes)`, in segment order. `None` for a
-    /// reply that writes outside its segment.
+    /// Decode a reply output against the request's segments: the call's
+    /// facts and each output segment's written `(address, bytes)`, in
+    /// segment order. `None` for a reply that writes outside its segment.
+    #[allow(clippy::type_complexity)]
     pub fn decode_written<'r>(
         segments: &[NetSegment],
         reply: &'r [u8],
-    ) -> Option<alloc::vec::Vec<(u64, &'r [u8])>> {
+    ) -> Option<(NetTransferFacts, alloc::vec::Vec<(u64, &'r [u8])>)> {
+        let facts = NetTransferFacts::from_raw(read_u64(reply, 0)?)?;
         let mut out = alloc::vec::Vec::new();
-        let mut cursor = 0usize;
+        let mut cursor = NET_TRANSFER_FACTS_BYTES;
         for segment in segments.iter().filter(|segment| segment.output) {
             let start = read_u32(reply, cursor)?;
             let end = read_u32(reply, cursor + 4)?;
@@ -295,7 +303,41 @@ impl<'a> NetCall<'a> {
             cursor += 8 + bytes.len();
             out.push((segment.address.checked_add(u64::from(start))?, bytes));
         }
-        (cursor == reply.len()).then_some(out)
+        (cursor == reply.len()).then_some((facts, out))
+    }
+}
+
+/// What the carrier observed of the socket a [`HostFileOp::NetSyscall`]
+/// call ran on, leading its reply output (#2414). The ring's transfer
+/// continuation needs both: a stream transfer continues past a short record
+/// where a datagram never does, and a blocking one waits for the rest where
+/// a non-blocking one returns what moved.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetTransferFacts {
+    /// The socket is a byte stream (`SOCK_STREAM`).
+    pub stream: bool,
+    /// The call could wait: neither the description's `O_NONBLOCK` nor
+    /// the call's `MSG_DONTWAIT` was set.
+    pub blocking: bool,
+}
+
+const NET_TRANSFER_FACTS_BYTES: usize = 8;
+const NET_FACT_STREAM: u64 = 1;
+const NET_FACT_BLOCKING: u64 = 2;
+
+impl NetTransferFacts {
+    pub const fn raw(self) -> u64 {
+        (self.stream as u64 * NET_FACT_STREAM) | (self.blocking as u64 * NET_FACT_BLOCKING)
+    }
+
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        if raw & !(NET_FACT_STREAM | NET_FACT_BLOCKING) != 0 {
+            return None;
+        }
+        Some(Self {
+            stream: raw & NET_FACT_STREAM != 0,
+            blocking: raw & NET_FACT_BLOCKING != 0,
+        })
     }
 }
 
@@ -330,10 +372,14 @@ struct NetCallerWire {
 /// Encoded bytes of a [`NetCaller`].
 pub const NET_CALLER_BYTES: usize = core::mem::size_of::<NetCallerWire>();
 
-/// Largest data range one [`HostFileOp::NetSyscall`] stages (a `send`'s
-/// bytes or a `recv`'s buffer): one record's chunk less the caller, call
-/// and segment framing and the socket address that may travel with it.
-pub const NET_TRANSFER_MAX_BYTES: usize = HOST_FILE_CHUNK_BYTES - 4096;
+/// Largest data range one [`HostFileOp::NetSyscall`] record stages (a
+/// `send`'s bytes or a `recv`'s buffer): one whole chunk, beside the caller,
+/// call, segment framing and socket address the record area also carries
+/// ([`HOST_FILE_FRAMING_BYTES`]). Every inet datagram fits it (an IP
+/// datagram's total length is 16 bits), so a datagram is always one
+/// transfer; a stream transfer larger than one record continues in the
+/// ring's owned transfer continuation.
+pub const NET_TRANSFER_MAX_BYTES: usize = HOST_FILE_CHUNK_BYTES;
 
 impl NetCaller {
     pub fn encode(&self) -> [u8; NET_CALLER_BYTES] {
@@ -411,6 +457,38 @@ impl PollWait {
             1 => Some(Self::MayWait),
             _ => None,
         }
+    }
+}
+
+/// [`HostFileOp::Poll`] `args[2]`: the poll call's ring serial
+/// ([`HostCallSerial`]).
+pub const POLL_CALL_SERIAL_ARG: usize = 2;
+
+/// One poll call's identity across the records its ring publishes for it
+/// (#2414 review P0-2). The ring stamps a new serial on a call's first
+/// record, at the call's own entry, and keeps it on every record it
+/// publishes again for that call after a host-readiness wake; the carrier
+/// keys the call's deadline on the member and this serial. A new call,
+/// including one issued again after an interrupted one, has a new serial,
+/// so it never inherits another call's deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct HostCallSerial(core::num::NonZeroU64);
+
+impl HostCallSerial {
+    pub const fn new(raw: core::num::NonZeroU64) -> Self {
+        Self(raw)
+    }
+
+    /// `None` for an unstamped record (0).
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match core::num::NonZeroU64::new(raw) {
+            Some(raw) => Some(Self(raw)),
+            None => None,
+        }
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0.get()
     }
 }
 
@@ -568,12 +646,18 @@ const MAGIC: u32 = u32::from_le_bytes(*b"CHFR");
 const VERSION: u16 = 1;
 /// Fixed header, including the reply words.
 pub const HOST_FILE_HEADER_BYTES: usize = 96;
-/// Largest input or output area one record carries. Larger transfers are
-/// split by the ring continuation.
+/// Largest data chunk one record carries. Larger transfers are split by the
+/// ring continuation.
 pub const HOST_FILE_CHUNK_BYTES: usize = 64 * 1024;
+/// Framing a record area carries beside one chunk of data: a network call's
+/// caller, call and segment table, and its socket address.
+pub const HOST_FILE_FRAMING_BYTES: usize = 4096;
+/// Largest input or output area one record carries: one chunk and its
+/// framing.
+pub const HOST_FILE_AREA_BYTES: usize = HOST_FILE_CHUNK_BYTES + HOST_FILE_FRAMING_BYTES;
 /// Largest complete record.
 pub const MAX_HOST_FILE_RECORD_BYTES: u64 =
-    (HOST_FILE_HEADER_BYTES + 2 * HOST_FILE_CHUNK_BYTES) as u64;
+    (HOST_FILE_HEADER_BYTES + 2 * HOST_FILE_AREA_BYTES) as u64;
 
 // Header layout (little-endian byte offsets).
 const OP: usize = 6;
@@ -613,9 +697,9 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 }
 
 /// Total record length for `input_len` staged bytes and `output_cap` reply
-/// bytes, or `None` when either exceeds one chunk.
+/// bytes, or `None` when either exceeds one area.
 pub const fn record_len(input_len: usize, output_cap: usize) -> Option<usize> {
-    if input_len > HOST_FILE_CHUNK_BYTES || output_cap > HOST_FILE_CHUNK_BYTES {
+    if input_len > HOST_FILE_AREA_BYTES || output_cap > HOST_FILE_AREA_BYTES {
         return None;
     }
     Some(HOST_FILE_HEADER_BYTES + input_len + output_cap)
@@ -944,9 +1028,20 @@ impl<'a> AccessContext<'a> {
 /// without a mutable view (the ring re-stages a record with its caller's
 /// access context in front of the input).
 pub fn request_parts(bytes: &[u8]) -> Option<(HostFileHeader, &[u8], usize)> {
+    record_parts(bytes, REPLY_PENDING)
+}
+
+/// [`request_parts`] of a record whose reply was written: the request a
+/// reply answers, for the ring to continue the call with its next record
+/// (#2414).
+pub fn replied_parts(bytes: &[u8]) -> Option<(HostFileHeader, &[u8], usize)> {
+    record_parts(bytes, REPLY_WRITTEN)
+}
+
+fn record_parts(bytes: &[u8], state: u32) -> Option<(HostFileHeader, &[u8], usize)> {
     if read_u32(bytes, 0) != Some(MAGIC)
         || read_u16(bytes, 4) != Some(VERSION)
-        || read_u32(bytes, STATE) != Some(REPLY_PENDING)
+        || read_u32(bytes, STATE) != Some(state)
     {
         return None;
     }
@@ -1126,7 +1221,7 @@ mod tests {
             },
         ];
         let send = NetCall::encode(44, [0; 6], &segments, &[&data, &address]).unwrap();
-        assert!(NET_CALLER_BYTES + send.len() <= HOST_FILE_CHUNK_BYTES);
+        assert!(NET_CALLER_BYTES + send.len() <= HOST_FILE_AREA_BYTES);
         let recv = [
             NetSegment {
                 address: 0x1000,
@@ -1147,7 +1242,10 @@ mod tests {
                 output: true,
             },
         ];
-        assert!(NetCall::output_capacity(&recv) <= HOST_FILE_CHUNK_BYTES);
+        assert!(NetCall::output_capacity(&recv) <= HOST_FILE_AREA_BYTES);
+        // The largest inet datagram (65,535 bytes of IP datagram) is one
+        // transfer.
+        const { assert!(NET_TRANSFER_MAX_BYTES >= 65_535) };
     }
 
     #[test]
@@ -1179,18 +1277,30 @@ mod tests {
         assert_eq!(call.segments(), segments);
         let staged: alloc::vec::Vec<_> = call.staged().map(|(_, bytes)| bytes).collect();
         assert_eq!(staged, [Some(&b"\x10\0\0\0"[..]), None, Some(&b"ab"[..])]);
-        assert_eq!(NetCall::output_capacity(&segments), 8 + 4 + 8 + 16);
+        assert_eq!(NetCall::output_capacity(&segments), 8 + 8 + 4 + 8 + 16);
         // Mismatched staged inputs are refused.
         assert!(NetCall::encode(207, [0; 6], &segments, &[b"ab"]).is_none());
         assert!(NetCall::decode(&input[..input.len() - 1]).is_none());
 
-        let reply = NetCall::encode_written(&[(0, b"\x08\0\0\0"), (0, b"12345678")]);
+        let facts = NetTransferFacts {
+            stream: true,
+            blocking: false,
+        };
+        let reply = NetCall::encode_written(facts, &[(0, b"\x08\0\0\0"), (0, b"12345678")]);
         assert_eq!(
             NetCall::decode_written(&segments, &reply).unwrap(),
-            [(0x1000, &b"\x08\0\0\0"[..]), (0x2000, &b"12345678"[..])]
+            (
+                facts,
+                alloc::vec![(0x1000, &b"\x08\0\0\0"[..]), (0x2000, &b"12345678"[..])]
+            )
         );
+        // Facts round-trip; an unknown fact is refused.
+        for raw in 0..4 {
+            assert_eq!(NetTransferFacts::from_raw(raw).unwrap().raw(), raw);
+        }
+        assert!(NetTransferFacts::from_raw(4).is_none());
         // An extent past its segment, or a trailing byte, is refused.
-        let past = NetCall::encode_written(&[(2, b"123"), (0, b"")]);
+        let past = NetCall::encode_written(facts, &[(2, b"123"), (0, b"")]);
         assert!(NetCall::decode_written(&segments, &past).is_none());
         let mut trailing = reply.clone();
         trailing.push(0);
@@ -1205,6 +1315,6 @@ mod tests {
         assert_eq!(view.reply(0, b"12345"), Err(HostFileRecordError::Invalid));
         let view = HostFileRequestView::parse(&mut bytes).unwrap();
         assert_eq!(view.reply(-9, b"1"), Err(HostFileRecordError::Invalid));
-        assert!(record_len(HOST_FILE_CHUNK_BYTES + 1, 0).is_none());
+        assert!(record_len(HOST_FILE_AREA_BYTES + 1, 0).is_none());
     }
 }

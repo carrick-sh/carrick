@@ -864,6 +864,19 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<(), NativeProcessError> {
         Err(NativeProcessError::Unsupported)
     }
+    /// Copy a syscall's input from the caller's user memory on the selected
+    /// record's live address space, with EL0 permissions: the next record
+    /// of a socket send the ring continues (#2414). Its staging proved the
+    /// whole range readable, so this is the plain user copy staging uses; a
+    /// range a sibling unmapped since faults.
+    fn copy_syscall_input(
+        &mut self,
+        _mm: &Self::Mm,
+        _address: UserVa,
+        _bytes: &mut [u8],
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
     fn copy_siginfo(
         &mut self,
         _mm: &Self::Mm,
@@ -1937,6 +1950,9 @@ pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     zone: &'a ZoneTables<C>,
     exec_capability: Arc<carrick_core_abi::service::ExecCapabilityId>,
     ipc_channels: IpcWaitChannels,
+    /// The next poll call's ring serial
+    /// ([`carrick_core_abi::host_file::HostCallSerial`], #2414).
+    host_call_serials: core::sync::atomic::AtomicU64,
     #[cfg(test)]
     signal_check_hook: SpinLock<Option<Box<dyn FnOnce() + Send + 'a>>>,
     #[cfg(test)]
@@ -4440,6 +4456,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             #[cfg(test)]
             yield_receipt_race_hook: SpinLock::new(None),
             registry: SpinLock::new(None),
+            host_call_serials: core::sync::atomic::AtomicU64::new(1),
         })
     }
     pub fn enter<'r, S: NativeProcessService<'a, C, Mm = M>>(
@@ -5983,6 +6000,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .clone();
         self.service.copy_syscall_output(&mm, address, bytes)
     }
+    /// Copy a syscall's input from the caller's own MM: a continued socket
+    /// send's next record (#2414).
+    pub(super) fn copy_syscall_input(
+        &mut self,
+        address: UserVa,
+        bytes: &mut [u8],
+    ) -> Result<(), NativeProcessError> {
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        self.service.copy_syscall_input(&mm, address, bytes)
+    }
     /// Everything this member retained for the rerun of its last call (a
     /// relative futex wait, a thread-stock answer) is void once anything
     /// other than that rerun runs: a signal frame, an exit, a run failure.
@@ -6944,6 +6981,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
     /// Original context of an interrupted, unconsumed child-wait query.
     /// Only this owned operation may be restarted after a caught handler.
+    /// Retain this member's interrupted syscall for the shared signal
+    /// policy, which restarts it under `SA_RESTART` (or when no handler
+    /// runs) from its own entry context on either ISA: a host-file call a
+    /// signal interrupted before any effect (#2414). The same custody as an
+    /// interrupted child wait, consumed by the member's next checkpoint.
+    pub(super) fn retain_interrupted_syscall(&mut self) -> Result<(), NativeFailure> {
+        let thread = NativeThreadIdentity::from_binding(self.binding)?;
+        let mut graph = self.runtime.graph.lock();
+        let resources = graph
+            .owner
+            .task_mut(self.key)
+            .map_err(|_| NativeFailure::Stale)?
+            .native_mut()
+            .resources_mut();
+        if !resources.members.iter().any(|member| {
+            member.thread == thread
+                && member.record == self.record
+                && core::ptr::eq(member.control.control(), self.control)
+        }) || !signal_record_exists(self.source.zone, self.record)
+        {
+            return Err(NativeFailure::Stale);
+        }
+        NATIVE_SIGNAL_CONTINUATIONS.fetch_add(1, Ordering::Release);
+        resources.interrupted_child_waits.insert(
+            self.record,
+            InterruptedChildWait {
+                thread,
+                words: Some(Box::new(*self.words)),
+            },
+        );
+        Ok(())
+    }
     pub fn take_interrupted_child_wait(&mut self) -> Option<Box<C>> {
         let thread = NativeThreadIdentity::from_binding(self.binding).ok()?;
         let mut graph = self.runtime.graph.lock();

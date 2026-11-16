@@ -1129,6 +1129,9 @@ impl<V: file::MemoryValidator> carrick_personality_linux::native_host_file::Host
     fn writable(&mut self, dst: u64, len: usize) -> usize {
         self.0.validator.writable_bytes(dst, len)
     }
+    fn readable(&mut self, src: u64, len: usize) -> usize {
+        self.0.validator.readable_bytes(src, len)
+    }
 }
 
 /// Stage an ISA-decoded host-file call against the caller's ring namespace.
@@ -1867,22 +1870,13 @@ pub(super) fn native_service_user_return(
             // Only an interrupted, uncommitted crossing may request restart.
             // Reuse the authenticated ARM return marker: FAR retains original
             // arg0 while the result word carries EINTR into shared policy.
-            let interrupted = match operation {
-                Some(carrick_core_abi::service::ServiceOperation::Crossing { ordinal }) => {
-                    Some(ordinal)
-                }
-                // A host network call interrupted while it waited on its
-                // host object (#231).
-                Some(carrick_core_abi::service::ServiceOperation::HostFile { payload, .. }) => {
-                    Some(payload.ordinal())
-                }
-                _ => None,
-            };
+            // An interrupted host-file call is retained for the shared
+            // signal policy by its own service (#2414), on both ISAs.
             if result.raw() == carrick_syscall_abi::LINUX_EINTR.guest_retval()
-                && interrupted.is_some_and(|ordinal| {
-                    ordinal.raw() == frame.x[8]
-                        && carrick_signal_core::is_native_restartable_syscall(ordinal.raw())
-                })
+                && matches!(operation,
+                    Some(carrick_core_abi::service::ServiceOperation::Crossing { ordinal })
+                    if ordinal.raw() == frame.x[8]
+                        && carrick_signal_core::is_native_restartable_syscall(ordinal.raw()))
             {
                 frame.far = frame.x[0];
                 frame.esr = 0xfffe;
