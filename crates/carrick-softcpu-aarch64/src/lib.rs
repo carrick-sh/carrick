@@ -261,6 +261,9 @@ pub fn classify(w: u32) -> A64Class {
 }
 
 #[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
 mod tests {
     use super::{A64Class, SystemRegister, classify};
     #[test]
@@ -355,5 +358,3 @@ mod tests {
         assert_eq!(classify(0xd5182000), Msr(reg));
     }
 }
-#[cfg(test)]
-extern crate std;
