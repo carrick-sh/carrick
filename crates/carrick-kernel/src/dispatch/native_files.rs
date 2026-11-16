@@ -2297,8 +2297,8 @@ mod tests {
     /// #231 (apt's `chown`/`chmod` warnings): a ring child's `fchmod`,
     /// `fchown`, `fchmodat` and `fchownat` are the host task's cores under
     /// the child's own credentials, carried in its access context: root may
-    /// give a file away, an unprivileged caller may not (EPERM), and -1 is
-    /// always allowed. A closed descriptor is EBADF, a missing path ENOENT,
+    /// give a file away, an unprivileged caller may not (EPERM), its owner
+    /// may keep its own uid and set its own group, and -1 is always allowed. A closed descriptor is EBADF, a missing path ENOENT,
     /// a contended or in-zone resource never guessed.
     #[test]
     fn native_child_chmod_chown_dispatch_with_the_callers_credentials() {
@@ -2353,6 +2353,29 @@ mod tests {
                 "{upper:?}"
             );
             assert_eq!(fchown(&other, file, unchanged, unchanged), 0, "{upper:?}");
+            // chown(2): once the file is its own, the unprivileged caller may
+            // "change" the uid to its own and the group to one it is in,
+            // and still may not give the file away or pick a foreign group.
+            assert_eq!(fchown(&root, file, 65534, 65534), 0, "{upper:?}");
+            assert_eq!(fchown(&other, file, 65534, unchanged), 0, "{upper:?}");
+            assert_eq!(
+                chownat(&other, b"attr", 65534, unchanged, 0),
+                0,
+                "{upper:?}"
+            );
+            assert_eq!(
+                chownat(
+                    &other,
+                    b"attr",
+                    unchanged,
+                    65534,
+                    carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW
+                ),
+                0,
+                "{upper:?}"
+            );
+            assert_eq!(fchown(&other, file, 65534, 0), eperm, "{upper:?}");
+            assert_eq!(chownat(&other, b"attr", 4321, 65534, 0), eperm, "{upper:?}");
             assert_eq!(fchmod(&root, 999, 0o600), -9);
             assert_eq!(fchown(&root, 999, unchanged, unchanged), -9);
             assert_eq!(chmodat(&root, b"missing", 0o600), -2);

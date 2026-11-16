@@ -17771,6 +17771,7 @@ fn serve_child_host_file(
     task: &CurrentTask,
     venue: &crate::ipc::IpcVenue<'_>,
     dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    credentials: &carrick_personality_linux::identity::TaskCredentials,
 ) -> Option<i64> {
     use carrick_core_abi::service::ServiceOrigin;
     use carrick_personality_linux::native_host_file::HostFileStage;
@@ -17793,20 +17794,18 @@ fn serve_child_host_file(
             ..
         } => {
             // The production service stamps a path call's access context
-            // from the caller's task row (`service.rs`): here a root child
-            // whose cwd is `/`.
+            // from the caller's task row (`service.rs`): here the child's
+            // `credentials`, with its cwd at `/`.
             let record = if resolves_path {
-                use carrick_personality_linux::identity::TaskCredentials;
                 use carrick_personality_linux::task_fs::{TaskFs, TaskPath};
                 let fs = TaskFs {
                     cwd: TaskPath::root_directory(),
                     root: None,
                 };
                 let mut access = Vec::new();
-                fs.encode_access(&TaskCredentials::ROOT, 0o022, &mut access)
-                    .unwrap();
+                fs.encode_access(credentials, 0o022, &mut access).unwrap();
                 carrick_personality_linux::native_host_file::stamp_access_context(&record, &access)
-                    .expect("a root context and test path fit one record")
+                    .expect("a child context and test path fit one record")
             } else {
                 record
             };
@@ -17861,6 +17860,13 @@ fn with_arm_root_host_dispatch<R>(
 /// a caller that resumes with its registers as they were).
 #[cfg(test)]
 const ARM_RESUME: u64 = u64::MAX;
+
+/// [`with_arm_process_host_dispatch`]'s pseudo call: a child's
+/// `setresgid(a1, a1, a1)` then `setresuid(a0, a0, a0)`, applied to its task
+/// row directly. The harness's children share the root's thread slot, so a
+/// child's own identity call would name the root's tid.
+#[cfg(test)]
+const ARM_CHILD_SETRESIDS: u64 = u64::MAX - 1;
 
 /// [`with_arm_process_host_dispatch`]'s answer for a forwarded call the
 /// host would block in (`DispatchOutcome::WaitOnFds`): the harness has no
@@ -18002,6 +18008,20 @@ fn with_arm_process_host_files<R>(
     let mut call = |caller: ArmCaller, nr: u64, args: [u64; 6]| -> (CompletionRoute, i64) {
         if nr == ARM_RESUME && active == Some(caller) {
             return (CompletionRoute::Served, i64::MIN);
+        }
+        if nr == ARM_CHILD_SETRESIDS {
+            let ArmCaller::Child(pid) = caller else {
+                panic!("ARM_CHILD_SETRESIDS names a child");
+            };
+            let (uid, gid) = (Some(args[0] as u32), Some(args[1] as u32));
+            let runtime: &std::sync::Arc<NativeProcessRuntime<'_, _, _>> = runtime
+                .as_ref()
+                .expect("a child exists only after the root's clone");
+            let set = runtime.update_task_identity_for_test(pid, |creds| {
+                creds.set_resgid(gid, gid, gid)?;
+                creds.set_resuid(uid, uid, uid)
+            });
+            return (CompletionRoute::Served, set.err().unwrap_or(0));
         }
         if active != Some(caller) {
             let runtime: &std::sync::Arc<NativeProcessRuntime<'_, _, _>> = runtime
@@ -18166,7 +18186,11 @@ fn with_arm_process_host_files<R>(
         }
         // A child has no host fallback: a forward is the native host-file
         // venue's request, or nothing (a counted ENOSYS).
-        let ret = serve_child_host_file(&frame, &fixture.task, &venue, &dispatcher)
+        let credentials = runtime
+            .task_identity_for_test(pid)
+            .expect("a live child's task row")
+            .0;
+        let ret = serve_child_host_file(&frame, &fixture.task, &venue, &dispatcher, &credentials)
             .unwrap_or(carrick_syscall_abi::LINUX_ENOSYS.guest_retval());
         (route, ret)
     };
@@ -18644,6 +18668,136 @@ fn arm_fork_child_chmod_chown_on_ring_files() {
     assert!(
         mismatches.is_empty(),
         "a fork child's chmod/chown left Linux's contract:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// #2406 review P0-1: chown(2) lets an unprivileged owner "change" the uid
+/// to its own and the group to one it is in; -1 leaves either alone, and a
+/// foreign uid or group is EPERM. A root fork child gives a file to
+/// 65534:65534 and drops to those ids, so it still owns the file. On the PR's first head every explicit
+/// uid was EPERM for a non-root caller, its own included.
+#[test]
+fn arm_fork_child_owner_chown_keeps_its_own_ids() {
+    use carrick_abi::{LINUX_AT_FDCWD, LINUX_AT_SYMLINK_NOFOLLOW, LINUX_O_CREAT, LINUX_O_RDWR};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let unchanged = u64::from(u32::MAX);
+    let eperm = carrick_abi::LINUX_EPERM.guest_retval();
+    let (mismatches, _) = with_arm_process_host_dispatch(|call| {
+        let mut mismatches = Vec::new();
+        let tmp = GuestUserBuffer::from_bytes(b"/tmp\0");
+        let (_, made) = call(
+            ArmCaller::Root,
+            sys::MKDIRAT.raw(),
+            [LINUX_AT_FDCWD, tmp.arg(), 0o777, 0, 0, 0],
+        );
+        assert!(made == 0 || made == -17, "mkdir /tmp: {made}");
+        let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-2406-owner-chown\0");
+        let (_, created) = call(
+            ArmCaller::Root,
+            sys::OPENAT.raw(),
+            [
+                LINUX_AT_FDCWD,
+                path.arg(),
+                LINUX_O_RDWR | LINUX_O_CREAT,
+                0o644,
+                0,
+                0,
+            ],
+        );
+        assert!(created >= 0, "create the file: {created}");
+        let (route, pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid} ({route:?})");
+        let child = ArmCaller::Child(pid as u32);
+        let (route, fd) = call(
+            child,
+            sys::OPENAT.raw(),
+            [LINUX_AT_FDCWD, path.arg(), LINUX_O_RDWR, 0, 0, 0],
+        );
+        assert!(fd >= 0, "child open of the file: {fd} ({route:?})");
+        let fd = fd as u64;
+        let (_, given) = call(child, sys::FCHOWN.raw(), [fd, 65534, 65534, 0, 0, 0]);
+        assert_eq!(given, 0, "the root child gives the file to 65534:65534");
+        let (_, dropped) = call(child, ARM_CHILD_SETRESIDS, [65534, 65534, 0, 0, 0, 0]);
+        assert_eq!(dropped, 0, "the child drops to 65534:65534");
+        let mut expect = |what: &str, got: i64, want: i64| {
+            if got != want {
+                mismatches.push(format!("{what}: got {got}, want {want}"));
+            }
+        };
+        let fchown = |uid, gid| [fd, uid, gid, 0, 0, 0];
+        let fchownat = |uid, gid, flags| [LINUX_AT_FDCWD, path.arg(), uid, gid, flags, 0];
+        for (what, nr, args, want) in [
+            (
+                "fchown(fd, own uid, -1)",
+                sys::FCHOWN,
+                fchown(65534, unchanged),
+                0,
+            ),
+            (
+                "fchownat(path, own uid, -1, 0)",
+                sys::FCHOWNAT,
+                fchownat(65534, unchanged, 0),
+                0,
+            ),
+            (
+                "fchownat(path, own uid, -1, AT_SYMLINK_NOFOLLOW)",
+                sys::FCHOWNAT,
+                fchownat(65534, unchanged, LINUX_AT_SYMLINK_NOFOLLOW),
+                0,
+            ),
+            (
+                "fchown(fd, -1, own gid)",
+                sys::FCHOWN,
+                fchown(unchanged, 65534),
+                0,
+            ),
+            (
+                "fchownat(path, own uid, own gid, 0)",
+                sys::FCHOWNAT,
+                fchownat(65534, 65534, 0),
+                0,
+            ),
+            (
+                "fchown(fd, -1, -1)",
+                sys::FCHOWN,
+                fchown(unchanged, unchanged),
+                0,
+            ),
+            (
+                "fchown(fd, 0, -1)",
+                sys::FCHOWN,
+                fchown(0, unchanged),
+                eperm,
+            ),
+            (
+                "fchown(fd, -1, 0)",
+                sys::FCHOWN,
+                fchown(unchanged, 0),
+                eperm,
+            ),
+            (
+                "fchownat(path, own uid, 0, 0)",
+                sys::FCHOWNAT,
+                fchownat(65534, 0, 0),
+                eperm,
+            ),
+            (
+                "fchownat(path, 0, own gid, 0)",
+                sys::FCHOWNAT,
+                fchownat(0, 65534, 0),
+                eperm,
+            ),
+        ] {
+            expect(what, call(child, nr.raw(), args).1, want);
+        }
+        mismatches
+    });
+    assert!(
+        mismatches.is_empty(),
+        "an unprivileged owner's chown left chown(2):\n{}",
         mismatches.join("\n")
     );
 }
@@ -19738,8 +19892,14 @@ fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
             CompletionRoute::Forward,
             "child syscall {nr} must decline in-ring pipe family to stage host-file request"
         );
-        serve_child_host_file(&frame, &fixture.task, &venue, &dispatcher)
-            .unwrap_or_else(|| panic!("child syscall {nr} staged nothing"))
+        serve_child_host_file(
+            &frame,
+            &fixture.task,
+            &venue,
+            &dispatcher,
+            &carrick_personality_linux::identity::TaskCredentials::ROOT,
+        )
+        .unwrap_or_else(|| panic!("child syscall {nr} staged nothing"))
     };
 
     let stat_buf = GuestUserBuffer::zeroed(core::mem::size_of::<LinuxStat>());

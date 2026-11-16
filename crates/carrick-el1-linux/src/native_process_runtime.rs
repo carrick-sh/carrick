@@ -4737,6 +4737,28 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let task = graph.owner.task(key).ok()?;
         Some((task.leader_credentials().ok()?.clone(), task.umask))
     }
+    /// Apply `update` to the leader credentials of the root's child
+    /// `visible`, as its own `setresuid`/`setresgid` would.
+    #[cfg(test)]
+    pub(crate) fn update_task_identity_for_test(
+        &self,
+        visible: u32,
+        update: impl FnOnce(
+            &mut carrick_personality_linux::identity::TaskCredentials,
+        ) -> Result<(), i64>,
+    ) -> Result<(), i64> {
+        let root = self.graph.lock().root_key;
+        let key = self
+            .namespace_child_key(root, visible)
+            .ok_or(carrick_personality_linux::identity::ESRCH)?;
+        let mut graph = self.graph.lock();
+        let task = graph
+            .owner
+            .task_mut(key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        let leader = task.metadata().namespace_pid;
+        update(task.credentials_for_mut(leader)?)
+    }
     pub fn namespace_child_key(&self, caller: TaskKey, visible: u32) -> Option<TaskKey> {
         self.graph
             .lock()
