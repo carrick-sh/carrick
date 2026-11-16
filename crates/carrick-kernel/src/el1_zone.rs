@@ -318,7 +318,7 @@ pub(crate) fn host_ready_revision(carrier: Option<&CarrierZone>, record: RecordR
 
 /// Publish a host object's readiness to the member waiting on it: notify
 /// its host-readiness queue from a host thread and deliver the wake (the
-/// member reruns its call). A member that is not waiting (its queue
+/// member publishes its call's record again). A member that is not waiting (its queue
 /// retired, rebound or empty) is not affected beyond the epoch bump that
 /// makes a pending park rerun.
 pub(crate) fn notify_host_ready(carrier: Option<&CarrierZone>, record: RecordRef) {

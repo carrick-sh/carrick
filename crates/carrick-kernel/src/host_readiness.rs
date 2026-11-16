@@ -4,13 +4,12 @@
 //! crossing: when a native call on one would block, the carrier sampled the
 //! member's host-readiness queue before its non-blocking probe, enrols the
 //! host descriptors with the carrier's one wait reactor (the
-//! [`CarrierWaitService`](crate::kernel::continuation::CarrierWaitService)
-//! that also serves the run root's host-fd waits) and answers the member's
-//! service with an owner wait on that queue. When the host reports a
-//! descriptor ready, or a poll's deadline passes, the reactor notifies the
-//! queue and the member reruns its call once. Nothing polls, no second
-//! reactor thread exists, and a member's execution capacity is released
-//! while it waits.
+//! [`CarrierWaitService`] that also serves the run root's host-fd waits) and
+//! answers the member's service with an owner wait on that queue. When the
+//! host reports a descriptor ready, or a poll's deadline passes, the reactor
+//! notifies the queue and the member publishes its call's record again,
+//! which probes once. Nothing polls, no second reactor thread exists, and a
+//! member's execution capacity is released while it waits.
 //!
 //! A member waits in at most one call, so its enrolments are that call's: a
 //! new wait replaces them, and they are dropped once notified. Enrolments
@@ -96,8 +95,8 @@ impl std::fmt::Debug for HostReadyWait {
 }
 
 impl HostReadyWait {
-    /// Publish this wait's readiness to its member: the member reruns its
-    /// call once.
+    /// Publish this wait's readiness to its member: the member publishes its
+    /// call's record again, which probes once.
     pub(crate) fn notify(self) {
         crate::el1_zone::notify_host_ready(self.carrier.as_ref(), self.record);
     }
