@@ -14,6 +14,12 @@
  *   SETTID_BUSY    fork with CLONE_CHILD_SETTID: the child's tid store is
  *                  Busy once before its first instruction; the child then
  *                  finds its tid stored (the store used to be dropped)
+ *   ENTROPY_SETTLED_BEFORE_PARK  #2416: the child's getrandom into a COW
+ *                  page finds its space editor held, and the holder
+ *                  releases it before the child enrolls on the owner wait.
+ *                  The wait settles inline; getrandom restarts and returns
+ *                  8, the parent's page keeps its bytes, and exactly one
+ *                  wait was released before its park
  */
 #define INJECT_EDITOR_BUSY_ONCE -495     /* 0x...fe11 */
 #define INJECT_OWNED_COPY_BUSY_ONCE -485 /* 0x...fe1b */
@@ -21,6 +27,8 @@
 #define INJECT_FORK_CENSUS_ROOT_HELD_ONCE -473 /* 0x...fe27 */
 #define INJECT_FORK_COMMIT_ROOT_HELD_ONCE -472 /* 0x...fe28 */
 #define INJECT_FORK_ROOT_HOLD_CENSUS -471      /* 0x...fe29 */
+#define INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE -468   /* 0x...fe2c */
+#define INJECT_EDITOR_RELEASED_BEFORE_PARK_CENSUS -467 /* 0x...fe2d */
 #define SIGCHLD 17
 #define CLONE_CHILD_SETTID 0x01000000
 .global _start
@@ -112,8 +120,17 @@ _start:
     js errno_exit
     jz settid_child
     mov %rax, %r12
+#elif defined(ENTROPY_SETTLED_BEFORE_PARK)
+    /* Resident here before fork, so the child's write is a COW edit. */
+    movq $0x12345678, entropy_buffer(%rip)
+    mov $57, %eax
+    syscall
+    test %rax, %rax
+    js errno_exit
+    jz entropy_child
+    mov %rax, %r12
 #else
-#error "FORK_EDITOR, FORK_CENSUS_ROOT, FORK_COMMIT_ROOT, WAITID_BUSY or SETTID_BUSY"
+#error "FORK_EDITOR, FORK_CENSUS_ROOT, FORK_COMMIT_ROOT, WAITID_BUSY, SETTID_BUSY or ENTROPY_SETTLED_BEFORE_PARK"
 #endif
     /* wait4(child, &status, 0, NULL) */
     mov %r12, %rdi
@@ -154,6 +171,12 @@ _start:
     syscall
     cmp $1, %rax
     jne fail_census
+#elif defined(ENTROPY_SETTLED_BEFORE_PARK)
+    /* The child exited 7; its random bytes went to its own copy. */
+    cmp $7, %edi
+    jne exit
+    cmpq $0x12345678, entropy_buffer(%rip)
+    jne fail_output
 #endif
     jmp exit
 #endif
@@ -167,6 +190,27 @@ sleep_child:
     mov $35, %eax
     syscall
     mov $95, %edi
+    jmp exit
+entropy_child:
+    mov $INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_inject
+    /* getrandom(entropy_buffer, 8, 0) */
+    lea entropy_buffer(%rip), %rdi
+    mov $8, %esi
+    xor %edx, %edx
+    mov $318, %eax
+    syscall
+    test %rax, %rax
+    js errno_exit
+    cmp $8, %rax
+    jne fail_output
+    mov $INJECT_EDITOR_RELEASED_BEFORE_PARK_CENSUS, %rax
+    syscall
+    cmp $1, %rax
+    jne fail_census
+    mov $7, %edi
     jmp exit
 settid_child:
     mov $186, %eax
@@ -213,3 +257,8 @@ ctid:
 .balign 64
 info:
     .skip 128
+
+.data
+.balign 4096
+entropy_buffer:
+    .quad 0

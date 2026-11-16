@@ -135,6 +135,45 @@ mod test_support {
     static SCAN_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     /// The held slot, plus one (0: none).
     static SCAN_HOLD_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    /// The calling member's next user-memory preparation finds its space
+    /// editor held, and the holder releases it before the member enrolls on
+    /// the owner wait (#2416): the wait settles before its park.
+    pub const INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE: u64 = 0xffff_ffff_ffff_fe2c;
+    /// Owner waits the armed hold refused and released before their park.
+    pub const INJECT_EDITOR_RELEASED_BEFORE_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe2d;
+    /// Address of the armed member's current task, or 0.
+    static EARLY_RELEASE_TASK: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    static EARLY_RELEASES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Called before a native member's user-memory access: hold the editor
+    /// for exactly the armed member's next acquisition. True when held.
+    pub fn hold_editor_for_early_release(task: &carrick_el1_abi::CurrentTask) -> bool {
+        let address = task as *const carrick_el1_abi::CurrentTask as u64;
+        EARLY_RELEASE_TASK
+            .compare_exchange(address, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && (carrick_sched_core::spaces::inject_editor_busy_once()
+                || carrick_x86_carrier::entry::fatal_boot())
+    }
+
+    /// The held access returned. If it was refused with an owner wait, the
+    /// holder releases now, before the member enrolls; a hold the access
+    /// never met fails the run instead of passing vacuously.
+    pub fn release_editor_before_park(
+        held: bool,
+        waited: bool,
+        source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+        task: &'static carrick_el1_abi::CurrentTask,
+    ) {
+        if !held {
+            return;
+        }
+        if !waited || !crate::anonymous::release_injected_editor_now(source, task) {
+            carrick_x86_carrier::entry::fatal_boot();
+        }
+        EARLY_RELEASES.fetch_add(1, Ordering::AcqRel);
+    }
 
     /// Called at the top of each pass of the idle scheduler on `slot`,
     /// before it looks for work.
@@ -565,6 +604,13 @@ mod test_support {
                 Some(u64::from(SCAN_HOLD.load(Ordering::Acquire) >= SCAN_HELD))
             }
             INJECT_CURRENT_CPU => Some(u64::from(binding.cpu_slot)),
+            INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE => EARLY_RELEASE_TASK
+                .compare_exchange(0, binding.task_address, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                .then_some(0),
+            INJECT_EDITOR_RELEASED_BEFORE_PARK_CENSUS => {
+                Some(EARLY_RELEASES.load(Ordering::Acquire))
+            }
             INJECT_COW_SETTLE_TIMED_OUT => {
                 Some(u64::from(COW_SETTLE_TIMED_OUT.load(Ordering::Acquire)))
             }
