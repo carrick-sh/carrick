@@ -104,3 +104,36 @@ These count MRS/MSR instructions, not backend-initialized register state.
 | `S3_3_C4_C2_1 (DAIF)` | 12 |
 | `S3_3_C4_C4_0 (FPCR)` | 2 |
 | `S3_3_C4_C4_1 (FPSR)` | 2 |
+
+## Rebase measurement: most frequent unknown encodings
+
+The rebuilt production image has **1,373 unknown words** across
+310 distinct encodings. The table records the twenty most frequent words,
+sorted by count and then encoding, with the first encountered address as an
+example. It is informational; no test compares it with a fresh measurement.
+Regenerate with the command above. The class and register tables above retain
+the original baseline measurement. Diagnostic causes do not validate operands
+or promote an Unknown word to a recognized instruction.
+
+| Hex word | Diagnostic cause | Count | Example address |
+|---|---|---:|---|
+| `0xd5033f5f` | clrex | 529 | `0x2d040018e0` |
+| `0x9ac82428` | variable shifts | 65 | `0x2d04000cf8` |
+| `0xd4200020` | brk | 62 | `0x2d0402d350` |
+| `0xdac01108` | CLZ | 53 | `0x2d04004c78` |
+| `0x9ac82129` | variable shifts | 51 | `0x2d0400766c` |
+| `0x9ac82128` | variable shifts | 21 | `0x2d0401a83c` |
+| `0xdac01129` | CLZ | 16 | `0x2d04008dd0` |
+| `0x1ac92109` | variable shifts | 14 | `0x2d0402b1bc` |
+| `0x9ac9254a` | variable shifts | 13 | `0x2d0400a1d4` |
+| `0xdac0114a` | CLZ | 13 | `0x2d04040dec` |
+| `0x9ac92149` | variable shifts | 12 | `0x2d0400748c` |
+| `0xdac002c8` | RBIT | 12 | `0x2d04094af0` |
+| `0x1ac82128` | variable shifts | 11 | `0x2d04072698` |
+| `0xdac00268` | RBIT | 10 | `0x2d04004f18` |
+| `0x9ac82528` | variable shifts | 9 | `0x2d04020ac4` |
+| `0xdac00308` | RBIT | 9 | `0x2d040853d4` |
+| `0x1ac92508` | variable shifts | 8 | `0x2d0404b34c` |
+| `0x9acd21cd` | variable shifts | 8 | `0x2d04129e58` |
+| `0x1ac82528` | variable shifts | 7 | `0x2d0402bc9c` |
+| `0x9ada2108` | variable shifts | 7 | `0x2d0408f290` |
