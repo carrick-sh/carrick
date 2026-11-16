@@ -273,9 +273,14 @@ pub fn transfer_with_io<U: UserCopy>(
             let Some((end, _)) = op.kind.stream_end() else {
                 return Err(IpcError::Corrupt);
             };
-            // After this end's SHUT_WR, a write is EPIPE (and SIGPIPE).
-            if guard.stream_lane(end)?.references(pipe::End::Writer) == 0 {
+            // After this end's SHUT_WR, or once the peer closed or shut its
+            // reads, a write is EPIPE (and SIGPIPE), a zero-length one too
+            // (send(2)); otherwise a zero-length write is complete at once.
+            let lane = guard.stream_lane(end)?;
+            if lane.references(pipe::End::Writer) == 0 || lane.references(pipe::End::Reader) == 0 {
                 StepStatus::Broken
+            } else if op.progress.is_complete() {
+                StepStatus::Complete
             } else {
                 guard.ensure_stream_storage(end)?;
                 let mut p = guard.stream_lane(end)?;
