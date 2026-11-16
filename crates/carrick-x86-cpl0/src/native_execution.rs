@@ -268,7 +268,9 @@ fn settle_current_work(current: &carrick_el1_abi::CurrentTask) {
 /// Consume the shared timer claim; hardware only supplies a counter interrupt.
 /// A thread running on `slot` keeps its slice deadline armed alongside.
 pub fn expire_signal_timer(slot: SlotId) {
-    expire_timers(slot, running_on(slot));
+    if native_process::is_admitted() {
+        expire_timers(slot, running_on(slot));
+    }
 }
 
 /// Whether a thread runs on `slot` (not its idle loop, which publishes
