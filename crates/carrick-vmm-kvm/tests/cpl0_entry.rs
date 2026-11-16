@@ -4239,3 +4239,20 @@ fn production_child_getrandom_owner_wait_settled_before_park_restarts_syscall() 
         "getrandom owner wait settled before its park",
     );
 }
+
+/// #2242: the leader's fork holds its process's birth reservation
+/// (`reserve_birth`, held by the fixture image at MM preparation) while the
+/// worker thread on the other CPU forks too, as Go's concurrent `fork/exec`
+/// does. Contention is "not now": the worker parks on the reservation's
+/// release and reruns its fork, never failing with -EAGAIN (111). The
+/// worker's park releases the held fork; on a failed fork the worker
+/// releases it.
+#[test]
+fn production_fork_waits_while_sibling_fork_holds_birth_reservation() {
+    bounded_contention_witness(
+        "production_fork_waits_while_sibling_fork_holds_birth_reservation",
+        "native_fork_birth_contention.S",
+        &[],
+        "worker fork under a held birth reservation",
+    );
+}
