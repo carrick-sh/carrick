@@ -2112,6 +2112,36 @@ pub fn complete(
     SyscallResult::new(reply.result)
 }
 
+/// Whether a served record's EPIPE owes its caller SIGPIPE (Linux's
+/// `write(2)` to a pipe or socket, and `send` without `MSG_NOSIGNAL`). The
+/// carrier serves with the signal suppressed; the ring, which owns the
+/// caller's signals, raises it.
+pub fn sigpipe_on_epipe(record: &[u8]) -> bool {
+    let Some(input) = host_file::replied_input(record) else {
+        return false;
+    };
+    let Some(reply) = host_file::reply(record) else {
+        return false;
+    };
+    if reply.result != carrick_syscall_abi::LINUX_EPIPE.guest_retval() {
+        return false;
+    }
+    let op = record
+        .get(6..8)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+    if op == Some(HostFileOp::Write as u16) {
+        return true;
+    }
+    op == Some(HostFileOp::NetSyscall as u16)
+        && host_file::NetCall::decode(input).is_some_and(|call| {
+            call.canonical == crate::crossing::nr::SENDTO.raw()
+                && call.args[3] & LINUX_MSG_NOSIGNAL == 0
+        })
+}
+
+/// Linux `MSG_NOSIGNAL`.
+const LINUX_MSG_NOSIGNAL: u64 = 0x4000;
+
 /// Stamp a staged `Write` record with its writer's own `RLIMIT_FSIZE` soft
 /// limit (`args[0]` for Write, `args[1]` for Truncate/Ftruncate,
 /// `u64::MAX` unlimited), which only the caller's ring owns. The carrier

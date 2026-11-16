@@ -2664,7 +2664,6 @@ pub const LINUX_EISCONN: LinuxErrno = LinuxErrno::new(106);
 pub const LINUX_ENOMEM: LinuxErrno = LinuxErrno::new(12);
 pub const LINUX_EACCES: LinuxErrno = LinuxErrno::new(13);
 pub const LINUX_EEXIST: LinuxErrno = LinuxErrno::new(17);
-pub const LINUX_EPIPE: LinuxErrno = LinuxErrno::new(32);
 pub const LINUX_ESPIPE: LinuxErrno = LinuxErrno::new(29);
 pub const LINUX_EROFS: LinuxErrno = LinuxErrno::new(30);
 pub const LINUX_ENOTSUP: LinuxErrno = LinuxErrno::new(95);

@@ -117,6 +117,17 @@ impl PortalOwnerWait {
             revision,
         }
     }
+    /// A member's wait on its own host-readiness queue (#231). `revision`
+    /// is that queue's epoch, sampled by the carrier before the probe that
+    /// found the member's host object not ready; no MM resource state backs
+    /// it, and the ring parks only the receiving member on its own queue.
+    pub const fn host_readiness(handle: El1MmHandle, revision: u64) -> Self {
+        Self {
+            handle,
+            cause: PortalWaitCause::HostReadiness,
+            revision,
+        }
+    }
     pub const fn handle(self) -> El1MmHandle {
         self.handle
     }
