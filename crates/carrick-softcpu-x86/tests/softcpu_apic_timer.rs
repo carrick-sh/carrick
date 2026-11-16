@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use carrick_softcpu_x86::{
-    ApicCluster, Cpl0CpuidView, DescriptorTablePtr, ExtentRecord, ExtentTable, FrameGpa,
+    ApicCluster, DescriptorTablePtr, ExtentRecord, ExtentTable, FrameGpa, GuestCpuidView,
     LAPIC_DEFAULT_PHYS_BASE, LAPIC_DFR_OFFSET, LAPIC_ESR_ILLEGAL_REG_ADDRESS, LAPIC_ESR_OFFSET,
     LAPIC_ESR_RECEIVE_ILLEGAL_VECTOR, LAPIC_ESR_SEND_ILLEGAL_VECTOR, LAPIC_ICR_DELIVERY_FIXED,
     LAPIC_ICR_DEST_MODE_LOGICAL, LAPIC_ICR_HIGH_OFFSET, LAPIC_ICR_LEVEL_ASSERT,
@@ -258,7 +258,11 @@ fn setup_apic_machine(
     let gdt_bytes: Vec<u8> = gdt.iter().flat_map(|w| w.to_le_bytes()).collect();
     mem.write_gpa(data_frame.raw(), &gdt_bytes);
 
-    let cpuid = Box::new(Cpl0CpuidView::with_tsc_deadline(apic_id, 1_000_000_000));
+    let cpuid = Box::new(
+        GuestCpuidView::default()
+            .with_apic_id(apic_id)
+            .with_tsc(carrick_x86::TscCrystalRatio::from_hz(1_000_000_000u64)),
+    );
     let mut machine = SoftMachine::new(mem, cpuid).expect("SoftMachine::new");
     let ctx = machine.context_mut();
     ctx.cr3 = PML4_GPA;
@@ -627,7 +631,9 @@ fn tsc_deadline_and_initial_count_timers_with_injectable_clock_and_bounded_hlt()
             &(LAPIC_LVT_TIMER_MODE_TSC_DEADLINE | LAPIC_LVT_MASKED | 0xef).to_le_bytes(),
         );
         let caps = carrick_softcpu_x86::MsrCapabilities::from_cpuid(
-            &Cpl0CpuidView::with_tsc_deadline(0, 1_000_000_000),
+            &GuestCpuidView::default()
+                .with_apic_id(0)
+                .with_tsc(carrick_x86::TscCrystalRatio::from_hz(1_000_000_000u64)),
         );
         ctx.write_msr(MSR_IA32_TSC_DEADLINE, 4_000, caps).unwrap();
         assert_eq!(ctx.msrs().read(MSR_IA32_TSC_DEADLINE, caps).unwrap(), 4_000);
@@ -871,10 +877,11 @@ fn hlt_deadline_wait_uses_clock_domain_after_guest_tsc_write() {
         LAPIC_LVT_TIMER_OFFSET,
         &(LAPIC_LVT_TIMER_MODE_TSC_DEADLINE | 0xef).to_le_bytes(),
     );
-    let caps = carrick_softcpu_x86::MsrCapabilities::from_cpuid(&Cpl0CpuidView::with_tsc_deadline(
-        0,
-        1_000_000_000,
-    ));
+    let caps = carrick_softcpu_x86::MsrCapabilities::from_cpuid(
+        &GuestCpuidView::default()
+            .with_apic_id(0)
+            .with_tsc(carrick_x86::TscCrystalRatio::from_hz(1_000_000_000)),
+    );
     ctx.write_msr(MSR_IA32_TSC, 5_000, caps).unwrap();
     ctx.write_msr(MSR_IA32_TSC_DEADLINE, 6_000, caps).unwrap();
     assert!(matches!(
@@ -1048,10 +1055,11 @@ fn deadline_written_at_reset_is_ignored() {
     let (mut cpu, mut mem) = machine.into_parts();
     cpu.step_block(&mut mem).unwrap();
     let ctx = cpu.context_mut();
-    let caps = carrick_softcpu_x86::MsrCapabilities::from_cpuid(&Cpl0CpuidView::with_tsc_deadline(
-        0,
-        1_000_000_000,
-    ));
+    let caps = carrick_softcpu_x86::MsrCapabilities::from_cpuid(
+        &GuestCpuidView::default()
+            .with_apic_id(0)
+            .with_tsc(carrick_x86::TscCrystalRatio::from_hz(1_000_000_000)),
+    );
     assert_eq!(ctx.msrs().read(MSR_IA32_TSC_DEADLINE, caps).unwrap(), 0);
     ctx.lapic_mmio_write(LAPIC_SVR_OFFSET, &0x1ffu32.to_le_bytes());
     ctx.lapic_mmio_write(
