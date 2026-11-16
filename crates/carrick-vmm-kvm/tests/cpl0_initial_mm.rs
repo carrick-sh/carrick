@@ -1135,7 +1135,8 @@ fn run_until_wait_enrolled(
         stopped.store(true, std::sync::atomic::Ordering::Release);
         assert!(
             watcher.join().expect("bounded enrollment watcher"),
-            "wait must enroll before retirement completes"
+            "wait must enroll, and its CPU idle, before retirement completes: exit {exit:?}\n{}",
+            factory.capture_physical_state().zone_census
         );
         assert_eq!(exit, CarrierRunExit::Kick);
     });
@@ -1196,9 +1197,11 @@ fn native_kill_wake_to_a_busy_home_queues_the_parent_at_home() {
     let task = root.binding().task();
     parent.cpu_mut().load(root).expect("load root");
     run_to_marker(&mut parent, task, 1, &factory);
+    // Pinned, not only placed: CPU 0 idles once the parent parks and would
+    // steal a sender it may run, sending the kill from the parent's home.
     factory
-        .fixture_place_native_thread(child_tid, carrick_guest_arch::CpuId::new(1))
-        .expect("place sender on peer");
+        .fixture_pin_native_thread(child_tid, carrick_guest_arch::CpuId::new(1))
+        .expect("sender on peer");
     run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
     let (claim, _, wakes_before) = factory
         .fixture_native_wait_state(root_tid)
@@ -1619,9 +1622,11 @@ fn native_runtime_exit_wake(hold_home: bool) {
     // This marker follows actual wait4(WNOHANG)==0 and a successful fork.
     // Retirement is still held at its stopped physical crossing.
     run_to_marker(&mut parent, task, 2, &factory);
+    // Pinned, not only placed: CPU 0 idles once the parent parks and would
+    // steal the sibling and run it to its own exit.
     factory
-        .fixture_place_native_thread(newborn_tid, carrick_guest_arch::CpuId::new(1))
-        .expect("place sibling on peer");
+        .fixture_pin_native_thread(newborn_tid, carrick_guest_arch::CpuId::new(1))
+        .expect("sibling on peer");
     assert!(
         factory
             .fork_admission_refusal()
@@ -2054,8 +2059,10 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
         [2],
         "marker reached its destination once"
     );
+    // Pinned, not only placed: CPU 1 idles once the child parks and would
+    // steal the grandchild back from the stopped root executor.
     factory
-        .fixture_place_native_thread(newborn_tid, carrick_guest_arch::CpuId::new(0))
+        .fixture_pin_native_thread(newborn_tid, carrick_guest_arch::CpuId::new(0))
         .expect("migrate peer-born child to root executor");
     run_until_wait_enrolled(&mut peer, task, &factory, child_tid, true);
     // The newborn is queued on CPU 0; its parent enrolled wait4 on CPU 1.
