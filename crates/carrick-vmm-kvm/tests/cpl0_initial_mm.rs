@@ -1078,23 +1078,18 @@ fn run_to_marker(
     panic!("marker exit budget");
 }
 
+/// Run `cpu` until `tid` parks in its wait and `cpu` idles with nothing it
+/// may run, then kick it there. Both conditions are the boundary: an idle
+/// CPU steals any queued thread its affinity allows from a stopped peer
+/// (`ZoneTables::steal`), so a fixture thread only placed, not pinned, on
+/// the other CPU runs here instead, and that CPU never idles. Kicking on the
+/// park alone raced that steal: the verdict then followed host scheduling.
 fn run_until_wait_enrolled(
     cpu: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
     task: carrick_guest_arch::TaskIdentity,
     factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
     tid: carrick_el1_abi::El1TaskId,
     peer: bool,
-) {
-    run_until_wait_enrolled_with_boundary(cpu, task, factory, tid, peer, false);
-}
-
-fn run_until_wait_enrolled_with_boundary(
-    cpu: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
-    task: carrick_guest_arch::TaskIdentity,
-    factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
-    tid: carrick_el1_abi::El1TaskId,
-    peer: bool,
-    idle_boundary: bool,
 ) {
     use carrick_hal::VcpuKick;
     use carrick_sched_core::Claim;
@@ -1110,12 +1105,9 @@ fn run_until_wait_enrolled_with_boundary(
                     .expect("native enrollment")
                     .0;
                 if matches!(claim, Claim::Parked { .. })
-                    && (!idle_boundary
-                        || factory
-                            .fixture_native_cpu_idle(carrick_guest_arch::CpuId::new(u32::from(
-                                peer,
-                            )))
-                            .expect("idle enrollment boundary"))
+                    && factory
+                        .fixture_native_cpu_idle(carrick_guest_arch::CpuId::new(u32::from(peer)))
+                        .expect("idle enrollment boundary")
                 {
                     kick.kick();
                     return true;
@@ -1133,7 +1125,12 @@ fn run_until_wait_enrolled_with_boundary(
             cpu.fixture_run_idle_peer().expect("enroll peer wait")
         } else {
             cpu.fixture_run_until_native_kick(task)
-                .expect("enroll actual wait")
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "enroll actual wait: {error:?}\n{}",
+                        factory.capture_physical_state().zone_census
+                    )
+                })
         };
         stopped.store(true, std::sync::atomic::Ordering::Release);
         assert!(
@@ -1315,7 +1312,7 @@ fn native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there() {
     factory
         .fixture_pin_native_thread(child_tid, cpu0)
         .expect("pin the waiter to CPU 0");
-    run_until_wait_enrolled_with_boundary(&mut parent, task, &factory, child_tid, false, true);
+    run_until_wait_enrolled(&mut parent, task, &factory, child_tid, false);
     assert!(matches!(
         factory
             .fixture_native_wait_state(child_tid)
@@ -1873,7 +1870,7 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
             .expect("fork evidence")
             .is_none()
     );
-    run_until_wait_enrolled_with_boundary(&mut parent, task, &factory, root_tid, false, true);
+    run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
     let (claim, _, wakes) = factory
         .fixture_native_wait_state(root_tid)
         .expect("first wait");
@@ -1899,7 +1896,7 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
     assert_eq!(wakes, 1);
     // A wake for the first child is insufficient: wait(-1) must enroll again
     // instead of returning ECHILD while the second child's MM is still charged.
-    run_until_wait_enrolled_with_boundary(&mut parent, task, &factory, root_tid, false, true);
+    run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
     let (claim, _, wakes) = factory
         .fixture_native_wait_state(root_tid)
         .expect("remaining child");
