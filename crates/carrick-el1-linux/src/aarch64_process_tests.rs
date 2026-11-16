@@ -19796,6 +19796,83 @@ fn arm_root_socketpair_nonblock_and_shutdown() {
     expect.assert_empty("a ring stream pair's flags and shutdown left Linux's contract");
 }
 
+/// #2361 on #2401's ring-wide FIOCLEX/FIONCLEX: a ring stream end is a ring
+/// description like any other, so `ioctl(FIOCLEX)` and `ioctl(FIONCLEX)` set
+/// and clear its descriptor's close-on-exec flag in ring (the one writer,
+/// `set_owned_cloexec`), and leave the peer end's flag alone.
+#[test]
+fn arm_root_socketpair_end_fioclex_sets_and_clears_cloexec() {
+    use ArmCaller::Root;
+    use carrick_abi::{
+        LINUX_AF_UNIX, LINUX_F_GETFD, LINUX_FD_CLOEXEC, LINUX_FIOCLEX, LINUX_FIONCLEX,
+        LINUX_SOCK_STREAM,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (expect, _) = with_arm_process_host_dispatch(|call| {
+        let expect = ArmExpect::new();
+        let sockets = GuestUserBuffer::zeroed(8);
+        expect.served(
+            "socketpair without SOCK_CLOEXEC",
+            call(
+                Root,
+                sys::SOCKETPAIR.raw(),
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64,
+                    0,
+                    sockets.arg(),
+                    0,
+                    0,
+                ],
+            ),
+            0,
+        );
+        let [first, second] = fd_pair_of(&sockets);
+        let (ioctl, fcntl) = (sys::IOCTL.raw(), sys::FCNTL.raw());
+        expect.served(
+            "F_GETFD before FIOCLEX",
+            call(Root, fcntl, [first, LINUX_F_GETFD, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "FIOCLEX",
+            call(Root, ioctl, [first, LINUX_FIOCLEX, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "F_GETFD after FIOCLEX",
+            call(Root, fcntl, [first, LINUX_F_GETFD, 0, 0, 0, 0]),
+            LINUX_FD_CLOEXEC as i64,
+        );
+        expect.served(
+            "the peer end's F_GETFD",
+            call(Root, fcntl, [second, LINUX_F_GETFD, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "FIONCLEX",
+            call(Root, ioctl, [first, LINUX_FIONCLEX, 0, 0, 0, 0]),
+            0,
+        );
+        expect.served(
+            "F_GETFD after FIONCLEX",
+            call(Root, fcntl, [first, LINUX_F_GETFD, 0, 0, 0, 0]),
+            0,
+        );
+        for fd in [first, second] {
+            expect.served(
+                "close",
+                call(Root, sys::CLOSE.raw(), [fd, 0, 0, 0, 0, 0]),
+                0,
+            );
+        }
+        expect
+    });
+    expect.assert_empty("FIOCLEX/FIONCLEX on a ring stream end left Linux's contract");
+}
+
 /// #2361: libuv's spawn loop on a ring stream pair: both ends ADD to the
 /// root's ring epoll as pure ring members (no host adoption; a second ADD
 /// is EEXIST, libuv's `uv__io_poll` assertion), report

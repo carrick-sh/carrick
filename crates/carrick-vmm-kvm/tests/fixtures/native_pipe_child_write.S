@@ -3,7 +3,9 @@
  * the child's status. Child exit 0 = the write returned 1; otherwise the
  * child exits with the negated errno its write returned (38 = ENOSYS).
  * 90 pipe2 failed, 91 fork/wait failed. With SOCKETPAIR (#2361) the pair
- * is socketpair(AF_UNIX, SOCK_STREAM, 0) instead: 90 is its failure. */
+ * is socketpair(AF_UNIX, SOCK_STREAM, 0) instead: 90 is its failure. With
+ * SOCKET_FIOCLEX too, the root first sets and clears fds[0]'s close-on-exec
+ * flag with ioctl(FIOCLEX/FIONCLEX), checking F_GETFD: 93 is its failure. */
 .global _start
 .text
 _start:
@@ -25,6 +27,32 @@ _start:
     syscall
     test %rax, %rax
     jnz fail_pipe
+#ifdef SOCKET_FIOCLEX
+    mov fds(%rip), %edi
+    mov $0x5451, %esi
+    mov $16, %eax                  /* ioctl(fds[0], FIOCLEX) */
+    syscall
+    test %rax, %rax
+    jnz fail_cloexec
+    mov fds(%rip), %edi
+    mov $1, %esi
+    mov $72, %eax                  /* fcntl(fds[0], F_GETFD) */
+    syscall
+    cmp $1, %rax                   /* FD_CLOEXEC */
+    jne fail_cloexec
+    mov fds(%rip), %edi
+    mov $0x5450, %esi
+    mov $16, %eax                  /* ioctl(fds[0], FIONCLEX) */
+    syscall
+    test %rax, %rax
+    jnz fail_cloexec
+    mov fds(%rip), %edi
+    mov $1, %esi
+    mov $72, %eax                  /* fcntl(fds[0], F_GETFD) */
+    syscall
+    test %rax, %rax
+    jnz fail_cloexec
+#endif
     mov $57, %eax                  /* fork */
     syscall
     test %eax, %eax
@@ -118,6 +146,9 @@ fail_read:
     jmp exit
 fail_pipe:
     mov $90, %edi
+    jmp exit
+fail_cloexec:
+    mov $93, %edi
     jmp exit
 fail_wait:
     mov $91, %edi
