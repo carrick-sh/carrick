@@ -4051,21 +4051,22 @@ fn production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation() {
     assert_eq!(outcome.run.terminating_signal, None);
 }
 
-/// #2306 on x86 CPL0: the interleaving four host CPU hogs produce in the
+/// #2306 on x86 CPL0: the interleavings four host CPU hogs produce in the
 /// witness above, made deterministic. The other CPU is woken from its idle
-/// sleep and its scan for work is held until this CPU's migration at the
-/// worker's switch-in has found no idle CPU, so the preempted leader (this
-/// CPU's home thread, which no other CPU may take) stays queued here behind
-/// the worker polling for the held fork. The worker's slice must end: the
-/// leader then runs, the worker migrates to the idle CPU, the leader forks,
-/// and the worker parks in wait4 and reaps the zombie. With no slice
-/// deadline nothing preempts the poller, and the bounded child times out.
+/// sleep and its scan for work held for 20 ms, so this CPU's migrations
+/// find no idle CPU. The preempted leader (this CPU's home thread, which no
+/// other CPU may take) waits here behind the worker polling for the held
+/// fork until the worker's slice ends; then the worker waits here behind
+/// the leader, whose held fork spins on this CPU, until the other CPU's
+/// idle scan takes it from this CPU's queue. Without the slice nothing
+/// preempts the poller; without the stealing scan the other CPU sleeps
+/// past the worker. Either way the bounded child times out.
 #[test]
 fn production_leader_queued_behind_a_polling_worker_runs_when_its_slice_ends() {
     bounded_contention_witness(
         "production_leader_queued_behind_a_polling_worker_runs_when_its_slice_ends",
         "native_wait_birth_contention.S",
-        &["-DPEER_SCANS_AFTER_MIGRATION=1"],
+        &["-DHOLD_PEER_SCAN=1"],
         "held fork with the leader queued behind its polling worker",
     );
 }

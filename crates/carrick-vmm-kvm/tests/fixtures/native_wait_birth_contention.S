@@ -8,11 +8,13 @@
  * Worker: poll INJECT_BIRTH_HELD; wait4(zombie) must reap it with
  * status 5 << 8 once the fork releases its reservation.
  *
- * With -DPEER_SCANS_AFTER_MIGRATION (#2306), the other CPU is woken and
- * its idle scan held until this CPU's migration at the worker's switch-in
- * has run: that migration finds no idle CPU, and the leader, this CPU's
- * home thread, stays queued here behind the polling worker until the
- * worker's slice ends.
+ * With -DHOLD_PEER_SCAN (#2306), the other CPU is woken and its idle scan
+ * held for 20 ms, as a loaded host deschedules its vCPU: the switch-in of
+ * the worker and the rotation when the worker's slice ends find no idle
+ * CPU. The leader, this CPU's home thread, waits here behind the polling
+ * worker until that slice ends; then the worker waits here behind the
+ * leader, whose held fork spins on this CPU, until the other CPU's idle
+ * scan takes it.
  *
  * Exit 7: the worker reaped the zombie. 100 + n: the worker's wait4 failed
  * with errno n (111 = EAGAIN); 150 + n and 200 + n: the first or the held
@@ -21,7 +23,7 @@
 #define INJECT_HOLD_NEXT_BIRTH    0xfffffffffffffe1f
 #define INJECT_BIRTH_HELD         0xfffffffffffffe20
 #define INJECT_RELEASE_HELD_BIRTH 0xfffffffffffffe21
-#define INJECT_PEER_SCANS_AFTER_MIGRATION 0xfffffffffffffe2a
+#define INJECT_HOLD_PEER_SCAN     0xfffffffffffffe2a
 #define INJECT_PEER_SCAN_HELD     0xfffffffffffffe2b
 #define POLL_LIMIT                0x10000000
 
@@ -78,8 +80,8 @@ _start:
     test %rax, %rax
     jnz fail_arm
 
-#ifdef PEER_SCANS_AFTER_MIGRATION
-    mov $INJECT_PEER_SCANS_AFTER_MIGRATION, %rax
+#ifdef HOLD_PEER_SCAN
+    mov $INJECT_HOLD_PEER_SCAN, %rax
     syscall
     test %rax, %rax
     jnz fail_arm

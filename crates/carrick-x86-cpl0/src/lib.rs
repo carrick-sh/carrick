@@ -118,19 +118,20 @@ mod test_support {
     pub const INJECT_FORK_COMMIT_ROOT_HELD_ONCE: u64 = 0xffff_ffff_ffff_fe28;
     /// Fork acquisitions refused by an injected root hold.
     pub const INJECT_FORK_ROOT_HOLD_CENSUS: u64 = 0xffff_ffff_ffff_fe29;
-    /// Wake the peer CPU and hold its next idle scan, before the scan,
-    /// until this CPU's next run-queue migration has run (#2306): the
-    /// interleaving a loaded host produces when the peer's vCPU thread is
-    /// descheduled between its wake and its next sleep.
-    pub const INJECT_PEER_SCANS_AFTER_MIGRATION: u64 = 0xffff_ffff_ffff_fe2a;
+    /// Wake the peer CPU and hold its next idle scan, before the scan, for
+    /// [`SCAN_HOLD_NS`] (#2306): the window a loaded host opens when the
+    /// peer's vCPU thread is descheduled between its wake and its next
+    /// sleep. Every migration and rotation this CPU runs meanwhile finds no
+    /// idle peer.
+    pub const INJECT_HOLD_PEER_SCAN: u64 = 0xffff_ffff_ffff_fe2a;
     /// 1 once the peer's idle scan is held (or released), else 0.
     pub const INJECT_PEER_SCAN_HELD: u64 = 0xffff_ffff_ffff_fe2b;
     const SCAN_ARMED: u8 = 1;
     const SCAN_HELD: u8 = 2;
     const SCAN_RELEASED: u8 = 3;
-    /// About seconds of spinning: a migration that never runs fails the
-    /// run instead of hanging it.
-    const SCAN_HOLD_SPINS: u64 = 1 << 32;
+    /// Ten slices: the poller's slice ends, and its rotation's migration
+    /// runs, while the peer is held.
+    const SCAN_HOLD_NS: u64 = 20_000_000;
     static SCAN_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     /// The held slot, plus one (0: none).
     static SCAN_HOLD_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -138,6 +139,7 @@ mod test_support {
     /// Called at the top of each pass of the idle scheduler on `slot`,
     /// before it looks for work.
     pub fn hold_idle_scan(slot: carrick_sched_core::SlotId) {
+        use carrick_guest_arch::InterruptBackend;
         if SCAN_HOLD_SLOT.load(Ordering::Acquire) != slot.raw() + 1
             || SCAN_HOLD
                 .compare_exchange(SCAN_ARMED, SCAN_HELD, Ordering::AcqRel, Ordering::Acquire)
@@ -145,27 +147,26 @@ mod test_support {
         {
             return;
         }
-        let mut spins = 0_u64;
-        while SCAN_HOLD.load(Ordering::Acquire) == SCAN_HELD {
-            spins += 1;
-            if spins > SCAN_HOLD_SPINS {
-                carrick_x86_carrier::entry::fatal_boot();
-            }
+        let mut backend = carrick_el1::isa::x86::X86Backend;
+        let now = |backend: &mut carrick_el1::isa::x86::X86Backend| {
+            backend
+                .counter()
+                .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot())
+                .raw()
+        };
+        let hz = backend
+            .frequency()
+            .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot())
+            .raw()
+            .get();
+        let ticks = u128::from(hz) * u128::from(SCAN_HOLD_NS) / 1_000_000_000;
+        let until = now(&mut backend).saturating_add(u64::try_from(ticks).unwrap_or(u64::MAX));
+        while now(&mut backend) < until {
             core::hint::spin_loop();
         }
+        SCAN_HOLD.store(SCAN_RELEASED, Ordering::Release);
     }
 
-    /// Called after `slot` migrated its run queue: a held peer scan goes on.
-    pub fn release_idle_scan(slot: carrick_sched_core::SlotId) {
-        if SCAN_HOLD_SLOT.load(Ordering::Acquire) != slot.raw() + 1 {
-            let _ = SCAN_HOLD.compare_exchange(
-                SCAN_HELD,
-                SCAN_RELEASED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
-    }
     /// A fork MM acquisition an injected root hold can refuse.
     #[derive(Clone, Copy)]
     pub enum ForkRootSite {
@@ -547,7 +548,7 @@ mod test_support {
                     .then_some(0)
             }
             INJECT_FORK_ROOT_HOLD_CENSUS => Some(FORK_ROOT_REFUSALS.load(Ordering::Acquire)),
-            INJECT_PEER_SCANS_AFTER_MIGRATION => {
+            INJECT_HOLD_PEER_SCAN => {
                 let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
                 if SCAN_HOLD
                     .compare_exchange(0, SCAN_ARMED, Ordering::AcqRel, Ordering::Acquire)
