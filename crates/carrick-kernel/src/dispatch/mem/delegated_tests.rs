@@ -9196,3 +9196,247 @@ mod private_file_owner {
         assert_eq!(memory.write_bytes_total.get(), 0);
     }
 }
+
+/// One memory syscall through the production host dispatcher, for `abi`.
+fn v8_abi_call(
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut CountingMmapMemory,
+    abi: carrick_abi::LinuxGuestAbi,
+    number: u64,
+    args: [u64; 6],
+) -> i64 {
+    match dispatcher
+        .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
+            SyscallRequest::new(number, SyscallArgs(args)).with_guest_abi(abi),
+            memory,
+            &CompatReporter::default(),
+        )
+        .expect("memory syscall dispatch")
+    {
+        DispatchOutcome::Returned { value } => value,
+        DispatchOutcome::Errno { errno } => errno.guest_retval(),
+        other => panic!("expected a syscall result, got {other:?}"),
+    }
+}
+
+/// V8's `CodeRange::InitReservation` (`kRecommitOnly`, mmap(2) and madvise(2)):
+/// reserve a `PROT_NONE | MAP_NORESERVE` range, make all of it RWX, then
+/// `MADV_DONTNEED` all of it. The discard is the owner's: an admitted MM's
+/// generic `zero_backing` is refused, so a backend without the sparse
+/// discard fast path (outside the arena, or KVM/x86) answered ENOMEM and V8
+/// aborted with "Failed to reserve virtual memory for CodeRange".
+#[test]
+fn delegated_v8_code_range_dontneed_retires_through_the_owner() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | carrick_abi::LINUX_MAP_NORESERVE;
+    let abi_call = v8_abi_call;
+    for abi in [
+        carrick_abi::LinuxGuestAbi::Aarch64,
+        carrick_abi::LinuxGuestAbi::X86_64,
+    ] {
+        // An arena placement, and a free hint outside the arena (V8 asks
+        // near its embedded builtins, below the PIE image).
+        for (hint, len) in [
+            (0, 128 * 1024 * 1024),
+            (0, 2 * GIB),
+            (0, 4 * GIB),
+            (0x70_0000_0000, 2 * GIB),
+            (0x70_0000_0000, 4 * GIB),
+        ] {
+            let case = format!("{abi:?} hint={hint:#x} len={len:#x}");
+            let mut dispatcher = SyscallDispatcher::new();
+            let root = Root::admit(&dispatcher);
+            let base = if hint == 0 { LINUX_MMAP_BASE } else { hint };
+            let mut memory = CountingMmapMemory::new(base, PAGE as usize);
+            memory.defer_anon = true;
+            memory.owner_refuses_zero_backing = true;
+            let mapped = abi_call(
+                &mut dispatcher,
+                &mut memory,
+                abi,
+                SYS_MMAP,
+                [hint, len, 0, flags, u64::MAX, 0],
+            );
+            assert_eq!(mapped, base as i64, "{case}: reserve-only mmap");
+            let mapped = mapped as u64;
+            assert_eq!(
+                abi_call(
+                    &mut dispatcher,
+                    &mut memory,
+                    abi,
+                    SYS_MPROTECT,
+                    [mapped, len, 7, 0, 0, 0]
+                ),
+                0,
+                "{case}: whole-range RWX"
+            );
+            memory.unmap_log.borrow_mut().clear();
+            assert_eq!(
+                abi_call(
+                    &mut dispatcher,
+                    &mut memory,
+                    abi,
+                    SYS_MADVISE,
+                    [mapped, len, carrick_abi::LINUX_MADV_DONTNEED, 0, 0, 0]
+                ),
+                0,
+                "{case}: MADV_DONTNEED of the committed reservation"
+            );
+            assert_eq!(memory.zero_backing_calls.get(), 0, "{case}: no scrub");
+            assert_eq!(
+                *memory.unmap_log.borrow(),
+                vec![(mapped, len as usize)],
+                "{case}: the owner retires the frames under its node"
+            );
+            // The node keeps its permission: the next touch is a fresh zero
+            // page from the owner, not a hole.
+            let mut rows = Vec::new();
+            root.lock()
+                .observe_range(
+                    ReservationRange::new(mapped, mapped + len).unwrap(),
+                    &mut |row| rows.push((row.range.start(), row.range.end(), row.protection)),
+                )
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![(
+                    mapped,
+                    mapped + len,
+                    ReservationProtection::READ_WRITE_EXECUTE
+                )],
+                "{case}"
+            );
+            assert!(root.lock().is_admitted(), "{case}");
+            // V8 then commits sub-ranges and trims its alignment slack.
+            assert_eq!(
+                abi_call(
+                    &mut dispatcher,
+                    &mut memory,
+                    abi,
+                    SYS_MPROTECT,
+                    [mapped + 16 * PAGE, 64 * PAGE, 3, 0, 0, 0]
+                ),
+                0,
+                "{case}: sub-range RW"
+            );
+            for (start, trim) in [(mapped, 16 * PAGE), (mapped + len - 16 * PAGE, 16 * PAGE)] {
+                assert_eq!(
+                    abi_call(
+                        &mut dispatcher,
+                        &mut memory,
+                        abi,
+                        SYS_MUNMAP,
+                        [start, trim, 0, 0, 0, 0]
+                    ),
+                    0,
+                    "{case}: trim {start:#x}"
+                );
+            }
+            let mut rows = Vec::new();
+            root.lock()
+                .observe_range(
+                    ReservationRange::new(mapped, mapped + len).unwrap(),
+                    &mut |row| rows.push((row.range.start(), row.range.end(), row.protection)),
+                )
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    (
+                        mapped + 16 * PAGE,
+                        mapped + 80 * PAGE,
+                        ReservationProtection::READ_WRITE
+                    ),
+                    (
+                        mapped + 80 * PAGE,
+                        mapped + len - 16 * PAGE,
+                        ReservationProtection::READ_WRITE_EXECUTE
+                    ),
+                ],
+                "{case}"
+            );
+        }
+    }
+}
+
+/// The same V8 discard when the backend's own sparse discard fast path
+/// (HVF, inside the arena) takes it before the owner path: the guest still
+/// reads a zero page on the next touch, with no scrub, no owner retirement,
+/// and the RWX node kept.
+#[test]
+fn delegated_v8_code_range_dontneed_fast_path_reads_zero_on_next_touch() {
+    let len = 64 * PAGE;
+    let flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | carrick_abi::LINUX_MAP_NORESERVE;
+    for abi in [
+        carrick_abi::LinuxGuestAbi::Aarch64,
+        carrick_abi::LinuxGuestAbi::X86_64,
+    ] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, len as usize);
+        memory.defer_anon = true;
+        memory.discard_anon = true;
+        memory.owner_refuses_zero_backing = true;
+        let mapped = v8_abi_call(
+            &mut dispatcher,
+            &mut memory,
+            abi,
+            SYS_MMAP,
+            [0, len, 0, flags, u64::MAX, 0],
+        );
+        assert_eq!(mapped, LINUX_MMAP_BASE as i64, "{abi:?}: reserve-only mmap");
+        let mapped = mapped as u64;
+        assert_eq!(
+            v8_abi_call(
+                &mut dispatcher,
+                &mut memory,
+                abi,
+                SYS_MPROTECT,
+                [mapped, len, 7, 0, 0, 0]
+            ),
+            0,
+            "{abi:?}: whole-range RWX"
+        );
+        // The guest's earlier writes into the committed range.
+        memory.bytes.fill(0xa5);
+        memory.unmap_log.borrow_mut().clear();
+        assert_eq!(
+            v8_abi_call(
+                &mut dispatcher,
+                &mut memory,
+                abi,
+                SYS_MADVISE,
+                [mapped, len, carrick_abi::LINUX_MADV_DONTNEED, 0, 0, 0]
+            ),
+            0,
+            "{abi:?}: MADV_DONTNEED on the fast path"
+        );
+        assert!(
+            memory.bytes.iter().all(|&byte| byte == 0),
+            "{abi:?}: the next touch reads a zero page"
+        );
+        assert_eq!(memory.zero_backing_calls.get(), 0, "{abi:?}: no scrub");
+        assert!(
+            memory.unmap_log.borrow().is_empty(),
+            "{abi:?}: the fast path took the discard, not the owner"
+        );
+        let mut rows = Vec::new();
+        root.lock()
+            .observe_range(
+                ReservationRange::new(mapped, mapped + len).unwrap(),
+                &mut |row| rows.push((row.range.start(), row.range.end(), row.protection)),
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                mapped,
+                mapped + len,
+                ReservationProtection::READ_WRITE_EXECUTE
+            )],
+            "{abi:?}: the node keeps its permission"
+        );
+        assert!(root.lock().is_admitted(), "{abi:?}");
+    }
+}
