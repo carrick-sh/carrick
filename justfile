@@ -1050,7 +1050,7 @@ check-layering:
 # excludes its entire harness, then run the deterministic replay controls.
 test-vmfree-schedule:
     ./scripts/closure-assert-vmfree-schedule.sh
-    {{_admit}} {{_cargo}} test -p carrick-kernel-example --test schedule_replay
+    {{_admit}} {{_cargo}} test -p carrick-kernel-example --test main schedule_replay::
 
 # VMM-less compile of the Carrick kernel: the public crate must build for a
 # target that has no Hypervisor.framework at all

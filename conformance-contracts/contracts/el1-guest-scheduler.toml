@@ -15,7 +15,7 @@
 # #898 diagnostic-only: entry_binding fatals now retain their invariant
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:
-# carrick-kernel-example::scheduler_handoff::self_affinity_change_requires_migration_before_return
+# carrick-kernel-example::main::scheduler_handoff::self_affinity_change_requires_migration_before_return
 schema_version = 1
 id = "kernel.el1.guest-scheduler"
 title = "Guest threads are scheduled across vCPUs inside the guest: blocking handoffs, timed futex waits, preemption and idle need no host exit, and the host still reaches every thread parked on an idle vCPU"
@@ -55,7 +55,7 @@ vm_free = [
   "carrick-el1-linux::sched::tests (a_wait_with_nothing_runnable_idles_until_host_work, an_idle_vcpu_parks_in_wfi_after_its_spin, a_timed_wait_ends_in_guest_with_etimedout, switched_in_timed_wait_uses_its_own_timer_lease, a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to, the_virtual_timer_preempts_a_compute_loop, a_kick_taken_at_el0_forwards)",
   "carrick-el1-linux::sched::tests::{cancelled_on_cpu_thread_is_not_stranded_by_repark,signal_requested_on_cpu_is_not_lost_by_repark}",
   "carrick-hal::aarch64_arch::tests::aarch64_sigframe_shows_the_guest_its_historical_daif",
-  "carrick-kernel-example::scheduler_handoff::self_affinity_change_requires_migration_before_return",
+  "carrick-kernel-example::main::scheduler_handoff::self_affinity_change_requires_migration_before_return",
   "carrick-kernel::el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record (test-only observation extension: source-hashed retired-delivery publication count at 1/8/32, enforced by kernel.el1.deferred-handback-identity; no new guest scheduling, live-path cost or signed acceptance)",
   "carrick-kernel::el1_zone::tests::{deferred_slot_handback_does_not_wake_a_reused_record,deferred_slot_handback_preserves_live_records} (deferred incarnation preservation only; signed historical-failure attribution remains open)",
   "carrick-kernel::kernel::scheduler::tests::{a_deferred_zone_handback_does_not_audit_a_reaped_target,zone_handback_authenticates_the_registered_continuation} (exact deferred wake target, reaped-task no-op and matching continuation delivery; VM-free only)",

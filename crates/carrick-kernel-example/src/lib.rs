@@ -25,7 +25,7 @@
 //! NO features -- the backend above is its own, over the kernel's ordinary
 //! public surface, which is what a real backend author gets -- and needs
 //! `carrick-hal`'s `test-support` only for the two Null bridges.
-//! `tests/fork_pipe_wait.rs`
+//! `tests/main/fork_pipe_wait.rs`
 //! is the proof: `pipe2 -> fork -> (child: write, exit 7) -> read -> wait4 ->
 //! exit` through `SyscallDispatcher`, and it fails to compile the moment one
 //! of those items regresses to `pub(crate)`.

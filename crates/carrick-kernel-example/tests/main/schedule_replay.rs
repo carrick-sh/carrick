@@ -487,8 +487,8 @@ fn expect_regression_rejection(
 #[test]
 fn historical_fd_pin_receipts_keep_their_exact_generation_and_bad_result() {
     for json in [
-        include_str!("fixtures/fdpin-seed5.json"),
-        include_str!("fixtures/fdpin-seed5-main-prefx.json"),
+        include_str!("../fixtures/fdpin-seed5.json"),
+        include_str!("../fixtures/fdpin-seed5-main-prefx.json"),
     ] {
         let retained: ScheduleReceipt = serde_json::from_str(json).unwrap();
         assert_eq!(retained.seed, 5);

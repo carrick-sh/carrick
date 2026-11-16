@@ -59,3 +59,2195 @@ test = "carrick_el1_linux::aarch64_process_tests::arm_raw_exit_decline_after_mem
 reason = "#2359: a refused clear-tid copy-out on raw exit is now \"not now\" (the exit restores membership and reruns in ring through the owner-input wait) instead of declining to HostCustody, so the decline witness was renamed for the refused-copy contract it now asserts (8787221ef)."
 replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_raw_exit_refused_copy_after_membership_reservation_restores_live"
 pr = 2367
+
+# #2408 Slice 1: carrick-kernel-example integration tests consolidated into `main`.
+
+[[retired]]
+test = "admission_interleavings::admitted_credential_wait_releases_permit_without_redispatch"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::admission_interleavings::admitted_credential_wait_releases_permit_without_redispatch"
+pr = 2408
+
+[[retired]]
+test = "admission_interleavings::check_enroll_wake_interleaving_preserves_epoch"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::admission_interleavings::check_enroll_wake_interleaving_preserves_epoch"
+pr = 2408
+
+[[retired]]
+test = "admission_interleavings::claim_reuse_removes_queue_entries_and_stale_completions"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::admission_interleavings::claim_reuse_removes_queue_entries_and_stale_completions"
+pr = 2408
+
+[[retired]]
+test = "admission_interleavings::exec_publication_retires_late_ledger_entry"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::admission_interleavings::exec_publication_retires_late_ledger_entry"
+pr = 2408
+
+[[retired]]
+test = "admission_interleavings::operation_receipt_rejects_authority_and_scale_drift"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::admission_interleavings::operation_receipt_rejects_authority_and_scale_drift"
+pr = 2408
+
+[[retired]]
+test = "admission_interleavings::retained_setid_birth_seed0_replays_fixed_and_preserves_historical_drift"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::admission_interleavings::retained_setid_birth_seed0_replays_fixed_and_preserves_historical_drift"
+pr = 2408
+
+[[retired]]
+test = "admission_interleavings::setresuid_during_sibling_birth_completes_once"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::admission_interleavings::setresuid_during_sibling_birth_completes_once"
+pr = 2408
+
+[[retired]]
+test = "admission_interleavings::thread_publication_receipt_names_creator_and_child_once"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::admission_interleavings::thread_publication_receipt_names_creator_and_child_once"
+pr = 2408
+
+[[retired]]
+test = "admission_interleavings::wait_service_keeps_a_wake_published_before_enrollment"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::admission_interleavings::wait_service_keeps_a_wake_published_before_enrollment"
+pr = 2408
+
+[[retired]]
+test = "composition_root_packaging::test_detached_composition_root_packages_aarch64"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::composition_root_packaging::test_detached_composition_root_packages_aarch64"
+pr = 2408
+
+[[retired]]
+test = "composition_root_packaging::test_detached_composition_root_packages_x86_64"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::composition_root_packaging::test_detached_composition_root_packages_x86_64"
+pr = 2408
+
+[[retired]]
+test = "composition_root_packaging::test_packaging_missing_manifest_fails_cleanly"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::composition_root_packaging::test_packaging_missing_manifest_fails_cleanly"
+pr = 2408
+
+[[retired]]
+test = "conflicting_tls_preemption::test_aarch64_context_switch_restores_tpidr_el0_and_x18_without_leakage"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::conflicting_tls_preemption::test_aarch64_context_switch_restores_tpidr_el0_and_x18_without_leakage"
+pr = 2408
+
+[[retired]]
+test = "conflicting_tls_preemption::test_conflicting_tls_preemption_preserves_registers"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::conflicting_tls_preemption::test_conflicting_tls_preemption_preserves_registers"
+pr = 2408
+
+[[retired]]
+test = "conflicting_tls_preemption::test_personality_configured_thread_pointer_registers"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::conflicting_tls_preemption::test_personality_configured_thread_pointer_registers"
+pr = 2408
+
+[[retired]]
+test = "conflicting_tls_preemption::test_x86_context_switch_restores_fs_and_gs_base_without_leakage"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::conflicting_tls_preemption::test_x86_context_switch_restores_fs_and_gs_base_without_leakage"
+pr = 2408
+
+[[retired]]
+test = "contracts::fork_filetable_contract_is_semantically_exact_and_affine"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::fork_filetable_contract_is_semantically_exact_and_affine"
+pr = 2408
+
+[[retired]]
+test = "contracts::fork_filetable_structural_red_control"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::fork_filetable_structural_red_control"
+pr = 2408
+
+[[retired]]
+test = "contracts::fork_mappings_contract_is_semantically_exact_and_constant"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::fork_mappings_contract_is_semantically_exact_and_constant"
+pr = 2408
+
+[[retired]]
+test = "contracts::fork_mappings_structural_red_control"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::fork_mappings_structural_red_control"
+pr = 2408
+
+[[retired]]
+test = "contracts::fork_stage1_image_contract_admits_one_task_per_serial_fork"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::fork_stage1_image_contract_admits_one_task_per_serial_fork"
+pr = 2408
+
+[[retired]]
+test = "contracts::fork_stage1_image_structural_red_control"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::fork_stage1_image_structural_red_control"
+pr = 2408
+
+[[retired]]
+test = "contracts::futex_contention_contract_is_semantically_exact_and_linear"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::futex_contention_contract_is_semantically_exact_and_linear"
+pr = 2408
+
+[[retired]]
+test = "contracts::futex_partial_wake_scales_with_target_wake_count"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::futex_partial_wake_scales_with_target_wake_count"
+pr = 2408
+
+[[retired]]
+test = "contracts::futex_requeue_contract_is_semantically_exact_and_linear"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::futex_requeue_contract_is_semantically_exact_and_linear"
+pr = 2408
+
+[[retired]]
+test = "contracts::futex_requeue_partial_and_full"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::futex_requeue_partial_and_full"
+pr = 2408
+
+[[retired]]
+test = "contracts::futex_requeue_structural_red_control"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::futex_requeue_structural_red_control"
+pr = 2408
+
+[[retired]]
+test = "contracts::futex_structural_red_control"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::futex_structural_red_control"
+pr = 2408
+
+[[retired]]
+test = "contracts::futex_zero_wake_visits_queue_head_without_waiter_inspections"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::futex_zero_wake_visits_queue_head_without_waiter_inspections"
+pr = 2408
+
+[[retired]]
+test = "contracts::inotify09_hotpath_is_semantically_exact_and_linear"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::inotify09_hotpath_is_semantically_exact_and_linear"
+pr = 2408
+
+[[retired]]
+test = "contracts::inotify09_hotpath_structural_red_control"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::inotify09_hotpath_structural_red_control"
+pr = 2408
+
+[[retired]]
+test = "contracts::inotify_churn_preserves_unread_watch_identity"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::inotify_churn_preserves_unread_watch_identity"
+pr = 2408
+
+[[retired]]
+test = "contracts::inotify_readiness_contract_does_not_scan_the_queue"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::inotify_readiness_contract_does_not_scan_the_queue"
+pr = 2408
+
+[[retired]]
+test = "contracts::inotify_readiness_cost_does_not_grow_with_queue_depth"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::inotify_readiness_cost_does_not_grow_with_queue_depth"
+pr = 2408
+
+[[retired]]
+test = "contracts::inotify_readiness_structural_red_control"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::inotify_readiness_structural_red_control"
+pr = 2408
+
+[[retired]]
+test = "contracts::inotify_watch_contract_is_semantically_exact"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::inotify_watch_contract_is_semantically_exact"
+pr = 2408
+
+[[retired]]
+test = "contracts::inotify_watch_structural_red_control"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::inotify_watch_structural_red_control"
+pr = 2408
+
+[[retired]]
+test = "contracts::scheduler_cost_contract_is_semantically_exact_and_constant"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::scheduler_cost_contract_is_semantically_exact_and_constant"
+pr = 2408
+
+[[retired]]
+test = "contracts::scheduler_lifecycle_contract_is_semantically_exact_and_constant"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::scheduler_lifecycle_contract_is_semantically_exact_and_constant"
+pr = 2408
+
+[[retired]]
+test = "contracts::scheduler_progress_contract_is_semantically_exact_and_linear"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::scheduler_progress_contract_is_semantically_exact_and_linear"
+pr = 2408
+
+[[retired]]
+test = "contracts::unrelated_futex_population_does_not_increase_target_queue_visits"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::contracts::unrelated_futex_population_does_not_increase_target_queue_visits"
+pr = 2408
+
+[[retired]]
+test = "deferred_regressions::blocked_socket_write_retains_sender_after_partial_progress"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::deferred_regressions::blocked_socket_write_retains_sender_after_partial_progress"
+pr = 2408
+
+[[retired]]
+test = "deferred_regressions::default_message_credentials_use_real_gid"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::deferred_regressions::default_message_credentials_use_real_gid"
+pr = 2408
+
+[[retired]]
+test = "deferred_regressions::failed_copyout_does_not_leave_stale_sender_credentials"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::deferred_regressions::failed_copyout_does_not_leave_stale_sender_credentials"
+pr = 2408
+
+[[retired]]
+test = "deferred_regressions::ignored_sigchld_wakes_an_already_parked_parent"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::deferred_regressions::ignored_sigchld_wakes_an_already_parked_parent"
+pr = 2408
+
+[[retired]]
+test = "deferred_regressions::nocldwait_wakes_an_already_parked_parent"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::deferred_regressions::nocldwait_wakes_an_already_parked_parent"
+pr = 2408
+
+[[retired]]
+test = "deferred_regressions::sender_credentials_survive_peek_partial_read_and_sender_exit"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::deferred_regressions::sender_credentials_survive_peek_partial_read_and_sender_exit"
+pr = 2408
+
+[[retired]]
+test = "deferred_regressions::stream_receive_stops_at_a_sender_credential_boundary"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::deferred_regressions::stream_receive_stops_at_a_sender_credential_boundary"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_close_frees_descriptor_slot_for_subsequent_open"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_close_frees_descriptor_slot_for_subsequent_open"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_dup3_ebusy_loser_preserves_target_and_epoll_registration"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_dup3_ebusy_loser_preserves_target_and_epoll_registration"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_failed_open_releases_admission_and_next_valid_open_uses_lowest_slot"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_failed_open_releases_admission_and_next_valid_open_uses_lowest_slot"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_fifo_open_cancellation_releases_reservation_exactly_once"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_fifo_open_cancellation_releases_reservation_exactly_once"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_fifo_open_parks_with_reserved_slot_and_rejects_dup2_ebusy"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_fifo_open_parks_with_reserved_slot_and_rejects_dup2_ebusy"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_fork_during_pending_fifo_open_allows_child_to_allocate_uncommitted_slot"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_fork_during_pending_fifo_open_allows_child_to_allocate_uncommitted_slot"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_fork_preserves_independent_rlimits_and_descriptor_tables"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_fork_preserves_independent_rlimits_and_descriptor_tables"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_hostfs_open_full_table_returns_emfile_before_missing_path_resolution"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_hostfs_open_full_table_returns_emfile_before_missing_path_resolution"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_hostfs_open_rejected_by_rlimit_does_not_create_nonexistent_file"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_hostfs_open_rejected_by_rlimit_does_not_create_nonexistent_file"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_hostfs_open_rejected_by_rlimit_does_not_truncate_existing_file"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_hostfs_open_rejected_by_rlimit_does_not_truncate_existing_file"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_memfs_open_full_table_returns_emfile_before_missing_path_resolution"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_memfs_open_full_table_returns_emfile_before_missing_path_resolution"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_memfs_open_rejected_by_rlimit_does_not_create_nonexistent_file"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_memfs_open_rejected_by_rlimit_does_not_create_nonexistent_file"
+pr = 2408
+
+[[retired]]
+test = "fd_admission::test_memfs_open_rejected_by_rlimit_does_not_truncate_existing_file"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fd_admission::test_memfs_open_rejected_by_rlimit_does_not_truncate_existing_file"
+pr = 2408
+
+[[retired]]
+test = "fork_clone_orderings::child_exit_between_wait_scan_and_enrollment"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_clone_orderings::child_exit_between_wait_scan_and_enrollment"
+pr = 2408
+
+[[retired]]
+test = "fork_clone_orderings::child_exit_while_parent_has_another_prepared_fork"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_clone_orderings::child_exit_while_parent_has_another_prepared_fork"
+pr = 2408
+
+[[retired]]
+test = "fork_clone_orderings::child_exit_while_parent_holds_sibling_clone_publication_reservation"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_clone_orderings::child_exit_while_parent_holds_sibling_clone_publication_reservation"
+pr = 2408
+
+[[retired]]
+test = "fork_clone_orderings::child_report_after_poll_enrollment"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_clone_orderings::child_report_after_poll_enrollment"
+pr = 2408
+
+[[retired]]
+test = "fork_clone_orderings::child_report_between_poll_readiness_check_and_enrollment"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_clone_orderings::child_report_between_poll_readiness_check_and_enrollment"
+pr = 2408
+
+[[retired]]
+test = "fork_clone_orderings::fork_report_and_reap_while_parent_sibling_clone_is_reserved"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_clone_orderings::fork_report_and_reap_while_parent_sibling_clone_is_reserved"
+pr = 2408
+
+[[retired]]
+test = "fork_clone_orderings::unread_child_report_is_ready_before_poll_starts"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_clone_orderings::unread_child_report_is_ready_before_poll_starts"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::a_blocked_read_is_dispatched_exactly_twice_when_the_writer_arrives"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::a_blocked_read_is_dispatched_exactly_twice_when_the_writer_arrives"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::a_forked_task_can_fork_again"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::a_forked_task_can_fork_again"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::a_lost_wake_fails_inside_the_bound"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::a_lost_wake_fails_inside_the_bound"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::a_timerfd_read_parks_until_the_timer_fires"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::a_timerfd_read_parks_until_the_timer_fires"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::blocking_write_over_pipe_capacity_completes_byte_exact"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::blocking_write_over_pipe_capacity_completes_byte_exact"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::child_write_to_broken_pipe_terminates_with_sigpipe"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::child_write_to_broken_pipe_terminates_with_sigpipe"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::clock_nanosleep_completes_after_its_interval"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::clock_nanosleep_completes_after_its_interval"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::duplicate_capture_tags_in_one_syscall_rejects"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::duplicate_capture_tags_in_one_syscall_rejects"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::exit_expectation_mismatch_fails"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::exit_expectation_mismatch_fails"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::fork_pipe_wait_through_the_public_surface"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::fork_pipe_wait_through_the_public_surface"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::layout_integer_signedness_is_checked_before_dispatch"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::layout_integer_signedness_is_checked_before_dispatch"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::layout_narrow_integer_overflow_rejects"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::layout_narrow_integer_overflow_rejects"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::layout_relocation_offset_overflow_rejects"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::layout_relocation_offset_overflow_rejects"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::layout_write_outside_layout_bounds_rejects"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::layout_write_outside_layout_bounds_rejects"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::nanosleep_completes_after_its_interval_with_zero_remaining"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::nanosleep_completes_after_its_interval_with_zero_remaining"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::pselect6_timeout_zeroes_non_null_fd_set"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::pselect6_timeout_zeroes_non_null_fd_set"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::save_out_i32_out_of_bounds_rejects"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::save_out_i32_out_of_bounds_rejects"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::save_ret_on_failed_syscall_rejects"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::save_ret_on_failed_syscall_rejects"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::saved_return_reused_as_operand"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::saved_return_reused_as_operand"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::sig_ign_drops_signal_without_terminating"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::sig_ign_drops_signal_without_terminating"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::sigkill_from_the_parent_terminates_the_child_and_wait4_reports_the_signal"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::sigkill_from_the_parent_terminates_the_child_and_wait4_reports_the_signal"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::sigprocmask_blocked_sigchld_received_by_signalfd4_with_pid"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::sigprocmask_blocked_sigchld_received_by_signalfd4_with_pid"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::sigprocmask_blocked_sigchld_received_by_sigtimedwait_with_pid_and_status"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::sigprocmask_blocked_sigchld_received_by_sigtimedwait_with_pid_and_status"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::sigprocmask_blocked_signal_received_by_signalfd4"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::sigprocmask_blocked_signal_received_by_signalfd4"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::sigprocmask_blocked_signal_received_by_sigtimedwait"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::sigprocmask_blocked_signal_received_by_sigtimedwait"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::successful_errno_expectation_matches"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::successful_errno_expectation_matches"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::tagged_save_out_of_bounds_rejects"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::tagged_save_out_of_bounds_rejects"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::wrong_errno_diagnostic_reports_label_pid_and_errnos"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::wrong_errno_diagnostic_reports_label_pid_and_errnos"
+pr = 2408
+
+[[retired]]
+test = "fork_pipe_wait::wrong_return_diagnostic_reports_label_pid_and_values"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_pipe_wait::wrong_return_diagnostic_reports_label_pid_and_values"
+pr = 2408
+
+[[retired]]
+test = "fork_threads_exit::a_forked_child_that_threads_and_forks_again_retires_every_task"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_threads_exit::a_forked_child_that_threads_and_forks_again_retires_every_task"
+pr = 2408
+
+[[retired]]
+test = "fork_threads_exit::fork_from_a_threaded_process_retires_every_task"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_threads_exit::fork_from_a_threaded_process_retires_every_task"
+pr = 2408
+
+[[retired]]
+test = "fork_threads_exit::fork_parent_exit_between_pipe_readv_admission_and_continuation_build"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_threads_exit::fork_parent_exit_between_pipe_readv_admission_and_continuation_build"
+pr = 2408
+
+[[retired]]
+test = "fork_threads_exit::fork_parent_exit_between_pipe_wait_admission_and_continuation_build"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_threads_exit::fork_parent_exit_between_pipe_wait_admission_and_continuation_build"
+pr = 2408
+
+[[retired]]
+test = "fork_threads_exit::fork_parent_exit_between_pipe_write_admission_and_continuation_build"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::fork_threads_exit::fork_parent_exit_between_pipe_write_admission_and_continuation_build"
+pr = 2408
+
+[[retired]]
+test = "host_wait_cancellation::peer_exec_retires_host_wait_without_guest_return"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::host_wait_cancellation::peer_exec_retires_host_wait_without_guest_return"
+pr = 2408
+
+[[retired]]
+test = "n2_creation::fork_pipe_wait_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_creation::fork_pipe_wait_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_creation::thread_create_join_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_creation::thread_create_join_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_creation::vfork_failed_prepare_exec_wait_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_creation::vfork_failed_prepare_exec_wait_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_lifecycle::exit_group_budget_red"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_lifecycle::exit_group_budget_red"
+pr = 2408
+
+[[retired]]
+test = "n2_task_lifecycle::exit_group_parked_siblings_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_lifecycle::exit_group_parked_siblings_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_lifecycle::reparent_reap_budget_red"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_lifecycle::reparent_reap_budget_red"
+pr = 2408
+
+[[retired]]
+test = "n2_task_lifecycle::reparent_reap_two_parents_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_lifecycle::reparent_reap_two_parents_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_lifecycle::sa_nocldwait_budget_red"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_lifecycle::sa_nocldwait_budget_red"
+pr = 2408
+
+[[retired]]
+test = "n2_task_lifecycle::sa_nocldwait_two_parents_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_lifecycle::sa_nocldwait_two_parents_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_lifecycle::wnohang_echild_budget_red"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_lifecycle::wnohang_echild_budget_red"
+pr = 2408
+
+[[retired]]
+test = "n2_task_lifecycle::wnohang_echild_two_parents_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_lifecycle::wnohang_echild_two_parents_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_transactions::cancelled_prepublication_birth_cancels_start_and_releases_edges_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_transactions::cancelled_prepublication_birth_cancels_start_and_releases_edges_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_transactions::clone_during_exec_close_cannot_publish_and_rollback_reopens_birth_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_transactions::clone_during_exec_close_cannot_publish_and_rollback_reopens_birth_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_transactions::clone_publication_during_fork_reservation_keeps_exact_shared_edges_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_transactions::clone_publication_during_fork_reservation_keeps_exact_shared_edges_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_transactions::delayed_parent_notification_preserves_durable_exact_status_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_transactions::delayed_parent_notification_preserves_durable_exact_status_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_transactions::failed_birth_stages_unwind_edges_once_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_transactions::failed_birth_stages_unwind_edges_once_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_transactions::failed_thread_birth_restores_claim_and_shared_edges_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_transactions::failed_thread_birth_restores_claim_and_shared_edges_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_transactions::uid_limit_counts_both_live_parents_and_shared_threads_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_transactions::uid_limit_counts_both_live_parents_and_shared_threads_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "n2_task_transactions::vfork_releases_only_on_exact_child_mm_release_at_1_8_32"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::n2_task_transactions::vfork_releases_only_on_exact_child_mm_release_at_1_8_32"
+pr = 2408
+
+[[retired]]
+test = "namespace_two_process::two_live_process_late_lower_refill_cannot_resurrect_whiteout"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::namespace_two_process::two_live_process_late_lower_refill_cannot_resurrect_whiteout"
+pr = 2408
+
+[[retired]]
+test = "namespace_two_process::two_live_process_lower_copy_up_and_whiteout_matrix"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::namespace_two_process::two_live_process_lower_copy_up_and_whiteout_matrix"
+pr = 2408
+
+[[retired]]
+test = "namespace_two_process::two_live_process_namespace_publication_matrix"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::namespace_two_process::two_live_process_namespace_publication_matrix"
+pr = 2408
+
+[[retired]]
+test = "native_execution_scope::native_execution_scope_contract"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::native_execution_scope::native_execution_scope_contract"
+pr = 2408
+
+[[retired]]
+test = "personality_handle_table::test_handle_inheritance_copies_only_inheritable_filtered_entries_and_retains_lifetime"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_handle_table::test_handle_inheritance_copies_only_inheritable_filtered_entries_and_retains_lifetime"
+pr = 2408
+
+[[retired]]
+test = "personality_handle_table::test_handle_insert_get_duplicate_and_close_preserve_lifetime"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_handle_table::test_handle_insert_get_duplicate_and_close_preserve_lifetime"
+pr = 2408
+
+[[retired]]
+test = "personality_handle_table::test_handle_number_codec_round_trip_and_invalid_number_rejection"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_handle_table::test_handle_number_codec_round_trip_and_invalid_number_rejection"
+pr = 2408
+
+[[retired]]
+test = "personality_handle_table::test_inherit_and_exit_racing_concurrent_close_finalize_exactly_once"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_handle_table::test_inherit_and_exit_racing_concurrent_close_finalize_exactly_once"
+pr = 2408
+
+[[retired]]
+test = "personality_handle_table::test_recycled_slot_rejects_stale_generation_pin_and_handle"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_handle_table::test_recycled_slot_rejects_stale_generation_pin_and_handle"
+pr = 2408
+
+[[retired]]
+test = "personality_handle_table::test_retained_guard_prevents_finalization_and_refuses_double_release"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_handle_table::test_retained_guard_prevents_finalization_and_refuses_double_release"
+pr = 2408
+
+[[retired]]
+test = "personality_handle_table::test_table_capacity_limit_and_slot_generation_exhaustion_retire_permanently"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_handle_table::test_table_capacity_limit_and_slot_generation_exhaustion_retire_permanently"
+pr = 2408
+
+[[retired]]
+test = "personality_handle_table::test_task_exit_releases_every_remaining_pin_and_reclaims_task_slot"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_handle_table::test_task_exit_releases_every_remaining_pin_and_reclaims_task_slot"
+pr = 2408
+
+[[retired]]
+test = "personality_handle_table::test_task_host_churn_beyond_max_tasks_and_recycled_task_id_rejection"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_handle_table::test_task_host_churn_beyond_max_tasks_and_recycled_task_id_rejection"
+pr = 2408
+
+[[retired]]
+test = "personality_stack_arguments::test_entry_decode_error_variants_and_user_stack_offset"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_stack_arguments::test_entry_decode_error_variants_and_user_stack_offset"
+pr = 2408
+
+[[retired]]
+test = "personality_stack_arguments::test_personality_decode_aarch64_snapshot"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_stack_arguments::test_personality_decode_aarch64_snapshot"
+pr = 2408
+
+[[retired]]
+test = "personality_stack_arguments::test_personality_decode_protected_stack_returns_fault"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_stack_arguments::test_personality_decode_protected_stack_returns_fault"
+pr = 2408
+
+[[retired]]
+test = "personality_stack_arguments::test_personality_decode_stack_copy_boundary_without_overread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_stack_arguments::test_personality_decode_stack_copy_boundary_without_overread"
+pr = 2408
+
+[[retired]]
+test = "personality_stack_arguments::test_personality_decode_unmapped_stack_returns_fault"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_stack_arguments::test_personality_decode_unmapped_stack_returns_fault"
+pr = 2408
+
+[[retired]]
+test = "personality_stack_arguments::test_personality_decode_unsupported_abi_returns_unsupported"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_stack_arguments::test_personality_decode_unsupported_abi_returns_unsupported"
+pr = 2408
+
+[[retired]]
+test = "personality_stack_arguments::test_personality_decode_x86_snapshot"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_stack_arguments::test_personality_decode_x86_snapshot"
+pr = 2408
+
+[[retired]]
+test = "personality_stack_arguments::test_personality_encode_return"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_stack_arguments::test_personality_encode_return"
+pr = 2408
+
+[[retired]]
+test = "personality_user_copy::test_personality_copy_out_to_read_only_page_refused"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_user_copy::test_personality_copy_out_to_read_only_page_refused"
+pr = 2408
+
+[[retired]]
+test = "personality_user_copy::test_personality_copy_out_to_writable_page"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_user_copy::test_personality_copy_out_to_writable_page"
+pr = 2408
+
+[[retired]]
+test = "personality_user_copy::test_personality_multi_page_copy_in"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_user_copy::test_personality_multi_page_copy_in"
+pr = 2408
+
+[[retired]]
+test = "personality_user_copy::test_personality_range_overflow_refused"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_user_copy::test_personality_range_overflow_refused"
+pr = 2408
+
+[[retired]]
+test = "personality_user_copy::test_personality_unmapped_page_gives_typed_fault"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::personality_user_copy::test_personality_unmapped_page_gives_typed_fault"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::control_non_tracer_echild_after_detach"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::control_non_tracer_echild_after_detach"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::control_normal_child_wait_continuation_succeeds"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::control_normal_child_wait_continuation_succeeds"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::control_ordinary_non_ptrace_job_control_stop_waitid_reports_cld_stopped"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::control_ordinary_non_ptrace_job_control_stop_waitid_reports_cld_stopped"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::control_unrelated_non_tracer_sees_echild"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::control_unrelated_non_tracer_sees_echild"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_attach_and_wait_on_ancestor_root_continuation_wait4"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_attach_and_wait_on_ancestor_root_continuation_wait4"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_attach_and_wait_on_ancestor_root_continuation_waitid"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_attach_and_wait_on_ancestor_root_continuation_waitid"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_attach_and_wait_on_non_child_sibling_continuation_wait4"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_attach_and_wait_on_non_child_sibling_continuation_wait4"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_attach_and_wait_on_non_child_sibling_continuation_waitid"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_attach_and_wait_on_non_child_sibling_continuation_waitid"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_fast_stop_before_wait_ancestor_root_wait4"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_fast_stop_before_wait_ancestor_root_wait4"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_fast_stop_before_wait_ancestor_root_waitid"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_fast_stop_before_wait_ancestor_root_waitid"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_fast_stop_before_wait_non_child_sibling_wait4"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_fast_stop_before_wait_non_child_sibling_wait4"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_fast_stop_before_wait_non_child_sibling_waitid"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_fast_stop_before_wait_non_child_sibling_waitid"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_lost_wake_window_ancestor_root_wait4"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_lost_wake_window_ancestor_root_wait4"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_lost_wake_window_ancestor_root_waitid"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_lost_wake_window_ancestor_root_waitid"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_lost_wake_window_non_child_sibling_wait4"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_lost_wake_window_non_child_sibling_wait4"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_lost_wake_window_non_child_sibling_waitid"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_lost_wake_window_non_child_sibling_waitid"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_peek_after_wait_reports_unsettled_stop_waits_for_tracee_settlement"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_peek_after_wait_reports_unsettled_stop_waits_for_tracee_settlement"
+pr = 2408
+
+[[retired]]
+test = "ptrace_wait::ptrace_peek_parked_on_unsettled_stop_answers_esrch_when_tracee_dies"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::ptrace_wait::ptrace_peek_parked_on_unsettled_stop_answers_esrch_when_tracee_dies"
+pr = 2408
+
+[[retired]]
+test = "root_exit_full_width::invalid_signal_death_must_not_be_success"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::root_exit_full_width::invalid_signal_death_must_not_be_success"
+pr = 2408
+
+[[retired]]
+test = "root_exit_full_width::linux_host_adapter_preserves_exit_and_signal_wait_encodings"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::root_exit_full_width::linux_host_adapter_preserves_exit_and_signal_wait_encodings"
+pr = 2408
+
+[[retired]]
+test = "root_exit_full_width::root_exit_record_codec_preserves_full_width_termination"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::root_exit_full_width::root_exit_record_codec_preserves_full_width_termination"
+pr = 2408
+
+[[retired]]
+test = "schedule_replay::futex_wake_acknowledgment_survives_explored_schedules"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::schedule_replay::futex_wake_acknowledgment_survives_explored_schedules"
+pr = 2408
+
+[[retired]]
+test = "schedule_replay::futex_wake_exit_receipt_replays"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::schedule_replay::futex_wake_exit_receipt_replays"
+pr = 2408
+
+[[retired]]
+test = "schedule_replay::historical_fd_pin_receipts_keep_their_exact_generation_and_bad_result"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::schedule_replay::historical_fd_pin_receipts_keep_their_exact_generation_and_bad_result"
+pr = 2408
+
+[[retired]]
+test = "schedule_replay::receipts_bind_scenarios_without_ambient_kernel_sources"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::schedule_replay::receipts_bind_scenarios_without_ambient_kernel_sources"
+pr = 2408
+
+[[retired]]
+test = "schedule_replay::record_fd_pin_schedule_on_historical_revision"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::schedule_replay::record_fd_pin_schedule_on_historical_revision"
+pr = 2408
+
+[[retired]]
+test = "schedule_replay::record_futex_wake_exit_receipt"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::schedule_replay::record_futex_wake_exit_receipt"
+pr = 2408
+
+[[retired]]
+test = "schedule_replay::regression_replay_checks_explicit_current_result_and_work"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::schedule_replay::regression_replay_checks_explicit_current_result_and_work"
+pr = 2408
+
+[[retired]]
+test = "schedule_replay::replay_rejects_runnable_actor_generation_fixture_and_suffix_drift"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::schedule_replay::replay_rejects_runnable_actor_generation_fixture_and_suffix_drift"
+pr = 2408
+
+[[retired]]
+test = "schedule_replay::scheduled_external_readiness_fails_closed"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::schedule_replay::scheduled_external_readiness_fails_closed"
+pr = 2408
+
+[[retired]]
+test = "schedule_replay::seeded_fd_pin_schedule_records_and_replays"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::schedule_replay::seeded_fd_pin_schedule_records_and_replays"
+pr = 2408
+
+[[retired]]
+test = "scheduler_affinity::affinity_errors_leave_both_masks_unchanged"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_affinity::affinity_errors_leave_both_masks_unchanged"
+pr = 2408
+
+[[retired]]
+test = "scheduler_affinity::affinity_permission_uses_the_named_threads_credentials"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_affinity::affinity_permission_uses_the_named_threads_credentials"
+pr = 2408
+
+[[retired]]
+test = "scheduler_affinity::affinity_set_allows_target_real_uid_match"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_affinity::affinity_set_allows_target_real_uid_match"
+pr = 2408
+
+[[retired]]
+test = "scheduler_affinity::empty_setaffinity_does_not_read_the_host_mask_pointer"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_affinity::empty_setaffinity_does_not_read_the_host_mask_pointer"
+pr = 2408
+
+[[retired]]
+test = "scheduler_affinity::getaffinity_reads_the_named_thread_including_the_leader_from_a_sibling"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_affinity::getaffinity_reads_the_named_thread_including_the_leader_from_a_sibling"
+pr = 2408
+
+[[retired]]
+test = "scheduler_affinity::host_and_control_share_the_only_affinity_mask"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_affinity::host_and_control_share_the_only_affinity_mask"
+pr = 2408
+
+[[retired]]
+test = "scheduler_affinity::other_process_setaffinity_changes_only_the_named_thread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_affinity::other_process_setaffinity_changes_only_the_named_thread"
+pr = 2408
+
+[[retired]]
+test = "scheduler_affinity::root_without_sys_nice_cannot_set_another_owners_affinity"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_affinity::root_without_sys_nice_cannot_set_another_owners_affinity"
+pr = 2408
+
+[[retired]]
+test = "scheduler_affinity::short_setaffinity_zero_extends_and_changes_only_the_named_thread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_affinity::short_setaffinity_zero_extends_and_changes_only_the_named_thread"
+pr = 2408
+
+[[retired]]
+test = "scheduler_affinity::sibling_setaffinity_changes_only_the_named_thread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_affinity::sibling_setaffinity_changes_only_the_named_thread"
+pr = 2408
+
+[[retired]]
+test = "scheduler_affinity::sys_nice_allows_nonroot_to_set_another_owners_affinity"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_affinity::sys_nice_allows_nonroot_to_set_another_owners_affinity"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::host_wait_authentication_and_stale_unregister"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::host_wait_authentication_and_stale_unregister"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::host_wait_control_pokes_and_residency_flush_requests"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::host_wait_control_pokes_and_residency_flush_requests"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::host_wait_dropped_token_unwinding_with_active_replacement"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::host_wait_dropped_token_unwinding_with_active_replacement"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::host_wait_graceful_close_and_drain"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::host_wait_graceful_close_and_drain"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::host_wait_handoff_affinity_pinned_placement"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::host_wait_handoff_affinity_pinned_placement"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::host_wait_handoff_concurrent_returns"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::host_wait_handoff_concurrent_returns"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::host_wait_handoff_nested_lineage_and_ancestor_return"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::host_wait_handoff_nested_lineage_and_ancestor_return"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::host_wait_handoff_no_spare_vacant_and_resumes"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::host_wait_handoff_no_spare_vacant_and_resumes"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::host_wait_handoff_separate_process_child_progresses_on_spare"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::host_wait_handoff_separate_process_child_progresses_on_spare"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::host_wait_handoff_sibling_thread_progresses_on_spare"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::host_wait_handoff_sibling_thread_progresses_on_spare"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::injected_host_sync_allows_replacement_mm_mutation"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::injected_host_sync_allows_replacement_mm_mutation"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::injected_host_sync_does_not_readmit_a_retired_thread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::injected_host_sync_does_not_readmit_a_retired_thread"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::injected_stdio_short_write_then_error_preserves_writer_contract"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::injected_stdio_short_write_then_error_preserves_writer_contract"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::injected_stdio_unwind_restores_cpu_ownership"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::injected_stdio_unwind_restores_cpu_ownership"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::injected_stdio_writer_allows_replacement_mm_mutation"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::injected_stdio_writer_allows_replacement_mm_mutation"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::injected_stdio_writer_does_not_readmit_a_retired_thread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::injected_stdio_writer_does_not_readmit_a_retired_thread"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::nested_host_wait_final_return_clears_stale_handoff_reason"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::nested_host_wait_final_return_clears_stale_handoff_reason"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::queued_affinity_change_requires_migration_before_claim"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::queued_affinity_change_requires_migration_before_claim"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::redirected_stdio_writer_allows_replacement_mm_mutation"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::redirected_stdio_writer_allows_replacement_mm_mutation"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::redirected_stdio_writer_does_not_readmit_a_retired_thread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::redirected_stdio_writer_does_not_readmit_a_retired_thread"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::remote_affinity_exclusion_kicks_the_exact_running_thread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::remote_affinity_exclusion_kicks_the_exact_running_thread"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::retired_stdio_unwind_does_not_readmit_the_old_task"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::retired_stdio_unwind_does_not_readmit_the_old_task"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::self_affinity_change_requires_migration_before_return"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::self_affinity_change_requires_migration_before_return"
+pr = 2408
+
+[[retired]]
+test = "scheduler_handoff::uncontended_host_wait_return_has_zero_spurious_preemptions"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_handoff::uncontended_host_wait_return_has_zero_spurious_preemptions"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::cost_assertions_and_fifo_rotation"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::cost_assertions_and_fifo_rotation"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::custom_quantum_policy_sets_10ms_deadline"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::custom_quantum_policy_sets_10ms_deadline"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::default_fifo_policy_never_materializes_snapshots"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::default_fifo_policy_never_materializes_snapshots"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::distinct_processes_have_distinct_process_ids"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::distinct_processes_have_distinct_process_ids"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::host_wait_loop_does_not_reset_the_fairness_quantum"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::host_wait_loop_does_not_reset_the_fairness_quantum"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::one_cpu_two_executors_independent_residencies"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::one_cpu_two_executors_independent_residencies"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::pending_signal_plus_fairness_isolation"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::pending_signal_plus_fairness_isolation"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::pick_next_callback_reentrancy_without_deadlock"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::pick_next_callback_reentrancy_without_deadlock"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::queue_change_during_callback_and_stale_fallback_to_fifo"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::queue_change_during_callback_and_stale_fallback_to_fifo"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::run_budget_constructor_bounds_and_defaults"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::run_budget_constructor_bounds_and_defaults"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::sibling_threads_have_distinct_thread_ids_and_equal_process_ids"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::sibling_threads_have_distinct_thread_ids_and_equal_process_ids"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::threaded_driver_wait_preemption_work_wakes_on_manual_clock_advance"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::threaded_driver_wait_preemption_work_wakes_on_manual_clock_advance"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::timeline_a_starts_0_b_queues_1ms_due_at_4ms"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::timeline_a_starts_0_b_queues_1ms_due_at_4ms"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::timeline_a_starts_0_b_queues_20ms_immediately_eligible"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::timeline_a_starts_0_b_queues_20ms_immediately_eligible"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::timeline_affinity_constrained_contender_never_kicks_ineligible_cpu"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::timeline_affinity_constrained_contender_never_kicks_ineligible_cpu"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::timeline_b_claimed_by_idle_executor_cancels_unclaimed_deadline"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::timeline_b_claimed_by_idle_executor_cancels_unclaimed_deadline"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::timeline_deadline_fires_after_exec_unbind_no_successor"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::timeline_deadline_fires_after_exec_unbind_no_successor"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::timeline_demand_disappears_after_delivery_claim_at_most_one_extra_exit"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::timeline_demand_disappears_after_delivery_claim_at_most_one_extra_exit"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::timeline_more_wakes_do_not_extend_deadline"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::timeline_more_wakes_do_not_extend_deadline"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::timeline_one_contender_several_busy_executors_selects_oldest"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::timeline_one_contender_several_busy_executors_selects_oldest"
+pr = 2408
+
+[[retired]]
+test = "scheduler_preemption::uncontended_syscall_steps_retain_residency"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::scheduler_preemption::uncontended_syscall_steps_retain_residency"
+pr = 2408
+
+[[retired]]
+test = "seam_reserve_commit::address_space_reserve_commit_decommit_witness_contract"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::seam_reserve_commit::address_space_reserve_commit_decommit_witness_contract"
+pr = 2408
+
+[[retired]]
+test = "semantics::epoll::an_epoll_instance_is_shared_across_fork_and_a_write_in_the_child_wakes_the_parent"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::epoll::an_epoll_instance_is_shared_across_fork_and_a_write_in_the_child_wakes_the_parent"
+pr = 2408
+
+[[retired]]
+test = "semantics::epoll::closing_a_duplicated_descriptor_in_the_same_process_keeps_the_epoll_registration_until_both_close"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::epoll::closing_a_duplicated_descriptor_in_the_same_process_keeps_the_epoll_registration_until_both_close"
+pr = 2408
+
+[[retired]]
+test = "semantics::epoll::closing_an_inherited_descriptor_keeps_the_epoll_registration_until_the_child_closes_it"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::epoll::closing_an_inherited_descriptor_keeps_the_epoll_registration_until_the_child_closes_it"
+pr = 2408
+
+[[retired]]
+test = "semantics::epoll::edge_triggered_reports_once_until_new_data_arrives"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::epoll::edge_triggered_reports_once_until_new_data_arrives"
+pr = 2408
+
+[[retired]]
+test = "semantics::epoll::epoll_ctl_add_of_a_registered_fd_is_eexist_and_del_of_an_unregistered_fd_is_enoent"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::epoll::epoll_ctl_add_of_a_registered_fd_is_eexist_and_del_of_an_unregistered_fd_is_enoent"
+pr = 2408
+
+[[retired]]
+test = "semantics::epoll::epollhup_is_reported_when_every_writer_closes"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::epoll::epollhup_is_reported_when_every_writer_closes"
+pr = 2408
+
+[[retired]]
+test = "semantics::epoll::reused_numeric_descriptor_does_not_trigger_or_mask_epoll_for_original_description"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::epoll::reused_numeric_descriptor_does_not_trigger_or_mask_epoll_for_original_description"
+pr = 2408
+
+[[retired]]
+test = "semantics::fork_scaling::fork_children_receive_independent_futex_table_under_population"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::fork_scaling::fork_children_receive_independent_futex_table_under_population"
+pr = 2408
+
+[[retired]]
+test = "semantics::fork_scaling::fork_dispatch_count_does_not_grow_linearly_with_population"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::fork_scaling::fork_dispatch_count_does_not_grow_linearly_with_population"
+pr = 2408
+
+[[retired]]
+test = "semantics::fork_scaling::fork_with_32_parked_children_completes"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::fork_scaling::fork_with_32_parked_children_completes"
+pr = 2408
+
+[[retired]]
+test = "semantics::fork_scaling::fork_with_64_parked_children_completes"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::fork_scaling::fork_with_64_parked_children_completes"
+pr = 2408
+
+[[retired]]
+test = "semantics::futex::a_private_futex_is_not_shared_across_fork"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::futex::a_private_futex_is_not_shared_across_fork"
+pr = 2408
+
+[[retired]]
+test = "semantics::futex::futex_requeue_moves_waiters_without_waking_them"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::futex::futex_requeue_moves_waiters_without_waking_them"
+pr = 2408
+
+[[retired]]
+test = "semantics::futex::futex_wait_parks_and_a_wake_from_the_sibling_thread_resumes_it"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::futex::futex_wait_parks_and_a_wake_from_the_sibling_thread_resumes_it"
+pr = 2408
+
+[[retired]]
+test = "semantics::futex::futex_wait_with_a_stale_value_is_eagain"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::futex::futex_wait_with_a_stale_value_is_eagain"
+pr = 2408
+
+[[retired]]
+test = "semantics::futex::futex_wake_returns_the_number_woken"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::futex::futex_wake_returns_the_number_woken"
+pr = 2408
+
+[[retired]]
+test = "semantics::futex_contention::futex_cmp_requeue_moves_and_wakes_the_correct_counts"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::futex_contention::futex_cmp_requeue_moves_and_wakes_the_correct_counts"
+pr = 2408
+
+[[retired]]
+test = "semantics::futex_contention::futex_cmp_requeue_with_stale_val3_returns_eagain"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::futex_contention::futex_cmp_requeue_with_stale_val3_returns_eagain"
+pr = 2408
+
+[[retired]]
+test = "semantics::futex_contention::futex_pi_lock_unlock_deadlock_detection"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::futex_contention::futex_pi_lock_unlock_deadlock_detection"
+pr = 2408
+
+[[retired]]
+test = "semantics::futex_contention::futex_requeue_durability_across_signal_broadcast"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::futex_contention::futex_requeue_durability_across_signal_broadcast"
+pr = 2408
+
+[[retired]]
+test = "semantics::futex_contention::futex_wait_zero_timeout_returns_etimedout_immediately"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::futex_contention::futex_wait_zero_timeout_returns_etimedout_immediately"
+pr = 2408
+
+[[retired]]
+test = "semantics::futex_contention::futex_wake_of_unshared_address_across_fork_is_zero"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::futex_contention::futex_wake_of_unshared_address_across_fork_is_zero"
+pr = 2408
+
+[[retired]]
+test = "semantics::identity::getpid_and_getppid_for_init_process"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::identity::getpid_and_getppid_for_init_process"
+pr = 2408
+
+[[retired]]
+test = "semantics::identity::getppid_returns_parent_pid_after_fork"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::identity::getppid_returns_parent_pid_after_fork"
+pr = 2408
+
+[[retired]]
+test = "semantics::identity::getppid_updates_on_reparenting_to_init"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::identity::getppid_updates_on_reparenting_to_init"
+pr = 2408
+
+[[retired]]
+test = "semantics::identity::gettid_differs_from_parent_tid_in_thread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::identity::gettid_differs_from_parent_tid_in_thread"
+pr = 2408
+
+[[retired]]
+test = "semantics::identity::identity_and_credential_syscalls_are_consistent_across_fork"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::identity::identity_and_credential_syscalls_are_consistent_across_fork"
+pr = 2408
+
+[[retired]]
+test = "semantics::inotify_watch::inotify_watch_lifecycle_in_host_fs"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::inotify_watch::inotify_watch_lifecycle_in_host_fs"
+pr = 2408
+
+[[retired]]
+test = "semantics::inotify_watch::partial_positive_write_notifies_on_both_backends"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::inotify_watch::partial_positive_write_notifies_on_both_backends"
+pr = 2408
+
+[[retired]]
+test = "semantics::inotify_watch::rejected_write_does_not_modify_or_consume_watch"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::inotify_watch::rejected_write_does_not_modify_or_consume_watch"
+pr = 2408
+
+[[retired]]
+test = "semantics::inotify_watch::rejected_write_does_not_modify_or_consume_watch_in_memory"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::inotify_watch::rejected_write_does_not_modify_or_consume_watch_in_memory"
+pr = 2408
+
+[[retired]]
+test = "semantics::inotify_watch::repeated_host_writes_refresh_cached_size"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::inotify_watch::repeated_host_writes_refresh_cached_size"
+pr = 2408
+
+[[retired]]
+test = "semantics::pgrp::a_parent_may_move_a_child_into_the_parents_group_before_exec"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pgrp::a_parent_may_move_a_child_into_the_parents_group_before_exec"
+pr = 2408
+
+[[retired]]
+test = "semantics::pgrp::kill_minus_pgid_reaches_every_member_and_kill_zero_reaches_the_callers_group"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pgrp::kill_minus_pgid_reaches_every_member_and_kill_zero_reaches_the_callers_group"
+pr = 2408
+
+[[retired]]
+test = "semantics::pgrp::kill_of_a_non_existent_pid_is_esrch"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pgrp::kill_of_a_non_existent_pid_is_esrch"
+pr = 2408
+
+[[retired]]
+test = "semantics::pgrp::kill_signal_zero_probes_existence"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pgrp::kill_signal_zero_probes_existence"
+pr = 2408
+
+[[retired]]
+test = "semantics::pgrp::setpgid_on_a_child_in_another_session_is_eperm"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pgrp::setpgid_on_a_child_in_another_session_is_eperm"
+pr = 2408
+
+[[retired]]
+test = "semantics::pgrp::setpgid_zero_zero_makes_the_caller_a_group_leader"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pgrp::setpgid_zero_zero_makes_the_caller_a_group_leader"
+pr = 2408
+
+[[retired]]
+test = "semantics::pgrp::setsid_by_a_group_leader_is_eperm"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pgrp::setsid_by_a_group_leader_is_eperm"
+pr = 2408
+
+[[retired]]
+test = "semantics::pgrp::wait4_minus_nonexistent_pgid_returns_echild"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pgrp::wait4_minus_nonexistent_pgid_returns_echild"
+pr = 2408
+
+[[retired]]
+test = "semantics::pgrp::zombie_keeps_process_group_membership_until_reaped"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pgrp::zombie_keeps_process_group_membership_until_reaped"
+pr = 2408
+
+[[retired]]
+test = "semantics::pidfd::a_pidfd_becomes_readable_when_the_process_exits"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pidfd::a_pidfd_becomes_readable_when_the_process_exits"
+pr = 2408
+
+[[retired]]
+test = "semantics::pidfd::pidfd_open_on_a_reaped_pid_is_esrch"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pidfd::pidfd_open_on_a_reaped_pid_is_esrch"
+pr = 2408
+
+[[retired]]
+test = "semantics::pidfd::pidfd_send_signal_kills_the_child"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pidfd::pidfd_send_signal_kills_the_child"
+pr = 2408
+
+[[retired]]
+test = "semantics::pidfd::waitid_p_pidfd_reaps_through_the_descriptor"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pidfd::waitid_p_pidfd_reaps_through_the_descriptor"
+pr = 2408
+
+[[retired]]
+test = "semantics::pipe::a_dup2d_write_end_keeps_the_pipe_open_until_both_descriptors_close"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pipe::a_dup2d_write_end_keeps_the_pipe_open_until_both_descriptors_close"
+pr = 2408
+
+[[retired]]
+test = "semantics::pipe::fionread_reports_queued_bytes_on_the_read_end_and_on_the_write_end"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pipe::fionread_reports_queued_bytes_on_the_read_end_and_on_the_write_end"
+pr = 2408
+
+[[retired]]
+test = "semantics::pipe::o_nonblock_read_on_an_empty_pipe_is_eagain_and_write_to_a_full_pipe_is_eagain"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pipe::o_nonblock_read_on_an_empty_pipe_is_eagain_and_write_to_a_full_pipe_is_eagain"
+pr = 2408
+
+[[retired]]
+test = "semantics::pipe::read_returns_zero_only_after_every_writer_closes"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pipe::read_returns_zero_only_after_every_writer_closes"
+pr = 2408
+
+[[retired]]
+test = "semantics::pipe::write_to_a_pipe_with_no_readers_dies_by_sigpipe"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pipe::write_to_a_pipe_with_no_readers_dies_by_sigpipe"
+pr = 2408
+
+[[retired]]
+test = "semantics::pipe::write_with_sigpipe_ignored_is_epipe"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pipe::write_with_sigpipe_ignored_is_epipe"
+pr = 2408
+
+[[retired]]
+test = "semantics::pipe::writes_up_to_pipe_buf_are_atomic_across_two_writers"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::pipe::writes_up_to_pipe_buf_are_atomic_across_two_writers"
+pr = 2408
+
+[[retired]]
+test = "semantics::signal::ignored_signal_does_not_terminate_process"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::signal::ignored_signal_does_not_terminate_process"
+pr = 2408
+
+[[retired]]
+test = "semantics::signal::kill_child_with_sigterm_produces_signal_death"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::signal::kill_child_with_sigterm_produces_signal_death"
+pr = 2408
+
+[[retired]]
+test = "semantics::signal::sigchld_is_delivered_on_child_exit"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::signal::sigchld_is_delivered_on_child_exit"
+pr = 2408
+
+[[retired]]
+test = "semantics::signal::signal_mask_is_inherited_across_fork"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::signal::signal_mask_is_inherited_across_fork"
+pr = 2408
+
+[[retired]]
+test = "semantics::signal::signalfd4_delivers_pending_signal_as_read"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::signal::signalfd4_delivers_pending_signal_as_read"
+pr = 2408
+
+[[retired]]
+test = "semantics::signal::tgkill_targets_specific_thread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::signal::tgkill_targets_specific_thread"
+pr = 2408
+
+[[retired]]
+test = "semantics::threads::a_thread_exiting_alone_leaves_the_process_running"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::threads::a_thread_exiting_alone_leaves_the_process_running"
+pr = 2408
+
+[[retired]]
+test = "semantics::threads::clone_thread_shares_the_fd_table_and_memory_and_exit_group_ends_every_thread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::threads::clone_thread_shares_the_fd_table_and_memory_and_exit_group_ends_every_thread"
+pr = 2408
+
+[[retired]]
+test = "semantics::threads::fork_from_multithreaded_parent_reaps_child_exit_zero"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::threads::fork_from_multithreaded_parent_reaps_child_exit_zero"
+pr = 2408
+
+[[retired]]
+test = "semantics::threads::leader_exits_first_and_final_sibling_exit_retires_process"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::threads::leader_exits_first_and_final_sibling_exit_retires_process"
+pr = 2408
+
+[[retired]]
+test = "semantics::threads::root_leader_parked_and_sibling_exit_group_terminates_with_exit_code"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::threads::root_leader_parked_and_sibling_exit_group_terminates_with_exit_code"
+pr = 2408
+
+[[retired]]
+test = "semantics::threads::second_process_kill_resolves_a_just_published_thread"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::threads::second_process_kill_resolves_a_just_published_thread"
+pr = 2408
+
+[[retired]]
+test = "semantics::threads::single_root_thread_exit_retires_process_with_exit_code"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::threads::single_root_thread_exit_retires_process_with_exit_code"
+pr = 2408
+
+[[retired]]
+test = "semantics::threads::tgkill_wakes_the_exact_sibling_signal_waiter"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::threads::tgkill_wakes_the_exact_sibling_signal_waiter"
+pr = 2408
+
+[[retired]]
+test = "semantics::threads::thread_clone_at_rlimit_nproc_is_eagain_across_two_live_processes"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::threads::thread_clone_at_rlimit_nproc_is_eagain_across_two_live_processes"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::a_descriptor_passed_over_scm_rights_reads_the_same_pipe"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::a_descriptor_passed_over_scm_rights_reads_the_same_pipe"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::recv_on_a_stream_socket_whose_peer_closed_returns_zero"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::recv_on_a_stream_socket_whose_peer_closed_returns_zero"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::recvmsg_control_truncation_sets_msg_ctrunc"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::recvmsg_control_truncation_sets_msg_ctrunc"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::scm_credentials_carry_the_senders_pid_uid_gid"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::scm_credentials_carry_the_senders_pid_uid_gid"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::scm_credentials_deferred_read_after_sender_exit_and_reap"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::scm_credentials_deferred_read_after_sender_exit_and_reap"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::scm_credentials_explicit_unprivileged_forgery_returns_eperm"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::scm_credentials_explicit_unprivileged_forgery_returns_eperm"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::scm_credentials_peek_does_not_consume"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::scm_credentials_peek_does_not_consume"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::scm_credentials_stream_read_capping_across_multiple_senders"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::scm_credentials_stream_read_capping_across_multiple_senders"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::scm_credentials_synthesized_for_plain_write"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::scm_credentials_synthesized_for_plain_write"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::scm_credentials_tracks_multiple_forked_senders_and_preserves_so_peercred"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::scm_credentials_tracks_multiple_forked_senders_and_preserves_so_peercred"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::scm_credentials_zero_length_datagram_and_subsequent_datagram"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::scm_credentials_zero_length_datagram_and_subsequent_datagram"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::send_after_peer_close_is_epipe_with_msg_nosignal"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::send_after_peer_close_is_epipe_with_msg_nosignal"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::send_after_peer_close_without_msg_nosignal_terminates_with_sigpipe"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::send_after_peer_close_without_msg_nosignal_terminates_with_sigpipe"
+pr = 2408
+
+[[retired]]
+test = "semantics::unix::so_peercred_names_the_peer_process"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::unix::so_peercred_names_the_peer_process"
+pr = 2408
+
+[[retired]]
+test = "semantics::wait::a_zombie_is_reaped_exactly_once"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::wait::a_zombie_is_reaped_exactly_once"
+pr = 2408
+
+[[retired]]
+test = "semantics::wait::an_orphan_is_reparented_to_init_which_can_reap_it"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::wait::an_orphan_is_reparented_to_init_which_can_reap_it"
+pr = 2408
+
+[[retired]]
+test = "semantics::wait::prctl_set_child_subreaper_receives_the_grandchild"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::wait::prctl_set_child_subreaper_receives_the_grandchild"
+pr = 2408
+
+[[retired]]
+test = "semantics::wait::sigchld_set_to_sig_ign_autoreaps_and_wait4_reports_echild"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::wait::sigchld_set_to_sig_ign_autoreaps_and_wait4_reports_echild"
+pr = 2408
+
+[[retired]]
+test = "semantics::wait::wait4_minus_one_reaps_any_child_and_echild_when_none_remain"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::wait::wait4_minus_one_reaps_any_child_and_echild_when_none_remain"
+pr = 2408
+
+[[retired]]
+test = "semantics::wait::waitid_wnowait_leaves_the_zombie_and_a_second_waitid_consumes_it"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::wait::waitid_wnowait_leaves_the_zombie_and_a_second_waitid_consumes_it"
+pr = 2408
+
+[[retired]]
+test = "semantics::wait::wnohang_returns_zero_while_the_child_lives_then_reaps_it"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::semantics::wait::wnohang_returns_zero_while_the_child_lives_then_reaps_it"
+pr = 2408
+
+[[retired]]
+test = "setid_birth_admission::setid_during_a_claimed_sibling_birth_completes_without_wait_or_errno"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::setid_birth_admission::setid_during_a_claimed_sibling_birth_completes_without_wait_or_errno"
+pr = 2408
+
+[[retired]]
+test = "socket_close::tcp_local_shut_rd_dup_alias_lifecycle"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_close::tcp_local_shut_rd_dup_alias_lifecycle"
+pr = 2408
+
+[[retired]]
+test = "socket_close::tcp_local_shut_rd_wakes_epoll_with_epollrdhup"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_close::tcp_local_shut_rd_wakes_epoll_with_epollrdhup"
+pr = 2408
+
+[[retired]]
+test = "socket_close::tcp_local_shut_rd_with_in_and_rdhup_interest"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_close::tcp_local_shut_rd_with_in_and_rdhup_interest"
+pr = 2408
+
+[[retired]]
+test = "socket_close::tcp_local_shut_rdwr_wakes_epoll_with_epollrdhup"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_close::tcp_local_shut_rdwr_wakes_epoll_with_epollrdhup"
+pr = 2408
+
+[[retired]]
+test = "socket_close::tcp_local_shut_wr_negative_control_no_rdhup"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_close::tcp_local_shut_wr_negative_control_no_rdhup"
+pr = 2408
+
+[[retired]]
+test = "socket_close::tcp_peer_close_wakes_epoll_with_epollrdhup"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_close::tcp_peer_close_wakes_epoll_with_epollrdhup"
+pr = 2408
+
+[[retired]]
+test = "socket_close::tcp_peer_shut_wr_live_peer_handshake"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_close::tcp_peer_shut_wr_live_peer_handshake"
+pr = 2408
+
+[[retired]]
+test = "socket_close::unix_socketpair_local_shut_rd_wakes_epoll_with_epollrdhup"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_close::unix_socketpair_local_shut_rd_wakes_epoll_with_epollrdhup"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::af_unix_recv_errqueue_ignores_flag_and_returns_payload"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::af_unix_recv_errqueue_ignores_flag_and_returns_payload"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::af_unix_recv_errqueue_on_eof_ignores_flag_and_returns_zero"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::af_unix_recv_errqueue_on_eof_ignores_flag_and_returns_zero"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::recvfrom_empty_socket_invalid_addrlen_returns_eagain"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::recvfrom_empty_socket_invalid_addrlen_returns_eagain"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::recvfrom_queued_data_negative_addrlen_returns_einval_and_consumes_data"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::recvfrom_queued_data_negative_addrlen_returns_einval_and_consumes_data"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::recvfrom_queued_data_null_addrlen_returns_efault_and_consumes_data"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::recvfrom_queued_data_null_addrlen_returns_efault_and_consumes_data"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::recvfrom_unnamed_socketpair_updates_addrlen_to_zero"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::recvfrom_unnamed_socketpair_updates_addrlen_to_zero"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::recvmsg_invalid_namelen_precedence_over_errqueue_returns_einval"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::recvmsg_invalid_namelen_precedence_over_errqueue_returns_einval"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::sctp_connect_preserves_client_and_accepted_protocol_identity"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::sctp_connect_preserves_client_and_accepted_protocol_identity"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::sctp_recvfrom_preserves_source_address"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::sctp_recvfrom_preserves_source_address"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::sctp_recvmsg_message_boundaries_and_eor"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::sctp_recvmsg_message_boundaries_and_eor"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::sctp_recvmsg_preserves_source_address"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::sctp_recvmsg_preserves_source_address"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::sctp_unread_close_preserves_peer_reset"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::sctp_unread_close_preserves_peer_reset"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::tcp_recv_empty_errqueue_on_eof_returns_eagain_then_regular_recv_returns_zero"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::tcp_recv_empty_errqueue_on_eof_returns_eagain_then_regular_recv_returns_zero"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::tcp_recv_empty_errqueue_returns_eagain_and_preserves_stream_payload"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::tcp_recv_empty_errqueue_returns_eagain_and_preserves_stream_payload"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::tcp_recvfrom_ignores_source_pointer_for_payload_and_eof"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::tcp_recvfrom_ignores_source_pointer_for_payload_and_eof"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::tcp_recvfrom_queued_data_errqueue_with_invalid_addrlen_returns_eagain_and_preserves_data"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::tcp_recvfrom_queued_data_errqueue_with_invalid_addrlen_returns_eagain_and_preserves_data"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::tcp_recvmsg_bad_iovec_pointer_returns_efault_before_errqueue"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::tcp_recvmsg_bad_iovec_pointer_returns_efault_before_errqueue"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::tcp_recvmsg_cmsg_cloexec_echoes_in_msg_flags"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::tcp_recvmsg_cmsg_cloexec_echoes_in_msg_flags"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::tcp_recvmsg_empty_errqueue_returns_eagain_and_preserves_stream_payload"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::tcp_recvmsg_empty_errqueue_returns_eagain_and_preserves_stream_payload"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::tcp_recvmsg_ignores_source_pointer"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::tcp_recvmsg_ignores_source_pointer"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::tcp_recvmsg_long_ancillary_buffer_zeroes_msg_controllen_and_msg_flags"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::tcp_recvmsg_long_ancillary_buffer_zeroes_msg_controllen_and_msg_flags"
+pr = 2408
+
+[[retired]]
+test = "socket_receive::tcp_recvmsg_null_name_negative_namelen_errqueue_returns_eagain"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::socket_receive::tcp_recvmsg_null_name_negative_namelen_errqueue_returns_eagain"
+pr = 2408
+
+[[retired]]
+test = "spawn_birth_capacity::first_host_thread_clone_primes_executable_sibling_capacity"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::spawn_birth_capacity::first_host_thread_clone_primes_executable_sibling_capacity"
+pr = 2408
+
+[[retired]]
+test = "spawn_birth_capacity::process_only_startup_reserves_no_sibling_runtime_capacity"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::spawn_birth_capacity::process_only_startup_reserves_no_sibling_runtime_capacity"
+pr = 2408
+
+[[retired]]
+test = "stdio_host_wait_contention::stdio_writer_mutex_contention_allows_spare_progression_and_mm_mutation"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::stdio_host_wait_contention::stdio_writer_mutex_contention_allows_spare_progression_and_mm_mutation"
+pr = 2408
+
+[[retired]]
+test = "stdio_inherited_backpressure::inherited_stdio_backpressure_and_pinning_in_host_wait"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::stdio_inherited_backpressure::inherited_stdio_backpressure_and_pinning_in_host_wait"
+pr = 2408
+
+[[retired]]
+test = "unicode_paths::test_unicode_composed_vs_decomposed_alias_protection"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::unicode_paths::test_unicode_composed_vs_decomposed_alias_protection"
+pr = 2408
+
+[[retired]]
+test = "unicode_paths::test_unicode_file_create_write_read_reopen_unlink"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::unicode_paths::test_unicode_file_create_write_read_reopen_unlink"
+pr = 2408
+
+[[retired]]
+test = "unicode_paths::test_unicode_hardlink_exact_name_retained"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::unicode_paths::test_unicode_hardlink_exact_name_retained"
+pr = 2408
+
+[[retired]]
+test = "unicode_paths::test_unicode_rename_and_replacement"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::unicode_paths::test_unicode_rename_and_replacement"
+pr = 2408
+
+[[retired]]
+test = "unicode_paths::test_unicode_symlink_and_directory_names"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::unicode_paths::test_unicode_symlink_and_directory_names"
+pr = 2408
+
+[[retired]]
+test = "unicode_paths::test_unicode_lookup_bounds_directory_entry_visits_with_siblings"
+reason = "#2408: consolidated carrick-kernel-example integration tests into the single main test binary."
+replaced_by = "main::unicode_paths::test_unicode_lookup_bounds_directory_entry_visits_with_siblings"
+pr = 2408

@@ -9,7 +9,7 @@ rationale = "Normal native execution must retain exact census membership and a p
 
 [bindings]
 vm_free = [
-  "carrick-kernel-example::native_execution_scope::native_execution_scope_contract; kernel native_execution tests; runtime native_admission_allows_carrier_cow_without_hardware_ack and mixed hardware-owner COW composition",
+  "carrick-kernel-example::main::native_execution_scope::native_execution_scope_contract; kernel native_execution tests; runtime native_admission_allows_carrier_cow_without_hardware_ack and mixed hardware-owner COW composition",
 ]
 
 [bindings.unresolved]

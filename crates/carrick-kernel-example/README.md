@@ -72,7 +72,7 @@ support is not a kernel conformance defect.
 | `src/scripted.rs` | Script execution, process construction, fork, and retirement through public kernel operations. |
 | `src/driver.rs` | Outcome handling and kernel continuation enrollment; bounded parking on `CarrierWaitService`. |
 | `src/process.rs` | `CarrierProcess`, `MmBackend`, and `Stage1MmProjection` implementations with exact kernel identity and address-space bindings. |
-| `tests/fork_pipe_wait.rs` | Harness contracts, including lost-wake bounds and dispatch counts. |
+| `tests/main/fork_pipe_wait.rs` | Harness contracts, including lost-wake bounds and dispatch counts. |
 | `tests/semantics/` | Linux semantics across processes and threads, grouped by syscall domain. |
 
 The driver shares continuation completion and signal policy with the real

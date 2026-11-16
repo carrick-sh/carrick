@@ -25,7 +25,7 @@ description = "Modification events follow positive write completion; rejected an
 linux_authority = ["man 2 write", "man 7 inotify", "probe:inotifywrite"]
 fixture_requirements = ["probe:inotifywrite", "probe:inotifymatrix"]
 related_contracts = ["kernel.fs.write-seek"]
-capability = { class = "vm-free-existing", capability = "carrick-kernel-example::inotify_watch_contract and semantics::inotify_watch" }
+capability = { class = "vm-free-existing", capability = "carrick-kernel-example::inotify_watch_contract and main::semantics::inotify_watch" }
 coverage = { status = "bound", layer = "vm-free" }
 
 [[claims]]

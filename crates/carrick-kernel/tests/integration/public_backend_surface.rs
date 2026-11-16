@@ -35,7 +35,7 @@
 //! It is NOT a check on what `crates/carrick-kernel-example` consumes: the
 //! example takes `carrick-kernel` with no features and brings its OWN
 //! `CarrierProcess` / `MmBackend` / `Stage1MmProjection` impls, which is the
-//! bring-your-own-backend point. Its `tests/fork_pipe_wait.rs` is the standing
+//! bring-your-own-backend point. Its `tests/main/fork_pipe_wait.rs` is the standing
 //! check on the ungated public surface; this file is the standing check on the
 //! gated doubles.
 

@@ -47,7 +47,7 @@ vm_free = [
   "carrick-el1-linux::x86_production_forward::x86_clone_child_serves_stdout_stat_write_and_own_redirect (production CPL0 entry and native owner publish EFAULT on atomic copy fault)",
   "carrick-el1-linux::sched::tests::production_futex_wait_switch_keeps_successor_result_separate_from_wait_result (two live threads, production entry; successor write result 28, original op 393 result zero, two parks and two switches; attribution control only)",
   "carrick-el1-linux::sched::tests::{cancelled_on_cpu_thread_is_not_stranded_by_repark,signal_requested_on_cpu_is_not_lost_by_repark}",
-  "carrick-kernel-example::scheduler_handoff::self_affinity_change_requires_migration_before_return",
+  "carrick-kernel-example::main::scheduler_handoff::self_affinity_change_requires_migration_before_return",
   "carrick-kernel::el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record (test-only observation extension: source-hashed retired-delivery publication count at 1/8/32, enforced by kernel.el1.deferred-handback-identity; no new guest scheduling, live-path cost or signed acceptance)",
   "carrick-kernel::el1_zone::tests::{deferred_slot_handback_does_not_wake_a_reused_record,deferred_slot_handback_preserves_live_records} (deferred incarnation preservation only; signed historical-failure attribution remains open)",
   "carrick-kernel::kernel::scheduler::tests::{a_deferred_zone_handback_does_not_audit_a_reaped_target,zone_handback_authenticates_the_registered_continuation} (exact deferred wake target, reaped-task no-op and matching continuation delivery; VM-free only)",
