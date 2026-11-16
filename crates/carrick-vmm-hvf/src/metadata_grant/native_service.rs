@@ -272,7 +272,7 @@ impl NativeService {
         match served {
             Ok(reply @ carrick_hal::fork_stock::NativeHostFileReply::HostReadyWait { .. }) => {
                 // No reply was written: the member waits on its own
-                // host-readiness queue and reruns the call (#231).
+                // host-readiness queue and publishes the call's record again (#231).
                 let wait = reply
                     .owner_wait(request.identity.birth.mm)
                     .ok_or_else(stale)?;

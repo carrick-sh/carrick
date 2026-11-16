@@ -1004,7 +1004,7 @@ impl CarrierWaitServiceInner {
             if result < 0 {
                 if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                     // A host refusal of the wait itself: every native member
-                    // reruns its call once and re-enrols, rather than wait
+                    // publishes its call's record once and re-enrols, rather than wait
                     // unseen.
                     let woken = inner.state.lock().host_ready.take_all();
                     for wait in woken {

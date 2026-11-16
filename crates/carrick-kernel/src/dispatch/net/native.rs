@@ -15,8 +15,8 @@
 //! (`socket`, `accept`) leaves the scratch table for the caller's own ring
 //! namespace. A call that would block answers an owner wait on the member's
 //! host-readiness queue, sampled before the call, and the host descriptor is
-//! enrolled with the carrier's one wait reactor; the member reruns the call
-//! when it is ready.
+//! enrolled with the carrier's one wait reactor; the member publishes the
+//! call's record again when it is ready.
 
 use std::sync::Arc;
 

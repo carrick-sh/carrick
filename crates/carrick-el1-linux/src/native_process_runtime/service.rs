@@ -273,7 +273,8 @@ impl PendingService<'_> {
     /// A caught signal interrupts a guest wait, not an internal obligation
     /// that must finish before its committed context can return to user code.
     /// The service parked on its member's host-readiness queue (#231): no
-    /// reply exists, and the call reruns or reports its interruption.
+    /// reply exists, and the call publishes its record again or reports its
+    /// interruption.
     fn waited_on_host_readiness(&self) -> bool {
         self.wait
             .is_some_and(|wait| wait.cause() == carrick_core_abi::PortalWaitCause::HostReadiness)

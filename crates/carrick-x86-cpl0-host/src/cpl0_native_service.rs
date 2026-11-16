@@ -407,7 +407,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .and_then(|reply| reply.owner_wait(pending.ticket.request().identity.birth.mm));
         match &served {
             // No reply was written: the member waits on its host-readiness
-            // queue and reruns the call.
+            // queue and publishes the call's record again.
             Ok(carrick_hal::fork_stock::NativeHostFileReply::HostReadyWait { .. }) => {}
             Ok(carrick_hal::fork_stock::NativeHostFileReply::Replied(None)) => {
                 let physical = kernel_pod_physical(
