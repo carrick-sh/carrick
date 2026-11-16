@@ -5,10 +5,11 @@ guest_surfaces = ["syscall:madvise"]
 semantic_authority = ["Linux private anonymous zero-fill and fork isolation"]
 fixture = "unit:anonymous-discard-no-scrub"
 scale_points = [1, 8, 32, 128]
-rationale = "A successful backend retirement must replace the fallback scrub, not precede another clear. Unsupported backends retain the authenticated scrub."
+rationale = "A successful backend retirement must replace the fallback scrub, not precede another clear. An admitted MM's owner retires its private anonymous nodes instead of the scrub it refuses. Unsupported host-setup backends retain the authenticated scrub."
 [bindings]
 vm_free = [
   "carrick-kernel::dispatch::mem::madvise::tests::anonymous_discard_avoids_scrub_contract",
+  "carrick-kernel::dispatch::mem::delegated_tests::delegated_v8_code_range_dontneed_retires_through_the_owner",
 ]
 embed = [
   "carrick-conformance-next::deferred_anonymous_pristine_scrub_semantics",
