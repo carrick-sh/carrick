@@ -911,6 +911,19 @@ impl RootFsVfs {
     }
 
     /// Set owner on an open host file descriptor and update dentry cache.
+    /// The guest-visible (uid, gid) of an open host fd, as fstat reports
+    /// it: its owner xattrs, root for either one unset.
+    pub fn fget_owner(
+        &self,
+        raw_fd: std::os::fd::RawFd,
+    ) -> (carrick_abi::NsUid, carrick_abi::NsGid) {
+        let (uid, gid) = crate::fs_backend::fget_owner_xattr(raw_fd);
+        (
+            uid.unwrap_or(carrick_abi::NsUid::ROOT),
+            gid.unwrap_or(carrick_abi::NsGid::ROOT),
+        )
+    }
+
     pub fn fset_owner(
         &self,
         raw_fd: std::os::fd::RawFd,
