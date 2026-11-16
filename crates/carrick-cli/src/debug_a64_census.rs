@@ -182,7 +182,7 @@ impl Census {
     }
     fn report(&self, input: &[u8], mode: &str, compiler: &str) -> Value {
         json!({"schema":"carrick.a64-census.v1", "tool_version":env!("CARGO_PKG_VERSION"),
-            "classifier":"hand-authored-a64-v1", "compiler_query":compiler,
+            "classifier":"hand-authored-a64-v1", "compiler":compiler,
             "scope":"EL1 plus loader; EL0 fixture closure is slice 0b", "input_mode":mode,
             "input_sha256":sha(input), "spans":self.spans,"counts":self.counts,
             "system_registers":self.registers,"unknown_count":self.unknown.len(),"unknown":self.unknown})
@@ -247,14 +247,13 @@ pub(crate) fn run(input: Option<&Path>) -> Result<()> {
             }
         }
     }
-    let compiler = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()?;
-    ensure!(compiler.status.success(), "rustc version query failed");
-    let compiler = String::from_utf8(compiler.stdout)?;
     println!(
         "{}",
-        serde_json::to_string_pretty(&census.report(&bytes, mode, compiler.trim()))?
+        serde_json::to_string_pretty(&census.report(
+            &bytes,
+            mode,
+            env!("CARRICK_CENSUS_COMPILER")
+        ))?
     );
     census.finish()
 }
