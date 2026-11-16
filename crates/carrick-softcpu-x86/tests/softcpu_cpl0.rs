@@ -1469,3 +1469,54 @@ fn faulting_iretq_and_idt_preserve_gdt_accessed_bit_and_cpuid_tsc_are_consistent
         "faulting IDT delivery must not set CS Accessed bit"
     );
 }
+
+#[test]
+fn softmachine_vcpus_execute_the_shared_cpuid_contract() {
+    for apic_id in [0, 1, 7] {
+        let hz = 1_000_000_000;
+        let expected = carrick_x86::GuestCpuidView::default()
+            .with_apic_id(apic_id)
+            .with_tsc(carrick_x86::TscCrystalRatio::from_hz(hz));
+        let (_, mem, _) = setup_cpl0_cpu(
+            &[0x0f, 0xa2],
+            Box::new(Cpl0CpuidView::with_tsc_deadline(apic_id, hz as u32)),
+        );
+        let mut machine = SoftMachine::new(
+            mem,
+            Box::new(Cpl0CpuidView::with_tsc_deadline(apic_id, hz as u32)),
+        )
+        .unwrap();
+        enter_cpl0(machine.context_mut(), CODE_VA);
+        machine.context_mut().cr4 |= 1 << 18;
+        machine.context_mut().xcr0 = 7;
+        for (leaf, subleaf) in [
+            (1, 0),
+            (7, 0),
+            (0xd, 0),
+            (0xd, 1),
+            (0xd, 2),
+            (0xb, 0),
+            (0xb, 1),
+            (0xb, 2),
+            (0x15, 0),
+        ] {
+            let ctx = machine.context_mut();
+            ctx.rip = CODE_VA;
+            ctx.gpr[reg::RAX] = leaf as u64;
+            ctx.gpr[reg::RCX] = subleaf as u64;
+            machine.run(1).unwrap();
+            let ctx = machine.context();
+            let got = CpuidRegs::new(
+                ctx.gpr[reg::RAX] as u32,
+                ctx.gpr[reg::RBX] as u32,
+                ctx.gpr[reg::RCX] as u32,
+                ctx.gpr[reg::RDX] as u32,
+            );
+            assert_eq!(
+                got,
+                expected.cpuid(leaf, subleaf),
+                "vcpu {apic_id} leaf {leaf:#x}/{subleaf}"
+            );
+        }
+    }
+}
