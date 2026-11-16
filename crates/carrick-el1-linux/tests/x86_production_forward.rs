@@ -2746,19 +2746,19 @@ fn x86_epoll_ctl_on_a_ring_non_epoll_fd_is_served_einval() {
     drop(held);
 }
 
-/// #2361: a ring stream pair's end answers its socket calls in ring on x86
-/// too, through the CPL0 entry and the shared IPC venue (x86 has no socket
-/// crossing: before #2361 each was a counted ENOSYS). `getsockopt` reports
-/// an AF_UNIX stream, `getsockname` an unnamed address, `shutdown(SHUT_WR)`
-/// is served, and `sendmsg` is refused in ring with EOPNOTSUPP (the ring
-/// carries no ancillary data).
-#[test]
-fn x86_socket_calls_on_a_ring_stream_end_are_served() {
+/// A ring stream pair installed as fds 3 (first end) and 4 (second end) in
+/// the ring table of a CPL0 task, and `body` given that task's x86 syscall
+/// entry, the IPC owner and the pair's object.
+fn with_x86_ring_stream_pair<R>(
+    body: impl FnOnce(
+        &dyn Fn(u64, [u64; 6]) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+        &carrick_kernel::el1_ipc::HostIpc,
+        carrick_el1_abi::ipc::IpcObjectHandle,
+    ) -> R,
+) -> R {
     use carrick_el1_abi::ipc::{IpcBacking, StreamEnd, fd};
     use carrick_el1_linux::ipc::{IpcVenue, MapTables};
     use carrick_kernel::el1_ipc::{HostIpc, HostTable};
-    use carrick_personality_linux::dispatch::CompletionRoute;
-    use carrick_test_support::GuestUserBuffer;
     use std::sync::Arc;
 
     let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
@@ -2838,52 +2838,103 @@ fn x86_socket_calls_on_a_ring_stream_end_are_served() {
         );
         (route, frame.rax as i64)
     };
-    // x86_64: getsockopt 55, getsockname 51, shutdown 48, sendmsg 46.
-    let value = GuestUserBuffer::zeroed(4);
-    let length = GuestUserBuffer::from_value(4u32);
-    assert_eq!(
-        call(55, [3, 1, 3, value.arg(), length.arg(), 0]),
-        (CompletionRoute::Served, 0),
-        "getsockopt(SOL_SOCKET, SO_TYPE)"
-    );
-    assert_eq!(value.as_bytes(), &1i32.to_ne_bytes(), "SOCK_STREAM");
-    let address = GuestUserBuffer::zeroed(16);
-    let address_len = GuestUserBuffer::from_value(16u32);
-    assert_eq!(
-        call(51, [4, address.arg(), address_len.arg(), 0, 0, 0]),
-        (CompletionRoute::Served, 0),
-        "getsockname"
-    );
-    assert_eq!(address_len.as_bytes(), &2u32.to_ne_bytes());
-    assert_eq!(&address.as_bytes()[..2], &1u16.to_ne_bytes(), "AF_UNIX");
-    assert_eq!(
-        call(48, [4, 1, 0, 0, 0, 0]),
-        (CompletionRoute::Served, 0),
-        "shutdown(SHUT_WR)"
-    );
-    {
-        let mut guard = owner
-            .region()
-            .lock(object, &carrick_sched_core::ShortLockSpin)
-            .unwrap();
-        assert_eq!(
-            guard
-                .stream_lane(StreamEnd::Second)
-                .unwrap()
-                .references(carrick_el1_abi::ipc::pipe::End::Writer),
-            0,
-            "the second end's writes are shut"
-        );
-    }
-    let header = GuestUserBuffer::zeroed(56);
-    assert_eq!(
-        call(46, [3, header.arg(), 0, 0, 0, 0]),
-        (
-            CompletionRoute::Served,
-            carrick_syscall_abi::LINUX_EOPNOTSUPP.guest_retval()
-        ),
-        "sendmsg is refused in ring"
-    );
+    let result = body(&call, &owner, object);
     assert_eq!(isa_unsupported.load(Ordering::Relaxed), 0);
     drop(held);
+    result
+}
+
+/// #2361: a ring stream pair's end answers its socket calls in ring on x86
+/// too, through the CPL0 entry and the shared IPC venue (x86 has no socket
+/// crossing: before #2361 each was a counted ENOSYS). `getsockopt` reports
+/// an AF_UNIX stream, `getsockname` an unnamed address, `shutdown(SHUT_WR)`
+/// is served, and `sendmsg` is refused in ring with EOPNOTSUPP (the ring
+/// carries no ancillary data).
+#[test]
+fn x86_socket_calls_on_a_ring_stream_end_are_served() {
+    use carrick_el1_abi::ipc::StreamEnd;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
+
+    with_x86_ring_stream_pair(|call, owner, object| {
+        // x86_64: getsockopt 55, getsockname 51, shutdown 48, sendmsg 46.
+        let value = GuestUserBuffer::zeroed(4);
+        let length = GuestUserBuffer::from_value(4u32);
+        assert_eq!(
+            call(55, [3, 1, 3, value.arg(), length.arg(), 0]),
+            (CompletionRoute::Served, 0),
+            "getsockopt(SOL_SOCKET, SO_TYPE)"
+        );
+        assert_eq!(value.as_bytes(), &1i32.to_ne_bytes(), "SOCK_STREAM");
+        let address = GuestUserBuffer::zeroed(16);
+        let address_len = GuestUserBuffer::from_value(16u32);
+        assert_eq!(
+            call(51, [4, address.arg(), address_len.arg(), 0, 0, 0]),
+            (CompletionRoute::Served, 0),
+            "getsockname"
+        );
+        assert_eq!(address_len.as_bytes(), &2u32.to_ne_bytes());
+        assert_eq!(&address.as_bytes()[..2], &1u16.to_ne_bytes(), "AF_UNIX");
+        assert_eq!(
+            call(48, [4, 1, 0, 0, 0, 0]),
+            (CompletionRoute::Served, 0),
+            "shutdown(SHUT_WR)"
+        );
+        {
+            let mut guard = owner
+                .region()
+                .lock(object, &carrick_sched_core::ShortLockSpin)
+                .unwrap();
+            assert_eq!(
+                guard
+                    .stream_lane(StreamEnd::Second)
+                    .unwrap()
+                    .references(carrick_el1_abi::ipc::pipe::End::Writer),
+                0,
+                "the second end's writes are shut"
+            );
+        }
+        let header = GuestUserBuffer::zeroed(56);
+        assert_eq!(
+            call(46, [3, header.arg(), 0, 0, 0, 0]),
+            (
+                CompletionRoute::Served,
+                carrick_syscall_abi::LINUX_EOPNOTSUPP.guest_retval()
+            ),
+            "sendmsg is refused in ring"
+        );
+    });
+}
+
+/// #2361 on #2401's ring-wide FIOCLEX/FIONCLEX, on x86: a ring stream end is
+/// a ring description like any other, so `ioctl(FIOCLEX)` and
+/// `ioctl(FIONCLEX)` set and clear its descriptor's close-on-exec flag in
+/// ring, and leave the peer end's flag alone.
+#[test]
+fn x86_fioclex_on_a_ring_stream_end_sets_and_clears_cloexec() {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+
+    with_x86_ring_stream_pair(|call, _, _| {
+        // x86_64: ioctl 16, fcntl 72; FIONCLEX 0x5450, FIOCLEX 0x5451,
+        // F_GETFD 1.
+        let served = |value| (CompletionRoute::Served, value);
+        assert_eq!(call(72, [3, 1, 0, 0, 0, 0]), served(0), "F_GETFD before");
+        assert_eq!(call(16, [3, 0x5451, 0, 0, 0, 0]), served(0), "FIOCLEX");
+        assert_eq!(
+            call(72, [3, 1, 0, 0, 0, 0]),
+            served(1),
+            "F_GETFD after FIOCLEX"
+        );
+        assert_eq!(
+            call(72, [4, 1, 0, 0, 0, 0]),
+            served(0),
+            "the peer end's F_GETFD"
+        );
+        assert_eq!(call(16, [3, 0x5450, 0, 0, 0, 0]), served(0), "FIONCLEX");
+        assert_eq!(
+            call(72, [3, 1, 0, 0, 0, 0]),
+            served(0),
+            "F_GETFD after FIONCLEX"
+        );
+    });
 }
