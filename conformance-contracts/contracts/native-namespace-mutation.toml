@@ -44,7 +44,8 @@ Round 3 (#231) adds chmod and chown: fchmod/fchown of a ring file follow the
 descriptor for every task, path fchmodat/fchmodat2/fchownat are the
 descendant's, and x86 legacy chmod/chown/lchown normalize to the *at forms.
 The records carry the caller's access context, whose credentials decide
-EPERM. Witnesses compare against the native oracle on x86 KVM and Linux's
+EPERM under chown(2)'s owner rule: an unprivileged owner may keep its uid and
+set a group it is in; anything else is EPERM. Witnesses compare against the native oracle on x86 KVM and Linux's
 documented answers on ARM, red first. A run root's EPERM after its ring
 setresuid stays with #1861 (root credentials are its host task's).
 """
@@ -62,8 +63,9 @@ vm_free = [
   "carrick-kernel::dispatch::native_files::tests::native_child_truncate_dispatch_preserves_resize_access_and_errno_matrix",
   "carrick-kernel::dispatch::native_files::tests::native_child_rename_dispatch_preserves_moves_noreplace_and_errno_matrix",
   "carrick-kernel::dispatch::native_files::tests::native_child_rename_refuses_directory_and_memory_name_publication_before_effects",
-  "carrick-kernel::dispatch::native_files::tests::native_child_chmod_chown_dispatch_with_the_callers_credentials (root gives away, an unprivileged caller gets EPERM, -1 always allowed)",
+  "carrick-kernel::dispatch::native_files::tests::native_child_chmod_chown_dispatch_with_the_callers_credentials (root gives away, an unprivileged caller gets EPERM, its owner keeps its own ids, -1 always allowed)",
   "carrick-el1-linux::aarch64_process_tests::arm_fork_child_chmod_chown_on_ring_files (production ARM dispatch; red: every call -38)",
+  "carrick-el1-linux::aarch64_process_tests::arm_fork_child_owner_chown_keeps_its_own_ids (production ARM dispatch; red: an owner's own uid was EPERM)",
   "carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_chmod_chown_on_ring_files_matches_native",
   "carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_chmod_chown_on_ring_files_matches_native",
   "carrick-personality-linux::native_host_file::tests::chmod_and_chown_stage_their_records_with_the_callers_authority",

@@ -9,6 +9,11 @@ chmod(2) and chown(2). Four wire operations (24-27) extend the record:
 access context: only the owner or a privileged caller may change a mode,
 and only a privileged caller may give a file away, so the credentials that
 decide EPERM are the caller's own (its ring task row), never the carrier's.
+chown(2)'s owner rule, in the shared `chown_permission_errno`: an
+unprivileged caller acts only on a file it owns (as stat reports the
+owner), may leave the uid as it is (-1 or its own uid) and may set the group
+to its fsgid or a supplementary group; any other explicit id is EPERM, and
+-1/-1 is never refused (#2406 review P0-1).
 
 - `fchmod`/`fchown` follow the descriptor, as `ftruncate` does: a ring
   file's call is staged for the run root too (a delegated stdio stream keeps
@@ -27,9 +32,12 @@ decide EPERM are the caller's own (its ring task row), never the carrier's.
   `chmod_path`, `chown_path`). Watched and synthetic paths refuse before
   effects, as round 2's mutations do.
 
-Witnesses, red first on #2401's head: `native_file_attr.S` (20 steps)
+Witnesses, red first on #2401's head: `native_file_attr.S` (50 steps)
 against the native oracle on the production x86 KVM path, root and fork
-child; `arm_fork_child_chmod_chown_on_ring_files` on the production ARM
+child, including the legacy calls' ENOENT, ENOTDIR, EFAULT, ENAMETOOLONG,
+EACCES and EPERM, and lchown changing a link where chown follows it;
+`arm_fork_child_chmod_chown_on_ring_files` and
+`arm_fork_child_owner_chown_keeps_its_own_ids` on the production ARM
 dispatch; a carrier matrix with root and unprivileged callers.
 
 Boundary: a run root's filesystem calls are served under its host task's
