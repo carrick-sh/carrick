@@ -339,31 +339,23 @@ pub(crate) fn notify_host_ready(carrier: Option<&CarrierZone>, record: RecordRef
         let ObjectWakeDelivery {
             handed, len, slots, ..
         } = delivery;
-        queue
-            .notify_object_host(
-                &mut |record| {
-                    let Some(target) = handed.get_mut(*len) else {
-                        carrick_fatal::carrick_fatal!(
-                            "host_ready::wake",
-                            "duplicate host readiness waiter delivery"
-                        );
-                    };
+        let _ = queue.notify_object_host(
+            &mut |record| {
+                // One member's queue hands back at most that member.
+                if let Some(target) = handed.get_mut(*len) {
                     target.write(record);
                     *len += 1;
-                },
-                &mut |placed| {
-                    if placed.resched {
-                        let index = usize::from(placed.slot.raw());
-                        slots[index / 64] |= 1 << (index % 64);
-                    }
-                },
-            )
-            .unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!(
-                    "host_ready::wake",
-                    "host readiness wake ownership failed"
-                )
-            });
+                }
+            },
+            &mut |placed| {
+                if placed.resched {
+                    let index = usize::from(placed.slot.raw());
+                    slots[index / 64] |= 1 << (index % 64);
+                }
+            },
+        );
+        // A refused notification leaves the epoch unmoved and the member
+        // parked: the queue was retired with its record.
     }
     let mut delivery = Box::new(ObjectWakeDelivery::for_carrier(carrier.cloned()));
     if let Some(zone) = zone() {

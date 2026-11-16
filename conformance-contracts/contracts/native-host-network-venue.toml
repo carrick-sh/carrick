@@ -1,0 +1,46 @@
+schema_version = 1
+id = "kernel.native.host-network-venue"
+title = "Native processes reach the host network through the carrier's one socket implementation"
+guest_surfaces = ["syscall:socket", "syscall:connect", "syscall:bind", "syscall:listen", "syscall:accept", "syscall:accept4", "syscall:sendto", "syscall:recvfrom", "syscall:getsockopt", "syscall:setsockopt", "syscall:getsockname", "syscall:getpeername", "syscall:shutdown", "syscall:read", "syscall:write", "syscall:fstat", "syscall:ppoll", "syscall:poll"]
+semantic_authority = ["man 2 socket", "man 2 connect", "man 2 bind", "man 2 listen", "man 2 accept4", "man 2 send", "man 2 recv", "man 2 getsockopt", "man 2 getsockname", "man 2 getpeername", "man 2 shutdown", "man 2 poll", "man 7 signal", "director ruling on #231"]
+fixture = "crates/carrick-vmm-kvm/tests/fixtures/native_child_inet.S"
+scale_points = [1]
+structural_budgets = []
+rationale = """
+The network is a real host crossing. A ring-owned (native) process has no
+host task, so before #231 its AF_INET/AF_INET6 socket calls were a counted
+ENOSYS. A child's call on the inet family, and every call on a socket
+descriptor, stages one NetSyscall record: the canonical syscall, its
+arguments and exactly the user ranges Linux's call reads or writes. The
+carrier runs the dispatcher's own socket handler for that syscall against a
+scratch descriptor table holding only the caller's socket, so a native
+process sees the run root's network model exactly (address rewriting,
+in-zone loopback, DNS gateway, per-description option state); there is no
+second socket implementation. A socket the call creates moves into the
+caller's ring namespace. Completion copies back only written extents.
+
+A call that would block never blocks the carrier or holds execution
+capacity: the carrier samples the member's own host-readiness queue before
+its one non-blocking probe, enrols the host fd with its readiness watch and
+answers an owner wait. The watch notifies the queue once the host reports
+readiness (or a poll's deadline passes) and the member reruns the call once.
+A signal cancels the wait as EINTR. AF_UNIX and in-zone descriptors keep
+their ring owners; the run root keeps its existing routes.
+"""
+
+[bindings]
+vm_free = [
+  "carrick-el1-linux::dispatch::tests::native_host_file_stage_stages_a_fork_childs_inet_socket",
+  "carrick-core-abi::host_file::tests::net_call_round_trips_segments_and_written_extents",
+  "carrick-kernel::host_readiness::tests::a_ready_descriptor_fires_its_member_once_and_a_new_wait_replaces_the_old",
+  "carrick-kernel::host_readiness::tests::a_deadline_fires_without_a_descriptor_and_a_closed_source_is_forgotten",
+  "carrick-kernel::host_readiness::tests::a_poll_deadline_is_fixed_by_its_first_wait_and_spent_when_answered",
+]
+embed = [
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_tcp_and_udp_cross_to_the_host_network (fork child: blocking TCP connect/send/recv/shutdown/EOF, UDP sendto + poll + recvfrom, poll timeout, non-blocking connect + poll(POLLOUT) + SO_ERROR, TCP over ::1)",
+]
+
+[bindings.unresolved]
+embed_structural = "The director owns the signed HVF binding; the HVF transport change is cross-checked only."
+observation = "No versioned WorkObservation counts venue crossings or watch enrolments yet."
+docker = "The fixture's expectations are Linux's socket(2)/poll(2) results against a loopback peer; no Docker differential was run."

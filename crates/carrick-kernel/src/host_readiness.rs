@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -27,14 +27,27 @@ use parking_lot::Mutex;
 use crate::el1_zone::CarrierZone;
 
 /// The identity of one enrolled host object, so its source can drop its
-/// enrolments when the object closes.
+/// enrolments when the object closes: the address of a token the source
+/// owns for its whole life ([`HostReadinessToken`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) struct HostReadinessSource(u64);
+pub(crate) struct HostReadinessSource(usize);
 
 impl HostReadinessSource {
-    pub(crate) fn next() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    /// A deadline alone, which no source forgets.
+    const DEADLINE: Self = Self(0);
+}
+
+/// A host object's readiness identity, held for the object's life.
+#[derive(Debug)]
+pub(crate) struct HostReadinessToken(Box<u8>);
+
+impl HostReadinessToken {
+    pub(crate) fn new() -> Self {
+        Self(Box::new(0))
+    }
+
+    pub(crate) fn source(&self) -> HostReadinessSource {
+        HostReadinessSource(&*self.0 as *const u8 as usize)
     }
 }
 
@@ -147,7 +160,7 @@ impl HostReadinessWatch {
         }
         if enrolled.is_empty() {
             enrolled.push(Enrolment {
-                source: HostReadinessSource::next(),
+                source: HostReadinessSource::DEADLINE,
                 fd: None,
                 events: 0,
                 record,
@@ -252,10 +265,13 @@ fn run(shared: &Shared, control: &OwnedFd) {
             )
         };
         if ready < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
+            // EINTR, or a host refusal of the wait itself: every member
+            // reruns its call once and re-enrols, rather than wait unseen.
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                let woken = std::mem::take(&mut *shared.enrolments.lock());
+                notify_once(woken);
             }
-            carrick_fatal::carrick_fatal!("host_ready::watch", "host readiness poll failed");
+            continue;
         }
         if pollfds[0].revents != 0 {
             drain(control);
@@ -294,14 +310,19 @@ fn run(shared: &Shared, control: &OwnedFd) {
             }
             woken
         };
-        let mut notified: Vec<carrick_el1_abi::RecordRef> = Vec::new();
-        for held in woken {
-            if notified.contains(&held.record) {
-                continue;
-            }
-            notified.push(held.record);
-            crate::el1_zone::notify_host_ready(held.carrier.as_ref(), held.record);
+        notify_once(woken);
+    }
+}
+
+/// Notify each member of `woken` once.
+fn notify_once(woken: Vec<Enrolment>) {
+    let mut notified: Vec<carrick_el1_abi::RecordRef> = Vec::new();
+    for held in woken {
+        if notified.contains(&held.record) {
+            continue;
         }
+        notified.push(held.record);
+        crate::el1_zone::notify_host_ready(held.carrier.as_ref(), held.record);
     }
 }
 
@@ -371,7 +392,8 @@ mod tests {
     fn a_ready_descriptor_fires_its_member_once_and_a_new_wait_replaces_the_old() {
         let watch = HostReadinessWatch::start().unwrap();
         let (read, write) = pipe_pair().unwrap();
-        let source = HostReadinessSource::next();
+        let token = HostReadinessToken::new();
+        let source = token.source();
         let interest = |events| HostReadinessInterest {
             source,
             fd: std::os::fd::AsFd::as_fd(&read),
@@ -409,7 +431,8 @@ mod tests {
         assert!(settles(&watch, 0), "the deadline notifies its member");
 
         let (read, _write) = pipe_pair().unwrap();
-        let source = HostReadinessSource::next();
+        let token = HostReadinessToken::new();
+        let source = token.source();
         watch
             .enrol(
                 record(3),

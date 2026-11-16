@@ -3852,13 +3852,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         self.copy_syscall_output(carrick_guest_arch::UserVa::new(address), bytes)
                             .is_ok()
                     };
-                    Ok(NativeResume::Returned(
-                        carrick_personality_linux::native_host_file::complete(
-                            &pending_file.record,
-                            pending_file.output,
-                            &mut copy_out,
-                        ),
-                    ))
+                    let result = carrick_personality_linux::native_host_file::complete(
+                        &pending_file.record,
+                        pending_file.output,
+                        &mut copy_out,
+                    );
+                    if carrick_personality_linux::native_host_file::sigpipe_on_epipe(
+                        &pending_file.record,
+                    ) {
+                        carrick_personality_linux::signal::ProcessSignals::raise_sigpipe(self);
+                    }
+                    Ok(NativeResume::Returned(result))
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Supplied)
                     if pending.waited_on_host_readiness() =>

@@ -72,6 +72,7 @@ pub const LINUX_ENOTTY: LinuxErrno = LinuxErrno::new(25);
 pub const LINUX_EFBIG: LinuxErrno = LinuxErrno::new(27);
 pub const LINUX_ENOSPC: LinuxErrno = LinuxErrno::new(28);
 pub const LINUX_ESPIPE: LinuxErrno = LinuxErrno::new(29);
+pub const LINUX_EPIPE: LinuxErrno = LinuxErrno::new(32);
 pub const LINUX_ERANGE: LinuxErrno = LinuxErrno::new(34);
 pub const LINUX_ENAMETOOLONG: LinuxErrno = LinuxErrno::new(36);
 pub const LINUX_ENOSYS: LinuxErrno = LinuxErrno::new(38);

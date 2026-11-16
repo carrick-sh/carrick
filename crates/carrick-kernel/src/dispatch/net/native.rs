@@ -35,7 +35,7 @@ const NATIVE_SOCKET_FD: i32 = 3;
 /// descriptors, as a host fd slot holds one.
 pub(in crate::dispatch) struct NativeNetFile {
     description: parking_lot::Mutex<Arc<crate::kernel::FileDescription>>,
-    source: crate::host_readiness::HostReadinessSource,
+    token: crate::host_readiness::HostReadinessToken,
     owner: Weak<HostIpc>,
 }
 
@@ -44,7 +44,7 @@ impl NativeNetFile {
         description.retain_fd_ref();
         Self {
             description: parking_lot::Mutex::new(description),
-            source: crate::host_readiness::HostReadinessSource::next(),
+            token: crate::host_readiness::HostReadinessToken::new(),
             owner: Arc::downgrade(owner),
         }
     }
@@ -55,7 +55,7 @@ impl NativeNetFile {
 
     /// The readiness-watch identity of this socket's enrolments.
     pub(in crate::dispatch) fn source(&self) -> crate::host_readiness::HostReadinessSource {
-        self.source
+        self.token.source()
     }
 
     /// A call replaced the socket's description (a loopback connect becomes
@@ -76,7 +76,7 @@ impl Drop for NativeNetFile {
     fn drop(&mut self) {
         // The ring released the last descriptor naming this socket.
         if let Some(owner) = self.owner.upgrade() {
-            owner.forget_host_ready(self.source);
+            owner.forget_host_ready(self.token.source());
         }
         self.description.get_mut().release_fd_ref();
     }
@@ -283,6 +283,11 @@ impl SyscallDispatcher {
             }
             args[0] = NATIVE_SOCKET_FD as u64;
         }
+        // The ring raises the caller's own SIGPIPE on EPIPE: the dispatcher's
+        // would reach the task whose context the call borrows.
+        if call.canonical == carrick_abi::syscall::nr::SENDTO.raw() {
+            args[3] |= carrick_abi::LINUX_MSG_NOSIGNAL as u64;
+        }
         let mut memory = StagedMemory::new(call);
         let ran =
             self.run_native_net_handler(&context, &scratch, call.canonical, args, &mut memory);
@@ -290,14 +295,9 @@ impl SyscallDispatcher {
         // table (an in-zone loopback pair); every other slot is a socket the
         // call created, which moves to the caller's ring namespace.
         let mut created = None;
-        let slots: Vec<(i32, crate::kernel::FileSlot)> = {
-            let mut open_files = scratch.write_open_files(None);
-            let numbers: Vec<i32> = open_files.keys().copied().collect();
-            numbers
-                .into_iter()
-                .filter_map(|number| open_files.remove(&number).map(|slot| (number, slot)))
-                .collect()
-        };
+        // Retire the scratch table as a task's table retires at exit: its
+        // slots' references pass to this call.
+        let slots = scratch.drain_functional_refs();
         for (number, slot) in &slots {
             match socket {
                 Some((socket, _)) if *number == NATIVE_SOCKET_FD => {
@@ -333,7 +333,7 @@ impl SyscallDispatcher {
                         .fds
                         .iter()
                         .map(|wait| crate::host_readiness::HostReadinessInterest {
-                            source: socket.source,
+                            source: socket.source(),
                             // SAFETY: the scratch slot and the ring's
                             // descriptor retain this description's host fd
                             // until the watch holds its own duplicate.
@@ -382,8 +382,10 @@ impl SyscallDispatcher {
         const STAGE: u64 = 0x1000;
         let (canonical, args, segment, staged): (u64, [u64; 6], NetSegment, Option<&[u8]>) =
             match header.op {
+                // read(2) and write(2) of a socket are recv and send with
+                // no flags (the carrier never raises the caller's SIGPIPE).
                 HostFileOp::Read => (
-                    carrick_abi::syscall::nr::READ.raw(),
+                    carrick_abi::syscall::nr::RECVFROM.raw(),
                     [0, STAGE, capacity as u64, 0, 0, 0],
                     NetSegment {
                         address: STAGE,
@@ -394,7 +396,7 @@ impl SyscallDispatcher {
                     None,
                 ),
                 HostFileOp::Write => (
-                    carrick_abi::syscall::nr::WRITE.raw(),
+                    carrick_abi::syscall::nr::SENDTO.raw(),
                     [0, STAGE, input.len() as u64, 0, 0, 0],
                     NetSegment {
                         address: STAGE,
