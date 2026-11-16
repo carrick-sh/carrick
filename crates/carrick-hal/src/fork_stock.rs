@@ -61,15 +61,9 @@ impl NativeHostFileReply {
     ) -> Option<carrick_core_abi::PortalOwnerWait> {
         match self {
             Self::Replied(_) => None,
-            // SAFETY: the service sampled `revision` from the requesting
-            // member's own host-readiness queue before its failed probe.
-            Self::HostReadyWait { revision } => Some(unsafe {
-                carrick_core_abi::PortalOwnerWait::from_owner(
-                    requester,
-                    carrick_core_abi::PortalWaitCause::HostReadiness,
-                    *revision,
-                )
-            }),
+            Self::HostReadyWait { revision } => Some(
+                carrick_core_abi::PortalOwnerWait::host_readiness(requester, *revision),
+            ),
         }
     }
 }
