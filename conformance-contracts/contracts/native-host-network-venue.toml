@@ -1,8 +1,8 @@
 schema_version = 1
 id = "kernel.native.host-network-venue"
 title = "Native processes reach the host network through the carrier's one socket implementation"
-guest_surfaces = ["syscall:socket", "syscall:connect", "syscall:bind", "syscall:listen", "syscall:accept", "syscall:accept4", "syscall:sendto", "syscall:recvfrom", "syscall:getsockopt", "syscall:setsockopt", "syscall:getsockname", "syscall:getpeername", "syscall:shutdown", "syscall:read", "syscall:write", "syscall:fstat", "syscall:ppoll", "syscall:poll"]
-semantic_authority = ["man 2 socket", "man 2 connect", "man 2 bind", "man 2 listen", "man 2 accept4", "man 2 send", "man 2 recv", "man 2 getsockopt", "man 2 getsockname", "man 2 getpeername", "man 2 shutdown", "man 2 poll", "man 7 signal", "director ruling on #231"]
+guest_surfaces = ["syscall:socket", "syscall:connect", "syscall:bind", "syscall:listen", "syscall:accept", "syscall:accept4", "syscall:sendto", "syscall:recvfrom", "syscall:getsockopt", "syscall:setsockopt", "syscall:getsockname", "syscall:getpeername", "syscall:shutdown", "syscall:sendmsg", "syscall:recvmsg", "syscall:sendmmsg", "syscall:recvmmsg", "syscall:read", "syscall:write", "syscall:fstat", "syscall:ppoll", "syscall:poll"]
+semantic_authority = ["man 2 socket", "man 2 connect", "man 2 bind", "man 2 listen", "man 2 accept4", "man 2 send", "man 2 recv", "man 2 getsockopt", "man 2 getsockname", "man 2 getpeername", "man 2 shutdown", "man 2 sendmmsg", "man 2 recvmmsg", "man 3 cmsg", "man 2 poll", "man 7 signal", "director ruling on #231"]
 fixture = "crates/carrick-vmm-kvm/tests/fixtures/native_child_inet.S"
 scale_points = [1]
 structural_budgets = []
@@ -57,6 +57,21 @@ published again) before the carrier claims it answers the bytes moved or
 EINTR, never a restart from byte 0 or a restarted poll, and a refused later
 record answers the bytes moved rather than ENOSYS.
 
+A message call (sendmsg, recvmsg, sendmmsg, recvmmsg; #2418, glibc's
+resolver sends its A and AAAA queries with one sendmmsg) is one record whose
+segments are the caller's own headers, iovec arrays, buffers and socket
+addresses at their user addresses, so the carrier runs its one handler for
+each on the staged memory. Linux's own refusals come first (iovlen over
+UIO_MAXIOV is EMSGSIZE, a negative namelen EINVAL), and a send's namelen is
+clamped to sockaddr_storage, as the Docker oracle shows. A receive's buffers
+are fitted to one record's data range, which any datagram fits; a send whose
+data does not fit is EMSGSIZE on a datagram socket. A batch stages every
+message it sends, or the received messages that fit whole. The carrier
+sends with MSG_NOSIGNAL and the ring raises the caller's own SIGPIPE. A send
+with ancillary data, a blocking stream send or MSG_WAITALL stream receive (a
+message call has no transfer continuation yet), and a call larger than one
+record stay a counted ENOSYS, never a guessed result.
+
 A socket the run root created and a native child inherited is a physical
 hold of the root's description (its fstat answers S_IFSOCK). It has no
 native venue yet, so its socket calls are refused (a counted ENOSYS); only
@@ -93,11 +108,14 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr",
   "carrick-el1-linux::native_process_runtime::host_test_support::a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr_on_arm",
   "carrick-kernel::dispatch::native_files::tests::an_inherited_root_socket_is_never_enotsock_in_a_native_child",
+  "carrick-el1-linux::dispatch::tests::native_host_file_stage_stages_a_fork_childs_resolver_messages",
+  "carrick-kernel::dispatch::native_files::tests::a_native_childs_resolver_messages_cross_as_linux",
 ]
 embed = [
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_tcp_and_udp_cross_to_the_host_network (fork child: blocking TCP connect/send/recv/shutdown/EOF, UDP sendto + poll + recvfrom, poll timeout, non-blocking connect + poll(POLLOUT) + SO_ERROR, TCP over ::1)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_calls_run_under_the_childs_own_identity (fork child: TCP SO_PEERCRED {0,-1,-1}, 64 KiB recv, a 100000-byte blocking send returns 100000, SIGPIPE on EPIPE / none with MSG_NOSIGNAL / write raises it, setresuid(1000) then raw ICMP socket EPERM and TCP socket still opens)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_transfers_keep_their_whole_extent (fork child: 65000-byte UDP send and recv whole, 100000-byte UDP send EMSGSIZE with nothing transmitted, a short recv buffer truncates a datagram and discards its rest, a 409600-byte blocking TCP send into a small window returns 409600, a 200000-byte MSG_WAITALL recv returns 200000)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_glibc_resolver_calls_answer_as_linux (fork child against loopback name servers, the Docker oracle's values for the same static fixture: Go's dial (AF_INET6 connect, write, poll, read) and glibc's sendmmsg of A and AAAA (2; msg_len 7 and 10), recvfrom of each answer, sendmsg, recvmsg (namelen 16) and recvmmsg of one)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_repoll_after_eintr_waits_its_own_timeout (fork child: a SIGUSR1-interrupted poll is EINTR; the same poll after its deadline passed waits its own timeout; a blocking recvfrom interrupted under SA_RESTART restarts and receives)",
 ]
 
