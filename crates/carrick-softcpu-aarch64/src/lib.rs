@@ -277,7 +277,10 @@ mod closure {
         }))
     }
 }
-pub use closure::*;
+pub use closure::{
+    Barrier, BarrierAccess, BarrierDomain, BarrierKind, ExceptionGeneration, ExceptionKind,
+    Extract, NamedSystemRegister, PstateField, PstateImmediate, SystemAccess, SystemDirection,
+};
 
 mod decode {
     //! Hand-written leaves from Arm ARM DDI0487, A64 encoding index.
