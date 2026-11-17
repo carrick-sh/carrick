@@ -114,6 +114,36 @@ impl NativeOpenFile {
     }
 }
 
+/// Whether a native descriptor's host resource, other than a native network
+/// socket, is a socket (#2414). `Some(false)` only for a proven non-socket:
+/// a venue-opened file, an inherited file, or a stdio stream (whose `fstat`
+/// is the dispatcher's synthetic stdio record). `Some(true)` for a socket
+/// the run root created and a child inherited (a physical hold of the
+/// root's description, whose `fstat` answers S_IFSOCK); `None` when the
+/// resource cannot be inspected.
+pub(in crate::dispatch) fn native_resource_is_socket(resource: &HostResource) -> Option<bool> {
+    use super::fd_table::OpenDescription;
+    let is_socket = |description: &crate::kernel::FileDescription| {
+        description.inspect_kind(|open| {
+            matches!(
+                open,
+                OpenDescription::HostSocket { .. }
+                    | OpenDescription::InMemorySocket { .. }
+                    | OpenDescription::Netlink { .. }
+                    | OpenDescription::Packet { .. }
+            )
+        })
+    };
+    if resource.downcast_ref::<ImplicitHostStdio>().is_some() {
+        return Some(false);
+    }
+    if let Some(file) = resource.downcast_ref::<NativeOpenFile>() {
+        return is_socket(&file.description);
+    }
+    let hold = resource.downcast_ref::<crate::kernel::objects::IpcPhysicalHold>()?;
+    is_socket(hold.retain_io()?.description())
+}
+
 impl Drop for NativeOpenFile {
     fn drop(&mut self) {
         // The ring released the last descriptor naming this description.
