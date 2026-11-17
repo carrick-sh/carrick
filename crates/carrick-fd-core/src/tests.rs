@@ -2849,13 +2849,15 @@ fn filtered_live_close_and_dup_replace_defer_host_release_once() {
 
     // Closing host_a in parent while peer still holds it yields None.
     assert_eq!(
-        c.close_filtered(parent, host_a, can_release),
+        c.close_filtered(parent, host_a, can_release)
+            .map(|retired| retired.release),
         Ok(DeferredRelease::None)
     );
     assert_eq!(c.take_retired_ofd(), Ok(None));
     // Final live close of host_a in peer defers release to retired_ofds.
     assert!(matches!(
-        c.close_filtered(peer, host_a, can_release),
+        c.close_filtered(peer, host_a, can_release)
+            .map(|retired| retired.release),
         Ok(DeferredRelease::Deferred(_))
     ));
     assert_eq!(
@@ -2867,12 +2869,14 @@ fn filtered_live_close_and_dup_replace_defer_host_release_once() {
     // Replacing host_b via dup2_filtered in parent while peer holds it yields None,
     // then replacing host_b via dup3_filtered in peer defers host_b (102) once.
     assert_eq!(
-        c.dup2_filtered(parent, pipe_fd, host_b, can_release),
+        c.dup2_filtered(parent, pipe_fd, host_b, can_release)
+            .map(|retired| retired.release),
         Ok(DeferredRelease::None)
     );
     assert_eq!(c.take_retired_ofd(), Ok(None));
     assert!(matches!(
-        c.dup3_filtered(peer, pipe_fd, host_b, true, can_release),
+        c.dup3_filtered(peer, pipe_fd, host_b, true, can_release)
+            .map(|retired| retired.release),
         Ok(DeferredRelease::Deferred(_))
     ));
     assert_eq!(
@@ -2883,19 +2887,23 @@ fn filtered_live_close_and_dup_replace_defer_host_release_once() {
 
     // Closing all ring-releasable pipe_fd aliases returns Now(Description(10)) on the last one.
     assert_eq!(
-        c.close_filtered(parent, pipe_fd, can_release),
+        c.close_filtered(parent, pipe_fd, can_release)
+            .map(|retired| retired.release),
         Ok(DeferredRelease::None)
     );
     assert_eq!(
-        c.close_filtered(parent, host_b, can_release),
+        c.close_filtered(parent, host_b, can_release)
+            .map(|retired| retired.release),
         Ok(DeferredRelease::None)
     );
     assert_eq!(
-        c.close_filtered(peer, pipe_fd, can_release),
+        c.close_filtered(peer, pipe_fd, can_release)
+            .map(|retired| retired.release),
         Ok(DeferredRelease::None)
     );
     assert_eq!(
-        c.close_filtered(peer, host_b, can_release),
+        c.close_filtered(peer, host_b, can_release)
+            .map(|retired| retired.release),
         Ok(DeferredRelease::Now(description(10)))
     );
 

@@ -916,6 +916,10 @@ pub struct IpcOperation {
     /// (`CNTVCT_EL0`), kept across wakes so a re-parked wait sleeps only its
     /// remaining time. Unused by transfer operations.
     pub deadline: IpcCounterDeadline,
+    /// A parked advisory lock call's request, decoded once at entry: a
+    /// woken rerun takes exactly this lock (fcntl(2) copies its
+    /// `struct flock` in once). Unused by other kinds.
+    pub lock: fd::record_lock::RawLockRequest,
 }
 
 /// The per-call flags of a stream socket transfer (`sendto`/`recvfrom`):
@@ -1024,6 +1028,7 @@ impl IpcOperation {
         handback: IpcHandback::None,
         result: 0,
         deadline: IpcCounterDeadline::NONE,
+        lock: fd::record_lock::RawLockRequest::NONE,
     };
 }
 

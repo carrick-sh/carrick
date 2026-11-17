@@ -2,8 +2,8 @@
 //! lookups still see the prior description, fork does not inherit claims, and
 //! close cannot make a claimed number available to an unrelated opener.
 use super::{
-    Authority, DeferredRelease, Description, Entry, Error, Fd, LockWait, OfdPin, PIN, REF,
-    SlotBacking, TableId,
+    Authority, Description, Entry, Error, Fd, LockWait, OfdPin, PIN, REF, Retired, SlotBacking,
+    TableId,
 };
 
 /// One reservation in an exact table incarnation. Move into commit or cancel;
@@ -156,7 +156,7 @@ impl<B: SlotBacking, W: LockWait, const T: usize> Authority<'_, B, W, T> {
         pin: &OfdPin,
         cloexec: bool,
         release_here: impl FnOnce(Description) -> bool,
-    ) -> Result<DeferredRelease, ReservationRefusal> {
+    ) -> Result<Retired, ReservationRefusal> {
         let result = (|| {
             let (_guard, t) = self.lock(reservation.table)?;
             self.check_pin(pin)?;
@@ -175,9 +175,17 @@ impl<B: SlotBacking, W: LockWait, const T: usize> Authority<'_, B, W, T> {
                 },
             );
             t.storage.unreserve(fd);
+            // The displaced descriptor's file is read in this acquisition:
+            // a close racing the numeric claim leaves nothing displaced.
             match old {
-                Some(old) => self.drop_hold_filtered(old.ofd, REF, release_here),
-                None => Ok(DeferredRelease::None),
+                Some(old) => {
+                    let file = self.ofd_file(old.ofd);
+                    Ok(Retired {
+                        release: self.drop_hold_filtered(old.ofd, REF, release_here)?,
+                        file,
+                    })
+                }
+                None => Ok(Retired::NONE),
             }
         })();
         result.map_err(|error| ReservationRefusal { error, reservation })

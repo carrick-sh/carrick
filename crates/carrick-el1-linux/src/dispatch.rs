@@ -3276,6 +3276,13 @@ impl<
                 let Some(venue) = self.ipc else {
                     return false;
                 };
+                // A woken wait is routed by the operation it retained,
+                // before any look at the descriptor: a sibling sharing the
+                // table may have closed or replaced that number meanwhile,
+                // and the wait goes on with the description it pinned.
+                if self.resumes_operation() {
+                    return true;
+                }
                 return match venue.region.fd(NativeFdWait).file_identity(
                     carrick_fd_core::TableId::from_raw(raw),
                     carrick_fd_core::Fd(self.frame.argument(0).unwrap_or(0) as i32),
@@ -4599,14 +4606,6 @@ impl<
                 }
             };
         let new_fd = reservation.fd();
-        // dup2(2)/dup3(2) over an open descriptor close it first: its file's
-        // record locks of this table end (fcntl(2)).
-        let replaced_file = match request.target {
-            NativeDupTarget::Exact(fd) if fd != request.old => {
-                authority.file_identity(table, fd).ok().flatten()
-            }
-            _ => None,
-        };
         let mut reservation = Some(reservation);
         let projected = super::file_table::with_host_binding_dup(
             self.fd_map,
@@ -4652,9 +4651,13 @@ impl<
         ipc::settle_native_release(&venue.region, pin_release, zone, task)
             .map_err(map_ipc_error)?;
 
-        let (release, delegated_release) = projected?;
-        ipc::settle_native_release(&venue.region, release, zone, task).map_err(map_ipc_error)?;
-        if let Some(file) = replaced_file {
+        let (retired, delegated_release) = projected?;
+        ipc::settle_native_release(&venue.region, retired.release, zone, task)
+            .map_err(map_ipc_error)?;
+        // dup2(2)/dup3(2) over an open descriptor close it first: the file
+        // the commit displaced, read in its own table acquisition, loses
+        // this table's record locks (fcntl(2)).
+        if let Some(file) = retired.file {
             ipc::release_record_locks(&venue.region, zone, task, table, file)
                 .map_err(map_ipc_error)?;
         }
@@ -5806,26 +5809,25 @@ impl<
                     Ok(effects) => effects,
                     Err(err) => return map_fd_error(err),
                 };
-                let locked_file = venue
-                    .region
-                    .fd(NativeFdWait)
-                    .file_identity(table, old)
-                    .ok()
-                    .flatten();
                 #[cfg(test)]
                 close_retire_hold::run(&venue.region, table, old);
-                let released = match venue.region.fd(NativeFdWait).close_filtered(
+                let retired = match venue.region.fd(NativeFdWait).close_filtered(
                     table,
                     old,
                     ipc::is_zone_releasable_backing,
                 ) {
-                    Ok(rel) => rel,
+                    Ok(retired) => retired,
                     Err(err) => return map_fd_error(err),
                 };
-                if let Err(err) = ipc::settle_native_release(&venue.region, released, zone, task) {
+                if let Err(err) =
+                    ipc::settle_native_release(&venue.region, retired.release, zone, task)
+                {
                     return map_ipc_error(err);
                 }
-                if let Some(file) = locked_file
+                // The file this close retired, read in the same table
+                // acquisition: its record locks of this table end
+                // (fcntl(2)), whatever another thread did to the number.
+                if let Some(file) = retired.file
                     && let Err(err) =
                         ipc::release_record_locks(&venue.region, zone, task, table, file)
                 {
