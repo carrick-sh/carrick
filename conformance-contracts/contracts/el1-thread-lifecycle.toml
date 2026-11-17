@@ -99,9 +99,6 @@ production_clone_thread_runs_and_exits_without_ending_parent,
 fork_child_exit_group_retires_futex_worker,
 fork_child_exit_group_retires_runnable_worker,
 fork_child_exit_group_retires_computing_worker
-(4 passed, 0 failed). Full test-kvm: 490 passed, 1 failed, 19 ignored;
-the native Linux oracle exit-status assertion failed in
-native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked.
 No retry, signed acceptance, or runtime-ratio claim; semantics and budgets
 remain unchanged.
 """

@@ -50,9 +50,6 @@ Request/response IPC between forked processes (`pairs` concurrent pairs, 128 rou
 existing descriptor writes and ordering. Existing Linux/KVM bindings run:
 zone_pipe_child_poll_wakes_on_parent_write_within_five_seconds,
 zone_pipe_child_write_parent_read_moves_exact_byte
-(2 passed, 0 failed). Full test-kvm: 490 passed, 1 failed, 19 ignored;
-the native Linux oracle exit-status assertion failed in
-native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked.
 No retry, signed acceptance, or runtime-ratio claim; semantics and budgets
 remain unchanged.
 """

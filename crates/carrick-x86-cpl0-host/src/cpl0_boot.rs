@@ -5132,3 +5132,102 @@ mod birth_source_tests {
         assert_eq!(second.allocate(second.identity()).unwrap().get(), 1);
     }
 }
+
+#[cfg(test)]
+mod bootstrap_descriptor_tests {
+    use super::*;
+    use crate::guest_ram::WindowKind;
+    use carrick_hal::guest_arch::GuestArch;
+    use carrick_hal::x8664_arch::X8664GuestArch;
+    use carrick_x86::interrupts::*;
+
+    fn word(ram: &GuestRam, gpa: u64) -> u64 {
+        u64::from_le_bytes(ram.read(gpa, 8).unwrap().try_into().unwrap())
+    }
+
+    #[test]
+    fn initialize_bootstrap_descriptors_has_exact_bytes() {
+        for hardware_interrupts in [false, true] {
+            let mut ram = GuestRam::new();
+            ram.add_window(0, RAM_SIZE, WindowKind::Private).unwrap();
+            let boot = X8664GuestArch::bootstrap_sysregs();
+            let entries = [
+                IMAGE_VA + 16,
+                IMAGE_VA + 32,
+                IMAGE_VA + 48,
+                IMAGE_VA + 64,
+                IMAGE_VA + 80,
+            ];
+            ram.write_gpa(IRQ_HEADER_GPA, &IRQ_HEADER_MAGIC.to_le_bytes())
+                .unwrap();
+            for (index, entry) in entries.iter().enumerate() {
+                ram.write_gpa(
+                    IRQ_HEADER_GPA + 8 * (index as u64 + 1),
+                    &entry.to_le_bytes(),
+                )
+                .unwrap();
+            }
+            initialize_bootstrap_descriptors(&mut ram, &boot, hardware_interrupts).unwrap();
+            // Fixed architectural encodings, independent of the serializer.
+            for (index, expected) in [
+                0,
+                0x0020_9b00_0000_0000,
+                0x0000_9300_0000_0000,
+                0x0000_f300_0000_0000,
+                0x0020_fb00_0000_0000,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(word(&ram, LAYOUT.gdt_base + index as u64 * 8), expected);
+            }
+            for slot in 0..2 {
+                let idt =
+                    carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), slot).unwrap();
+                let stub = carrick_x86::fault_slot_gpa(carrick_x86::fault_stub_base(LAYOUT), slot)
+                    .unwrap();
+                for vector in 0..256_u64 {
+                    let irq = [
+                        TIMER_VECTOR,
+                        KICK_VECTOR,
+                        RESCHED_VECTOR,
+                        SHOOTDOWN_VECTOR,
+                        PAGE_FAULT_VECTOR,
+                    ]
+                    .iter()
+                    .position(|&v| u64::from(v) == vector)
+                    .filter(|_| hardware_interrupts);
+                    let fault = [0, 6, 8, 10, 11, 12, 13, 14, 16, 17, 19].contains(&vector);
+                    let mut expected = [0_u8; 16];
+                    if fault || irq.is_some() {
+                        let entry = irq.map_or(DIRECT_VA + stub + vector * 128, |i| entries[i]);
+                        expected[0..2].copy_from_slice(&(entry as u16).to_le_bytes());
+                        expected[2..4].copy_from_slice(&8_u16.to_le_bytes());
+                        expected[4] = u8::from(vector == 8);
+                        expected[5] = 0x8e;
+                        expected[6..8].copy_from_slice(&((entry >> 16) as u16).to_le_bytes());
+                        expected[8..12].copy_from_slice(&((entry >> 32) as u32).to_le_bytes());
+                    }
+                    assert_eq!(
+                        ram.read(idt + vector * 16, 16).unwrap(),
+                        expected,
+                        "interrupts={hardware_interrupts} slot={slot} vector={vector}"
+                    );
+                }
+                let tss =
+                    carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), slot).unwrap();
+                let stack =
+                    carrick_x86::fault_slot_gpa(carrick_x86::fault_stack_base(LAYOUT), slot)
+                        .unwrap();
+                assert_eq!(word(&ram, tss + 4), DIRECT_VA + stack + 4096);
+                assert_eq!(
+                    word(&ram, tss + 36),
+                    DIRECT_VA + IST_STACK_BASE + (slot + 1) * 4096
+                );
+                for offset in [12, 20, 44, 52, 60, 68, 76, 84] {
+                    assert_eq!(word(&ram, tss + offset), 0);
+                }
+            }
+        }
+    }
+}

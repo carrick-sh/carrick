@@ -50,9 +50,6 @@ shared_guest_owner_loads_static_elf_and_exits_seven,
 production_enters_pt_interp_instead_of_executable_entry,
 production_initial_image_spans_more_than_one_edit_table_budget,
 cpl0_boot::cpl0_layout_tests::production_boot_refuses_stale_layout_before_entry
-(4 passed, 0 failed). Full test-kvm: 490 passed, 1 failed, 19 ignored;
-the native Linux oracle exit-status assertion failed in
-native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked.
 No retry, signed acceptance, or runtime-ratio claim; semantics and budgets
 remain unchanged.
 """

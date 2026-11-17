@@ -1,8 +1,7 @@
 # Soft x86 CPL0 bring-up: existing mechanisms and extraction
 
-Part of #671 / #578 step 2b; R1, 2026-11-17. Source inventory taken at
-GitHub main 51c981ab4bbc550c24f18982713ccec671c538fc. References below name
-source locations at that revision, not a maintained line-pinned inventory.
+Part of #671 / #578 step 2b; R2. References below name functions and types in the
+shared host coordinator and KVM adapter.
 Clean room: Carrick code and Intel SDM only; no external implementation source.
 No instruction-semantics web search was used.
 
@@ -13,21 +12,21 @@ step 2b and #1486 G4/L4 require the real ring bytes, not a host-code ring or
 user-mode fake syscall harness. #671 remains open until static hello boots
 through `carrick run --vcpu soft` without KVM and the fixture suite agrees.
 
-The neutral host crate already exports the coordinator (`src/lib.rs:7`),
-`CarrierCpuBackend` (`carrier_cpu.rs:97`) and the sealed `CarrierCpuIo`
-(`carrier_cpu.rs:123`). `claim_carrier_cpu_io` owns backend admission; do not
+The neutral host crate already exports the coordinator (`src/lib.rs`),
+`CarrierCpuBackend` (`carrier_cpu.rs`) and the sealed `CarrierCpuIo`
+(`carrier_cpu.rs`). `claim_carrier_cpu_io` owns backend admission; do not
 implement a second executor. It covers snapshot read/write, VcpuExit, pending
 I/O, kick arm/disarm, slot identity, MSRs and FS base. `CarrierMemoryIo`
-(`carrier_memory.rs:31`) covers slot limit, registration and MSI; the generic
+(`carrier_memory.rs`) covers slot limit, registration and MSI; the generic
 `CarrierMemory` owns extents, identities, roots and publication/retirement.
 `ProductionCpuLease`, `ProductionCpuFactory`, and `BootstrapCustody` already
-live in neutral `cpl0_boot.rs`; KVM aliases them at `cpl0_boot.rs:65-71`.
+live in neutral `cpl0_boot.rs`; KVM aliases them at `cpl0_boot.rs`.
 Keep their authority and teardown ordering unchanged.
 
-The remaining `Cpl0Carrier` is concrete (`vmm-kvm/src/cpl0_boot.rs:287`):
-`boot`/`boot_with_interrupts` (729/737) load fixture paths;
-`boot_production` (747) includes the built image; `boot_production_image`
-(758) validates extent size. All converge on `boot_bytes_inner` (1777-2605).
+The remaining `Cpl0Carrier` is concrete (`vmm-kvm/src/cpl0_boot.rs`):
+`boot`/`boot_with_interrupts` load fixture paths;
+`boot_production` includes the built image; `boot_production_image` validates
+extent size. All converge on `boot_bytes_inner`.
 
 ### Backend disposition
 
@@ -36,19 +35,19 @@ not code introduced in R1. Neutral protocol/policy moves; ioctl mechanics stay.
 
 | Mechanism and current sites | Disposition |
 | --- | --- |
-| VM creation / memslots: `carrick-vmm-kvm/src/cpl0_boot.rs:2312-2316`, `carrier_memory.rs:24-40`; shared custody in `carrick-x86-cpl0-host/src/carrier_memory.rs:31` | KVM registration stays. RAM window selection and shared `CarrierMemory<M>` installation move. Soft implements slot registration over its retained extent table, preserving backing identities and lifetime. |
-| In-kernel irqchip: `carrick-vmm-kvm/src/kvm.rs:1169`; LAPIC state / APIC base and route discovery at `cpl0_boot.rs:2472,2546-2590` | KVM irqchip ioctls stay; soft counterpart is ApicCluster. Route publication and guest binding are neutral. |
-| Secondary SIPI admission: `carrick-vmm-kvm/src/cpl0_boot.rs:2485-2494,3899` | KVM MP-state transition stays; soft creates stopped CPU state directly. No emulated SIPI required for M1's single CPU. |
-| MSI: `carrick-vmm-kvm/src/carrier_memory.rs:43-60`, `cpl0_boot.rs:220,2705,2888` | KVM_SIGNAL_MSI stays behind CarrierMemoryIo. Soft signal_msi queues the corresponding ApicCluster event. Shared wake/shootdown protocol must use that seam. |
-| Guest-debug stepping: `carrick-vmm-kvm/src/cpl0_boot.rs:3050-3082` | KVM fixture debugger stays; no shared ioctl-shaped API. Soft diagnostics use bounded block execution and typed exits if a later fixture needs stepping. |
-| vCPU allocation/run/exits: `carrick-vmm-kvm/src/carrier_memory.rs:79-95`, `cpl0_boot.rs:267,2420`, `carrier_cpu.rs:20-95` | KVM handles and exit conversion stay. Shared coordinator uses owned CarrierCpuIo, soft counterpart drives SoftMachine and converts run results into VcpuExit. |
-| MSR/sysreg/segment setup: `carrick-vmm-kvm/src/cpl0_boot.rs:2434-2523`; fixture retarget at 1136-1175 and 1604-1633 | Register encoding/ioctls stay. Desired long-mode state, private IDT/TSS aliases, syscall entry and KERNEL_GS_BASE are neutral boot policy; soft installs the same values. Existing CarrierCpuBackend handles running snapshots/MSRs; boot also needs descriptor/control-state installation. |
-| CPUID: `carrick-vmm-kvm/src/kvm.rs:1137,1527`; production SMEP/SMAP check at `cpl0_boot.rs:2442-2458`, fixture overrides at 2636-2672 | KVM CPUID installation stays; reuse existing GuestCpuidView on soft. Move required-feature validation with boot policy, not a new host-derived view. |
-| TSC: `carrick-vmm-kvm/src/cpl0_boot.rs:2527-2544,2616`; `kvm.rs:1102-1118` | KVM_GET_TSC_KHZ stays. Frequency publication into CpuBinding is neutral; soft supplies its clock/view frequency. Do not alter KVM's clock. |
-| Kick/signal/watchdog: `carrick-vmm-kvm/src/cpl0_boot.rs:96-118,2931,3195,3715`; `carrier_cpu.rs:89-95`, `kvm.rs:673` | KVM thread signal/immediate_exit stays. Existing CarrierCpuBackend kick protocol is shared; soft kick sets durable cancellation checked at block boundaries. Never use host signals as soft guest faults. |
-| GDT/fault stubs/IDT/TSS/IST/IRQ gates: `carrick-vmm-kvm/src/cpl0_boot.rs:2087-2180` | Move byte construction into neutral host crate, using existing carrick-x86 layout/descriptor helpers. Neither backend reimplements these bytes. |
-| PML4/image/trampoline/maps: `carrick-vmm-kvm/src/cpl0_boot.rs:1787-2085`; initial binding/metadata at 2181-2310 | Move RAM/image/map preparation and binding initialization next. Fixture interrupt map helpers in carrier_interrupts must move first or be passed as data, never copied. |
-| Reservations/IPC/file-region/initial extent: `carrick-vmm-kvm/src/cpl0_boot.rs:1965-2000,2317-2418`; neutral `BootstrapCustody::new` | Move installation around CarrierMemory<M>; reuse anonymous_owner, BootstrapFileRegion and custody. No backend-specific reservation or allocator authority. |
+| VM creation / memslots: `KvmVm::create_empty`, `CarrierMemory::install_bootstrap` | KVM registration stays. RAM window selection and shared `CarrierMemory<M>` installation move. Soft implements slot registration over retained extents, preserving backing identities and lifetime. |
+| In-kernel irqchip: `KvmVm::create_empty`; LAPIC/APIC route discovery in `Cpl0Carrier::boot_bytes_inner` | KVM irqchip ioctls stay; soft counterpart is ApicCluster. Route publication and guest binding are neutral. |
+| Secondary SIPI admission: `Cpl0Carrier::boot_bytes_inner` | KVM MP-state transition stays; soft creates stopped CPU state directly. No emulated SIPI required for M1. |
+| MSI: `CarrierMemoryIo::signal_msi` | KVM_SIGNAL_MSI stays behind CarrierMemoryIo. Soft queues the corresponding ApicCluster event. |
+| Guest-debug stepping: `Cpl0Carrier` | KVM fixture debugger stays; no shared ioctl-shaped API. |
+| vCPU allocation/run/exits: `CarrierMachine::from_memory`, `CarrierCpuBackend` | KVM handles and exit conversion stay. Soft drives SoftMachine through the existing owned CarrierCpuIo protocol. |
+| MSR/sysreg/segment setup: `Cpl0Carrier::boot_bytes_inner`, `program_longmode_entry`, `program_fault_segments` | Register encoding/ioctls stay. Desired long-mode state, private IDT/TSS aliases, syscall entry and KERNEL_GS_BASE are neutral boot policy. |
+| CPUID: `GuestCpuidView`, `Cpl0Carrier::boot_bytes_inner`, `fixture_cpuid_with_tsc_hz` | KVM CPUID installation stays. Move required-feature validation with boot policy; reuse the existing guest view. |
+| TSC: `Cpl0Carrier::boot_bytes_inner`, `fixture_publish_tsc_hz` | KVM_GET_TSC_KHZ stays. Frequency publication into CpuBinding is neutral; soft supplies its clock/view frequency. |
+| Kick/signal/watchdog: `FixtureWatchdog`, `CarrierCpuBackend` | KVM thread signal/immediate_exit stays. Soft sets durable cancellation checked at block boundaries. |
+| GDT/fault stubs/IDT/TSS/IST/IRQ gates: `initialize_bootstrap_descriptors` | Shared byte construction uses existing carrick-x86 layout/descriptor helpers. Neither backend reimplements the bytes. |
+| PML4/image/trampoline/maps and metadata: `Cpl0Carrier::boot_bytes_inner` | Move RAM/image/map preparation and binding initialization next. Move `supervisor_maps`, `lapic_map` and `data_map` from carrier_interrupts; never copy them. |
+| Reservations/IPC/file-region/initial extent: `Cpl0Carrier::boot_bytes_inner`, `BootstrapCustody::new` | Move installation around CarrierMemory<M>; reuse anonymous_owner, BootstrapFileRegion and custody. No backend-specific reservation or allocator authority. |
 
 ## Minimal seam and staged extraction
 
@@ -80,7 +79,7 @@ not code introduced in R1. Neutral protocol/policy moves; ioctl mechanics stay.
    from serialized ExtentTable tests or start a peer to satisfy a two-CPU API.
    Parameterizing CPU count is a separate behavioral change after the pure move.
 5. **Follow-up selection slice:** add ExecutionBackend::SoftX86Cpl0 alongside
-   KvmX86Cpl0 (`carrick-kernel/src/page_profile.rs:20`), runtime factory selection,
+   KvmX86Cpl0 (`carrick-kernel/src/page_profile.rs`), runtime factory selection,
    `--vcpu hardware|soft|auto` and CARRICK_VCPU. Auto chooses soft only for absent
    hypervisor capability, never after a hardware error. Keep exec-backend hvpatch
    orthogonal. Follow with static hello and hosted soft-x86 receipt integration.
@@ -101,19 +100,20 @@ names all eight affected families and the existing witnesses run:
 `x86.vmx.segment-entry`, `kernel.native.entropy`, and
 `kernel.native.host-file-venue`. Their descriptor rationale records the
 selected bound witnesses without weakening semantics, bindings or budgets.
-Intel SDM vol. 3 remains the descriptor layout authority. No deliberately
-failing semantic witness is invented for unchanged descriptor writes.
+Intel SDM vol. 3 remains the descriptor layout authority. The byte witness
+below checks unchanged descriptor writes with explicit mutation controls.
 
-Status on GitHub main 7cfd79f0a: extracted statements compare equal modulo
-whitespace; KVM lib 47 passed (same as the supplied baseline), neutral host
-lib 104 passed, shared x86 lib 84 passed, soft CPU/MMU 271 passed and 2 ignored.
-Full `just test-kvm` failed: 490 passed, 1 failed, 19 ignored. The failure is
-`native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked` at
-`cpl0_initial_mm.rs:658`, the native Linux oracle exit-status assertion;
-no retry or pre-existing-failure claim is made. The selected witnesses for
-all eight families passed, but this is not a green KVM-lane receipt.
-`just check-linux`, KVM compile and `just build-cpl0` passed. Full `just ci`
-is not rerun in R1c because prerequisites are not all green. Remaining check
-results and the final contract gate are recorded on the PR. Signed HVF and
-merge-queue acceptance remain director-owned. #2414 is still open and has
-landing priority; #2468 stays draft and needs another rebase after it lands.
+R2 status: descriptor construction is shared through
+`initialize_bootstrap_descriptors`; remaining neutral preparation and CPU
+bring-up are still in `Cpl0Carrier::boot_bytes_inner`. The KVM-free
+`bootstrap_descriptor_tests::initialize_bootstrap_descriptors_has_exact_bytes`
+witness checks GDT, rebased fault gates, private TSS/IST and optional IRQ gates.
+Mutation results and transient run populations belong to the PR evidence.
+R2 preparation is blocked on moving fixture helpers from
+`carrick-vmm-kvm/src/carrier_interrupts.rs`, which is outside the current
+worker fence; no helper implementation is copied as a workaround.
+The native Linux oracle failure is tracked as flaky on main in #2320.
+CPUID and VMX segment bindings provide gate coverage; no descriptor-path
+coverage (follow-up #2476). The byte witness addresses #2477.
+Signed HVF and merge-queue acceptance remain director-owned. #2414 has landing
+priority; #2468 stays draft and must rebase after it lands.
