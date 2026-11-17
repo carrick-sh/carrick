@@ -49,6 +49,20 @@ return_kick_and_timer_preempt_two_private_contexts exercise the retained maps.
 The existing CPL0 initial-MM, file-region and entropy bindings also run through
 this bootstrap. CPUID bindings provide gate coverage; no descriptor-path
 coverage. No scheduler policy, binding, budget or runtime-ratio claim changes.
+
+#671 R3 owned preparation extraction: prepare_boot returns PreparedBoot before
+backend registration. RAM, the ELF plan, table capacity, IPC backings and their
+generation, and kernel pod storage move without copying bytes or allocations.
+The original preparation block retains its validation and publication order;
+only module paths and the borrowed inventory boundary change. Existing bound
+KVM initial-MM, IPC, lifecycle, file-region and entropy witnesses named here
+exercise that same bootstrap. The neutral bootstrap descriptor byte witness
+initialize_bootstrap_descriptors_has_exact_bytes also runs. CPUID and segment
+bindings provide gate coverage; no descriptor-path coverage (follow-up #2476).
+The scheduler fixtures entry_kick_and_timer_preempt_two_private_contexts and
+return_kick_and_timer_preempt_two_private_contexts exercise both retained roots.
+No bindings, semantic expectations, structural budgets or acceptance layers
+change; signed acceptance and runtime-ratio promotion remain director-owned.
 """
 
 [bindings]
