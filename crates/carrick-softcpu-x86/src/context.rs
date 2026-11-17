@@ -561,7 +561,8 @@ fn host_clflush_supported() -> bool {
     if CLFLUSH_UNAVAILABLE.with(|missing| missing.get()) {
         return false;
     }
-    discover_host_clflush()
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(discover_host_clflush)
 }
 
 impl SoftCpuContext {
