@@ -1263,6 +1263,7 @@ impl HostIpc {
         resource: Box<dyn std::any::Any + Send + Sync>,
         access: fd::AccessMode,
         flags: fd::StatusFlags,
+        identity: Option<fd::record_lock::FileIdentity>,
         cloexec: bool,
     ) -> Result<fd::Fd, InstallHostDescriptionError> {
         let token = self
@@ -1275,10 +1276,13 @@ impl HostIpc {
         };
         loop {
             let seen = self.region().ofd_count();
-            let opened = self.region().fd(HostLockWait).open(
+            // Stamped before any descriptor names it: every advisory lock
+            // taken through the description finds its file.
+            let opened = self.region().fd(HostLockWait).open_identified(
                 table,
                 fd::Fd(0),
                 fd::Description::new(backing, access, flags),
+                identity,
                 cloexec,
             );
             match opened {
@@ -1400,6 +1404,27 @@ impl HostIpc {
         Ok(released)
     }
 
+    /// Drop the advisory locks whose owner no longer exists (a table the
+    /// ring retired at exit, a description whose last reference the ring or
+    /// this host released) and wake the ring waiters parked on the lock
+    /// object: their calls rerun and probe once (#231).
+    fn reap_file_locks(&self) -> Result<(), IpcError> {
+        let region = self.region();
+        let Some(mut locks) = region.existing_file_locks(&HostLockWait)? else {
+            return Ok(());
+        };
+        if !locks.table().reap(&region.fd(HostLockWait)) {
+            return Ok(());
+        }
+        let wake = locks.released();
+        let mut delivery = self.object_wake_delivery();
+        delivery.collect(wake);
+        drop(locks);
+        delivery.deliver();
+        self.service_wake(&wake);
+        Ok(())
+    }
+
     /// Release a bounded batch of host-backed OFDs finalized in the ring
     /// (`close_filtered` / `dup2_filtered` / `dup3_filtered`).
     pub fn drain_retired_ofds(&self) -> Result<usize, AdmissionError> {
@@ -1412,6 +1437,9 @@ impl HostIpc {
             };
             self.release(description.backing)?;
             count += 1;
+        }
+        if count != 0 {
+            self.reap_file_locks()?;
         }
         Ok(count)
     }
@@ -1434,6 +1462,9 @@ impl HostIpc {
             }
             self.reclaim_descriptors(extent?)?;
             count += 1;
+        }
+        if count != 0 {
+            self.reap_file_locks()?;
         }
         Ok(count)
     }
