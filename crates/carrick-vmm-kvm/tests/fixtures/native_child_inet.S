@@ -72,7 +72,11 @@
  *   glibc: socket(AF_INET, SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC), connect,
  *        sendmmsg of two queries (A and AAAA, MSG_NOSIGNAL), poll and
  *        recvfrom of both answers, then sendmsg, poll and recvmsg, then
- *        send and recvmmsg of one.
+ *        send and recvmmsg of one; each header is on its own page, which
+ *        the call itself writes first (an unbroken copy-on-write share);
+ *        then sendmmsg of two whose second entry is on an unmapped page
+ *        (Linux sends the first and answers 1), and a sendmsg larger than
+ *        any datagram (EMSGSIZE).
  *
  * In both modes every check runs; the child exits 128 + the mask of failed
  * bits (0 when all pass), or the stage number of a step the checks rely on.
@@ -111,7 +115,9 @@
 #define SYS_EPOLL_CREATE1 291
 #define SYS_RECVMMSG 299
 #define SYS_SENDMMSG 307
-#define DNS_STEPS 30
+#define SYS_MMAP 9
+#define SYS_MUNMAP 11
+#define DNS_STEPS 33
 
 /* Record `mask` in xfails unless %rax == value; continue either way. */
 #define CHECK(mask, value)   \
@@ -1118,6 +1124,39 @@ dns:
     STEP(28)
     movl rmsg+56(%rip), %eax       /* its msg_len */
     STEP(29)
+    xor %edi, %edi                 /* mmap(NULL, 8192, RW, PRIVATE|ANON, -1, 0) */
+    mov $8192, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $SYS_MMAP, %eax
+    syscall
+    mov %rax, %r12
+    lea 4096(%r12), %rdi           /* munmap(its second page) */
+    mov $4096, %esi
+    mov $SYS_MUNMAP, %eax
+    syscall
+    lea mmsgs(%rip), %rsi          /* the A query's header, last on page 0 */
+    lea 4096-64(%r12), %rdi
+    mov $64, %ecx
+    rep movsb
+    movl $0, 4096-64+56(%r12)      /* its msg_len */
+    mov %rbx, %rdi                 /* sendmmsg(g, tail, 2, MSG_NOSIGNAL) */
+    lea 4096-64(%r12), %rsi
+    mov $2, %edx
+    mov $0x4000, %r10d
+    mov $SYS_SENDMMSG, %eax
+    syscall
+    STEP(30)
+    movl 4096-64+56(%r12), %eax    /* msg_len of the one sent */
+    STEP(31)
+    mov %rbx, %rdi                 /* sendmsg(g, &bigmsg, MSG_NOSIGNAL) */
+    lea bigmsg(%rip), %rsi
+    mov $0x4000, %edx
+    mov $SYS_SENDMSG, %eax
+    syscall
+    STEP(32)
 
     mov $1, %edi                   /* write(1, dns_results, 8 * DNS_STEPS) */
     lea dns_results(%rip), %rsi
@@ -1180,11 +1219,19 @@ iov_aaaa:
     .quad qaaaa, 10
 riov:
     .quad rbuf, 64
-/* Two struct mmsghdr (64 bytes each): msghdr, then msg_len. */
+/* A msghdr whose one iovec is larger than any datagram. */
+bigmsg:
+    .quad 0, 0, bigiov, 1, 0, 0, 0
+bigiov:
+    .quad bigbuf, 70000
+/* Two struct mmsghdr (64 bytes each): msghdr, then msg_len. Each header
+ * page is first written by the call that writes the header back. */
+.balign 4096
 mmsgs:
     .quad 0, 0, iov_a, 1, 0, 0, 0, 0
     .quad 0, 0, iov_aaaa, 1, 0, 0, 0, 0
 /* One receive struct mmsghdr: a name buffer and one iovec. */
+.balign 4096
 rmsg:
     .quad rname
     .long 28, 0
@@ -1193,6 +1240,7 @@ rname:
     .zero 32
 rbuf:
     .zero 64
+.balign 4096
 #endif
 #ifdef ID_PORT
 id_addr:
@@ -1307,4 +1355,9 @@ pollfd:
 .align 4096
 huge:
     .zero 409600
+#endif
+#ifdef DNS_PORT
+.bss
+bigbuf:
+    .zero 70000
 #endif

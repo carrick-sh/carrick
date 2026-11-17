@@ -4937,6 +4937,8 @@ pub const LINUX_MSG_WAITALL: i32 = 0x0100;
 pub const LINUX_MSG_ERRQUEUE: i32 = 0x2000;
 pub const LINUX_MSG_NOSIGNAL: i32 = 0x4000;
 pub const LINUX_MSG_MORE: i32 = 0x8000;
+/// `recvmmsg`: wait for the first message only, then take what is queued.
+pub const LINUX_MSG_WAITFORONE: i32 = 0x1_0000;
 pub const LINUX_MSG_CMSG_CLOEXEC: i32 = 0x4000_0000_u32 as i32;
 // Linux socket option levels and names. Linux numbers them as small
 // integers (SOL_SOCKET=1) while macOS reuses the IPPROTO/SO scheme

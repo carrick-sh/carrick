@@ -5683,37 +5683,40 @@ impl DnsResponders {
 /// `native_child_inet.S`, as the Docker oracle ran the same fixture: a
 /// descriptor-valued step is any descriptor (`None` here), every other step
 /// its exact result.
-const DNS_STEP_ORACLE: [Option<i64>; 30] = [
-    None,     // 0 socket(AF_INET6, SOCK_DGRAM)
-    Some(0),  // 1 connect [::1]
-    Some(3),  // 2 write
-    Some(1),  // 3 poll(POLLIN)
-    Some(4),  // 4 read "Rgo6"
-    None,     // 5 epoll_create1
-    None,     // 6 socket(AF_INET, SOCK_DGRAM)
-    Some(0),  // 7 connect 127.0.0.1
-    Some(0),  // 8 epoll_ctl(ADD)
-    Some(3),  // 9 write
-    Some(1),  // 10 epoll_wait
-    Some(5),  // 11 its events: EPOLLIN|EPOLLOUT
-    Some(4),  // 12 read "Rgo4"
-    None,     // 13 socket(AF_INET, SOCK_DGRAM)
-    Some(0),  // 14 connect
-    Some(2),  // 15 sendmmsg of two
-    Some(7),  // 16 msg_len of the A query
-    Some(10), // 17 msg_len of the AAAA query
-    Some(1),  // 18 poll(POLLIN)
-    Some(8),  // 19 recvfrom "RA-query"
-    Some(1),  // 20 poll(POLLIN)
-    Some(11), // 21 recvfrom "RAAAA-query"
-    Some(7),  // 22 sendmsg
-    Some(1),  // 23 poll(POLLIN)
-    Some(8),  // 24 recvmsg
-    Some(16), // 25 its msg_namelen
-    Some(1),  // 26 sendto
-    Some(1),  // 27 poll(POLLIN)
-    Some(1),  // 28 recvmmsg of one
-    Some(2),  // 29 its msg_len "Rq"
+const DNS_STEP_ORACLE: [Option<i64>; 33] = [
+    None,      // 0 socket(AF_INET6, SOCK_DGRAM)
+    Some(0),   // 1 connect [::1]
+    Some(3),   // 2 write
+    Some(1),   // 3 poll(POLLIN)
+    Some(4),   // 4 read "Rgo6"
+    None,      // 5 epoll_create1
+    None,      // 6 socket(AF_INET, SOCK_DGRAM)
+    Some(0),   // 7 connect 127.0.0.1
+    Some(0),   // 8 epoll_ctl(ADD)
+    Some(3),   // 9 write
+    Some(1),   // 10 epoll_wait
+    Some(5),   // 11 its events: EPOLLIN|EPOLLOUT
+    Some(4),   // 12 read "Rgo4"
+    None,      // 13 socket(AF_INET, SOCK_DGRAM)
+    Some(0),   // 14 connect
+    Some(2),   // 15 sendmmsg of two
+    Some(7),   // 16 msg_len of the A query
+    Some(10),  // 17 msg_len of the AAAA query
+    Some(1),   // 18 poll(POLLIN)
+    Some(8),   // 19 recvfrom "RA-query"
+    Some(1),   // 20 poll(POLLIN)
+    Some(11),  // 21 recvfrom "RAAAA-query"
+    Some(7),   // 22 sendmsg
+    Some(1),   // 23 poll(POLLIN)
+    Some(8),   // 24 recvmsg
+    Some(16),  // 25 its msg_namelen
+    Some(1),   // 26 sendto
+    Some(1),   // 27 poll(POLLIN)
+    Some(1),   // 28 recvmmsg of one
+    Some(2),   // 29 its msg_len "Rq"
+    Some(1),   // 30 sendmmsg of two, the second unmapped
+    Some(7),   // 31 msg_len of the one sent
+    Some(-90), // 32 sendmsg larger than any datagram: EMSGSIZE
 ];
 
 /// Run the `DNS_PORT` mode (`root`: in the run root, else in a forked
@@ -5742,8 +5745,10 @@ const GO_DIAL_STEPS: core::ops::RangeInclusive<usize> = 0..=4;
 /// Go's netpoller: a connected AF_INET datagram socket in an epoll set.
 const GO_NETPOLL_STEPS: core::ops::RangeInclusive<usize> = 5..=12;
 /// glibc's resolver: sendmmsg of A and AAAA, recvfrom, and the other
-/// message calls (sendmsg, recvmsg, recvmmsg).
-const GLIBC_STEPS: core::ops::RangeInclusive<usize> = 13..=29;
+/// message calls (sendmsg, recvmsg, recvmmsg), each header on a page the
+/// call writes first (#2418 review P0-1); then a batch whose later entry
+/// faults (P0-3) and a send larger than any datagram (P0-5).
+const GLIBC_STEPS: core::ops::RangeInclusive<usize> = 13..=32;
 
 fn assert_dns_steps_are_linux(steps: &[i64], ranges: &[core::ops::RangeInclusive<usize>]) {
     assert_eq!(steps.len(), DNS_STEP_ORACLE.len(), "{steps:?}");
