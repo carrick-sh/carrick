@@ -37,6 +37,7 @@ jobs:
       main: ${{ steps.request.outputs.main }}
       xtask_key: ${{ steps.xtask.outputs.key }}
       gate_runs_on: ${{ steps.route.outputs.runs_on }}
+      covered: ${{ steps.covered.outputs.covered }}
     steps:
       - name: Refuse unauthorized actors before checking out code
         env:
@@ -49,6 +50,29 @@ jobs:
           case "$EVENT_NAME" in merge_group|push) exit 0 ;; esac
           case "$ACTOR" in tjfontaine) ;; *) exit 1 ;; esac
           case "$TRIGGERING_ACTOR" in tjfontaine) ;; *) exit 1 ;; esac
+      # A push to main whose commit already passed its merge group's signed
+      # gate, and was sealed there as the next reusable base (#2451, #2482),
+      # needs no second Mac gate (owner, 2026-11-17). A push with no such
+      # seal (an admin merge, a failed or unsealed group) still runs the gate.
+      - name: Skip a main push already sealed by its merge group
+        id: covered
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          covered=false
+          runs=$(gh api "repos/$REPO/actions/workflows/signed-gate.yml/runs?event=merge_group&head_sha=$SHA&status=success&per_page=20" --jq '.workflow_runs[] | select(.head_branch | startswith("gh-readonly-queue/main/")) | .id')
+          for run in $runs; do
+            if gh api --paginate "repos/$REPO/actions/runs/$run/artifacts?per_page=100" --jq '.artifacts[].name' | grep -q "^signed-base-reuse-$SHA-"; then
+              echo "covered by merge-group run $run (signed-base-reuse-$SHA-*)"
+              covered=true
+              break
+            fi
+          done
+          echo "covered=$covered" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: main
@@ -109,6 +133,7 @@ jobs:
   # this one bundle (#1889); candidate code builds only added probes (#1980).
   base-fixtures:
     needs: authorize
+    if: needs.authorize.outputs.covered != 'true'
     runs-on: ubuntu-latest
     # main's publisher takes up to 60 minutes; the fetcher waits up to 75.
     timeout-minutes: 90
@@ -358,7 +383,7 @@ jobs:
 
   publish:
     needs: [authorize, gate]
-    if: always() && needs.authorize.result == 'success'
+    if: always() && needs.authorize.result == 'success' && needs.authorize.outputs.covered != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

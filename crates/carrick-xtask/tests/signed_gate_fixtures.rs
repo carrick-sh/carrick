@@ -401,3 +401,62 @@ fn signed_gate_reuses_sealed_base_on_mac_with_token_isolated_from_execute() {
         Some("signed-fixtures-${{ needs.authorize.outputs.sha }}")
     );
 }
+
+#[test]
+fn main_push_skips_the_mac_gate_only_when_its_merge_group_sealed_it() {
+    // Owner, 2026-11-17: a main push whose commit was already sealed by its
+    // merge group's signed gate (#2451, #2482) needs no second Mac gate. A
+    // push without such a seal still runs the full gate.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = fs::read_to_string(root.join(".github/workflows/signed-gate.yml")).unwrap();
+    let docs = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
+    let jobs = &docs[0]["jobs"];
+
+    assert_eq!(
+        jobs["authorize"]["outputs"]["covered"].as_str(),
+        Some("${{ steps.covered.outputs.covered }}")
+    );
+    let covered = jobs["authorize"]["steps"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"].as_str() == Some("covered"))
+        .expect("authorize must decide whether a main push is already sealed");
+    assert_eq!(covered["if"].as_str(), Some("github.event_name == 'push'"));
+    let run = covered["run"].as_str().unwrap();
+    // Only a successful merge-queue run for this exact commit that published
+    // this commit's reusable base receipt counts.
+    assert!(
+        run.contains("event=merge_group&head_sha=$SHA&status=success"),
+        "{run}"
+    );
+    assert!(
+        run.contains("startswith(\"gh-readonly-queue/main/\")"),
+        "{run}"
+    );
+    assert!(run.contains("^signed-base-reuse-$SHA-"), "{run}");
+    assert!(
+        run.contains("covered=false"),
+        "a push defaults to running the gate"
+    );
+
+    assert_eq!(
+        jobs["base-fixtures"]["if"].as_str(),
+        Some("needs.authorize.outputs.covered != 'true'"),
+        "every Mac-bound job hangs off base-fixtures, so skipping it skips the gate"
+    );
+    for job in ["candidate-probes", "gate"] {
+        assert!(
+            jobs[job]["if"]
+                .as_str()
+                .map_or(true, |c| !c.contains("always()")),
+            "{job} must not run when base-fixtures is skipped"
+        );
+    }
+    assert_eq!(
+        jobs["publish"]["if"].as_str(),
+        Some(
+            "always() && needs.authorize.result == 'success' && needs.authorize.outputs.covered != 'true'"
+        )
+    );
+}
