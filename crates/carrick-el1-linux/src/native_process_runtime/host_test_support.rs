@@ -6510,6 +6510,154 @@ fn a_native_childs_poll_keeps_one_serial_per_call_and_a_new_call_a_new_one() {
     );
 }
 
+/// A resumed call's outcome, for a witness's failure message.
+#[cfg(test)]
+fn resume_name<E: core::fmt::Debug>(answer: &Result<NativeResume, E>) -> String {
+    match answer {
+        Ok(NativeResume::Returned(result)) => format!("Returned({})", result.raw()),
+        Ok(NativeResume::RetrySyscall) => "RetrySyscall".into(),
+        Ok(NativeResume::Left(_)) => "Left".into(),
+        Ok(_) => "another resume".into(),
+        Err(error) => format!("Err({error:?})"),
+    }
+}
+
+/// Begin a native child's blocking 200000-byte stream `sendto` and serve
+/// its first record with all 65536 of its bytes moved: the child has
+/// published the call's next record, which the carrier has not claimed.
+#[cfg(test)]
+fn native_send_after_its_first_record(wait: &HostReadyWaitFixture) -> RecordRef {
+    use carrick_core_abi::host_file::{HostFileRequestView, NetCall, NetTransferFacts};
+    use carrick_personality_linux::native_host_file::{HostFileCall, SocketCall};
+    const LEN: usize = 200_000;
+    let buffer: &'static [u8] = Box::leak(vec![7u8; LEN].into_boxed_slice());
+    let call = SocketCall::decode(
+        carrick_personality_linux::crossing::nr::SENDTO,
+        &[3, buffer.as_ptr() as u64, LEN as u64, 0, 0, 0],
+    )
+    .unwrap();
+    let record = wait.begin(HostFileCall::Socket(call), 208, false);
+    let stream = NetTransferFacts {
+        stream: true,
+        blocking: true,
+    };
+    wait.serve(record, |bytes, ticket| {
+        HostFileRequestView::parse(bytes)
+            .unwrap()
+            .reply(65_536, &NetCall::encode_written(stream, &[]))
+            .unwrap();
+        assert!(ticket.complete(true).is_ok());
+    });
+    let (resumed, next) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+    assert_eq!(resumed, record);
+    assert!(
+        matches!(next, Ok(NativeResume::Left(None))),
+        "the send publishes its next record"
+    );
+    record
+}
+
+/// #2414 review P0-1: a signal that cancels a native child's stream send
+/// after its first record moved 65536 bytes, before the carrier claims the
+/// next record (the call never parks on its host-readiness queue), answers
+/// the bytes moved, as Linux's interrupted send does; it is never retried
+/// from byte 0, which would send those bytes twice. Red before the fix: the
+/// unwaited cancellation fell through to the venue's restart of a regular
+/// file call (`RetrySyscall`).
+#[cfg(test)]
+#[test]
+fn a_signal_between_a_native_childs_send_records_answers_the_bytes_moved() {
+    let wait = HostReadyWaitFixture::new();
+    let record = native_send_after_its_first_record(&wait);
+    let fixture = &wait.capacity.fixture;
+    let mut service = fixture.service();
+    fixture
+        .runtime
+        .cancel_service(record, fixture.slot, &mut service)
+        .expect("a signal cancels the next record's service");
+    // The carrier claims the cancelled record and declines it: no effect.
+    wait.serve(record, |_, ticket| assert!(ticket.complete(false).is_ok()));
+    let (resumed, (answer, retained)) = wait.enter(|child| {
+        let answer = child.resume_checkpoint(|_| Ok(None));
+        (answer, child.take_interrupted_child_wait().is_some())
+    });
+    assert_eq!(resumed, record);
+    assert!(
+        matches!(answer, Ok(NativeResume::Returned(result)) if result.raw() == 65_536),
+        "the interrupted send answers the bytes it moved, got {}",
+        resume_name(&answer)
+    );
+    assert!(!retained, "a send that moved bytes is never restarted");
+}
+
+/// #2414 review P0-1: a carrier that refuses a native child's stream send's
+/// second record answers the bytes the first moved; a counted ENOSYS would
+/// discard bytes already on the wire. Red before the fix: the refusal
+/// answered ENOSYS.
+#[cfg(test)]
+#[test]
+fn a_refused_next_send_record_answers_the_bytes_moved() {
+    let wait = HostReadyWaitFixture::new();
+    let record = native_send_after_its_first_record(&wait);
+    wait.serve(record, |_, ticket| {
+        assert!(ticket.complete(false).is_ok());
+    });
+    let (resumed, answer) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+    assert_eq!(resumed, record);
+    assert!(
+        matches!(answer, Ok(NativeResume::Returned(result)) if result.raw() == 65_536),
+        "the refused record's call answers the bytes moved, got {}",
+        resume_name(&answer)
+    );
+}
+
+/// #2414 review P0-1: a native child's poll that waited on its
+/// host-readiness queue publishes its record again; a signal that cancels
+/// that record before the carrier claims it answers EINTR and is not
+/// retained for a restart, as Linux never restarts an interrupted poll.
+/// Red before the fix: the re-published record had no wait of its own, and
+/// its cancellation fell through to `RetrySyscall`, which re-ran the poll.
+#[cfg(test)]
+#[test]
+fn a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr() {
+    use carrick_personality_linux::native_host_file::HostFileCall;
+    let pollfd = Box::leak(Box::new([3u8, 0, 0, 0, 1, 0, 0, 0]));
+    let poll = HostFileCall::Ppoll {
+        fds: pollfd.as_ptr() as u64,
+        nfds: 1,
+        timeout: 0,
+        sigmask: 0,
+    };
+    let wait = HostReadyWaitFixture::new();
+    let record = wait.begin(poll, 74, false);
+    wait.answer_wait(record);
+    wait.notify_ready(record);
+    let (_, published) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+    assert!(matches!(published, Ok(NativeResume::Left(None))));
+    let fixture = &wait.capacity.fixture;
+    let mut service = fixture.service();
+    fixture
+        .runtime
+        .cancel_service(record, fixture.slot, &mut service)
+        .expect("a signal cancels the re-published poll");
+    wait.serve(record, |_, ticket| assert!(ticket.complete(false).is_ok()));
+    let (resumed, (answer, retained)) = wait.enter(|child| {
+        let answer = child.resume_checkpoint(|_| Ok(None));
+        (answer, child.take_interrupted_child_wait().is_some())
+    });
+    assert_eq!(resumed, record);
+    assert!(
+        matches!(
+            answer,
+            Ok(NativeResume::Returned(result))
+                if result.raw() == carrick_syscall_abi::LINUX_EINTR.guest_retval()
+        ),
+        "the interrupted poll answers EINTR, got {}",
+        resume_name(&answer)
+    );
+    assert!(!retained, "Linux never restarts an interrupted poll");
+}
+
 #[cfg(test)]
 #[test]
 fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
