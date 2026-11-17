@@ -1,6 +1,6 @@
 # AArch64 soft CPU stage-1 walker (A2)
 
-Part of #2480, round 2 (design revision). This is an inventory and proposed design, not an
+Part of #2480, round 3 (published design revision). This is an inventory and proposed design, not an
 implemented walker. Inventory taken on GitHub main on 2026-11-17. N1 placement
 and TLB policy belongs to the x86 soft-CPU lane; this document does not reserve
 its implementation or change its interfaces.
@@ -38,9 +38,9 @@ line-pinned inventory.
 | Same: `LeafAccess`, `terminal_descriptor_permits_el0`, `Stage1FaultKind` | Read/write/execute; leaf validity/AF/AP/UXN check; decode translation/AF/permission FSC class | EL1/PAN/UAO/WXN, hierarchical table permissions, fault level or ESR/FAR construction |
 | `crates/carrick-mmu-core/src/aarch64/descriptor_txn.rs` and `owner_fork.rs` | Production edits, private/COW authority, fixed 4 KiB geometry and nG publication | General 16 KiB guest walker or register-driven translation regime |
 | `crates/carrick-mmu-core/src/live_descriptor_words.rs`, `descriptor_refusal.rs` | ISA-neutral live descriptor load/CAS/publication interface and refusal vocabulary, already shared by x86 | Need no duplicate ARM descriptor-memory trait |
-
 | `crates/carrick-mmu-core/src/owner_mmu.rs`: `OwnerMmu`, `Aarch64Mmu::translate_with`, `OwnerTranslation` | Four-level authenticated-load walk; decodes blocks/pages, returns output and executable state, checks `terminal_descriptor_permits_el0` when requested; `translate` supplies `LiveDescriptorWords` | Not a register-driven architectural permission/fault walk |
 | `crates/carrick-mmu-core/src/aarch64/owner_fork.rs`: ARM `OwnerForkMmu` impl (`is_table`, `split`, `table_word`, `split_table_word`) | ISA-neutral owner calls ARM format/geometry and COW edit hooks | Owner policy is not CPU translation policy |
+| `crates/carrick-mmu-core/src/owner_mmu.rs`: `OwnerGrantMmu: OwnerForkMmu`, `execute_grant` | Grant publication inherits `OwnerForkMmu::is_table`; its ARM implementation is in `aarch64/owner_fork.rs` | No separate grant-specific descriptor classifier |
 | `crates/carrick-el1-linux/src/mm_portal/maintenance.rs`: `retired_page` | Loads upper tables and retained invalid page output for scrub | Invalid retained output is never a CPU translation |
 | `crates/carrick-mmu-core/src/aarch64.rs`: `existing_l3_descriptor`, `existing_terminal_descriptor`, `split_terminal_descriptor`, `PageTableManager::try_translate` | Live edit walks, block/page output decoding and splitting; manager tree traversal/edit paths use the same format | These need the shared format decoder, not another architectural walk |
 | `crates/carrick-mmu-core/src/aarch64/descriptor_txn.rs`: `output_mask`, `plan_descriptor_op`, `execute_descriptor_op`; submodules `guest_cow::classify_guest_cow_write`, `copy_window` | Transaction traversal, terminal geometry, COW table descent and page-only copy-window descent | Retained/prepared owner states remain separate from architectural validity |
@@ -408,7 +408,7 @@ was reposted. This table records decisions, not implementation evidence.
 
 | Finding | Disposition and verified evidence |
 | --- | --- |
-| P0-1 | Accepted inventory gap: `Aarch64Mmu::translate_with` does decode block/page outputs. Choose (b), one shared format decoder, owner permission view retained; slice 2 explicitly gates decoder reuse. Added edit, fork, COW/copy-window, anonymous traversal and nG-builder consumers found by repository search. Naming correction: `is_table` is on `OwnerForkMmu` in `aarch64/owner_fork.rs`; `OwnerGrantMmu` in `owner_mmu.rs` adds `execute_grant`, not `is_table`, and maintenance contains `retired_page`. |
+| P0-1 | Accepted inventory gap: `Aarch64Mmu::translate_with` does decode block/page outputs. Choose (b), one shared format decoder, owner permission view retained; slice 2 explicitly gates decoder reuse. Added edit, fork, COW/copy-window, anonymous traversal and nG-builder consumers found by repository search. Naming clarification: `OwnerGrantMmu: OwnerForkMmu` inherits `is_table`; the method is declared by `OwnerForkMmu` in `owner_mmu.rs` and implemented for ARM in `aarch64/owner_fork.rs`. `OwnerGrantMmu` adds `execute_grant`; maintenance contains `retired_page`. The inventory finding is valid, with no separate grant-specific decoder to migrate. |
 | P0-2 | Accepted: `SoftTlbEntry` and `SoftTlb::tag_for` cannot contain the proposed identity tuple. Specify spare-bit permission classes without EL/PAN/UAO flushes, no initial ASID retention, TTBR0/1/ASID/config flushes and the per-CPU cross-root argument. Arm D5.4.2–3 verifies the UAO/PAN distinction. |
 | P1-1 | Accepted: neutral `stage1` vocabulary in mmu-core, static generic softmmu, x86 `SoftWalker` first caller and compatibility exports; move `LeafSize` with old-path re-export. Verified existing names in softmmu `domains`, `lib`, `walker` and x86 `descriptor_txn`. |
 | P1-2 | Accepted: move/re-export existing `LeafAccess`, preserve probe wire conversion and map Read/Write/Execute to planes 0/1/2; x86 `Access` becomes an alias. |
