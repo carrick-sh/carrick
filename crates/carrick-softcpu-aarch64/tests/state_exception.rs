@@ -325,3 +325,26 @@ fn irq_preserves_syndrome_and_access_trap_enters_restart_vector() {
     assert_eq!(cpu.el1.esr, Syndrome(0x6232_d3e5));
     assert_eq!(cpu.el1.elr, ProgramCounter(0x1000));
 }
+
+#[test]
+fn decoded_svc_enters_real_vector_group_then_decoded_eret_restores() {
+    use carrick_softcpu_aarch64::{ExceptionKind, Instruction, decode_instruction};
+    // C4.1.3 / C6 SVC immediate encoding, generated across its full field.
+    for immediate in [0u16, 1, 0x1234, 0xffff] {
+        let word = 0xd400_0001 | (u32::from(immediate) << 5);
+        let Instruction::ExceptionGeneration(e) = decode_instruction(word) else {
+            panic!("SVC")
+        };
+        assert_eq!(e.kind, ExceptionKind::Svc);
+        let mut cpu = CpuState::default();
+        cpu.pc = ProgramCounter(0x1000);
+        cpu.el1.vbar = VirtualAddress(0x8000);
+        take_exception(&mut cpu, Exception::Svc(e.immediate));
+        assert_eq!(cpu.pc, ProgramCounter(0x8400));
+        assert_eq!(cpu.el1.esr, Syndrome(0x5600_0000 | u64::from(immediate)));
+        assert_eq!(decode_instruction(0xd69f_03e0), Instruction::Eret);
+        eret(&mut cpu).unwrap();
+        assert_eq!(cpu.pc, ProgramCounter(0x1004));
+        assert_eq!(cpu.pstate.el, ExceptionLevel::El0);
+    }
+}
