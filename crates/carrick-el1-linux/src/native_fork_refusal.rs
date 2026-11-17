@@ -213,14 +213,13 @@ pub fn fork_scratch(
             cause,
         };
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        emit(format_args!(
-            "{refusal:?}; census={{child_words: {}, parent_words: {}, live_words: {}, custody: {}, mappings: {mapping_count}}}; heap={:?}",
-            count.child,
-            count.parent,
-            count.live,
-            count.custody,
-            carrick_el1::alloc::GLOBAL_ALLOCATOR.diagnostics()
-        ));
+        {
+            let heap = carrick_el1::alloc::GLOBAL_ALLOCATOR.diagnostics();
+            let (child, parent, live, custody) = (count.child, count.parent, count.live, count.custody);
+            emit(format_args!(
+                "{refusal:?}; census={{child_words: {child}, parent_words: {parent}, live_words: {live}, custody: {custody}, mappings: {mapping_count}}}; heap={heap:?}"
+            ));
+        }
         super::native_process_runtime::NativeProcessError::ForkRefused(refusal)
     })
 }
