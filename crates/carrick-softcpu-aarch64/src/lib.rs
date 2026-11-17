@@ -8,6 +8,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+mod closure;
+pub use closure::*;
+
 mod decode {
     //! Hand-written leaves from Arm ARM DDI0487, A64 encoding index.
     //! This is decoding only: no instruction is executed on the host.
@@ -32,6 +35,9 @@ mod decode {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ExclusiveOption(u8);
     impl ExclusiveOption {
+        pub(crate) const fn from_option(value: u8) -> Self {
+            Self(value)
+        }
         pub const fn value(self) -> u8 {
             self.0
         }
@@ -599,6 +605,7 @@ mod instruction {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Instruction {
         Unallocated,
+        Barrier(crate::Barrier),
         CensusGap(Decoded),
         Hint(Hint),
         Arithmetic(Arithmetic),
@@ -630,6 +637,9 @@ mod instruction {
     }
 
     pub fn decode_instruction(word: u32) -> Instruction {
+        if let Some(instruction) = crate::closure::decode(word) {
+            return instruction;
+        }
         let hint = match word {
             0xd503201f => Some(Hint::Nop),
             0xd503203f => Some(Hint::Yield),
