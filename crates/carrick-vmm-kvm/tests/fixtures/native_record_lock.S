@@ -38,7 +38,32 @@
  *  P16 openat(LOCK_PATH, O_RDWR)                      fd d, its own OFD
  *  P17 flock(d, LOCK_EX|LOCK_NB)                      EWOULDBLOCK: b's
  *  P18 close(b): the last reference of b's OFD
- *  P19 flock(d, LOCK_EX|LOCK_NB)                      0 */
+ *  P19 flock(d, LOCK_EX|LOCK_NB)                      0
+ *
+ * -DLIFECYCLE: the record lock's owner is the process, across its threads
+ * and its exits (fcntl(2)). Parent P1 open (fd a), P2 pipe2(ready), (go),
+ * fork. Child:
+ *   L1 openat(LOCK_PATH, O_RDWR)                      fd c
+ *   L2 a CLONE_THREAD worker takes F_SETLK F_WRLCK on c, then raw-exits
+ *      (a non-last thread's exit(2)); the child joins it: the worker's
+ *      status
+ *   L3 write(ready)    L4 read(go)
+ *   L5 openat(LOCK_PATH, O_RDWR)                      fd e
+ *   L6 dup2(e, c): the replaced c was a descriptor of the file
+ *   L7 write(ready)    L8 read(go)
+ *   L9 F_SETLK F_WRLCK on e                           0
+ *      then a worker that keeps calling getpid, and exit_group(0)
+ * Parent after fork:
+ *   M1 read(ready)
+ *   M2 F_GETLK l_type                                 1: the lock outlived
+ *      the worker that took it
+ *   M3 l_pid == the child                             1
+ *   M4 write(go)       M5 read(ready)
+ *   M6 F_GETLK l_type                                 2: dup2 released it
+ *   M7 write(go)
+ *   M8 wait4(child): exit code                        0
+ *   M9 F_GETLK l_type                                 2: exit_group with a
+ *      running worker released L9 */
 .global _start
 .text
 
@@ -69,6 +94,7 @@
 1:  call value_byte
 .endm
 
+#ifndef LIFECYCLE
 _start:
     lea out(%rip), %r15
 
@@ -236,6 +262,179 @@ child:
     xor %edi, %edi
     jmp exit
 
+#endif /* !LIFECYCLE */
+
+#ifdef LIFECYCLE
+_start:
+    lea out(%rip), %r15
+
+    mov $-100, %edi                 /* P1: openat(lock, O_RDWR|O_CREAT, 0640) */
+    lea lock(%rip), %rsi
+    mov $0x42, %edx
+    mov $0640, %r10d
+    mov $257, %eax
+    syscall
+    mov %rax, %r12
+    record_status
+
+    lea ready(%rip), %rdi           /* P2: pipe2(ready), pipe2(go) */
+    xor %esi, %esi
+    mov $293, %eax
+    syscall
+    test %rax, %rax
+    js 1f
+    lea go(%rip), %rdi
+    xor %esi, %esi
+    mov $293, %eax
+    syscall
+1:  record_status
+
+    mov $57, %eax                   /* fork */
+    syscall
+    test %rax, %rax
+    js fork_failed
+    jz lchild
+    mov %rax, %rbx
+
+    movl ready(%rip), %edi          /* M1: read(ready) */
+    call read_byte
+    record_status
+
+    getlk_type                      /* M2: F_GETLK l_type */
+
+    movslq flk+24(%rip), %rax       /* M3: l_pid == the child */
+    cmp %rax, %rbx
+    sete %al
+    movzbl %al, %eax
+    call value_byte
+
+    movl go+4(%rip), %edi           /* M4: write(go) */
+    call write_byte
+    record_status
+
+    movl ready(%rip), %edi          /* M5: read(ready) */
+    call read_byte
+    record_status
+
+    getlk_type                      /* M6: F_GETLK l_type */
+
+    movl go+4(%rip), %edi           /* M7: write(go) */
+    call write_byte
+    record_status
+
+    mov %rbx, %rdi                  /* M8: wait4(child, &status, 0, NULL) */
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    cmp %rbx, %rax
+    jne fork_failed
+    mov status(%rip), %eax
+    shr $8, %eax
+    and $0xff, %eax
+    call value_byte
+
+    getlk_type                      /* M9: F_GETLK l_type */
+
+    call report
+    xor %edi, %edi
+    jmp exit
+
+lchild:
+    call open_lock                  /* L1: fd c */
+    mov %rax, %r12
+    record_status
+
+    movl $1, tstatus(%rip)          /* L2: worker F_SETLK, raw exit */
+    lea lock_worker(%rip), %rbx
+    call spawn
+    lea tid(%rip), %rdi
+    call join
+    movl tstatus(%rip), %eax
+    call value_byte
+
+    movl ready+4(%rip), %edi        /* L3: write(ready) */
+    call write_byte
+    record_status
+
+    movl go(%rip), %edi             /* L4: read(go) */
+    call read_byte
+    record_status
+
+    call open_lock                  /* L5: fd e */
+    mov %rax, %r13
+    record_status
+
+    mov %r13, %rdi                  /* L6: dup2(e, c) */
+    mov %r12, %rsi
+    mov $33, %eax
+    syscall
+    record_status
+    mov %r13, %r12
+
+    movl ready+4(%rip), %edi        /* L7: write(ready) */
+    call write_byte
+    record_status
+
+    movl go(%rip), %edi             /* L8: read(go) */
+    call read_byte
+    record_status
+
+    record_lock 6, 1                /* L9: F_SETLK F_WRLCK on e */
+    record_status
+
+    call report                     /* a running worker, then exit_group */
+    lea spin_worker(%rip), %rbx
+    call spawn
+    xor %edi, %edi
+    jmp exit
+
+/* clone(CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|
+ * CHILD_CLEARTID) onto `stack`, running %rbx; tid in `tid`. */
+spawn:
+    mov $0x00350f00, %edi
+    lea stack_top(%rip), %rsi
+    lea tid(%rip), %rdx
+    mov %rdx, %r10
+    xor %r8d, %r8d
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    jz 1f
+    ret
+1:  jmp *%rbx
+
+/* Wait until the CLEARTID word at %rdi is zero, as pthread_join does. */
+join:
+    mov (%rdi), %edx
+    test %edx, %edx
+    jz 1f
+    xor %esi, %esi
+    xor %r10d, %r10d
+    mov $202, %eax
+    syscall
+    jmp join
+1:  ret
+
+lock_worker:
+    record_lock 6, 1
+    test %rax, %rax
+    js 1f
+    xor %eax, %eax
+1:  neg %eax
+    movl %eax, tstatus(%rip)
+    xor %edi, %edi                  /* exit(2): this thread only */
+    mov $60, %eax
+    syscall
+    ud2
+
+spin_worker:
+    mov $39, %eax
+    syscall
+    jmp spin_worker
+#endif /* LIFECYCLE */
+
 fork_failed:
     mov $90, %edi
 exit:
@@ -317,4 +516,9 @@ byte: .skip 8
 flk: .skip 32
 out: .skip 64
 pause_word: .skip 8
+tid: .skip 8
+tstatus: .skip 8
+.balign 16
+stack: .skip 4096
+stack_top:
 .section .note.GNU-stack,"",@progbits
