@@ -1299,15 +1299,19 @@ fn side_phases<L>(
     mut acquire: impl FnMut(HostLeaseMode) -> Result<L, ReceiptError>,
     mut run: impl FnMut(SidePhase, Option<&L>) -> Result<(), ReceiptError>,
 ) -> Result<(), ReceiptError> {
-    let lease = acquire(HostLeaseMode::Gate)?;
-    for phase in [SidePhase::Build, SidePhase::Accept, SidePhase::Inspect] {
-        run(phase, Some(&lease))?;
+    {
+        let lease = acquire(HostLeaseMode::Carrick)?;
+        run(SidePhase::Build, Some(&lease))?;
     }
-    Ok(())
+    // No inherited admission: accept owns its shared build and exclusive
+    // execution phases, including artifact re-verification after admission.
+    run(SidePhase::Accept, None)?;
+    let lease = acquire(HostLeaseMode::Gate)?;
+    run(SidePhase::Inspect, Some(&lease))
 }
 
 /// Run the merge base (unless this is a main baseline) and then the candidate
-/// on this Mac, under one exclusive host lease and with the merge base's
+/// on this Mac, with per-side build/execution admission and the merge base's
 /// trusted fixture bundle. Publication compares the candidate only with this paired
 /// base, so host or fixture differences cannot surface as NEW failures (#1884).
 fn execute(
@@ -1356,7 +1360,7 @@ fn execute(
 
 /// The pairing itself: the base (unless this is a main baseline) and then the
 /// candidate, each handed to `run`, which builds, accepts and inspects one
-/// commit. `execute` supplies the real runner under one exclusive lease.
+/// commit. `execute` supplies the real runner with per-phase leases.
 /// Any error is recorded in `execution-error.txt` for publication.
 pub fn execute_pair(
     request: &Request,
@@ -1559,7 +1563,7 @@ struct FixtureSources<'a> {
 }
 
 /// Build, accept and independently inspect one commit in a fresh detached
-/// worktree. The caller holds the exclusive gate lease for the whole pair.
+/// worktree. Release shared build admission before accept takes its own leases.
 fn execute_one(
     root: &Path,
     run: &PairedRun,
@@ -2136,6 +2140,38 @@ mod tests {
                 "release Gate",
             ]
         );
+    }
+
+    #[test]
+    fn side_phase_failure_releases_admission_and_stops_before_later_work() {
+        use std::cell::Cell;
+        for failing in [SidePhase::Build, SidePhase::Accept, SidePhase::Inspect] {
+            let held = Cell::new(false);
+            let phases = std::cell::RefCell::new(Vec::new());
+            struct Held<'a>(&'a Cell<bool>);
+            impl Drop for Held<'_> {
+                fn drop(&mut self) {
+                    self.0.set(false);
+                }
+            }
+            let result = side_phases(
+                |_| {
+                    assert!(!held.replace(true));
+                    Ok(Held(&held))
+                },
+                |phase, _| {
+                    phases.borrow_mut().push(phase);
+                    if phase == failing {
+                        Err(fail("phase failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert!(!held.get());
+            assert_eq!(phases.borrow().last(), Some(&failing));
+        }
     }
 
     use super::*;
