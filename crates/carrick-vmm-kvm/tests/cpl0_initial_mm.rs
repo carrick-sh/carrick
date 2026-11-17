@@ -4342,8 +4342,9 @@ fn serial_host_root_and_fork_child_contend_record_locks_and_flock() {
 /// and exits (`native_record_lock.S -DLIFECYCLE`). A fork child's CLONE_THREAD
 /// worker takes the lock and raw-exits (a non-last thread's exit): the lock
 /// stays, held by the child's pid. dup2(2) over a descriptor of the file
-/// releases it. exit_group(2) with a worker still running releases the lock
-/// the child took again. Compared with the native oracle.
+/// releases it. The parent then parks in F_SETLKW on the lock the child took
+/// again, until the child's exit_group(2), with a worker still running,
+/// releases it and wakes the parent. Compared with the native oracle.
 #[test]
 fn serial_host_fork_child_record_lock_outlives_its_thread_and_ends_with_dup2_and_exit_group() {
     bounded_witness(
@@ -4357,7 +4358,7 @@ fn serial_host_fork_child_record_lock_outlives_its_thread_and_ends_with_dup2_and
                     )]
                 });
             assert_eq!(native.0, 0, "native oracle: {native:?}");
-            assert_eq!(native.1.len(), 22, "native oracle: {native:?}");
+            assert_eq!(native.1.len(), 25, "native oracle: {native:?}");
             assert_eq!(
                 (carrick.0, &carrick.1, &carrick.2),
                 (native.0, &native.1, &Vec::new()),
