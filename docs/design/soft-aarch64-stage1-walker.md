@@ -8,7 +8,7 @@ its implementation or change its interfaces.
 ## Authority and scope
 
 Architectural authority is the [Arm ARM, DDI 0487G.a, ID011921](https://documentation-service.arm.com/static/60119835773bb020e3de6fee),
-downloaded directly from Arm. Relevant sections: D5.2 (address translation),
+downloaded directly from Arm. Relevant sections: D5.1.4 (address tagging), D5.2 (address translation),
 D5.3 (descriptors), D5.4.2–3 (PAN/UAO), D5.4.5–6 (permissions), D5.4.9–15
 (blocks, AF/dirty management and contiguous), D5.8.2–3 (fault levels and
 priority), D13.2 ESR_EL1 (pages 3145–3153), FAR_EL1 and SCTLR_EL1.EPAN.
@@ -112,7 +112,7 @@ is walked. Root selection must nevertheless use the input range, T0SZ/T1SZ,
 TBI/TBID and EPD; equality of the two programmed roots is no license to ignore
 TTBR1. With TBI enabled for the access, bit 55 selects the lower/upper
 range; canonicality checks the bits below the ignored top byte against the
-selected T0SZ/T1SZ range. TBID can disable tag ignoring for instruction fetch.
+selected T0SZ/T1SZ range (D5.1.4). TBID can disable tag ignoring for instruction fetch.
 Upper and lower roots must be tested with different bytes.
 
 `aarch64/owner_fork.rs::arm_translation_regime_matches_tcr_bootstrap` already
@@ -415,7 +415,7 @@ was reposted. This table records decisions, not implementation evidence.
 | P1-3 | Accepted: remove `MmioHoles::Default`, explicit ARM holes, x86-scoped LAPIC/default constructors with compatibility aliases. Search found no external default caller. |
 | P1-4 | Accepted: host page size constrains placement/backing; exact fragment tags/planes and crossing resolution enforce permissions. Slice 4 owns the VM-free matrix, slice 6 actual host verification; no host-MMU-protection claim. |
 | P2 register path | Accepted: replace nonexistent boot method with `GuestArch::bootstrap_sysregs`/`Aarch64BootSysregs` and KVM `program_sysregs`; register values unchanged, HA/HD clear. Cite `arm_translation_regime_matches_tcr_bootstrap`. |
-| P2 TBI | Accepted: bit 55 selects range when top byte ignored; canonical check covers the remaining range bits (D5.2). |
+| P2 TBI | Accepted: bit 55 selects range when top byte ignored; canonical check covers the remaining range bits (D5.1.4, D5.2). |
 | P2 code coherence | Accepted: explicit always-coherent model with IC IVAU/ISB ordering and shared code-generation hooks. |
 | P2 COW | Accepted: ARM architectural permission fault only; owner retains Linux software-bit/COW policy, x86 classification stays in x86. |
 | P2 cost/review witnesses | Accepted: name descriptor-load hook/counter, reuse closed #607; add x86 tag/layout witness and shared-kernel director/independent-review requirements for slices 1/4. |
