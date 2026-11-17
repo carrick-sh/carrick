@@ -7142,6 +7142,135 @@ mod tests {
         );
     }
 
+    /// #2418: a fork child's resolver message calls are host network
+    /// crossings. glibc sends its A and AAAA queries with one `sendmmsg`
+    /// and reads answers with `recvmsg`-shaped calls; ARM's production
+    /// staging stages each call as one venue request whose segments are the
+    /// caller's own headers, iovec arrays, buffers and socket address, at
+    /// their user addresses. A receive's buffer is fitted to one record's
+    /// data range in the staged iovec copy only. Red before: staging
+    /// declined every message call and the child got a counted ENOSYS.
+    #[test]
+    fn native_host_file_stage_stages_a_fork_childs_resolver_messages() {
+        use carrick_core_abi::host_file::{HostFileOp, HostFileRequestView, NetCall, NetSegment};
+        use carrick_personality_linux::native_host_file::{
+            DescriptionAccess, HostFileStage, NativeDescriptor,
+        };
+        struct Resident;
+        impl file::MemoryValidator for Resident {
+            fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+            fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+        }
+        let address = |bytes: &[u8]| bytes.as_ptr().addr() as u64;
+        let stage = |nr: u64, args: [u64; 4]| {
+            let mut frame = TrapFrame {
+                esr: 0x15 << 26,
+                ..TrapFrame::default()
+            };
+            frame.x[8] = nr;
+            frame.x[..4].copy_from_slice(&args);
+            let staged = native_host_file_stage(
+                &frame,
+                &CurrentTask::new(),
+                &Resident,
+                [3, 4, 5],
+                carrick_core_abi::service::ServiceOrigin::Descendant,
+                |fd| {
+                    assert_eq!(fd, 3);
+                    Some(NativeDescriptor::HostBacked {
+                        access: DescriptionAccess::ReadWrite,
+                    })
+                },
+                &mut |_| 0,
+            );
+            let Some(HostFileStage::Request { mut record, .. }) = staged else {
+                panic!("a fork child's message call crosses to the host network: {staged:?}");
+            };
+            let view = HostFileRequestView::parse(&mut record).unwrap();
+            assert_eq!(view.header().op, HostFileOp::NetSyscall);
+            assert_eq!(view.header().fd, 3);
+            let call = NetCall::decode(view.input()).unwrap();
+            let staged: Vec<(NetSegment, Option<Vec<u8>>)> = call
+                .staged()
+                .map(|(segment, bytes)| (segment, bytes.map(<[u8]>::to_vec)))
+                .collect();
+            (call.canonical, call.args, staged)
+        };
+        let segment = |bytes: &[u8], input: bool, output: bool| NetSegment {
+            address: address(bytes),
+            len: bytes.len() as u32,
+            input,
+            output,
+        };
+        let word = |value: u64| value.to_le_bytes();
+        let iovec = |base: &[u8], len: u64| [word(address(base)), word(len)].concat();
+
+        // sendmmsg(fd, msgs, 2, MSG_NOSIGNAL): two headers, each with one
+        // iovec naming its query.
+        let (a, aaaa) = (b"A-query".to_vec(), b"AAAA-query".to_vec());
+        let iovecs = [iovec(&a, 7), iovec(&aaaa, 10)];
+        let mut msgs = vec![0u8; 128];
+        for (index, iov) in iovecs.iter().enumerate() {
+            let header = &mut msgs[index * 64..];
+            header[16..24].copy_from_slice(&word(address(iov)));
+            header[24..32].copy_from_slice(&word(1));
+        }
+        let (canonical, args, staged) = stage(269, [3, address(&msgs), 2, 0x4000]);
+        assert_eq!(
+            (canonical, args[..4].to_vec()),
+            (269, vec![3, address(&msgs), 2, 0x4000])
+        );
+        assert_eq!(
+            staged,
+            [
+                (segment(&msgs[..64], true, true), Some(msgs[..64].to_vec())),
+                (segment(&iovecs[0], true, false), Some(iovecs[0].clone())),
+                (segment(&a, true, false), Some(a.clone())),
+                (segment(&msgs[64..], true, true), Some(msgs[64..].to_vec())),
+                (segment(&iovecs[1], true, false), Some(iovecs[1].clone())),
+                (segment(&aaaa, true, false), Some(aaaa.clone())),
+            ]
+        );
+
+        // recvmsg(fd, &msg, 0) into a 100000-byte buffer with a name: the
+        // header is read and written back, the buffer is fitted to one
+        // record's range in the staged iovec copy, and the name is written.
+        let buffer = vec![0u8; 100_000];
+        let name = vec![0u8; 28];
+        let iov = iovec(&buffer, 100_000);
+        let mut msg = vec![0u8; 56];
+        msg[..8].copy_from_slice(&word(address(&name)));
+        msg[8..12].copy_from_slice(&28u32.to_le_bytes());
+        msg[16..24].copy_from_slice(&word(address(&iov)));
+        msg[24..32].copy_from_slice(&word(1));
+        let (canonical, _, staged) = stage(212, [3, address(&msg), 0, 0]);
+        assert_eq!(canonical, 212);
+        let fitted = iovec(
+            &buffer,
+            carrick_core_abi::host_file::NET_TRANSFER_MAX_BYTES as u64,
+        );
+        assert_eq!(
+            staged,
+            [
+                (segment(&msg, true, true), Some(msg.clone())),
+                (segment(&iov, true, false), Some(fitted)),
+                (
+                    segment(
+                        &buffer[..carrick_core_abi::host_file::NET_TRANSFER_MAX_BYTES],
+                        false,
+                        true
+                    ),
+                    None
+                ),
+                (segment(&name, false, true), None),
+            ]
+        );
+    }
+
     /// #1954: an ARM `write`/`writev` whose buffer is readable for 16 bytes
     /// and then unmapped stages the readable prefix behind a supply of the
     /// exact unmapped page, so a refused supply writes 16 bytes (Linux's

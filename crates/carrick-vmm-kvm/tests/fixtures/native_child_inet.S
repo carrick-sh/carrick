@@ -60,6 +60,20 @@
  *        SA_RESTART, restarts and receives the datagram a grandchild sends
  *        300 ms after the signal (1, and the handler ran).
  *
+ * With DNS_PORT (and DNS6_PORT) the child instead makes a resolver's UDP
+ * calls against a responder on those ports that answers every datagram
+ * with "R" and its payload (#2418), and writes each step's raw result
+ * (DNS_STEPS 64-bit words) to stdout, then exits 0; with DNS_ROOT the run
+ * root makes them itself, without a fork:
+ *   Go: socket(AF_INET6, SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC), connect
+ *        [::1], write, poll(POLLIN), read; then an AF_INET one connected to
+ *        127.0.0.1, added to an epoll set (EPOLLIN|EPOLLOUT|EPOLLRDHUP|
+ *        EPOLLET, as Go's netpoller), write, epoll_wait, read;
+ *   glibc: socket(AF_INET, SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC), connect,
+ *        sendmmsg of two queries (A and AAAA, MSG_NOSIGNAL), poll and
+ *        recvfrom of both answers, then sendmsg, poll and recvmsg, then
+ *        send and recvmmsg of one.
+ *
  * In both modes every check runs; the child exits 128 + the mask of failed
  * bits (0 when all pass), or the stage number of a step the checks rely on.
  * The root reaps the child and exits with its status. Child exit 0 = every
@@ -89,6 +103,15 @@
 #define SYS_GETPPID 110
 #define SYS_BIND 49
 #define SYS_EXIT 60
+#define SYS_READ 0
+#define SYS_SENDMSG 46
+#define SYS_RECVMSG 47
+#define SYS_EPOLL_WAIT 232
+#define SYS_EPOLL_CTL 233
+#define SYS_EPOLL_CREATE1 291
+#define SYS_RECVMMSG 299
+#define SYS_SENDMMSG 307
+#define DNS_STEPS 30
 
 /* Record `mask` in xfails unless %rax == value; continue either way. */
 #define CHECK(mask, value)   \
@@ -106,6 +129,9 @@
 .global _start
 .text
 _start:
+#ifdef DNS_ROOT
+    jmp dns
+#endif
     mov $SYS_FORK, %eax
     syscall
     test %eax, %eax
@@ -123,6 +149,9 @@ _start:
     jmp exit
 
 child:
+#ifdef DNS_PORT
+    jmp dns
+#endif
 #ifdef ID_PORT
     jmp identity
 #endif
@@ -904,6 +933,201 @@ usr1_restorer:
     ud2
 #endif
 
+#ifdef DNS_PORT
+/* Record %rax as the result of step `i`. */
+#define STEP(i) mov %rax, dns_results+8*(i)(%rip)
+
+/* poll(fd, POLLIN, 5 s) into step `i`. */
+#define POLLIN_STEP(fd, i)          \
+    mov fd, %edi;                   \
+    mov %edi, pollfd(%rip);         \
+    movl $1, pollfd+4(%rip);        \
+    lea pollfd(%rip), %rdi;         \
+    mov $1, %esi;                   \
+    mov $5000, %edx;                \
+    mov $SYS_POLL, %eax;            \
+    syscall;                        \
+    STEP(i)
+
+dns:
+    /* Go: an AF_INET6 datagram socket connected to [::1]. */
+    mov $10, %edi                  /* socket(AF_INET6, SOCK_DGRAM|NONBLOCK|CLOEXEC) */
+    mov $0x80802, %esi
+    xor %edx, %edx
+    mov $SYS_SOCKET, %eax
+    syscall
+    STEP(0)
+    mov %rax, %r12
+    mov %r12, %rdi                 /* connect(s6, &dns6_addr, 28) */
+    lea dns6_addr(%rip), %rsi
+    mov $28, %edx
+    mov $SYS_CONNECT, %eax
+    syscall
+    STEP(1)
+    mov %r12, %rdi                 /* write(s6, "go6", 3) */
+    lea go6(%rip), %rsi
+    mov $3, %edx
+    mov $SYS_WRITE, %eax
+    syscall
+    STEP(2)
+    POLLIN_STEP(%r12d, 3)
+    mov %r12, %rdi                 /* read(s6, buffer, 32) */
+    lea buffer(%rip), %rsi
+    mov $32, %edx
+    mov $SYS_READ, %eax
+    syscall
+    STEP(4)
+
+    /* Go's netpoller: an AF_INET one in an epoll set. */
+    mov $0x80000, %edi             /* epoll_create1(EPOLL_CLOEXEC) */
+    mov $SYS_EPOLL_CREATE1, %eax
+    syscall
+    STEP(5)
+    mov %rax, %r14
+    mov $2, %edi                   /* socket(AF_INET, SOCK_DGRAM|NONBLOCK|CLOEXEC) */
+    mov $0x80802, %esi
+    xor %edx, %edx
+    mov $SYS_SOCKET, %eax
+    syscall
+    STEP(6)
+    mov %rax, %r13
+    mov %r13, %rdi                 /* connect(s4, &dns_addr, 16) */
+    lea dns_addr(%rip), %rsi
+    mov $16, %edx
+    mov $SYS_CONNECT, %eax
+    syscall
+    STEP(7)
+    mov %r13d, epoll_event+4(%rip) /* data: the descriptor */
+    mov %r14, %rdi                 /* epoll_ctl(e, EPOLL_CTL_ADD, s4, &event) */
+    mov $1, %esi
+    mov %r13, %rdx
+    lea epoll_event(%rip), %r10
+    mov $SYS_EPOLL_CTL, %eax
+    syscall
+    STEP(8)
+    mov %r13, %rdi                 /* write(s4, "go4", 3) */
+    lea go4(%rip), %rsi
+    mov $3, %edx
+    mov $SYS_WRITE, %eax
+    syscall
+    STEP(9)
+    /* epoll_wait until EPOLLIN: the first event may be EPOLLOUT alone. */
+    mov $3, %ebx
+1:
+    mov %r14, %rdi                 /* epoll_wait(e, events, 4, 5 s) */
+    lea epoll_events(%rip), %rsi
+    mov $4, %edx
+    mov $5000, %r10d
+    mov $SYS_EPOLL_WAIT, %eax
+    syscall
+    STEP(10)
+    test %rax, %rax
+    jle 2f
+    movl epoll_events(%rip), %eax
+    mov %rax, dns_results+8*11(%rip)
+    test $1, %eax
+    jnz 2f
+    dec %ebx
+    jnz 1b
+2:
+    mov %r13, %rdi                 /* read(s4, buffer, 32) */
+    lea buffer(%rip), %rsi
+    mov $32, %edx
+    mov $SYS_READ, %eax
+    syscall
+    STEP(12)
+
+    /* glibc: a connected socket, sendmmsg of A and AAAA, recvfrom each. */
+    mov $2, %edi                   /* socket(AF_INET, SOCK_DGRAM|NONBLOCK|CLOEXEC) */
+    mov $0x80802, %esi
+    xor %edx, %edx
+    mov $SYS_SOCKET, %eax
+    syscall
+    STEP(13)
+    mov %rax, %rbx
+    mov %rbx, %rdi                 /* connect(g, &dns_addr, 16) */
+    lea dns_addr(%rip), %rsi
+    mov $16, %edx
+    mov $SYS_CONNECT, %eax
+    syscall
+    STEP(14)
+    mov %rbx, %rdi                 /* sendmmsg(g, mmsgs, 2, MSG_NOSIGNAL) */
+    lea mmsgs(%rip), %rsi
+    mov $2, %edx
+    mov $0x4000, %r10d
+    mov $SYS_SENDMMSG, %eax
+    syscall
+    STEP(15)
+    movl mmsgs+56(%rip), %eax      /* msg_len of each */
+    STEP(16)
+    movl mmsgs+64+56(%rip), %eax
+    STEP(17)
+    POLLIN_STEP(%ebx, 18)
+    movl $16, addrlen(%rip)        /* recvfrom(g, buffer, 32, 0, &peer, &len) */
+    mov %rbx, %rdi
+    lea buffer(%rip), %rsi
+    mov $32, %edx
+    xor %r10d, %r10d
+    lea peer(%rip), %r8
+    lea addrlen(%rip), %r9
+    mov $SYS_RECVFROM, %eax
+    syscall
+    STEP(19)
+    POLLIN_STEP(%ebx, 20)
+    mov %rbx, %rdi                 /* recvfrom(g, buffer, 32, 0, NULL, NULL) */
+    lea buffer(%rip), %rsi
+    mov $32, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $SYS_RECVFROM, %eax
+    syscall
+    STEP(21)
+    mov %rbx, %rdi                 /* sendmsg(g, &msg (A query), MSG_NOSIGNAL) */
+    lea mmsgs(%rip), %rsi
+    mov $0x4000, %edx
+    mov $SYS_SENDMSG, %eax
+    syscall
+    STEP(22)
+    POLLIN_STEP(%ebx, 23)
+    mov %rbx, %rdi                 /* recvmsg(g, &rmsg, 0) */
+    lea rmsg(%rip), %rsi
+    xor %edx, %edx
+    mov $SYS_RECVMSG, %eax
+    syscall
+    STEP(24)
+    mov rmsg+8(%rip), %eax         /* msg_namelen the call wrote back */
+    STEP(25)
+    mov %rbx, %rdi                 /* sendto(g, "q", 1, 0, NULL, 0) */
+    lea query(%rip), %rsi
+    mov $1, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $SYS_SENDTO, %eax
+    syscall
+    STEP(26)
+    POLLIN_STEP(%ebx, 27)
+    mov %rbx, %rdi                 /* recvmmsg(g, rmmsg, 1, 0, NULL) */
+    lea rmsg(%rip), %rsi
+    mov $1, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    mov $SYS_RECVMMSG, %eax
+    syscall
+    STEP(28)
+    movl rmsg+56(%rip), %eax       /* its msg_len */
+    STEP(29)
+
+    mov $1, %edi                   /* write(1, dns_results, 8 * DNS_STEPS) */
+    lea dns_results(%rip), %rsi
+    mov $8*DNS_STEPS, %edx
+    mov $SYS_WRITE, %eax
+    syscall
+    xor %edi, %edi
+    jmp exit
+#endif
+
 fail:
     mov %r15d, %edi
     cmp $-38, %rax
@@ -919,6 +1143,57 @@ exit:
 
 .data
 .align 8
+#ifdef DNS_PORT
+dns_results:
+    .fill DNS_STEPS, 8, 0x7eadbeef
+dns_addr:
+    .short 2
+    .short DNS_PORT
+    .byte 127, 0, 0, 1
+    .quad 0
+dns6_addr:
+    .short 10
+    .short DNS6_PORT
+    .long 0                        /* flowinfo */
+    .quad 0                        /* ::1 */
+    .byte 0, 0, 0, 0, 0, 0, 0, 1
+    .long 0                        /* scope id */
+.align 8
+epoll_event:
+    .long 0x80002005               /* EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET */
+    .long 0
+    .quad 0
+epoll_events:
+    .zero 48
+go6:
+    .ascii "go6"
+go4:
+    .ascii "go4"
+qa:
+    .ascii "A-query"
+qaaaa:
+    .ascii "AAAA-query"
+.align 8
+iov_a:
+    .quad qa, 7
+iov_aaaa:
+    .quad qaaaa, 10
+riov:
+    .quad rbuf, 64
+/* Two struct mmsghdr (64 bytes each): msghdr, then msg_len. */
+mmsgs:
+    .quad 0, 0, iov_a, 1, 0, 0, 0, 0
+    .quad 0, 0, iov_aaaa, 1, 0, 0, 0, 0
+/* One receive struct mmsghdr: a name buffer and one iovec. */
+rmsg:
+    .quad rname
+    .long 28, 0
+    .quad riov, 1, 0, 0, 0, 0
+rname:
+    .zero 32
+rbuf:
+    .zero 64
+#endif
 #ifdef ID_PORT
 id_addr:
     .short 2

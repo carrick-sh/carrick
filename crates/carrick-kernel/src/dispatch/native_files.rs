@@ -2130,6 +2130,179 @@ mod tests {
         assert!(super::super::creds::has_effective_capability(&root, 13));
     }
 
+    /// #2418: a native child's resolver message calls, end to end through
+    /// the shared ring staging, the carrier's socket handlers and the ring's
+    /// completion: glibc's `sendmmsg` of an A and an AAAA query on a
+    /// connected UDP socket (each message's `msg_len` written back), then
+    /// `recvmsg` of each answer with its source address (`msg_namelen`
+    /// written back) and `recvmmsg` of one, against a loopback name server.
+    /// Results are the Docker oracle's for the same calls. Red before: the
+    /// staging declined every message call (a counted ENOSYS).
+    #[test]
+    fn a_native_childs_resolver_messages_cross_as_linux() {
+        use carrick_personality_linux::native_host_file::{
+            DescriptionAccess, HostFileCall, HostFileStage, HostFileUser, NativeDescriptor,
+            NativeNamespace, SocketCall,
+        };
+        /// The test's own memory as the caller's user memory.
+        struct Own;
+        impl HostFileUser for Own {
+            fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+                // SAFETY: every staged address names a live test buffer.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr(), dst.len())
+                };
+                true
+            }
+            fn writable(&mut self, _dst: u64, len: usize) -> usize {
+                len
+            }
+        }
+        let fixture = fixture();
+        let root = fixture.dispatcher.capture_one_task_context().unwrap();
+        let caller = host_file::NetCaller {
+            task: root.task().key(),
+            ns_pid: std::num::NonZeroU32::new(7).unwrap(),
+            ids: host_file::AccessIds {
+                ruid: 0,
+                euid: 0,
+                suid: 0,
+                fsuid: 0,
+                rgid: 0,
+                egid: 0,
+                sgid: 0,
+                fsgid: 0,
+            },
+            cap_effective: 0,
+        };
+        // Stage `nr(args)` as the ring does, serve it, and complete it into
+        // the test's memory.
+        use carrick_personality_linux::crossing::nr;
+        let call = |nr, args: [u64; 6]| -> i64 {
+            let socket = SocketCall::decode(nr, &args).unwrap();
+            let staged = carrick_personality_linux::native_host_file::stage(
+                HostFileCall::Socket(socket),
+                &mut NativeNamespace {
+                    table: fixture.table,
+                    resolve: &mut |_| {
+                        Some(NativeDescriptor::HostBacked {
+                            access: DescriptionAccess::ReadWrite,
+                        })
+                    },
+                    releases: &mut |_| 0,
+                },
+                &mut Own,
+            );
+            let Some(HostFileStage::Request { record, output, .. }) = staged else {
+                panic!("{nr:?} crosses to the host network: {staged:?}");
+            };
+            let mut record =
+                carrick_personality_linux::native_host_file::stamp_net_caller(&record, &caller)
+                    .unwrap()
+                    .into_vec();
+            fixture.serve(None, &mut record).unwrap();
+            carrick_personality_linux::native_host_file::complete(
+                &record,
+                output,
+                &mut |address, bytes| {
+                    // SAFETY: the staged output ranges are live test buffers.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            address as *mut u8,
+                            bytes.len(),
+                        )
+                    };
+                    true
+                },
+            )
+            .raw()
+        };
+        let address = |bytes: &[u8]| bytes.as_ptr() as u64;
+        let word = |value: u64| value.to_le_bytes();
+        let iovec = |base: &[u8], len: usize| [word(address(base)), word(len as u64)].concat();
+
+        // A loopback name server answering each query with "R" and the
+        // query, then telling the test both answers are queued.
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let port = server.local_addr().unwrap().port();
+        let (answered, queued) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let mut query = [0u8; 64];
+                let (len, from) = server.recv_from(&mut query).unwrap();
+                server
+                    .send_to(&[b"R".as_slice(), &query[..len]].concat(), from)
+                    .unwrap();
+                answered.send(()).unwrap();
+            }
+        });
+        let fd = call(nr::SOCKET, [2, 2, 0, 0, 0, 0]);
+        assert!(fd >= 0, "a UDP socket: {fd}");
+        let mut server_address = [0u8; 16];
+        server_address[..2].copy_from_slice(&2u16.to_le_bytes());
+        server_address[2..4].copy_from_slice(&port.to_be_bytes());
+        server_address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        let args = [fd as u64, address(&server_address), 16, 0, 0, 0];
+        assert_eq!(call(nr::CONNECT, args), 0);
+
+        // sendmmsg(fd, msgs, 2, MSG_NOSIGNAL): 2, and each msg_len.
+        let (a, aaaa) = (b"A-query".to_vec(), b"AAAA-query".to_vec());
+        let iovecs = [iovec(&a, a.len()), iovec(&aaaa, aaaa.len())];
+        let mut msgs = vec![0u8; 128];
+        for (index, iov) in iovecs.iter().enumerate() {
+            let header = &mut msgs[index * 64..];
+            header[16..24].copy_from_slice(&word(address(iov)));
+            header[24..32].copy_from_slice(&word(1));
+        }
+        assert_eq!(
+            call(nr::SENDMMSG, [fd as u64, address(&msgs), 2, 0x4000, 0, 0]),
+            2
+        );
+        let msg_len = |header: &[u8]| u32::from_le_bytes(header[56..60].try_into().unwrap());
+        assert_eq!((msg_len(&msgs[..64]), msg_len(&msgs[64..])), (7, 10));
+        queued.recv().unwrap();
+        queued.recv().unwrap();
+
+        // recvmsg(fd, &msg, 0) of each answer, with its source address.
+        let buffer = vec![0u8; 64];
+        let name = vec![0u8; 28];
+        let iov = iovec(&buffer, buffer.len());
+        let mut msg = vec![0u8; 56];
+        msg[..8].copy_from_slice(&word(address(&name)));
+        msg[16..24].copy_from_slice(&word(address(&iov)));
+        msg[24..32].copy_from_slice(&word(1));
+        for answer in [b"RA-query".as_slice(), b"RAAAA-query"] {
+            msg[8..12].copy_from_slice(&28u32.to_le_bytes());
+            assert_eq!(
+                call(nr::RECVMSG, [fd as u64, address(&msg), 0, 0, 0, 0]),
+                answer.len() as i64
+            );
+            assert_eq!(&buffer[..answer.len()], answer);
+            assert_eq!(u32::from_le_bytes(msg[8..12].try_into().unwrap()), 16);
+            assert_eq!(name[..8], server_address[..8], "the name server answered");
+        }
+
+        // sendmsg of one more query, then recvmmsg(fd, msgs, 1, 0, NULL).
+        assert_eq!(
+            call(nr::SENDMSG, [fd as u64, address(&msgs), 0x4000, 0, 0, 0]),
+            7
+        );
+        queued.recv().unwrap();
+        let mut batch = vec![0u8; 64];
+        batch[16..24].copy_from_slice(&word(address(&iov)));
+        batch[24..32].copy_from_slice(&word(1));
+        assert_eq!(
+            call(nr::RECVMMSG, [fd as u64, address(&batch), 1, 0, 0, 0]),
+            1
+        );
+        assert_eq!(msg_len(&batch), 8);
+        assert_eq!(&buffer[..8], b"RA-query");
+    }
+
     /// #231: inside a native member's network call every identity read
     /// answers the member's stamped caller, never the borrowed root
     /// context's, including scopes nested in the call.
