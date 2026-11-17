@@ -21,3 +21,14 @@ fn system_closure_red_witness() {
         );
     }
 }
+
+#[test]
+fn exception_closure_red_witness() {
+    for word in [0xd4000001, 0xd4000022, 0xd4000003, 0xd4400000] {
+        assert_ne!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
