@@ -176,7 +176,7 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
 
     // A woken wait takes its own operation back before any descriptor
     // lookup: the description it pinned is the one it locks.
-    let mut retained = match sched.take_object_operation() {
+    let mut retained: Option<(IpcOpToken, IpcOperation)> = match sched.take_object_operation() {
         Err(_) => return IpcServed::Forward,
         Ok(None) => None,
         Ok(Some(operation)) => {
@@ -381,13 +381,9 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
                 };
                 let result = match released {
                     Ok(true) => {
-                        let wake = locks.released();
+                        let effects = notify_released(sched, &mut locks);
                         drop(locks);
-                        super::notify_native_wake(
-                            wake,
-                            Some((sched.zone(), sched.slot())),
-                            sched.task(),
-                        );
+                        finish_wakes(sched, effects);
                         0
                     }
                     Ok(false) => 0,
@@ -438,7 +434,7 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
             return finish_with(sched, frame, region, retained.take(), fresh_pin.take(), 0);
         }
         let outcome = locks.table().set(request, &owners);
-        let wake = outcome.released.then(|| locks.released());
+        let wake = outcome.released.then(|| notify_released(sched, &mut locks));
         let blocked = match outcome.taken {
             Ok(()) => None,
             Err(SetRefusal::Full) => Some(carrick_abi::LINUX_ENOLCK.guest_retval()),
@@ -452,23 +448,15 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
                 let object = locks.handle();
                 let Some(snap) = snapshot(sched, object, WaitFor::Readable) else {
                     drop(locks);
-                    if let Some(wake) = wake {
-                        super::notify_native_wake(
-                            wake,
-                            Some((sched.zone(), sched.slot())),
-                            sched.task(),
-                        );
+                    if let Some(effects) = wake {
+                        finish_wakes(sched, effects);
                     }
                     drop_hold(sched, region, retained.take(), fresh_pin.take());
                     return IpcServed::Forward;
                 };
                 drop(locks);
-                if let Some(wake) = wake {
-                    super::notify_native_wake(
-                        wake,
-                        Some((sched.zone(), sched.slot())),
-                        sched.task(),
-                    );
+                if let Some(effects) = wake {
+                    finish_wakes(sched, effects);
                 }
                 let (token, op) = match retained.take() {
                     Some((token, mut op)) => {
@@ -527,8 +515,8 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
             }
         };
         drop(locks);
-        if let Some(wake) = wake {
-            super::notify_native_wake(wake, Some((sched.zone(), sched.slot())), sched.task());
+        if let Some(effects) = wake {
+            finish_wakes(sched, effects);
         }
         return finish_with(
             sched,
@@ -538,6 +526,34 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
             fresh_pin.take(),
             blocked.unwrap_or(0),
         );
+    }
+}
+
+/// Publish a release on the lock object's `Readable` lane and notify its
+/// waiters under the table's lock (the object-wait epoch rule); the caller
+/// delivers the effects once the lock is dropped.
+fn notify_released<E: IpcExecution>(
+    sched: &E,
+    locks: &mut carrick_el1_abi::ipc::FileLocksGuard<'_>,
+) -> [Option<carrick_sched_core::WakeEffects>; 2] {
+    // The lock object has no host subscriber: only ring waiters park on it.
+    let _ = locks.released();
+    super::notify(
+        sched,
+        locks.handle(),
+        carrick_el1_abi::ipc::pipe::WakeSet {
+            readers: true,
+            writers: false,
+        },
+    )
+}
+
+fn finish_wakes<E: IpcExecution>(
+    sched: &mut E,
+    effects: [Option<carrick_sched_core::WakeEffects>; 2],
+) {
+    for effects in effects.into_iter().flatten() {
+        sched.finish_object_wake(effects);
     }
 }
 

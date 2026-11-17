@@ -18880,6 +18880,130 @@ fn arm_fork_child_owner_chown_keeps_its_own_ids() {
 /// record locks; F_SETLKW and a blocking flock wait, releasing the CPU,
 /// until the holder lets go; a flock belongs to its open file description
 /// and ends with its last close.
+/// #231: two F_SETLKW waiters on one lock. A's unlock wakes both; the one
+/// that reruns first takes the lock, the other finds it held again and
+/// parks once more on its retained operation; B's unlock wakes it and its
+/// rerun takes the lock. No waiter is lost, none spins.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_arm_two_lock_waiters_rerun_and_park_again() {
+    use carrick_abi::{
+        LINUX_AT_FDCWD, LINUX_F_SETLK, LINUX_F_SETLKW, LINUX_F_UNLCK, LINUX_F_WRLCK, LINUX_O_CREAT,
+        LINUX_O_RDWR, LinuxFlock64,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute::{self, Suspended};
+    use carrick_test_support::GuestUserBuffer;
+
+    let (steps, _) = with_arm_process_window_dispatch(|call| {
+        let tmp = GuestUserBuffer::from_bytes(b"/tmp\0");
+        call(
+            ArmCaller::Root,
+            sys::MKDIRAT.raw(),
+            [LINUX_AT_FDCWD, tmp.arg(), 0o777, 0, 0, 0],
+        );
+        let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-231-two-waiters-lock\0");
+        // The root's child A forks B and C (the harness admits one root fork).
+        let (_, a) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        let a = ArmCaller::Child(a as u32);
+        let (_, b) = call(a, 220, [17, 0, 0, 0, 0, 0]);
+        let b = ArmCaller::Child(b as u32);
+        call(b, ARM_RESUME, [0; 6]);
+        let (_, c) = call(a, 220, [17, 0, 0, 0, 0, 0]);
+        let c = ArmCaller::Child(c as u32);
+        call(c, ARM_RESUME, [0; 6]);
+        let mut open = |who| {
+            let (_, fd) = call(
+                who,
+                sys::OPENAT.raw(),
+                [
+                    LINUX_AT_FDCWD,
+                    path.arg(),
+                    LINUX_O_RDWR | LINUX_O_CREAT,
+                    0o640,
+                    0,
+                    0,
+                ],
+            );
+            assert!(fd >= 0, "{who:?} open: {fd}");
+            fd as u64
+        };
+        let (fa, fb, fc) = (open(a), open(b), open(c));
+        let lock = |l_type: i32| {
+            GuestUserBuffer::from_value(LinuxFlock64 {
+                l_type: l_type as i16,
+                ..Default::default()
+            })
+        };
+        let (write, unlock) = (lock(LINUX_F_WRLCK), lock(LINUX_F_UNLCK));
+        let fcntl = sys::FCNTL.raw();
+        let set = |fd, cmd, arg: &GuestUserBuffer| [fd, cmd, arg.arg(), 0, 0, 0];
+        let mut steps = Vec::new();
+        let mut step = |what: &'static str, got: (CompletionRoute, i64)| {
+            steps.push((what, got.0, if got.0 == Suspended { 0 } else { got.1 }));
+        };
+        step("A F_SETLK", call(a, fcntl, set(fa, LINUX_F_SETLK, &write)));
+        step(
+            "B F_SETLKW parks",
+            call(b, fcntl, set(fb, LINUX_F_SETLKW, &write)),
+        );
+        step(
+            "C F_SETLKW parks",
+            call(c, fcntl, set(fc, LINUX_F_SETLKW, &write)),
+        );
+        step("A unlock", call(a, fcntl, set(fa, LINUX_F_SETLK, &unlock)));
+        let woken = call(b, ARM_RESUME, [0; 6]);
+        step("B woken", (woken.0, 0));
+        step(
+            "B rerun takes it",
+            call(b, fcntl, set(fb, LINUX_F_SETLKW, &write)),
+        );
+        let woken = call(c, ARM_RESUME, [0; 6]);
+        step("C woken", (woken.0, 0));
+        step(
+            "C rerun parks again",
+            call(c, fcntl, set(fc, LINUX_F_SETLKW, &write)),
+        );
+        step("C still parked", call(c, ARM_RESUME, [0; 6]));
+        step("B unlock", call(b, fcntl, set(fb, LINUX_F_SETLK, &unlock)));
+        let woken = call(c, ARM_RESUME, [0; 6]);
+        step("C woken again", (woken.0, 0));
+        step(
+            "C rerun takes it",
+            call(c, fcntl, set(fc, LINUX_F_SETLKW, &write)),
+        );
+        steps
+    });
+    let routes: Vec<_> = steps
+        .iter()
+        .map(|&(what, route, ret)| {
+            (
+                what,
+                route == Suspended,
+                if route == Suspended { 0 } else { ret },
+            )
+        })
+        .collect();
+    assert_eq!(
+        routes,
+        [
+            ("A F_SETLK", false, 0),
+            ("B F_SETLKW parks", true, 0),
+            ("C F_SETLKW parks", true, 0),
+            ("A unlock", false, 0),
+            ("B woken", false, 0),
+            ("B rerun takes it", false, 0),
+            ("C woken", false, 0),
+            ("C rerun parks again", true, 0),
+            ("C still parked", true, 0),
+            ("B unlock", false, 0),
+            ("C woken again", false, 0),
+            ("C rerun takes it", false, 0),
+        ],
+        "{steps:?}"
+    );
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_arm_fork_children_contend_record_locks_and_flock_in_the_ring() {
