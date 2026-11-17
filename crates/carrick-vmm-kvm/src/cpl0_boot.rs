@@ -1913,26 +1913,16 @@ impl Cpl0Carrier {
         let [mut a, mut b]: [KvmVcpu; 2] =
             cpus.try_into().map_err(|_| fail("carrier vCPU count"))?;
         for (index, cpu) in [&mut a, &mut b].into_iter().enumerate() {
-            let mut layout = LAYOUT;
-            layout.trampoline_base = plan.entry;
-            carrick_x86::program_longmode_entry(
-                cpu,
-                layout,
-                USER_CODE + index as u64 * 4096,
-                0x3_1ff0 + index as u64 * 0x1_0000,
+            let state = BootCpuState::new(
+                plan.entry,
+                &boot,
+                carrick_guest_arch::CpuId::new(index as u32),
+                hardware_interrupts,
+                initial_extent_bytes.is_some(),
             )?;
-            if hardware_interrupts && initial_extent_bytes.is_none() {
-                // This fixture enters CPL3 directly. Unlike the production
-                // initial-MM IRET frame, the generic x86 bootstrap flags
-                // still have IF clear for CPL0 bringup. Admit native APIC
-                // interrupts before the first fixture user instruction.
-                cpu.set_gpr(X86Reg::Rflags, boot.rflags | (1 << 9))?;
-            }
-            carrick_x86::program_fault_segments(cpu, LAYOUT, index as u64)?;
+            state.program_entry(cpu)?;
             let mut system = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
             if initial_extent_bytes.is_some() {
-                const CPUID_SMEP_SMAP: u32 = (1 << 7) | (1 << 20);
-                const CR4_SMEP_SMAP: u64 = (1 << 20) | (1 << 21);
                 let cpuid = cpu
                     .fd()
                     .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1942,37 +1932,21 @@ impl Cpl0Carrier {
                     .iter()
                     .find(|entry| entry.function == 7 && entry.index == 0)
                     .map_or(0, |entry| entry.ebx);
-                if features & CPUID_SMEP_SMAP != CPUID_SMEP_SMAP {
+                if features & state.cpuid_leaf7_required != state.cpuid_leaf7_required {
                     return Err(fail("production CPL0 requires CPUID SMEP and SMAP"));
                 }
-                system.cr4 |= CR4_SMEP_SMAP;
+                system.cr4 |= state.cr4_required;
             }
-            system.gdt.base = DIRECT_VA + LAYOUT.gdt_base;
-            system.idt.base = DIRECT_VA
-                + carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index as u64)?;
-            system.tr = crate::kvm_x86_engine::KvmSegment::from(
-                carrick_x86::SegmentDescriptor::tss64_busy(
-                    DIRECT_VA
-                        + carrick_x86::fault_slot_gpa(
-                            carrick_x86::fault_tss_base(LAYOUT),
-                            index as u64,
-                        )?,
-                ),
-            )
-            .0;
-            if hardware_interrupts {
-                system.apic_base = carrick_x86::interrupts::LAPIC_BASE
-                    | 0x800
-                    | if index == 0 { 0x100 } else { 0 };
+            system.gdt.base = state.gdt_base;
+            system.idt.base = state.idt_base;
+            system.tr = crate::kvm_x86_engine::KvmSegment::from(state.tr).0;
+            if let Some(apic_base) = state.apic_base {
+                system.apic_base = apic_base;
             }
             cpu.fd()
                 .set_sregs(&system)
                 .map_err(|e| fail(e.to_string()))?;
-            cpu.set_syscall_msrs(
-                plan.entry,
-                boot.star,
-                boot.sfmask | (1 << 10) | (1 << 8) | (1 << 18),
-            )?;
+            cpu.set_syscall_msrs(state.lstar, state.star, state.sfmask)?;
             if hardware_interrupts {
                 // KVM_CREATE_IRQCHIP leaves the secondary vCPU awaiting SIPI.
                 // Both native CPL0 entry states were installed while stopped;
@@ -1985,7 +1959,7 @@ impl Cpl0Carrier {
             }
             let msrs = Msrs::from_entries(&[kvm_msr_entry {
                 index: 0xc000_0102,
-                data: METADATA_VA + BINDING_OFFSET + index as u64 * STRIDE,
+                data: state.kernel_gs_base,
                 ..Default::default()
             }])
             .map_err(|e| fail(e.to_string()))?;
