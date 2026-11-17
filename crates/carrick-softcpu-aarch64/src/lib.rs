@@ -609,6 +609,8 @@ mod instruction {
         MoveWide(MoveWide),
         Bitfield(Bitfield),
         Address(Address),
+        Multiply(Multiply),
+        Divide(Divide),
         ConditionalSelect(ConditionalSelect),
         ConditionalCompare(ConditionalCompare),
     }
@@ -669,6 +671,12 @@ mod instruction {
         }
         if let Some(c) = conditional_compare(word) {
             return Instruction::ConditionalCompare(c);
+        }
+        if let Some(m) = multiply(word) {
+            return Instruction::Multiply(m);
+        }
+        if let Some(d) = divide(word) {
+            return Instruction::Divide(d);
         }
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
     }
@@ -1282,6 +1290,91 @@ mod instruction {
         })
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MultiplyKind {
+        SameWidth,
+        SignedLong,
+        UnsignedLong,
+        SignedHigh,
+        UnsignedHigh,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Multiply {
+        pub kind: MultiplyKind,
+        pub width: crate::Width,
+        pub subtract: bool,
+        pub rd: OperandRegister,
+        pub rn: OperandRegister,
+        pub rm: OperandRegister,
+        pub accumulator: Option<OperandRegister>,
+    }
+    /// DDI0487G.a C6.2.184/197 MADD/MSUB, C6.2.240/243 SMADDL/SMSUBL,
+    /// C6.2.341/343 UMADDL/UMSUBL, C6.2.244/344 SMULH/UMULH;
+    /// C4.1.5 Data-processing (3 source), C4-337–338.
+    fn multiply(w: u32) -> Option<Multiply> {
+        if w & 0x7f000000 != 0x1b000000 {
+            return None;
+        }
+        let sf = w >> 31;
+        let kind = match (w >> 21) & 7 {
+            0 => MultiplyKind::SameWidth,
+            1 if sf == 1 => MultiplyKind::SignedLong,
+            5 if sf == 1 => MultiplyKind::UnsignedLong,
+            2 if sf == 1 => MultiplyKind::SignedHigh,
+            6 if sf == 1 => MultiplyKind::UnsignedHigh,
+            _ => return None,
+        };
+        let high = matches!(kind, MultiplyKind::SignedHigh | MultiplyKind::UnsignedHigh);
+        // The high-half form does not consume an accumulator. Accept the
+        // canonical all-ones Ra field; noncanonical constrained bits fail shut.
+        if high && w & 0xfc00 != 0x7c00 {
+            return None;
+        }
+        Some(Multiply {
+            kind,
+            width: if sf == 0 {
+                crate::Width::W32
+            } else {
+                crate::Width::X64
+            },
+            subtract: w & 0x8000 != 0,
+            rd: OperandRegister::field(w, false),
+            rn: OperandRegister::field(w >> 5, false),
+            rm: OperandRegister::field(w >> 16, false),
+            accumulator: if high {
+                None
+            } else {
+                Some(OperandRegister::field(w >> 10, false))
+            },
+        })
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Divide {
+        pub width: crate::Width,
+        pub signed: bool,
+        pub rd: OperandRegister,
+        pub rn: OperandRegister,
+        pub rm: OperandRegister,
+    }
+    /// DDI0487G.a C6.2.236 SDIV, C6.2.340 UDIV;
+    /// C4.1.5 Data-processing (2 source), C4-328–330.
+    fn divide(w: u32) -> Option<Divide> {
+        if w & 0x7fe0f800 != 0x1ac00800 {
+            return None;
+        }
+        Some(Divide {
+            width: if w >> 31 == 0 {
+                crate::Width::W32
+            } else {
+                crate::Width::X64
+            },
+            signed: w & 0x400 != 0,
+            rd: OperandRegister::field(w, false),
+            rn: OperandRegister::field(w >> 5, false),
+            rm: OperandRegister::field(w >> 16, false),
+        })
+    }
+
     /// Register index 0..30. Architectural register 31 is represented separately.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Gpr(u8);
@@ -1610,8 +1703,9 @@ mod instruction {
 pub use instruction::{
     AddImmediate, AddSubtract, Address, AddressBase, Arithmetic, ArithmeticOperand, Bitfield,
     BitfieldOperation, Branch, CompareImmediate, CompareOperand, Condition, ConditionalCompare,
-    ConditionalSelect, Extend, Gpr, Hint, Instruction, Logical, LogicalImmediate, LogicalOperand,
-    LogicalOperation, MemoryAddress, MemoryIndex, MemoryOffset, MemoryOperation, MemoryRegister,
-    MemorySize, MoveWide, MoveWideOperation, Nzcv, OperandRegister, PairMemory, PcOffset,
-    RegisterBranch, ScalarMemory, SelectOperation, ShiftAmount, VectorRegister, decode_instruction,
+    ConditionalSelect, Divide, Extend, Gpr, Hint, Instruction, Logical, LogicalImmediate,
+    LogicalOperand, LogicalOperation, MemoryAddress, MemoryIndex, MemoryOffset, MemoryOperation,
+    MemoryRegister, MemorySize, MoveWide, MoveWideOperation, Multiply, MultiplyKind, Nzcv,
+    OperandRegister, PairMemory, PcOffset, RegisterBranch, ScalarMemory, SelectOperation,
+    ShiftAmount, VectorRegister, decode_instruction,
 };
