@@ -7,10 +7,12 @@ use std::sync::mpsc;
 use crate::trap::TrapError;
 use carrick_kernel::dispatch::SyscallDispatcher;
 use carrick_kernel::kernel::objects::{
-    BlockedReason, ExecutionFailure, ExecutionGeneration, MigratableTaskState,
+    BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
     ThreadExecutionLease, ThreadExecutionState, ThreadKey,
 };
-use carrick_kernel::kernel::{ExecutorKick as _, ExecutorRegistration, RunnableThread, Scheduler};
+use carrick_kernel::kernel::{
+    ExecutorDeath, ExecutorKick as _, ExecutorRegistration, RunnableThread, Scheduler,
+};
 
 use super::binding::{PersistentTaskBinding, PreparedVforkChildActivation, TaskBindingResolver};
 use super::probe_executor_lifecycle;
@@ -397,6 +399,9 @@ where
         let running = match scheduler.take(registration) {
             Ok(running) => running,
             Err(carrick_kernel::kernel::RunQueueError::Closed) => return Ok(()),
+            // The dying worker's own death verdict pokes executor control
+            // (#2420); a drain has no control work, so it takes again.
+            Err(carrick_kernel::kernel::RunQueueError::ControlPoked) => continue,
             Err(error) => return Err(error.to_string()),
         };
         let executor = running.executor();
@@ -562,6 +567,32 @@ where
     R: TaskBindingResolver<B>,
 {
     fail_running_and_retire::<B, R>(resolver, scheduler, running, reason, &ReceiptLog::default())
+}
+
+/// A worker's notice of its own death, the carrier's terminal verdict
+/// (#2420). An arm of `run_executor_loop` that kills its worker while holding
+/// a claim publishes the death through this BEFORE the claim's failure
+/// settlement: that settlement publishes the claimed job's result, and a run
+/// wait that reads the result must already see the death behind it, or it
+/// returns a generic carrier failure in place of the worker's own error.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkerDeathNotice<'a> {
+    pub(crate) scheduler: &'a Scheduler,
+    pub(crate) executor: ExecutorId,
+    pub(crate) worker: usize,
+}
+
+impl WorkerDeathNotice<'_> {
+    /// Publish the death with the worker's own `error`, and return it. The
+    /// first death is the verdict; a later one changes nothing.
+    pub(crate) fn publish(self, error: String) -> String {
+        self.scheduler.publish_executor_death(ExecutorDeath {
+            executor: self.executor,
+            worker: self.worker,
+            error: error.clone(),
+        });
+        error
+    }
 }
 
 pub(crate) fn with_settlement_error(mut source: String, settlement: Option<String>) -> String {
