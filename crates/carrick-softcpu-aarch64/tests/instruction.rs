@@ -190,3 +190,17 @@ fn conditional_reserved_bits_fail_shut() {
         );
     }
 }
+
+#[test]
+fn multiply_divide_forms_have_typed_operands() {
+    for word in [
+        0x9b020c20, 0x9b028c20, 0x9b220c20, 0x9ba20c20, 0x9b427c20, 0x9bc27c20, 0x9ac20c20,
+        0x1ac20820,
+    ] {
+        assert_ne!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
