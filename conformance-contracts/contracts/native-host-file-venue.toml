@@ -75,6 +75,15 @@ The scheduler fixtures entry_kick_and_timer_preempt_two_private_contexts and
 return_kick_and_timer_preempt_two_private_contexts exercise both retained roots.
 No bindings, semantic expectations, structural budgets or acceptance layers
 change; signed acceptance and runtime-ratio promotion remain director-owned.
+
+A mount-served synthetic file the venue opens (the run's injected
+/etc/resolv.conf and /etc/services, #2418) reads its blob at the
+description's offset through the carrier buffer, as a task's read does.
+Before, the venue opened it but refused its read, a counted ENOSYS, so the
+guest's resolvers saw no nameserver. As Docker's bind mount does, the
+injection replaces an image's own /etc/resolv.conf. A /proc/<pid>/{mem,
+pagemap} renders an address space only a task has; the venue never opens
+one and its carrier read stays refused.
 """
 
 [bindings]
@@ -92,6 +101,7 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::host_root_open_publishes_unstamped_record_through_service_notice",
   "carrick-el1-linux::native_process_runtime::host_test_support::root_exec_access_refusal_is_counted_before_service_publication (production admitted and registered root has no filesystem authority: host-file open and exec refuse before service publication)",
   "carrick-kernel::dispatch::native_files::tests::native_reads_equal_the_dispatchers_own_syscalls",
+  "carrick-kernel::dispatch::native_files::tests::native_read_serves_the_injected_resolv_conf_over_the_images (#2418: the injected resolv.conf reads its launch snapshot's nameserver, never the image's, then end of file; red: NativeHostFileRefusal)",
   "carrick-el1-linux::dispatch::tests::native_host_file_stage_keeps_in_zone_writes_in_ring_and_stages_host_stdout",
   "carrick-kernel::dispatch::mem::native_successor::tests::successor_image_rows_cover_every_user_leaf_and_make_elf_pages_lazy",
   "carrick-kernel::dispatch::native_files::tests::in_zone_pipe_stat_matches_the_dispatchers_pipe_record",
