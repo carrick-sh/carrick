@@ -1,6 +1,6 @@
 # AArch64 soft CPU stage-1 walker (A2)
 
-Part of #2480, round 3 (published design revision). This is an inventory and proposed design, not an
+Part of #2480. This is an inventory and proposed design, not an
 implemented walker. Inventory taken on GitHub main on 2026-11-17. N1 placement
 and TLB policy belongs to the x86 soft-CPU lane; this document does not reserve
 its implementation or change its interfaces.
@@ -11,7 +11,14 @@ Architectural authority is the [Arm ARM, DDI 0487G.a, ID011921](https://document
 downloaded directly from Arm. Relevant sections: D5.1.4 (address tagging), D5.2 (address translation),
 D5.3 (descriptors), D5.4.2–3 (PAN/UAO), D5.4.5–6 (permissions), D5.4.9–15
 (blocks, AF/dirty management and contiguous), D5.8.2–3 (fault levels and
-priority), D13.2 ESR_EL1 (pages 3145–3153), FAR_EL1 and SCTLR_EL1.EPAN.
+priority), D13.2 ESR_EL1 (pages 3145–3153), and FAR_EL1.
+For EPAN specifically, G.a already defines FEAT_PAN3 in A2.4.3 (pages
+A2-76–77), lists it among Armv8.7 additions to earlier extensions in A2.10.3
+(page A2-106), describes PAN in D5.4.2 (page D5-2732), and defines
+SCTLR_EL1.EPAN bit 57 in D13.2.116 (page D13-3575). Those pages were read
+directly in the linked G.a PDF; no later edition is needed for this claim.
+This is section-specific verification, not a claim to have verified the entire
+Arm ARM or the unimplemented walker.
 No external implementation source was consulted; no Linux, QEMU, Wine or
 other copyleft source is admissible. Repo code is implementation evidence,
 not architectural authority. In particular, comments describing PAN3 as an
@@ -23,7 +30,7 @@ AArch64 EL1&0 stage 1, 48-bit VA, 40-bit output, 4 KiB granule, software AF
 management. Feature exposure must be explicit; host capabilities cannot select
 semantics. 16 KiB *host* pages must work with these same guest tables. A future
 16 KiB guest granule needs separate geometry and witnesses, not reuse of the
-4 KiB shifts. No behavior code is proposed in this round.
+4 KiB shifts. No behavior code is proposed by this design.
 
 ## Existing mechanisms
 
@@ -46,12 +53,52 @@ line-pinned inventory.
 | `crates/carrick-mmu-core/src/aarch64/descriptor_txn.rs`: `output_mask`, `plan_descriptor_op`, `execute_descriptor_op`; submodules `guest_cow::classify_guest_cow_write`, `copy_window` | Transaction traversal, terminal geometry, COW table descent and page-only copy-window descent | Retained/prepared owner states remain separate from architectural validity |
 | `crates/carrick-el1/src/memory.rs`: `ArmAnonymousDecode::next_table`; `crates/carrick-mem/src/memory.rs`: `stage1_hvpatch_page_tables::scope_table` | ARM table classification for neutral anonymous-backing traversal and recursive nG publication | Neither implements CPU access checking |
 
-Inventory search covered descriptor type masks, 39/30/21/12 shifts, table
-walk/translate names across `crates/`, including test-only raw walks in
-`mm_portal/tests.rs`. Diagnostics (`debug_walk`, `walk_descriptors_host`) and
-builders are consumers of the same format, not independent architectural
-permission authorities. Extraction must audit these consumers rather than
-copy their permissive diagnostic behavior into CPU translation.
+The following additional consumers are part of the same slice-2 audit. “Keep
+owner view” means keep its authentication/software-state policy, **not** keep
+an independent format decoder. Every production format extraction below must
+use the shared decoder (including its geometry/output helpers).
+
+| Source / symbol | Verified behavior | Slice 2 disposition and reason |
+| --- | --- | --- |
+| `crates/carrick-vmm-hvf/src/trap/foreign_mm.rs::foreign_stage1_translate` | Four-level pinned-owner walk with VALID/TABLE_OR_PAGE, ADDRESS_MASK, SHIFTS 39/30/21/12 and its own L3 page check/output | Migrate format decode; keep pinned-owner loads and generation receipts as owner-view authority, not CPU permissions |
+| `crates/carrick-vmm-hvf/src/trap/foreign_mm/current_read.rs::translation` | Second four-level walk resolves atomic words through the frame inventory and backing generation; checks EL0 AP and reserved L0/L3 forms; computes block/page output | Migrate format decode; keep live-inventory authentication, read-window guards and EL0 owner-view admission |
+| `crates/carrick-vmm-hvf/src/trap/cow_engine.rs::require_published_repoint` | Uses manager debug walk and terminal EL0 predicates, then recomputes span as `1 << (39 - 9*level)` and masks output | Migrate span/output decode; keep completed-publication/expected-access validation as owner-view policy |
+| `crates/carrick-vmm-hvf/src/metadata_grant/native_service.rs::native_cow_fault_split` | Four-level stock-backed atomic walk, `descriptor & 3 != 3` terminal detection, then `guest_cow::is_guest_cow_write_leaf` and split-table count | Migrate table/terminal/output format decode; retain COW software-bit policy and stock custody in owner view |
+| `crates/carrick-vmm-hvf/src/hvpatch_probe_support/kernel_memory.rs`: `indices`, `PA_MASK`, `table_descriptor`, `leaf_descriptor`, `build_parent_tables`, `copy_child_table_path` | Probe-support geometry and descriptor builders/readback, not a general CPU permission walk | Migrate geometry/output helpers; retain probe fixture construction. Exact raw-byte assertions remain independent expected values |
+| `crates/carrick-vmm-hvf/src/trap.rs::next_deferred_cow_authentication_page` | Decodes valid block type and L1/L2 span from an already authenticated walk to skip covered pages | Migrate block/span decode; keep COW-arm boundary clipping and conservative invalid-leaf handling |
+| `crates/carrick-core/src/mm/frames.rs::grant_page_available`; `crates/carrick-core/src/mm/fork.rs`: `reconcile_parent_page`, `census_entry`, `copy_entry` and recursive table traversal | Generic four-level owner traversals use `B::is_table`/ADDRESS_MASK, calculate spans and block outputs for census, reconciliation and custody | Keep neutral owner-view traversal; route ARM format/geometry/output through shared decoder via owner hooks, including currently inline mask/span calculations. Fork inheritance/retired-state policy stays separate |
+| `crates/carrick-el1/src/memory.rs`: `classify_anonymous_range`, `owed_retired_terminals` and recursive anonymous traversal | Consume `AnonymousDescriptorDecode` (ARM binding is `ArmAnonymousDecode` above) | Keep neutral owner-view consumers; migrate the ARM hook, not a second traversal implementation |
+| `crates/carrick-vmm-hvf/src/trap/cow_engine.rs`: `materialize_retired_reuse`, `reuse_sole_owner_cow_in_place`, `perform_frame_cow`, `report_physical_cow_source_refusal`, `winner_pte_writable_private`; `trap/foreign_mm.rs` COW publication receipt checks | Page-output masks plus validity/AP/nG/private-state checks over manager/live terminal words, including retained output and diagnostics | Migrate page-output/format extraction; keep owner publication/retained-state predicates and diagnostic reporting. Invalid retained output must remain distinct from CPU validity |
+| `crates/carrick-vmm-hvf/src/trap/process_plan.rs`: `build_setup_process_plan` and child receipt checks; `crates/carrick-aarch64/src/engine.rs`: `commit_prepared_host_write`, `live_el1_grant_pages`, `build_process_spec` | Decode terminal page output for diagnostics, copyout/grant publication and fork-COW receipt authentication | Migrate format/output extraction; keep owner receipt and expected-AP/private/nG policy; shared-MM block receipts must use correct leaf span |
+| `crates/carrick-mem/src/memory.rs`: `stage1_identity_page_tables`, `stage1_carrier_maintenance_page_tables`, `el1_stack_page_descriptor` | Build table/page/block bytes and stack descriptors; hvpatch recursive nG traversal is listed above | Share format geometry/encoding helpers without changing image bytes; builders are not permission authorities |
+| Test/support raw walks: `crates/carrick-el1-linux/src/mm_portal/tests.rs`; `aarch64_process_tests/native_fault_supply_tests.rs`; `crates/carrick-core/tests/aarch64_fork_geometry.rs`; `crates/carrick-vmm-hvf/tests/el1_descriptor_service.rs`; HVF `trap/foreign_mm.rs::invalidate_live_leaf_without_shadow_for_test`, `trap/guest_alias/tests.rs`, `trap/memory_protection/tests.rs`; `crates/carrick-el1/src/memory/live_peer_tests.rs` | Fixture traversal, descriptor mutation or expected-output readback | Audit in slice 2: reusable fixture walkers use shared format helpers; raw expected bytes/negative mutations remain independent test assertions, never production decoders |
+
+Search method used for this revision (source text, not a host-selected build):
+
+```sh
+rg -n '0x0000_ffff_ffff_f000|ADDRESS_MASK|\[39, 30, 21, 12\]|descriptor & 3' --glob '*.rs'
+rg -n -i 'terminal|walk' crates --glob '*.rs'
+rg -n -i '0x0000_ffff_ffff_f000|ADDRESS_MASK|\[39[^]]*30[^]]*21[^]]*12\]|descriptor & (3|0b11)|terminal|walk' --glob '*.rs'
+```
+
+Read candidate function bodies and callers, including cfg-macOS HVF files;
+case-insensitive follow-up catches uppercase masks and typed shift literals.
+The commands cover all tracked crate source regardless of cfg, including
+`carrick-vmm-hvf`, `carrick-el1*`, `carrick-mem`, `carrick-hal`,
+`carrick-runtime` and `carrick-engine`. TTBR-only root masks (scheduler context,
+HAL root publication, EL1 live-root/service-window bindings and HVF root setup)
+are not descriptor walkers; x86 PML4/CPL0 walks share some shifts but are not ARM
+decoders. Runtime/engine wrappers delegate to the listed manager/owner APIs.
+Archived `docs/perf-results` Rust snapshots are historical, not production.
+Diagnostics (`debug_walk`, `walk_descriptors_host`) remain format consumers,
+not architectural permission authorities.
+
+Limits: this is a textual candidate audit, not a proof against differently
+spelled future decoders, generated source or build behavior. Re-run it at the
+implementation head and account for every inventory row. A Linux build does
+not compile cfg-macOS bodies: slice 2 must run `just cross-check-macos` and a
+signed macOS unit shard on its exact head for the migrated HVF consumers.
+Extraction must not copy permissive diagnostic behavior into CPU translation.
 
 Decision **(b)**: `Aarch64Mmu::translate_with` remains the Linux-permission/owner
 view. It and the architectural walk share **one descriptor-format decoder**
@@ -168,7 +215,15 @@ Access direction **is `LeafAccess`**, moved from `aarch64` and re-exported
 there. Preserve its existing Read=0, Write=1, Execute=2 probe wire encoding
 (`hvpatch__stale__stage1__retry`) through an explicit wire conversion with a
 compatibility witness. Replace x86 descriptor `Access` with a re-export of
-that same type; no third direction enum. TLB planes map explicitly Read→0,
+that same type. The inventory must also account for
+`carrick-guest-arch::Access`, the R/W/X direction of `FaultInfo::access`,
+alongside LeafAccess, x86 Access and the fault-record vocabulary
+`carrick-kernel::event_ring::RingAccess` (which also has Unknown). The alias
+proposal does **not** cover guest-arch Access: guest-arch is a lower
+dependency, so retain it with an exhaustive explicit conversion at the fault
+boundary rather than introduce a reverse dependency on mmu-core. RingAccess
+also retains its event-wire encoding; do not alias it to LeafAccess. Witness
+all three directions and the distinct wire mappings. TLB planes map explicitly Read→0,
 Write→1, Execute→2. `LeafSize` moves from `x86::descriptor_txn` to the neutral
 module with the old path re-exporting; x86-specific level interpretation stays
 in x86. `LeafSpan` carries base/size for eviction without assuming host geometry.
@@ -192,6 +247,10 @@ x86 is its first production caller in the extraction PR.**
 VA page OR mode bits. x86 bits 0–5 remain byte-identical
 (`TLB_TAG_CPL3_BIT`, `AC_BIT`, `WP_OFF_BIT`, `SMEP_OFF_BIT`, `SMAP_OFF_BIT`,
 `NXE_OFF_BIT`, each with the `TLB_TAG_` prefix); bits 6–11 are spare. Do not
+permit ARM class tags to set all of bits 0–11 together: for the highest
+VA page that would collide with `TLB_TAG_INVALID = u64::MAX`. Prefer typed
+per-ISA tag newtypes with checked class construction and an invalid-sentinel
+noncollision witness over raw u64 class tags. Do not
 attempt to pack root generations, 16-bit ASIDs and epochs into this entry.
 
 1. ARM supplies a collision-free permission-class tag in bits 6–11: encode
@@ -317,7 +376,10 @@ maintenance needs its own instruction classification and CM/WnR rules.
 | Data alignment | `0x21` | no table level; access layer checks as required |
 
 L0 AF/permission faults need LPA2 and are not valid outputs for this profile;
-`Stage1FaultKind::from_fault_status` alone is insufficient validation.
+`Stage1FaultKind::from_fault_status` masks with `0x3c`, classifies only
+translation/access-flag/permission and returns `None` for address-size and
+external aborts. It neither validates the level nor builds the full fault;
+alone it is insufficient validation.
 Disabled EPD/range failures are translation faults at the architectural start
 level; output-address overflow is address-size, not a truncated successful
 translation. Reserved descriptor forms (including L0 block/L3 type 01) must
@@ -372,10 +434,10 @@ slice. Keep semantic and deterministic work evidence separate from timing.
 
 | Order | Crates and deliverable | Red-first witness / acceptance |
 | --- | --- | --- |
-| 1: N1 agreement and extraction | x86-owned `carrick-softmmu`, shared `carrick-mmu-core` vocabulary | Adapter contract fails for two roots at same VA and distinct permission contexts; x86 existing contract tests unchanged; byte-identical tag values across the x86 mode matrix and unchanged `SoftTlbEntry::SIZE`, offsets and tag constants; zero additional warm-hit descriptor reads via `SoftMmuMemory::on_descriptor_load` and fixture `descriptor_loads`/`loads()` deltas, zero inventory scans or coordinator locks (reuse #607 retirement). Pure moves recorded separately; no fabricated red for byte-identical movement |
-| 2: ARM hardware walk | `carrick-mmu-core::aarch64`; test fixture uses real `carrick-mem` builder | Production entry rejects missing/reserved descriptors, wrong root, output overflow, misaligned block encoding and AF=0 at correct level; demonstrate failures before correction, then exact output/leaf span, four descriptor reads maximum for 4 KiB/48-bit cold walk; no second block/page decoder: owner `translate_with`, editor and architectural walk share format decode with output/EL0 regressions; no descriptor CAS with HA=HD=0 |
+| 1: N1 agreement and extraction | x86-owned `carrick-softmmu`, shared `carrick-mmu-core` vocabulary | Pure x86 extraction: existing production facade/contract tests unchanged; byte-identical tag values across the x86 mode matrix and unchanged `SoftTlbEntry::SIZE`, offsets and tag constants; zero additional warm-hit descriptor reads via `SoftMmuMemory::on_descriptor_load` and fixture `descriptor_loads`/`loads()` deltas, zero inventory scans or coordinator locks (reuse #607 retirement). Pure moves recorded separately; no fabricated red for byte-identical movement |
+| 2: ARM hardware walk | `carrick-mmu-core::aarch64`; test fixture uses real `carrick-mem` builder | Production entry rejects missing/reserved descriptors, wrong root, output overflow, misaligned block encoding and AF=0 at correct level; demonstrate failures before correction, then exact output/leaf span, four descriptor reads maximum for 4 KiB/48-bit cold walk; no second block/page decoder: account for every production and support row in Existing mechanisms, with owner `translate_with`, editors, all HVF consumers and architectural walk sharing format/geometry/output decode while preserving owner policy; output/EL0/retained-state regressions; `just cross-check-macos` plus a signed macOS unit shard on the exact head for migrated HVF consumers; no descriptor CAS with HA=HD=0 |
 | 3: permission and faults | same mmu core; `carrick-softcpu-aarch64` exception builder | AP four-way matrix, table AP/PXN/UXN restrictions, WXN, PAN off/on, EPAN and UAO profile pairs; exact EC/ISS/FSC/FAR examples and combined-fault priority fail before implementation; no successful unauthorized access |
-| 4: ARM softmmu binding | x86-approved shared softmmu adapter plus ARM CPU context | Same-VA two live roots, ASID/nG flush witnesses (no retention), distinct TTBR0/1 writes flush high/low hits, TBI bit-55 selection, TLBI/root generation peer acknowledgement; production placement/softmmu guest-4-KiB × host-4/16-KiB matrix with adjacent permissions and crossings; x86 suite still passes; PAN/UAO/EL class changes select correct hits with zero full-flush delta, config changes invalidate; no MMIO TLB fill |
+| 4: ARM softmmu binding | x86-approved shared softmmu adapter plus ARM CPU context | Production `SoftWalker::walk_and_fill` through the ARM `Stage1Walker` binding must fail before implementation for two live roots at the same VA and distinct permission contexts; ASID/nG flush witnesses (no retention), distinct TTBR0/1 writes flush high/low hits, TBI bit-55 selection, TLBI/root generation peer acknowledgement; production placement/softmmu guest-4-KiB × host-4/16-KiB matrix with adjacent permissions and crossings; x86 suite still passes; PAN/UAO/EL class changes select correct hits with zero full-flush delta, config changes invalidate; no MMIO TLB fill |
 | 5: execution integration | `carrick-softcpu-aarch64`, shared APIs only as agreed | Execute actual LDTR/LDTRB/STTRB plus ordinary LDR/STR/fetch, check current-EL abort versus lower-EL abort, vector/ELR/FAR and restart; second-page fault with first page valid, no unauthorized partial write; two live CPU invalidation and two live MM alias isolation |
 | 6: hardware differential | existing fixture/runtime owners, separately authorized paths | Same production image/table bytes on soft and hardware profiles, PAN/UAO/NX/AF/root/cross-page fault records compared with architectural UNKNOWN bits masked; retain population and artifact identities, then signed embed and ecosystem evidence |
 
@@ -390,32 +452,13 @@ coverage. Linux-visible permissions derive from mmap/mprotect semantics;
 architectural table/abort authority is the Arm ARM. Structural invariant:
 bounded table work, no descriptor copying/scanning on warm hits, no authority
 bypass, no x86 A/D writes on ARM's software-AF profile. Register the future
-contract outside this round's fence through the director; if the contract gate
+contract outside this document's fence through the director; if the contract gate
 flags guest-surface files, stop and report instead of adding evidence here.
 
-This round changes only this document and qualifies for the documentation
+This revision changes only this document and qualifies for the documentation
 exemption in `docs/conformance-contracts.md`: no executable semantic or work
 expectation changes. No crate was touched; crate tests, lint-domains,
 test-touched and full `just ci` are therefore not required for this checkpoint.
 Required checks are fmt-check, doc, check-contract-change against fetched main
 and authority-debt source-only. Runtime, signed and hardware differential
 verification remain future work; this document cannot claim those results.
-
-## Review disposition
-
-Verified against repository symbols and the Arm ARM above; no reviewer prose
-was reposted. This table records decisions, not implementation evidence.
-
-| Finding | Disposition and verified evidence |
-| --- | --- |
-| P0-1 | Accepted inventory gap: `Aarch64Mmu::translate_with` does decode block/page outputs. Choose (b), one shared format decoder, owner permission view retained; slice 2 explicitly gates decoder reuse. Added edit, fork, COW/copy-window, anonymous traversal and nG-builder consumers found by repository search. Naming clarification: `OwnerGrantMmu: OwnerForkMmu` inherits `is_table`; the method is declared by `OwnerForkMmu` in `owner_mmu.rs` and implemented for ARM in `aarch64/owner_fork.rs`. `OwnerGrantMmu` adds `execute_grant`; maintenance contains `retired_page`. The inventory finding is valid, with no separate grant-specific decoder to migrate. |
-| P0-2 | Accepted: `SoftTlbEntry` and `SoftTlb::tag_for` cannot contain the proposed identity tuple. Specify spare-bit permission classes without EL/PAN/UAO flushes, no initial ASID retention, TTBR0/1/ASID/config flushes and the per-CPU cross-root argument. Arm D5.4.2–3 verifies the UAO/PAN distinction. |
-| P1-1 | Accepted: neutral `stage1` vocabulary in mmu-core, static generic softmmu, x86 `SoftWalker` first caller and compatibility exports; move `LeafSize` with old-path re-export. Verified existing names in softmmu `domains`, `lib`, `walker` and x86 `descriptor_txn`. |
-| P1-2 | Accepted: move/re-export existing `LeafAccess`, preserve probe wire conversion and map Read/Write/Execute to planes 0/1/2; x86 `Access` becomes an alias. |
-| P1-3 | Accepted: remove `MmioHoles::Default`, explicit ARM holes, x86-scoped LAPIC/default constructors with compatibility aliases. Search found no external default caller. |
-| P1-4 | Accepted: host page size constrains placement/backing; exact fragment tags/planes and crossing resolution enforce permissions. Slice 4 owns the VM-free matrix, slice 6 actual host verification; no host-MMU-protection claim. |
-| P2 register path | Accepted: replace nonexistent boot method with `GuestArch::bootstrap_sysregs`/`Aarch64BootSysregs` and KVM `program_sysregs`; register values unchanged, HA/HD clear. Cite `arm_translation_regime_matches_tcr_bootstrap`. |
-| P2 TBI | Accepted: bit 55 selects range when top byte ignored; canonical check covers the remaining range bits (D5.1.4, D5.2). |
-| P2 code coherence | Accepted: explicit always-coherent model with IC IVAU/ISB ordering and shared code-generation hooks. |
-| P2 COW | Accepted: ARM architectural permission fault only; owner retains Linux software-bit/COW policy, x86 classification stays in x86. |
-| P2 cost/review witnesses | Accepted: name descriptor-load hook/counter, reuse closed #607; add x86 tag/layout witness and shared-kernel director/independent-review requirements for slices 1/4. |
