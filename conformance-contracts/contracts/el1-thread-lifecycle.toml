@@ -101,6 +101,16 @@ fork_child_exit_group_retires_runnable_worker,
 fork_child_exit_group_retires_computing_worker
 No retry, signed acceptance, or runtime-ratio claim; semantics and budgets
 remain unchanged.
+
+#671 R3 fixture-map extraction moves supervisor_maps, lapic_map and data_map
+with their layout assertions into the neutral boot coordinator. Function
+bodies and map geometry are unchanged; cross-crate visibility is widened.
+Existing KVM bindings x5_shared_clone_exit,
+entry_kick_and_timer_preempt_two_private_contexts and
+return_kick_and_timer_preempt_two_private_contexts exercise the retained maps.
+The existing CPL0 initial-MM, file-region and entropy bindings also run through
+this bootstrap. CPUID bindings provide gate coverage; no descriptor-path
+coverage. No scheduler policy, binding, budget or runtime-ratio claim changes.
 """
 
 [bindings]
