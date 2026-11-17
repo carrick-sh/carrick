@@ -20,6 +20,13 @@ retired table stops owning and the host drain reaps and wakes. A blocking
 request never spins or holds capacity: it parks as an owned FileLockWait
 operation on the lock object's lane, enrolled under the table lock, and a
 release's wake reruns it to probe once. A signal ends it with EINTR.
+The operation keeps the request decoded at entry (fcntl(2) copies its
+struct flock in once), and a woken wait is routed by that operation before
+any descriptor lookup: it goes on with the description it pinned even when
+a sibling closed or replaced its number, and a record lock taken through a
+number that no longer names that description is given back with EBADF.
+A close or dup2 releases the record locks of exactly the file it retired,
+read in the same descriptor-table acquisition.
 Not served (counted ENOSYS): SEEK_CUR/SEEK_END bases and unstamped
 descriptions; no EDEADLK. The host-dispatched ARM run root keeps the host
 arbiter (dispatch/fs/locks.rs), so its locks and a native child's do not
@@ -37,13 +44,20 @@ vm_free = [
   "carrick-fd-core::record_lock::tests::ofd_and_flock_locks_keep_their_owners_and_families_apart",
   "carrick-fd-core::record_lock::tests::a_dead_owners_locks_block_nobody",
   "carrick-fd-core::record_lock::tests::posix_ranges_follow_fcntl",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_arm_woken_lock_waiters_take_the_request_they_parked_with (the waiters' struct flock rewritten to F_UNLCK while they park; red on a0bd7837d: both reruns returned at once, neither holding the lock)",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_arm_lock_waiter_goes_on_with_its_description_after_a_sibling_replaces_its_fd (a sibling dup2s a pipe over the waited-on fd: F_SETLKW ends EBADF holding nothing and blocking flock 0, as the native oracle; red on a0bd7837d: the rerun was routed away from the lock owner)",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_arm_close_releases_record_locks_of_the_file_it_retired (a sibling's dup2 between close's entry and its retirement; red on a0bd7837d: the other file's locks were released, the closed file's survived)",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_arm_dup_releases_record_locks_only_of_a_displaced_file (a sibling's close and relock between dup3's claim and its commit; red on a0bd7837d: the sibling's lock was released)",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_ends_record_locks_on_close_on_exec (production exec service: the close-on-exec sweep ends the process's record lock and keeps flock and OFD locks; red with the exec release removed)",
   "carrick-fd-core::record_lock::tests::identities_follow_the_description_incarnation",
+  "carrick-fd-core::record_lock::tests::a_parked_request_round_trips_and_refuses_foreign_records",
   "carrick-el1-abi::ipc::tests::el1_ipc_file_lock_layout_refuses_the_previous_abi",
   "carrick-el1-abi::ipc::tests::el1_ipc_file_locks_and_identities_are_shared_by_both_venues",
 ]
 embed = [
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_and_fork_child_contend_record_locks_and_flock (native oracle byte for byte; red: fcntl x10, flock x4 refused)",
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_record_lock_outlives_its_thread_and_ends_with_dup2_and_exit_group (a non-last thread's exit keeps the lock; dup2 and exit_group with a running worker release it; red: fcntl x5 refused)",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_exec_close_on_exec_ends_record_locks_and_keeps_flock_and_ofd_locks (a fork child execs itself; native oracle byte for byte; red with the exec release removed: E8 reported the record lock still held)",
 ]
 
 [bindings.unresolved]
