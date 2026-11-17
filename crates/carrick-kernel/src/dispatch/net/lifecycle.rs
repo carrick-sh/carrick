@@ -1992,6 +1992,69 @@ mod icmp_ping_tests {
     }
 }
 
+#[cfg(test)]
+mod datagram_send_buffer_tests {
+    use super::*;
+
+    fn host_send_buffer(fd: i32) -> libc::c_int {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `fd` is a live socket and `value`/`len` are valid out-parameters.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &mut value as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt(SO_SNDBUF) on a live host socket");
+        value
+    }
+
+    /// #2414: a native child's 65,000-byte UDP `sendto` got EMSGSIZE on macOS
+    /// because a host datagram socket's send buffer defaults to
+    /// `net.inet.udp.maxdgram` (9,216) and bounds the largest datagram the
+    /// host accepts (Linux accepts up to 65,507). The one host-socket
+    /// constructor must raise it, for both families, and must leave every
+    /// other socket type alone. Red on the previous constructor on Linux too:
+    /// the raised buffer is larger than a plain host UDP socket's default.
+    #[test]
+    fn a_host_datagram_socket_gets_a_send_buffer_for_a_whole_linux_datagram() {
+        for family in [LINUX_AF_INET, LINUX_AF_INET6] {
+            let plain = unsafe {
+                libc::socket(
+                    if family == LINUX_AF_INET {
+                        libc::AF_INET
+                    } else {
+                        libc::AF_INET6
+                    },
+                    libc::SOCK_DGRAM,
+                    0,
+                )
+            };
+            if plain < 0 {
+                // No AF_INET6 on this host: nothing to compare.
+                continue;
+            }
+            let default = host_send_buffer(plain);
+            unsafe { libc::close(plain) };
+            let fd = create_host_socket(family, LINUX_SOCK_DGRAM, 0).unwrap();
+            let raised = host_send_buffer(fd);
+            unsafe { libc::close(fd) };
+            assert!(
+                raised >= 65_535,
+                "family {family}: host SO_SNDBUF {raised} must admit a 65,507-byte datagram"
+            );
+            assert!(
+                raised > default,
+                "family {family}: host SO_SNDBUF {raised} must be raised above the plain default {default}"
+            );
+        }
+    }
+}
+
 /// Create the host socket backing a guest `(family, base_type, protocol)`
 /// socket (`base_type` without `SOCK_NONBLOCK`/`SOCK_CLOEXEC`), validated
 /// and backed exactly as a guest `socket(2)` is: the one constructor the
