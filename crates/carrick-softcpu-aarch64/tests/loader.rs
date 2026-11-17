@@ -240,11 +240,18 @@ fn sys_space_tlbi_fields_and_names() {
         (6, 5, "- rvae3os - - - rvale3os - -"),
         (6, 6, "- rvae3 - - - rvale3 - -"),
     ];
+    let mut reserved_tlbi = Vec::new();
     for w in (0xd5008000..=0xd507ffff).chain(0xd5288000..=0xd52fffff) {
         // Only CRn=8 is the TLBI neighbourhood; the surrounding space
         // contains allocated hints, barriers, PSTATE and system registers.
         if (w >> 12) & 15 == 8 {
             assert_eq!(decode_instruction(w), Instruction::Unallocated, "{w:08x}");
+            reserved_tlbi.push(w);
+        }
+    }
+    if std::env::var_os("CARRICK_LLVM_OBJDUMP").is_some() {
+        for line in oracle_lines(&reserved_tlbi, "reserved-tlbi").unwrap() {
+            assert!(!line.starts_with("tlbi "), "reserved neighbour: {line}");
         }
     }
     let words: Vec<_> = (0xd5088000..=0xd50fffff).collect();
