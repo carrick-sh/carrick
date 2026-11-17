@@ -93,3 +93,17 @@ fn reserved_pair_encodings_fail_shut() {
         );
     }
 }
+
+#[test]
+fn acquire_release_and_exclusive_forms_are_typed() {
+    for word in [
+        0xc8dffc20, 0xc89ffc20, 0xc85f7c20, 0xc8027c20, 0xc85ffc20, 0xc802fc20, 0xc87f0840,
+        0xc8230840, 0x085ffc20,
+    ] {
+        assert_ne!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
