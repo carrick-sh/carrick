@@ -416,3 +416,109 @@ impl Default for SoftTlb {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod layout_pin_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    /// Mode bits of `SoftTlb::mode_tag_bits`, indexed by
+    /// `cpl3 | ac << 1 | cr0_wp << 2 | cr4_smep << 3 | cr4_smap << 4 | efer_nxe << 5`.
+    /// Recorded from main before the stage-1 vocabulary extraction (#2480);
+    /// an extraction that changes any of them changes the cache identity.
+    const X86_MODE_TAG_BITS: [u64; 64] = [
+        0x3c, 0x21, 0x3c, 0x21, 0x38, 0x21, 0x38, 0x21, 0x34, 0x21, 0x34, 0x21, 0x30, 0x21, 0x30,
+        0x21, 0x2c, 0x21, 0x2e, 0x21, 0x28, 0x21, 0x2a, 0x21, 0x24, 0x21, 0x26, 0x21, 0x20, 0x21,
+        0x22, 0x21, 0x1c, 0x01, 0x1c, 0x01, 0x18, 0x01, 0x18, 0x01, 0x14, 0x01, 0x14, 0x01, 0x10,
+        0x01, 0x10, 0x01, 0x0c, 0x01, 0x0e, 0x01, 0x08, 0x01, 0x0a, 0x01, 0x04, 0x01, 0x06, 0x01,
+        0x00, 0x01, 0x02, 0x01,
+    ];
+
+    fn mode(index: u32, stack_access: bool) -> CpuAccessMode {
+        let bit = |n: u32| index & (1 << n) != 0;
+        let base = if bit(0) {
+            CpuAccessMode::ring3_with_ac(bit(1))
+        } else {
+            CpuAccessMode::ring0(bit(1))
+        };
+        base.with_cr0_wp(bit(2))
+            .with_cr4_smep(bit(3))
+            .with_cr4_smap(bit(4))
+            .with_efer_nxe(bit(5))
+            .with_stack_access(stack_access)
+    }
+
+    #[test]
+    fn soft_tlb_entry_layout_and_tag_constants_are_pinned() {
+        assert_eq!(SoftTlbEntry::SIZE, 16);
+        assert_eq!(core::mem::align_of::<SoftTlbEntry>(), 16);
+        assert_eq!(SoftTlbEntry::TAG_OFFSET, 0);
+        assert_eq!(SoftTlbEntry::ADDEND_OFFSET, 8);
+        assert_eq!(
+            core::mem::offset_of!(SoftTlbEntry, tag),
+            SoftTlbEntry::TAG_OFFSET
+        );
+        assert_eq!(
+            core::mem::offset_of!(SoftTlbEntry, addend),
+            SoftTlbEntry::ADDEND_OFFSET
+        );
+        assert_eq!(SoftTlbPlane::BYTE_SIZE, 16 * 1024);
+        assert_eq!(SoftTlb::WRITE_PLANE_OFFSET, 16 * 1024);
+        assert_eq!(SoftTlb::EXEC_PLANE_OFFSET, 32 * 1024);
+        assert_eq!(
+            (SOFT_TLB_BITS, SOFT_TLB_ENTRIES, SOFT_TLB_INDEX_MASK),
+            (10, 1024, 0x3ff)
+        );
+        assert_eq!(TLB_TAG_INVALID, u64::MAX);
+        assert_eq!(
+            [
+                TLB_TAG_CPL3_BIT,
+                TLB_TAG_AC_BIT,
+                TLB_TAG_WP_OFF_BIT,
+                TLB_TAG_SMEP_OFF_BIT,
+                TLB_TAG_SMAP_OFF_BIT,
+                TLB_TAG_NXE_OFF_BIT,
+                TLB_TAG_MODE_MASK,
+            ],
+            [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x3f]
+        );
+    }
+
+    #[test]
+    fn x86_mode_matrix_tags_are_byte_identical() {
+        let vas = [
+            0,
+            0x0000_0000_0040_1234,
+            0x0000_7fff_ffff_ffff,
+            0xffff_8000_0000_0abc,
+            0xffff_ffff_ffff_f000,
+        ];
+        for (index, &expected) in X86_MODE_TAG_BITS.iter().enumerate() {
+            for stack_access in [false, true] {
+                let mode = mode(index as u32, stack_access);
+                assert_eq!(SoftTlb::mode_tag_bits(mode), expected, "mode {index}");
+                for raw in vas {
+                    let va = GuestVa::new(raw);
+                    let tag = SoftTlb::tag_for(va, mode);
+                    assert_eq!(tag, (raw & !0xfff) | expected, "mode {index} va {raw:#x}");
+                    assert_ne!(tag, TLB_TAG_INVALID, "mode {index} va {raw:#x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn access_planes_map_read_write_execute_to_zero_one_two() {
+        let tlb = SoftTlb::new();
+        let base = core::ptr::from_ref(&tlb) as usize;
+        let planes = [
+            (Access::Read, SoftTlb::READ_PLANE_OFFSET),
+            (Access::Write, SoftTlb::WRITE_PLANE_OFFSET),
+            (Access::Execute, SoftTlb::EXEC_PLANE_OFFSET),
+        ];
+        for (access, offset) in planes {
+            let plane = core::ptr::from_ref(tlb.plane(access)) as usize;
+            assert_eq!(plane - base, offset, "{access:?}");
+        }
+    }
+}
