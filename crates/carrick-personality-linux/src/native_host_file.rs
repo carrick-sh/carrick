@@ -741,12 +741,19 @@ pub enum HostFileStage {
     /// Nothing is staged: the call crosses to the host unchanged.
     Crossing,
     /// A write gathered `prefix`'s bytes before the user read at `address`
-    /// stopped it. The ring supplies `address` and retries the exact call,
-    /// as for [`HostFileStage::Fault`]; if the supply is refused, the call
-    /// completes as the staged `prefix` write instead, the short count
-    /// Linux returns when its user copy faults after some bytes
-    /// ([`HostFileStage::refused`]).
-    FaultAfterPrefix { address: u64, prefix: Box<[u8]> },
+    /// stopped it, or a message batch staged the entries before one whose
+    /// `access` at `address` faults (#2418). The ring supplies `address`
+    /// and retries the exact call, as for [`HostFileStage::Fault`]; if the
+    /// supply is refused, the call completes as the staged `prefix` record
+    /// instead, with its `output`: the short count Linux returns when its
+    /// user copy faults after some bytes, or the entries a batch moved
+    /// before the one that failed ([`HostFileStage::refused`]).
+    FaultAfterPrefix {
+        address: u64,
+        access: Access,
+        prefix: Box<[u8]>,
+        output: Option<HostFileOutput>,
+    },
     /// A host crossing: the staged record and where its output goes.
     Request {
         record: Box<[u8]>,
@@ -769,7 +776,9 @@ impl HostFileStage {
         match self {
             Self::Fault { address, access } => Some((*address, *access)),
             Self::PrepareOutput { address } => Some((*address, Access::Write)),
-            Self::FaultAfterPrefix { address, .. } => Some((*address, Access::Read)),
+            Self::FaultAfterPrefix {
+                address, access, ..
+            } => Some((*address, *access)),
             _ => None,
         }
     }
@@ -781,9 +790,9 @@ impl HostFileStage {
         match self {
             Self::Fault { .. } => errno(carrick_syscall_abi::LINUX_EFAULT),
             Self::PrepareOutput { .. } => Self::Crossing,
-            Self::FaultAfterPrefix { prefix, .. } => Self::Request {
+            Self::FaultAfterPrefix { prefix, output, .. } => Self::Request {
                 record: prefix,
-                output: None,
+                output,
                 resolves_path: false,
                 map: None,
                 chdir: false,
@@ -1024,7 +1033,9 @@ impl Staging<'_, '_> {
                     match self.request(HostFileOp::Write, fd, 0, [0; 4], &prefix, None) {
                         HostFileStage::Request { record, .. } => HostFileStage::FaultAfterPrefix {
                             address,
+                            access: Access::Read,
                             prefix: record,
+                            output: None,
                         },
                         stage => stage,
                     }

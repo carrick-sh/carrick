@@ -386,11 +386,18 @@ impl<'a> NetView<'a> {
         const MSG_LEN_OFFSET: u64 = <LinuxMsghdr as KernelAbi>::ABI_SIZE as u64;
         let mut received: i32 = 0;
         for i in 0..vlen {
+            // Linux answers the count received once one was (#2418 review
+            // P0-3): only a failing first entry is the call's own error.
+            let failed = |errno| {
+                if received > 0 {
+                    DispatchOutcome::returned_i32(received)
+                } else {
+                    DispatchOutcome::errno(errno)
+                }
+            };
             let entry = match msgvec.checked_add(i as u64 * MMSGHDR_SIZE) {
                 Some(a) => a,
-                None => {
-                    return DispatchOutcome::errno(LINUX_EFAULT);
-                }
+                None => return failed(LINUX_EFAULT),
             };
             // After the first successful recvmsg, switch to non-blocking
             // so we drain whatever else is in the queue without waiting.
@@ -406,9 +413,7 @@ impl<'a> NetView<'a> {
                 // `match outcome` below keeps the multi-message semantics: a
                 // failure after >=1 success still returns the count.
                 Err(DispatchError::Errno(errno)) => DispatchOutcome::Errno { errno },
-                Err(_) => {
-                    return DispatchOutcome::errno(LINUX_EFAULT);
-                }
+                Err(_) => return failed(LINUX_EFAULT),
             };
             match outcome {
                 DispatchOutcome::Returned { value } => {
@@ -417,16 +422,11 @@ impl<'a> NetView<'a> {
                         .write_bytes(entry + MSG_LEN_OFFSET, &len_u32.to_le_bytes())
                         .is_err()
                     {
-                        return DispatchOutcome::errno(LINUX_EFAULT);
+                        return failed(LINUX_EFAULT);
                     }
                     received += 1;
                 }
-                DispatchOutcome::Errno { errno } => {
-                    if received > 0 {
-                        return DispatchOutcome::returned_i32(received);
-                    }
-                    return DispatchOutcome::errno(errno);
-                }
+                DispatchOutcome::Errno { errno } => return failed(errno),
                 other => return other,
             }
         }

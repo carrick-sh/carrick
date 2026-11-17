@@ -20,12 +20,23 @@
 //! A message call (`sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`; #2418)
 //! stages each header, its iovec array, every buffer it names and its
 //! socket address as segments at their own user addresses, so the carrier's
-//! handler reads and writes the caller's structures in place. A receive's
-//! buffers are fitted to one record's data range (any datagram fits it,
-//! and a stream receive may return less); a send whose data does not fit
-//! one record stages none of it, and the carrier answers it by the socket's
-//! type ([`host_file::NET_MESSAGE_UNSTAGED`]). Ancillary data a send carries is not staged
-//! yet: such a call is a counted ENOSYS.
+//! handler reads the caller's structures in place. What it may write is
+//! declared exactly and supplied writable before the crossing: a received
+//! message's buffers, name and `msg_namelen`, `msg_controllen` and
+//! `msg_flags` fields, and each batched message's `msg_len`, never the
+//! rest of a header. A receive's buffers are fitted to one record's data
+//! range (any datagram fits it, and a stream receive may return less); a
+//! `sendmsg` whose data does not fit one record stages none of it, and the
+//! carrier answers it by the socket's type
+//! ([`host_file::NET_MESSAGE_UNSTAGED`]).
+//!
+//! Only what one record serves exactly crosses; the rest stays a counted
+//! ENOSYS (#2418 review): ancillary data in either direction (a non-zero
+//! `msg_controllen`), a batch whose entries do not all fit one record, a
+//! `recvmmsg` timeout, and output ranges that overlap. A batch entry after
+//! the first that faults stages the entries before it
+//! ([`HostFileStage::FaultAfterPrefix`]): Linux stops there and answers
+//! the count moved.
 //!
 //! AF_UNIX and every other family keep their own route: a `socket` call of
 //! another domain is not decoded here, and a call on an in-zone descriptor
@@ -55,14 +66,14 @@ const TRANSFER_LEN_MAX: u64 = i32::MAX as u64;
 const LINUX_MSG_PEEK: u64 = 0x2;
 /// Linux `MSG_WAITALL`.
 const LINUX_MSG_WAITALL: u64 = 0x100;
-/// `struct timespec` bytes (`recvmmsg`'s timeout).
-const TIMESPEC_BYTES: usize = 16;
 /// `msghdr` field offsets.
 const MSG_NAMELEN: usize = 8;
 const MSG_IOV: usize = 16;
 const MSG_IOVLEN: usize = 24;
-const MSG_CONTROL: usize = 32;
 const MSG_CONTROLLEN: usize = 40;
+const MSG_FLAGS: usize = 48;
+/// `struct mmsghdr`'s `msg_len`, after its `struct msghdr`.
+const MSG_LEN: usize = 56;
 
 /// A decoded call of the host network family: its canonical number and
 /// argument words. Pointers in them are still untrusted user addresses.
@@ -156,13 +167,15 @@ impl Plan {
 
     /// Stage `bytes`, read from `address`, as the call reads them there:
     /// the caller's own bytes, or a copy the ring fitted to one record (a
-    /// message's clamped iovec lengths or socket address length).
-    fn staged(&mut self, address: u64, bytes: Vec<u8>, output: bool) {
+    /// message's clamped iovec lengths or socket address length). The call
+    /// never writes them back: what it writes is declared on its own
+    /// ([`Plan::write`]), so a copy-back never restores this snapshot.
+    fn staged(&mut self, address: u64, bytes: Vec<u8>) {
         self.segments.push(NetSegment {
             address,
             len: bytes.len() as u32,
             input: true,
-            output,
+            output: false,
         });
         self.inputs.push(bytes);
     }
@@ -257,9 +270,24 @@ enum Message {
     /// A send whose data does not fit one record: its header and iovecs
     /// are staged, its data is not ([`host_file::NET_MESSAGE_UNSTAGED`]).
     Unstaged,
-    /// The message cannot cross in one record: ancillary data to send, or
+    /// The message cannot cross in one record exactly: ancillary data, or
     /// a later message of a batch whose data does not fit.
     Unfitted,
+}
+
+/// What staging one call decided.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Shape {
+    /// Every range the call touches is staged.
+    Whole,
+    /// The entries of a batch before one whose range at `address` faults
+    /// are staged (#2418 review P0-3). The ring supplies the fault and
+    /// retries the whole call; refused, the staged entries move, as Linux
+    /// answers the count moved before the entry that failed.
+    Prefix { address: u64, access: Access },
+    /// Not stageable exactly in one record: the call stays unrouted (a
+    /// counted ENOSYS), never a guessed result.
+    Refused,
 }
 
 fn word(bytes: &[u8], offset: usize) -> u64 {
@@ -267,25 +295,34 @@ fn word(bytes: &[u8], offset: usize) -> u64 {
 }
 
 impl Plan {
-    /// Whether this plan and `next` together fit one record, with a
-    /// `recvmmsg` timeout still to stage.
-    fn fits_with(&self, next: &Plan, timeout: bool) -> bool {
+    /// Whether this plan and `next` together fit one record.
+    fn fits_with(&self, next: &Plan) -> bool {
         let mut segments = self.segments.clone();
         segments.extend_from_slice(&next.segments);
-        if timeout {
-            segments.push(NetSegment {
-                address: 0,
-                len: TIMESPEC_BYTES as u32,
-                input: true,
-                output: true,
-            });
-        }
         segments.len() <= host_file::NET_SEGMENTS_MAX
             && record_len(
                 host_file::NET_CALLER_BYTES + NetCall::input_len(&segments),
                 NetCall::output_capacity(&segments),
             )
             .is_some()
+    }
+
+    /// Whether two ranges the call may write overlap: the copy-back of
+    /// each has no single answer for the bytes they share.
+    fn outputs_overlap(&self) -> bool {
+        let mut outputs: Vec<(u64, u64)> = self
+            .segments
+            .iter()
+            .filter(|segment| segment.output && segment.len > 0)
+            .map(|segment| {
+                (
+                    segment.address,
+                    segment.address.saturating_add(u64::from(segment.len)),
+                )
+            })
+            .collect();
+        outputs.sort_unstable();
+        outputs.windows(2).any(|pair| pair[1].0 < pair[0].1)
     }
 
     /// Stage one message header at `header` (a `struct mmsghdr` when
@@ -320,7 +357,6 @@ impl Plan {
         );
         let iov = word(&msg, MSG_IOV);
         let iovlen = word(&msg, MSG_IOVLEN);
-        let control = word(&msg, MSG_CONTROL);
         let controllen = word(&msg, MSG_CONTROLLEN);
         // Linux refuses these before touching any other range.
         if iovlen > LINUX_UIO_MAXIOV {
@@ -329,7 +365,11 @@ impl Plan {
         if name != 0 && (namelen as i32) < 0 {
             return Err(errno(carrick_syscall_abi::LINUX_EINVAL));
         }
-        if send && control != 0 && controllen != 0 {
+        // Ancillary data is not staged in either direction: Linux's
+        // control messages (and its EFAULT for a length without a buffer)
+        // are not answered here, and no guest length sizes a carrier
+        // allocation. A buffer with no length carries nothing.
+        if controllen != 0 {
             return Ok(Message::Unfitted);
         }
         let mut vectors = Vec::new();
@@ -363,17 +403,28 @@ impl Plan {
             }
             *data += room - left;
         }
-        // Linux writes a received message's name, control and flag lengths
-        // back into its header, and each batched message's length after it.
-        let header_written = !send || batch;
         if send && name != 0 && namelen != 0 {
             // Linux reads at most a `struct sockaddr_storage`.
             let len = namelen.min(carrick_syscall_abi::LINUX_SOCKADDR_STORAGE_BYTES as u32);
             msg[MSG_NAMELEN..MSG_NAMELEN + 4].copy_from_slice(&len.to_le_bytes());
         }
-        self.staged(header, msg, header_written);
+        self.staged(header, msg);
+        // Linux writes a received message's name, control and flag lengths
+        // back into its header, and each batched message's length after it:
+        // exactly those fields are the call's output, supplied now (#2418
+        // review P0-1), so the copy-back cannot fault after data moved.
+        if !send {
+            if name != 0 {
+                self.write(user, header + MSG_NAMELEN as u64, 4)?;
+            }
+            self.write(user, header + MSG_CONTROLLEN as u64, 8)?;
+            self.write(user, header + MSG_FLAGS as u64, 4)?;
+        }
+        if batch {
+            self.write(user, header + MSG_LEN as u64, 4)?;
+        }
         if iovlen > 0 {
-            self.staged(iov, vectors, false);
+            self.staged(iov, vectors);
         }
         for (base, len) in ranges {
             if send {
@@ -390,9 +441,6 @@ impl Plan {
                 self.write(user, name, len)?;
             }
         }
-        if !send && control != 0 && controllen != 0 {
-            self.write(user, control, (controllen as usize).min(SOCKET_OPTION_MAX))?;
-        }
         Ok(if unstaged {
             Message::Unstaged
         } else {
@@ -407,15 +455,21 @@ pub(super) fn stage(
     user: &mut dyn HostFileUser,
 ) -> Option<HostFileStage> {
     use crate::crossing::nr;
+    // Linux checks a `recvmmsg` timeout between datagrams and writes back
+    // what is left of it; one record keeps no deadline. It is refused,
+    // before the descriptor, which Linux looks up after validating it.
+    let timed = call.canonical == nr::RECVMMSG && call.args[4] != 0;
     if let Some(fd) = call.fd() {
         match staging.descriptor(fd)? {
-            NativeDescriptor::Absent => return Some(errno(carrick_syscall_abi::LINUX_EBADF)),
             // A ring object stays with its ring owner (and its counted
             // refusal), never a guessed ENOTSOCK.
             NativeDescriptor::InZone(_) => return Some(HostFileStage::InRing),
+            _ if timed => return None,
+            NativeDescriptor::Absent => return Some(errno(carrick_syscall_abi::LINUX_EBADF)),
             NativeDescriptor::HostBacked { .. } => {}
         }
     }
+    let message = [nr::SENDMSG, nr::RECVMSG, nr::SENDMMSG, nr::RECVMMSG].contains(&call.canonical);
     let mut args = call.args;
     let mut plan = Plan::default();
     let staged = (|| {
@@ -484,15 +538,17 @@ pub(super) fn stage(
                 Message::Unstaged => {
                     args[host_file::NET_MESSAGE_UNSTAGED_ARG] = host_file::NET_MESSAGE_UNSTAGED;
                 }
-                Message::Unfitted => return Ok(false),
+                Message::Unfitted => return Ok(Shape::Refused),
             }
         } else if c == nr::SENDMMSG || c == nr::RECVMMSG {
             let send = c == nr::SENDMMSG;
-            let timeout = !send && args[4] != 0;
-            let vlen = args[2].min(LINUX_UIO_MAXIOV);
+            // `vlen` is an unsigned int; Linux moves at most UIO_MAXIOV.
+            let vlen = u64::from(args[2] as u32).min(LINUX_UIO_MAXIOV);
             let mut data = 0usize;
             let mut staged = 0u64;
             while staged < vlen {
+                // No entry lies past the end of the address space: Linux
+                // stops there as at a fault (entry 0 never wraps).
                 let Some(header) =
                     args[1].checked_add(staged * carrick_syscall_abi::LINUX_MMSGHDR_BYTES as u64)
                 else {
@@ -500,23 +556,22 @@ pub(super) fn stage(
                 };
                 let mut next = Plan::default();
                 let mut next_data = data;
-                let fitted = match next.message(user, header, send, true, &mut next_data) {
-                    Ok(fitted) => fitted,
-                    // Linux answers a later message's own error on the
-                    // caller's next call; this one moves the messages
-                    // before it.
+                match next.message(user, header, send, true, &mut next_data) {
+                    Ok(Message::Staged) if plan.fits_with(&next) => {}
+                    // The batch crosses whole in one record or not at all:
+                    // one cut short would leave datagrams queued, or unsent,
+                    // that Linux's call moves (#2418 review P0-4).
+                    Ok(_) => return Ok(Shape::Refused),
+                    // Linux stops at a later entry that fails before it
+                    // moves anything and answers the count moved before it:
+                    // an error ends the batch there, and a fault stages the
+                    // entries before it behind the fault's supply.
                     Err(HostFileStage::Returned(_)) if staged > 0 => break,
-                    Err(stage) => return Err(stage),
-                };
-                if fitted != Message::Staged || !plan.fits_with(&next, timeout) {
-                    // A send moves every message or crosses not at all; a
-                    // receive's later message that does not fit whole is
-                    // left for the caller's next call, as when no datagram
-                    // is queued for it yet.
-                    if send || staged == 0 {
-                        return Ok(false);
+                    Err(HostFileStage::Fault { address, access }) if staged > 0 => {
+                        args[2] = staged;
+                        return Ok(Shape::Prefix { address, access });
                     }
-                    break;
+                    Err(stage) => return Err(stage),
                 }
                 plan.segments.extend(next.segments);
                 plan.inputs.extend(next.inputs);
@@ -524,9 +579,6 @@ pub(super) fn stage(
                 staged += 1;
             }
             args[2] = staged;
-            if timeout {
-                plan.read(user, args[4], TIMESPEC_BYTES, true)?;
-            }
         } else if c == nr::GETSOCKOPT {
             let mut word = [0u8; 4];
             if !user.copy_in(&mut word, args[4]) {
@@ -554,16 +606,18 @@ pub(super) fn stage(
                 plan.read(user, args[3], len, false)?;
             }
         }
-        Ok(true)
+        Ok(Shape::Whole)
     })();
-    match staged {
+    let prefix = match staged {
         Err(stage) => return Some(stage),
         // Not stageable in one record: the call stays unrouted (a counted
         // ENOSYS), never a guessed result.
-        Ok(false) => return None,
-        Ok(true) if !plan.fits_with(&Plan::default(), false) => return None,
-        Ok(true) => {}
-    }
+        Ok(Shape::Refused) => return None,
+        Ok(_) if !plan.fits_with(&Plan::default()) => return None,
+        Ok(_) if message && plan.outputs_overlap() => return None,
+        Ok(Shape::Whole) => None,
+        Ok(Shape::Prefix { address, access }) => Some((address, access)),
+    };
     let inputs: Vec<&[u8]> = plan.inputs.iter().map(Vec::as_slice).collect();
     let Some(input) = NetCall::encode(call.canonical.raw(), args, &plan.segments, &inputs) else {
         return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
@@ -575,14 +629,25 @@ pub(super) fn stage(
         len: NetCall::output_capacity(&plan.segments),
         layout: OutputLayout::Net,
     };
-    Some(staging.request(
+    let request = staging.request(
         HostFileOp::NetSyscall,
         call.fd().unwrap_or(-1),
         0,
         [0; 4],
         &input,
         Some(output),
-    ))
+    );
+    Some(match (prefix, request) {
+        (Some((address, access)), HostFileStage::Request { record, output, .. }) => {
+            HostFileStage::FaultAfterPrefix {
+                address,
+                access,
+                prefix: record,
+                output,
+            }
+        }
+        (_, stage) => stage,
+    })
 }
 
 /// Copy a served call's written extents back to the caller's memory, as its
