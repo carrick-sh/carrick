@@ -23,8 +23,16 @@ release's wake reruns it to probe once. A signal ends it with EINTR.
 The operation keeps the request decoded at entry (fcntl(2) copies its
 struct flock in once), and a woken wait is routed by that operation before
 any descriptor lookup: it goes on with the description it pinned even when
-a sibling closed or replaced its number, and a record lock taken through a
-number that no longer names that description is given back with EBADF.
+a sibling closed or replaced its number, and a record lock that nothing
+blocks, asked through a number that no longer names that description, is
+refused with EBADF before it is taken (nothing is ever given back).
+Ranges and refusal order follow the native oracle: a base or end past the
+largest offset is EOVERFLOW, a start before 0 EINVAL; F_GETLK checks its
+type first, F_SETLK its range before its type and access, an OFD l_pid
+last; flock's operation before its descriptor. A lock with no free table
+record is ENOLCK (a true capacity limit under the table's exclusion). The
+fd authority waits out a busy writer (ShortLockWait, enforced by type):
+contention is never an errno here.
 A close or dup2 releases the record locks of exactly the file it retired,
 read in the same descriptor-table acquisition.
 Not served (counted ENOSYS): SEEK_CUR/SEEK_END bases and unstamped
@@ -44,6 +52,10 @@ vm_free = [
   "carrick-fd-core::record_lock::tests::ofd_and_flock_locks_keep_their_owners_and_families_apart",
   "carrick-fd-core::record_lock::tests::a_dead_owners_locks_block_nobody",
   "carrick-fd-core::record_lock::tests::posix_ranges_follow_fcntl",
+  "carrick-fd-core::record_lock::tests::posix_ranges_tell_overflow_from_invalid",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_review_record_lock_overflow_matches_linux (F_SETLK (i64::MAX, 2) is EOVERFLOW, as native Linux 6.12.115; controls (i64::MAX, 1) 0 and (-1, 1) EINVAL; red on 820b8bb11: -22)",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_arm_record_lock_range_and_refusal_order_match_linux (the native range table and refusal order; red on 820b8bb11 in the overflow, OFD pid-after-access and flock operation-first rows)",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_arm_replaced_lock_waiter_with_a_full_lock_table_answers_ebadf (a stale rerun on a full lock table answers EBADF holding nothing; red on 3f83746a7: ENOLCK)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_arm_woken_lock_waiters_take_the_request_they_parked_with (the waiters' struct flock rewritten to F_UNLCK while they park; red on a0bd7837d: both reruns returned at once, neither holding the lock)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_arm_lock_waiter_goes_on_with_its_description_after_a_sibling_replaces_its_fd (a sibling dup2s a pipe over the waited-on fd: F_SETLKW ends EBADF holding nothing and blocking flock 0, as the native oracle; red on a0bd7837d: the rerun was routed away from the lock owner)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_arm_close_releases_record_locks_of_the_file_it_retired (a sibling's dup2 between close's entry and its retirement; red on a0bd7837d: the other file's locks were released, the closed file's survived)",
@@ -58,10 +70,11 @@ embed = [
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_and_fork_child_contend_record_locks_and_flock (native oracle byte for byte; red: fcntl x10, flock x4 refused)",
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_record_lock_outlives_its_thread_and_ends_with_dup2_and_exit_group (a non-last thread's exit keeps the lock; dup2 and exit_group with a running worker release it; red: fcntl x5 refused)",
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_exec_close_on_exec_ends_record_locks_and_keeps_flock_and_ofd_locks (a fork child execs itself; native oracle byte for byte; red with the exec release removed: E8 reported the record lock still held)",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_record_lock_ranges_and_refusal_order_match_native (native_record_lock.S -DRANGES: EOVERFLOW rows and refusal order, native oracle byte for byte; red on 820b8bb11 in G1, G4-G6, G8, G9)",
 ]
 
 [bindings.unresolved]
-semantics = "SEEK_CUR/SEEK_END bases, EDEADLK and the host-dispatched ARM run root's locks (host arbiter) are not served by this owner (#2460)."
+semantics = "SEEK_CUR/SEEK_END bases (and so their EINVAL/EOVERFLOW range answers), EDEADLK and the host-dispatched ARM run root's locks (host arbiter) are not served by this owner (#2460). An exhausted IPC operation arena still forwards a blocking request (counted ENOSYS) instead of parking on the arena's release, as main's pipes do (follow-up)."
 structural = "No work-count budget is bound; the table costs the number of locks held per operation, and every release wakes every lock waiter of the zone (one lane, #2460). The pool-exhaustion witness serial_host_lock_waiters_beyond_the_pool_hold_no_capacity and its pipe control are ignored on #2458: one x86 wake of two parked fork children fails the carrier on main before any lock code runs."
 embed_structural = "UNRUN (director): signed ARM run of apt-get on the implementation head."
 docker = "The x86 KVM witness compares with the native Linux oracle; no Docker differential."
