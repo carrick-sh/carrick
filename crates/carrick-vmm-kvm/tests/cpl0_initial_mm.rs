@@ -4367,6 +4367,66 @@ fn serial_host_fork_child_record_lock_outlives_its_thread_and_ends_with_dup2_and
     );
 }
 
+/// #231: lock waiters hold no execution capacity. Six fork children park in
+/// F_SETLKW on the parent's write lock, more than the pool has vCPUs; the
+/// parent still runs and unlocks, and each waiter in turn takes the lock and
+/// exits, its exit releasing the lock and waking the next (`-DPOOL`).
+/// Compared with the native oracle. Blocked on main's x86 multi-waiter wake
+/// (#2458), which its pipe control reproduces without any lock.
+#[test]
+#[ignore = "#2458: one x86 wake of two parked fork children fails the carrier"]
+fn serial_host_lock_waiters_beyond_the_pool_hold_no_capacity() {
+    bounded_witness(
+        "serial_host_lock_waiters_beyond_the_pool_hold_no_capacity",
+        || {
+            let (native, carrick) =
+                ring_file_fixture_run("native_record_lock.S", &["-DPOOL"], |dir, name| {
+                    vec![format!(
+                        "-DLOCK_PATH=\"{}\"",
+                        dir.join(format!("{name}-lock")).display()
+                    )]
+                });
+            assert_eq!(native.0, 0, "native oracle: {native:?}");
+            assert_eq!(native.1, [0, 0, 0, 0, 6, 0], "native oracle: {native:?}");
+            assert_eq!(
+                (carrick.0, &carrick.1, &carrick.2),
+                (native.0, &native.1, &Vec::new()),
+                "(exit, step bytes, refused counters)"
+            );
+        },
+    );
+}
+
+/// The control for [`serial_host_lock_waiters_beyond_the_pool_hold_no_capacity`]:
+/// the same six fork children park in `read(2)` on one pipe instead of on the
+/// lock, and the parent feeds them one byte at a time (`-DPOOL -DPIPE`).
+/// Red on main 9a4b3783e: `owner grant stale execution/root` (#2458).
+#[test]
+#[ignore = "#2458: one x86 wake of two parked fork children fails the carrier"]
+fn serial_host_pipe_readers_beyond_the_pool_hold_no_capacity() {
+    bounded_witness(
+        "serial_host_pipe_readers_beyond_the_pool_hold_no_capacity",
+        || {
+            let (native, carrick) = ring_file_fixture_run(
+                "native_record_lock.S",
+                &["-DPOOL", "-DPIPE"],
+                |dir, name| {
+                    vec![format!(
+                        "-DLOCK_PATH=\"{}\"",
+                        dir.join(format!("{name}-lock")).display()
+                    )]
+                },
+            );
+            assert_eq!(native.1, [0, 0, 0, 0, 6, 0], "native oracle: {native:?}");
+            assert_eq!(
+                (carrick.0, &carrick.1, &carrick.2),
+                (native.0, &native.1, &Vec::new()),
+                "(exit, step bytes, refused counters)"
+            );
+        },
+    );
+}
+
 /// Run `test` in a separate `timeout`-bounded process: a parked guest need
 /// not consume the pool's exit budget, so a lost wake must not hang CI.
 fn bounded_witness(test: &str, witness: impl FnOnce()) {
