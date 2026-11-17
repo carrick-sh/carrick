@@ -82,3 +82,14 @@ fn pair_memory_forms_are_typed() {
         );
     }
 }
+
+#[test]
+fn reserved_pair_encodings_fail_shut() {
+    for word in [0xe9400440, 0xec400440, 0x68400440] {
+        assert_eq!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
