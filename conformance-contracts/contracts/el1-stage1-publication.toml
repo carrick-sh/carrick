@@ -1,3 +1,10 @@
+# #2480 slice 1 (N1 vocabulary): aarch64::LeafAccess moved verbatim into the
+# neutral carrick-mmu-core stage1 module (crates/carrick-mmu-core/src/stage1.rs)
+# and aarch64.rs re-exports it; x86::descriptor_txn::Access is now the same
+# type. Discriminants and the stale-stage1 probe wire encoding are unchanged
+# (explicit wire conversion added). No ARM descriptor, walk, publication or
+# refusal behaviour changes: the bindings below remain the regression
+# evidence and no new acceptance is claimed.
 # #1733: `vcpu_loop/signal.rs` adds `exclude_settling_guest_cow`, a held
 # use of the existing `exclude_el1_editor` settlement for the EL0 COW refill.
 # No change to this contract's guest semantics, bindings or budgets.
