@@ -105,7 +105,8 @@ fn oracle_lines(words: &[u32], group: &str) -> Result<Vec<String>, Box<dyn std::
             line.split_whitespace()
                 .map(|part| {
                     if let Some(hex) = part.strip_prefix("#0x") {
-                        format!("#{}", u32::from_str_radix(hex, 16).expect("LLVM immediate"))
+                        u32::from_str_radix(hex, 16)
+                            .map_or_else(|_| part.to_owned(), |value| format!("#{value}"))
                     } else {
                         part.to_owned()
                     }
@@ -133,10 +134,16 @@ fn reg(number: u32) -> OperandRegister {
         OperandRegister::Zr
     } else {
         // Obtain an architectural register from an independent known ADD word.
-        let Instruction::Arithmetic(a) = decode_instruction(0x91000000 | number) else {
-            panic!()
-        };
-        a.rd
+        let instruction = decode_instruction(0x91000000 | number);
+        assert!(
+            matches!(instruction, Instruction::Arithmetic(_)),
+            "known ADD register fixture"
+        );
+        if let Instruction::Arithmetic(a) = instruction {
+            a.rd
+        } else {
+            OperandRegister::Zr
+        }
     }
 }
 fn llvm(words: &[u32], group: &str) -> Option<Vec<String>> {
@@ -150,7 +157,13 @@ fn llvm(words: &[u32], group: &str) -> Option<Vec<String>> {
         "distinct differential words"
     );
     println!("{group}: {} distinct LLVM cross-checks", words.len());
-    Some(oracle_lines(words, group).expect("LLVM oracle succeeds"))
+    let result = oracle_lines(words, group);
+    assert!(
+        result.is_ok(),
+        "LLVM oracle failed: {:?}",
+        result.as_ref().err()
+    );
+    result.ok()
 }
 
 #[test]
@@ -350,7 +363,7 @@ fn bounded_extract_fields_and_reserved_widths() {
         let rm = (i >> 1) & 31;
         let rn = (i >> 6) & 31;
         let rd = (i >> 11) & 31;
-        let lsb = (i * 13 >> 3) & if sf == 1 { 63 } else { 31 };
+        let lsb = ((i * 13) >> 3) & if sf == 1 { 63 } else { 31 };
         let w = 0x13800000 | sf << 31 | sf << 22 | rm << 16 | lsb << 10 | rn << 5 | rd;
         assert_eq!(
             decode_instruction(w),
@@ -394,7 +407,7 @@ fn bounded_unprivileged_transfer_operands() {
         let opc = (i >> 2) & 3;
         let imm = (i >> 4) & 511;
         let rn = (i >> 11) & 31;
-        let rt = (i * 17 >> 7) & 31;
+        let rt = ((i * 17) >> 7) & 31;
         let w = 0x38000800 | size << 30 | opc << 22 | imm << 12 | rn << 5 | rt;
         if opc == 2 && size == 3 || opc == 3 && size >= 2 {
             assert_eq!(decode_instruction(w), Instruction::Unallocated);
