@@ -226,10 +226,14 @@ do not mask a translation fault with a later permission failure.
 
 For valid FAR faults, FAR records the faulting virtual address, not the table
 IPA or translated output. Preserve the original tagged address alongside the
-TBI-normalized walk address and apply FAR_EL1's architectural tag rules; any
-architecturally UNKNOWN tag bits are excluded from hardware comparisons. For
-a cross-page access choose the first failing subaccess address, not always the
-instruction's starting VA. Preserve the faulting PC for restart (SVC's next-PC
+TBI-normalized walk address: Data Abort FAR includes the tag when tagging is
+enabled. For synchronous external aborts with TBI enabled, the top eight FAR
+bits are UNKNOWN and excluded from hardware comparisons. For a cross-page
+access with only the second page failing, FAR is the lowest address in that
+page touched by the instruction, not its starting VA. If different addresses
+produce different faults, Arm does not prioritize between those faults; the
+soft implementation may choose a deterministic order but the differential
+must accept the architecturally permitted outcomes. Preserve the faulting PC for restart (SVC's next-PC
 rule does not apply). Example: EL1 LDTR read permission failure at L3 yields
 ESR `0x9600_000f`; EL0 write permission failure at L3 yields `0x9200_004f`;
 EL0 instruction L2 translation failure yields `0x8200_0006`.
