@@ -5231,3 +5231,122 @@ mod bootstrap_descriptor_tests {
         }
     }
 }
+
+pub mod fixture_maps {
+    //! Shared fixture map geometry for stopped CPL0 bootstrap preparation.
+    use crate as carrick_x86_cpl0_host;
+    use carrick_guest_arch::FrameGpa;
+    use carrick_mem::pml4::Pml4MapSpec;
+    use carrick_sched_core::{ParkedContextWords, ZoneTables};
+    use carrick_x86::cpl0_scheduler::*;
+    use carrick_x86::interrupts::*;
+
+    pub const FIRST_ROOT: u64 = 0x60_0000;
+    pub const PROGRESS_ZONE_GPA: u64 = (carrick_x86_cpl0_host::cpl0_boot::ALLOCATOR_GPA
+        + carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE)
+        .next_multiple_of(0x20_0000);
+    // The guest and host must name the same retained sidecars when the shared
+    // lifecycle layout moves. Boot publication and stopped observation use this
+    // translation, rather than keeping a second physical placement constant.
+    pub const LIFECYCLE_LANES_GPA: FrameGpa = FrameGpa::new(
+        PROGRESS_ZONE_GPA
+            + (carrick_x86::cpl0_lifecycle::LIFECYCLE_LANE
+                - carrick_x86::cpl0_lifecycle::LIFECYCLE_ZONE),
+    );
+    // boot_lifecycle shares this mapping, including its two fixed sidecars.
+    pub const SUPERVISOR_BYTES: u64 = (carrick_x86::cpl0_lifecycle::LIFECYCLE_LANE - PROGRESS_ZONE
+        + carrick_x86::cpl0_lifecycle::LIFECYCLE_STRIDE
+        + size_of::<carrick_x86::cpl0_lifecycle::LifecycleLane>() as u64)
+        .next_multiple_of(4096);
+    pub const PROGRESS_STATE_GPA: u64 = PROGRESS_ZONE_GPA + (PROGRESS_STATE - PROGRESS_ZONE);
+    // Table walkers use the shared bootstrap direct-window authority. Keep roots
+    // in low RAM even when the scheduler's independent backing grows past it.
+    pub const SECOND_ROOT: u64 = (carrick_x86_cpl0_host::cpl0_boot::META_GPA
+        + carrick_x86_cpl0_host::cpl0_boot::META_LEN)
+        .next_multiple_of(4096);
+    const _: () = {
+        use carrick_x86::cpl0_lifecycle::{LIFECYCLE_STRIDE, LIFECYCLE_ZONE, LifecycleLane};
+
+        assert!(
+            FIRST_ROOT + carrick_x86::X86_PML4_CAPACITY
+                <= carrick_x86_cpl0_host::cpl0_boot::META_GPA
+        );
+        assert!(
+            SECOND_ROOT + carrick_x86::X86_PML4_CAPACITY
+                <= carrick_x86_cpl0_host::cpl0_boot::RAM_SIZE as u64
+        );
+        assert!(
+            SECOND_ROOT + carrick_x86::X86_PML4_CAPACITY
+                <= carrick_el1_abi::X86_CPL0_DIRECT_WINDOW_BYTES
+        );
+        assert!(
+            PROGRESS_ZONE_GPA + size_of::<ZoneTables<ParkedContextWords>>() as u64
+                <= PROGRESS_STATE_GPA
+        );
+        assert!(
+            PROGRESS_STATE_GPA + size_of::<ProgressState>() as u64 <= LIFECYCLE_LANES_GPA.raw()
+        );
+        assert!(SECOND_ROOT.is_multiple_of(4096));
+        assert!(LIFECYCLE_ZONE == PROGRESS_ZONE);
+        let lanes_gpa = LIFECYCLE_LANES_GPA.raw();
+        assert!(SECOND_ROOT + carrick_x86::X86_PML4_CAPACITY <= lanes_gpa);
+        assert!(lanes_gpa.is_multiple_of(align_of::<LifecycleLane>() as u64));
+        assert!(LIFECYCLE_STRIDE.is_multiple_of(align_of::<LifecycleLane>() as u64));
+        assert!(size_of::<LifecycleLane>() as u64 <= LIFECYCLE_STRIDE);
+        assert!(
+            lanes_gpa + LIFECYCLE_STRIDE + size_of::<LifecycleLane>() as u64
+                <= PROGRESS_ZONE_GPA + SUPERVISOR_BYTES
+        );
+        let direct = carrick_el1_abi::X86_CPL0_DIRECT_VA + PROGRESS_ZONE_GPA;
+        assert!(
+            direct + SUPERVISOR_BYTES <= PROGRESS_ZONE
+                || PROGRESS_ZONE + SUPERVISOR_BYTES <= direct
+        );
+        assert!(direct + SUPERVISOR_BYTES <= carrick_el1_abi::X86_CPL0_REGION_BASE);
+        assert!(PROGRESS_ZONE + SUPERVISOR_BYTES <= carrick_el1_abi::X86_CPL0_REGION_BASE);
+        assert!(
+            PROGRESS_ZONE_GPA + SUPERVISOR_BYTES
+                <= carrick_x86_cpl0_host::cpl0_boot::KERNEL_REGION_GPA
+        );
+        // The interrupt witness has a separate window above allocator backing.
+        assert!(
+            PROGRESS_ZONE_GPA
+                >= carrick_x86_cpl0_host::cpl0_boot::ALLOCATOR_GPA
+                    + carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE
+        );
+    };
+    pub fn supervisor_maps() -> [Pml4MapSpec; 2] {
+        [
+            Pml4MapSpec {
+                va: PROGRESS_ZONE,
+                gpa: PROGRESS_ZONE_GPA,
+                len: SUPERVISOR_BYTES,
+                user: false,
+                write: true,
+                exec: false,
+            },
+            lapic_map(),
+        ]
+    }
+
+    pub fn lapic_map() -> Pml4MapSpec {
+        Pml4MapSpec {
+            va: carrick_x86::interrupts::LAPIC_VA,
+            gpa: LAPIC_BASE,
+            len: 4096,
+            user: false,
+            write: true,
+            exec: false,
+        }
+    }
+    pub fn data_map(index: u64) -> Pml4MapSpec {
+        Pml4MapSpec {
+            va: PROGRESS_DATA,
+            gpa: PROGRESS_DATA + index * 4096,
+            len: 4096,
+            user: true,
+            write: true,
+            exec: false,
+        }
+    }
+}

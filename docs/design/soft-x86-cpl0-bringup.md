@@ -1,6 +1,6 @@
 # Soft x86 CPL0 bring-up: existing mechanisms and extraction
 
-Part of #671 / #578 step 2b; R2. References below name functions and types in the
+Part of #671 / #578 step 2b; R3. References below name functions and types in the
 shared host coordinator and KVM adapter.
 Clean room: Carrick code and Intel SDM only; no external implementation source.
 No instruction-semantics web search was used.
@@ -103,15 +103,16 @@ selected bound witnesses without weakening semantics, bindings or budgets.
 Intel SDM vol. 3 remains the descriptor layout authority. The byte witness
 below checks unchanged descriptor writes with explicit mutation controls.
 
-R2 status: descriptor construction is shared through
+R3 status: descriptor construction is shared through
 `initialize_bootstrap_descriptors`; remaining neutral preparation and CPU
 bring-up are still in `Cpl0Carrier::boot_bytes_inner`. The KVM-free
 `bootstrap_descriptor_tests::initialize_bootstrap_descriptors_has_exact_bytes`
 witness checks GDT, rebased fault gates, private TSS/IST and optional IRQ gates.
 Mutation results and transient run populations belong to the PR evidence.
-R2 preparation is blocked on moving fixture helpers from
-`carrick-vmm-kvm/src/carrier_interrupts.rs`, which is outside the current
-worker fence; no helper implementation is copied as a workaround.
+Fixture map geometry and its layout assertions now live in the shared
+`cpl0_boot::fixture_maps` module. KVM re-exports the same helpers so boot
+and fixture call sites continue to use one implementation. The cross-crate
+visibility change is isolated from the remaining preparation extraction.
 The native Linux oracle failure is tracked as flaky on main in #2320.
 CPUID and VMX segment bindings provide gate coverage; no descriptor-path
 coverage (follow-up #2476). The byte witness addresses #2477.
