@@ -3054,6 +3054,33 @@ fn complete_poll_array<'p, C: carrick_core_abi::EntryContext>(
     FamilyCompletion::Complete(result.raw())
 }
 
+/// Test hold between a native close(2)/dup2(2) entry and the table
+/// acquisition that retires the descriptor: a witness plays a sibling
+/// thread's change of the same descriptor table there (#231), as a
+/// concurrent caller sharing the table could at that instant.
+#[cfg(test)]
+pub(crate) mod close_retire_hold {
+    use carrick_el1_abi::ipc::IpcRegion;
+    use carrick_el1_abi::ipc::fd::{Fd, TableId};
+
+    type Hold = Box<dyn FnOnce(&IpcRegion<'_>, TableId, Fd)>;
+    std::thread_local! {
+        static HOLD: core::cell::RefCell<Option<Hold>> = const { core::cell::RefCell::new(None) };
+    }
+
+    /// The next native close or exact dup on this thread runs `hold` with
+    /// the table and the descriptor number it is about to retire.
+    pub(crate) fn set(hold: impl FnOnce(&IpcRegion<'_>, TableId, Fd) + 'static) {
+        HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(hold)));
+    }
+
+    pub(super) fn run(region: &IpcRegion<'_>, table: TableId, fd: Fd) {
+        if let Some(hold) = HOLD.with(|slot| slot.borrow_mut().take()) {
+            hold(region, table, fd);
+        }
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn host_owned_poll_copyout_refusal_keeps_the_host_fallback() {
@@ -4590,6 +4617,8 @@ impl<
             request.cloexec,
             || {
                 let claim = reservation.take().ok_or(Error::InvalidArgument)?;
+                #[cfg(test)]
+                close_retire_hold::run(&venue.region, table, new_fd);
                 match authority.commit_reservation_filtered(
                     claim,
                     &pin,
@@ -5783,6 +5812,8 @@ impl<
                     .file_identity(table, old)
                     .ok()
                     .flatten();
+                #[cfg(test)]
+                close_retire_hold::run(&venue.region, table, old);
                 let released = match venue.region.fd(NativeFdWait).close_filtered(
                     table,
                     old,

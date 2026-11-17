@@ -106,6 +106,145 @@ fn serial_host_native_readlink_copyout_fault_returns_errno_14() {
     );
 }
 
+/// The file [`serial_host_native_fork_exec_ends_record_locks_on_close_on_exec`]
+/// locks.
+const EXEC_LOCK_FILE: fd::record_lock::FileIdentity = fd::record_lock::FileIdentity {
+    device: fd::record_lock::FileDevice::new(7),
+    inode: match fd::record_lock::FileInode::new(2452) {
+        Some(inode) => inode,
+        None => panic!("a nonzero inode"),
+    },
+};
+
+/// The root's descriptors of [`EXEC_LOCK_FILE`], inherited by its fork child.
+#[derive(Clone, Copy)]
+struct ExecLockFds {
+    /// The child's record lock is taken through it; exec keeps it.
+    record: fd::Fd,
+    /// Another descriptor of the file, close-on-exec.
+    cloexec: fd::Fd,
+    /// Its own description, flock(2)-locked; exec keeps it.
+    flock: fd::Fd,
+    /// Its own description, OFD-locked; exec keeps it.
+    ofd: fd::Fd,
+}
+
+/// The owners of the child's three locks.
+struct ExecLockOwners {
+    table: fd::record_lock::LockOwner,
+    flock: fd::record_lock::LockOwner,
+    ofd: fd::record_lock::LockOwner,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ExecLockHeld {
+    record: bool,
+    flock: bool,
+    ofd: bool,
+}
+
+impl ExecLockFds {
+    /// The fork child's locks before its exec, in the zone's one table: a
+    /// whole-file record lock of its descriptor table, a flock of one
+    /// description and an OFD lock of another. Only exec's sweep is under
+    /// test here; production fcntl(2) and flock(2) take these in
+    /// `serial_host_arm_fork_children_contend_record_locks_and_flock_in_the_ring`
+    /// and the KVM `-DEXEC` witness.
+    fn take_locks(
+        self,
+        region: carrick_el1_abi::ipc::IpcRegion<'_>,
+        table: fd::TableId,
+    ) -> ExecLockOwners {
+        use fd::record_lock::{Lock, LockClass, LockKind, LockOwner, LockPid, LockRange};
+        let authority = region.fd(ShortLockSpin);
+        assert_eq!(authority.getfd(table, self.cloexec), Ok(true));
+        let key = |fd| {
+            let (pin, _) = authority.pin(table, fd).unwrap();
+            let key = pin.key();
+            assert_eq!(authority.unpin(pin), Ok(None));
+            LockOwner::description(key)
+        };
+        let owners = ExecLockOwners {
+            table: LockOwner::table(table),
+            flock: key(self.flock),
+            ofd: key(self.ofd),
+        };
+        assert_ne!(key(self.record), key(self.cloexec), "two descriptions");
+        let locks = region.file_locks(&ShortLockSpin).unwrap();
+        for (owner, class, range) in [
+            (
+                owners.table,
+                LockClass::Record,
+                LockRange::from_posix(0, 0, 10),
+            ),
+            (owners.flock, LockClass::Flock, Ok(LockRange::WHOLE_FILE)),
+            (
+                owners.ofd,
+                LockClass::Record,
+                LockRange::from_posix(0, 100, 10),
+            ),
+        ] {
+            let outcome = locks.table().set(
+                Lock {
+                    file: EXEC_LOCK_FILE,
+                    owner,
+                    class,
+                    kind: LockKind::Write,
+                    range: range.unwrap(),
+                    pid: LockPid::new(42),
+                },
+                &authority,
+            );
+            assert_eq!(outcome.taken, Ok(()));
+        }
+        drop(locks);
+        assert_eq!(
+            owners.held(region),
+            ExecLockHeld {
+                record: true,
+                flock: true,
+                ofd: true,
+            }
+        );
+        owners
+    }
+}
+
+impl ExecLockOwners {
+    fn held(&self, region: carrick_el1_abi::ipc::IpcRegion<'_>) -> ExecLockHeld {
+        use fd::record_lock::LockClass;
+        let locks = region.file_locks(&ShortLockSpin).unwrap();
+        ExecLockHeld {
+            record: locks.table().holds(self.table, LockClass::Record),
+            flock: locks.table().holds(self.flock, LockClass::Flock),
+            ofd: locks.table().holds(self.ofd, LockClass::Record),
+        }
+    }
+}
+
+/// #2452 review P0-4: a native fork child's exec, through the production
+/// exec service, closes its close-on-exec descriptors. One names the file
+/// its process holds a record lock on, so that lock ends (fcntl(2): a close
+/// of any descriptor of the file); its flock and OFD lock belong to
+/// descriptions the successor keeps, and stay (flock(2), fcntl(2)). Red
+/// with exec's `release_exec_record_locks` removed: the record lock
+/// survived the exec.
+#[test]
+fn serial_host_native_fork_exec_ends_record_locks_on_close_on_exec() {
+    fork_exec_probe_copy_alignment(
+        None,
+        u32::MAX as u64,
+        false,
+        None,
+        None,
+        false,
+        None,
+        false,
+        false,
+        true,
+    );
+}
+
 fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
     fork_exec_probe(futex, bitset, false, None);
 }
@@ -419,7 +558,7 @@ fn fork_exec_probe_alignment(
     misaligned: bool,
 ) {
     fork_exec_probe_copy_alignment(
-        futex, bitset, timed, metadata, departure, false, None, false, misaligned,
+        futex, bitset, timed, metadata, departure, false, None, false, misaligned, false,
     );
 }
 
@@ -436,7 +575,7 @@ fn fork_exec_probe_copy(
     clock: bool,
 ) {
     fork_exec_probe_copy_alignment(
-        futex, bitset, timed, metadata, departure, readlink, copy_error, clock, false,
+        futex, bitset, timed, metadata, departure, readlink, copy_error, clock, false, false,
     );
 }
 
@@ -451,6 +590,7 @@ fn fork_exec_probe_copy_alignment(
     copy_error: Option<NativeProcessError>,
     clock: bool,
     misaligned: bool,
+    locks: bool,
 ) {
     let counters = carrick_el1_abi::Counters::new();
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -510,6 +650,28 @@ fn fork_exec_probe_copy_alignment(
             description.install(table.id(), fd::Fd(6), true).unwrap();
         }
     }
+    // `locks`: four descriptors of one stamped file, as the carrier's
+    // native open installs them; the child inherits them across fork.
+    let lock_fds = locks.then(|| {
+        let install = |cloexec| {
+            owner
+                .install_host_description(
+                    table.id(),
+                    Box::new(()),
+                    fd::AccessMode::ReadWrite,
+                    fd::StatusFlags::default(),
+                    Some(EXEC_LOCK_FILE),
+                    cloexec,
+                )
+                .unwrap()
+        };
+        ExecLockFds {
+            record: install(false),
+            cloexec: install(true),
+            flock: install(false),
+            ofd: install(false),
+        }
+    });
     // Fork, exec and dispatch use the same published table map, just as the
     // carrier does. The fixture registered this retained EL1 region above.
     let map = carrick_el1_abi::ipc_table_map_host().unwrap();
@@ -604,6 +766,10 @@ fn fork_exec_probe_copy_alignment(
     activate_target(source, &fixture.task, &child_binding);
     let child_table = fixture.task.linux.file_table.load(Ordering::Acquire);
     assert_ne!(child_table, 5, "production fork owns an inherited table");
+    let lock_owners = lock_fds.map(|fds| {
+        let table = fd::TableId::from_raw(map.lookup_owned(child_table).unwrap());
+        fds.take_locks(owner.region(), table)
+    });
     let mut service = Physical {
         zone: fixture.zone,
         page: fixture.page,
@@ -732,6 +898,21 @@ fn fork_exec_probe_copy_alignment(
         fixture.task.mm.key.load(Ordering::Acquire),
         child_binding.address.mm.raw().get()
     );
+    if let Some(owners) = lock_owners {
+        assert_eq!(
+            owners.held(owner.region()),
+            ExecLockHeld {
+                record: false,
+                flock: true,
+                ofd: true,
+            },
+            "exec closed a close-on-exec descriptor of the file: the record \
+             lock ends (fcntl(2)); the flock and OFD lock stay with the \
+             descriptions the successor keeps"
+        );
+        registry.unregister_root_for_test(&runtime);
+        return;
+    }
     if let Some(operation) = futex {
         child_futex(
             fixture,
