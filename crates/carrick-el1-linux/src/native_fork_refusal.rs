@@ -1,6 +1,10 @@
 //! Preserve the native fork operation and its owner refusal until errno encoding.
 
-use carrick_core::mm::{fork::ForkError, reservation::Refusal, transaction::MmError};
+use carrick_core::mm::{
+    fork::{ForkCensus, ForkError, ForkOwnerRefusal, ForkScratch},
+    reservation::Refusal,
+    transaction::MmError,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeForkStage {
@@ -57,6 +61,11 @@ pub enum NativeForkCause {
     SiblingBirth {
         observed: carrick_sched_core::process::wait::TaskWakeGeneration,
     },
+    /// The kernel heap missed the fork's scratch while a metadata grant is
+    /// in flight on the carrier mailbox: capacity is owed, so this is "not
+    /// now". The fork keeps its syscall and reruns once the carrier serves
+    /// the grant (#2441). A miss nothing is owed for is `Fork(NoMemory)`.
+    MetadataOwed,
 }
 
 impl From<MmError> for NativeForkCause {
@@ -82,26 +91,138 @@ pub struct NativeForkRefusal {
 }
 
 impl NativeForkRefusal {
+    /// Every cause has exactly one answer, so a new cause cannot reach the
+    /// guest as a fallback errno (#2441). Contention is "not now"; memory
+    /// and limit exhaustion is ENOMEM, as Linux answers fork and clone.
     pub fn error(self) -> super::native_process_runtime::NativeProcessError {
         use super::native_process_runtime::NativeProcessError as E;
-        use carrick_el1_abi::ForkStockRefusal as R;
         match self.cause {
-            NativeForkCause::Busy | NativeForkCause::SiblingBirth { .. } => E::Busy,
+            NativeForkCause::Busy
+            | NativeForkCause::SiblingBirth { .. }
+            | NativeForkCause::MetadataOwed => E::Busy,
             // Today's EAGAIN answer, as a refusal rather than "not now".
             NativeForkCause::GateShut => E::Exhausted,
-            // Owner contention keeps its release to enrol on (#2306); it is
-            // never the fault answer of a refused owner operation.
-            NativeForkCause::Mm(MmError::Wait(wait)) => E::OwnerWait(wait),
-            NativeForkCause::Mm(MmError::Busy)
-            | NativeForkCause::Reservation(Refusal::Busy | Refusal::PreparedConflict)
-            | NativeForkCause::Fork(ForkError::Busy) => E::Busy,
-            NativeForkCause::StockReservation(R::Invalid) => E::Invalid,
-            NativeForkCause::StockReservation(R::Stale) => E::Stale,
-            NativeForkCause::StockReservation(R::Capacity) => E::Exhausted,
-            NativeForkCause::StockReservation(R::Inventory) => E::Busy,
-            _ => E::Fault,
+            NativeForkCause::Mm(error) => mm_error(error),
+            NativeForkCause::Reservation(refusal) => reservation_error(refusal),
+            NativeForkCause::Fork(error) => fork_error(error),
+            NativeForkCause::StockReservation(refusal) => stock_error(refusal),
+            // A refused stock reply keeps the owner's answer; a crossing that
+            // carried none is the transport's fault answer.
+            NativeForkCause::StockCrossing {
+                reply: Some(refusal),
+                ..
+            } => stock_error(refusal),
+            NativeForkCause::StockCrossing { reply: None, .. } => E::Fault,
         }
     }
+}
+
+fn mm_error(error: MmError) -> super::native_process_runtime::NativeProcessError {
+    use super::native_process_runtime::NativeProcessError as E;
+    match error {
+        // Owner contention keeps its release to enrol on (#2306); it is
+        // never the fault answer of a refused owner operation.
+        MmError::Wait(wait) => E::OwnerWait(wait),
+        MmError::Busy => E::Busy,
+        MmError::NoMemory
+        | MmError::MetadataRequired
+        | MmError::Table(carrick_mmu_core::aarch64::PageTableError::OutOfTables) => E::NoMemory,
+        MmError::Reservation(refusal) => reservation_error(refusal),
+        MmError::Fault
+        | MmError::UnsupportedExecutableCow
+        | MmError::Stale
+        | MmError::Invalid
+        | MmError::Core
+        | MmError::Table(_) => E::Fault,
+    }
+}
+
+fn reservation_error(refusal: Refusal) -> super::native_process_runtime::NativeProcessError {
+    use super::native_process_runtime::NativeProcessError as E;
+    match refusal {
+        Refusal::Busy | Refusal::PreparedConflict => E::Busy,
+        Refusal::Limit | Refusal::MetadataRequired => E::NoMemory,
+        Refusal::Stale
+        | Refusal::Invalid
+        | Refusal::Collision
+        | Refusal::Hole
+        | Refusal::ForeignMapping => E::Fault,
+    }
+}
+
+fn fork_error(error: ForkError) -> super::native_process_runtime::NativeProcessError {
+    use super::native_process_runtime::NativeProcessError as E;
+    match error {
+        ForkError::Busy => E::Busy,
+        ForkError::NoMemory
+        | ForkError::MetadataRequired
+        | ForkError::OwnerRefusal(ForkOwnerRefusal::Limit) => E::NoMemory,
+        ForkError::Invalid
+        | ForkError::Stale
+        | ForkError::Core
+        | ForkError::OwnerRefusal(
+            ForkOwnerRefusal::Invalid
+            | ForkOwnerRefusal::Collision
+            | ForkOwnerRefusal::Hole
+            | ForkOwnerRefusal::ForeignMapping,
+        ) => E::Fault,
+    }
+}
+
+fn stock_error(
+    refusal: carrick_el1_abi::ForkStockRefusal,
+) -> super::native_process_runtime::NativeProcessError {
+    use super::native_process_runtime::NativeProcessError as E;
+    use carrick_el1_abi::ForkStockRefusal as R;
+    match refusal {
+        R::Invalid => E::Invalid,
+        R::Stale => E::Stale,
+        R::Capacity => E::Exhausted,
+        R::Inventory => E::Busy,
+    }
+}
+
+/// Allocate a fork's exact-size scratch, on every ISA's fork venue. The loan
+/// was sized from this census, so its one real refusal is a kernel heap
+/// miss (#2441). A miss whose metadata grant is in flight is owed capacity:
+/// "not now", and the fork reruns. Any other refusal keeps its typed cause,
+/// and a heap miss answers ENOMEM. The record names the census and heap.
+pub fn fork_scratch(
+    request: carrick_el1_abi::PortalForkRequest,
+    mapping_count: usize,
+    count: &ForkCensus,
+) -> Result<ForkScratch, super::native_process_runtime::NativeProcessError> {
+    ForkScratch::bounded(
+        request,
+        mapping_count,
+        count.child,
+        count.parent,
+        count.live,
+        count.custody,
+    )
+    .map_err(|error| {
+        let cause = if error == ForkError::NoMemory
+            && carrick_el1::alloc::GLOBAL_ALLOCATOR.capacity_owed()
+        {
+            NativeForkCause::MetadataOwed
+        } else {
+            NativeForkCause::Fork(error)
+        };
+        let refusal = NativeForkRefusal {
+            stage: NativeForkStage::Scratch,
+            cause,
+        };
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        emit(format_args!(
+            "{refusal:?}; census={{child_words: {}, parent_words: {}, live_words: {}, custody: {}, mappings: {mapping_count}}}; heap={:?}",
+            count.child,
+            count.parent,
+            count.live,
+            count.custody,
+            carrick_el1::alloc::GLOBAL_ALLOCATOR.diagnostics()
+        ));
+        super::native_process_runtime::NativeProcessError::ForkRefused(refusal)
+    })
 }
 
 pub fn refused(
@@ -247,6 +368,7 @@ mod tests {
             (E::Invalid, -22, R::NativeInvalid),
             (E::Stale, -22, R::NativeStale),
             (E::Exhausted, -11, R::NativeExhausted),
+            (E::NoMemory, -12, R::NativeNoMemory),
             (E::Fault, -14, R::NativeFault),
             (E::Unsupported, -38, R::NativeUnsupported),
             (E::GroupExitCustody, -38, R::X86GroupExitCustody),
@@ -329,6 +451,106 @@ mod tests {
         assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-14));
         assert_ne!(error, refused(NativeForkStage::Prepare, ForkError::Core));
         assert_ne!(error, refused(NativeForkStage::Census, ForkError::Stale));
+    }
+
+    /// #2441: memory and limit exhaustion at any stage is ENOMEM, as Linux
+    /// answers fork and clone, never EFAULT; a heap miss whose metadata grant
+    /// is in flight is "not now". Every cause has one exhaustive answer.
+    #[test]
+    fn exhausted_fork_is_enomem_and_an_owed_grant_is_contention() {
+        use carrick_mmu_core::aarch64::PageTableError;
+        for (stage, cause) in [
+            (
+                NativeForkStage::Scratch,
+                NativeForkCause::Fork(ForkError::NoMemory),
+            ),
+            (
+                NativeForkStage::Prepare,
+                NativeForkCause::Fork(ForkError::MetadataRequired),
+            ),
+            (
+                NativeForkStage::Publish,
+                NativeForkCause::Fork(ForkError::OwnerRefusal(ForkOwnerRefusal::Limit)),
+            ),
+            (
+                NativeForkStage::Prepare,
+                NativeForkCause::Mm(MmError::NoMemory),
+            ),
+            (
+                NativeForkStage::Prepare,
+                NativeForkCause::Mm(MmError::Table(PageTableError::OutOfTables)),
+            ),
+            (
+                NativeForkStage::Commit,
+                NativeForkCause::Mm(MmError::Reservation(Refusal::Limit)),
+            ),
+            (
+                NativeForkStage::Commit,
+                NativeForkCause::Reservation(Refusal::Limit),
+            ),
+        ] {
+            let error = refused(stage, cause);
+            assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-12));
+        }
+        assert_eq!(
+            refused(NativeForkStage::Scratch, NativeForkCause::MetadataOwed).failure(),
+            Err(NativeContention::BUSY)
+        );
+        use carrick_el1_abi::ForkStockRefusal as R;
+        for (reply, errno) in [(Some(R::Capacity), Ok(-11)), (None, Ok(-14))] {
+            let error = refused(
+                NativeForkStage::StockCrossing,
+                NativeForkCause::StockCrossing { status: 1, reply },
+            );
+            assert_eq!(error.failure().map(|failure| failure.errno()), errno);
+        }
+        assert_eq!(
+            refused(
+                NativeForkStage::StockCrossing,
+                NativeForkCause::StockCrossing {
+                    status: 1,
+                    reply: Some(R::Inventory),
+                },
+            )
+            .failure(),
+            Err(NativeContention::BUSY)
+        );
+    }
+
+    /// The census-sized scratch refuses only a heap miss. Without a grant
+    /// mailbox (host builds, the x86 CPL0 image) nothing is owed: ENOMEM.
+    #[test]
+    fn scratch_heap_miss_without_a_grant_mailbox_is_enomem() {
+        let request = carrick_el1_abi::PortalForkRequest {
+            operation: carrick_el1_abi::PortalOperation {
+                carrier: core::num::NonZeroU64::MIN,
+                mm: carrick_el1_abi::ReservationMm::new(1).unwrap(),
+                incarnation: core::num::NonZeroU64::MIN,
+                sequence: core::num::NonZeroU64::MIN,
+            },
+            parent_generation: carrick_el1_abi::ReservationGeneration::new(1).unwrap(),
+            child_mm: carrick_el1_abi::ReservationMm::new(2).unwrap(),
+            child_tables: carrick_el1_abi::PortalForkTableArena::new(0x20000, 0x1000).unwrap(),
+            parent_tables: carrick_el1_abi::PortalForkTableArena::new(0x30000, 0x1000).unwrap(),
+            kernel_control_ipa: 0x40000,
+        };
+        let count = ForkCensus {
+            child: 512,
+            parent: 0,
+            live: 512,
+            custody: 0,
+        };
+        assert!(fork_scratch(request, 0, &count).is_ok());
+        assert!(carrick_core::mm::fork::inject_scratch_exhausted_once());
+        let error = fork_scratch(request, 0, &count).unwrap_err();
+        assert_eq!(
+            error,
+            NativeProcessError::ForkRefused(NativeForkRefusal {
+                stage: NativeForkStage::Scratch,
+                cause: NativeForkCause::Fork(ForkError::NoMemory),
+            })
+        );
+        assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-12));
     }
 
     /// A held reservation root at the mapping census or the child commit

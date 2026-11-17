@@ -6,7 +6,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
+use carrick_core::mm::fork::{ForkCensus, census_table};
 use carrick_core::mm::transaction::OwnerVenue;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use carrick_core::mm::transaction::{SelectionVenues, UserWriteRequest, UserWriteVenue};
@@ -2287,26 +2287,14 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 refused(NativeForkStage::PublishRoot, e),
             ));
         }
-        let scratch = match ForkScratch::bounded(
-            loan.request,
-            mappings.len(),
-            count.child,
-            count.parent,
-            count.live,
-            count.custody,
-        ) {
-            Ok(scratch) => scratch,
-            Err(e) => {
-                owner.spaces.free(index);
-                return Err(abandon_loan(
-                    &self.crossing,
-                    self.worker(),
-                    &loan,
-                    None,
-                    refused(NativeForkStage::Scratch, e),
-                ));
-            }
-        };
+        let scratch =
+            match super::native_fork_refusal::fork_scratch(loan.request, mappings.len(), &count) {
+                Ok(scratch) => scratch,
+                Err(e) => {
+                    owner.spaces.free(index);
+                    return Err(abandon_loan(&self.crossing, self.worker(), &loan, None, e));
+                }
+            };
         let plan = match owner.prepare_fork(loan.request, scratch, &*live, self.worker()) {
             Ok(plan) => plan,
             Err(e) => {
