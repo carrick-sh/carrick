@@ -644,6 +644,11 @@ fn generated_pair_memory_matches_llvm_operands() {
     let words: Vec<_> = words.into_iter().collect();
     let path = std::env::temp_dir().join(format!("carrick-a64-pair-{}.o", std::process::id()));
     std::fs::write(&path, object(&words)).expect("valid fixture");
+    // LLVM_MEMORY_DEFAULT_PRINTER: LLVM 22.1.2 no-aliases prints
+    // "str q0, [x0, x0, lsl #4]" for S=0 as well as S=1. Arm ARM
+    // DDI0487G.a C7.2.332 defines shift = S ? scale : 0. The default
+    // printer distinguishes these semantic operands correctly, so compare
+    // every accepted memory form against that output without exceptions.
     let output = Command::new(std::env::var_os("CARRICK_LLVM_OBJDUMP").expect("set LLVM"))
         .args([
             "-D",
