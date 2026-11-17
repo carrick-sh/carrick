@@ -348,3 +348,41 @@ fn decoded_svc_enters_real_vector_group_then_decoded_eret_restores() {
         assert_eq!(cpu.pstate.el, ExceptionLevel::El0);
     }
 }
+
+/// The legacy table is a production census input: lower-EL SVC -> HVC ->
+/// ERET can run entirely through these state transitions. Other vector variants
+/// contain memory/arithmetic instructions that belong to the A3 translator.
+#[test]
+fn svc_roundtrip_through_generated_production_vector_table() {
+    use carrick_softcpu_aarch64::{ExceptionKind, Instruction, decode_instruction};
+    let Some(path) = std::env::var_os("CARRICK_A64_VECTOR_TABLE") else {
+        return;
+    };
+    let table = std::fs::read(path).unwrap();
+    let mut cpu = CpuState::default();
+    cpu.pc = ProgramCounter(0x1000);
+    cpu.el1.vbar = VirtualAddress(0x8000);
+    let Instruction::ExceptionGeneration(svc) = decode_instruction(0xd400_0001) else {
+        panic!("SVC")
+    };
+    take_exception(&mut cpu, Exception::Svc(svc.immediate));
+    let offset = usize::try_from(cpu.pc.0 - cpu.el1.vbar.0).unwrap();
+    assert_eq!(offset, 0x400);
+    let word = |offset| u32::from_le_bytes(table[offset..offset + 4].try_into().unwrap());
+    let Instruction::ExceptionGeneration(hvc) = decode_instruction(word(offset)) else {
+        panic!("production HVC")
+    };
+    assert_eq!(hvc.kind, ExceptionKind::Hvc);
+    let saved = cpu.el1.clone();
+    assert!(matches!(
+        take_exception(&mut cpu, Exception::Hvc(hvc.immediate)),
+        ExceptionOutcome::ProviderExit(_)
+    ));
+    assert_eq!(cpu.el1, saved);
+    // A3 resumes after the provider boundary; no host HVC is executed.
+    cpu.pc = ProgramCounter(cpu.pc.0 + 4);
+    assert_eq!(decode_instruction(word(offset + 4)), Instruction::Eret);
+    eret(&mut cpu).unwrap();
+    assert_eq!(cpu.pc, ProgramCounter(0x1004));
+    assert_eq!(cpu.pstate.el, ExceptionLevel::El0);
+}
