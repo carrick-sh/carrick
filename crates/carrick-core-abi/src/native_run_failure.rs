@@ -21,6 +21,8 @@ pub enum NativeRunFailureReason {
     ClaimRollback = 11,
     /// A committed birth's record could not be queued (#1100).
     BornEnqueueRefused = 12,
+    /// The kernel heap could not hold a native operation's storage (#2441).
+    NativeNoMemory = 13,
 }
 impl NativeRunFailureReason {
     pub const fn as_str(self) -> &'static str {
@@ -37,6 +39,7 @@ impl NativeRunFailureReason {
             Self::BirthSettlement => "native birth settlement",
             Self::ClaimRollback => "native claim rollback",
             Self::BornEnqueueRefused => "native birth enqueue refused",
+            Self::NativeNoMemory => "native process out of memory",
         }
     }
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -53,6 +56,7 @@ impl NativeRunFailureReason {
             10 => Some(Self::BirthSettlement),
             11 => Some(Self::ClaimRollback),
             12 => Some(Self::BornEnqueueRefused),
+            13 => Some(Self::NativeNoMemory),
             _ => None,
         }
     }
