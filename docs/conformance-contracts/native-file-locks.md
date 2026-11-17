@@ -23,6 +23,21 @@ host file.
   replaced goes on with its open file description; once the lock is free
   it returns `EBADF` holding nothing (native oracle, Linux 6.12). A read lock needs a readable description, a write lock a writable
   one (`EBADF`).
+- fcntl(2) ranges (native oracle, Linux 6.12.115, x86_64): a base or a
+  range end past the largest file offset is `EOVERFLOW` (`l_start =
+  i64::MAX, l_len = 2`; `(i64::MAX, 1)` succeeds); a range starting before
+  offset 0 is `EINVAL` (`(-1, 1)`, `(5, -6)`, `(i64::MAX, i64::MIN)`).
+  Refusal order: an `O_PATH` descriptor is `EBADF` before the `struct
+  flock` is read (not `EFAULT`); `F_GETLK` refuses an `l_type` other than
+  `F_RDLCK`/`F_WRLCK` first, then the base and range; `F_SETLK` checks the
+  range before its `l_type` and before the description's access mode; an
+  OFD command's nonzero `l_pid` is `EINVAL` after both. flock(2) refuses
+  an unknown operation (`EINVAL`) before it looks at the descriptor.
+- A lock that cannot be allocated is `ENOLCK` (fcntl(2), flock(2)). Linux
+  has no fixed table; Carrick's has `IPC_FILE_LOCKS` records, so a set (or
+  an unlock that must split a range) that finds no free record answers
+  `ENOLCK` with nothing changed. That is a true capacity limit (the call
+  holds the table's exclusion, so it is never contention).
 - fcntl(2), OFD locks: owned by the open file description, `l_pid` must be
   zero, released on the description's last close.
 - flock(2): owned by the open file description, a separate family from
@@ -53,11 +68,21 @@ The operation keeps the request decoded at entry (`RawLockRequest`: kind
 and range), and a rerun takes exactly that lock, never a re-read of user
 memory. Routing a woken call asks for its retained operation before the
 descriptor's current object, so a sibling's close or dup2 of the number
-cannot strand the operation or its description pin. After a record lock is
-taken, the descriptor is asked under the lock table's exclusion whether it
-still names the pinned description (`Authority::names_pinned`); if not, the
-lock is given back and the call returns `EBADF`. A close that retires the
-descriptor after that answer releases the lock itself.
+cannot strand the operation or its description pin. When nothing blocks a
+record lock, before it is taken, the descriptor is asked under the lock
+table's exclusion whether it still names the pinned description
+(`Authority::names_pinned`); if not, the call returns `EBADF` with nothing
+taken. A close that retires the descriptor after that answer releases the
+table's record locks under the same exclusion, so after the lock exists.
+No lock is ever taken and then given back, so a full table can never leave
+a lock held that the guest was told it does not hold.
+
+The owner's descriptor authority waits with a `ShortLockWait`
+(`EL1_WAIT`, bound through `waits_out_writers`, which accepts no other
+policy): a busy descriptor-table writer is waited out, never refused. An
+fd authority `Contended` on this path is therefore a broken invariant, not
+an errno or a counted ENOSYS; a bounded policy cannot be bound here
+without a type error.
 
 close(2) and the descriptor a dup2/dup3 replaces release the record locks
 of the file the retirement returned (`carrick_fd_core::Retired`), read in
@@ -103,14 +128,28 @@ both ISAs map.
   sibling's change of the table played at the `close_retire_hold` test hold),
   and `native_exec_pipe_tests::serial_host_native_fork_exec_ends_record_locks_on_close_on_exec`
   (the production exec service's close-on-exec sweep).
+- ARM, #2452 re-review: `serial_host_review_record_lock_overflow_matches_linux`
+  (`(i64::MAX, 2)` is `EOVERFLOW`; controls `(i64::MAX, 1)` 0 and `(-1, 1)`
+  `EINVAL`; red on 820b8bb11: -22),
+  `serial_host_arm_record_lock_range_and_refusal_order_match_linux` (the
+  oracle's range table and refusal order) and
+  `serial_host_arm_replaced_lock_waiter_with_a_full_lock_table_answers_ebadf`
+  (a stale rerun on a full table answers `EBADF` holding nothing; red on
+  3f83746a7: `ENOLCK`).
 - x86: `serial_host_root_and_fork_child_contend_record_locks_and_flock`
   (production KVM CPL0, the run root and its fork child, against the native
   oracle; red: fcntl x10 and flock x4 refused), and
   `serial_host_exec_close_on_exec_ends_record_locks_and_keeps_flock_and_ofd_locks`
   (a fork child execs: its record lock ends, its flock and OFD lock stay,
-  byte for byte with the native oracle).
+  byte for byte with the native oracle), and
+  `serial_host_fork_child_record_lock_ranges_and_refusal_order_match_native`
+  (`native_record_lock.S -DRANGES`: the overflow rows and refusal order,
+  byte for byte with the native oracle; red on 820b8bb11).
 
 ## Not served
 
 `l_whence` `SEEK_CUR`/`SEEK_END` and descriptions the carrier did not stamp
-stay a counted ENOSYS; `F_SETLKW` reports no `EDEADLK`.
+stay a counted ENOSYS (so their `EINVAL`/`EOVERFLOW` range answers, which
+need the description's offset or size, are not given either, including an
+`F_SETLK` with a bad `l_type` and such a base); `F_SETLKW` reports no
+`EDEADLK`.
