@@ -606,6 +606,7 @@ mod instruction {
         ScalarMemory(ScalarMemory),
         PairMemory(PairMemory),
         Logical(Logical),
+        MoveWide(MoveWide),
     }
 
     /// Arm ARM DDI0487G.a C6.2.92 HINT, C6.2.204 NOP, C6.2.354 YIELD,
@@ -649,6 +650,9 @@ mod instruction {
         }
         if let Some(l) = logical(word) {
             return Instruction::Logical(l);
+        }
+        if let Some(m) = move_wide(word) {
+            return Instruction::MoveWide(m);
         }
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
     }
@@ -1052,6 +1056,45 @@ mod instruction {
         })
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MoveWideOperation {
+        Not,
+        Zero,
+        Keep,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MoveWide {
+        pub operation: MoveWideOperation,
+        pub width: crate::Width,
+        pub rd: OperandRegister,
+        pub immediate: u16,
+        pub shift: ShiftAmount,
+    }
+    /// DDI0487G.a C6.2.191 MOVK, C6.2.192 MOVN, C6.2.193 MOVZ;
+    /// C4.1.2 Move wide (immediate), C4-283–284.
+    fn move_wide(w: u32) -> Option<MoveWide> {
+        if w & 0x1f800000 != 0x12800000 || (w >> 31 == 0 && w & (1 << 22) != 0) {
+            return None;
+        }
+        let operation = match (w >> 29) & 3 {
+            0 => MoveWideOperation::Not,
+            2 => MoveWideOperation::Zero,
+            3 => MoveWideOperation::Keep,
+            _ => return None,
+        };
+        Some(MoveWide {
+            operation,
+            width: if w >> 31 == 0 {
+                crate::Width::W32
+            } else {
+                crate::Width::X64
+            },
+            rd: OperandRegister::field(w, false),
+            immediate: ((w >> 5) & 65535) as u16,
+            shift: ShiftAmount((((w >> 21) & 3) * 16) as u8),
+        })
+    }
+
     /// Register index 0..30. Architectural register 31 is represented separately.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Gpr(u8);
@@ -1380,7 +1423,7 @@ mod instruction {
 pub use instruction::{
     AddImmediate, AddSubtract, Arithmetic, ArithmeticOperand, Branch, Condition, Extend, Gpr, Hint,
     Instruction, Logical, LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress,
-    MemoryIndex, MemoryOffset, MemoryOperation, MemoryRegister, MemorySize, OperandRegister,
-    PairMemory, PcOffset, RegisterBranch, ScalarMemory, ShiftAmount, VectorRegister,
-    decode_instruction,
+    MemoryIndex, MemoryOffset, MemoryOperation, MemoryRegister, MemorySize, MoveWide,
+    MoveWideOperation, OperandRegister, PairMemory, PcOffset, RegisterBranch, ScalarMemory,
+    ShiftAmount, VectorRegister, decode_instruction,
 };
