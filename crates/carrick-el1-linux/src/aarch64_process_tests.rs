@@ -17875,6 +17875,15 @@ const ARM_CHILD_SETRESIDS: u64 = u64::MAX - 1;
 #[cfg(test)]
 const ARM_LEAVE_ON_PARK: u64 = u64::MAX - 2;
 
+/// [`with_arm_process_host_dispatch`]'s pseudo call: a thread sharing the
+/// child's descriptor table runs `dup2(a0, a1)` while the child itself may
+/// be parked. The harness runs one thread per process, so the sibling's
+/// dup2 is played on the child's ring table at the fd authority, with the
+/// release a replaced descriptor owes (its description's last reference,
+/// its file's record locks). Returns 0 or the negated errno.
+#[cfg(test)]
+const ARM_SIBLING_DUP2: u64 = u64::MAX - 3;
+
 /// [`with_arm_process_host_dispatch`]'s answer for a forwarded call the
 /// host would block in (`DispatchOutcome::WaitOnFds`): the harness has no
 /// carrier waiter to run it.
@@ -18058,6 +18067,46 @@ fn with_arm_process_host_files<R>(
         }
         if nr == ARM_LEAVE_ON_PARK {
             leave_on_park = true;
+            return (CompletionRoute::Served, 0);
+        }
+        if nr == ARM_SIBLING_DUP2 {
+            let ArmCaller::Child(pid) = caller else {
+                panic!("ARM_SIBLING_DUP2 names a ring child");
+            };
+            let runtime: &std::sync::Arc<NativeProcessRuntime<'_, _, _>> = runtime
+                .as_ref()
+                .expect("a child exists only after the root's clone");
+            let binding = runtime.task_binding(resolve_child(runtime, pid)).unwrap();
+            let file_table = fixture.zone.record(binding.record.id).identity().file_table;
+            let table = carrick_el1_abi::ipc::fd::TableId::from_raw(
+                map.lookup_owned(file_table)
+                    .expect("a ring child owns its table"),
+            );
+            let region = owner.region();
+            let replaced = region
+                .fd(carrick_sched_core::ShortLockSpin)
+                .file_identity(table, carrick_el1_abi::ipc::fd::Fd(args[1] as i32));
+            let retired = match region.fd(carrick_sched_core::ShortLockSpin).dup2_filtered(
+                table,
+                carrick_el1_abi::ipc::fd::Fd(args[0] as i32),
+                carrick_el1_abi::ipc::fd::Fd(args[1] as i32),
+                crate::ipc::is_zone_releasable_backing,
+            ) {
+                Ok(retired) => retired,
+                Err(carrick_el1_abi::ipc::fd::Error::BadFd) => {
+                    return (
+                        CompletionRoute::Served,
+                        carrick_syscall_abi::LINUX_EBADF.guest_retval(),
+                    );
+                }
+                Err(error) => panic!("sibling dup2: {error:?}"),
+            };
+            let zone = Some((fixture.zone, fixture.slot));
+            crate::ipc::settle_native_release(&region, retired, zone, &fixture.task).unwrap();
+            if let Ok(Some(file)) = replaced {
+                crate::ipc::release_record_locks(&region, zone, &fixture.task, table, file)
+                    .unwrap();
+            }
             return (CompletionRoute::Served, 0);
         }
         if active != Some(caller) {
@@ -19004,6 +19053,494 @@ fn serial_host_arm_two_lock_waiters_rerun_and_park_again() {
             ("C rerun takes it", false, 0),
         ],
         "{steps:?}"
+    );
+}
+
+/// The run root's child A and A's children B and C (the harness admits one
+/// root fork), each switched in once, for the lock witnesses below.
+#[cfg(test)]
+fn arm_three_lock_processes(
+    call: &mut dyn FnMut(
+        ArmCaller,
+        u64,
+        [u64; 6],
+    ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+) -> [ArmCaller; 3] {
+    use carrick_abi::LINUX_AT_FDCWD;
+    use carrick_personality_linux::crossing::nr as sys;
+    let tmp = carrick_test_support::GuestUserBuffer::from_bytes(b"/tmp\0");
+    call(
+        ArmCaller::Root,
+        sys::MKDIRAT.raw(),
+        [LINUX_AT_FDCWD, tmp.arg(), 0o777, 0, 0, 0],
+    );
+    let (_, a) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+    assert!(a > 0, "root fork: {a}");
+    let a = ArmCaller::Child(a as u32);
+    let mut child = || {
+        let (_, pid) = call(a, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "A's fork: {pid}");
+        let pid = ArmCaller::Child(pid as u32);
+        call(pid, ARM_RESUME, [0; 6]);
+        pid
+    };
+    let (b, c) = (child(), child());
+    [a, b, c]
+}
+
+/// `openat(path, O_RDWR|O_CREAT, 0640)` as `who`.
+#[cfg(test)]
+fn arm_open_lock_file(
+    call: &mut dyn FnMut(
+        ArmCaller,
+        u64,
+        [u64; 6],
+    ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+    who: ArmCaller,
+    path: &carrick_test_support::GuestUserBuffer,
+) -> u64 {
+    use carrick_abi::{LINUX_AT_FDCWD, LINUX_O_CREAT, LINUX_O_RDWR};
+    let (_, fd) = call(
+        who,
+        carrick_personality_linux::crossing::nr::OPENAT.raw(),
+        [
+            LINUX_AT_FDCWD,
+            path.arg(),
+            LINUX_O_RDWR | LINUX_O_CREAT,
+            0o640,
+            0,
+            0,
+        ],
+    );
+    assert!(fd >= 0, "{who:?} open: {fd}");
+    fd as u64
+}
+
+/// #2452 review P0-1: a woken F_SETLKW takes the lock its call asked for
+/// when it parked. fcntl(2) copies `struct flock` in once; B's and C's
+/// requests sit in one shared structure that is rewritten to F_UNLCK while
+/// both wait (another thread could do that). Red on a0bd7837d: each rerun
+/// re-read the structure, so B's "rerun" unlocked nothing and returned 0
+/// holding no lock, and C returned at once instead of parking behind B.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_arm_woken_lock_waiters_take_the_request_they_parked_with() {
+    use carrick_abi::{
+        LINUX_F_GETLK, LINUX_F_SETLK, LINUX_F_SETLKW, LINUX_F_UNLCK, LINUX_F_WRLCK, LinuxFlock64,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute::{self, Suspended};
+    use carrick_test_support::GuestUserBuffer;
+
+    let (steps, _) = with_arm_process_host_dispatch(|call| {
+        let [a, b, c] = arm_three_lock_processes(call);
+        let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-2452-parked-request-lock\0");
+        let (fa, fb, fc) = (
+            arm_open_lock_file(call, a, &path),
+            arm_open_lock_file(call, b, &path),
+            arm_open_lock_file(call, c, &path),
+        );
+        let lock = |l_type: i32| {
+            GuestUserBuffer::from_value(LinuxFlock64 {
+                l_type: l_type as i16,
+                ..Default::default()
+            })
+        };
+        let (write, unlock) = (lock(LINUX_F_WRLCK), lock(LINUX_F_UNLCK));
+        let mut shared = lock(LINUX_F_WRLCK);
+        let shared_arg = shared.arg();
+        let fcntl = sys::FCNTL.raw();
+        let mut steps: Vec<(&'static str, bool, i64)> = Vec::new();
+        let mut step = |what, got: (CompletionRoute, i64)| {
+            let parked = got.0 == Suspended;
+            steps.push((what, parked, if parked { 0 } else { got.1 }));
+        };
+        // A's F_GETLK: the holder's type and whether its l_pid is `pid`.
+        let holder = |call: &mut dyn FnMut(ArmCaller, u64, [u64; 6]) -> (CompletionRoute, i64),
+                      pid: ArmCaller| {
+            let query = lock(LINUX_F_WRLCK);
+            call(a, fcntl, [fa, LINUX_F_GETLK, query.arg(), 0, 0, 0]);
+            let got = query.values::<LinuxFlock64>()[0];
+            let ArmCaller::Child(pid) = pid else {
+                unreachable!()
+            };
+            i64::from(got.l_type) * 10 + i64::from(got.l_pid == pid as i32)
+        };
+        step(
+            "A F_SETLK",
+            call(a, fcntl, [fa, LINUX_F_SETLK, write.arg(), 0, 0, 0]),
+        );
+        call(b, ARM_LEAVE_ON_PARK, [0; 6]);
+        step(
+            "B F_SETLKW parks",
+            call(b, fcntl, [fb, LINUX_F_SETLKW, shared_arg, 0, 0, 0]),
+        );
+        call(c, ARM_LEAVE_ON_PARK, [0; 6]);
+        step(
+            "C F_SETLKW parks",
+            call(c, fcntl, [fc, LINUX_F_SETLKW, shared_arg, 0, 0, 0]),
+        );
+        // Another thread rewrites the waiters' structure.
+        shared.as_mut_bytes()[..2].copy_from_slice(&(LINUX_F_UNLCK as i16).to_ne_bytes());
+        step(
+            "A unlock",
+            call(a, fcntl, [fa, LINUX_F_SETLK, unlock.arg(), 0, 0, 0]),
+        );
+        let woken = call(b, ARM_RESUME, [0; 6]);
+        step("B woken", (woken.0, 0));
+        step(
+            "B rerun takes the write lock",
+            call(b, fcntl, [fb, LINUX_F_SETLKW, shared_arg, 0, 0, 0]),
+        );
+        let held = holder(call, b);
+        step(
+            "B holds a write lock (type*10 + pid is B)",
+            (CompletionRoute::Served, held),
+        );
+        let woken = call(c, ARM_RESUME, [0; 6]);
+        step("C woken", (woken.0, 0));
+        call(c, ARM_LEAVE_ON_PARK, [0; 6]);
+        step(
+            "C rerun parks behind B",
+            call(c, fcntl, [fc, LINUX_F_SETLKW, shared_arg, 0, 0, 0]),
+        );
+        step(
+            "B unlock",
+            call(b, fcntl, [fb, LINUX_F_SETLK, unlock.arg(), 0, 0, 0]),
+        );
+        let woken = call(c, ARM_RESUME, [0; 6]);
+        step("C woken again", (woken.0, 0));
+        step(
+            "C rerun takes the write lock",
+            call(c, fcntl, [fc, LINUX_F_SETLKW, shared_arg, 0, 0, 0]),
+        );
+        let held = holder(call, c);
+        step(
+            "C holds a write lock (type*10 + pid is C)",
+            (CompletionRoute::Served, held),
+        );
+        steps
+    });
+    let wrlck = i64::from(carrick_abi::LINUX_F_WRLCK as i16) * 10 + 1;
+    assert_eq!(
+        steps,
+        [
+            ("A F_SETLK", false, 0),
+            ("B F_SETLKW parks", true, 0),
+            ("C F_SETLKW parks", true, 0),
+            ("A unlock", false, 0),
+            ("B woken", false, 0),
+            ("B rerun takes the write lock", false, 0),
+            ("B holds a write lock (type*10 + pid is B)", false, wrlck),
+            ("C woken", false, 0),
+            ("C rerun parks behind B", true, 0),
+            ("B unlock", false, 0),
+            ("C woken again", false, 0),
+            ("C rerun takes the write lock", false, 0),
+            ("C holds a write lock (type*10 + pid is C)", false, wrlck),
+        ],
+    );
+}
+
+/// #2452 review P0-2: a lock waiter is routed by the operation it
+/// retained, before any look at its descriptor. While B waits, a thread
+/// sharing B's table dup2s a pipe over the waited-on descriptor. Linux
+/// (native oracle, Linux 6.12): the blocked call goes on with its open file
+/// description; once the lock is free a POSIX F_SETLKW returns EBADF and
+/// holds nothing (the number no longer names the file), while a blocking
+/// flock returns 0 and its lock ends with the description's last
+/// reference, the call's own. Red on a0bd7837d: the rerun was routed by
+/// the pipe now at the number, away from the lock owner, stranding the
+/// retained operation and the description it pinned.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_arm_lock_waiter_goes_on_with_its_description_after_a_sibling_replaces_its_fd() {
+    use carrick_abi::{
+        LINUX_F_SETLK, LINUX_F_SETLKW, LINUX_F_UNLCK, LINUX_F_WRLCK, LINUX_LOCK_EX, LINUX_LOCK_NB,
+        LINUX_LOCK_UN, LinuxFlock64,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute::{self, Suspended};
+    use carrick_test_support::GuestUserBuffer;
+
+    let (steps, _) = with_arm_process_host_dispatch(|call| {
+        let [a, b, c] = arm_three_lock_processes(call);
+        let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-2452-replaced-waiter-lock\0");
+        let (fa, fb, fc) = (
+            arm_open_lock_file(call, a, &path),
+            arm_open_lock_file(call, b, &path),
+            arm_open_lock_file(call, c, &path),
+        );
+        let pipe = GuestUserBuffer::zeroed(8);
+        let (_, made) = call(b, sys::PIPE2.raw(), [pipe.arg(), 0, 0, 0, 0, 0]);
+        assert_eq!(made, 0, "B pipe2");
+        let reader = u64::from(pipe.values::<u32>()[0]);
+        let lock = |l_type: i32| {
+            GuestUserBuffer::from_value(LinuxFlock64 {
+                l_type: l_type as i16,
+                ..Default::default()
+            })
+        };
+        let (write, unlock) = (lock(LINUX_F_WRLCK), lock(LINUX_F_UNLCK));
+        let (fcntl, flock) = (sys::FCNTL.raw(), sys::FLOCK.raw());
+        let mut steps: Vec<(&'static str, bool, i64)> = Vec::new();
+        let mut step = |what, got: (CompletionRoute, i64)| {
+            let parked = got.0 == Suspended;
+            steps.push((what, parked, if parked { 0 } else { got.1 }));
+        };
+        step(
+            "A F_SETLK",
+            call(a, fcntl, [fa, LINUX_F_SETLK, write.arg(), 0, 0, 0]),
+        );
+        call(b, ARM_LEAVE_ON_PARK, [0; 6]);
+        step(
+            "B F_SETLKW parks",
+            call(b, fcntl, [fb, LINUX_F_SETLKW, write.arg(), 0, 0, 0]),
+        );
+        step(
+            "B's sibling dup2s a pipe over the fd",
+            call(b, ARM_SIBLING_DUP2, [reader, fb, 0, 0, 0, 0]),
+        );
+        step(
+            "A unlock",
+            call(a, fcntl, [fa, LINUX_F_SETLK, unlock.arg(), 0, 0, 0]),
+        );
+        let woken = call(b, ARM_RESUME, [0; 6]);
+        step("B woken", (woken.0, 0));
+        step(
+            "B rerun: EBADF",
+            call(b, fcntl, [fb, LINUX_F_SETLKW, write.arg(), 0, 0, 0]),
+        );
+        step(
+            "C F_SETLK: B holds nothing",
+            call(c, fcntl, [fc, LINUX_F_SETLK, write.arg(), 0, 0, 0]),
+        );
+        step(
+            "C unlock",
+            call(c, fcntl, [fc, LINUX_F_SETLK, unlock.arg(), 0, 0, 0]),
+        );
+
+        // flock(2): the lock belongs to the description, which the call
+        // still holds.
+        let fb2 = arm_open_lock_file(call, b, &path);
+        step(
+            "A flock LOCK_EX",
+            call(a, flock, [fa, LINUX_LOCK_EX, 0, 0, 0, 0]),
+        );
+        call(b, ARM_LEAVE_ON_PARK, [0; 6]);
+        step(
+            "B flock LOCK_EX parks",
+            call(b, flock, [fb2, LINUX_LOCK_EX, 0, 0, 0, 0]),
+        );
+        step(
+            "B's sibling dup2s a pipe over the flock fd",
+            call(b, ARM_SIBLING_DUP2, [reader, fb2, 0, 0, 0, 0]),
+        );
+        step(
+            "A flock LOCK_UN",
+            call(a, flock, [fa, LINUX_LOCK_UN, 0, 0, 0, 0]),
+        );
+        let woken = call(b, ARM_RESUME, [0; 6]);
+        step("B woken by LOCK_UN", (woken.0, 0));
+        step(
+            "B flock rerun takes it",
+            call(b, flock, [fb2, LINUX_LOCK_EX, 0, 0, 0, 0]),
+        );
+        step(
+            "C flock LOCK_EX|LOCK_NB: B's ended with its description",
+            call(c, flock, [fc, LINUX_LOCK_EX | LINUX_LOCK_NB, 0, 0, 0, 0]),
+        );
+        steps
+    });
+    let ebadf = carrick_syscall_abi::LINUX_EBADF.guest_retval();
+    assert_eq!(
+        steps,
+        [
+            ("A F_SETLK", false, 0),
+            ("B F_SETLKW parks", true, 0),
+            ("B's sibling dup2s a pipe over the fd", false, 0),
+            ("A unlock", false, 0),
+            ("B woken", false, 0),
+            ("B rerun: EBADF", false, ebadf),
+            ("C F_SETLK: B holds nothing", false, 0),
+            ("C unlock", false, 0),
+            ("A flock LOCK_EX", false, 0),
+            ("B flock LOCK_EX parks", true, 0),
+            ("B's sibling dup2s a pipe over the flock fd", false, 0),
+            ("A flock LOCK_UN", false, 0),
+            ("B woken by LOCK_UN", false, 0),
+            ("B flock rerun takes it", false, 0),
+            (
+                "C flock LOCK_EX|LOCK_NB: B's ended with its description",
+                false,
+                0
+            ),
+        ],
+    );
+}
+
+/// #2452 review P0-3: close(2) releases the table's record locks of the
+/// file it actually retired. B holds a write lock on Y (through `m`) and
+/// closes `n`, a descriptor of X; between B's entry and the retirement a
+/// thread sharing B's table dup2s `m` over `n` (the test hold). The close
+/// then retires a descriptor of Y, so Y's lock ends (fcntl(2)) while Y
+/// stays open at `m`. Red on a0bd7837d: the close sampled `n` as X in a
+/// separate table acquisition and released X's locks; Y's lock survived.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_arm_close_releases_record_locks_of_the_file_it_retired() {
+    use carrick_abi::{LINUX_F_SETLK, LINUX_F_WRLCK, LinuxFlock64};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (results, _) = with_arm_process_host_dispatch(|call| {
+        let [_, b, c] = arm_three_lock_processes(call);
+        let x = GuestUserBuffer::from_bytes(b"/tmp/carrick-2452-close-race-x\0");
+        let y = GuestUserBuffer::from_bytes(b"/tmp/carrick-2452-close-race-y\0");
+        // `n` duplicates `x_kept`: the replaced descriptor is not the last
+        // of its description.
+        let x_kept = arm_open_lock_file(call, b, &x);
+        let n = call(b, sys::DUP.raw(), [x_kept, 0, 0, 0, 0, 0]).1;
+        assert!(n >= 0, "B dup: {n}");
+        let n = n as u64;
+        let m = arm_open_lock_file(call, b, &y);
+        let y_c = arm_open_lock_file(call, c, &y);
+        let write = GuestUserBuffer::from_value(LinuxFlock64 {
+            l_type: LINUX_F_WRLCK as i16,
+            ..Default::default()
+        });
+        let fcntl = sys::FCNTL.raw();
+        let mut results = Vec::new();
+        results.push((
+            "B F_SETLK on Y",
+            call(b, fcntl, [m, LINUX_F_SETLK, write.arg(), 0, 0, 0]).1,
+        ));
+        crate::dispatch::close_retire_hold::set(move |region, table, fd| {
+            assert_eq!(fd.0 as u64, n, "the hold runs in B's close of n");
+            // The sibling's dup2(m, n): X's description keeps `x_kept`,
+            // and B's table holds no lock on X, so it owes nothing.
+            let retired = region
+                .fd(carrick_sched_core::ShortLockSpin)
+                .dup2_filtered(
+                    table,
+                    carrick_el1_abi::ipc::fd::Fd(m as i32),
+                    fd,
+                    crate::ipc::is_zone_releasable_backing,
+                )
+                .unwrap();
+            assert_eq!(retired, carrick_el1_abi::ipc::fd::DeferredRelease::None);
+        });
+        results.push((
+            "B close(n)",
+            call(b, sys::CLOSE.raw(), [n, 0, 0, 0, 0, 0]).1,
+        ));
+        results.push((
+            "C F_SETLK on Y after B closed a Y descriptor",
+            call(c, fcntl, [y_c, LINUX_F_SETLK, write.arg(), 0, 0, 0]).1,
+        ));
+        results
+    });
+    assert_eq!(
+        results,
+        [
+            ("B F_SETLK on Y", 0),
+            ("B close(n)", 0),
+            ("C F_SETLK on Y after B closed a Y descriptor", 0),
+        ]
+    );
+}
+
+/// #2452 review P0-3, dup2(2): only a descriptor the commit actually
+/// displaced ends its file's record locks. B dup3s `m` (Y) over `n` (X);
+/// after B's numeric claim on `n`, a thread sharing B's table closes `n`
+/// and then takes a write lock on X through `k` (the test hold). The claim
+/// lets that close through, so B's commit displaces nothing and the
+/// sibling's lock, taken after its own close, stands. Red on a0bd7837d:
+/// the dup sampled `n` as X before the commit and released X's locks.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_arm_dup_releases_record_locks_only_of_a_displaced_file() {
+    use carrick_abi::{LINUX_F_SETLK, LINUX_F_WRLCK, LinuxFlock64};
+    use carrick_el1_abi::ipc::fd::record_lock::{
+        Lock, LockClass, LockKind, LockOwner, LockPid, LockRange,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (results, _) = with_arm_process_host_dispatch(|call| {
+        let [_, b, c] = arm_three_lock_processes(call);
+        let ArmCaller::Child(b_pid) = b else {
+            unreachable!()
+        };
+        let x = GuestUserBuffer::from_bytes(b"/tmp/carrick-2452-dup-race-x\0");
+        let y = GuestUserBuffer::from_bytes(b"/tmp/carrick-2452-dup-race-y\0");
+        let k = arm_open_lock_file(call, b, &x);
+        // `n` duplicates `k`: the sibling's close of `n` is not the last of
+        // its description.
+        let n = call(b, sys::DUP.raw(), [k, 0, 0, 0, 0, 0]).1;
+        assert!(n >= 0, "B dup: {n}");
+        let n = n as u64;
+        let m = arm_open_lock_file(call, b, &y);
+        let x_c = arm_open_lock_file(call, c, &x);
+        crate::dispatch::close_retire_hold::set(move |region, table, fd| {
+            assert_eq!(fd.0 as u64, n, "the hold runs in B's dup3 onto n");
+            let authority = region.fd(carrick_sched_core::ShortLockSpin);
+            // The sibling's close(n): X stays open at `k`, and B's table
+            // holds no lock on X yet, so the close owes nothing.
+            let retired = authority
+                .close_filtered(table, fd, crate::ipc::is_zone_releasable_backing)
+                .unwrap();
+            assert_eq!(retired, carrick_el1_abi::ipc::fd::DeferredRelease::None);
+            // Then its F_SETLK F_WRLCK on X through `k`.
+            let file = authority
+                .file_identity(table, carrick_el1_abi::ipc::fd::Fd(k as i32))
+                .unwrap()
+                .expect("X is a stamped file");
+            let locks = region
+                .file_locks(&carrick_sched_core::ShortLockSpin)
+                .unwrap();
+            let taken = locks.table().set(
+                Lock {
+                    file,
+                    owner: LockOwner::table(table),
+                    class: LockClass::Record,
+                    kind: LockKind::Write,
+                    range: LockRange::WHOLE_FILE,
+                    pid: LockPid::new(b_pid),
+                },
+                &authority,
+            );
+            assert_eq!(taken.taken, Ok(()));
+        });
+        let mut results = Vec::new();
+        results.push((
+            "B dup3(m, n)",
+            call(b, sys::DUP3.raw(), [m, n, 0, 0, 0, 0]).1 - n as i64,
+        ));
+        let write = GuestUserBuffer::from_value(LinuxFlock64 {
+            l_type: LINUX_F_WRLCK as i16,
+            ..Default::default()
+        });
+        results.push((
+            "C F_SETLK on X against the sibling's lock",
+            call(
+                c,
+                sys::FCNTL.raw(),
+                [x_c, LINUX_F_SETLK, write.arg(), 0, 0, 0],
+            )
+            .1,
+        ));
+        results
+    });
+    assert_eq!(
+        results,
+        [
+            ("B dup3(m, n)", 0),
+            (
+                "C F_SETLK on X against the sibling's lock",
+                carrick_syscall_abi::LINUX_EAGAIN.guest_retval()
+            ),
+        ]
     );
 }
 

@@ -66,7 +66,34 @@
  *      child's exit_group (a worker still running) released L9
  *   M8 wait4(child): exit code                        0
  *   M9 F_GETLK l_type                                 2: the parent's own
- *      lock never conflicts with itself */
+ *      lock never conflicts with itself
+ *
+ * -DEXEC (with SUCCESSOR_PATH, this fixture's own path): exec's
+ * close-on-exec sweep and advisory locks (fcntl(2), flock(2), execve(2)).
+ * Parent E1 open (fd a), E2 pipe2(ready), (go), fork. Child:
+ *   X1 openat(LOCK_PATH, O_RDWR)                      fd c, kept by exec
+ *   X2 F_SETLK F_WRLCK [0, 10) on c                   0
+ *   X3 openat(LOCK_PATH, O_RDWR|O_CLOEXEC)            fd e, another
+ *      descriptor of the file, closed by exec
+ *   X4 openat (fd f), flock(f, LOCK_EX)               0, kept by exec
+ *   X5 openat (fd g), F_OFD_SETLK F_WRLCK [100, 110)  0, kept by exec
+ *   X6 dup2(ready[1], 20), dup2(go[0], 21)            0
+ *   then write(ready), read(go), execve(SUCCESSOR_PATH, {path, "s"}): the
+ *   successor (argc 2) writes fd 20, reads fd 21 and exits 0.
+ * Parent after fork:
+ *   E3 read(ready)
+ *   E4 F_GETLK F_WRLCK [0, 10) l_type                 1: the child's lock
+ *   E5 l_pid == the child                             1
+ *   E6 write(go)       E7 read(ready): the successor runs
+ *   E8 F_GETLK F_WRLCK [0, 10) l_type                 2: exec closed e, a
+ *      descriptor of the file, so the process's record lock ended
+ *   E9 openat (fd h), flock(h, LOCK_EX|LOCK_NB)       EWOULDBLOCK: f's
+ *      description, kept across exec, still holds its flock
+ *  E10 F_OFD_GETLK F_WRLCK [100, 110) l_type          1: g's OFD lock too
+ *  E11 write(go)       E12 wait4(child): exit code    0
+ *  E13 flock(h, LOCK_EX|LOCK_NB)                      0: the successor's
+ *      exit closed f
+ *  E14 F_OFD_GETLK F_WRLCK [100, 110) l_type          2 */
 .global _start
 .text
 
@@ -88,6 +115,29 @@
     syscall
 .endm
 
+/* fcntl(%r12, cmd, &flk) with flk = {type, SEEK_SET, start, len}. */
+.macro range_lock cmd, type, start, len
+    movw $\type, flk(%rip)
+    movw $0, flk+2(%rip)
+    movq $\start, flk+8(%rip)
+    movq $\len, flk+16(%rip)
+    movl $0, flk+24(%rip)
+    mov %r12, %rdi
+    mov $\cmd, %esi
+    lea flk(%rip), %rdx
+    mov $72, %eax
+    syscall
+.endm
+
+/* The l_type a range query reported, or 0x80 | errno. */
+.macro range_type cmd, start, len
+    range_lock \cmd, 1, \start, \len
+    test %rax, %rax
+    js 1f
+    movzwl flk(%rip), %eax
+1:  call value_byte
+.endm
+
 /* The l_type a F_GETLK reported, or 0x80 | errno. */
 .macro getlk_type
     record_lock 5, 1
@@ -97,7 +147,7 @@
 1:  call value_byte
 .endm
 
-#if !defined(LIFECYCLE) && !defined(POOL)
+#if !defined(LIFECYCLE) && !defined(POOL) && !defined(EXEC)
 _start:
     lea out(%rip), %r15
 
@@ -265,7 +315,7 @@ child:
     xor %edi, %edi
     jmp exit
 
-#endif /* !LIFECYCLE && !POOL */
+#endif /* !LIFECYCLE && !POOL && !EXEC */
 
 #ifdef POOL
 #define WAITERS 6
@@ -566,6 +616,173 @@ spin_worker:
     syscall
     jmp spin_worker
 #endif /* LIFECYCLE */
+
+#ifdef EXEC
+_start:
+    cmpq $2, (%rsp)                 /* argc 2: the exec successor */
+    je successor
+    lea out(%rip), %r15
+
+    mov $-100, %edi                 /* E1: openat(lock, O_RDWR|O_CREAT, 0640) */
+    lea lock(%rip), %rsi
+    mov $0x42, %edx
+    mov $0640, %r10d
+    mov $257, %eax
+    syscall
+    mov %rax, %r12
+    record_status
+
+    lea ready(%rip), %rdi           /* E2: pipe2(ready), pipe2(go) */
+    xor %esi, %esi
+    mov $293, %eax
+    syscall
+    test %rax, %rax
+    js 1f
+    lea go(%rip), %rdi
+    xor %esi, %esi
+    mov $293, %eax
+    syscall
+1:  record_status
+
+    mov $57, %eax                   /* fork */
+    syscall
+    test %rax, %rax
+    js fork_failed
+    jz echild
+    mov %rax, %rbx
+
+    movl ready(%rip), %edi          /* E3: read(ready) */
+    call read_byte
+    record_status
+
+    range_type 5, 0, 10             /* E4: F_GETLK [0, 10) l_type */
+
+    movslq flk+24(%rip), %rax       /* E5: l_pid == the child */
+    cmp %rax, %rbx
+    sete %al
+    movzbl %al, %eax
+    call value_byte
+
+    movl go+4(%rip), %edi           /* E6: write(go) */
+    call write_byte
+    record_status
+
+    movl ready(%rip), %edi          /* E7: read(ready), from the successor */
+    call read_byte
+    record_status
+
+    range_type 5, 0, 10             /* E8: F_GETLK [0, 10) l_type */
+
+    call open_lock                  /* E9: fd h, flock(h, LOCK_EX|LOCK_NB) */
+    mov %rax, %r14
+    mov %r14, %rdi
+    mov $6, %esi
+    mov $73, %eax
+    syscall
+    record_status
+
+    range_type 36, 100, 10          /* E10: F_OFD_GETLK [100, 110) l_type */
+
+    movl go+4(%rip), %edi           /* E11: write(go) */
+    call write_byte
+    record_status
+
+    mov %rbx, %rdi                  /* E12: wait4(child, &status, 0, NULL) */
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    cmp %rbx, %rax
+    jne fork_failed
+    mov status(%rip), %eax
+    shr $8, %eax
+    and $0xff, %eax
+    call value_byte
+
+    mov %r14, %rdi                  /* E13: flock(h, LOCK_EX|LOCK_NB) */
+    mov $6, %esi
+    mov $73, %eax
+    syscall
+    record_status
+
+    range_type 36, 100, 10          /* E14: F_OFD_GETLK [100, 110) l_type */
+
+    call report
+    xor %edi, %edi
+    jmp exit
+
+echild:
+    call open_lock                  /* X1: fd c */
+    mov %rax, %r12
+    record_status
+
+    range_lock 6, 1, 0, 10          /* X2: F_SETLK F_WRLCK [0, 10) */
+    record_status
+
+    mov $-100, %edi                 /* X3: openat(lock, O_RDWR|O_CLOEXEC) */
+    lea lock(%rip), %rsi
+    mov $0x80002, %edx
+    xor %r10d, %r10d
+    mov $257, %eax
+    syscall
+    record_status
+
+    call open_lock                  /* X4: fd f, flock(f, LOCK_EX) */
+    mov %rax, %rdi
+    mov $2, %esi
+    mov $73, %eax
+    syscall
+    record_status
+
+    call open_lock                  /* X5: fd g, F_OFD_SETLK [100, 110) */
+    mov %rax, %r12
+    range_lock 37, 1, 100, 10
+    record_status
+
+    movl ready+4(%rip), %edi        /* X6: dup2(ready[1], 20), (go[0], 21) */
+    mov $20, %esi
+    mov $33, %eax
+    syscall
+    test %rax, %rax
+    js 1f
+    movl go(%rip), %edi
+    mov $21, %esi
+    mov $33, %eax
+    syscall
+1:  record_status
+
+    call report
+    mov $20, %edi                   /* the parent probes, then lets go */
+    call write_byte
+    mov $21, %edi
+    call read_byte
+
+    lea successor_path(%rip), %rdi  /* execve(SUCCESSOR_PATH, {path, "s"}) */
+    lea successor_argv(%rip), %rsi
+    lea successor_envp(%rip), %rdx
+    mov $59, %eax
+    syscall
+    neg %eax                        /* exec returned: its errno is the exit */
+    mov %eax, %edi
+    jmp exit
+
+successor:
+    mov $20, %edi                   /* write(20): exec is done */
+    call write_byte
+    mov $21, %edi                   /* read(21): the parent has probed */
+    call read_byte
+    xor %edi, %edi
+    jmp exit
+
+.section .rodata
+successor_path: .asciz SUCCESSOR_PATH
+successor_arg: .asciz "s"
+.balign 8
+successor_argv: .quad successor_path, successor_arg, 0
+successor_envp: .quad 0
+.text
+#endif /* EXEC */
 
 fork_failed:
     mov $90, %edi
