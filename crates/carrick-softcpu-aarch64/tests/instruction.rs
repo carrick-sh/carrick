@@ -48,3 +48,28 @@ fn arithmetic_reserved_fields_fail_shut() {
         );
     }
 }
+
+#[test]
+fn branch_forms_are_typed() {
+    for word in [
+        0x14000000, 0x97ffffff, 0x54ffffe0, 0x3400003f, 0xb5ffffe0, 0x36000020, 0xb7ffffe0,
+        0xd61f03e0, 0xd63f0020, 0xd65f03c0,
+    ] {
+        assert_ne!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
+
+#[test]
+fn branch_fixed_fields_fail_shut() {
+    for word in [0x54000010, 0xd61f0001, 0xd63f0400, 0xd65f0800] {
+        assert_eq!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
