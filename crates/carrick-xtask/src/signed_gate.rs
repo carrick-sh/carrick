@@ -911,11 +911,21 @@ pub fn validate_side_receipt(
 }
 
 fn logged(command: &mut Command, lease: &HostLease, log: &Path) -> Result<bool, ReceiptError> {
+    logged_optional(command, Some(lease), log)
+}
+
+fn logged_optional(
+    command: &mut Command,
+    lease: Option<&HostLease>,
+    log: &Path,
+) -> Result<bool, ReceiptError> {
     let stdout = fs::File::create(log).map_err(|e| fail(e.to_string()))?;
     let stderr = stdout.try_clone().map_err(|e| fail(e.to_string()))?;
-    lease
-        .configure_command(command)
-        .map_err(|e| fail(e.to_string()))?;
+    if let Some(lease) = lease {
+        lease
+            .configure_command(command)
+            .map_err(|e| fail(e.to_string()))?;
+    }
     let status = command
         .stdin(Stdio::null())
         .stdout(stdout)
@@ -1278,6 +1288,24 @@ pub struct PairedRun {
     pub receipt_name: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidePhase {
+    Build,
+    Accept,
+    Inspect,
+}
+
+fn side_phases<L>(
+    mut acquire: impl FnMut(HostLeaseMode) -> Result<L, ReceiptError>,
+    mut run: impl FnMut(SidePhase, Option<&L>) -> Result<(), ReceiptError>,
+) -> Result<(), ReceiptError> {
+    let lease = acquire(HostLeaseMode::Gate)?;
+    for phase in [SidePhase::Build, SidePhase::Accept, SidePhase::Inspect] {
+        run(phase, Some(&lease))?;
+    }
+    Ok(())
+}
+
 /// Run the merge base (unless this is a main baseline) and then the candidate
 /// on this Mac, under one exclusive host lease and with the merge base's
 /// trusted fixture bundle. Publication compares the candidate only with this paired
@@ -1304,17 +1332,6 @@ fn execute(
         .map(fs::canonicalize)
         .transpose()
         .map_err(|e| fail(e.to_string()))?;
-    let lease = (|| {
-        crate::host_load::check().map_err(|e| fail(e.to_string()))?;
-        HostLease::acquire(HostLeaseMode::Gate).map_err(|e| fail(e.to_string()))
-    })();
-    let lease = match lease {
-        Ok(lease) => lease,
-        Err(error) => {
-            write(&output.join("execution-error.txt"), error.to_string())?;
-            return Err(error);
-        }
-    };
     let host_identity = crate::accept::SignedHostIdentity::capture();
     let reuse_ctx = reuse_base.map(|reuse_dir| ReuseExecutionContext {
         root,
@@ -1325,7 +1342,6 @@ fn execute(
     execute_pair(&request, &output, reuse_ctx.as_ref(), |run| {
         execute_one(
             root,
-            &lease,
             run,
             FixtureSources {
                 bundle: &bundle,
@@ -1546,7 +1562,6 @@ struct FixtureSources<'a> {
 /// worktree. The caller holds the exclusive gate lease for the whole pair.
 fn execute_one(
     root: &Path,
-    lease: &HostLease,
     run: &PairedRun,
     fixtures: FixtureSources<'_>,
 ) -> Result<(), ReceiptError> {
@@ -1596,112 +1611,131 @@ fn execute_one(
     // repository's physical path for exact artifact-path comparisons.
     let tree = fs::canonicalize(&tree).map_err(|e| fail(e.to_string()))?;
     let receipt_path = output.join(receipt_name);
-    let result = (|| {
-        let xtask = std::env::current_exe().map_err(|e| fail(e.to_string()))?;
-        let mut fetch = Command::new(&xtask);
-        fetch
-            .current_dir(&tree)
-            .args(["--root", &tree.to_string_lossy(), "fixtures", "fetch"]);
-        if !logged(&mut fetch, lease, &output.join("fixture-fetch.log"))? {
-            return Err(fail("fixture dependency fetch failed"));
-        }
-        verify_fixture_artifact(&tree, bundle, candidate_probes, commit, publisher)?;
-        let mut restore = Command::new(&xtask);
-        restore.current_dir(&tree).args([
-            "--root",
-            &tree.to_string_lossy(),
-            "fixtures",
-            "restore",
-            "--bundle",
-            &bundle.to_string_lossy(),
-        ]);
-        if let Some(set) = candidate_probes {
-            restore.arg("--candidate-probes").arg(set);
-        }
-        if !logged(&mut restore, lease, &output.join("fixture-restore.log"))? {
-            return Err(fail(
-                "fixture restore failed for the authorized exact-SHA artifact",
-            ));
-        }
-        let mut build = Command::new("just");
-        build.current_dir(&tree).arg("build");
-        if !logged(&mut build, lease, &output.join("build.log"))? {
-            return Err(fail("just build failed"));
-        }
-        let mut accept = crate::command::locked_cargo();
-        accept.current_dir(&tree).args([
-            "run",
-            "--locked",
-            "-p",
-            "carrick-xtask",
-            "--",
-            "accept",
-            "--profile",
-            "no-docker",
-            "--phase",
-            "signed",
-            "--receipt",
-            &receipt_path.to_string_lossy(),
-        ]);
-        let accepted = logged(&mut accept, lease, &output.join("accept.log"))?;
-        write(
-            &output.join(ACCEPT_EXIT),
-            json!({"success": accepted}).to_string(),
-        )?;
-        // accept rebuilds once under the same lease before testing. Its receipt
-        // names that artifact; inspect it independently before releasing the lease.
-        let mut receipt = load(&receipt_path)?;
-        // Capture on the execution Mac, including when the commit predates
-        // host-aware accept receipts. Never infer identity on the hosted publisher.
-        receipt.host_identity = crate::accept::SignedHostIdentity::capture();
-        // Both runs of a pair restore the base's trusted bundle. Record its
-        // identity with this trusted executor's validation, so a base commit
-        // whose accept predates content identity remains comparable.
-        let trusted = crate::accept::verify_signed_fixtures(&tree)
-            .map_err(|e| fail(format!("trusted fixture validation: {e}")))?;
-        if let Some(recorded) = &receipt.fixture_validation
-            && recorded.inputs_sha256 != trusted.inputs_sha256
-        {
-            return Err(fail(
-                "accept recorded fixture inputs that differ from the restored bundle",
-            ));
-        }
-        receipt.fixture_validation = Some(trusted);
-        write(
-            &receipt_path,
-            serde_json::to_vec_pretty(&receipt).map_err(|e| fail(e.to_string()))?,
-        )?;
-        // Older accept receipts encode an unknown reap as remaining_count=0
-        // plus human diagnostics. Prove cleanup again without parsing those
-        // diagnostics or allowing them to disappear behind known test failures.
-        for (index, count) in receipt.cleanup_counts.iter().enumerate() {
-            let log = output.join(format!("cleanup-{index}.log"));
-            let mut reap = Command::new(tree.join("scripts/sudo/kill.sh"));
-            reap.current_dir(&tree).arg(&count.run_id);
-            if !logged(&mut reap, lease, &log)?
-                || parse_cleanup_count(&fs::read_to_string(&log).map_err(|e| fail(e.to_string()))?)
-                    != Some(0)
-            {
-                return Err(fail(format!(
-                    "independent scoped cleanup failed for {}",
-                    count.step
-                )));
+    let result = side_phases(
+        |mode| {
+            crate::host_load::check().map_err(|e| fail(e.to_string()))?;
+            HostLease::acquire(mode).map_err(|e| fail(e.to_string()))
+        },
+        |phase, lease| {
+            let xtask = std::env::current_exe().map_err(|e| fail(e.to_string()))?;
+            if phase == SidePhase::Build {
+                let lease = lease.ok_or_else(|| fail("build requires carrick lease"))?;
+                let mut fetch = Command::new(&xtask);
+                fetch.current_dir(&tree).args([
+                    "--root",
+                    &tree.to_string_lossy(),
+                    "fixtures",
+                    "fetch",
+                ]);
+                if !logged(&mut fetch, lease, &output.join("fixture-fetch.log"))? {
+                    return Err(fail("fixture dependency fetch failed"));
+                }
+                verify_fixture_artifact(&tree, bundle, candidate_probes, commit, publisher)?;
+                let mut restore = Command::new(&xtask);
+                restore.current_dir(&tree).args([
+                    "--root",
+                    &tree.to_string_lossy(),
+                    "fixtures",
+                    "restore",
+                    "--bundle",
+                    &bundle.to_string_lossy(),
+                ]);
+                if let Some(set) = candidate_probes {
+                    restore.arg("--candidate-probes").arg(set);
+                }
+                if !logged(&mut restore, lease, &output.join("fixture-restore.log"))? {
+                    return Err(fail(
+                        "fixture restore failed for the authorized exact-SHA artifact",
+                    ));
+                }
+                let mut build = Command::new("just");
+                build.current_dir(&tree).arg("build");
+                if !logged(&mut build, lease, &output.join("build.log"))? {
+                    return Err(fail("just build failed"));
+                }
+                return Ok(());
             }
-        }
-        write(
-            &output.join("cleanup.json"),
-            serde_json::to_vec_pretty(&receipt.cleanup_counts).map_err(|e| fail(e.to_string()))?,
-        )?;
-        let identity = inspect_artifact(&tree).map_err(fail)?;
-        if receipt.artifact.as_ref() != Some(&identity) {
-            return Err(fail("post-gate artifact identity differs from the receipt"));
-        }
-        write(
-            &output.join("identity.json"),
-            serde_json::to_vec_pretty(&identity).map_err(|e| fail(e.to_string()))?,
-        )?;
-        validate_side_receipt(side, &receipt, commit)
-    })();
+            if phase == SidePhase::Accept {
+                let mut accept = crate::command::locked_cargo();
+                accept.current_dir(&tree).args([
+                    "run",
+                    "--locked",
+                    "-p",
+                    "carrick-xtask",
+                    "--",
+                    "accept",
+                    "--profile",
+                    "no-docker",
+                    "--phase",
+                    "signed",
+                    "--receipt",
+                    &receipt_path.to_string_lossy(),
+                ]);
+                let accepted = logged_optional(&mut accept, lease, &output.join("accept.log"))?;
+                write(
+                    &output.join(ACCEPT_EXIT),
+                    json!({"success": accepted}).to_string(),
+                )?;
+                return Ok(());
+            }
+            let lease = lease.ok_or_else(|| fail("inspection requires gate lease"))?;
+            // accept rebuilds once before testing. Its receipt
+            // names that artifact; inspect it independently before releasing the lease.
+            let mut receipt = load(&receipt_path)?;
+            // Capture on the execution Mac, including when the commit predates
+            // host-aware accept receipts. Never infer identity on the hosted publisher.
+            receipt.host_identity = crate::accept::SignedHostIdentity::capture();
+            // Both runs of a pair restore the base's trusted bundle. Record its
+            // identity with this trusted executor's validation, so a base commit
+            // whose accept predates content identity remains comparable.
+            let trusted = crate::accept::verify_signed_fixtures(&tree)
+                .map_err(|e| fail(format!("trusted fixture validation: {e}")))?;
+            if let Some(recorded) = &receipt.fixture_validation
+                && recorded.inputs_sha256 != trusted.inputs_sha256
+            {
+                return Err(fail(
+                    "accept recorded fixture inputs that differ from the restored bundle",
+                ));
+            }
+            receipt.fixture_validation = Some(trusted);
+            write(
+                &receipt_path,
+                serde_json::to_vec_pretty(&receipt).map_err(|e| fail(e.to_string()))?,
+            )?;
+            // Older accept receipts encode an unknown reap as remaining_count=0
+            // plus human diagnostics. Prove cleanup again without parsing those
+            // diagnostics or allowing them to disappear behind known test failures.
+            for (index, count) in receipt.cleanup_counts.iter().enumerate() {
+                let log = output.join(format!("cleanup-{index}.log"));
+                let mut reap = Command::new(tree.join("scripts/sudo/kill.sh"));
+                reap.current_dir(&tree).arg(&count.run_id);
+                if !logged(&mut reap, lease, &log)?
+                    || parse_cleanup_count(
+                        &fs::read_to_string(&log).map_err(|e| fail(e.to_string()))?,
+                    ) != Some(0)
+                {
+                    return Err(fail(format!(
+                        "independent scoped cleanup failed for {}",
+                        count.step
+                    )));
+                }
+            }
+            write(
+                &output.join("cleanup.json"),
+                serde_json::to_vec_pretty(&receipt.cleanup_counts)
+                    .map_err(|e| fail(e.to_string()))?,
+            )?;
+            let identity = inspect_artifact(&tree).map_err(fail)?;
+            if receipt.artifact.as_ref() != Some(&identity) {
+                return Err(fail("post-gate artifact identity differs from the receipt"));
+            }
+            write(
+                &output.join("identity.json"),
+                serde_json::to_vec_pretty(&identity).map_err(|e| fail(e.to_string()))?,
+            )?;
+            validate_side_receipt(side, &receipt, commit)
+        },
+    );
     // Preserve logs even on errors before dropping the detached worktree.
     let logs = tree.join("target/el1-gate");
     let log_copy = if logs.exists() {
@@ -2067,6 +2101,43 @@ pub fn run(root: &Path, args: SignedGateArgs) -> Result<(), ReceiptError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn side_phases_release_build_lease_before_accept_admission() {
+        use std::cell::RefCell;
+        let events = RefCell::new(Vec::new());
+        struct Held<'a>(&'a RefCell<Vec<String>>, HostLeaseMode);
+        impl Drop for Held<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push(format!("release {:?}", self.1));
+            }
+        }
+        side_phases(
+            |mode| {
+                events.borrow_mut().push(format!("acquire {mode:?}"));
+                Ok(Held(&events, mode))
+            },
+            |phase, lease| {
+                events
+                    .borrow_mut()
+                    .push(format!("{phase:?} {:?}", lease.map(|l| l.1)));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *events.borrow(),
+            [
+                "acquire Carrick",
+                "Build Some(Carrick)",
+                "release Carrick",
+                "Accept None",
+                "acquire Gate",
+                "Inspect Some(Gate)",
+                "release Gate",
+            ]
+        );
+    }
+
     use super::*;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
