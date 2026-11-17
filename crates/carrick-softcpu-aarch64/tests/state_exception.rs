@@ -102,3 +102,38 @@ fn hvc_preserves_saved_exception_and_illegal_return_sets_il() {
     assert_eq!(cpu.pstate.el, ExceptionLevel::El1);
     assert_eq!(cpu.pc, ProgramCounter(0x9000));
 }
+
+#[test]
+fn illegal_return_restores_unconditional_fields() {
+    let mut cpu = CpuState::default();
+    cpu.pstate.el = ExceptionLevel::El1;
+    cpu.pstate.sp = StackSelect::El1;
+    cpu.el1.spsr = SavedPstate(0xa040_0148); // NZCV, PAN, DAIF, illegal EL2
+    eret(&mut cpu).unwrap();
+    assert_eq!(cpu.pstate.daif, InterruptMasks(5));
+    assert!(cpu.pstate.pan);
+    assert_eq!(cpu.pstate.nzcv, 10);
+    assert_eq!(cpu.pstate.sp, StackSelect::El1);
+}
+
+fn sys(fields: (u8, u8, u8, u8, u8)) -> carrick_softcpu_aarch64::SystemRegister {
+    let (op0, op1, crn, crm, op2) = fields;
+    carrick_softcpu_aarch64::SystemRegister {
+        op0,
+        op1,
+        crn,
+        crm,
+        op2,
+    }
+}
+#[test]
+fn el0_privileged_register_is_undefined_not_a_system_trap() {
+    let cpu = CpuState::default();
+    let error = cpu
+        .mrs(
+            sys((3, 0, 4, 0, 1)),
+            carrick_softcpu_aarch64::OperandRegister::Zr,
+        )
+        .unwrap_err();
+    assert_eq!(error.syndrome, Syndrome(0x0200_0000));
+}
