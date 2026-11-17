@@ -441,8 +441,16 @@ impl SyscallDispatcher {
         }
         match owner.with_pinned_host_description(table, fd::Fd(header.fd), |resource, flags| {
             let Some(socket) = resource.downcast_ref::<NativeNetFile>() else {
-                // A host file or stdio stream is not a socket.
-                return NetServed::Reply(carrick_abi::LINUX_ENOTSOCK.guest_retval(), Vec::new());
+                // A host file or stdio stream is not a socket. A socket the
+                // run root created and this member inherited has no native
+                // venue yet: a counted ENOSYS, never a fabricated ENOTSOCK
+                // its `fstat` (S_IFSOCK) contradicts.
+                return match crate::dispatch::native_files::native_resource_is_socket(resource) {
+                    Some(false) => {
+                        NetServed::Reply(carrick_abi::LINUX_ENOTSOCK.guest_retval(), Vec::new())
+                    }
+                    Some(true) | None => NetServed::Refused,
+                };
             };
             self.run_native_net_call(
                 owner,
