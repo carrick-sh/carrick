@@ -8,6 +8,280 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+mod closure {
+    //! Remaining baseline leaves, hand-written from Arm ARM DDI0487G.a.
+    use crate::Instruction;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BarrierKind {
+        Dsb,
+        Dmb,
+        Isb,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BarrierDomain {
+        OuterShareable,
+        NonShareable,
+        InnerShareable,
+        FullSystem,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BarrierAccess {
+        Reads,
+        Writes,
+        All,
+    }
+    /// DDI0487G.a C6.2.80 DMB, C6.2.82 DSB, C6.2.97 ISB;
+    /// C4.1.3 encoding index, Barriers. Reserved options deliberately fail shut,
+    /// including the reserved options architecturally executed as full-system.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Barrier {
+        pub kind: BarrierKind,
+        pub domain: BarrierDomain,
+        pub access: BarrierAccess,
+        pub option: crate::ExclusiveOption,
+    }
+    fn barrier(w: u32) -> Option<Instruction> {
+        let kind = match w & 0xfffff0ff {
+            0xd503309f => BarrierKind::Dsb,
+            0xd50330bf => BarrierKind::Dmb,
+            0xd50330df if w == 0xd5033fdf => BarrierKind::Isb,
+            _ => return None,
+        };
+        let option = ((w >> 8) & 15) as u8;
+        let access = match option & 3 {
+            1 => BarrierAccess::Reads,
+            2 => BarrierAccess::Writes,
+            3 => BarrierAccess::All,
+            _ => return None,
+        };
+        let domain = match option >> 2 {
+            0 => BarrierDomain::OuterShareable,
+            1 => BarrierDomain::NonShareable,
+            2 => BarrierDomain::InnerShareable,
+            _ => BarrierDomain::FullSystem,
+        };
+        Some(Instruction::Barrier(Barrier {
+            kind,
+            domain,
+            access,
+            option: crate::ExclusiveOption::from_option(option),
+        }))
+    }
+
+    /// Architectural system-register identity. The original census fields remain
+    /// available through `encoding`; names never discard or alias that identity.
+    /// DDI0487G.a C6.2.194 MRS, C6.2.196 MSR (register), C4.1.3
+    /// System register move; D13 AArch64 System Register Descriptions.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum NamedSystemRegister {
+        /// DDI0487G.a D13.2.135 TTBR0_EL1.
+        Ttbr0El1,
+        /// DDI0487G.a D13.2.138 TTBR1_EL1.
+        Ttbr1El1,
+        /// DDI0487G.a C5.2.11 SP_EL0.
+        SpEl0,
+        /// DDI0487G.a D13.2.130 TPIDR_EL0.
+        TpidrEl0,
+        /// DDI0487G.a D13.2.134 TPIDRRO_EL0.
+        TpidrroEl0,
+        /// DDI0487G.a D13.2.28 CONTEXTIDR_EL1.
+        ContextidrEl1,
+        /// DDI0487G.a C5.2.7 FPCR.
+        Fpcr,
+        /// DDI0487G.a C5.2.8 FPSR.
+        Fpsr,
+        /// DDI0487G.a C5.2.2 DAIF.
+        Daif,
+        /// DDI0487G.a C5.2.10 PAN.
+        Pan,
+        /// DDI0487G.a D13.2.103 PAR_EL1.
+        ParEl1,
+        /// DDI0487G.a D13.8.1 CNTFRQ_EL0.
+        CntfrqEl0,
+        /// DDI0487G.a D13.8.29 CNTVCT_EL0.
+        CntvctEl0,
+        /// DDI0487G.a D13.8.25 CNTV_CTL_EL0.
+        CntvCtlEl0,
+        /// DDI0487G.a D13.8.26 CNTV_CVAL_EL0.
+        CntvCvalEl0,
+        /// DDI0487G.a D13.2.99 MPIDR_EL1.
+        MpidrEl1,
+        /// DDI0487G.a D12.3 Table D12-2, system-register encodings (GIC register space).
+        IccIar1El1,
+        /// DDI0487G.a D12.3 Table D12-2, system-register encodings (GIC register space).
+        IccEoir1El1,
+        /// DDI0487G.a D12.3 Table D12-2, system-register encodings (GIC register space).
+        IccSgi1rEl1,
+        Unnamed(crate::SystemRegister),
+    }
+    impl NamedSystemRegister {
+        pub fn from_encoding(r: crate::SystemRegister) -> Self {
+            match (r.op0, r.op1, r.crn, r.crm, r.op2) {
+                (3, 0, 2, 0, 0) => Self::Ttbr0El1,
+                (3, 0, 2, 0, 1) => Self::Ttbr1El1,
+                (3, 0, 4, 1, 0) => Self::SpEl0,
+                (3, 3, 13, 0, 2) => Self::TpidrEl0,
+                (3, 3, 13, 0, 3) => Self::TpidrroEl0,
+                (3, 0, 13, 0, 1) => Self::ContextidrEl1,
+                (3, 3, 4, 4, 0) => Self::Fpcr,
+                (3, 3, 4, 4, 1) => Self::Fpsr,
+                (3, 3, 4, 2, 1) => Self::Daif,
+                (3, 0, 4, 2, 3) => Self::Pan,
+                (3, 0, 7, 4, 0) => Self::ParEl1,
+                (3, 3, 14, 0, 0) => Self::CntfrqEl0,
+                (3, 3, 14, 0, 2) => Self::CntvctEl0,
+                (3, 3, 14, 3, 1) => Self::CntvCtlEl0,
+                (3, 3, 14, 3, 2) => Self::CntvCvalEl0,
+                (3, 0, 0, 0, 5) => Self::MpidrEl1,
+                (3, 0, 12, 12, 0) => Self::IccIar1El1,
+                (3, 0, 12, 12, 1) => Self::IccEoir1El1,
+                (3, 0, 12, 11, 5) => Self::IccSgi1rEl1,
+                _ => Self::Unnamed(r),
+            }
+        }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SystemDirection {
+        Read,
+        Write,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SystemAccess {
+        pub direction: SystemDirection,
+        pub encoding: crate::SystemRegister,
+        pub register: NamedSystemRegister,
+        pub rt: crate::OperandRegister,
+    }
+    /// DDI0487G.a C6.2.195 MSR (immediate); C4.1.3 PSTATE encoding index.
+    /// Feature-dependent fields are decoded, without asserting execution support.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PstateField {
+        SpSel,
+        DaifSet,
+        DaifClr,
+        Pan,
+        Uao,
+        Dit,
+        Ssbs,
+        Tco,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PstateImmediate {
+        pub field: PstateField,
+        pub immediate: u8,
+    }
+    fn system(w: u32) -> Option<Instruction> {
+        if w & 0xffd00000 == 0xd5100000 {
+            let encoding = crate::SystemRegister::from_word(w);
+            return Some(Instruction::SystemAccess(SystemAccess {
+                direction: if w & (1 << 21) != 0 {
+                    SystemDirection::Read
+                } else {
+                    SystemDirection::Write
+                },
+                register: NamedSystemRegister::from_encoding(encoding),
+                encoding,
+                rt: crate::OperandRegister::field(w, false),
+            }));
+        }
+        if w & 0xfff8f01f != 0xd500401f {
+            return None;
+        }
+        let field = match ((w >> 16) & 7, (w >> 5) & 7) {
+            (0, 3) => PstateField::Uao,
+            (0, 4) => PstateField::Pan,
+            (0, 5) => PstateField::SpSel,
+            (3, 1) => PstateField::Ssbs,
+            (3, 2) => PstateField::Dit,
+            (3, 4) => PstateField::Tco,
+            (3, 6) => PstateField::DaifSet,
+            (3, 7) => PstateField::DaifClr,
+            _ => return None,
+        };
+        Some(Instruction::PstateImmediate(PstateImmediate {
+            field,
+            immediate: ((w >> 8) & 15) as u8,
+        }))
+    }
+    pub(crate) fn decode(w: u32) -> Option<Instruction> {
+        barrier(w)
+            .or_else(|| system(w))
+            .or_else(|| exception(w))
+            .or_else(|| extract(w))
+    }
+
+    /// DDI0487G.a C6.2.38 BRK, C6.2.76–78 DCPS1/2/3, C6.2.93 HLT,
+    /// C6.2.94 HVC, C6.2.241 SMC, C6.2.321 SVC;
+    /// C4.1.3 Exception generation encoding index, pp. C4-286–287.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ExceptionKind {
+        Svc,
+        Hvc,
+        Smc,
+        Brk,
+        Hlt,
+        Dcps1,
+        Dcps2,
+        Dcps3,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ExceptionGeneration {
+        pub kind: ExceptionKind,
+        pub immediate: u16,
+    }
+    fn exception(w: u32) -> Option<Instruction> {
+        let kind = match w & 0xffe0001f {
+            0xd4000001 => ExceptionKind::Svc,
+            0xd4000002 => ExceptionKind::Hvc,
+            0xd4000003 => ExceptionKind::Smc,
+            0xd4200000 => ExceptionKind::Brk,
+            0xd4400000 => ExceptionKind::Hlt,
+            0xd4a00001 => ExceptionKind::Dcps1,
+            0xd4a00002 => ExceptionKind::Dcps2,
+            0xd4a00003 => ExceptionKind::Dcps3,
+            _ => return None,
+        };
+        Some(Instruction::ExceptionGeneration(ExceptionGeneration {
+            kind,
+            immediate: ((w >> 5) & 0xffff) as u16,
+        }))
+    }
+
+    /// DDI0487G.a C6.2.90 EXTR; C4.1.2 Extract encoding index.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Extract {
+        pub width: crate::Width,
+        pub rm: crate::OperandRegister,
+        pub rn: crate::OperandRegister,
+        pub rd: crate::OperandRegister,
+        pub lsb: u8,
+    }
+    fn extract(w: u32) -> Option<Instruction> {
+        if w & 0x7fa00000 != 0x13800000
+            || (w >> 22) & 1 != w >> 31
+            || (w >> 31 == 0 && w & 0x8000 != 0)
+        {
+            return None;
+        }
+        Some(Instruction::Extract(Extract {
+            width: if w >> 31 == 0 {
+                crate::Width::W32
+            } else {
+                crate::Width::X64
+            },
+            rm: crate::OperandRegister::field(w >> 16, false),
+            rn: crate::OperandRegister::field(w >> 5, false),
+            rd: crate::OperandRegister::field(w, false),
+            lsb: ((w >> 10) & 63) as u8,
+        }))
+    }
+}
+pub use closure::{
+    Barrier, BarrierAccess, BarrierDomain, BarrierKind, ExceptionGeneration, ExceptionKind,
+    Extract, NamedSystemRegister, PstateField, PstateImmediate, SystemAccess, SystemDirection,
+};
+
 mod decode {
     //! Hand-written leaves from Arm ARM DDI0487, A64 encoding index.
     //! This is decoding only: no instruction is executed on the host.
@@ -32,6 +306,9 @@ mod decode {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ExclusiveOption(u8);
     impl ExclusiveOption {
+        pub(crate) const fn from_option(value: u8) -> Self {
+            Self(value)
+        }
         pub const fn value(self) -> u8 {
             self.0
         }
@@ -592,6 +869,250 @@ mod tests {
     }
 }
 
+mod loader {
+    //! Loader leaves, hand-written from the Arm ARM DDI0487G.a PDF.
+    use crate::{Instruction, MemorySize, OperandRegister};
+
+    /// Arm ARM DDI0487G.a C6.2.99–101 LDADD byte, halfword, word and doubleword.
+    /// `acquire` retains the encoded A bit; effective acquisition also needs Rt != ZR.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AtomicAdd {
+        pub size: MemorySize,
+        pub acquire: bool,
+        pub release: bool,
+        pub source: OperandRegister,
+        pub destination: OperandRegister,
+        pub base: OperandRegister,
+    }
+    impl AtomicAdd {
+        pub fn acquires(self) -> bool {
+            self.acquire && self.destination != OperandRegister::Zr
+        }
+    }
+
+    pub(crate) fn decode(word: u32) -> Option<Instruction> {
+        if word & 0xfff80000 == 0xd5080000 {
+            let op1 = ((word >> 16) & 7) as u8;
+            let crn = ((word >> 12) & 15) as u8;
+            let crm = ((word >> 8) & 15) as u8;
+            let op2 = ((word >> 5) & 7) as u8;
+            if let Some(operation) = TlbiOperation::from_fields(op1, crn, crm, op2) {
+                return Some(Instruction::SystemOperation(SystemOperation {
+                    operation,
+                    op1,
+                    crn,
+                    crm,
+                    op2,
+                    rt: OperandRegister::field(word, false),
+                }));
+            }
+        }
+        // C6.2.87 ERET. C6.2.88 ERETAA/ERETAB require pointer authentication;
+        // the production loader does not emit them, so they remain Unallocated.
+        if word & 0x3f20fc00 == 0x38200000 {
+            return Some(Instruction::AtomicAdd(AtomicAdd {
+                size: match word >> 30 {
+                    0 => MemorySize::Byte,
+                    1 => MemorySize::Half,
+                    2 => MemorySize::Word,
+                    _ => MemorySize::Double,
+                },
+                acquire: word & (1 << 23) != 0,
+                release: word & (1 << 22) != 0,
+                source: OperandRegister::field(word >> 16, false),
+                destination: OperandRegister::field(word, false),
+                base: OperandRegister::field(word >> 5, true),
+            }));
+        }
+        (word == 0xd69f03e0).then_some(Instruction::Eret)
+    }
+
+    /// Arm ARM DDI0487G.a C6.2.332 TLBI and C6.2.328 SYS.
+    /// Exact SYS fields are retained, including Rt for operandless aliases.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SystemOperation {
+        pub operation: TlbiOperation,
+        pub op1: u8,
+        pub crn: u8,
+        pub crm: u8,
+        pub op2: u8,
+        pub rt: OperandRegister,
+    }
+
+    /// Arm ARM DDI0487G.a C6.2.332, pp. C6-1470–1472.
+    /// Includes FEAT_TLBIOS and FEAT_TLBIRANGE without claiming execution support.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TlbiOperation {
+        Vmalle1is,
+        Vae1is,
+        Aside1is,
+        Vaae1is,
+        Vale1is,
+        Vaale1is,
+        Vmalle1,
+        Vae1,
+        Aside1,
+        Vaae1,
+        Vale1,
+        Vaale1,
+        Ipas2e1is,
+        Ipas2le1is,
+        Alle2is,
+        Vae2is,
+        Alle1is,
+        Vale2is,
+        Vmalls12e1is,
+        Ipas2e1,
+        Ipas2le1,
+        Alle2,
+        Vae2,
+        Alle1,
+        Vale2,
+        Vmalls12e1,
+        Alle3is,
+        Vae3is,
+        Vale3is,
+        Alle3,
+        Vae3,
+        Vale3,
+        Vmalle1os,
+        Vae1os,
+        Aside1os,
+        Vaae1os,
+        Vale1os,
+        Vaale1os,
+        Alle2os,
+        Vae2os,
+        Alle1os,
+        Vale2os,
+        Vmalls12e1os,
+        Ipas2e1os,
+        Ipas2le1os,
+        Alle3os,
+        Vae3os,
+        Vale3os,
+        Rvae1is,
+        Rvaae1is,
+        Rvale1is,
+        Rvaale1is,
+        Rvae1os,
+        Rvaae1os,
+        Rvale1os,
+        Rvaale1os,
+        Rvae1,
+        Rvaae1,
+        Rvale1,
+        Rvaale1,
+        Ripas2e1is,
+        Ripas2le1is,
+        Rvae2is,
+        Rvale2is,
+        Ripas2e1,
+        Ripas2e1os,
+        Ripas2le1,
+        Ripas2le1os,
+        Rvae2os,
+        Rvale2os,
+        Rvae2,
+        Rvale2,
+        Rvae3is,
+        Rvale3is,
+        Rvae3os,
+        Rvale3os,
+        Rvae3,
+        Rvale3,
+    }
+    impl TlbiOperation {
+        pub fn from_fields(op1: u8, crn: u8, crm: u8, op2: u8) -> Option<Self> {
+            if crn != 8 {
+                return None;
+            }
+            Some(match (op1, crm, op2) {
+                (0, 3, 0) => Self::Vmalle1is,
+                (0, 3, 1) => Self::Vae1is,
+                (0, 3, 2) => Self::Aside1is,
+                (0, 3, 3) => Self::Vaae1is,
+                (0, 3, 5) => Self::Vale1is,
+                (0, 3, 7) => Self::Vaale1is,
+                (0, 7, 0) => Self::Vmalle1,
+                (0, 7, 1) => Self::Vae1,
+                (0, 7, 2) => Self::Aside1,
+                (0, 7, 3) => Self::Vaae1,
+                (0, 7, 5) => Self::Vale1,
+                (0, 7, 7) => Self::Vaale1,
+                (4, 0, 1) => Self::Ipas2e1is,
+                (4, 0, 5) => Self::Ipas2le1is,
+                (4, 3, 0) => Self::Alle2is,
+                (4, 3, 1) => Self::Vae2is,
+                (4, 3, 4) => Self::Alle1is,
+                (4, 3, 5) => Self::Vale2is,
+                (4, 3, 6) => Self::Vmalls12e1is,
+                (4, 4, 1) => Self::Ipas2e1,
+                (4, 4, 5) => Self::Ipas2le1,
+                (4, 7, 0) => Self::Alle2,
+                (4, 7, 1) => Self::Vae2,
+                (4, 7, 4) => Self::Alle1,
+                (4, 7, 5) => Self::Vale2,
+                (4, 7, 6) => Self::Vmalls12e1,
+                (6, 3, 0) => Self::Alle3is,
+                (6, 3, 1) => Self::Vae3is,
+                (6, 3, 5) => Self::Vale3is,
+                (6, 7, 0) => Self::Alle3,
+                (6, 7, 1) => Self::Vae3,
+                (6, 7, 5) => Self::Vale3,
+                (0, 1, 0) => Self::Vmalle1os,
+                (0, 1, 1) => Self::Vae1os,
+                (0, 1, 2) => Self::Aside1os,
+                (0, 1, 3) => Self::Vaae1os,
+                (0, 1, 5) => Self::Vale1os,
+                (0, 1, 7) => Self::Vaale1os,
+                (4, 1, 0) => Self::Alle2os,
+                (4, 1, 1) => Self::Vae2os,
+                (4, 1, 4) => Self::Alle1os,
+                (4, 1, 5) => Self::Vale2os,
+                (4, 1, 6) => Self::Vmalls12e1os,
+                (4, 4, 0) => Self::Ipas2e1os,
+                (4, 4, 4) => Self::Ipas2le1os,
+                (6, 1, 0) => Self::Alle3os,
+                (6, 1, 1) => Self::Vae3os,
+                (6, 1, 5) => Self::Vale3os,
+                (0, 2, 1) => Self::Rvae1is,
+                (0, 2, 3) => Self::Rvaae1is,
+                (0, 2, 5) => Self::Rvale1is,
+                (0, 2, 7) => Self::Rvaale1is,
+                (0, 5, 1) => Self::Rvae1os,
+                (0, 5, 3) => Self::Rvaae1os,
+                (0, 5, 5) => Self::Rvale1os,
+                (0, 5, 7) => Self::Rvaale1os,
+                (0, 6, 1) => Self::Rvae1,
+                (0, 6, 3) => Self::Rvaae1,
+                (0, 6, 5) => Self::Rvale1,
+                (0, 6, 7) => Self::Rvaale1,
+                (4, 0, 2) => Self::Ripas2e1is,
+                (4, 0, 6) => Self::Ripas2le1is,
+                (4, 2, 1) => Self::Rvae2is,
+                (4, 2, 5) => Self::Rvale2is,
+                (4, 4, 2) => Self::Ripas2e1,
+                (4, 4, 3) => Self::Ripas2e1os,
+                (4, 4, 6) => Self::Ripas2le1,
+                (4, 4, 7) => Self::Ripas2le1os,
+                (4, 5, 1) => Self::Rvae2os,
+                (4, 5, 5) => Self::Rvale2os,
+                (4, 6, 1) => Self::Rvae2,
+                (4, 6, 5) => Self::Rvale2,
+                (6, 2, 1) => Self::Rvae3is,
+                (6, 2, 5) => Self::Rvale3is,
+                (6, 5, 1) => Self::Rvae3os,
+                (6, 5, 5) => Self::Rvale3os,
+                (6, 6, 1) => Self::Rvae3,
+                (6, 6, 5) => Self::Rvale3,
+                _ => return None,
+            })
+        }
+    }
+}
+pub use loader::{AtomicAdd, SystemOperation, TlbiOperation};
+
 mod instruction {
     //! Typed decoding entry point. Unimplemented and reserved leaves fail shut.
     use crate::Decoded;
@@ -599,11 +1120,21 @@ mod instruction {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Instruction {
         Unallocated,
+        /// Arm ARM DDI0487G.a C6.2.87 ERET (no pointer authentication).
+        Eret,
+        AtomicAdd(crate::AtomicAdd),
+        SystemOperation(crate::SystemOperation),
+        Barrier(crate::Barrier),
+        ExceptionGeneration(crate::ExceptionGeneration),
+        SystemAccess(crate::SystemAccess),
+        PstateImmediate(crate::PstateImmediate),
         CensusGap(Decoded),
         Hint(Hint),
         Arithmetic(Arithmetic),
         Branch(Branch),
         ScalarMemory(ScalarMemory),
+        UnprivilegedMemory(ScalarMemory),
+        Extract(crate::Extract),
         PairMemory(PairMemory),
         Logical(Logical),
         MoveWide(MoveWide),
@@ -630,6 +1161,12 @@ mod instruction {
     }
 
     pub fn decode_instruction(word: u32) -> Instruction {
+        if let Some(instruction) = crate::loader::decode(word) {
+            return instruction;
+        }
+        if let Some(instruction) = crate::closure::decode(word) {
+            return instruction;
+        }
         let hint = match word {
             0xd503201f => Some(Hint::Nop),
             0xd503203f => Some(Hint::Yield),
@@ -650,7 +1187,11 @@ mod instruction {
             return Instruction::Branch(b);
         }
         if let Some(m) = scalar_memory(word).or_else(|| literal_memory(word)) {
-            return Instruction::ScalarMemory(m);
+            return if word & 0x3f200c00 == 0x38000800 {
+                Instruction::UnprivilegedMemory(m)
+            } else {
+                Instruction::ScalarMemory(m)
+            };
         }
         if let Some(m) = pair_memory(word) {
             return Instruction::PairMemory(m);
@@ -778,7 +1319,10 @@ mod instruction {
     /// C7.2.191/193/194 LDR/LDUR and C7.2.331/332 STR (SIMD&FP).
     /// Encoding index C4.1.4, pp. C4-312–317, C4-325–327:
     /// unscaled, pre/post-indexed, register offset, unsigned immediate.
-    /// Prefetch and unprivileged forms are deliberately unsupported.
+    /// C6.2.156–161 LDTR/B/H/SB/SH/SW, C6.2.293–295 STTR/B/H;
+    /// C4.1.4 Load/store register (unprivileged) encoding index.
+    /// Unprivileged forms share the offset decode and have a distinct Instruction.
+    /// Prefetch forms are deliberately unsupported.
     fn scalar_memory(w: u32) -> Option<ScalarMemory> {
         if w & 0x3b000000 != 0x39000000 && w & 0x3b000000 != 0x38000000 {
             return None;
@@ -844,6 +1388,7 @@ mod instruction {
         } else {
             let index = match (w >> 10) & 3 {
                 0 => MemoryIndex::Offset,
+                2 if !vector => MemoryIndex::Offset,
                 1 => MemoryIndex::Post,
                 3 => MemoryIndex::Pre,
                 _ => return None,
@@ -1469,7 +2014,7 @@ mod instruction {
         Zr,
     }
     impl OperandRegister {
-        fn field(bits: u32, sp: bool) -> Self {
+        pub(crate) fn field(bits: u32, sp: bool) -> Self {
             match bits & 31 {
                 31 if sp => Self::Sp,
                 31 => Self::Zr,
