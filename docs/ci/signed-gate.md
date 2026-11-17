@@ -1,8 +1,7 @@
 # Signed gate in the merge queue
 
 `Signed gate` runs signed acceptance on every `checks_requested` merge group
-for this repository's `main` queue. On one assigned Mac, under one host
-lease, it builds, signs and accepts the event's **base_sha** and then the exact
+for this repository's `main` queue. On one assigned Mac, it builds, signs and accepts the event's **base_sha** and then the exact
 group head, compares the two receipts, and posts `signed-gate` as a commit
 status. The **Signed queue gate** check requires successful authorization, the
 trusted base fixture fetch, the candidate probe build, execution and verdict
@@ -22,8 +21,8 @@ A signed receipt depends on the Mac that ran it: a test can fail
 deterministically on one gate Mac and pass on another. A base receipt from a
 different host would report such a failure as NEW and eject every group
 (#1884). The gate job therefore runs the merge base itself, before the
-candidate, on the same Mac in the same job and under the same exclusive
-`gate` lease. The receipts record the execution host and fixture content
+candidate, on the same Mac in the same job, with exclusive `gate` admission
+for guest execution. The receipts record the execution host and fixture content
 identity, and publication compares the candidate only with this paired base.
 A pair whose host or fixture evidence still differs is reported as
 **INCOMPARABLE BASE — BLOCKED**, never as NEW (an incomplete base is not
@@ -264,14 +263,15 @@ base's archive from that authenticated run; the Mac verifies its producing
 SHA and each checkout's fixture input identity before restoration. No
 manually provisioned archive or Docker is needed on the Mac.
 
-GitHub assigns one job at a time to a runner. The Rust executor also holds
-the machine's exclusive `gate` lease across both runs' fixture restore, `just
-build`, `cargo run -p carrick-xtask -- accept --profile no-docker --phase
-signed`, and independent artifact inspection. A paired job takes about twice
-a single run (roughly 45-70 minutes; the job timeout is 240). Nested acceptance reuses that
-lease: under an outer gate `accept` does not split its build from guest
-execution (#2013), so the executor's lease still spans the pair. Both runners must share their local lease path with all other gate
-participants on that host. A per-SHA Actions concurrency group with
+GitHub assigns one job at a time to a runner. For each side, the Rust executor
+restores fixtures and runs `just build` under shared `carrick`, then releases
+that lease fully. It invokes signed `accept` without inherited admission:
+accept builds under shared `carrick`, releases it, takes `gate`, and re-verifies
+that the admitted artifacts are unchanged before running guests (#2013).
+After accept returns, independent scoped cleanup and artifact inspection take
+`gate` again. No shared lease is upgraded and no exclusive lease spans both
+sides or their release builds. Both runners must share their local lease path
+with all other gate participants on that host. A per-SHA Actions concurrency group with
 `cancel-in-progress: false` queues duplicate requests. GitHub does not expose
 `runner.name` when job concurrency is evaluated, so host serialization uses
 the lease rather than an invalid runner-name expression (director ruling on
