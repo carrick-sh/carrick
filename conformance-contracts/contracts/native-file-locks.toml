@@ -29,6 +29,7 @@ yet conflict (follow-up).
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::serial_host_arm_fork_children_contend_record_locks_and_flock_in_the_ring (production ARM dispatch, two live processes; red: every lock call -38)",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_arm_two_lock_waiters_rerun_and_park_again (one release wakes two waiters; the loser parks again on its retained operation)",
   "carrick-fd-core::record_lock::tests::two_tables_contend_for_one_record_lock_until_a_close_releases_it",
   "carrick-fd-core::record_lock::tests::readers_share_and_a_writer_waits_for_every_reader",
   "carrick-fd-core::record_lock::tests::unlock_splits_and_a_retake_merges_the_owners_ranges",
@@ -42,10 +43,11 @@ vm_free = [
 ]
 embed = [
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_and_fork_child_contend_record_locks_and_flock (native oracle byte for byte; red: fcntl x10, flock x4 refused)",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_record_lock_outlives_its_thread_and_ends_with_dup2_and_exit_group (a non-last thread's exit keeps the lock; dup2 and exit_group with a running worker release it; red: fcntl x5 refused)",
 ]
 
 [bindings.unresolved]
-semantics = "SEEK_CUR/SEEK_END bases, EDEADLK and the host-dispatched ARM run root's locks (host arbiter) are not served by this owner."
-structural = "No work-count budget is bound; the table costs the number of locks held per operation."
+semantics = "SEEK_CUR/SEEK_END bases, EDEADLK and the host-dispatched ARM run root's locks (host arbiter) are not served by this owner (#2460)."
+structural = "No work-count budget is bound; the table costs the number of locks held per operation, and every release wakes every lock waiter of the zone (one lane, #2460). The pool-exhaustion witness serial_host_lock_waiters_beyond_the_pool_hold_no_capacity and its pipe control are ignored on #2458: one x86 wake of two parked fork children fails the carrier on main before any lock code runs."
 embed_structural = "UNRUN (director): signed ARM run of apt-get on the implementation head."
 docker = "The x86 KVM witness compares with the native Linux oracle; no Docker differential."

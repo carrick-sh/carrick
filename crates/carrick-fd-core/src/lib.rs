@@ -1165,8 +1165,8 @@ pub struct Authority<'a, B: SlotBacking, W: LockWait, const T: usize> {
 impl<B: SlotBacking, W: LockWait, const T: usize> record_lock::LockOwners
     for Authority<'_, B, W, T>
 {
-    fn live(&self, owner: record_lock::LockOwner) -> bool {
-        self.lock_owner_live(owner)
+    fn exists(&self, owner: record_lock::LockOwner) -> bool {
+        self.lock_owner_exists(owner)
     }
 }
 
@@ -2608,7 +2608,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
 
     /// Whether a lock owner still exists: a table still published under its
     /// generation, or a description with a reference or pin left.
-    fn lock_owner_live(&self, owner: record_lock::LockOwner) -> bool {
+    fn lock_owner_exists(&self, owner: record_lock::LockOwner) -> bool {
         match owner {
             record_lock::LockOwner::Table { index, generation } => {
                 self.core.tables.get(index as usize).is_some_and(|table| {
