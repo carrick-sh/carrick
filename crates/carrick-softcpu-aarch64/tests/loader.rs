@@ -343,12 +343,13 @@ fn generated_loader_vector_spans_are_typed() {
 }
 
 fn assert_loader_vector_spans_typed(path: &std::path::Path) {
-    let bytes = std::fs::read(path).expect("generated production spans");
+    let bytes =
+        std::fs::read(path).unwrap_or_else(|error| panic!("generated production spans: {error}"));
     assert!(!bytes.is_empty(), "no generated code measured");
     assert_eq!(bytes.len() % 4, 0, "partial instruction in generated spans");
     let mut words = 0;
     for (offset, b) in bytes.chunks_exact(4).enumerate() {
-        let word = u32::from_le_bytes(b.try_into().unwrap());
+        let word = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         assert_ne!(
             decode_instruction(word),
             Instruction::Unallocated,
