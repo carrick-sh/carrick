@@ -3237,6 +3237,27 @@ impl<
             {
                 return true;
             }
+            if ipc::LockCall::decode(ordinal, self.frame.argument(1).unwrap_or(u64::MAX)).is_some()
+            {
+                // Advisory locks are the ring's on a file the carrier named
+                // at open; a closed descriptor is EBADF here.
+                let NativeDescriptorNamespace::Native(Some(raw)) =
+                    self.native_descriptor_namespace()
+                else {
+                    return false;
+                };
+                let Some(venue) = self.ipc else {
+                    return false;
+                };
+                return match venue.region.fd(NativeFdWait).file_identity(
+                    carrick_fd_core::TableId::from_raw(raw),
+                    carrick_fd_core::Fd(self.frame.argument(0).unwrap_or(0) as i32),
+                ) {
+                    Ok(identity) => identity.is_some(),
+                    Err(carrick_fd_core::Error::BadFd) => true,
+                    Err(_) => false,
+                };
+            }
             if ordinal == carrick_personality_linux::crossing::nr::FCNTL.raw() {
                 return matches!(
                     self.frame.argument(1).unwrap_or(u64::MAX),
@@ -3253,7 +3274,8 @@ impl<
             return false;
         }
         if self.frame.may_serve_descriptor() {
-            return ordinal != carrick_personality_linux::crossing::nr::FCNTL.raw();
+            return ordinal != carrick_personality_linux::crossing::nr::FCNTL.raw()
+                && ordinal != carrick_personality_linux::crossing::nr::FLOCK.raw();
         }
         if ![
             carrick_personality_linux::crossing::nr::DUP,
@@ -4550,6 +4572,14 @@ impl<
                 }
             };
         let new_fd = reservation.fd();
+        // dup2(2)/dup3(2) over an open descriptor close it first: its file's
+        // record locks of this table end (fcntl(2)).
+        let replaced_file = match request.target {
+            NativeDupTarget::Exact(fd) if fd != request.old => {
+                authority.file_identity(table, fd).ok().flatten()
+            }
+            _ => None,
+        };
         let mut reservation = Some(reservation);
         let projected = super::file_table::with_host_binding_dup(
             self.fd_map,
@@ -4595,6 +4625,10 @@ impl<
 
         let (release, delegated_release) = projected?;
         ipc::settle_native_release(&venue.region, release, zone, task).map_err(map_ipc_error)?;
+        if let Some(file) = replaced_file {
+            ipc::release_record_locks(&venue.region, zone, task, table, file)
+                .map_err(map_ipc_error)?;
+        }
         Self::settle_delegated_release(self.frame, self.open_table, task, delegated_release)?;
         Ok(new_fd)
     }
@@ -5342,6 +5376,9 @@ impl<
             .record_source()
             .map(|source| (source.zone, source.slot));
 
+        if ipc::LockCall::decode(ordinal, self.frame.argument(1).unwrap_or(u64::MAX)).is_some() {
+            return self.ipc_file_lock(table);
+        }
         let owner =
             carrick_personality_linux::dispatch::owner_ordinal(self.frame.canonical_ordinal());
         if matches!(
@@ -5740,6 +5777,12 @@ impl<
                     Ok(effects) => effects,
                     Err(err) => return map_fd_error(err),
                 };
+                let locked_file = venue
+                    .region
+                    .fd(NativeFdWait)
+                    .file_identity(table, old)
+                    .ok()
+                    .flatten();
                 let released = match venue.region.fd(NativeFdWait).close_filtered(
                     table,
                     old,
@@ -5749,6 +5792,12 @@ impl<
                     Err(err) => return map_fd_error(err),
                 };
                 if let Err(err) = ipc::settle_native_release(&venue.region, released, zone, task) {
+                    return map_ipc_error(err);
+                }
+                if let Some(file) = locked_file
+                    && let Err(err) =
+                        ipc::release_record_locks(&venue.region, zone, task, table, file)
+                {
                     return map_ipc_error(err);
                 }
                 let change = super::file_table::close_host_binding(
@@ -6003,6 +6052,133 @@ impl<
                 disposition,
             )
         }
+    }
+
+    /// fcntl(2) record and OFD locks and flock(2) on a native table's file
+    /// ([`ipc::serve_file_lock`]), on whichever execution venue runs the
+    /// caller. A wait parks as an owned operation on the lock object.
+    #[inline(never)]
+    fn ipc_file_lock(&mut self, table: carrick_el1_abi::ipc::fd::TableId) -> FamilyCompletion {
+        let Some(venue) = self.ipc else {
+            return FamilyCompletion::Forward;
+        };
+        let counters = self.counters;
+        let orig_x0 = self.frame.argument(0).unwrap_or(0);
+        let arguments: [u64; 6] = core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0));
+        let ordinal = self.frame.canonical_ordinal();
+        let pc = self.frame.arm_frame_ref().map_or(0, |frame| frame.elr);
+        let presented = self.process.as_deref().map(|owner| owner.binding());
+        let mut output = None;
+        let (task, disposition, input_wait) = if self.frame.arm_scheduler() {
+            let current_tasks = self.current_tasks;
+            let Some(frame) = self.frame.arm_frame() else {
+                return FamilyCompletion::Forward;
+            };
+            let slot = frame.slot as usize;
+            let (Some(zone), Some(task), Some(zslot)) = (
+                self.zone.as_mut(),
+                current_tasks.get(slot),
+                SlotId::from_index(slot),
+            ) else {
+                return FamilyCompletion::Forward;
+            };
+            let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
+            let mut user = file::OwnerCopy {
+                inner: file::DiagnosedCopy {
+                    inner: file::ValidatedCopy {
+                        task,
+                        validator: &file::HardwareValidator,
+                    },
+                    diagnostic: file::CopyDiagnostic {
+                        counters,
+                        ordinal,
+                        arguments,
+                        pc,
+                        presented,
+                        expected: Some(crate::common_entry::execution_binding(task)),
+                    },
+                },
+                owner: self.process.as_deref_mut(),
+                wait: None,
+                input_wait: None,
+            };
+            let disposition =
+                ipc::serve_file_lock(&mut sched, frame, venue, &mut user, table, &mut output);
+            (task, disposition, user.input_wait.take())
+        } else {
+            let (Some(source), Some(task)) = (
+                self.record_source(),
+                self.current_tasks.get(self.frame.task_index()),
+            ) else {
+                return FamilyCompletion::Forward;
+            };
+            if let Some(process) = self.process.as_deref_mut() {
+                process.prepare_object_park();
+            }
+            let mut native_handoff = None;
+            let mut exec = ipc::NativeIpcExecution {
+                source,
+                task,
+                counters,
+                handoff: &mut native_handoff,
+                frame: core::marker::PhantomData,
+            };
+            let mut user = file::OwnerCopy {
+                inner: file::DiagnosedCopy {
+                    inner: file::ValidatedCopy {
+                        task,
+                        validator: &file::HardwareValidator,
+                    },
+                    diagnostic: file::CopyDiagnostic {
+                        counters,
+                        ordinal,
+                        arguments,
+                        pc,
+                        presented,
+                        expected: Some(crate::common_entry::execution_binding(task)),
+                    },
+                },
+                owner: self.process.as_deref_mut(),
+                wait: None,
+                input_wait: None,
+            };
+            let disposition = ipc::serve_file_lock(
+                &mut exec,
+                &mut *self.frame,
+                venue,
+                &mut user,
+                table,
+                &mut output,
+            );
+            let input_wait = user.input_wait.take();
+            if let Some(receipt) = native_handoff
+                && let Some(process) = self.process.as_deref_mut()
+            {
+                process.store_handoff_receipt(receipt);
+            }
+            (task, disposition, input_wait)
+        };
+        if let Some(request) = input_wait {
+            return self.ipc_input_wait(request);
+        }
+        if let Some(output) = output {
+            let flock = output.flock;
+            return complete_poll_copyout(
+                self.process.as_deref_mut(),
+                task,
+                carrick_guest_arch::UserVa::new(output.address),
+                zerocopy::IntoBytes::as_bytes(&flock),
+                SyscallResult::new(0),
+                (counters, ordinal, arguments, pc),
+            );
+        }
+        let result = self.frame.result().0 as i64;
+        carrick_personality_linux::dispatch::transfer_effect(
+            &task.linux,
+            orig_x0,
+            result,
+            disposition,
+        )
     }
 
     fn ipc_poll_transfer(&mut self) -> FamilyCompletion

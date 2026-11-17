@@ -128,15 +128,32 @@ impl NativeOpenSink {
         file: crate::dispatch::fd_table::OpenFile,
     ) -> Result<fd::Fd, carrick_abi::LinuxErrno> {
         let open_flags = LinuxOpenFlags::from_bits_retain(self.flags);
+        // The file's identity as the guest's stat names it (#231): the ring
+        // keys fcntl(2) and flock(2) locks on it, so two descriptions of one
+        // file conflict. An O_PATH description locks nothing.
+        let record = if open_flags.contains(LinuxOpenFlags::PATH) {
+            None
+        } else {
+            fs.description_stat_record(&file.description, None).ok()
+        };
         // A mount-served open meets O_DIRECTORY only after the host task's
         // install, which then withdraws its fd. A ring descriptor, visible to
         // the caller's other threads at once, is checked before it exists.
         if open_flags.contains(LinuxOpenFlags::DIRECTORY) {
-            let record = fs.description_stat_record(&file.description, None)?;
-            if record.mode & carrick_abi::LINUX_S_IFMT != carrick_abi::LINUX_S_IFDIR {
+            let mode = match &record {
+                Some(record) => record.mode,
+                None => fs.description_stat_record(&file.description, None)?.mode,
+            };
+            if mode & carrick_abi::LINUX_S_IFMT != carrick_abi::LINUX_S_IFDIR {
                 return Err(carrick_abi::LINUX_ENOTDIR);
             }
         }
+        let identity = record.and_then(|record| {
+            Some(fd::record_lock::FileIdentity {
+                device: fd::record_lock::FileDevice::new(record.fs_identity as u32),
+                inode: fd::record_lock::FileInode::new(record.ino)?,
+            })
+        });
         let access = if open_flags.contains(LinuxOpenFlags::PATH) {
             fd::AccessMode::Path
         } else {
@@ -167,6 +184,7 @@ impl NativeOpenSink {
             Box::new(NativeOpenFile::new(Arc::clone(&file.description))),
             access,
             status,
+            identity,
             open_flags.contains(LinuxOpenFlags::CLOEXEC),
         ) {
             Ok(number) => Ok(number),

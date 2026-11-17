@@ -3085,10 +3085,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if let Some((region, map)) = self.service.exec_ipc_binding()
             && let Some(raw) = map.lookup_owned(table_custody.file_table())
         {
-            if region
-                .fd(carrick_sched_core::ShortLockSpin)
-                .exec_deferred(carrick_fd_core::TableId::from_raw(raw))
-                .is_err()
+            let table = carrick_fd_core::TableId::from_raw(raw);
+            if crate::ipc::release_exec_record_locks(
+                &region,
+                Some((self.source.zone, self.source.slot)),
+                self.current,
+                table,
+            )
+            .is_err()
+                || region
+                    .fd(carrick_sched_core::ShortLockSpin)
+                    .exec_deferred(table)
+                    .is_err()
             {
                 return Ok(self.exec_past_no_return());
             }

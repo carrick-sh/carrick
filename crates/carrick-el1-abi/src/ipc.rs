@@ -95,6 +95,7 @@ use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use carrick_fd_core::free_list::{pop, push};
+use carrick_fd_core::record_lock::{LockRecord, LockTable, LockTableHeader, OfdIdentityRecord};
 pub use carrick_fd_core::{
     self as fd, BackingToken, DescriptorSlot, Extent, LockWait, OfdPin, OfdRecord, RawOfdPin,
     RawTableId, SlotBacking, bitmap_words,
@@ -134,10 +135,14 @@ pub const IPC_PIPE_PAGE_SIZE: usize = 4096;
 /// Alignment of every pool extent (a pipe ring starts on a guest page).
 pub const IPC_POOL_ALIGN: u64 = IPC_PIPE_PAGE_SIZE as u64;
 const IPC_DESCRIPTOR_STORAGE_NODES: usize = (crate::EL1_IPC_POOL_SPAN / IPC_POOL_ALIGN) as usize;
-/// Region magic: "CRKIPC" + ABI version 8 (ring stream socket pairs,
-/// after operation-owned poll waits and vector input receipts alongside
-/// elastic object/description stores).
-pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x08");
+/// Region magic: "CRKIPC" + ABI version 9 (the zone's advisory file locks
+/// and per-description file identities, after ring stream socket pairs,
+/// operation-owned poll waits, vector input receipts and elastic
+/// object/description stores).
+pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x09");
+/// Advisory locks the zone holds at once (fcntl(2) record and OFD locks and
+/// flock(2) locks together); one more is ENOLCK.
+pub const IPC_FILE_LOCKS: usize = 2048;
 const IPC_READY: u64 = 1;
 /// Leaf words of the owed-host-wake index: one bit per object.
 const HOST_WAKE_LEAF_WORDS: usize = IPC_MAX_OBJECTS / 64;
@@ -412,6 +417,9 @@ pub enum IpcObjectKind {
     /// A connected `AF_UNIX` `SOCK_STREAM` pair: two pipe lanes under one
     /// lock, one written by each [`StreamEnd`].
     Stream,
+    /// The zone's advisory file locks ([`IpcRegion::file_locks`]): its lock
+    /// serializes the [`LockTable`], its `Readable` lane parks lock waiters.
+    FileLocks,
 }
 const KIND_FREE: u32 = 0;
 const KIND_PIPE: u32 = 1;
@@ -430,6 +438,7 @@ const KIND_STREAM_SECOND_CLOSED: u32 = 6;
 /// stream socket by `SO_SNDBUF`; the bytes it buffers before a writer
 /// blocks are not part of its contract.)
 pub const IPC_STREAM_LANE_BYTES: usize = IPC_STOCK_RING_BYTES as usize / 2;
+const KIND_FILE_LOCKS: u32 = 7;
 
 /// A pipe's pool storage: `ring_bytes` of ring (guest-page multiple) followed
 /// by `pages` [`Page`] metadata entries, starting at pool `offset`
@@ -554,7 +563,9 @@ pub struct IpcDirectory {
     object_published: AtomicU64,
     object_ceiling: AtomicU64,
     ofd_ceiling: AtomicU64,
-    _reserved: [u64; 1],
+    /// The [`IpcObjectKind::FileLocks`] object, packed by
+    /// [`pack_file_locks`]; zero until the first lock operation creates it.
+    file_locks: AtomicU64,
     fd: IpcFdCore,
     free_operations: AtomicU64,
     /// Ring stock: two tagged lock-free stacks over `ring_stock` slots, the
@@ -598,9 +609,26 @@ type DescriptorStorage = fd::storage::Storage<IPC_DESCRIPTOR_STORAGE_NODES>;
 /// Offset of pointer-free pipe allocation metadata, after descriptor metadata.
 pub const IPC_PIPE_STORAGE_OFFSET: usize =
     page_round(IPC_DESCRIPTOR_STORAGE_OFFSET + core::mem::size_of::<DescriptorStorage>());
+/// Offset of the per-description file identities, parallel to the OFD
+/// store ([`fd::record_lock::OfdIdentityRecord`], one per OFD record).
+pub const IPC_OFD_IDENTITIES_OFFSET: usize =
+    page_round(IPC_PIPE_STORAGE_OFFSET + core::mem::size_of::<DescriptorStorage>());
+/// Offset of the zone's advisory lock table: its header, then
+/// [`IPC_FILE_LOCKS`] records.
+pub const IPC_FILE_LOCKS_OFFSET: usize = page_round(
+    IPC_OFD_IDENTITIES_OFFSET + IPC_MAX_OFDS * core::mem::size_of::<OfdIdentityRecord>(),
+);
 /// Length of the directory mapping, including both allocator stores.
-pub const IPC_DIRECTORY_BYTES: usize =
-    (IPC_PIPE_STORAGE_OFFSET + core::mem::size_of::<DescriptorStorage>()).next_multiple_of(0x4000);
+pub const IPC_DIRECTORY_BYTES: usize = (IPC_FILE_LOCKS_OFFSET
+    + core::mem::size_of::<LockTableHeader>()
+    + IPC_FILE_LOCKS * core::mem::size_of::<LockRecord>())
+.next_multiple_of(0x4000);
+const _: () = assert!(
+    IPC_FILE_LOCKS_OFFSET.is_multiple_of(core::mem::align_of::<LockRecord>())
+        && core::mem::size_of::<LockTableHeader>()
+            .is_multiple_of(core::mem::align_of::<LockRecord>())
+        && IPC_OFD_IDENTITIES_OFFSET.is_multiple_of(core::mem::align_of::<OfdIdentityRecord>())
+);
 const _: () =
     assert!(IPC_EPOLL_ITEMS_OFFSET.is_multiple_of(core::mem::align_of::<epoll::IpcEpollItem>()));
 const _: () = assert!(IPC_OBJECTS_OFFSET.is_multiple_of(core::mem::align_of::<IpcObjectRecord>()));
@@ -722,6 +750,13 @@ const LAYOUT_FACTS: &[u64] = &[
     KIND_STREAM_FIRST_CLOSED as u64,
     KIND_STREAM_SECOND_CLOSED as u64,
     core::mem::size_of::<IpcKindState>() as u64,
+    KIND_FILE_LOCKS as u64,
+    IpcOpKind::FileLockWait as u64,
+    core::mem::offset_of!(IpcDirectory, file_locks) as u64,
+    IPC_OFD_IDENTITIES_OFFSET as u64,
+    IPC_FILE_LOCKS_OFFSET as u64,
+    IPC_FILE_LOCKS as u64,
+    FILE_LOCKS_PRESENT,
 ];
 
 /// FNV-1a over `LAYOUT_FACTS` and the fd core's layout facts. Written into
@@ -730,14 +765,17 @@ const LAYOUT_FACTS: &[u64] = &[
 pub const IPC_LAYOUT_HASH: u64 = {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
-    let n = LAYOUT_FACTS.len() + fd::LAYOUT_FACTS.len() + vectors::VECTOR_LAYOUT.len();
+    let locks = LAYOUT_FACTS.len() + fd::LAYOUT_FACTS.len() + vectors::VECTOR_LAYOUT.len();
+    let n = locks + fd::record_lock::LAYOUT_FACTS.len();
     while i < n {
         let mut word = if i < LAYOUT_FACTS.len() {
             LAYOUT_FACTS[i]
         } else if i < LAYOUT_FACTS.len() + fd::LAYOUT_FACTS.len() {
             fd::LAYOUT_FACTS[i - LAYOUT_FACTS.len()]
-        } else {
+        } else if i < locks {
             vectors::VECTOR_LAYOUT[i - LAYOUT_FACTS.len() - fd::LAYOUT_FACTS.len()]
+        } else {
+            fd::record_lock::LAYOUT_FACTS[i - locks]
         };
         let mut b = 0;
         while b < 8 {
@@ -781,6 +819,12 @@ pub enum IpcOpKind {
     StreamSecondRead = 9,
     /// A write by a stream pair's [`StreamEnd::Second`].
     StreamSecondWrite = 10,
+    /// A blocking `F_SETLKW`/`F_OFD_SETLKW` or flock(2) parked on the
+    /// [`IpcObjectKind::FileLocks`] `Readable` lane (`object`), pinning the
+    /// locked description. It owns no progress: a woken wait reruns the call
+    /// from its original registers, and a signal interrupts it (restartable
+    /// under `SA_RESTART`, signal(7)).
+    FileLockWait = 11,
 }
 
 impl IpcOpKind {
@@ -1824,6 +1868,7 @@ impl<'a> IpcRegion<'a> {
                 KIND_STREAM => "stream",
                 KIND_STREAM_FIRST_CLOSED => "stream(first closed)",
                 KIND_STREAM_SECOND_CLOSED => "stream(second closed)",
+                KIND_FILE_LOCKS => "file-locks",
                 KIND_FREE => "free",
                 _ => "?",
             },
@@ -1899,6 +1944,10 @@ impl<'a> IpcRegion<'a> {
                 ),
                 None => writeln!(out, " epoll=?"),
             },
+            // The census holds the object's lock, which serializes the table.
+            Some(IpcObjectKind::FileLocks) => {
+                writeln!(out, " locks={}", self.lock_table_unchecked().len())
+            }
             None => writeln!(out),
         }
     }
@@ -2386,6 +2435,152 @@ impl<'a> IpcRegion<'a> {
     }
 }
 
+/// Marks a published [`IpcDirectory::file_locks`] word.
+const FILE_LOCKS_PRESENT: u64 = 1 << 63;
+const fn pack_file_locks(object: IpcObjectHandle) -> u64 {
+    FILE_LOCKS_PRESENT | ((object.index as u64) << 32) | object.generation as u64
+}
+const fn unpack_file_locks(word: u64) -> Option<IpcObjectHandle> {
+    if word & FILE_LOCKS_PRESENT == 0 {
+        return None;
+    }
+    Some(IpcObjectHandle {
+        index: ((word & !FILE_LOCKS_PRESENT) >> 32) as u32,
+        generation: word as u32,
+    })
+}
+
+/// The zone's advisory lock table under its object's lock. Dropping it
+/// releases the lock; a caller that released any lock first takes
+/// [`FileLocksGuard::released`] and delivers that wake after the drop.
+pub struct FileLocksGuard<'a> {
+    guard: IpcObjectGuard<'a>,
+    table: LockTable<'a>,
+}
+
+impl<'a> FileLocksGuard<'a> {
+    pub fn table(&self) -> &LockTable<'a> {
+        &self.table
+    }
+    /// The object whose `Readable` lane lock waiters park on.
+    pub fn handle(&self) -> IpcObjectHandle {
+        self.guard.handle()
+    }
+    /// Advance the waiters' lane: some lock was given up. Deliver the wake
+    /// after dropping the guard.
+    pub fn released(&mut self) -> IpcWake {
+        self.guard.publish(WakeSet {
+            readers: true,
+            writers: false,
+        })
+    }
+}
+
+impl<'a> IpcRegion<'a> {
+    /// The zone's advisory lock object, creating it on first use. Lock
+    /// waits park on its `Readable` lane and every release publishes it.
+    pub fn file_locks_object<W: LockWait>(&self, wait: &W) -> Result<IpcObjectHandle, IpcError> {
+        if let Some(object) = unpack_file_locks(self.dir.file_locks.load(Ordering::Acquire)) {
+            return Ok(object);
+        }
+        let (index, record) = match self.pop_object() {
+            Ok(popped) => popped,
+            Err(IpcError::NoObjects) => {
+                self.grow_objects(self.object_count())?;
+                self.pop_object()?
+            }
+            Err(error) => return Err(error),
+        };
+        let created = self
+            .lock_fresh(index, record, wait)?
+            .publish_kind(KIND_FILE_LOCKS);
+        match self.dir.file_locks.compare_exchange(
+            0,
+            pack_file_locks(created),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(created),
+            Err(winner) => {
+                // Another venue published first: return this record.
+                self.lock(created, wait)?.free();
+                unpack_file_locks(winner).ok_or(IpcError::Corrupt)
+            }
+        }
+    }
+
+    /// Lock the zone's advisory lock table (creating its object on first
+    /// use).
+    pub fn file_locks<W: LockWait>(&self, wait: &W) -> Result<FileLocksGuard<'a>, IpcError> {
+        let object = self.file_locks_object(wait)?;
+        self.lock_file_locks(object, wait)
+    }
+
+    /// [`Self::file_locks`] only if a lock was ever taken in this zone:
+    /// release paths of descriptions that never locked anything stop here.
+    pub fn existing_file_locks<W: LockWait>(
+        &self,
+        wait: &W,
+    ) -> Result<Option<FileLocksGuard<'a>>, IpcError> {
+        match unpack_file_locks(self.dir.file_locks.load(Ordering::Acquire)) {
+            Some(object) => self.lock_file_locks(object, wait).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Apply `release` to the zone's lock table, when a lock was ever taken
+    /// here. A change that gave any lock up publishes the waiters' lane:
+    /// the caller delivers the returned wake (no lock is held by then).
+    pub fn release_file_locks<W: LockWait>(
+        &self,
+        wait: &W,
+        release: impl FnOnce(&LockTable<'a>) -> bool,
+    ) -> Result<Option<IpcWake>, IpcError> {
+        let Some(mut locks) = self.existing_file_locks(wait)? else {
+            return Ok(None);
+        };
+        if !release(locks.table()) {
+            return Ok(None);
+        }
+        Ok(Some(locks.released()))
+    }
+
+    fn lock_file_locks<W: LockWait>(
+        &self,
+        object: IpcObjectHandle,
+        wait: &W,
+    ) -> Result<FileLocksGuard<'a>, IpcError> {
+        let guard = self.lock(object, wait)?;
+        if guard.kind() != Some(IpcObjectKind::FileLocks) {
+            return Err(IpcError::WrongKind);
+        }
+        Ok(FileLocksGuard {
+            guard,
+            table: self.lock_table_unchecked(),
+        })
+    }
+
+    /// The lock table's records, for a caller holding the lock object's
+    /// lock (the only exclusion that may operate on them).
+    fn lock_table_unchecked(&self) -> LockTable<'a> {
+        // SAFETY: the lock table lies in the directory mapping at a fixed,
+        // aligned offset ([`IPC_FILE_LOCKS_OFFSET`]); all-zero is an empty
+        // table of atomics; every venue writes it only under that lock.
+        unsafe {
+            let header = self.base.add(IPC_FILE_LOCKS_OFFSET);
+            LockTable::new(
+                &*header.cast::<LockTableHeader>(),
+                core::slice::from_raw_parts(
+                    header
+                        .add(core::mem::size_of::<LockTableHeader>())
+                        .cast::<LockRecord>(),
+                    IPC_FILE_LOCKS,
+                ),
+            )
+        }
+    }
+}
+
 impl SlotBacking for IpcRegion<'_> {
     fn table_lock_release(
         &self,
@@ -2397,6 +2592,20 @@ impl SlotBacking for IpcRegion<'_> {
             (Some(ceiling), Ok(fd)) => ceiling.cover(fd),
             _ => false,
         }
+    }
+
+    fn ofd_identity(&self, index: usize) -> Option<&OfdIdentityRecord> {
+        (index < IPC_MAX_OFDS).then(|| {
+            // SAFETY: in bounds of the identity store parallel to the OFD
+            // reservation; all-zero is a valid (unstamped) record of atomics.
+            unsafe {
+                &*self
+                    .base
+                    .add(IPC_OFD_IDENTITIES_OFFSET)
+                    .cast::<OfdIdentityRecord>()
+                    .add(index)
+            }
+        })
     }
 
     fn ofd(&self, index: usize) -> Option<&OfdRecord> {
@@ -2528,6 +2737,7 @@ impl<'a> IpcObjectGuard<'a> {
             KIND_STREAM | KIND_STREAM_FIRST_CLOSED | KIND_STREAM_SECOND_CLOSED => {
                 Some(IpcObjectKind::Stream)
             }
+            KIND_FILE_LOCKS => Some(IpcObjectKind::FileLocks),
             _ => None,
         }
     }
