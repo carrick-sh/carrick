@@ -107,7 +107,7 @@ pub struct CpuState {
     pub pc: ProgramCounter,
     pub pstate: Pstate,
     pub el1: El1Registers,
-    named: [SystemValue; 19],
+    pub named: NamedRegisters,
 }
 /// Undefined access raises EC=0; denied allocated MRS/MSR raises EC=0x18.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +161,7 @@ impl CpuState {
     ) -> Result<SystemValue, SystemAccessException> {
         let slot = self.access(r, rt, true)?;
         Ok(SystemValue(match slot {
-            Slot::Named(i) => self.named[i].0,
+            Slot::Named(i) => self.named.read(i).0,
             Slot::Elr => self.el1.elr.0,
             Slot::Spsr => self.el1.spsr.0,
             Slot::Esr => self.el1.esr.0,
@@ -190,7 +190,7 @@ impl CpuState {
         let slot = self.access(r, rt, false)?;
         let v = value.0;
         match slot {
-            Slot::Named(i) => self.named[i] = value,
+            Slot::Named(i) => self.named.write(i, value),
             Slot::Elr => self.el1.elr = ProgramCounter(v),
             Slot::Spsr => self.el1.spsr = SavedPstate(v),
             Slot::Esr => self.el1.esr = Syndrome(v & 0xffff_ffff),
@@ -227,26 +227,47 @@ impl CpuState {
             syndrome: Syndrome(0x0200_0000),
         };
         let slot = Slot::decode(r).ok_or(undefined)?;
-        if (read && matches!(slot, Slot::Named(17 | 18)))
-            || (!read && matches!(slot, Slot::CurrentEl | Slot::Named(12 | 15 | 16)))
+        if (read && matches!(slot, Slot::Named(NamedSlot::IccEoir1 | NamedSlot::IccSgi1r)))
+            || (!read
+                && matches!(
+                    slot,
+                    Slot::CurrentEl
+                        | Slot::Named(NamedSlot::Cntvct | NamedSlot::Mpidr | NamedSlot::IccIar1)
+                ))
             || (matches!(slot, Slot::SpEl0) && self.pstate.sp == StackSelect::El0)
         {
             return Err(undefined);
         }
-        if self.pstate.el == ExceptionLevel::El0 && !read && matches!(slot, Slot::Named(11)) {
+        if self.pstate.el == ExceptionLevel::El0
+            && !read
+            && matches!(slot, Slot::Named(NamedSlot::Cntfrq))
+        {
             return Err(undefined);
         }
         let allowed = match slot {
-            Slot::Named(3 | 6 | 7) | Slot::Nzcv => true,
-            Slot::Named(4) => read,
-            Slot::Named(11) => read && self.el1.cntkctl.0 & 3 != 0,
-            Slot::Named(12) => read && self.el1.cntkctl.0 & 2 != 0,
-            Slot::Named(13 | 14) => self.el1.cntkctl.0 & (1 << 8) != 0,
+            Slot::Named(NamedSlot::TpidrEl0 | NamedSlot::Fpcr | NamedSlot::Fpsr) | Slot::Nzcv => {
+                true
+            }
+            Slot::Named(NamedSlot::TpidrroEl0) => read,
+            Slot::Named(NamedSlot::Cntfrq) => read && self.el1.cntkctl.0 & 3 != 0,
+            Slot::Named(NamedSlot::Cntvct) => read && self.el1.cntkctl.0 & 2 != 0,
+            Slot::Named(NamedSlot::CntvCtl | NamedSlot::CntvCval) => {
+                self.el1.cntkctl.0 & (1 << 8) != 0
+            }
             Slot::Daif => self.el1.sctlr.0 & (1 << 9) != 0,
             _ => false,
         };
         if self.pstate.el == ExceptionLevel::El0 && !allowed {
-            if !matches!(slot, Slot::Daif | Slot::Named(11..=14)) {
+            if !matches!(
+                slot,
+                Slot::Daif
+                    | Slot::Named(
+                        NamedSlot::Cntfrq
+                            | NamedSlot::Cntvct
+                            | NamedSlot::CntvCtl
+                            | NamedSlot::CntvCval
+                    )
+            ) {
                 return Err(undefined);
             }
             let rt = match rt {
@@ -269,7 +290,7 @@ impl CpuState {
 }
 #[derive(Clone, Copy)]
 enum Slot {
-    Named(usize),
+    Named(NamedSlot),
     Elr,
     Spsr,
     Esr,
@@ -292,25 +313,25 @@ impl Slot {
     fn decode(r: SystemRegister) -> Option<Self> {
         use NamedSystemRegister as N;
         Some(match N::from_encoding(r) {
-            N::Ttbr0El1 => Self::Named(0),
-            N::Ttbr1El1 => Self::Named(1),
+            N::Ttbr0El1 => Self::Named(NamedSlot::Ttbr0),
+            N::Ttbr1El1 => Self::Named(NamedSlot::Ttbr1),
             N::SpEl0 => Self::SpEl0,
-            N::TpidrEl0 => Self::Named(3),
-            N::TpidrroEl0 => Self::Named(4),
-            N::ContextidrEl1 => Self::Named(5),
-            N::Fpcr => Self::Named(6),
-            N::Fpsr => Self::Named(7),
+            N::TpidrEl0 => Self::Named(NamedSlot::TpidrEl0),
+            N::TpidrroEl0 => Self::Named(NamedSlot::TpidrroEl0),
+            N::ContextidrEl1 => Self::Named(NamedSlot::Contextidr),
+            N::Fpcr => Self::Named(NamedSlot::Fpcr),
+            N::Fpsr => Self::Named(NamedSlot::Fpsr),
             N::Daif => Self::Daif,
             N::Pan => Self::Pan,
-            N::ParEl1 => Self::Named(10),
-            N::CntfrqEl0 => Self::Named(11),
-            N::CntvctEl0 => Self::Named(12),
-            N::CntvCtlEl0 => Self::Named(13),
-            N::CntvCvalEl0 => Self::Named(14),
-            N::MpidrEl1 => Self::Named(15),
-            N::IccIar1El1 => Self::Named(16),
-            N::IccEoir1El1 => Self::Named(17),
-            N::IccSgi1rEl1 => Self::Named(18),
+            N::ParEl1 => Self::Named(NamedSlot::Par),
+            N::CntfrqEl0 => Self::Named(NamedSlot::Cntfrq),
+            N::CntvctEl0 => Self::Named(NamedSlot::Cntvct),
+            N::CntvCtlEl0 => Self::Named(NamedSlot::CntvCtl),
+            N::CntvCvalEl0 => Self::Named(NamedSlot::CntvCval),
+            N::MpidrEl1 => Self::Named(NamedSlot::Mpidr),
+            N::IccIar1El1 => Self::Named(NamedSlot::IccIar1),
+            N::IccEoir1El1 => Self::Named(NamedSlot::IccEoir1),
+            N::IccSgi1rEl1 => Self::Named(NamedSlot::IccSgi1r),
             N::Unnamed(_) => match (r.op0, r.op1, r.crn, r.crm, r.op2) {
                 (3, 0, 4, 0, 1) => Self::Elr,
                 (3, 0, 4, 0, 0) => Self::Spsr,
@@ -329,5 +350,89 @@ impl Slot {
                 _ => return None,
             },
         })
+    }
+}
+
+/// D13 named register backing. Timer/GIC values are passive state; A3 owns
+/// time advancement and interrupt-controller effects. FP access is enabled
+/// in this EL0/EL1 profile (no EL2/EL3 or FP access traps).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct NamedRegisters {
+    pub ttbr0: SystemValue,
+    pub ttbr1: SystemValue,
+    pub tpidrel0: SystemValue,
+    pub tpidrroel0: SystemValue,
+    pub contextidr: SystemValue,
+    pub fpcr: SystemValue,
+    pub fpsr: SystemValue,
+    pub par: SystemValue,
+    pub cntfrq: SystemValue,
+    pub cntvct: SystemValue,
+    pub cntvctl: SystemValue,
+    pub cntvcval: SystemValue,
+    pub mpidr: SystemValue,
+    pub icciar1: SystemValue,
+    pub icceoir1: SystemValue,
+    pub iccsgi1r: SystemValue,
+}
+#[derive(Clone, Copy)]
+enum NamedSlot {
+    Ttbr0,
+    Ttbr1,
+    TpidrEl0,
+    TpidrroEl0,
+    Contextidr,
+    Fpcr,
+    Fpsr,
+    Par,
+    Cntfrq,
+    Cntvct,
+    CntvCtl,
+    CntvCval,
+    Mpidr,
+    IccIar1,
+    IccEoir1,
+    IccSgi1r,
+}
+impl NamedRegisters {
+    fn read(&self, slot: NamedSlot) -> SystemValue {
+        match slot {
+            NamedSlot::Ttbr0 => self.ttbr0,
+            NamedSlot::Ttbr1 => self.ttbr1,
+            NamedSlot::TpidrEl0 => self.tpidrel0,
+            NamedSlot::TpidrroEl0 => self.tpidrroel0,
+            NamedSlot::Contextidr => self.contextidr,
+            NamedSlot::Fpcr => self.fpcr,
+            NamedSlot::Fpsr => self.fpsr,
+            NamedSlot::Par => self.par,
+            NamedSlot::Cntfrq => self.cntfrq,
+            NamedSlot::Cntvct => self.cntvct,
+            NamedSlot::CntvCtl => self.cntvctl,
+            NamedSlot::CntvCval => self.cntvcval,
+            NamedSlot::Mpidr => self.mpidr,
+            NamedSlot::IccIar1 => self.icciar1,
+            NamedSlot::IccEoir1 => self.icceoir1,
+            NamedSlot::IccSgi1r => self.iccsgi1r,
+        }
+    }
+    fn write(&mut self, slot: NamedSlot, value: SystemValue) {
+        match slot {
+            NamedSlot::Ttbr0 => self.ttbr0 = value,
+            NamedSlot::Ttbr1 => self.ttbr1 = value,
+            NamedSlot::TpidrEl0 => self.tpidrel0 = value,
+            NamedSlot::TpidrroEl0 => self.tpidrroel0 = value,
+            NamedSlot::Contextidr => self.contextidr = value,
+            NamedSlot::Fpcr => self.fpcr = value,
+            NamedSlot::Fpsr => self.fpsr = value,
+            NamedSlot::Par => self.par = value,
+            NamedSlot::Cntfrq => self.cntfrq = value,
+            NamedSlot::Cntvct => self.cntvct = value,
+            NamedSlot::CntvCtl => self.cntvctl = value,
+            NamedSlot::CntvCval => self.cntvcval = value,
+            NamedSlot::Mpidr => self.mpidr = value,
+            NamedSlot::IccIar1 => self.icciar1 = value,
+            NamedSlot::IccEoir1 => self.icceoir1 = value,
+            NamedSlot::IccSgi1r => self.iccsgi1r = value,
+        }
     }
 }

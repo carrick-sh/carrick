@@ -52,6 +52,7 @@ pub enum Exception {
     Hvc(u16),
     Brk(u16),
     Unknown,
+    SystemAccess(SystemAccessException),
     Irq,
     Fiq,
     SError,
@@ -75,6 +76,9 @@ pub enum ExceptionOutcome {
 /// of LDTR/STTR permission regime. Scalar EL1-target faults have ISV=0;
 /// S1PTW=0 (a stage-1 table read is not a stage-2 table-walk fault).
 pub fn syndrome(exception: Exception, origin: ExceptionLevel) -> Syndrome {
+    if let Exception::SystemAccess(error) = exception {
+        return error.syndrome;
+    }
     let current = u64::from(origin == ExceptionLevel::El1);
     let (ec, iss) = match exception {
         Exception::Svc(i) => (0x15, u64::from(i)),
@@ -97,6 +101,12 @@ pub fn syndrome(exception: Exception, origin: ExceptionLevel) -> Syndrome {
 /// switching to EL1h. SVC saves next PC; abort/BRK/IRQ save restart PC.
 /// HVC is Carrick's typed provider boundary, preserving saved EL1 syndrome.
 pub fn take_exception(cpu: &mut CpuState, exception: Exception) -> ExceptionOutcome {
+    let exception =
+        if matches!(exception, Exception::Hvc(_)) && cpu.pstate.el == ExceptionLevel::El0 {
+            Exception::Unknown
+        } else {
+            exception
+        };
     if let Exception::Hvc(immediate) = exception {
         return ExceptionOutcome::ProviderExit(ProviderExit { immediate });
     }
