@@ -61,16 +61,31 @@ A message call (sendmsg, recvmsg, sendmmsg, recvmmsg; #2418, glibc's
 resolver sends its A and AAAA queries with one sendmmsg) is one record whose
 segments are the caller's own headers, iovec arrays, buffers and socket
 addresses at their user addresses, so the carrier runs its one handler for
-each on the staged memory. Linux's own refusals come first (iovlen over
-UIO_MAXIOV is EMSGSIZE, a negative namelen EINVAL), and a send's namelen is
-clamped to sockaddr_storage, as the Docker oracle shows. A receive's buffers
-are fitted to one record's data range, which any datagram fits; a send whose
-data does not fit is EMSGSIZE on a datagram socket. A batch stages every
-message it sends, or the received messages that fit whole. The carrier
-sends with MSG_NOSIGNAL and the ring raises the caller's own SIGPIPE. A send
-with ancillary data, a blocking stream send or MSG_WAITALL stream receive (a
-message call has no transfer continuation yet), and a call larger than one
-record stay a counted ENOSYS, never a guessed result.
+each on the staged memory. Its outputs are exactly what Linux writes: a
+received message's buffers, name, msg_namelen, msg_controllen and msg_flags,
+and each batched message's msg_len. Each is supplied writable before the
+crossing (a header on an unbroken copy-on-write page faults first), and the
+copy-back carries only bytes the call wrote, never the staged snapshot of
+the rest of a header. Linux's own refusals come first (iovlen over
+UIO_MAXIOV is EMSGSIZE, a negative namelen with a name EINVAL, iovec
+lengths whose sum overflows ssize_t EINVAL), and a send's namelen is
+clamped to sockaddr_storage. A receive's buffers are fitted to one record's
+data range, which any datagram fits; a sendmsg whose data does not fit is
+EMSGSIZE on a datagram socket. vlen is an unsigned int, clamped to
+UIO_MAXIOV. A batch crosses whole: a later entry that faults or fails
+before moving anything ends it there, and the call answers the entries
+moved before it (a supplied fault retries the whole batch). The carrier
+sends with MSG_NOSIGNAL and the ring raises the caller's own SIGPIPE for
+sendmsg and sendmmsg without MSG_NOSIGNAL. A counted ENOSYS, never a
+guessed result, answers every shape one record cannot serve exactly:
+ancillary data either way (any non-zero msg_controllen), a batch whose
+entries do not all fit one record, a recvmmsg timeout, a blocking recvmmsg
+of more than one message without MSG_WAITFORONE, a blocking stream send or
+MSG_WAITALL stream receive, a stream sendmmsg of more than one message, a
+sendmsg larger than one record on a stream socket, and output ranges that
+overlap. A recvmmsg whose later entry fails answers the count received but
+does not hold that entry's error for the socket's next call, as Linux's
+does.
 
 A socket the run root created and a native child inherited is a physical
 hold of the root's description (its fstat answers S_IFSOCK). It has no
@@ -110,12 +125,25 @@ vm_free = [
   "carrick-kernel::dispatch::native_files::tests::an_inherited_root_socket_is_never_enotsock_in_a_native_child",
   "carrick-el1-linux::dispatch::tests::native_host_file_stage_stages_a_fork_childs_resolver_messages",
   "carrick-kernel::dispatch::native_files::tests::a_native_childs_resolver_messages_cross_as_linux",
+  "carrick-personality-linux::native_host_file::tests::a_message_header_linux_writes_back_is_supplied_writable_before_the_crossing",
+  "carrick-personality-linux::native_host_file::tests::message_control_data_is_a_counted_refusal_in_either_direction",
+  "carrick-personality-linux::native_host_file::tests::a_later_batch_entry_that_faults_moves_the_entries_before_it",
+  "carrick-personality-linux::native_host_file::tests::a_receive_batch_is_staged_whole_or_refused",
+  "carrick-personality-linux::native_host_file::tests::a_message_header_declares_only_the_fields_linux_writes_back",
+  "carrick-personality-linux::native_host_file::tests::message_header_errors_and_name_lengths_answer_as_linux",
+  "carrick-personality-linux::native_host_file::tests::a_message_send_that_fails_epipe_owes_sigpipe_unless_msg_nosignal",
+  "carrick-kernel::dispatch::native_files::tests::a_native_message_receive_writes_back_only_the_header_fields_linux_writes",
+  "carrick-kernel::dispatch::native_files::tests::a_native_blocking_recvmmsg_waits_for_one_only_with_msg_waitforone",
+  "carrick-kernel::dispatch::native_files::tests::native_message_calls_one_record_cannot_answer_are_emsgsize_or_refused",
+  "carrick-kernel::dispatch::net::send_recv::recvmmsg_tests::recvmmsg_answers_the_count_received_before_a_failing_entry",
+  "carrick-el1-linux::dispatch::tests::native_host_file_stage_supplies_a_fork_childs_message_ranges_first",
+  "carrick-x86-cpl0::native_stage::tests::descendant_message_calls_supply_their_ranges_before_crossing",
 ]
 embed = [
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_tcp_and_udp_cross_to_the_host_network (fork child: blocking TCP connect/send/recv/shutdown/EOF, UDP sendto + poll + recvfrom, poll timeout, non-blocking connect + poll(POLLOUT) + SO_ERROR, TCP over ::1)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_calls_run_under_the_childs_own_identity (fork child: TCP SO_PEERCRED {0,-1,-1}, 64 KiB recv, a 100000-byte blocking send returns 100000, SIGPIPE on EPIPE / none with MSG_NOSIGNAL / write raises it, setresuid(1000) then raw ICMP socket EPERM and TCP socket still opens)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_transfers_keep_their_whole_extent (fork child: 65000-byte UDP send and recv whole, 100000-byte UDP send EMSGSIZE with nothing transmitted, a short recv buffer truncates a datagram and discards its rest, a 409600-byte blocking TCP send into a small window returns 409600, a 200000-byte MSG_WAITALL recv returns 200000)",
-  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_glibc_resolver_calls_answer_as_linux (fork child against loopback name servers, the Docker oracle's values for the same static fixture: Go's dial (AF_INET6 connect, write, poll, read) and glibc's sendmmsg of A and AAAA (2; msg_len 7 and 10), recvfrom of each answer, sendmsg, recvmsg (namelen 16) and recvmmsg of one)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_glibc_resolver_calls_answer_as_linux (fork child against loopback name servers, the Docker oracle's values for the same static fixture: Go's dial (AF_INET6 connect, write, poll, read) and glibc's sendmmsg of A and AAAA (2; msg_len 7 and 10), recvfrom of each answer, sendmsg, recvmsg (namelen 16) and recvmmsg of one, each header on a page the call writes first; then a sendmmsg of two whose second entry is unmapped (1, msg_len 7) and a sendmsg larger than any datagram (EMSGSIZE), as the same fixture answers natively on Linux 6.12 x86_64)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_repoll_after_eintr_waits_its_own_timeout (fork child: a SIGUSR1-interrupted poll is EINTR; the same poll after its deadline passed waits its own timeout; a blocking recvfrom interrupted under SA_RESTART restarts and receives)",
 ]
 
