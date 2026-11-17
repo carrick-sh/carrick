@@ -1,5 +1,6 @@
-//! Arm ARM DDI0487G.a D1.10 exception entry / AArch64.TakeException,
-//! D1.11 exception return / AArch64.ExceptionReturn, and D13.2 ESR_EL1.
+//! Arm ARM DDI0487G.a D1.10 exception entry / AArch64.TakeException (J1-7877–7878),
+//! D1.11 exception return / AArch64.ExceptionReturn (J1-7951),
+//! SetPSTATEFromPSR (J1-8205–8206), and D13.2.37 ESR_EL1.
 //! Pure virtual transitions; no host exceptions or provider actions.
 use crate::state::*;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +24,7 @@ pub enum Access {
     Read,
     Write,
 }
-/// D13.2 ESR_EL1 IFSC/DFSC tables. L0 AF/permission requires LPA2;
+/// D13.2.37 ESR_EL1 IFSC/DFSC tables. L0 AF/permission requires LPA2;
 /// represented by a separate leaf level type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultStatus {
@@ -71,7 +72,7 @@ pub enum ExceptionOutcome {
     Entered,
     ProviderExit(ProviderExit),
 }
-/// D13.2 ESR_EL1 EC and instruction/data abort ISS tables, plus
+/// D13.2.37 ESR_EL1 EC and instruction/data abort ISS tables, plus
 /// shared pseudocode ExceptionSyndrome. Origin is execution EL, independent
 /// of LDTR/STTR permission regime. Scalar EL1-target faults have ISV=0;
 /// S1PTW=0 (a stage-1 table read is not a stage-2 table-walk fault).
