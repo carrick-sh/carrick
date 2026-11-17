@@ -1336,6 +1336,11 @@ fn execute(
         .map(fs::canonicalize)
         .transpose()
         .map_err(|e| fail(e.to_string()))?;
+    if let Err(error) = crate::host_load::check() {
+        let error = fail(error.to_string());
+        write(&output.join("execution-error.txt"), error.to_string())?;
+        return Err(error);
+    }
     let host_identity = crate::accept::SignedHostIdentity::capture();
     let reuse_ctx = reuse_base.map(|reuse_dir| ReuseExecutionContext {
         root,
@@ -1616,10 +1621,7 @@ fn execute_one(
     let tree = fs::canonicalize(&tree).map_err(|e| fail(e.to_string()))?;
     let receipt_path = output.join(receipt_name);
     let result = side_phases(
-        |mode| {
-            crate::host_load::check().map_err(|e| fail(e.to_string()))?;
-            HostLease::acquire(mode).map_err(|e| fail(e.to_string()))
-        },
+        |mode| HostLease::acquire(mode).map_err(|e| fail(e.to_string())),
         |phase, lease| {
             let xtask = std::env::current_exe().map_err(|e| fail(e.to_string()))?;
             if phase == SidePhase::Build {
