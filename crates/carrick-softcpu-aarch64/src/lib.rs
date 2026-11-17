@@ -606,6 +606,8 @@ mod instruction {
     pub enum Instruction {
         Unallocated,
         Barrier(crate::Barrier),
+        SystemAccess(crate::SystemAccess),
+        PstateImmediate(crate::PstateImmediate),
         CensusGap(Decoded),
         Hint(Hint),
         Arithmetic(Arithmetic),
@@ -1479,7 +1481,7 @@ mod instruction {
         Zr,
     }
     impl OperandRegister {
-        fn field(bits: u32, sp: bool) -> Self {
+        pub(crate) fn field(bits: u32, sp: bool) -> Self {
             match bits & 31 {
                 31 if sp => Self::Sp,
                 31 => Self::Zr,
