@@ -623,6 +623,34 @@ pub(super) fn widen_stream_socket_buffers(
     Ok(())
 }
 
+/// Smallest host `SO_SNDBUF` that lets a Linux-sized datagram through: Linux
+/// accepts up to 65,507 payload bytes per UDP datagram, while macOS defaults a
+/// datagram socket's send buffer to `net.inet.udp.maxdgram` (9,216) and fails a
+/// larger send with `EMSGSIZE` (the director measured on macOS: the default
+/// buffer fails 9,217/65,000/65,507-byte sends, `SO_SNDBUF=65535` and 1 MiB
+/// send them in full; `kern.ipc.maxsockbuf` is 8 MiB).
+const HOST_DGRAM_SNDBUF_TARGET: libc::c_int = 1024 * 1024;
+const HOST_DGRAM_SNDBUF_FLOOR: libc::c_int = 65_535;
+
+/// Give an AF_INET/AF_INET6 datagram socket a host send buffer that admits a
+/// whole Linux datagram, so the host does not answer `EMSGSIZE` below Linux's
+/// own 65,507-byte ceiling. Best-effort like [`widen_stream_socket_buffers`]:
+/// a host that rejects or clamps the request keeps its existing buffer and
+/// socket creation still succeeds. Only the SEND buffer matters (a datagram
+/// larger than it is rejected at `sendto`); the guest-visible
+/// `getsockopt(SO_SNDBUF)` stays the guest-intended value, never this host
+/// value.
+pub(super) fn widen_datagram_send_buffer(host_fd: i32, family: i32, base_type: i32) {
+    if base_type != LINUX_SOCK_DGRAM || !matches!(family, LINUX_AF_INET | LINUX_AF_INET6) {
+        return;
+    }
+    for size in [HOST_DGRAM_SNDBUF_TARGET, HOST_DGRAM_SNDBUF_FLOOR] {
+        if set_host_socket_buffer_size(host_fd, libc::SO_SNDBUF, size).is_ok() {
+            return;
+        }
+    }
+}
+
 pub(super) fn linux_to_host_socktype(t: i32) -> i32 {
     // Linux and macOS agree on the numeric values for the BSD socket
     // types we care about (1=STREAM, 2=DGRAM, 3=RAW, 5=SEQPACKET).

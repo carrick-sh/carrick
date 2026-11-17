@@ -2121,6 +2121,9 @@ pub(in crate::dispatch) fn create_host_socket(
         unsafe { libc::close(host_fd) };
         return Err(errno);
     }
+    // A datagram socket's host send buffer bounds the largest datagram the
+    // host accepts (macOS defaults it to 9,216): raise it to Linux's ceiling.
+    widen_datagram_send_buffer(host_fd, family, base_type);
     Ok(host_fd)
 }
 
