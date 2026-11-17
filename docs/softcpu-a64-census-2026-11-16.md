@@ -137,3 +137,32 @@ or promote an Unknown word to a recognized instruction.
 | `0x9acd21cd` | variable shifts | 8 | `0x2d04129e58` |
 | `0x1ac82528` | variable shifts | 7 | `0x2d0402bc9c` |
 | `0x9ada2108` | variable shifts | 7 | `0x2d0408f290` |
+
+## Hosted decode gate (#2454)
+
+`just a64-census-gate` builds the production ELF through the CLI's
+`carrick-el1-image` dependency on Linux. Cargo build-script JSON identifies the
+fresh image's output directory. The gate runs the production census with
+`--strict`, then all ignored softcpu integration witnesses, including both
+real-image tests and the LLVM operand differentials (#2470). It sets
+`CARRICK_A64_ELF` and uses the pinned Rust sysroot's `llvm-objdump` through
+`CARRICK_LLVM_OBJDUMP` (an explicit override is accepted). No guest VM boots.
+The toolchain must include `aarch64-unknown-none-softfloat` and LLVM tools;
+`jq` is required. Build metadata and the census report remain under
+`$CARGO_TARGET_DIR/a64-census-gate` (default `target/a64-census-gate`).
+
+The report includes `typed_undecoded_count` and `typed_undecoded`, retaining
+span, address, encoding and classifier class for each word the typed decoder
+rejects. Classifier unknowns remain a separate population; the two populations
+may overlap. Report mode exits zero; strict mode rejects either population.
+These are static decoding checks, not evidence of instruction execution.
+
+For a known-answer negative run, pass a copy of the ELF with an executable
+mapping-symbol word replaced by `0xffffffff` to
+`just a64-census-gate /path/to/corrupted.elf`. The override affects the census
+and both real-image witnesses. To check the LLVM harness fails closed, run with
+`CARRICK_LLVM_OBJDUMP=/bin/false`; the differentials must fail.
+
+The director-supplied hosted job is advisory initially. Its stable check name
+is `A64 census gate` (job id `a64-census-gate`); do not add it to `ci-ok` or
+branch-protection requirements until the director promotes it.
