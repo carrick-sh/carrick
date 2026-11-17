@@ -3774,6 +3774,76 @@ fn fork_reservation_refusal_from_concurrent_munmap_rolls_back_without_quarantine
     assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
 }
 
+/// #2441: a fork whose scratch the kernel heap cannot hold is refused at
+/// stage Scratch with ENOMEM, as Linux answers an exhausted fork, never
+/// EFAULT. The refusal hands every loaned table back and frees the closed
+/// child space, so the next fork on the same entry succeeds.
+#[test]
+fn fork_scratch_exhaustion_answers_enomem_and_returns_the_loan() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let initial_stock = [
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ];
+    let crossing = TestStockCrossing::new(&initial_stock);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+    let mut entry = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap();
+
+    assert!(carrick_core::mm::fork::inject_scratch_exhausted_once());
+    let refused = entry.fork(ProcessForkChildTid::NONE);
+    let LifecycleOutcome::Returned { result, .. } = refused else {
+        panic!(
+            "an exhausted fork scratch must answer, not {}",
+            super::native_process_runtime::host_test_support::outcome_kind(&refused)
+        );
+    };
+    assert_eq!(result.raw(), -12, "fork scratch exhaustion is ENOMEM");
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
+    assert!(crossing.pending_loan.lock().unwrap().is_none());
+    assert_eq!(
+        crossing.grant_tables.lock().unwrap().len(),
+        initial_stock.len(),
+        "the refused fork must return every loaned table page"
+    );
+    assert!(
+        fixture.zone.spaces.find(2).is_none(),
+        "the refused fork must free the closed child space"
+    );
+
+    let second = entry.fork(ProcessForkChildTid::NONE);
+    assert!(
+        matches!(second, LifecycleOutcome::Returned { result, .. } if result.raw() > 0),
+        "the next fork after a scratch refusal must succeed"
+    );
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 2);
+    assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
+}
+
 #[test]
 fn fork_reserve_refusal_retains_diagnostic_stage_and_retryable_errno() {
     let fixture = Fixture::new(0x10000, asid(1));

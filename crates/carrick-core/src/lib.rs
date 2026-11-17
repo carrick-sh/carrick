@@ -24,7 +24,8 @@ pub use personality::{
     TaskKey, TaskSerial, ThreadKey, UserMemory, UserStackOffset,
 };
 
-#[cfg(test)]
+// Host test-support failpoints are per test thread.
+#[cfg(any(test, all(feature = "test-support", not(target_os = "none"))))]
 extern crate std;
 
 pub mod affinity;
