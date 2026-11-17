@@ -175,5 +175,42 @@ fn system(w: u32) -> Option<Instruction> {
     }))
 }
 pub(crate) fn decode(w: u32) -> Option<Instruction> {
-    barrier(w).or_else(|| system(w))
+    barrier(w).or_else(|| system(w)).or_else(|| exception(w))
+}
+
+/// DDI0487G.a C6.2.37 BRK, C6.2.76–78 DCPS1/2/3, C6.2.93 HLT,
+/// C6.2.94 HVC, C6.2.241 SMC, C6.2.321 SVC;
+/// C4.1.3 Exception generation encoding index, pp. C4-286–287.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceptionKind {
+    Svc,
+    Hvc,
+    Smc,
+    Brk,
+    Hlt,
+    Dcps1,
+    Dcps2,
+    Dcps3,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExceptionGeneration {
+    pub kind: ExceptionKind,
+    pub immediate: u16,
+}
+fn exception(w: u32) -> Option<Instruction> {
+    let kind = match w & 0xffe0001f {
+        0xd4000001 => ExceptionKind::Svc,
+        0xd4000002 => ExceptionKind::Hvc,
+        0xd4000003 => ExceptionKind::Smc,
+        0xd4200000 => ExceptionKind::Brk,
+        0xd4400000 => ExceptionKind::Hlt,
+        0xd4a00001 => ExceptionKind::Dcps1,
+        0xd4a00002 => ExceptionKind::Dcps2,
+        0xd4a00003 => ExceptionKind::Dcps3,
+        _ => return None,
+    };
+    Some(Instruction::ExceptionGeneration(ExceptionGeneration {
+        kind,
+        immediate: ((w >> 5) & 0xffff) as u16,
+    }))
 }
