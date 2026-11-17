@@ -223,9 +223,11 @@ struct PendingClockSample {
 }
 
 /// A staged host-file write's gathered prefix, written instead if the
-/// stage fault that stopped its gather is refused (Linux's short write).
+/// stage fault that stopped its gather is refused (Linux's short write), or
+/// a message batch's entries before the one that faulted, with its output.
 struct RefusedStagePrefix<'a> {
     record: Box<[u8]>,
+    output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
     call: NativeServiceCall<'a>,
 }
 
@@ -1275,16 +1277,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         fault: carrick_guest_arch::FaultInfo,
         fault_sequence: Option<core::num::NonZeroU64>,
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
-        prefix: Option<(Box<[u8]>, NativeServiceCall<'a>)>,
+        prefix: Option<(
+            Box<[u8]>,
+            Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+            NativeServiceCall<'a>,
+        )>,
     ) -> Result<NativeResume, NativeProcessError> {
         self.begin_service_inner(
             ServiceOperation::Fault(fault),
             fault_sequence,
             owner_wait,
             match prefix {
-                Some((record, call)) => {
-                    ServicePayload::StagePrefix(RefusedStagePrefix { record, call })
-                }
+                Some((record, output, call)) => ServicePayload::StagePrefix(RefusedStagePrefix {
+                    record,
+                    output,
+                    call,
+                }),
                 None => ServicePayload::None,
             },
             ServiceCompletion::RetrySyscall,
@@ -3795,12 +3803,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
             && let Some(prefix) = pending.stage_prefix.take()
         {
-            // The staged write made no effect before its fault: write the
-            // gathered prefix now, as Linux returns the bytes before a fault.
+            // The staged call made no effect before its fault: serve the
+            // gathered prefix now, as Linux returns what moved before it.
             self.release_service_claim(pending.claim)?;
             return self.begin_host_file_service(
                 prefix.record,
-                None,
+                prefix.output,
                 false,
                 None,
                 false,

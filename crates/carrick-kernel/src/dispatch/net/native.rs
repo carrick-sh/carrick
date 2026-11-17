@@ -240,7 +240,10 @@ pub(in crate::dispatch) mod observed_caller {
 
 /// Staged user memory of one call: exactly the ranges the ring staged.
 /// Any other access faults, as the caller's own memory would for a range
-/// Linux's call does not touch. Writes record each range's written extent.
+/// Linux's call does not touch. A write lands in a range the call may write
+/// and records exactly what it wrote (#2418 review P0-5): each range's
+/// writes are one run, so its copy-back is only bytes the call wrote, never
+/// the snapshot staging took of the rest.
 pub(in crate::dispatch) struct StagedMemory {
     segments: Vec<StagedSegment>,
 }
@@ -248,6 +251,7 @@ pub(in crate::dispatch) struct StagedMemory {
 struct StagedSegment {
     segment: NetSegment,
     bytes: Vec<u8>,
+    /// The bytes the call wrote, `[start, end)`: one run.
     written: Option<(usize, usize)>,
 }
 
@@ -265,11 +269,17 @@ impl StagedMemory {
         }
     }
 
-    fn find(&self, address: u64, len: usize) -> Option<(usize, usize)> {
-        self.segments.iter().enumerate().find_map(|(index, held)| {
-            let offset = usize::try_from(address.checked_sub(held.segment.address)?).ok()?;
-            (offset.checked_add(len)? <= held.bytes.len()).then_some((index, offset))
-        })
+    /// The segment holding `[address, address + len)` whole, and its
+    /// offset there: among the ranges the call may write when `output`.
+    fn find(&self, address: u64, len: usize, output: bool) -> Option<(usize, usize)> {
+        self.segments
+            .iter()
+            .enumerate()
+            .filter(|(_, held)| !output || held.segment.output)
+            .find_map(|(index, held)| {
+                let offset = usize::try_from(address.checked_sub(held.segment.address)?).ok()?;
+                (offset.checked_add(len)? <= held.bytes.len()).then_some((index, offset))
+            })
     }
 
     /// The call's `facts` and the written extent of each output range, in
@@ -290,8 +300,7 @@ impl StagedMemory {
 
 impl carrick_guest_mem::GuestMemory for StagedMemory {
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
-        self.find(address, length)
-            .is_some_and(|(index, _)| self.segments[index].segment.output)
+        self.find(address, length, true).is_some()
     }
 
     fn read_bytes_raw(
@@ -300,7 +309,7 @@ impl carrick_guest_mem::GuestMemory for StagedMemory {
         length: usize,
     ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
         let (index, offset) = self
-            .find(address, length)
+            .find(address, length, false)
             .ok_or(carrick_guest_mem::MemoryError::OutOfBounds { address, length })?;
         Ok(self.segments[index].bytes[offset..offset + length].to_vec())
     }
@@ -311,17 +320,37 @@ impl carrick_guest_mem::GuestMemory for StagedMemory {
         bytes: &[u8],
     ) -> Result<(), carrick_guest_mem::MemoryError> {
         let length = bytes.len();
-        let (index, offset) = self
-            .find(address, length)
-            .filter(|(index, _)| self.segments[*index].segment.output)
-            .ok_or(carrick_guest_mem::MemoryError::OutOfBounds { address, length })?;
-        let held = &mut self.segments[index];
-        held.bytes[offset..offset + length].copy_from_slice(bytes);
+        if length == 0 {
+            return Ok(());
+        }
+        let out_of_bounds = || carrick_guest_mem::MemoryError::OutOfBounds { address, length };
+        let (index, offset) = self.find(address, length, true).ok_or_else(out_of_bounds)?;
         let end = offset + length;
+        let held = &mut self.segments[index];
         held.written = Some(match held.written {
-            Some((start, previous)) => (start.min(offset), previous.max(end)),
             None => (offset, end),
+            Some((start, previous)) if offset <= previous && end >= start => {
+                (start.min(offset), previous.max(end))
+            }
+            // Apart from the call's earlier write, the copy-back would
+            // carry the unwritten bytes between them.
+            Some(_) => return Err(out_of_bounds()),
         });
+        held.bytes[offset..end].copy_from_slice(bytes);
+        // Every other staged copy of these bytes reads what the call wrote,
+        // as the caller's own memory would.
+        let stop = address + length as u64;
+        for (other, held) in self.segments.iter_mut().enumerate() {
+            let first = held.segment.address;
+            let start = address.max(first);
+            let last = stop.min(first.saturating_add(held.bytes.len() as u64));
+            if other == index || start >= last {
+                continue;
+            }
+            let (from, to) = ((start - address) as usize, (start - first) as usize);
+            let len = (last - start) as usize;
+            held.bytes[to..to + len].copy_from_slice(&bytes[from..from + len]);
+        }
         Ok(())
     }
 }
@@ -399,7 +428,16 @@ fn native_transfer_extent(
 ///   and refused on any other;
 /// - a send that may stop part way on a blocking stream socket, and a
 ///   `MSG_WAITALL` receive on one, are refused: Linux completes them whole,
-///   and a message call has no transfer continuation across records yet.
+///   and a message call has no transfer continuation across records yet;
+/// - a blocking `recvmmsg` of more than one message without
+///   `MSG_WAITFORONE` (Linux waits for them all) or with a timeout (Linux
+///   checks it between datagrams and writes it back) is refused: no
+///   continuation waits for the rest or keeps the deadline (#2418 review
+///   P0-4);
+/// - a `sendmmsg` of more than one message on a socket that is not a
+///   datagram socket is refused: Linux raises SIGPIPE for a later
+///   message's EPIPE while it answers the count sent, and the ring raises
+///   it only for an EPIPE answer.
 fn native_message_admission(
     call: &NetCall<'_>,
     socket: Option<&NativeNetFile>,
@@ -432,6 +470,15 @@ fn native_message_admission(
     let blocking = !nonblock && flags & carrick_abi::LINUX_MSG_DONTWAIT as u64 == 0;
     let whole = send || flags & carrick_abi::LINUX_MSG_WAITALL as u64 != 0;
     if blocking && whole && !datagram {
+        return Some(NetServed::Refused);
+    }
+    if call.canonical == nr::RECVMMSG.raw()
+        && (args[4] != 0
+            || blocking && args[2] > 1 && flags & carrick_abi::LINUX_MSG_WAITFORONE as u64 == 0)
+    {
+        return Some(NetServed::Refused);
+    }
+    if call.canonical == nr::SENDMMSG.raw() && args[2] > 1 && !datagram {
         return Some(NetServed::Refused);
     }
     None

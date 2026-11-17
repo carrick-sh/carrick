@@ -1108,15 +1108,24 @@ enum NativeServiceStage {
         flags: crate::native_process_runtime::NativeEntropyFlags,
         requested: carrick_guest_arch::GuestLen,
     },
-    /// Supply `fault`, then retry the SVC. A refused supply writes the
-    /// staged `prefix` record (a short write) when staging gathered one.
+    /// Supply `fault`, then retry the SVC. A refused supply serves the
+    /// staged `prefix` record and its output (a short write, or a batch's
+    /// entries before the faulting one) when staging built one.
     Fault {
         fault: carrick_guest_arch::FaultInfo,
-        prefix: Option<alloc::boxed::Box<[u8]>>,
+        prefix: Option<StagePrefix>,
     },
     Return(i64),
     Operation,
 }
+
+/// A staged prefix record and its output, served if a stage fault's supply
+/// is refused.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+type StagePrefix = (
+    alloc::boxed::Box<[u8]>,
+    Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+);
 
 struct HostFileCopy<'a, V: file::MemoryValidator>(file::ValidatedCopy<'a, V>);
 
@@ -1364,7 +1373,7 @@ pub(super) struct NativeServiceBegin {
         carrick_guest_arch::GuestLen,
     )>,
     retry_exec_stage: bool,
-    stage_prefix: Option<alloc::boxed::Box<[u8]>>,
+    stage_prefix: Option<StagePrefix>,
     service_wait: Option<carrick_core_abi::PortalOwnerWait>,
 }
 
@@ -1482,11 +1491,13 @@ pub(super) fn native_service_decision(
             Some(
                 carrick_personality_linux::native_host_file::HostFileStage::FaultAfterPrefix {
                     address,
+                    access,
                     prefix,
+                    output,
                 },
             ) => NativeServiceStage::Fault {
-                fault: native_host_file_fault(address, carrick_guest_arch::Access::Read),
-                prefix: Some(prefix),
+                fault: native_host_file_fault(address, access),
+                prefix: Some((prefix, output)),
             },
             Some(carrick_personality_linux::native_host_file::HostFileStage::InRing) => {
                 // An in-zone object the ring does not serve yet never
@@ -1674,9 +1685,10 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
                     fault,
                     fault_sequence,
                     service_wait,
-                    stage_prefix.map(|record| {
+                    stage_prefix.map(|(record, output)| {
                         (
                             record,
+                            output,
                             crate::native_process_runtime::NativeServiceCall::new(
                                 carrick_guest_arch::NativeOrdinal::new(ordinal),
                                 service_counters,
