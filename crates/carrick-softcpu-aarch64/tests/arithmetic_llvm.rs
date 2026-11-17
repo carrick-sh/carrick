@@ -851,3 +851,91 @@ fn generated_logical_matches_llvm_operands() {
         words.len()
     );
 }
+
+#[test]
+#[ignore = "requires Rust-sysroot CARRICK_LLVM_OBJDUMP"]
+fn generated_move_wide_matches_llvm_operands() {
+    let mut words = BTreeSet::new();
+    for sf in 0..2u32 {
+        for opc in 0..4 {
+            for hw in 0..4 {
+                for imm in (0..65536).step_by(127) {
+                    for rd in [0, 17, 30, 31] {
+                        words.insert(sf << 31 | opc << 29 | 0x12800000 | hw << 21 | imm << 5 | rd);
+                    }
+                }
+            }
+        }
+    }
+    assert!(words.len() >= 50_000);
+    let words: Vec<_> = words.into_iter().collect();
+    let path = std::env::temp_dir().join(format!("carrick-a64-movewide-{}.o", std::process::id()));
+    std::fs::write(&path, object(&words)).expect("valid fixture");
+    let output = Command::new(std::env::var_os("CARRICK_LLVM_OBJDUMP").expect("set LLVM"))
+        .args([
+            "-D",
+            "-M",
+            "no-aliases",
+            "--no-show-raw-insn",
+            "--no-leading-addr",
+        ])
+        .arg(&path)
+        .output()
+        .expect("valid fixture");
+    std::fs::remove_file(path).expect("valid fixture");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("valid fixture");
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|s| s.starts_with(' ') && !s.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), words.len());
+    let mut accepted = 0;
+    for (&w, line) in words.iter().zip(lines) {
+        if let Instruction::MoveWide(m) = decode_instruction(w) {
+            let name = match m.operation {
+                MoveWideOperation::Not => "movn",
+                MoveWideOperation::Zero => "movz",
+                MoveWideOperation::Keep => "movk",
+            };
+            let mut expected = format!("{name} {}, #0x{:x}", reg(m.rd, m.width), m.immediate);
+            if m.shift.value() != 0 {
+                expected.push_str(&format!(", lsl #{}", m.shift.value()));
+            }
+            let actual = line
+                .split("//")
+                .next()
+                .expect("instruction")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let expected = if actual.starts_with("mov ") && m.operation != MoveWideOperation::Keep {
+                let value = (m.immediate as u64) << m.shift.value();
+                let value = if m.operation == MoveWideOperation::Not {
+                    !value
+                } else {
+                    value
+                };
+                let value = if m.width == Width::W32 {
+                    value as u32 as i32 as i64
+                } else {
+                    value as i64
+                };
+                let immediate = if value < 0 {
+                    format!("#-0x{:x}", value.unsigned_abs())
+                } else {
+                    format!("#0x{value:x}")
+                };
+                format!("mov {}, {immediate}", reg(m.rd, m.width))
+            } else {
+                expected
+            };
+            assert_eq!(expected, actual, "{w:08x}");
+            accepted += 1;
+        }
+    }
+    println!(
+        "{} distinct move-wide words; {accepted} accepted; 0 wrong class / operand mismatches",
+        words.len()
+    );
+}

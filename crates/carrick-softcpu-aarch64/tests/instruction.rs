@@ -124,3 +124,21 @@ fn move_wide_forms_have_typed_operands() {
         );
     }
 }
+
+#[test]
+fn move_wide_retains_halfword_and_reserved_selectors() {
+    use carrick_softcpu_aarch64::MoveWideOperation;
+    let Instruction::MoveWide(m) = decode_instruction(0xf2e24680) else {
+        panic!("missing move-wide")
+    };
+    assert_eq!(m.operation, MoveWideOperation::Keep);
+    assert_eq!(m.immediate, 0x1234);
+    assert_eq!(m.shift.value(), 48);
+    for word in [0x72c00000, 0x32800000, 0x52e00000] {
+        assert_eq!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
