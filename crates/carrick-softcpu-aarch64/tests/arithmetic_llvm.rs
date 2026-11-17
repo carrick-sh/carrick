@@ -939,3 +939,202 @@ fn generated_move_wide_matches_llvm_operands() {
         words.len()
     );
 }
+
+fn oracle_lines(words: &[u32], group: &str) -> Vec<String> {
+    let path = std::env::temp_dir().join(format!("carrick-a64-{group}-{}.o", std::process::id()));
+    std::fs::write(&path, object(words)).expect("valid fixture");
+    let output = Command::new(std::env::var_os("CARRICK_LLVM_OBJDUMP").expect("set LLVM"))
+        .args([
+            "-D",
+            "-M",
+            "no-aliases",
+            "--no-print-imm-hex",
+            "--no-show-raw-insn",
+            "--no-leading-addr",
+        ])
+        .arg(&path)
+        .output()
+        .expect("valid fixture");
+    std::fs::remove_file(path).expect("valid fixture");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("valid fixture");
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|s| s.starts_with(' ') && !s.trim().is_empty())
+        .map(|line| {
+            line.split("//")
+                .next()
+                .expect("instruction")
+                .split(" <")
+                .next()
+                .expect("instruction")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    assert_eq!(lines.len(), words.len());
+    lines
+}
+
+#[test]
+#[ignore = "requires Rust-sysroot CARRICK_LLVM_OBJDUMP"]
+fn generated_bitfield_matches_llvm_operands() {
+    let mut words = BTreeSet::new();
+    for sf in 0..2u32 {
+        for opc in 0..4 {
+            for n in 0..2 {
+                for r in 0..64 {
+                    for s in 0..64 {
+                        for (rn, rd) in [(1, 0), (31, 31)] {
+                            words.insert(
+                                sf << 31
+                                    | opc << 29
+                                    | 0x13000000
+                                    | n << 22
+                                    | r << 16
+                                    | s << 10
+                                    | rn << 5
+                                    | rd,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let words: Vec<_> = words.into_iter().collect();
+    assert!(words.len() >= 50_000);
+    let mut accepted = 0;
+    for (&w, actual) in words.iter().zip(oracle_lines(&words, "bitfield")) {
+        if let Instruction::Bitfield(b) = decode_instruction(w) {
+            let name = match b.operation {
+                BitfieldOperation::Signed => "sbfm",
+                BitfieldOperation::Merge => "bfm",
+                BitfieldOperation::Unsigned => "ubfm",
+            };
+            let expected = format!(
+                "{name} {}, {}, #{}, #{}",
+                reg(b.rd, b.width),
+                reg(b.rn, b.width),
+                b.rotate.value(),
+                b.last.value()
+            );
+            // Arm ARM C6.2.29/234/337 alias relations. LLVM retains these
+            // aliases even with no-aliases; compare their exact inverse fields.
+            let mnemonic = actual.split_whitespace().next().expect("mnemonic");
+            let rd = reg(b.rd, b.width);
+            let rn = reg(b.rn, b.width);
+            let r = u32::from(b.rotate.value());
+            let last = u32::from(b.last.value());
+            let width = if b.width == Width::W32 { 32 } else { 64 };
+            let expected = match mnemonic {
+                "asr" if b.operation == BitfieldOperation::Signed && last == width - 1 => {
+                    format!("asr {rd}, {rn}, #{r}")
+                }
+                "lsr" if b.operation == BitfieldOperation::Unsigned && last == width - 1 => {
+                    format!("lsr {rd}, {rn}, #{r}")
+                }
+                "lsl" if b.operation == BitfieldOperation::Unsigned && last + 1 == r => {
+                    format!("lsl {rd}, {rn}, #{}", width - r)
+                }
+                "sxtb" | "sxth" | "sxtw"
+                    if b.operation == BitfieldOperation::Signed
+                        && r == 0
+                        && last
+                            == match mnemonic {
+                                "sxtb" => 7,
+                                "sxth" => 15,
+                                _ => 31,
+                            } =>
+                {
+                    format!("{mnemonic} {rd}, {}", reg(b.rn, Width::W32))
+                }
+                "uxtb" | "uxth"
+                    if b.operation == BitfieldOperation::Unsigned
+                        && r == 0
+                        && last == if mnemonic == "uxtb" { 7 } else { 15 } =>
+                {
+                    format!("{mnemonic} {rd}, {}", reg(b.rn, Width::W32))
+                }
+                "sbfx" | "ubfx" | "bfxil"
+                    if last >= r
+                        && b.operation
+                            == match mnemonic {
+                                "sbfx" => BitfieldOperation::Signed,
+                                "ubfx" => BitfieldOperation::Unsigned,
+                                _ => BitfieldOperation::Merge,
+                            } =>
+                {
+                    format!("{mnemonic} {rd}, {rn}, #{r}, #{}", last - r + 1)
+                }
+                "sbfiz" | "ubfiz" | "bfi"
+                    if last < r
+                        && b.operation
+                            == match mnemonic {
+                                "sbfiz" => BitfieldOperation::Signed,
+                                "ubfiz" => BitfieldOperation::Unsigned,
+                                _ => BitfieldOperation::Merge,
+                            } =>
+                {
+                    format!("{mnemonic} {rd}, {rn}, #{}, #{}", width - r, last + 1)
+                }
+                "bfc"
+                    if b.operation == BitfieldOperation::Merge
+                        && b.rn == OperandRegister::Zr
+                        && last < r =>
+                {
+                    format!("bfc {rd}, #{}, #{}", width - r, last + 1)
+                }
+                _ => expected,
+            };
+            assert_eq!(expected, actual, "{w:08x}");
+            accepted += 1;
+        }
+    }
+    println!(
+        "{} distinct bitfield words; {accepted} accepted; 0 wrong class / operand mismatches",
+        words.len()
+    );
+}
+
+#[test]
+#[ignore = "requires Rust-sysroot CARRICK_LLVM_OBJDUMP"]
+fn generated_address_matches_llvm_operands() {
+    let mut words = BTreeSet::new();
+    for page in 0..2u32 {
+        for lo in 0..4 {
+            for hi in (0..524288).step_by(127) {
+                for rd in [0, 17, 31] {
+                    words.insert(page << 31 | lo << 29 | 0x10000000 | hi << 5 | rd);
+                }
+            }
+        }
+    }
+    let words: Vec<_> = words.into_iter().collect();
+    assert!(words.len() >= 50_000);
+    for (i, (&w, actual)) in words
+        .iter()
+        .zip(oracle_lines(&words, "address"))
+        .enumerate()
+    {
+        let Instruction::Address(a) = decode_instruction(w) else {
+            panic!("missing address {w:08x}")
+        };
+        let pc = i as u64 * 4;
+        let (name, base) = match a.base {
+            AddressBase::Pc => ("adr", pc),
+            AddressBase::Page => ("adrp", pc & !4095),
+        };
+        let expected = format!(
+            "{name} {}, 0x{:x}",
+            reg(a.rd, Width::X64),
+            base.wrapping_add_signed(a.offset.bytes())
+        );
+        assert_eq!(expected, actual, "{w:08x}");
+    }
+    println!(
+        "{} distinct address words; 0 wrong class / operand mismatches",
+        words.len()
+    );
+}

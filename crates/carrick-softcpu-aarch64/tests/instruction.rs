@@ -155,3 +155,14 @@ fn bitfield_and_address_forms_have_typed_operands() {
         );
     }
 }
+
+#[test]
+fn bitfield_reserved_fields_fail_shut() {
+    for word in [0x93000000, 0x13400000, 0x13200000, 0x13008000, 0xf3400000] {
+        assert_eq!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
