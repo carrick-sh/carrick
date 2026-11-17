@@ -779,6 +779,8 @@ impl SyscallDispatcher {
             )),
             fd::AccessMode::ReadWrite,
             flags,
+            // A socket has no file identity for record locks.
+            None,
             slot.close_on_exec(),
         ) {
             Ok(number) => i64::from(number.0),
