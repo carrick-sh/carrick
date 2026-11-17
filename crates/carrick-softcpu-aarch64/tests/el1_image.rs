@@ -5,43 +5,43 @@
 use carrick_softcpu_aarch64::{A64Class, classify};
 use std::collections::BTreeMap;
 
-fn u16_at(bytes: &[u8], offset: usize) -> usize {
-    usize::from(u16::from_le_bytes(
-        bytes[offset..offset + 2]
-            .try_into()
-            .expect("ELF field has the expected width"),
-    ))
-}
-fn u32_at(bytes: &[u8], offset: usize) -> usize {
-    usize::try_from(u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("ELF field has the expected width"),
-    ))
-    .expect("valid production ELF fixture")
-}
-fn u64_at(bytes: &[u8], offset: usize) -> usize {
-    usize::try_from(u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("ELF field has the expected width"),
-    ))
-    .expect("valid production ELF fixture")
-}
-fn string_at(bytes: &[u8], offset: usize) -> &str {
-    let tail = &bytes[offset..];
-    std::str::from_utf8(
-        &tail[..tail
-            .iter()
-            .position(|&b| b == 0)
-            .expect("valid production ELF fixture")],
-    )
-    .expect("valid production ELF fixture")
-}
-
 #[test]
 #[ignore = "requires CARRICK_A64_ELF pointing to the rebuilt production EL1 ELF"]
 fn linked_el1_executable_mapping_spans_have_no_unknown_words() {
+    fn u16_at(bytes: &[u8], offset: usize) -> usize {
+        usize::from(u16::from_le_bytes(
+            bytes[offset..offset + 2]
+                .try_into()
+                .expect("ELF field has the expected width"),
+        ))
+    }
+    fn u32_at(bytes: &[u8], offset: usize) -> usize {
+        usize::try_from(u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("ELF field has the expected width"),
+        ))
+        .expect("valid production ELF fixture")
+    }
+    fn u64_at(bytes: &[u8], offset: usize) -> usize {
+        usize::try_from(u64::from_le_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("ELF field has the expected width"),
+        ))
+        .expect("valid production ELF fixture")
+    }
+    fn string_at(bytes: &[u8], offset: usize) -> &str {
+        let tail = &bytes[offset..];
+        std::str::from_utf8(
+            &tail[..tail
+                .iter()
+                .position(|&b| b == 0)
+                .expect("valid production ELF fixture")],
+        )
+        .expect("valid production ELF fixture")
+    }
+
     // ELF64 fields per the System V ABI; the AArch64 ELF ABI defines the
     // authoritative $x/$d mapping symbols. Malformed inputs fail the witness.
     let path = std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF");
