@@ -456,30 +456,41 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
         }
         let outcome = locks.table().set(request, &owners);
         let mut wake = outcome.released.then(|| notify_released(sched, &mut locks));
-        let blocked = match outcome.taken {
-            // A record lock taken through a descriptor another thread of
-            // the table closed or replaced meanwhile (fcntl(2): its close
-            // released the table's locks on the file before this one
-            // existed) is given back: EBADF, as Linux answers. Asked under
-            // the lock table's exclusion: a close that retires the
-            // descriptor after this answer releases the lock itself.
-            Ok(())
-                if matches!(owner, LockOwner::Table { .. })
-                    && !names_description(
-                        &authority,
-                        table,
-                        Fd(fd_arg as i32),
-                        retained.as_ref().map(|(_, op)| op.pin),
-                        fresh_pin.as_ref(),
-                    ) =>
-            {
-                if !matches!(locks.table().unlock(file, owner, class, range), Ok(false))
-                    && wake.is_none()
-                {
-                    wake = Some(notify_released(sched, &mut locks));
-                }
-                Some(ebadf)
+        // A record lock taken through a descriptor another thread of the
+        // table closed or replaced meanwhile (fcntl(2): its close released
+        // the table's locks on the file before this one existed) is given
+        // back: EBADF, as Linux answers. Asked under the lock table's
+        // exclusion: a close that retires the descriptor after this answer
+        // releases the lock itself. A table the answer could not be read
+        // from leaves nothing taken either: the call is refused as any
+        // other contended lookup here.
+        let stale = match outcome.taken {
+            Ok(()) if matches!(owner, LockOwner::Table { .. }) => names_description(
+                &authority,
+                table,
+                Fd(fd_arg as i32),
+                retained.as_ref().map(|(_, op)| op.pin),
+                fresh_pin.as_ref(),
+            )
+            .map(|names| !names),
+            _ => Ok(false),
+        };
+        if stale != Ok(false)
+            && !matches!(locks.table().unlock(file, owner, class, range), Ok(false))
+            && wake.is_none()
+        {
+            wake = Some(notify_released(sched, &mut locks));
+        }
+        if stale.is_err() {
+            drop(locks);
+            if let Some(effects) = wake {
+                finish_wakes(sched, effects);
             }
+            drop_hold(sched, region, retained.take(), fresh_pin.take());
+            return IpcServed::Forward;
+        }
+        let blocked = match outcome.taken {
+            Ok(()) if stale == Ok(true) => Some(ebadf),
             Ok(()) => None,
             Err(SetRefusal::Full) => Some(carrick_abi::LINUX_ENOLCK.guest_retval()),
             Err(SetRefusal::Conflict(_)) if !blocking => {
@@ -582,16 +593,16 @@ fn names_description<W: carrick_el1_abi::ipc::fd::LockWait>(
     fd: Fd,
     retained: Option<carrick_el1_abi::ipc::RawOfdPin>,
     fresh: Option<&OfdPin>,
-) -> bool {
+) -> Result<bool, FdError> {
     match (retained, fresh) {
-        (_, Some(pin)) => authority.names_pinned(table, fd, pin) == Ok(true),
+        (_, Some(pin)) => authority.names_pinned(table, fd, pin),
         (Some(raw), None) => {
             let pin = OfdPin::from_raw(raw);
-            let names = authority.names_pinned(table, fd, &pin) == Ok(true);
+            let names = authority.names_pinned(table, fd, &pin);
             let _ = pin.into_raw();
             names
         }
-        (None, None) => false,
+        (None, None) => Err(FdError::StalePin),
     }
 }
 
