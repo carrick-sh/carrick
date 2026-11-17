@@ -263,7 +263,7 @@ impl Lock {
 
 /// The descriptor authority's view of which owners still exist.
 pub trait LockOwners {
-    fn live(&self, owner: LockOwner) -> bool;
+    fn exists(&self, owner: LockOwner) -> bool;
 }
 
 /// Why a lock was not taken.
@@ -463,14 +463,14 @@ impl<'a> LockTable<'a> {
 
     /// Drop the records of owners that no longer exist.
     pub fn reap(&self, owners: &impl LockOwners) -> bool {
-        self.remove_where(|lock| !owners.live(lock.owner))
+        self.remove_where(|lock| !owners.exists(lock.owner))
     }
 
     /// The live lock that blocks `request`, lowest start first (`F_GETLK`).
     pub fn conflict(&self, request: &Lock, owners: &impl LockOwners) -> Option<Lock> {
         self.locks()
             .map(|(_, lock)| lock)
-            .filter(|lock| lock.blocks(request) && owners.live(lock.owner))
+            .filter(|lock| lock.blocks(request) && owners.exists(lock.owner))
             .min_by_key(|lock| lock.range.start)
     }
 
@@ -670,7 +670,7 @@ mod tests {
     /// Every owner exists unless listed as dead.
     struct Owners(Vec<LockOwner>);
     impl LockOwners for Owners {
-        fn live(&self, owner: LockOwner) -> bool {
+        fn exists(&self, owner: LockOwner) -> bool {
             !self.0.contains(&owner)
         }
     }
@@ -944,19 +944,19 @@ mod tests {
         let (pin, _) = c.pin(t, fd).unwrap();
         let key = pin.key();
         assert_eq!(c.pinned_identity(&pin), Ok(Some(FILE)));
-        assert!(c.lock_owner_live(LockOwner::Description(key)));
-        assert!(c.lock_owner_live(LockOwner::table(t)));
+        assert!(c.lock_owner_exists(LockOwner::Description(key)));
+        assert!(c.lock_owner_exists(LockOwner::table(t)));
         assert_eq!(c.unpin(pin), Ok(None));
         assert_eq!(
             c.close_filtered(t, fd, |_| false),
             Ok(crate::DeferredRelease::Deferred(key))
         );
-        assert!(!c.lock_owner_live(LockOwner::Description(key)));
+        assert!(!c.lock_owner_exists(LockOwner::Description(key)));
         assert!(c.take_retired_ofd().unwrap().is_some());
         let reused = c.open(t, Fd(0), host, false).unwrap();
         assert_eq!(c.file_identity(t, reused), Ok(None));
         assert_eq!(c.file_identity(t, Fd(5)), Err(crate::Error::BadFd));
         c.destroy_table(t, |_| {}).unwrap();
-        assert!(!c.lock_owner_live(LockOwner::table(t)));
+        assert!(!c.lock_owner_exists(LockOwner::table(t)));
     }
 }
