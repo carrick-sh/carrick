@@ -3444,10 +3444,29 @@ raise SystemExit('unexpected gh invocation: ' + repr(args))
             std::fs::write(
                 &req_path,
                 serde_json::to_vec(&Request {
-                    kind: RequestKind::Main,
+                    kind: if String::from(
+                        receipt
+                            .fixture_validation
+                            .as_ref()
+                            .unwrap()
+                            .bundle_source_head
+                            .clone(),
+                    ) == self.base
+                    {
+                        RequestKind::Main
+                    } else {
+                        RequestKind::MergeGroup
+                    },
                     prs: vec![],
                     sha: self.base.clone(),
-                    base: self.base.clone(),
+                    base: String::from(
+                        receipt
+                            .fixture_validation
+                            .as_ref()
+                            .unwrap()
+                            .bundle_source_head
+                            .clone(),
+                    ),
                 })
                 .unwrap(),
             )
@@ -3472,7 +3491,15 @@ raise SystemExit('unexpected gh invocation: ' + repr(args))
                 .output()
                 .unwrap();
             assert!(
-                pub_out.status.success(),
+                pub_out.status.success()
+                    || String::from(
+                        receipt
+                            .fixture_validation
+                            .as_ref()
+                            .unwrap()
+                            .bundle_source_head
+                            .clone()
+                    ) != self.base,
                 "main publish failed: stdout={} stderr={}",
                 String::from_utf8_lossy(&pub_out.stdout),
                 String::from_utf8_lossy(&pub_out.stderr)
@@ -3745,6 +3772,81 @@ raise SystemExit('unexpected gh invocation: ' + repr(args))
             !comment.contains("ran on the same host in this job."),
             "reused base must not falsely claim in-job base execution: {comment}"
         );
+    }
+
+    #[test]
+    fn merge_group_candidate_seal_becomes_next_groups_base() {
+        let mut bench = ReuseBench::new();
+        // The landed SHA is the previous group's canonical candidate SHA;
+        // its fixtures still come from that group's ancestor base.
+        let landed = bench.head.clone();
+        let receipt = bench.receipt_for(&landed);
+        let ancestor = bench.base.clone();
+        bench.base = landed.clone();
+        let (name, artifact) = bench.publish_main_reusable_artifact(501, &receipt);
+        let mut producer = bench.trusted_main_run(501);
+        producer["event"] = json!("merge_group");
+        producer["head_branch"] = json!("gh-readonly-queue/main/pr-42-test");
+        assert!(trusted_reuse_run(&producer, &landed));
+        let mut wrong_sha = producer.clone();
+        wrong_sha["head_sha"] = json!(ancestor);
+        assert!(!trusted_reuse_run(&wrong_sha, &landed));
+        bench.write_gh_state(
+            vec![producer],
+            vec![json!({
+                "id": 9002, "name": name, "expired": false,
+                "workflow_run": {"id": 501}, "dir": artifact
+            })],
+        );
+        let request = Request {
+            kind: RequestKind::MergeGroup,
+            prs: vec![43],
+            sha: landed.clone(),
+            base: landed,
+        };
+        let reused = bench.dir.path().join("next-base");
+        let lookup = bench.run_lookup(&request, &bench.bundle.archive, &bench.host, &reused);
+        assert!(lookup.status.success());
+        assert!(
+            reused.join("base-seal.json").exists(),
+            "{}",
+            String::from_utf8_lossy(&lookup.stderr)
+        );
+        let ctx = ReuseExecutionContext {
+            root: &bench.repo,
+            bundle: &bench.bundle.archive,
+            host_identity: Some(bench.host.clone()),
+            reuse_dir: &reused,
+        };
+        let mut sides = Vec::new();
+        execute_pair(
+            &request,
+            &bench.dir.path().join("next-results"),
+            Some(&ctx),
+            |run| {
+                sides.push(run.side);
+                write_run_evidence(
+                    &run.output,
+                    run.receipt_name,
+                    &bench.receipt_for(&run.commit),
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(sides, [PairSide::Candidate]);
+
+        let changed = pack_test_bundle(
+            &bench.dir.path().join("changed"),
+            &bench.base,
+            b"v2",
+            "changed-inputs",
+        );
+        let refused = bench.dir.path().join("changed-base");
+        let lookup = bench.run_lookup(&request, &changed.archive, &bench.host, &refused);
+        assert!(lookup.status.success());
+        assert!(!refused.join("base-seal.json").exists());
+        assert!(String::from_utf8_lossy(&lookup.stderr).contains("NoMatchingArtifact"));
     }
 
     /// Key-field mismatch witness (#1918): mismatching ANY key field (base SHA,
