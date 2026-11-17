@@ -339,12 +339,12 @@ fn sys_space_tlbi_fields_and_names() {
 #[ignore = "requires CARRICK_A64_LOADER_SPANS generated from production loader/vector builders"]
 fn generated_loader_vector_spans_are_typed() {
     let path = std::env::var_os("CARRICK_A64_LOADER_SPANS").expect("set CARRICK_A64_LOADER_SPANS");
-    assert_loader_vector_spans_typed(std::path::Path::new(&path));
+    assert_loader_vector_spans_typed(std::path::Path::new(&path))
+        .expect("generated production spans");
 }
 
-fn assert_loader_vector_spans_typed(path: &std::path::Path) {
-    let bytes =
-        std::fs::read(path).unwrap_or_else(|error| panic!("generated production spans: {error}"));
+fn assert_loader_vector_spans_typed(path: &std::path::Path) -> std::io::Result<()> {
+    let bytes = std::fs::read(path)?;
     assert!(!bytes.is_empty(), "no generated code measured");
     assert_eq!(bytes.len() % 4, 0, "partial instruction in generated spans");
     let mut words = 0;
@@ -359,6 +359,7 @@ fn assert_loader_vector_spans_typed(path: &std::path::Path) {
         words += 1;
     }
     println!("typed {words} generated production loader/vector words");
+    Ok(())
 }
 
 #[test]
@@ -366,7 +367,7 @@ fn generated_loader_vector_spans_reject_eretaa() {
     let path =
         std::env::temp_dir().join(format!("carrick-a64-negative-{}.bin", std::process::id()));
     std::fs::write(&path, 0xd69f0be0u32.to_le_bytes()).unwrap();
-    let result = std::panic::catch_unwind(|| assert_loader_vector_spans_typed(&path));
+    let result = std::panic::catch_unwind(|| assert_loader_vector_spans_typed(&path).unwrap());
     std::fs::remove_file(path).unwrap();
     assert!(
         result.is_err(),
