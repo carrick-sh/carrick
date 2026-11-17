@@ -9,11 +9,16 @@ use crate::carrier_memory::{
     BackingExtent, BackingHandle, CarrierMemory, CarrierMemoryIo, InventoryTransaction,
     PreparedBacking,
 };
-use crate::guest_ram::GuestRam;
+use crate::guest_ram::{GuestRam, WindowKind};
 use carrick_core_abi::X86_CPL0_INITIAL_EXTENT_GPA;
+use carrick_core_abi::{
+    X86_CPL0_INITIAL_EXTENT_VA, X86_INITIAL_BOOT_HEADER_GPA, X86_INITIAL_BOOT_MAGIC,
+    X86_INITIAL_BOOT_VERSION, X86InitialBootHeader,
+};
 use carrick_core_abi::{X86_INITIAL_BOOT_LOADED, X86InitialBootGrant, X86InitialBootRequest};
 use carrick_el1::memory::reservations::{LinuxReservationLayout, X86Cpl0Reservations, X86Cpl0Zone};
 use carrick_el1_abi::GuestMmuPublication;
+use carrick_el1_abi::{BlockedMask, Lifecycle};
 use carrick_el1_abi::{
     Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_SIZE, El1TaskId, ThreadControlSlot,
     ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE, X86_CPL0_DYNAMIC_METADATA_BASE,
@@ -30,6 +35,7 @@ use carrick_hal::{FrameEventCapacity, FrameInventoryEvent, MemPerms};
 use carrick_hal::{FrameId, FrameLength, MappingGeneration, MappingId};
 #[cfg(test)]
 use carrick_kernel::kernel::{FrameInventoryAuthority, MmId, ObjectIdRegistry};
+use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
 use carrick_mmu_core::x86::descriptor_txn::{
     Access, BackingIdentity, DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, translate_leaf,
 };
@@ -39,7 +45,7 @@ use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg};
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 /// Initialize the stopped carrier's GDT, fault stubs, private IDT/TSS/IST and
@@ -5349,4 +5355,468 @@ pub mod fixture_maps {
             exec: false,
         }
     }
+}
+
+/// Owned neutral preparation retained through memory installation and CPU admission.
+/// Moving this value preserves the original RAM and authority backing allocations.
+pub struct PreparedBoot {
+    pub ram: Arc<GuestRam>,
+    pub plan: carrick_mem::elf::LoadPlan,
+    pub boot: carrick_hal::x8664_arch::X8664BootSysregs,
+    pub hardware_interrupts: bool,
+    pub fixture_copy: bool,
+    pub table_capacity: usize,
+    pub ipc_backings: Vec<PreparedBacking>,
+    pub ipc_generation: Option<NonZeroU64>,
+    pub kernel_pod_storage: Vec<anonymous_owner::KernelPodStorage>,
+}
+
+/// Prepare retained RAM and bindings before backend memory registration.
+pub fn prepare_boot(
+    frame_inventory: &dyn PhysicalFrameInventory,
+    bytes: &[u8],
+    programs: [&[u8]; 2],
+    interrupts: bool,
+    initial_extent_bytes: Option<usize>,
+    fixture_image: bool,
+    ipc: Option<Arc<dyn carrick_el1_abi::IpcWindowBacking>>,
+) -> Result<PreparedBoot, TrapError> {
+    let hardware_interrupts = interrupts || initial_extent_bytes.is_some();
+    let plan = carrick_mem::elf::plan_elf_load_bytes_for(bytes, 62)
+        .map_err(|e| fail(format!("CPL0 ELF: {e}")))?;
+    if !(IMAGE_VA..IMAGE_VA + IMAGE_SIZE).contains(&plan.entry) {
+        return Err(fail("CPL0 entry outside its supervisor image"));
+    }
+    let mut ram = GuestRam::new();
+    if initial_extent_bytes.is_some() {
+        let zone_end = carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize + size_of::<X86Cpl0Zone>();
+        let region_bytes = (zone_end + 4095) & !4095;
+        ram.add_window(0, META_GPA as usize, WindowKind::Private)
+            .map_err(|e| fail(e.to_string()))?;
+        ram.add_window(PRODUCTION_METADATA_GPA, region_bytes, WindowKind::Private)
+            .map_err(|e| fail(e.to_string()))?;
+    } else {
+        ram.add_window(0, RAM_SIZE, WindowKind::Private)
+            .map_err(|e| fail(e.to_string()))?;
+        if interrupts {
+            ram.add_window(
+                fixture_maps::PROGRESS_ZONE_GPA,
+                fixture_maps::SUPERVISOR_BYTES as usize,
+                WindowKind::Private,
+            )
+            .map_err(|e| fail(e.to_string()))?;
+        }
+    }
+    ram.add_window(
+        ALLOCATOR_GPA,
+        EL1_BOOTSTRAP_METADATA_SIZE as usize,
+        WindowKind::Private,
+    )
+    .map_err(|e| fail(e.to_string()))?;
+    let kernel_pod_storage = anonymous_owner::retained_kernel_pod_storage(&plan.segments);
+    let mut maps = Vec::new();
+    for segment in &plan.segments {
+        let end = segment
+            .virtual_address
+            .checked_add(segment.memory_size)
+            .ok_or_else(|| fail("CPL0 segment overflow"))?;
+        if segment.virtual_address < IMAGE_VA || end > IMAGE_VA + IMAGE_SIZE {
+            return Err(fail("CPL0 segment outside its supervisor image"));
+        }
+        let start = segment.file_offset as usize;
+        let data = bytes
+            .get(start..start + segment.file_size as usize)
+            .ok_or_else(|| fail("CPL0 segment file bounds"))?;
+        let gpa = IMAGE_GPA + segment.virtual_address - IMAGE_VA;
+        ram.write_gpa(gpa, data).map_err(|e| fail(e.to_string()))?;
+        let va = segment.virtual_address & !0xfff;
+        maps.push(Pml4MapSpec {
+            va,
+            gpa: IMAGE_GPA + va - IMAGE_VA,
+            len: ((end + 0xfff) & !0xfff) - va,
+            user: false,
+            write: segment.perms.write,
+            exec: segment.perms.execute,
+        });
+    }
+    if initial_extent_bytes.is_some() {
+        let bytes = ram
+            .read(
+                X86_INITIAL_BOOT_HEADER_GPA,
+                size_of::<X86InitialBootHeader>(),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        // SAFETY: read returned a complete header; byte storage may be unaligned.
+        let header = unsafe {
+            bytes
+                .as_ptr()
+                .cast::<X86InitialBootHeader>()
+                .read_unaligned()
+        };
+        if header.magic != X86_INITIAL_BOOT_MAGIC || header.version != X86_INITIAL_BOOT_VERSION {
+            return Err(fail("production image boot header invalid"));
+        }
+        validate_layout_hash(header.layout_hash)?;
+    }
+    // Existing x86 descriptor/TSS/IDT machinery, including private stacks
+    // and exception stubs, remains the hardware authority.
+    let stub_start = carrick_x86::fault_stub_base(LAYOUT);
+    let stub_end = carrick_x86::fault_tss_base(LAYOUT);
+    if !(IMAGE_GPA + IMAGE_SIZE < stub_start && stub_start < stub_end && stub_end < META_GPA) {
+        return Err(fail("CPL0 stub outside direct window"));
+    }
+    // Retained exception stubs execute from their supervisor alias. The
+    // page tables, private IDTs, TSS, stacks and records need write access
+    // but must never be executable in that alias.
+    for (start, end, write, exec) in [
+        (IMAGE_GPA + IMAGE_SIZE, stub_start, true, false),
+        (stub_start, stub_end, false, true),
+        (stub_end, META_GPA, true, false),
+    ] {
+        maps.push(Pml4MapSpec {
+            va: DIRECT_VA + start,
+            gpa: start,
+            len: end - start,
+            user: false,
+            write,
+            exec,
+        });
+    }
+    maps.push(Pml4MapSpec {
+        va: DIRECT_VA + META_GPA,
+        gpa: META_GPA,
+        len: if initial_extent_bytes.is_some() {
+            ((carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize + size_of::<X86Cpl0Zone>() + 4095)
+                & !4095) as u64
+        } else {
+            0x40_0000
+        },
+        user: false,
+        write: true,
+        exec: false,
+    });
+    maps.push(Pml4MapSpec {
+        va: METADATA_VA,
+        gpa: META_GPA,
+        len: META_LEN,
+        user: false,
+        write: true,
+        exec: false,
+    });
+    if initial_extent_bytes.is_some() {
+        maps.push(Pml4MapSpec {
+            va: METADATA_VA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+            gpa: PRODUCTION_METADATA_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+            len: (size_of::<X86Cpl0Zone>() as u64 + 4095) & !4095,
+            user: false,
+            write: true,
+            exec: false,
+        });
+    }
+    maps.push(Pml4MapSpec {
+        va: X86_CPL0_BOOTSTRAP_METADATA_BASE,
+        gpa: ALLOCATOR_GPA,
+        len: EL1_BOOTSTRAP_METADATA_SIZE,
+        user: false,
+        write: true,
+        exec: false,
+    });
+    if let Some(len) = initial_extent_bytes {
+        maps.push(Pml4MapSpec {
+            va: X86_CPL0_INITIAL_EXTENT_VA,
+            gpa: INITIAL_EXTENT_GPA,
+            len: len as u64,
+            user: false,
+            write: true,
+            exec: false,
+        });
+    }
+    maps.push(Pml4MapSpec {
+        va: X86_CPL0_REGION_BASE,
+        gpa: KERNEL_REGION_GPA,
+        len: carrick_el1_abi::EL1_REGION_SIZE,
+        user: false,
+        write: true,
+        exec: false,
+    });
+
+    // These aliases map the authority's original allocations, never a copy.
+    const IPC_GPA: u64 = IPC_WINDOW_GPA;
+    let mut ipc_backings = Vec::new();
+    let mut ipc_generation = None;
+    if let Some(owner) = ipc {
+        use crate::carrier_memory::IpcWindowPart;
+        let window = unsafe {
+            carrick_el1_abi::IpcWindow::new(
+                owner.directory_ptr() as usize,
+                owner.directory_len(),
+                owner.pool_ptr() as usize,
+                owner.pool_len(),
+            )
+        }
+        .ok_or_else(|| fail("invalid IPC window geometry"))?;
+        ipc_generation = Some(
+            window
+                .attach()
+                .map_err(|e| fail(format!("IPC window attachment: {e:?}")))?
+                .operation_slot_generation(),
+        );
+        for (part, va, gpa) in [
+            (
+                IpcWindowPart::Directory,
+                carrick_el1_abi::X86_CPL0_IPC_BASE,
+                IPC_GPA,
+            ),
+            (
+                IpcWindowPart::Pool,
+                carrick_el1_abi::X86_CPL0_IPC_POOL_BASE,
+                IPC_GPA + carrick_el1_abi::EL1_IPC_DIRECTORY_SPAN,
+            ),
+        ] {
+            let extent = Arc::new(
+                BackingExtent::ipc_window(FrameGpa::new(gpa), Arc::clone(&owner), part)
+                    .map_err(|e| fail(e.to_string()))?,
+            );
+            maps.push(Pml4MapSpec {
+                va,
+                gpa,
+                len: extent.len as u64,
+                user: false,
+                write: true,
+                exec: false,
+            });
+            ipc_backings.push(PreparedBacking {
+                extent,
+                identity: backing_identity(frame_inventory)?,
+            });
+        }
+    }
+
+    for (index, program) in programs.iter().enumerate() {
+        if program.is_empty() {
+            continue;
+        }
+        if program.len() > 4096 {
+            return Err(fail("CPL0 fixture exceeds one code page"));
+        }
+        let code = USER_CODE + index as u64 * 4096;
+        ram.write_gpa(code, program)
+            .map_err(|e| fail(e.to_string()))?;
+        maps.push(Pml4MapSpec {
+            va: code,
+            gpa: code,
+            len: 4096,
+            user: true,
+            write: false,
+            exec: true,
+        });
+        let stack = 0x3_0000 + index as u64 * 0x1_0000;
+        maps.push(Pml4MapSpec {
+            va: stack,
+            gpa: stack,
+            len: 8192,
+            user: true,
+            write: true,
+            exec: false,
+        });
+    }
+    if interrupts {
+        maps.push(Pml4MapSpec {
+            va: DIRECT_VA + fixture_maps::PROGRESS_ZONE_GPA,
+            gpa: fixture_maps::PROGRESS_ZONE_GPA,
+            len: fixture_maps::SUPERVISOR_BYTES,
+            user: false,
+            write: true,
+            exec: false,
+        });
+        maps.extend(fixture_maps::supervisor_maps());
+        maps.push(fixture_maps::data_map(0));
+    } else if hardware_interrupts {
+        maps.push(fixture_maps::lapic_map());
+    }
+    // CPL0 ordinary loads/copies can race a page-table publication after
+    // preflight. Keep every bootstrap supervisor leaf outside the user
+    // range so a changed lower-half leaf cannot expose kernel backing.
+    if maps
+        .iter()
+        .any(|map| !map.user && map.va < 0x0000_8000_0000_0000)
+    {
+        return Err(fail("CPL0 supervisor map in user range"));
+    }
+    // Fixture bootstrap roots reserve an exclusive zero suffix for the
+    // same private copy branch that production initial-MM admission owns.
+    // The constructor cannot allocate these pages into any other branch.
+    let fixture_copy = fixture_image && initial_extent_bytes.is_none();
+    let table_capacity = (carrick_x86::X86_PML4_CAPACITY as usize)
+        .checked_sub(if fixture_copy {
+            carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES * 4096
+        } else {
+            0
+        })
+        .ok_or_else(|| fail("fixture private copy table capacity"))?;
+    // Every CPU's kernel stack guard stays unmapped in the direct window
+    // the stacks run on (#369), whatever bootstrap map would cover it.
+    let guards: Vec<(u64, u64)> = carrick_el1_abi::x86_cpl0_kernel_stack_guards().collect();
+    let tables = pml4_tables(
+        &carrick_mem::pml4::punch_holes(&maps, &guards),
+        LAYOUT.pml4_base,
+        table_capacity,
+    )
+    .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
+    ram.write_gpa(LAYOUT.pml4_base, &tables)
+        .map_err(|e| fail(e.to_string()))?;
+    if interrupts {
+        let last = maps.last_mut().ok_or_else(|| fail("progress data map"))?;
+        *last = fixture_maps::data_map(1);
+        let second = pml4_tables(
+            &carrick_mem::pml4::punch_holes(&maps, &guards),
+            fixture_maps::SECOND_ROOT,
+            table_capacity,
+        )
+        .map_err(|e| fail(format!("second progress root: {e:?}")))?;
+        ram.write_gpa(fixture_maps::SECOND_ROOT, &second)
+            .map_err(|e| fail(e.to_string()))?;
+    }
+    let boot = <carrick_hal::x8664_arch::X8664GuestArch as carrick_hal::guest_arch::GuestArch>::bootstrap_sysregs();
+    initialize_bootstrap_descriptors(&mut ram, &boot, hardware_interrupts)?;
+    // SAFETY: private zeroed backing; typed objects fit and are aligned.
+    // They are initialized before registration or any guest execution.
+    unsafe {
+        let page = ram
+            .host_ptr(META_GPA, size_of::<ThreadLifecyclePage>())
+            .ok_or_else(|| fail("lifecycle page backing"))?
+            .cast::<ThreadLifecyclePage>();
+        page.write(ThreadLifecyclePage::new());
+        // Retained empty control storage, shared by real native births.
+        // Identity issuance and all live/runnable publication stay in ring.
+        let controls = ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_OFFSET,
+                carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_SIZE as usize,
+            )
+            .ok_or_else(|| fail("native root thread control backing"))?
+            .cast::<ThreadControlSlot>();
+        for index in 0..=carrick_el1_abi::THREAD_POOL_ENTRIES {
+            controls.add(index).write(ThreadControlSlot::new());
+        }
+        (*page)
+            .thread_born()
+            .ok_or_else(|| fail("second live task admission"))?;
+        let counters = ram
+            .host_ptr(META_GPA + COUNTERS_OFFSET, size_of::<Counters>())
+            .ok_or_else(|| fail("counter backing"))?
+            .cast::<Counters>();
+        counters.write(Counters::new());
+        let routes = ram
+            .host_ptr(META_GPA + ROUTES_OFFSET, size_of::<PublishedApicIds>())
+            .ok_or_else(|| fail("APIC route table backing"))?
+            .cast::<PublishedApicIds>();
+        routes.write(PublishedApicIds::new());
+        let shootdown = ram
+            .host_ptr(META_GPA + SHOOTDOWN_OFFSET, size_of::<ShootdownTable>())
+            .ok_or_else(|| fail("shootdown table backing"))?
+            .cast::<ShootdownTable>();
+        shootdown.write(ShootdownTable::new());
+        for index in 0..2 {
+            let offset = index as u64 * STRIDE;
+            let slot = ram
+                .host_ptr(
+                    META_GPA + CONTROL_OFFSET + offset,
+                    size_of::<ThreadControlSlot>(),
+                )
+                .ok_or_else(|| fail("control slot backing"))?
+                .cast::<ThreadControlSlot>();
+            slot.write(ThreadControlSlot::new());
+            (*slot)
+                .reset_for_host_birth(BlockedMask(0))
+                .map_err(|_| fail("control slot still owned by graph"))?;
+            if !(*slot).publish_visible_tid(41 + index as u32) {
+                return Err(fail("issued slot identity"));
+            }
+            let birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                carrick_core_abi::EntryTaskKey::from_raw(41 + index as u64),
+                carrick_core_abi::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(11 + index as u64)
+                        .ok_or_else(|| fail("issued slot birth serial"))?,
+                ),
+                carrick_core_abi::EntryThreadGeneration::from_raw(101 + index as u64),
+            )
+            .ok_or_else(|| fail("issued slot birth identity"))?;
+            (*slot).publish_host_birth_identity(birth);
+            let task = ram
+                .host_ptr(META_GPA + TASK_OFFSET + offset, size_of::<CurrentTask>())
+                .ok_or_else(|| fail("current task backing"))?
+                .cast::<CurrentTask>();
+            task.write(CurrentTask::new());
+            (*task).set(
+                El1TaskId::from_linux_tid(41 + index as i32),
+                carrick_el1_abi::SnapshotGeneration::from_raw(11 + index as u64),
+                5,
+            );
+            (*task)
+                .mm
+                .thread_generation
+                .store(101 + index as u64, Ordering::Release);
+            (*task).mm.key.store(201 + index as u64, Ordering::Release);
+            (*shootdown).members[index].publish(
+                if interrupts && index == 1 {
+                    fixture_maps::SECOND_ROOT
+                } else {
+                    LAYOUT.pml4_base
+                },
+                201 + index as u64,
+                1,
+            );
+            (*task).publish_lifecycle(METADATA_VA, METADATA_VA + CONTROL_OFFSET + offset);
+            let binding = ram
+                .host_ptr(META_GPA + BINDING_OFFSET + offset, size_of::<CpuBinding>())
+                .ok_or_else(|| fail("CPU binding backing"))?
+                .cast::<CpuBinding>();
+            binding.write(CpuBinding {
+                kernel_stack: DIRECT_VA + carrick_el1_abi::x86_cpl0_kernel_stack_end_gpa(index)
+                    - carrick_el1_abi::X86_CPL0_KERNEL_STACK_TOP_RESERVE,
+                user_stack: 0,
+                self_address: METADATA_VA + BINDING_OFFSET + offset,
+                task_address: METADATA_VA + TASK_OFFSET + offset,
+                counters_address: METADATA_VA + COUNTERS_OFFSET,
+                entry_kick: AtomicU32::new(0),
+                return_kick: AtomicU32::new(0),
+                entries: AtomicU64::new(0),
+                publications: AtomicU64::new(0),
+                completions: AtomicU64::new(0),
+                captured_stack: AtomicU64::new(0),
+                scheduler_witness: AtomicU64::new(if fixture_image && interrupts && index == 0 {
+                    carrick_x86::cpl0_scheduler::PROGRESS_STATE
+                } else {
+                    0
+                }),
+                cpu_slot: index as u32,
+                tsc_hz: AtomicU64::new(0),
+                wake_routes_address: METADATA_VA + ROUTES_OFFSET,
+                apic_timer_hz: AtomicU64::new(0),
+                pending_irqs: AtomicU32::new(0),
+                shootdown_table_address: METADATA_VA + SHOOTDOWN_OFFSET,
+                fault_active: AtomicU64::new(0),
+                fault_frame: AtomicU64::new(0),
+                fault_address: AtomicU64::new(0),
+                fault_reason: AtomicU64::new(0),
+                mm_owner_generation: AtomicU64::new(1),
+                last_seen_generation: AtomicU64::new(0),
+                stdio_table_admitted: AtomicU64::new(0),
+                file_region: carrick_el1_abi::FileRegionBinding::UNPUBLISHED,
+            });
+        }
+    }
+    let ram = Arc::new(ram);
+    Ok(PreparedBoot {
+        ram,
+        plan,
+        boot,
+        hardware_interrupts,
+        fixture_copy,
+        table_capacity,
+        ipc_backings,
+        ipc_generation,
+        kernel_pod_storage,
+    })
 }

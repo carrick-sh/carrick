@@ -46,19 +46,19 @@ not code introduced in R1. Neutral protocol/policy moves; ioctl mechanics stay.
 | TSC: `Cpl0Carrier::boot_bytes_inner`, `fixture_publish_tsc_hz` | KVM_GET_TSC_KHZ stays. Frequency publication into CpuBinding is neutral; soft supplies its clock/view frequency. |
 | Kick/signal/watchdog: `FixtureWatchdog`, `CarrierCpuBackend` | KVM thread signal/immediate_exit stays. Soft sets durable cancellation checked at block boundaries. |
 | GDT/fault stubs/IDT/TSS/IST/IRQ gates: `initialize_bootstrap_descriptors` | Shared byte construction uses existing carrick-x86 layout/descriptor helpers. Neither backend reimplements the bytes. |
-| PML4/image/trampoline/maps and metadata: `Cpl0Carrier::boot_bytes_inner` | Move RAM/image/map preparation and binding initialization next. Move `supervisor_maps`, `lapic_map` and `data_map` from carrier_interrupts; never copy them. |
+| PML4/image/trampoline/maps and metadata: `prepare_boot`, `PreparedBoot` | Shared RAM/image/map preparation and binding initialization retain the original owned allocations. `supervisor_maps`, `lapic_map` and `data_map` live once in `fixture_maps`; KVM re-exports them. |
 | Reservations/IPC/file-region/initial extent: `Cpl0Carrier::boot_bytes_inner`, `BootstrapCustody::new` | Move installation around CarrierMemory<M>; reuse anonymous_owner, BootstrapFileRegion and custody. No backend-specific reservation or allocator authority. |
 
 ## Minimal seam and staged extraction
 
-1. **This landable:** `initialize_bootstrap_descriptors(&mut GuestRam,
+1. **Shared descriptor preparation:** `initialize_bootstrap_descriptors(&mut GuestRam,
    &X8664BootSysregs, hardware_interrupts)` in the existing neutral cpl0_boot
    module. It moves GDT/fault/IST/IRQ construction verbatim, modulo indentation,
    before CPU creation/entry. The caller retains bootstrap_sysregs for subsequent
    CPU programming. It needs no new trait: these are writes to already-neutral
    GuestRam, before CarrierMemoryIo registration or CarrierCpuIo admission.
    The two-slot layout stays exactly as KVM currently builds it.
-2. **Remaining neutral preparation:** extract RAM windows, ELF load/validation,
+2. **Shared neutral preparation:** `prepare_boot` extracts RAM windows, ELF load/validation,
    PML4/trampoline/fixture maps and metadata/bindings into an owned prepared-boot
    value; retain the ELF plan, table capacity, IPC backings/generation and pod
    storage without copies. Move fixture map helpers, not their implementations
@@ -104,15 +104,21 @@ Intel SDM vol. 3 remains the descriptor layout authority. The byte witness
 below checks unchanged descriptor writes with explicit mutation controls.
 
 R3 status: descriptor construction is shared through
-`initialize_bootstrap_descriptors`; remaining neutral preparation and CPU
-bring-up are still in `Cpl0Carrier::boot_bytes_inner`. The KVM-free
+`initialize_bootstrap_descriptors`. `prepare_boot` now owns RAM windows,
+ELF loading/validation, page-table and fixture-map preparation, and initial
+metadata/bindings. Its `PreparedBoot` retains the original RAM, ELF plan,
+table capacity, IPC backings/generation and kernel pod storage by move. KVM
+consumes that value before memory registration; registration, installation
+and CPU bring-up remain in `Cpl0Carrier::boot_bytes_inner`. The KVM-free
 `bootstrap_descriptor_tests::initialize_bootstrap_descriptors_has_exact_bytes`
 witness checks GDT, rebased fault gates, private TSS/IST and optional IRQ gates.
 Mutation results and transient run populations belong to the PR evidence.
 Fixture map geometry and its layout assertions now live in the shared
 `cpl0_boot::fixture_maps` module. KVM re-exports the same helpers so boot
 and fixture call sites continue to use one implementation. The cross-crate
-visibility change is isolated from the remaining preparation extraction.
+visibility change is isolated from the inline preparation extraction.
+That extraction changes the helper/value boundary and module paths only;
+its descriptor evidence is a separate additive-rationale commit.
 The native Linux oracle failure is tracked as flaky on main in #2320.
 CPUID and VMX segment bindings provide gate coverage; no descriptor-path
 coverage (follow-up #2476). The byte witness addresses #2477.
