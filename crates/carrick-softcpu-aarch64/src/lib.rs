@@ -607,6 +607,8 @@ mod instruction {
         PairMemory(PairMemory),
         Logical(Logical),
         MoveWide(MoveWide),
+        Bitfield(Bitfield),
+        Address(Address),
     }
 
     /// Arm ARM DDI0487G.a C6.2.92 HINT, C6.2.204 NOP, C6.2.354 YIELD,
@@ -653,6 +655,12 @@ mod instruction {
         }
         if let Some(m) = move_wide(word) {
             return Instruction::MoveWide(m);
+        }
+        if let Some(b) = bitfield(word) {
+            return Instruction::Bitfield(b);
+        }
+        if let Some(a) = address(word) {
+            return Instruction::Address(a);
         }
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
     }
@@ -1095,6 +1103,81 @@ mod instruction {
         })
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BitfieldOperation {
+        Signed,
+        Merge,
+        Unsigned,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Bitfield {
+        pub operation: BitfieldOperation,
+        pub width: crate::Width,
+        pub rd: OperandRegister,
+        pub rn: OperandRegister,
+        pub rotate: ShiftAmount,
+        pub last: ShiftAmount,
+    }
+    /// DDI0487G.a C6.2.29 BFM, C6.2.234 SBFM, C6.2.337 UBFM;
+    /// C4.1.2 Bitfield, C4-284. Preserve immr/imms for wraparound inserts.
+    fn bitfield(w: u32) -> Option<Bitfield> {
+        if w & 0x1f800000 != 0x13000000 {
+            return None;
+        }
+        let sf = w >> 31;
+        if ((w >> 22) & 1) != sf || (sf == 0 && w & 0x208000 != 0) {
+            return None;
+        }
+        let operation = match (w >> 29) & 3 {
+            0 => BitfieldOperation::Signed,
+            1 => BitfieldOperation::Merge,
+            2 => BitfieldOperation::Unsigned,
+            _ => return None,
+        };
+        Some(Bitfield {
+            operation,
+            width: if sf == 0 {
+                crate::Width::W32
+            } else {
+                crate::Width::X64
+            },
+            rd: OperandRegister::field(w, false),
+            rn: OperandRegister::field(w >> 5, false),
+            rotate: ShiftAmount(((w >> 16) & 63) as u8),
+            last: ShiftAmount(((w >> 10) & 63) as u8),
+        })
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AddressBase {
+        Pc,
+        Page,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Address {
+        pub base: AddressBase,
+        pub rd: OperandRegister,
+        pub offset: PcOffset,
+    }
+    /// DDI0487G.a C6.2.10 ADR, C6.2.11 ADRP;
+    /// C4.1.2 PC-rel. addressing, C4-281. ADRP aligns PC before adding offset.
+    fn address(w: u32) -> Option<Address> {
+        if w & 0x1f000000 != 0x10000000 {
+            return None;
+        }
+        let page = w >> 31 != 0;
+        let imm = ((w >> 5) & 0x7ffff) << 2 | ((w >> 29) & 3);
+        let offset = ((imm << 11) as i32 >> 11) as i64;
+        Some(Address {
+            base: if page {
+                AddressBase::Page
+            } else {
+                AddressBase::Pc
+            },
+            rd: OperandRegister::field(w, false),
+            offset: PcOffset(if page { offset << 12 } else { offset }),
+        })
+    }
+
     /// Register index 0..30. Architectural register 31 is represented separately.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Gpr(u8);
@@ -1421,9 +1504,10 @@ mod instruction {
     }
 }
 pub use instruction::{
-    AddImmediate, AddSubtract, Arithmetic, ArithmeticOperand, Branch, Condition, Extend, Gpr, Hint,
-    Instruction, Logical, LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress,
-    MemoryIndex, MemoryOffset, MemoryOperation, MemoryRegister, MemorySize, MoveWide,
-    MoveWideOperation, OperandRegister, PairMemory, PcOffset, RegisterBranch, ScalarMemory,
-    ShiftAmount, VectorRegister, decode_instruction,
+    AddImmediate, AddSubtract, Address, AddressBase, Arithmetic, ArithmeticOperand, Bitfield,
+    BitfieldOperation, Branch, Condition, Extend, Gpr, Hint, Instruction, Logical,
+    LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress, MemoryIndex, MemoryOffset,
+    MemoryOperation, MemoryRegister, MemorySize, MoveWide, MoveWideOperation, OperandRegister,
+    PairMemory, PcOffset, RegisterBranch, ScalarMemory, ShiftAmount, VectorRegister,
+    decode_instruction,
 };
