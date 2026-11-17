@@ -554,8 +554,8 @@ pub fn classify(w: u32) -> A64Class {
     }
     // Preserve the original census bucket for the 320 EL1 VA/ASID words,
     // using the one typed TLBI decoder (C6.2.332).
-    if let Some(Instruction::SystemOperation(op)) = loader::decode(w) {
-        if matches!(
+    if let Some(Instruction::SystemOperation(op)) = loader::decode(w)
+        && matches!(
             op.operation,
             TlbiOperation::Vae1is
                 | TlbiOperation::Aside1is
@@ -567,9 +567,9 @@ pub fn classify(w: u32) -> A64Class {
                 | TlbiOperation::Vaae1
                 | TlbiOperation::Vale1
                 | TlbiOperation::Vaale1
-        ) {
-            return A64Class::TlbInvalidate;
-        }
+        )
+    {
+        return A64Class::TlbInvalidate;
     }
     // Branches, Exception Generating and System: exception generation,
     // unconditional branch (register/immediate), compare/test/conditional.
