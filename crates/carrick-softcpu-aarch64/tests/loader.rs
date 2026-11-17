@@ -144,6 +144,16 @@ fn ldadd_all_operands_and_reserved_neighbours() {
                                 format!("x{rn}")
                             }
                         );
+                        // C6.2.99–101 fixed V, bit 24, and bits 11:10.
+                        for bit in [26, 24, 11, 10] {
+                            assert!(
+                                !matches!(
+                                    decode_instruction(w ^ (1 << bit)),
+                                    Instruction::AtomicAdd(_)
+                                ),
+                                "{w:08x} bit {bit}"
+                            );
+                        }
                         // Other LSE operations are outside this typed leaf.
                         for opc in 1..16 {
                             assert_eq!(decode_instruction(w | opc << 12), Instruction::Unallocated);
@@ -230,6 +240,9 @@ fn sys_space_tlbi_fields_and_names() {
         (6, 5, "- rvae3os - - - rvale3os - -"),
         (6, 6, "- rvae3 - - - rvale3 - -"),
     ];
+    for w in (0xd5008000..=0xd507ffff).chain(0xd5288000..=0xd52fffff) {
+        assert_eq!(decode_instruction(w), Instruction::Unallocated, "{w:08x}");
+    }
     let words: Vec<_> = (0xd5088000..=0xd50fffff).collect();
     let llvm =
         std::env::var_os("CARRICK_LLVM_OBJDUMP").map(|_| oracle_lines(&words, "sys").unwrap());
@@ -315,6 +328,10 @@ fn sys_space_tlbi_fields_and_names() {
 #[ignore = "requires CARRICK_A64_LOADER_SPANS generated from production loader/vector builders"]
 fn generated_loader_vector_spans_are_typed() {
     let path = std::env::var_os("CARRICK_A64_LOADER_SPANS").expect("set CARRICK_A64_LOADER_SPANS");
+    assert_loader_vector_spans_typed(std::path::Path::new(&path));
+}
+
+fn assert_loader_vector_spans_typed(path: &std::path::Path) {
     let bytes = std::fs::read(path).expect("generated production spans");
     assert!(!bytes.is_empty(), "no generated code measured");
     assert_eq!(bytes.len() % 4, 0, "partial instruction in generated spans");
@@ -330,4 +347,17 @@ fn generated_loader_vector_spans_are_typed() {
         words += 1;
     }
     println!("typed {words} generated production loader/vector words");
+}
+
+#[test]
+fn generated_loader_vector_spans_reject_eretaa() {
+    let path =
+        std::env::temp_dir().join(format!("carrick-a64-negative-{}.bin", std::process::id()));
+    std::fs::write(&path, 0xd69f0be0u32.to_le_bytes()).unwrap();
+    let result = std::panic::catch_unwind(|| assert_loader_vector_spans_typed(&path));
+    std::fs::remove_file(path).unwrap();
+    assert!(
+        result.is_err(),
+        "ERETAA must fail the production span witness"
+    );
 }
