@@ -4733,6 +4733,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     ) -> Option<(carrick_personality_linux::identity::TaskCredentials, u32)> {
         let root = self.graph.lock().root_key;
         let key = self.namespace_child_key(root, visible)?;
+        self.task_identity_of_for_test(key)
+    }
+    /// [`Self::task_identity_for_test`] of any live task, a grandchild
+    /// included.
+    #[cfg(test)]
+    pub(crate) fn task_identity_of_for_test(
+        &self,
+        key: TaskKey,
+    ) -> Option<(carrick_personality_linux::identity::TaskCredentials, u32)> {
         let graph = self.graph.lock();
         let task = graph.owner.task(key).ok()?;
         Some((task.leader_credentials().ok()?.clone(), task.umask))
