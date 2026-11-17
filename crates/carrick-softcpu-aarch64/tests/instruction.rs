@@ -142,3 +142,16 @@ fn move_wide_retains_halfword_and_reserved_selectors() {
         );
     }
 }
+
+#[test]
+fn bitfield_and_address_forms_have_typed_operands() {
+    for word in [
+        0x93401c20, 0xb3401c20, 0xd3401c20, 0x13001c20, 0x10000020, 0x90000020,
+    ] {
+        assert_ne!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
