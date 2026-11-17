@@ -36,6 +36,49 @@ pub enum ForkError {
     Core,
 }
 
+/// Refuse the next fork scratch allocation as if the kernel heap could not
+/// hold it. A host test thread owns its own; a freestanding guest test image
+/// has one. This symbol does not exist in an ordinary Carrick guest image.
+#[cfg(feature = "test-support")]
+pub fn inject_scratch_exhausted_once() -> bool {
+    #[cfg(target_os = "none")]
+    {
+        INJECT_SCRATCH_EXHAUSTED
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        INJECT_SCRATCH_EXHAUSTED.with(|armed| !armed.replace(true))
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn injected_scratch_exhausted() -> bool {
+    #[cfg(target_os = "none")]
+    {
+        INJECT_SCRATCH_EXHAUSTED.swap(false, core::sync::atomic::Ordering::AcqRel)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        INJECT_SCRATCH_EXHAUSTED.with(|armed| armed.replace(false))
+    }
+}
+
+#[cfg(all(feature = "test-support", target_os = "none"))]
+static INJECT_SCRATCH_EXHAUSTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(feature = "test-support", not(target_os = "none")))]
+std::thread_local! {
+    static INJECT_SCRATCH_EXHAUSTED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
 /// All allocation occurs before borrowing either owner. Unlinked table words
 /// and parent undo storage stay owned across physical custody suspension.
 #[derive(Clone, Debug)]
@@ -83,6 +126,10 @@ impl ForkScratch {
             || child_len as u64 * 8 > request.child_tables.len
             || parent_len as u64 * 8 > request.parent_tables.len
         {
+            return Err(ForkError::NoMemory);
+        }
+        #[cfg(feature = "test-support")]
+        if injected_scratch_exhausted() {
             return Err(ForkError::NoMemory);
         }
         let mut child = Vec::new();

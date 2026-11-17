@@ -4183,6 +4183,20 @@ fn production_fork_census_root_busy_once_then_forks() {
     );
 }
 
+/// #2441 on x86 CPL0: the next production fork's scratch finds the kernel
+/// heap exhausted. Fork answers ENOMEM, as Linux does, never EFAULT (114);
+/// the refusal returned its stock loan, so the next fork returns the
+/// child's pid and the parent reaps it.
+#[test]
+fn production_fork_scratch_exhaustion_answers_enomem() {
+    bounded_contention_witness(
+        "production_fork_scratch_exhaustion_answers_enomem",
+        "native_not_now_contention.S",
+        &["-DFORK_SCRATCH_EXHAUSTED=1"],
+        "fork scratch exhaustion",
+    );
+}
+
 /// #2306 on x86 CPL0: as above with the root held once while the fork
 /// commits the child's MM. The prepared child is aborted and the fork
 /// reruns to success, never EFAULT (114).
