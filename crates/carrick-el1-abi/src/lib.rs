@@ -1984,6 +1984,21 @@ impl MetadataGrantMailbox {
     pub fn has_guest_work(&self) -> bool {
         self.state.load(Ordering::Acquire) != METADATA_MAILBOX_IDLE
     }
+
+    /// Whether an allocation that missed now is owed capacity: a mailbox
+    /// transaction is in flight, so a rerun after the carrier serves it can
+    /// admit a grant (or publish its own request). Only an answered ALLOC
+    /// the host denied owes nothing; neither does an idle mailbox (#2441).
+    pub fn capacity_owed(&self) -> bool {
+        match self.state.load(Ordering::Acquire) {
+            METADATA_MAILBOX_IDLE => false,
+            METADATA_MAILBOX_RESPONSE => {
+                u64::from(self.op.load(Ordering::Relaxed)) != METADATA_GRANT_OP_ALLOC
+                    || self.status.load(Ordering::Relaxed) == METADATA_GRANT_SUCCESS
+            }
+            _ => true,
+        }
+    }
 }
 
 /// Host completion publishes under the exact request's waiter queue lock.
