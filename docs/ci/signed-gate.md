@@ -27,7 +27,7 @@ identity, and publication compares the candidate only with this paired base.
 A pair whose host or fixture evidence still differs is reported as
 **INCOMPARABLE BASE — BLOCKED**, never as NEW (an incomplete base is not
 that case; see below). No receipt from another host, macOS build, fixture
-bundle or toolchain is ever used. When an admitted `main` run of
+bundle or toolchain is ever used. When an admitted `main` or canonical merge-group candidate run of
 `signed-gate.yml` already published a sealed `signed-base-reuse-<base>-<key_sha256>`
 artifact for the exact same Mac, macOS build, fixture bundle, `rust-toolchain.toml`
 and `scripts/entitlements.plist` (#1918), `reuse-lookup` verifies the seal on
@@ -37,18 +37,19 @@ The xtask subcommands (`reuse-lookup`, `prepare-reuse-upload`, `--reuse-base`)
 landed first (#2061) because the gate builds xtask from trusted `main` (#2092);
 `signed-gate.yml` now calls them.
 
-**Fixture authority comes from main, never from the candidate** (#1889).
-The `base-fixtures` job runs trusted `main` code that finds the
-`kernel-runtime.yml` run which built exactly the merge base, and checks that
-run's workflow path, `main` branch, head SHA, repository and event (a push,
-or an owner dispatch). It downloads only that run's `signed-fixtures-<base>`
-artifact, waiting up to 75 minutes while main's publisher may still upload
-it, and fails when no such bundle exists. Both paired runs restore this one
-bundle: the base checkout must match it exactly, and the candidate checkout
-must have equal fixture inputs. Fixture builds are not bit-reproducible (two
-main bundles with identical inputs differed in 19 of 1195 executables), so a
-second, candidate-built bundle would never have equal `content_sha256`;
-publication still requires equal content and input identity.
+**Fixture authority is verified by trusted main tooling.** Before asking
+main's `kernel-runtime.yml` publisher, `base-fixtures` looks for the successful
+canonical merge-group run whose head equals the landed base SHA. If that run
+preserved its executed archive as `signed-fixtures-<base>`, the tool verifies
+its full input identity against a detached checkout of the landed commit.
+A changed input, missing archive or invalid producer logs a miss and uses the
+normal main publisher. The workflow must upload the original archive after
+successful candidate seal preparation; it must never rebuild that archive.
+Both sides restore the selected bundle. Receipt reuse still requires exact
+archive, manifest and content hashes, along with the same host, hardware,
+macOS build, toolchain, signing inputs and verified binary identity. The
+archive's publishing SHA is provenance, not input identity. Added-probe
+candidates cannot seed reuse until their fixture inputs match a base bundle.
 
 **Added probes are built from candidate code** (owner decision, #1980). The
 `candidate-probes` job runs trusted `main` code on the publisher's runner
