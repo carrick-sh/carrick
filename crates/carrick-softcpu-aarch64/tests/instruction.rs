@@ -166,3 +166,16 @@ fn bitfield_reserved_fields_fail_shut() {
         );
     }
 }
+
+#[test]
+fn conditional_forms_have_typed_operands() {
+    for word in [
+        0x9a820020, 0x9a820420, 0xda820020, 0xda820420, 0xfa420020, 0xba420820,
+    ] {
+        assert_ne!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
