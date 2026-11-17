@@ -276,18 +276,28 @@ fn sys_space_tlbi_fields_and_names() {
             }
         );
         if let Some(lines) = &llvm {
-            // LLVM retains TLBI aliases even with no-aliases; compare names and Rt.
-            assert_eq!(
-                lines[i],
-                format!(
-                    "tlbi {name}{}",
-                    if rt == 31 && (name.starts_with("vmall") || name.starts_with("alle")) {
-                        String::new()
-                    } else {
-                        format!(", {}", reg_text(s.rt, true))
-                    }
-                ),
-                "{w:08x}"
+            // LLVM uses either the TLBI alias or SYS for operandless operations
+            // with a non-ZR Rt. Both must preserve the exact operation and operand.
+            let alias = format!(
+                "tlbi {name}{}",
+                if rt == 31 && (name.starts_with("vmall") || name.starts_with("alle")) {
+                    String::new()
+                } else {
+                    format!(", {}", reg_text(s.rt, true))
+                }
+            );
+            let sys = format!(
+                "sys #{op1}, c{crn}, c{crm}, #{op2}{}",
+                if rt == 31 {
+                    String::new()
+                } else {
+                    format!(", x{rt}")
+                }
+            );
+            assert!(
+                lines[i] == alias || lines[i] == sys,
+                "{w:08x}: {} != {alias} or {sys}",
+                lines[i]
             );
         }
         typed += 1;
