@@ -4412,6 +4412,42 @@ fn serial_host_exec_close_on_exec_ends_record_locks_and_keeps_flock_and_ofd_lock
     );
 }
 
+/// #2452 re-review: the ring lock owner answers fcntl(2)'s served
+/// `SEEK_SET` ranges and the order of fcntl's and flock(2)'s refusals as
+/// native Linux does (`native_record_lock.S -DRANGES`, in a fork child): a
+/// range past the largest offset is EOVERFLOW (G1, G4), checked before an
+/// OFD lock's `l_pid` (G5) and an F_SETLK's type (G6); F_GETLK checks its
+/// type first (G7); a description's access before an OFD `l_pid` (G8);
+/// flock's operation before its descriptor (G9). Compared with the native
+/// oracle. Red on 820b8bb11 in G1, G4 to G6, G8 and G9.
+#[test]
+fn serial_host_fork_child_record_lock_ranges_and_refusal_order_match_native() {
+    bounded_witness(
+        "serial_host_fork_child_record_lock_ranges_and_refusal_order_match_native",
+        || {
+            let (native, carrick) =
+                ring_file_fixture_run("native_record_lock.S", &["-DRANGES"], |dir, name| {
+                    vec![format!(
+                        "-DLOCK_PATH=\"{}\"",
+                        dir.join(format!("{name}-lock")).display()
+                    )]
+                });
+            assert_eq!(native.0, 0, "native oracle: {native:?}");
+            // Child G1..G11, then the parent's R1, R2 and R3.
+            assert_eq!(
+                native.1,
+                [75, 0, 22, 75, 75, 75, 22, 9, 22, 22, 0, 0, 0, 0],
+                "native oracle: {native:?}"
+            );
+            assert_eq!(
+                (carrick.0, &carrick.1, &carrick.2),
+                (native.0, &native.1, &Vec::new()),
+                "(exit, child then parent step bytes, refused counters)"
+            );
+        },
+    );
+}
+
 /// #231: lock waiters hold no execution capacity. Six fork children park in
 /// F_SETLKW on the parent's write lock, more than the pool has vCPUs; the
 /// parent still runs and unlocks, and each waiter in turn takes the lock and
