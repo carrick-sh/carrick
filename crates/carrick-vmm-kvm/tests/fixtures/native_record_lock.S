@@ -52,7 +52,8 @@
  *   L6 dup2(e, c): the replaced c was a descriptor of the file
  *   L7 write(ready)    L8 read(go)
  *   L9 F_SETLK F_WRLCK on e                           0
- *      then a worker that keeps calling getpid, and exit_group(0)
+ *  L10 write(ready), then a worker that keeps calling getpid, and
+ *      exit_group(0)
  * Parent after fork:
  *   M1 read(ready)
  *   M2 F_GETLK l_type                                 1: the lock outlived
@@ -60,10 +61,12 @@
  *   M3 l_pid == the child                             1
  *   M4 write(go)       M5 read(ready)
  *   M6 F_GETLK l_type                                 2: dup2 released it
- *   M7 write(go)
+ *   M7 write(go)       M7b read(ready)
+ *  M7c F_SETLKW F_WRLCK                               0: parked until the
+ *      child's exit_group (a worker still running) released L9
  *   M8 wait4(child): exit code                        0
- *   M9 F_GETLK l_type                                 2: exit_group with a
- *      running worker released L9 */
+ *   M9 F_GETLK l_type                                 2: the parent's own
+ *      lock never conflicts with itself */
 .global _start
 .text
 
@@ -440,6 +443,13 @@ _start:
     call write_byte
     record_status
 
+    movl ready(%rip), %edi          /* M7b: read(ready): L9 holds the lock */
+    call read_byte
+    record_status
+
+    record_lock 7, 1                /* M7c: F_SETLKW parks until the child's */
+    record_status                   /* exit_group releases L9 */
+
     mov %rbx, %rdi                  /* M8: wait4(child, &status, 0, NULL) */
     lea status(%rip), %rsi
     xor %edx, %edx
@@ -500,6 +510,10 @@ lchild:
     record_status
 
     record_lock 6, 1                /* L9: F_SETLK F_WRLCK on e */
+    record_status
+
+    movl ready+4(%rip), %edi        /* L10: write(ready) */
+    call write_byte
     record_status
 
     call report                     /* a running worker, then exit_group */
