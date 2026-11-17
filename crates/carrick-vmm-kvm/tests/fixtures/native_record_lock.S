@@ -93,7 +93,24 @@
  *  E11 write(go)       E12 wait4(child): exit code    0
  *  E13 flock(h, LOCK_EX|LOCK_NB)                      0: the successor's
  *      exit closed f
- *  E14 F_OFD_GETLK F_WRLCK [100, 110) l_type          2 */
+ *  E14 F_OFD_GETLK F_WRLCK [100, 110) l_type          2
+ *
+ * -DRANGES: fcntl(2)'s served SEEK_SET ranges and the order of its and
+ * flock(2)'s refusals (#2452), in a fork child (the ring's lock owner).
+ * Parent R1 openat (fd a, O_RDWR|O_CREAT), R2 openat (fd r, O_RDONLY),
+ * fork. Child, on a unless named, l_pid 0 unless named:
+ *   G1 F_SETLK F_WRLCK (i64::MAX, 2)                  EOVERFLOW
+ *   G2 F_SETLK F_WRLCK (i64::MAX, 1)                  0
+ *   G3 F_SETLK F_WRLCK (-1, 1)                        EINVAL
+ *   G4 F_GETLK F_WRLCK (i64::MAX, 2)                  EOVERFLOW
+ *   G5 F_OFD_SETLK F_WRLCK (i64::MAX, 2), l_pid 5     EOVERFLOW: range first
+ *   G6 F_SETLK l_type 7 (i64::MAX, 2)                 EOVERFLOW: range first
+ *   G7 F_GETLK l_type 7 (i64::MAX, 2)                 EINVAL: type first
+ *   G8 F_OFD_SETLK F_WRLCK (0, 1) on r, l_pid 5       EBADF: access first
+ *   G9 flock(-1, 77)                                  EINVAL: operation first
+ *  G10 F_SETLK F_WRLCK (i64::MAX, i64::MIN)           EINVAL
+ *  G11 F_SETLK F_WRLCK (i64::MAX, -i64::MAX)          0
+ * Parent R3 wait4(child): exit code                   0 */
 .global _start
 .text
 
@@ -129,6 +146,23 @@
     syscall
 .endm
 
+/* fcntl(fd, cmd, &flk) with flk = {type, SEEK_SET, start, len, pid}, any
+ * 64-bit start and len. */
+.macro wide_lock fd, cmd, type, start, len, pid
+    movw $\type, flk(%rip)
+    movw $0, flk+2(%rip)
+    movabsq $\start, %rax
+    movq %rax, flk+8(%rip)
+    movabsq $\len, %rax
+    movq %rax, flk+16(%rip)
+    movl $\pid, flk+24(%rip)
+    mov \fd, %rdi
+    mov $\cmd, %esi
+    lea flk(%rip), %rdx
+    mov $72, %eax
+    syscall
+.endm
+
 /* The l_type a range query reported, or 0x80 | errno. */
 .macro range_type cmd, start, len
     range_lock \cmd, 1, \start, \len
@@ -147,7 +181,7 @@
 1:  call value_byte
 .endm
 
-#if !defined(LIFECYCLE) && !defined(POOL) && !defined(EXEC)
+#if !defined(LIFECYCLE) && !defined(POOL) && !defined(EXEC) && !defined(RANGES)
 _start:
     lea out(%rip), %r15
 
@@ -315,7 +349,89 @@ child:
     xor %edi, %edi
     jmp exit
 
-#endif /* !LIFECYCLE && !POOL && !EXEC */
+#endif /* !LIFECYCLE && !POOL && !EXEC && !RANGES */
+
+#ifdef RANGES
+#define I64_MAX 0x7fffffffffffffff
+#define I64_MIN 0x8000000000000000
+#define NEG_I64_MAX 0x8000000000000001
+_start:
+    lea out(%rip), %r15
+
+    mov $-100, %edi                 /* R1: openat(lock, O_RDWR|O_CREAT, 0640) */
+    lea lock(%rip), %rsi
+    mov $0x42, %edx
+    mov $0640, %r10d
+    mov $257, %eax
+    syscall
+    mov %rax, %r12
+    record_status
+
+    mov $-100, %edi                 /* R2: openat(lock, O_RDONLY) */
+    lea lock(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $257, %eax
+    syscall
+    mov %rax, %r13
+    record_status
+
+    mov $57, %eax                   /* fork */
+    syscall
+    test %rax, %rax
+    js fork_failed
+    jz rchild
+    mov %rax, %rbx
+
+    mov %rbx, %rdi                  /* R3: wait4(child, &status, 0, NULL) */
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    cmp %rbx, %rax
+    jne fork_failed
+    mov status(%rip), %eax
+    shr $8, %eax
+    and $0xff, %eax
+    call value_byte
+
+    call report
+    xor %edi, %edi
+    jmp exit
+
+rchild:
+    lea out(%rip), %r15             /* the child reports only its own */
+    wide_lock %r12, 6, 1, I64_MAX, 2, 0         /* G1 */
+    record_status
+    wide_lock %r12, 6, 1, I64_MAX, 1, 0         /* G2 */
+    record_status
+    wide_lock %r12, 6, 1, -1, 1, 0              /* G3 */
+    record_status
+    wide_lock %r12, 5, 1, I64_MAX, 2, 0         /* G4 */
+    record_status
+    wide_lock %r12, 37, 1, I64_MAX, 2, 5        /* G5 */
+    record_status
+    wide_lock %r12, 6, 7, I64_MAX, 2, 0         /* G6 */
+    record_status
+    wide_lock %r12, 5, 7, I64_MAX, 2, 0         /* G7 */
+    record_status
+    wide_lock %r13, 37, 1, 0, 1, 5              /* G8 */
+    record_status
+    mov $-1, %edi                               /* G9: flock(-1, 77) */
+    mov $77, %esi
+    mov $73, %eax
+    syscall
+    record_status
+    wide_lock %r12, 6, 1, I64_MAX, I64_MIN, 0   /* G10 */
+    record_status
+    wide_lock %r12, 6, 1, I64_MAX, NEG_I64_MAX, 0 /* G11 */
+    record_status
+
+    call report
+    xor %edi, %edi
+    jmp exit
+#endif /* RANGES */
 
 #ifdef POOL
 #define WAITERS 6
