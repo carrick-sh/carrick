@@ -1164,6 +1164,122 @@ fn openat_missing_rootfs_file_returns_enoent() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+/// A guest path that crosses an ABSOLUTE intermediate directory symlink
+/// resolves that target under the GUEST root (path_resolution(7)). When the
+/// re-rooted target is missing in the guest, open and stat must report
+/// ENOENT, whatever the HOST has at the same absolute path. Two shapes:
+///
+/// - the target is a host directory outside the sandbox (a host-file escape
+///   if served);
+/// - the target is the sandbox root's own absolute host path, so the host
+///   kernel's resolution lands INSIDE the sandbox and a prefix containment
+///   check on the served fd accepts it: a wrong guest-visible result in every
+///   build profile.
+///
+/// Both a read-only open and a non-truncating `O_RDWR` open are driven, and
+/// the bytes behind the link must be unchanged afterwards.
+#[test]
+fn openat_through_absolute_dir_symlink_never_serves_the_host_path() {
+    use carrick_vfs::fs_backend::HostFsBackend;
+
+    const LINUX_O_RDONLY: u64 = 0;
+    const LINUX_ENOENT: i32 = 2;
+
+    let scratch = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    std::fs::write(outside.path().join("leak.txt"), b"host bytes").unwrap();
+    let root_abs = std::fs::canonicalize(scratch.path()).unwrap();
+    let outside_abs = std::fs::canonicalize(outside.path()).unwrap();
+
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+    backend
+        .set_file_contents("/inner/leak.txt", b"sandbox bytes".to_vec())
+        .unwrap();
+    backend
+        .symlink(outside_abs.to_str().unwrap(), "/esc")
+        .unwrap();
+    backend
+        .symlink(root_abs.join("inner").to_str().unwrap(), "/alias")
+        .unwrap();
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+
+    // Control: the sandbox file itself is reachable by its own guest path,
+    // so an ENOENT below is the symlink's re-rooting, not a broken setup.
+    memory.write_bytes(0x4000, b"/inner/leak.txt\0").unwrap();
+    let control = dispatcher
+        .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDONLY, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert!(
+        matches!(control, DispatchOutcome::Returned { .. }),
+        "control open of /inner/leak.txt: {control:?}"
+    );
+
+    for path in ["/esc/leak.txt", "/alias/leak.txt"] {
+        let mut path_c = path.as_bytes().to_vec();
+        path_c.push(0);
+        memory.write_bytes(0x4000, &path_c).unwrap();
+        for flags in [LINUX_O_RDONLY, LINUX_O_RDWR] {
+            let outcome = dispatcher
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(
+                        56,
+                        SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, flags, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap();
+            assert_eq!(
+                outcome,
+                DispatchOutcome::Errno {
+                    errno: LinuxErrno::new(LINUX_ENOENT)
+                },
+                "openat({path}, {flags:#o}) must not serve the host-resolved file",
+            );
+        }
+        // newfstatat(AT_FDCWD, path, &st, 0): the metadata lane must agree.
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    79,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0x4400, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(LINUX_ENOENT)
+            },
+            "newfstatat({path}) must not report the host-resolved file",
+        );
+    }
+    assert_eq!(
+        std::fs::read(outside.path().join("leak.txt")).unwrap(),
+        b"host bytes"
+    );
+    assert_eq!(
+        std::fs::read(scratch.path().join("inner/leak.txt")).unwrap(),
+        b"sandbox bytes"
+    );
+}
+
 #[test]
 fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(

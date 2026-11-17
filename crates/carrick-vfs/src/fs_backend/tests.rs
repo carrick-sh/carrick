@@ -1061,20 +1061,34 @@ fn host_fast_open_containment_failure_falls_back_without_serving() {
     let (b, _scratch) = host_backend();
     let outside = tempfile::TempDir::new().unwrap();
     std::fs::write(outside.path().join("leak.txt"), b"host bytes").unwrap();
-    // An intermediate ABSOLUTE symlink pointing at a HOST directory: the
-    // raw openat follows it out of the sandbox, the F_GETPATH containment
-    // check rejects the fd (never serve bytes from an uncontained fd),
-    // and the slow path refuses the escape as before.
+    // An intermediate ABSOLUTE symlink pointing at a HOST directory. The
+    // guest re-roots it (its target is missing in the guest), so no lane may
+    // ever let the host kernel resolve the whole path from the sandbox root:
+    // that follows the link out of the sandbox. Every outcome but `Served`
+    // is exact here; the assertion holds with or without debug assertions
+    // (`cargo test --release`), because it no longer leans on a
+    // debug-only F_GETPATH proof.
     b.symlink(outside.path().to_str().unwrap(), "/esc").unwrap();
     assert!(matches!(
         b.fast_open_for_guest(Path::new("esc/leak.txt"), false, false),
-        FastGuestOpen::Fallback
+        FastGuestOpen::Missing | FastGuestOpen::Fallback
     ));
     assert!(
         b.open_raw_fd("/esc/leak.txt", false, false, false)
             .served()
             .is_none()
     );
+    // A non-truncating O_RDWR open would hand the guest a WRITABLE host fd.
+    assert!(matches!(
+        b.fast_open_for_guest(Path::new("esc/leak.txt"), true, false),
+        FastGuestOpen::Fallback
+    ));
+    assert!(
+        b.open_raw_fd("/esc/leak.txt", true, false, false)
+            .served()
+            .is_none()
+    );
+    assert!(b.metadata("/esc/leak.txt").is_none());
     assert!(matches!(
         b.fast_open_for_guest(Path::new("esc/leak.txt"), true, true),
         FastGuestOpen::Fallback
@@ -1087,6 +1101,45 @@ fn host_fast_open_containment_failure_falls_back_without_serving() {
     assert_eq!(
         std::fs::read(outside.path().join("leak.txt")).unwrap(),
         b"host bytes"
+    );
+}
+
+/// An intermediate ABSOLUTE symlink whose target is the sandbox root's own
+/// host path. The guest re-roots it to a path that does not exist, so the
+/// only exact answer is a miss. The host kernel's resolution lands INSIDE the
+/// sandbox, so an `F_GETPATH` prefix check accepts the fd: the open and stat
+/// lanes must never let the host kernel resolve the path at all, in any
+/// build profile.
+#[cfg(target_os = "macos")]
+#[test]
+fn host_fast_open_containment_never_resolves_absolute_symlink_on_host() {
+    let (b, scratch) = host_backend();
+    b.set_file_contents("/inner/leak.txt", b"sandbox bytes".to_vec())
+        .unwrap();
+    let root_abs = std::fs::canonicalize(scratch.path()).unwrap();
+    b.symlink(root_abs.join("inner").to_str().unwrap(), "/alias")
+        .unwrap();
+
+    for (write, trunc) in [(false, false), (true, false), (true, true)] {
+        assert!(
+            !matches!(
+                b.fast_open_for_guest(Path::new("alias/leak.txt"), write, trunc),
+                FastGuestOpen::Served { .. }
+            ),
+            "fast open (write={write}, trunc={trunc}) served a host-resolved fd"
+        );
+        assert!(
+            b.open_raw_fd("/alias/leak.txt", write, false, trunc)
+                .served()
+                .is_none(),
+            "open (write={write}, trunc={trunc}) served a host-resolved fd"
+        );
+    }
+    assert!(b.metadata("/alias/leak.txt").is_none());
+    assert!(b.lookup("/alias/leak.txt").is_none());
+    assert_eq!(
+        b.file_contents("/inner/leak.txt").unwrap(),
+        b"sandbox bytes"
     );
 }
 
