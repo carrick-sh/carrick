@@ -1,8 +1,8 @@
 //! Static A64 measurement. JSON goes to stdout; --strict additionally rejects
-//! unknown encodings. ELF mapping symbols are authoritative; flat-image mode is
+//! unknown encodings or typed-undecoded words. ELF mapping symbols are authoritative; flat-image mode is
 //! explicitly conservative because it cannot distinguish literal data.
 use anyhow::{Context, Result, ensure};
-use carrick_softcpu_aarch64::{A64Class, classify};
+use carrick_softcpu_aarch64::{A64Class, Instruction, classify, decode_instruction};
 use goblin::elf::{Elf, header, section_header, sym};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -22,6 +22,7 @@ struct Census {
     gaps: BTreeMap<String, u64>,
     registers: BTreeMap<String, u64>,
     unknown: Vec<Value>,
+    typed_undecoded: Vec<Value>,
     spans: Vec<Value>,
 }
 
@@ -92,6 +93,11 @@ impl Census {
         for (i, word) in bytes.chunks_exact(4).enumerate() {
             let word = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
             let class = classify(word);
+            if decode_instruction(word) == Instruction::Unallocated {
+                self.typed_undecoded.push(json!({"span":name,
+                    "address":address + i as u64 * 4,
+                    "encoding":format!("0x{word:08x}"), "class":format!("{class:?}")}));
+            }
             let class_name = match class {
                 A64Class::Mrs(reg) | A64Class::Msr(reg) => {
                     let fields = (reg.op0, reg.op1, reg.crn, reg.crm, reg.op2);
@@ -251,19 +257,20 @@ impl Census {
             "classifier":"hand-authored-a64-v1", "compiler_producers":self.producers, "producer_source":"ELF .comment when present; flat bytes have no producer metadata",
             "scope":"EL1 plus loader; EL0 fixture closure is slice 0b", "input_mode":mode,
             "input_sha256":sha(input), "spans":self.spans,"counts":self.counts,
-            "system_registers":self.registers,"gap_counts":gaps,"unknown_count":self.unknown.len(),"unknown":self.unknown})
+            "system_registers":self.registers,"gap_counts":gaps,"typed_undecoded_count":self.typed_undecoded.len(),"typed_undecoded":self.typed_undecoded,"unknown_count":self.unknown.len(),"unknown":self.unknown})
     }
     fn finish(&self) -> Result<()> {
         ensure!(
-            self.unknown.is_empty(),
-            "A64 census contains {} unknown words",
-            self.unknown.len()
+            self.unknown.is_empty() && self.typed_undecoded.is_empty(),
+            "A64 census contains {} unknown words and {} typed-undecoded words",
+            self.unknown.len(),
+            self.typed_undecoded.len()
         );
         Ok(())
     }
 }
 
-pub(crate) fn run(input: Option<&Path>, strict: bool) -> Result<()> {
+pub(crate) fn run(input: Option<&Path>, strict: bool, output: Option<&Path>) -> Result<()> {
     let mut census = Census::default();
     let bytes = if let Some(path) = input {
         std::fs::read(path).with_context(|| format!("read {}", path.display()))?
@@ -277,8 +284,32 @@ pub(crate) fn run(input: Option<&Path>, strict: bool) -> Result<()> {
         census.span("embedded-flat-conservative-includes-data", 0, &bytes)?;
         "flat upper bound, includes data"
     };
+    let mut exported = Vec::new();
+    loader_spans(|name, address, bytes| {
+        census.span(name, address, bytes)?;
+        if output.is_some() {
+            exported.extend_from_slice(bytes);
+        }
+        Ok(())
+    })?;
+    if let Some(path) = output {
+        std::fs::write(path, &exported).with_context(|| format!("write {}", path.display()))?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&census.report(&bytes, mode))?
+    );
+    if strict {
+        census.finish()?;
+    }
+    Ok(())
+}
+
+// One enumeration serves both measurement and export; retain every generated
+// page, including repeated configurations and padding.
+fn loader_spans(mut visit: impl FnMut(&str, u64, &[u8]) -> Result<()>) -> Result<()> {
     use carrick_mem::memory;
-    census.span(
+    visit(
         "loader-maintenance",
         memory::LINUX_EL1_MAINT_BASE,
         &memory::el1_maintenance_bytes(),
@@ -289,14 +320,14 @@ pub(crate) fn run(input: Option<&Path>, strict: bool) -> Result<()> {
         ("shim", memory::el1_vectors_bytes_shim()),
         ("shim-fd", memory::el1_vectors_bytes_shim_fd_ceiling()),
     ] {
-        census.span(name, memory::LINUX_EL1_VECTORS_BASE, &bytes)?;
+        visit(name, memory::LINUX_EL1_VECTORS_BASE, &bytes)?;
     }
     for identity in [false, true] {
         for fd in [false, true] {
             for el1 in [false, true] {
                 for irq in [memory::El1IrqMode::Masked, memory::El1IrqMode::Gic] {
                     let name = format!("mailbox-identity={identity}-fd={fd}-el1={el1}-irq={irq:?}");
-                    census.span(
+                    visit(
                         &name,
                         memory::LINUX_EL1_VECTORS_BASE,
                         &memory::el1_vectors_bytes_mailbox_irq(identity, fd, el1, irq),
@@ -305,20 +336,13 @@ pub(crate) fn run(input: Option<&Path>, strict: bool) -> Result<()> {
             }
             for irq in [memory::El1IrqMode::Masked, memory::El1IrqMode::Gic] {
                 let name = format!("clock-identity={identity}-fd={fd}-irq={irq:?}");
-                census.span(
+                visit(
                     &name,
                     memory::LINUX_EL1_VECTORS_BASE,
                     &memory::el1_vectors_bytes_mailbox_clock(identity, fd, irq),
                 )?;
             }
         }
-    }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&census.report(&bytes, mode))?
-    );
-    if strict {
-        census.finish()?;
     }
     Ok(())
 }
