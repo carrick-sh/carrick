@@ -604,6 +604,7 @@ mod instruction {
         Arithmetic(Arithmetic),
         Branch(Branch),
         ScalarMemory(ScalarMemory),
+        PairMemory(PairMemory),
     }
 
     /// Arm ARM DDI0487G.a C6.2.92 HINT, C6.2.204 NOP, C6.2.354 YIELD,
@@ -641,6 +642,9 @@ mod instruction {
         }
         if let Some(m) = scalar_memory(word).or_else(|| literal_memory(word)) {
             return Instruction::ScalarMemory(m);
+        }
+        if let Some(m) = pair_memory(word) {
+            return Instruction::PairMemory(m);
         }
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
     }
@@ -861,6 +865,70 @@ mod instruction {
                 }
             },
             address: MemoryAddress::Literal(PcOffset((((w << 8) as i32) >> 13) as i64 * 4)),
+        })
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PairMemory {
+        pub operation: MemoryOperation,
+        pub size: MemorySize,
+        pub first: MemoryRegister,
+        pub second: MemoryRegister,
+        pub base: OperandRegister,
+        pub offset: MemoryOffset,
+        pub index: MemoryIndex,
+        pub non_temporal: bool,
+    }
+
+    /// DDI0487G.a C6.2.129–131 LDNP/LDP/LDPSW, C6.2.276/277 STNP/STP;
+    /// C7.2.189/190 LDNP/LDP and C7.2.329/330 STNP/STP (SIMD&FP).
+    /// Encoding index C4.1.4, Load/store no-allocate pair and register pair,
+    /// offset/pre/post-indexed, pp. C4-309–312. MTE STGP is unsupported.
+    fn pair_memory(w: u32) -> Option<PairMemory> {
+        if w & 0x3a000000 != 0x28000000 {
+            return None;
+        }
+        let opc = w >> 30;
+        let vector = w & (1 << 26) != 0;
+        let load = w & (1 << 22) != 0;
+        let mode = (w >> 23) & 3;
+        if opc == 3 || (!vector && opc == 1 && (!load || mode == 0)) {
+            return None;
+        }
+        let scale = if vector { opc + 2 } else { 2 + (opc >> 1) };
+        let register = |bits| {
+            if vector {
+                MemoryRegister::Vector(VectorRegister((bits & 31) as u8))
+            } else {
+                MemoryRegister::Integer {
+                    register: OperandRegister::field(bits, false),
+                    width: if opc == 0 {
+                        crate::Width::W32
+                    } else {
+                        crate::Width::X64
+                    },
+                }
+            }
+        };
+        Some(PairMemory {
+            operation: if !load {
+                MemoryOperation::Store
+            } else if !vector && opc == 1 {
+                MemoryOperation::LoadSigned
+            } else {
+                MemoryOperation::Load
+            },
+            size: MemorySize::scale(scale)?,
+            first: register(w),
+            second: register(w >> 10),
+            base: OperandRegister::field(w >> 5, true),
+            offset: MemoryOffset((((w << 10) as i32) >> 25) << scale),
+            index: match mode {
+                1 => MemoryIndex::Post,
+                3 => MemoryIndex::Pre,
+                _ => MemoryIndex::Offset,
+            },
+            non_temporal: mode == 0,
         })
     }
 
@@ -1192,6 +1260,6 @@ mod instruction {
 pub use instruction::{
     AddImmediate, AddSubtract, Arithmetic, ArithmeticOperand, Branch, Condition, Extend, Gpr, Hint,
     Instruction, MemoryAddress, MemoryIndex, MemoryOffset, MemoryOperation, MemoryRegister,
-    MemorySize, OperandRegister, PcOffset, RegisterBranch, ScalarMemory, ShiftAmount,
+    MemorySize, OperandRegister, PairMemory, PcOffset, RegisterBranch, ScalarMemory, ShiftAmount,
     VectorRegister, decode_instruction,
 };

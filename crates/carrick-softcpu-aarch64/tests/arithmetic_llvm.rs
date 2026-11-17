@@ -600,3 +600,113 @@ fn generated_scalar_memory_matches_llvm_operands() {
         words.len()
     );
 }
+
+#[test]
+#[ignore = "requires Rust-sysroot CARRICK_LLVM_OBJDUMP"]
+fn generated_pair_memory_matches_llvm_operands() {
+    let mut words = BTreeSet::new();
+    for opc in 0..4u32 {
+        for v in 0..2 {
+            for load in 0..2 {
+                for mode in 0..4 {
+                    for imm in [0, 1, 31, 63, 64, 127] {
+                        for rn in [0, 1, 17, 30, 31] {
+                            for rt in [0, 1, 18, 30, 31] {
+                                for rt2 in [0, 1, 19, 30, 31] {
+                                    words.insert(
+                                        0x28000000
+                                            | opc << 30
+                                            | v << 26
+                                            | mode << 23
+                                            | load << 22
+                                            | imm << 15
+                                            | rt2 << 10
+                                            | rn << 5
+                                            | rt,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Exhaustive imm7 and all pair modes for distinct additional populations.
+    for imm in 0..128u32 {
+        for rt in 0..32 {
+            for mode in 0..4 {
+                words.insert(0xa8400000 | mode << 23 | imm << 15 | 1 << 10 | 2 << 5 | rt);
+            }
+        }
+    }
+    assert!(words.len() >= 50_000);
+    let words: Vec<_> = words.into_iter().collect();
+    let path = std::env::temp_dir().join(format!("carrick-a64-pair-{}.o", std::process::id()));
+    std::fs::write(&path, object(&words)).expect("valid fixture");
+    let output = Command::new(std::env::var_os("CARRICK_LLVM_OBJDUMP").expect("set LLVM"))
+        .args([
+            "-D",
+            "--no-print-imm-hex",
+            "--no-show-raw-insn",
+            "--no-leading-addr",
+        ])
+        .arg(&path)
+        .output()
+        .expect("valid fixture");
+    std::fs::remove_file(path).expect("valid fixture");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("valid fixture");
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|s| s.starts_with(' ') && !s.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), words.len());
+    let mut accepted = 0;
+    for (&w, line) in words.iter().zip(lines) {
+        if let Instruction::PairMemory(m) = decode_instruction(w) {
+            let r = |r| match r {
+                MemoryRegister::Integer { register, width } => reg(register, width),
+                MemoryRegister::Vector(r) => format!(
+                    "{}{}",
+                    match m.size {
+                        MemorySize::Word => 's',
+                        MemorySize::Double => 'd',
+                        MemorySize::Quad => 'q',
+                        _ => unreachable!(),
+                    },
+                    r.number()
+                ),
+            };
+            let name = match (m.operation, m.non_temporal) {
+                (MemoryOperation::Store, false) => "stp",
+                (MemoryOperation::Store, true) => "stnp",
+                (MemoryOperation::Load, false) => "ldp",
+                (MemoryOperation::Load, true) => "ldnp",
+                (MemoryOperation::LoadSigned, _) => "ldpsw",
+            };
+            let b = reg(m.base, Width::X64);
+            let n = m.offset.bytes();
+            let address = match m.index {
+                MemoryIndex::Post => format!("[{b}], #{n}"),
+                MemoryIndex::Pre => format!("[{b}, #{n}]!"),
+                MemoryIndex::Offset if n == 0 => format!("[{b}]"),
+                MemoryIndex::Offset => format!("[{b}, #{n}]"),
+            };
+            let expected = format!("{name} {}, {}, {address}", r(m.first), r(m.second));
+            let actual = line
+                .split("//")
+                .next()
+                .expect("instruction")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(expected, actual, "{w:08x}");
+            accepted += 1;
+        }
+    }
+    println!(
+        "{} distinct pair words; {accepted} accepted; 0 wrong class / operand mismatches",
+        words.len()
+    );
+}
