@@ -20,6 +20,10 @@
  *                  The wait settles inline; getrandom restarts and returns
  *                  8, the parent's page keeps its bytes, and exactly one
  *                  wait was released before its park
+ *   FORK_SCRATCH_EXHAUSTED  #2441: not contention but its counterpart. The
+ *                  next fork's scratch finds the kernel heap exhausted:
+ *                  fork answers ENOMEM (-12), never EFAULT (114). That
+ *                  refusal returned its loan, so the next fork succeeds
  */
 #define INJECT_EDITOR_BUSY_ONCE -495     /* 0x...fe11 */
 #define INJECT_OWNED_COPY_BUSY_ONCE -485 /* 0x...fe1b */
@@ -29,6 +33,8 @@
 #define INJECT_FORK_ROOT_HOLD_CENSUS -471      /* 0x...fe29 */
 #define INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE -468   /* 0x...fe2c */
 #define INJECT_EDITOR_RELEASED_BEFORE_PARK_CENSUS -467 /* 0x...fe2d */
+#define INJECT_FORK_SCRATCH_EXHAUSTED_ONCE -466 /* 0x...fe2e */
+#define ENOMEM 12
 #define SIGCHLD 17
 #define CLONE_CHILD_SETTID 0x01000000
 .global _start
@@ -59,6 +65,21 @@ _start:
     syscall
     test %rax, %rax
     jnz fail_inject
+    mov $57, %eax
+    syscall
+    test %rax, %rax
+    js errno_exit
+    jz exit_child
+    mov %rax, %r12
+#elif defined(FORK_SCRATCH_EXHAUSTED)
+    mov $INJECT_FORK_SCRATCH_EXHAUSTED_ONCE, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_inject
+    mov $57, %eax
+    syscall
+    cmp $-ENOMEM, %rax
+    jne scratch_not_enomem
     mov $57, %eax
     syscall
     test %rax, %rax
@@ -130,7 +151,7 @@ _start:
     jz entropy_child
     mov %rax, %r12
 #else
-#error "FORK_EDITOR, FORK_CENSUS_ROOT, FORK_COMMIT_ROOT, WAITID_BUSY, SETTID_BUSY or ENTROPY_SETTLED_BEFORE_PARK"
+#error "FORK_EDITOR, FORK_CENSUS_ROOT, FORK_COMMIT_ROOT, FORK_SCRATCH_EXHAUSTED, WAITID_BUSY, SETTID_BUSY or ENTROPY_SETTLED_BEFORE_PARK"
 #endif
     /* wait4(child, &status, 0, NULL) */
     mov %r12, %rdi
@@ -218,6 +239,13 @@ settid_child:
     cmpl %eax, ctid(%rip)
     jne fail_output
     mov $7, %edi
+    jmp exit
+scratch_not_enomem:
+    /* The refused fork's answer: an errno, or a child that must not exist. */
+    test %rax, %rax
+    js errno_exit
+    jz exit_child
+    mov $91, %edi
     jmp exit
 errno_exit:
     neg %rax
