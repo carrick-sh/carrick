@@ -39,9 +39,6 @@ serial_host_native_child_getrandom_cow_preserves_parent,
 serial_host_native_child_getrandom_lazy_output_returns_eight_bytes,
 serial_host_native_child_getrandom_boundary_returns_accessible_prefix,
 cpl0_boot::anonymous_owner::custody_tests::native_backing_editor_exclusion_busy_once_then_success
-(9 passed, 0 failed). Full test-kvm: 490 passed, 1 failed, 19 ignored;
-the native Linux oracle exit-status assertion failed in
-native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked.
 No retry, signed acceptance, or runtime-ratio claim; semantics and budgets
 remain unchanged.
 """

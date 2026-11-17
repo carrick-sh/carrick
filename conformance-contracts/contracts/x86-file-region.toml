@@ -26,9 +26,6 @@ cpl0_boot::initial_reply_tests::shared_physical_staging_rolls_back_before_exposu
 cpl0_boot::initial_reply_tests::inventory_retains_two_live_owner_selected_mms,
 cpl0_boot::initial_reply_tests::initial_inventory_refuses_a_receipt_from_another_mm,
 cpl0_boot::cpl0_layout_tests::file_region_published_before_guest_entry
-(5 passed, 0 failed). Full test-kvm: 490 passed, 1 failed, 19 ignored;
-the native Linux oracle exit-status assertion failed in
-native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked.
 No retry, signed acceptance, or runtime-ratio claim; semantics and budgets
 remain unchanged.
 """
