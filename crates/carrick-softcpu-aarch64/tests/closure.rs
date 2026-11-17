@@ -10,3 +10,14 @@ fn barrier_closure_red_witness() {
         );
     }
 }
+
+#[test]
+fn system_closure_red_witness() {
+    for word in [0xd5382000, 0xd5182000, 0xd5034fdf, 0xd50041bf] {
+        assert_ne!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
