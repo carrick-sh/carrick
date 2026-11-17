@@ -42,6 +42,111 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
+/// Initialize the stopped carrier's GDT, fault stubs, private IDT/TSS/IST and
+/// native IRQ gates in retained RAM, before registration or guest execution.
+/// Both backends must use these exact descriptor bytes and supervisor aliases.
+pub fn initialize_bootstrap_descriptors(
+    ram: &mut GuestRam,
+    boot: &carrick_hal::x8664_arch::X8664BootSysregs,
+    hardware_interrupts: bool,
+) -> Result<(), TrapError> {
+    let gdt: Vec<u8> = boot
+        .gdt
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    ram.write_gpa(LAYOUT.gdt_base, &gdt)
+        .map_err(|e| fail(e.to_string()))?;
+    carrick_x86::write_fault_tables_with(LAYOUT, |gpa, bytes| {
+        ram.write_gpa(gpa, bytes).map_err(|e| fail(e.to_string()))
+    })?;
+    // Intel SDM vol. 3: 64-bit TSS IST1 occupies bytes 36..44; the IDT
+    // gate's byte 4 selects IST1. Keep double faults off the syscall stack.
+    // Reuse the existing descriptors/stubs rather than build another IDT.
+    for index in 0..2 {
+        let tss = carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), index)?;
+        let fault_stack =
+            carrick_x86::fault_slot_gpa(carrick_x86::fault_stack_base(LAYOUT), index)?;
+        ram.write_gpa(tss + 4, &(DIRECT_VA + fault_stack + 4096).to_le_bytes())
+            .map_err(|e| fail(e.to_string()))?;
+        // The one-page IST1 (#DF) stacks sit back to back with no guard
+        // (#369 guards the kernel stacks): the #DF handler's frame is
+        // fixed and small, so it cannot reach the next CPU's page.
+        let ist_top = DIRECT_VA + IST_STACK_BASE + (index + 1) * 4096;
+        ram.write_gpa(tss + 36, &ist_top.to_le_bytes())
+            .map_err(|e| fail(e.to_string()))?;
+        let idt = carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index)?;
+        ram.write_gpa(idt + 8 * 16 + 4, &[1])
+            .map_err(|e| fail(e.to_string()))?;
+        for vector in 0..256_u64 {
+            let gate_gpa = idt + vector * 16;
+            let ptr = ram
+                .host_ptr(gate_gpa, 16)
+                .ok_or_else(|| fail("IDT gate backing"))?;
+            // SAFETY: bootstrap owns retained, initialized IDT backing and
+            // no vCPU can read it before publication completes.
+            let gate = unsafe { core::slice::from_raw_parts(ptr, 16) };
+            if gate[5] & 0x80 == 0 {
+                continue;
+            }
+            let low = u16::from_le_bytes([gate[0], gate[1]]) as u64;
+            let mid = u16::from_le_bytes([gate[6], gate[7]]) as u64;
+            let high = u32::from_le_bytes([gate[8], gate[9], gate[10], gate[11]]) as u64;
+            let entry = DIRECT_VA + low + (mid << 16) + (high << 32);
+            ram.write_gpa(gate_gpa, &(entry as u16).to_le_bytes())
+                .map_err(|e| fail(e.to_string()))?;
+            ram.write_gpa(gate_gpa + 6, &((entry >> 16) as u16).to_le_bytes())
+                .map_err(|e| fail(e.to_string()))?;
+            ram.write_gpa(gate_gpa + 8, &((entry >> 32) as u32).to_le_bytes())
+                .map_err(|e| fail(e.to_string()))?;
+        }
+    }
+    if hardware_interrupts {
+        use carrick_x86::interrupts::{
+            IRQ_HEADER_GPA, IRQ_HEADER_MAGIC, KICK_VECTOR, PAGE_FAULT_VECTOR, RESCHED_VECTOR,
+            SHOOTDOWN_VECTOR, TIMER_VECTOR,
+        };
+        let header = ram
+            .read(IRQ_HEADER_GPA, 6 * size_of::<u64>())
+            .map_err(|error| fail(format!("native IRQ header: {error}")))?;
+        let mut words = [0_u64; 6];
+        for (word, bytes) in words.iter_mut().zip(header.chunks_exact(8)) {
+            *word = u64::from_le_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| fail("native IRQ header width"))?,
+            );
+        }
+        if words[0] != IRQ_HEADER_MAGIC
+            || words[1..]
+                .iter()
+                .any(|pc| !(IMAGE_VA..IMAGE_VA + IMAGE_SIZE).contains(pc))
+        {
+            return Err(fail("native IRQ header or entry outside image"));
+        }
+        for index in 0..2 {
+            let idt = carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index)?;
+            for (vector, entry) in [
+                TIMER_VECTOR,
+                KICK_VECTOR,
+                RESCHED_VECTOR,
+                SHOOTDOWN_VECTOR,
+                PAGE_FAULT_VECTOR,
+            ]
+            .into_iter()
+            .zip(words[1..].iter().copied())
+            {
+                ram.write_gpa(
+                    idt + u64::from(vector) * 16,
+                    &carrick_x86::interrupts::interrupt_gate(entry),
+                )
+                .map_err(|error| fail(error.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub const RAM_SIZE: usize = 16 * 1024 * 1024;
 pub const META_GPA: u64 = carrick_core_abi::X86_CPL0_METADATA_GPA;
 pub const META_LEN: u64 = 0x10_0000;
