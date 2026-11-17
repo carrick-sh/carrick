@@ -124,3 +124,35 @@ CPUID and VMX segment bindings provide gate coverage; no descriptor-path
 coverage (follow-up #2476). The byte witness addresses #2477.
 Signed HVF and merge-queue acceptance remain director-owned. #2414 has landing
 priority; #2468 stays draft and must rebase after it lands.
+
+
+### R4 CPU bring-up classification (before extraction)
+
+After `prepare_boot`, VM creation (`KvmVm::create_empty`), CPU allocation
+(`CarrierMachine::from_memory`), raw sreg reads/writes and `KvmSegment`
+conversion, CPUID ioctl reads, MP-state RUNNABLE admission, MSR ioctl arrays,
+TSC-kHz reads and LAPIC register reads/writes are KVM mechanics. They remain
+in the adapter, including its readback checks and error messages.
+
+Memory registration, IPC slot binding, fixture copy-window provisioning,
+file-region/initial-extent installation, fault-record initialization and
+file-binding publication precede CPU creation. These use shared owners but
+are outside this CPU-state extraction. Custody construction follows it.
+
+Neutral CPU policy comprises the entry-layout trampoline override, per-slot
+RIP/RSP, existing `program_longmode_entry` and `program_fault_segments`
+helpers, fixture IF enablement, production SMEP/SMAP requirement and CR4 bits,
+direct-map GDTR/IDTR/TR aliases, optional LAPIC base/BSP bits, syscall
+LSTAR/STAR/SFMASK and per-slot KERNEL_GS_BASE. The helpers already own the
+CR0/CR3/CR4/EFER and segment descriptor definitions: reuse them, do not copy.
+CPUID view construction/qualification is already shared in `GuestCpuidView`;
+this function only checks installed leaf 7 for production SMEP/SMAP.
+TSC conversion and nonzero validation, binding publication, APIC destination
+encoding, software-enable vector and route publication are neutral policy
+interleaved with KVM observations. No APIC identity may be guessed from slot.
+
+A boot-only provider is justified only with a KVM production caller here;
+no unused provider or change to the running snapshot/memory protocols belongs
+in R4. Fixture stepping, watchdog, execution and soft-machine selection stay
+outside this slice. Any change to setter order or admission semantics requires
+a separate behavior change and stops this mechanical lane.
