@@ -1007,7 +1007,13 @@ fn candidate_base_fixtures(root: &Path, base: &str, output: &Path) -> Result<(),
             Some(root),
         )?;
         let tree = fs::canonicalize(tree).map_err(|e| fail(e.to_string()))?;
-        let admitted = verify_fixture_artifact(&tree, &bundle, None, base, base);
+        let admitted = (|| {
+            // Hosted base-fixture jobs can use a prebuilt xtask with an empty
+            // Cargo cache. Resolve the landed commit's pinned fixture graphs
+            // before the verifier performs its offline input inventory.
+            crate::fixtures::fetch_dependencies(&tree).map_err(|e| fail(e.to_string()))?;
+            verify_fixture_artifact(&tree, &bundle, None, base, base)
+        })();
         let cleanup = checked(
             "git",
             &["worktree", "remove", "--force", &tree.to_string_lossy()],
