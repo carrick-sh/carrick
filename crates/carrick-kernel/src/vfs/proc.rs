@@ -984,6 +984,16 @@ pub(crate) fn is_proc_self_pagemap_path(path: &str, self_pid: u32) -> bool {
         .is_some_and(|mid| names_calling_process(mid, self_pid))
 }
 
+/// True iff `path` is any process's `/proc/<pid>/{mem,pagemap}`: a file whose
+/// reads render an address space, so only a reader with a task may serve it.
+pub(crate) fn is_proc_address_space_path(path: &str) -> bool {
+    path.strip_prefix("/proc/").is_some_and(|rest| {
+        rest.strip_suffix("/mem")
+            .or_else(|| rest.strip_suffix("/pagemap"))
+            .is_some()
+    })
+}
+
 /// The errno an open of a FOREIGN `/proc/<pid>/{mem,pagemap}` must fail with,
 /// or `None` when `path` is not one of those (or names the caller, which is
 /// served normally).

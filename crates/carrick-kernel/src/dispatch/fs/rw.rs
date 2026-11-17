@@ -1470,6 +1470,22 @@ impl<'a> FsView<'a> {
                     let bytes = synthetic_device_read(kind, length);
                     deliver_read(memory, address, bytes.len(), &bytes)
                 }
+                // A mount-served blob the venue opened (`/etc/resolv.conf`,
+                // `/etc/services`, #2418). A `/proc/<pid>/{mem,pagemap}`
+                // reads the caller's address space, which only a task has;
+                // the venue never opens one (`open_needs_caller_task`).
+                OpenDescription::SyntheticFile {
+                    path,
+                    contents,
+                    offset,
+                    ..
+                } if !crate::vfs::proc::is_proc_address_space_path(path) => {
+                    let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
+                    let read_len = remaining.len().min(length);
+                    let outcome = deliver_read(memory, address, read_len, &remaining[..read_len])?;
+                    *offset += read_len;
+                    Ok(outcome)
+                }
                 OpenDescription::HostFile { .. } => read_host_file_sequential(
                     &mut open,
                     None,
