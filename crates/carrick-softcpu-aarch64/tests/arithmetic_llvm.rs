@@ -1138,3 +1138,114 @@ fn generated_address_matches_llvm_operands() {
         words.len()
     );
 }
+
+fn condition_name(c: Condition) -> &'static str {
+    match c {
+        Condition::Eq => "eq",
+        Condition::Ne => "ne",
+        Condition::Cs => "hs",
+        Condition::Cc => "lo",
+        Condition::Mi => "mi",
+        Condition::Pl => "pl",
+        Condition::Vs => "vs",
+        Condition::Vc => "vc",
+        Condition::Hi => "hi",
+        Condition::Ls => "ls",
+        Condition::Ge => "ge",
+        Condition::Lt => "lt",
+        Condition::Gt => "gt",
+        Condition::Le => "le",
+        Condition::Al => "al",
+        Condition::Nv => "nv",
+    }
+}
+
+#[test]
+#[ignore = "requires Rust-sysroot CARRICK_LLVM_OBJDUMP"]
+fn generated_conditional_matches_llvm_operands() {
+    let mut words = BTreeSet::new();
+    for sf in 0..2u32 {
+        for op in 0..2 {
+            for cond in 0..16 {
+                for rm in 0..32 {
+                    for rn in [0, 17, 31] {
+                        for low in 0..4 {
+                            for rd in [0, 19, 31] {
+                                words.insert(
+                                    sf << 31
+                                        | op << 30
+                                        | 0x1a800000
+                                        | rm << 16
+                                        | cond << 12
+                                        | low << 10
+                                        | rn << 5
+                                        | rd,
+                                );
+                            }
+                        }
+                        for imm in 0..2 {
+                            for nzcv in 0..16 {
+                                words.insert(
+                                    sf << 31
+                                        | op << 30
+                                        | 0x3a400000
+                                        | rm << 16
+                                        | cond << 12
+                                        | imm << 11
+                                        | rn << 5
+                                        | nzcv,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let words: Vec<_> = words.into_iter().collect();
+    assert!(words.len() >= 50_000);
+    let mut accepted = 0;
+    for (&w, actual) in words.iter().zip(oracle_lines(&words, "conditional")) {
+        let expected = match decode_instruction(w) {
+            Instruction::ConditionalSelect(c) => {
+                let name = match c.operation {
+                    SelectOperation::Select => "csel",
+                    SelectOperation::Increment => "csinc",
+                    SelectOperation::Invert => "csinv",
+                    SelectOperation::Negate => "csneg",
+                };
+                format!(
+                    "{name} {}, {}, {}, {}",
+                    reg(c.rd, c.width),
+                    reg(c.rn, c.width),
+                    reg(c.rm, c.width),
+                    condition_name(c.condition)
+                )
+            }
+            Instruction::ConditionalCompare(c) => {
+                let name = if c.operation == AddSubtract::Add {
+                    "ccmn"
+                } else {
+                    "ccmp"
+                };
+                let operand = match c.operand {
+                    CompareOperand::Register(r) => reg(r, c.width),
+                    CompareOperand::Immediate(i) => format!("#{}", i.value()),
+                };
+                format!(
+                    "{name} {}, {operand}, #{}, {}",
+                    reg(c.rn, c.width),
+                    c.otherwise.bits(),
+                    condition_name(c.condition)
+                )
+            }
+            _ => continue,
+        };
+        assert_eq!(expected, actual, "{w:08x}");
+        accepted += 1;
+    }
+    println!(
+        "{} distinct conditional words; {accepted} accepted; 0 wrong class / operand mismatches",
+        words.len()
+    );
+}
