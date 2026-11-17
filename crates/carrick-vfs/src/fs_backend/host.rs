@@ -620,10 +620,10 @@ pub(crate) enum FastGuestOpen {
     /// proving that the nearest existing ancestor is a contained directory;
     /// ordinary mutable-backend callers retain their exact fallback.
     Missing,
-    /// Anything else (miss, escape, alias, exotic type, error): run the exact
-    /// cap-std slow path. A fast-path failure proves nothing about the guest
-    /// view — e.g. an intermediate ABSOLUTE symlink resolves against the host
-    /// root here but under the guest root on the slow path.
+    /// Anything else (unresolvable parent, alias, exotic type, error): run the
+    /// exact cap-std slow path. A fast-path failure proves nothing about the
+    /// guest view — e.g. a parent behind a symlink whose re-rooted target the
+    /// directory cache could not open.
     Fallback,
     /// The host refused a resource the guest is entitled to (see
     /// [`host_open_refusal`]) even after carrick reclaimed its own descriptor
@@ -2306,92 +2306,53 @@ impl HostFsBackend {
             .unwrap_or(libc::EIO))
     }
 
-    /// Fast `real_stat` for the common regular-file / directory case on
-    /// `--fs host`: one `fstatat` (kernel resolves the whole path) instead of
-    /// cap-std's per-component walk, with an `openat`+`F_GETPATH` containment
-    /// check that an intermediate symlink didn't escape the sandbox root. Returns
-    /// `None` (→ the cap-std path handles it) for symlink leaves (owner on the
-    /// link), FIFOs/sockets/devices (open would block or differ), escapes (cap-std
-    /// re-roots absolute-symlink targets), or any error. See
-    /// docs/fs-host-capstd-amplification.md.
-    /// Core of the fast path: `fstatat` (one syscall, kernel-resolved) + an
-    /// `openat`+`F_GETPATH` containment check, returning the raw `stat` and the
-    /// carrick entry kind for the common regular-file / directory case. `None`
-    /// (→ cap-std handles it) for symlink leaves, FIFOs/sockets/devices, escapes
-    /// (an intermediate symlink the kernel followed out of the sandbox root), or
-    /// any error. See docs/fs-host-capstd-amplification.md.
     /// Open `rel` ONCE under the sandbox root and resolve everything a stat
-    /// needs from the resulting fd: type (`fstat`), sandbox containment
-    /// (`F_GETPATH`), and the guest mode/owner/socket xattrs (`fgetxattr`). A
-    /// single in-kernel path walk replaces the old `fstatat` + separate
-    /// containment `openat` + one `getxattr` PER attribute (each its own full
-    /// re-walk of the path; ~7 walks of a deep path per guest stat, see
+    /// needs from the resulting fd: type (`fstat`) and the guest
+    /// mode/owner/socket xattrs (`fgetxattr`), replacing an `fstatat` plus one
+    /// `getxattr` PER attribute (each its own full re-walk of the path, see
     /// docs/fs-host-capstd-amplification.md). `O_EVTONLY` opens "for event
-    /// monitoring only": `fstat`/`F_GETPATH`/`fgetxattr` all work, but the kernel
-    /// records NO access, so atime is preserved exactly as the guest set it (the
-    /// property the path-based xattr peeks were introduced for). Returns the
+    /// monitoring only": `fstat`/`fgetxattr` work, but the kernel records NO
+    /// access, so atime is preserved exactly as the guest set it. Returns the
     /// still-open fd (auto-closed on drop, including every early return) so the
     /// caller can read fd-relative xattrs with no further walk. `None` (→ the
-    /// cap-std slow path) for symlink leaves, FIFOs/sockets/devices, sandbox
-    /// escapes, or any error.
+    /// cap-std slow path) for symlink leaves, FIFOs/sockets/devices, a parent
+    /// the directory cache cannot resolve, or any error.
+    ///
+    /// Every open here is ONE `O_NOFOLLOW` component beneath a dirfd from the
+    /// kernel directory cache, so containment is structural in every build
+    /// profile and no `F_GETPATH` is issued. A path whose parent the cache
+    /// cannot resolve (a re-rooted symlink target missing in the guest, a
+    /// `..` climbing out, the hop limit, fd exhaustion) and a symlink leaf
+    /// both return `None`: letting the host kernel resolve them would follow
+    /// an absolute symlink against the HOST root. A caller that follows links
+    /// passes the `resolve_following` result, whose leaf is not a symlink.
     #[cfg(target_os = "macos")]
     fn fast_open_contained(
         &self,
         rel: &Path,
-        follow: bool,
     ) -> Option<(std::os::fd::OwnedFd, libc::stat, RootFsEntryKind)> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        use std::os::unix::ffi::OsStrExt;
         if !self.fast_fs {
             return None;
         }
-        let root_prefix = self.root_prefix.as_deref()?;
+        self.root_prefix.as_ref()?;
 
         // ONE open. O_EVTONLY: event-monitoring open — fstat/F_GETPATH/fgetxattr
         // all work but the kernel records no access, so atime is untouched (this
         // is what made the per-attr path getxattrs necessary; folding them onto
         // one O_EVTONLY fd keeps the atime guarantee AND collapses the walks).
-        // O_NONBLOCK so a (racing) FIFO can't wedge the open. O_NOFOLLOW on lstat
-        // (`!follow`) so a leaf symlink isn't traversed; on stat (`follow`) it IS
-        // traversed and the F_GETPATH containment below proves the *target* is
-        // in-sandbox.
+        // O_NONBLOCK so a (racing) FIFO can't wedge the open. O_NOFOLLOW so a
+        // symlink leaf (ELOOP) goes to the slow path, which re-roots an
+        // absolute target under the guest root.
         const O_EVTONLY: libc::c_int = 0x8000;
-        let mut oflags = O_EVTONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
-        if !follow {
-            oflags |= libc::O_NOFOLLOW;
-        }
+        let oflags = O_EVTONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW;
 
         // Resolve the parent through the kernel directory cache and open the
-        // LEAF against it. Two things follow, and both are the point of the
-        // cache:
-        //
-        //  - the directory chain is resolved once per directory instead of once
-        //    per call, so the kernel walks one component here, not the path;
-        //  - on the `!follow` arm the open is a single component `O_NOFOLLOW`
-        //    beneath an already-proven dirfd, which cannot traverse a symlink
-        //    and therefore cannot leave the sandbox. Containment is structural
-        //    and the `F_GETPATH` is not issued at all — it was 6.43 host
-        //    `fcntl`s per guest `openat` on the cold build.
-        //
-        // The `follow` arm still proves containment explicitly: the leaf symlink
-        // IS traversed there and its target may be anywhere.
-        let (raw, proven) = match self.namei_leaf(rel) {
-            Some((parent_fd, name_c)) => {
-                let raw =
-                    unsafe { host_openat!(parent_fd.as_raw_fd(), name_c.as_ptr(), oflags, 0) };
-                (raw, !follow)
-            }
-            None => {
-                // No cached resolution (an intermediate symlink, a missing
-                // parent, the cache disabled): fall back to letting the kernel
-                // resolve the whole path from the sandbox root, which must then
-                // be proven contained.
-                let rel_c = std::ffi::CString::new(rel.as_os_str().as_bytes()).ok()?;
-                let raw =
-                    unsafe { host_openat!(self.root_fd.as_raw_fd(), rel_c.as_ptr(), oflags, 0) };
-                (raw, false)
-            }
-        };
+        // LEAF against it. The directory chain is resolved once per directory
+        // instead of once per call, so the kernel walks one component here,
+        // not the path.
+        let (parent_fd, name_c) = self.namei_leaf(rel)?;
+        let raw = unsafe { host_openat!(parent_fd.as_raw_fd(), name_c.as_ptr(), oflags, 0) };
         if raw < 0 {
             return None; // symlink leaf (O_NOFOLLOW→ELOOP), ENOENT, …
         }
@@ -2415,68 +2376,48 @@ impl HostFsBackend {
         } else {
             return None; // symlink/FIFO/socket-node/device
         };
-
-        // Containment: structural containment guarantees that child paths
-        // resolved under parent dirfds cannot escape the root. Preserve debug
-        // assertions only.
-        let _ = (&root_prefix, &proven);
-        #[cfg(debug_assertions)]
-        if !proven && !fd_contained_under(raw, root_prefix) {
-            return None;
-        }
         Some((fd, st, kind))
     }
 
-    /// [`HostFsBackend::fast_open_contained`] for callers that only need
-    /// `(stat, kind)`, with the same acceptance set (a plain regular file or
-    /// directory; everything else is `None` for the exact slow path).
+    /// [`HostFsBackend::fast_open_contained`]'s acceptance set (a plain regular
+    /// file or directory; everything else is `None` for the exact slow path)
+    /// for callers that only need `(stat, kind)` of the entry itself.
     ///
-    /// On the `!follow` arm with a cached parent this is ONE
-    /// `fstatat(parent, leaf, AT_SYMLINK_NOFOLLOW)`: a single component that
-    /// cannot traverse a symlink beneath an already-contained dirfd is
-    /// contained by the same structural argument the open lane relies on, and
-    /// a stat records no access, so nothing the `O_EVTONLY` open provided is
-    /// lost. That open was `openat`+`fstat`+`close` for a KIND — three host
-    /// calls per `lookup_kind`, which is the first probe of every ordinary
-    /// guest `open`, `unlink` and `mkdir`. The follow arm keeps the open: a
-    /// followed leaf symlink can land anywhere and its target must be proven
-    /// contained on the fd.
+    /// This is ONE `fstatat(parent, leaf, AT_SYMLINK_NOFOLLOW)`: a single
+    /// component that cannot traverse a symlink beneath an already-contained
+    /// dirfd is contained by the same structural argument the open lane relies
+    /// on, and a stat records no access, so nothing the `O_EVTONLY` open
+    /// provided is lost. That open was `openat`+`fstat`+`close` for a KIND —
+    /// three host calls per `lookup_kind`, which is the first probe of every
+    /// ordinary guest `open`, `unlink` and `mkdir`.
     #[cfg(target_os = "macos")]
-    fn fast_lstat_contained(
-        &self,
-        rel: &Path,
-        follow: bool,
-    ) -> Option<(libc::stat, RootFsEntryKind)> {
+    fn fast_lstat_contained(&self, rel: &Path) -> Option<(libc::stat, RootFsEntryKind)> {
         use std::os::fd::AsRawFd;
-        if !follow
-            && self.fast_fs
-            && self.root_prefix.is_some()
-            && let Some((parent_fd, name_c)) = self.namei_leaf(rel)
-        {
-            let mut st: libc::stat = unsafe { core::mem::zeroed() };
-            let rc = unsafe {
-                host_fstatat!(
-                    parent_fd.as_raw_fd(),
-                    name_c.as_ptr(),
-                    &mut st,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if rc != 0 {
-                return None;
-            }
-            let typ = st.st_mode as u32 & libc::S_IFMT as u32;
-            let kind = if typ == libc::S_IFDIR as u32 {
-                RootFsEntryKind::Directory
-            } else if typ == libc::S_IFREG as u32 {
-                RootFsEntryKind::File
-            } else {
-                return None;
-            };
-            return Some((st, kind));
+        if !self.fast_fs || self.root_prefix.is_none() {
+            return None;
         }
-        self.fast_open_contained(rel, follow)
-            .map(|(_fd, st, kind)| (st, kind))
+        let (parent_fd, name_c) = self.namei_leaf(rel)?;
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        let rc = unsafe {
+            host_fstatat!(
+                parent_fd.as_raw_fd(),
+                name_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+        let kind = if typ == libc::S_IFDIR as u32 {
+            RootFsEntryKind::Directory
+        } else if typ == libc::S_IFREG as u32 {
+            RootFsEntryKind::File
+        } else {
+            return None;
+        };
+        Some((st, kind))
     }
 
     /// Build guest-facing metadata from the already-contained fd fast path.
@@ -2514,7 +2455,7 @@ impl HostFsBackend {
             });
         }
 
-        let (fd, st, kind) = self.fast_open_contained(rel, false)?;
+        let (fd, st, kind) = self.fast_open_contained(rel)?;
         if !self.name_matches_on_disk(rel) {
             return None;
         }
@@ -2539,10 +2480,10 @@ impl HostFsBackend {
     /// sibling of [`HostFsBackend::fast_open_contained`]: ONE `openat` with
     /// the REAL access mode replaces the `resolve_following` leaf pre-stat
     /// for the common regular-file case, and the returned fd is
-    /// the fd actually served to the guest. Truncating opens require a proven
-    /// parent before the destructive open; creating opens keep the contained
-    /// parent-creation path per the sandbox rationale in
-    /// docs/fs-host-capstd-amplification.md.
+    /// the fd actually served to the guest. Every open, truncating or not,
+    /// needs a contained parent from the directory cache before the host sees
+    /// the leaf; creating opens keep the contained parent-creation path per
+    /// the sandbox rationale in docs/fs-host-capstd-amplification.md.
     ///
     /// Unlike the `O_EVTONLY` probes, this IS the guest's open: a regular
     /// file's atime advances exactly as a real `open(2)`+read would, which is
@@ -2555,35 +2496,31 @@ impl HostFsBackend {
         trunc: bool,
     ) -> FastGuestOpen {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        use std::os::unix::ffi::OsStrExt;
-        if !self.fast_fs {
+        if !self.fast_fs || self.root_prefix.is_none() {
             return FastGuestOpen::Fallback;
         }
-        let Some(root_prefix) = self.root_prefix.as_deref() else {
-            return FastGuestOpen::Fallback;
-        };
-        let Ok(rel_c) = std::ffi::CString::new(rel.as_os_str().as_bytes()) else {
-            return FastGuestOpen::Fallback;
-        };
         // Resolve the parent through the kernel directory cache and open the
         // leaf against it. Every open on this path is `O_NOFOLLOW`, so a single
         // component beneath an already-proven dirfd cannot traverse a symlink
-        // and containment is structural — the `F_GETPATH` below is then not
-        // issued at all. Without a cached parent, the kernel resolves the whole
-        // path from the sandbox root and containment must be proven explicitly.
-        let namei = self.namei_leaf_res(rel);
-        let (dir_fd, rel_c, proven) = match &namei {
-            Ok((parent_fd, name_c)) => (parent_fd.as_raw_fd(), name_c, true),
+        // and containment is structural in every build profile — no
+        // `F_GETPATH` is issued. A parent the cache cannot resolve is never
+        // handed to the host kernel as a whole path: that would follow an
+        // intermediate absolute symlink against the HOST root.
+        let (parent_fd, name_c) = match self.namei_leaf_res(rel) {
+            Ok(pair) => pair,
             Err(errno) => {
-                // Truncation must never precede containment validation. Without
-                // a proven parent, use the contained resolver before opening.
-                if trunc {
-                    return FastGuestOpen::Fallback;
-                }
-                if let Some(refused) = host_open_refusal(*errno) {
+                if let Some(refused) = host_open_refusal(errno) {
                     return FastGuestOpen::Refused(refused);
                 }
-                (self.root_fd.as_raw_fd(), &rel_c, false)
+                // A missing ancestor (including a re-rooted symlink target)
+                // is an ENOENT before any fd existed, exactly as a missing
+                // leaf below: `Missing` stays non-authoritative until the
+                // immutable-lower caller proves it.
+                return if errno == libc::ENOENT && !write {
+                    FastGuestOpen::Missing
+                } else {
+                    FastGuestOpen::Fallback
+                };
             }
         };
         // O_NONBLOCK: a racing FIFO at the leaf must never block this open
@@ -2591,10 +2528,8 @@ impl HostFsBackend {
         // before the fd is served. O_NOFOLLOW: a symlink leaf is the typed
         // `SymlinkLeaf` outcome (ELOOP), not a host-side traversal — its
         // absolute target must be re-rooted under the guest root by the slow
-        // path. O_NOCTTY: purely defensive — an intermediate absolute symlink
-        // can briefly land this open on an arbitrary host node before the
-        // containment check rejects it, and that probe must never acquire a
-        // controlling terminal.
+        // path. O_NOCTTY: purely defensive — a probe of a contained device
+        // node must never acquire a controlling terminal.
         let base = libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY;
         // The host open carries the guest's OWN access mode. An O_RDWR open of
         // an APFS file costs ~1.7x an O_RDONLY one (10.8 vs 6.3 us measured
@@ -2613,7 +2548,12 @@ impl HostFsBackend {
             return FastGuestOpen::Fallback;
         }
         let trunc_flag = if trunc { libc::O_TRUNC } else { 0 };
-        let raw = match self.openat_for_guest(dir_fd, rel_c, accmode | base | trunc_flag, 0) {
+        let raw = match self.openat_for_guest(
+            parent_fd.as_raw_fd(),
+            &name_c,
+            accmode | base | trunc_flag,
+            0,
+        ) {
             Ok(raw) => raw,
             Err(libc::ELOOP) => return FastGuestOpen::SymlinkLeaf,
             Err(libc::ENOENT) if !write => return FastGuestOpen::Missing,
@@ -2629,14 +2569,6 @@ impl HostFsBackend {
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
         if unsafe { host_fstat!(raw, &mut st) } != 0 {
-            return FastGuestOpen::Fallback;
-        }
-        // Containment: structural containment guarantees that child paths
-        // resolved under parent dirfds cannot escape the root. Preserve debug
-        // assertions only.
-        let _ = (&root_prefix, &proven);
-        #[cfg(debug_assertions)]
-        if !proven && !fd_contained_under(raw, root_prefix) {
             return FastGuestOpen::Fallback;
         }
         // Byte-exact leaf-name guard against macOS's normalizing VFS, exactly
@@ -3284,8 +3216,11 @@ impl HostFsBackend {
         }
     }
 
+    /// `real_stat`'s fd-centric lane. `normalized` is already
+    /// `resolve_following`-resolved when the caller follows links, so the leaf
+    /// is opened `O_NOFOLLOW` either way.
     #[cfg(target_os = "macos")]
-    fn fast_real_stat(&self, normalized: &Path, follow: bool) -> Option<RealStat> {
+    fn fast_real_stat(&self, normalized: &Path) -> Option<RealStat> {
         use std::os::fd::AsRawFd;
         let rel = Self::rel_path(normalized)?; // None == root dir: let cap-std handle
 
@@ -3300,7 +3235,7 @@ impl HostFsBackend {
             return Some(rs);
         }
 
-        let (fd, st, kind) = self.fast_open_contained(rel, follow)?;
+        let (fd, st, kind) = self.fast_open_contained(rel)?;
         let raw = fd.as_raw_fd();
 
         // mode/owner/socket via ONE flistxattr-gated pass on the ALREADY-OPEN fd
@@ -3337,16 +3272,12 @@ impl HostFsBackend {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn fast_real_stat(&self, _normalized: &Path, _follow: bool) -> Option<RealStat> {
+    fn fast_real_stat(&self, _normalized: &Path) -> Option<RealStat> {
         None
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn fast_lstat_contained(
-        &self,
-        _rel: &Path,
-        _follow: bool,
-    ) -> Option<(libc::stat, RootFsEntryKind)> {
+    fn fast_lstat_contained(&self, _rel: &Path) -> Option<(libc::stat, RootFsEntryKind)> {
         None
     }
 
@@ -4875,7 +4806,7 @@ impl FsBackend for HostFsBackend {
         }
         let rel = Self::rel_path(&normalized)?;
         // Fast contained dir stat (no per-component walk) — the glob hot path.
-        if let Some((_, RootFsEntryKind::Directory)) = self.fast_lstat_contained(rel, false) {
+        if let Some((_, RootFsEntryKind::Directory)) = self.fast_lstat_contained(rel) {
             return if self.name_matches_on_disk(rel) {
                 Some(OverlayEntry::Dir)
             } else {
@@ -7356,7 +7287,7 @@ impl FsBackend for HostFsBackend {
             return None;
         }
 
-        if let Some(rs) = self.fast_real_stat(&normalized, follow) {
+        if let Some(rs) = self.fast_real_stat(&normalized) {
             return Some(rs);
         }
 
