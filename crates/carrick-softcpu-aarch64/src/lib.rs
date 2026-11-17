@@ -591,3 +591,6 @@ mod tests {
         assert_eq!(classify(0xd5182000), Msr(reg));
     }
 }
+
+mod instruction;
+pub use instruction::*;
