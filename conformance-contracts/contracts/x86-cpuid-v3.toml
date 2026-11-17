@@ -63,6 +63,17 @@ The scheduler fixtures entry_kick_and_timer_preempt_two_private_contexts and
 return_kick_and_timer_preempt_two_private_contexts exercise both retained roots.
 No bindings, semantic expectations, structural budgets or acceptance layers
 change; signed acceptance and runtime-ratio promotion remain director-owned.
+
+#671 R4 computes the production leaf-7 feature requirement and CR4 mask in
+BootCpuState. KVM still observes the installed CPUID view and refuses missing
+SMEP/SMAP before installing the same control bits. GuestCpuidView remains the
+single shared CPUID policy; neither its qualification nor its topology changes.
+The KVM-free boot_cpu_state_has_exact_values witness checks the feature masks,
+explicit CPUID APIC identity and BSP/AP LAPIC-base values. Existing cpuid tests
+and the bound KVM library witnesses run unchanged. Actual LAPIC identity and
+TSC observation, conversion and publication remain in the adapter; no identity
+is inferred from slot and no unused boot-provider trait is introduced.
+No binding, budget, runtime-ratio or signed-acceptance claim changes.
 """
 
 [bindings]

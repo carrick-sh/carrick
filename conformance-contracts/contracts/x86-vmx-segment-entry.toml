@@ -43,6 +43,18 @@ The scheduler fixtures entry_kick_and_timer_preempt_two_private_contexts and
 return_kick_and_timer_preempt_two_private_contexts exercise both retained roots.
 No bindings, semantic expectations, structural budgets or acceptance layers
 change; signed acceptance and runtime-ratio promotion remain director-owned.
+
+#671 R4 isolates the new BootCpuState value/helper boundary from KVM ioctl
+conversion. It retains the existing program_longmode_entry and
+program_fault_segments helpers, per-slot entry registers, direct-map GDTR,
+private IDTR/TR, fixture IF policy and production CR4 requirement. KVM keeps
+its setter order, readback checks and admission. The neutral production-caller
+witness boot_cpu_state_has_exact_values records control registers, hidden
+segment values and entry registers for both slots and all boot-mode pairs.
+RIP-stride, CR4-SMAP and IDT-alias mutations each make that witness fail.
+Existing vmx_programmed_entry_segments_are_valid and
+vmx_restore_user_and_cpl0_segments_are_valid bindings also run unchanged.
+No binding, budget, runtime-ratio or signed-acceptance claim changes.
 """
 
 [bindings]

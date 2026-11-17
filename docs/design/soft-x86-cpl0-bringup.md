@@ -156,3 +156,23 @@ no unused provider or change to the running snapshot/memory protocols belongs
 in R4. Fixture stepping, watchdog, execution and soft-machine selection stay
 outside this slice. Any change to setter order or admission semantics requires
 a separate behavior change and stops this mechanical lane.
+
+
+R4 status: `cpl0_boot::boot_cpu::BootCpuState` now computes the desired
+per-slot entry values, direct-map descriptor aliases, production CPUID/CR4
+masks, LAPIC base/BSP bits and syscall MSRs. Its `program_entry` reuses the
+existing shared long-mode/fault-segment helpers, in their original order.
+The value retains `CpuId`; programming cannot accept a different slot.
+KVM consumes it through the original setters and keeps the same observation,
+conversion, readback and MP-state admission. The helper/value boundary is an
+isolated extraction commit; the contract rationale follows separately.
+The module lives inline in the already-mapped boot surface, avoiding a registry
+or gate change for a new file. KVM-free value/recorded-setter witnesses cover
+both slots and all fixture/production and interrupt-mode combinations, with
+three independent mutation controls. The existing KVM tests are unchanged.
+No new provider trait lands: this value has a production caller, but CPU
+creation/admission and the observed TSC/LAPIC publication loop remain concrete
+KVM operations. A generic boot provider remains a later extraction, requiring
+its own production caller and evidence; it does not reuse the running snapshot
+protocol. No behavior change, soft-machine work or execution selection is part
+of this slice. Signed HVF and final queue acceptance remain director-owned.
