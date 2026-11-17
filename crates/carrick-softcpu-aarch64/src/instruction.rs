@@ -7,6 +7,7 @@ pub enum Instruction {
     CensusGap(Decoded),
     Hint(Hint),
     Arithmetic(Arithmetic),
+    Branch(Branch),
 }
 
 /// Arm ARM DDI0487G.a C6.2.92 HINT, C6.2.204 NOP, C6.2.354 YIELD,
@@ -38,6 +39,9 @@ pub fn decode_instruction(word: u32) -> Instruction {
 
     if let Some(a) = arithmetic(word) {
         return Instruction::Arithmetic(a);
+    }
+    if let Some(b) = branch(word) {
+        return Instruction::Branch(b);
     }
     crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
 }
@@ -219,4 +223,150 @@ fn arithmetic(w: u32) -> Option<Arithmetic> {
         rn: OperandRegister::field(w >> 5, uses_sp),
         operand,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcOffset(i64);
+impl PcOffset {
+    pub const fn bytes(self) -> i64 {
+        self.0
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Condition {
+    Eq,
+    Ne,
+    Cs,
+    Cc,
+    Mi,
+    Pl,
+    Vs,
+    Vc,
+    Hi,
+    Ls,
+    Ge,
+    Lt,
+    Gt,
+    Le,
+    Al,
+    Nv,
+}
+impl Condition {
+    fn field(w: u32) -> Self {
+        match w & 15 {
+            0 => Self::Eq,
+            1 => Self::Ne,
+            2 => Self::Cs,
+            3 => Self::Cc,
+            4 => Self::Mi,
+            5 => Self::Pl,
+            6 => Self::Vs,
+            7 => Self::Vc,
+            8 => Self::Hi,
+            9 => Self::Ls,
+            10 => Self::Ge,
+            11 => Self::Lt,
+            12 => Self::Gt,
+            13 => Self::Le,
+            14 => Self::Al,
+            _ => Self::Nv,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterBranch {
+    Jump,
+    Call,
+    Return,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Branch {
+    Immediate {
+        link: bool,
+        offset: PcOffset,
+    },
+    Conditional {
+        condition: Condition,
+        offset: PcOffset,
+    },
+    Compare {
+        width: crate::Width,
+        nonzero: bool,
+        rt: OperandRegister,
+        offset: PcOffset,
+    },
+    Test {
+        bit: ShiftAmount,
+        nonzero: bool,
+        rt: OperandRegister,
+        offset: PcOffset,
+    },
+    Register {
+        op: RegisterBranch,
+        rn: OperandRegister,
+    },
+}
+
+fn signed_offset(field: u32, bits: u32) -> PcOffset {
+    PcOffset(((i64::from(field) << (64 - bits)) >> (64 - bits)) << 2)
+}
+
+/// DDI0487G.a C6.2.26 B, C6.2.33 BL; C4.1.3 Unconditional branch (immediate).
+fn branch_immediate(w: u32) -> Option<Branch> {
+    (w & 0x7c000000 == 0x14000000).then_some(Branch::Immediate {
+        link: w >> 31 != 0,
+        offset: signed_offset(w & 0x03ffffff, 26),
+    })
+}
+/// DDI0487G.a C6.2.25 B.cond; C4.1.3 Conditional branch (immediate).
+fn branch_conditional(w: u32) -> Option<Branch> {
+    (w & 0xff000010 == 0x54000000).then_some(Branch::Conditional {
+        condition: Condition::field(w),
+        offset: signed_offset((w >> 5) & 0x7ffff, 19),
+    })
+}
+/// DDI0487G.a C6.2.44 CBNZ, C6.2.45 CBZ;
+/// C4.1.3 Compare and branch (immediate).
+fn branch_compare(w: u32) -> Option<Branch> {
+    (w & 0x7e000000 == 0x34000000).then_some(Branch::Compare {
+        width: if w >> 31 == 0 {
+            crate::Width::W32
+        } else {
+            crate::Width::X64
+        },
+        nonzero: w & (1 << 24) != 0,
+        rt: OperandRegister::field(w, false),
+        offset: signed_offset((w >> 5) & 0x7ffff, 19),
+    })
+}
+/// DDI0487G.a C6.2.330 TBNZ, C6.2.331 TBZ;
+/// C4.1.3 Test and branch (immediate). Bit 31 is bit_pos[5], not sf.
+fn branch_test(w: u32) -> Option<Branch> {
+    (w & 0x7e000000 == 0x36000000).then_some(Branch::Test {
+        bit: ShiftAmount((((w >> 26) & 32) | ((w >> 19) & 31)) as u8),
+        nonzero: w & (1 << 24) != 0,
+        rt: OperandRegister::field(w, false),
+        offset: signed_offset((w >> 5) & 0x3fff, 14),
+    })
+}
+/// DDI0487G.a C6.2.36 BR, C6.2.34 BLR, C6.2.220 RET;
+/// C4.1.3 Unconditional branch (register). Authentication extensions fail shut.
+fn branch_register(w: u32) -> Option<Branch> {
+    let op = match w & 0xfffffc1f {
+        0xd61f0000 => RegisterBranch::Jump,
+        0xd63f0000 => RegisterBranch::Call,
+        0xd65f0000 => RegisterBranch::Return,
+        _ => return None,
+    };
+    Some(Branch::Register {
+        op,
+        rn: OperandRegister::field(w >> 5, false),
+    })
+}
+fn branch(w: u32) -> Option<Branch> {
+    branch_immediate(w)
+        .or_else(|| branch_conditional(w))
+        .or_else(|| branch_compare(w))
+        .or_else(|| branch_test(w))
+        .or_else(|| branch_register(w))
 }
