@@ -147,8 +147,11 @@ pub struct LockRange {
 /// Why a POSIX `l_start`/`l_len` pair names no range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RangeError {
-    /// Negative start, or an empty or wrapped interval (EINVAL).
+    /// A range that starts before offset 0 (EINVAL).
     Invalid,
+    /// A base past the largest file offset, or a range that ends beyond it
+    /// (EOVERFLOW).
+    Overflow,
 }
 
 impl LockRange {
@@ -162,16 +165,25 @@ impl LockRange {
     /// fcntl(2): bytes `start .. start + len`, or for a negative `len`
     /// `start + len .. start`; a zero `len` extends to the end of any file.
     /// `origin` is the `l_whence` base already resolved to an offset.
+    /// Native Linux answers a base past the largest offset with EOVERFLOW
+    /// whatever `len` is, a range starting before 0 with EINVAL, and a
+    /// range ending past the largest offset with EOVERFLOW.
     pub fn from_posix(origin: u64, start: i64, len: i64) -> Result<Self, RangeError> {
         let anchor = i128::from(origin) + i128::from(start);
         let end_of_file = i128::from(Self::END_OF_FILE);
+        if anchor >= end_of_file {
+            return Err(RangeError::Overflow);
+        }
         let (first, last) = match len {
             0 => (anchor, end_of_file),
             len if len > 0 => (anchor, anchor + i128::from(len)),
             len => (anchor + i128::from(len), anchor),
         };
-        if first < 0 || last <= first || last > end_of_file {
+        if first < 0 {
             return Err(RangeError::Invalid);
+        }
+        if last > end_of_file {
+            return Err(RangeError::Overflow);
         }
         Ok(Self {
             start: first as u64,
@@ -978,11 +990,44 @@ mod tests {
         assert_eq!(LockRange::from_posix(100, -10, 5), Ok(range(90, 95)));
         assert_eq!(LockRange::from_posix(0, -1, 0), Err(RangeError::Invalid));
         assert_eq!(LockRange::from_posix(0, 3, -5), Err(RangeError::Invalid));
-        assert_eq!(
-            LockRange::from_posix(0, i64::MAX, 2),
-            Err(RangeError::Invalid)
-        );
         assert_eq!(LockRange::from_posix(0, 7, 0).unwrap().posix_len(), 0);
+    }
+
+    /// Native Linux 6.12.115 (x86_64 oracle): a range ending past the
+    /// largest offset, or a base past it whatever `l_len` is, is
+    /// EOVERFLOW; a range starting before 0 is EINVAL.
+    #[test]
+    fn posix_ranges_tell_overflow_from_invalid() {
+        const MAX: i64 = i64::MAX;
+        let end = LockRange::END_OF_FILE;
+        for (origin, start, len, want) in [
+            (0, MAX, 2, Err(RangeError::Overflow)),
+            (0, MAX, MAX, Err(RangeError::Overflow)),
+            (0, 2, MAX, Err(RangeError::Overflow)),
+            (0, MAX, 1, Ok(range(end - 1, end))),
+            (0, 1, MAX, Ok(range(1, end))),
+            (0, MAX, 0, Ok(range(end - 1, end))),
+            (0, MAX, -MAX, Ok(range(0, end - 1))),
+            (0, -1, 1, Err(RangeError::Invalid)),
+            (0, -1, MAX, Err(RangeError::Invalid)),
+            (0, i64::MIN, 1, Err(RangeError::Invalid)),
+            (0, MAX, i64::MIN, Err(RangeError::Invalid)),
+            (0, 0, i64::MIN, Err(RangeError::Invalid)),
+            (0, 5, -6, Err(RangeError::Invalid)),
+            // A resolved base (SEEK_CUR at 4) past the largest offset.
+            (4, MAX, 0, Err(RangeError::Overflow)),
+            (4, MAX, -5, Err(RangeError::Overflow)),
+            (4, MAX - 4, 0, Ok(range(end - 1, end))),
+            (4, MAX - 3, 0, Err(RangeError::Overflow)),
+            (4, MAX - 4, 2, Err(RangeError::Overflow)),
+            (4, -5, 1, Err(RangeError::Invalid)),
+        ] {
+            assert_eq!(
+                LockRange::from_posix(origin, start, len),
+                want,
+                "origin {origin}, l_start {start}, l_len {len}"
+            );
+        }
         assert_eq!(range(3, 8).posix_len(), 5);
     }
 
