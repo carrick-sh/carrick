@@ -1795,8 +1795,8 @@ impl NativeOwnerSignalFixture {
 
 /// Real native fork/service ownership for host executor-capacity tests. Only
 /// physical MM operations use `Physical`; no child receives a host task binding.
-pub struct NativeServiceCapacityFixture {
-    fixture: NativeSignalFixture,
+pub struct NativeServiceCapacityFixture<C: ProcessContext + 'static = ParkedContextWords> {
+    fixture: NativeSignalFixture<C>,
     pending: Vec<
         carrick_core_abi::service::ServiceTicket<&'static carrick_core_abi::service::ServiceCell>,
     >,
@@ -1827,64 +1827,6 @@ impl NativeServiceCapacityFixture {
     #[cfg(test)]
     fn from_fixture(fixture: NativeSignalFixture, children: usize) -> Self {
         Self::from_fixture_rusage(fixture, children, UserVa::new(0))
-    }
-
-    fn from_fixture_rusage(fixture: NativeSignalFixture, children: usize, rusage: UserVa) -> Self {
-        let source = BornInZoneSource {
-            zone: fixture.zone,
-            slot: fixture.slot,
-        };
-        for _ in 0..children {
-            // Every process birth has its own lifecycle owner, just as the
-            // production fork stock does. Sharing one page hides exit bugs.
-            let mut service = fixture.service();
-            service.page = Box::leak(Box::new(ThreadLifecyclePage::new()));
-            service.controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
-                ThreadControlSlot::new()
-            })));
-            let mut entry = fixture
-                .runtime
-                .enter_registered(
-                    fixture.registry,
-                    source,
-                    fixture.task,
-                    fixture.address,
-                    &words(fixture.address),
-                    &mut service,
-                )
-                .unwrap();
-            assert!(
-                matches!(entry.fork(ProcessForkChildTid::NONE), LifecycleOutcome::Returned { result, .. } if result.raw() > 0)
-            );
-        }
-        let mut service = fixture.service();
-        let mut entry = fixture
-            .runtime
-            .enter_registered(
-                fixture.registry,
-                source,
-                fixture.task,
-                fixture.address,
-                &words(fixture.address),
-                &mut service,
-            )
-            .unwrap();
-        assert!(matches!(
-            entry.wait4(
-                ProcessWaitPid::from_syscall_argument(u64::MAX),
-                UserVa::new(0x1000),
-                LinuxWaitOptions::empty(),
-                rusage,
-            ),
-            LifecycleOutcome::Transferred { .. }
-        ));
-        assert!(entry.take_handoff_receipt().is_some());
-        drop(entry);
-        Self {
-            fixture,
-            pending: Vec::new(),
-            children,
-        }
     }
 
     #[cfg(test)]
@@ -1972,8 +1914,100 @@ impl NativeServiceCapacityFixture {
         );
         Self::from_fixture(fixture, children)
     }
+}
 
-    fn select(&self) -> Option<(RecordRef, AddressContext<RootGpa>, ParkedContextWords)> {
+impl<C: ProcessContext + 'static> NativeServiceCapacityFixture<C> {
+    /// [`Self::new`] on the context and owner MMU of `B`'s ISA.
+    #[cfg(test)]
+    fn new_for<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
+        children: usize,
+        make_words: fn(AddressContext<RootGpa>) -> C,
+    ) -> Self {
+        let fixture = NativeSignalFixture::<C>::with_identity_for::<B>(
+            true,
+            |_| {
+                (
+                    ExecutionBinding {
+                        task: carrick_core_abi::EntryTaskKey::from_raw(7001),
+                        generation: carrick_core_abi::SnapshotGeneration::INITIAL,
+                        mm: carrick_core_abi::EntryMmKey::from_raw(1),
+                        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(1),
+                    },
+                    carrick_core_abi::EntryTaskKey::from_raw(7001),
+                    carrick_core_abi::BirthSerial::of_task(TaskSerial::from_registry_allocation(
+                        NonZeroU64::MIN,
+                    )),
+                    5,
+                )
+            },
+            make_words,
+        );
+        Self::from_fixture_rusage(fixture, children, UserVa::new(0))
+    }
+
+    fn from_fixture_rusage(
+        fixture: NativeSignalFixture<C>,
+        children: usize,
+        rusage: UserVa,
+    ) -> Self {
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        for _ in 0..children {
+            // Every process birth has its own lifecycle owner, just as the
+            // production fork stock does. Sharing one page hides exit bugs.
+            let mut service = fixture.service();
+            service.page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+            service.controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+                ThreadControlSlot::new()
+            })));
+            let mut entry = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    source,
+                    fixture.task,
+                    fixture.address,
+                    &(fixture.make_words)(fixture.address),
+                    &mut service,
+                )
+                .unwrap();
+            assert!(
+                matches!(entry.fork(ProcessForkChildTid::NONE), LifecycleOutcome::Returned { result, .. } if result.raw() > 0)
+            );
+        }
+        let mut service = fixture.service();
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::MAX),
+                UserVa::new(0x1000),
+                LinuxWaitOptions::empty(),
+                rusage,
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+        drop(entry);
+        Self {
+            fixture,
+            pending: Vec::new(),
+            children,
+        }
+    }
+
+    fn select(&self) -> Option<(RecordRef, AddressContext<RootGpa>, C)> {
         let fixture = &self.fixture;
         let selected = fixture.zone.switch_in_full(fixture.slot)?;
         let record = fixture.zone.record_ref(selected.record);
@@ -2012,7 +2046,9 @@ impl NativeServiceCapacityFixture {
             *fixture.zone.record(selected.record).ctx_mut()
         }))
     }
+}
 
+impl NativeServiceCapacityFixture {
     /// One guest idle quantum. The caller retains no execution capacity after
     /// this returns; all outstanding tickets remain owned by this fixture.
     pub fn park_next(&mut self) -> Option<usize> {
@@ -6030,19 +6066,22 @@ fn native_child_socket_call_runs_under_the_childs_own_identity() {
 /// production ring service: the claimed ticket, its record and the queue
 /// revision the carrier sampled.
 #[cfg(test)]
-struct HostReadyWaitFixture {
+struct HostReadyWaitFixture<C: ProcessContext + 'static> {
     counters: &'static carrick_el1_abi::Counters,
-    capacity: NativeServiceCapacityFixture,
+    capacity: NativeServiceCapacityFixture<C>,
     /// The child its slot last selected.
-    loaded: core::cell::RefCell<Option<(RecordRef, AddressContext<RootGpa>, ParkedContextWords)>>,
+    loaded: core::cell::RefCell<Option<(RecordRef, AddressContext<RootGpa>, C)>>,
 }
 
 #[cfg(test)]
-impl HostReadyWaitFixture {
-    fn new() -> Self {
+impl<C: ProcessContext + 'static> HostReadyWaitFixture<C> {
+    /// One child on the context and owner MMU of `B`'s ISA.
+    fn new_for<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
+        make_words: fn(AddressContext<RootGpa>) -> C,
+    ) -> Self {
         Self {
             counters: Box::leak(Box::new(carrick_el1_abi::Counters::new())),
-            capacity: NativeServiceCapacityFixture::new(1),
+            capacity: NativeServiceCapacityFixture::new_for::<B>(1, make_words),
             loaded: core::cell::RefCell::new(None),
         }
     }
@@ -6051,13 +6090,7 @@ impl HostReadyWaitFixture {
     fn enter<R>(
         &self,
         run: impl FnOnce(
-            &mut NativeProcessEntry<
-                '_,
-                'static,
-                AddressContext<RootGpa>,
-                ParkedContextWords,
-                Physical<'static, ParkedContextWords>,
-            >,
+            &mut NativeProcessEntry<'_, 'static, AddressContext<RootGpa>, C, Physical<'static, C>>,
         ) -> R,
     ) -> (RecordRef, R) {
         let selected = self.capacity.select().unwrap();
@@ -6071,13 +6104,7 @@ impl HostReadyWaitFixture {
     fn enter_loaded<R>(
         &self,
         run: impl FnOnce(
-            &mut NativeProcessEntry<
-                '_,
-                'static,
-                AddressContext<RootGpa>,
-                ParkedContextWords,
-                Physical<'static, ParkedContextWords>,
-            >,
+            &mut NativeProcessEntry<'_, 'static, AddressContext<RootGpa>, C, Physical<'static, C>>,
         ) -> R,
     ) -> R {
         let fixture = &self.capacity.fixture;
@@ -6156,10 +6183,7 @@ impl HostReadyWaitFixture {
         let fixture = &self.capacity.fixture;
         let key =
             carrick_sched_core::object_wait::ObjectWaitKey::native_host_ready(record).unwrap();
-        let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-            '_,
-            ParkedContextWords,
-        >| {
+        let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
             crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
         };
         let _ = fixture
@@ -6233,8 +6257,8 @@ impl HostReadyWaitFixture {
             '_,
             'static,
             AddressContext<RootGpa>,
-            ParkedContextWords,
-            Physical<'static, ParkedContextWords>,
+            C,
+            Physical<'static, C>,
         >| {
             if !loaded {
                 assert!(matches!(
@@ -6302,9 +6326,32 @@ impl HostReadyWaitFixture {
 #[cfg(test)]
 #[test]
 fn a_signal_interrupts_a_native_childs_host_readiness_wait_with_eintr() {
+    a_signal_interrupts_a_native_childs_host_readiness_wait_with_eintr_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
+
+/// [`a_signal_interrupts_a_native_childs_host_readiness_wait_with_eintr`] on the AArch64 owner's context and MMU.
+#[cfg(test)]
+#[test]
+fn a_signal_interrupts_a_native_childs_host_readiness_wait_with_eintr_on_arm() {
+    a_signal_interrupts_a_native_childs_host_readiness_wait_with_eintr_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[cfg(test)]
+fn a_signal_interrupts_a_native_childs_host_readiness_wait_with_eintr_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
     use carrick_personality_linux::native_host_file::{HostFileCall, SocketCall};
     let buffer = Box::leak(Box::new([0u8; 16]));
-    let wait = HostReadyWaitFixture::new();
+    let wait = HostReadyWaitFixture::<C>::new_for::<B>(make_words);
     let call = SocketCall::decode(
         carrick_personality_linux::crossing::nr::RECVFROM,
         &[3, buffer.as_ptr() as u64, 16, 0, 0, 0],
@@ -6351,6 +6398,29 @@ fn a_signal_interrupts_a_native_childs_host_readiness_wait_with_eintr() {
 #[cfg(test)]
 #[test]
 fn a_native_childs_blocking_send_continues_across_records_to_its_full_count() {
+    a_native_childs_blocking_send_continues_across_records_to_its_full_count_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
+
+/// [`a_native_childs_blocking_send_continues_across_records_to_its_full_count`] on the AArch64 owner's context and MMU.
+#[cfg(test)]
+#[test]
+fn a_native_childs_blocking_send_continues_across_records_to_its_full_count_on_arm() {
+    a_native_childs_blocking_send_continues_across_records_to_its_full_count_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[cfg(test)]
+fn a_native_childs_blocking_send_continues_across_records_to_its_full_count_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
     use carrick_core_abi::host_file::{
         HostFileRequestView, NetCall, NetTransferFacts, replied_input, request_parts,
     };
@@ -6358,7 +6428,7 @@ fn a_native_childs_blocking_send_continues_across_records_to_its_full_count() {
     const LEN: usize = 200_000;
     let buffer: &'static [u8] = Box::leak(vec![7u8; LEN].into_boxed_slice());
     let base = buffer.as_ptr() as u64;
-    let wait = HostReadyWaitFixture::new();
+    let wait = HostReadyWaitFixture::<C>::new_for::<B>(make_words);
     let call = SocketCall::decode(
         carrick_personality_linux::crossing::nr::SENDTO,
         &[3, base, LEN as u64, 0, 0, 0],
@@ -6450,6 +6520,29 @@ fn a_native_childs_blocking_send_continues_across_records_to_its_full_count() {
 #[cfg(test)]
 #[test]
 fn a_native_childs_poll_keeps_one_serial_per_call_and_a_new_call_a_new_one() {
+    a_native_childs_poll_keeps_one_serial_per_call_and_a_new_call_a_new_one_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
+
+/// [`a_native_childs_poll_keeps_one_serial_per_call_and_a_new_call_a_new_one`] on the AArch64 owner's context and MMU.
+#[cfg(test)]
+#[test]
+fn a_native_childs_poll_keeps_one_serial_per_call_and_a_new_call_a_new_one_on_arm() {
+    a_native_childs_poll_keeps_one_serial_per_call_and_a_new_call_a_new_one_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[cfg(test)]
+fn a_native_childs_poll_keeps_one_serial_per_call_and_a_new_call_a_new_one_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
     use carrick_core_abi::host_file::{HostCallSerial, POLL_CALL_SERIAL_ARG, request_parts};
     use carrick_personality_linux::native_host_file::HostFileCall;
     let pollfd = Box::leak(Box::new([3u8, 0, 0, 0, 1, 0, 0, 0]));
@@ -6466,7 +6559,7 @@ fn a_native_childs_poll_keeps_one_serial_per_call_and_a_new_call_a_new_one() {
             input.to_vec(),
         )
     };
-    let wait = HostReadyWaitFixture::new();
+    let wait = HostReadyWaitFixture::<C>::new_for::<B>(make_words);
     let record = wait.begin(poll, 73, false);
     let (first, set) = serial(&wait.answer_wait(record));
     assert!(first.is_some(), "the ring stamps the poll call's serial");
@@ -6526,7 +6619,9 @@ fn resume_name<E: core::fmt::Debug>(answer: &Result<NativeResume, E>) -> String 
 /// its first record with all 65536 of its bytes moved: the child has
 /// published the call's next record, which the carrier has not claimed.
 #[cfg(test)]
-fn native_send_after_its_first_record(wait: &HostReadyWaitFixture) -> RecordRef {
+fn native_send_after_its_first_record<C: ProcessContext + 'static>(
+    wait: &HostReadyWaitFixture<C>,
+) -> RecordRef {
     use carrick_core_abi::host_file::{HostFileRequestView, NetCall, NetTransferFacts};
     use carrick_personality_linux::native_host_file::{HostFileCall, SocketCall};
     const LEN: usize = 200_000;
@@ -6567,7 +6662,30 @@ fn native_send_after_its_first_record(wait: &HostReadyWaitFixture) -> RecordRef 
 #[cfg(test)]
 #[test]
 fn a_signal_between_a_native_childs_send_records_answers_the_bytes_moved() {
-    let wait = HostReadyWaitFixture::new();
+    a_signal_between_a_native_childs_send_records_answers_the_bytes_moved_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
+
+/// [`a_signal_between_a_native_childs_send_records_answers_the_bytes_moved`] on the AArch64 owner's context and MMU.
+#[cfg(test)]
+#[test]
+fn a_signal_between_a_native_childs_send_records_answers_the_bytes_moved_on_arm() {
+    a_signal_between_a_native_childs_send_records_answers_the_bytes_moved_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[cfg(test)]
+fn a_signal_between_a_native_childs_send_records_answers_the_bytes_moved_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
+    let wait = HostReadyWaitFixture::<C>::new_for::<B>(make_words);
     let record = native_send_after_its_first_record(&wait);
     let fixture = &wait.capacity.fixture;
     let mut service = fixture.service();
@@ -6597,7 +6715,30 @@ fn a_signal_between_a_native_childs_send_records_answers_the_bytes_moved() {
 #[cfg(test)]
 #[test]
 fn a_refused_next_send_record_answers_the_bytes_moved() {
-    let wait = HostReadyWaitFixture::new();
+    a_refused_next_send_record_answers_the_bytes_moved_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
+
+/// [`a_refused_next_send_record_answers_the_bytes_moved`] on the AArch64 owner's context and MMU.
+#[cfg(test)]
+#[test]
+fn a_refused_next_send_record_answers_the_bytes_moved_on_arm() {
+    a_refused_next_send_record_answers_the_bytes_moved_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[cfg(test)]
+fn a_refused_next_send_record_answers_the_bytes_moved_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
+    let wait = HostReadyWaitFixture::<C>::new_for::<B>(make_words);
     let record = native_send_after_its_first_record(&wait);
     wait.serve(record, |_, ticket| {
         assert!(ticket.complete(false).is_ok());
@@ -6620,6 +6761,29 @@ fn a_refused_next_send_record_answers_the_bytes_moved() {
 #[cfg(test)]
 #[test]
 fn a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr() {
+    a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
+
+/// [`a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr`] on the AArch64 owner's context and MMU.
+#[cfg(test)]
+#[test]
+fn a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr_on_arm() {
+    a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[cfg(test)]
+fn a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
     use carrick_personality_linux::native_host_file::HostFileCall;
     let pollfd = Box::leak(Box::new([3u8, 0, 0, 0, 1, 0, 0, 0]));
     let poll = HostFileCall::Ppoll {
@@ -6628,7 +6792,7 @@ fn a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr() {
         timeout: 0,
         sigmask: 0,
     };
-    let wait = HostReadyWaitFixture::new();
+    let wait = HostReadyWaitFixture::<C>::new_for::<B>(make_words);
     let record = wait.begin(poll, 74, false);
     wait.answer_wait(record);
     wait.notify_ready(record);
