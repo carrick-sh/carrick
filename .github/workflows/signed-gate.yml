@@ -413,14 +413,14 @@ jobs:
           if-no-files-found: error
           retention-days: 90
       - name: Download base fixture bundle for reusable main baseline
-        if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'
+        if: (needs.authorize.outputs.main == 'true' || github.event_name == 'merge_group') && steps.verdict.outcome == 'success'
         uses: actions/download-artifact@v4
         with:
           name: signed-base-fixtures-${{ github.run_attempt }}
           path: ${{ runner.temp }}/signed-fixtures
       - name: Prepare admitted reusable base receipt
         id: reuse_base
-        if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'
+        if: (needs.authorize.outputs.main == 'true' || github.event_name == 'merge_group') && steps.verdict.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -436,11 +436,19 @@ jobs:
             --run-id "${{ github.run_id }}" \
             --output "$RUNNER_TEMP/signed-base-reuse"
       - name: Publish admitted reusable base receipt
-        if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success' && steps.reuse_base.outputs.artifact_name != ''
+        if: (needs.authorize.outputs.main == 'true' || github.event_name == 'merge_group') && steps.verdict.outcome == 'success' && steps.reuse_base.outputs.artifact_name != ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.reuse_base.outputs.artifact_name }}
           path: ${{ runner.temp }}/signed-base-reuse/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve the admitted candidate's executed fixture archive
+        if: github.event_name == 'merge_group' && steps.verdict.outcome == 'success' && steps.reuse_base.outputs.artifact_name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-fixtures-${{ needs.authorize.outputs.sha }}
+          path: ${{ runner.temp }}/signed-fixtures/*.tar.gz
           if-no-files-found: error
           retention-days: 30
       - name: Upload comparison and publication log
