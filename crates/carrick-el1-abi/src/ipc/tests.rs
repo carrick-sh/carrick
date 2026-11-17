@@ -1915,3 +1915,93 @@ fn stream_pair_outlives_a_close_after_both_ends_shut_everything() {
         Err(IpcError::Stale)
     ));
 }
+
+/// #231: the zone's advisory lock table and the per-description file
+/// identities joined the directory in ABI version 9. A region a carrier
+/// published with the previous layout (version 8, hash below) is refused,
+/// whether its header carries the old hash or the old magic.
+#[test]
+fn el1_ipc_file_lock_layout_refuses_the_previous_abi() {
+    const VERSION_8_LAYOUT_HASH: u64 = 0x89da_c522_ccd4_6220;
+    const VERSION_8_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x08");
+    assert_ne!(IPC_LAYOUT_HASH, VERSION_8_LAYOUT_HASH);
+    assert_ne!(IPC_MAGIC, VERSION_8_MAGIC);
+    assert!(IPC_DIRECTORY_BYTES as u64 <= crate::EL1_IPC_DIRECTORY_SPAN);
+    assert!(
+        IPC_OFD_IDENTITIES_OFFSET
+            >= IPC_PIPE_STORAGE_OFFSET + core::mem::size_of::<DescriptorStorage>()
+    );
+    let len = 1 << 20;
+    let dl = IPC_DIRECTORY_BYTES;
+    for (field, old) in [(0, VERSION_8_MAGIC), (1, VERSION_8_LAYOUT_HASH)] {
+        let dir = zeroed_directory();
+        let pool = unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(len, 4096).unwrap()) };
+        unsafe { IpcRegion::initialize(dir, dl, pool, len, 79, IpcLimits::ZONE) }.unwrap();
+        assert!(unsafe { IpcRegion::attach(dir, dl, pool, len) }.is_ok());
+        let header = unsafe { &(*dir).header };
+        match field {
+            0 => header.magic.store(old, Ordering::Relaxed),
+            _ => header.layout_hash.store(old, Ordering::Relaxed),
+        }
+        assert_eq!(
+            unsafe { IpcRegion::attach(dir, dl, pool, len) }.err(),
+            Some(IpcError::BadRegion),
+            "a version-8 header field {field}"
+        );
+    }
+}
+
+/// #231: one lock table and one identity per description across venues.
+/// The host stamps a description it opens with its file; EL1 reads the same
+/// identity through its own view, and both views lock the same table, whose
+/// object either venue may create first.
+#[test]
+fn el1_ipc_file_locks_and_identities_are_shared_by_both_venues() {
+    use carrick_fd_core::record_lock::{
+        FileDevice, FileIdentity, FileInode, Lock, LockClass, LockKind, LockOwner, LockPid,
+        LockRange,
+    };
+    let fx = fixture(1 << 20);
+    let t = fx.table();
+    let file = FileIdentity {
+        device: FileDevice::new(3),
+        inode: FileInode::new(99).unwrap(),
+    };
+    let host = Description::new(
+        IpcBacking::Host(HostResourceToken::new(5).unwrap()).encode(),
+        AccessMode::ReadWrite,
+        StatusFlags::default(),
+    );
+    let fd = fx
+        .region
+        .fd(Spin)
+        .open_identified(t, Fd(0), host, Some(file), false)
+        .unwrap();
+    let el1 = Box::leak(Box::new(fx.region.for_el1_slot(0)));
+    assert_eq!(el1.fd(EL1).file_identity(t, fd), Ok(Some(file)));
+    let (pin, _) = el1.fd(EL1).pin(t, fd).unwrap();
+    assert_eq!(el1.fd(EL1).pinned_identity(&pin), Ok(Some(file)));
+
+    let object = el1.file_locks_object(&EL1).unwrap();
+    assert_eq!(fx.region.file_locks_object(&Spin).unwrap(), object);
+    let lock = Lock {
+        file,
+        owner: LockOwner::table(t),
+        class: LockClass::Record,
+        kind: LockKind::Write,
+        range: LockRange::WHOLE_FILE,
+        pid: LockPid::new(7),
+    };
+    {
+        let locks = el1.file_locks(&EL1).unwrap();
+        let authority = el1.fd(EL1);
+        assert_eq!(locks.table().set(lock, &authority).taken, Ok(()));
+    }
+    let mut locks = fx.region.existing_file_locks(&Spin).unwrap().unwrap();
+    assert_eq!(locks.table().len(), 1);
+    assert!(locks.table().release_file(file, LockOwner::table(t)));
+    let wake = locks.released();
+    assert!(wake.readers && wake.object == object);
+    drop(locks);
+    let _ = el1.fd(EL1).unpin(pin).unwrap();
+}

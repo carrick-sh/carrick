@@ -82,6 +82,8 @@ mod epoll;
 pub use epoll::{SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2};
 mod execution;
 pub use execution::{IpcExecution, NativeIpcExecution};
+mod file_lock;
+pub(crate) use file_lock::{LockCall, serve_file_lock};
 
 /// One Linux syscall argument word from the shared frame.
 fn argument_word(frame: &impl GuestDispatchFrame, index: usize) -> u64 {
@@ -238,6 +240,74 @@ pub(crate) fn notify_native_wake<C: carrick_el1_abi::EntryContext>(
     }
 }
 
+/// Give up advisory locks in the zone's lock table and wake the waiters
+/// parked on it (their calls rerun and probe once). With no zone in hand the
+/// wake is the host's: its release drain reaps and publishes again.
+pub(crate) fn release_native_locks<C: carrick_el1_abi::EntryContext>(
+    region: &IpcRegion<'_>,
+    zone: Option<(&carrick_sched_core::ZoneTables<C>, carrick_el1_abi::SlotId)>,
+    task: &CurrentTask,
+    release: impl FnOnce(&carrick_el1_abi::ipc::fd::record_lock::LockTable<'_>) -> bool,
+) -> Result<(), carrick_el1_abi::ipc::IpcError> {
+    if let Some(wake) = region.release_file_locks(&EL1_WAIT, release)? {
+        if zone.is_none() {
+            task.linux.mark_pending_host_work();
+        }
+        notify_native_wake(wake, zone, task);
+    }
+    Ok(())
+}
+
+/// A close of any descriptor naming `file` through `table` (close(2), the
+/// descriptor a dup2(2) replaces, exec's close-on-exec sweep): the table's
+/// record locks on that file end (fcntl(2)).
+pub(crate) fn release_record_locks<C: carrick_el1_abi::EntryContext>(
+    region: &IpcRegion<'_>,
+    zone: Option<(&carrick_sched_core::ZoneTables<C>, carrick_el1_abi::SlotId)>,
+    task: &CurrentTask,
+    table: TableId,
+    file: carrick_el1_abi::ipc::fd::record_lock::FileIdentity,
+) -> Result<(), carrick_el1_abi::ipc::IpcError> {
+    use carrick_el1_abi::ipc::fd::record_lock::LockOwner;
+    release_native_locks(region, zone, task, |locks| {
+        locks.release_file(file, LockOwner::table(table))
+    })
+}
+
+/// exec(2)'s close-on-exec sweep closes descriptors of the files it names:
+/// release this table's record locks on each before the sweep. A table
+/// that holds no record lock scans nothing.
+pub(crate) fn release_exec_record_locks<C: carrick_el1_abi::EntryContext>(
+    region: &IpcRegion<'_>,
+    zone: Option<(&carrick_sched_core::ZoneTables<C>, carrick_el1_abi::SlotId)>,
+    task: &CurrentTask,
+    table: TableId,
+) -> Result<(), carrick_el1_abi::ipc::IpcError> {
+    use carrick_el1_abi::ipc::fd::record_lock::{LockClass, LockOwner};
+    let holds = match region.existing_file_locks(&EL1_WAIT)? {
+        Some(locks) => locks
+            .table()
+            .holds(LockOwner::table(table), LockClass::Record),
+        None => false,
+    };
+    if !holds {
+        return Ok(());
+    }
+    let authority = region.fd(EL1_WAIT);
+    let capacity = authority
+        .backing_capacity(table)
+        .map_err(carrick_el1_abi::ipc::IpcError::Fd)?;
+    for fd in 0..capacity {
+        let fd = Fd(fd as i32);
+        if authority.getfd(table, fd) == Ok(true)
+            && let Ok(Some(file)) = authority.file_identity(table, fd)
+        {
+            release_record_locks(region, zone, task, table, file)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn is_zone_releasable_backing(
     description: carrick_el1_abi::ipc::fd::Description,
 ) -> bool {
@@ -256,7 +326,14 @@ pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
     use carrick_el1_abi::ipc::fd::DeferredRelease;
     match release {
         DeferredRelease::None => Ok(()),
-        DeferredRelease::Deferred => {
+        DeferredRelease::Deferred(key) => {
+            // The description's last reference: its OFD and flock(2) locks
+            // end here, whoever drops it (fcntl(2), flock(2)).
+            release_native_locks(region, zone, task, |locks| {
+                locks.release_owner(
+                    carrick_el1_abi::ipc::fd::record_lock::LockOwner::Description(key),
+                )
+            })?;
             task.linux.mark_pending_host_work();
             Ok(())
         }

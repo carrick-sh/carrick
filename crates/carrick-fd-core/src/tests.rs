@@ -309,6 +309,7 @@ fn arena() -> &'static Mutex<Vec<Backing>> {
 /// records (a venue that never grows past them).
 pub(crate) struct TestArena {
     ofds: &'static [OfdRecord],
+    identities: &'static [crate::record_lock::OfdIdentityRecord],
     objects: &'static [ObjectRecord],
     /// The venue's monotone descriptor ceiling, as the ARM vector reads it.
     ceiling: AtomicU64,
@@ -334,8 +335,15 @@ impl TestArena {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         );
+        let identities = Box::leak(
+            (0..ofds)
+                .map(|_| crate::record_lock::OfdIdentityRecord::default())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
         Box::leak(Box::new(Self {
             ofds: records,
+            identities,
             objects: obj_records,
             ceiling: AtomicU64::new(0),
             refuse_cover: core::sync::atomic::AtomicBool::new(false),
@@ -375,6 +383,9 @@ impl SlotBacking for TestArena {
     }
     fn object(&self, index: usize) -> Option<&ObjectRecord> {
         self.objects.get(index)
+    }
+    fn ofd_identity(&self, index: usize) -> Option<&crate::record_lock::OfdIdentityRecord> {
+        self.identities.get(index)
     }
 }
 pub(crate) fn storage(capacity: usize) -> Extent {
@@ -2843,10 +2854,10 @@ fn filtered_live_close_and_dup_replace_defer_host_release_once() {
     );
     assert_eq!(c.take_retired_ofd(), Ok(None));
     // Final live close of host_a in peer defers release to retired_ofds.
-    assert_eq!(
+    assert!(matches!(
         c.close_filtered(peer, host_a, can_release),
-        Ok(DeferredRelease::Deferred)
-    );
+        Ok(DeferredRelease::Deferred(_))
+    ));
     assert_eq!(
         c.take_retired_ofd().unwrap().unwrap().backing,
         BackingToken(101)
@@ -2860,10 +2871,10 @@ fn filtered_live_close_and_dup_replace_defer_host_release_once() {
         Ok(DeferredRelease::None)
     );
     assert_eq!(c.take_retired_ofd(), Ok(None));
-    assert_eq!(
+    assert!(matches!(
         c.dup3_filtered(peer, pipe_fd, host_b, true, can_release),
-        Ok(DeferredRelease::Deferred)
-    );
+        Ok(DeferredRelease::Deferred(_))
+    ));
     assert_eq!(
         c.take_retired_ofd().unwrap().unwrap().backing,
         BackingToken(102)

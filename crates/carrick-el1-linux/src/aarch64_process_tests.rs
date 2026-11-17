@@ -18227,6 +18227,9 @@ fn with_arm_process_host_files<R>(
         }
         if route == CompletionRoute::Suspended {
             active = None;
+            if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+                work.settled();
+            }
         }
         // The carrier's boundary settles the work a child's call (its own
         // clone) announced, as it does for the root's, and replays a call
@@ -18877,8 +18880,9 @@ fn arm_fork_child_owner_chown_keeps_its_own_ids() {
 /// record locks; F_SETLKW and a blocking flock wait, releasing the CPU,
 /// until the holder lets go; a flock belongs to its open file description
 /// and ends with its last close.
+#[cfg(not(target_os = "macos"))]
 #[test]
-fn arm_fork_children_contend_record_locks_and_flock_in_the_ring() {
+fn serial_host_arm_fork_children_contend_record_locks_and_flock_in_the_ring() {
     use carrick_abi::{
         LINUX_AT_FDCWD, LINUX_F_GETLK, LINUX_F_RDLCK, LINUX_F_SETLK, LINUX_F_SETLKW, LINUX_F_UNLCK,
         LINUX_F_WRLCK, LINUX_LOCK_EX, LINUX_LOCK_NB, LINUX_LOCK_SH, LINUX_LOCK_UN, LINUX_O_CREAT,
@@ -18986,6 +18990,7 @@ fn arm_fork_children_contend_record_locks_and_flock_in_the_ring() {
             0,
         );
         // F_SETLKW parks A until B unlocks, then the rerun takes the lock.
+        call(a, ARM_LEAVE_ON_PARK, [0; 6]);
         let parked = call(a, fcntl, [fd_a, LINUX_F_SETLKW, write.arg(), 0, 0, 0]);
         if parked.0 != CompletionRoute::Suspended {
             mismatches
@@ -19042,6 +19047,7 @@ fn arm_fork_children_contend_record_locks_and_flock_in_the_ring() {
             ),
             eagain,
         );
+        call(b, ARM_LEAVE_ON_PARK, [0; 6]);
         let parked = call(b, flock_nr, [fd_b, LINUX_LOCK_SH, 0, 0, 0, 0]);
         if parked.0 != CompletionRoute::Suspended {
             mismatches

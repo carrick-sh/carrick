@@ -1399,6 +1399,7 @@ pub const fn descriptor_ordinal(ordinal: CanonicalNr) -> bool {
         nr::DUP
             | nr::DUP3
             | nr::FCNTL
+            | nr::FLOCK
             | nr::FSTAT
             | nr::NEWFSTATAT
             | nr::IOCTL
