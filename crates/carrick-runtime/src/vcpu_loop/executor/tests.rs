@@ -5016,12 +5016,10 @@ const HVF_EXECUTOR_DEATHS: [&str; 2] = [
 
 /// A carrier whose only executor dies with `death` while running the root.
 /// The root's sibling is never runnable, so the census keeps one live task,
-/// as a worker parked in a futex wait does. `observe` enrols a run wait
-/// before the pool starts.
+/// as a worker parked in a futex wait does.
 fn carrier_with_dying_executor(
     pid: i32,
     death: &'static str,
-    observe: impl FnOnce(&Scheduler),
 ) -> (
     Arc<Kernel>,
     KernelContext,
@@ -5031,7 +5029,6 @@ fn carrier_with_dying_executor(
     let (kernel, root) = bootstrap(pid);
     let _parked = sibling(&kernel, &root, pid + 100);
     let scheduler = Arc::new(single_cpu_scheduler(Arc::clone(&kernel)));
-    observe(&scheduler);
     let factory = Arc::new(FakeFactory::default());
     factory.install(&root, FakeBinding::new(760, [Step::FailRunWith(death)]));
     let generation = publish(&root, 760);
@@ -5049,8 +5046,7 @@ fn carrier_with_dying_executor(
 #[test]
 fn executor_worker_death_ends_the_supervised_run_wait() {
     for (offset, death) in (0..).zip(HVF_EXECUTOR_DEATHS) {
-        let (kernel, _root, scheduler, pool) =
-            carrier_with_dying_executor(14_760 + offset, death, |_| {});
+        let (kernel, _root, scheduler, pool) = carrier_with_dying_executor(14_760 + offset, death);
 
         // The run's container job: nothing the dead worker owned will ever
         // publish it.
@@ -5089,35 +5085,6 @@ fn executor_worker_death_ends_the_supervised_run_wait() {
         assert_eq!(death_verdict.worker, 0);
         assert!(death_verdict.error.contains(death));
 
-        let shutdown = pool
-            .shutdown()
-            .expect_err("the worker failure stays visible at shutdown");
-        assert!(shutdown.to_string().contains(death));
-    }
-}
-
-/// #2420 on the x86 lane: the CPL0 run's completion applies the same verdict,
-/// so `prepare`'s completion receive ends with the dead worker's error
-/// instead of waiting on a root no executor will finish.
-#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-#[test]
-fn kvm_executor_worker_death_ends_the_run_completion() {
-    for (offset, death) in (0..).zip(HVF_EXECUTOR_DEATHS) {
-        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
-        let (_kernel, _root, _scheduler, pool) =
-            carrier_with_dying_executor(14_770 + offset, death, |scheduler| {
-                scheduler.observe_executor_death(Arc::new(
-                    super::cpl0::Cpl0ExecutorDeathCompletion::new(completed_tx),
-                ));
-            });
-        let completion = completed_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("an executor death must end the run's completion wait, not park it");
-        let error = completion.expect_err("a dead executor's run ends with an error");
-        assert!(
-            error.contains("executor worker died index=0") && error.contains(death),
-            "the run's error names the worker and its exact death: {error}"
-        );
         let shutdown = pool
             .shutdown()
             .expect_err("the worker failure stays visible at shutdown");

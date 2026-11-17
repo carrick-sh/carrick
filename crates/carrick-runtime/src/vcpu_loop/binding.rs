@@ -12017,6 +12017,428 @@ mod tests {
         scheduler.wait_closed();
     }
 
+    /// Where a #2420 witness executor's worker dies.
+    #[derive(Clone, Copy)]
+    enum WitnessDeath {
+        /// Running the task it claimed, as the HVF native service kills a
+        /// worker (`native owed return of MM`).
+        Running,
+        /// At its first guest idle, holding no task.
+        Idle,
+    }
+
+    /// A real pool worker whose backend dies at `death` with `error`. Every
+    /// step around it, from the claim through the failure settlement on the
+    /// production binding to the death verdict, is the production worker's.
+    /// Only the pool's first worker dies at idle; any worker dies running.
+    #[derive(Clone)]
+    struct DyingExecutorFactory {
+        death: WitnessDeath,
+        error: &'static str,
+        idle_victim_taken: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl DyingExecutorFactory {
+        fn new(death: WitnessDeath, error: &'static str) -> Self {
+            Self {
+                death,
+                error,
+                idle_victim_taken: Arc::default(),
+            }
+        }
+    }
+
+    struct DyingExecutor {
+        death: WitnessDeath,
+        error: &'static str,
+        idle_victim: bool,
+        id: u64,
+    }
+
+    #[derive(Clone)]
+    struct NoopWitnessKick;
+
+    impl carrick_hal::VcpuKick for NoopWitnessKick {
+        fn kick(&self) {}
+    }
+
+    impl executor::PersistentExecutorFactory for DyingExecutorFactory {
+        type Executor = DyingExecutor;
+
+        fn create(
+            &self,
+            registration: &carrick_kernel::kernel::ExecutorRegistration,
+        ) -> Result<Self::Executor, TrapError> {
+            Ok(DyingExecutor {
+                death: self.death,
+                error: self.error,
+                idle_victim: !self
+                    .idle_victim_taken
+                    .swap(true, std::sync::atomic::Ordering::AcqRel),
+                id: u64::from(registration.id().raw_for_probe()),
+            })
+        }
+    }
+
+    impl executor::PersistentExecutor for DyingExecutor {
+        type TaskBinding = continuation::HvpatchTaskBinding;
+
+        fn load(
+            &mut self,
+            task: &executor::RunnableTask<'_, Self::TaskBinding>,
+        ) -> Result<(), TrapError> {
+            task.validate_for_load().map(|_| ())
+        }
+
+        fn run_until_boundary(
+            &mut self,
+            _need_resched: &std::sync::atomic::AtomicBool,
+            _submission: &mut executor::ExecutorSubmissionContext<'_>,
+        ) -> Result<executor::ExecutorExit, TrapError> {
+            Err(TrapError::Hypervisor(self.error.to_owned()))
+        }
+
+        fn take_cpu_receipt(&mut self) -> executor::ExecutorCpuReceipt {
+            executor::ExecutorCpuReceipt::default()
+        }
+
+        fn hardware_kick(&self) -> Result<executor::ExactHardwareKick, TrapError> {
+            executor::ExactHardwareKick::new(
+                Box::new(NoopWitnessKick),
+                self.id.max(1),
+                executor::current_owner_thread_port(),
+            )
+        }
+
+        fn save(
+            &mut self,
+            lease: carrick_kernel::kernel::objects::ThreadExecutionLease,
+        ) -> Result<executor::SavedRunnable, executor::ExecutorSaveError> {
+            Ok(executor::SavedRunnable::new(lease))
+        }
+
+        fn invalidate_asid(
+            &mut self,
+            _generation: crate::hvpatch::AsidGeneration,
+        ) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn audit_boundary(&mut self) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn destroy(self) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn has_physical_idle_lane(&self) -> bool {
+            self.idle_victim && matches!(self.death, WitnessDeath::Idle)
+        }
+
+        fn arm_guest_idle(&mut self) -> Result<(), TrapError> {
+            Err(TrapError::Hypervisor(self.error.to_owned()))
+        }
+    }
+
+    fn start_dying_pool(
+        runtime: &Arc<HvpatchRuntimeDirectory>,
+        scheduler: &Arc<carrick_kernel::kernel::Scheduler>,
+        factory: DyingExecutorFactory,
+    ) -> executor::ExecutorPool<
+        DyingExecutorFactory,
+        executor::TaskBindingDirectory<continuation::HvpatchTaskBinding>,
+    > {
+        executor::ExecutorPool::start(
+            executor::ExecutorPoolConfig {
+                bound_workers: scheduler.cpu_count(),
+                spare_executors: 0,
+                vcpu_ceiling: scheduler.cpu_count(),
+                reserve: 0,
+            },
+            Arc::clone(scheduler),
+            Arc::new(factory),
+            Arc::clone(runtime.persistent_bindings()),
+            executor::ExecutorBoundaryAudit,
+        )
+        .expect("start the dying worker's pool")
+    }
+
+    /// The run's liveness, bound to the carrier's kernel and scheduler as
+    /// `HvpatchRuntimeDirectory::process_graph_liveness` binds it.
+    fn witness_liveness(
+        kernel: &Arc<carrick_kernel::kernel::Kernel>,
+        scheduler: &Arc<carrick_kernel::kernel::Scheduler>,
+    ) -> ProcessGraphLiveness {
+        ProcessGraphLiveness {
+            kernel: Some(Arc::downgrade(kernel)),
+            scheduler: Some(Arc::clone(scheduler)),
+            recorded: Arc::default(),
+            fixed_census: None,
+            poll: Duration::from_millis(10),
+            confirm: crate::vcpu_loop::outcome::LIVENESS_CONFIRM,
+        }
+    }
+
+    fn assert_executor_died(result: Result<VcpuLoopOutcome, RuntimeError>, death: &str) {
+        let error = result.expect_err("a dead executor's run ends with an error");
+        let text = error.to_string();
+        let RuntimeError::KernelAborted { post_mortem, .. } = &error else {
+            panic!("the death is a carrier-terminal abort with a post-mortem: {text}");
+        };
+        assert!(
+            matches!(
+                post_mortem.reason,
+                carrick_kernel::kernel::debug::AbortReason::ExecutorDied { .. }
+            ),
+            "the post-mortem names the executor death: {text}"
+        );
+        assert!(
+            text.contains("executor worker died index=") && text.contains(death),
+            "the run's error carries the worker's exact error: {text}"
+        );
+    }
+
+    /// #2420, HVF claimed-root death: the worker dies running the root, so
+    /// its failure settlement on the production binding publishes the root's
+    /// generic carrier failure. The run must end with the death verdict and
+    /// the worker's own error, at once, while a parked sibling still holds
+    /// its quantum; before the fix the wait returned the settlement's generic
+    /// failure and stalled on that sibling's retirement.
+    #[test]
+    fn claimed_root_executor_death_ends_the_launch_wait_with_its_verdict() {
+        struct NeverPolled;
+        impl continuation::PersistentQuantumJob for NeverPolled {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut executor::HvpatchQuantumControl<'_, '_>,
+            ) -> executor::ExecutorExit {
+                unreachable!("the parked sibling never runs")
+            }
+        }
+        const DEATH: &str = "hypervisor operation failed: native owed return of MM";
+
+        let (runtime, scheduler, kernel, root, process, generation) =
+            test_carrier_graph_with_dispatcher!(72_440, SyscallDispatcher::new());
+        runtime
+            .persistent_bindings()
+            .retire(root.thread().key(), generation);
+
+        let threads = VcpuThreadRegistry::default();
+        let root_result = HvpatchLoopResult::pending();
+        let root_completion = continuation::LogicalJobCompletion::pending();
+        let root_settlement =
+            HvpatchExternalTerminalSettlement::new(root_result.clone(), root_completion.clone());
+        let sibling_completion = continuation::LogicalJobCompletion::pending();
+        let sibling_settlement = HvpatchExternalTerminalSettlement::new(
+            HvpatchLoopResult::pending(),
+            sibling_completion.clone(),
+        );
+        enroll_persistent_process_member(&threads, &root_settlement);
+        enroll_persistent_process_member(&threads, &sibling_settlement);
+
+        let this_tid = ThreadId::synthetic_for_tests(72_440);
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(this_tid)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            threads.clone(),
+            kicker,
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(root.retain_exact());
+        let production = ProductionHvpatchLoopJob {
+            kernel: Arc::clone(&kernel),
+            state,
+            phase: HvpatchProductionPhase::Resident,
+            registration_wait: None,
+            slot_wait: None,
+            terminal_settlement: root_settlement,
+            terminal_result: None,
+            completion: root_completion.clone(),
+            traps: 0,
+            budget_floor: 0,
+            seen_signal_progress: signal_progress_count(),
+            last_signal_progress: Instant::now(),
+            terminal_runtime: PersistentTerminalRuntimeState::Resident,
+            pending_terminal_retirement: None,
+            pending_terminal_inventory: None,
+            external_exec: None,
+        };
+        let root_binding = Arc::new(continuation::HvpatchTaskBinding::new(
+            executor::TaskLoadIdentity {
+                abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                version: 1,
+                mm: root.shared().mm().id(),
+                asid_generation: process.asid_generation(),
+            },
+            Arc::new(continuation::HvpatchTaskQuantum::new(
+                Box::new(HvpatchLoopJob::production(
+                    production,
+                    InjectedExecutionLeaseSlot::new(),
+                )),
+                root_completion.clone(),
+            )),
+            Box::new(72_440_u64),
+        ));
+        runtime
+            .persistent_bindings()
+            .publish(root.thread().key(), generation, root_binding)
+            .expect("publish the production root binding");
+        let sibling_quantum = Arc::new(continuation::HvpatchTaskQuantum::new(
+            Box::new(NeverPolled),
+            sibling_completion,
+        ));
+        let launch = VcpuLoopLaunch::Persistent {
+            liveness: witness_liveness(root.kernel(), &scheduler),
+            result: root_result,
+            completion: root_completion,
+            process_retirement: kernel.process_physical_retirement.clone(),
+        };
+
+        let pool = start_dying_pool(
+            &runtime,
+            &scheduler,
+            DyingExecutorFactory::new(WitnessDeath::Running, DEATH),
+        );
+        let (wait_tx, wait_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let started = Instant::now();
+            let _ = wait_tx.send((launch.wait(), started.elapsed()));
+        });
+        // Bounded by the harness, never by the product.
+        let (result, waited) = wait_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the launch wait must end");
+        assert_executor_died(result, DEATH);
+        assert!(
+            waited < PHYSICAL_JOB_RETIREMENT_TIMEOUT,
+            "the verdict must not wait out a parked sibling's retirement ({waited:?})"
+        );
+        waiter.join().expect("launch waiter");
+
+        let shutdown = pool
+            .shutdown()
+            .expect_err("the worker failure stays visible at shutdown");
+        assert!(shutdown.to_string().contains(DEATH));
+        drop(sibling_quantum);
+    }
+
+    /// #2420, unsupervised retirement wait: a non-last leader exits raw, so
+    /// the root's launch wait parks on the process's physical retirement for
+    /// its live sibling. A worker then dies holding nothing; the sibling may
+    /// never run again, so the wait must end with the death verdict. Before
+    /// the fix it parked forever.
+    #[test]
+    fn leader_raw_exit_retirement_wait_ends_with_executor_death() {
+        struct NeverPolled;
+        impl continuation::PersistentQuantumJob for NeverPolled {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut executor::HvpatchQuantumControl<'_, '_>,
+            ) -> executor::ExecutorExit {
+                unreachable!("the parked sibling never runs")
+            }
+        }
+        const DEATH: &str = "hypervisor operation failed: native service custody mismatch";
+
+        let (runtime, scheduler, kernel, root, _process, _generation) =
+            test_carrier_graph_with_dispatcher!(72_450, SyscallDispatcher::new());
+        // The leader's own scheduler row is off the run queue for the whole
+        // witness: no live worker has guest work to run.
+        let leader_executor = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .expect("register the leader's executor");
+        let leader_row = scheduler
+            .take(&leader_executor)
+            .expect("take the exited leader's row");
+        let threads = VcpuThreadRegistry::default();
+        let root_result = HvpatchLoopResult::pending();
+        let root_completion = continuation::LogicalJobCompletion::pending();
+        let root_settlement =
+            HvpatchExternalTerminalSettlement::new(root_result.clone(), root_completion.clone());
+        let sibling_completion = continuation::LogicalJobCompletion::pending();
+        let sibling_settlement = HvpatchExternalTerminalSettlement::new(
+            HvpatchLoopResult::pending(),
+            sibling_completion.clone(),
+        );
+        enroll_persistent_process_member(&threads, &root_settlement);
+        enroll_persistent_process_member(&threads, &sibling_settlement);
+        let root_quantum = Arc::new(continuation::HvpatchTaskQuantum::new(
+            Box::new(NeverPolled),
+            root_completion.clone(),
+        ));
+        let sibling_quantum = Arc::new(continuation::HvpatchTaskQuantum::new(
+            Box::new(NeverPolled),
+            sibling_completion,
+        ));
+        let launch = VcpuLoopLaunch::Persistent {
+            liveness: witness_liveness(root.kernel(), &scheduler),
+            result: root_result.clone(),
+            completion: root_completion.clone(),
+            process_retirement: kernel.process_physical_retirement.clone(),
+        };
+
+        // The leader's raw `exit`: its own job ends `ThreadDone` and retires,
+        // and no member has begun the process exit.
+        root_result.publish(Ok(VcpuLoopOutcome::ThreadDone));
+        root_completion.publish();
+        drop(root_quantum);
+        let (wait_tx, wait_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let _ = wait_tx.send(launch.wait());
+        });
+        assert!(
+            wait_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the leader's wait parks for its live sibling"
+        );
+
+        let pool = start_dying_pool(
+            &runtime,
+            &scheduler,
+            DyingExecutorFactory::new(WitnessDeath::Idle, DEATH),
+        );
+        // Bounded by the harness, never by the product.
+        let result = wait_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("an executor death must end the retirement wait, not park it");
+        assert_executor_died(result, DEATH);
+        waiter.join().expect("launch waiter");
+
+        assert!(
+            executor::fail_running_and_retire_for_test::<continuation::HvpatchTaskBinding, _>(
+                runtime.persistent_bindings().as_ref(),
+                &scheduler,
+                leader_row,
+                carrick_kernel::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
+            )
+            .is_none(),
+            "settle the leader's row for teardown"
+        );
+        scheduler
+            .unregister_executor(&leader_executor)
+            .expect("unregister the leader's executor");
+        let shutdown = pool
+            .shutdown()
+            .expect_err("the worker failure stays visible at shutdown");
+        assert!(shutdown.to_string().contains(DEATH));
+        drop(sibling_quantum);
+    }
+
     #[test]
     fn persistent_root_wait_does_not_outrun_sibling_terminal_mount_owner() {
         struct NeverPolled {
