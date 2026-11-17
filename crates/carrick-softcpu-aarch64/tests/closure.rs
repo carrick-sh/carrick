@@ -632,3 +632,59 @@ fn exception_index_reserved_combinations_fail_shut() {
         }
     }
 }
+
+#[test]
+fn vector_unprivileged_lookalikes_are_unallocated() {
+    for word in [0x3c000800, 0x7c400841, 0x3c800841, 0xfc000800] {
+        assert_eq!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+    // V=1 has no unprivileged transfer. With bit21 set, these imm9
+    // samples instead select reserved register-offset options (000/001),
+    // so valid SIMD register-offset instructions are outside this sweep.
+    for size in 0..4 {
+        for opc in 0..4 {
+            for bit21 in 0..2 {
+                for imm9 in [0, 1, 16, 256, 257] {
+                    for rn in [0, 1, 17, 31] {
+                        for rt in [0, 2, 19, 31] {
+                            let word = 0x3c000800
+                                | size << 30
+                                | opc << 22
+                                | bit21 << 21
+                                | imm9 << 12
+                                | rn << 5
+                                | rt;
+                            assert_eq!(
+                                decode_instruction(word),
+                                Instruction::Unallocated,
+                                "{word:08x}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pstate_crn5_lookalikes_are_unallocated() {
+    // CRn must be 4 for MSR (immediate), including every supported
+    // PSTATE selector. CRn=5 must not alias that namespace.
+    for op1 in 0..8 {
+        for crm in 0..16 {
+            for op2 in 0..8 {
+                let word = 0xd500501f | op1 << 16 | crm << 8 | op2 << 5;
+                assert_eq!(
+                    decode_instruction(word),
+                    Instruction::Unallocated,
+                    "{word:08x}"
+                );
+            }
+        }
+    }
+}
