@@ -15,10 +15,15 @@
 //! any descriptor lookup (its routing asks for that operation first, too),
 //! and probes the table once more for the request the operation recorded
 //! at entry, never a re-read of the caller's `struct flock`. A record lock
-//! taken through a descriptor that no longer names the pinned description
-//! (another thread closed or replaced it) is given back: EBADF, as Linux
-//! answers. A signal ends the wait with EINTR, restartable under
-//! `SA_RESTART` (signal(7)).
+//! that nothing blocks, asked through a descriptor that no longer names the
+//! pinned description (another thread closed or replaced it), is never
+//! taken: EBADF, as Linux answers. A signal ends the wait with EINTR,
+//! restartable under `SA_RESTART` (signal(7)).
+//!
+//! The descriptor reads here wait with [`EL1_WAIT`], a
+//! [`carrick_sched_core::ShortLockWait`]: a busy table writer is waited
+//! out, never refused, so the fd authority's `Contended` is a broken
+//! invariant on this path, never an errno or a counted ENOSYS.
 //!
 //! Not served here (left a counted ENOSYS): an `l_whence` of `SEEK_CUR` or
 //! `SEEK_END`, whose base lives with the host description, and a
@@ -32,7 +37,7 @@ use crate::dispatch::GuestDispatchFrame;
 use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::from_sched_token;
 use carrick_el1_abi::ipc::fd::record_lock::{
-    Lock, LockClass, LockKind, LockOwner, LockPid, LockRange, LockRequest, SetRefusal,
+    Lock, LockClass, LockKind, LockOwner, LockPid, LockRange, LockRequest, RangeError, SetRefusal,
 };
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::WaitFor;
@@ -120,23 +125,26 @@ enum Wanted {
     Unlock,
 }
 
-/// Decode the caller's `struct flock` (`SEEK_SET` only), as fcntl(2)
-/// validates it before acting: `Err` is the errno to return, `Ok(None)`
-/// a base this owner does not serve.
+/// Decode the caller's `struct flock` (`SEEK_SET` only) in the order
+/// native Linux refuses it (6.12 oracle): `F_GETLK` (`query`) refuses a
+/// type other than `F_RDLCK`/`F_WRLCK` first, then the base and range
+/// (EINVAL, or EOVERFLOW past the largest offset); `F_SETLK` refuses its
+/// type after the range. The description's access mode and an OFD lock's
+/// `l_pid` come after this (see [`serve_file_lock`]). `Err` is the errno
+/// to return, `Ok(None)` a base this owner does not serve.
 fn decode_flock(
     flock: &carrick_abi::LinuxFlock64,
-    ofd: bool,
+    query: bool,
 ) -> Result<Option<(Wanted, LockRange)>, i64> {
     use carrick_abi::{LINUX_F_RDLCK, LINUX_F_UNLCK, LINUX_F_WRLCK, LINUX_SEEK_SET};
     let einval = carrick_syscall_abi::LINUX_EINVAL.guest_retval();
     let wanted = match i32::from(flock.l_type) {
-        LINUX_F_RDLCK => Wanted::Lock(LockKind::Read),
-        LINUX_F_WRLCK => Wanted::Lock(LockKind::Write),
-        LINUX_F_UNLCK => Wanted::Unlock,
-        _ => return Err(einval),
+        LINUX_F_RDLCK => Some(Wanted::Lock(LockKind::Read)),
+        LINUX_F_WRLCK => Some(Wanted::Lock(LockKind::Write)),
+        LINUX_F_UNLCK if !query => Some(Wanted::Unlock),
+        _ => None,
     };
-    // An OFD lock has no owning process: its l_pid must be zero.
-    if ofd && flock.l_pid != 0 {
+    if query && wanted.is_none() {
         return Err(einval);
     }
     let whence = flock.l_whence;
@@ -149,10 +157,12 @@ fn decode_flock(
             Err(einval)
         };
     }
-    let (start, len) = (flock.l_start, flock.l_len);
-    LockRange::from_posix(0, start, len)
-        .map(|range| Some((wanted, range)))
-        .map_err(|_| einval)
+    let range =
+        LockRange::from_posix(0, flock.l_start, flock.l_len).map_err(|error| match error {
+            RangeError::Invalid => einval,
+            RangeError::Overflow => carrick_abi::LINUX_EOVERFLOW.guest_retval(),
+        })?;
+    wanted.map(|wanted| Some((wanted, range))).ok_or(einval)
 }
 
 /// Serve one advisory lock call of the running native task on its ring
@@ -177,7 +187,7 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
     };
     let syscall_nr = frame.native_number().raw() as u32;
     let region = &venue.region;
-    let authority = region.fd(EL1_WAIT);
+    let authority = region.fd(waits_out_writers(EL1_WAIT));
 
     // A woken wait takes its own operation back before any descriptor
     // lookup: the description it pinned is the one it locks.
@@ -238,16 +248,35 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
             }
         }
     } else {
-        match authority.pin(table, Fd(fd_arg as i32)) {
-            Ok((pin, description)) => (pin.key(), description, Some(pin)),
-            Err(FdError::BadFd) => {
-                set_result(
-                    frame,
-                    carrick_syscall_abi::LINUX_EBADF.guest_retval() as u64,
-                );
-                return IpcServed::Returned { switched: false };
+        // flock(2) refuses an unknown operation before it looks at the
+        // descriptor (native oracle: flock(-1, 77) is EINVAL).
+        if matches!(call, LockCall::Flock { .. }) && !LockCall::valid_flock_operation(arg1) {
+            set_result(
+                frame,
+                carrick_syscall_abi::LINUX_EINVAL.guest_retval() as u64,
+            );
+            return IpcServed::Returned { switched: false };
+        }
+        loop {
+            match authority.pin(table, Fd(fd_arg as i32)) {
+                Ok((pin, description)) => break (pin.key(), description, Some(pin)),
+                Err(FdError::BadFd) => {
+                    set_result(
+                        frame,
+                        carrick_syscall_abi::LINUX_EBADF.guest_retval() as u64,
+                    );
+                    return IpcServed::Returned { switched: false };
+                }
+                // The lock-free pin landed on a record a close freed and
+                // reused: its pin is the caller's to release (possibly the
+                // reuse's final release), and the lookup runs again, as
+                // after that close.
+                Err(FdError::PinRaced(raw)) => {
+                    drop_hold(sched, region, None, Some(OfdPin::from_raw(raw)));
+                }
+                Err(FdError::Contended) => uncontended(),
+                Err(_) => return IpcServed::Forward,
             }
-            Err(_) => return IpcServed::Forward,
         }
     };
     let identity = match fresh_pin.as_ref() {
@@ -267,6 +296,21 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
         drop_hold(sched, region, retained.take(), fresh_pin.take());
         return IpcServed::Forward;
     };
+    // fcntl(2) and flock(2): an O_PATH descriptor locks nothing, refused
+    // before the call reads its `struct flock` (native oracle: EBADF, not
+    // EFAULT, for an unreadable one).
+    let ebadf = carrick_syscall_abi::LINUX_EBADF.guest_retval();
+    let access = description.access;
+    if access == AccessMode::Path {
+        return finish_with(
+            sched,
+            frame,
+            region,
+            retained.take(),
+            fresh_pin.take(),
+            ebadf,
+        );
+    }
 
     // Input after the descriptor (EBADF first, as Linux) and before any
     // effect. A woken wait reruns the request it parked with: fcntl(2)
@@ -288,24 +332,12 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
             }
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
         }
-        (LockCall::Flock { kind, wait }, None) => {
-            if !LockCall::valid_flock_operation(arg1) {
-                return finish_with(
-                    sched,
-                    frame,
-                    region,
-                    retained.take(),
-                    fresh_pin.take(),
-                    carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
-                );
-            }
-            (
-                kind.map_or(Wanted::Unlock, Wanted::Lock),
-                LockRange::WHOLE_FILE,
-                wait,
-            )
-        }
-        (LockCall::Query { ofd } | LockCall::Set { ofd, .. }, None) => {
+        (LockCall::Flock { kind, wait }, None) => (
+            kind.map_or(Wanted::Unlock, Wanted::Lock),
+            LockRange::WHOLE_FILE,
+            wait,
+        ),
+        (LockCall::Query { .. } | LockCall::Set { .. }, None) => {
             let bytes = zerocopy::IntoBytes::as_mut_bytes(&mut flock);
             if !user.copy_in(bytes, arg2) {
                 if user.has_copyin_refusal() && retained.is_none() {
@@ -321,7 +353,7 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
                     carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
                 );
             }
-            match decode_flock(&flock, ofd) {
+            match decode_flock(&flock, matches!(call, LockCall::Query { .. })) {
                 Ok(Some((wanted, range))) => (
                     wanted,
                     range,
@@ -346,24 +378,31 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
     };
     let (wanted, range, blocking) = request;
 
-    // fcntl(2) and flock(2): an O_PATH descriptor locks nothing, and a
-    // record lock needs the access its type names.
-    let ebadf = carrick_syscall_abi::LINUX_EBADF.guest_retval();
-    let access = description.access;
-    let refused = match (&call, &wanted) {
-        _ if access == AccessMode::Path => true,
-        (LockCall::Set { .. }, Wanted::Lock(LockKind::Read)) => access == AccessMode::WriteOnly,
-        (LockCall::Set { .. }, Wanted::Lock(LockKind::Write)) => access == AccessMode::ReadOnly,
-        _ => false,
+    // fcntl(2): a record lock needs the access its type names; then an
+    // OFD lock, which has no owning process, refuses a nonzero l_pid
+    // (native oracle: access first).
+    let refusal = match (&call, &wanted) {
+        (LockCall::Set { .. }, Wanted::Lock(LockKind::Read)) if access == AccessMode::WriteOnly => {
+            Some(ebadf)
+        }
+        (LockCall::Set { .. }, Wanted::Lock(LockKind::Write)) if access == AccessMode::ReadOnly => {
+            Some(ebadf)
+        }
+        (LockCall::Query { ofd: true } | LockCall::Set { ofd: true, .. }, _)
+            if flock.l_pid != 0 =>
+        {
+            Some(carrick_syscall_abi::LINUX_EINVAL.guest_retval())
+        }
+        _ => None,
     };
-    if refused {
+    if let Some(errno) = refusal {
         return finish_with(
             sched,
             frame,
             region,
             retained.take(),
             fresh_pin.take(),
-            ebadf,
+            errno,
         );
     }
 
@@ -454,43 +493,38 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
             });
             return finish_with(sched, frame, region, retained.take(), fresh_pin.take(), 0);
         }
-        let outcome = locks.table().set(request, &owners);
-        let mut wake = outcome.released.then(|| notify_released(sched, &mut locks));
-        // A record lock taken through a descriptor another thread of the
-        // table closed or replaced meanwhile (fcntl(2): its close released
-        // the table's locks on the file before this one existed) is given
-        // back: EBADF, as Linux answers. Asked under the lock table's
-        // exclusion: a close that retires the descriptor after this answer
-        // releases the lock itself. A table the answer could not be read
-        // from leaves nothing taken either: the call is refused as any
-        // other contended lookup here.
-        let stale = match outcome.taken {
-            Ok(()) if matches!(owner, LockOwner::Table { .. }) => names_description(
+        // A record lock asked through a descriptor another thread of the
+        // table closed or replaced meanwhile (fcntl(2): that close released
+        // the table's locks on the file) is never taken: EBADF, as Linux
+        // answers once nothing blocks the request; a blocked call waits on
+        // with its pinned description, as Linux's does. Asked under the
+        // lock table's exclusion, before any effect: a close that retires
+        // the descriptor after this answer releases its record locks under
+        // this exclusion too, so after this lock exists. Nothing is ever
+        // taken that must be given back.
+        if matches!(owner, LockOwner::Table { .. })
+            && locks.table().conflict(&request, &owners).is_none()
+            && !names_description(
                 &authority,
                 table,
                 Fd(fd_arg as i32),
                 retained.as_ref().map(|(_, op)| op.pin),
                 fresh_pin.as_ref(),
             )
-            .map(|names| !names),
-            _ => Ok(false),
-        };
-        if stale != Ok(false)
-            && !matches!(locks.table().unlock(file, owner, class, range), Ok(false))
-            && wake.is_none()
         {
-            wake = Some(notify_released(sched, &mut locks));
-        }
-        if stale.is_err() {
             drop(locks);
-            if let Some(effects) = wake {
-                finish_wakes(sched, effects);
-            }
-            drop_hold(sched, region, retained.take(), fresh_pin.take());
-            return IpcServed::Forward;
+            return finish_with(
+                sched,
+                frame,
+                region,
+                retained.take(),
+                fresh_pin.take(),
+                ebadf,
+            );
         }
+        let outcome = locks.table().set(request, &owners);
+        let wake = outcome.released.then(|| notify_released(sched, &mut locks));
         let blocked = match outcome.taken {
-            Ok(()) if stale == Ok(true) => Some(ebadf),
             Ok(()) => None,
             Err(SetRefusal::Full) => Some(carrick_abi::LINUX_ENOLCK.guest_retval()),
             Err(SetRefusal::Conflict(_)) if !blocking => {
@@ -586,15 +620,22 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
 }
 
 /// Whether `fd` of `table` still names the call's description: its
-/// retained wait's pin (`retained`) or its fresh one.
-fn names_description<W: carrick_el1_abi::ipc::fd::LockWait>(
+/// retained wait's pin (`retained`) or its fresh one. A table retired
+/// meanwhile names nothing. The authority waits out a busy writer
+/// ([`ShortLockWait`](carrick_sched_core::ShortLockWait)), so contention
+/// never reaches here as an answer; a pin that is not live is the call's
+/// own ownership bug.
+fn names_description<W>(
     authority: &carrick_el1_abi::ipc::IpcFdAuthority<'_, W>,
     table: TableId,
     fd: Fd,
     retained: Option<carrick_el1_abi::ipc::RawOfdPin>,
     fresh: Option<&OfdPin>,
-) -> Result<bool, FdError> {
-    match (retained, fresh) {
+) -> bool
+where
+    W: carrick_el1_abi::ipc::fd::LockWait + carrick_sched_core::ShortLockWait,
+{
+    let names = match (retained, fresh) {
         (_, Some(pin)) => authority.names_pinned(table, fd, pin),
         (Some(raw), None) => {
             let pin = OfdPin::from_raw(raw);
@@ -603,7 +644,29 @@ fn names_description<W: carrick_el1_abi::ipc::fd::LockWait>(
             names
         }
         (None, None) => Err(FdError::StalePin),
+    };
+    match names {
+        Ok(names) => names,
+        Err(FdError::StaleTable) => false,
+        Err(FdError::Contended) => uncontended(),
+        Err(_) => {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        }
     }
+}
+
+/// This owner's descriptor wait: a [`ShortLockWait`](carrick_sched_core::ShortLockWait)
+/// waits a busy table writer out and never refuses. Binding the authority
+/// through here keeps a refusing (bounded) policy off this path at compile
+/// time: contention is "not now", never an errno (AGENTS.md).
+const fn waits_out_writers<W: carrick_sched_core::ShortLockWait>(wait: W) -> W {
+    wait
+}
+
+/// `Contended` from an authority bound by [`waits_out_writers`]: its wait
+/// policy cannot refuse, so this is a broken invariant.
+fn uncontended() -> ! {
+    crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
 }
 
 /// Publish a release on the lock object's `Readable` lane and notify its
