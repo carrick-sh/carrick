@@ -104,3 +104,42 @@ No test is renamed or removed. Check moved-block equality, one implementation,
 contract-change classification, and source/range authority-debt ratchets; record
 an authority-moves entry only if a nonzero cohort actually moves. Never raise a
 ceiling. Runtime evidence and any failed checks are reported separately on the PR.
+
+## R1b whole-item boundary (2026-11-17)
+
+Status: blocked before a move-only implementation. GitHub main advanced to
+`7cfd79f0a`; R1 rebased cleanly, but its helper extraction remains rejected by
+`just check-contract-change`. No exemption, binding, ceiling or budget changed.
+The R1 proposal above is not an accepted pure move.
+
+The descriptor statements are inline in `Cpl0Carrier::boot_bytes_inner` on main;
+there is no existing descriptor-construction function/item to relocate unchanged.
+The enclosing function also creates `KvmVm`, installs KVM CPU control registers
+and MSRs, and returns the concrete KVM carrier. Moving it whole into the neutral
+crate would introduce the backend dependency the extraction is meant to remove.
+A `use` or `pub use` cannot preserve that associated-function implementation.
+
+The next ordered RAM/ELF/PML4/trampoline/maps/metadata preparation is likewise
+inline in the same function. Fixture mappings additionally refer to
+`crate::carrier_interrupts`, outside this round's fence. Thus no subsequent
+preparation helper can move whole with an unchanged signature this round.
+The first required boundary is the descriptor helper itself, before the next
+prepared-boot value or generic CPU provider. Creating that boundary must be a
+separate evidence-bound change, not labelled as a whole-item move. No further
+extraction, soft carrier build or selection work was attempted in R1b.
+
+The rebased R1 contract check still reports eight distinct contract IDs (ten
+surface/contract pairs): `kernel.native.entropy`,
+`kernel.native.host-file-venue`, `kernel.x86.file-region`,
+`x86.mm.initial-image`, `kernel.el1.ipc-two-process`,
+`kernel.el1.thread-lifecycle`, `x86.cpuid.v3`, and `x86.vmx.segment-entry`.
+These are the actual gate output, rather than nine distinct families. Running
+existing tests alone does not satisfy the current changed-evidence classifier;
+any binding changes needed for a separate helper boundary require an expanded
+fence. The director was asked for that decision. Keep #2468 draft behind #2414.
+
+R1b baseline on the rebased implementation: `CARRICK_RUN_ID=671-r1b-before
+cargo test -p carrick-vmm-kvm --lib` exited zero: 47 passed, 0 failed,
+0 ignored. This is the requested library baseline, not the full `just test-kvm`
+lane population. With no implementation change, no after-extraction runtime
+claim is made. The remaining validation and full CI were not run while blocked.
