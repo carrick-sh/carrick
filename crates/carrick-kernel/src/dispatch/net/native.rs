@@ -390,6 +390,53 @@ fn native_transfer_extent(
     None
 }
 
+/// Admit a message call (`sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`;
+/// #2418) to the handler, whose user ranges the ring staged. `Some` is the
+/// call's answer before any handler runs:
+/// - a `sendmsg` whose data the ring did not stage
+///   ([`carrick_core_abi::host_file::NET_MESSAGE_UNSTAGED`]) is larger than
+///   one record, so larger than any datagram: EMSGSIZE on a datagram socket,
+///   and refused on any other;
+/// - a send that may stop part way on a blocking stream socket, and a
+///   `MSG_WAITALL` receive on one, are refused: Linux completes them whole,
+///   and a message call has no transfer continuation across records yet.
+fn native_message_admission(
+    call: &NetCall<'_>,
+    socket: Option<&NativeNetFile>,
+    nonblock: bool,
+    args: &mut [u64; 6],
+) -> Option<NetServed> {
+    use carrick_abi::syscall::nr;
+    use carrick_core_abi::host_file::{NET_MESSAGE_UNSTAGED, NET_MESSAGE_UNSTAGED_ARG};
+    let (send, flags) = match call.canonical {
+        c if c == nr::SENDMSG.raw() => (true, args[2]),
+        c if c == nr::RECVMSG.raw() => (false, args[2]),
+        c if c == nr::SENDMMSG.raw() => (true, args[3]),
+        c if c == nr::RECVMMSG.raw() => (false, args[3]),
+        _ => return None,
+    };
+    let kind = socket.and_then(native_socket_type);
+    let datagram = matches!(
+        kind,
+        Some(carrick_abi::LINUX_SOCK_DGRAM | carrick_abi::LINUX_SOCK_RAW)
+    );
+    if call.canonical == nr::SENDMSG.raw() && args[NET_MESSAGE_UNSTAGED_ARG] != 0 {
+        if args[NET_MESSAGE_UNSTAGED_ARG] != NET_MESSAGE_UNSTAGED || !datagram {
+            return Some(NetServed::Refused);
+        }
+        return Some(NetServed::Reply(
+            carrick_abi::LINUX_EMSGSIZE.guest_retval(),
+            Vec::new(),
+        ));
+    }
+    let blocking = !nonblock && flags & carrick_abi::LINUX_MSG_DONTWAIT as u64 == 0;
+    let whole = send || flags & carrick_abi::LINUX_MSG_WAITALL as u64 != 0;
+    if blocking && whole && !datagram {
+        return Some(NetServed::Refused);
+    }
+    None
+}
+
 /// One served network call.
 pub(in crate::dispatch) enum NetServed {
     /// The call's result and the reply output (written extents).
@@ -499,7 +546,16 @@ impl SyscallDispatcher {
         };
         let mut args = call.args;
         if let Some(answer) =
-            native_transfer_extent(call, socket.map(|(socket, _)| socket), &mut args)
+            native_transfer_extent(call, socket.map(|(socket, _)| socket), &mut args).or_else(
+                || {
+                    native_message_admission(
+                        call,
+                        socket.map(|(socket, _)| socket),
+                        socket.is_some_and(|(_, nonblock)| nonblock),
+                        &mut args,
+                    )
+                },
+            )
         {
             return answer;
         }
@@ -539,8 +595,17 @@ impl SyscallDispatcher {
         }
         // The ring raises the caller's own SIGPIPE on EPIPE: the dispatcher's
         // would reach the task whose context the call borrows.
-        if call.canonical == carrick_abi::syscall::nr::SENDTO.raw() {
-            args[3] |= carrick_abi::LINUX_MSG_NOSIGNAL as u64;
+        let flags = match call.canonical {
+            c if c == carrick_abi::syscall::nr::SENDTO.raw()
+                || c == carrick_abi::syscall::nr::SENDMMSG.raw() =>
+            {
+                Some(3)
+            }
+            c if c == carrick_abi::syscall::nr::SENDMSG.raw() => Some(2),
+            _ => None,
+        };
+        if let Some(flags) = flags {
+            args[flags] |= carrick_abi::LINUX_MSG_NOSIGNAL as u64;
         }
         let mut memory = StagedMemory::new(call);
         let ran = self.run_native_net_handler(

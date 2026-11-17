@@ -15,3 +15,14 @@ pub const LINUX_SOCK_DGRAM: i32 = 2;
 pub const LINUX_SOCK_RAW: i32 = 3;
 pub const LINUX_SOCK_RDM: i32 = 4;
 pub const LINUX_SOCK_SEQPACKET: i32 = 5;
+
+/// Linux `struct msghdr` on an LP64 ABI: `msg_name` (8), `msg_namelen`
+/// (4, then 4 of padding), `msg_iov` (8), `msg_iovlen` (8), `msg_control`
+/// (8), `msg_controllen` (8), `msg_flags` (4, then 4 of padding).
+pub const LINUX_MSGHDR_BYTES: usize = 56;
+/// Linux `struct mmsghdr`: a `struct msghdr`, then `msg_len` (4, then 4 of
+/// padding).
+pub const LINUX_MMSGHDR_BYTES: usize = 64;
+/// Linux `struct sockaddr_storage`: the largest socket address a call
+/// reads or writes.
+pub const LINUX_SOCKADDR_STORAGE_BYTES: usize = 128;

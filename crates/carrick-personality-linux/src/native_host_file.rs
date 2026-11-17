@@ -2131,7 +2131,8 @@ pub fn complete(
 }
 
 /// Whether a served record's EPIPE owes its caller SIGPIPE (Linux's
-/// `write(2)` to a pipe or socket, and `send` without `MSG_NOSIGNAL`). The
+/// `write(2)` to a pipe or socket, and `send`, `sendmsg` or `sendmmsg`
+/// without `MSG_NOSIGNAL`). The
 /// carrier serves with the signal suppressed; the ring, which owns the
 /// caller's signals, raises it.
 pub fn sigpipe_on_epipe(record: &[u8]) -> bool {
@@ -2152,8 +2153,13 @@ pub fn sigpipe_on_epipe(record: &[u8]) -> bool {
     }
     op == Some(HostFileOp::NetSyscall as u16)
         && socket::staged_call(input).is_some_and(|call| {
-            call.canonical == crate::crossing::nr::SENDTO.raw()
-                && call.args[3] & LINUX_MSG_NOSIGNAL == 0
+            use crate::crossing::nr;
+            let flags = match call.canonical {
+                c if c == nr::SENDTO.raw() || c == nr::SENDMMSG.raw() => call.args[3],
+                c if c == nr::SENDMSG.raw() => call.args[2],
+                _ => return false,
+            };
+            flags & LINUX_MSG_NOSIGNAL == 0
         })
 }
 
