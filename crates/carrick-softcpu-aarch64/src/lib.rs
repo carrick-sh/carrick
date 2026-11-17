@@ -966,4 +966,7 @@ mod instruction {
             .or_else(|| branch_register(w))
     }
 }
-pub use instruction::*;
+pub use instruction::{
+    AddImmediate, AddSubtract, Arithmetic, ArithmeticOperand, Branch, Condition, Extend, Gpr, Hint,
+    Instruction, OperandRegister, PcOffset, RegisterBranch, ShiftAmount, decode_instruction,
+};
