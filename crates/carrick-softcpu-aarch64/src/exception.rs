@@ -142,7 +142,7 @@ pub enum ReturnError {
     UndefinedAtEl0,
 }
 /// D1.11 Illegal return events from AArch64 state; AArch64.ExceptionReturn.
-/// Illegal SPSR.M retains current EL/SP/masks, sets IL, restores NZCV and
+/// Illegal SPSR.M retains current EL/SP, sets IL, restores NZCV/PAN/DAIF and
 /// branches to ELR. ERET at EL0 is undefined and changes no state.
 pub fn eret(cpu: &mut CpuState) -> Result<(), ReturnError> {
     if cpu.pstate.el == ExceptionLevel::El0 {
@@ -153,6 +153,8 @@ pub fn eret(cpu: &mut CpuState) -> Result<(), ReturnError> {
     } else {
         cpu.pstate.il = true;
         cpu.pstate.nzcv = ((cpu.el1.spsr.0 >> 28) & 15) as u8;
+        cpu.pstate.pan = cpu.el1.spsr.0 & (1 << 22) != 0;
+        cpu.pstate.daif = InterruptMasks(((cpu.el1.spsr.0 >> 6) & 15) as u8);
     }
     cpu.pc = cpu.el1.elr;
     Ok(())

@@ -228,19 +228,27 @@ impl CpuState {
         };
         let slot = Slot::decode(r).ok_or(undefined)?;
         if (read && matches!(slot, Slot::Named(17 | 18)))
-            || (!read && matches!(slot, Slot::CurrentEl | Slot::Named(11 | 12 | 15 | 16)))
+            || (!read && matches!(slot, Slot::CurrentEl | Slot::Named(12 | 15 | 16)))
             || (matches!(slot, Slot::SpEl0) && self.pstate.sp == StackSelect::El0)
         {
+            return Err(undefined);
+        }
+        if self.pstate.el == ExceptionLevel::El0 && !read && matches!(slot, Slot::Named(11)) {
             return Err(undefined);
         }
         let allowed = match slot {
             Slot::Named(3 | 6 | 7) | Slot::Nzcv => true,
             Slot::Named(4) => read,
-            Slot::Named(11 | 12) => read && self.el1.cntkctl.0 & 2 != 0,
+            Slot::Named(11) => read && self.el1.cntkctl.0 & 3 != 0,
+            Slot::Named(12) => read && self.el1.cntkctl.0 & 2 != 0,
+            Slot::Named(13 | 14) => self.el1.cntkctl.0 & (1 << 8) != 0,
             Slot::Daif => self.el1.sctlr.0 & (1 << 9) != 0,
             _ => false,
         };
         if self.pstate.el == ExceptionLevel::El0 && !allowed {
+            if !matches!(slot, Slot::Daif | Slot::Named(11..=14)) {
+                return Err(undefined);
+            }
             let rt = match rt {
                 OperandRegister::Gpr(r) => r.number(),
                 _ => 31,
