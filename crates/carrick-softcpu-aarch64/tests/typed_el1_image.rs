@@ -109,7 +109,7 @@ fn linked_el1_executable_mapping_spans_are_typed() {
             let offset = u64_at(section, 24)
                 .checked_add(lo - start)
                 .expect("valid production ELF fixture");
-            for (i, word) in bytes[offset..offset + hi - lo].chunks_exact(4).enumerate() {
+            for word in bytes[offset..offset + hi - lo].chunks_exact(4) {
                 let word =
                     u32::from_le_bytes(word.try_into().expect("ELF field has the expected width"));
                 words += 1;
