@@ -3765,6 +3765,25 @@ elif '/runs/501/artifacts?' in args[-1]:
 else:
     raise SystemExit('unexpected request: ' + repr(args))
 "#);
+    let real_cargo = Command::new("sh")
+        .args(["-c", "command -v cargo"])
+        .output()
+        .unwrap();
+    assert!(real_cargo.status.success());
+    let real_cargo = String::from_utf8(real_cargo.stdout).unwrap();
+    write_exec(
+        &bin,
+        "cargo",
+        br#"#!/usr/bin/env python3
+import os, sys
+if 'fetch' in sys.argv[1:]:
+    with open(os.environ['TEST_FETCHES'], 'a') as out:
+        out.write('fetch\n')
+os.execv(os.environ['TEST_CARGO'], [os.environ['TEST_CARGO']] + sys.argv[1:])
+"#,
+    );
+    let fetches = transport.path().join("fetches");
+    fs::write(&fetches, b"").unwrap();
     let request = transport.path().join("request.json");
     fs::write(
         &request,
@@ -3775,26 +3794,36 @@ else:
     )
     .unwrap();
     let output = transport.path().join("downloaded");
-    let result = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
-        .args(["--root"])
-        .arg(f.repo.path())
-        .args(["signed-gate", "base-fixtures", "--request"])
-        .arg(request)
-        .arg("--output")
-        .arg(&output)
-        .args(["--wait-minutes", "0"])
-        .env(
-            "PATH",
-            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
-        )
-        .env("TEST_RUN", transport.path().join("run.json"))
-        .env("TEST_ARCHIVE", &artifact)
-        .output()
-        .unwrap();
+    let result = Command::new(
+        std::env::var_os("CARRICK_TEST_GATE_XTASK")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_carrick-xtask").into()),
+    )
+    .args(["--root"])
+    .arg(f.repo.path())
+    .args(["signed-gate", "base-fixtures", "--request"])
+    .arg(request)
+    .arg("--output")
+    .arg(&output)
+    .args(["--wait-minutes", "0"])
+    .env(
+        "PATH",
+        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+    )
+    .env("TEST_CARGO", real_cargo.trim())
+    .env("TEST_FETCHES", &fetches)
+    .env("TEST_RUN", transport.path().join("run.json"))
+    .env("TEST_ARCHIVE", &artifact)
+    .output()
+    .unwrap();
     assert!(
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fetches).unwrap().lines().count(),
+        7,
+        "production base-fixtures must fetch all pinned fixture graphs before offline verification"
     );
     assert_eq!(
         fs::read(output.join("bundle.tar.gz")).unwrap(),
