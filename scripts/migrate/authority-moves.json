@@ -212,6 +212,10 @@
     {
       "owner": "carrick_cli::args::debug_a64_census::run",
       "issue": 2412
+    },
+    {
+      "owner": "carrick_cli::args::debug_a64_census::export_loader_spans",
+      "issue": 2501
     }
   ],
   "terminal_custody": []
