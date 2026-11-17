@@ -252,7 +252,7 @@ pub fn run_prepared_kvm_pool(
         max_traps,
         debug_server,
         #[cfg(feature = "kvm-pool-test-control")]
-        None,
+        KvmPoolTestControl::default(),
         None,
     )
     .map_err(|failure| failure.error)
@@ -272,7 +272,7 @@ pub fn try_run_prepared_kvm_pool(
         max_traps,
         None,
         #[cfg(feature = "kvm-pool-test-control")]
-        None,
+        KvmPoolTestControl::default(),
         None,
     )
 }
@@ -299,7 +299,10 @@ pub fn try_run_prepared_kvm_pool_with_loaded_pre_entry_hook(
         dispatcher,
         loaded_exits.max(idle_exits),
         None,
-        Some(hook),
+        KvmPoolTestControl {
+            loaded_pre_entry_hook: Some(hook),
+            injected_death: None,
+        },
         Some((loaded_exits, idle_exits)),
     )
 }
@@ -365,7 +368,14 @@ pub fn witness_kvm_exec_retarget(
         dormant,
         factory,
         ..
-    } = assemble_kvm_root_pool(machine, &root_context, dispatcher, 16, None, None)?;
+    } = assemble_kvm_root_pool(
+        machine,
+        &root_context,
+        dispatcher,
+        16,
+        None,
+        KvmPoolTestControl::default(),
+    )?;
     let kick = Arc::new(executor::WorkerKick::new(Arc::new(
         executor::ReceiptLog::default(),
     )));
@@ -549,6 +559,61 @@ pub fn witness_kvm_exec_retarget(
 pub type KvmLoadedPreEntryHook =
     crate::vcpu_loop::executor::cpl0::LoadedPreEntryHook<carrick_vmm_kvm::KvmKickHandle>;
 
+/// A worker death the KVM pool injects for test control (#2420).
+#[doc(hidden)]
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "kvm-pool-test-control",
+    target_arch = "x86_64"
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KvmInjectedExecutorDeath {
+    /// The idle peer's worker dies at its first guest idle, holding no task
+    /// and outside any lane: only the executor-death verdict ends the run.
+    IdlePeerFirstIdle,
+    /// The worker that sent the guest's exit dies right after sending it.
+    AfterGuestExit,
+}
+
+/// Test control for the production KVM pool, compiled only into test
+/// targets.
+#[doc(hidden)]
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "kvm-pool-test-control",
+    target_arch = "x86_64"
+))]
+#[derive(Clone, Default)]
+pub struct KvmPoolTestControl {
+    pub loaded_pre_entry_hook: Option<KvmLoadedPreEntryHook>,
+    pub injected_death: Option<KvmInjectedExecutorDeath>,
+}
+
+/// Run the production KVM pool under `test_control`.
+#[doc(hidden)]
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "kvm-pool-test-control",
+    target_arch = "x86_64"
+))]
+pub fn try_run_prepared_kvm_pool_with_test_control(
+    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
+    root_context: carrick_kernel::kernel::KernelContext,
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    max_traps: usize,
+    test_control: KvmPoolTestControl,
+) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
+    run_prepared_kvm_pool_with_debug(
+        machine,
+        root_context,
+        dispatcher,
+        max_traps,
+        None,
+        test_control,
+        None,
+    )
+}
+
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 type KvmExecutorFactory = crate::vcpu_loop::executor::cpl0::Cpl0PersistentExecutorFactory<
     carrick_vmm_kvm::carrier_cpu::KvmCpuIo,
@@ -585,7 +650,7 @@ fn assemble_kvm_root_pool(
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
     lane_exit_budgets: Option<(usize, usize)>,
-    #[cfg(feature = "kvm-pool-test-control")] loaded_pre_entry_hook: Option<KvmLoadedPreEntryHook>,
+    #[cfg(feature = "kvm-pool-test-control")] test_control: KvmPoolTestControl,
 ) -> Result<KvmRootPool, RuntimeError> {
     use crate::vcpu_loop::executor;
     use carrick_hal::threaded::GuestCpuState;
@@ -646,7 +711,9 @@ fn assemble_kvm_root_pool(
             scheduler: Arc::clone(&scheduler),
             root_binding: Arc::clone(&binding),
             #[cfg(feature = "kvm-pool-test-control")]
-            loaded_pre_entry_hook,
+            loaded_pre_entry_hook: test_control.loaded_pre_entry_hook,
+            #[cfg(feature = "kvm-pool-test-control")]
+            injected_death: test_control.injected_death,
         },
     )?);
     Ok(KvmRootPool {
@@ -672,7 +739,7 @@ fn run_prepared_kvm_pool_with_debug(
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
     debug_server: Option<PreparedKvmDebugServer>,
-    #[cfg(feature = "kvm-pool-test-control")] loaded_pre_entry_hook: Option<KvmLoadedPreEntryHook>,
+    #[cfg(feature = "kvm-pool-test-control")] test_control: KvmPoolTestControl,
     lane_exit_budgets: Option<(usize, usize)>,
 ) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
     use crate::vcpu_loop::executor::{self, PersistentTaskBinding};
@@ -707,7 +774,7 @@ fn run_prepared_kvm_pool_with_debug(
         max_traps,
         lane_exit_budgets,
         #[cfg(feature = "kvm-pool-test-control")]
-        loaded_pre_entry_hook,
+        test_control,
     )?;
     if let Some((_, ref physical_debug)) = debug_server {
         physical_debug.attach(&physical);
@@ -1934,7 +2001,7 @@ impl PreparedRun {
                         max_traps,
                         kvm_debug,
                         #[cfg(feature = "kvm-pool-test-control")]
-                        None,
+                        KvmPoolTestControl::default(),
                         None,
                     )
                     .map_err(|failure| failure.error)

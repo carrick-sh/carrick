@@ -98,6 +98,8 @@ pub(crate) struct Cpl0PersistentExecutorFactory<M: CarrierCpuIo, Mem: CarrierMem
     bound_host_fds: Arc<BoundHostFds>,
     #[cfg(feature = "kvm-pool-test-control")]
     loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
+    #[cfg(feature = "kvm-pool-test-control")]
+    injected_death: Option<crate::prepare::KvmInjectedExecutorDeath>,
 }
 
 /// The run root's current task binding, shared by every executor of one
@@ -292,6 +294,8 @@ pub(crate) struct Cpl0PersistentExecutorConfig<M: CarrierCpuIo, Mem: CarrierMemo
     pub(crate) root_binding: Arc<Cpl0TaskBinding>,
     #[cfg(feature = "kvm-pool-test-control")]
     pub(crate) loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
+    #[cfg(feature = "kvm-pool-test-control")]
+    pub(crate) injected_death: Option<crate::prepare::KvmInjectedExecutorDeath>,
 }
 
 /// The CPL0 run's completion, applying the scheduler's executor-death
@@ -350,6 +354,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutorFactory<M, Mem
             bound_host_fds,
             #[cfg(feature = "kvm-pool-test-control")]
             loaded_pre_entry_hook: config.loaded_pre_entry_hook,
+            #[cfg(feature = "kvm-pool-test-control")]
+            injected_death: config.injected_death,
         })
     }
 }
@@ -399,6 +405,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> PersistentExecutorFactory
             idle_kick: M::for_current_thread_kick(),
             #[cfg(feature = "kvm-pool-test-control")]
             loaded_pre_entry_hook: self.loaded_pre_entry_hook.clone(),
+            #[cfg(feature = "kvm-pool-test-control")]
+            injected_death: self.injected_death,
         })
     }
 }
@@ -425,6 +433,8 @@ pub(crate) struct Cpl0PersistentExecutor<M: CarrierCpuIo, Mem: CarrierMemoryIo =
     bound_host_fds: Arc<BoundHostFds>,
     #[cfg(feature = "kvm-pool-test-control")]
     loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
+    #[cfg(feature = "kvm-pool-test-control")]
+    injected_death: Option<crate::prepare::KvmInjectedExecutorDeath>,
     external_signals: HostSignalIngressProducer,
 }
 
@@ -605,6 +615,12 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             .send(Ok(result))
             .map_err(|_| TrapError::Hypervisor("CPL0 completion receiver closed".into()))?;
         self.completion_sent = true;
+        #[cfg(feature = "kvm-pool-test-control")]
+        if self.injected_death == Some(crate::prepare::KvmInjectedExecutorDeath::AfterGuestExit) {
+            return Err(TrapError::Hypervisor(
+                "injected executor death after the guest exit".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1459,6 +1475,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> PersistentExecutor for Cpl0Persisten
     }
 
     fn arm_guest_idle(&mut self) -> Result<(), TrapError> {
+        #[cfg(feature = "kvm-pool-test-control")]
+        if self.injected_death == Some(crate::prepare::KvmInjectedExecutorDeath::IdlePeerFirstIdle)
+            && self.physical.is_idle_peer_slot()
+        {
+            return Err(TrapError::Hypervisor(
+                "injected executor death at the idle peer's first guest idle".into(),
+            ));
+        }
         if self.physical.is_idle_peer_slot() {
             self.physical.arm_idle_kick(&self.idle_kick)?;
         }

@@ -135,6 +135,29 @@ fn try_run_program_with_dispatcher_image(
     carrick_runtime::prepare::try_run_prepared_kvm_pool(carrier, root, dispatcher, max_exits)
 }
 
+/// Run `elf` on the production pool under `test_control`.
+#[allow(dead_code)]
+pub fn try_run_pool_fixture_with_test_control(
+    elf: &[u8],
+    max_exits: usize,
+    test_control: carrick_runtime::prepare::KvmPoolTestControl,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_runtime::prepare::PreparedKvmPoolFailure,
+> {
+    let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let (carrier, root) =
+        boot_program_carrier(&program, ROOT_AFFINITY_ANY, |_| {}, &dispatcher, None);
+    carrick_runtime::prepare::try_run_prepared_kvm_pool_with_test_control(
+        carrier,
+        root,
+        dispatcher,
+        max_exits,
+        test_control,
+    )
+}
+
 /// Load the issued root of a booted production carrier on a real KVM
 /// executor and retarget it to a committed `execve` successor (#2142).
 #[allow(dead_code)]
