@@ -84,3 +84,32 @@ fn logical_forms_have_typed_operands() {
         );
     }
 }
+
+#[test]
+fn logical_reserved_masks_and_shifts_fail_shut() {
+    for word in [0x12400000, 0x9240fc00, 0x9200fc00, 0x0a008000] {
+        assert_eq!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
+
+#[test]
+fn logical_masks_rotate_and_replicate() {
+    use carrick_softcpu_aarch64::LogicalOperand;
+    for (word, mask) in [
+        (0x92401c20, 255),
+        (0x320083ff, 0x10001),
+        (0x320107ff, 0x80000001),
+    ] {
+        let Instruction::Logical(l) = decode_instruction(word) else {
+            panic!("missing logical")
+        };
+        let LogicalOperand::Immediate(i) = l.operand else {
+            panic!("missing immediate")
+        };
+        assert_eq!(i.value(), mask);
+    }
+}
