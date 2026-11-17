@@ -882,6 +882,7 @@ mod instruction {
         /// Arm ARM DDI0487G.a C6.2.87 ERET (no pointer authentication).
         Eret,
         AtomicAdd(crate::AtomicAdd),
+        SystemOperation(crate::SystemOperation),
         Barrier(crate::Barrier),
         ExceptionGeneration(crate::ExceptionGeneration),
         SystemAccess(crate::SystemAccess),
