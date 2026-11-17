@@ -508,6 +508,16 @@ mod layout_pin_tests {
     }
 
     #[test]
+    fn softmmu_access_is_the_neutral_leaf_access() {
+        let access: carrick_mmu_core::stage1::LeafAccess = crate::Access::Write;
+        assert_eq!(
+            core::any::TypeId::of::<crate::Access>(),
+            core::any::TypeId::of::<carrick_mmu_core::stage1::LeafAccess>()
+        );
+        assert_eq!(access, carrick_mmu_core::stage1::LeafAccess::Write);
+    }
+
+    #[test]
     fn access_planes_map_read_write_execute_to_zero_one_two() {
         let tlb = SoftTlb::new();
         let base = core::ptr::from_ref(&tlb) as usize;
