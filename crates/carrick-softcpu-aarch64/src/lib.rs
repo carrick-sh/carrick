@@ -605,6 +605,7 @@ mod instruction {
         Branch(Branch),
         ScalarMemory(ScalarMemory),
         PairMemory(PairMemory),
+        Logical(Logical),
     }
 
     /// Arm ARM DDI0487G.a C6.2.92 HINT, C6.2.204 NOP, C6.2.354 YIELD,
@@ -645,6 +646,9 @@ mod instruction {
         }
         if let Some(m) = pair_memory(word) {
             return Instruction::PairMemory(m);
+        }
+        if let Some(l) = logical(word) {
+            return Instruction::Logical(l);
         }
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
     }
@@ -929,6 +933,122 @@ mod instruction {
                 _ => MemoryIndex::Offset,
             },
             non_temporal: mode == 0,
+        })
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LogicalOperation {
+        And,
+        Orr,
+        Eor,
+        Ands,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LogicalImmediate(u64);
+    impl LogicalImmediate {
+        pub const fn value(self) -> u64 {
+            self.0
+        }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LogicalOperand {
+        Immediate(LogicalImmediate),
+        Shifted {
+            rm: OperandRegister,
+            shift: crate::Shift,
+            amount: ShiftAmount,
+            invert: bool,
+        },
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Logical {
+        pub width: crate::Width,
+        pub operation: LogicalOperation,
+        pub rd: OperandRegister,
+        pub rn: OperandRegister,
+        pub operand: LogicalOperand,
+    }
+    /// DDI0487G.a C6.2.12/14 AND/ANDS, C6.2.85 EOR, C6.2.206 ORR (immediate);
+    /// C4.1.2 Logical (immediate), C4-282–283; J1 DecodeBitMasks, J1-7953–7954.
+    /// Derive the element length, reject reserved all-ones, rotate and replicate.
+    fn logical_immediate(w: u32) -> Option<LogicalOperand> {
+        if w & 0x1f800000 != 0x12000000 {
+            return None;
+        }
+        let n = (w >> 22) & 1;
+        if w >> 31 == 0 && n != 0 {
+            return None;
+        }
+        let s = (w >> 10) & 63;
+        let combined = (n << 6) | ((!s) & 63);
+        if combined < 2 {
+            return None;
+        }
+        let length = 31 - combined.leading_zeros();
+        let size = 1u32 << length;
+        let levels = size - 1;
+        let s = s & levels;
+        if s == levels {
+            return None;
+        }
+        let r = (w >> 16) & levels;
+        let ones = (1u64 << (s + 1)) - 1;
+        let element_mask = u64::MAX >> (64 - size);
+        let element = if r == 0 {
+            ones
+        } else {
+            (ones >> r | ones << (size - r)) & element_mask
+        };
+        let width = if w >> 31 == 0 { 32 } else { 64 };
+        let mut mask = 0;
+        let mut position = 0;
+        while position < width {
+            mask |= element << position;
+            position += size;
+        }
+        Some(LogicalOperand::Immediate(LogicalImmediate(mask)))
+    }
+    /// DDI0487G.a C6.2.13/15 AND/ANDS, C6.2.31/32 BIC/BICS,
+    /// C6.2.84/86 EON/EOR, C6.2.205/207 ORN/ORR (shifted register);
+    /// C4.1.5 Logical (shifted register), C4-332.
+    fn logical_shifted(w: u32) -> Option<LogicalOperand> {
+        if w & 0x1f000000 != 0x0a000000 || (w >> 31 == 0 && w & 0x8000 != 0) {
+            return None;
+        }
+        Some(LogicalOperand::Shifted {
+            rm: OperandRegister::field(w >> 16, false),
+            shift: match (w >> 22) & 3 {
+                0 => crate::Shift::Lsl,
+                1 => crate::Shift::Lsr,
+                2 => crate::Shift::Asr,
+                _ => crate::Shift::Ror,
+            },
+            amount: ShiftAmount(((w >> 10) & 63) as u8),
+            invert: w & (1 << 21) != 0,
+        })
+    }
+    fn logical(w: u32) -> Option<Logical> {
+        let operand = logical_immediate(w).or_else(|| logical_shifted(w))?;
+        let operation = match (w >> 29) & 3 {
+            0 => LogicalOperation::And,
+            1 => LogicalOperation::Orr,
+            2 => LogicalOperation::Eor,
+            _ => LogicalOperation::Ands,
+        };
+        Some(Logical {
+            width: if w >> 31 == 0 {
+                crate::Width::W32
+            } else {
+                crate::Width::X64
+            },
+            operation,
+            rd: OperandRegister::field(
+                w,
+                matches!(operand, LogicalOperand::Immediate(_))
+                    && operation != LogicalOperation::Ands,
+            ),
+            rn: OperandRegister::field(w >> 5, false),
+            operand,
         })
     }
 
@@ -1259,7 +1379,8 @@ mod instruction {
 }
 pub use instruction::{
     AddImmediate, AddSubtract, Arithmetic, ArithmeticOperand, Branch, Condition, Extend, Gpr, Hint,
-    Instruction, MemoryAddress, MemoryIndex, MemoryOffset, MemoryOperation, MemoryRegister,
-    MemorySize, OperandRegister, PairMemory, PcOffset, RegisterBranch, ScalarMemory, ShiftAmount,
-    VectorRegister, decode_instruction,
+    Instruction, Logical, LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress,
+    MemoryIndex, MemoryOffset, MemoryOperation, MemoryRegister, MemorySize, OperandRegister,
+    PairMemory, PcOffset, RegisterBranch, ScalarMemory, ShiftAmount, VectorRegister,
+    decode_instruction,
 };

@@ -710,3 +710,144 @@ fn generated_pair_memory_matches_llvm_operands() {
         words.len()
     );
 }
+
+#[test]
+#[ignore = "requires Rust-sysroot CARRICK_LLVM_OBJDUMP"]
+fn generated_logical_matches_llvm_operands() {
+    let mut words = BTreeSet::new();
+    for sf in 0..2u32 {
+        for opc in 0..4 {
+            let head = sf << 31 | opc << 29;
+            for n in 0..2 {
+                for r in 0..64 {
+                    for s in 0..64 {
+                        for (rn, rd) in [(1, 0), (31, 31)] {
+                            words.insert(
+                                head | 0x12000000 | n << 22 | r << 16 | s << 10 | rn << 5 | rd,
+                            );
+                        }
+                    }
+                }
+            }
+            for shift in 0..4 {
+                for invert in 0..2 {
+                    for amount in 0..64 {
+                        for (rn, rm, rd) in [(1, 2, 0), (31, 31, 31), (17, 18, 19)] {
+                            words.insert(
+                                head | 0x0a000000
+                                    | shift << 22
+                                    | invert << 21
+                                    | rm << 16
+                                    | amount << 10
+                                    | rn << 5
+                                    | rd,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(words.len() >= 50_000);
+    let words: Vec<_> = words.into_iter().collect();
+    let path = std::env::temp_dir().join(format!("carrick-a64-logical-{}.o", std::process::id()));
+    std::fs::write(&path, object(&words)).expect("valid fixture");
+    let output = Command::new(std::env::var_os("CARRICK_LLVM_OBJDUMP").expect("set LLVM"))
+        .args([
+            "-D",
+            "-M",
+            "no-aliases",
+            "--no-show-raw-insn",
+            "--no-leading-addr",
+        ])
+        .arg(&path)
+        .output()
+        .expect("valid fixture");
+    std::fs::remove_file(path).expect("valid fixture");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("valid fixture");
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|s| s.starts_with(' ') && !s.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), words.len());
+    let mut accepted = 0;
+    for (&w, line) in words.iter().zip(lines) {
+        if let Instruction::Logical(l) = decode_instruction(w) {
+            let invert = matches!(l.operand, LogicalOperand::Shifted { invert: true, .. });
+            let name = match (l.operation, invert) {
+                (LogicalOperation::And, false) => "and",
+                (LogicalOperation::And, true) => "bic",
+                (LogicalOperation::Ands, false) => "ands",
+                (LogicalOperation::Ands, true) => "bics",
+                (LogicalOperation::Orr, false) => "orr",
+                (LogicalOperation::Orr, true) => "orn",
+                (LogicalOperation::Eor, false) => "eor",
+                (LogicalOperation::Eor, true) => "eon",
+            };
+            let operand = match l.operand {
+                LogicalOperand::Immediate(i) => format!("#0x{:x}", i.value()),
+                LogicalOperand::Shifted {
+                    rm, shift, amount, ..
+                } => {
+                    let r = reg(rm, l.width);
+                    if shift == Shift::Lsl && amount.value() == 0 {
+                        r
+                    } else {
+                        format!(
+                            "{r}, {} #{}",
+                            match shift {
+                                Shift::Lsl => "lsl",
+                                Shift::Lsr => "lsr",
+                                Shift::Asr => "asr",
+                                Shift::Ror => "ror",
+                            },
+                            amount.value()
+                        )
+                    }
+                }
+            };
+            let expected = format!(
+                "{name} {}, {}, {operand}",
+                reg(l.rd, l.width),
+                reg(l.rn, l.width)
+            );
+            let actual = line
+                .split("//")
+                .next()
+                .expect("instruction")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            // LLVM retains the ORR-immediate MOV alias even with no-aliases.
+            let expected = if actual.starts_with("mov ")
+                && l.operation == LogicalOperation::Orr
+                && l.rn == OperandRegister::Zr
+                && matches!(l.operand, LogicalOperand::Immediate(_))
+            {
+                let LogicalOperand::Immediate(imm) = l.operand else {
+                    unreachable!()
+                };
+                let value = if l.width == Width::W32 {
+                    imm.value() as u32 as i32 as i64
+                } else {
+                    imm.value() as i64
+                };
+                let signed = if value < 0 {
+                    format!("#-0x{:x}", value.unsigned_abs())
+                } else {
+                    format!("#0x{value:x}")
+                };
+                format!("mov {}, {signed}", reg(l.rd, l.width))
+            } else {
+                expected
+            };
+            assert_eq!(expected, actual, "{w:08x}");
+            accepted += 1;
+        }
+    }
+    println!(
+        "{} distinct logical words; {accepted} accepted; 0 wrong class / operand mismatches",
+        words.len()
+    );
+}
