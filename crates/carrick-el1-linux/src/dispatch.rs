@@ -7224,21 +7224,25 @@ mod tests {
             (canonical, args[..4].to_vec()),
             (269, vec![3, address(&msgs), 2, 0x4000])
         );
+        // Each header is read; only its `msg_len` is written back.
         assert_eq!(
             staged,
             [
-                (segment(&msgs[..64], true, true), Some(msgs[..64].to_vec())),
+                (segment(&msgs[..64], true, false), Some(msgs[..64].to_vec())),
+                (segment(&msgs[56..60], false, true), None),
                 (segment(&iovecs[0], true, false), Some(iovecs[0].clone())),
                 (segment(&a, true, false), Some(a.clone())),
-                (segment(&msgs[64..], true, true), Some(msgs[64..].to_vec())),
+                (segment(&msgs[64..], true, false), Some(msgs[64..].to_vec())),
+                (segment(&msgs[120..124], false, true), None),
                 (segment(&iovecs[1], true, false), Some(iovecs[1].clone())),
                 (segment(&aaaa, true, false), Some(aaaa.clone())),
             ]
         );
 
         // recvmsg(fd, &msg, 0) into a 100000-byte buffer with a name: the
-        // header is read and written back, the buffer is fitted to one
-        // record's range in the staged iovec copy, and the name is written.
+        // header is read and its name, control and flag lengths written
+        // back, the buffer is fitted to one record's range in the staged
+        // iovec copy, and the name is written.
         let buffer = vec![0u8; 100_000];
         let name = vec![0u8; 28];
         let iov = iovec(&buffer, 100_000);
@@ -7256,7 +7260,10 @@ mod tests {
         assert_eq!(
             staged,
             [
-                (segment(&msg, true, true), Some(msg.clone())),
+                (segment(&msg, true, false), Some(msg.clone())),
+                (segment(&msg[8..12], false, true), None),
+                (segment(&msg[40..48], false, true), None),
+                (segment(&msg[48..52], false, true), None),
                 (segment(&iov, true, false), Some(fitted)),
                 (
                     segment(
@@ -7269,6 +7276,109 @@ mod tests {
                 (segment(&name, false, true), None),
             ]
         );
+    }
+
+    /// #2418 review P0-1 and P0-3: ARM's production staging of a fork
+    /// child's message calls supplies every range the call writes back
+    /// before the crossing (a received header on a page whose copy-on-write
+    /// share is unbroken faults writable first), and a later batch entry
+    /// that faults stages the entries before it: a refused supply moves
+    /// them, as Linux answers the count moved. Red before: the header
+    /// crossed unchecked and the later entry's fault was EFAULT.
+    #[test]
+    fn native_host_file_stage_supplies_a_fork_childs_message_ranges_first() {
+        use carrick_core_abi::host_file::{HostFileRequestView, NetCall};
+        use carrick_guest_arch::Access;
+        use carrick_personality_linux::native_host_file::{
+            DescriptionAccess, HostFileStage, NativeDescriptor,
+        };
+        /// Resident memory but for `hole`, not writable (`write`) or not
+        /// readable.
+        struct Hole {
+            hole: core::ops::Range<u64>,
+            write: bool,
+        }
+        impl Hole {
+            fn cut(&self, user_va: u64, len: usize, write: bool) -> usize {
+                if write == self.write
+                    && user_va < self.hole.end
+                    && user_va + len as u64 > self.hole.start
+                {
+                    return self.hole.start.saturating_sub(user_va) as usize;
+                }
+                len
+            }
+        }
+        impl file::MemoryValidator for Hole {
+            fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
+                self.cut(user_va, len, true)
+            }
+            fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
+                self.cut(user_va, len, false)
+            }
+        }
+        let address = |bytes: &[u8]| bytes.as_ptr().addr() as u64;
+        let stage = |validator: &Hole, nr: u64, args: [u64; 4]| {
+            let mut frame = TrapFrame {
+                esr: 0x15 << 26,
+                ..TrapFrame::default()
+            };
+            frame.x[8] = nr;
+            frame.x[..4].copy_from_slice(&args);
+            native_host_file_stage(
+                &frame,
+                &CurrentTask::new(),
+                validator,
+                [3, 4, 5],
+                carrick_core_abi::service::ServiceOrigin::Descendant,
+                |_| {
+                    Some(NativeDescriptor::HostBacked {
+                        access: DescriptionAccess::ReadWrite,
+                    })
+                },
+                &mut |_| 0,
+            )
+            .expect("a fork child's message call is staged")
+        };
+        let word = |value: u64| value.to_le_bytes();
+        let buffer = vec![0u8; 32];
+        let iov = [word(address(&buffer)), word(32)].concat();
+        let mut msgs = vec![0u8; 128];
+        for header in msgs.chunks_exact_mut(64) {
+            header[16..24].copy_from_slice(&word(address(&iov)));
+            header[24..32].copy_from_slice(&word(1));
+        }
+        let first = address(&msgs);
+        // recvmsg: the header's `msg_controllen` is the first field
+        // written back (no name): supplied writable first.
+        let unwritable = Hole {
+            hole: first..first + 64,
+            write: true,
+        };
+        assert_eq!(
+            stage(&unwritable, 212, [3, first, 0, 0]),
+            HostFileStage::Fault {
+                address: first + 40,
+                access: Access::Write,
+            }
+        );
+        // sendmmsg of two whose second header is unreadable.
+        let unreadable = Hole {
+            hole: first + 64..first + 128,
+            write: false,
+        };
+        let staged = stage(&unreadable, 269, [3, first, 2, 0x4000]);
+        assert_eq!(staged.fault(), Some((first + 64, Access::Read)));
+        let HostFileStage::Request {
+            mut record,
+            output: Some(_),
+            ..
+        } = staged.refused()
+        else {
+            panic!("a refused supply sends the first message alone");
+        };
+        let view = HostFileRequestView::parse(&mut record).unwrap();
+        assert_eq!(NetCall::decode(view.input()).unwrap().args[2], 1);
     }
 
     /// #1954: an ARM `write`/`writev` whose buffer is readable for 16 bytes

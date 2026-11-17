@@ -608,4 +608,93 @@ mod tests {
             );
         }
     }
+
+    /// #2418 review P0-1 and P0-3: x86's production staging of a fork
+    /// child's message calls through the shared stage. A received header
+    /// on a page whose copy-on-write share is unbroken faults writable
+    /// before the crossing; a later `sendmmsg` entry that faults stages
+    /// the entries before it, which a refused supply sends (Linux answers
+    /// the count sent). Red before: the header crossed unchecked and the
+    /// later entry's fault was EFAULT.
+    #[test]
+    fn descendant_message_calls_supply_their_ranges_before_crossing() {
+        use carrick_core_abi::host_file::{HostFileRequestView, NetCall};
+        use carrick_guest_arch::Access;
+        struct Hole {
+            hole: core::ops::Range<u64>,
+            write: bool,
+        }
+        impl Hole {
+            fn cut(&self, user_va: u64, len: usize, write: bool) -> usize {
+                if write == self.write
+                    && user_va < self.hole.end
+                    && user_va + len as u64 > self.hole.start
+                {
+                    return self.hole.start.saturating_sub(user_va) as usize;
+                }
+                len
+            }
+        }
+        impl MemoryValidator for Hole {
+            fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
+                self.cut(user_va, len, true)
+            }
+            fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
+                self.cut(user_va, len, false)
+            }
+        }
+        let stage = |validator: &Hole, nr: u64, args: [u64; 6]| {
+            let call = decode_x86_64(nr, args, 0x8000);
+            let task = CurrentTask::new();
+            stage_call(
+                &call,
+                &task,
+                validator,
+                CHILD,
+                |_| false,
+                || Some(([3, 4, 5], |_| host())),
+            )
+            .expect("a fork child's message call is staged")
+        };
+        let address = |bytes: &[u8]| bytes.as_ptr().addr() as u64;
+        let word = |value: u64| value.to_le_bytes();
+        let buffer = vec![0u8; 32];
+        let iov = [word(address(&buffer)), word(32)].concat();
+        let mut msgs = vec![0u8; 128];
+        for header in msgs.chunks_exact_mut(64) {
+            header[16..24].copy_from_slice(&word(address(&iov)));
+            header[24..32].copy_from_slice(&word(1));
+        }
+        let first = address(&msgs);
+        // recvmsg (x86 47): `msg_controllen` is the first field written
+        // back (no name).
+        let unwritable = Hole {
+            hole: first..first + 64,
+            write: true,
+        };
+        assert_eq!(
+            stage(&unwritable, 47, [3, first, 0, 0, 0, 0]),
+            HostFileStage::Fault {
+                address: first + 40,
+                access: Access::Write,
+            }
+        );
+        // sendmmsg (x86 307) of two whose second header is unreadable.
+        let unreadable = Hole {
+            hole: first + 64..first + 128,
+            write: false,
+        };
+        let staged = stage(&unreadable, 307, [3, first, 2, 0x4000, 0, 0]);
+        assert_eq!(staged.fault(), Some((first + 64, Access::Read)));
+        let HostFileStage::Request {
+            mut record,
+            output: Some(_),
+            ..
+        } = staged.refused()
+        else {
+            panic!("a refused supply sends the first message alone");
+        };
+        let view = HostFileRequestView::parse(&mut record).unwrap();
+        assert_eq!(NetCall::decode(view.input()).unwrap().args[2], 1);
+    }
 }

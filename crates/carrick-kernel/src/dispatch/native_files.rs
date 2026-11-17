@@ -2303,6 +2303,292 @@ mod tests {
         assert_eq!(&buffer[..8], b"RA-query");
     }
 
+    /// The test's own memory as a native member's user memory (#2418).
+    struct OwnUserMemory;
+    impl carrick_personality_linux::native_host_file::HostFileUser for OwnUserMemory {
+        fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+            // SAFETY: every staged address names a live test buffer.
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr(), dst.len()) };
+            true
+        }
+        fn writable(&mut self, _dst: u64, len: usize) -> usize {
+            len
+        }
+    }
+
+    /// A native member's staged socket call: its stamped record and output.
+    struct StagedNetCall {
+        record: Vec<u8>,
+        output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+    }
+
+    impl Fixture {
+        /// Stage `nr(args)` through the shared ring staging over the test's
+        /// own memory and stamp its caller, as the ring's service does.
+        /// `None`: the stage refused it (a counted ENOSYS).
+        fn net_staged(
+            &self,
+            nr: carrick_abi::CanonicalNr,
+            args: [u64; 6],
+        ) -> Option<StagedNetCall> {
+            use carrick_personality_linux::native_host_file::{
+                DescriptionAccess, HostFileCall, HostFileStage, NativeDescriptor, NativeNamespace,
+                SocketCall,
+            };
+            let root = self.dispatcher.capture_one_task_context().unwrap();
+            let caller = host_file::NetCaller {
+                task: root.task().key(),
+                ns_pid: std::num::NonZeroU32::new(7).unwrap(),
+                ids: host_file::AccessIds {
+                    ruid: 0,
+                    euid: 0,
+                    suid: 0,
+                    fsuid: 0,
+                    rgid: 0,
+                    egid: 0,
+                    sgid: 0,
+                    fsgid: 0,
+                },
+                cap_effective: 0,
+            };
+            let socket = SocketCall::decode(nr, &args).unwrap();
+            match carrick_personality_linux::native_host_file::stage(
+                HostFileCall::Socket(socket),
+                &mut NativeNamespace {
+                    table: self.table,
+                    resolve: &mut |_| {
+                        Some(NativeDescriptor::HostBacked {
+                            access: DescriptionAccess::ReadWrite,
+                        })
+                    },
+                    releases: &mut |_| 0,
+                },
+                &mut OwnUserMemory,
+            ) {
+                None => None,
+                Some(HostFileStage::Request { record, output, .. }) => Some(StagedNetCall {
+                    record: carrick_personality_linux::native_host_file::stamp_net_caller(
+                        &record, &caller,
+                    )
+                    .unwrap()
+                    .into_vec(),
+                    output,
+                }),
+                Some(other) => panic!("{nr:?} crosses or is refused: {other:?}"),
+            }
+        }
+
+        /// Serve a staged call in the carrier and complete it into the
+        /// test's own memory: its result, ENOSYS when refused.
+        fn net_served(&self, mut staged: StagedNetCall) -> i64 {
+            if self.serve(None, &mut staged.record).is_err() {
+                return carrick_abi::LINUX_ENOSYS.guest_retval();
+            }
+            carrick_personality_linux::native_host_file::complete(
+                &staged.record,
+                staged.output,
+                &mut |address, bytes| {
+                    // SAFETY: the staged output ranges are live test buffers.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            address as *mut u8,
+                            bytes.len(),
+                        )
+                    };
+                    true
+                },
+            )
+            .raw()
+        }
+
+        fn net_call(&self, nr: carrick_abi::CanonicalNr, args: [u64; 6]) -> i64 {
+            match self.net_staged(nr, args) {
+                Some(staged) => self.net_served(staged),
+                None => carrick_abi::LINUX_ENOSYS.guest_retval(),
+            }
+        }
+
+        /// A `type` inet socket connected to `server` (`0x800` in `type`
+        /// is `SOCK_NONBLOCK`).
+        fn net_connected(&self, type_: u64, server: std::net::SocketAddr) -> u64 {
+            use carrick_personality_linux::crossing::nr;
+            let fd = self.net_call(nr::SOCKET, [2, type_, 0, 0, 0, 0]);
+            assert!(fd >= 0, "socket: {fd}");
+            let mut address = [0u8; 16];
+            address[..2].copy_from_slice(&2u16.to_le_bytes());
+            address[2..4].copy_from_slice(&server.port().to_be_bytes());
+            address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            let args = [fd as u64, address.as_ptr() as u64, 16, 0, 0, 0];
+            assert_eq!(self.net_call(nr::CONNECT, args), 0);
+            fd as u64
+        }
+    }
+
+    /// A loopback datagram server that answers each datagram with `R` and
+    /// its payload, then reports it answered.
+    fn answering_server(answers: usize) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<()>) {
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let address = server.local_addr().unwrap();
+        let (answered, queued) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..answers {
+                let mut query = [0u8; 64];
+                let (len, from) = server.recv_from(&mut query).unwrap();
+                server
+                    .send_to(&[b"R".as_slice(), &query[..len]].concat(), from)
+                    .unwrap();
+                answered.send(()).unwrap();
+            }
+        });
+        (address, queued)
+    }
+
+    /// A Linux `struct mmsghdr` naming one iovec.
+    fn one_iovec_header(name: &[u8], iov: &[u8]) -> Vec<u8> {
+        let mut header = vec![0u8; 64];
+        if !name.is_empty() {
+            header[..8].copy_from_slice(&(name.as_ptr() as u64).to_le_bytes());
+            header[8..12].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        }
+        header[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_le_bytes());
+        header[24..32].copy_from_slice(&1u64.to_le_bytes());
+        header
+    }
+
+    fn iovec_of(buffer: &[u8]) -> Vec<u8> {
+        [
+            (buffer.as_ptr() as u64).to_le_bytes(),
+            (buffer.len() as u64).to_le_bytes(),
+        ]
+        .concat()
+    }
+
+    /// #2418 review P0-5: a native member's `recvmsg` writes back into its
+    /// header only what Linux writes (`msg_namelen`, `msg_controllen`,
+    /// `msg_flags`). Bytes of the header the caller changes while the call
+    /// is in flight (another thread's store to `msg_control` or the
+    /// padding) keep the caller's value. Red before: completion copied the
+    /// whole span from `msg_namelen` to `msg_flags` back from the snapshot
+    /// staging took.
+    #[test]
+    fn a_native_message_receive_writes_back_only_the_header_fields_linux_writes() {
+        use carrick_personality_linux::crossing::nr;
+        let fixture = fixture();
+        let (server, queued) = answering_server(1);
+        let fd = fixture.net_connected(2, server);
+        let query = b"q";
+        let args = [fd, query.as_ptr() as u64, 1, 0, 0, 0];
+        assert_eq!(fixture.net_call(nr::SENDTO, args), 1);
+        queued.recv().unwrap();
+
+        let buffer = vec![0u8; 32];
+        let name = vec![0u8; 28];
+        let iov = iovec_of(&buffer);
+        let mut msg = one_iovec_header(&name, &iov);
+        let staged = fixture
+            .net_staged(nr::RECVMSG, [fd, msg.as_ptr() as u64, 0, 0, 0, 0])
+            .expect("a recvmsg crosses");
+        // The caller's stores while the call is in flight.
+        msg[12..16].copy_from_slice(b"pad!");
+        msg[32..40].copy_from_slice(&0x5eed_u64.to_le_bytes());
+        msg[52..56].copy_from_slice(b"pad?");
+        assert_eq!(fixture.net_served(staged), 2);
+        assert_eq!(&buffer[..2], b"Rq");
+        assert_eq!(u32::from_le_bytes(msg[8..12].try_into().unwrap()), 16);
+        assert_eq!(&msg[12..16], b"pad!");
+        assert_eq!(&msg[32..40], &0x5eed_u64.to_le_bytes());
+        assert_eq!(&msg[52..56], b"pad?");
+    }
+
+    /// #2418 review P0-4: Linux's blocking `recvmmsg` of more than one
+    /// message waits for every one unless `MSG_WAITFORONE` is set; the
+    /// venue has no continuation to wait for the rest, so it refuses that
+    /// call (a counted ENOSYS) and serves the `MSG_WAITFORONE` one, which
+    /// waits for the first only. Red before: the blocking call returned
+    /// what was queued.
+    #[test]
+    fn a_native_blocking_recvmmsg_waits_for_one_only_with_msg_waitforone() {
+        use carrick_personality_linux::crossing::nr;
+        let fixture = fixture();
+        let (server, queued) = answering_server(2);
+        let fd = fixture.net_connected(2, server);
+        for query in [b"a", b"b"] {
+            let args = [fd, query.as_ptr() as u64, 1, 0, 0, 0];
+            assert_eq!(fixture.net_call(nr::SENDTO, args), 1);
+            queued.recv().unwrap();
+        }
+        let buffers = [vec![0u8; 32], vec![0u8; 32]];
+        let iovs = [iovec_of(&buffers[0]), iovec_of(&buffers[1])];
+        let msgs = [
+            one_iovec_header(&[], &iovs[0]),
+            one_iovec_header(&[], &iovs[1]),
+        ]
+        .concat();
+        let call =
+            |flags| fixture.net_call(nr::RECVMMSG, [fd, msgs.as_ptr() as u64, 2, flags, 0, 0]);
+        assert_eq!(call(0), carrick_abi::LINUX_ENOSYS.guest_retval());
+        assert_eq!(call(carrick_abi::LINUX_MSG_WAITFORONE as u64), 2);
+        assert_eq!(
+            (&buffers[0][..2], &buffers[1][..2]),
+            (&b"Ra"[..], &b"Rb"[..])
+        );
+    }
+
+    /// #2418 review P0-5: the message calls Linux answers whole that one
+    /// record cannot: a `sendmsg` larger than one record is EMSGSIZE on a
+    /// datagram socket (larger than any datagram) and refused on a stream;
+    /// a blocking stream `sendmsg` or `sendmmsg`, a `MSG_WAITALL` stream
+    /// `recvmsg`, and a stream `sendmmsg` of more than one message (whose
+    /// later EPIPE Linux signals while answering the count) are refused
+    /// (counted ENOSYS), never a guess.
+    #[test]
+    fn native_message_calls_one_record_cannot_answer_are_emsgsize_or_refused() {
+        use carrick_personality_linux::crossing::nr;
+        let fixture = fixture();
+        let enosys = carrick_abi::LINUX_ENOSYS.guest_retval();
+        let large = vec![7u8; 70_000];
+        let iov = iovec_of(&large);
+        let msg = one_iovec_header(&[], &iov);
+        let small = vec![7u8; 8];
+        let small_iov = iovec_of(&small);
+        let msgs = [
+            one_iovec_header(&[], &small_iov),
+            one_iovec_header(&[], &small_iov),
+        ]
+        .concat();
+        let socket = |type_: u64| {
+            let fd = fixture.net_call(nr::SOCKET, [2, type_, 0, 0, 0, 0]);
+            assert!(fd >= 0, "socket: {fd}");
+            fd as u64
+        };
+        let udp = socket(2);
+        assert_eq!(
+            fixture.net_call(nr::SENDMSG, [udp, msg.as_ptr() as u64, 0, 0, 0, 0]),
+            carrick_abi::LINUX_EMSGSIZE.guest_retval()
+        );
+        let tcp = socket(1);
+        let nonblocking_tcp = socket(1 | 0x800);
+        for (call, args) in [
+            (
+                nr::SENDMSG,
+                [nonblocking_tcp, msg.as_ptr() as u64, 0, 0, 0, 0],
+            ),
+            (nr::SENDMSG, [tcp, msgs.as_ptr() as u64, 0, 0, 0, 0]),
+            (nr::SENDMMSG, [tcp, msgs.as_ptr() as u64, 1, 0, 0, 0]),
+            (nr::RECVMSG, [tcp, msgs.as_ptr() as u64, 0x100, 0, 0, 0]),
+            (
+                nr::SENDMMSG,
+                [nonblocking_tcp, msgs.as_ptr() as u64, 2, 0, 0, 0],
+            ),
+        ] {
+            assert_eq!(fixture.net_call(call, args), enosys, "{call:?} {args:?}");
+        }
+    }
+
     /// #231: inside a native member's network call every identity read
     /// answers the member's stamped caller, never the borrowed root
     /// context's, including scopes nested in the call.

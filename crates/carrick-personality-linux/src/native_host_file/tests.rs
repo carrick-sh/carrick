@@ -6,6 +6,9 @@ struct Memory {
     base: u64,
     bytes: Vec<u8>,
     writable: bool,
+    /// Resident but not yet writable: a page whose copy-on-write share is
+    /// unbroken, or a read-only mapping. Writing it needs a supply.
+    read_only: core::ops::Range<u64>,
 }
 impl HostFileUser for Memory {
     fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
@@ -26,7 +29,11 @@ impl HostFileUser for Memory {
             return 0;
         }
         let end = self.base + self.bytes.len() as u64;
-        (end.saturating_sub(dst) as usize).min(len)
+        let len = (end.saturating_sub(dst) as usize).min(len);
+        if dst < self.read_only.end && dst + len as u64 > self.read_only.start {
+            return self.read_only.start.saturating_sub(dst) as usize;
+        }
+        len
     }
 }
 
@@ -42,6 +49,7 @@ fn memory(bytes: &[u8]) -> Memory {
         base: BASE,
         bytes,
         writable: true,
+        read_only: 0..0,
     }
 }
 
@@ -2255,4 +2263,507 @@ fn a_socket_send_proves_its_whole_extent_readable_and_holds_a_datagram() {
     let call = socket::staged_call(input).unwrap();
     assert_eq!(call.args[2], 65_000);
     assert_eq!(call.segments()[0].len, 65_000);
+}
+
+/// A Linux `struct mmsghdr` (its leading `struct msghdr`, then `msg_len`).
+fn msghdr(
+    name: u64,
+    namelen: u32,
+    iov: u64,
+    iovlen: u64,
+    control: u64,
+    controllen: u64,
+) -> Vec<u8> {
+    let mut header = vec![0u8; carrick_syscall_abi::LINUX_MMSGHDR_BYTES];
+    header[..8].copy_from_slice(&name.to_le_bytes());
+    header[8..12].copy_from_slice(&namelen.to_le_bytes());
+    header[16..24].copy_from_slice(&iov.to_le_bytes());
+    header[24..32].copy_from_slice(&iovlen.to_le_bytes());
+    header[32..40].copy_from_slice(&control.to_le_bytes());
+    header[40..48].copy_from_slice(&controllen.to_le_bytes());
+    header
+}
+
+fn iovec(base: u64, len: u64) -> Vec<u8> {
+    [base.to_le_bytes(), len.to_le_bytes()].concat()
+}
+
+/// Lay `parts` out at their offsets in one buffer of `len` bytes.
+fn laid_out(len: usize, parts: &[(usize, &[u8])]) -> Vec<u8> {
+    let mut bytes = vec![0u8; len];
+    for (at, part) in parts {
+        bytes[*at..*at + part.len()].copy_from_slice(part);
+    }
+    bytes
+}
+
+fn socket_stage(
+    user: &mut Memory,
+    canonical: CanonicalNr,
+    args: [u64; 6],
+) -> Option<HostFileStage> {
+    let call = SocketCall::decode(canonical, &args).expect("a socket call");
+    run(HostFileCall::Socket(call), user)
+}
+
+/// The arguments and segment table a staged socket request carries.
+fn staged_net(stage: Option<HostFileStage>) -> ([u64; 6], Vec<host_file::NetSegment>) {
+    let (record, output, _) = request(stage);
+    assert_eq!(output.map(|output| output.layout), Some(OutputLayout::Net));
+    let (_, input, _) = host_file::request_parts(&record).unwrap();
+    let call = host_file::NetCall::decode(input).expect("a staged socket call");
+    (call.args, call.segments().to_vec())
+}
+
+fn net_segment(address: u64, len: u32, input: bool, output: bool) -> host_file::NetSegment {
+    host_file::NetSegment {
+        address,
+        len,
+        input,
+        output,
+    }
+}
+
+const MSG_DONTWAIT: u64 = 0x40;
+
+/// #2418 review P0-1: a received message's header, and a batched sent
+/// one's `msg_len`, are written back after the call moved its data. A
+/// header on a page whose copy-on-write share is unbroken (or a read-only
+/// one) is supplied writable before the crossing, as every other output
+/// range is; a refused supply is EFAULT before any datagram moved. Red
+/// before: the header was declared output unchecked, the carrier sent or
+/// consumed the datagram and completion answered EFAULT after it.
+#[test]
+fn a_message_header_linux_writes_back_is_supplied_writable_before_the_crossing() {
+    use crate::crossing::nr;
+    // Page 0: the header. Page 1: its iovec, buffer and name.
+    let bytes = laid_out(
+        8192,
+        &[
+            (0, &msghdr(BASE + 4096 + 512, 16, BASE + 4096, 1, 0, 0)),
+            (4096, &iovec(BASE + 4096 + 64, 32)),
+        ],
+    );
+    let mut user = memory(&bytes);
+    user.read_only = BASE..BASE + 4096;
+    let fault = |user: &mut Memory, canonical, args| {
+        socket_stage(user, canonical, args).and_then(|stage| stage.fault())
+    };
+    // recvmsg and recvmmsg write msg_namelen first; sendmmsg writes msg_len.
+    let header = [SOCKET_FD, BASE, 0, 0, 0, 0];
+    assert_eq!(
+        fault(&mut user, nr::RECVMSG, header),
+        Some((BASE + 8, Access::Write))
+    );
+    let batch = [SOCKET_FD, BASE, 1, MSG_DONTWAIT, 0, 0];
+    assert_eq!(
+        fault(&mut user, nr::RECVMMSG, batch),
+        Some((BASE + 8, Access::Write))
+    );
+    assert_eq!(
+        fault(&mut user, nr::SENDMMSG, batch),
+        Some((BASE + 56, Access::Write))
+    );
+    assert_eq!(
+        socket_stage(&mut user, nr::RECVMSG, header).map(HostFileStage::refused),
+        returned(carrick_syscall_abi::LINUX_EFAULT)
+    );
+    // sendmsg writes nothing back: its read-only header crosses.
+    staged_net(socket_stage(&mut user, nr::SENDMSG, header));
+    // Supplied: every call crosses.
+    user.read_only = 0..0;
+    staged_net(socket_stage(&mut user, nr::RECVMSG, header));
+    staged_net(socket_stage(&mut user, nr::RECVMMSG, batch));
+    staged_net(socket_stage(&mut user, nr::SENDMMSG, batch));
+}
+
+/// #2418 review P0-2 and P1-1: ancillary data is not staged. A message
+/// call with a non-zero `msg_controllen`, either way and whatever
+/// `msg_control` holds, is a counted refusal: Linux's control messages
+/// (and its EFAULT for a NULL buffer) are not answered by a guess, and no
+/// guest length sizes a carrier allocation. A control pointer with no
+/// length carries nothing and crosses. Red before: a receive's control
+/// buffer crossed with its unclamped length, and a send's NULL control
+/// buffer with a length was sent as if it had none.
+#[test]
+fn message_control_data_is_a_counted_refusal_in_either_direction() {
+    use crate::crossing::nr;
+    let iov = iovec(BASE + 0x200, 32);
+    for (control, controllen) in [
+        (BASE + 0x400, 64),
+        (BASE + 0x400, 0x7fff_fff0),
+        (BASE + 0x400, 0x1_0000_0000),
+        (0, 64),
+    ] {
+        let header = msghdr(0, 0, BASE + 0x100, 1, control, controllen);
+        let mut user = memory(&laid_out(4096, &[(0, &header), (0x100, &iov)]));
+        for (canonical, args) in [
+            (nr::RECVMSG, [SOCKET_FD, BASE, 0, 0, 0, 0]),
+            (nr::SENDMSG, [SOCKET_FD, BASE, 0, 0, 0, 0]),
+            (nr::RECVMMSG, [SOCKET_FD, BASE, 1, MSG_DONTWAIT, 0, 0]),
+            (nr::SENDMMSG, [SOCKET_FD, BASE, 1, 0, 0, 0]),
+        ] {
+            assert_eq!(
+                socket_stage(&mut user, canonical, args),
+                None,
+                "{canonical:?} with msg_control {control:#x}, msg_controllen {controllen:#x}"
+            );
+        }
+    }
+    let header = msghdr(0, 0, BASE + 0x100, 1, BASE + 0x400, 0);
+    let mut user = memory(&laid_out(4096, &[(0, &header), (0x100, &iov)]));
+    for canonical in [nr::RECVMSG, nr::SENDMSG] {
+        let (_, segments) = staged_net(socket_stage(
+            &mut user,
+            canonical,
+            [SOCKET_FD, BASE, 0, 0, 0, 0],
+        ));
+        assert!(
+            segments
+                .iter()
+                .all(|segment| segment.address != BASE + 0x400),
+            "{segments:?}"
+        );
+    }
+}
+
+/// #2418 review P0-3: Linux's `sendmmsg` and `recvmmsg` move their entries
+/// in order and stop at the first that fails; once one moved, the call
+/// answers the count moved. A later entry whose header, iovecs or ranges
+/// fault stages the entries before it behind a supply of the faulting
+/// page: a supplied page retries the whole batch, a refused one moves the
+/// staged prefix. Red before: the refused supply answered EFAULT and moved
+/// nothing.
+#[test]
+fn a_later_batch_entry_that_faults_moves_the_entries_before_it() {
+    use crate::crossing::nr;
+    // sendmmsg: entry 0 is the resident page's last 64 bytes, entry 1 is
+    // on the next, unmapped page.
+    let bytes = laid_out(
+        4096,
+        &[
+            (4096 - 64, &msghdr(0, 0, BASE + 0x100, 1, 0, 0)),
+            (0x100, &iovec(BASE + 0x200, 7)),
+            (0x200, b"A-query"),
+        ],
+    );
+    let mut user = memory(&bytes);
+    let args = [SOCKET_FD, BASE + 4096 - 64, 2, 0x4000, 0, 0];
+    let stage = socket_stage(&mut user, nr::SENDMMSG, args).unwrap();
+    assert_eq!(stage.fault(), Some((BASE + 4096, Access::Read)));
+    let (staged, segments) = staged_net(Some(stage.refused()));
+    assert_eq!(staged[2], 1, "a refused supply sends entry 0 alone");
+    assert!(segments.iter().all(|segment| segment.address < BASE + 4096));
+    user.bytes.resize(8192, 0);
+    assert_eq!(
+        staged_net(socket_stage(&mut user, nr::SENDMMSG, args)).0[2],
+        2
+    );
+
+    // recvmmsg: entry 1's buffer is on a page not yet writable.
+    let bytes = laid_out(
+        8192,
+        &[
+            (0, &msghdr(0, 0, BASE + 0x100, 1, 0, 0)),
+            (64, &msghdr(0, 0, BASE + 0x110, 1, 0, 0)),
+            (0x100, &iovec(BASE + 0x200, 32)),
+            (0x110, &iovec(BASE + 4096, 32)),
+        ],
+    );
+    let mut user = memory(&bytes);
+    user.read_only = BASE + 4096..BASE + 8192;
+    let args = [SOCKET_FD, BASE, 2, MSG_DONTWAIT, 0, 0];
+    let stage = socket_stage(&mut user, nr::RECVMMSG, args).unwrap();
+    assert_eq!(stage.fault(), Some((BASE + 4096, Access::Write)));
+    assert_eq!(staged_net(Some(stage.refused())).0[2], 1);
+    user.read_only = 0..0;
+    assert_eq!(
+        staged_net(socket_stage(&mut user, nr::RECVMMSG, args)).0[2],
+        2
+    );
+    // An unreadable first entry moves nothing: EFAULT once refused.
+    let stage = socket_stage(
+        &mut user,
+        nr::RECVMMSG,
+        [SOCKET_FD, BASE + 8192, 2, 0, 0, 0],
+    );
+    assert_eq!(
+        stage.map(HostFileStage::refused),
+        returned(carrick_syscall_abi::LINUX_EFAULT)
+    );
+}
+
+/// #2418 review P0-4: a `recvmmsg` crosses only as Linux's whole call.
+/// One whose entries do not all fit one record (their buffers, or their
+/// segments) is refused whole, never cut to fewer entries that leave
+/// datagrams queued; a timeout, which Linux checks between datagrams and
+/// writes back, is refused before the descriptor is looked up (Linux
+/// validates it first); and `vlen` is the `unsigned int` Linux reads. Red
+/// before: the batch was cut short, the timeout crossed unhonoured, and a
+/// count in the register's upper half read past the caller's array.
+#[test]
+fn a_receive_batch_is_staged_whole_or_refused() {
+    use crate::crossing::nr;
+    // Two 40000-byte buffers: entry 1 does not fit the data range left.
+    let bytes = laid_out(
+        0x1000 + 80_000,
+        &[
+            (0, &msghdr(0, 0, BASE + 0x100, 1, 0, 0)),
+            (64, &msghdr(0, 0, BASE + 0x110, 1, 0, 0)),
+            (0x100, &iovec(BASE + 0x1000, 40_000)),
+            (0x110, &iovec(BASE + 0x1000 + 40_000, 40_000)),
+        ],
+    );
+    let mut user = memory(&bytes);
+    assert_eq!(
+        socket_stage(
+            &mut user,
+            nr::RECVMMSG,
+            [SOCKET_FD, BASE, 2, MSG_DONTWAIT, 0, 0]
+        ),
+        None
+    );
+    // One entry's buffer holds any datagram whole.
+    let one = [SOCKET_FD, BASE, 1, MSG_DONTWAIT, 0, 0];
+    assert_eq!(
+        staged_net(socket_stage(&mut user, nr::RECVMMSG, one)).0[2],
+        1
+    );
+    // A timeout, even on a closed descriptor.
+    for fd in [SOCKET_FD, 7] {
+        assert_eq!(
+            socket_stage(
+                &mut user,
+                nr::RECVMMSG,
+                [fd, BASE, 1, MSG_DONTWAIT, BASE + 0x200, 0]
+            ),
+            None
+        );
+    }
+
+    // A hundred one-byte entries: more segments than one record holds.
+    let mut parts = Vec::new();
+    let headers: Vec<Vec<u8>> = (0..100u64)
+        .map(|entry| msghdr(0, 0, BASE + 0x2000 + 16 * entry, 1, 0, 0))
+        .collect();
+    let iovecs: Vec<Vec<u8>> = (0..100u64)
+        .map(|entry| iovec(BASE + 0x3000 + entry, 1))
+        .collect();
+    for (entry, (header, iov)) in headers.iter().zip(&iovecs).enumerate() {
+        parts.push((64 * entry, header.as_slice()));
+        parts.push((0x2000 + 16 * entry, iov.as_slice()));
+    }
+    let mut user = memory(&laid_out(0x4000, &parts));
+    assert_eq!(
+        socket_stage(
+            &mut user,
+            nr::RECVMMSG,
+            [SOCKET_FD, BASE, 100, MSG_DONTWAIT, 0, 0]
+        ),
+        None
+    );
+
+    // vlen is an unsigned int: the upper half of its register is not the
+    // count. The one entry is the resident page's last; past it is unmapped.
+    let bytes = laid_out(
+        4096,
+        &[
+            (4096 - 64, &msghdr(0, 0, BASE + 0x100, 1, 0, 0)),
+            (0x100, &iovec(BASE + 0x200, 32)),
+        ],
+    );
+    let mut user = memory(&bytes);
+    let msgvec = BASE + 4096 - 64;
+    for canonical in [nr::RECVMMSG, nr::SENDMMSG] {
+        let (args, _) = staged_net(socket_stage(
+            &mut user,
+            canonical,
+            [SOCKET_FD, msgvec, (1 << 32) | 1, MSG_DONTWAIT, 0, 0],
+        ));
+        assert_eq!(args[2], 1, "{canonical:?}");
+        let (args, segments) = staged_net(socket_stage(
+            &mut user,
+            canonical,
+            [SOCKET_FD, msgvec, 1 << 32, MSG_DONTWAIT, 0, 0],
+        ));
+        assert_eq!((args[2], segments.len()), (0, 0), "{canonical:?}");
+    }
+}
+
+/// #2418 review P0-5: a message call declares as output exactly the
+/// header fields Linux writes back (a received message's `msg_namelen`
+/// when it has a name, `msg_controllen` and `msg_flags`; a batched
+/// message's `msg_len`), so completion never copies back the rest of the
+/// header (`msg_iov`, `msg_control`, padding) from the snapshot staging
+/// took. Output ranges that overlap one another have no single answer a
+/// copy-back can give and are refused. Red before: the whole header was
+/// one output segment.
+#[test]
+fn a_message_header_declares_only_the_fields_linux_writes_back() {
+    use crate::crossing::nr;
+    let header = msghdr(BASE + 0x300, 28, BASE + 0x100, 1, 0, 0);
+    let mut user = memory(&laid_out(
+        4096,
+        &[(0, &header), (0x100, &iovec(BASE + 0x200, 32))],
+    ));
+    let (_, segments) = staged_net(socket_stage(
+        &mut user,
+        nr::RECVMSG,
+        [SOCKET_FD, BASE, 0, 0, 0, 0],
+    ));
+    assert_eq!(
+        segments,
+        [
+            net_segment(BASE, 56, true, false),
+            net_segment(BASE + 8, 4, false, true),
+            net_segment(BASE + 40, 8, false, true),
+            net_segment(BASE + 48, 4, false, true),
+            net_segment(BASE + 0x100, 16, true, false),
+            net_segment(BASE + 0x200, 32, false, true),
+            net_segment(BASE + 0x300, 28, false, true),
+        ]
+    );
+    let (_, segments) = staged_net(socket_stage(
+        &mut user,
+        nr::RECVMMSG,
+        [SOCKET_FD, BASE, 1, MSG_DONTWAIT, 0, 0],
+    ));
+    assert_eq!(
+        segments[..5],
+        [
+            net_segment(BASE, 64, true, false),
+            net_segment(BASE + 8, 4, false, true),
+            net_segment(BASE + 40, 8, false, true),
+            net_segment(BASE + 48, 4, false, true),
+            net_segment(BASE + 56, 4, false, true),
+        ]
+    );
+    let (_, segments) = staged_net(socket_stage(
+        &mut user,
+        nr::SENDMMSG,
+        [SOCKET_FD, BASE, 1, 0, 0, 0],
+    ));
+    assert_eq!(
+        segments,
+        [
+            net_segment(BASE, 64, true, false),
+            net_segment(BASE + 56, 4, false, true),
+            net_segment(BASE + 0x100, 16, true, false),
+            net_segment(BASE + 0x200, 32, true, false),
+            net_segment(BASE + 0x300, 28, true, false),
+        ]
+    );
+    // Two buffers over one range, or a buffer over the header: refused.
+    for overlapping in [
+        [iovec(BASE + 0x200, 32), iovec(BASE + 0x210, 32)].concat(),
+        [iovec(BASE + 0x200, 32), iovec(BASE, 32)].concat(),
+    ] {
+        let header = msghdr(BASE + 0x300, 28, BASE + 0x100, 2, 0, 0);
+        let mut user = memory(&laid_out(4096, &[(0, &header), (0x100, &overlapping)]));
+        assert_eq!(
+            socket_stage(&mut user, nr::RECVMSG, [SOCKET_FD, BASE, 0, 0, 0, 0]),
+            None
+        );
+    }
+}
+
+/// #2418 review P0-5: the errors Linux answers for a message header
+/// before it moves anything: more than `UIO_MAXIOV` iovecs is EMSGSIZE, a
+/// negative `msg_namelen` with a name is EINVAL (without a name it is
+/// ignored), and iovec lengths whose sum overflows an `ssize_t` are
+/// EINVAL. A send reads at most a `struct sockaddr_storage` of its name.
+#[test]
+fn message_header_errors_and_name_lengths_answer_as_linux() {
+    use crate::crossing::nr;
+    let stage = |header: &[u8], iovecs: &[u8], canonical| {
+        let mut user = memory(&laid_out(8192, &[(0, header), (0x100, iovecs)]));
+        socket_stage(&mut user, canonical, [SOCKET_FD, BASE, 0, 0, 0, 0])
+    };
+    let one = iovec(BASE + 0x1000, 8);
+    for canonical in [nr::SENDMSG, nr::RECVMSG] {
+        assert_eq!(
+            stage(&msghdr(0, 0, BASE + 0x100, 1025, 0, 0), &one, canonical),
+            returned(carrick_syscall_abi::LINUX_EMSGSIZE),
+            "{canonical:?}"
+        );
+        assert_eq!(
+            stage(
+                &msghdr(BASE + 0x800, 0x8000_0000, BASE + 0x100, 1, 0, 0),
+                &one,
+                canonical
+            ),
+            returned(carrick_syscall_abi::LINUX_EINVAL),
+            "{canonical:?}"
+        );
+        staged_net(stage(
+            &msghdr(0, 0x8000_0000, BASE + 0x100, 1, 0, 0),
+            &one,
+            canonical,
+        ));
+        let overflowing = [
+            iovec(BASE + 0x1000, i64::MAX as u64),
+            iovec(BASE + 0x1000, 1),
+        ]
+        .concat();
+        assert_eq!(
+            stage(
+                &msghdr(0, 0, BASE + 0x100, 2, 0, 0),
+                &overflowing,
+                canonical
+            ),
+            returned(carrick_syscall_abi::LINUX_EINVAL),
+            "{canonical:?}"
+        );
+    }
+    let (_, segments) = staged_net(stage(
+        &msghdr(BASE + 0x800, 200, BASE + 0x100, 1, 0, 0),
+        &one,
+        nr::SENDMSG,
+    ));
+    assert_eq!(
+        segments.last(),
+        Some(&net_segment(BASE + 0x800, 128, true, false))
+    );
+}
+
+/// #2418 review P0-5: a `sendmsg` or `sendmmsg` that fails EPIPE owes its
+/// caller SIGPIPE unless the call passed `MSG_NOSIGNAL`, as `send` does;
+/// a receive never does.
+#[test]
+fn a_message_send_that_fails_epipe_owes_sigpipe_unless_msg_nosignal() {
+    use crate::crossing::nr;
+    let bytes = laid_out(
+        4096,
+        &[
+            (0, &msghdr(0, 0, BASE + 0x100, 1, 0, 0)),
+            (0x100, &iovec(BASE + 0x200, 4)),
+        ],
+    );
+    let epipe = carrick_syscall_abi::LINUX_EPIPE.guest_retval();
+    for (canonical, flags, args, owed) in [
+        (nr::SENDMSG, 0, [SOCKET_FD, BASE, 0, 0, 0, 0], true),
+        (
+            nr::SENDMSG,
+            0x4000,
+            [SOCKET_FD, BASE, 0x4000, 0, 0, 0],
+            false,
+        ),
+        (nr::SENDMMSG, 0, [SOCKET_FD, BASE, 1, 0, 0, 0], true),
+        (
+            nr::SENDMMSG,
+            0x4000,
+            [SOCKET_FD, BASE, 1, 0x4000, 0, 0],
+            false,
+        ),
+        (nr::RECVMSG, 0, [SOCKET_FD, BASE, 0, 0, 0, 0], false),
+    ] {
+        let mut user = memory(&bytes);
+        let mut record = socket_record(&mut user, canonical, args).into_vec();
+        serve_socket(&mut record, epipe, STREAM);
+        assert_eq!(
+            sigpipe_on_epipe(&record),
+            owed,
+            "{canonical:?} with flags {flags:#x}"
+        );
+    }
 }

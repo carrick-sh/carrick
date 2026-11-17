@@ -3252,6 +3252,71 @@ mod recvmmsg_tests {
         );
     }
 
+    /// #2418 review P0-3: once an entry is received, a later entry that
+    /// fails ends the call with the count received, as Linux's recvmmsg
+    /// answers; only a failing first entry is the call's own error. Here
+    /// entry 1's `msg_len` is past the caller's memory, so the write of its
+    /// length fails after its datagram was received. Red before: EFAULT,
+    /// with both datagrams consumed.
+    #[test]
+    fn recvmmsg_answers_the_count_received_before_a_failing_entry() {
+        use crate::dispatch::{CompatReporter, SyscallArgs, SyscallRequest};
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let base = 0x1000u64;
+        let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
+        let mut call = |nr: u64, args: [u64; 6], memory: &mut LinearMemory| match dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(nr, SyscallArgs::from(args)),
+                memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value as i64,
+            DispatchOutcome::Errno { errno } => errno.guest_retval(),
+            other => panic!("syscall {nr}: {other:?}"),
+        };
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = call(198, [2, 2, 0, 0, 0, 0], &mut memory);
+        assert!(fd >= 0, "socket: {fd}");
+        let fd = fd as u64;
+        let mut address = [0u8; 16];
+        address[..2].copy_from_slice(&2u16.to_le_bytes());
+        address[2..4].copy_from_slice(&server.local_addr().unwrap().port().to_be_bytes());
+        address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        memory.write_bytes(base, &address).unwrap();
+        assert_eq!(call(203, [fd, base, 16, 0, 0, 0], &mut memory), 0);
+        memory.write_bytes(base + 0x100, b"q").unwrap();
+        for _ in 0..2 {
+            assert_eq!(call(206, [fd, base + 0x100, 1, 0, 0, 0], &mut memory), 1);
+            let mut query = [0u8; 8];
+            let (_, from) = server.recv_from(&mut query).unwrap();
+            server.send_to(b"R", from).unwrap();
+        }
+        // Entry 1's header is the memory's last 56 bytes: its `msg_len`
+        // is past the end.
+        let msgvec = base + 0x1000 - 120;
+        let mut header = [0u8; 56];
+        header[16..24].copy_from_slice(&(base + 0x200).to_le_bytes());
+        header[24..32].copy_from_slice(&1u64.to_le_bytes());
+        memory.write_bytes(msgvec, &header).unwrap();
+        memory.write_bytes(msgvec + 64, &header).unwrap();
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(base + 0x300).to_le_bytes());
+        iov[8..].copy_from_slice(&32u64.to_le_bytes());
+        memory.write_bytes(base + 0x200, &iov).unwrap();
+        let dontwait = LinuxMsgFlags::DONTWAIT.bits() as u64;
+        assert_eq!(call(243, [fd, msgvec, 2, dontwait, 0, 0], &mut memory), 1);
+        assert_eq!(
+            memory.read_bytes(msgvec + 56, 4).unwrap(),
+            1u32.to_le_bytes()
+        );
+        assert_eq!(memory.read_bytes(base + 0x300, 1).unwrap(), b"R");
+    }
+
     #[test]
     fn recvmmsg_null_timeout_is_not_validated() {
         // A NULL timeout pointer is the common case and must NOT be treated as a
