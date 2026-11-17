@@ -32,3 +32,14 @@ fn exception_closure_red_witness() {
         );
     }
 }
+
+#[test]
+fn transfer_extract_closure_red_witness() {
+    for word in [0xf8400800, 0xf8000800, 0x93c10020] {
+        assert_ne!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
