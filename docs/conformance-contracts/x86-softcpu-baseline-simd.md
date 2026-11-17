@@ -49,11 +49,11 @@ CARRICK_CPUID_WITNESS_SHARED=1 cargo test -p carrick-softcpu-x86 \
   --test softcpu_level0 advertised_bit_allowlist -- --nocapture
 ```
 
-This is deliberately a failing diagnostic until the remaining advertised
-families execute. This slice reports seven #UD families: PCLMULQDQ, FMA,
-MOVBE, AES-NI, F16C, BMI1 and BMI2. They need follow-up implementation and
-semantic witnesses before #1472 switches to the shared view. No failure is
-accepted as execution and no known-gap list suppresses the diagnostic.
+This diagnostic passes after the merged v3 execution work (#1469/#1534).
+Confirmed on an x86 host with the command above for #1557. PCLMULQDQ, FMA,
+MOVBE, AES-NI, F16C, BMI1 and BMI2 now have execution and semantic witnesses.
+No failure is accepted as execution and no known-gap list suppresses the
+diagnostic.
 
 The obscure SSE/SSE2 tail also remains unproved: e.g. COMISS, RSQRTPS/SS,
 RCPSS, other packed/scalar conversion variants, packed saturating arithmetic,
@@ -77,3 +77,23 @@ dispatch in `context.rs`. Baseline leaves check host SSE/SSE2 explicitly;
 the v3 host-feature match otherwise rejected them before execution. The
 control checks retain v3 feature gating and exempt integer MOVNTI from
 vector-state controls. Guest CPUID defaults remain unchanged.
+
+
+Review follow-ups (#1557): host CLFSH discovery is shared once across all
+contexts. The production preparation witness was red with 16 extra CPUID
+queries across 16 subsequent preparations and now requires zero. Unsupported
+host refusal and the existing guest CPUID revocation witness remain enforced.
+
+The MMX native FXSAVE-image coverage witness compares all eight 80-bit ST
+values (including bits 79:64), control/status/tags and memory for MOVQ
+load/register/store, PADDB and EMMS, at TOP 0, 3 and 7. It passes against
+unchanged main implementation: this is coverage, not evidence of a model bug.
+Native metadata is compared before/after the instruction, and nonzero virtual
+FIP/FOP/FDP must remain unchanged. This distinction matters on the AMD host,
+where native save/restore canonicalizes the supplied pointer fields to zero;
+the test does not claim native preservation of nonzero pointer fields there.
+The authority remains Intel SDM MMX/x87 state semantics and native execution.
+
+The removed early baseline-SSE exclusion is redundant: avx::supported includes
+baseline_sse directly, except TZCNT/LZCNT, neither of which is a baseline-SSE
+mnemonic. This is a predicate simplification with no admission change.

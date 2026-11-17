@@ -190,6 +190,26 @@ pub enum DeferredRelease {
     Deferred(OfdKey),
 }
 
+/// One descriptor retired under its table's lock (close(2), or the one a
+/// dup2(2)/dup3(2) replaced): its description's final-reference outcome
+/// and the file that description named, read in the same acquisition.
+/// fcntl(2): a close of any descriptor of a file ends its table's record
+/// locks on that file, so the venue releases them for exactly this file,
+/// never for one sampled apart from the retirement.
+#[must_use = "a retired descriptor owes its description's release and its file's record locks"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Retired {
+    pub release: DeferredRelease,
+    pub file: Option<record_lock::FileIdentity>,
+}
+impl Retired {
+    /// Nothing was retired (an empty slot, a same-number dup2).
+    pub const NONE: Self = Self {
+        release: DeferredRelease::None,
+        file: None,
+    };
+}
+
 /// Exact identity of one open file description incarnation. Copyable:
 /// naming a description does not retain it (an [`OfdPin`] does).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1620,10 +1640,33 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         table: &Table<'a>,
         fd: Fd,
         release_here: impl FnOnce(Description) -> bool,
-    ) -> Result<DeferredRelease, Error> {
+    ) -> Result<Retired, Error> {
         let entry = table.entry(fd)?;
+        self.retire_entry_filtered(table, fd, entry.ofd, release_here)
+    }
+
+    /// Vacate `fd`, whose entry names `ofd`, under the table's lock: the
+    /// file is read before the hold drops (a final drop clears it).
+    fn retire_entry_filtered(
+        &self,
+        table: &Table<'a>,
+        fd: Fd,
+        ofd: u32,
+        release_here: impl FnOnce(Description) -> bool,
+    ) -> Result<Retired, Error> {
+        let file = self.ofd_file(ofd);
         table.storage.vacate(fd.0 as usize);
-        self.drop_hold_filtered(entry.ofd, REF, release_here)
+        Ok(Retired {
+            release: self.drop_hold_filtered(ofd, REF, release_here)?,
+            file,
+        })
+    }
+
+    /// The file description `ofd` names, when it was opened with one.
+    fn ofd_file(&self, ofd: u32) -> Option<record_lock::FileIdentity> {
+        self.backing
+            .ofd_identity(ofd as usize)
+            .and_then(record_lock::OfdIdentityRecord::identity)
     }
 
     fn publish(&self, index: usize, limit: usize, storage: Extent) -> TableId {
@@ -1769,6 +1812,27 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             .ofd_identity(pin.key.index as usize)
             .and_then(record_lock::OfdIdentityRecord::identity))
     }
+    /// Whether `fd` still names the pinned description. Lock-free like
+    /// [`Self::get`]: a venue that just took a record lock through `fd`
+    /// asks this under its lock table's exclusion, so a close that retired
+    /// `fd` first is seen here and a later one releases the lock itself.
+    pub fn names_pinned(&self, table: TableId, fd: Fd, pin: &OfdPin) -> Result<bool, Error> {
+        self.check_pin(pin)?;
+        let mut attempt: u32 = 0;
+        loop {
+            let (record, seq, storage) = self.read_table(table)?;
+            let entry = Self::slot(&storage, fd);
+            if Self::slot(&storage, fd) == entry && record.unchanged_since(seq) {
+                // The pin keeps its description's index from reuse.
+                return Ok(entry.is_some_and(|entry| entry.ofd == pin.key.index));
+            }
+            attempt = attempt.saturating_add(1);
+            if !self.wait.wait(attempt) {
+                return Err(Error::Contended);
+            }
+        }
+    }
+
     /// O(1) read-only snapshot, taking no lock (see [`TableRecord`]); it
     /// retains nothing. `Contended` only while a writer keeps changing the
     /// table's extent or identity past the wait policy.
@@ -2029,7 +2093,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         new: Fd,
         cloexec: bool,
         release_here: impl FnOnce(Description) -> bool,
-    ) -> Result<DeferredRelease, Error> {
+    ) -> Result<Retired, Error> {
         if new.0 < 0 || new.0 as usize >= t.limit {
             return Err(Error::BadFd);
         }
@@ -2044,8 +2108,8 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         let covered = self.cover(new.0 as usize)?;
         self.retain(ofd, REF)?;
         let released = match self.close_locked_filtered(t, new, release_here) {
-            Ok(d) => d,
-            Err(Error::BadFd) => DeferredRelease::None,
+            Ok(retired) => retired,
+            Err(Error::BadFd) => Retired::NONE,
             Err(e) => return Err(e),
         };
         t.storage.install(covered, Entry { ofd, cloexec });
@@ -2060,11 +2124,11 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         old: Fd,
         new: Fd,
         release_here: impl FnOnce(Description) -> bool,
-    ) -> Result<DeferredRelease, Error> {
+    ) -> Result<Retired, Error> {
         let (_guard, t) = self.lock(table)?;
         let entry = t.entry(old)?;
         if old == new {
-            return Ok(DeferredRelease::None);
+            return Ok(Retired::NONE);
         }
         self.replace_exact_filtered(&t, entry.ofd, new, false, release_here)
     }
@@ -2078,7 +2142,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         new: Fd,
         cloexec: bool,
         release_here: impl FnOnce(Description) -> bool,
-    ) -> Result<DeferredRelease, Error> {
+    ) -> Result<Retired, Error> {
         if old == new {
             return Err(Error::InvalidArgument);
         }
@@ -2094,7 +2158,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         table: TableId,
         fd: Fd,
         release_here: impl FnOnce(Description) -> bool,
-    ) -> Result<DeferredRelease, Error> {
+    ) -> Result<Retired, Error> {
         let (_guard, t) = self.lock(table)?;
         self.close_locked_filtered(&t, fd, release_here)
     }
@@ -2308,8 +2372,9 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         let (_guard, t) = self.lock(table)?;
         for fd in 0..t.storage.capacity() {
             if t.storage.get(fd).is_some_and(|entry| entry.cloexec)
-                && let DeferredRelease::Now(description) =
-                    self.close_locked_filtered(&t, Fd(fd as i32), |_| release_here)?
+                && let DeferredRelease::Now(description) = self
+                    .close_locked_filtered(&t, Fd(fd as i32), |_| release_here)?
+                    .release
             {
                 release(description);
             }

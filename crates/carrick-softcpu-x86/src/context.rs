@@ -543,6 +543,28 @@ pub enum AdmitRefused {
     Terminal,
 }
 
+// Host capabilities are immutable; guest feature admission remains per execution.
+fn discover_host_clflush() -> bool {
+    #[cfg(test)]
+    CLFLUSH_DISCOVERIES.with(|count| count.set(count.get() + 1));
+    std::arch::x86_64::__cpuid(1).edx & (1 << 19) != 0
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLFLUSH_DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CLFLUSH_UNAVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn host_clflush_supported() -> bool {
+    #[cfg(test)]
+    if CLFLUSH_UNAVAILABLE.with(|missing| missing.get()) {
+        return false;
+    }
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(discover_host_clflush)
+}
+
 impl SoftCpuContext {
     /// A context seated in `extents`' invalidation domain. Its TLB starts
     /// empty and the CPU starts parked.
@@ -896,9 +918,7 @@ impl SoftCpuContext {
         for (index, d) in planned.insns.iter().enumerate() {
             // CLFLUSH is separately enumerated by host CPUID even on x86_64.
             // Refuse preparation rather than allowing a host #UD in the helper.
-            if d.raw.mnemonic() == Mnemonic::Clflush
-                && std::arch::x86_64::__cpuid(1).edx & (1 << 19) == 0
-            {
+            if d.raw.mnemonic() == Mnemonic::Clflush && !host_clflush_supported() {
                 return Err(EmitError::EncodeFailed {
                     va: d.va,
                     detail: "CLFLUSH requires a CLFSH-capable same-ISA host".into(),
@@ -2956,6 +2976,40 @@ mod tests {
             cpu.execute_planned_block(&planned, &mut NoMemory).unwrap();
         }
         crate::cpu::JIT_ALLOCATIONS.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    fn clflush_block() -> crate::block::PlannedBlock {
+        let mut planned = fp_block();
+        planned.insn_bytes[0][..3].copy_from_slice(&[0x0f, 0xae, 0x38]);
+        planned.insns[0] =
+            crate::decode::classify(&planned.insn_bytes[0][..3], planned.start).unwrap();
+        planned
+    }
+
+    #[test]
+    fn clflush_host_discovery_is_once_across_contexts_and_blocks() {
+        let planned = clflush_block();
+        let mut ctx = SoftCpuContext::new(&test_extents()).unwrap();
+        ctx.prepare_block(&planned).unwrap();
+        CLFLUSH_DISCOVERIES.with(|count| count.set(0));
+        for _ in 0..8 {
+            let mut peer = SoftCpuContext::new(&test_extents()).unwrap();
+            peer.prepare_block(&planned).unwrap();
+            ctx.prepare_block(&planned).unwrap();
+        }
+        CLFLUSH_DISCOVERIES.with(|count| assert_eq!(count.get(), 0));
+    }
+
+    #[test]
+    fn clflush_unsupported_host_refuses_preparation() {
+        let mut ctx = SoftCpuContext::new(&test_extents()).unwrap();
+        CLFLUSH_UNAVAILABLE.with(|missing| missing.set(true));
+        let result = ctx.prepare_block(&clflush_block());
+        CLFLUSH_UNAVAILABLE.with(|missing| missing.set(false));
+        assert!(matches!(
+            result,
+            Err(crate::emit::EmitError::EncodeFailed { .. })
+        ));
     }
 
     #[test]

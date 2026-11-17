@@ -12,8 +12,13 @@
 //! description, enrols on the lock object's `Readable` lane under the
 //! table's lock and parks. Every release publishes that lane; a woken call
 //! re-enters with its original registers, takes its operation back before
-//! any descriptor lookup, and probes the table once more. A signal ends the
-//! wait with EINTR, restartable under `SA_RESTART` (signal(7)).
+//! any descriptor lookup (its routing asks for that operation first, too),
+//! and probes the table once more for the request the operation recorded
+//! at entry, never a re-read of the caller's `struct flock`. A record lock
+//! taken through a descriptor that no longer names the pinned description
+//! (another thread closed or replaced it) is given back: EBADF, as Linux
+//! answers. A signal ends the wait with EINTR, restartable under
+//! `SA_RESTART` (signal(7)).
 //!
 //! Not served here (left a counted ENOSYS): an `l_whence` of `SEEK_CUR` or
 //! `SEEK_END`, whose base lives with the host description, and a
@@ -27,7 +32,7 @@ use crate::dispatch::GuestDispatchFrame;
 use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::from_sched_token;
 use carrick_el1_abi::ipc::fd::record_lock::{
-    Lock, LockClass, LockKind, LockOwner, LockPid, LockRange, SetRefusal,
+    Lock, LockClass, LockKind, LockOwner, LockPid, LockRange, LockRequest, SetRefusal,
 };
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::WaitFor;
@@ -264,10 +269,26 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
     };
 
     // Input after the descriptor (EBADF first, as Linux) and before any
-    // effect.
+    // effect. A woken wait reruns the request it parked with: fcntl(2)
+    // copies `struct flock` in once, so a later rewrite of the caller's
+    // memory by another thread changes nothing about this call.
     let mut flock = carrick_abi::LinuxFlock64::default();
-    let request = match call {
-        LockCall::Flock { kind, wait } => {
+    let parked = retained
+        .as_ref()
+        .map(|(_, op)| LockRequest::from_raw(op.lock));
+    let request = match (call, parked) {
+        (
+            LockCall::Flock { wait, .. } | LockCall::Set { wait, .. },
+            Some(Some(LockRequest { kind, range })),
+        ) => (Wanted::Lock(kind), range, wait),
+        // Only a blocking lock request parks, and it records its request.
+        (_, Some(_)) => {
+            if let Some((token, _)) = retained.take() {
+                retain_native_operation(sched, token);
+            }
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+        }
+        (LockCall::Flock { kind, wait }, None) => {
             if !LockCall::valid_flock_operation(arg1) {
                 return finish_with(
                     sched,
@@ -284,7 +305,7 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
                 wait,
             )
         }
-        LockCall::Query { ofd } | LockCall::Set { ofd, .. } => {
+        (LockCall::Query { ofd } | LockCall::Set { ofd, .. }, None) => {
             let bytes = zerocopy::IntoBytes::as_mut_bytes(&mut flock);
             if !user.copy_in(bytes, arg2) {
                 if user.has_copyin_refusal() && retained.is_none() {
@@ -434,8 +455,42 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
             return finish_with(sched, frame, region, retained.take(), fresh_pin.take(), 0);
         }
         let outcome = locks.table().set(request, &owners);
-        let wake = outcome.released.then(|| notify_released(sched, &mut locks));
+        let mut wake = outcome.released.then(|| notify_released(sched, &mut locks));
+        // A record lock taken through a descriptor another thread of the
+        // table closed or replaced meanwhile (fcntl(2): its close released
+        // the table's locks on the file before this one existed) is given
+        // back: EBADF, as Linux answers. Asked under the lock table's
+        // exclusion: a close that retires the descriptor after this answer
+        // releases the lock itself. A table the answer could not be read
+        // from leaves nothing taken either: the call is refused as any
+        // other contended lookup here.
+        let stale = match outcome.taken {
+            Ok(()) if matches!(owner, LockOwner::Table { .. }) => names_description(
+                &authority,
+                table,
+                Fd(fd_arg as i32),
+                retained.as_ref().map(|(_, op)| op.pin),
+                fresh_pin.as_ref(),
+            )
+            .map(|names| !names),
+            _ => Ok(false),
+        };
+        if stale != Ok(false)
+            && !matches!(locks.table().unlock(file, owner, class, range), Ok(false))
+            && wake.is_none()
+        {
+            wake = Some(notify_released(sched, &mut locks));
+        }
+        if stale.is_err() {
+            drop(locks);
+            if let Some(effects) = wake {
+                finish_wakes(sched, effects);
+            }
+            drop_hold(sched, region, retained.take(), fresh_pin.take());
+            return IpcServed::Forward;
+        }
         let blocked = match outcome.taken {
+            Ok(()) if stale == Ok(true) => Some(ebadf),
             Ok(()) => None,
             Err(SetRefusal::Full) => Some(carrick_abi::LINUX_ENOLCK.guest_retval()),
             Err(SetRefusal::Conflict(_)) if !blocking => {
@@ -478,6 +533,7 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
                             buf: IpcUserVa(arg2),
                             orig_x0: fd_arg,
                             nr: syscall_nr,
+                            lock: LockRequest { kind, range }.into_raw(),
                             ..IpcOperation::EMPTY
                         };
                         match region.begin_operation(op) {
@@ -526,6 +582,27 @@ pub(crate) fn serve_file_lock<E: IpcExecution, M: UserCopy>(
             fresh_pin.take(),
             blocked.unwrap_or(0),
         );
+    }
+}
+
+/// Whether `fd` of `table` still names the call's description: its
+/// retained wait's pin (`retained`) or its fresh one.
+fn names_description<W: carrick_el1_abi::ipc::fd::LockWait>(
+    authority: &carrick_el1_abi::ipc::IpcFdAuthority<'_, W>,
+    table: TableId,
+    fd: Fd,
+    retained: Option<carrick_el1_abi::ipc::RawOfdPin>,
+    fresh: Option<&OfdPin>,
+) -> Result<bool, FdError> {
+    match (retained, fresh) {
+        (_, Some(pin)) => authority.names_pinned(table, fd, pin),
+        (Some(raw), None) => {
+            let pin = OfdPin::from_raw(raw);
+            let names = authority.names_pinned(table, fd, &pin);
+            let _ = pin.into_raw();
+            names
+        }
+        (None, None) => Err(FdError::StalePin),
     }
 }
 
