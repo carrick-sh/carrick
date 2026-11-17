@@ -484,6 +484,46 @@ fn native_fork_child_execs_static_successor() {
     assert!(outcome.run.stderr.is_empty());
 }
 
+/// #2441: Go's build forks and execs a compile or link tool per package. A
+/// parent's fork (or vfork), exec and reap cycles, and rounds of four
+/// concurrently live exec'd children, keep succeeding through the production
+/// fork, exec and exit path: each round's stock loan, child space and fork
+/// scratch (on this ISA's fixed, grant-less kernel heap) return when its
+/// children are reaped. A leak refuses a later fork; 91 is a failed call.
+#[test]
+fn native_fork_exec_reap_cycles_keep_forking() {
+    for (flags, cycles, live) in [
+        (&[][..], 96, 1),
+        (&[][..], 24, 4),
+        (&["-DVFORK=1"][..], 96, 1),
+        (&["-DVFORK=1"][..], 24, 4),
+    ] {
+        let directory = tempfile::tempdir().expect("successor directory");
+        let successor = directory.path().join("successor");
+        let marker = native_exit_fixture("native_exec_marker.S");
+        carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+        let mut defines = vec![
+            format!("-DSUCCESSOR_PATH=\"{}\"", successor.display()),
+            format!("-DCYCLES={cycles}"),
+            format!("-DLIVE={live}"),
+        ];
+        defines.extend(flags.iter().map(|flag| flag.to_string()));
+        let defines: Vec<&str> = defines.iter().map(String::as_str).collect();
+        let elf = native_exit_fixture_with_flags("native_fork_exec.S", &defines);
+        let outcome = run_exec_fixture(&elf, 32 * cycles * live);
+        assert_eq!(
+            outcome.run.exit_code, 0,
+            "{flags:?} {cycles} x {live}: a fork, exec or reap failed: {:?}",
+            outcome.run
+        );
+        assert_eq!(
+            outcome.run.stdout,
+            b"X\n".repeat(cycles * live),
+            "{flags:?} {cycles} x {live}: every child exec'd its successor"
+        );
+    }
+}
+
 /// #2235: a child's exec refused before the arm returns execve(2)'s errno
 /// and the child's old image runs on: it exits with that errno, which the
 /// parent collects and propagates. Missing is ENOENT (2); a non-ELF file is
