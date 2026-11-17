@@ -449,7 +449,7 @@ fn main_push_skips_the_mac_gate_only_when_its_merge_group_sealed_it() {
         assert!(
             jobs[job]["if"]
                 .as_str()
-                .map_or(true, |c| !c.contains("always()")),
+                .is_none_or(|c| !c.contains("always()")),
             "{job} must not run when base-fixtures is skipped"
         );
     }
