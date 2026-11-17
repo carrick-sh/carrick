@@ -1,7 +1,7 @@
 //! Optional differential oracle. LLVM is a test oracle, never a decode dependency.
 //! Invoke with CARRICK_LLVM_OBJDUMP pointing at the Rust-sysroot llvm-objdump.
 use carrick_softcpu_aarch64::*;
-use std::{collections::BTreeSet, fmt::Write as _, process::Command};
+use std::{collections::BTreeSet, process::Command};
 
 fn reg(r: OperandRegister, width: Width) -> String {
     let prefix = if width == Width::X64 { 'x' } else { 'w' };
@@ -30,7 +30,7 @@ fn expected(a: Arithmetic) -> String {
     );
     match a.operand {
         ArithmeticOperand::Immediate(i) => {
-            write!(s, "#0x{:x}", i.encoded()).expect("valid differential fixture");
+            s.push_str(&format!("#0x{:x}", i.encoded()));
             if i.shift().value() != 0 {
                 s.push_str(", lsl #12");
             }
@@ -45,7 +45,7 @@ fn expected(a: Arithmetic) -> String {
                     Shift::Asr => "asr",
                     Shift::Ror => "ror",
                 };
-                write!(s, ", {name} #{}", amount.value()).expect("valid differential fixture");
+                s.push_str(&format!(", {name} #{}", amount.value()));
             }
         }
         ArithmeticOperand::Extended { rm, extend, amount } => {
@@ -60,7 +60,7 @@ fn expected(a: Arithmetic) -> String {
             if sp_lsl {
                 s.push_str(&reg(rm, width));
                 if amount.value() != 0 {
-                    write!(s, ", lsl #{}", amount.value()).expect("valid differential fixture");
+                    s.push_str(&format!(", lsl #{}", amount.value()));
                 }
                 return s;
             }
@@ -74,9 +74,9 @@ fn expected(a: Arithmetic) -> String {
                 Extend::Sxtw => "sxtw",
                 Extend::Sxtx => "sxtx",
             };
-            write!(s, "{}, {name}", reg(rm, width)).expect("valid differential fixture");
+            s.push_str(&format!("{}, {name}", reg(rm, width)));
             if amount.value() != 0 {
-                write!(s, " #{}", amount.value()).expect("valid differential fixture");
+                s.push_str(&format!(" #{}", amount.value()));
             }
         }
     }
