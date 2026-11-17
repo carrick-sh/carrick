@@ -614,6 +614,8 @@ mod instruction {
         Arithmetic(Arithmetic),
         Branch(Branch),
         ScalarMemory(ScalarMemory),
+        UnprivilegedMemory(ScalarMemory),
+        Extract(crate::Extract),
         PairMemory(PairMemory),
         Logical(Logical),
         MoveWide(MoveWide),
@@ -663,7 +665,11 @@ mod instruction {
             return Instruction::Branch(b);
         }
         if let Some(m) = scalar_memory(word).or_else(|| literal_memory(word)) {
-            return Instruction::ScalarMemory(m);
+            return if word & 0x3f200c00 == 0x38000800 {
+                Instruction::UnprivilegedMemory(m)
+            } else {
+                Instruction::ScalarMemory(m)
+            };
         }
         if let Some(m) = pair_memory(word) {
             return Instruction::PairMemory(m);
@@ -791,7 +797,10 @@ mod instruction {
     /// C7.2.191/193/194 LDR/LDUR and C7.2.331/332 STR (SIMD&FP).
     /// Encoding index C4.1.4, pp. C4-312–317, C4-325–327:
     /// unscaled, pre/post-indexed, register offset, unsigned immediate.
-    /// Prefetch and unprivileged forms are deliberately unsupported.
+    /// C6.2.156–161 LDTR/B/H/SB/SH/SW, C6.2.293–295 STTR/B/H;
+    /// C4.1.4 Load/store register (unprivileged) encoding index.
+    /// Unprivileged forms share the offset decode and have a distinct Instruction.
+    /// Prefetch forms are deliberately unsupported.
     fn scalar_memory(w: u32) -> Option<ScalarMemory> {
         if w & 0x3b000000 != 0x39000000 && w & 0x3b000000 != 0x38000000 {
             return None;
@@ -857,6 +866,7 @@ mod instruction {
         } else {
             let index = match (w >> 10) & 3 {
                 0 => MemoryIndex::Offset,
+                2 if !vector => MemoryIndex::Offset,
                 1 => MemoryIndex::Post,
                 3 => MemoryIndex::Pre,
                 _ => return None,
