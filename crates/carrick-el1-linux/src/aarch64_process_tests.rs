@@ -19694,6 +19694,133 @@ fn serial_host_arm_lock_waiter_goes_on_with_its_description_after_a_sibling_repl
     );
 }
 
+/// #2452 director ruling, item 2: a record lock asked through a
+/// descriptor a sibling replaced is never taken, so nothing is ever given
+/// back, even when the lock table is full. B parks in F_SETLKW on [0, 1);
+/// a thread sharing B's table dup2s a pipe over B's descriptor; C fills
+/// the table until F_SETLK is ENOLCK (its capacity); A's unlock frees one
+/// record, which C takes again. B's rerun, with nothing blocking it,
+/// answers EBADF and holds nothing, as Linux's (native oracle for #2452
+/// review P0-2: EBADF once the lock is free; Linux has no fixed table).
+/// Red on 3f83746a7: the rerun took the lock first and the full table
+/// refused it, ENOLCK.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_arm_replaced_lock_waiter_with_a_full_lock_table_answers_ebadf() {
+    use carrick_abi::{
+        LINUX_F_GETLK, LINUX_F_SETLK, LINUX_F_SETLKW, LINUX_F_UNLCK, LINUX_F_WRLCK, LinuxFlock64,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute::{self, Suspended};
+    use carrick_test_support::GuestUserBuffer;
+
+    let enolck = carrick_abi::LINUX_ENOLCK.guest_retval();
+    let (steps, _) = with_arm_process_host_dispatch(|call| {
+        let [a, b, c] = arm_three_lock_processes(call);
+        let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-2452-full-table-lock\0");
+        let (fa, fb, fc) = (
+            arm_open_lock_file(call, a, &path),
+            arm_open_lock_file(call, b, &path),
+            arm_open_lock_file(call, c, &path),
+        );
+        let pipe = GuestUserBuffer::zeroed(8);
+        let (_, made) = call(b, sys::PIPE2.raw(), [pipe.arg(), 0, 0, 0, 0, 0]);
+        assert_eq!(made, 0, "B pipe2");
+        let reader = u64::from(pipe.values::<u32>()[0]);
+        let byte = |l_type: i32, l_start: i64| {
+            GuestUserBuffer::from_value(LinuxFlock64 {
+                l_type: l_type as i16,
+                l_start,
+                l_len: 1,
+                ..Default::default()
+            })
+        };
+        let (write, unlock) = (byte(LINUX_F_WRLCK, 0), byte(LINUX_F_UNLCK, 0));
+        let fcntl = sys::FCNTL.raw();
+        let mut steps: Vec<(&'static str, bool, i64)> = Vec::new();
+        let mut step = |what, got: (CompletionRoute, i64)| {
+            let parked = got.0 == Suspended;
+            steps.push((what, parked, if parked { 0 } else { got.1 }));
+        };
+        step(
+            "A F_SETLK [0, 1)",
+            call(a, fcntl, [fa, LINUX_F_SETLK, write.arg(), 0, 0, 0]),
+        );
+        call(b, ARM_LEAVE_ON_PARK, [0; 6]);
+        step(
+            "B F_SETLKW [0, 1) parks",
+            call(b, fcntl, [fb, LINUX_F_SETLKW, write.arg(), 0, 0, 0]),
+        );
+        step(
+            "B's sibling dup2s a pipe over the fd",
+            call(b, ARM_SIBLING_DUP2, [reader, fb, 0, 0, 0, 0]),
+        );
+        // C's locks on separate bytes [2i, 2i + 1) never merge: one record
+        // each, until the table refuses one.
+        let mut next = 1;
+        let filled = loop {
+            assert!(
+                next <= carrick_el1_abi::ipc::IPC_FILE_LOCKS as i64,
+                "the lock table never filled"
+            );
+            let lock = byte(LINUX_F_WRLCK, 2 * next);
+            let (_, got) = call(c, fcntl, [fc, LINUX_F_SETLK, lock.arg(), 0, 0, 0]);
+            next += 1;
+            if got != 0 {
+                break got;
+            }
+        };
+        step(
+            "C fills the table: F_SETLK",
+            (CompletionRoute::Served, filled),
+        );
+        step(
+            "A unlock frees one record",
+            call(a, fcntl, [fa, LINUX_F_SETLK, unlock.arg(), 0, 0, 0]),
+        );
+        let last = byte(LINUX_F_WRLCK, 2 * next);
+        step(
+            "C takes it: the table is full again",
+            call(c, fcntl, [fc, LINUX_F_SETLK, last.arg(), 0, 0, 0]),
+        );
+        let woken = call(b, ARM_RESUME, [0; 6]);
+        step("B woken", (woken.0, 0));
+        step(
+            "B rerun: EBADF",
+            call(b, fcntl, [fb, LINUX_F_SETLKW, write.arg(), 0, 0, 0]),
+        );
+        let query = byte(LINUX_F_WRLCK, 0);
+        call(c, fcntl, [fc, LINUX_F_GETLK, query.arg(), 0, 0, 0]);
+        step(
+            "C F_GETLK [0, 1): l_type, B holds nothing",
+            (
+                CompletionRoute::Served,
+                i64::from(query.values::<LinuxFlock64>()[0].l_type),
+            ),
+        );
+        steps
+    });
+    let ebadf = carrick_syscall_abi::LINUX_EBADF.guest_retval();
+    assert_eq!(
+        steps,
+        [
+            ("A F_SETLK [0, 1)", false, 0),
+            ("B F_SETLKW [0, 1) parks", true, 0),
+            ("B's sibling dup2s a pipe over the fd", false, 0),
+            ("C fills the table: F_SETLK", false, enolck),
+            ("A unlock frees one record", false, 0),
+            ("C takes it: the table is full again", false, 0),
+            ("B woken", false, 0),
+            ("B rerun: EBADF", false, ebadf),
+            (
+                "C F_GETLK [0, 1): l_type, B holds nothing",
+                false,
+                i64::from(LINUX_F_UNLCK as i16)
+            ),
+        ],
+    );
+}
+
 /// #2452 review P0-3: close(2) releases the table's record locks of the
 /// file it actually retired. B holds a write lock on Y (through `m`) and
 /// closes `n`, a descriptor of X; between B's entry and the retirement a
