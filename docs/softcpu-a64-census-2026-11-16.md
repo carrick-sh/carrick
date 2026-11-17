@@ -166,3 +166,43 @@ and both real-image witnesses. To check the LLVM harness fails closed, run with
 The director-supplied hosted job is advisory initially. Its stable check name
 is `A64 census gate` (job id `a64-census-gate`); do not add it to `ci-ok` or
 branch-protection requirements until the director promotes it.
+
+## Round 2: loader/vector typed gaps
+
+After #2455 merged, the loader/vector subset still contains **2,081**
+typed-undecoded words: 10 in `loader-maintenance`, 2,071 across the 28 vector
+builder configurations. These are synthesized by `carrick-mem::memory`, not
+ELF sections or linker symbols. The production ELF's mapping-symbol spans are
+an independent population (the subject of #2471).
+
+| Class | Words | LLVM mnemonic cross-check |
+|---|---:|---|
+| Mrs | 616 | `mrs` (ELR, ESR, FAR, SPSR, SP_EL0, TPIDR, TTBR0) |
+| Msr | 427 | `msr` (ELR, ESR, FAR, SPSR, TPIDR) |
+| Eret | 598 | `eret` |
+| Hvc | 357 | `hvc #1/#2/#3/#4/#5/#7` |
+| Barrier | 78 | `dsb sy/ish/ishst`, `isb` |
+| LseAtomic | 4 | `ldaddal x17, xzr, [x16]` |
+| Tlbi | 1 | `tlbi vmalle1is` |
+
+All rejected words are real emitted instructions. No rejected word is a
+literal, zero/UDF word, NOP padding, or `.balign` filler. The builders fill
+unused vector and maintenance space explicitly with NOPs, which already decode.
+The four LSE words occur in clock transport code; LLVM notes that destination
+XZR drops acquire semantics. A future typed implementation must preserve that
+operand-dependent behavior.
+
+The 16 KiB maintenance span includes the initial maintenance/service-return
+sequence and the ASID maintenance sequence at offset `0x100`. The vector spans
+cover the 16-slot table plus identity/fstat, mailbox, clock, current-EL sync,
+EL1 vector, EL0 IRQ/signal/fault and resume-invalidation handlers. Multiplicity
+across configurations is intentional. Excluding these words as data would hide
+real decode gaps; no span fix is proposed. The detailed region/configuration
+breakdown and reproduction commands are in the round 2 PR evidence comment.
+
+The rebased production CLI run reports 2,600 spans, 458,467 words, zero
+classifier unknowns and 3,363 typed-undecoded words (1,282 in ELF `.text`,
+2,081 in synthesized loader/vector pages). Strict exits 1. Every synthesized
+span's SHA-256 and every rejected word's span/offset/encoding match the
+independent diagnostic above. These are measurements before #2471 lands,
+not a claim that the remaining decode work is closed.
