@@ -388,9 +388,9 @@ mod decode {
     /// Arm ARM DDI0487G.a, "A64 instruction set encoding", Data-processing
     /// (2 source), pp. C4-329–330; Data-processing (1 source), pp. C4-330–331;
     /// Exception generation (BRK), pp. C4-286–287; Barriers (CLREX), p. C4-289; and "A64 system instructions for address
-    /// translation" / "A64 system instructions for TLB maintenance" tables.
-    /// Only the baseline AT forms plus FEAT_PAN2 RP/WP and the EL1 VA/ASID
-    /// TLBI forms listed here are admitted; extension and reserved leaves fail shut.
+    /// translation" tables.
+    /// Only baseline AT forms plus FEAT_PAN2 RP/WP are admitted here;
+    /// TLBI uses loader::decode exclusively.
     pub fn decode(w: u32) -> Option<Decoded> {
         let rd = Register((w & 31) as u8);
         let rn = Register(((w >> 5) & 31) as u8);
