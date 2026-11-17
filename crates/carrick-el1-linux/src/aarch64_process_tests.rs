@@ -18895,7 +18895,7 @@ fn serial_host_arm_two_lock_waiters_rerun_and_park_again() {
     use carrick_personality_linux::dispatch::CompletionRoute::{self, Suspended};
     use carrick_test_support::GuestUserBuffer;
 
-    let (steps, _) = with_arm_process_window_dispatch(|call| {
+    let (steps, _) = with_arm_process_host_dispatch(|call| {
         let tmp = GuestUserBuffer::from_bytes(b"/tmp\0");
         call(
             ArmCaller::Root,
@@ -18943,10 +18943,12 @@ fn serial_host_arm_two_lock_waiters_rerun_and_park_again() {
             steps.push((what, got.0, if got.0 == Suspended { 0 } else { got.1 }));
         };
         step("A F_SETLK", call(a, fcntl, set(fa, LINUX_F_SETLK, &write)));
+        call(b, ARM_LEAVE_ON_PARK, [0; 6]);
         step(
             "B F_SETLKW parks",
             call(b, fcntl, set(fb, LINUX_F_SETLKW, &write)),
         );
+        call(c, ARM_LEAVE_ON_PARK, [0; 6]);
         step(
             "C F_SETLKW parks",
             call(c, fcntl, set(fc, LINUX_F_SETLKW, &write)),
@@ -18960,6 +18962,7 @@ fn serial_host_arm_two_lock_waiters_rerun_and_park_again() {
         );
         let woken = call(c, ARM_RESUME, [0; 6]);
         step("C woken", (woken.0, 0));
+        call(c, ARM_LEAVE_ON_PARK, [0; 6]);
         step(
             "C rerun parks again",
             call(c, fcntl, set(fc, LINUX_F_SETLKW, &write)),

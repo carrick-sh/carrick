@@ -42,12 +42,12 @@ table lock, then parks, releasing its execution capacity. Every release
 publishes that lane; the woken call takes its operation back before any
 descriptor lookup and probes once. Contention is never an errno.
 
-## IPC layout change (ABI version 8)
+## IPC layout change (ABI version 9)
 
 The directory gains, after the pipe allocator store, one
 `OfdIdentityRecord` per OFD record and the lock table (a header and
-`IPC_FILE_LOCKS` records). `IPC_MAGIC` moves to version 8 and the layout
-facts fold `record_lock::LAYOUT_FACTS` into `IPC_LAYOUT_HASH`; a version-7
+`IPC_FILE_LOCKS` records). `IPC_MAGIC` moves to version 9 and the layout
+facts fold `record_lock::LAYOUT_FACTS` into `IPC_LAYOUT_HASH`; a version-8
 magic or hash is refused at attach
 (`el1_ipc_file_lock_layout_refuses_the_previous_abi`). `IPC_DIRECTORY_BYTES`
 stays inside `EL1_IPC_DIRECTORY_SPAN` (a compile-time assertion), which
