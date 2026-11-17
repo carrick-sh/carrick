@@ -603,6 +603,7 @@ mod instruction {
         Hint(Hint),
         Arithmetic(Arithmetic),
         Branch(Branch),
+        ScalarMemory(ScalarMemory),
     }
 
     /// Arm ARM DDI0487G.a C6.2.92 HINT, C6.2.204 NOP, C6.2.354 YIELD,
@@ -638,7 +639,229 @@ mod instruction {
         if let Some(b) = branch(word) {
             return Instruction::Branch(b);
         }
+        if let Some(m) = scalar_memory(word).or_else(|| literal_memory(word)) {
+            return Instruction::ScalarMemory(m);
+        }
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
+    }
+
+    /// Transfer size in bytes (including the SIMD 128-bit form).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MemorySize {
+        Byte,
+        Half,
+        Word,
+        Double,
+        Quad,
+    }
+    impl MemorySize {
+        pub const fn bytes(self) -> u8 {
+            match self {
+                Self::Byte => 1,
+                Self::Half => 2,
+                Self::Word => 4,
+                Self::Double => 8,
+                Self::Quad => 16,
+            }
+        }
+        fn scale(scale: u32) -> Option<Self> {
+            Some(match scale {
+                0 => Self::Byte,
+                1 => Self::Half,
+                2 => Self::Word,
+                3 => Self::Double,
+                4 => Self::Quad,
+                _ => return None,
+            })
+        }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct VectorRegister(u8);
+    impl VectorRegister {
+        pub const fn number(self) -> u8 {
+            self.0
+        }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MemoryRegister {
+        Integer {
+            register: OperandRegister,
+            width: crate::Width,
+        },
+        Vector(VectorRegister),
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MemoryOperation {
+        Store,
+        Load,
+        LoadSigned,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MemoryIndex {
+        Offset,
+        Pre,
+        Post,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MemoryOffset(i32);
+    impl MemoryOffset {
+        pub const fn bytes(self) -> i32 {
+            self.0
+        }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MemoryAddress {
+        Immediate {
+            base: OperandRegister,
+            offset: MemoryOffset,
+            index: MemoryIndex,
+            unscaled: bool,
+        },
+        Register {
+            base: OperandRegister,
+            offset: OperandRegister,
+            extend: Extend,
+            scaled: bool,
+        },
+        Literal(PcOffset),
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ScalarMemory {
+        pub operation: MemoryOperation,
+        pub size: MemorySize,
+        pub register: MemoryRegister,
+        pub address: MemoryAddress,
+    }
+
+    /// DDI0487G.a C6.2.132/134 LDR, C6.2.136–146 LDRB/H/SB/SH/SW,
+    /// C6.2.168–173 LDUR/B/H/SB/SH/SW, C6.2.278–283 STR/B/H;
+    /// C7.2.191/193/194 LDR/LDUR and C7.2.331/332 STR (SIMD&FP).
+    /// Encoding index C4.1.4, pp. C4-312–317, C4-325–327:
+    /// unscaled, pre/post-indexed, register offset, unsigned immediate.
+    /// Prefetch and unprivileged forms are deliberately unsupported.
+    fn scalar_memory(w: u32) -> Option<ScalarMemory> {
+        if w & 0x3b000000 != 0x39000000 && w & 0x3b000000 != 0x38000000 {
+            return None;
+        }
+        let size = w >> 30;
+        let opc = (w >> 22) & 3;
+        let vector = w & (1 << 26) != 0;
+        let scale = if vector {
+            size | ((opc >> 1) << 2)
+        } else {
+            size
+        };
+        let size = MemorySize::scale(scale)?;
+        let operation = if vector || opc < 2 {
+            if opc & 1 != 0 {
+                MemoryOperation::Load
+            } else {
+                MemoryOperation::Store
+            }
+        } else {
+            if scale == 3 || (scale == 2 && opc == 3) {
+                return None;
+            }
+            MemoryOperation::LoadSigned
+        };
+        let register = if vector {
+            MemoryRegister::Vector(VectorRegister((w & 31) as u8))
+        } else {
+            MemoryRegister::Integer {
+                register: OperandRegister::field(w, false),
+                width: if (opc == 2) || scale == 3 {
+                    crate::Width::X64
+                } else {
+                    crate::Width::W32
+                },
+            }
+        };
+        let base = OperandRegister::field(w >> 5, true);
+        let address = if w & (1 << 24) != 0 {
+            MemoryAddress::Immediate {
+                base,
+                offset: MemoryOffset((((w >> 10) & 4095) << scale) as i32),
+                index: MemoryIndex::Offset,
+                unscaled: false,
+            }
+        } else if w & (1 << 21) != 0 {
+            if w & 0xc00 != 0x800 {
+                return None;
+            }
+            let extend = match (w >> 13) & 7 {
+                2 => Extend::Uxtw,
+                3 => Extend::Uxtx,
+                6 => Extend::Sxtw,
+                7 => Extend::Sxtx,
+                _ => return None,
+            };
+            MemoryAddress::Register {
+                base,
+                offset: OperandRegister::field(w >> 16, false),
+                extend,
+                scaled: w & 0x1000 != 0,
+            }
+        } else {
+            let index = match (w >> 10) & 3 {
+                0 => MemoryIndex::Offset,
+                1 => MemoryIndex::Post,
+                3 => MemoryIndex::Pre,
+                _ => return None,
+            };
+            MemoryAddress::Immediate {
+                base,
+                offset: MemoryOffset(((w << 11) as i32) >> 23),
+                index,
+                unscaled: index == MemoryIndex::Offset,
+            }
+        };
+        Some(ScalarMemory {
+            operation,
+            size,
+            register,
+            address,
+        })
+    }
+
+    /// DDI0487G.a C6.2.133 LDR (literal), C6.2.145 LDRSW (literal),
+    /// C7.2.192 LDR (literal, SIMD&FP); C4.1.4 Load register (literal), C4-309.
+    fn literal_memory(w: u32) -> Option<ScalarMemory> {
+        if w & 0x3b000000 != 0x18000000 {
+            return None;
+        }
+        let opc = w >> 30;
+        if opc == 3 {
+            return None;
+        }
+        let vector = w & (1 << 26) != 0;
+        let size = MemorySize::scale(if vector {
+            opc + 2
+        } else if opc == 1 {
+            3
+        } else {
+            2
+        })?;
+        Some(ScalarMemory {
+            operation: if !vector && opc == 2 {
+                MemoryOperation::LoadSigned
+            } else {
+                MemoryOperation::Load
+            },
+            size,
+            register: if vector {
+                MemoryRegister::Vector(VectorRegister((w & 31) as u8))
+            } else {
+                MemoryRegister::Integer {
+                    register: OperandRegister::field(w, false),
+                    width: if opc == 0 {
+                        crate::Width::W32
+                    } else {
+                        crate::Width::X64
+                    },
+                }
+            },
+            address: MemoryAddress::Literal(PcOffset((((w << 8) as i32) >> 13) as i64 * 4)),
+        })
     }
 
     /// Register index 0..30. Architectural register 31 is represented separately.
@@ -968,5 +1191,7 @@ mod instruction {
 }
 pub use instruction::{
     AddImmediate, AddSubtract, Arithmetic, ArithmeticOperand, Branch, Condition, Extend, Gpr, Hint,
-    Instruction, OperandRegister, PcOffset, RegisterBranch, ShiftAmount, decode_instruction,
+    Instruction, MemoryAddress, MemoryIndex, MemoryOffset, MemoryOperation, MemoryRegister,
+    MemorySize, OperandRegister, PcOffset, RegisterBranch, ScalarMemory, ShiftAmount,
+    VectorRegister, decode_instruction,
 };

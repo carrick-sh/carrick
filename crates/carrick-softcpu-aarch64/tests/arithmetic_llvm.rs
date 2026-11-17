@@ -410,3 +410,193 @@ fn hint_neighbourhood_has_no_false_acceptances() {
     assert_eq!(hints, 6);
     println!("65536 distinct hint neighbourhood words; 6 accepted; 0 mismatches");
 }
+
+fn memory_expected(m: ScalarMemory, pc: u64) -> String {
+    let signed = m.operation == MemoryOperation::LoadSigned;
+    let load = m.operation != MemoryOperation::Store;
+    let unscaled = matches!(m.address, MemoryAddress::Immediate { unscaled: true, .. });
+    let mut name = match (load, unscaled) {
+        (true, true) => "ldur",
+        (false, true) => "stur",
+        (true, false) => "ldr",
+        (false, false) => "str",
+    }
+    .to_owned();
+    let r = match m.register {
+        MemoryRegister::Integer { register, width } => {
+            name.push_str(match (m.size, signed) {
+                (MemorySize::Byte, false) => "b",
+                (MemorySize::Half, false) => "h",
+                (MemorySize::Byte, true) => "sb",
+                (MemorySize::Half, true) => "sh",
+                (MemorySize::Word, true) => "sw",
+                _ => "",
+            });
+            reg(register, width)
+        }
+        MemoryRegister::Vector(r) => format!(
+            "{}{}",
+            match m.size {
+                MemorySize::Byte => 'b',
+                MemorySize::Half => 'h',
+                MemorySize::Word => 's',
+                MemorySize::Double => 'd',
+                MemorySize::Quad => 'q',
+            },
+            r.number()
+        ),
+    };
+    let address = match m.address {
+        MemoryAddress::Literal(offset) => format!("0x{:x}", pc.wrapping_add_signed(offset.bytes())),
+        MemoryAddress::Immediate {
+            base,
+            offset,
+            index,
+            ..
+        } => {
+            let b = reg(base, Width::X64);
+            let n = offset.bytes();
+            match index {
+                MemoryIndex::Post => format!("[{b}], #{n}"),
+                MemoryIndex::Pre => format!("[{b}, #{n}]!"),
+                MemoryIndex::Offset if n == 0 => format!("[{b}]"),
+                MemoryIndex::Offset => format!("[{b}, #{n}]"),
+            }
+        }
+        MemoryAddress::Register {
+            base,
+            offset,
+            extend,
+            scaled,
+        } => {
+            let b = reg(base, Width::X64);
+            let r = reg(
+                offset,
+                if matches!(extend, Extend::Uxtw | Extend::Sxtw) {
+                    Width::W32
+                } else {
+                    Width::X64
+                },
+            );
+            let name = match extend {
+                Extend::Uxtw => "uxtw",
+                Extend::Uxtx => "lsl",
+                Extend::Sxtw => "sxtw",
+                Extend::Sxtx => "sxtx",
+                _ => unreachable!(),
+            };
+            if extend == Extend::Uxtx && !scaled {
+                format!("[{b}, {r}]")
+            } else if scaled {
+                format!("[{b}, {r}, {name} #{}]", m.size.bytes().trailing_zeros())
+            } else {
+                format!("[{b}, {r}, {name}]")
+            }
+        }
+    };
+    format!("{name} {r}, {address}")
+}
+
+#[test]
+#[ignore = "requires Rust-sysroot CARRICK_LLVM_OBJDUMP"]
+fn generated_scalar_memory_matches_llvm_operands() {
+    let mut words = BTreeSet::new();
+    for size in 0..4u32 {
+        for v in 0..2 {
+            for opc in 0..4 {
+                let head = size << 30 | v << 26 | opc << 22;
+                for rn in [0, 17, 31] {
+                    for rt in [0, 18, 31] {
+                        for imm in [0, 1, 255, 256, 511] {
+                            for mode in 0..4 {
+                                words.insert(
+                                    head | 0x38000000 | imm << 12 | mode << 10 | rn << 5 | rt,
+                                );
+                            }
+                        }
+                        for imm in [0, 1, 31, 2047, 4095] {
+                            words.insert(head | 0x39000000 | imm << 10 | rn << 5 | rt);
+                        }
+                        for rm in [0, 19, 31] {
+                            for option in 0..8 {
+                                for low in 0..8 {
+                                    words.insert(
+                                        head | 0x38200000
+                                            | rm << 16
+                                            | option << 13
+                                            | low << 10
+                                            | rn << 5
+                                            | rt,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for opc in 0..4u32 {
+        for v in 0..2 {
+            for imm in [0, 1, 0x3ffff, 0x40000, 0x7ffff] {
+                for rt in 0..32 {
+                    words.insert(opc << 30 | v << 26 | 0x18000000 | imm << 5 | rt);
+                }
+            }
+        }
+    }
+    assert!(words.len() >= 50_000);
+    let words: Vec<_> = words.into_iter().collect();
+    let path = std::env::temp_dir().join(format!("carrick-a64-memory-{}.o", std::process::id()));
+    std::fs::write(&path, object(&words)).expect("valid differential fixture");
+    let output =
+        Command::new(std::env::var_os("CARRICK_LLVM_OBJDUMP").expect("valid differential fixture"))
+            .args([
+                "-D",
+                "--no-print-imm-hex",
+                "--no-show-raw-insn",
+                "--no-leading-addr",
+            ])
+            .arg(&path)
+            .output()
+            .expect("valid differential fixture");
+    std::fs::remove_file(path).expect("valid differential fixture");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("valid differential fixture");
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|s| s.starts_with(' ') && !s.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), words.len());
+    let mut accepted = 0;
+    let mut mismatches = 0;
+    for (i, (&w, line)) in words.iter().zip(lines).enumerate() {
+        if let Instruction::ScalarMemory(m) = decode_instruction(w) {
+            let actual = line
+                .split("//")
+                .next()
+                .expect("valid differential fixture")
+                .split(" <")
+                .next()
+                .expect("valid differential fixture")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if memory_expected(m, i as u64 * 4) != actual {
+                if mismatches < 20 {
+                    println!(
+                        "{w:08x}: {:?} versus {actual}",
+                        memory_expected(m, i as u64 * 4)
+                    );
+                }
+                mismatches += 1;
+            }
+            accepted += 1;
+        }
+    }
+    assert_eq!(mismatches, 0, "oracle mismatches");
+    println!(
+        "{} distinct scalar memory words; {accepted} accepted; 0 wrong class / operand mismatches",
+        words.len()
+    );
+}
