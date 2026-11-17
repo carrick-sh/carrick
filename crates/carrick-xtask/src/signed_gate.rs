@@ -1290,6 +1290,7 @@ pub struct PairedRun {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidePhase {
+    Prepare,
     Build,
     Accept,
     Inspect,
@@ -1299,6 +1300,12 @@ fn side_phases<L>(
     mut acquire: impl FnMut(HostLeaseMode) -> Result<L, ReceiptError>,
     mut run: impl FnMut(SidePhase, Option<&L>) -> Result<(), ReceiptError>,
 ) -> Result<(), ReceiptError> {
+    {
+        // Fixture publication and disk reclamation require exclusion too;
+        // finish those existing admissions before the shared release build.
+        let lease = acquire(HostLeaseMode::Gate)?;
+        run(SidePhase::Prepare, Some(&lease))?;
+    }
     {
         let lease = acquire(HostLeaseMode::Carrick)?;
         run(SidePhase::Build, Some(&lease))?;
@@ -1624,8 +1631,8 @@ fn execute_one(
         |mode| HostLease::acquire(mode).map_err(|e| fail(e.to_string())),
         |phase, lease| {
             let xtask = std::env::current_exe().map_err(|e| fail(e.to_string()))?;
-            if phase == SidePhase::Build {
-                let lease = lease.ok_or_else(|| fail("build requires carrick lease"))?;
+            if phase == SidePhase::Prepare {
+                let lease = lease.ok_or_else(|| fail("fixture publication requires gate lease"))?;
                 let mut fetch = Command::new(&xtask);
                 fetch.current_dir(&tree).args([
                     "--root",
@@ -1654,8 +1661,22 @@ fn execute_one(
                         "fixture restore failed for the authorized exact-SHA artifact",
                     ));
                 }
+                // The public build recipe performs exclusive disk admission
+                // before its shared build body. Preserve that ordering here,
+                // rather than attempting gate admission under shared carrick.
+                let mut disk = Command::new("just");
+                disk.current_dir(&tree)
+                    .env("CARRICK_XTASK_BIN", &xtask)
+                    .arg("check-disk");
+                if !logged(&mut disk, lease, &output.join("disk-admission.log"))? {
+                    return Err(fail("build disk admission failed"));
+                }
+                return Ok(());
+            }
+            if phase == SidePhase::Build {
+                let lease = lease.ok_or_else(|| fail("build requires carrick lease"))?;
                 let mut build = Command::new("just");
-                build.current_dir(&tree).arg("build");
+                build.current_dir(&tree).arg("_build");
                 if !logged(&mut build, lease, &output.join("build.log"))? {
                     return Err(fail("just build failed"));
                 }
@@ -2133,6 +2154,9 @@ mod tests {
         assert_eq!(
             *events.borrow(),
             [
+                "acquire Gate",
+                "Prepare Some(Gate)",
+                "release Gate",
                 "acquire Carrick",
                 "Build Some(Carrick)",
                 "release Carrick",
@@ -2147,7 +2171,12 @@ mod tests {
     #[test]
     fn side_phase_failure_releases_admission_and_stops_before_later_work() {
         use std::cell::Cell;
-        for failing in [SidePhase::Build, SidePhase::Accept, SidePhase::Inspect] {
+        for failing in [
+            SidePhase::Prepare,
+            SidePhase::Build,
+            SidePhase::Accept,
+            SidePhase::Inspect,
+        ] {
             let held = Cell::new(false);
             let phases = std::cell::RefCell::new(Vec::new());
             struct Held<'a>(&'a Cell<bool>);

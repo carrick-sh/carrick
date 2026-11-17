@@ -264,8 +264,10 @@ SHA and each checkout's fixture input identity before restoration. No
 manually provisioned archive or Docker is needed on the Mac.
 
 GitHub assigns one job at a time to a runner. For each side, the Rust executor
-restores fixtures and runs `just build` under shared `carrick`, then releases
-that lease fully. It invokes signed `accept` without inherited admission:
+restores fixtures and performs disk admission under a short `gate` lease,
+then releases it fully. Fixture publication already requires gate and must
+never attempt to upgrade shared admission. It runs the signed `just _build`
+body under shared `carrick`, then releases that lease fully. It invokes signed `accept` without inherited admission:
 accept builds under shared `carrick`, releases it, takes `gate`, and re-verifies
 that the admitted artifacts are unchanged before running guests (#2013).
 After accept returns, independent scoped cleanup and artifact inspection take
