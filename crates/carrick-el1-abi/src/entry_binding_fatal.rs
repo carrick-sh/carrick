@@ -78,6 +78,9 @@ pub enum EntryBindingFatalReason {
     /// no host route (a ring-owned fork child): its forward has no server,
     /// and a counted ENOSYS would lose the call (#1941: a lost futex wake).
     OwnedFamilyForward = 62,
+    /// A native service refused because the kernel heap could not hold its
+    /// storage (#2441).
+    NativeServiceNoMemory = 63,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -133,6 +136,7 @@ impl EntryBindingFatalReason {
             60 => Some(Self::SwitchInStaleRoot),
             61 => Some(Self::RequeueRefused),
             62 => Some(Self::OwnedFamilyForward),
+            63 => Some(Self::NativeServiceNoMemory),
 
             _ => None,
         }

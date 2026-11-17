@@ -2033,6 +2033,7 @@ pub(crate) fn declined_fault_admission_result(
         Err(
             NativeProcessError::Busy
             | NativeProcessError::Exhausted
+            | NativeProcessError::NoMemory
             | NativeProcessError::Fault
             | NativeProcessError::ForkRefused(_)
             | NativeProcessError::Unsupported
@@ -2929,6 +2930,7 @@ fn native_service_fatal_reason(
         Error::Invalid => Fatal::NativeServiceInvalid,
         Error::Stale => Fatal::NativeServiceStale,
         Error::Exhausted => Fatal::NativeServiceExhausted,
+        Error::NoMemory => Fatal::NativeServiceNoMemory,
         Error::Fault => Fatal::NativeServiceFault,
         Error::Unsupported => Fatal::NativeServiceUnsupported,
         Error::GroupExitCustody => Fatal::NativeServiceGroupExit,
@@ -6822,6 +6824,7 @@ mod tests {
             (Error::Invalid, Fatal::NativeServiceInvalid),
             (Error::Stale, Fatal::NativeServiceStale),
             (Error::Exhausted, Fatal::NativeServiceExhausted),
+            (Error::NoMemory, Fatal::NativeServiceNoMemory),
             (Error::Fault, Fatal::NativeServiceFault),
             (Error::Unsupported, Fatal::NativeServiceUnsupported),
             (Error::GroupExitCustody, Fatal::NativeServiceGroupExit),
@@ -6920,6 +6923,7 @@ mod tests {
             Run::BirthSettlement,
             Run::ClaimRollback,
             Run::BornEnqueueRefused,
+            Run::NativeNoMemory,
         ] {
             let custody = Custody::NativeRunFailure(reason);
             let invariant = NativeInvariant::PhysicalCustody(custody);

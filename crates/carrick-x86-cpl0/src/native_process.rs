@@ -5,7 +5,7 @@ mod user_copy;
 use super::anonymous;
 use crate::exec_successor::{X86ExecMachine, X86ExecSuccessor};
 use crate::rust_alloc::{boxed::Box, sync::Arc, vec::Vec};
-use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
+use carrick_core::mm::fork::{ForkCensus, census_table};
 use carrick_core::mm::transaction::{MmPortal, OwnerVenue};
 use carrick_el1::isa::x86::context::scheduler::WakeCpu;
 use carrick_el1::memory::reservations::{
@@ -19,7 +19,7 @@ use carrick_el1_abi::{
 };
 use carrick_el1_linux::mm_portal::production::GuestMetadataPin;
 use carrick_el1_linux::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
-use carrick_el1_linux::native_fork_refusal::{NativeForkStage, busy, refused};
+use carrick_el1_linux::native_fork_refusal::{NativeForkStage, busy, fork_scratch, refused};
 use carrick_el1_linux::native_process_runtime::{
     ExecSuccessorSlot, NativeExecSuccessor, NativeFailure, NativeForkPreparation,
     NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
@@ -451,15 +451,7 @@ impl Service {
             .roots
             .publish(index.index(), loan.request.child_mm, layout)
             .map_err(|e| free(refused(NativeForkStage::PublishRoot, e)))?;
-        let scratch = ForkScratch::bounded(
-            loan.request,
-            mapping_count,
-            count.child,
-            count.parent,
-            count.live,
-            count.custody,
-        )
-        .map_err(|e| free(refused(NativeForkStage::Scratch, e)))?;
+        let scratch = fork_scratch(loan.request, mapping_count, &count).map_err(free)?;
         let plan = owner
             .prepare_fork(loan.request, scratch, live, self.worker())
             .map_err(|e| free(refused(NativeForkStage::Prepare, e)))?;
