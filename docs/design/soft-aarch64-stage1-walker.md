@@ -5,6 +5,20 @@ implemented walker. Inventory taken on GitHub main on 2026-11-17. N1 placement
 and TLB policy belongs to the x86 soft-CPU lane; this document does not reserve
 its implementation or change its interfaces.
 
+## Status
+
+Slice 1 (N1 extraction) is in draft PR #2497 and has not landed. It
+adds `carrick-mmu-core::stage1` with `LeafAccess` (the x86 descriptor
+`Access` is now this type), `LeafSize`, `LeafSpan`, `WalkError<F>`,
+`Stage1Leaf` and `Stage1Walker`. The x86 `HardwareWalker` wraps
+`translate_leaf_hardware`, and `SoftWalker::walk_and_fill` calls it by
+static dispatch as the trait's first production caller. Leaf
+authentication is generic over `Stage1Leaf`. The soft TLB tag, the
+x86 fault records and the outcome types stay x86. Making them generic
+belongs with the ARM binding (slice 4), which defines the second
+instance. The PR does not remove `MmioHoles::default` (see Placement
+and publication). No AArch64 walk exists yet.
+
 ## Authority and scope
 
 Architectural authority is the [Arm ARM, DDI 0487G.a, ID011921](https://documentation-service.arm.com/static/60119835773bb020e3de6fee),

@@ -1,3 +1,11 @@
+# #2480 slice 1 (N1 seam): SoftWalker::walk_and_fill now calls the x86
+# HardwareWalker (carrick_mmu_core::stage1::Stage1Walker over
+# translate_leaf_hardware, static dispatch) and authenticates leaves through
+# the neutral Stage1Leaf/LeafSpan; descriptor refusal is WalkError::Refusal.
+# Seat, retirement and TLB plumbing are unchanged; same walk, loads, A/D CAS
+# and authentication span (witness: carrick-mmu-core x86 descriptor_txn
+# tests::hardware_walker_is_translate_leaf_hardware_with_refusal_split). The
+# bindings below were re-run unchanged; no new acceptance is claimed.
 # #2480 slice 1 (N1 vocabulary): LeafAccess moved verbatim from
 # carrick-mmu-core aarch64 and LeafSize from x86::descriptor_txn into the
 # neutral carrick-mmu-core stage1 module (crates/carrick-mmu-core/src/stage1.rs);
