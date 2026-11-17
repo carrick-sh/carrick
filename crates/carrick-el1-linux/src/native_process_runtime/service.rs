@@ -138,6 +138,10 @@ struct PendingHostFile<'a> {
     /// The bytes a socket `send`/`recv` moved in its earlier records: the
     /// call's owned continuation across records (#2414).
     transfer: carrick_personality_linux::native_host_file::NetTransfer,
+    /// The call already waited on its member's host-readiness queue: this
+    /// record is the call's own again, and a signal that cancels it before
+    /// any effect interrupts a blocking call (#2414).
+    waited: bool,
 }
 
 /// What a host-file service does after its record's completion, when the
@@ -1554,6 +1558,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             map,
             chdir,
             transfer: Default::default(),
+            waited: false,
         })
     }
 
@@ -1598,6 +1603,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ///   which keep the call's deadline and the bytes it already moved. A
     ///   signal that interrupted the wait answers EINTR, or the bytes the
     ///   call already moved.
+    /// - A record of a call that already waited or moved bytes, cancelled
+    ///   before any effect of its own, interrupts that call the same way: a
+    ///   regular-file restart would run the call again from its first byte,
+    ///   and Linux never restarts a poll.
+    /// - A refused record of a call that already moved bytes answers them:
+    ///   they are on the wire, and a counted ENOSYS would lose them.
     /// - A socket transfer's record copies its received bytes back, then
     ///   the call continues with its next range or answers the bytes moved
     ///   ([`carrick_personality_linux::native_host_file::net_transfer_step`]).
@@ -1612,15 +1623,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let Some(file) = pending.host_file.as_ref() else {
             return Ok(None);
         };
+        if result == ServiceResult::Refused {
+            return Ok((file.transfer.done() != 0).then(|| {
+                HostFileContinuation::Returned(
+                    file.transfer
+                        .stopped(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS)),
+                )
+            }));
+        }
         if carrick_core_abi::host_file::reply(&file.record).is_none() {
-            if !waited {
-                return Ok(None);
-            }
+            let continued = waited || file.waited || file.transfer.done() != 0;
             return Ok(Some(match result {
-                ServiceResult::Supplied => {
+                ServiceResult::Supplied if waited => {
                     let mut file = pending.host_file.take().ok_or(NativeProcessError::Stale)?;
                     file.record =
                         venue::request_again(&file.record).ok_or(NativeProcessError::Invalid)?;
+                    file.waited = true;
                     HostFileContinuation::Publish(file)
                 }
                 // Linux's interrupted blocking socket call or poll: EINTR, or
@@ -1628,7 +1646,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // that Linux restarts (a socket call, a read or write; never
                 // a poll) is retained for the shared signal policy, which
                 // restarts it under SA_RESTART on either ISA.
-                _ => {
+                ServiceResult::Cancelled if continued => {
                     if file.transfer.done() == 0 && venue::restarts_after_interrupt(&file.record) {
                         self.retain_interrupted_syscall()
                             .map_err(NativeProcessError::from)?;
@@ -1638,6 +1656,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             .stopped(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EINTR)),
                     )
                 }
+                // A first record cancelled before any effect is the venue's
+                // restart; a supply without a reply or a wait is a transport
+                // violation. Both keep the record's own completion.
+                _ => return Ok(None),
             }));
         }
         if !venue::is_net_transfer(&file.record) {
@@ -3786,7 +3808,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             );
         }
         if matches!(request.operation, ServiceOperation::HostFile { .. })
-            && matches!(result, ServiceResult::Supplied | ServiceResult::Cancelled)
+            && matches!(
+                result,
+                ServiceResult::Supplied | ServiceResult::Cancelled | ServiceResult::Refused
+            )
             && let Some(next) = self.continue_host_file(&mut pending, result)?
         {
             self.release_service_claim(pending.claim)?;
