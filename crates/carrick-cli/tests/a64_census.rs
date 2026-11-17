@@ -71,6 +71,15 @@ fn command_rejects_reserved_code_excludes_literals_and_is_deterministic() -> any
     assert_eq!(measurement.status.code(), Some(0));
     assert_eq!(measurement.stdout, first.stdout);
     let report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    assert!(
+        report["typed_undecoded_count"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+    );
+    assert!(report["typed_undecoded"].as_array().is_some_and(|words| {
+        words.iter().any(|word| word["address"] == 0x1004)
+            && !words.iter().any(|word| word["address"] == 0x1008)
+    }));
     let unknown = report["unknown"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("missing unknown words"))?;
@@ -85,5 +94,23 @@ fn command_rejects_reserved_code_excludes_literals_and_is_deterministic() -> any
             .any(|word| word["span"] == "" && word["address"] == 0x1008)
     );
     assert!(!unknown.iter().any(|word| word["address"] == 0x1008));
+    // A recognized FP computation is deliberately outside this typed decoder.
+    // Strict must reject it even though the classifier has no unknown words.
+    let mut typed_gap = fixture();
+    put(&mut typed_gap, 68, 0x1e602800, 4);
+    std::fs::write(&path, typed_gap)?;
+    let typed = invoke()?;
+    assert_eq!(typed.status.code(), Some(1));
+    let typed_report: serde_json::Value = serde_json::from_slice(&typed.stdout)?;
+    assert_eq!(typed_report["unknown_count"], 0);
+    assert!(
+        typed_report["typed_undecoded"]
+            .as_array()
+            .is_some_and(|words| {
+                words
+                    .iter()
+                    .any(|word| word["address"] == 0x1004 && word["encoding"] == "0x1e602800")
+            })
+    );
     Ok(())
 }
