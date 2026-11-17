@@ -118,3 +118,28 @@ fn atomic_transfer_reserved_fields_fail_shut() {
         );
     }
 }
+
+/// Arm ARM DDI0487G.a C7.2.332: shift = S ? scale : 0.
+/// LLVM 22.1.2's no-aliases printer reports LSL #4 for both Q words;
+/// its default printer distinguishes them. Both encodings stay supported.
+#[test]
+fn q_register_offset_preserves_the_architectural_scale_bit() {
+    use carrick_softcpu_aarch64::{Extend, MemoryAddress, MemorySize};
+    for (word, expected_scaled) in [(0x3ca06800, false), (0x3ca07800, true)] {
+        let Instruction::ScalarMemory(m) = decode_instruction(word) else {
+            panic!("Q register-offset transfer missing");
+        };
+        assert_eq!(m.size, MemorySize::Quad);
+        let MemoryAddress::Register { extend, scaled, .. } = m.address else {
+            panic!("wrong addressing form");
+        };
+        assert_eq!(extend, Extend::Uxtx);
+        assert_eq!(scaled, expected_scaled);
+        let shift = if scaled {
+            m.size.bytes().trailing_zeros()
+        } else {
+            0
+        };
+        assert_eq!(shift, if expected_scaled { 4 } else { 0 });
+    }
+}
