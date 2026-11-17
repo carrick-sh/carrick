@@ -69,3 +69,16 @@ fn scalar_literal_offset_does_not_include_rt() {
     assert_eq!(index, MemoryIndex::Offset);
     assert!(unscaled);
 }
+
+#[test]
+fn pair_memory_forms_are_typed() {
+    for word in [
+        0xa9bf7bfd, 0xa8c17bfd, 0xa9400440, 0x69400440, 0x28400440, 0xad400440,
+    ] {
+        assert_ne!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
