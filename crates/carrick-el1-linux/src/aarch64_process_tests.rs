@@ -19114,6 +19114,323 @@ fn arm_open_lock_file(
     fd as u64
 }
 
+/// #2452 re-review P0: a served SEEK_SET range past the largest file
+/// offset is fcntl(2)'s EOVERFLOW, not EINVAL. Native Linux 6.12.115
+/// (x86_64 oracle, this struct layout): `l_start = i64::MAX, l_len = 2`
+/// returns -1/errno 75; the controls `(i64::MAX, 1)` succeed and
+/// `(-1, 1)` is errno 22. Red on 820b8bb11: the neutral decoder folded the
+/// overflow into its EINVAL.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_review_record_lock_overflow_matches_linux() {
+    use carrick_abi::{LINUX_F_SETLK, LINUX_F_WRLCK, LinuxFlock64};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+    let (results, _) = with_arm_process_host_dispatch(|call| {
+        let [a, _, _] = arm_three_lock_processes(call);
+        let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-review2452-overflow\0");
+        let fd = arm_open_lock_file(call, a, &path);
+        [(i64::MAX, 2), (i64::MAX, 1), (-1, 1)].map(|(l_start, l_len)| {
+            let lock = GuestUserBuffer::from_value(LinuxFlock64 {
+                l_type: LINUX_F_WRLCK as i16,
+                l_start,
+                l_len,
+                ..Default::default()
+            });
+            call(
+                a,
+                sys::FCNTL.raw(),
+                [fd, LINUX_F_SETLK, lock.arg(), 0, 0, 0],
+            )
+            .1
+        })
+    });
+    assert_eq!(
+        results,
+        [
+            carrick_abi::LINUX_EOVERFLOW.guest_retval(),
+            0,
+            carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+        ],
+        "Linux: EOVERFLOW for l_start + l_len - 1 past the largest offset; \
+         (i64::MAX, 1) succeeds; (-1, 1) is EINVAL"
+    );
+}
+
+/// #2452: the ring lock owner answers every served `struct flock` range
+/// and the order of fcntl(2)'s and flock(2)'s refusals as native Linux
+/// 6.12.115 does (x86_64 oracle, one O_RDWR and one O_RDONLY description
+/// of a regular file, `SEEK_SET`): the range is checked before an
+/// `F_SETLK`'s lock type and a description's access mode, and an OFD
+/// lock's `l_pid` after both; `F_GETLK` refuses a type other than
+/// `F_RDLCK`/`F_WRLCK` first; flock(2) refuses an unknown operation
+/// before it looks at the descriptor. Red on 820b8bb11 in the overflow
+/// rows, the type-before-range and pid-before-access rows, and flock's
+/// EBADF-before-EINVAL.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_arm_record_lock_range_and_refusal_order_match_linux() {
+    use carrick_abi::{
+        LINUX_AT_FDCWD, LINUX_F_GETLK, LINUX_F_OFD_GETLK, LINUX_F_OFD_SETLK, LINUX_F_RDLCK,
+        LINUX_F_SETLK, LINUX_F_UNLCK, LINUX_F_WRLCK, LINUX_O_RDONLY, LinuxFlock64,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+    const MAX: i64 = i64::MAX;
+    const MIN: i64 = i64::MIN;
+    let (eoverflow, einval, ebadf) = (
+        carrick_abi::LINUX_EOVERFLOW.guest_retval(),
+        carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+        carrick_syscall_abi::LINUX_EBADF.guest_retval(),
+    );
+    let (wr, rd, un) = (LINUX_F_WRLCK, LINUX_F_RDLCK, LINUX_F_UNLCK);
+    // (what, read-only descriptor, command, l_type, l_start, l_len, l_pid,
+    // Linux's answer)
+    let rows: &[(&str, bool, u64, i32, i64, i64, i32, i64)] = &[
+        (
+            "SETLK max,2",
+            false,
+            LINUX_F_SETLK,
+            wr,
+            MAX,
+            2,
+            0,
+            eoverflow,
+        ),
+        (
+            "SETLK max,max",
+            false,
+            LINUX_F_SETLK,
+            wr,
+            MAX,
+            MAX,
+            0,
+            eoverflow,
+        ),
+        (
+            "SETLK 2,max",
+            false,
+            LINUX_F_SETLK,
+            wr,
+            2,
+            MAX,
+            0,
+            eoverflow,
+        ),
+        ("SETLK 1,max", false, LINUX_F_SETLK, wr, 1, MAX, 0, 0),
+        ("SETLK max,0", false, LINUX_F_SETLK, wr, MAX, 0, 0, 0),
+        ("SETLK 5,-5", false, LINUX_F_SETLK, wr, 5, -5, 0, 0),
+        ("SETLK 5,-6", false, LINUX_F_SETLK, wr, 5, -6, 0, einval),
+        ("SETLK 0,-1", false, LINUX_F_SETLK, wr, 0, -1, 0, einval),
+        (
+            "SETLK max,min",
+            false,
+            LINUX_F_SETLK,
+            wr,
+            MAX,
+            MIN,
+            0,
+            einval,
+        ),
+        ("SETLK max,-max", false, LINUX_F_SETLK, wr, MAX, -MAX, 0, 0),
+        ("SETLK min,1", false, LINUX_F_SETLK, wr, MIN, 1, 0, einval),
+        ("SETLK -1,0", false, LINUX_F_SETLK, wr, -1, 0, 0, einval),
+        (
+            "GETLK max,2",
+            false,
+            LINUX_F_GETLK,
+            wr,
+            MAX,
+            2,
+            0,
+            eoverflow,
+        ),
+        ("GETLK max,1", false, LINUX_F_GETLK, wr, MAX, 1, 0, 0),
+        (
+            "OFD_SETLK max,2",
+            false,
+            LINUX_F_OFD_SETLK,
+            wr,
+            MAX,
+            2,
+            0,
+            eoverflow,
+        ),
+        (
+            "OFD_GETLK max,2",
+            false,
+            LINUX_F_OFD_GETLK,
+            wr,
+            MAX,
+            2,
+            0,
+            eoverflow,
+        ),
+        (
+            "SETLK F_UNLCK max,2",
+            false,
+            LINUX_F_SETLK,
+            un,
+            MAX,
+            2,
+            0,
+            eoverflow,
+        ),
+        (
+            "SETLK type 7 max,2: range first",
+            false,
+            LINUX_F_SETLK,
+            7,
+            MAX,
+            2,
+            0,
+            eoverflow,
+        ),
+        ("SETLK type 7 0,1", false, LINUX_F_SETLK, 7, 0, 1, 0, einval),
+        (
+            "GETLK F_UNLCK max,2: type first",
+            false,
+            LINUX_F_GETLK,
+            un,
+            MAX,
+            2,
+            0,
+            einval,
+        ),
+        (
+            "GETLK type 7 max,2: type first",
+            false,
+            LINUX_F_GETLK,
+            7,
+            MAX,
+            2,
+            0,
+            einval,
+        ),
+        (
+            "OFD_SETLK pid 5 max,2: range first",
+            false,
+            LINUX_F_OFD_SETLK,
+            wr,
+            MAX,
+            2,
+            5,
+            eoverflow,
+        ),
+        (
+            "OFD_GETLK pid 5 max,2: range first",
+            false,
+            LINUX_F_OFD_GETLK,
+            wr,
+            MAX,
+            2,
+            5,
+            eoverflow,
+        ),
+        (
+            "OFD_GETLK pid 5 0,1",
+            false,
+            LINUX_F_OFD_GETLK,
+            wr,
+            0,
+            1,
+            5,
+            einval,
+        ),
+        (
+            "SETLK write on O_RDONLY max,2: range first",
+            true,
+            LINUX_F_SETLK,
+            wr,
+            MAX,
+            2,
+            0,
+            eoverflow,
+        ),
+        (
+            "SETLK write on O_RDONLY -1,1: range first",
+            true,
+            LINUX_F_SETLK,
+            wr,
+            -1,
+            1,
+            0,
+            einval,
+        ),
+        (
+            "OFD_SETLK write on O_RDONLY pid 5: access first",
+            true,
+            LINUX_F_OFD_SETLK,
+            wr,
+            0,
+            1,
+            5,
+            ebadf,
+        ),
+        (
+            "GETLK write on O_RDONLY",
+            true,
+            LINUX_F_GETLK,
+            wr,
+            0,
+            1,
+            0,
+            0,
+        ),
+        (
+            "SETLK read on O_RDONLY max,1",
+            true,
+            LINUX_F_SETLK,
+            rd,
+            MAX,
+            1,
+            0,
+            0,
+        ),
+    ];
+    let (got, _) = with_arm_process_host_dispatch(|call| {
+        let [a, _, _] = arm_three_lock_processes(call);
+        let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-2452-range-order\0");
+        let rw = arm_open_lock_file(call, a, &path);
+        let (_, ro) = call(
+            a,
+            sys::OPENAT.raw(),
+            [LINUX_AT_FDCWD, path.arg(), LINUX_O_RDONLY, 0, 0, 0],
+        );
+        assert!(ro >= 0, "O_RDONLY open: {ro}");
+        let mut got: Vec<(&str, i64)> = rows
+            .iter()
+            .map(
+                |&(what, read_only, cmd, l_type, l_start, l_len, l_pid, _)| {
+                    let lock = GuestUserBuffer::from_value(LinuxFlock64 {
+                        l_type: l_type as i16,
+                        l_start,
+                        l_len,
+                        l_pid,
+                        ..Default::default()
+                    });
+                    let fd = if read_only { ro as u64 } else { rw };
+                    (
+                        what,
+                        call(a, sys::FCNTL.raw(), [fd, cmd, lock.arg(), 0, 0, 0]).1,
+                    )
+                },
+            )
+            .collect();
+        got.push((
+            "flock(-1, 77): operation first",
+            call(a, sys::FLOCK.raw(), [u64::MAX, 77, 0, 0, 0, 0]).1,
+        ));
+        got
+    });
+    let mut want: Vec<(&str, i64)> = rows
+        .iter()
+        .map(|&(what, .., linux)| (what, linux))
+        .collect();
+    want.push(("flock(-1, 77): operation first", einval));
+    assert_eq!(got, want);
+}
+
 /// #2452 review P0-1: a woken F_SETLKW takes the lock its call asked for
 /// when it parked. fcntl(2) copies `struct flock` in once; B's and C's
 /// requests sit in one shared structure that is rewritten to F_UNLCK while
