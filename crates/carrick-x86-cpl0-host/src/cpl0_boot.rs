@@ -48,6 +48,239 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
+pub mod boot_cpu {
+    //! Desired stopped-CPU policy; backend observation and admission stay in KVM.
+    use super::*;
+    use carrick_hal::x8664_arch::X8664BootSysregs;
+    use carrick_x86::{SegmentDescriptor, X86Vcpu};
+
+    /// Values layered on the existing shared long-mode and fault-segment helpers.
+    /// This is boot policy, not a running CPU snapshot or an execution capability.
+    pub struct BootCpuState {
+        cpu: carrick_guest_arch::CpuId,
+        pub layout: BringupLayout,
+        pub rip: u64,
+        pub rsp: u64,
+        pub fixture_rflags: Option<u64>,
+        pub cr4_required: u64,
+        pub cpuid_leaf7_required: u32,
+        pub gdt_base: u64,
+        pub idt_base: u64,
+        pub tr: SegmentDescriptor,
+        pub apic_base: Option<u64>,
+        pub lstar: u64,
+        pub star: u64,
+        pub sfmask: u64,
+        pub kernel_gs_base: u64,
+    }
+
+    impl BootCpuState {
+        pub fn new(
+            entry: u64,
+            boot: &X8664BootSysregs,
+            cpu: carrick_guest_arch::CpuId,
+            hardware_interrupts: bool,
+            production: bool,
+        ) -> Result<Self, TrapError> {
+            let slot = u64::from(cpu.raw());
+            let mut layout = LAYOUT;
+            layout.trampoline_base = entry;
+            Ok(Self {
+                cpu,
+                layout,
+                rip: USER_CODE + slot * 4096,
+                rsp: 0x3_1ff0 + slot * 0x1_0000,
+                fixture_rflags: (hardware_interrupts && !production)
+                    .then_some(boot.rflags | (1 << 9)),
+                cpuid_leaf7_required: if production { (1 << 7) | (1 << 20) } else { 0 },
+                cr4_required: if production { (1 << 20) | (1 << 21) } else { 0 },
+                gdt_base: DIRECT_VA + LAYOUT.gdt_base,
+                idt_base: DIRECT_VA
+                    + carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), slot)?,
+                tr: SegmentDescriptor::tss64_busy(
+                    DIRECT_VA
+                        + carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), slot)?,
+                ),
+                apic_base: hardware_interrupts.then_some(
+                    carrick_x86::interrupts::LAPIC_BASE | 0x800 | if slot == 0 { 0x100 } else { 0 },
+                ),
+                lstar: entry,
+                star: boot.star,
+                sfmask: boot.sfmask | (1 << 10) | (1 << 8) | (1 << 18),
+                kernel_gs_base: METADATA_VA + BINDING_OFFSET + slot * STRIDE,
+            })
+        }
+
+        /// Keep the original helper/setter order, including slot-zero bootstrap.
+        pub fn program_entry<C: X86Vcpu>(&self, cpu: &mut C) -> Result<(), TrapError> {
+            carrick_x86::program_longmode_entry(cpu, self.layout, self.rip, self.rsp)?;
+            if let Some(flags) = self.fixture_rflags {
+                cpu.set_gpr(X86Reg::Rflags, flags)?;
+            }
+            carrick_x86::program_fault_segments(cpu, LAYOUT, u64::from(self.cpu.raw()))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use carrick_hal::guest_arch::GuestArch;
+        use carrick_hal::x8664_arch::X8664GuestArch;
+        use carrick_x86::{GuestSegment, MsrInstall, X86Seg};
+
+        #[derive(Default)]
+        struct RecordingVcpu {
+            gprs: Vec<(X86Reg, u64)>,
+            segments: Vec<(X86Seg, GuestSegment)>,
+        }
+        impl X86Vcpu for RecordingVcpu {
+            fn get_gpr(&self, _r: X86Reg) -> Result<u64, TrapError> {
+                Ok(0)
+            }
+            fn set_gpr(&mut self, r: X86Reg, v: u64) -> Result<(), TrapError> {
+                self.gprs.push((r, v));
+                Ok(())
+            }
+            fn set_segment(
+                &mut self,
+                seg: X86Seg,
+                descriptor: carrick_x86::SegmentDescriptor,
+            ) -> Result<(), TrapError> {
+                self.segments.push((seg, descriptor.into()));
+                Ok(())
+            }
+            fn get_fs_base(&self) -> Result<u64, TrapError> {
+                Ok(0)
+            }
+            fn set_fs_base(&mut self, _v: u64) -> Result<(), TrapError> {
+                Ok(())
+            }
+            fn get_gs_base(&self) -> Result<u64, TrapError> {
+                Ok(0)
+            }
+            fn set_gs_base(&mut self, _v: u64) -> Result<(), TrapError> {
+                Ok(())
+            }
+            fn set_syscall_msrs(
+                &mut self,
+                _l: u64,
+                _s: u64,
+                _m: u64,
+            ) -> Result<MsrInstall, TrapError> {
+                Ok(MsrInstall::Direct)
+            }
+            fn get_fp(&self) -> Result<Option<[u8; 512]>, TrapError> {
+                Ok(None)
+            }
+            fn set_fp(&mut self, _fx: &[u8; 512]) -> Result<bool, TrapError> {
+                Ok(true)
+            }
+            fn run(&mut self) -> Result<carrick_x86::X86Exit, TrapError> {
+                Err(TrapError::Hypervisor(
+                    "RecordingVcpu::run unused".to_owned(),
+                ))
+            }
+            fn enable_halt_exit(&mut self) -> Result<(), TrapError> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn boot_cpu_state_has_exact_values() {
+            let boot = X8664GuestArch::bootstrap_sysregs();
+            for production in [false, true] {
+                for interrupts in [false, true] {
+                    for slot in 0..2 {
+                        // CPUID policy stays in the existing shared view; IDs are
+                        // explicit backend observations, never inferred from slot.
+                        let view = carrick_x86::cpuid::GuestCpuidView::x86_64_v3().with_apic_id(37);
+                        assert_eq!(view.cpuid(1, 0).ebx >> 24, 37);
+                        assert_eq!(
+                            view.cpuid(7, 0).ebx & ((1 << 7) | (1 << 20)),
+                            (1 << 7) | (1 << 20)
+                        );
+                        let state = BootCpuState::new(
+                            0x12345000,
+                            &boot,
+                            carrick_guest_arch::CpuId::new(slot as u32),
+                            interrupts,
+                            production,
+                        )
+                        .unwrap();
+                        assert_eq!(state.layout.trampoline_base, 0x12345000);
+                        assert_eq!(state.rip, USER_CODE + slot * 4096);
+                        assert_eq!(state.rsp, 0x31ff0 + slot * 0x10000);
+                        assert_eq!(
+                            state.fixture_rflags,
+                            if interrupts && !production {
+                                Some(0x202)
+                            } else {
+                                None
+                            }
+                        );
+                        assert_eq!(
+                            state.cpuid_leaf7_required,
+                            if production { 0x100080 } else { 0 }
+                        );
+                        assert_eq!(state.cr4_required, if production { 0x300000 } else { 0 });
+                        assert_eq!(state.gdt_base, DIRECT_VA + LAYOUT.gdt_base);
+                        assert_eq!(
+                            state.idt_base,
+                            DIRECT_VA + carrick_x86::fault_idt_base(LAYOUT) + slot * 4096
+                        );
+                        assert_eq!(
+                            state.tr.base(),
+                            DIRECT_VA + carrick_x86::fault_tss_base(LAYOUT) + slot * 4096
+                        );
+                        assert_eq!(state.tr.limit(), 0x67);
+                        assert_eq!(state.tr.access_rights(), 0x8b);
+                        assert_eq!(
+                            state.apic_base,
+                            if interrupts {
+                                Some(0xfee00800 | if slot == 0 { 0x100 } else { 0 })
+                            } else {
+                                None
+                            }
+                        );
+                        assert_eq!(state.lstar, 0x12345000);
+                        assert_eq!(state.star, boot.star);
+                        assert_eq!(state.sfmask, boot.sfmask | 0x40500);
+                        assert_eq!(
+                            state.kernel_gs_base,
+                            METADATA_VA + BINDING_OFFSET + slot * STRIDE
+                        );
+                        let mut cpu = RecordingVcpu::default();
+                        state.program_entry(&mut cpu).unwrap();
+                        let reg = |r| cpu.gprs.iter().rev().find(|(key, _)| *key == r).unwrap().1;
+                        assert_eq!(reg(X86Reg::Cr0), 0x80010033);
+                        assert_eq!(reg(X86Reg::Cr3), LAYOUT.pml4_base);
+                        assert_eq!(reg(X86Reg::Cr4), boot.cr4);
+                        assert_eq!(reg(X86Reg::Efer), boot.efer);
+                        assert_eq!(reg(X86Reg::Rip), state.rip);
+                        assert_eq!(reg(X86Reg::Rsp), state.rsp);
+                        let seg = |r| {
+                            cpu.segments
+                                .iter()
+                                .rev()
+                                .find(|(key, _)| *key == r)
+                                .unwrap()
+                                .1
+                        };
+                        let cs = seg(X86Seg::Cs);
+                        assert_eq!(cs.selector, 0x23);
+                        assert_eq!(cs.limit, 0xffffffff);
+                        assert_eq!(seg(X86Seg::Ss).selector, 0x1b);
+                        assert_eq!(seg(X86Seg::Gdtr).base, LAYOUT.gdt_base);
+                        assert_eq!(seg(X86Seg::Gdtr).limit, 39);
+                        assert_eq!(seg(X86Seg::Idtr).limit, 4095);
+                    }
+                }
+            }
+        }
+    }
+}
+pub use boot_cpu::BootCpuState;
+
 /// Initialize the stopped carrier's GDT, fault stubs, private IDT/TSS/IST and
 /// native IRQ gates in retained RAM, before registration or guest execution.
 /// Both backends must use these exact descriptor bytes and supervisor aliases.
