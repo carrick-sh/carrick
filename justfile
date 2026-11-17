@@ -1616,3 +1616,25 @@ ci-results:
         fi
         exit 1
     fi
+
+# Hosted Linux static decode gate; optional ELF override is for known-answer runs.
+# Build-script JSON selects this build's production image without stale-file globs.
+a64-census-gate elf="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+    logs="$CARGO_TARGET_DIR/a64-census-gate"
+    mkdir -p "$logs"
+    {{_cargo}} build -p carrick-cli --no-default-features --features syscall-shim,platform-linux --message-format=json > "$logs/build.json"
+    out=$(jq -r 'select(.reason == "build-script-executed" and (.package_id | contains("carrick-el1-image"))) | .out_dir' "$logs/build.json")
+    test -n "$out"
+    export CARRICK_A64_ELF="$out/el1-target/aarch64-unknown-none-softfloat/el1-image/carrick-el1"
+    override={{quote(elf)}}
+    if [[ -n "$override" ]]; then export CARRICK_A64_ELF="$override"; fi
+    export CARRICK_LLVM_OBJDUMP="${CARRICK_LLVM_OBJDUMP:-$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objdump}"
+    status=0
+    "$CARGO_TARGET_DIR/debug/carrick" debug a64-census "$CARRICK_A64_ELF" --strict > "$logs/report.json" || status=$?
+    jq -er '"a64 census: spans=\(.spans | length) words=\([.counts[]] | add) unknown=\(.unknown_count) typed-undecoded=\(.typed_undecoded_count)"' "$logs/report.json"
+    # Run every ignore-gated image and LLVM differential witness, even if strict failed.
+    {{_cargo}} test -p carrick-softcpu-aarch64 --tests -- --ignored --nocapture || status=1
+    exit "$status"
