@@ -113,3 +113,14 @@ fn logical_masks_rotate_and_replicate() {
         assert_eq!(i.value(), mask);
     }
 }
+
+#[test]
+fn move_wide_forms_have_typed_operands() {
+    for word in [0xd2800020, 0x92800020, 0xf2e24680, 0x52a24680] {
+        assert_ne!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
