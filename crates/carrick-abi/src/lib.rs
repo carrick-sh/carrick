@@ -2724,7 +2724,6 @@ pub const LINUX_EBADMSG: LinuxErrno = LinuxErrno::new(74);
 pub const LINUX_EOVERFLOW: LinuxErrno = LinuxErrno::new(75);
 pub const LINUX_EILSEQ: LinuxErrno = LinuxErrno::new(84);
 pub const LINUX_EDESTADDRREQ: LinuxErrno = LinuxErrno::new(89);
-pub const LINUX_EMSGSIZE: LinuxErrno = LinuxErrno::new(90);
 pub const LINUX_EPROTOTYPE: LinuxErrno = LinuxErrno::new(91);
 pub const LINUX_EPROTONOSUPPORT: LinuxErrno = LinuxErrno::new(93);
 pub const LINUX_EPFNOSUPPORT: LinuxErrno = LinuxErrno::new(96);

@@ -17,13 +17,23 @@
 //! record in the ring's owned continuation ([`NetTransfer`]), which keeps
 //! the bytes already moved and the call's completion authority.
 //!
+//! A message call (`sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`; #2418)
+//! stages each header, its iovec array, every buffer it names and its
+//! socket address as segments at their own user addresses, so the carrier's
+//! handler reads and writes the caller's structures in place. A receive's
+//! buffers are fitted to one record's data range (any datagram fits it,
+//! and a stream receive may return less); a send whose data does not fit
+//! one record stages none of it, and the carrier answers it by the socket's
+//! type ([`host_file::NET_MESSAGE_UNSTAGED`]). Ancillary data a send carries is not staged
+//! yet: such a call is a counted ENOSYS.
+//!
 //! AF_UNIX and every other family keep their own route: a `socket` call of
 //! another domain is not decoded here, and a call on an in-zone descriptor
 //! stays with its ring owner.
 
 use super::{
-    Access, HostFileOp, HostFileOutput, HostFileStage, HostFileUser, NativeDescriptor,
-    OutputLayout, Staging, errno, gather_user,
+    Access, HostFileOp, HostFileOutput, HostFileStage, HostFileUser, IOVEC_BYTES, LINUX_UIO_MAXIOV,
+    NativeDescriptor, OutputLayout, Staging, errno, gather_user,
 };
 use crate::abi::entry::SyscallResult;
 use alloc::boxed::Box;
@@ -45,6 +55,14 @@ const TRANSFER_LEN_MAX: u64 = i32::MAX as u64;
 const LINUX_MSG_PEEK: u64 = 0x2;
 /// Linux `MSG_WAITALL`.
 const LINUX_MSG_WAITALL: u64 = 0x100;
+/// `struct timespec` bytes (`recvmmsg`'s timeout).
+const TIMESPEC_BYTES: usize = 16;
+/// `msghdr` field offsets.
+const MSG_NAMELEN: usize = 8;
+const MSG_IOV: usize = 16;
+const MSG_IOVLEN: usize = 24;
+const MSG_CONTROL: usize = 32;
+const MSG_CONTROLLEN: usize = 40;
 
 /// A decoded call of the host network family: its canonical number and
 /// argument words. Pointers in them are still untrusted user addresses.
@@ -73,6 +91,10 @@ impl SocketCall {
             nr::GETSOCKNAME,
             nr::GETPEERNAME,
             nr::SHUTDOWN,
+            nr::SENDMSG,
+            nr::RECVMSG,
+            nr::SENDMMSG,
+            nr::RECVMMSG,
         ];
         if !family.contains(&canonical) {
             return None;
@@ -130,6 +152,19 @@ impl Plan {
         });
         self.inputs.push(bytes);
         Ok(())
+    }
+
+    /// Stage `bytes`, read from `address`, as the call reads them there:
+    /// the caller's own bytes, or a copy the ring fitted to one record (a
+    /// message's clamped iovec lengths or socket address length).
+    fn staged(&mut self, address: u64, bytes: Vec<u8>, output: bool) {
+        self.segments.push(NetSegment {
+            address,
+            len: bytes.len() as u32,
+            input: true,
+            output,
+        });
+        self.inputs.push(bytes);
     }
 
     /// Declare `len` user bytes at `address` the call may write. The ring
@@ -214,6 +249,158 @@ impl Plan {
     }
 }
 
+/// How one message header staged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Message {
+    /// Every range the call touches is staged.
+    Staged,
+    /// A send whose data does not fit one record: its header and iovecs
+    /// are staged, its data is not ([`host_file::NET_MESSAGE_UNSTAGED`]).
+    Unstaged,
+    /// The message cannot cross in one record: ancillary data to send, or
+    /// a later message of a batch whose data does not fit.
+    Unfitted,
+}
+
+fn word(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap_or([0; 8]))
+}
+
+impl Plan {
+    /// Whether this plan and `next` together fit one record, with a
+    /// `recvmmsg` timeout still to stage.
+    fn fits_with(&self, next: &Plan, timeout: bool) -> bool {
+        let mut segments = self.segments.clone();
+        segments.extend_from_slice(&next.segments);
+        if timeout {
+            segments.push(NetSegment {
+                address: 0,
+                len: TIMESPEC_BYTES as u32,
+                input: true,
+                output: true,
+            });
+        }
+        segments.len() <= host_file::NET_SEGMENTS_MAX
+            && record_len(
+                host_file::NET_CALLER_BYTES + NetCall::input_len(&segments),
+                NetCall::output_capacity(&segments),
+            )
+            .is_some()
+    }
+
+    /// Stage one message header at `header` (a `struct mmsghdr` when
+    /// `batch`) and every range Linux's call touches through it. `data`
+    /// counts the data bytes the call's earlier messages staged; at most one
+    /// record's data range ([`NET_TRANSFER_MAX_BYTES`]) is staged in all.
+    fn message(
+        &mut self,
+        user: &mut dyn HostFileUser,
+        header: u64,
+        send: bool,
+        batch: bool,
+        data: &mut usize,
+    ) -> Result<Message, HostFileStage> {
+        use carrick_syscall_abi::{LINUX_MMSGHDR_BYTES, LINUX_MSGHDR_BYTES};
+        let fault = |address| HostFileStage::Fault {
+            address,
+            access: Access::Read,
+        };
+        let header_len = if batch {
+            LINUX_MMSGHDR_BYTES
+        } else {
+            LINUX_MSGHDR_BYTES
+        };
+        let mut msg = Vec::new();
+        gather_user(user, &mut msg, header, header_len).map_err(fault)?;
+        let name = word(&msg, 0);
+        let namelen = u32::from_le_bytes(
+            msg[MSG_NAMELEN..MSG_NAMELEN + 4]
+                .try_into()
+                .unwrap_or([0; 4]),
+        );
+        let iov = word(&msg, MSG_IOV);
+        let iovlen = word(&msg, MSG_IOVLEN);
+        let control = word(&msg, MSG_CONTROL);
+        let controllen = word(&msg, MSG_CONTROLLEN);
+        // Linux refuses these before touching any other range.
+        if iovlen > LINUX_UIO_MAXIOV {
+            return Err(errno(carrick_syscall_abi::LINUX_EMSGSIZE));
+        }
+        if name != 0 && (namelen as i32) < 0 {
+            return Err(errno(carrick_syscall_abi::LINUX_EINVAL));
+        }
+        if send && control != 0 && controllen != 0 {
+            return Ok(Message::Unfitted);
+        }
+        let mut vectors = Vec::new();
+        gather_user(user, &mut vectors, iov, iovlen as usize * IOVEC_BYTES).map_err(fault)?;
+        let mut total: u64 = 0;
+        for vector in vectors.chunks_exact(IOVEC_BYTES) {
+            total = match total.checked_add(word(vector, 8)) {
+                Some(total) if total <= i64::MAX as u64 => total,
+                _ => return Err(errno(carrick_syscall_abi::LINUX_EINVAL)),
+            };
+        }
+        let room = NET_TRANSFER_MAX_BYTES - *data;
+        let unstaged = send && total > room as u64;
+        let mut ranges = Vec::new();
+        if !unstaged {
+            // A receive's buffers are fitted to the data range left: the
+            // staged iovec copy names the fitted lengths, the caller's own
+            // array is never written.
+            let mut left = room;
+            for vector in vectors.chunks_exact_mut(IOVEC_BYTES) {
+                let len = (word(vector, 8) as usize).min(left);
+                vector[8..16].copy_from_slice(&(len as u64).to_le_bytes());
+                left -= len;
+                if len > 0 {
+                    ranges.push((word(vector, 0), len));
+                }
+            }
+            if !send && total > room as u64 && (batch && *data > 0) {
+                // A later message of a batch gets a whole buffer or none.
+                return Ok(Message::Unfitted);
+            }
+            *data += room - left;
+        }
+        // Linux writes a received message's name, control and flag lengths
+        // back into its header, and each batched message's length after it.
+        let header_written = !send || batch;
+        if send && name != 0 && namelen != 0 {
+            // Linux reads at most a `struct sockaddr_storage`.
+            let len = namelen.min(carrick_syscall_abi::LINUX_SOCKADDR_STORAGE_BYTES as u32);
+            msg[MSG_NAMELEN..MSG_NAMELEN + 4].copy_from_slice(&len.to_le_bytes());
+        }
+        self.staged(header, msg, header_written);
+        if iovlen > 0 {
+            self.staged(iov, vectors, false);
+        }
+        for (base, len) in ranges {
+            if send {
+                self.read(user, base, len, false)?;
+            } else {
+                self.write(user, base, len)?;
+            }
+        }
+        if name != 0 && namelen != 0 {
+            let len = (namelen as usize).min(carrick_syscall_abi::LINUX_SOCKADDR_STORAGE_BYTES);
+            if send {
+                self.read(user, name, len, false)?;
+            } else {
+                self.write(user, name, len)?;
+            }
+        }
+        if !send && control != 0 && controllen != 0 {
+            self.write(user, control, (controllen as usize).min(SOCKET_OPTION_MAX))?;
+        }
+        Ok(if unstaged {
+            Message::Unstaged
+        } else {
+            Message::Staged
+        })
+    }
+}
+
 pub(super) fn stage(
     call: SocketCall,
     staging: &mut Staging<'_, '_>,
@@ -290,6 +477,56 @@ pub(super) fn stage(
             if args[4] != 0 {
                 plan.address_result(user, args[4], args[5])?;
             }
+        } else if c == nr::SENDMSG || c == nr::RECVMSG {
+            let send = c == nr::SENDMSG;
+            match plan.message(user, args[1], send, false, &mut 0)? {
+                Message::Staged => {}
+                Message::Unstaged => {
+                    args[host_file::NET_MESSAGE_UNSTAGED_ARG] = host_file::NET_MESSAGE_UNSTAGED;
+                }
+                Message::Unfitted => return Ok(false),
+            }
+        } else if c == nr::SENDMMSG || c == nr::RECVMMSG {
+            let send = c == nr::SENDMMSG;
+            let timeout = !send && args[4] != 0;
+            let vlen = args[2].min(LINUX_UIO_MAXIOV);
+            let mut data = 0usize;
+            let mut staged = 0u64;
+            while staged < vlen {
+                let Some(header) =
+                    args[1].checked_add(staged * carrick_syscall_abi::LINUX_MMSGHDR_BYTES as u64)
+                else {
+                    break;
+                };
+                let mut next = Plan::default();
+                let mut next_data = data;
+                let fitted = match next.message(user, header, send, true, &mut next_data) {
+                    Ok(fitted) => fitted,
+                    // Linux answers a later message's own error on the
+                    // caller's next call; this one moves the messages
+                    // before it.
+                    Err(HostFileStage::Returned(_)) if staged > 0 => break,
+                    Err(stage) => return Err(stage),
+                };
+                if fitted != Message::Staged || !plan.fits_with(&next, timeout) {
+                    // A send moves every message or crosses not at all; a
+                    // receive's later message that does not fit whole is
+                    // left for the caller's next call, as when no datagram
+                    // is queued for it yet.
+                    if send || staged == 0 {
+                        return Ok(false);
+                    }
+                    break;
+                }
+                plan.segments.extend(next.segments);
+                plan.inputs.extend(next.inputs);
+                data = next_data;
+                staged += 1;
+            }
+            args[2] = staged;
+            if timeout {
+                plan.read(user, args[4], TIMESPEC_BYTES, true)?;
+            }
         } else if c == nr::GETSOCKOPT {
             let mut word = [0u8; 4];
             if !user.copy_in(&mut word, args[4]) {
@@ -317,10 +554,15 @@ pub(super) fn stage(
                 plan.read(user, args[3], len, false)?;
             }
         }
-        Ok(())
+        Ok(true)
     })();
-    if let Err(stage) = staged {
-        return Some(stage);
+    match staged {
+        Err(stage) => return Some(stage),
+        // Not stageable in one record: the call stays unrouted (a counted
+        // ENOSYS), never a guessed result.
+        Ok(false) => return None,
+        Ok(true) if !plan.fits_with(&Plan::default(), false) => return None,
+        Ok(true) => {}
     }
     let inputs: Vec<&[u8]> = plan.inputs.iter().map(Vec::as_slice).collect();
     let Some(input) = NetCall::encode(call.canonical.raw(), args, &plan.segments, &inputs) else {

@@ -129,8 +129,19 @@ pub struct NetSegment {
 
 /// Largest staged bytes of one segment.
 pub const NET_SEGMENT_MAX_BYTES: usize = HOST_FILE_CHUNK_BYTES;
-/// Most segments one call stages.
-pub const NET_SEGMENTS_MAX: usize = 4;
+/// The argument word of a `sendmsg` [`NetCall`] (one no message call has)
+/// that carries [`NET_MESSAGE_UNSTAGED`].
+pub const NET_MESSAGE_UNSTAGED_ARG: usize = 5;
+/// A `sendmsg` whose data does not fit one record stages its header and
+/// iovecs but none of its data. The carrier answers EMSGSIZE for a
+/// datagram socket, whose largest datagram one record always holds, and
+/// refuses the call (a counted ENOSYS) for any other socket.
+pub const NET_MESSAGE_UNSTAGED: u64 = 1;
+
+/// Most segments one call stages: as many as the record's framing area
+/// holds. A message call (`sendmsg`, `recvmmsg`, ...) stages each header,
+/// iovec array, buffer and socket address as its own segment.
+pub const NET_SEGMENTS_MAX: usize = HOST_FILE_FRAMING_BYTES / NET_SEGMENT_BYTES;
 const NET_CALL_FIXED_BYTES: usize = 8 + 6 * 8 + 4;
 const NET_SEGMENT_BYTES: usize = 16;
 const NET_SEGMENT_INPUT: u32 = 1;
@@ -239,6 +250,18 @@ impl<'a> NetCall<'a> {
 
     pub fn segments(&self) -> &[NetSegment] {
         &self.segments
+    }
+
+    /// The encoded input length of a request with `segments`: its framing
+    /// and every input segment's staged bytes.
+    pub fn input_len(segments: &[NetSegment]) -> usize {
+        NET_CALL_FIXED_BYTES
+            + segments.len() * NET_SEGMENT_BYTES
+            + segments
+                .iter()
+                .filter(|segment| segment.input)
+                .map(|segment| segment.len as usize)
+                .sum::<usize>()
     }
 
     /// Each segment with its staged bytes (`None` for an output-only one).
