@@ -8,7 +8,275 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-mod closure;
+mod closure {
+    //! Remaining baseline leaves, hand-written from Arm ARM DDI0487G.a.
+    use crate::Instruction;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BarrierKind {
+        Dsb,
+        Dmb,
+        Isb,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BarrierDomain {
+        OuterShareable,
+        NonShareable,
+        InnerShareable,
+        FullSystem,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BarrierAccess {
+        Reads,
+        Writes,
+        All,
+    }
+    /// DDI0487G.a C6.2.80 DMB, C6.2.82 DSB, C6.2.97 ISB;
+    /// C4.1.3 encoding index, Barriers. Reserved options deliberately fail shut,
+    /// including the reserved options architecturally executed as full-system.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Barrier {
+        pub kind: BarrierKind,
+        pub domain: BarrierDomain,
+        pub access: BarrierAccess,
+        pub option: crate::ExclusiveOption,
+    }
+    fn barrier(w: u32) -> Option<Instruction> {
+        let kind = match w & 0xfffff0ff {
+            0xd503309f => BarrierKind::Dsb,
+            0xd50330bf => BarrierKind::Dmb,
+            0xd50330df if w == 0xd5033fdf => BarrierKind::Isb,
+            _ => return None,
+        };
+        let option = ((w >> 8) & 15) as u8;
+        let access = match option & 3 {
+            1 => BarrierAccess::Reads,
+            2 => BarrierAccess::Writes,
+            3 => BarrierAccess::All,
+            _ => return None,
+        };
+        let domain = match option >> 2 {
+            0 => BarrierDomain::OuterShareable,
+            1 => BarrierDomain::NonShareable,
+            2 => BarrierDomain::InnerShareable,
+            _ => BarrierDomain::FullSystem,
+        };
+        Some(Instruction::Barrier(Barrier {
+            kind,
+            domain,
+            access,
+            option: crate::ExclusiveOption::from_option(option),
+        }))
+    }
+
+    /// Architectural system-register identity. The original census fields remain
+    /// available through `encoding`; names never discard or alias that identity.
+    /// DDI0487G.a C6.2.194 MRS, C6.2.196 MSR (register), C4.1.3
+    /// System register move; D13 AArch64 System Register Descriptions.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum NamedSystemRegister {
+        /// DDI0487G.a D13.2.135 TTBR0_EL1.
+        Ttbr0El1,
+        /// DDI0487G.a D13.2.138 TTBR1_EL1.
+        Ttbr1El1,
+        /// DDI0487G.a C5.2.11 SP_EL0.
+        SpEl0,
+        /// DDI0487G.a D13.2.130 TPIDR_EL0.
+        TpidrEl0,
+        /// DDI0487G.a D13.2.134 TPIDRRO_EL0.
+        TpidrroEl0,
+        /// DDI0487G.a D13.2.28 CONTEXTIDR_EL1.
+        ContextidrEl1,
+        /// DDI0487G.a C5.2.7 FPCR.
+        Fpcr,
+        /// DDI0487G.a C5.2.8 FPSR.
+        Fpsr,
+        /// DDI0487G.a C5.2.2 DAIF.
+        Daif,
+        /// DDI0487G.a C5.2.10 PAN.
+        Pan,
+        /// DDI0487G.a D13.2.103 PAR_EL1.
+        ParEl1,
+        /// DDI0487G.a D13.8.1 CNTFRQ_EL0.
+        CntfrqEl0,
+        /// DDI0487G.a D13.8.29 CNTVCT_EL0.
+        CntvctEl0,
+        /// DDI0487G.a D13.8.25 CNTV_CTL_EL0.
+        CntvCtlEl0,
+        /// DDI0487G.a D13.8.26 CNTV_CVAL_EL0.
+        CntvCvalEl0,
+        /// DDI0487G.a D13.2.99 MPIDR_EL1.
+        MpidrEl1,
+        /// DDI0487G.a D12.3 Table D12-2, system-register encodings (GIC register space).
+        IccIar1El1,
+        /// DDI0487G.a D12.3 Table D12-2, system-register encodings (GIC register space).
+        IccEoir1El1,
+        /// DDI0487G.a D12.3 Table D12-2, system-register encodings (GIC register space).
+        IccSgi1rEl1,
+        Unnamed(crate::SystemRegister),
+    }
+    impl NamedSystemRegister {
+        pub fn from_encoding(r: crate::SystemRegister) -> Self {
+            match (r.op0, r.op1, r.crn, r.crm, r.op2) {
+                (3, 0, 2, 0, 0) => Self::Ttbr0El1,
+                (3, 0, 2, 0, 1) => Self::Ttbr1El1,
+                (3, 0, 4, 1, 0) => Self::SpEl0,
+                (3, 3, 13, 0, 2) => Self::TpidrEl0,
+                (3, 3, 13, 0, 3) => Self::TpidrroEl0,
+                (3, 0, 13, 0, 1) => Self::ContextidrEl1,
+                (3, 3, 4, 4, 0) => Self::Fpcr,
+                (3, 3, 4, 4, 1) => Self::Fpsr,
+                (3, 3, 4, 2, 1) => Self::Daif,
+                (3, 0, 4, 2, 3) => Self::Pan,
+                (3, 0, 7, 4, 0) => Self::ParEl1,
+                (3, 3, 14, 0, 0) => Self::CntfrqEl0,
+                (3, 3, 14, 0, 2) => Self::CntvctEl0,
+                (3, 3, 14, 3, 1) => Self::CntvCtlEl0,
+                (3, 3, 14, 3, 2) => Self::CntvCvalEl0,
+                (3, 0, 0, 0, 5) => Self::MpidrEl1,
+                (3, 0, 12, 12, 0) => Self::IccIar1El1,
+                (3, 0, 12, 12, 1) => Self::IccEoir1El1,
+                (3, 0, 12, 11, 5) => Self::IccSgi1rEl1,
+                _ => Self::Unnamed(r),
+            }
+        }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SystemDirection {
+        Read,
+        Write,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SystemAccess {
+        pub direction: SystemDirection,
+        pub encoding: crate::SystemRegister,
+        pub register: NamedSystemRegister,
+        pub rt: crate::OperandRegister,
+    }
+    /// DDI0487G.a C6.2.195 MSR (immediate); C4.1.3 PSTATE encoding index.
+    /// Feature-dependent fields are decoded, without asserting execution support.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PstateField {
+        SpSel,
+        DaifSet,
+        DaifClr,
+        Pan,
+        Uao,
+        Dit,
+        Ssbs,
+        Tco,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PstateImmediate {
+        pub field: PstateField,
+        pub immediate: u8,
+    }
+    fn system(w: u32) -> Option<Instruction> {
+        if w & 0xffd00000 == 0xd5100000 {
+            let encoding = crate::SystemRegister::from_word(w);
+            return Some(Instruction::SystemAccess(SystemAccess {
+                direction: if w & (1 << 21) != 0 {
+                    SystemDirection::Read
+                } else {
+                    SystemDirection::Write
+                },
+                register: NamedSystemRegister::from_encoding(encoding),
+                encoding,
+                rt: crate::OperandRegister::field(w, false),
+            }));
+        }
+        if w & 0xfff8f01f != 0xd500401f {
+            return None;
+        }
+        let field = match ((w >> 16) & 7, (w >> 5) & 7) {
+            (0, 3) => PstateField::Uao,
+            (0, 4) => PstateField::Pan,
+            (0, 5) => PstateField::SpSel,
+            (3, 1) => PstateField::Ssbs,
+            (3, 2) => PstateField::Dit,
+            (3, 4) => PstateField::Tco,
+            (3, 6) => PstateField::DaifSet,
+            (3, 7) => PstateField::DaifClr,
+            _ => return None,
+        };
+        Some(Instruction::PstateImmediate(PstateImmediate {
+            field,
+            immediate: ((w >> 8) & 15) as u8,
+        }))
+    }
+    pub(crate) fn decode(w: u32) -> Option<Instruction> {
+        barrier(w)
+            .or_else(|| system(w))
+            .or_else(|| exception(w))
+            .or_else(|| extract(w))
+    }
+
+    /// DDI0487G.a C6.2.38 BRK, C6.2.76–78 DCPS1/2/3, C6.2.93 HLT,
+    /// C6.2.94 HVC, C6.2.241 SMC, C6.2.321 SVC;
+    /// C4.1.3 Exception generation encoding index, pp. C4-286–287.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ExceptionKind {
+        Svc,
+        Hvc,
+        Smc,
+        Brk,
+        Hlt,
+        Dcps1,
+        Dcps2,
+        Dcps3,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ExceptionGeneration {
+        pub kind: ExceptionKind,
+        pub immediate: u16,
+    }
+    fn exception(w: u32) -> Option<Instruction> {
+        let kind = match w & 0xffe0001f {
+            0xd4000001 => ExceptionKind::Svc,
+            0xd4000002 => ExceptionKind::Hvc,
+            0xd4000003 => ExceptionKind::Smc,
+            0xd4200000 => ExceptionKind::Brk,
+            0xd4400000 => ExceptionKind::Hlt,
+            0xd4a00001 => ExceptionKind::Dcps1,
+            0xd4a00002 => ExceptionKind::Dcps2,
+            0xd4a00003 => ExceptionKind::Dcps3,
+            _ => return None,
+        };
+        Some(Instruction::ExceptionGeneration(ExceptionGeneration {
+            kind,
+            immediate: ((w >> 5) & 0xffff) as u16,
+        }))
+    }
+
+    /// DDI0487G.a C6.2.90 EXTR; C4.1.2 Extract encoding index.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Extract {
+        pub width: crate::Width,
+        pub rm: crate::OperandRegister,
+        pub rn: crate::OperandRegister,
+        pub rd: crate::OperandRegister,
+        pub lsb: u8,
+    }
+    fn extract(w: u32) -> Option<Instruction> {
+        if w & 0x7fa00000 != 0x13800000
+            || (w >> 22) & 1 != w >> 31
+            || (w >> 31 == 0 && w & 0x8000 != 0)
+        {
+            return None;
+        }
+        Some(Instruction::Extract(Extract {
+            width: if w >> 31 == 0 {
+                crate::Width::W32
+            } else {
+                crate::Width::X64
+            },
+            rm: crate::OperandRegister::field(w >> 16, false),
+            rn: crate::OperandRegister::field(w >> 5, false),
+            rd: crate::OperandRegister::field(w, false),
+            lsb: ((w >> 10) & 63) as u8,
+        }))
+    }
+}
 pub use closure::*;
 
 mod decode {
