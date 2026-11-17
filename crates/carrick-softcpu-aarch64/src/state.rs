@@ -35,6 +35,8 @@ impl InterruptMasks {
 }
 /// D1.6 PSTATE; C5.2.17 SPSR_EL1 bit layout. SS is outside this profile.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// Public fields are raw provider state. Architectural transitions never create
+/// EL0+SP=1; banking and save canonicalize that raw combination to EL0t.
 pub struct Pstate {
     pub el: ExceptionLevel,
     pub sp: StackSelect,
@@ -53,7 +55,7 @@ impl Pstate {
                 | (u64::from(self.uao) << 23)
                 | (u64::from(self.il) << 20)
                 | (u64::from(self.el == ExceptionLevel::El1) << 2)
-                | u64::from(self.sp == StackSelect::El1),
+                | u64::from(self.el == ExceptionLevel::El1 && self.sp == StackSelect::El1),
         )
     }
     pub(crate) fn restore(saved: SavedPstate) -> Option<Self> {
