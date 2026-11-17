@@ -1088,7 +1088,7 @@ pub(crate) enum DebugCommand {
         /// Linked AArch64 ELF. Without a path, scan embedded flat bytes
         /// conservatively (includes data and cannot establish code closure).
         input: Option<PathBuf>,
-        /// Fail with exit 1 if any declared executable word is unknown.
+        /// Fail with exit 1 on any unknown or typed-undecoded executable word.
         #[arg(long)]
         strict: bool,
     },
