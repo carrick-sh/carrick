@@ -29,6 +29,7 @@ vm_free = [
   "carrick-xtask::lease_supervisor::macos_scope::tests::privileged_identity_is_observable_without_signal_permission",
   "carrick-xtask::lease_supervisor::serial_host::missing_children_cleanup_fixture",
   "carrick-xtask::lease_supervisor::serial_host::missing_children_file_still_reaps_and_releases",
+  "carrick-xtask::signed_gate::tests::execute_entry_uses_real_shared_build_and_releases_before_accept",
   "carrick-xtask::signed_gate::tests::side_phases_release_build_lease_before_accept_admission",
   "carrick-xtask::target_prune::tests::either_shared_or_exclusive_host_lease_prevents_pruning",
   "carrick-xtask::tests::host_lease::cancellation_preserves_another_checkout_with_identical_command",

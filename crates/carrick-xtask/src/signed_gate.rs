@@ -1296,6 +1296,21 @@ enum SidePhase {
     Inspect,
 }
 
+#[cfg(test)]
+thread_local! {
+    // Only the external build/guest operations are doubled. The execute entry,
+    // pairing, detached checkout and kernel-backed host leases remain real.
+    static EXECUTE_WITNESS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn acquire_side_lease(mode: HostLeaseMode) -> Result<HostLease, ReceiptError> {
+    #[cfg(test)]
+    if let Some(path) = EXECUTE_WITNESS.with(|slot| slot.borrow().clone()) {
+        return HostLease::acquire_path(&path, mode).map_err(|e| fail(e.to_string()));
+    }
+    HostLease::acquire(mode).map_err(|e| fail(e.to_string()))
+}
+
 fn side_phases<L>(
     mut acquire: impl FnMut(HostLeaseMode) -> Result<L, ReceiptError>,
     mut run: impl FnMut(SidePhase, Option<&L>) -> Result<(), ReceiptError>,
@@ -1329,7 +1344,10 @@ fn execute(
     candidate_probes: Option<&Path>,
     reuse_base: Option<&Path>,
 ) -> Result<(), ReceiptError> {
-    if std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64" {
+    let supported = std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64";
+    #[cfg(test)]
+    let supported = supported || EXECUTE_WITNESS.with(|slot| slot.borrow().is_some());
+    if !supported {
         return Err(fail("requires macOS ARM64"));
     }
     let request: Request =
@@ -1627,142 +1645,165 @@ fn execute_one(
     // repository's physical path for exact artifact-path comparisons.
     let tree = fs::canonicalize(&tree).map_err(|e| fail(e.to_string()))?;
     let receipt_path = output.join(receipt_name);
-    let result = side_phases(
-        |mode| HostLease::acquire(mode).map_err(|e| fail(e.to_string())),
-        |phase, lease| {
-            let xtask = std::env::current_exe().map_err(|e| fail(e.to_string()))?;
-            if phase == SidePhase::Prepare {
-                let lease = lease.ok_or_else(|| fail("fixture publication requires gate lease"))?;
-                let mut fetch = Command::new(&xtask);
-                fetch.current_dir(&tree).args([
-                    "--root",
-                    &tree.to_string_lossy(),
-                    "fixtures",
-                    "fetch",
-                ]);
-                if !logged(&mut fetch, lease, &output.join("fixture-fetch.log"))? {
-                    return Err(fail("fixture dependency fetch failed"));
+    let result = side_phases(acquire_side_lease, |phase, lease| {
+        #[cfg(test)]
+        if let Some(path) = EXECUTE_WITNESS.with(|slot| slot.borrow().clone()) {
+            use std::os::fd::AsRawFd;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| fail(e.to_string()))?;
+            let operation = if phase == SidePhase::Accept {
+                libc::LOCK_EX
+            } else {
+                libc::LOCK_SH
+            };
+            // SAFETY: a separate open file description probes the real lock.
+            let admitted = unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0;
+            assert_eq!(
+                admitted,
+                matches!(phase, SidePhase::Build | SidePhase::Accept),
+                "{side:?} {phase:?}"
+            );
+            assert_eq!(
+                lease.map(HostLease::mode),
+                match phase {
+                    SidePhase::Build => Some(HostLeaseMode::Carrick),
+                    SidePhase::Accept => None,
+                    _ => Some(HostLeaseMode::Gate),
                 }
-                verify_fixture_artifact(&tree, bundle, candidate_probes, commit, publisher)?;
-                let mut restore = Command::new(&xtask);
-                restore.current_dir(&tree).args([
-                    "--root",
-                    &tree.to_string_lossy(),
-                    "fixtures",
-                    "restore",
-                    "--bundle",
-                    &bundle.to_string_lossy(),
-                ]);
-                if let Some(set) = candidate_probes {
-                    restore.arg("--candidate-probes").arg(set);
-                }
-                if !logged(&mut restore, lease, &output.join("fixture-restore.log"))? {
-                    return Err(fail(
-                        "fixture restore failed for the authorized exact-SHA artifact",
-                    ));
-                }
-                // The public build recipe performs exclusive disk admission
-                // before its shared build body. Preserve that ordering here,
-                // rather than attempting gate admission under shared carrick.
-                let mut disk = Command::new("just");
-                disk.current_dir(&tree)
-                    .env("CARRICK_XTASK_BIN", &xtask)
-                    .arg("check-disk");
-                if !logged(&mut disk, lease, &output.join("disk-admission.log"))? {
-                    return Err(fail("build disk admission failed"));
-                }
-                return Ok(());
+            );
+            write(&output.join(format!("{phase:?}.witness")), b"observed")?;
+            return Ok(());
+        }
+        let xtask = std::env::current_exe().map_err(|e| fail(e.to_string()))?;
+        if phase == SidePhase::Prepare {
+            let lease = lease.ok_or_else(|| fail("fixture publication requires gate lease"))?;
+            let mut fetch = Command::new(&xtask);
+            fetch
+                .current_dir(&tree)
+                .args(["--root", &tree.to_string_lossy(), "fixtures", "fetch"]);
+            if !logged(&mut fetch, lease, &output.join("fixture-fetch.log"))? {
+                return Err(fail("fixture dependency fetch failed"));
             }
-            if phase == SidePhase::Build {
-                let lease = lease.ok_or_else(|| fail("build requires carrick lease"))?;
-                let mut build = Command::new("just");
-                build.current_dir(&tree).arg("_build");
-                if !logged(&mut build, lease, &output.join("build.log"))? {
-                    return Err(fail("just build failed"));
-                }
-                return Ok(());
+            verify_fixture_artifact(&tree, bundle, candidate_probes, commit, publisher)?;
+            let mut restore = Command::new(&xtask);
+            restore.current_dir(&tree).args([
+                "--root",
+                &tree.to_string_lossy(),
+                "fixtures",
+                "restore",
+                "--bundle",
+                &bundle.to_string_lossy(),
+            ]);
+            if let Some(set) = candidate_probes {
+                restore.arg("--candidate-probes").arg(set);
             }
-            if phase == SidePhase::Accept {
-                let mut accept = crate::command::locked_cargo();
-                accept.current_dir(&tree).args([
-                    "run",
-                    "--locked",
-                    "-p",
-                    "carrick-xtask",
-                    "--",
-                    "accept",
-                    "--profile",
-                    "no-docker",
-                    "--phase",
-                    "signed",
-                    "--receipt",
-                    &receipt_path.to_string_lossy(),
-                ]);
-                let accepted = logged_optional(&mut accept, lease, &output.join("accept.log"))?;
-                write(
-                    &output.join(ACCEPT_EXIT),
-                    json!({"success": accepted}).to_string(),
-                )?;
-                return Ok(());
-            }
-            let lease = lease.ok_or_else(|| fail("inspection requires gate lease"))?;
-            // accept rebuilds once before testing. Its receipt
-            // names that artifact; inspect it independently before releasing the lease.
-            let mut receipt = load(&receipt_path)?;
-            // Capture on the execution Mac, including when the commit predates
-            // host-aware accept receipts. Never infer identity on the hosted publisher.
-            receipt.host_identity = crate::accept::SignedHostIdentity::capture();
-            // Both runs of a pair restore the base's trusted bundle. Record its
-            // identity with this trusted executor's validation, so a base commit
-            // whose accept predates content identity remains comparable.
-            let trusted = crate::accept::verify_signed_fixtures(&tree)
-                .map_err(|e| fail(format!("trusted fixture validation: {e}")))?;
-            if let Some(recorded) = &receipt.fixture_validation
-                && recorded.inputs_sha256 != trusted.inputs_sha256
-            {
+            if !logged(&mut restore, lease, &output.join("fixture-restore.log"))? {
                 return Err(fail(
-                    "accept recorded fixture inputs that differ from the restored bundle",
+                    "fixture restore failed for the authorized exact-SHA artifact",
                 ));
             }
-            receipt.fixture_validation = Some(trusted);
-            write(
-                &receipt_path,
-                serde_json::to_vec_pretty(&receipt).map_err(|e| fail(e.to_string()))?,
-            )?;
-            // Older accept receipts encode an unknown reap as remaining_count=0
-            // plus human diagnostics. Prove cleanup again without parsing those
-            // diagnostics or allowing them to disappear behind known test failures.
-            for (index, count) in receipt.cleanup_counts.iter().enumerate() {
-                let log = output.join(format!("cleanup-{index}.log"));
-                let mut reap = Command::new(tree.join("scripts/sudo/kill.sh"));
-                reap.current_dir(&tree).arg(&count.run_id);
-                if !logged(&mut reap, lease, &log)?
-                    || parse_cleanup_count(
-                        &fs::read_to_string(&log).map_err(|e| fail(e.to_string()))?,
-                    ) != Some(0)
-                {
-                    return Err(fail(format!(
-                        "independent scoped cleanup failed for {}",
-                        count.step
-                    )));
-                }
+            // The public build recipe performs exclusive disk admission
+            // before its shared build body. Preserve that ordering here,
+            // rather than attempting gate admission under shared carrick.
+            let mut disk = Command::new("just");
+            disk.current_dir(&tree)
+                .env("CARRICK_XTASK_BIN", &xtask)
+                .arg("check-disk");
+            if !logged(&mut disk, lease, &output.join("disk-admission.log"))? {
+                return Err(fail("build disk admission failed"));
             }
-            write(
-                &output.join("cleanup.json"),
-                serde_json::to_vec_pretty(&receipt.cleanup_counts)
-                    .map_err(|e| fail(e.to_string()))?,
-            )?;
-            let identity = inspect_artifact(&tree).map_err(fail)?;
-            if receipt.artifact.as_ref() != Some(&identity) {
-                return Err(fail("post-gate artifact identity differs from the receipt"));
+            return Ok(());
+        }
+        if phase == SidePhase::Build {
+            let lease = lease.ok_or_else(|| fail("build requires carrick lease"))?;
+            let mut build = Command::new("just");
+            build.current_dir(&tree).arg("_build");
+            if !logged(&mut build, lease, &output.join("build.log"))? {
+                return Err(fail("just build failed"));
             }
+            return Ok(());
+        }
+        if phase == SidePhase::Accept {
+            let mut accept = crate::command::locked_cargo();
+            accept.current_dir(&tree).args([
+                "run",
+                "--locked",
+                "-p",
+                "carrick-xtask",
+                "--",
+                "accept",
+                "--profile",
+                "no-docker",
+                "--phase",
+                "signed",
+                "--receipt",
+                &receipt_path.to_string_lossy(),
+            ]);
+            let accepted = logged_optional(&mut accept, lease, &output.join("accept.log"))?;
             write(
-                &output.join("identity.json"),
-                serde_json::to_vec_pretty(&identity).map_err(|e| fail(e.to_string()))?,
+                &output.join(ACCEPT_EXIT),
+                json!({"success": accepted}).to_string(),
             )?;
-            validate_side_receipt(side, &receipt, commit)
-        },
-    );
+            return Ok(());
+        }
+        let lease = lease.ok_or_else(|| fail("inspection requires gate lease"))?;
+        // accept rebuilds once before testing. Its receipt
+        // names that artifact; inspect it independently before releasing the lease.
+        let mut receipt = load(&receipt_path)?;
+        // Capture on the execution Mac, including when the commit predates
+        // host-aware accept receipts. Never infer identity on the hosted publisher.
+        receipt.host_identity = crate::accept::SignedHostIdentity::capture();
+        // Both runs of a pair restore the base's trusted bundle. Record its
+        // identity with this trusted executor's validation, so a base commit
+        // whose accept predates content identity remains comparable.
+        let trusted = crate::accept::verify_signed_fixtures(&tree)
+            .map_err(|e| fail(format!("trusted fixture validation: {e}")))?;
+        if let Some(recorded) = &receipt.fixture_validation
+            && recorded.inputs_sha256 != trusted.inputs_sha256
+        {
+            return Err(fail(
+                "accept recorded fixture inputs that differ from the restored bundle",
+            ));
+        }
+        receipt.fixture_validation = Some(trusted);
+        write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&receipt).map_err(|e| fail(e.to_string()))?,
+        )?;
+        // Older accept receipts encode an unknown reap as remaining_count=0
+        // plus human diagnostics. Prove cleanup again without parsing those
+        // diagnostics or allowing them to disappear behind known test failures.
+        for (index, count) in receipt.cleanup_counts.iter().enumerate() {
+            let log = output.join(format!("cleanup-{index}.log"));
+            let mut reap = Command::new(tree.join("scripts/sudo/kill.sh"));
+            reap.current_dir(&tree).arg(&count.run_id);
+            if !logged(&mut reap, lease, &log)?
+                || parse_cleanup_count(&fs::read_to_string(&log).map_err(|e| fail(e.to_string()))?)
+                    != Some(0)
+            {
+                return Err(fail(format!(
+                    "independent scoped cleanup failed for {}",
+                    count.step
+                )));
+            }
+        }
+        write(
+            &output.join("cleanup.json"),
+            serde_json::to_vec_pretty(&receipt.cleanup_counts).map_err(|e| fail(e.to_string()))?,
+        )?;
+        let identity = inspect_artifact(&tree).map_err(fail)?;
+        if receipt.artifact.as_ref() != Some(&identity) {
+            return Err(fail("post-gate artifact identity differs from the receipt"));
+        }
+        write(
+            &output.join("identity.json"),
+            serde_json::to_vec_pretty(&identity).map_err(|e| fail(e.to_string()))?,
+        )?;
+        validate_side_receipt(side, &receipt, commit)
+    });
     // Preserve logs even on errors before dropping the detached worktree.
     let logs = tree.join("target/el1-gate");
     let log_copy = if logs.exists() {
@@ -2210,6 +2251,67 @@ mod tests {
     use std::process::ExitStatus;
 
     const TIMEOUT: &str = "fatal: unable to access 'https://github.com/carrick-sh/carrick/': Recv failure: Operation timed out";
+
+    #[test]
+    fn execute_entry_uses_real_shared_build_and_releases_before_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+            vec!["remote", "add", "origin", "."],
+        ] {
+            checked("git", &args, Some(&repo)).unwrap();
+        }
+        let commit = checked("git", &["rev-parse", "HEAD"], Some(&repo))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let request = dir.path().join("request.json");
+        write(
+            &request,
+            serde_json::to_vec(&Request {
+                kind: RequestKind::MergeGroup,
+                prs: vec![42],
+                sha: commit.clone(),
+                base: commit,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let bundle = dir.path().join("bundle");
+        write(&bundle, b"external fixture operations doubled").unwrap();
+        EXECUTE_WITNESS.with(|slot| *slot.borrow_mut() = Some(dir.path().join("host.lock")));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                EXECUTE_WITNESS.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        let output = dir.path().join("results");
+        execute(&repo, &request, &output, &bundle, None, None).unwrap();
+        for side in [output.clone(), output.join(BASE_DIR)] {
+            for phase in ["Prepare", "Build", "Accept", "Inspect"] {
+                assert!(side.join(format!("{phase}.witness")).is_file());
+            }
+        }
+        assert!(
+            HostLease::try_exclusive(&dir.path().join("host.lock"))
+                .unwrap()
+                .is_some()
+        );
+    }
 
     fn exit(code: i32, stderr: &str) -> CommandError {
         CommandError::NonZeroExit {
