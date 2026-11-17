@@ -1,3 +1,10 @@
+# #2480 slice 1 (N1 vocabulary): aarch64::LeafAccess moved verbatim into the
+# neutral carrick-mmu-core stage1 module (crates/carrick-mmu-core/src/stage1.rs)
+# and aarch64.rs re-exports it; x86::descriptor_txn::Access is now the same
+# type. Discriminants and the stale-stage1 probe wire encoding are unchanged
+# (explicit wire conversion added). No ARM descriptor, walk, publication or
+# refusal behaviour changes: the bindings below remain the regression
+# evidence and no new acceptance is claimed.
 # #1394: additional ABI bookkeeping witness only; existing semantic and
 # work-budget bindings remain authoritative. Census publication reads counters
 # after executor join and does not alter this contract's guest operation.

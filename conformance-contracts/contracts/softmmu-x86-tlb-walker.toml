@@ -1,3 +1,13 @@
+# #2480 slice 1 (N1 vocabulary): LeafAccess moved verbatim from
+# carrick-mmu-core aarch64 and LeafSize from x86::descriptor_txn into the
+# neutral carrick-mmu-core stage1 module (crates/carrick-mmu-core/src/stage1.rs);
+# aarch64::LeafAccess and x86::descriptor_txn::{Access, LeafSize} are now
+# re-exports of the same types. LeafAccess gains an explicit probe wire
+# conversion (Read=0, Write=1, Execute=2, unchanged). No semantic, layout or
+# work change: the existing bindings below remain the regression evidence,
+# re-run unchanged at this head; no new acceptance is claimed.
+# Pinned additionally by carrick-softmmu tlb::layout_pin_tests (SoftTlbEntry
+# layout, tag constants and the 64-mode x86 tag matrix, recorded on main).
 schema_version = 1
 id = "softmmu.x86.tlb-walker"
 title = "Software vCPU linear guest-physical placement, per-CPU SoftTlb, and stage-1 x86-64 walker binding"
