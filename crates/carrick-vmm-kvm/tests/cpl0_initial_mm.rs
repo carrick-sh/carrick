@@ -5641,6 +5641,160 @@ fn native_child_inet_repoll_after_eintr_waits_its_own_timeout() {
     );
 }
 
+/// A resolver's name servers on loopback (#2418): a UDP responder on
+/// 127.0.0.1 and one on `::1`, each answering every datagram with `R` and
+/// its payload until the test ends.
+struct DnsResponders {
+    defines: Vec<String>,
+}
+
+impl DnsResponders {
+    fn start() -> Self {
+        let wire = |port: u16| port.swap_bytes().to_string();
+        let answer = |socket: std::net::UdpSocket| {
+            std::thread::spawn(move || {
+                let mut query = [0u8; 512];
+                while let Ok((len, from)) = socket.recv_from(&mut query) {
+                    let mut reply = vec![b'R'];
+                    reply.extend_from_slice(&query[..len]);
+                    let _ = socket.send_to(&reply, from);
+                }
+            });
+        };
+        let v4 = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp responder");
+        let v6 = std::net::UdpSocket::bind("[::1]:0").expect("udp6 responder");
+        let defines = vec![
+            format!(
+                "-DDNS_PORT={}",
+                wire(v4.local_addr().expect("bound").port())
+            ),
+            format!(
+                "-DDNS6_PORT={}",
+                wire(v6.local_addr().expect("bound").port())
+            ),
+        ];
+        answer(v4);
+        answer(v6);
+        Self { defines }
+    }
+}
+
+/// What Linux answers each step of the `DNS_PORT` mode of
+/// `native_child_inet.S`, as the Docker oracle ran the same fixture: a
+/// descriptor-valued step is any descriptor (`None` here), every other step
+/// its exact result.
+const DNS_STEP_ORACLE: [Option<i64>; 30] = [
+    None,     // 0 socket(AF_INET6, SOCK_DGRAM)
+    Some(0),  // 1 connect [::1]
+    Some(3),  // 2 write
+    Some(1),  // 3 poll(POLLIN)
+    Some(4),  // 4 read "Rgo6"
+    None,     // 5 epoll_create1
+    None,     // 6 socket(AF_INET, SOCK_DGRAM)
+    Some(0),  // 7 connect 127.0.0.1
+    Some(0),  // 8 epoll_ctl(ADD)
+    Some(3),  // 9 write
+    Some(1),  // 10 epoll_wait
+    Some(5),  // 11 its events: EPOLLIN|EPOLLOUT
+    Some(4),  // 12 read "Rgo4"
+    None,     // 13 socket(AF_INET, SOCK_DGRAM)
+    Some(0),  // 14 connect
+    Some(2),  // 15 sendmmsg of two
+    Some(7),  // 16 msg_len of the A query
+    Some(10), // 17 msg_len of the AAAA query
+    Some(1),  // 18 poll(POLLIN)
+    Some(8),  // 19 recvfrom "RA-query"
+    Some(1),  // 20 poll(POLLIN)
+    Some(11), // 21 recvfrom "RAAAA-query"
+    Some(7),  // 22 sendmsg
+    Some(1),  // 23 poll(POLLIN)
+    Some(8),  // 24 recvmsg
+    Some(16), // 25 its msg_namelen
+    Some(1),  // 26 sendto
+    Some(1),  // 27 poll(POLLIN)
+    Some(1),  // 28 recvmmsg of one
+    Some(2),  // 29 its msg_len "Rq"
+];
+
+/// Run the `DNS_PORT` mode (`root`: in the run root, else in a forked
+/// native child) and return each step's raw result.
+fn dns_style_udp_steps(root: bool) -> Vec<i64> {
+    let responders = DnsResponders::start();
+    let mut defines = vec!["-DTCP_PORT=0", "-DUDP_PORT=0", "-DTCP_NB_PORT=0"];
+    defines.extend(responders.defines.iter().map(String::as_str));
+    if root {
+        defines.push("-DDNS_ROOT");
+    }
+    let elf = native_exit_fixture_with_flags("native_child_inet.S", &defines);
+    let outcome = run_exec_fixture(&elf, 256);
+    assert_eq!(outcome.run.exit_code, 0, "{:?}", outcome.run);
+    outcome
+        .run
+        .stdout
+        .chunks_exact(8)
+        .map(|word| i64::from_le_bytes(word.try_into().expect("one step")))
+        .collect()
+}
+
+/// Go's resolver dial: a connected AF_INET6 datagram socket, write, poll
+/// and read.
+const GO_DIAL_STEPS: core::ops::RangeInclusive<usize> = 0..=4;
+/// Go's netpoller: a connected AF_INET datagram socket in an epoll set.
+const GO_NETPOLL_STEPS: core::ops::RangeInclusive<usize> = 5..=12;
+/// glibc's resolver: sendmmsg of A and AAAA, recvfrom, and the other
+/// message calls (sendmsg, recvmsg, recvmmsg).
+const GLIBC_STEPS: core::ops::RangeInclusive<usize> = 13..=29;
+
+fn assert_dns_steps_are_linux(steps: &[i64], ranges: &[core::ops::RangeInclusive<usize>]) {
+    assert_eq!(steps.len(), DNS_STEP_ORACLE.len(), "{steps:?}");
+    let mismatched: Vec<(usize, i64, Option<i64>)> = ranges
+        .iter()
+        .flat_map(|range| range.clone())
+        .map(|step| (step, steps[step], DNS_STEP_ORACLE[step]))
+        .filter(|(_, got, want)| match want {
+            Some(want) => got != want,
+            None => *got < 0,
+        })
+        .collect();
+    assert!(
+        mismatched.is_empty(),
+        "(step, carrick, linux) where they differ (-38 is ENOSYS): {mismatched:?}; all: {steps:?}"
+    );
+}
+
+/// #2418: a forked native child makes glibc's resolver calls (sendmmsg of
+/// A and AAAA queries on a connected UDP socket, poll, recvfrom, and
+/// sendmsg, recvmsg and recvmmsg) and Go's resolver dial (a connected
+/// AF_INET6 socket, write, poll, read) against loopback name servers, with
+/// the Docker oracle's results. Red before the message calls were staged:
+/// sendmmsg, sendmsg, recvmsg and recvmmsg were each a counted ENOSYS.
+#[test]
+fn native_child_glibc_resolver_calls_answer_as_linux() {
+    assert_dns_steps_are_linux(&dns_style_udp_steps(false), &[GO_DIAL_STEPS, GLIBC_STEPS]);
+}
+
+/// #2418 item 2: Go's netpoller adds the dialed socket to its epoll set.
+/// A native child's `epoll_ctl(EPOLL_CTL_ADD)` of a host socket is a
+/// counted ENOSYS, which Go's dial returns unwrapped (`dial udp [::1]:53:
+/// function not implemented`).
+#[test]
+#[ignore = "#2418 item 2: a ring epoll set does not admit a host socket yet"]
+fn native_child_go_netpoller_adds_a_udp_socket_to_epoll() {
+    assert_dns_steps_are_linux(&dns_style_udp_steps(false), &[GO_NETPOLL_STEPS]);
+}
+
+/// #2418 item 3: the x86 run root makes the same resolver calls itself.
+/// Its `socket()` is a counted ENOSYS: x86 has no crossing for the socket
+/// family, and the venue serves only a native child's.
+#[test]
+#[ignore = "#2418 item 3: the x86 run root's sockets are not served yet"]
+fn run_root_resolver_calls_answer_as_linux() {
+    assert_dns_steps_are_linux(
+        &dns_style_udp_steps(true),
+        &[GO_DIAL_STEPS, GO_NETPOLL_STEPS, GLIBC_STEPS],
+    );
+}
+
 /// #231: a forked native child's blocking AF_INET/AF_INET6 TCP and UDP
 /// sockets cross to the host network: socket, setsockopt, connect,
 /// getsockopt(SO_ERROR), getpeername, send, recv (MSG_WAITALL), shutdown,
