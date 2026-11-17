@@ -141,6 +141,15 @@ fn reg(number: u32) -> OperandRegister {
 }
 fn llvm(words: &[u32], group: &str) -> Option<Vec<String>> {
     std::env::var_os("CARRICK_LLVM_OBJDUMP")?;
+    assert_eq!(
+        words
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        words.len(),
+        "distinct differential words"
+    );
+    println!("{group}: {} distinct LLVM cross-checks", words.len());
     Some(oracle_lines(words, group).expect("LLVM oracle succeeds"))
 }
 
@@ -384,7 +393,7 @@ fn bounded_unprivileged_transfer_operands() {
         let size = i & 3;
         let opc = (i >> 2) & 3;
         let imm = (i >> 4) & 511;
-        let rn = (i >> 13) & 31;
+        let rn = (i >> 11) & 31;
         let rt = (i * 17 >> 7) & 31;
         let w = 0x38000800 | size << 30 | opc << 22 | imm << 12 | rn << 5 | rt;
         if opc == 2 && size == 3 || opc == 3 && size >= 2 {
@@ -488,7 +497,125 @@ fn bounded_pstate_llvm_cross_check() {
     }
     if let Some(lines) = llvm(&words, "closure-pstate") {
         for (word, line) in words.iter().zip(lines) {
-            assert!(line.starts_with("msr "), "{word:08x}: {line}");
+            let field = match ((word >> 16) & 7, (word >> 5) & 7) {
+                (0, 3) => "uao",
+                (0, 4) => "pan",
+                (0, 5) => "spsel",
+                (3, 1) => "ssbs",
+                (3, 2) => "dit",
+                (3, 4) => "tco",
+                (3, 6) => "daifset",
+                (3, 7) => "daifclr",
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                line.to_ascii_lowercase(),
+                format!("msr {field}, #{}", (word >> 8) & 15),
+                "{word:08x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn named_registers_preserve_the_production_namespace() {
+    let cases = [
+        (0xd5382000, NamedSystemRegister::Ttbr0El1, "ttbr0_el1"),
+        (0xd5382020, NamedSystemRegister::Ttbr1El1, "ttbr1_el1"),
+        (0xd5384100, NamedSystemRegister::SpEl0, "sp_el0"),
+        (0xd53bd040, NamedSystemRegister::TpidrEl0, "tpidr_el0"),
+        (0xd53bd060, NamedSystemRegister::TpidrroEl0, "tpidrro_el0"),
+        (
+            0xd538d020,
+            NamedSystemRegister::ContextidrEl1,
+            "contextidr_el1",
+        ),
+        (0xd53b4400, NamedSystemRegister::Fpcr, "fpcr"),
+        (0xd53b4420, NamedSystemRegister::Fpsr, "fpsr"),
+        (0xd53b4220, NamedSystemRegister::Daif, "daif"),
+        (0xd5384260, NamedSystemRegister::Pan, "pan"),
+        (0xd5387400, NamedSystemRegister::ParEl1, "par_el1"),
+        (0xd53be000, NamedSystemRegister::CntfrqEl0, "cntfrq_el0"),
+        (0xd53be040, NamedSystemRegister::CntvctEl0, "cntvct_el0"),
+        (0xd53be320, NamedSystemRegister::CntvCtlEl0, "cntv_ctl_el0"),
+        (
+            0xd53be340,
+            NamedSystemRegister::CntvCvalEl0,
+            "cntv_cval_el0",
+        ),
+        (0xd53800a0, NamedSystemRegister::MpidrEl1, "mpidr_el1"),
+        (0xd538cc00, NamedSystemRegister::IccIar1El1, "icc_iar1_el1"),
+        (
+            0xd538cc20,
+            NamedSystemRegister::IccEoir1El1,
+            "icc_eoir1_el1",
+        ),
+        (
+            0xd538cba0,
+            NamedSystemRegister::IccSgi1rEl1,
+            "icc_sgi1r_el1",
+        ),
+    ];
+    for (word, expected, _) in cases {
+        let Instruction::SystemAccess(access) = decode_instruction(word) else {
+            panic!()
+        };
+        assert_eq!(access.register, expected);
+        let Instruction::SystemAccess(write) = decode_instruction(word & !(1 << 21)) else {
+            panic!()
+        };
+        assert_eq!(write.register, expected);
+        assert_eq!(access.encoding, write.encoding);
+    }
+    let words: Vec<_> = cases
+        .iter()
+        .map(|case| {
+            if matches!(
+                case.1,
+                NamedSystemRegister::IccEoir1El1 | NamedSystemRegister::IccSgi1rEl1
+            ) {
+                case.0 & !(1 << 21)
+            } else {
+                case.0
+            }
+        })
+        .collect();
+    if let Some(lines) = llvm(&words, "closure-named-registers") {
+        for ((line, (_, _, name)), word) in lines.iter().zip(cases).zip(&words) {
+            let expected = if word & (1 << 21) == 0 {
+                format!("msr {name}, x0")
+            } else {
+                format!("mrs x0, {name}")
+            };
+            assert_eq!(line.to_ascii_lowercase(), expected);
+        }
+    }
+}
+
+#[test]
+fn exception_index_reserved_combinations_fail_shut() {
+    for opc in 0..8 {
+        for op2 in 0..8 {
+            for ll in 0..4 {
+                let word = 0xd4000000 | opc << 21 | 17 << 5 | op2 << 2 | ll;
+                let valid = op2 == 0
+                    && match opc {
+                        0 | 5 => ll != 0,
+                        1 | 2 => ll == 0,
+                        _ => false,
+                    };
+                assert_eq!(
+                    matches!(
+                        decode_instruction(word),
+                        Instruction::ExceptionGeneration(_)
+                    ),
+                    valid,
+                    "{word:08x}"
+                );
+                if !valid {
+                    assert_eq!(decode_instruction(word), Instruction::Unallocated);
+                }
+            }
         }
     }
 }
