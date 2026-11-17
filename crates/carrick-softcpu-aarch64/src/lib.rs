@@ -298,6 +298,7 @@ mod decode {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Immediate16(u16);
     impl Immediate16 {
+        /// Preserve a complete architectural 16-bit immediate field.
         pub const fn new(value: u16) -> Self {
             Self(value)
         }
