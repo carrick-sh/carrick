@@ -10,7 +10,6 @@ rationale = "This native tooling contract exercises commands and fork-without-ex
 
 [bindings]
 vm_free = [
-  "carrick-xtask::signed_gate::tests::side_phases_release_build_lease_before_accept_admission",
   "carrick-xtask::host_lease::tests::a_shared_holder_reenters_through_another_spelling_of_the_lock",
   "carrick-xtask::host_lease::tests::a_symlink_or_non_regular_lock_or_turnstile_is_refused",
   "carrick-xtask::host_lease::tests::a_thread_holding_a_shared_lease_reenters_past_a_queued_writer",
@@ -30,6 +29,7 @@ vm_free = [
   "carrick-xtask::lease_supervisor::macos_scope::tests::privileged_identity_is_observable_without_signal_permission",
   "carrick-xtask::lease_supervisor::serial_host::missing_children_cleanup_fixture",
   "carrick-xtask::lease_supervisor::serial_host::missing_children_file_still_reaps_and_releases",
+  "carrick-xtask::signed_gate::tests::side_phases_release_build_lease_before_accept_admission",
   "carrick-xtask::target_prune::tests::either_shared_or_exclusive_host_lease_prevents_pruning",
   "carrick-xtask::tests::host_lease::cancellation_preserves_another_checkout_with_identical_command",
   "carrick-xtask::tests::host_lease::nested_admission_requires_the_supervisor_scope_writer",
