@@ -175,7 +175,10 @@ fn system(w: u32) -> Option<Instruction> {
     }))
 }
 pub(crate) fn decode(w: u32) -> Option<Instruction> {
-    barrier(w).or_else(|| system(w)).or_else(|| exception(w))
+    barrier(w)
+        .or_else(|| system(w))
+        .or_else(|| exception(w))
+        .or_else(|| extract(w))
 }
 
 /// DDI0487G.a C6.2.37 BRK, C6.2.76–78 DCPS1/2/3, C6.2.93 HLT,
@@ -212,5 +215,32 @@ fn exception(w: u32) -> Option<Instruction> {
     Some(Instruction::ExceptionGeneration(ExceptionGeneration {
         kind,
         immediate: ((w >> 5) & 0xffff) as u16,
+    }))
+}
+
+/// DDI0487G.a C6.2.90 EXTR; C4.1.2 Extract encoding index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extract {
+    pub width: crate::Width,
+    pub rm: crate::OperandRegister,
+    pub rn: crate::OperandRegister,
+    pub rd: crate::OperandRegister,
+    pub lsb: u8,
+}
+fn extract(w: u32) -> Option<Instruction> {
+    if w & 0x7fa00000 != 0x13800000 || (w >> 22) & 1 != w >> 31 || (w >> 31 == 0 && w & 0x8000 != 0)
+    {
+        return None;
+    }
+    Some(Instruction::Extract(Extract {
+        width: if w >> 31 == 0 {
+            crate::Width::W32
+        } else {
+            crate::Width::X64
+        },
+        rm: crate::OperandRegister::field(w >> 16, false),
+        rn: crate::OperandRegister::field(w >> 5, false),
+        rd: crate::OperandRegister::field(w, false),
+        lsb: ((w >> 10) & 63) as u8,
     }))
 }
