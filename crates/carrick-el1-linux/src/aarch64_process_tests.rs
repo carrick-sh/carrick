@@ -19186,7 +19186,8 @@ fn serial_host_arm_record_lock_range_and_refusal_order_match_linux() {
     let (wr, rd, un) = (LINUX_F_WRLCK, LINUX_F_RDLCK, LINUX_F_UNLCK);
     // (what, read-only descriptor, command, l_type, l_start, l_len, l_pid,
     // Linux's answer)
-    let rows: &[(&str, bool, u64, i32, i64, i64, i32, i64)] = &[
+    type Row = (&'static str, bool, u64, i32, i64, i64, i32, i64);
+    let rows: &[Row] = &[
         (
             "SETLK max,2",
             false,

@@ -74,7 +74,7 @@ embed = [
 ]
 
 [bindings.unresolved]
-semantics = "SEEK_CUR/SEEK_END bases (and so their EINVAL/EOVERFLOW range answers), EDEADLK and the host-dispatched ARM run root's locks (host arbiter) are not served by this owner (#2460). An exhausted IPC operation arena still forwards a blocking request (counted ENOSYS) instead of parking on the arena's release, as main's pipes do (follow-up)."
+semantics = "SEEK_CUR/SEEK_END bases (and so their EINVAL/EOVERFLOW range answers), EDEADLK and the host-dispatched ARM run root's locks (host arbiter) are not served by this owner (#2460). An exhausted IPC operation arena still forwards a blocking request (counted ENOSYS) instead of parking on the arena's release, as main's pipes do (#2473)."
 structural = "No work-count budget is bound; the table costs the number of locks held per operation, and every release wakes every lock waiter of the zone (one lane, #2460). The pool-exhaustion witness serial_host_lock_waiters_beyond_the_pool_hold_no_capacity and its pipe control are ignored on #2458: one x86 wake of two parked fork children fails the carrier on main before any lock code runs."
 embed_structural = "UNRUN (director): signed ARM run of apt-get on the implementation head."
 docker = "The x86 KVM witness compares with the native Linux oracle; no Docker differential."
