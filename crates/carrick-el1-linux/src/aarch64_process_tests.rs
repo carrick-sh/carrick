@@ -18083,9 +18083,6 @@ fn with_arm_process_host_files<R>(
                     .expect("a ring child owns its table"),
             );
             let region = owner.region();
-            let replaced = region
-                .fd(carrick_sched_core::ShortLockSpin)
-                .file_identity(table, carrick_el1_abi::ipc::fd::Fd(args[1] as i32));
             let retired = match region.fd(carrick_sched_core::ShortLockSpin).dup2_filtered(
                 table,
                 carrick_el1_abi::ipc::fd::Fd(args[0] as i32),
@@ -18102,8 +18099,9 @@ fn with_arm_process_host_files<R>(
                 Err(error) => panic!("sibling dup2: {error:?}"),
             };
             let zone = Some((fixture.zone, fixture.slot));
-            crate::ipc::settle_native_release(&region, retired, zone, &fixture.task).unwrap();
-            if let Ok(Some(file)) = replaced {
+            crate::ipc::settle_native_release(&region, retired.release, zone, &fixture.task)
+                .unwrap();
+            if let Some(file) = retired.file {
                 crate::ipc::release_record_locks(&region, zone, &fixture.task, table, file)
                     .unwrap();
             }
@@ -19428,7 +19426,11 @@ fn serial_host_arm_close_releases_record_locks_of_the_file_it_retired() {
                     crate::ipc::is_zone_releasable_backing,
                 )
                 .unwrap();
-            assert_eq!(retired, carrick_el1_abi::ipc::fd::DeferredRelease::None);
+            assert_eq!(
+                retired.release,
+                carrick_el1_abi::ipc::fd::DeferredRelease::None
+            );
+            assert!(retired.file.is_some(), "n named X");
         });
         results.push((
             "B close(n)",
@@ -19490,7 +19492,10 @@ fn serial_host_arm_dup_releases_record_locks_only_of_a_displaced_file() {
             let retired = authority
                 .close_filtered(table, fd, crate::ipc::is_zone_releasable_backing)
                 .unwrap();
-            assert_eq!(retired, carrick_el1_abi::ipc::fd::DeferredRelease::None);
+            assert_eq!(
+                retired.release,
+                carrick_el1_abi::ipc::fd::DeferredRelease::None
+            );
             // Then its F_SETLK F_WRLCK on X through `k`.
             let file = authority
                 .file_identity(table, carrick_el1_abi::ipc::fd::Fd(k as i32))

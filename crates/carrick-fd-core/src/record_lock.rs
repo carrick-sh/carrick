@@ -261,6 +261,68 @@ impl Lock {
     }
 }
 
+/// What one blocking fcntl(2)/flock(2) call asked for, decoded once at
+/// entry. A waiter's operation keeps it: a woken rerun takes exactly this
+/// lock, never a re-read of the caller's `struct flock`, which another
+/// thread may have rewritten while it waited (fcntl(2) copies it in once).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LockRequest {
+    pub kind: LockKind,
+    pub range: LockRange,
+}
+
+/// [`LockRequest`] as plain data in a shared continuation record; the zero
+/// value names no request. A range starts below [`LockRange::END_OF_FILE`],
+/// so the start's top bit is free to carry the kind.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RawLockRequest {
+    start_and_kind: u64,
+    end: u64,
+}
+
+const REQUEST_WRITE: u64 = 1 << 63;
+
+impl RawLockRequest {
+    pub const NONE: Self = Self {
+        start_and_kind: 0,
+        end: 0,
+    };
+}
+
+impl LockRequest {
+    pub const fn into_raw(self) -> RawLockRequest {
+        RawLockRequest {
+            start_and_kind: self.range.start
+                | match self.kind {
+                    LockKind::Read => 0,
+                    LockKind::Write => REQUEST_WRITE,
+                },
+            end: self.range.end,
+        }
+    }
+
+    /// The request `raw` records; `None` for [`RawLockRequest::NONE`] or a
+    /// record no [`Self::into_raw`] wrote.
+    pub const fn from_raw(raw: RawLockRequest) -> Option<Self> {
+        let start = raw.start_and_kind & !REQUEST_WRITE;
+        if start >= raw.end || raw.end > LockRange::END_OF_FILE {
+            return None;
+        }
+        Some(Self {
+            kind: if raw.start_and_kind & REQUEST_WRITE != 0 {
+                LockKind::Write
+            } else {
+                LockKind::Read
+            },
+            range: LockRange {
+                start,
+                end: raw.end,
+            },
+        })
+    }
+}
+
 /// The descriptor authority's view of which owners still exist.
 pub trait LockOwners {
     fn exists(&self, owner: LockOwner) -> bool;
@@ -928,6 +990,32 @@ mod tests {
     /// its descriptors; a reuse of the record starts unstamped, and the
     /// final deferred close names the exact description it ended.
     #[test]
+    fn a_parked_request_round_trips_and_refuses_foreign_records() {
+        let request = LockRequest {
+            kind: LockKind::Write,
+            range: LockRange::from_posix(0, 10, 5).unwrap(),
+        };
+        assert_eq!(LockRequest::from_raw(request.into_raw()), Some(request));
+        let whole = LockRequest {
+            kind: LockKind::Read,
+            range: LockRange::WHOLE_FILE,
+        };
+        assert_eq!(LockRequest::from_raw(whole.into_raw()), Some(whole));
+        assert_eq!(LockRequest::from_raw(RawLockRequest::NONE), None);
+        assert_eq!(LockRequest::from_raw(RawLockRequest::default()), None);
+        let empty = RawLockRequest {
+            start_and_kind: 5 | REQUEST_WRITE,
+            end: 5,
+        };
+        assert_eq!(LockRequest::from_raw(empty), None);
+        let past_end = RawLockRequest {
+            start_and_kind: 0,
+            end: LockRange::END_OF_FILE + 1,
+        };
+        assert_eq!(LockRequest::from_raw(past_end), None);
+    }
+
+    #[test]
     fn identities_follow_the_description_incarnation() {
         let (core, arena) = core_with::<2>(4);
         let c = core.bind(arena, Spin);
@@ -949,7 +1037,10 @@ mod tests {
         assert_eq!(c.unpin(pin), Ok(None));
         assert_eq!(
             c.close_filtered(t, fd, |_| false),
-            Ok(crate::DeferredRelease::Deferred(key))
+            Ok(crate::Retired {
+                release: crate::DeferredRelease::Deferred(key),
+                file: Some(FILE),
+            })
         );
         assert!(!c.lock_owner_exists(LockOwner::Description(key)));
         assert!(c.take_retired_ofd().unwrap().is_some());
