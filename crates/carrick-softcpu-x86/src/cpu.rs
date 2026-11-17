@@ -708,7 +708,6 @@ impl SoftCpu {
             && let Some(first) = planned.insns.first()
             && !crate::avx::supported(&first.raw)
             && first.raw.encoding() != iced_x86::EncodingKind::VEX
-            && !crate::avx::baseline_sse(&first.raw)
             && (0..first.raw.op_count()).any(|i| {
                 first.raw.op_kind(i) == iced_x86::OpKind::Register
                     && first.raw.op_register(i).is_xmm()

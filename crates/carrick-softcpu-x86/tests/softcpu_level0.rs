@@ -5806,3 +5806,86 @@ fn typed_host_write_preflights_the_entire_physical_span() {
     .unwrap();
     assert_eq!(cpu.code_walk_count(), 2); // cold plan + explicit execute walk above
 }
+
+#[test]
+fn advertised_mmx_fxsave_image_matches_native() {
+    #[repr(C, align(16))]
+    struct Image([u8; 512]);
+    // MOVQ load/register/store, PADDB and EMMS. Each instruction starts with
+    // distinctive nonzero x87 metadata and exponent fields, including TOP.
+    for bytes in [
+        &[0x0f, 0x6f, 0x07][..],
+        &[0x0f, 0x6f, 0xc1],
+        &[0x0f, 0x7f, 0x07],
+        &[0x0f, 0xfc, 0xc1],
+        &[0x0f, 0x77],
+    ] {
+        for top in [0u16, 3, 7] {
+            let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0x0f, 0x05]].concat());
+            let mut image = Image(cpu.context().fxsave.0);
+            image.0[2..4].copy_from_slice(&(top << 11).to_le_bytes());
+            image.0[4] = 0xff;
+            image.0[6..8].copy_from_slice(&0x123u16.to_le_bytes());
+            image.0[8..16].copy_from_slice(&0x1234_5678u64.to_le_bytes());
+            image.0[16..24].copy_from_slice(&0x7654_3210u64.to_le_bytes());
+            for i in 0..8 {
+                image.0[32 + i * 16..40 + i * 16]
+                    .copy_from_slice(&(0x8000_0000_0000_0100u64 + i as u64).to_le_bytes());
+                image.0[40 + i * 16..42 + i * 16]
+                    .copy_from_slice(&(0x3ff0u16 + i as u16).to_le_bytes());
+            }
+            let initial = image.0;
+            cpu.context_mut().fxsave.0 = initial;
+            cpu.context_mut().gpr[reg::RDI] = 0x800000;
+            let mut operand = [0x81u8; 8];
+            mem.write_direct(0x800000, &operand);
+            let mut host = Image([0; 512]);
+            let mut loaded = Image([0; 512]);
+            // SysV: RDI=operand, RSI=guest image, RDX=host image.
+            // Save host, load guest, execute, save result, restore host.
+            let mut native = vec![0x48, 0x0f, 0xae, 0x02, 0x48, 0x0f, 0xae, 0x0e];
+            native.extend_from_slice(&[0x48, 0x0f, 0xae, 0x01]); // fxsave64 [rcx]
+            native.extend_from_slice(bytes);
+            native.extend_from_slice(&[0x48, 0x0f, 0xae, 0x06, 0x48, 0x0f, 0xae, 0x0a, 0xc3]);
+            let mut jit = JitCodeBuffer::new(native.len()).unwrap();
+            let entry = jit.publish(&native).unwrap();
+            // SAFETY: the fixed leaf touches only the live aligned images and
+            // eight-byte operand; it restores host FP state before returning.
+            unsafe {
+                let run: unsafe extern "sysv64" fn(*mut u8, *mut u8, *mut u8, *mut u8) =
+                    std::mem::transmute(entry);
+                run(
+                    operand.as_mut_ptr(),
+                    image.0.as_mut_ptr(),
+                    host.0.as_mut_ptr(),
+                    loaded.0.as_mut_ptr(),
+                );
+            }
+            assert_eq!(&image.0[6..24], &loaded.0[6..24], "native MMX metadata");
+            step_ok(
+                &mut cpu,
+                &mut mem,
+                sys(va + bytes.len() as u64, va + bytes.len() as u64 + 2),
+            );
+            let actual = &cpu.context().fxsave.0;
+            assert_eq!(
+                &actual[..5],
+                &image.0[..5],
+                "control/status/tags {bytes:x?}"
+            );
+            assert_eq!(
+                &actual[6..24],
+                &initial[6..24],
+                "virtual FOP/FIP/FDP {bytes:x?}"
+            );
+            for i in 0..8 {
+                assert_eq!(
+                    &actual[32 + i * 16..42 + i * 16],
+                    &image.0[32 + i * 16..42 + i * 16],
+                    "ST{i} including exponent, TOP={top}, {bytes:x?}"
+                );
+            }
+            assert_eq!(mem.read_direct(0x800000, 8).unwrap(), operand);
+        }
+    }
+}
