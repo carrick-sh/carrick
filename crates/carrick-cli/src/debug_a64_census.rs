@@ -270,15 +270,7 @@ impl Census {
     }
 }
 
-pub(crate) fn run(input: Option<&Path>, strict: bool) -> Result<()> {
-    run_with_export(input, strict, None)
-}
-
-pub(crate) fn export_spans(input: &Path, output: &Path) -> Result<()> {
-    run_with_export(Some(input), false, Some(output))
-}
-
-fn run_with_export(input: Option<&Path>, strict: bool, output: Option<&Path>) -> Result<()> {
+pub(crate) fn run(input: Option<&Path>, strict: bool, output: Option<&Path>) -> Result<()> {
     let mut census = Census::default();
     let bytes = if let Some(path) = input {
         std::fs::read(path).with_context(|| format!("read {}", path.display()))?

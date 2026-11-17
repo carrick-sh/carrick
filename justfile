@@ -1634,11 +1634,10 @@ a64-census-gate elf="":
     export CARRICK_LLVM_OBJDUMP="${CARRICK_LLVM_OBJDUMP:-$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objdump}"
     spans=$(mktemp "$logs/loader-spans.XXXXXX")
     trap 'rm -f "$spans"' EXIT
-    "$CARGO_TARGET_DIR/debug/carrick" debug a64-census-export-spans "$CARRICK_A64_ELF" "$spans" > "$logs/export-report.json"
-    export CARRICK_A64_LOADER_SPANS="$spans"
     status=0
-    "$CARGO_TARGET_DIR/debug/carrick" debug a64-census "$CARRICK_A64_ELF" --strict > "$logs/report.json" || status=$?
+    "$CARGO_TARGET_DIR/debug/carrick" debug a64-census "$CARRICK_A64_ELF" --strict --export-loader-spans "$spans" > "$logs/report.json" || status=$?
     jq -er '"a64 census: spans=\(.spans | length) words=\([.counts[]] | add) unknown=\(.unknown_count) typed-undecoded=\(.typed_undecoded_count)"' "$logs/report.json"
+    export CARRICK_A64_LOADER_SPANS="$spans"
     # Run every ignore-gated image and LLVM differential witness, even if strict failed.
     {{_cargo}} test -p carrick-softcpu-aarch64 --tests -- --ignored --nocapture || status=1
     exit "$status"

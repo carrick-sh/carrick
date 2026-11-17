@@ -216,11 +216,11 @@ or any witness/tool failure. `CARRICK_LLVM_OBJDUMP` defaults to the pinned Rust
 sysroot's LLVM tool; an explicit override is retained for known-answer checks.
 The optional recipe argument selects another ELF for negative controls.
 
-`carrick debug a64-census-export-spans <ELF> <OUTPUT>` prints the same
+`carrick debug a64-census <ELF> --export-loader-spans <OUTPUT>` prints the same
 measurement and writes every production loader/vector page in census order as
 concatenated little-endian 32-bit words, without a header. This uses the same
 span enumeration as the census, retaining padding and repeated configurations.
-The existing `a64-census` command and its strict behavior are unchanged.
+Without the export flag, census behavior is unchanged.
 The recipe creates a temporary export, sets `CARRICK_A64_LOADER_SPANS` for the
 ignored loader witness, and removes the export on exit, including failure.
 No guest executes in this gate; a green static gate establishes typed closure

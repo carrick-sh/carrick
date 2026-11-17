@@ -124,8 +124,9 @@ fn command_exports_all_loader_words_deterministically() -> anyhow::Result<()> {
     for name in ["first.bin", "second.bin"] {
         let export = directory.path().join(name);
         let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
-            .args(["debug", "a64-census-export-spans"])
+            .args(["debug", "a64-census"])
             .arg(&input)
+            .arg("--export-loader-spans")
             .arg(&export)
             .output()?;
         assert!(
