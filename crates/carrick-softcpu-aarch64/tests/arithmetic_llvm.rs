@@ -945,41 +945,41 @@ fn generated_move_wide_matches_llvm_operands() {
     );
 }
 
-fn oracle_lines(words: &[u32], group: &str) -> Vec<String> {
+fn oracle_lines(words: &[u32], group: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let path = std::env::temp_dir().join(format!("carrick-a64-{group}-{}.o", std::process::id()));
-    std::fs::write(&path, object(words)).expect("valid fixture");
-    let output = Command::new(std::env::var_os("CARRICK_LLVM_OBJDUMP").expect("set LLVM"))
-        .args([
-            "-D",
-            "-M",
-            "no-aliases",
-            "--no-print-imm-hex",
-            "--no-show-raw-insn",
-            "--no-leading-addr",
-        ])
-        .arg(&path)
-        .output()
-        .expect("valid fixture");
-    std::fs::remove_file(path).expect("valid fixture");
+    std::fs::write(&path, object(words))?;
+    let output =
+        Command::new(std::env::var_os("CARRICK_LLVM_OBJDUMP").ok_or("set CARRICK_LLVM_OBJDUMP")?)
+            .args([
+                "-D",
+                "-M",
+                "no-aliases",
+                "--no-print-imm-hex",
+                "--no-show-raw-insn",
+                "--no-leading-addr",
+            ])
+            .arg(&path)
+            .output()?;
+    std::fs::remove_file(path)?;
     assert!(output.status.success());
-    let text = String::from_utf8(output.stdout).expect("valid fixture");
+    let text = String::from_utf8(output.stdout)?;
     let lines: Vec<_> = text
         .lines()
         .filter(|s| s.starts_with(' ') && !s.trim().is_empty())
         .map(|line| {
             line.split("//")
                 .next()
-                .expect("instruction")
+                .unwrap_or_default()
                 .split(" <")
                 .next()
-                .expect("instruction")
+                .unwrap_or_default()
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
         })
         .collect();
     assert_eq!(lines.len(), words.len());
-    lines
+    Ok(lines)
 }
 
 #[test]
@@ -1011,7 +1011,10 @@ fn generated_bitfield_matches_llvm_operands() {
     let words: Vec<_> = words.into_iter().collect();
     assert!(words.len() >= 50_000);
     let mut accepted = 0;
-    for (&w, actual) in words.iter().zip(oracle_lines(&words, "bitfield")) {
+    for (&w, actual) in words
+        .iter()
+        .zip(oracle_lines(&words, "bitfield").expect("valid LLVM fixture"))
+    {
         if let Instruction::Bitfield(b) = decode_instruction(w) {
             let name = match b.operation {
                 BitfieldOperation::Signed => "sbfm",
@@ -1120,7 +1123,7 @@ fn generated_address_matches_llvm_operands() {
     assert!(words.len() >= 50_000);
     for (i, (&w, actual)) in words
         .iter()
-        .zip(oracle_lines(&words, "address"))
+        .zip(oracle_lines(&words, "address").expect("valid LLVM fixture"))
         .enumerate()
     {
         let Instruction::Address(a) = decode_instruction(w) else {
@@ -1210,7 +1213,10 @@ fn generated_conditional_matches_llvm_operands() {
     let words: Vec<_> = words.into_iter().collect();
     assert!(words.len() >= 50_000);
     let mut accepted = 0;
-    for (&w, actual) in words.iter().zip(oracle_lines(&words, "conditional")) {
+    for (&w, actual) in words
+        .iter()
+        .zip(oracle_lines(&words, "conditional").expect("valid LLVM fixture"))
+    {
         let expected = match decode_instruction(w) {
             Instruction::ConditionalSelect(c) => {
                 let name = match c.operation {
@@ -1298,7 +1304,10 @@ fn generated_multiply_divide_matches_llvm_operands() {
     let words: Vec<_> = words.into_iter().collect();
     assert!(words.len() >= 50_000);
     let mut accepted = 0;
-    for (&w, actual) in words.iter().zip(oracle_lines(&words, "multiply-divide")) {
+    for (&w, actual) in words
+        .iter()
+        .zip(oracle_lines(&words, "multiply-divide").expect("valid LLVM fixture"))
+    {
         let expected = match decode_instruction(w) {
             Instruction::Multiply(m) => {
                 let name = match (m.kind, m.subtract) {
@@ -1385,7 +1394,10 @@ fn generated_atomic_transfers_match_llvm_operands() {
     let words: Vec<_> = words.into_iter().collect();
     assert!(words.len() >= 50_000);
     let mut accepted = 0;
-    for (&w, actual) in words.iter().zip(oracle_lines(&words, "atomic-transfer")) {
+    for (&w, actual) in words
+        .iter()
+        .zip(oracle_lines(&words, "atomic-transfer").expect("valid LLVM fixture"))
+    {
         if let Instruction::AtomicTransfer(a) = decode_instruction(w) {
             let pair = a.second.is_some();
             let (name, status) = match a.kind {
