@@ -4750,6 +4750,52 @@ mod tests {
         assert_eq!(read(zero, HostFileOp::Pread, [4, 0, 0, 0]), (8, vec![0; 8]));
     }
 
+    /// #2418: the run's injected `/etc/resolv.conf` is a mount-served
+    /// synthetic file. A native caller's open of it was served but its
+    /// sequential `read` was refused (counted ENOSYS), so glibc and Go saw
+    /// no nameserver and fell back to loopback. As Docker does, the injection
+    /// replaces an image's own file. Red before the carrier read: -38.
+    #[test]
+    fn native_read_serves_the_injected_resolv_conf_over_the_images() {
+        let lower = rootfs();
+        std::fs::write(
+            lower.path().join("etc/resolv.conf"),
+            b"nameserver 203.0.113.9\n",
+        )
+        .unwrap();
+        let rootfs = carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap();
+        let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+        dispatcher.set_host_resolver_snapshot(
+            &carrick_vfs::HostResolverSnapshot::from_resolv_conf("nameserver 192.0.2.53\n"),
+        );
+        let fixture = fixture_with(dispatcher, Some(lower));
+        let authority = authority_of(&fixture.dispatcher);
+        let fd = fixture.venue_open(
+            &authority,
+            b"/etc/resolv.conf",
+            carrick_abi::LINUX_O_RDONLY,
+            0,
+        ) as i32;
+        assert!(fd >= 0, "open /etc/resolv.conf: {fd}");
+        let read = || {
+            fixture.result(
+                None,
+                record(fixture.table, HostFileOp::Read, fd, [0; 4], &[], 4096),
+            )
+        };
+        let (len, bytes) = read();
+        assert!(len > 0, "read /etc/resolv.conf: {len}");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.lines().any(|line| line == "nameserver 192.0.2.53"),
+            "{text:?}"
+        );
+        assert!(!text.contains("203.0.113.9"), "{text:?}");
+        assert_eq!(len as usize, text.len());
+        // The description's offset advanced: the next read is end of file.
+        assert_eq!(read(), (0, Vec::new()));
+    }
+
     /// What only a host task's open may hold stays refused for a native
     /// caller, before the mount acts: a terminal end (no pty is allocated)
     /// and the opener's own `/proc` view. Mount-served opens a native caller
