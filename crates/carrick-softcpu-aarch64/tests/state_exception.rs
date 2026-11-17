@@ -1,5 +1,5 @@
 //! Known answers: DDI0487G.a D1 exception entry/return and D13.2 ESR_EL1;
-//! A2's three worked scalar stage-1 fault examples.
+//! A2's scalar stage-1 examples plus an EL1 instruction permission abort.
 use carrick_softcpu_aarch64::{exception::*, state::*};
 
 #[test]
