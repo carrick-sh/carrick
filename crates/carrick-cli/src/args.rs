@@ -103,6 +103,14 @@ impl From<PullArg> for carrick_image::PullPolicy {
     }
 }
 
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct A64CensusExportSpansArgs {
+    /// Linked AArch64 ELF used for the accompanying census.
+    pub(crate) input: PathBuf,
+    /// Raw concatenated little-endian instruction words, without a header.
+    pub(crate) output: PathBuf,
+}
+
 // Container launch arguments shared across `run`, `create`, and `run-elf`.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct RunArgs {
@@ -1083,6 +1091,8 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Export production loader/vector pages and print their ELF census.
+    A64CensusExportSpans(A64CensusExportSpansArgs),
     /// Static A64 encoding census (slice 0a; no guest execution).
     A64Census {
         /// Linked AArch64 ELF. Without a path, scan embedded flat bytes

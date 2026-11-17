@@ -206,3 +206,22 @@ classifier unknowns and 3,363 typed-undecoded words (1,282 in ELF `.text`,
 span's SHA-256 and every rejected word's span/offset/encoding match the
 independent diagnostic above. These are measurements before #2471 lands,
 not a claim that the remaining decode work is closed.
+
+## Strict typed gate (#2454)
+
+`just a64-census-gate` builds the production ELF, prints the strict census
+summary, and runs the real-image, generated loader/vector and LLVM arithmetic
+witnesses. It fails on an unknown or typed-undecoded word, an export failure,
+or any witness/tool failure. `CARRICK_LLVM_OBJDUMP` defaults to the pinned Rust
+sysroot's LLVM tool; an explicit override is retained for known-answer checks.
+The optional recipe argument selects another ELF for negative controls.
+
+`carrick debug a64-census-export-spans <ELF> <OUTPUT>` prints the same
+measurement and writes every production loader/vector page in census order as
+concatenated little-endian 32-bit words, without a header. This uses the same
+span enumeration as the census, retaining padding and repeated configurations.
+The existing `a64-census` command and its strict behavior are unchanged.
+The recipe creates a temporary export, sets `CARRICK_A64_LOADER_SPANS` for the
+ignored loader witness, and removes the export on exit, including failure.
+No guest executes in this gate; a green static gate establishes typed closure
+for these measured spans, not runtime emulation correctness.
