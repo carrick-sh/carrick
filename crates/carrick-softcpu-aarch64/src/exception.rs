@@ -2,7 +2,10 @@
 //! D1.11 exception return / AArch64.ExceptionReturn (J1-7951),
 //! SetPSTATEFromPSR (J1-8205–8206), and D13.2.37 ESR_EL1.
 //! Pure virtual transitions; no host exceptions or provider actions.
-use crate::state::*;
+use crate::state::{
+    CpuState, ExceptionLevel, InterruptMasks, ProgramCounter, Pstate, StackSelect,
+    SystemAccessException, VirtualAddress,
+};
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Syndrome(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
