@@ -869,6 +869,9 @@ mod tests {
     }
 }
 
+mod loader;
+pub use loader::*;
+
 mod instruction {
     //! Typed decoding entry point. Unimplemented and reserved leaves fail shut.
     use crate::Decoded;
@@ -876,6 +879,8 @@ mod instruction {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Instruction {
         Unallocated,
+        /// Arm ARM DDI0487G.a C6.2.87 ERET (no pointer authentication).
+        Eret,
         Barrier(crate::Barrier),
         ExceptionGeneration(crate::ExceptionGeneration),
         SystemAccess(crate::SystemAccess),
@@ -913,6 +918,9 @@ mod instruction {
     }
 
     pub fn decode_instruction(word: u32) -> Instruction {
+        if let Some(instruction) = crate::loader::decode(word) {
+            return instruction;
+        }
         if let Some(instruction) = crate::closure::decode(word) {
             return instruction;
         }
