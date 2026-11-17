@@ -1619,7 +1619,7 @@ ci-results:
 
 # Hosted Linux static decode gate; optional ELF override is for known-answer runs.
 # Build-script JSON selects this build's production image without stale-file globs.
-a64-census-gate elf="":
+a64-census-gate elf="" loader-spans="":
     #!/usr/bin/env bash
     set -euo pipefail
     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
@@ -1632,9 +1632,15 @@ a64-census-gate elf="":
     override={{quote(elf)}}
     if [[ -n "$override" ]]; then export CARRICK_A64_ELF="$override"; fi
     export CARRICK_LLVM_OBJDUMP="${CARRICK_LLVM_OBJDUMP:-$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objdump}"
+    spans=$(mktemp "$logs/loader-spans.XXXXXX")
+    trap 'rm -f "$spans"' EXIT
+    export CARRICK_A64_LOADER_SPANS="$spans"
     status=0
-    "$CARGO_TARGET_DIR/debug/carrick" debug a64-census "$CARRICK_A64_ELF" --strict > "$logs/report.json" || status=$?
+    "$CARGO_TARGET_DIR/debug/carrick" debug a64-census "$CARRICK_A64_ELF" --strict --export-loader-spans "$spans" > "$logs/report.json" || status=$?
     jq -er '"a64 census: spans=\(.spans | length) words=\([.counts[]] | add) unknown=\(.unknown_count) typed-undecoded=\(.typed_undecoded_count)"' "$logs/report.json"
+    # Optional raw-span override is for known-answer failure controls.
+    span_override={{quote(loader-spans)}}
+    if [[ -n "$span_override" ]]; then export CARRICK_A64_LOADER_SPANS="$span_override"; fi
     # Run every ignore-gated image and LLVM differential witness, even if strict failed.
     {{_cargo}} test -p carrick-softcpu-aarch64 --tests -- --ignored --nocapture || status=1
     exit "$status"

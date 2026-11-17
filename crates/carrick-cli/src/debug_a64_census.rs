@@ -271,6 +271,14 @@ impl Census {
 }
 
 pub(crate) fn run(input: Option<&Path>, strict: bool) -> Result<()> {
+    run_with_export(input, strict, None)
+}
+
+pub(crate) fn run_with_export(
+    input: Option<&Path>,
+    strict: bool,
+    export: Option<&Path>,
+) -> Result<()> {
     let mut census = Census::default();
     let bytes = if let Some(path) = input {
         std::fs::read(path).with_context(|| format!("read {}", path.display()))?
@@ -285,7 +293,15 @@ pub(crate) fn run(input: Option<&Path>, strict: bool) -> Result<()> {
         "flat upper bound, includes data"
     };
     use carrick_mem::memory;
-    census.span(
+    let mut loader_bytes = Vec::new();
+    let mut loader_span = |name: &str, address: u64, bytes: &[u8]| -> Result<()> {
+        census.span(name, address, bytes)?;
+        if export.is_some() {
+            loader_bytes.extend_from_slice(bytes);
+        }
+        Ok(())
+    };
+    loader_span(
         "loader-maintenance",
         memory::LINUX_EL1_MAINT_BASE,
         &memory::el1_maintenance_bytes(),
@@ -296,14 +312,14 @@ pub(crate) fn run(input: Option<&Path>, strict: bool) -> Result<()> {
         ("shim", memory::el1_vectors_bytes_shim()),
         ("shim-fd", memory::el1_vectors_bytes_shim_fd_ceiling()),
     ] {
-        census.span(name, memory::LINUX_EL1_VECTORS_BASE, &bytes)?;
+        loader_span(name, memory::LINUX_EL1_VECTORS_BASE, &bytes)?;
     }
     for identity in [false, true] {
         for fd in [false, true] {
             for el1 in [false, true] {
                 for irq in [memory::El1IrqMode::Masked, memory::El1IrqMode::Gic] {
                     let name = format!("mailbox-identity={identity}-fd={fd}-el1={el1}-irq={irq:?}");
-                    census.span(
+                    loader_span(
                         &name,
                         memory::LINUX_EL1_VECTORS_BASE,
                         &memory::el1_vectors_bytes_mailbox_irq(identity, fd, el1, irq),
@@ -312,13 +328,17 @@ pub(crate) fn run(input: Option<&Path>, strict: bool) -> Result<()> {
             }
             for irq in [memory::El1IrqMode::Masked, memory::El1IrqMode::Gic] {
                 let name = format!("clock-identity={identity}-fd={fd}-irq={irq:?}");
-                census.span(
+                loader_span(
                     &name,
                     memory::LINUX_EL1_VECTORS_BASE,
                     &memory::el1_vectors_bytes_mailbox_clock(identity, fd, irq),
                 )?;
             }
         }
+    }
+    if let Some(path) = export {
+        std::fs::write(path, &loader_bytes)
+            .with_context(|| format!("write loader spans {}", path.display()))?;
     }
     println!(
         "{}",

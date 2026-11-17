@@ -206,3 +206,19 @@ classifier unknowns and 3,363 typed-undecoded words (1,282 in ELF `.text`,
 span's SHA-256 and every rejected word's span/offset/encoding match the
 independent diagnostic above. These are measurements before #2471 lands,
 not a claim that the remaining decode work is closed.
+
+## Strict gate and loader export
+
+`carrick debug a64-census <ELF> --strict --export-loader-spans <path>`
+exports the maintenance page and every vector configuration already enumerated
+by the census. The file concatenates all generated pages in census order as
+little-endian 32-bit words, without a header, ELF words, or deduplication.
+The census and export share the same production-builder traversal.
+
+`just a64-census-gate` builds the production ELF, exports these pages to a
+recipe-owned temporary file, and supplies it to the ignored loader witness via
+`CARRICK_A64_LOADER_SPANS`. The file is removed on exit. The real-image and LLVM
+arithmetic witnesses also run; any failure makes the recipe fail. LLVM objdump
+comes from the pinned Rust sysroot unless explicitly overridden. The optional
+ELF and raw-loader-span recipe arguments support known-answer negative controls.
+Reports and build metadata remain under `target/a64-census-gate`.
