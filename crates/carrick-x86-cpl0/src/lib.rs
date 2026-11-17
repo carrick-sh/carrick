@@ -141,6 +141,9 @@ mod test_support {
     pub const INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE: u64 = 0xffff_ffff_ffff_fe2c;
     /// Owner waits the armed hold refused and released before their park.
     pub const INJECT_EDITOR_RELEASED_BEFORE_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe2d;
+    /// The next native fork's scratch allocation finds the kernel heap
+    /// exhausted (#2441).
+    pub const INJECT_FORK_SCRATCH_EXHAUSTED_ONCE: u64 = 0xffff_ffff_ffff_fe2e;
     /// Address of the armed member's current task, or 0.
     static EARLY_RELEASE_TASK: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
@@ -497,6 +500,9 @@ mod test_support {
             }
             INJECT_METADATA_REQUIRED_ONCE => {
                 carrick_core::mm::reservation::inject_metadata_required_once().then_some(0)
+            }
+            INJECT_FORK_SCRATCH_EXHAUSTED_ONCE => {
+                carrick_core::mm::fork::inject_scratch_exhausted_once().then_some(0)
             }
             INJECT_WAIT_PARK_CENSUS => {
                 let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
