@@ -935,7 +935,7 @@ mod instruction {
         })
     }
     /// DDI0487G.a C6.2.330 TBNZ, C6.2.331 TBZ;
-    /// C4.1.3 Test and branch (immediate). Bit 31 is bit_pos[5], not sf.
+    /// C4.1.3 Test and branch (immediate). Bit 31 is `bit_pos[5]`, not sf.
     fn branch_test(w: u32) -> Option<Branch> {
         (w & 0x7e000000 == 0x36000000).then_some(Branch::Test {
             bit: ShiftAmount((((w >> 26) & 32) | ((w >> 19) & 31)) as u8),
