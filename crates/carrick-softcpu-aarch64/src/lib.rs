@@ -298,6 +298,9 @@ mod decode {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Immediate16(u16);
     impl Immediate16 {
+        pub const fn new(value: u16) -> Self {
+            Self(value)
+        }
         pub const fn value(self) -> u16 {
             self.0
         }

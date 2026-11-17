@@ -2,6 +2,10 @@
 //! D1.11 exception return / AArch64.ExceptionReturn (J1-7951),
 //! SetPSTATEFromPSR (J1-8205–8206), and D13.2.37 ESR_EL1.
 //! Pure virtual transitions; no host exceptions or provider actions.
+//! A3 wiring must enforce restored IL on the next instruction (EC=0x0e)
+//! and apply the configured address size to ELR before fetching after ERET.
+//! SError ISS=0 is the chosen non-RAS implementation-defined syndrome;
+//! HVC at EL1 is a deliberate provider boundary in this EL0/EL1 profile.
 use crate::state::{
     CpuState, ExceptionLevel, InterruptMasks, ProgramCounter, Pstate, StackSelect,
     SystemAccessException, VirtualAddress,
@@ -36,7 +40,6 @@ pub enum FaultStatus {
     AccessFlag(LeafLevel),
     Permission(LeafLevel),
     ExternalWalk(TableLevel),
-    Alignment,
 }
 impl FaultStatus {
     fn fsc(self) -> u64 {
@@ -46,10 +49,16 @@ impl FaultStatus {
             Self::AccessFlag(l) => 9 + l as u64,
             Self::Permission(l) => 13 + l as u64,
             Self::ExternalWalk(l) => 20 + l as u64,
-            Self::Alignment => 0x21,
         }
     }
 }
+/// Alignment faults are data-only (D13.2.37 DFSC); there is no Fetch variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataAccess {
+    Read,
+    Write,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Exception immediates use the same typed domain as decoded operands.
 /// ```compile_fail
@@ -57,14 +66,23 @@ impl FaultStatus {
 /// let _ = Exception::Svc(1);
 /// ```
 pub enum Exception {
-    Svc(u16),
-    Hvc(u16),
+    Svc(crate::Immediate16),
+    Hvc(crate::Immediate16),
     Brk(u16),
     Unknown,
     SystemAccess(SystemAccessException),
     Irq,
     Fiq,
     SError,
+    /// Alignment cannot be combined with instruction fetch.
+    /// ```compile_fail
+    /// use carrick_softcpu_aarch64::{exception::*, state::VirtualAddress};
+    /// let _ = Exception::Alignment { access: Access::Fetch, address: VirtualAddress(0) };
+    /// ```
+    Alignment {
+        access: DataAccess,
+        address: VirtualAddress,
+    },
     Abort {
         access: Access,
         status: FaultStatus,
@@ -73,7 +91,7 @@ pub enum Exception {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderExit {
-    pub immediate: u16,
+    pub immediate: crate::Immediate16,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExceptionOutcome {
@@ -90,10 +108,18 @@ pub fn syndrome(exception: Exception, origin: ExceptionLevel) -> Syndrome {
     }
     let current = u64::from(origin == ExceptionLevel::El1);
     let (ec, iss) = match exception {
-        Exception::Svc(i) => (0x15, u64::from(i)),
-        Exception::Hvc(i) => (0x16, u64::from(i)),
+        Exception::Svc(i) => (0x15, u64::from(i.value())),
+        Exception::Hvc(i) => (0x16, u64::from(i.value())),
         Exception::Brk(i) => (0x3c, u64::from(i)),
         Exception::SError => (0x2f, 0),
+        Exception::Alignment { access, .. } => (
+            0x24 + current,
+            0x21 | if access == DataAccess::Write {
+                1 << 6
+            } else {
+                0
+            },
+        ),
         Exception::Abort { access, status, .. } => (
             if access == Access::Fetch {
                 0x20 + current
@@ -144,7 +170,7 @@ pub fn take_exception(cpu: &mut CpuState, exception: Exception) -> ExceptionOutc
     if !matches!(exception, Exception::Irq | Exception::Fiq) {
         cpu.el1.esr = syndrome(exception, origin.el);
     }
-    if let Exception::Abort { address, .. } = exception {
+    if let Exception::Abort { address, .. } | Exception::Alignment { address, .. } = exception {
         cpu.el1.far = address;
     }
     cpu.pstate.el = ExceptionLevel::El1;
