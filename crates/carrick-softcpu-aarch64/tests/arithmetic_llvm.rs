@@ -30,7 +30,7 @@ fn expected(a: Arithmetic) -> String {
     );
     match a.operand {
         ArithmeticOperand::Immediate(i) => {
-            write!(s, "#0x{:x}", i.encoded()).unwrap();
+            write!(s, "#0x{:x}", i.encoded()).expect("valid differential fixture");
             if i.shift().value() != 0 {
                 s.push_str(", lsl #12");
             }
@@ -45,7 +45,7 @@ fn expected(a: Arithmetic) -> String {
                     Shift::Asr => "asr",
                     Shift::Ror => "ror",
                 };
-                write!(s, ", {name} #{}", amount.value()).unwrap();
+                write!(s, ", {name} #{}", amount.value()).expect("valid differential fixture");
             }
         }
         ArithmeticOperand::Extended { rm, extend, amount } => {
@@ -60,7 +60,7 @@ fn expected(a: Arithmetic) -> String {
             if sp_lsl {
                 s.push_str(&reg(rm, width));
                 if amount.value() != 0 {
-                    write!(s, ", lsl #{}", amount.value()).unwrap();
+                    write!(s, ", lsl #{}", amount.value()).expect("valid differential fixture");
                 }
                 return s;
             }
@@ -74,9 +74,9 @@ fn expected(a: Arithmetic) -> String {
                 Extend::Sxtw => "sxtw",
                 Extend::Sxtx => "sxtx",
             };
-            write!(s, "{}, {name}", reg(rm, width)).unwrap();
+            write!(s, "{}, {name}", reg(rm, width)).expect("valid differential fixture");
             if amount.value() != 0 {
-                write!(s, " #{}", amount.value()).unwrap();
+                write!(s, " #{}", amount.value()).expect("valid differential fixture");
             }
         }
     }
@@ -166,7 +166,7 @@ fn generated_arithmetic_matches_llvm_operands() {
     let words: Vec<_> = words.into_iter().collect();
     let path =
         std::env::temp_dir().join(format!("carrick-a64-arithmetic-{}.o", std::process::id()));
-    std::fs::write(&path, object(&words)).unwrap();
+    std::fs::write(&path, object(&words)).expect("valid differential fixture");
     let output = Command::new(llvm)
         .args([
             "-D",
@@ -177,14 +177,14 @@ fn generated_arithmetic_matches_llvm_operands() {
         ])
         .arg(&path)
         .output()
-        .unwrap();
-    std::fs::remove_file(path).unwrap();
+        .expect("valid differential fixture");
+    std::fs::remove_file(path).expect("valid differential fixture");
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = String::from_utf8(output.stdout).unwrap();
+    let text = String::from_utf8(output.stdout).expect("valid differential fixture");
     let lines: Vec<_> = text
         .lines()
         .filter(|s| s.starts_with(" ") && !s.trim().is_empty())
@@ -196,7 +196,7 @@ fn generated_arithmetic_matches_llvm_operands() {
             let actual = line
                 .split("//")
                 .next()
-                .unwrap()
+                .expect("valid differential fixture")
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -313,7 +313,7 @@ fn generated_branches_match_llvm_operands() {
     assert!(words.len() >= 50_000);
     let words: Vec<_> = words.into_iter().collect();
     let path = std::env::temp_dir().join(format!("carrick-a64-branches-{}.o", std::process::id()));
-    std::fs::write(&path, object(&words)).unwrap();
+    std::fs::write(&path, object(&words)).expect("valid differential fixture");
     let output = Command::new(llvm)
         .args([
             "-D",
@@ -324,14 +324,14 @@ fn generated_branches_match_llvm_operands() {
         ])
         .arg(&path)
         .output()
-        .unwrap();
-    std::fs::remove_file(path).unwrap();
+        .expect("valid differential fixture");
+    std::fs::remove_file(path).expect("valid differential fixture");
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = String::from_utf8(output.stdout).unwrap();
+    let text = String::from_utf8(output.stdout).expect("valid differential fixture");
     let lines: Vec<_> = text
         .lines()
         .filter(|s| s.starts_with(" ") && !s.trim().is_empty())
@@ -344,7 +344,7 @@ fn generated_branches_match_llvm_operands() {
         let actual = line
             .split(" <")
             .next()
-            .unwrap()
+            .expect("valid differential fixture")
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
@@ -365,7 +365,7 @@ fn hint_neighbourhood_has_no_false_acceptances() {
     // words and check every accepted hint against LLVM, including all fixed bits.
     let words: Vec<_> = (0..65536).map(|low| 0xd5030000 | low).collect();
     let path = std::env::temp_dir().join(format!("carrick-a64-hints-{}.o", std::process::id()));
-    std::fs::write(&path, object(&words)).unwrap();
+    std::fs::write(&path, object(&words)).expect("valid differential fixture");
     let output = Command::new(llvm)
         .args([
             "-D",
@@ -376,10 +376,10 @@ fn hint_neighbourhood_has_no_false_acceptances() {
         ])
         .arg(&path)
         .output()
-        .unwrap();
-    std::fs::remove_file(path).unwrap();
+        .expect("valid differential fixture");
+    std::fs::remove_file(path).expect("valid differential fixture");
     assert!(output.status.success());
-    let text = String::from_utf8(output.stdout).unwrap();
+    let text = String::from_utf8(output.stdout).expect("valid differential fixture");
     let lines: Vec<_> = text
         .lines()
         .filter(|s| s.starts_with(" ") && !s.trim().is_empty())
@@ -391,7 +391,7 @@ fn hint_neighbourhood_has_no_false_acceptances() {
             let actual = line
                 .split(" <")
                 .next()
-                .unwrap()
+                .expect("valid differential fixture")
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
