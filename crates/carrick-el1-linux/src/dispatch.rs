@@ -3069,7 +3069,9 @@ pub(crate) mod close_retire_hold {
     }
 
     /// The next native close or exact dup on this thread runs `hold` with
-    /// the table and the descriptor number it is about to retire.
+    /// the table and the descriptor number it is about to retire. Its
+    /// witnesses run where ring children's IPC transfers do (not macOS).
+    #[cfg(not(target_os = "macos"))]
     pub(crate) fn set(hold: impl FnOnce(&IpcRegion<'_>, TableId, Fd) + 'static) {
         HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(hold)));
     }

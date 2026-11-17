@@ -19056,7 +19056,7 @@ fn serial_host_arm_two_lock_waiters_rerun_and_park_again() {
 
 /// The run root's child A and A's children B and C (the harness admits one
 /// root fork), each switched in once, for the lock witnesses below.
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 fn arm_three_lock_processes(
     call: &mut dyn FnMut(
         ArmCaller,
@@ -19087,7 +19087,7 @@ fn arm_three_lock_processes(
 }
 
 /// `openat(path, O_RDWR|O_CREAT, 0640)` as `who`.
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 fn arm_open_lock_file(
     call: &mut dyn FnMut(
         ArmCaller,
