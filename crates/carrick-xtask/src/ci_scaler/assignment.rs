@@ -317,7 +317,9 @@ pub fn admit_assigned(
         request.set_len(0)?;
         request.write_all(&serde_json::to_vec(context)?)?;
         request.sync_all()?;
-        request
+        // Release by LOCK_UN on return: a bare close leaves the lock held by
+        // an unrelated pre-exec fork's copy of this description (#2484).
+        crate::lock_file::OwnedFileLock::from_locked(request)
     };
     let deadline = Instant::now() + limit;
     loop {
@@ -1137,6 +1139,57 @@ mod tests {
             assert_eq!(seen, want, "unlock={unlock}");
             let _ = std::fs::remove_file(dir.path().join("draining"));
         }
+    }
+
+    /// The #2484 mechanism on the production entry point: `admit_assigned`
+    /// returns while a forked child (another test's fork-to-exec window)
+    /// holds a copy of the request fd it published. A return that only
+    /// closes its fd leaves the lifetime lock held and `quiesce_guest` reads
+    /// `Busy` for a hook that is gone; the return must release the lock.
+    #[test]
+    fn ci_scaler_admit_assigned_return_releases_the_request_lock_despite_a_forked_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("admission.lock"), "").unwrap();
+        std::fs::write(dir.path().join("assignment.json"), "").unwrap();
+        let state = dir.path().to_path_buf();
+        let hook = std::thread::spawn({
+            let state = state.clone();
+            move || admit_assigned(&state, &run_b(), 0, Duration::from_secs(60))
+        });
+        // The hook is waiting once its request is published and locked.
+        let mut tries = 0u64;
+        while !waiting_assignment_locked(&state).unwrap() {
+            assert!(!hook.is_finished(), "admit_assigned returned early");
+            tries += 1;
+            assert!(tries < 100_000_000, "the hook never published its request");
+            std::thread::yield_now();
+        }
+        let mut gate = [0; 2];
+        assert_eq!(unsafe { libc::pipe(gate.as_mut_ptr()) }, 0);
+        // SAFETY: the child calls only async-signal-safe functions (read,
+        // _exit) and touches no Rust state.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe {
+                let mut byte = 0u8;
+                libc::close(gate[1]);
+                libc::read(gate[0], (&raw mut byte).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(gate[0]) };
+        // Draining ends the wait: admit_assigned returns its refusal.
+        std::fs::write(state.join("draining"), "").unwrap();
+        assert!(hook.join().unwrap().is_err());
+        let seen = super::quiesce_guest(&state);
+        unsafe {
+            libc::write(gate[1], [1u8].as_ptr().cast(), 1);
+            libc::close(gate[1]);
+            let mut status = 0;
+            libc::waitpid(child, &raw mut status, 0);
+        }
+        assert_eq!(seen.unwrap(), Assignment::Unassigned);
     }
 
     #[test]
