@@ -328,16 +328,7 @@ const ACCESS_FLAG: u64 = 1 << 10;
 const AP_EL0_ACCESS: u64 = 1 << 6;
 const AP_READ_ONLY: u64 = 1 << 7;
 
-/// The direction of one EL0 access, as decoded from the fault syndrome.
-/// The discriminants are the wire encoding of the
-/// `hvpatch__stale__stage1__retry` probe's access argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum LeafAccess {
-    Read = 0,
-    Write = 1,
-    Execute = 2,
-}
+pub use crate::stage1::LeafAccess;
 
 /// What a stage-1 data or instruction abort's fault status code (`DFSC` /
 /// `IFSC`, ESR bits `[5:0]`) says the faulting walk found. The discriminants

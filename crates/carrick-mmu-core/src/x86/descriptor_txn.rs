@@ -4,6 +4,7 @@ pub use crate::aarch64::descriptor_txn::{
 };
 pub use crate::descriptor_refusal::DescriptorRefusal;
 pub use crate::live_descriptor_words::LiveDescriptorWords;
+pub use crate::stage1::{LeafAccess as Access, LeafSize};
 use alloc::{collections::BTreeMap, vec::Vec};
 use carrick_guest_arch::{
     Access as GuestAccess, EditBacking, EditCowAccess, EditIntent, EditLeafSize, EditOperation,
@@ -33,26 +34,12 @@ pub struct Permissions {
     pub executable: bool,
     pub user: bool,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LeafSize {
-    Page,
-    Block2M,
-    Block1G,
-}
-impl LeafSize {
-    pub const fn bytes(self) -> u64 {
-        match self {
-            Self::Page => PAGE,
-            Self::Block2M => 1 << 21,
-            Self::Block1G => 1 << 30,
-        }
-    }
-    const fn level(self) -> usize {
-        match self {
-            Self::Page => 3,
-            Self::Block2M => 2,
-            Self::Block1G => 1,
-        }
+/// x86 paging level holding a leaf of `size`: PT, PD or PDPT.
+const fn leaf_level(size: LeafSize) -> usize {
+    match size {
+        LeafSize::Page => 3,
+        LeafSize::Block2M => 2,
+        LeafSize::Block1G => 1,
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -334,7 +321,7 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
             0,
             span.va + offset,
             offset,
-            size.level(),
+            leaf_level(size),
         )?;
     }
     Ok(DescriptorPlan {
@@ -932,12 +919,6 @@ pub fn execute_descriptor_txn<W: LiveDescriptorWords + ?Sized, J: DescriptorJour
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Access {
-    Read,
-    Write,
-    Execute,
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultClass {
     NotPresent,
