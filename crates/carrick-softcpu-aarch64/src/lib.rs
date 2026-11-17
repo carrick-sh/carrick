@@ -606,6 +606,7 @@ mod instruction {
     pub enum Instruction {
         Unallocated,
         Barrier(crate::Barrier),
+        ExceptionGeneration(crate::ExceptionGeneration),
         SystemAccess(crate::SystemAccess),
         PstateImmediate(crate::PstateImmediate),
         CensusGap(Decoded),
