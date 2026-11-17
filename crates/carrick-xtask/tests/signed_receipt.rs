@@ -3803,10 +3803,16 @@ raise SystemExit('unexpected gh invocation: ' + repr(args))
                 "workflow_run": {"id": 501}, "dir": artifact
             })],
         );
+        git_cmd(
+            &bench.repo,
+            &["commit", "--allow-empty", "-qm", "next group candidate"],
+        );
+        let next_head = git_cmd(&bench.repo, &["rev-parse", "HEAD"]);
+        assert_ne!(next_head, landed);
         let request = Request {
             kind: RequestKind::MergeGroup,
             prs: vec![43],
-            sha: landed.clone(),
+            sha: next_head,
             base: landed,
         };
         let reused = bench.dir.path().join("next-base");
