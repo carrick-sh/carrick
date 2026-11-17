@@ -51,6 +51,16 @@ the ring's owned continuation moves a stream transfer record by record from
 the byte after the last one moved: a blocking send to its full count, a
 MSG_WAITALL receive on a blocking stream until its buffer is full or the
 stream ends; a signal or error after progress answers the bytes moved.
+That holds for every record after the call's first, whether or not it
+parks: a signal that cancels a later record (or a waited call's own record
+published again) before the carrier claims it answers the bytes moved or
+EINTR, never a restart from byte 0 or a restarted poll, and a refused later
+record answers the bytes moved rather than ENOSYS.
+
+A socket the run root created and a native child inherited is a physical
+hold of the root's description (its fstat answers S_IFSOCK). It has no
+native venue yet, so its socket calls are refused (a counted ENOSYS); only
+a proven non-socket answers ENOTSOCK.
 """
 
 [bindings]
@@ -73,6 +83,16 @@ vm_free = [
   "carrick-personality-linux::native_host_file::tests::a_socket_send_keeps_its_whole_extent_across_records",
   "carrick-personality-linux::native_host_file::tests::a_socket_receive_continues_only_for_msg_waitall_on_a_blocking_stream",
   "carrick-personality-linux::native_host_file::tests::a_socket_send_proves_its_whole_extent_readable_and_holds_a_datagram",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_signal_interrupts_a_native_childs_host_readiness_wait_with_eintr_on_arm",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_native_childs_blocking_send_continues_across_records_to_its_full_count_on_arm",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_native_childs_poll_keeps_one_serial_per_call_and_a_new_call_a_new_one_on_arm",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_signal_between_a_native_childs_send_records_answers_the_bytes_moved",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_signal_between_a_native_childs_send_records_answers_the_bytes_moved_on_arm",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_refused_next_send_record_answers_the_bytes_moved",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_refused_next_send_record_answers_the_bytes_moved_on_arm",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr",
+  "carrick-el1-linux::native_process_runtime::host_test_support::a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr_on_arm",
+  "carrick-kernel::dispatch::native_files::tests::an_inherited_root_socket_is_never_enotsock_in_a_native_child",
 ]
 embed = [
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_tcp_and_udp_cross_to_the_host_network (fork child: blocking TCP connect/send/recv/shutdown/EOF, UDP sendto + poll + recvfrom, poll timeout, non-blocking connect + poll(POLLOUT) + SO_ERROR, TCP over ::1)",
