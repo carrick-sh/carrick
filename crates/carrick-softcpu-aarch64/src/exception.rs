@@ -51,6 +51,11 @@ impl FaultStatus {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Exception immediates use the same typed domain as decoded operands.
+/// ```compile_fail
+/// use carrick_softcpu_aarch64::exception::Exception;
+/// let _ = Exception::Svc(1);
+/// ```
 pub enum Exception {
     Svc(u16),
     Hvc(u16),
