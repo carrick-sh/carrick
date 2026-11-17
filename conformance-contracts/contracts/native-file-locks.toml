@@ -1,0 +1,51 @@
+schema_version = 1
+id = "kernel.native.file-locks"
+title = "The ring owns advisory file locks for native processes"
+guest_surfaces = ["syscall:fcntl", "syscall:flock"]
+semantic_authority = ["man 2 fcntl", "man 2 flock", "docs/host-facility-boundary.md"]
+fixture = "unit:serial_host_arm_fork_children_contend_record_locks_and_flock_in_the_ring"
+scale_points = [1, 2]
+structural_budgets = []
+rationale = """
+#231 (apt's lock files). fcntl(2) record locks (F_GETLK/F_SETLK/F_SETLKW),
+OFD locks (F_OFD_*) and flock(2) are compat-zone state: one neutral lock
+table (carrick-fd-core record_lock) in the IPC directory, keyed by the
+file's typed identity, which the carrier stamps on a native host-file
+description at open. A record lock belongs to the caller's descriptor
+table, an OFD lock or flock to one open file description. A close of any
+descriptor of the file ends the table's record locks on it, as does the
+descriptor a dup2/dup3 replaces and exec's close-on-exec sweep; the
+description's last reference ends its OFD and flock locks; at exit the
+retired table stops owning and the host drain reaps and wakes. A blocking
+request never spins or holds capacity: it parks as an owned FileLockWait
+operation on the lock object's lane, enrolled under the table lock, and a
+release's wake reruns it to probe once. A signal ends it with EINTR.
+Not served (counted ENOSYS): SEEK_CUR/SEEK_END bases and unstamped
+descriptions; no EDEADLK. The host-dispatched ARM run root keeps the host
+arbiter (dispatch/fs/locks.rs), so its locks and a native child's do not
+yet conflict (follow-up).
+"""
+
+[bindings]
+vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::serial_host_arm_fork_children_contend_record_locks_and_flock_in_the_ring (production ARM dispatch, two live processes; red: every lock call -38)",
+  "carrick-fd-core::record_lock::tests::two_tables_contend_for_one_record_lock_until_a_close_releases_it",
+  "carrick-fd-core::record_lock::tests::readers_share_and_a_writer_waits_for_every_reader",
+  "carrick-fd-core::record_lock::tests::unlock_splits_and_a_retake_merges_the_owners_ranges",
+  "carrick-fd-core::record_lock::tests::a_full_table_refuses_before_any_effect",
+  "carrick-fd-core::record_lock::tests::ofd_and_flock_locks_keep_their_owners_and_families_apart",
+  "carrick-fd-core::record_lock::tests::a_dead_owners_locks_block_nobody",
+  "carrick-fd-core::record_lock::tests::posix_ranges_follow_fcntl",
+  "carrick-fd-core::record_lock::tests::identities_follow_the_description_incarnation",
+  "carrick-el1-abi::ipc::tests::el1_ipc_file_lock_layout_refuses_the_previous_abi",
+  "carrick-el1-abi::ipc::tests::el1_ipc_file_locks_and_identities_are_shared_by_both_venues",
+]
+embed = [
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_and_fork_child_contend_record_locks_and_flock (native oracle byte for byte; red: fcntl x10, flock x4 refused)",
+]
+
+[bindings.unresolved]
+semantics = "SEEK_CUR/SEEK_END bases, EDEADLK and the host-dispatched ARM run root's locks (host arbiter) are not served by this owner."
+structural = "No work-count budget is bound; the table costs the number of locks held per operation."
+embed_structural = "UNRUN (director): signed ARM run of apt-get on the implementation head."
+docker = "The x86 KVM witness compares with the native Linux oracle; no Docker differential."
