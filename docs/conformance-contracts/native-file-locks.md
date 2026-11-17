@@ -17,12 +17,19 @@ host file.
   and `F_GETLK` reports it with its holder's pid (`-1` for an OFD lock);
   `F_SETLKW` waits and is interrupted by a signal; a close of ANY
   descriptor of the file releases the closer's record locks, and so does
-  exit. A read lock needs a readable description, a write lock a writable
+  exit, and exec closing a close-on-exec descriptor of the file (execve(2)
+  keeps record locks otherwise). The `struct flock` is copied in once, at
+  the call. A blocked `F_SETLKW` whose descriptor another thread closed or
+  replaced goes on with its open file description; once the lock is free
+  it returns `EBADF` holding nothing (native oracle, Linux 6.12). A read lock needs a readable description, a write lock a writable
   one (`EBADF`).
 - fcntl(2), OFD locks: owned by the open file description, `l_pid` must be
   zero, released on the description's last close.
 - flock(2): owned by the open file description, a separate family from
-  fcntl locks; a conversion is not atomic; released on the last close.
+  fcntl locks; a conversion is not atomic; released on the last close. A
+  blocked flock whose descriptor was replaced takes the lock (0) and holds
+  it until the description's last reference, its own call's, ends (native
+  oracle). OFD locks and flocks of descriptions kept across exec stay.
 
 ## Carrick invariant
 
@@ -41,6 +48,21 @@ its description: it enrols on the lock object's `Readable` lane under the
 table lock, then parks, releasing its execution capacity. Every release
 publishes that lane; the woken call takes its operation back before any
 descriptor lookup and probes once. Contention is never an errno.
+
+The operation keeps the request decoded at entry (`RawLockRequest`: kind
+and range), and a rerun takes exactly that lock, never a re-read of user
+memory. Routing a woken call asks for its retained operation before the
+descriptor's current object, so a sibling's close or dup2 of the number
+cannot strand the operation or its description pin. After a record lock is
+taken, the descriptor is asked under the lock table's exclusion whether it
+still names the pinned description (`Authority::names_pinned`); if not, the
+lock is given back and the call returns `EBADF`. A close that retires the
+descriptor after that answer releases the lock itself.
+
+close(2) and the descriptor a dup2/dup3 replaces release the record locks
+of the file the retirement returned (`carrick_fd_core::Retired`), read in
+the same descriptor-table acquisition that vacated the number, never of a
+file sampled apart from it.
 
 ## IPC layout change (ABI version 9)
 
@@ -72,9 +94,21 @@ both ISAs map.
 
 - ARM: `serial_host_arm_fork_children_contend_record_locks_and_flock_in_the_ring`
   (production ARM dispatch of two live fork children; red: every call -38).
+- ARM, #2452 review: `serial_host_arm_woken_lock_waiters_take_the_request_they_parked_with`
+  (the request survives a rewrite of the caller's `struct flock`),
+  `serial_host_arm_lock_waiter_goes_on_with_its_description_after_a_sibling_replaces_its_fd`
+  (routing by the retained operation; `EBADF` for F_SETLKW, 0 for flock),
+  `serial_host_arm_close_releases_record_locks_of_the_file_it_retired` and
+  `serial_host_arm_dup_releases_record_locks_only_of_a_displaced_file` (a
+  sibling's change of the table played at the `close_retire_hold` test hold),
+  and `native_exec_pipe_tests::serial_host_native_fork_exec_ends_record_locks_on_close_on_exec`
+  (the production exec service's close-on-exec sweep).
 - x86: `serial_host_root_and_fork_child_contend_record_locks_and_flock`
   (production KVM CPL0, the run root and its fork child, against the native
-  oracle; red: fcntl x10 and flock x4 refused).
+  oracle; red: fcntl x10 and flock x4 refused), and
+  `serial_host_exec_close_on_exec_ends_record_locks_and_keeps_flock_and_ofd_locks`
+  (a fork child execs: its record lock ends, its flock and OFD lock stay,
+  byte for byte with the native oracle).
 
 ## Not served
 
