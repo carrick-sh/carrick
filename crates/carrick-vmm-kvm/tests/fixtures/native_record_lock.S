@@ -94,7 +94,7 @@
 1:  call value_byte
 .endm
 
-#ifndef LIFECYCLE
+#if !defined(LIFECYCLE) && !defined(POOL)
 _start:
     lea out(%rip), %r15
 
@@ -262,7 +262,125 @@ child:
     xor %edi, %edi
     jmp exit
 
-#endif /* !LIFECYCLE */
+#endif /* !LIFECYCLE && !POOL */
+
+#ifdef POOL
+#define WAITERS 6
+_start:
+    lea out(%rip), %r15
+
+    mov $-100, %edi                 /* Q1: openat(lock, O_RDWR|O_CREAT, 0640) */
+    lea lock(%rip), %rsi
+    mov $0x42, %edx
+    mov $0640, %r10d
+    mov $257, %eax
+    syscall
+    mov %rax, %r12
+    record_status
+
+    record_lock 6, 1                /* Q2: F_SETLK F_WRLCK */
+    record_status
+
+    lea ready(%rip), %rdi           /* Q3: pipe2(ready), pipe2(go) */
+    xor %esi, %esi
+    mov $293, %eax
+    syscall
+    test %rax, %rax
+    js 1f
+    lea go(%rip), %rdi
+    xor %esi, %esi
+    mov $293, %eax
+    syscall
+1:  record_status
+
+    mov $WAITERS, %r13d             /* fork the waiters */
+1:  mov $57, %eax
+    syscall
+    test %rax, %rax
+    js fork_failed
+    jz pool_waiter
+    dec %r13d
+    jnz 1b
+
+    call wait_50ms                  /* Q4: let every waiter park */
+#ifdef PIPE
+    mov $WAITERS, %r14d             /* the control: one byte per reader */
+6:  movl go+4(%rip), %edi
+    call write_byte
+    call wait_50ms
+    dec %r14d
+    jnz 6b
+#endif
+    record_lock 6, 2                /* Q5: F_SETLK F_UNLCK */
+    record_status
+
+    xor %r13d, %r13d                /* Q6: one byte per waiter */
+    mov $WAITERS, %r14d
+2:  movl ready(%rip), %edi
+    call read_byte
+    cmp $1, %rax
+    jne 3f
+    inc %r13d
+    dec %r14d
+    jnz 2b
+3:  mov %r13d, %eax
+    call value_byte
+
+    xor %ebx, %ebx                  /* Q7: wait4 every waiter */
+    mov $WAITERS, %r14d
+4:  mov $-1, %rdi
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    test %rax, %rax
+    js fork_failed
+    or status(%rip), %ebx
+    dec %r14d
+    jnz 4b
+    mov %ebx, %eax
+    shr $8, %eax
+    or %ebx, %eax
+    and $0xff, %eax
+    call value_byte
+
+    call report
+    xor %edi, %edi
+    jmp exit
+
+pool_waiter:
+#ifdef PIPE
+    movl go(%rip), %edi             /* read(go) parks until a byte comes */
+    call read_byte
+    cmp $1, %rax
+    jne 5f
+    xor %eax, %eax
+#else
+    record_lock 7, 1                /* F_SETLKW F_WRLCK */
+#endif
+    test %rax, %rax
+    jnz 5f
+    movl ready+4(%rip), %edi
+    call write_byte
+    xor %edi, %edi
+    jmp exit
+5:  neg %eax
+    mov %eax, %edi
+    jmp exit
+
+/* futex(FUTEX_WAIT) on a private word for 50 ms */
+wait_50ms:
+    lea pause_word(%rip), %rdi
+    xor %esi, %esi
+    xor %edx, %edx
+    lea pause_time(%rip), %r10
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $202, %eax
+    syscall
+    ret
+#endif /* POOL */
 
 #ifdef LIFECYCLE
 _start:
