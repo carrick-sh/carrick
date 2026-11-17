@@ -114,3 +114,41 @@ fn command_rejects_reserved_code_excludes_literals_and_is_deterministic() -> any
     );
     Ok(())
 }
+
+#[test]
+fn command_exports_all_loader_words_deterministically() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("image.elf");
+    std::fs::write(&input, fixture())?;
+    let mut exports = Vec::new();
+    for name in ["first.bin", "second.bin"] {
+        let export = directory.path().join(name);
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
+            .args(["debug", "a64-census"])
+            .arg(&input)
+            .arg("--export-loader-spans")
+            .arg(&export)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        // The fixture has one ELF code span. All subsequent spans are the
+        // production maintenance/vector pages, including repeated configurations.
+        let loader_bytes: u64 = report["spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|span| span["bytes"].as_u64().unwrap())
+            .sum();
+        let bytes = std::fs::read(export)?;
+        assert!(loader_bytes > 0);
+        assert_eq!(bytes.len() as u64, loader_bytes);
+        exports.push(bytes);
+    }
+    assert_eq!(exports[0], exports[1]);
+    Ok(())
+}
