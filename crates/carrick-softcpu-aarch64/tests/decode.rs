@@ -229,3 +229,24 @@ fn sys_operands_and_reserved_namespace() {
         }
     }
 }
+
+#[test]
+fn tlbi_has_one_public_representation() {
+    use carrick_softcpu_aarch64::{Instruction, decode, decode_instruction};
+    for crm in [3, 7] {
+        for op2 in [1, 2, 3, 5, 7] {
+            for rt in 0..32 {
+                let word = 0xd5088000 | crm << 8 | op2 << 5 | rt;
+                assert!(
+                    decode(word).is_none(),
+                    "TLBI must use SystemOperation exclusively"
+                );
+                assert!(matches!(
+                    decode_instruction(word),
+                    Instruction::SystemOperation(_)
+                ));
+                assert_eq!(classify(word), A64Class::TlbInvalidate);
+            }
+        }
+    }
+}
