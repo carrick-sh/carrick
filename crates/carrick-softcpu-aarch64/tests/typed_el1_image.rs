@@ -2,7 +2,7 @@
 //! carrick-el1-image OUT_DIR/el1-target/aarch64-unknown-none-softfloat/el1-image/
 //! carrick-el1 ELF. Explicit invocation avoids rebuilding the kernel in every
 //! VM-free decoder test. No instruction inventory or fixed word count is used.
-use carrick_softcpu_aarch64::{Instruction, classify, decode_instruction};
+use carrick_softcpu_aarch64::{Instruction, NamedSystemRegister, classify, decode_instruction};
 use std::collections::BTreeMap;
 
 #[test]
@@ -113,6 +113,13 @@ fn linked_el1_executable_mapping_spans_are_typed() {
                 let word =
                     u32::from_le_bytes(word.try_into().expect("ELF field has the expected width"));
                 words += 1;
+                if let Instruction::SystemAccess(access) = decode_instruction(word) {
+                    assert!(
+                        !matches!(access.register, NamedSystemRegister::Unnamed(_)),
+                        "unnamed production register: {:?}",
+                        access.encoding
+                    );
+                }
                 if decode_instruction(word) == Instruction::Unallocated {
                     *unknown.entry(format!("{:?}", classify(word))).or_default() += 1;
                 }
