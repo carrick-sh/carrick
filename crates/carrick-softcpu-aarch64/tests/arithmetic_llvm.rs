@@ -1249,3 +1249,96 @@ fn generated_conditional_matches_llvm_operands() {
         words.len()
     );
 }
+
+#[test]
+#[ignore = "requires Rust-sysroot CARRICK_LLVM_OBJDUMP"]
+fn generated_multiply_divide_matches_llvm_operands() {
+    let mut words = BTreeSet::new();
+    for sf in 0..2u32 {
+        for op in 0..8 {
+            for sub in 0..2 {
+                for rm in 0..32 {
+                    for rn in [0, 1, 17, 30, 31] {
+                        for ra in [0, 18, 31] {
+                            for rd in [0, 1, 19, 30, 31] {
+                                words.insert(
+                                    sf << 31
+                                        | 0x1b000000
+                                        | op << 21
+                                        | rm << 16
+                                        | sub << 15
+                                        | ra << 10
+                                        | rn << 5
+                                        | rd,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for sf in 0..2u32 {
+        for opcode in 0..64 {
+            for rm in [0, 1, 17, 30, 31] {
+                for rn in [0, 18, 31] {
+                    for rd in [0, 1, 19, 30, 31] {
+                        words
+                            .insert(sf << 31 | 0x1ac00000 | rm << 16 | opcode << 10 | rn << 5 | rd);
+                    }
+                }
+            }
+        }
+    }
+    let words: Vec<_> = words.into_iter().collect();
+    assert!(words.len() >= 50_000);
+    let mut accepted = 0;
+    for (&w, actual) in words.iter().zip(oracle_lines(&words, "multiply-divide")) {
+        let expected = match decode_instruction(w) {
+            Instruction::Multiply(m) => {
+                let name = match (m.kind, m.subtract) {
+                    (MultiplyKind::SameWidth, false) => "madd",
+                    (MultiplyKind::SameWidth, true) => "msub",
+                    (MultiplyKind::SignedLong, false) => "smaddl",
+                    (MultiplyKind::SignedLong, true) => "smsubl",
+                    (MultiplyKind::UnsignedLong, false) => "umaddl",
+                    (MultiplyKind::UnsignedLong, true) => "umsubl",
+                    (MultiplyKind::SignedHigh, _) => "smulh",
+                    (MultiplyKind::UnsignedHigh, _) => "umulh",
+                };
+                let width = if matches!(
+                    m.kind,
+                    MultiplyKind::SignedLong | MultiplyKind::UnsignedLong
+                ) {
+                    Width::W32
+                } else {
+                    m.width
+                };
+                let mut expected = format!(
+                    "{name} {}, {}, {}",
+                    reg(m.rd, m.width),
+                    reg(m.rn, width),
+                    reg(m.rm, width)
+                );
+                if let Some(ra) = m.accumulator {
+                    expected.push_str(&format!(", {}", reg(ra, m.width)));
+                }
+                expected
+            }
+            Instruction::Divide(d) => format!(
+                "{} {}, {}, {}",
+                if d.signed { "sdiv" } else { "udiv" },
+                reg(d.rd, d.width),
+                reg(d.rn, d.width),
+                reg(d.rm, d.width)
+            ),
+            _ => continue,
+        };
+        assert_eq!(expected, actual, "{w:08x}");
+        accepted += 1;
+    }
+    println!(
+        "{} distinct multiply/divide words; {accepted} accepted; 0 wrong class / operand mismatches",
+        words.len()
+    );
+}

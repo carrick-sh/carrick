@@ -204,3 +204,14 @@ fn multiply_divide_forms_have_typed_operands() {
         );
     }
 }
+
+#[test]
+fn multiply_reserved_combinations_fail_shut() {
+    for word in [0x1b220c20, 0x9b628c20, 0x9b42fc20, 0x9bc20020, 0x3b020c20] {
+        assert_eq!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
