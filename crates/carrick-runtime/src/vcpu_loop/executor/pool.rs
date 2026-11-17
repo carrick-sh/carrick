@@ -621,6 +621,8 @@ pub(crate) struct WorkerChannels {
 }
 
 pub(crate) struct WorkerRuntime<'a> {
+    /// The worker's pool slot, as its death names it.
+    pub(crate) worker: usize,
     pub(crate) registration: &'a ExecutorRegistration,
     pub(crate) kick: &'a Arc<WorkerKick>,
     pub(crate) boundary: &'a WorkerBoundaryAudit,

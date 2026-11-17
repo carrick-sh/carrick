@@ -6759,8 +6759,8 @@ impl VcpuLoopLaunch {
                 }
                 wait_for_physical_job_retirement(&completion)?;
                 match &outcome {
-                    Ok(_) => process_retirement.wait()?,
-                    Err(_) => process_retirement.wait_if_exit_started_or_published()?,
+                    Ok(_) => process_retirement.wait(&liveness)?,
+                    Err(_) => process_retirement.wait_if_exit_started_or_published(&liveness)?,
                 }
                 tracing::info!(
                     outcome = match &outcome {

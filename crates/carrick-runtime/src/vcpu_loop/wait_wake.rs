@@ -252,6 +252,17 @@ struct ProcessPhysicalRetirementState {
     changed: Condvar,
 }
 
+/// Wakes a process's physical-retirement wait on the carrier's executor
+/// death (#2420).
+struct RetirementDeathWake(Arc<ProcessPhysicalRetirementState>);
+
+impl carrick_kernel::kernel::ExecutorDeathObserver for RetirementDeathWake {
+    fn executor_died(&self, _death: &carrick_kernel::kernel::ExecutorDeath) {
+        let _publication = self.0.publication.lock();
+        self.0.changed.notify_all();
+    }
+}
+
 #[derive(Default)]
 struct ProcessPhysicalRetirementPublication {
     exit_started: bool,
@@ -306,27 +317,48 @@ impl ProcessPhysicalRetirement {
         Ok(())
     }
 
-    pub(crate) fn wait(&self) -> Result<(), RuntimeError> {
-        self.wait_with_publication_timeout(PHYSICAL_JOB_RETIREMENT_TIMEOUT)
+    pub(crate) fn wait(&self, liveness: &ProcessGraphLiveness) -> Result<(), RuntimeError> {
+        self.wait_with_publication_timeout(liveness, PHYSICAL_JOB_RETIREMENT_TIMEOUT)
     }
 
-    pub(crate) fn wait_if_exit_started_or_published(&self) -> Result<(), RuntimeError> {
+    pub(crate) fn wait_if_exit_started_or_published(
+        &self,
+        liveness: &ProcessGraphLiveness,
+    ) -> Result<(), RuntimeError> {
         let must_wait = {
             let publication = self.state.publication.lock();
             publication.exit_started || publication.completions.published().is_some()
         };
-        if must_wait { self.wait() } else { Ok(()) }
+        if must_wait {
+            self.wait(liveness)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn wait_with_publication_timeout(
         &self,
+        liveness: &ProcessGraphLiveness,
         publication_timeout: std::time::Duration,
     ) -> Result<(), RuntimeError> {
+        // Enrolled before the publication lock: a death already recorded is
+        // delivered during enrolment, and its wake takes that lock.
+        let _death_wake =
+            liveness.enrol_executor_death(Arc::new(RetirementDeathWake(Arc::clone(&self.state))));
         let completions = {
             let mut publication = self.state.publication.lock();
             let mut deadline = None;
             while publication.completions.published().is_none() {
                 if !publication.exit_started {
+                    // A leader that exited raw waits here for its siblings,
+                    // unbounded. A dead executor (#2420) means a sibling may
+                    // never run again, so its verdict ends the wait.
+                    if let Some(death) = liveness.executor_death() {
+                        drop(publication);
+                        return Err(liveness.abort(
+                            carrick_kernel::kernel::debug::AbortReason::executor_died(&death),
+                        ));
+                    }
                     self.state.changed.wait(&mut publication);
                     continue;
                 }
@@ -537,6 +569,21 @@ impl Drop for ContainerJobReservation {
     }
 }
 
+/// Answer every job this wait has not reached with the carrier's abort: a
+/// verdict that one job's result can never arrive holds for the whole group.
+fn abort_remaining_jobs(
+    rest: &[HvpatchLoopResult],
+    reason: &str,
+    post_mortem: &Arc<carrick_kernel::kernel::debug::PostMortem>,
+) {
+    for other in rest {
+        other.publish_if_pending(Err(RuntimeError::KernelAborted {
+            reason: reason.to_owned(),
+            post_mortem: Arc::clone(post_mortem),
+        }));
+    }
+}
+
 pub(crate) fn wait_process_jobs(
     jobs: Vec<HvpatchProcessJobHandle>,
     liveness: &ProcessGraphLiveness,
@@ -570,12 +617,7 @@ pub(crate) fn wait_process_jobs(
                     post_mortem,
                 }) = &result
                 {
-                    for other in pending.iter().skip(index + 1) {
-                        other.publish_if_pending(Err(RuntimeError::KernelAborted {
-                            reason: reason.clone(),
-                            post_mortem: Arc::clone(post_mortem),
-                        }));
-                    }
+                    abort_remaining_jobs(&pending[index + 1..], reason, post_mortem);
                     // The kernel is frozen and captured; waiting the remaining
                     // physical-retirement bounds would only add 5 s per job to
                     // an outcome that is already decided.
@@ -589,10 +631,22 @@ pub(crate) fn wait_process_jobs(
                 // quantum's drop receipt before container-scoped VFS and
                 // mount-table retirement examines the ownership graph.
                 match wait_for_physical_job_retirement(&completion).and_then(|()| match &result {
-                    Ok(_) => process_retirement.wait(),
-                    Err(_) => process_retirement.wait_if_exit_started_or_published(),
+                    Ok(_) => process_retirement.wait(liveness),
+                    Err(_) => process_retirement.wait_if_exit_started_or_published(liveness),
                 }) {
                     Ok(()) => result,
+                    // A dead executor ended the retirement wait (#2420): the
+                    // group is answered as for any carrier-terminal abort.
+                    Err(RuntimeError::KernelAborted {
+                        reason,
+                        post_mortem,
+                    }) => {
+                        abort_remaining_jobs(&pending[index + 1..], &reason, &post_mortem);
+                        return Err(RuntimeError::KernelAborted {
+                            reason,
+                            post_mortem,
+                        });
+                    }
                     Err(retirement_error) => match result {
                         Ok(_) => Err(retirement_error),
                         Err(result_error) => Err(RuntimeError::CarrierFailed(format!(
@@ -1493,7 +1547,10 @@ mod tests {
         retirement.begin_process_exit();
 
         let error = retirement
-            .wait_with_publication_timeout(std::time::Duration::from_millis(20))
+            .wait_with_publication_timeout(
+                &ProcessGraphLiveness::unbound(),
+                std::time::Duration::from_millis(20),
+            )
             .expect_err("started process exit must not wait forever for a missing receipt");
         assert!(
             error
@@ -1526,7 +1583,7 @@ mod tests {
         normal.publish();
         normal.publish_physical_retirement_for_test();
         retirement
-            .wait()
+            .wait(&ProcessGraphLiveness::unbound())
             .expect("normal receipt remains authoritative");
     }
 

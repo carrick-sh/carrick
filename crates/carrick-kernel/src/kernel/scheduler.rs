@@ -3829,6 +3829,14 @@ impl Scheduler {
         }
     }
 
+    /// Withdraw a run wait's enrolment once the wait has ended.
+    pub fn forget_executor_death_observer(&self, observer: &Arc<dyn ExecutorDeathObserver>) {
+        self.executor_death
+            .lock()
+            .observers
+            .retain(|enrolled| !Arc::ptr_eq(enrolled, observer));
+    }
+
     pub fn install_generation_observer(
         &self,
         observer: Arc<dyn SchedulerGenerationObserver>,

@@ -124,6 +124,19 @@ pub(crate) struct ProcessGraphLiveness {
     pub(crate) confirm: std::time::Duration,
 }
 
+/// A wait's enrolment on the executor-death verdict, withdrawn on drop.
+pub(crate) struct ExecutorDeathEnrolment {
+    scheduler: Arc<carrick_kernel::kernel::scheduler::Scheduler>,
+    observer: Arc<dyn carrick_kernel::kernel::ExecutorDeathObserver>,
+}
+
+impl Drop for ExecutorDeathEnrolment {
+    fn drop(&mut self) {
+        self.scheduler
+            .forget_executor_death_observer(&self.observer);
+    }
+}
+
 /// A cheap census of everything that could still publish a job result.
 ///
 /// Deliberately cheap: `task_count`/`zombie_count`/`retired_thread_count` are
@@ -319,6 +332,48 @@ impl ProcessGraphLiveness {
         self.scheduler.as_ref()?.executor_death()
     }
 
+    /// Enrol `observer` on this carrier's executor-death verdict until the
+    /// returned enrolment drops. `None` when no scheduler is bound.
+    pub(crate) fn enrol_executor_death(
+        &self,
+        observer: Arc<dyn carrick_kernel::kernel::ExecutorDeathObserver>,
+    ) -> Option<ExecutorDeathEnrolment> {
+        let scheduler = Arc::clone(self.scheduler.as_ref()?);
+        scheduler.observe_executor_death(Arc::clone(&observer));
+        Some(ExecutorDeathEnrolment {
+            scheduler,
+            observer,
+        })
+    }
+
+    /// End a wait with the executor-death verdict, if an executor died.
+    pub(crate) fn executor_death_abort(&self) -> Option<RuntimeError> {
+        let death = self.executor_death()?;
+        Some(
+            self.abort(carrick_kernel::kernel::debug::AbortReason::executor_died(
+                &death,
+            )),
+        )
+    }
+
+    /// The answer to a job whose result was published. A dying worker
+    /// publishes its death before it fails the job it held (#2420), so a
+    /// failed result that meets a recorded death is that death's settlement:
+    /// the run ends with the death verdict and the worker's own error, not
+    /// the settlement's generic carrier failure. A guest outcome stays the
+    /// job's result.
+    pub(crate) fn answer_published(
+        &self,
+        result: Result<VcpuLoopOutcome, RuntimeError>,
+    ) -> Result<VcpuLoopOutcome, RuntimeError> {
+        match result {
+            Err(error) if !matches!(error, RuntimeError::KernelAborted { .. }) => {
+                Err(self.executor_death_abort().unwrap_or(error))
+            }
+            result => result,
+        }
+    }
+
     /// How long a census whose only liveness is an executor claim must hold
     /// unchanged before it is a verdict. See [`LIVENESS_CLAIM_STALL_WINDOWS`].
     pub(crate) fn claim_stall(&self) -> std::time::Duration {
@@ -460,7 +515,8 @@ impl HvpatchLoopResult {
             {
                 let mut slot = self.state.result.lock();
                 if let Some(result) = slot.take() {
-                    return result;
+                    drop(slot);
+                    return liveness.answer_published(result);
                 }
                 self.state.ready.wait_for(&mut slot, liveness.poll);
                 if slot.is_some() {
@@ -476,10 +532,8 @@ impl HvpatchLoopResult {
             // An executor death is carrier-terminal too. The graph still
             // looks live (the dead worker's siblings are parked, not gone),
             // so no census verdict would ever fire for it (#2420).
-            if let Some(death) = liveness.executor_death() {
-                return Err(liveness.abort(
-                    carrick_kernel::kernel::debug::AbortReason::executor_died(&death),
-                ));
+            if let Some(abort) = liveness.executor_death_abort() {
+                return Err(abort);
             }
             // An operator's `carrick debug abort --run-id` is latched by the
             // debug server and executed HERE, through the same sink, so a
@@ -515,7 +569,7 @@ impl HvpatchLoopResult {
                         // A settlement landed while the verdict was being
                         // formed. A real result always beats an abort: the job
                         // was published, so the premise of the verdict is gone.
-                        Some(result) => result,
+                        Some(result) => liveness.answer_published(result),
                         None => {
                             carrick_kernel::event_ring::rec_hvpatch_settle_object(
                                 Arc::as_ptr(&self.state) as usize,

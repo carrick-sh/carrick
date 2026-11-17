@@ -849,10 +849,22 @@ fn run_prepared_kvm_pool_with_debug(
                 authority_refusals: authority_refusals.clone(),
             }
         })?;
-    shutdown.map_err(|error| PreparedKvmPoolFailure {
-        error: RuntimeError::Configuration(error.to_string()),
-        authority_refusals,
-    })?;
+    match (shutdown, scheduler.executor_death()) {
+        (Ok(_), _) => {}
+        // The run's first completion was its guest exit. A worker that died
+        // after it, while the run ended or at teardown, fails its own join
+        // but does not unsay the exit: the death would have been the run's
+        // result only by reaching the completion first (#2420).
+        (Err(error), Some(death)) => {
+            tracing::error!(%death, %error, "executor died after the guest exit was the run's result");
+        }
+        (Err(error), None) => {
+            return Err(PreparedKvmPoolFailure {
+                error: RuntimeError::Configuration(error.to_string()),
+                authority_refusals,
+            });
+        }
+    }
     let (guest_entries, portal_exits) = physical.initial_execution_witness()?;
     let physical_crossing_families: Vec<_> = physical
         .physical_crossing_counts()?
