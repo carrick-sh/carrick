@@ -71,9 +71,3 @@ test = "carrick_el1_linux::aarch64_process_tests::arm_glibc_pthread_join_robust_
 reason = "#2109: a registered robust list no longer declines a raw exit to host custody, so the #2124 host-retirement wake witness now reaches host custody through a pending-signal decline, and a twin witnesses the robust exit retiring in ring and waking the join itself."
 replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_glibc_pthread_join_host_retirement_wake_meets_ring_wait"
 pr = 2182
-
-[[retired]]
-test = "fixtures::signed_gate_artifact_requires_exact_sha_and_matching_inputs"
-reason = "#2451: a passing merge-group candidate's receipt can now seed the next group's reusable base, and fixture admission is keyed on fixture input identity, not on which SHA published the archive. The witness was renamed for what it proves: matching inputs are required across publisher SHAs."
-replaced_by = "fixtures::signed_gate_artifact_requires_matching_inputs_across_publisher_shas"
-pr = 2459

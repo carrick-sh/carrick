@@ -3640,7 +3640,9 @@ fn restore_refuses_a_shared_lease() {
 }
 
 #[test]
-fn signed_gate_artifact_requires_matching_inputs_across_publisher_shas() {
+// Name kept from before #2451 (#2475 blocks retirement): this now proves
+// fixture inputs must match across publisher SHAs, not an exact SHA.
+fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     if !cargo_env::in_clean_cargo_test() {
         return;
     }
