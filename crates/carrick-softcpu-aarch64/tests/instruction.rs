@@ -179,3 +179,14 @@ fn conditional_forms_have_typed_operands() {
         );
     }
 }
+
+#[test]
+fn conditional_reserved_bits_fail_shut() {
+    for word in [0xba820020, 0x9a820820, 0xda420020, 0xfa420430, 0xfa420420] {
+        assert_eq!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}

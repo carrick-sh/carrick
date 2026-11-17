@@ -609,6 +609,8 @@ mod instruction {
         MoveWide(MoveWide),
         Bitfield(Bitfield),
         Address(Address),
+        ConditionalSelect(ConditionalSelect),
+        ConditionalCompare(ConditionalCompare),
     }
 
     /// Arm ARM DDI0487G.a C6.2.92 HINT, C6.2.204 NOP, C6.2.354 YIELD,
@@ -661,6 +663,12 @@ mod instruction {
         }
         if let Some(a) = address(word) {
             return Instruction::Address(a);
+        }
+        if let Some(c) = conditional_select(word) {
+            return Instruction::ConditionalSelect(c);
+        }
+        if let Some(c) = conditional_compare(word) {
+            return Instruction::ConditionalCompare(c);
         }
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
     }
@@ -1178,6 +1186,102 @@ mod instruction {
         })
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SelectOperation {
+        Select,
+        Increment,
+        Invert,
+        Negate,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ConditionalSelect {
+        pub width: crate::Width,
+        pub operation: SelectOperation,
+        pub rd: OperandRegister,
+        pub rn: OperandRegister,
+        pub rm: OperandRegister,
+        pub condition: Condition,
+    }
+    /// DDI0487G.a C6.2.69 CSEL, C6.2.72–74 CSINC/CSINV/CSNEG;
+    /// C4.1.5 Conditional select, C4-336–337.
+    fn conditional_select(w: u32) -> Option<ConditionalSelect> {
+        if w & 0x3fe00800 != 0x1a800000 {
+            return None;
+        }
+        Some(ConditionalSelect {
+            width: if w >> 31 == 0 {
+                crate::Width::W32
+            } else {
+                crate::Width::X64
+            },
+            operation: match ((w >> 29) & 2) | ((w >> 10) & 1) {
+                0 => SelectOperation::Select,
+                1 => SelectOperation::Increment,
+                2 => SelectOperation::Invert,
+                _ => SelectOperation::Negate,
+            },
+            rd: OperandRegister::field(w, false),
+            rn: OperandRegister::field(w >> 5, false),
+            rm: OperandRegister::field(w >> 16, false),
+            condition: Condition::field(w >> 12),
+        })
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CompareImmediate(u8);
+    impl CompareImmediate {
+        pub const fn value(self) -> u8 {
+            self.0
+        }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Nzcv(u8);
+    impl Nzcv {
+        pub const fn bits(self) -> u8 {
+            self.0
+        }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CompareOperand {
+        Register(OperandRegister),
+        Immediate(CompareImmediate),
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ConditionalCompare {
+        pub width: crate::Width,
+        pub operation: AddSubtract,
+        pub rn: OperandRegister,
+        pub operand: CompareOperand,
+        pub condition: Condition,
+        pub otherwise: Nzcv,
+    }
+    /// DDI0487G.a C6.2.46–49 CCMN/CCMP (immediate/register);
+    /// C4.1.5 Conditional compare (register/immediate), C4-335–336.
+    fn conditional_compare(w: u32) -> Option<ConditionalCompare> {
+        if w & 0x3fe00410 != 0x3a400000 {
+            return None;
+        }
+        Some(ConditionalCompare {
+            width: if w >> 31 == 0 {
+                crate::Width::W32
+            } else {
+                crate::Width::X64
+            },
+            operation: if w & (1 << 30) == 0 {
+                AddSubtract::Add
+            } else {
+                AddSubtract::Subtract
+            },
+            rn: OperandRegister::field(w >> 5, false),
+            operand: if w & 0x800 == 0 {
+                CompareOperand::Register(OperandRegister::field(w >> 16, false))
+            } else {
+                CompareOperand::Immediate(CompareImmediate(((w >> 16) & 31) as u8))
+            },
+            condition: Condition::field(w >> 12),
+            otherwise: Nzcv((w & 15) as u8),
+        })
+    }
+
     /// Register index 0..30. Architectural register 31 is represented separately.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Gpr(u8);
@@ -1505,9 +1609,9 @@ mod instruction {
 }
 pub use instruction::{
     AddImmediate, AddSubtract, Address, AddressBase, Arithmetic, ArithmeticOperand, Bitfield,
-    BitfieldOperation, Branch, Condition, Extend, Gpr, Hint, Instruction, Logical,
-    LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress, MemoryIndex, MemoryOffset,
-    MemoryOperation, MemoryRegister, MemorySize, MoveWide, MoveWideOperation, OperandRegister,
-    PairMemory, PcOffset, RegisterBranch, ScalarMemory, ShiftAmount, VectorRegister,
-    decode_instruction,
+    BitfieldOperation, Branch, CompareImmediate, CompareOperand, Condition, ConditionalCompare,
+    ConditionalSelect, Extend, Gpr, Hint, Instruction, Logical, LogicalImmediate, LogicalOperand,
+    LogicalOperation, MemoryAddress, MemoryIndex, MemoryOffset, MemoryOperation, MemoryRegister,
+    MemorySize, MoveWide, MoveWideOperation, Nzcv, OperandRegister, PairMemory, PcOffset,
+    RegisterBranch, ScalarMemory, SelectOperation, ShiftAmount, VectorRegister, decode_instruction,
 };
