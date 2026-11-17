@@ -33,7 +33,7 @@ pub struct InterruptMasks(pub u8);
 impl InterruptMasks {
     pub const ALL: Self = Self(15);
 }
-/// D1.6 PSTATE; D13.2 SPSR_EL1 bit layout. SS is outside this profile.
+/// D1.6 PSTATE; C5.2.17 SPSR_EL1 bit layout. SS is outside this profile.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Pstate {
     pub el: ExceptionLevel,
@@ -75,7 +75,7 @@ impl Pstate {
         })
     }
 }
-/// D13.2 SCTLR_EL1.SPAN (23), EPAN (57), UMA (9).
+/// D13.2.116 SCTLR_EL1.SPAN (23), EPAN (57), UMA (9).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Sctlr(pub u64);
 impl Sctlr {
@@ -213,7 +213,11 @@ impl CpuState {
                     StackSelect::El1
                 }
             }
-            Slot::CurrentEl => unreachable!("access rejects read-only register"),
+            Slot::CurrentEl => {
+                return Err(SystemAccessException {
+                    syndrome: Syndrome(0x0200_0000),
+                });
+            }
         }
         Ok(())
     }

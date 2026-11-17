@@ -306,3 +306,22 @@ fn hvc_at_el0_is_undefined_and_cannot_exit_provider() {
     assert_eq!(cpu.el1.esr, Syndrome(0x0200_0000));
     assert_eq!(cpu.el1.elr, ProgramCounter(0x1000));
 }
+
+#[test]
+fn irq_preserves_syndrome_and_access_trap_enters_restart_vector() {
+    use carrick_softcpu_aarch64::OperandRegister;
+    let mut cpu = CpuState::default();
+    cpu.pc = ProgramCounter(0x1000);
+    cpu.el1.esr = Syndrome(0x1234);
+    cpu.el1.far = VirtualAddress(0x5678);
+    let error = cpu
+        .mrs(sys((3, 3, 4, 2, 1)), OperandRegister::Zr)
+        .unwrap_err();
+    take_exception(&mut cpu, Exception::Irq);
+    assert_eq!(cpu.el1.esr, Syndrome(0x1234));
+    assert_eq!(cpu.el1.far, VirtualAddress(0x5678));
+    eret(&mut cpu).unwrap();
+    take_exception(&mut cpu, Exception::SystemAccess(error));
+    assert_eq!(cpu.el1.esr, Syndrome(0x6232_d3e5));
+    assert_eq!(cpu.el1.elr, ProgramCounter(0x1000));
+}
