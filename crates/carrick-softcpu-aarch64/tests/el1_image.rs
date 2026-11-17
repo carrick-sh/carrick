@@ -7,24 +7,36 @@ use std::collections::BTreeMap;
 
 fn u16_at(bytes: &[u8], offset: usize) -> usize {
     usize::from(u16::from_le_bytes(
-        bytes[offset..offset + 2].try_into().unwrap(),
+        bytes[offset..offset + 2]
+            .try_into()
+            .expect("ELF field has the expected width"),
     ))
 }
 fn u32_at(bytes: &[u8], offset: usize) -> usize {
     usize::try_from(u32::from_le_bytes(
-        bytes[offset..offset + 4].try_into().unwrap(),
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("ELF field has the expected width"),
     ))
-    .unwrap()
+    .expect("valid production ELF fixture")
 }
 fn u64_at(bytes: &[u8], offset: usize) -> usize {
     usize::try_from(u64::from_le_bytes(
-        bytes[offset..offset + 8].try_into().unwrap(),
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("ELF field has the expected width"),
     ))
-    .unwrap()
+    .expect("valid production ELF fixture")
 }
 fn string_at(bytes: &[u8], offset: usize) -> &str {
     let tail = &bytes[offset..];
-    std::str::from_utf8(&tail[..tail.iter().position(|&b| b == 0).unwrap()]).unwrap()
+    std::str::from_utf8(
+        &tail[..tail
+            .iter()
+            .position(|&b| b == 0)
+            .expect("valid production ELF fixture")],
+    )
+    .expect("valid production ELF fixture")
 }
 
 #[test]
@@ -33,7 +45,7 @@ fn linked_el1_executable_mapping_spans_have_no_unknown_words() {
     // ELF64 fields per the System V ABI; the AArch64 ELF ABI defines the
     // authoritative $x/$d mapping symbols. Malformed inputs fail the witness.
     let path = std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF");
-    let bytes = std::fs::read(path).unwrap();
+    let bytes = std::fs::read(path).expect("valid production ELF fixture");
     assert_eq!(&bytes[..6], b"\x7fELF\x02\x01");
     assert_eq!(u16_at(&bytes, 18), 183, "not AArch64");
     let table = u64_at(&bytes, 40);
@@ -71,7 +83,9 @@ fn linked_el1_executable_mapping_spans_have_no_unknown_words() {
         }
         assert_eq!(u32_at(section, 4), 1, "executable section lacks file bytes");
         let start = u64_at(section, 16);
-        let end = start.checked_add(u64_at(section, 32)).unwrap();
+        let end = start
+            .checked_add(u64_at(section, 32))
+            .expect("valid production ELF fixture");
         let mut boundaries = BTreeMap::new();
         for &(_, address, code) in symbols.iter().filter(|s| s.0 == index) {
             assert!((start..end).contains(&address));
@@ -92,9 +106,12 @@ fn linked_el1_executable_mapping_spans_have_no_unknown_words() {
             let (lo, hi) = (pair[0].0, pair[1].0);
             assert_eq!(lo % 4, 0);
             assert_eq!((hi - lo) % 4, 0);
-            let offset = u64_at(section, 24).checked_add(lo - start).unwrap();
+            let offset = u64_at(section, 24)
+                .checked_add(lo - start)
+                .expect("valid production ELF fixture");
             for (i, word) in bytes[offset..offset + hi - lo].chunks_exact(4).enumerate() {
-                let word = u32::from_le_bytes(word.try_into().unwrap());
+                let word =
+                    u32::from_le_bytes(word.try_into().expect("ELF field has the expected width"));
                 words += 1;
                 if classify(word) == A64Class::Unknown {
                     unknown.push((lo + 4 * i, word));
