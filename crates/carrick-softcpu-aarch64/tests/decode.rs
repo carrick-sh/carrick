@@ -166,7 +166,7 @@ fn operands_preserve_width_registers_and_operation() {
 
 #[test]
 fn sys_operands_and_reserved_namespace() {
-    use carrick_softcpu_aarch64::{Decoded, Shareability, TlbOperation, Translation, decode};
+    use carrick_softcpu_aarch64::{Decoded, Translation, decode};
     let forms = [
         (0, 8, 0, Translation::S1E1R),
         (0, 8, 1, Translation::S1E1W),
@@ -203,28 +203,44 @@ fn sys_operands_and_reserved_namespace() {
             }
         }
     }
-    for (crm, scope) in [
-        (3, Shareability::InnerShareable),
-        (7, Shareability::NonShareable),
+    use carrick_softcpu_aarch64::{
+        Instruction, OperandRegister, TlbiOperation, decode_instruction,
+    };
+    for (crm, operations) in [
+        (
+            3,
+            [
+                TlbiOperation::Vae1is,
+                TlbiOperation::Aside1is,
+                TlbiOperation::Vaae1is,
+                TlbiOperation::Vale1is,
+                TlbiOperation::Vaale1is,
+            ],
+        ),
+        (
+            7,
+            [
+                TlbiOperation::Vae1,
+                TlbiOperation::Aside1,
+                TlbiOperation::Vaae1,
+                TlbiOperation::Vale1,
+                TlbiOperation::Vaale1,
+            ],
+        ),
     ] {
-        for (op2, op) in [
-            (1, TlbOperation::Vae1),
-            (2, TlbOperation::Aside1),
-            (3, TlbOperation::Vaae1),
-            (5, TlbOperation::Vale1),
-            (7, TlbOperation::Vaale1),
-        ] {
+        for (op2, op) in [1, 2, 3, 5, 7].into_iter().zip(operations) {
             for rt in 0..32 {
                 let word = 0xd5088000 | (crm << 8) | (op2 << 5) | rt;
-                let Some(Decoded::TlbInvalidate {
-                    op: got,
-                    scope: got_scope,
-                    xt,
-                }) = decode(word)
-                else {
+                let Instruction::SystemOperation(got) = decode_instruction(word) else {
                     panic!("{word:08x}")
                 };
-                assert_eq!((got, got_scope, u32::from(xt.number())), (op, scope, rt));
+                assert_eq!(got.operation, op);
+                assert_eq!(got.crm, crm as u8);
+                match got.rt {
+                    OperandRegister::Zr => assert_eq!(rt, 31),
+                    OperandRegister::Gpr(r) => assert_eq!(u32::from(r.number()), rt),
+                    OperandRegister::Sp => panic!("TLBI Rt cannot be SP"),
+                }
             }
         }
     }

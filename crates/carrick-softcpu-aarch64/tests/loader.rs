@@ -241,7 +241,11 @@ fn sys_space_tlbi_fields_and_names() {
         (6, 6, "- rvae3 - - - rvale3 - -"),
     ];
     for w in (0xd5008000..=0xd507ffff).chain(0xd5288000..=0xd52fffff) {
-        assert_eq!(decode_instruction(w), Instruction::Unallocated, "{w:08x}");
+        // Only CRn=8 is the TLBI neighbourhood; the surrounding space
+        // contains allocated hints, barriers, PSTATE and system registers.
+        if (w >> 12) & 15 == 8 {
+            assert_eq!(decode_instruction(w), Instruction::Unallocated, "{w:08x}");
+        }
     }
     let words: Vec<_> = (0xd5088000..=0xd50fffff).collect();
     let llvm =
