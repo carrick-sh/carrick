@@ -107,3 +107,14 @@ fn acquire_release_and_exclusive_forms_are_typed() {
         );
     }
 }
+
+#[test]
+fn atomic_transfer_reserved_fields_fail_shut() {
+    for word in [0xc85f0020, 0xc8407c20, 0xc89f7c20, 0xc8bffc20, 0x087f0020] {
+        assert_eq!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}

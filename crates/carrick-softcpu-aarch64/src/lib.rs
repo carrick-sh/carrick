@@ -611,6 +611,7 @@ mod instruction {
         Address(Address),
         Multiply(Multiply),
         Divide(Divide),
+        AtomicTransfer(AtomicTransfer),
         ConditionalSelect(ConditionalSelect),
         ConditionalCompare(ConditionalCompare),
     }
@@ -677,6 +678,9 @@ mod instruction {
         }
         if let Some(d) = divide(word) {
             return Instruction::Divide(d);
+        }
+        if let Some(a) = atomic_transfer(word) {
+            return Instruction::AtomicTransfer(a);
         }
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
     }
@@ -1375,6 +1379,80 @@ mod instruction {
         })
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AtomicTransferKind {
+        LoadAcquire,
+        StoreRelease,
+        LoadExclusive {
+            acquire: bool,
+        },
+        StoreExclusive {
+            release: bool,
+            status: OperandRegister,
+        },
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AtomicTransfer {
+        pub kind: AtomicTransferKind,
+        pub size: MemorySize,
+        pub first: OperandRegister,
+        pub second: Option<OperandRegister>,
+        pub base: OperandRegister,
+    }
+    /// DDI0487G.a C6.2.111–117 LDAR/B/H, LDAXP/LDAXR/B/H;
+    /// C6.2.174–177 LDXP/LDXR/B/H; C6.2.266–268 STLR/B/H;
+    /// C6.2.272–275 STLXP/STLXR/B/H; C6.2.305–308 STXP/STXR/B/H.
+    /// C4.1.4 Load/store exclusive, C4-306–308.
+    /// LSE CAS/CASP and limited-ordering extensions remain unsupported.
+    fn atomic_transfer(w: u32) -> Option<AtomicTransfer> {
+        if w & 0x3f000000 != 0x08000000 {
+            return None;
+        }
+        let size = w >> 30;
+        let ordinary = w & (1 << 23) != 0;
+        let load = w & (1 << 22) != 0;
+        let pair = w & (1 << 21) != 0;
+        let ordered = w & (1 << 15) != 0;
+        let rs = (w >> 16) & 31;
+        let rt2 = (w >> 10) & 31;
+        if (!pair && rt2 != 31) || (load && rs != 31) {
+            return None;
+        }
+        let kind = if ordinary {
+            if pair || !ordered || rs != 31 {
+                return None;
+            }
+            if load {
+                AtomicTransferKind::LoadAcquire
+            } else {
+                AtomicTransferKind::StoreRelease
+            }
+        } else {
+            if pair && size < 2 {
+                return None;
+            }
+            if load {
+                AtomicTransferKind::LoadExclusive { acquire: ordered }
+            } else {
+                AtomicTransferKind::StoreExclusive {
+                    release: ordered,
+                    status: OperandRegister::field(rs, false),
+                }
+            }
+        };
+        Some(AtomicTransfer {
+            kind,
+            size: MemorySize::scale(size)?,
+            first: OperandRegister::field(w, false),
+            second: if pair {
+                Some(OperandRegister::field(rt2, false))
+            } else {
+                None
+            },
+            base: OperandRegister::field(w >> 5, true),
+        })
+    }
+
     /// Register index 0..30. Architectural register 31 is represented separately.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Gpr(u8);
@@ -1701,11 +1779,11 @@ mod instruction {
     }
 }
 pub use instruction::{
-    AddImmediate, AddSubtract, Address, AddressBase, Arithmetic, ArithmeticOperand, Bitfield,
-    BitfieldOperation, Branch, CompareImmediate, CompareOperand, Condition, ConditionalCompare,
-    ConditionalSelect, Divide, Extend, Gpr, Hint, Instruction, Logical, LogicalImmediate,
-    LogicalOperand, LogicalOperation, MemoryAddress, MemoryIndex, MemoryOffset, MemoryOperation,
-    MemoryRegister, MemorySize, MoveWide, MoveWideOperation, Multiply, MultiplyKind, Nzcv,
-    OperandRegister, PairMemory, PcOffset, RegisterBranch, ScalarMemory, SelectOperation,
-    ShiftAmount, VectorRegister, decode_instruction,
+    AddImmediate, AddSubtract, Address, AddressBase, Arithmetic, ArithmeticOperand, AtomicTransfer,
+    AtomicTransferKind, Bitfield, BitfieldOperation, Branch, CompareImmediate, CompareOperand,
+    Condition, ConditionalCompare, ConditionalSelect, Divide, Extend, Gpr, Hint, Instruction,
+    Logical, LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress, MemoryIndex,
+    MemoryOffset, MemoryOperation, MemoryRegister, MemorySize, MoveWide, MoveWideOperation,
+    Multiply, MultiplyKind, Nzcv, OperandRegister, PairMemory, PcOffset, RegisterBranch,
+    ScalarMemory, SelectOperation, ShiftAmount, VectorRegister, decode_instruction,
 };

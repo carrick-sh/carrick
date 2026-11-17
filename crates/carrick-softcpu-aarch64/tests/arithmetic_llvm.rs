@@ -1342,3 +1342,94 @@ fn generated_multiply_divide_matches_llvm_operands() {
         words.len()
     );
 }
+
+#[test]
+#[ignore = "requires Rust-sysroot CARRICK_LLVM_OBJDUMP"]
+fn generated_atomic_transfers_match_llvm_operands() {
+    let mut words = BTreeSet::new();
+    for size in 0..4u32 {
+        for ordinary in 0..2 {
+            for load in 0..2 {
+                for pair in 0..2 {
+                    for ordered in 0..2 {
+                        for rs in [0, 17, 31] {
+                            for rt2 in [0, 18, 31] {
+                                for rn in [0, 19, 31] {
+                                    for rt in 0..32 {
+                                        words.insert(
+                                            size << 30
+                                                | 0x08000000
+                                                | ordinary << 23
+                                                | load << 22
+                                                | pair << 21
+                                                | rs << 16
+                                                | ordered << 15
+                                                | rt2 << 10
+                                                | rn << 5
+                                                | rt,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let words: Vec<_> = words.into_iter().collect();
+    assert!(words.len() >= 50_000);
+    let mut accepted = 0;
+    for (&w, actual) in words.iter().zip(oracle_lines(&words, "atomic-transfer")) {
+        if let Instruction::AtomicTransfer(a) = decode_instruction(w) {
+            let pair = a.second.is_some();
+            let (name, status) = match a.kind {
+                AtomicTransferKind::LoadAcquire => ("ldar", None),
+                AtomicTransferKind::StoreRelease => ("stlr", None),
+                AtomicTransferKind::LoadExclusive { acquire } => (
+                    match (pair, acquire) {
+                        (false, false) => "ldxr",
+                        (false, true) => "ldaxr",
+                        (true, false) => "ldxp",
+                        (true, true) => "ldaxp",
+                    },
+                    None,
+                ),
+                AtomicTransferKind::StoreExclusive { release, status } => (
+                    match (pair, release) {
+                        (false, false) => "stxr",
+                        (false, true) => "stlxr",
+                        (true, false) => "stxp",
+                        (true, true) => "stlxp",
+                    },
+                    Some(status),
+                ),
+            };
+            let suffix = match a.size {
+                MemorySize::Byte => "b",
+                MemorySize::Half => "h",
+                _ => "",
+            };
+            let width = if a.size == MemorySize::Double {
+                Width::X64
+            } else {
+                Width::W32
+            };
+            let mut expected = format!("{name}{suffix} ");
+            if let Some(status) = status {
+                expected.push_str(&format!("{}, ", reg(status, Width::W32)));
+            }
+            expected.push_str(&reg(a.first, width));
+            if let Some(second) = a.second {
+                expected.push_str(&format!(", {}", reg(second, width)));
+            }
+            expected.push_str(&format!(", [{}]", reg(a.base, Width::X64)));
+            assert_eq!(expected, actual, "{w:08x}");
+            accepted += 1;
+        }
+    }
+    println!(
+        "{} distinct atomic transfer words; {accepted} accepted; 0 wrong class / operand mismatches",
+        words.len()
+    );
+}
