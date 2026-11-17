@@ -4368,6 +4368,50 @@ fn serial_host_fork_child_record_lock_outlives_its_thread_and_ends_with_dup2_and
     );
 }
 
+/// #2452 review P0-4: exec(2) and advisory locks (`native_record_lock.S
+/// -DEXEC`). A fork child takes a record lock through one descriptor of the
+/// file, a flock and an OFD lock through two others, opens a fourth with
+/// O_CLOEXEC and execs this fixture again. Exec's close-on-exec sweep closes
+/// a descriptor of the file, so the process's record lock ends (fcntl(2));
+/// the flock and the OFD lock belong to descriptions the successor keeps,
+/// and end only with its exit. Compared with the native oracle. Red with
+/// exec's record-lock release removed: E8 reported the lock still held.
+#[test]
+fn serial_host_exec_close_on_exec_ends_record_locks_and_keeps_flock_and_ofd_locks() {
+    bounded_witness(
+        "serial_host_exec_close_on_exec_ends_record_locks_and_keeps_flock_and_ofd_locks",
+        || {
+            let dir = tempfile::tempdir_in("/tmp").expect("exec lock fixture directory");
+            let run = |name: &str, native: bool| -> FileMetadataReport {
+                let successor = dir.path().join(format!("{name}-exec"));
+                let lock = format!(
+                    "-DLOCK_PATH=\"{}\"",
+                    dir.path().join(format!("{name}-lock")).display()
+                );
+                let path = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+                let elf = native_exit_fixture_with_flags(
+                    "native_record_lock.S",
+                    &["-DEXEC", &lock, &path],
+                );
+                carrick_test_support::executable::write_executable_mode(&successor, &elf, 0o700);
+                if native {
+                    native_file_report(dir.path(), name, &elf)
+                } else {
+                    production_file_report(&elf)
+                }
+            };
+            let (native, carrick) = (run("native", true), run("carrick", false));
+            assert_eq!(native.0, 0, "native oracle: {native:?}");
+            assert_eq!(native.1.len(), 2 + 6 + 2 + 12, "native oracle: {native:?}");
+            assert_eq!(
+                (carrick.0, &carrick.1, &carrick.2),
+                (native.0, &native.1, &Vec::new()),
+                "(exit, child then parent step bytes, refused counters)"
+            );
+        },
+    );
+}
+
 /// #231: lock waiters hold no execution capacity. Six fork children park in
 /// F_SETLKW on the parent's write lock, more than the pool has vCPUs; the
 /// parent still runs and unlocks, and each waiter in turn takes the lock and
