@@ -354,7 +354,9 @@ fn signed_gate_reuses_sealed_base_on_mac_with_token_isolated_from_execute() {
         .expect("publish job must download base fixture bundle for reusable main baseline");
     assert_eq!(
         download_bundle["if"].as_str(),
-        Some("needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'")
+        Some(
+            "(needs.authorize.outputs.main == 'true' || github.event_name == 'merge_group') && steps.verdict.outcome == 'success'"
+        )
     );
     let prep = publish_steps
         .iter()
@@ -366,7 +368,9 @@ fn signed_gate_reuses_sealed_base_on_mac_with_token_isolated_from_execute() {
         .expect("publish job must prepare reusable base for admitted Main runs");
     assert_eq!(
         prep["if"].as_str(),
-        Some("needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'")
+        Some(
+            "(needs.authorize.outputs.main == 'true' || github.event_name == 'merge_group') && steps.verdict.outcome == 'success'"
+        )
     );
     let upload = publish_steps
         .iter()
@@ -375,7 +379,25 @@ fn signed_gate_reuses_sealed_base_on_mac_with_token_isolated_from_execute() {
     assert_eq!(
         upload["if"].as_str(),
         Some(
-            "needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success' && steps.reuse_base.outputs.artifact_name != ''"
+            "(needs.authorize.outputs.main == 'true' || github.event_name == 'merge_group') && steps.verdict.outcome == 'success' && steps.reuse_base.outputs.artifact_name != ''"
         )
+    );
+    // #2451: a passing merge group seals its candidate as the next base, so
+    // it must also preserve the exact fixture archive the candidate executed.
+    let preserve = publish_steps
+        .iter()
+        .find(|s| {
+            s["name"].as_str() == Some("Preserve the admitted candidate's executed fixture archive")
+        })
+        .expect("a merge group must preserve its candidate's executed fixture archive");
+    assert_eq!(
+        preserve["if"].as_str(),
+        Some(
+            "github.event_name == 'merge_group' && steps.verdict.outcome == 'success' && steps.reuse_base.outputs.artifact_name != ''"
+        )
+    );
+    assert_eq!(
+        preserve["with"]["name"].as_str(),
+        Some("signed-fixtures-${{ needs.authorize.outputs.sha }}")
     );
 }
