@@ -137,3 +137,172 @@ fn el0_privileged_register_is_undefined_not_a_system_trap() {
         .unwrap_err();
     assert_eq!(error.syndrome, Syndrome(0x0200_0000));
 }
+
+#[test]
+fn system_register_roundtrips_and_access_syndromes() {
+    use carrick_softcpu_aarch64::{Instruction, OperandRegister, decode_instruction};
+    let mut cpu = CpuState::default();
+    cpu.pstate.el = ExceptionLevel::El1;
+    cpu.pstate.sp = StackSelect::El1;
+    // D13/C5 register encodings, independent of the name lookup implementation.
+    for fields in [
+        (3, 0, 2, 0, 0),
+        (3, 0, 2, 0, 1),
+        (3, 0, 13, 0, 1),
+        (3, 3, 13, 0, 2),
+        (3, 3, 13, 0, 3),
+        (3, 3, 4, 4, 0),
+        (3, 3, 4, 4, 1),
+        (3, 0, 7, 4, 0),
+        (3, 3, 14, 3, 1),
+        (3, 3, 14, 3, 2),
+        (3, 0, 4, 0, 1),
+        (3, 0, 4, 0, 0),
+        (3, 0, 5, 2, 0),
+        (3, 0, 6, 0, 0),
+        (3, 0, 13, 0, 4),
+        (3, 0, 2, 0, 2),
+        (3, 0, 10, 2, 0),
+    ] {
+        cpu.msr(sys(fields), OperandRegister::Zr, SystemValue(0x1234))
+            .unwrap();
+        assert_eq!(
+            cpu.mrs(sys(fields), OperandRegister::Zr).unwrap(),
+            SystemValue(0x1234)
+        );
+    }
+    for n in 0..31 {
+        // MRS Xt, TPIDR_EL0 obtains an existing typed GPR operand.
+        let Instruction::SystemAccess(a) = decode_instruction(0xd53bd040 | n) else {
+            panic!("MRS")
+        };
+        cpu.write_operand(a.rt, RegisterValue(0x100 + u64::from(n)));
+        assert_eq!(cpu.read_operand(a.rt), RegisterValue(0x100 + u64::from(n)));
+    }
+    cpu.write_operand(OperandRegister::Zr, RegisterValue(9));
+    assert_eq!(cpu.read_operand(OperandRegister::Zr), RegisterValue(0));
+    cpu.pstate.el = ExceptionLevel::El0;
+    let trap = cpu
+        .mrs(sys((3, 3, 4, 2, 1)), OperandRegister::Zr)
+        .unwrap_err();
+    assert_eq!(trap.syndrome, Syndrome(0x6232_d3e5)); // EC/IL, op0/op2/op1/CRn/Rt/CRm/read
+    assert!(
+        cpu.mrs(sys((3, 0, 15, 15, 7)), OperandRegister::Zr)
+            .is_err()
+    );
+    assert!(
+        cpu.msr(sys((3, 3, 13, 0, 3)), OperandRegister::Zr, SystemValue(0))
+            .is_err()
+    );
+    assert!(eret(&mut cpu).is_err());
+}
+
+#[test]
+fn pan_span_and_saved_status_known_answers() {
+    for span in [false, true] {
+        for pan in [false, true] {
+            let mut cpu = CpuState::default();
+            cpu.pstate = Pstate {
+                el: ExceptionLevel::El1,
+                sp: StackSelect::El0,
+                nzcv: 10,
+                daif: InterruptMasks(5),
+                pan,
+                uao: true,
+                il: true,
+            };
+            cpu.el1.sctlr = Sctlr((u64::from(span) << 23) | (1 << 57));
+            assert!(cpu.el1.sctlr.epan());
+            take_exception(&mut cpu, Exception::Brk(0x1234));
+            assert_eq!(
+                cpu.el1.spsr,
+                SavedPstate(0xa090_0144 | (u64::from(pan) << 22))
+            );
+            assert_eq!(cpu.el1.esr, Syndrome(0xf200_1234));
+            assert_eq!(cpu.pstate.pan, !span || pan);
+            assert!(!cpu.pstate.il);
+        }
+    }
+    for mode in 0..32 {
+        let mut cpu = CpuState::default();
+        cpu.pstate.el = ExceptionLevel::El1;
+        cpu.el1.spsr = SavedPstate(mode);
+        eret(&mut cpu).unwrap();
+        assert_eq!(cpu.pstate.il, ![0, 4, 5].contains(&mode));
+    }
+}
+
+/// Optional real-vector smoke: generate raw spans through carrick_mem::memory
+/// (the CLI census's production builders), never a committed word inventory.
+#[test]
+fn generated_vectors_drive_state_transitions() {
+    use carrick_softcpu_aarch64::{
+        ExceptionKind, Instruction, SystemDirection, decode_instruction,
+    };
+    let Some(path) = std::env::var_os("CARRICK_A64_LOADER_SPANS") else {
+        return;
+    };
+    let bytes = std::fs::read(path).unwrap();
+    assert!(!bytes.is_empty());
+    assert_eq!(bytes.len() % 4, 0);
+    let mut seen = [0; 5];
+    for word in bytes.chunks_exact(4) {
+        let decoded = decode_instruction(u32::from_le_bytes(word.try_into().unwrap()));
+        let mut cpu = CpuState::default();
+        cpu.pstate.el = ExceptionLevel::El1;
+        cpu.pstate.sp = StackSelect::El1;
+        cpu.el1.vbar = VirtualAddress(0x8000);
+        match decoded {
+            Instruction::Eret => {
+                cpu.el1.elr = ProgramCounter(0x1000);
+                eret(&mut cpu).unwrap();
+                assert_eq!(cpu.pc, ProgramCounter(0x1000));
+                seen[0] += 1;
+            }
+            Instruction::ExceptionGeneration(e) if e.kind == ExceptionKind::Hvc => {
+                let saved = cpu.el1.clone();
+                assert!(matches!(
+                    take_exception(&mut cpu, Exception::Hvc(e.immediate)),
+                    ExceptionOutcome::ProviderExit(_)
+                ));
+                assert_eq!(cpu.el1, saved);
+                seen[1] += 1;
+            }
+            Instruction::ExceptionGeneration(e) if e.kind == ExceptionKind::Svc => {
+                cpu.pstate.el = ExceptionLevel::El0;
+                take_exception(&mut cpu, Exception::Svc(e.immediate));
+                assert_eq!(cpu.pc, ProgramCounter(0x8400));
+                seen[2] += 1;
+            }
+            Instruction::SystemAccess(a) => match a.direction {
+                SystemDirection::Read => {
+                    cpu.mrs(a.encoding, a.rt).unwrap();
+                    seen[3] += 1;
+                }
+                SystemDirection::Write => {
+                    cpu.msr(a.encoding, a.rt, SystemValue(0)).unwrap();
+                    seen[4] += 1;
+                }
+            },
+            _ => (),
+        }
+    }
+    assert!(
+        seen[0] > 0 && seen[1] > 0 && seen[3] > 0 && seen[4] > 0,
+        "{seen:?}"
+    );
+    // Loader vectors do not necessarily contain SVC, which originates in EL0.
+    // SVC itself is exercised by the default known-answer vector matrix.
+}
+
+#[test]
+fn hvc_at_el0_is_undefined_and_cannot_exit_provider() {
+    let mut cpu = CpuState::default();
+    cpu.pc = ProgramCounter(0x1000);
+    assert_eq!(
+        take_exception(&mut cpu, Exception::Hvc(1)),
+        ExceptionOutcome::Entered
+    );
+    assert_eq!(cpu.el1.esr, Syndrome(0x0200_0000));
+    assert_eq!(cpu.el1.elr, ProgramCounter(0x1000));
+}
