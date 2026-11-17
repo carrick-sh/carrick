@@ -25,7 +25,26 @@ semantic_authority = ["man 2 getrandom", "docs/host-facility-boundary.md"]
 fixture = "unit:arm_native_fork_child_getrandom_default_returns_eight_bytes"
 scale_points = [1]
 structural_budgets = []
-rationale = "A fork child and parent remain live through bounded entropy staging, the existing host getrandom handler, exact ticket acknowledgment, copyout and native resume. Staging is bounded to 4096 bytes. Busy and OwnerWait retain bytes and the committed cursor rather than regenerating or replaying output. Physical signed ARM and x86 transport have separate bindings."
+rationale = """
+A fork child and parent remain live through bounded entropy staging, the existing host getrandom handler, exact ticket acknowledgment, copyout and native resume. Staging is bounded to 4096 bytes. Busy and OwnerWait retain bytes and the committed cursor rather than regenerating or replaying output. Physical signed ARM and x86 transport have separate bindings.
+
+#671 R1c neutral CPL0 boot extraction: the helper boundary preserves the
+existing descriptor writes and ordering. Existing Linux/KVM bindings run:
+serial_host_native_child_getrandom_default_returns_eight_bytes,
+serial_host_native_child_getrandom_nonblock_returns_eight_bytes,
+serial_host_native_root_getrandom_returns_eight_bytes,
+serial_host_native_root_getrandom_lazy_output_returns_eight_bytes,
+serial_host_native_child_getrandom_readonly_returns_efault,
+serial_host_native_child_getrandom_cow_preserves_parent,
+serial_host_native_child_getrandom_lazy_output_returns_eight_bytes,
+serial_host_native_child_getrandom_boundary_returns_accessible_prefix,
+cpl0_boot::anonymous_owner::custody_tests::native_backing_editor_exclusion_busy_once_then_success
+(9 passed, 0 failed). Full test-kvm: 490 passed, 1 failed, 19 ignored;
+the native Linux oracle exit-status assertion failed in
+native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked.
+No retry, signed acceptance, or runtime-ratio claim; semantics and budgets
+remain unchanged.
+"""
 
 [bindings]
 vm_free = [

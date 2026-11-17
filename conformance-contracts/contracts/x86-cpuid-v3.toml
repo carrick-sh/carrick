@@ -32,6 +32,15 @@ PCLMULQDQ and TSC_DEADLINE), including `AVX-512`, `AMX`, `SHA`, `RDRAND`, `RDSEE
 `RDTSCP`, `PDPE1GB`, and AMD SEV leaves. Red-first witnesses prove raw host
 `KVM_GET_SUPPORTED_CPUID` pass-through fails the strict v3 isolation audit and
 verify host qualification refusal and scrubbing before live KVM ring-3 execution.
+
+#671 R1c neutral CPL0 boot extraction: the helper boundary preserves the
+existing descriptor writes and ordering. Existing Linux/KVM bindings run:
+kvm::x86_tests::x86_vcpu_exposes_pinned_x86_64_v3_profile
+(1 passed, 0 failed). Full test-kvm: 490 passed, 1 failed, 19 ignored;
+the native Linux oracle exit-status assertion failed in
+native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked.
+No retry, signed acceptance, or runtime-ratio claim; semantics and budgets
+remain unchanged.
 """
 
 [bindings]

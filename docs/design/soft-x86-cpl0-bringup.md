@@ -93,14 +93,27 @@ custody/service changes are outside this slice. #2414 has landing priority;
 this PR stays draft, never enters the queue ahead of it, and must rebase after
 it merges. Repeat the comparison before push.
 
-The move exemption in docs/conformance-contracts.md applies to the two exact
-cpl0_boot.rs paths in this slice: same constants, loops, ordering, writes and
-errors; only a borrowed RAM/boot-register helper boundary is introduced.
-Affected existing families include kernel.el1.thread-lifecycle,
-kernel.x86.file-region and x86.carrier.cli-run. Intel SDM vol. 3 is the descriptor
-layout authority; existing KVM boot witnesses remain the behavior authority.
-There is no deliberately failing semantic witness for a behavior-neutral move.
-No test is renamed or removed. Check moved-block equality, one implementation,
-contract-change classification, and source/range authority-debt ratchets; record
-an authority-moves entry only if a nonzero cohort actually moves. Never raise a
-ceiling. Runtime evidence and any failed checks are reported separately on the PR.
+R1c classifies this extraction as a helper/signature boundary change, not
+an automatic whole-function move exemption. The isolated extraction commit
+names all eight affected families and the existing witnesses run:
+`kernel.el1.ipc-two-process`, `kernel.el1.thread-lifecycle`,
+`kernel.x86.file-region`, `x86.cpuid.v3`, `x86.mm.initial-image`,
+`x86.vmx.segment-entry`, `kernel.native.entropy`, and
+`kernel.native.host-file-venue`. Their descriptor rationale records the
+selected bound witnesses without weakening semantics, bindings or budgets.
+Intel SDM vol. 3 remains the descriptor layout authority. No deliberately
+failing semantic witness is invented for unchanged descriptor writes.
+
+Status on GitHub main 7cfd79f0a: extracted statements compare equal modulo
+whitespace; KVM lib 47 passed (same as the supplied baseline), neutral host
+lib 104 passed, shared x86 lib 84 passed, soft CPU/MMU 271 passed and 2 ignored.
+Full `just test-kvm` failed: 490 passed, 1 failed, 19 ignored. The failure is
+`native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked` at
+`cpl0_initial_mm.rs:658`, the native Linux oracle exit-status assertion;
+no retry or pre-existing-failure claim is made. The selected witnesses for
+all eight families passed, but this is not a green KVM-lane receipt.
+`just check-linux`, KVM compile and `just build-cpl0` passed. Full `just ci`
+is not rerun in R1c because prerequisites are not all green. Remaining check
+results and the final contract gate are recorded on the PR. Signed HVF and
+merge-queue acceptance remain director-owned. #2414 is still open and has
+landing priority; #2468 stays draft and needs another rebase after it lands.
