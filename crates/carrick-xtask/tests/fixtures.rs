@@ -3640,7 +3640,7 @@ fn restore_refuses_a_shared_lease() {
 }
 
 #[test]
-fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
+fn signed_gate_artifact_requires_matching_inputs_across_publisher_shas() {
     if !cargo_env::in_clean_cargo_test() {
         return;
     }
@@ -3660,20 +3660,18 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     .unwrap();
     fixtures::verify_installed(f.repo.path()).unwrap();
 
-    // Equal input identity does not authorize an archive from another SHA
-    // in this Actions lane, although general fixture reuse permits it.
+    // Equal input identity admits an archive built at an ancestor SHA.
     f.manifest.source_head = "a".repeat(40).try_into().unwrap();
     f.republish();
     let wrong_sha = fixtures::archive::pack(&f.path, output.path()).unwrap();
-    let error = carrick_xtask::signed_gate::verify_fixture_artifact(
+    carrick_xtask::signed_gate::verify_fixture_artifact(
         f.repo.path(),
         &wrong_sha,
         None,
         &sha,
         &sha,
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("source SHA differs"), "{error}");
+    .unwrap();
 
     f.manifest.source_head = sha.clone().try_into().unwrap();
     *f.manifest.sources.values_mut().next().unwrap() = hash(b"different inputs");
@@ -3706,16 +3704,15 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
         &sha,
     )
     .unwrap();
-    // The bundle still has to come from the merge base's exact SHA...
-    let error = carrick_xtask::signed_gate::verify_fixture_artifact(
+    // The next group uses the same archive after this candidate lands.
+    carrick_xtask::signed_gate::verify_fixture_artifact(
         f.repo.path(),
         &artifact,
         None,
         &candidate,
         &candidate,
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("source SHA differs"), "{error}");
+    .unwrap();
     // ...and a candidate whose inputs differ is refused, never given another bundle.
     let error = carrick_xtask::signed_gate::verify_fixture_artifact(
         f.repo.path(),
@@ -3726,6 +3723,84 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("input identity"), "{error}");
+}
+
+#[test]
+fn next_base_downloads_candidates_original_archive_by_input_identity() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let f = Fixture::new();
+    let transport = CanonicalTempDir::new();
+    let artifact = fixtures::archive::pack(&f.path, transport.path()).unwrap();
+    git(
+        f.repo.path(),
+        &["commit", "--allow-empty", "-m", "landed candidate"],
+    );
+    git(f.repo.path(), &["remote", "add", "origin", "."]);
+    let landed = git(f.repo.path(), &["rev-parse", "HEAD"]);
+    let run = serde_json::json!({"id": 501, "path": ".github/workflows/signed-gate.yml",
+        "event": "merge_group", "head_branch": "gh-readonly-queue/main/pr-42-test",
+        "head_sha": landed, "conclusion": "success", "repository": {"full_name": "carrick-sh/carrick"},
+        "head_repository": {"full_name": "carrick-sh/carrick"}});
+    fs::write(
+        transport.path().join("run.json"),
+        serde_json::to_vec(&run).unwrap(),
+    )
+    .unwrap();
+    let bin = transport.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    write_exec(&bin, "gh", br#"#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys
+args = sys.argv[1:]
+run = json.loads(pathlib.Path(os.environ['TEST_RUN']).read_text())
+if args[:2] == ['run', 'download']:
+    dest = pathlib.Path(args[args.index('--dir') + 1])
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(os.environ['TEST_ARCHIVE'], dest / 'bundle.tar.gz')
+elif '/workflows/signed-gate.yml/runs?' in args[-1]:
+    print(json.dumps([{'workflow_runs': [run]}]))
+elif '/runs/501/artifacts?' in args[-1]:
+    print(json.dumps([{'artifacts': [{'name': 'signed-fixtures-' + run['head_sha'], 'expired': False}]}]))
+else:
+    raise SystemExit('unexpected request: ' + repr(args))
+"#);
+    let request = transport.path().join("request.json");
+    fs::write(
+        &request,
+        serde_json::to_vec(
+            &serde_json::json!({"kind": "MergeGroup", "prs": [43], "sha": landed, "base": landed}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let output = transport.path().join("downloaded");
+    let result = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["--root"])
+        .arg(f.repo.path())
+        .args(["signed-gate", "base-fixtures", "--request"])
+        .arg(request)
+        .arg("--output")
+        .arg(&output)
+        .args(["--wait-minutes", "0"])
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("TEST_RUN", transport.path().join("run.json"))
+        .env("TEST_ARCHIVE", &artifact)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read(output.join("bundle.tar.gz")).unwrap(),
+        fs::read(artifact).unwrap()
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("admitted candidate fixture archive"));
 }
 
 // ---- Added probes built from candidate code (#1980) ----

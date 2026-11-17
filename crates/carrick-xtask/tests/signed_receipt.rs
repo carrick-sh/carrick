@@ -3472,38 +3472,42 @@ raise SystemExit('unexpected gh invocation: ' + repr(args))
             )
             .unwrap();
 
-            let posts = main_dir.join("posts.jsonl");
-            let pub_out = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
-                .env("PATH", self.path_env())
-                .env("TEST_POSTS", &posts)
-                .env_remove("GITHUB_STEP_SUMMARY")
-                .args(["--root", &self.repo.to_string_lossy()])
-                .args(["signed-gate", "publish", "--request"])
-                .arg(&req_path)
-                .args(["--results"])
-                .arg(&results)
-                .args([
-                    "--run-url",
-                    "https://github.com/carrick-sh/carrick/actions/runs/500",
-                    "--execution-result",
-                    "success",
-                ])
-                .output()
-                .unwrap();
-            assert!(
-                pub_out.status.success()
-                    || String::from(
-                        receipt
-                            .fixture_validation
-                            .as_ref()
-                            .unwrap()
-                            .bundle_source_head
-                            .clone()
-                    ) != self.base,
-                "main publish failed: stdout={} stderr={}",
-                String::from_utf8_lossy(&pub_out.stdout),
-                String::from_utf8_lossy(&pub_out.stderr)
-            );
+            // This helper stages the already-admitted candidate. Main also
+            // exercises its self-baseline publisher; group publication needs
+            // separate paired-base evidence and is covered by publish_group.
+            if String::from(
+                receipt
+                    .fixture_validation
+                    .as_ref()
+                    .unwrap()
+                    .bundle_source_head
+                    .clone(),
+            ) == self.base
+            {
+                let posts = main_dir.join("posts.jsonl");
+                let pub_out = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+                    .env("PATH", self.path_env())
+                    .env("TEST_POSTS", &posts)
+                    .env_remove("GITHUB_STEP_SUMMARY")
+                    .args(["--root", &self.repo.to_string_lossy()])
+                    .args(["signed-gate", "publish", "--request"])
+                    .arg(&req_path)
+                    .args(["--results"])
+                    .arg(&results)
+                    .args([
+                        "--run-url",
+                        "https://github.com/carrick-sh/carrick/actions/runs/500",
+                        "--execution-result",
+                        "success",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    pub_out.status.success(),
+                    "main publish failed: {}",
+                    String::from_utf8_lossy(&pub_out.stderr)
+                );
+            }
 
             let gh_output = main_dir.join("github-output.txt");
             let artifact_dir = self.artifacts_root.join(format!("artifact-{run_id}"));
@@ -3786,6 +3790,7 @@ raise SystemExit('unexpected gh invocation: ' + repr(args))
         let (name, artifact) = bench.publish_main_reusable_artifact(501, &receipt);
         let mut producer = bench.trusted_main_run(501);
         producer["event"] = json!("merge_group");
+        producer["conclusion"] = json!("success");
         producer["head_branch"] = json!("gh-readonly-queue/main/pr-42-test");
         assert!(trusted_reuse_run(&producer, &landed));
         let mut wrong_sha = producer.clone();
@@ -3847,6 +3852,60 @@ raise SystemExit('unexpected gh invocation: ' + repr(args))
         assert!(lookup.status.success());
         assert!(!refused.join("base-seal.json").exists());
         assert!(String::from_utf8_lossy(&lookup.stderr).contains("NoMatchingArtifact"));
+    }
+
+    #[test]
+    fn changed_candidate_fixture_inputs_publish_no_seal_and_clear_stale_output() {
+        let bench = ReuseBench::new();
+        let mut receipt = bench.receipt_for(&bench.head);
+        receipt.fixture_validation.as_mut().unwrap().inputs_sha256 =
+            "e".repeat(64).try_into().unwrap();
+        let results = bench.dir.path().join("changed-candidate");
+        std::fs::create_dir(&results).unwrap();
+        write_run_evidence(&results, "candidate.json", &receipt);
+        let request = bench.dir.path().join("changed-request.json");
+        std::fs::write(
+            &request,
+            serde_json::to_vec(&Request {
+                kind: RequestKind::MergeGroup,
+                prs: vec![42],
+                sha: bench.head.clone(),
+                base: bench.base.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let output = bench.dir.path().join("stale-seal");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("base-seal.json"), b"stale").unwrap();
+        let gh_output = bench.dir.path().join("changed-gh-output");
+        let result = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .arg("--root")
+            .arg(&bench.repo)
+            .args(["signed-gate", "prepare-reuse-upload", "--request"])
+            .arg(request)
+            .arg("--results")
+            .arg(results)
+            .arg("--fixture-bundle")
+            .arg(&bench.bundle.archive)
+            .args(["--run-id", "502", "--output"])
+            .arg(&output)
+            .env("GITHUB_OUTPUT", &gh_output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!output.exists());
+        assert_eq!(
+            std::fs::read_to_string(gh_output).unwrap(),
+            "artifact_name=\n"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("fixture_validation.inputs_sha256")
+        );
     }
 
     /// Key-field mismatch witness (#1918): mismatching ANY key field (base SHA,

@@ -147,20 +147,27 @@ impl fmt::Display for ReuseMissReason {
     }
 }
 
-/// Only `signed-gate.yml` runs on `main` in this repository may supply a
-/// reusable base receipt: an automatic `push` to `main` for `base`, or an
-/// owner-initiated `workflow_dispatch` on `main`.
+/// Trusted main baselines or canonical merge-group candidates may seed reuse.
+/// A merge-group SHA is the commit that lands; PR branches never supply seals.
 pub fn trusted_reuse_run(run: &Value, base: &str) -> bool {
+    let main = run["head_branch"] == "main";
+    let merge_group = run["event"] == "merge_group"
+        && run["conclusion"] == "success"
+        && run["head_branch"]
+            .as_str()
+            .is_some_and(|b| b.starts_with("gh-readonly-queue/main/"))
+        && run["head_sha"] == base;
     run["path"] == SIGNED_GATE_WORKFLOW
-        && run["head_branch"] == "main"
         && run["repository"]["full_name"] == REPOSITORY
         && run["head_repository"]["full_name"] == REPOSITORY
-        && ((run["event"] == "push" && run["head_sha"] == base)
-            || (run["event"] == "workflow_dispatch"
-                && run["actor"]["login"].as_str().is_some_and(super::allowed)
-                && run["triggering_actor"]["login"]
-                    .as_str()
-                    .is_some_and(super::allowed)))
+        && (merge_group
+            || (main
+                && ((run["event"] == "push" && run["head_sha"] == base)
+                    || (run["event"] == "workflow_dispatch"
+                        && run["actor"]["login"].as_str().is_some_and(super::allowed)
+                        && run["triggering_actor"]["login"]
+                            .as_str()
+                            .is_some_and(super::allowed)))))
 }
 
 fn ensure_commit_present(root: &Path, commit: &str) -> Result<(), ReuseMissReason> {
@@ -206,7 +213,7 @@ fn git_blob_sha256(root: &Path, commit: &str, rel_path: &str) -> Result<String, 
     Ok(format!("{:x}", Sha256::digest(&out.stdout)))
 }
 
-/// Single key computation shared by the `Main` publisher (`prepare_reuse_upload`)
+/// Single key computation shared by the publisher (`prepare_reuse_upload`)
 /// and the gate-Mac consumer (`reuse_lookup` and `execute_pair`).
 pub fn compute_base_reuse_key(
     root: &Path,
@@ -236,12 +243,6 @@ pub fn compute_base_reuse_key(
         .map_err(|e| e.to_string())
         .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
         .map_err(ReuseMissReason::FixtureBundleInvalid)?;
-    let bundle_head = String::from(manifest.source_head.clone());
-    if bundle_head != base_sha {
-        return Err(ReuseMissReason::FixtureBundleInvalid(format!(
-            "bundle source_head {bundle_head} differs from base {base_sha}"
-        )));
-    }
     let fixture_manifest_sha256 = crate::provision::compute_sha256(unpacked.manifest())
         .map_err(|e| ReuseMissReason::FixtureBundleInvalid(e.to_string()))?;
     let fixture_inputs_sha256 = String::from(
@@ -468,10 +469,10 @@ fn verify_receipt_matches_key(
             detail: "reusable base must not carry candidate_probes".into(),
         });
     }
-    if String::from(fv.bundle_source_head.clone()) != key.base_sha {
+    if String::from(fv.checkout_head.clone()) != key.base_sha {
         return Err(ReuseMissReason::ReceiptKeyInconsistent {
-            field: "fixture_validation.bundle_source_head",
-            detail: "bundle_source_head differs from key base_sha".into(),
+            field: "fixture_validation.checkout_head",
+            detail: "checkout_head differs from key base_sha".into(),
         });
     }
     if String::from(fv.manifest_sha256.clone()) != key.fixture_manifest_sha256 {
@@ -561,7 +562,7 @@ fn verify_reusable_package(
     Ok(seal)
 }
 
-fn copy_regular_tree(src: &Path, dst: &Path) -> Result<(), ReceiptError> {
+pub(super) fn copy_regular_tree(src: &Path, dst: &Path) -> Result<(), ReceiptError> {
     fs::create_dir_all(dst).map_err(|e| super::fail(format!("{}: {e}", dst.display())))?;
     let entries = fs::read_dir(src).map_err(|e| super::fail(format!("{}: {e}", src.display())))?;
     for entry in entries {
@@ -770,7 +771,7 @@ pub(crate) fn try_install_reused_base(
     Ok((seal.files, reuse_meta))
 }
 
-/// Package an admitted, complete `Main` run's evidence into the `base/` +
+/// Package an admitted, complete main or merge-group candidate run's evidence into the `base/` +
 /// `base-seal.json` layout under the canonical [`BaseReuseKey`].
 pub fn prepare_reuse_upload(
     root: &Path,
@@ -785,13 +786,16 @@ pub fn prepare_reuse_upload(
     }
     let request: super::Request = serde_json::from_value(super::read_json(request_path)?)
         .map_err(|e| super::fail(e.to_string()))?;
-    if request.kind != super::RequestKind::Main {
+    if !matches!(
+        request.kind,
+        super::RequestKind::Main | super::RequestKind::MergeGroup
+    ) {
         return Err(super::fail(
-            "only Main requests may publish a reusable base receipt",
+            "only Main or MergeGroup requests may publish a reusable base receipt",
         ));
     }
-    let base_sha = super::sha(&request.base)?;
-    if super::sha(&request.sha)? != base_sha {
+    let base_sha = super::sha(&request.sha)?;
+    if request.kind == super::RequestKind::Main && super::sha(&request.base)? != base_sha {
         return Err(super::fail(
             "Main request candidate SHA differs from base SHA",
         ));
@@ -803,21 +807,21 @@ pub fn prepare_reuse_upload(
     let gaps = super::receipt_gaps(&candidate);
     if !gaps.is_empty() {
         return Err(super::fail(format!(
-            "incomplete main receipt cannot seed reusable base: {}",
+            "incomplete candidate receipt cannot seed reusable base: {}",
             gaps.join("; ")
         )));
     }
     let paired_gaps = super::paired_base_gaps(&candidate, super::accept_exit(results)?);
     if !paired_gaps.is_empty() {
         return Err(super::fail(format!(
-            "main run has paired base gaps: {}",
+            "candidate run has paired base gaps: {}",
             paired_gaps.join("; ")
         )));
     }
     let diff = crate::signed_receipt::compare(&candidate, &candidate)?;
     if diff.blocks() {
         return Err(super::fail(
-            "main receipt failed self-comparison; refusing reusable base publication",
+            "candidate receipt failed self-comparison; refusing reusable base publication",
         ));
     }
 
@@ -825,9 +829,24 @@ pub fn prepare_reuse_upload(
         .host_identity
         .clone()
         .filter(SignedHostIdentity::is_complete)
-        .ok_or_else(|| super::fail("main receipt lacks complete host_identity"))?;
+        .ok_or_else(|| super::fail("candidate receipt lacks complete host_identity"))?;
     let key = compute_base_reuse_key(root, &base_sha, host_identity, bundle_path)
         .map_err(|e| super::fail(format!("cannot compute base reuse key: {e}")))?;
+    // Added probes or differing fixture inputs can pass the queue verdict,
+    // but cannot seed a baseline under this archive's exact key. This is a
+    // logged non-publication, never a relaxed key or a failed queue verdict.
+    if request.kind == super::RequestKind::MergeGroup
+        && let Err(reason) = verify_receipt_matches_key(&candidate, &key)
+    {
+        eprintln!(
+            "signed-gate: candidate base seal not reusable ({reason}); no artifact published"
+        );
+        if output.exists() {
+            fs::remove_dir_all(output).map_err(|e| super::fail(e.to_string()))?;
+        }
+        write_artifact_output("")?;
+        return Ok(String::new());
+    }
     let key_sha256 = key.key_sha256()?;
     let artifact_name = key.artifact_name()?;
 
@@ -900,6 +919,11 @@ pub fn prepare_reuse_upload(
     verify_reusable_package(output, &base_sha, &key, Some(run_id), false)
         .map_err(|e| super::fail(format!("staged reusable base failed self-check: {e}")))?;
 
+    write_artifact_output(&artifact_name)?;
+    Ok(artifact_name)
+}
+
+fn write_artifact_output(name: &str) -> Result<(), ReceiptError> {
     if let Ok(gh_out) = std::env::var("GITHUB_OUTPUT") {
         use std::io::Write;
         let mut file = fs::OpenOptions::new()
@@ -907,10 +931,10 @@ pub fn prepare_reuse_upload(
             .append(true)
             .open(&gh_out)
             .map_err(|e| super::fail(format!("{gh_out}: {e}")))?;
-        writeln!(file, "artifact_name={artifact_name}")
+        writeln!(file, "artifact_name={name}")
             .map_err(|e| super::fail(format!("{gh_out}: {e}")))?;
     }
-    Ok(artifact_name)
+    Ok(())
 }
 
 /// Re-verify `BaseSeal.reuse` on the hosted `publish` runner so a tampered or
