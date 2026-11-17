@@ -73,3 +73,14 @@ fn branch_fixed_fields_fail_shut() {
         );
     }
 }
+
+#[test]
+fn logical_forms_have_typed_operands() {
+    for word in [0x92401c20, 0x12001c20, 0xaa020020, 0x8a220020, 0xea420420] {
+        assert_ne!(
+            decode_instruction(word),
+            Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+}
