@@ -217,7 +217,10 @@ mod decode {
         None
     }
 }
-pub use decode::*;
+pub use decode::{
+    Decoded, ExclusiveOption, Immediate16, Register, Shareability, Shift, TlbOperation,
+    Translation, Unary, Width, decode,
+};
 
 /// MRS/MSR encoding fields, preserving the architectural namespace exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
