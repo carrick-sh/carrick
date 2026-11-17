@@ -23,6 +23,12 @@ fn scalar_abort_known_answers() {
             FaultStatus::Translation(TableLevel::L2),
             0x8200_0006,
         ),
+        (
+            ExceptionLevel::El1,
+            Access::Fetch,
+            FaultStatus::Permission(LeafLevel::L2),
+            0x8600_000e,
+        ),
     ] {
         let mut cpu = CpuState::default();
         cpu.pstate.el = el;
@@ -385,4 +391,101 @@ fn svc_roundtrip_through_generated_production_vector_table() {
     eret(&mut cpu).unwrap();
     assert_eq!(cpu.pc, ProgramCounter(0x1004));
     assert_eq!(cpu.pstate.el, ExceptionLevel::El0);
+}
+
+/// D13.2.116 UMA is bit 9, independent of neighbouring controls.
+#[test]
+fn el0_daif_access_obeys_uma_bit_nine() {
+    use carrick_softcpu_aarch64::OperandRegister;
+    for control in [0, 1 << 8, 1 << 9, 1 << 10, !0u64 ^ (1 << 9)] {
+        let mut cpu = CpuState::default();
+        cpu.el1.sctlr = Sctlr(control);
+        cpu.pstate.daif = InterruptMasks(5);
+        let read = cpu.mrs(sys((3, 3, 4, 2, 1)), OperandRegister::Zr);
+        let write = cpu.msr(
+            sys((3, 3, 4, 2, 1)),
+            OperandRegister::Zr,
+            SystemValue(10 << 6),
+        );
+        if control & (1 << 9) != 0 {
+            assert_eq!(read.unwrap(), SystemValue(5 << 6));
+            write.unwrap();
+            assert_eq!(cpu.pstate.daif, InterruptMasks(10));
+        } else {
+            assert_eq!(read.unwrap_err().syndrome, Syndrome(0x6232_d3e5));
+            assert_eq!(write.unwrap_err().syndrome, Syndrome(0x6232_d3e4));
+            assert_eq!(cpu.pstate.daif, InterruptMasks(5));
+        }
+    }
+}
+
+/// C5.2 SP_EL0 access is UNDEFINED while it is the active stack pointer.
+#[test]
+fn sp_el0_access_is_undefined_at_el1_using_sp_zero() {
+    use carrick_softcpu_aarch64::OperandRegister;
+    let mut cpu = CpuState::default();
+    cpu.pstate.el = ExceptionLevel::El1;
+    cpu.sp_el0 = StackPointer(0x1230);
+    let register = sys((3, 0, 4, 1, 0));
+    assert_eq!(
+        cpu.mrs(register, OperandRegister::Zr).unwrap_err().syndrome,
+        Syndrome(0x0200_0000)
+    );
+    assert_eq!(
+        cpu.msr(register, OperandRegister::Zr, SystemValue(0x4560))
+            .unwrap_err()
+            .syndrome,
+        Syndrome(0x0200_0000)
+    );
+    assert_eq!(cpu.sp_el0, StackPointer(0x1230));
+    cpu.pstate.sp = StackSelect::El1;
+    assert_eq!(
+        cpu.mrs(register, OperandRegister::Zr).unwrap(),
+        SystemValue(0x1230)
+    );
+    cpu.msr(register, OperandRegister::Zr, SystemValue(0x4560))
+        .unwrap();
+    assert_eq!(cpu.sp_el0, StackPointer(0x4560));
+}
+
+/// D13.2.140 VBAR_EL1[10:0] is RES0, on register writes and vector use.
+#[test]
+fn vbar_low_bits_are_res0() {
+    use carrick_softcpu_aarch64::OperandRegister;
+    for base in [0x8000, 0xffff_0000_1234_5800] {
+        for low in 0..=0x7ff {
+            let mut cpu = CpuState::default();
+            cpu.pstate.el = ExceptionLevel::El1;
+            cpu.pstate.sp = StackSelect::El1;
+            cpu.msr(
+                sys((3, 0, 12, 0, 0)),
+                OperandRegister::Zr,
+                SystemValue(base | low),
+            )
+            .unwrap();
+            assert_eq!(
+                cpu.mrs(sys((3, 0, 12, 0, 0)), OperandRegister::Zr).unwrap(),
+                SystemValue(base)
+            );
+            // Public raw state can also be supplied by a provider.
+            cpu.el1.vbar = VirtualAddress(base | low);
+            take_exception(&mut cpu, Exception::Irq);
+            assert_eq!(cpu.pc, ProgramCounter(base + 0x280));
+        }
+    }
+}
+
+/// EL0+SP=1 cannot be produced by architectural transitions. Public raw
+/// PSTATE fields can express it: banking and saving must still select EL0.
+#[test]
+fn raw_el0_sp_one_uses_the_el0_bank_and_saved_mode() {
+    let mut cpu = CpuState::default();
+    cpu.pstate.sp = StackSelect::El1;
+    cpu.sp_el0 = StackPointer(0x1000);
+    cpu.sp_el1 = StackPointer(0x2000);
+    assert_eq!(cpu.sp(), StackPointer(0x1000));
+    cpu.set_sp(StackPointer(0x3000));
+    assert_eq!(cpu.sp_el0, StackPointer(0x3000));
+    assert_eq!(cpu.sp_el1, StackPointer(0x2000));
+    assert_eq!(cpu.pstate.save().0 & 31, 0);
 }
