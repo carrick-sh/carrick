@@ -563,27 +563,37 @@ fn native_simd_block_preserves_callee_saved_host_simd() {
     let bytes: Vec<_> = block.words().iter().flat_map(|w| w.to_le_bytes()).collect();
     let mut jit = JitCodeBuffer::new(bytes.len()).unwrap();
     let entry = jit.publish(&bytes).unwrap();
-    let mut frame = BlockFrame::default();
-    frame.slots[1] = 0xa5;
-    let host_d8: u64;
-    let mut region = vec![BlockFrame::default(); 64 * 1024 / size_of::<BlockFrame>()];
-    let top = region.last_mut().unwrap();
-    *top = frame;
-    // SAFETY: The same generated AAPCS64 block ABI that HostBlockRunner uses.
-    // The block runs on the live, 16-byte-aligned frame with a signal landing
-    // region below it. The assembly declares the ABI and its own V8 write.
-    unsafe {
-        core::arch::asm!(
-            "movi v8.8b, #0x73",
-            "blr x1",
-            "umov x9, v8.d[0]",
-            inout("x0") top as *mut BlockFrame => _,
-            in("x1") entry,
-            lateout("x9") host_d8,
-            lateout("v8") _,
-            clobber_abi("C"),
-        );
-    }
+    // DDI0487G.a encodings for an AAPCS64 caller with a live value in D8.
+    let caller_code: Vec<_> = [
+        0xa9be_7bfdu32, // stp x29, x30, [sp, #-32]!
+        0xfd00_0be8,    // str d8, [sp, #16]
+        0x0f03_e668,    // movi v8.8b, #0x73
+        0xd63f_0020,    // blr x1
+        0x4e08_3d00,    // umov x0, v8.d[0]
+        0xfd40_0be8,    // ldr d8, [sp, #16]
+        0xa8c2_7bfd,    // ldp x29, x30, [sp], #32
+        0xd65f_03c0,    // ret
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    let mut caller_jit = JitCodeBuffer::new(caller_code.len()).unwrap();
+    let caller_entry = caller_jit.publish(&caller_code).unwrap();
+    // SAFETY: this RX function preserves the caller's D8, LR and SP,
+    // calls the live RX block in X1 with the frame in X0 and returns in X0.
+    let call = unsafe {
+        std::mem::transmute::<usize, extern "C" fn(*mut BlockFrame, u64) -> u64>(
+            caller_entry as usize,
+        )
+    };
+    let mut region = vec![
+        BlockFrame::default();
+        carrick_softcpu_aarch64_host::FRAME_REGION_BYTES / size_of::<BlockFrame>()
+    ];
+    let index = region.len() - 1;
+    region[index].slots[1] = 0xa5;
+    let frame = region.as_mut_ptr().wrapping_add(index);
+    let host_d8 = call(frame, entry);
     assert_eq!(host_d8, u64::from_le_bytes([0x73; 8]));
-    assert_eq!(top.vectors[8], u128::from_le_bytes([0xa5; 16]));
+    assert_eq!(region[index].vectors[8], u128::from_le_bytes([0xa5; 16]));
 }
