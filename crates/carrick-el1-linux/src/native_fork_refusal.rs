@@ -37,43 +37,6 @@ pub enum NativeForkStage {
     StockCrossing,
 }
 
-impl NativeForkStage {
-    /// Whether this stage re-checks the parent snapshot the census took
-    /// under the editor, which the fork released for the stock crossing
-    /// and the scratch (#2441). There, `MmError::Stale` means the parent's
-    /// generation, operation sequence or a read descriptor moved: another
-    /// live thread of the parent committed an edit, and the fork reruns
-    /// with a fresh snapshot. Exhaustive, so a new stage picks its answer.
-    pub const fn revalidates_parent_snapshot(self) -> bool {
-        match self {
-            Self::Prepare | Self::Publish => true,
-            Self::ParentLifecycleGate { .. }
-            | Self::BirthReservation
-            | Self::ParentSpaceEdit
-            | Self::ParentForkReady
-            | Self::ChildLifecycleClaim
-            | Self::ChildControlReset
-            | Self::BirthPublication
-            | Self::PrepareService
-            | Self::ForkFileTable
-            | Self::CommitChildService
-            | Self::MappingCount
-            | Self::SpaceAccess
-            | Self::ParentRoot
-            | Self::ObserveMappings
-            | Self::TransferSequence
-            | Self::Census
-            | Self::PublishRoot
-            | Self::Scratch
-            | Self::Reserve
-            | Self::Commit
-            | Self::Abort
-            | Self::OpenChildSpace
-            | Self::StockCrossing => false,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeForkCause {
     Busy,
@@ -146,11 +109,10 @@ pub struct NativeForkRefusal {
 /// Per cause:
 /// - [`Self::NotNow`]: `Busy`, `SiblingBirth`, `MetadataOwed` (the fork
 ///   parks on that grant's request queue), `MmError::{Wait, Busy}`,
-///   `Refusal::{Busy, PreparedConflict}`, `ForkError::Busy`, a stock
-///   `Inventory` reply, and `MmError::Stale` at a stage that re-checks the
-///   parent snapshot ([`NativeForkStage::revalidates_parent_snapshot`]):
-///   another live thread of the parent moved it, and the fork reruns with
-///   a fresh snapshot.
+///   `Refusal::{Busy, PreparedConflict}`, `ForkError::Busy`, and a stock
+///   `Inventory` reply. A parent snapshot another live thread of the parent
+///   moved between the census and the fork's prepare or publish is
+///   `MmError::Busy` at its source: the fork reruns with a fresh snapshot.
 /// - [`Self::OutOfMemory`] (ENOMEM): `MmError::{NoMemory, MetadataRequired}`,
 ///   `PageTableError::{OutOfTables, MetadataAllocation}`,
 ///   `Refusal::{Limit, MetadataRequired}`,
@@ -159,8 +121,8 @@ pub struct NativeForkRefusal {
 ///   parent's births) and a stock `Capacity` reply.
 /// - [`Self::Unsupported`] (a counted ENOSYS): `MmError::UnsupportedExecutableCow`.
 /// - [`Self::InvariantViolation`] (fatal): the owner refused its own state.
-///   `MmError::{Fault, Invalid, Core}`, `MmError::Stale` at every other
-///   stage, and every other page-table
+///   `MmError::{Fault, Stale, Invalid, Core}` at every stage, and every
+///   other page-table
 ///   error; `Refusal::{Stale, Invalid, Collision, Hole, ForeignMapping}`;
 ///   `ForkError::{Invalid, Stale, Core}` and the owner refusals `Invalid`,
 ///   `Collision`, `Hole` and `ForeignMapping`; a stock `Invalid` or `Stale`
@@ -194,9 +156,6 @@ impl NativeForkRefusal {
             | NativeForkCause::SiblingBirth { .. }
             | NativeForkCause::MetadataOwed { .. } => Class::NotNow(None),
             NativeForkCause::GateShut => Class::BirthsExhausted,
-            NativeForkCause::Mm(MmError::Stale) if self.stage.revalidates_parent_snapshot() => {
-                Class::NotNow(None)
-            }
             NativeForkCause::Mm(error) => mm_class(error),
             NativeForkCause::Reservation(refusal) => reservation_class(refusal),
             NativeForkCause::Fork(error) => fork_class(error),
@@ -685,10 +644,8 @@ mod tests {
         };
         let mut classes = std::collections::BTreeMap::<&str, usize>::new();
         for cause in every_cause() {
-            // A stage that holds the editor: no cause there is a moved
-            // snapshot (`fork_stale_snapshot_is_not_now_only_where_revalidated`).
             let refusal = NativeForkRefusal {
-                stage: NativeForkStage::Census,
+                stage: NativeForkStage::Prepare,
                 cause,
             };
             let class = refusal.class();
@@ -724,12 +681,13 @@ mod tests {
         );
     }
 
-    /// #2441: `MmError::Stale` is a superseded parent snapshot only where
-    /// the fork re-checks the snapshot it took under the editor (prepare
-    /// and publish): another thread of the parent moved it, so the fork
-    /// reruns. Everywhere else it is a broken invariant.
+    /// #2441, the director's ruling on #2508: a Stale cause is a broken
+    /// invariant at every stage, the prepare and publish stages that
+    /// re-check the census's parent snapshot included. A snapshot another
+    /// live thread of the parent moved is `MmError::Busy` at its source,
+    /// never Stale, so no stage reruns a fork on Stale.
     #[test]
-    fn fork_stale_snapshot_is_not_now_only_where_revalidated() {
+    fn every_stale_cause_is_an_invariant_at_every_stage() {
         let observed = carrick_el1_abi::GateState::Open;
         let stages = [
             NativeForkStage::ParentLifecycleGate { observed },
@@ -760,23 +718,12 @@ mod tests {
         ];
         for stage in stages {
             let class = |cause| NativeForkRefusal { stage, cause }.class();
-            let moved = matches!(stage, NativeForkStage::Prepare | NativeForkStage::Publish);
-            assert_eq!(stage.revalidates_parent_snapshot(), moved, "{stage:?}");
-            assert_eq!(
-                class(NativeForkCause::Mm(MmError::Stale)),
-                if moved {
-                    NativeForkClass::NotNow(None)
-                } else {
-                    NativeForkClass::InvariantViolation
-                },
-                "{stage:?}"
-            );
-            // Only the snapshot's own Stale moves; the rest keep their class.
             for cause in [
-                NativeForkCause::Mm(MmError::Invalid),
+                NativeForkCause::Mm(MmError::Stale),
                 NativeForkCause::Mm(MmError::Reservation(Refusal::Stale)),
                 NativeForkCause::Reservation(Refusal::Stale),
                 NativeForkCause::Fork(ForkError::Stale),
+                NativeForkCause::StockReservation(carrick_el1_abi::ForkStockRefusal::Stale),
             ] {
                 assert_eq!(
                     class(cause),
@@ -784,6 +731,11 @@ mod tests {
                     "{stage:?} {cause:?}"
                 );
             }
+            assert_eq!(
+                class(NativeForkCause::Mm(MmError::Busy)),
+                NativeForkClass::NotNow(None),
+                "{stage:?}"
+            );
         }
     }
 
