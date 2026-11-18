@@ -126,6 +126,7 @@ embed = [
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_cwd_and_relative_open_agree (native Linux control and directory-specific marker bytes)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_cwd_is_inherited_and_isolated (native Linux control and directory-specific marker bytes)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_two_live_processes_keep_distinct_cwds (native Linux control and directory-specific marker bytes)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_reads_the_injected_resolv_conf_over_the_images (#2418: x86 witness of the shared carrier read; the root reads the injected nameserver, never the image's, then end of file; red: exit 11, -38 ENOSYS)",
 ]
 
 [bindings.unresolved]
