@@ -118,7 +118,6 @@ fn register_only_words_copy_through() {
         0x93c21020,    // extr x0, x1, x2, #4
         0xd503201f,    // nop
         0xd5033bbf,    // dmb ish
-        0xd5033fdf,    // isb
     ] {
         assert_eq!(
             class(word),
@@ -130,7 +129,11 @@ fn register_only_words_copy_through() {
 
 #[test]
 fn exits_and_branches_classify() {
-    let cases: [(u32, InstructionClass); 18] = [
+    let cases = [
+        (
+            0xd5033fdf,
+            InstructionClass::Exit(ExitReason::InstructionSynchronization),
+        ), // isb
         (0xf9400020, InstructionClass::Exit(ExitReason::Memory)), // ldr x0, [x1]
         (0xa9bf7bfd, InstructionClass::Exit(ExitReason::Memory)), // stp x29, x30, [sp, #-16]!
         (0xc85f7c20, InstructionClass::Exit(ExitReason::Memory)), // ldxr x0, [x1]
