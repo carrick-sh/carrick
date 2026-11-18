@@ -401,6 +401,7 @@ fn emit_rewritten_mem_op(
         });
     }
     let virt = begin_virt_r14_r15(out, &mut rewritten, info_factory, false);
+    let high_byte = begin_high_byte_stand_in(out, &mut rewritten, info_factory);
     rewritten.set_segment_prefix(Register::None);
     rewritten.set_memory_base(Register::R14);
     rewritten.set_memory_index(Register::None);
@@ -409,6 +410,9 @@ fn emit_rewritten_mem_op(
     rewritten.set_memory_displ_size(0);
 
     encode_one(out, &rewritten, va)?;
+    if let Some(stand_in) = high_byte {
+        end_high_byte_stand_in(out, stand_in);
+    }
     end_virt_r14_r15(out, &virt);
     if bit_string {
         emit_mov_gpr_from_r15_disp32(out, 1, CTX_PROBE_SPILL1_OFF as i32);
@@ -426,6 +430,73 @@ fn encode_one(out: &mut Vec<u8>, insn: &Instruction, va: u64) -> Result<(), Emit
         })?;
     out.extend_from_slice(&encoder.take_buffer());
     Ok(())
+}
+
+/// A legacy high-byte register operand carried through a low-byte stand-in.
+#[derive(Clone, Copy)]
+struct HighByteStandIn {
+    /// `AH`/`CH`/`DH`/`BH` encoded as ModRM register codes 4..=7.
+    high_code: u8,
+    /// RAX..RBX: its low byte (`AL`..`BL`) needs no REX either.
+    stand_in: usize,
+    written: bool,
+}
+
+/// SDM Vol. 2A 2.2.1.2: with any REX prefix, register codes 4..=7 name
+/// SPL/BPL/SIL/DIL, so AH/CH/DH/BH cannot share an instruction with the R14
+/// memory base. Move the byte into an unused RAX..RBX (`MOVZX r32, r/m8`),
+/// let the rewritten instruction use its low byte, and move it back with
+/// `MOV r/m8, r8` if the instruction writes it. Neither touches RFLAGS. The
+/// stand-in is spilled in `CTX_VIRT_SPILL0`, which is free: an instruction
+/// naming a high-byte register cannot also name R14, R15 or SPL.
+fn begin_high_byte_stand_in(
+    out: &mut Vec<u8>,
+    insn: &mut Instruction,
+    info_factory: &mut InstructionInfoFactory,
+) -> Option<HighByteStandIn> {
+    let (operand, high) = (0..insn.op_count()).find_map(|i| {
+        (insn.op_kind(i) == OpKind::Register
+            && matches!(
+                insn.op_register(i),
+                Register::AH | Register::CH | Register::DH | Register::BH
+            ))
+        .then(|| (i, insn.op_register(i)))
+    })?;
+    let info = info_factory.info(insn);
+    let mut used = 0u16;
+    let mut written = false;
+    for used_register in info.used_registers() {
+        if let Some(index) = gpr_index(used_register.register()) {
+            used |= 1 << index;
+        }
+        written |= used_register.register() == high
+            && matches!(
+                used_register.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            );
+    }
+    let stand_in = (0..4).find(|&candidate| used & (1 << candidate) == 0)?;
+    let high_code = 4 + gpr_index(high)? as u8;
+    emit_mov_r15_disp32_from_gpr(out, CTX_VIRT_SPILL0_OFF as i32, stand_in);
+    // movzx stand_in32, high
+    out.extend_from_slice(&[0x0f, 0xb6, 0xc0 | ((stand_in as u8) << 3) | high_code]);
+    insn.set_op_register(operand, map_reg_width(high, stand_in));
+    Some(HighByteStandIn {
+        high_code,
+        stand_in,
+        written,
+    })
+}
+
+fn end_high_byte_stand_in(out: &mut Vec<u8>, state: HighByteStandIn) {
+    if state.written {
+        // mov high, stand_in8
+        out.extend_from_slice(&[0x88, 0xc0 | ((state.stand_in as u8) << 3) | state.high_code]);
+    }
+    emit_mov_gpr_from_r15_disp32(out, state.stand_in, CTX_VIRT_SPILL0_OFF as i32);
 }
 
 struct VirtSpillState {
