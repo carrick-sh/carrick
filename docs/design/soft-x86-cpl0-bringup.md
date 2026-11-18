@@ -256,18 +256,56 @@ in slot 1's boot state. M1 is single-vCPU (#2397), so it is never started.
 The guest exits 0 with stdout `hello\n`.
 
 Rust std's startup on the bhyve musl hello fixture polls fds 0-2 through
-`HostReadinessCrossing`. Only the runtime executor's host-readiness
-service answers that crossing (`carrick-runtime`,
-`vcpu_loop/executor/cpl0.rs`). The stopped-lease driver therefore refuses
-it, and std aborts. The witness is ignored with that reason, as the
-production KVM CLI musl hello is. The next slice either wires the soft
-backend into the runtime executor pool, or moves the executor's host
-routes out of `carrick-runtime`. Both are director-ruled.
+`HostReadinessCrossing`. M1-2 found that only the runtime executor's
+host-readiness service answered it (`carrick-runtime`,
+`vcpu_loop/executor/cpl0.rs`), so the soft driver refused it and std
+aborted.
+
+### M1-3 status: review fixes and the shared readiness service
+
+The independent review's findings on #2518 are fixed, each red first:
+
+- **Memory custody.** The soft memory view (`SoftCarrierMemory`) now owns
+  an `Arc` of every backing it places (`SoftBackings`: the bootstrap
+  windows' `GuestRam` and each registered `BackingExtent`). Its
+  constructor is crate-private and `unsafe`, and it refuses a
+  registration the backings do not retain. A soft CPU no longer depends
+  on a carrier's custody for liveness. The witness swaps two carriers'
+  custodies and drops one; before the fix it died with `SIGSEGV`.
+- **JIT high-byte forms.** The high-byte stand-in is chosen after the
+  memory operand is rebased on R14. A virtualized RSP beside a high-byte
+  register is hosted in a legacy register.
+- **Probe rows** each assert their own expected exit.
+- **Setter state.** `SoftBootVcpu` refreshes the TLB mode tag on RFLAGS,
+  recomputes `EFER.LMA` on CR0, and installs the FS/GS descriptor base.
+
+The neutral part of the readiness service moved, as new code, into
+`carrick-x86-cpl0-host::host_readiness`:
+
+- the crossing decode;
+- the host-owned stdio descriptor table;
+- the one-shot host `poll` sample over the task's supervisor batch;
+- the remaining-wait decision.
+
+Parking a waiting task stays with the executor. The soft hello driver
+answers the crossing through it. The runtime executor's delegation to the
+module is a `carrick-runtime` hunk for the director.
+
+The musl hello now boots to: the readiness crossing answered with 0, then
+two `OWNER_GRANT_PORT` (`0xd1`) doorbells. It fails at a fault loop in the
+ring (`dispatch_classified_fault` -> `FaultSupply::editor` ->
+`descriptor_txn::Planner::edit`, once per ~512 soft blocks). The owner
+grants install carrier slots after boot. The soft memory view
+authenticates and places only the slots it saw at boot, so every touch of
+a granted frame faults again. Admitting run-time slots needs the view to
+retain their backings. That means a read of the `CarrierMemory` slot
+backings, which `carrier_memory.rs` does not expose today.
 
 Still open:
 
 - the soft peer CPU's start and the APIC cluster;
 - MSI;
-- placement refresh when slots change at run time;
+- placement and extent refresh, with retained backings, when slots
+  change at run time (the musl hello's frontier);
 - soft-walk admission of roots other than the CPU's current CR3;
 - runtime selection (`--vcpu soft`).
