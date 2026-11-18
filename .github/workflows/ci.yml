@@ -2731,6 +2731,9 @@ jobs:
           [ "$status" -eq 0 ] || exit "$status"
           elf=$(find target/debug/build -path '*carrick-el1-image-*/out/el1-target/aarch64-unknown-none-softfloat/el1-image/carrick-el1' -type f -print -quit)
           [ -n "$elf" ] || { echo "production EL1 ELF not found" >&2; exit 1; }
+          # The ignored witnesses include the LLVM differentials, which need
+          # the toolchain's llvm-objdump (as `just a64-census-gate` sets it).
+          export CARRICK_LLVM_OBJDUMP="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objdump"
           CARRICK_A64_ELF="$PWD/$elf" cargo test -p carrick-softcpu-aarch64 \
             -- --ignored --nocapture > soft-aarch64-logs/probe.log 2>&1 || status=$?
           cat soft-aarch64-logs/probe.log
