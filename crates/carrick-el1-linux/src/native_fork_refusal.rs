@@ -394,6 +394,131 @@ mod tests {
         mailbox.owed_grant().unwrap()
     }
 
+    /// One of every native fork refusal cause, each nested owner variant
+    /// included.
+    fn every_cause() -> std::vec::Vec<NativeForkCause> {
+        use carrick_el1_abi::ForkStockRefusal as Stock;
+        use carrick_mmu_core::aarch64::PageTableError as Table;
+        // SAFETY: a synthetic receipt; no owner or queue is entered.
+        let wait = unsafe {
+            carrick_core_abi::PortalOwnerWait::from_owner(
+                carrick_core_abi::El1MmHandle::from_admitted_owner(
+                    core::num::NonZeroU64::MIN,
+                    carrick_el1_abi::ReservationMm::new(7).unwrap(),
+                    core::num::NonZeroU64::MIN,
+                ),
+                carrick_core_abi::PortalWaitCause::Editor,
+                1,
+            )
+        };
+        let refusals = [
+            Refusal::Busy,
+            Refusal::PreparedConflict,
+            Refusal::Limit,
+            Refusal::MetadataRequired,
+            Refusal::Stale,
+            Refusal::Invalid,
+            Refusal::Collision,
+            Refusal::Hole,
+            Refusal::ForeignMapping,
+        ];
+        let owner_refusals = [
+            ForkOwnerRefusal::Invalid,
+            ForkOwnerRefusal::Collision,
+            ForkOwnerRefusal::Hole,
+            ForkOwnerRefusal::ForeignMapping,
+            ForkOwnerRefusal::Limit,
+        ];
+        let stock = [
+            Stock::Invalid,
+            Stock::Stale,
+            Stock::Capacity,
+            Stock::Inventory,
+        ];
+        let mut causes = std::vec![
+            NativeForkCause::Busy,
+            NativeForkCause::GateShut,
+            NativeForkCause::SiblingBirth {
+                observed: carrick_sched_core::process::wait::TaskWakeGeneration::from_task_counter(
+                    1
+                ),
+            },
+            NativeForkCause::MetadataOwed {
+                grant: owed_grant()
+            },
+            NativeForkCause::StockCrossing {
+                status: 1,
+                reply: None,
+            },
+        ];
+        for error in [
+            MmError::Fault,
+            MmError::UnsupportedExecutableCow,
+            MmError::Stale,
+            MmError::Busy,
+            MmError::Wait(wait),
+            MmError::NoMemory,
+            MmError::MetadataRequired,
+            MmError::Invalid,
+            MmError::Core,
+        ]
+        .into_iter()
+        .chain(
+            [
+                Table::OutOfTables,
+                Table::BadAddress,
+                Table::MissingArenaSource,
+                Table::ConflictingArenaSource,
+                Table::UnresolvedArena(0),
+                Table::GicWindowOutput,
+                Table::MetadataAllocation,
+                Table::GuestOwnsLiveDescriptors,
+                Table::CarrickOwnedWindow,
+            ]
+            .map(MmError::Table),
+        )
+        .chain(refusals.map(MmError::Reservation))
+        {
+            causes.push(NativeForkCause::Mm(error));
+        }
+        causes.extend(refusals.map(NativeForkCause::Reservation));
+        for error in [
+            ForkError::Invalid,
+            ForkError::NoMemory,
+            ForkError::Busy,
+            ForkError::Stale,
+            ForkError::MetadataRequired,
+            ForkError::Core,
+        ]
+        .into_iter()
+        .chain(owner_refusals.map(ForkError::OwnerRefusal))
+        {
+            causes.push(NativeForkCause::Fork(error));
+        }
+        causes.extend(stock.map(NativeForkCause::StockReservation));
+        causes.extend(stock.map(|reply| NativeForkCause::StockCrossing {
+            status: 2,
+            reply: Some(reply),
+        }));
+        causes
+    }
+
+    /// #2441: no native fork refusal reaches the guest as EFAULT. The fork
+    /// transaction walks no guest address, and Linux never answers a plain
+    /// fork EFAULT; a refusal is "not now", exhaustion, unsupported, or a
+    /// broken invariant that ends the run.
+    #[test]
+    fn no_fork_refusal_cause_answers_efault() {
+        for cause in every_cause() {
+            let error = refused(NativeForkStage::Prepare, cause);
+            assert_ne!(
+                error.failure().map(|failure| failure.errno()),
+                Ok(-14),
+                "{cause:?} reached the guest as EFAULT"
+            );
+        }
+    }
+
     #[test]
     fn boundary_observes_every_untyped_error_without_changing_policy() {
         use NativeProcessError as E;
