@@ -23,6 +23,7 @@ pub const EL1_IMAGE_SIZE: carrick_guest_arch::GuestLen =
 
 pub mod descriptor_txn;
 pub mod owner_fork;
+pub mod stage1_walk;
 
 /// Why the host could not build a guest descriptor transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
