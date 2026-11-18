@@ -358,6 +358,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "process.exec.custody" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "process.exec.native-exe-link" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support/terminal_entry_tests.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "diagnostics.syscall-refusal" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "kernel.el1.deferred-handback-identity" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "kernel.el1.ipc-two-process" },
