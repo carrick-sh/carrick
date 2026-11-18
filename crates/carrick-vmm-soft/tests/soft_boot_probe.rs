@@ -7,7 +7,10 @@
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #![allow(clippy::expect_used, clippy::panic)]
 
+use carrick_softcpu_x86::SoftMachineExit;
 use carrick_vmm_soft::{BootExit, BootReport, ProbeImage, SoftCarrier, boot_probe};
+use carrick_x86::cpl0_entry::{FORWARD_PORT, WORK_PORT};
+use carrick_x86_cpl0_host::cpl0_boot::USER_CODE;
 
 mod common;
 use common::{bind_issued_root, inventory, static_elf};
@@ -29,28 +32,70 @@ fn probe(image: ProbeImage<'_>) -> BootReport {
     report
 }
 
-/// The carrier protocol's first serviced exit: port I/O or `HLT`, or a
-/// complete fault-doorbell record for a CPL3 fault. A ring-0 fault record
-/// is a carrier failure on KVM too (`fault_exit_from_record`). A ring fatal
-/// is admitted only where the stopped carrier lacks what the ring requires.
-fn reached_host_exit(report: &BootReport, ring_fatal_admitted: bool) -> bool {
-    match &report.outcome {
-        BootExit::HostExit(_) => report.fatal_payload.is_none() || ring_fatal_admitted,
-        BootExit::FaultDoorbell(record) => record.cs & 3 == 3,
+/// The exit one probe row must reach. Each row names its own: a CPL3
+/// fault record standing in for a port exit (or the reverse) is a failure.
+#[derive(Clone, Copy, Debug)]
+enum Expected {
+    /// The stopped production ring enters CPL3 at `USER_CODE` with no
+    /// program mapped: the ring's IDT stub reports that instruction-fetch
+    /// `#PF` to the carrier.
+    UserFetchFault,
+    /// A carrier host exit `OUT` on this port, with no ring fatal.
+    Out(u16),
+}
+
+/// `Ok` when `report` reached exactly `expected`.
+fn check(report: &BootReport, expected: Expected) -> Result<(), String> {
+    let reached = match (expected, &report.outcome) {
+        (Expected::UserFetchFault, BootExit::FaultDoorbell(record)) => {
+            record.vector == 14
+                && record.cs & 3 == 3
+                // #PF error code: user-mode instruction fetch, not present.
+                && record.error_code == 0x14
+                && record.rip == USER_CODE
+                && record.cr2 == USER_CODE
+        }
+        (Expected::Out(port), BootExit::HostExit(SoftMachineExit::IoOut { port: out, .. })) => {
+            *out == port && report.fatal_payload.is_none()
+        }
         _ => false,
+    };
+    if reached {
+        Ok(())
+    } else {
+        Err(format!(
+            "[{}] expected {expected:?}: {}",
+            report.image, report.summary
+        ))
     }
 }
 
-#[test]
-fn production_ring_image_boots_to_first_carrier_exit_on_soft_cpu() {
-    let exit_seven = static_elf(EXIT_SEVEN);
+/// Row 2's shape: the production ring admits `elf` as the initial MM of
+/// the kernel's issued root.
+fn admitted_row(name: &'static str, elf: &[u8]) -> BootReport {
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher);
     let root = dispatcher.capture_one_task_context().expect("issued root");
     let bind = |carrier: &mut SoftCarrier| bind_issued_root(carrier, &root);
+    let report = probe(ProbeImage {
+        name,
+        elf: PRODUCTION,
+        programs: [&[], &[]],
+        initial_extent_bytes: None,
+        fixture_image: false,
+        user_elf: Some(elf),
+        ipc,
+        bind: Some(&bind),
+    });
+    assert!(report.admitted, "[{name}] initial MM not admitted");
+    report
+}
+
+#[test]
+fn production_ring_image_boots_to_first_carrier_exit_on_soft_cpu() {
     let reports = [
         (
-            false,
+            Expected::UserFetchFault,
             probe(ProbeImage {
                 name: "production, stopped boot",
                 elf: PRODUCTION,
@@ -63,22 +108,18 @@ fn production_ring_image_boots_to_first_carrier_exit_on_soft_cpu() {
             }),
         ),
         // The initial MM is admitted through the shared `load_guest_mm`, as
-        // the KVM witnesses admit one through `run_pool_fixture`.
+        // the KVM witnesses admit one through `run_pool_fixture`; its
+        // `exit_group` reaches the carrier as root work.
         (
-            false,
-            probe(ProbeImage {
-                name: "production, admitted exit_group(7) ELF",
-                elf: PRODUCTION,
-                programs: [&[], &[]],
-                initial_extent_bytes: None,
-                fixture_image: false,
-                user_elf: Some(&exit_seven),
-                ipc,
-                bind: Some(&bind),
-            }),
+            Expected::Out(WORK_PORT),
+            admitted_row(
+                "production, admitted exit_group(7) ELF",
+                &static_elf(EXIT_SEVEN),
+            ),
         ),
+        // The fixture ring forwards its CPL3 `exit_group` to the host.
         (
-            false,
+            Expected::Out(FORWARD_PORT),
             probe(ProbeImage {
                 name: "fixture, exit_group(7) syscall",
                 elf: FIXTURE,
@@ -93,11 +134,22 @@ fn production_ring_image_boots_to_first_carrier_exit_on_soft_cpu() {
     ];
     let failed: Vec<_> = reports
         .iter()
-        .filter(|(fatal, report)| {
-            !reached_host_exit(report, *fatal)
-                || (report.image.contains("admitted") && !report.admitted)
-        })
-        .map(|(_, report)| format!("[{}] {}", report.image, report.summary))
+        .filter_map(|(expected, report)| check(report, *expected).err())
         .collect();
     assert!(failed.is_empty(), "soft boot probe:\n{}", failed.join("\n"));
+}
+
+/// Mutation witness for the per-row expectation: an admitted root that
+/// faults at CPL3 (`ud2`) reaches a complete CPL3 fault-doorbell record,
+/// which the old shared predicate accepted for every row. Row 2 expects
+/// `WORK_PORT` and must refuse it.
+#[test]
+fn a_user_fault_does_not_pass_for_the_admitted_root_work_exit() {
+    let report = admitted_row("production, admitted ud2 ELF", &static_elf(&[0x0f, 0x0b]));
+    assert!(
+        matches!(&report.outcome, BootExit::FaultDoorbell(record) if record.cs & 3 == 3),
+        "the mutation must reach a CPL3 fault record: {}",
+        report.summary
+    );
+    assert!(check(&report, Expected::Out(WORK_PORT)).is_err());
 }
