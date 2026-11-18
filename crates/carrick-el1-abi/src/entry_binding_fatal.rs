@@ -189,6 +189,7 @@ pub enum EntryBindingFatalReason {
     NativeServiceQuarantinedForkAbortScrub = 171,
     NativeServiceQuarantinedForkAbortLoan = 172,
     NativeServiceQuarantinedForkSettleCustody = 173,
+    NativeServiceQuarantinedNoticePublishDuplicate = 174,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -355,6 +356,7 @@ impl EntryBindingFatalReason {
             171 => Some(Self::NativeServiceQuarantinedForkAbortScrub),
             172 => Some(Self::NativeServiceQuarantinedForkAbortLoan),
             173 => Some(Self::NativeServiceQuarantinedForkSettleCustody),
+            174 => Some(Self::NativeServiceQuarantinedNoticePublishDuplicate),
 
             _ => None,
         }
@@ -678,7 +680,7 @@ mod tests {
 
     #[test]
     fn fatal_detail_round_trip_and_formatter() {
-        for raw in (1..=48).chain(60..=173) {
+        for raw in (1..=48).chain(60..=174) {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
             for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
                 let detail = EntryBindingFatalDetail {
@@ -697,8 +699,8 @@ mod tests {
             "reason=MissingNativeFrame at=1646:9"
         );
         assert_eq!(
-            format!("{}", FatalDetail(Some(174), Some(0))),
-            "reason=unknown(0xae) at=0:0"
+            format!("{}", FatalDetail(Some(175), Some(0))),
+            "reason=unknown(0xaf) at=0:0"
         );
         assert_eq!(
             format!("{}", FatalDetail(None, None)),

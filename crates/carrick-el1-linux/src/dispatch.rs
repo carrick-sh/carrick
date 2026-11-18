@@ -3025,6 +3025,9 @@ fn native_service_fatal_reason(
             Quarantine::OwnerWaitPublishBusy => Fatal::NativeServiceQuarantinedOwnerWaitPublishBusy,
             Quarantine::ServicePublishBusy => Fatal::NativeServiceQuarantinedServicePublishBusy,
             Quarantine::NoticePublishBusy => Fatal::NativeServiceQuarantinedNoticePublishBusy,
+            Quarantine::NoticePublishDuplicate => {
+                Fatal::NativeServiceQuarantinedNoticePublishDuplicate
+            }
             Quarantine::NoticeAbortBusy => Fatal::NativeServiceQuarantinedNoticeAbortBusy,
             Quarantine::NoticeConsumeBusy => Fatal::NativeServiceQuarantinedNoticeConsumeBusy,
             Quarantine::ParkCancelBusy => Fatal::NativeServiceQuarantinedParkCancelBusy,
@@ -7140,6 +7143,10 @@ mod tests {
             (
                 Quarantine::HandoffReceipt,
                 Fatal::NativeServiceQuarantinedHandoffReceipt,
+            ),
+            (
+                Quarantine::NoticePublishDuplicate,
+                Fatal::NativeServiceQuarantinedNoticePublishDuplicate,
             ),
         ] {
             let invariant = native_service_invariant(Error::ServiceQuarantined(reason));

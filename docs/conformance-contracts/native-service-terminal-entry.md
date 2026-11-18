@@ -45,11 +45,28 @@ pretending that yielding can repair them. The member-row binding
 zero notices and claims when an executing member incorrectly retains a
 suspended signal row.
 
-The notice is per execution lane, not per process: `native_service_idle`
-returns `Action::Idle` directly to the host. Both the loaded and idle paths in
-`vcpu_loop::executor::backend` take the lane's native service notice before
-another guest entry. An occupied notice at publication therefore cannot be a
-sibling's legitimate outstanding work.
+The notice is per execution lane (`CurrentTask.service_notice`), not per
+process. While `native_service_idle` returns `Action::Idle` directly to the
+host, `NativeProcessEntry::resume_checkpoint` can park a resumed `host_owned`
+member in `begin_return_work` (publishing its `ServiceSelector` into the slot's
+`service_notice` and returning `NativeResume::Left(None)`) while
+`Sched::run_ready` immediately switches in another runnable member on that same
+vCPU slot before host `take_worker_native_service` drains `service_notice`.
+When that switched-in peer enters an unserved crossing (such as a 4 KiB
+teardown `mmap` SVC) or owes IRQ/served `CarrierWork`, `service_notice` holds
+another live record's unconsumed selector. That cross-member collision is
+contention ("not now"), never a broken invariant: `publish_or_observe` observes
+the live holder with zero stores (`Held(holder)`), keeps the caller's already
+published `PendingService`, enrols on `ObjectWaitKey::native_service(holder.record)`,
+probes once under that queue lock, releases execution capacity, and reruns
+notice publication when woken. A `service_notice` word that already names the
+publisher's own `RecordId` remains broken duplicate lane custody and fails
+closed with `NativeServiceQuarantine::NoticePublishDuplicate`
+(`EntryBindingFatalReason::NativeServiceQuarantinedNoticePublishDuplicate`).
+All other 14 `service_protocol_error` sites operate on the per-member
+`ServiceCell` under exclusive executing-member ownership or under
+`ObjectWaitKey::native_service(self.record)` exclusion and remain true
+protocol invariants.
 
 Claim, cancellation, completion and owner-wait transitions serialize on the
 same native-service queue. A cell CAS refusal under that exclusion is likewise
