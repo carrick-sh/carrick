@@ -251,22 +251,15 @@ fn stock_class(refusal: carrick_el1_abi::ForkStockRefusal) -> NativeForkClass {
 }
 
 /// End the run on a fork refusal that broke a kernel invariant
-/// ([`NativeForkClass::InvariantViolation`]): never a guest errno. The fatal
-/// record names the refusal's stage and cause.
+/// ([`NativeForkClass::InvariantViolation`]): never a guest errno. The
+/// diagnostic names the refusal's stage and cause; the fatal carries the
+/// typed reason `NativeForkInvariant` through the entry-completion sink.
 #[track_caller]
 pub fn invariant_violated(refusal: NativeForkRefusal) -> ! {
-    #[cfg(target_os = "none")]
-    {
-        emit(format_args!("{refusal:?}; class=InvariantViolation"));
-        super::dispatch::invalid_completion(super::dispatch::NativeInvariant::NativeService(
-            carrick_el1_abi::EntryBindingFatalReason::NativeForkInvariant,
-        ))
-    }
-    #[cfg(not(target_os = "none"))]
-    carrick_fatal::carrick_fatal!(
-        "el1::native_fork",
-        "fork refusal broke a kernel invariant: {refusal:?}"
-    )
+    emit(format_args!("{refusal:?}; class=InvariantViolation"));
+    super::dispatch::invalid_completion(super::dispatch::NativeInvariant::NativeService(
+        carrick_el1_abi::EntryBindingFatalReason::NativeForkInvariant,
+    ))
 }
 
 /// Allocate a fork's exact-size scratch, on every ISA's fork venue. The loan
