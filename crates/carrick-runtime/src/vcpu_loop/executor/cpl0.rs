@@ -1,6 +1,5 @@
 //! KVM task binding onto the shared executor submission authority.
 use std::collections::BTreeMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -9,13 +8,14 @@ use std::sync::mpsc;
 #[cfg(test)]
 mod host_fd_binding_tests {
     use super::*;
+    use carrick_x86_cpl0_host::host_readiness::BoundReadiness;
     use std::os::fd::AsRawFd;
 
     #[test]
     fn live_unbound_host_fd_cannot_be_named_by_cpl0() {
         let file = std::fs::File::open("/dev/null").unwrap();
         let fd = carrick_el1_abi::HostBoundFd::new(file.as_raw_fd()).unwrap();
-        let bindings = BoundHostFds::from_readiness([
+        let bindings = bind_stdio_readiness([
             Some(StdioReadiness::Host(fd)),
             Some(StdioReadiness::AlwaysWritable),
             Some(StdioReadiness::AlwaysWritable),
@@ -73,8 +73,12 @@ use carrick_x86::arch_context::X86ArchContext;
 use carrick_x86_cpl0_host::carrier_cpu::{CarrierCpuIo, CarrierRunExit};
 use carrick_x86_cpl0_host::carrier_memory::CarrierMemoryIo;
 use carrick_x86_cpl0_host::cpl0_boot::{
-    ForwardVenue, GuestExitStatus, InitialSyscallDisposition, KernelStackSnapshot,
-    ProductionCpuFactory, ProductionCpuLease, ProductionForwardFrame,
+    GuestExitStatus, InitialSyscallDisposition, KernelStackSnapshot, ProductionCpuFactory,
+    ProductionCpuLease, ProductionForwardFrame,
+};
+use carrick_x86_cpl0_host::host_readiness::{
+    BoundHostFds, HostReadinessRequest, HostReadinessStep, ReadinessCrossing, ReadinessWait,
+    StdioBinding, sample_host_readiness,
 };
 
 pub(crate) struct Cpl0PersistentExecutorFactory<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
@@ -138,54 +142,15 @@ impl Cpl0RootBinding {
     }
 }
 
-enum BoundReadiness {
-    Host(OwnedFd),
-    AlwaysWritable,
-    Invalid,
-}
-
-/// Host-owned descriptor authority for the current CPL0 stdio bindings.
-/// A guest-supplied raw host number is never admitted by this table.
-struct BoundHostFds {
-    stdio: [BoundReadiness; 3],
-}
-
-impl BoundHostFds {
-    fn from_readiness(readiness: [Option<StdioReadiness>; 3]) -> Result<Self, TrapError> {
-        let [stdin, stdout, stderr] = readiness;
-        Ok(Self {
-            stdio: [Self::bind(stdin)?, Self::bind(stdout)?, Self::bind(stderr)?],
+/// The run dispatcher's stdio readiness, bound through the shared carrier
+/// readiness authority.
+fn bind_stdio_readiness(readiness: [Option<StdioReadiness>; 3]) -> Result<BoundHostFds, TrapError> {
+    BoundHostFds::from_stdio(readiness.map(|readiness| {
+        readiness.map(|readiness| match readiness {
+            StdioReadiness::AlwaysWritable => StdioBinding::AlwaysWritable,
+            StdioReadiness::Host(fd) => StdioBinding::Host(fd),
         })
-    }
-
-    fn bind(readiness: Option<StdioReadiness>) -> Result<BoundReadiness, TrapError> {
-        match readiness {
-            Some(StdioReadiness::AlwaysWritable) => Ok(BoundReadiness::AlwaysWritable),
-            None => Ok(BoundReadiness::Invalid),
-            Some(StdioReadiness::Host(fd)) => {
-                // The host dispatcher, rather than CPL0, supplied this fd.
-                // Duplicate it now so close/reuse of the source number cannot
-                // redirect a later poll or reactor registration.
-                let owned = unsafe { libc::fcntl(fd.raw(), libc::F_DUPFD_CLOEXEC, 0) };
-                if owned < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::EBADF) {
-                        return Ok(BoundReadiness::Invalid);
-                    }
-                    return Err(TrapError::Hypervisor(format!(
-                        "bind stdio readiness descriptor: {error}"
-                    )));
-                }
-                // SAFETY: F_DUPFD_CLOEXEC returned a fresh owned host fd.
-                Ok(BoundReadiness::Host(unsafe { OwnedFd::from_raw_fd(owned) }))
-            }
-        }
-    }
-
-    fn resolve(&self, binding: carrick_el1_abi::HostObjectBinding) -> Option<&BoundReadiness> {
-        let index = usize::try_from(binding.stdio_fd()?).ok()?;
-        self.stdio.get(index)
-    }
+    }))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -342,7 +307,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutorFactory<M, Mem
                 .dispatcher
                 .lock()
                 .map_err(|_| TrapError::Hypervisor("CPL0 dispatcher poisoned".into()))?;
-            Arc::new(BoundHostFds::from_readiness([
+            Arc::new(bind_stdio_readiness([
                 dispatcher.stdio_readiness(0),
                 dispatcher.stdio_readiness(1),
                 dispatcher.stdio_readiness(2),
@@ -449,14 +414,6 @@ struct RetainedForward {
 }
 
 #[derive(Clone, Copy)]
-struct HostReadinessRequest {
-    address: u64,
-    count: usize,
-    deadline: Option<std::time::Instant>,
-    sig_mask: carrick_abi::WaitSigMask,
-}
-
-#[derive(Clone, Copy)]
 enum ForwardRequest {
     Syscall(SyscallRequest),
     HostReadiness(HostReadinessRequest),
@@ -478,11 +435,6 @@ impl From<ForwardRequest> for carrick_kernel::kernel::continuation::BlockedConti
             ForwardRequest::HostReadiness(_) => Self::HostReadiness,
         }
     }
-}
-
-enum HostReadinessStep {
-    Ready(i64),
-    Wait(Vec<(carrick_el1_abi::HostBoundFd, carrick_abi::PollEvents)>),
 }
 
 enum ForwardDecision {
@@ -560,78 +512,13 @@ impl std::fmt::Display for ForwardAuthorityRefusal {
 }
 
 impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
-    fn sample_host_readiness(
-        venue: &mut ForwardVenue<'_, M, Mem>,
-        request: HostReadinessRequest,
-        bound_host_fds: &BoundHostFds,
-    ) -> Result<HostReadinessStep, TrapError> {
-        venue.with_host_readiness_entries(request.address, request.count, |entries| {
-            let mut pollfds: Vec<libc::pollfd> = entries
-                .iter()
-                .map(|entry| {
-                    let bound = bound_host_fds.resolve(entry.binding).ok_or_else(|| {
-                        TrapError::Hypervisor("unbound CPL0 host readiness descriptor".into())
-                    })?;
-                    Ok(libc::pollfd {
-                        fd: match bound {
-                            BoundReadiness::Host(fd) => fd.as_raw_fd(),
-                            BoundReadiness::AlwaysWritable | BoundReadiness::Invalid => -1,
-                        },
-                        events: entry.events,
-                        revents: 0,
-                    })
-                })
-                .collect::<Result<Vec<_>, TrapError>>()?;
-            let result =
-                unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 0) };
-            if result < 0 {
-                return Err(TrapError::Hypervisor(format!(
-                    "host readiness probe: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            let mut ready = 0i64;
-            for (entry, pollfd) in entries.iter_mut().zip(&pollfds) {
-                entry.revents = match bound_host_fds.resolve(entry.binding) {
-                    Some(BoundReadiness::AlwaysWritable) => entry.events & libc::POLLOUT,
-                    Some(BoundReadiness::Invalid) => libc::POLLNVAL,
-                    Some(BoundReadiness::Host(_)) => pollfd.revents,
-                    None => {
-                        return Err(TrapError::Hypervisor(
-                            "host readiness binding disappeared".into(),
-                        ));
-                    }
-                };
-                ready += i64::from(entry.revents != 0);
-            }
-            if ready > 0 {
-                Ok(HostReadinessStep::Ready(ready))
-            } else {
-                Ok(HostReadinessStep::Wait(
-                    pollfds
-                        .into_iter()
-                        .filter(|fd| fd.fd >= 0)
-                        .filter_map(|fd| {
-                            carrick_el1_abi::HostBoundFd::new(fd.fd).map(|host_fd| {
-                                (host_fd, carrick_abi::PollEvents::from_bits(fd.events))
-                            })
-                        })
-                        .collect(),
-                ))
-            }
-        })?
-    }
-
     fn host_readiness_wait(
         request: HostReadinessRequest,
         fds: Vec<(carrick_el1_abi::HostBoundFd, carrick_abi::PollEvents)>,
     ) -> Option<DispatchOutcome> {
-        let timeout = request
-            .deadline
-            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
-        if timeout.is_some_and(|timeout| timeout.is_zero()) {
+        let ReadinessWait::Until(timeout) = request.wait(std::time::Instant::now()) else {
             return None;
-        }
+        };
         Some(DispatchOutcome::WaitOnFds {
             fds: WaitFds::host_readiness(fds),
             timeout,
@@ -847,43 +734,20 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     "invalid host object write binding".into(),
                 ));
             }
-            if frame.rax == carrick_el1_abi::HostReadinessCrossing::NUMBER
-                && carrick_el1_abi::HostReadinessCrossing::is_crossing(frame.rcx)
-            {
-                let sig_mask = match frame.r8 {
-                    carrick_el1_abi::HostReadinessCrossing::MASK_NONE => {
-                        carrick_abi::WaitSigMask::NONE
-                    }
-                    carrick_el1_abi::HostReadinessCrossing::MASK_REPLACE => {
-                        carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(frame.r10))
-                    }
-                    _ => {
+            if let Some(readiness) =
+                match ReadinessCrossing::decode(frame, std::time::Instant::now)? {
+                    ReadinessCrossing::Other => None,
+                    ReadinessCrossing::Refused(errno) => {
                         return Ok(ForwardDecision::Immediate(
-                            InitialSyscallDisposition::Refused(carrick_abi::LINUX_EINVAL),
+                            InitialSyscallDisposition::Refused(errno),
                         ));
                     }
-                };
-                let count = usize::try_from(frame.rsi)
-                    .map_err(|_| TrapError::Hypervisor("host readiness count overflow".into()))?;
-                let Some(timeout) = carrick_el1_abi::HostReadinessTimeout::from_wire(frame.rdx)
-                else {
-                    return Ok(ForwardDecision::Immediate(
-                        InitialSyscallDisposition::Refused(carrick_abi::LINUX_EINVAL),
-                    ));
-                };
-                let timeout_ms = timeout.millis();
-                let deadline = (timeout_ms >= 0).then(|| {
-                    std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64)
-                });
-                let readiness = HostReadinessRequest {
-                    address: frame.rdi,
-                    count,
-                    deadline,
-                    sig_mask,
-                };
+                    ReadinessCrossing::Request(readiness) => Some(readiness),
+                }
+            {
                 self.stats
                     .record(crate::prepare::InitialForwardClass::Host("readiness"))?;
-                return match Self::sample_host_readiness(venue, readiness, &self.bound_host_fds)? {
+                return match sample_host_readiness(venue, &readiness, &self.bound_host_fds)? {
                     HostReadinessStep::Ready(value) => Ok(ForwardDecision::Immediate(
                         InitialSyscallDisposition::Return(value),
                     )),
@@ -1157,11 +1021,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     match folded {
                         Some(outcome) => Ok(outcome),
                         None if let ForwardRequest::HostReadiness(readiness) = retained.request => {
-                            match Self::sample_host_readiness(
-                                venue,
-                                readiness,
-                                &self.bound_host_fds,
-                            )? {
+                            match sample_host_readiness(venue, &readiness, &self.bound_host_fds)? {
                                 HostReadinessStep::Ready(value) => {
                                     Ok(DispatchOutcome::Returned { value })
                                 }

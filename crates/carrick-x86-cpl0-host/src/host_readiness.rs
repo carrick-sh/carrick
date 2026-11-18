@@ -48,8 +48,8 @@ pub enum ReadinessCrossing {
 }
 
 impl ReadinessCrossing {
-    /// Decode `frame`, timing a finite timeout from `now`.
-    pub fn decode(frame: &NativeFrame, now: Instant) -> Result<Self, TrapError> {
+    /// Decode `frame`, reading the clock only for a valid, finite timeout.
+    pub fn decode(frame: &NativeFrame, now: impl FnOnce() -> Instant) -> Result<Self, TrapError> {
         if frame.rax != HostReadinessCrossing::NUMBER
             || !HostReadinessCrossing::is_crossing(frame.rcx)
         {
@@ -70,7 +70,7 @@ impl ReadinessCrossing {
         let timeout_ms = timeout.millis();
         let deadline = u64::try_from(timeout_ms)
             .ok()
-            .map(|millis| now + Duration::from_millis(millis));
+            .map(|millis| now() + Duration::from_millis(millis));
         Ok(Self::Request(HostReadinessRequest {
             address: frame.rdi,
             count,
@@ -275,25 +275,26 @@ mod tests {
     #[test]
     fn decode_routes_only_tagged_crossings_and_refuses_malformed_ones() {
         let now = Instant::now();
+        let no_clock = || panic!("no timeout clock needed");
         let untagged = NativeFrame {
             rcx: 0x40_1000,
             ..frame(HostReadinessCrossing::MASK_NONE, 0)
         };
         assert_eq!(
-            ReadinessCrossing::decode(&untagged, now).unwrap(),
+            ReadinessCrossing::decode(&untagged, no_clock).unwrap(),
             ReadinessCrossing::Other
         );
         assert_eq!(
-            ReadinessCrossing::decode(&frame(7, 0), now).unwrap(),
+            ReadinessCrossing::decode(&frame(7, 0), no_clock).unwrap(),
             ReadinessCrossing::Refused(carrick_abi::LINUX_EINVAL)
         );
         assert_eq!(
-            ReadinessCrossing::decode(&frame(HostReadinessCrossing::MASK_NONE, 1 << 40), now)
+            ReadinessCrossing::decode(&frame(HostReadinessCrossing::MASK_NONE, 1 << 40), no_clock)
                 .unwrap(),
             ReadinessCrossing::Refused(carrick_abi::LINUX_EINVAL)
         );
         let ReadinessCrossing::Request(request) =
-            ReadinessCrossing::decode(&frame(HostReadinessCrossing::MASK_REPLACE, 250), now)
+            ReadinessCrossing::decode(&frame(HostReadinessCrossing::MASK_REPLACE, 250), || now)
                 .unwrap()
         else {
             panic!("tagged crossing")
@@ -313,7 +314,7 @@ mod tests {
         );
         let ReadinessCrossing::Request(forever) = ReadinessCrossing::decode(
             &frame(HostReadinessCrossing::MASK_NONE, (-1i64) as u64),
-            now,
+            no_clock,
         )
         .unwrap() else {
             panic!("tagged crossing")
