@@ -5927,3 +5927,27 @@ fn high_byte_register_memory_operands_survive_the_r14_rebase() {
     // CMPXCHG matched AL: its ZF survives the stand-in's MOVs.
     assert_ne!(cpu.context().rflags & (1 << 6), 0);
 }
+
+/// #671 M1-2: an executor worker thread owns a production carrier CPU, so a
+/// stopped soft CPU moves to another host thread and runs a block there.
+/// Red before `SoftCpuContext: Send`: the move does not compile.
+#[test]
+fn stopped_soft_cpu_moves_to_another_host_thread_and_runs() {
+    // mov eax, 39 (getpid); syscall
+    let (cpu, mem, code_va) = setup_snippet(&[0xb8, 39, 0, 0, 0, 0x0f, 0x05]);
+    let (cpu, exit) = std::thread::spawn(move || {
+        let (mut cpu, mut mem) = (cpu, mem);
+        let exit = cpu.step_block(&mut mem).unwrap();
+        (cpu, exit)
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        exit,
+        SoftCpuExit::Syscall {
+            rip: code_va + 5,
+            next_rip: code_va + 7,
+        }
+    );
+    assert_eq!(cpu.context().gpr[reg::RAX], LINUX_SYS_GETPID);
+}
