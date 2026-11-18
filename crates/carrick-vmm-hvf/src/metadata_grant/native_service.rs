@@ -866,7 +866,11 @@ impl NativeService {
         let mut offered = false;
         let delivery = self.ticket.publish_prepared((), |()| {
             let entry = prepared.take().ok_or(())?;
-            if !reply.submit(window, &txn) {
+            if !reply.submit_with_trace(
+                window,
+                &txn,
+                carrick_hal::diagnostic_capture::trace_grant_refusals(),
+            ) {
                 prepared = Some(entry);
                 return Err(());
             }
@@ -1809,7 +1813,7 @@ pub(super) fn settle_native_descriptor_reply(
         }) {
             let entry = &mut ledger.entries[index];
             let txn = *entry.grant.transaction();
-            let Some(receipt) = reply.inspect_receipt(window, &txn) else {
+            let Some((receipt, trace)) = reply.inspect_receipt_with_trace(window, &txn) else {
                 // Terminal cancellation may skip applying a delivered reply.
                 // Only confirmed withdrawal proves no descriptor was claimed;
                 // unknown visibility keeps the complete grant in this ledger.
@@ -1824,7 +1828,7 @@ pub(super) fn settle_native_descriptor_reply(
             // settle validates the full transaction digest and refuses unknown
             // visibility. Keep the row through physical/table settlement and
             // reply acknowledgment; no bare generation can retire its grant.
-            entry.grant.settle(&receipt)?;
+            entry.grant.settle(&receipt, trace)?;
             if reply.take_receipt(window, &txn) != Some(receipt) {
                 return Err(stale());
             }
@@ -1991,6 +1995,7 @@ mod intake_tests {
         fn settle(
             &mut self,
             _: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+            _: Option<carrick_mmu_core::live_descriptor_words::GrantRefusalTrace>,
         ) -> Result<bool, TrapError> {
             panic!("unclaimed or unknown descriptor cannot manufacture a receipt")
         }
