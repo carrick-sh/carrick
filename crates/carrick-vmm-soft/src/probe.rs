@@ -199,7 +199,7 @@ pub fn boot_probe(
                     Some(SoftStop::Unsupported(exit)) => BootExit::Unsupported(exit),
                     Some(SoftStop::TripleFault(exception)) => BootExit::TripleFault(exception),
                     Some(SoftStop::StepBudget { rip }) => BootExit::StepBudget { rip },
-                    None => BootExit::StepBudget {
+                    Some(SoftStop::Kicked) | None => BootExit::StepBudget {
                         rip: carrier.machine().context().rip,
                     },
                     Some(SoftStop::Emit { va, detail }) => BootExit::Emit { va, detail },

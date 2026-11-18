@@ -8,18 +8,25 @@
 //! [`carrick_x86_cpl0_host::cpl0_boot::BootCpuState`] and
 //! `BootstrapCustody`, and admits the initial guest MM through the shared
 //! [`carrick_x86_cpl0_host::cpl0_boot::load_guest_mm`]. [`boot_probe`]
-//! reports how far a ring image gets. It is not yet a `CarrierCpuBackend`
-//! and is not wired to the runtime; see
+//! reports how far a ring image gets. [`SoftCarrier::into_worker_parts`]
+//! hands its CPUs, as [`SoftCpuBackend`]s behind the shared
+//! `CarrierCpuBackend` seam, to the shared production worker custody. It is
+//! not wired to the runtime; see
 //! `docs/design/soft-x86-cpl0-bringup.md` ("Follow-up soft slice").
 
 #![cfg(target_arch = "x86_64")]
 
+pub mod backend;
 pub mod carrier;
 pub mod cpu;
 pub mod memory;
 pub mod probe;
 
-pub use carrier::{SoftBootImage, SoftCarrier, SoftRunTrace, SoftStop};
-pub use cpu::{SoftBootVcpu, apply_boot_cpu_state};
+pub use backend::{SoftCpuBackend, SoftKick, SoftRunContext, SoftWatchdog};
+pub use carrier::{
+    SoftBootImage, SoftCarrier, SoftCpuIo, SoftRunTrace, SoftRunner, SoftStop, SoftWorkerParts,
+    soft_cpuid,
+};
+pub use cpu::{SoftBootVcpu, SoftCpuView, apply_boot_cpu_state};
 pub use memory::{SoftCarrierMemory, SoftVm};
 pub use probe::{BootExit, BootReport, ProbeBind, ProbeImage, boot_probe};

@@ -1300,8 +1300,10 @@ dependencies = [
 name = "carrick-vmm-soft"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "carrick-el1-abi",
  "carrick-guest-arch",
+ "carrick-guest-mem",
  "carrick-hal",
  "carrick-kernel",
  "carrick-mem",
