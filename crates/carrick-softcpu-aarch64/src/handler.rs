@@ -263,7 +263,7 @@ pub fn execute(
                 take_exception(cpu, Exception::Alignment { access, address });
                 Outcome::Continue
             }
-            Err(MemoryAccessError::Abort(fault)) => match mmu::abort(fault) {
+            Err(MemoryAccessError::Abort(fault)) => match mmu::fault_exception(fault) {
                 Some(exception) => {
                     take_exception(cpu, exception);
                     Outcome::Continue

@@ -156,7 +156,7 @@ pub fn run<X: ExecuteBlock>(
         // fault as the first word of the next block.
         match fetch(cpu, memory, cpu.pc) {
             Ok(_) => {}
-            Err(Some(Stage1Error::Abort(fault))) => match mmu::abort(fault) {
+            Err(Some(Stage1Error::Abort(fault))) => match mmu::fault_exception(fault) {
                 Some(exception) => {
                     // A taken abort spends one budget step, so a vector that
                     // itself faults cannot spin without bound.
