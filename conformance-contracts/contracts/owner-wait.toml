@@ -2,7 +2,8 @@
 # owed grant request's own (ObjectWaitKey::metadata_request), not an MM
 # resource's: a fork whose scratch missed while that grant is in flight parks
 # there and reruns once. Fork refusals carry a NativeForkClass; a broken
-# invariant ends the run (EntryBindingFatalReason::NativeForkInvariant).
+# invariant ends the run (EntryBindingFatalReason::NativeForkInvariant), and a
+# parent snapshot another thread moved before prepare or publish reruns.
 # #2306: errno and run-failure conversion moves to NativeFailure; owner
 # contention (NativeContention) parks, retains its syscall or yields at the
 # owner checkpoint. Witnesses are bound below; this contract's settlement,
@@ -179,6 +180,8 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::fork_refusal_class::serial_host::{fork_invariant_refusal_ends_the_run_x86,fork_invariant_refusal_ends_the_run_aarch64} (#2441: production fork entry on both ISA contexts; a Census refusal of ForkError::Core ends the run through the fatal sink instead of answering -14; red at 8e6a20037)",
   "carrick-el1-linux::native_process_runtime::host_test_support::{forks_owed_a_metadata_grant_park_on_it_then_rerun_once,forks_owed_a_metadata_grant_park_on_it_then_rerun_once_on_arm} (#2441: production fork entry on both ISA contexts; three children, more than the one slot, fork while grant request g is in flight; each parks on ObjectWaitKey::metadata_request(g) as an owner wait, owes the carrier no work, holds no execution capacity and does not rerun while g is pending; g's completion under its queue lock wakes all three and each reruns its clone exactly once; red at fc0d58140, which published CarrierWork)",
   "carrick-el1-linux::native_process_runtime::host_test_support::{fork_owed_an_answered_grant_reruns_at_once,fork_owed_an_answered_grant_reruns_at_once_on_arm,cancelling_a_fork_waiting_for_a_metadata_grant_wakes_it,cancelling_a_fork_waiting_for_a_metadata_grant_wakes_it_on_arm} (#2441: the probe under the grant queue's lock reruns at once when the grant is answered or its queue moved on; a terminal cancellation finds the grant wait on its request's queue, Stale without that branch)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::contention_not_now::{fork_superseded_snapshot_reruns_then_forks_x86,fork_superseded_snapshot_reruns_then_forks_aarch64} (#2441: production fork entry on both ISA contexts; MmError::Stale at the Prepare or Publish stage, where another live thread of the parent moved the snapshot the census took, keeps the syscall, publishes no child and forks on the rerun; red at 53d0352ac, which ended the run with NativeForkInvariant)",
+  "carrick-el1-linux::native_fork_refusal::tests::fork_stale_snapshot_is_not_now_only_where_revalidated (#2441: MmError::Stale is not now only at the stages that re-check the parent snapshot; every other stage, and every other Stale cause, stays an invariant violation)",
   "carrick-el1::alloc::tests::miss_is_owed_its_grant_only_while_the_grant_is_in_flight (#2441: a heap miss is owed its exact grant request only while that request is requested, served or unadmitted; the request is pending only until answered; a denied grant or no mailbox owes nothing)",
   "carrick-runtime::vcpu_loop::binding::tests::terminal_core_capture_parks_on_another_holder_then_publishes (#1733: a Busy core capture enrols through the retained-memory wait path (a physical dependency here), blocks with nothing queued, wakes once on release and reruns; red when the enrolment is skipped)",
 ]
