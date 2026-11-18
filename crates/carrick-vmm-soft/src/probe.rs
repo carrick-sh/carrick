@@ -10,7 +10,9 @@ use carrick_softcpu_x86::{
     EmitError, GuestCpuidView, SoftAccessKind, SoftMachine, SoftMachineExit, X86Exception,
     read_guest_bytes,
 };
-use carrick_x86::cpl0_entry::{DIRECT_VA, FAULT_DOORBELL_PORT, PublishedApicId, PublishedApicIds};
+use carrick_x86::cpl0_entry::{
+    DIRECT_VA, FATAL_PORT, FAULT_DOORBELL_PORT, PublishedApicId, PublishedApicIds,
+};
 use carrick_x86::{FaultDoorbellRecord, X86_FAULT_RECORD_U32_WORDS};
 use carrick_x86_cpl0_host::cpl0_boot::{
     BootCpuState, LAYOUT, META_GPA, ROUTES_OFFSET, fail, prepare_boot,
@@ -71,6 +73,8 @@ pub struct BootReport {
     pub decoded: Option<String>,
     /// Exception deliveries observed (`interrupted rip -> stub rip`).
     pub deliveries: Vec<(u64, u64)>,
+    /// `RAX` at a `FATAL_PORT` exit: the ring's fatal payload.
+    pub fatal_payload: Option<u64>,
     pub exit: BootExit,
     pub summary: String,
 }
@@ -117,6 +121,7 @@ pub fn boot_probe(
         bytes: Vec::new(),
         decoded: None,
         deliveries: Vec::new(),
+        fatal_payload: None,
         exit: BootExit::Setup(String::new()),
         summary: String::new(),
     };
@@ -170,6 +175,12 @@ pub fn boot_probe(
                         Err(error) => BootExit::Setup(error.to_string()),
                     };
                 }
+            }
+            SoftMachineExit::IoOut {
+                port: FATAL_PORT, ..
+            } => {
+                report.fatal_payload = Some(machine.context().gpr[carrick_softcpu_x86::reg::RAX]);
+                break BootExit::HostExit(exit);
             }
             SoftMachineExit::IoOut { .. }
             | SoftMachineExit::IoIn { .. }
@@ -283,6 +294,12 @@ fn summarize(report: &BootReport) -> String {
         report.blocks
     );
     match &report.exit {
+        BootExit::HostExit(SoftMachineExit::IoOut {
+            port: FATAL_PORT, ..
+        }) => format!(
+            "boots to ring fatal exit (FATAL_PORT, rax {:#x}) at {at}",
+            report.fatal_payload.unwrap_or_default()
+        ),
         BootExit::HostExit(SoftMachineExit::IoOut {
             port, size, value, ..
         }) => format!(
