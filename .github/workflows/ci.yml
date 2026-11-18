@@ -2612,6 +2612,82 @@ jobs:
         if: ${{ always() }}
         run: just ci-cache-finish
 
+  # aarch64 soft CPU dev loop (#1236): native copy-through blocks execute
+  # only on an arm64 host. Small and crate-scoped so every push gets arm64
+  # feedback, drafts included. Advisory: not in ci-ok's needs until the soft
+  # lane has a known-answer history.
+  soft-aarch64-native:
+    name: soft aarch64 · copy-through engine (Linux ARM64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-tools
+        with:
+          tools: just,sccache
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
+      - name: Configure persisted compiler cache
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-arm64 read-only
+      - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-arm64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-arm64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-arm64-
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
+      - name: Soft aarch64 unit and native execution witnesses
+        run: |
+          set -u
+          mkdir -p soft-aarch64-logs
+          status=0
+          cargo test -p carrick-softcpu-aarch64 \
+            > soft-aarch64-logs/unit.log 2>&1 || status=$?
+          cat soft-aarch64-logs/unit.log
+          exit "$status"
+      - name: Production EL1 image boot probe
+        if: ${{ !cancelled() }}
+        run: |
+          set -u
+          status=0
+          cargo build -p carrick-el1-image > soft-aarch64-logs/el1-build.log 2>&1 || status=$?
+          cat soft-aarch64-logs/el1-build.log
+          [ "$status" -eq 0 ] || exit "$status"
+          elf=$(find target/debug/build -path '*carrick-el1-image-*/out/el1-target/aarch64-unknown-none-softfloat/el1-image/carrick-el1' -type f -print -quit)
+          [ -n "$elf" ] || { echo "production EL1 ELF not found" >&2; exit 1; }
+          CARRICK_A64_ELF="$PWD/$elf" cargo test -p carrick-softcpu-aarch64 \
+            -- --ignored --nocapture > soft-aarch64-logs/probe.log 2>&1 || status=$?
+          cat soft-aarch64-logs/probe.log
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: soft-aarch64-logs
+          path: soft-aarch64-logs
+          retention-days: 7
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just ci-cache-finish
+
   # Single ruleset check. Only a successful docs-only PR filter permits skips;
   # a failed/cancelled filter or an unexpectedly skipped dependency is red.
   ci-ok:
