@@ -91,6 +91,15 @@ impl Sctlr {
     pub fn epan(self) -> bool {
         self.0 & (1 << 57) != 0
     }
+
+    pub(crate) fn traps_el0_wait(self, wait: crate::exception::WaitInstruction) -> bool {
+        use crate::exception::WaitInstruction;
+        let bit = match wait {
+            WaitInstruction::Wfi => 16, // nTWI
+            WaitInstruction::Wfe => 18, // nTWE
+        };
+        self.0 & (1 << bit) == 0
+    }
 }
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct El1Registers {
