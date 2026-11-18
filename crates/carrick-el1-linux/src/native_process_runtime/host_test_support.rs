@@ -9769,7 +9769,9 @@ fn native_service_exit_missing_unowned_receipt_remains_an_invariant() {
         .unwrap();
     assert!(matches!(
         entry.settle_service_exit(Ok(NativeResume::Left(None)), NativeServiceExit::Bridge),
-        Err(NativeProcessError::Quarantined)
+        Err(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::HandoffAuthentication
+        ))
     ));
     assert!(matches!(
         entry.settle_service_exit(Err(NativeProcessError::Busy), NativeServiceExit::Bridge),
