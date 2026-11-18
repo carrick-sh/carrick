@@ -563,11 +563,15 @@ impl ExecuteBlock for TracingRunner {
         frame: &mut BlockFrame,
     ) -> Result<usize, HostError> {
         let start = block.guest().start().0;
-        if start < LINUX_EL0_TRAMPOLINE_BASE
-            && let Some(mut svc) = self.pending_svc.take()
-        {
-            svc.ret = Some(frame.slots[0] as i64);
-            self.syscalls.push(svc);
+        if start < LINUX_EL0_TRAMPOLINE_BASE {
+            if let Some(mut svc) = self.pending_svc.take() {
+                svc.ret = Some(frame.slots[0] as i64);
+                self.syscalls.push(svc);
+            } else if let Some(last) = self.syscalls.last_mut()
+                && last.ret.is_none()
+            {
+                last.ret = Some(frame.slots[0] as i64);
+            }
         }
         let exit_idx = self.inner.execute(block, frame)?;
         if start < LINUX_EL0_TRAMPOLINE_BASE {
