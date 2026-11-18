@@ -343,3 +343,31 @@ fn production_ring_runs_musl_hello_to_exit_on_soft_cpu() {
     assert_eq!(run.stdout, b"hello, x86_64 world\n", "{}", run.summary());
     assert_eq!(run.exit, Some(0), "{}", run.summary());
 }
+
+#[test]
+#[ignore = "M1-6 fork root admission frontier; requires the separately assembled fork fixture"]
+fn production_ring_forked_child_writes_and_is_reaped() {
+    let elf = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/soft-lifecycle/fork"
+    ))
+    .expect("static fork fixture");
+    let run = run_hello(&elf);
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert_eq!(run.stdout, b"E", "{}", run.summary());
+    assert_eq!(run.exit, Some(7), "{}", run.summary());
+}
+
+#[test]
+#[ignore = "M1-6 thread lifecycle frontier; requires the separately assembled TWO_LIVE fixture"]
+fn production_ring_non_last_threads_raw_exit() {
+    let elf = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/soft-lifecycle/raw-exit"
+    ))
+    .expect("static raw-exit fixture");
+    let run = run_hello(&elf);
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert!(run.stdout.is_empty(), "{}", run.summary());
+    assert_eq!(run.exit, Some(0), "{}", run.summary());
+}

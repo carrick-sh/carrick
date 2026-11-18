@@ -396,3 +396,54 @@ The fixture-independent anonymous-page test exhausted the unchanged
 prints `hello\n` and exits 0. The separately built musl hello completes
 its startup poll, takes four owner grants, prints
 `hello, x86_64 world\n` and exits 0 through the production soft ring.
+
+### M1-6 status: fork and raw thread exit
+
+The musl hello stays opt-in. Its source and lockfile are in-tree and the
+standalone fixture builds offline with an installed musl Rust target. The
+shared CPL0 build recipe invokes Cargo for the freestanding image and its
+test-support sibling. Embedding the musl user ELF would add a separate build
+invocation and artifact copy to that recipe or the soft build script. That
+build authority is outside this round's scope.
+
+Two existing static assembly fixtures exercise the production soft ring.
+The fork fixture makes the parent wait for its child, which writes `E` and
+exits before the parent reaps it and exits 7. The `TWO_LIVE` fixture holds a
+sibling live while another worker performs raw `exit`, joins both via their
+clear-child-tid words, and exits 0. Direct Linux execution produced both
+expected results. These are diagnostic fixtures for the existing
+`kernel.el1.fork-cow` and `kernel.el1.thread-lifecycle` surfaces.
+
+From the repository root, build the local fixtures and run either diagnostic
+by name:
+
+```sh
+mkdir -p target/soft-lifecycle
+cc -nostdlib -static -no-pie -Wl,--build-id=none \
+  crates/carrick-cli/tests/fixtures/x86_forked_child_stdout.S \
+  -o target/soft-lifecycle/fork
+cc -nostdlib -static -no-pie -Wl,--build-id=none -DTWO_LIVE \
+  crates/carrick-vmm-kvm/tests/fixtures/native_robust_raw_exit.S \
+  -o target/soft-lifecycle/raw-exit
+cargo test --locked -p carrick-vmm-soft --test soft_hello -- \
+  production_ring_forked_child_writes_and_is_reaped --ignored --exact
+cargo test --locked -p carrick-vmm-soft --test soft_hello -- \
+  production_ring_non_last_threads_raw_exit --ignored --exact
+```
+
+- Fork boots through initial MM admission, root load, the root-fork seed
+  doorbell (`0xd9`) and three fork-stock doorbells (`0xd2`). It fails on the
+  first walk after `mov cr3` selects `0x480b000`, before child stdout. GDB
+  observed `ExtentTable::expected_generation` return `None` for that root.
+  The ring page fault escalates to a triple fault because exception delivery
+  also needs the newly selected root. A stopped backing refresh carries
+  placement only. The existing fork-stock owner must also publish the exact
+  authorized root before guest re-entry, and revoke it when retired. Reading
+  that authority requires a shared custody seam beyond the existing backing
+  iterator.
+- Raw thread exit boots through initial MM admission, root load and two owner
+  grants (`0xd1`). GDB observed the first `clone` and then 23 consecutive
+  timer interrupts (`0xe0`) at the same user return RIP (`0x4010f9`). The
+  guest interval exceeds the watchdog deadline before worker exit or
+  clear-child-tid completion. The fix must preserve guest clock and IRQ
+  semantics while allowing the queued thread to run.
