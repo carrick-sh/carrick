@@ -2513,6 +2513,7 @@ fn terminal_close_with_retained_service_entry_for<
 /// after this member's earlier service was cancelled but before its owner
 /// checkpoint consumed that wait. Closing is authoritative: the new entry
 /// settles the retained service and retires instead of becoming an invariant.
+#[cfg(test)]
 #[test]
 fn arm_terminal_close_with_retained_service_accepts_mmap_entry() {
     terminal_close_with_retained_service_entry_for::<
@@ -2527,6 +2528,7 @@ fn arm_terminal_close_with_retained_service_accepts_mmap_entry() {
     );
 }
 
+#[cfg(test)]
 #[test]
 fn x86_terminal_close_with_retained_service_accepts_mmap_entry() {
     terminal_close_with_retained_service_entry_for::<
@@ -2544,6 +2546,7 @@ fn x86_terminal_close_with_retained_service_accepts_mmap_entry() {
 /// #2532 run A: the same terminal interleaving can arrive from an IRQ as
 /// CarrierWork. Its exception continuation owns the exact retained record;
 /// terminal settlement must not publish a second service or return to EL0.
+#[cfg(test)]
 #[test]
 fn arm_terminal_close_with_retained_service_accepts_irq_carrier_work() {
     terminal_close_with_retained_service_entry_for::<
@@ -2559,6 +2562,7 @@ fn arm_terminal_close_with_retained_service_accepts_irq_carrier_work() {
     );
 }
 
+#[cfg(test)]
 #[test]
 fn x86_terminal_close_with_retained_service_accepts_irq_carrier_work() {
     terminal_close_with_retained_service_entry_for::<
