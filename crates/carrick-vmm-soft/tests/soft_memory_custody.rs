@@ -37,15 +37,9 @@ fn boot() -> SoftCarrier {
 /// The slot-0 fixture program, read through the soft CPU's translation.
 fn program_bytes(carrier: &mut SoftCarrier) -> [u8; EXIT_SEVEN.len()] {
     let mut bytes = [0; EXIT_SEVEN.len()];
-    let (cpu, memory) = carrier.machine_mut().parts_mut();
-    carrick_softcpu_x86::read_guest_bytes(
-        cpu.context_mut(),
-        memory,
-        USER_CODE,
-        &mut bytes,
-        carrick_softcpu_x86::SoftAccessKind::Read,
-    )
-    .expect("program bytes translate");
+    carrier
+        .read_guest_bytes(USER_CODE, &mut bytes)
+        .expect("program bytes translate");
     bytes
 }
 
