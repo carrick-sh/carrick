@@ -391,6 +391,20 @@ fn el0_waits_trap_under_their_own_sctlr_control() {
 }
 
 #[test]
+fn wfe_consumes_a_pending_local_event_before_checking_the_trap() {
+    for (word, hint) in [(0xd503209f, Hint::Sev), (0xd50320bf, Hint::Sevl)] {
+        let mut r = Rig::el0();
+        assert_eq!(r.run(word), Outcome::Event(Event::Hint(hint)));
+        assert_eq!(r.run(0xd503205f), Outcome::Continue); // WFE consumes the event
+        assert_eq!(r.pc(), PC + 8);
+        assert_eq!(r.run(0xd503205f), Outcome::Continue); // WFE traps
+        assert_eq!(r.pc(), VBAR + 0x400);
+        assert_eq!(r.cpu.el1.elr, ProgramCounter(PC + 8));
+        assert_eq!(r.cpu.el1.esr, Syndrome(0x07e0_0001));
+    }
+}
+
+#[test]
 fn higher_el_tlbi_and_at_are_undefined_at_el1() {
     for word in [
         0xd50c_871f, // tlbi alle2

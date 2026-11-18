@@ -186,6 +186,8 @@ pub fn take_exception(cpu: &mut CpuState, exception: Exception) -> ExceptionOutc
     if !matches!(exception, Exception::Irq | Exception::Fiq) {
         cpu.el1.esr = syndrome(exception, origin.el);
     }
+    // D1.10.5 leaves FAR unknown for other reported exceptions.
+    // Keeping the prior value is this profile's deterministic choice.
     cpu.el1.far = match exception {
         Exception::Abort { address, .. } | Exception::Alignment { address, .. } => address,
         Exception::PcAlignment => VirtualAddress(cpu.pc.0),
@@ -219,6 +221,8 @@ pub fn eret(cpu: &mut CpuState) -> Result<(), ReturnError> {
         cpu.pstate.pan = cpu.el1.spsr.0 & (1 << 22) != 0;
         cpu.pstate.daif = InterruptMasks(((cpu.el1.spsr.0 >> 6) & 15) as u8);
     }
+    // AArch64.ExceptionReturn performs SendEventLocal even on an illegal return.
+    cpu.signal_local_event();
     cpu.pc = cpu.el1.elr;
     Ok(())
 }

@@ -205,6 +205,14 @@ pub fn execute(
             Outcome::Continue
         }
         Instruction::Hint(h) => {
+            // Hint_WFE consumes a pending event before testing for a trap.
+            if h == Hint::Wfe && cpu.consume_local_event() {
+                next(cpu);
+                return Outcome::Continue;
+            }
+            if matches!(h, Hint::Sev | Hint::Sevl) {
+                cpu.signal_local_event();
+            }
             let wait = match h {
                 Hint::Wfi => Some(WaitInstruction::Wfi),
                 Hint::Wfe => Some(WaitInstruction::Wfe),

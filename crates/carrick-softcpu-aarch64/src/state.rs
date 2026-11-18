@@ -117,6 +117,7 @@ pub struct El1Registers {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CpuState {
     x: [RegisterValue; 31],
+    local_event: bool,
     pub sp_el0: StackPointer,
     pub sp_el1: StackPointer,
     pub pc: ProgramCounter,
@@ -130,6 +131,14 @@ pub struct SystemAccessException {
     pub syndrome: Syndrome,
 }
 impl CpuState {
+    pub(crate) fn signal_local_event(&mut self) {
+        self.local_event = true;
+    }
+
+    pub(crate) fn consume_local_event(&mut self) -> bool {
+        core::mem::take(&mut self.local_event)
+    }
+
     pub fn sp(&self) -> StackPointer {
         if self.pstate.el == ExceptionLevel::El0 || self.pstate.sp == StackSelect::El0 {
             self.sp_el0
