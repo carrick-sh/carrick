@@ -55,7 +55,7 @@ std::thread_local! {
 }
 
 /// Physical fork preparations this thread ran.
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn prepare_mm_calls() -> usize {
     PREPARE_MM_CALLS.with(std::cell::Cell::get)
 }
