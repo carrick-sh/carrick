@@ -19,7 +19,9 @@ use carrick_el1_abi::{
 };
 use carrick_el1_linux::mm_portal::production::GuestMetadataPin;
 use carrick_el1_linux::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
-use carrick_el1_linux::native_fork_refusal::{NativeForkStage, busy, fork_scratch, refused};
+use carrick_el1_linux::native_fork_refusal::{
+    NativeForkStage, busy, fork_scratch, refused, stock_refused,
+};
 use carrick_el1_linux::native_process_runtime::{
     ExecSuccessorSlot, NativeExecSuccessor, NativeFailure, NativeForkPreparation,
     NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
@@ -478,7 +480,7 @@ impl Service {
                 // itself failed: the parent may still link a loaned page, so
                 // the loan stays pending rather than be scrubbed or reused.
                 if matches!(e, carrick_core::mm::transaction::MmError::Core) {
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(refused(NativeForkStage::Publish, e));
                 }
                 return Err(abandon_loan(
                     &loan,
@@ -506,19 +508,14 @@ impl Service {
         }
         match reserve.take(loan) {
             Some(Ok(())) => {}
-            Some(Err(carrick_el1_abi::ForkStockRefusal::Capacity)) => {
-                return Err(abort_published(&mut child, NativeProcessError::Exhausted));
+            Some(Err(reply)) => {
+                let refusal = stock_refused(NativeForkStage::Reserve, Some(reply));
+                return Err(abort_published(&mut child, refusal));
             }
-            Some(Err(carrick_el1_abi::ForkStockRefusal::Inventory)) => {
-                return Err(abort_published(&mut child, NativeProcessError::Busy));
+            None => {
+                let refusal = stock_refused(NativeForkStage::Reserve, None);
+                return Err(abort_published(&mut child, refusal));
             }
-            Some(Err(carrick_el1_abi::ForkStockRefusal::Stale)) => {
-                return Err(abort_published(&mut child, NativeProcessError::Stale));
-            }
-            Some(Err(carrick_el1_abi::ForkStockRefusal::Invalid)) => {
-                return Err(abort_published(&mut child, NativeProcessError::Invalid));
-            }
-            None => return Err(abort_published(&mut child, NativeProcessError::Quarantined)),
         }
         let address = AddressContext {
             mm: child_mm,
@@ -956,10 +953,13 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 core::arch::asm!("out dx, eax", in("dx") FORK_STOCK_PORT, in("rax") &raw mut exchange, options(nostack));
             }
         }
-        let loan = exchange
-            .take(request)
-            .ok_or(NativeProcessError::Stale)?
-            .map_err(|_| NativeProcessError::Exhausted)?;
+        let loan = match exchange.take(request) {
+            Some(Ok(loan)) => loan,
+            Some(Err(reply)) => {
+                return Err(stock_refused(NativeForkStage::StockCrossing, Some(reply)));
+            }
+            None => return Err(stock_refused(NativeForkStage::StockCrossing, None)),
+        };
         // The carrier never loans a record a live MM uses (the parent's is
         // charged to it), so this refusal is a carrier custody fault. It is
         // the one post-crossing error that keeps the loan: an abort would
