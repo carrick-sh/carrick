@@ -309,3 +309,67 @@ Still open:
   change at run time (the musl hello's frontier);
 - soft-walk admission of roots other than the CPU's current CR3;
 - runtime selection (`--vcpu soft`).
+
+### M1-4 status: one build recipe, and the run-time slot refresh design
+
+**Build recipe.** The nested `cargo build -p carrick-x86-cpl0` recipe
+moved out of `carrick-vmm-kvm/build.rs` into `carrick-vmm-kvm/cpl0_build.rs`,
+beside `cpl0_inputs.rs`. Both build scripts `#[path]`-include it and call
+`build_images`. The only parameter is whether `CARRICK_X86_CPL0_TEST_IMAGE`
+is published (KVM yes, soft no). Each build script still reads its own
+cargo environment and passes `std::fs::copy` in. The authority-debt census
+refuses an authority site in a file two build programs compile ("ambiguous
+compilation-target owner"), so the shared file holds none. The same rule
+already refuses `cpl0_inputs.rs`'s `std::fs` sites under `--base` (see the
+PR evidence).
+
+**Run-time slots (the musl hello frontier).** Owner grants
+(`service_anonymous_grant`, via `CarrierMemory::prepare` -> `install`) add
+carrier slots while the CPU is stopped at `OWNER_GRANT_PORT`. `SoftVm`
+records each registration, but `SoftCarrierMemory` placed and
+authenticated only the slots it saw at construction. The refresh reuses
+existing mechanisms and adds none:
+
+1. **Retained backings.** The view may place only memory it retains
+   (`SoftBackings::retains`, the M1-3 custody fix). A granted slot's
+   `Arc<BackingExtent>` lives only in `CarrierMemory`'s private `Slot`
+   table. The additive read-only accessor
+   `CarrierMemory::retained_backings() -> impl Iterator<Item = &Arc<BackingExtent>>`
+   must yield `slot.backing.extent` for every installed slot, bootstrap
+   windows included (their extents retain the `GuestRam`). It must not
+   expose `Slot`, handles or identities. This needs the director's ruling on
+   `carrier_memory.rs`.
+2. **Who feeds it.** The view's `SoftBackings` becomes a shared handle
+   (`Arc<Mutex<..>>`) held by every soft view of the carrier (slot 0 and
+   the peer). After any crossing the custody serves under `with_stopped_io`
+   (owner grant, fork stock, child retire), the soft driver (the
+   `soft_hello` driver now, the runtime's soft executor later) copies the
+   accessor's `Arc`s into that handle. Missing that step fails closed: the
+   refresh refuses an unretained registration rather than placing it.
+3. **Refresh point.** `SoftCpuBackend::run_guest` already calls
+   `admit_current_root` before each run. It first calls a new
+   `SoftCarrierMemory::refresh(&SoftVm)`, which compares the view's placed
+   `CarrierMemoryRegion`s with `SoftVm`'s, keyed by slot. For each new
+   region it checks `retains`, rebuilds the `LinearPlacement` from the full
+   segment list (`LinearPlacement::with_segments`; `SoftVm`'s slot limit is
+   `MAX_PLACEMENT_SEGMENTS`, so it never overflows), and authenticates the
+   extent with `ExtentTable::install(ExtentRecord::new(.., BOOT_GENERATION))`.
+   That is the walker's existing extent authentication, as at boot. A
+   removed or changed slot fails closed for now. Its retirement path is
+   `ExtentTable::remove` with a `SoftRequester` and the seat's
+   `PendingRetirement`/`reclaim`, and that is a later slice (fork-child
+   retirement needs it).
+4. **Flush.** After a refresh that changed anything, the backend calls
+   `SoftCpu::flush_tlb` (the `mov cr3`-style local flush). Old segments keep
+   their host addresses, so cached translations stay valid. The flush is
+   there because the placement object itself was replaced. Additions need no
+   code-page work: `ExtentTable` marks code pages per frame, and no frame of
+   a new extent can have a translated block. Removals clear their span's
+   code pages inside `ExtentTable::remove`.
+
+`soft_hello.rs::production_ring_runs_musl_hello_to_exit_on_soft_cpu`
+(now `#[ignore]`d) becomes the red-first
+witness on the production run path: today it fails at the fault loop, and
+it must pass once the accessor lands. No soft-side code lands before the
+ruling, because a refresh with no production caller would be an unused
+second path.
