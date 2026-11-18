@@ -1,7 +1,6 @@
 //! Level 0 `SoftCpu` execution engine and executable code-buffer management.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::ptr::NonNull;
 
 use carrick_softmmu::{ExtentTable, InventoryTerminal, SoftRequester, SoftSeatError};
 use iced_x86::{Instruction, Mnemonic};
@@ -23,23 +22,7 @@ use crate::msr::EFER_SCE;
 use crate::privileged::{PrivilegedOutcome, emulate_sensitive_op};
 
 #[cfg(test)]
-thread_local! {
-    pub(crate) static JIT_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(crate) static FAIL_SMALL_JIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn inject_small_jit_failure(capacity: usize, publish: bool) -> bool {
-    capacity == 4096
-        && FAIL_SMALL_JIT.with(|fault| {
-            if fault.get() == Some(publish) {
-                fault.set(None);
-                true
-            } else {
-                false
-            }
-        })
-}
+pub(crate) use carrick_host_jit::{FAIL_SMALL_JIT, JIT_ALLOCATIONS};
 
 const DEFAULT_JIT_CAPACITY: usize = 256 * 1024;
 
@@ -70,99 +53,7 @@ pub enum SoftCpuExit {
     },
 }
 
-/// Host executable scratch buffer for translated blocks (never maps guest VAs).
-pub struct JitCodeBuffer {
-    ptr: NonNull<u8>,
-    capacity: usize,
-    cursor: usize,
-    executable: bool,
-}
-
-// SAFETY: `JitCodeBuffer` owns a private `mmap` allocation not shared across threads without sync.
-unsafe impl Send for JitCodeBuffer {}
-
-impl JitCodeBuffer {
-    /// Allocate a host executable scratch buffer of `capacity` bytes.
-    pub fn new(capacity: usize) -> Option<Self> {
-        let cap = capacity.max(4096).checked_add(4095)? & !4095;
-        #[cfg(test)]
-        {
-            JIT_ALLOCATIONS.with(|count| count.set(count.get() + 1));
-            if inject_small_jit_failure(cap, false) {
-                return None;
-            }
-        }
-        let prot = libc::PROT_READ | libc::PROT_WRITE;
-        let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
-        // SAFETY: anonymous private host allocation for translated block bytes only.
-        let raw = unsafe { libc::mmap(std::ptr::null_mut(), cap, prot, flags, -1, 0) };
-        if raw == libc::MAP_FAILED {
-            return None;
-        }
-        Some(Self {
-            ptr: NonNull::new(raw.cast::<u8>())?,
-            capacity: cap,
-            cursor: 0,
-            executable: false,
-        })
-    }
-
-    /// Publish under W^X, returning an RX address only after mprotect succeeds.
-    /// The owner must ensure no previously published code is executing while
-    /// this exclusive publication changes the mapping back to RW.
-    pub fn publish(&mut self, bytes: &[u8]) -> Option<u64> {
-        #[cfg(test)]
-        if inject_small_jit_failure(self.capacity, true) {
-            return None;
-        }
-        if bytes.is_empty() || bytes.len() > self.capacity {
-            return None;
-        }
-        if self.executable {
-            // SAFETY: the exclusive owner holds the entire live mmap allocation.
-            if unsafe {
-                libc::mprotect(
-                    self.ptr.as_ptr().cast(),
-                    self.capacity,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                )
-            } != 0
-            {
-                return None;
-            }
-            self.executable = false;
-        }
-        if self.cursor.checked_add(bytes.len())? > self.capacity {
-            self.cursor = 0;
-        }
-        // SAFETY: `self.cursor + bytes.len() <= self.capacity`.
-        let dst = unsafe { self.ptr.as_ptr().add(self.cursor) };
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
-        self.cursor += (bytes.len() + 15) & !15;
-        // SAFETY: publication is complete and no mutable pointer escapes this owner.
-        if unsafe {
-            libc::mprotect(
-                self.ptr.as_ptr().cast(),
-                self.capacity,
-                libc::PROT_READ | libc::PROT_EXEC,
-            )
-        } != 0
-        {
-            return None;
-        }
-        self.executable = true;
-        Some(dst as u64)
-    }
-}
-
-impl Drop for JitCodeBuffer {
-    fn drop(&mut self) {
-        // SAFETY: `self.ptr` and `self.capacity` came from `libc::mmap` in `Self::new`.
-        unsafe {
-            let _ = libc::munmap(self.ptr.as_ptr().cast(), self.capacity);
-        }
-    }
-}
+pub use carrick_host_jit::JitCodeBuffer;
 
 const TRANSLATION_CACHE_CAPACITY: usize = 1024;
 type BlockKey = (u64, (usize, usize, bool));

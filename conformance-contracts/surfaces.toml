@@ -581,6 +581,8 @@ surfaces = [
   { path = "crates/carrick-host-bsd/src/futex.rs", contract = "kernel.futex.requeue" },
   { path = "crates/carrick-host-bsd/src/multiplexer.rs", contract = "kernel.inotify.watch" },
   { path = "crates/carrick-host-bsd/src/signal_backend.rs", contract = "kernel.el1.signal-delivery-owner" },
+  # Host executable memory for soft CPU blocks (moved from carrick-softcpu-x86, #1236); host-internal, no guest-visible behaviour.
+  { path = "crates/carrick-host-jit/src/lib.rs", contracts = [] },
   { path = "crates/carrick-host/src/host_mapping.rs", contract = "process.exec.backing" },
   { path = "crates/carrick-kernel-example/src/personality.rs", contracts = [] },
   { path = "crates/carrick-kernel-example/tests/host_wait_cancellation.rs", contract = "kernel.scheduler.host-wait-handoff" },
