@@ -108,6 +108,12 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
         &mut self.mem
     }
 
+    /// Borrow the CPU and its memory together, e.g. for a stopped
+    /// [`crate::read_guest_bytes`] through the CPU's translation state.
+    pub fn parts_mut(&mut self) -> (&mut SoftCpu, &mut M) {
+        (&mut self.cpu, &mut self.mem)
+    }
+
     #[must_use]
     pub fn context(&self) -> &SoftCpuContext {
         self.cpu.context()

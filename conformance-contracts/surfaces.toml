@@ -1464,6 +1464,8 @@ surfaces = [
   # Pure soft-x86 boot bring-up probe (#671), not wired to the runtime; no guest-visible behaviour yet.
   { path = "crates/carrick-vmm-soft/build.rs", contracts = [] },
   # Pure soft-x86 boot bring-up probe (#671), not wired to the runtime; no guest-visible behaviour yet.
+  { path = "crates/carrick-vmm-soft/src/carrier.rs", contracts = [] },
+  # Pure soft-x86 boot bring-up probe (#671), not wired to the runtime; no guest-visible behaviour yet.
   { path = "crates/carrick-vmm-soft/src/cpu.rs", contracts = [] },
   # Pure soft-x86 boot bring-up probe (#671), not wired to the runtime; no guest-visible behaviour yet.
   { path = "crates/carrick-vmm-soft/src/lib.rs", contracts = [] },
