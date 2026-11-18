@@ -215,6 +215,88 @@ fn terminal_close_with_signal_wait_irq_for<
     assert!(sibling.task.service_notice.take().unwrap().is_none());
 }
 
+/// A CarrierWork selector is only a demand to settle work already owed by
+/// this execution lane. Another executor may consume that work after the
+/// selector is captured but before its ticket is served. The carrier then
+/// refuses the empty demand; the exact saved continuation must resume rather
+/// than turning ordinary completion contention into an invariant.
+fn refused_carrier_work_resumes_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    owner_entry: OwnerEntry,
+) {
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let task = fixture.task;
+    let zone = fixture.zone;
+    let record = fixture.record;
+    let control = fixture.control;
+    on_service_doorbell(Some(Box::new(move || {
+        let notice = task.service_notice.take().unwrap().unwrap();
+        let key = carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap();
+        let queue = zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+        // SAFETY: the fixture retains this exact member and its service queue.
+        let ticket = unsafe {
+            ServiceCell::claim_notice(
+                &control.service,
+                notice,
+                NonZeroU64::MIN,
+                zone.record(record.id).identity(),
+            )
+        }
+        .unwrap();
+        assert!(matches!(
+            ticket.request().operation,
+            ServiceOperation::CarrierWork { entry, .. } if entry == owner_entry
+        ));
+        // The selected work was consumed by another executor before this
+        // physical intake. Refusal is the production transport answer.
+        assert!(ticket.complete(false).is_ok());
+        drop(queue);
+        false
+    })));
+
+    let mut service = fixture.service();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &(fixture.make_words)(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    let result = entry.begin_service(
+        ServiceOperation::CarrierWork {
+            entry: owner_entry,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
+        },
+        None,
+    );
+    let phase = entry.native_service_phase();
+    let settled = entry.settle_service_exit(result, NativeServiceExit::CarrierWork);
+    let resumed = crate::dispatch::native_service_completion(settled, phase)
+        .unwrap_or_else(|fatal| panic!("refused completed CarrierWork became {fatal:?}"));
+    on_service_doorbell(None);
+    assert!(matches!(
+        resumed,
+        NativeResume::Returned(result) if result.raw() == 0
+    ));
+}
+
 /// #2532 run B: a real SVC entry for mmap may race a sibling's terminal close
 /// after this member's earlier service was cancelled but before its owner
 /// checkpoint consumed that wait. Closing is authoritative: the new entry
@@ -297,4 +379,41 @@ fn x86_terminal_close_with_signal_wait_accepts_irq_carrier_work() {
         ParkedContextWords,
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
     >(words);
+}
+
+/// #2532 run B: the captured mmap SVC may be the saved syscall frame for
+/// ServedWithWork rather than an mmap crossing. A refusal after another
+/// executor drains that work resumes the completed mmap result.
+#[test]
+fn arm_refused_carrier_work_resumes_completed_syscall() {
+    refused_carrier_work_resumes_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, OwnerEntry::Syscall);
+}
+
+#[test]
+fn x86_refused_carrier_work_resumes_completed_syscall() {
+    refused_carrier_work_resumes_for::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        words,
+        OwnerEntry::Syscall,
+    );
+}
+
+/// #2532 runs A and round 2: an IRQ frame captures the same empty
+/// CarrierWork demand with an exception continuation.
+#[test]
+fn arm_refused_carrier_work_resumes_irq_continuation() {
+    refused_carrier_work_resumes_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, OwnerEntry::Exception);
+}
+
+#[test]
+fn x86_refused_carrier_work_resumes_irq_continuation() {
+    refused_carrier_work_resumes_for::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        words,
+        OwnerEntry::Exception,
+    );
 }

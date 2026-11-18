@@ -358,14 +358,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn native_service_doorbell(&mut self) -> bool {
         #[cfg(test)]
         {
-            ENTROPY_DOORBELL.with(|hook| {
-                if let Some(hook) = hook.borrow_mut().as_mut() {
-                    hook();
-                    true
-                } else {
-                    false
-                }
-            })
+            ENTROPY_DOORBELL.with(|hook| hook.borrow_mut().as_mut().is_some_and(|hook| hook()))
         }
         #[cfg(not(test))]
         {
@@ -11431,13 +11424,13 @@ fn entropy_service_preparation_busy_retries_before_generation() {
 #[cfg(test)]
 std::thread_local! {
     static ENTROPY_PREPARE_BUSY_ONCE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
-    static ENTROPY_DOORBELL: core::cell::RefCell<Option<Box<dyn FnMut()>>> = const { core::cell::RefCell::new(None) };
+    static ENTROPY_DOORBELL: core::cell::RefCell<Option<Box<dyn FnMut() -> bool>>> = const { core::cell::RefCell::new(None) };
 }
 
 /// Answer the Physical carrier's native-service doorbell with `hook`, or
 /// restore the unanswered doorbell with `None`.
 #[cfg(all(test, not(target_os = "macos")))]
-pub(crate) fn on_service_doorbell(hook: Option<Box<dyn FnMut()>>) {
+pub(crate) fn on_service_doorbell(hook: Option<Box<dyn FnMut() -> bool>>) {
     ENTROPY_DOORBELL.with(|slot| *slot.borrow_mut() = hook);
 }
 
@@ -11513,6 +11506,7 @@ fn entropy_physical_checkpoint(busy: bool) {
                 })
                 .unwrap();
             assert!(ticket.complete(true).is_ok());
+            true
         }))
     });
     take_signal_copies();
