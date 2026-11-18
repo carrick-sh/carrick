@@ -1509,8 +1509,7 @@ surfaces = [
   { path = "crates/carrick-x86-cpl0-host/src/cpl0_private_witness.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-x86-cpl0-host/src/cpl0_return_settlement.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-x86-cpl0-host/src/guest_ram.rs", contract = "kernel.mm.address-space-occupancy" },
-  # Carrier-neutral host readiness crossing service (#671); only the soft carrier's hosted test drives it until the runtime executor delegates to it; no production guest-visible behaviour yet.
-  { path = "crates/carrick-x86-cpl0-host/src/host_readiness.rs", contracts = [] },
+  { path = "crates/carrick-x86-cpl0-host/src/host_readiness.rs", contract = "kernel.signal.temporary-wait-mask" },
   { path = "crates/carrick-x86-cpl0-host/src/lib.rs", contract = "kernel.x86.file-region" },
   { path = "crates/carrick-x86-cpl0/src/anonymous.rs", contract = "kernel.el1.anonymous-munmap" },
   { path = "crates/carrick-x86-cpl0/src/anonymous.rs", contract = "kernel.el1.anonymous-permissions" },

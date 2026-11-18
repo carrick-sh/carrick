@@ -154,7 +154,7 @@ fn drive(elf: &[u8], run: &mut HelloRun) -> Result<(), String> {
                         // Host-bound poll readiness (std's startup probe of
                         // fds 0-2) through the shared carrier service.
                         let now = std::time::Instant::now();
-                        match ReadinessCrossing::decode(frame, now)? {
+                        match ReadinessCrossing::decode(frame, || now)? {
                             ReadinessCrossing::Other => {}
                             ReadinessCrossing::Refused(errno) => {
                                 return Ok(Ok((frame.rax, errno.guest_retval())));
