@@ -464,5 +464,51 @@ The raw-exit fixture reaches the first clone. GDB observed the kick vector
 `test %rax,%rax` immediately after the clone syscall. The APIC latched
 expired deadlines with IF clear inside the CPL0 `arm_tsc_deadline` and
 `prepare_parked_resume` paths. The next return to CPL3 takes the pending
-timer before executing that user instruction. The fixture remains opt-in
-pending a scheduler progress fix.
+timer before executing that user instruction. At M1-7 the fixture was opt-in.
+
+### #2537: the single-vCPU execution clock
+
+The original soft carrier used a host `Instant` for RDTSC and the APIC
+deadline. A timer slice could elapse while the soft CPU translated or
+executed CPL0 resume blocks, or while the host was outside the CPU. On
+re-entry, an already pending vector could take the first interruptible
+boundary after the CPL0 return. The APIC correctly disarmed each expired
+deadline and latched one vector. Scheduling another runnable task then
+armed a new deadline, which could expire before that task resumed.
+
+GDB on the original carrier recorded the following from
+`LocalApic::poll_timer`, `deliver_external_interrupt` and the runner's
+block counter:
+
+| Block | Event | RIP | RFLAGS | TSC / deadline or RAX |
+| ---: | --- | --- | --- | --- |
+| 141305 | Deadline latches `0xe0` in CPL0 | `0xffffffff8000c6a1` | `0x46` | `0xb395e6b6` / `0xb395e37e` |
+| 141415 | Delivers `0xe0` to child | `0x4010f9` | `0x246` | `RAX = 0` |
+| 143383 | Deadline latches `0xe0` in CPL0 | `0xffffffff80157280` | `0x46` | `0xc1b94a18` / `0xc1b91e04` |
+| 143492 | Delivers `0xe0` to parent | `0x4010f9` | `0x246` | `RAX = 0x26de` |
+
+The soft runner now charges 200 TSC ticks per executed block at the
+published 2 GHz rate, including blocks that end in a guest fault or a
+carrier exit. This is 100 ns of virtual time per block. A 2 ms guest slice
+corresponds to 20,000 blocks. Host delays and repeated steps on a parked
+CPU charge zero ticks. An interruptible HLT can jump to a timer event
+that outranks the current APIC priority and can wake that CPU. RDTSC and
+absolute LAPIC deadlines share this virtual clock, including the guest's
+TSC offset. Interrupt delivery follows IF, interrupt shadow and APIC
+priority. The timebase is local to the single-vCPU soft carrier.
+
+The same in-tree `TWO_LIVE` fixture exits 0 on KVM, where hardware executes
+the resume path directly. Intel VMX describes a
+guest-visible offset and optional scaling of the physical TSC. On the
+worker VM, two `KVM_GET_MSRS` reads of `IA32_TSC` after a one-instruction
+guest's HLT exit, with no intervening `KVM_RUN`, observed `0x2b5658e`
+and `0x7bb8bf6` about 20 ms apart.
+[Intel SDM, Vol. 3](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
+
+The active soft fixture assembles the KVM witness's source, verifies both
+non-last raw exits and their clear-child-tid joins, and exits 0 with the
+existing 4,000,000-block ceiling. The before/after GDB trace observed
+24 kick deliveries and zero timer expirations in the passing run. The
+VM-free APIC witness covers virtual TSC accounting at a PIO exit and
+delivery of an armed timer to an interruptible HLT. The existing contract
+is `x86.softcpu.apic-timer`.
