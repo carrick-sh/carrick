@@ -1068,6 +1068,14 @@ name = "carrick-softcpu-aarch64"
 version = "0.1.0"
 
 [[package]]
+name = "carrick-softcpu-aarch64-host"
+version = "0.1.0"
+dependencies = [
+ "carrick-host-jit",
+ "carrick-softcpu-aarch64",
+]
+
+[[package]]
 name = "carrick-softcpu-x86"
 version = "0.1.0"
 dependencies = [
