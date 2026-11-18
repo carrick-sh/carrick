@@ -722,6 +722,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-host-jit"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "carrick-host-linux"
 version = "0.1.0"
 dependencies = [
@@ -1066,6 +1073,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-conformance-contract",
  "carrick-hal",
+ "carrick-host-jit",
  "carrick-softmmu",
  "carrick-x86",
  "goblin",
