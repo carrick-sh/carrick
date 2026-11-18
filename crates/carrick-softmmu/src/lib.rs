@@ -25,6 +25,11 @@
 //!   `ACCESSED`/`DIRTY` updates, `COW` write classification, extent authentication
 //!   `(Stage1Gpa, leaf.size, OwnerGeneration) -> AuthenticatedGpa`, and frame-keyed code-page
 //!   generation bumping).
+//! - [`resolve_leaf`]: the ISA-neutral slow path every binding shares: any [`Stage1Walker`] over
+//!   [`AuthenticatedDescriptorWords`], the MMIO-hole screen, extent authentication of the leaf's
+//!   whole span and [`LinearPlacement::host`]. x86 [`SoftWalker::walk_and_fill`] calls it with
+//!   [`HardwareWalker`]; the AArch64 soft CPU calls it with
+//!   `carrick_mmu_core::aarch64::stage1_walk::Aarch64Walker`.
 
 #![no_std]
 extern crate alloc;
@@ -70,6 +75,7 @@ pub use tlb::{
 };
 pub use walker::{
     AccessOutcome, AuthenticatedDescriptorWords, ExtentCloneError, ExtentEditError, ExtentRecord,
-    ExtentTable, HostWriteError, Reclaimed, ResolvedAccess, ResolvedSpan, RetiredIdentity,
-    Retirement, SoftMmuMemory, SoftWalker, SoftWalkerStats, WalkOutcome,
+    ExtentTable, HostWriteError, LeafResolveError, Reclaimed, ResolvedAccess, ResolvedLeaf,
+    ResolvedSpan, RetiredIdentity, Retirement, SoftMmuMemory, SoftWalker, SoftWalkerStats,
+    WalkOutcome, resolve_leaf,
 };
