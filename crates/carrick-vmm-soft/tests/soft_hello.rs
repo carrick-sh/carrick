@@ -514,3 +514,35 @@ fn production_ring_non_last_threads_raw_exit() {
     assert!(run.stdout.is_empty(), "{}", run.summary());
     assert_eq!(run.exit, Some(0), "{}", run.summary());
 }
+
+#[test]
+fn production_ring_resumes_after_retiring_a_child_slot() {
+    let elf = assemble_static_fixture(
+        "child-entropy",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../carrick-vmm-kvm/tests/fixtures/native_child_entropy.S"
+        ),
+        &[],
+    );
+    let run = run_hello(&elf);
+    let retirement = format!("doorbell {:#x}", carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT);
+    assert!(run.exits.contains(&retirement), "{}", run.summary());
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert!(run.stdout.is_empty(), "{}", run.summary());
+    assert_eq!(run.exit, Some(8), "{}", run.summary());
+}
+
+/// Run a locally built, trusted repository fixture through the same ring
+/// and stopped-worker driver. The corpus runner invokes this independently
+/// for each ELF so a failed assertion or blocked fixture leaves a result.
+#[test]
+#[ignore = "requires CARRICK_SOFT_FIXTURE to name a locally built in-tree ELF"]
+fn production_ring_static_fixture_probe() {
+    let path = std::env::var_os("CARRICK_SOFT_FIXTURE").expect("fixture path");
+    let elf = std::fs::read(&path).expect("read static fixture");
+    let run = run_hello(&elf);
+    println!("[production, {path:?}] {}", run.summary());
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert!(run.exit.is_some(), "{}", run.summary());
+}
