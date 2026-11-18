@@ -233,7 +233,7 @@ mod closure {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ExceptionGeneration {
         pub kind: ExceptionKind,
-        pub immediate: u16,
+        pub immediate: crate::Immediate16,
     }
     fn exception(w: u32) -> Option<Instruction> {
         let kind = match w & 0xffe0001f {
@@ -249,7 +249,7 @@ mod closure {
         };
         Some(Instruction::ExceptionGeneration(ExceptionGeneration {
             kind,
-            immediate: ((w >> 5) & 0xffff) as u16,
+            immediate: crate::Immediate16::new(((w >> 5) & 0xffff) as u16),
         }))
     }
 

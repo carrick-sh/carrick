@@ -338,7 +338,7 @@ fn bounded_exception_immediates() {
                 decode_instruction(w),
                 Instruction::ExceptionGeneration(ExceptionGeneration {
                     kind: kinds[index],
-                    immediate: imm as u16
+                    immediate: Immediate16::new(imm as u16)
                 })
             );
             assert_eq!(decode_instruction(w | 4), Instruction::Unallocated);

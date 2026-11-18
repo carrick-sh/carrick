@@ -1,6 +1,6 @@
 //! Known answers: DDI0487G.a D1 exception entry/return and D13.2 ESR_EL1;
 //! A2's scalar stage-1 examples plus an EL1 instruction permission abort.
-use carrick_softcpu_aarch64::{exception::*, state::*};
+use carrick_softcpu_aarch64::{Immediate16, exception::*, state::*};
 
 #[test]
 fn scalar_abort_known_answers() {
@@ -87,10 +87,7 @@ fn vectors_banking_and_return() {
         (ExceptionLevel::El1, StackSelect::El1, 0x200),
     ] {
         for (event, extra) in [
-            (
-                Exception::Svc(carrick_softcpu_aarch64::Immediate16::new(9)),
-                0,
-            ),
+            (Exception::Svc(Immediate16::new(9)), 0),
             (Exception::Irq, 0x80),
             (Exception::Fiq, 0x100),
             (Exception::SError, 0x180),
@@ -131,12 +128,9 @@ fn hvc_preserves_saved_exception_and_illegal_return_sets_il() {
     cpu.el1.esr = Syndrome(0x9600_000f);
     let saved = cpu.el1.clone();
     assert_eq!(
-        take_exception(
-            &mut cpu,
-            Exception::Hvc(carrick_softcpu_aarch64::Immediate16::new(3))
-        ),
+        take_exception(&mut cpu, Exception::Hvc(Immediate16::new(3))),
         ExceptionOutcome::ProviderExit(ProviderExit {
-            immediate: carrick_softcpu_aarch64::Immediate16::new(3)
+            immediate: Immediate16::new(3)
         })
     );
     assert_eq!(cpu.el1, saved);
@@ -247,7 +241,7 @@ fn system_register_roundtrips_and_access_syndromes() {
 fn system_access_traps_preserve_rt() {
     use carrick_softcpu_aarch64::{Instruction, OperandRegister, decode_instruction};
 
-    // C6.2 MRS: Xt is X17 for the DAIF system register.
+    // C6.2.194 MRS: Xt is X17 for the DAIF system register.
     let Instruction::SystemAccess(mrs) = decode_instruction(0xd53b_4231) else {
         panic!("MRS X17, DAIF");
     };
@@ -301,7 +295,7 @@ fn pan_span_and_saved_status_known_answers() {
             };
             cpu.el1.sctlr = Sctlr((u64::from(span) << 23) | (1 << 57));
             assert!(cpu.el1.sctlr.epan());
-            take_exception(&mut cpu, Exception::Brk(0x1234));
+            take_exception(&mut cpu, Exception::Brk(Immediate16::new(0x1234)));
             assert_eq!(
                 cpu.el1.spsr,
                 SavedPstate(0xa090_0144 | (u64::from(pan) << 22))
@@ -350,10 +344,7 @@ fn generated_vectors_drive_state_transitions() {
             Instruction::ExceptionGeneration(e) if e.kind == ExceptionKind::Hvc => {
                 let saved = cpu.el1.clone();
                 assert!(matches!(
-                    take_exception(
-                        &mut cpu,
-                        Exception::Hvc(carrick_softcpu_aarch64::Immediate16::new(e.immediate))
-                    ),
+                    take_exception(&mut cpu, Exception::Hvc(e.immediate)),
                     ExceptionOutcome::ProviderExit(_)
                 ));
                 assert_eq!(cpu.el1, saved);
@@ -361,10 +352,7 @@ fn generated_vectors_drive_state_transitions() {
             }
             Instruction::ExceptionGeneration(e) if e.kind == ExceptionKind::Svc => {
                 cpu.pstate.el = ExceptionLevel::El0;
-                take_exception(
-                    &mut cpu,
-                    Exception::Svc(carrick_softcpu_aarch64::Immediate16::new(e.immediate)),
-                );
+                take_exception(&mut cpu, Exception::Svc(e.immediate));
                 assert_eq!(cpu.pc, ProgramCounter(0x8400));
                 seen[2] += 1;
             }
@@ -394,10 +382,7 @@ fn hvc_at_el0_is_undefined_and_cannot_exit_provider() {
     let mut cpu = CpuState::default();
     cpu.pc = ProgramCounter(0x1000);
     assert_eq!(
-        take_exception(
-            &mut cpu,
-            Exception::Hvc(carrick_softcpu_aarch64::Immediate16::new(1))
-        ),
+        take_exception(&mut cpu, Exception::Hvc(Immediate16::new(1))),
         ExceptionOutcome::Entered
     );
     assert_eq!(cpu.el1.esr, Syndrome(0x0200_0000));
@@ -436,10 +421,7 @@ fn decoded_svc_enters_real_vector_group_then_decoded_eret_restores() {
         let mut cpu = CpuState::default();
         cpu.pc = ProgramCounter(0x1000);
         cpu.el1.vbar = VirtualAddress(0x8000);
-        take_exception(
-            &mut cpu,
-            Exception::Svc(carrick_softcpu_aarch64::Immediate16::new(e.immediate)),
-        );
+        take_exception(&mut cpu, Exception::Svc(e.immediate));
         assert_eq!(cpu.pc, ProgramCounter(0x8400));
         assert_eq!(cpu.el1.esr, Syndrome(0x5600_0000 | u64::from(immediate)));
         assert_eq!(decode_instruction(0xd69f_03e0), Instruction::Eret);
@@ -465,10 +447,7 @@ fn svc_roundtrip_through_generated_production_vector_table() {
     let Instruction::ExceptionGeneration(svc) = decode_instruction(0xd400_0001) else {
         panic!("SVC")
     };
-    take_exception(
-        &mut cpu,
-        Exception::Svc(carrick_softcpu_aarch64::Immediate16::new(svc.immediate)),
-    );
+    take_exception(&mut cpu, Exception::Svc(svc.immediate));
     let offset = usize::try_from(cpu.pc.0 - cpu.el1.vbar.0).unwrap();
     assert_eq!(offset, 0x400);
     let word = |offset| u32::from_le_bytes(table[offset..offset + 4].try_into().unwrap());
@@ -478,10 +457,7 @@ fn svc_roundtrip_through_generated_production_vector_table() {
     assert_eq!(hvc.kind, ExceptionKind::Hvc);
     let saved = cpu.el1.clone();
     assert!(matches!(
-        take_exception(
-            &mut cpu,
-            Exception::Hvc(carrick_softcpu_aarch64::Immediate16::new(hvc.immediate))
-        ),
+        take_exception(&mut cpu, Exception::Hvc(hvc.immediate)),
         ExceptionOutcome::ProviderExit(_)
     ));
     assert_eq!(cpu.el1, saved);

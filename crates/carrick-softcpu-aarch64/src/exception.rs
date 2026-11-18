@@ -73,7 +73,7 @@ pub enum Exception {
     /// use carrick_softcpu_aarch64::exception::Exception;
     /// let _ = Exception::Brk(1u16);
     /// ```
-    Brk(u16),
+    Brk(crate::Immediate16),
     Unknown,
     SystemAccess(SystemAccessException),
     Irq,
@@ -115,7 +115,7 @@ pub fn syndrome(exception: Exception, origin: ExceptionLevel) -> Syndrome {
     let (ec, iss) = match exception {
         Exception::Svc(i) => (0x15, u64::from(i.value())),
         Exception::Hvc(i) => (0x16, u64::from(i.value())),
-        Exception::Brk(i) => (0x3c, u64::from(i)),
+        Exception::Brk(i) => (0x3c, u64::from(i.value())),
         Exception::SError => (0x2f, 0),
         Exception::Alignment { access, .. } => (
             0x24 + current,
