@@ -969,10 +969,11 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     );
 
     // 3. Diagnostic continuation past SYS_ppoll=0: sanitize_standard_fds
-    // succeeds, and lang_start_internal immediately invokes signal(SIGPIPE,
-    // SIG_IGN) -> rt_sigaction(13, ...) (nr=134), which refuses in-ring (-38)
-    // without shared-carrier Aarch64NativeProcessService custody and forwards
-    // the diagnostic write on stderr (fd=2) via HVC #2.
+    // succeeds without aborting, and lang_start_internal immediately invokes
+    // signal(SIGPIPE, SIG_IGN) -> rt_sigaction(13, ..., 8) (nr=134). With
+    // CurrentTask[0] issued but shared-carrier ZoneTables / SignalTable absent,
+    // dispatch::dispatch forwards Family::Signal(RtSigaction) via HVC #2
+    // (ForwardReason::FamilyFallback) to the host carrier.
     complete_mailbox_syscall(&mut memory, 0);
     let after_ppoll = probe_traced(&mut cpu, &mut memory, &mut runner, 1_000_000);
     let next_state = read_u32(
@@ -987,16 +988,10 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
         &mut memory,
         mb + core::mem::offset_of!(Aarch64SyscallMailbox, native_nr) as u64,
     );
-    let next_fd = read_u64(&mut memory, args_off);
-    let next_buf = read_u64(&mut memory, args_off + 8);
-    let next_len = read_u64(&mut memory, args_off + 16);
-    let mut stderr_msg = vec![0u8; (next_len as usize).min(256)];
-    if next_nr == 64 {
-        let _ = memory.read(VirtualAddress(next_buf), &mut stderr_msg);
-    }
+    let signum = read_u64(&mut memory, args_off);
+    let sigsetsize = read_u64(&mut memory, args_off + 24);
     println!(
-        "musl hello after ppoll=0: {after_ppoll}; mailbox state={next_state} trap_kind={next_trap} nr={next_nr} fd={next_fd} len={next_len} stderr={:?}",
-        String::from_utf8_lossy(&stderr_msg)
+        "musl hello after ppoll=0: {after_ppoll}; mailbox state={next_state} trap_kind={next_trap} nr={next_nr} signum={signum} sigsetsize={sigsetsize}",
     );
     for (idx, sc) in runner.syscalls.iter().skip(2).enumerate() {
         println!(
@@ -1012,16 +1007,25 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
             sc.ret
         );
     }
-    assert_eq!((next_state, next_trap, cpu.el1.esr.0), (1, 1, 0x5600_0000));
     assert!(
+        matches!(
+            after_ppoll.stop,
+            Stop::Event { event: Event::ProviderExit(exit), .. } if exit.immediate.value() == 2
+        ),
+        "{after_ppoll}"
+    );
+    assert_eq!((next_state, next_trap, cpu.el1.esr.0), (1, 1, 0x5600_0000));
+    assert_eq!(
+        (next_nr, signum, sigsetsize),
+        (134, 13, 8),
+        "expected post-ppoll carrier crossing to be SYS_rt_sigaction(SIGPIPE, ..., 8)"
+    );
+    assert_eq!(
         runner
             .syscalls
             .iter()
-            .any(|s| s.nr == 134 && s.args[0] == 13 && s.ret == Some(-38)),
-        "expected rt_sigaction(SIGPIPE) to refuse with -ENOSYS without shared carrier process custody"
-    );
-    assert!(
-        matches!(next_nr, 64 | 66) && next_fd == 2,
-        "expected stderr write/writev after SIGPIPE reset refusal, got nr={next_nr} fd={next_fd}"
+            .map(|s| (s.nr, s.ret))
+            .collect::<Vec<_>>(),
+        vec![(96, Some(-38)), (73, Some(0)), (134, None)]
     );
 }
