@@ -35,7 +35,7 @@ pub enum AccessClass {
 /// Why an access produced no physical address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage1Error {
-    /// The walk faulted: deliver it with [`abort`].
+    /// The walk faulted: deliver it with [`fault_exception`].
     Abort(Aarch64Fault),
     /// SCTLR_EL1.M is set under a TCR_EL1 this profile does not implement.
     Regime(UnsupportedRegime),

@@ -37,10 +37,10 @@ use crate::stage1::{LeafAccess, LeafSpan, Stage1Leaf, Stage1Walker, WalkError};
 const PXN: u64 = 1 << 53;
 /// D5.3.3 contiguous hint, bit 52.
 const CONTIGUOUS: u64 = 1 << 52;
-/// D5.3.3 AttrIndx[2:0], bits 4:2.
+/// D5.3.3 `AttrIndx[2:0]`, bits 4:2.
 const ATTR_INDEX_SHIFT: u32 = 2;
 /// D5.3.3 next-level table attributes (HPD=0): PXNTable 59, UXNTable 60,
-/// APTable[0] 61 (no EL0 access), APTable[1] 62 (no write at any EL).
+/// `APTable[0]` 61 (no EL0 access), `APTable[1]` 62 (no write at any EL).
 const PXN_TABLE: u64 = 1 << 59;
 const UXN_TABLE: u64 = 1 << 60;
 const AP_TABLE_NO_EL0: u64 = 1 << 61;
@@ -450,7 +450,7 @@ impl Aarch64Leaf {
     pub const fn asid(&self) -> u16 {
         self.asid
     }
-    /// MAIR_EL1 attribute index (AttrIndx[2:0]).
+    /// MAIR_EL1 attribute index (`AttrIndx[2:0]`).
     pub const fn attr_index(&self) -> u8 {
         ((self.descriptor >> ATTR_INDEX_SHIFT) & 0b111) as u8
     }

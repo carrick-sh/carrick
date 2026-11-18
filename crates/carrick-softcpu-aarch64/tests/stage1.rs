@@ -198,7 +198,7 @@ fn translated_loads_and_stores_reach_the_stage1_output() {
     assert_eq!(r.memory.get(KDATA_PA + 0x20), 0xabcd);
     // A tagged pointer (TBI0) reaches the same output.
     r.cpu.pc = ProgramCounter(CODE);
-    r.set(0, KDATA + 0x18 | (0x5a << 56));
+    r.set(0, (KDATA + 0x18) | (0x5a << 56));
     assert_eq!(r.run(LDR_X1_X0), Outcome::Continue);
     assert_eq!(r.get(1), 0x1122_3344_5566_7788);
 }
