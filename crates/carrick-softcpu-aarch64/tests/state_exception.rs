@@ -48,6 +48,37 @@ fn scalar_abort_known_answers() {
     }
 }
 
+/// D13.2.37 ESR_EL1, IFSC and DFSC tables (pp. D13-3146, D13-3151–3152).
+#[test]
+fn abort_fsc_encodes_fault_kind_and_level() {
+    for (status, fsc) in [
+        (FaultStatus::AddressSize(TableLevel::L0), 0x00),
+        (FaultStatus::AddressSize(TableLevel::L1), 0x01),
+        (FaultStatus::AddressSize(TableLevel::L2), 0x02),
+        (FaultStatus::AddressSize(TableLevel::L3), 0x03),
+        (FaultStatus::AccessFlag(LeafLevel::L1), 0x09),
+        (FaultStatus::AccessFlag(LeafLevel::L2), 0x0a),
+        (FaultStatus::AccessFlag(LeafLevel::L3), 0x0b),
+        (FaultStatus::ExternalWalk(TableLevel::L0), 0x14),
+        (FaultStatus::ExternalWalk(TableLevel::L1), 0x15),
+        (FaultStatus::ExternalWalk(TableLevel::L2), 0x16),
+        (FaultStatus::ExternalWalk(TableLevel::L3), 0x17),
+    ] {
+        for (access, upper) in [(Access::Fetch, 0x8200_0000), (Access::Read, 0x9200_0000)] {
+            let mut cpu = CpuState::default();
+            take_exception(
+                &mut cpu,
+                Exception::Abort {
+                    access,
+                    status,
+                    address: VirtualAddress(0x1234),
+                },
+            );
+            assert_eq!(cpu.el1.esr, Syndrome(upper | fsc), "{access:?} {status:?}");
+        }
+    }
+}
+
 #[test]
 fn vectors_banking_and_return() {
     for (el, sp, offset) in [
@@ -209,6 +240,49 @@ fn system_register_roundtrips_and_access_syndromes() {
             .is_err()
     );
     assert!(eret(&mut cpu).is_err());
+}
+
+/// D13.2.37 ESR_EL1, trapped system instruction ISS (Rt[9:5], direction[0]).
+#[test]
+fn system_access_traps_preserve_rt() {
+    use carrick_softcpu_aarch64::{Instruction, OperandRegister, decode_instruction};
+
+    // C6.2 MRS: Xt is X17 for the DAIF system register.
+    let Instruction::SystemAccess(mrs) = decode_instruction(0xd53b_4231) else {
+        panic!("MRS X17, DAIF");
+    };
+    let mut cpu = CpuState::default();
+    for (rt, esr) in [
+        (mrs.rt, 0x6232_d225),
+        // A provider can pass the typed SP operand, which uses Rt encoding 31.
+        (OperandRegister::Sp, 0x6232_d3e5),
+    ] {
+        let read = cpu.mrs(mrs.encoding, rt).unwrap_err();
+        let write = cpu.msr(mrs.encoding, rt, SystemValue(0)).unwrap_err();
+        assert_eq!(read.syndrome, Syndrome(esr), "{rt:?}");
+        assert_eq!(write.syndrome, Syndrome(esr & !1), "{rt:?}");
+    }
+}
+
+/// D1.6.2 stack pointer selection and C5.2 SP_EL0/SP_EL1.
+#[test]
+fn sp_operand_reads_and_writes_the_active_bank() {
+    use carrick_softcpu_aarch64::OperandRegister::Sp;
+
+    let mut cpu = CpuState::default();
+    cpu.sp_el0 = StackPointer(0x1000);
+    cpu.sp_el1 = StackPointer(0x2000);
+    assert_eq!(cpu.read_operand(Sp), RegisterValue(0x1000));
+    cpu.write_operand(Sp, RegisterValue(0x3000));
+    assert_eq!(cpu.sp_el0, StackPointer(0x3000));
+    assert_eq!(cpu.sp_el1, StackPointer(0x2000));
+
+    cpu.pstate.el = ExceptionLevel::El1;
+    cpu.pstate.sp = StackSelect::El1;
+    assert_eq!(cpu.read_operand(Sp), RegisterValue(0x2000));
+    cpu.write_operand(Sp, RegisterValue(0x4000));
+    assert_eq!(cpu.sp_el0, StackPointer(0x3000));
+    assert_eq!(cpu.sp_el1, StackPointer(0x4000));
 }
 
 #[test]
@@ -445,6 +519,92 @@ fn el0_daif_access_obeys_uma_bit_nine() {
     }
 }
 
+/// D13.8.15 CNTKCTL_EL1, with register encodings from D13.8.1, D13.8.25,
+/// D13.8.26 and D13.8.29. ESR_EL1 trap encoding is in D13.2.37.
+#[test]
+fn el0_counter_and_virtual_timer_traps_obey_cntkctl() {
+    use carrick_softcpu_aarch64::OperandRegister::Zr;
+
+    let cntkctl = sys((3, 0, 14, 1, 0));
+    let cntfrq = sys((3, 3, 14, 0, 0));
+    let cntvct = sys((3, 3, 14, 0, 2));
+    // Isolate each control, including EL0PTEN and the neighboring EVNTEN bit.
+    for (control, frequency, counter, timer) in [
+        (0, false, false, false),
+        (1 << 0, true, false, false),
+        (1 << 1, true, true, false),
+        (1 << 2, false, false, false),
+        (1 << 8, false, false, true),
+        (1 << 9, false, false, false),
+        (0x303, true, true, true),
+    ] {
+        let mut cpu = CpuState::default();
+        cpu.pstate.el = ExceptionLevel::El1;
+        cpu.msr(cntkctl, Zr, SystemValue(control)).unwrap();
+        cpu.msr(cntfrq, Zr, SystemValue(24_000_000)).unwrap();
+        cpu.pstate.el = ExceptionLevel::El0;
+
+        for (register, allowed, value, esr) in [
+            (cntfrq, frequency, 24_000_000, 0x6230_fbe1),
+            (cntvct, counter, 0, 0x6234_fbe1),
+        ] {
+            let read = cpu.mrs(register, Zr);
+            if allowed {
+                assert_eq!(read.unwrap(), SystemValue(value), "{register:?}");
+            } else {
+                assert_eq!(read.unwrap_err().syndrome, Syndrome(esr), "{register:?}");
+            }
+            let write = cpu.msr(register, Zr, SystemValue(1)).unwrap_err();
+            assert_eq!(write.syndrome, Syndrome(0x0200_0000), "{register:?}");
+        }
+
+        for (fields, esr, value) in [
+            ((3, 3, 14, 3, 1), 0x6232_fbe6, SystemValue(1)),
+            ((3, 3, 14, 3, 2), 0x6234_fbe6, SystemValue(0x1234)),
+        ] {
+            let register = sys(fields);
+            let write = cpu.msr(register, Zr, value);
+            let read = cpu.mrs(register, Zr);
+            if timer {
+                write.unwrap();
+                assert_eq!(read.unwrap(), value, "{register:?}");
+            } else {
+                assert_eq!(write.unwrap_err().syndrome, Syndrome(esr), "{register:?}");
+                assert_eq!(
+                    read.unwrap_err().syndrome,
+                    Syndrome(esr | 1),
+                    "{register:?}"
+                );
+            }
+        }
+    }
+}
+
+/// D13.8.16–18, D13.8.20 and D13.8.27 give the encodings of these
+/// registers, which have no slot in Carrick's EL0/EL1 state model.
+#[test]
+fn el0_unmodeled_timer_registers_are_undefined() {
+    use carrick_softcpu_aarch64::OperandRegister::Zr;
+
+    for control in [0, 1 << 0, 1 << 8, 1 << 9, 0x303] {
+        let mut cpu = CpuState::default();
+        cpu.el1.cntkctl = SystemValue(control);
+        for fields in [
+            (3, 3, 14, 0, 1), // CNTPCT_EL0
+            (3, 3, 14, 2, 0), // CNTP_TVAL_EL0
+            (3, 3, 14, 2, 1), // CNTP_CTL_EL0
+            (3, 3, 14, 2, 2), // CNTP_CVAL_EL0
+            (3, 3, 14, 3, 0), // CNTV_TVAL_EL0
+        ] {
+            let register = sys(fields);
+            let read = cpu.mrs(register, Zr).unwrap_err();
+            let write = cpu.msr(register, Zr, SystemValue(1)).unwrap_err();
+            assert_eq!(read.syndrome, Syndrome(0x0200_0000), "{register:?}");
+            assert_eq!(write.syndrome, Syndrome(0x0200_0000), "{register:?}");
+        }
+    }
+}
+
 /// C5.2 SP_EL0 access is UNDEFINED while it is the active stack pointer.
 #[test]
 fn sp_el0_access_is_undefined_at_el1_using_sp_zero() {
@@ -520,24 +680,32 @@ fn raw_el0_sp_one_uses_the_el0_bank_and_saved_mode() {
     assert_eq!(cpu.pstate.save().0 & 31, 0);
 }
 
+/// D13.2.37 ESR_EL1, DFSC 0b100001 (alignment fault); D1.10.1–2 give
+/// the restart address and synchronous vector offsets.
 #[test]
 fn alignment_abort_is_data_only_and_preserves_fault_address() {
-    for (el, access, expected) in [
-        (ExceptionLevel::El0, DataAccess::Read, 0x9200_0021),
-        (ExceptionLevel::El0, DataAccess::Write, 0x9200_0061),
-        (ExceptionLevel::El1, DataAccess::Read, 0x9600_0021),
-        (ExceptionLevel::El1, DataAccess::Write, 0x9600_0061),
+    for (el, sp, vector, esr) in [
+        (ExceptionLevel::El0, StackSelect::El0, 0x8400, 0x9200_0021),
+        (ExceptionLevel::El1, StackSelect::El0, 0x8000, 0x9600_0021),
+        (ExceptionLevel::El1, StackSelect::El1, 0x8200, 0x9600_0021),
     ] {
-        let mut cpu = CpuState::default();
-        cpu.pstate.el = el;
-        take_exception(
-            &mut cpu,
-            Exception::Alignment {
-                access,
-                address: VirtualAddress(0x123),
-            },
-        );
-        assert_eq!(cpu.el1.esr, Syndrome(expected));
-        assert_eq!(cpu.el1.far, VirtualAddress(0x123));
+        for (access, wnr) in [(DataAccess::Read, 0), (DataAccess::Write, 0x40)] {
+            let mut cpu = CpuState::default();
+            cpu.pstate.el = el;
+            cpu.pstate.sp = sp;
+            cpu.pc = ProgramCounter(0x1234);
+            cpu.el1.vbar = VirtualAddress(0x8000);
+            take_exception(
+                &mut cpu,
+                Exception::Alignment {
+                    access,
+                    address: VirtualAddress(0x123),
+                },
+            );
+            assert_eq!(cpu.el1.esr, Syndrome(esr | wnr));
+            assert_eq!(cpu.el1.far, VirtualAddress(0x123));
+            assert_eq!(cpu.el1.elr, ProgramCounter(0x1234));
+            assert_eq!(cpu.pc, ProgramCounter(vector));
+        }
     }
 }
