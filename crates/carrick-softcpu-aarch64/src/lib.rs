@@ -2327,6 +2327,7 @@ pub use instruction::{
     ScalarMemory, SelectOperation, ShiftAmount, VectorRegister, decode_instruction,
 };
 
+pub mod dispatch;
 pub mod exception;
 pub mod handler;
 pub mod state;
