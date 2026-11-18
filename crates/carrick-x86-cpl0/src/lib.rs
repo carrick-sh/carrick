@@ -204,7 +204,10 @@ mod test_support {
 
     /// Count a fork the parent owner refused Busy at prepare or publish.
     pub fn record_fork_superseded(error: carrick_core::mm::transaction::MmError) {
-        if error == carrick_core::mm::transaction::MmError::Busy {
+        use carrick_core::mm::transaction::MmError;
+        if matches!(error, MmError::Wait(wait)
+            if wait.cause() == carrick_el1_abi::PortalWaitCause::Editor)
+        {
             FORK_SUPERSEDED.fetch_add(1, Ordering::AcqRel);
         }
     }

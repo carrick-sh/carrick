@@ -17,7 +17,7 @@ impl From<crate::mm::fork::ForkError> for MmError {
         match e {
             ForkError::Invalid => Self::Invalid,
             ForkError::NoMemory => Self::NoMemory,
-            ForkError::Busy => Self::Busy,
+            ForkError::Busy | ForkError::SnapshotMoved => Self::Busy,
             ForkError::Stale => Self::Stale,
             ForkError::MetadataRequired => Self::MetadataRequired,
             // A fork owner refusal keeps its typed reservation cause. The
