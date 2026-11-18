@@ -696,8 +696,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
                         crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
                     })
-            }
-            .map_err(|_| NativeFailure::Stale)?;
+            };
+            let queue = match queue {
+                Ok(queue) => queue,
+                // A grant's request queue is one carrier-wide slot, and a
+                // later request rebinds it only once it is empty: the grant
+                // this fork waited on drained and woke it. The woken fork
+                // finds its cancellation at its owner checkpoint (#2441).
+                Err(carrick_sched_core::object_wait::ObjectWaitError::Stale)
+                    if wait.cause() == carrick_core_abi::PortalWaitCause::MetadataGrant =>
+                {
+                    return Ok(());
+                }
+                Err(_) => return Err(NativeFailure::Stale),
+            };
             // Recheck after queue admission: a completed wait may already have
             // moved to its successor. Cancellation remains sticky in the cell.
             if self
