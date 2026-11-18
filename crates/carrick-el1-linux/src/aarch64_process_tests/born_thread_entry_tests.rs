@@ -5043,6 +5043,176 @@ fn arm_wait4_reaps_zombie_while_sibling_vfork_holds_birth_reservation() {
     wait4_reaps_zombie_while_sibling_holds_birth_reservation(true);
 }
 
+/// #2441, the director's ruling on #2508: a multi-threaded parent (a Go
+/// program) forks on one thread while another thread maps memory. Thread
+/// A's fork takes its census under the parent's space editor, then drops
+/// the editor for its stock loan crossing. During that crossing sibling B,
+/// live on a second vCPU, runs a real anonymous `mmap`, which commits an
+/// edit and moves the parent's generation. A's prepare finds the snapshot
+/// it took superseded: real contention, so it is "not now" (`Busy`), never
+/// a broken invariant. A keeps its clone and reruns it once, with a fresh
+/// census and a second loan, and forks; B's mapping stays.
+#[test]
+fn arm_fork_superseded_by_sibling_mmap_is_busy_once_then_forks() {
+    let mut harness = ProductionProcessHarness::new();
+    let fixture = harness.fixture;
+    let slot0 = fixture.slot;
+    let mut cpu = crate::sched::FakeCpu::default();
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
+    let (_sibling_tid, sibling) = harness.spawn_thread(&stack, &mut cpu);
+    if fixture.zone.slot(slot0).current() == Some(sibling) {
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        assert!(fixture.zone.requeue_preempted(slot0, sibling).is_queued());
+        assert_eq!(
+            harness.switch_next(&mut cpu, &mut frame),
+            carrick_el1_abi::Action::Served
+        );
+    }
+    assert_eq!(
+        fixture.zone.slot(slot0).current(),
+        Some(harness.parent_record)
+    );
+    // vCPU 1 takes B from vCPU 0's queue.
+    let second: &'static mut SecondVcpu = Box::leak(Box::new(SecondVcpu::new(fixture)));
+    let mut idle = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        second.switch_next(fixture, &mut idle),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(fixture.zone.slot(second.slot).current(), Some(sibling));
+
+    // A's first stock loan crossing runs B's mmap on vCPU 1, as a sibling
+    // vCPU does during a real synchronous crossing.
+    let mapped = Arc::new(std::sync::Mutex::new(None));
+    let mapped_by_hook = mapped.clone();
+    let second_address = core::ptr::from_mut(second) as usize;
+    let fixture_address = core::ptr::from_ref(fixture) as usize;
+    *harness.dispatch_service.crossing.on_loan.lock().unwrap() = Some(Box::new(move || {
+        // SAFETY: the leaked vCPU outlives the test; the outer fork runs
+        // this hook synchronously and never touches vCPU 1's state.
+        let second = unsafe { &mut *(second_address as *mut SecondVcpu) };
+        // SAFETY: the harness leaks its fixture for the life of the test.
+        let fixture: &'static Fixture = unsafe { &*(fixture_address as *const Fixture) };
+        // B's mmap(NULL, 0x4000, PROT_READ | PROT_WRITE,
+        // MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), through the delegated
+        // anonymous owner that serves it on vCPU 1.
+        let mut map = carrick_el1_abi::TrapFrame {
+            esr: 0x5600_0000,
+            elr: 0x50_0004,
+            slot: u64::from(second.slot.raw()),
+            ..Default::default()
+        };
+        map.x[8] = 222;
+        map.x[..6].copy_from_slice(&[0, 0x4000, 3, 0x22, u64::MAX, 0]);
+        let served = carrick_el1::memory::serve_delegated_anonymous(
+            &mut map,
+            &carrick_el1_abi::Counters::new(),
+            second.task,
+            crate::sched::object_wait::space_access(fixture.zone, second.slot),
+            fixture.region.table(),
+            &mut super::UnbackedMmapMemory {
+                tables: &fixture.tables,
+            },
+            None,
+        );
+        assert_eq!(served, carrick_el1::memory::DelegatedAnonymous::Served);
+        *mapped_by_hook.lock().unwrap() = Some(map.x[0] as i64);
+    }));
+
+    // Stock crossings the harness's own births made so far.
+    let counts = |crossing: &TestStockCrossing| {
+        [
+            crossing.loans_requested.load(Ordering::Acquire),
+            crossing.settlements_aborted.load(Ordering::Acquire),
+            crossing.settlements_committed.load(Ordering::Acquire),
+        ]
+    };
+    let [loans, aborted, committed] = counts(&harness.dispatch_service.crossing);
+    let mut clone = carrick_el1_abi::TrapFrame::default();
+    clone.x[8] = 220;
+    clone.x[0] = 17;
+    harness.call_current(&mut clone, &mut cpu);
+    let mapped = mapped
+        .lock()
+        .unwrap()
+        .take()
+        .expect("A's fork crossed for stock after its census");
+    assert!(
+        mapped > 0 && mapped & 0xfff == 0,
+        "B's mmap during A's fork: {mapped}"
+    );
+    // A kept its clone as carrier work and released vCPU 0: not now.
+    assert!(fixture.zone.slot(slot0).current().is_none());
+    assert!(matches!(
+        fixture.zone.record(harness.parent_record).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    assert_eq!(
+        counts(&harness.dispatch_service.crossing),
+        [loans + 1, aborted + 1, committed],
+        "the superseded fork returned its one loan and published no child"
+    );
+    // The carrier acknowledges the work; A resumes and reruns its clone.
+    let notice = harness
+        .task
+        .service_notice
+        .take()
+        .unwrap()
+        .expect("the retained clone announced carrier work");
+    let queue = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(
+                fixture.zone.record_ref(harness.parent_record),
+            )
+            .unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        )
+        .unwrap();
+    // SAFETY: the parent's control slot outlives the harness.
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &harness._parent_control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(harness.parent_record).identity(),
+        )
+    }
+    .unwrap();
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(slot0, &mut carrick_sched_core::WakeEffects::default())
+        .unwrap();
+    drop(queue);
+    let mut resumed = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        harness.switch_next(&mut cpu, &mut resumed),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(
+        fixture.zone.slot(slot0).current(),
+        Some(harness.parent_record)
+    );
+    // The retained clone resumes rewound onto its SVC (the harness's
+    // frames start at pc 0), and the guest executes it again.
+    assert_eq!(resumed.elr, 0u64.wrapping_sub(4), "A resumes at its clone");
+    clone = carrick_el1_abi::TrapFrame::default();
+    clone.x[8] = 220;
+    clone.x[0] = 17;
+    harness.call_current(&mut clone, &mut cpu);
+    let pid = clone.x[0] as i64;
+    assert!(pid > 0, "A's fork after the superseded snapshot: {pid}");
+    assert!(harness.find_record_by_tid(pid as u64).is_some());
+    let crossing = &harness.dispatch_service.crossing;
+    assert_eq!(
+        counts(crossing),
+        [loans + 2, aborted + 1, committed + 1],
+        "the superseded fork was Busy exactly once, then forked"
+    );
+    assert!(crossing.pending_loan.lock().unwrap().is_none());
+}
+
 /// #2109: a glibc thread of a native fork child, pinned with
 /// `sched_setaffinity` to CPU 1, ends with a raw `exit` while its leader and
 /// a sibling stay live. It runs from the zone on CPU 1's slot, whose executor
