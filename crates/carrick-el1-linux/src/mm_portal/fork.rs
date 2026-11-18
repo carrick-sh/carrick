@@ -299,11 +299,18 @@ impl<
             return Err(MmError::Stale);
         }
         let mut root = self.root(request.operation.mm, worker)?;
-        if root.incarnation().raw() != request.operation.incarnation.get()
-            || root.generation() != request.parent_generation
+        if root.incarnation().raw() != request.operation.incarnation.get() {
+            return Err(MmError::Stale);
+        }
+        // The census took this snapshot under the editor and released it
+        // for the stock crossing and the scratch. A moved generation or
+        // operation sequence is another live thread of the parent's
+        // committed edit: contention, so the fork reruns with a fresh
+        // census (#2441). Stale stays the broken invariants above.
+        if root.generation() != request.parent_generation
             || root.operation_sequence() != request.operation.sequence.get()
         {
-            return Err(MmError::Stale);
+            return Err(MmError::Busy);
         }
         if !root.fork_ready() {
             return Err(MmError::Busy);

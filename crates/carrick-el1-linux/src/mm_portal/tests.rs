@@ -2260,10 +2260,12 @@ fn owner_fork_refuses_stale_unchanged_shared_leaf_during_custody() {
             0,
         )
         .unwrap();
+    // Another thread of the parent moved a leaf the prepare read:
+    // contention, never a broken invariant (#2441).
     parent_tables.words[1536].store((IPA + 4096) | RW, Ordering::Release);
     assert!(matches!(
         portal.publish_fork(plan, &words, 0),
-        Err(MmError::Stale)
+        Err(MmError::Busy)
     ));
     assert!(
         !region
@@ -3673,7 +3675,7 @@ fn fork_child_write_preparation_mode(prepare_first: bool, race_drain: bool) {
                 &words,
                 1
             ),
-            Err(MmError::Stale)
+            Err(MmError::Busy)
         ));
         assert_eq!(grandchild.words[1536].load(Ordering::Acquire), 0);
         let mut request = request;
