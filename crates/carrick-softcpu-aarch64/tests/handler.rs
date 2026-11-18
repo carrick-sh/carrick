@@ -472,3 +472,95 @@ fn exclusive_ordered_and_lse_accesses_fault_with_alignment_check_disabled() {
         assert!(!r.monitor.is_open());
     }
 }
+
+#[test]
+fn spsel_immediates_switch_the_active_stack_at_el1_only() {
+    let mut r = Rig::el1();
+    r.cpu.sp_el0 = StackPointer(0x10000);
+    r.cpu.sp_el1 = StackPointer(0x11000);
+    assert_eq!(r.run(0xd500_40bf), Outcome::Continue); // msr spsel, #0
+    assert_eq!((r.pc(), r.cpu.sp()), (PC + 4, StackPointer(0x10000)));
+    assert_eq!(r.run(0xd500_41bf), Outcome::Continue); // msr spsel, #1
+    assert_eq!((r.pc(), r.cpu.sp()), (PC + 8, StackPointer(0x11000)));
+    assert_el0_undefined(0xd500_41bf);
+}
+
+#[test]
+fn pan_immediates_set_and_clear_at_el1_only() {
+    let mut r = Rig::el1();
+    assert_eq!(r.run(0xd500_419f), Outcome::Continue); // msr pan, #1
+    assert_eq!((r.pc(), r.cpu.pstate.pan), (PC + 4, true));
+    assert_eq!(r.run(0xd500_409f), Outcome::Continue); // msr pan, #0
+    assert_eq!((r.pc(), r.cpu.pstate.pan), (PC + 8, false));
+    assert_el0_undefined(0xd500_419f);
+}
+
+#[test]
+fn uao_immediates_set_and_clear_at_el1_only() {
+    let mut r = Rig::el1();
+    assert_eq!(r.run(0xd500_417f), Outcome::Continue); // msr uao, #1
+    assert_eq!((r.pc(), r.cpu.pstate.uao), (PC + 4, true));
+    assert_eq!(r.run(0xd500_407f), Outcome::Continue); // msr uao, #0
+    assert_eq!((r.pc(), r.cpu.pstate.uao), (PC + 8, false));
+    assert_el0_undefined(0xd500_417f);
+}
+
+#[test]
+fn uma_allows_daif_immediates_at_el0() {
+    let mut r = Rig::el0();
+    r.cpu.el1.sctlr = Sctlr(1 << 9); // UMA
+    assert_eq!(r.run(0xd503_43df), Outcome::Continue); // msr daifset, #3
+    assert_eq!((r.pc(), r.cpu.pstate.daif), (PC + 4, InterruptMasks(3)));
+    assert_eq!(r.run(0xd503_42ff), Outcome::Continue); // msr daifclr, #2
+    assert_eq!((r.pc(), r.cpu.pstate.daif), (PC + 8, InterruptMasks(1)));
+}
+
+fn assert_el0_undefined(word: u32) {
+    let mut r = Rig::el0();
+    assert_eq!(r.run(word), Outcome::Continue);
+    assert_eq!(r.pc(), VBAR + 0x400);
+    assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
+    assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
+}
+
+#[test]
+fn eret_and_hvc_are_undefined_at_el0() {
+    assert_el0_undefined(0xd69f_03e0); // eret
+    assert_el0_undefined(0xd400_0022); // hvc #1
+}
+
+#[test]
+fn sp_el0_sysreg_access_requires_the_el1_stack_bank() {
+    const MSR: u32 = 0xd518_4101; // msr sp_el0, x1
+    const MRS: u32 = 0xd538_4102; // mrs x2, sp_el0
+
+    let mut r = Rig::el1();
+    r.cpu.sp_el1 = StackPointer(0x11000);
+    r.set(1, 0x10000);
+    assert_eq!(r.run(MSR), Outcome::Continue);
+    assert_eq!(r.run(MRS), Outcome::Continue);
+    assert_eq!((r.pc(), r.get(2), r.cpu.sp().0), (PC + 8, 0x10000, 0x11000));
+
+    for word in [MSR, MRS] {
+        let mut r = Rig::el1();
+        r.cpu.pstate.sp = StackSelect::El0;
+        r.cpu.sp_el0 = StackPointer(0x10000);
+        r.set(1, 0x11000);
+        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.pc(), VBAR); // current EL with SP_EL0
+        assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
+        assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
+        assert_eq!((r.cpu.sp_el0.0, r.get(2)), (0x10000, 0));
+        assert_el0_undefined(word);
+    }
+}
+
+#[test]
+fn vbar_el1_write_discards_res0_bits() {
+    let mut r = Rig::el1();
+    r.set(1, VBAR | 0x7ff);
+    assert_eq!(r.run(0xd518_c001), Outcome::Continue); // msr vbar_el1, x1
+    assert_eq!(r.cpu.el1.vbar, VirtualAddress(VBAR));
+    assert_eq!(r.run(0xd538_c002), Outcome::Continue); // mrs x2, vbar_el1
+    assert_eq!((r.pc(), r.get(2)), (PC + 8, VBAR));
+}
