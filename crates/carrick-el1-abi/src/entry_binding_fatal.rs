@@ -463,6 +463,34 @@ mod tests {
     use std::{boxed::Box, format};
 
     #[test]
+    fn native_fork_fatal_detail_round_trip_and_formatter() {
+        // The entry-only fallback formatter must decode the same x2/x3
+        // payload as the formatter with retained entry context.
+        let reason = 0x0312_0100;
+        let location = (9769 << 32) | 9;
+        let detail = EntryBindingFatalDetail::decode(reason, location).unwrap();
+        assert_eq!(detail.encode(), [reason, location]);
+        let registers = ArmEntryFatalRegisters {
+            reason: Some(reason),
+            source_location: Some(location),
+            ..Default::default()
+        };
+        let capture = ArmEntryBindingFatal::capture(
+            registers,
+            &crate::TrapFrame::default(),
+            binding(),
+            &zone(),
+            crate::SlotId::new(0),
+        );
+        for text in [
+            format!("{capture}"),
+            format!("{}", ArmEl1FatalReport::EntryUnavailable(&registers)),
+        ] {
+            assert!(text.contains("reason=NativeForkInvariantScratchMmFault at=9769:9"));
+        }
+    }
+
+    #[test]
     fn fatal_detail_round_trip_and_formatter() {
         for raw in (1..=48).chain(60..=61) {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
