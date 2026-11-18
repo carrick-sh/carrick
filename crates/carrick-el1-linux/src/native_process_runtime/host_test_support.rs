@@ -2523,7 +2523,7 @@ fn native_service_suspended_member_cannot_admit_a_second_bridge() {
         .expect("a second bridge cannot own a suspended member");
     assert_eq!(
         fatal.fatal_reason(),
-        carrick_el1_abi::EntryBindingFatalReason::NativeServiceQuarantined
+        carrick_el1_abi::EntryBindingFatalReason::NativeServiceQuarantinedMemberWaitInstalled
     );
     assert!(fixture.task.service_notice.take().unwrap().is_none());
     assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);

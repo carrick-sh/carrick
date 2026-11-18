@@ -2042,6 +2042,7 @@ pub(crate) fn declined_fault_admission_result(
             | NativeProcessError::Stale
             | NativeProcessError::Quarantined),
         ) => Err(error),
+        Err(error @ NativeProcessError::ServiceQuarantined(_)) => Err(error),
         Err(
             NativeProcessError::Busy
             | NativeProcessError::Exhausted
@@ -2935,7 +2936,9 @@ fn native_service_invariant_at(
 fn native_service_fatal_reason(
     error: super::native_process_runtime::NativeProcessError,
 ) -> carrick_el1_abi::EntryBindingFatalReason {
-    use super::native_process_runtime::NativeProcessError as Error;
+    use super::native_process_runtime::{
+        NativeProcessError as Error, NativeServiceQuarantine as Quarantine,
+    };
     use carrick_el1_abi::EntryBindingFatalReason as Fatal;
     match error {
         Error::Invalid => Fatal::NativeServiceInvalid,
@@ -2946,6 +2949,42 @@ fn native_service_fatal_reason(
         Error::GroupExitCustody => Fatal::NativeServiceGroupExit,
         Error::Busy => Fatal::NativeServiceBusy,
         Error::Quarantined => Fatal::NativeServiceQuarantined,
+        Error::ServiceQuarantined(reason) => match reason {
+            Quarantine::HandoffAuthentication => {
+                Fatal::NativeServiceQuarantinedHandoffAuthentication
+            }
+            Quarantine::MemberWaitInstalled => Fatal::NativeServiceQuarantinedMemberWaitInstalled,
+            Quarantine::ClaimOverflow => Fatal::NativeServiceQuarantinedClaimOverflow,
+            Quarantine::ClosedGateNoExitRow => Fatal::NativeServiceQuarantinedClosedGateNoExitRow,
+            Quarantine::DuplicateNoticeQueue => Fatal::NativeServiceQuarantinedDuplicateNoticeQueue,
+            Quarantine::DuplicateNoticeCleanup => {
+                Fatal::NativeServiceQuarantinedDuplicateNoticeCleanup
+            }
+            Quarantine::RetainedServiceMissing => {
+                Fatal::NativeServiceQuarantinedRetainedServiceMissing
+            }
+            Quarantine::RetainedServiceUnexpectedResume => {
+                Fatal::NativeServiceQuarantinedRetainedServiceUnexpectedResume
+            }
+            Quarantine::RetainedLifecycleMissing => {
+                Fatal::NativeServiceQuarantinedRetainedLifecycleMissing
+            }
+            Quarantine::RetainedHostCustody => Fatal::NativeServiceQuarantinedRetainedHostCustody,
+            Quarantine::RetainedLifecycleOutcome => {
+                Fatal::NativeServiceQuarantinedRetainedLifecycleOutcome
+            }
+            Quarantine::AdapterOperationTake => Fatal::NativeServiceQuarantinedAdapterOperationTake,
+            Quarantine::AdapterOperationRestore => {
+                Fatal::NativeServiceQuarantinedAdapterOperationRestore
+            }
+            Quarantine::HostCompletionQueue => Fatal::NativeServiceQuarantinedHostCompletionQueue,
+            Quarantine::ParkRefused => Fatal::NativeServiceQuarantinedParkRefused,
+            Quarantine::ParkResultMissing => Fatal::NativeServiceQuarantinedParkResultMissing,
+            Quarantine::RetainOperation => Fatal::NativeServiceQuarantinedRetainOperation,
+            Quarantine::RequeueRefused => Fatal::NativeServiceQuarantinedRequeueRefused,
+            Quarantine::ReleaseRefused => Fatal::NativeServiceQuarantinedReleaseRefused,
+            Quarantine::HandoffReceipt => Fatal::NativeServiceQuarantinedHandoffReceipt,
+        },
         Error::NoChild => Fatal::NativeServiceNoChild,
         Error::OwnerWait(_) => Fatal::NativeServiceOwnerWait,
         Error::ForkRefused(refusal) => native_service_fatal_reason(refusal.error()),
@@ -6864,6 +6903,100 @@ mod tests {
                 std::format!("{invariant:?}"),
                 std::format!("NativeService({expected:?})")
             );
+        }
+    }
+
+    #[test]
+    fn native_service_quarantines_name_the_failing_invariant() {
+        use super::super::native_process_runtime::{
+            NativeProcessError as Error, NativeServiceQuarantine as Quarantine,
+        };
+        use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+        for (reason, expected) in [
+            (
+                Quarantine::HandoffAuthentication,
+                Fatal::NativeServiceQuarantinedHandoffAuthentication,
+            ),
+            (
+                Quarantine::MemberWaitInstalled,
+                Fatal::NativeServiceQuarantinedMemberWaitInstalled,
+            ),
+            (
+                Quarantine::ClaimOverflow,
+                Fatal::NativeServiceQuarantinedClaimOverflow,
+            ),
+            (
+                Quarantine::ClosedGateNoExitRow,
+                Fatal::NativeServiceQuarantinedClosedGateNoExitRow,
+            ),
+            (
+                Quarantine::DuplicateNoticeQueue,
+                Fatal::NativeServiceQuarantinedDuplicateNoticeQueue,
+            ),
+            (
+                Quarantine::DuplicateNoticeCleanup,
+                Fatal::NativeServiceQuarantinedDuplicateNoticeCleanup,
+            ),
+            (
+                Quarantine::RetainedServiceMissing,
+                Fatal::NativeServiceQuarantinedRetainedServiceMissing,
+            ),
+            (
+                Quarantine::RetainedServiceUnexpectedResume,
+                Fatal::NativeServiceQuarantinedRetainedServiceUnexpectedResume,
+            ),
+            (
+                Quarantine::RetainedLifecycleMissing,
+                Fatal::NativeServiceQuarantinedRetainedLifecycleMissing,
+            ),
+            (
+                Quarantine::RetainedHostCustody,
+                Fatal::NativeServiceQuarantinedRetainedHostCustody,
+            ),
+            (
+                Quarantine::RetainedLifecycleOutcome,
+                Fatal::NativeServiceQuarantinedRetainedLifecycleOutcome,
+            ),
+            (
+                Quarantine::AdapterOperationTake,
+                Fatal::NativeServiceQuarantinedAdapterOperationTake,
+            ),
+            (
+                Quarantine::AdapterOperationRestore,
+                Fatal::NativeServiceQuarantinedAdapterOperationRestore,
+            ),
+            (
+                Quarantine::HostCompletionQueue,
+                Fatal::NativeServiceQuarantinedHostCompletionQueue,
+            ),
+            (
+                Quarantine::ParkRefused,
+                Fatal::NativeServiceQuarantinedParkRefused,
+            ),
+            (
+                Quarantine::ParkResultMissing,
+                Fatal::NativeServiceQuarantinedParkResultMissing,
+            ),
+            (
+                Quarantine::RetainOperation,
+                Fatal::NativeServiceQuarantinedRetainOperation,
+            ),
+            (
+                Quarantine::RequeueRefused,
+                Fatal::NativeServiceQuarantinedRequeueRefused,
+            ),
+            (
+                Quarantine::ReleaseRefused,
+                Fatal::NativeServiceQuarantinedReleaseRefused,
+            ),
+            (
+                Quarantine::HandoffReceipt,
+                Fatal::NativeServiceQuarantinedHandoffReceipt,
+            ),
+        ] {
+            let invariant = native_service_invariant(Error::ServiceQuarantined(reason));
+            assert_eq!(invariant.fatal_reason(), expected);
+            assert_eq!(Fatal::from_raw(expected as u64), Some(expected));
         }
     }
 
