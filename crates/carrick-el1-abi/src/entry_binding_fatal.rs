@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn fatal_detail_round_trip_and_formatter() {
-        for raw in (1..=48).chain(60..=143) {
+        for raw in (1..=48).chain(60..=173) {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
             for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
                 let detail = EntryBindingFatalDetail {
@@ -697,8 +697,8 @@ mod tests {
             "reason=MissingNativeFrame at=1646:9"
         );
         assert_eq!(
-            format!("{}", FatalDetail(Some(99), Some(0))),
-            "reason=unknown(0x63) at=0:0"
+            format!("{}", FatalDetail(Some(174), Some(0))),
+            "reason=unknown(0xae) at=0:0"
         );
         assert_eq!(
             format!("{}", FatalDetail(None, None)),
