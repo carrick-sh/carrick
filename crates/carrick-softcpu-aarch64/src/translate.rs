@@ -192,7 +192,8 @@ impl GuestBlock {
 }
 
 /// Split one block starting at `start`. `fetch` returns the guest word at an
-/// address, or None when it cannot be fetched; an empty block means the very
+/// address, or None when it cannot be fetched. An unaligned start returns an
+/// empty block without calling `fetch`; otherwise an empty block means the
 /// first word could not be fetched.
 pub fn split_block(
     start: ProgramCounter,
@@ -200,6 +201,12 @@ pub fn split_block(
     mut fetch: impl FnMut(ProgramCounter) -> Option<u32>,
 ) -> GuestBlock {
     let mut instructions = Vec::new();
+    if !start.0.is_multiple_of(4) {
+        return GuestBlock {
+            start,
+            instructions,
+        };
+    }
     let mut pc = start;
     let page = start.0 / CODE_PAGE_BYTES;
     while instructions.len() < limits.max_instructions.max(1) && pc.0 / CODE_PAGE_BYTES == page {
@@ -218,7 +225,8 @@ pub fn split_block(
 }
 
 /// Partition a linear code span into consecutive blocks, each starting where
-/// the previous one ended. Used to measure real images.
+/// the previous one ended. An unaligned base yields no blocks. Used to
+/// measure real images.
 pub fn split_span(base: ProgramCounter, words: &[u32], limits: BlockLimits) -> Vec<GuestBlock> {
     let mut blocks = Vec::new();
     let mut pc = base;
@@ -229,6 +237,9 @@ pub fn split_span(base: ProgramCounter, words: &[u32], limits: BlockLimits) -> V
                 .get(usize::try_from((at.0 - base.0) / 4).ok()?)
                 .copied()
         });
+        if block.instructions.is_empty() {
+            break;
+        }
         pc = block.next_pc();
         blocks.push(block);
     }
