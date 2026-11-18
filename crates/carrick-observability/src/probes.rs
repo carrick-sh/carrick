@@ -3643,6 +3643,7 @@ mod hvpatch_guest_probe_abi {
         for name in [
             "hvpatch-owner-grant-descriptor-refused",
             "frame-grant-residency-refused",
+            "frame-grant-residency-segment-grown",
             "descriptor-journal-reserve-failed",
             "descriptor-plan-refused",
         ] {
@@ -3657,6 +3658,7 @@ mod hvpatch_guest_probe_abi {
         // matching stubs when cross-compiling.
         super::hvpatch_owner_grant_descriptor_refused(|| (0, 0, 0, 0, 0, 0));
         super::frame_grant_residency_refused(0, 0, 0, 0, 0);
+        super::frame_grant_residency_segment_grown(0, 0, 0);
         super::descriptor_journal_reserve_failed(0, 0, 0, 0);
         super::descriptor_plan_refused(0, 0, 0, 0, 0, 0);
     }
@@ -6254,6 +6256,8 @@ mod real {
         }
         /// Failed residency publication: MM, span, sampled occupancy and capacity.
         fn frame__grant__residency__refused(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Elastic residency table grew one overflow segment: segment index, total slots and guest base.
+        fn frame__grant__residency__segment__grown(_: u64, _: u64, _: u64) {}
         /// Finished plan exceeded journal reserve: ISA, kind, stores and grants.
         fn descriptor__journal__reserve__failed(_: u64, _: u64, _: u64, _: u64) {}
         /// Refused descriptor plan: ISA, site, op kind, live stores, table grants and reason.
@@ -7131,6 +7135,18 @@ mod real {
 
     pub fn frame_grant_residency_refused(mm: u64, va: u64, len: u64, used: u64, total: u64) {
         carrick_usdt::frame__grant__residency__refused!(|| (mm, va, len, used, total));
+    }
+
+    pub fn frame_grant_residency_segment_grown(
+        segment_index: u64,
+        slots_total: u64,
+        guest_base: u64,
+    ) {
+        carrick_usdt::frame__grant__residency__segment__grown!(|| (
+            segment_index,
+            slots_total,
+            guest_base
+        ));
     }
 
     pub fn descriptor_journal_reserve_failed(isa: u64, kind: u64, stores: u64, grants: u64) {
@@ -9872,6 +9888,7 @@ mod stub {
     ) {
     }
     stub!(frame_grant_residency_refused(mm: u64, va: u64, len: u64, used: u64, total: u64));
+    stub!(frame_grant_residency_segment_grown(segment_index: u64, slots_total: u64, guest_base: u64));
     stub!(descriptor_journal_reserve_failed(isa: u64, kind: u64, stores: u64, grants: u64));
     stub!(descriptor_plan_refused(isa: u64, site: u64, kind: u64, stores: u64, grants: u64, refusal: u64));
     stub!(hvpatch_native_fault_supply(mm: u64, sequence: u64, phase: super::HvpatchNativeFaultPhase, fault_page: u64, length: u64));

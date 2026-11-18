@@ -538,7 +538,13 @@ impl CarrierMetadataAccess {
             carrier,
             generation,
         };
-        access.region().ok()?;
+        let region = access.region().ok()?;
+        if let Some(pointer) = region.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
+            carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
+        ) {
+            // SAFETY: initialized atomic ABI record in the retained carrier mapping.
+            ensure_residency_segment_provider(&access.carrier.custody, unsafe { &*pointer });
+        }
         Some(access)
     }
 
@@ -1039,6 +1045,59 @@ pub(crate) fn install_fork_lifecycle(
                 map_metadata_backing,
             )
         })
+}
+
+/// Bind the carrier's retained metadata aperture as the on-demand overflow
+/// segment provider for `table`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn ensure_residency_segment_provider(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    table: &carrick_el1_abi::FrameGrantResidencyTable,
+) {
+    let weak = Arc::downgrade(custody);
+    table.register_host_segment_provider_if_unset(Box::new(move |residency, expected_count| {
+        let Some(custody) = weak.upgrade() else {
+            return false;
+        };
+        let Some(generation) = custody.live_generation() else {
+            return false;
+        };
+        let Ok(extent) = install_fork_lifecycle(&custody, generation) else {
+            return false;
+        };
+        let Ok(pin) = metadata_aperture(&custody)
+            .lock()
+            .pin_extent(extent, generation.0)
+        else {
+            return false;
+        };
+        let host_ptr = pin
+            .base
+            .cast::<carrick_el1_abi::FrameGrantResidencyOverflowSegment>();
+        // SAFETY: `install_fork_lifecycle` allocated a retained 512 KiB zeroed
+        // metadata backing mapped in EL1 stage-1 and HVF stage-2 at
+        // `extent.base()`, retained by `metadata_aperture(&custody)` for the
+        // carrier's lifetime.
+        let installed = unsafe {
+            residency.install_external_overflow_segment(
+                host_ptr,
+                extent.base(),
+                extent,
+                expected_count,
+            )
+        };
+        match installed {
+            Ok(segment_index) => {
+                carrick_observability::probes::frame_grant_residency_segment_grown(
+                    u64::from(segment_index),
+                    residency.slot_capacity() as u64,
+                    extent.base(),
+                );
+                true
+            }
+            Err(_) => residency.overflow_segment_count() > expected_count,
+        }
+    }));
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -916,13 +916,20 @@ fn publish_el1_region_host_ptr(mapping: &GuestMapping, host: *mut u8) {
     if mapping.guest_start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE {
         // The mapping is still exclusively owned by boot. Initialize in
         // place before publishing the host aperture or admitting guest CPUs.
+        let residency = unsafe {
+            host.add(carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize)
+                .cast::<carrick_el1_abi::FrameGrantResidencyTable>()
+        };
         let ingress = unsafe {
             host.add(carrick_el1_abi::EL1_SIGNAL_INGRESS_OFFSET as usize)
                 .cast::<carrick_el1_abi::SharedSignalIngressQueue>()
         };
         // SAFETY: the mapped region covers the checked ABI reservation and
         // no consumer can access it until the pointer is published below.
-        unsafe { carrick_el1_abi::SharedSignalIngressQueue::initialize_at(ingress) };
+        unsafe {
+            carrick_el1_abi::FrameGrantResidencyTable::init_in_place(residency);
+            carrick_el1_abi::SharedSignalIngressQueue::initialize_at(ingress);
+        }
         let counters_ptr = unsafe { host.add(carrick_el1_abi::EL1_COUNTERS_OFFSET as usize) };
         record_el1_counters_host_ptr(counters_ptr as usize);
         EL1_REGION_HOST_PTR.store(host as usize, std::sync::atomic::Ordering::Release);

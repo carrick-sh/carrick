@@ -2794,6 +2794,14 @@ impl PublicationContext<'static> {
                 TransferPreparation::Declined
             });
         }
+        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            crate::metadata_grant::ensure_residency_segment_provider(&self.custody, table);
+            let _ = table.ensure_capacity_for(
+                window.operation.mm.raw(),
+                window.range.start(),
+                window.range.len(),
+            );
+        }
         carrick_observability::probes::hvpatch_el1_owner_grant_supply(
             window.range.start(),
             window.range.len(),
@@ -3014,6 +3022,21 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
                 carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot
             )
         );
+        let residency_grown =
+            matches!(
+                receipt.outcome,
+                DescriptorOutcome::Refused(
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::ResidencyCapacity
+                )
+            ) && carrick_el1_abi::frame_grant_residency_host().is_some_and(|table| {
+                crate::metadata_grant::ensure_residency_segment_provider(
+                    &self.context.custody,
+                    table,
+                );
+                let span = txn.op.span();
+                table.ensure_capacity_for(txn.id.mm_key.get(), span.va, span.len)
+            });
+        let retryable = stale_root || residency_grown;
         let result = self
             .context
             .state
@@ -3041,13 +3064,13 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
             }
         }
         self.descriptor_settled = true;
-        if !applied && !stale_root {
+        if !applied && !retryable {
             return Err(TrapError::Hypervisor(format!(
                 "owner grant descriptor refused: {:?}",
                 receipt.outcome
             )));
         }
-        Ok(applied || stale_root)
+        Ok(applied || retryable)
     }
 }
 impl PendingTransferGrant {

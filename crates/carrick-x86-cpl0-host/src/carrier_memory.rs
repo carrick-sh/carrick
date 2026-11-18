@@ -942,6 +942,96 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         Ok(())
     }
 
+    /// Ensure the retained residency table has probe headroom for `(mm_key,
+    /// semantic_base, len)`, mapping 512 KiB supervisor metadata overflow
+    /// extents on demand when the probe chain saturates.
+    pub fn ensure_residency_capacity(
+        &mut self,
+        region: FrameGpa,
+        dynamic_residency_va: u64,
+        dynamic_residency_gpa: FrameGpa,
+        mm_key: u64,
+        semantic_base: u64,
+        len: u64,
+    ) -> Result<bool, MemoryError> {
+        const PREFLIGHT_HEADROOM: usize = 4;
+        let residency_gpa =
+            FrameGpa::new(region.raw() + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET);
+        loop {
+            let (has_headroom, has_slot, current_count) = {
+                // SAFETY: retained aligned residency table initialized at boot.
+                let residency = unsafe {
+                    self.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(
+                        residency_gpa,
+                    )?
+                };
+                (
+                    residency.has_probe_headroom(mm_key, semantic_base, len, PREFLIGHT_HEADROOM),
+                    residency.has_probe_slot(mm_key, semantic_base, len),
+                    residency.overflow_segment_count(),
+                )
+            };
+            if has_headroom {
+                return Ok(true);
+            }
+            if current_count as usize
+                >= carrick_el1_abi::MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS
+            {
+                return Ok(has_slot);
+            }
+            let extent_len = carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE;
+            let offset = u64::from(current_count) * (extent_len as u64);
+            let seg_gpa = FrameGpa::new(dynamic_residency_gpa.raw() + offset);
+            let seg_va = dynamic_residency_va + offset;
+            let serial = NonZeroU64::new(0x10_0000 + u64::from(current_count) + 1)
+                .ok_or_else(|| error("residency overflow serial"))?;
+            let extent = BackingExtent::private(seg_gpa, extent_len)?;
+            let handles = self.install(&[PreparedBacking {
+                extent: Arc::new(extent),
+                identity: BackingIdentity {
+                    frame_id: serial,
+                    mapping_id: serial,
+                    owner_generation: serial,
+                    inventory_revision: serial,
+                },
+            }])?;
+            let slot = self
+                .slots
+                .get_mut(&handles[0].slot)
+                .ok_or_else(|| error("residency overflow slot disappeared"))?;
+            slot.bootstrap = true;
+            let host_raw =
+                self.record_ptr::<carrick_el1_abi::FrameGrantResidencyOverflowSegment>(seg_gpa)?;
+            let host_ptr = std::ptr::NonNull::new(host_raw)
+                .ok_or_else(|| error("residency overflow host pointer"))?;
+            let meta_extent =
+                carrick_el1_abi::MetadataExtent::new(seg_va, extent_len as u64, serial.get())
+                    .ok_or_else(|| error("residency overflow metadata extent"))?;
+            // SAFETY: `self.slots` retains this zeroed 512 KiB bootstrap extent
+            // mapped at `seg_gpa` / supervisor `seg_va` for the VM lifetime.
+            let residency = unsafe {
+                self.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(residency_gpa)?
+            };
+            let installed = unsafe {
+                residency.install_external_overflow_segment(
+                    host_ptr,
+                    seg_va,
+                    meta_extent,
+                    current_count,
+                )
+            };
+            if let Ok(segment_index) = installed {
+                carrick_observability::probes::frame_grant_residency_segment_grown(
+                    u64::from(segment_index),
+                    residency.slot_capacity() as u64,
+                    seg_va,
+                );
+            } else if residency.overflow_segment_count() <= current_count {
+                return Ok(residency.has_probe_slot(mm_key, semantic_base, len));
+            }
+        }
+    }
+
     /// Borrow an aligned record from retained stage-2 backing.
     ///
     /// # Safety

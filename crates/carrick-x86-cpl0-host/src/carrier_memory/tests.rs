@@ -170,3 +170,82 @@ fn ipc_memslots_retain_original_authority_without_copying() {
         "VM destruction releases authority"
     );
 }
+
+#[test]
+fn ensure_residency_capacity_installs_bootstrap_overflow_segments_past_primary_table() {
+    use crate::cpl0_boot::{DYNAMIC_RESIDENCY_VA, KERNEL_REGION_GPA, RESIDENCY_OVERFLOW_GPA};
+    let mut memory = CarrierMemory::new(TestMemoryIo::default()).unwrap();
+    let serial = NonZeroU64::new(1).unwrap();
+    let region_extent = BackingExtent::private(
+        FrameGpa::new(KERNEL_REGION_GPA),
+        carrick_el1_abi::EL1_REGION_SIZE as usize,
+    )
+    .unwrap();
+    memory
+        .install(&[PreparedBacking {
+            extent: Arc::new(region_extent),
+            identity: BackingIdentity {
+                frame_id: serial,
+                mapping_id: serial,
+                owner_generation: serial,
+                inventory_revision: serial,
+            },
+        }])
+        .unwrap();
+    memory
+        .initialize_fault_records(FrameGpa::new(KERNEL_REGION_GPA))
+        .unwrap();
+
+    let total_pages = carrick_el1_abi::FRAME_GRANT_RESIDENCY_SLOTS + 512;
+    let base_va = 0x5000_0000u64;
+    for idx in 0..total_pages {
+        let va = base_va + (idx as u64) * 4096;
+        assert!(
+            memory
+                .ensure_residency_capacity(
+                    FrameGpa::new(KERNEL_REGION_GPA),
+                    DYNAMIC_RESIDENCY_VA,
+                    FrameGpa::new(RESIDENCY_OVERFLOW_GPA),
+                    1,
+                    va,
+                    4096,
+                )
+                .unwrap()
+        );
+        let residency = unsafe {
+            memory
+                .retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(FrameGpa::new(
+                    KERNEL_REGION_GPA + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+                ))
+                .unwrap()
+        };
+        let slot = residency
+            .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key: 1,
+                semantic_base: va,
+                physical_ipa: 0x3_0000_0000 + (idx as u64) * 4096,
+                len: 4096,
+                mapping_id: 10 + idx as u64,
+                frame_id: 10 + idx as u64,
+                owner_generation: 1,
+                inventory_revision: 1,
+            })
+            .expect("overflow segment must admit grants past 4,096 slots");
+        let page = residency.lookup(1, va).unwrap();
+        assert_eq!(page.slot, slot);
+        assert!(residency.record_commit(page));
+    }
+
+    let residency = unsafe {
+        memory
+            .retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(FrameGpa::new(
+                KERNEL_REGION_GPA + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+            ))
+            .unwrap()
+    };
+    assert!(residency.overflow_segment_count() >= 1);
+    for idx in 0..total_pages {
+        let va = base_va + (idx as u64) * 4096;
+        assert!(residency.is_guest_committed(1, va));
+    }
+}

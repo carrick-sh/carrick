@@ -415,6 +415,8 @@ const _: () = {
     );
 };
 pub const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
+/// Supervisor-only GPA window for on-demand residency overflow segments.
+pub const RESIDENCY_OVERFLOW_GPA: u64 = KERNEL_REGION_GPA + carrick_el1_abi::EL1_REGION_SIZE;
 /// Reserved before dynamic grants, including carriers with no IPC authority.
 pub const IPC_WINDOW_GPA: u64 = 0x2_0000_0000;
 pub const DYNAMIC_GRANT_GPA: u64 = IPC_WINDOW_GPA + carrick_el1_abi::EL1_IPC_SIZE;
@@ -472,6 +474,14 @@ pub const IMAGE_VA: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_BASE;
 pub const IMAGE_SIZE: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE;
 pub const IMAGE_GPA: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA;
 pub const METADATA_VA: u64 = X86_CPL0_DYNAMIC_METADATA_BASE;
+pub const DYNAMIC_RESIDENCY_OFFSET: u64 = (carrick_core_abi::X86_CPL0_ZONE_OFFSET
+    + size_of::<X86Cpl0Zone>() as u64)
+    .next_multiple_of(0x20_0000);
+pub const DYNAMIC_RESIDENCY_VA: u64 = METADATA_VA + DYNAMIC_RESIDENCY_OFFSET;
+pub const DYNAMIC_RESIDENCY_MAP_LEN: u64 =
+    ((carrick_el1_abi::MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS
+        * carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE) as u64)
+        .next_multiple_of(0x20_0000);
 // Fork lifecycle stock: each 16 KiB slot holds a lifecycle page and, 4 KiB
 // above it, the thread control slots. More records than CPUs keep a parent's
 // fork from racing a reaped child that has not yet left its slot.
@@ -495,6 +505,12 @@ const _: () = {
             <= carrick_hal::fork_stock::LIFECYCLE_CONTROLS_OFFSET
     );
     assert!(FORK_LIFECYCLE_OFFSET + FORK_LIFECYCLE_SLOTS * FORK_LIFECYCLE_STRIDE <= META_LEN);
+    assert!(
+        DYNAMIC_RESIDENCY_OFFSET + DYNAMIC_RESIDENCY_MAP_LEN
+            <= carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE
+    );
+    assert!(RESIDENCY_OVERFLOW_GPA.is_multiple_of(0x20_0000));
+    assert!(RESIDENCY_OVERFLOW_GPA + DYNAMIC_RESIDENCY_MAP_LEN <= IPC_WINDOW_GPA);
 };
 pub const USER_CODE: u64 = 0x1_0000;
 pub use carrick_x86::cpl0_entry::DIRECT_VA;
@@ -5746,6 +5762,14 @@ pub fn prepare_boot(
             exec: false,
         });
     }
+    maps.push(Pml4MapSpec {
+        va: DYNAMIC_RESIDENCY_VA,
+        gpa: RESIDENCY_OVERFLOW_GPA,
+        len: DYNAMIC_RESIDENCY_MAP_LEN,
+        user: false,
+        write: true,
+        exec: false,
+    });
     maps.push(Pml4MapSpec {
         va: X86_CPL0_BOOTSTRAP_METADATA_BASE,
         gpa: ALLOCATOR_GPA,

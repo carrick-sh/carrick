@@ -36,6 +36,10 @@ pub enum DescriptorRefusal {
     /// at its reserved copy-window address; only EL1's bounded copy may
     /// write those leaves.
     CarrickOwnedWindow = 24,
+    /// The shared frame-grant residency table has no available slot in its
+    /// currently published segments: the host provisions another segment and
+    /// retries the exact grant.
+    ResidencyCapacity = 25,
 }
 
 impl DescriptorRefusal {
@@ -66,6 +70,7 @@ impl DescriptorRefusal {
             22 => Self::ReclaimCapacity,
             23 => Self::CopyWindowAbsent,
             24 => Self::CarrickOwnedWindow,
+            25 => Self::ResidencyCapacity,
             _ => return None,
         })
     }
@@ -77,17 +82,21 @@ mod tests {
 
     #[test]
     fn both_isa_receipts_carry_the_same_stable_refusal() {
-        let refusal = DescriptorRefusal::StaleRoot;
-        let arm = crate::aarch64::descriptor_txn::DescriptorOutcome::Refused(refusal);
-        let x86 = crate::x86::descriptor_txn::DescriptorOutcome::Refused(refusal);
-        assert_eq!(
-            arm,
-            crate::aarch64::descriptor_txn::DescriptorOutcome::Refused(refusal)
-        );
-        assert_eq!(
-            x86,
-            crate::x86::descriptor_txn::DescriptorOutcome::Refused(refusal)
-        );
-        assert_eq!(DescriptorRefusal::from_code(refusal as u32), Some(refusal));
+        for refusal in [
+            DescriptorRefusal::StaleRoot,
+            DescriptorRefusal::ResidencyCapacity,
+        ] {
+            let arm = crate::aarch64::descriptor_txn::DescriptorOutcome::Refused(refusal);
+            let x86 = crate::x86::descriptor_txn::DescriptorOutcome::Refused(refusal);
+            assert_eq!(
+                arm,
+                crate::aarch64::descriptor_txn::DescriptorOutcome::Refused(refusal)
+            );
+            assert_eq!(
+                x86,
+                crate::x86::descriptor_txn::DescriptorOutcome::Refused(refusal)
+            );
+            assert_eq!(DescriptorRefusal::from_code(refusal as u32), Some(refusal));
+        }
     }
 }

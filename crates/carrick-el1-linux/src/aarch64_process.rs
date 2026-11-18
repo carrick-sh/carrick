@@ -1979,13 +1979,16 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                         let _ = root;
                     },
                 )
-                .map(|receipt| {
-                    matches!(receipt.outcome,
-            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
-                | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
-                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied
-                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot
-                ))
+                .map(|receipt| match receipt.outcome {
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
+                    | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied
+                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot,
+                    ) => (true, false),
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::ResidencyCapacity,
+                    ) => (false, true),
+                    _ => (false, false),
                 })
             };
             Ok(accepted)
@@ -2009,10 +2012,36 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         )?;
         // The carrier authenticated the full receipt. Retain only the retry
         // verdict across the crossing, not a by-value descriptor journal.
-        if applied? != Some(false) {
-            Ok(())
-        } else {
-            Err(MmError::Stale)
+        match applied? {
+            None | Some((true, _)) => Ok(()),
+            Some((false, true)) => {
+                let residency_grown = if let Some(residency) = self.residency {
+                    residency.has_probe_slot(
+                        window.operation.mm.raw(),
+                        window.range.start(),
+                        window.range.len(),
+                    )
+                } else {
+                    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+                    {
+                        carrick_el1::isa::frame_grant_residency_guest().has_probe_slot(
+                            window.operation.mm.raw(),
+                            window.range.start(),
+                            window.range.len(),
+                        )
+                    }
+                    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+                    {
+                        false
+                    }
+                };
+                if residency_grown {
+                    Ok(())
+                } else {
+                    Err(MmError::Stale)
+                }
+            }
+            Some((false, false)) => Err(MmError::Stale),
         }
     }
 

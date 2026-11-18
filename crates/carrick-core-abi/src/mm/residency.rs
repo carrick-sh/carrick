@@ -1,6 +1,8 @@
 //! Exact live residency and retained grant-window custody for either ISA.
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub const FRAME_GRANT_RESIDENCY_SLOTS: usize = 4096;
+pub const FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS: usize = 2048;
+pub const MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS: usize = 63;
 /// Requested bulk extent: 512 Linux pages, clamped by the supplying adapter
 /// at the exact VMA or alignment edge.
 pub const EL1_FRAME_GRANT_TARGET_SIZE: u64 = 2 * 1024 * 1024;
@@ -192,15 +194,179 @@ impl Drop for FrameGrantResidencyRetirement<'_> {
     }
 }
 
-/// Fixed shared open-addressed index. Grants hash by their smallest power-of-two
-/// page-count bucket. A page in a grant lies in its base bucket or the next
-/// bucket, so lookups check those two buckets for each size class. Disjoint
-/// short grants in one 2 MiB window no longer consume one 64-slot chain.
+/// Why a grant's residency row was not published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidencyPublishError {
+    Invalid,
+    Overlap,
+    Capacity,
+}
+
+/// Why an overflow residency segment was not installed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidencySegmentInstallError {
+    InvalidExtent,
+    AlreadyGrown,
+    Exhausted,
+}
+
+/// One dynamically provisioned 2,048-slot residency segment, sized to fit inside
+/// one 512 KiB metadata extent (`EL1_DYNAMIC_METADATA_EXTENT_SIZE`).
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct FrameGrantResidencyOverflowSegment {
+    slots: [FrameGrantResidencyRecord; FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS],
+    dirty: [AtomicU64; FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS / 64],
+}
+
+const _: () = assert!(
+    core::mem::size_of::<FrameGrantResidencyOverflowSegment>()
+        <= crate::EL1_DYNAMIC_METADATA_EXTENT_SIZE
+);
+
+impl FrameGrantResidencyOverflowSegment {
+    pub const fn new() -> Self {
+        Self {
+            slots: [const { FrameGrantResidencyRecord::new() };
+                FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS],
+            dirty: [const { AtomicU64::new(0) }; FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS / 64],
+        }
+    }
+
+    /// Initialize an overflow segment in place without a large stack temporary.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for writes, non-null, aligned to `align_of::<Self>()`,
+    /// and point to storage of at least `size_of::<Self>()` bytes.
+    pub unsafe fn init_in_place(ptr: *mut Self) {
+        unsafe {
+            let slots = core::ptr::addr_of_mut!((*ptr).slots).cast::<FrameGrantResidencyRecord>();
+            for index in 0..FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS {
+                slots.add(index).write(FrameGrantResidencyRecord::new());
+            }
+            let dirty = core::ptr::addr_of_mut!((*ptr).dirty).cast::<AtomicU64>();
+            for index in 0..FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS / 64 {
+                dirty.add(index).write(AtomicU64::new(0));
+            }
+        }
+    }
+}
+
+impl Default for FrameGrantResidencyOverflowSegment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+struct ResidencyOverflowDescriptor {
+    guest_base: AtomicU64,
+    extent_base: AtomicU64,
+    extent_len: AtomicU64,
+    token: AtomicU64,
+}
+
+impl ResidencyOverflowDescriptor {
+    const fn new() -> Self {
+        Self {
+            guest_base: AtomicU64::new(0),
+            extent_base: AtomicU64::new(0),
+            extent_len: AtomicU64::new(0),
+            token: AtomicU64::new(0),
+        }
+    }
+}
+
+struct SegmentView<'a> {
+    base_slot: usize,
+    slots: &'a [FrameGrantResidencyRecord],
+    dirty: &'a [AtomicU64],
+}
+
+#[cfg(not(target_os = "none"))]
+type HostSegmentProvider =
+    alloc::boxed::Box<dyn Fn(&FrameGrantResidencyTable, u32) -> bool + Send + Sync>;
+
+#[cfg(not(target_os = "none"))]
+struct HostTableSegments {
+    provider_lock: AtomicU32,
+    elastic_enabled: AtomicU32,
+    provider: core::cell::UnsafeCell<Option<HostSegmentProvider>>,
+    segments: [core::sync::atomic::AtomicPtr<FrameGrantResidencyOverflowSegment>;
+        MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS],
+    owned: [AtomicU32; MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS],
+}
+
+#[cfg(not(target_os = "none"))]
+// SAFETY: `segments` and `owned` are atomic; `provider` is accessed only under `provider_lock`.
+unsafe impl Sync for HostTableSegments {}
+#[cfg(not(target_os = "none"))]
+unsafe impl Send for HostTableSegments {}
+
+#[cfg(not(target_os = "none"))]
+impl HostTableSegments {
+    fn new() -> Self {
+        Self {
+            provider_lock: AtomicU32::new(0),
+            elastic_enabled: AtomicU32::new(1),
+            provider: core::cell::UnsafeCell::new(None),
+            segments: [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) };
+                MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS],
+            owned: [const { AtomicU32::new(0) }; MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS],
+        }
+    }
+
+    fn find(table: &FrameGrantResidencyTable) -> Option<&Self> {
+        let raw = table.host_state.load(Ordering::Acquire) as usize as *const Self;
+        if raw.is_null() {
+            None
+        } else {
+            // SAFETY: `host_state` lives in supervisor-only memory, is published
+            // once via `Box::into_raw` in `get_or_insert`, and is reclaimed only
+            // under `&mut self` in `Drop`.
+            Some(unsafe { &*raw })
+        }
+    }
+
+    fn get_or_insert(table: &FrameGrantResidencyTable) -> Option<&Self> {
+        if let Some(existing) = Self::find(table) {
+            return Some(existing);
+        }
+        let raw = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(Self::new()));
+        match table.host_state.compare_exchange(
+            0,
+            raw.addr() as u64,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Some(unsafe { &*raw }),
+            Err(actual) => {
+                // SAFETY: `raw` lost the CAS and was never published.
+                unsafe { drop(alloc::boxed::Box::from_raw(raw)) };
+                let ptr = actual as usize as *const Self;
+                (!ptr.is_null()).then(|| unsafe { &*ptr })
+            }
+        }
+    }
+}
+
+/// Shared open-addressed residency index with an inline 4,096-slot primary
+/// segment and up to 63 on-demand 2,048-slot overflow segments. Grants hash by
+/// their smallest power-of-two page-count bucket. A page in a grant lies in
+/// its base bucket or the next bucket, so lookups check those two buckets for
+/// each size class in each active segment.
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct FrameGrantResidencyTable {
     slots: [FrameGrantResidencyRecord; FRAME_GRANT_RESIDENCY_SLOTS],
     dirty: [AtomicU64; FRAME_GRANT_RESIDENCY_SLOTS / 64],
+    publishing: AtomicU32,
+    overflow_count: AtomicU32,
+    host_state: AtomicU64,
+    _header_reserved: [u64; 6],
+    overflow: [ResidencyOverflowDescriptor; MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS],
+    _tail_reserved: [u64; 4],
 }
 
 impl FrameGrantResidencyTable {
@@ -216,6 +382,13 @@ impl FrameGrantResidencyTable {
         Self {
             slots: [const { Self::initial_slot() }; FRAME_GRANT_RESIDENCY_SLOTS],
             dirty: [const { Self::initial_dirty() }; FRAME_GRANT_RESIDENCY_SLOTS / 64],
+            publishing: AtomicU32::new(0),
+            overflow_count: AtomicU32::new(0),
+            host_state: AtomicU64::new(0),
+            _header_reserved: [0; 6],
+            overflow: [const { ResidencyOverflowDescriptor::new() };
+                MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS],
+            _tail_reserved: [0; 4],
         }
     }
 
@@ -237,128 +410,567 @@ impl FrameGrantResidencyTable {
             for index in 0..FRAME_GRANT_RESIDENCY_SLOTS / 64 {
                 dirty.add(index).write(Self::initial_dirty());
             }
+            core::ptr::addr_of_mut!((*ptr).publishing).write(AtomicU32::new(0));
+            core::ptr::addr_of_mut!((*ptr).overflow_count).write(AtomicU32::new(0));
+            core::ptr::addr_of_mut!((*ptr).host_state).write(AtomicU64::new(0));
+            core::ptr::addr_of_mut!((*ptr)._header_reserved).write([0; 6]);
+            let overflow =
+                core::ptr::addr_of_mut!((*ptr).overflow).cast::<ResidencyOverflowDescriptor>();
+            for index in 0..MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS {
+                overflow
+                    .add(index)
+                    .write(ResidencyOverflowDescriptor::new());
+            }
+            core::ptr::addr_of_mut!((*ptr)._tail_reserved).write([0; 4]);
         }
     }
 
-    fn first_slot(mm_key: u64, bucket: u64, class: u32) -> usize {
-        let mixed = mm_key.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            ^ bucket.wrapping_mul(0xbf58_476d_1ce4_e5b9)
-            ^ u64::from(class).wrapping_mul(0x94d0_49bb_1331_11eb);
-        (mixed as usize) & (FRAME_GRANT_RESIDENCY_SLOTS - 1)
+    pub fn overflow_segment_count(&self) -> u32 {
+        self.overflow_count
+            .load(Ordering::Acquire)
+            .min(MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS as u32)
     }
 
-    fn probe(mm_key: u64, bucket: u64, class: u32, offset: usize) -> usize {
-        (Self::first_slot(mm_key, bucket, class) + offset) & (FRAME_GRANT_RESIDENCY_SLOTS - 1)
+    pub fn slot_capacity(&self) -> usize {
+        FRAME_GRANT_RESIDENCY_SLOTS
+            + (self.overflow_segment_count() as usize) * FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS
     }
 
-    /// Host: publish an authenticated grant while the exact-MM mutation guard
-    /// excludes a guest editor. Failure leaves ordinary host first touch live.
-    pub fn publish(&self, identity: FrameGrantResidencyIdentity) -> Option<usize> {
-        if !identity.valid() {
+    fn segment_view(&self, segment: usize) -> Option<SegmentView<'_>> {
+        if segment == 0 {
+            return Some(SegmentView {
+                base_slot: 0,
+                slots: &self.slots,
+                dirty: &self.dirty,
+            });
+        }
+        let overflow_idx = segment - 1;
+        if overflow_idx >= self.overflow_segment_count() as usize {
             return None;
         }
-        // All size classes share one table. Check every covered page before
-        // admission so unlike classes cannot publish overlapping grants.
-        // Exact-MM editors serialize publications for this MM.
+        let base_slot =
+            FRAME_GRANT_RESIDENCY_SLOTS + overflow_idx * FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS;
+        #[cfg(target_os = "none")]
+        {
+            let desc = &self.overflow[overflow_idx];
+            let guest_base = desc.guest_base.load(Ordering::Relaxed);
+            let extent = crate::MetadataExtent::new(
+                desc.extent_base.load(Ordering::Relaxed),
+                desc.extent_len.load(Ordering::Relaxed),
+                desc.token.load(Ordering::Relaxed),
+            )?;
+            if guest_base == 0
+                || !guest_base.is_multiple_of(core::mem::align_of::<
+                    FrameGrantResidencyOverflowSegment,
+                >() as u64)
+                || !extent.contains(
+                    guest_base,
+                    core::mem::size_of::<FrameGrantResidencyOverflowSegment>() as u64,
+                )
+            {
+                return None;
+            }
+            // SAFETY: on `target_os = "none"`, the host carrier mapped this
+            // kernel-only metadata extent before publishing `overflow_count`
+            // with Release ordering, and retains it for the carrier lifetime.
+            let seg = unsafe { &*(guest_base as *const FrameGrantResidencyOverflowSegment) };
+            Some(SegmentView {
+                base_slot,
+                slots: &seg.slots,
+                dirty: &seg.dirty,
+            })
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let host = HostTableSegments::find(self)?;
+            let ptr = host.segments.get(overflow_idx)?.load(Ordering::Acquire);
+            if ptr.is_null() {
+                return None;
+            }
+            // SAFETY: `ptr` comes exclusively from host-owned memory (never
+            // guest-writable ABI words) and remains valid for `&self`'s lifetime.
+            let seg = unsafe { &*ptr };
+            Some(SegmentView {
+                base_slot,
+                slots: &seg.slots,
+                dirty: &seg.dirty,
+            })
+        }
+    }
+
+    fn slot_parts(&self, slot: usize) -> Option<(&FrameGrantResidencyRecord, &AtomicU64, usize)> {
+        if slot < FRAME_GRANT_RESIDENCY_SLOTS {
+            return Some((&self.slots[slot], &self.dirty[slot / 64], slot % 64));
+        }
+        let rem = slot - FRAME_GRANT_RESIDENCY_SLOTS;
+        let overflow_idx = rem / FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS;
+        let local = rem % FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS;
+        let view = self.segment_view(1 + overflow_idx)?;
+        Some((
+            view.slots.get(local)?,
+            view.dirty.get(local / 64)?,
+            local % 64,
+        ))
+    }
+
+    fn first_slot_in_segment(
+        mm_key: u64,
+        bucket: u64,
+        class: u32,
+        segment: usize,
+        segment_slots: usize,
+    ) -> usize {
+        let salt = (segment as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+        let mixed = mm_key.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ bucket.wrapping_mul(0xbf58_476d_1ce4_e5b9)
+            ^ u64::from(class).wrapping_mul(0x94d0_49bb_1331_11eb)
+            ^ salt;
+        (mixed as usize) & (segment_slots - 1)
+    }
+
+    fn probe_in_segment(
+        mm_key: u64,
+        bucket: u64,
+        class: u32,
+        segment: usize,
+        segment_slots: usize,
+        offset: usize,
+    ) -> usize {
+        (Self::first_slot_in_segment(mm_key, bucket, class, segment, segment_slots) + offset)
+            & (segment_slots - 1)
+    }
+
+    /// True if currently published segments hold at least `min_slots` empty or
+    /// retired slots in the bounded probe chain for `(mm_key, semantic_base, len)`.
+    pub fn has_probe_headroom(
+        &self,
+        mm_key: u64,
+        semantic_base: u64,
+        len: u64,
+        min_slots: usize,
+    ) -> bool {
+        if min_slots == 0 {
+            return true;
+        }
+        if mm_key == 0
+            || len == 0
+            || len > EL1_FRAME_GRANT_TARGET_SIZE
+            || !semantic_base.is_multiple_of(GRANT_PAGE_SIZE)
+            || !len.is_multiple_of(GRANT_PAGE_SIZE)
+        {
+            return false;
+        }
+        let class = (len / GRANT_PAGE_SIZE).next_power_of_two().trailing_zeros();
+        let bucket = semantic_base / (GRANT_PAGE_SIZE << class);
+        let total_segments = 1 + self.overflow_segment_count() as usize;
+        let mut available = 0usize;
+        for segment in 0..total_segments {
+            let Some(view) = self.segment_view(segment) else {
+                continue;
+            };
+            let segment_slots = view.slots.len();
+            for probe in 0..GRANT_PROBES {
+                let local =
+                    Self::probe_in_segment(mm_key, bucket, class, segment, segment_slots, probe);
+                let state = view.slots[local].state.load(Ordering::Acquire);
+                if state == GRANT_EMPTY || state & GRANT_STATE_MASK == GRANT_RETIRED {
+                    available += 1;
+                    if available >= min_slots {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// True if at least one currently published segment has an empty or retired
+    /// slot in the bounded probe chain for `(mm_key, semantic_base, len)`.
+    pub fn has_probe_slot(&self, mm_key: u64, semantic_base: u64, len: u64) -> bool {
+        self.has_probe_headroom(mm_key, semantic_base, len, 1)
+    }
+
+    /// Register a carrier-specific segment allocator once on the host. When set,
+    /// `provision_overflow_segment` maps shared guest+host metadata extents via
+    /// this carrier callback instead of unmapped host heap memory.
+    #[cfg(not(target_os = "none"))]
+    pub fn register_host_segment_provider_if_unset(&self, provider: HostSegmentProvider) {
+        let Some(host) = HostTableSegments::get_or_insert(self) else {
+            return;
+        };
+        while host
+            .provider_lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        // SAFETY: `provider_lock` serializes all access to `host.provider`.
+        unsafe {
+            let slot = &mut *host.provider.get();
+            if slot.is_none() {
+                *slot = Some(provider);
+            }
+        }
+        host.provider_lock.store(0, Ordering::Release);
+    }
+
+    /// Enable or withhold host-driven segment growth (used by capacity-refusal
+    /// unit witnesses to observe `DescriptorRefusal::ResidencyCapacity` before
+    /// explicitly provisioning the next segment).
+    #[cfg(not(target_os = "none"))]
+    pub fn set_elastic_growth_enabled(&self, enabled: bool) {
+        if let Some(host) = HostTableSegments::get_or_insert(self) {
+            host.elastic_enabled
+                .store(u32::from(enabled), Ordering::Release);
+        }
+    }
+
+    /// Install a carrier-retained shared overflow segment at `expected_overflow_count`.
+    ///
+    /// # Safety
+    /// `host_ptr` must point to valid, writable, 64-byte-aligned storage of at
+    /// least `size_of::<FrameGrantResidencyOverflowSegment>()` bytes that
+    /// outlives `self` and every `FrameGrantTransferPin` borrowed from `self`,
+    /// mapped into the guest kernel metadata aperture at `guest_base` within `extent`.
+    #[cfg(not(target_os = "none"))]
+    pub unsafe fn install_external_overflow_segment(
+        &self,
+        host_ptr: core::ptr::NonNull<FrameGrantResidencyOverflowSegment>,
+        guest_base: u64,
+        extent: crate::MetadataExtent,
+        expected_overflow_count: u32,
+    ) -> Result<u32, ResidencySegmentInstallError> {
+        unsafe {
+            self.install_overflow_segment_inner(
+                host_ptr,
+                guest_base,
+                extent,
+                expected_overflow_count,
+                false,
+            )
+        }
+    }
+
+    #[cfg(not(target_os = "none"))]
+    unsafe fn install_overflow_segment_inner(
+        &self,
+        host_ptr: core::ptr::NonNull<FrameGrantResidencyOverflowSegment>,
+        guest_base: u64,
+        extent: crate::MetadataExtent,
+        expected_overflow_count: u32,
+        owned_by_table: bool,
+    ) -> Result<u32, ResidencySegmentInstallError> {
+        let seg_bytes = core::mem::size_of::<FrameGrantResidencyOverflowSegment>() as u64;
+        let seg_align = core::mem::align_of::<FrameGrantResidencyOverflowSegment>();
+        if guest_base == 0
+            || !guest_base.is_multiple_of(seg_align as u64)
+            || !host_ptr.as_ptr().addr().is_multiple_of(seg_align)
+            || !extent.contains(guest_base, seg_bytes)
+        {
+            return Err(ResidencySegmentInstallError::InvalidExtent);
+        }
+        let Some(host) = HostTableSegments::get_or_insert(self) else {
+            return Err(ResidencySegmentInstallError::Exhausted);
+        };
+        if self.overflow_segment_count() > expected_overflow_count {
+            return Err(ResidencySegmentInstallError::AlreadyGrown);
+        }
+        if (expected_overflow_count as usize) >= MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS {
+            return Err(ResidencySegmentInstallError::Exhausted);
+        }
+        // SAFETY: caller owns `host_ptr` exclusively prior to publication.
+        unsafe { FrameGrantResidencyOverflowSegment::init_in_place(host_ptr.as_ptr()) };
+
+        while self
+            .publishing
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        let current = self.overflow_count.load(Ordering::Relaxed);
+        if current != expected_overflow_count {
+            self.publishing.store(0, Ordering::Release);
+            return Err(ResidencySegmentInstallError::AlreadyGrown);
+        }
+        let idx = current as usize;
+        if idx >= MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS {
+            self.publishing.store(0, Ordering::Release);
+            return Err(ResidencySegmentInstallError::Exhausted);
+        }
+        host.owned[idx].store(u32::from(owned_by_table), Ordering::Relaxed);
+        host.segments[idx].store(host_ptr.as_ptr(), Ordering::Release);
+        let desc = &self.overflow[idx];
+        desc.guest_base.store(guest_base, Ordering::Relaxed);
+        desc.extent_base.store(extent.base(), Ordering::Relaxed);
+        desc.extent_len.store(extent.len(), Ordering::Relaxed);
+        desc.token.store(extent.token(), Ordering::Relaxed);
+        self.overflow_count.store(current + 1, Ordering::Release);
+        self.publishing.store(0, Ordering::Release);
+        Ok(current + 1)
+    }
+
+    /// Provision one overflow segment when `overflow_segment_count() == expected_overflow_count`.
+    /// Uses the carrier's registered shared-aperture provider when attached, or
+    /// fallible host allocation in VM-free / host-only configurations.
+    #[cfg(not(target_os = "none"))]
+    pub fn provision_overflow_segment(&self, expected_overflow_count: u32) -> bool {
+        if self.overflow_segment_count() > expected_overflow_count {
+            return true;
+        }
+        if (expected_overflow_count as usize) >= MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS {
+            return false;
+        }
+        let Some(host) = HostTableSegments::get_or_insert(self) else {
+            return false;
+        };
+        while host
+            .provider_lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        let result = if self.overflow_segment_count() > expected_overflow_count {
+            true
+        } else {
+            // SAFETY: `provider_lock` is held exclusively here.
+            let provider = unsafe { (*host.provider.get()).as_ref() };
+            if let Some(provide) = provider {
+                provide(self, expected_overflow_count)
+            } else {
+                self.provision_host_only_segment(expected_overflow_count)
+            }
+        };
+        host.provider_lock.store(0, Ordering::Release);
+        result
+    }
+
+    #[cfg(not(target_os = "none"))]
+    fn provision_host_only_segment(&self, expected_overflow_count: u32) -> bool {
+        let layout = core::alloc::Layout::new::<FrameGrantResidencyOverflowSegment>();
+        // SAFETY: layout has nonzero size (`393,472` bytes) and 64-byte alignment;
+        // null return is handled fallibly without aborting.
+        let raw = unsafe { alloc::alloc::alloc_zeroed(layout) }
+            .cast::<FrameGrantResidencyOverflowSegment>();
+        let Some(ptr) = core::ptr::NonNull::new(raw) else {
+            return false;
+        };
+        let addr = ptr.as_ptr().addr() as u64;
+        let Some(extent) = crate::MetadataExtent::new(
+            addr,
+            layout.size() as u64,
+            u64::from(expected_overflow_count) + 1,
+        ) else {
+            unsafe { alloc::alloc::dealloc(ptr.as_ptr().cast(), layout) };
+            return false;
+        };
+        // SAFETY: freshly allocated zeroed host segment owned by `HostTableSegments`
+        // until `Self::drop` reclaims it.
+        let installed = unsafe {
+            self.install_overflow_segment_inner(ptr, addr, extent, expected_overflow_count, true)
+        };
+        if installed.is_err() {
+            unsafe { alloc::alloc::dealloc(ptr.as_ptr().cast(), layout) };
+            return self.overflow_segment_count() > expected_overflow_count;
+        }
+        true
+    }
+
+    /// Ensure at least one probe slot exists for `(mm_key, semantic_base, len)`
+    /// before entering an exact-MM editor, growing on demand when enabled.
+    #[cfg(not(target_os = "none"))]
+    pub fn ensure_capacity_for(&self, mm_key: u64, semantic_base: u64, len: u64) -> bool {
+        const PREFLIGHT_HEADROOM: usize = 4;
+        if self.has_probe_headroom(mm_key, semantic_base, len, PREFLIGHT_HEADROOM) {
+            return true;
+        }
+        if let Some(host) = HostTableSegments::find(self)
+            && host.elastic_enabled.load(Ordering::Acquire) == 0
+        {
+            return self.has_probe_slot(mm_key, semantic_base, len);
+        }
+        while !self.has_probe_headroom(mm_key, semantic_base, len, PREFLIGHT_HEADROOM) {
+            let current = self.overflow_segment_count();
+            if current as usize >= MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS
+                || !self.provision_overflow_segment(current)
+            {
+                return self.has_probe_slot(mm_key, semantic_base, len);
+            }
+        }
+        true
+    }
+
+    /// Publish an authenticated grant while the exact-MM mutation guard
+    /// excludes a guest editor, returning the typed refusal reason on failure.
+    pub fn try_publish(
+        &self,
+        identity: FrameGrantResidencyIdentity,
+    ) -> Result<usize, ResidencyPublishError> {
+        if !identity.valid() {
+            return Err(ResidencyPublishError::Invalid);
+        }
+        // All size classes and segments share one logical index. Check every
+        // covered page before admission so unlike classes or segments cannot
+        // publish overlapping grants. Exact-MM editors serialize publications
+        // for this MM.
         for page in (identity.semantic_base..identity.semantic_base + identity.len)
             .step_by(GRANT_PAGE_SIZE as usize)
         {
             if self.lookup(identity.mm_key, page).is_some() {
-                return None;
+                return Err(ResidencyPublishError::Overlap);
             }
         }
         let class = (identity.len / GRANT_PAGE_SIZE)
             .next_power_of_two()
             .trailing_zeros();
         let bucket = identity.semantic_base / (GRANT_PAGE_SIZE << class);
-        let mut available = None;
-        for probe in 0..GRANT_PROBES {
-            let slot = Self::probe(identity.mm_key, bucket, class, probe);
-            let record = &self.slots[slot];
-            let state = record.state.load(Ordering::Acquire);
-            if state & GRANT_STATE_MASK == GRANT_LIVE {
-                let prior = record.identity();
-                if prior.mm_key == identity.mm_key
-                    && prior.semantic_base < identity.semantic_base + identity.len
-                    && identity.semantic_base < prior.semantic_base + prior.len
-                {
-                    return None;
+        let total_segments = 1 + self.overflow_segment_count() as usize;
+        let mut available: Option<(usize, &FrameGrantResidencyRecord)> = None;
+
+        for segment in 0..total_segments {
+            let Some(view) = self.segment_view(segment) else {
+                continue;
+            };
+            let segment_slots = view.slots.len();
+            for probe in 0..GRANT_PROBES {
+                let local = Self::probe_in_segment(
+                    identity.mm_key,
+                    bucket,
+                    class,
+                    segment,
+                    segment_slots,
+                    probe,
+                );
+                let global_slot = view.base_slot + local;
+                let record = &view.slots[local];
+                let state = record.state.load(Ordering::Acquire);
+                if state & GRANT_STATE_MASK == GRANT_LIVE {
+                    let prior = record.identity();
+                    if prior.mm_key == identity.mm_key
+                        && prior.semantic_base < identity.semantic_base + identity.len
+                        && identity.semantic_base < prior.semantic_base + prior.len
+                    {
+                        return Err(ResidencyPublishError::Overlap);
+                    }
+                } else if state == GRANT_EMPTY {
+                    if available.is_none() {
+                        available = Some((global_slot, record));
+                    }
+                    break;
+                } else if state & GRANT_STATE_MASK == GRANT_RETIRED && available.is_none() {
+                    available = Some((global_slot, record));
                 }
-            } else if state == GRANT_EMPTY {
-                available.get_or_insert(slot);
+            }
+            if available.is_some() {
                 break;
-            } else if state & GRANT_STATE_MASK == GRANT_RETIRED {
-                available.get_or_insert(slot);
             }
         }
-        let slot = available?;
-        let record = &self.slots[slot];
+
+        let Some((slot, record)) = available else {
+            return Err(ResidencyPublishError::Capacity);
+        };
         let state = record.state.load(Ordering::Acquire);
-        record
-            .state
-            .compare_exchange(
-                state,
-                (state & !GRANT_STATE_MASK).wrapping_add(4) | GRANT_WRITING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok()?;
+        if state & GRANT_STATE_MASK == GRANT_LIVE
+            || state & GRANT_STATE_MASK == GRANT_WRITING
+            || record
+                .state
+                .compare_exchange(
+                    state,
+                    (state & !GRANT_STATE_MASK).wrapping_add(4) | GRANT_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return Err(ResidencyPublishError::Capacity);
+        }
         record.publish(identity);
-        Some(slot)
+        Ok(slot)
     }
 
-    /// Diagnostic sample of occupied slots, including in-flight publishers.
-    /// Other MMs can change the table during the scan.
+    /// Host: publish an authenticated grant while the exact-MM mutation guard
+    /// excludes a guest editor. Failure leaves ordinary host first touch live.
+    pub fn publish(&self, identity: FrameGrantResidencyIdentity) -> Option<usize> {
+        self.try_publish(identity).ok()
+    }
+
+    /// Diagnostic sample of occupied slots across all active segments, including
+    /// in-flight publishers. Other MMs can change the table during the scan.
     pub fn observed_slots_used(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.state.load(Ordering::Relaxed) & GRANT_STATE_MASK,
-                    GRANT_WRITING | GRANT_LIVE
-                )
-            })
-            .count()
+        let total_segments = 1 + self.overflow_segment_count() as usize;
+        let mut count = 0;
+        for segment in 0..total_segments {
+            let Some(view) = self.segment_view(segment) else {
+                continue;
+            };
+            count += view
+                .slots
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.state.load(Ordering::Relaxed) & GRANT_STATE_MASK,
+                        GRANT_WRITING | GRANT_LIVE
+                    )
+                })
+                .count();
+        }
+        count
     }
 
     /// Guest: find the exact live grant covering a prepared leaf.
     pub fn lookup(&self, mm_key: u64, va: u64) -> Option<FrameGrantResidencyPage> {
         let page = va & !(GRANT_PAGE_SIZE - 1);
-        for class in 0..=EL1_FRAME_GRANT_TARGET_SIZE
+        let max_class = EL1_FRAME_GRANT_TARGET_SIZE
             .div_ceil(GRANT_PAGE_SIZE)
-            .trailing_zeros()
-        {
-            let bucket = page / (GRANT_PAGE_SIZE << class);
-            for candidate in [Some(bucket), (class > 0 && bucket > 0).then(|| bucket - 1)]
-                .into_iter()
-                .flatten()
-            {
-                for probe in 0..GRANT_PROBES {
-                    let slot = Self::probe(mm_key, candidate, class, probe);
-                    let record = &self.slots[slot];
-                    let epoch = record.state.load(Ordering::Acquire);
-                    match epoch & GRANT_STATE_MASK {
-                        GRANT_EMPTY => break,
-                        GRANT_LIVE => {
-                            let identity = record.identity();
-                            if identity.mm_key == mm_key
-                                && page >= identity.semantic_base
-                                && page - identity.semantic_base < identity.len
-                                && record.state.load(Ordering::Acquire) == epoch
-                            {
-                                let bit =
-                                    ((page - identity.semantic_base) / GRANT_PAGE_SIZE) as usize;
-                                return Some(FrameGrantResidencyPage {
-                                    slot,
-                                    identity,
-                                    expected_ipa: identity.physical_ipa
-                                        + bit as u64 * GRANT_PAGE_SIZE,
-                                    epoch,
-                                    bit,
-                                });
+            .trailing_zeros();
+        let total_segments = 1 + self.overflow_segment_count() as usize;
+        for segment in 0..total_segments {
+            let Some(view) = self.segment_view(segment) else {
+                continue;
+            };
+            let segment_slots = view.slots.len();
+            for class in 0..=max_class {
+                let bucket = page / (GRANT_PAGE_SIZE << class);
+                for candidate in [Some(bucket), (class > 0 && bucket > 0).then(|| bucket - 1)]
+                    .into_iter()
+                    .flatten()
+                {
+                    for probe in 0..GRANT_PROBES {
+                        let local = Self::probe_in_segment(
+                            mm_key,
+                            candidate,
+                            class,
+                            segment,
+                            segment_slots,
+                            probe,
+                        );
+                        let record = &view.slots[local];
+                        let epoch = record.state.load(Ordering::Acquire);
+                        match epoch & GRANT_STATE_MASK {
+                            GRANT_EMPTY => break,
+                            GRANT_LIVE => {
+                                let identity = record.identity();
+                                if identity.mm_key == mm_key
+                                    && page >= identity.semantic_base
+                                    && page - identity.semantic_base < identity.len
+                                    && record.state.load(Ordering::Acquire) == epoch
+                                {
+                                    let bit = ((page - identity.semantic_base) / GRANT_PAGE_SIZE)
+                                        as usize;
+                                    return Some(FrameGrantResidencyPage {
+                                        slot: view.base_slot + local,
+                                        identity,
+                                        expected_ipa: identity.physical_ipa
+                                            + bit as u64 * GRANT_PAGE_SIZE,
+                                        epoch,
+                                        bit,
+                                    });
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -370,7 +982,7 @@ impl FrameGrantResidencyTable {
     /// editor. A racing retirement either closes admission first or observes
     /// this pin and refuses; stale page tokens cannot pin a successor.
     pub fn pin_transfer(&self, page: FrameGrantResidencyPage) -> Option<FrameGrantTransferPin<'_>> {
-        let record = self.slots.get(page.slot)?;
+        let (record, _, _) = self.slot_parts(page.slot)?;
         if record.state.load(Ordering::Acquire) != page.epoch || record.identity() != page.identity
         {
             return None;
@@ -392,7 +1004,7 @@ impl FrameGrantResidencyTable {
 
     /// Guest: record a committed VALID leaf before releasing the MM editor.
     pub fn record_commit(&self, page: FrameGrantResidencyPage) -> bool {
-        let Some(record) = self.slots.get(page.slot) else {
+        let Some((record, dirty_word, dirty_bit)) = self.slot_parts(page.slot) else {
             return false;
         };
         if record.state.load(Ordering::Acquire) != page.epoch
@@ -403,7 +1015,7 @@ impl FrameGrantResidencyTable {
             return false;
         }
         record.committed[page.bit / 64].fetch_or(1 << (page.bit % 64), Ordering::Release);
-        self.dirty[page.slot / 64].fetch_or(1 << (page.slot % 64), Ordering::Release);
+        dirty_word.fetch_or(1 << dirty_bit, Ordering::Release);
         true
     }
 
@@ -413,7 +1025,9 @@ impl FrameGrantResidencyTable {
         let Some(page) = self.lookup(mm_key, va) else {
             return false;
         };
-        let record = &self.slots[page.slot];
+        let Some((record, _, _)) = self.slot_parts(page.slot) else {
+            return false;
+        };
         record.state.load(Ordering::Acquire) == page.epoch
             && record.identity() == page.identity
             && record.committed[page.bit / 64].load(Ordering::Acquire) & (1 << (page.bit % 64)) != 0
@@ -428,21 +1042,30 @@ impl FrameGrantResidencyTable {
         mm_key: u64,
         mut visit: impl FnMut(usize, FrameGrantResidencyIdentity, [u64; 8]) -> core::ops::ControlFlow<B>,
     ) -> core::ops::ControlFlow<B> {
-        for (word_index, word) in self.dirty.iter().enumerate() {
-            let mut pending = word.load(Ordering::Acquire);
-            while pending != 0 {
-                let bit = pending.trailing_zeros() as usize;
-                pending &= pending - 1;
-                let slot = word_index * 64 + bit;
-                let record = &self.slots[slot];
-                let epoch = record.state.load(Ordering::Acquire);
-                if epoch & GRANT_STATE_MASK == GRANT_LIVE {
-                    let identity = record.identity();
-                    if identity.mm_key == mm_key && record.state.load(Ordering::Acquire) == epoch {
-                        let bits =
-                            core::array::from_fn(|i| record.committed[i].load(Ordering::Acquire));
-                        if record.state.load(Ordering::Acquire) == epoch {
-                            visit(slot, identity, bits)?;
+        let total_segments = 1 + self.overflow_segment_count() as usize;
+        for segment in 0..total_segments {
+            let Some(view) = self.segment_view(segment) else {
+                continue;
+            };
+            for (word_index, word) in view.dirty.iter().enumerate() {
+                let mut pending = word.load(Ordering::Acquire);
+                while pending != 0 {
+                    let bit = pending.trailing_zeros() as usize;
+                    pending &= pending - 1;
+                    let local = word_index * 64 + bit;
+                    let record = &view.slots[local];
+                    let epoch = record.state.load(Ordering::Acquire);
+                    if epoch & GRANT_STATE_MASK == GRANT_LIVE {
+                        let identity = record.identity();
+                        if identity.mm_key == mm_key
+                            && record.state.load(Ordering::Acquire) == epoch
+                        {
+                            let bits = core::array::from_fn(|i| {
+                                record.committed[i].load(Ordering::Acquire)
+                            });
+                            if record.state.load(Ordering::Acquire) == epoch {
+                                visit(view.base_slot + local, identity, bits)?;
+                            }
                         }
                     }
                 }
@@ -452,7 +1075,7 @@ impl FrameGrantResidencyTable {
     }
 
     pub fn ack_dirty(&self, slot: usize, identity: FrameGrantResidencyIdentity) -> bool {
-        let Some(record) = self.slots.get(slot) else {
+        let Some((record, dirty_word, dirty_bit)) = self.slot_parts(slot) else {
             return false;
         };
         if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE
@@ -460,7 +1083,7 @@ impl FrameGrantResidencyTable {
         {
             return false;
         }
-        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        dirty_word.fetch_and(!(1 << dirty_bit), Ordering::AcqRel);
         true
     }
 
@@ -470,7 +1093,7 @@ impl FrameGrantResidencyTable {
         slot: usize,
         identity: FrameGrantResidencyIdentity,
     ) -> Option<[u64; 8]> {
-        let record = self.slots.get(slot)?;
+        let (record, _, _) = self.slot_parts(slot)?;
         let epoch = record.state.load(Ordering::Acquire);
         if epoch & GRANT_STATE_MASK != GRANT_LIVE || record.identity() != identity {
             return None;
@@ -481,7 +1104,7 @@ impl FrameGrantResidencyTable {
 
     /// Host: retire this exact grant before unmapping or reusing its owner.
     pub fn retire(&self, slot: usize, identity: FrameGrantResidencyIdentity) -> bool {
-        let Some(record) = self.slots.get(slot) else {
+        let Some((record, dirty_word, dirty_bit)) = self.slot_parts(slot) else {
             return false;
         };
         let epoch = record.state.load(Ordering::Acquire);
@@ -508,7 +1131,7 @@ impl FrameGrantResidencyTable {
             record.transfer_pins.store(0, Ordering::Release);
             return false;
         }
-        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        dirty_word.fetch_and(!(1 << dirty_bit), Ordering::AcqRel);
         true
     }
 
@@ -523,19 +1146,25 @@ impl FrameGrantResidencyTable {
         mut visit: impl FnMut(u64, u64),
     ) {
         let end = start.saturating_add(len);
-        for record in &self.slots {
-            let state = record.state.load(Ordering::Acquire);
-            if state & GRANT_STATE_MASK != GRANT_LIVE {
+        let total_segments = 1 + self.overflow_segment_count() as usize;
+        for segment in 0..total_segments {
+            let Some(view) = self.segment_view(segment) else {
                 continue;
-            }
-            let identity = record.identity();
-            let grant_end = identity.semantic_base.saturating_add(identity.len);
-            if identity.mm_key == mm_key
-                && identity.semantic_base < end
-                && start < grant_end
-                && record.state.load(Ordering::Acquire) == state
-            {
-                visit(identity.semantic_base, grant_end);
+            };
+            for record in view.slots {
+                let state = record.state.load(Ordering::Acquire);
+                if state & GRANT_STATE_MASK != GRANT_LIVE {
+                    continue;
+                }
+                let identity = record.identity();
+                let grant_end = identity.semantic_base.saturating_add(identity.len);
+                if identity.mm_key == mm_key
+                    && identity.semantic_base < end
+                    && start < grant_end
+                    && record.state.load(Ordering::Acquire) == state
+                {
+                    visit(identity.semantic_base, grant_end);
+                }
             }
         }
     }
@@ -552,17 +1181,23 @@ impl FrameGrantResidencyTable {
         if start >= end {
             return true;
         }
-        for (slot, record) in self.slots.iter().enumerate() {
-            if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE {
+        let total_segments = 1 + self.overflow_segment_count() as usize;
+        for segment in 0..total_segments {
+            let Some(view) = self.segment_view(segment) else {
                 continue;
-            }
-            let identity = record.identity();
-            if identity.mm_key == mm_key
-                && identity.semantic_base < end
-                && start < identity.semantic_base.saturating_add(identity.len)
-                && !self.retire_fragment(slot, identity, start, end)
-            {
-                return false;
+            };
+            for (local, record) in view.slots.iter().enumerate() {
+                if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE {
+                    continue;
+                }
+                let identity = record.identity();
+                if identity.mm_key == mm_key
+                    && identity.semantic_base < end
+                    && start < identity.semantic_base.saturating_add(identity.len)
+                    && !self.retire_fragment(view.base_slot + local, identity, start, end)
+                {
+                    return false;
+                }
             }
         }
         true
@@ -581,36 +1216,42 @@ impl FrameGrantResidencyTable {
         if mm_key == 0 || start >= end {
             return None;
         }
-        for record in &self.slots {
-            let state = record.state.load(Ordering::Acquire);
-            if state & GRANT_STATE_MASK != GRANT_LIVE {
+        let total_segments = 1 + self.overflow_segment_count() as usize;
+        for segment in 0..total_segments {
+            let Some(view) = self.segment_view(segment) else {
                 continue;
-            }
-            let identity = record.identity();
-            if identity.mm_key != mm_key
-                || identity.semantic_base >= end
-                || start >= identity.semantic_base.saturating_add(identity.len)
-                || record.state.load(Ordering::Acquire) != state
-            {
-                continue;
-            }
-            if record
-                .transfer_pins
-                .compare_exchange(
-                    0,
-                    TRANSFER_PIN_RETIRING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                self.cancel_retirement(mm_key, start, end);
-                return None;
-            }
-            if record.state.load(Ordering::Acquire) != state || record.identity() != identity {
-                record.transfer_pins.store(0, Ordering::Release);
-                self.cancel_retirement(mm_key, start, end);
-                return None;
+            };
+            for record in view.slots {
+                let state = record.state.load(Ordering::Acquire);
+                if state & GRANT_STATE_MASK != GRANT_LIVE {
+                    continue;
+                }
+                let identity = record.identity();
+                if identity.mm_key != mm_key
+                    || identity.semantic_base >= end
+                    || start >= identity.semantic_base.saturating_add(identity.len)
+                    || record.state.load(Ordering::Acquire) != state
+                {
+                    continue;
+                }
+                if record
+                    .transfer_pins
+                    .compare_exchange(
+                        0,
+                        TRANSFER_PIN_RETIRING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    self.cancel_retirement(mm_key, start, end);
+                    return None;
+                }
+                if record.state.load(Ordering::Acquire) != state || record.identity() != identity {
+                    record.transfer_pins.store(0, Ordering::Release);
+                    self.cancel_retirement(mm_key, start, end);
+                    return None;
+                }
             }
         }
         Some(FrameGrantResidencyRetirement {
@@ -623,40 +1264,52 @@ impl FrameGrantResidencyTable {
     }
 
     fn cancel_retirement(&self, mm_key: u64, start: u64, end: u64) {
-        for record in &self.slots {
-            let state = record.state.load(Ordering::Acquire);
-            if state & GRANT_STATE_MASK != GRANT_LIVE {
+        let total_segments = 1 + self.overflow_segment_count() as usize;
+        for segment in 0..total_segments {
+            let Some(view) = self.segment_view(segment) else {
                 continue;
-            }
-            let identity = record.identity();
-            if identity.mm_key == mm_key
-                && identity.semantic_base < end
-                && start < identity.semantic_base.saturating_add(identity.len)
-                && record.state.load(Ordering::Acquire) == state
-            {
-                let _ = record.transfer_pins.compare_exchange(
-                    TRANSFER_PIN_RETIRING,
-                    0,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+            };
+            for record in view.slots {
+                let state = record.state.load(Ordering::Acquire);
+                if state & GRANT_STATE_MASK != GRANT_LIVE {
+                    continue;
+                }
+                let identity = record.identity();
+                if identity.mm_key == mm_key
+                    && identity.semantic_base < end
+                    && start < identity.semantic_base.saturating_add(identity.len)
+                    && record.state.load(Ordering::Acquire) == state
+                {
+                    let _ = record.transfer_pins.compare_exchange(
+                        TRANSFER_PIN_RETIRING,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
             }
         }
     }
 
     fn commit_retirement(&self, mm_key: u64, start: u64, end: u64) -> bool {
-        for (slot, record) in self.slots.iter().enumerate() {
-            let state = record.state.load(Ordering::Acquire);
-            if state & GRANT_STATE_MASK != GRANT_LIVE {
+        let total_segments = 1 + self.overflow_segment_count() as usize;
+        for segment in 0..total_segments {
+            let Some(view) = self.segment_view(segment) else {
                 continue;
-            }
-            let identity = record.identity();
-            if identity.mm_key == mm_key
-                && identity.semantic_base < end
-                && start < identity.semantic_base.saturating_add(identity.len)
-                && !self.retire_claimed_fragment(slot, identity, start, end)
-            {
-                return false;
+            };
+            for (local, record) in view.slots.iter().enumerate() {
+                let state = record.state.load(Ordering::Acquire);
+                if state & GRANT_STATE_MASK != GRANT_LIVE {
+                    continue;
+                }
+                let identity = record.identity();
+                if identity.mm_key == mm_key
+                    && identity.semantic_base < end
+                    && start < identity.semantic_base.saturating_add(identity.len)
+                    && !self.retire_claimed_fragment(view.base_slot + local, identity, start, end)
+                {
+                    return false;
+                }
             }
         }
         true
@@ -708,7 +1361,7 @@ impl FrameGrantResidencyTable {
         start: u64,
         end: u64,
     ) -> bool {
-        let Some(record) = self.slots.get(slot) else {
+        let Some((record, dirty_word, dirty_bit)) = self.slot_parts(slot) else {
             return false;
         };
         let state = record.state.load(Ordering::Acquire);
@@ -731,7 +1384,7 @@ impl FrameGrantResidencyTable {
         {
             return false;
         }
-        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        dirty_word.fetch_and(!(1 << dirty_bit), Ordering::AcqRel);
         self.publish_retirement_fragments(identity, bits, start, end);
         true
     }
@@ -760,18 +1413,42 @@ impl FrameGrantResidencyTable {
                 len: fragment_end - fragment_start,
                 ..identity
             };
-            if let Some(fragment_slot) = self.publish(fragment) {
+            #[cfg(not(target_os = "none"))]
+            let _ = self.ensure_capacity_for(fragment.mm_key, fragment.semantic_base, fragment.len);
+            if let Some(fragment_slot) = self.publish(fragment)
+                && let Some((record, dirty_word, dirty_bit)) = self.slot_parts(fragment_slot)
+            {
                 let shift = ((fragment_start - base) / GRANT_PAGE_SIZE) as usize;
                 let count = (fragment.len / GRANT_PAGE_SIZE) as usize;
                 for bit in 0..count {
                     let old_bit = shift + bit;
                     if bits[old_bit / 64] & (1 << (old_bit % 64)) != 0 {
-                        self.slots[fragment_slot].committed[bit / 64]
-                            .fetch_or(1 << (bit % 64), Ordering::Release);
-                        self.dirty[fragment_slot / 64]
-                            .fetch_or(1 << (fragment_slot % 64), Ordering::Release);
+                        record.committed[bit / 64].fetch_or(1 << (bit % 64), Ordering::Release);
+                        dirty_word.fetch_or(1 << dirty_bit, Ordering::Release);
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+impl Drop for FrameGrantResidencyTable {
+    fn drop(&mut self) {
+        let raw = self.host_state.swap(0, Ordering::AcqRel) as usize as *mut HostTableSegments;
+        if raw.is_null() {
+            return;
+        }
+        // SAFETY: `&mut self` guarantees exclusive ownership of `host_state`.
+        let host = unsafe { alloc::boxed::Box::from_raw(raw) };
+        let layout = core::alloc::Layout::new::<FrameGrantResidencyOverflowSegment>();
+        for idx in 0..MAX_FRAME_GRANT_RESIDENCY_OVERFLOW_SEGMENTS {
+            let ptr = host.segments[idx].swap(core::ptr::null_mut(), Ordering::AcqRel);
+            if !ptr.is_null() && host.owned[idx].swap(0, Ordering::AcqRel) != 0 {
+                // SAFETY: `owned != 0` marks segments allocated by
+                // `provision_host_only_segment` with `layout`, and `&mut self`
+                // guarantees all `FrameGrantTransferPin` borrows have ended.
+                unsafe { alloc::alloc::dealloc(ptr.cast(), layout) };
             }
         }
     }
@@ -887,6 +1564,54 @@ mod tests {
     }
 
     #[test]
+    fn overflow_segments_preserve_dirty_commit_pin_and_retirement_invariants() {
+        let table = table();
+        let count = FRAME_GRANT_RESIDENCY_SLOTS + FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS + 64;
+        for index in 0..count {
+            let va = 0x4000_0000 + index as u64 * GRANT_PAGE_SIZE;
+            let row = FrameGrantResidencyIdentity {
+                mm_key: 9,
+                semantic_base: va,
+                physical_ipa: 0x8000_0000 + index as u64 * GRANT_PAGE_SIZE,
+                len: GRANT_PAGE_SIZE,
+                mapping_id: index as u64 + 1,
+                frame_id: index as u64 + 1,
+                owner_generation: 1,
+                inventory_revision: 1,
+            };
+            assert!(table.ensure_capacity_for(row.mm_key, row.semantic_base, row.len));
+            let slot = table.try_publish(row).expect("elastic residency slot");
+            let page = table.lookup(9, va).expect("lookup across segments");
+            assert_eq!(page.slot, slot);
+            assert!(table.record_commit(page));
+            assert!(table.is_guest_committed(9, va));
+        }
+        assert!(table.overflow_segment_count() >= 2);
+        let mut dirty_seen = 0usize;
+        let _ = table.for_each_dirty_mm::<()>(9, |slot, row, _| {
+            dirty_seen += 1;
+            assert!(table.ack_dirty(slot, row));
+            core::ops::ControlFlow::Continue(())
+        });
+        assert_eq!(dirty_seen, count);
+
+        let tail_va = 0x4000_0000 + (count as u64 - 1) * GRANT_PAGE_SIZE;
+        let tail_page = table.lookup(9, tail_va).unwrap();
+        let pin = table.pin_transfer(tail_page).unwrap();
+        assert!(
+            table
+                .begin_retire_overlapping(9, tail_va, GRANT_PAGE_SIZE)
+                .is_none()
+        );
+        drop(pin);
+        let retirement = table
+            .begin_retire_overlapping(9, 0x4000_0000, count as u64 * GRANT_PAGE_SIZE)
+            .unwrap();
+        assert!(retirement.commit());
+        assert_eq!(table.observed_slots_used(), 0);
+    }
+
+    #[test]
     fn constructors_have_identical_wire_bytes_and_frozen_arm_layout() {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
@@ -901,7 +1626,15 @@ mod tests {
         assert_eq!(core::mem::align_of::<FrameGrantResidencyRecord>(), 64);
         assert_eq!(FrameGrantResidencyRecord::COMMITTED_OFFSET, 72);
         assert_eq!(FrameGrantResidencyRecord::TRANSFER_PINS_OFFSET, 136);
-        assert_eq!(core::mem::size_of::<FrameGrantResidencyTable>(), 786_944);
+        assert_eq!(
+            core::mem::size_of::<FrameGrantResidencyOverflowSegment>(),
+            393_472
+        );
+        assert_eq!(
+            core::mem::align_of::<FrameGrantResidencyOverflowSegment>(),
+            64
+        );
+        assert_eq!(core::mem::size_of::<FrameGrantResidencyTable>(), 789_056);
         assert_eq!(core::mem::align_of::<FrameGrantResidencyTable>(), 64);
 
         let layout = std::alloc::Layout::new::<FrameGrantResidencyTable>();
@@ -918,6 +1651,24 @@ mod tests {
             assert_eq!(ordinary_bytes, inplace_bytes);
             std::alloc::dealloc(ordinary.cast(), layout);
             std::alloc::dealloc(inplace.cast(), layout);
+        }
+
+        let seg_layout = std::alloc::Layout::new::<FrameGrantResidencyOverflowSegment>();
+        unsafe {
+            let ordinary =
+                std::alloc::alloc(seg_layout).cast::<FrameGrantResidencyOverflowSegment>();
+            let inplace =
+                std::alloc::alloc(seg_layout).cast::<FrameGrantResidencyOverflowSegment>();
+            assert!(!ordinary.is_null() && !inplace.is_null());
+            ordinary.write(FrameGrantResidencyOverflowSegment::new());
+            FrameGrantResidencyOverflowSegment::init_in_place(inplace);
+            let ordinary_bytes =
+                core::slice::from_raw_parts(ordinary.cast::<u8>(), seg_layout.size());
+            let inplace_bytes =
+                core::slice::from_raw_parts(inplace.cast::<u8>(), seg_layout.size());
+            assert_eq!(ordinary_bytes, inplace_bytes);
+            std::alloc::dealloc(ordinary.cast(), seg_layout);
+            std::alloc::dealloc(inplace.cast(), seg_layout);
         }
     }
 }

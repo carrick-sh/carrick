@@ -1466,6 +1466,27 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                                 },
                             );
                             if parent.is_none() {
+                                let _ = vm.ensure_residency_capacity(
+                                    FrameGpa::new(KERNEL_REGION_GPA),
+                                    DYNAMIC_RESIDENCY_VA,
+                                    FrameGpa::new(RESIDENCY_OVERFLOW_GPA),
+                                    resident.mm_key,
+                                    resident.semantic_base,
+                                    resident.len,
+                                );
+                                // SAFETY: same retained kernel region as the original COW pool.
+                                let residency = unsafe {
+                                    vm.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(
+                                        FrameGpa::new(
+                                            KERNEL_REGION_GPA
+                                                + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+                                        ),
+                                    )
+                                }
+                                .map_err(|e| {
+                                    trap_error = Some(fail(e.to_string()));
+                                    ForkStockRefusal::Inventory
+                                })?;
                                 let slot = residency.publish(resident).ok_or_else(|| {
                                     trap_error =
                                         Some(fail("physical fork source residency capacity"));
@@ -1490,12 +1511,46 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             resident.owner_generation = identity.owner_generation.get();
                             resident.inventory_revision = identity.inventory_revision.get();
                             if resident_windows.insert(resident.semantic_base) {
+                                let _ = vm.ensure_residency_capacity(
+                                    FrameGpa::new(KERNEL_REGION_GPA),
+                                    DYNAMIC_RESIDENCY_VA,
+                                    FrameGpa::new(RESIDENCY_OVERFLOW_GPA),
+                                    resident.mm_key,
+                                    resident.semantic_base,
+                                    resident.len,
+                                );
+                                // SAFETY: same retained kernel region as the original COW pool.
+                                let residency = unsafe {
+                                    vm.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(
+                                        FrameGpa::new(
+                                            KERNEL_REGION_GPA
+                                                + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+                                        ),
+                                    )
+                                }
+                                .map_err(|e| {
+                                    trap_error = Some(fail(e.to_string()));
+                                    ForkStockRefusal::Inventory
+                                })?;
                                 residency.publish(resident).ok_or_else(|| {
                                     trap_error =
                                         Some(fail("physical fork child residency capacity"));
                                     ForkStockRefusal::Inventory
                                 })?;
                             }
+                            // SAFETY: same retained kernel region as the original COW pool.
+                            let residency = unsafe {
+                                vm.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(
+                                    FrameGpa::new(
+                                        KERNEL_REGION_GPA
+                                            + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+                                    ),
+                                )
+                            }
+                            .map_err(|e| {
+                                trap_error = Some(fail(e.to_string()));
+                                ForkStockRefusal::Inventory
+                            })?;
                             let page = residency
                                 .lookup(resident.mm_key, edge.span().va)
                                 .ok_or_else(|| {
@@ -2267,6 +2322,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             let _proof = exclusion
                 .ok_or_else(|| fail("owner grant refused"))?
                 .proof();
+            let residency_capacity = receipt.as_ref().is_some_and(|receipt| {
+                matches!(
+                    receipt.outcome,
+                    DescriptorOutcome::Refused(
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::ResidencyCapacity
+                    )
+                )
+            });
             // The exact withdrawn or rolled-back receipt proves that none of
             // these fresh bytes are named by a guest descriptor.
             pending.inventory.guest_exposed = false;
@@ -2279,6 +2342,17 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 .as_mut()
                 .ok_or_else(|| fail("Prepare stock absent on cancellation"))?
                 .return_unused(pending.tables, 0)?;
+            if residency_capacity {
+                let span = pending.txn.op.span();
+                let _ = self._vm.ensure_residency_capacity(
+                    FrameGpa::new(KERNEL_REGION_GPA),
+                    DYNAMIC_RESIDENCY_VA,
+                    FrameGpa::new(RESIDENCY_OVERFLOW_GPA),
+                    pending.txn.id.mm_key.get(),
+                    span.va,
+                    span.len,
+                );
+            }
             return Ok(false);
         }
         let receipt = receipt.ok_or_else(|| fail("owner grant applied receipt absent"))?;
@@ -2445,8 +2519,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             return Ok(None);
         }
         let root = context.root;
-        let gpa = self.anonymous_next_gpa;
         let len = publication_len.next_multiple_of(4096);
+        self._vm
+            .ensure_residency_capacity(
+                FrameGpa::new(KERNEL_REGION_GPA),
+                DYNAMIC_RESIDENCY_VA,
+                FrameGpa::new(RESIDENCY_OVERFLOW_GPA),
+                mm.get(),
+                window.range.start(),
+                len,
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        let gpa = self.anonymous_next_gpa;
         self.anonymous_next_gpa = FrameGpa::new(
             gpa.raw()
                 .checked_add(len)

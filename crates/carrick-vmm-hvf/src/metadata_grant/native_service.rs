@@ -984,6 +984,21 @@ impl NativeService {
         } else {
             None
         };
+        let preflight_len = bytes
+            .as_ref()
+            .map_or(window.range.len(), |bytes| bytes.len() as u64);
+        if let Some(pointer) = self
+            .region
+            .record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
+                carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
+            )
+        {
+            // SAFETY: initialized atomic ABI record in the retained carrier mapping.
+            let table = unsafe { &*pointer };
+            super::ensure_residency_segment_provider(&custody, table);
+            let _ =
+                table.ensure_capacity_for(handle.mm().raw(), window.range.start(), preflight_len);
+        }
         let mut stock = custody.fork_stock.lock();
         if stock.owner.child_owner(handle.mm()) != Some(handle)
             || stock.owner.child_root(handle.mm()) != Some(root)
@@ -1838,26 +1853,51 @@ pub(super) fn settle_native_descriptor_reply(
             return Ok(true);
         }
         drop(ledger);
-        let mut stock = custody.fork_stock.lock();
-        if !stock.owner.child_execution_matches(execution, owner) {
-            return Ok(false);
-        }
-        let Some(txn) = stock
-            .owner
-            .child_physical_mut(owner.mm(), execution.context.root)
-            .and_then(|physical| physical.supplied.as_ref())
-            .and_then(|grants| grants.pending_backing_reply(reply, generation))
-        else {
-            return Ok(false);
+        let mut residency_capacity_span = None;
+        let settled = {
+            let mut stock = custody.fork_stock.lock();
+            if !stock.owner.child_execution_matches(execution, owner) {
+                return Ok(false);
+            }
+            let Some(txn) = stock
+                .owner
+                .child_physical_mut(owner.mm(), execution.context.root)
+                .and_then(|physical| physical.supplied.as_ref())
+                .and_then(|grants| grants.pending_backing_reply(reply, generation))
+            else {
+                return Ok(false);
+            };
+            if reply.descriptor().inspect_receipt(txn.id).is_some_and(|receipt| {
+                matches!(
+                    receipt.outcome,
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::ResidencyCapacity
+                    )
+                )
+            }) {
+                residency_capacity_span = Some(txn.op.span());
+            }
+            settle_backing_and_tables(
+                custody,
+                &mut stock,
+                owner,
+                execution.context.root,
+                reply,
+                &txn,
+            )
         };
-        settle_backing_and_tables(
-            custody,
-            &mut stock,
-            owner,
-            execution.context.root,
-            reply,
-            &txn,
-        )
+        if matches!(settled, Ok(true))
+            && let Some(span) = residency_capacity_span
+            && let Some(pointer) = region.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
+                carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
+            )
+        {
+            // SAFETY: initialized atomic ABI record in the retained carrier mapping.
+            let table = unsafe { &*pointer };
+            super::ensure_residency_segment_provider(custody, table);
+            let _ = table.ensure_capacity_for(owner.mm().raw(), span.va, span.len);
+        }
+        settled
     })();
     match accepted {
         Ok(true) => Ok(settlement.accept()),

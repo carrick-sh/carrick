@@ -243,6 +243,15 @@ pub fn serve_grant<
     let Some(window) = slot.window() else {
         return Ok(None);
     };
+    #[cfg(not(target_os = "none"))]
+    {
+        let mm_key = window.operation.mm.raw();
+        let start = window.range.start();
+        let _ = residency.ensure_capacity_for(mm_key, start, window.range.len());
+        if window.range.len() > 4096 {
+            let _ = residency.ensure_capacity_for(mm_key, start, 4096);
+        }
+    }
     let target = grant_target(portal, &window, worker)?;
     Ok(apply_grant::<B, _>(
         slot, words, residency, target, invalidate,
@@ -377,19 +386,30 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
             owner_generation: backing.owner_generation.get(),
             inventory_revision: backing.inventory_revision.get(),
         };
-        let Some(residency_slot) = residency.publish(identity) else {
-            if words.observe_residency_failure() {
-                words.descriptor_diagnostic(
-                    carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic::ResidencyRefused {
-                        mm_key: identity.mm_key,
-                        va: identity.semantic_base,
-                        len: identity.len,
-                        slots_used: residency.observed_slots_used(),
-                        slots_total: carrick_core_abi::mm::FRAME_GRANT_RESIDENCY_SLOTS,
-                    },
-                );
+        let residency_slot = match residency.try_publish(identity) {
+            Ok(slot) => slot,
+            Err(reason) => {
+                if words.observe_residency_failure() {
+                    words.descriptor_diagnostic(
+                        carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic::ResidencyRefused {
+                            mm_key: identity.mm_key,
+                            va: identity.semantic_base,
+                            len: identity.len,
+                            slots_used: residency.observed_slots_used(),
+                            slots_total: residency.slot_capacity(),
+                        },
+                    );
+                }
+                return DescriptorOutcome::Refused(match reason {
+                    carrick_core_abi::ResidencyPublishError::Invalid => {
+                        DescriptorRefusal::BadEncoding
+                    }
+                    carrick_core_abi::ResidencyPublishError::Overlap => DescriptorRefusal::Occupied,
+                    carrick_core_abi::ResidencyPublishError::Capacity => {
+                        DescriptorRefusal::ResidencyCapacity
+                    }
+                });
             }
-            return DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity);
         };
         let outcome = B::execute_grant(words, grant.ttbr0, txn);
         if let DescriptorOutcome::Applied(_) = outcome {

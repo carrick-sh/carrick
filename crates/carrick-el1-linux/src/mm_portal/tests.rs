@@ -1309,7 +1309,7 @@ fn untouched_transfer_window(prefix: bool) {
     assert_eq!(
         refused.outcome,
         DescriptorOutcome::Refused(
-            carrick_mmu_core::descriptor_refusal::DescriptorRefusal::JournalCapacity,
+            carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied,
         )
     );
     let (receipt, trace) = slot.take_receipt_with_trace(window, &txn).unwrap();
@@ -1382,6 +1382,139 @@ fn untouched_transfer_window(prefix: bool) {
         .unwrap()
         .unwrap();
     assert!(matches!(refused.outcome, DescriptorOutcome::Refused(_)));
+}
+
+#[test]
+fn grant_residency_capacity_refuses_cleanly_and_recovers_with_overflow_segment() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
+        TableGrants,
+    };
+    use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 16, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 0);
+    let maintenance = CallerInvalidatesAsid;
+    let words = tables.live(&maintenance);
+    let residency = residency();
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA + 7),
+            4,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let TransferStep::Supply(window) = portal
+        .select(
+            &transfer,
+            &words,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency,
+                slot: 0,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("missing lazy owner receipt");
+    };
+    let nz = |n| NonZeroU64::new(n).unwrap();
+    let txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: nz(mm.raw()),
+            generation: nz(1),
+        },
+        root: SubstrateGpa(ROOT),
+        op: DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: window.range.start(),
+                ipa: IPA,
+                len: 4096,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(VA, 4096),
+            backing: BackingIdentity {
+                frame_id: nz(2),
+                mapping_id: nz(3),
+                owner_generation: nz(4),
+                inventory_revision: nz(5),
+            },
+        },
+        tables: TableGrants::new(&[]).unwrap(),
+    };
+    let slot = carrick_el1_abi::PortalGrantSlot::new();
+    residency.set_elastic_growth_enabled(false);
+    let mut filler_idx = 0u64;
+    while residency.has_probe_slot(mm.raw(), window.range.start(), 4096) {
+        let filler_va = 0x8000_0000 + filler_idx * 4096;
+        filler_idx += 1;
+        let _ = residency.publish(carrick_el1_abi::FrameGrantResidencyIdentity {
+            mm_key: mm.raw(),
+            semantic_base: filler_va,
+            physical_ipa: 0x9000_0000 + filler_idx * 4096,
+            len: 4096,
+            mapping_id: 100 + filler_idx,
+            frame_id: 100 + filler_idx,
+            owner_generation: 1,
+            inventory_revision: 1,
+        });
+    }
+    let filled_slots = residency.observed_slots_used();
+    assert!(slot.submit_with_trace(window, &txn, true));
+    let refused = serve_grant(&portal, &slot, &words, &residency, 0, || {})
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        refused.outcome,
+        DescriptorOutcome::Refused(
+            carrick_mmu_core::descriptor_refusal::DescriptorRefusal::ResidencyCapacity,
+        )
+    );
+    let (receipt, trace) = slot.take_receipt_with_trace(window, &txn).unwrap();
+    assert_eq!(receipt, refused);
+    assert_eq!(
+        trace,
+        Some(carrick_mmu_core::live_descriptor_words::GrantRefusalTrace {
+            residency_published: false,
+            event: Some(
+                carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic::ResidencyRefused {
+                    mm_key: mm.raw(),
+                    va: window.range.start(),
+                    len: 4096,
+                    slots_used: filled_slots,
+                    slots_total: carrick_core_abi::mm::FRAME_GRANT_RESIDENCY_SLOTS,
+                }
+            ),
+        })
+    );
+    assert!(residency.lookup(mm.raw(), VA).is_none());
+    assert_eq!(tables.words[1536].load(Ordering::Acquire), 0);
+
+    // Enabling elastic growth allows serve_grant to grow an overflow segment
+    // and succeed on the retry without corrupting descriptors or residency.
+    residency.set_elastic_growth_enabled(true);
+    assert!(slot.submit(window, &txn));
+    let applied = serve_grant(&portal, &slot, &words, &residency, 0, || {})
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(applied.outcome, DescriptorOutcome::Applied(_)),
+        "{applied:?}"
+    );
+    assert!(slot.take_receipt(window, &txn).is_some());
+    assert!(residency.is_guest_committed(mm.raw(), VA));
+    assert_eq!(
+        residency.slot_capacity(),
+        carrick_core_abi::mm::FRAME_GRANT_RESIDENCY_SLOTS
+            + carrick_core_abi::mm::FRAME_GRANT_RESIDENCY_OVERFLOW_SLOTS
+    );
 }
 
 #[test]

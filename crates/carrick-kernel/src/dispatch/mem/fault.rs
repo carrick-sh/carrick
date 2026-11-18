@@ -1027,6 +1027,11 @@ impl GrantResidencyPublication {
                     len: end - start,
                     ..grant
                 };
+                let _ = table.ensure_capacity_for(
+                    fragment.mm_key,
+                    fragment.semantic_base,
+                    fragment.len,
+                );
                 if let Some(slot) = table.publish(fragment)
                     && let Some(va) = resident.filter(|va| start <= va.raw() && va.raw() < end)
                     && let Some(page) = table.lookup(grant.mm_key, va.raw())

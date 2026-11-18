@@ -18,6 +18,13 @@ carrick*:::frame-grant-residency-refused
         timestamp, pid, tid, arg0, arg1, arg2, arg3, arg4);
 }
 
+carrick*:::frame-grant-residency-segment-grown
+/pid == $target || progenyof($target)/
+{
+    printf("RESIDENCY_SEGMENT_GROWN ns=%d pid=%d tid=%d segment=%d total=%d guest_base=0x%x\n",
+        timestamp, pid, tid, arg0, arg1, arg2);
+}
+
 carrick*:::descriptor-journal-reserve-failed
 /pid == $target || progenyof($target)/
 {

@@ -10,6 +10,10 @@ rationale = "Proposed M1 policy: guest pages 4096 bytes; host compounds 16384 by
 [bindings]
 vm_free = [
   "carrick-core::x86_acceleration::x3_shared_protocol (orders 3a/3b components only: both descriptor ISAs at 16/64/256 pages, exact grant generation and rollback; 4 KiB/16 KiB backing, logical leaf references and pin-before-return; dirty-load closure/drain, stale invalidation refusal, exact root nonce, failed arena retirement quarantine, and 20000-mapping retirement receipt authentication; no signed physical mapping census, production pool-exhaustion, exec/clear-tid or order-4 wait acceptance)",
+  "carrick-core::x86_acceleration::arm_private_file_4k_grants_scale_past_initial_residency",
+  "carrick-core::x86_acceleration::x86_private_file_4k_grants_scale_past_initial_residency",
+  "carrick-core-abi::mm::residency::tests::overflow_segments_preserve_dirty_commit_pin_and_retirement_invariants",
+  "carrick-x86-cpl0-host::carrier_memory::tests::ensure_residency_capacity_installs_bootstrap_overflow_segments_past_primary_table",
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
   "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
 ]

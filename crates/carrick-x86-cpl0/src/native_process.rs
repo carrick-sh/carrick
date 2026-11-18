@@ -744,19 +744,25 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 )
             };
             match result {
-                Ok(receipt) => Some(receipt.is_some_and(|receipt| {
-                    matches!(receipt.outcome,
-                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
-                    | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
-                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied
-                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot))
+                Ok(receipt) => Some(receipt.map_or((false, false), |receipt| {
+                    match receipt.outcome {
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
+                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                            carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied
+                            | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot,
+                        ) => (true, false),
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                            carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::ResidencyCapacity,
+                        ) => (false, true),
+                        _ => (false, false),
+                    }
                 })),
                 // The shared pending owner retains this reply while it parks on
                 // the exact producer, including resumption on another CPU.
                 Err(MmError::Wait(wait)) => return Err(MmError::Wait(wait)),
                 Err(MmError::Busy) => return Err(MmError::Wait(editor_wait)),
                 Err(MmError::Stale) => None,
-                Err(_) => Some(false),
+                Err(_) => Some((false, false)),
             }
         };
         // All MM guards and descriptor traversal frames have unwound before
@@ -784,10 +790,23 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             Some(Err(())) => return Err(MmError::Wait(editor_wait)),
             None => return Err(MmError::Stale),
         }
-        if applied == Some(false) {
-            Err(MmError::Stale)
-        } else {
-            Ok(())
+        match applied {
+            None | Some((true, _)) => Ok(()),
+            Some((false, true)) => {
+                let residency = unsafe {
+                    &*(venues.residency.raw() as *const carrick_el1_abi::FrameGrantResidencyTable)
+                };
+                if residency.has_probe_slot(
+                    window.operation.mm.raw(),
+                    window.range.start(),
+                    window.range.len(),
+                ) {
+                    Ok(())
+                } else {
+                    Err(MmError::Stale)
+                }
+            }
+            Some((false, false)) => Err(MmError::Stale),
         }
     }
 
