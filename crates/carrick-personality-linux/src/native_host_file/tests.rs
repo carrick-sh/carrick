@@ -2377,6 +2377,40 @@ fn a_message_header_linux_writes_back_is_supplied_writable_before_the_crossing()
     staged_net(socket_stage(&mut user, nr::SENDMMSG, batch));
 }
 
+/// #2418 re-review P0: `sendmsg` takes three arguments, so a libc wrapper
+/// leaves the sixth syscall register (`%r9`, `x5`) as whatever it held. The
+/// staged request carries the carrier's "data not staged" marker in that
+/// slot (`NET_MESSAGE_UNSTAGED_ARG`), so a stale register value must never
+/// reach the carrier on a message that WAS staged: a 1 on a datagram socket
+/// answered EMSGSIZE and any other non-zero value a counted ENOSYS for a
+/// healthy `sendmsg`. Red before: the slot kept the caller's register.
+#[test]
+fn a_staged_message_call_never_forwards_the_callers_stale_sixth_register() {
+    use crate::crossing::nr;
+    let bytes = laid_out(
+        8192,
+        &[
+            (0, &msghdr(0, 0, BASE + 4096, 1, 0, 0)),
+            (4096, &iovec(BASE + 4096 + 64, 32)),
+        ],
+    );
+    for stale in [1, 0xdead_beef, u64::MAX] {
+        for canonical in [nr::SENDMSG, nr::RECVMSG] {
+            let mut user = memory(&bytes);
+            let (args, _) = staged_net(socket_stage(
+                &mut user,
+                canonical,
+                [SOCKET_FD, BASE, 0, 0, 0, stale],
+            ));
+            assert_eq!(
+                args[host_file::NET_MESSAGE_UNSTAGED_ARG],
+                0,
+                "{canonical:?} with a stale sixth register {stale:#x}"
+            );
+        }
+    }
+}
+
 /// #2418 review P0-2 and P1-1: ancillary data is not staged. A message
 /// call with a non-zero `msg_controllen`, either way and whatever
 /// `msg_control` holds, is a counted refusal: Linux's control messages
