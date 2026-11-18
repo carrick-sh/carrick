@@ -60,7 +60,7 @@ cost. That leaves only host SP for the engine:
   exit stub records only an exit index. The dispatcher maps the index to the
   guest PC through the block's exit table.
 
-Frame layout (64-bit slots; `translate::frame` constants):
+Frame layout (`translate::frame` constants):
 
 | Offset | Content |
 | --- | --- |
@@ -69,6 +69,7 @@ Frame layout (64-bit slots; `translate::frame` constants):
 | 0x100 | guest NZCV, in MRS NZCV format (bits 31:28) |
 | 0x108 | saved host SP |
 | 0x110 | scratch spill |
+| 0x120..0x320 | guest Q0..Q31, sixteen bytes per register |
 
 ### Entry and exit stubs
 
@@ -109,6 +110,12 @@ safe code on x86.
 
 v1 never chains blocks: every edge returns to the dispatcher. Chaining direct
 edges is a later slice and needs the invalidation hooks below.
+
+SIMD copy-through is limited to the baseline general-register `DUP` and
+`UMOV` forms used by the musl CRT. SIMD blocks load and store Q0–Q31 in the
+engine frame and save host V8–V15 on the host stack. These forms cannot change
+FPCR or FPSR. Scalar-only emitted blocks keep their existing entry and exit
+sequences. Vector memory still exits to the handler and uses the guest MMU.
 
 ## Cache, self-modifying code and the I-cache
 

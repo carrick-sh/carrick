@@ -360,11 +360,31 @@ production `carrick-el1` ELF, and the unmodified static `hello-aarch64` ELF
   `0x2D_001E_8000` publishing `state = 1`, `trap_kind = 1`, `native_nr = 64`
   (`SYS_write`), `args = [0x1, 0x210140, 0x3]` (`"ok\n"`), and
   `resume_pc = 0x210134` (guarded by an `EL0` `UDF #0` mutation control).
-- Hosted Linux `arm64` execution status: `boot_probe.rs` is cross-checked cleanly
-  with `cargo clippy --tests --target aarch64-unknown-linux-gnu -- -D warnings`.
-  Because this worker VM is `x86_64`, `ci.yml` has no `push` trigger on `work/*`,
-  this round forbids opening a PR before `#2540` lands, and the worker GitHub App
-  token receives HTTP 403 on `gh workflow run ci.yml --ref work/1236-m2-guest`,
-  the live `soft-aarch64-native` block count awaits shepherd workflow dispatch
-  (`gh workflow run ci.yml --ref work/1236-m2-guest`) or draft PR creation once
-  `#2540` merges.
+- Hosted Linux `arm64` ran the opening draft head through the same probe
+  in 2,898 blocks. It verified the published write request and rejected the
+  EL0 `UDF #0` mutation. [Hosted arm64 job](https://github.com/carrick-sh/carrick/actions/runs/44381592878/job/135074973119).
+
+### 3.3 M2-2b musl CRT
+
+The pinned toolchain's static musl ELF exercises general-register `DUP` and
+`UMOV` in `memset`. Its `memcpy` uses integer register pairs. The translator
+copies these two allocated SIMD forms. Scalar and pair SIMD memory operations
+go through the same stage-1 path as integer transfers. A narrow load clears the
+upper bytes, and a store that crosses into a missing stage-1 mapping takes a
+data abort before publishing either part.
+
+The virtual cache profile advertises 64-byte lines and a 64-byte ZVA block.
+`CTR_EL0` follows UCT. EL0 reads DCZID_EL0.DZP as the inverse of DZE, and a
+disallowed `DC ZVA` traps before translation. A permitted ZVA makes one aligned
+64-byte write after resolving the operand as a stage-1 store to Normal memory.
+`IC IVAU` checks UCI before translating the VA and reports an allowed operation's
+stage-1 data abort with ISS.CM set. The dispatcher has no cached translation to
+invalidate.
+
+VM-free witnesses use the production decoder and exit handler for typed
+encodings, permission controls, non-identity stage-1 output, and exact
+ESR/FAR/ELR. The red parent exits undefined on `DUP`, returns Unsupported
+for Q loads, and takes undefined-instruction exceptions for the cache
+instructions. The hosted native witness checks guest vector data across
+blocks and the AAPCS64 callee-save boundary. There is no signed or Docker
+binding for the test-only soft-AArch64 lane.

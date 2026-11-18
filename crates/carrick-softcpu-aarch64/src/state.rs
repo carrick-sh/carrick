@@ -1,7 +1,7 @@
 //! Virtual EL0/EL1 state. Arm ARM DDI0487G.a D1.6 (PSTATE), C5.2
 //! (special-purpose registers), D13.2 (EL1 registers). No host register access.
 use crate::exception::Syndrome;
-use crate::{NamedSystemRegister, OperandRegister, SystemRegister};
+use crate::{NamedSystemRegister, OperandRegister, SystemRegister, VectorRegister};
 
 macro_rules! domain {
     ($name:ident) => {
@@ -92,6 +92,18 @@ impl Sctlr {
         self.0 & (1 << 57) != 0
     }
 
+    pub(crate) fn dze(self) -> bool {
+        self.0 & (1 << 14) != 0
+    }
+
+    pub(crate) fn uct(self) -> bool {
+        self.0 & (1 << 15) != 0
+    }
+
+    pub(crate) fn uci(self) -> bool {
+        self.0 & (1 << 26) != 0
+    }
+
     pub(crate) fn traps_el0_wait(self, wait: crate::exception::WaitInstruction) -> bool {
         use crate::exception::WaitInstruction;
         let bit = match wait {
@@ -117,6 +129,7 @@ pub struct El1Registers {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CpuState {
     x: [RegisterValue; 31],
+    pub vectors: [u128; 32],
     local_event: bool,
     pub sp_el0: StackPointer,
     pub sp_el1: StackPointer,
@@ -130,7 +143,42 @@ pub struct CpuState {
 pub struct SystemAccessException {
     pub syndrome: Syndrome,
 }
+impl SystemAccessException {
+    pub(crate) fn sys64(r: SystemRegister, rt: OperandRegister, read: bool) -> Self {
+        let rt = match rt {
+            OperandRegister::Gpr(r) => r.number(),
+            _ => 31,
+        };
+        let iss = u64::from(read)
+            | (u64::from(r.crm) << 1)
+            | (u64::from(rt) << 5)
+            | (u64::from(r.crn) << 10)
+            | (u64::from(r.op1) << 14)
+            | (u64::from(r.op2) << 17)
+            | (u64::from(r.op0) << 20);
+        Self {
+            syndrome: Syndrome(0x6200_0000 | iss),
+        }
+    }
+}
+
+/// D13 DCZID_EL0.BS is log2 of the block size in words.
+const DC_ZVA_BLOCK_SHIFT: u8 = 4;
+pub(crate) const DC_ZVA_BYTES: usize = 4 << DC_ZVA_BLOCK_SHIFT;
+
+/// D13 CTR_EL0: 64-byte I/D lines, PIPT L1 I-cache, baseline RES1 bit 31.
+/// Do not claim IDC/DIC or disclose a physical host cache geometry.
+const CTR_EL0: u64 = 0x8004_c004;
+
 impl CpuState {
+    pub fn read_vector(&self, r: VectorRegister) -> u128 {
+        self.vectors[usize::from(r.number())]
+    }
+
+    pub fn write_vector(&mut self, r: VectorRegister, value: u128) {
+        self.vectors[usize::from(r.number())] = value;
+    }
+
     pub(crate) fn signal_local_event(&mut self) {
         self.local_event = true;
     }
@@ -198,6 +246,11 @@ impl CpuState {
             Slot::Mair => self.el1.mair.0,
             Slot::Cntkctl => self.el1.cntkctl.0,
             Slot::Nzcv => u64::from(self.pstate.nzcv & 15) << 28,
+            Slot::Ctr => CTR_EL0,
+            Slot::Dczid => {
+                let prohibited = self.pstate.el == ExceptionLevel::El0 && !self.el1.sctlr.dze();
+                (u64::from(prohibited) << 4) | u64::from(DC_ZVA_BLOCK_SHIFT)
+            }
             Slot::Daif => u64::from(self.pstate.daif.0 & 15) << 6,
             Slot::Pan => u64::from(self.pstate.pan) << 22,
             Slot::Uao => u64::from(self.pstate.uao) << 23,
@@ -237,7 +290,7 @@ impl CpuState {
                     StackSelect::El1
                 }
             }
-            Slot::CurrentEl => {
+            Slot::CurrentEl | Slot::Ctr | Slot::Dczid => {
                 return Err(SystemAccessException {
                     syndrome: Syndrome(0x0200_0000),
                 });
@@ -260,6 +313,8 @@ impl CpuState {
                 && matches!(
                     slot,
                     Slot::CurrentEl
+                        | Slot::Ctr
+                        | Slot::Dczid
                         | Slot::Named(NamedSlot::Cntvct | NamedSlot::Mpidr | NamedSlot::IccIar1)
                 ))
             || (matches!(slot, Slot::SpEl0) && self.pstate.sp == StackSelect::El0)
@@ -282,6 +337,8 @@ impl CpuState {
             Slot::Named(NamedSlot::CntvCtl | NamedSlot::CntvCval) => {
                 self.el1.cntkctl.0 & (1 << 8) != 0
             }
+            Slot::Ctr => self.el1.sctlr.uct(),
+            Slot::Dczid => true,
             Slot::Daif => self.el1.sctlr.0 & (1 << 9) != 0,
             _ => false,
         };
@@ -289,6 +346,7 @@ impl CpuState {
             if !matches!(
                 slot,
                 Slot::Daif
+                    | Slot::Ctr
                     | Slot::Named(
                         NamedSlot::Cntfrq
                             | NamedSlot::Cntvct
@@ -298,20 +356,7 @@ impl CpuState {
             ) {
                 return Err(undefined);
             }
-            let rt = match rt {
-                OperandRegister::Gpr(r) => r.number(),
-                _ => 31,
-            };
-            let iss = u64::from(read)
-                | (u64::from(r.crm) << 1)
-                | (u64::from(rt) << 5)
-                | (u64::from(r.crn) << 10)
-                | (u64::from(r.op1) << 14)
-                | (u64::from(r.op2) << 17)
-                | (u64::from(r.op0) << 20);
-            return Err(SystemAccessException {
-                syndrome: Syndrome(0x6200_0000 | iss),
-            });
+            return Err(SystemAccessException::sys64(r, rt, read));
         }
         Ok(slot)
     }
@@ -336,6 +381,8 @@ enum Slot {
     Uao,
     Spsel,
     CurrentEl,
+    Ctr,
+    Dczid,
 }
 impl Slot {
     fn decode(r: SystemRegister) -> Option<Self> {
@@ -347,6 +394,8 @@ impl Slot {
             N::TpidrEl0 => Self::Named(NamedSlot::TpidrEl0),
             N::TpidrroEl0 => Self::Named(NamedSlot::TpidrroEl0),
             N::ContextidrEl1 => Self::Named(NamedSlot::Contextidr),
+            N::CtrEl0 => Self::Ctr,
+            N::DczidEl0 => Self::Dczid,
             N::Fpcr => Self::Named(NamedSlot::Fpcr),
             N::Fpsr => Self::Named(NamedSlot::Fpsr),
             N::Daif => Self::Daif,

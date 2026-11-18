@@ -13,8 +13,8 @@ use crate::exception::{
 };
 use crate::mmu::{self, AccessClass, Stage1Error};
 use crate::state::{
-    CpuState, ExceptionLevel, InterruptMasks, ProgramCounter, RegisterValue, StackSelect,
-    SystemAccessException, SystemValue, VirtualAddress,
+    CpuState, DC_ZVA_BYTES, ExceptionLevel, InterruptMasks, ProgramCounter, RegisterValue,
+    StackSelect, SystemAccessException, SystemValue, VirtualAddress,
 };
 use crate::translate::GuestInstruction;
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
     SystemRegister, TlbiOperation, Translation, Width,
 };
 use carrick_mmu_core::aarch64::stage1_walk::Aarch64Fault;
-use carrick_mmu_core::stage1::LeafAccess;
+use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
 
 /// A guest access guest memory cannot serve (an unbacked physical address,
 /// such as MMIO). Not an architectural abort: stage-1 faults are delivered
@@ -152,14 +152,50 @@ pub fn execute(
             }
         },
         Instruction::PstateImmediate(p) => pstate(cpu, i.word(), p.field, p.immediate),
-        Instruction::InstructionCache(op) => {
-            // C6.2.95, C5.3 Table C5-6: IC IALLUIS and IC IALLU require EL1 or
-            // higher; at EL0 they are UNDEFINED.
-            if cpu.pstate.el == ExceptionLevel::El0 {
-                return undefined(cpu);
+        Instruction::InstructionCache(op) => match op {
+            IcOperation::Ialluis | IcOperation::Iallu => {
+                // C5.3 Table C5-6: the whole-cache forms require EL1.
+                if cpu.pstate.el == ExceptionLevel::El0 {
+                    return undefined(cpu);
+                }
+                next(cpu);
+                Outcome::Event(Event::Ic(op))
             }
-            next(cpu);
-            Outcome::Event(Event::Ic(op))
+            IcOperation::Ivau(rt) => {
+                if cpu.pstate.el == ExceptionLevel::El0 && !cpu.el1.sctlr.uci() {
+                    return sys_trap(cpu, i.word(), rt);
+                }
+                let address = operand(cpu, rt);
+                // Translate as a data cache-maintenance address, not as a
+                // fetch: execute permission is not needed to invalidate it.
+                match mmu::translate(
+                    cpu,
+                    memory,
+                    address,
+                    LeafAccess::Read,
+                    AccessClass::Ordinary,
+                ) {
+                    Ok(_) => {
+                        next(cpu);
+                        Outcome::Event(Event::Ic(op))
+                    }
+                    Err(Stage1Error::Abort(fault)) => enter_memory_exception(
+                        cpu,
+                        mmu::fault_status(fault).map(|status| Exception::CacheMaintenanceAbort {
+                            status,
+                            address: VirtualAddress(fault.va.raw()),
+                        }),
+                    ),
+                    Err(error) => Outcome::Event(Event::Translation(error)),
+                }
+            }
+        },
+        Instruction::DataCacheZero(rt) => {
+            if cpu.pstate.el == ExceptionLevel::El0 && !cpu.el1.sctlr.dze() {
+                return sys_trap(cpu, i.word(), rt);
+            }
+            let result = dc_zva(cpu, memory, operand(cpu, rt));
+            finish_memory(cpu, result.map(Some))
         }
         Instruction::SystemOperation(op) => {
             // C5.4: op1 selects the minimum EL for these TLBI encodings.
@@ -262,27 +298,71 @@ pub fn execute(
             cpu.pc = ProgramCounter(target);
             Outcome::Continue
         }
-        _ => match memory_operation(cpu, monitor, memory, i) {
-            Ok(Some(())) => {
-                next(cpu);
-                Outcome::Continue
-            }
-            Ok(None) => Outcome::Event(Event::Unsupported),
-            Err(MemoryAccessError::Provider(fault)) => Outcome::Event(Event::MemoryFault(fault)),
-            Err(MemoryAccessError::Alignment { access, address }) => {
-                take_exception(cpu, Exception::Alignment { access, address });
-                Outcome::Continue
-            }
-            Err(MemoryAccessError::Abort(fault)) => match mmu::fault_exception(fault) {
-                Some(exception) => {
-                    take_exception(cpu, exception);
-                    Outcome::Continue
-                }
-                None => Outcome::Event(Event::Unsupported),
-            },
-            Err(MemoryAccessError::Translation(error)) => Outcome::Event(Event::Translation(error)),
-        },
+        _ => {
+            let result = memory_operation(cpu, monitor, memory, i);
+            finish_memory(cpu, result)
+        }
     }
+}
+
+fn enter_memory_exception(cpu: &mut CpuState, exception: Option<Exception>) -> Outcome {
+    match exception {
+        Some(exception) => {
+            take_exception(cpu, exception);
+            Outcome::Continue
+        }
+        None => Outcome::Event(Event::Unsupported),
+    }
+}
+
+fn finish_memory(cpu: &mut CpuState, result: Result<Option<()>, MemoryAccessError>) -> Outcome {
+    match result {
+        Ok(Some(())) => {
+            next(cpu);
+            Outcome::Continue
+        }
+        Ok(None) => Outcome::Event(Event::Unsupported),
+        Err(MemoryAccessError::Provider(fault)) => Outcome::Event(Event::MemoryFault(fault)),
+        Err(MemoryAccessError::Alignment { access, address }) => {
+            enter_memory_exception(cpu, Some(Exception::Alignment { access, address }))
+        }
+        Err(MemoryAccessError::Abort(fault)) => {
+            enter_memory_exception(cpu, mmu::fault_exception(fault))
+        }
+        Err(MemoryAccessError::Translation(error)) => Outcome::Event(Event::Translation(error)),
+    }
+}
+
+/// DC ZVA translates the operand as a store and zeros a single aligned block.
+/// At 64 bytes the block cannot straddle this profile's 4 KiB translation.
+fn dc_zva(
+    cpu: &CpuState,
+    memory: &mut impl GuestMemory,
+    address: u64,
+) -> Result<(), MemoryAccessError> {
+    // When translation is disabled the baseline data memory type is Device.
+    let (pa, device) = if mmu::enabled(cpu) {
+        let leaf = mmu::walk(
+            cpu,
+            memory,
+            address,
+            LeafAccess::Write,
+            AccessClass::Ordinary,
+        )?;
+        let attributes = (cpu.el1.mair.0 >> (8 * leaf.attr_index())) as u8;
+        (leaf.output().raw(), attributes & 0xf0 == 0)
+    } else {
+        (address, true)
+    };
+    if device {
+        return Err(MemoryAccessError::Alignment {
+            access: DataAccess::Write,
+            address: VirtualAddress(address),
+        });
+    }
+    let base = pa & !(DC_ZVA_BYTES as u64 - 1);
+    memory.write(VirtualAddress(base), &[0; DC_ZVA_BYTES])?;
+    Ok(())
 }
 
 const LINK: crate::Gpr = match crate::Gpr::new(30) {
@@ -293,6 +373,13 @@ const LINK: crate::Gpr = match crate::Gpr::new(30) {
 fn system_trap(cpu: &mut CpuState, e: SystemAccessException) -> Outcome {
     take_exception(cpu, Exception::SystemAccess(e));
     Outcome::Continue
+}
+
+fn sys_trap(cpu: &mut CpuState, word: u32, rt: OperandRegister) -> Outcome {
+    system_trap(
+        cpu,
+        SystemAccessException::sys64(SystemRegister::from_word(word), rt, false),
+    )
 }
 
 /// C6.2.195 MSR (immediate), C5.2.2 DAIF, C5.2.10 PAN, C5.2.16 SPSel.
@@ -397,13 +484,8 @@ impl DataAccessor {
         size: MemorySize,
     ) -> Result<u64, MemoryAccessError> {
         let mut bytes = [0; 8];
-        let n = usize::from(size.bytes()).min(8);
-        let (pieces, count) = self.pieces(cpu, memory, address, n, LeafAccess::Read)?;
-        let mut at = 0;
-        for &(pa, len) in &pieces[..count] {
-            memory.read(VirtualAddress(pa), &mut bytes[at..at + len])?;
-            at += len;
-        }
+        let n = usize::from(size.bytes());
+        self.read(cpu, memory, address, &mut bytes[..n])?;
         Ok(u64::from_le_bytes(bytes))
     }
 
@@ -415,9 +497,38 @@ impl DataAccessor {
         size: MemorySize,
         value: u64,
     ) -> Result<(), MemoryAccessError> {
-        let n = usize::from(size.bytes()).min(8);
-        let bytes = value.to_le_bytes();
-        let (pieces, count) = self.pieces(cpu, memory, address, n, LeafAccess::Write)?;
+        self.write(
+            cpu,
+            memory,
+            address,
+            &value.to_le_bytes()[..usize::from(size.bytes())],
+        )
+    }
+
+    fn read(
+        &self,
+        cpu: &CpuState,
+        memory: &mut impl GuestMemory,
+        address: u64,
+        bytes: &mut [u8],
+    ) -> Result<(), MemoryAccessError> {
+        let (pieces, count) = self.pieces(cpu, memory, address, bytes.len(), LeafAccess::Read)?;
+        let mut at = 0;
+        for &(pa, len) in &pieces[..count] {
+            memory.read(VirtualAddress(pa), &mut bytes[at..at + len])?;
+            at += len;
+        }
+        Ok(())
+    }
+
+    fn write(
+        &self,
+        cpu: &CpuState,
+        memory: &mut impl GuestMemory,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), MemoryAccessError> {
+        let (pieces, count) = self.pieces(cpu, memory, address, bytes.len(), LeafAccess::Write)?;
         let mut at = 0;
         for &(pa, len) in &pieces[..count] {
             memory.write(VirtualAddress(pa), &bytes[at..at + len])?;
@@ -448,10 +559,28 @@ fn loaded(value: u64, size: MemorySize, op: MemoryOperation, width: Width) -> u6
     }
 }
 
-fn integer(r: MemoryRegister) -> Option<(OperandRegister, Width)> {
-    match r {
-        MemoryRegister::Integer { register, width } => Some((register, width)),
-        MemoryRegister::Vector(_) => None,
+fn register_bytes(cpu: &CpuState, register: MemoryRegister) -> [u8; 16] {
+    match register {
+        MemoryRegister::Integer { register, .. } => u128::from(operand(cpu, register)),
+        MemoryRegister::Vector(register) => cpu.read_vector(register),
+    }
+    .to_le_bytes()
+}
+
+fn set_memory_register(
+    cpu: &mut CpuState,
+    register: MemoryRegister,
+    bytes: [u8; 16],
+    size: MemorySize,
+    op: MemoryOperation,
+) {
+    let value = u128::from_le_bytes(bytes);
+    match register {
+        MemoryRegister::Integer { register, width } => {
+            set_operand(cpu, register, loaded(value as u64, size, op, width));
+        }
+        // A narrow SIMD&FP load zeros the upper bits of the 128-bit register.
+        MemoryRegister::Vector(register) => cpu.write_vector(register, value),
     }
 }
 
@@ -499,8 +628,7 @@ fn check_alignment(address: u64, bytes: u64, access: DataAccess) -> Result<(), M
     Ok(())
 }
 
-/// Returns Ok(None) for a decoded memory form this slice does not implement
-/// (SIMD&FP registers); nothing is changed then.
+/// Returns Ok(None) when the instruction is not a supported memory form.
 fn memory_operation(
     cpu: &mut CpuState,
     monitor: &mut ExclusiveMonitor,
@@ -515,9 +643,6 @@ fn memory_operation(
                 } else {
                     AccessClass::Ordinary
                 },
-            };
-            let Some((rt, width)) = integer(m.register) else {
-                return Ok(None);
             };
             let (address, writeback) = match m.address {
                 MemoryAddress::Immediate {
@@ -556,21 +681,24 @@ fn memory_operation(
             if cpu.el1.sctlr.alignment_check() {
                 check_alignment(address, u64::from(m.size.bytes()), access)?;
             }
+            let size = usize::from(m.size.bytes());
             if access == DataAccess::Write {
-                data.store(cpu, memory, address, m.size, operand(cpu, rt))?;
+                data.write(
+                    cpu,
+                    memory,
+                    address,
+                    &register_bytes(cpu, m.register)[..size],
+                )?;
             } else {
-                let v = data.load(cpu, memory, address, m.size)?;
-                set_operand(cpu, rt, loaded(v, m.size, m.operation, width));
+                let mut bytes = [0; 16];
+                data.read(cpu, memory, address, &mut bytes[..size])?;
+                set_memory_register(cpu, m.register, bytes, m.size, m.operation);
             }
             if let Some((base, value)) = writeback {
                 set_operand(cpu, base, value);
             }
         }
         Instruction::PairMemory(p) => {
-            let (Some((first, width)), Some((second, _))) = (integer(p.first), integer(p.second))
-            else {
-                return Ok(None);
-            };
             let b = operand(cpu, p.base);
             let moved = b.wrapping_add(p.offset.bytes() as i64 as u64);
             let address = if p.index == MemoryIndex::Post {
@@ -586,28 +714,25 @@ fn memory_operation(
             if cpu.el1.sctlr.alignment_check() {
                 check_alignment(address, step, access)?;
             }
+            let size = usize::from(p.size.bytes());
+            let next_address = address.wrapping_add(step);
             if access == DataAccess::Write {
                 // Both halves translate before either is written.
-                data.pieces(
+                data.pieces(cpu, memory, address, 2 * size, LeafAccess::Write)?;
+                data.write(cpu, memory, address, &register_bytes(cpu, p.first)[..size])?;
+                data.write(
                     cpu,
                     memory,
-                    address,
-                    2 * usize::from(p.size.bytes()),
-                    LeafAccess::Write,
-                )?;
-                data.store(cpu, memory, address, p.size, operand(cpu, first))?;
-                data.store(
-                    cpu,
-                    memory,
-                    address.wrapping_add(step),
-                    p.size,
-                    operand(cpu, second),
+                    next_address,
+                    &register_bytes(cpu, p.second)[..size],
                 )?;
             } else {
-                let a = data.load(cpu, memory, address, p.size)?;
-                let c = data.load(cpu, memory, address.wrapping_add(step), p.size)?;
-                set_operand(cpu, first, loaded(a, p.size, p.operation, width));
-                set_operand(cpu, second, loaded(c, p.size, p.operation, width));
+                let mut first = [0; 16];
+                let mut second = [0; 16];
+                data.read(cpu, memory, address, &mut first[..size])?;
+                data.read(cpu, memory, next_address, &mut second[..size])?;
+                set_memory_register(cpu, p.first, first, p.size, p.operation);
+                set_memory_register(cpu, p.second, second, p.size, p.operation);
             }
             if p.index != MemoryIndex::Offset {
                 set_operand(cpu, p.base, moved);

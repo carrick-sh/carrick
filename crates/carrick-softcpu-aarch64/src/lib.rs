@@ -93,6 +93,9 @@ mod closure {
         Fpcr,
         /// DDI0487G.a C5.2.8 FPSR.
         Fpsr,
+        /// DDI0487G.a D13 CTR_EL0 and DCZID_EL0.
+        CtrEl0,
+        DczidEl0,
         /// DDI0487G.a C5.2.2 DAIF.
         Daif,
         /// DDI0487G.a C5.2.10 PAN.
@@ -128,6 +131,8 @@ mod closure {
                 (3, 0, 13, 0, 1) => Self::ContextidrEl1,
                 (3, 3, 4, 4, 0) => Self::Fpcr,
                 (3, 3, 4, 4, 1) => Self::Fpsr,
+                (3, 3, 0, 0, 1) => Self::CtrEl0,
+                (3, 3, 0, 0, 7) => Self::DczidEl0,
                 (3, 3, 4, 2, 1) => Self::Daif,
                 (3, 0, 4, 2, 3) => Self::Pan,
                 (3, 0, 7, 4, 0) => Self::ParEl1,
@@ -882,6 +887,12 @@ mod loader {
             0xd508_751f => return Some(Instruction::InstructionCache(IcOperation::Iallu)),
             _ => {}
         }
+        let rt = OperandRegister::field(word, false);
+        match word & !31 {
+            0xd50b_7520 => return Some(Instruction::InstructionCache(IcOperation::Ivau(rt))),
+            0xd50b_7420 => return Some(Instruction::DataCacheZero(rt)),
+            _ => {}
+        }
         if word & 0xfff80000 == 0xd5080000 {
             let op1 = ((word >> 16) & 7) as u8;
             let crn = ((word >> 12) & 15) as u8;
@@ -925,6 +936,7 @@ mod loader {
     pub enum IcOperation {
         Ialluis,
         Iallu,
+        Ivau(OperandRegister),
     }
 
     /// Arm ARM DDI0487G.a C6.2.332 TLBI and C6.2.328 SYS.
@@ -1124,6 +1136,8 @@ mod instruction {
         Eret,
         AtomicAdd(crate::AtomicAdd),
         InstructionCache(crate::IcOperation),
+        DataCacheZero(OperandRegister),
+        SimdCopy(SimdCopy),
         SystemOperation(crate::SystemOperation),
         Barrier(crate::Barrier),
         ExceptionGeneration(crate::ExceptionGeneration),
@@ -1164,6 +1178,9 @@ mod instruction {
     pub fn decode_instruction(word: u32) -> Instruction {
         if let Some(instruction) = crate::loader::decode(word) {
             return instruction;
+        }
+        if let Some(copy) = simd_copy(word) {
+            return Instruction::SimdCopy(copy);
         }
         if let Some(instruction) = crate::closure::decode(word) {
             return instruction;
@@ -1260,8 +1277,57 @@ mod instruction {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct VectorRegister(u8);
     impl VectorRegister {
+        pub const fn new(number: u8) -> Option<Self> {
+            if number < 32 {
+                Some(Self(number))
+            } else {
+                None
+            }
+        }
         pub const fn number(self) -> u8 {
             self.0
+        }
+    }
+    /// C4.1 Advanced SIMD copy, DUP (general) and UMOV. Only register
+    /// forms used by the musl CRT are admitted; no memory or FP side effects.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SimdCopy {
+        DuplicateGeneral {
+            destination: VectorRegister,
+            source: OperandRegister,
+            element: MemorySize,
+            full_width: bool,
+        },
+        UnsignedMove {
+            destination: OperandRegister,
+            source: VectorRegister,
+            element: MemorySize,
+            lane: u8,
+        },
+    }
+
+    fn simd_copy(word: u32) -> Option<SimdCopy> {
+        let q = word & (1 << 30) != 0;
+        let imm5 = ((word >> 16) & 31) as u8;
+        let size = imm5.trailing_zeros();
+        let element = MemorySize::scale(size)?;
+        match word & 0xbfe0_fc00 {
+            // DUP (general): imm5[3:0] must select an element no wider than
+            // 64 bits. Q=0 cannot encode a one-lane 64-bit vector.
+            0x0e00_0c00 if size < 3 || (size == 3 && q) => Some(SimdCopy::DuplicateGeneral {
+                destination: VectorRegister((word & 31) as u8),
+                source: OperandRegister::field(word >> 5, false),
+                element,
+                full_width: q,
+            }),
+            // UMOV: Q selects Xd (64-bit elements) or Wd (smaller elements).
+            0x0e00_3c00 if (q && size == 3) || (!q && size < 3) => Some(SimdCopy::UnsignedMove {
+                destination: OperandRegister::field(word, false),
+                source: VectorRegister(((word >> 5) & 31) as u8),
+                element,
+                lane: imm5 >> (size + 1),
+            }),
+            _ => None,
         }
     }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2339,7 +2405,7 @@ pub use instruction::{
     Logical, LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress, MemoryIndex,
     MemoryOffset, MemoryOperation, MemoryRegister, MemorySize, MoveWide, MoveWideOperation,
     Multiply, MultiplyKind, Nzcv, OperandRegister, PairMemory, PcOffset, RegisterBranch,
-    ScalarMemory, SelectOperation, ShiftAmount, VectorRegister, decode_instruction,
+    ScalarMemory, SelectOperation, ShiftAmount, SimdCopy, VectorRegister, decode_instruction,
 };
 
 pub mod dispatch;

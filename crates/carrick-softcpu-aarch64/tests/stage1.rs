@@ -446,7 +446,7 @@ fn el0_dc_zva_zeros_one_translated_block_with_store_faults() {
     let mut r = Rig::el0();
     r.set(3, HOLE + 31);
     assert_eq!(r.run(0xd50b_7423), Outcome::Continue);
-    assert_eq!(r.cpu.el1.esr, Syndrome(0x6202_dc68)); // DZE trap before translation
+    assert_eq!(r.cpu.el1.esr, Syndrome(0x6212_dc68)); // DZE trap before translation
     assert_eq!(r.cpu.el1.elr, ProgramCounter(CODE));
 }
 
@@ -456,7 +456,7 @@ fn el0_ic_ivau_traps_or_translates_with_cache_maintenance_syndrome() {
     let mut r = Rig::el0();
     r.set(3, HOLE + 31);
     assert_eq!(r.run(0xd50b_7523), Outcome::Continue);
-    assert_eq!(r.cpu.el1.esr, Syndrome(0x6202_dc6a)); // UCI trap before translation
+    assert_eq!(r.cpu.el1.esr, Syndrome(0x6212_dc6a)); // UCI trap before translation
     assert_eq!(r.cpu.el1.elr, ProgramCounter(CODE));
 
     let mut r = Rig::el0();
@@ -469,4 +469,38 @@ fn el0_ic_ivau_traps_or_translates_with_cache_maintenance_syndrome() {
     r.set(3, HOLE + 31);
     assert_eq!(r.run(0xd50b_7523), Outcome::Continue);
     r.assert_abort(0x400, 0x9200_0147, HOLE + 31);
+}
+
+#[test]
+fn el0_q_store_crossing_a_stage1_hole_writes_neither_half() {
+    use carrick_softcpu_aarch64::VectorRegister;
+    let mut r = Rig::el0();
+    let address = HOLE - 8;
+    let q31 = VectorRegister::new(31).unwrap();
+    r.cpu.write_vector(q31, u128::MAX);
+    r.memory.put(UDATA_PA + PAGE - 8, 0x1020_3040_5060_7080);
+    r.set(0, address);
+    assert_eq!(r.run(0x3c81_0c1f), Outcome::Continue); // str q31, [x0, #16]!
+    r.assert_abort(0x400, 0x9200_0047, address + 16);
+    assert_eq!(r.get(0), address);
+
+    let mut r = Rig::el0();
+    r.cpu.write_vector(q31, u128::MAX);
+    r.memory.put(UDATA_PA + PAGE - 8, 0x1020_3040_5060_7080);
+    r.set(0, address);
+    assert_eq!(r.run(0x3d80_001f), Outcome::Continue); // str q31, [x0]
+    r.assert_abort(0x400, 0x9200_0047, HOLE);
+    assert_eq!(r.memory.get(UDATA_PA + PAGE - 8), 0x1020_3040_5060_7080);
+}
+
+#[test]
+fn el0_dc_zva_to_device_memory_raises_alignment_before_writing() {
+    let mut r = Rig::el0();
+    r.cpu.el1.sctlr.0 |= 1 << 14; // DZE
+    r.cpu.el1.mair = SystemValue(0); // AttrIndx=0 selects Device-nGnRnE
+    r.memory.put(UDATA_PA, u64::MAX);
+    r.set(3, UDATA + 31);
+    assert_eq!(r.run(0xd50b_7423), Outcome::Continue);
+    r.assert_abort(0x400, 0x9200_0061, UDATA + 31);
+    assert_eq!(r.memory.get(UDATA_PA), u64::MAX);
 }

@@ -520,7 +520,7 @@ fn native_dispatch_refetches_after_isb_and_enters_the_fault_vector() {
 }
 
 #[test]
-fn native_musl_simd_survives_memory_exits_and_preserves_host_d8_to_d15() {
+fn native_musl_simd_survives_memory_exits() {
     const DATA: u64 = CODE + 0x100;
     for (fill, expected) in [(0xa5, [0xa5; 16]), (0x1c, [0x1c; 16])] {
         let mut cpu = CpuState::default();
@@ -549,4 +549,41 @@ fn native_musl_simd_survives_memory_exits_and_preserves_host_d8_to_d15() {
         memory.read(VirtualAddress(DATA), &mut actual).unwrap();
         assert_eq!(actual, expected);
     }
+}
+
+#[test]
+fn native_simd_block_preserves_callee_saved_host_simd() {
+    use carrick_softcpu_aarch64::translate::{emit_block, split_span};
+    let blocks = split_span(
+        ProgramCounter(CODE),
+        &[0x4e01_0c28], // dup v8.16b, w1
+        BlockLimits::default(),
+    );
+    let block = emit_block(&blocks[0]).unwrap();
+    let bytes: Vec<_> = block.words().iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut jit = JitCodeBuffer::new(bytes.len()).unwrap();
+    let entry = jit.publish(&bytes).unwrap();
+    let mut frame = BlockFrame::default();
+    frame.slots[1] = 0xa5;
+    let host_d8: u64;
+    let mut region = vec![BlockFrame::default(); 64 * 1024 / size_of::<BlockFrame>()];
+    let top = region.last_mut().unwrap();
+    *top = frame;
+    // SAFETY: The same generated AAPCS64 block ABI that HostBlockRunner uses.
+    // The block runs on the live, 16-byte-aligned frame with a signal landing
+    // region below it. The assembly declares the ABI and its own V8 write.
+    unsafe {
+        core::arch::asm!(
+            "movi v8.8b, #0x73",
+            "blr x1",
+            "umov x9, v8.d[0]",
+            inout("x0") top as *mut BlockFrame => _,
+            in("x1") entry,
+            lateout("x9") host_d8,
+            lateout("v8") _,
+            clobber_abi("C"),
+        );
+    }
+    assert_eq!(host_d8, u64::from_le_bytes([0x73; 8]));
+    assert_eq!(top.vectors[8], u128::from_le_bytes([0xa5; 16]));
 }
