@@ -319,14 +319,52 @@ Per `AGENTS.md` ("Fix in shared layers; move code, never copy it"):
 
 ---
 
-## 3. First Hosted-ARM64 Guest-Visible Exit Receipt
+## 3. First Guest-Visible Exit Probe and Verification Status
 
-Driven by `crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs`
-(`production_el1_image_boots_past_trampoline_to_first_guest_hvc`) from the
-production `StagedCpu::initial_root` entry (`PC = 0x2d00000000` in `EL1h` with
-`el0_trampoline_bytes()`, `el1_vectors_bytes_mailbox_clock(true, true, El1IrqMode::Gic)`,
-`stage1_hvpatch_page_tables()`, `SP_EL1 = 0x2d001e8000`, and unmodified static
-`hello-aarch64` ELF at `ELR_EL1 = 0x210120`):
+### 3.1 Pre-Fix Boot Blocker Found and Fixed (`IC IALLUIS` at `0x2D_0000_0008`)
 
-- Hosted `soft-aarch64-native` receipt: *(populated immediately after hosted CI
-  run on `work/1236-m2-guest`)*
+`#2540` entered `carrick_el1_syscall` (`0x2D_0400_0068`) directly with a
+synthetic `TrapFrame` and stopped at an unbacked return sentinel
+(`0x2D_0000_0000`). Starting instead from the real production carrier handoff
+(`StagedCpu::initial_root`, `PC = LINUX_EL0_TRAMPOLINE_BASE = 0x2D_0000_0000` in
+`EL1h` with `el0_trampoline_bytes()`) immediately exposed a missing `EL1`
+cache-maintenance instruction at word 2 (`0x2D_0000_0008`):
+
+- Pre-fix (`be376f436`): `0xd508_711f` (`ic ialluis`) decoded as
+  `Instruction::Unallocated`, raising a current-EL undefined instruction
+  exception (`ELR_EL1 = 0x2d00000008`, `ESR_EL1 = 0x02000000`) into
+  `VBAR_EL1 + 0x200` (`HVC #3`).
+- Post-fix (`250fdce1f`): `IC IALLUIS` (`0xd508_711f`) and `IC IALLU`
+  (`0xd508_751f`) decode as `Instruction::InstructionCache(IcOperation)`, fault
+  at `EL0` (`EC = 0x00`), and retire as `Event::Ic` at `EL1`, allowing
+  `el0_trampoline_bytes()` to drop via `eret` to `EL0t` at `0x21_0120` and enter
+  the lower-EL `SVC #0` vector (`ESR_EL1 = 0x56000000`, `HVC #2`).
+
+### 3.2 Full Production Carrier-Root Probe (`boot_probe.rs`)
+
+`crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs`
+(`production_el1_image_boots_past_trampoline_to_first_guest_hvc`) installs the
+full production kernel control hole (`el0_trampoline_bytes`,
+`el1_vectors_bytes_mailbox_clock(true, true, El1IrqMode::Gic)`,
+`stage1_hvpatch_page_tables`, `el1_stack_guard_tables`, `el1_maintenance_bytes`,
+`stage1_carrier_maintenance_page_tables`, identity/ceiling/mailbox pages), the
+production `carrick-el1` ELF, and the unmodified static `hello-aarch64` ELF
+(`entry = 0x21_0120`, `SP_EL1 = 0x2D_001E_8000` slot 0 mailbox):
+
+- Execution path: `0x2D_0000_0000` (`EL1h` trampoline) -> `eret` -> `0x21_0120`
+  (`EL0t` `hello-aarch64`) -> `svc #0` at `0x21_0130` -> `0x2D_0001_0400` ->
+  `0x2D_0001_1000` (`EL1_VECTOR_HOOK`) -> `0x2D_0400_0068`
+  (`carrick_el1_syscall` returning `Action::Forward`) -> `0x2D_0001_0A2C`
+  (`MAILBOX_CAPTURE_OFFSET`) -> **`HVC #2` (`0xd400_0042`) at
+  `PC = 0x2D_0001_0B3C`** (`cpu.pc = 0x2D_0001_0B40`), with `mailbox[0]` at
+  `0x2D_001E_8000` publishing `state = 1`, `trap_kind = 1`, `native_nr = 64`
+  (`SYS_write`), `args = [0x1, 0x210140, 0x3]` (`"ok\n"`), and
+  `resume_pc = 0x210134` (guarded by an `EL0` `UDF #0` mutation control).
+- Hosted Linux `arm64` execution status: `boot_probe.rs` is cross-checked cleanly
+  with `cargo clippy --tests --target aarch64-unknown-linux-gnu -- -D warnings`.
+  Because this worker VM is `x86_64`, `ci.yml` has no `push` trigger on `work/*`,
+  this round forbids opening a PR before `#2540` lands, and the worker GitHub App
+  token receives HTTP 403 on `gh workflow run ci.yml --ref work/1236-m2-guest`,
+  the live `soft-aarch64-native` block count awaits shepherd workflow dispatch
+  (`gh workflow run ci.yml --ref work/1236-m2-guest`) or draft PR creation once
+  `#2540` merges.
