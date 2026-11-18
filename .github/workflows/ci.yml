@@ -2717,7 +2717,7 @@ jobs:
           set -u
           mkdir -p soft-aarch64-logs
           status=0
-          cargo test -p carrick-softcpu-aarch64 \
+          cargo test -p carrick-softcpu-aarch64 -p carrick-host-jit -p carrick-softcpu-aarch64-host \
             > soft-aarch64-logs/unit.log 2>&1 || status=$?
           cat soft-aarch64-logs/unit.log
           exit "$status"
@@ -2738,8 +2738,10 @@ jobs:
           export CARRICK_LLVM_OBJDUMP="$sysroot/lib/rustlib/$host/bin/llvm-objdump"
           # The loader-span census witness needs the span file that only
           # `just a64-census-gate` exports; the A64 census gate job runs it.
-          CARRICK_A64_ELF="$PWD/$elf" cargo test -p carrick-softcpu-aarch64 --tests \
-            -- --ignored --nocapture --skip generated_loader_vector_spans_are_typed \
+          CARRICK_A64_ELF="$PWD/$elf" cargo test -p carrick-softcpu-aarch64 -p carrick-softcpu-aarch64-host --tests \
+            -- --ignored --nocapture \
+            --skip generated_loader_vector_spans_are_typed \
+            --skip production_loader_vector_spans_split_and_translate_with_no_undefined_word \
             > soft-aarch64-logs/probe.log 2>&1 || status=$?
           cat soft-aarch64-logs/probe.log
           exit "$status"
