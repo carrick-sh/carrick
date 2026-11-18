@@ -174,8 +174,8 @@ On x86 (this VM and every CI lane):
   offsets, exact stub words, all hand-encoded from the Arm ARM and checked with
   `llvm-objdump` when `CARRICK_LLVM_OBJDUMP` is set.
 - Handlers: known answers from the Arm ARM pseudocode. Apply each mutation
-  independently, run the named test in `carrick-softcpu-aarch64/tests/handler.rs`,
-  and restore the source before the next mutation. Each mutation below
+  independently, run the named handler integration test or dispatcher unit
+  test, and restore the source before the next mutation. Each mutation below
   compiles and fails its named test.
 
   | File | One-line mutation | Test |
@@ -190,6 +190,9 @@ On x86 (this VM and every CI lane):
   | `handler.rs` | Change HVC's exception to `Exception::Svc(immediate)`. | `eret_and_hvc_are_undefined_at_el0` |
   | `state.rs` | Delete the access guard line for SP_EL0 with `StackSelect::El0`. | `sp_el0_sysreg_access_requires_the_el1_stack_bank` |
   | `state.rs` | Replace the VBAR write's `VirtualAddress(v & !0x7ff)` with `VirtualAddress(v)`. | `vbar_el1_write_discards_res0_bits` |
+  | `state.rs` | Change the nTWE bit from 18 to 16. | `el0_waits_trap_under_their_own_sctlr_control` |
+  | `dispatch.rs` | Add `&& !cpu.pstate.il` to the PC alignment fault condition. | `misaligned_pc_takes_priority_over_illegal_execution_state` |
+  | `dispatch.rs` | Replace `else if cpu.pstate.il` with `else if false && cpu.pstate.il`. | `restored_il_takes_an_exception_before_the_next_guest_instruction` |
 - Dispatcher: a `cfg(test)`-only `ExecuteBlock` double runs blocks of a small
   fixed instruction subset, only to test the dispatcher's exit mapping, PC
   continuation and stop reasons. It is never a product path.
@@ -203,6 +206,10 @@ On the arm64 runner (`#[cfg(all(target_arch = "aarch64", target_os = "linux"))]`
 - Fault delivery: execute up to ISB, then fetch the next block. An undefined
   AT or a misaligned LDAR reaches the EL1h vector with the matching ESR, ELR
   and FAR visible through native dispatch.
+- Wait and prefetch traps: native dispatch observes the EL1 vector for WFI,
+  WFE, illegal execution state and PC alignment. Under the flat memory profile,
+  PC alignment precedes illegal execution state and both precede the first
+  block fetch. A stage-1 walker must give instruction aborts priority over IL.
 - Exit round trip: a block ending in MRS/SVC exits with the exact restart PC,
   and the handler resumes.
 - I-cache publication: a published function is rewritten at the same address

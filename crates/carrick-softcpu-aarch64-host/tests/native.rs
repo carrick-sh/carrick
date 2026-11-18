@@ -101,6 +101,71 @@ fn run_at(cpu: &mut CpuState, memory: &mut Flat) -> (Report<HostError>, Vec<u64>
     (report, exec.starts)
 }
 
+#[test]
+fn native_dispatch_delivers_wait_and_prefetch_traps() {
+    const VBAR: u64 = 0x4001_0000;
+    for (start, word, il, esr, far, starts) in [
+        (
+            CODE,
+            0xd503207f,
+            false,
+            0x07e0_0000,
+            0,
+            &([CODE, VBAR + 0x400])[..],
+        ),
+        (
+            CODE,
+            0xd503205f,
+            false,
+            0x07e0_0001,
+            0,
+            &([CODE, VBAR + 0x400])[..],
+        ),
+        (
+            CODE,
+            0xd28000e0,
+            true,
+            0x3a00_0000,
+            0,
+            &([VBAR + 0x400])[..],
+        ),
+        (
+            CODE + 2,
+            0xd28000e0,
+            true,
+            0x8a00_0000,
+            CODE + 2,
+            &([VBAR + 0x400])[..],
+        ),
+    ] {
+        let mut cpu = CpuState::default();
+        cpu.pc = ProgramCounter(start);
+        cpu.pstate.il = il;
+        cpu.el1.vbar = VirtualAddress(VBAR);
+        let mut memory = Flat::default();
+        memory.put_words(CODE, &[word]);
+        // Read the syndrome in the EL1 vector, then return to the provider.
+        memory.put_words(VBAR + 0x400, &[0xd5385201, 0xd4000002]);
+        let (report, observed) = run_at(&mut cpu, &mut memory);
+        assert_eq!(observed, [starts, &[VBAR + 0x404]].concat(), "{report}");
+        assert!(
+            matches!(
+                report.stop,
+                Stop::Event {
+                    event: Event::ProviderExit(_),
+                    ..
+                }
+            ),
+            "{report}"
+        );
+        assert_eq!(x(&cpu, 0), 0);
+        assert_eq!(x(&cpu, 1), esr);
+        assert_eq!(cpu.el1.elr.0, start);
+        assert_eq!(cpu.el1.far.0, far);
+        assert_eq!(cpu.el1.spsr.0, u64::from(il) << 20);
+    }
+}
+
 // Arm ARM DDI0487G.a C6.2. The same words run through the translator and
 // directly as the body of an AAPCS64 leaf, giving an independent host result.
 const SNIPPET: [u32; 17] = [
