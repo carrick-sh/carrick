@@ -23,14 +23,17 @@
 #define INJECT_FORK_PREPARE_HELD         0xfffffffffffffe30
 #define INJECT_RELEASE_HELD_FORK_PREPARE 0xfffffffffffffe31
 #define INJECT_FORK_SUPERSEDED_CENSUS    0xfffffffffffffe32
+#define INJECT_HOLD_EDITOR_AND_RESUME_FORK 0xfffffffffffffe35
+#define INJECT_FORK_EDITOR_WAITERS      0xfffffffffffffe36
+#define INJECT_FORK_EDITOR_PROGRESS     0xfffffffffffffe37
 #define POLL_LIMIT                       0x10000000
 
 .global _start
 .text
 _start:
-    /* mmap(NULL, 0x3000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) */
+    /* mmap(NULL, 0x5000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) */
     xor %edi, %edi
-    mov $0x3000, %esi
+    mov $0x5000, %esi
     mov $3, %edx
     mov $0x22, %r10d
     mov $-1, %r8
@@ -81,6 +84,31 @@ ready_loop:
     syscall
     jmp ready_loop
 ready:
+#ifdef HOLD_EDITOR
+    /* Two additional members share the fork's CPU when the editor's
+     * sibling occupies the other CPL0 CPU. */
+    mov $0x003d0f00, %edi
+    lea 0x3ff0(%r12), %rsi
+    lea 0x04(%r12), %rdx
+    mov %rdx, %r10
+    lea 0x180(%r12), %r8
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js fail_clone
+    jz pool_waiter
+
+    mov $0x003d0f00, %edi
+    lea 0x4ff0(%r12), %rsi
+    lea 0x08(%r12), %rdx
+    mov %rdx, %r10
+    lea 0x200(%r12), %r8
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js fail_clone
+    jz pool_progress
+#endif
 
     /* The held fork; its child exits 0 at once. */
     mov $57, %eax
@@ -116,6 +144,19 @@ join_loop:
     je fail_join
     jmp join_loop
 joined:
+#ifdef HOLD_EDITOR
+    /* Wait for the second forking member to report its successful reap. */
+    mov $POLL_LIMIT, %r13
+pool_join:
+    cmpl $1, 0x70(%r12)
+    je pool_joined
+    dec %r13
+    jz fail_join
+    mov $24, %eax
+    syscall
+    jmp pool_join
+pool_joined:
+#endif
     mov 0x30(%r12), %edi
     cmp $22, %edi
     jne die
@@ -155,8 +196,16 @@ held:
     mov $9, %eax
     syscall
     mov %rax, %r14
+#ifdef HOLD_EDITOR
+    mov $INJECT_HOLD_EDITOR_AND_RESUME_FORK, %rax
+    syscall
+    test %rax, %rax
+    jnz worker_never_held
+
+#else
     mov $INJECT_RELEASE_HELD_FORK_PREPARE, %rax
     syscall
+#endif
     test %r14, %r14
     js worker_errno
     movl $22, 0x30(%r12)
@@ -173,6 +222,59 @@ worker_exit:
     mov $60, %eax
     syscall
     ud2
+
+#ifdef HOLD_EDITOR
+pool_waiter:
+    mov $1, %r15d
+    call wait_for_editor_queue
+    mov $57, %eax
+    syscall
+    test %rax, %rax
+    jz child_exit
+    js fail_held_fork
+    mov %rax, %r14
+    mov %rax, %rdi
+    lea 0x68(%r12), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    cmp %r14, %rax
+    jne fail_reap
+    cmpl $0, 0x68(%r12)
+    jne fail_reap
+    movl $1, 0x70(%r12)
+    jmp worker_exit
+
+pool_progress:
+    mov $2, %r15d
+    call wait_for_editor_queue
+    /* This member runs with both fork continuations still parked. */
+    mov $39, %eax
+    syscall
+    test %rax, %rax
+    jle fail_ready
+    mov $INJECT_FORK_EDITOR_PROGRESS, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_ready
+    jmp worker_exit
+
+wait_for_editor_queue:
+    mov $POLL_LIMIT, %r13
+1:
+    mov $INJECT_FORK_EDITOR_WAITERS, %rax
+    syscall
+    cmp %r15, %rax
+    je 2f
+    dec %r13
+    jz fail_ready
+    mov $24, %eax
+    syscall
+    jmp 1b
+2:
+    ret
+#endif
 
 child_exit:
     xor %edi, %edi
