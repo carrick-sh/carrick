@@ -18,7 +18,7 @@ use carrick_softcpu_x86::{
     ExtentRecord, ExtentTable, FrameGpa, LinearPlacement, MmioHoles, OwnerGeneration, RootGpa,
     SoftMmuMemory,
 };
-use carrick_softmmu::{MAX_PLACEMENT_SEGMENTS, PAGE_SIZE_4K, PlacementSegment};
+use carrick_softmmu::{HostWriteError, MAX_PLACEMENT_SEGMENTS, PAGE_SIZE_4K, PlacementSegment};
 use carrick_x86_cpl0_host::carrier_memory::{BackingExtent, CarrierMemoryIo, CarrierMemoryRegion};
 use carrick_x86_cpl0_host::cpl0_boot::retained_slots::RetainedCarrierSlots;
 use carrick_x86_cpl0_host::cpl0_boot::{ProductionCpuFactory, fail};
@@ -47,6 +47,14 @@ type RetainedSlots = BTreeMap<u32, RetainedSlot>;
 struct RetainedSlot {
     region: CarrierMemoryRegion,
     backing: Arc<BackingExtent>,
+}
+
+impl RetainedSlot {
+    fn same_registration(&self, other: Option<&Self>) -> bool {
+        other.is_some_and(|other| {
+            self.region == other.region && Arc::ptr_eq(&self.backing, &other.backing)
+        })
+    }
 }
 
 impl SoftVm {
@@ -220,32 +228,43 @@ impl SoftCarrierMemory {
         }
     }
 
-    /// Refresh additions while the vCPU is stopped. The existing extent
-    /// table keeps the CPU's seat, admitted roots and frame code generations.
+    /// Refresh the published slot snapshot while the vCPU is stopped. Keep
+    /// the same invalidation domain and frame code generations across reuse.
     pub(crate) fn refresh(&mut self) -> Result<bool, TrapError> {
         let retained = self.vm.retained_slots()?;
         if Arc::ptr_eq(&self.retained, &retained) {
             return Ok(false);
         }
 
-        for (&index, old) in self.retained.iter() {
-            if retained.get(&index).is_none_or(|slot| {
-                slot.region != old.region || !Arc::ptr_eq(&slot.backing, &old.backing)
-            }) {
-                return Err(fail(format!(
-                    "soft slot {index} changed or retired without a retirement protocol"
-                )));
-            }
-        }
-
-        if self.retained.len() == retained.len() {
+        let retired = self
+            .retained
+            .iter()
+            .filter(|(index, old)| !old.same_registration(retained.get(index)))
+            .map(|(_, old)| FrameGpa::new(old.region.guest_phys_addr))
+            .collect::<Vec<_>>();
+        if retired.is_empty() && self.retained.len() == retained.len() {
             self.retained = retained;
             return Ok(false);
         }
 
         let placement = Self::placement_for(&retained)?;
+        // The old snapshot keeps its backings alive during retirement. The
+        // only runnable vCPU parks at the end of each step, so completion is
+        // immediate and its next admission serves the invalidation debt.
+        for base in retired {
+            let retirement = self
+                .extents
+                .remove(base, None)
+                .map_err(|error| fail(format!("soft slot retirement {base:?}: {error:?}")))?
+                .ok_or_else(|| fail(format!("soft slot retirement missing extent {base:?}")))?;
+            let completion = retirement
+                .pending
+                .try_complete()
+                .map_err(|_| fail("soft slot retirement found a running vCPU"))?;
+            self.extents.reclaim(&completion);
+        }
         for (index, slot) in retained.iter() {
-            if !self.retained.contains_key(index) {
+            if !slot.same_registration(self.retained.get(index)) {
                 Self::install_extent(&mut self.extents, &slot.region)?;
             }
         }
@@ -260,9 +279,15 @@ impl SoftCarrierMemory {
     pub(crate) fn invalidate_host_writes(&mut self) -> Result<(), TrapError> {
         let mut slots = self.vm.slots();
         for &page in &slots.host_written {
-            self.extents
+            match self
+                .extents
                 .invalidate_host_written_page(page, BOOT_GENERATION)
-                .map_err(|error| fail(format!("soft host write {page:?}: {error:?}")))?;
+            {
+                // Custody recorded the write while the slot existed. A
+                // subsequent retirement already deactivated its code pages.
+                Ok(()) | Err(HostWriteError::Owner) => {}
+                Err(error) => return Err(fail(format!("soft host write {page:?}: {error:?}"))),
+            }
         }
         slots.host_written.clear();
         Ok(())
@@ -273,12 +298,12 @@ impl SoftCarrierMemory {
     pub fn admit_root(&mut self, root: u64) -> Result<(), TrapError> {
         let root = RootGpa::page_aligned(FrameGpa::new(root))
             .ok_or_else(|| fail("soft root alignment"))?;
-        if self.extents.expected_generation(root) == Some(BOOT_GENERATION)
-            || (self
-                .extents
-                .lookup_span(root.address().raw(), PAGE_SIZE_4K)
-                .is_some_and(|extent| extent.generation == BOOT_GENERATION)
-                && self.extents.set_root_generation(root, BOOT_GENERATION))
+        if self
+            .extents
+            .lookup_span(root.address().raw(), PAGE_SIZE_4K)
+            .is_some_and(|extent| extent.generation == BOOT_GENERATION)
+            && (self.extents.expected_generation(root) == Some(BOOT_GENERATION)
+                || self.extents.set_root_generation(root, BOOT_GENERATION))
         {
             Ok(())
         } else {
@@ -291,8 +316,8 @@ impl SoftCarrierMemory {
 }
 
 // SAFETY: each placement points to allocations held by its retained
-// snapshot. Refresh preserves the actual backing of every existing slot and
-// updates the same inventory domain as the CPU's invalidation seat.
+// snapshot. Refresh completes removals in the CPU's own invalidation domain
+// before replacing the placement or releasing the previous snapshot.
 unsafe impl SoftMmuMemory for SoftCarrierMemory {
     fn placement(&self) -> &LinearPlacement {
         &self.placement
