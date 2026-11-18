@@ -3638,6 +3638,30 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
+    fn owner_grant_refusal_script_names_the_compiled_probes() {
+        let script = include_str!("../../../scripts/dtrace/owner-grant-descriptor-refusals.d");
+        for name in [
+            "hvpatch-owner-grant-descriptor-refused",
+            "frame-grant-residency-refused",
+            "descriptor-journal-reserve-failed",
+            "descriptor-plan-refused",
+        ] {
+            assert!(
+                script
+                    .lines()
+                    .any(|line| line == format!("carrick*:::{name}"))
+            );
+        }
+
+        // Instantiate the real USDT wrappers on native probe targets and the
+        // matching stubs when cross-compiling.
+        super::hvpatch_owner_grant_descriptor_refused(|| (0, 0, 0, 0, 0, 0));
+        super::frame_grant_residency_refused(0, 0, 0, 0, 0);
+        super::descriptor_journal_reserve_failed(0, 0, 0, 0);
+        super::descriptor_plan_refused(0, 0, 0, 0, 0, 0);
+    }
+
+    #[test]
     fn epoll_lookup_provider_and_stub_keep_file_authority_abi_stable() {
         let source = include_str!("probes.rs");
         let declaration = "fn epoll__lookup(_: u64, _: i32, _: u64, _: u64, _: u32) {}";
@@ -6217,6 +6241,24 @@ mod real {
         fn hvpatch__executor__failure(_: u32, _: &str) {}
         /// Native crossing refusal: MM, MM incarnation, record, sequence, ordinal.
         fn hvpatch__native__crossing__refused(_: u64, _: u64, _: u32, _: u64, _: u64) {}
+        /// Transfer settlement: transaction generation, op kind, span VA and
+        /// length, refusal code, and whether exact residency is live.
+        fn hvpatch__owner__grant__descriptor__refused(
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) {
+        }
+        /// Failed residency publication: MM, span, sampled occupancy and capacity.
+        fn frame__grant__residency__refused(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Finished plan exceeded journal reserve: ISA, kind, stores and grants.
+        fn descriptor__journal__reserve__failed(_: u64, _: u64, _: u64, _: u64) {}
+        /// Refused descriptor plan: ISA, site, op kind, live stores, table grants and reason.
+        /// Site 3 identifies the journal reserve failure after planning succeeded.
+        fn descriptor__plan__refused(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) {}
         /// Native fault supply: MM, sequence, phase, fault page, selected length.
         fn hvpatch__native__fault__supply(_: u64, _: u64, _: u32, _: u64, _: u64) {}
         /// One scheduler wake edge against a kernel thread. Args: ThreadSerial,
@@ -7078,6 +7120,32 @@ mod real {
             sequence,
             ordinal
         ));
+    }
+
+    #[allow(clippy::redundant_closure)] // `usdt` requires a syntactic closure.
+    pub fn hvpatch_owner_grant_descriptor_refused(
+        arguments: impl FnOnce() -> (u64, u64, u64, u64, u64, u64),
+    ) {
+        carrick_usdt::hvpatch__owner__grant__descriptor__refused!(|| arguments());
+    }
+
+    pub fn frame_grant_residency_refused(mm: u64, va: u64, len: u64, used: u64, total: u64) {
+        carrick_usdt::frame__grant__residency__refused!(|| (mm, va, len, used, total));
+    }
+
+    pub fn descriptor_journal_reserve_failed(isa: u64, kind: u64, stores: u64, grants: u64) {
+        carrick_usdt::descriptor__journal__reserve__failed!(|| (isa, kind, stores, grants));
+    }
+
+    pub fn descriptor_plan_refused(
+        isa: u64,
+        site: u64,
+        kind: u64,
+        stores: u64,
+        grants: u64,
+        refusal: u64,
+    ) {
+        carrick_usdt::descriptor__plan__refused!(|| (isa, site, kind, stores, grants, refusal));
     }
 
     pub fn hvpatch_native_fault_supply(
@@ -9799,6 +9867,13 @@ mod stub {
     ));
     stub!(hvpatch_executor_failure(executor: u32, error: &str));
     stub!(hvpatch_native_crossing_refused(mm: u64, incarnation: u64, record: u32, sequence: u64, ordinal: u64));
+    pub fn hvpatch_owner_grant_descriptor_refused(
+        _arguments: impl FnOnce() -> (u64, u64, u64, u64, u64, u64),
+    ) {
+    }
+    stub!(frame_grant_residency_refused(mm: u64, va: u64, len: u64, used: u64, total: u64));
+    stub!(descriptor_journal_reserve_failed(isa: u64, kind: u64, stores: u64, grants: u64));
+    stub!(descriptor_plan_refused(isa: u64, site: u64, kind: u64, stores: u64, grants: u64, refusal: u64));
     stub!(hvpatch_native_fault_supply(mm: u64, sequence: u64, phase: super::HvpatchNativeFaultPhase, fault_page: u64, length: u64));
     stub!(hvpatch_scheduler_wake(
         thread_serial: u64,

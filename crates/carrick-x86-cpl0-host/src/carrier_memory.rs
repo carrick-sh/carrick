@@ -1691,6 +1691,16 @@ impl<M: CarrierMemoryIo> LiveDescriptorWords for DescriptorWords<'_, M> {
         std::sync::atomic::fence(Ordering::SeqCst);
     }
     fn invalidate_range(&self, _va: u64, _len: u64) {} // Owner's trailing CPL0 drain before any re-entry.
+
+    fn descriptor_diagnostic(
+        &self,
+        event: carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic,
+    ) {
+        carrick_hal::diagnostic_capture::trace_descriptor_diagnostic(
+            carrick_guest_arch::GuestIsa::X86_64,
+            event,
+        );
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
