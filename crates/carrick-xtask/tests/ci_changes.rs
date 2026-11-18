@@ -498,21 +498,23 @@ fn draft_pr_runs_cheap_linux_checks_and_its_ci_ok_cannot_land() {
       "lint-gates": { "result": "success" },
       "xtask-tests-build": { "result": "success" },
       "lint-domains": { "result": "success" },
-      "portable": { "result": "skipped" },
-      "loom": { "result": "skipped" },
-      "linux-doc": { "result": "skipped" },
+      "portable": { "result": "success" },
+      "loom": { "result": "success" },
+      "x86-host-tests": { "result": "success" },
+      "linux-doc": { "result": "success" },
       "macos-authority": { "result": "skipped" },
       "macos-clippy": { "result": "skipped" },
       "macos-build": { "result": "skipped" },
       "macos-unit-a": { "result": "skipped" },
       "macos-unit-b": { "result": "skipped" },
       "macos-integration": { "result": "skipped" },
-      "cross-check-freebsd": { "result": "skipped" },
-      "cross-check-netbsd": { "result": "skipped" },
-      "cross-check-macos": { "result": "skipped" },
-      "kernel-linux-native": { "result": "skipped" },
-      "el1-native-tests": { "result": "skipped" },
-      "el1-native-gate": { "result": "skipped" }
+      "cross-check-freebsd": { "result": "success" },
+      "cross-check-netbsd": { "result": "success" },
+      "cross-check-macos": { "result": "success" },
+      "cross-check-linux": { "result": "success" },
+      "kernel-linux-native": { "result": "success" },
+      "el1-native-tests": { "result": "success" },
+      "el1-native-gate": { "result": "success" }
     }"#;
     // #1321: a draft run's ci-ok is never a landing signal. When everything
     // it ran passed it still fails, and says why, so auto-merge can't take a
@@ -545,6 +547,33 @@ fn draft_pr_runs_cheap_linux_checks_and_its_ci_ok_cannot_land() {
         "draft PR with failing lint-domains must fail ci-results"
     );
 
+    // The cheap hosted jobs run on a draft, so a skipped one on a heavy draft
+    // is a broken gate, and a red one is a red ci-results.
+    for job in [
+        "portable",
+        "loom",
+        "x86-host-tests",
+        "linux-doc",
+        "kernel-linux-native",
+        "cross-check-freebsd",
+        "cross-check-netbsd",
+        "cross-check-macos",
+        "el1-native-tests",
+        "el1-native-gate",
+    ] {
+        let needle = format!(r#""{job}": {{ "result": "success" }}"#);
+        for result in ["failure", "skipped"] {
+            let replaced =
+                draft_needs.replace(&needle, &format!(r#""{job}": {{ "result": "{result}" }}"#));
+            let (ok, out) = run_ci_results_with_env("pull_request", Some("true"), &replaced, &[]);
+            assert!(!ok, "draft PR with {job} {result} must fail ci-results");
+            assert!(
+                !out.contains("draft run:"),
+                "{job} {result} must fail on the job, not the draft notice: {out}"
+            );
+        }
+    }
+
     let draft_skipped_lint_domains = draft_needs.replace(
         r#""lint-domains": { "result": "success" }"#,
         r#""lint-domains": { "result": "skipped" }"#,
@@ -553,6 +582,86 @@ fn draft_pr_runs_cheap_linux_checks_and_its_ci_ok_cannot_land() {
         !run_ci_results("pull_request", Some("true"), &draft_skipped_lint_domains),
         "draft PR with skipped lint-domains on heavy PR must fail ci-results"
     );
+}
+
+/// The jobs a draft PR runs: hosted, cheap, and the failures `ci-ok` would
+/// raise at ready time. A self-hosted Mac or gate runner never takes a draft.
+const DRAFT_JOBS: &[&str] = &[
+    "portable",
+    "loom",
+    "x86-host-tests",
+    "linux-doc",
+    "kernel-linux-native",
+    "cross-check-freebsd",
+    "cross-check-netbsd",
+    "cross-check-macos",
+    "cross-check-linux",
+    "x86-test-list",
+    "el1-native-tests",
+    "el1-native-gate",
+];
+
+const DRAFT_GATED_JOBS: &[&str] = &[
+    "macos-clippy",
+    "macos-build",
+    "macos-unit-a",
+    "macos-unit-b",
+    "macos-integration",
+    "arm-test-list",
+];
+
+#[test]
+fn ci_workflow_runs_cheap_hosted_jobs_on_drafts_and_keeps_mac_jobs_off_them() {
+    let text = fs::read_to_string(workspace_root().join(".github/workflows/ci.yml")).unwrap();
+    let docs = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
+    let jobs = docs[0]["jobs"].as_hash().unwrap();
+    let job = |name: &str| {
+        jobs.iter()
+            .find(|(k, _)| k.as_str() == Some(name))
+            .unwrap_or_else(|| panic!("job {name} missing from ci.yml"))
+            .1
+    };
+    for name in DRAFT_JOBS {
+        let j = job(name);
+        let cond = j["if"].as_str().unwrap_or("");
+        assert!(
+            !cond.contains("draft"),
+            "{name} must run on draft PRs, but its condition names draft: {cond}"
+        );
+        let runs_on = j["runs-on"].as_str().unwrap_or("");
+        assert!(
+            runs_on.starts_with("ubuntu-"),
+            "{name} runs on a draft, so it must be a GitHub-hosted Linux job, not {runs_on}"
+        );
+    }
+    for name in DRAFT_GATED_JOBS {
+        let j = job(name);
+        let cond = j["if"].as_str().unwrap_or("");
+        assert!(
+            cond.contains("github.event.pull_request.draft == false"),
+            "{name} runs on the Mac runners and must stay off draft PRs: {cond}"
+        );
+        assert!(
+            j["runs-on"].as_str().unwrap_or("").contains("macos_runner"),
+            "{name} is pinned as a Mac job"
+        );
+    }
+    // The macOS authority census is merge-group only, never a draft job.
+    let authority = job("macos-authority")["if"].as_str().unwrap_or("");
+    assert!(
+        authority.contains("github.event_name == 'merge_group'"),
+        "{authority}"
+    );
+    // Every job that still names draft is a Mac job; nothing else hides behind it.
+    for (name, body) in jobs {
+        let name = name.as_str().unwrap();
+        if body["if"].as_str().unwrap_or("").contains("draft") {
+            assert!(
+                DRAFT_GATED_JOBS.contains(&name),
+                "{name} is draft-gated but not in the Mac-only list"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -829,6 +938,7 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
       "cross-check-freebsd": { "result": "success" },
       "cross-check-netbsd": { "result": "success" },
       "cross-check-macos": { "result": "success" },
+      "cross-check-linux": { "result": "success" },
       "kernel-linux-native": { "result": "success" },
       "el1-native-tests": { "result": "skipped" },
       "el1-native-gate": { "result": "skipped" }
@@ -974,6 +1084,7 @@ fn heavy_same_repo_pr_requires_the_full_macos_suite() {
       "cross-check-freebsd": { "result": "success" },
       "cross-check-netbsd": { "result": "success" },
       "cross-check-macos": { "result": "success" },
+      "cross-check-linux": { "result": "success" },
       "kernel-linux-native": { "result": "success" },
       "el1-native-tests": { "result": "success" },
       "el1-native-gate": { "result": "success" }
@@ -1337,6 +1448,7 @@ fn el1_native_closure_gates_pr_surfaces_and_refuses_new_failures_before_landing(
       "cross-check-freebsd": { "result": "success" },
       "cross-check-netbsd": { "result": "success" },
       "cross-check-macos": { "result": "success" },
+      "cross-check-linux": { "result": "success" },
       "kernel-linux-native": { "result": "success" },
       "el1-native-tests": { "result": "skipped" },
       "el1-native-gate": { "result": "skipped" }
