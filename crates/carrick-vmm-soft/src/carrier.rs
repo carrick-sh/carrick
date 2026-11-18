@@ -94,6 +94,22 @@ pub struct SoftRunTrace {
     pub recent: std::collections::VecDeque<u64>,
 }
 
+impl SoftRunTrace {
+    /// The `n` block RIPs most frequent in [`Self::recent`], with their
+    /// counts, hottest first: where a run that stopped without an exit
+    /// was spending its blocks.
+    pub fn hot_blocks(&self, n: usize) -> Vec<(u64, usize)> {
+        let mut counts = std::collections::BTreeMap::<u64, usize>::new();
+        for &rip in &self.recent {
+            *counts.entry(rip).or_default() += 1;
+        }
+        let mut hot: Vec<_> = counts.into_iter().collect();
+        hot.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        hot.truncate(n);
+        hot
+    }
+}
+
 /// How many recent block RIPs a [`SoftRunTrace`] keeps.
 pub const RECENT_BLOCKS: usize = 512;
 
