@@ -466,6 +466,50 @@ mod tests {
     }
 
     #[test]
+    fn svc_and_eret_restore_the_origin_and_signal_one_local_event() {
+        for (el, sp, offset, mode) in [
+            (ExceptionLevel::El0, StackSelect::El0, 0x400, 0),
+            (ExceptionLevel::El1, StackSelect::El0, 0, 4),
+            (ExceptionLevel::El1, StackSelect::El1, 0x200, 5),
+        ] {
+            let mut cpu = el1();
+            cpu.pstate.el = el;
+            cpu.pstate.sp = sp;
+            cpu.pstate.nzcv = 0xa;
+            cpu.pstate.daif.0 = 5;
+            cpu.pstate.uao = true;
+            let initial = cpu.pstate;
+            // Permit WFE so a second wait reports a suspension at either EL.
+            cpu.el1.sctlr.0 = 1 << 18;
+            let mut m = Flat::default();
+            m.code(ENTRY, &[0xd40000e1, 0xd503205f, 0xd503205f]); // svc #7; wfe; wfe
+            m.code(VBAR + offset, &[0xd69f03e0]); // eret
+
+            let entry = go(&mut cpu, &mut m, &mut GuestSemantics, 1);
+            assert_eq!(entry.pc, ProgramCounter(VBAR + offset));
+            assert_eq!(cpu.el1.esr.0, 0x5600_0007);
+            assert_eq!(cpu.el1.elr.0, ENTRY + 4);
+            assert_eq!(cpu.el1.spsr.0, 0xa080_0140 | mode);
+            assert_eq!(cpu.pstate.sp, StackSelect::El1);
+            assert_eq!(cpu.pstate.daif.0, 15);
+            assert!(cpu.pstate.pan);
+            assert!(!cpu.pstate.uao);
+
+            let returned = go(&mut cpu, &mut m, &mut GuestSemantics, 3);
+            assert_eq!(cpu.pstate, initial);
+            let Stop::Event {
+                instruction,
+                event: Event::Hint(crate::Hint::Wfe),
+            } = returned.stop
+            else {
+                panic!("{returned}");
+            };
+            assert_eq!(instruction.pc.0, ENTRY + 8);
+            assert_eq!(returned.pc.0, ENTRY + 12);
+        }
+    }
+
+    #[test]
     fn isb_retires_and_starts_a_new_dispatch_at_the_next_word() {
         let mut m = Flat::default();
         m.code(ENTRY, &[0xd503_3fdf, 0xd400_0002]); // isb; hvc #0
