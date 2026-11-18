@@ -17,7 +17,7 @@ use crate::{
     AtomicTransferKind, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, Extend, Hint,
     Immediate16, Instruction, MemoryAddress, MemoryIndex, MemoryOperation, MemoryRegister,
     MemorySize, OperandRegister, PstateField, RegisterBranch, SystemDirection, SystemRegister,
-    TlbiOperation, Width,
+    TlbiOperation, Translation, Width,
 };
 
 /// A guest access the flat memory model cannot serve (an unmapped address,
@@ -136,14 +136,26 @@ pub fn execute(
         },
         Instruction::PstateImmediate(p) => pstate(cpu, i.word, p.field, p.immediate),
         Instruction::SystemOperation(op) => {
-            if cpu.pstate.el == ExceptionLevel::El0 {
+            // C5.4: op1 selects the minimum EL for these TLBI encodings.
+            if cpu.pstate.el == ExceptionLevel::El0 || op.op1 != 0 {
                 return undefined(cpu);
             }
             next(cpu);
             Outcome::Event(Event::Tlbi(op.operation))
         }
-        Instruction::CensusGap(Decoded::AddressTranslate { .. }) => {
-            if cpu.pstate.el == ExceptionLevel::El0 {
+        Instruction::CensusGap(Decoded::AddressTranslate { op, .. }) => {
+            // C5.3, Table C5-3: only the op1=0 AT aliases are available at EL1.
+            if cpu.pstate.el == ExceptionLevel::El0
+                || !matches!(
+                    op,
+                    Translation::S1E1R
+                        | Translation::S1E1W
+                        | Translation::S1E0R
+                        | Translation::S1E0W
+                        | Translation::S1E1Rp
+                        | Translation::S1E1Wp
+                )
+            {
                 return undefined(cpu);
             }
             Outcome::Event(Event::AddressTranslate)
