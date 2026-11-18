@@ -1834,6 +1834,21 @@ pub struct MetadataGrantResponse {
     pub cookie: u64,
 }
 
+/// The single-flight metadata request a kernel heap miss is owed: the
+/// request in flight when the allocation missed. Its generation names the
+/// request's own wait queue (`ObjectWaitKey::metadata_request`), which the
+/// carrier's completion publishes under (`MetadataCompletionWake`), so a
+/// caller that waits for the grant enrols there. Only the mailbox issues one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwedMetadataGrant {
+    generation: core::num::NonZeroU64,
+}
+impl OwedMetadataGrant {
+    pub const fn generation(self) -> core::num::NonZeroU64 {
+        self.generation
+    }
+}
+
 /// One carrier-wide single-flight request. The allocator lock serializes guest
 /// publication/consumption; the state word transfers ownership to and from the
 /// host with release/acquire ordering. Host service happens only after EL1 has
@@ -1985,19 +2000,34 @@ impl MetadataGrantMailbox {
         self.state.load(Ordering::Acquire) != METADATA_MAILBOX_IDLE
     }
 
-    /// Whether an allocation that missed now is owed capacity: a mailbox
-    /// transaction is in flight, so a rerun after the carrier serves it can
+    /// The grant an allocation that missed now is owed: a mailbox
+    /// transaction is in flight, so a rerun after the carrier answers it can
     /// admit a grant (or publish its own request). Only an answered ALLOC
     /// the host denied owes nothing; neither does an idle mailbox (#2441).
-    pub fn capacity_owed(&self) -> bool {
-        match self.state.load(Ordering::Acquire) {
+    /// Sample it under the allocator lock, which excludes guest publication
+    /// and consumption.
+    pub fn owed_grant(&self) -> Option<OwedMetadataGrant> {
+        let owed = match self.state.load(Ordering::Acquire) {
             METADATA_MAILBOX_IDLE => false,
             METADATA_MAILBOX_RESPONSE => {
                 u64::from(self.op.load(Ordering::Relaxed)) != METADATA_GRANT_OP_ALLOC
                     || self.status.load(Ordering::Relaxed) == METADATA_GRANT_SUCCESS
             }
             _ => true,
-        }
+        };
+        let generation = core::num::NonZeroU64::new(self.request_generation())?;
+        owed.then_some(OwedMetadataGrant { generation })
+    }
+
+    /// Whether request `generation` still awaits the carrier's answer. Probe
+    /// it under that request's wait-queue lock: the carrier publishes the
+    /// answer under the same lock, and no later request can bind the queue
+    /// meanwhile, so a waiter that sees it pending cannot miss the wake.
+    pub fn grant_pending(&self, generation: core::num::NonZeroU64) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            METADATA_MAILBOX_REQUESTED | METADATA_MAILBOX_HOST_WORKING
+        ) && self.request_generation() == generation.get()
     }
 }
 

@@ -61,11 +61,15 @@ pub enum NativeForkCause {
     SiblingBirth {
         observed: carrick_sched_core::process::wait::TaskWakeGeneration,
     },
-    /// The kernel heap missed the fork's scratch while a metadata grant is
-    /// in flight on the carrier mailbox: capacity is owed, so this is "not
-    /// now". The fork keeps its syscall and reruns once the carrier serves
-    /// the grant (#2441). A miss nothing is owed for is `Fork(NoMemory)`.
-    MetadataOwed,
+    /// The kernel heap missed the fork's scratch while metadata grant
+    /// `grant` is in flight on the carrier mailbox: capacity is owed, so
+    /// this is "not now". Waiting for the grant is a guest wait: the fork
+    /// keeps its syscall, parks on the grant request's own queue and reruns
+    /// once the carrier answers it (#2441). A miss nothing is owed for is
+    /// `Fork(NoMemory)`.
+    MetadataOwed {
+        grant: carrick_el1_abi::OwedMetadataGrant,
+    },
 }
 
 impl From<MmError> for NativeForkCause {
@@ -99,7 +103,7 @@ impl NativeForkRefusal {
         match self.cause {
             NativeForkCause::Busy
             | NativeForkCause::SiblingBirth { .. }
-            | NativeForkCause::MetadataOwed => E::Busy,
+            | NativeForkCause::MetadataOwed { .. } => E::Busy,
             // Today's EAGAIN answer, as a refusal rather than "not now".
             NativeForkCause::GateShut => E::Exhausted,
             NativeForkCause::Mm(error) => mm_error(error),
@@ -201,12 +205,12 @@ pub fn fork_scratch(
         count.custody,
     )
     .map_err(|error| {
-        let cause = if error == ForkError::NoMemory
-            && carrick_el1::alloc::GLOBAL_ALLOCATOR.capacity_owed()
-        {
-            NativeForkCause::MetadataOwed
-        } else {
-            NativeForkCause::Fork(error)
+        let owed = (error == ForkError::NoMemory)
+            .then(|| carrick_el1::alloc::GLOBAL_ALLOCATOR.owed_grant())
+            .flatten();
+        let cause = match owed {
+            Some(grant) => NativeForkCause::MetadataOwed { grant },
+            None => NativeForkCause::Fork(error),
         };
         let refusal = NativeForkRefusal {
             stage: NativeForkStage::Scratch,
@@ -261,6 +265,22 @@ pub fn sibling_birth(
                 ..
             },
         )) => Some(*observed),
+        _ => None,
+    }
+}
+
+/// The grant a fork's scratch miss is owed, if `error` is one: the fork
+/// waits for that grant, then reruns.
+pub fn metadata_owed(
+    error: &Result<u32, super::native_process_runtime::NativeProcessError>,
+) -> Option<carrick_el1_abi::OwedMetadataGrant> {
+    match error {
+        Err(super::native_process_runtime::NativeProcessError::ForkRefused(
+            NativeForkRefusal {
+                cause: NativeForkCause::MetadataOwed { grant },
+                ..
+            },
+        )) => Some(*grant),
         _ => None,
     }
 }
@@ -358,6 +378,21 @@ use super::native_diagnostic::emit;
 mod tests {
     use super::super::native_process_runtime::{NativeContention, NativeProcessError};
     use super::*;
+
+    /// A grant request in flight on a stand-in carrier mailbox.
+    fn owed_grant() -> carrick_el1_abi::OwedMetadataGrant {
+        let mailbox = carrick_el1_abi::MetadataGrantMailbox::new();
+        assert!(
+            mailbox.try_publish_request(carrick_el1_abi::MetadataGrantRequest {
+                op: carrick_el1_abi::METADATA_GRANT_OP_ALLOC,
+                arg1: 512 * 1024,
+                arg2: 0,
+                arg3: 0,
+                cookie: 0,
+            })
+        );
+        mailbox.owed_grant().unwrap()
+    }
 
     #[test]
     fn boundary_observes_every_untyped_error_without_changing_policy() {
@@ -492,7 +527,13 @@ mod tests {
             assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-12));
         }
         assert_eq!(
-            refused(NativeForkStage::Scratch, NativeForkCause::MetadataOwed).failure(),
+            refused(
+                NativeForkStage::Scratch,
+                NativeForkCause::MetadataOwed {
+                    grant: owed_grant()
+                }
+            )
+            .failure(),
             Err(NativeContention::BUSY)
         );
         use carrick_el1_abi::ForkStockRefusal as R;
@@ -518,8 +559,9 @@ mod tests {
 
     /// The census-sized scratch refuses only a heap miss. Without a grant
     /// mailbox (host builds, the x86 CPL0 image) nothing is owed: ENOMEM.
+    /// With a grant in flight, the miss is owed that grant.
     #[test]
-    fn scratch_heap_miss_without_a_grant_mailbox_is_enomem() {
+    fn scratch_heap_miss_is_enomem_unless_a_grant_is_in_flight() {
         let request = carrick_el1_abi::PortalForkRequest {
             operation: carrick_el1_abi::PortalOperation {
                 carrier: core::num::NonZeroU64::MIN,
@@ -550,6 +592,34 @@ mod tests {
             })
         );
         assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-12));
+
+        // With a grant request in flight on the carrier mailbox, the same
+        // miss is owed that exact grant: the fork waits for it.
+        let mailbox: &'static carrick_el1_abi::MetadataGrantMailbox = std::boxed::Box::leak(
+            std::boxed::Box::new(carrick_el1_abi::MetadataGrantMailbox::new()),
+        );
+        assert!(
+            mailbox.try_publish_request(carrick_el1_abi::MetadataGrantRequest {
+                op: carrick_el1_abi::METADATA_GRANT_OP_ALLOC,
+                arg1: 512 * 1024,
+                arg2: 0,
+                arg3: 0,
+                cookie: 0,
+            })
+        );
+        carrick_el1::alloc::install_host_test_grant_mailbox(Some(mailbox));
+        assert!(carrick_core::mm::fork::inject_scratch_exhausted_once());
+        let owed = fork_scratch(request, 0, &count).unwrap_err();
+        carrick_el1::alloc::install_host_test_grant_mailbox(None);
+        let grant = mailbox.owed_grant().unwrap();
+        assert_eq!(
+            owed,
+            NativeProcessError::ForkRefused(NativeForkRefusal {
+                stage: NativeForkStage::Scratch,
+                cause: NativeForkCause::MetadataOwed { grant },
+            })
+        );
+        assert_eq!(super::metadata_owed(&Err(owed)), Some(grant));
     }
 
     /// A held reservation root at the mapping census or the child commit
