@@ -66,6 +66,23 @@ The scheduler fixtures entry_kick_and_timer_preempt_two_private_contexts and
 return_kick_and_timer_preempt_two_private_contexts exercise both retained roots.
 No bindings, semantic expectations, structural budgets or acceptance layers
 change; signed acceptance and runtime-ratio promotion remain director-owned.
+
+#671 M1-1 shared boot extraction: install_boot_memory (generic over
+CarrierMemoryIo) now holds KVM's post-preparation memory registration, and
+load_guest_mm with publish_production_reservations is generic over
+Cpl0BootCarrier. bind_initial_task_identity, bind_execution and
+initial_mm_key moved onto BootstrapCustody, and initial_extent_bytes_for
+and unexpected_boot_wake are shared functions. KVM delegates to all of
+them. The moved bodies keep their validation, publication order and
+errors: only indentation, module paths, borrow spellings and the
+custody/CPU accessors change. KVM's kernel entry keeps the original
+sregs/MSR/regs ioctl sequence. just test-kvm passed with exit 0 at
+c744a7e13 (patch-identical code at 66eb87b3a) in both partitions, including KVM lib (47) and neutral host
+lib (106). The soft carrier (carrick-vmm-soft) is the second production
+caller; its probe admits an initial MM through the same functions. No
+bindings, semantic expectations, structural budgets or acceptance layers
+change. Signed acceptance and runtime-ratio promotion remain
+director-owned.
 """
 
 [bindings]
