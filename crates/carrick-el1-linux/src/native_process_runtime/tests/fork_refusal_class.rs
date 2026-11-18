@@ -69,6 +69,7 @@ fn invariant_case(case: &str) -> NativeProcessError {
 
 /// Fork preparations the fatal child must have run when its run ends, or
 /// `usize::MAX` when its service counts none.
+#[cfg(test)]
 static FATAL_PREPARATIONS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(usize::MAX);
 
@@ -76,6 +77,7 @@ static FATAL_PREPARATIONS: core::sync::atomic::AtomicUsize =
 /// fatal sink exits 86, or 87 when the fork ran a number of Physical
 /// preparations other than `preparations` (a rerun); bounded so that a
 /// regression fails instead of hanging. `test` is the full test path.
+#[cfg(test)]
 pub(crate) fn fatal_child(
     test: &str,
     cases: &[&str],

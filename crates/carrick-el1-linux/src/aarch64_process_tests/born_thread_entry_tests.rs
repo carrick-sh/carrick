@@ -5210,7 +5210,8 @@ fn arm_fork_superseded_by_sibling_mmap_is_busy_once_then_forks() {
         [loans + 2, aborted + 1, committed + 1],
         "the superseded fork was Busy exactly once, then forked"
     );
-    assert!(crossing.pending_loan.lock().unwrap().is_none());
+    let pending = crossing.pending_loan.lock().unwrap().is_some();
+    assert!(!pending, "no loan stays pending");
 }
 
 /// #2109: a glibc thread of a native fork child, pinned with
