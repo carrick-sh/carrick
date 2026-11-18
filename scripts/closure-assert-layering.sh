@@ -92,6 +92,7 @@ native_target_for() {
     carrick-vmm-kvm) echo x86_64-unknown-linux-gnu ;;
     carrick-vmm-bhyve) echo x86_64-unknown-freebsd ;;
     carrick-vmm-nvmm) echo x86_64-unknown-netbsd ;;
+    carrick-vmm-soft) echo x86_64-unknown-linux-gnu ;;
     *) echo '' ;;
   esac
 }
