@@ -140,12 +140,21 @@ impl ProductionMemberCpu for SoftCpuBackend {
                 Some(SoftStop::Kicked) => Ok(VcpuExit::Kicked),
                 stop => {
                     let ctx = self.runner.machine().context();
+                    let trace = self.runner.trace();
+                    let hot: Vec<_> = trace
+                        .hot_blocks(8)
+                        .into_iter()
+                        .map(|(rip, count)| format!("{rip:#x} x {count}"))
+                        .collect();
                     Err(fail(format!(
-                        "soft carrier stopped: {stop:?} (rip={:#x} cpl={} cr3={:#x} blocks={})",
+                        "soft carrier stopped: {stop:?} (rip={:#x} cpl={} cr3={:#x} blocks={} \
+                         hot of last {}: [{}])",
                         ctx.rip,
                         ctx.cpl,
                         ctx.cr3,
-                        self.runner.trace().blocks
+                        trace.blocks,
+                        trace.recent.len(),
+                        hot.join(", ")
                     )))
                 }
             },
