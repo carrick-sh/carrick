@@ -29,7 +29,7 @@ use carrick_el1_abi::GuestMmuPublication;
 use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
     BlockedMask, Counters, CurrentTask, El1TaskId, ReservationMm, ReservationRange,
-    ThreadControlSlot, ThreadLifecyclePage, X86_CPL0_REGION_BASE,
+    ThreadControlSlot, ThreadLifecyclePage,
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGpa, UserVa};
@@ -1781,17 +1781,7 @@ impl Cpl0Carrier {
         fixture_image: bool,
         ipc: Option<Arc<dyn carrick_el1_abi::IpcWindowBacking>>,
     ) -> Result<Self, TrapError> {
-        let PreparedBoot {
-            ram,
-            plan,
-            boot,
-            hardware_interrupts,
-            fixture_copy,
-            table_capacity,
-            ipc_backings,
-            ipc_generation,
-            kernel_pod_storage,
-        } = prepare_boot(
+        let prepared = prepare_boot(
             &*frame_inventory,
             bytes,
             programs,
@@ -1801,113 +1791,26 @@ impl Cpl0Carrier {
             ipc,
         )?;
         let vm = KvmVm::create_empty().map_err(|e| fail(e.to_string()))?;
-        let mut memory = CarrierMemory::new(vm).map_err(|e| fail(e.to_string()))?;
-        memory
-            .install_bootstrap(Arc::clone(&ram))
-            .map_err(|e| fail(e.to_string()))?;
-        if !ipc_backings.is_empty() {
-            memory
-                .install(&ipc_backings)
-                .map_err(|e| fail(e.to_string()))?;
-            let zone = ram
-                .host_ptr(
-                    PRODUCTION_METADATA_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
-                    size_of::<X86Cpl0Zone>(),
-                )
-                .ok_or_else(|| fail("IPC operation slot zone"))?;
-            // SAFETY: the production zone was initialized above and remains
-            // retained; no vCPU has been created or entered.
-            let zone = unsafe { &*zone.cast::<X86Cpl0Zone>() };
-            zone.bind_ipc_operation_slots(
-                ipc_generation.ok_or_else(|| fail("IPC slot generation missing"))?,
-                &carrick_sched_core::BoundedSpin(0),
-                &|owned| {
-                    let _ = owned.into_parts();
-                },
-            )
-            .map_err(|e| fail(format!("IPC slot binding: {e:?}")))?;
-        }
-        if fixture_copy {
-            let mut roots = vec![LAYOUT.pml4_base];
-            if interrupts {
-                roots.push(crate::carrier_interrupts::SECOND_ROOT);
-            }
-            for base in roots {
-                let root = RootGpa::page_aligned(FrameGpa::new(base))
-                    .ok_or_else(|| fail("fixture copy root alignment"))?;
-                let mut grants = [root; carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES];
-                for (index, grant) in grants.iter_mut().enumerate() {
-                    let pa = base
-                        .checked_add(table_capacity as u64)
-                        .and_then(|pa| pa.checked_add(index as u64 * 4096))
-                        .ok_or_else(|| fail("fixture copy table grant overflow"))?;
-                    *grant = RootGpa::page_aligned(FrameGpa::new(pa))
-                        .ok_or_else(|| fail("fixture copy table grant alignment"))?;
-                }
-                carrick_mmu_core::x86::copy_window::provision_cow_copy_window(
-                    &memory.words(),
-                    root,
-                    grants,
-                )
-                .map_err(|reason| fail(format!("fixture private copy branch: {reason:?}")))?;
-            }
-        }
-        let identity = backing_identity(&*frame_inventory)?;
-        let extent = Arc::new(
-            BackingExtent::private(
-                FrameGpa::new(KERNEL_REGION_GPA),
-                carrick_el1_abi::EL1_REGION_SIZE as usize,
-            )
-            .map_err(|e| fail(e.to_string()))?,
-        );
-        let file_binding = carrick_el1_abi::FileRegionBinding::new(
-            carrick_el1_abi::FileRegionId::from_carrier(memory.identity().nonzero()),
-            carrick_guest_arch::KernelVa::new(X86_CPL0_REGION_BASE),
-            FrameGpa::new(KERNEL_REGION_GPA),
-            carrick_guest_arch::GuestLen::new(carrick_el1_abi::EL1_REGION_SIZE),
-        )
-        .map_err(|e| fail(format!("file region binding: {e:?}")))?;
-        // SAFETY: this fresh private extent covers the complete binding and
-        // has no guest, registration or table users yet. RetainedFileRegion
-        // keeps the same mapping alive through registration destruction.
-        let files = unsafe { BootstrapFileRegion::initialize(Arc::clone(&extent), file_binding) }?;
-        if !ipc_backings.is_empty() {
-            files.publish_ipc_window()?;
-        }
-        let handles = memory
-            .install(&[PreparedBacking { extent, identity }])
-            .map_err(|e| fail(e.to_string()))?;
-        let kernel_region = Some(handles[0]);
-        let initial_extent = if let Some(len) = initial_extent_bytes {
-            let identity = backing_identity(&*frame_inventory)?;
-            let extent = BackingExtent::private(FrameGpa::new(INITIAL_EXTENT_GPA), len)
-                .map_err(|e| fail(e.to_string()))?;
-            let handles = memory
-                .install(&[PreparedBacking {
-                    extent: Arc::new(extent),
-                    identity,
-                }])
-                .map_err(|e| fail(e.to_string()))?;
-            Some((handles[0], len))
-        } else {
-            None
-        };
-        memory
-            .initialize_fault_records(FrameGpa::new(KERNEL_REGION_GPA))
-            .map_err(|error| fail(error.to_string()))?;
-        for index in 0..2 {
-            let binding = ram
-                .host_ptr(
-                    META_GPA + BINDING_OFFSET + index as u64 * STRIDE,
-                    size_of::<CpuBinding>(),
-                )
-                .ok_or_else(|| fail("file CPU binding"))?
-                .cast::<CpuBinding>();
-            // SAFETY: initialized retained binding; vCPUs have not been created.
-            unsafe {
-                (*binding).file_region = file_binding;
-            }
-        }
+        let BootMemory {
+            memory,
+            files,
+            kernel_region,
+            initial_extent,
+        } = install_boot_memory(
+            vm,
+            &*frame_inventory,
+            &prepared,
+            interrupts,
+            initial_extent_bytes,
+        )?;
+        let PreparedBoot {
+            ram,
+            plan,
+            boot,
+            hardware_interrupts,
+            kernel_pod_storage,
+            ..
+        } = prepared;
         let machine = CarrierMachine::from_memory(memory, 2).map_err(|e| fail(e.to_string()))?;
         let (cpus, vm) = machine.into_parts();
         let [mut a, mut b]: [KvmVcpu; 2] =
@@ -3770,6 +3673,7 @@ impl Cpl0Carrier {
 #[cfg(test)]
 mod cpl0_layout_tests {
     use super::*;
+    use carrick_el1_abi::X86_CPL0_REGION_BASE;
     use std::sync::mpsc;
 
     #[test]
