@@ -880,7 +880,9 @@ impl SoftCpuContext {
         self.gs.base = self.msrs.gs_base();
     }
 
-    pub(crate) fn sync_efer_lma(&mut self) {
+    /// Recompute `EFER.LMA` from `EFER.LME` and `CR0.PG`, as a `CR0` write
+    /// does. A host programming a stopped CPU's `cr0` directly calls this.
+    pub fn sync_efer_lma(&mut self) {
         self.msrs.sync_lma(self.cr0);
     }
 
