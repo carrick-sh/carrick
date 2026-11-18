@@ -13,7 +13,7 @@
 use carrick_guest_mem::GuestMemory as _;
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
 use carrick_kernel::dispatch::{DispatchOutcome, StdioReadiness};
-use carrick_vmm_soft::{SoftBootImage, SoftCarrier};
+use carrick_vmm_soft::{SoftBootImage, SoftCarrier, publish_worker_backings};
 use carrick_x86_cpl0_host::carrier_cpu::CarrierRunExit;
 use carrick_x86_cpl0_host::cpl0_boot::{
     InitialReservationLimits, PhysicalProcessExit, initial_extent_bytes_for, load_guest_mm,
@@ -45,6 +45,32 @@ const HELLO: &[u8] = &[
     0x0f, 0x05, // syscall
     0x0f, 0x0b, // ud2
     b'h', b'e', b'l', b'l', b'o', b'\n',
+];
+
+/// mmap one anonymous page, write through its first fault, and print the
+/// bytes from that page. Exit 1 if mmap fails.
+const ANONYMOUS_HELLO: &[u8] = &[
+    0x31, 0xff, // xor edi, edi
+    0xbe, 0, 0x10, 0, 0, // mov esi, 4096
+    0xba, 3, 0, 0, 0, // mov edx, PROT_READ | PROT_WRITE
+    0x41, 0xba, 0x22, 0, 0, 0, // mov r10d, MAP_PRIVATE | MAP_ANONYMOUS
+    0x41, 0xb8, 0xff, 0xff, 0xff, 0xff, // mov r8d, -1
+    0x45, 0x31, 0xc9, // xor r9d, r9d
+    0xb8, 9, 0, 0, 0, // mov eax, 9 (mmap)
+    0x0f, 0x05, // syscall
+    0x48, 0x85, 0xc0, // test rax, rax
+    0xbf, 1, 0, 0, 0, // mov edi, 1
+    0x78, 0x1d, // js exit_group
+    0x48, 0x89, 0xc6, // mov rsi, rax
+    0xc7, 0x06, b'h', b'e', b'l', b'l', // mov dword ptr [rsi], "hell"
+    0x66, 0xc7, 0x46, 4, b'o', b'\n', // mov word ptr [rsi+4], "o\n"
+    0xba, 6, 0, 0, 0, // mov edx, 6
+    0xb8, 1, 0, 0, 0, // mov eax, 1 (write)
+    0x0f, 0x05, // syscall
+    0x31, 0xff, // xor edi, edi
+    0xb8, 0xe7, 0, 0, 0, // mov eax, 231 (exit_group)
+    0x0f, 0x05, // syscall
+    0x0f, 0x0b, // ud2
 ];
 
 /// What the soft root lease did, and how far it got.
@@ -248,7 +274,9 @@ fn drive(elf: &[u8], run: &mut HelloRun) -> Result<(), String> {
                     .map_err(|error| format!("doorbell {port:#x}: {error}"))?;
                 run.exits.push(format!("doorbell {port:#x}"));
                 match status {
-                    None => {}
+                    None => publish_worker_backings(&factory).map_err(|error| {
+                        format!("slot publication after doorbell {port:#x}: {error}")
+                    })?,
                     Some(PhysicalProcessExit::Exited(status)) => {
                         if status.kind() != carrick_sched_core::process::TerminationKind::Exited {
                             return Err(format!("terminated by signal {}", status.code()));
@@ -285,15 +313,24 @@ fn production_ring_runs_static_hello_to_exit_on_soft_cpu() {
     assert_eq!(run.exit, Some(0), "{}", run.summary());
 }
 
-/// The bhyve/KVM M2 static musl hello (`just test-kvm` builds it). Rust std
-/// startup polls fds 0-2 through the ring's `HostReadinessCrossing`, now
-/// answered by the shared carrier readiness service. The run then takes two
-/// `OWNER_GRANT_PORT` doorbells and loops in the ring's fault path: the
-/// granted slots are installed after boot, and the soft memory view still
-/// authenticates only the slots it placed at boot, so every touch of a
-/// granted frame faults again (`docs/design/soft-x86-cpl0-bringup.md`).
 #[test]
-#[ignore = "owner-granted slots are not yet admitted into the soft memory view"]
+fn production_ring_resumes_after_runtime_slot_install() {
+    let run = run_hello(&static_elf(ANONYMOUS_HELLO));
+    println!("[production, anonymous hello] {}", run.summary());
+    assert!(
+        run.exits.iter().any(|exit| exit == "doorbell 0xd1"),
+        "{}",
+        run.summary()
+    );
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert_eq!(run.stdout, b"hello\n", "{}", run.summary());
+    assert_eq!(run.exit, Some(0), "{}", run.summary());
+}
+
+/// The bhyve/KVM M2 static musl hello exercises stdio readiness and the
+/// runtime slot refresh through the production soft ring.
+#[test]
+#[ignore = "requires the separately built musl hello fixture from just test-kvm"]
 fn production_ring_runs_musl_hello_to_exit_on_soft_cpu() {
     let elf = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),

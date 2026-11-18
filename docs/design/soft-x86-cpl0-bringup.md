@@ -373,3 +373,26 @@ witness on the production run path: today it fails at the fault loop, and
 it must pass once the accessor lands. No soft-side code lands before the
 ruling, because a refresh with no production caller would be an unused
 second path.
+
+### M1-5 status: owner-granted slots reach the software MMU
+
+The stopped host service publishes the current slot snapshot under the
+existing custody lock. Each published registration matches the retained
+allocation's GPA, length and host base. Each soft CPU view holds its own
+reference to the snapshot, so subsequent unregisters or custody changes
+cannot free memory the view still addresses. A registration invalidates
+the publication until custody supplies its backing.
+
+Before entering the guest, the soft backend keeps the same walker
+inventory and adds an extent only for each newly installed slot. A new
+snapshot rebuilds placement only when slots were added. The subsequent
+local TLB flush includes instruction fetch. Cached blocks re-authenticate
+their code frames and generations on their next entry. A removed or
+replaced slot still stops the soft carrier pending integration with
+`ExtentTable::remove` and its retirement protocol.
+
+The fixture-independent anonymous-page test exhausted the unchanged
+4,000,000-block budget after two owner grants before the refresh. It now
+prints `hello\n` and exits 0. The separately built musl hello completes
+its startup poll, takes four owner grants, prints
+`hello, x86_64 world\n` and exits 0 through the production soft ring.

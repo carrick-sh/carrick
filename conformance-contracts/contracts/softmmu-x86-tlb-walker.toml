@@ -71,6 +71,16 @@ witness softmmu_contract::segmented_placement_maps_each_slot_and_refuses_gaps_an
 was red (missing API) before the change and passes after it. The existing
 bindings below were re-run unchanged (all carrick-softmmu and
 carrick-softcpu-x86 suites pass). No new acceptance is claimed.
+
+#671 M1-5 runtime slots: after an owner grant, the stopped soft carrier
+publishes only registrations whose GPA, extent length and host base match
+retained carrier allocations. It extends the existing walker inventory
+before the next guest entry and invalidates the local read, write and
+execute TLB. Existing slots keep their backing identity. An unchanged
+snapshot bypasses placement and inventory work. The production CPL0
+anonymous-page witness reaches the owner grant, writes a newly backed
+page, reads it via the stdout crossing, and exits within the same block
+budget that the pre-fix fault loop exhausted.
 """
 
 [bindings]
