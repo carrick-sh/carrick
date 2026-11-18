@@ -1025,6 +1025,12 @@ pub enum LeafResolveError<F, L> {
     },
 }
 
+/// The outcome of [`resolve_leaf`] for walker `W`.
+pub type LeafResolution<W> = Result<
+    ResolvedLeaf<<W as Stage1Walker>::Leaf>,
+    LeafResolveError<<W as Stage1Walker>::Fault, <W as Stage1Walker>::Leaf>,
+>;
+
 /// The one ISA-neutral slow path: walk `va` with `walker` through
 /// `root`'s generation-authenticated descriptor words, screen the output
 /// against the placement's MMIO holes, authenticate the leaf's whole span
@@ -1039,7 +1045,7 @@ pub fn resolve_leaf<W: Stage1Walker, M: SoftMmuMemory + ?Sized>(
     context: &W::Context,
     va: GuestVa,
     access: Access,
-) -> Result<ResolvedLeaf<W::Leaf>, LeafResolveError<W::Fault, W::Leaf>> {
+) -> LeafResolution<W> {
     let leaf = {
         let checked = AuthenticatedDescriptorWords::new(memory, root);
         walker
