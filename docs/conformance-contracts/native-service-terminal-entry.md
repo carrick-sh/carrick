@@ -65,6 +65,22 @@ The exec successor population checks already cancel the prepared successor or
 terminate the losing image when validation fails. They do not escape through
 bridge settlement and are unchanged here.
 
+Issue #2532 covers the terminal case that the duplicate-custody rule must not
+mask. A process close can cancel a member's retained service and wake its exact
+record while an already captured mmap SVC or IRQ CarrierWork entry still owns
+that execution lane. The member row is then legitimate old-service custody,
+and the pending process close is authoritative. The four VM-free bindings
+`{arm,x86}_terminal_close_with_retained_service_accepts_{mmap_entry,irq_carrier_work}`
+use two live members, one retained service ticket, the production group-close
+cancellation, and the production service begin/settlement boundary. Before the
+correction all four fail with exact `NativeServiceQuarantined`: the early
+member-wait check precedes the closed-gate/pending-close check added for #1575.
+The required outcome consumes the retained service claim, publishes no second
+notice, and retires the member through the existing close authority. A member
+wait without a pending close remains quarantined. Work stays bounded to one
+retained-service settlement and one terminal member transaction, with no
+polling, retry, timer, or additional host request.
+
 Director confirmation requires signed runs of `el1_fork_cow_resolves_in_guest`,
 `el1_sched_two_processes_share_vcpus`,
 `el1_thread_lifecycle_cleartid_tid_reuse`,

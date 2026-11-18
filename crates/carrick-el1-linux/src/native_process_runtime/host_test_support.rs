@@ -2392,6 +2392,185 @@ fn arm_words(address: AddressContext<RootGpa>) -> carrick_el1_abi::Aarch64Parked
     carrick_el1_abi::Aarch64ParkedContext::from_parts(native, address)
 }
 
+#[cfg(test)]
+fn terminal_close_with_retained_service_entry_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    operation: carrick_core_abi::service::ServiceOperation,
+    exit: NativeServiceExit,
+) {
+    use carrick_core_abi::service::ServiceOperation;
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let mut sibling = add_service_sibling(
+        &fixture,
+        Some(ServiceOperation::Crossing {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(64),
+        }),
+    );
+    assert_eq!(fixture.page.live(), 2);
+    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 1);
+
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(root.take_run_failure().is_none());
+    }
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::gate(fixture.page),
+        carrick_el1_abi::GateState::Closed
+    );
+    assert!(
+        fixture
+            .runtime
+            .graph
+            .lock()
+            .has_member_wait(&sibling.record),
+        "the cancelled service remains the sibling's exact retained owner"
+    );
+    assert!(
+        sibling
+            .service_ticket
+            .take()
+            .unwrap()
+            .complete(true)
+            .is_ok(),
+        "the carrier settles the cancelled service ticket"
+    );
+
+    let slot = [fixture.slot, sibling.slot]
+        .into_iter()
+        .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+        .expect("the cancelled service wakes its exact member");
+    assert_eq!(
+        fixture.zone.switch_in_full(slot).unwrap().record,
+        sibling.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+        .unwrap()
+        .words;
+    let mut sibling_service = fixture.service();
+    sibling_service.waker_slot = slot;
+    let mut member = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+    let result = member.begin_service(operation, None);
+    let phase = member.native_service_phase();
+    let settled = member.settle_service_exit(result, exit);
+    let resumed = crate::dispatch::native_service_completion(settled, phase)
+        .unwrap_or_else(|fatal| panic!("terminal service entry became {fatal:?}"));
+    assert!(matches!(resumed, NativeResume::Left(None)));
+    assert!(member.take_handoff_receipt().is_some());
+    drop(member);
+
+    assert!(fixture.zone.live(sibling.record).is_none());
+    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
+    assert!(
+        !fixture
+            .runtime
+            .graph
+            .lock()
+            .has_member_wait(&sibling.record)
+    );
+    assert!(sibling.task.service_notice.take().unwrap().is_none());
+}
+
+/// #2532 run B: a real SVC entry for mmap may race a sibling's terminal close
+/// after this member's earlier service was cancelled but before its owner
+/// checkpoint consumed that wait. Closing is authoritative: the new entry
+/// settles the retained service and retires instead of becoming an invariant.
+#[test]
+fn arm_terminal_close_with_retained_service_accepts_mmap_entry() {
+    terminal_close_with_retained_service_entry_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        arm_words,
+        carrick_core_abi::service::ServiceOperation::Crossing {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(222),
+        },
+        NativeServiceExit::Bridge,
+    );
+}
+
+#[test]
+fn x86_terminal_close_with_retained_service_accepts_mmap_entry() {
+    terminal_close_with_retained_service_entry_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(
+        words,
+        carrick_core_abi::service::ServiceOperation::Crossing {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(9),
+        },
+        NativeServiceExit::Bridge,
+    );
+}
+
+/// #2532 run A: the same terminal interleaving can arrive from an IRQ as
+/// CarrierWork. Its exception continuation owns the exact retained record;
+/// terminal settlement must not publish a second service or return to EL0.
+#[test]
+fn arm_terminal_close_with_retained_service_accepts_irq_carrier_work() {
+    terminal_close_with_retained_service_entry_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        arm_words,
+        carrick_core_abi::service::ServiceOperation::CarrierWork {
+            entry: OwnerEntry::Exception,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
+        },
+        NativeServiceExit::CarrierWork,
+    );
+}
+
+#[test]
+fn x86_terminal_close_with_retained_service_accepts_irq_carrier_work() {
+    terminal_close_with_retained_service_entry_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(
+        words,
+        carrick_core_abi::service::ServiceOperation::CarrierWork {
+            entry: OwnerEntry::Exception,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
+        },
+        NativeServiceExit::CarrierWork,
+    );
+}
+
 /// These are corrupt custody, not a sibling holding a releasable resource.
 /// Drive the same begin/settle pair as arm_native_service_exit: an exact
 /// member may have only one cell, pending row and execution-lane notice.
