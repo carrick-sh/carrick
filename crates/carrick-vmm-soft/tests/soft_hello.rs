@@ -24,6 +24,7 @@ use carrick_x86_cpl0_host::host_readiness::{
     BoundHostFds, HostReadinessStep, ReadinessCrossing, ReadinessWait, StdioBinding,
     sample_host_readiness,
 };
+use std::time::{Duration, Instant};
 
 mod common;
 #[path = "../../carrick-cli/tests/fixtures/x86_process_entry.rs"]
@@ -80,6 +81,7 @@ const ANONYMOUS_HELLO: &[u8] = &[
 #[derive(Debug)]
 struct HelloRun {
     stdout: Vec<u8>,
+    stdout_at: Vec<Instant>,
     exit: Option<i32>,
     exits: Vec<String>,
     failure: Option<String>,
@@ -109,6 +111,7 @@ fn run_hello(elf: &[u8]) -> HelloRun {
 fn run_with_stdout_patch(elf: &[u8], patch: Option<u8>) -> HelloRun {
     let mut run = HelloRun {
         stdout: Vec::new(),
+        stdout_at: Vec::new(),
         exit: None,
         exits: Vec::new(),
         failure: None,
@@ -351,7 +354,11 @@ fn drive(elf: &[u8], run: &mut HelloRun, patch: Option<u8>) -> Result<(), String
             }
             other => return Err(format!("unexpected carrier exit {other:?}")),
         }
-        run.stdout = dispatcher.stdout();
+        let stdout = dispatcher.stdout();
+        if stdout.len() > run.stdout.len() {
+            run.stdout_at.push(Instant::now());
+        }
+        run.stdout = stdout;
     }
     Ok(())
 }
@@ -552,4 +559,28 @@ fn production_ring_non_last_threads_raw_exit() {
     assert!(run.failure.is_none(), "{}", run.summary());
     assert!(run.stdout.is_empty(), "{}", run.summary());
     assert_eq!(run.exit, Some(0), "{}", run.summary());
+}
+
+#[test]
+fn production_ring_nanosleep_waits_on_host() {
+    let elf = assemble_static_fixture(
+        "nanosleep",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/nanosleep.S"),
+        &[],
+    );
+    let run = run_hello(&elf);
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert_eq!(run.stdout, b"SE", "{}", run.summary());
+    assert_eq!(run.exit, Some(0), "{}", run.summary());
+    let [start, end] = run.stdout_at.as_slice() else {
+        panic!("expected separate sleep markers: {}", run.summary());
+    };
+    let elapsed = *end - *start;
+    println!("[production, nanosleep] {elapsed:?} between host markers");
+    // Exclude boot and teardown. Leave 10 ms for block-accounted progress
+    // and give a loaded host 10 s to complete this 200 ms sleep.
+    assert!(
+        (Duration::from_millis(190)..Duration::from_secs(10)).contains(&elapsed),
+        "200 ms nanosleep took {elapsed:?} on the host"
+    );
 }
