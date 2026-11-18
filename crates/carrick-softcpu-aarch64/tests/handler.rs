@@ -401,3 +401,74 @@ fn el1_at_requires_a_walk_and_el0_at_is_undefined() {
         assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
     }
 }
+
+#[test]
+fn strict_scalar_and_pair_alignment_fault_before_memory_or_writeback() {
+    for (word, offset, write) in [
+        (0xf940_0020, 0, false), // ldr x0, [x1]
+        (0xf800_8c20, 8, true),  // str x0, [x1, #8]!
+        (0xa940_0820, 0, false), // ldp x0, x2, [x1]
+    ] {
+        let mut r = Rig::el1();
+        r.cpu.el1.sctlr = Sctlr(1 << 1); // A, with M clear
+        r.set(0, 42);
+        r.set(1, 0x10001);
+        r.set(2, 43);
+        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.pc(), VBAR + 0x200);
+        assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
+        assert_eq!(r.cpu.el1.far, VirtualAddress(0x10001 + offset));
+        assert_eq!(
+            r.cpu.el1.esr,
+            Syndrome(0x9600_0021 | (u64::from(write) << 6))
+        );
+        assert_eq!((r.get(0), r.get(1), r.get(2)), (42, 0x10001, 43));
+        assert!(r.memory.0.is_empty());
+    }
+
+    // Ordinary pair accesses check element alignment, including when A=1.
+    let mut r = Rig::el1();
+    r.cpu.el1.sctlr = Sctlr(1 << 1);
+    r.set(1, 0x10008);
+    r.memory.put(0x10008, 17);
+    r.memory.put(0x10010, 19);
+    assert_eq!(r.run(0xa940_0820), Outcome::Continue);
+    assert_eq!((r.pc(), r.get(0), r.get(2)), (PC + 4, 17, 19));
+
+    // The flat RAM model permits an ordinary unaligned load with A clear.
+    r.cpu.el1.sctlr = Sctlr(0);
+    r.set(1, 0x10001);
+    r.memory.put(0x10001, 23);
+    assert_eq!(r.run(0xf940_0020), Outcome::Continue);
+    assert_eq!((r.pc(), r.get(0)), (PC + 8, 23));
+}
+
+#[test]
+fn exclusive_ordered_and_lse_accesses_fault_with_alignment_check_disabled() {
+    for (word, address, write) in [
+        (0xc85f_7c20, 0x10001, false), // ldxr x0, [x1]
+        (0xc803_7c20, 0x10001, true),  // stxr w3, x0, [x1]
+        (0xc87f_0820, 0x10008, false), // ldxp x0, x2, [x1]
+        (0xc823_0820, 0x10008, true),  // stxp w3, x0, x2, [x1]
+        (0xc8df_fc20, 0x10001, false), // ldar x0, [x1]
+        (0xc89f_fc20, 0x10001, true),  // stlr x0, [x1]
+        (0xf822_0020, 0x10001, false), // ldadd x2, x0, [x1]: alignment check is a read
+    ] {
+        let mut r = Rig::el0();
+        r.set(0, 42);
+        r.set(1, address);
+        r.set(2, 43);
+        r.set(3, 44);
+        assert_eq!(r.run(word), Outcome::Continue, "{word:#010x}");
+        assert_eq!(r.pc(), VBAR + 0x400, "{word:#010x}");
+        assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
+        assert_eq!(r.cpu.el1.far, VirtualAddress(address));
+        assert_eq!(
+            r.cpu.el1.esr,
+            Syndrome(0x9200_0021 | (u64::from(write) << 6))
+        );
+        assert_eq!((r.get(0), r.get(2), r.get(3)), (42, 43, 44));
+        assert!(r.memory.0.is_empty());
+        assert!(!r.monitor.is_open());
+    }
+}

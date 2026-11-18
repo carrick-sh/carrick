@@ -77,10 +77,14 @@ impl Pstate {
         })
     }
 }
-/// D13.2.116 SCTLR_EL1.SPAN (23), EPAN (57), UMA (9).
+/// D13.2.116 SCTLR_EL1.SPAN (23), EPAN (57), UMA (9), A (1).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Sctlr(pub u64);
 impl Sctlr {
+    pub fn alignment_check(self) -> bool {
+        self.0 & (1 << 1) != 0
+    }
+
     pub fn span(self) -> bool {
         self.0 & (1 << 23) != 0
     }
