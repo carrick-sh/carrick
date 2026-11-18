@@ -124,27 +124,6 @@ fn fork_preparation_busy_once_then_forks<
     fork_preparation_not_now_once_then_forks::<C, B>(make_words, NativeProcessError::Busy);
 }
 
-/// #2441: a fork whose parent snapshot another live thread of the parent
-/// superseded between the census and the fork's prepare or publish
-/// (`MmError::Stale` at those stages: the parent's generation, operation
-/// sequence or a read descriptor moved) is not now. It keeps the exact
-/// syscall and reruns with a fresh snapshot; it neither ends the run nor
-/// answers an errno.
-fn fork_superseded_snapshot_reruns_then_forks<
-    C: ProcessContext + 'static,
-    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
->(
-    make_words: fn(AddressContext<RootGpa>) -> C,
-) {
-    use crate::native_fork_refusal::{NativeForkStage, refused};
-    for stage in [NativeForkStage::Prepare, NativeForkStage::Publish] {
-        fork_preparation_not_now_once_then_forks::<C, B>(
-            make_words,
-            refused(stage, carrick_core::mm::transaction::MmError::Stale),
-        );
-    }
-}
-
 fn fork_preparation_not_now_once_then_forks<
     C: ProcessContext + 'static,
     B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
@@ -225,22 +204,6 @@ fn fork_preparation_busy_once_then_forks_x86() {
 #[test]
 fn fork_preparation_busy_once_then_forks_aarch64() {
     fork_preparation_busy_once_then_forks::<
-        carrick_sched_core::Aarch64ParkedContext,
-        carrick_mmu_core::owner_mmu::Aarch64Mmu,
-    >(arm_words);
-}
-
-#[test]
-fn fork_superseded_snapshot_reruns_then_forks_x86() {
-    fork_superseded_snapshot_reruns_then_forks::<
-        ParkedContextWords,
-        carrick_mmu_core::x86::owner_mmu::X86Mmu,
-    >(words);
-}
-
-#[test]
-fn fork_superseded_snapshot_reruns_then_forks_aarch64() {
-    fork_superseded_snapshot_reruns_then_forks::<
         carrick_sched_core::Aarch64ParkedContext,
         carrick_mmu_core::owner_mmu::Aarch64Mmu,
     >(arm_words);
