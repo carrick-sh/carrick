@@ -35,7 +35,7 @@ use crate::memory::{SoftCarrierMemory, SoftVm};
 /// Soft TSC frequency published to the CPUID view and the CPU binding.
 pub const SOFT_TSC_HZ: u64 = 2_000_000_000;
 
-/// The single-vCPU model executes one guest block per 100 ns of virtual time.
+/// The single-vCPU clock has a progress floor of 100 ns per executed block.
 const SOFT_TSC_TICKS_PER_BLOCK: NonZeroU64 = NonZeroU64::new(SOFT_TSC_HZ / 10_000_000).unwrap();
 
 /// The CPUID view every soft carrier CPU presents. M1 is single-vCPU
@@ -196,7 +196,9 @@ impl SoftRunner {
                 self.trace.recent.pop_front();
             }
             self.trace.recent.push_back(before);
-            let step = self.machine.step();
+            let step = self
+                .machine
+                .step_with_kick(&|| kicked.is_some_and(|kick| kick.load(Ordering::Acquire)));
             self.trace.blocks += 1;
             let exit = match step {
                 Err(error) => {
@@ -229,6 +231,12 @@ impl SoftRunner {
                 Ok(Some(exit)) => exit,
             };
             match exit {
+                SoftMachineExit::Hlt { .. }
+                    if kicked.is_some_and(|kick| kick.swap(false, Ordering::AcqRel)) =>
+                {
+                    self.trace.stop = Some(SoftStop::Kicked);
+                    return None;
+                }
                 SoftMachineExit::IoOut { .. }
                 | SoftMachineExit::IoIn { .. }
                 | SoftMachineExit::Hlt { .. } => {
