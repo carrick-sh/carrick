@@ -5048,12 +5048,23 @@ fn arm_wait4_reaps_zombie_while_sibling_vfork_holds_birth_reservation() {
 /// A's fork takes its census under the parent's space editor, then drops
 /// the editor for its stock loan crossing. During that crossing sibling B,
 /// live on a second vCPU, runs a real anonymous `mmap`, which commits an
-/// edit and moves the parent's generation. A's prepare finds the snapshot
-/// it took superseded: real contention, so it is "not now" (`Busy`), never
-/// a broken invariant. A keeps its clone and reruns it once, with a fresh
-/// census and a second loan, and forks; B's mapping stays.
+/// edit and moves the parent's generation. A discards the old snapshot
+/// through the MM owner queue and takes one new census. If B still holds
+/// the editor, A releases its execution slot until B drops it.
 #[test]
 fn arm_fork_superseded_by_sibling_mmap_is_busy_once_then_forks() {
+    fork_superseded_by_sibling_mmap(false);
+}
+
+#[test]
+fn arm_fork_superseded_by_sibling_mmap_parks_on_editor() {
+    fork_superseded_by_sibling_mmap(true);
+}
+
+fn fork_superseded_by_sibling_mmap(hold_editor: bool) {
+    thread_local! {
+        static HELD_EDITOR: std::cell::RefCell<Option<carrick_sched_core::spaces::SpaceEditor<'static, carrick_sched_core::Aarch64ParkedContext>>> = const { std::cell::RefCell::new(None) };
+    }
     let mut harness = ProductionProcessHarness::new();
     let fixture = harness.fixture;
     let slot0 = fixture.slot;
@@ -5080,11 +5091,32 @@ fn arm_fork_superseded_by_sibling_mmap_is_busy_once_then_forks() {
         carrick_el1_abi::Action::Served
     );
     assert_eq!(fixture.zone.slot(second.slot).current(), Some(sibling));
+    let waiter_stacks = hold_editor.then(|| {
+        // The default pool for one guest CPU has one bound worker and
+        // two spares. A plus these two waiters use that many entries.
+        core::array::from_fn::<_, 2, _>(|_| carrick_test_support::GuestUserBuffer::zeroed(8192))
+    });
+    let extra_waiters = waiter_stacks.as_ref().map(|stacks| {
+        stacks
+            .each_ref()
+            .map(|stack| harness.spawn_thread(stack, &mut cpu).1)
+    });
+    let progress_stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
+    let progress = hold_editor.then(|| harness.spawn_thread(&progress_stack, &mut cpu).1);
+    assert_eq!(
+        fixture.zone.slot(slot0).current(),
+        Some(harness.parent_record)
+    );
 
     // A's first stock loan crossing runs B's mmap on vCPU 1, as a sibling
     // vCPU does during a real synchronous crossing.
     let mapped = Arc::new(std::sync::Mutex::new(None));
     let mapped_by_hook = mapped.clone();
+    let mm = NonZeroU64::new(second.task.mm.key.load(Ordering::Acquire)).unwrap();
+    let entry = fixture.zone.space_entry(mm).unwrap();
+    let notification = entry.live_notifications().unwrap();
+    let editor_key =
+        notification.key(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor);
     let second_address = core::ptr::from_mut(second) as usize;
     let fixture_address = core::ptr::from_ref(fixture) as usize;
     *harness.dispatch_service.crossing.on_loan.lock().unwrap() = Some(Box::new(move || {
@@ -5117,6 +5149,18 @@ fn arm_fork_superseded_by_sibling_mmap_is_busy_once_then_forks() {
         );
         assert_eq!(served, carrick_el1::memory::DelegatedAnonymous::Served);
         *mapped_by_hook.lock().unwrap() = Some(map.x[0] as i64);
+        if hold_editor {
+            // B follows its committed mmap with a second edit lease, held
+            // until the test has observed A waiting on B's release.
+            let editor = crate::sched::object_wait::space_access(fixture.zone, second.slot)
+                .try_begin_edit(
+                    entry.index(),
+                    mm.get(),
+                    NonZeroU64::new(u64::from(second.slot.raw()) + 1).unwrap(),
+                )
+                .unwrap();
+            HELD_EDITOR.set(Some(editor));
+        }
     }));
 
     // Stock crossings the harness's own births made so far.
@@ -5145,6 +5189,80 @@ fn arm_fork_superseded_by_sibling_mmap_is_busy_once_then_forks() {
         harness.task.service_notice.take().unwrap().is_none(),
         "an MM publication settles the old snapshot without carrier work"
     );
+    if let Some(progress) = progress {
+        assert!(matches!(
+            fixture.zone.record(harness.parent_record).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+        assert_eq!(
+            fixture
+                .zone
+                .object_queue_census(editor_key.index())
+                .unwrap()
+                .waiters,
+            1
+        );
+        assert_eq!(
+            counts(&harness.dispatch_service.crossing),
+            [loans + 1, aborted + 1, committed]
+        );
+        // With B still holding the editor, admit enough fork waiters
+        // to occupy the default single-CPU pool if a wait pinned a lane.
+        for waiter in extra_waiters.unwrap() {
+            let mut entry = carrick_el1_abi::TrapFrame::default();
+            if fixture.zone.slot(slot0).current().is_none() {
+                assert_eq!(
+                    harness.switch_next(&mut cpu, &mut entry),
+                    carrick_el1_abi::Action::Served
+                );
+            }
+            assert_eq!(fixture.zone.slot(slot0).current(), Some(waiter));
+            entry.x[8] = 220;
+            entry.x[0] = 17;
+            harness.call_current(&mut entry, &mut cpu);
+            assert!(matches!(
+                fixture.zone.record(waiter).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ));
+        }
+        assert_eq!(
+            fixture
+                .zone
+                .object_queue_census(editor_key.index())
+                .unwrap()
+                .waiters,
+            3
+        );
+        let mut getpid = carrick_el1_abi::TrapFrame::default();
+        if fixture.zone.slot(slot0).current().is_none() {
+            assert_eq!(
+                harness.switch_next(&mut cpu, &mut getpid),
+                carrick_el1_abi::Action::Served
+            );
+        }
+        assert_eq!(fixture.zone.slot(slot0).current(), Some(progress));
+        getpid.x[8] = 172;
+        harness.call_current(&mut getpid, &mut cpu);
+        assert_eq!(getpid.x[0], u64::from(harness._parent_pid));
+        assert_eq!(
+            counts(&harness.dispatch_service.crossing),
+            [loans + 1, aborted + 1, committed]
+        );
+
+        drop(HELD_EDITOR.take().expect("sibling's live editor"));
+        let mut resumed = carrick_el1_abi::TrapFrame::default();
+        resumed.x[8] = 93;
+        harness.call_current(&mut resumed, &mut cpu);
+        assert_eq!(
+            resumed.elr,
+            0u64.wrapping_sub(4),
+            "resume at the original clone"
+        );
+        clone = carrick_el1_abi::TrapFrame::default();
+        clone.x[8] = 220;
+        clone.x[0] = 17;
+        harness.call_current(&mut clone, &mut cpu);
+    }
     assert_eq!(
         fixture.zone.slot(slot0).current(),
         Some(harness.parent_record)

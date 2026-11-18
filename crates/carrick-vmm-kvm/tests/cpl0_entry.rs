@@ -4212,6 +4212,18 @@ fn production_fork_superseded_by_sibling_mmap_is_busy_once_then_forks() {
     );
 }
 
+/// The sibling retains the real editor after mmap. It can release the
+/// editor only once the production fork has enrolled on the MM queue.
+#[test]
+fn production_fork_superseded_by_sibling_mmap_parks_on_editor() {
+    bounded_contention_witness(
+        "production_fork_superseded_by_sibling_mmap_parks_on_editor",
+        "native_fork_superseded_snapshot.S",
+        &["-DHOLD_EDITOR=1"],
+        "fork parks on its sibling's live editor",
+    );
+}
+
 /// #2441 on x86 CPL0, review P0-2 on #2508: the carrier's Inventory reply
 /// to the next production fork's stock loan is contention. The fork keeps
 /// its syscall and reruns, and the parent reaps its child, never EAGAIN
