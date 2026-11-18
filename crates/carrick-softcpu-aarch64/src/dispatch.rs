@@ -5,11 +5,13 @@
 //! docs/design/soft-aarch64-translator.md, "Cache".
 use crate::exception::{Exception, take_exception};
 use crate::handler::{self, Event, ExclusiveMonitor, GuestMemory, Outcome};
+use crate::mmu::{self, AccessClass, Stage1Error};
 use crate::state::{CpuState, ProgramCounter, VirtualAddress};
 use crate::translate::{
     BlockExit, BlockFrame, BlockLimits, GuestInstruction, TranslateError, TranslatedBlock,
     emit_block, split_block,
 };
+use carrick_mmu_core::stage1::LeafAccess;
 use core::fmt;
 
 /// Runs one translated block against `frame` and returns its exit index.
@@ -98,8 +100,8 @@ impl<E: fmt::Debug> fmt::Display for Report<E> {
     }
 }
 
-/// Events the dispatcher absorbs and continues past. Flat memory has no TLB,
-/// so a TLBI has nothing to invalidate; NOP-like hints never stop.
+/// Events the dispatcher absorbs and continues past. There is no translation
+/// cache, so a TLBI has nothing to invalidate; NOP-like hints never stop.
 fn absorbed(event: Event) -> bool {
     matches!(
         event,
@@ -107,10 +109,25 @@ fn absorbed(event: Event) -> bool {
     )
 }
 
-fn fetch(memory: &mut impl GuestMemory, pc: ProgramCounter) -> Option<u32> {
+/// Fetch one instruction word, stage-1 translated when SCTLR_EL1.M is set.
+fn fetch(
+    cpu: &CpuState,
+    memory: &mut impl GuestMemory,
+    pc: ProgramCounter,
+) -> Result<u32, Option<Stage1Error>> {
+    let pa = mmu::translate(
+        cpu,
+        memory,
+        pc.0,
+        LeafAccess::Execute,
+        AccessClass::Ordinary,
+    )
+    .map_err(Some)?;
     let mut bytes = [0; 4];
-    memory.read(VirtualAddress(pc.0), &mut bytes).ok()?;
-    Some(u32::from_le_bytes(bytes))
+    memory
+        .read(VirtualAddress(pa), &mut bytes)
+        .map_err(|_| None)?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 /// Run at most `budget` blocks from `cpu.pc`.
@@ -128,14 +145,33 @@ pub fn run<X: ExecuteBlock>(
             break Stop::Budget;
         }
         // DDI0487G.a D1.12.4: PC alignment precedes instruction aborts
-        // and illegal execution state. Flat memory has no architectural
-        // instruction aborts, so both checks can precede block fetch here.
+        // and illegal execution state, so both checks precede block fetch.
         if !cpu.pc.0.is_multiple_of(4) {
             take_exception(cpu, Exception::PcAlignment);
         } else if cpu.pstate.il {
             take_exception(cpu, Exception::IllegalExecutionState);
         }
-        let guest = split_block(cpu.pc, limits, |pc| fetch(memory, pc));
+        // D5.8: an instruction abort on the block's first word is taken at
+        // that PC; later words that fault end the block before them, and
+        // fault as the first word of the next block.
+        match fetch(cpu, memory, cpu.pc) {
+            Ok(_) => {}
+            Err(Some(Stage1Error::Abort(fault))) => match mmu::abort(fault) {
+                Some(exception) => {
+                    // A taken abort spends one budget step, so a vector that
+                    // itself faults cannot spin without bound.
+                    take_exception(cpu, exception);
+                    blocks += 1;
+                    continue;
+                }
+                None => break Stop::Fetch(VirtualAddress(cpu.pc.0)),
+            },
+            Err(_) => break Stop::Fetch(VirtualAddress(cpu.pc.0)),
+        }
+        let guest = {
+            let cpu = &*cpu;
+            split_block(cpu.pc, limits, |pc| fetch(cpu, memory, pc).ok())
+        };
         if guest.instructions().is_empty() {
             break Stop::Fetch(VirtualAddress(cpu.pc.0));
         }

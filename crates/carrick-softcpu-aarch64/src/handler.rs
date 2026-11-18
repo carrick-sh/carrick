@@ -5,12 +5,13 @@
 //! Semantics: Arm ARM DDI0487G.a C6.2 instruction pages (LDR/STR/LDP/STP,
 //! LDXR/STXR, LDADD, BR/BLR/RET, MSR immediate), D1.10/D1.11 exception entry
 //! and return (via `exception`), and D13.2 register access (via `state`).
-//! This slice models guest memory as flat pages: no stage-1 walk, so no
-//! translation or permission faults are raised here. Data alignment is checked
-//! before accessing memory.
+//! Data alignment is checked before translation; with SCTLR_EL1.M set every
+//! access translates through the stage-1 walker (`mmu`) and its faults are
+//! taken as EL1 data aborts.
 use crate::exception::{
     DataAccess, Exception, ExceptionOutcome, ProviderExit, WaitInstruction, eret, take_exception,
 };
+use crate::mmu::{self, AccessClass, Stage1Error};
 use crate::state::{
     CpuState, ExceptionLevel, InterruptMasks, ProgramCounter, RegisterValue, StackSelect,
     SystemAccessException, SystemValue, VirtualAddress,
@@ -22,15 +23,20 @@ use crate::{
     MemorySize, OperandRegister, PstateField, RegisterBranch, SystemDirection, SystemRegister,
     TlbiOperation, Translation, Width,
 };
+use carrick_mmu_core::aarch64::stage1_walk::Aarch64Fault;
+use carrick_mmu_core::stage1::LeafAccess;
 
-/// A guest access the flat memory model cannot serve (an unmapped address,
-/// such as MMIO). Not an architectural abort: there is no walker yet.
+/// A guest access guest memory cannot serve (an unbacked physical address,
+/// such as MMIO). Not an architectural abort: stage-1 faults are delivered
+/// as aborts through `mmu`; this is the provider's boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryFault {
     pub address: VirtualAddress,
 }
 
-/// Guest memory as the handlers see it. Little-endian data.
+/// Guest memory as the handlers see it. Little-endian data. Addresses are
+/// physical: with SCTLR_EL1.M clear they equal the virtual address, with M
+/// set they are the stage-1 output.
 pub trait GuestMemory {
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault>;
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault>;
@@ -60,14 +66,18 @@ pub enum Event {
     ProviderExit(ProviderExit),
     Tlbi(TlbiOperation),
     Hint(Hint),
-    /// MSR SCTLR_EL1 would set M. Not retired: the flat model has no walker.
+    /// MSR SCTLR_EL1 would set M under a TCR_EL1 the stage-1 walker does
+    /// not admit. Not retired.
     MmuEnable {
         value: SystemValue,
     },
     /// AT needs a stage-1 walk. Not retired.
     AddressTranslate,
-    /// Not retired: the flat model could not serve this access.
+    /// Not retired: guest memory could not serve this (physical) access.
     MemoryFault(MemoryFault),
+    /// Not retired: the stage-1 walk could not run (descriptor memory
+    /// refused, or translation enabled under an unadmitted TCR_EL1).
+    Translation(Stage1Error),
     /// Not retired: decoded, but not implemented by this slice.
     Unsupported,
 }
@@ -121,10 +131,13 @@ pub fn execute(
             },
             SystemDirection::Write => {
                 let value = SystemValue(operand(cpu, a.rt));
+                // Setting M under a TCR_EL1 the walker does not admit stops;
+                // an admitted regime enables translation (`mmu`).
                 if is_sctlr(a.encoding)
                     && cpu.pstate.el == ExceptionLevel::El1
                     && value.0 & 1 != 0
                     && cpu.el1.sctlr.0 & 1 == 0
+                    && mmu::regime(cpu).is_err()
                 {
                     return Outcome::Event(Event::MmuEnable { value });
                 }
@@ -250,6 +263,14 @@ pub fn execute(
                 take_exception(cpu, Exception::Alignment { access, address });
                 Outcome::Continue
             }
+            Err(MemoryAccessError::Abort(fault)) => match mmu::abort(fault) {
+                Some(exception) => {
+                    take_exception(cpu, exception);
+                    Outcome::Continue
+                }
+                None => Outcome::Event(Event::Unsupported),
+            },
+            Err(MemoryAccessError::Translation(error)) => Outcome::Event(Event::Translation(error)),
         },
     }
 }
@@ -319,22 +340,84 @@ fn extend(value: u64, e: Extend) -> u64 {
     }
 }
 
-fn load(memory: &mut impl GuestMemory, address: u64, size: MemorySize) -> Result<u64, MemoryFault> {
-    let mut bytes = [0; 8];
-    let n = usize::from(size.bytes()).min(8);
-    memory.read(VirtualAddress(address), &mut bytes[..n])?;
-    Ok(u64::from_le_bytes(bytes))
+/// One data access at `address`: stage-1 translated piecewise when
+/// SCTLR_EL1.M is set (`mmu`), every page translated before any byte moves,
+/// so a fault on the second page of a crossing access writes nothing.
+struct DataAccessor {
+    class: AccessClass,
 }
 
-fn store(
-    memory: &mut impl GuestMemory,
-    address: u64,
-    size: MemorySize,
-    value: u64,
-) -> Result<(), MemoryFault> {
-    let n = usize::from(size.bytes()).min(8);
-    memory.write(VirtualAddress(address), &value.to_le_bytes()[..n])
+impl DataAccessor {
+    /// The physical pieces of `[address, address + len)`, at most two.
+    fn pieces(
+        &self,
+        cpu: &CpuState,
+        memory: &mut impl GuestMemory,
+        address: u64,
+        len: usize,
+        access: LeafAccess,
+    ) -> Result<([(u64, usize); 2], usize), MemoryAccessError> {
+        if !mmu::enabled(cpu) {
+            return Ok(([(address, len), (0, 0)], 1));
+        }
+        let first = (PAGE - (address & (PAGE - 1))) as usize;
+        let pa = mmu::translate(cpu, memory, address, access, self.class)?;
+        if len <= first {
+            return Ok(([(pa, len), (0, 0)], 1));
+        }
+        // FAR for a second-page fault is the lowest address it touches.
+        let next = mmu::translate(
+            cpu,
+            memory,
+            address.wrapping_add(first as u64),
+            access,
+            self.class,
+        )?;
+        if next == pa.wrapping_add(first as u64) {
+            return Ok(([(pa, len), (0, 0)], 1));
+        }
+        Ok(([(pa, first), (next, len - first)], 2))
+    }
+
+    fn load(
+        &self,
+        cpu: &CpuState,
+        memory: &mut impl GuestMemory,
+        address: u64,
+        size: MemorySize,
+    ) -> Result<u64, MemoryAccessError> {
+        let mut bytes = [0; 8];
+        let n = usize::from(size.bytes()).min(8);
+        let (pieces, count) = self.pieces(cpu, memory, address, n, LeafAccess::Read)?;
+        let mut at = 0;
+        for &(pa, len) in &pieces[..count] {
+            memory.read(VirtualAddress(pa), &mut bytes[at..at + len])?;
+            at += len;
+        }
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn store(
+        &self,
+        cpu: &CpuState,
+        memory: &mut impl GuestMemory,
+        address: u64,
+        size: MemorySize,
+        value: u64,
+    ) -> Result<(), MemoryAccessError> {
+        let n = usize::from(size.bytes()).min(8);
+        let bytes = value.to_le_bytes();
+        let (pieces, count) = self.pieces(cpu, memory, address, n, LeafAccess::Write)?;
+        let mut at = 0;
+        for &(pa, len) in &pieces[..count] {
+            memory.write(VirtualAddress(pa), &bytes[at..at + len])?;
+            at += len;
+        }
+        Ok(())
+    }
 }
+
+const PAGE: u64 = 4096;
 
 /// Sign-extend a `size`-byte value to `width` (W results are zero-extended
 /// into the X register, C6.2.142 LDRSB and friends).
@@ -368,11 +451,22 @@ enum MemoryAccessError {
         access: DataAccess,
         address: VirtualAddress,
     },
+    Abort(Aarch64Fault),
+    Translation(Stage1Error),
 }
 
 impl From<MemoryFault> for MemoryAccessError {
     fn from(fault: MemoryFault) -> Self {
         Self::Provider(fault)
+    }
+}
+
+impl From<Stage1Error> for MemoryAccessError {
+    fn from(error: Stage1Error) -> Self {
+        match error {
+            Stage1Error::Abort(fault) => Self::Abort(fault),
+            other => Self::Translation(other),
+        }
     }
 }
 
@@ -405,6 +499,13 @@ fn memory_operation(
 ) -> Result<Option<()>, MemoryAccessError> {
     match i.instruction() {
         Instruction::ScalarMemory(m) | Instruction::UnprivilegedMemory(m) => {
+            let data = DataAccessor {
+                class: if matches!(i.instruction(), Instruction::UnprivilegedMemory(_)) {
+                    AccessClass::Unprivileged
+                } else {
+                    AccessClass::Ordinary
+                },
+            };
             let Some((rt, width)) = integer(m.register) else {
                 return Ok(None);
             };
@@ -446,9 +547,9 @@ fn memory_operation(
                 check_alignment(address, u64::from(m.size.bytes()), access)?;
             }
             if access == DataAccess::Write {
-                store(memory, address, m.size, operand(cpu, rt))?;
+                data.store(cpu, memory, address, m.size, operand(cpu, rt))?;
             } else {
-                let v = load(memory, address, m.size)?;
+                let v = data.load(cpu, memory, address, m.size)?;
                 set_operand(cpu, rt, loaded(v, m.size, m.operation, width));
             }
             if let Some((base, value)) = writeback {
@@ -469,20 +570,32 @@ fn memory_operation(
             };
             let step = u64::from(p.size.bytes());
             let access = data_access(p.operation);
+            let data = DataAccessor {
+                class: AccessClass::Ordinary,
+            };
             if cpu.el1.sctlr.alignment_check() {
                 check_alignment(address, step, access)?;
             }
             if access == DataAccess::Write {
-                store(memory, address, p.size, operand(cpu, first))?;
-                store(
+                // Both halves translate before either is written.
+                data.pieces(
+                    cpu,
+                    memory,
+                    address,
+                    2 * usize::from(p.size.bytes()),
+                    LeafAccess::Write,
+                )?;
+                data.store(cpu, memory, address, p.size, operand(cpu, first))?;
+                data.store(
+                    cpu,
                     memory,
                     address.wrapping_add(step),
                     p.size,
                     operand(cpu, second),
                 )?;
             } else {
-                let a = load(memory, address, p.size)?;
-                let c = load(memory, address.wrapping_add(step), p.size)?;
+                let a = data.load(cpu, memory, address, p.size)?;
+                let c = data.load(cpu, memory, address.wrapping_add(step), p.size)?;
                 set_operand(cpu, first, loaded(a, p.size, p.operation, width));
                 set_operand(cpu, second, loaded(c, p.size, p.operation, width));
             }
@@ -491,6 +604,9 @@ fn memory_operation(
             }
         }
         Instruction::AtomicTransfer(t) => {
+            let data = DataAccessor {
+                class: AccessClass::Ordinary,
+            };
             let address = operand(cpu, t.base);
             let step = u64::from(t.size.bytes());
             let count = if t.second.is_some() { 2 } else { 1 };
@@ -507,9 +623,9 @@ fn memory_operation(
             check_alignment(address, step * u64::from(count), access)?;
             match t.kind {
                 AtomicTransferKind::LoadAcquire | AtomicTransferKind::LoadExclusive { .. } => {
-                    let a = load(memory, address, t.size)?;
+                    let a = data.load(cpu, memory, address, t.size)?;
                     let c = match t.second {
-                        Some(_) => load(memory, address.wrapping_add(step), t.size)?,
+                        Some(_) => data.load(cpu, memory, address.wrapping_add(step), t.size)?,
                         None => 0,
                     };
                     set_operand(cpu, t.first, a);
@@ -521,14 +637,15 @@ fn memory_operation(
                     }
                 }
                 AtomicTransferKind::StoreRelease => {
-                    store(memory, address, t.size, operand(cpu, t.first))?;
+                    data.store(cpu, memory, address, t.size, operand(cpu, t.first))?;
                 }
                 AtomicTransferKind::StoreExclusive { status, .. } => {
                     let held = monitor.reservation == Some((address, t.size.bytes() * count));
                     if held {
-                        store(memory, address, t.size, operand(cpu, t.first))?;
+                        data.store(cpu, memory, address, t.size, operand(cpu, t.first))?;
                         if let Some(second) = t.second {
-                            store(
+                            data.store(
+                                cpu,
                                 memory,
                                 address.wrapping_add(step),
                                 t.size,
@@ -545,9 +662,12 @@ fn memory_operation(
             let address = operand(cpu, a.base);
             // TranslateAddressForAtomicAccess checks alignment as a read.
             check_alignment(address, u64::from(a.size.bytes()), DataAccess::Read)?;
-            let old = load(memory, address, a.size)?;
+            let data = DataAccessor {
+                class: AccessClass::Ordinary,
+            };
+            let old = data.load(cpu, memory, address, a.size)?;
             let addend = operand(cpu, a.source);
-            store(memory, address, a.size, old.wrapping_add(addend))?;
+            data.store(cpu, memory, address, a.size, old.wrapping_add(addend))?;
             set_operand(cpu, a.destination, old);
         }
         _ => return Ok(None),
