@@ -272,6 +272,31 @@ fn eret_restores_el0_and_clears_the_monitor() {
 }
 
 #[test]
+fn illegal_eret_restores_uao_from_spsr_el1() {
+    for uao in [true, false] {
+        let mut r = Rig::el1();
+        r.cpu.pstate.uao = !uao;
+        r.cpu.el1.elr = ProgramCounter(0x4000);
+        // EL2h is illegal when returning from EL1. NZCV=0xb, PAN=1, DAIF=6.
+        r.cpu.el1.spsr = SavedPstate(0xb040_0189 | (u64::from(uao) << 23));
+        assert_eq!(r.run(0xd69f_03e0), Outcome::Continue); // eret
+        assert_eq!(r.pc(), 0x4000);
+        assert_eq!(
+            r.cpu.pstate,
+            Pstate {
+                el: ExceptionLevel::El1,
+                sp: StackSelect::El1,
+                nzcv: 0xb,
+                daif: InterruptMasks(6),
+                pan: true,
+                uao,
+                il: true,
+            }
+        );
+    }
+}
+
+#[test]
 fn indirect_branches_read_rn_before_linking() {
     let mut r = Rig::el1();
     r.set(30, 0x5000);
