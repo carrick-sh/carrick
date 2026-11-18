@@ -420,3 +420,53 @@ mod production {
         assert_eq!(r.cpu.el1.esr, Syndrome(0x9600_000e));
     }
 }
+
+#[test]
+fn el0_dc_zva_zeros_one_translated_block_with_store_faults() {
+    // Arm ARM DC ZVA and ESR_EL1.ISS: DC ZVA is a data store (CM=0).
+    let mut r = Rig::el0();
+    r.cpu.el1.mair = SystemValue(0xff);
+    r.cpu.el1.sctlr.0 |= 1 << 14; // DZE
+    for offset in (0..80).step_by(8) {
+        r.memory.put(UDATA_PA + offset, u64::MAX);
+    }
+    r.set(3, UDATA + 31);
+    assert_eq!(r.run(0xd50b_7423), Outcome::Continue);
+    assert_eq!(r.cpu.pc.0, CODE + 4);
+    for offset in (0..64).step_by(8) {
+        assert_eq!(r.memory.get(UDATA_PA + offset), 0);
+    }
+    assert_eq!(r.memory.get(UDATA_PA + 64), u64::MAX);
+
+    r.cpu.pc = ProgramCounter(CODE);
+    r.set(3, KDATA + 31); // EL0 write permission is denied
+    assert_eq!(r.run(0xd50b_7423), Outcome::Continue);
+    r.assert_abort(0x400, 0x9200_004f, KDATA + 31);
+
+    let mut r = Rig::el0();
+    r.set(3, HOLE + 31);
+    assert_eq!(r.run(0xd50b_7423), Outcome::Continue);
+    assert_eq!(r.cpu.el1.esr, Syndrome(0x6202_dc68)); // DZE trap before translation
+    assert_eq!(r.cpu.el1.elr, ProgramCounter(CODE));
+}
+
+#[test]
+fn el0_ic_ivau_traps_or_translates_with_cache_maintenance_syndrome() {
+    // DDI0487G.a IC IVAU, SCTLR_EL1.UCI and ESR_EL1.ISS.CM.
+    let mut r = Rig::el0();
+    r.set(3, HOLE + 31);
+    assert_eq!(r.run(0xd50b_7523), Outcome::Continue);
+    assert_eq!(r.cpu.el1.esr, Syndrome(0x6202_dc6a)); // UCI trap before translation
+    assert_eq!(r.cpu.el1.elr, ProgramCounter(CODE));
+
+    let mut r = Rig::el0();
+    r.cpu.el1.sctlr.0 |= 1 << 26; // UCI
+    r.set(3, UDATA + 31);
+    assert!(matches!(r.run(0xd50b_7523), Outcome::Event(Event::Ic(_))));
+    assert_eq!(r.cpu.pc.0, CODE + 4);
+
+    r.cpu.pc = ProgramCounter(CODE);
+    r.set(3, HOLE + 31);
+    assert_eq!(r.run(0xd50b_7523), Outcome::Continue);
+    r.assert_abort(0x400, 0x9200_0147, HOLE + 31);
+}

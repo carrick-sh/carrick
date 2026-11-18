@@ -518,3 +518,35 @@ fn native_dispatch_refetches_after_isb_and_enters_the_fault_vector() {
         );
     }
 }
+
+#[test]
+fn native_musl_simd_survives_memory_exits_and_preserves_host_d8_to_d15() {
+    const DATA: u64 = CODE + 0x100;
+    for (fill, expected) in [(0xa5, [0xa5; 16]), (0x1c, [0x1c; 16])] {
+        let mut cpu = CpuState::default();
+        cpu.pc = ProgramCounter(CODE);
+        cpu.el1.sctlr.0 = 1 << 18; // allow EL0 WFE
+        set_x(&mut cpu, 0, DATA);
+        set_x(&mut cpu, 1, fill);
+        let mut memory = Flat::default();
+        memory.put(DATA, &[0xff; 16]);
+        memory.put_words(
+            CODE,
+            &[
+                0x4e01_0c28, // dup v8.16b, w1
+                0x3d80_0008, // str q8, [x0] (handler exit)
+                0x3dc0_001f, // ldr q31, [x0] (handler exit)
+                0x4e18_3fe2, // umov x2, v31.d[1]
+                0xd503_205f, // wfe
+            ],
+        );
+
+        let (report, starts) = run_at(&mut cpu, &mut memory);
+        assert_eq!(starts, [CODE, CODE + 8, CODE + 12], "{report}");
+        assert_eq!(report.pc.0, CODE + 20);
+        assert_eq!(x(&cpu, 2), u64::from_le_bytes([fill as u8; 8]));
+        let mut actual = [0; 16];
+        memory.read(VirtualAddress(DATA), &mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
+}

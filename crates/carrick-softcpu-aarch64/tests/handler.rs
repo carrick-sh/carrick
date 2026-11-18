@@ -726,3 +726,51 @@ fn vbar_el1_write_discards_res0_bits() {
     assert_eq!(r.run(0xd538_c002), Outcome::Continue); // mrs x2, vbar_el1
     assert_eq!((r.pc(), r.get(2)), (PC + 8, VBAR));
 }
+
+#[test]
+fn el0_reads_virtual_cache_geometry_and_obeys_uct() {
+    // DDI0487G.a D13 DCZID_EL0, CTR_EL0 and the trapped SYS64 ISS layout.
+    let mut r = Rig::el0();
+    r.cpu.el1.sctlr = Sctlr((1 << 14) | (1 << 15));
+    assert_eq!(r.run(0xd53b_00e5), Outcome::Continue); // MRS X5, DCZID_EL0
+    assert_eq!(r.get(5), 4);
+    assert_eq!(r.run(0xd53b_0026), Outcome::Continue); // MRS X6, CTR_EL0
+    assert_eq!(r.get(6), 0x8004_c004);
+    assert_eq!(r.pc(), PC + 8);
+
+    r.cpu.el1.sctlr = Sctlr(0);
+    assert_eq!(r.run(0xd53b_00e5), Outcome::Continue);
+    assert_eq!(r.get(5), 0x14); // DZP reflects DZE at EL0
+    assert_eq!(r.run(0xd53b_0026), Outcome::Continue);
+    assert_eq!(r.cpu.el1.esr, Syndrome(0x6232_c0c1));
+    assert_eq!(r.cpu.el1.elr, ProgramCounter(PC + 12));
+    assert_eq!(r.pc(), VBAR + 0x400);
+    assert_eq!(r.get(6), 0x8004_c004); // trapped MRS never writes Rt
+}
+
+#[test]
+fn el0_vector_scalar_and_pair_memory_transfer_guest_bytes() {
+    // DDI0487G.a C6.2 LDR/STR and LDP/STP (SIMD&FP).
+    let mut r = Rig::el0();
+    let a = 0x10_113;
+    r.set(0, a);
+    r.memory.put(a, 0x0123_4567_89ab_cdef);
+    r.memory.put(a + 8, 0xfedc_ba98_7654_3210);
+    r.memory.put(a + 16, 0x1122_3344_5566_7788);
+    r.memory.put(a + 24, 0xaabb_ccdd_eeff_0102);
+
+    assert_eq!(r.run(0x3dc0_001f), Outcome::Continue); // LDR Q31, [X0]
+    assert_eq!(r.run(0x3d80_0c1f), Outcome::Continue); // STR Q31, [X0, #48]
+    assert_eq!(r.memory.get(a + 48), 0x0123_4567_89ab_cdef);
+    assert_eq!(r.memory.get(a + 56), 0xfedc_ba98_7654_3210);
+    assert_eq!(r.run(0xad40_7c1e), Outcome::Continue); // LDP Q30, Q31, [X0]
+    assert_eq!(r.run(0xad02_7c1e), Outcome::Continue); // STP Q30, Q31, [X0, #64]
+    for offset in [0, 8, 16, 24] {
+        assert_eq!(r.memory.get(a + 64 + offset), r.memory.get(a + offset));
+    }
+    assert_eq!(r.run(0xfd40_001f), Outcome::Continue); // LDR D31, [X0]
+    assert_eq!(r.run(0x3d80_181f), Outcome::Continue); // STR Q31, [X0, #96]
+    assert_eq!(r.memory.get(a + 96), 0x0123_4567_89ab_cdef);
+    assert_eq!(r.memory.get(a + 104), 0);
+    assert_eq!(r.pc(), PC + 24);
+}
