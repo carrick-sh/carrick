@@ -943,10 +943,18 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 .max(4096),
         };
         let mut exchange = ForkStockExchange::new(request).ok_or(NativeProcessError::Invalid)?;
-        // SAFETY: aligned exclusive supervisor stack record remains live
-        // through stopped host authentication; DX is always the hardware port.
-        unsafe {
-            core::arch::asm!("out dx, eax", in("dx") FORK_STOCK_PORT, in("rax") &raw mut exchange, options(nostack));
+        #[cfg(feature = "test-support")]
+        let injected = crate::test_support::take_fork_loan_refusal();
+        #[cfg(not(feature = "test-support"))]
+        let injected = None;
+        if let Some(refusal) = injected {
+            exchange.refuse(refusal);
+        } else {
+            // SAFETY: aligned exclusive supervisor stack record remains live
+            // through stopped host authentication; DX is always the hardware port.
+            unsafe {
+                core::arch::asm!("out dx, eax", in("dx") FORK_STOCK_PORT, in("rax") &raw mut exchange, options(nostack));
+            }
         }
         let loan = exchange
             .take(request)
