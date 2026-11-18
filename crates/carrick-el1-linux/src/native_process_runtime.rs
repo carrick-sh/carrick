@@ -9758,6 +9758,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                 Ok(pid) => break pid,
                 Err(error) => super::native_fork_refusal::observe_process_error(error),
             };
+            // A broken kernel invariant ends the run; it is no guest errno.
+            if let NativeProcessError::ForkRefused(refusal) = error
+                && refusal.class()
+                    == super::native_fork_refusal::NativeForkClass::InvariantViolation
+            {
+                super::native_fork_refusal::invariant_violated(refusal);
+            }
             match error.failure() {
                 Ok(failure) => return self.fail(failure),
                 // A refused fork has published no child: contention reruns it.

@@ -94,73 +94,141 @@ pub struct NativeForkRefusal {
     pub cause: NativeForkCause,
 }
 
+/// What a native fork refusal means (#2441). Every cause has exactly one
+/// class, chosen by an exhaustive match in [`NativeForkRefusal::class`]
+/// with no fallback arm, so a new cause cannot silently reach the guest as
+/// EFAULT; its author must pick its class.
+///
+/// No cause is a guest-address fault. The native fork transaction reads and
+/// writes only kernel-owned state: the parent's reservations and page
+/// tables, the fork scratch, and the carrier's fork stock. The clone's guest
+/// pointers (`CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`, the TLS and stack)
+/// are consumed outside it. So EFAULT, which Linux never answers for a plain
+/// fork, is not a fork-refusal answer here.
+///
+/// Per cause:
+/// - [`Self::NotNow`]: `Busy`, `SiblingBirth`, `MetadataOwed` (the fork
+///   parks on that grant's request queue), `MmError::{Wait, Busy}`,
+///   `Refusal::{Busy, PreparedConflict}`, `ForkError::Busy`, and a stock
+///   `Inventory` reply.
+/// - [`Self::OutOfMemory`] (ENOMEM): `MmError::{NoMemory, MetadataRequired}`,
+///   `PageTableError::{OutOfTables, MetadataAllocation}`,
+///   `Refusal::{Limit, MetadataRequired}`,
+///   `ForkError::{NoMemory, MetadataRequired, OwnerRefusal(Limit)}`.
+/// - [`Self::BirthsExhausted`] (EAGAIN): `GateShut` (no release reopens the
+///   parent's births) and a stock `Capacity` reply.
+/// - [`Self::Unsupported`] (a counted ENOSYS): `MmError::UnsupportedExecutableCow`.
+/// - [`Self::InvariantViolation`] (fatal): the owner refused its own state.
+///   `MmError::{Fault, Stale, Invalid, Core}` and every other page-table
+///   error; `Refusal::{Stale, Invalid, Collision, Hole, ForeignMapping}`;
+///   `ForkError::{Invalid, Stale, Core}` and the owner refusals `Invalid`,
+///   `Collision`, `Hole` and `ForeignMapping`; a stock `Invalid` or `Stale`
+///   reply; and a stock crossing that failed without a typed reply. The
+///   live parent's MM cannot be retired or rewritten under its own
+///   reserved birth, and the fork walks no guest address, so each of these
+///   means the owner contradicted itself, never a guest error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeForkClass {
+    /// Contention or a guest wait: the fork keeps its syscall and reruns.
+    /// `Some` names the owner release it enrols on.
+    NotNow(Option<carrick_core_abi::PortalOwnerWait>),
+    /// Kernel memory or a mapping limit ran out: ENOMEM, as Linux answers
+    /// fork and clone.
+    OutOfMemory,
+    /// The parent admits no more births: EAGAIN.
+    BirthsExhausted,
+    /// A mapping this kernel cannot fork yet: a counted ENOSYS.
+    Unsupported,
+    /// A broken kernel invariant: the fork entry ends the run
+    /// ([`invariant_violated`]); it never reaches the guest as an errno.
+    InvariantViolation,
+}
+
 impl NativeForkRefusal {
-    /// Every cause has exactly one answer, so a new cause cannot reach the
-    /// guest as a fallback errno (#2441). Contention is "not now"; memory
-    /// and limit exhaustion is ENOMEM, as Linux answers fork and clone.
-    pub fn error(self) -> super::native_process_runtime::NativeProcessError {
-        use super::native_process_runtime::NativeProcessError as E;
+    /// The one class of this refusal's cause ([`NativeForkClass`]).
+    pub fn class(self) -> NativeForkClass {
+        use NativeForkClass as Class;
         match self.cause {
             NativeForkCause::Busy
             | NativeForkCause::SiblingBirth { .. }
-            | NativeForkCause::MetadataOwed { .. } => E::Busy,
-            // Today's EAGAIN answer, as a refusal rather than "not now".
-            NativeForkCause::GateShut => E::Exhausted,
-            NativeForkCause::Mm(error) => mm_error(error),
-            NativeForkCause::Reservation(refusal) => reservation_error(refusal),
-            NativeForkCause::Fork(error) => fork_error(error),
-            NativeForkCause::StockReservation(refusal) => stock_error(refusal),
-            // A refused stock reply keeps the owner's answer; a crossing that
-            // carried none is the transport's fault answer.
-            NativeForkCause::StockCrossing {
+            | NativeForkCause::MetadataOwed { .. } => Class::NotNow(None),
+            NativeForkCause::GateShut => Class::BirthsExhausted,
+            NativeForkCause::Mm(error) => mm_class(error),
+            NativeForkCause::Reservation(refusal) => reservation_class(refusal),
+            NativeForkCause::Fork(error) => fork_class(error),
+            NativeForkCause::StockReservation(refusal)
+            | NativeForkCause::StockCrossing {
                 reply: Some(refusal),
                 ..
-            } => stock_error(refusal),
-            NativeForkCause::StockCrossing { reply: None, .. } => E::Fault,
+            } => stock_class(refusal),
+            NativeForkCause::StockCrossing { reply: None, .. } => Class::InvariantViolation,
+        }
+    }
+
+    /// The native answer of this refusal's class. An invariant violation
+    /// answers `Quarantined` only off the fork entry, which ends the run
+    /// before encoding one.
+    pub fn error(self) -> super::native_process_runtime::NativeProcessError {
+        use super::native_process_runtime::NativeProcessError as E;
+        match self.class() {
+            NativeForkClass::NotNow(Some(wait)) => E::OwnerWait(wait),
+            NativeForkClass::NotNow(None) => E::Busy,
+            NativeForkClass::OutOfMemory => E::NoMemory,
+            NativeForkClass::BirthsExhausted => E::Exhausted,
+            NativeForkClass::Unsupported => E::Unsupported,
+            NativeForkClass::InvariantViolation => E::Quarantined,
         }
     }
 }
 
-fn mm_error(error: MmError) -> super::native_process_runtime::NativeProcessError {
-    use super::native_process_runtime::NativeProcessError as E;
+fn mm_class(error: MmError) -> NativeForkClass {
+    use NativeForkClass as Class;
+    use carrick_mmu_core::aarch64::PageTableError as Table;
     match error {
-        // Owner contention keeps its release to enrol on (#2306); it is
-        // never the fault answer of a refused owner operation.
-        MmError::Wait(wait) => E::OwnerWait(wait),
-        MmError::Busy => E::Busy,
+        // Owner contention keeps its release to enrol on (#2306).
+        MmError::Wait(wait) => Class::NotNow(Some(wait)),
+        MmError::Busy => Class::NotNow(None),
         MmError::NoMemory
         | MmError::MetadataRequired
-        | MmError::Table(carrick_mmu_core::aarch64::PageTableError::OutOfTables) => E::NoMemory,
-        MmError::Reservation(refusal) => reservation_error(refusal),
+        | MmError::Table(Table::OutOfTables | Table::MetadataAllocation) => Class::OutOfMemory,
+        MmError::Reservation(refusal) => reservation_class(refusal),
+        MmError::UnsupportedExecutableCow => Class::Unsupported,
         MmError::Fault
-        | MmError::UnsupportedExecutableCow
         | MmError::Stale
         | MmError::Invalid
         | MmError::Core
-        | MmError::Table(_) => E::Fault,
+        | MmError::Table(
+            Table::BadAddress
+            | Table::MissingArenaSource
+            | Table::ConflictingArenaSource
+            | Table::UnresolvedArena(_)
+            | Table::GicWindowOutput
+            | Table::GuestOwnsLiveDescriptors
+            | Table::CarrickOwnedWindow,
+        ) => Class::InvariantViolation,
     }
 }
 
-fn reservation_error(refusal: Refusal) -> super::native_process_runtime::NativeProcessError {
-    use super::native_process_runtime::NativeProcessError as E;
+fn reservation_class(refusal: Refusal) -> NativeForkClass {
+    use NativeForkClass as Class;
     match refusal {
-        Refusal::Busy | Refusal::PreparedConflict => E::Busy,
-        Refusal::Limit | Refusal::MetadataRequired => E::NoMemory,
+        Refusal::Busy | Refusal::PreparedConflict => Class::NotNow(None),
+        Refusal::Limit | Refusal::MetadataRequired => Class::OutOfMemory,
         Refusal::Stale
         | Refusal::Invalid
         | Refusal::Collision
         | Refusal::Hole
-        | Refusal::ForeignMapping => E::Fault,
+        | Refusal::ForeignMapping => Class::InvariantViolation,
     }
 }
 
-fn fork_error(error: ForkError) -> super::native_process_runtime::NativeProcessError {
-    use super::native_process_runtime::NativeProcessError as E;
+fn fork_class(error: ForkError) -> NativeForkClass {
+    use NativeForkClass as Class;
     match error {
-        ForkError::Busy => E::Busy,
+        ForkError::Busy => Class::NotNow(None),
         ForkError::NoMemory
         | ForkError::MetadataRequired
-        | ForkError::OwnerRefusal(ForkOwnerRefusal::Limit) => E::NoMemory,
+        | ForkError::OwnerRefusal(ForkOwnerRefusal::Limit) => Class::OutOfMemory,
         ForkError::Invalid
         | ForkError::Stale
         | ForkError::Core
@@ -169,21 +237,36 @@ fn fork_error(error: ForkError) -> super::native_process_runtime::NativeProcessE
             | ForkOwnerRefusal::Collision
             | ForkOwnerRefusal::Hole
             | ForkOwnerRefusal::ForeignMapping,
-        ) => E::Fault,
+        ) => Class::InvariantViolation,
     }
 }
 
-fn stock_error(
-    refusal: carrick_el1_abi::ForkStockRefusal,
-) -> super::native_process_runtime::NativeProcessError {
-    use super::native_process_runtime::NativeProcessError as E;
+fn stock_class(refusal: carrick_el1_abi::ForkStockRefusal) -> NativeForkClass {
     use carrick_el1_abi::ForkStockRefusal as R;
     match refusal {
-        R::Invalid => E::Invalid,
-        R::Stale => E::Stale,
-        R::Capacity => E::Exhausted,
-        R::Inventory => E::Busy,
+        R::Inventory => NativeForkClass::NotNow(None),
+        R::Capacity => NativeForkClass::BirthsExhausted,
+        R::Invalid | R::Stale => NativeForkClass::InvariantViolation,
     }
+}
+
+/// End the run on a fork refusal that broke a kernel invariant
+/// ([`NativeForkClass::InvariantViolation`]): never a guest errno. The fatal
+/// record names the refusal's stage and cause.
+#[track_caller]
+pub fn invariant_violated(refusal: NativeForkRefusal) -> ! {
+    #[cfg(target_os = "none")]
+    {
+        emit(format_args!("{refusal:?}; class=InvariantViolation"));
+        super::dispatch::invalid_completion(super::dispatch::NativeInvariant::NativeService(
+            carrick_el1_abi::EntryBindingFatalReason::NativeForkInvariant,
+        ))
+    }
+    #[cfg(not(target_os = "none"))]
+    carrick_fatal::carrick_fatal!(
+        "el1::native_fork",
+        "fork refusal broke a kernel invariant: {refusal:?}"
+    )
 }
 
 /// Allocate a fork's exact-size scratch, on every ISA's fork venue. The loan
@@ -519,6 +602,89 @@ mod tests {
         }
     }
 
+    /// #2441: each cause has exactly its documented class
+    /// ([`NativeForkClass`]); a broken invariant never reaches the guest,
+    /// and each other class has its one answer.
+    #[test]
+    fn every_fork_refusal_cause_has_its_class() {
+        use NativeForkClass as Class;
+        use carrick_el1_abi::ForkStockRefusal as Stock;
+        use carrick_mmu_core::aarch64::PageTableError as Table;
+        let expected = |cause: NativeForkCause| match cause {
+            NativeForkCause::Busy
+            | NativeForkCause::SiblingBirth { .. }
+            | NativeForkCause::MetadataOwed { .. }
+            | NativeForkCause::Mm(
+                MmError::Busy | MmError::Reservation(Refusal::Busy | Refusal::PreparedConflict),
+            )
+            | NativeForkCause::Reservation(Refusal::Busy | Refusal::PreparedConflict)
+            | NativeForkCause::Fork(ForkError::Busy)
+            | NativeForkCause::StockReservation(Stock::Inventory)
+            | NativeForkCause::StockCrossing {
+                reply: Some(Stock::Inventory),
+                ..
+            } => Class::NotNow(None),
+            NativeForkCause::Mm(MmError::Wait(wait)) => Class::NotNow(Some(wait)),
+            NativeForkCause::Mm(
+                MmError::NoMemory
+                | MmError::MetadataRequired
+                | MmError::Table(Table::OutOfTables | Table::MetadataAllocation)
+                | MmError::Reservation(Refusal::Limit | Refusal::MetadataRequired),
+            )
+            | NativeForkCause::Reservation(Refusal::Limit | Refusal::MetadataRequired)
+            | NativeForkCause::Fork(
+                ForkError::NoMemory
+                | ForkError::MetadataRequired
+                | ForkError::OwnerRefusal(ForkOwnerRefusal::Limit),
+            ) => Class::OutOfMemory,
+            NativeForkCause::GateShut
+            | NativeForkCause::StockReservation(Stock::Capacity)
+            | NativeForkCause::StockCrossing {
+                reply: Some(Stock::Capacity),
+                ..
+            } => Class::BirthsExhausted,
+            NativeForkCause::Mm(MmError::UnsupportedExecutableCow) => Class::Unsupported,
+            _ => Class::InvariantViolation,
+        };
+        let mut classes = std::collections::BTreeMap::<&str, usize>::new();
+        for cause in every_cause() {
+            let refusal = NativeForkRefusal {
+                stage: NativeForkStage::Prepare,
+                cause,
+            };
+            let class = refusal.class();
+            assert_eq!(class, expected(cause), "{cause:?}");
+            let answer = refusal.error().failure().map(|failure| failure.errno());
+            match class {
+                Class::NotNow(_) => assert!(answer.is_err(), "{cause:?}"),
+                Class::OutOfMemory => assert_eq!(answer, Ok(-12), "{cause:?}"),
+                Class::BirthsExhausted => assert_eq!(answer, Ok(-11), "{cause:?}"),
+                Class::Unsupported => assert_eq!(answer, Ok(-38), "{cause:?}"),
+                // Off the fork entry only; the entry ends the run first.
+                Class::InvariantViolation => assert_eq!(answer, Ok(-5), "{cause:?}"),
+            }
+            *classes
+                .entry(match class {
+                    Class::NotNow(_) => "not now",
+                    Class::OutOfMemory => "enomem",
+                    Class::BirthsExhausted => "eagain",
+                    Class::Unsupported => "enosys",
+                    Class::InvariantViolation => "invariant",
+                })
+                .or_default() += 1;
+        }
+        assert_eq!(
+            classes.into_iter().collect::<std::vec::Vec<_>>(),
+            [
+                ("eagain", 3),
+                ("enomem", 11),
+                ("enosys", 1),
+                ("invariant", 33),
+                ("not now", 12),
+            ]
+        );
+    }
+
     #[test]
     fn boundary_observes_every_untyped_error_without_changing_policy() {
         use NativeProcessError as E;
@@ -607,14 +773,17 @@ mod tests {
                 cause: NativeForkCause::Fork(ForkError::Core),
             })
         );
-        assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-14));
+        let NativeProcessError::ForkRefused(refusal) = error else {
+            unreachable!()
+        };
+        assert_eq!(refusal.class(), NativeForkClass::InvariantViolation);
         assert_ne!(error, refused(NativeForkStage::Prepare, ForkError::Core));
         assert_ne!(error, refused(NativeForkStage::Census, ForkError::Stale));
     }
 
     /// #2441: memory and limit exhaustion at any stage is ENOMEM, as Linux
     /// answers fork and clone, never EFAULT; a heap miss whose metadata grant
-    /// is in flight is "not now". Every cause has one exhaustive answer.
+    /// is in flight is "not now".
     #[test]
     fn exhausted_fork_is_enomem_and_an_owed_grant_is_contention() {
         use carrick_mmu_core::aarch64::PageTableError;
@@ -647,6 +816,14 @@ mod tests {
                 NativeForkStage::Commit,
                 NativeForkCause::Reservation(Refusal::Limit),
             ),
+            // A fork owner's Limit keeps its type through the MM owner's
+            // error (formerly folded into MmError::Fault, so EFAULT).
+            (
+                NativeForkStage::Publish,
+                NativeForkCause::Mm(MmError::from(ForkError::OwnerRefusal(
+                    ForkOwnerRefusal::Limit,
+                ))),
+            ),
         ] {
             let error = refused(stage, cause);
             assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-12));
@@ -662,13 +839,14 @@ mod tests {
             Err(NativeContention::BUSY)
         );
         use carrick_el1_abi::ForkStockRefusal as R;
-        for (reply, errno) in [(Some(R::Capacity), Ok(-11)), (None, Ok(-14))] {
-            let error = refused(
-                NativeForkStage::StockCrossing,
-                NativeForkCause::StockCrossing { status: 1, reply },
-            );
-            assert_eq!(error.failure().map(|failure| failure.errno()), errno);
-        }
+        let error = refused(
+            NativeForkStage::StockCrossing,
+            NativeForkCause::StockCrossing {
+                status: 1,
+                reply: Some(R::Capacity),
+            },
+        );
+        assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-11));
         assert_eq!(
             refused(
                 NativeForkStage::StockCrossing,
@@ -758,12 +936,10 @@ mod tests {
             ] {
                 assert_eq!(refused(stage, cause).failure(), Err(NativeContention::BUSY));
             }
-            assert_eq!(
-                refused(stage, MmError::Fault)
-                    .failure()
-                    .map(|failure| failure.errno()),
-                Ok(-14)
-            );
+            let NativeProcessError::ForkRefused(refusal) = refused(stage, MmError::Fault) else {
+                unreachable!()
+            };
+            assert_eq!(refusal.class(), NativeForkClass::InvariantViolation);
         }
     }
 
@@ -808,20 +984,31 @@ mod tests {
         }
     }
 
+    /// A stock reply keeps its owner's class at the reservation and at the
+    /// crossing: an Invalid or Stale reply means the carrier refused the
+    /// parent's own exact request, a broken invariant (#2441).
     #[test]
-    fn reserve_diagnostics_preserve_each_stock_refusal_encoding() {
+    fn reserve_diagnostics_preserve_each_stock_refusal_class() {
         use carrick_el1_abi::ForkStockRefusal as R;
-        for (reply, error) in [
-            (R::Invalid, NativeProcessError::Invalid),
-            (R::Stale, NativeProcessError::Stale),
-            (R::Capacity, NativeProcessError::Exhausted),
-            (R::Inventory, NativeProcessError::Busy),
+        for (reply, class) in [
+            (R::Invalid, NativeForkClass::InvariantViolation),
+            (R::Stale, NativeForkClass::InvariantViolation),
+            (R::Capacity, NativeForkClass::BirthsExhausted),
+            (R::Inventory, NativeForkClass::NotNow(None)),
         ] {
-            let diagnostic = refused(
-                NativeForkStage::Reserve,
+            for cause in [
                 NativeForkCause::StockReservation(reply),
-            );
-            assert_eq!(diagnostic.failure(), error.failure());
+                NativeForkCause::StockCrossing {
+                    status: 2,
+                    reply: Some(reply),
+                },
+            ] {
+                let refusal = NativeForkRefusal {
+                    stage: NativeForkStage::Reserve,
+                    cause,
+                };
+                assert_eq!(refusal.class(), class, "{cause:?}");
+            }
         }
     }
 }
