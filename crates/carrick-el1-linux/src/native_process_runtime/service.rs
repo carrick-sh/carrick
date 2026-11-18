@@ -655,13 +655,19 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         if let Some(wait) = wait {
             drop(guard);
             // The queue the owner wait parked on: a host-readiness wait
-            // (#231) parks on the member's own queue, every other cause on
-            // its MM resource's (`park_owner_wait`).
+            // (#231) parks on the member's own queue, a metadata grant wait
+            // (#2441) on its grant request's, every other cause on its MM
+            // resource's (`park_owner_wait`).
             let key = if wait.cause() == carrick_core_abi::PortalWaitCause::HostReadiness {
                 if wait.handle() != request.identity.birth.mm {
                     return Err(NativeFailure::Stale);
                 }
                 ObjectWaitKey::native_host_ready(record).ok_or(NativeFailure::Stale)?
+            } else if wait.cause() == carrick_core_abi::PortalWaitCause::MetadataGrant {
+                if wait.handle() != request.identity.birth.mm {
+                    return Err(NativeFailure::Stale);
+                }
+                ObjectWaitKey::metadata_request(wait.revision()).ok_or(NativeFailure::Stale)?
             } else {
                 carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
                     self.zone,
@@ -2735,9 +2741,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         use carrick_sched_core::object_wait::ObjectWaitError;
         let zone = self.source.zone;
         // A host-readiness wait (#231) parks on the member's own queue, which
-        // its carrier sampled before the probe; every other cause is an MM
-        // resource's.
-        let enrollment = if wait.cause() == carrick_core_abi::PortalWaitCause::HostReadiness {
+        // its carrier sampled before the probe; a metadata grant wait (#2441)
+        // on its grant request's, probed below under that queue's lock;
+        // every other cause is an MM resource's.
+        let grant = match wait.cause() {
+            carrick_core_abi::PortalWaitCause::MetadataGrant => {
+                Some(core::num::NonZeroU64::new(wait.revision()).ok_or(NativeProcessError::Stale)?)
+            }
+            _ => None,
+        };
+        let enrollment = if grant.is_some()
+            || wait.cause() == carrick_core_abi::PortalWaitCause::HostReadiness
+        {
             if wait.handle() != request.identity.birth.mm {
                 return Err(NativeProcessError::Stale);
             }
@@ -2753,9 +2768,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
         };
         let operation = self.take_preparation_operation(request)?;
-        let park = match &enrollment {
-            Some(enrollment) => enrollment.owner_request(operation),
-            None => match carrick_core_abi::wait::ObjectParkRequest::host_readiness_owner(
+        let park = match (&enrollment, grant) {
+            (Some(enrollment), _) => enrollment.owner_request(operation),
+            (None, Some(generation)) => {
+                let Some(key) = ObjectWaitKey::metadata_request(generation.get()) else {
+                    self.restore_preparation_operation(operation)?;
+                    return Err(NativeProcessError::Stale);
+                };
+                carrick_core_abi::wait::ObjectParkRequest::owner(
+                    key,
+                    operation,
+                    carrick_sched_core::object_wait::OwnerEntry::Exception,
+                    // SAFETY: the save_context closure below probes the grant
+                    // under this same queue's lock, which the carrier holds
+                    // to publish its answer (`MetadataCompletionWake`).
+                    unsafe {
+                        carrick_core::wait::OwnerProbeUnderQueueLock::for_save_context_probe()
+                    },
+                )
+            }
+            (None, None) => match carrick_core_abi::wait::ObjectParkRequest::host_readiness_owner(
                 self.record,
                 wait,
                 operation,
@@ -2768,6 +2800,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
             },
         };
+        // Whether admission reached the probe: a grant request queue that
+        // moved on before it (`Stale`) was answered, and its waiter reruns.
+        let mut probed = false;
         let parked = carrick_core::wait::park_object_record(
             zone,
             self.source.slot,
@@ -2776,6 +2811,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 crate::sched::object_wait::deliver_completion(zone, self.source.slot, owned);
             },
             || {
+                probed = true;
                 // MM queue -> service queue is the only nested queue order.
                 let key =
                     ObjectWaitKey::native_service(self.record).ok_or(ObjectWaitError::Stale)?;
@@ -2808,6 +2844,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 if !enrollment
                     .as_ref()
                     .is_none_or(|enrollment| enrollment.is_live())
+                    || grant.is_some_and(|generation| {
+                        !carrick_el1::alloc::GLOBAL_ALLOCATOR.grant_pending(generation)
+                    })
                     || self
                         .control
                         .service
@@ -2830,6 +2869,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(NativeResume::Left(None))
             }
             Err((ObjectWaitError::Changed, operation)) => {
+                self.restore_preparation_operation(operation)?;
+                self.finish_owner_wait(request)
+            }
+            Err((ObjectWaitError::Stale, operation)) if grant.is_some() && !probed => {
                 self.restore_preparation_operation(operation)?;
                 self.finish_owner_wait(request)
             }
