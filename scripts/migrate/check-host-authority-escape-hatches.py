@@ -53,6 +53,10 @@ RAW_SYSCALL_BOUNDARIES = frozenset(
 
 ASSEMBLY_BOUNDARIES = frozenset(
     {
+        # #2521: publish written JIT bytes with DC CVAU / DSB ISH / IC IVAU /
+        # ISB. MRS CTR_EL0 supplies the line strides and coherence bits for
+        # this sequence.
+        PurePosixPath("crates/carrick-host-jit/src/publish.rs"),
         PurePosixPath("crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.rs"),
         PurePosixPath("crates/carrick-runtime/src/vcpu_loop/native_probe.rs"),
         PurePosixPath("crates/carrick-runtime/tools/vdso_getrandom_blob.rs"),
