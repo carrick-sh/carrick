@@ -67,13 +67,13 @@ impl ExecuteBlock for HostBlockRunner {
         block: &TranslatedBlock,
         frame: &mut BlockFrame,
     ) -> Result<usize, HostError> {
-        let bytes: Vec<u8> = block.words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let bytes: Vec<u8> = block.words().iter().flat_map(|w| w.to_le_bytes()).collect();
         let entry = self.code.publish(&bytes).ok_or(HostError::Publish)?;
         let top = self.region.len() - 1;
         self.region[top] = frame.clone();
         // Derived from the whole region: host signal frames land below `top`.
         let slot = self.region.as_mut_ptr().wrapping_add(top);
-        // SAFETY: `entry` is the RX start of `block.words`, an AAPCS64
+        // SAFETY: `entry` is the RX start of `block.words()`, an AAPCS64
         // function (translate::entry_stub/common_exit) that takes the frame
         // in x0, restores x19..x30 and host SP before returning the exit
         // index in x0, and touches no memory but the frame and the region

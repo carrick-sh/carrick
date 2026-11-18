@@ -65,7 +65,9 @@ impl<E: fmt::Debug> fmt::Display for Report<E> {
             } => write!(
                 f,
                 "fails at: SCTLR_EL1.M enable at PC={:#x} (word {:#010x}, value {:#x})",
-                i.pc.0, i.word, value.0
+                i.pc().0,
+                i.word(),
+                value.0
             ),
             Stop::Event {
                 instruction: i,
@@ -73,7 +75,10 @@ impl<E: fmt::Debug> fmt::Display for Report<E> {
             } => write!(
                 f,
                 "fails at: unmapped guest access {:#x} at PC={:#x} (word {:#010x}, {:?})",
-                m.address.0, i.pc.0, i.word, i.instruction
+                m.address.0,
+                i.pc().0,
+                i.word(),
+                i.instruction()
             ),
             Stop::Event {
                 instruction: i,
@@ -81,7 +86,10 @@ impl<E: fmt::Debug> fmt::Display for Report<E> {
             } => write!(
                 f,
                 "fails at: {:?} at PC={:#x} (word {:#010x}, {:?})",
-                event, i.pc.0, i.word, i.class
+                event,
+                i.pc().0,
+                i.word(),
+                i.class()
             ),
             Stop::Translate(e) => write!(f, "fails at: translation {e:?}"),
             Stop::Execute(ref e) => write!(f, "fails at: host launch {e:?}"),
@@ -128,7 +136,7 @@ pub fn run<X: ExecuteBlock>(
             take_exception(cpu, Exception::IllegalExecutionState);
         }
         let guest = split_block(cpu.pc, limits, |pc| fetch(memory, pc));
-        if guest.instructions.is_empty() {
+        if guest.instructions().is_empty() {
             break Stop::Fetch(VirtualAddress(cpu.pc.0));
         }
         let block = match emit_block(&guest) {
@@ -142,11 +150,11 @@ pub fn run<X: ExecuteBlock>(
         };
         frame.store_to(cpu);
         blocks += 1;
-        match block.exits.get(index) {
+        match block.exits().get(index) {
             None => break Stop::BadExit(index),
             Some(BlockExit::Continue(pc)) => cpu.pc = *pc,
             Some(BlockExit::Handler(i)) => {
-                cpu.pc = i.pc;
+                cpu.pc = i.pc();
                 match handler::execute(cpu, monitor, memory, i) {
                     Outcome::Continue => {}
                     Outcome::Event(e) if absorbed(e) => {}
@@ -208,8 +216,8 @@ mod tests {
             f: &mut BlockFrame,
         ) -> Result<usize, &'static str> {
             let nzcv = (frame::NZCV / 8) as usize;
-            for i in &block.guest.instructions {
-                match i.instruction {
+            for i in block.guest().instructions() {
+                match i.instruction() {
                     Instruction::MoveWide(m) => {
                         let shift = u32::from(m.shift.value());
                         let imm = u64::from(m.immediate) << shift;
@@ -241,15 +249,15 @@ mod tests {
                         set(f, a.rd, r);
                     }
                     Instruction::Hint(crate::Hint::Nop) => {}
-                    _ if i.class.terminates() => {}
+                    _ if i.class().terminates() => {}
                     _ => return Err("double: instruction outside its subset"),
                 }
             }
-            Ok(match block.terminator {
+            Ok(match block.terminator() {
                 Terminator::Handler(e) | Terminator::Jump(e) | Terminator::Fallthrough(e) => e,
                 Terminator::Conditional { fallthrough, taken } => {
                     let Some(Instruction::Branch(Branch::Conditional { condition, .. })) =
-                        block.guest.terminator().map(|t| t.instruction)
+                        block.guest().terminator().map(|t| t.instruction())
                     else {
                         return Err("double: only B.cond");
                     };
@@ -270,7 +278,7 @@ mod tests {
     impl ExecuteBlock for WrongExit {
         type Error = ();
         fn execute(&mut self, b: &TranslatedBlock, _: &mut BlockFrame) -> Result<usize, ()> {
-            Ok(b.exits.len())
+            Ok(b.exits().len())
         }
     }
 
@@ -349,7 +357,7 @@ mod tests {
             panic!("{r}");
         };
         assert_eq!(
-            (instruction.pc.0, exit.immediate.value()),
+            (instruction.pc().0, exit.immediate.value()),
             (VBAR + 0x204, 2)
         );
         assert_eq!(r.pc, ProgramCounter(VBAR + 0x208));
@@ -504,7 +512,7 @@ mod tests {
             else {
                 panic!("{returned}");
             };
-            assert_eq!(instruction.pc.0, ENTRY + 8);
+            assert_eq!(instruction.pc().0, ENTRY + 8);
             assert_eq!(returned.pc.0, ENTRY + 12);
         }
     }

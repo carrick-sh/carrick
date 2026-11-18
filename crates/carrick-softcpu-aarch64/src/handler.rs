@@ -101,15 +101,15 @@ fn is_sctlr(r: SystemRegister) -> bool {
     (r.op0, r.op1, r.crn, r.crm, r.op2) == (3, 0, 1, 0, 0)
 }
 
-/// Perform the instruction a block exited on. `cpu.pc` must equal `i.pc`.
+/// Perform the instruction a block exited on. `cpu.pc` must equal `i.pc()`.
 pub fn execute(
     cpu: &mut CpuState,
     monitor: &mut ExclusiveMonitor,
     memory: &mut impl GuestMemory,
     i: &GuestInstruction,
 ) -> Outcome {
-    debug_assert_eq!(cpu.pc, i.pc);
-    match i.instruction {
+    debug_assert_eq!(cpu.pc, i.pc());
+    match i.instruction() {
         Instruction::SystemAccess(a) => match a.direction {
             SystemDirection::Read => match cpu.mrs(a.encoding, a.rt) {
                 Ok(v) => {
@@ -137,7 +137,7 @@ pub fn execute(
                 }
             }
         },
-        Instruction::PstateImmediate(p) => pstate(cpu, i.word, p.field, p.immediate),
+        Instruction::PstateImmediate(p) => pstate(cpu, i.word(), p.field, p.immediate),
         Instruction::SystemOperation(op) => {
             // C5.4: op1 selects the minimum EL for these TLBI encodings.
             if cpu.pstate.el == ExceptionLevel::El0 || op.op1 != 0 {
@@ -403,7 +403,7 @@ fn memory_operation(
     memory: &mut impl GuestMemory,
     i: &GuestInstruction,
 ) -> Result<Option<()>, MemoryAccessError> {
-    match i.instruction {
+    match i.instruction() {
         Instruction::ScalarMemory(m) | Instruction::UnprivilegedMemory(m) => {
             let Some((rt, width)) = integer(m.register) else {
                 return Ok(None);
