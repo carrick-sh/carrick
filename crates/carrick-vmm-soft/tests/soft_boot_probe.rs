@@ -34,10 +34,11 @@ fn probe(image: ProbeImage<'_>) -> BootReport {
 
 /// The carrier protocol's first serviced exit: port I/O or `HLT`, or a
 /// complete fault-doorbell record for a CPL3 fault. A ring-0 fault record
-/// is a carrier failure on KVM too (`fault_exit_from_record`).
-fn reached_host_exit(report: &BootReport) -> bool {
+/// is a carrier failure on KVM too (`fault_exit_from_record`). A ring fatal
+/// is admitted only where the stopped carrier lacks what the ring requires.
+fn reached_host_exit(report: &BootReport, ring_fatal_admitted: bool) -> bool {
     match &report.exit {
-        BootExit::HostExit(_) => true,
+        BootExit::HostExit(_) => report.fatal_payload.is_none() || ring_fatal_admitted,
         BootExit::FaultDoorbell(record) => record.cs & 3 == 3,
         _ => false,
     }
@@ -46,32 +47,44 @@ fn reached_host_exit(report: &BootReport) -> bool {
 #[test]
 fn production_ring_image_boots_to_first_carrier_exit_on_soft_cpu() {
     let reports = [
-        probe(ProbeImage {
-            name: "production, stopped boot",
-            elf: PRODUCTION,
-            programs: [&[], &[]],
-            initial_extent_bytes: Some(INITIAL_EXTENT),
-            fixture_image: false,
-        }),
-        probe(ProbeImage {
-            name: "production, exit_group(7) syscall",
-            elf: PRODUCTION,
-            programs: [EXIT_SEVEN, &[]],
-            initial_extent_bytes: Some(INITIAL_EXTENT),
-            fixture_image: false,
-        }),
-        probe(ProbeImage {
-            name: "fixture, exit_group(7) syscall",
-            elf: FIXTURE,
-            programs: [EXIT_SEVEN, EXIT_SEVEN],
-            initial_extent_bytes: None,
-            fixture_image: true,
-        }),
+        (
+            false,
+            probe(ProbeImage {
+                name: "production, stopped boot",
+                elf: PRODUCTION,
+                programs: [&[], &[]],
+                initial_extent_bytes: Some(INITIAL_EXTENT),
+                fixture_image: false,
+            }),
+        ),
+        // Production entry requires an admitted initial MM and scheduler
+        // record (the KVM witnesses admit one through `run_pool_fixture`);
+        // without it the ring refuses in `native_execution::capture`.
+        (
+            true,
+            probe(ProbeImage {
+                name: "production, exit_group(7) syscall",
+                elf: PRODUCTION,
+                programs: [EXIT_SEVEN, &[]],
+                initial_extent_bytes: Some(INITIAL_EXTENT),
+                fixture_image: false,
+            }),
+        ),
+        (
+            false,
+            probe(ProbeImage {
+                name: "fixture, exit_group(7) syscall",
+                elf: FIXTURE,
+                programs: [EXIT_SEVEN, EXIT_SEVEN],
+                initial_extent_bytes: None,
+                fixture_image: true,
+            }),
+        ),
     ];
     let failed: Vec<_> = reports
         .iter()
-        .filter(|report| !reached_host_exit(report))
-        .map(|report| format!("[{}] {}", report.image, report.summary))
+        .filter(|(fatal, report)| !reached_host_exit(report, *fatal))
+        .map(|(_, report)| format!("[{}] {}", report.image, report.summary))
         .collect();
     assert!(failed.is_empty(), "soft boot probe:\n{}", failed.join("\n"));
 }
