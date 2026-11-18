@@ -2,8 +2,8 @@
 //! D1.11 exception return / AArch64.ExceptionReturn (J1-7951),
 //! SetPSTATEFromPSR (J1-8205–8206), and D13.2.37 ESR_EL1.
 //! Pure virtual transitions; no host exceptions or provider actions.
-//! A3 wiring must enforce restored IL on the next instruction (EC=0x0e)
-//! and apply the configured address size to ELR before fetching after ERET.
+//! Dispatch checks the PC and restored IL before executing the next block.
+//! Address-size checks on ERET belong to the translation regime.
 //! SError ISS=0 is the chosen non-RAS implementation-defined syndrome;
 //! HVC at EL1 is a deliberate provider boundary in this EL0/EL1 profile.
 use crate::state::{
@@ -77,6 +77,8 @@ pub enum Exception {
     Brk(u16),
     Unknown,
     WaitTrap(WaitInstruction),
+    IllegalExecutionState,
+    PcAlignment,
     SystemAccess(SystemAccessException),
     Irq,
     Fiq,
@@ -123,6 +125,8 @@ pub fn syndrome(exception: Exception, origin: ExceptionLevel) -> Syndrome {
             0x01,
             (0b11110 << 20) | u64::from(wait == WaitInstruction::Wfe),
         ),
+        Exception::IllegalExecutionState => (0x0e, 0),
+        Exception::PcAlignment => (0x22, 0),
         Exception::SError => (0x2f, 0),
         Exception::Alignment { access, .. } => (
             0x24 + current,
@@ -182,9 +186,11 @@ pub fn take_exception(cpu: &mut CpuState, exception: Exception) -> ExceptionOutc
     if !matches!(exception, Exception::Irq | Exception::Fiq) {
         cpu.el1.esr = syndrome(exception, origin.el);
     }
-    if let Exception::Abort { address, .. } | Exception::Alignment { address, .. } = exception {
-        cpu.el1.far = address;
-    }
+    cpu.el1.far = match exception {
+        Exception::Abort { address, .. } | Exception::Alignment { address, .. } => address,
+        Exception::PcAlignment => VirtualAddress(cpu.pc.0),
+        _ => cpu.el1.far,
+    };
     cpu.pstate.el = ExceptionLevel::El1;
     cpu.pstate.sp = StackSelect::El1;
     cpu.pstate.daif = InterruptMasks::ALL;

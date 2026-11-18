@@ -3,6 +3,7 @@
 //! arm64 host), map the exit index back to a guest exit, run its handler, and
 //! repeat under a block budget. No translation cache in this slice: see
 //! docs/design/soft-aarch64-translator.md, "Cache".
+use crate::exception::{Exception, take_exception};
 use crate::handler::{self, Event, ExclusiveMonitor, GuestMemory, Outcome};
 use crate::state::{CpuState, ProgramCounter, VirtualAddress};
 use crate::translate::{
@@ -117,6 +118,14 @@ pub fn run<X: ExecuteBlock>(
     let stop = loop {
         if blocks >= budget {
             break Stop::Budget;
+        }
+        // DDI0487G.a D1.12.4: PC alignment precedes instruction aborts
+        // and illegal execution state. Flat memory has no architectural
+        // instruction aborts, so both checks can precede block fetch here.
+        if !cpu.pc.0.is_multiple_of(4) {
+            take_exception(cpu, Exception::PcAlignment);
+        } else if cpu.pstate.il {
+            take_exception(cpu, Exception::IllegalExecutionState);
         }
         let guest = split_block(cpu.pc, limits, |pc| fetch(memory, pc));
         if guest.instructions.is_empty() {
