@@ -439,9 +439,10 @@ exact sequence:
    `HostCrossingSet::Aarch64` (`strict = true`) directly, refusing every
    ring-owned syscall in-ring with `-38` (`-ENOSYS`) and returning via `eret`
    without exiting to the carrier:
-   - `svc[0]`: `set_tid_address` (`nr = 96` at `0x442ca0` in `__init_tp`) ->
-     `-38` (stored into `self->tid` and ignored by musl `__init_tp`).
-   - `svc[1]`: `ppoll([0, 1, 2], 3, {0, 0}, NULL, 8)` (`nr = 73` at `0x442304`,
+   - `svc[0]`: `set_tid_address` (`nr = 96` at `0x442ca0` in `__init_tp`, after
+     `msr tpidr_el0, x0` at `0x444028` wrote `0x472130`) -> `-38` (stored into
+     `self->tid` and ignored by musl `__init_tp`).
+   - `svc[1]`: `ppoll([0, 1, 2], 3, {0, 0}, NULL, 8)` (`nr = 73` at `0x4422e4`,
      called from `lang_start_internal`'s `sanitize_standard_fds` at `0x41efa4`)
      -> `-38`; `lang_start_internal` checks `errno > 22` (`EINVAL`) at
      `0x41efc0..0x41efc4` and calls `bl 0x43c6d0 <abort>` at `0x41f358`
@@ -449,17 +450,28 @@ exact sequence:
    - `svc[2..=8]`: inside `abort()`, 7 signal/thread syscalls
      (`135, 130, 135, 135, 134, 130, 135`) all return `-38` in-ring, reaching
      `abort()`'s fallback `0x43c744: strb wzr, [x0]`.
-3. **Harness fix and shared-carrier boundary**: publishing an issued root
+3. **Second blocker exposed once `CurrentTask[0]` is admitted (`AT S1E0R` at
+   `0x2D_0410_C410`)**: with `CurrentTask[0]` issued, `PendingFamilies::poll`
+   enters `HardwareValidator::checked_bytes` (`crates/carrick-el1/src/file.rs:294-305`)
+   to validate the user `timespec` (`0xfffffefcf0`) and `pollfd` array
+   (`0xfffffefd00`), executing `at s1e0r, x12` (`0xd508_784c`) + `isb` +
+   `mrs xN, par_el1`. On hosted arm64 run `44416887222`, that stopped after
+   4,422 blocks on `Event::AddressTranslate`. Wiring `AT S1E1R/W`, `AT S1E0R/W`,
+   and `AT S1E1RP/WP` through `Aarch64Walker` into 64-bit `PAR_EL1`
+   (Arm ARM DDI 0487G.a C6.2.21, C5.3, D5.4.2, D13.2.103) in
+   `carrick-softcpu-aarch64::mmu::address_translate` closes that ISA gap.
+4. **Harness fix and shared-carrier boundary**: publishing an issued root
    `CurrentTask[0]` (`SnapshotGeneration::INITIAL`, `file_table = 1`) and
    host-bound stdio `0..=2` (`FdMapSlot` + `DelegatedOpenFile` with
-   `HostObjectBinding::{STDIN, STDOUT, STDERR}`) in `boot_probe.rs` routes
-   `ppoll` (`nr = 73`) through `PendingFamilies::poll` and stops cleanly at the
-   first guest-visible carrier call (`HVC #2` at `0x2D_0001_0B3C`,
-   `cpu.pc = 0x2D_0001_0B40`, `mailbox.state = 1`, `trap_kind = 1`,
-   `native_nr = 73`, `ESR_EL1 = 0x5600_0000`). Completing `ppoll = 0` via the
-   mailbox advances past `sanitize_standard_fds` to `signal(SIGPIPE, SIG_IGN)`
-   (`rt_sigaction` `nr = 134` at `0x41f138`), which requires the shared
-   carrier's `Aarch64NativeProcessService` (`ZoneTables` +
+   `HostObjectBinding::{STDIN, STDOUT, STDERR}`) in `boot_probe.rs`, together
+   with `AT S1E*` -> `PAR_EL1`, routes `ppoll` (`nr = 73`) through
+   `PendingFamilies::poll` and stops cleanly at the first guest-visible carrier
+   call (`HVC #2` at `0x2D_0001_0B3C`, `cpu.pc = 0x2D_0001_0B40`,
+   `mailbox.state = 1`, `trap_kind = 1`, `native_nr = 73`,
+   `ESR_EL1 = 0x5600_0000`). Completing `ppoll = 0` via the mailbox advances
+   past `sanitize_standard_fds` to `signal(SIGPIPE, SIG_IGN)` (`rt_sigaction`
+   `nr = 134` at `0x41f138`), which requires the shared carrier's
+   `Aarch64NativeProcessService` (`ZoneTables` +
    `ThreadLifecyclePage`/`ThreadControlSlot` + `MM_PORTAL_*` + `HVC #6`/`#7`
    custody in `crates/carrick-aarch64` + `crates/carrick-vmm-soft`, Section
    2.4).
