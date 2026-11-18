@@ -1,0 +1,10 @@
+/var/lib/carrick-conductor/repo/target-main/debug/deps/log-b84bdee44f52b083.d: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/macros.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/serde.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/__private_api.rs
+
+/var/lib/carrick-conductor/repo/target-main/debug/deps/liblog-b84bdee44f52b083.rlib: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/macros.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/serde.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/__private_api.rs
+
+/var/lib/carrick-conductor/repo/target-main/debug/deps/liblog-b84bdee44f52b083.rmeta: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/macros.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/serde.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/__private_api.rs
+
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/lib.rs:
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/macros.rs:
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/serde.rs:
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/log-0.4.29/src/__private_api.rs:

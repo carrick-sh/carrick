@@ -1,0 +1,10 @@
+/var/lib/carrick-conductor/repo/target-main/debug/deps/idna-51b8c8ff089c1bec.d: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/deprecated.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/punycode.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/uts46.rs
+
+/var/lib/carrick-conductor/repo/target-main/debug/deps/libidna-51b8c8ff089c1bec.rlib: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/deprecated.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/punycode.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/uts46.rs
+
+/var/lib/carrick-conductor/repo/target-main/debug/deps/libidna-51b8c8ff089c1bec.rmeta: /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/lib.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/deprecated.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/punycode.rs /var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/uts46.rs
+
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/lib.rs:
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/deprecated.rs:
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/punycode.rs:
+/var/lib/carrick-conductor/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/uts46.rs:

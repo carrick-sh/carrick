@@ -1,0 +1,30 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling zerocopy v0.8.48
+   Compiling foldhash v0.1.5
+   Compiling hashbrown v0.15.5
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling bitflags v2.11.1
+   Compiling carrick-signal-core v0.1.0 (/tmp/wt-main/crates/carrick-signal-core)
+   Compiling syn v2.0.117
+   Compiling carrick-pipe-core v0.1.0 (/tmp/wt-main/crates/carrick-pipe-core)
+   Compiling carrick-el1-control-abi v0.1.0 (/tmp/wt-main/crates/carrick-el1-control-abi)
+   Compiling carrick-inotify-core v0.1.0 (/tmp/wt-main/crates/carrick-inotify-core)
+   Compiling carrick-el1-linux v0.1.0 (/tmp/wt-main/crates/carrick-el1-linux)
+   Compiling zerocopy-derive v0.8.48
+   Compiling serde_derive v1.0.228
+   Compiling carrick-guest-arch v0.1.0 (/tmp/wt-main/crates/carrick-guest-arch)
+   Compiling carrick-mmu-core v0.1.0 (/tmp/wt-main/crates/carrick-mmu-core)
+   Compiling carrick-sched-core v0.1.0 (/tmp/wt-main/crates/carrick-sched-core)
+   Compiling carrick-syscall-abi v0.1.0 (/tmp/wt-main/crates/carrick-syscall-abi)
+   Compiling carrick-abi v0.1.0 (/tmp/wt-main/crates/carrick-abi)
+   Compiling carrick-core-abi v0.1.0 (/tmp/wt-main/crates/carrick-core-abi)
+   Compiling carrick-core v0.1.0 (/tmp/wt-main/crates/carrick-core)
+   Compiling carrick-fd-core v0.1.0 (/tmp/wt-main/crates/carrick-fd-core)
+   Compiling carrick-personality-api v0.1.0 (/tmp/wt-main/crates/carrick-personality-api)
+   Compiling carrick-personality-linux v0.1.0 (/tmp/wt-main/crates/carrick-personality-linux)
+   Compiling carrick-el1-abi v0.1.0 (/tmp/wt-main/crates/carrick-el1-abi)
+   Compiling carrick-el1 v0.1.0 (/tmp/wt-main/crates/carrick-el1)
+    Finished `el1-image` profile [optimized + debuginfo] target(s) in 35.04s

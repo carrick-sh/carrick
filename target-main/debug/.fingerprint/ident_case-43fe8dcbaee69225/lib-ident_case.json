@@ -1,0 +1,1 @@
+{"rustc":16696009966390864400,"features":"[]","declared_features":"[]","target":5776078485490251590,"profile":3033921117576893,"path":5532078834038624085,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/ident_case-43fe8dcbaee69225/dep-lib-ident_case","checksum":false}}],"rustflags":["-C","force-frame-pointers=yes"],"config":8247474407144887393,"compile_kind":0}
