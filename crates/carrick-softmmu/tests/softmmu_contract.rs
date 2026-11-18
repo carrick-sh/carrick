@@ -1863,3 +1863,205 @@ fn largest_fixture_keeps_untouched_pages_nonresident() {
     );
     std::hint::black_box(&shared);
 }
+
+// #2480: the ISA-neutral `resolve_leaf` seam, driven by both stage-1 walkers.
+
+fn x86_context(root: RootGpa, user: bool) -> carrick_softmmu::HardwareWalkContext {
+    carrick_softmmu::HardwareWalkContext {
+        root,
+        user,
+        config: carrick_softmmu::HardwareWalkConfig {
+            max_phy_addr: carrick_softmmu::DEFAULT_MAX_PHY_ADDR,
+            nxe: true,
+            cr0_wp: true,
+            cr4_smep: true,
+            cr4_smap: true,
+            rflags_ac: false,
+            update_ad: true,
+        },
+    }
+}
+
+#[test]
+fn x86_hardware_walker_resolves_through_the_shared_softmmu_seam() -> Result<(), PlacementError> {
+    use carrick_softmmu::{HardwareFaultClass, HardwareWalker, LeafResolveError, ResolvedLeaf};
+    let mut rig = Rig::new()?;
+    let va = GuestVa::new(0x0000_0000_4020_3123);
+    rig.map_a(va, pte(F1_GPA, true, true, false, false));
+    let user = x86_context(rig.root, true);
+    let resolved =
+        carrick_softmmu::resolve_leaf(&HardwareWalker, &rig.mem, rig.root, &user, va, Access::Read)
+            .unwrap();
+    let ResolvedLeaf::Ram {
+        leaf,
+        frame_gpa,
+        host_page,
+    } = resolved
+    else {
+        panic!("RAM expected: {resolved:?}");
+    };
+    assert_eq!(leaf.output.raw(), F1_GPA | 0x123);
+    assert_eq!(frame_gpa.raw(), F1_GPA);
+    assert_eq!(host_page.page_base(), rig.mem.host_of(F1_GPA));
+    // The production x86 binding resolves the same page through the seam.
+    let mode = CpuAccessMode::ring3();
+    let produced = rig.walk_ram(va, Access::Read, mode);
+    assert_eq!(
+        (produced.frame_gpa, produced.host_page),
+        (frame_gpa, host_page)
+    );
+    // A supervisor fetch from a user page is the x86 walker's own fault.
+    let supervisor = x86_context(rig.root, false);
+    assert_eq!(
+        carrick_softmmu::resolve_leaf(
+            &HardwareWalker,
+            &rig.mem,
+            rig.root,
+            &supervisor,
+            va,
+            Access::Execute,
+        ),
+        Err(LeafResolveError::Walk(carrick_softmmu::WalkError::Fault(
+            HardwareFaultClass::Smep
+        )))
+    );
+    Ok(())
+}
+
+mod aarch64_seam {
+    use super::*;
+    use carrick_mmu_core::aarch64::stage1_walk::{
+        Aarch64AccessClass, Aarch64El, Aarch64Fault, Aarch64FaultKind, Aarch64Level, Aarch64Regime,
+        Aarch64WalkContext, Aarch64Walker,
+    };
+    use carrick_softmmu::{LeafResolveError, ResolvedLeaf, Stage1Leaf, WalkError, resolve_leaf};
+
+    // Arm ARM D5.3 encodings.
+    const TABLE: u64 = 0b11;
+    const PAGE: u64 = 0b11;
+    const BLOCK: u64 = 0b01;
+    const AF: u64 = 1 << 10;
+    const AP_ALL_RW: u64 = 0b01 << 6;
+    const AP_EL1_RW: u64 = 0b00 << 6;
+    const PXN: u64 = 1 << 53;
+    const UXN: u64 = 1 << 54;
+    /// T0SZ=T1SZ=16, TG1=4K, IPS=40 bits, TBI0/TBI1.
+    const TCR: u64 = 16 | (16 << 16) | (0b10 << 30) | (0b010 << 32) | (1 << 37) | (1 << 38);
+    const L0: u64 = PML4_A_GPA;
+    const L1: u64 = PDPT_A_GPA;
+    const L2: u64 = PD_A_GPA;
+    const L3: u64 = PT_A_GPA;
+
+    fn va(l2: u64, l3: u64, offset: u64) -> GuestVa {
+        GuestVa::new((1 << 30) | (l2 << 21) | (l3 << 12) | offset)
+    }
+
+    fn arm_memory() -> Result<VecGuestMemory, PlacementError> {
+        // No xAPIC: the ARM binding supplies its own device holes.
+        let holes = MmioHoles::empty().with_hole(CUSTOM_MMIO_GPA, PAGE_SIZE_4K)?;
+        let mut mem = VecGuestMemory::with_holes(TEST_SPAN_BYTES, holes)?;
+        let gen1 = generation(1);
+        for gpa in [L0, L1, L2, L3, F1_GPA, F2_GPA] {
+            assert!(mem.install_extent(FrameGpa::new(gpa), PAGE_SIZE_4K, gen1));
+        }
+        assert!(mem.install_extent(FrameGpa::new(HUGE_2M_BASE_GPA), HUGE_2M_SIZE, gen1));
+        assert!(mem.extents_mut().set_root_generation(root_gpa(L0), gen1));
+        mem.set(L0, 0, L1 | TABLE);
+        mem.set(L1, 1, L2 | TABLE);
+        mem.set(L2, 1, L3 | TABLE);
+        mem.set(L3, 3, F1_GPA | PAGE | AF | AP_ALL_RW | PXN);
+        mem.set(L3, 4, F2_GPA | PAGE | AF | AP_EL1_RW | UXN);
+        mem.set(L3, 5, CUSTOM_MMIO_GPA | PAGE | AF | AP_EL1_RW | UXN);
+        // F4 has no extent: its leaf must not authenticate.
+        mem.set(L3, 6, F4_GPA | PAGE | AF | AP_ALL_RW | PXN);
+        mem.set(L2, 2, HUGE_2M_BASE_GPA | BLOCK | AF | AP_ALL_RW | PXN);
+        Ok(mem)
+    }
+
+    fn context(el: Aarch64El, class: Aarch64AccessClass, pan: bool) -> Aarch64WalkContext {
+        Aarch64WalkContext {
+            regime: Aarch64Regime::new(TCR, L0, L0, 0).unwrap(),
+            el,
+            pan,
+            uao: false,
+            class,
+        }
+    }
+
+    #[test]
+    fn aarch64_walker_resolves_through_the_shared_softmmu_seam() -> Result<(), PlacementError> {
+        let mem = arm_memory()?;
+        let root = root_gpa(L0);
+        let el0 = context(Aarch64El::El0, Aarch64AccessClass::Ordinary, false);
+        let user = va(1, 3, 0x123);
+        mem.reset_loads();
+        let resolved = resolve_leaf(&Aarch64Walker, &mem, root, &el0, user, Access::Write).unwrap();
+        let ResolvedLeaf::Ram {
+            leaf,
+            frame_gpa,
+            host_page,
+        } = resolved
+        else {
+            panic!("RAM expected: {resolved:?}");
+        };
+        assert_eq!(leaf.output().raw(), F1_GPA | 0x123);
+        assert_eq!(frame_gpa.raw(), F1_GPA);
+        assert_eq!(host_page.page_base(), mem.host_of(F1_GPA));
+        assert_eq!(mem.loads(), 4, "one authenticated load per level");
+        // HA=HD=0: the walk never wrote a descriptor (no x86 A/D update).
+        assert_eq!(mem.get(L3, 3), F1_GPA | PAGE | AF | AP_ALL_RW | PXN);
+
+        // The ARM permission fault comes back as the walker's own record.
+        let kernel = va(1, 4, 0x8);
+        assert_eq!(
+            resolve_leaf(&Aarch64Walker, &mem, root, &el0, kernel, Access::Read),
+            Err(LeafResolveError::Walk(WalkError::Fault(Aarch64Fault {
+                kind: Aarch64FaultKind::Permission,
+                level: Aarch64Level::L3,
+                va: kernel,
+                access: Access::Read,
+            })))
+        );
+        // PAN denies the privileged load; the LDTR class does not.
+        let pan = context(Aarch64El::El1, Aarch64AccessClass::Ordinary, true);
+        let ldtr = context(Aarch64El::El1, Aarch64AccessClass::Unprivileged, true);
+        assert!(resolve_leaf(&Aarch64Walker, &mem, root, &pan, user, Access::Read).is_err());
+        assert!(resolve_leaf(&Aarch64Walker, &mem, root, &ldtr, user, Access::Read).is_ok());
+        assert!(resolve_leaf(&Aarch64Walker, &mem, root, &pan, kernel, Access::Read).is_ok());
+
+        // Device memory exits, never fills.
+        let device = va(1, 5, 0x40);
+        assert!(matches!(
+            resolve_leaf(&Aarch64Walker, &mem, root, &pan, device, Access::Read),
+            Ok(ResolvedLeaf::Mmio { gpa, .. }) if gpa == CUSTOM_MMIO_GPA | 0x40
+        ));
+        // An output without an extent is an authority failure, not a fault.
+        assert!(matches!(
+            resolve_leaf(&Aarch64Walker, &mem, root, &el0, va(1, 6, 0), Access::Read),
+            Err(LeafResolveError::UnauthenticatedExtent { .. })
+        ));
+        // A 2 MiB block authenticates its whole span.
+        let block = va(2, 7, 0x10);
+        let Ok(ResolvedLeaf::Ram {
+            leaf, frame_gpa, ..
+        }) = resolve_leaf(&Aarch64Walker, &mem, root, &el0, block, Access::Read)
+        else {
+            panic!("block RAM expected");
+        };
+        assert_eq!(leaf.span().bytes(), HUGE_2M_SIZE);
+        assert_eq!(frame_gpa.raw(), HUGE_2M_BASE_GPA + (7 << 12));
+        // A root without a registered generation refuses descriptor loads.
+        assert!(matches!(
+            resolve_leaf(
+                &Aarch64Walker,
+                &mem,
+                root_gpa(PML4_B_GPA),
+                &el0,
+                user,
+                Access::Read
+            ),
+            Err(LeafResolveError::Walk(WalkError::Refusal(_)))
+        ));
+        Ok(())
+    }
+}
