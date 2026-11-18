@@ -75,6 +75,11 @@ pub enum PortalWaitCause {
     /// watch, and its queue is the member's own
     /// (`ObjectWaitKey::native_host_ready`), not an MM resource's.
     HostReadiness = 7,
+    /// The carrier-wide metadata grant a kernel heap miss is owed. Its
+    /// producer is the carrier's grant completion, and its queue is the
+    /// request's own (`ObjectWaitKey::metadata_request(revision)`), not an
+    /// MM resource's: the revision is that request's generation.
+    MetadataGrant = 8,
 }
 impl PortalWaitCause {
     pub const fn encode(self) -> u64 {
@@ -89,6 +94,7 @@ impl PortalWaitCause {
             5 => Some(Self::Metadata),
             6 => Some(Self::ReservationPool),
             7 => Some(Self::HostReadiness),
+            8 => Some(Self::MetadataGrant),
             _ => None,
         }
     }
@@ -126,6 +132,17 @@ impl PortalOwnerWait {
             handle,
             cause: PortalWaitCause::HostReadiness,
             revision,
+        }
+    }
+    /// A member's wait for the metadata grant its kernel heap miss is owed
+    /// (#2441). `generation` names the in-flight grant request whose queue
+    /// the member parks on; no MM resource state backs it, and the member
+    /// probes that request under its queue lock before parking.
+    pub const fn metadata_grant(handle: El1MmHandle, generation: core::num::NonZeroU64) -> Self {
+        Self {
+            handle,
+            cause: PortalWaitCause::MetadataGrant,
+            revision: generation.get(),
         }
     }
     pub const fn handle(self) -> El1MmHandle {
@@ -375,6 +392,7 @@ pub const MM_TRANSFER_LAYOUT_HASH: u64 = {
         MM_PORTAL_PROTOCOL,
         PortalWaitCause::ReservationPool as u64,
         PortalWaitCause::HostReadiness as u64,
+        PortalWaitCause::MetadataGrant as u64,
         PREPARED,
         SUSPENDED,
         core::mem::size_of::<PortalTransferSlot>() as u64,

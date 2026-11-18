@@ -5855,6 +5855,35 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ContinuationPark::Interrupted => Err(NativeFailure::Stale),
         }
     }
+    /// A fork whose scratch missed while metadata grant `grant` is in
+    /// flight waits for that grant (#2441). It is a guest wait, not
+    /// contention: the clone is retained as an owner wait on the grant
+    /// request's own queue, which releases this execution lane; the
+    /// carrier's completion wakes it and the clone reruns once. `None`
+    /// means the grant was answered before enrolment: rerun at once.
+    fn park_metadata_grant(
+        &mut self,
+        grant: carrick_el1_abi::OwedMetadataGrant,
+    ) -> Result<Option<LifecycleOutcome>, NativeFailure> {
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeFailure::Stale)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        let handle = self.service.service_mm_handle(&mm)?;
+        self.retain_syscall(NativeContention {
+            owner_wait: Some(carrick_core_abi::PortalOwnerWait::metadata_grant(
+                handle,
+                grant.generation(),
+            )),
+        })
+    }
     /// Suspend a vfork(2) parent after its child is published (clone(2):
     /// "the calling process is suspended until the child releases its
     /// virtual memory resources, i.e., until the child calls execve or
@@ -9711,6 +9740,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             if let Some(observed) = super::native_fork_refusal::sibling_birth(&forked) {
                 match self.park_contended_fork(observed) {
                     // The release already published: rerun at once.
+                    Ok(None) => continue,
+                    Ok(Some(outcome)) => return outcome,
+                    Err(failure) => return self.fail(failure),
+                }
+            }
+            // The fork's scratch is owed a metadata grant: wait for it.
+            if let Some(grant) = super::native_fork_refusal::metadata_owed(&forked) {
+                match self.park_metadata_grant(grant) {
+                    // The grant was answered before enrolment: rerun at once.
                     Ok(None) => continue,
                     Ok(Some(outcome)) => return outcome,
                     Err(failure) => return self.fail(failure),
