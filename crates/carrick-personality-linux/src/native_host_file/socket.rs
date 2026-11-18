@@ -534,7 +534,10 @@ pub(super) fn stage(
         } else if c == nr::SENDMSG || c == nr::RECVMSG {
             let send = c == nr::SENDMSG;
             match plan.message(user, args[1], send, false, &mut 0)? {
-                Message::Staged => {}
+                // The slot carries the carrier's own marker, never the
+                // caller's: the call has three arguments, so its sixth
+                // register is whatever the libc wrapper left (#2418).
+                Message::Staged => args[host_file::NET_MESSAGE_UNSTAGED_ARG] = 0,
                 Message::Unstaged => {
                     args[host_file::NET_MESSAGE_UNSTAGED_ARG] = host_file::NET_MESSAGE_UNSTAGED;
                 }
