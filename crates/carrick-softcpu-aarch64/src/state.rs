@@ -168,7 +168,7 @@ impl CpuState {
             Slot::Spsr => self.el1.spsr.0,
             Slot::Esr => self.el1.esr.0,
             Slot::Far => self.el1.far.0,
-            Slot::Vbar => self.el1.vbar.0,
+            Slot::Vbar => self.el1.vbar.0 & !0x7ff,
             Slot::Sctlr => self.el1.sctlr.0,
             Slot::Tpidr => self.el1.tpidr.0,
             Slot::SpEl0 => self.sp_el0.0,
