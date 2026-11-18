@@ -12502,6 +12502,11 @@ mod futex_contention;
 #[path = "tests/contention_not_now.rs"]
 mod contention_not_now;
 
+// The fork-preparation refusal script, like the native suite, is off macOS.
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "tests/fork_refusal_class.rs"]
+mod fork_refusal_class;
+
 #[cfg(test)]
 #[path = "tests/x86_switch_in_binding.rs"]
 mod x86_switch_in_binding;
