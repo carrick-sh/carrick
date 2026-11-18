@@ -221,11 +221,13 @@ On the arm64 runner (`#[cfg(all(target_arch = "aarch64", target_os = "linux"))]`
 - I-cache publication: a published function is rewritten at the same address
   and must return the new value (`carrick-host-jit`).
 - Boot probe: the production EL1 image is entered at `carrick_el1_syscall`
-  the way the loader's vector code enters it: EL1h, x0 = a trap frame for an
-  SVC from EL0, x30 = a return sentinel. It runs on flat memory (PT_LOAD
-  segments, a stack and the frame) under a block budget and prints
+  after a simulated vector handoff. It starts in EL1h with x0 pointing to an
+  EL0 SVC trap frame on slot zero's stack and x30 holding the return sentinel.
+  The probe loads the production stage-1 tables and vectors, programs the
+  bootstrap registers, and backs the image's EL1 region and initial metadata
+  extent. It runs under a block budget and prints
   `boots to PC=... after N blocks / fails at ...`. A diagnostic second pass
-  maps each faulting page as zero to show what comes next. The stage-1 walker
+  maps faulting physical pages as zero to show what comes next. The stage-1 walker
   (`carrick_mmu_core::aarch64::stage1_walk`, consumed through `mmu`) is in
   #2480; see `soft-aarch64-stage1-walker.md`.
 
