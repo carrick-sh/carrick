@@ -29,6 +29,8 @@ pub enum ForkError {
     Invalid,
     NoMemory,
     Busy,
+    /// A live parent edit superseded the snapshot consumed by this fork.
+    SnapshotMoved,
     Stale,
     /// Owner metadata backing must be supplied before publication can finish.
     MetadataRequired,
@@ -398,26 +400,24 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
         mut child: C,
         child_handle: El1MmHandle,
     ) -> Result<UnpublishedChild<B>, ForkError> {
-        // A parent descriptor, generation or operation sequence that moved
-        // since the prepare read it is another live thread of the parent's
-        // fault or edit: contention, and the fork reruns (#2441). `Stale`
-        // names only a broken invariant.
-        for (pa, before) in &self.scratch.reads {
-            if words.load(*pa).map_err(|_| ForkError::Core)? != *before {
-                return Err(ForkError::Busy);
-            }
-        }
+        // Check identity before interpreting a mismatch as a live edit.
         if self.request.parent_generation.raw() >= u64::MAX - 1
             || parent.incarnation() != self.request.operation.incarnation.get()
+            || child.is_admitted()
         {
             return Err(ForkError::Stale);
         }
         if parent.generation() != self.request.parent_generation
             || parent.operation_sequence() != self.request.operation.sequence.get()
         {
-            return Err(ForkError::Busy);
+            return Err(ForkError::SnapshotMoved);
         }
-        if !parent.fork_ready() || child.is_admitted() {
+        for (pa, before) in &self.scratch.reads {
+            if words.load(*pa).map_err(|_| ForkError::Core)? != *before {
+                return Err(ForkError::SnapshotMoved);
+            }
+        }
+        if !parent.fork_ready() {
             return Err(ForkError::Busy);
         }
         parent.reserve_fork_certificate(self.request)?;
@@ -458,18 +458,18 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
                                 Err(if result.is_err() {
                                     ForkError::Core
                                 } else {
-                                    ForkError::Busy
+                                    ForkError::SnapshotMoved
                                 })
                             }
                         }
                     }
-                    Ok(false) => Err(ForkError::Busy),
+                    Ok(false) => Err(ForkError::SnapshotMoved),
                     Err(_) => Err(ForkError::Core),
                 }
             } else {
                 match words.compare_exchange(edit.pa, edit.before, edit.after) {
                     Ok(true) => Ok(()),
-                    Ok(false) => Err(ForkError::Busy),
+                    Ok(false) => Err(ForkError::SnapshotMoved),
                     Err(_) => Err(ForkError::Core),
                 }
             };
