@@ -15,7 +15,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use carrick_el1_abi::{
-    EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_EXTENT_SIZE, EL1_STACK_GUARD_TABLES_BASE,
+    ContextGeneration, CurrentTask, DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE,
+    DELEGATED_STATE_GUEST, DelegatedOpenFile, EL1_CURRENT_TASKS_BASE, EL1_DYNAMIC_METADATA_BASE,
+    EL1_DYNAMIC_METADATA_EXTENT_SIZE, EL1_FD_MAP_BASE, EL1_OPEN_FILE_TABLE_BASE,
+    EL1_STACK_GUARD_TABLES_BASE, El1TaskId, FdMapSlot, HostObjectBinding, SnapshotGeneration,
     TrapFrame, is_el1_stack_guard, stack_slot_top,
 };
 use carrick_mem::arch_sysregs::{MAIR_EL1_BOOTSTRAP, SCTLR_EL1_BOOTSTRAP, TCR_EL1_BOOTSTRAP};
@@ -29,16 +32,20 @@ use carrick_mem::memory::{
     el1_vectors_bytes_mailbox_clock, stage1_carrier_maintenance_page_tables,
     stage1_hvpatch_page_tables, stage1_identity_page_tables,
 };
-use carrick_softcpu_aarch64::dispatch::{Report, Stop, run};
+use carrick_softcpu_aarch64::dispatch::{ExecuteBlock, Report, Stop, run};
 use carrick_softcpu_aarch64::handler::{Event, ExclusiveMonitor, GuestMemory, MemoryFault};
 use carrick_softcpu_aarch64::state::{
     CpuState, ExceptionLevel, InterruptMasks, ProgramCounter, RegisterValue, SavedPstate, Sctlr,
     StackPointer, StackSelect, SystemValue, VirtualAddress,
 };
-use carrick_softcpu_aarch64::translate::BlockLimits;
-use carrick_softcpu_aarch64::{Gpr, OperandRegister};
+use carrick_softcpu_aarch64::translate::{
+    BlockExit, BlockFrame, BlockLimits, ExitReason, InstructionClass, TranslatedBlock, frame,
+};
+use carrick_softcpu_aarch64::{ExceptionKind, Gpr, OperandRegister};
 use carrick_softcpu_aarch64_host::{HostBlockRunner, HostError};
-use std::collections::BTreeMap;
+use core::num::NonZeroU64;
+use core::sync::atomic::Ordering;
+use std::collections::{BTreeMap, VecDeque};
 
 const PAGE: u64 = 4096;
 const INITIAL_METADATA_END: u64 =
@@ -501,10 +508,261 @@ fn production_el1_image_boots_past_trampoline_to_first_guest_hvc() {
     );
 }
 
+const MAX_RETIRED_BRANCHES: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetiredBranch {
+    from: u64,
+    to: u64,
+    lr: u64,
+    sp: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetiredSyscall {
+    pc: u64,
+    lr: u64,
+    sp: u64,
+    nr: u64,
+    args: [u64; 6],
+    ret: Option<i64>,
+}
+
+struct TracingRunner {
+    inner: HostBlockRunner,
+    branches: VecDeque<RetiredBranch>,
+    syscalls: Vec<RetiredSyscall>,
+    pending_svc: Option<RetiredSyscall>,
+    tpidr_writes: Vec<(u64, u64)>,
+}
+
+impl TracingRunner {
+    fn new() -> Result<Self, HostError> {
+        Ok(Self {
+            inner: HostBlockRunner::new()?,
+            branches: VecDeque::with_capacity(MAX_RETIRED_BRANCHES),
+            syscalls: Vec::new(),
+            pending_svc: None,
+            tpidr_writes: Vec::new(),
+        })
+    }
+
+    fn finish_pending(&mut self) {
+        if let Some(svc) = self.pending_svc.take() {
+            self.syscalls.push(svc);
+        }
+    }
+}
+
+impl ExecuteBlock for TracingRunner {
+    type Error = HostError;
+
+    fn execute(
+        &mut self,
+        block: &TranslatedBlock,
+        frame: &mut BlockFrame,
+    ) -> Result<usize, HostError> {
+        let start = block.guest().start().0;
+        if start < LINUX_EL0_TRAMPOLINE_BASE
+            && let Some(mut svc) = self.pending_svc.take()
+        {
+            svc.ret = Some(frame.slots[0] as i64);
+            self.syscalls.push(svc);
+        }
+        let exit_idx = self.inner.execute(block, frame)?;
+        if start < LINUX_EL0_TRAMPOLINE_BASE {
+            let sp = frame.slots[(frame::GUEST_SP / 8) as usize];
+            let lr = frame.slots[30];
+            match block.exits().get(exit_idx).copied() {
+                Some(BlockExit::Continue(target)) => {
+                    if let Some(term) = block.guest().terminator()
+                        && matches!(term.class(), InstructionClass::Branch(_))
+                        && target != block.guest().next_pc()
+                    {
+                        if self.branches.len() == MAX_RETIRED_BRANCHES {
+                            self.branches.pop_front();
+                        }
+                        self.branches.push_back(RetiredBranch {
+                            from: term.pc().0,
+                            to: target.0,
+                            lr,
+                            sp,
+                        });
+                    }
+                }
+                Some(BlockExit::Handler(ins)) => {
+                    if matches!(
+                        ins.class(),
+                        InstructionClass::Exit(ExitReason::Exception(ExceptionKind::Svc))
+                    ) {
+                        self.pending_svc = Some(RetiredSyscall {
+                            pc: ins.pc().0,
+                            lr,
+                            sp,
+                            nr: frame.slots[8],
+                            args: [
+                                frame.slots[0],
+                                frame.slots[1],
+                                frame.slots[2],
+                                frame.slots[3],
+                                frame.slots[4],
+                                frame.slots[5],
+                            ],
+                            ret: None,
+                        });
+                    } else if ins.word() & 0xffff_ffe0 == 0xd51b_d040 {
+                        // DDI0487G.a C6.2.196: MSR TPIDR_EL0, Xt (S3_3_C13_C0_2).
+                        let rt = (ins.word() & 31) as usize;
+                        let val = if rt == 31 { 0 } else { frame.slots[rt] };
+                        self.tpidr_writes.push((ins.pc().0, val));
+                    }
+                }
+                None => {}
+            }
+        }
+        Ok(exit_idx)
+    }
+}
+
+fn probe_traced(
+    cpu: &mut CpuState,
+    memory: &mut Pages,
+    runner: &mut TracingRunner,
+    budget: u64,
+) -> Report<HostError> {
+    let report = run(
+        cpu,
+        &mut ExclusiveMonitor::default(),
+        memory,
+        runner,
+        BlockLimits::default(),
+        budget,
+    );
+    runner.finish_pending();
+    report
+}
+
+#[repr(C, align(64))]
+struct AlignedRecord<const N: usize>([u8; N]);
+
+/// Populate a zero-valid `#[repr(C)]` ABI record through its typed atomic
+/// methods and write the resulting bytes into guest physical `Pages`.
+fn load_abi_record<T, const N: usize>(memory: &mut Pages, at: u64, init: impl FnOnce(&T)) {
+    assert_eq!(N, core::mem::size_of::<T>());
+    assert!(core::mem::align_of::<AlignedRecord<N>>() >= core::mem::align_of::<T>());
+    let mut buf = AlignedRecord([0u8; N]);
+    let ptr = buf.0.as_mut_ptr().cast::<T>();
+    // SAFETY: `AlignedRecord<N>` has size `size_of::<T>()` and >=64-byte
+    // alignment, and all-zero bytes are the initialized `::new()` state of
+    // `CurrentTask`, `DelegatedOpenFile`, and `FdMapSlot`. `ptr` derives
+    // mutable provenance over `buf.0`, and the shared borrow ends before
+    // `buf.0` is copied into `memory`.
+    unsafe { init(&*ptr) };
+    memory.load(at, &buf.0);
+}
+
+/// Admit slot 0's root task (`CurrentTask[0]`) and bind guest fds 0..=2 to the
+/// carrier's stdio streams (`FdMap` + `DelegatedOpenFile`), matching the minimum
+/// host publication `PendingFamilies::poll` / `file_write` authenticate before
+/// forwarding host-backed stdio crossings via `HVC #2`.
+fn admit_root_task_with_stdio(memory: &mut Pages) {
+    load_abi_record::<CurrentTask, { core::mem::size_of::<CurrentTask>() }>(
+        memory,
+        EL1_CURRENT_TASKS_BASE,
+        |task| {
+            task.mm.thread_generation.store(1, Ordering::Relaxed);
+            task.publish_host_loaded(1, ContextGeneration::new(NonZeroU64::new(1).unwrap()));
+            task.set(El1TaskId::from_linux_tid(1), SnapshotGeneration::INITIAL, 1);
+        },
+    );
+    for (fd, (flags, binding)) in [
+        (0u32, (DELEGATED_FLAG_READABLE, HostObjectBinding::STDIN)),
+        (1u32, (DELEGATED_FLAG_WRITABLE, HostObjectBinding::STDOUT)),
+        (2u32, (DELEGATED_FLAG_WRITABLE, HostObjectBinding::STDERR)),
+    ] {
+        let handle = fd + 1;
+        load_abi_record::<DelegatedOpenFile, { core::mem::size_of::<DelegatedOpenFile>() }>(
+            memory,
+            EL1_OPEN_FILE_TABLE_BASE
+                + u64::from(fd) * core::mem::size_of::<DelegatedOpenFile>() as u64,
+            |open| {
+                open.flags.store(flags, Ordering::Relaxed);
+                open.generation.store(1, Ordering::Relaxed);
+                open.bind_host_object(binding);
+                open.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
+            },
+        );
+        load_abi_record::<FdMapSlot, { core::mem::size_of::<FdMapSlot>() }>(
+            memory,
+            EL1_FD_MAP_BASE + u64::from(fd) * core::mem::size_of::<FdMapSlot>() as u64,
+            |slot| {
+                slot.set(1, fd, handle, 1);
+            },
+        );
+    }
+}
+
+fn complete_mailbox_syscall(memory: &mut Pages, return_value: i64) {
+    let mb = LINUX_SYSCALL_MAILBOX_BASE;
+    memory.load(
+        mb + core::mem::offset_of!(Aarch64SyscallMailbox, return_value) as u64,
+        &(return_value as u64).to_le_bytes(),
+    );
+    memory.load(
+        mb + core::mem::offset_of!(Aarch64SyscallMailbox, response_action) as u64,
+        &1u32.to_le_bytes(),
+    );
+    memory.load(
+        mb + core::mem::offset_of!(Aarch64SyscallMailbox, state) as u64,
+        &2u32.to_le_bytes(),
+    );
+}
+
+fn read_cstr(memory: &mut Pages, mut at: u64, max: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while out.len() < max {
+        let mut b = [0u8; 1];
+        if memory.read(VirtualAddress(at), &mut b).is_err() || b[0] == 0 {
+            break;
+        }
+        out.push(b[0]);
+        at += 1;
+    }
+    out
+}
+
+fn read_initial_stack_auxv(memory: &mut Pages, sp: u64) -> (u64, Vec<u8>, Vec<(u64, u64)>) {
+    let argc = read_u64(memory, sp);
+    let argv0_ptr = read_u64(memory, sp + 8);
+    let argv0 = read_cstr(memory, argv0_ptr, 64);
+    let mut cursor = sp + 8 * (1 + argc + 1);
+    while read_u64(memory, cursor) != 0 {
+        cursor += 8;
+    }
+    cursor += 8;
+    let mut auxv = Vec::new();
+    loop {
+        let a_type = read_u64(memory, cursor);
+        let a_val = read_u64(memory, cursor + 8);
+        cursor += 16;
+        if a_type == 0 {
+            break;
+        }
+        auxv.push((a_type, a_val));
+    }
+    (argc, argv0, auxv)
+}
+
 #[test]
 #[ignore = "requires production CARRICK_A64_ELF and the pinned arm64 musl rust-std target"]
 fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
-    use carrick_mem::{linux_abi::LinuxAarch64Hwcap, memory::AddressSpace};
+    use carrick_mem::{
+        linux_abi::{
+            LINUX_AT_HWCAP, LINUX_AT_PAGESZ, LINUX_AT_RANDOM, LINUX_AT_SYSINFO_EHDR,
+            LinuxAarch64Hwcap,
+        },
+        memory::AddressSpace,
+    };
     use std::process::Command;
 
     let elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
@@ -531,27 +789,133 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     std::fs::remove_file(out).expect("remove compiled musl hello");
 
     assert_eq!(field(&user_elf, 16, 2), 2, "musl hello must be ET_EXEC");
-    let (mut cpu, mut memory, entry) = enter_carrier_root(&elf, &user_elf);
-    let image = AddressSpace::load_elf_bytes(&user_elf)
-        .unwrap()
-        // DDI0487G.a FEAT_LSE: LDADD alone does not authorize advertising
-        // ATOMICS. Let libc select its baseline exclusive-load/store path.
-        .without_auxv_hwcap(LinuxAarch64Hwcap::ATOMICS)
-        .with_linux_initial_stack_at(["musl-hello"], [] as [&str; 0], LINUX_STACK_TOP, 4 * PAGE)
-        .unwrap();
-    let sp = image.initial_stack_pointer().unwrap();
-    let stack = image
-        .regions()
-        .iter()
-        .find(|r| r.start <= sp && sp < r.end)
-        .unwrap();
-    let (offset, bytes) = stack.shared_initialized_bytes();
-    memory.load(stack.start + offset, &bytes);
-    cpu.sp_el0 = StackPointer(sp);
+    let build_guest = || {
+        let (mut cpu, mut memory, entry) = enter_carrier_root(&elf, &user_elf);
+        let image = AddressSpace::load_elf_bytes(&user_elf)
+            .unwrap()
+            // DDI0487G.a FEAT_LSE: LDADD alone does not authorize advertising
+            // ATOMICS. Let libc select its baseline exclusive-load/store path.
+            .without_auxv_hwcap(LinuxAarch64Hwcap::ATOMICS)
+            // No vvar/vDSO pages are mapped in this carrier-root fixture.
+            .with_vdso_auxv(false)
+            .with_linux_initial_stack_at(["musl-hello"], [] as [&str; 0], LINUX_STACK_TOP, 4 * PAGE)
+            .unwrap();
+        let sp = image.initial_stack_pointer().unwrap();
+        let stack = image
+            .regions()
+            .iter()
+            .find(|r| r.start <= sp && sp < r.end)
+            .unwrap();
+        let (offset, bytes) = stack.shared_initialized_bytes();
+        memory.load(stack.start + offset, &bytes);
+        cpu.sp_el0 = StackPointer(sp);
+        (cpu, memory, entry, sp)
+    };
 
-    let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
-    let report = probe(&mut cpu, &mut memory, &mut runner, 1_000_000);
+    // 1. Mutation / pre-admission control: when CurrentTask[0] is unissued
+    // (all-zero), EL1 refuses every ring-owned syscall in-ring with -ENOSYS
+    // (-38): set_tid_address (96), then sanitize_standard_fds's ppoll (73),
+    // which causes std::rt::lang_start_internal to call musl abort() and fault
+    // on `strb wzr, [x0]` (FAR=0, ESR=0x92000047, mailbox.state=0).
+    let (mut unadmitted_cpu, mut unadmitted_mem, _, sp) = build_guest();
+    let (argc, argv0, auxv) = read_initial_stack_auxv(&mut unadmitted_mem, sp);
+    assert_eq!(argc, 1);
+    assert_eq!(argv0, b"musl-hello");
+    assert_eq!(
+        auxv.iter()
+            .find(|(k, _)| *k == LINUX_AT_PAGESZ)
+            .map(|(_, v)| *v),
+        Some(PAGE)
+    );
+    assert!(
+        auxv.iter()
+            .find(|(k, _)| *k == LINUX_AT_RANDOM)
+            .is_some_and(|(_, v)| *v != 0)
+    );
+    assert!(
+        auxv.iter()
+            .find(|(k, _)| *k == LINUX_AT_HWCAP)
+            .is_some_and(|(_, v)| *v & LinuxAarch64Hwcap::ATOMICS.bits() == 0)
+    );
+    assert!(
+        !auxv.iter().any(|(k, _)| *k == LINUX_AT_SYSINFO_EHDR),
+        "AT_SYSINFO_EHDR must not be advertised without mapped vDSO pages"
+    );
+
+    let mut unadmitted_trace = TracingRunner::new().expect("Linux arm64 host runner");
+    let unadmitted_report = probe_traced(
+        &mut unadmitted_cpu,
+        &mut unadmitted_mem,
+        &mut unadmitted_trace,
+        1_000_000,
+    );
     let mb = LINUX_SYSCALL_MAILBOX_BASE;
+    let unadmitted_state = read_u32(
+        &mut unadmitted_mem,
+        mb + core::mem::offset_of!(Aarch64SyscallMailbox, state) as u64,
+    );
+    println!(
+        "musl hello (unadmitted CurrentTask[0] control): {unadmitted_report}; ESR={:#x} ELR={:#x} FAR={:#x} TPIDR_EL0={:#x} mailbox.state={unadmitted_state}",
+        unadmitted_cpu.el1.esr.0,
+        unadmitted_cpu.el1.elr.0,
+        unadmitted_cpu.el1.far.0,
+        unadmitted_cpu.named.tpidrel0.0,
+    );
+    for (pc, val) in &unadmitted_trace.tpidr_writes {
+        println!("  unadmitted MSR TPIDR_EL0 @ {pc:#x} <= {val:#x}");
+    }
+    for (idx, sc) in unadmitted_trace.syscalls.iter().enumerate() {
+        println!(
+            "  unadmitted svc[{idx}]: pc={:#x} lr={:#x} nr={} args=[{:#x}, {:#x}, {:#x}, {:#x}] -> {:?}",
+            sc.pc, sc.lr, sc.nr, sc.args[0], sc.args[1], sc.args[2], sc.args[3], sc.ret
+        );
+    }
+    let tail_start = unadmitted_trace.branches.len().saturating_sub(16);
+    for br in unadmitted_trace.branches.iter().skip(tail_start) {
+        println!(
+            "  unadmitted el0 branch: {:#x} -> {:#x} (lr={:#x}, sp={:#x})",
+            br.from, br.to, br.lr, br.sp
+        );
+    }
+    assert_ne!(unadmitted_cpu.named.tpidrel0.0, 0);
+    assert!(!unadmitted_trace.tpidr_writes.is_empty());
+    let unadmitted_nrs: Vec<(u64, Option<i64>)> = unadmitted_trace
+        .syscalls
+        .iter()
+        .map(|s| (s.nr, s.ret))
+        .collect();
+    assert_eq!(
+        unadmitted_nrs,
+        vec![
+            (96, Some(-38)),
+            (73, Some(-38)),
+            (135, Some(-38)),
+            (130, Some(-38)),
+            (135, Some(-38)),
+            (135, Some(-38)),
+            (134, Some(-38)),
+            (130, Some(-38)),
+            (135, Some(-38)),
+        ],
+        "unadmitted root task must refuse ring-owned syscalls with -ENOSYS and trigger abort"
+    );
+    assert_eq!(
+        (
+            unadmitted_state,
+            unadmitted_cpu.el1.esr.0,
+            unadmitted_cpu.el1.far.0
+        ),
+        (0, 0x9200_0047, 0)
+    );
+
+    // 2. Admitted root task + stdio fds: set_tid_address (96) is still ignored
+    // by __init_tp (-38 without Aarch64NativeProcessService), and
+    // sanitize_standard_fds's ppoll([0, 1, 2], 3, {0, 0}, NULL, 8) (nr=73)
+    // reaches PendingFamilies::poll and forwards cleanly via HVC #2.
+    let (mut cpu, mut memory, entry, _) = build_guest();
+    admit_root_task_with_stdio(&mut memory);
+    let mut runner = TracingRunner::new().expect("Linux arm64 host runner");
+    let report = probe_traced(&mut cpu, &mut memory, &mut runner, 1_000_000);
     let state = read_u32(
         &mut memory,
         mb + core::mem::offset_of!(Aarch64SyscallMailbox, state) as u64,
@@ -564,25 +928,24 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
         &mut memory,
         mb + core::mem::offset_of!(Aarch64SyscallMailbox, native_nr) as u64,
     );
+    let args_off = mb + core::mem::offset_of!(Aarch64SyscallMailbox, args) as u64;
+    let nfds = read_u64(&mut memory, args_off + 8);
     let resume = read_u64(
         &mut memory,
         mb + core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc) as u64,
     );
     println!(
-        "musl hello entry {entry:#x}: {report}; ESR={:#x} ELR={:#x} FAR={:#x}; mailbox state={state} trap_kind={trap_kind} nr={nr} resume_pc={resume:#x}",
-        cpu.el1.esr.0, cpu.el1.elr.0, cpu.el1.far.0
+        "musl hello entry {entry:#x}: {report}; ESR={:#x} ELR={:#x} FAR={:#x} TPIDR_EL0={:#x}; mailbox state={state} trap_kind={trap_kind} nr={nr} nfds={nfds} resume_pc={resume:#x}",
+        cpu.el1.esr.0, cpu.el1.elr.0, cpu.el1.far.0, cpu.named.tpidrel0.0
     );
-    if state == 0 && cpu.el1.esr.0 == 0x0200_0000 {
-        // The ELF loads at its identity-mapped VAs in this fixture.
-        let mut bytes = [0; 4];
-        if memory
-            .read(VirtualAddress(cpu.el1.elr.0), &mut bytes)
-            .is_ok()
-        {
-            println!("  undefined guest word {:#010x}", u32::from_le_bytes(bytes));
-        }
+    for (idx, sc) in runner.syscalls.iter().enumerate() {
+        println!(
+            "  admitted svc[{idx}]: pc={:#x} lr={:#x} nr={} args=[{:#x}, {:#x}, {:#x}, {:#x}] -> {:?}",
+            sc.pc, sc.lr, sc.nr, sc.args[0], sc.args[1], sc.args[2], sc.args[3], sc.ret
+        );
     }
     assert!(memory.read_boot_root);
+    assert_ne!(cpu.named.tpidrel0.0, 0);
     assert!(
         matches!(
             report.stop,
@@ -591,4 +954,74 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
         "{report}"
     );
     assert_eq!((state, trap_kind, cpu.el1.esr.0), (1, 1, 0x5600_0000));
+    assert_eq!(
+        (nr, nfds),
+        (73, 3),
+        "expected first carrier crossing to be SYS_ppoll on stdio [0, 1, 2]"
+    );
+    assert_eq!(
+        runner
+            .syscalls
+            .iter()
+            .map(|s| (s.nr, s.ret))
+            .collect::<Vec<_>>(),
+        vec![(96, Some(-38)), (73, None)]
+    );
+
+    // 3. Diagnostic continuation past SYS_ppoll=0: sanitize_standard_fds
+    // succeeds, and lang_start_internal immediately invokes signal(SIGPIPE,
+    // SIG_IGN) -> rt_sigaction(13, ...) (nr=134), which refuses in-ring (-38)
+    // without shared-carrier Aarch64NativeProcessService custody and forwards
+    // the diagnostic write on stderr (fd=2) via HVC #2.
+    complete_mailbox_syscall(&mut memory, 0);
+    let after_ppoll = probe_traced(&mut cpu, &mut memory, &mut runner, 1_000_000);
+    let next_state = read_u32(
+        &mut memory,
+        mb + core::mem::offset_of!(Aarch64SyscallMailbox, state) as u64,
+    );
+    let next_trap = read_u32(
+        &mut memory,
+        mb + core::mem::offset_of!(Aarch64SyscallMailbox, trap_kind) as u64,
+    );
+    let next_nr = read_u64(
+        &mut memory,
+        mb + core::mem::offset_of!(Aarch64SyscallMailbox, native_nr) as u64,
+    );
+    let next_fd = read_u64(&mut memory, args_off);
+    let next_buf = read_u64(&mut memory, args_off + 8);
+    let next_len = read_u64(&mut memory, args_off + 16);
+    let mut stderr_msg = vec![0u8; (next_len as usize).min(256)];
+    if next_nr == 64 {
+        let _ = memory.read(VirtualAddress(next_buf), &mut stderr_msg);
+    }
+    println!(
+        "musl hello after ppoll=0: {after_ppoll}; mailbox state={next_state} trap_kind={next_trap} nr={next_nr} fd={next_fd} len={next_len} stderr={:?}",
+        String::from_utf8_lossy(&stderr_msg)
+    );
+    for (idx, sc) in runner.syscalls.iter().skip(2).enumerate() {
+        println!(
+            "  post-ppoll svc[{}]: pc={:#x} lr={:#x} nr={} args=[{:#x}, {:#x}, {:#x}, {:#x}] -> {:?}",
+            idx + 2,
+            sc.pc,
+            sc.lr,
+            sc.nr,
+            sc.args[0],
+            sc.args[1],
+            sc.args[2],
+            sc.args[3],
+            sc.ret
+        );
+    }
+    assert_eq!((next_state, next_trap, cpu.el1.esr.0), (1, 1, 0x5600_0000));
+    assert!(
+        runner
+            .syscalls
+            .iter()
+            .any(|s| s.nr == 134 && s.args[0] == 13 && s.ret == Some(-38)),
+        "expected rt_sigaction(SIGPIPE) to refuse with -ENOSYS without shared carrier process custody"
+    );
+    assert!(
+        matches!(next_nr, 64 | 66) && next_fd == 2,
+        "expected stderr write/writev after SIGPIPE reset refusal, got nr={next_nr} fd={next_fd}"
+    );
 }

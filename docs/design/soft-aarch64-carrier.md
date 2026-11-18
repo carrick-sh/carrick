@@ -270,31 +270,48 @@ CPU gaps before `main`'s `write`/`writev` syscall:
 Per `AGENTS.md` ("Fix in shared layers; move code, never copy it"):
 
 - **`crates/carrick-softcpu-aarch64`** (`no_std`, pure ISA):
-  `IcOperation` (`Ialluis`, `Iallu`, later `Ivau`), `DcOperation::Zva`,
+  `IcOperation` (`Ialluis`, `Iallu`, `Ivau`), `DataCacheZero`,
   `NamedSystemRegister::Nzcv` / `DczidEl0` / `CtrEl0`, `V0..V31` state +
   `BlockFrame` layout + `MemoryRegister::Vector` handler + AdvSIMD `Verbatim`
-  classification, and the virtual timer + per-CPU GICv3 `ICC_*` state machine.
-- **`crates/carrick-aarch64`** (shared AArch64 VMM/carrier layer):
-  1. Move `decode_el0_sys64_read` / `El0SysRegRead` out of
-     `crates/carrick-vmm-hvf/src/trap/sysreg.rs:49-71` into `carrick-aarch64` so
-     HVF, `Aarch64EngineCore` (`engine.rs:2608-2615`), and soft-aarch64 share one
-     decoder.
-  2. Extract an AArch64 stopped-CPU carrier seam (`El1CarrierCpu` /
-     `El1CarrierMemory` / `El1BootstrapCustody`, mirroring
-     `crates/carrick-x86-cpl0-host/src/carrier_cpu.rs` and `carrier_memory.rs`)
-     that owns `StagedCpu::initial_root` construction, `call_el1_service`
-     (`hvc #7`), and stopped-CPU `hvc #6` dispatch over `carrick-hal::fork_stock`
-     and `carrick-hal::native_exec`, instead of duplicating
-     `carrick-vmm-hvf/src/metadata_grant.rs`.
-- **`crates/carrick-vmm-soft`** (existing VM-free soft carrier crate):
+  classification (adding `MOVI` 64-bit zero immediate C7.2.192 `0x6f00_e400`
+  reached at `0x41f14c` in `std::rt::lang_start_internal`), and the virtual
+  timer + per-CPU GICv3 `ICC_*` state machine.
+- **`crates/carrick-aarch64`** (shared AArch64 VMM/carrier layer — **Step (a)
+  extraction PR**):
+  `carrick-aarch64` already owns `Aarch64EngineCore` (`engine.rs`),
+  `run_el1_service_call_on` / `EL1_SERVICE_CALL_RETURN` (`hvc #7` at
+  `engine.rs:184-294`), `MM_PORTAL_*` staging/grant/bind/service/fork
+  (`engine.rs:5617-9805`, `user_transfer.rs`, `fork.rs`), `Stage1Authority`
+  (`stage1_authority.rs`), and `Aarch64Exit` (`vmm.rs:54-133`). Three host-OS
+  neutral pieces remain gated inside `carrick-vmm-hvf` and move here:
+  1. Move `El0SysRegRead` + `decode_el0_sys64_read` from
+     `crates/carrick-vmm-hvf/src/trap/sysreg.rs:49-71` (with unit tests at
+     `crates/carrick-vmm-hvf/src/trap/thread_sibling_tests.rs:17-46`) into
+     `crates/carrick-aarch64/src/sysreg.rs`, and wire `Aarch64Exit::Sys64Read`
+     in `crates/carrick-aarch64/src/engine.rs:2608-2615`.
+  2. Extract stopped-CPU EL1 root boot & task/zone admission from
+     `crates/carrick-vmm-hvf/src/staged_cpu.rs:39-78` (`StagedCpu::initial_root`)
+     and `crates/carrick-vmm-hvf/src/trap/persistent_executor.rs:314-325, 977`
+     (retaining the 7 kernel control-hole spans, registering `EL1_IPC_BASE`,
+     admitting the root `ZoneTables` record + `ThreadLifecyclePage` /
+     `ThreadControlSlot` + `CurrentTask[0]`, and issuing the initial
+     `MM_PORTAL_GRANT_ESR` `hvc #7` service call).
+  3. Extract stopped-CPU `hvc #6` owner/metadata custody (`GRANT_OP_*` `1..=15`)
+     from `crates/carrick-vmm-hvf/src/metadata_grant.rs:2352-2537`
+     (`handle_metadata_grant_trap` and `metadata_grant/native_service.rs`)
+     parameterized over `&mut impl Aarch64Vcpu` + host ABI region custody rather
+     than `applevisor::vcpu::Vcpu`, reusing `carrick-hal::fork_stock` and
+     `carrick-hal::native_exec`.
+- **`crates/carrick-vmm-soft`** (existing VM-free soft carrier crate — **Step
+  (b) soft-aarch64 carrier PR**):
   widen `crates/carrick-vmm-soft/src/lib.rs:11` from `target_arch = "x86_64"` to
-  dispatch per host architecture (`#[cfg(target_arch = "x86_64")]` for CPL0 and
-  `#[cfg(target_arch = "aarch64")]` for EL1), binding `HostBlockRunner`
-  (`carrick-softcpu-aarch64-host`) + `SoftMmuMemory` (`carrick-softmmu` +
-  `Aarch64Walker`) to the shared `carrick-aarch64` EL1 carrier seam and hosting
-  `tests/soft_aarch64_hello.rs`. Do **not** create a parallel
-  `carrick-vmm-soft-aarch64` crate unless `carrick-x86-cpl0-host` vs
-  `carrick-aarch64` dependency isolation requires a thin feature split.
+  dispatch per host architecture (`#[cfg(all(target_arch = "x86_64", target_os = "linux"))]`
+  for CPL0 and `#[cfg(all(target_arch = "aarch64", target_os = "linux"))]` for
+  EL1), binding `HostBlockRunner` (`carrick-softcpu-aarch64-host`) +
+  `SoftMmuMemory` (`carrick-softmmu` + `Aarch64Walker`) to the shared
+  `carrick-aarch64` EL1 carrier seam and `SyscallDispatcher`, witnessed by
+  `crates/carrick-vmm-soft/tests/soft_aarch64_hello.rs` (`stdout == "hello, aarch64 world\n"`,
+  `exit == 0`). Do **not** create a parallel `carrick-vmm-soft-aarch64` crate.
 
 ### 2.5 Ordered M2 Slice Plan
 
@@ -395,3 +412,54 @@ only admits LDADD from that extension. The original probe reached an
 undefined `CAS` in the Rust runtime's outlined atomics after the musl CRT.
 The capability mask lets the same unmodified executable select its
 load-exclusive/store-exclusive path.
+
+### 3.4 M2-2b Musl `abort()` Root Cause and First-Carrier-Call Closure
+
+On head `b8d373eb2`, `production_el1_image_runs_static_musl_hello_to_first_carrier_call`
+ran 9,896 blocks and stopped at `PC = 0x2D_0001_0BD8` (`not_svc` `HVC #2` at
+`0x2D_0001_0BD4`, `mailbox.state = 0`) on an `EL0` stage-1 write translation
+fault in musl `abort()` (`ELR_EL1 = 0x43c744`: `strb wzr, [x0]`,
+`ESR_EL1 = 0x9200_0047`, `FAR_EL1 = 0x0`). Sysroot `llvm-objdump` disassembly
+and the retired-block `TracingRunner` ring in `boot_probe.rs` establish the
+exact sequence:
+
+1. **Musl CRT and TLS initialization succeed completely**: `_start` (`0x4047b0`)
+   -> `__libc_start_main` (`0x43c5e8`) -> `__init_libc` (`0x43c394`) parses
+   `auxv` (`AT_PAGESZ = 4096`, non-zero `AT_RANDOM`, `AT_HWCAP` without
+   `ATOMICS`; `.with_vdso_auxv(false)` removes the unmapped `AT_SYSINFO_EHDR`
+   entry), initializes static TLS, and writes `TPIDR_EL0` via
+   `__set_thread_area` (`0x444028`). Execution enters Rust `main` (`0x404a4c`)
+   -> `std::rt::lang_start_internal` (`0x41eef0`), where `mrs TPIDR_EL0` and the
+   LL/SC `__aarch64_cas8_relax` (`0x449be0`) assign `ThreadId = 1`.
+2. **Root cause — unissued `CurrentTask[0]` in `enter_carrier_root`**:
+   `enter_carrier_root` zero-filled `EL1_CURRENT_TASKS_BASE` (`0x2D_04B0_0000`),
+   so `pending.binding()` returned `None` and
+   `carrick_personality_linux::dispatch::dispatch`
+   (`crates/carrick-personality-linux/src/dispatch.rs:1835-1859`) evaluated
+   `HostCrossingSet::Aarch64` (`strict = true`) directly, refusing every
+   ring-owned syscall in-ring with `-38` (`-ENOSYS`) and returning via `eret`
+   without exiting to the carrier:
+   - `svc[0]`: `set_tid_address` (`nr = 96` at `0x442ca0` in `__init_tp`) ->
+     `-38` (stored into `self->tid` and ignored by musl `__init_tp`).
+   - `svc[1]`: `ppoll([0, 1, 2], 3, {0, 0}, NULL, 8)` (`nr = 73` at `0x442304`,
+     called from `lang_start_internal`'s `sanitize_standard_fds` at `0x41efa4`)
+     -> `-38`; `lang_start_internal` checks `errno > 22` (`EINVAL`) at
+     `0x41efc0..0x41efc4` and calls `bl 0x43c6d0 <abort>` at `0x41f358`
+     (`LR = 0x41f35c`).
+   - `svc[2..=8]`: inside `abort()`, 7 signal/thread syscalls
+     (`135, 130, 135, 135, 134, 130, 135`) all return `-38` in-ring, reaching
+     `abort()`'s fallback `0x43c744: strb wzr, [x0]`.
+3. **Harness fix and shared-carrier boundary**: publishing an issued root
+   `CurrentTask[0]` (`SnapshotGeneration::INITIAL`, `file_table = 1`) and
+   host-bound stdio `0..=2` (`FdMapSlot` + `DelegatedOpenFile` with
+   `HostObjectBinding::{STDIN, STDOUT, STDERR}`) in `boot_probe.rs` routes
+   `ppoll` (`nr = 73`) through `PendingFamilies::poll` and stops cleanly at the
+   first guest-visible carrier call (`HVC #2` at `0x2D_0001_0B3C`,
+   `cpu.pc = 0x2D_0001_0B40`, `mailbox.state = 1`, `trap_kind = 1`,
+   `native_nr = 73`, `ESR_EL1 = 0x5600_0000`). Completing `ppoll = 0` via the
+   mailbox advances past `sanitize_standard_fds` to `signal(SIGPIPE, SIG_IGN)`
+   (`rt_sigaction` `nr = 134` at `0x41f138`), which requires the shared
+   carrier's `Aarch64NativeProcessService` (`ZoneTables` +
+   `ThreadLifecyclePage`/`ThreadControlSlot` + `MM_PORTAL_*` + `HVC #6`/`#7`
+   custody in `crates/carrick-aarch64` + `crates/carrick-vmm-soft`, Section
+   2.4).
