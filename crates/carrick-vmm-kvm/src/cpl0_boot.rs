@@ -374,77 +374,7 @@ impl Cpl0Carrier {
         argv: &[String],
         env: &[String],
     ) -> Result<usize, TrapError> {
-        const PAGE: usize = 4096;
-        const MAX_BYTES: usize = X86_CPL0_INITIAL_EXTENT_MAX_SIZE as usize;
-        let mut image_pages = 0usize;
-        let mut initialized = 0usize;
-        for region in &image.regions {
-            let pages = usize::try_from((region.end - region.start) / PAGE as u64)
-                .map_err(|_| fail("initial image page count"))?;
-            image_pages = image_pages
-                .checked_add(pages)
-                .ok_or_else(|| fail("initial image pages"))?;
-            initialized = initialized
-                .checked_add(region.file_bytes.len())
-                .ok_or_else(|| fail("initial image bytes"))?;
-        }
-        let strings = argv
-            .iter()
-            .chain(env)
-            .try_fold(0usize, |sum, value| sum.checked_add(value.len()))
-            .ok_or_else(|| fail("initial argv/env bytes"))?;
-        let user_pages = image_pages
-            .checked_add(initial_stack_pages(image, argv, env)?)
-            .ok_or_else(|| fail("initial user pages"))?;
-        let table_pages = initial_table_grant_count(user_pages)
-            .ok_or_else(|| fail("initial table grant count"))?;
-        let grants = table_pages
-            .checked_add(user_pages)
-            .ok_or_else(|| fail("initial grant count"))?;
-        let string_count = argv
-            .len()
-            .checked_add(env.len())
-            .ok_or_else(|| fail("initial string count"))?;
-        let region_bytes = image
-            .regions
-            .len()
-            .checked_mul(size_of::<carrick_core_abi::X86InitialBootRegion>())
-            .ok_or_else(|| fail("initial region metadata"))?;
-        let string_bytes = string_count
-            .checked_mul(size_of::<carrick_core_abi::X86InitialBootString>())
-            .ok_or_else(|| fail("initial string metadata"))?;
-        let metadata = size_of::<carrick_core_abi::X86InitialBootRequest>()
-            .checked_add(region_bytes)
-            .and_then(|n| n.checked_add(string_bytes))
-            .and_then(|n| {
-                n.checked_add(
-                    grants.checked_mul(size_of::<carrick_core_abi::X86InitialBootGrant>())?,
-                )
-            })
-            .and_then(|n| {
-                n.checked_add(
-                    user_pages.checked_mul(size_of::<carrick_el1_abi::GuestMmuPublication>())?,
-                )
-            })
-            .and_then(|n| n.checked_add(initialized))
-            .and_then(|n| n.checked_add(strings))
-            .and_then(|n| n.checked_add(PAGE * 8)) // bounded alignment and argv terminators
-            .ok_or_else(|| fail("initial request capacity"))?;
-        let metadata_pages = metadata
-            .checked_add(PAGE - 1)
-            .ok_or_else(|| fail("initial metadata alignment"))?
-            / PAGE;
-        let total_pages = metadata_pages
-            .checked_add(grants)
-            .ok_or_else(|| fail("initial extent pages"))?;
-        let bytes = total_pages
-            .checked_mul(PAGE)
-            .and_then(|bytes| bytes.checked_add(anonymous_owner::prepare_table_working_bytes()?))
-            .ok_or_else(|| fail("initial extent size"))?;
-        if bytes > MAX_BYTES {
-            return Err(fail("initial image exceeds carrier memory budget"));
-        }
-        Ok(bytes)
+        carrick_x86_cpl0_host::cpl0_boot::initial_extent_bytes_for(image, argv, env)
     }
     pub fn physical_slot_count(&self) -> usize {
         self.custody.memory().slot_count()
