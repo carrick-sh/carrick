@@ -166,6 +166,45 @@ fn native_dispatch_delivers_wait_and_prefetch_traps() {
     }
 }
 
+#[test]
+fn native_svc_vector_returns_to_el0_and_wakes_one_wfe() {
+    const VECTOR: u64 = 0x4001_0400;
+    let mut memory = Flat::default();
+    // svc #7; wfe; movz x0, #7; wfe
+    memory.put_words(CODE, &[0xd40000e1, 0xd503205f, 0xd28000e0, 0xd503205f]);
+    // mrs x1, spsr_el1; mrs x2, elr_el1; eret
+    memory.put_words(VECTOR, &[0xd5384001, 0xd5384022, 0xd69f03e0]);
+    let mut cpu = CpuState::default();
+    cpu.pc = ProgramCounter(CODE);
+    cpu.pstate.nzcv = 10;
+    cpu.pstate.daif.0 = 5;
+    cpu.pstate.uao = true;
+    cpu.el1.vbar = VirtualAddress(VECTOR & !0x7ff);
+    cpu.el1.sctlr.0 = 1 << 18; // nTWE
+    let origin = cpu.pstate;
+    let (report, starts) = run_at(&mut cpu, &mut memory);
+    assert_eq!(
+        starts,
+        [CODE, VECTOR, VECTOR + 4, VECTOR + 8, CODE + 4, CODE + 8]
+    );
+    assert!(
+        matches!(
+            report.stop,
+            Stop::Event {
+                event: Event::Hint(carrick_softcpu_aarch64::Hint::Wfe),
+                ..
+            }
+        ),
+        "{report}"
+    );
+    assert_eq!(report.pc.0, CODE + 16);
+    assert_eq!(
+        [x(&cpu, 0), x(&cpu, 1), x(&cpu, 2)],
+        [7, 0xa080_0140, CODE + 4]
+    );
+    assert_eq!(cpu.pstate, origin);
+}
+
 // Arm ARM DDI0487G.a C6.2. The same words run through the translator and
 // directly as the body of an AAPCS64 leaf, giving an independent host result.
 const SNIPPET: [u32; 17] = [
