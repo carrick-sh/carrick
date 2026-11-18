@@ -124,6 +124,7 @@ impl ProductionMemberCpu for SoftCpuBackend {
     }
 
     fn run_guest(&mut self) -> Result<VcpuExit, TrapError> {
+        self.runner.refresh_memory()?;
         self.admit_current_root()?;
         let kick = self.kick.clone();
         let exit = self.runner.run(kick.as_ref().map(|kick| &*kick.0));

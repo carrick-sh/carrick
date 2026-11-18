@@ -1296,6 +1296,8 @@ pub mod anonymous_owner;
 #[path = "cpl0_exec.rs"]
 pub mod exec_service;
 
+pub mod retained_slots;
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,

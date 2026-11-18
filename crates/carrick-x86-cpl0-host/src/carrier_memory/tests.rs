@@ -52,7 +52,7 @@ fn retained_backings_follow_committed_slot_installs() {
         0x1000
     );
 
-    memory.install(&[installed.clone()]).unwrap();
+    memory.install(std::slice::from_ref(&installed)).unwrap();
     assert_eq!(memory.retained_backings().count(), 2);
     assert!(
         memory

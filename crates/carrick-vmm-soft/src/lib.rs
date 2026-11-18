@@ -28,5 +28,5 @@ pub use carrier::{
     soft_cpuid,
 };
 pub use cpu::{SoftBootVcpu, SoftCpuView, apply_boot_cpu_state};
-pub use memory::{SoftBackings, SoftCarrierMemory, SoftVm};
+pub use memory::{SoftCarrierMemory, SoftVm, publish_worker_backings};
 pub use probe::{BootExit, BootReport, ProbeBind, ProbeImage, boot_probe};

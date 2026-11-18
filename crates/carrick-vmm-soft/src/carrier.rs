@@ -20,6 +20,7 @@ use carrick_x86::{SegmentDescriptor, SegmentDpl, X86Reg, X86Seg, X86Vcpu};
 use carrick_x86_cpl0_host::carrier_cpu::{
     CarrierChildBindings, CarrierCpu, OwnedCpuIo, claim_carrier_cpu_io,
 };
+use carrick_x86_cpl0_host::cpl0_boot::retained_slots::RetainedCarrierSlots;
 use carrick_x86_cpl0_host::cpl0_boot::{
     BINDING_OFFSET, BootCpuState, BootMemory, BootstrapCustody, Cpl0BootCarrier, KernelEntry,
     LAYOUT, META_GPA, PreparedBoot, ProductionWorkerParts, ROUTES_OFFSET, fail,
@@ -28,7 +29,7 @@ use carrick_x86_cpl0_host::cpl0_boot::{
 
 use crate::backend::{SoftCpuBackend, SoftRunContext};
 use crate::cpu::{SoftBootVcpu, SoftCpuView, apply_boot_cpu_state};
-use crate::memory::{SoftBackings, SoftCarrierMemory, SoftVm};
+use crate::memory::{SoftCarrierMemory, SoftVm};
 
 /// Soft TSC frequency published to the CPUID view and the CPU binding.
 pub const SOFT_TSC_HZ: u64 = 2_000_000_000;
@@ -143,6 +144,16 @@ impl SoftRunner {
         &mut self.machine
     }
 
+    pub(crate) fn refresh_memory(&mut self) -> Result<(), TrapError> {
+        let (cpu, memory) = self.machine.parts_mut();
+        if memory.refresh()? {
+            // Includes the execute plane. Cached blocks re-authenticate
+            // the mapped frame and its code generation on their next entry.
+            cpu.context_mut().flush_tlb();
+        }
+        Ok(())
+    }
+
     /// Run to the next carrier exit (port I/O or `HLT`). `None` is a stop
     /// without one, recorded in [`SoftRunTrace::stop`]; a `kicked` flag
     /// raised before a block stops the run as [`SoftStop::Kicked`].
@@ -210,14 +221,13 @@ impl SoftRunner {
 }
 
 /// A stopped soft CPL0 carrier. The machine's memory view retains its own
-/// `Arc` of every backing it places ([`SoftBackings`]), so it never
+/// `Arc` of every backing it places, so it never
 /// depends on this carrier's custody for liveness.
 pub struct SoftCarrier {
     runner: SoftRunner,
     custody: BootstrapCustody<SoftVm>,
     entry: u64,
     /// The backings every soft CPU of this carrier places.
-    backings: SoftBackings,
     /// The stopped boot state of physical slot 1, programmed onto the
     /// worker hand-off's second soft CPU.
     peer: BootCpuState,
@@ -257,20 +267,7 @@ impl SoftCarrier {
             false,
             image.initial_extent_bytes,
         )?;
-        let mut extents: Vec<_> = prepared
-            .ipc_backings
-            .iter()
-            .map(|backing| Arc::clone(&backing.extent))
-            .collect();
-        for handle in kernel_region
-            .into_iter()
-            .chain(initial_extent.map(|(handle, _)| handle))
-        {
-            let backing = memory
-                .backing(handle)
-                .map_err(|error| fail(error.to_string()))?;
-            extents.push(Arc::clone(&backing.extent));
-        }
+        SoftVm::publish_backings(RetainedCarrierSlots::new(&memory)?)?;
         let PreparedBoot {
             ram,
             plan,
@@ -279,11 +276,8 @@ impl SoftCarrier {
             kernel_pod_storage,
             ..
         } = prepared;
-        let backings = SoftBackings::new(Arc::clone(&ram), extents);
         let cpuid = soft_cpuid();
-        // SAFETY: `install_boot_memory` made every registration in `vm`
-        // through its `CarrierMemory`, whose backings are `backings`.
-        let view = unsafe { SoftCarrierMemory::new(&vm, LAYOUT.pml4_base, backings.clone()) }?;
+        let view = SoftCarrierMemory::new(&vm, LAYOUT.pml4_base)?;
         let mut machine = SoftMachine::new(view, Box::new(cpuid))
             .map_err(|error| fail(format!("soft CPU: {error:?}")))?;
         let slot = carrick_guest_arch::CpuId::new(0);
@@ -339,7 +333,6 @@ impl SoftCarrier {
                 kernel_pod_storage,
             )?,
             entry: plan.entry,
-            backings,
             peer,
             hardware_interrupts,
             production,
@@ -394,15 +387,7 @@ impl SoftCarrier {
             .maintenance_root()
             .ok_or_else(|| fail("soft production run has no maintenance root"))?;
         let cpuid = soft_cpuid();
-        // SAFETY: the custody's `CarrierMemory` made every registration in
-        // its `SoftVm`, over the backings recorded at boot.
-        let view = unsafe {
-            SoftCarrierMemory::new(
-                self.custody.memory().vm(),
-                LAYOUT.pml4_base,
-                self.backings.clone(),
-            )
-        }?;
+        let view = SoftCarrierMemory::new(self.custody.memory().vm(), LAYOUT.pml4_base)?;
         let mut peer = SoftMachine::new(view, Box::new(cpuid))
             .map_err(|error| fail(format!("soft peer CPU: {error:?}")))?;
         apply_boot_cpu_state(
