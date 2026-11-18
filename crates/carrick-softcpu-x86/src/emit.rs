@@ -401,13 +401,16 @@ fn emit_rewritten_mem_op(
         });
     }
     let virt = begin_virt_r14_r15(out, &mut rewritten, info_factory, false);
-    let high_byte = begin_high_byte_stand_in(out, &mut rewritten, info_factory);
+    // Rebase before choosing a high-byte stand-in: the original base and
+    // index address nothing once R14 holds the translated address, so they
+    // are free stand-in candidates.
     rewritten.set_segment_prefix(Register::None);
     rewritten.set_memory_base(Register::R14);
     rewritten.set_memory_index(Register::None);
     rewritten.set_memory_index_scale(1);
     rewritten.set_memory_displacement64(0);
     rewritten.set_memory_displ_size(0);
+    let high_byte = begin_high_byte_stand_in(out, &mut rewritten, info_factory);
 
     encode_one(out, &rewritten, va)?;
     if let Some(stand_in) = high_byte {
