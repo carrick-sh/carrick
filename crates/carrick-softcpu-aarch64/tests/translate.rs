@@ -714,3 +714,28 @@ fn misaligned_block_and_span_do_not_fetch_across_a_code_page() {
         assert!(split_span(pc, &[0xd503_201f], BlockLimits::default()).is_empty());
     }
 }
+
+#[test]
+fn musl_simd_copy_decodes_only_allocated_register_forms() {
+    // DDI0487G.a C4.1 SIMD copy, DUP (general) and UMOV.
+    for word in [
+        0x4e01_0c20, // dup v0.16b, w1
+        0x4e08_3c01, // umov x1, v0.d[0]
+        0x4e18_3fff, // umov xzr, v31.d[1]
+    ] {
+        assert_eq!(class(word), InstructionClass::Copy(CopyKind::Verbatim));
+    }
+    for word in [
+        0x4e00_0c20, // DUP with imm5=0: undefined
+        0x0e08_0c20, // DUP with Q=0 and a 64-bit element: undefined
+        0x0e08_3c01, // UMOV with Q=0 and a 64-bit element: undefined
+        0x4e04_3c01, // UMOV with Q=1 and a 32-bit element: undefined
+        0x4e20_1c00, // AND vector, outside this CRT subset
+        0x3d80_0000, // STR Q0, [X0] must use guest memory
+    ] {
+        assert!(
+            matches!(class(word), InstructionClass::Exit(_)),
+            "{word:#x}"
+        );
+    }
+}
