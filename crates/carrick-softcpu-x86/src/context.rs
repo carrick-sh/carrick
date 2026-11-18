@@ -565,6 +565,14 @@ fn host_clflush_supported() -> bool {
     *SUPPORTED.get_or_init(discover_host_clflush)
 }
 
+// SAFETY: the context's only non-`Send` fields are per-block borrows:
+// `active_mem_ptr` (the memory seat of one `execute`) and the bounce
+// descriptors gated by `bounce_active`. `execute`'s guard clears both before
+// it returns, so a context that is not executing a block holds no live
+// borrow, and moving it to another thread moves only owned state. A block
+// runs on the thread that holds `&mut self` throughout.
+unsafe impl Send for SoftCpuContext {}
+
 impl SoftCpuContext {
     /// A context seated in `extents`' invalidation domain. Its TLB starts
     /// empty and the CPU starts parked.
