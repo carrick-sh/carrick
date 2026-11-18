@@ -81,6 +81,12 @@ snapshot bypasses placement and inventory work. The production CPL0
 anonymous-page witness reaches the owner grant, writes a newly backed
 page, reads it via the stdout crossing, and exits within the same block
 budget that the pre-fix fault loop exhausted.
+
+#671 M1-6 maintenance root: both soft worker views admit the
+carrier-published supervisor root before guest entry. The ring can switch
+to it without a carrier exit, so admitting stopped CR3 alone leaves the
+very next walk without an owner generation. This keeps the existing
+extent and page-table authentication for the maintenance walk.
 """
 
 [bindings]

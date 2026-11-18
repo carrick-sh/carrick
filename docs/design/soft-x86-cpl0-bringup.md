@@ -431,19 +431,23 @@ cargo test --locked -p carrick-vmm-soft --test soft_hello -- \
   production_ring_non_last_threads_raw_exit --ignored --exact
 ```
 
-- Fork boots through initial MM admission, root load, the root-fork seed
-  doorbell (`0xd9`) and three fork-stock doorbells (`0xd2`). It fails on the
-  first walk after `mov cr3` selects `0x480b000`, before child stdout. GDB
-  observed `ExtentTable::expected_generation` return `None` for that root.
-  The ring page fault escalates to a triple fault because exception delivery
-  also needs the newly selected root. A stopped backing refresh carries
-  placement only. The existing fork-stock owner must also publish the exact
-  authorized root before guest re-entry, and revoke it when retired. Reading
-  that authority requires a shared custody seam beyond the existing backing
-  iterator.
+- Before the fix, fork reached initial MM admission, root load, the
+  root-fork seed doorbell (`0xd9`) and three fork-stock doorbells (`0xd2`).
+  It triple-faulted on the first walk after `install_maintenance_root`
+  selected `0x480b000`, before child stdout. GDB observed
+  `ExtentTable::expected_generation` return `None` for that root. The soft
+  worker hand-off now admits the shared carrier's exact maintenance root
+  into both existing extent inventories before either worker starts. The
+  maintenance root is retained for the carrier lifetime. The same fixture
+  now walks the maintenance root and reaches `install_address_context` for
+  the fork child's CR3 (`0x480c000`). That root has no walker generation, so
+  the next walk still triple-faults before child stdout. Child-root
+  publication and retirement need the shared carrier's authority for the
+  exact adopted root. The stopped slot snapshot currently provides backing
+  placement alone.
 - Raw thread exit boots through initial MM admission, root load and two owner
   grants (`0xd1`). GDB observed the first `clone` and then 23 consecutive
   timer interrupts (`0xe0`) at the same user return RIP (`0x4010f9`). The
-  guest interval exceeds the watchdog deadline before worker exit or
-  clear-child-tid completion. The fix must preserve guest clock and IRQ
-  semantics while allowing the queued thread to run.
+  guest interval exceeds the debug watchdog deadline. An optimized host
+  build reaches the unchanged 4,000,000-block limit. Neither run proves
+  worker exit or clear-child-tid completion.
