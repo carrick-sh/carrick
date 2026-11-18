@@ -185,6 +185,7 @@ impl Vfs for ResolvConfVfs {
             path: path.to_string(),
             contents: self.contents.clone(),
             status_flags: 0,
+            origin: super::SyntheticOrigin::Blob,
         })
     }
 

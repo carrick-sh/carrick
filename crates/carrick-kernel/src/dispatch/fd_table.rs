@@ -1390,6 +1390,10 @@ pub(crate) enum OpenDescription {
         path: String,
         contents: Vec<u8>,
         offset: usize,
+        /// What `contents` is, as the mount (or the kernel) that built this
+        /// description typed it: the whole file, or the placeholder of a
+        /// live `/proc/<pid>/{mem,pagemap}` that only a task's read renders.
+        origin: carrick_vfs::SyntheticOrigin,
     },
     ProcExecutable {
         base: OpenDescriptionBase,
@@ -4507,6 +4511,7 @@ mod tests {
             path: "/mapped".into(),
             contents: vec![42],
             offset: 0,
+            origin: carrick_vfs::SyntheticOrigin::Blob,
         }));
         let description = kernel_file_description(Arc::clone(&backing), 0);
         description.retain_fd_ref();

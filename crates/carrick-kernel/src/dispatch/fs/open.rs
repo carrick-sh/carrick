@@ -1982,6 +1982,7 @@ impl<'a> FsView<'a> {
                 path,
                 contents,
                 status_flags,
+                origin,
             } => {
                 let status = ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC;
                 let open_file =
@@ -1990,6 +1991,7 @@ impl<'a> FsView<'a> {
                             path,
                             contents,
                             offset: 0,
+                            origin,
                             base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
                         })),
                         status,

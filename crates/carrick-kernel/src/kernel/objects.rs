@@ -4810,6 +4810,7 @@ mod tests {
                 path: "/projection".into(),
                 contents: b"source".to_vec(),
                 offset: 0,
+                origin: carrick_vfs::SyntheticOrigin::Blob,
             },
         ));
         let description =

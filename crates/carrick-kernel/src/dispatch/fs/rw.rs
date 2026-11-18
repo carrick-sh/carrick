@@ -1471,15 +1471,15 @@ impl<'a> FsView<'a> {
                     deliver_read(memory, address, bytes.len(), &bytes)
                 }
                 // A mount-served blob the venue opened (`/etc/resolv.conf`,
-                // `/etc/services`, #2418). A `/proc/<pid>/{mem,pagemap}`
-                // reads the caller's address space, which only a task has;
-                // the venue never opens one (`open_needs_caller_task`).
+                // `/etc/services`, #2418). A `ProcAddressSpace` description
+                // reads the caller's address space, which only a task has:
+                // it falls to the refusal below.
                 OpenDescription::SyntheticFile {
-                    path,
                     contents,
                     offset,
+                    origin: carrick_vfs::SyntheticOrigin::Blob,
                     ..
-                } if !crate::vfs::proc::is_proc_address_space_path(path) => {
+                } => {
                     let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
                     let read_len = remaining.len().min(length);
                     let outcome = deliver_read(memory, address, read_len, &remaining[..read_len])?;

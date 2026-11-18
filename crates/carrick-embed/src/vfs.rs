@@ -1324,6 +1324,7 @@ impl Vfs for FilterVfs {
                 path: p,
                 contents,
                 status_flags,
+                origin,
             } = handle
         {
             let transformed = (filter)(&p, contents);
@@ -1331,6 +1332,7 @@ impl Vfs for FilterVfs {
                 path: p,
                 contents: transformed,
                 status_flags,
+                origin,
             };
         }
         Ok(handle)

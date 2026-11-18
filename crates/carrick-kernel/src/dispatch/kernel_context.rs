@@ -947,6 +947,7 @@ mod tests {
                 path: "/inherited/file".to_owned(),
                 contents: Vec::new(),
                 offset: 0,
+                origin: carrick_vfs::SyntheticOrigin::Blob,
             })),
             crate::linux_abi::LINUX_O_RDONLY,
         );
@@ -1026,6 +1027,7 @@ mod tests {
                 path: "/post-fork/file".to_owned(),
                 contents: Vec::new(),
                 offset: 0,
+                origin: carrick_vfs::SyntheticOrigin::Blob,
             })),
             crate::linux_abi::LINUX_O_RDONLY,
         );

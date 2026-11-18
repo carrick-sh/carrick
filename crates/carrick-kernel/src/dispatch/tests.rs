@@ -5431,6 +5431,7 @@ mod hvpatch_in_process_fork_tests {
                 path: "/close-range-unshare".to_owned(),
                 contents: b"payload".to_vec(),
                 offset: 0,
+                origin: carrick_vfs::SyntheticOrigin::Blob,
             })),
             crate::linux_abi::LINUX_O_RDWR,
         );
@@ -5707,6 +5708,7 @@ mod hvpatch_in_process_fork_tests {
                 path: "/fork-clone".to_owned(),
                 contents: b"payload".to_vec(),
                 offset: 2,
+                origin: carrick_vfs::SyntheticOrigin::Blob,
             })),
             crate::linux_abi::LINUX_O_RDWR,
         );
@@ -6031,6 +6033,7 @@ mod hvpatch_in_process_fork_tests {
             path: "epoll-inherited-owner".to_owned(),
             contents: Vec::new(),
             offset: 0,
+            origin: carrick_vfs::SyntheticOrigin::Blob,
         }));
         let fd = dispatcher
             .install_fd_at_or_above(

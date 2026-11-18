@@ -403,6 +403,19 @@ pub trait VirtualConsoleDevice: Send + Sync + std::fmt::Debug {
     fn set_winsize(&self, winsize: carrick_abi::LinuxWinsize);
 }
 
+/// What an in-memory [`VfsHandle::Bytes`] (and the synthetic description the
+/// dispatcher builds from it) holds, as the mount that opened it typed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticOrigin {
+    /// `contents` is the whole file: any reader, with or without a task, is
+    /// served from it.
+    Blob,
+    /// The opener's own `/proc/<pid>/{mem,pagemap}`, typed by the proc mount.
+    /// `contents` is empty; a read renders the reader's address space, so
+    /// only a reader with a task may serve it.
+    ProcAddressSpace,
+}
+
 /// What a successful [`Vfs::open`] returns. Each variant carries just
 /// enough information for the dispatcher to construct its own private
 /// `OpenDescription` *without* the mount needing to know about that enum —
@@ -444,11 +457,12 @@ pub enum VfsHandle {
     },
     /// In-memory bytes. Used by ProcVfs/SysVfs for the synthetic
     /// `/proc/*` and `/sys/*` files; the dispatcher converts this to
-    /// an `OpenDescription::SyntheticFile`.
+    /// an `OpenDescription::SyntheticFile` of the same `origin`.
     Bytes {
         path: String,
         contents: Vec<u8>,
         status_flags: u32,
+        origin: SyntheticOrigin,
     },
     /// A pty end backed by a host fd. The dispatcher converts this to a
     /// `HostPipe` open-description tagged with `PtyRole` so the ioctl
@@ -516,13 +530,15 @@ impl PartialEq for VfsHandle {
                     path: p1,
                     contents: c1,
                     status_flags: s1,
+                    origin: o1,
                 },
                 Self::Bytes {
                     path: p2,
                     contents: c2,
                     status_flags: s2,
+                    origin: o2,
                 },
-            ) => p1 == p2 && c1 == c2 && s1 == s2,
+            ) => p1 == p2 && c1 == c2 && s1 == s2 && o1 == o2,
             (
                 Self::Pty {
                     host_fd: h1,
