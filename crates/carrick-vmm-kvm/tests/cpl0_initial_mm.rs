@@ -1961,6 +1961,150 @@ fn work_port_services_bound_tasks_on_loaded_and_idle_peer_lanes() {
         .settled();
 }
 
+/// #2532 x86 production witness: a live sibling is stopped at the physical
+/// boundary for a real native service while the leader's exit_group closes
+/// the process. Completing that exact retained service wakes the sibling
+/// into its captured entry. It must settle the old service owner and retire;
+/// before #2532 a newer entry saw that retained member wait and raised
+/// NativeServiceQuarantined. The shared host witnesses deterministically
+/// supply the observed newer mmap SVC and IRQ CarrierWork frame shapes.
+#[test]
+fn terminal_close_settles_a_retained_native_service_entry() {
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+
+    let elf = native_exit_fixture("native_terminal_service_entry.S");
+    let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
+    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let sibling_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let mut leader = factory.claim(0).expect("leader executor");
+    let mut sibling = factory.claim(1).expect("sibling executor");
+    let task = root.binding().task();
+    leader.cpu_mut().load(root).expect("load leader");
+
+    run_to_marker(&mut leader, task, 1, &factory);
+    factory
+        .fixture_pin_native_thread(sibling_tid, carrick_guest_arch::CpuId::new(1))
+        .expect("pin sibling on peer");
+
+    let mut retained_service = None;
+    for _ in 0..128 {
+        let exit = sibling
+            .fixture_run_idle_peer()
+            .expect("sibling native service entry");
+        match exit {
+            CarrierRunExit::PhysicalDoorbell {
+                port: carrick_x86::cpl0_entry::NATIVE_SERVICE_PORT,
+                ..
+            } => {
+                retained_service = Some(exit);
+                break;
+            }
+            exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
+                assert!(
+                    sibling
+                        .service_idle_peer_doorbell(&exit, |_, _| {})
+                        .expect("sibling setup service")
+                        .is_none()
+                );
+            }
+            CarrierRunExit::Kick => {}
+            CarrierRunExit::SyscallTrap => panic!("getrandom must use native service"),
+            other => panic!("unexpected sibling entry exit: {other:?}"),
+        }
+    }
+    let retained_service = retained_service.expect("retained native service boundary");
+
+    let leader_exit = leader
+        .fixture_run_loaded(task)
+        .expect("leader exit_group")
+        .exit;
+    assert!(
+        matches!(leader_exit, CarrierRunExit::PhysicalDoorbell { .. }),
+        "exit_group must close before its physical boundary: {leader_exit:?}"
+    );
+    assert!(
+        leader
+            .service_physical_doorbell(task, &leader_exit, |_, _| {})
+            .expect("leader terminal boundary")
+            .is_none(),
+        "the sibling still owns terminal settlement"
+    );
+
+    assert!(
+        sibling
+            .service_idle_peer_doorbell(&retained_service, |_, _| {})
+            .expect("complete cancelled native service")
+            .is_none()
+    );
+    let root_claim = factory
+        .fixture_native_wait_state(root_tid)
+        .expect("root terminal state")
+        .0;
+    let sibling_claim = factory
+        .fixture_native_wait_state(sibling_tid)
+        .expect("sibling terminal state")
+        .0;
+    assert!(
+        matches!(root_claim, carrick_sched_core::Claim::Parked { .. })
+            && matches!(
+                sibling_claim,
+                carrick_sched_core::Claim::OnCpu { slot, .. }
+                    if slot == carrick_sched_core::SlotId::new(1)
+            ),
+        "the retained owner resumes on its execution lane first: root={root_claim:?}, sibling={sibling_claim:?}"
+    );
+
+    let peer_process_exit = std::cell::Cell::new(None);
+    run_until_idle(
+        &factory,
+        carrick_guest_arch::CpuId::new(1),
+        || {
+            let exit = sibling
+                .fixture_run_idle_peer()
+                .unwrap_or_else(|error| panic!("retained service settlement: {error:?}"));
+            if matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }) {
+                peer_process_exit.set(
+                    sibling
+                        .service_idle_peer_doorbell(&exit, |_, _| {})
+                        .expect("terminal sibling service"),
+                );
+            }
+            exit
+        },
+        || peer_process_exit.get().is_some(),
+    );
+
+    let mut process_exit = peer_process_exit.get();
+    for _ in 0..128 {
+        if process_exit.is_some() {
+            break;
+        }
+        let exit = leader
+            .fixture_run_loaded(task)
+            .unwrap_or_else(|error| panic!("retained service settlement: {error:?}"))
+            .exit;
+        match exit {
+            exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
+                process_exit = leader
+                    .service_physical_doorbell(task, &exit, |_, _| {})
+                    .expect("terminal sibling service");
+                if process_exit.is_some() {
+                    break;
+                }
+            }
+            CarrierRunExit::Kick => {}
+            other => panic!("unexpected terminal sibling exit: {other:?}"),
+        }
+    }
+    assert_eq!(
+        process_exit,
+        Some(carrick_vmm_kvm::cpl0_boot::PhysicalProcessExit::Exited(
+            carrick_sched_core::process::TerminationStatus::exited(7)
+        )),
+        "exit_group status is published after the retained service owner settles"
+    );
+}
+
 fn peer_retirement(
     peer: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
 ) -> carrick_vmm_kvm::carrier_cpu::CarrierRunExit {
