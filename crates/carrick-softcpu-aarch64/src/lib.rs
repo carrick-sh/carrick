@@ -8,6 +8,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 mod closure {
     //! Remaining baseline leaves, hand-written from Arm ARM DDI0487G.a.
     use crate::Instruction;
@@ -1986,6 +1988,14 @@ mod instruction {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Gpr(u8);
     impl Gpr {
+        /// X0..X30; register 31 is SP or ZR by context, never a `Gpr`.
+        pub const fn new(number: u8) -> Option<Self> {
+            if number < 31 {
+                Some(Self(number))
+            } else {
+                None
+            }
+        }
         pub const fn number(self) -> u8 {
             self.0
         }
@@ -2319,3 +2329,4 @@ pub use instruction::{
 
 pub mod exception;
 pub mod state;
+pub mod translate;
