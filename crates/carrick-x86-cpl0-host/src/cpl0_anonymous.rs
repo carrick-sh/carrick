@@ -2250,11 +2250,19 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     ) -> Result<bool, TrapError> {
         use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
         let index = pending.execution.cpu.raw() as usize;
-        let receipt = reply.take_receipt(pending.window, &pending.txn);
+        let (receipt, trace) = reply
+            .take_receipt_with_trace(pending.window, &pending.txn)
+            .map_or((None, None), |(receipt, trace)| (Some(receipt), trace));
         if let Some(receipt) = &receipt
             && (receipt.id != pending.txn.id || receipt.digest != pending.txn.digest())
         {
             return Err(fail("owner grant receipt identity"));
+        }
+        if let Some(event) = trace.and_then(|trace| trace.event) {
+            carrick_hal::diagnostic_capture::trace_descriptor_diagnostic(
+                carrick_guest_arch::GuestIsa::X86_64,
+                event,
+            );
         }
         let undo = match receipt.as_ref().map(|receipt| &receipt.outcome) {
             Some(DescriptorOutcome::Applied(_)) => false,
@@ -2582,7 +2590,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let admission = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
             self._vm.admit_guest_edit(native)
         });
-        if !matches!(admission, Ok(Ok(()))) || !reply.submit(window, &txn) {
+        if !matches!(admission, Ok(Ok(())))
+            || !reply.submit_with_trace(
+                window,
+                &txn,
+                carrick_hal::diagnostic_capture::trace_grant_refusals(),
+            )
+        {
             // SAFETY: the vCPU is stopped, and no descriptor submission was
             // admitted. The fresh extent has never been guest-visible.
             unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }

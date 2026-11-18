@@ -262,6 +262,19 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
     let (window, grant, editor, authenticated) = target.into_parts();
     let mm = window.operation.mm;
     let claimed = slot.descriptor().claim_for_mm(mm.raw())?;
+    use carrick_mmu_core::live_descriptor_words::{GrantRefusalTrace, ObservedDescriptorWords};
+
+    let trace_requested = claimed.grant_trace_requested();
+    let trace = ::core::cell::Cell::new(GrantRefusalTrace::default());
+    let observe = |event| {
+        let mut sample = trace.get();
+        sample.record(event);
+        trace.set(sample);
+    };
+    let words = &ObservedDescriptorWords {
+        words,
+        observe: trace_requested.then_some(&observe as &dyn Fn(_)),
+    };
     let outcome = (|| {
         let Ok(txn) = claimed.txn() else {
             return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
@@ -365,6 +378,17 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
             inventory_revision: backing.inventory_revision.get(),
         };
         let Some(residency_slot) = residency.publish(identity) else {
+            if words.observe_residency_failure() {
+                words.descriptor_diagnostic(
+                    carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic::ResidencyRefused {
+                        mm_key: identity.mm_key,
+                        va: identity.semantic_base,
+                        len: identity.len,
+                        slots_used: residency.observed_slots_used(),
+                        slots_total: carrick_core_abi::mm::FRAME_GRANT_RESIDENCY_SLOTS,
+                    },
+                );
+            }
             return DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity);
         };
         let outcome = B::execute_grant(words, grant.ttbr0, txn);
@@ -373,11 +397,20 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
                 residency.record_commit(page);
             }
         } else {
+            if matches!(outcome, DescriptorOutcome::Refused(_)) {
+                words.descriptor_diagnostic(
+                    carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic::ResidencyPublishedBeforeRefusal,
+                );
+            }
             residency.retire(residency_slot, identity);
         }
         outcome
     })();
-    let receipt = claimed.complete(outcome, invalidate);
+    let receipt = claimed.complete_with_grant_trace(
+        outcome,
+        invalidate,
+        trace_requested.then(|| trace.get()),
+    );
     drop(editor);
     Some(receipt)
 }
