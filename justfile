@@ -861,6 +861,9 @@ test-kvm *ARGS:
         {{_cargo}} build --release \
         --manifest-path crates/carrick-vmm-bhyve/fixtures/hello-x86_64/Cargo.toml \
         --target x86_64-unknown-linux-musl
+    {{_admit}} {{_cargo}} test --locked -p carrick-vmm-soft --lib {{ARGS}}
+    {{_admit}} {{_cargo}} test --locked -p carrick-vmm-soft --test soft_hello {{ARGS}} -- \
+        production_ring_runs_musl_hello_to_exit_on_soft_cpu --exact --ignored
     {{_admit}} {{_cargo}} test --locked -p carrick-vmm-kvm --lib --bins {{ARGS}}
     # The x86 CPL0 host coordinator is Linux-only and its CPU/coordinator
     # modules are x86_64-only, so its VM-free lib tests run here, not in macOS
