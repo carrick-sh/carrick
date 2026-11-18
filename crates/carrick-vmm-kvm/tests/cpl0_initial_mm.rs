@@ -3974,6 +3974,60 @@ fn serial_host_root_loader_reads_stats_and_protects_through_the_ring() {
     assert!(!outcome.run.trap_limit_hit);
 }
 
+/// #2418: the run's injected `/etc/resolv.conf` read by the root on the
+/// production CPL0 path. The image ships its own file; the run's resolver
+/// snapshot replaces it, as Docker's bind mount does. The guest opens it,
+/// reads it, writes what it read to stdout, and a second read is end of file.
+/// Before the carrier read was served the open succeeded but the read was a
+/// counted ENOSYS (exit 11, -38). No in-test native oracle applies: the
+/// injection is Carrick's, and Docker's `--network host` oracle shows the
+/// same file semantics.
+#[test]
+fn serial_host_root_reads_the_injected_resolv_conf_over_the_images() {
+    let lower = tempfile::tempdir().expect("image root directory");
+    std::fs::create_dir(lower.path().join("etc")).expect("image /etc");
+    std::fs::write(
+        lower.path().join("etc/resolv.conf"),
+        b"nameserver 203.0.113.9\n",
+    )
+    .expect("image resolv.conf");
+    let rootfs = carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path())
+        .expect("immutable image rootfs");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_rootfs(rootfs);
+    dispatcher.set_host_resolver_snapshot(&carrick_vfs::HostResolverSnapshot::from_resolv_conf(
+        "nameserver 192.0.2.53\n",
+    ));
+    let elf = native_exit_fixture_with_flags("native_resolv_read.S", &[]);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        128,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .expect("production resolv.conf runtime");
+    let failed = outcome
+        .run
+        .stderr
+        .get(..8)
+        .map(|raw| i64::from_le_bytes(raw.try_into().expect("8 bytes")));
+    assert_eq!(
+        (outcome.run.exit_code, failed),
+        (0, None),
+        "exit is the failed step (10 open, 11 read, 12 write, 13 second read) \
+         and its result: {:?}",
+        outcome.run
+    );
+    let text = String::from_utf8(outcome.run.stdout.clone()).expect("resolv.conf text");
+    assert!(
+        text.lines().any(|line| line == "nameserver 192.0.2.53"),
+        "{text:?}"
+    );
+    assert!(!text.contains("203.0.113.9"), "{text:?}");
+    assert!(!outcome.run.trap_limit_hit);
+}
+
 /// Run one `native_ring_descriptors.S` mode on the production CPL0 path,
 /// after the native oracle exits 0 with it. Returns the guest's exit code
 /// (the failed step) and its nonzero refusal counters as (x86 nr, count).
