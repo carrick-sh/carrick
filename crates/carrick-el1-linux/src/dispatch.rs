@@ -3086,6 +3086,48 @@ fn native_service_fatal_reason(
             Quarantine::CompletionLifecycleOutcome => {
                 Fatal::NativeServiceQuarantinedCompletionLifecycleOutcome
             }
+            Quarantine::UserWriteMmCore => Fatal::NativeServiceQuarantinedUserWriteMmCore,
+            Quarantine::BirthControlResetUnclaim => {
+                Fatal::NativeServiceQuarantinedBirthControlResetUnclaim
+            }
+            Quarantine::BirthAffinityUnclaim => Fatal::NativeServiceQuarantinedBirthAffinityUnclaim,
+            Quarantine::BirthVisibleTidUnclaim => {
+                Fatal::NativeServiceQuarantinedBirthVisibleTidUnclaim
+            }
+            Quarantine::BirthRecordUnclaim => Fatal::NativeServiceQuarantinedBirthRecordUnclaim,
+            Quarantine::ForkPublicationAbort => Fatal::NativeServiceQuarantinedForkPublicationAbort,
+            Quarantine::BirthReservationRelease => {
+                Fatal::NativeServiceQuarantinedBirthReservationRelease
+            }
+            Quarantine::BirthMmSettle => Fatal::NativeServiceQuarantinedBirthMmSettle,
+            Quarantine::ChildGraphLookup => Fatal::NativeServiceQuarantinedChildGraphLookup,
+            Quarantine::ChildRegistryRegistration => {
+                Fatal::NativeServiceQuarantinedChildRegistryRegistration
+            }
+            Quarantine::ChildNativeOwnership => Fatal::NativeServiceQuarantinedChildNativeOwnership,
+            Quarantine::ChildRequeue => Fatal::NativeServiceQuarantinedChildRequeue,
+            Quarantine::SignalCompletionRoute => {
+                Fatal::NativeServiceQuarantinedSignalCompletionRoute
+            }
+            Quarantine::ForkLoanScrub => Fatal::NativeServiceQuarantinedForkLoanScrub,
+            Quarantine::ForkLoanAbort => Fatal::NativeServiceQuarantinedForkLoanAbort,
+            Quarantine::ExecPredecessorMm => Fatal::NativeServiceQuarantinedExecPredecessorMm,
+            Quarantine::ExecSuccessorMm => Fatal::NativeServiceQuarantinedExecSuccessorMm,
+            Quarantine::ExecPredecessorSpace => Fatal::NativeServiceQuarantinedExecPredecessorSpace,
+            Quarantine::ExecSuccessorSpace => Fatal::NativeServiceQuarantinedExecSuccessorSpace,
+            Quarantine::ExecPredecessorGrant => Fatal::NativeServiceQuarantinedExecPredecessorGrant,
+            Quarantine::ExecIdleRoot => Fatal::NativeServiceQuarantinedExecIdleRoot,
+            Quarantine::ExecSuccessorGrant => Fatal::NativeServiceQuarantinedExecSuccessorGrant,
+            Quarantine::ExecPortal => Fatal::NativeServiceQuarantinedExecPortal,
+            Quarantine::ExecRetiredSpaceDrain => {
+                Fatal::NativeServiceQuarantinedExecRetiredSpaceDrain
+            }
+            Quarantine::ForkPublishCore => Fatal::NativeServiceQuarantinedForkPublishCore,
+            Quarantine::ForkInvalidRootAbort => Fatal::NativeServiceQuarantinedForkInvalidRootAbort,
+            Quarantine::ForkReserveAbort => Fatal::NativeServiceQuarantinedForkReserveAbort,
+            Quarantine::ForkAbortScrub => Fatal::NativeServiceQuarantinedForkAbortScrub,
+            Quarantine::ForkAbortLoan => Fatal::NativeServiceQuarantinedForkAbortLoan,
+            Quarantine::ForkSettleCustody => Fatal::NativeServiceQuarantinedForkSettleCustody,
         },
         Error::NoChild => Fatal::NativeServiceNoChild,
         Error::OwnerWait(_) => Fatal::NativeServiceOwnerWait,
