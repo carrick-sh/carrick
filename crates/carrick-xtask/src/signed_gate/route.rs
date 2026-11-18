@@ -751,7 +751,31 @@ mod tests {
                 .contains("isn't being served")
         );
         // A job queued for only 5 min is not yet a stranding.
-        let jobs = [recent, job("", "queued", None, now - 300, m4)];
+        let jobs = [recent.clone(), job("", "queued", None, now - 300, m4)];
+        assert_eq!(availability("carrick-m4", &jobs, now), Ok(()));
+        // #2469: a Mac running another gate now isn't free. Routing to it would queue this
+        // gate behind that one (about 45 min) while another gate Mac sits idle, so prefer the
+        // shared label, even though that runs the base side again (about 23 min).
+        let jobs = [
+            recent.clone(),
+            job("carrick-m4", "in_progress", Some(now - 600), now - 700, m4),
+        ];
+        assert!(
+            availability("carrick-m4", &jobs, now)
+                .unwrap_err()
+                .contains("running another gate")
+        );
+        // Another Mac's in-progress gate doesn't make carrick-m4 busy.
+        let jobs = [
+            recent.clone(),
+            job(
+                "cloudmac-gate",
+                "in_progress",
+                Some(now - 600),
+                now - 700,
+                "x",
+            ),
+        ];
         assert_eq!(availability("carrick-m4", &jobs, now), Ok(()));
         // decide() falls back to the shared label when the Mac isn't available.
         let route = decide_one(
