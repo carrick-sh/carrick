@@ -173,8 +173,23 @@ On x86 (this VM and every CI lane):
 - Emitter: copy-through identity, rewritten immediates, relocated branch
   offsets, exact stub words, all hand-encoded from the Arm ARM and checked with
   `llvm-objdump` when `CARRICK_LLVM_OBJDUMP` is set.
-- Handlers: known answers from the Arm ARM pseudocode, plus mutation controls:
-  each documented one-line mutation must turn a named test red.
+- Handlers: known answers from the Arm ARM pseudocode. Apply each mutation
+  independently, run the named test in `carrick-softcpu-aarch64/tests/handler.rs`,
+  and restore the source before the next mutation. Each mutation below
+  compiles and fails its named test.
+
+  | File | One-line mutation | Test |
+  | --- | --- | --- |
+  | `handler.rs` | Replace the SPSel immediate arm's `if !el0` with `if false`. | `spsel_immediates_switch_the_active_stack_at_el1_only` |
+  | `handler.rs` | Replace the PAN immediate arm's `if !el0` with `if false`. | `pan_immediates_set_and_clear_at_el1_only` |
+  | `handler.rs` | Replace the UAO immediate arm's `if !el0` with `if false`. | `uao_immediates_set_and_clear_at_el1_only` |
+  | `handler.rs` | Replace the DAIF immediate trap condition with `if el0`. | `uma_allows_daif_immediates_at_el0` |
+  | `handler.rs` | Replace the AT arm's `if cpu.pstate.el == ExceptionLevel::El0` with `if false`. | `el1_at_requires_a_walk_and_el0_at_is_undefined` |
+  | `handler.rs` | Replace the AT arm's `\|\| !matches!(` with `\|\| false && !matches!(`. | `higher_el_tlbi_and_at_are_undefined_at_el1` |
+  | `handler.rs` | Replace the ERET error arm with `Err(_) => { next(cpu); Outcome::Continue },`. | `eret_and_hvc_are_undefined_at_el0` |
+  | `handler.rs` | Change HVC's exception to `Exception::Svc(immediate)`. | `eret_and_hvc_are_undefined_at_el0` |
+  | `state.rs` | Delete the access guard line for SP_EL0 with `StackSelect::El0`. | `sp_el0_sysreg_access_requires_the_el1_stack_bank` |
+  | `state.rs` | Replace the VBAR write's `VirtualAddress(v & !0x7ff)` with `VirtualAddress(v)`. | `vbar_el1_write_discards_res0_bits` |
 - Dispatcher: a `cfg(test)`-only `ExecuteBlock` double runs blocks of a small
   fixed instruction subset, only to test the dispatcher's exit mapping, PC
   continuation and stop reasons. It is never a product path.
