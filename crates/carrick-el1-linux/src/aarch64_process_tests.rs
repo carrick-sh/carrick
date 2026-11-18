@@ -3854,6 +3854,7 @@ fn fork_scratch_exhaustion_answers_enomem_and_returns_the_loan() {
 
 /// A production AArch64 fork entry whose next stock loan the carrier
 /// refuses with `refusal`.
+#[cfg(test)]
 fn fork_with_refused_loan(refusal: ForkStockRefusal) {
     let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {
@@ -3902,7 +3903,8 @@ fn fork_with_refused_loan(refusal: ForkStockRefusal) {
         "an Inventory loan reply is not now: the fork keeps its syscall, never EAGAIN"
     );
     assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
-    assert!(crossing.pending_loan.lock().unwrap().is_none());
+    let pending = crossing.pending_loan.lock().unwrap().is_some();
+    assert!(!pending, "the refused loan left no loan pending");
     assert!(
         fixture.zone.spaces.find(2).is_none(),
         "the refused loan opened no child space"
