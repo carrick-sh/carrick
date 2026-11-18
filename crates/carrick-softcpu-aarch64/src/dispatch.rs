@@ -390,6 +390,73 @@ mod tests {
     }
 
     #[test]
+    fn misaligned_pc_takes_priority_over_illegal_execution_state() {
+        for (el, sp, offset, mode) in [
+            (ExceptionLevel::El0, StackSelect::El0, 0x400, 0),
+            (ExceptionLevel::El1, StackSelect::El0, 0, 4),
+            (ExceptionLevel::El1, StackSelect::El1, 0x200, 5),
+        ] {
+            let mut cpu = el1();
+            cpu.pc = ProgramCounter(ENTRY + 2);
+            cpu.pstate.el = el;
+            cpu.pstate.sp = sp;
+            cpu.pstate.il = true;
+            let mut m = Flat::default();
+            m.code(VBAR + offset, &[0xd4000002]); // hvc #0
+            let r = go(&mut cpu, &mut m, &mut GuestSemantics, 1);
+            assert!(
+                matches!(
+                    r.stop,
+                    Stop::Event {
+                        event: Event::ProviderExit(_),
+                        ..
+                    }
+                ),
+                "{r}"
+            );
+            assert_eq!(cpu.el1.esr.0, 0x8a00_0000);
+            assert_eq!(cpu.el1.far.0, ENTRY + 2);
+            assert_eq!(cpu.el1.elr.0, ENTRY + 2);
+            assert_eq!(cpu.el1.spsr.0, (1 << 20) | mode);
+            assert!(!cpu.pstate.il);
+        }
+    }
+
+    #[test]
+    fn restored_il_takes_an_exception_before_the_next_guest_instruction() {
+        for (saved_mode, vector, expected_mode) in [
+            (1 << 20, 0x400, 0), // legal EL0t return with SPSR.IL set
+            (8, 0x200, 5),       // illegal EL2t return retains EL1h
+        ] {
+            let mut cpu = el1();
+            cpu.el1.spsr = crate::state::SavedPstate(saved_mode);
+            cpu.el1.elr = ProgramCounter(ENTRY + 4);
+            let mut m = Flat::default();
+            m.code(ENTRY, &[0xd69f03e0, 0xd28000e0]); // eret; movz x0, #7
+            m.code(VBAR + vector, &[0xd4000002]); // hvc #0
+            let r = go(&mut cpu, &mut m, &mut GuestSemantics, 2);
+            assert!(
+                matches!(
+                    r.stop,
+                    Stop::Event {
+                        event: Event::ProviderExit(_),
+                        ..
+                    }
+                ),
+                "{r}"
+            );
+            assert_eq!(cpu.el1.esr.0, 0x3a00_0000);
+            assert_eq!(cpu.el1.elr.0, ENTRY + 4);
+            assert_eq!(cpu.el1.spsr.0 & 0x10_001f, (1 << 20) | expected_mode);
+            assert_eq!(
+                cpu.read_operand(crate::OperandRegister::field(0, false)).0,
+                0
+            );
+            assert!(!cpu.pstate.il);
+        }
+    }
+
+    #[test]
     fn isb_retires_and_starts_a_new_dispatch_at_the_next_word() {
         let mut m = Flat::default();
         m.code(ENTRY, &[0xd503_3fdf, 0xd400_0002]); // isb; hvc #0
