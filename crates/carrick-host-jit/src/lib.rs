@@ -1,10 +1,13 @@
 //! `carrick-host-jit` — host executable memory for the soft CPUs' translated
 //! blocks, shared by every ISA (moved whole from `carrick-softcpu-x86`,
 //! #1236). Code is written while the mapping is RW and published RX; the
-//! mapping is never writable and executable at once.
+//! mapping is never writable and executable at once. Publication works on
+//! x86_64 and Linux arm64 hosts; every other host, macOS arm64 included, is
+//! refused with [`PublishError::UnsupportedHost`] (see `publish.rs`).
 
 mod publish;
 
+pub use publish::PublishError;
 use publish::publish_instructions;
 use std::ptr::NonNull;
 
@@ -67,7 +70,10 @@ impl JitCodeBuffer {
 
     /// Publish under W^X, returning an RX address only after mprotect succeeds.
     /// The owner must ensure no previously published code is executing while
-    /// this exclusive publication changes the mapping back to RW.
+    /// this exclusive publication changes the mapping back to RW. Returns
+    /// `None` on a host without instruction publication
+    /// ([`PublishError::UnsupportedHost`]): no address is ever handed out for
+    /// bytes this host has not made visible to instruction fetch.
     pub fn publish(&mut self, bytes: &[u8]) -> Option<u64> {
         #[cfg(any(test, feature = "test-hooks"))]
         if inject_small_jit_failure(self.capacity, true) {
@@ -96,9 +102,7 @@ impl JitCodeBuffer {
         // SAFETY: `self.cursor + bytes.len() <= self.capacity`.
         let dst = unsafe { self.ptr.as_ptr().add(self.cursor) };
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
-        if !publish_instructions(dst, bytes.len()) {
-            return None;
-        }
+        publish_instructions(dst, bytes.len()).ok()?;
         self.cursor += (bytes.len() + 15) & !15;
         // SAFETY: publication is complete and no mutable pointer escapes this owner.
         if unsafe {
@@ -130,6 +134,36 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
+    /// The publication cfg witness, macOS side: macOS arm64 has no native
+    /// publication in this crate (the HVF lane owns macOS JIT), so the leaf
+    /// refuses with the typed error and the buffer hands out no address. It
+    /// issues no cache maintenance and executes nothing.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn macos_arm64_refuses_publication_with_a_typed_error() {
+        let bytes = [0u8; 64];
+        assert_eq!(
+            publish_instructions(bytes.as_ptr(), bytes.len()),
+            Err(PublishError::UnsupportedHost)
+        );
+        let mut jit = JitCodeBuffer::new(4096).unwrap();
+        assert_eq!(jit.publish(&[1, 2, 3]), None);
+    }
+
+    /// The publication cfg witness, Linux side: both Linux hosts this crate
+    /// builds for (x86_64 and arm64) publish natively, so a cfg change that
+    /// drops either one from the native arms fails here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_hosts_publish_natively() {
+        let bytes = [0u8; 256];
+        assert_eq!(publish_instructions(bytes.as_ptr(), bytes.len()), Ok(()));
+    }
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "linux")
+    ))]
     #[test]
     fn publish_copies_at_aligned_cursor_and_refuses_bad_sizes() {
         let mut jit = JitCodeBuffer::new(4096).unwrap();
@@ -152,8 +186,8 @@ mod tests {
 
     /// The aarch64 publication witness: run a published function, rewrite it
     /// in place with a different constant and run it again. Executes only on
-    /// an arm64 host (the hosted ubuntu-24.04-arm job).
-    #[cfg(target_arch = "aarch64")]
+    /// a Linux arm64 host (the hosted ubuntu-24.04-arm job).
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     #[test]
     fn republished_code_at_the_same_address_runs_the_new_bytes() {
         /// MOVZ W0, #imm16 (C6.2.193, sf=0, hw=0); RET (C6.2.219).
