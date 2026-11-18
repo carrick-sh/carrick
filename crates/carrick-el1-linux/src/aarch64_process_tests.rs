@@ -323,6 +323,9 @@ struct TestStockCrossing {
     settlements_aborted: AtomicUsize,
     reserved_custody_rows: AtomicUsize,
     refuse_reserve: std::sync::Mutex<Option<ForkStockRefusal>>,
+    /// The next stock loan crossing's typed refusal, replied as the
+    /// carrier refuses a loan.
+    refuse_loan: std::sync::Mutex<Option<ForkStockRefusal>>,
     /// Runs once inside the next fork's stock loan crossing: the forking
     /// caller still holds its birth reservation, as a real vCPU's synchronous
     /// crossing does while sibling vCPUs keep running.
@@ -425,6 +428,7 @@ impl TestStockCrossing {
             settlements_aborted: AtomicUsize::new(0),
             reserved_custody_rows: AtomicUsize::new(0),
             refuse_reserve: std::sync::Mutex::new(None),
+            refuse_loan: std::sync::Mutex::new(None),
             on_loan: std::sync::Mutex::new(None),
             on_commit: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -655,6 +659,10 @@ impl ForkStockCrossing for TestStockCrossing {
                 }
                 let loans = self.loans_requested.fetch_add(1, Ordering::AcqRel) + 1;
                 let exchange = unsafe { &mut *(record_gpa as *mut ForkStockExchange) };
+                if let Some(refusal) = self.refuse_loan.lock().unwrap().take() {
+                    exchange.refuse(refusal);
+                    return Err(NativeProcessError::Exhausted);
+                }
                 let req = exchange.request().ok_or(NativeProcessError::Invalid)?;
                 let child_pages = (req.child_bytes as usize).div_ceil(4096).max(1);
                 let parent_pages = (req.parent_bytes as usize).div_ceil(4096).max(1);
@@ -3842,6 +3850,98 @@ fn fork_scratch_exhaustion_answers_enomem_and_returns_the_loan() {
     );
     assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 2);
     assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
+}
+
+/// A production AArch64 fork entry whose next stock loan the carrier
+/// refuses with `refusal`.
+fn fork_with_refused_loan(refusal: ForkStockRefusal) {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let initial_stock = [
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ];
+    let crossing = TestStockCrossing::new(&initial_stock);
+    *crossing.refuse_loan.lock().unwrap() = Some(refusal);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+    let mut entry = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap();
+    let refused = entry.fork(ProcessForkChildTid::NONE);
+    if refusal != ForkStockRefusal::Inventory {
+        panic!(
+            "a {refusal:?} loan reply is a broken invariant, yet the fork returned {}",
+            super::native_process_runtime::host_test_support::outcome_kind(&refused)
+        );
+    }
+    assert_eq!(
+        super::native_process_runtime::host_test_support::outcome_kind(&refused),
+        "Transferred",
+        "an Inventory loan reply is not now: the fork keeps its syscall, never EAGAIN"
+    );
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
+    assert!(crossing.pending_loan.lock().unwrap().is_none());
+    assert!(
+        fixture.zone.spaces.find(2).is_none(),
+        "the refused loan opened no child space"
+    );
+    let second = entry.fork(ProcessForkChildTid::NONE);
+    assert!(
+        matches!(second, LifecycleOutcome::Returned { result, .. } if result.raw() > 0),
+        "the rerun forks once the carrier has inventory"
+    );
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 2);
+    assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
+}
+
+/// #2441, review P0-2 on #2508: the carrier's Inventory reply to a stock
+/// loan is contention, so the fork is not now and reruns; it formerly
+/// answered EAGAIN like every loan refusal.
+#[test]
+fn fork_loan_inventory_reply_is_not_now_then_forks() {
+    fork_with_refused_loan(ForkStockRefusal::Inventory);
+}
+
+/// #2441, review P0-2 on #2508: a Stale or Invalid stock loan reply is a
+/// broken carrier invariant. The production fork entry ends the run
+/// through the entry-completion fatal; it formerly answered EAGAIN.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_fork_loan_invariant_reply_ends_the_run() {
+    super::native_process_runtime::host_test_support::fork_refusal_class::fatal_child(
+        "aarch64_process_tests::serial_host_fork_loan_invariant_reply_ends_the_run",
+        &["stale", "invalid"],
+        None,
+        |case| {
+            fork_with_refused_loan(match case {
+                "stale" => ForkStockRefusal::Stale,
+                "invalid" => ForkStockRefusal::Invalid,
+                _ => unreachable!("{case}"),
+            })
+        },
+    );
 }
 
 #[test]

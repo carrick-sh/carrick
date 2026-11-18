@@ -157,6 +157,24 @@ mod test_support {
     /// Native fork preparations or publications the parent owner refused
     /// Busy because the parent snapshot moved (#2441).
     pub const INJECT_FORK_SUPERSEDED_CENSUS: u64 = 0xffff_ffff_ffff_fe32;
+    /// The next native fork's stock loan is refused Inventory, as the
+    /// carrier refuses a loan it has no stock for (#2441).
+    pub const INJECT_FORK_LOAN_INVENTORY_ONCE: u64 = 0xffff_ffff_ffff_fe33;
+    /// The next native fork's stock loan is refused Stale, a broken carrier
+    /// invariant (#2441).
+    pub const INJECT_FORK_LOAN_STALE_ONCE: u64 = 0xffff_ffff_ffff_fe34;
+    /// The armed loan refusal: 0 none, 1 Inventory, 2 Stale.
+    static FORK_LOAN_REFUSAL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// Take the armed loan refusal: the fork replies it to its own loan
+    /// record instead of crossing, so the carrier lends nothing.
+    pub fn take_fork_loan_refusal() -> Option<carrick_el1_abi::ForkStockRefusal> {
+        match FORK_LOAN_REFUSAL.swap(0, Ordering::AcqRel) {
+            1 => Some(carrick_el1_abi::ForkStockRefusal::Inventory),
+            2 => Some(carrick_el1_abi::ForkStockRefusal::Stale),
+            _ => None,
+        }
+    }
     static FORK_PREPARE_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     static FORK_SUPERSEDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -567,6 +585,17 @@ mod test_support {
                 .is_ok()
                 .then_some(0),
             INJECT_FORK_SUPERSEDED_CENSUS => Some(FORK_SUPERSEDED.load(Ordering::Acquire)),
+            INJECT_FORK_LOAN_INVENTORY_ONCE | INJECT_FORK_LOAN_STALE_ONCE => {
+                let armed = if native == INJECT_FORK_LOAN_INVENTORY_ONCE {
+                    1
+                } else {
+                    2
+                };
+                FORK_LOAN_REFUSAL
+                    .compare_exchange(0, armed, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                    .then_some(0)
+            }
             INJECT_WAIT_PARK_CENSUS => {
                 let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
                     carrick_guest_arch::CpuId::new(binding.cpu_slot),
