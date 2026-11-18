@@ -1736,9 +1736,36 @@ impl SourceCensus {
                 "ambiguous line-only rule owner at {file}:{line}"
             )));
         }
-        if matches.iter().any(|owner| {
-            owner.start == nearest.start && owner.end == nearest.end && owner.name != nearest.name
-        }) {
+        let same_span = |owner: &Owner| owner.start == nearest.start && owner.end == nearest.end;
+        if matches
+            .iter()
+            .any(|owner| same_span(owner) && owner.name != nearest.name)
+        {
+            // Discovery reports one physical source site. Attribute a shared
+            // build module to its local Cargo build target when that target
+            // includes it under a unique symbolic owner.
+            if self.is_build_file(file) {
+                let local_targets: Vec<_> = self
+                    .build_roots
+                    .iter()
+                    .filter(|target| {
+                        Path::new(&target.source)
+                            .parent()
+                            .is_some_and(|dir| Path::new(file).starts_with(dir))
+                    })
+                    .map(|target| format!("{}::build_program::", target.package.replace('-', "_")))
+                    .collect();
+                if let [prefix] = local_targets.as_slice() {
+                    let mut local = matches
+                        .iter()
+                        .filter(|owner| same_span(owner) && owner.name.starts_with(prefix));
+                    if let Some(owner) = local.next()
+                        && local.all(|other| other.name == owner.name)
+                    {
+                        return Ok(owner.name.clone());
+                    }
+                }
+            }
             return Err(DebtError::Policy(format!(
                 "ambiguous compilation-target owner at {file}:{line}:{column:?}"
             )));
