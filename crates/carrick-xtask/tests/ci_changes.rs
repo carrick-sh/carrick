@@ -656,13 +656,23 @@ fn ci_workflow_runs_cheap_hosted_jobs_on_drafts_and_keeps_mac_jobs_off_them() {
         authority.contains("github.event_name == 'merge_group'"),
         "{authority}"
     );
-    // Every job that still names draft is a Mac job; nothing else hides behind it.
+    // The rule, so a new job needs no edit here: a GitHub-hosted Linux job
+    // never waits for ready-for-review, and a job that still names draft is a
+    // self-hosted Mac job.
     for (name, body) in jobs {
         let name = name.as_str().unwrap();
-        if body["if"].as_str().unwrap_or("").contains("draft") {
+        let cond = body["if"].as_str().unwrap_or("");
+        let runs_on = body["runs-on"].as_str().unwrap_or("");
+        if runs_on.starts_with("ubuntu-") {
             assert!(
-                DRAFT_GATED_JOBS.contains(&name),
-                "{name} is draft-gated but not in the Mac-only list"
+                !cond.contains("draft"),
+                "{name} is a hosted Linux job and must run on drafts: {cond}"
+            );
+        }
+        if cond.contains("draft") {
+            assert!(
+                runs_on.contains("macos_runner"),
+                "{name} names draft but is not a self-hosted Mac job ({runs_on})"
             );
         }
     }
