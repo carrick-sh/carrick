@@ -22776,3 +22776,55 @@ fn arm_two_live_processes_dup_and_close_isolate_tables() {
 
     registry().unregister_root_for_test(&runtime);
 }
+
+/// Anonymous mmap memory with no stage-1 backing: the delegated anonymous
+/// owner edits reservations only, as a sibling thread's `mmap` does.
+#[cfg(test)]
+pub(super) struct UnbackedMmapMemory<'a> {
+    pub(super) tables: &'a crate::mm_portal::test_support::Tables,
+}
+#[cfg(test)]
+impl carrick_el1::memory::AnonymousBackingProbe for UnbackedMmapMemory<'_> {
+    fn backing(
+        &mut self,
+        _: carrick_guest_arch::AddressSpaceRegister,
+        _: UserVa,
+        _: carrick_guest_arch::GuestLen,
+    ) -> carrick_el1::memory::Stage1Backing {
+        carrick_el1::memory::Stage1Backing::of(carrick_el1::memory::RangeBacking::Empty)
+    }
+    fn stock_span(&mut self, _: ReservationMm, _: UserVa) -> Option<carrick_guest_arch::UserRange> {
+        None
+    }
+}
+#[cfg(test)]
+impl carrick_el1::memory::AnonymousPermissionEditor for UnbackedMmapMemory<'_> {
+    fn protect_and_invalidate(
+        &mut self,
+        _root: carrick_guest_arch::AddressSpaceRegister,
+        edit: carrick_mmu_core::aarch64::GuestPermissionEdit,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
+        unsafe {
+            carrick_mmu_core::aarch64::protect_existing_el1_private_pages(
+                self.tables.words.as_ptr().cast_mut(),
+                self.tables.base,
+                self.tables.words.len() * 8,
+                None,
+                edit,
+            )
+        }
+        .map(|_| ())
+    }
+}
+#[cfg(test)]
+impl carrick_el1::memory::AnonymousRetirementEditor for UnbackedMmapMemory<'_> {
+    fn retire_and_invalidate(
+        &mut self,
+        _: ReservationMm,
+        _: carrick_guest_arch::AddressSpaceRegister,
+        _: UserVa,
+        _: carrick_guest_arch::GuestLen,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
+        Ok(())
+    }
+}
