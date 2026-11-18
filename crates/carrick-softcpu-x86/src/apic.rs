@@ -8,6 +8,7 @@
 //! wakeups into the soft CPU execution loop.
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -158,6 +159,15 @@ pub trait TscClock: Send + Sync + fmt::Debug {
     /// Returns the current unscaled TSC tick counter at nominal frequency `tsc_hz`.
     fn now_tsc(&self, tsc_hz: u64) -> u64;
 
+    /// Account for a guest block that ran, including a block that ended in a guest fault.
+    fn account_block(&self) {}
+
+    /// Advance an execution clock to a deliverable timer deadline while the vCPU is halted.
+    /// Returns false for clocks that advance independently of execution.
+    fn advance_halted_to(&self, _deadline_tsc: u64) -> bool {
+        false
+    }
+
     /// Waits until `ready` reports a deliverable interrupt, the deadline, or `max_wait`.
     ///
     /// Notifications enroll under the node lock; stale kicks and masked IRR do not bypass parking.
@@ -173,6 +183,57 @@ pub trait TscClock: Send + Sync + fmt::Debug {
     /// Optional hook allowing deterministic clocks to register an [`ApicNode`] so manual clock
     /// advances immediately wake parked `HLT` waiters.
     fn register_node(&self, _node: Weak<ApicNode>) {}
+}
+
+/// Single-vCPU virtual time driven by guest block execution and halted timer events.
+///
+/// Use a separate clock per vCPU. Its tick count is independent of host scheduling,
+/// translation latency, and time spent handling exits.
+#[derive(Debug)]
+pub(crate) struct BlockTscClock {
+    ticks: AtomicU64,
+    ticks_per_block: NonZeroU64,
+}
+
+impl BlockTscClock {
+    #[must_use]
+    pub(crate) const fn new(ticks_per_block: NonZeroU64) -> Self {
+        Self {
+            ticks: AtomicU64::new(0),
+            ticks_per_block,
+        }
+    }
+}
+
+impl TscClock for BlockTscClock {
+    fn now_tsc(&self, _tsc_hz: u64) -> u64 {
+        self.ticks.load(Ordering::Relaxed)
+    }
+
+    fn account_block(&self) {
+        self.ticks
+            .fetch_add(self.ticks_per_block.get(), Ordering::Relaxed);
+    }
+
+    fn advance_halted_to(&self, deadline_tsc: u64) -> bool {
+        self.ticks.fetch_max(deadline_tsc, Ordering::Relaxed);
+        true
+    }
+
+    fn wait_until(
+        &self,
+        deadline_tsc: Option<u64>,
+        tsc_hz: u64,
+        kick: &ApicNode,
+        max_wait: Duration,
+        ready: &dyn Fn() -> bool,
+    ) -> bool {
+        // SoftMachine advances halted virtual time for a timer that can wake
+        // the CPU. Without one, only an externally injected event can wake it.
+        kick.wait_for_event(max_wait, || {
+            ready() || deadline_tsc.is_some_and(|deadline| self.now_tsc(tsc_hz) >= deadline)
+        })
+    }
 }
 
 /// Host monotonic wall-clock TSC source backed by [`Instant`].
@@ -1063,6 +1124,12 @@ impl LocalApic {
             }
             LapicTimerMode::Reserved => None,
         }
+    }
+
+    /// Whether the timer's LVT vector can interrupt at the current priority.
+    pub(crate) fn timer_outranks_ppr(&self) -> bool {
+        (self.lvt_timer & LAPIC_LVT_MASKED) == 0
+            && ((self.lvt_timer & 0xff) >> 4) > u32::from(self.ppr() >> 4)
     }
 
     /// Evaluates both `IA32_TSC_DEADLINE` and initial-count APIC timers against `now_tsc`.
