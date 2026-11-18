@@ -136,7 +136,7 @@ fn leaf_level(level: Aarch64Level) -> Option<LeafLevel> {
 
 /// The EL1 abort exception for a walker fault: instruction abort for a
 /// fetch, data abort otherwise; FAR is the faulting VA as presented.
-pub fn abort(fault: Aarch64Fault) -> Option<Exception> {
+pub fn fault_exception(fault: Aarch64Fault) -> Option<Exception> {
     let status = match fault.kind {
         Aarch64FaultKind::AddressSize => FaultStatus::AddressSize(table_level(fault.level)),
         Aarch64FaultKind::Translation => FaultStatus::Translation(table_level(fault.level)),
