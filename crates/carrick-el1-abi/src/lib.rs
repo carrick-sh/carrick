@@ -1839,7 +1839,13 @@ pub struct MetadataGrantResponse {
 /// request's own wait queue (`ObjectWaitKey::metadata_request`), which the
 /// carrier's completion publishes under (`MetadataCompletionWake`), so a
 /// caller that waits for the grant enrols there. Only the mailbox issues one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct OwedMetadataGrant {
     generation: core::num::NonZeroU64,
 }

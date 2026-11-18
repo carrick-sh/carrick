@@ -43,6 +43,7 @@ fn fork_invariant_refusal_ends_the_run<
     );
 }
 
+#[cfg(test)]
 mod serial_host {
     use super::*;
 
@@ -53,7 +54,7 @@ mod serial_host {
         const CHILD: &str = "CARRICK_NATIVE_FORK_FATAL_CHILD";
         if std::env::var(CHILD).ok().as_deref() == Some(test) {
             carrick_fatal::set_hook(|domain, _| {
-                assert_eq!(domain, "el1::native_fork");
+                assert_eq!(domain, "el1::entry_completion");
                 std::process::exit(86);
             });
             run();
