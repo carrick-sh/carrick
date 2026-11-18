@@ -2465,6 +2465,10 @@ impl<M: descriptor_txn::TableMaintenance + ?Sized> descriptor_txn::LiveDescripto
     fn invalidate_range(&self, va: u64, len: u64) {
         self.maintenance.invalidate_range(va, len);
     }
+
+    fn descriptor_diagnostic(&self, event: crate::live_descriptor_words::DescriptorDiagnostic) {
+        self.maintenance.descriptor_diagnostic(event);
+    }
 }
 
 #[derive(Debug)]
