@@ -71,3 +71,9 @@ test = "carrick_el1_linux::aarch64_process_tests::arm_glibc_pthread_join_robust_
 reason = "#2109: a registered robust list no longer declines a raw exit to host custody, so the #2124 host-retirement wake witness now reaches host custody through a pending-signal decline, and a twin witnesses the robust exit retiring in ring and waking the join itself."
 replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_glibc_pthread_join_host_retirement_wake_meets_ring_wait"
 pr = 2182
+
+[[retired]]
+test = "carrick_el1_linux::native_fork_refusal::tests::reserve_diagnostics_preserve_each_stock_refusal_encoding"
+reason = "#2441: a native fork refusal now carries a typed class (guest address fault, resource exhaustion, not-now contention, broken invariant) instead of a guest-errno encoding, so the witness that pinned each stock reply's errno became a witness of each reply's class, and the same Invalid, Stale, Capacity and Inventory replies are now asserted by class (Invalid and Stale stay invariants)."
+replaced_by = "carrick_el1_linux::native_fork_refusal::tests::reserve_diagnostics_preserve_each_stock_refusal_class"
+pr = 2508
