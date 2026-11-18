@@ -764,6 +764,26 @@ impl ExtentTable {
             .get(&frame_gpa.raw())
             .map_or(0, |&(_, generation)| generation)
     }
+
+    /// Invalidate translated code for a page already written through stopped
+    /// physical custody. Untouched code and data-only pages keep their stamps.
+    pub fn invalidate_host_written_page(
+        &mut self,
+        page: FrameGpa,
+        owner: OwnerGeneration,
+    ) -> Result<(), HostWriteError> {
+        if self.is_terminal() {
+            return Err(HostWriteError::Terminal);
+        }
+        let frame = self
+            .authenticate(Stage1Gpa::new(page.raw()), PAGE_SIZE_4K, owner)
+            .ok_or(HostWriteError::Owner)?;
+        if self.is_code_page(frame) && self.on_code_page_write(frame, &mut []).is_none() {
+            self.make_terminal();
+            return Err(HostWriteError::GenerationExhausted);
+        }
+        Ok(())
+    }
     /// Bump `frame_gpa`'s code generation on guest write and flush `write`
     /// planes across `peer_tlbs`. `None` once the frame's generation is
     /// exhausted: the bump is refused (never saturated, which would let a

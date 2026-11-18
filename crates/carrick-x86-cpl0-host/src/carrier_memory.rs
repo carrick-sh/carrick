@@ -42,6 +42,10 @@ pub trait CarrierMemoryIo: Send + Sync + 'static {
         region: CarrierMemoryRegion,
     ) -> Result<(), carrick_hal::OsError>;
     fn signal_msi(&self, address_lo: u32, data: u32) -> Result<(), carrick_hal::OsError>;
+
+    /// Report a successful host write to retained RAM before the stopped
+    /// carrier may reenter. Hardware carriers need no software cache update.
+    fn host_wrote_ram(&self, _start: FrameGpa, _len: usize) {}
 }
 
 #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
@@ -1639,6 +1643,9 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             .ok_or_else(|| error("carrier write bounds"))?;
         // SAFETY: exclusive stopped custody, retained bounded backing.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        if !bytes.is_empty() {
+            self.vm.host_wrote_ram(pa, bytes.len());
+        }
         Ok(())
     }
     pub fn words(&self) -> DescriptorWords<'_, M> {

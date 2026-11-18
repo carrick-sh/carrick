@@ -266,6 +266,21 @@ fn drive(elf: &[u8], run: &mut HelloRun, patch: Option<u8>) -> Result<(), String
                             .map_err(|error| {
                                 carrick_x86_cpl0_host::cpl0_boot::fail(error.to_string())
                             })?;
+                        // Some root stdio writes are forwarded as the plain
+                        // Linux syscall. Patch only after dispatch copied the
+                        // original byte to stdout.
+                        if let (Some(patch), DispatchOutcome::Returned { value: 1 }) =
+                            (patch, &outcome)
+                            && frame.rax == 1
+                            && frame.rdi == 1
+                            && frame.rdx == 1
+                        {
+                            venue
+                                .write_bytes_raw(frame.rsi, &[patch])
+                                .map_err(|error| {
+                                    carrick_x86_cpl0_host::cpl0_boot::fail(error.to_string())
+                                })?;
+                        }
                         Ok(match outcome {
                             DispatchOutcome::Returned { value } => Ok((frame.rax, value)),
                             DispatchOutcome::Errno { errno } => {
@@ -368,7 +383,6 @@ fn production_ring_xgetbv_matches_the_x86_64_v3_contract() {
 }
 
 #[test]
-#[ignore = "reveals the pending shared host-write invalidation boundary"]
 fn production_ring_retranslates_a_code_page_written_through_forward_venue() {
     // Call the same leaf before and after the host writes to its immediate.
     // The stdout crossing records the original byte; exit_group uses the
