@@ -11,7 +11,9 @@ use carrick_softcpu_x86::{
     CpuidAuthority, DescriptorTablePtr, LAPIC_SVR_OFFSET, MSR_IA32_APIC_BASE, MSR_IA32_FMASK,
     MSR_IA32_LSTAR, MSR_IA32_STAR, MsrCapabilities, MsrIndex, SoftCpuContext, SoftSegment, reg,
 };
-use carrick_x86::{MsrInstall, SegmentDescriptor, X86Exit, X86Reg, X86Seg, X86Vcpu};
+use carrick_x86::{
+    MsrInstall, SegmentDescriptor, X86Exit, X86Reg, X86Seg, X86Vcpu, XSAVE_AVX_OFFSET, XSAVE_LEN,
+};
 use carrick_x86_cpl0_host::cpl0_boot::{BootCpuState, fail};
 
 /// The shared `X86Vcpu` setter surface over a stopped soft CPU context.
@@ -28,7 +30,7 @@ impl<'a> SoftBootVcpu<'a> {
         }
     }
 
-    fn write_msr(&mut self, index: MsrIndex, value: u64) -> Result<(), TrapError> {
+    pub(crate) fn write_msr(&mut self, index: MsrIndex, value: u64) -> Result<(), TrapError> {
         self.ctx
             .write_msr(index, value, self.caps)
             .map(|_| ())
@@ -67,18 +69,83 @@ const fn soft_segment(descriptor: SegmentDescriptor) -> SoftSegment {
     }
 }
 
+/// Read one register of a stopped soft CPU.
+fn read_register(ctx: &SoftCpuContext, reg: X86Reg) -> Result<u64, TrapError> {
+    Ok(match reg {
+        X86Reg::Rip => ctx.rip,
+        X86Reg::Rflags => ctx.rflags,
+        X86Reg::Cr0 => ctx.cr0,
+        X86Reg::Cr2 => ctx.cr2,
+        X86Reg::Cr3 => ctx.cr3,
+        X86Reg::Cr4 => ctx.cr4,
+        X86Reg::Efer => ctx.efer(),
+        gpr => ctx.gpr[gpr_index(gpr).ok_or_else(|| fail("soft register"))?],
+    })
+}
+
+/// The soft CPU keeps x87/SSE in its FXSAVE image and the AVX upper halves
+/// beside it: the standard-format XSAVE area carries both, with
+/// `XSTATE_BV = x87 | SSE | AVX`.
+fn read_xsave(ctx: &SoftCpuContext) -> [u8; XSAVE_LEN] {
+    let mut area = carrick_x86::fxsave_to_xsave(ctx.fxsave.0);
+    area[XSAVE_AVX_OFFSET..XSAVE_AVX_OFFSET + ctx.ymm_hi128.len()].copy_from_slice(&ctx.ymm_hi128);
+    area[512] = 0x07;
+    area
+}
+
+/// A read-only [`X86Vcpu`] view of a stopped soft CPU, for the shared
+/// [`carrick_x86::snapshot`]. Every setter refuses.
+pub struct SoftCpuView<'a>(pub &'a SoftCpuContext);
+
+fn read_only() -> TrapError {
+    fail("read-only soft CPU view")
+}
+
+impl X86Vcpu for SoftCpuView<'_> {
+    fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
+        read_register(self.0, reg)
+    }
+    fn set_gpr(&mut self, _: X86Reg, _: u64) -> Result<(), TrapError> {
+        Err(read_only())
+    }
+    fn set_segment(&mut self, _: X86Seg, _: SegmentDescriptor) -> Result<(), TrapError> {
+        Err(read_only())
+    }
+    fn get_fs_base(&self) -> Result<u64, TrapError> {
+        Ok(self.0.fs_base())
+    }
+    fn set_fs_base(&mut self, _: u64) -> Result<(), TrapError> {
+        Err(read_only())
+    }
+    fn get_gs_base(&self) -> Result<u64, TrapError> {
+        Ok(self.0.gs_base())
+    }
+    fn set_gs_base(&mut self, _: u64) -> Result<(), TrapError> {
+        Err(read_only())
+    }
+    fn set_syscall_msrs(&mut self, _: u64, _: u64, _: u64) -> Result<MsrInstall, TrapError> {
+        Err(read_only())
+    }
+    fn get_fp(&self) -> Result<Option<[u8; 512]>, TrapError> {
+        Ok(Some(self.0.fxsave.0))
+    }
+    fn set_fp(&mut self, _: &[u8; 512]) -> Result<bool, TrapError> {
+        Err(read_only())
+    }
+    fn get_xsave(&self) -> Result<Option<[u8; XSAVE_LEN]>, TrapError> {
+        Ok(Some(read_xsave(self.0)))
+    }
+    fn run(&mut self) -> Result<X86Exit, TrapError> {
+        Err(read_only())
+    }
+    fn enable_halt_exit(&mut self) -> Result<(), TrapError> {
+        Err(read_only())
+    }
+}
+
 impl X86Vcpu for SoftBootVcpu<'_> {
     fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
-        Ok(match reg {
-            X86Reg::Rip => self.ctx.rip,
-            X86Reg::Rflags => self.ctx.rflags,
-            X86Reg::Cr0 => self.ctx.cr0,
-            X86Reg::Cr2 => self.ctx.cr2,
-            X86Reg::Cr3 => self.ctx.cr3,
-            X86Reg::Cr4 => self.ctx.cr4,
-            X86Reg::Efer => self.ctx.efer(),
-            gpr => self.ctx.gpr[gpr_index(gpr).ok_or_else(|| fail("soft register"))?],
-        })
+        read_register(self.ctx, reg)
     }
 
     fn set_gpr(&mut self, reg: X86Reg, value: u64) -> Result<(), TrapError> {
@@ -167,10 +234,23 @@ impl X86Vcpu for SoftBootVcpu<'_> {
     }
 
     fn get_fp(&self) -> Result<Option<[u8; 512]>, TrapError> {
-        Ok(None)
+        Ok(Some(self.ctx.fxsave.0))
     }
-    fn set_fp(&mut self, _fx: &[u8; 512]) -> Result<bool, TrapError> {
-        Ok(false)
+    fn set_fp(&mut self, fx: &[u8; 512]) -> Result<bool, TrapError> {
+        self.ctx.fxsave.0 = *fx;
+        Ok(true)
+    }
+
+    fn get_xsave(&self) -> Result<Option<[u8; XSAVE_LEN]>, TrapError> {
+        Ok(Some(read_xsave(self.ctx)))
+    }
+    fn set_xsave(&mut self, area: &[u8; XSAVE_LEN]) -> Result<bool, TrapError> {
+        self.ctx.fxsave.0.copy_from_slice(&area[..512]);
+        let ymm = self.ctx.ymm_hi128.len();
+        self.ctx
+            .ymm_hi128
+            .copy_from_slice(&area[XSAVE_AVX_OFFSET..XSAVE_AVX_OFFSET + ymm]);
+        Ok(true)
     }
 
     fn run(&mut self) -> Result<X86Exit, TrapError> {
