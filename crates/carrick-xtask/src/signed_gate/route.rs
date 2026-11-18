@@ -92,6 +92,17 @@ pub fn availability(runner: &str, gate_jobs: &[Value], now: u64) -> Result<(), S
             STRANDED_AFTER_SECS / 60
         ));
     }
+    // #2469: a Mac already running a gate isn't free. Routing to it queues this gate behind
+    // that one (about 45 min) while another gate Mac may be idle; the shared label runs the
+    // base side again (about 23 min) on whichever gate Mac frees first, which is cheaper.
+    let busy = gate_jobs
+        .iter()
+        .any(|job| job["status"] == "in_progress" && job["runner_name"].as_str() == Some(runner));
+    if busy {
+        return Err(format!(
+            "{runner} is running another gate now: route to any free gate Mac instead"
+        ));
+    }
     let live = gate_jobs.iter().any(|job| {
         job["runner_name"].as_str() == Some(runner)
             && job["started_at"]
