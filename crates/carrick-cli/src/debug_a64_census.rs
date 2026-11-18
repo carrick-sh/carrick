@@ -318,6 +318,11 @@ fn loader_spans(mut visit: impl FnMut(&str, u64, &[u8]) -> Result<()>) -> Result
         memory::LINUX_EL1_MAINT_BASE,
         &memory::el1_maintenance_bytes(),
     )?;
+    visit(
+        "el0-trampoline",
+        memory::LINUX_EL0_TRAMPOLINE_BASE,
+        &memory::el0_trampoline_bytes(),
+    )?;
     for (name, bytes) in [
         ("legacy", memory::el1_vectors_bytes()),
         ("legacy-fd", memory::el1_vectors_bytes_fd_ceiling()),
