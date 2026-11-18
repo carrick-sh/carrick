@@ -833,7 +833,7 @@ jobs:
 
   portable:
     needs: [changes, xtask-build, xtask-tests-build]
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -952,7 +952,7 @@ jobs:
     needs: [changes, xtask-build, xtask-tests-build]
     # Only the director's enqueue-stage ISA-witness check reads its artifact (#2328 item 4); it runs beside
     # the gates, and ci-ok doesn't need it, so it never lengthens the landing path.
-    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: github.event_name == 'pull_request' && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -1077,7 +1077,7 @@ jobs:
 
   loom:
     needs: [changes, xtask-build]
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     # The fd-core model alone runs about 15 minutes on an M-class core.
     # The fd-core model alone runs about 15 minutes on an M-class core.
@@ -1157,7 +1157,7 @@ jobs:
   # run here before landing (live `/dev/kvm` stays on post-landing Willow).
   x86-host-tests:
     needs: [changes]
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -1213,7 +1213,7 @@ jobs:
 
   linux-doc:
     needs: [changes, xtask-build]
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -1930,7 +1930,7 @@ jobs:
 
   cross-check-linux:
     needs: [changes, xtask-build]
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -2029,7 +2029,7 @@ jobs:
 
   kernel-linux-native:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     env:
@@ -2095,7 +2095,7 @@ jobs:
   el1-native-tests:
     name: EL1 · native-process tests (Linux ARM64)
     needs: changes
-    if: (github.event_name == 'pull_request' && github.event.pull_request.draft == false && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.el1_native == 'true') || github.event_name == 'merge_group'
+    if: (github.event_name == 'pull_request' && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.el1_native == 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
@@ -2183,7 +2183,7 @@ jobs:
       contents: read
       actions: read
     needs: [changes, el1-native-tests]
-    if: ((github.event_name == 'pull_request' && github.event.pull_request.draft == false && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.el1_native == 'true') || github.event_name == 'merge_group') && needs.el1-native-tests.result == 'success'
+    if: ((github.event_name == 'pull_request' && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.el1_native == 'true') || github.event_name == 'merge_group') && needs.el1-native-tests.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
@@ -2319,7 +2319,7 @@ jobs:
 
   cross-check-freebsd:
     needs: [changes, xtask-build]
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -2448,7 +2448,7 @@ jobs:
 
   cross-check-netbsd:
     needs: [changes, xtask-build]
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -2570,7 +2570,7 @@ jobs:
 
   cross-check-macos:
     needs: [changes, xtask-build]
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:

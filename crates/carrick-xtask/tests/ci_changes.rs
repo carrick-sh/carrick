@@ -523,8 +523,12 @@ fn draft_pr_runs_cheap_linux_checks_and_its_ci_ok_cannot_land() {
     assert!(!ok, "a draft PR's ci-results must not pass: {out}");
     assert!(out.contains("draft run: the jobs that ran passed"), "{out}");
     assert!(
-        !run_ci_results("pull_request", Some("false"), draft_needs),
-        "non-draft PR with skipped expensive jobs must fail ci-results"
+        !run_ci_results(
+            "pull_request",
+            Some("false"),
+            &draft_needs.replace(r#""macos": "false""#, r#""macos": "true""#)
+        ),
+        "non-draft PR with skipped Mac jobs must fail ci-results"
     );
 
     let draft_failed_lint = draft_needs.replace(

@@ -1561,7 +1561,7 @@ ci-results:
        (with_entries(select(.key as $k | $el1_pair | index($k)))
          | select(length == 2)
          | if $event == "merge_group" then all(.[]; .result == "success")
-           elif $event == "pull_request" and ($root.changes.outputs.heavy // "true") == "true" and ($root.changes.outputs.el1_native // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
+           elif $event == "pull_request" and ($root.changes.outputs.heavy // "true") == "true" and ($root.changes.outputs.el1_native // "true") == "true" and ($is_lower | not) then all(.[]; .result == "success")
            else all(.[]; .result == "skipped") end) and
        if $event == "pull_request" then
          (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select(.key | startswith("macos-")))
@@ -1574,7 +1574,14 @@ ci-results:
          (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"])["lint-domains"]
            | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
              else .result == "skipped" end) and
-         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "trusted-steps" and .key != "lint-clippy" and .key != "lint-gates" and .key != "xtask-tests-build" and .key != "lint-domains"))
+         # Hosted Linux checks, lints and cross-compiles run on drafts too, so a
+         # draft shows the failures ci-ok would raise at ready time. Only a job
+         # outside this list waits for ready-for-review.
+         (["portable", "loom", "x86-host-tests", "linux-doc", "cross-check-linux", "kernel-linux-native", "cross-check-freebsd", "cross-check-netbsd", "cross-check-macos"]) as $draft_runs |
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "trusted-steps" and .key != "lint-clippy" and .key != "lint-gates" and .key != "xtask-tests-build" and .key != "lint-domains" and (.key as $k | $draft_runs | index($k))))
+           | if ($root.changes.outputs.heavy // "true") == "true" and ($is_lower | not) then all(.[]; .result == "success")
+             else all(.[]; .result == "skipped") end) and
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "trusted-steps" and .key != "lint-clippy" and .key != "lint-gates" and .key != "xtask-tests-build" and .key != "lint-domains" and (.key as $k | $draft_runs | index($k) | not)))
            | if ($root.changes.outputs.heavy // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
          (.["linked-issue"].result == "success") and
@@ -1609,7 +1616,7 @@ ci-results:
     # landed a failing carrick-embed test this way). Everything it did run
     # passed; say so, and stay red until a ready-for-review run covers it.
     if [[ "${CI_EVENT}" == pull_request && "${CI_DRAFT:-false}" == true && "${is_lower}" != true && "${CI_LOWER_LAYER:-false}" != true ]]; then
-        msg="draft run: the jobs that ran passed, but the macOS unit shards and heavy jobs were skipped, so this ci-ok can't land the PR. Mark it ready for review to run the full suite."
+        msg="draft run: the jobs that ran passed (hosted checks, lints and cross-compiles run on drafts), but the self-hosted macOS jobs and the signed gates were skipped, so this ci-ok can't land the PR. Mark it ready for review to run the full suite."
         echo "${msg}"
         if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
             echo "${msg}" >> "${GITHUB_STEP_SUMMARY}"
