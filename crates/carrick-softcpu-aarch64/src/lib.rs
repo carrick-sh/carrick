@@ -225,6 +225,11 @@ mod closure {
         Dcps2,
         Dcps3,
     }
+    /// An exception-generating instruction and its architectural immediate.
+    /// ```compile_fail
+    /// use carrick_softcpu_aarch64::{ExceptionGeneration, ExceptionKind};
+    /// let _ = ExceptionGeneration { kind: ExceptionKind::Brk, immediate: 1u16 };
+    /// ```
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ExceptionGeneration {
         pub kind: ExceptionKind,

@@ -68,6 +68,11 @@ pub enum DataAccess {
 pub enum Exception {
     Svc(crate::Immediate16),
     Hvc(crate::Immediate16),
+    /// Breakpoint with the immediate reported in ESR_EL1 (DDI0487G.a C6.2.38).
+    /// ```compile_fail
+    /// use carrick_softcpu_aarch64::exception::Exception;
+    /// let _ = Exception::Brk(1u16);
+    /// ```
     Brk(u16),
     Unknown,
     SystemAccess(SystemAccessException),
