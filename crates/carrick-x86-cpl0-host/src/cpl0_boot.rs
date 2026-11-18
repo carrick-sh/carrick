@@ -6958,6 +6958,81 @@ pub fn unexpected_boot_wake(
     Ok(())
 }
 
+/// The backend operations one production CPU's run admission needs: the
+/// stopped privilege level and interruptibility, a KICK queued to the CPU's
+/// own APIC before reentry, and one guest run.
+pub trait ProductionMemberCpu {
+    /// The stopped CPU's current privilege level (CS.DPL).
+    fn stopped_cpl(&self) -> Result<u8, TrapError>;
+    /// Stopped at CPL3 with interrupts enabled and no interrupt shadow or
+    /// injected event pending.
+    fn stopped_at_interruptible_user(&self) -> Result<bool, TrapError>;
+    /// Queue `KICK_VECTOR` to this CPU's own local APIC, durable across the
+    /// reentry that follows.
+    fn queue_reentry_kick(&mut self) -> Result<(), TrapError>;
+    fn run_guest(&mut self) -> Result<VcpuExit, TrapError>;
+}
+
+/// Run one production CPU under the shared file-execution admission and the
+/// shootdown table's running/ack protocol. A CPU entering with shootdown
+/// debt is kicked so the ring settles that debt before user code resumes.
+pub fn run_production_member<C: ProductionMemberCpu>(
+    cpu: &mut C,
+    table: &ShootdownTable,
+    slot: usize,
+    actual_run: Option<&AtomicU32>,
+    execution: &RwLock<()>,
+) -> Result<VcpuExit, TrapError> {
+    let _running = execution.try_read().map_err(|error| match error {
+        std::sync::TryLockError::WouldBlock => TrapError::ExecutionAdmissionBusy,
+        std::sync::TryLockError::Poisoned(_) => TrapError::ExecutionAdmissionPoisoned,
+    })?;
+    let member = table
+        .members
+        .get(slot)
+        .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+    struct RunningAdmission<'a>(&'a AtomicU32);
+    impl Drop for RunningAdmission<'_> {
+        fn drop(&mut self) {
+            self.0.store(0, Ordering::Release);
+        }
+    }
+    // A sender that observes this release either targets the live vCPU or
+    // races this pre-run scan, which queues its durable MSI before KVM_RUN.
+    member.running.store(1, Ordering::Release);
+    let running_admission = RunningAdmission(&member.running);
+    let cpl = cpu.stopped_cpl()?;
+    let has_debt = table.requests.iter().any(|request| {
+        request.generation.load(Ordering::Acquire) > request.served[slot].load(Ordering::Acquire)
+    });
+    if has_debt {
+        if cpl == 3 && !cpu.stopped_at_interruptible_user()? {
+            return Err(fail("shootdown debt requires interruptible CPL3 reentry"));
+        } else if cpl != 0 && cpl != 3 {
+            return Err(fail("shootdown debt on unsupported CPL reentry"));
+        }
+        cpu.queue_reentry_kick()?;
+    }
+    let actual_guard = actual_run.map(|flag| {
+        flag.store(1, Ordering::Release);
+        RunningAdmission(flag)
+    });
+    let result = cpu.run_guest()?;
+    drop(actual_guard);
+    drop(running_admission);
+    if cpu.stopped_at_interruptible_user()? {
+        // The host may release a sender after this vCPU has stopped, but
+        // leaves `served` behind until native KICK settles debt on reentry.
+        for request in &table.requests {
+            let generation = request.generation.load(Ordering::Acquire);
+            if generation != 0 {
+                request.ack[slot].store(generation, Ordering::Release);
+            }
+        }
+    }
+    Ok(result)
+}
+
 impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     /// Replace the bootstrap's provisional identity with the exact root
     /// issued by the shared kernel, before the initial MM is admitted.
@@ -7013,6 +7088,41 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     pub fn initial_mm_key(&self) -> u64 {
         self.initial_task()
             .map_or(INITIAL_MM_KEY, |identity| identity.mm.raw().get())
+    }
+    /// The issued root task's state for the executor hand-off: its binding
+    /// (carrier, task serial, execution generation, initial MM context) over
+    /// `image`, the stopped root CPU, with the resume payload marked.
+    pub fn worker_root_state(
+        &self,
+        image: &carrick_x86::X86VcpuSnapshot,
+    ) -> Result<carrick_x86::arch_context::X86ArchContext, TrapError> {
+        let root = self
+            .initial_task()
+            .ok_or_else(|| fail("worker handoff has no issued root task"))?;
+        let mm = NonZeroU64::new(self.initial_mm_key()).ok_or_else(|| fail("initial MM key"))?;
+        let context = self
+            .memory()
+            .root(mm)
+            .ok_or_else(|| fail("worker handoff has no initial MM"))?;
+        let binding = carrick_hal::guest_arch_binding::GuestArchBinding::x86(
+            carrick_guest_arch::TaskIdentity {
+                carrier: carrick_guest_arch::CarrierGeneration::new(
+                    self.memory().identity().nonzero(),
+                ),
+                task: carrick_guest_arch::TaskSerial::new(
+                    NonZeroU64::new(root.task.serial.raw())
+                        .ok_or_else(|| fail("worker root task serial"))?,
+                ),
+                execution: carrick_guest_arch::ExecutionGeneration::new(
+                    NonZeroU64::new(root.thread.generation)
+                        .ok_or_else(|| fail("worker root execution generation"))?,
+                ),
+            },
+            context,
+        );
+        let mut resume = [0; carrick_hal::threaded::X86_TASK_RESUME_PAYLOAD_LEN];
+        resume[56..64].copy_from_slice(&carrick_hal::threaded::X86_TASK_RESUME_MAGIC.to_le_bytes());
+        carrick_x86::arch_context::X86ArchContext::capture(binding, image, resume)
     }
     fn stopped_task(&self, index: usize) -> &CurrentTask {
         // SAFETY: the stopped bootstrap owns initialized metadata at these offsets.
