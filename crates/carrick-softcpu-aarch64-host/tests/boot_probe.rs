@@ -44,7 +44,6 @@ const INITIAL_METADATA_END: u64 =
 struct Pages {
     pages: BTreeMap<u64, Box<[u8; PAGE as usize]>>,
     read_boot_root: bool,
-    wrote_boot_metadata: bool,
 }
 
 impl Pages {
@@ -86,9 +85,6 @@ impl GuestMemory for Pages {
         }
         for (i, b) in bytes.iter().enumerate() {
             *self.byte(address.0 + i as u64)? = *b;
-        }
-        if (EL1_DYNAMIC_METADATA_BASE..INITIAL_METADATA_END).contains(&address.0) {
-            self.wrote_boot_metadata = true;
         }
         Ok(())
     }
@@ -231,10 +227,14 @@ fn production_el1_image_boot_probe() {
         memory.read_boot_root,
         "the probe never read its stage-1 root"
     );
-    assert!(
-        memory.wrote_boot_metadata,
-        "probe did not retire a bootstrap metadata store: {strict}"
-    );
+    if strict.stop == Stop::Fetch(VirtualAddress(RETURN_SENTINEL)) {
+        println!(
+            "  returned to the loader sentinel: x0 (exit word) = {:#x}",
+            cpu.read_operand(OperandRegister::Gpr(Gpr::new(0).unwrap()))
+                .0
+        );
+        return;
+    }
 
     // Diagnostic pass: demand-zero pages, to show what comes after.
     let (mut cpu, mut memory) = enter(&elf);
@@ -268,4 +268,5 @@ fn production_el1_image_boot_probe() {
                 .0
         );
     }
+    panic!("strict probe did not return to the loader sentinel: {strict}");
 }
