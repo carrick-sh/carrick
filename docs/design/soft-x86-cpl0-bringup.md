@@ -387,9 +387,8 @@ Before entering the guest, the soft backend keeps the same walker
 inventory and adds an extent only for each newly installed slot. A new
 snapshot rebuilds placement only when slots were added. The subsequent
 local TLB flush includes instruction fetch. Cached blocks re-authenticate
-their code frames and generations on their next entry. A removed or
-replaced slot still stops the soft carrier pending integration with
-`ExtentTable::remove` and its retirement protocol.
+their code frames and generations on their next entry. At M1-5 a removed
+or replaced slot stopped the soft carrier before re-entry.
 
 The fixture-independent anonymous-page test exhausted the unchanged
 4,000,000-block budget after two owner grants before the refresh. It now
@@ -570,3 +569,66 @@ checks actual slice expiry before rotating. With this fix, the controlled-clock
 and contended-head witnesses, eight-round `TWO_LIVE`, the 200 ms nanosleep
 witness, the musl static hello, and the KVM `TWO_LIVE` and slice-end witnesses
 all exit 0 under unchanged slice and block budgets.
+
+### #671: retired slots in the production fixture sweep
+
+The sweep uses the production CPL0 image from #2541. The existing
+`soft_hello` driver boots each standalone fixture, binds the issued root
+and enters the shared production worker. Run an individual locally built
+fixture from the repository root:
+
+```sh
+CARRICK_SOFT_FIXTURE=/absolute/path/to/local/static-elf \
+  cargo test --locked -p carrick-vmm-soft --test soft_hello -- \
+  production_ring_static_fixture_probe --exact --ignored --nocapture
+```
+
+The earliest recurring carrier stop was after a normal custody update.
+`native_child_entropy.S` forked from the root, used the child entropy
+service at `0xd8`, and reached the child-retire doorbell `0xd6`. The next
+guest entry after work doorbell `0xcb` refused to refresh soft slot 7.
+GDB on the corrected worker observed `OUT` at `0xffffffff8012372b` on
+port `0xd6` with width 4 and value `0x90e0dc00`, then work port
+`0xcb` at `0xffffffff80003a67` with width 1 and value `0x60`. The
+retired extent began at GPA `0x228000000`. The parent reaped the child
+and exited 8 with empty stdout, matching the KVM witness's required
+result.
+
+The soft memory view compares the published slot registrations and retains
+the old backing until its extent retirement completes. It reuses
+`ExtentTable::remove` and `reclaim` in the existing invalidation domain.
+M1's sole runnable software vCPU is parked between blocks, so completion
+requires no wait. Its next entry serves the invalidation debt. Code
+reactivation at a reused GPA gets a new code generation, and root admission
+requires a full page in a live extent. Each changed snapshot does one
+retirement per revoked or replaced slot. The unchanged snapshot takes the
+existing pointer comparison, and block entry has the same work budget.
+The contract is `softmmu.x86.physical-retirement` (Intel SDM Vol. 3A,
+§4.10.4).
+
+The fixture census records guest termination and stdout from the harness
+and the exact diagnostic or last carrier event on a stop. The default
+driver has empty argv and env, no mounted root filesystem or injected
+preopened descriptors, and refuses native exec image loading. It samples
+host readiness without parking. Its output therefore describes the soft
+driver's execution of each ELF. Configuration-specific KVM witnesses add
+their own peers, inputs, and handshakes.
+
+The static glibc build of the same hello prints `hello, x86_64 world\n`
+and reaches the root-exit doorbell `0xd3` with SIGSEGV. The soft block
+trace immediately before the fatal fetch ends at `0x276c89`, whose
+terminator is `call *%rax` at `0x276c8f`. GDB observed CPL3
+`#PF(error=0x14, RIP=CR2=0xd7)` at the destination. The same ELF exits 0
+with the greeting on native Linux. Mounted at `/hello` in the KVM test's
+local empty-image layout, it prints the greeting and exits 139. The bad
+call target's provenance is unresolved in this sweep.
+
+| Production soft witness | On #2541 | With slot retirement |
+| --- | --- | --- |
+| Static assembly hello | Exit 0, `hello\n` | Exit 0, `hello\n` |
+| Static musl hello | Exit 0, `hello, x86_64 world\n` | Exit 0, `hello, x86_64 world\n` |
+| Static glibc hello | `0xd3`, SIGSEGV after `hello, x86_64 world\n` | Same CPL3 fetch fault at `0xd7` |
+| Forked child stdout | Exit 7, `E` | Exit 7, `E` |
+| Robust raw exit, `TWO_LIVE` | Exit 0, empty stdout | Exit 0, empty stdout |
+| Child entropy and wait | Slot 7 rejected after `0xd6 → 0xcb`, empty stdout | Exit 8, empty stdout |
+| Autoreap, three forks | Slot 11 rejected after `0xd6 → 0xcb`, bytes `01 02` | Exit 7, bytes `01 02 03 04` |
