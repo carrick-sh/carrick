@@ -16,7 +16,9 @@ workspace = true
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-hal = { path = "../carrick-hal" }
+carrick-mem = { path = "../carrick-mem" }
 carrick-softcpu-x86 = { path = "../carrick-softcpu-x86" }
+carrick-softmmu = { path = "../carrick-softmmu", features = ["std"] }
 carrick-x86 = { path = "../carrick-x86" }
 carrick-x86-cpl0-host = { path = "../carrick-x86-cpl0-host" }
 goblin = { workspace = true }
