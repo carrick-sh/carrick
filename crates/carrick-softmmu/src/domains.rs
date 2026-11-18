@@ -1,12 +1,14 @@
 //! Typed address, privilege, and fault domains for the software MMU.
 
 pub use carrick_guest_arch::{FrameGpa, GuestVa, RootGpa, UserVa};
+pub use carrick_mmu_core::stage1::{LeafSpan, Stage1Leaf, Stage1Walker, WalkError};
 pub use carrick_mmu_core::x86::descriptor_txn::{
     ACCESSED, ADDRESS, Access, COW, DEFAULT_MAX_PHY_ADDR, DIRTY, DescriptorRefusal, FaultClass,
-    HUGE, HardwareFaultClass, HardwareWalkConfig, LeafSize, LiveDescriptorWords,
-    MAX_AD_CAS_RETRIES, MAX_MAX_PHY_ADDR, MAY_EXEC, MAY_WRITE, MIN_MAX_PHY_ADDR, NX, PAGE,
-    PAT_LARGE, PREPARED, PRESENT, PRIVATE, RETIRED, TranslatedLeaf, USER, WRITE,
-    has_hardware_reserved_bits_when_present, reserved_phyaddr_mask, translate_leaf_hardware,
+    HUGE, HardwareFaultClass, HardwareWalkConfig, HardwareWalkContext, HardwareWalker, LeafSize,
+    LiveDescriptorWords, MAX_AD_CAS_RETRIES, MAX_MAX_PHY_ADDR, MAY_EXEC, MAY_WRITE,
+    MIN_MAX_PHY_ADDR, NX, PAGE, PAT_LARGE, PREPARED, PRESENT, PRIVATE, RETIRED, TranslatedLeaf,
+    USER, WRITE, has_hardware_reserved_bits_when_present, reserved_phyaddr_mask,
+    translate_leaf_hardware,
 };
 
 pub const PAGE_SHIFT_4K: u32 = 12;
@@ -83,16 +85,11 @@ impl Stage1Gpa {
     pub(crate) const fn new(raw: u64) -> Self {
         Self(raw)
     }
-    pub(crate) const fn from_leaf_page(leaf: &TranslatedLeaf) -> Self {
-        Self(leaf.output.raw() & PAGE_BASE_MASK_4K)
+    pub(crate) fn from_leaf_page<L: Stage1Leaf>(leaf: &L) -> Self {
+        Self(leaf.output().raw() & PAGE_BASE_MASK_4K)
     }
-    pub(crate) const fn from_leaf_base(leaf: &TranslatedLeaf) -> Self {
-        let sz = if leaf.size >= PAGE_SIZE_4K && leaf.size.is_power_of_two() {
-            leaf.size
-        } else {
-            PAGE_SIZE_4K
-        };
-        Self(leaf.output.raw() & !(sz - 1))
+    pub(crate) fn from_leaf_base<L: Stage1Leaf>(leaf: &L) -> Self {
+        Self(leaf.span().base().raw())
     }
     pub const fn raw(self) -> u64 {
         self.0

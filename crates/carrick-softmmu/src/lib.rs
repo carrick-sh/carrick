@@ -16,7 +16,8 @@
 //!   4 KiB or 2 MiB / 1 GiB sibling slots on `invlpg` ([`SoftTlb::evict_va`]), and write-plane
 //!   flushed across CPUs when an authenticated frame becomes a code page
 //!   ([`ExtentTable::mark_code_page`]).
-//! - [`SoftWalker`]: binds [`carrick_mmu_core::x86::descriptor_txn::translate_leaf_hardware`] over
+//! - [`SoftWalker`]: binds [`HardwareWalker`], the x86 [`Stage1Walker`] over
+//!   [`carrick_mmu_core::x86::descriptor_txn::translate_leaf_hardware`], over
 //!   [`carrick_mmu_core::live_descriptor_words::LiveDescriptorWords`] in a single 4-level walk with
 //!   hardware x86-64 permission semantics (`PRESENT`, `USER` vs CPL, `WRITE` with `CR0.WP`, `NX`
 //!   with `EFER.NXE`, `CR4.SMAP` via `RFLAGS.AC` in `CPL0`, `CR4.SMEP` for `CPL0` instruction fetch
@@ -43,12 +44,13 @@ pub use carrick_core::mm::retirement::invalidation::{
 pub use domains::{
     ACCESSED, ADDRESS, Access, AuthenticatedGpa, COW, Cpl, CpuAccessMode, DEFAULT_MAX_PHY_ADDR,
     DIRTY, DescriptorRefusal, FaultClass, FrameGpa, GuestVa, HUGE, HardwareFaultClass,
-    HardwareWalkConfig, LeafSize, LiveDescriptorWords, MAX_AD_CAS_RETRIES, MAX_MAX_PHY_ADDR,
-    MAY_EXEC, MAY_WRITE, MIN_MAX_PHY_ADDR, NX, OwnerGeneration, PAGE, PAGE_BASE_MASK_4K,
-    PAGE_OFFSET_MASK_4K, PAGE_SHIFT_4K, PAGE_SIZE_4K, PAT_LARGE, PREPARED, PRESENT, PRIVATE,
-    PageFaultClass, PageFaultErrorCode, PageFaultInfo, RETIRED, RootGpa, SoftCpuException,
-    SoftFaultClass, SoftTranslationError, Stage1Gpa, TranslatedLeaf, USER, UserVa, WRITE,
-    X86Page4K, has_hardware_reserved_bits_when_present, reserved_phyaddr_mask,
+    HardwareWalkConfig, HardwareWalkContext, HardwareWalker, LeafSize, LeafSpan,
+    LiveDescriptorWords, MAX_AD_CAS_RETRIES, MAX_MAX_PHY_ADDR, MAY_EXEC, MAY_WRITE,
+    MIN_MAX_PHY_ADDR, NX, OwnerGeneration, PAGE, PAGE_BASE_MASK_4K, PAGE_OFFSET_MASK_4K,
+    PAGE_SHIFT_4K, PAGE_SIZE_4K, PAT_LARGE, PREPARED, PRESENT, PRIVATE, PageFaultClass,
+    PageFaultErrorCode, PageFaultInfo, RETIRED, RootGpa, SoftCpuException, SoftFaultClass,
+    SoftTranslationError, Stage1Gpa, Stage1Leaf, Stage1Walker, TranslatedLeaf, USER, UserVa, WRITE,
+    WalkError, X86Page4K, has_hardware_reserved_bits_when_present, reserved_phyaddr_mask,
     translate_leaf_hardware,
 };
 pub use placement::{

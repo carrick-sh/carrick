@@ -1510,3 +1510,132 @@ fn hardware_walk_enforces_cr0_wp_cr4_smep_cr4_smap_and_nxe() {
     cfg.cr4_smap = false;
     assert!(hw(Access::Read, &cfg).is_ok());
 }
+
+// #2480 N1: the Stage1Walker facade is exactly translate_leaf_hardware on the
+// same descriptor words (same result, same loads, same A/D writes), with the
+// descriptor refusal split out of the guest fault classes.
+#[test]
+fn hardware_walker_is_translate_leaf_hardware_with_refusal_split() {
+    use crate::stage1::{LeafSpan, Stage1Leaf, Stage1Walker, WalkError};
+    let configs = {
+        let base = HardwareWalkConfig::new();
+        let mut no_ad = base;
+        no_ad.update_ad = false;
+        let mut no_nxe = base;
+        no_nxe.nxe = false;
+        let mut permissive = base;
+        (permissive.cr0_wp, permissive.cr4_smep, permissive.cr4_smap) = (false, false, false);
+        [base, no_ad, no_nxe, permissive]
+    };
+    // (path index or None, clear, set): terminal edits and a refused table.
+    let edits: [(Option<usize>, u64, u64); 6] = [
+        (None, 0, 0),
+        (Some(usize::MAX), PRESENT, 0),
+        (Some(usize::MAX), WRITE, 0),
+        (Some(usize::MAX), USER, 0),
+        (Some(usize::MAX), 0, NX),
+        (Some(0), ADDRESS, 0x00ff_0000_0000),
+    ];
+    let mut rows = 0;
+    let mut seen = BTreeMap::new();
+    for size in [LeafSize::Page, LeafSize::Block2M, LeafSize::Block1G] {
+        for &(at, clear, set) in &edits {
+            for config in configs {
+                for user in [false, true] {
+                    for access in Access::ALL {
+                        for offset in [19, 0x0000_8000_0000_0000] {
+                            let fixture = || {
+                                let (words, va, _, path) = raw_translation(size);
+                                if let Some(at) = at {
+                                    let pa = path[at.min(path.len() - 1)];
+                                    let mut map = words.words.borrow_mut();
+                                    let entry = map[&pa];
+                                    map.insert(pa, (entry & !clear) | set);
+                                }
+                                (words, va)
+                            };
+                            let (direct_words, va) = fixture();
+                            let (seam_words, _) = fixture();
+                            let direct = translate_leaf_hardware(
+                                &direct_words,
+                                root(0x1000),
+                                UserVa::new(va + offset),
+                                access,
+                                user,
+                                &config,
+                            );
+                            let context = HardwareWalkContext {
+                                root: root(0x1000),
+                                user,
+                                config,
+                            };
+                            let seam = HardwareWalker.walk(
+                                &seam_words,
+                                &context,
+                                GuestVa::new(va + offset),
+                                access,
+                            );
+                            let expected = direct.map_err(|fault| match fault {
+                                HardwareFaultClass::DescriptorLoad(refusal) => {
+                                    WalkError::Refusal(refusal)
+                                }
+                                fault => WalkError::Fault(fault),
+                            });
+                            assert_eq!(seam, expected, "{size:?} {at:?} {access:?} {user}");
+                            let class = match seam {
+                                Ok(_) => "leaf",
+                                Err(WalkError::Refusal(_)) => "refusal",
+                                Err(WalkError::Fault(HardwareFaultClass::NonCanonical)) => {
+                                    "non-canonical"
+                                }
+                                Err(WalkError::Fault(HardwareFaultClass::NotPresent)) => {
+                                    "not-present"
+                                }
+                                Err(WalkError::Fault(HardwareFaultClass::Protection)) => {
+                                    "protection"
+                                }
+                                Err(WalkError::Fault(HardwareFaultClass::Nx)) => "nx",
+                                Err(WalkError::Fault(HardwareFaultClass::Reserved)) => "reserved",
+                                Err(WalkError::Fault(HardwareFaultClass::Smep)) => "smep",
+                                Err(WalkError::Fault(HardwareFaultClass::Smap)) => "smap",
+                                Err(WalkError::Fault(_)) => "other",
+                            };
+                            *seen.entry(class).or_insert(0) += 1;
+                            if let Ok(leaf) = seam {
+                                assert_eq!(leaf.output(), leaf.output);
+                                assert_eq!(
+                                    Some(leaf.span()),
+                                    LeafSpan::new(
+                                        FrameGpa::new(leaf.output.raw() & !(size.bytes() - 1)),
+                                        size.bytes()
+                                    )
+                                );
+                            }
+                            assert_eq!(
+                                (seam_words.reads.get(), seam_words.stores.get()),
+                                (direct_words.reads.get(), direct_words.stores.get())
+                            );
+                            assert_eq!(*seam_words.words.borrow(), *direct_words.words.borrow());
+                            rows += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(rows, 3 * 6 * 4 * 2 * 3 * 2);
+    // The matrix reaches every outcome the seam distinguishes.
+    for class in [
+        "leaf",
+        "refusal",
+        "non-canonical",
+        "not-present",
+        "protection",
+        "nx",
+        "reserved",
+        "smep",
+        "smap",
+    ] {
+        assert!(seen.contains_key(class), "{class} not reached: {seen:?}");
+    }
+}

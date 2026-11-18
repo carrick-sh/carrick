@@ -92,6 +92,17 @@ pub fn availability(runner: &str, gate_jobs: &[Value], now: u64) -> Result<(), S
             STRANDED_AFTER_SECS / 60
         ));
     }
+    // #2469: a Mac already running a gate isn't free. Routing to it queues this gate behind
+    // that one (about 45 min) while another gate Mac may be idle; the shared label runs the
+    // base side again (about 23 min) on whichever gate Mac frees first, which is cheaper.
+    let busy = gate_jobs
+        .iter()
+        .any(|job| job["status"] == "in_progress" && job["runner_name"].as_str() == Some(runner));
+    if busy {
+        return Err(format!(
+            "{runner} is running another gate now: route to any free gate Mac instead"
+        ));
+    }
     let live = gate_jobs.iter().any(|job| {
         job["runner_name"].as_str() == Some(runner)
             && job["started_at"]
@@ -751,7 +762,31 @@ mod tests {
                 .contains("isn't being served")
         );
         // A job queued for only 5 min is not yet a stranding.
-        let jobs = [recent, job("", "queued", None, now - 300, m4)];
+        let jobs = [recent.clone(), job("", "queued", None, now - 300, m4)];
+        assert_eq!(availability("carrick-m4", &jobs, now), Ok(()));
+        // #2469: a Mac running another gate now isn't free. Routing to it would queue this
+        // gate behind that one (about 45 min) while another gate Mac sits idle, so prefer the
+        // shared label, even though that runs the base side again (about 23 min).
+        let jobs = [
+            recent.clone(),
+            job("carrick-m4", "in_progress", Some(now - 600), now - 700, m4),
+        ];
+        assert!(
+            availability("carrick-m4", &jobs, now)
+                .unwrap_err()
+                .contains("running another gate")
+        );
+        // Another Mac's in-progress gate doesn't make carrick-m4 busy.
+        let jobs = [
+            recent.clone(),
+            job(
+                "cloudmac-gate",
+                "in_progress",
+                Some(now - 600),
+                now - 700,
+                "x",
+            ),
+        ];
         assert_eq!(availability("carrick-m4", &jobs, now), Ok(()));
         // decide() falls back to the shared label when the Mac isn't available.
         let route = decide_one(

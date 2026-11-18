@@ -1,12 +1,13 @@
-//! Stage-1 page-table walker binding over [`translate_leaf_hardware`], [`LiveDescriptorWords`],
+//! Stage-1 page-table walker binding over [`HardwareWalker`] (a [`Stage1Walker`]), [`LiveDescriptorWords`],
 //! [`LinearPlacement`], [`ExtentTable`], and [`SoftTlb`].
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use carrick_mmu_core::stage1::{Stage1Leaf, Stage1Walker, WalkError};
 use carrick_mmu_core::x86::descriptor_txn::{
     DEFAULT_MAX_PHY_ADDR, DescriptorRefusal, HardwareFaultClass, HardwareWalkConfig,
-    LiveDescriptorWords, MAX_MAX_PHY_ADDR, MIN_MAX_PHY_ADDR, translate_leaf_hardware,
+    HardwareWalkContext, HardwareWalker, LiveDescriptorWords, MAX_MAX_PHY_ADDR, MIN_MAX_PHY_ADDR,
 };
 
 use crate::domains::{
@@ -636,26 +637,21 @@ impl ExtentTable {
         self.authenticate(table, PAGE_SIZE_4K, expected_generation)
     }
 
-    pub(crate) fn authenticate_leaf(
+    pub(crate) fn authenticate_leaf<L: Stage1Leaf>(
         &self,
         root: RootGpa,
-        leaf: &TranslatedLeaf,
+        leaf: &L,
     ) -> Result<AuthenticatedGpa, Option<OwnerGeneration>> {
         let expected = self.expected_generation(root).ok_or(None)?;
-        let leaf_size = if leaf.size >= PAGE_SIZE_4K && leaf.size.is_power_of_two() {
-            leaf.size
-        } else {
-            PAGE_SIZE_4K
-        };
-        let leaf_base = Stage1Gpa::from_leaf_base(leaf);
+        let span = leaf.span();
         let record = self
-            .lookup_span(leaf_base.raw(), leaf_size)
+            .lookup_span(span.base().raw(), span.bytes())
             .ok_or(Some(expected))?;
         if record.generation != expected {
             return Err(Some(expected));
         }
         Ok(AuthenticatedGpa::from_authenticated_raw(
-            leaf.output.raw() & PAGE_BASE_MASK_4K,
+            leaf.output().raw() & PAGE_BASE_MASK_4K,
         ))
     }
 
@@ -977,7 +973,7 @@ pub struct SoftWalkerStats {
 }
 
 /// Stage-1 page-table walker binding that enforces x86 hardware permission rules in a single walk
-/// via [`translate_leaf_hardware`] and populates [`SoftTlb`].
+/// via the [`HardwareWalker`] [`Stage1Walker`] and populates [`SoftTlb`].
 #[derive(Clone, Copy, Debug)]
 pub struct SoftWalker {
     max_phy_addr: u8,
@@ -1057,7 +1053,7 @@ impl SoftWalker {
         SoftTranslationError::CpuException(exc)
     }
 
-    /// Perform a single slow-path stage-1 hardware walk via [`translate_leaf_hardware`] and populate `tlb`.
+    /// Perform a single slow-path stage-1 hardware walk via [`HardwareWalker`] and populate `tlb`.
     pub fn walk_and_fill<M: SoftMmuMemory>(
         &mut self,
         memory: &mut M,
@@ -1083,32 +1079,29 @@ impl SoftWalker {
             update_ad: true,
         };
 
+        let context = HardwareWalkContext {
+            root,
+            user: effective_mode.cpl.is_user(),
+            config: hw_config,
+        };
         let walk_res = {
             let checked = AuthenticatedDescriptorWords::new(memory, root);
-            let dva = va.to_descriptor_va();
-            translate_leaf_hardware(
-                &checked,
-                root,
-                dva,
-                access,
-                effective_mode.cpl.is_user(),
-                &hw_config,
-            )
+            HardwareWalker.walk(&checked, &context, va, access)
         };
         let leaf = match walk_res {
             Ok(leaf) => leaf,
-            Err(HardwareFaultClass::NonCanonical) => {
+            Err(WalkError::Fault(HardwareFaultClass::NonCanonical)) => {
                 return Err(self.non_canonical_exception(va, access, effective_mode));
             }
-            Err(HardwareFaultClass::DescriptorLoad(refusal)) => {
+            Err(WalkError::Refusal(refusal)) => {
                 self.stats.descriptor_load_errors += 1;
                 return Err(SoftTranslationError::DescriptorLoad { va, refusal });
             }
-            Err(HardwareFaultClass::AdCasRetryExhausted { retries }) => {
+            Err(WalkError::Fault(HardwareFaultClass::AdCasRetryExhausted { retries })) => {
                 self.stats.ad_cas_retries_exhausted += 1;
                 return Err(SoftTranslationError::AdCasRetryExhausted { va, retries });
             }
-            Err(hw_fault) => {
+            Err(WalkError::Fault(hw_fault)) => {
                 let pf_class = match hw_fault {
                     HardwareFaultClass::NotPresent => PageFaultClass::NotPresent,
                     HardwareFaultClass::Reserved => PageFaultClass::ReservedBit,

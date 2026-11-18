@@ -298,6 +298,10 @@ mod decode {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Immediate16(u16);
     impl Immediate16 {
+        /// Preserve a complete architectural 16-bit immediate field.
+        pub const fn new(value: u16) -> Self {
+            Self(value)
+        }
         pub const fn value(self) -> u16 {
             self.0
         }
@@ -352,20 +356,6 @@ mod decode {
         S1E1Rp,
         S1E1Wp,
     }
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum TlbOperation {
-        Vae1,
-        Vale1,
-        Aside1,
-        Vaae1,
-        Vaale1,
-    }
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Shareability {
-        InnerShareable,
-        NonShareable,
-    }
-
     /// Operands of the supported leaves. Other existing census classes have no
     /// operand decoder yet and return None from `decode`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,19 +383,14 @@ mod decode {
             op: Translation,
             xt: Register,
         },
-        TlbInvalidate {
-            op: TlbOperation,
-            scope: Shareability,
-            xt: Register,
-        },
     }
 
     /// Arm ARM DDI0487G.a, "A64 instruction set encoding", Data-processing
     /// (2 source), pp. C4-329–330; Data-processing (1 source), pp. C4-330–331;
     /// Exception generation (BRK), pp. C4-286–287; Barriers (CLREX), p. C4-289; and "A64 system instructions for address
-    /// translation" / "A64 system instructions for TLB maintenance" tables.
-    /// Only the baseline AT forms plus FEAT_PAN2 RP/WP and the EL1 VA/ASID
-    /// TLBI forms listed here are admitted; extension and reserved leaves fail shut.
+    /// translation" tables.
+    /// Only baseline AT forms plus FEAT_PAN2 RP/WP are admitted here;
+    /// TLBI uses loader::decode exclusively.
     pub fn decode(w: u32) -> Option<Decoded> {
         let rd = Register((w & 31) as u8);
         let rn = Register(((w >> 5) & 31) as u8);
@@ -473,30 +458,11 @@ mod decode {
             };
             return Some(Decoded::AddressTranslate { op, xt: rd });
         }
-        // SYS op1=0 CRn=8. CRm=3/7 selects IS/local; op2=4/6 are
-        // unallocated, and VMALLE1 (op2=0) stays in the existing census class.
-        if w & 0xfffff000 == 0xd5088000 {
-            let scope = match (w >> 8) & 15 {
-                3 => Shareability::InnerShareable,
-                7 => Shareability::NonShareable,
-                _ => return None,
-            };
-            let op = match (w >> 5) & 7 {
-                1 => TlbOperation::Vae1,
-                2 => TlbOperation::Aside1,
-                3 => TlbOperation::Vaae1,
-                5 => TlbOperation::Vale1,
-                7 => TlbOperation::Vaale1,
-                _ => return None,
-            };
-            return Some(Decoded::TlbInvalidate { op, scope, xt: rd });
-        }
         None
     }
 }
 pub use decode::{
-    Decoded, ExclusiveOption, Immediate16, Register, Shareability, Shift, TlbOperation,
-    Translation, Unary, Width, decode,
+    Decoded, ExclusiveOption, Immediate16, Register, Shift, Translation, Unary, Width, decode,
 };
 
 /// MRS/MSR encoding fields, preserving the architectural namespace exactly.
@@ -588,8 +554,26 @@ pub fn classify(w: u32) -> A64Class {
             Decoded::Breakpoint { .. } => A64Class::Breakpoint,
             Decoded::ClearExclusive { .. } => A64Class::ClearExclusive,
             Decoded::AddressTranslate { .. } => A64Class::AddressTranslate,
-            Decoded::TlbInvalidate { .. } => A64Class::TlbInvalidate,
         };
+    }
+    // Preserve the original census bucket for the 320 EL1 VA/ASID words,
+    // using the one typed TLBI decoder (C6.2.332).
+    if let Some(Instruction::SystemOperation(op)) = loader::decode(w)
+        && matches!(
+            op.operation,
+            TlbiOperation::Vae1is
+                | TlbiOperation::Aside1is
+                | TlbiOperation::Vaae1is
+                | TlbiOperation::Vale1is
+                | TlbiOperation::Vaale1is
+                | TlbiOperation::Vae1
+                | TlbiOperation::Aside1
+                | TlbiOperation::Vaae1
+                | TlbiOperation::Vale1
+                | TlbiOperation::Vaale1
+        )
+    {
+        return A64Class::TlbInvalidate;
     }
     // Branches, Exception Generating and System: exception generation,
     // unconditional branch (register/immediate), compare/test/conditional.

@@ -4,10 +4,12 @@ pub use crate::aarch64::descriptor_txn::{
 };
 pub use crate::descriptor_refusal::DescriptorRefusal;
 pub use crate::live_descriptor_words::LiveDescriptorWords;
+pub use crate::stage1::{LeafAccess as Access, LeafSize};
+use crate::stage1::{LeafSpan, Stage1Leaf, Stage1Walker, WalkError};
 use alloc::{collections::BTreeMap, vec::Vec};
 use carrick_guest_arch::{
     Access as GuestAccess, EditBacking, EditCowAccess, EditIntent, EditLeafSize, EditOperation,
-    EditPermissions, FrameGpa, RootGpa, UserVa,
+    EditPermissions, FrameGpa, GuestVa, RootGpa, UserVa,
 };
 
 pub const PAGE: u64 = 4096;
@@ -33,26 +35,12 @@ pub struct Permissions {
     pub executable: bool,
     pub user: bool,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LeafSize {
-    Page,
-    Block2M,
-    Block1G,
-}
-impl LeafSize {
-    pub const fn bytes(self) -> u64 {
-        match self {
-            Self::Page => PAGE,
-            Self::Block2M => 1 << 21,
-            Self::Block1G => 1 << 30,
-        }
-    }
-    const fn level(self) -> usize {
-        match self {
-            Self::Page => 3,
-            Self::Block2M => 2,
-            Self::Block1G => 1,
-        }
+/// x86 paging level holding a leaf of `size`: PT, PD or PDPT.
+const fn leaf_level(size: LeafSize) -> usize {
+    match size {
+        LeafSize::Page => 3,
+        LeafSize::Block2M => 2,
+        LeafSize::Block1G => 1,
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -334,7 +322,7 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
             0,
             span.va + offset,
             offset,
-            size.level(),
+            leaf_level(size),
         )?;
     }
     Ok(DescriptorPlan {
@@ -933,12 +921,6 @@ pub fn execute_descriptor_txn<W: LiveDescriptorWords + ?Sized, J: DescriptorJour
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Access {
-    Read,
-    Write,
-    Execute,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultClass {
     NotPresent,
     CowWrite,
@@ -1370,6 +1352,62 @@ pub fn translate_leaf_hardware<W: LiveDescriptorWords + ?Sized>(
     config: &HardwareWalkConfig,
 ) -> Result<TranslatedLeaf, HardwareFaultClass> {
     walk_leaf_inner(words, root, va, access, user, WalkMode::Hardware(config))
+}
+
+/// Inputs of one x86 hardware walk: the PML4 root, whether the access is
+/// at CPL3, and the paging controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HardwareWalkContext {
+    pub root: RootGpa,
+    pub user: bool,
+    pub config: HardwareWalkConfig,
+}
+
+/// The x86-64 four-level hardware walk as a [`Stage1Walker`]: exactly
+/// [`translate_leaf_hardware`], with a descriptor-memory refusal split out of
+/// the guest fault classes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HardwareWalker;
+
+impl Stage1Walker for HardwareWalker {
+    type Context = HardwareWalkContext;
+    /// Never [`HardwareFaultClass::DescriptorLoad`]: that is a [`WalkError::Refusal`].
+    type Fault = HardwareFaultClass;
+    type Leaf = TranslatedLeaf;
+
+    #[inline]
+    fn walk<D: LiveDescriptorWords + ?Sized>(
+        &self,
+        words: &D,
+        context: &HardwareWalkContext,
+        va: GuestVa,
+        access: Access,
+    ) -> Result<TranslatedLeaf, WalkError<HardwareFaultClass>> {
+        translate_leaf_hardware(
+            words,
+            context.root,
+            va.to_descriptor_va(),
+            access,
+            context.user,
+            &context.config,
+        )
+        .map_err(|fault| match fault {
+            HardwareFaultClass::DescriptorLoad(refusal) => WalkError::Refusal(refusal),
+            fault => WalkError::Fault(fault),
+        })
+    }
+}
+
+impl Stage1Leaf for TranslatedLeaf {
+    #[inline]
+    fn output(&self) -> FrameGpa {
+        self.output
+    }
+
+    #[inline]
+    fn span(&self) -> LeafSpan {
+        LeafSpan::containing(self.output, self.size)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

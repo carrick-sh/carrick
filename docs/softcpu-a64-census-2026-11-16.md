@@ -137,3 +137,91 @@ or promote an Unknown word to a recognized instruction.
 | `0x9acd21cd` | variable shifts | 8 | `0x2d04129e58` |
 | `0x1ac82528` | variable shifts | 7 | `0x2d0402bc9c` |
 | `0x9ada2108` | variable shifts | 7 | `0x2d0408f290` |
+
+## Hosted decode gate (#2454)
+
+`just a64-census-gate` builds the production ELF through the CLI's
+`carrick-el1-image` dependency on Linux. Cargo build-script JSON identifies the
+fresh image's output directory. The gate runs the production census with
+`--strict`, then all ignored softcpu integration witnesses, including both
+real-image tests and the LLVM operand differentials (#2470). It sets
+`CARRICK_A64_ELF` and uses the pinned Rust sysroot's `llvm-objdump` through
+`CARRICK_LLVM_OBJDUMP` (an explicit override is accepted). No guest VM boots.
+The toolchain must include `aarch64-unknown-none-softfloat` and LLVM tools;
+`jq` is required. Build metadata and the census report remain under
+`$CARGO_TARGET_DIR/a64-census-gate` (default `target/a64-census-gate`).
+
+The report includes `typed_undecoded_count` and `typed_undecoded`, retaining
+span, address, encoding and classifier class for each word the typed decoder
+rejects. Classifier unknowns remain a separate population; the two populations
+may overlap. Report mode exits zero; strict mode rejects either population.
+These are static decoding checks, not evidence of instruction execution.
+
+For a known-answer negative run, pass a copy of the ELF with an executable
+mapping-symbol word replaced by `0xffffffff` to
+`just a64-census-gate /path/to/corrupted.elf`. The override affects the census
+and both real-image witnesses. To check the LLVM harness fails closed, run with
+`CARRICK_LLVM_OBJDUMP=/bin/false`; the differentials must fail.
+
+The director-supplied hosted job is advisory initially. Its stable check name
+is `A64 census gate` (job id `a64-census-gate`); do not add it to `ci-ok` or
+branch-protection requirements until the director promotes it.
+
+## Round 2: loader/vector typed gaps
+
+After #2455 merged, the loader/vector subset still contains **2,081**
+typed-undecoded words: 10 in `loader-maintenance`, 2,071 across the 28 vector
+builder configurations. These are synthesized by `carrick-mem::memory`, not
+ELF sections or linker symbols. The production ELF's mapping-symbol spans are
+an independent population (the subject of #2471).
+
+| Class | Words | LLVM mnemonic cross-check |
+|---|---:|---|
+| Mrs | 616 | `mrs` (ELR, ESR, FAR, SPSR, SP_EL0, TPIDR, TTBR0) |
+| Msr | 427 | `msr` (ELR, ESR, FAR, SPSR, TPIDR) |
+| Eret | 598 | `eret` |
+| Hvc | 357 | `hvc #1/#2/#3/#4/#5/#7` |
+| Barrier | 78 | `dsb sy/ish/ishst`, `isb` |
+| LseAtomic | 4 | `ldaddal x17, xzr, [x16]` |
+| Tlbi | 1 | `tlbi vmalle1is` |
+
+All rejected words are real emitted instructions. No rejected word is a
+literal, zero/UDF word, NOP padding, or `.balign` filler. The builders fill
+unused vector and maintenance space explicitly with NOPs, which already decode.
+The four LSE words occur in clock transport code; LLVM notes that destination
+XZR drops acquire semantics. A future typed implementation must preserve that
+operand-dependent behavior.
+
+The 16 KiB maintenance span includes the initial maintenance/service-return
+sequence and the ASID maintenance sequence at offset `0x100`. The vector spans
+cover the 16-slot table plus identity/fstat, mailbox, clock, current-EL sync,
+EL1 vector, EL0 IRQ/signal/fault and resume-invalidation handlers. Multiplicity
+across configurations is intentional. Excluding these words as data would hide
+real decode gaps; no span fix is proposed. The detailed region/configuration
+breakdown and reproduction commands are in the round 2 PR evidence comment.
+
+The rebased production CLI run reports 2,600 spans, 458,467 words, zero
+classifier unknowns and 3,363 typed-undecoded words (1,282 in ELF `.text`,
+2,081 in synthesized loader/vector pages). Strict exits 1. Every synthesized
+span's SHA-256 and every rejected word's span/offset/encoding match the
+independent diagnostic above. These are measurements before #2471 lands,
+not a claim that the remaining decode work is closed.
+
+## Strict typed gate (#2454)
+
+`just a64-census-gate` builds the production ELF, prints the strict census
+summary, and runs the real-image, generated loader/vector and LLVM arithmetic
+witnesses. It fails on an unknown or typed-undecoded word, an export failure,
+or any witness/tool failure. `CARRICK_LLVM_OBJDUMP` defaults to the pinned Rust
+sysroot's LLVM tool; an explicit override is retained for known-answer checks.
+The optional recipe argument selects another ELF for negative controls.
+
+`carrick debug a64-census <ELF> --export-loader-spans <OUTPUT>` prints the same
+measurement and writes every production loader/vector page in census order as
+concatenated little-endian 32-bit words, without a header. This uses the same
+span enumeration as the census, retaining padding and repeated configurations.
+Without the export flag, census behavior is unchanged.
+The recipe creates a temporary export, sets `CARRICK_A64_LOADER_SPANS` for the
+ignored loader witness, and removes the export on exit, including failure.
+No guest executes in this gate; a green static gate establishes typed closure
+for these measured spans, not runtime emulation correctness.
