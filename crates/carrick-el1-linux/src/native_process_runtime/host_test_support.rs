@@ -1805,11 +1805,19 @@ pub struct NativeServiceCapacityFixture<C: ProcessContext + 'static = ParkedCont
         carrick_core_abi::service::ServiceTicket<&'static carrick_core_abi::service::ServiceCell>,
     >,
     children: usize,
+    hold_notice: bool,
+    parked_count: usize,
 }
 
 impl NativeServiceCapacityFixture {
     pub fn new(children: usize) -> Self {
         Self::new_with_rusage(children, UserVa::new(0))
+    }
+
+    pub fn new_with_held_notice(children: usize) -> Self {
+        let mut fixture = Self::new(children);
+        fixture.hold_notice = true;
+        fixture
     }
 
     fn new_with_rusage(children: usize, rusage: UserVa) -> Self {
@@ -2008,6 +2016,8 @@ impl<C: ProcessContext + 'static> NativeServiceCapacityFixture<C> {
             fixture,
             pending: Vec::new(),
             children,
+            hold_notice: false,
+            parked_count: 0,
         }
     }
 
@@ -2094,6 +2104,10 @@ impl NativeServiceCapacityFixture {
         ));
         assert!(entry.take_handoff_receipt().is_some());
         assert!(fixture.zone.slot(fixture.slot).current().is_none());
+        if self.hold_notice {
+            self.parked_count += 1;
+            return Some(self.parked_count);
+        }
         let notice = fixture.task.service_notice.take().unwrap().unwrap();
         let queue = fixture
             .zone
@@ -2116,7 +2130,76 @@ impl NativeServiceCapacityFixture {
     }
 
     pub fn outstanding(&self) -> usize {
-        self.pending.len()
+        if self.hold_notice {
+            self.parked_count
+        } else {
+            self.pending.len()
+        }
+    }
+
+    pub fn acknowledge_contended_and_retire(&mut self) {
+        use carrick_core_abi::service::ServiceCell;
+        assert_eq!(self.parked_count, self.children);
+        let fixture = &self.fixture;
+        let mut completed = 0usize;
+        while completed < self.children {
+            let notice = fixture.task.service_notice.take().unwrap().unwrap();
+            let holder = notice.record;
+            let identity = fixture.zone.record(holder.id).identity();
+            let queue = fixture
+                .zone
+                .object_wait(
+                    carrick_sched_core::object_wait::ObjectWaitKey::native_service(holder).unwrap(),
+                    &carrick_sched_core::ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                )
+                .unwrap();
+            // SAFETY: the real native owner retains this exact control allocation.
+            let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+            let ticket = unsafe {
+                ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, identity)
+            }
+            .unwrap();
+            assert!(ticket.complete(true).is_ok());
+            queue
+                .notify_object(fixture.slot, &mut WakeEffects::default())
+                .unwrap();
+            drop(queue);
+
+            while let Some((record, address, words)) = self.select() {
+                let mut service = fixture.service();
+                let mut entry = fixture
+                    .runtime
+                    .enter_registered(
+                        fixture.registry,
+                        BornInZoneSource {
+                            zone: fixture.zone,
+                            slot: fixture.slot,
+                        },
+                        fixture.task,
+                        address,
+                        &words,
+                        &mut service,
+                    )
+                    .unwrap();
+                match entry.resume_checkpoint(|_| Ok(None)).unwrap() {
+                    NativeResume::Returned(result) => {
+                        assert_eq!(result.raw(), words.syscall_return() as i64);
+                        assert!(!fixture.runtime.graph.lock().has_member_wait(&record));
+                        assert!(matches!(
+                            entry.exit_group(0),
+                            LifecycleOutcome::Transferred { .. }
+                        ));
+                        completed += 1;
+                    }
+                    NativeResume::Left(None) => {}
+                    _ => panic!("unexpected resume"),
+                }
+            }
+        }
+        assert!(fixture.task.service_notice.take().unwrap().is_none());
     }
 
     pub fn acknowledge_and_retire(&mut self) {

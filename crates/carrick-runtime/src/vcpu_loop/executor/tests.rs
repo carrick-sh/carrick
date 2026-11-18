@@ -9678,6 +9678,60 @@ fn native_service_waits_do_not_exhaust_the_default_executor_pool() {
     native.lock().acknowledge_and_retire();
 }
 
+/// #2532 round 4: contended `ServiceNotice` waits must release execution
+/// capacity just like ordinary native-service waits, never exhausting the
+/// default executor pool when the first child's notice remains unconsumed.
+#[test]
+fn native_service_notice_contention_does_not_exhaust_the_default_executor_pool() {
+    use carrick_el1_linux::native_process_runtime::host_test_support::NativeServiceCapacityFixture;
+    let (kernel, _root) = bootstrap(19_741);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let config = ExecutorPoolConfig {
+        bound_workers: super::pool::bound_executors_from_value(1, None),
+        spare_executors: super::pool::spare_executors_from_value(1, None),
+        vcpu_ceiling: 8,
+        reserve: 1,
+    };
+    let workers = config.executor_count().unwrap();
+    assert_eq!(workers, 3);
+    let children = workers + 1;
+    let native = Arc::new(parking_lot::Mutex::new(
+        NativeServiceCapacityFixture::new_with_held_notice(children),
+    ));
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let factory = Arc::new(FakeFactory {
+        native_services: Some(Arc::clone(&native)),
+        native_progress: Some(progress_tx),
+        ..FakeFactory::default()
+    });
+    let pool = ExecutorPool::start(
+        config,
+        scheduler,
+        Arc::clone(&factory),
+        Arc::clone(&factory),
+        ExecutorBoundaryAudit::production(),
+    )
+    .unwrap();
+    let progressed: Result<BTreeSet<_>, _> = (0..children)
+        .map(|_| progress_rx.recv_timeout(Duration::from_secs(5)))
+        .collect();
+    let report = pool.shutdown().unwrap();
+    assert_eq!(
+        progressed,
+        Ok((1..=children).collect()),
+        "all contended children must park before the first notice is consumed"
+    );
+    assert_eq!(native.lock().outstanding(), children);
+    assert!(
+        factory.bindings.lock().is_empty(),
+        "no host child task adoption"
+    );
+    assert_eq!(report.created(), workers);
+    assert_eq!(report.destroyed(), workers);
+    assert_eq!(report.joined(), workers);
+    native.lock().acknowledge_contended_and_retire();
+}
+
 /// #900: the pool's shutdown kick reaches a worker waiting in the guest's
 /// scheduler as durable host work on its zone slot, not a bare hardware
 /// kick. The guest scheduler may be running a native thread at EL0 on that
