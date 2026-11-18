@@ -84,11 +84,11 @@ fn undefined(cpu: &mut CpuState) -> Outcome {
     Outcome::Continue
 }
 
-fn read(cpu: &CpuState, r: OperandRegister) -> u64 {
+fn operand(cpu: &CpuState, r: OperandRegister) -> u64 {
     cpu.read_operand(r).0
 }
 
-fn write(cpu: &mut CpuState, r: OperandRegister, value: u64) {
+fn set_operand(cpu: &mut CpuState, r: OperandRegister, value: u64) {
     cpu.write_operand(r, RegisterValue(value));
 }
 
@@ -109,14 +109,14 @@ pub fn execute(
         Instruction::SystemAccess(a) => match a.direction {
             SystemDirection::Read => match cpu.mrs(a.encoding, a.rt) {
                 Ok(v) => {
-                    write(cpu, a.rt, v.0);
+                    set_operand(cpu, a.rt, v.0);
                     next(cpu);
                     Outcome::Continue
                 }
                 Err(e) => system_trap(cpu, e),
             },
             SystemDirection::Write => {
-                let value = SystemValue(read(cpu, a.rt));
+                let value = SystemValue(operand(cpu, a.rt));
                 if is_sctlr(a.encoding)
                     && cpu.pstate.el == ExceptionLevel::El1
                     && value.0 & 1 != 0
@@ -186,10 +186,10 @@ pub fn execute(
         }
         Instruction::Unallocated => undefined(cpu),
         Instruction::Branch(Branch::Register { op, rn }) => {
-            let target = read(cpu, rn);
+            let target = operand(cpu, rn);
             if op == RegisterBranch::Call {
                 let link = cpu.pc.0.wrapping_add(4);
-                write(cpu, OperandRegister::Gpr(LINK), link);
+                set_operand(cpu, OperandRegister::Gpr(LINK), link);
             }
             cpu.pc = ProgramCounter(target);
             Outcome::Continue
@@ -333,7 +333,7 @@ fn memory_operation(
                     index,
                     ..
                 } => {
-                    let b = read(cpu, base);
+                    let b = operand(cpu, base);
                     let moved = b.wrapping_add(offset.bytes() as i64 as u64);
                     match index {
                         MemoryIndex::Offset => (moved, None),
@@ -352,21 +352,21 @@ fn memory_operation(
                     } else {
                         0
                     };
-                    let index = extend(read(cpu, offset), e) << shift;
-                    (read(cpu, base).wrapping_add(index), None)
+                    let index = extend(operand(cpu, offset), e) << shift;
+                    (operand(cpu, base).wrapping_add(index), None)
                 }
                 MemoryAddress::Literal(offset) => {
                     (cpu.pc.0.wrapping_add(offset.bytes() as u64), None)
                 }
             };
             if m.operation == MemoryOperation::Store {
-                store(memory, address, m.size, read(cpu, rt))?;
+                store(memory, address, m.size, operand(cpu, rt))?;
             } else {
                 let v = load(memory, address, m.size)?;
-                write(cpu, rt, loaded(v, m.size, m.operation, width));
+                set_operand(cpu, rt, loaded(v, m.size, m.operation, width));
             }
             if let Some((base, value)) = writeback {
-                write(cpu, base, value);
+                set_operand(cpu, base, value);
             }
         }
         Instruction::PairMemory(p) => {
@@ -374,7 +374,7 @@ fn memory_operation(
             else {
                 return Ok(None);
             };
-            let b = read(cpu, p.base);
+            let b = operand(cpu, p.base);
             let moved = b.wrapping_add(p.offset.bytes() as i64 as u64);
             let address = if p.index == MemoryIndex::Post {
                 b
@@ -383,25 +383,25 @@ fn memory_operation(
             };
             let step = u64::from(p.size.bytes());
             if p.operation == MemoryOperation::Store {
-                store(memory, address, p.size, read(cpu, first))?;
+                store(memory, address, p.size, operand(cpu, first))?;
                 store(
                     memory,
                     address.wrapping_add(step),
                     p.size,
-                    read(cpu, second),
+                    operand(cpu, second),
                 )?;
             } else {
                 let a = load(memory, address, p.size)?;
                 let c = load(memory, address.wrapping_add(step), p.size)?;
-                write(cpu, first, loaded(a, p.size, p.operation, width));
-                write(cpu, second, loaded(c, p.size, p.operation, width));
+                set_operand(cpu, first, loaded(a, p.size, p.operation, width));
+                set_operand(cpu, second, loaded(c, p.size, p.operation, width));
             }
             if p.index != MemoryIndex::Offset {
-                write(cpu, p.base, moved);
+                set_operand(cpu, p.base, moved);
             }
         }
         Instruction::AtomicTransfer(t) => {
-            let address = read(cpu, t.base);
+            let address = operand(cpu, t.base);
             let step = u64::from(t.size.bytes());
             let count = if t.second.is_some() { 2 } else { 1 };
             match t.kind {
@@ -411,41 +411,41 @@ fn memory_operation(
                         Some(_) => load(memory, address.wrapping_add(step), t.size)?,
                         None => 0,
                     };
-                    write(cpu, t.first, a);
+                    set_operand(cpu, t.first, a);
                     if let Some(second) = t.second {
-                        write(cpu, second, c);
+                        set_operand(cpu, second, c);
                     }
                     if matches!(t.kind, AtomicTransferKind::LoadExclusive { .. }) {
                         monitor.reservation = Some((address, t.size.bytes() * count));
                     }
                 }
                 AtomicTransferKind::StoreRelease => {
-                    store(memory, address, t.size, read(cpu, t.first))?;
+                    store(memory, address, t.size, operand(cpu, t.first))?;
                 }
                 AtomicTransferKind::StoreExclusive { status, .. } => {
                     let held = monitor.reservation == Some((address, t.size.bytes() * count));
                     if held {
-                        store(memory, address, t.size, read(cpu, t.first))?;
+                        store(memory, address, t.size, operand(cpu, t.first))?;
                         if let Some(second) = t.second {
                             store(
                                 memory,
                                 address.wrapping_add(step),
                                 t.size,
-                                read(cpu, second),
+                                operand(cpu, second),
                             )?;
                         }
                     }
                     monitor.clear();
-                    write(cpu, status, u64::from(!held));
+                    set_operand(cpu, status, u64::from(!held));
                 }
             }
         }
         Instruction::AtomicAdd(a) => {
-            let address = read(cpu, a.base);
+            let address = operand(cpu, a.base);
             let old = load(memory, address, a.size)?;
-            let addend = read(cpu, a.source);
+            let addend = operand(cpu, a.source);
             store(memory, address, a.size, old.wrapping_add(addend))?;
-            write(cpu, a.destination, old);
+            set_operand(cpu, a.destination, old);
         }
         _ => return Ok(None),
     }
