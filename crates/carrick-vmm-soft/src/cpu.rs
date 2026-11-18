@@ -159,8 +159,18 @@ impl X86Vcpu for SoftBootVcpu<'_> {
             X86Reg::Efer => self.write_msr(carrick_softcpu_x86::MSR_IA32_EFER, value)?,
             gpr => self.ctx.gpr[gpr_index(gpr).ok_or_else(|| fail("soft register"))?] = value,
         }
+        if reg == X86Reg::Cr0 {
+            self.ctx.sync_efer_lma();
+        }
         if matches!(reg, X86Reg::Cr0 | X86Reg::Cr3 | X86Reg::Cr4) {
             self.ctx.flush_tlb();
+        }
+        // RFLAGS.AC, CR0.WP and CR4.SMEP/SMAP are part of the TLB's
+        // access-mode tag (the EFER MSR write refreshes it itself).
+        if matches!(
+            reg,
+            X86Reg::Rflags | X86Reg::Cr0 | X86Reg::Cr3 | X86Reg::Cr4
+        ) {
             self.ctx.sync_tlb_tag_bits();
         }
         Ok(())
@@ -176,17 +186,14 @@ impl X86Vcpu for SoftBootVcpu<'_> {
             X86Seg::Ss => self.ctx.ss = segment,
             X86Seg::Ds => self.ctx.ds = segment,
             X86Seg::Es => self.ctx.es = segment,
+            // As on KVM, the descriptor's base is the FS/GS base.
             X86Seg::Fs => {
-                self.ctx.fs = SoftSegment {
-                    base: self.ctx.fs_base(),
-                    ..segment
-                }
+                self.ctx.fs = segment;
+                self.set_fs_base(descriptor.base())?;
             }
             X86Seg::Gs => {
-                self.ctx.gs = SoftSegment {
-                    base: self.ctx.gs_base(),
-                    ..segment
-                }
+                self.ctx.gs = segment;
+                self.set_gs_base(descriptor.base())?;
             }
             X86Seg::Tr => self.ctx.tr = segment,
             X86Seg::Ldtr => self.ctx.ldtr = segment,
