@@ -917,7 +917,7 @@ pub fn apply_descriptor_plan<W: LiveDescriptorWords + ?Sized, J: DescriptorJourn
         if let Some((reason, restored)) = error {
             words.descriptor_diagnostic(DescriptorDiagnostic::PlanRefused {
                 site: DescriptorPlanRefusalSite::Apply,
-                reason: reason,
+                reason,
                 op_kind: plan.op_kind,
                 live_stores: plan.entries.len(),
                 table_grants: plan.tables_linked,
