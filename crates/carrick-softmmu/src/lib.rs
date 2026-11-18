@@ -28,8 +28,10 @@
 //! - [`resolve_leaf`]: the ISA-neutral slow path every binding shares: any [`Stage1Walker`] over
 //!   [`AuthenticatedDescriptorWords`], the MMIO-hole screen, extent authentication of the leaf's
 //!   whole span and [`LinearPlacement::host`]. x86 [`SoftWalker::walk_and_fill`] calls it with
-//!   [`HardwareWalker`]; the AArch64 soft CPU calls it with
-//!   `carrick_mmu_core::aarch64::stage1_walk::Aarch64Walker`.
+//!   [`HardwareWalker`], and the contract test (`crates/carrick-softmmu/tests/softmmu_contract.rs`)
+//!   calls it with `carrick_mmu_core::aarch64::stage1_walk::Aarch64Walker`; the AArch64 soft CPU
+//!   engine still uses `mmu::translate` (`crates/carrick-softcpu-aarch64/src/mmu.rs`) until it
+//!   moves onto `carrick-softmmu`.
 
 #![no_std]
 extern crate alloc;
