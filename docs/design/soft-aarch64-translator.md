@@ -215,6 +215,30 @@ On the arm64 runner (`#[cfg(all(target_arch = "aarch64", target_os = "linux"))]`
   maps each faulting page as zero to show what comes next. The stage-1 walker
   is a later shared-crate slice.
 
+## System registers in the production image
+
+The typed census follows the ELF's code mapping symbols and decodes the
+generated loader/vector spans separately. The ELF entry symbol is
+`carrick_el1_syscall`. Its function body has no MRS or MSR. Elsewhere in the
+ELF the decoded accesses are:
+
+| Access | Registers |
+| --- | --- |
+| Read | MPIDR_EL1, PAR_EL1, CNTFRQ_EL0, CNTVCT_EL0, ICC_IAR1_EL1 |
+| Write | TTBR1_EL1, CNTV_CTL_EL0, CNTV_CVAL_EL0, ICC_EOIR1_EL1, ICC_SGI1R_EL1 |
+| Read and write | TTBR0_EL1, SP_EL0, CONTEXTIDR_EL1, TPIDR_EL0, TPIDRRO_EL0, DAIF, FPCR, FPSR |
+
+The generated vector spans also read TTBR0_EL1 and SP_EL0, and read and
+write ELR_EL1, SPSR_EL1, ESR_EL1, FAR_EL1 and TPIDR_EL1. The existing
+EL1h register bank accepts every direction observed in these spans.
+Timer and interrupt-controller slots hold passive state until their
+devices are wired.
+
+The measured code contains no MSR to SCTLR_EL1. The probe enters a
+syscall vector's callee with a fabricated trap frame, so the presence of
+GIC or timer accesses elsewhere in the ELF cannot establish pre-MMU
+execution of those instructions.
+
 ## Open questions for the director
 
 1. (Ruled) `carrick-host-jit` and `carrick-softcpu-aarch64-host`, plus their
