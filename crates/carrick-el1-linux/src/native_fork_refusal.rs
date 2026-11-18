@@ -35,6 +35,9 @@ pub enum NativeForkStage {
     Abort,
     OpenChildSpace,
     StockCrossing,
+    /// An untyped answer reached the fork entry from the birth or its MM
+    /// service ([`typed_invariant`]).
+    Entry,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +73,19 @@ pub enum NativeForkCause {
     MetadataOwed {
         grant: carrick_el1_abi::OwedMetadataGrant,
     },
+    /// The birth or its MM service answered a bare invariant refusal
+    /// instead of a typed cause: the fork's own records, lifecycle page or
+    /// loaned stock contradicted themselves ([`typed_invariant`]).
+    Untyped(UntypedInvariant),
+}
+
+/// A bare native answer that, in a fork, names a broken invariant: the
+/// fork walks no guest address, so none of them is a guest error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UntypedInvariant {
+    Stale,
+    Invalid,
+    Quarantined,
 }
 
 impl From<MmError> for NativeForkCause {
@@ -126,7 +142,8 @@ pub struct NativeForkRefusal {
 ///   error; `Refusal::{Stale, Invalid, Collision, Hole, ForeignMapping}`;
 ///   `ForkError::{Invalid, Stale, Core}` and the owner refusals `Invalid`,
 ///   `Collision`, `Hole` and `ForeignMapping`; a stock `Invalid` or `Stale`
-///   reply; and a stock crossing that failed without a typed reply. The
+///   reply; a stock crossing that failed without a typed reply; and an
+///   untyped `Stale`, `Invalid` or `Quarantined` answer. The
 ///   live parent's MM cannot be retired or rewritten under its own
 ///   reserved birth, and the fork walks no guest address, so each of these
 ///   means the owner contradicted itself, never a guest error.
@@ -165,6 +182,9 @@ impl NativeForkRefusal {
                 ..
             } => stock_class(refusal),
             NativeForkCause::StockCrossing { reply: None, .. } => Class::InvariantViolation,
+            NativeForkCause::Untyped(
+                UntypedInvariant::Stale | UntypedInvariant::Invalid | UntypedInvariant::Quarantined,
+            ) => Class::InvariantViolation,
         }
     }
 
@@ -305,6 +325,44 @@ pub fn fork_scratch(
         }
         super::native_process_runtime::NativeProcessError::ForkRefused(refusal)
     })
+}
+
+/// A carrier stock reply that refused the exchange at `stage`, typed by
+/// its class on every ISA's fork venue: an `Inventory` reply is not now, a
+/// `Capacity` reply exhausts births, a `Stale` or `Invalid` reply, or a
+/// completed crossing with no reply (`None`), breaks an invariant.
+pub fn stock_refused(
+    stage: NativeForkStage,
+    reply: Option<carrick_el1_abi::ForkStockRefusal>,
+) -> super::native_process_runtime::NativeProcessError {
+    refused(
+        stage,
+        match reply {
+            Some(reply) => NativeForkCause::StockReservation(reply),
+            None => NativeForkCause::StockCrossing {
+                status: 0,
+                reply: None,
+            },
+        },
+    )
+}
+
+/// Type a fork's bare invariant answer at the fork entry (#2441). Inside a
+/// fork, `Stale`, `Invalid` and `Quarantined` name the fork's own records,
+/// lifecycle page, loaned stock or settlement contradicting themselves,
+/// never a guest error, so they carry [`NativeForkCause::Untyped`] and end
+/// the run. Every other answer keeps its own meaning.
+pub fn typed_invariant(
+    error: super::native_process_runtime::NativeProcessError,
+) -> super::native_process_runtime::NativeProcessError {
+    use super::native_process_runtime::NativeProcessError as E;
+    let invariant = match error {
+        E::Stale => UntypedInvariant::Stale,
+        E::Invalid => UntypedInvariant::Invalid,
+        E::Quarantined => UntypedInvariant::Quarantined,
+        error => return error,
+    };
+    refused(NativeForkStage::Entry, NativeForkCause::Untyped(invariant))
 }
 
 pub fn refused(
@@ -579,6 +637,14 @@ mod tests {
             status: 2,
             reply: Some(reply),
         }));
+        causes.extend(
+            [
+                UntypedInvariant::Stale,
+                UntypedInvariant::Invalid,
+                UntypedInvariant::Quarantined,
+            ]
+            .map(NativeForkCause::Untyped),
+        );
         causes
     }
 
@@ -675,7 +741,7 @@ mod tests {
                 ("eagain", 3),
                 ("enomem", 11),
                 ("enosys", 1),
-                ("invariant", 33),
+                ("invariant", 36),
                 ("not now", 12),
             ]
         );
@@ -715,6 +781,7 @@ mod tests {
             NativeForkStage::Abort,
             NativeForkStage::OpenChildSpace,
             NativeForkStage::StockCrossing,
+            NativeForkStage::Entry,
         ];
         for stage in stages {
             let class = |cause| NativeForkRefusal { stage, cause }.class();
@@ -736,6 +803,56 @@ mod tests {
                 NativeForkClass::NotNow(None),
                 "{stage:?}"
             );
+        }
+    }
+
+    /// #2441, review P0-2 on #2508: every ISA's fork venue types a carrier
+    /// stock reply by its class, and the fork entry types a bare invariant
+    /// answer, so no broken invariant reaches the guest as an errno and no
+    /// Inventory reply answers EAGAIN.
+    #[test]
+    fn stock_replies_and_bare_invariants_keep_their_class() {
+        use carrick_el1_abi::ForkStockRefusal as Stock;
+        let class = |error| match error {
+            NativeProcessError::ForkRefused(refusal) => refusal.class(),
+            error => panic!("untyped {error:?}"),
+        };
+        for stage in [NativeForkStage::StockCrossing, NativeForkStage::Reserve] {
+            assert_eq!(
+                class(stock_refused(stage, Some(Stock::Inventory))),
+                NativeForkClass::NotNow(None)
+            );
+            assert_eq!(
+                class(stock_refused(stage, Some(Stock::Capacity))),
+                NativeForkClass::BirthsExhausted
+            );
+            for reply in [Some(Stock::Stale), Some(Stock::Invalid), None] {
+                assert_eq!(
+                    class(stock_refused(stage, reply)),
+                    NativeForkClass::InvariantViolation,
+                    "{stage:?} {reply:?}"
+                );
+            }
+        }
+        for bare in [
+            NativeProcessError::Stale,
+            NativeProcessError::Invalid,
+            NativeProcessError::Quarantined,
+        ] {
+            assert_eq!(
+                class(typed_invariant(bare)),
+                NativeForkClass::InvariantViolation,
+                "{bare:?}"
+            );
+        }
+        for kept in [
+            NativeProcessError::Busy,
+            NativeProcessError::Exhausted,
+            NativeProcessError::NoMemory,
+            NativeProcessError::Fault,
+            NativeProcessError::Unsupported,
+        ] {
+            assert_eq!(typed_invariant(kept), kept);
         }
     }
 
