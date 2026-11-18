@@ -870,6 +870,10 @@ surfaces = [
   { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.fork.stage1-image" },
   { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.mm.image-page-permissions" },
   { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.mm.metadata-refusal" },
+  # AArch64 stage-1 CPU walk for the test-only arm64 soft-CPU lane (#2480); no production
+  # guest runs through it yet. The director registers the ARM soft-CPU contract when A3 makes it guest-visible.
+  { path = "crates/carrick-mmu-core/src/aarch64/stage1_walk.rs", contracts = [] },
+  { path = "crates/carrick-mmu-core/src/aarch64/stage1_walk/tests.rs", contracts = [] },
   { path = "crates/carrick-mmu-core/src/live_descriptor_words.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-mmu-core/src/stage1.rs", contract = "kernel.el1.fault-entry" },
   { path = "crates/carrick-mmu-core/src/stage1.rs", contract = "kernel.mm.image-page-permissions" },
@@ -1167,6 +1171,9 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contracts = [] },
   # Static diagnostics only: no guest execution or advertised CPU semantics.
   { path = "crates/carrick-softcpu-aarch64/src/lib.rs", contracts = [] },
+  # Stage-1 translation of handler accesses and block fetch for the test-only arm64 lane (#2480).
+  # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
+  { path = "crates/carrick-softcpu-aarch64/src/mmu.rs", contracts = [] },
   # Virtual CPU and system registers for the test-only arm64 lane.
   # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
   { path = "crates/carrick-softcpu-aarch64/src/state.rs", contracts = [] },
