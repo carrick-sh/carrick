@@ -1461,6 +1461,16 @@ surfaces = [
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_root_fcntl.S", contract = "kernel.el1.ipc-fd-authority" },
   { path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs", contract = "x86.run-elf.poll" },
   { path = "crates/carrick-vmm-nvmm/src/nvmm_x86_engine.rs", contract = "x86.vmx.segment-entry" },
+  # Pure soft-x86 boot bring-up probe (#671), not wired to the runtime; no guest-visible behaviour yet.
+  { path = "crates/carrick-vmm-soft/build.rs", contracts = [] },
+  # Pure soft-x86 boot bring-up probe (#671), not wired to the runtime; no guest-visible behaviour yet.
+  { path = "crates/carrick-vmm-soft/src/cpu.rs", contracts = [] },
+  # Pure soft-x86 boot bring-up probe (#671), not wired to the runtime; no guest-visible behaviour yet.
+  { path = "crates/carrick-vmm-soft/src/lib.rs", contracts = [] },
+  # Pure soft-x86 boot bring-up probe (#671), not wired to the runtime; no guest-visible behaviour yet.
+  { path = "crates/carrick-vmm-soft/src/memory.rs", contracts = [] },
+  # Pure soft-x86 boot bring-up probe (#671), not wired to the runtime; no guest-visible behaviour yet.
+  { path = "crates/carrick-vmm-soft/src/probe.rs", contracts = [] },
   { path = "crates/carrick-x86-carrier/src/entry.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-x86-carrier/src/entry.rs", contract = "kernel.native.entropy" },
   { path = "crates/carrick-x86-carrier/src/exec_build.rs", contract = "process.exec.custody" },
