@@ -2189,5 +2189,208 @@ fn x4_shared_wait_records() {
     assert!(r_zone.completion_enabled(wait_key));
 }
 
+fn private_file_4k_grants_scale_past_initial_residency<
+    B: carrick_mmu_core::owner_mmu::OwnerGrantMmu,
+>(
+    x86: bool,
+    backend: B,
+) {
+    use carrick_core::mm::frames::{select_backing_window, serve_grant};
+    use carrick_core_abi::{FRAME_GRANT_RESIDENCY_SLOTS, PortalGrantSlot};
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
+        TableGrants,
+    };
+    use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+
+    // Python/pip startup maps shared libraries and C extensions as private file
+    // mappings and first-touches > 4,096 distinct 4 KiB pages in one MM.
+    const TOTAL_PAGES: usize = FRAME_GRANT_RESIDENCY_SLOTS + 512;
+    const L2_TABLES: usize = TOTAL_PAGES / 512;
+
+    let mut region = Region::new();
+    region.add_bank();
+    let spaces = AddressSpaces::new();
+    let nz = |n| NonZeroU64::new(n).unwrap();
+    let mm_id = 1;
+    let index = spaces.publish_closed(mm_id, ROOT, ROOT).unwrap();
+    let mm = carrick_core_abi::ReservationMm::new(mm_id).unwrap();
+    region
+        .table()
+        .publish(
+            index.index(),
+            mm,
+            carrick_el1::memory::reservations::Layout {
+                heap: carrick_core_abi::ReservationRange::new(4096, VA).unwrap(),
+                arena: carrick_core_abi::ReservationRange::new(VA, VA + 0x1000_0000).unwrap(),
+                brk: 4096,
+                address_limit: u64::MAX,
+                data_limit: u64::MAX,
+                external_address_bytes: 0,
+                external_data_bytes: 0,
+            },
+        )
+        .unwrap();
+    let view = nodes(&region);
+    {
+        let mut owner = region
+            .table()
+            .lock_el1_resolved_with_context::<NoPin, carrick_el1_abi::Aarch64ParkedContext>(
+                index.index(),
+                mm,
+                &view,
+                0,
+            )
+            .unwrap();
+        owner
+            .import_with_backing(
+                carrick_core_abi::ReservationRange::new(VA, VA + TOTAL_PAGES as u64 * 4096)
+                    .unwrap(),
+                carrick_core_abi::ReservationProtection::READ_WRITE,
+                carrick_core_abi::ReservationNodeFlags::EMPTY,
+                carrick_core_abi::HostBackingIdentity::new(nz(1), nz(1), 0),
+            )
+            .unwrap();
+        owner.finish_import().unwrap();
+    }
+    spaces.open(index);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view).with_mmu(backend);
+    let tables = Tables::new(ROOT, IPA, 0);
+    if x86 {
+        tables.words[0].store((ROOT + 4096) | PRESENT | WRITE | USER, Ordering::Release);
+        tables.words[512 + 1].store((ROOT + 8192) | PRESENT | WRITE | USER, Ordering::Release);
+        for pd in 0..L2_TABLES {
+            tables.words[1024 + pd].store(
+                (ROOT + (3 + pd as u64) * 4096) | PRESENT | WRITE | USER,
+                Ordering::Release,
+            );
+        }
+    } else {
+        for l2 in 0..L2_TABLES {
+            tables.words[1024 + l2].store((ROOT + (3 + l2 as u64) * 4096) | 3, Ordering::Release);
+        }
+    }
+    let live = tables.live(&CallerInvalidatesAsid);
+    let residency = residency();
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let wire = PortalGrantSlot::new();
+
+    for page_index in 0..TOTAL_PAGES {
+        let page_va = VA + page_index as u64 * 4096;
+        let page_ipa = IPA + page_index as u64 * 4096;
+        let transfer = portal
+            .begin(
+                handle,
+                GuestVa::new(page_va),
+                1,
+                TransferIntent::UserRead,
+                0,
+            )
+            .unwrap();
+        let TransferStep::Supply(window) = portal
+            .select(
+                &transfer,
+                &live,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency,
+                    slot: 0,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected 4 KiB file-backed grant supply at page {page_index}");
+        };
+        assert_eq!(window.range.start(), page_va);
+        assert_eq!(window.range.len(), 4096);
+
+        let id = nz(page_index as u64 + 1);
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: nz(mm.raw()),
+                generation: id,
+            },
+            root: SubstrateGpa(ROOT),
+            op: DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: page_va,
+                    ipa: page_ipa,
+                    len: 4096,
+                    writable: true,
+                    executable: false,
+                },
+                resident: PageSpan::new(page_va, 4096),
+                backing: BackingIdentity {
+                    frame_id: id,
+                    mapping_id: id,
+                    owner_generation: nz(1),
+                    inventory_revision: nz(1),
+                },
+            },
+            tables: TableGrants::NONE,
+        };
+        assert!(wire.submit(window, &txn));
+        let receipt = serve_grant(&portal, &wire, &live, &residency, 0, || {})
+            .unwrap()
+            .unwrap();
+        assert!(wire.take_receipt(window, &txn).is_some());
+        assert!(
+            matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
+            "grant {page_index} at {page_va:#x} (slots_used={}) refused: {:?}",
+            residency.observed_slots_used(),
+            receipt.outcome
+        );
+    }
+
+    // Every single-page residency record remains live and committed while mapped;
+    // neither commit nor a wider candidate window supersedes published slots.
+    for page_index in 0..TOTAL_PAGES {
+        let page_va = VA + page_index as u64 * 4096;
+        assert!(residency.is_guest_committed(mm.raw(), page_va));
+    }
+    let bulk_candidate = carrick_core_abi::PortalGrantWindow {
+        operation: carrick_core_abi::PortalOperation {
+            carrier: NonZeroU64::MIN,
+            mm,
+            incarnation: handle.incarnation(),
+            sequence: nz(TOTAL_PAGES as u64 + 1),
+        },
+        mapping_incarnation: carrick_core_abi::ReservationIncarnation::new(1).unwrap(),
+        range: carrick_core_abi::ReservationRange::new(VA, VA + 16 * 4096).unwrap(),
+        protection: carrick_core_abi::ReservationProtection::from_bits(3).unwrap(),
+        fault_page: VA,
+        host_backing: None,
+        fork_sequence: None,
+    };
+    assert_eq!(
+        select_backing_window::<B, _>(&live, ROOT, bulk_candidate),
+        Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::AlreadyValid)
+    );
+
+    // Explicit munmap retirement releases all slots across every segment.
+    let retirement = residency
+        .begin_retire_overlapping(mm.raw(), VA, TOTAL_PAGES as u64 * 4096)
+        .expect("no active transfer pins");
+    assert!(retirement.commit());
+    assert_eq!(residency.observed_slots_used(), 0);
+}
+
+#[test]
+fn arm_private_file_4k_grants_scale_past_initial_residency() {
+    private_file_4k_grants_scale_past_initial_residency(
+        false,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    );
+}
+
+#[test]
+fn x86_private_file_4k_grants_scale_past_initial_residency() {
+    private_file_4k_grants_scale_past_initial_residency(
+        true,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    );
+}
+
 #[path = "x86_acceleration/compact_context.rs"]
 mod compact_context;
