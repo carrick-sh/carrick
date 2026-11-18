@@ -176,3 +176,49 @@ KVM operations. A generic boot provider remains a later extraction, requiring
 its own production caller and evidence; it does not reuse the running snapshot
 protocol. No behavior change, soft-machine work or execution selection is part
 of this slice. Signed HVF and final queue acceptance remain director-owned.
+
+
+### M1-1 status: shared memory installation and initial-MM admission
+
+The neutral boot after `prepare_boot` is now one implementation used by
+both backends. `install_boot_memory`, generic over `CarrierMemoryIo`,
+holds the memory-registration block that `boot_bytes_inner` used to run
+inline: bootstrap windows, IPC backings and slot binding, fixture copy
+windows, kernel file region, fault records, initial extent and CPU file
+bindings. Only VM creation stays in KVM.
+
+The initial-MM admission (`load_guest_mm`,
+`publish_production_reservations`) is generic over `Cpl0BootCarrier`.
+This is the boot-only provider the R4 status anticipated, and it has two
+production callers. It carries only what the admission needs from a
+backend: custody, CPU count, a stopped register read, one `KernelEntry`
+and run-to-exit. KVM implements it with its original sregs/MSR/regs
+ioctl sequence and production run context. The running snapshot protocol
+(`CarrierCpuBackend`) is untouched.
+
+`bind_initial_task_identity`, `bind_execution` and `initial_mm_key` now
+live on `BootstrapCustody`, and `initial_extent_bytes_for` and
+`unexpected_boot_wake` are shared functions. KVM's methods delegate to
+them.
+
+The soft carrier (`carrick-vmm-soft`) implements `CarrierMemoryIo` as
+`SoftVm`, a slot table. Its `SoftMmuMemory` places each registered slot
+as one linear segment (`LinearPlacement::with_segments`). The soft CPU
+therefore translates through the allocations `CarrierMemory` owns; no
+bytes are copied. `SoftCarrier` implements `Cpl0BootCarrier` over one
+`SoftMachine` and authenticates the admitted initial root for soft walks
+before each run.
+
+The probe follows the KVM witnesses' `boot_program_carrier` sequence:
+kernel-issued root, birth source, IPC table map, then
+`bind_initial_task_identity` and `load_guest_mm`. It boots the production
+ring past initial-MM admission. The root runs its `exit_group(7)` syscall
+to the first serviced carrier exit, `WORK_PORT` in `carrick_x86_enter`.
+
+Still concrete per backend: stopped-CPU creation and programming
+(`BootCpuState` is shared; the setters are not), TSC and APIC identity
+publication, MP-state admission, and the peer CPU's start. The soft
+carrier is single-vCPU (#2397), refuses MSI, and does not refresh its
+placement when slots change at run time. Those, the executor
+(`CarrierCpuBackend` over `SoftMachine`) and runtime selection are the
+next slices.
