@@ -1,0 +1,36 @@
+[package]
+name = "carrick-vmm-soft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_vmm_soft"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Neutral soft-x86 carrier bring-up (#671). No KVM, HVF or personality crate.
+[dependencies]
+carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-hal = { path = "../carrick-hal" }
+carrick-softcpu-x86 = { path = "../carrick-softcpu-x86" }
+carrick-x86 = { path = "../carrick-x86" }
+carrick-x86-cpl0-host = { path = "../carrick-x86-cpl0-host" }
+goblin = { workspace = true }
+iced-x86 = { workspace = true }
+rustc-demangle = { workspace = true }
+libc = { workspace = true }
+
+[build-dependencies]
+# build.rs derives the CPL0 image inputs directly from local manifests.
+toml.workspace = true
+
+[dev-dependencies]
+carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
+
+# The probe boots the ring image in the VM-free soft CPU: no /dev/kvm.
+[package.metadata.carrick.test-lanes]
+"*" = "host"

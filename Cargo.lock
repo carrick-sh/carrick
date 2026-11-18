@@ -1297,6 +1297,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-vmm-soft"
+version = "0.1.0"
+dependencies = [
+ "carrick-el1-abi",
+ "carrick-guest-arch",
+ "carrick-hal",
+ "carrick-kernel",
+ "carrick-softcpu-x86",
+ "carrick-x86",
+ "carrick-x86-cpl0-host",
+ "goblin",
+ "iced-x86",
+ "libc",
+ "rustc-demangle",
+ "toml",
+]
+
+[[package]]
 name = "carrick-x86"
 version = "0.1.0"
 dependencies = [
