@@ -20,6 +20,12 @@
  *                  The wait settles inline; getrandom restarts and returns
  *                  8, the parent's page keeps its bytes, and exactly one
  *                  wait was released before its park
+ *   FORK_LOAN_INVENTORY  #2441: the carrier refuses the next fork's stock
+ *                  loan Inventory once: fork reruns and returns the
+ *                  child's pid, never EAGAIN (111)
+ *   FORK_LOAN_STALE  #2441: the carrier refuses the next fork's stock loan
+ *                  Stale, a broken invariant: the run ends at the fork,
+ *                  which must never return (EAGAIN 111 formerly)
  *   FORK_SCRATCH_EXHAUSTED  #2441: not contention but its counterpart. The
  *                  next fork's scratch finds the kernel heap exhausted:
  *                  fork answers ENOMEM (-12), never EFAULT (114). That
@@ -34,6 +40,8 @@
 #define INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE -468   /* 0x...fe2c */
 #define INJECT_EDITOR_RELEASED_BEFORE_PARK_CENSUS -467 /* 0x...fe2d */
 #define INJECT_FORK_SCRATCH_EXHAUSTED_ONCE -466 /* 0x...fe2e */
+#define INJECT_FORK_LOAN_INVENTORY_ONCE -461 /* 0x...fe33 */
+#define INJECT_FORK_LOAN_STALE_ONCE -460     /* 0x...fe34 */
 #define ENOMEM 12
 #define SIGCHLD 17
 #define CLONE_CHILD_SETTID 0x01000000
@@ -61,6 +69,21 @@ _start:
     mov $INJECT_FORK_CENSUS_ROOT_HELD_ONCE, %rax
 #else
     mov $INJECT_FORK_COMMIT_ROOT_HELD_ONCE, %rax
+#endif
+    syscall
+    test %rax, %rax
+    jnz fail_inject
+    mov $57, %eax
+    syscall
+    test %rax, %rax
+    js errno_exit
+    jz exit_child
+    mov %rax, %r12
+#elif defined(FORK_LOAN_INVENTORY) || defined(FORK_LOAN_STALE)
+#if defined(FORK_LOAN_INVENTORY)
+    mov $INJECT_FORK_LOAN_INVENTORY_ONCE, %rax
+#else
+    mov $INJECT_FORK_LOAN_STALE_ONCE, %rax
 #endif
     syscall
     test %rax, %rax
@@ -151,7 +174,7 @@ _start:
     jz entropy_child
     mov %rax, %r12
 #else
-#error "FORK_EDITOR, FORK_CENSUS_ROOT, FORK_COMMIT_ROOT, FORK_SCRATCH_EXHAUSTED, WAITID_BUSY, SETTID_BUSY or ENTROPY_SETTLED_BEFORE_PARK"
+#error "FORK_EDITOR, FORK_CENSUS_ROOT, FORK_COMMIT_ROOT, FORK_LOAN_INVENTORY, FORK_LOAN_STALE, FORK_SCRATCH_EXHAUSTED, WAITID_BUSY, SETTID_BUSY or ENTROPY_SETTLED_BEFORE_PARK"
 #endif
     /* wait4(child, &status, 0, NULL) */
     mov %r12, %rdi
