@@ -1,3 +1,8 @@
+# #2441: PortalWaitCause::MetadataGrant is an owner wait whose queue is the
+# owed grant request's own (ObjectWaitKey::metadata_request), not an MM
+# resource's: a fork whose scratch missed while that grant is in flight parks
+# there and reruns once. Fork refusals carry a NativeForkClass; a broken
+# invariant ends the run (EntryBindingFatalReason::NativeForkInvariant).
 # #2306: errno and run-failure conversion moves to NativeFailure; owner
 # contention (NativeContention) parks, retains its syscall or yields at the
 # owner checkpoint. Witnesses are bound below; this contract's settlement,
@@ -169,8 +174,12 @@ vm_free = [
   "carrick-runtime::vcpu_loop::tests::serial_host_file_fault_owner_wait_parks_then_reruns_fetch (#1692: owner file-fault resolution releases the exact frame mailbox, production binding parks on the authenticated owner notification, wake resumes through ResumeFaultOwner, and the faulting fetch reruns without replaying host service)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_zone_poll_output_owner_wait_preserves_ready_answer",
   "carrick-el1-linux::aarch64_process_tests::fork_scratch_exhaustion_answers_enomem_and_returns_the_loan (#2441: production AArch64 fork entry; a fork scratch the kernel heap cannot hold answers ENOMEM (-12), never EFAULT; the refusal returns every loaned table and frees the closed child space, and the next fork succeeds; red at d947e7c62 with -14)",
-  "carrick-el1-linux::native_fork_refusal::tests::{exhausted_fork_is_enomem_and_an_owed_grant_is_contention,scratch_heap_miss_without_a_grant_mailbox_is_enomem} (#2441: every native fork refusal cause has one exhaustive answer; memory and limit exhaustion is ENOMEM, a heap miss with a metadata grant in flight is contention)",
-  "carrick-el1::alloc::tests::miss_is_owed_capacity_only_while_its_grant_is_in_flight (#2441: a heap miss is owed capacity only while its metadata grant is requested, served or unadmitted; a denied grant or no mailbox owes nothing)",
+  "carrick-el1-linux::native_fork_refusal::tests::{exhausted_fork_is_enomem_and_an_owed_grant_is_contention,scratch_heap_miss_is_enomem_unless_a_grant_is_in_flight} (#2441: memory and limit exhaustion is ENOMEM, a fork owner's Limit included; a heap miss with a metadata grant in flight is owed that exact grant)",
+  "carrick-el1-linux::native_fork_refusal::tests::{no_fork_refusal_cause_answers_efault,every_fork_refusal_cause_has_its_class} (#2441: each of the 60 native fork refusal causes has exactly one NativeForkClass; none answers EFAULT; a broken invariant answers no guest errno; red at 8e6a20037)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::fork_refusal_class::serial_host::{fork_invariant_refusal_ends_the_run_x86,fork_invariant_refusal_ends_the_run_aarch64} (#2441: production fork entry on both ISA contexts; a Census refusal of ForkError::Core ends the run through the fatal sink instead of answering -14; red at 8e6a20037)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::{forks_owed_a_metadata_grant_park_on_it_then_rerun_once,forks_owed_a_metadata_grant_park_on_it_then_rerun_once_on_arm} (#2441: production fork entry on both ISA contexts; three children, more than the one slot, fork while grant request g is in flight; each parks on ObjectWaitKey::metadata_request(g) as an owner wait, owes the carrier no work, holds no execution capacity and does not rerun while g is pending; g's completion under its queue lock wakes all three and each reruns its clone exactly once; red at fc0d58140, which published CarrierWork)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::{fork_owed_an_answered_grant_reruns_at_once,fork_owed_an_answered_grant_reruns_at_once_on_arm,cancelling_a_fork_waiting_for_a_metadata_grant_wakes_it,cancelling_a_fork_waiting_for_a_metadata_grant_wakes_it_on_arm} (#2441: the probe under the grant queue's lock reruns at once when the grant is answered or its queue moved on; a terminal cancellation finds the grant wait on its request's queue, Stale without that branch)",
+  "carrick-el1::alloc::tests::miss_is_owed_its_grant_only_while_the_grant_is_in_flight (#2441: a heap miss is owed its exact grant request only while that request is requested, served or unadmitted; the request is pending only until answered; a denied grant or no mailbox owes nothing)",
   "carrick-runtime::vcpu_loop::binding::tests::terminal_core_capture_parks_on_another_holder_then_publishes (#1733: a Busy core capture enrols through the retained-memory wait path (a physical dependency here), blocks with nothing queued, wakes once on release and reruns; red when the enrolment is skipped)",
 ]
 
