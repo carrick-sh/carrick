@@ -99,7 +99,7 @@ safe code on x86.
 | EXIT | ISB | End the block and retire ISB before fetching at the next guest PC (Arm ARM B2.3.4). |
 | COPY (rewritten) | ADR, ADRP | The guest PC is known, so Rd gets a host `movz`/`movk` immediate sequence. Rd=XZR emits nothing. |
 | EXIT memory | every load/store, pair, unprivileged (LDTR/STTR), literal, acquire/release, exclusive, LSE (LDADD) | v1: all memory operations exit. The handler computes the address from the frame, reads or writes `GuestMemory` and applies writeback. A fast path through the soft TLB is a later slice. Exclusives use a virtual per-CPU monitor in the handler state, never a host reservation. |
-| EXIT system | MRS, MSR (register and PSTATE immediate), TLBI, AT, CLREX | `CpuState::mrs`/`msr`, with an EL0 trap taken through `take_exception`. TLBI is a typed event for the dispatcher's owner. MSR SCTLR_EL1 setting M stops the slice-0 probe (flat memory has no stage-1 walk). |
+| EXIT system | MRS, MSR (register and PSTATE immediate), TLBI, AT, CLREX | `CpuState::mrs`/`msr`, with an EL0 trap taken through `take_exception`. TLBI is a typed event for the dispatcher's owner. MSR SCTLR_EL1 setting M retires when the current TCR_EL1 is admitted by the stage-1 walker (#2480, `mmu`), and stops otherwise. |
 | EXIT exception | SVC, HVC, BRK, SMC, HLT, DCPS, ERET | `take_exception` / `eret`. HVC is a provider exit. SMC/HLT/DCPS are undefined in this EL0/EL1 profile. Guest SVC/HVC are never issued against the host. |
 | EXIT wait | WFI, WFE, SEV, SEVL | Typed events; v1 stops on a wait. |
 | EXIT undefined | `Unallocated`, SIMD/FP census gaps | Undefined-instruction exception (EC 0). A host JIT bug is a distinct `TranslateError`, never a guest exception. |
@@ -209,9 +209,10 @@ On the arm64 runner (`#[cfg(all(target_arch = "aarch64", target_os = "linux"))]`
   AT or a misaligned LDAR reaches the EL1h vector with the matching ESR, ELR
   and FAR visible through native dispatch.
 - Wait and prefetch traps: native dispatch observes the EL1 vector for WFI,
-  WFE, illegal execution state and PC alignment. Under the flat memory profile,
-  PC alignment precedes illegal execution state and both precede the first
-  block fetch. A stage-1 walker must give instruction aborts priority over IL.
+  WFE, illegal execution state and PC alignment. PC alignment precedes
+  illegal execution state and both precede the first block fetch. With
+  SCTLR_EL1.M set, the block's first word is translated before splitting, and
+  a walker fault is taken there as an instruction abort (#2480).
 - Exit round trip: a block ending in MRS/SVC exits with the exact restart PC,
   and the handler resumes. An EL0 SVC vector reads SPSR_EL1 and ELR_EL1 then
   executes ERET. ERET restores the origin and sets the local event register,
@@ -225,7 +226,8 @@ On the arm64 runner (`#[cfg(all(target_arch = "aarch64", target_os = "linux"))]`
   segments, a stack and the frame) under a block budget and prints
   `boots to PC=... after N blocks / fails at ...`. A diagnostic second pass
   maps each faulting page as zero to show what comes next. The stage-1 walker
-  is a later shared-crate slice.
+  (`carrick_mmu_core::aarch64::stage1_walk`, consumed through `mmu`) is in
+  #2480; see `soft-aarch64-stage1-walker.md`.
 
 ## System registers in the production image
 
