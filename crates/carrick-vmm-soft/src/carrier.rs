@@ -368,7 +368,7 @@ impl SoftCarrier {
     /// whose image becomes the issued root's state; slot 1 is a second soft
     /// CPU in its stopped boot state. M1 is single-vCPU (#2397): the idle
     /// peer is not started, so the root runs with no peer in the zone.
-    pub fn into_worker_parts(self) -> Result<SoftWorkerParts, TrapError> {
+    pub fn into_worker_parts(mut self) -> Result<SoftWorkerParts, TrapError> {
         let root_state = self
             .custody
             .worker_root_state(&carrick_x86::snapshot(&SoftCpuView(
@@ -386,8 +386,15 @@ impl SoftCarrier {
             .custody
             .maintenance_root()
             .ok_or_else(|| fail("soft production run has no maintenance root"))?;
+        // The ring switches to this custody-issued root without exiting to
+        // the host. Admit it in both CPU views before either can run.
+        self.runner
+            .machine_mut()
+            .mem_mut()
+            .admit_root(maintenance_root.address().raw())?;
         let cpuid = soft_cpuid();
-        let view = SoftCarrierMemory::new(self.custody.memory().vm(), LAYOUT.pml4_base)?;
+        let mut view = SoftCarrierMemory::new(self.custody.memory().vm(), LAYOUT.pml4_base)?;
+        view.admit_root(maintenance_root.address().raw())?;
         let mut peer = SoftMachine::new(view, Box::new(cpuid))
             .map_err(|error| fail(format!("soft peer CPU: {error:?}")))?;
         apply_boot_cpu_state(
