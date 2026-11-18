@@ -2054,6 +2054,7 @@ mod netlink_readiness_tests {
                 path: "/fixture/synthetic".to_string(),
                 contents: b"synthetic content".to_vec(),
                 offset: 0,
+                origin: carrick_vfs::SyntheticOrigin::Blob,
             })),
             LINUX_O_RDONLY,
             0,

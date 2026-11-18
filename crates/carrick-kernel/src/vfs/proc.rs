@@ -984,14 +984,19 @@ pub(crate) fn is_proc_self_pagemap_path(path: &str, self_pid: u32) -> bool {
         .is_some_and(|mid| names_calling_process(mid, self_pid))
 }
 
-/// True iff `path` is any process's `/proc/<pid>/{mem,pagemap}`: a file whose
-/// reads render an address space, so only a reader with a task may serve it.
-pub(crate) fn is_proc_address_space_path(path: &str) -> bool {
-    path.strip_prefix("/proc/").is_some_and(|rest| {
-        rest.strip_suffix("/mem")
-            .or_else(|| rest.strip_suffix("/pagemap"))
-            .is_some()
-    })
+/// The proc mount's typing of a synthetic open: the CALLER's own
+/// `/proc/<pid>/{mem,pagemap}` is a live view of its address space, every
+/// other synthetic file a blob. The description carries this origin, so a
+/// reader decides by type, never by re-reading the path.
+fn synthetic_origin_for_open(path: &str, ctx: &OpenContext<'_>) -> carrick_vfs::SyntheticOrigin {
+    let normalized = normalize_self_pid_path(path, ctx);
+    let path = normalized.as_ref();
+    let self_pid = context_self_pid(ctx);
+    if is_proc_self_mem_path(path, self_pid) || is_proc_self_pagemap_path(path, self_pid) {
+        carrick_vfs::SyntheticOrigin::ProcAddressSpace
+    } else {
+        carrick_vfs::SyntheticOrigin::Blob
+    }
 }
 
 /// The errno an open of a FOREIGN `/proc/<pid>/{mem,pagemap}` must fail with,
@@ -1036,18 +1041,17 @@ pub(crate) fn proc_foreign_live_memory_open_errno(
 }
 
 pub(crate) fn synthetic_file_for_open(path: &str, ctx: &OpenContext<'_>) -> Option<Vec<u8>> {
-    let normalized = normalize_self_pid_path(path, ctx);
-    let path = normalized.as_ref();
     // The CALLER's own `/proc/<pid>/mem` and `/proc/<pid>/pagemap` are live
-    // files, not precomputed blobs: return an EMPTY blob so they OPEN as
-    // `SyntheticFile`; the read handler recognizes the path and derives bytes
-    // from guest memory or from the sparse pagemap offset. A PEER's must not
-    // reach that handler — it would describe this caller's address space; see
-    // `proc_foreign_live_memory_open_errno`.
-    let self_pid = context_self_pid(ctx);
-    if is_proc_self_mem_path(path, self_pid) || is_proc_self_pagemap_path(path, self_pid) {
+    // files, not precomputed blobs: return an EMPTY blob so they OPEN as a
+    // `SyntheticFile` of origin `ProcAddressSpace`; the read handler derives
+    // bytes from guest memory or from the sparse pagemap offset. A PEER's
+    // must not reach that handler — it would describe this caller's address
+    // space; see `proc_foreign_live_memory_open_errno`.
+    if synthetic_origin_for_open(path, ctx) == carrick_vfs::SyntheticOrigin::ProcAddressSpace {
         return Some(Vec::new());
     }
+    let normalized = normalize_self_pid_path(path, ctx);
+    let path = normalized.as_ref();
     match path {
         "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
         "/proc/config.gz" => Some(synthetic_proc_config_gz(ctx.guest_arch)),
@@ -2645,6 +2649,7 @@ impl Vfs for ProcVfs {
             path: path.to_string(),
             contents,
             status_flags: 0,
+            origin: synthetic_origin_for_open(path, ctx),
         })
     }
 

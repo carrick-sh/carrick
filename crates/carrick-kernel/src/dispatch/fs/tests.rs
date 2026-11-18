@@ -15,6 +15,7 @@ fn rename_open_descriptions_visits_only_matching_recorded_paths() {
                 path: format!("/unrelated/file{i}"),
                 contents: Vec::new(),
                 offset: 0,
+                origin: carrick_vfs::SyntheticOrigin::Blob,
             },
             0,
         );
@@ -458,6 +459,7 @@ fn procmap_query_reports_exact_next_filter_and_name_contracts() {
                     path: "/proc/self/maps".to_owned(),
                     contents: Vec::new(),
                     offset: 0,
+                    origin: carrick_vfs::SyntheticOrigin::Blob,
                 })),
                 LINUX_O_RDONLY,
                 0,
@@ -6227,6 +6229,7 @@ fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
         path: "/memfd:test".to_string(),
         contents: Vec::new(),
         offset: 0,
+        origin: carrick_vfs::SyntheticOrigin::Blob,
     }));
     let fd = dispatcher
         .install_fd_at_or_above(
@@ -8196,6 +8199,7 @@ fn non_pipe_access_mode_readv_writev_and_splice_precedence() {
         path: "/tmp/test-wronly".to_string(),
         contents: vec![1, 2, 3, 4],
         offset: 0,
+        origin: carrick_vfs::SyntheticOrigin::Blob,
     };
     let wr_fd = pair
         .dispatcher
@@ -9782,6 +9786,7 @@ fn lseek_data_and_hole_across_backends() {
         path: "/synth_file".to_string(),
         contents: vec![0xDD; 100],
         offset: 0,
+        origin: carrick_vfs::SyntheticOrigin::Blob,
     };
     let synth_fd = match dispatcher.install_fd(synth_desc, 0) {
         DispatchOutcome::Returned { value } => value as i32,
@@ -11696,6 +11701,7 @@ fn close_borrows_sibling_exact_claim_instead_of_returning_ebusy() {
         path: "/close-race-old".to_owned(),
         contents: Vec::new(),
         offset: 0,
+        origin: carrick_vfs::SyntheticOrigin::Blob,
     }));
     let old = OpenFile::from_open_description_with_status_flags(old, LINUX_O_RDONLY, 0);
     let fd = dispatcher

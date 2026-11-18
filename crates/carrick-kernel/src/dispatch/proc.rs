@@ -8209,6 +8209,7 @@ mod kernel_process_dispatch_tests {
                 path: "/tmp/pidfd-getfd-target".to_owned(),
                 contents: Vec::new(),
                 offset: 0,
+                origin: carrick_vfs::SyntheticOrigin::Blob,
             })),
             LINUX_O_RDWR,
         );

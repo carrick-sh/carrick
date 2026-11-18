@@ -719,6 +719,7 @@ impl<'a> FsView<'a> {
                     path: path.to_string(),
                     contents,
                     offset: 0,
+                    origin: carrick_vfs::SyntheticOrigin::Blob,
                     base: OpenDescriptionBase::new(status),
                 })),
                 status,

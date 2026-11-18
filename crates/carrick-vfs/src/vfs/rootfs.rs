@@ -2282,6 +2282,7 @@ impl Vfs for RootFsVfs {
                             path: path.to_string(),
                             contents,
                             status_flags: 0,
+                            origin: super::SyntheticOrigin::Blob,
                         });
                     }
                 }
@@ -2296,6 +2297,7 @@ impl Vfs for RootFsVfs {
                 path: path.to_string(),
                 contents: bytes,
                 status_flags: 0,
+                origin: super::SyntheticOrigin::Blob,
             })
         };
         if flags.trunc {

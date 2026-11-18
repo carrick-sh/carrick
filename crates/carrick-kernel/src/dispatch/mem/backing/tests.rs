@@ -1311,6 +1311,7 @@ fn range_owned_metadata_removal_clears_every_mmap_classification() {
             path: "memfd:metadata-remove".into(),
             contents: Vec::new(),
             offset: 0,
+            origin: carrick_vfs::SyntheticOrigin::Blob,
         })),
         crate::linux_abi::LINUX_O_RDWR,
     );
@@ -1355,6 +1356,7 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
             path: "memfd:split-predecessor".into(),
             contents: Vec::new(),
             offset: 0,
+            origin: carrick_vfs::SyntheticOrigin::Blob,
         })),
         crate::linux_abi::LINUX_O_RDWR,
     );
@@ -1632,6 +1634,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
             path: "memfd:test".into(),
             contents: Vec::new(),
             offset: 0,
+            origin: carrick_vfs::SyntheticOrigin::Blob,
         })),
         crate::linux_abi::LINUX_O_RDWR,
     );

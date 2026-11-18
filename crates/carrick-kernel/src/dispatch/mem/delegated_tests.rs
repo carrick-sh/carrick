@@ -8389,6 +8389,7 @@ mod private_file_owner {
                     path: "/proc/synthetic".into(),
                     contents: payload.clone(),
                     offset: 0,
+                    origin: carrick_vfs::SyntheticOrigin::Blob,
                 },
                 "overlay" => OpenDescription::File {
                     base: base(),

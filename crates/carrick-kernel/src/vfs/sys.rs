@@ -318,6 +318,7 @@ impl Vfs for SysVfs {
             path: path.to_string(),
             contents,
             status_flags: 0,
+            origin: carrick_vfs::SyntheticOrigin::Blob,
         })
     }
 
