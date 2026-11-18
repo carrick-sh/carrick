@@ -102,7 +102,9 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
         | Instruction::AtomicAdd(_) => InstructionClass::Exit(ExitReason::Memory),
         Instruction::SystemAccess(_) => InstructionClass::Exit(ExitReason::SystemRegister),
         Instruction::PstateImmediate(_) => InstructionClass::Exit(ExitReason::Pstate),
-        Instruction::SystemOperation(_) => InstructionClass::Exit(ExitReason::SystemOperation),
+        Instruction::SystemOperation(_) | Instruction::InstructionCache(_) => {
+            InstructionClass::Exit(ExitReason::SystemOperation)
+        }
         Instruction::CensusGap(Decoded::AddressTranslate { .. }) => {
             InstructionClass::Exit(ExitReason::AddressTranslate)
         }
