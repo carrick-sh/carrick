@@ -91,6 +91,12 @@ extent and page-table authentication for the maintenance walk.
 #671 M1 preserves a single executing soft worker. The unused peer is
 retained by the shared factory for custody, but guest entry refuses it
 before it can access backing through a disjoint walker inventory.
+
+#671 M1-7 host writes: the stopped soft worker consumes the physical pages
+touched by CarrierMemory writes before executing another block. Only active
+code generations on those authenticated pages change. The stopped carrier
+witness executes one cached block twice with a single-byte write between
+exits. It returns 7 instead of 9 when the notification is removed.
 """
 
 [bindings]

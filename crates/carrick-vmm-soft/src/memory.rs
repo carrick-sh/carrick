@@ -10,15 +10,15 @@
 //! very allocations `CarrierMemory` owns. Nothing is copied: the view
 //! retains its own `Arc` of each backing.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use carrick_hal::{OsError, TrapError};
 use carrick_softcpu_x86::{
     ExtentRecord, ExtentTable, FrameGpa, LinearPlacement, MmioHoles, OwnerGeneration, RootGpa,
     SoftMmuMemory,
 };
-use carrick_softmmu::{MAX_PLACEMENT_SEGMENTS, PlacementSegment};
+use carrick_softmmu::{MAX_PLACEMENT_SEGMENTS, PAGE_SIZE_4K, PlacementSegment};
 use carrick_x86_cpl0_host::carrier_memory::{BackingExtent, CarrierMemoryIo, CarrierMemoryRegion};
 use carrick_x86_cpl0_host::cpl0_boot::retained_slots::RetainedCarrierSlots;
 use carrick_x86_cpl0_host::cpl0_boot::{ProductionCpuFactory, fail};
@@ -39,6 +39,7 @@ pub struct SoftVm {
 struct SlotTable {
     regions: BTreeMap<u32, CarrierMemoryRegion>,
     retained: Option<Arc<RetainedSlots>>,
+    host_written: BTreeSet<FrameGpa>,
 }
 
 type RetainedSlots = BTreeMap<u32, RetainedSlot>;
@@ -53,14 +54,14 @@ impl SoftVm {
         Self::default()
     }
 
+    fn slots(&self) -> MutexGuard<'_, SlotTable> {
+        self.slots.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(crate) fn publish_backings(
         memory: RetainedCarrierSlots<'_, Self>,
     ) -> Result<(), TrapError> {
-        let mut slots = memory
-            .vm()
-            .slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut slots = memory.vm().slots();
         if slots.retained.is_some() {
             return Ok(());
         }
@@ -99,9 +100,7 @@ impl SoftVm {
     }
 
     fn retained_slots(&self) -> Result<Arc<RetainedSlots>, TrapError> {
-        self.slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.slots()
             .retained
             .clone()
             .ok_or_else(|| fail("soft slots changed without retained backing publication"))
@@ -122,7 +121,7 @@ impl CarrierMemoryIo for SoftVm {
     }
 
     unsafe fn set_user_memory_region(&self, region: CarrierMemoryRegion) -> Result<(), OsError> {
-        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut slots = self.slots();
         if region.memory_size == 0 {
             slots.regions.remove(&region.slot);
         } else {
@@ -138,6 +137,18 @@ impl CarrierMemoryIo for SoftVm {
         Err(OsError::new(
             "soft carrier has no MSI route (single-vCPU M1)",
         ))
+    }
+
+    fn host_wrote_ram(&self, start: FrameGpa, len: usize) {
+        let Some(last) = len
+            .checked_sub(1)
+            .and_then(|offset| start.raw().checked_add(offset as u64))
+        else {
+            return;
+        };
+        let mask = !(PAGE_SIZE_4K - 1);
+        let pages = ((start.raw() & mask)..=(last & mask)).step_by(PAGE_SIZE_4K as usize);
+        self.slots().host_written.extend(pages.map(FrameGpa::new));
     }
 }
 
@@ -242,6 +253,19 @@ impl SoftCarrierMemory {
         self.placement = placement;
         self.retained = retained;
         Ok(true)
+    }
+
+    /// Consume the writes in the only runnable (slot 0) view. A peer cannot
+    /// run with an independent code inventory until the multi-vCPU work.
+    pub(crate) fn invalidate_host_writes(&mut self) -> Result<(), TrapError> {
+        let mut slots = self.vm.slots();
+        for &page in &slots.host_written {
+            self.extents
+                .invalidate_host_written_page(page, BOOT_GENERATION)
+                .map_err(|error| fail(format!("soft host write {page:?}: {error:?}")))?;
+        }
+        slots.host_written.clear();
+        Ok(())
     }
 
     /// Authenticate `root` (a page-table root inside a registered slot) for

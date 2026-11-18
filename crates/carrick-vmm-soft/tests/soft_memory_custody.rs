@@ -6,8 +6,10 @@
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #![allow(clippy::expect_used, clippy::panic)]
 
+use carrick_guest_arch::FrameGpa;
+use carrick_softcpu_x86::SoftMachineExit;
 use carrick_vmm_soft::{SoftBootImage, SoftCarrier};
-use carrick_x86_cpl0_host::cpl0_boot::{Cpl0BootCarrier, USER_CODE};
+use carrick_x86_cpl0_host::cpl0_boot::{Cpl0BootCarrier, KernelEntry, USER_CODE};
 
 mod common;
 use common::inventory;
@@ -20,11 +22,15 @@ const EXIT_SEVEN: &[u8] = &[
 ];
 
 fn boot() -> SoftCarrier {
+    boot_with_program(EXIT_SEVEN)
+}
+
+fn boot_with_program(program: &[u8]) -> SoftCarrier {
     SoftCarrier::boot(
         inventory(),
         SoftBootImage {
             elf: FIXTURE,
-            programs: [EXIT_SEVEN, EXIT_SEVEN],
+            programs: [program, EXIT_SEVEN],
             initial_extent_bytes: None,
             fixture_image: true,
             ipc: None,
@@ -32,6 +38,37 @@ fn boot() -> SoftCarrier {
         MAX_BLOCKS,
     )
     .expect("soft fixture boot")
+}
+
+#[test]
+fn stopped_host_write_replaces_a_cached_instruction() {
+    // mov eax, 7; out 0x80, eax; jmp back to mov. Two visits to the same
+    // translated block with no intervening ring work to evict it.
+    let mut carrier = boot_with_program(&[0xb8, 7, 0, 0, 0, 0xe7, 0x80, 0xeb, 0xf7]);
+    carrier
+        .enter_kernel(
+            0,
+            KernelEntry {
+                rip: USER_CODE,
+                rdi: 0,
+                rsp: 0,
+                gs_base: 0,
+            },
+        )
+        .expect("enter fixture code at CPL0 for port I/O");
+    let assert_exit = |exit, expected| {
+        assert!(
+            matches!(exit, Some(SoftMachineExit::IoOut { port: 0x80, value, .. }) if value == expected),
+            "expected {expected}, got {exit:?}"
+        );
+    };
+    assert_exit(carrier.run(), 7);
+    carrier
+        .custody_mut()
+        .memory_mut()
+        .write(FrameGpa::new(USER_CODE + 1), &[9])
+        .expect("stopped physical write");
+    assert_exit(carrier.run(), 9);
 }
 
 /// The slot-0 fixture program, read through the soft CPU's translation.

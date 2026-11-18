@@ -162,6 +162,13 @@ impl SoftRunner {
             ..DIRECT_VA + carrick_x86::fault_tss_base(LAYOUT);
         self.trace.last_exit = None;
         self.trace.stop = None;
+        if let Err(error) = self.machine.mem_mut().invalidate_host_writes() {
+            self.trace.stop = Some(SoftStop::Emit {
+                va: self.machine.context().rip,
+                detail: error.to_string(),
+            });
+            return None;
+        }
         loop {
             if kicked.is_some_and(|kick| kick.swap(false, Ordering::AcqRel)) {
                 self.trace.stop = Some(SoftStop::Kicked);
