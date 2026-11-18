@@ -113,6 +113,83 @@ fn mrs_reads_into_rt_and_advances() {
 }
 
 #[test]
+fn production_sysreg_roundtrips_obey_register_widths() {
+    // MSR encodings for the read/write registers in the typed ELF and vector
+    // census, with inputs and readback derived from DDI0487G.a C5.2/D13.2.
+    for (msr, input, expected) in [
+        (0xd5182000, 0x0000_1234_5678_9000, 0x0000_1234_5678_9000), // TTBR0_EL1
+        (0xd5184100, 0x1234_8000, 0x1234_8000),                     // SP_EL0
+        (0xd518d020, 0x1234_abcd_9876_5432, 0x9876_5432),           // CONTEXTIDR_EL1
+        (0xd51bd040, 0x1234_abcd_0000_8000, 0x1234_abcd_0000_8000), // TPIDR_EL0
+        (0xd51bd060, 0x1234_abcd_0000_9000, 0x1234_abcd_0000_9000), // TPIDRRO_EL0
+        (0xd51b4220, 0xffff_ffff_ffff_fe7f, 0x240),                 // DAIF
+        (0xd51b4400, 0xffff_ffff_0440_6000, 0x0440_0000),           // FPCR
+        (0xd51b4420, 0xffff_ffff_ffff_ffff, 0x0800_009f),           // FPSR
+        (0xd5184020, 0x1234_abcd_0000_3100, 0x1234_abcd_0000_3100), // ELR_EL1
+        (0xd5184000, 0xffff_ffff_a000_0145, 0xa000_0145),           // SPSR_EL1
+        (0xd5185200, 0xffff_ffff_9200_004f, 0x9200_004f),           // ESR_EL1
+        (0xd5186000, 0x1234_abcd_0000_2210, 0x1234_abcd_0000_2210), // FAR_EL1
+        (0xd518d080, 0x1234_abcd_0000_9000, 0x1234_abcd_0000_9000), // TPIDR_EL1
+    ] {
+        let mut r = Rig::el1();
+        r.set(0, input);
+        r.set(1, !expected);
+        assert_eq!(r.run(msr), Outcome::Continue, "MSR {msr:#x}");
+        assert_eq!(r.pc(), PC + 4, "MSR {msr:#x}");
+        let mrs = msr | (1 << 21) | 1; // MRS to X1
+        assert_eq!(r.run(mrs), Outcome::Continue, "MRS {mrs:#x}");
+        assert_eq!(r.pc(), PC + 8, "MRS {mrs:#x}");
+        assert_eq!(r.get(1), expected, "MRS {mrs:#x}");
+    }
+}
+
+#[test]
+fn production_sysreg_reads_use_virtual_cpu_state() {
+    let mut r = Rig::el1();
+    r.cpu.named.mpidr = SystemValue(0x1234_12ab_4503_0201);
+    r.cpu.named.par = SystemValue(0x8123);
+    r.cpu.named.cntfrq = SystemValue(0xffff_ffff_017d_7840);
+    r.cpu.named.cntvct = SystemValue(0x2345_6789_abcd_ef00);
+    r.cpu.named.icciar1 = SystemValue(0x3ff);
+
+    for (mrs, expected) in [
+        (0xd53800a1, 0x0000_00ab_c103_0201), // MPIDR_EL1
+        (0xd5387401, 0x8123),                // PAR_EL1
+        (0xd53be001, 25_000_000),            // CNTFRQ_EL0
+        (0xd53be041, 0x2345_6789_abcd_ef00), // CNTVCT_EL0
+        (0xd538cc01, 0x3ff),                 // ICC_IAR1_EL1
+    ] {
+        let pc = r.pc();
+        assert_eq!(r.run(mrs), Outcome::Continue, "MRS {mrs:#x}");
+        assert_eq!(r.pc(), pc + 4, "MRS {mrs:#x}");
+        assert_eq!(r.get(1), expected, "MRS {mrs:#x}");
+    }
+}
+
+#[test]
+fn production_sysreg_writes_update_their_owned_slots() {
+    let mut r = Rig::el1();
+    r.cpu.named.cntvctl = SystemValue(4); // provider's read-only ISTATUS
+    for (msr, input) in [
+        (0xd5182020, 0x1234_abcd_8000),      // TTBR1_EL1
+        (0xd51be320, 0xffff_ffff_ffff_fffb), // CNTV_CTL_EL0
+        (0xd51be340, 0x1_2345_6789),         // CNTV_CVAL_EL0
+        (0xd518cc20, 0x29),                  // ICC_EOIR1_EL1
+        (0xd518cba0, 0x100_0001),            // ICC_SGI1R_EL1
+    ] {
+        let pc = r.pc();
+        r.set(0, input);
+        assert_eq!(r.run(msr), Outcome::Continue, "MSR {msr:#x}");
+        assert_eq!(r.pc(), pc + 4, "MSR {msr:#x}");
+    }
+    assert_eq!(r.cpu.named.ttbr1.0, 0x1234_abcd_8000);
+    assert_eq!(r.cpu.named.cntvctl.0, 7);
+    assert_eq!(r.cpu.named.cntvcval.0, 0x1_2345_6789);
+    assert_eq!(r.cpu.named.icceoir1.0, 0x29);
+    assert_eq!(r.cpu.named.iccsgi1r.0, 0x100_0001);
+}
+
+#[test]
 fn msr_at_el0_to_an_el1_register_is_undefined() {
     let mut r = Rig::el0();
     r.set(3, 5);
