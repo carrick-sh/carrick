@@ -1966,8 +1966,9 @@ fn work_port_services_bound_tasks_on_loaded_and_idle_peer_lanes() {
 /// the process. Completing that exact retained service wakes the sibling
 /// into its captured entry. It must settle the old service owner and retire;
 /// before #2532 a newer entry saw that retained member wait and raised
-/// NativeServiceQuarantined. The shared host witnesses deterministically
-/// supply the observed newer mmap SVC and IRQ CarrierWork frame shapes.
+/// NativeServiceQuarantined. Publishing real host work while the service is
+/// retained supplies the observed IRQ CarrierWork entry; the shared host
+/// witnesses also drive the mmap SVC shape.
 #[test]
 fn terminal_close_settles_a_retained_native_service_entry() {
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
@@ -2013,6 +2014,9 @@ fn terminal_close_settles_a_retained_native_service_entry() {
         }
     }
     let retained_service = retained_service.expect("retained native service boundary");
+    factory
+        .fixture_mark_current_host_work(carrick_guest_arch::CpuId::new(1))
+        .expect("publish CarrierWork while the sibling service is retained");
 
     let leader_exit = leader
         .fixture_run_loaded(task)
@@ -2065,7 +2069,11 @@ fn terminal_close_settles_a_retained_native_service_entry() {
             if matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }) {
                 peer_process_exit.set(
                     sibling
-                        .service_idle_peer_doorbell(&exit, |_, _| {})
+                        .service_idle_peer_doorbell(&exit, |_, pending| {
+                            if let Some(pending) = pending {
+                                pending.settled();
+                            }
+                        })
                         .expect("terminal sibling service"),
                 );
             }
