@@ -2017,6 +2017,12 @@ fn terminal_close_settles_a_retained_native_service_entry() {
     factory
         .fixture_mark_current_host_work(carrick_guest_arch::CpuId::new(1))
         .expect("publish CarrierWork while the sibling service is retained");
+    factory
+        .fixture_inject_irq(
+            carrick_guest_arch::CpuId::new(1),
+            carrick_x86::interrupts::KICK_VECTOR,
+        )
+        .expect("inject the CarrierWork IRQ before service completion");
 
     let leader_exit = leader
         .fixture_run_loaded(task)
