@@ -575,6 +575,13 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
     pub fn slot_count(&self) -> usize {
         self.slots.len()
     }
+    /// Borrow the allocation retained by each installed slot, including
+    /// bootstrap windows. Callers can clone the Arcs to retain storage
+    /// independently of the lifetime of a slot registration.
+    pub fn retained_backings(&self) -> impl Iterator<Item = &Arc<BackingExtent>> {
+        self.slots.values().map(|slot| &slot.backing.extent)
+    }
+
     pub fn retained_bytes(&self) -> usize {
         self.slots.values().map(|s| s.backing.extent.len).sum()
     }

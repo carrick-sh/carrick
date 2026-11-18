@@ -26,6 +26,42 @@ impl CarrierMemoryIo for TestMemoryIo {
     }
 }
 #[test]
+fn retained_backings_follow_committed_slot_installs() {
+    let mut memory =
+        CarrierMemory::new(test_support::MemoryTestIo::new(TestMemoryIo::default())).unwrap();
+    let mut ram = GuestRam::new();
+    ram.add_window(0x1000, PAGE as usize, crate::guest_ram::WindowKind::Private)
+        .unwrap();
+    memory.install_bootstrap(Arc::new(ram)).unwrap();
+    let tag = NonZeroU64::new(2).unwrap();
+    let backing = |gpa| PreparedBacking {
+        extent: Arc::new(BackingExtent::private(FrameGpa::new(gpa), PAGE as usize).unwrap()),
+        identity: BackingIdentity {
+            frame_id: tag,
+            mapping_id: tag,
+            owner_generation: tag,
+            inventory_revision: tag,
+        },
+    };
+    let installed = backing(0x2000);
+    let redundant = backing(0x1000);
+    assert!(memory.install(&[installed.clone(), redundant]).is_err());
+    assert_eq!(memory.retained_backings().count(), 1);
+    assert_eq!(
+        memory.retained_backings().next().unwrap().base.raw(),
+        0x1000
+    );
+
+    memory.install(&[installed.clone()]).unwrap();
+    assert_eq!(memory.retained_backings().count(), 2);
+    assert!(
+        memory
+            .retained_backings()
+            .any(|extent| Arc::ptr_eq(extent, &installed.extent))
+    );
+}
+
+#[test]
 fn one_memslot_authenticates_each_inventoried_frame_independently() {
     test_support::one_memslot_authenticates_each_inventoried_frame_independently(|| {
         test_support::MemoryTestIo::new(TestMemoryIo::default())
