@@ -154,6 +154,30 @@
   ],
   "authority_debt_admissions": [
     {
+      "owner": "carrick_vmm_soft::build_program::main",
+      "issue": 671
+    },
+    {
+      "owner": "carrick_vmm_soft::build_program::main::CARGO_CFG_TARGET_ARCH",
+      "issue": 671
+    },
+    {
+      "owner": "carrick_vmm_soft::build_program::main::CARGO_CFG_TARGET_OS",
+      "issue": 671
+    },
+    {
+      "owner": "carrick_vmm_soft::build_program::main::CARGO_MANIFEST_DIR",
+      "issue": 671
+    },
+    {
+      "owner": "carrick_vmm_soft::build_program::main::OUT_DIR",
+      "issue": 671
+    },
+    {
+      "owner": "carrick_vmm_soft::build_program::main::CARGO",
+      "issue": 671
+    },
+    {
       "owner": "carrick_runtime::deadline_driver::DeadlineDriver::start",
       "issue": 1977
     },
