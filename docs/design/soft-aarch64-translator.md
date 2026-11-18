@@ -240,10 +240,17 @@ ELF the decoded accesses are:
 | Read and write | TTBR0_EL1, SP_EL0, CONTEXTIDR_EL1, TPIDR_EL0, TPIDRRO_EL0, DAIF, FPCR, FPSR |
 
 The generated vector spans also read TTBR0_EL1 and SP_EL0, and read and
-write ELR_EL1, SPSR_EL1, ESR_EL1, FAR_EL1 and TPIDR_EL1. The existing
-EL1h register bank accepts every direction observed in these spans.
-Timer and interrupt-controller slots hold passive state until their
-devices are wired.
+write ELR_EL1, SPSR_EL1, ESR_EL1, FAR_EL1 and TPIDR_EL1. The splitter
+witness checks every decoded access against the virtual EL1h register bank
+on each census run. The handler tests give known answers for all observed
+directions. On arm64, a native block sequence reads back CONTEXTIDR_EL1,
+FPCR, FPSR, virtual MPIDR_EL1 and virtual CNTFRQ_EL0.
+
+The EL1h bank holds passive timer and interrupt-controller state. CNTV_CTL_EL0
+writes update ENABLE and IMASK and preserve the provider's ISTATUS bit.
+FPCR and FPSR hold baseline AArch64 control and status fields. CONTEXTIDR_EL1,
+CNTFRQ_EL0, MPIDR_EL1 and SPSR_EL1 enforce their register widths or fixed
+reserved bits. Instruction-side FP state and feature extensions are separate.
 
 The measured code contains no MSR to SCTLR_EL1. The probe enters a
 syscall vector's callee with a fabricated trap frame, so the presence of

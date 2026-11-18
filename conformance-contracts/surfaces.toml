@@ -1158,16 +1158,16 @@ surfaces = [
   { path = "crates/carrick-signal-linux/src/lib.rs", contract = "kernel.el1.signal-delivery-owner" },
   # arm64 host launch for the aarch64 copy-through engine (#1236); a test-only execution lane, no guest-visible product path yet.
   { path = "crates/carrick-softcpu-aarch64-host/src/lib.rs", contracts = [] },
-  # Copy-through dispatcher over the ExecuteBlock seam (#1236); no host launch on main, so nothing executes yet.
+  # Copy-through dispatcher over the ExecuteBlock seam (#1236), driven by the test-only arm64 lane.
   { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contracts = [] },
-  # Pure virtual CPU state/exception machinery, not wired to execution; no guest-visible behaviour yet.
+  # Virtual exception entry and return for the test-only arm64 lane.
   # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
   { path = "crates/carrick-softcpu-aarch64/src/exception.rs", contracts = [] },
-  # Copy-through exit handlers against the virtual CPU state (#1236); not wired to execution.
+  # Copy-through exit handlers for the test-only arm64 lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contracts = [] },
   # Static diagnostics only: no guest execution or advertised CPU semantics.
   { path = "crates/carrick-softcpu-aarch64/src/lib.rs", contracts = [] },
-  # Pure virtual CPU state/exception machinery, not wired to execution; no guest-visible behaviour yet.
+  # Virtual CPU and system registers for the test-only arm64 lane.
   # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
   { path = "crates/carrick-softcpu-aarch64/src/state.rs", contracts = [] },
   # Copy-through block splitter and A64 emitter (#1236); pure word translation, nothing executes.

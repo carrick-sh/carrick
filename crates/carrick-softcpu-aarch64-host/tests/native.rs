@@ -205,6 +205,53 @@ fn native_svc_vector_returns_to_el0_and_wakes_one_wfe() {
     assert_eq!(cpu.pstate, origin);
 }
 
+#[test]
+fn native_dispatch_uses_virtual_sysregs_and_reserved_bit_rules() {
+    let mut memory = Flat::default();
+    memory.put_words(
+        CODE,
+        &[
+            0xd518d020, // msr contextidr_el1, x0
+            0xd538d021, // mrs x1, contextidr_el1
+            0xd51b4402, // msr fpcr, x2
+            0xd53b4403, // mrs x3, fpcr
+            0xd51b4422, // msr fpsr, x2
+            0xd53b4424, // mrs x4, fpsr
+            0xd53800a5, // mrs x5, mpidr_el1
+            0xd53be006, // mrs x6, cntfrq_el0
+            0xd4000002, // hvc #0
+        ],
+    );
+    let mut cpu = CpuState::default();
+    cpu.pc = ProgramCounter(CODE);
+    cpu.pstate.el = ExceptionLevel::El1;
+    cpu.pstate.sp = StackSelect::El1;
+    cpu.named.mpidr = SystemValue(0x1_0002_0304);
+    cpu.named.cntfrq = SystemValue(25_000_000);
+    set_x(&mut cpu, 0, 0x1234_abcd_9876_5432);
+    set_x(&mut cpu, 2, 0xffff_ffff_0440_6081);
+    let (report, starts) = run_at(&mut cpu, &mut memory);
+    assert!(
+        matches!(
+            report.stop,
+            Stop::Event {
+                event: Event::ProviderExit(_),
+                ..
+            }
+        ),
+        "{report}"
+    );
+    assert_eq!(
+        starts,
+        core::array::from_fn::<_, 9, _>(|n| CODE + 4 * n as u64)
+    );
+    assert_eq!(x(&cpu, 1), 0x9876_5432);
+    assert_eq!(x(&cpu, 3), 0x0440_0000);
+    assert_eq!(x(&cpu, 4), 0x81);
+    assert_eq!(x(&cpu, 5), 0x1_8002_0304);
+    assert_eq!(x(&cpu, 6), 25_000_000);
+}
+
 // Arm ARM DDI0487G.a C6.2. The same words run through the translator and
 // directly as the body of an AAPCS64 leaf, giving an independent host result.
 const SNIPPET: [u32; 17] = [

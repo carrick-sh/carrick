@@ -3,9 +3,11 @@
 //! CARRICK_LLVM_OBJDUMP set they are also checked against llvm-objdump text.
 // Test helpers outside #[test] fns fail loudly on malformed fixtures.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-use carrick_softcpu_aarch64::state::ProgramCounter;
+use carrick_softcpu_aarch64::state::{
+    CpuState, ExceptionLevel, ProgramCounter, StackSelect, SystemValue,
+};
 use carrick_softcpu_aarch64::translate::*;
-use carrick_softcpu_aarch64::{ExceptionKind, Hint, RegisterBranch};
+use carrick_softcpu_aarch64::{ExceptionKind, Hint, Instruction, RegisterBranch, SystemDirection};
 use std::collections::BTreeMap;
 use std::process::Command;
 
@@ -602,6 +604,7 @@ fn measure(name: &str, spans: &[(u64, Vec<u32>)]) {
     let mut blocks = 0usize;
     let mut sizes: BTreeMap<usize, usize> = BTreeMap::new();
     let mut emitted = 0usize;
+    let mut sysreg_accesses = 0;
     for (base, span) in spans {
         for block in split_span(ProgramCounter(*base), span, BlockLimits::default()) {
             for i in &block.instructions {
@@ -612,6 +615,23 @@ fn measure(name: &str, spans: &[(u64, Vec<u32>)]) {
                     InstructionClass::Branch(b) => format!("Branch({b:?})"),
                 };
                 *classes.entry(key).or_default() += 1;
+                if let Instruction::SystemAccess(access) = i.instruction {
+                    let mut cpu = CpuState::default();
+                    cpu.pstate.el = ExceptionLevel::El1;
+                    cpu.pstate.sp = StackSelect::El1;
+                    let result = match access.direction {
+                        SystemDirection::Read => cpu.mrs(access.encoding, access.rt).map(|_| ()),
+                        SystemDirection::Write => {
+                            cpu.msr(access.encoding, access.rt, SystemValue(0))
+                        }
+                    };
+                    assert!(
+                        result.is_ok(),
+                        "{name}: EL1h register bank rejects {access:?} at {:#x}: {result:?}",
+                        i.pc.0
+                    );
+                    sysreg_accesses += 1;
+                }
             }
             blocks += 1;
             *sizes.entry(block.instructions.len()).or_default() += 1;
@@ -626,7 +646,7 @@ fn measure(name: &str, spans: &[(u64, Vec<u32>)]) {
     let max = sizes.keys().last().copied().unwrap_or(0);
     println!(
         "{name}: {words} words, {blocks} blocks, mean {:.2} max {max} guest words/block, \
-         {emitted} host words; classes {classes:?}",
+         {emitted} host words, {sysreg_accesses} EL1h system-register accesses; classes {classes:?}",
         words as f64 / blocks as f64
     );
     assert_eq!(undefined, 0, "{name}: undefined production words");
