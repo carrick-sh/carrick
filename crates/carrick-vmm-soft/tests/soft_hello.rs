@@ -12,11 +12,16 @@
 
 use carrick_guest_mem::GuestMemory as _;
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
-use carrick_kernel::dispatch::DispatchOutcome;
+use carrick_kernel::dispatch::{DispatchOutcome, StdioReadiness};
 use carrick_vmm_soft::{SoftBootImage, SoftCarrier};
 use carrick_x86_cpl0_host::carrier_cpu::CarrierRunExit;
 use carrick_x86_cpl0_host::cpl0_boot::{
     InitialReservationLimits, PhysicalProcessExit, initial_extent_bytes_for, load_guest_mm,
+};
+
+use carrick_x86_cpl0_host::host_readiness::{
+    BoundHostFds, HostReadinessStep, ReadinessCrossing, ReadinessWait, StdioBinding,
+    sample_host_readiness,
 };
 
 mod common;
@@ -128,6 +133,16 @@ fn drive(elf: &[u8], run: &mut HelloRun) -> Result<(), String> {
         .load(root_state)
         .map_err(|error| format!("root load: {error}"))?;
     run.exits.push("root loaded".to_owned());
+    // The run's stdio readiness authority, as the runtime executor binds it.
+    let host_fds = BoundHostFds::from_stdio([0, 1, 2].map(|fd| {
+        dispatcher
+            .stdio_readiness(fd)
+            .map(|readiness| match readiness {
+                StdioReadiness::AlwaysWritable => StdioBinding::AlwaysWritable,
+                StdioReadiness::Host(fd) => StdioBinding::Host(fd),
+            })
+    }))
+    .map_err(|error| format!("setup: stdio readiness {error}"))?;
     for _ in 0..MAX_EXITS {
         let stopped = lease
             .fixture_run_loaded(task)
@@ -136,6 +151,29 @@ fn drive(elf: &[u8], run: &mut HelloRun) -> Result<(), String> {
             CarrierRunExit::SyscallTrap => {
                 let (value, token) = lease
                     .capture_forward(task, |venue, frame| {
+                        // Host-bound poll readiness (std's startup probe of
+                        // fds 0-2) through the shared carrier service.
+                        let now = std::time::Instant::now();
+                        match ReadinessCrossing::decode(frame, now)? {
+                            ReadinessCrossing::Other => {}
+                            ReadinessCrossing::Refused(errno) => {
+                                return Ok(Ok((frame.rax, errno.guest_retval())));
+                            }
+                            ReadinessCrossing::Request(request) => {
+                                return Ok(
+                                    match sample_host_readiness(venue, &request, &host_fds)? {
+                                        HostReadinessStep::Ready(value) => Ok((frame.rax, value)),
+                                        HostReadinessStep::Wait(_) => match request.wait(now) {
+                                            ReadinessWait::Expired => Ok((frame.rax, 0)),
+                                            ReadinessWait::Until(timeout) => Err(format!(
+                                                "unserved host readiness wait {timeout:?}: \
+                                                 parking needs an execution lease"
+                                            )),
+                                        },
+                                    },
+                                );
+                            }
+                        }
                         if frame.rax == carrick_el1_abi::HostObjectWriteCrossing::NUMBER
                             && frame.rcx == carrick_el1_abi::HostObjectWriteCrossing::FRAME_TAG
                         {
@@ -248,13 +286,14 @@ fn production_ring_runs_static_hello_to_exit_on_soft_cpu() {
 }
 
 /// The bhyve/KVM M2 static musl hello (`just test-kvm` builds it). Rust std
-/// startup polls fds 0-2 through the ring's `HostReadinessCrossing`, which
-/// the runtime executor's host-readiness service answers; the stopped-lease
-/// driver here serves only plain forwards and stdio writes, so the run is
-/// refused (-38) and std aborts. The production KVM CLI musl hello is also
-/// ignored (`x86_kvm_run.rs`).
+/// startup polls fds 0-2 through the ring's `HostReadinessCrossing`, now
+/// answered by the shared carrier readiness service. The run then takes two
+/// `OWNER_GRANT_PORT` doorbells and loops in the ring's fault path: the
+/// granted slots are installed after boot, and the soft memory view still
+/// authenticates only the slots it placed at boot, so every touch of a
+/// granted frame faults again (`docs/design/soft-x86-cpl0-bringup.md`).
 #[test]
-#[ignore = "std's startup poll needs the runtime-owned host-readiness service"]
+#[ignore = "owner-granted slots are not yet admitted into the soft memory view"]
 fn production_ring_runs_musl_hello_to_exit_on_soft_cpu() {
     let elf = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
