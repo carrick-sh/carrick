@@ -588,9 +588,9 @@ pub const X86_HOST_JOB: &str = "x86-host-tests";
 
 /// Host-lane roots that exist only on x86_64 Linux and similar hosts: a
 /// crate-level `#![cfg(...)]` naming `target_arch = "x86_64"` and no
-/// `target_os` (an OS-gated root, such as bhyve's or NVMM's, has its own
-/// lane). Returns `(package, target, root)` for library roots and for test
-/// targets in the `host` lane.
+/// `target_os`, or a Linux x86_64 root in the VM-free soft carrier. Other
+/// OS-gated roots, such as bhyve's or NVMM's, have their own lanes. Returns
+/// `(package, target, root)` for library roots and tests in the `host` lane.
 pub fn x86_only_roots(metadata: &Value, targets: &[TestTarget]) -> Vec<(String, String, PathBuf)> {
     let mut roots = Vec::new();
     for package in metadata
@@ -620,7 +620,7 @@ pub fn x86_only_roots(metadata: &Value, targets: &[TestTarget]) -> Vec<(String, 
                 continue;
             };
             let src = PathBuf::from(src);
-            if root_is_x86_64_only(&src) {
+            if root_is_x86_64_only(&src, name == "carrick-vmm-soft") {
                 roots.push((name.to_owned(), target_name.to_owned(), src));
             }
         }
@@ -629,13 +629,14 @@ pub fn x86_only_roots(metadata: &Value, targets: &[TestTarget]) -> Vec<(String, 
     roots
 }
 
-fn root_is_x86_64_only(src: &Path) -> bool {
+fn root_is_x86_64_only(src: &Path, include_linux: bool) -> bool {
     std::fs::read_to_string(src).is_ok_and(|text| {
         text.lines().any(|line| {
             let line = line.trim_start();
             line.starts_with("#![cfg(")
                 && line.contains("target_arch = \"x86_64\"")
-                && !line.contains("target_os")
+                && (!line.contains("target_os")
+                    || (include_linux && line.contains("target_os = \"linux\"")))
         })
     })
 }
@@ -1058,22 +1059,35 @@ mod tests {
             "cargo test --locked -p carrick-softcpu-x86 -p carrick-softmmu",
         );
         assert!(x86_root_errors(&gated, &roots).is_empty());
-        // The real roots: only softcpu-x86, never an OS-gated bhyve/NVMM root.
+        // The soft carrier needs both Linux and x86_64. Bhyve/NVMM roots
+        // remain the responsibility of their respective OS lanes.
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, text: &str| {
             let path = dir.path().join(name);
             std::fs::write(&path, text).unwrap();
             path
         };
-        assert!(root_is_x86_64_only(&write(
-            "a.rs",
-            "#![cfg(target_arch = \"x86_64\")]\n"
-        )));
-        assert!(!root_is_x86_64_only(&write(
-            "b.rs",
-            "#![cfg(all(target_os = \"freebsd\", target_arch = \"x86_64\"))]\n"
-        )));
-        assert!(!root_is_x86_64_only(&write("c.rs", "//! portable\n")));
+        assert!(root_is_x86_64_only(
+            &write("a.rs", "#![cfg(target_arch = \"x86_64\")]\n"),
+            false
+        ));
+        let soft = write(
+            "soft.rs",
+            "#![cfg(all(target_arch = \"x86_64\", target_os = \"linux\"))]\n",
+        );
+        assert!(root_is_x86_64_only(&soft, true));
+        assert!(!root_is_x86_64_only(&soft, false));
+        assert!(!root_is_x86_64_only(
+            &write(
+                "b.rs",
+                "#![cfg(all(target_os = \"freebsd\", target_arch = \"x86_64\"))]\n"
+            ),
+            false
+        ));
+        assert!(!root_is_x86_64_only(
+            &write("c.rs", "//! portable\n"),
+            false
+        ));
     }
     #[test]
     fn linux_only_libs_need_a_linux_gate() {
