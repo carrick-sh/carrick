@@ -81,6 +81,9 @@ pub enum EntryBindingFatalReason {
     /// A native service refused because the kernel heap could not hold its
     /// storage (#2441).
     NativeServiceNoMemory = 63,
+    /// A native fork refusal whose cause means the owner contradicted its
+    /// own state (`NativeForkClass::InvariantViolation`, #2441).
+    NativeForkInvariant = 64,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -137,6 +140,7 @@ impl EntryBindingFatalReason {
             61 => Some(Self::RequeueRefused),
             62 => Some(Self::OwnedFamilyForward),
             63 => Some(Self::NativeServiceNoMemory),
+            64 => Some(Self::NativeForkInvariant),
 
             _ => None,
         }
