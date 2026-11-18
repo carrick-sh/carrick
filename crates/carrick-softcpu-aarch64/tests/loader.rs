@@ -15,6 +15,34 @@ fn tlbi_loader_red_witness() {
     assert_ne!(decode_instruction(0xd508831f), Instruction::Unallocated);
 }
 
+#[test]
+fn el0_entry_trampoline_span_is_typed_and_has_no_undefined_word() {
+    let bytes = carrick_mem::memory::el0_trampoline_bytes();
+    assert_loader_vector_spans_typed(&bytes);
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let blocks = translate::split_span(
+        state::ProgramCounter(carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE),
+        &words,
+        translate::BlockLimits::default(),
+    );
+    assert!(!blocks.is_empty());
+    for block in &blocks {
+        for instruction in block.instructions() {
+            assert_ne!(
+                instruction.class(),
+                translate::InstructionClass::Exit(translate::ExitReason::Undefined),
+                "PC={:#x} word={:#010x}",
+                instruction.pc().0,
+                instruction.word()
+            );
+        }
+        translate::emit_block(block).expect("trampoline block translates");
+    }
+}
+
 use std::process::Command;
 fn object(words: &[u32]) -> Vec<u8> {
     let text_end = 64 + 4 * words.len();

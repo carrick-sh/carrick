@@ -284,7 +284,7 @@ mod tests {
                         }
                         set(f, a.rd, r);
                     }
-                    Instruction::Hint(crate::Hint::Nop) => {}
+                    Instruction::Hint(crate::Hint::Nop) | Instruction::Barrier(_) => {}
                     _ if i.class().terminates() => {}
                     _ => return Err("double: instruction outside its subset"),
                 }
@@ -582,5 +582,50 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn production_el0_entry_trampoline_drops_to_el0_and_enters_lower_el_svc_vector() {
+        use crate::state::{InterruptMasks, SavedPstate};
+        let trampoline = carrick_mem::memory::el0_trampoline_bytes();
+        let words: std::vec::Vec<u32> = trampoline
+            .chunks_exact(4)
+            .take(8)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let tramp_base = carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE;
+        let user_entry = 0x21_0120;
+        let mut m = Flat::default();
+        m.code(tramp_base, &words);
+        // Unmodified EL0 SVC #0 at user entry.
+        m.code(user_entry, &[0xd400_0001]);
+        // Current-EL sync fault vector (hvc #3) vs Lower-EL sync vector (hvc #2).
+        m.code(VBAR + 0x200, &[0xd400_0062]);
+        m.code(VBAR + 0x400, &[0xd400_0042]);
+
+        let mut cpu = el1();
+        cpu.pc = ProgramCounter(tramp_base);
+        cpu.pstate.daif = InterruptMasks::ALL;
+        cpu.el1.elr = ProgramCounter(user_entry);
+        // SPSR_EL1 = EL0t with DAIF masked (0x3c0), matching StagedCpu::initial_root.
+        cpu.el1.spsr = SavedPstate(0x3c0);
+
+        let r = go(&mut cpu, &mut m, &mut GuestSemantics, 16);
+        let Stop::Event {
+            instruction,
+            event: Event::ProviderExit(exit),
+        } = r.stop
+        else {
+            panic!("{r}");
+        };
+        assert_eq!(
+            (instruction.pc().0, exit.immediate.value()),
+            (VBAR + 0x400, 2),
+            "expected lower-EL SVC vector (HVC #2), got ESR={:#x} ELR={:#x}: {r}",
+            cpu.el1.esr.0,
+            cpu.el1.elr.0
+        );
+        assert_eq!(cpu.el1.elr, ProgramCounter(user_entry + 4));
+        assert_eq!(cpu.el1.esr.0, (0x15 << 26) | (1 << 25));
     }
 }
