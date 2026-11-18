@@ -398,19 +398,24 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
         mut child: C,
         child_handle: El1MmHandle,
     ) -> Result<UnpublishedChild<B>, ForkError> {
+        // A parent descriptor, generation or operation sequence that moved
+        // since the prepare read it is another live thread of the parent's
+        // fault or edit: contention, and the fork reruns (#2441). `Stale`
+        // names only a broken invariant.
         for (pa, before) in &self.scratch.reads {
             if words.load(*pa).map_err(|_| ForkError::Core)? != *before {
-                return Err(ForkError::Stale);
+                return Err(ForkError::Busy);
             }
         }
-        if self.request.parent_generation.raw() >= u64::MAX - 1 {
-            return Err(ForkError::Stale);
-        }
-        if parent.incarnation() != self.request.operation.incarnation.get()
-            || parent.generation() != self.request.parent_generation
-            || parent.operation_sequence() != self.request.operation.sequence.get()
+        if self.request.parent_generation.raw() >= u64::MAX - 1
+            || parent.incarnation() != self.request.operation.incarnation.get()
         {
             return Err(ForkError::Stale);
+        }
+        if parent.generation() != self.request.parent_generation
+            || parent.operation_sequence() != self.request.operation.sequence.get()
+        {
+            return Err(ForkError::Busy);
         }
         if !parent.fork_ready() || child.is_admitted() {
             return Err(ForkError::Busy);
@@ -453,18 +458,18 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
                                 Err(if result.is_err() {
                                     ForkError::Core
                                 } else {
-                                    ForkError::Stale
+                                    ForkError::Busy
                                 })
                             }
                         }
                     }
-                    Ok(false) => Err(ForkError::Stale),
+                    Ok(false) => Err(ForkError::Busy),
                     Err(_) => Err(ForkError::Core),
                 }
             } else {
                 match words.compare_exchange(edit.pa, edit.before, edit.after) {
                     Ok(true) => Ok(()),
-                    Ok(false) => Err(ForkError::Stale),
+                    Ok(false) => Err(ForkError::Busy),
                     Err(_) => Err(ForkError::Core),
                 }
             };
