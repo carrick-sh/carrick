@@ -14173,6 +14173,54 @@ mod tests {
         assert!(host.is_valid(g + 3 * TWO_MIB) && host.is_valid(g + 2 * TWO_MIB + PT_PAGE));
     }
 
+    #[test]
+    fn two_page_grant_window_retirement_uses_inline_journal() {
+        use descriptor_txn::{CallerInvalidatesAsid, DescriptorOutcome, DescriptorTxnId};
+
+        const GRANT_WINDOW: u64 = 0x60_0000_0000;
+        const GRANT_PAGES: u64 = 256;
+        let (mut mgr, resolver) = create_live_fixture();
+        mgr.begin_undo().unwrap();
+        mgr.map_aliased(
+            GRANT_WINDOW,
+            LINUX_ALIAS_IPA_BASE,
+            GRANT_PAGES * PT_PAGE,
+            RWX,
+            None,
+        )
+        .unwrap();
+        unsafe { mgr.sync_to_host(&*resolver).unwrap() };
+        mgr.commit_undo();
+        mgr.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
+
+        let id = DescriptorTxnId {
+            mm_key: core::num::NonZeroU64::MIN,
+            generation: core::num::NonZeroU64::MIN,
+        };
+        let txn = mgr
+            .prepare_guest_descriptor_txn(id, mgr.unmap_aliased_op(GRANT_WINDOW, 2 * PT_PAGE), None)
+            .unwrap();
+        snapshot_allocations::FAIL_AFTER.with(|limit| limit.set(Some(0)));
+        // SAFETY: the fixture is the only editor of this live image.
+        let result =
+            unsafe { mgr.execute_guest_descriptor_txn_as_host(&txn, &CallerInvalidatesAsid) };
+        snapshot_allocations::FAIL_AFTER.with(|limit| limit.set(None));
+
+        let receipt = result.unwrap();
+        let DescriptorOutcome::Applied(applied) = receipt.outcome else {
+            panic!("{receipt:?}");
+        };
+        assert_eq!(applied.live_stores, 2);
+        let verified = mgr.settle_guest_descriptor_receipt(&txn, &receipt).unwrap();
+        assert!(verified.reclaimed_tables().is_empty());
+        assert_eq!(mgr.translate(GRANT_WINDOW), None);
+        assert_eq!(mgr.translate(GRANT_WINDOW + PT_PAGE), None);
+        assert_eq!(
+            mgr.translate(GRANT_WINDOW + 2 * PT_PAGE),
+            Some(LINUX_ALIAS_IPA_BASE + 2 * PT_PAGE)
+        );
+    }
+
     /// On the guest-owned live lane an alias munmap is one EL1 transaction:
     /// the host plans and narrows the reclaim budget, EL1 unlinks under
     /// break-before-make, the freed table crosses the slot in the receipt,

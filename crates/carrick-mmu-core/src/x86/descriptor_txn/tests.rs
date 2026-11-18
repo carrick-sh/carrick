@@ -1374,6 +1374,51 @@ fn stale_root_grants_receipt_and_journal_capacity_refuse_without_writes() {
     assert_eq!(words.load(0x1000).unwrap(), 0);
 }
 #[test]
+fn two_page_grant_window_retirement_uses_inline_journal() {
+    const GRANT_WINDOW: u64 = 0x60_0000_0000;
+    const GRANT_PAGES: u64 = 256;
+    const OUTPUT: u64 = 0x400000;
+    let words = Words::new();
+    assert!(matches!(
+        apply(
+            &words,
+            map(GRANT_WINDOW, OUTPUT, GRANT_PAGES * PAGE, LeafSize::Page),
+            &[root(0x2000), root(0x3000), root(0x4000)],
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+
+    let txn = txn(
+        DescriptorOp::Unmap(PageSpan::new(GRANT_WINDOW, 2 * PAGE)),
+        &[],
+    );
+    let plan = plan_descriptor_txn(&words, &txn, txn.root).unwrap();
+    assert_eq!(plan.live_stores(), 2);
+    assert!(matches!(
+        execute_descriptor_txn(&words, &txn, txn.root, &mut InlineJournal::new()).outcome,
+        DescriptorOutcome::Applied {
+            stores: 2,
+            tables_linked: 0
+        }
+    ));
+    for va in [GRANT_WINDOW, GRANT_WINDOW + PAGE] {
+        assert!(translate(&words, txn.root, UserVa::new(va), Access::Read, true).is_err());
+    }
+    assert_eq!(
+        translate(
+            &words,
+            txn.root,
+            UserVa::new(GRANT_WINDOW + 2 * PAGE),
+            Access::Read,
+            true
+        )
+        .unwrap()
+        .raw(),
+        OUTPUT + 2 * PAGE
+    );
+}
+
+#[test]
 fn whole_block_protection_edits_one_terminal_without_split_grants() {
     let words = Words::new();
     let span = PageSpan::new(1 << 30, 1 << 30);
