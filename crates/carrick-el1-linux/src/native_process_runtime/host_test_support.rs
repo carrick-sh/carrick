@@ -14225,6 +14225,191 @@ fn cancelling_a_fork_waiting_for_a_metadata_grant_wakes_it_on_arm() {
     >(arm_words);
 }
 
+/// #2441: a terminal cancellation of a fork whose metadata grant `g` was
+/// already answered, while the woken fork still waits on its run queue and
+/// a later request `g + 1` rebound the grant's one request queue. The
+/// service row still names the wait on `g`, but that queue moved on only
+/// because `g` drained, which woke every waiter: the fork is already woken.
+/// The cancellation (SIGKILL here; a sibling's `exit_group` cancels the
+/// same way) completes, and the run continues normally: the woken fork
+/// resumes at its owner checkpoint and publishes no child.
+#[cfg(test)]
+fn cancelling_a_fork_woken_from_a_drained_grant_ends_normally_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
+    use carrick_sched_core::object_wait::{ObjectWaitKey, OwnedObjectWakeEffects};
+    let capacity = NativeServiceCapacityFixture::<C>::new_for::<B>(1, make_words);
+    let fixture = &capacity.fixture;
+    let processes = || fixture.runtime.graph.lock().owner.tasks().len();
+    let completion = |owned: OwnedObjectWakeEffects<'_, C>| {
+        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+    };
+    let mailbox: &'static carrick_el1_abi::MetadataGrantMailbox =
+        Box::leak(Box::new(carrick_el1_abi::MetadataGrantMailbox::new()));
+    let request = carrick_el1_abi::MetadataGrantRequest {
+        op: carrick_el1_abi::METADATA_GRANT_OP_ALLOC,
+        arg1: 512 * 1024,
+        arg2: 0,
+        arg3: 0,
+        cookie: 0,
+    };
+    // The allocator publishes a request and binds its queue
+    // (`MetadataStorage::publish_request`).
+    let publish = || {
+        let mut generation = 0;
+        assert!(mailbox.try_publish_request_prepared(request, |published| {
+            generation = published;
+            fixture
+                .zone
+                .bind_object_wait(
+                    ObjectWaitKey::metadata_request(published).unwrap(),
+                    &carrick_sched_core::ShortLockSpin,
+                    &completion,
+                )
+                .is_ok()
+        }));
+        ObjectWaitKey::metadata_request(generation).unwrap()
+    };
+    let key = publish();
+    carrick_el1::alloc::install_host_test_grant_mailbox(Some(mailbox));
+    let (record, address, words) = capacity.select().unwrap();
+    let mut service = fixture.service();
+    {
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                address,
+                &words,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.resume_checkpoint(|_| Ok(None)),
+            Ok(NativeResume::NoPending)
+        ));
+        PREPARE_MM_ERRORS.with(|errors| {
+            errors
+                .borrow_mut()
+                .push_back(owed_metadata_grant_refusal(mailbox))
+        });
+        assert_eq!(
+            outcome_kind(&child.fork(ProcessForkChildTid::NONE)),
+            "Transferred"
+        );
+        assert!(child.take_handoff_receipt().is_some());
+    }
+    // The carrier answers `g` under its queue's lock: the fork is woken
+    // onto the run queue, where it has not run yet.
+    assert!(mailbox.claim_request().is_some());
+    {
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &completion)
+            .unwrap();
+        mailbox.publish_response(
+            carrick_el1_abi::METADATA_GRANT_SUCCESS,
+            0x8000_0000,
+            512 * 1024,
+            7,
+        );
+        assert_eq!(
+            queue
+                .notify_object(fixture.slot, &mut WakeEffects::default())
+                .unwrap()
+                .queued,
+            1
+        );
+    }
+    // Another vCPU's allocator consumes the answer and publishes `g + 1`,
+    // rebinding the grant's one request queue.
+    assert!(mailbox.claim_response().is_some());
+    mailbox.finish_response();
+    let next = publish();
+    assert_eq!(next.index(), key.index(), "one carrier-wide request queue");
+    assert!(
+        fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &completion)
+            .is_err(),
+        "the drained grant's queue is now g + 1's"
+    );
+    // A SIGKILL reaches the woken fork's process before it runs.
+    let page = fixture.zone.record(record.id).identity().lifecycle_page;
+    // SAFETY: the fork stock's leaked page outlives this fixture.
+    unsafe { &*(page as *const ThreadLifecyclePage) }
+        .process_exit_custody()
+        .publish_cancellation(carrick_core::terminal::ProcessCancellation::FatalSignal);
+    let cancelled = fixture
+        .runtime
+        .cancel_service(record, fixture.slot, &mut service);
+    assert!(
+        cancelled.is_ok(),
+        "a grant wait whose queue drained is already woken: {cancelled:?}"
+    );
+    assert_eq!(
+        fixture
+            .zone
+            .object_queue_census(next.index())
+            .unwrap()
+            .waiters,
+        0,
+        "g + 1's queue gained no waiter"
+    );
+    let (resumed, address, words) = capacity.select().unwrap();
+    assert_eq!(resumed, record);
+    let mut child = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            address,
+            &words,
+            &mut service,
+        )
+        .unwrap();
+    let resumed = child.resume_checkpoint(|_| Ok(None));
+    assert!(
+        resumed.is_ok(),
+        "the cancelled, already woken fork resumes at its owner checkpoint: {:?}",
+        resumed.err()
+    );
+    drop(child);
+    assert_eq!(processes(), 2, "the cancelled fork published no child");
+    carrick_el1::alloc::install_host_test_grant_mailbox(None);
+}
+
+#[cfg(test)]
+#[test]
+fn cancelling_a_fork_woken_from_a_drained_grant_ends_normally() {
+    cancelling_a_fork_woken_from_a_drained_grant_ends_normally_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
+
+/// [`cancelling_a_fork_woken_from_a_drained_grant_ends_normally`] on the AArch64 owner's context and MMU.
+#[cfg(test)]
+#[test]
+fn cancelling_a_fork_woken_from_a_drained_grant_ends_normally_on_arm() {
+    cancelling_a_fork_woken_from_a_drained_grant_ends_normally_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
 /// #2441: a fork owed a grant the carrier has already answered probes it
 /// once and reruns at once, in the same entry, without parking: the answer
 /// is published (`answered_in_place`), or a later request already holds
