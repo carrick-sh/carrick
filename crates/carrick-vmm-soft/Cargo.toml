@@ -13,6 +13,7 @@ workspace = true
 
 # Neutral soft-x86 carrier bring-up (#671). No KVM, HVF or personality crate.
 [dependencies]
+carrick-abi = { path = "../carrick-abi" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-hal = { path = "../carrick-hal" }
@@ -32,6 +33,7 @@ toml.workspace = true
 
 [dev-dependencies]
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 
 # The probe boots the ring image in the VM-free soft CPU: no /dev/kvm.
