@@ -103,6 +103,11 @@ enum PreparedService {
     Retired(NativeResume),
 }
 
+enum ClosingMemberWait {
+    Service,
+    Signal,
+}
+
 enum PendingServiceReply {
     Fault(Box<carrick_el1_abi::PortalGrantSlot>),
     Exec(Box<ExecSuccessorManifest>),
@@ -2092,16 +2097,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         };
         self.service_phase = NativeServicePhase::Member;
+        let mut closing_wait = None;
         let member = {
-            let graph = self.runtime.graph.lock();
+            let mut graph = self.runtime.graph.lock();
             if graph.has_member_wait(&self.record) {
-                // A process close cancels every member's retained service, but
-                // its completion can wake the exact member directly into an
-                // already captured SVC or IRQ entry. Settle that old owner
-                // before this new entry can publish work. Other member waits,
-                // and a service wait without terminal authority, are broken
-                // duplicate custody and keep their existing classification.
-                if graph.pending.has_exit(&self.key) && graph.service_wait(&self.record).is_some() {
+                // Process close can wake an exact retained service or signal
+                // wait directly into an already captured SVC or IRQ entry.
+                // Settle a service; discard a signal wait whose syscall can no
+                // longer return; then retire before this entry publishes work.
+                // A wait without terminal authority remains broken custody.
+                if graph.pending.has_exit(&self.key) {
+                    closing_wait = Some(if graph.service_wait(&self.record).is_some() {
+                        ClosingMemberWait::Service
+                    } else {
+                        graph.remove_signal_wait(&self.record).ok_or(
+                            NativeProcessError::ServiceQuarantined(
+                                NativeServiceQuarantine::RetainedSignalWaitMissing,
+                            ),
+                        )?;
+                        ClosingMemberWait::Signal
+                    });
                     None
                 } else {
                     // IPC keeps its separately retained operation on refusal.
@@ -2139,9 +2154,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         };
         let Some((page, control, mm)) = member else {
-            return self
-                .settle_retained_service_for_closing_entry()
-                .map(PreparedService::Retired);
+            return match closing_wait {
+                Some(ClosingMemberWait::Service) => self
+                    .settle_retained_service_for_closing_entry()
+                    .map(PreparedService::Retired),
+                Some(ClosingMemberWait::Signal) => {
+                    self.retire_closing_entry().map(PreparedService::Retired)
+                }
+                None => Err(NativeProcessError::Stale),
+            };
         };
         self.service_phase = NativeServicePhase::Birth;
         let birth =
