@@ -222,3 +222,52 @@ carrier is single-vCPU (#2397), refuses MSI, and does not refresh its
 placement when slots change at run time. Those, the executor
 (`CarrierCpuBackend` over `SoftMachine`) and runtime selection are the
 next slices.
+
+
+### M1-2 status: the soft carrier CPU behind `CarrierCpuBackend`
+
+The production ring now runs a static hello to its exit on soft CPUs.
+`SoftCpuBackend` implements `CarrierCpuBackend` over one `SoftMachine`,
+and the shared custody claims it as `CarrierCpuIo`. Images go through the
+shared `X86Vcpu` snapshot, with a full x87/SSE/AVX XSAVE area. Its runs
+enter through `run_production_member`. That function moved from KVM's
+`run_member` into the shared host, over a small `ProductionMemberCpu`
+trait. It owns the file-execution lease, the shootdown table's
+running/ack protocol and the reentry KICK. A soft kick is a flag checked
+between blocks. A soft `OUT` has already advanced RIP, so pending I/O
+completion has nothing to do. `SoftCpuContext` is `Send`, so executor
+worker threads can own it. Its two raw pointers are per-block borrows that
+`execute`'s guard clears.
+
+`SoftCarrier::into_worker_parts` builds the shared `ProductionWorkerParts`.
+The issued root's state comes from `BootstrapCustody::worker_root_state`,
+which also moved out of KVM. The second physical CPU is a stopped soft CPU
+in slot 1's boot state. M1 is single-vCPU (#2397), so it is never started.
+
+`tests/soft_hello.rs` drives the root lease of the shared
+`ProductionCpuFactory`, as the KVM stopped-worker witnesses in
+`cpl0_initial_mm.rs` do. The run takes four steps:
+
+- initial-MM admission, then the root load;
+- the forwarded `write`, dispatched by the kernel dispatcher;
+- `WORK_PORT`;
+- the exit doorbell.
+
+The guest exits 0 with stdout `hello\n`.
+
+Rust std's startup on the bhyve musl hello fixture polls fds 0-2 through
+`HostReadinessCrossing`. Only the runtime executor's host-readiness
+service answers that crossing (`carrick-runtime`,
+`vcpu_loop/executor/cpl0.rs`). The stopped-lease driver therefore refuses
+it, and std aborts. The witness is ignored with that reason, as the
+production KVM CLI musl hello is. The next slice either wires the soft
+backend into the runtime executor pool, or moves the executor's host
+routes out of `carrick-runtime`. Both are director-ruled.
+
+Still open:
+
+- the soft peer CPU's start and the APIC cluster;
+- MSI;
+- placement refresh when slots change at run time;
+- soft-walk admission of roots other than the CPU's current CR3;
+- runtime selection (`--vcpu soft`).

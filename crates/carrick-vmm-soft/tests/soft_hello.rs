@@ -154,7 +154,10 @@ fn drive(elf: &[u8], run: &mut HelloRun) -> Result<(), String> {
                                 .map_err(|error| {
                                     carrick_x86_cpl0_host::cpl0_boot::fail(error.to_string())
                                 })?;
-                            return Ok(Ok(dispatcher.forward_stdio_bytes(object, &bytes)));
+                            return Ok(Ok((
+                                frame.rax,
+                                dispatcher.forward_stdio_bytes(object, &bytes),
+                            )));
                         }
                         // A plain forwarded call takes the runtime executor's
                         // host route: normalize, then dispatch under the root.
@@ -179,8 +182,10 @@ fn drive(elf: &[u8], run: &mut HelloRun) -> Result<(), String> {
                                 carrick_x86_cpl0_host::cpl0_boot::fail(error.to_string())
                             })?;
                         Ok(match outcome {
-                            DispatchOutcome::Returned { value } => Ok(value),
-                            DispatchOutcome::Errno { errno } => Ok(errno.guest_retval()),
+                            DispatchOutcome::Returned { value } => Ok((frame.rax, value)),
+                            DispatchOutcome::Errno { errno } => {
+                                Ok((frame.rax, errno.guest_retval()))
+                            }
                             other => Err(format!(
                                 "unserved forward outcome {other:?} for native {}",
                                 raw.native_number.0
@@ -188,11 +193,11 @@ fn drive(elf: &[u8], run: &mut HelloRun) -> Result<(), String> {
                         })
                     })
                     .map_err(|error| format!("forward capture: {error}"))?;
-                let value = value?;
+                let (number, value) = value?;
                 lease
                     .complete_forward(task, token, value)
                     .map_err(|error| format!("forward completion: {error}"))?;
-                run.exits.push(format!("forward={value}"));
+                run.exits.push(format!("forward {number:#x}={value}"));
             }
             CarrierRunExit::PhysicalDoorbell { port, .. } => {
                 let kernel = root.kernel();
@@ -239,5 +244,26 @@ fn production_ring_runs_static_hello_to_exit_on_soft_cpu() {
     println!("[production, static hello] {}", run.summary());
     assert!(run.failure.is_none(), "{}", run.summary());
     assert_eq!(run.stdout, b"hello\n", "{}", run.summary());
+    assert_eq!(run.exit, Some(0), "{}", run.summary());
+}
+
+/// The bhyve/KVM M2 static musl hello (`just test-kvm` builds it). Rust std
+/// startup polls fds 0-2 through the ring's `HostReadinessCrossing`, which
+/// the runtime executor's host-readiness service answers; the stopped-lease
+/// driver here serves only plain forwards and stdio writes, so the run is
+/// refused (-38) and std aborts. The production KVM CLI musl hello is also
+/// ignored (`x86_kvm_run.rs`).
+#[test]
+#[ignore = "std's startup poll needs the runtime-owned host-readiness service"]
+fn production_ring_runs_musl_hello_to_exit_on_soft_cpu() {
+    let elf = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carrick-vmm-bhyve/fixtures/hello-x86_64/target/x86_64-unknown-linux-musl/release/carrick-hello-x86_64"
+    ))
+    .expect("musl hello fixture");
+    let run = run_hello(&elf);
+    println!("[production, musl hello] {}", run.summary());
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert_eq!(run.stdout, b"hello, x86_64 world\n", "{}", run.summary());
     assert_eq!(run.exit, Some(0), "{}", run.summary());
 }
