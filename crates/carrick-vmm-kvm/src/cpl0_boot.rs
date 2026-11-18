@@ -23,8 +23,7 @@ use carrick_el1::memory::reservations::{
 };
 use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
-    BlockedMask, Counters, CurrentTask, El1TaskId, ReservationMm, ThreadControlSlot,
-    ThreadLifecyclePage,
+    BlockedMask, Counters, CurrentTask, ReservationMm, ThreadControlSlot, ThreadLifecyclePage,
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_arch::{RootGpa, UserVa};
@@ -690,51 +689,7 @@ impl Cpl0Carrier {
         &mut self,
         identity: InitialTaskBinding,
     ) -> Result<(), TrapError> {
-        if self.custody.initial_task().is_some()
-            || self.custody.has_initial_inventory()
-            || self
-                .custody
-                .actual_run()
-                .iter()
-                .any(|flag| flag.load(Ordering::Acquire) != 0)
-            || identity.thread.tid != identity.task.id.raw() as u64
-            || identity.thread.serial == 0
-            || identity.thread.file_table == 0
-            || identity.thread.generation == 0
-            || identity.thread.mm != 0
-            || identity.thread.lifecycle_page != 0
-            || identity.thread.control_slot != 0
-        {
-            return Err(fail("initial task binding requires stopped root admission"));
-        }
-        let tid = u32::try_from(identity.thread.tid)
-            .map_err(|_| fail("initial task TID outside guest ABI"))?;
-        let birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
-            carrick_core_abi::EntryTaskKey::from_raw(identity.thread.tid),
-            carrick_core_abi::BirthSerial::of_task(identity.task.serial),
-            carrick_core_abi::EntryThreadGeneration::from_raw(identity.thread.serial),
-        )
-        .ok_or_else(|| fail("initial root birth identity"))?;
-        let control: &ThreadControlSlot = self.metadata(CONTROL_OFFSET);
-        control
-            .reset_for_host_birth(BlockedMask(0))
-            .map_err(|_| fail("control slot still owned by graph"))?;
-        if !control.publish_visible_tid(tid) {
-            return Err(fail("initial root control slot identity"));
-        }
-        control.publish_host_birth_identity(birth);
-        let task = self.task(0);
-        task.set(
-            El1TaskId::from_linux_tid(identity.task.id.raw()),
-            carrick_el1_abi::SnapshotGeneration::from_raw(identity.thread.generation),
-            identity.thread.file_table,
-        );
-        task.mm
-            .thread_generation
-            .store(identity.thread.serial, Ordering::Release);
-        task.publish_visible_pid(tid);
-        self.custody.set_initial_task(identity);
-        Ok(())
+        self.custody.bind_initial_task_identity(identity)
     }
 
     /// Transfer the two physical CPUs to executor adapters after completing
