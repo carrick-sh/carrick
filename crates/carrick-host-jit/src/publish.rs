@@ -2,19 +2,6 @@
 //! crate. It runs on the host CPU against this crate's own mapping and makes
 //! no system call.
 
-/// Read this host's CTR_EL0 (Arm ARM D13.2.34) to visit each cache line in
-/// the publication range and select the maintenance required by this CPU.
-#[cfg(target_arch = "aarch64")]
-pub fn cache_type() -> u64 {
-    let ctr: u64;
-    // SAFETY: CTR_EL0 is readable at EL0 on Linux and macOS (the kernel sets
-    // SCTLR_EL1.UCT or emulates the trap); the read touches no memory.
-    unsafe {
-        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags));
-    }
-    ctr
-}
-
 /// Make `len` bytes just stored at `start` visible to this host's instruction
 /// fetch. x86_64 keeps instruction fetch coherent with the storing core's
 /// writes (the mprotect system call that follows serializes it), so there is
@@ -33,7 +20,12 @@ pub(crate) fn publish_instructions(_start: *const u8, _len: usize) -> bool {
 /// invalidation is not needed for coherence on this host.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn publish_instructions(start: *const u8, len: usize) -> bool {
-    let ctr = cache_type();
+    let ctr: u64;
+    // SAFETY: CTR_EL0 is readable at EL0 on the supported hosts. Its line
+    // strides and coherence bits determine which maintenance to issue below.
+    unsafe {
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags));
+    }
     let begin = start as usize;
     let end = begin.saturating_add(len);
     if ctr & (1 << 28) == 0 {

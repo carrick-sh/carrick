@@ -8,6 +8,7 @@
 // Test helpers outside #[test] fns fail loudly on malformed fixtures.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use carrick_host_jit::JitCodeBuffer;
 use carrick_softcpu_aarch64::dispatch::{ExecuteBlock, Report, Stop, run};
 use carrick_softcpu_aarch64::handler::{ExclusiveMonitor, GuestMemory, MemoryFault};
 use carrick_softcpu_aarch64::state::{
@@ -100,77 +101,62 @@ fn run_at(cpu: &mut CpuState, memory: &mut Flat) -> (Report<HostError>, Vec<u64>
     (report, exec.starts)
 }
 
-/// One register-only snippet, assembled once as words for the engine (the
-/// `global_asm!` symbol) and once inline for the host CPU (`asm!`).
-macro_rules! register_snippet {
-    () => {
-        concat!(
-            "csel x14, x0, x1, vs\n",
-            "adds x2, x0, x1\n",
-            "csel x3, x0, x1, cs\n",
-            "sub x4, x0, x1, lsl #4\n",
-            "subs x5, x1, x0\n",
-            "cset x6, mi\n",
-            "and x7, x0, #0xff00ff00ff00ff00\n",
-            "orr x8, x1, x0, lsl #7\n",
-            "eor x9, x0, x1, asr #13\n",
-            "movz x10, #0xbeef, lsl #16\n",
-            "movk x10, #0xdead, lsl #48\n",
-            "movn x11, #0x1234\n",
-            "lsr x12, x0, #9\n",
-            "ccmp x0, x1, #2, ne\n",
-            "csinc x13, x1, x0, hi\n",
-            "madd x14, x0, x1, x14\n",
-            "bics x15, x1, x0\n",
-        )
-    };
-}
+// Arm ARM DDI0487G.a C6.2. The same words run through the translator and
+// directly as the body of an AAPCS64 leaf, giving an independent host result.
+const SNIPPET: [u32; 17] = [
+    0x9a81600e, // csel x14, x0, x1, vs
+    0xab010002, // adds x2, x0, x1
+    0x9a812003, // csel x3, x0, x1, cs
+    0xcb011004, // sub x4, x0, x1, lsl #4
+    0xeb000025, // subs x5, x1, x0
+    0x9a9f57e6, // cset x6, mi
+    0x92089c07, // and x7, x0, #0xff00ff00ff00ff00
+    0xaa001c28, // orr x8, x1, x0, lsl #7
+    0xca813409, // eor x9, x0, x1, asr #13
+    0xd2b7ddea, // movz x10, #0xbeef, lsl #16
+    0xf2fbd5aa, // movk x10, #0xdead, lsl #48
+    0x9282468b, // movn x11, #0x1234
+    0xd349fc0c, // lsr x12, x0, #9
+    0xfa411002, // ccmp x0, x1, #2, ne
+    0x9a80842d, // csinc x13, x1, x0, hi
+    0x9b01380e, // madd x14, x0, x1, x14
+    0xea20002f, // bics x15, x1, x0
+];
 
-core::arch::global_asm!(
-    ".pushsection .text.carrick_register_snippet, \"ax\"",
-    ".p2align 2",
-    ".globl carrick_register_snippet_start",
-    "carrick_register_snippet_start:",
-    register_snippet!(),
-    ".globl carrick_register_snippet_end",
-    "carrick_register_snippet_end:",
-    ".popsection",
-);
-
-unsafe extern "C" {
-    static carrick_register_snippet_start: u32;
-    static carrick_register_snippet_end: u32;
-}
-
-fn snippet_words() -> Vec<u32> {
-    let start = &raw const carrick_register_snippet_start;
-    let end = &raw const carrick_register_snippet_end;
-    let len = (end as usize - start as usize) / 4;
-    // SAFETY: both symbols bound the snippet in this binary's readable text
-    // section; `len` words lie between them.
-    unsafe { std::slice::from_raw_parts(start, len) }.to_vec()
-}
-
-/// The snippet on the host CPU: X0..X15 and NZCV in, X0..X15 and NZCV out.
+/// Run the unchanged snippet, with X17 pointing to 16 registers and NZCV.
 fn hardware(input: [u64; 16], nzcv: u64) -> ([u64; 16], u64) {
-    let mut r = input;
-    let mut flags = nzcv;
-    // SAFETY: the snippet only computes in X0..X15 and NZCV, all declared
-    // as operands; it touches no memory and no stack.
-    unsafe {
-        core::arch::asm!(
-            "msr nzcv, {flags}",
-            register_snippet!(),
-            "mrs {flags}, nzcv",
-            flags = inout(reg) flags,
-            inout("x0") r[0], inout("x1") r[1], inout("x2") r[2], inout("x3") r[3],
-            inout("x4") r[4], inout("x5") r[5], inout("x6") r[6], inout("x7") r[7],
-            inout("x8") r[8], inout("x9") r[9], inout("x10") r[10], inout("x11") r[11],
-            inout("x12") r[12], inout("x13") r[13], inout("x14") r[14], inout("x15") r[15],
-            options(nomem, nostack),
-        );
-    }
-    (r, flags)
+    // LDP/STP Xn, Xn+1, [X17, #8*n]: signed imm7 in units of eight bytes.
+    let pairs = |opcode: u32| {
+        (0..16u32)
+            .step_by(2)
+            .map(move |n| opcode | (n << 15) | ((n + 1) << 10) | (17 << 5) | n)
+    };
+    let code: Vec<u8> = [
+        0xaa00_03f1u32, // mov x17, x0
+        0xf940_4230,    // ldr x16, [x17, #128]
+        0xd51b_4210,    // msr nzcv, x16
+    ]
+    .into_iter()
+    .chain(pairs(0xa940_0000))
+    .chain(SNIPPET)
+    .chain(pairs(0xa900_0000))
+    .chain([
+        0xd53b_4210, // mrs x16, nzcv
+        0xf900_4230, // str x16, [x17, #128]
+        0xd65f_03c0, // ret
+    ])
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    let mut frame = [0; 17];
+    frame[..16].copy_from_slice(&input);
+    frame[16] = nzcv;
+    let mut jit = JitCodeBuffer::new(code.len()).unwrap();
+    let entry = jit.publish(&code).unwrap();
+    // SAFETY: this live RX leaf uses only caller-saved registers and NZCV.
+    // Its loads and stores stay inside the 17-word frame passed in X0.
+    let call = unsafe { std::mem::transmute::<usize, extern "C" fn(*mut u64)>(entry as usize) };
+    call(frame.as_mut_ptr());
+    (core::array::from_fn(|n| frame[n]), frame[16])
 }
 
 /// Known answers from the C6.2 pseudocode (AddWithCarry, ConditionHolds,
@@ -224,8 +210,7 @@ fn engine(words: &[u32], input: [u64; 16], nzcv: u64) -> ([u64; 16], u64, Report
 
 #[test]
 fn register_only_blocks_match_known_answers_and_the_host_cpu() {
-    let words = snippet_words();
-    assert_eq!(words.len(), 17, "snippet assembled to an unexpected length");
+    let words = SNIPPET;
     let cases = [
         (0x8000_0000_0000_0001, 0x8000_0000_0000_0003, 0x1000_0000),
         (0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321, 0xf000_0000),

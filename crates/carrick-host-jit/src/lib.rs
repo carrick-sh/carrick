@@ -5,8 +5,6 @@
 
 mod publish;
 
-#[cfg(target_arch = "aarch64")]
-pub use publish::cache_type;
 use publish::publish_instructions;
 use std::ptr::NonNull;
 
@@ -165,8 +163,6 @@ mod tests {
             image[4..8].copy_from_slice(&0xd65f_03c0u32.to_le_bytes());
             image
         }
-        // IDC (28) / DIC (29) set means this host skips the clean / invalidate.
-        println!("CTR_EL0 = {:#x}", cache_type());
         let mut jit = JitCodeBuffer::new(4096).unwrap();
         let call = |entry: u64| {
             // SAFETY: `entry` is a just-published RX AAPCS64 function taking
