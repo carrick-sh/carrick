@@ -9,7 +9,7 @@
 //! translation or permission faults are raised here. Data alignment is checked
 //! before accessing memory.
 use crate::exception::{
-    DataAccess, Exception, ExceptionOutcome, ProviderExit, eret, take_exception,
+    DataAccess, Exception, ExceptionOutcome, ProviderExit, WaitInstruction, eret, take_exception,
 };
 use crate::state::{
     CpuState, ExceptionLevel, InterruptMasks, ProgramCounter, RegisterValue, StackSelect,
@@ -205,6 +205,19 @@ pub fn execute(
             Outcome::Continue
         }
         Instruction::Hint(h) => {
+            let wait = match h {
+                Hint::Wfi => Some(WaitInstruction::Wfi),
+                Hint::Wfe => Some(WaitInstruction::Wfe),
+                _ => None,
+            };
+            // This dispatcher surfaces waits that would otherwise suspend the CPU.
+            if cpu.pstate.el == ExceptionLevel::El0
+                && let Some(wait) = wait
+                && cpu.el1.sctlr.traps_el0_wait(wait)
+            {
+                take_exception(cpu, Exception::WaitTrap(wait));
+                return Outcome::Continue;
+            }
             next(cpu);
             Outcome::Event(Event::Hint(h))
         }

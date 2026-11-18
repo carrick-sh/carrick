@@ -60,6 +60,12 @@ pub enum DataAccess {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitInstruction {
+    Wfi,
+    Wfe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Exception immediates use the same typed domain as decoded operands.
 /// ```compile_fail
 /// use carrick_softcpu_aarch64::exception::Exception;
@@ -70,6 +76,7 @@ pub enum Exception {
     Hvc(crate::Immediate16),
     Brk(u16),
     Unknown,
+    WaitTrap(WaitInstruction),
     SystemAccess(SystemAccessException),
     Irq,
     Fiq,
@@ -111,6 +118,11 @@ pub fn syndrome(exception: Exception, origin: ExceptionLevel) -> Syndrome {
         Exception::Svc(i) => (0x15, u64::from(i.value())),
         Exception::Hvc(i) => (0x16, u64::from(i.value())),
         Exception::Brk(i) => (0x3c, u64::from(i)),
+        // WFxTrap and ConditionSyndrome: CV=1, COND=AL in AArch64.
+        Exception::WaitTrap(wait) => (
+            0x01,
+            (0b11110 << 20) | u64::from(wait == WaitInstruction::Wfe),
+        ),
         Exception::SError => (0x2f, 0),
         Exception::Alignment { access, .. } => (
             0x24 + current,
