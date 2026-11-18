@@ -390,6 +390,21 @@ mod tests {
     }
 
     #[test]
+    fn isb_retires_and_starts_a_new_dispatch_at_the_next_word() {
+        let mut m = Flat::default();
+        m.code(ENTRY, &[0xd503_3fdf, 0xd400_0002]); // isb; hvc #0
+        let r = go(&mut el1(), &mut m, &mut GuestSemantics, 2);
+        assert_eq!((r.blocks, r.pc), (2, ProgramCounter(ENTRY + 8)));
+        assert!(matches!(
+            r.stop,
+            Stop::Event {
+                event: Event::ProviderExit(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn tlbi_is_absorbed_and_execution_continues() {
         let mut m = Flat::default();
         // tlbi vmalle1 ; hvc #0

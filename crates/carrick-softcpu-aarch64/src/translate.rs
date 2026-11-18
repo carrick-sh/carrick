@@ -9,8 +9,8 @@
 //! MRS/MSR C6.2.194/C6.2.196, B.cond C6.2.25, CBZ C6.2.45, TBZ C6.2.331).
 use crate::state::{CpuState, ProgramCounter, RegisterValue, StackPointer};
 use crate::{
-    AddressBase, Branch, Decoded, ExceptionKind, Gpr, Hint, Instruction, LogicalOperand,
-    OperandRegister, RegisterBranch, decode_instruction,
+    AddressBase, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, Gpr, Hint, Instruction,
+    LogicalOperand, OperandRegister, RegisterBranch, decode_instruction,
 };
 use alloc::vec::Vec;
 
@@ -34,6 +34,7 @@ pub enum ExitReason {
     SystemOperation,
     AddressTranslate,
     ClearExclusive,
+    InstructionSynchronization,
     Exception(ExceptionKind),
     Eret,
     Hint(Hint),
@@ -78,6 +79,10 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
                 InstructionClass::Copy(CopyKind::Verbatim)
             }
         }
+        Instruction::Barrier(Barrier {
+            kind: BarrierKind::Isb,
+            ..
+        }) => InstructionClass::Exit(ExitReason::InstructionSynchronization),
         Instruction::MoveWide(_)
         | Instruction::Bitfield(_)
         | Instruction::Extract(_)
