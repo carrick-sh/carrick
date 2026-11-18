@@ -465,13 +465,15 @@ exact sequence:
    host-bound stdio `0..=2` (`FdMapSlot` + `DelegatedOpenFile` with
    `HostObjectBinding::{STDIN, STDOUT, STDERR}`) in `boot_probe.rs`, together
    with `AT S1E*` -> `PAR_EL1`, routes `ppoll` (`nr = 73`) through
-   `PendingFamilies::poll` and stops cleanly at the first guest-visible carrier
-   call (`HVC #2` at `0x2D_0001_0B3C`, `cpu.pc = 0x2D_0001_0B40`,
-   `mailbox.state = 1`, `trap_kind = 1`, `native_nr = 73`,
+   `PendingFamilies::poll` and stops cleanly after **10,299 blocks** at the
+   first guest-visible carrier call (`HVC #2` at `0x2D_0001_0B3C`,
+   `cpu.pc = 0x2D_0001_0B40`, `mailbox.state = 1`, `trap_kind = 1`,
+   `native_nr = 73`, `nfds = 3`, `ELR_EL1 = 0x4422e8`,
    `ESR_EL1 = 0x5600_0000`). Completing `ppoll = 0` via the mailbox advances
-   past `sanitize_standard_fds` to `signal(SIGPIPE, SIG_IGN)` (`rt_sigaction`
-   `nr = 134` at `0x41f138`), which requires the shared carrier's
-   `Aarch64NativeProcessService` (`ZoneTables` +
-   `ThreadLifecyclePage`/`ThreadControlSlot` + `MM_PORTAL_*` + `HVC #6`/`#7`
-   custody in `crates/carrick-aarch64` + `crates/carrick-vmm-soft`, Section
-   2.4).
+   **1,226 more blocks** past `sanitize_standard_fds` to
+   `signal(SIGPIPE, SIG_IGN)` (`rt_sigaction(13, ..., 8)` `nr = 134` at
+   `0x43f060`), which EL1 forwards via `HVC #2` (`ForwardReason::FamilyFallback`)
+   because in-ring signal/MM/process custody (`ZoneTables` + `Reservations` +
+   `ThreadLifecyclePage`/`ThreadControlSlot` + `MM_PORTAL_*` + `HVC #6`/`#7` +
+   `SyscallDispatcher`) belongs to the shared carrier in `crates/carrick-aarch64`
+   and `crates/carrick-vmm-soft` (Section 2.4).
