@@ -19,9 +19,9 @@ use crate::state::{
 use crate::translate::GuestInstruction;
 use crate::{
     AtomicTransferKind, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, Extend, Hint,
-    Immediate16, Instruction, MemoryAddress, MemoryIndex, MemoryOperation, MemoryRegister,
-    MemorySize, OperandRegister, PstateField, RegisterBranch, SystemDirection, SystemRegister,
-    TlbiOperation, Translation, Width,
+    IcOperation, Immediate16, Instruction, MemoryAddress, MemoryIndex, MemoryOperation,
+    MemoryRegister, MemorySize, OperandRegister, PstateField, RegisterBranch, SystemDirection,
+    SystemRegister, TlbiOperation, Translation, Width,
 };
 use carrick_mmu_core::aarch64::stage1_walk::Aarch64Fault;
 use carrick_mmu_core::stage1::LeafAccess;
@@ -65,6 +65,7 @@ pub enum Event {
     /// HVC at EL1: Carrick's provider boundary. PC is the next instruction.
     ProviderExit(ProviderExit),
     Tlbi(TlbiOperation),
+    Ic(IcOperation),
     Hint(Hint),
     /// MSR SCTLR_EL1 would set M under a TCR_EL1 the stage-1 walker does
     /// not admit. Not retired.
@@ -151,6 +152,15 @@ pub fn execute(
             }
         },
         Instruction::PstateImmediate(p) => pstate(cpu, i.word(), p.field, p.immediate),
+        Instruction::InstructionCache(op) => {
+            // C6.2.95, C5.3 Table C5-6: IC IALLUIS and IC IALLU require EL1 or
+            // higher; at EL0 they are UNDEFINED.
+            if cpu.pstate.el == ExceptionLevel::El0 {
+                return undefined(cpu);
+            }
+            next(cpu);
+            Outcome::Event(Event::Ic(op))
+        }
         Instruction::SystemOperation(op) => {
             // C5.4: op1 selects the minimum EL for these TLBI encodings.
             if cpu.pstate.el == ExceptionLevel::El0 || op.op1 != 0 {

@@ -105,7 +105,7 @@ impl<E: fmt::Debug> fmt::Display for Report<E> {
 fn absorbed(event: Event) -> bool {
     matches!(
         event,
-        Event::Tlbi(_) | Event::Hint(crate::Hint::Sev | crate::Hint::Sevl)
+        Event::Tlbi(_) | Event::Ic(_) | Event::Hint(crate::Hint::Sev | crate::Hint::Sevl)
     )
 }
 

@@ -877,6 +877,11 @@ mod loader {
     }
 
     pub(crate) fn decode(word: u32) -> Option<Instruction> {
+        match word {
+            0xd508_711f => return Some(Instruction::InstructionCache(IcOperation::Ialluis)),
+            0xd508_751f => return Some(Instruction::InstructionCache(IcOperation::Iallu)),
+            _ => {}
+        }
         if word & 0xfff80000 == 0xd5080000 {
             let op1 = ((word >> 16) & 7) as u8;
             let crn = ((word >> 12) & 15) as u8;
@@ -911,6 +916,15 @@ mod loader {
             }));
         }
         (word == 0xd69f03e0).then_some(Instruction::Eret)
+    }
+
+    /// Arm ARM DDI0487G.a C6.2.95 IC and C5.3 Table C5-6: EL1 whole-cache
+    /// instruction invalidations (`op1 = 0, CRn = 7, Rt = 11111`). Encodings
+    /// with `Rt != 11111` are architecturally UNDEFINED.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum IcOperation {
+        Ialluis,
+        Iallu,
     }
 
     /// Arm ARM DDI0487G.a C6.2.332 TLBI and C6.2.328 SYS.
@@ -1097,7 +1111,7 @@ mod loader {
         }
     }
 }
-pub use loader::{AtomicAdd, SystemOperation, TlbiOperation};
+pub use loader::{AtomicAdd, IcOperation, SystemOperation, TlbiOperation};
 
 mod instruction {
     //! Typed decoding entry point. Unimplemented and reserved leaves fail shut.
@@ -1109,6 +1123,7 @@ mod instruction {
         /// Arm ARM DDI0487G.a C6.2.87 ERET (no pointer authentication).
         Eret,
         AtomicAdd(crate::AtomicAdd),
+        InstructionCache(crate::IcOperation),
         SystemOperation(crate::SystemOperation),
         Barrier(crate::Barrier),
         ExceptionGeneration(crate::ExceptionGeneration),

@@ -525,6 +525,24 @@ fn higher_el_tlbi_and_at_are_undefined_at_el1() {
 }
 
 #[test]
+fn el1_ic_iallu_retires_and_el0_ic_iallu_is_undefined() {
+    for (word, expected) in [
+        (0xd508_711f, carrick_softcpu_aarch64::IcOperation::Ialluis),
+        (0xd508_751f, carrick_softcpu_aarch64::IcOperation::Iallu),
+    ] {
+        let mut r = Rig::el1();
+        assert_eq!(r.run(word), Outcome::Event(Event::Ic(expected)));
+        assert_eq!(r.pc(), PC + 4);
+
+        let mut r = Rig::el0();
+        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.pc(), VBAR + 0x400);
+        assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
+        assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
+    }
+}
+
+#[test]
 fn el1_at_requires_a_walk_and_el0_at_is_undefined() {
     for word in [
         0xd508_7800, // at s1e1r, x0
