@@ -13856,6 +13856,11 @@ pub(crate) fn outcome_kind(outcome: &LifecycleOutcome) -> std::string::String {
     }
 }
 
+/// A native entry of the capacity fixture's process on its test venue.
+#[cfg(test)]
+type PhysicalEntry<'e, C> =
+    NativeProcessEntry<'e, 'static, AddressContext<RootGpa>, C, Physical<'static, C>>;
+
 /// The fork's scratch missed while `mailbox`'s grant request is in flight
 /// (`native_fork_refusal::fork_scratch`).
 #[cfg(test)]
@@ -13922,11 +13927,7 @@ fn forks_owed_a_metadata_grant_park_on_it_then_rerun_once_for<
     ));
     carrick_el1::alloc::install_host_test_grant_mailbox(Some(mailbox));
     let key = ObjectWaitKey::metadata_request(generation).unwrap();
-    let enter = |address,
-                 words: &C,
-                 run: &mut dyn FnMut(
-        &mut NativeProcessEntry<'_, 'static, AddressContext<RootGpa>, C, Physical<'static, C>>,
-    )| {
+    let enter = |address, words: &C, run: &mut dyn FnMut(&mut PhysicalEntry<'_, C>)| {
         // Every birth has its own lifecycle owner, as the fork stock does.
         let mut service = fixture.service();
         service.page = Box::leak(Box::new(ThreadLifecyclePage::new()));
