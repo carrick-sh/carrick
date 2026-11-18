@@ -204,9 +204,12 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
             PortalWaitCause::PendingEdit => SpaceWaitCause::PendingEdit,
             PortalWaitCause::Gate => SpaceWaitCause::Gate,
             PortalWaitCause::Metadata => SpaceWaitCause::Metadata,
-            // Neither is an MM resource cause: the reservation pool has its
-            // own queue, and a host readiness wait parks on the member's.
-            PortalWaitCause::ReservationPool | PortalWaitCause::HostReadiness => {
+            // None is an MM resource cause: the reservation pool has its
+            // own queue, a host readiness wait parks on the member's, and a
+            // metadata grant wait on its grant request's.
+            PortalWaitCause::ReservationPool
+            | PortalWaitCause::HostReadiness
+            | PortalWaitCause::MetadataGrant => {
                 return Err(ObjectWaitError::Stale);
             }
         };
