@@ -395,6 +395,15 @@ impl SoftCarrier {
         self.runner.machine_mut()
     }
 
+    /// Override the soft vCPU's per-block TSC progress floor and future run
+    /// block ceiling before handing slot 0 to worker custody.
+    pub fn set_execution_clock(&mut self, ticks_per_block: NonZeroU64, max_blocks: u64) {
+        self.runner
+            .machine_mut()
+            .set_block_tsc_clock(ticks_per_block);
+        self.runner.max_blocks = max_blocks;
+    }
+
     /// Read `dst.len()` bytes at guest `va` through slot 0's translation in
     /// its current mode.
     pub fn read_guest_bytes(&mut self, va: u64, dst: &mut [u8]) -> Result<(), SoftMemoryFault> {

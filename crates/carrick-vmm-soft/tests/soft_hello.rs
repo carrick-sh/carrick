@@ -103,10 +103,18 @@ impl HelloRun {
 }
 
 fn run_hello(elf: &[u8]) -> HelloRun {
-    run_with_stdout_patch(elf, None)
+    run_with_options(elf, None, None)
 }
 
 fn run_with_stdout_patch(elf: &[u8], patch: Option<u8>) -> HelloRun {
+    run_with_options(elf, patch, None)
+}
+
+fn run_with_options(
+    elf: &[u8],
+    patch: Option<u8>,
+    execution_clock: Option<(std::num::NonZeroU64, u64)>,
+) -> HelloRun {
     let mut run = HelloRun {
         stdout: Vec::new(),
         stdout_at: Vec::new(),
@@ -114,7 +122,7 @@ fn run_with_stdout_patch(elf: &[u8], patch: Option<u8>) -> HelloRun {
         exits: Vec::new(),
         failure: None,
     };
-    if let Err(failure) = drive(elf, &mut run, patch) {
+    if let Err(failure) = drive(elf, &mut run, patch, execution_clock) {
         run.failure = Some(failure);
     }
     run
@@ -155,14 +163,23 @@ fn boot_initial_mm(
     Ok(carrier)
 }
 
-fn drive(elf: &[u8], run: &mut HelloRun, patch: Option<u8>) -> Result<(), String> {
+fn drive(
+    elf: &[u8],
+    run: &mut HelloRun,
+    patch: Option<u8>,
+    execution_clock: Option<(std::num::NonZeroU64, u64)>,
+) -> Result<(), String> {
     let mut dispatcher = SyscallDispatcher::default();
     let reporter = carrick_kernel::compat::CompatReporter::default();
     let root = dispatcher
         .capture_one_task_context()
         .map_err(|error| format!("setup: issued root {error:?}"))?;
-    let carrier = boot_initial_mm(elf, &dispatcher, &root)?;
+    let mut carrier = boot_initial_mm(elf, &dispatcher, &root)?;
     run.exits.push("initial-MM admission".to_owned());
+    if let Some((ticks_per_block, worker_blocks)) = execution_clock {
+        let ceiling = carrier.trace().blocks.saturating_add(worker_blocks);
+        carrier.set_execution_clock(ticks_per_block, ceiling);
+    }
     let parts = carrier
         .into_worker_parts()
         .map_err(|error| format!("worker hand-off: {error}"))?;
@@ -544,4 +561,29 @@ fn production_ring_nanosleep_waits_on_host() {
         (Duration::from_millis(190)..Duration::from_secs(10)).contains(&elapsed),
         "200 ms nanosleep took {elapsed:?} on the host"
     );
+}
+
+/// Deterministic VM-free slice-start witness on the production CPL0 entry
+/// point: at 50 us per block (100,000 ticks at 2 GHz, or 40 blocks per 2 ms
+/// slice), starting the slice before the ~140-block CPL0 return preparation or
+/// arming a 1 ms retry before rotation expires in CPL0 before user instructions
+/// retire; starting the slice immediately before the 1-block IRET stub lets all
+/// two-live rounds complete inside 200,000 worker blocks.
+#[test]
+fn production_ring_slice_starts_after_cpl0_return_preparation() {
+    let elf = assemble_static_fixture(
+        "slice-return",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../carrick-vmm-kvm/tests/fixtures/native_robust_raw_exit.S"
+        ),
+        &["-DTWO_LIVE"],
+    );
+    let ticks_per_block =
+        std::num::NonZeroU64::new(carrick_vmm_soft::carrier::SOFT_TSC_HZ / 20_000)
+            .expect("50 us per block");
+    let run = run_with_options(&elf, None, Some((ticks_per_block, 200_000)));
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert!(run.stdout.is_empty(), "{}", run.summary());
+    assert_eq!(run.exit, Some(0), "{}", run.summary());
 }
