@@ -11429,7 +11429,7 @@ std::thread_local! {
 
 /// Answer the Physical carrier's native-service doorbell with `hook`, or
 /// restore the unanswered doorbell with `None`.
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 pub(crate) fn on_service_doorbell(hook: Option<Box<dyn FnMut() -> bool>>) {
     ENTROPY_DOORBELL.with(|slot| *slot.borrow_mut() = hook);
 }
