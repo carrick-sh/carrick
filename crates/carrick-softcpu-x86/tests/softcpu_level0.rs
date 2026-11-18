@@ -5889,3 +5889,41 @@ fn advertised_mmx_fxsave_image_matches_native() {
         }
     }
 }
+
+/// Legacy high-byte registers (AH/CH/DH/BH) cannot be encoded with a REX
+/// prefix (SDM Vol. 2A §2.2.1.2), but the native memory path rebases the
+/// operand on R14. Store, load, read-modify-write, exchange and CMPXCHG
+/// (implicit AL) must keep their architectural results (#671 M1-0: the
+/// CPL0 ring's `user_fault_gate::replace` stores DH).
+#[test]
+fn high_byte_register_memory_operands_survive_the_r14_rebase() {
+    let code = &[
+        0x88, 0x71, 0x10, // mov [rcx+0x10], dh
+        0x8a, 0x79, 0x11, // mov bh, [rcx+0x11]
+        0x02, 0x61, 0x12, // add ah, [rcx+0x12]
+        0x86, 0x71, 0x13, // xchg [rcx+0x13], dh
+        0x0f, 0xb0, 0x79, 0x14, // cmpxchg [rcx+0x14], bh
+        0x0f, 0x05,
+    ];
+    let (mut cpu, mut mem, va) = setup_snippet(code);
+    let data = 0x2000_0000u64;
+    mem.map_range(data, 4096, PagePerms::USER_RW);
+    mem.write_direct(data + 0x10, &[0, 0x5c, 0x30, 0x77, 0x01]);
+    let gpr = &mut cpu.context_mut().gpr;
+    gpr[reg::RCX] = data;
+    gpr[reg::RDX] = 0xab00;
+    gpr[reg::RBX] = 0x1111_1111_1111_1111;
+    gpr[reg::RAX] = 0x2222_2222_2222_2201;
+    step_ok(&mut cpu, &mut mem, sys(va + 16, va + 18));
+    let gpr = cpu.context_mut().gpr;
+    assert_eq!(
+        (gpr[reg::RAX], gpr[reg::RBX], gpr[reg::RDX]),
+        (0x2222_2222_2222_5201, 0x1111_1111_1111_5c11, 0x7700)
+    );
+    assert_eq!(
+        mem.read_direct(data + 0x10, 5).unwrap(),
+        [0xab, 0x5c, 0x30, 0xab, 0x5c]
+    );
+    // CMPXCHG matched AL: its ZF survives the stand-in's MOVs.
+    assert_ne!(cpu.context().rflags & (1 << 6), 0);
+}
