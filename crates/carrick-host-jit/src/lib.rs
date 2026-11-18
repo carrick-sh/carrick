@@ -225,6 +225,11 @@ mod tests {
             image[4..8].copy_from_slice(&0xd65f_03c0u32.to_le_bytes());
             image
         }
+        let ctr: u64;
+        // SAFETY: CTR_EL0 is readable at EL0 on Linux; no memory is touched.
+        unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+        // IDC (28) / DIC (29) set means this host skips the clean / invalidate.
+        println!("CTR_EL0 = {ctr:#x}");
         let mut jit = JitCodeBuffer::new(4096).unwrap();
         let call = |entry: u64| {
             // SAFETY: `entry` is a just-published RX AAPCS64 function taking
