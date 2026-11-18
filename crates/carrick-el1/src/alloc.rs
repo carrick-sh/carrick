@@ -444,14 +444,28 @@ impl MetadataStorage {
         false
     }
 
-    /// Whether a miss is owed capacity rather than exhaustion: a metadata
-    /// grant is in flight on the carrier mailbox, so the caller may keep its
-    /// operation and rerun once the carrier serves it ("not now"). A denied
-    /// grant owes nothing, and neither does a venue with no grant mailbox
-    /// (the x86 CPL0 image, host builds): there a miss is ENOMEM (#2441).
-    pub fn capacity_owed(&self) -> bool {
+    /// The grant a miss is owed, rather than exhaustion: a metadata grant
+    /// is in flight on the carrier mailbox, so the caller may keep its
+    /// operation, wait for that grant and rerun ("not now"). A denied grant
+    /// owes nothing, and neither does a venue with no grant mailbox (the x86
+    /// CPL0 image, host builds): there a miss is ENOMEM (#2441).
+    pub fn owed_grant(&self) -> Option<carrick_el1_abi::OwedMetadataGrant> {
+        // The allocator lock excludes guest publication and consumption,
+        // so the mailbox is in a host-visible state for this sample.
+        let core = self.lock.lock_irqsave();
+        let owed = self
+            .grant_mailbox()
+            .and_then(carrick_el1_abi::MetadataGrantMailbox::owed_grant);
+        core::mem::drop(core);
+        owed
+    }
+
+    /// Whether grant request `generation` still awaits the carrier. Probe
+    /// it under that request's wait-queue lock
+    /// ([`carrick_el1_abi::MetadataGrantMailbox::grant_pending`]).
+    pub fn grant_pending(&self, generation: core::num::NonZeroU64) -> bool {
         self.grant_mailbox()
-            .is_some_and(carrick_el1_abi::MetadataGrantMailbox::capacity_owed)
+            .is_some_and(|mailbox| mailbox.grant_pending(generation))
     }
 
     /// The carrier mailbox an owed grant is served on. A host build has
@@ -866,26 +880,32 @@ mod tests {
         assert_eq!(storage.diagnostics().active_extents, 1);
     }
 
-    /// #2441: a miss whose grant is in flight is owed capacity, so its
-    /// caller reruns; a denied grant owes nothing, and the next miss is
-    /// exhaustion. Without a mailbox no miss is ever owed.
+    /// #2441: a miss whose grant is in flight is owed that grant, so its
+    /// caller waits for it and reruns; a denied grant owes nothing, and the
+    /// next miss is exhaustion. Without a mailbox no miss is ever owed.
     #[test]
-    fn miss_is_owed_capacity_only_while_its_grant_is_in_flight() {
-        assert!(!MetadataStorage::new().capacity_owed());
+    fn miss_is_owed_its_grant_only_while_the_grant_is_in_flight() {
+        assert_eq!(MetadataStorage::new().owed_grant(), None);
         let storage = storage_with_mailbox();
         let mailbox = storage.mailbox.as_ref().unwrap();
         let layout = Layout::from_size_align(12000, 16).unwrap();
-        assert!(!storage.capacity_owed());
+        assert_eq!(storage.owed_grant(), None);
         assert!(storage.allocate(layout).is_none());
-        assert!(storage.capacity_owed(), "a published grant request is owed");
+        let owed = storage
+            .owed_grant()
+            .expect("a published grant request is owed");
+        assert_eq!(owed.generation().get(), mailbox.request_generation());
+        assert!(storage.grant_pending(owed.generation()));
         assert_eq!(
             mailbox.claim_request().unwrap().op,
             carrick_el1_abi::METADATA_GRANT_OP_ALLOC
         );
-        assert!(
-            storage.capacity_owed(),
+        assert_eq!(
+            storage.owed_grant(),
+            Some(owed),
             "a grant the host is serving is owed"
         );
+        assert!(storage.grant_pending(owed.generation()));
         let mut backing = vec![0u128; 1024];
         mailbox.publish_response(
             carrick_el1_abi::METADATA_GRANT_SUCCESS,
@@ -893,17 +913,32 @@ mod tests {
             16384,
             76,
         );
-        assert!(storage.capacity_owed(), "an unadmitted grant is owed");
+        assert_eq!(
+            storage.owed_grant(),
+            Some(owed),
+            "an unadmitted grant is owed"
+        );
+        assert!(
+            !storage.grant_pending(owed.generation()),
+            "an answered grant no longer waits: its waiter reruns"
+        );
         let pointer = storage.allocate(layout).expect("the rerun gets its grant");
-        assert!(!storage.capacity_owed());
+        assert_eq!(storage.owed_grant(), None);
         let second = Layout::from_size_align(16000, 16).unwrap();
         assert!(storage.allocate(second).is_none());
+        let next = storage
+            .owed_grant()
+            .expect("the next miss is owed its own grant");
+        assert_ne!(next, owed, "each request is its own grant");
+        assert!(!storage.grant_pending(owed.generation()));
+        assert!(storage.grant_pending(next.generation()));
         mailbox.claim_request().unwrap();
         mailbox.publish_response(carrick_el1_abi::METADATA_GRANT_ERR_INVALID, 0, 0, 0);
-        assert!(!storage.capacity_owed(), "a denied grant owes nothing");
+        assert_eq!(storage.owed_grant(), None, "a denied grant owes nothing");
         assert!(storage.allocate(second).is_none());
-        assert!(
-            !storage.capacity_owed(),
+        assert_eq!(
+            storage.owed_grant(),
+            None,
             "the miss after a denial is exhaustion"
         );
         storage.deallocate(pointer, layout);
