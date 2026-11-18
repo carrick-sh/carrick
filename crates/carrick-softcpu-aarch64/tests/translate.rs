@@ -672,3 +672,18 @@ fn isb_prevents_fetching_the_following_instruction_in_the_same_block() {
         [BlockExit::Handler(_)]
     ));
 }
+
+#[test]
+fn misaligned_block_and_span_do_not_fetch_across_a_code_page() {
+    for address in [0x1ffe, 0x1fff] {
+        let pc = ProgramCounter(address);
+        let mut reads = 0;
+        let block = split_block(pc, BlockLimits::default(), |_| {
+            reads += 1;
+            Some(0xd503_201f)
+        });
+        assert_eq!(reads, 0);
+        assert!(block.instructions.is_empty());
+        assert!(split_span(pc, &[0xd503_201f], BlockLimits::default()).is_empty());
+    }
+}
