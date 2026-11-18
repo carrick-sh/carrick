@@ -197,9 +197,12 @@ On x86 (this VM and every CI lane):
 On the arm64 runner (`#[cfg(all(target_arch = "aarch64", target_os = "linux"))]`;
 `carrick-softcpu-aarch64-host/tests/native.rs` and `tests/boot_probe.rs`):
 
-- Differential: register-only blocks run through the engine and directly via
-  `core::arch::asm!`; all GPRs and NZCV must match each other and the hand-derived
-  answers.
+- Differential: the same register-only words run through the engine and
+  directly in an AAPCS64 leaf published by `JitCodeBuffer`. X0–X15 and NZCV
+  must match each other and the hand-derived answers.
+- Fault delivery: execute up to ISB, then fetch the next block. An undefined
+  AT or a misaligned LDAR reaches the EL1h vector with the matching ESR, ELR
+  and FAR visible through native dispatch.
 - Exit round trip: a block ending in MRS/SVC exits with the exact restart PC,
   and the handler resumes.
 - I-cache publication: a published function is rewritten at the same address
@@ -216,7 +219,7 @@ On the arm64 runner (`#[cfg(all(target_arch = "aarch64", target_os = "linux"))]`
 
 1. (Ruled) `carrick-host-jit` and `carrick-softcpu-aarch64-host`, plus their
    `surfaces.toml` entries.
-2. A reviewed `.semgrep/host-authority-escape-hatches.yml` exclusion for
-   `crates/carrick-host-jit/src/publish.rs` (`lint-domains`).
+2. (Ruled) The reviewed assembly boundary is `carrick-host-jit/src/publish.rs`
+   in the Semgrep and Rust-token authority checks (#2521).
 3. Confirm that per-dispatch re-translation is acceptable until N2 extracts
    the cache.

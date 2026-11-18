@@ -10,7 +10,7 @@
 
 use carrick_host_jit::JitCodeBuffer;
 use carrick_softcpu_aarch64::dispatch::{ExecuteBlock, Report, Stop, run};
-use carrick_softcpu_aarch64::handler::{ExclusiveMonitor, GuestMemory, MemoryFault};
+use carrick_softcpu_aarch64::handler::{Event, ExclusiveMonitor, GuestMemory, MemoryFault};
 use carrick_softcpu_aarch64::state::{
     CpuState, ExceptionLevel, ProgramCounter, RegisterValue, StackPointer, StackSelect,
     SystemValue, VirtualAddress,
@@ -312,4 +312,58 @@ fn exits_restart_at_the_exact_pc_and_handlers_resume() {
     assert_eq!(cpu.el1.elr, ProgramCounter(CODE + 28));
     assert_eq!(cpu.el1.esr.0 >> 26, 0x15, "EC: SVC from AArch64");
     assert_eq!(cpu.el1.esr.0 & 0xffff, 7, "ISS: the SVC immediate");
+}
+
+#[test]
+fn native_dispatch_refetches_after_isb_and_enters_the_fault_vector() {
+    const VECTOR: u64 = 0x4000_8200;
+    for (word, esr, far) in [
+        (0xd50c_7800, 0x0200_0000, 0),       // at s1e2r, x0: undefined at EL1
+        (0xc8df_fc20, 0x9600_0021, 0x10001), // ldar x0, [x1]: alignment fault
+    ] {
+        let mut memory = Flat::default();
+        memory.put_words(
+            CODE,
+            &[
+                0xd280_00e0, // movz x0, #7
+                0xd503_3fdf, // isb
+                word,
+                0xd280_0120, // movz x0, #9 (the fault must prevent this)
+            ],
+        );
+        memory.put_words(
+            VECTOR,
+            &[
+                0xd538_5202, // mrs x2, esr_el1
+                0xd538_4023, // mrs x3, elr_el1
+                0xd538_6004, // mrs x4, far_el1
+                0xd400_0002, // hvc #0
+            ],
+        );
+        let mut cpu = CpuState::default();
+        cpu.pc = ProgramCounter(CODE);
+        cpu.pstate.el = ExceptionLevel::El1;
+        cpu.pstate.sp = StackSelect::El1;
+        cpu.el1.vbar = VirtualAddress(VECTOR - 0x200);
+        set_x(&mut cpu, 1, 0x10001);
+        let (report, starts) = run_at(&mut cpu, &mut memory);
+        assert!(
+            matches!(
+                report.stop,
+                Stop::Event {
+                    event: Event::ProviderExit(_),
+                    ..
+                }
+            ),
+            "{report}"
+        );
+        assert_eq!(
+            starts,
+            [CODE, CODE + 8, VECTOR, VECTOR + 4, VECTOR + 8, VECTOR + 12]
+        );
+        assert_eq!(
+            (x(&cpu, 0), x(&cpu, 2), x(&cpu, 3), x(&cpu, 4)),
+            (7, esr, CODE + 8, far)
+        );
+    }
 }
