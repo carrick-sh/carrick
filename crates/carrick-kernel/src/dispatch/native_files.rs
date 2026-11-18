@@ -4796,6 +4796,58 @@ mod tests {
         assert_eq!(read(), (0, Vec::new()));
     }
 
+    /// #2418, the type half: the carrier read serves a synthetic file only
+    /// when its description is a `Blob`. The root's own `/proc/<pid>/mem`
+    /// and `/proc/<pid>/pagemap`, opened through the production open, carry
+    /// the proc mount's `ProcAddressSpace` origin; their carrier read renders
+    /// no address space and is refused, never served as an empty blob. Red
+    /// with the proc mount typing them `Blob`: a 0-byte reply.
+    #[test]
+    fn native_read_refuses_a_proc_address_space_description_by_type() {
+        let mut fixture = rootfs_fixture();
+        let files = fixture
+            .dispatcher
+            .capture_one_task_context()
+            .unwrap()
+            .resources()
+            .files();
+        for path in [&b"/proc/self/mem\0"[..], b"/proc/self/pagemap\0"] {
+            let name = String::from_utf8_lossy(&path[..path.len() - 1]);
+            let fd = root_openat(&mut fixture.dispatcher, path, carrick_abi::LINUX_O_RDONLY);
+            assert!(fd >= 0, "root open {name}: {fd}");
+            let description = files
+                .slot(FileSlotNumber::for_open_fd(fd as i32).unwrap())
+                .unwrap()
+                .description();
+            let header = HostFileHeader {
+                op: HostFileOp::Read,
+                table: fixture.table,
+                fd: fd as i32,
+                flags: 0,
+                args: [0; 4],
+            };
+            assert!(
+                matches!(
+                    fixture
+                        .dispatcher
+                        .native_read_into_record(header, &description, 64),
+                    Served::Refused
+                ),
+                "{name}: a carrier read is refused"
+            );
+            assert!(
+                description.inspect_kind(|open| matches!(
+                    open,
+                    super::super::fd_table::OpenDescription::SyntheticFile {
+                        origin: carrick_vfs::SyntheticOrigin::ProcAddressSpace,
+                        ..
+                    }
+                )) == Some(true),
+                "{name}: the proc mount types it"
+            );
+        }
+    }
+
     /// What only a host task's open may hold stays refused for a native
     /// caller, before the mount acts: a terminal end (no pty is allocated)
     /// and the opener's own `/proc` view. Mount-served opens a native caller
