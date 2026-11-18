@@ -388,3 +388,10 @@ for Q loads, and takes undefined-instruction exceptions for the cache
 instructions. The hosted native witness checks guest vector data across
 blocks and the AAPCS64 callee-save boundary. There is no signed or Docker
 binding for the test-only soft-AArch64 lane.
+
+The hosted musl probe withholds `AT_HWCAP.ATOMICS` before building the Linux
+stack. The hardware-oriented default advertises FEAT_LSE, but this profile
+only admits LDADD from that extension. The original probe reached an
+undefined `CAS` in the Rust runtime's outlined atomics after the musl CRT.
+The capability mask lets the same unmodified executable select its
+load-exclusive/store-exclusive path.

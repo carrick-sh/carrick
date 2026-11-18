@@ -504,7 +504,7 @@ fn production_el1_image_boots_past_trampoline_to_first_guest_hvc() {
 #[test]
 #[ignore = "requires production CARRICK_A64_ELF and the pinned arm64 musl rust-std target"]
 fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
-    use carrick_mem::memory::AddressSpace;
+    use carrick_mem::{linux_abi::LinuxAarch64Hwcap, memory::AddressSpace};
     use std::process::Command;
 
     let elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
@@ -534,6 +534,9 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     let (mut cpu, mut memory, entry) = enter_carrier_root(&elf, &user_elf);
     let image = AddressSpace::load_elf_bytes(&user_elf)
         .unwrap()
+        // DDI0487G.a FEAT_LSE: LDADD alone does not authorize advertising
+        // ATOMICS. Let libc select its baseline exclusive-load/store path.
+        .without_auxv_hwcap(LinuxAarch64Hwcap::ATOMICS)
         .with_linux_initial_stack_at(["musl-hello"], [] as [&str; 0], LINUX_STACK_TOP, 4 * PAGE)
         .unwrap();
     let sp = image.initial_stack_pointer().unwrap();
@@ -569,6 +572,16 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
         "musl hello entry {entry:#x}: {report}; ESR={:#x} ELR={:#x} FAR={:#x}; mailbox state={state} trap_kind={trap_kind} nr={nr} resume_pc={resume:#x}",
         cpu.el1.esr.0, cpu.el1.elr.0, cpu.el1.far.0
     );
+    if state == 0 && cpu.el1.esr.0 == 0x0200_0000 {
+        // The ELF loads at its identity-mapped VAs in this fixture.
+        let mut bytes = [0; 4];
+        if memory
+            .read(VirtualAddress(cpu.el1.elr.0), &mut bytes)
+            .is_ok()
+        {
+            println!("  undefined guest word {:#010x}", u32::from_le_bytes(bytes));
+        }
+    }
     assert!(memory.read_boot_root);
     assert!(
         matches!(
