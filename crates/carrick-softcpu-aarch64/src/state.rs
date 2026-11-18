@@ -216,7 +216,7 @@ impl CpuState {
         match slot {
             Slot::Named(i) => self.named.write(i, value),
             Slot::Elr => self.el1.elr = ProgramCounter(v),
-            Slot::Spsr => self.el1.spsr = SavedPstate(v),
+            Slot::Spsr => self.el1.spsr = SavedPstate(v & 0xffff_ffff),
             Slot::Esr => self.el1.esr = Syndrome(v & 0xffff_ffff),
             Slot::Far => self.el1.far = VirtualAddress(v),
             Slot::Vbar => self.el1.vbar = VirtualAddress(v & !0x7ff),
@@ -433,11 +433,13 @@ impl NamedRegisters {
             NamedSlot::Fpcr => self.fpcr,
             NamedSlot::Fpsr => self.fpsr,
             NamedSlot::Par => self.par,
-            NamedSlot::Cntfrq => self.cntfrq,
+            NamedSlot::Cntfrq => SystemValue(self.cntfrq.0 & 0xffff_ffff),
             NamedSlot::Cntvct => self.cntvct,
             NamedSlot::CntvCtl => self.cntvctl,
             NamedSlot::CntvCval => self.cntvcval,
-            NamedSlot::Mpidr => self.mpidr,
+            // Aff3, U, MT and Aff2:Aff0 come from the virtual CPU topology.
+            // D13.2.99 defines bit 31 as RES1 and other bits as RES0.
+            NamedSlot::Mpidr => SystemValue((self.mpidr.0 & 0xff_41ff_ffff) | (1 << 31)),
             NamedSlot::IccIar1 => self.icciar1,
             NamedSlot::IccEoir1 => self.icceoir1,
             NamedSlot::IccSgi1r => self.iccsgi1r,
@@ -449,13 +451,16 @@ impl NamedRegisters {
             NamedSlot::Ttbr1 => self.ttbr1 = value,
             NamedSlot::TpidrEl0 => self.tpidrel0 = value,
             NamedSlot::TpidrroEl0 => self.tpidrroel0 = value,
-            NamedSlot::Contextidr => self.contextidr = value,
-            NamedSlot::Fpcr => self.fpcr = value,
-            NamedSlot::Fpsr => self.fpsr = value,
+            NamedSlot::Contextidr => self.contextidr = SystemValue(value.0 & 0xffff_ffff),
+            // C5.2.7/C5.2.8. This AArch64-only profile exposes baseline
+            // FP control/status storage, with AArch32, FP16 and AFP fields RAZ.
+            NamedSlot::Fpcr => self.fpcr = SystemValue(value.0 & 0x07c0_9f00),
+            NamedSlot::Fpsr => self.fpsr = SystemValue(value.0 & 0x0800_009f),
             NamedSlot::Par => self.par = value,
-            NamedSlot::Cntfrq => self.cntfrq = value,
+            NamedSlot::Cntfrq => self.cntfrq = SystemValue(value.0 & 0xffff_ffff),
             NamedSlot::Cntvct => self.cntvct = value,
-            NamedSlot::CntvCtl => self.cntvctl = value,
+            // D13.8.25. ISTATUS is supplied by the provider and is read-only.
+            NamedSlot::CntvCtl => self.cntvctl = SystemValue((self.cntvctl.0 & 4) | (value.0 & 3)),
             NamedSlot::CntvCval => self.cntvcval = value,
             NamedSlot::Mpidr => self.mpidr = value,
             NamedSlot::IccIar1 => self.icciar1 = value,

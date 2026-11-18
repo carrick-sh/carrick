@@ -159,30 +159,30 @@ fn system_register_roundtrips_and_access_syndromes() {
     cpu.pstate.el = ExceptionLevel::El1;
     cpu.pstate.sp = StackSelect::El1;
     // D13/C5 register encodings, independent of the name lookup implementation.
-    for fields in [
-        (3, 0, 2, 0, 0),
-        (3, 0, 2, 0, 1),
-        (3, 0, 13, 0, 1),
-        (3, 3, 13, 0, 2),
-        (3, 3, 13, 0, 3),
-        (3, 3, 4, 4, 0),
-        (3, 3, 4, 4, 1),
-        (3, 0, 7, 4, 0),
-        (3, 3, 14, 3, 1),
-        (3, 3, 14, 3, 2),
-        (3, 0, 4, 0, 1),
-        (3, 0, 4, 0, 0),
-        (3, 0, 5, 2, 0),
-        (3, 0, 6, 0, 0),
-        (3, 0, 13, 0, 4),
-        (3, 0, 2, 0, 2),
-        (3, 0, 10, 2, 0),
+    for (fields, value) in [
+        ((3, 0, 2, 0, 0), 0x1234),
+        ((3, 0, 2, 0, 1), 0x1234),
+        ((3, 0, 13, 0, 1), 0x1234),
+        ((3, 3, 13, 0, 2), 0x1234),
+        ((3, 3, 13, 0, 3), 0x1234),
+        ((3, 3, 4, 4, 0), 0x0040_0000),
+        ((3, 3, 4, 4, 1), 0x14),
+        ((3, 0, 7, 4, 0), 0x1234),
+        ((3, 3, 14, 3, 1), 0x3),
+        ((3, 3, 14, 3, 2), 0x1234),
+        ((3, 0, 4, 0, 1), 0x1234),
+        ((3, 0, 4, 0, 0), 0x1234),
+        ((3, 0, 5, 2, 0), 0x1234),
+        ((3, 0, 6, 0, 0), 0x1234),
+        ((3, 0, 13, 0, 4), 0x1234),
+        ((3, 0, 2, 0, 2), 0x1234),
+        ((3, 0, 10, 2, 0), 0x1234),
     ] {
-        cpu.msr(sys(fields), OperandRegister::Zr, SystemValue(0x1234))
+        cpu.msr(sys(fields), OperandRegister::Zr, SystemValue(value))
             .unwrap();
         assert_eq!(
             cpu.mrs(sys(fields), OperandRegister::Zr).unwrap(),
-            SystemValue(0x1234)
+            SystemValue(value)
         );
     }
     for n in 0..31 {
