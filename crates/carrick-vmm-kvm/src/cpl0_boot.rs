@@ -162,50 +162,36 @@ fn stopped_at_interruptible_user(cpu: &KvmVcpu) -> Result<bool, TrapError> {
         && events.interrupt.injected == 0)
 }
 
-pub(crate) fn run_member(
-    cpu: &mut KvmVcpu,
-    table: &ShootdownTable,
-    slot: usize,
-    vm: &VmFd,
-    actual_run: Option<&AtomicU32>,
-    execution: &RwLock<()>,
-) -> Result<VcpuExit, TrapError> {
-    let _running = execution.try_read().map_err(|error| match error {
-        std::sync::TryLockError::WouldBlock => TrapError::ExecutionAdmissionBusy,
-        std::sync::TryLockError::Poisoned(_) => TrapError::ExecutionAdmissionPoisoned,
-    })?;
-    let member = table
-        .members
-        .get(slot)
-        .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
-    struct RunningAdmission<'a>(&'a std::sync::atomic::AtomicU32);
-    impl Drop for RunningAdmission<'_> {
-        fn drop(&mut self) {
-            self.0.store(0, Ordering::Release);
-        }
+/// One KVM vCPU and its VM's MSI route, as the shared production run
+/// admission drives them.
+struct KvmMember<'a> {
+    cpu: &'a mut KvmVcpu,
+    vm: &'a VmFd,
+}
+
+impl ProductionMemberCpu for KvmMember<'_> {
+    fn stopped_cpl(&self) -> Result<u8, TrapError> {
+        Ok(self
+            .cpu
+            .fd()
+            .get_sregs()
+            .map_err(|e| fail(e.to_string()))?
+            .cs
+            .dpl)
     }
-    // A sender that observes this release either targets the live vCPU or
-    // races this pre-run scan, which queues its durable MSI before KVM_RUN.
-    member.running.store(1, Ordering::Release);
-    let running_admission = RunningAdmission(&member.running);
-    let sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
-    let has_debt = table.requests.iter().any(|request| {
-        request.generation.load(Ordering::Acquire) > request.served[slot].load(Ordering::Acquire)
-    });
-    if has_debt {
-        if sregs.cs.dpl == 3 && !stopped_at_interruptible_user(cpu)? {
-            return Err(fail("shootdown debt requires interruptible CPL3 reentry"));
-        } else if sregs.cs.dpl != 0 && sregs.cs.dpl != 3 {
-            return Err(fail("shootdown debt on unsupported CPL reentry"));
-        }
-        let lapic = cpu.fd().get_lapic().map_err(|e| fail(e.to_string()))?;
+    fn stopped_at_interruptible_user(&self) -> Result<bool, TrapError> {
+        stopped_at_interruptible_user(self.cpu)
+    }
+    fn queue_reentry_kick(&mut self) -> Result<(), TrapError> {
+        let lapic = self.cpu.fd().get_lapic().map_err(|e| fail(e.to_string()))?;
         let apic_id = u32::from_le_bytes([
             lapic.regs[0x20] as u8,
             lapic.regs[0x21] as u8,
             lapic.regs[0x22] as u8,
             lapic.regs[0x23] as u8,
         ]) >> 24;
-        let delivered = vm
+        let delivered = self
+            .vm
             .signal_msi(kvm_msi {
                 address_lo: 0xfee0_0000 | (apic_id << 12),
                 data: u32::from(carrick_x86::interrupts::KICK_VECTOR),
@@ -215,25 +201,28 @@ pub(crate) fn run_member(
         if delivered <= 0 {
             return Err(fail("reentry shootdown MSI was blocked"));
         }
+        Ok(())
     }
-    let actual_guard = actual_run.map(|flag| {
-        flag.store(1, Ordering::Release);
-        RunningAdmission(flag)
-    });
-    let result = HvVcpu::run(cpu)?;
-    drop(actual_guard);
-    drop(running_admission);
-    if stopped_at_interruptible_user(cpu)? {
-        // The host may release a sender after this vCPU has stopped, but
-        // leaves `served` behind until native KICK settles debt on reentry.
-        for request in &table.requests {
-            let generation = request.generation.load(Ordering::Acquire);
-            if generation != 0 {
-                request.ack[slot].store(generation, Ordering::Release);
-            }
-        }
+    fn run_guest(&mut self) -> Result<VcpuExit, TrapError> {
+        Ok(HvVcpu::run(self.cpu)?)
     }
-    Ok(result)
+}
+
+pub(crate) fn run_member(
+    cpu: &mut KvmVcpu,
+    table: &ShootdownTable,
+    slot: usize,
+    vm: &VmFd,
+    actual_run: Option<&AtomicU32>,
+    execution: &RwLock<()>,
+) -> Result<VcpuExit, TrapError> {
+    run_production_member(
+        &mut KvmMember { cpu, vm },
+        table,
+        slot,
+        actual_run,
+        execution,
+    )
 }
 
 /// Physical run authority retained by a worker after the carrier's vCPU is
@@ -699,13 +688,12 @@ impl Cpl0Carrier {
         mut self,
         max_exits: usize,
     ) -> Result<ProductionWorkerParts, TrapError> {
-        let root = self
-            .custody
+        // The issued root and its initial MM must exist before the peer starts.
+        self.custody
             .initial_task()
             .ok_or_else(|| fail("worker handoff has no issued root task"))?;
         let mm = NonZeroU64::new(self.initial_mm_key()).ok_or_else(|| fail("initial MM key"))?;
-        let context = self
-            .custody
+        self.custody
             .memory()
             .root(mm)
             .ok_or_else(|| fail("worker handoff has no initial MM"))?;
@@ -714,29 +702,9 @@ impl Cpl0Carrier {
             cpu.complete_pending_io_exit()
                 .map_err(|error| fail(format!("complete bootstrap I/O: {error}")))?;
         }
-        let binding = carrick_hal::guest_arch_binding::GuestArchBinding::x86(
-            carrick_guest_arch::TaskIdentity {
-                carrier: carrick_guest_arch::CarrierGeneration::new(
-                    self.custody.memory().identity().nonzero(),
-                ),
-                task: carrick_guest_arch::TaskSerial::new(
-                    NonZeroU64::new(root.task.serial.raw())
-                        .ok_or_else(|| fail("worker root task serial"))?,
-                ),
-                execution: carrick_guest_arch::ExecutionGeneration::new(
-                    NonZeroU64::new(root.thread.generation)
-                        .ok_or_else(|| fail("worker root execution generation"))?,
-                ),
-            },
-            context,
-        );
-        let mut resume = [0; carrick_hal::threaded::X86_TASK_RESUME_PAYLOAD_LEN];
-        resume[56..64].copy_from_slice(&carrick_hal::threaded::X86_TASK_RESUME_MAGIC.to_le_bytes());
-        let root_state = carrick_x86::arch_context::X86ArchContext::capture(
-            binding,
-            &carrick_x86::snapshot(&self.cpus[0])?,
-            resume,
-        )?;
+        let root_state = self
+            .custody
+            .worker_root_state(&carrick_x86::snapshot(&self.cpus[0])?)?;
         let runs = [
             self.production_run_context(0)?,
             self.production_run_context(1)?,
