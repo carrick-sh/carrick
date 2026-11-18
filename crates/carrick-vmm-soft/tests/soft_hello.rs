@@ -455,14 +455,9 @@ fn production_ring_runs_musl_hello_to_exit_on_soft_cpu() {
     assert_eq!(run.exit, Some(0), "{}", run.summary());
 }
 
-#[test]
-fn production_ring_forked_child_writes_and_is_reaped() {
-    let source = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../carrick-cli/tests/fixtures/x86_forked_child_stdout.S"
-    );
+fn assemble_static_fixture(name: &str, source: &str, flags: &[&str]) -> Vec<u8> {
     let output =
-        std::path::Path::new(env!("OUT_DIR")).join(format!("soft-fork-{}", std::process::id()));
+        std::path::Path::new(env!("OUT_DIR")).join(format!("soft-{name}-{}", std::process::id()));
     let assembled = std::process::Command::new("timeout")
         .args([
             "10",
@@ -472,18 +467,32 @@ fn production_ring_forked_child_writes_and_is_reaped() {
             "-no-pie",
             "-Wl,--build-id=none",
         ])
+        .args(flags)
         .arg(source)
         .arg("-o")
         .arg(&output)
         .output()
-        .expect("assemble static fork fixture");
+        .expect("assemble static fixture");
     assert!(
         assembled.status.success(),
         "{}",
         String::from_utf8_lossy(&assembled.stderr)
     );
-    let elf = std::fs::read(&output).expect("static fork fixture");
-    std::fs::remove_file(output).expect("remove assembled fork fixture");
+    let elf = std::fs::read(&output).expect("read assembled static fixture");
+    std::fs::remove_file(output).expect("remove assembled static fixture");
+    elf
+}
+
+#[test]
+fn production_ring_forked_child_writes_and_is_reaped() {
+    let elf = assemble_static_fixture(
+        "fork",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../carrick-cli/tests/fixtures/x86_forked_child_stdout.S"
+        ),
+        &[],
+    );
     let run = run_hello(&elf);
     assert!(run.failure.is_none(), "{}", run.summary());
     assert_eq!(run.stdout, b"E", "{}", run.summary());
@@ -491,13 +500,15 @@ fn production_ring_forked_child_writes_and_is_reaped() {
 }
 
 #[test]
-#[ignore = "M1-6 thread lifecycle frontier; requires the separately assembled TWO_LIVE fixture"]
 fn production_ring_non_last_threads_raw_exit() {
-    let elf = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/soft-lifecycle/raw-exit"
-    ))
-    .expect("static raw-exit fixture");
+    let elf = assemble_static_fixture(
+        "raw-exit",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../carrick-vmm-kvm/tests/fixtures/native_robust_raw_exit.S"
+        ),
+        &["-DTWO_LIVE"],
+    );
     let run = run_hello(&elf);
     assert!(run.failure.is_none(), "{}", run.summary());
     assert!(run.stdout.is_empty(), "{}", run.summary());
