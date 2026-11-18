@@ -6,8 +6,11 @@
 //! LDXR/STXR, LDADD, BR/BLR/RET, MSR immediate), D1.10/D1.11 exception entry
 //! and return (via `exception`), and D13.2 register access (via `state`).
 //! This slice models guest memory as flat pages: no stage-1 walk, so no
-//! translation, permission or alignment faults are raised here.
-use crate::exception::{Exception, ExceptionOutcome, ProviderExit, eret, take_exception};
+//! translation or permission faults are raised here. Data alignment is checked
+//! before accessing memory.
+use crate::exception::{
+    DataAccess, Exception, ExceptionOutcome, ProviderExit, eret, take_exception,
+};
 use crate::state::{
     CpuState, ExceptionLevel, InterruptMasks, ProgramCounter, RegisterValue, StackSelect,
     SystemAccessException, SystemValue, VirtualAddress,
@@ -221,7 +224,11 @@ pub fn execute(
                 Outcome::Continue
             }
             Ok(None) => Outcome::Event(Event::Unsupported),
-            Err(fault) => Outcome::Event(Event::MemoryFault(fault)),
+            Err(MemoryAccessError::Provider(fault)) => Outcome::Event(Event::MemoryFault(fault)),
+            Err(MemoryAccessError::Alignment { access, address }) => {
+                take_exception(cpu, Exception::Alignment { access, address });
+                Outcome::Continue
+            }
         },
     }
 }
@@ -334,6 +341,39 @@ fn integer(r: MemoryRegister) -> Option<(OperandRegister, Width)> {
     }
 }
 
+enum MemoryAccessError {
+    Provider(MemoryFault),
+    Alignment {
+        access: DataAccess,
+        address: VirtualAddress,
+    },
+}
+
+impl From<MemoryFault> for MemoryAccessError {
+    fn from(fault: MemoryFault) -> Self {
+        Self::Provider(fault)
+    }
+}
+
+fn data_access(operation: MemoryOperation) -> DataAccess {
+    if operation == MemoryOperation::Store {
+        DataAccess::Write
+    } else {
+        DataAccess::Read
+    }
+}
+
+/// DDI0487G.a J1.1 AArch64.CheckAlignment; this profile lacks FEAT_LSE2.
+fn check_alignment(address: u64, bytes: u64, access: DataAccess) -> Result<(), MemoryAccessError> {
+    if !address.is_multiple_of(bytes) {
+        return Err(MemoryAccessError::Alignment {
+            access,
+            address: VirtualAddress(address),
+        });
+    }
+    Ok(())
+}
+
 /// Returns Ok(None) for a decoded memory form this slice does not implement
 /// (SIMD&FP registers); nothing is changed then.
 fn memory_operation(
@@ -341,7 +381,7 @@ fn memory_operation(
     monitor: &mut ExclusiveMonitor,
     memory: &mut impl GuestMemory,
     i: &GuestInstruction,
-) -> Result<Option<()>, MemoryFault> {
+) -> Result<Option<()>, MemoryAccessError> {
     match i.instruction {
         Instruction::ScalarMemory(m) | Instruction::UnprivilegedMemory(m) => {
             let Some((rt, width)) = integer(m.register) else {
@@ -380,7 +420,11 @@ fn memory_operation(
                     (cpu.pc.0.wrapping_add(offset.bytes() as u64), None)
                 }
             };
-            if m.operation == MemoryOperation::Store {
+            let access = data_access(m.operation);
+            if cpu.el1.sctlr.alignment_check() {
+                check_alignment(address, u64::from(m.size.bytes()), access)?;
+            }
+            if access == DataAccess::Write {
                 store(memory, address, m.size, operand(cpu, rt))?;
             } else {
                 let v = load(memory, address, m.size)?;
@@ -403,7 +447,11 @@ fn memory_operation(
                 moved
             };
             let step = u64::from(p.size.bytes());
-            if p.operation == MemoryOperation::Store {
+            let access = data_access(p.operation);
+            if cpu.el1.sctlr.alignment_check() {
+                check_alignment(address, step, access)?;
+            }
+            if access == DataAccess::Write {
                 store(memory, address, p.size, operand(cpu, first))?;
                 store(
                     memory,
@@ -425,6 +473,17 @@ fn memory_operation(
             let address = operand(cpu, t.base);
             let step = u64::from(t.size.bytes());
             let count = if t.second.is_some() { 2 } else { 1 };
+            // An exclusive pair checks its full size. Check before the
+            // reservation test, the early-fault choice permitted by STXR.
+            let access = match t.kind {
+                AtomicTransferKind::LoadAcquire | AtomicTransferKind::LoadExclusive { .. } => {
+                    DataAccess::Read
+                }
+                AtomicTransferKind::StoreRelease | AtomicTransferKind::StoreExclusive { .. } => {
+                    DataAccess::Write
+                }
+            };
+            check_alignment(address, step * u64::from(count), access)?;
             match t.kind {
                 AtomicTransferKind::LoadAcquire | AtomicTransferKind::LoadExclusive { .. } => {
                     let a = load(memory, address, t.size)?;
@@ -463,6 +522,8 @@ fn memory_operation(
         }
         Instruction::AtomicAdd(a) => {
             let address = operand(cpu, a.base);
+            // TranslateAddressForAtomicAccess checks alignment as a read.
+            check_alignment(address, u64::from(a.size.bytes()), DataAccess::Read)?;
             let old = load(memory, address, a.size)?;
             let addend = operand(cpu, a.source);
             store(memory, address, a.size, old.wrapping_add(addend))?;
