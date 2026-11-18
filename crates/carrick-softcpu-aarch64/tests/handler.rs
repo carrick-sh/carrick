@@ -361,3 +361,43 @@ fn waits_are_events_after_the_instruction() {
     assert_eq!(r.run(0xd503207f), Outcome::Event(Event::Hint(Hint::Wfi)));
     assert_eq!(r.pc(), PC + 4);
 }
+
+#[test]
+fn higher_el_tlbi_and_at_are_undefined_at_el1() {
+    for word in [
+        0xd50c_871f, // tlbi alle2
+        0xd50e_871f, // tlbi alle3
+        0xd50c_7800, // at s1e2r, x0
+        0xd50c_7880, // at s12e1r, x0
+        0xd50c_78e0, // at s12e0w, x0
+        0xd50e_7800, // at s1e3r, x0
+    ] {
+        let mut r = Rig::el1();
+        assert_eq!(r.run(word), Outcome::Continue, "{word:#010x}");
+        assert_eq!(r.pc(), VBAR + 0x200);
+        assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
+        assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
+    }
+}
+
+#[test]
+fn el1_at_requires_a_walk_and_el0_at_is_undefined() {
+    for word in [
+        0xd508_7800, // at s1e1r, x0
+        0xd508_7820, // at s1e1w, x0
+        0xd508_7840, // at s1e0r, x0
+        0xd508_7860, // at s1e0w, x0
+        0xd508_7900, // at s1e1rp, x0
+        0xd508_7920, // at s1e1wp, x0
+    ] {
+        let mut r = Rig::el1();
+        assert_eq!(r.run(word), Outcome::Event(Event::AddressTranslate));
+        assert_eq!(r.pc(), PC);
+
+        let mut r = Rig::el0();
+        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.pc(), VBAR + 0x400);
+        assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
+        assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
+    }
+}
