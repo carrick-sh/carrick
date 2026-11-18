@@ -2457,12 +2457,17 @@ fn native_service_duplicate_custody_is_an_invariant_at_bridge_settlement() {
             fixture.control.service.consume(request.identity).unwrap();
         }
         let result = entry.begin_service(operation, None);
+        let expected = if occupied_notice {
+            NativeServiceQuarantine::NoticePublishBusy
+        } else {
+            NativeServiceQuarantine::ServiceBindBusy
+        };
         assert!(
             matches!(
                 entry.settle_service_exit(result, NativeServiceExit::Bridge),
-                Err(NativeProcessError::Quarantined)
+                Err(NativeProcessError::ServiceQuarantined(reason)) if reason == expected
             ),
-            "duplicate custody must not report transient Busy (notice={occupied_notice})"
+            "duplicate custody must report its exact site (notice={occupied_notice})"
         );
         assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
         assert!(

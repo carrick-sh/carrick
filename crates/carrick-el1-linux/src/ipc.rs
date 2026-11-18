@@ -2132,13 +2132,17 @@ pub fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
     binding: carrick_el1_abi::ExecutionBinding,
     operation: carrick_sched_core::object_wait::OperationToken,
 ) -> Result<usize, crate::native_process_runtime::NativeProcessError> {
-    use crate::native_process_runtime::NativeProcessError;
-    let token = from_sched_token(operation).ok_or(NativeProcessError::Quarantined)?;
+    use crate::native_process_runtime::{NativeProcessError, NativeServiceQuarantine};
+    let token = from_sched_token(operation).ok_or(NativeProcessError::ServiceQuarantined(
+        NativeServiceQuarantine::IpcOperationToken,
+    ))?;
     let op = region
         .operation(&token)
         .map_err(|_| NativeProcessError::Stale)?;
     if op.task.0 != binding.task.raw() || op.mm.0 != binding.mm.raw() {
-        return Err(NativeProcessError::Quarantined);
+        return Err(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::IpcOperationBinding,
+        ));
     }
     let op = region
         .finish_operation(token, || notify_operation_release(region, zone, slot))
@@ -2146,10 +2150,15 @@ pub fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
     let release = region
         .fd(EL1_WAIT)
         .unpin_filtered(OfdPin::from_raw(op.pin), is_zone_releasable_backing)
-        .map_err(|_| NativeProcessError::Quarantined)?;
-    settle_native_release(region, release, Some((zone, slot)), task)
-        .map_err(|_| NativeProcessError::Quarantined)?;
-    usize::try_from(op.progress.written).map_err(|_| NativeProcessError::Quarantined)
+        .map_err(|_| {
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::IpcOperationUnpin)
+        })?;
+    settle_native_release(region, release, Some((zone, slot)), task).map_err(|_| {
+        NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::IpcOperationRelease)
+    })?;
+    usize::try_from(op.progress.written).map_err(|_| {
+        NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::IpcProgressOverflow)
+    })
 }
 
 /// Count why a call leaves for the host (`Counters::ipc_leaves`).
