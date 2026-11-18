@@ -29,10 +29,8 @@ use super::aarch64_process::{
     resume_selected, with_process_entry,
 };
 #[cfg(test)]
-use super::native_process_runtime::{NativeContention, NativeFailure};
-use super::native_process_runtime::{
-    NativeProcessError, NativeProcessRuntime, NativeServiceQuarantine,
-};
+use super::native_process_runtime::{NativeContention, NativeFailure, NativeServiceQuarantine};
+use super::native_process_runtime::{NativeProcessError, NativeProcessRuntime};
 #[cfg(test)]
 use super::native_process_runtime::{NativeProcessRegistry, NativeProcessService};
 use carrick_el1_abi::{
