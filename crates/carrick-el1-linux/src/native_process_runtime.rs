@@ -9734,7 +9734,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             child_tid.parent = ProcessForkParent::Runs;
         }
         let pid = loop {
-            let forked = self.fork_owned(child_tid);
+            // A bare invariant answer is typed here, so it ends the run.
+            let forked = self
+                .fork_owned(child_tid)
+                .map_err(super::native_fork_refusal::typed_invariant);
             // A sibling's birth holds the reservation and this fork enrolled
             // on its release: park on that release, not on carrier work.
             if let Some(observed) = super::native_fork_refusal::sibling_birth(&forked) {
@@ -18574,7 +18577,6 @@ mod tests {
         next_page: usize,
         loan_in_flight: bool,
         abort_count: usize,
-        fail_context: bool,
         fail_fd_table: bool,
         fail_commit: bool,
         committed_children: Vec<(NonZeroU64, NonZeroU64)>,
@@ -18645,11 +18647,6 @@ mod tests {
         }
 
         fn prepared_context(&self, p: &Self::PreparedMm) -> AddressContext<RootGpa> {
-            if self.fail_context {
-                let mut bad = *p;
-                bad.mm = MmGeneration::new(NonZeroU64::new(bad.mm.raw().get() + 999).unwrap());
-                return bad;
-            }
             *p
         }
 
@@ -18845,7 +18842,6 @@ mod tests {
             next_page: 0,
             loan_in_flight: false,
             abort_count: 0,
-            fail_context: false,
             fail_fd_table: false,
             fail_commit: false,
             committed_children: Vec::new(),
@@ -18855,39 +18851,16 @@ mod tests {
             .enter(source, &task, words(address), &mut service)
             .unwrap();
 
-        // 1. Injected failure at metadata validation (address.mm mismatch)
-        entry.service.fail_context = true;
-        let outcome1 = entry.fork(ProcessForkChildTid::NONE);
-        assert!(matches!(
-            outcome1,
-            LifecycleOutcome::Returned { result, .. } if result.raw() == NativeFailure::Stale.errno()
-        ));
-        assert_eq!(entry.service.abort_count, 1);
-        assert!(!entry.service.loan_in_flight);
-        entry.service.fail_context = false;
-
-        // Next fork succeeds!
-        let outcome2 = entry.fork(ProcessForkChildTid::NONE);
-        let LifecycleOutcome::Returned { result: pid1, .. } = outcome2 else {
-            panic!("expected fork success after metadata validation recovery");
-        };
-        assert!(
-            runtime
-                .namespace_child_key(entry.key, pid1.raw() as u32)
-                .is_some()
-        );
-        assert_eq!(pid1.raw(), 43);
-        assert_eq!(entry.service.abort_count, 1);
-        assert!(!entry.service.loan_in_flight);
-
-        // 2. Injected failure at fork_fd_table
+        // A prepared MM whose context names another MM is a broken
+        // invariant that ends the run (#2441), so no step injects it here.
+        // 1. Injected failure at fork_fd_table
         entry.service.fail_fd_table = true;
         let outcome3 = entry.fork(ProcessForkChildTid::NONE);
         assert!(matches!(
             outcome3,
             LifecycleOutcome::Returned { result, .. } if result.raw() == NativeFailure::Exhausted.errno()
         ));
-        assert_eq!(entry.service.abort_count, 2);
+        assert_eq!(entry.service.abort_count, 1);
         assert!(!entry.service.loan_in_flight);
         entry.service.fail_fd_table = false;
 
@@ -18901,15 +18874,11 @@ mod tests {
                 .namespace_child_key(entry.key, pid2.raw() as u32)
                 .is_some()
         );
-        assert_eq!(pid2.raw(), 45);
-        assert!(
-            pid2.raw() > pid1.raw(),
-            "issued child identities stay distinct"
-        );
-        assert_eq!(entry.service.abort_count, 2);
+        assert_eq!(pid2.raw(), 43);
+        assert_eq!(entry.service.abort_count, 1);
         assert!(!entry.service.loan_in_flight);
 
-        // 3. Injected failure at commit_mm
+        // 2. Injected failure at commit_mm
         entry.service.fail_commit = true;
         let outcome5 = entry.fork(ProcessForkChildTid::NONE);
         assert_eq!(
@@ -18917,7 +18886,7 @@ mod tests {
             "Transferred",
             "a Busy commit rolls back and retains the fork, never EAGAIN"
         );
-        assert_eq!(entry.service.abort_count, 3);
+        assert_eq!(entry.service.abort_count, 2);
         assert!(!entry.service.loan_in_flight);
         entry.service.fail_commit = false;
 
@@ -18931,15 +18900,15 @@ mod tests {
                 .namespace_child_key(entry.key, pid3.raw() as u32)
                 .is_some()
         );
-        assert_eq!(pid3.raw(), 47);
+        assert_eq!(pid3.raw(), 45);
         assert!(
             pid3.raw() > pid2.raw(),
             "issued child identities stay distinct"
         );
-        assert_eq!(entry.service.abort_count, 3);
+        assert_eq!(entry.service.abort_count, 2);
         assert!(!entry.service.loan_in_flight);
 
-        // 4. Injected failure at alloc_record exhaustion
+        // 3. Injected failure at alloc_record exhaustion
         let mut filled_records = Vec::new();
         while let Ok(r) = zone.alloc_record(ThreadIdentity {
             tid: 900 + filled_records.len() as u64,
@@ -18961,7 +18930,7 @@ mod tests {
             outcome7,
             LifecycleOutcome::Returned { result, .. } if result.raw() == NativeFailure::Exhausted.errno()
         ));
-        assert_eq!(entry.service.abort_count, 4);
+        assert_eq!(entry.service.abort_count, 3);
         assert!(!entry.service.loan_in_flight);
 
         // Free one record so alloc_record can succeed
@@ -18977,12 +18946,12 @@ mod tests {
                 .namespace_child_key(entry.key, pid4.raw() as u32)
                 .is_some()
         );
-        assert_eq!(pid4.raw(), 49);
+        assert_eq!(pid4.raw(), 47);
         assert!(
             pid4.raw() > pid3.raw(),
             "issued child identities stay distinct"
         );
-        assert_eq!(entry.service.abort_count, 4);
+        assert_eq!(entry.service.abort_count, 3);
         assert!(!entry.service.loan_in_flight);
 
         for r in filled_records {
@@ -19071,7 +19040,6 @@ mod tests {
             next_page: 0,
             loan_in_flight: false,
             abort_count: 0,
-            fail_context: false,
             fail_fd_table: false,
             fail_commit: false,
             committed_children: Vec::new(),

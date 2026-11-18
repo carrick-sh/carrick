@@ -880,14 +880,17 @@ impl AdmittedCustodyToken {
                 crossed?;
             }
             Some(Err(reply)) => {
-                return Err(refused(
+                return Err(super::native_fork_refusal::stock_refused(
                     NativeForkStage::Reserve,
-                    super::native_fork_refusal::NativeForkCause::StockReservation(reply),
+                    Some(reply),
                 ));
             }
             None => {
                 crossed?;
-                return Err(NativeProcessError::Stale);
+                return Err(super::native_fork_refusal::stock_refused(
+                    NativeForkStage::Reserve,
+                    None,
+                ));
             }
         }
         let commit = ForkStockSettlement::commit_reserved(loan, completion)
@@ -2208,10 +2211,18 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 crossed?;
                 loan
             }
-            Some(Err(_)) => return Err(NativeProcessError::Exhausted),
+            Some(Err(reply)) => {
+                return Err(super::native_fork_refusal::stock_refused(
+                    NativeForkStage::StockCrossing,
+                    Some(reply),
+                ));
+            }
             None => {
                 crossed?;
-                return Err(NativeProcessError::Stale);
+                return Err(super::native_fork_refusal::stock_refused(
+                    NativeForkStage::StockCrossing,
+                    None,
+                ));
             }
         };
         if loan.lifecycle.page.raw() == self.task.metadata.lifecycle_page.load(Ordering::Acquire) {
@@ -2353,8 +2364,11 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             Ok(child) => child,
             Err(e) => {
                 owner.spaces.free(index);
+                // `Core`: the publish's own rollback failed, so the parent
+                // may still link a loaned page and the loan stays pending.
+                // A broken invariant: the fork entry ends the run on it.
                 if matches!(e, carrick_core::mm::transaction::MmError::Core) {
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(refused(NativeForkStage::Publish, e));
                 }
                 return Err(abandon_loan(
                     &self.crossing,
