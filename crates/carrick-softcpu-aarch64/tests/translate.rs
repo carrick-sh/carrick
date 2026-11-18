@@ -20,7 +20,7 @@ fn block(words: &[u32]) -> GuestBlock {
 }
 
 fn class(word: u32) -> InstructionClass {
-    GuestInstruction::decode(PC, word).class
+    GuestInstruction::decode(PC, word).class()
 }
 
 fn object(words: &[u32]) -> Vec<u8> {
@@ -201,8 +201,8 @@ fn exits_and_branches_classify() {
 #[test]
 fn splitter_ends_blocks_at_terminators_limits_and_pages() {
     let b = block(&[0xd2800540, 0x8b020020, 0xf9400020, 0xd503201f]);
-    assert_eq!(b.instructions.len(), 3);
-    assert_eq!(b.terminator().map(|i| i.word), Some(0xf9400020));
+    assert_eq!(b.instructions().len(), 3);
+    assert_eq!(b.terminator().map(|i| i.word()), Some(0xf9400020));
     assert_eq!(b.next_pc(), ProgramCounter(PC.0 + 12));
 
     let nops = vec![0xd503201fu32; 200];
@@ -213,14 +213,18 @@ fn splitter_ends_blocks_at_terminators_limits_and_pages() {
         },
         |pc| nops.get(((pc.0 - PC.0) / 4) as usize).copied(),
     );
-    assert_eq!((b.instructions.len(), b.terminator()), (5, None));
+    assert_eq!((b.instructions().len(), b.terminator()), (5, None));
 
     let near_end = ProgramCounter(0x1ff8);
     let b = split_block(near_end, BlockLimits::default(), |_| Some(0xd503201f));
-    assert_eq!(b.instructions.len(), 2, "a block never crosses a code page");
+    assert_eq!(
+        b.instructions().len(),
+        2,
+        "a block never crosses a code page"
+    );
 
     let b = split_block(PC, BlockLimits::default(), |_| None);
-    assert!(b.instructions.is_empty());
+    assert!(b.instructions().is_empty());
     assert_eq!(emit_block(&b), Err(TranslateError::Empty));
 
     let spans = split_span(
@@ -231,7 +235,7 @@ fn splitter_ends_blocks_at_terminators_limits_and_pages() {
     assert_eq!(
         spans
             .iter()
-            .map(|b| b.instructions.len())
+            .map(|b| b.instructions().len())
             .collect::<Vec<_>>(),
         [2, 1]
     );
@@ -315,7 +319,7 @@ fn common_exit_is_exact() {
 }
 
 fn body(t: &TranslatedBlock) -> &[u32] {
-    &t.words[entry_stub().len()..t.words.len() - common_exit().len()]
+    &t.words()[entry_stub().len()..t.words().len() - common_exit().len()]
 }
 
 #[test]
@@ -324,12 +328,12 @@ fn copy_through_block_is_verbatim_then_one_fallthrough_exit() {
     let nops: Vec<u32> = words.iter().copied().chain([0xd503201f; 60]).collect();
     let t = emit_block(&block(&nops)).unwrap();
     assert_eq!(&body(&t)[..4], &words);
-    assert_eq!(t.exits.len(), 1);
+    assert_eq!(t.exits().len(), 1);
     assert_eq!(
-        t.exits[0],
+        t.exits()[0],
         BlockExit::Continue(ProgramCounter(PC.0 + 4 * 64))
     );
-    assert_eq!(t.terminator, Terminator::Fallthrough(0));
+    assert_eq!(t.terminator(), Terminator::Fallthrough(0));
     let site = &body(&t)[64..];
     assert_eq!(site[..2], [0xa90007e0, 0xd2800000]); // stp x0, x1, [sp]; movz x0, #0
     // b common_exit: the very next word.
@@ -341,11 +345,11 @@ fn handler_exit_keeps_restart_pc_and_index() {
     // movz x0, #42; ldr x1, [x0]: the load does not run in the block.
     let t = emit_block(&block(&[0xd2800540, 0xf9400001])).unwrap();
     assert_eq!(body(&t)[0], 0xd2800540);
-    assert_eq!(t.terminator, Terminator::Handler(0));
-    let BlockExit::Handler(i) = t.exits[0] else {
+    assert_eq!(t.terminator(), Terminator::Handler(0));
+    let BlockExit::Handler(i) = t.exits()[0] else {
         panic!("load must exit to its handler");
     };
-    assert_eq!((i.pc, i.word), (ProgramCounter(PC.0 + 4), 0xf9400001));
+    assert_eq!((i.pc(), i.word()), (ProgramCounter(PC.0 + 4), 0xf9400001));
     assert_eq!(body(&t)[1..3], [0xa90007e0, 0xd2800000]);
 }
 
@@ -426,10 +430,13 @@ fn direct_branches_exit_to_their_targets() {
     let link = PC.0 + 4;
     let m = materialize(30, link);
     assert_eq!(&body(&t)[..m.len()], &m[..]);
-    assert_eq!(t.exits, [BlockExit::Continue(ProgramCounter(PC.0 + 0x40))]);
+    assert_eq!(
+        t.exits(),
+        [BlockExit::Continue(ProgramCounter(PC.0 + 0x40))]
+    );
     // b -8
     let t = emit_block(&block(&[0x17fffffe])).unwrap();
-    assert_eq!(t.exits, [BlockExit::Continue(ProgramCounter(PC.0 - 8))]);
+    assert_eq!(t.exits(), [BlockExit::Continue(ProgramCounter(PC.0 - 8))]);
 }
 
 #[test]
@@ -443,14 +450,14 @@ fn conditional_branches_are_relocated_to_a_local_taken_stub() {
         assert_eq!(body(&t)[1], relocated, "{word:08x}");
         assert_text(&[relocated], &[text]);
         assert_eq!(
-            t.exits,
+            t.exits(),
             [
                 BlockExit::Continue(ProgramCounter(PC.0 + 8)),
                 BlockExit::Continue(ProgramCounter(PC.0 + 4 + 0x100)),
             ]
         );
         assert_eq!(
-            t.terminator,
+            t.terminator(),
             Terminator::Conditional {
                 fallthrough: 0,
                 taken: 1
@@ -464,9 +471,9 @@ fn conditional_branches_are_relocated_to_a_local_taken_stub() {
 #[test]
 fn every_exit_site_branches_to_the_common_exit() {
     let t = emit_block(&block(&[0x54000801])).unwrap();
-    let common = t.words.len() - common_exit().len();
+    let common = t.words().len() - common_exit().len();
     for (index, at) in t
-        .words
+        .words()
         .iter()
         .enumerate()
         .filter(|(_, w)| **w & 0xfc000000 == 0x14000000)
@@ -520,8 +527,8 @@ fn verbatim_words_never_name_the_stack_pointer() {
     let mut seen = 0;
     for word in (0..=u32::MAX).step_by(4099) {
         let i = GuestInstruction::decode(PC, word);
-        if i.class == InstructionClass::Copy(CopyKind::Verbatim) {
-            let text = format!("{:?}", i.instruction);
+        if i.class() == InstructionClass::Copy(CopyKind::Verbatim) {
+            let text = format!("{:?}", i.instruction());
             assert!(
                 !text.contains("Sp,") && !text.contains("Sp }"),
                 "{word:08x} {text}"
@@ -607,15 +614,15 @@ fn measure(name: &str, spans: &[(u64, Vec<u32>)]) {
     let mut sysreg_accesses = 0;
     for (base, span) in spans {
         for block in split_span(ProgramCounter(*base), span, BlockLimits::default()) {
-            for i in &block.instructions {
+            for i in block.instructions() {
                 words += 1;
-                let key = match i.class {
+                let key = match i.class() {
                     InstructionClass::Copy(k) => format!("Copy({k:?})"),
                     InstructionClass::Exit(r) => format!("Exit({r:?})"),
                     InstructionClass::Branch(b) => format!("Branch({b:?})"),
                 };
                 *classes.entry(key).or_default() += 1;
-                if let Instruction::SystemAccess(access) = i.instruction {
+                if let Instruction::SystemAccess(access) = i.instruction() {
                     let mut cpu = CpuState::default();
                     cpu.pstate.el = ExceptionLevel::El1;
                     cpu.pstate.sp = StackSelect::El1;
@@ -628,15 +635,15 @@ fn measure(name: &str, spans: &[(u64, Vec<u32>)]) {
                     assert!(
                         result.is_ok(),
                         "{name}: EL1h register bank rejects {access:?} at {:#x}: {result:?}",
-                        i.pc.0
+                        i.pc().0
                     );
                     sysreg_accesses += 1;
                 }
             }
             blocks += 1;
-            *sizes.entry(block.instructions.len()).or_default() += 1;
+            *sizes.entry(block.instructions().len()).or_default() += 1;
             let t = emit_block(&block).expect("every production block translates");
-            emitted += t.words.len();
+            emitted += t.words().len();
             // Determinism: translating twice yields the same host words.
             assert_eq!(emit_block(&block).unwrap(), t);
         }
@@ -688,7 +695,7 @@ fn isb_prevents_fetching_the_following_instruction_in_the_same_block() {
     assert_eq!(fetched, [PC, ProgramCounter(PC.0 + 4)]);
     assert_eq!(block.next_pc(), ProgramCounter(PC.0 + 8));
     assert!(matches!(
-        emit_block(&block).unwrap().exits.as_slice(),
+        emit_block(&block).unwrap().exits(),
         [BlockExit::Handler(_)]
     ));
 }
@@ -703,7 +710,7 @@ fn misaligned_block_and_span_do_not_fetch_across_a_code_page() {
             Some(0xd503_201f)
         });
         assert_eq!(reads, 0);
-        assert!(block.instructions.is_empty());
+        assert!(block.instructions().is_empty());
         assert!(split_span(pc, &[0xd503_201f], BlockLimits::default()).is_empty());
     }
 }

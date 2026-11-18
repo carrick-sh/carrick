@@ -139,13 +139,29 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestInstruction {
-    pub pc: ProgramCounter,
-    pub word: u32,
-    pub instruction: Instruction,
-    pub class: InstructionClass,
+    pc: ProgramCounter,
+    word: u32,
+    instruction: Instruction,
+    class: InstructionClass,
 }
 
 impl GuestInstruction {
+    pub fn pc(&self) -> ProgramCounter {
+        self.pc
+    }
+
+    pub fn word(&self) -> u32 {
+        self.word
+    }
+
+    pub fn instruction(&self) -> Instruction {
+        self.instruction
+    }
+
+    pub fn class(&self) -> InstructionClass {
+        self.class
+    }
+
     pub fn decode(pc: ProgramCounter, word: u32) -> Self {
         let instruction = decode_instruction(word);
         Self {
@@ -185,11 +201,19 @@ pub const CODE_PAGE_BYTES: u64 = 4096;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestBlock {
-    pub start: ProgramCounter,
-    pub instructions: Vec<GuestInstruction>,
+    start: ProgramCounter,
+    instructions: Vec<GuestInstruction>,
 }
 
 impl GuestBlock {
+    pub fn start(&self) -> ProgramCounter {
+        self.start
+    }
+
+    pub fn instructions(&self) -> &[GuestInstruction] {
+        &self.instructions
+    }
+
     pub fn terminator(&self) -> Option<&GuestInstruction> {
         self.instructions.last().filter(|i| i.class.terminates())
     }
@@ -357,10 +381,29 @@ pub enum Terminator {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslatedBlock {
-    pub guest: GuestBlock,
-    pub words: Vec<u32>,
-    pub exits: Vec<BlockExit>,
-    pub terminator: Terminator,
+    guest: GuestBlock,
+    words: Vec<u32>,
+    exits: Vec<BlockExit>,
+    terminator: Terminator,
+}
+
+impl TranslatedBlock {
+    pub fn guest(&self) -> &GuestBlock {
+        &self.guest
+    }
+
+    /// Read-only AAPCS64 machine code produced by the emitter.
+    pub fn words(&self) -> &[u32] {
+        &self.words
+    }
+
+    pub fn exits(&self) -> &[BlockExit] {
+        &self.exits
+    }
+
+    pub fn terminator(&self) -> Terminator {
+        self.terminator
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

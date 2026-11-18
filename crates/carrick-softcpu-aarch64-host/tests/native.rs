@@ -71,7 +71,7 @@ impl ExecuteBlock for Recording {
         block: &TranslatedBlock,
         frame: &mut BlockFrame,
     ) -> Result<usize, HostError> {
-        self.starts.push(block.guest.start.0);
+        self.starts.push(block.guest().start().0);
         self.runner.execute(block, frame)
     }
 }
