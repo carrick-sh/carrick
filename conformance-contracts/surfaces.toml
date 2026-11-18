@@ -1383,6 +1383,8 @@ surfaces = [
   { path = "crates/carrick-vmm-hvf/src/vcpu_kick.rs", contract = "kernel.timer.delivery-gate" },
   { path = "crates/carrick-vmm-hvf/tests/support/shutdown_kick.rs", contract = "kernel.vcpu.shutdown-entry" },
   { path = "crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs", contract = "kernel.vcpu.shutdown-entry" },
+  # Build-time CPL0 image recipe shared by the KVM and soft build scripts (#671); it builds the ring image, no guest-visible behaviour.
+  { path = "crates/carrick-vmm-kvm/cpl0_build.rs", contracts = [] },
   { path = "crates/carrick-vmm-kvm/src/carrier_cpu.rs", contract = "kernel.mm.address-space-occupancy" },
   { path = "crates/carrick-vmm-kvm/src/carrier_cpu.rs", contract = "x86.vmx.segment-entry" },
   { path = "crates/carrick-vmm-kvm/src/carrier_interrupts.rs", contract = "kernel.el1.thread-lifecycle" },
