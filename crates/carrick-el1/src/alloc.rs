@@ -450,11 +450,25 @@ impl MetadataStorage {
     /// grant owes nothing, and neither does a venue with no grant mailbox
     /// (the x86 CPL0 image, host builds): there a miss is ENOMEM (#2441).
     pub fn capacity_owed(&self) -> bool {
+        self.grant_mailbox()
+            .is_some_and(carrick_el1_abi::MetadataGrantMailbox::capacity_owed)
+    }
+
+    /// The carrier mailbox an owed grant is served on. A host build has
+    /// none, except the one a host test installed on its own thread.
+    fn grant_mailbox(&self) -> Option<&carrick_el1_abi::MetadataGrantMailbox> {
         #[cfg(any(target_os = "none", test))]
-        if let Some((mailbox, _)) = self.mailbox_context() {
-            return mailbox.capacity_owed();
+        {
+            self.mailbox_context().map(|(mailbox, _)| mailbox)
         }
-        false
+        #[cfg(all(feature = "host-test", not(target_os = "none"), not(test)))]
+        {
+            HOST_TEST_GRANT_MAILBOX.with(core::cell::Cell::get)
+        }
+        #[cfg(not(any(target_os = "none", test, feature = "host-test")))]
+        {
+            None
+        }
     }
 
     pub fn diagnostics(&self) -> AllocatorDiagnostics {
@@ -474,6 +488,22 @@ unsafe impl core::alloc::GlobalAlloc for MetadataStorage {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         self.deallocate(ptr, layout)
     }
+}
+
+#[cfg(all(feature = "host-test", not(target_os = "none"), not(test)))]
+std::thread_local! {
+    static HOST_TEST_GRANT_MAILBOX: core::cell::Cell<Option<&'static carrick_el1_abi::MetadataGrantMailbox>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Stand in for the carrier mailbox on this host test thread: the global
+/// allocator's owed-grant view reads `mailbox`, so a host witness can hold
+/// a metadata grant in flight. `None` removes it.
+#[cfg(all(feature = "host-test", not(target_os = "none"), not(test)))]
+pub fn install_host_test_grant_mailbox(
+    mailbox: Option<&'static carrick_el1_abi::MetadataGrantMailbox>,
+) {
+    HOST_TEST_GRANT_MAILBOX.with(|installed| installed.set(mailbox));
 }
 
 /// Global EL1 kernel metadata allocator instance.
