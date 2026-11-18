@@ -539,8 +539,23 @@ fn begin_virt_r14_r15(
         }
     }
 
+    // AH/CH/DH/BH cannot share an instruction with a REX prefix (SDM Vol. 2A
+    // 2.2.1.2): beside one, only a legacy register can host the virtualized
+    // operand.
+    let high_byte = (0..insn.op_count()).any(|i| {
+        insn.op_kind(i) == OpKind::Register
+            && matches!(
+                insn.op_register(i),
+                Register::AH | Register::CH | Register::DH | Register::BH
+            )
+    });
+    let candidates: &[usize] = if high_byte {
+        &[3, 5, 6, 7]
+    } else {
+        &[8, 9, 10, 11, 12, 13, 3, 5, 6, 7]
+    };
     let mut pick_free = || -> usize {
-        for cand in [8usize, 9, 10, 11, 12, 13, 3, 5, 6, 7] {
+        for &cand in candidates {
             if (used_mask & (1u16 << cand)) == 0 {
                 used_mask |= 1u16 << cand;
                 return cand;
