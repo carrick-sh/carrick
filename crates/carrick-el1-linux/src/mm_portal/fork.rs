@@ -5,7 +5,7 @@ use super::{El1MmHandle, MmError};
 #[cfg(target_os = "none")]
 use crate::rust_alloc::vec::Vec;
 use carrick_core::mm::transaction::{MmPortal as CoreMmPortal, OwnerVenue};
-use carrick_el1_abi::{EntryContext, ReservationGeometry, ReservationPolicy};
+use carrick_el1_abi::{EntryContext, PortalWaitCause, ReservationGeometry, ReservationPolicy};
 use carrick_el1_abi::{
     PinnedMetadataExtent, PortalForkCompletion, PortalForkCustody, PortalForkRequest,
     ReservationNodeFlags,
@@ -275,18 +275,12 @@ impl<
             return Err(MmError::Invalid);
         }
         let owner = NonZeroU64::new(u64::from(worker) + 1).ok_or(MmError::Invalid)?;
-        let index = self
-            .spaces
-            .find(request.operation.mm.raw())
-            .ok_or(MmError::Stale)?;
-        let editor = self
-            .space_access(worker)?
-            .try_begin_edit(index, request.operation.mm.raw(), owner)
-            .ok_or(MmError::Busy)?;
-        let grant = self
-            .spaces
-            .grant(index, request.operation.mm.raw())
-            .ok_or(MmError::Busy)?;
+        let parent = self.admitted_handle(request.operation.mm, worker)?;
+        if parent.incarnation() != request.operation.incarnation {
+            return Err(MmError::Stale);
+        }
+        let editor = self.editor_for(parent, worker)?;
+        let grant = editor.grant();
         let child_index = self
             .spaces
             .find(request.child_mm.raw())
@@ -298,19 +292,13 @@ impl<
         if child_editor.grant().ttbr0 & B::ADDRESS_MASK != request.child_tables.base {
             return Err(MmError::Stale);
         }
-        let mut root = self.root(request.operation.mm, worker)?;
-        if root.incarnation().raw() != request.operation.incarnation.get() {
-            return Err(MmError::Stale);
-        }
-        // The census took this snapshot under the editor and released it
-        // for the stock crossing and the scratch. A moved generation or
-        // operation sequence is another live thread of the parent's
-        // committed edit: contention, so the fork reruns with a fresh
-        // census (#2441). Stale stays the broken invariants above.
+        let mut root = self.root_for(parent, worker)?;
         if root.generation() != request.parent_generation
             || root.operation_sequence() != request.operation.sequence.get()
         {
-            return Err(MmError::Busy);
+            return Err(snapshot_moved(
+                self.observe_wait(parent, PortalWaitCause::Editor)?,
+            ));
         }
         if !root.fork_ready() {
             return Err(MmError::Busy);
@@ -379,14 +367,11 @@ impl<
     ) -> Result<UnpublishedEl1Child<B>, MmError> {
         let request = plan.request;
         let owner = NonZeroU64::new(u64::from(worker) + 1).ok_or(MmError::Invalid)?;
-        let index = self
-            .spaces
-            .find(request.operation.mm.raw())
-            .ok_or(MmError::Stale)?;
-        let editor = self
-            .space_access(worker)?
-            .try_begin_edit(index, request.operation.mm.raw(), owner)
-            .ok_or(MmError::Busy)?;
+        let parent = self.admitted_handle(request.operation.mm, worker)?;
+        if parent.incarnation() != request.operation.incarnation {
+            return Err(MmError::Stale);
+        }
+        let editor = self.editor_for(parent, worker)?;
         let child_index = self
             .spaces
             .find(request.child_mm.raw())
@@ -398,7 +383,7 @@ impl<
         if child_editor.grant().ttbr0 & B::ADDRESS_MASK != request.child_tables.base {
             return Err(MmError::Stale);
         }
-        let root = self.root(request.operation.mm, worker)?;
+        let root = self.root_for(parent, worker)?;
         let child = self.child_root(request.child_mm, worker)?;
         let child_incarnation = NonZeroU64::new(child.incarnation().raw()).ok_or(MmError::Stale)?;
         let child_handle = unsafe {
@@ -406,11 +391,29 @@ impl<
         };
         let mmap_next = editor.mmap_next();
         let brk = root.brk_current();
-        let inner = plan.publish(words, root, child, child_handle)?;
+        let inner = match plan.publish(words, root, child, child_handle) {
+            Ok(inner) => inner,
+            Err(carrick_core::mm::fork::ForkError::SnapshotMoved) => {
+                return Err(snapshot_moved(
+                    self.observe_wait(parent, PortalWaitCause::Editor)?,
+                ));
+            }
+            Err(other) => return Err(other.into()),
+        };
         child_editor.set_mmap_next(mmap_next);
         child_editor.set_brk_current(brk);
         Ok(UnpublishedEl1Child { inner })
     }
+}
+
+// The sibling edit owns the parent's editor until its release. If we
+// acquired the editor and found a replacement snapshot, our read of that
+// snapshot is serialized after the edit. Releasing this editor publishes that
+// observation on the same queue, so enrollment sees Changed even if the
+// sibling already left. A still-held editor instead parks via editor_for.
+fn snapshot_moved(observed: Option<carrick_el1_abi::PortalOwnerWait>) -> MmError {
+    // Source-free model fixtures have no scheduler queue.
+    observed.map_or(MmError::Busy, MmError::Wait)
 }
 
 pub use carrick_core::mm::fork::{

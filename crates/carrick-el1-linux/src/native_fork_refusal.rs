@@ -128,7 +128,7 @@ pub struct NativeForkRefusal {
 ///   `Refusal::{Busy, PreparedConflict}`, `ForkError::Busy`, and a stock
 ///   `Inventory` reply. A parent snapshot another live thread of the parent
 ///   moved between the census and the fork's prepare or publish is
-///   `MmError::Busy` at its source: the fork reruns with a fresh snapshot.
+///   `MmError::Wait` on the parent editor publication.
 /// - [`Self::OutOfMemory`] (ENOMEM): `MmError::{NoMemory, MetadataRequired}`,
 ///   `PageTableError::{OutOfTables, MetadataAllocation}`,
 ///   `Refusal::{Limit, MetadataRequired}`,
@@ -255,6 +255,7 @@ fn fork_class(error: ForkError) -> NativeForkClass {
         ForkError::Invalid
         | ForkError::Stale
         | ForkError::Core
+        | ForkError::SnapshotMoved
         | ForkError::OwnerRefusal(
             ForkOwnerRefusal::Invalid
             | ForkOwnerRefusal::Collision
@@ -623,6 +624,7 @@ mod tests {
             ForkError::Invalid,
             ForkError::NoMemory,
             ForkError::Busy,
+            ForkError::SnapshotMoved,
             ForkError::Stale,
             ForkError::MetadataRequired,
             ForkError::Core,
@@ -741,7 +743,7 @@ mod tests {
                 ("eagain", 3),
                 ("enomem", 11),
                 ("enosys", 1),
-                ("invariant", 36),
+                ("invariant", 37),
                 ("not now", 12),
             ]
         );
