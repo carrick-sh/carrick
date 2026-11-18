@@ -455,12 +455,14 @@ impl Service {
             .map_err(|e| free(refused(NativeForkStage::PublishRoot, e)))?;
         let scratch = fork_scratch(loan.request, mapping_count, &count).map_err(free)?;
         #[cfg(feature = "test-support")]
-        crate::test_support::hold_armed_fork_prepare();
+        let held_snapshot = crate::test_support::hold_armed_fork_prepare();
         let plan = owner
             .prepare_fork(loan.request, scratch, live, self.worker())
             .map_err(|e| {
                 #[cfg(feature = "test-support")]
-                crate::test_support::record_fork_superseded(e);
+                if held_snapshot {
+                    crate::test_support::record_fork_superseded(e);
+                }
                 free(refused(NativeForkStage::Prepare, e))
             })?;
         let mut custody = Vec::new();
@@ -472,7 +474,9 @@ impl Service {
             Ok(child) => child,
             Err(e) => {
                 #[cfg(feature = "test-support")]
-                crate::test_support::record_fork_superseded(e);
+                if held_snapshot {
+                    crate::test_support::record_fork_superseded(e);
+                }
                 owner.spaces.free(index);
                 // A refused publish may have stored into the loaned tables;
                 // it rolled its parent edits back, so they are unlinked and

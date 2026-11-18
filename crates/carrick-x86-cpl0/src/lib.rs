@@ -163,6 +163,12 @@ mod test_support {
     /// The next native fork's stock loan is refused Stale, a broken carrier
     /// invariant (#2441).
     pub const INJECT_FORK_LOAN_STALE_ONCE: u64 = 0xffff_ffff_ffff_fe34;
+    /// After its real mmap, the sibling retains the parent editor across fork Prepare.
+    const INJECT_HOLD_EDITOR_AND_RESUME_FORK: u64 = 0xffff_ffff_ffff_fe35;
+    const INJECT_FORK_EDITOR_WAITERS: u64 = 0xffff_ffff_ffff_fe36;
+    const INJECT_FORK_EDITOR_PROGRESS: u64 = 0xffff_ffff_ffff_fe37;
+    static FORK_EDITOR_PROGRESS: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
     /// The armed loan refusal: 0 none, 1 Inventory, 2 Stale.
     static FORK_LOAN_REFUSAL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
@@ -181,12 +187,12 @@ mod test_support {
     /// Called by the native fork between its stock loan crossing and its
     /// prepare, on the forking member's CPU, with no owner lock held. While
     /// held it acknowledges shootdowns, as a member away at a crossing does.
-    pub fn hold_armed_fork_prepare() {
+    pub fn hold_armed_fork_prepare() -> bool {
         if FORK_PREPARE_HOLD
             .compare_exchange(BIRTH_ARMED, BIRTH_HELD, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return;
+            return false;
         }
         let mut spins = 0_u64;
         while FORK_PREPARE_HOLD.load(Ordering::Acquire) == BIRTH_HELD {
@@ -200,6 +206,7 @@ mod test_support {
             core::hint::spin_loop();
         }
         FORK_PREPARE_HOLD.store(0, Ordering::Release);
+        true
     }
 
     /// Count a fork the parent owner refused Busy at prepare or publish.
@@ -587,6 +594,57 @@ mod test_support {
                 )
                 .is_ok()
                 .then_some(0),
+            INJECT_HOLD_EDITOR_AND_RESUME_FORK | INJECT_FORK_EDITOR_WAITERS => {
+                use carrick_sched_core::spaces::notification::SpaceWaitCause;
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                let source = carrick_x86_carrier::native_execution::source(slot);
+                // SAFETY: dispatch owns this exact current-task binding.
+                let task =
+                    unsafe { &*(binding.task_address as *const carrick_el1_abi::CurrentTask) };
+                let mm = core::num::NonZeroU64::new(task.mm.key.load(Ordering::Acquire))?;
+                let entry = source.zone.space_entry(mm)?;
+                let key = entry.live_notifications().ok()?.key(SpaceWaitCause::Editor);
+                if native == INJECT_FORK_EDITOR_WAITERS {
+                    return Some(u64::from(
+                        source.zone.object_queue_census(key.index())?.waiters,
+                    ));
+                }
+                let access = carrick_core::wait::space_access(
+                    source.zone,
+                    slot,
+                    crate::native_process::release,
+                );
+                let editor = access.try_begin_edit(
+                    entry.index(),
+                    mm.get(),
+                    core::num::NonZeroU64::new(u64::from(slot.raw()) + 1)?,
+                )?;
+                FORK_PREPARE_HOLD
+                    .compare_exchange(
+                        BIRTH_HELD,
+                        BIRTH_RELEASED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .ok()?;
+                for _ in 0..BIRTH_HOLD_SPINS {
+                    if FORK_EDITOR_PROGRESS.load(Ordering::Acquire)
+                        && source.zone.object_queue_census(key.index())?.waiters
+                            == carrick_el1::isa::x86::context::native::CPL0_CPU_COUNT as u32
+                    {
+                        drop(editor);
+                        return Some(0);
+                    }
+                    core::hint::spin_loop();
+                }
+                carrick_x86_carrier::entry::fatal_boot()
+            }
+            INJECT_FORK_EDITOR_PROGRESS => {
+                FORK_EDITOR_PROGRESS.store(true, Ordering::Release);
+                Some(0)
+            }
             INJECT_FORK_SUPERSEDED_CENSUS => Some(FORK_SUPERSEDED.load(Ordering::Acquire)),
             INJECT_FORK_LOAN_INVENTORY_ONCE | INJECT_FORK_LOAN_STALE_ONCE => {
                 let armed = if native == INJECT_FORK_LOAN_INVENTORY_ONCE {
