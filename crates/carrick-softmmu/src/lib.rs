@@ -54,8 +54,9 @@ pub use domains::{
     translate_leaf_hardware,
 };
 pub use placement::{
-    HostVa, LAPIC_MMIO_BASE_GPA, LAPIC_MMIO_SIZE_BYTES, LinearPlacement, MAX_MMIO_HOLES, MmioHole,
-    MmioHoles, PlacementError, PlacementGpa, X86HostPage4K,
+    HostVa, LAPIC_MMIO_BASE_GPA, LAPIC_MMIO_SIZE_BYTES, LinearPlacement, MAX_MMIO_HOLES,
+    MAX_PLACEMENT_SEGMENTS, MmioHole, MmioHoles, PlacementError, PlacementGpa, PlacementSegment,
+    X86HostPage4K,
 };
 pub use retirement::{
     InventoryTerminal, LookupAdmission, PendingRetirement, RetirementWaitError, RunningSeat,

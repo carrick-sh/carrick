@@ -189,14 +189,56 @@ pub enum PlacementError {
     AddressOverflow {
         gpa: u64,
     },
+    /// More segments than [`MAX_PLACEMENT_SEGMENTS`].
+    TooManySegments,
+    /// A segment overlaps an earlier one at `gpa`.
+    OverlappingSegment {
+        gpa: u64,
+    },
+    /// A range starting at `gpa` crosses the end of its segment.
+    SegmentBoundary {
+        gpa: u64,
+    },
 }
 
-/// Typed linear placement (`host = gpa + K`) of guest-physical memory.
+/// Maximum number of linear segments in one [`LinearPlacement`].
+pub const MAX_PLACEMENT_SEGMENTS: usize = 64;
+
+/// One linear piece of a placement: `[base_gpa, base_gpa + len)` at
+/// `host = gpa - base_gpa + host_addr`. A carrier registers each retained
+/// allocation as its own segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacementSegment {
+    pub base_gpa: u64,
+    pub len: u64,
+    pub host_addr: usize,
+}
+
+impl PlacementSegment {
+    pub const fn new(base_gpa: u64, len: u64, host_addr: usize) -> Self {
+        Self {
+            base_gpa,
+            len,
+            host_addr,
+        }
+    }
+    const fn end_gpa(self) -> u64 {
+        self.base_gpa.saturating_add(self.len)
+    }
+    const fn contains(self, gpa: u64) -> bool {
+        gpa >= self.base_gpa && gpa < self.end_gpa()
+    }
+}
+
+/// Typed linear placement (`host = gpa + K`) of guest-physical memory, or a
+/// set of disjoint linear segments (`host = gpa + K_i`, one per slot).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LinearPlacement {
     base_host_addr: usize,
     span_bytes: u64,
     holes: MmioHoles,
+    segments: [PlacementSegment; MAX_PLACEMENT_SEGMENTS],
+    segment_count: usize,
 }
 
 impl LinearPlacement {
@@ -239,10 +281,81 @@ impl LinearPlacement {
         base_host_addr
             .checked_add(span_usize)
             .ok_or(PlacementError::AddressOverflow { gpa: span_bytes })?;
+        let mut segments = [PlacementSegment::new(0, 0, 0); MAX_PLACEMENT_SEGMENTS];
+        segments[0] = PlacementSegment::new(0, span_bytes, base_host_addr);
         Ok(Self {
             base_host_addr,
             span_bytes,
             holes,
+            segments,
+            segment_count: 1,
+        })
+    }
+
+    /// Construct a placement from disjoint linear segments, one per
+    /// registered slot. `span_bytes` is the highest segment end and
+    /// `base_host_addr` the first segment's host address.
+    ///
+    /// # Safety
+    ///
+    /// [`Self::new`]'s backing contract applies to every segment: each
+    /// `host_addr` must identify a 4096-byte-aligned host allocation covering
+    /// its `len` bytes, valid, initialized and stable for every access through
+    /// this placement, its copies and cached translations.
+    pub unsafe fn with_segments(
+        segments: &[PlacementSegment],
+        holes: MmioHoles,
+    ) -> Result<Self, PlacementError> {
+        if segments.is_empty() {
+            return Err(PlacementError::UnalignedPlacement {
+                base_host_addr: 0,
+                span_bytes: 0,
+            });
+        }
+        if segments.len() > MAX_PLACEMENT_SEGMENTS {
+            return Err(PlacementError::TooManySegments);
+        }
+        let mut table = [PlacementSegment::new(0, 0, 0); MAX_PLACEMENT_SEGMENTS];
+        let mut span_bytes = 0;
+        for (index, segment) in segments.iter().enumerate() {
+            if segment.len == 0
+                || (segment.host_addr & (PAGE_OFFSET_MASK_4K as usize)) != 0
+                || (segment.base_gpa & PAGE_OFFSET_MASK_4K) != 0
+                || (segment.len & PAGE_OFFSET_MASK_4K) != 0
+            {
+                return Err(PlacementError::UnalignedPlacement {
+                    base_host_addr: segment.host_addr,
+                    span_bytes: segment.len,
+                });
+            }
+            let len = usize::try_from(segment.len)
+                .map_err(|_| PlacementError::AddressOverflow { gpa: segment.len })?;
+            segment
+                .host_addr
+                .checked_add(len)
+                .ok_or(PlacementError::AddressOverflow { gpa: segment.len })?;
+            let end = segment.base_gpa.checked_add(segment.len).ok_or(
+                PlacementError::AddressOverflow {
+                    gpa: segment.base_gpa,
+                },
+            )?;
+            if let Some(earlier) = table[..index]
+                .iter()
+                .find(|earlier| segment.base_gpa < earlier.end_gpa() && end > earlier.base_gpa)
+            {
+                return Err(PlacementError::OverlappingSegment {
+                    gpa: segment.base_gpa.max(earlier.base_gpa),
+                });
+            }
+            table[index] = *segment;
+            span_bytes = span_bytes.max(end);
+        }
+        Ok(Self {
+            base_host_addr: segments[0].host_addr,
+            span_bytes,
+            holes,
+            segments: table,
+            segment_count: segments.len(),
         })
     }
     /// Construct a placement with the default x86 MMIO holes.
@@ -288,13 +401,25 @@ impl LinearPlacement {
                 span_bytes: self.span_bytes,
             });
         }
-        let offset =
-            usize::try_from(raw).map_err(|_| PlacementError::AddressOverflow { gpa: raw })?;
-        let addr = self
-            .base_host_addr
+        let segment = self.segment(raw)?;
+        let offset = usize::try_from(raw - segment.base_gpa)
+            .map_err(|_| PlacementError::AddressOverflow { gpa: raw })?;
+        let addr = segment
+            .host_addr
             .checked_add(offset)
             .ok_or(PlacementError::AddressOverflow { gpa: raw })?;
         Ok(HostVa::new(addr))
+    }
+
+    fn segment(&self, gpa: u64) -> Result<PlacementSegment, PlacementError> {
+        self.segments[..self.segment_count]
+            .iter()
+            .copied()
+            .find(|segment| segment.contains(gpa))
+            .ok_or(PlacementError::OutOfBounds {
+                gpa,
+                span_bytes: self.span_bytes,
+            })
     }
 
     /// Validate a contiguous `[frame_gpa, frame_gpa + len)` byte extent and return its starting [`HostVa`].
@@ -320,6 +445,10 @@ impl LinearPlacement {
         if self.holes.overlaps_range(raw, len_u64) {
             return Err(PlacementError::MmioHole { gpa: raw });
         }
-        self.host(frame_gpa)
+        let host = self.host(frame_gpa)?;
+        if end > self.segment(raw)?.end_gpa() {
+            return Err(PlacementError::SegmentBoundary { gpa: raw });
+        }
+        Ok(host)
     }
 }
