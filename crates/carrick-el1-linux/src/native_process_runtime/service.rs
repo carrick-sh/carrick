@@ -945,6 +945,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 | NativeProcessError::Stale
                 | NativeProcessError::Quarantined,
             ) => return result,
+            Err(NativeProcessError::ServiceQuarantined(_)) => return result,
             // The wrapper was decoded above; another wrapper is a codec invariant.
             Err(NativeProcessError::ForkRefused(_)) => return Err(NativeProcessError::Invalid),
             Err(
@@ -971,7 +972,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // deferred preparation is not failed execution authentication.
             let result = self.yield_service_checkpoint()?;
             self.take_handoff_receipt()
-                .ok_or(NativeProcessError::Quarantined)?;
+                .ok_or(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::HandoffAuthentication,
+                ))?;
             return Ok(result);
         }
         Ok(result)
@@ -1737,7 +1740,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<NativeResume, NativeProcessError> {
         let result = result?;
         if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::HandoffAuthentication,
+            ));
         }
         Ok(result)
     }
@@ -2109,7 +2114,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         {
                             NativeProcessError::Busy
                         } else {
-                            NativeProcessError::Quarantined
+                            NativeProcessError::ServiceQuarantined(
+                                NativeServiceQuarantine::MemberWaitInstalled,
+                            )
                         },
                     );
                 }
@@ -2224,8 +2231,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             })
             .transpose()?;
         // Claim acquisition refuses only on counter overflow, not contention.
-        let claim = carrick_core::terminal::NativeServiceClaim::acquire(page)
-            .map_err(|_| NativeProcessError::Quarantined)?;
+        let claim = carrick_core::terminal::NativeServiceClaim::acquire(page).map_err(|_| {
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ClaimOverflow)
+        })?;
         self.service_phase = NativeServicePhase::Publication;
         let mut closing = false;
         let published = {
@@ -2234,7 +2242,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // Close publishes its gate and pending operation under this
                 // lock. A terminal gate without that owner is broken custody.
                 closing = graph.pending.has_exit(&self.key);
-                Err(NativeProcessError::Quarantined)
+                Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::ClosedGateNoExitRow,
+                ))
             } else if graph.has_member_wait(&self.record) {
                 Err(
                     if adapter
@@ -2243,7 +2253,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     {
                         NativeProcessError::Busy
                     } else {
-                        NativeProcessError::Quarantined
+                        NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::MemberWaitInstalled,
+                        )
                     },
                 )
             } else if let Some(wait) = owner_wait {
@@ -2366,7 +2378,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
                     crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
                 })
-                .map_err(|_| NativeProcessError::Quarantined)?;
+                .map_err(|_| {
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::DuplicateNoticeQueue,
+                    )
+                })?;
             // SAFETY: notice publication failed, so no transport can hold
             // this identity. The queue also excludes concurrent cancellation.
             unsafe { self.control.service.abort_unpublished(request.identity) }
@@ -2382,7 +2398,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .graph
                     .lock()
                     .remove_service_wait(&self.record)
-                    .ok_or(NativeProcessError::Quarantined)?;
+                    .ok_or(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::DuplicateNoticeCleanup,
+                    ))?;
                 self.release_service_claim(pending.claim)?;
                 return Err(error.into());
             }
@@ -2403,19 +2421,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<NativeResume, NativeProcessError> {
         match self
             .resume_service()
-            .ok_or(NativeProcessError::Quarantined)??
-        {
+            .ok_or(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::RetainedServiceMissing,
+            ))?? {
             NativeResume::NoPending => {}
             deferred @ NativeResume::Left(_) => return Ok(deferred),
-            _ => return Err(NativeProcessError::Quarantined),
+            _ => {
+                return Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::RetainedServiceUnexpectedResume,
+                ));
+            }
         }
-        let outcome = self
-            .resume_pending_lifecycle()
-            .ok_or(NativeProcessError::Quarantined)?;
+        let outcome =
+            self.resume_pending_lifecycle()
+                .ok_or(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::RetainedLifecycleMissing,
+                ))?;
         match outcome {
             LifecycleOutcome::HostCustody => {
                 if !self.yield_terminal_host_custody() {
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::RetainedHostCustody,
+                    ));
                 }
                 Ok(NativeResume::Left(None))
             }
@@ -2423,7 +2450,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 progress: carrick_core::Served::Idle,
                 ..
             } if self.handoff.is_some() => Ok(NativeResume::Left(self.take_root_exit())),
-            _ => Err(NativeProcessError::Quarantined),
+            _ => Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::RetainedLifecycleOutcome,
+            )),
         }
     }
 
@@ -2445,7 +2474,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.source.slot,
                 self.source.zone.record(self.record.id).identity(),
             )
-            .map_err(|_| NativeProcessError::Quarantined)?
+            .map_err(|_| {
+                NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::AdapterOperationTake,
+                )
+            })?
             .ok_or(NativeProcessError::Stale)?;
             Ok(token)
         } else {
@@ -2468,7 +2501,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.source.zone.record(self.record.id).identity(),
                 operation,
             )
-            .map_err(|_| NativeProcessError::Quarantined)?;
+            .map_err(|_| {
+                NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::AdapterOperationRestore,
+                )
+            })?;
         }
         Ok(())
     }
@@ -2488,7 +2525,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // These queues are bound as guest-owned queues at birth. A host
         // continuation domain may not take over a native member's operation.
         if zone.completion_enabled(key) {
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::HostCompletionQueue,
+            ));
         }
         let adapter = self.has_adapter_operation();
         let token = self.take_preparation_operation(request)?;
@@ -2608,7 +2647,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return Ok(self.yield_service_checkpoint_as(entry)?);
                 }
                 if error != ObjectWaitError::Changed && failure.is_none() {
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ParkRefused,
+                    ));
                 }
                 None
             }
@@ -2629,7 +2670,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 ),
             };
         }
-        let mut parked = parked.ok_or(NativeProcessError::Quarantined)?;
+        let mut parked = parked.ok_or(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::ParkResultMissing,
+        ))?;
         self.handoff = parked.take_receipt();
         Ok(NativeResume::Left(None))
     }
@@ -2643,7 +2686,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.source.zone.record(self.record.id).identity(),
             operation,
         )
-        .map_err(|_| NativeProcessError::Quarantined)
+        .map_err(|_| {
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::RetainOperation)
+        })
     }
 
     /// Whether a host requester holds this lane's exact running record: its
@@ -2718,7 +2763,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .zone
                     .requeue_preempted(self.source.slot, self.record.id);
                 if !requeue.is_queued() {
-                    return Err(NativeFailure::Quarantined);
+                    return Err(NativeFailure::ServiceQuarantined(
+                        NativeServiceQuarantine::RequeueRefused,
+                    ));
                 }
                 self.source.zone.clear_current(self.source.slot);
                 self.yield_receipt_race();
@@ -2730,14 +2777,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     &carrick_sched_core::ShortLockSpin,
                 );
                 if release != carrick_sched_core::CurrentRelease::Requeued {
-                    return Err(NativeFailure::Quarantined);
+                    return Err(NativeFailure::ServiceQuarantined(
+                        NativeServiceQuarantine::ReleaseRefused,
+                    ));
                 }
                 // From here the queued record may already be the host's (#1467):
                 // the requeue itself, not a later claim read, is the publication.
                 self.yield_receipt_race();
                 carrick_core::entry::publish_handoff_yield(start, release)
             };
-        self.handoff = Some(receipt.ok_or(NativeFailure::Quarantined)?);
+        self.handoff = Some(receipt.ok_or(NativeFailure::ServiceQuarantined(
+            NativeServiceQuarantine::HandoffReceipt,
+        ))?);
         Ok(NativeResume::Left(None))
     }
 

@@ -306,6 +306,36 @@ pub(crate) fn native_entry_owned(
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
 )]
+pub enum NativeServiceQuarantine {
+    HandoffAuthentication,
+    MemberWaitInstalled,
+    ClaimOverflow,
+    ClosedGateNoExitRow,
+    DuplicateNoticeQueue,
+    DuplicateNoticeCleanup,
+    RetainedServiceMissing,
+    RetainedServiceUnexpectedResume,
+    RetainedLifecycleMissing,
+    RetainedHostCustody,
+    RetainedLifecycleOutcome,
+    AdapterOperationTake,
+    AdapterOperationRestore,
+    HostCompletionQueue,
+    ParkRefused,
+    ParkResultMissing,
+    RetainOperation,
+    RequeueRefused,
+    ReleaseRefused,
+    HandoffReceipt,
+}
+
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum NativeProcessError {
     Invalid,
     Stale,
@@ -317,6 +347,7 @@ pub enum NativeProcessError {
     GroupExitCustody,
     Busy,
     Quarantined,
+    ServiceQuarantined(NativeServiceQuarantine),
     NoChild,
 }
 impl NativeProcessError {
@@ -352,6 +383,7 @@ impl NativeProcessError {
             Self::Unsupported => Ok(NativeFailure::Unsupported),
             Self::GroupExitCustody => Ok(NativeFailure::GroupExitCustody),
             Self::Quarantined => Ok(NativeFailure::Quarantined),
+            Self::ServiceQuarantined(reason) => Ok(NativeFailure::ServiceQuarantined(reason)),
             Self::NoChild => Ok(NativeFailure::NoChild),
             Self::OwnerWait(wait) => Err(NativeContention {
                 owner_wait: Some(wait),
@@ -378,6 +410,7 @@ pub enum NativeFailure {
     Unsupported,
     GroupExitCustody,
     Quarantined,
+    ServiceQuarantined(NativeServiceQuarantine),
     NoChild,
 }
 impl NativeFailure {
@@ -389,7 +422,7 @@ impl NativeFailure {
             Self::Exhausted => R::NativeExhausted,
             Self::Fault => R::NativeFault,
             Self::Unsupported => R::NativeUnsupported,
-            Self::Quarantined => R::NativeQuarantined,
+            Self::Quarantined | Self::ServiceQuarantined(_) => R::NativeQuarantined,
             Self::NoChild => R::NativeNoChild,
             Self::GroupExitCustody => R::X86GroupExitCustody,
         }
@@ -400,7 +433,7 @@ impl NativeFailure {
             Self::Exhausted => -11,
             Self::Fault => -14,
             Self::Unsupported | Self::GroupExitCustody => -38,
-            Self::Quarantined => -5,
+            Self::Quarantined | Self::ServiceQuarantined(_) => -5,
             Self::NoChild => -10,
         }
     }
@@ -415,6 +448,7 @@ impl From<NativeFailure> for NativeProcessError {
             NativeFailure::Unsupported => Self::Unsupported,
             NativeFailure::GroupExitCustody => Self::GroupExitCustody,
             NativeFailure::Quarantined => Self::Quarantined,
+            NativeFailure::ServiceQuarantined(reason) => Self::ServiceQuarantined(reason),
             NativeFailure::NoChild => Self::NoChild,
         }
     }

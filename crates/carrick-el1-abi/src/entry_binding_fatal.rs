@@ -78,6 +78,26 @@ pub enum EntryBindingFatalReason {
     /// no host route (a ring-owned fork child): its forward has no server,
     /// and a counted ENOSYS would lose the call (#1941: a lost futex wake).
     OwnedFamilyForward = 62,
+    NativeServiceQuarantinedHandoffAuthentication = 63,
+    NativeServiceQuarantinedMemberWaitInstalled = 64,
+    NativeServiceQuarantinedClaimOverflow = 65,
+    NativeServiceQuarantinedClosedGateNoExitRow = 66,
+    NativeServiceQuarantinedDuplicateNoticeQueue = 67,
+    NativeServiceQuarantinedDuplicateNoticeCleanup = 68,
+    NativeServiceQuarantinedRetainedServiceMissing = 69,
+    NativeServiceQuarantinedRetainedServiceUnexpectedResume = 70,
+    NativeServiceQuarantinedRetainedLifecycleMissing = 71,
+    NativeServiceQuarantinedRetainedHostCustody = 72,
+    NativeServiceQuarantinedRetainedLifecycleOutcome = 73,
+    NativeServiceQuarantinedAdapterOperationTake = 74,
+    NativeServiceQuarantinedAdapterOperationRestore = 75,
+    NativeServiceQuarantinedHostCompletionQueue = 76,
+    NativeServiceQuarantinedParkRefused = 77,
+    NativeServiceQuarantinedParkResultMissing = 78,
+    NativeServiceQuarantinedRetainOperation = 79,
+    NativeServiceQuarantinedRequeueRefused = 80,
+    NativeServiceQuarantinedReleaseRefused = 81,
+    NativeServiceQuarantinedHandoffReceipt = 82,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -133,6 +153,26 @@ impl EntryBindingFatalReason {
             60 => Some(Self::SwitchInStaleRoot),
             61 => Some(Self::RequeueRefused),
             62 => Some(Self::OwnedFamilyForward),
+            63 => Some(Self::NativeServiceQuarantinedHandoffAuthentication),
+            64 => Some(Self::NativeServiceQuarantinedMemberWaitInstalled),
+            65 => Some(Self::NativeServiceQuarantinedClaimOverflow),
+            66 => Some(Self::NativeServiceQuarantinedClosedGateNoExitRow),
+            67 => Some(Self::NativeServiceQuarantinedDuplicateNoticeQueue),
+            68 => Some(Self::NativeServiceQuarantinedDuplicateNoticeCleanup),
+            69 => Some(Self::NativeServiceQuarantinedRetainedServiceMissing),
+            70 => Some(Self::NativeServiceQuarantinedRetainedServiceUnexpectedResume),
+            71 => Some(Self::NativeServiceQuarantinedRetainedLifecycleMissing),
+            72 => Some(Self::NativeServiceQuarantinedRetainedHostCustody),
+            73 => Some(Self::NativeServiceQuarantinedRetainedLifecycleOutcome),
+            74 => Some(Self::NativeServiceQuarantinedAdapterOperationTake),
+            75 => Some(Self::NativeServiceQuarantinedAdapterOperationRestore),
+            76 => Some(Self::NativeServiceQuarantinedHostCompletionQueue),
+            77 => Some(Self::NativeServiceQuarantinedParkRefused),
+            78 => Some(Self::NativeServiceQuarantinedParkResultMissing),
+            79 => Some(Self::NativeServiceQuarantinedRetainOperation),
+            80 => Some(Self::NativeServiceQuarantinedRequeueRefused),
+            81 => Some(Self::NativeServiceQuarantinedReleaseRefused),
+            82 => Some(Self::NativeServiceQuarantinedHandoffReceipt),
 
             _ => None,
         }
@@ -456,7 +496,7 @@ mod tests {
 
     #[test]
     fn fatal_detail_round_trip_and_formatter() {
-        for raw in (1..=48).chain(60..=61) {
+        for raw in (1..=48).chain(60..=82) {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
             for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
                 let detail = EntryBindingFatalDetail {
