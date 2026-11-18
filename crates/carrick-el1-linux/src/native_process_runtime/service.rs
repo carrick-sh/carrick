@@ -29,7 +29,7 @@ pub(super) fn bind_member_service<C: ProcessContext>(
             record,
             mm,
         })
-        .map_err(service_protocol_error)
+        .map_err(|error| service_protocol_error(error, NativeServiceQuarantine::ServiceBindBusy))
 }
 
 fn bind_member_service_queue<C: ProcessContext>(
@@ -649,10 +649,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         {
             return Ok(());
         }
-        control
-            .service
-            .cancel(request.identity)
-            .map_err(service_protocol_error)?;
+        control.service.cancel(request.identity).map_err(|error| {
+            service_protocol_error(error, NativeServiceQuarantine::ServiceCancelBusy)
+        })?;
         let wait = self
             .graph
             .lock()
@@ -1027,7 +1026,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceCompletion::OwnerCheckpoint,
         )?;
         if matches!(outcome, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ReturnWorkHandoff,
+            ));
         }
         Ok(outcome)
     }
@@ -1126,13 +1127,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // lease rather than looping inside this one.
                 if !matches!(self.begin_return_work()?, NativeResume::Left(_)) {
                     let _ = self.take_pending_signal_delivery();
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::SignalReturnWork,
+                    ));
                 }
                 Ok(())
             }
             Ok(_) => {
                 let _ = self.take_pending_signal_delivery();
-                Err(NativeProcessError::Quarantined)
+                Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::SignalDeferralOutcome,
+                ))
             }
             Err(error) => {
                 let _ = self.take_pending_signal_delivery();
@@ -1156,7 +1161,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let installed = OperationToken::new(census.operation, census.operation_generation)
             .ok_or(NativeProcessError::Stale)?;
         if installed.identity() != identity {
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::AdapterOperationIdentity,
+            ));
         }
         self.begin_service_inner(
             operation,
@@ -1273,7 +1280,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 progress: carrick_core::Served::Idle,
                 result: SyscallResult::new(0),
             }),
-            _ => Err(NativeProcessError::Quarantined),
+            _ => Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ServiceOutcome,
+            )),
         }
     }
 
@@ -2201,9 +2210,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     control
                         .service
                         .bound_birth(self.key, self.binding.thread_generation, self.record)
-                        .map_err(service_protocol_error)?
+                        .map_err(|error| {
+                            service_protocol_error(
+                                error,
+                                NativeServiceQuarantine::ServiceBirthReadBusy,
+                            )
+                        })?
                 }
-                Err(error) => return Err(service_protocol_error(error).into()),
+                Err(error) => {
+                    return Err(service_protocol_error(
+                        error,
+                        NativeServiceQuarantine::ServiceBirthProbeBusy,
+                    )
+                    .into());
+                }
             };
         self.service_phase = NativeServicePhase::Unspecified;
         let exec_successor = matches!(operation, ServiceOperation::Exec { .. })
@@ -2283,7 +2303,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.control
                     .service
                     .begin_owner_wait(birth, self.binding.generation, operation, wait)
-                    .map_err(|error| service_protocol_error(error).into())
+                    .map_err(|error| {
+                        service_protocol_error(error, NativeServiceQuarantine::OwnerWaitPublishBusy)
+                            .into()
+                    })
             } else {
                 self.control
                     .service
@@ -2294,7 +2317,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         fault_sequence,
                         reply.as_ref().map(PendingServiceReply::address),
                     )
-                    .map_err(|error| service_protocol_error(error).into())
+                    .map_err(|error| {
+                        service_protocol_error(error, NativeServiceQuarantine::ServicePublishBusy)
+                            .into()
+                    })
             }
         };
         let request = match published {
@@ -2389,7 +2415,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .current
             .service_notice
             .publish(request.identity.into())
-            .map_err(service_protocol_error)
+            .map_err(|error| {
+                service_protocol_error(error, NativeServiceQuarantine::NoticePublishBusy)
+            })
         {
             let key =
                 ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
@@ -2406,13 +2434,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 })?;
             // SAFETY: notice publication failed, so no transport can hold
             // this identity. The queue also excludes concurrent cancellation.
-            unsafe { self.control.service.abort_unpublished(request.identity) }
-                .map_err(service_protocol_error)?;
+            unsafe { self.control.service.abort_unpublished(request.identity) }.map_err(
+                |error| service_protocol_error(error, NativeServiceQuarantine::NoticeAbortBusy),
+            )?;
             {
                 self.control
                     .service
                     .consume(request.identity)
-                    .map_err(service_protocol_error)?;
+                    .map_err(|error| {
+                        service_protocol_error(error, NativeServiceQuarantine::NoticeConsumeBusy)
+                    })?;
                 drop(guard);
                 let pending = self
                     .runtime
@@ -2602,7 +2633,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     || self.runtime.graph.lock().pending.has_exit(&self.key))
                     && let Err(error) = self.control.service.cancel(request.identity)
                 {
-                    failure = Some(service_protocol_error(error));
+                    failure = Some(service_protocol_error(
+                        error,
+                        NativeServiceQuarantine::ParkCancelBusy,
+                    ));
                     return Err(ObjectWaitError::Stale);
                 }
                 if defer_completion {
@@ -2613,7 +2647,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         }
                         Ok(false) | Err(ServiceError::Busy) => {}
                         Err(error) => {
-                            failure = Some(service_protocol_error(error));
+                            failure = Some(service_protocol_error(
+                                error,
+                                NativeServiceQuarantine::ParkReadyBusy,
+                            ));
                             return Err(ObjectWaitError::Stale);
                         }
                     }
@@ -2636,7 +2673,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         }
                         Err(ServiceError::Busy) => {}
                         Err(error) => {
-                            failure = Some(service_protocol_error(error));
+                            failure = Some(service_protocol_error(
+                                error,
+                                NativeServiceQuarantine::ParkConsumeBusy,
+                            ));
                             return Err(ObjectWaitError::Stale);
                         }
                     }
@@ -2969,7 +3009,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             Err((_, operation)) => {
                 self.restore_preparation_operation(operation)?;
-                Err(NativeProcessError::Quarantined)
+                Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::OwnerWaitParkRefused,
+                ))
             }
         }
     }
@@ -2989,7 +3031,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .control
             .service
             .finish_owner_wait(request.identity)
-            .map_err(service_protocol_error)?;
+            .map_err(|error| {
+                service_protocol_error(error, NativeServiceQuarantine::OwnerWaitFinishBusy)
+            })?;
         // Remove the phase under the service queue before cancellation observes IDLE.
         let pending = self
             .runtime
@@ -3436,7 +3480,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             match result {
                 Ok(prepared) => prepared,
-                Err(_) => return Err(NativeProcessError::Quarantined),
+                Err(_) => {
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ExecAdoption,
+                    ));
+                }
             }
         };
         let Some(successor_slot) = pending.exec_successor.as_ref() else {
@@ -3539,9 +3587,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .slot(self.source.slot)
             .current()
             .or_else(|| zone.slot(self.source.slot).host_record())
-            .ok_or(NativeProcessError::Quarantined)?;
-        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
-            .ok_or(NativeProcessError::Quarantined)?;
+            .ok_or(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::WaitRecordMissing,
+            ))?;
+        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record).ok_or(
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::WaitHandoffStart),
+        )?;
         let address = WaitChannel::address(channel);
         let guard = zone.short_lock(
             ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
@@ -3571,7 +3622,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         let sequence = zone.next_seq(record);
         zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
-            .map_err(|_| NativeProcessError::Quarantined)?;
+            .map_err(|_| {
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::WaitEnqueue)
+            })?;
         // SAFETY: this entry still owns the current record through the guarded
         // park publication.
         unsafe {
@@ -3584,7 +3637,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             &guard,
             carrick_el1_abi::EntryRecordGeneration(sequence),
         )
-        .ok_or(NativeProcessError::Quarantined)?;
+        .ok_or(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::WaitHandoffReceipt,
+        ))?;
         drop(guard);
         zone.clear_current(self.source.slot);
         self.handoff = Some(receipt);
@@ -3656,7 +3711,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.source.slot,
             self.source.zone.record(self.record.id).identity(),
         )
-        .map_err(|_| NativeProcessError::Quarantined)?
+        .map_err(|_| {
+            NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::AdapterResultOperationTake,
+            )
+        })?
         .ok_or(NativeProcessError::Stale)?;
         let (region, _) = self
             .service
@@ -3710,7 +3769,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<NativeResume, NativeProcessError> {
         self.service_phase = NativeServicePhase::Completion;
         if pending.request != *request {
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::CompletionRequestMismatch,
+            ));
         }
         let retry_syscall_after_supply = pending.retry_syscall_after_supply;
         let exiting = self.runtime.graph.lock().pending.has_exit(&self.key)
@@ -3731,7 +3792,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     let next = self.prepare_fault_repark(request, pending, wait)?;
                     return self.park_owner_wait(&next, wait);
                 }
-                Err(_) => return Err(NativeProcessError::Quarantined),
+                Err(_) => {
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::FaultReplyCancellation,
+                    ));
+                }
             }
         }
         if pending.fault_reply_cancelling {
@@ -3846,7 +3911,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 request.operation,
                 wait,
             )
-            .map_err(service_protocol_error)?;
+            .map_err(|error| {
+                service_protocol_error(error, NativeServiceQuarantine::WaitCompletionBusy)
+            })?;
         pending.request = next;
         pending.wait = Some(wait);
         self.runtime
@@ -4030,7 +4097,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     if result != ServiceResult::Cancelled {
                         self.retain_thread_stock_reply(
                             carrick_core_abi::service::CarrierWorkReply::for_result(demand, result)
-                                .ok_or(NativeProcessError::Quarantined)?,
+                                .ok_or(NativeProcessError::ServiceQuarantined(
+                                    NativeServiceQuarantine::ThreadStockReply,
+                                ))?,
                         );
                     }
                     return Ok(NativeResume::RetrySyscall);
@@ -4047,7 +4116,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
                     ))),
                     ServiceResult::Wait(_) | ServiceResult::ExecPrepared(_) => {
-                        Err(NativeProcessError::Quarantined)
+                        Err(NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::RelativeFutexReply,
+                        ))
                     }
                 };
             }
@@ -4057,9 +4128,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .clock_sample
                         .take()
                         .ok_or(NativeProcessError::Stale)?;
-                    match carrick_core_abi::clock::parse_reply(&*sample.record)
-                        .map_err(|_| NativeProcessError::Quarantined)?
-                    {
+                    match carrick_core_abi::clock::parse_reply(&*sample.record).map_err(|_| {
+                        NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::ClockReplyDecode,
+                        )
+                    })? {
                         carrick_core_abi::clock::ClockReply::Sample(Ok((seconds, nanos))) => {
                             let mut bytes = Vec::with_capacity(16);
                             bytes.extend_from_slice(&seconds.to_le_bytes());
@@ -4081,12 +4154,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 errno.raw().get(),
                             ))))
                         }
-                        _ => Err(NativeProcessError::Quarantined),
+                        _ => Err(NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::ClockReplyVariant,
+                        )),
                     }
                 }
                 // An admitted resource may not disappear or produce an unrelated reply.
-                (ServiceOperation::Clock { .. }, _) => Err(NativeProcessError::Quarantined),
-                (_, ServiceResult::Wait(_)) => Err(NativeProcessError::Quarantined),
+                (ServiceOperation::Clock { .. }, _) => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::ClockOperationResult,
+                )),
+                (_, ServiceResult::Wait(_)) => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::UnexpectedWaitResult,
+                )),
                 (
                     ServiceOperation::CarrierWork { .. },
                     ServiceResult::Supplied | ServiceResult::Cancelled,
@@ -4103,15 +4182,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             // No scheduling scalar can complete this operation.
                             Ok(NativeResume::NoPending)
                         }
-                        _ => Err(NativeProcessError::Quarantined),
+                        _ => Err(NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::CarrierContinuation,
+                        )),
                     }
                 }
                 (ServiceOperation::CarrierWork { .. }, ServiceResult::Refused) => {
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::CarrierWorkRefused,
+                    ))
                 }
                 (ServiceOperation::Entropy { .. }, ServiceResult::Supplied) => {
                     // Supplied requires a valid reply in the retained entropy record.
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::EntropyReplyMissing,
+                    ))
                 }
                 (ServiceOperation::Entropy { .. }, ServiceResult::Cancelled) => {
                     Ok(NativeResume::Returned(SyscallResult::from_errno(
@@ -4148,11 +4233,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .map_err(|_| NativeProcessError::Fault)?;
                     Ok(NativeResume::NoPending)
                 }
-                (_, ServiceResult::BackingFault) => Err(NativeProcessError::Quarantined),
+                (_, ServiceResult::BackingFault) => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::UnexpectedBackingFault,
+                )),
                 (ServiceOperation::Exec { .. }, ServiceResult::Failed(failure)) => Ok(
                     NativeResume::Returned(SyscallResult::new(-i64::from(failure.raw()))),
                 ),
-                (_, ServiceResult::Failed(_)) => Err(NativeProcessError::Quarantined),
+                (_, ServiceResult::Failed(_)) => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::UnexpectedFailureResult,
+                )),
                 (ServiceOperation::Fault(fault), ServiceResult::Refused) => {
                     self.force_sigsegv_info(
                         carrick_signal_core::policy::SigBlockMask::blocking_all_of(
@@ -4195,7 +4284,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 (ServiceOperation::Crossing { .. }, ServiceResult::Supplied) => {
                     // No generic host syscall dispatcher owns native semantics.
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::CrossingSupplied,
+                    ))
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Supplied)
                 | (ServiceOperation::HostFile { .. }, ServiceResult::Cancelled)
@@ -4262,7 +4353,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Supplied) => {
                     // Supplied without a reply is a transport violation.
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::HostFileReplyMissing,
+                    ))
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Refused) => {
                     // The venue does not serve this exact request: counted
@@ -4279,17 +4372,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     Ok(NativeResume::RetrySyscall)
                 }
                 (ServiceOperation::Exception(_), ServiceResult::Supplied) => {
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ExceptionSupplied,
+                    ))
                 }
                 (ServiceOperation::Exec { .. }, ServiceResult::Supplied) => {
                     // The successor adoption route consumes successful preparation
                     // before this ordinary syscall-return mapping is reachable.
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ExecSupplied,
+                    ))
                 }
                 (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(_)) => {
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ExecPreparedConsumed,
+                    ))
                 }
-                (_, ServiceResult::ExecPrepared(_)) => Err(NativeProcessError::Quarantined),
+                (_, ServiceResult::ExecPrepared(_)) => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::UnexpectedExecPrepared,
+                )),
                 (ServiceOperation::Exec { .. }, ServiceResult::Refused) => {
                     Ok(NativeResume::Returned(SyscallResult::new(
                         carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
@@ -4297,7 +4398,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 (ServiceOperation::Exec { .. }, ServiceResult::Cancelled) => {
                     // Cancelled execs retire above before an old-image return.
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ExecCancelled,
+                    ))
                 }
             }
         })();
@@ -4329,7 +4432,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     progress: carrick_core::Served::Idle,
                     ..
                 }) => Ok(NativeResume::Left(None)),
-                _ => Err(NativeProcessError::Quarantined),
+                _ => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::CompletionLifecycleOutcome,
+                )),
             };
         }
         completed
@@ -4343,14 +4448,17 @@ fn entropy_copy_fault(committed: usize) -> NativeResume {
     })
 }
 
-pub(super) fn service_protocol_error(error: ServiceError) -> NativeFailure {
+pub(super) fn service_protocol_error(
+    error: ServiceError,
+    busy: NativeServiceQuarantine,
+) -> NativeFailure {
     match error {
         // All callers either own the exact executing member before transport
         // publication, or hold its native-service queue. The transport takes
         // that same queue for claim and acknowledgment. Expected not-ready
         // consumption is handled before this mapper; a failed transition here
         // means duplicate/mismatched custody, not a releasable resource.
-        ServiceError::Busy => NativeFailure::Quarantined,
+        ServiceError::Busy => NativeFailure::ServiceQuarantined(busy),
         ServiceError::Stale => NativeFailure::Stale,
         ServiceError::Exhausted => NativeFailure::Exhausted,
     }

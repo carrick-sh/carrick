@@ -328,6 +328,66 @@ pub enum NativeServiceQuarantine {
     RequeueRefused,
     ReleaseRefused,
     HandoffReceipt,
+    ExecPayloadOwnerWait,
+    HostFileOwnerWait,
+    RetryExecStageOperation,
+    MissingOperation,
+    IpcOperationToken,
+    IpcOperationBinding,
+    IpcOperationUnpin,
+    IpcOperationRelease,
+    IpcProgressOverflow,
+    ClosingStatusMissing,
+    ClosingHostCustody,
+    ClosingLifecycleOutcome,
+    ServiceBindBusy,
+    ServiceCancelBusy,
+    ServiceBirthReadBusy,
+    ServiceBirthProbeBusy,
+    OwnerWaitPublishBusy,
+    ServicePublishBusy,
+    NoticePublishBusy,
+    NoticeAbortBusy,
+    NoticeConsumeBusy,
+    ParkCancelBusy,
+    ParkReadyBusy,
+    ParkConsumeBusy,
+    OwnerWaitFinishBusy,
+    WaitCompletionBusy,
+    ServiceRecordRebindBusy,
+    ReturnWorkHandoff,
+    SignalReturnWork,
+    SignalDeferralOutcome,
+    AdapterOperationIdentity,
+    ServiceOutcome,
+    OwnerWaitParkRefused,
+    ExecAdoption,
+    WaitRecordMissing,
+    WaitHandoffStart,
+    WaitEnqueue,
+    WaitHandoffReceipt,
+    AdapterResultOperationTake,
+    CompletionRequestMismatch,
+    FaultReplyCancellation,
+    ThreadStockReply,
+    RelativeFutexReply,
+    ClockReplyDecode,
+    ClockReplyVariant,
+    ClockOperationResult,
+    UnexpectedWaitResult,
+    CarrierContinuation,
+    CarrierWorkRefused,
+    EntropyReplyMissing,
+    UnexpectedBackingFault,
+    UnexpectedFailureResult,
+    CrossingSupplied,
+    HostFileReplyMissing,
+    ExceptionSupplied,
+    ExecSupplied,
+    ExecPreparedConsumed,
+    UnexpectedExecPrepared,
+    ExecCancelled,
+    CompletionLifecycleOutcome,
 }
 
 #[derive(
@@ -2485,7 +2545,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             control
                 .service
                 .prepare_record_rebind(process, binding.thread_generation, old_record, reference)
-                .map_err(service::service_protocol_error)?
+                .map_err(|error| {
+                    service::service_protocol_error(
+                        error,
+                        NativeServiceQuarantine::ServiceRecordRebindBusy,
+                    )
+                })?
         } else {
             None
         };
@@ -7226,13 +7291,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub(super) fn retire_closing_entry(&mut self) -> Result<NativeResume, NativeProcessError> {
         let status = self
             .pending_close_status()
-            .ok_or(NativeProcessError::Quarantined)?;
+            .ok_or(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ClosingStatusMissing,
+            ))?;
         let outcome = self.retire_closing_member(status)?;
         match outcome {
             LifecycleOutcome::HostCustody => {
                 // An adopted host member retires on its exact host owner.
                 if !self.yield_terminal_host_custody() {
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ClosingHostCustody,
+                    ));
                 }
                 Ok(NativeResume::Left(None))
             }
@@ -7240,7 +7309,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 progress: carrick_core::Served::Idle,
                 ..
             } if self.handoff.is_some() => Ok(NativeResume::Left(self.take_root_exit())),
-            _ => Err(NativeProcessError::Quarantined),
+            _ => Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ClosingLifecycleOutcome,
+            )),
         }
     }
 

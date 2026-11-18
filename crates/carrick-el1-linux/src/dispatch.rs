@@ -1635,51 +1635,58 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
     } else {
         super::native_process_runtime::NativeServiceExit::Bridge
     };
-    let result = if let Some(payload) = exec_payload {
-        if service_wait.is_some() {
-            Err(super::native_process_runtime::NativeProcessError::Quarantined)
-        } else {
-            // The exec service resolves a descriptor `execveat`
-            // names in the caller's own ring table (#1530), read
-            // through the stable owned-table authority: an unrelated
-            // table-map update must not read as "no table" (ENOSYS).
-            let table = exec_table();
-            process.begin_exec_service(
-                payload,
-                table,
-                crate::native_process_runtime::NativeServiceCall::new(
-                    carrick_guest_arch::NativeOrdinal::new(ordinal),
-                    counters,
-                ),
-            )
-        }
-    } else if let Some((address, capacity, flags, requested)) = entropy {
-        process.begin_entropy_service(address, capacity, flags, requested)
-    } else if let Some(staged) = host_file {
-        if service_wait.is_some() {
-            Err(super::native_process_runtime::NativeProcessError::Quarantined)
-        } else {
-            let StagedHostFile {
-                record,
-                output,
-                resolves_path,
-                map,
-                chdir,
-            } = *staged;
-            process.begin_host_file_service(
-                record,
-                output,
-                resolves_path,
-                map,
-                chdir,
-                crate::native_process_runtime::NativeServiceCall::new(
-                    carrick_guest_arch::NativeOrdinal::new(ordinal),
-                    service_counters,
-                ),
-            )
-        }
-    } else if retry_exec_stage {
-        match operation {
+    let result =
+        if let Some(payload) = exec_payload {
+            if service_wait.is_some() {
+                Err(super::native_process_runtime::NativeProcessError::ServiceQuarantined(
+                super::native_process_runtime::NativeServiceQuarantine::ExecPayloadOwnerWait,
+            ))
+            } else {
+                // The exec service resolves a descriptor `execveat`
+                // names in the caller's own ring table (#1530), read
+                // through the stable owned-table authority: an unrelated
+                // table-map update must not read as "no table" (ENOSYS).
+                let table = exec_table();
+                process.begin_exec_service(
+                    payload,
+                    table,
+                    crate::native_process_runtime::NativeServiceCall::new(
+                        carrick_guest_arch::NativeOrdinal::new(ordinal),
+                        counters,
+                    ),
+                )
+            }
+        } else if let Some((address, capacity, flags, requested)) = entropy {
+            process.begin_entropy_service(address, capacity, flags, requested)
+        } else if let Some(staged) = host_file {
+            if service_wait.is_some() {
+                Err(
+                    super::native_process_runtime::NativeProcessError::ServiceQuarantined(
+                        super::native_process_runtime::NativeServiceQuarantine::HostFileOwnerWait,
+                    ),
+                )
+            } else {
+                let StagedHostFile {
+                    record,
+                    output,
+                    resolves_path,
+                    map,
+                    chdir,
+                } = *staged;
+                process.begin_host_file_service(
+                    record,
+                    output,
+                    resolves_path,
+                    map,
+                    chdir,
+                    crate::native_process_runtime::NativeServiceCall::new(
+                        carrick_guest_arch::NativeOrdinal::new(ordinal),
+                        service_counters,
+                    ),
+                )
+            }
+        } else if retry_exec_stage {
+            match operation {
             Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) => process
                 .begin_exec_stage_fault_service(
                     fault,
@@ -1696,17 +1703,23 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
                         )
                     }),
                 ),
-            _ => Err(super::native_process_runtime::NativeProcessError::Quarantined),
+            _ => Err(super::native_process_runtime::NativeProcessError::ServiceQuarantined(
+                super::native_process_runtime::NativeServiceQuarantine::RetryExecStageOperation,
+            )),
         }
-    } else if let Some(operation) = operation {
-        if let Some(wait) = service_wait {
-            process.begin_owner_service_wait(operation, wait)
+        } else if let Some(operation) = operation {
+            if let Some(wait) = service_wait {
+                process.begin_owner_service_wait(operation, wait)
+            } else {
+                process.begin_service(operation, fault_sequence)
+            }
         } else {
-            process.begin_service(operation, fault_sequence)
-        }
-    } else {
-        Err(super::native_process_runtime::NativeProcessError::Quarantined)
-    };
+            Err(
+                super::native_process_runtime::NativeProcessError::ServiceQuarantined(
+                    super::native_process_runtime::NativeServiceQuarantine::MissingOperation,
+                ),
+            )
+        };
     let result = process.settle_service_exit(result, exit);
     (result, process.native_service_phase())
 }
@@ -2987,6 +3000,92 @@ fn native_service_fatal_reason(
             Quarantine::RequeueRefused => Fatal::NativeServiceQuarantinedRequeueRefused,
             Quarantine::ReleaseRefused => Fatal::NativeServiceQuarantinedReleaseRefused,
             Quarantine::HandoffReceipt => Fatal::NativeServiceQuarantinedHandoffReceipt,
+            Quarantine::ExecPayloadOwnerWait => Fatal::NativeServiceQuarantinedExecPayloadOwnerWait,
+            Quarantine::HostFileOwnerWait => Fatal::NativeServiceQuarantinedHostFileOwnerWait,
+            Quarantine::RetryExecStageOperation => {
+                Fatal::NativeServiceQuarantinedRetryExecStageOperation
+            }
+            Quarantine::MissingOperation => Fatal::NativeServiceQuarantinedMissingOperation,
+            Quarantine::IpcOperationToken => Fatal::NativeServiceQuarantinedIpcOperationToken,
+            Quarantine::IpcOperationBinding => Fatal::NativeServiceQuarantinedIpcOperationBinding,
+            Quarantine::IpcOperationUnpin => Fatal::NativeServiceQuarantinedIpcOperationUnpin,
+            Quarantine::IpcOperationRelease => Fatal::NativeServiceQuarantinedIpcOperationRelease,
+            Quarantine::IpcProgressOverflow => Fatal::NativeServiceQuarantinedIpcProgressOverflow,
+            Quarantine::ClosingStatusMissing => Fatal::NativeServiceQuarantinedClosingStatusMissing,
+            Quarantine::ClosingHostCustody => Fatal::NativeServiceQuarantinedClosingHostCustody,
+            Quarantine::ClosingLifecycleOutcome => {
+                Fatal::NativeServiceQuarantinedClosingLifecycleOutcome
+            }
+            Quarantine::ServiceBindBusy => Fatal::NativeServiceQuarantinedServiceBindBusy,
+            Quarantine::ServiceCancelBusy => Fatal::NativeServiceQuarantinedServiceCancelBusy,
+            Quarantine::ServiceBirthReadBusy => Fatal::NativeServiceQuarantinedServiceBirthReadBusy,
+            Quarantine::ServiceBirthProbeBusy => {
+                Fatal::NativeServiceQuarantinedServiceBirthProbeBusy
+            }
+            Quarantine::OwnerWaitPublishBusy => Fatal::NativeServiceQuarantinedOwnerWaitPublishBusy,
+            Quarantine::ServicePublishBusy => Fatal::NativeServiceQuarantinedServicePublishBusy,
+            Quarantine::NoticePublishBusy => Fatal::NativeServiceQuarantinedNoticePublishBusy,
+            Quarantine::NoticeAbortBusy => Fatal::NativeServiceQuarantinedNoticeAbortBusy,
+            Quarantine::NoticeConsumeBusy => Fatal::NativeServiceQuarantinedNoticeConsumeBusy,
+            Quarantine::ParkCancelBusy => Fatal::NativeServiceQuarantinedParkCancelBusy,
+            Quarantine::ParkReadyBusy => Fatal::NativeServiceQuarantinedParkReadyBusy,
+            Quarantine::ParkConsumeBusy => Fatal::NativeServiceQuarantinedParkConsumeBusy,
+            Quarantine::OwnerWaitFinishBusy => Fatal::NativeServiceQuarantinedOwnerWaitFinishBusy,
+            Quarantine::WaitCompletionBusy => Fatal::NativeServiceQuarantinedWaitCompletionBusy,
+            Quarantine::ServiceRecordRebindBusy => {
+                Fatal::NativeServiceQuarantinedServiceRecordRebindBusy
+            }
+            Quarantine::ReturnWorkHandoff => Fatal::NativeServiceQuarantinedReturnWorkHandoff,
+            Quarantine::SignalReturnWork => Fatal::NativeServiceQuarantinedSignalReturnWork,
+            Quarantine::SignalDeferralOutcome => {
+                Fatal::NativeServiceQuarantinedSignalDeferralOutcome
+            }
+            Quarantine::AdapterOperationIdentity => {
+                Fatal::NativeServiceQuarantinedAdapterOperationIdentity
+            }
+            Quarantine::ServiceOutcome => Fatal::NativeServiceQuarantinedServiceOutcome,
+            Quarantine::OwnerWaitParkRefused => Fatal::NativeServiceQuarantinedOwnerWaitParkRefused,
+            Quarantine::ExecAdoption => Fatal::NativeServiceQuarantinedExecAdoption,
+            Quarantine::WaitRecordMissing => Fatal::NativeServiceQuarantinedWaitRecordMissing,
+            Quarantine::WaitHandoffStart => Fatal::NativeServiceQuarantinedWaitHandoffStart,
+            Quarantine::WaitEnqueue => Fatal::NativeServiceQuarantinedWaitEnqueue,
+            Quarantine::WaitHandoffReceipt => Fatal::NativeServiceQuarantinedWaitHandoffReceipt,
+            Quarantine::AdapterResultOperationTake => {
+                Fatal::NativeServiceQuarantinedAdapterResultOperationTake
+            }
+            Quarantine::CompletionRequestMismatch => {
+                Fatal::NativeServiceQuarantinedCompletionRequestMismatch
+            }
+            Quarantine::FaultReplyCancellation => {
+                Fatal::NativeServiceQuarantinedFaultReplyCancellation
+            }
+            Quarantine::ThreadStockReply => Fatal::NativeServiceQuarantinedThreadStockReply,
+            Quarantine::RelativeFutexReply => Fatal::NativeServiceQuarantinedRelativeFutexReply,
+            Quarantine::ClockReplyDecode => Fatal::NativeServiceQuarantinedClockReplyDecode,
+            Quarantine::ClockReplyVariant => Fatal::NativeServiceQuarantinedClockReplyVariant,
+            Quarantine::ClockOperationResult => Fatal::NativeServiceQuarantinedClockOperationResult,
+            Quarantine::UnexpectedWaitResult => Fatal::NativeServiceQuarantinedUnexpectedWaitResult,
+            Quarantine::CarrierContinuation => Fatal::NativeServiceQuarantinedCarrierContinuation,
+            Quarantine::CarrierWorkRefused => Fatal::NativeServiceQuarantinedCarrierWorkRefused,
+            Quarantine::EntropyReplyMissing => Fatal::NativeServiceQuarantinedEntropyReplyMissing,
+            Quarantine::UnexpectedBackingFault => {
+                Fatal::NativeServiceQuarantinedUnexpectedBackingFault
+            }
+            Quarantine::UnexpectedFailureResult => {
+                Fatal::NativeServiceQuarantinedUnexpectedFailureResult
+            }
+            Quarantine::CrossingSupplied => Fatal::NativeServiceQuarantinedCrossingSupplied,
+            Quarantine::HostFileReplyMissing => Fatal::NativeServiceQuarantinedHostFileReplyMissing,
+            Quarantine::ExceptionSupplied => Fatal::NativeServiceQuarantinedExceptionSupplied,
+            Quarantine::ExecSupplied => Fatal::NativeServiceQuarantinedExecSupplied,
+            Quarantine::ExecPreparedConsumed => Fatal::NativeServiceQuarantinedExecPreparedConsumed,
+            Quarantine::UnexpectedExecPrepared => {
+                Fatal::NativeServiceQuarantinedUnexpectedExecPrepared
+            }
+            Quarantine::ExecCancelled => Fatal::NativeServiceQuarantinedExecCancelled,
+            Quarantine::CompletionLifecycleOutcome => {
+                Fatal::NativeServiceQuarantinedCompletionLifecycleOutcome
+            }
         },
         Error::NoChild => Fatal::NativeServiceNoChild,
         Error::OwnerWait(_) => Fatal::NativeServiceOwnerWait,
