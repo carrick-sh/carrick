@@ -4168,8 +4168,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 )),
                 (
                     ServiceOperation::CarrierWork { .. },
-                    ServiceResult::Supplied | ServiceResult::Cancelled,
+                    ServiceResult::Supplied | ServiceResult::Cancelled | ServiceResult::Refused,
                 ) => {
+                    // CarrierWork is a demand captured from this lane's
+                    // already-committed boundary, not a new guest operation.
+                    // Another executor may drain the work before physical
+                    // intake, so refusal is the same bounded completion as an
+                    // empty supply: the retained continuation remains the
+                    // sole authority for the syscall result or parked owner.
                     match pending.carrier_continuation {
                         // Committed bytes/results survive readiness and cancellation.
                         Some(CarrierContinuation::Completed(result)) => {
@@ -4186,11 +4192,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             NativeServiceQuarantine::CarrierContinuation,
                         )),
                     }
-                }
-                (ServiceOperation::CarrierWork { .. }, ServiceResult::Refused) => {
-                    Err(NativeProcessError::ServiceQuarantined(
-                        NativeServiceQuarantine::CarrierWorkRefused,
-                    ))
                 }
                 (ServiceOperation::Entropy { .. }, ServiceResult::Supplied) => {
                     // Supplied requires a valid reply in the retained entropy record.
