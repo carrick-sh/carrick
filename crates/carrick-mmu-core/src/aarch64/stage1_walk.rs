@@ -539,10 +539,6 @@ impl Stage1Walker for Aarch64Walker {
             })
         };
         let regime = &context.regime;
-        // RED WITNESS STUB: no architectural walk yet.
-        if regime.tcr() != u64::MAX {
-            return Err(fault(Aarch64FaultKind::Translation, Aarch64Level::L0));
-        }
         let raw = va.raw();
         let (range, tbi) = regime.select(raw);
         let (ttbr, tnsz, disabled) = regime.range_config(range);
