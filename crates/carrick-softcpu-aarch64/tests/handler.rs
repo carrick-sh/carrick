@@ -363,6 +363,34 @@ fn waits_are_events_after_the_instruction() {
 }
 
 #[test]
+fn el0_waits_trap_under_their_own_sctlr_control() {
+    // DDI0487G.a WFxTrap and ConditionSyndrome: EC=1, IL=1,
+    // CV=1, COND=AL, TI=0 for WFI and 1 for WFE.
+    for (word, hint, enable, other_enable, esr) in [
+        (0xd503207f, Hint::Wfi, 1 << 16, 1 << 18, 0x07e0_0000),
+        (0xd503205f, Hint::Wfe, 1 << 18, 1 << 16, 0x07e0_0001),
+    ] {
+        let mut r = Rig::el0();
+        r.cpu.el1.sctlr = Sctlr(other_enable);
+        r.cpu.pstate.nzcv = 0xa;
+        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.pc(), VBAR + 0x400);
+        assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
+        assert_eq!(r.cpu.el1.esr, Syndrome(esr));
+        assert_eq!(r.cpu.el1.spsr, SavedPstate(0xa000_0000));
+
+        let mut r = Rig::el0();
+        r.cpu.el1.sctlr = Sctlr(enable);
+        assert_eq!(r.run(word), Outcome::Event(Event::Hint(hint)));
+        assert_eq!(r.pc(), PC + 4);
+
+        let mut r = Rig::el1();
+        assert_eq!(r.run(word), Outcome::Event(Event::Hint(hint)));
+        assert_eq!(r.pc(), PC + 4);
+    }
+}
+
+#[test]
 fn higher_el_tlbi_and_at_are_undefined_at_el1() {
     for word in [
         0xd50c_871f, // tlbi alle2
