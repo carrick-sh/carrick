@@ -1,6 +1,7 @@
-# Soft aarch64 translator: native copy-through (M2-0)
+# Soft aarch64 translator: native copy-through (M2-0, M2-1)
 
-Part of #1236. Status: design checkpoint for director approval. Source: the
+Part of #1236. Status: M2-0 design approved; M2-1 host adapter per the
+director's rulings (carrick-host-jit, carrick-softcpu-aarch64-host). Source: the
 Arm Architecture Reference Manual (DDI0487) only; no third-party emulator,
 decoder or JIT source was read.
 
@@ -19,15 +20,15 @@ interpreter in M2.
 | Exception entry/return (#2494) | `src/exception.rs` (`take_exception`, `eret`) | SVC/BRK/undefined/system-access handlers call these; HVC stays a `ProviderExit`. |
 | Production word enumeration | `tests/typed_el1_image.rs` (`CARRICK_A64_ELF`), `tests/loader.rs` (`CARRICK_A64_LOADER_SPANS`), `carrick debug a64-census` | Same env-gated inputs drive the splitter witness. |
 | x86 soft CPU block planning and emission | `carrick-softcpu-x86/src/cpu.rs`, `context.rs` | Model only: plan a block, emit, publish, run, exit with exact RIP. Its emitter is x86-specific and is not shared. |
-| `JitCodeBuffer` (mmap RW, copy, mprotect RX) | `carrick-softcpu-x86/src/cpu.rs:74` | Same W^X discipline. It is x86-crate private and has no I-cache publication (x86 does not need it), so arm64 needs its own allocation adapter (below). Moving it to a neutral host crate is the N2 slice. |
+| `JitCodeBuffer` (mmap RW, copy, mprotect RX) | moved whole (M2-1) to `carrick-host-jit`; `carrick-softcpu-x86` re-exports it | Both soft CPUs share it. M2-1 adds the aarch64 I-cache publication to `publish`. |
+| aarch64 I-cache helpers | `carrick-vmm-kvm/src/kvm.rs` (IC IVAU only), `carrick-aarch64/src/icache.rs` (macOS `sys_icache_invalidate`) | Not moved here: one director-filed `seam` follow-up covers both. |
 | Translation cache and budget (#616) | `carrick-softcpu-x86/src/cpu.rs:166` (`blocks: BTreeMap<BlockKey, CachedBlock>`, FIFO `block_order`, `TRANSLATION_CACHE_CAPACITY`) | **Not neutral yet.** It lives inside `SoftCpu`. This slice writes *no* cache: the dispatcher re-translates on each dispatch (see "Cache" below), so there is no second cache to retire later. |
 | Invalidation authority (#601/#684/#681) | `carrick-core/src/mm/retirement/invalidation.rs`, `carrick-softmmu/src/retirement.rs` (`SoftVcpuSeat`) | Plugs in at the cache slice; see "Self-modifying code". |
 | Soft machine seam | `carrick-vmm-soft` | Not on main (open in #2518). Host adapter placement below. |
 
 **New in this slice:** the block splitter, the A64-to-A64 emitter with
 entry/exit stubs, the exit handlers, the dispatcher over an `ExecuteBlock`
-trait, and (pending approval) the arm64 host adapter that publishes and calls a
-block.
+trait, and (M2-1) the arm64 host adapter that publishes and calls a block.
 
 ## Block model
 
@@ -133,15 +134,26 @@ edges is a later slice and needs the invalidation hooks below.
 (guest words to host words, stubs, exit tables) is safe code there and is
 unit-tested on x86.
 
-The `unsafe` is mmap RW, write, mprotect RX, I-cache publication, the frame
-region, and the call through the block's function pointer. The spec places it
-"behind the neutral host JIT adapter in carrick-vmm-soft". That crate is not on
-main (#2518 is open), so this design proposes a **new tiny crate
-`carrick-softcpu-aarch64-host`** (`#![cfg(target_arch = "aarch64")]` bodies,
-compile-checked everywhere): `HostBlockRunner` implementing
-`carrick_softcpu_aarch64::dispatch::ExecuteBlock`. Director approval is
-required; until then this PR holds only the pure pieces. When the neutral
-adapter lands in `carrick-vmm-soft`, the crate's contents move there.
+The `unsafe` is split across two crates, each `unsafe` block small and
+commented:
+
+- **`carrick-host-jit`** (neutral, `libc` only): `JitCodeBuffer` (mmap RW,
+  write, mprotect RX; never W and X together), moved whole from the x86 soft
+  CPU. `publish` makes the written range visible to instruction fetch before
+  the RX switch. On aarch64 it runs the Arm ARM B2.4.4 sequence: `DC CVAU` per
+  data line, `DSB ISH`, `IC IVAU` per instruction line, `DSB ISH`, `ISB`. Line
+  sizes come from CTR_EL0 (DminLine, IminLine), and the clean or invalidate is
+  skipped when CTR_EL0.IDC or DIC say it is not needed. On x86_64 it is a no-op,
+  and any other host refuses. All of the crate's inline assembly is in
+  `src/publish.rs`.
+- **`carrick-softcpu-aarch64-host`**: `HostBlockRunner` implementing
+  `carrick_softcpu_aarch64::dispatch::ExecuteBlock`. It publishes the block's
+  words and copies the frame into the last frame of a 64 KiB region. It then
+  calls the block's AAPCS64 function (the entry stub saves x19..x30 and host
+  SP, the common exit restores them and returns the exit index) and copies the
+  frame back. The only `unsafe` is that call. It runs only on Linux arm64;
+  every other host gets `HostError::UnsupportedHost` from `new()`, never a fake
+  success.
 
 macOS (later): `MAP_JIT`, `pthread_jit_write_protect_np` toggled around the
 write, `sys_icache_invalidate`, and the `com.apple.security.cs.allow-jit`
@@ -164,20 +176,29 @@ On x86 (this VM and every CI lane):
   fixed instruction subset, only to test the dispatcher's exit mapping, PC
   continuation and stop reasons. It is never a product path.
 
-On the arm64 runner (`#[cfg(target_arch = "aarch64")]`, after adapter approval):
+On the arm64 runner (`#[cfg(all(target_arch = "aarch64", target_os = "linux"))]`;
+`carrick-softcpu-aarch64-host/tests/native.rs` and `tests/boot_probe.rs`):
 
 - Differential: register-only blocks run through the engine and directly via
   `core::arch::asm!`; all GPRs and NZCV must match each other and the hand-derived
   answers.
 - Exit round trip: a block ending in MRS/SVC exits with the exact restart PC,
   and the handler resumes.
-- Boot probe: the production EL1 image from its entry, under a block budget,
-  prints `boots to PC=... after N blocks / fails at ...`.
+- I-cache publication: a published function is rewritten at the same address
+  and must return the new value (`carrick-host-jit`).
+- Boot probe: the production EL1 image is entered at `carrick_el1_syscall`
+  the way the loader's vector code enters it: EL1h, x0 = a trap frame for an
+  SVC from EL0, x30 = a return sentinel. It runs on flat memory (PT_LOAD
+  segments, a stack and the frame) under a block budget and prints
+  `boots to PC=... after N blocks / fails at ...`. A diagnostic second pass
+  maps each faulting page as zero to show what comes next. The stage-1 walker
+  is a later shared-crate slice.
 
 ## Open questions for the director
 
-1. Approve `carrick-softcpu-aarch64-host` (or name another adapter home).
-2. Approve the `conformance-contracts/surfaces.toml` entries (`contracts = []`)
-   for the new pure source files `translate.rs`, `handler.rs` and `dispatch.rs`.
+1. (Ruled) `carrick-host-jit` and `carrick-softcpu-aarch64-host`, plus their
+   `surfaces.toml` entries.
+2. A reviewed `.semgrep/host-authority-escape-hatches.yml` exclusion for
+   `crates/carrick-host-jit/src/publish.rs` (`lint-domains`).
 3. Confirm that per-dispatch re-translation is acceptable until N2 extracts
    the cache.
