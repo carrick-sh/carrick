@@ -1,0 +1,16 @@
+[package]
+name = "carrick-host-jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Allocation counting and one-shot failure injection for dependent crates'
+# own tests (the x86 soft CPU enables it as a dev-dependency only).
+test-hooks = []
+
+[dependencies]
+libc = { workspace = true }
