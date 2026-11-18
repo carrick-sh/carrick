@@ -5141,66 +5141,14 @@ fn arm_fork_superseded_by_sibling_mmap_is_busy_once_then_forks() {
         mapped > 0 && mapped & 0xfff == 0,
         "B's mmap during A's fork: {mapped}"
     );
-    // A kept its clone as carrier work and released vCPU 0: not now.
-    assert!(fixture.zone.slot(slot0).current().is_none());
-    assert!(matches!(
-        fixture.zone.record(harness.parent_record).claim(),
-        carrick_sched_core::Claim::Parked { .. }
-    ));
-    assert_eq!(
-        counts(&harness.dispatch_service.crossing),
-        [loans + 1, aborted + 1, committed],
-        "the superseded fork returned its one loan and published no child"
-    );
-    // The carrier acknowledges the work; A resumes and reruns its clone.
-    let notice = harness
-        .task
-        .service_notice
-        .take()
-        .unwrap()
-        .expect("the retained clone announced carrier work");
-    let queue = fixture
-        .zone
-        .object_wait(
-            carrick_sched_core::object_wait::ObjectWaitKey::native_service(
-                fixture.zone.record_ref(harness.parent_record),
-            )
-            .unwrap(),
-            &carrick_sched_core::ShortLockSpin,
-            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
-        )
-        .unwrap();
-    // SAFETY: the parent's control slot outlives the harness.
-    let ticket = unsafe {
-        carrick_core_abi::service::ServiceCell::claim_notice(
-            &harness._parent_control.service,
-            notice,
-            NonZeroU64::MIN,
-            fixture.zone.record(harness.parent_record).identity(),
-        )
-    }
-    .unwrap();
-    assert!(ticket.complete(true).is_ok());
-    queue
-        .notify_object(slot0, &mut carrick_sched_core::WakeEffects::default())
-        .unwrap();
-    drop(queue);
-    let mut resumed = carrick_el1_abi::TrapFrame::default();
-    assert_eq!(
-        harness.switch_next(&mut cpu, &mut resumed),
-        carrick_el1_abi::Action::Served
+    assert!(
+        harness.task.service_notice.take().unwrap().is_none(),
+        "an MM publication settles the old snapshot without carrier work"
     );
     assert_eq!(
         fixture.zone.slot(slot0).current(),
         Some(harness.parent_record)
     );
-    // The retained clone resumes rewound onto its SVC (the harness's
-    // frames start at pc 0), and the guest executes it again.
-    assert_eq!(resumed.elr, 0u64.wrapping_sub(4), "A resumes at its clone");
-    clone = carrick_el1_abi::TrapFrame::default();
-    clone.x[8] = 220;
-    clone.x[0] = 17;
-    harness.call_current(&mut clone, &mut cpu);
     let pid = clone.x[0] as i64;
     assert!(pid > 0, "A's fork after the superseded snapshot: {pid}");
     assert!(harness.find_record_by_tid(pid as u64).is_some());
