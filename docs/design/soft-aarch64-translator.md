@@ -193,6 +193,7 @@ On x86 (this VM and every CI lane):
   | `state.rs` | Change the nTWE bit from 18 to 16. | `el0_waits_trap_under_their_own_sctlr_control` |
   | `dispatch.rs` | Add `&& !cpu.pstate.il` to the PC alignment fault condition. | `misaligned_pc_takes_priority_over_illegal_execution_state` |
   | `dispatch.rs` | Replace `else if cpu.pstate.il` with `else if false && cpu.pstate.il`. | `restored_il_takes_an_exception_before_the_next_guest_instruction` |
+  | `exception.rs` | Delete `cpu.signal_local_event();` from ERET. | `svc_and_eret_restore_the_origin_and_signal_one_local_event` |
 - Dispatcher: a `cfg(test)`-only `ExecuteBlock` double runs blocks of a small
   fixed instruction subset, only to test the dispatcher's exit mapping, PC
   continuation and stop reasons. It is never a product path.
@@ -211,7 +212,10 @@ On the arm64 runner (`#[cfg(all(target_arch = "aarch64", target_os = "linux"))]`
   PC alignment precedes illegal execution state and both precede the first
   block fetch. A stage-1 walker must give instruction aborts priority over IL.
 - Exit round trip: a block ending in MRS/SVC exits with the exact restart PC,
-  and the handler resumes.
+  and the handler resumes. An EL0 SVC vector reads SPSR_EL1 and ELR_EL1 then
+  executes ERET. ERET restores the origin and sets the local event register,
+  so the first WFE retires and the second reports a wait. SEV and SEVL also set
+  this local bit. External wakeups and inter-CPU event delivery are separate.
 - I-cache publication: a published function is rewritten at the same address
   and must return the new value (`carrick-host-jit`).
 - Boot probe: the production EL1 image is entered at `carrick_el1_syscall`
