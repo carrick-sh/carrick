@@ -1155,6 +1155,8 @@ surfaces = [
   { path = "crates/carrick-signal-core/src/wait.rs", contract = "kernel.signal.socket-restart" },
   { path = "crates/carrick-signal-linux/src/fork_reset.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-signal-linux/src/lib.rs", contract = "kernel.el1.signal-delivery-owner" },
+  # arm64 host launch for the aarch64 copy-through engine (#1236); a test-only execution lane, no guest-visible product path yet.
+  { path = "crates/carrick-softcpu-aarch64-host/src/lib.rs", contracts = [] },
   # Copy-through dispatcher over the ExecuteBlock seam (#1236); no host launch on main, so nothing executes yet.
   { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contracts = [] },
   # Pure virtual CPU state/exception machinery, not wired to execution; no guest-visible behaviour yet.

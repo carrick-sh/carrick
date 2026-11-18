@@ -1,0 +1,12 @@
+[package]
+name = "carrick-softcpu-aarch64-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-host-jit = { path = "../carrick-host-jit" }
+carrick-softcpu-aarch64 = { path = "../carrick-softcpu-aarch64" }
