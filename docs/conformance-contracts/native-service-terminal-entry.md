@@ -81,6 +81,16 @@ wait without a pending close remains quarantined. Work stays bounded to one
 retained-service settlement and one terminal member transaction, with no
 polling, retry, timer, or additional host request.
 
+The correction recognizes only the conjunction of an exact service wait and
+the process's pending close. It consumes that service through `resume_service`
+and hands `NoPending` to the existing lifecycle checkpoint, which consumes the
+old owner continuation before retiring the member. The ARM and x86 mmap and
+CarrierWork bindings pass at the production service-settlement boundary;
+`native_service_suspended_member_cannot_admit_a_second_bridge` and
+`native_service_duplicate_custody_is_an_invariant_at_bridge_settlement` still
+prove that non-service waits and service custody without terminal authority
+remain quarantined.
+
 Director confirmation requires signed runs of `el1_fork_cow_resolves_in_guest`,
 `el1_sched_two_processes_share_vcpus`,
 `el1_thread_lifecycle_cleartid_tid_reuse`,
