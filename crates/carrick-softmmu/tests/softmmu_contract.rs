@@ -17,9 +17,9 @@ use carrick_softmmu::{
     AccessOutcome, AuthenticatedDescriptorWords, Cpl, CpuAccessMode, ExtentEditError, ExtentRecord,
     ExtentTable, FrameGpa, GuestVa, LAPIC_MMIO_BASE_GPA, LAPIC_MMIO_SIZE_BYTES, LinearPlacement,
     MmioHole, MmioHoles, OwnerGeneration, PAGE_OFFSET_MASK_4K, PAGE_SIZE_4K, PageFaultClass,
-    PageFaultErrorCode, PageFaultInfo, PlacementError, ResolvedAccess, ResolvedSpan, Retirement,
-    RootGpa, SOFT_TLB_ENTRIES, SoftCpuException, SoftMmuMemory, SoftTlb, SoftTlbEntry,
-    SoftTlbPlane, SoftTranslationError, SoftWalker, TLB_TAG_AC_BIT, TLB_TAG_CPL3_BIT,
+    PageFaultErrorCode, PageFaultInfo, PlacementError, PlacementSegment, ResolvedAccess,
+    ResolvedSpan, Retirement, RootGpa, SOFT_TLB_ENTRIES, SoftCpuException, SoftMmuMemory, SoftTlb,
+    SoftTlbEntry, SoftTlbPlane, SoftTranslationError, SoftWalker, TLB_TAG_AC_BIT, TLB_TAG_CPL3_BIT,
     TLB_TAG_NXE_OFF_BIT, TLB_TAG_SMAP_OFF_BIT, TLB_TAG_SMEP_OFF_BIT, TLB_TAG_WP_OFF_BIT,
     WalkOutcome, X86HostPage4K,
 };
@@ -460,6 +460,69 @@ fn linear_placement_enforces_alignment_bounds_and_mmio_holes() -> Result<(), Pla
     };
     assert_eq!((va, error), (va_oob, oob_err));
     assert_eq!(rig.mem.placement().host(auth_oob), Err(oob_err));
+    Ok(())
+}
+
+/// #671: a carrier registers each retained allocation as its own slot, so a
+/// placement is linear per segment (`host = gpa + K_i`), never across a gap
+/// or a segment boundary, and refuses overlapping or unaligned segments.
+#[test]
+fn segmented_placement_maps_each_slot_and_refuses_gaps_and_boundaries() -> Result<(), PlacementError>
+{
+    let mut rig = Rig::new()?;
+    let mode = CpuAccessMode::ring3();
+    let va_f1 = GuestVa::new(0x0000_0010_0000);
+    rig.map_a(va_f1, pte(F1_GPA, true, true, true, false));
+    let auth_f1 = rig.walk_ram(va_f1, Access::Read, mode).frame_gpa;
+
+    let low = zeroed_atomic_words(2 * PAGE_SIZE_4K as usize / 8);
+    let high = zeroed_atomic_words(4 * PAGE_SIZE_4K as usize / 8);
+    let page = PAGE_SIZE_4K as usize;
+    let align = |words: &[AtomicU64]| (words.as_ptr() as usize).next_multiple_of(page);
+    let (low_host, high_host) = (align(&low), align(&high));
+    let segments = [
+        PlacementSegment::new(0, PAGE_SIZE_4K, low_host),
+        PlacementSegment::new(F1_GPA, PAGE_SIZE_4K, high_host),
+        PlacementSegment::new(F1_GPA + PAGE_SIZE_4K, PAGE_SIZE_4K, high_host + 2 * page),
+    ];
+    // SAFETY: each segment names one aligned, zeroed page owned by `low` or
+    // `high` for every use below; these checks only compute addresses.
+    let placement = unsafe { LinearPlacement::with_segments(&segments, MmioHoles::x86_default())? };
+    assert_eq!(placement.host(auth_f1)?.raw(), high_host);
+    assert_eq!(placement.host_range(auth_f1, page)?.raw(), high_host);
+    assert_eq!(
+        placement.host_range(auth_f1, 2 * page),
+        Err(PlacementError::SegmentBoundary { gpa: F1_GPA })
+    );
+    assert_eq!(placement.span_bytes(), F1_GPA + 2 * PAGE_SIZE_4K);
+
+    // A GPA between registered slots has no host backing.
+    let gap = [PlacementSegment::new(0, PAGE_SIZE_4K, low_host)];
+    // SAFETY: as above; only address computation follows.
+    let gapped = unsafe { LinearPlacement::with_segments(&gap, MmioHoles::empty())? };
+    assert_eq!(
+        gapped.host(auth_f1),
+        Err(PlacementError::OutOfBounds {
+            gpa: F1_GPA,
+            span_bytes: PAGE_SIZE_4K,
+        })
+    );
+    let overlapping = [
+        PlacementSegment::new(0, 2 * PAGE_SIZE_4K, low_host),
+        PlacementSegment::new(PAGE_SIZE_4K, PAGE_SIZE_4K, high_host),
+    ];
+    // SAFETY: overlapping segments are refused before construction.
+    assert_eq!(
+        unsafe { LinearPlacement::with_segments(&overlapping, MmioHoles::empty()) },
+        Err(PlacementError::OverlappingSegment { gpa: PAGE_SIZE_4K })
+    );
+    let unaligned = [PlacementSegment::new(0x800, PAGE_SIZE_4K, low_host)];
+    // SAFETY: an unaligned segment is refused before construction.
+    assert!(matches!(
+        unsafe { LinearPlacement::with_segments(&unaligned, MmioHoles::empty()) },
+        Err(PlacementError::UnalignedPlacement { .. })
+    ));
+    drop((low, high));
     Ok(())
 }
 
