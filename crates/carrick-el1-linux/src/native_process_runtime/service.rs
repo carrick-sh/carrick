@@ -2087,38 +2087,54 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         };
         self.service_phase = NativeServicePhase::Member;
-        let (page, control, mm) = {
+        let member = {
             let graph = self.runtime.graph.lock();
             if graph.has_member_wait(&self.record) {
-                // IPC keeps its separately retained operation on refusal.
-                // A bridge owns the executing exact member and cannot also
-                // have an outstanding suspended operation on that member.
-                return Err(
-                    if adapter
-                        || (matches!(operation, ServiceOperation::CarrierWork { .. })
-                            && self.retains_adapter_under(&graph))
-                    {
-                        NativeProcessError::Busy
-                    } else {
-                        NativeProcessError::Quarantined
-                    },
-                );
+                // A process close cancels every member's retained service, but
+                // its completion can wake the exact member directly into an
+                // already captured SVC or IRQ entry. Settle that old owner
+                // before this new entry can publish work. Other member waits,
+                // and a service wait without terminal authority, are broken
+                // duplicate custody and keep their existing classification.
+                if graph.pending.has_exit(&self.key) && graph.service_wait(&self.record).is_some() {
+                    None
+                } else {
+                    // IPC keeps its separately retained operation on refusal.
+                    // A bridge owns the executing exact member and cannot also
+                    // have an outstanding suspended operation on that member.
+                    return Err(
+                        if adapter
+                            || (matches!(operation, ServiceOperation::CarrierWork { .. })
+                                && self.retains_adapter_under(&graph))
+                        {
+                            NativeProcessError::Busy
+                        } else {
+                            NativeProcessError::Quarantined
+                        },
+                    );
+                }
+            } else {
+                let resources = graph
+                    .owner
+                    .task(self.key)
+                    .map_err(|_| NativeProcessError::Stale)?
+                    .native()
+                    .resources();
+                let member = resources
+                    .members
+                    .iter()
+                    .find(|member| {
+                        member.record == self.record
+                            && core::ptr::eq(member.control.control(), self.control)
+                    })
+                    .ok_or(NativeProcessError::Stale)?;
+                Some((resources.page, member.control.clone(), resources.mm.clone()))
             }
-            let resources = graph
-                .owner
-                .task(self.key)
-                .map_err(|_| NativeProcessError::Stale)?
-                .native()
-                .resources();
-            let member = resources
-                .members
-                .iter()
-                .find(|member| {
-                    member.record == self.record
-                        && core::ptr::eq(member.control.control(), self.control)
-                })
-                .ok_or(NativeProcessError::Stale)?;
-            (resources.page, member.control.clone(), resources.mm.clone())
+        };
+        let Some((page, control, mm)) = member else {
+            return self
+                .settle_retained_service_for_closing_entry()
+                .map(PreparedService::Retired);
         };
         self.service_phase = NativeServicePhase::Birth;
         let birth =
@@ -2374,6 +2390,41 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         #[cfg(test)]
         super::host_test_support::run_service_published_hook(self.runtime as *const _ as usize);
         Ok(PreparedService::Request(request, adapter))
+    }
+
+    /// A terminal close may wake an exact retained service into a newer SVC
+    /// or IRQ frame before the ordinary owner checkpoint consumes the old
+    /// service. The old service remains authoritative: finish it once, then
+    /// retire through the existing close transaction without publishing the
+    /// newer operation.
+    #[inline(never)]
+    fn settle_retained_service_for_closing_entry(
+        &mut self,
+    ) -> Result<NativeResume, NativeProcessError> {
+        match self
+            .resume_service()
+            .ok_or(NativeProcessError::Quarantined)??
+        {
+            NativeResume::NoPending => {}
+            deferred @ NativeResume::Left(_) => return Ok(deferred),
+            _ => return Err(NativeProcessError::Quarantined),
+        }
+        let outcome = self
+            .resume_pending_lifecycle()
+            .ok_or(NativeProcessError::Quarantined)?;
+        match outcome {
+            LifecycleOutcome::HostCustody => {
+                if !self.yield_terminal_host_custody() {
+                    return Err(NativeProcessError::Quarantined);
+                }
+                Ok(NativeResume::Left(None))
+            }
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            } if self.handoff.is_some() => Ok(NativeResume::Left(self.take_root_exit())),
+            _ => Err(NativeProcessError::Quarantined),
+        }
     }
 
     fn has_adapter_operation(&self) -> bool {
