@@ -474,7 +474,7 @@ fn sp_el0_access_is_undefined_at_el1_using_sp_zero() {
     assert_eq!(cpu.sp_el0, StackPointer(0x4560));
 }
 
-/// D13.2.140 VBAR_EL1[10:0] is RES0, on register writes and vector use.
+/// D13.2.140 VBAR_EL1[10:0] is RES0, including on reads of provider state.
 #[test]
 fn vbar_low_bits_are_res0() {
     use carrick_softcpu_aarch64::OperandRegister;
@@ -495,6 +495,10 @@ fn vbar_low_bits_are_res0() {
             );
             // Public raw state can also be supplied by a provider.
             cpu.el1.vbar = VirtualAddress(base | low);
+            assert_eq!(
+                cpu.mrs(sys((3, 0, 12, 0, 0)), OperandRegister::Zr).unwrap(),
+                SystemValue(base)
+            );
             take_exception(&mut cpu, Exception::Irq);
             assert_eq!(cpu.pc, ProgramCounter(base + 0x280));
         }
