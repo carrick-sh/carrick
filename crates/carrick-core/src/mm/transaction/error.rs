@@ -20,7 +20,11 @@ impl From<crate::mm::fork::ForkError> for MmError {
             ForkError::Busy => Self::Busy,
             ForkError::Stale => Self::Stale,
             ForkError::MetadataRequired => Self::MetadataRequired,
-            ForkError::OwnerRefusal(refusal) => Self::from(match refusal {
+            // A fork owner refusal keeps its typed reservation cause. The
+            // generic Refusal conversion folds Hole and Limit into Fault, a
+            // user fault plan's answer; a fork walks no user address, and its
+            // Limit is exhaustion (#2441).
+            ForkError::OwnerRefusal(refusal) => Self::Reservation(match refusal {
                 ForkOwnerRefusal::Invalid => Refusal::Invalid,
                 ForkOwnerRefusal::Collision => Refusal::Collision,
                 ForkOwnerRefusal::Hole => Refusal::Hole,
