@@ -63,20 +63,19 @@ impl InstructionClass {
 
 /// Classify one typed instruction for the copy-through engine.
 pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
-    use InstructionClass::{Branch as B, Copy as C, Exit as E};
     match instruction {
         Instruction::Arithmetic(a) => {
             if a.rd == OperandRegister::Sp || a.rn == OperandRegister::Sp {
-                C(CopyKind::StackPointer)
+                InstructionClass::Copy(CopyKind::StackPointer)
             } else {
-                C(CopyKind::Verbatim)
+                InstructionClass::Copy(CopyKind::Verbatim)
             }
         }
         Instruction::Logical(l) => {
             if l.rd == OperandRegister::Sp || l.rn == OperandRegister::Sp {
-                C(CopyKind::StackPointer)
+                InstructionClass::Copy(CopyKind::StackPointer)
             } else {
-                C(CopyKind::Verbatim)
+                InstructionClass::Copy(CopyKind::Verbatim)
             }
         }
         Instruction::MoveWide(_)
@@ -88,30 +87,40 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
         | Instruction::ConditionalCompare(_)
         | Instruction::Barrier(_)
         | Instruction::CensusGap(Decoded::VariableShift { .. } | Decoded::OneSource { .. })
-        | Instruction::Hint(Hint::Nop | Hint::Yield) => C(CopyKind::Verbatim),
-        Instruction::Address(_) => C(CopyKind::PcRelative),
-        Instruction::Hint(hint) => E(ExitReason::Hint(hint)),
+        | Instruction::Hint(Hint::Nop | Hint::Yield) => InstructionClass::Copy(CopyKind::Verbatim),
+        Instruction::Address(_) => InstructionClass::Copy(CopyKind::PcRelative),
+        Instruction::Hint(hint) => InstructionClass::Exit(ExitReason::Hint(hint)),
         Instruction::ScalarMemory(_)
         | Instruction::UnprivilegedMemory(_)
         | Instruction::PairMemory(_)
         | Instruction::AtomicTransfer(_)
-        | Instruction::AtomicAdd(_) => E(ExitReason::Memory),
-        Instruction::SystemAccess(_) => E(ExitReason::SystemRegister),
-        Instruction::PstateImmediate(_) => E(ExitReason::Pstate),
-        Instruction::SystemOperation(_) => E(ExitReason::SystemOperation),
-        Instruction::CensusGap(Decoded::AddressTranslate { .. }) => E(ExitReason::AddressTranslate),
-        Instruction::CensusGap(Decoded::ClearExclusive { .. }) => E(ExitReason::ClearExclusive),
-        Instruction::CensusGap(Decoded::Breakpoint { .. }) => {
-            E(ExitReason::Exception(ExceptionKind::Brk))
+        | Instruction::AtomicAdd(_) => InstructionClass::Exit(ExitReason::Memory),
+        Instruction::SystemAccess(_) => InstructionClass::Exit(ExitReason::SystemRegister),
+        Instruction::PstateImmediate(_) => InstructionClass::Exit(ExitReason::Pstate),
+        Instruction::SystemOperation(_) => InstructionClass::Exit(ExitReason::SystemOperation),
+        Instruction::CensusGap(Decoded::AddressTranslate { .. }) => {
+            InstructionClass::Exit(ExitReason::AddressTranslate)
         }
-        Instruction::ExceptionGeneration(e) => E(ExitReason::Exception(e.kind)),
-        Instruction::Eret => E(ExitReason::Eret),
-        Instruction::Unallocated => E(ExitReason::Undefined),
-        Instruction::Branch(Branch::Immediate { link, .. }) => B(BranchKind::Direct { link }),
+        Instruction::CensusGap(Decoded::ClearExclusive { .. }) => {
+            InstructionClass::Exit(ExitReason::ClearExclusive)
+        }
+        Instruction::CensusGap(Decoded::Breakpoint { .. }) => {
+            InstructionClass::Exit(ExitReason::Exception(ExceptionKind::Brk))
+        }
+        Instruction::ExceptionGeneration(e) => {
+            InstructionClass::Exit(ExitReason::Exception(e.kind))
+        }
+        Instruction::Eret => InstructionClass::Exit(ExitReason::Eret),
+        Instruction::Unallocated => InstructionClass::Exit(ExitReason::Undefined),
+        Instruction::Branch(Branch::Immediate { link, .. }) => {
+            InstructionClass::Branch(BranchKind::Direct { link })
+        }
         Instruction::Branch(
             Branch::Conditional { .. } | Branch::Compare { .. } | Branch::Test { .. },
-        ) => B(BranchKind::Conditional),
-        Instruction::Branch(Branch::Register { op, .. }) => B(BranchKind::Indirect(op)),
+        ) => InstructionClass::Branch(BranchKind::Conditional),
+        Instruction::Branch(Branch::Register { op, .. }) => {
+            InstructionClass::Branch(BranchKind::Indirect(op))
+        }
     }
 }
 
