@@ -353,8 +353,32 @@ fn loader_spans(mut visit: impl FnMut(&str, u64, &[u8]) -> Result<()>) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::Census;
+    use super::{Census, loader_spans};
     use anyhow::Result;
+    use carrick_mem::memory::{LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL0_TRAMPOLINE_SIZE};
+
+    #[test]
+    fn loader_spans_include_el0_trampoline() -> Result<()> {
+        let mut spans = Vec::new();
+        loader_spans(|name, address, bytes| {
+            spans.push((name.to_owned(), address, bytes.to_vec()));
+            Ok(())
+        })?;
+        let (_, address, bytes) = spans
+            .iter()
+            .find(|(name, _, _)| name == "el0-trampoline")
+            .expect("loader census is missing the el0-trampoline span");
+        assert_eq!(*address, LINUX_EL0_TRAMPOLINE_BASE);
+        assert_eq!(bytes.len() as u64, LINUX_EL0_TRAMPOLINE_SIZE);
+        assert!(
+            bytes
+                .chunks_exact(4)
+                .any(|word| word == 0xd508711f_u32.to_le_bytes()),
+            "el0-trampoline span is missing IC IALLUIS"
+        );
+        Ok(())
+    }
+
     #[test]
     fn reserved_span_rejected_and_report_deterministic() -> Result<()> {
         let bytes: Vec<u8> = [0xd503201f_u32, 0xffff_ffff]
