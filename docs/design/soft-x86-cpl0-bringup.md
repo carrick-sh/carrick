@@ -519,3 +519,12 @@ before its ring syscall to another write after it returns. It uses a
 190 ms lower bound and a 10 s upper bound to allow host scheduling and
 translation overhead. Both production witnesses are bound to
 `x86.softcpu.apic-timer`.
+
+The release host-clock trial measured 299 ms between the nanosleep markers.
+The same trial reached both initial-MM allocation exits for `TWO_LIVE`,
+then hit the existing fixture guest-interval deadline. In the debug trial,
+GDB captured six timer expirations in CPL0 with IF clear and eight
+deliveries to CPL3 RIP `0x4010f9`, the first instruction after clone.
+The native scheduler starts the slice before the CPL0 return path.
+When the slice has already expired on return, the timer can rotate the
+task before it executes that first instruction.
