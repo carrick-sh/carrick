@@ -504,3 +504,90 @@ fn el0_dc_zva_to_device_memory_raises_alignment_before_writing() {
     r.assert_abort(0x400, 0x9200_0061, UDATA + 31);
     assert_eq!(r.memory.get(UDATA_PA), u64::MAX);
 }
+
+#[test]
+fn el1_at_populates_par_el1_with_stage1_attributes_and_faults() {
+    // DDI0487G.a C6.2.21 AT, C5.3 AT S1E*, D5.4.2 PAN, D13.2.103 PAR_EL1.
+    let mut r = Rig::el1();
+    r.cpu.pstate.pan = true;
+    r.cpu.el1.mair = SystemValue(0x00_44_ff);
+    let l3 = ROOT_A + 3 * PAGE;
+    // UDATA: AttrIndx=0 (0xff Normal WB), SH=0b11 (Inner Shareable), EL0 RW.
+    r.memory.put(
+        l3 + ((UDATA >> 12) & 511) * 8,
+        UDATA_PA | LEAF_PAGE | AF | AP_ALL_RW | (0b11 << 8) | PXN,
+    );
+    // KDATA: AttrIndx=1 (0x44 Normal NC -> effective Outer Shareable 0b10), EL1 RO.
+    r.memory.put(
+        l3 + ((KDATA >> 12) & 511) * 8,
+        KDATA_PA | LEAF_PAGE | AF | (0b10 << 6) | (1 << 2) | UXN,
+    );
+
+    // 1. Production HardwareValidator form (`at s1e0r, x12` = 0xd508_784c):
+    // succeeds on EL0-accessible UDATA even with PSTATE.PAN=1, stripping
+    // page offset bits [11:0] and preserving ATTR=0xff, PA[47:12], RES1[11], SH=0b11.
+    r.set(12, UDATA + 0xcf0);
+    assert_eq!(r.run(0xd508_784c), Outcome::Continue);
+    assert_eq!(r.cpu.pc.0, CODE + 4);
+    assert_eq!(
+        r.cpu.named.par.0,
+        (0xff << 56) | UDATA_PA | (1 << 11) | (0b11 << 7)
+    );
+
+    // 2. `at s1e1r, x12` (0xd508_780c) ignores PSTATE.PAN, whereas
+    // `at s1e1rp, x12` (0xd508_790c) enforces PSTATE.PAN and reports an L3
+    // permission fault (FST=0x0f, F=1) in PAR_EL1 without taking an abort or
+    // touching ESR_EL1 / FAR_EL1.
+    r.cpu.pc = ProgramCounter(CODE);
+    r.cpu.el1.esr = Syndrome(0x5600_0000);
+    r.cpu.el1.far = VirtualAddress(0xaa55);
+    assert_eq!(r.run(0xd508_780c), Outcome::Continue);
+    assert_eq!(
+        r.cpu.named.par.0,
+        (0xff << 56) | UDATA_PA | (1 << 11) | (0b11 << 7)
+    );
+    r.cpu.pc = ProgramCounter(CODE);
+    assert_eq!(r.run(0xd508_790c), Outcome::Continue);
+    assert_eq!(r.cpu.pc.0, CODE + 4);
+    assert_eq!(r.cpu.named.par.0, (1 << 11) | (0x0f << 1) | 1);
+    assert_eq!(r.cpu.el1.esr, Syndrome(0x5600_0000));
+    assert_eq!(r.cpu.el1.far, VirtualAddress(0xaa55));
+
+    // 3. `at s1e1r` vs `at s1e1w` and `at s1e0r` on EL1-RO KDATA:
+    // EL1 read reports ATTR=0x44 and forced SH=0b10; EL1 write and EL0 read
+    // both record FST=0x0f (permission L3) in PAR_EL1.
+    r.cpu.pc = ProgramCounter(CODE);
+    r.set(12, KDATA + 0x28);
+    assert_eq!(r.run(0xd508_780c), Outcome::Continue);
+    assert_eq!(
+        r.cpu.named.par.0,
+        (0x44 << 56) | KDATA_PA | (1 << 11) | (0b10 << 7)
+    );
+    for denied in [0xd508_782c, 0xd508_784c, 0xd508_786c] {
+        r.cpu.pc = ProgramCounter(CODE);
+        assert_eq!(r.run(denied), Outcome::Continue);
+        assert_eq!(r.cpu.named.par.0, (1 << 11) | (0x0f << 1) | 1);
+    }
+
+    // 4. Unmapped HOLE reports L3 translation fault (FST=0x07), and Rt=31
+    // (`at s1e0r, xzr` = 0xd508_785f) translates VA=0 (unmapped L3, FST=0x07)
+    // rather than SP_EL1.
+    r.cpu.sp_el1 = StackPointer(UDATA);
+    r.cpu.pc = ProgramCounter(CODE);
+    r.set(12, HOLE + 8);
+    assert_eq!(r.run(0xd508_784c), Outcome::Continue);
+    assert_eq!(r.cpu.named.par.0, (1 << 11) | (0x07 << 1) | 1);
+    r.cpu.pc = ProgramCounter(CODE);
+    assert_eq!(r.run(0xd508_785f), Outcome::Continue);
+    assert_eq!(r.cpu.named.par.0, (1 << 11) | (0x07 << 1) | 1);
+
+    // 5. Missing descriptor backing is a provider stop, not a guest PAR_EL1 fault.
+    r.cpu.named.ttbr0 = SystemValue(0x90_0000);
+    r.cpu.named.par = SystemValue(0x1234);
+    r.cpu.pc = ProgramCounter(CODE);
+    assert!(matches!(
+        r.run(0xd508_784c),
+        Outcome::Event(Event::Translation(Stage1Error::Descriptor(_)))
+    ));
+    assert_eq!((r.cpu.pc.0, r.cpu.named.par.0), (CODE, 0x1234));
+}

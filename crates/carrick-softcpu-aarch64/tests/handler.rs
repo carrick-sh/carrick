@@ -553,8 +553,12 @@ fn el1_at_requires_a_walk_and_el0_at_is_undefined() {
         0xd508_7920, // at s1e1wp, x0
     ] {
         let mut r = Rig::el1();
-        assert_eq!(r.run(word), Outcome::Event(Event::AddressTranslate));
-        assert_eq!(r.pc(), PC);
+        r.set(0, 0x1234_5678);
+        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.pc(), PC + 4);
+        // D5.2.9 / D13.2.103: with SCTLR_EL1.M=0, flat data translation yields
+        // Device-nGnRnE (ATTR=0), PA[47:12], RES1 bit 11, SH=0b10 (Outer).
+        assert_eq!(r.cpu.named.par.0, 0x1234_5000 | (1 << 11) | (0b10 << 7));
 
         let mut r = Rig::el0();
         assert_eq!(r.run(word), Outcome::Continue);
