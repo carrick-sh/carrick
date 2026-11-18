@@ -15,6 +15,7 @@ use carrick_softcpu_x86::{
     EmitError, GuestCpuidView, SoftAccessKind, SoftMachine, SoftMachineExit, SoftMemoryFault,
     X86Exception, read_guest_bytes,
 };
+use carrick_softmmu::PAGE_SIZE_4K;
 use carrick_x86::cpl0_entry::{CpuBinding, DIRECT_VA, PublishedApicId, PublishedApicIds};
 use carrick_x86::{SegmentDescriptor, SegmentDpl, X86Reg, X86Seg, X86Vcpu};
 use carrick_x86_cpl0_host::carrier_cpu::{
@@ -154,6 +155,11 @@ impl SoftRunner {
         Ok(())
     }
 
+    pub(crate) fn admit_current_root(&mut self) -> Result<(), TrapError> {
+        let root = self.machine.context().cr3 & !(PAGE_SIZE_4K - 1);
+        self.machine.mem_mut().admit_root(root)
+    }
+
     /// Run to the next carrier exit (port I/O or `HLT`). `None` is a stop
     /// without one, recorded in [`SoftRunTrace::stop`]; a `kicked` flag
     /// raised before a block stops the run as [`SoftStop::Kicked`].
@@ -181,6 +187,7 @@ impl SoftRunner {
                 return None;
             }
             let before = self.machine.context().rip;
+            let cr3 = self.machine.context().cr3;
             if self.trace.recent.len() == RECENT_BLOCKS {
                 self.trace.recent.pop_front();
             }
@@ -197,6 +204,19 @@ impl SoftRunner {
                 }
                 Ok(None) => {
                     let rip = self.machine.context().rip;
+                    // The trusted ring can switch to a new address space without
+                    // a doorbell. MOV CR3 has already performed privilege checks
+                    // and flushed the TLB. Admit the selected retained frame
+                    // before the next instruction fetch or interrupt delivery.
+                    if (cr3 ^ self.machine.context().cr3) >= PAGE_SIZE_4K
+                        && let Err(error) = self.admit_current_root()
+                    {
+                        self.trace.stop = Some(SoftStop::Emit {
+                            va: rip,
+                            detail: error.to_string(),
+                        });
+                        return None;
+                    }
                     if stubs.contains(&rip) && !stubs.contains(&before) {
                         self.trace.deliveries.push((before, rip));
                     }

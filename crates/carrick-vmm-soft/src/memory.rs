@@ -273,8 +273,12 @@ impl SoftCarrierMemory {
     pub fn admit_root(&mut self, root: u64) -> Result<(), TrapError> {
         let root = RootGpa::page_aligned(FrameGpa::new(root))
             .ok_or_else(|| fail("soft root alignment"))?;
-        if self.extents.expected_generation(root).is_some()
-            || self.extents.set_root_generation(root, BOOT_GENERATION)
+        if self.extents.expected_generation(root) == Some(BOOT_GENERATION)
+            || (self
+                .extents
+                .lookup_span(root.address().raw(), PAGE_SIZE_4K)
+                .is_some_and(|extent| extent.generation == BOOT_GENERATION)
+                && self.extents.set_root_generation(root, BOOT_GENERATION))
         {
             Ok(())
         } else {

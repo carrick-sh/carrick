@@ -414,19 +414,13 @@ clear-child-tid words, and exits 0. Direct Linux execution produced both
 expected results. These are diagnostic fixtures for the existing
 `kernel.el1.fork-cow` and `kernel.el1.thread-lifecycle` surfaces.
 
-From the repository root, build the local fixtures and run either diagnostic
-by name:
+From the repository root, build and run the raw-exit diagnostic:
 
 ```sh
 mkdir -p target/soft-lifecycle
-cc -nostdlib -static -no-pie -Wl,--build-id=none \
-  crates/carrick-cli/tests/fixtures/x86_forked_child_stdout.S \
-  -o target/soft-lifecycle/fork
 cc -nostdlib -static -no-pie -Wl,--build-id=none -DTWO_LIVE \
   crates/carrick-vmm-kvm/tests/fixtures/native_robust_raw_exit.S \
   -o target/soft-lifecycle/raw-exit
-cargo test --locked -p carrick-vmm-soft --test soft_hello -- \
-  production_ring_forked_child_writes_and_is_reaped --ignored --exact
 cargo test --locked -p carrick-vmm-soft --test soft_hello -- \
   production_ring_non_last_threads_raw_exit --ignored --exact
 ```
@@ -451,3 +445,24 @@ cargo test --locked -p carrick-vmm-soft --test soft_hello -- \
   guest interval exceeds the debug watchdog deadline. An optimized host
   build reaches the unchanged 4,000,000-block limit. Neither run proves
   worker exit or clear-child-tid completion.
+
+### M1-7 status: fork CR3 and the raw-exit timer
+
+The fork now walks the child's `0x480c000` root. The soft runner admits
+the page selected by the ring's committed MOV CR3 before its next fetch or
+interrupt delivery. A new root must name a full page in an authenticated
+retained extent. The instruction already invalidates the TLB and every
+descriptor in the subsequent walk still goes through extent authentication.
+The fixture serves the child's native stdout request with the shared
+dispatcher and requester record. The regular soft suite assembles the
+in-tree fixture locally. The child writes `E`, the parent reaps it and
+exits 7.
+
+The raw-exit fixture reaches the first clone. GDB observed the kick vector
+`0xe2`, followed by timer vector `0xe0` alternating between the parent
+(positive RAX) and the child (zero RAX) at `0x4010f9`. This is the user
+`test %rax,%rax` immediately after the clone syscall. The APIC latched
+expired deadlines with IF clear inside the CPL0 `arm_tsc_deadline` and
+`prepare_parked_resume` paths. The next return to CPL3 takes the pending
+timer before executing that user instruction. The fixture remains opt-in
+pending a scheduler progress fix.

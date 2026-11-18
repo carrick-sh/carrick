@@ -101,13 +101,6 @@ impl SoftCpuBackend {
         }
         Ok(())
     }
-
-    /// Authenticate the CPU's current page-table root for soft walks.
-    fn admit_current_root(&mut self) -> Result<(), TrapError> {
-        let machine = self.runner.machine_mut();
-        let root = machine.context().cr3 & !0xfff;
-        machine.mem_mut().admit_root(root)
-    }
 }
 
 impl ProductionMemberCpu for SoftCpuBackend {
@@ -133,7 +126,7 @@ impl ProductionMemberCpu for SoftCpuBackend {
     fn run_guest(&mut self) -> Result<VcpuExit, TrapError> {
         self.require_primary()?;
         self.runner.refresh_memory()?;
-        self.admit_current_root()?;
+        self.runner.admit_current_root()?;
         let kick = self.kick.clone();
         let exit = self.runner.run(kick.as_ref().map(|kick| &*kick.0));
         match exit {
