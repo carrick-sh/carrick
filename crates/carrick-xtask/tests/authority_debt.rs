@@ -3220,6 +3220,33 @@ fn build_program_authority_has_its_own_boundary_and_owner() {
 }
 
 #[test]
+fn shared_build_module_uses_its_local_build_target_owner() {
+    let root = tempfile::tempdir().unwrap();
+    let file = "crates/local-build/shared.rs";
+    for (package, build) in [
+        (
+            "local-build",
+            r#"#[path = "shared.rs"] mod shared; fn main() {}"#,
+        ),
+        (
+            "earlier-importer",
+            r#"#[path = "../local-build/shared.rs"] mod imported; fn main() {}"#,
+        ),
+    ] {
+        let package = root.path().join("crates").join(package);
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        write_source(package.join("src/lib.rs"), "").unwrap();
+        write_source(package.join("build.rs"), build).unwrap();
+    }
+    write_source(root.path().join(file), "fn inputs() {}").unwrap();
+    let census = load_census(root.path()).unwrap();
+    assert_eq!(
+        census.owner_at(file, 1, 0).unwrap(),
+        "local_build::build_program::shared::inputs"
+    );
+}
+
+#[test]
 fn build_program_cannot_path_load_production_source() {
     let root = build_program_fixture(
         "#[path = \"src/lib.rs\"] mod runtime; fn main() {}",
