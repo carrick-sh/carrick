@@ -6,10 +6,11 @@
 //! escalation), and Ring-0 port I/O exits so CPL0 kernels (including `carrick-x86-cpl0-fixture`)
 //! execute deterministically without `/dev/kvm`.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::apic::{ApicCluster, ApicNode, TscClock};
+use crate::apic::{ApicCluster, ApicNode, BlockTscClock, TscClock};
 use crate::context::{SoftCpuContext, SoftSegment, X86Exception, X86ExceptionVector, reg};
 use crate::cpu::{SoftCpu, SoftCpuExit, SoftCpuNewError};
 use crate::cpuid::CpuidAuthority;
@@ -128,6 +129,12 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
         self.cpu.set_clock(clock);
     }
 
+    /// Start a fresh virtual TSC source that charges a fixed number of ticks per guest block.
+    /// An interruptible HLT can advance this clock to the next deliverable local timer event.
+    pub fn set_block_tsc_clock(&mut self, ticks_per_block: NonZeroU64) {
+        self.set_clock(Arc::new(BlockTscClock::new(ticks_per_block)));
+    }
+
     /// Attach this machine's local APIC to `cluster` for cross-vCPU `ICR` IPI routing.
     pub fn attach_apic_cluster(&mut self, cluster: Arc<ApicCluster>) {
         self.cpu.attach_apic_cluster(cluster);
@@ -204,6 +211,9 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
         }
 
         let exit = self.cpu.step_block(&mut self.mem)?;
+        if let Some(clock) = self.cpu.context().msrs().clock() {
+            clock.account_block();
+        }
         Ok(handle_cpu_exit(
             &mut self.cpu,
             &mut self.mem,
@@ -224,6 +234,17 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
             rip: self.cpu.context().rip,
         })
     }
+}
+
+fn advance_halted_timer(ctx: &SoftCpuContext) -> bool {
+    if (ctx.rflags & RFLAGS_IF) == 0 || !ctx.lapic().timer_outranks_ppr() {
+        return false;
+    }
+    let msrs = ctx.msrs();
+    if let (Some(clock), Some(deadline)) = (msrs.clock(), ctx.next_timer_deadline_tsc()) {
+        return clock.advance_halted_to(msrs.clock_deadline(deadline));
+    }
+    false
 }
 
 fn wait_for_apic_event(cpu: &SoftCpu, max_wait: Duration) {
@@ -265,12 +286,15 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
         SoftCpuExit::Continue { .. } => None,
         SoftCpuExit::Hlt { rip, next_rip } => {
             let _ = cpu.poll_apic_timer();
-            if ((cpu.context().rflags & RFLAGS_IF) == 0
-                || !cpu.context().has_deliverable_apic_interrupt())
-                && let Some(max_wait) = hlt_wait_timeout
+            if (cpu.context().rflags & RFLAGS_IF) == 0
+                || !cpu.context().has_deliverable_apic_interrupt()
             {
-                wait_for_apic_event(cpu, max_wait);
-                let _ = cpu.poll_apic_timer();
+                if advance_halted_timer(cpu.context()) {
+                    let _ = cpu.poll_apic_timer();
+                } else if let Some(max_wait) = hlt_wait_timeout {
+                    wait_for_apic_event(cpu, max_wait);
+                    let _ = cpu.poll_apic_timer();
+                }
             }
             if (cpu.context().rflags & RFLAGS_IF) != 0
                 && cpu.context().has_deliverable_apic_interrupt()

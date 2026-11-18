@@ -35,6 +35,9 @@ use crate::memory::{SoftCarrierMemory, SoftVm};
 /// Soft TSC frequency published to the CPUID view and the CPU binding.
 pub const SOFT_TSC_HZ: u64 = 2_000_000_000;
 
+/// The single-vCPU model executes one guest block per 100 ns of virtual time.
+const SOFT_TSC_TICKS_PER_BLOCK: NonZeroU64 = NonZeroU64::new(SOFT_TSC_HZ / 10_000_000).unwrap();
+
 /// The CPUID view every soft carrier CPU presents. M1 is single-vCPU
 /// (#2397): each soft CPU reports APIC ID 0 until the APIC cluster lands.
 pub fn soft_cpuid() -> GuestCpuidView {
@@ -125,7 +128,8 @@ pub struct SoftRunner {
 }
 
 impl SoftRunner {
-    pub fn new(machine: SoftMachine<SoftCarrierMemory>, max_blocks: u64) -> Self {
+    pub fn new(mut machine: SoftMachine<SoftCarrierMemory>, max_blocks: u64) -> Self {
+        machine.set_block_tsc_clock(SOFT_TSC_TICKS_PER_BLOCK);
         Self {
             machine,
             max_blocks,

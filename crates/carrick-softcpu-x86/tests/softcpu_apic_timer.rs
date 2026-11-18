@@ -4,6 +4,7 @@
 #![cfg(target_arch = "x86_64")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -889,6 +890,48 @@ fn hlt_deadline_wait_uses_clock_domain_after_guest_tsc_write() {
         SoftMachineExit::Hlt { .. }
     ));
     assert_eq!(*clock.0.lock().unwrap(), Some(2_000));
+}
+
+#[test]
+fn block_tsc_clock_counts_guest_work_and_wakes_hlt_at_the_deadline() {
+    let (mut machine, data_frame, isr_frame) = setup_apic_machine(0, &[0xe6, 0x80, 0xfb, 0xf4]); // out 0x80, al; sti; hlt
+    machine.mem_mut().write_gpa(isr_frame.raw(), &[0xe6, 0x81]); // out 0x81, al
+    machine.mem_mut().write_gpa(
+        data_frame.raw() + 0x100 + 0xef * 16,
+        &idt_gate64(ISR_VA, 0x08, 0, 0, true, false),
+    );
+    machine.set_block_tsc_clock(NonZeroU64::new(100).unwrap());
+    let ctx = machine.context_mut();
+    ctx.rflags &= !(1 << 9);
+    ctx.lapic_mmio_write(LAPIC_SVR_OFFSET, &0x1ffu32.to_le_bytes());
+    ctx.lapic_mmio_write(
+        LAPIC_LVT_TIMER_OFFSET,
+        &(LAPIC_LVT_TIMER_MODE_TSC_DEADLINE | 0xef).to_le_bytes(),
+    );
+    let caps = carrick_softcpu_x86::MsrCapabilities::from_cpuid(
+        &GuestCpuidView::default()
+            .with_tsc(carrick_x86::TscCrystalRatio::from_hz(1_000_000_000u64)),
+    );
+    ctx.write_msr(MSR_IA32_TSC, 5_000, caps).unwrap();
+    ctx.write_msr(MSR_IA32_TSC_DEADLINE, 6_000, caps).unwrap();
+
+    assert!(matches!(
+        machine.step().unwrap(),
+        Some(SoftMachineExit::IoOut { port: 0x80, .. })
+    ));
+    assert_eq!(machine.context().now_tsc(), 5_100);
+    assert_eq!(machine.context().lapic().timer_fire_count(), 0);
+    assert_eq!(machine.step().unwrap(), None); // STI; the shadow covers HLT.
+    assert_eq!(machine.context().now_tsc(), 5_200);
+    assert_eq!(machine.step().unwrap(), None); // HLT advances to the timer event.
+    assert_eq!(machine.context().now_tsc(), 6_000);
+    assert_eq!(machine.context().rip, ISR_VA);
+    assert_eq!(machine.context().lapic().timer_fire_count(), 1);
+    assert!(matches!(
+        machine.step().unwrap(),
+        Some(SoftMachineExit::IoOut { port: 0x81, .. })
+    ));
+    assert_eq!(machine.context().now_tsc(), 6_100);
 }
 
 #[test]
