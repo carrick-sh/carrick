@@ -14,9 +14,10 @@ use crate::state::{
 };
 use crate::translate::GuestInstruction;
 use crate::{
-    AtomicTransferKind, Branch, Decoded, ExceptionKind, Extend, Hint, Immediate16, Instruction,
-    MemoryAddress, MemoryIndex, MemoryOperation, MemoryRegister, MemorySize, OperandRegister,
-    PstateField, RegisterBranch, SystemDirection, SystemRegister, TlbiOperation, Width,
+    AtomicTransferKind, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, Extend, Hint,
+    Immediate16, Instruction, MemoryAddress, MemoryIndex, MemoryOperation, MemoryRegister,
+    MemorySize, OperandRegister, PstateField, RegisterBranch, SystemDirection, SystemRegister,
+    TlbiOperation, Width,
 };
 
 /// A guest access the flat memory model cannot serve (an unmapped address,
@@ -180,6 +181,14 @@ pub fn execute(
             }
             Err(_) => undefined(cpu),
         },
+        Instruction::Barrier(Barrier {
+            kind: BarrierKind::Isb,
+            ..
+        }) => {
+            // B2.3.4: the next guest fetch must occur after this boundary.
+            next(cpu);
+            Outcome::Continue
+        }
         Instruction::Hint(h) => {
             next(cpu);
             Outcome::Event(Event::Hint(h))

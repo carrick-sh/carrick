@@ -649,3 +649,23 @@ fn production_loader_vector_spans_split_and_translate_with_no_undefined_word() {
         .collect();
     measure("loader/vector spans", &[(0, words)]);
 }
+
+#[test]
+fn isb_prevents_fetching_the_following_instruction_in_the_same_block() {
+    let mut fetched = Vec::new();
+    let block = split_block(PC, BlockLimits::default(), |pc| {
+        fetched.push(pc);
+        match pc.0 - PC.0 {
+            0 => Some(0xd503_3bbf), // dmb ish
+            4 => Some(0xd503_3fdf), // isb
+            8 => Some(0xd503_201f), // nop
+            _ => None,
+        }
+    });
+    assert_eq!(fetched, [PC, ProgramCounter(PC.0 + 4)]);
+    assert_eq!(block.next_pc(), ProgramCounter(PC.0 + 8));
+    assert!(matches!(
+        emit_block(&block).unwrap().exits.as_slice(),
+        [BlockExit::Handler(_)]
+    ));
+}
