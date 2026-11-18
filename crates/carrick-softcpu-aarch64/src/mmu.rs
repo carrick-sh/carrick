@@ -96,11 +96,11 @@ pub fn translate(
     Ok(walk(cpu, memory, va, access, class)?.output().raw())
 }
 
-/// D13.2.103 PAR_EL1 bit 11 is RES1 in both 64-bit formats (F=0 and F=1).
+/// D13.2.103 `PAR_EL1` bit 11 is RES1 in both 64-bit formats (`F=0` and `F=1`).
 const PAR_RES1: u64 = 1 << 11;
-/// D13.2.103 PAR_EL1.PA[47:12] mask when F=0 (IPS <= 48 bits).
+/// D13.2.103 `PAR_EL1.PA[47:12]` mask when `F=0` (`IPS <= 48` bits).
 const PAR_PA_MASK: u64 = 0x0000_ffff_ffff_f000;
-/// D13.2.103 PAR_EL1.SH shift (bits [8:7]); Outer Shareable is 0b10.
+/// D13.2.103 `PAR_EL1.SH` shift (`bits [8:7]`); Outer Shareable is `0b10`.
 const PAR_SH_SHIFT: u32 = 7;
 const PAR_SH_OUTER: u64 = 0b10;
 
