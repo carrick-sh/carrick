@@ -302,11 +302,25 @@ fn drive(elf: &[u8], run: &mut HelloRun, patch: Option<u8>) -> Result<(), String
             CarrierRunExit::PhysicalDoorbell { port, .. } => {
                 let kernel = root.kernel();
                 let status = lease
-                    .service_physical_doorbell(task, &stopped.exit, |served, doorbell| {
-                        carrick_kernel::el1_delegation::settle_host_work_boundary(
-                            kernel, served, doorbell,
-                        );
-                    })
+                    .service_physical_doorbell_with_host_file(
+                        task,
+                        &stopped.exit,
+                        |served, doorbell| {
+                            carrick_kernel::el1_delegation::settle_host_work_boundary(
+                                kernel, served, doorbell,
+                            );
+                        },
+                        // The fork fixture's native host-file record is the
+                        // child's stdout write. Use the dispatcher that owns
+                        // the requesting ring task's retained file resources.
+                        &mut |_, requester, record| {
+                            dispatcher
+                                .serve_native_host_file_for(record, None, requester)
+                                .map(|reply| reply.into_reply())
+                                .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)
+                        },
+                        &mut |_| Err(carrick_abi::LINUX_ENOSYS),
+                    )
                     .map_err(|error| format!("doorbell {port:#x}: {error}"))?;
                 run.exits.push(format!("doorbell {port:#x}"));
                 match status {
@@ -442,13 +456,34 @@ fn production_ring_runs_musl_hello_to_exit_on_soft_cpu() {
 }
 
 #[test]
-#[ignore = "M1-6 fork root admission frontier; requires the separately assembled fork fixture"]
 fn production_ring_forked_child_writes_and_is_reaped() {
-    let elf = std::fs::read(concat!(
+    let source = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../target/soft-lifecycle/fork"
-    ))
-    .expect("static fork fixture");
+        "/../carrick-cli/tests/fixtures/x86_forked_child_stdout.S"
+    );
+    let output =
+        std::path::Path::new(env!("OUT_DIR")).join(format!("soft-fork-{}", std::process::id()));
+    let assembled = std::process::Command::new("timeout")
+        .args([
+            "10",
+            "cc",
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-Wl,--build-id=none",
+        ])
+        .arg(source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("assemble static fork fixture");
+    assert!(
+        assembled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&assembled.stderr)
+    );
+    let elf = std::fs::read(&output).expect("static fork fixture");
+    std::fs::remove_file(output).expect("remove assembled fork fixture");
     let run = run_hello(&elf);
     assert!(run.failure.is_none(), "{}", run.summary());
     assert_eq!(run.stdout, b"E", "{}", run.summary());
