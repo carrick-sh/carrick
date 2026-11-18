@@ -1,6 +1,6 @@
 //! Arm ARM DDI0487G.a D1.10 exception entry / AArch64.TakeException (J1-7877–7878),
 //! D1.11 exception return / AArch64.ExceptionReturn (J1-7951),
-//! SetPSTATEFromPSR (J1-8205–8206), and D13.2.37 ESR_EL1.
+//! SetPSTATEFromPSR (J1-8204–8205), and D13.2.37 ESR_EL1.
 //! Pure virtual transitions; no host exceptions or provider actions.
 //! Dispatch checks the PC and restored IL before executing the next block.
 //! Address-size checks on ERET belong to the translation regime.
@@ -208,7 +208,8 @@ pub enum ReturnError {
 }
 /// D1.11 Illegal return events from AArch64 state; AArch64.ExceptionReturn.
 /// Illegal SPSR.M retains current EL/SP, sets IL, restores NZCV/PAN/DAIF and
-/// branches to ELR. ERET at EL0 is undefined and changes no state.
+/// branches to ELR. This profile uses saved UAO for the architecturally
+/// UNKNOWN UAO on illegal return. ERET at EL0 is undefined and changes no state.
 pub fn eret(cpu: &mut CpuState) -> Result<(), ReturnError> {
     if cpu.pstate.el == ExceptionLevel::El0 {
         return Err(ReturnError::UndefinedAtEl0);
@@ -219,6 +220,7 @@ pub fn eret(cpu: &mut CpuState) -> Result<(), ReturnError> {
         cpu.pstate.il = true;
         cpu.pstate.nzcv = ((cpu.el1.spsr.0 >> 28) & 15) as u8;
         cpu.pstate.pan = cpu.el1.spsr.0 & (1 << 22) != 0;
+        cpu.pstate.uao = cpu.el1.spsr.0 & (1 << 23) != 0;
         cpu.pstate.daif = InterruptMasks(((cpu.el1.spsr.0 >> 6) & 15) as u8);
     }
     // AArch64.ExceptionReturn performs SendEventLocal even on an illegal return.
