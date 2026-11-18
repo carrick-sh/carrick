@@ -569,9 +569,9 @@ fn el1_at_populates_par_el1_with_stage1_attributes_and_faults() {
         assert_eq!(r.cpu.named.par.0, (1 << 11) | (0x0f << 1) | 1);
     }
 
-    // 4. Unmapped HOLE reports L3 translation fault (FST=0x07), and Rt=31
-    // (`at s1e0r, xzr` = 0xd508_785f) translates VA=0 (unmapped L3, FST=0x07)
-    // rather than SP_EL1.
+    // 4. Unmapped HOLE (under mapped l2[2] -> l3) reports L3 translation
+    // fault (FST=0x07), and Rt=31 (`at s1e0r, xzr` = 0xd508_785f) translates
+    // VA=0 (unmapped l2[0], L2 translation fault FST=0x06) rather than SP_EL1.
     r.cpu.sp_el1 = StackPointer(UDATA);
     r.cpu.pc = ProgramCounter(CODE);
     r.set(12, HOLE + 8);
@@ -579,10 +579,10 @@ fn el1_at_populates_par_el1_with_stage1_attributes_and_faults() {
     assert_eq!(r.cpu.named.par.0, (1 << 11) | (0x07 << 1) | 1);
     r.cpu.pc = ProgramCounter(CODE);
     assert_eq!(r.run(0xd508_785f), Outcome::Continue);
-    assert_eq!(r.cpu.named.par.0, (1 << 11) | (0x07 << 1) | 1);
+    assert_eq!(r.cpu.named.par.0, (1 << 11) | (0x06 << 1) | 1);
 
     // 5. Missing descriptor backing is a provider stop, not a guest PAR_EL1 fault.
-    r.cpu.named.ttbr0 = SystemValue(0x90_0000);
+    r.cpu.named.ttbr0 = SystemValue(0xf0_0000);
     r.cpu.named.par = SystemValue(0x1234);
     r.cpu.pc = ProgramCounter(CODE);
     assert!(matches!(

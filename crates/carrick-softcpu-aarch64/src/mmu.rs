@@ -96,6 +96,90 @@ pub fn translate(
     Ok(walk(cpu, memory, va, access, class)?.output().raw())
 }
 
+/// D13.2.103 PAR_EL1 bit 11 is RES1 in both 64-bit formats (F=0 and F=1).
+const PAR_RES1: u64 = 1 << 11;
+/// D13.2.103 PAR_EL1.PA[47:12] mask when F=0 (IPS <= 48 bits).
+const PAR_PA_MASK: u64 = 0x0000_ffff_ffff_f000;
+/// D13.2.103 PAR_EL1.SH shift (bits [8:7]); Outer Shareable is 0b10.
+const PAR_SH_SHIFT: u32 = 7;
+const PAR_SH_OUTER: u64 = 0b10;
+
+/// Perform an EL1 `AT S1E*` stage-1 translation (Arm ARM DDI0487G.a C6.2.21,
+/// C5.3, D5.2.9, D5.4.2, D13.2.103) and return the 64-bit `PAR_EL1` value.
+/// Returns `None` for non-EL1 `AT` encodings (`op1 != 0`), which are undefined
+/// at EL1. Stage-1 faults never raise exceptions: they return `Ok(par)` with
+/// `PAR_EL1.F=1` and `FST=status_code()`.
+pub(crate) fn address_translate(
+    cpu: &CpuState,
+    memory: &mut impl GuestMemory,
+    op: crate::Translation,
+    va: u64,
+) -> Option<Result<u64, Stage1Error>> {
+    use crate::Translation;
+    let (el, pan, access) = match op {
+        Translation::S1E1R => (Aarch64El::El1, false, LeafAccess::Read),
+        Translation::S1E1W => (Aarch64El::El1, false, LeafAccess::Write),
+        Translation::S1E0R => (Aarch64El::El0, false, LeafAccess::Read),
+        Translation::S1E0W => (Aarch64El::El0, false, LeafAccess::Write),
+        Translation::S1E1Rp => (Aarch64El::El1, cpu.pstate.pan, LeafAccess::Read),
+        Translation::S1E1Wp => (Aarch64El::El1, cpu.pstate.pan, LeafAccess::Write),
+        _ => return None,
+    };
+    if !enabled(cpu) {
+        // D5.1.1 / D5.2.9: flat data translation strips an ignored top byte
+        // under TBI0/TBI1, faults as L0 address-size above 48 bits, and
+        // otherwise yields Device-nGnRnE (ATTR=0x00) and Outer Shareable (0b10).
+        let tbi_bit = if (va >> 55) & 1 == 0 { 37 } else { 38 };
+        let effective = if (cpu.el1.tcr.0 >> tbi_bit) & 1 != 0 {
+            va & 0x00ff_ffff_ffff_ffff
+        } else {
+            va
+        };
+        if effective >> 48 != 0 {
+            return Some(Ok(PAR_RES1 | 1));
+        }
+        return Some(Ok((effective & PAR_PA_MASK)
+            | PAR_RES1
+            | (PAR_SH_OUTER << PAR_SH_SHIFT)));
+    }
+    let regime = match regime(cpu) {
+        Ok(regime) => regime,
+        Err(error) => return Some(Err(Stage1Error::Regime(error))),
+    };
+    let context = Aarch64WalkContext {
+        regime,
+        el,
+        pan,
+        uao: false,
+        class: Aarch64AccessClass::Ordinary,
+    };
+    let words = PhysicalWords(RefCell::new(memory));
+    Some(
+        match Aarch64Walker.walk(&words, &context, GuestVa::new(va), access) {
+            Ok(leaf) => {
+                let attr = (cpu.el1.mair.0 >> (8 * u32::from(leaf.attr_index()))) & 0xff;
+                let raw_sh = (leaf.descriptor() >> 8) & 0b11;
+                // D5.5 / D13.2.103: Device memory and Normal Inner+Outer
+                // Non-cacheable (0x44) are effectively Outer Shareable (0b10);
+                // reserved descriptor SH=0b01 behaves as Non-shareable (0b00).
+                let sh = if attr & 0xf0 == 0 || attr == 0x44 {
+                    PAR_SH_OUTER
+                } else if raw_sh == 0b01 {
+                    0
+                } else {
+                    raw_sh
+                };
+                let pa = leaf.output().raw() & PAR_PA_MASK;
+                Ok((attr << 56) | pa | PAR_RES1 | (sh << PAR_SH_SHIFT))
+            }
+            Err(WalkError::Fault(fault)) => {
+                Ok(PAR_RES1 | (u64::from(fault.status_code()) << 1) | 1)
+            }
+            Err(WalkError::Refusal(refusal)) => Err(Stage1Error::Descriptor(refusal)),
+        },
+    )
+}
+
 /// Walk an enabled stage-1 regime, retaining the selected memory attribute.
 pub(crate) fn walk(
     cpu: &CpuState,

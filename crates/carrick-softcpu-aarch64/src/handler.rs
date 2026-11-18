@@ -21,7 +21,7 @@ use crate::{
     AtomicTransferKind, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, Extend, Hint,
     IcOperation, Immediate16, Instruction, MemoryAddress, MemoryIndex, MemoryOperation,
     MemoryRegister, MemorySize, OperandRegister, PstateField, RegisterBranch, SystemDirection,
-    SystemRegister, TlbiOperation, Translation, Width,
+    SystemRegister, TlbiOperation, Width,
 };
 use carrick_mmu_core::aarch64::stage1_walk::Aarch64Fault;
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
@@ -72,8 +72,6 @@ pub enum Event {
     MmuEnable {
         value: SystemValue,
     },
-    /// AT needs a stage-1 walk. Not retired.
-    AddressTranslate,
     /// Not retired: guest memory could not serve this (physical) access.
     MemoryFault(MemoryFault),
     /// Not retired: the stage-1 walk could not run (descriptor memory
@@ -205,22 +203,26 @@ pub fn execute(
             next(cpu);
             Outcome::Event(Event::Tlbi(op.operation))
         }
-        Instruction::CensusGap(Decoded::AddressTranslate { op, .. }) => {
+        Instruction::CensusGap(Decoded::AddressTranslate { op, xt }) => {
             // C5.3, Table C5-3: only the op1=0 AT aliases are available at EL1.
-            if cpu.pstate.el == ExceptionLevel::El0
-                || !matches!(
-                    op,
-                    Translation::S1E1R
-                        | Translation::S1E1W
-                        | Translation::S1E0R
-                        | Translation::S1E0W
-                        | Translation::S1E1Rp
-                        | Translation::S1E1Wp
-                )
-            {
+            if cpu.pstate.el == ExceptionLevel::El0 {
                 return undefined(cpu);
             }
-            Outcome::Event(Event::AddressTranslate)
+            let va = match crate::Gpr::new(xt.number()) {
+                Some(r) => cpu.read_operand(OperandRegister::Gpr(r)).0,
+                None => 0, // C6.2.21: Rt=31 is XZR.
+            };
+            let Some(result) = mmu::address_translate(cpu, memory, op, va) else {
+                return undefined(cpu);
+            };
+            match result {
+                Ok(par) => {
+                    cpu.named.par = SystemValue(par);
+                    next(cpu);
+                    Outcome::Continue
+                }
+                Err(error) => Outcome::Event(Event::Translation(error)),
+            }
         }
         Instruction::CensusGap(Decoded::ClearExclusive { .. }) => {
             monitor.clear();
