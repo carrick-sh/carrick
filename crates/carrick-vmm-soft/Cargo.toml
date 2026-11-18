@@ -32,6 +32,7 @@ toml.workspace = true
 
 [dev-dependencies]
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
+carrick-sched-core = { path = "../carrick-sched-core" }
 
 # The probe boots the ring image in the VM-free soft CPU: no /dev/kvm.
 [package.metadata.carrick.test-lanes]

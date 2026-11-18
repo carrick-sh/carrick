@@ -9,7 +9,8 @@
 
 use std::sync::Arc;
 
-use carrick_vmm_soft::{BootExit, BootReport, ProbeImage, boot_probe};
+use carrick_vmm_soft::{BootExit, BootReport, ProbeImage, SoftCarrier, boot_probe};
+use carrick_x86_cpl0_host::cpl0_boot::{Cpl0BootCarrier, InitialTaskBinding};
 
 const PRODUCTION: &[u8] = include_bytes!(env!("CARRICK_X86_CPL0_IMAGE"));
 const FIXTURE: &[u8] = include_bytes!(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"));
@@ -60,6 +61,57 @@ fn inventory() -> Arc<dyn carrick_hal::PhysicalFrameInventory> {
         .physical_projection(Arc::new(carrick_kernel::kernel::ObjectIdRegistry::new()))
 }
 
+/// The KVM production witnesses' stopped-carrier sequence
+/// (`boot_program_carrier`): publish the retained IPC table map to the
+/// kernel-issued root, bind the carrier's birth source into the kernel, and
+/// bind that exact root as the initial task.
+fn bind_issued_root(
+    carrier: &mut SoftCarrier,
+    root: &carrick_kernel::kernel::KernelContext,
+) -> Result<(), String> {
+    let owner = root
+        .kernel()
+        .ipc()
+        .map_err(|error| format!("IPC owner: {error:?}"))?;
+    let map = carrier
+        .custody()
+        .ipc_table_map()
+        .map_err(|error| error.to_string())?;
+    root.resources()
+        .files()
+        .publish_ipc(
+            owner,
+            carrick_kernel::kernel::objects::IpcTableMapBinding::Retained(map),
+        )
+        .map_err(|error| format!("publish exact table: {error:?}"))?;
+    let source = carrier
+        .custody()
+        .birth_serial_source()
+        .map_err(|error| error.to_string())?;
+    root.kernel()
+        .bind_initial_birth_source(source)
+        .map_err(|error| format!("bind initial birth source: {error:?}"))?;
+    carrier
+        .custody_mut()
+        .bind_initial_task_identity(InitialTaskBinding {
+            task: root.task().key(),
+            mm: carrick_hal::MmGeneration::new(root.shared().mm().id().nonzero()),
+            thread: carrick_sched_core::ThreadIdentity {
+                tid: carrick_el1_abi::El1TaskId::from_linux_tid(root.thread().key().tid.raw())
+                    .raw(),
+                serial: root.thread().key().serial.raw(),
+                mm: 0,
+                file_table: root.resources().files().id().raw(),
+                generation: carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL.raw(),
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: 0,
+                control_slot: 0,
+            },
+        })
+        .map_err(|error| error.to_string())
+}
+
 fn probe(image: ProbeImage<'_>) -> BootReport {
     let report = boot_probe(inventory(), image, MAX_BLOCKS);
     println!("{report}");
@@ -81,6 +133,10 @@ fn reached_host_exit(report: &BootReport, ring_fatal_admitted: bool) -> bool {
 #[test]
 fn production_ring_image_boots_to_first_carrier_exit_on_soft_cpu() {
     let exit_seven = static_elf(EXIT_SEVEN);
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher);
+    let root = dispatcher.capture_one_task_context().expect("issued root");
+    let bind = |carrier: &mut SoftCarrier| bind_issued_root(carrier, &root);
     let reports = [
         (
             false,
@@ -91,6 +147,8 @@ fn production_ring_image_boots_to_first_carrier_exit_on_soft_cpu() {
                 initial_extent_bytes: Some(INITIAL_EXTENT),
                 fixture_image: false,
                 user_elf: None,
+                ipc: None,
+                bind: None,
             }),
         ),
         // The initial MM is admitted through the shared `load_guest_mm`, as
@@ -104,6 +162,8 @@ fn production_ring_image_boots_to_first_carrier_exit_on_soft_cpu() {
                 initial_extent_bytes: None,
                 fixture_image: false,
                 user_elf: Some(&exit_seven),
+                ipc,
+                bind: Some(&bind),
             }),
         ),
         (
@@ -115,12 +175,17 @@ fn production_ring_image_boots_to_first_carrier_exit_on_soft_cpu() {
                 initial_extent_bytes: None,
                 fixture_image: true,
                 user_elf: None,
+                ipc: None,
+                bind: None,
             }),
         ),
     ];
     let failed: Vec<_> = reports
         .iter()
-        .filter(|(fatal, report)| !reached_host_exit(report, *fatal))
+        .filter(|(fatal, report)| {
+            !reached_host_exit(report, *fatal)
+                || (report.image.contains("admitted") && !report.admitted)
+        })
         .map(|(_, report)| format!("[{}] {}", report.image, report.summary))
         .collect();
     assert!(failed.is_empty(), "soft boot probe:\n{}", failed.join("\n"));
