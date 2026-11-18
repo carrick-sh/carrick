@@ -173,9 +173,8 @@ On x86 (this VM and every CI lane):
 - Emitter: copy-through identity, rewritten immediates, relocated branch
   offsets, exact stub words, all hand-encoded from the Arm ARM and checked with
   `llvm-objdump` when `CARRICK_LLVM_OBJDUMP` is set.
-- Handlers: known answers from the Arm ARM pseudocode. Apply each mutation
-  independently, run the named handler integration test or dispatcher unit
-  test, and restore the source before the next mutation. Each mutation below
+- Mutation controls: apply each mutation independently, run its named test,
+  and restore the source before the next mutation. Each mutation below
   compiles and fails its named test.
 
   | File | One-line mutation | Test |
@@ -194,6 +193,8 @@ On x86 (this VM and every CI lane):
   | `dispatch.rs` | Add `&& !cpu.pstate.il` to the PC alignment fault condition. | `misaligned_pc_takes_priority_over_illegal_execution_state` |
   | `dispatch.rs` | Replace `else if cpu.pstate.il` with `else if false && cpu.pstate.il`. | `restored_il_takes_an_exception_before_the_next_guest_instruction` |
   | `exception.rs` | Delete `cpu.signal_local_event();` from ERET. | `svc_and_eret_restore_the_origin_and_signal_one_local_event` |
+  | `exception.rs` | Delete the `cpu.pstate.uao` assignment in the illegal ERET branch. | `illegal_eret_restores_uao_from_spsr_el1` |
+  | `translate.rs` | Replace ISB's `InstructionClass::Exit(ExitReason::InstructionSynchronization)` with `InstructionClass::Copy(CopyKind::Verbatim)`. | `isb_prevents_fetching_the_following_instruction_in_the_same_block` |
 - Dispatcher: a `cfg(test)`-only `ExecuteBlock` double runs blocks of a small
   fixed instruction subset, only to test the dispatcher's exit mapping, PC
   continuation and stop reasons. It is never a product path.
