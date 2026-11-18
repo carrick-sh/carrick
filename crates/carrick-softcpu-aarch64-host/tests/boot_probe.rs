@@ -124,6 +124,28 @@ fn load_elf(bytes: &[u8], memory: &mut Pages) -> u64 {
 // This probe starts after the vector handoff, so the trampoline page is
 // unbacked. It is EL1-executable at stage 1 and stops at the provider fetch.
 const RETURN_SENTINEL: u64 = LINUX_EL0_TRAMPOLINE_BASE;
+const _: () = assert!(RETURN_SENTINEL == 0x2d_0000_0000);
+
+fn assert_sentinel_return(cpu: &CpuState, strict: &Report<HostError>) {
+    assert_eq!(
+        strict.pc,
+        ProgramCounter(RETURN_SENTINEL),
+        "strict probe did not stop at the loader sentinel PC: {strict}"
+    );
+    assert_eq!(
+        strict.stop,
+        Stop::Fetch(VirtualAddress(RETURN_SENTINEL)),
+        "strict probe did not stop on an instruction fetch from the loader sentinel: {strict}"
+    );
+    let exit_word = cpu
+        .read_operand(OperandRegister::Gpr(Gpr::new(0).unwrap()))
+        .0;
+    println!("  returned to the loader sentinel: x0 (exit word) = {exit_word:#x}");
+    assert_eq!(
+        exit_word, 0,
+        "strict probe returned non-zero exit word: {strict}"
+    );
+}
 
 fn set_x(cpu: &mut CpuState, n: u8, v: u64) {
     cpu.write_operand(OperandRegister::Gpr(Gpr::new(n).unwrap()), RegisterValue(v));
@@ -227,46 +249,39 @@ fn production_el1_image_boot_probe() {
         memory.read_boot_root,
         "the probe never read its stage-1 root"
     );
-    if strict.stop == Stop::Fetch(VirtualAddress(RETURN_SENTINEL)) {
-        println!(
-            "  returned to the loader sentinel: x0 (exit word) = {:#x}",
-            cpu.read_operand(OperandRegister::Gpr(Gpr::new(0).unwrap()))
-                .0
-        );
-        return;
-    }
-
-    // Diagnostic pass: demand-zero pages, to show what comes after.
-    let (mut cpu, mut memory) = enter(&elf);
-    let mut blocks = 0;
-    let mut demand = Vec::new();
-    let last = loop {
-        let report = probe(&mut cpu, &mut memory, &mut runner, BUDGET - blocks);
-        blocks += report.blocks;
-        match report.stop {
-            Stop::Event {
-                event: Event::MemoryFault(fault),
-                ..
-            } if demand.len() < 64 => {
-                demand.push((report.pc.0, fault.address.0 & !(PAGE - 1)));
-                memory.map_zero(fault.address.0);
+    if strict.stop != Stop::Fetch(VirtualAddress(RETURN_SENTINEL)) {
+        // Diagnostic pass: demand-zero pages, to show what comes after.
+        let (mut cpu, mut memory) = enter(&elf);
+        let mut blocks = 0;
+        let mut demand = Vec::new();
+        let last = loop {
+            let report = probe(&mut cpu, &mut memory, &mut runner, BUDGET - blocks);
+            blocks += report.blocks;
+            match report.stop {
+                Stop::Event {
+                    event: Event::MemoryFault(fault),
+                    ..
+                } if demand.len() < 64 => {
+                    demand.push((report.pc.0, fault.address.0 & !(PAGE - 1)));
+                    memory.map_zero(fault.address.0);
+                }
+                _ => break report,
             }
-            _ => break report,
+        };
+        for (pc, page) in &demand {
+            println!("  demand-zero page {page:#x} (first touch at PC={pc:#x})");
         }
-    };
-    for (pc, page) in &demand {
-        println!("  demand-zero page {page:#x} (first touch at PC={pc:#x})");
-    }
-    println!(
-        "boot probe (demand-zero, {} pages) total {blocks} blocks; last run: {last}",
-        demand.len()
-    );
-    if last.stop == Stop::Fetch(VirtualAddress(RETURN_SENTINEL)) {
         println!(
-            "  returned to the loader sentinel: x0 (exit word) = {:#x}",
-            cpu.read_operand(OperandRegister::Gpr(Gpr::new(0).unwrap()))
-                .0
+            "boot probe (demand-zero, {} pages) total {blocks} blocks; last run: {last}",
+            demand.len()
         );
+        if last.stop == Stop::Fetch(VirtualAddress(RETURN_SENTINEL)) {
+            println!(
+                "  returned to the loader sentinel: x0 (exit word) = {:#x}",
+                cpu.read_operand(OperandRegister::Gpr(Gpr::new(0).unwrap()))
+                    .0
+            );
+        }
     }
-    panic!("strict probe did not return to the loader sentinel: {strict}");
+    assert_sentinel_return(&cpu, &strict);
 }
