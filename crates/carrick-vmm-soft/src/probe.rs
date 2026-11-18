@@ -117,6 +117,27 @@ impl fmt::Display for BootReport {
     }
 }
 
+/// Collapse consecutive equal names into `name x count` (a lone name stays
+/// bare). Names compare whole: `foo` never absorbs `foo_bar`.
+fn collapse_runs(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut runs: Vec<(String, u64)> = Vec::new();
+    for name in names {
+        match runs.last_mut() {
+            Some((last, count)) if *last == name => *count += 1,
+            _ => runs.push((name, 1)),
+        }
+    }
+    runs.into_iter()
+        .map(|(name, count)| {
+            if count == 1 {
+                name
+            } else {
+                format!("{name} x {count}")
+            }
+        })
+        .collect()
+}
+
 /// Boot `image` on one soft CPU (slot 0) and run at most `max_blocks`.
 pub fn boot_probe(
     inventory: Arc<dyn PhysicalFrameInventory>,
@@ -233,19 +254,12 @@ pub fn boot_probe(
     let trace = carrier.trace().clone();
     report.blocks = trace.blocks;
     report.deliveries = trace.deliveries;
-    for rip in trace.recent {
-        let name = symbols.function(rip).unwrap_or_else(|| format!("{rip:#x}"));
-        match report.recent.last_mut() {
-            Some(last) if last.starts_with(&name) => {
-                let count = last
-                    .rsplit_once(" x ")
-                    .and_then(|(_, count)| count.parse::<u64>().ok())
-                    .unwrap_or(1);
-                *last = format!("{name} x {}", count + 1);
-            }
-            _ => report.recent.push(name),
-        }
-    }
+    report.recent = collapse_runs(
+        trace
+            .recent
+            .into_iter()
+            .map(|rip| symbols.function(rip).unwrap_or_else(|| format!("{rip:#x}"))),
+    );
     let machine = carrier.machine_mut();
     let rip = match report.outcome {
         BootExit::HostExit(
@@ -405,5 +419,19 @@ impl Symbols {
         let index = self.0.partition_point(|&(address, ..)| address <= rip);
         let (address, size, name) = self.0.get(index.checked_sub(1)?)?;
         (size == &0 || rip < address + size).then(|| format!("{name}+{:#x}", rip - address))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collapse_runs;
+
+    #[test]
+    fn runs_collapse_on_whole_names_only() {
+        let names = ["foo", "foo", "foo_bar", "foo_bar", "foo_bar", "foo", "bar"];
+        assert_eq!(
+            collapse_runs(names.map(String::from)),
+            ["foo x 2", "foo_bar x 3", "foo", "bar"]
+        );
     }
 }

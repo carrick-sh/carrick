@@ -1314,7 +1314,6 @@ dependencies = [
  "carrick-x86-cpl0-host",
  "goblin",
  "iced-x86",
- "libc",
  "rustc-demangle",
  "toml",
 ]
