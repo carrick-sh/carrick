@@ -1276,56 +1276,6 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
         }
     }
 
-    struct UnbackedMmapMemory<'a> {
-        tables: &'a crate::mm_portal::test_support::Tables,
-    }
-    impl carrick_el1::memory::AnonymousBackingProbe for UnbackedMmapMemory<'_> {
-        fn backing(
-            &mut self,
-            _: carrick_guest_arch::AddressSpaceRegister,
-            _: UserVa,
-            _: carrick_guest_arch::GuestLen,
-        ) -> carrick_el1::memory::Stage1Backing {
-            carrick_el1::memory::Stage1Backing::of(carrick_el1::memory::RangeBacking::Empty)
-        }
-        fn stock_span(
-            &mut self,
-            _: ReservationMm,
-            _: UserVa,
-        ) -> Option<carrick_guest_arch::UserRange> {
-            None
-        }
-    }
-    impl carrick_el1::memory::AnonymousPermissionEditor for UnbackedMmapMemory<'_> {
-        fn protect_and_invalidate(
-            &mut self,
-            _root: carrick_guest_arch::AddressSpaceRegister,
-            edit: carrick_mmu_core::aarch64::GuestPermissionEdit,
-        ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
-            unsafe {
-                carrick_mmu_core::aarch64::protect_existing_el1_private_pages(
-                    self.tables.words.as_ptr().cast_mut(),
-                    self.tables.base,
-                    self.tables.words.len() * 8,
-                    None,
-                    edit,
-                )
-            }
-            .map(|_| ())
-        }
-    }
-    impl carrick_el1::memory::AnonymousRetirementEditor for UnbackedMmapMemory<'_> {
-        fn retire_and_invalidate(
-            &mut self,
-            _: ReservationMm,
-            _: carrick_guest_arch::AddressSpaceRegister,
-            _: UserVa,
-            _: carrick_guest_arch::GuestLen,
-        ) -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
-            Ok(())
-        }
-    }
-
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let source = BornInZoneSource {

@@ -4197,6 +4197,21 @@ fn production_fork_scratch_exhaustion_answers_enomem() {
     );
 }
 
+/// #2441 on x86 CPL0, the director's ruling on #2508: a worker thread's
+/// real mmap moves the parent's generation while the leader's production
+/// fork is held between its census and its prepare. The fork is Busy
+/// exactly once (the image's superseded-fork census reads 1), reruns, and
+/// returns the child's pid; it never ends the run as a broken invariant.
+#[test]
+fn production_fork_superseded_by_sibling_mmap_is_busy_once_then_forks() {
+    bounded_contention_witness(
+        "production_fork_superseded_by_sibling_mmap_is_busy_once_then_forks",
+        "native_fork_superseded_snapshot.S",
+        &[],
+        "fork superseded by a sibling's mmap",
+    );
+}
+
 /// #2306 on x86 CPL0: as above with the root held once while the fork
 /// commits the child's MM. The prepared child is aborted and the fork
 /// reruns to success, never EFAULT (114).

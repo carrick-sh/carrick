@@ -144,6 +144,52 @@ mod test_support {
     /// The next native fork's scratch allocation finds the kernel heap
     /// exhausted (#2441).
     pub const INJECT_FORK_SCRATCH_EXHAUSTED_ONCE: u64 = 0xffff_ffff_ffff_fe2e;
+    /// Hold the next native fork after its census released the parent's
+    /// space editor and its stock loan crossed, just before its prepare
+    /// re-checks the parent snapshot the census took (#2441), until a
+    /// sibling thread releases it. While held, the sibling's own calls
+    /// edit the parent: real contention, no injected refusal.
+    pub const INJECT_HOLD_NEXT_FORK_PREPARE: u64 = 0xffff_ffff_ffff_fe2f;
+    /// 1 once the armed fork is held, else 0.
+    pub const INJECT_FORK_PREPARE_HELD: u64 = 0xffff_ffff_ffff_fe30;
+    /// Release the held fork to its prepare.
+    pub const INJECT_RELEASE_HELD_FORK_PREPARE: u64 = 0xffff_ffff_ffff_fe31;
+    /// Native fork preparations or publications the parent owner refused
+    /// Busy because the parent snapshot moved (#2441).
+    pub const INJECT_FORK_SUPERSEDED_CENSUS: u64 = 0xffff_ffff_ffff_fe32;
+    static FORK_PREPARE_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    static FORK_SUPERSEDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Called by the native fork between its stock loan crossing and its
+    /// prepare, on the forking member's CPU, with no owner lock held. While
+    /// held it acknowledges shootdowns, as a member away at a crossing does.
+    pub fn hold_armed_fork_prepare() {
+        if FORK_PREPARE_HOLD
+            .compare_exchange(BIRTH_ARMED, BIRTH_HELD, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let mut spins = 0_u64;
+        while FORK_PREPARE_HOLD.load(Ordering::Acquire) == BIRTH_HELD {
+            spins += 1;
+            if spins > BIRTH_HOLD_SPINS {
+                carrick_x86_carrier::entry::fatal_boot();
+            }
+            if carrick_el1::isa::x86::interrupt::sync_user_memory_generation().is_err() {
+                carrick_x86_carrier::entry::fatal_boot();
+            }
+            core::hint::spin_loop();
+        }
+        FORK_PREPARE_HOLD.store(0, Ordering::Release);
+    }
+
+    /// Count a fork the parent owner refused Busy at prepare or publish.
+    pub fn record_fork_superseded(error: carrick_core::mm::transaction::MmError) {
+        if error == carrick_core::mm::transaction::MmError::Busy {
+            FORK_SUPERSEDED.fetch_add(1, Ordering::AcqRel);
+        }
+    }
     /// Address of the armed member's current task, or 0.
     static EARLY_RELEASE_TASK: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
@@ -504,6 +550,23 @@ mod test_support {
             INJECT_FORK_SCRATCH_EXHAUSTED_ONCE => {
                 carrick_core::mm::fork::inject_scratch_exhausted_once().then_some(0)
             }
+            INJECT_HOLD_NEXT_FORK_PREPARE => FORK_PREPARE_HOLD
+                .compare_exchange(0, BIRTH_ARMED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                .then_some(0),
+            INJECT_FORK_PREPARE_HELD => Some(u64::from(
+                FORK_PREPARE_HOLD.load(Ordering::Acquire) == BIRTH_HELD,
+            )),
+            INJECT_RELEASE_HELD_FORK_PREPARE => FORK_PREPARE_HOLD
+                .compare_exchange(
+                    BIRTH_HELD,
+                    BIRTH_RELEASED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+                .then_some(0),
+            INJECT_FORK_SUPERSEDED_CENSUS => Some(FORK_SUPERSEDED.load(Ordering::Acquire)),
             INJECT_WAIT_PARK_CENSUS => {
                 let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
                     carrick_guest_arch::CpuId::new(binding.cpu_slot),
