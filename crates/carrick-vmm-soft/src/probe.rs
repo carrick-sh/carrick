@@ -17,8 +17,12 @@ use carrick_x86_cpl0_host::cpl0_boot::{
 
 use crate::carrier::{SoftBootImage, SoftCarrier, SoftStop};
 
+/// Binds a stopped, booted carrier before its initial MM is admitted
+/// (e.g. the shared kernel's issued root task).
+pub type ProbeBind<'a> = &'a dyn Fn(&mut SoftCarrier) -> Result<(), String>;
+
 /// The ring image and stopped-carrier shape to probe.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ProbeImage<'a> {
     pub name: &'a str,
     pub elf: &'a [u8],
@@ -32,6 +36,10 @@ pub struct ProbeImage<'a> {
     /// Production boot: admit this static x86-64 ELF as the initial guest MM
     /// (no argv or env) before running.
     pub user_elf: Option<&'a [u8]>,
+    /// The production IPC window authority.
+    pub ipc: Option<Arc<dyn carrick_el1_abi::IpcWindowBacking>>,
+    /// Runs after boot and before initial-MM admission.
+    pub bind: Option<ProbeBind<'a>>,
 }
 
 /// How a probe run ended.
@@ -74,6 +82,9 @@ pub struct BootReport {
     pub deliveries: Vec<(u64, u64)>,
     /// `RAX` at a `FATAL_PORT` exit: the ring's fatal payload.
     pub fatal_payload: Option<u64>,
+    /// The functions of the most recent blocks, oldest first, with
+    /// consecutive repeats collapsed (`symbol x count`).
+    pub recent: Vec<String>,
     pub outcome: BootExit,
     pub summary: String,
 }
@@ -99,6 +110,9 @@ impl fmt::Display for BootReport {
         for (from, to) in &self.deliveries {
             writeln!(f, "  delivery    {from:#x} -> stub {to:#x}")?;
         }
+        for function in &self.recent {
+            writeln!(f, "  recent      {function}")?;
+        }
         write!(f, "  outcome     {:?}", self.outcome)
     }
 }
@@ -122,6 +136,7 @@ pub fn boot_probe(
         decoded: None,
         deliveries: Vec::new(),
         fatal_payload: None,
+        recent: Vec::new(),
         outcome: BootExit::Setup(String::new()),
         summary: String::new(),
     };
@@ -144,6 +159,7 @@ pub fn boot_probe(
             programs: image.programs,
             initial_extent_bytes,
             fixture_image: image.fixture_image,
+            ipc: image.ipc,
         },
         max_blocks,
     ) {
@@ -156,6 +172,11 @@ pub fn boot_probe(
     };
     report.entry = carrier.entry();
     report.outcome = 'run: {
+        if let Some(bind) = image.bind
+            && let Err(error) = bind(&mut carrier)
+        {
+            break 'run BootExit::Setup(error);
+        }
         if let Some((program, _)) = &user {
             let Ok(prepared) = carrick_mem::x86_initial_image::prepare_x86_elf(program) else {
                 break 'run BootExit::Setup("user ELF image".to_owned());
@@ -212,6 +233,19 @@ pub fn boot_probe(
     let trace = carrier.trace().clone();
     report.blocks = trace.blocks;
     report.deliveries = trace.deliveries;
+    for rip in trace.recent {
+        let name = symbols.function(rip).unwrap_or_else(|| format!("{rip:#x}"));
+        match report.recent.last_mut() {
+            Some(last) if last.starts_with(&name) => {
+                let count = last
+                    .rsplit_once(" x ")
+                    .and_then(|(_, count)| count.parse::<u64>().ok())
+                    .unwrap_or(1);
+                *last = format!("{name} x {}", count + 1);
+            }
+            _ => report.recent.push(name),
+        }
+    }
     let machine = carrier.machine_mut();
     let rip = match report.outcome {
         BootExit::HostExit(
@@ -278,7 +312,10 @@ fn summarize(report: &BootReport) -> String {
         BootExit::HostExit(SoftMachineExit::IoOut {
             port, size, value, ..
         }) => format!(
-            "boots to first carrier host exit OUT port {port:#x} size {size} value {value:#x} at {at}"
+            "boots to first carrier host exit OUT port {port:#x}{} size {size} value {value:#x} at {at}",
+            port_name(*port)
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default()
         ),
         BootExit::HostExit(SoftMachineExit::IoIn { port, size, .. }) => {
             format!("boots to first carrier host exit IN port {port:#x} size {size} at {at}")
@@ -306,6 +343,23 @@ fn summarize(report: &BootReport) -> String {
         Some(rest) if report.admitted => format!("boots past initial-MM admission to {rest}"),
         _ => summary,
     }
+}
+
+/// The carrier protocol's name for a ring port.
+fn port_name(port: u16) -> Option<&'static str> {
+    use carrick_x86::cpl0_entry as ports;
+    Some(match port {
+        ports::FORWARD_PORT => "FORWARD_PORT",
+        ports::FAULT_DOORBELL_PORT => "FAULT_DOORBELL_PORT",
+        ports::CONTROL_PORT => "CONTROL_PORT",
+        ports::ENTRY_KICK_PORT => "ENTRY_KICK_PORT",
+        ports::RETURN_KICK_PORT => "RETURN_KICK_PORT",
+        ports::WORK_PORT => "WORK_PORT",
+        ports::NATIVE_SERVICE_PORT => "NATIVE_SERVICE_PORT",
+        ports::YIELD_PORT => "YIELD_PORT",
+        ports::OWNER_GRANT_PORT => "OWNER_GRANT_PORT",
+        _ => return None,
+    })
 }
 
 fn decode(rip: u64, bytes: &[u8]) -> Option<String> {
@@ -338,6 +392,13 @@ impl Symbols {
             .collect();
         symbols.sort_unstable_by_key(|&(address, ..)| address);
         Self(symbols)
+    }
+
+    /// The containing function's name, without offset.
+    fn function(&self, rip: u64) -> Option<String> {
+        let index = self.0.partition_point(|&(address, ..)| address <= rip);
+        let (address, size, name) = self.0.get(index.checked_sub(1)?)?;
+        (size == &0 || rip < address + size).then(|| name.clone())
     }
 
     fn nearest(&self, rip: u64) -> Option<String> {

@@ -26,7 +26,7 @@ use crate::memory::{SoftCarrierMemory, SoftVm};
 pub const SOFT_TSC_HZ: u64 = 2_000_000_000;
 
 /// The ring image and stopped-carrier shape to boot.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SoftBootImage<'a> {
     pub elf: &'a [u8],
     /// Per-slot CPL3 fixture code mapped at `USER_CODE` (empty: none).
@@ -35,6 +35,8 @@ pub struct SoftBootImage<'a> {
     pub initial_extent_bytes: Option<usize>,
     /// The image is the test-support fixture build.
     pub fixture_image: bool,
+    /// The production IPC window authority, as KVM's `boot_production` takes.
+    pub ipc: Option<Arc<dyn carrick_el1_abi::IpcWindowBacking>>,
 }
 
 /// Why a soft run stopped without a carrier exit.
@@ -64,7 +66,13 @@ pub struct SoftRunTrace {
     /// Exception deliveries into the ring's fault stubs
     /// (`interrupted rip -> stub rip`).
     pub deliveries: Vec<(u64, u64)>,
+    /// Start RIPs of the most recent blocks, oldest first (at most
+    /// [`RECENT_BLOCKS`]).
+    pub recent: std::collections::VecDeque<u64>,
 }
+
+/// How many recent block RIPs a [`SoftRunTrace`] keeps.
+pub const RECENT_BLOCKS: usize = 512;
 
 /// A stopped soft CPL0 carrier. Field order is drop order: the machine
 /// translates through registrations the custody's `CarrierMemory` owns.
@@ -93,7 +101,7 @@ impl SoftCarrier {
             false,
             image.initial_extent_bytes,
             image.fixture_image,
-            None,
+            image.ipc,
         )?;
         let vm = SoftVm::new();
         let BootMemory {
@@ -220,6 +228,10 @@ impl SoftCarrier {
                 return None;
             }
             let before = self.machine.context().rip;
+            if self.trace.recent.len() == RECENT_BLOCKS {
+                self.trace.recent.pop_front();
+            }
+            self.trace.recent.push_back(before);
             let step = self.machine.step();
             self.trace.blocks += 1;
             let exit = match step {
@@ -244,7 +256,7 @@ impl SoftCarrier {
                 | SoftMachineExit::IoIn { .. }
                 | SoftMachineExit::Hlt { .. } => {
                     let rax = self.machine.context().gpr[carrick_softcpu_x86::reg::RAX];
-                    self.trace.last_exit = Some((exit.clone(), rax));
+                    self.trace.last_exit = Some((exit, rax));
                     return Some(exit);
                 }
                 SoftMachineExit::UnhandledSensitive { .. } => {

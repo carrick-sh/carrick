@@ -22,4 +22,4 @@ pub mod probe;
 pub use carrier::{SoftBootImage, SoftCarrier, SoftRunTrace, SoftStop};
 pub use cpu::{SoftBootVcpu, apply_boot_cpu_state};
 pub use memory::{SoftCarrierMemory, SoftVm};
-pub use probe::{BootExit, BootReport, ProbeImage, boot_probe};
+pub use probe::{BootExit, BootReport, ProbeBind, ProbeImage, boot_probe};

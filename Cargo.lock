@@ -1305,6 +1305,7 @@ dependencies = [
  "carrick-hal",
  "carrick-kernel",
  "carrick-mem",
+ "carrick-sched-core",
  "carrick-softcpu-x86",
  "carrick-softmmu",
  "carrick-x86",
