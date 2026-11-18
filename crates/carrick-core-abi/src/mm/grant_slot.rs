@@ -5,6 +5,8 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorReceipt, DescriptorTxn, DescriptorTxnSlot,
 };
 
+use carrick_mmu_core::live_descriptor_words::GrantRefusalTrace;
+
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::PortalGrantWindow;
@@ -264,6 +266,15 @@ impl PortalGrantSlot {
                 .is_none_or(|window| window.operation.mm.raw() == mm_key))
     }
     pub fn submit(&self, window: PortalGrantWindow, txn: &DescriptorTxn) -> bool {
+        self.submit_with_trace(window, txn, false)
+    }
+
+    pub fn submit_with_trace(
+        &self,
+        window: PortalGrantWindow,
+        txn: &DescriptorTxn,
+        trace: bool,
+    ) -> bool {
         if !window.valid() || txn.id.mm_key.get() != window.operation.mm.raw() || {
             let state = self.state.load(Ordering::Acquire);
             let selected = state == 3
@@ -278,7 +289,7 @@ impl PortalGrantSlot {
         } {
             return false;
         }
-        if !self.descriptor.submit(txn) {
+        if !self.descriptor.submit_with_grant_trace(txn, trace) {
             self.state.store(0, Ordering::Release);
             return false;
         }
@@ -318,15 +329,42 @@ impl PortalGrantSlot {
     ) -> Option<DescriptorReceipt> {
         (self.window() == Some(window)).then(|| self.descriptor.inspect_receipt(txn.id))?
     }
+    pub fn inspect_receipt_with_trace(
+        &self,
+        window: PortalGrantWindow,
+        txn: &DescriptorTxn,
+    ) -> Option<(DescriptorReceipt, Option<GrantRefusalTrace>)> {
+        (self.window() == Some(window))
+            .then(|| self.descriptor.inspect_receipt_with_grant_trace(txn.id))?
+    }
+
+    pub fn take_receipt_with_trace(
+        &self,
+        window: PortalGrantWindow,
+        txn: &DescriptorTxn,
+    ) -> Option<(DescriptorReceipt, Option<GrantRefusalTrace>)> {
+        self.consume_receipt(window, || {
+            self.descriptor.take_receipt_with_grant_trace(txn.id)
+        })
+    }
+
     pub fn take_receipt(
         &self,
         window: PortalGrantWindow,
         txn: &DescriptorTxn,
     ) -> Option<DescriptorReceipt> {
+        self.consume_receipt(window, || self.descriptor.take_receipt(txn.id))
+    }
+
+    fn consume_receipt<T>(
+        &self,
+        window: PortalGrantWindow,
+        take: impl FnOnce() -> Option<T>,
+    ) -> Option<T> {
         if self.window() != Some(window) {
             return None;
         }
-        let receipt = self.descriptor.take_receipt(txn.id)?;
+        let receipt = take()?;
         self.state.store(0, Ordering::Release);
         Some(receipt)
     }

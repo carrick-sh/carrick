@@ -4,6 +4,7 @@ pub use crate::aarch64::descriptor_txn::{
 };
 pub use crate::descriptor_refusal::DescriptorRefusal;
 pub use crate::live_descriptor_words::LiveDescriptorWords;
+use crate::live_descriptor_words::{DescriptorDiagnostic, DescriptorPlanRefusalSite};
 pub use crate::stage1::{LeafAccess as Access, LeafSize};
 use crate::stage1::{LeafSpan, Stage1Leaf, Stage1Walker, WalkError};
 use alloc::{collections::BTreeMap, vec::Vec};
@@ -87,6 +88,21 @@ pub enum DescriptorOp {
     },
 }
 impl DescriptorOp {
+    /// Digest operation kind, also used by descriptor diagnostics.
+    fn kind(self) -> u64 {
+        match self {
+            Self::Map { .. } => 1,
+            Self::Publish { .. } => 2,
+            Self::Protect { .. } => 3,
+            Self::ArmCow(_) => 4,
+            Self::CowRepoint { .. } => 5,
+            Self::Unmap(_) => 6,
+            Self::Coalesce { .. } => 7,
+            Self::Prepare { .. } => 8,
+            Self::Retire(_) => 9,
+        }
+    }
+
     pub fn span(self) -> PageSpan {
         match self {
             Self::Prepare { span, .. }
@@ -219,6 +235,7 @@ pub struct DescriptorPlan {
     id: DescriptorTxnId,
     digest: u64,
     span: PageSpan,
+    op_kind: u64,
 }
 impl DescriptorPlan {
     pub fn live_stores(&self) -> usize {
@@ -332,6 +349,7 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
         id: txn.id,
         digest: txn.digest(),
         span,
+        op_kind: txn.op.kind(),
     })
 }
 
@@ -478,9 +496,17 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
         if before == after {
             return Ok(());
         }
-        self.entries
-            .try_reserve(1)
-            .map_err(|_| DescriptorRefusal::JournalCapacity)?;
+        if self.entries.try_reserve(1).is_err() {
+            self.words
+                .descriptor_diagnostic(DescriptorDiagnostic::PlanRefused {
+                    site: DescriptorPlanRefusalSite::Walk,
+                    reason: DescriptorRefusal::JournalCapacity,
+                    op_kind: self.txn.op.kind(),
+                    live_stores: self.entries.len(),
+                    table_grants: self.used,
+                });
+            return Err(DescriptorRefusal::JournalCapacity);
+        }
         self.entries.push(JournalEntry {
             pa,
             before,
@@ -755,7 +781,7 @@ impl DescriptorTxn<'_> {
         ] {
             hash = mix(hash, word);
         }
-        let (kind, a, b, flags, backing) = match self.op {
+        let (a, b, flags, backing) = match self.op {
             DescriptorOp::Map {
                 output,
                 permissions: p,
@@ -764,7 +790,6 @@ impl DescriptorTxn<'_> {
                 backing,
                 ..
             } => (
-                1,
                 output.raw(),
                 size.bytes(),
                 permissions(p) | u64::from(resident),
@@ -779,12 +804,11 @@ impl DescriptorTxn<'_> {
             } => {
                 hash = mix(hash, resident.va);
                 hash = mix(hash, resident.len);
-                (8, output.raw(), PAGE, permissions(p), Some(backing))
+                (output.raw(), PAGE, permissions(p), Some(backing))
             }
             DescriptorOp::Publish {
                 expected, access, ..
             } => (
-                2,
                 expected.raw(),
                 0,
                 match access {
@@ -794,16 +818,16 @@ impl DescriptorTxn<'_> {
                 },
                 None,
             ),
-            DescriptorOp::Protect { permissions: p, .. } => (3, 0, 0, permissions(p), None),
-            DescriptorOp::ArmCow(_) => (4, 0, 0, 0, None),
+            DescriptorOp::Protect { permissions: p, .. } => (0, 0, permissions(p), None),
+            DescriptorOp::ArmCow(_) => (0, 0, 0, None),
             DescriptorOp::CowRepoint {
                 old, new, backing, ..
-            } => (5, old.raw(), new.raw(), 0, Some(backing)),
-            DescriptorOp::Unmap(_) => (6, 0, 0, 0, None),
-            DescriptorOp::Retire(_) => (9, 0, 0, 0, None),
-            DescriptorOp::Coalesce { size, .. } => (7, size.bytes(), 0, 0, None),
+            } => (old.raw(), new.raw(), 0, Some(backing)),
+            DescriptorOp::Unmap(_) => (0, 0, 0, None),
+            DescriptorOp::Retire(_) => (0, 0, 0, None),
+            DescriptorOp::Coalesce { size, .. } => (size.bytes(), 0, 0, None),
         };
-        for word in [kind, a, b, flags] {
+        for word in [self.op.kind(), a, b, flags] {
             hash = mix(hash, word);
         }
         if let Some(b) = backing {
@@ -863,6 +887,13 @@ pub fn apply_descriptor_plan<W: LiveDescriptorWords + ?Sized, J: DescriptorJourn
     journal: &mut J,
 ) -> DescriptorReceipt {
     let outcome = if !journal.reserve(plan.entries.len()) {
+        words.descriptor_diagnostic(DescriptorDiagnostic::PlanRefused {
+            site: DescriptorPlanRefusalSite::JournalReserve,
+            reason: DescriptorRefusal::JournalCapacity,
+            op_kind: plan.op_kind,
+            live_stores: plan.entries.len(),
+            table_grants: plan.tables_linked,
+        });
         DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity)
     } else {
         let mut error = None;
@@ -884,6 +915,13 @@ pub fn apply_descriptor_plan<W: LiveDescriptorWords + ?Sized, J: DescriptorJourn
             }
         }
         if let Some((reason, restored)) = error {
+            words.descriptor_diagnostic(DescriptorDiagnostic::PlanRefused {
+                site: DescriptorPlanRefusalSite::Apply,
+                reason: reason,
+                op_kind: plan.op_kind,
+                live_stores: plan.entries.len(),
+                table_grants: plan.tables_linked,
+            });
             if undo(words, journal.entries(), plan.span) && restored {
                 DescriptorOutcome::RolledBack(reason)
             } else {
