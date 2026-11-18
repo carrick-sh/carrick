@@ -2676,9 +2676,14 @@ jobs:
           [ -n "$elf" ] || { echo "production EL1 ELF not found" >&2; exit 1; }
           # The ignored witnesses include the LLVM differentials, which need
           # the toolchain's llvm-objdump (as `just a64-census-gate` sets it).
-          export CARRICK_LLVM_OBJDUMP="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objdump"
-          CARRICK_A64_ELF="$PWD/$elf" cargo test -p carrick-softcpu-aarch64 \
-            -- --ignored --nocapture > soft-aarch64-logs/probe.log 2>&1 || status=$?
+          sysroot=$(rustc --print sysroot)
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          export CARRICK_LLVM_OBJDUMP="$sysroot/lib/rustlib/$host/bin/llvm-objdump"
+          # The loader-span census witness needs the span file that only
+          # `just a64-census-gate` exports; the A64 census gate job runs it.
+          CARRICK_A64_ELF="$PWD/$elf" cargo test -p carrick-softcpu-aarch64 --tests \
+            -- --ignored --nocapture --skip generated_loader_vector_spans_are_typed \
+            > soft-aarch64-logs/probe.log 2>&1 || status=$?
           cat soft-aarch64-logs/probe.log
           exit "$status"
       - uses: actions/upload-artifact@v4
