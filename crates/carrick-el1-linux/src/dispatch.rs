@@ -2966,6 +2966,9 @@ fn native_service_fatal_reason(
             Quarantine::RetainedServiceUnexpectedResume => {
                 Fatal::NativeServiceQuarantinedRetainedServiceUnexpectedResume
             }
+            Quarantine::RetainedSignalWaitMissing => {
+                Fatal::NativeServiceQuarantinedRetainedSignalWaitMissing
+            }
             Quarantine::RetainedLifecycleMissing => {
                 Fatal::NativeServiceQuarantinedRetainedLifecycleMissing
             }
@@ -6944,6 +6947,10 @@ mod tests {
             (
                 Quarantine::RetainedServiceUnexpectedResume,
                 Fatal::NativeServiceQuarantinedRetainedServiceUnexpectedResume,
+            ),
+            (
+                Quarantine::RetainedSignalWaitMissing,
+                Fatal::NativeServiceQuarantinedRetainedSignalWaitMissing,
             ),
             (
                 Quarantine::RetainedLifecycleMissing,

@@ -315,6 +315,7 @@ pub enum NativeServiceQuarantine {
     DuplicateNoticeCleanup,
     RetainedServiceMissing,
     RetainedServiceUnexpectedResume,
+    RetainedSignalWaitMissing,
     RetainedLifecycleMissing,
     RetainedHostCustody,
     RetainedLifecycleOutcome,

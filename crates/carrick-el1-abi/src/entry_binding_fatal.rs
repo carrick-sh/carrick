@@ -98,6 +98,7 @@ pub enum EntryBindingFatalReason {
     NativeServiceQuarantinedRequeueRefused = 80,
     NativeServiceQuarantinedReleaseRefused = 81,
     NativeServiceQuarantinedHandoffReceipt = 82,
+    NativeServiceQuarantinedRetainedSignalWaitMissing = 83,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -173,6 +174,7 @@ impl EntryBindingFatalReason {
             80 => Some(Self::NativeServiceQuarantinedRequeueRefused),
             81 => Some(Self::NativeServiceQuarantinedReleaseRefused),
             82 => Some(Self::NativeServiceQuarantinedHandoffReceipt),
+            83 => Some(Self::NativeServiceQuarantinedRetainedSignalWaitMissing),
 
             _ => None,
         }
@@ -496,7 +498,7 @@ mod tests {
 
     #[test]
     fn fatal_detail_round_trip_and_formatter() {
-        for raw in (1..=48).chain(60..=82) {
+        for raw in (1..=48).chain(60..=83) {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
             for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
                 let detail = EntryBindingFatalDetail {
