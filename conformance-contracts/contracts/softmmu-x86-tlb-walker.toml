@@ -87,6 +87,10 @@ carrier-published supervisor root before guest entry. The ring can switch
 to it without a carrier exit, so admitting stopped CR3 alone leaves the
 very next walk without an owner generation. This keeps the existing
 extent and page-table authentication for the maintenance walk.
+
+#671 M1 preserves a single executing soft worker. The unused peer is
+retained by the shared factory for custody, but guest entry refuses it
+before it can access backing through a disjoint walker inventory.
 """
 
 [bindings]

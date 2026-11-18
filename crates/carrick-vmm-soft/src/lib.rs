@@ -14,7 +14,7 @@
 //! not wired to the runtime; see
 //! `docs/design/soft-x86-cpl0-bringup.md` ("Follow-up soft slice").
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
 pub mod backend;
 pub mod carrier;

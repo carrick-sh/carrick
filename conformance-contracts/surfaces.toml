@@ -1467,8 +1467,7 @@ surfaces = [
   { path = "crates/carrick-vmm-soft/build.rs", contracts = [] },
   { path = "crates/carrick-vmm-soft/src/backend.rs", contract = "softmmu.x86.tlb-walker" },
   { path = "crates/carrick-vmm-soft/src/carrier.rs", contract = "softmmu.x86.tlb-walker" },
-  # Pure soft-x86 boot bring-up probe (#671), not wired to the runtime; no guest-visible behaviour yet.
-  { path = "crates/carrick-vmm-soft/src/cpu.rs", contracts = [] },
+  { path = "crates/carrick-vmm-soft/src/cpu.rs", contract = "x86.cpuid.v3" },
   # Pure soft-x86 boot bring-up probe (#671), not wired to the runtime; no guest-visible behaviour yet.
   { path = "crates/carrick-vmm-soft/src/lib.rs", contracts = [] },
   { path = "crates/carrick-vmm-soft/src/memory.rs", contract = "softmmu.x86.tlb-walker" },

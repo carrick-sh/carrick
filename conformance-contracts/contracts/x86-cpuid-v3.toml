@@ -91,6 +91,10 @@ caller; its probe admits an initial MM through the same functions. No
 bindings, semantic expectations, structural budgets or acceptance layers
 change. Signed acceptance and runtime-ratio promotion remain
 director-owned.
+
+#671 M1 soft entry installs the same x87/SSE/AVX XCR0 mask as KVM. The
+production soft ring's XGETBV(0) witness returned 3 before the fix and now
+returns the x86-64-v3 mask, 7, matching the advertised XSAVE components.
 """
 
 [bindings]
