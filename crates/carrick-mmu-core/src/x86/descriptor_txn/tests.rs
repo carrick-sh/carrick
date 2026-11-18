@@ -1355,11 +1355,27 @@ fn stale_root_grants_receipt_and_journal_capacity_refuse_without_writes() {
         execute_descriptor_txn(&words, &txn, root(0x5000), &mut journal).outcome,
         DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot)
     );
+    let diagnostic = Cell::new(None);
+    let observe = |event| diagnostic.set(Some(event));
+    let observed = crate::live_descriptor_words::ObservedDescriptorWords {
+        words: &words,
+        observe: Some(&observe),
+    };
     let mut storage = [JournalEntry::default(); 3];
     let mut small = crate::aarch64::descriptor_txn::SliceJournal::new(&mut storage);
     assert_eq!(
-        execute_descriptor_txn(&words, &txn, txn.root, &mut small).outcome,
+        execute_descriptor_txn(&observed, &txn, txn.root, &mut small).outcome,
         DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity)
+    );
+    assert_eq!(
+        diagnostic.get(),
+        Some(DescriptorDiagnostic::PlanRefused {
+            site: DescriptorPlanRefusalSite::JournalReserve,
+            reason: DescriptorRefusal::JournalCapacity,
+            op_kind: 1,
+            live_stores: 4,
+            table_grants: 3,
+        })
     );
     assert_eq!(words.writes.get(), 0);
     let plan = plan_descriptor_txn(&words, &txn, txn.root).unwrap();

@@ -67,7 +67,11 @@ pub fn supply<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
     let slot = slots
         .grant(service.slot()?)
         .ok_or_else(|| TrapError::Hypervisor("owner grant slot absent".into()))?;
-    if !slot.submit(window, grant.transaction()) {
+    if !slot.submit_with_trace(
+        window,
+        grant.transaction(),
+        carrick_hal::diagnostic_capture::trace_grant_refusals(),
+    ) {
         return Err(TrapError::Hypervisor(
             "owner grant slot occupied by another request".into(),
         ));
@@ -93,8 +97,8 @@ fn finish_supply(
     target: TransferTarget,
     result: Result<TrapFrame, TrapError>,
 ) -> Result<SupplyProgress, TrapError> {
-    if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
-        let settled = grant.settle(&receipt)?;
+    if let Some((receipt, trace)) = slot.take_receipt_with_trace(window, grant.transaction()) {
+        let settled = grant.settle(&receipt, trace)?;
         result?;
         Ok(if settled {
             SupplyProgress::Ready
@@ -227,6 +231,7 @@ pub trait TransferGrant: Send {
     fn settle(
         &mut self,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+        trace: Option<carrick_mmu_core::live_descriptor_words::GrantRefusalTrace>,
     ) -> Result<bool, TrapError>;
 }
 pub enum TransferPreparation {
@@ -801,7 +806,11 @@ mod grant_wait_tests {
         fn transaction(&self) -> &DescriptorTxn {
             &self.txn
         }
-        fn settle(&mut self, _: &DescriptorReceipt) -> Result<bool, TrapError> {
+        fn settle(
+            &mut self,
+            _: &DescriptorReceipt,
+            _: Option<carrick_mmu_core::live_descriptor_words::GrantRefusalTrace>,
+        ) -> Result<bool, TrapError> {
             panic!("an admission wait must not invent a descriptor receipt");
         }
     }

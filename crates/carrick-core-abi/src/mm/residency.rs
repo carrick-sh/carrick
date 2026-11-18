@@ -307,6 +307,20 @@ impl FrameGrantResidencyTable {
         Some(slot)
     }
 
+    /// Diagnostic sample of occupied slots, including in-flight publishers.
+    /// Other MMs can change the table during the scan.
+    pub fn observed_slots_used(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.state.load(Ordering::Relaxed) & GRANT_STATE_MASK,
+                    GRANT_WRITING | GRANT_LIVE
+                )
+            })
+            .count()
+    }
+
     /// Guest: find the exact live grant covering a prepared leaf.
     pub fn lookup(&self, mm_key: u64, va: u64) -> Option<FrameGrantResidencyPage> {
         let page = va & !(GRANT_PAGE_SIZE - 1);
