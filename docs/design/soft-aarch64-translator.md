@@ -22,7 +22,7 @@ interpreter in M2.
 | x86 soft CPU block planning and emission | `carrick-softcpu-x86/src/cpu.rs`, `context.rs` | Model only: plan a block, emit, publish, run, exit with exact RIP. Its emitter is x86-specific and is not shared. |
 | `JitCodeBuffer` (mmap RW, copy, mprotect RX) | moved whole (M2-1) to `carrick-host-jit`; `carrick-softcpu-x86` re-exports it | Both soft CPUs share it. M2-1 adds the aarch64 I-cache publication to `publish`. |
 | aarch64 I-cache helpers | `carrick-vmm-kvm/src/kvm.rs` (IC IVAU only), `carrick-aarch64/src/icache.rs` (macOS `sys_icache_invalidate`) | Not moved here: one director-filed `seam` follow-up covers both. |
-| Translation cache and budget (#616) | `carrick-softcpu-x86/src/cpu.rs:166` (`blocks: BTreeMap<BlockKey, CachedBlock>`, FIFO `block_order`, `TRANSLATION_CACHE_CAPACITY`) | **Not neutral yet.** It lives inside `SoftCpu`. This slice writes *no* cache: the dispatcher re-translates on each dispatch (see "Cache" below), so there is no second cache to retire later. |
+| Translation cache and budget (#616) | `carrick-softcpu-x86/src/cpu.rs` (`blocks: BTreeMap<BlockKey, CachedBlock>`, FIFO `block_order`, `TRANSLATION_CACHE_CAPACITY`) | **Not neutral yet.** It lives inside `SoftCpu`. This slice writes *no* cache: the dispatcher re-translates on each dispatch (see "Cache" below), so there is no second cache to retire later. |
 | Invalidation authority (#601/#684/#681) | `carrick-core/src/mm/retirement/invalidation.rs`, `carrick-softmmu/src/retirement.rs` (`SoftVcpuSeat`) | Plugs in at the cache slice; see "Self-modifying code". |
 | Soft machine seam | `carrick-vmm-soft` | Not on main (open in #2518). Host adapter placement below. |
 
@@ -95,7 +95,8 @@ safe code on x86.
 
 | Class | Instructions | Lowering |
 | --- | --- | --- |
-| COPY | add/sub (imm, shifted, extended, with carry; flag-setting too), logical (imm, shifted), move-wide, bitfield, extract, conditional select/compare, multiply/divide, variable shifts, CLZ/CLS/RBIT/REV, NOP/YIELD, DMB/DSB/ISB | Word verbatim. SP-naming forms use the scratch rewrite. Barriers are EL0-legal; guest memory is reached only through handlers, so a native barrier orders the handler's host accesses too. Divide by zero yields 0 in A64, so no copy word can fault. |
+| COPY | add/sub (imm, shifted, extended, with carry; flag-setting too), logical (imm, shifted), move-wide, bitfield, extract, conditional select/compare, multiply/divide, variable shifts, CLZ/CLS/RBIT/REV, NOP/YIELD, DMB/DSB | Word verbatim. SP-naming forms use the scratch rewrite. Barriers are EL0-legal; guest memory is reached only through handlers, so a native barrier orders the handler's host accesses too. Divide by zero yields 0 in A64, so no copy word can fault. |
+| EXIT | ISB | End the block and retire ISB before fetching at the next guest PC (Arm ARM B2.3.4). |
 | COPY (rewritten) | ADR, ADRP | The guest PC is known, so Rd gets a host `movz`/`movk` immediate sequence. Rd=XZR emits nothing. |
 | EXIT memory | every load/store, pair, unprivileged (LDTR/STTR), literal, acquire/release, exclusive, LSE (LDADD) | v1: all memory operations exit. The handler computes the address from the frame, reads or writes `GuestMemory` and applies writeback. A fast path through the soft TLB is a later slice. Exclusives use a virtual per-CPU monitor in the handler state, never a host reservation. |
 | EXIT system | MRS, MSR (register and PSTATE immediate), TLBI, AT, CLREX | `CpuState::mrs`/`msr`, with an EL0 trap taken through `take_exception`. TLBI is a typed event for the dispatcher's owner. MSR SCTLR_EL1 setting M stops the slice-0 probe (flat memory has no stage-1 walk). |
@@ -114,8 +115,10 @@ edges is a later slice and needs the invalidation hooks below.
 - **Cache:** the dispatcher translates the block at each dispatch. This is the
   smallest honest slice: correctness first, no second cache. The N2 slice
   (design spec "N2: cache and code publication") extracts the x86 cache storage
-  into a neutral crate; this dispatcher then keys it by (guest PC, EL,
-  translation regime). Re-translation per dispatch is a known pathological cost
+  into a neutral crate. Cache identity includes guest PC, execution mode and
+  profile, translation regime, the address-space root incarnation and ASID,
+  and the physical code frame identity and generation of each covered page.
+  Re-translation per dispatch is a known pathological cost
   and blocks any performance claim until N2 lands.
 - **Guest IC IVAU / IC IALLU / code-page writes:** a guest code-page write or
   IC operation becomes an invalidation request to the shared authority
