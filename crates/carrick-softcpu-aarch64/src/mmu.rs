@@ -45,9 +45,7 @@ pub enum Stage1Error {
 
 /// Whether stage-1 translation is enabled (SCTLR_EL1.M, D13.2.116).
 pub fn enabled(cpu: &CpuState) -> bool {
-    // RED WITNESS STUB: translation never engages (the pre-#2480 flat model).
-    let _ = cpu;
-    false
+    cpu.el1.sctlr.0 & 1 != 0
 }
 
 /// The admitted regime of `cpu`'s current registers.
