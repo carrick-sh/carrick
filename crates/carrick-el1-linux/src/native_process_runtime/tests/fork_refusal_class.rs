@@ -57,61 +57,81 @@ fn invariant_case(case: &str) -> NativeProcessError {
         // snapshot another thread moved is `MmError::Busy` at its source.
         "prepare-stale" => refused(NativeForkStage::Prepare, MmError::Stale),
         "publish-stale" => refused(NativeForkStage::Publish, MmError::Stale),
+        // An untyped invariant answer from the birth or its MM service, such
+        // as a publish whose rollback failed (`Quarantined`), formerly
+        // answered EINVAL or EIO.
+        "bare-stale" => NativeProcessError::Stale,
+        "bare-invalid" => NativeProcessError::Invalid,
+        "bare-quarantined" => NativeProcessError::Quarantined,
         _ => unreachable!("{case}"),
+    }
+}
+
+/// Fork preparations the fatal child must have run when its run ends, or
+/// `usize::MAX` when its service counts none.
+static FATAL_PREPARATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Run `test`'s body once per case, each in a child test process whose
+/// fatal sink exits 86, or 87 when the fork ran a number of Physical
+/// preparations other than `preparations` (a rerun); bounded so that a
+/// regression fails instead of hanging. `test` is the full test path.
+pub(crate) fn fatal_child(
+    test: &str,
+    cases: &[&str],
+    preparations: Option<usize>,
+    run: impl Fn(&str),
+) {
+    use core::sync::atomic::Ordering;
+    use wait_timeout::ChildExt;
+    const CHILD: &str = "CARRICK_NATIVE_FORK_FATAL_CHILD";
+    const CASE: &str = "CARRICK_NATIVE_FORK_FATAL_CASE";
+    if std::env::var(CHILD).ok().as_deref() == Some(test) {
+        FATAL_PREPARATIONS.store(preparations.unwrap_or(usize::MAX), Ordering::Release);
+        carrick_fatal::set_hook(|domain, _| {
+            assert_eq!(domain, "el1::entry_completion");
+            let expected = FATAL_PREPARATIONS.load(Ordering::Acquire);
+            let reran = expected != usize::MAX && prepare_mm_calls() != expected;
+            std::process::exit(if reran { 87 } else { 86 });
+        });
+        run(&std::env::var(CASE).unwrap());
+        return;
+    }
+    for case in cases {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, test)
+            .env(CASE, case)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let timed_out = child
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .is_none();
+        if timed_out {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(!timed_out, "fork fatal child {case} exceeded 10 seconds");
+        assert_ne!(
+            output.status.code(),
+            Some(87),
+            "{case}: the fork reran before the broken invariant ended the run"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "{case}: the broken invariant must end the run: {}",
+            std::string::String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
 #[cfg(test)]
 mod serial_host {
     use super::*;
-
-    /// Run `test`'s body once per case, each in a child test process whose
-    /// fatal sink exits 86 when the fork ran exactly one preparation (no
-    /// rerun) and 87 otherwise; bounded so that a regression fails instead
-    /// of hanging.
-    fn fatal_child(test: &str, cases: &[&str], run: impl Fn(&str)) {
-        use wait_timeout::ChildExt;
-        const CHILD: &str = "CARRICK_NATIVE_FORK_FATAL_CHILD";
-        const CASE: &str = "CARRICK_NATIVE_FORK_FATAL_CASE";
-        if std::env::var(CHILD).ok().as_deref() == Some(test) {
-            carrick_fatal::set_hook(|domain, _| {
-                assert_eq!(domain, "el1::entry_completion");
-                std::process::exit(if prepare_mm_calls() == 1 { 86 } else { 87 });
-            });
-            run(&std::env::var(CASE).unwrap());
-            return;
-        }
-        for case in cases {
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", test, "--nocapture"])
-                .env(CHILD, test)
-                .env(CASE, case)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            let timed_out = child
-                .wait_timeout(std::time::Duration::from_secs(10))
-                .unwrap()
-                .is_none();
-            if timed_out {
-                child.kill().unwrap();
-            }
-            let output = child.wait_with_output().unwrap();
-            assert!(!timed_out, "fork fatal child {case} exceeded 10 seconds");
-            assert_ne!(
-                output.status.code(),
-                Some(87),
-                "{case}: the fork reran before the broken invariant ended the run"
-            );
-            assert_eq!(
-                output.status.code(),
-                Some(86),
-                "{case}: the broken invariant must end the run: {}",
-                std::string::String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
 
     const MODULE: &str =
         "native_process_runtime::host_test_support::fork_refusal_class::serial_host::";
@@ -120,7 +140,13 @@ mod serial_host {
     fn fork_invariant_refusal_ends_the_run_x86() {
         fatal_child(
             &std::format!("{MODULE}fork_invariant_refusal_ends_the_run_x86"),
-            &["census-core"],
+            &[
+                "census-core",
+                "bare-stale",
+                "bare-invalid",
+                "bare-quarantined",
+            ],
+            Some(1),
             |case| {
                 fork_invariant_refusal_ends_the_run::<
                     ParkedContextWords,
@@ -134,7 +160,13 @@ mod serial_host {
     fn fork_invariant_refusal_ends_the_run_aarch64() {
         fatal_child(
             &std::format!("{MODULE}fork_invariant_refusal_ends_the_run_aarch64"),
-            &["census-core"],
+            &[
+                "census-core",
+                "bare-stale",
+                "bare-invalid",
+                "bare-quarantined",
+            ],
+            Some(1),
             |case| {
                 fork_invariant_refusal_ends_the_run::<
                     carrick_sched_core::Aarch64ParkedContext,
@@ -153,6 +185,7 @@ mod serial_host {
         fatal_child(
             &std::format!("{MODULE}fork_stale_prepare_or_publish_ends_the_run_without_rerun_x86"),
             &["prepare-stale", "publish-stale"],
+            Some(1),
             |case| {
                 fork_invariant_refusal_ends_the_run::<
                     ParkedContextWords,
@@ -169,6 +202,7 @@ mod serial_host {
                 "{MODULE}fork_stale_prepare_or_publish_ends_the_run_without_rerun_aarch64"
             ),
             &["prepare-stale", "publish-stale"],
+            Some(1),
             |case| {
                 fork_invariant_refusal_ends_the_run::<
                     carrick_sched_core::Aarch64ParkedContext,

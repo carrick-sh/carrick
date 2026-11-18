@@ -4212,6 +4212,40 @@ fn production_fork_superseded_by_sibling_mmap_is_busy_once_then_forks() {
     );
 }
 
+/// #2441 on x86 CPL0, review P0-2 on #2508: the carrier's Inventory reply
+/// to the next production fork's stock loan is contention. The fork keeps
+/// its syscall and reruns, and the parent reaps its child, never EAGAIN
+/// (111), which every loan refusal formerly answered.
+#[test]
+fn production_fork_loan_inventory_reply_is_not_now_then_forks() {
+    bounded_contention_witness(
+        "production_fork_loan_inventory_reply_is_not_now_then_forks",
+        "native_not_now_contention.S",
+        &["-DFORK_LOAN_INVENTORY=1"],
+        "fork stock loan refused Inventory",
+    );
+}
+
+/// #2441 on x86 CPL0, review P0-2 on #2508: a Stale reply to the next
+/// production fork's stock loan is a broken carrier invariant. The fork
+/// entry ends the run through the guest's fatal doorbell (port 0xcc); the
+/// fork never returns to the guest, which formerly saw EAGAIN (exit 111).
+#[test]
+fn production_fork_loan_stale_reply_ends_the_run() {
+    let elf =
+        kvm_pool_fixture::assemble_fixture("native_not_now_contention.S", &["-DFORK_LOAN_STALE=1"]);
+    match try_run_instrumented_pool_fixture(&elf, 128) {
+        Err(error) => assert!(
+            error.to_string().contains("production port 0xcc"),
+            "a broken stock loan invariant must ring the fatal doorbell (port 0xcc): {error}"
+        ),
+        Ok(outcome) => panic!(
+            "the guest survived a Stale stock loan reply with exit {} (111 = EAGAIN)",
+            outcome.run.exit_code
+        ),
+    }
+}
+
 /// #2306 on x86 CPL0: as above with the root held once while the fork
 /// commits the child's MM. The prepared child is aborted and the fork
 /// reruns to success, never EFAULT (114).
