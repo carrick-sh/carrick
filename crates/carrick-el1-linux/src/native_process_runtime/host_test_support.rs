@@ -47,6 +47,19 @@ std::thread_local! {
     };
 }
 
+// Physical fork preparations this thread ran, refused or not: a refusal
+// that ends the run must not have rerun the fork (#2441).
+#[cfg(test)]
+std::thread_local! {
+    static PREPARE_MM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Physical fork preparations this thread ran.
+#[cfg(test)]
+pub(crate) fn prepare_mm_calls() -> usize {
+    PREPARE_MM_CALLS.with(std::cell::Cell::get)
+}
+
 /// Refuse the next Physical fork preparations, in order.
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn fail_prepare_mm(errors: &[NativeProcessError]) {
@@ -396,6 +409,8 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         _: &C,
         child: MmGeneration,
     ) -> Result<Self::PreparedMm, NativeProcessError> {
+        #[cfg(test)]
+        PREPARE_MM_CALLS.with(|calls| calls.set(calls.get() + 1));
         #[cfg(test)]
         if let Some(error) = PREPARE_MM_ERRORS.with(|errors| errors.borrow_mut().pop_front()) {
             return Err(error);
