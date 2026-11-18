@@ -37,7 +37,7 @@ fn probe(image: ProbeImage<'_>) -> BootReport {
 /// is a carrier failure on KVM too (`fault_exit_from_record`). A ring fatal
 /// is admitted only where the stopped carrier lacks what the ring requires.
 fn reached_host_exit(report: &BootReport, ring_fatal_admitted: bool) -> bool {
-    match &report.exit {
+    match &report.outcome {
         BootExit::HostExit(_) => report.fatal_payload.is_none() || ring_fatal_admitted,
         BootExit::FaultDoorbell(record) => record.cs & 3 == 3,
         _ => false,

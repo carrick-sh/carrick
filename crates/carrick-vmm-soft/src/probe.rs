@@ -75,7 +75,7 @@ pub struct BootReport {
     pub deliveries: Vec<(u64, u64)>,
     /// `RAX` at a `FATAL_PORT` exit: the ring's fatal payload.
     pub fatal_payload: Option<u64>,
-    pub exit: BootExit,
+    pub outcome: BootExit,
     pub summary: String,
 }
 
@@ -100,7 +100,7 @@ impl fmt::Display for BootReport {
         for (from, to) in &self.deliveries {
             writeln!(f, "  delivery    {from:#x} -> stub {to:#x}")?;
         }
-        write!(f, "  exit        {:?}", self.exit)
+        write!(f, "  outcome     {:?}", self.outcome)
     }
 }
 
@@ -122,13 +122,13 @@ pub fn boot_probe(
         decoded: None,
         deliveries: Vec::new(),
         fatal_payload: None,
-        exit: BootExit::Setup(String::new()),
+        outcome: BootExit::Setup(String::new()),
         summary: String::new(),
     };
     let mut machine = match stopped_machine(inventory, image, &mut report) {
         Ok(machine) => machine,
         Err(error) => {
-            report.exit = BootExit::Setup(error.to_string());
+            report.outcome = BootExit::Setup(error.to_string());
             report.summary = format!("fails at setup: {error}");
             return report;
         }
@@ -136,7 +136,7 @@ pub fn boot_probe(
     let stubs = DIRECT_VA + carrick_x86::fault_stub_base(LAYOUT)
         ..DIRECT_VA + carrick_x86::fault_tss_base(LAYOUT);
     let mut doorbell = Vec::new();
-    report.exit = loop {
+    report.outcome = loop {
         if report.blocks >= max_blocks {
             break BootExit::StepBudget {
                 rip: machine.context().rip,
@@ -194,7 +194,7 @@ pub fn boot_probe(
             }
         }
     };
-    let rip = match report.exit {
+    let rip = match report.outcome {
         BootExit::HostExit(
             SoftMachineExit::IoOut { rip, .. }
             | SoftMachineExit::IoIn { rip, .. }
@@ -293,7 +293,7 @@ fn summarize(report: &BootReport) -> String {
             .unwrap_or_default(),
         report.blocks
     );
-    match &report.exit {
+    match &report.outcome {
         BootExit::HostExit(SoftMachineExit::IoOut {
             port: FATAL_PORT, ..
         }) => format!(
