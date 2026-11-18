@@ -130,6 +130,13 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
 }
 
 /// One decoded guest instruction at its guest address.
+///
+/// The raw word and its decoded classification are inseparable.
+/// ```compile_fail
+/// use carrick_softcpu_aarch64::{state::ProgramCounter, translate::GuestInstruction};
+/// let mut instruction = GuestInstruction::decode(ProgramCounter(0), 0xd503_201f);
+/// instruction.word = 0;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestInstruction {
     pub pc: ProgramCounter,
@@ -171,6 +178,11 @@ pub const CODE_PAGE_BYTES: u64 = 4096;
 /// A straight-line guest block. If the last instruction terminates, it is the
 /// block's terminator; otherwise the block was cut by a limit, a page
 /// boundary or an unfetchable word, and falls through to `next_pc`.
+/// Only the splitter constructs blocks, enforcing page and terminator boundaries.
+/// ```compile_fail
+/// use carrick_softcpu_aarch64::{state::ProgramCounter, translate::GuestBlock};
+/// let _ = GuestBlock { start: ProgramCounter(0), instructions: vec![] };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestBlock {
     pub start: ProgramCounter,
@@ -329,6 +341,20 @@ pub enum Terminator {
 
 /// A translated block: host words (an AAPCS64 function taking the frame in
 /// x0 and returning the exit index in x0) plus its exit table.
+/// Only the emitter constructs blocks that a native runner can execute.
+/// ```compile_fail
+/// use carrick_softcpu_aarch64::{
+///     state::ProgramCounter,
+///     translate::{BlockLimits, Terminator, TranslatedBlock, split_block},
+/// };
+/// let guest = split_block(ProgramCounter(0), BlockLimits::default(), |_| None);
+/// let _ = TranslatedBlock {
+///     guest,
+///     words: vec![],
+///     exits: vec![],
+///     terminator: Terminator::Fallthrough(0),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslatedBlock {
     pub guest: GuestBlock,
