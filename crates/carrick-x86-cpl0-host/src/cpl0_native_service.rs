@@ -374,7 +374,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             '_,
             carrick_sched_core::ParkedContextWords,
         >| self.complete_object_wake(lease.cpu, owned);
-        let _queue = zone
+        let queue = zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin, &completion)
             .map_err(|_| fail("native service acknowledgment queue"))?;
         if let Some(wait) = owner_wait {
@@ -386,9 +386,25 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 .complete(supplied)
                 .map_err(|_| fail("native service acknowledgment"))?;
         }
-        // This synchronous doorbell precedes park enrollment. The shared owner
-        // probes ACK under the same queue and requeues its exact continuation;
-        // no host waiter, readiness pipe or polling path is introduced.
+        // Wake any peer parked on this holder's release after contending on
+        // the per-slot `service_notice` (#2532).
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        queue
+            .notify_object(SlotId::new(lease.cpu.raw() as u8), &mut effects)
+            .map_err(|_| fail("native service acknowledgment wake"))?;
+        drop(queue);
+        if effects.queued_own || effects.owes_host_boundary() {
+            self.task(lease.cpu).linux.mark_pending_host_work();
+        }
+        if effects.sgi_slots().next().is_some() {
+            let sink = self.carrier_zone_wake()?;
+            for target in effects.sgi_slots() {
+                sink.resched(target);
+            }
+            if sink.take_undelivered().is_some() {
+                return Err(fail("native service reschedule not delivered"));
+            }
+        }
         Ok(NativeNoticeStep::Settled)
     }
 
@@ -466,7 +482,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             '_,
             carrick_sched_core::ParkedContextWords,
         >| self.complete_object_wake(lease.cpu, owned);
-        let _queue = zone
+        let queue = zone
             .object_wait(pending.key, &carrick_sched_core::ShortLockSpin, &completion)
             .map_err(|_| fail("native host file acknowledgment queue"))?;
         match owner_wait {
@@ -478,6 +494,23 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 .ticket
                 .complete(served.is_ok())
                 .map_err(|_| fail("native host file acknowledgment"))?,
+        }
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        queue
+            .notify_object(SlotId::new(lease.cpu.raw() as u8), &mut effects)
+            .map_err(|_| fail("native host file acknowledgment wake"))?;
+        drop(queue);
+        if effects.queued_own || effects.owes_host_boundary() {
+            self.task(lease.cpu).linux.mark_pending_host_work();
+        }
+        if effects.sgi_slots().next().is_some() {
+            let sink = self.carrier_zone_wake()?;
+            for target in effects.sgi_slots() {
+                sink.resched(target);
+            }
+            if sink.take_undelivered().is_some() {
+                return Err(fail("native host file reschedule not delivered"));
+            }
         }
         Ok(())
     }

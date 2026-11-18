@@ -347,6 +347,7 @@ pub enum NativeServiceQuarantine {
     OwnerWaitPublishBusy,
     ServicePublishBusy,
     NoticePublishBusy,
+    NoticePublishDuplicate,
     NoticeAbortBusy,
     NoticeConsumeBusy,
     ParkCancelBusy,

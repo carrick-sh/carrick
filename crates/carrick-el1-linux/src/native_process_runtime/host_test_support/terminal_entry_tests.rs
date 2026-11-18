@@ -839,3 +839,323 @@ fn x86_busy_service_notice_releases_execution_capacity() {
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
     >(words);
 }
+
+fn busy_service_notice_cancellation_wakes_and_retires_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    crossing_ordinal: u64,
+) {
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let sibling = add_service_sibling(&fixture, None);
+    assert_eq!(fixture.page.live(), 2);
+
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+
+    // Fork a second live process onto `fixture.slot`, then let it run ahead of
+    // the root leader and park in `begin_service(CarrierWork)` so its selector
+    // legitimately holds `fixture.task.service_notice`.
+    {
+        let mut fork_service = fixture.service();
+        fork_service.page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+        fork_service.controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        })));
+        let mut leader = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut fork_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            leader.fork(ProcessForkChildTid::NONE),
+            LifecycleOutcome::Returned { result, .. } if result.raw() > 0
+        ));
+    }
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, fixture.record.id)
+            .is_queued()
+    );
+    fixture.zone.clear_current(fixture.slot);
+
+    let selected_child = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_ne!(selected_child.record, fixture.record.id);
+    let child_record = fixture.zone.record_ref(selected_child.record);
+    let child_identity = fixture.zone.record(selected_child.record).identity();
+    let child_key = fixture
+        .registry
+        .state
+        .lock()
+        .members
+        .values()
+        .find(|member| member.record == child_record)
+        .unwrap()
+        .process;
+    let child_addr = fixture.runtime.task_binding(child_key).unwrap().address;
+    fixture
+        .zone
+        .install_space(fixture.slot, child_identity.mm)
+        .unwrap();
+    fixture.task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(child_identity.tid as i32),
+        carrick_core_abi::SnapshotGeneration::from_raw(child_identity.generation),
+        child_identity.file_table,
+    );
+    fixture
+        .task
+        .mm
+        .key
+        .store(child_identity.mm, Ordering::Release);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(child_identity.serial, Ordering::Release);
+    let child_ns_pid = fixture
+        .runtime
+        .graph
+        .lock()
+        .owner
+        .task_mut(child_key)
+        .unwrap()
+        .metadata()
+        .namespace_pid;
+    fixture.task.publish_visible_pid(child_ns_pid);
+    fixture.task.publish_root_generation(child_addr.generation);
+    fixture
+        .task
+        .publish_lifecycle(child_identity.lifecycle_page, child_identity.control_slot);
+    let child_words = unsafe { *fixture.zone.record(selected_child.record).ctx_mut() };
+    {
+        let mut service = fixture.service();
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                child_addr,
+                &child_words,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+        let result = child.begin_service(
+            ServiceOperation::CarrierWork {
+                entry: OwnerEntry::Syscall,
+                demand: carrick_core_abi::service::CarrierDemand::Work,
+            },
+            None,
+        );
+        let phase = child.native_service_phase();
+        let settled = child.settle_service_exit(result, NativeServiceExit::CarrierWork);
+        let resumed = crate::dispatch::native_service_completion(settled, phase).unwrap();
+        assert!(matches!(resumed, NativeResume::Left(None)));
+    }
+
+    // Switch the root leader back onto `fixture.slot` while the child's notice
+    // still occupies `fixture.task.service_notice`, and park on its Crossing.
+    let selected_leader = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected_leader.record, fixture.record.id);
+    let leader_identity = fixture.zone.record(fixture.record.id).identity();
+    fixture
+        .zone
+        .install_space(fixture.slot, leader_identity.mm)
+        .unwrap();
+    fixture.task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(leader_identity.tid as i32),
+        carrick_core_abi::SnapshotGeneration::from_raw(leader_identity.generation),
+        leader_identity.file_table,
+    );
+    fixture
+        .task
+        .mm
+        .key
+        .store(leader_identity.mm, Ordering::Release);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(leader_identity.serial, Ordering::Release);
+    let root_key = fixture.runtime.graph.lock().root_key;
+    let leader_ns_pid = fixture
+        .runtime
+        .graph
+        .lock()
+        .owner
+        .task_mut(root_key)
+        .unwrap()
+        .metadata()
+        .namespace_pid;
+    fixture.task.publish_visible_pid(leader_ns_pid);
+    fixture
+        .task
+        .publish_root_generation(fixture.address.generation);
+    fixture
+        .task
+        .publish_lifecycle(leader_identity.lifecycle_page, leader_identity.control_slot);
+    {
+        let mut service = fixture.service();
+        let mut leader = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let result = leader.begin_service(
+            ServiceOperation::Crossing {
+                ordinal: carrick_guest_arch::NativeOrdinal::new(crossing_ordinal),
+            },
+            None,
+        );
+        let phase = leader.native_service_phase();
+        let settled = leader.settle_service_exit(result, NativeServiceExit::Bridge);
+        let resumed = crate::dispatch::native_service_completion(settled, phase).unwrap();
+        assert!(matches!(resumed, NativeResume::Left(None)));
+    }
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 1);
+
+    // The sibling worker on `sibling.slot` calls `exit_group(7)` while the
+    // child's notice is still unconsumed in `fixture.task.service_notice`.
+    {
+        let mut sibling_service = fixture.service();
+        sibling_service.waker_slot = sibling.slot;
+        let mut worker = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: sibling.slot,
+                },
+                sibling.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut sibling_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            worker.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(worker.take_run_failure().is_none());
+    }
+
+    // `cancel_service` must wake the leader off `child_record`'s queue without
+    // disturbing the child's live selector in `fixture.task.service_notice`.
+    let woken_slot = [fixture.slot, sibling.slot]
+        .into_iter()
+        .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+        .expect("cancelling a contended notice wait must wake the parked member");
+    assert_eq!(
+        fixture.zone.switch_in_full(woken_slot).unwrap().record,
+        fixture.record.id
+    );
+    let leader_saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    {
+        let mut leader_service = fixture.service();
+        leader_service.waker_slot = woken_slot;
+        let mut leader = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: woken_slot,
+                },
+                fixture.task,
+                fixture.address,
+                &leader_saved,
+                &mut leader_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            leader.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::Left(_)
+        ));
+    }
+    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
+    assert!(
+        !fixture
+            .runtime
+            .graph
+            .lock()
+            .has_member_wait(&fixture.record)
+    );
+
+    // The child's selector in `fixture.task.service_notice` is untouched and
+    // still claims and completes cleanly.
+    let child_notice = fixture
+        .task
+        .service_notice
+        .take()
+        .unwrap()
+        .expect("peer notice must survive cancellation of a contended waiter");
+    assert_eq!(child_notice.record, child_record);
+    let child_key =
+        carrick_sched_core::object_wait::ObjectWaitKey::native_service(child_record).unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(child_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        })
+        .unwrap();
+    let child_control = unsafe { &*(child_identity.control_slot as *const ThreadControlSlot) };
+    let ticket = unsafe {
+        ServiceCell::claim_notice(
+            &child_control.service,
+            child_notice,
+            NonZeroU64::MIN,
+            child_identity,
+        )
+    }
+    .unwrap();
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(
+            fixture.slot,
+            &mut carrick_sched_core::WakeEffects::default(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn arm_busy_service_notice_cancellation_wakes_and_retires() {
+    busy_service_notice_cancellation_wakes_and_retires_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, 222);
+}
+
+#[test]
+fn x86_busy_service_notice_cancellation_wakes_and_retires() {
+    busy_service_notice_cancellation_wakes_and_retires_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, 9);
+}

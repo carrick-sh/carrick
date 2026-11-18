@@ -2185,9 +2185,21 @@ impl NativeServiceCapacityFixture {
                     )
                     .unwrap();
                 match entry.resume_checkpoint(|_| Ok(None)).unwrap() {
+                    NativeResume::Returned(result) if record == fixture.record => {
+                        // The first exiting child wakes the parent's `wait4`
+                        // onto this same slot with the reaped child PID.
+                        assert!(result.raw() >= 7002);
+                        let waiting = fixture.runtime.graph.lock().has_member_wait(&record);
+                        assert!(!waiting);
+                        assert!(matches!(
+                            entry.exit_group(0),
+                            LifecycleOutcome::Transferred { .. }
+                        ));
+                    }
                     NativeResume::Returned(result) => {
                         assert_eq!(result.raw(), words.syscall_return() as i64);
-                        assert!(!fixture.runtime.graph.lock().has_member_wait(&record));
+                        let waiting = fixture.runtime.graph.lock().has_member_wait(&record);
+                        assert!(!waiting);
                         assert!(matches!(
                             entry.exit_group(0),
                             LifecycleOutcome::Transferred { .. }
@@ -2534,7 +2546,7 @@ fn native_service_duplicate_custody_is_an_invariant_at_bridge_settlement() {
         }
         let result = entry.begin_service(operation, None);
         let expected = if occupied_notice {
-            NativeServiceQuarantine::NoticePublishBusy
+            NativeServiceQuarantine::NoticePublishDuplicate
         } else {
             NativeServiceQuarantine::ServiceBindBusy
         };

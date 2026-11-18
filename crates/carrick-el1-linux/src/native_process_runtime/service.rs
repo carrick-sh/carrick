@@ -100,7 +100,23 @@ impl CallerAccessFailure {
 
 enum PreparedService {
     Request(ServiceRequest, bool),
+    NoticeWait(
+        ServiceRequest,
+        carrick_core_abi::service::ServiceSelector,
+        bool,
+    ),
     Retired(NativeResume),
+}
+
+enum NoticeParkOutcome {
+    Resumed(NativeResume),
+    Published(bool),
+}
+
+enum NoticeFinishOutcome {
+    Resumed(NativeResume),
+    Published(bool),
+    Held(carrick_core_abi::service::ServiceSelector, bool),
 }
 
 enum ClosingMemberWait {
@@ -276,6 +292,8 @@ pub(super) struct PendingService<'a> {
     carrier_continuation: Option<CarrierContinuation>,
     request: ServiceRequest,
     pub(super) wait: Option<carrick_core_abi::PortalOwnerWait>,
+    notice_wait: Option<carrick_core_abi::service::ServiceSelector>,
+    checkpoints_owner: bool,
     pub(super) claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
     control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
 }
@@ -725,10 +743,63 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 drop(queue);
             }
         } else {
-            guard
-                .notify_object(slot, &mut effects)
-                .map_err(|_| NativeFailure::Quarantined)?;
-            drop(guard);
+            let notice_wait = self
+                .graph
+                .lock()
+                .service_wait(&record)
+                .and_then(|pending| pending.notice_wait);
+            if let Some(holder) = notice_wait {
+                drop(guard);
+                let Some(holder_key) = ObjectWaitKey::native_service(holder.record) else {
+                    return Ok(());
+                };
+                let Ok(queue) = self.zone.object_wait(
+                    holder_key,
+                    &carrick_sched_core::ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                ) else {
+                    return Ok(());
+                };
+                if self
+                    .graph
+                    .lock()
+                    .service_wait(&record)
+                    .is_some_and(|pending| {
+                        pending.request == request && pending.notice_wait == Some(holder)
+                    })
+                {
+                    let operation = if adapter {
+                        let census = self
+                            .zone
+                            .record(record.id)
+                            .object_wait_census()
+                            .ok_or(NativeFailure::Stale)?;
+                        OperationToken::new(census.operation, census.operation_generation)
+                    } else {
+                        OperationToken::new(
+                            u64::from(record.id.raw()),
+                            request.identity.sequence.get(),
+                        )
+                    }
+                    .ok_or(NativeFailure::Stale)?;
+                    let owned =
+                        queue.wake_owner_operation(record, &operation, slot, Handback::Resumed);
+                    drop(queue);
+                    if let Some(owned) = owned {
+                        let (_, wake) = owned.into_parts();
+                        effects = wake;
+                    }
+                } else {
+                    drop(queue);
+                }
+            } else {
+                guard
+                    .notify_object(slot, &mut effects)
+                    .map_err(|_| NativeFailure::Quarantined)?;
+                drop(guard);
+            }
         }
         service.wake_effects(effects);
         Ok(())
@@ -2004,9 +2075,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             owner_wait,
             payload,
             completion.retries_syscall(),
+            completion.checkpoints_owner(),
         )?;
         let (request, adapter) = match prepared {
             PreparedService::Request(request, adapter) => (request, adapter),
+            PreparedService::NoticeWait(request, holder, adapter) => {
+                return match self.park_notice_wait(
+                    &request,
+                    holder,
+                    adapter || completion.checkpoints_owner(),
+                )? {
+                    NoticeParkOutcome::Resumed(result) => Ok(result),
+                    NoticeParkOutcome::Published(defer_completion) => {
+                        let physical_checkpoint = self.service.native_service_doorbell();
+                        self.park_service(&request, physical_checkpoint || defer_completion)
+                    }
+                };
+            }
             PreparedService::Retired(result) => return Ok(result),
         };
         if let Some(wait) = owner_wait {
@@ -2028,6 +2113,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
         payload: ServicePayload<'a>,
         retry_syscall_after_supply: bool,
+        checkpoints_owner: bool,
     ) -> Result<PreparedService, NativeProcessError> {
         self.service_phase = NativeServicePhase::Payload;
         let (payload, entropy_preparation, stage_prefix) = match payload {
@@ -2380,6 +2466,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 carrier_continuation,
                 request,
                 wait: owner_wait,
+                notice_wait: None,
+                checkpoints_owner,
                 claim,
                 control,
             })),
@@ -2411,50 +2499,34 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Ok(PreparedService::Request(request, adapter));
         }
         self.service_phase = NativeServicePhase::Notice;
-        if let Err(error) = self
+        match self
             .current
             .service_notice
-            .publish(request.identity.into())
-            .map_err(|error| {
-                service_protocol_error(error, NativeServiceQuarantine::NoticePublishBusy)
-            })
+            .publish_or_observe(request.identity.into())
         {
-            let key =
-                ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
-            let guard = self
-                .source
-                .zone
-                .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                })
-                .map_err(|_| {
+            Ok(()) => {}
+            Err(carrick_core_abi::service::ServiceNoticeBusy::Held(holder)) => {
+                if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {
+                    pending.notice_wait = Some(holder);
+                    return Ok(PreparedService::NoticeWait(request, holder, adapter));
+                }
+                return self.abort_unpublished_service(request, NativeProcessError::Stale);
+            }
+            Err(carrick_core_abi::service::ServiceNoticeBusy::Duplicate(_)) => {
+                return self.abort_unpublished_service(
+                    request,
                     NativeProcessError::ServiceQuarantined(
-                        NativeServiceQuarantine::DuplicateNoticeQueue,
-                    )
-                })?;
-            // SAFETY: notice publication failed, so no transport can hold
-            // this identity. The queue also excludes concurrent cancellation.
-            unsafe { self.control.service.abort_unpublished(request.identity) }.map_err(
-                |error| service_protocol_error(error, NativeServiceQuarantine::NoticeAbortBusy),
-            )?;
-            {
-                self.control
-                    .service
-                    .consume(request.identity)
-                    .map_err(|error| {
-                        service_protocol_error(error, NativeServiceQuarantine::NoticeConsumeBusy)
-                    })?;
-                drop(guard);
-                let pending = self
-                    .runtime
-                    .graph
-                    .lock()
-                    .remove_service_wait(&self.record)
-                    .ok_or(NativeProcessError::ServiceQuarantined(
-                        NativeServiceQuarantine::DuplicateNoticeCleanup,
-                    ))?;
-                self.release_service_claim(pending.claim)?;
-                return Err(error.into());
+                        NativeServiceQuarantine::NoticePublishDuplicate,
+                    ),
+                );
+            }
+            Err(carrick_core_abi::service::ServiceNoticeBusy::Corrupt) => {
+                return self.abort_unpublished_service(
+                    request,
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::NoticePublishBusy,
+                    ),
+                );
             }
         }
         #[cfg(test)]
@@ -2880,13 +2952,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 _ => return Some(Err(NativeProcessError::Stale)),
             }
         }
-        let wait = self
-            .runtime
-            .graph
-            .lock()
-            .service_wait(&self.record)
-            .and_then(|pending| pending.wait);
-        Some(if wait.is_some() {
+        let (wait, notice_wait, checkpoints_owner, adapter) =
+            self.runtime.graph.lock().service_wait(&self.record).map_or(
+                (None, None, false, false),
+                |pending| {
+                    (
+                        pending.wait,
+                        pending.notice_wait,
+                        pending.checkpoints_owner,
+                        pending.adapter,
+                    )
+                },
+            );
+        Some(if notice_wait.is_some() {
+            match self.finish_notice_wait(&request, adapter || checkpoints_owner) {
+                Ok(NoticeFinishOutcome::Resumed(result)) => Ok(result),
+                Ok(NoticeFinishOutcome::Published(defer_completion)) => {
+                    let physical_checkpoint = self.service.native_service_doorbell();
+                    self.park_service(&request, physical_checkpoint || defer_completion)
+                }
+                Ok(NoticeFinishOutcome::Held(holder, defer_completion)) => {
+                    match self.park_notice_wait(&request, holder, defer_completion) {
+                        Ok(NoticeParkOutcome::Resumed(result)) => Ok(result),
+                        Ok(NoticeParkOutcome::Published(defer_completion)) => {
+                            let physical_checkpoint = self.service.native_service_doorbell();
+                            self.park_service(&request, physical_checkpoint || defer_completion)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        } else if wait.is_some() {
             self.finish_owner_wait(&request)
         } else {
             self.park_service(&request, false)
@@ -3043,6 +3140,311 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok_or(NativeProcessError::Stale)?;
         drop(queue);
         self.finish_service(request, result, pending)
+    }
+
+    #[inline(never)]
+    fn abort_unpublished_service<T>(
+        &mut self,
+        request: ServiceRequest,
+        error: NativeProcessError,
+    ) -> Result<T, NativeProcessError> {
+        let key = ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
+        let guard = self
+            .source
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .map_err(|_| {
+                NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::DuplicateNoticeQueue,
+                )
+            })?;
+        // SAFETY: notice publication failed, so no transport can hold
+        // this identity. The queue also excludes concurrent cancellation.
+        unsafe { self.control.service.abort_unpublished(request.identity) }
+            .map_err(|err| service_protocol_error(err, NativeServiceQuarantine::NoticeAbortBusy))?;
+        self.control
+            .service
+            .consume(request.identity)
+            .map_err(|err| {
+                service_protocol_error(err, NativeServiceQuarantine::NoticeConsumeBusy)
+            })?;
+        let pending = self
+            .runtime
+            .graph
+            .lock()
+            .remove_service_wait(&self.record)
+            .ok_or(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::DuplicateNoticeCleanup,
+            ))?;
+        drop(guard);
+        self.release_service_claim(pending.claim)?;
+        Err(error)
+    }
+
+    #[inline(never)]
+    fn cancel_unpublished_service(
+        &mut self,
+        request: &ServiceRequest,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let key = ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
+        let guard = self
+            .source
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .map_err(|_| NativeProcessError::Stale)?;
+        // SAFETY: this identity never published a notice into `service_notice`,
+        // so no carrier ticket exists; `guard` excludes `cancel_service`.
+        unsafe { self.control.service.abort_unpublished(request.identity) }
+            .map_err(|err| service_protocol_error(err, NativeServiceQuarantine::NoticeAbortBusy))?;
+        let result = self
+            .control
+            .service
+            .consume(request.identity)
+            .map_err(|err| {
+                service_protocol_error(err, NativeServiceQuarantine::NoticeConsumeBusy)
+            })?;
+        let pending = self
+            .runtime
+            .graph
+            .lock()
+            .remove_service_wait(&self.record)
+            .ok_or(NativeProcessError::Stale)?;
+        drop(guard);
+        self.finish_service(request, result, pending)
+    }
+
+    fn service_owner_entry(&self, request: &ServiceRequest) -> OwnerEntry {
+        match request.operation {
+            _ if self
+                .runtime
+                .graph
+                .lock()
+                .service_wait(&self.record)
+                .is_some_and(|pending| pending.retry_syscall_after_supply) =>
+            {
+                OwnerEntry::Syscall
+            }
+            ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => OwnerEntry::Exception,
+            ServiceOperation::Crossing { .. }
+            | ServiceOperation::Exec { .. }
+            | ServiceOperation::HostFile { .. }
+            | ServiceOperation::Entropy { .. }
+            | ServiceOperation::Clock { .. } => OwnerEntry::Syscall,
+            ServiceOperation::CarrierWork { entry, .. } => entry,
+        }
+    }
+
+    fn should_cancel_unpublished(
+        &mut self,
+        identity: carrick_core_abi::service::ServiceIdentity,
+    ) -> bool {
+        if self.control.service.cancel_queued(identity) {
+            return true;
+        }
+        let (interruptible, exec, output_cancelled) =
+            self.runtime.graph.lock().service_wait(&self.record).map_or(
+                (false, false, false),
+                |pending| {
+                    (
+                        pending.signal_interruptible(),
+                        matches!(pending.request.operation, ServiceOperation::Exec { .. }),
+                        (pending.copyout.is_some() || pending.copyin)
+                            && pending.claim.cancellation().is_some(),
+                    )
+                },
+            );
+        output_cancelled
+            || (interruptible && self.signal_interrupts_current())
+            || (exec && self.latch_default_terminating_exec_signal())
+            || self.runtime.graph.lock().pending.has_exit(&self.key)
+    }
+
+    /// Park an unpublished service request on the live peer currently holding
+    /// this slot's `service_notice` (#2532). Probing `publish_or_observe` once
+    /// under `holder`'s native-service queue lock closes the race with the
+    /// carrier's `take` + `complete` + `notify_object` without nesting two
+    /// members' native-service queue locks.
+    #[inline(never)]
+    fn park_notice_wait(
+        &mut self,
+        request: &ServiceRequest,
+        holder: carrick_core_abi::service::ServiceSelector,
+        defer_completion: bool,
+    ) -> Result<NoticeParkOutcome, NativeProcessError> {
+        self.service_phase = NativeServicePhase::Park;
+        use carrick_core_abi::service::ServiceNoticeBusy;
+        use carrick_sched_core::object_wait::ObjectWaitError;
+        let zone = self.source.zone;
+        let holder_key =
+            ObjectWaitKey::native_service(holder.record).ok_or(NativeProcessError::Stale)?;
+        if zone.completion_enabled(holder_key) {
+            return self.abort_unpublished_service(
+                *request,
+                NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::HostCompletionQueue,
+                ),
+            );
+        }
+        let token = self.take_preparation_operation(request)?;
+        let entry = self.service_owner_entry(request);
+        let mut save_context_ran = false;
+        let mut cancelled = false;
+        let mut published = false;
+        let mut holder_changed = false;
+        let mut failure = None;
+        let parked = carrick_core::wait::park_object_record(
+            zone,
+            self.source.slot,
+            carrick_core::wait::ObjectParkRequest::owner(
+                holder_key,
+                token,
+                entry,
+                // SAFETY: `save_context` probes `service_notice` and sticky
+                // cancellation under `holder_key`'s queue lock, which the
+                // carrier holds to complete `holder` and `notify_object` after
+                // draining `service_notice`.
+                unsafe { carrick_core::wait::OwnerProbeUnderQueueLock::for_save_context_probe() },
+            ),
+            &|_| {},
+            || {
+                save_context_ran = true;
+                if self.should_cancel_unpublished(request.identity) {
+                    cancelled = true;
+                    return Err(ObjectWaitError::Changed);
+                }
+                match self
+                    .current
+                    .service_notice
+                    .publish_or_observe(request.identity.into())
+                {
+                    Ok(()) => {
+                        published = true;
+                        Err(ObjectWaitError::Changed)
+                    }
+                    Err(ServiceNoticeBusy::Held(live)) if live == holder => {
+                        // SAFETY: this slot still owns the exact OnCpu record.
+                        unsafe {
+                            *zone.record(self.record.id).ctx_mut() = *self.words;
+                        }
+                        Ok((self.record.id, false))
+                    }
+                    Err(ServiceNoticeBusy::Held(_)) => {
+                        holder_changed = true;
+                        Err(ObjectWaitError::Changed)
+                    }
+                    Err(ServiceNoticeBusy::Duplicate(_)) => {
+                        failure = Some(NativeServiceQuarantine::NoticePublishDuplicate);
+                        Err(ObjectWaitError::Stale)
+                    }
+                    Err(ServiceNoticeBusy::Corrupt) => {
+                        failure = Some(NativeServiceQuarantine::NoticePublishBusy);
+                        Err(ObjectWaitError::Stale)
+                    }
+                }
+            },
+        );
+        match parked {
+            Ok(mut parked) => {
+                self.handoff = parked.take_receipt();
+                Ok(NoticeParkOutcome::Resumed(NativeResume::Left(None)))
+            }
+            Err((error, operation)) => {
+                if let Some(reason) = failure {
+                    self.restore_preparation_operation(operation)?;
+                    return self.abort_unpublished_service(
+                        *request,
+                        NativeProcessError::ServiceQuarantined(reason),
+                    );
+                }
+                if cancelled {
+                    self.restore_preparation_operation(operation)?;
+                    return self
+                        .cancel_unpublished_service(request)
+                        .map(NoticeParkOutcome::Resumed);
+                }
+                if published {
+                    if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record)
+                    {
+                        pending.notice_wait = None;
+                    }
+                    self.restore_preparation_operation(operation)?;
+                    #[cfg(test)]
+                    super::host_test_support::run_service_published_hook(
+                        self.runtime as *const _ as usize,
+                    );
+                    return Ok(NoticeParkOutcome::Published(defer_completion));
+                }
+                let holder_retired = !save_context_ran && error == ObjectWaitError::Stale;
+                let host_contended = error == ObjectWaitError::Occupied
+                    && !holder_changed
+                    && self.host_requested_current();
+                if holder_changed || holder_retired || host_contended {
+                    self.retain_record_operation(operation)?;
+                    return Ok(NoticeParkOutcome::Resumed(
+                        self.yield_service_checkpoint_as(entry)?,
+                    ));
+                }
+                self.restore_preparation_operation(operation)?;
+                Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::ParkRefused,
+                ))
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn finish_notice_wait(
+        &mut self,
+        request: &ServiceRequest,
+        defer_completion: bool,
+    ) -> Result<NoticeFinishOutcome, NativeProcessError> {
+        self.service_phase = NativeServicePhase::Notice;
+        use carrick_core_abi::service::ServiceNoticeBusy;
+        if self.should_cancel_unpublished(request.identity) {
+            return self
+                .cancel_unpublished_service(request)
+                .map(NoticeFinishOutcome::Resumed);
+        }
+        match self
+            .current
+            .service_notice
+            .publish_or_observe(request.identity.into())
+        {
+            Ok(()) => {
+                if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {
+                    pending.notice_wait = None;
+                } else {
+                    return Err(NativeProcessError::Stale);
+                }
+                #[cfg(test)]
+                super::host_test_support::run_service_published_hook(
+                    self.runtime as *const _ as usize,
+                );
+                Ok(NoticeFinishOutcome::Published(defer_completion))
+            }
+            Err(ServiceNoticeBusy::Held(holder)) => {
+                if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {
+                    pending.notice_wait = Some(holder);
+                } else {
+                    return Err(NativeProcessError::Stale);
+                }
+                Ok(NoticeFinishOutcome::Held(holder, defer_completion))
+            }
+            Err(ServiceNoticeBusy::Duplicate(_)) => self.abort_unpublished_service(
+                *request,
+                NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::NoticePublishDuplicate,
+                ),
+            ),
+            Err(ServiceNoticeBusy::Corrupt) => self.abort_unpublished_service(
+                *request,
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::NoticePublishBusy),
+            ),
+        }
     }
 
     /// Publish the already-installed successor through the graph, registry,

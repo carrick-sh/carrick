@@ -280,6 +280,13 @@ impl Frames {
         ) + self
             .required("::park_service::")?
             .max(self.required("::park_owner_wait::")? + self.maximum("::finish_owner_wait::"))
+            .max(
+                self.required("::park_notice_wait::")?
+                    .max(self.maximum("::finish_notice_wait::"))
+                    + self
+                        .maximum("::cancel_unpublished_service::")
+                        .max(self.maximum("::abort_unpublished_service::")),
+            )
             + self
                 .maximum("::finish_service::")
                 .max(self.maximum("::take_preparation_operation::"))
@@ -296,8 +303,10 @@ impl Frames {
             ])
             + self.required("::prepare_service_inner::")?.max(
                 self.maximum("::park_service::")
+                    .max(self.maximum("::park_notice_wait::"))
                     + self
                         .maximum("::yield_service_checkpoint::")
+                        .max(self.maximum("::yield_service_checkpoint_as::"))
                         .max(self.maximum("::take_preparation_operation::")),
             )
             + self.maximum("::release_service_claim::")
@@ -482,6 +491,7 @@ impl Frames {
                     + self.maximum("::begin_service::")
                     + self.required("::begin_service_inner::")?
                     + self.required("::prepare_service_inner::")?
+                    + self.maximum("::abort_unpublished_service::")
                     + self.maximum("::release_service_claim::")
                     + allocation,
             ),
@@ -495,16 +505,22 @@ impl Frames {
                     + self.required("::begin_return_work::")?
                     + self.required("::begin_service_inner::")?
                     + (self.required("::prepare_service_inner::")?
-                        + self.sum(&[
+                        + self.maximum("::abort_unpublished_service::").max(self.sum(&[
                             "::retire_closing_entry::",
                             "::retire_closing_member::",
                             "::retire_cancelled_pool_member::",
                             "::retire_thread_verdict::",
                             "::retire_thread_identity::",
                             "::lifecycle_admission_settled::",
-                        ]))
+                        ])))
                     .max(
                         self.required("::park_service::")?
+                            .max(
+                                self.required("::park_notice_wait::")?
+                                    + self
+                                        .maximum("::cancel_unpublished_service::")
+                                        .max(self.maximum("::abort_unpublished_service::")),
+                            )
                             + self.sum(&[
                                 "::yield_service_checkpoint::",
                                 "::yield_service_checkpoint_as::",
@@ -861,6 +877,7 @@ mod tests {
             "x::settle_service_exit::h0",
             "x::begin_return_work::h0",
             "x::park_owner_wait::h0",
+            "x::park_notice_wait::h0",
             "x::apply_fault_reply::h0",
             "x::settle_native_descriptor_reply::h0",
             "x::setup_arm_signal_frame::h0",
@@ -893,6 +910,8 @@ mod tests {
     fn native_admission_and_completion_locals_remain_charged() {
         for (symbol, chain) in [
             ("prepare_service_inner", "native service admission"),
+            ("park_notice_wait", "native service continuation"),
+            ("finish_notice_wait", "native service continuation"),
             ("finish_service_result", "native service continuation"),
             ("prepare_fault_repark", "native service continuation"),
         ] {
@@ -953,6 +972,9 @@ mod tests {
         for method in [
             "begin_return_work",
             "finish_host_resume",
+            "park_notice_wait",
+            "cancel_unpublished_service",
+            "abort_unpublished_service",
             "yield_service_checkpoint",
             "yield_service_checkpoint_as",
             "retire_closing_entry",
