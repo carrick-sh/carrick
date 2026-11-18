@@ -12,7 +12,8 @@ use carrick_softcpu_x86::{
     MSR_IA32_LSTAR, MSR_IA32_STAR, MsrCapabilities, MsrIndex, SoftCpuContext, SoftSegment, reg,
 };
 use carrick_x86::{
-    MsrInstall, SegmentDescriptor, X86Exit, X86Reg, X86Seg, X86Vcpu, XSAVE_AVX_OFFSET, XSAVE_LEN,
+    MsrInstall, SegmentDescriptor, X86Exit, X86Reg, X86Seg, X86Vcpu, XCR0_X86_64_V3_MASK,
+    XSAVE_AVX_OFFSET, XSAVE_LEN,
 };
 use carrick_x86_cpl0_host::cpl0_boot::{BootCpuState, fail};
 
@@ -283,6 +284,7 @@ pub fn apply_boot_cpu_state(
 ) -> Result<(), TrapError> {
     let mut vcpu = SoftBootVcpu::new(ctx, cpuid);
     state.program_entry(&mut vcpu)?;
+    vcpu.ctx.xcr0 = u64::from(XCR0_X86_64_V3_MASK);
     if production {
         let features = cpuid.cpuid(7, 0).ebx;
         if features & state.cpuid_leaf7_required != state.cpuid_leaf7_required {

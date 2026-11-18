@@ -12,7 +12,8 @@
 
 use carrick_guest_mem::GuestMemory as _;
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
-use carrick_kernel::dispatch::{DispatchOutcome, StdioReadiness};
+use carrick_kernel::dispatch::{DispatchOutcome, StdioReadiness, SyscallDispatcher};
+use carrick_kernel::kernel::KernelContext;
 use carrick_vmm_soft::{SoftBootImage, SoftCarrier, publish_worker_backings};
 use carrick_x86_cpl0_host::carrier_cpu::CarrierRunExit;
 use carrick_x86_cpl0_host::cpl0_boot::{
@@ -100,27 +101,33 @@ impl HelloRun {
 }
 
 fn run_hello(elf: &[u8]) -> HelloRun {
+    run_with_stdout_patch(elf, None)
+}
+
+fn run_with_stdout_patch(elf: &[u8], patch: Option<u8>) -> HelloRun {
     let mut run = HelloRun {
         stdout: Vec::new(),
         exit: None,
         exits: Vec::new(),
         failure: None,
     };
-    if let Err(failure) = drive(elf, &mut run) {
+    if let Err(failure) = drive(elf, &mut run, patch) {
         run.failure = Some(failure);
     }
     run
 }
 
-fn drive(elf: &[u8], run: &mut HelloRun) -> Result<(), String> {
+fn boot_initial_mm(
+    elf: &[u8],
+    dispatcher: &SyscallDispatcher,
+    root: &KernelContext,
+) -> Result<SoftCarrier, String> {
     let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None)
         .map_err(|error| format!("setup: user ELF {error:?}"))?;
     let image = carrick_mem::x86_initial_image::prepare_x86_elf(&program)
         .map_err(|error| format!("setup: user ELF image {error:?}"))?;
     let extent = initial_extent_bytes_for(&image, &[], &[]).map_err(|error| error.to_string())?;
-    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
-    let reporter = carrick_kernel::compat::CompatReporter::default();
-    let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher);
+    let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(dispatcher);
     let mut carrier = SoftCarrier::boot(
         inventory(),
         SoftBootImage {
@@ -133,10 +140,7 @@ fn drive(elf: &[u8], run: &mut HelloRun) -> Result<(), String> {
         MAX_BLOCKS,
     )
     .map_err(|error| format!("setup: {error}"))?;
-    let root = dispatcher
-        .capture_one_task_context()
-        .map_err(|error| format!("setup: issued root {error:?}"))?;
-    bind_issued_root(&mut carrier, &root).map_err(|error| format!("setup: {error}"))?;
+    bind_issued_root(&mut carrier, root).map_err(|error| format!("setup: {error}"))?;
     load_guest_mm(
         &mut carrier,
         &image,
@@ -145,6 +149,16 @@ fn drive(elf: &[u8], run: &mut HelloRun) -> Result<(), String> {
         InitialReservationLimits::UNLIMITED,
     )
     .map_err(|error| format!("initial-MM admission: {error}"))?;
+    Ok(carrier)
+}
+
+fn drive(elf: &[u8], run: &mut HelloRun, patch: Option<u8>) -> Result<(), String> {
+    let mut dispatcher = SyscallDispatcher::default();
+    let reporter = carrick_kernel::compat::CompatReporter::default();
+    let root = dispatcher
+        .capture_one_task_context()
+        .map_err(|error| format!("setup: issued root {error:?}"))?;
+    let carrier = boot_initial_mm(elf, &dispatcher, &root)?;
     run.exits.push("initial-MM admission".to_owned());
     let parts = carrier
         .into_worker_parts()
@@ -218,6 +232,13 @@ fn drive(elf: &[u8], run: &mut HelloRun) -> Result<(), String> {
                                 .map_err(|error| {
                                     carrick_x86_cpl0_host::cpl0_boot::fail(error.to_string())
                                 })?;
+                            if let Some(patch) = patch {
+                                venue
+                                    .write_bytes_raw(frame.rsi, &[patch])
+                                    .map_err(|error| {
+                                        carrick_x86_cpl0_host::cpl0_boot::fail(error.to_string())
+                                    })?;
+                            }
                             return Ok(Ok((
                                 frame.rax,
                                 dispatcher.forward_stdio_bytes(object, &bytes),
@@ -311,6 +332,68 @@ fn production_ring_runs_static_hello_to_exit_on_soft_cpu() {
     assert!(run.failure.is_none(), "{}", run.summary());
     assert_eq!(run.stdout, b"hello\n", "{}", run.summary());
     assert_eq!(run.exit, Some(0), "{}", run.summary());
+}
+
+#[test]
+fn production_soft_worker_refuses_peer_entry() {
+    let dispatcher = SyscallDispatcher::default();
+    let root = dispatcher.capture_one_task_context().expect("issued root");
+    let carrier = boot_initial_mm(&static_elf(HELLO), &dispatcher, &root).expect("initial MM");
+    let (_, factory) = carrier
+        .into_worker_parts()
+        .expect("worker hand-off")
+        .into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let mut peer = factory.claim(1).expect("peer lease");
+    let entry = peer.run_idle_peer();
+    assert!(
+        matches!(entry, Err(carrick_hal::TrapError::UnsupportedPlatform)),
+        "the unconfigured soft peer reached guest entry: {entry:?}"
+    );
+}
+
+#[test]
+fn production_ring_xgetbv_matches_the_x86_64_v3_contract() {
+    // xor ecx, ecx; xgetbv; mov edi, eax; mov eax, 231; syscall; ud2.
+    let code = [
+        0x31, 0xc9, 0x0f, 0x01, 0xd0, 0x89, 0xc7, 0xb8, 0xe7, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
+    ];
+    let run = run_hello(&static_elf(&code));
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert_eq!(
+        run.exit,
+        Some(carrick_x86::XCR0_X86_64_V3_MASK as i32),
+        "{}",
+        run.summary()
+    );
+}
+
+#[test]
+#[ignore = "reveals the pending shared host-write invalidation boundary"]
+fn production_ring_retranslates_a_code_page_written_through_forward_venue() {
+    // Call the same leaf before and after the host writes to its immediate.
+    // The stdout crossing records the original byte; exit_group uses the
+    // value loaded by the second call to the translated leaf.
+    let code = [
+        0xe8, 0x28, 0, 0, 0, // call leaf
+        0xbf, 1, 0, 0, 0, // mov edi, 1 (stdout)
+        0x48, 0x8d, 0x35, 0x1d, 0, 0, 0, // lea rsi, [rip + leaf + 1]
+        0xba, 1, 0, 0, 0, // mov edx, 1
+        0xb8, 1, 0, 0, 0, // mov eax, 1 (write)
+        0x0f, 0x05, // syscall
+        0xe8, 0x0b, 0, 0, 0, // call leaf
+        0x89, 0xc7, // mov edi, eax
+        0xb8, 0xe7, 0, 0, 0, // mov eax, 231 (exit_group)
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+        0xb8, 7, 0, 0, 0, 0xc3, // leaf: mov eax, 7; ret
+    ];
+    let mut elf = static_elf(&code);
+    // PT_LOAD p_flags: user code is deliberately writable for this test.
+    elf[68..72].copy_from_slice(&7u32.to_le_bytes());
+    let run = run_with_stdout_patch(&elf, Some(9));
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert_eq!(run.stdout, [7], "{}", run.summary());
+    assert_eq!(run.exit, Some(9), "{}", run.summary());
 }
 
 #[test]

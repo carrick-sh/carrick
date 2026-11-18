@@ -95,6 +95,13 @@ impl SoftCpuBackend {
         SoftBootVcpu::new(self.runner.machine_mut().context_mut(), &self.cpuid)
     }
 
+    fn require_primary(&self) -> Result<(), TrapError> {
+        if self.run.slot != CpuId::new(0) {
+            return Err(TrapError::UnsupportedPlatform);
+        }
+        Ok(())
+    }
+
     /// Authenticate the CPU's current page-table root for soft walks.
     fn admit_current_root(&mut self) -> Result<(), TrapError> {
         let machine = self.runner.machine_mut();
@@ -124,6 +131,7 @@ impl ProductionMemberCpu for SoftCpuBackend {
     }
 
     fn run_guest(&mut self) -> Result<VcpuExit, TrapError> {
+        self.require_primary()?;
         self.runner.refresh_memory()?;
         self.admit_current_root()?;
         let kick = self.kick.clone();
@@ -242,6 +250,9 @@ impl CarrierCpuBackend for SoftCpuBackend {
     }
 
     fn run(&mut self) -> Result<VcpuExit, TrapError> {
+        // A parked M1 peer has a custody record for the shared two-slot
+        // factory, but its extent table cannot participate in execution.
+        self.require_primary()?;
         let ram = Arc::clone(&self.run.ram);
         let table = ram
             .host_ptr(META_GPA + SHOOTDOWN_OFFSET, size_of::<ShootdownTable>())
