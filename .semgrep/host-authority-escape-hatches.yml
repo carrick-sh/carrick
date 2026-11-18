@@ -41,6 +41,10 @@ rules:
     severity: ERROR
     paths:
       exclude:
+        # #2521: publish written JIT bytes with DC CVAU / DSB ISH / IC IVAU /
+        # ISB. MRS CTR_EL0 supplies the line strides and coherence bits for
+        # this sequence.
+        - /crates/carrick-host-jit/src/publish.rs
         - /crates/carrick-el1/src/file.rs
         - /crates/carrick-el1/src/sched/hw.rs
         - /crates/carrick-el1/src/sched/aarch64_context.rs
