@@ -30,7 +30,9 @@ use super::aarch64_process::{
 };
 #[cfg(test)]
 use super::native_process_runtime::{NativeContention, NativeFailure};
-use super::native_process_runtime::{NativeProcessError, NativeProcessRuntime};
+use super::native_process_runtime::{
+    NativeProcessError, NativeProcessRuntime, NativeServiceQuarantine,
+};
 #[cfg(test)]
 use super::native_process_runtime::{NativeProcessRegistry, NativeProcessService};
 use carrick_el1_abi::{
@@ -3962,7 +3964,10 @@ fn assert_commit_fault_keeps_child_closed(fault: CommitFault) {
     let (error, born) = service
         .settle_mm(born)
         .expect_err("unacknowledged Commit must not settle a published child");
-    assert_eq!(error, NativeProcessError::Quarantined);
+    assert_eq!(
+        error,
+        NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ForkSettleCustody)
+    );
     assert_eq!(crossing.settlements_reserved.load(Ordering::Acquire), 1);
     assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
     assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 0);

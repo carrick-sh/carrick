@@ -36,7 +36,7 @@ use super::native_process_runtime::NativeResume;
 use super::native_process_runtime::{
     ExecSuccessorSlot, FallibleBox, NativeExecSuccessor, NativeFailure, NativeForkPreparation,
     NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
-    NativeProcessService,
+    NativeProcessService, NativeServiceQuarantine,
 };
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use carrick_el1::memory::reservations;
@@ -52,7 +52,10 @@ fn native_user_write_preserves_nonfault_refusals() {
         (MmError::Busy, NativeProcessError::Busy),
         (MmError::Stale, NativeProcessError::Stale),
         (MmError::Invalid, NativeProcessError::Invalid),
-        (MmError::Core, NativeProcessError::Quarantined),
+        (
+            MmError::Core,
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::UserWriteMmCore),
+        ),
         (
             MmError::UnsupportedExecutableCow,
             NativeProcessError::Unsupported,
@@ -803,7 +806,9 @@ where
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => {
             Ok(carrick_el1_abi::Action::Idle)
         }
-        Some(_) => Err(NativeProcessError::Quarantined),
+        Some(_) => Err(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::SignalCompletionRoute,
+        )),
     }
 }
 
@@ -938,12 +943,12 @@ fn abandon_loan<X: ForkStockCrossing>(
     if let Some(words) = scrub
         && !super::fork_loan::scrub_tables(words, loan)
     {
-        return NativeProcessError::Quarantined;
+        return NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ForkLoanScrub);
     }
     if abort_loan(crossing, worker, loan) {
         error
     } else {
-        NativeProcessError::Quarantined
+        NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ForkLoanAbort)
     }
 }
 
@@ -1826,32 +1831,34 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         successor: AddressContext<RootGpa>,
         effects: carrick_el1_abi::ExecCommitEffects,
     ) -> Result<(), NativeProcessError> {
-        let predecessor_mm = ReservationMm::new(predecessor.mm.raw().get())
-            .ok_or(NativeProcessError::Quarantined)?;
-        let successor_mm =
-            ReservationMm::new(successor.mm.raw().get()).ok_or(NativeProcessError::Quarantined)?;
-        let predecessor_index = self
-            .zone
-            .spaces
-            .find(predecessor_mm.raw())
-            .ok_or(NativeProcessError::Quarantined)?;
-        let successor_index = self
-            .zone
-            .spaces
-            .find(successor_mm.raw())
-            .ok_or(NativeProcessError::Quarantined)?;
+        let predecessor_mm = ReservationMm::new(predecessor.mm.raw().get()).ok_or(
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ExecPredecessorMm),
+        )?;
+        let successor_mm = ReservationMm::new(successor.mm.raw().get()).ok_or(
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ExecSuccessorMm),
+        )?;
+        let predecessor_index = self.zone.spaces.find(predecessor_mm.raw()).ok_or(
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ExecPredecessorSpace),
+        )?;
+        let successor_index = self.zone.spaces.find(successor_mm.raw()).ok_or(
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ExecSuccessorSpace),
+        )?;
         let predecessor_grant = self
             .zone
             .spaces
             .grant(predecessor_index, predecessor_mm.raw())
-            .ok_or(NativeProcessError::Quarantined)?;
+            .ok_or(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ExecPredecessorGrant,
+            ))?;
         self.zone.spaces.close(predecessor_index);
 
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let idle = self.zone.spaces.idle_ttbr();
             if idle == 0 {
-                return Err(NativeProcessError::Quarantined);
+                return Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::ExecIdleRoot,
+                ));
             }
             crate::sched::ThreadCpu::set_translation(&mut crate::sched::HardwareCpu, idle, idle);
         }
@@ -1860,7 +1867,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         let successor_grant = self
             .zone
             .install_space(self.slot, successor_mm.raw())
-            .ok_or(NativeProcessError::Quarantined)?;
+            .ok_or(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ExecSuccessorGrant,
+            ))?;
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             crate::sched::ThreadCpu::set_translation(
@@ -1883,7 +1892,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             mm: predecessor_mm,
         });
         {
-            let owner = self.portal().map_err(|_| NativeProcessError::Quarantined)?;
+            let owner = self.portal().map_err(|_| {
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ExecPortal)
+            })?;
             RETIRED_SPACES
                 .drain_portal(
                     &owner,
@@ -1891,7 +1902,11 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                     carrick_sched_core::ZONE_SLOTS,
                     self.worker(),
                 )
-                .map_err(|_| NativeProcessError::Quarantined)?;
+                .map_err(|_| {
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ExecRetiredSpaceDrain,
+                    )
+                })?;
         }
         self.crossing.cross_exec_settle(
             predecessor_mm,
@@ -2375,7 +2390,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             Err(e) => {
                 owner.spaces.free(index);
                 if matches!(e, carrick_core::mm::transaction::MmError::Core) {
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ForkPublishCore,
+                    ));
                 }
                 return Err(abandon_loan(
                     &self.crossing,
@@ -2391,7 +2408,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             loan.request.child_tables.base & AARCH64_ROOT_ADDRESS_MASK,
         )) else {
             if child.abort(&owner, &*live, self.worker()).is_err() {
-                return Err(NativeProcessError::Quarantined);
+                return Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::ForkInvalidRootAbort,
+                ));
             }
             owner.spaces.free(index);
             return Err(abandon_loan(
@@ -2413,7 +2432,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             Ok(admitted) => admitted,
             Err(e) => {
                 if child.abort(&owner, &*live, self.worker()).is_err() {
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ForkReserveAbort,
+                    ));
                 }
                 owner.spaces.free(index);
                 return Err(abandon_loan(
@@ -2496,17 +2517,26 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
         owner.spaces.free(prepared.admitted.index);
         if !super::fork_loan::scrub_tables(&*prepared.words, &prepared.loan) {
-            return Err((NativeProcessError::Quarantined, prepared));
+            return Err((
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ForkAbortScrub),
+                prepared,
+            ));
         }
         if !abort_loan(&self.crossing, self.worker(), &prepared.loan) {
-            return Err((NativeProcessError::Quarantined, prepared));
+            return Err((
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ForkAbortLoan),
+                prepared,
+            ));
         }
         Ok(())
     }
 
     fn settle_mm(&mut self, born: Self::Born) -> Result<(), (NativeProcessError, Self::Born)> {
         if let Err(admitted) = born.admitted.consume(&self.crossing, self.slot, self.zone) {
-            return Err((NativeProcessError::Quarantined, Born { admitted }));
+            return Err((
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ForkSettleCustody),
+                Born { admitted },
+            ));
         }
         Ok(())
     }

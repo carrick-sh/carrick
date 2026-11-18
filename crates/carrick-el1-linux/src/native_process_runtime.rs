@@ -388,6 +388,36 @@ pub enum NativeServiceQuarantine {
     UnexpectedExecPrepared,
     ExecCancelled,
     CompletionLifecycleOutcome,
+    UserWriteMmCore,
+    BirthControlResetUnclaim,
+    BirthAffinityUnclaim,
+    BirthVisibleTidUnclaim,
+    BirthRecordUnclaim,
+    ForkPublicationAbort,
+    BirthReservationRelease,
+    BirthMmSettle,
+    ChildGraphLookup,
+    ChildRegistryRegistration,
+    ChildNativeOwnership,
+    ChildRequeue,
+    SignalCompletionRoute,
+    ForkLoanScrub,
+    ForkLoanAbort,
+    ExecPredecessorMm,
+    ExecSuccessorMm,
+    ExecPredecessorSpace,
+    ExecSuccessorSpace,
+    ExecPredecessorGrant,
+    ExecIdleRoot,
+    ExecSuccessorGrant,
+    ExecPortal,
+    ExecRetiredSpaceDrain,
+    ForkPublishCore,
+    ForkInvalidRootAbort,
+    ForkReserveAbort,
+    ForkAbortScrub,
+    ForkAbortLoan,
+    ForkSettleCustody,
 }
 
 #[derive(
@@ -422,7 +452,9 @@ impl NativeProcessError {
             UserWriteError::Owner(MmError::Busy) | UserWriteError::Busy => NativeProcessError::Busy,
             UserWriteError::Owner(MmError::Stale) => NativeProcessError::Stale,
             UserWriteError::Owner(MmError::Invalid) => NativeProcessError::Invalid,
-            UserWriteError::Owner(MmError::Core) => NativeProcessError::Quarantined,
+            UserWriteError::Owner(MmError::Core) => {
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::UserWriteMmCore)
+            }
             UserWriteError::Owner(MmError::UnsupportedExecutableCow)
             | UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
             UserWriteError::Owner(_) | UserWriteError::Fault => NativeProcessError::Fault,
@@ -9037,18 +9069,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 )
                 .is_err()
             {
-                page.unclaim(claim)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
+                page.unclaim(claim).map_err(|_| {
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::BirthControlResetUnclaim,
+                    )
+                })?;
                 return Err(busy(NativeForkStage::ChildControlReset));
             }
             if control.set_affinity(parent_affinity).is_err() {
-                page.unclaim(claim)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
+                page.unclaim(claim).map_err(|_| {
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::BirthAffinityUnclaim,
+                    )
+                })?;
                 return Err(NativeProcessError::Invalid);
             }
             if !control.publish_visible_tid(visible.get()) {
-                page.unclaim(claim)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
+                page.unclaim(claim).map_err(|_| {
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::BirthVisibleTidUnclaim,
+                    )
+                })?;
                 return Err(NativeProcessError::Invalid);
             }
             let born = page
@@ -9070,7 +9111,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     let (_, claim) = refusal.into_parts();
                     match page.unclaim(claim) {
                         Ok(_) => NativeProcessError::Invalid,
-                        Err(_) => NativeProcessError::Quarantined,
+                        Err(_) => NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::BirthRecordUnclaim,
+                        ),
                     }
                 })?;
             page.publish(born)
@@ -9285,7 +9328,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }
                     Err(prepared) => {
                         self.service.quarantine_fork(*prepared);
-                        return Err(NativeProcessError::Quarantined);
+                        return Err(NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::ForkPublicationAbort,
+                        ));
                     }
                 };
                 return Err(error);
@@ -9300,11 +9345,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .is_err()
         {
             self.service.quarantine_born(published.born);
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::BirthReservationRelease,
+            ));
         }
         if let Err((_, born)) = self.service.settle_mm(published.born) {
             self.service.quarantine_born(born);
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::BirthMmSettle,
+            ));
         }
         let child_mm = self
             .runtime
@@ -9312,7 +9361,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .lock()
             .owner
             .task(child_key)
-            .map_err(|_| NativeProcessError::Quarantined)?
+            .map_err(|_| {
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ChildGraphLookup)
+            })?
             .native()
             .resources()
             .mm
@@ -9359,11 +9410,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .is_err()
         {
             unrow(self.runtime);
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ChildRegistryRegistration,
+            ));
         }
         if !self.source.zone.mark_native_owned(record) {
             unrow(self.runtime);
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ChildNativeOwnership,
+            ));
         }
         // The child's only owner is this queue entry: a refusal would leave
         // the published child on no run queue (#1100).
@@ -9374,7 +9429,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .is_queued()
         {
             unrow(self.runtime);
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ChildRequeue,
+            ));
         }
         Ok(visible.get())
     }

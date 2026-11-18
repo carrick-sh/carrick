@@ -774,7 +774,9 @@ fn arm_declined_fault_returns_a_quarantined_delivery_refusal() {
             &mut owner_wait,
             |_, _| Some(carrick_personality_linux::dispatch::CompletionRoute::Forward),
         ),
-        Err(NativeProcessError::Quarantined),
+        Err(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::SignalCompletionRoute,
+        )),
         "an unexpected delivery route is returned as Quarantined, never served"
     );
     assert!(owner_wait.is_none());
