@@ -2,7 +2,8 @@
 //! crate. It runs on the host CPU against this crate's own mapping and makes
 //! no system call.
 
-/// This host's CTR_EL0 (cache type register, Arm ARM D13.2.34).
+/// Read this host's CTR_EL0 (Arm ARM D13.2.34) to visit each cache line in
+/// the publication range and select the maintenance required by this CPU.
 #[cfg(target_arch = "aarch64")]
 pub fn cache_type() -> u64 {
     let ctr: u64;
