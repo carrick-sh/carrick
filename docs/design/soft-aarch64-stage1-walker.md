@@ -1,23 +1,78 @@
 # AArch64 soft CPU stage-1 walker (A2)
 
-Part of #2480. This is an inventory and proposed design, not an
-implemented walker. Inventory taken on GitHub main on 2026-11-17. N1 placement
-and TLB policy belongs to the x86 soft-CPU lane; this document does not reserve
-its implementation or change its interfaces.
+Part of #2480. The inventory below dates from 2026-11-17, taken on GitHub
+main. N1 placement and TLB policy belong to the x86 soft-CPU lane, and this
+document does not reserve their implementation or change their interfaces.
+The implementation status follows.
 
 ## Status
 
-Slice 1 (N1 extraction) is in draft PR #2497 and has not landed. It
-adds `carrick-mmu-core::stage1` with `LeafAccess` (the x86 descriptor
-`Access` is now this type), `LeafSize`, `LeafSpan`, `WalkError<F>`,
-`Stage1Leaf` and `Stage1Walker`. The x86 `HardwareWalker` wraps
-`translate_leaf_hardware`, and `SoftWalker::walk_and_fill` calls it by
-static dispatch as the trait's first production caller. Leaf
-authentication is generic over `Stage1Leaf`. The soft TLB tag, the
-x86 fault records and the outcome types stay x86. Making them generic
-belongs with the ARM binding (slice 4), which defines the second
-instance. The PR does not remove `MmioHoles::default` (see Placement
-and publication). No AArch64 walk exists yet.
+Slice 1 (N1) landed with #2497 as `carrick-mmu-core::stage1`. It provides
+`LeafAccess`, `LeafSize`, `LeafSpan`, `WalkError<F>`, `Stage1Leaf` and
+`Stage1Walker`, and the x86 `HardwareWalker` is the first instance.
+
+PR #2540 (depends on #2521) adds the following. It is a soft-CPU profile,
+not a claim of hardware parity.
+
+- **Walker (slices 2–3, CPU side):** `carrick-mmu-core::aarch64::stage1_walk`.
+  - `Aarch64Walker: Stage1Walker` walks 4 KiB-granule tables over
+    `LiveDescriptorWords`.
+  - It selects TTBR0 or TTBR1 by AddrTop (bit 55 under TBI, otherwise
+    bit 63). The bits from AddrTop down to the input size must equal the
+    range bit, and a range or EPD failure is a level-0 translation fault.
+  - The start level comes from TnSZ (16..=39). TTBR, table and output
+    addresses are checked against TCR.IPS and fault as address size.
+  - Descriptors are decoded once, by `DescriptorFormat`, built on the
+    `aarch64.rs` constants. An L0 block and an L3 type 01 are invalid.
+  - AF=0 faults, since HA=HD=0. APTable, PXNTable and UXNTable fold into the
+    leaf check.
+  - Permissions: AP; PXN and UXN; EL0-writable implies PXN; WXN; PAN; and
+    LDTR/STTR checked as EL0 when UAO=0. EL0 execute-only memory is allowed,
+    and EPAN is RES0.
+  - Faults carry kind, level, the original VA and the direction, and
+    `status_code()` is the DFSC/IFSC value. Leaves carry output, span, level,
+    descriptor, nG, the ASID selected by TCR.A1/AS, AttrIndx and the
+    contiguous hint, which never widens the span.
+  - `Aarch64Regime::new` refuses with a typed `UnsupportedRegime`: 16 KiB
+    and 64 KiB granules, HA, HD, HPD, HWU, TBID, NFD, E0PD, TCMA, DS, and a
+    52-bit or reserved IPS.
+  - Known answers include the production `stage1_identity_page_tables` bytes
+    under `TCR_EL1_BOOTSTRAP` and `SCTLR_EL1_BOOTSTRAP`. Their outputs and
+    levels agree with `walk_descriptors`/`terminal_entry` on more than 1,500
+    sampled VAs.
+- **softmmu seam (slice 4, partial):** `carrick_softmmu::resolve_leaf<W:
+  Stage1Walker>` is the one slow path for any ISA: the walk over
+  `AuthenticatedDescriptorWords`, the MMIO-hole screen, extent authentication
+  of the whole leaf span, and `LinearPlacement::host`. x86
+  `SoftWalker::walk_and_fill` now calls it unchanged (the x86 contract suite
+  is the witness). The AArch64 walker is driven through it in the same
+  contract fixture with ARM tables. The ARM TLB permission-class tags (bits
+  6–11) and `MmioHoles::default` removal are **not done**.
+- **Execution (slice 5, partial):** `carrick-softcpu-aarch64::mmu`.
+  - With SCTLR_EL1.M set, handler data accesses and each block's first fetch
+    translate through the walker under the live registers and PSTATE, with
+    LDTR*/STTR* as the unprivileged class.
+  - Every page of an access is translated before any byte moves, so a fault
+    on the second page of a crossing access writes nothing, and FAR is the
+    second page's first byte.
+  - Faults go through the existing EL1 exception entry: EC
+    0x20/0x21/0x24/0x25, IL=1, WnR, ISV=0, FAR = VA, ELR = the faulting PC.
+  - A TCR the walker does not admit stops the CPU, as does a descriptor read
+    that guest RAM cannot serve. Neither is a guest abort.
+  - The engine reads descriptors from its `GuestMemory`. It does **not** yet
+    use the softmmu placement or soft TLB: there is no translation cache, so
+    TTBR/TCR/SCTLR writes and TLBI need no invalidation.
+
+Not done here (follow-ups):
+
+- Migrating the existing ARM decoders onto `DescriptorFormat`:
+  `owner_mmu.rs::Aarch64Mmu::translate_with` and the HVF consumers in the
+  table below. Both are outside this PR's fence.
+- The ARM soft TLB binding: tags, warm hits, ASID/nG flush witnesses.
+- `AT S1E*` through the walker into PAR_EL1.
+- Modelled synchronous external aborts on a table walk.
+- Moving the engine's memory onto softmmu placement.
+- Hardware differential (slice 6).
 
 ## Authority and scope
 
@@ -395,9 +450,9 @@ L0 AF/permission faults need LPA2 and are not valid outputs for this profile;
 translation/access-flag/permission and returns `None` for address-size and
 external aborts. It neither validates the level nor builds the full fault;
 alone it is insufficient validation.
-Disabled EPD/range failures are translation faults at the architectural start
-level; output-address overflow is address-size, not a truncated successful
-translation. Reserved descriptor forms (including L0 block/L3 type 01) must
+Disabled EPD/range failures are level-0 translation faults (D5.2.6; for the
+48-bit production profile this is also the start level). Output-address
+overflow is address size, not a truncated successful translation. Reserved descriptor forms (including L0 block/L3 type 01) must
 follow D5.3/D5.8 rather than diagnostic-walk permissiveness. Prioritize faults
 per D5.8.3: input checks, each table read/format/output check, AF, permissions;
 do not mask a translation fault with a later permission failure.
@@ -470,10 +525,8 @@ bypass, no x86 A/D writes on ARM's software-AF profile. Register the future
 contract outside this document's fence through the director; if the contract gate
 flags guest-surface files, stop and report instead of adding evidence here.
 
-This revision changes only this document and qualifies for the documentation
-exemption in `docs/conformance-contracts.md`: no executable semantic or work
-expectation changes. No crate was touched; crate tests, lint-domains,
-test-touched and full `just ci` are therefore not required for this checkpoint.
-Required checks are fmt-check, doc, check-contract-change against fetched main
-and authority-debt source-only. Runtime, signed and hardware differential
-verification remain future work; this document cannot claim those results.
+The #2481 revision of this document was documentation-only. The #2540
+revision records the implementation status above. Its crate tests, contract
+rows and runtime evidence are on that PR. Signed and hardware differential
+verification remain future work, and this document cannot claim those
+results.
