@@ -92,6 +92,11 @@ pub enum Exception {
         access: DataAccess,
         address: VirtualAddress,
     },
+    /// IC IVAU by VA, reported as a data abort with ISS.CM and WnR set.
+    CacheMaintenanceAbort {
+        status: FaultStatus,
+        address: VirtualAddress,
+    },
     Abort {
         access: Access,
         status: FaultStatus,
@@ -136,6 +141,9 @@ pub fn syndrome(exception: Exception, origin: ExceptionLevel) -> Syndrome {
                 0
             },
         ),
+        Exception::CacheMaintenanceAbort { status, .. } => {
+            (0x24 + current, status.fsc() | (1 << 8) | (1 << 6))
+        }
         Exception::Abort { access, status, .. } => (
             if access == Access::Fetch {
                 0x20 + current
@@ -189,7 +197,9 @@ pub fn take_exception(cpu: &mut CpuState, exception: Exception) -> ExceptionOutc
     // D1.10.5 leaves FAR unknown for other reported exceptions.
     // Keeping the prior value is this profile's deterministic choice.
     cpu.el1.far = match exception {
-        Exception::Abort { address, .. } | Exception::Alignment { address, .. } => address,
+        Exception::Abort { address, .. }
+        | Exception::CacheMaintenanceAbort { address, .. }
+        | Exception::Alignment { address, .. } => address,
         Exception::PcAlignment => VirtualAddress(cpu.pc.0),
         _ => cpu.el1.far,
     };

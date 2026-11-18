@@ -1169,7 +1169,7 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64/src/exception.rs", contracts = [] },
   # Copy-through exit handlers for the test-only arm64 lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contracts = [] },
-  # Static diagnostics only: no guest execution or advertised CPU semantics.
+  # Typed A64 census and instruction decoder for the test-only soft-CPU lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/lib.rs", contracts = [] },
   # Stage-1 translation of handler accesses and block fetch for the test-only arm64 lane (#2480).
   # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.

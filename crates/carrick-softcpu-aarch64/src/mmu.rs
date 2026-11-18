@@ -13,8 +13,8 @@ use core::cell::RefCell;
 
 use carrick_guest_arch::GuestVa;
 use carrick_mmu_core::aarch64::stage1_walk::{
-    Aarch64AccessClass, Aarch64El, Aarch64Fault, Aarch64FaultKind, Aarch64Level, Aarch64Regime,
-    Aarch64WalkContext, Aarch64Walker, UnsupportedRegime,
+    Aarch64AccessClass, Aarch64El, Aarch64Fault, Aarch64FaultKind, Aarch64Leaf, Aarch64Level,
+    Aarch64Regime, Aarch64WalkContext, Aarch64Walker, UnsupportedRegime,
 };
 use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
 use carrick_mmu_core::live_descriptor_words::LiveDescriptorWords;
@@ -93,6 +93,17 @@ pub fn translate(
     if !enabled(cpu) {
         return Ok(va);
     }
+    Ok(walk(cpu, memory, va, access, class)?.output().raw())
+}
+
+/// Walk an enabled stage-1 regime, retaining the selected memory attribute.
+pub(crate) fn walk(
+    cpu: &CpuState,
+    memory: &mut impl GuestMemory,
+    va: u64,
+    access: LeafAccess,
+    class: AccessClass,
+) -> Result<Aarch64Leaf, Stage1Error> {
     let context = Aarch64WalkContext {
         regime: regime(cpu).map_err(Stage1Error::Regime)?,
         el: match cpu.pstate.el {
@@ -108,7 +119,7 @@ pub fn translate(
     };
     let words = PhysicalWords(RefCell::new(memory));
     match Aarch64Walker.walk(&words, &context, GuestVa::new(va), access) {
-        Ok(leaf) => Ok(leaf.output().raw()),
+        Ok(leaf) => Ok(leaf),
         Err(WalkError::Fault(fault)) => Err(Stage1Error::Abort(fault)),
         Err(WalkError::Refusal(refusal)) => Err(Stage1Error::Descriptor(refusal)),
     }
@@ -137,19 +148,22 @@ fn leaf_level(level: Aarch64Level) -> Option<LeafLevel> {
 /// The EL1 abort exception for a walker fault: instruction abort for a
 /// fetch, data abort otherwise; FAR is the faulting VA as presented.
 pub fn fault_exception(fault: Aarch64Fault) -> Option<Exception> {
-    let status = match fault.kind {
-        Aarch64FaultKind::AddressSize => FaultStatus::AddressSize(table_level(fault.level)),
-        Aarch64FaultKind::Translation => FaultStatus::Translation(table_level(fault.level)),
-        Aarch64FaultKind::AccessFlag => FaultStatus::AccessFlag(leaf_level(fault.level)?),
-        Aarch64FaultKind::Permission => FaultStatus::Permission(leaf_level(fault.level)?),
-    };
     Some(Exception::Abort {
         access: match fault.access {
             LeafAccess::Read => Access::Read,
             LeafAccess::Write => Access::Write,
             LeafAccess::Execute => Access::Fetch,
         },
-        status,
+        status: fault_status(fault)?,
         address: VirtualAddress(fault.va.raw()),
+    })
+}
+
+pub(crate) fn fault_status(fault: Aarch64Fault) -> Option<FaultStatus> {
+    Some(match fault.kind {
+        Aarch64FaultKind::AddressSize => FaultStatus::AddressSize(table_level(fault.level)),
+        Aarch64FaultKind::Translation => FaultStatus::Translation(table_level(fault.level)),
+        Aarch64FaultKind::AccessFlag => FaultStatus::AccessFlag(leaf_level(fault.level)?),
+        Aarch64FaultKind::Permission => FaultStatus::Permission(leaf_level(fault.level)?),
     })
 }

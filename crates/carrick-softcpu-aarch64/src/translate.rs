@@ -88,6 +88,7 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
         | Instruction::Extract(_)
         | Instruction::Multiply(_)
         | Instruction::Divide(_)
+        | Instruction::SimdCopy(_)
         | Instruction::ConditionalSelect(_)
         | Instruction::ConditionalCompare(_)
         | Instruction::Barrier(_)
@@ -102,9 +103,9 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
         | Instruction::AtomicAdd(_) => InstructionClass::Exit(ExitReason::Memory),
         Instruction::SystemAccess(_) => InstructionClass::Exit(ExitReason::SystemRegister),
         Instruction::PstateImmediate(_) => InstructionClass::Exit(ExitReason::Pstate),
-        Instruction::SystemOperation(_) | Instruction::InstructionCache(_) => {
-            InstructionClass::Exit(ExitReason::SystemOperation)
-        }
+        Instruction::SystemOperation(_)
+        | Instruction::InstructionCache(_)
+        | Instruction::DataCacheZero(_) => InstructionClass::Exit(ExitReason::SystemOperation),
         Instruction::CensusGap(Decoded::AddressTranslate { .. }) => {
             InstructionClass::Exit(ExitReason::AddressTranslate)
         }
@@ -295,7 +296,9 @@ pub mod frame {
     pub const HOST_SP: u32 = 0x108;
     pub const SCRATCH: u32 = 0x110;
     pub const SLOTS: usize = 36;
-    pub const BYTES: usize = SLOTS * 8;
+    /// Guest Q0..Q31, sixteen bytes per register.
+    pub const VECTORS: u32 = (SLOTS * 8) as u32;
+    pub const BYTES: usize = SLOTS * 8 + 32 * 16;
 }
 
 /// The frame a block runs against. The host adapter places it at the top of a
@@ -304,12 +307,19 @@ pub mod frame {
 #[repr(C, align(16))]
 pub struct BlockFrame {
     pub slots: [u64; frame::SLOTS],
+    pub vectors: [u128; 32],
 }
+
+const _: () = {
+    assert!(core::mem::offset_of!(BlockFrame, vectors) == frame::VECTORS as usize);
+    assert!(core::mem::size_of::<BlockFrame>() == frame::BYTES);
+};
 
 impl Default for BlockFrame {
     fn default() -> Self {
         Self {
             slots: [0; frame::SLOTS],
+            vectors: [0; 32],
         }
     }
 }
@@ -320,7 +330,7 @@ const fn slot(offset: u32) -> usize {
 
 impl BlockFrame {
     /// Load the guest registers a block can observe: X0..X30, the current
-    /// banked SP and NZCV.
+    /// banked SP, NZCV, and Q0..Q31.
     pub fn from_cpu(cpu: &CpuState) -> Self {
         let mut f = Self::default();
         for n in 0..31u8 {
@@ -328,6 +338,7 @@ impl BlockFrame {
                 f.slots[usize::from(n)] = cpu.read_operand(OperandRegister::Gpr(r)).0;
             }
         }
+        f.vectors = cpu.vectors;
         f.slots[slot(frame::GUEST_SP)] = cpu.sp().0;
         f.slots[slot(frame::NZCV)] = u64::from(cpu.pstate.nzcv & 15) << 28;
         f
@@ -342,6 +353,7 @@ impl BlockFrame {
                 );
             }
         }
+        cpu.vectors = self.vectors;
         cpu.set_sp(StackPointer(self.slots[slot(frame::GUEST_SP)]));
         cpu.pstate.nzcv = ((self.slots[slot(frame::NZCV)] >> 28) & 15) as u8;
     }
@@ -417,7 +429,7 @@ pub enum TranslateError {
     Encoding(u32),
 }
 
-/// Host instruction encoders (DDI0487G.a C6.2). 64-bit forms only.
+/// Host instruction encoders (DDI0487G.a C6.2).
 pub mod encode {
     pub const SP: u32 = 31;
     /// STP Xt1, Xt2, [Xn|SP, #imm] (signed offset).
@@ -435,6 +447,18 @@ pub mod encode {
     /// LDP Xt1, Xt2, [Xn|SP], #imm (post-index).
     pub const fn ldp_post(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
         0xa8c0_0000 | ((((offset / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+    }
+    /// STP Qt1, Qt2, [Xn|SP, #imm] (signed offset).
+    pub const fn stp_q(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
+        0xad00_0000 | ((((offset / 16) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+    }
+    /// LDP Qt1, Qt2, [Xn|SP, #imm] (signed offset).
+    pub const fn ldp_q(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
+        stp_q(rt, rt2, rn, offset) | (1 << 22)
+    }
+    /// STP Qt1, Qt2, [Xn|SP, #imm]! (pre-index).
+    pub const fn stp_q_pre(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
+        stp_q(rt, rt2, rn, offset) | (1 << 23)
     }
     /// STR Xt, [Xn|SP, #imm] (unsigned offset).
     pub const fn str(rt: u32, rn: u32, offset: u32) -> u32 {
@@ -477,10 +501,22 @@ use encode::SP;
 /// Host words that enter a block: an AAPCS64 prologue saving x19..x30, then
 /// host SP to the frame, SP = frame, guest NZCV and guest X0..X30.
 pub fn entry_stub() -> Vec<u32> {
-    let mut w = Vec::with_capacity(24);
+    entry_stub_for(false)
+}
+
+fn entry_stub_for(simd: bool) -> Vec<u32> {
+    let mut w = Vec::with_capacity(if simd { 47 } else { 27 });
     w.push(encode::stp_pre(29, 30, SP, -96));
     for (i, r) in [19, 21, 23, 25, 27].into_iter().enumerate() {
         w.push(encode::stp(r, r + 1, SP, 16 * (i as i32 + 1)));
+    }
+    if simd {
+        // AAPCS64 requires the low half of V8..V15 to survive. Save full
+        // vectors in pairs, on the host stack, before loading guest state.
+        w.push(encode::stp_q_pre(8, 9, SP, -128));
+        for r in [10, 12, 14] {
+            w.push(encode::stp_q(r, r + 1, SP, 16 * (r as i32 - 8)));
+        }
     }
     w.push(encode::add_imm(1, SP, 0));
     w.push(encode::str(1, 0, frame::HOST_SP));
@@ -491,6 +527,16 @@ pub fn entry_stub() -> Vec<u32> {
         w.push(encode::ldp(r, r + 1, SP, 8 * r as i32));
     }
     w.push(encode::ldr(30, SP, 8 * 30));
+    if simd {
+        for r in (0..32).step_by(2) {
+            w.push(encode::ldp_q(
+                r,
+                r + 1,
+                SP,
+                frame::VECTORS as i32 + 16 * r as i32,
+            ));
+        }
+    }
     w
 }
 
@@ -498,15 +544,35 @@ pub fn entry_stub() -> Vec<u32> {
 /// stored and the exit index in x0: store guest X2..X30 and NZCV, restore the
 /// host stack and callee-saved registers, return the exit index.
 pub fn common_exit() -> Vec<u32> {
-    let mut w = Vec::with_capacity(28);
+    common_exit_for(false)
+}
+
+fn common_exit_for(simd: bool) -> Vec<u32> {
+    let mut w = Vec::with_capacity(if simd { 49 } else { 28 });
     for r in (2..30).step_by(2) {
         w.push(encode::stp(r, r + 1, SP, 8 * r as i32));
     }
     w.push(encode::str(30, SP, 8 * 30));
     w.push(encode::mrs_nzcv(1));
     w.push(encode::str(1, SP, frame::NZCV));
+    if simd {
+        for r in (0..32).step_by(2) {
+            w.push(encode::stp_q(
+                r,
+                r + 1,
+                SP,
+                frame::VECTORS as i32 + 16 * r as i32,
+            ));
+        }
+    }
     w.push(encode::ldr(1, SP, frame::HOST_SP));
     w.push(encode::add_imm(SP, 1, 0));
+    if simd {
+        for r in [8, 10, 12, 14] {
+            w.push(encode::ldp_q(r, r + 1, SP, 16 * (r as i32 - 8)));
+        }
+        w.push(encode::add_imm(SP, SP, 128));
+    }
     for (i, r) in [19, 21, 23, 25, 27].into_iter().enumerate() {
         w.push(encode::ldp(r, r + 1, SP, 16 * (i as i32 + 1)));
     }
@@ -624,8 +690,12 @@ pub fn emit_block(guest: &GuestBlock) -> Result<TranslatedBlock, TranslateError>
     if guest.instructions.is_empty() {
         return Err(TranslateError::Empty);
     }
+    let simd = guest
+        .instructions
+        .iter()
+        .any(|i| matches!(i.instruction, Instruction::SimdCopy(_)));
     let mut e = Emitter {
-        words: entry_stub(),
+        words: entry_stub_for(simd),
         exits: Vec::new(),
         sites: Vec::new(),
     };
@@ -687,7 +757,7 @@ pub fn emit_block(guest: &GuestBlock) -> Result<TranslatedBlock, TranslateError>
         None => Terminator::Fallthrough(e.exit(BlockExit::Continue(guest.next_pc()))),
     };
     let common = e.words.len();
-    e.words.extend(common_exit());
+    e.words.extend(common_exit_for(simd));
     for site in core::mem::take(&mut e.sites) {
         e.words[site] = encode::b(4 * (common as i64 - site as i64));
     }

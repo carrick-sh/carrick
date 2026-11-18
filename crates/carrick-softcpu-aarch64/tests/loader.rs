@@ -302,8 +302,14 @@ fn sys_space_tlbi_fields_and_names() {
             .unwrap_or("-");
         let d = decode_instruction(w);
         if name == "-" {
-            if !matches!(d, Instruction::CensusGap(Decoded::AddressTranslate { .. })) {
-                assert_eq!(d, Instruction::Unallocated, "{w:08x}");
+            match w & !31 {
+                0xd50b_7420 => assert!(matches!(d, Instruction::DataCacheZero(_))),
+                0xd50b_7520 => assert!(matches!(
+                    d,
+                    Instruction::InstructionCache(carrick_softcpu_aarch64::IcOperation::Ivau(_))
+                )),
+                _ if matches!(d, Instruction::CensusGap(Decoded::AddressTranslate { .. })) => {}
+                _ => assert_eq!(d, Instruction::Unallocated, "{w:08x}"),
             }
             continue;
         }

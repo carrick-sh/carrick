@@ -500,3 +500,82 @@ fn production_el1_image_boots_past_trampoline_to_first_guest_hvc() {
         "EL0 UDF mutation must not pass as a forwarded SYS_write: {fault_report}"
     );
 }
+
+#[test]
+#[ignore = "requires production CARRICK_A64_ELF and the pinned arm64 musl rust-std target"]
+fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
+    use carrick_mem::memory::AddressSpace;
+    use std::process::Command;
+
+    let elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
+        .expect("read the production EL1 ELF");
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/musl_hello.rs");
+    let out = std::env::temp_dir().join(format!("carrick-musl-hello-{}", std::process::id()));
+    let status = Command::new("rustc")
+        .args([
+            "--target",
+            "aarch64-unknown-linux-musl",
+            "-C",
+            "relocation-model=static",
+            "-C",
+            "debuginfo=2",
+            "-o",
+        ])
+        .arg(&out)
+        .arg(fixture)
+        .status()
+        .expect("compile static musl hello with the pinned toolchain");
+    assert!(status.success());
+    let user_elf = std::fs::read(&out).expect("read musl hello");
+    std::fs::remove_file(out).expect("remove compiled musl hello");
+
+    assert_eq!(field(&user_elf, 16, 2), 2, "musl hello must be ET_EXEC");
+    let (mut cpu, mut memory, entry) = enter_carrier_root(&elf, &user_elf);
+    let image = AddressSpace::load_elf_bytes(&user_elf)
+        .unwrap()
+        .with_linux_initial_stack_at(["musl-hello"], [] as [&str; 0], LINUX_STACK_TOP, 4 * PAGE)
+        .unwrap();
+    let sp = image.initial_stack_pointer().unwrap();
+    let stack = image
+        .regions()
+        .iter()
+        .find(|r| r.start <= sp && sp < r.end)
+        .unwrap();
+    let (offset, bytes) = stack.shared_initialized_bytes();
+    memory.load(stack.start + offset, &bytes);
+    cpu.sp_el0 = StackPointer(sp);
+
+    let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
+    let report = probe(&mut cpu, &mut memory, &mut runner, 1_000_000);
+    let mb = LINUX_SYSCALL_MAILBOX_BASE;
+    let state = read_u32(
+        &mut memory,
+        mb + core::mem::offset_of!(Aarch64SyscallMailbox, state) as u64,
+    );
+    let trap_kind = read_u32(
+        &mut memory,
+        mb + core::mem::offset_of!(Aarch64SyscallMailbox, trap_kind) as u64,
+    );
+    let nr = read_u64(
+        &mut memory,
+        mb + core::mem::offset_of!(Aarch64SyscallMailbox, native_nr) as u64,
+    );
+    let resume = read_u64(
+        &mut memory,
+        mb + core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc) as u64,
+    );
+    println!(
+        "musl hello entry {entry:#x}: {report}; ESR={:#x} ELR={:#x} FAR={:#x}; mailbox state={state} trap_kind={trap_kind} nr={nr} resume_pc={resume:#x}",
+        cpu.el1.esr.0, cpu.el1.elr.0, cpu.el1.far.0
+    );
+    assert!(memory.read_boot_root);
+    assert!(
+        matches!(
+            report.stop,
+            Stop::Event { event: Event::ProviderExit(exit), .. } if exit.immediate.value() == 2
+        ),
+        "{report}"
+    );
+    assert_eq!((state, trap_kind, cpu.el1.esr.0), (1, 1, 0x5600_0000));
+}
