@@ -900,7 +900,10 @@ fn block_tsc_clock_counts_guest_work_and_wakes_hlt_at_the_deadline() {
         data_frame.raw() + 0x100 + 0xef * 16,
         &idt_gate64(ISR_VA, 0x08, 0, 0, true, false),
     );
-    machine.set_block_tsc_clock(NonZeroU64::new(100).unwrap());
+    // Make the block floor observable and put the deadline beyond it even
+    // after STI and HLT have both retired.
+    let ticks_per_block = 50_000_000;
+    machine.set_block_tsc_clock(NonZeroU64::new(ticks_per_block).unwrap());
     let ctx = machine.context_mut();
     ctx.rflags &= !(1 << 9);
     ctx.lapic_mmio_write(LAPIC_SVR_OFFSET, &0x1ffu32.to_le_bytes());
@@ -912,26 +915,34 @@ fn block_tsc_clock_counts_guest_work_and_wakes_hlt_at_the_deadline() {
         &GuestCpuidView::default()
             .with_tsc(carrick_x86::TscCrystalRatio::from_hz(1_000_000_000u64)),
     );
-    ctx.write_msr(MSR_IA32_TSC, 5_000, caps).unwrap();
-    ctx.write_msr(MSR_IA32_TSC_DEADLINE, 6_000, caps).unwrap();
+    let start = std::time::Instant::now();
+    let deadline = 300_000_000;
+    ctx.write_msr(MSR_IA32_TSC_DEADLINE, deadline, caps)
+        .unwrap();
 
     assert!(matches!(
         machine.step().unwrap(),
         Some(SoftMachineExit::IoOut { port: 0x80, .. })
     ));
-    assert_eq!(machine.context().now_tsc(), 5_100);
+    assert!(machine.context().now_tsc() >= ticks_per_block);
     assert_eq!(machine.context().lapic().timer_fire_count(), 0);
     assert_eq!(machine.step().unwrap(), None); // STI; the shadow covers HLT.
-    assert_eq!(machine.context().now_tsc(), 5_200);
-    assert_eq!(machine.step().unwrap(), None); // HLT advances to the timer event.
-    assert_eq!(machine.context().now_tsc(), 6_000);
+    assert!(machine.context().now_tsc() >= 2 * ticks_per_block);
+    // A host kick can return from HLT without delivering the timer.
+    assert!(matches!(
+        machine.step_with_kick(&|| true).unwrap(),
+        Some(SoftMachineExit::Hlt { .. })
+    ));
+    assert_eq!(machine.context().lapic().timer_fire_count(), 0);
+    assert_eq!(machine.step().unwrap(), None); // HLT waits for the timer event.
+    assert!(start.elapsed() >= Duration::from_millis(280));
+    assert!(machine.context().now_tsc() >= deadline);
     assert_eq!(machine.context().rip, ISR_VA);
     assert_eq!(machine.context().lapic().timer_fire_count(), 1);
     assert!(matches!(
         machine.step().unwrap(),
         Some(SoftMachineExit::IoOut { port: 0x81, .. })
     ));
-    assert_eq!(machine.context().now_tsc(), 6_100);
 }
 
 #[test]

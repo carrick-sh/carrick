@@ -10,7 +10,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::apic::{ApicCluster, ApicNode, BlockTscClock, TscClock};
+use crate::apic::{ApicCluster, ApicNode, MonotonicTscClock, TscClock};
 use crate::context::{SoftCpuContext, SoftSegment, X86Exception, X86ExceptionVector, reg};
 use crate::cpu::{SoftCpu, SoftCpuExit, SoftCpuNewError};
 use crate::cpuid::CpuidAuthority;
@@ -62,6 +62,7 @@ pub struct SoftMachine<M: SoftMmuMemory> {
     cpu: SoftCpu,
     mem: M,
     hlt_wait_timeout: Option<Duration>,
+    wait_for_armed_timer: bool,
 }
 
 impl<M: SoftMmuMemory> SoftMachine<M> {
@@ -72,6 +73,7 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
             cpu,
             mem,
             hlt_wait_timeout: None,
+            wait_for_armed_timer: false,
         })
     }
 
@@ -82,6 +84,7 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
             cpu,
             mem,
             hlt_wait_timeout: None,
+            wait_for_armed_timer: false,
         }
     }
 
@@ -127,12 +130,17 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
     /// Attach an injectable [`TscClock`] for `RDTSC` and APIC timer deadlines.
     pub fn set_clock(&mut self, clock: Arc<dyn TscClock>) {
         self.cpu.set_clock(clock);
+        self.wait_for_armed_timer = false;
     }
 
-    /// Start a fresh virtual TSC source that charges a fixed number of ticks per guest block.
-    /// An interruptible HLT can advance this clock to the next deliverable local timer event.
+    /// Start a host-monotonic TSC with a floor of `ticks_per_block` per executed block.
+    /// An interruptible HLT uses the host deadline of any timer that can wake this vCPU.
     pub fn set_block_tsc_clock(&mut self, ticks_per_block: NonZeroU64) {
-        self.set_clock(Arc::new(BlockTscClock::new(ticks_per_block)));
+        self.set_clock(Arc::new(MonotonicTscClock::with_block_floor(
+            0,
+            ticks_per_block.get(),
+        )));
+        self.wait_for_armed_timer = true;
     }
 
     /// Attach this machine's local APIC to `cluster` for cross-vCPU `ICR` IPI routing.
@@ -158,7 +166,8 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
 
     /// Configure the maximum bounded wait duration when `HLT` executes with no immediately
     /// deliverable local APIC interrupt. When `None` (the default), `HLT` exits immediately
-    /// unless an APIC interrupt or expired timer is already pending.
+    /// unless an APIC interrupt or expired timer is already pending. A machine configured
+    /// with [`Self::set_block_tsc_clock`] still waits for a timer that can wake it.
     pub fn set_hlt_wait_timeout(&mut self, timeout: Option<Duration>) {
         self.hlt_wait_timeout = timeout;
     }
@@ -184,6 +193,15 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
     /// Returns `Ok(None)` when guest execution continues inside the machine, or `Ok(Some(exit))`
     /// on a host-visible exit (`HLT`, PIO, triple fault).
     pub fn step(&mut self) -> Result<Option<SoftMachineExit>, EmitError> {
+        self.step_with_kick(&|| false)
+    }
+
+    /// Like [`Self::step`], but returns from an HLT wait on a host kick.
+    /// The caller publishes the kick predicate before notifying the APIC node.
+    pub fn step_with_kick(
+        &mut self,
+        host_kicked: &dyn Fn() -> bool,
+    ) -> Result<Option<SoftMachineExit>, EmitError> {
         let _ = self.cpu.poll_apic_timer();
 
         if (self.cpu.context().rflags & RFLAGS_IF) != 0
@@ -207,6 +225,8 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
                 &mut self.mem,
                 SoftCpuExit::Hlt { rip, next_rip },
                 self.hlt_wait_timeout,
+                self.wait_for_armed_timer,
+                host_kicked,
             ));
         }
 
@@ -219,6 +239,8 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
             &mut self.mem,
             exit,
             self.hlt_wait_timeout,
+            self.wait_for_armed_timer,
+            host_kicked,
         ))
     }
 
@@ -236,27 +258,28 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
     }
 }
 
-fn advance_halted_timer(ctx: &SoftCpuContext) -> bool {
-    if (ctx.rflags & RFLAGS_IF) == 0 || !ctx.lapic().timer_outranks_ppr() {
-        return false;
-    }
-    let msrs = ctx.msrs();
-    if let (Some(clock), Some(deadline)) = (msrs.clock(), ctx.next_timer_deadline_tsc()) {
-        return clock.advance_halted_to(msrs.clock_deadline(deadline));
-    }
-    false
-}
-
-fn wait_for_apic_event(cpu: &SoftCpu, max_wait: Duration) {
-    let deadline = cpu
-        .context()
-        .next_timer_deadline_tsc()
-        .map(|deadline| cpu.context().msrs().clock_deadline(deadline));
-    let tsc_hz = cpu.context().tsc_hz();
-    let node = cpu.apic_node();
-    let ready = || {
-        (cpu.context().rflags & RFLAGS_IF) != 0 && cpu.context().has_deliverable_apic_interrupt()
+fn wait_for_apic_event(
+    cpu: &SoftCpu,
+    max_wait: Option<Duration>,
+    wait_for_armed_timer: bool,
+    host_kicked: &dyn Fn() -> bool,
+) {
+    let ctx = cpu.context();
+    let interruptible = (ctx.rflags & RFLAGS_IF) != 0;
+    let deadline = if interruptible && ctx.lapic().timer_outranks_ppr() {
+        ctx.next_timer_deadline_tsc()
+            .map(|deadline| ctx.msrs().clock_deadline(deadline))
+    } else {
+        None
     };
+    let Some(max_wait) =
+        max_wait.or_else(|| (wait_for_armed_timer && deadline.is_some()).then_some(Duration::MAX))
+    else {
+        return;
+    };
+    let tsc_hz = ctx.tsc_hz();
+    let node = cpu.apic_node();
+    let ready = || host_kicked() || (interruptible && ctx.has_deliverable_apic_interrupt());
     if let Some(clock) = cpu.context().msrs().clock() {
         let _ = clock.wait_until(deadline, tsc_hz, &node, max_wait, &ready);
     } else {
@@ -281,6 +304,8 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
     mem: &mut M,
     exit: SoftCpuExit,
     hlt_wait_timeout: Option<Duration>,
+    wait_for_armed_timer: bool,
+    host_kicked: &dyn Fn() -> bool,
 ) -> Option<SoftMachineExit> {
     match exit {
         SoftCpuExit::Continue { .. } => None,
@@ -289,12 +314,8 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
             if (cpu.context().rflags & RFLAGS_IF) == 0
                 || !cpu.context().has_deliverable_apic_interrupt()
             {
-                if advance_halted_timer(cpu.context()) {
-                    let _ = cpu.poll_apic_timer();
-                } else if let Some(max_wait) = hlt_wait_timeout {
-                    wait_for_apic_event(cpu, max_wait);
-                    let _ = cpu.poll_apic_timer();
-                }
+                wait_for_apic_event(cpu, hlt_wait_timeout, wait_for_armed_timer, host_kicked);
+                let _ = cpu.poll_apic_timer();
             }
             if (cpu.context().rflags & RFLAGS_IF) != 0
                 && cpu.context().has_deliverable_apic_interrupt()

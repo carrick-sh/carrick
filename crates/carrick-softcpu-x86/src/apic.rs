@@ -8,7 +8,6 @@
 //! wakeups into the soft CPU execution loop.
 
 use std::fmt;
-use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -162,12 +161,6 @@ pub trait TscClock: Send + Sync + fmt::Debug {
     /// Account for a guest block that ran, including a block that ended in a guest fault.
     fn account_block(&self) {}
 
-    /// Advance an execution clock to a deliverable timer deadline while the vCPU is halted.
-    /// Returns false for clocks that advance independently of execution.
-    fn advance_halted_to(&self, _deadline_tsc: u64) -> bool {
-        false
-    }
-
     /// Waits until `ready` reports a deliverable interrupt, the deadline, or `max_wait`.
     ///
     /// Notifications enroll under the node lock; stale kicks and masked IRR do not bypass parking.
@@ -185,72 +178,40 @@ pub trait TscClock: Send + Sync + fmt::Debug {
     fn register_node(&self, _node: Weak<ApicNode>) {}
 }
 
-/// Single-vCPU virtual time driven by guest block execution and halted timer events.
-///
-/// Use a separate clock per vCPU. Its tick count is independent of host scheduling,
-/// translation latency, and time spent handling exits.
-#[derive(Debug)]
-pub(crate) struct BlockTscClock {
-    ticks: AtomicU64,
-    ticks_per_block: NonZeroU64,
-}
-
-impl BlockTscClock {
-    #[must_use]
-    pub(crate) const fn new(ticks_per_block: NonZeroU64) -> Self {
-        Self {
-            ticks: AtomicU64::new(0),
-            ticks_per_block,
-        }
-    }
-}
-
-impl TscClock for BlockTscClock {
-    fn now_tsc(&self, _tsc_hz: u64) -> u64 {
-        self.ticks.load(Ordering::Relaxed)
-    }
-
-    fn account_block(&self) {
-        self.ticks
-            .fetch_add(self.ticks_per_block.get(), Ordering::Relaxed);
-    }
-
-    fn advance_halted_to(&self, deadline_tsc: u64) -> bool {
-        self.ticks.fetch_max(deadline_tsc, Ordering::Relaxed);
-        true
-    }
-
-    fn wait_until(
-        &self,
-        deadline_tsc: Option<u64>,
-        tsc_hz: u64,
-        kick: &ApicNode,
-        max_wait: Duration,
-        ready: &dyn Fn() -> bool,
-    ) -> bool {
-        // SoftMachine advances halted virtual time for a timer that can wake
-        // the CPU. Without one, only an externally injected event can wake it.
-        kick.wait_for_event(max_wait, || {
-            ready() || deadline_tsc.is_some_and(|deadline| self.now_tsc(tsc_hz) >= deadline)
-        })
-    }
-}
-
-/// Host monotonic wall-clock TSC source backed by [`Instant`].
+/// Host monotonic TSC source backed by [`Instant`] with an optional block progress floor.
 #[derive(Debug)]
 pub struct MonotonicTscClock {
-    base_tsc: AtomicU64,
+    base_tsc: u64,
     anchor: Instant,
+    block_ticks: AtomicU64,
+    ticks_per_block: u64,
 }
 
 impl MonotonicTscClock {
     /// Creates a monotonic TSC clock anchored at `Instant::now()` with `base_tsc`.
     #[must_use]
     pub fn new(base_tsc: u64) -> Self {
+        Self::with_block_floor(base_tsc, 0)
+    }
+
+    pub(crate) fn with_block_floor(base_tsc: u64, ticks_per_block: u64) -> Self {
         Self {
-            base_tsc: AtomicU64::new(base_tsc),
+            base_tsc,
             anchor: Instant::now(),
+            block_ticks: AtomicU64::new(0),
+            ticks_per_block,
         }
+    }
+
+    fn host_tsc(&self, tsc_hz: u64) -> u64 {
+        let ticks = self
+            .anchor
+            .elapsed()
+            .as_nanos()
+            .saturating_mul(u128::from(tsc_hz))
+            / 1_000_000_000;
+        self.base_tsc
+            .saturating_add(u64::try_from(ticks).unwrap_or(u64::MAX))
     }
 }
 
@@ -262,12 +223,15 @@ impl Default for MonotonicTscClock {
 
 impl TscClock for MonotonicTscClock {
     fn now_tsc(&self, tsc_hz: u64) -> u64 {
-        let elapsed_ns = self.anchor.elapsed().as_nanos();
-        let delta = elapsed_ns
-            .saturating_mul(u128::from(tsc_hz))
-            .checked_div(1_000_000_000)
-            .map_or(u64::MAX, |ticks| u64::try_from(ticks).unwrap_or(u64::MAX));
-        self.base_tsc.load(Ordering::Acquire).saturating_add(delta)
+        self.host_tsc(tsc_hz)
+            .max(self.block_ticks.load(Ordering::Relaxed))
+    }
+
+    fn account_block(&self) {
+        if self.ticks_per_block != 0 {
+            self.block_ticks
+                .fetch_add(self.ticks_per_block, Ordering::Relaxed);
+        }
     }
 
     fn wait_until(
@@ -281,14 +245,15 @@ impl TscClock for MonotonicTscClock {
         if ready() {
             return true;
         }
-        let now = self.now_tsc(tsc_hz);
+        let host_tsc = self.host_tsc(tsc_hz);
         if let Some(deadline) = deadline_tsc
-            && now >= deadline
+            && host_tsc.max(self.block_ticks.load(Ordering::Relaxed)) >= deadline
         {
             return true;
         }
         let wait_duration = if let Some(deadline) = deadline_tsc {
-            let remaining_ticks = deadline.saturating_sub(now);
+            // The block floor cannot advance while this vCPU is parked.
+            let remaining_ticks = deadline.saturating_sub(host_tsc);
             let hz = tsc_hz.max(1);
             let nanos = u128::from(remaining_ticks)
                 .saturating_mul(1_000_000_000)
@@ -302,8 +267,9 @@ impl TscClock for MonotonicTscClock {
         if wait_duration.is_zero() {
             return ready() || deadline_tsc.is_some_and(|d| self.now_tsc(tsc_hz) >= d);
         }
-        kick.wait_for_event(wait_duration, ready);
-        ready() || deadline_tsc.is_some_and(|d| self.now_tsc(tsc_hz) >= d)
+        kick.wait_for_event(wait_duration, || {
+            ready() || deadline_tsc.is_some_and(|d| self.now_tsc(tsc_hz) >= d)
+        })
     }
 }
 

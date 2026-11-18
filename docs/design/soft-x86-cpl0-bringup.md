@@ -487,15 +487,20 @@ block counter:
 | 143383 | Deadline latches `0xe0` in CPL0 | `0xffffffff80157280` | `0x46` | `0xc1b94a18` / `0xc1b91e04` |
 | 143492 | Delivers `0xe0` to parent | `0x4010f9` | `0x246` | `RAX = 0x26de` |
 
-The soft runner now charges 200 TSC ticks per executed block at the
-published 2 GHz rate, including blocks that end in a guest fault or a
-carrier exit. This is 100 ns of virtual time per block. A 2 ms guest slice
-corresponds to 20,000 blocks. Host delays and repeated steps on a parked
-CPU charge zero ticks. An interruptible HLT can jump to a timer event
-that outranks the current APIC priority and can wake that CPU. RDTSC and
-absolute LAPIC deadlines share this virtual clock, including the guest's
-TSC offset. Interrupt delivery follows IF, interrupt shadow and APIC
-priority. The timebase is local to the single-vCPU soft carrier.
+The block-only clock eliminated the observed timer-return stall, but its
+HLT deadline jump also let a 200 ms ring nanosleep return in 79 ms of
+host time between guest markers on the release carrier.
+
+The soft runner uses the maximum of host monotonic time at its published
+2 GHz rate and 200 ticks per executed block. A block ending in a guest
+fault or carrier exit counts toward the floor. RDTSC and absolute LAPIC
+deadlines share that timebase, including the guest's TSC offset. An
+interruptible HLT with an eligible timer enrolls on the APIC node until
+the corresponding host deadline or an earlier notification. The host
+wait translates the deadline using the monotonic anchor because the
+block floor stays fixed while parked. Interrupt delivery follows IF,
+interrupt shadow and APIC priority. The timebase is local to the
+single-vCPU soft carrier.
 
 The same in-tree `TWO_LIVE` fixture exits 0 on KVM, where hardware executes
 the resume path directly. Intel VMX describes a
@@ -505,10 +510,12 @@ guest's HLT exit, with no intervening `KVM_RUN`, observed `0x2b5658e`
 and `0x7bb8bf6` about 20 ms apart.
 [Intel SDM, Vol. 3](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
 
-The active soft fixture assembles the KVM witness's source, verifies both
-non-last raw exits and their clear-child-tid joins, and exits 0 with the
-existing 4,000,000-block ceiling. The before/after GDB trace observed
-24 kick deliveries and zero timer expirations in the passing run. The
-VM-free APIC witness covers virtual TSC accounting at a PIO exit and
-delivery of an armed timer to an interruptible HLT. The existing contract
-is `x86.softcpu.apic-timer`.
+The active soft fixture assembles the KVM witness's source and verifies both
+non-last raw exits and their clear-child-tid joins under the existing
+4,000,000-block ceiling. The VM-free APIC witness checks the TSC floor at a
+PIO exit, a host kick before the deadline, and delivery after the host
+deadline. The production nanosleep witness measures from a child write
+before its ring syscall to another write after it returns. It uses a
+190 ms lower bound and a 10 s upper bound to allow host scheduling and
+translation overhead. Both production witnesses are bound to
+`x86.softcpu.apic-timer`.

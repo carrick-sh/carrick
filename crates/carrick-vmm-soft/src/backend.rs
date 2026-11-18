@@ -10,12 +10,12 @@
 //! an armed kick.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use carrick_guest_arch::{CpuId, RootGpa};
 use carrick_hal::{TrapError, VcpuExit};
-use carrick_softcpu_x86::{MsrIndex, SoftMachineExit};
+use carrick_softcpu_x86::{ApicNode, MsrIndex, SoftMachineExit};
 use carrick_x86::cpl0_entry::ShootdownTable;
 use carrick_x86::{GuestCpuidView, SegmentDescriptor, SegmentDpl, X86Reg, X86Seg, X86Vcpu};
 use carrick_x86_cpl0_host::carrier_cpu::{CarrierCpuBackend, FixtureWatchdog};
@@ -28,13 +28,24 @@ use crate::carrier::{SoftRunner, SoftStop};
 use crate::cpu::{SoftBootVcpu, SoftCpuView};
 
 /// A host kick for one soft CPU: raised from any thread, observed by the
-/// CPU between blocks. Clones share the flag.
+/// CPU between blocks and while it is enrolled in an HLT wait.
 #[derive(Clone, Default)]
-pub struct SoftKick(Arc<AtomicBool>);
+pub struct SoftKick(Arc<SoftKickState>);
+
+#[derive(Default)]
+struct SoftKickState {
+    pending: AtomicBool,
+    node: Mutex<Weak<ApicNode>>,
+}
 
 impl carrick_hal::VcpuKick for SoftKick {
     fn kick(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.pending.store(true, Ordering::Release);
+        if let Ok(node) = self.0.node.lock()
+            && let Some(node) = node.upgrade()
+        {
+            node.kick();
+        }
     }
 }
 
@@ -128,7 +139,7 @@ impl ProductionMemberCpu for SoftCpuBackend {
         self.runner.refresh_memory()?;
         self.runner.admit_current_root()?;
         let kick = self.kick.clone();
-        let exit = self.runner.run(kick.as_ref().map(|kick| &*kick.0));
+        let exit = self.runner.run(kick.as_ref().map(|kick| &kick.0.pending));
         match exit {
             Some(SoftMachineExit::IoOut {
                 port, size, value, ..
@@ -266,11 +277,21 @@ impl CarrierCpuBackend for SoftCpuBackend {
     }
 
     fn arm_run_kick(&mut self, kick: &Self::KickHandle) -> Result<(), TrapError> {
+        *kick
+            .0
+            .node
+            .lock()
+            .map_err(|_| fail("soft kick node lock"))? =
+            Arc::downgrade(&self.runner.machine().apic_node());
         self.kick = Some(kick.clone());
         Ok(())
     }
 
-    fn disarm_run_kick(_kick: &Self::KickHandle) {}
+    fn disarm_run_kick(kick: &Self::KickHandle) {
+        if let Ok(mut node) = kick.0.node.lock() {
+            *node = Weak::new();
+        }
+    }
 
     fn physical_slot(&self) -> Option<CpuId> {
         Some(self.run.slot)
