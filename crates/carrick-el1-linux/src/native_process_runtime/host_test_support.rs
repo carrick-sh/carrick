@@ -2491,7 +2491,10 @@ fn terminal_close_with_retained_service_entry_for<
     let resumed = crate::dispatch::native_service_completion(settled, phase)
         .unwrap_or_else(|fatal| panic!("terminal service entry became {fatal:?}"));
     assert!(matches!(resumed, NativeResume::Left(None)));
-    assert!(member.take_handoff_receipt().is_some());
+    assert!(
+        member.take_handoff_receipt().is_none(),
+        "production service settlement consumes the retirement receipt"
+    );
     drop(member);
 
     assert!(fixture.zone.live(sibling.record).is_none());
