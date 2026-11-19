@@ -392,6 +392,7 @@ pub(super) struct OwnedCopyout<'a> {
 pub(super) enum CopyoutData {
     Bytes { address: UserVa, bytes: Vec<u8> },
     Poll(Vec<carrick_syscall_abi::PollReventsOutput>),
+    Spans(Vec<(UserVa, Vec<u8>)>),
 }
 
 impl CopyoutData {
@@ -399,6 +400,7 @@ impl CopyoutData {
         match self {
             Self::Bytes { bytes, .. } => bytes.len(),
             Self::Poll(fields) => fields.len() * 2,
+            Self::Spans(spans) => spans.iter().map(|(_, bytes)| bytes.len()).sum(),
         }
     }
 
@@ -410,6 +412,25 @@ impl CopyoutData {
                     .checked_add(offset as u64)
                     .ok_or(NativeProcessError::Fault)?;
                 (UserVa::new(address), &bytes[offset..])
+            }
+            Self::Spans(spans) => {
+                let mut within = offset;
+                let (address, bytes) = spans
+                    .iter()
+                    .find(|(_, bytes)| {
+                        if within < bytes.len() {
+                            true
+                        } else {
+                            within -= bytes.len();
+                            false
+                        }
+                    })
+                    .ok_or(NativeProcessError::Fault)?;
+                let address = address
+                    .raw()
+                    .checked_add(within as u64)
+                    .ok_or(NativeProcessError::Fault)?;
+                (UserVa::new(address), &bytes[within..])
             }
             Self::Poll(fields) => {
                 let (address, bytes) = fields[offset / 2]
@@ -1073,7 +1094,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let previous_prepared_offset = prepared_offset.take();
             let (address, bytes) = output.data.unit(output.offset)?;
             let count = bytes.len();
-            if matches!(output.data, CopyoutData::Poll(_))
+            if matches!(output.data, CopyoutData::Poll(_) | CopyoutData::Spans(_))
                 && !carrick_guest_arch::lower_half_range(address.raw(), count as u64)
             {
                 return Err(NativeProcessError::Fault);
