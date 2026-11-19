@@ -4,12 +4,12 @@
 //! repeat under a block budget. No translation cache in this slice: see
 //! docs/design/soft-aarch64-translator.md, "Cache".
 use crate::exception::{Exception, take_exception};
-use crate::handler::{self, Event, ExclusiveMonitor, GuestMemory, Outcome};
+use crate::handler::{self, Event, ExclusiveMonitor, GuestMemory, MemoryFault, Outcome};
 use crate::mmu::{self, AccessClass, Stage1Error};
 use crate::state::{CpuState, ProgramCounter, VirtualAddress};
 use crate::translate::{
-    BlockExit, BlockFrame, BlockLimits, GuestInstruction, TranslateError, TranslatedBlock,
-    emit_block, split_block,
+    BlockExit, BlockFrame, BlockLimits, ExitReason, GuestInstruction, InstructionClass,
+    TranslateError, TranslatedBlock, emit_block, split_block,
 };
 use carrick_mmu_core::stage1::LeafAccess;
 use core::fmt;
@@ -43,10 +43,29 @@ pub enum Stop<E> {
     BadExit(usize),
 }
 
+/// Guest-engine work performed during one bounded run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RunWork {
+    pub retired_instructions: u64,
+    /// Host launch attempts.
+    pub dispatches: u64,
+    /// Host launches that returned a valid exit index.
+    pub executed_blocks: u64,
+    /// Calls to split and decode a block.
+    pub decoded_blocks: u64,
+    /// Calls to emit a decoded block.
+    pub emitted_blocks: u64,
+    pub stage1_walks: u64,
+    /// Exits into a scalar, pair, atomic or cache-zero memory handler.
+    pub memory_exits: u64,
+}
+
 /// The result of a bounded run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Report<E> {
+    /// Budget steps, including instruction aborts taken before a launch.
     pub blocks: u64,
+    pub work: RunWork,
     pub pc: ProgramCounter,
     pub stop: Stop<E>,
 }
@@ -130,6 +149,26 @@ fn fetch(
     Ok(u32::from_le_bytes(bytes))
 }
 
+struct MeasuredMemory<'a, M> {
+    inner: &'a mut M,
+    walks: u64,
+}
+
+impl<M: GuestMemory> GuestMemory for MeasuredMemory<'_, M> {
+    fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault> {
+        self.inner.read(address, bytes)
+    }
+
+    fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault> {
+        self.inner.write(address, bytes)
+    }
+
+    fn record_stage1_walk(&mut self) {
+        self.walks += 1;
+        self.inner.record_stage1_walk();
+    }
+}
+
 /// Run at most `budget` blocks from `cpu.pc`.
 pub fn run<X: ExecuteBlock>(
     cpu: &mut CpuState,
@@ -140,6 +179,11 @@ pub fn run<X: ExecuteBlock>(
     budget: u64,
 ) -> Report<X::Error> {
     let mut blocks = 0;
+    let mut work = RunWork::default();
+    let memory = &mut MeasuredMemory {
+        inner: memory,
+        walks: 0,
+    };
     let stop = loop {
         if blocks >= budget {
             break Stop::Budget;
@@ -168,6 +212,7 @@ pub fn run<X: ExecuteBlock>(
             },
             Err(_) => break Stop::Fetch(VirtualAddress(cpu.pc.0)),
         }
+        work.decoded_blocks += 1;
         let guest = {
             let cpu = &*cpu;
             split_block(cpu.pc, limits, |pc| fetch(cpu, memory, pc).ok())
@@ -175,37 +220,63 @@ pub fn run<X: ExecuteBlock>(
         if guest.instructions().is_empty() {
             break Stop::Fetch(VirtualAddress(cpu.pc.0));
         }
+        work.emitted_blocks += 1;
         let block = match emit_block(&guest) {
             Ok(b) => b,
             Err(e) => break Stop::Translate(e),
         };
         let mut frame = BlockFrame::from_cpu(cpu);
+        work.dispatches += 1;
         let index = match executor.execute(&block, &mut frame) {
             Ok(i) => i,
             Err(e) => break Stop::Execute(e),
         };
         frame.store_to(cpu);
         blocks += 1;
-        match block.exits().get(index) {
-            None => break Stop::BadExit(index),
-            Some(BlockExit::Continue(pc)) => cpu.pc = *pc,
-            Some(BlockExit::Handler(i)) => {
+        let Some(exit) = block.exits().get(index) else {
+            break Stop::BadExit(index);
+        };
+        work.executed_blocks += 1;
+        let instructions = guest.instructions().len() as u64;
+        match exit {
+            BlockExit::Continue(pc) => {
+                work.retired_instructions += instructions;
+                cpu.pc = *pc;
+            }
+            BlockExit::Handler(i) => {
+                // The generated block retires the prefix before the handler.
+                work.retired_instructions += instructions - 1;
+                if i.class() == InstructionClass::Exit(ExitReason::Memory)
+                    || matches!(i.instruction(), crate::Instruction::DataCacheZero(_))
+                {
+                    work.memory_exits += 1;
+                }
                 cpu.pc = i.pc();
                 match handler::execute(cpu, monitor, memory, i) {
-                    Outcome::Continue => {}
-                    Outcome::Event(e) if absorbed(e) => {}
+                    Outcome::Continue => work.retired_instructions += 1,
+                    Outcome::Fault => {}
                     Outcome::Event(event) => {
-                        break Stop::Event {
-                            instruction: *i,
+                        if matches!(
                             event,
-                        };
+                            Event::ProviderExit(_) | Event::Tlbi(_) | Event::Ic(_) | Event::Hint(_)
+                        ) {
+                            work.retired_instructions += 1;
+                        }
+                        if !absorbed(event) {
+                            break Stop::Event {
+                                instruction: *i,
+                                event,
+                            };
+                        }
                     }
                 }
             }
         }
     };
+    work.stage1_walks = memory.walks;
     Report {
         blocks,
+        work,
         pc: cpu.pc,
         stop,
     }
@@ -219,7 +290,6 @@ mod tests {
     //! product path (the product launch runs the emitted host words).
     extern crate std;
     use super::*;
-    use crate::handler::MemoryFault;
     use crate::state::{ExceptionLevel, StackSelect};
     use crate::translate::{Terminator, frame};
     use crate::{
@@ -372,6 +442,59 @@ mod tests {
             BlockLimits::default(),
             budget,
         )
+    }
+
+    #[test]
+    fn run_work_distinguishes_retired_instructions_from_memory_exits() {
+        let mut m = Flat::default();
+        // movz x1, #0; ldr x2, [x1]; hvc #2
+        m.code(ENTRY, &[0xd280_0001, 0xf940_0022, 0xd400_0042]);
+        let r = go(&mut el1(), &mut m, &mut GuestSemantics, 10);
+        assert!(matches!(
+            r.stop,
+            Stop::Event {
+                event: Event::MemoryFault(_),
+                ..
+            }
+        ));
+        assert_eq!(r.blocks, 1);
+        assert_eq!(
+            r.work,
+            RunWork {
+                retired_instructions: 1,
+                dispatches: 1,
+                executed_blocks: 1,
+                decoded_blocks: 1,
+                emitted_blocks: 1,
+                stage1_walks: 0,
+                memory_exits: 1,
+            }
+        );
+
+        m.code(0, &[42, 0]);
+        let r = go(&mut el1(), &mut m, &mut GuestSemantics, 10);
+        assert!(matches!(
+            r.stop,
+            Stop::Event {
+                event: Event::ProviderExit(_),
+                ..
+            }
+        ));
+        assert_eq!(r.work.retired_instructions, 3);
+        assert_eq!(r.work.memory_exits, 1);
+
+        // A fault delivered to the guest vector never retired.
+        m.code(ENTRY, &[0xd280_0001, 0]);
+        m.code(VBAR + 0x200, &[0xd400_0042]);
+        let r = go(&mut el1(), &mut m, &mut GuestSemantics, 10);
+        assert!(matches!(
+            r.stop,
+            Stop::Event {
+                event: Event::ProviderExit(_),
+                ..
+            }
+        ));
+        assert_eq!(r.work.retired_instructions, 2);
     }
 
     #[test]

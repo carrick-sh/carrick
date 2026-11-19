@@ -31,12 +31,36 @@ fn inject_small_jit_failure(capacity: usize, publish: bool) -> bool {
         })
 }
 
+/// Publication work performed by a JIT buffer over its lifetime.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PublicationWork {
+    /// Blocks successfully made executable.
+    pub publications: u64,
+    /// Host protection changes attempted (RW and RX).
+    pub mprotect_calls: u64,
+    /// AArch64 instruction-cache synchronization sequences. The number of
+    /// individual cache-line operations depends on the host's coherence bits.
+    pub icache_syncs: u64,
+}
+
+impl PublicationWork {
+    /// Work between two snapshots of the same buffer.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            publications: self.publications - earlier.publications,
+            mprotect_calls: self.mprotect_calls - earlier.mprotect_calls,
+            icache_syncs: self.icache_syncs - earlier.icache_syncs,
+        }
+    }
+}
+
 /// Host executable scratch buffer for translated blocks (never maps guest VAs).
 pub struct JitCodeBuffer {
     ptr: NonNull<u8>,
     capacity: usize,
     cursor: usize,
     executable: bool,
+    work: PublicationWork,
 }
 
 // SAFETY: `JitCodeBuffer` owns a private `mmap` allocation not shared across threads without sync.
@@ -65,7 +89,12 @@ impl JitCodeBuffer {
             capacity: cap,
             cursor: 0,
             executable: false,
+            work: PublicationWork::default(),
         })
+    }
+
+    pub fn publication_work(&self) -> PublicationWork {
+        self.work
     }
 
     /// Publish under W^X, returning an RX address only after mprotect succeeds.
@@ -83,6 +112,7 @@ impl JitCodeBuffer {
             return None;
         }
         if self.executable {
+            self.work.mprotect_calls += 1;
             // SAFETY: the exclusive owner holds the entire live mmap allocation.
             if unsafe {
                 libc::mprotect(
@@ -103,7 +133,11 @@ impl JitCodeBuffer {
         let dst = unsafe { self.ptr.as_ptr().add(self.cursor) };
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
         publish_instructions(dst, bytes.len()).ok()?;
+        if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+            self.work.icache_syncs += 1;
+        }
         self.cursor += (bytes.len() + 15) & !15;
+        self.work.mprotect_calls += 1;
         // SAFETY: publication is complete and no mutable pointer escapes this owner.
         if unsafe {
             libc::mprotect(
@@ -116,6 +150,7 @@ impl JitCodeBuffer {
             return None;
         }
         self.executable = true;
+        self.work.publications += 1;
         Some(dst as u64)
     }
 }
@@ -178,6 +213,14 @@ mod tests {
         assert_eq!(read(second, 2), [4, 5]);
         assert_eq!(jit.publish(&[]), None);
         assert_eq!(jit.publish(&[0; 4097]), None);
+        assert_eq!(
+            jit.publication_work(),
+            PublicationWork {
+                publications: 2,
+                mprotect_calls: 3,
+                icache_syncs: if cfg!(target_arch = "aarch64") { 2 } else { 0 },
+            }
+        );
         // A full-capacity image wraps the cursor to the start of the mapping.
         let whole = jit.publish(&[7; 4096]).unwrap();
         assert_eq!(jit.publish(&[9; 4096]).unwrap(), whole);

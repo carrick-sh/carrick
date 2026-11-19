@@ -153,6 +153,7 @@ pub(crate) fn address_translate(
         uao: false,
         class: Aarch64AccessClass::Ordinary,
     };
+    memory.record_stage1_walk();
     let words = PhysicalWords(RefCell::new(memory));
     Some(
         match Aarch64Walker.walk(&words, &context, GuestVa::new(va), access) {
@@ -201,6 +202,7 @@ pub(crate) fn walk(
             AccessClass::Unprivileged => Aarch64AccessClass::Unprivileged,
         },
     };
+    memory.record_stage1_walk();
     let words = PhysicalWords(RefCell::new(memory));
     match Aarch64Walker.walk(&words, &context, GuestVa::new(va), access) {
         Ok(leaf) => Ok(leaf),
