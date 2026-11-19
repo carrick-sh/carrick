@@ -955,22 +955,21 @@ pub fn rec_el1_frame_grant_claim(
 
 #[inline]
 fn encode_frame_grant_decision(decision: FrameGrantDecision, prot: u64, len: u64) -> i32 {
-    use FrameGrantDecision::*;
     let (code, detail) = match decision {
-        PlanFound => (0, None),
-        NoPlan => (1, None),
-        FirstTouchDenied => (2, None),
-        PrepareRefused => (3, None),
-        Ready => (4, None),
-        PrepareError => (5, None),
-        PublishUnsupported => (6, None),
-        PublishRefused(reason) => (7, Some(reason)),
-        DescriptorRefused(reason) => (8, Some(reason)),
-        DescriptorRolledBack(reason) => (9, Some(reason)),
-        MailboxSlotNotWorking => (10, None),
-        MailboxStaleRequest => (11, None),
-        MailboxInvalidReady => (12, None),
-        FatalPublication => (13, None),
+        FrameGrantDecision::PlanFound => (0, None),
+        FrameGrantDecision::NoPlan => (1, None),
+        FrameGrantDecision::FirstTouchDenied => (2, None),
+        FrameGrantDecision::PrepareRefused => (3, None),
+        FrameGrantDecision::Ready => (4, None),
+        FrameGrantDecision::PrepareError => (5, None),
+        FrameGrantDecision::PublishUnsupported => (6, None),
+        FrameGrantDecision::PublishRefused(reason) => (7, Some(reason)),
+        FrameGrantDecision::DescriptorRefused(reason) => (8, Some(reason)),
+        FrameGrantDecision::DescriptorRolledBack(reason) => (9, Some(reason)),
+        FrameGrantDecision::MailboxSlotNotWorking => (10, None),
+        FrameGrantDecision::MailboxStaleRequest => (11, None),
+        FrameGrantDecision::MailboxInvalidReady => (12, None),
+        FrameGrantDecision::FatalPublication => (13, None),
     };
     let extent = match detail {
         Some(reason) => ((reason as u32) << 16) | (len >> 12).min(0xffff) as u32,
