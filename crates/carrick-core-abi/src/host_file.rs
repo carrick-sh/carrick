@@ -114,6 +114,9 @@ pub enum HostFileOp {
     /// output segments' written extents ([`NetCall::encode_written`]). The
     /// header `fd` is the descriptor argument (`-1` for `socket`).
     NetSyscall = 28,
+    /// A ring epoll's carrier-socket interest. The header names the epoll
+    /// descriptor, op, member number, events and cookie. Waits stay in ring.
+    EpollSocketCtl = 29,
     /// Flush a file's data and metadata for fsync or fdatasync.
     Fsync = 30,
     /// Flush the filesystem containing the descriptor.
@@ -640,6 +643,7 @@ impl HostFileOp {
             26 => Self::Fchmodat,
             27 => Self::Fchownat,
             28 => Self::NetSyscall,
+            29 => Self::EpollSocketCtl,
             30 => Self::Fsync,
             31 => Self::Syncfs,
             32 => Self::SyncFileRange,

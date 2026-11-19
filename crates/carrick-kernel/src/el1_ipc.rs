@@ -5,6 +5,7 @@ pub use table::{HostSlotReservation, HostTable};
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_el1_abi::ipc::{
@@ -559,7 +560,85 @@ pub struct HostIpc {
     carrier_zone: std::sync::OnceLock<crate::el1_zone::CarrierZone>,
     /// The deadlines of native members' poll waits (#231).
     poll_deadlines: crate::host_readiness::PollDeadlines,
+    native_epolls: Mutex<Option<Arc<crate::dispatch::net::native_epoll::NativeSocketEpolls>>>,
 }
+struct SocketEpollLockWait<'a>(&'a crate::el1_zone::CarrierZone);
+
+impl SocketEpollLockWait<'_> {
+    fn complete(
+        &self,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >,
+    ) {
+        let zone = self.0.zone();
+        let (waker, effects) = owned.deliver_handbacks(&mut |record| {
+            if let Some(handback) = zone.place_host_handback(record)
+                && let carrick_sched_core::NativePlacement::Placed(placement) = handback.placement
+            {
+                self.0.resched(placement.slot);
+            }
+        });
+        carrick_el1::sched::object_wait::deliver_effects_with(
+            zone,
+            None,
+            waker,
+            effects,
+            false,
+            |slot, _| self.0.resched(slot),
+            (|slot| self.0.resched(slot), || {}),
+        );
+    }
+}
+
+impl carrick_sched_core::LockWait<carrick_sched_core::ParkedContextWords>
+    for SocketEpollLockWait<'_>
+{
+    fn wait(&self, attempt: u32) -> bool {
+        carrick_el1_abi::LockWait::wait(&HostLockWait, attempt)
+    }
+
+    fn complete_object_wake(
+        &self,
+        _: &carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >,
+    ) {
+        self.complete(owned);
+    }
+}
+
+impl carrick_sched_core::object_wait::ipc_release::IpcLockRelease for HostIpc {
+    fn carrier(&self) -> std::num::NonZeroU64 {
+        self.region().operation_slot_generation()
+    }
+
+    fn released(&self, index: carrick_sched_core::object_wait::ipc_release::IpcLockIndex) {
+        let identity = self.carrier();
+        if let Some(zone) = crate::el1_zone::zone() {
+            if let Ok(source) = zone.ipc_lock_release_source(index, identity) {
+                source
+                    .reserve()
+                    .publish(carrick_sched_core::Waker::Host, &|owned| {
+                        crate::el1_zone::complete_object_wake(zone, owned);
+                    });
+            }
+        } else if let Some(carrier) = self.carrier_zone.get()
+            && let Ok(source) = carrier.zone().ipc_lock_release_source(index, identity)
+        {
+            let wait = SocketEpollLockWait(carrier);
+            source
+                .reserve()
+                .publish(carrick_sched_core::Waker::Host, &|owned| {
+                    wait.complete(owned)
+                });
+        }
+    }
+}
+
 impl std::fmt::Debug for HostIpc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostIpc")
@@ -635,6 +714,7 @@ impl HostIpc {
             ceiling,
             carrier_zone: std::sync::OnceLock::new(),
             poll_deadlines: crate::host_readiness::PollDeadlines::default(),
+            native_epolls: Mutex::new(None),
         };
         let identity = NEXT_REGION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -1313,6 +1393,86 @@ impl HostIpc {
         }
     }
 
+    pub(crate) fn bind_socket_epoll_lock(&self, object: IpcObjectHandle) -> Result<(), IpcError> {
+        use carrick_sched_core::object_wait::ipc_release::IpcLockIndex;
+        let index = IpcLockIndex::object(object.index() as usize).ok_or(IpcError::Corrupt)?;
+        let identity = self.region().operation_slot_generation();
+        let result = if let Some(zone) = crate::el1_zone::zone() {
+            zone.bind_ipc_lock_release(index, identity, &HostLockWait, &|owned| {
+                crate::el1_zone::complete_object_wake(zone, owned);
+            })
+        } else if let Some(carrier) = self.carrier_zone.get() {
+            let wait = SocketEpollLockWait(carrier);
+            carrier
+                .zone()
+                .bind_ipc_lock_release(index, identity, &wait, &|owned| wait.complete(owned))
+        } else {
+            Ok(())
+        };
+        result.map_err(|_| IpcError::Corrupt)
+    }
+
+    pub(crate) fn socket_epoll_region(&self) -> Result<IpcRegion<'_>, IpcError> {
+        self.region().with_lock_release(self)
+    }
+
+    pub(crate) fn native_socket_epolls(
+        self: &Arc<Self>,
+        reactor: &Arc<crate::host_readiness::HostReadinessReactor>,
+    ) -> Result<Arc<crate::dispatch::net::native_epoll::NativeSocketEpolls>, carrick_abi::LinuxErrno>
+    {
+        let mut epolls = self.native_epolls.lock();
+        if let Some(held) = epolls.as_ref() {
+            return Ok(held.clone());
+        }
+        let producer = crate::dispatch::net::native_epoll::NativeSocketEpolls::new(self, reactor)?;
+        *epolls = Some(producer.clone());
+        Ok(producer)
+    }
+
+    pub(crate) fn existing_native_socket_epolls(
+        &self,
+    ) -> Option<Arc<crate::dispatch::net::native_epoll::NativeSocketEpolls>> {
+        self.native_epolls.lock().clone()
+    }
+
+    pub(crate) fn deliver_socket_epoll_wakes(&self, wakes: impl IntoIterator<Item = IpcWake>) {
+        for wake in wakes {
+            let mut delivery = self.object_wake_delivery();
+            delivery.collect(wake);
+            delivery.deliver();
+            self.service_wake(&wake);
+        }
+    }
+
+    pub(crate) fn host_resource(&self, token: HostResourceToken) -> Option<HostResource> {
+        self.resources.lock().live.get(&token.get()).cloned()
+    }
+
+    pub(crate) fn with_pinned_ofd<R>(
+        &self,
+        table: fd::TableId,
+        number: fd::Fd,
+        serve: impl FnOnce(fd::OfdKey, fd::Description) -> R,
+    ) -> Result<R, PinnedHostResourceError> {
+        let region = self.region();
+        let authority = region.fd(HostLockWait);
+        let (pin, description) = authority.pin(table, number).map_err(|error| match error {
+            fd::Error::BadFd => PinnedHostResourceError::BadFd,
+            _ => PinnedHostResourceError::Unavailable,
+        })?;
+        let result = serve(pin.key(), description);
+        match authority.unpin(pin) {
+            Ok(Some(last)) => {
+                self.release(last.backing)
+                    .map_err(|_| PinnedHostResourceError::Unavailable)?;
+            }
+            Ok(None) => {}
+            Err(_) => return Err(PinnedHostResourceError::Unavailable),
+        }
+        Ok(result)
+    }
+
     /// Pin the exact open description `fd` names in ring table `table` and
     /// hand its host resource to `serve`. The pin lasts for the whole service,
     /// so a concurrent close cannot retire the resource underneath it; a
@@ -1448,6 +1608,13 @@ impl HostIpc {
     /// Final-description release, after leaving the descriptor table lock.
     /// Delivers guest and host wakes after leaving object locks.
     pub fn release(&self, backing: fd::BackingToken) -> Result<IpcReleased, IpcError> {
+        if let Some(carrick_el1_abi::ipc::IpcBacking::Epoll { object }) =
+            carrick_el1_abi::ipc::IpcBacking::decode(backing)
+            && self.region().epoll_needs_host_release(object)
+            && let Some(epolls) = self.existing_native_socket_epolls()
+        {
+            epolls.forget_epoll(object);
+        }
         let released = self.region().release_backing(backing, &HostLockWait)?;
         if let IpcReleased::Object { wake, freed: false } = released {
             let region = self.region();

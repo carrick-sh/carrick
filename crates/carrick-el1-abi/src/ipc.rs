@@ -514,9 +514,8 @@ pub struct IpcObjectRecord {
     /// Host readiness subscribers (poll/epoll/blocked host waits). Zero
     /// means no host notification is owed for any change.
     host_subscribers: AtomicU32,
-    /// Set by a change made while host subscribers existed; the host clears
-    /// it when it delivers the notification.
-    host_wake_owed: AtomicU32,
+    /// Owed host wake and final carrier retirement flags.
+    host_flags: AtomicU32,
     next_free: AtomicU64,
     storage_offset: AtomicU64,
     storage_ring_bytes: AtomicU64,
@@ -532,6 +531,23 @@ pub struct IpcObjectRecord {
 // SAFETY: `state` is accessed only through an `IpcObjectGuard`, which holds
 // the record's lock; every other field is atomic.
 unsafe impl Sync for IpcObjectRecord {}
+
+const HOST_WAKE_OWED: u32 = 1;
+const EPOLL_NEEDS_HOST_RELEASE: u32 = 2;
+
+impl IpcObjectRecord {
+    fn owes_host_wake(&self) -> bool {
+        self.host_flags.load(Ordering::Acquire) & HOST_WAKE_OWED != 0
+    }
+
+    fn take_host_wake(&self) -> bool {
+        self.host_flags.fetch_and(!HOST_WAKE_OWED, Ordering::AcqRel) & HOST_WAKE_OWED != 0
+    }
+
+    fn owe_host_wake(&self) {
+        self.host_flags.fetch_or(HOST_WAKE_OWED, Ordering::Release);
+    }
+}
 
 /// Region header: authenticated by every attach.
 #[repr(C, align(64))]
@@ -1167,7 +1183,8 @@ pub enum IpcLockHolder {
     El1 { slot: u32 },
 }
 const LOCK_FREE: u32 = 0;
-const LOCK_HOST: u32 = u32::MAX;
+const LOCK_RELEASE_TRACKED: u32 = 1 << 31;
+const LOCK_HOST: u32 = LOCK_RELEASE_TRACKED - 1;
 impl IpcLockHolder {
     const fn word(self) -> u32 {
         match self {
@@ -1176,7 +1193,7 @@ impl IpcLockHolder {
         }
     }
     const fn from_word(word: u32) -> Option<Self> {
-        match word {
+        match word & !LOCK_RELEASE_TRACKED {
             LOCK_FREE => None,
             LOCK_HOST => Some(Self::Host),
             n => Some(Self::El1 { slot: n - 1 }),
@@ -1350,6 +1367,14 @@ impl<'a> IpcRegion<'a> {
         Ok(Self {
             lock_release: Some(release),
             ..self
+        })
+    }
+
+    /// Whether this lock incarnation's holder publishes after unlock.
+    pub fn has_tracked_lock_holder(&self, object: IpcObjectHandle) -> bool {
+        self.record(object.index()).is_some_and(|record| {
+            record.generation.load(Ordering::Relaxed) == u64::from(object.generation())
+                && record.lock.load(Ordering::Acquire) & LOCK_RELEASE_TRACKED != 0
         })
     }
 
@@ -1838,7 +1863,7 @@ impl<'a> IpcRegion<'a> {
                 .wake_leaf(index / 64)
                 .is_some_and(|w| w.load(Ordering::Acquire) & (1 << (index % 64)) != 0);
             if record.host_subscribers.load(Ordering::Acquire) == 0
-                && record.host_wake_owed.load(Ordering::Acquire) == 0
+                && !record.owes_host_wake()
                 && !indexed
             {
                 continue;
@@ -1880,7 +1905,7 @@ impl<'a> IpcRegion<'a> {
             record.read_seq.load(Ordering::Acquire),
             record.write_seq.load(Ordering::Acquire),
             record.host_subscribers.load(Ordering::Acquire),
-            record.host_wake_owed.load(Ordering::Acquire),
+            record.owes_host_wake(),
         )?;
         let mut locked = false;
         for _ in 0..64 {
@@ -1966,14 +1991,15 @@ impl<'a> IpcRegion<'a> {
     ) -> Result<IpcObjectGuard<'a>, IpcError> {
         let record = self.record(object.index).ok_or(IpcError::Stale)?;
         let mut attempt: u32 = 0;
+        let held = self.holder.word()
+            | if self.lock_release.is_some() {
+                LOCK_RELEASE_TRACKED
+            } else {
+                0
+            };
         while record
             .lock
-            .compare_exchange_weak(
-                LOCK_FREE,
-                self.holder.word(),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
+            .compare_exchange_weak(LOCK_FREE, held, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             attempt = attempt.saturating_add(1);
@@ -2274,7 +2300,7 @@ impl<'a> IpcRegion<'a> {
             return Err(IpcError::Corrupt);
         }
         if subs.fetch_sub(1, Ordering::AcqRel) == 1 {
-            guard.record.host_wake_owed.store(0, Ordering::Release);
+            guard.record.take_host_wake();
         }
         Ok(())
     }
@@ -2348,8 +2374,7 @@ impl<'a> IpcRegion<'a> {
     /// Host: take (and clear) the owed-wake flag of `object`.
     pub fn take_host_wake(&self, object: IpcObjectHandle) -> bool {
         self.record(object.index).is_some_and(|r| {
-            r.generation.load(Ordering::Acquire) == object.generation as u64
-                && r.host_wake_owed.swap(0, Ordering::AcqRel) != 0
+            r.generation.load(Ordering::Acquire) == object.generation as u64 && r.take_host_wake()
         })
     }
 }
@@ -3141,7 +3166,7 @@ impl<'a> IpcObjectGuard<'a> {
         let changed = wake.readers || wake.writers;
         let mut host_owed = changed && r.host_subscribers.load(Ordering::Relaxed) != 0;
         if host_owed {
-            r.host_wake_owed.store(1, Ordering::Release);
+            r.owe_host_wake();
             self.index_host_wake();
         }
         // Zone epoll items watching this member: queued on their epolls
@@ -3175,7 +3200,7 @@ impl<'a> IpcObjectGuard<'a> {
     /// Host, under this lock: consume the owed host wake, for delivery to a
     /// target the caller already holds alive.
     pub fn take_host_wake(&mut self) -> bool {
-        self.record.host_wake_owed.swap(0, Ordering::AcqRel) != 0
+        self.record.take_host_wake()
     }
 
     /// Host, under this lock, with no live delivery target for this
@@ -3183,7 +3208,7 @@ impl<'a> IpcObjectGuard<'a> {
     /// back in the index (a boundary drained it) for the boundary after a
     /// target exists, and count the refusal. False: nothing was owed.
     pub fn retain_undeliverable_host_wake(&mut self) -> bool {
-        if self.record.host_wake_owed.load(Ordering::Acquire) == 0 {
+        if !self.record.owes_host_wake() {
             return false;
         }
         self.index_host_wake();
@@ -3196,7 +3221,7 @@ impl<'a> IpcObjectGuard<'a> {
 
     fn publish_kind(self, kind: u32) -> IpcObjectHandle {
         self.record.host_subscribers.store(0, Ordering::Relaxed);
-        self.record.host_wake_owed.store(0, Ordering::Relaxed);
+        self.record.host_flags.store(0, Ordering::Relaxed);
         self.record.kind.store(kind, Ordering::Release);
         self.handle
     }

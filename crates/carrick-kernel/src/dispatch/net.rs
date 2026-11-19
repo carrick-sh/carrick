@@ -332,6 +332,7 @@ use epoll_ops::epoll_kqueue_for_wake_test;
 pub(in crate::dispatch) use epoll_ops::{IoRearm, WriteRearm};
 pub(super) mod lifecycle;
 pub(super) mod native;
+pub(crate) mod native_epoll;
 pub(super) use lifecycle::{host_stream_socket_is_connected, host_stream_socket_rdhup};
 pub(super) mod netlink;
 pub(crate) mod packet;

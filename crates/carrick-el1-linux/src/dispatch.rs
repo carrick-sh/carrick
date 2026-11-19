@@ -1157,6 +1157,64 @@ pub fn stage_native_host_file<V: file::MemoryValidator>(
     carrick_personality_linux::native_host_file::stage(call, namespace, &mut user)
 }
 
+/// Marshal only the socket half of a native epoll control request. The
+/// descriptor family selects this path after classifying both operands.
+pub fn stage_native_socket_epoll<V: file::MemoryValidator>(
+    task: &CurrentTask,
+    validator: &V,
+    table: [u64; 3],
+    args: [u64; 6],
+    abi: carrick_abi::LinuxGuestAbi,
+) -> carrick_personality_linux::native_host_file::HostFileStage {
+    use carrick_core_abi::host_file::{HOST_FILE_HEADER_BYTES, HostFileHeader, HostFileOp};
+    use carrick_personality_linux::native_host_file::HostFileStage;
+    let event_bytes = match abi {
+        carrick_abi::LinuxGuestAbi::Aarch64 => carrick_syscall_abi::LINUX_AARCH64_EPOLL_EVENT_BYTES,
+        carrick_abi::LinuxGuestAbi::X86_64 => carrick_syscall_abi::LINUX_X8664_EPOLL_EVENT_BYTES,
+    } as usize;
+    let [epoll, op, target, address, ..] = args;
+    let op = op as u32 as u64;
+    let mut event = [0u8; 16];
+    if op != carrick_abi::LINUX_EPOLL_CTL_DEL {
+        let mut copy = file::ValidatedCopy { task, validator };
+        if !copy.copy_in(&mut event[..event_bytes], address) {
+            let prefix = validator
+                .readable_bytes(address, event_bytes)
+                .min(event_bytes);
+            return HostFileStage::Fault {
+                address: address.saturating_add(prefix as u64),
+                access: carrick_guest_arch::Access::Read,
+            };
+        }
+    }
+    let header = HostFileHeader {
+        op: HostFileOp::EpollSocketCtl,
+        table,
+        fd: epoll as i32,
+        flags: u32::from_ne_bytes(event[..4].try_into().unwrap_or_default()),
+        args: [
+            op,
+            target as u32 as u64,
+            u64::from_ne_bytes(
+                event[event_bytes - 8..event_bytes]
+                    .try_into()
+                    .unwrap_or_default(),
+            ),
+            0,
+        ],
+    };
+    let mut record = alloc::vec![0; HOST_FILE_HEADER_BYTES].into_boxed_slice();
+    carrick_core_abi::host_file::encode(&mut record, header, &[], 0)
+        .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    HostFileStage::Request {
+        record,
+        output: None,
+        resolves_path: false,
+        map: None,
+        chdir: false,
+    }
+}
+
 /// The owner fault a host-file stage needs supplied before it can retry.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn native_host_file_fault(
@@ -1189,6 +1247,28 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
     use carrick_personality_linux::native_host_file::{HostFileCall, NativeNamespace};
     if (frame.esr >> 26) & 0x3f != 0x15 {
         return None;
+    }
+    if frame.x[8] == carrick_personality_linux::crossing::nr::EPOLL_CTL.raw()
+        && origin == carrick_core_abi::service::ServiceOrigin::Descendant
+        && matches!(
+            descriptor(frame.x[0] as i32),
+            Some(NativeDescriptor::InZone(
+                carrick_personality_linux::native_host_file::InZoneKind::Epoll,
+            ))
+        )
+        && matches!(
+            descriptor(frame.x[2] as i32),
+            Some(NativeDescriptor::HostBacked { .. })
+        )
+    {
+        let args = core::array::from_fn(|index| frame.x[index]);
+        return Some(stage_native_socket_epoll(
+            task,
+            validator,
+            table,
+            args,
+            carrick_abi::LinuxGuestAbi::Aarch64,
+        ));
     }
     // AArch64 native numbers are the canonical Linux numbers.
     let call = HostFileCall::decode(
@@ -4822,7 +4902,9 @@ impl<
                 Ok(reservation) => reservation,
                 Err(error) => {
                     let release = authority
-                        .unpin_filtered(pin, ipc::is_zone_releasable_backing)
+                        .unpin_filtered(pin, |description| {
+                            ipc::can_release_backing_in_ring(&venue.region, description)
+                        })
                         .map_err(map_fd_error)?;
                     ipc::settle_native_release(&venue.region, release, zone, task)
                         .map_err(map_ipc_error)?;
@@ -4846,7 +4928,7 @@ impl<
                     claim,
                     &pin,
                     request.cloexec,
-                    ipc::is_zone_releasable_backing,
+                    |description| ipc::can_release_backing_in_ring(&venue.region, description),
                 ) {
                     Ok(release) => Ok(release),
                     Err(refused) => {
@@ -4870,7 +4952,9 @@ impl<
                 .map_err(|refused| map_fd_error(refused.error()))?;
         }
         let pin_release = authority
-            .unpin_filtered(pin, ipc::is_zone_releasable_backing)
+            .unpin_filtered(pin, |description| {
+                ipc::can_release_backing_in_ring(&venue.region, description)
+            })
             .map_err(map_fd_error)?;
         ipc::settle_native_release(&venue.region, pin_release, zone, task)
             .map_err(map_ipc_error)?;
@@ -5244,7 +5328,9 @@ impl<
             }
             FamilyCompletion::Forward
         })();
-        match authority.unpin_filtered(pin, ipc::is_zone_releasable_backing) {
+        match authority.unpin_filtered(pin, |description| {
+            ipc::can_release_backing_in_ring(&venue.region, description)
+        }) {
             Ok(release) => {
                 if let Err(e) = ipc::settle_native_release(&venue.region, release, zone, task) {
                     return map_ipc_error(e);
@@ -5818,6 +5904,9 @@ impl<
                     IpcBacking,
                     epoll::{EpollCtlError, EpollMember},
                 };
+                let native_service = self.process.as_deref().is_some_and(|process| {
+                    !process.is_root_process() && process.owns_descriptor_namespace()
+                });
                 let authority = venue.region.fd(NativeFdWait);
                 let (epin, edesc) = match authority.pin(table, old) {
                     Ok(pair) => pair,
@@ -5855,6 +5944,14 @@ impl<
                         Err(error) => return map_fd_error(error),
                     };
                     let result = (|| {
+                        if native_service
+                            && matches!(
+                                IpcBacking::decode(description.backing),
+                                Some(IpcBacking::Host(_))
+                            )
+                        {
+                            return FamilyCompletion::NativeHostFile;
+                        }
                         let Some((member, kind)) = IpcBacking::decode(description.backing)
                             .and_then(EpollMember::of_backing)
                         else {
@@ -5936,7 +6033,9 @@ impl<
                             Err(EpollCtlError::Ipc(error)) => map_ipc_error(error),
                         }
                     })();
-                    match authority.unpin_filtered(pin, ipc::is_zone_releasable_backing) {
+                    match authority.unpin_filtered(pin, |description| {
+                        ipc::can_release_backing_in_ring(&venue.region, description)
+                    }) {
                         Ok(release) => {
                             if let Err(error) =
                                 ipc::settle_native_release(&venue.region, release, zone, task)
@@ -5948,7 +6047,9 @@ impl<
                     }
                     result
                 })();
-                match authority.unpin_filtered(epin, ipc::is_zone_releasable_backing) {
+                match authority.unpin_filtered(epin, |description| {
+                    ipc::can_release_backing_in_ring(&venue.region, description)
+                }) {
                     Ok(release) => {
                         if let Err(error) =
                             ipc::settle_native_release(&venue.region, release, zone, task)
@@ -6035,14 +6136,16 @@ impl<
                 };
                 #[cfg(test)]
                 close_retire_hold::run(&venue.region, table, old);
-                let retired = match venue.region.fd(NativeFdWait).close_filtered(
-                    table,
-                    old,
-                    ipc::is_zone_releasable_backing,
-                ) {
-                    Ok(retired) => retired,
-                    Err(err) => return map_fd_error(err),
-                };
+                let retired =
+                    match venue
+                        .region
+                        .fd(NativeFdWait)
+                        .close_filtered(table, old, |description| {
+                            ipc::can_release_backing_in_ring(&venue.region, description)
+                        }) {
+                        Ok(retired) => retired,
+                        Err(err) => return map_fd_error(err),
+                    };
                 if let Err(err) =
                     ipc::settle_native_release(&venue.region, retired.release, zone, task)
                 {

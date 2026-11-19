@@ -18006,6 +18006,10 @@ fn with_arm_process_host_files_on<R>(
     impl CurrentMmMemory for HostPointerMemory {}
 
     let context = dispatcher.capture_one_task_context().unwrap();
+    let wait_service = carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::new(
+        carrick_kernel::kernel::Scheduler::new(Arc::clone(context.kernel())),
+    ));
+    wait_service.serve_host_readiness();
     let owner: &'static _ = Box::leak(Box::new(context.kernel().ipc().unwrap()));
     let files = context.resources().files();
 
@@ -18337,7 +18341,7 @@ fn with_arm_process_host_files_on<R>(
                 forward = true;
             }
         }
-        if !forward {
+        if !forward && route != CompletionRoute::NativeService {
             return (route, frame.x[0] as i64);
         }
         // A child has no host fallback: a forward is the native host-file
