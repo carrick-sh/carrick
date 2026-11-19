@@ -179,6 +179,8 @@ mod sparse_materialization;
 mod guest_alias;
 
 mod sysreg;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use carrick_aarch64::esr::{El0SysRegRead, decode_el0_sys64_read};
 use sysreg::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod carrier_custody;
@@ -549,13 +551,6 @@ pub const HVF_PAGE_SIZE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
 // Guest stage-1 uses a 4 KiB granule even though HVF maps stage-2 in 16 KiB
 // chunks. Syscall memory copies must reselect the backing at this boundary.
 const GUEST_STAGE1_PAGE_SIZE: u64 = 0x1000;
-// ESR exception-class decode (svc/hvc/maintenance/syscall classifiers, the
-// SVC/HVC class consts, and ExecLevel) live in the shared carrick_hal::aarch64
-// module — imported above. This SHIFT is kept local only for the counter-trap
-// TESTS that synthesize an ESR syndrome (cntfrq/cntvct/dczid), so it is test-only.
-#[cfg(test)]
-const AARCH64_EXCEPTION_CLASS_SHIFT: u64 = 26;
-
 #[derive(
     ::core::fmt::Debug,
     ::core::clone::Clone,
