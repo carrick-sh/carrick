@@ -974,6 +974,23 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         Ok(unsafe { &*ptr.cast::<T>() })
     }
 
+    /// Resolve a retained stage-2 byte range to its non-null host alias.
+    pub(crate) fn retained_bytes_ptr(
+        &self,
+        pa: FrameGpa,
+        len: usize,
+    ) -> Result<core::ptr::NonNull<u8>, MemoryError> {
+        let slot = self
+            .locate(pa, len)
+            .ok_or_else(|| error("retained range bounds"))?;
+        let ptr = slot
+            .backing
+            .extent
+            .ptr(pa.raw(), len)
+            .ok_or_else(|| error("retained range backing"))?;
+        core::ptr::NonNull::new(ptr).ok_or_else(|| error("retained range null pointer"))
+    }
+
     /// Recover the exact retained identity at a physical page for this MM.
     pub fn frame_identity(
         &self,

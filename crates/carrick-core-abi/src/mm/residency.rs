@@ -195,6 +195,15 @@ impl FrameGrantResidencyRetirement<'_> {
         self.active = false;
         committed
     }
+
+    /// Transfer the active preclaim to an owned host guard that retains the
+    /// same resolved residency view until [`FrameGrantResidencyTable::commit_preclaimed_retirement`]
+    /// or [`FrameGrantResidencyTable::cancel_preclaimed_retirement`] runs.
+    #[must_use]
+    pub fn into_preclaimed_range(mut self) -> (u64, u64, u64) {
+        self.active = false;
+        (self.mm_key, self.start, self.end)
+    }
 }
 impl Drop for FrameGrantResidencyRetirement<'_> {
     fn drop(&mut self) {
@@ -367,12 +376,16 @@ pub struct FrameGrantResidencyTable<S = ResidencyStorage> {
 
 impl FrameGrantResidencyTable {
     pub const fn new() -> Self {
-        Self {
+        // Evaluate the empty table at compile time so debug callers copy one
+        // value into their return slot instead of materializing separate
+        // `ResidencySegment` and `ResidencyStorage` temporaries on the stack.
+        const EMPTY: FrameGrantResidencyTable = FrameGrantResidencyTable {
             storage: ResidencyStorage {
                 bootstrap: ResidencySegment::new(),
                 directory: ResidencyDirectory::new(),
             },
-        }
+        };
+        EMPTY
     }
 
     /// Initialize in place without materializing a large stack temporary.
@@ -751,6 +764,22 @@ impl<P: PinnedMetadataExtent> ResolvedResidencyTable<P> {
             .as_table(),
         )
     }
+
+    /// Borrow a view covering every resolved extension prefix, falling back to
+    /// `fallback`'s bootstrap storage only if `refresh` has never run.
+    pub fn view_or_bootstrap<'a>(
+        &'a self,
+        fallback: &'a FrameGrantResidencyTable,
+    ) -> FrameGrantResidencyTable<ResidencyRows<'a>> {
+        self.view().unwrap_or_else(|| {
+            ResidencyRows {
+                bootstrap: &fallback.storage.bootstrap,
+                directory: &fallback.storage.directory,
+                extensions: ResidencyExtensions::Resolved(&[]),
+            }
+            .as_table()
+        })
+    }
 }
 
 /// Venue-local access to the bootstrap and extension storage.
@@ -963,11 +992,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
 
     /// Number of extension segments published in the directory.
     pub fn published_extensions(&self) -> usize {
-        self.storage
-            .rows()
-            .directory
-            .count
-            .load(Ordering::Acquire) as usize
+        self.storage.rows().directory.count.load(Ordering::Acquire) as usize
     }
 
     /// Diagnostic sample of occupied slots, including in-flight publishers.
@@ -1352,6 +1377,19 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
                 );
             }
         }
+    }
+
+    /// Commit a preclaim transferred via [`FrameGrantResidencyRetirement::into_preclaimed_range`]
+    /// on the same resolved view.
+    #[must_use]
+    pub fn commit_preclaimed_retirement(&self, mm_key: u64, start: u64, end: u64) -> bool {
+        self.commit_retirement(mm_key, start, end)
+    }
+
+    /// Cancel a preclaim transferred via [`FrameGrantResidencyRetirement::into_preclaimed_range`]
+    /// on the same resolved view.
+    pub fn cancel_preclaimed_retirement(&self, mm_key: u64, start: u64, end: u64) {
+        self.cancel_retirement(mm_key, start, end);
     }
 
     fn commit_retirement(&self, mm_key: u64, start: u64, end: u64) -> bool {

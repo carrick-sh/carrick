@@ -52,18 +52,42 @@ impl Serialize for HostAliasTransaction {
     }
 }
 
+enum HostAliasResidencyRetirement {
+    Resolved(carrick_hal::host_residency::HostResidencyRetirement),
+    #[cfg(test)]
+    Borrowed(carrick_el1_abi::FrameGrantResidencyRetirement<'static>),
+}
+
+impl HostAliasResidencyRetirement {
+    #[must_use]
+    fn commit(self) -> bool {
+        match self {
+            Self::Resolved(retirement) => retirement.commit(),
+            #[cfg(test)]
+            Self::Borrowed(retirement) => retirement.commit(),
+        }
+    }
+}
+
 impl HostAliasTransaction {
     pub fn claim<'permit>(
         self,
         permit: &'permit mm_mutation::HostAliasPermit<'_>,
     ) -> Option<HostAliasInstallGuard<'permit>> {
-        self.claim_with_residency(permit, carrick_el1_abi::frame_grant_residency_host())
+        self.claim_with_retirement(permit, |mm_key, start, len| {
+            let Some(view) = carrick_hal::host_residency::current_host_residency() else {
+                return Ok(None);
+            };
+            view.begin_retire_overlapping(mm_key, start, len)
+                .map(|retirement| Some(HostAliasResidencyRetirement::Resolved(retirement)))
+                .ok_or(())
+        })
     }
 
-    fn claim_with_residency<'permit>(
+    fn claim_with_retirement<'permit>(
         mut self,
         permit: &'permit mm_mutation::HostAliasPermit<'_>,
-        residency: Option<&'static carrick_el1_abi::FrameGrantResidencyTable>,
+        begin_retirement: impl FnOnce(u64, u64, u64) -> Result<Option<HostAliasResidencyRetirement>, ()>,
     ) -> Option<HostAliasInstallGuard<'permit>> {
         if !permit.authorizes(&self.authority.mutation_coordinator, self.authority.mm_id) {
             return None;
@@ -88,22 +112,17 @@ impl HostAliasTransaction {
         // guard rollback. Retiring after `map_host_alias` is too late: a
         // transfer admitted in that interval can leave the replaced grant
         // authoritative over the new leaves.
-        let residency_retirement = match (
-            residency,
-            commit.as_ref().and_then(|commit| commit.mmap.as_ref()),
-        ) {
-            (Some(residency), Some(mmap)) => {
-                let Some(retirement) = residency.begin_retire_overlapping(
-                    self.authority.mm_id.raw(),
-                    mmap.start,
-                    mmap.len,
-                ) else {
-                    drop(phase);
-                    return None;
-                };
-                Some(retirement)
+        let residency_retirement = match commit.as_ref().and_then(|commit| commit.mmap.as_ref()) {
+            Some(mmap) => {
+                match begin_retirement(self.authority.mm_id.raw(), mmap.start, mmap.len) {
+                    Ok(retirement) => retirement,
+                    Err(()) => {
+                        drop(phase);
+                        return None;
+                    }
+                }
             }
-            _ => None,
+            None => None,
         };
         let installing = commit.take();
         *phase = HostAliasPhase::Installing {
@@ -140,8 +159,13 @@ impl HostAliasTransaction {
     ) -> Option<T> {
         let coordinator = Arc::clone(&self.authority.mutation_coordinator);
         mm_mutation::test_support::with_permit(coordinator, |permit| {
-            self.claim_with_residency(permit, Some(residency))
-                .map(use_install)
+            self.claim_with_retirement(permit, |mm_key, start, len| {
+                residency
+                    .begin_retire_overlapping(mm_key, start, len)
+                    .map(|retirement| Some(HostAliasResidencyRetirement::Borrowed(retirement)))
+                    .ok_or(())
+            })
+            .map(use_install)
         })
     }
 }
@@ -177,7 +201,7 @@ pub struct HostAliasInstallGuard<'permit> {
     pub(crate) authority: Arc<DispatchMmAuthority>,
     pub(crate) transactions: Arc<HostAliasTransactions>,
     pub(crate) _structural: mm_mutation::HostAliasCoordinatorGuard<'permit>,
-    residency_retirement: Option<carrick_el1_abi::FrameGrantResidencyRetirement<'static>>,
+    residency_retirement: Option<HostAliasResidencyRetirement>,
     pub(crate) id: HostAliasTransactionId,
     pub(crate) armed: bool,
 }
