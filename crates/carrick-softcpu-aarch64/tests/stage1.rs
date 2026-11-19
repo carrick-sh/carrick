@@ -597,3 +597,23 @@ fn el1_at_populates_par_el1_with_stage1_attributes_and_faults() {
     ));
     assert_eq!((r.cpu.pc.0, r.cpu.named.par.0), (CODE, 0x1234));
 }
+
+#[test]
+fn el0_structure_crossing_a_second_page_fault_preserves_state() {
+    let address = HOLE - 8;
+    // LD2/ST2 {V0.16B,V1.16B}, [X0], #32.
+    for (word, esr) in [(0x4cdf_8000, 0x9200_0007), (0x4c9f_8000, 0x9200_0047)] {
+        let mut r = Rig::el0();
+        let initial_bytes = 0x1234_5678_8765_4321;
+        r.memory.put(UDATA_PA + PAGE - 8, initial_bytes);
+        r.set(0, address);
+        r.cpu.vectors[0] = u128::MAX;
+        r.cpu.vectors[1] = 0x1234;
+        let vectors = r.cpu.vectors;
+        assert_eq!(r.run(word), Outcome::Continue);
+        r.assert_abort(0x400, esr, HOLE);
+        assert_eq!(r.get(0), address);
+        assert_eq!(r.cpu.vectors, vectors);
+        assert_eq!(r.memory.get(UDATA_PA + PAGE - 8), initial_bytes);
+    }
+}

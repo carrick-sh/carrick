@@ -536,6 +536,7 @@ pub enum A64Class {
     Sev,
     Hint,
     SimdFpLoadStore,
+    Prefetch,
     SimdFpCompute,
     Crc32,
 }
@@ -712,6 +713,9 @@ pub fn classify(w: u32) -> A64Class {
         || matches!(w & 0xffe0fc00, 0x9b407c00 | 0x9bc07c00)
     {
         return Multiply;
+    }
+    if instruction::prefetch(w) {
+        return A64Class::Prefetch;
     }
     // Loads and Stores: literal, pair, unsigned offset, unscaled/pre/post,
     // register offset. Reject reserved opc/size combinations before grouping.
@@ -1576,7 +1580,7 @@ mod instruction {
 
     /// PRFM and PRFUM have implementation-defined effect. This CPU ignores
     /// prefetch hints without translating or touching the supplied address.
-    fn prefetch(w: u32) -> bool {
+    pub(super) fn prefetch(w: u32) -> bool {
         matches!(w & 0xff00_0000, 0xd800_0000) // literal
             || matches!(w & 0xffc0_0000, 0xf980_0000) // unsigned offset
             || matches!(w & 0xffe0_0c00, 0xf880_0000) // unscaled
