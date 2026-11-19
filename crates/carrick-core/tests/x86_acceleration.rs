@@ -2335,6 +2335,55 @@ fn private_file_4k_grants_scale_past_initial_residency<
             .unwrap()
             .unwrap();
         assert!(wire.take_receipt(window, &txn).is_some());
+        if receipt.outcome
+            == DescriptorOutcome::Refused(
+                carrick_mmu_core::descriptor_refusal::DescriptorRefusal::ResidencyCapacity,
+            )
+        {
+            let mut census = [0; 3];
+            residency.inspect_occupied(
+                |row, committed| {
+                    let index = (row.semantic_base.saturating_sub(VA) / 4096) as usize;
+                    // The fixture inventory assigns these exact identities.
+                    // Every earlier transaction had an Applied receipt. Check
+                    // the live descriptor as well as the fixture owner tuple.
+                    spaces.find(row.mm_key).is_some()
+                        && row.mm_key == mm.raw()
+                        && index < page_index
+                        && row.semantic_base == VA + index as u64 * 4096
+                        && row.physical_ipa == IPA + index as u64 * 4096
+                        && row.len == 4096
+                        && row.mapping_id == index as u64 + 1
+                        && row.frame_id == row.mapping_id
+                        && row.owner_generation == 1
+                        && row.inventory_revision == 1
+                        && committed
+                        && matches!(
+                            B::translate(
+                                &live,
+                                B::root(ROOT).unwrap(),
+                                carrick_guest_arch::UserVa::new(row.semantic_base),
+                                carrick_mmu_core::aarch64::LeafAccess::Read,
+                                true,
+                            ),
+                            Ok(Some(leaf)) if leaf.output.raw() == row.physical_ipa
+                        )
+                },
+                |class| {
+                    census[match class {
+                        Some(true) => 0,
+                        Some(false) => 1,
+                        None => 2,
+                    }] += 1;
+                },
+            );
+            assert_eq!(census, [FRAME_GRANT_RESIDENCY_SLOTS, 0, 0]);
+            let [live, leaked, unknown] = census;
+            panic!(
+                "grant {page_index} at {page_va:#x} refused: {:?}; live={live} leaked={leaked} unknown={unknown}",
+                receipt.outcome
+            );
+        }
         assert!(
             matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
             "grant {page_index} at {page_va:#x} (slots_used={}) refused: {:?}",

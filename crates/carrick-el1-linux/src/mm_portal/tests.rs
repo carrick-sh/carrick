@@ -1309,7 +1309,7 @@ fn untouched_transfer_window(prefix: bool) {
     assert_eq!(
         refused.outcome,
         DescriptorOutcome::Refused(
-            carrick_mmu_core::descriptor_refusal::DescriptorRefusal::JournalCapacity,
+            carrick_mmu_core::descriptor_refusal::DescriptorRefusal::WrongBacking,
         )
     );
     let (receipt, trace) = slot.take_receipt_with_trace(window, &txn).unwrap();
@@ -1318,15 +1318,7 @@ fn untouched_transfer_window(prefix: bool) {
         trace,
         Some(carrick_mmu_core::live_descriptor_words::GrantRefusalTrace {
             residency_published: false,
-            event: Some(
-                carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic::ResidencyRefused {
-                    mm_key: mm.raw(),
-                    va: span.va,
-                    len: span.len,
-                    slots_used: 1,
-                    slots_total: carrick_core_abi::mm::FRAME_GRANT_RESIDENCY_SLOTS,
-                }
-            ),
+            event: None,
         })
     );
     assert!(residency.retire(prior_slot, prior));
