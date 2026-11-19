@@ -126,6 +126,9 @@ pub enum HostFileOp {
     Fstatfs = 34,
     /// Allocate a region of the descriptor. The arguments are mode, offset and length.
     Fallocate = 35,
+    /// Positional write of staged bytes. `args[0]` is the signed offset,
+    /// and `args[1]` is the writer's ring-owned RLIMIT_FSIZE.
+    Pwrite = 36,
 }
 
 /// A staged user-memory range of a [`HostFileOp::NetSyscall`] record.
@@ -635,6 +638,7 @@ impl HostFileOp {
             33 => Self::Statfs,
             34 => Self::Fstatfs,
             35 => Self::Fallocate,
+            36 => Self::Pwrite,
             _ => return None,
         })
     }

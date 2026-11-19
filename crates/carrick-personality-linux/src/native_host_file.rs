@@ -132,6 +132,24 @@ pub enum HostFileCall {
         offset: u64,
         length: u64,
     },
+    Pwrite64 {
+        fd: i32,
+        buf: u64,
+        count: u64,
+        offset: i64,
+    },
+    Pwritev {
+        fd: i32,
+        iov: u64,
+        iovcnt: u64,
+        offset: i64,
+    },
+    Readv {
+        fd: i32,
+        iov: u64,
+        iovcnt: u64,
+        offset: Option<i64>,
+    },
     Readlinkat {
         dirfd: carrick_fd_core::Fd,
         path: carrick_guest_arch::UserVa,
@@ -419,6 +437,9 @@ impl HostFileCall {
             {
                 !delegated(fd)
             }
+            Self::Pwrite64 { fd, .. } | Self::Pwritev { fd, .. } | Self::Readv { fd, .. } => {
+                origin != ServiceOrigin::Initial || !delegated(fd)
+            }
             Self::Fsync { fd }
             | Self::Syncfs { fd }
             | Self::SyncFileRange { fd, .. }
@@ -479,6 +500,24 @@ impl HostFileCall {
         use crate::crossing::nr;
         let fd = args[0] as i32;
         Some(match canonical {
+            c if c == nr::PWRITE64 => Self::Pwrite64 {
+                fd,
+                buf: args[1],
+                count: args[2],
+                offset: args[3] as i64,
+            },
+            c if c == nr::PWRITEV => Self::Pwritev {
+                fd,
+                iov: args[1],
+                iovcnt: args[2],
+                offset: args[3] as i64,
+            },
+            c if c == nr::READV || c == nr::PREADV => Self::Readv {
+                fd,
+                iov: args[1],
+                iovcnt: args[2],
+                offset: (c == nr::PREADV).then_some(args[3] as i64),
+            },
             c if c == nr::FSYNC || c == nr::FDATASYNC => Self::Fsync { fd },
             c if c == nr::SYNCFS => Self::Syncfs { fd },
             c if c == nr::SYNC_FILE_RANGE => Self::SyncFileRange {
@@ -725,6 +764,8 @@ pub enum OutputLayout {
     /// A network call's written extents, copied back to each user range its
     /// record's segment table names; `len` is the reply capacity.
     Net,
+    /// Scatter the record's flat read into the staged Linux iovec regions.
+    Vector,
 }
 
 impl HostFileOutput {
@@ -753,7 +794,7 @@ impl HostFileOutput {
     /// whatever the caller's encoding.
     pub const fn reply_capacity(self) -> usize {
         match self.layout {
-            OutputLayout::Bytes | OutputLayout::Net => self.len,
+            OutputLayout::Bytes | OutputLayout::Net | OutputLayout::Vector => self.len,
             OutputLayout::X8664Stat => LINUX_STAT_BYTES,
         }
     }
@@ -766,7 +807,7 @@ impl HostFileOutput {
                 (reply.len() <= self.len).then_some(alloc::borrow::Cow::Borrowed(reply))
             }
             // Completed per staged range by `socket::complete`.
-            OutputLayout::Net => None,
+            OutputLayout::Net | OutputLayout::Vector => None,
             OutputLayout::X8664Stat => {
                 let stat =
                     <carrick_syscall_abi::LinuxStat as zerocopy::FromBytes>::read_from_bytes(reply)
@@ -1109,10 +1150,19 @@ impl Staging<'_, '_> {
     fn write(
         &mut self,
         fd: i32,
+        offset: Option<i64>,
         user: &mut dyn HostFileUser,
         gather: impl FnOnce(&mut dyn HostFileUser) -> Result<Vec<u8>, Gathered>,
     ) -> Option<HostFileStage> {
+        let (op, args) = match offset {
+            Some(offset) if offset < 0 => return Some(errno(carrick_syscall_abi::LINUX_EINVAL)),
+            Some(offset) => (HostFileOp::Pwrite, [offset as u64, 0, 0, 0]),
+            None => (HostFileOp::Write, [0; 4]),
+        };
         Some(match self.descriptor(fd)? {
+            NativeDescriptor::InZone(_) if offset.is_some() => {
+                errno(carrick_syscall_abi::LINUX_ESPIPE)
+            }
             NativeDescriptor::InZone(_) => HostFileStage::InRing,
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
             NativeDescriptor::HostBacked { access } if !access.writable() => {
@@ -1120,7 +1170,7 @@ impl Staging<'_, '_> {
             }
             NativeDescriptor::HostBacked { .. } => match gather(user) {
                 Ok(input) if input.is_empty() => HostFileStage::Returned(SyscallResult::new(0)),
-                Ok(input) => self.request(HostFileOp::Write, fd, 0, [0; 4], &input, None),
+                Ok(input) => self.request(op, fd, 0, args, &input, None),
                 Err(Gathered::Answer(stage)) => stage,
                 // Nothing copied: supply first, EFAULT if refused.
                 Err(Gathered::Fault { prefix, address }) if prefix.is_empty() => {
@@ -1131,7 +1181,7 @@ impl Staging<'_, '_> {
                 }
                 // Supply first; a refused supply writes the prefix.
                 Err(Gathered::Fault { prefix, address }) => {
-                    match self.request(HostFileOp::Write, fd, 0, [0; 4], &prefix, None) {
+                    match self.request(op, fd, 0, args, &prefix, None) {
                         HostFileStage::Request { record, .. } => HostFileStage::FaultAfterPrefix {
                             address,
                             access: Access::Read,
@@ -1142,6 +1192,97 @@ impl Staging<'_, '_> {
                     }
                 }
             },
+        })
+    }
+
+    fn read_vectors(
+        &mut self,
+        fd: i32,
+        iov: u64,
+        iovcnt: u64,
+        offset: Option<i64>,
+        user: &mut dyn HostFileUser,
+    ) -> Option<HostFileStage> {
+        if offset.is_some_and(|offset| offset < 0) {
+            return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+        }
+        Some(match self.descriptor(fd)? {
+            NativeDescriptor::InZone(_) if offset.is_some() => {
+                errno(carrick_syscall_abi::LINUX_ESPIPE)
+            }
+            NativeDescriptor::InZone(_) => HostFileStage::InRing,
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { access } if !access.readable() => {
+                errno(carrick_syscall_abi::LINUX_EBADF)
+            }
+            NativeDescriptor::HostBacked { .. } => {
+                let (vectors, total) = match stage_iovecs(user, iov, iovcnt) {
+                    Ok(staged) => staged,
+                    Err(Gathered::Answer(answer)) => return Some(answer),
+                    Err(Gathered::Fault { address, .. }) => {
+                        return Some(HostFileStage::Fault {
+                            address,
+                            access: Access::Read,
+                        });
+                    }
+                };
+                let capacity = chunk(total);
+                if capacity == 0 {
+                    return Some(HostFileStage::Returned(SyscallResult::new(0)));
+                }
+                let mut left = capacity;
+                let mut fault = None;
+                for iov in vectors.chunks_exact(IOVEC_BYTES) {
+                    let (address, len) = iovec_words(iov);
+                    let len = (len as usize).min(left);
+                    let writable = user.writable(address, len);
+                    if writable < len {
+                        fault = Some(address.saturating_add(writable as u64));
+                        left -= writable;
+                        break;
+                    }
+                    left -= len;
+                    if left == 0 {
+                        break;
+                    }
+                }
+                let available = capacity - left;
+                if let Some(address) = fault
+                    && available == 0
+                {
+                    return Some(HostFileStage::Fault {
+                        address,
+                        access: Access::Write,
+                    });
+                }
+                let (op, args) = match offset {
+                    Some(offset) => (HostFileOp::Pread, [offset as u64, 0, 0, 0]),
+                    None => (HostFileOp::Read, [0; 4]),
+                };
+                let request = self.request(
+                    op,
+                    fd,
+                    0,
+                    args,
+                    &vectors,
+                    Some(HostFileOutput {
+                        address: 0,
+                        len: available,
+                        layout: OutputLayout::Vector,
+                    }),
+                );
+                match (fault, request) {
+                    (Some(address), HostFileStage::Request { record, output, .. }) => {
+                        HostFileStage::FaultAfterPrefix {
+                            address,
+                            access: Access::Write,
+                            prefix: record,
+                            output,
+                        }
+                    }
+                    (_, request) => request,
+                }
+            }
         })
     }
 }
@@ -1190,10 +1331,18 @@ fn path_pair(first: &[u8], second: &[u8]) -> Vec<u8> {
     input
 }
 
-/// Gather `writev` vectors into one bounded chunk, in order. A fault in a
-/// later vector keeps every byte the earlier ones (and its own readable
-/// head) supplied, as Linux's `writev` returns the bytes before the fault.
-fn gather_vectors(user: &mut dyn HostFileUser, iov: u64, iovcnt: u64) -> Result<Vec<u8>, Gathered> {
+fn iovec_words(bytes: &[u8]) -> (u64, u64) {
+    (
+        u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8])),
+        u64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0; 8])),
+    )
+}
+
+fn stage_iovecs(
+    user: &mut dyn HostFileUser,
+    iov: u64,
+    iovcnt: u64,
+) -> Result<(Vec<u8>, u64), Gathered> {
     if iovcnt > LINUX_UIO_MAXIOV {
         return Err(Gathered::Answer(errno(carrick_syscall_abi::LINUX_EINVAL)));
     }
@@ -1207,18 +1356,24 @@ fn gather_vectors(user: &mut dyn HostFileUser, iov: u64, iovcnt: u64) -> Result<
     })?;
     // Linux rejects a negative total before any transfer.
     let mut total: u64 = 0;
-    let mut segments = Vec::with_capacity(iovcnt as usize);
     for vector in vectors.chunks_exact(IOVEC_BYTES) {
-        let base = u64::from_le_bytes(vector[0..8].try_into().unwrap_or([0; 8]));
-        let len = u64::from_le_bytes(vector[8..16].try_into().unwrap_or([0; 8]));
+        let (_, len) = iovec_words(vector);
         total = match total.checked_add(len) {
             Some(total) if total <= i64::MAX as u64 => total,
             _ => return Err(Gathered::Answer(errno(carrick_syscall_abi::LINUX_EINVAL))),
         };
-        segments.push((base, len));
     }
+    Ok((vectors, total))
+}
+
+/// Gather `writev` vectors into one bounded chunk, in order. A fault in a
+/// later vector keeps every byte the earlier ones (and its own readable
+/// head) supplied, as Linux's `writev` returns the bytes before the fault.
+fn gather_vectors(user: &mut dyn HostFileUser, iov: u64, iovcnt: u64) -> Result<Vec<u8>, Gathered> {
+    let (vectors, total) = stage_iovecs(user, iov, iovcnt)?;
     let mut input = Vec::with_capacity(chunk(total));
-    for (base, len) in segments {
+    for vector in vectors.chunks_exact(IOVEC_BYTES) {
+        let (base, len) = iovec_words(vector);
         let room = HOST_FILE_CHUNK_BYTES - input.len();
         if room == 0 {
             break;
@@ -1253,7 +1408,7 @@ pub fn stage(
         ..
     }
     | HostFileStage::InRingReply { output, .. } = &staged
-        && output.layout != OutputLayout::Net
+        && !matches!(output.layout, OutputLayout::Net | OutputLayout::Vector)
     {
         let writable = user.writable(output.address, output.len);
         if writable < output.len {
@@ -1332,6 +1487,41 @@ fn stage_call(
 ) -> Option<HostFileStage> {
     let mut staging = Staging { namespace };
     Some(match call {
+        HostFileCall::Pwrite64 {
+            fd,
+            buf,
+            count,
+            offset,
+        } => {
+            return staging.write(fd, Some(offset), user, |user| {
+                let mut input = Vec::with_capacity(chunk(count));
+                match gather_user(user, &mut input, buf, chunk(count)) {
+                    Ok(()) => Ok(input),
+                    Err(address) => Err(Gathered::Fault {
+                        prefix: input,
+                        address,
+                    }),
+                }
+            });
+        }
+        HostFileCall::Pwritev {
+            fd,
+            iov,
+            iovcnt,
+            offset,
+        } => {
+            return staging.write(fd, Some(offset), user, |user| {
+                gather_vectors(user, iov, iovcnt)
+            });
+        }
+        HostFileCall::Readv {
+            fd,
+            iov,
+            iovcnt,
+            offset,
+        } => {
+            return staging.read_vectors(fd, iov, iovcnt, offset, user);
+        }
         HostFileCall::Fsync { fd } => {
             return staging.file_operation(HostFileOp::Fsync, fd, [0; 4], None);
         }
@@ -1387,7 +1577,7 @@ fn stage_call(
             );
         }
         HostFileCall::Write { fd, buf, count } => {
-            return staging.write(fd, user, |user| {
+            return staging.write(fd, None, user, |user| {
                 let mut input = Vec::with_capacity(chunk(count));
                 match gather_user(user, &mut input, buf, chunk(count)) {
                     Ok(()) => Ok(input),
@@ -1399,7 +1589,7 @@ fn stage_call(
             });
         }
         HostFileCall::Writev { fd, iov, iovcnt } => {
-            return staging.write(fd, user, |user| gather_vectors(user, iov, iovcnt));
+            return staging.write(fd, None, user, |user| gather_vectors(user, iov, iovcnt));
         }
         HostFileCall::Fstat {
             fd,
@@ -2295,6 +2485,30 @@ pub fn complete(
             .and_then(|input| socket::complete(reply.result, input, reply.output, copy_out))
             .unwrap_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO));
     }
+    if output.is_some_and(|output| output.layout == OutputLayout::Vector) {
+        let eio = SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
+        let Some(vectors) = host_file::replied_input(record) else {
+            return eio;
+        };
+        let mut bytes = reply.output;
+        for vector in vectors.chunks_exact(IOVEC_BYTES) {
+            let (address, len) = iovec_words(vector);
+            let len = (len as usize).min(bytes.len());
+            if len > 0 && !copy_out(address, &bytes[..len]) {
+                let delivered = reply.output.len() - bytes.len();
+                return if delivered == 0 {
+                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT)
+                } else {
+                    SyscallResult::new(delivered as i64)
+                };
+            }
+            bytes = &bytes[len..];
+            if bytes.is_empty() {
+                return SyscallResult::new(reply.result);
+            }
+        }
+        return eio;
+    }
     if let Some(output) = output {
         let Some(bytes) = output.encode(reply.output) else {
             return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
@@ -2359,7 +2573,7 @@ pub fn stamp_write_file_size_limit<E>(
     let mut args = view.header().args;
     let index = match view.header().op {
         HostFileOp::Write => 0,
-        HostFileOp::Truncate | HostFileOp::Ftruncate => 1,
+        HostFileOp::Truncate | HostFileOp::Ftruncate | HostFileOp::Pwrite => 1,
         _ => return Ok(()),
     };
     args[index] = soft_limit()?;

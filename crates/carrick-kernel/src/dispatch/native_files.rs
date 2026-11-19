@@ -908,6 +908,7 @@ impl SyscallDispatcher {
                 // duplicated stream. Writes go to the run's stdio sink, as the
                 // host write path does for the same description (#1410).
                 HostFileOp::Write
+                | HostFileOp::Pwrite
                 | HostFileOp::Fsync
                 | HostFileOp::Syncfs
                 | HostFileOp::SyncFileRange
@@ -940,6 +941,7 @@ impl SyscallDispatcher {
     /// stdio descriptors run.
     fn serve_native_stdio(&self, header: HostFileHeader, fd: i32, input: &[u8]) -> Served {
         match header.op {
+            HostFileOp::Pwrite => Served::errno(carrick_abi::LINUX_ESPIPE),
             HostFileOp::Fsync => Served::errno(carrick_abi::LINUX_EINVAL),
             HostFileOp::Syncfs => Served::value(0),
             HostFileOp::Fallocate | HostFileOp::SyncFileRange => {
@@ -1073,16 +1075,28 @@ impl SyscallDispatcher {
                 Ok(None) => Served::errno(carrick_abi::LINUX_EBADF),
                 Err(_) => Served::Refused,
             },
-            // `args[0]`: the writer's own RLIMIT_FSIZE soft limit, as its
-            // ring stamped it (unstamped, it reads as a finite 0).
-            HostFileOp::Write => match self.fs_view().write_description_from_carrier(
-                header.args[0],
-                description,
-                input,
-            ) {
-                Ok(super::fs::CarrierWritten::Done(outcome)) => served_outcome(outcome, Vec::new()),
-                Ok(super::fs::CarrierWritten::NeedsTask) | Err(_) => Served::Refused,
-            },
+            HostFileOp::Write | HostFileOp::Pwrite => {
+                let (limit, offset) = if header.op == HostFileOp::Pwrite {
+                    let offset = header.args[0] as i64;
+                    if offset < 0 {
+                        return Served::errno(carrick_abi::LINUX_EINVAL);
+                    }
+                    (header.args[1], Some(offset))
+                } else {
+                    (header.args[0], None)
+                };
+                match self.fs_view().write_description_from_carrier(
+                    limit,
+                    description,
+                    input,
+                    offset,
+                ) {
+                    Ok(super::fs::CarrierWritten::Done(outcome)) => {
+                        served_outcome(outcome, Vec::new())
+                    }
+                    Ok(super::fs::CarrierWritten::NeedsTask) | Err(_) => Served::Refused,
+                }
+            }
             HostFileOp::MapPrivate => self.native_map_source(description),
             HostFileOp::Openat
             | HostFileOp::Statfs

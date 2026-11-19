@@ -906,6 +906,7 @@ impl<'a> FsView<'a> {
         writer_file_size_limit: u64,
         description: &Arc<crate::kernel::FileDescription>,
         bytes: &[u8],
+        offset: Option<i64>,
     ) -> Result<CarrierWritten, DispatchError> {
         // RLIMIT_FSIZE and watcher events apply to regular files only.
         let Some(regular) = description.inspect_kind(|open| match open {
@@ -935,6 +936,19 @@ impl<'a> FsView<'a> {
         let Some(io_lease) = description.retain_fd_lease() else {
             return Ok(CarrierWritten::Done(DispatchOutcome::errno(LINUX_EBADF)));
         };
+        if let Some(offset) = offset {
+            return self
+                .pwrite64(
+                    HostFileWriter::<'_, '_, super::super::outcome::LinearMemory>::Carrier(
+                        admitted,
+                    ),
+                    description,
+                    bytes.to_vec(),
+                    bytes.len(),
+                    offset,
+                )
+                .map(CarrierWritten::Done);
+        }
         let (mut open, io_lease) = match self.begin_description_write(
             HostFileWriter::<'_, '_, super::super::outcome::LinearMemory>::Carrier(admitted),
             description,
@@ -1102,7 +1116,7 @@ impl<'a> FsView<'a> {
                 )
             }
             OwnedCopyInOperation::Pwrite64 { length, offset } => {
-                self.pwrite64(cx, pending.target, bytes, length, offset)
+                self.pwrite64_from_task(cx, pending.target, bytes, length, offset)
             }
             OwnedCopyInOperation::Writev(state) => {
                 self.resume_writev_copy_in(cx, pending.target, state, bytes)
@@ -3803,7 +3817,7 @@ impl<'a> FsView<'a> {
                     }
                 }
             };
-            this.pwrite64(cx, target, bytes, length, offset)
+            this.pwrite64_from_task(cx, target, bytes, length, offset)
         }
 
         fn pwritev_dispatch(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, rwf: u64) {
@@ -4233,7 +4247,7 @@ impl<'a> FsView<'a> {
         self.writev(cx, target, iovecs, nonblocking, 0, 0, None)
     }
 
-    fn pwrite64<M: CurrentMmMemory>(
+    fn pwrite64_from_task<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<'_, M>,
         target: WriteTarget,
@@ -4253,17 +4267,36 @@ impl<'a> FsView<'a> {
                 crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
             )?;
         }
-        let Some(open) = crate::kernel::FileDescription::write_for_io(&open_file.description)
-        else {
+        self.pwrite64(
+            HostFileWriter::Task {
+                cx,
+                tid: target.tid,
+                slot_authority: target.slot_authority,
+            },
+            &open_file.description,
+            bytes,
+            length,
+            offset,
+        )
+    }
+
+    fn pwrite64<M: CurrentMmMemory>(
+        &self,
+        mut writer: HostFileWriter<'_, '_, M>,
+        description: &Arc<crate::kernel::FileDescription>,
+        bytes: Vec<u8>,
+        length: usize,
+        offset: i64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let Some(open) = crate::kernel::FileDescription::write_for_io(description) else {
             return Ok(DispatchOutcome::errno(LINUX_EBADF));
         };
         // An O_APPEND fd forces EVERY write to EOF, ignoring the supplied
         // offset (pwrite04). macOS pwrite() on an O_APPEND fd returns EINVAL,
         // so seek-to-end then write() instead (matching the plain write()
         // append path).
-        let is_append =
-            LinuxOpenFlags::from_bits_truncate(open_file.description.common().status_flags())
-                .contains(LinuxOpenFlags::APPEND);
+        let is_append = LinuxOpenFlags::from_bits_truncate(description.common().status_flags())
+            .contains(LinuxOpenFlags::APPEND);
         if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
             match kind {
                 carrick_vfs::SyntheticDeviceKind::Full => {
@@ -4295,11 +4328,31 @@ impl<'a> FsView<'a> {
                 } else {
                     None
                 };
-                let Some(wait_authority) = target.slot_authority.map(WaitFdAuthority::logical)
-                else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                let (tid, authority, host_wait_runner): (
+                    _,
+                    crate::dispatch::io_pipe::HostPipeAuthority,
+                    _,
+                ) = match &mut writer {
+                    HostFileWriter::Task {
+                        cx,
+                        tid,
+                        slot_authority,
+                    } => {
+                        let Some(slot) = *slot_authority else {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        };
+                        (
+                            *tid,
+                            WaitFdAuthority::logical(slot).into(),
+                            self.host_wait_runner_for_ctx(cx),
+                        )
+                    }
+                    HostFileWriter::Carrier(_) => (
+                        crate::thread::ThreadId::NONE,
+                        WaitFdAuthority::internal(InternalWaitKind::HostReadiness).into(),
+                        None,
+                    ),
                 };
-                let host_wait_runner = self.host_wait_runner_for_ctx(cx);
                 let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
                 let outcome = write_host_pipe_owned_at(
                     bytes,
@@ -4309,8 +4362,8 @@ impl<'a> FsView<'a> {
                         None,
                         false,
                         HostWriteKind::RegularFile,
-                        target.tid,
-                        wait_authority,
+                        tid,
+                        authority,
                         self.cross.host_signal(),
                     )
                     .with_append(is_append)
@@ -4352,9 +4405,7 @@ impl<'a> FsView<'a> {
         );
         drop(open);
         if is_inmem_file {
-            let Some(mut open) =
-                crate::kernel::FileDescription::write_for_io(&open_file.description)
-            else {
+            let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             if let OpenDescription::InMemoryFile {
@@ -4394,7 +4445,7 @@ impl<'a> FsView<'a> {
                 };
                 let write_at = if is_append { cur_len } else { offset as usize };
                 if let Err(errno) = memfd_seal_write_check(
-                    open_file.description.common().seals(),
+                    description.common().seals(),
                     write_at,
                     bytes.len(),
                     cur_len,
@@ -4415,7 +4466,7 @@ impl<'a> FsView<'a> {
             }
             return Ok(DispatchOutcome::errno(LINUX_EBADF));
         }
-        let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
+        let Some(open) = crate::kernel::FileDescription::inspect(description) else {
             return Ok(DispatchOutcome::errno(LINUX_EBADF));
         };
         let errno = match &*open {
