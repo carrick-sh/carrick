@@ -492,15 +492,18 @@ HLT deadline jump also let a 200 ms ring nanosleep return in 79 ms of
 host time between guest markers on the release carrier.
 
 The soft runner uses the maximum of host monotonic time at its published
-2 GHz rate and 200 ticks per executed block. A block ending in a guest
+2 GHz rate and 200 ticks per executed block, bounding host monotonic advance
+across an active `SoftRunner::run` block loop to the retired block floor so
+host translation and scheduling stalls cannot expire a slice or retry deadline
+before user instructions retire. A block ending in a guest
 fault or carrier exit counts toward the floor. RDTSC and absolute LAPIC
 deadlines share that timebase, including the guest's TSC offset. An
-interruptible HLT with an eligible timer enrolls on the APIC node until
-the corresponding host deadline or an earlier notification. The host
-wait translates the deadline using the monotonic anchor because the
-block floor stays fixed while parked. Interrupt delivery follows IF,
-interrupt shadow and APIC priority. The timebase is local to the
-single-vCPU soft carrier.
+interruptible HLT with an eligible timer temporarily leaves the execution loop
+and enrolls on the APIC node until the corresponding host deadline or an
+earlier notification. The host wait translates the deadline using the
+monotonic anchor because the block floor stays fixed while parked. Interrupt
+delivery follows IF, interrupt shadow and APIC priority. The timebase is local
+to the single-vCPU soft carrier.
 
 The same in-tree `TWO_LIVE` fixture exits 0 on KVM, where hardware executes
 the resume path directly. Intel VMX describes a
@@ -519,7 +522,8 @@ before its ring syscall to another write after it returns. It uses a
 190 ms lower bound and a 10 s upper bound to allow host scheduling and
 translation overhead. A controlled-clock witness runs a two-thread multi-slice
 raw-exit guest at 50 µs per block under a 200,000-worker-block ceiling, and a
-contended-head witness holds slot 0's queued head claim away from slot 0 across
+contended-head witness at 2 µs per block (with 100 µs/block injected CPL0
+return latency) holds slot 0's queued head claim away from slot 0 across
 one user-origin `0xe0` interrupt (`runnable_head` returns `None` while
 `queued() != 0`) before restoring it on `iretq`. All four production witnesses
 are bound to `x86.softcpu.apic-timer`.
