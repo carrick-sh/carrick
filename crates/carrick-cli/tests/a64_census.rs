@@ -135,8 +135,8 @@ fn command_exports_all_loader_words_deterministically() -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        // The fixture has one ELF code span. All subsequent spans are the
-        // production maintenance/vector pages, including repeated configurations.
+        // The fixture has one ELF code span. The remaining spans are the
+        // production loader pages, including repeated vector configurations.
         let loader_bytes: u64 = report["spans"]
             .as_array()
             .unwrap()
