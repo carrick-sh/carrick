@@ -123,7 +123,8 @@ of its serves, so the reserved job is served by the next clone. The decision
 code is shared with cloudmac (`ci_scaler/assignment.rs`). Before JIT the
 controller requires the template's guest xtask to offer
 `admit-job --controller` (every template built since the cloudmac re-vet,
-#273, does) and otherwise refuses the clone, naming the template rebuild. Assignment serving continues while the lifecycle loop provisions another clone,
+#273, does) and that its `ci-scaler standing-events` equal the controller's
+(#2580), and otherwise refuses the clone, naming the template rebuild. Assignment serving continues while the lifecycle loop provisions another clone,
 reconciles teardown, or backs off. The two loops publish through a short-held
 ledger mutex: assignment writes preserve lifecycle state, lifecycle writes
 preserve authenticated assignments, and every publication is fsynced before
