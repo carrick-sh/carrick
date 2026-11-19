@@ -26,6 +26,8 @@ use carrick_x86_cpl0_host::host_readiness::{
 };
 
 mod common;
+#[path = "../../carrick-cli/tests/fixtures/x86_process_entry.rs"]
+mod x86_process_entry;
 use common::{bind_issued_root, inventory, static_elf};
 
 const PRODUCTION: &[u8] = include_bytes!(env!("CARRICK_X86_CPL0_IMAGE"));
@@ -436,6 +438,43 @@ fn production_ring_resumes_after_runtime_slot_install() {
     assert!(run.failure.is_none(), "{}", run.summary());
     assert_eq!(run.stdout, b"hello\n", "{}", run.summary());
     assert_eq!(run.exit, Some(0), "{}", run.summary());
+}
+
+fn run_compiled_entry_fixture(source: &str, flags: &[&str]) -> HelloRun {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(source);
+    let name = source.file_stem().expect("fixture stem").to_string_lossy();
+    let output =
+        std::path::Path::new(env!("OUT_DIR")).join(format!("soft-{name}-{}", std::process::id()));
+    x86_process_entry::compile_static_fixture(&source, &output, flags);
+    let elf = std::fs::read(&output).expect("read compiled entry fixture");
+    std::fs::remove_file(&output).expect("remove compiled entry fixture");
+    run_hello(&elf)
+}
+
+#[test]
+fn production_ring_runs_glibc_hello_to_exit_on_soft_cpu() {
+    let run = run_compiled_entry_fixture("../carrick-cli/tests/fixtures/x86_glibc_hello.c", &[]);
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert_eq!(run.stdout, b"hello, x86_64 world\n", "{}", run.summary());
+    assert_eq!(run.exit, Some(0), "{}", run.summary());
+}
+
+#[test]
+fn production_ring_clears_first_user_registers_on_soft_cpu() {
+    let run = run_compiled_entry_fixture("tests/fixtures/x86_entry_registers.S", &["-nostdlib"]);
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert_eq!(run.exit, Some(0), "{}", run.summary());
+
+    let registers = [
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9", "r10", "r11", "r12", "r13",
+        "r14", "r15", "rflags",
+    ];
+    assert_eq!(run.stdout.len(), registers.len() * 8, "{}", run.summary());
+    for (register, bytes) in registers.into_iter().zip(run.stdout.chunks_exact(8)) {
+        let value = u64::from_le_bytes(bytes.try_into().expect("register width"));
+        let expected = if register == "rflags" { 0x202 } else { 0 };
+        assert_eq!(value, expected, "first user {register} = {value:#x}");
+    }
 }
 
 /// The bhyve/KVM M2 static musl hello exercises stdio readiness and the
