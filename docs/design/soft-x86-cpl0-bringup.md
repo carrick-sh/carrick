@@ -518,8 +518,11 @@ deadline. The production nanosleep witness measures from a child write
 before its ring syscall to another write after it returns. It uses a
 190 ms lower bound and a 10 s upper bound to allow host scheduling and
 translation overhead. A controlled-clock witness runs a two-thread multi-slice
-raw-exit guest at 50 µs per block under a 200,000-worker-block ceiling. All
-three production witnesses are bound to `x86.softcpu.apic-timer`.
+raw-exit guest at 50 µs per block under a 200,000-worker-block ceiling, and a
+contended-head witness holds slot 0's queued head claim away from slot 0 across
+one user-origin `0xe0` interrupt (`runnable_head` returns `None` while
+`queued() != 0`) before restoring it on `iretq`. All four production witnesses
+are bound to `x86.softcpu.apic-timer`.
 
 Before the CPL0 slice-accounting fix, the host-clock trial reached both
 initial-MM allocation exits for `TWO_LIVE`, then stalled on CPL3 RIP
@@ -534,10 +537,13 @@ outgoing thread's expired `0xe0` pending in `IRR` when higher-priority
 now runs a single pre-`iretq` callback on the one return path after context
 validation and CR3/TLS installation so `arm_slice` stamps and arms the 2 ms
 slice immediately before `carrick_x86_resume_iret`; `expire_timers` arms only
-timed-park deadlines; and `schedule` drains any pending xAPIC `IRR` vectors
-after disarming outgoing timers. ARM EL1 already restores its parked frame
-before stamping the level-triggered virtual timer and checks actual slice
-expiry before rotating. With this fix, the controlled-clock witness,
-eight-round `TWO_LIVE`, the 200 ms nanosleep witness, the musl static hello,
-and the KVM `TWO_LIVE` and slice-end witnesses all exit 0 under unchanged
-slice and block budgets.
+timed-park deadlines; `signal_irq_return`'s non-rotating branch re-arms the
+ongoing slice via `with_slice` whenever `queued() != 0` (covering a concurrent
+`steal_from` that claimed the head `Queued{thief}` before unlinking it,
+matching ARM EL1's `Sched::program_timer(true)`); and `schedule` drains any
+pending xAPIC `IRR` vectors after disarming outgoing timers. ARM EL1 already
+restores its parked frame before stamping the level-triggered virtual timer and
+checks actual slice expiry before rotating. With this fix, the controlled-clock
+and contended-head witnesses, eight-round `TWO_LIVE`, the 200 ms nanosleep
+witness, the musl static hello, and the KVM `TWO_LIVE` and slice-end witnesses
+all exit 0 under unchanged slice and block budgets.
