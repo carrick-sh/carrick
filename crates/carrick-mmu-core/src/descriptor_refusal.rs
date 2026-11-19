@@ -36,6 +36,8 @@ pub enum DescriptorRefusal {
     /// at its reserved copy-window address; only EL1's bounded copy may
     /// write those leaves.
     CarrickOwnedWindow = 24,
+    /// The frame-grant residency index has no admissible slot for this window.
+    ResidencyCapacity = 25,
 }
 
 impl DescriptorRefusal {
@@ -66,6 +68,7 @@ impl DescriptorRefusal {
             22 => Self::ReclaimCapacity,
             23 => Self::CopyWindowAbsent,
             24 => Self::CarrickOwnedWindow,
+            25 => Self::ResidencyCapacity,
             _ => return None,
         })
     }
@@ -77,7 +80,7 @@ mod tests {
 
     #[test]
     fn both_isa_receipts_carry_the_same_stable_refusal() {
-        let refusal = DescriptorRefusal::StaleRoot;
+        let refusal = DescriptorRefusal::ResidencyCapacity;
         let arm = crate::aarch64::descriptor_txn::DescriptorOutcome::Refused(refusal);
         let x86 = crate::x86::descriptor_txn::DescriptorOutcome::Refused(refusal);
         assert_eq!(
@@ -88,6 +91,7 @@ mod tests {
             x86,
             crate::x86::descriptor_txn::DescriptorOutcome::Refused(refusal)
         );
-        assert_eq!(DescriptorRefusal::from_code(refusal as u32), Some(refusal));
+        assert_eq!(refusal as u32, 25);
+        assert_eq!(DescriptorRefusal::from_code(25), Some(refusal));
     }
 }
