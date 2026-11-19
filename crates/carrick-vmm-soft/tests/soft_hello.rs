@@ -12,7 +12,7 @@
 
 use carrick_guest_mem::GuestMemory as _;
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
-use carrick_kernel::dispatch::{DispatchOutcome, StdioReadiness, SyscallDispatcher};
+use carrick_kernel::dispatch::{DispatchOutcome, SyscallDispatcher};
 use carrick_kernel::kernel::KernelContext;
 use carrick_vmm_soft::{SoftBootImage, SoftCarrier, publish_worker_backings};
 use carrick_x86_cpl0_host::carrier_cpu::CarrierRunExit;
@@ -20,9 +20,8 @@ use carrick_x86_cpl0_host::cpl0_boot::{
     InitialReservationLimits, PhysicalProcessExit, initial_extent_bytes_for, load_guest_mm,
 };
 
-use carrick_x86_cpl0_host::host_readiness::{
-    BoundHostFds, HostReadinessStep, ReadinessCrossing, ReadinessWait, StdioBinding,
-    sample_host_readiness,
+use carrick_kernel::host_readiness::{
+    BoundHostFds, HostReadinessStep, ReadinessCrossing, ReadinessWait, sample_entries,
 };
 
 mod common;
@@ -174,15 +173,8 @@ fn drive(elf: &[u8], run: &mut HelloRun, patch: Option<u8>) -> Result<(), String
         .map_err(|error| format!("root load: {error}"))?;
     run.exits.push("root loaded".to_owned());
     // The run's stdio readiness authority, as the runtime executor binds it.
-    let host_fds = BoundHostFds::from_stdio([0, 1, 2].map(|fd| {
-        dispatcher
-            .stdio_readiness(fd)
-            .map(|readiness| match readiness {
-                StdioReadiness::AlwaysWritable => StdioBinding::AlwaysWritable,
-                StdioReadiness::Host(fd) => StdioBinding::Host(fd),
-            })
-    }))
-    .map_err(|error| format!("setup: stdio readiness {error}"))?;
+    let host_fds = BoundHostFds::from_stdio([0, 1, 2].map(|fd| dispatcher.stdio_readiness(fd)))
+        .map_err(|error| format!("setup: stdio readiness {error}"))?;
     for _ in 0..MAX_EXITS {
         let stopped = lease
             .fixture_run_loaded(task)
@@ -194,14 +186,24 @@ fn drive(elf: &[u8], run: &mut HelloRun, patch: Option<u8>) -> Result<(), String
                         // Host-bound poll readiness (std's startup probe of
                         // fds 0-2) through the shared carrier service.
                         let now = std::time::Instant::now();
-                        match ReadinessCrossing::decode(frame, || now)? {
+                        match ReadinessCrossing::decode(
+                            [
+                                frame.rax, frame.rcx, frame.rdi, frame.rsi, frame.rdx, frame.r10,
+                                frame.r8,
+                            ],
+                            || now,
+                        )? {
                             ReadinessCrossing::Other => {}
                             ReadinessCrossing::Refused(errno) => {
                                 return Ok(Ok((frame.rax, errno.guest_retval())));
                             }
                             ReadinessCrossing::Request(request) => {
                                 return Ok(
-                                    match sample_host_readiness(venue, &request, &host_fds)? {
+                                    match venue.with_host_readiness_entries(
+                                        request.address.raw(),
+                                        request.count,
+                                        |entries| sample_entries(entries, &host_fds),
+                                    )?? {
                                         HostReadinessStep::Ready(value) => Ok((frame.rax, value)),
                                         HostReadinessStep::Wait(_) => match request.wait(now) {
                                             ReadinessWait::Expired => Ok((frame.rax, 0)),

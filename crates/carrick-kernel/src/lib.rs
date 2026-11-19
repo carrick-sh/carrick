@@ -94,7 +94,7 @@ pub mod exec_helpers;
 pub mod exec_stamps;
 pub mod fanotify;
 pub(crate) mod file_authority;
-pub(crate) mod host_readiness;
+pub mod host_readiness;
 // The kernel's file authority is internal, but one binding type crosses the
 // crate boundary: the carrier activates the authority on the root file table
 // (`SyscallDispatcher::activate_file_authority`) and names what comes back.

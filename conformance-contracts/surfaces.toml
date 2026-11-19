@@ -741,7 +741,9 @@ surfaces = [
   { path = "crates/carrick-kernel/src/el1_zone.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-kernel/src/el1_zone.rs", contract = "kernel.scheduler.runnable-progress" },
   # Native process custody and Linux identity/exit/wait policy retain the shared lifecycle contracts.
+  { path = "crates/carrick-kernel/src/host_readiness.rs", contract = "kernel.el1.poll-select-owner" },
   { path = "crates/carrick-kernel/src/host_readiness.rs", contract = "kernel.native.host-network-venue" },
+  { path = "crates/carrick-kernel/src/host_readiness.rs", contract = "kernel.signal.temporary-wait-mask" },
   { path = "crates/carrick-kernel/src/inotify.rs", contract = "kernel.inotify.mark-race-hotpath" },
   { path = "crates/carrick-kernel/src/inotify.rs", contract = "kernel.inotify.readiness" },
   { path = "crates/carrick-kernel/src/inotify.rs", contract = "kernel.inotify.watch" },
@@ -1526,7 +1528,6 @@ surfaces = [
   { path = "crates/carrick-x86-cpl0-host/src/cpl0_private_witness.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-x86-cpl0-host/src/cpl0_return_settlement.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-x86-cpl0-host/src/guest_ram.rs", contract = "kernel.mm.address-space-occupancy" },
-  { path = "crates/carrick-x86-cpl0-host/src/host_readiness.rs", contract = "kernel.signal.temporary-wait-mask" },
   { path = "crates/carrick-x86-cpl0-host/src/lib.rs", contract = "kernel.x86.file-region" },
   { path = "crates/carrick-x86-cpl0/src/anonymous.rs", contract = "kernel.el1.anonymous-munmap" },
   { path = "crates/carrick-x86-cpl0/src/anonymous.rs", contract = "kernel.el1.anonymous-permissions" },

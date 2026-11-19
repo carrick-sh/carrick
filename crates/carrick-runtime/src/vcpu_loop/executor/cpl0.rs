@@ -8,14 +8,15 @@ use std::sync::mpsc;
 #[cfg(test)]
 mod host_fd_binding_tests {
     use super::*;
-    use carrick_x86_cpl0_host::host_readiness::BoundReadiness;
+    use carrick_kernel::dispatch::StdioReadiness;
+    use carrick_kernel::host_readiness::BoundReadiness;
     use std::os::fd::AsRawFd;
 
     #[test]
     fn live_unbound_host_fd_cannot_be_named_by_cpl0() {
         let file = std::fs::File::open("/dev/null").unwrap();
         let fd = carrick_el1_abi::HostBoundFd::new(file.as_raw_fd()).unwrap();
-        let bindings = bind_stdio_readiness([
+        let bindings = BoundHostFds::from_stdio([
             Some(StdioReadiness::Host(fd)),
             Some(StdioReadiness::AlwaysWritable),
             Some(StdioReadiness::AlwaysWritable),
@@ -62,7 +63,11 @@ use super::super::signal_ingress_producer::{HostIngressTarget, HostSignalIngress
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
 use carrick_kernel::compat::CompatReporter;
 use carrick_kernel::dispatch::{
-    DispatchOutcome, FdWaitCompletion, StdioReadiness, SyscallDispatcher, SyscallRequest, WaitFds,
+    DispatchOutcome, FdWaitCompletion, SyscallDispatcher, SyscallRequest, WaitFds,
+};
+use carrick_kernel::host_readiness::{
+    BoundHostFds, HostReadinessRequest, HostReadinessStep, ReadinessCrossing, ReadinessWait,
+    sample_entries,
 };
 use carrick_kernel::kernel::continuation::{
     ContinuationResumeEffects, RestartDecision, fold_continuation_completion, resume_continuation,
@@ -75,10 +80,6 @@ use carrick_x86_cpl0_host::carrier_memory::CarrierMemoryIo;
 use carrick_x86_cpl0_host::cpl0_boot::{
     GuestExitStatus, InitialSyscallDisposition, KernelStackSnapshot, ProductionCpuFactory,
     ProductionCpuLease, ProductionForwardFrame,
-};
-use carrick_x86_cpl0_host::host_readiness::{
-    BoundHostFds, HostReadinessRequest, HostReadinessStep, ReadinessCrossing, ReadinessWait,
-    StdioBinding, sample_host_readiness,
 };
 
 pub(crate) struct Cpl0PersistentExecutorFactory<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
@@ -140,17 +141,6 @@ impl Cpl0RootBinding {
         *root = successor;
         Ok(())
     }
-}
-
-/// The run dispatcher's stdio readiness, bound through the shared carrier
-/// readiness authority.
-fn bind_stdio_readiness(readiness: [Option<StdioReadiness>; 3]) -> Result<BoundHostFds, TrapError> {
-    BoundHostFds::from_stdio(readiness.map(|readiness| {
-        readiness.map(|readiness| match readiness {
-            StdioReadiness::AlwaysWritable => StdioBinding::AlwaysWritable,
-            StdioReadiness::Host(fd) => StdioBinding::Host(fd),
-        })
-    }))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -307,7 +297,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutorFactory<M, Mem
                 .dispatcher
                 .lock()
                 .map_err(|_| TrapError::Hypervisor("CPL0 dispatcher poisoned".into()))?;
-            Arc::new(bind_stdio_readiness([
+            Arc::new(BoundHostFds::from_stdio([
                 dispatcher.stdio_readiness(0),
                 dispatcher.stdio_readiness(1),
                 dispatcher.stdio_readiness(2),
@@ -734,20 +724,27 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     "invalid host object write binding".into(),
                 ));
             }
-            if let Some(readiness) =
-                match ReadinessCrossing::decode(frame, std::time::Instant::now)? {
-                    ReadinessCrossing::Other => None,
-                    ReadinessCrossing::Refused(errno) => {
-                        return Ok(ForwardDecision::Immediate(
-                            InitialSyscallDisposition::Refused(errno),
-                        ));
-                    }
-                    ReadinessCrossing::Request(readiness) => Some(readiness),
+            if let Some(readiness) = match ReadinessCrossing::decode(
+                [
+                    frame.rax, frame.rcx, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8,
+                ],
+                std::time::Instant::now,
+            )? {
+                ReadinessCrossing::Other => None,
+                ReadinessCrossing::Refused(errno) => {
+                    return Ok(ForwardDecision::Immediate(
+                        InitialSyscallDisposition::Refused(errno),
+                    ));
                 }
-            {
+                ReadinessCrossing::Request(readiness) => Some(readiness),
+            } {
                 self.stats
                     .record(crate::prepare::InitialForwardClass::Host("readiness"))?;
-                return match sample_host_readiness(venue, &readiness, &self.bound_host_fds)? {
+                return match venue.with_host_readiness_entries(
+                    readiness.address.raw(),
+                    readiness.count,
+                    |entries| sample_entries(entries, &self.bound_host_fds),
+                )?? {
                     HostReadinessStep::Ready(value) => Ok(ForwardDecision::Immediate(
                         InitialSyscallDisposition::Return(value),
                     )),
@@ -1021,7 +1018,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     match folded {
                         Some(outcome) => Ok(outcome),
                         None if let ForwardRequest::HostReadiness(readiness) = retained.request => {
-                            match sample_host_readiness(venue, &readiness, &self.bound_host_fds)? {
+                            match venue.with_host_readiness_entries(
+                                readiness.address.raw(),
+                                readiness.count,
+                                |entries| sample_entries(entries, &self.bound_host_fds),
+                            )?? {
                                 HostReadinessStep::Ready(value) => {
                                     Ok(DispatchOutcome::Returned { value })
                                 }
