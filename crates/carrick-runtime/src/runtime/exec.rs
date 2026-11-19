@@ -618,7 +618,11 @@ fn resolve_exec_target<'a>(
             let host_open: Option<
                 &carrick_kernel::dispatch::exec_files::ExecHostFileService<'_>,
             > = Some(&open);
-            #[cfg(not(feature = "platform-macos"))]
+            #[cfg(any(
+                feature = "platform-linux",
+                feature = "platform-freebsd",
+                feature = "platform-netbsd"
+            ))]
             let host_open = None;
             let source = files
                 .acquire_native_path(path, host_open, descriptor)
