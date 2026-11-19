@@ -609,9 +609,8 @@ fn production_ring_non_last_threads_raw_exit() {
         })),
     );
     let host = format!(
-        "soft JIT=native x86_64 profile_dir={} opt_level={} available_cpus={:?}",
-        env!("SOFT_BUILD_PROFILE_DIR"),
-        env!("SOFT_BUILD_OPT_LEVEL"),
+        "soft JIT=native x86_64 debug_assertions={} available_cpus={:?}",
+        cfg!(debug_assertions),
         std::thread::available_parallelism()
             .ok()
             .map(|cpus| cpus.get()),
