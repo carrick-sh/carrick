@@ -1085,8 +1085,8 @@ pub(crate) enum DebugCommand {
     },
     /// Static A64 encoding census (slice 0a; no guest execution).
     A64Census {
-        /// Linked AArch64 ELF. Without a path, scan embedded flat bytes
-        /// conservatively (includes data and cannot establish code closure).
+        /// Linked AArch64 EL1 ELF or rootfs directory containing AArch64 userland.
+        /// Without a path, conservatively scan embedded flat bytes.
         input: Option<PathBuf>,
         /// Fail with exit 1 on any unknown or typed-undecoded executable word.
         #[arg(long)]
