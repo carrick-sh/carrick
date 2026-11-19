@@ -3457,6 +3457,16 @@ pub trait ThreadedEngine:
         Ok(None)
     }
 
+    /// Clip a semantic plan against the authoritative live descriptor image
+    /// before allocating physical backing. The default venue has no live
+    /// descriptor view and preserves the request.
+    fn select_el1_frame_grant(
+        &mut self,
+        request: El1FrameGrantRequest,
+    ) -> Result<El1FrameGrantRequest, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+        Ok(request)
+    }
+
     /// Expose prepared grant backing with only `fault_va` accessible and
     /// the other pages prepared. The engine's live-descriptor owner decides
     /// the lane: on the host-owned lane it stores the leaves itself; on the

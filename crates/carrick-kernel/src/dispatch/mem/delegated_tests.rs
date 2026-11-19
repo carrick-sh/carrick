@@ -6868,11 +6868,9 @@ fn delegated_host_stock_keeps_fragmented_window_first_touch() {
     }
 }
 
-/// A descriptor installed by an earlier host first touch remains an occupied
-/// publication neighbour even when it lies inside the live root node.  Bulk
-/// read and write grants must stop at it instead of asking EL1 to replace the
-/// whole span and falling back to the legacy first-touch path on `Occupied`.
-fn production_grant_clips_host_resident_neighbour(access: u64) {
+/// A stale host residency row is not descriptor authority. The runtime clips
+/// this semantic plan against the live stage-1 image before preparing backing.
+fn production_grant_ignores_stale_host_residency(access: u64) {
     let dispatcher = SyscallDispatcher::new();
     let root = Root::admit(&dispatcher);
     let base = LINUX_MMAP_BASE + STOCK_WINDOW;
@@ -6905,24 +6903,24 @@ fn production_grant_clips_host_resident_neighbour(access: u64) {
                 access,
             )
         })
-        .expect("occupied neighbour must narrow, not refuse, the grant");
+        .expect("stale host residency must not suppress the semantic plan");
     assert_eq!(request.fault_va, fault);
     assert_eq!(request.access, access);
     assert!((request.semantic_base..request.semantic_base + request.len).contains(&fault));
     assert!(
-        !(request.semantic_base..request.semantic_base + request.len).contains(&(base + 3 * PAGE)),
-        "access={access}: grant crossed the occupied descriptor"
+        (request.semantic_base..request.semantic_base + request.len).contains(&(base + 3 * PAGE)),
+        "access={access}: a residency row incorrectly acted as descriptor authority"
     );
 }
 
 #[test]
-fn arm_read_grant_clips_occupied_neighbour_before_publication() {
-    production_grant_clips_host_resident_neighbour(1);
+fn arm_read_plan_ignores_in_node_stale_host_residency() {
+    production_grant_ignores_stale_host_residency(1);
 }
 
 #[test]
-fn x86_write_grant_clips_occupied_neighbour_before_publication() {
-    production_grant_clips_host_resident_neighbour(2);
+fn x86_write_plan_ignores_in_node_stale_host_residency() {
+    production_grant_ignores_stale_host_residency(2);
 }
 
 /// Host alias supply already has host mutation admission; extraction must
