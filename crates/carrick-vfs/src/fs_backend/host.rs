@@ -468,12 +468,14 @@ impl StatCacheEntry {
 }
 
 /// One directory in [`HostFsBackend::dir_cache`]: a containment-proven host
-/// dirfd plus its parent directory's generation cell.
+/// dirfd plus its parent directory's generation cell and whether any symlink
+/// was traversed along the cached path.
 pub(crate) struct DirCacheEntry {
     fd: std::sync::Arc<std::os::fd::OwnedFd>,
     parent_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stamped_parent_gen: u64,
     dir_generation: u64,
+    via_symlink: bool,
 }
 
 impl DirCacheEntry {
@@ -615,13 +617,8 @@ pub(crate) enum FastGuestOpen {
     /// `open_fifo_nonblock` handling — NEVER to the cap-std slow path, whose
     /// blocking `open(2)` of a writer-less FIFO would wedge the dispatcher.
     Fifo,
-    /// The kernel reported ENOENT before any fd existed. Immutable-lower
-    /// callers may turn this into an authoritative guest miss only after
-    /// proving that the nearest existing ancestor is a contained directory;
-    /// ordinary mutable-backend callers retain their exact fallback.
-    Missing,
-    /// Anything else (unresolvable parent, alias, exotic type, error): run the
-    /// exact cap-std slow path. A fast-path failure proves nothing about the
+    /// Anything else (miss, unresolvable parent, alias, exotic type, error):
+    /// run the exact slow path. A fast-path failure proves nothing about the
     /// guest view — e.g. a parent behind a symlink whose re-rooted target the
     /// directory cache could not open.
     Fallback,
@@ -629,6 +626,23 @@ pub(crate) enum FastGuestOpen {
     /// [`host_open_refusal`]) even after carrick reclaimed its own descriptor
     /// caches. Final: the slow path would only re-ask the same kernel.
     Refused(LinuxErrno),
+}
+
+/// Outcome of walking a normalized sandbox-relative parent path from
+/// `root_fd` one `O_DIRECTORY | O_NOFOLLOW` component at a time without ever
+/// traversing a symlink.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) enum NofollowParent {
+    /// Every component of the parent path is a real directory under `root_fd`,
+    /// reached with zero symlinks (and byte-exact on macOS).
+    Dir(std::sync::Arc<std::os::fd::OwnedFd>),
+    /// A component returned `ENOENT` directly beneath a symlink-free,
+    /// `O_DIRECTORY | O_NOFOLLOW`-walked ancestor chain from `root_fd`.
+    MissingBelowContainedAncestor,
+    /// Encountered a symlink (`ELOOP`/`ENOTDIR`), non-directory, Unicode
+    /// alias, invalid component, or any unexpected host error — fail closed to
+    /// the layered resolver.
+    Fallback,
 }
 
 /// Result of an immutable host lower's read-only regular-file fast path.
@@ -1785,7 +1799,7 @@ impl HostFsBackend {
                 Some(fd) => fd,
                 None => {
                     let fd = self.root_fd.clone();
-                    self.publish_dir_fd(Path::new(""), &fd, generation);
+                    self.publish_dir_fd(Path::new(""), &fd, generation, false);
                     fd
                 }
             }
@@ -1797,6 +1811,7 @@ impl HostFsBackend {
         // Start from the deepest cached ancestor. `ancestors()` yields
         // longest-first, so the first hit is the deepest.
         let mut current = root;
+        let mut current_via_symlink = false;
         let mut walked = PathBuf::new();
         let mut remaining: Vec<&std::ffi::OsStr> = Vec::new();
         {
@@ -1808,6 +1823,7 @@ impl HostFsBackend {
                     && let Ok(rest) = dir.strip_prefix(ancestor)
                 {
                     current = entry.fd.clone();
+                    current_via_symlink = entry.via_symlink;
                     walked = ancestor.to_path_buf();
                     remaining = rest.iter().collect();
                     found = true;
@@ -1879,15 +1895,16 @@ impl HostFsBackend {
                         normalize_raw(&parent.join(target_path)).ok_or(libc::EACCES)?
                     };
                     let target_fd = self.dir_fd_for_hops(&resolved_target, hops + 1)?;
-                    self.publish_dir_fd(&walked, &target_fd, generation);
+                    self.publish_dir_fd(&walked, &target_fd, generation, true);
                     current = target_fd;
+                    current_via_symlink = true;
                     continue;
                 }
                 return Err(err);
             }
             // SAFETY: `raw` is a freshly-opened owned dir fd.
             let fd = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
-            self.publish_dir_fd(&walked, &fd, generation);
+            self.publish_dir_fd(&walked, &fd, generation, current_via_symlink);
             current = fd;
         }
         Ok(current)
@@ -1910,7 +1927,8 @@ impl HostFsBackend {
         }
 
         let mut current = self.root_fd.clone();
-        self.publish_dir_fd(Path::new(""), &current, generation);
+        let mut current_via_symlink = false;
+        self.publish_dir_fd(Path::new(""), &current, generation, false);
         let flags = libc::O_RDONLY
             | libc::O_DIRECTORY
             | libc::O_CLOEXEC
@@ -1967,15 +1985,16 @@ impl HostFsBackend {
                         normalize_raw(&parent.join(target_path)).ok_or(libc::EACCES)?
                     };
                     let target_fd = self.dir_fd_for_hops(&resolved_target, hops + 1)?;
-                    self.publish_dir_fd(&walked, &target_fd, generation);
+                    self.publish_dir_fd(&walked, &target_fd, generation, true);
                     current = target_fd;
+                    current_via_symlink = true;
                     continue;
                 }
                 return Err(err);
             }
             // SAFETY: `raw` is a freshly-opened owned dir fd.
             let fd = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
-            self.publish_dir_fd(&walked, &fd, generation);
+            self.publish_dir_fd(&walked, &fd, generation, current_via_symlink);
             current = fd;
         }
         Ok(current)
@@ -1989,6 +2008,7 @@ impl HostFsBackend {
         dir: &Path,
         fd: &std::sync::Arc<std::os::fd::OwnedFd>,
         dir_generation: u64,
+        via_symlink: bool,
     ) {
         if !self.fast_fs {
             return;
@@ -2008,6 +2028,7 @@ impl HostFsBackend {
                 parent_gen,
                 stamped_parent_gen,
                 dir_generation,
+                via_symlink,
             },
         );
     }
@@ -2123,7 +2144,7 @@ impl HostFsBackend {
                 return Err(err);
             }
             let fd = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
-            self.publish_dir_fd(&walked, &fd, generation);
+            self.publish_dir_fd(&walked, &fd, generation, false);
             current = fd;
         }
         Ok(current)
@@ -2509,17 +2530,9 @@ impl HostFsBackend {
         let (parent_fd, name_c) = match self.namei_leaf_res(rel) {
             Ok(pair) => pair,
             Err(errno) => {
-                if let Some(refused) = host_open_refusal(errno) {
-                    return FastGuestOpen::Refused(refused);
-                }
-                // A missing ancestor (including a re-rooted symlink target)
-                // is an ENOENT before any fd existed, exactly as a missing
-                // leaf below: `Missing` stays non-authoritative until the
-                // immutable-lower caller proves it.
-                return if errno == libc::ENOENT && !write {
-                    FastGuestOpen::Missing
-                } else {
-                    FastGuestOpen::Fallback
+                return match host_open_refusal(errno) {
+                    Some(refused) => FastGuestOpen::Refused(refused),
+                    None => FastGuestOpen::Fallback,
                 };
             }
         };
@@ -2556,7 +2569,6 @@ impl HostFsBackend {
         ) {
             Ok(raw) => raw,
             Err(libc::ELOOP) => return FastGuestOpen::SymlinkLeaf,
-            Err(libc::ENOENT) if !write => return FastGuestOpen::Missing,
             Err(errno) => {
                 return match host_open_refusal(errno) {
                     Some(refused) => FastGuestOpen::Refused(refused),
@@ -2697,129 +2709,227 @@ impl HostFsBackend {
         HostFdOpen::Served((raw, representable))
     }
 
-    /// Prove that an ENOENT from `fast_open_for_guest` is a real miss in this
-    /// immutable tree. Walk upward only across ENOENT ancestors until an
-    /// existing directory can be opened and containment-checked. Encountering
-    /// a symlink leaf (ELOOP), non-directory, escape, Unicode alias, or any
-    /// unexpected host error fails closed to the layered resolver.
-    #[cfg(target_os = "macos")]
-    fn missing_below_contained_ancestor(&self, rel: &Path) -> bool {
+    /// Walk `parent` from `self.root_fd` one `O_DIRECTORY | O_NOFOLLOW`
+    /// component at a time without ever following a symlink.
+    ///
+    /// Unlike [`Self::dir_fd_for`], this never dereferences symlinks and never
+    /// issues a multi-component `openat` from `self.root_fd`. Cached
+    /// `dir_cache` entries are reused only for pure-ASCII paths whose entry
+    /// carries `!via_symlink`; any valid cached ancestor with `via_symlink`
+    /// fails closed immediately to [`NofollowParent::Fallback`].
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn resolve_parent_nofollow(&self, parent: &Path) -> NofollowParent {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
         use std::os::unix::ffi::OsStrExt as _;
+        use std::path::Component;
+        use std::sync::atomic::Ordering::Relaxed;
 
-        let Some(root_prefix) = self.root_prefix.as_deref() else {
-            return false;
-        };
-        let mut candidate = rel.parent();
-        loop {
-            let Some(parent) = candidate else {
-                return true;
-            };
-            if parent.as_os_str().is_empty() {
-                // `self.root_fd` is the already-open immutable root authority.
-                return true;
-            }
-            let Ok(parent_c) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else {
-                return false;
-            };
-            const O_EVTONLY: libc::c_int = 0x8000;
-            let raw = unsafe {
-                host_openat!(
-                    self.root_fd.as_raw_fd(),
-                    parent_c.as_ptr(),
-                    O_EVTONLY
-                        | libc::O_NONBLOCK
-                        | libc::O_CLOEXEC
-                        | libc::O_NOFOLLOW
-                        | libc::O_NOCTTY,
-                    0,
-                )
-            };
-            if raw < 0 {
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
-                    candidate = parent.parent();
-                    continue;
-                }
-                return false;
-            }
-            // SAFETY: `raw` is a freshly-opened owned descriptor.
-            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-            let mut stat: libc::stat = unsafe { core::mem::zeroed() };
-            if unsafe { host_fstat!(raw, &mut stat) } != 0
-                || stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32
-                || !fd_contained_under(raw, root_prefix)
-                || !self.name_matches_on_disk(parent)
-            {
-                return false;
-            }
-            drop(fd);
-            return true;
+        if !self.fast_fs {
+            return NofollowParent::Fallback;
         }
+        if parent.as_os_str().is_empty() {
+            return NofollowParent::Dir(self.root_fd.clone());
+        }
+        let parent_is_ascii = parent.as_os_str().as_bytes().is_ascii();
+        let generation = self.coherence.current_dir_generation();
+        let proc_gen = crate::fs_resolve_cache::current_process_generation();
+
+        let mut current = self.root_fd.clone();
+        let mut walked = PathBuf::new();
+        let mut remaining: Vec<&std::ffi::OsStr> = Vec::new();
+
+        if parent_is_ascii {
+            let mut cache = self.dir_cache.lock();
+            if self.dir_cache_proc_gen.load(Relaxed) != proc_gen {
+                cache.clear();
+                self.dir_cache_proc_gen.store(proc_gen, Relaxed);
+            }
+            if let Some(entry) = cache.get(parent)
+                && entry.is_valid(generation)
+            {
+                return if entry.via_symlink {
+                    NofollowParent::Fallback
+                } else {
+                    NofollowParent::Dir(entry.fd.clone())
+                };
+            }
+            let mut found = false;
+            for ancestor in parent.ancestors().skip(1) {
+                if let Some(entry) = cache.get(ancestor)
+                    && entry.is_valid(generation)
+                    && let Ok(rest) = parent.strip_prefix(ancestor)
+                {
+                    if entry.via_symlink {
+                        return NofollowParent::Fallback;
+                    }
+                    current = entry.fd.clone();
+                    walked = ancestor.to_path_buf();
+                    for comp in rest.components() {
+                        match comp {
+                            Component::Normal(name) => remaining.push(name),
+                            _ => return NofollowParent::Fallback,
+                        }
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                for comp in parent.components() {
+                    match comp {
+                        Component::Normal(name) => remaining.push(name),
+                        _ => return NofollowParent::Fallback,
+                    }
+                }
+            }
+        } else {
+            for comp in parent.components() {
+                match comp {
+                    Component::Normal(name) => remaining.push(name),
+                    _ => return NofollowParent::Fallback,
+                }
+            }
+        }
+
+        let flags = libc::O_RDONLY
+            | libc::O_DIRECTORY
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK
+            | libc::O_NOFOLLOW
+            | libc::O_NOCTTY;
+
+        for component in remaining {
+            let Some(component_c) = cstring_from_osstr(component) else {
+                return NofollowParent::Fallback;
+            };
+            self.path_walk_host_opens.fetch_add(1, Relaxed);
+            let raw = unsafe { host_openat!(current.as_raw_fd(), component_c.as_ptr(), flags, 0) };
+            if raw < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error();
+                return if err == Some(libc::ENOENT) {
+                    NofollowParent::MissingBelowContainedAncestor
+                } else {
+                    NofollowParent::Fallback
+                };
+            }
+            // SAFETY: `raw` is a freshly-opened owned directory descriptor.
+            let fd = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+            #[cfg(target_os = "macos")]
+            if !component.as_bytes().is_ascii()
+                && !matches!(
+                    leaf_name_matches_stored_macos(
+                        current.as_raw_fd(),
+                        &component_c,
+                        component.as_bytes(),
+                    ),
+                    Ok(true)
+                )
+            {
+                return NofollowParent::Fallback;
+            }
+            walked.push(component);
+            if parent_is_ascii {
+                self.publish_dir_fd(&walked, &fd, generation, false);
+            }
+            current = fd;
+        }
+        NofollowParent::Dir(current)
     }
 
     /// Immutable-lower sibling of `open_raw_fd_with_metadata`: successful
     /// files and authoritative contained misses are typed separately from the
     /// semantic fallback cases.
+    ///
+    /// Walks ancestors component-by-component with `O_DIRECTORY | O_NOFOLLOW`
+    /// (`resolve_parent_nofollow`) and opens the single leaf with `O_NOFOLLOW`:
+    /// any symlink in the ancestor chain or at the leaf, any non-directory
+    /// ancestor, any Unicode alias, or any other doubt fails closed to
+    /// [`ImmutableHostFileOpen::Fallback`].
     pub(crate) fn open_immutable_file_readonly(&self, path: &str) -> ImmutableHostFileOpen {
         #[cfg(target_os = "macos")]
         {
-            use std::os::fd::AsRawFd as _;
+            use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+            use std::os::unix::ffi::OsStrExt as _;
 
+            if !self.fast_fs {
+                return ImmutableHostFileOpen::Fallback;
+            }
             let Some(normalized) = normalize(path) else {
                 return ImmutableHostFileOpen::Fallback;
             };
             let Some(rel) = Self::rel_path(&normalized) else {
                 return ImmutableHostFileOpen::Fallback;
             };
-            match self.fast_open_for_guest(rel, false, false) {
-                FastGuestOpen::Served {
-                    fd,
-                    stat,
+            let Some(leaf) = rel.file_name() else {
+                return ImmutableHostFileOpen::Fallback;
+            };
+            let Some(leaf_c) = cstring_from_osstr(leaf) else {
+                return ImmutableHostFileOpen::Fallback;
+            };
+            let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+            let parent_fd = match self.resolve_parent_nofollow(parent) {
+                NofollowParent::Dir(fd) => fd,
+                NofollowParent::MissingBelowContainedAncestor => {
+                    return ImmutableHostFileOpen::Missing;
+                }
+                NofollowParent::Fallback => return ImmutableHostFileOpen::Fallback,
+            };
+            let flags = libc::O_RDONLY
+                | libc::O_NONBLOCK
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | libc::O_NOCTTY;
+            let raw = match self.openat_for_guest(parent_fd.as_raw_fd(), &leaf_c, flags, 0) {
+                Ok(raw) => raw,
+                Err(libc::ENOENT) => return ImmutableHostFileOpen::Missing,
+                Err(_) => return ImmutableHostFileOpen::Fallback,
+            };
+            // SAFETY: `raw` is a freshly-opened owned fd; OwnedFd closes it on
+            // drop, covering every early return below.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            let mut stat: libc::stat = unsafe { core::mem::zeroed() };
+            if unsafe { host_fstat!(raw, &mut stat) } != 0
+                || stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFREG as u32
+            {
+                return ImmutableHostFileOpen::Fallback;
+            }
+            if !leaf.as_bytes().is_ascii()
+                && !matches!(
+                    leaf_name_matches_stored_macos(parent_fd.as_raw_fd(), &leaf_c, leaf.as_bytes(),),
+                    Ok(true)
+                )
+            {
+                return ImmutableHostFileOpen::Fallback;
+            }
+            let (override_mode, _uid, _gid, is_socket) = fd_carrick_meta(fd.as_raw_fd());
+            if is_socket {
+                return ImmutableHostFileOpen::Fallback;
+            }
+            let on_disk_mode = stat.st_mode as u32 & 0o7777;
+            let mode = override_mode.unwrap_or(if on_disk_mode == 0 {
+                0o644
+            } else {
+                on_disk_mode
+            });
+            ImmutableHostFileOpen::Served {
+                file: std::fs::File::from(fd),
+                metadata: RootFsMetadata {
+                    // GUEST-ABSOLUTE, not the sandbox-relative form
+                    // `normalize` produces (it drops `RootDir`). This
+                    // metadata becomes an `OpenDescription::HostFile`,
+                    // whose `path` IS the guest path the fd was opened
+                    // at — `open_path()` serves it to `execveat`
+                    // AT_EMPTY_PATH (fexecve) and to `fchown`/`futimens`
+                    // path resolution. Every sibling producer of a
+                    // served `HostFile` stores the absolute path; this
+                    // lane storing `usr/local/bin/python3.12` made
+                    // `fexecve` re-resolve against the caller's cwd, so
+                    // it only worked while the cwd was `/`.
+                    path: Path::new("/").join(&normalized),
                     kind: RootFsEntryKind::File,
-                } => {
-                    let (override_mode, _uid, _gid, is_socket) = fd_carrick_meta(fd.as_raw_fd());
-                    if is_socket {
-                        return ImmutableHostFileOpen::Fallback;
-                    }
-                    let on_disk_mode = stat.st_mode as u32 & 0o7777;
-                    let mode = override_mode.unwrap_or(if on_disk_mode == 0 {
-                        0o644
-                    } else {
-                        on_disk_mode
-                    });
-                    ImmutableHostFileOpen::Served {
-                        file: std::fs::File::from(fd),
-                        metadata: RootFsMetadata {
-                            // GUEST-ABSOLUTE, not the sandbox-relative form
-                            // `normalize` produces (it drops `RootDir`). This
-                            // metadata becomes an `OpenDescription::HostFile`,
-                            // whose `path` IS the guest path the fd was opened
-                            // at — `open_path()` serves it to `execveat`
-                            // AT_EMPTY_PATH (fexecve) and to `fchown`/`futimens`
-                            // path resolution. Every sibling producer of a
-                            // served `HostFile` stores the absolute path; this
-                            // lane storing `usr/local/bin/python3.12` made
-                            // `fexecve` re-resolve against the caller's cwd, so
-                            // it only worked while the cwd was `/`.
-                            path: Path::new("/").join(&normalized),
-                            kind: RootFsEntryKind::File,
-                            mode,
-                            size: stat.st_size as usize,
-                        },
-                    }
-                }
-                FastGuestOpen::Missing if self.missing_below_contained_ancestor(rel) => {
-                    ImmutableHostFileOpen::Missing
-                }
-                // A host refusal is reported by the exact open the fallback
-                // performs (`open_raw_fd_with_metadata` → `Refused`), where
-                // the dispatcher owns the errno.
-                FastGuestOpen::Served { .. }
-                | FastGuestOpen::SymlinkLeaf
-                | FastGuestOpen::Fifo
-                | FastGuestOpen::Missing
-                | FastGuestOpen::Fallback
-                | FastGuestOpen::Refused(_) => ImmutableHostFileOpen::Fallback,
+                    mode,
+                    size: stat.st_size as usize,
+                },
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -5316,7 +5426,7 @@ impl FsBackend for HostFsBackend {
                         let fd =
                             std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
                         let generation = self.coherence.current_dir_generation();
-                        self.publish_dir_fd(rel.as_path(), &fd, generation);
+                        self.publish_dir_fd(rel.as_path(), &fd, generation, false);
                     }
                 }
                 self.clear_whiteout_normalized(rel.as_path());
@@ -6119,7 +6229,7 @@ impl FsBackend for HostFsBackend {
                     };
                 }
                 FastGuestOpen::Refused(refused) => return HostFdOpen::Refused(refused),
-                FastGuestOpen::SymlinkLeaf | FastGuestOpen::Missing | FastGuestOpen::Fallback => {}
+                FastGuestOpen::SymlinkLeaf | FastGuestOpen::Fallback => {}
             }
         }
         self.open_raw_fd_impl(path, write, create, trunc)
@@ -6262,7 +6372,7 @@ impl FsBackend for HostFsBackend {
                 // stays non-blocking).
                 FastGuestOpen::Fifo => return HostFdOpen::Unavailable,
                 FastGuestOpen::Refused(refused) => return HostFdOpen::Refused(refused),
-                FastGuestOpen::SymlinkLeaf | FastGuestOpen::Missing | FastGuestOpen::Fallback => {}
+                FastGuestOpen::SymlinkLeaf | FastGuestOpen::Fallback => {}
             }
         }
         let fd = match self.open_raw_fd_impl(path, write, create, trunc) {
@@ -7102,7 +7212,7 @@ impl FsBackend for HostFsBackend {
             // resolves symlinks and rejects aliases exactly.
             if got == expected.as_slice() {
                 let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-                self.publish_dir_fd(parent, &std::sync::Arc::new(owned), generation);
+                self.publish_dir_fd(parent, &std::sync::Arc::new(owned), generation, false);
                 ParentResolve::AllDirsNoSymlink
             } else {
                 unsafe { libc::close(fd) };
@@ -7238,7 +7348,7 @@ impl FsBackend for HostFsBackend {
             let dup_raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
             if dup_raw >= 0 {
                 let cached_fd = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(dup_raw) });
-                self.publish_dir_fd(&publish_path, &cached_fd, generation);
+                self.publish_dir_fd(&publish_path, &cached_fd, generation, false);
             }
             Some(fd)
         }
