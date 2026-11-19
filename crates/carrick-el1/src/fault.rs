@@ -2480,7 +2480,7 @@ mod tests {
                         armed.set(false);
                     }
                 ),
-                Ok(true)
+                Ok(carrick_el1_abi::FrameGrantCompletion::Published)
             );
             assert!(!armed.get());
             assert!(!origin.has_guest_work());
@@ -2574,7 +2574,7 @@ mod tests {
                     assert!(tables.get() && leaves.get());
                 }
             ),
-            Ok(true)
+            Ok(carrick_el1_abi::FrameGrantCompletion::Published)
         );
         assert!(!mailbox.has_guest_work());
         assert!(

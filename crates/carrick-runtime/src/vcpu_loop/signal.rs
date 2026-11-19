@@ -422,49 +422,23 @@ fn frame_grant_root_matches(
     Some(request.reservation_incarnation) == current
 }
 
-enum FrameGrantResponse<T> {
-    Refuse(u64, T),
-    Fail(String),
-}
-
-impl From<u64> for FrameGrantResponse<()> {
-    fn from(status: u64) -> Self {
-        Self::Refuse(status, ())
+fn publish_frame_grant_refusal(
+    mailbox: &carrick_el1_abi::FrameGrantMailbox,
+    request: carrick_el1_abi::FrameGrantRequest,
+    status: u64,
+) {
+    if !mailbox.publish_refusal(status) {
+        fail_frame_grant_publication(format_args!(
+            "claimed frame-grant request could not publish backend refusal: mm={} generation={} status={}",
+            request.mm_key, request.request_generation, status
+        ));
     }
 }
 
-fn publish_frame_grant_refusal<T>(
-    mailbox: &carrick_el1_abi::FrameGrantMailbox,
-    request: carrick_el1_abi::FrameGrantRequest,
-    response: impl Into<FrameGrantResponse<T>>,
-) -> T {
-    let result = match response.into() {
-        FrameGrantResponse::Refuse(status, value) if mailbox.publish_refusal(status) => Ok(value),
-        FrameGrantResponse::Refuse(status, _) => Err(format!(
-            "claimed frame-grant request could not publish backend refusal: mm={} generation={} status={}",
-            request.mm_key, request.request_generation, status
-        )),
-        FrameGrantResponse::Fail(error) => Err(error),
-    };
-    result.unwrap_or_else(|error| {
-        carrick_fatal::carrick_fatal!(
-            "hvpatch::el1_frame_grant",
-            "frame-grant publication failed: {error}"
-        )
-    })
-}
-
-/// Funnel an uncertain prepared grant into the same fail-stop authority as
-/// mailbox refusal failure. Its response never returns to the fault handler.
-fn fail_frame_grant_publication<T>(
-    mailbox: &carrick_el1_abi::FrameGrantMailbox,
-    request: carrick_el1_abi::FrameGrantRequest,
-    error: impl std::fmt::Display,
-) -> T {
-    publish_frame_grant_refusal(
-        mailbox,
-        request,
-        FrameGrantResponse::Fail(error.to_string()),
+fn fail_frame_grant_publication(error: impl std::fmt::Display) -> ! {
+    carrick_fatal::carrick_fatal!(
+        "hvpatch::el1_frame_grant",
+        "frame-grant publication failed: {error}"
     )
 }
 
@@ -964,22 +938,36 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     request.fault_va,
                     request.access,
                 );
-                let Some(prepared) = engine.prepare_el1_frame_grant(service)? else {
+                let record_decision = |decision| {
                     ring::rec_el1_frame_grant_decision(
                         ring_tid,
                         request.request_generation,
-                        FrameGrantDecision::PrepareRefused,
+                        decision,
                         prot,
                         service.len,
                         None,
                         None,
                     );
+                };
+                let Some(prepared) = engine.prepare_el1_frame_grant(service).inspect_err(|_| {
+                    record_decision(FrameGrantDecision::PrepareError);
+                })?
+                else {
+                    record_decision(FrameGrantDecision::PrepareRefused);
                     publish_frame_grant_refusal(
                         mailbox,
                         request,
                         carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
                     );
                     return Ok(Ok(true));
+                };
+                let fail_publication = |detail: String| -> ! {
+                    record_decision(FrameGrantDecision::FatalPublication);
+                    fail_frame_grant_publication(detail)
+                };
+                let decline_publication = |decision| {
+                    record_decision(decision);
+                    Ok(false)
                 };
                 let ready = prepared.ready();
                 let fault_page = plan.fault_page();
@@ -995,126 +983,170 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     owner_generation: ready.owner_generation,
                     inventory_revision: ready.inventory_revision,
                 };
-                let completed = mailbox.complete_grant(
-                    carrick_el1_abi::FrameGrantReady {
-                        mm_key: request.mm_key,
-                        request_generation: request.request_generation,
-                        semantic_base: service.semantic_base,
-                        physical_ipa: ready.physical_ipa,
-                        len: service.len,
-                        permissions: service.permissions,
-                        frame_id: ready.frame_id,
-                        mapping_id: ready.mapping_id,
-                        owner_generation: ready.owner_generation,
-                        inventory_revision: ready.inventory_revision,
-                    },
-                    |grant| {
-                        use carrick_hal::threaded::{
-                            El1FrameGrantPublication, El1FrameGrantPublished,
-                        };
-                        match engine.publish_el1_frame_grant(El1FrameGrantPublication {
+                use carrick_hal::threaded::El1FrameGrantRollback;
+                let backing = El1FrameGrantRollback {
+                    mm_key: service.mm_key,
+                    semantic_base: service.semantic_base,
+                    len: service.len,
+                    ready,
+                };
+                let publish = |grant: carrick_el1_abi::FrameGrantReady| {
+                    use carrick_hal::threaded::{El1FrameGrantPublication, El1FrameGrantPublished};
+                    let publication = engine
+                        .publish_el1_frame_grant(El1FrameGrantPublication {
                             mm_key: grant.mm_key,
                             semantic_base: grant.semantic_base,
                             len: grant.len,
                             fault_va: fault_page,
                             permissions: grant.permissions,
                             ready,
-                        }).unwrap_or_else(|error| fail_frame_grant_publication(
-                            mailbox, request, format!("prepared frame grant cannot publish descriptor: {error}")
-                        )) {
-                            El1FrameGrantPublished::OnHost => {
-                                engine.complete_el1_frame_grant(
-                                    carrick_hal::threaded::El1FrameGrantRollback {
-                                        mm_key: service.mm_key,
-                                        semantic_base: service.semantic_base,
-                                        len: service.len,
-                                        ready,
-                                    },
-                                ).unwrap_or_else(|error| fail_frame_grant_publication(
-                                    mailbox, request, format!("host descriptor cannot complete physical grant: {error}")
-                                ));
-                                Ok::<bool, TrapError>(true)
-                            }
-                            El1FrameGrantPublished::Unsupported
-                            | El1FrameGrantPublished::Refused(_) => Ok(false),
-                            // Keep the physical producer inside this bounded
-                            // mutation scope. EL1's descriptor service and
-                            // exact settlement finish before this executor
-                            // can return to a job-control or ptrace stop.
-                            El1FrameGrantPublished::Submit(txn) => {
-                                let slots = carrick_el1_abi::descriptor_txn_slots_host()
-                                    .unwrap_or_else(|| fail_frame_grant_publication(
-                                        mailbox, request, "prepared frame grant has no descriptor slots"
-                                    ));
-                                let verified = match apply_guest_descriptor_txns_now(
-                                    &mut EngineDrainVenue(&mut *engine), slots, &[txn],
-                                ) {
-                                    Ok(mut receipts) => receipts.pop().unwrap_or_else(|| fail_frame_grant_publication(
-                                        mailbox, request, "descriptor service returned no frame grant receipt"
-                                    )),
-                                    Err(carrick_aarch64::descriptor_drain::GuestPublishError::NotApplied { .. }) => {
-                                        return Ok(false);
-                                    }
-                                    Err(carrick_aarch64::descriptor_drain::GuestPublishError::Unsettled(error)) => fail_frame_grant_publication(
-                                        mailbox, request, format!("frame grant descriptor outcome is unsettled: {error}")
-                                    ),
-                                };
-                                engine.complete_el1_frame_grant(
-                                    carrick_hal::threaded::El1FrameGrantRollback {
-                                        mm_key: service.mm_key,
-                                        semantic_base: service.semantic_base,
-                                        len: service.len,
-                                        ready,
-                                    },
-                                ).unwrap_or_else(|error| fail_frame_grant_publication(
-                                    mailbox, request, format!("applied descriptor cannot complete physical grant: {error}")
-                                ));
-                                let protection = carrick_abi::LinuxProtFlags::from_bits_truncate(service.permissions);
-                                let original = held_plan.borrow_mut().take().unwrap_or_else(|| fail_frame_grant_publication(
-                                    mailbox, request, "fault plan was already consumed before receipt settlement"
-                                ));
-                                let publication = dispatcher.published_frame_grant_plan(
+                        })
+                        .unwrap_or_else(|error| {
+                            fail_publication(format!(
+                                "prepared frame grant cannot publish descriptor: {error}"
+                            ))
+                        });
+                    match publication {
+                        El1FrameGrantPublished::OnHost => {
+                            engine
+                                .complete_el1_frame_grant(backing)
+                                .unwrap_or_else(|error| {
+                                    fail_publication(format!(
+                                        "host descriptor cannot complete physical grant: {error}"
+                                    ))
+                                });
+                            Ok::<bool, TrapError>(true)
+                        }
+                        El1FrameGrantPublished::Unsupported => {
+                            decline_publication(FrameGrantDecision::PublishUnsupported)
+                        }
+                        El1FrameGrantPublished::Refused(reason) => {
+                            decline_publication(FrameGrantDecision::PublishRefused(reason))
+                        }
+                        // Keep the physical producer inside this bounded
+                        // mutation scope. EL1's descriptor service and
+                        // exact settlement finish before this executor
+                        // can return to a job-control or ptrace stop.
+                        El1FrameGrantPublished::Submit(txn) => {
+                            let slots = carrick_el1_abi::descriptor_txn_slots_host()
+                                .unwrap_or_else(|| {
+                                    fail_publication(
+                                        "prepared frame grant has no descriptor slots".into(),
+                                    )
+                                });
+                            use carrick_aarch64::descriptor_drain::{
+                                CleanRefusal, GuestPublishError,
+                            };
+                            let verified = match apply_guest_descriptor_txns_now(
+                                &mut EngineDrainVenue(&mut *engine),
+                                slots,
+                                &[txn],
+                            ) {
+                                Ok(mut receipts) => receipts.pop().unwrap_or_else(|| {
+                                    fail_publication(
+                                        "descriptor service returned no frame grant receipt".into(),
+                                    )
+                                }),
+                                Err(GuestPublishError::NotApplied { outcome, .. }) => {
+                                    let decision = match outcome {
+                                        CleanRefusal::Refused(reason) => {
+                                            FrameGrantDecision::DescriptorRefused(reason)
+                                        }
+                                        CleanRefusal::RolledBack(reason) => {
+                                            FrameGrantDecision::DescriptorRolledBack(reason)
+                                        }
+                                    };
+                                    return decline_publication(decision);
+                                }
+                                Err(GuestPublishError::Unsettled(error)) => fail_publication(
+                                    format!("frame grant descriptor outcome is unsettled: {error}"),
+                                ),
+                            };
+                            engine
+                                .complete_el1_frame_grant(backing)
+                                .unwrap_or_else(|error| {
+                                    fail_publication(format!(
+                                        "applied descriptor cannot complete physical grant: {error}"
+                                    ))
+                                });
+                            let protection = carrick_abi::LinuxProtFlags::from_bits_truncate(
+                                service.permissions,
+                            );
+                            let original = held_plan.borrow_mut().take().unwrap_or_else(|| {
+                                fail_publication(
+                                    "fault plan was already consumed before receipt settlement"
+                                        .into(),
+                                )
+                            });
+                            let publication = dispatcher.published_frame_grant_plan(
                                     &permit, original, residency_identity, protection, &verified,
-                                ).unwrap_or_else(|refusal| fail_frame_grant_publication(
-                                    mailbox, request, format!("applied descriptor cannot settle faulting page at 0x{address:x}: {refusal:?}")
-                                ));
-                                *settled_plan.borrow_mut() = Some(publication);
-                                Ok(true)
-                            }
+                                ).unwrap_or_else(|refusal| { fail_publication(format!("applied descriptor cannot settle faulting page at 0x{address:x}: {refusal:?}")) });
+                            *settled_plan.borrow_mut() = Some(publication);
+                            Ok(true)
                         }
-                    },
-                    || {
-                        if let Some(publication) = settled_plan.borrow_mut().take() {
-                            dispatcher.commit_published_frame_grant(publication, residency_identity);
-                        } else {
-                            // Host descriptors already settled during publish.
-                            // The same plan retains alias exclusion until
-                            // residency is committed below.
-                            let original = held_plan.borrow_mut().take().unwrap_or_else(|| fail_frame_grant_publication(
-                                mailbox, request, "fault plan was already consumed before host residency commit"
-                            ));
-                            dispatcher.commit_published_frame_grant(original, residency_identity);
-                        }
-                    },
-                ).unwrap_or_else(|error| fail_frame_grant_publication(
-                    mailbox, request, format!("frame grant mailbox could not complete publication: {error}")
-                ));
-                if !completed {
+                    }
+                };
+                let commit = || {
+                    if let Some(publication) = settled_plan.borrow_mut().take() {
+                        dispatcher.commit_published_frame_grant(publication, residency_identity);
+                    } else {
+                        // Host descriptors already settled during publish.
+                        // The same plan retains alias exclusion until
+                        // residency is committed below.
+                        let original = held_plan.borrow_mut().take().unwrap_or_else(|| {
+                            fail_publication(
+                                "fault plan was already consumed before host residency commit"
+                                    .into(),
+                            )
+                        });
+                        dispatcher.commit_published_frame_grant(original, residency_identity);
+                    }
+                };
+                let completed = mailbox
+                    .complete_grant(
+                        carrick_el1_abi::FrameGrantReady {
+                            mm_key: request.mm_key,
+                            request_generation: request.request_generation,
+                            semantic_base: service.semantic_base,
+                            physical_ipa: ready.physical_ipa,
+                            len: service.len,
+                            permissions: service.permissions,
+                            frame_id: ready.frame_id,
+                            mapping_id: ready.mapping_id,
+                            owner_generation: ready.owner_generation,
+                            inventory_revision: ready.inventory_revision,
+                        },
+                        publish,
+                        commit,
+                    )
+                    .unwrap_or_else(|error| {
+                        fail_publication(format!(
+                            "frame grant mailbox could not complete publication: {error}"
+                        ))
+                    });
+                use carrick_el1_abi::FrameGrantCompletion;
+                match completed {
+                    FrameGrantCompletion::SlotNotWorking => {
+                        record_decision(FrameGrantDecision::MailboxSlotNotWorking)
+                    }
+                    FrameGrantCompletion::StaleRequest => {
+                        record_decision(FrameGrantDecision::MailboxStaleRequest)
+                    }
+                    FrameGrantCompletion::InvalidReady => {
+                        record_decision(FrameGrantDecision::MailboxInvalidReady)
+                    }
+                    FrameGrantCompletion::Published | FrameGrantCompletion::PublicationDeclined => {
+                    }
+                }
+                if completed != FrameGrantCompletion::Published {
                     // Nothing exposed the prepared backing: undo exactly what
                     // `prepare_el1_frame_grant` published before refusing.
                     engine
-                        .roll_back_el1_frame_grant(carrick_hal::threaded::El1FrameGrantRollback {
-                            mm_key: service.mm_key,
-                            semantic_base: service.semantic_base,
-                            len: service.len,
-                            ready,
-                        })
+                        .roll_back_el1_frame_grant(backing)
                         .unwrap_or_else(|error| {
-                            fail_frame_grant_publication(
-                                mailbox,
-                                request,
-                                format!("refused frame grant cannot roll back backing: {error}"),
-                            )
+                            fail_publication(format!(
+                                "refused frame grant cannot roll back backing: {error}"
+                            ))
                         });
                     publish_frame_grant_refusal(
                         mailbox,
