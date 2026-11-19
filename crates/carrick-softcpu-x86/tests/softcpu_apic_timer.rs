@@ -946,6 +946,62 @@ fn block_tsc_clock_counts_guest_work_and_wakes_hlt_at_the_deadline() {
 }
 
 #[test]
+fn execution_loop_bounds_host_stall_while_hlt_still_waits_on_host() {
+    let (mut machine, data_frame, isr_frame) = setup_apic_machine(0, &[0xe6, 0x80, 0xfb, 0xf4]); // out 0x80, al; sti; hlt
+    machine.mem_mut().write_gpa(isr_frame.raw(), &[0xe6, 0x81]); // out 0x81, al
+    machine.mem_mut().write_gpa(
+        data_frame.raw() + 0x100 + 0xef * 16,
+        &idt_gate64(ISR_VA, 0x08, 0, 0, true, false),
+    );
+    let ticks_per_block = 100;
+    machine.set_block_tsc_clock(NonZeroU64::new(ticks_per_block).unwrap());
+    let ctx = machine.context_mut();
+    ctx.rflags &= !(1 << 9);
+    ctx.lapic_mmio_write(LAPIC_SVR_OFFSET, &0x1ffu32.to_le_bytes());
+    ctx.lapic_mmio_write(
+        LAPIC_LVT_TIMER_OFFSET,
+        &(LAPIC_LVT_TIMER_MODE_TSC_DEADLINE | 0xef).to_le_bytes(),
+    );
+    let tsc_hz = 1_000_000_000u64;
+    let caps = carrick_softcpu_x86::MsrCapabilities::from_cpuid(
+        &GuestCpuidView::default().with_tsc(carrick_x86::TscCrystalRatio::from_hz(tsc_hz)),
+    );
+    let clock = Arc::clone(ctx.msrs().clock().unwrap());
+    clock.enter_execution_loop(tsc_hz);
+    let initial = machine.context().now_tsc();
+    // Arm a 2 ms deadline (2,000,000 ticks at 1 GHz) and stall the host for 6 ms
+    // inside the active execution loop before retiring a single 100-tick block.
+    let short_deadline = initial + 2_000_000;
+    machine
+        .context_mut()
+        .write_msr(MSR_IA32_TSC_DEADLINE, short_deadline, caps)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(6));
+    assert!(matches!(
+        machine.step().unwrap(),
+        Some(SoftMachineExit::IoOut { port: 0x80, .. })
+    ));
+    assert_eq!(machine.context().now_tsc(), initial + ticks_per_block);
+    assert_eq!(machine.context().lapic().timer_fire_count(), 0);
+
+    // Arm a 60 ms deadline and enter HLT inside the execution loop: HLT must
+    // temporarily leave the execution loop and wait on real host monotonic time.
+    let hlt_start = std::time::Instant::now();
+    let hlt_deadline = machine.context().now_tsc() + 60_000_000;
+    machine
+        .context_mut()
+        .write_msr(MSR_IA32_TSC_DEADLINE, hlt_deadline, caps)
+        .unwrap();
+    assert_eq!(machine.step().unwrap(), None); // STI; shadow covers HLT.
+    assert_eq!(machine.step().unwrap(), None); // HLT waits on host time, then delivers 0xef.
+    assert!(hlt_start.elapsed() >= Duration::from_millis(50));
+    assert!(machine.context().now_tsc() >= hlt_deadline);
+    assert_eq!(machine.context().rip, ISR_VA);
+    assert_eq!(machine.context().lapic().timer_fire_count(), 1);
+    clock.leave_execution_loop(tsc_hz);
+}
+
+#[test]
 fn periodic_timer_coalesces_missed_periods_without_catchup_deliveries() {
     for missed in [1u64, 1_000, 1_000_000_000] {
         let mut apic = LocalApic::new(0);

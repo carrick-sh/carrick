@@ -186,6 +186,20 @@ impl SoftRunner {
             });
             return None;
         }
+        struct ExecutionLoopGuard(Option<(Arc<dyn carrick_softcpu_x86::TscClock>, u64)>);
+        impl Drop for ExecutionLoopGuard {
+            fn drop(&mut self) {
+                if let Some((clock, tsc_hz)) = self.0.take() {
+                    clock.leave_execution_loop(tsc_hz);
+                }
+            }
+        }
+        let loop_clock = self.machine.context().msrs().clock().cloned().map(|clock| {
+            let tsc_hz = self.machine.context().tsc_hz();
+            clock.enter_execution_loop(tsc_hz);
+            (clock, tsc_hz)
+        });
+        let _loop_guard = ExecutionLoopGuard(loop_clock);
         loop {
             if kicked.is_some_and(|kick| kick.swap(false, Ordering::AcqRel)) {
                 self.trace.stop = Some(SoftStop::Kicked);

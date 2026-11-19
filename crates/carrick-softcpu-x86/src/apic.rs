@@ -161,6 +161,17 @@ pub trait TscClock: Send + Sync + fmt::Debug {
     /// Account for a guest block that ran, including a block that ended in a guest fault.
     fn account_block(&self) {}
 
+    /// Enters an active guest block-execution loop (such as `SoftRunner::run`).
+    /// Clocks with a per-block progress floor cap host wall-clock advance across
+    /// the loop to the retired block floor so host translation or OS scheduling
+    /// latency does not expire guest timer slices before user instructions retire,
+    /// while parked `HLT` (`wait_until`) and stopped intervals advance at full
+    /// host monotonic rate.
+    fn enter_execution_loop(&self, _tsc_hz: u64) {}
+
+    /// Leaves an active guest block-execution loop opened by [`Self::enter_execution_loop`].
+    fn leave_execution_loop(&self, _tsc_hz: u64) {}
+
     /// Waits until `ready` reports a deliverable interrupt, the deadline, or `max_wait`.
     ///
     /// Notifications enroll under the node lock; stale kicks and masked IRR do not bypass parking.
@@ -185,6 +196,9 @@ pub struct MonotonicTscClock {
     anchor: Instant,
     block_ticks: AtomicU64,
     ticks_per_block: u64,
+    discounted_host_ticks: AtomicU64,
+    loop_start_raw_plus_one: AtomicU64,
+    loop_start_block_ticks: AtomicU64,
 }
 
 impl MonotonicTscClock {
@@ -200,10 +214,13 @@ impl MonotonicTscClock {
             anchor: Instant::now(),
             block_ticks: AtomicU64::new(0),
             ticks_per_block,
+            discounted_host_ticks: AtomicU64::new(0),
+            loop_start_raw_plus_one: AtomicU64::new(0),
+            loop_start_block_ticks: AtomicU64::new(0),
         }
     }
 
-    fn host_tsc(&self, tsc_hz: u64) -> u64 {
+    fn raw_host_tsc(&self, tsc_hz: u64) -> u64 {
         let ticks = self
             .anchor
             .elapsed()
@@ -212,6 +229,21 @@ impl MonotonicTscClock {
             / 1_000_000_000;
         self.base_tsc
             .saturating_add(u64::try_from(ticks).unwrap_or(u64::MAX))
+    }
+
+    fn host_tsc(&self, tsc_hz: u64) -> u64 {
+        let raw = self.raw_host_tsc(tsc_hz);
+        let mut discounted = self.discounted_host_ticks.load(Ordering::Acquire);
+        let start_plus_one = self.loop_start_raw_plus_one.load(Ordering::Acquire);
+        if start_plus_one != 0 {
+            let raw_delta = raw.saturating_sub(start_plus_one - 1);
+            let block_delta = self
+                .block_ticks
+                .load(Ordering::Acquire)
+                .saturating_sub(self.loop_start_block_ticks.load(Ordering::Acquire));
+            discounted = discounted.saturating_add(raw_delta.saturating_sub(block_delta));
+        }
+        raw.saturating_sub(discounted)
     }
 }
 
@@ -224,14 +256,49 @@ impl Default for MonotonicTscClock {
 impl TscClock for MonotonicTscClock {
     fn now_tsc(&self, tsc_hz: u64) -> u64 {
         self.host_tsc(tsc_hz)
-            .max(self.block_ticks.load(Ordering::Relaxed))
+            .max(self.block_ticks.load(Ordering::Acquire))
     }
 
     fn account_block(&self) {
         if self.ticks_per_block != 0 {
             self.block_ticks
-                .fetch_add(self.ticks_per_block, Ordering::Relaxed);
+                .fetch_add(self.ticks_per_block, Ordering::AcqRel);
         }
+    }
+
+    fn enter_execution_loop(&self, tsc_hz: u64) {
+        if self.ticks_per_block == 0 || self.loop_start_raw_plus_one.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let raw = self.raw_host_tsc(tsc_hz);
+        let host_now = raw.saturating_sub(self.discounted_host_ticks.load(Ordering::Acquire));
+        let synced_blocks = self
+            .block_ticks
+            .fetch_max(host_now, Ordering::AcqRel)
+            .max(host_now);
+        self.loop_start_block_ticks
+            .store(synced_blocks, Ordering::Release);
+        self.loop_start_raw_plus_one
+            .store(raw.saturating_add(1), Ordering::Release);
+    }
+
+    fn leave_execution_loop(&self, tsc_hz: u64) {
+        let start_plus_one = self.loop_start_raw_plus_one.load(Ordering::Acquire);
+        if start_plus_one == 0 {
+            return;
+        }
+        let raw = self.raw_host_tsc(tsc_hz);
+        let raw_delta = raw.saturating_sub(start_plus_one - 1);
+        let block_delta = self
+            .block_ticks
+            .load(Ordering::Acquire)
+            .saturating_sub(self.loop_start_block_ticks.load(Ordering::Acquire));
+        let excess = raw_delta.saturating_sub(block_delta);
+        if excess != 0 {
+            self.discounted_host_ticks
+                .fetch_add(excess, Ordering::AcqRel);
+        }
+        self.loop_start_raw_plus_one.store(0, Ordering::Release);
     }
 
     fn wait_until(
@@ -242,12 +309,33 @@ impl TscClock for MonotonicTscClock {
         max_wait: Duration,
         ready: &dyn Fn() -> bool,
     ) -> bool {
+        struct ReenterExecutionLoop<'a> {
+            clock: &'a MonotonicTscClock,
+            tsc_hz: u64,
+            reenter: bool,
+        }
+        impl Drop for ReenterExecutionLoop<'_> {
+            fn drop(&mut self) {
+                if self.reenter {
+                    self.clock.enter_execution_loop(self.tsc_hz);
+                }
+            }
+        }
+        let was_in_loop = self.loop_start_raw_plus_one.load(Ordering::Acquire) != 0;
+        if was_in_loop {
+            self.leave_execution_loop(tsc_hz);
+        }
+        let _reenter = ReenterExecutionLoop {
+            clock: self,
+            tsc_hz,
+            reenter: was_in_loop,
+        };
         if ready() {
             return true;
         }
         let host_tsc = self.host_tsc(tsc_hz);
         if let Some(deadline) = deadline_tsc
-            && host_tsc.max(self.block_ticks.load(Ordering::Relaxed)) >= deadline
+            && host_tsc.max(self.block_ticks.load(Ordering::Acquire)) >= deadline
         {
             return true;
         }
