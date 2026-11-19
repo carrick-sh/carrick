@@ -160,6 +160,32 @@ fn serial_host_native_child_advisory_mmap_stays_in_ring() {
     );
 }
 
+#[test]
+fn serial_host_native_exec_successor_advisory_mmap_stays_in_ring() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let code_range =
+        native_exit_fixture_with_flags("native_child_mmap_hint.S", &["-DEXEC_SUCCESSOR"]);
+    carrick_test_support::executable::write_executable_mode(&successor, &code_range, 0o700);
+    let path = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_fork_exec.S", &[&path]);
+    let outcome = run_exec_fixture(&elf, 128);
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        outcome.run.exit_code,
+        0,
+        "exec successor: mmap errno plus 100. mmap served={}, refused={}, anonymous leaves={:?}",
+        load(&counters.served[9]),
+        load(&counters.refused[9]),
+        counters.anonymous_leaves.each_ref().map(load),
+    );
+}
+
 // Production child entropy service, including CPL0 entry and host completion.
 #[test]
 fn serial_host_native_child_getrandom_default_returns_eight_bytes() {

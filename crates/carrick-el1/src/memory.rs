@@ -2,7 +2,8 @@
 
 pub mod reservations;
 
-use carrick_core::mm::reservation::ReservationGeometry;
+use carrick_core::mm::reservation::{AnonymousHintVenue, ReservationGeometry};
+use carrick_core_abi::service::ServiceOrigin;
 use carrick_el1_abi::CurrentTask;
 #[cfg(test)]
 use carrick_el1_abi::TrapFrame;
@@ -59,11 +60,38 @@ const MAP_SHARED: u64 = 0x01;
 const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
+#[cfg(test)]
 const MAP_GROWSDOWN: u64 = 0x0100;
 const MAP_NORESERVE: u64 = 0x4000;
 const MAP_STACK: u64 = 0x20000;
-const MAP_HUGETLB: u64 = 0x40000;
 const MAP_FIXED_NOREPLACE: u64 = 0x100000;
+
+// MAP_STACK, MAP_DENYWRITE and MAP_EXECUTABLE do not affect anonymous
+// ownership. MAP_NORESERVE changes swap reservation and leaves backing lazy.
+const DELEGATED_MMAP_FLAGS: u64 = MAP_PRIVATE
+    | MAP_ANONYMOUS
+    | MAP_FIXED
+    | MAP_FIXED_NOREPLACE
+    | MAP_STACK
+    | MAP_NORESERVE
+    | 0x0800 // MAP_DENYWRITE
+    | 0x1000; // MAP_EXECUTABLE
+
+fn private_anonymous_mmap(flags: u64) -> bool {
+    flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) == MAP_ANONYMOUS | MAP_PRIVATE
+        && flags & !DELEGATED_MMAP_FLAGS == 0
+}
+
+/// An admitted ring child can complete a non-fixed anonymous reservation
+/// before publishing unrelated completion work from its previous entry.
+pub fn may_complete_advisory_mmap_before_work(flags: u64, protection: u64) -> bool {
+    private_anonymous_mmap(flags)
+        && flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) == 0
+        && matches!(
+            MmapProtectionRoute::decode(protection),
+            MmapProtectionRoute::Reservation(_)
+        )
+}
 
 const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
@@ -244,6 +272,20 @@ pub fn decide_reservation_syscall<
     model: &mut ReservationModel<'_, G, C>,
     file: Option<carrick_el1_abi::HostBackingIdentity>,
 ) -> ReservationDisposition {
+    decide_reservation_syscall_for_origin(frame, current, model, file, ServiceOrigin::Initial)
+}
+
+/// Decide against the same placement venue on initial dispatch and release reprobe.
+pub fn decide_reservation_syscall_for_origin<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    frame: &(impl AnonymousCallView + ?Sized),
+    current: &CurrentTask,
+    model: &mut ReservationModel<'_, G, C>,
+    file: Option<carrick_el1_abi::HostBackingIdentity>,
+    service_origin: ServiceOrigin,
+) -> ReservationDisposition {
     use carrick_el1_abi::{ReservationProtection, ReservationRange};
     use reservations::{Decision, Placement, Refusal};
     let Some(origin) = ReservationOrigin::capture(current) else {
@@ -257,40 +299,16 @@ pub fn decide_reservation_syscall<
         SYS_BRK => model.brk(frame.arguments()[0]),
         SYS_MMAP => {
             let flags = frame.arguments()[3];
-            // `MAP_STACK` is a placement hint with no effect on the mapping
-            // (man 2 mmap); the root serves it as private anonymous memory.
-            // MAP_DENYWRITE and MAP_EXECUTABLE are ignored by Linux (man 2
-            // mmap); the dynamic loader passes MAP_DENYWRITE on its anonymous
-            // image reservation as well as its file segments.
-            // MAP_NORESERVE changes swap reservation, not mapping ownership.
-            // Like the host mmap decoder, keep backing lazy; V8 uses this
-            // hint for its PROT_NONE JIT reservation before mprotect(RWX).
-            const MAP_DENYWRITE: u64 = 0x0800;
-            const MAP_EXECUTABLE: u64 = 0x1000;
-            let supported = MAP_PRIVATE
-                | MAP_ANONYMOUS
-                | MAP_FIXED
-                | MAP_FIXED_NOREPLACE
-                | MAP_STACK
-                | MAP_NORESERVE
-                | MAP_DENYWRITE
-                | MAP_EXECUTABLE;
             let file = match file {
                 Some(source)
                     if flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) == MAP_PRIVATE
-                        && flags & (MAP_GROWSDOWN | MAP_HUGETLB) == 0
-                        && flags & !supported == 0 =>
+                        && flags & !DELEGATED_MMAP_FLAGS == 0 =>
                 {
                     Some(source)
                 }
                 _ => None,
             };
-            if file.is_none()
-                && (flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED)
-                    != MAP_ANONYMOUS | MAP_PRIVATE
-                    || flags & (MAP_GROWSDOWN | MAP_HUGETLB) != 0
-                    || flags & !supported != 0)
-            {
+            if file.is_none() && !private_anonymous_mmap(flags) {
                 return ReservationDisposition::Forward;
             }
             let prot = match MmapProtectionRoute::decode(frame.arguments()[2]) {
@@ -318,6 +336,13 @@ pub fn decide_reservation_syscall<
                     }
                     None => return ReservationDisposition::Return(-EINVAL),
                 },
+                None if service_origin == ServiceOrigin::Descendant => model
+                    .mmap_with_advisory_hint(
+                        placement,
+                        frame.arguments()[1],
+                        prot,
+                        AnonymousHintVenue::Ring,
+                    ),
                 None => model.mmap(placement, frame.arguments()[1], prot),
             }
         }
@@ -1200,6 +1225,13 @@ pub fn drive_return_settlement<
     }
 }
 
+/// Mapping inputs carried by the native adapter across one in-ring attempt.
+#[derive(Clone, Copy)]
+pub struct NativeMapping {
+    pub file: Option<carrick_el1_abi::HostBackingIdentity>,
+    pub origin: ServiceOrigin,
+}
+
 /// brk/mmap/munmap/mprotect for an MM whose shared reservation root is
 /// admitted. The root decides; a `Work` proposal completes in EL1 as one
 /// transaction under the MM's exact editor: a range with no stage-1 backing
@@ -1223,13 +1255,15 @@ pub fn serve_delegated_mapping<
     spaces: SpaceAccess<'_, C>,
     table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
     editor: &mut E,
-    file: Option<carrick_el1_abi::HostBackingIdentity>,
+    mapping: NativeMapping,
 ) -> DelegatedAnonymous {
     let slot = frame.slot().map_or(u32::MAX, |slot| slot.index() as u32);
-    let served = serve_delegated_anonymous(frame, counters, current, spaces, table, editor, file);
+    let served = serve_delegated_anonymous_for_origin(
+        frame, counters, current, spaces, table, editor, mapping,
+    );
     // A retained source this call did not consume (an errno, a refusal or a
     // forward) is retired now; one a committed node holds is unchanged.
-    if let Some(file) = file {
+    if let Some(file) = mapping.file {
         retire_native_sources(current, spaces, table, slot, &[file]);
     }
     served
@@ -1320,6 +1354,34 @@ pub fn serve_delegated_anonymous<
     editor: &mut E,
     file: Option<carrick_el1_abi::HostBackingIdentity>,
 ) -> DelegatedAnonymous {
+    serve_delegated_anonymous_for_origin(
+        frame,
+        counters,
+        current,
+        spaces,
+        table,
+        editor,
+        NativeMapping {
+            file,
+            origin: ServiceOrigin::Initial,
+        },
+    )
+}
+
+#[inline(never)]
+fn serve_delegated_anonymous_for_origin<
+    E: AnonymousDescriptorEditor,
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    frame: &mut (impl AnonymousCallView + ?Sized),
+    counters: &carrick_el1_abi::Counters,
+    current: &CurrentTask,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+    editor: &mut E,
+    mapping: NativeMapping,
+) -> DelegatedAnonymous {
     let nr = frame.canonical().raw();
     let Some((mm, index)) = delegated_anonymous_root(nr, current, spaces, table) else {
         return DelegatedAnonymous::NotDelegated;
@@ -1344,7 +1406,13 @@ pub fn serve_delegated_anonymous<
         }
         Err(_) => return forward(Leave::RootUnavailableStale),
     };
-    let decision = decide_reservation_syscall(frame, current, &mut model, file);
+    let decision = decide_reservation_syscall_for_origin(
+        frame,
+        current,
+        &mut model,
+        mapping.file,
+        mapping.origin,
+    );
     // Node exhaustion is a metadata-capacity request, not a refusal of the
     // Linux operation. Both ISAs use the same allocator and reservation bank
     // publisher. Drop MM custody before allocating, then decide against the
@@ -1384,7 +1452,13 @@ pub fn serve_delegated_anonymous<
             }
             Err(_) => return forward(Leave::RootUnavailableStale),
         };
-        decide_reservation_syscall(frame, current, &mut model, file)
+        decide_reservation_syscall_for_origin(
+            frame,
+            current,
+            &mut model,
+            mapping.file,
+            mapping.origin,
+        )
     } else {
         decision
     };
@@ -2440,7 +2514,10 @@ mod tests {
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(spaces),
                 table,
                 editor,
-                file,
+                NativeMapping {
+                    file,
+                    origin: ServiceOrigin::Initial,
+                },
             );
             assert_eq!(
                 counters.served[nr as usize].load(Ordering::Relaxed),

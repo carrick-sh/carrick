@@ -1979,10 +1979,9 @@ impl MemView<'_> {
             Some((address, stale))
         };
         let reservation_prot = ReservationProtection::from_bits(prot & 7);
-        // A free hint beyond the arena still belongs to this MM's owner.
-        // Validate host-known apertures/VMAs before granting the explicit
-        // external placement authority; the root repeats its collision check.
-        if root_eligible
+        // Validate the host apertures and VMAs before offering external
+        // placement to the same owner that can relocate an advisory hint.
+        let external = if root_eligible
             && !fixed
             && congruence == MmapGrantCongruence::Any
             && let Placement::Hint(hint) = placement
@@ -2006,46 +2005,23 @@ impl MemView<'_> {
                 crate::memory::LINUX_ROSETTA_VA_BASE,
                 crate::memory::LINUX_ROSETTA_VA_BASE
                     .saturating_add(crate::memory::LINUX_ROSETTA_WINDOW_SIZE),
-            )
-            && let Some(protection) = reservation_prot
-        {
-            match self.propose(mem, &root, |model| {
-                model.prepare_external_anonymous(range, protection)
-            })? {
-                Ok(request) => {
-                    let holes = root
-                        .with_root(|model| super::fault::root_holes(model, request.range))
-                        .unwrap_or_else(|refusal| {
-                            broken_root("an external placement observation", refusal)
-                        });
-                    mem.retire_stale_first_touch(&holes);
-                    return Ok(grant(mem, request.range.start()));
-                }
-                Err(Refusal::Limit | Refusal::MetadataRequired) => return Ok(None),
-                Err(_) => {}
-            }
-        }
+            ) {
+            Some(range)
+        } else {
+            None
+        };
         if root_eligible
             && congruence == MmapGrantCongruence::Any
             && let Some(reservation_prot) = reservation_prot
         {
+            use carrick_core::mm::reservation::AnonymousHintVenue;
             match self.propose(mem, &root, |model| {
-                match model.mmap(placement, length, reservation_prot) {
-                    // A rejected advisory hint does not change the mapping's
-                    // owner. In particular a hint into PIE text must relocate
-                    // through this same anonymous owner, rather than acquire
-                    // the opaque placeholder of a host-served mapping.
-                    Err(Refusal::ForeignMapping) if matches!(placement, Placement::Hint(_)) => {
-                        match model.mmap(Placement::Anywhere, length, reservation_prot) {
-                            // A full allocation layout can still have a host
-                            // alias gap. Preserve the existing fallback rather
-                            // than turning this optional relocation into ENOMEM.
-                            Err(Refusal::Limit) => Err(Refusal::ForeignMapping),
-                            result => result,
-                        }
-                    }
-                    result => result,
-                }
+                model.mmap_with_advisory_hint(
+                    placement,
+                    length,
+                    reservation_prot,
+                    AnonymousHintVenue::Host { external },
+                )
             })? {
                 Ok(request) => {
                     // What the root held no node for is fresh memory, however

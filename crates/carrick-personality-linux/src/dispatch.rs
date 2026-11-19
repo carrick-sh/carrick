@@ -280,6 +280,11 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn ipc_available(&self) -> bool {
         false
     }
+    /// A native child with a reservation owner may finish a non-fixed
+    /// private anonymous mmap before publishing earlier completion work.
+    fn may_complete_advisory_mmap_before_work(&self) -> bool {
+        false
+    }
     fn native_descriptor_owner(&self) -> bool {
         false
     }
@@ -1903,6 +1908,8 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         && !owned_yield
         && !owned_allocator_control
         && !owned_continuation
+        && !(family == Family::Anonymous(AnonymousCall::Mmap)
+            && pending.may_complete_advisory_mmap_before_work())
     {
         pending.declined_before_service(ordinal);
         pending.declined_for_work(ordinal);

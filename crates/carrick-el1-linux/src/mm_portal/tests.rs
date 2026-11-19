@@ -4072,7 +4072,13 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
             counters: &counters,
         };
         assert!(matches!(
-            park_anonymous_edit(&mut sched, &mut frame, region.table(), cause),
+            park_anonymous_edit(
+                &mut sched,
+                &mut frame,
+                region.table(),
+                cause,
+                carrick_core_abi::service::ServiceOrigin::Initial
+            ),
             Some(Served::Idle),
         ));
         assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 1);
@@ -4248,6 +4254,7 @@ fn anonymous_contention_then_metadata_provisions_without_park_serial_host() {
             &mut frame,
             region.table(),
             SpaceWaitCause::Reservations,
+            carrick_core_abi::service::ServiceOrigin::Initial,
             &metadata,
             None,
         ),
