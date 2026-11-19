@@ -715,27 +715,6 @@ impl MemState {
                     block_old_host(span.start.raw(), span.end.raw());
                 }
             }
-            for (start, end) in self
-                .resident
-                .within(window_start, window_end, ResidencyOwner::Host)
-            {
-                // A host first-touch record inside the live root node still
-                // names a descriptor that publication must not replace.  A
-                // MAP_FIXED successor clears these records when it replaces
-                // the mapping; while the record survives, clip it as an
-                // occupied neighbour rather than treating the root node as
-                // permission to publish across it.
-                if start < end {
-                    match ReservationRange::new(start, end) {
-                        Some(range) => {
-                            if let Err(error) = exclusions.exclude_occupied(range) {
-                                failure = Some(error);
-                            }
-                        }
-                        None => failure = Some(Refusal::Invalid),
-                    }
-                }
-            }
             for (_, span) in self
                 .prepared_root_grants
                 .iter()
