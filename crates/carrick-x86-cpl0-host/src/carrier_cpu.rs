@@ -813,7 +813,17 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
         if pending_io {
             self.io.complete_pending_io()?;
         }
-        let saved = X86ArchContext::capture(binding, &self.io.read_image()?, resume)?;
+        let image = self.io.read_image()?;
+        let root = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
+            .ok_or_else(|| boundary_error("unaligned detach CR3"))?;
+        let stopped_binding = if root == binding.context().root {
+            binding
+        } else {
+            self.child_bindings
+                .get(root)?
+                .ok_or_else(|| boundary_error("unregistered detach CR3"))?
+        };
+        let saved = X86ArchContext::capture(stopped_binding, &image, resume)?;
         self.io.write_image(&self.neutral)?;
         audit_image(&self.io.read_image()?, &self.neutral)?;
         self.custody = Custody::Idle;
