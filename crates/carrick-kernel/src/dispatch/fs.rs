@@ -1872,10 +1872,8 @@ impl<'a> FsView<'a> {
                     return Err(LINUX_EINVAL);
                 }
             }
-            HostFileOp::SyncFileRange => {
-                if Self::description_lacks_sync_file_range(description) {
-                    return Err(LINUX_ESPIPE);
-                }
+            HostFileOp::SyncFileRange if Self::description_lacks_sync_file_range(description) => {
+                return Err(LINUX_ESPIPE);
             }
             _ => {}
         }
