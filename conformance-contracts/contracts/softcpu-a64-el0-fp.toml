@@ -17,6 +17,8 @@ vm_free = [
   "carrick-softcpu-aarch64::handler::simd_structures_interleave_replicate_and_commit_only_after_read",
   "carrick-softcpu-aarch64::handler::el0_crc32_and_crc32c_match_standard_check_values",
   "carrick-softcpu-aarch64::handler::el0_reads_virtual_cpu_identity_through_the_instruction_handler",
+  "carrick-softcpu-aarch64::handler::el0_physical_counter_obeys_cntkctl_and_uses_the_virtual_clock",
+  "carrick-softcpu-aarch64::stage1::el0_structure_crossing_a_second_page_fault_preserves_state",
   "carrick-softcpu-aarch64::handler::el0_ldadd_raises_undefined_before_accessing_memory",
   "carrick-softcpu-aarch64::dispatch::tests::report_counts_each_el0_undefined_delivery_once_per_run",
 ]
