@@ -150,3 +150,25 @@ obstacle while unclipped neighbour slices retain owner authority. Admitted
 `Refusal::Invalid`. VM-free witnesses prove the shared reservation model and
 production host/ISA dispatch; signed Go test rows still require a signed HVF
 run on macOS.
+
+
+## Fork-child advisory placement (#1846)
+
+A native fork child or its exec successor uses the same anonymous reservation
+owner to relocate an advisory hint outside its allocation layout. The signed
+base capture at `566b1cbe2` returned errno 38 for the 256 MiB PROT_NONE
+reservations with MAP_NORESERVE at hints `0x10000000` and `0x200000000`.
+The live CPL0 fixture also returned 38 on main. The caller's existing
+reservation and editor release sources retain contention and reprobe the
+same placement policy. An exec successor may carry completion work into
+its first syscall. The native entry lets the MM owner finish the non-fixed
+private anonymous mmap, then publishes the result and settles that work at
+the existing completed boundary. Untouched pages remain lazy.
+
+The host keeps its exact external placement and alias search where it can
+validate host VMAs and apertures. A ring-only MM has allocation-layout
+authority and relocates outside hints. Granting it authority to place a new
+range outside the layout requires a proof against the host reservations as
+well as the currently published stage-1 leaves. The regression witnesses
+check successful page-aligned reservations and independent process stores.
+A signed parity run is still required to verify the npm row.
