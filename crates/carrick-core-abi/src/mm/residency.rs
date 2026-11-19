@@ -1,6 +1,7 @@
 //! Exact live residency and retained grant-window custody for either ISA.
 use crate::{
-    ExtentGrantReceipt, MetadataExtent, PinnedMetadataExtent, ReservationMetadataAllocator,
+    ExtentGrantReceipt, MetadataExtent, MetadataExtentResolver, MetadataResolutionError,
+    PinnedMetadataExtent, ReservationMetadataAllocator,
 };
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -309,7 +310,8 @@ struct ResidencyDirectory {
     publishing: AtomicU64,
     count: AtomicU64,
     entries: [SegmentLocationWire; MAX_RESIDENCY_EXTENSIONS],
-    reserved: [u64; 6],
+    retirement_epoch: AtomicU64,
+    reserved: [u64; 5],
 }
 
 impl ResidencyDirectory {
@@ -318,7 +320,8 @@ impl ResidencyDirectory {
             publishing: AtomicU64::new(0),
             count: AtomicU64::new(0),
             entries: [const { SegmentLocationWire::new() }; MAX_RESIDENCY_EXTENSIONS],
-            reserved: [0; 6],
+            retirement_epoch: AtomicU64::new(0),
+            reserved: [0; 5],
         }
     }
 
@@ -328,7 +331,8 @@ impl ResidencyDirectory {
         unsafe {
             core::ptr::addr_of_mut!((*ptr).publishing).write(AtomicU64::new(0));
             core::ptr::addr_of_mut!((*ptr).count).write(AtomicU64::new(0));
-            core::ptr::addr_of_mut!((*ptr).reserved).write([0; 6]);
+            core::ptr::addr_of_mut!((*ptr).retirement_epoch).write(AtomicU64::new(0));
+            core::ptr::addr_of_mut!((*ptr).reserved).write([0; 5]);
             let entries = core::ptr::addr_of_mut!((*ptr).entries).cast::<SegmentLocationWire>();
             for index in 0..MAX_RESIDENCY_EXTENSIONS {
                 entries.add(index).write(SegmentLocationWire::new());
@@ -486,6 +490,7 @@ impl FrameGrantResidencyTable {
     pub unsafe fn guest_view(&self) -> FrameGrantResidencyTable<ResidencyRows<'_>> {
         ResidencyRows {
             bootstrap: &self.storage.bootstrap,
+            directory: &self.storage.directory,
             extensions: ResidencyExtensions::Guest(&self.storage.directory, self.extension_count()),
         }
         .as_table()
@@ -585,6 +590,7 @@ impl FrameGrantResidencyTable {
         Some(
             ResidencyRows {
                 bootstrap: &self.storage.bootstrap,
+                directory: &self.storage.directory,
                 extensions: ResidencyExtensions::Aliases(extensions),
             }
             .as_table(),
@@ -598,16 +604,167 @@ pub struct ResolvedResidencySegment<'a> {
     segment: &'a ResidencySegment,
 }
 
+/// Uninhabited pin for bootstrap-only host venues that have no dynamic
+/// metadata extent resolver.
+pub enum NoDynamicResidencyPin {}
+
+// SAFETY: uninhabited; cannot be instantiated.
+unsafe impl PinnedMetadataExtent for NoDynamicResidencyPin {
+    fn extent(&self) -> MetadataExtent {
+        match *self {}
+    }
+
+    fn host_base(&self) -> core::ptr::NonNull<u8> {
+        match *self {}
+    }
+}
+
+/// Resolver for bootstrap-only host venues: rejects dynamic (`token != 0`)
+/// extensions fail-closed while allowing bootstrap (`token == 0`) aliases.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoDynamicResidencyResolver;
+
+impl MetadataExtentResolver for NoDynamicResidencyResolver {
+    type Pin = NoDynamicResidencyPin;
+
+    fn pin(&self, _extent: MetadataExtent) -> Result<Self::Pin, MetadataResolutionError> {
+        Err(MetadataResolutionError::InvalidExtent)
+    }
+}
+
+/// Host-owned retained aliases for every published residency extension.
+/// Mirrors `ResolvedReservationNodes`: refresh before host retirement,
+/// reconciliation, or census; an unchanged extension count does zero
+/// resolution or allocation work. Construct on the host heap, never on an
+/// EL1/CPL0 supervisor stack.
+pub struct ResolvedResidencyTable<P: PinnedMetadataExtent> {
+    table: *const FrameGrantResidencyTable,
+    count: usize,
+    segments: [*const ResidencySegment; MAX_RESIDENCY_EXTENSIONS],
+    pins: [Option<P>; MAX_RESIDENCY_EXTENSIONS],
+}
+
+// SAFETY: once published in the carrier directory, each segment pointer is
+// immutable and retained by either the carrier bootstrap region or `pins[i]`.
+// Access to records uses atomics only; no `&mut` is ever exposed.
+unsafe impl<P: PinnedMetadataExtent + Send> Send for ResolvedResidencyTable<P> {}
+unsafe impl<P: PinnedMetadataExtent + Sync> Sync for ResolvedResidencyTable<P> {}
+
+impl<P: PinnedMetadataExtent> Default for ResolvedResidencyTable<P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P: PinnedMetadataExtent> ResolvedResidencyTable<P> {
+    pub fn new() -> Self {
+        Self {
+            table: core::ptr::null(),
+            count: 0,
+            segments: [core::ptr::null(); MAX_RESIDENCY_EXTENSIONS],
+            pins: core::array::from_fn(|_| None),
+        }
+    }
+
+    pub fn extension_count(&self) -> usize {
+        self.count
+    }
+
+    pub fn table_ptr(&self) -> *const FrameGrantResidencyTable {
+        self.table
+    }
+
+    /// Resolve any extensions published after the cached prefix. Bootstrap
+    /// extensions (`token == 0`) resolve against `bootstrap` (`(guest_base,
+    /// extent_size, host_base)`); dynamic extensions (`token != 0`) are pinned
+    /// through `resolver`.
+    ///
+    /// # Safety
+    /// `table` and (when provided) `bootstrap` must belong to the same live
+    /// carrier as `resolver` and remain mapped for every borrow of `self`.
+    pub unsafe fn refresh<R: MetadataExtentResolver<Pin = P>>(
+        &mut self,
+        table: &FrameGrantResidencyTable,
+        resolver: &R,
+        bootstrap: Option<(u64, usize, core::ptr::NonNull<u8>)>,
+    ) -> Result<(), MetadataResolutionError> {
+        if !self.table.is_null() && !core::ptr::eq(self.table, table) {
+            return Err(MetadataResolutionError::StaleOwner);
+        }
+        let count = table.extension_count();
+        if count > MAX_RESIDENCY_EXTENSIONS || self.count > count {
+            return Err(MetadataResolutionError::StaleOwner);
+        }
+        while self.count < count {
+            let index = self.count;
+            let location = table
+                .extension_location(index)
+                .ok_or(MetadataResolutionError::StaleOwner)?;
+            let (segment_ptr, pin) = if location.extent.token == 0 {
+                let Some((guest_base, extent_size, host_base)) = bootstrap else {
+                    return Err(MetadataResolutionError::InvalidExtent);
+                };
+                // SAFETY: caller retains the exact carrier bootstrap mapping.
+                let resolved = unsafe {
+                    table.resolve_bootstrap_extension(index, guest_base, extent_size, host_base)
+                }
+                .ok_or(MetadataResolutionError::InvalidExtent)?;
+                (resolved.segment as *const ResidencySegment, None)
+            } else {
+                let extent = MetadataExtent::new(
+                    location.extent.base_va,
+                    location.extent.size as u64,
+                    location.extent.token,
+                )
+                .ok_or(MetadataResolutionError::InvalidExtent)?;
+                let pin = resolver.pin(extent)?;
+                // SAFETY: `pin` retains the exact dynamic extent for `table`'s carrier.
+                let resolved = unsafe { table.resolve_extension(index, &pin) }
+                    .ok_or(MetadataResolutionError::InvalidExtent)?;
+                (resolved.segment as *const ResidencySegment, Some(pin))
+            };
+            self.table = table;
+            self.segments[index] = segment_ptr;
+            self.pins[index] = pin;
+            self.count += 1;
+        }
+        self.table = table;
+        Ok(())
+    }
+
+    /// Borrow a view covering the bootstrap segment and every resolved
+    /// extension prefix. Returns `None` before the first `refresh`.
+    pub fn view(&self) -> Option<FrameGrantResidencyTable<ResidencyRows<'_>>> {
+        if self.table.is_null() {
+            return None;
+        }
+        // SAFETY: `refresh` verified `self.table` and every non-null segment
+        // alias in `self.segments[..self.count]`, and caller/pins retain them
+        // for the entire lifetime of `&self`.
+        let table = unsafe { &*self.table };
+        Some(
+            ResidencyRows {
+                bootstrap: &table.storage.bootstrap,
+                directory: &table.storage.directory,
+                extensions: ResidencyExtensions::Resolved(&self.segments[..self.count]),
+            }
+            .as_table(),
+        )
+    }
+}
+
 /// Venue-local access to the bootstrap and extension storage.
 #[derive(Clone, Copy)]
 pub struct ResidencyRows<'a> {
     bootstrap: &'a ResidencySegment,
+    directory: &'a ResidencyDirectory,
     extensions: ResidencyExtensions<'a>,
 }
 
 #[derive(Clone, Copy)]
 enum ResidencyExtensions<'a> {
     Aliases(&'a [ResolvedResidencySegment<'a>]),
+    Resolved(&'a [*const ResidencySegment]),
     Guest(&'a ResidencyDirectory, usize),
 }
 
@@ -624,9 +781,24 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyAccess for S {}
 
 impl sealed::ResidencyStorage for ResidencyStorage {
     fn rows(&self) -> ResidencyRows<'_> {
-        ResidencyRows {
-            bootstrap: &self.bootstrap,
-            extensions: ResidencyExtensions::Aliases(&[]),
+        #[cfg(target_os = "none")]
+        {
+            ResidencyRows {
+                bootstrap: &self.bootstrap,
+                directory: &self.directory,
+                extensions: ResidencyExtensions::Guest(
+                    &self.directory,
+                    self.directory.count.load(Ordering::Acquire) as usize,
+                ),
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            ResidencyRows {
+                bootstrap: &self.bootstrap,
+                directory: &self.directory,
+                extensions: ResidencyExtensions::Aliases(&[]),
+            }
         }
     }
 }
@@ -641,6 +813,7 @@ impl<'a> ResidencyRows<'a> {
     fn segments(self) -> impl Iterator<Item = &'a ResidencySegment> {
         let count = match self.extensions {
             ResidencyExtensions::Aliases(entries) => entries.len(),
+            ResidencyExtensions::Resolved(entries) => entries.len(),
             ResidencyExtensions::Guest(_, count) => count,
         };
         (0..=count).map_while(move |index| self.segment(index))
@@ -652,6 +825,11 @@ impl<'a> ResidencyRows<'a> {
         };
         match self.extensions {
             ResidencyExtensions::Aliases(entries) => entries.get(index).map(|alias| alias.segment),
+            ResidencyExtensions::Resolved(entries) => entries.get(index).map(|&ptr| {
+                // SAFETY: `ResolvedResidencyTable::refresh` validated each
+                // non-null, aligned segment alias and pins retain it for `'a`.
+                unsafe { &*ptr }
+            }),
             ResidencyExtensions::Guest(directory, count) if index < count => {
                 let location = directory.entries.get(index)?.read();
                 // SAFETY: guest_view requires published allocations to remain
@@ -760,6 +938,36 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
     /// Number of addressable records in this venue's resolved view.
     pub fn slot_capacity(&self) -> usize {
         self.segments().count() * FRAME_GRANT_RESIDENCY_SLOTS
+    }
+
+    /// Monotonic count of committed row retirements across every segment.
+    /// Callers sample this before a refused growth or probe and check it once
+    /// after enrolling on progress.
+    pub fn retirement_epoch(&self) -> u64 {
+        self.storage
+            .rows()
+            .directory
+            .retirement_epoch
+            .load(Ordering::Acquire)
+    }
+
+    /// True while another owner is installing a new extension segment.
+    pub fn is_publishing(&self) -> bool {
+        self.storage
+            .rows()
+            .directory
+            .publishing
+            .load(Ordering::Acquire)
+            != 0
+    }
+
+    /// Number of extension segments published in the directory.
+    pub fn published_extensions(&self) -> usize {
+        self.storage
+            .rows()
+            .directory
+            .count
+            .load(Ordering::Acquire) as usize
     }
 
     /// Diagnostic sample of occupied slots, including in-flight publishers.
@@ -1006,6 +1214,11 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             return false;
         }
         dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        self.storage
+            .rows()
+            .directory
+            .retirement_epoch
+            .fetch_add(1, Ordering::Release);
         true
     }
 
@@ -1229,6 +1442,11 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             return false;
         }
         dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        self.storage
+            .rows()
+            .directory
+            .retirement_epoch
+            .fetch_add(1, Ordering::Release);
         self.publish_retirement_fragments(identity, bits, start, end);
         true
     }
@@ -1445,6 +1663,7 @@ mod tests {
         }];
         let view = ResidencyRows {
             bootstrap: &bootstrap.storage.bootstrap,
+            directory: &bootstrap.storage.directory,
             extensions: ResidencyExtensions::Aliases(&aliases),
         }
         .as_table();
@@ -1629,8 +1848,60 @@ mod tests {
         // SAFETY: pin uses the exact test carrier's allocator venue.
         let aliases = [unsafe { table.resolve_extension(0, &pin) }.unwrap()];
         let host = table.resolved_view(&aliases).unwrap();
+        let epoch_before = table.retirement_epoch();
         assert!(host.retire(slot, pending));
+        assert_eq!(table.retirement_epoch(), epoch_before + 1);
         assert!(view.lookup(pending.mm_key, pending.semantic_base).is_none());
+
+        // ResolvedResidencyTable caches dynamic pins across refreshes and
+        // retires rows across both bootstrap and dynamic segments.
+        struct Resolver {
+            expected: MetadataExtent,
+            pin_calls: Cell<usize>,
+        }
+        impl MetadataExtentResolver for Resolver {
+            type Pin = Pin;
+            fn pin(&self, extent: MetadataExtent) -> Result<Pin, MetadataResolutionError> {
+                self.pin_calls.set(self.pin_calls.get() + 1);
+                if extent != self.expected {
+                    return Err(MetadataResolutionError::InvalidExtent);
+                }
+                Ok(Pin(extent))
+            }
+        }
+        let resolver = Resolver {
+            expected: MetadataExtent::new(extent.base_va, extent.size as u64, extent.token)
+                .unwrap(),
+            pin_calls: Cell::new(0),
+        };
+        let mut resolved = std::boxed::Box::new(ResolvedResidencyTable::new());
+        // SAFETY: table and resolver belong to this fixture for the whole test.
+        unsafe { resolved.refresh(&table, &resolver, None).unwrap() };
+        assert_eq!(resolved.extension_count(), 1);
+        assert_eq!(resolver.pin_calls.get(), 1);
+        // Unchanged generation performs zero re-pinning.
+        unsafe { resolved.refresh(&table, &resolver, None).unwrap() };
+        assert_eq!(resolver.pin_calls.get(), 1);
+        let host_view = resolved.view().unwrap();
+        let second_slot = view.try_publish(pending).expect("re-publish in extension");
+        assert!(second_slot >= FRAME_GRANT_RESIDENCY_SLOTS);
+        assert_eq!(
+            host_view.observed_slots_used(),
+            FRAME_GRANT_RESIDENCY_SLOTS + 1
+        );
+        let total_len = (FRAME_GRANT_RESIDENCY_SLOTS + 1) as u64 * GRANT_PAGE_SIZE;
+        let epoch_before_bulk = host_view.retirement_epoch();
+        assert!(
+            host_view
+                .begin_retire_overlapping(first.mm_key, first.semantic_base, total_len)
+                .expect("retire across bootstrap and dynamic segments")
+                .commit()
+        );
+        assert_eq!(host_view.observed_slots_used(), 0);
+        assert_eq!(
+            host_view.retirement_epoch(),
+            epoch_before_bulk + (FRAME_GRANT_RESIDENCY_SLOTS + 1) as u64
+        );
     }
 
     #[test]
