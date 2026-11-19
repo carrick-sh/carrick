@@ -1168,7 +1168,7 @@ surfaces = [
   { path = "crates/carrick-signal-linux/src/fork_reset.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-signal-linux/src/lib.rs", contract = "kernel.el1.signal-delivery-owner" },
   # arm64 host launch for the aarch64 copy-through engine (#1236); a test-only execution lane, no guest-visible product path yet.
-  { path = "crates/carrick-softcpu-aarch64-host/src/lib.rs", contracts = [] },
+  { path = "crates/carrick-softcpu-aarch64-host/src/lib.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs", contract = "arm.softcpu.cache-hot-set" },
   # Copy-through dispatcher over the ExecuteBlock seam (#1236), driven by the test-only arm64 lane.
   { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "arm.softcpu.cache-hot-set" },
@@ -1186,7 +1186,7 @@ surfaces = [
   # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
   { path = "crates/carrick-softcpu-aarch64/src/state.rs", contracts = [] },
   # Copy-through block splitter and A64 emitter (#1236); pure word translation, nothing executes.
-  { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contracts = [] },
+  { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-x86/examples/scan_unsupported.rs", contracts = [] },
   { path = "crates/carrick-softcpu-x86/src/apic.rs", contract = "x86.softcpu.apic-timer" },
   { path = "crates/carrick-softcpu-x86/src/avx.rs", contract = "x86.softcpu.level0" },

@@ -10,9 +10,7 @@ use carrick_softcpu_aarch64::handler::{
 };
 use carrick_softcpu_aarch64::mmu::Stage1Error;
 use carrick_softcpu_aarch64::state::*;
-use carrick_softcpu_aarch64::translate::{
-    BlockFrame, BlockLimits, GuestInstruction, TranslatedBlock,
-};
+use carrick_softcpu_aarch64::translate::{BlockLimits, GuestInstruction, TranslatedBlock};
 use carrick_softcpu_aarch64::{Gpr, OperandRegister};
 use std::collections::BTreeMap;
 
@@ -316,7 +314,11 @@ fn msr_sctlr_m_retires_under_an_admitted_tcr() {
 struct NoBlocks;
 impl ExecuteBlock for NoBlocks {
     type Error = ();
-    fn execute(&mut self, _: &TranslatedBlock, _: &mut BlockFrame) -> Result<usize, ()> {
+    type Code = ();
+    fn prepare(&mut self, _: &TranslatedBlock) -> Result<(), ()> {
+        panic!("no block may be prepared")
+    }
+    fn execute(&mut self, _: &TranslatedBlock, _: &(), _: &mut CpuState) -> Result<usize, ()> {
         panic!("no block may run")
     }
 }

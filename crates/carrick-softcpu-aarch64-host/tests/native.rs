@@ -17,7 +17,7 @@ use carrick_softcpu_aarch64::state::{
 };
 use carrick_softcpu_aarch64::translate::{BlockFrame, BlockLimits, TranslatedBlock};
 use carrick_softcpu_aarch64::{Gpr, OperandRegister};
-use carrick_softcpu_aarch64_host::{HostBlockRunner, HostError};
+use carrick_softcpu_aarch64_host::{HostBlockRunner, HostCode, HostError};
 use std::collections::BTreeMap;
 
 /// Byte-granular flat guest memory: unmapped bytes fault.
@@ -66,13 +66,20 @@ struct Recording {
 
 impl ExecuteBlock for Recording {
     type Error = HostError;
+    type Code = HostCode;
+
+    fn prepare(&mut self, block: &TranslatedBlock) -> Result<HostCode, HostError> {
+        self.runner.prepare(block)
+    }
+
     fn execute(
         &mut self,
         block: &TranslatedBlock,
-        frame: &mut BlockFrame,
+        code: &HostCode,
+        cpu: &mut CpuState,
     ) -> Result<usize, HostError> {
         self.starts.push(block.guest().start().0);
-        self.runner.execute(block, frame)
+        self.runner.execute(block, code, cpu)
     }
 }
 
