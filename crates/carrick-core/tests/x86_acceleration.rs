@@ -2196,9 +2196,12 @@ fn private_file_4k_grants_scale_past_initial_residency<
     backend: B,
     provision_extensions: bool,
 ) {
-    use carrick_core::mm::frames::{select_backing_window, serve_grant};
+    use carrick_core::mm::frames::{
+        GrantServeOutcome, select_backing_window, serve_grant_with_allocator,
+    };
     use carrick_core_abi::{
-        FRAME_GRANT_RESIDENCY_SLOTS, FrameGrantResidencyTable, PortalGrantSlot,
+        FRAME_GRANT_RESIDENCY_SLOTS, FrameGrantResidencyTable, NoDynamicResidencyResolver,
+        PortalGrantSlot, ResolvedResidencyTable,
     };
     use carrick_el1_abi::{
         EL1_BOOTSTRAP_METADATA_OFFSET, EL1_BOOTSTRAP_METADATA_SIZE,
@@ -2290,21 +2293,26 @@ fn private_file_4k_grants_scale_past_initial_residency<
         &*address
     };
     let allocator = carrick_el1::alloc::MetadataStorage::new();
+    // SAFETY: the bootstrap metadata extent is inside this same region, as in carrier boot.
+    let bootstrap = unsafe { storage_base.add(EL1_BOOTSTRAP_METADATA_OFFSET as usize) };
+    allocator
+        .admit_bootstrap_region(bootstrap as u64, EL1_BOOTSTRAP_METADATA_SIZE as usize)
+        .unwrap();
+    let expected_extensions = (TOTAL_PAGES - 1) / FRAME_GRANT_RESIDENCY_SLOTS;
     if provision_extensions {
-        // SAFETY: the bootstrap metadata extent is inside this same region.
-        let bootstrap = unsafe { storage_base.add(EL1_BOOTSTRAP_METADATA_OFFSET as usize) };
-        allocator
-            .admit_bootstrap_region(bootstrap as u64, EL1_BOOTSTRAP_METADATA_SIZE as usize)
-            .unwrap();
-        for index in 0..(TOTAL_PAGES - 1) / FRAME_GRANT_RESIDENCY_SLOTS {
+        for index in 0..expected_extensions {
             table
                 .grow(&allocator, index)
                 .expect("allocate residency segment");
         }
+        assert_eq!(table.extension_count(), expected_extensions);
+    } else {
+        assert_eq!(
+            table.extension_count(),
+            0,
+            "unprovisioned control must start with bootstrap segment only"
+        );
     }
-    // SAFETY: fixture allocation uses its ambient address and stays mapped
-    // until both the directory and its window transactions are finished.
-    let residency = unsafe { table.guest_view() };
     let handle = portal.admitted_handle(mm, 0).unwrap();
     let wire = PortalGrantSlot::new();
 
@@ -2364,72 +2372,100 @@ fn private_file_4k_grants_scale_past_initial_residency<
             tables: TableGrants::NONE,
         };
         assert!(wire.submit(window, &txn));
-        let receipt = serve_grant(&portal, &wire, &live, &residency, 0, || {})
-            .unwrap()
-            .unwrap();
-        assert!(wire.take_receipt(window, &txn).is_some());
-        if receipt.outcome
-            == DescriptorOutcome::Refused(
-                carrick_mmu_core::descriptor_refusal::DescriptorRefusal::ResidencyCapacity,
-            )
-        {
-            let mut census = [0; 3];
-            residency.inspect_occupied(
-                |row, committed| {
-                    let index = (row.semantic_base.saturating_sub(VA) / 4096) as usize;
-                    // The fixture inventory assigns these exact identities.
-                    // Every earlier transaction had an Applied receipt. Check
-                    // the live descriptor as well as the fixture owner tuple.
-                    spaces.find(row.mm_key).is_some()
-                        && row.mm_key == mm.raw()
-                        && index < page_index
-                        && row.semantic_base == VA + index as u64 * 4096
-                        && row.physical_ipa == IPA + index as u64 * 4096
-                        && row.len == 4096
-                        && row.mapping_id == index as u64 + 1
-                        && row.frame_id == row.mapping_id
-                        && row.owner_generation == 1
-                        && row.inventory_revision == 1
-                        && committed
-                        && matches!(
-                            B::translate(
-                                &live,
-                                B::root(ROOT).unwrap(),
-                                carrick_guest_arch::UserVa::new(row.semantic_base),
-                                carrick_mmu_core::aarch64::LeafAccess::Read,
-                                true,
-                            ),
-                            Ok(Some(leaf)) if leaf.output.raw() == row.physical_ipa
-                        )
-                },
-                |class| {
-                    census[match class {
-                        Some(true) => 0,
-                        Some(false) => 1,
-                        None => 2,
-                    }] += 1;
-                },
-            );
-            assert_eq!(census, [FRAME_GRANT_RESIDENCY_SLOTS, 0, 0]);
-            let [live, leaked, unknown] = census;
-            panic!(
-                "grant {page_index} at {page_va:#x} refused: {:?}; live={live} leaked={leaked} unknown={unknown}",
-                receipt.outcome
-            );
+        // SAFETY: table and allocator share this fixture's guest venue.
+        let outcome = unsafe {
+            serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {})
         }
+        .unwrap();
+        let GrantServeOutcome::Completed(receipt) = outcome else {
+            panic!("grant {page_index} at {page_va:#x} did not complete: {outcome:?}");
+        };
+        assert!(wire.take_receipt(window, &txn).is_some());
         assert!(
             matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
-            "grant {page_index} at {page_va:#x} (slots_used={}) refused: {:?}",
-            residency.observed_slots_used(),
+            "grant {page_index} at {page_va:#x} refused: {:?}",
             receipt.outcome
         );
     }
+
+    assert_eq!(table.extension_count(), expected_extensions);
+
+    // Host reconciliation, census and retirement resolve all segment aliases
+    // through ResolvedResidencyTable rather than reading only bootstrap slots.
+    let mut host_resolved = Box::new(ResolvedResidencyTable::new());
+    // SAFETY: table and bootstrap belong to this fixture for the test lifetime.
+    unsafe {
+        host_resolved
+            .refresh(
+                table,
+                &NoDynamicResidencyResolver,
+                Some((
+                    bootstrap as u64,
+                    EL1_BOOTSTRAP_METADATA_SIZE as usize,
+                    core::ptr::NonNull::new(bootstrap).unwrap(),
+                )),
+            )
+            .expect("host resolves all grown bootstrap segments");
+    }
+    assert_eq!(host_resolved.extension_count(), expected_extensions);
+    let host_view = host_resolved.view().expect("resolved host view");
+
+    // Census every occupied row across all segments: live=TOTAL_PAGES, leaked=0, unknown=0.
+    let mut census = [0usize; 3];
+    host_view.inspect_occupied(
+        |row, committed| {
+            let index = (row.semantic_base.saturating_sub(VA) / 4096) as usize;
+            spaces.find(row.mm_key).is_some()
+                && row.mm_key == mm.raw()
+                && index < TOTAL_PAGES
+                && row.semantic_base == VA + index as u64 * 4096
+                && row.physical_ipa == IPA + index as u64 * 4096
+                && row.len == 4096
+                && row.mapping_id == index as u64 + 1
+                && row.frame_id == row.mapping_id
+                && row.owner_generation == 1
+                && row.inventory_revision == 1
+                && committed
+                && matches!(
+                    B::translate(
+                        &live,
+                        B::root(ROOT).unwrap(),
+                        carrick_guest_arch::UserVa::new(row.semantic_base),
+                        carrick_mmu_core::aarch64::LeafAccess::Read,
+                        true,
+                    ),
+                    Ok(Some(leaf)) if leaf.output.raw() == row.physical_ipa
+                )
+        },
+        |class| {
+            census[match class {
+                Some(true) => 0,
+                Some(false) => 1,
+                None => 2,
+            }] += 1;
+        },
+    );
+    assert_eq!(
+        census,
+        [TOTAL_PAGES, 0, 0],
+        "expected live={TOTAL_PAGES} leaked=0 unknown=0 across all segments"
+    );
+
+    // Host dirty reconciliation acknowledges every committed row across all segments.
+    let mut reconciled = 0usize;
+    let _: core::ops::ControlFlow<()> = host_view.for_each_dirty_mm(mm.raw(), |slot, row, bits| {
+        assert_eq!(bits[0], 1);
+        assert!(host_view.ack_dirty(slot, row));
+        reconciled += 1;
+        core::ops::ControlFlow::Continue(())
+    });
+    assert_eq!(reconciled, TOTAL_PAGES);
 
     // Every single-page residency record remains live and committed while mapped;
     // neither commit nor a wider candidate window supersedes published slots.
     for page_index in 0..TOTAL_PAGES {
         let page_va = VA + page_index as u64 * 4096;
-        assert!(residency.is_guest_committed(mm.raw(), page_va));
+        assert!(host_view.is_guest_committed(mm.raw(), page_va));
     }
     let bulk_candidate = carrick_core_abi::PortalGrantWindow {
         operation: carrick_core_abi::PortalOperation {
@@ -2450,12 +2486,322 @@ fn private_file_4k_grants_scale_past_initial_residency<
         Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::AlreadyValid)
     );
 
-    // Explicit munmap retirement releases all slots across every segment.
-    let retirement = residency
+    // Explicit host munmap retirement through resolved segment aliases releases
+    // all slots across every segment with zero leaked rows.
+    let retirement = host_view
         .begin_retire_overlapping(mm.raw(), VA, TOTAL_PAGES as u64 * 4096)
         .expect("no active transfer pins");
     assert!(retirement.commit());
-    assert_eq!(residency.observed_slots_used(), 0);
+    assert_eq!(host_view.observed_slots_used(), 0);
+    let mut post_retire_census = 0usize;
+    host_view.inspect_occupied(|_, _| (), |_| post_retire_census += 1);
+    assert_eq!(post_retire_census, 0);
+}
+
+fn residency_growth_refused_once_then_succeeds<B: carrick_mmu_core::owner_mmu::OwnerGrantMmu>(
+    x86: bool,
+    backend: B,
+) {
+    use carrick_core::mm::frames::{GrantServeOutcome, serve_grant_with_allocator};
+    use carrick_core_abi::{
+        ExtentGrantReceipt, FRAME_GRANT_RESIDENCY_SLOTS, FrameGrantResidencyTable,
+        NoDynamicResidencyResolver, PortalGrantSlot, ReservationMetadataAllocator,
+        ResidencyGrowthRefusal, ResolvedResidencyTable,
+    };
+    use carrick_el1_abi::{
+        EL1_BOOTSTRAP_METADATA_OFFSET, EL1_BOOTSTRAP_METADATA_SIZE,
+        EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+    };
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
+        TableGrants,
+    };
+    use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+    use carrick_test_support::TestEl1Region;
+    use core::cell::Cell;
+
+    const TOTAL_PAGES: usize = FRAME_GRANT_RESIDENCY_SLOTS * 2 + 1;
+    const L2_TABLES: usize = TOTAL_PAGES.div_ceil(512);
+
+    struct GatedAllocator<'a> {
+        inner: &'a carrick_el1::alloc::MetadataStorage,
+        refuse_next: Cell<bool>,
+    }
+    // SAFETY: delegates to MetadataStorage which retains bootstrap allocations.
+    unsafe impl ReservationMetadataAllocator for GatedAllocator<'_> {
+        fn allocate_with_extent(
+            &self,
+            layout: core::alloc::Layout,
+        ) -> Option<(*mut u8, ExtentGrantReceipt)> {
+            if self.refuse_next.get() {
+                return None;
+            }
+            self.inner.allocate_with_extent(layout)
+        }
+        fn deallocate(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+            self.inner.deallocate(ptr, layout);
+        }
+    }
+
+    let mut region = Region::new();
+    region.add_bank();
+    let spaces = AddressSpaces::new();
+    let nz = |n| NonZeroU64::new(n).unwrap();
+    let mm_id = 1;
+    let index = spaces.publish_closed(mm_id, ROOT, ROOT).unwrap();
+    let mm = carrick_core_abi::ReservationMm::new(mm_id).unwrap();
+    region
+        .table()
+        .publish(
+            index.index(),
+            mm,
+            carrick_el1::memory::reservations::Layout {
+                heap: carrick_core_abi::ReservationRange::new(4096, VA).unwrap(),
+                arena: carrick_core_abi::ReservationRange::new(VA, VA + 0x1000_0000).unwrap(),
+                brk: 4096,
+                address_limit: u64::MAX,
+                data_limit: u64::MAX,
+                external_address_bytes: 0,
+                external_data_bytes: 0,
+            },
+        )
+        .unwrap();
+    let view = nodes(&region);
+    {
+        let mut owner = region
+            .table()
+            .lock_el1_resolved_with_context::<NoPin, carrick_el1_abi::Aarch64ParkedContext>(
+                index.index(),
+                mm,
+                &view,
+                0,
+            )
+            .unwrap();
+        owner
+            .import_with_backing(
+                carrick_core_abi::ReservationRange::new(VA, VA + TOTAL_PAGES as u64 * 4096)
+                    .unwrap(),
+                carrick_core_abi::ReservationProtection::READ_WRITE,
+                carrick_core_abi::ReservationNodeFlags::EMPTY,
+                carrick_core_abi::HostBackingIdentity::new(nz(1), nz(1), 0),
+            )
+            .unwrap();
+        owner.finish_import().unwrap();
+    }
+    spaces.open(index);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view).with_mmu(backend);
+    let tables = Tables::new(ROOT, IPA, 0);
+    if x86 {
+        tables.words[0].store((ROOT + 4096) | PRESENT | WRITE | USER, Ordering::Release);
+        tables.words[512 + 1].store((ROOT + 8192) | PRESENT | WRITE | USER, Ordering::Release);
+        for pd in 0..L2_TABLES {
+            tables.words[1024 + pd].store(
+                (ROOT + (3 + pd as u64) * 4096) | PRESENT | WRITE | USER,
+                Ordering::Release,
+            );
+        }
+    } else {
+        for l2 in 0..L2_TABLES {
+            tables.words[1024 + l2].store((ROOT + (3 + l2 as u64) * 4096) | 3, Ordering::Release);
+        }
+    }
+    let live = tables.live(&CallerInvalidatesAsid);
+    let mut storage = TestEl1Region::zeroed();
+    let storage_base = storage.as_mut_ptr();
+    let table = unsafe {
+        let address = storage_base
+            .add(EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize)
+            .cast::<FrameGrantResidencyTable>();
+        FrameGrantResidencyTable::init_in_place(address);
+        &*address
+    };
+    let backing_allocator = carrick_el1::alloc::MetadataStorage::new();
+    let bootstrap = unsafe { storage_base.add(EL1_BOOTSTRAP_METADATA_OFFSET as usize) };
+    backing_allocator
+        .admit_bootstrap_region(bootstrap as u64, EL1_BOOTSTRAP_METADATA_SIZE as usize)
+        .unwrap();
+    let allocator = GatedAllocator {
+        inner: &backing_allocator,
+        refuse_next: Cell::new(true),
+    };
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let wire = PortalGrantSlot::new();
+
+    let submit_page = |page_index: usize| {
+        let page_va = VA + page_index as u64 * 4096;
+        let page_ipa = IPA + page_index as u64 * 4096;
+        let transfer = portal
+            .begin(
+                handle,
+                GuestVa::new(page_va),
+                1,
+                TransferIntent::UserRead,
+                0,
+            )
+            .unwrap();
+        let TransferStep::Supply(window) = portal
+            .select(
+                &transfer,
+                &live,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: table,
+                    slot: 0,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected 4 KiB supply at page {page_index}");
+        };
+        let id = nz(page_index as u64 + 1);
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: nz(mm.raw()),
+                generation: id,
+            },
+            root: SubstrateGpa(ROOT),
+            op: DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: page_va,
+                    ipa: page_ipa,
+                    len: 4096,
+                    writable: true,
+                    executable: false,
+                },
+                resident: PageSpan::new(page_va, 4096),
+                backing: BackingIdentity {
+                    frame_id: id,
+                    mapping_id: id,
+                    owner_generation: nz(1),
+                    inventory_revision: nz(1),
+                },
+            },
+            tables: TableGrants::NONE,
+        };
+        assert!(wire.submit(window, &txn));
+        (window, txn)
+    };
+
+    // Fill the bootstrap 4,096 slots cleanly.
+    for page_index in 0..FRAME_GRANT_RESIDENCY_SLOTS {
+        let (window, txn) = submit_page(page_index);
+        let outcome = unsafe {
+            serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {})
+        }
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            GrantServeOutcome::Completed(receipt)
+                if matches!(receipt.outcome, DescriptorOutcome::Applied(_))
+        ));
+        assert!(wire.take_receipt(window, &txn).is_some());
+    }
+    assert_eq!(table.extension_count(), 0);
+
+    // 4,097th grant while allocator refuses: typed NotNow, no terminal receipt,
+    // descriptor claim released back to SUBMITTED so host withdrawal or retry works.
+    let (window_4096, txn_4096) = submit_page(FRAME_GRANT_RESIDENCY_SLOTS);
+    let first = unsafe {
+        serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {})
+    }
+    .unwrap();
+    let GrantServeOutcome::NotNow(continuation) = first else {
+        panic!("expected typed NotNow when growth is refused, got {first:?}");
+    };
+    assert_eq!(continuation.refusal, ResidencyGrowthRefusal::MetadataRequired);
+    assert_eq!(continuation.observed_extensions, 0);
+    assert!(!continuation.ready_to_retry(table));
+    assert!(wire.take_receipt(window_4096, &txn_4096).is_none());
+    // Host path (finish_supply / service_owner_file_fault) can cleanly withdraw
+    // the released claim, then resubmit once metadata is ready.
+    assert!(wire.withdraw(window_4096, &txn_4096));
+    assert!(wire.submit(window_4096, &txn_4096));
+
+    // Unblock metadata allocation: retry grows extension 0 and applies grant 4,096.
+    allocator.refuse_next.set(false);
+    let retried = unsafe {
+        serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {})
+    }
+    .unwrap();
+    let GrantServeOutcome::Completed(receipt) = retried else {
+        panic!("expected Applied after metadata became available, got {retried:?}");
+    };
+    assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+    assert!(wire.take_receipt(window_4096, &txn_4096).is_some());
+    assert_eq!(table.extension_count(), 1);
+
+    // Fill extension 0 and test the retirement-driven retry path: refuse growth
+    // at grant 8,192, verify NotNow, retire one row via host ResolvedResidencyTable,
+    // verify continuation.ready_to_retry flips true, and reapply the SAME untouched slot.
+    allocator.refuse_next.set(true);
+    for page_index in (FRAME_GRANT_RESIDENCY_SLOTS + 1)..(FRAME_GRANT_RESIDENCY_SLOTS * 2) {
+        let (window, txn) = submit_page(page_index);
+        let outcome = unsafe {
+            serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {})
+        }
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            GrantServeOutcome::Completed(receipt)
+                if matches!(receipt.outcome, DescriptorOutcome::Applied(_))
+        ));
+        assert!(wire.take_receipt(window, &txn).is_some());
+    }
+    let (window_8192, txn_8192) = submit_page(FRAME_GRANT_RESIDENCY_SLOTS * 2);
+    let second = unsafe {
+        serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {})
+    }
+    .unwrap();
+    let GrantServeOutcome::NotNow(cont_retire) = second else {
+        panic!("expected typed NotNow at second segment saturation, got {second:?}");
+    };
+    assert_eq!(cont_retire.refusal, ResidencyGrowthRefusal::MetadataRequired);
+    assert!(!cont_retire.ready_to_retry(table));
+
+    let mut host_resolved = Box::new(ResolvedResidencyTable::new());
+    unsafe {
+        host_resolved
+            .refresh(
+                table,
+                &NoDynamicResidencyResolver,
+                Some((
+                    bootstrap as u64,
+                    EL1_BOOTSTRAP_METADATA_SIZE as usize,
+                    core::ptr::NonNull::new(bootstrap).unwrap(),
+                )),
+            )
+            .unwrap();
+    }
+    let host_view = host_resolved.view().unwrap();
+    // Retire page 0 (same probe chain as 8192): ready_to_retry observes the
+    // retirement epoch advance and the exact untouched slot succeeds without growth.
+    assert!(
+        host_view
+            .begin_retire_overlapping(mm.raw(), VA, 4096)
+            .expect("retire first page")
+            .commit()
+    );
+    assert!(cont_retire.ready_to_retry(table));
+    let applied_after_retire = unsafe {
+        serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {})
+    }
+    .unwrap();
+    let GrantServeOutcome::Completed(receipt) = applied_after_retire else {
+        panic!("expected Applied after retirement freed slot, got {applied_after_retire:?}");
+    };
+    assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+    assert!(wire.take_receipt(window_8192, &txn_8192).is_some());
+    assert_eq!(table.extension_count(), 1);
+
+    // Full host retirement across both segments leaves zero live/leaked rows.
+    assert!(
+        host_view
+            .begin_retire_overlapping(mm.raw(), VA, TOTAL_PAGES as u64 * 4096)
+            .expect("retire all segments")
+            .commit()
+    );
+    assert_eq!(host_view.observed_slots_used(), 0);
 }
 
 #[test]
@@ -2476,8 +2822,6 @@ fn x86_private_file_4k_grants_scale_past_initial_residency() {
     );
 }
 
-// These witnesses isolate the shared descriptor owner. Platform first-touch
-// admission still needs to provision extensions before entering that owner.
 #[test]
 fn arm_private_file_grants_apply_across_provisioned_residency_segments() {
     private_file_4k_grants_scale_past_initial_residency(
@@ -2494,6 +2838,16 @@ fn x86_private_file_grants_apply_across_provisioned_residency_segments() {
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
         true,
     );
+}
+
+#[test]
+fn arm_residency_growth_refused_once_then_succeeds_through_portal() {
+    residency_growth_refused_once_then_succeeds(false, carrick_mmu_core::owner_mmu::Aarch64Mmu);
+}
+
+#[test]
+fn x86_residency_growth_refused_once_then_succeeds_through_portal() {
+    residency_growth_refused_once_then_succeeds(true, carrick_mmu_core::x86::owner_mmu::X86Mmu);
 }
 
 #[path = "x86_acceleration/compact_context.rs"]
