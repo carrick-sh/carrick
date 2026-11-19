@@ -1062,9 +1062,6 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     );
                     return Ok(Ok(true));
                 }
-                // A root-owned span's provenance is the root's: publish it
-                // for exactly this span before its backing is prepared.
-                dispatcher.adopt_frame_grant_provenance(&plan);
                 let service = carrick_kernel::dispatch::SyscallDispatcher::el1_frame_grant_request(
                     &plan,
                     request.mm_key,
@@ -1106,6 +1103,58 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         return Ok(Ok(true));
                     }
                 };
+                let selected_end = service
+                    .semantic_base
+                    .checked_add(service.len)
+                    .and_then(|end| {
+                        carrick_core_abi::ReservationRange::new(service.semantic_base, end)
+                    })
+                    .unwrap_or_else(|| {
+                        fail_frame_grant_publication(
+                            mailbox,
+                            request,
+                            "descriptor selector returned an invalid span".into(),
+                        )
+                    });
+                let admitted = carrick_core_abi::ReservationRange::new(
+                    plan.start(),
+                    plan.start().checked_add(plan.len()).unwrap_or_else(|| {
+                        fail_frame_grant_publication(
+                            mailbox,
+                            request,
+                            "semantic plan overflowed before descriptor selection".into(),
+                        )
+                    }),
+                )
+                .unwrap_or_else(|| {
+                    fail_frame_grant_publication(
+                        mailbox,
+                        request,
+                        "semantic plan was invalid before descriptor selection".into(),
+                    )
+                });
+                let selected = carrick_core::mm::frames::SelectedBackingPlan::new(
+                    admitted,
+                    selected_end,
+                    request.fault_va & !0xfff,
+                )
+                .unwrap_or_else(|reason| {
+                    fail_frame_grant_publication(
+                        mailbox,
+                        request,
+                        format!("descriptor selector returned a mismatched span: {reason:?}"),
+                    )
+                });
+                let plan = plan.narrow_to(selected).unwrap_or_else(|refusal| {
+                    fail_frame_grant_publication(
+                        mailbox,
+                        request,
+                        format!("descriptor selection cannot narrow semantic plan: {refusal:?}"),
+                    )
+                });
+                // Provenance, backing, publication, residency and stock now
+                // consume the exact same descriptor-selected plan.
+                dispatcher.adopt_frame_grant_provenance(&plan);
                 let Some(prepared) = engine.prepare_el1_frame_grant(service).inspect_err(|_| {
                     record_decision(FrameGrantDecision::PrepareError);
                 })?

@@ -5805,8 +5805,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let selected = self
             .page_tables
             .select_frame_grant_span(range, request.fault_va & !0xfff)?;
-        request.semantic_base = selected.start();
-        request.len = selected.len();
+        request.semantic_base = selected.range().start();
+        request.len = selected.range().len();
         Ok(request)
     }
 
