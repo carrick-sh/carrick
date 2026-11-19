@@ -6923,6 +6923,40 @@ fn x86_write_plan_ignores_in_node_stale_host_residency() {
     production_grant_ignores_stale_host_residency(2);
 }
 
+/// The descriptor-selected span is the semantic plan that provenance,
+/// publication, residency and stock must all consume.
+#[test]
+fn selected_backing_plan_narrows_the_committed_host_grant() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + 2 * STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base),
+        8 * PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    let fault = base + 4 * PAGE;
+
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(fault, STOCK_WINDOW, |plan| {
+            let admitted = carrick_core_abi::ReservationRange::new(plan.start(), plan.end())
+                .expect("production plan has a valid admitted range");
+            let selected = carrick_core_abi::ReservationRange::new(fault, fault + PAGE)
+                .expect("one selected page is a valid range");
+            let selected = carrick_core::mm::frames::SelectedBackingPlan::new(
+                admitted, selected, fault,
+            )
+            .expect("the selected fault page is contained by the admitted plan");
+            let plan = plan
+                .narrow_to(selected)
+                .expect("one descriptor-selected page narrows the semantic plan");
+            assert_eq!((plan.start(), plan.len()), (fault, PAGE));
+            assert_eq!(plan.publication().span, selected.range());
+        })
+        .expect("production planner admits the owner-backed mapping");
+}
+
 /// Host alias supply already has host mutation admission; extraction must
 /// not add the future native publication freeze to its selection policy.
 #[test]
