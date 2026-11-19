@@ -522,6 +522,61 @@ impl IdtTestRig {
 }
 
 #[test]
+fn timer_latch_survives_repeated_int80_returns() {
+    use carrick_softcpu_x86::{
+        LAPIC_LVT_TIMER_MODE_TSC_DEADLINE, LAPIC_LVT_TIMER_OFFSET, LAPIC_SVR_OFFSET,
+        MSR_IA32_TSC_DEADLINE, ManualTscClock, MsrCapabilities,
+    };
+    use std::sync::Arc;
+
+    const TIMER: u8 = 0xe0;
+    let mut rig = IdtTestRig::new();
+    let clock = Arc::new(ManualTscClock::new(1));
+    rig.machine.set_clock(clock.clone());
+    rig.write_kernel_code(&[0x48, 0xcf]); // iretq
+    rig.set_gate(0x80, CODE_VA, 0x08, 0, 0x0e, 3, true);
+    rig.write_user_code(&[0xcd, 0x80, 0xeb, 0xfc]); // int $0x80; jmp back to int
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+
+    // Enter the int handler once so the deadline passes just after IRETQ.
+    assert_eq!(rig.machine.step().unwrap(), None);
+    assert_eq!(rig.machine.context().cpl, 0);
+    let ctx = rig.machine.context_mut();
+    ctx.lapic_mmio_write(LAPIC_SVR_OFFSET, &0x1ffu32.to_le_bytes());
+    ctx.lapic_mmio_write(
+        LAPIC_LVT_TIMER_OFFSET,
+        &(LAPIC_LVT_TIMER_MODE_TSC_DEADLINE | u32::from(TIMER)).to_le_bytes(),
+    );
+    let caps = MsrCapabilities::from_cpuid(&GuestCpuidView::default());
+    ctx.write_msr(MSR_IA32_TSC_DEADLINE, 2, caps).unwrap();
+    assert_eq!(rig.machine.step().unwrap(), None);
+    assert_eq!(rig.machine.context().cpl, 3);
+    clock.set(2);
+
+    for user_blocks in 1..=8 {
+        assert_eq!(rig.machine.context().cpl, 3);
+        assert_eq!(
+            rig.machine.step().unwrap(),
+            None,
+            "CPL3 block {user_blocks}"
+        );
+        assert!(rig.machine.context().lapic().irr_bit(TIMER));
+        if user_blocks % 2 == 0 {
+            assert_eq!(rig.machine.context().cpl, 0);
+            assert_eq!(rig.machine.step().unwrap(), None); // IRETQ with IF clear
+        }
+    }
+    assert!(
+        matches!(
+            rig.machine.step().unwrap(),
+            Some(SoftMachineExit::IoOut { port: 0xe0, value, .. }) if value == u32::from(TIMER)
+        ),
+        "timer must be recognized at the boundary after eight CPL3 blocks since the latch"
+    );
+    assert!(!rig.machine.context().lapic().irr_bit(TIMER));
+}
+
+#[test]
 fn post_return_timer_deferral_leaves_fixed_interrupts_eligible() {
     use carrick_softcpu_x86::{
         LAPIC_LVT_TIMER_MODE_TSC_DEADLINE, LAPIC_LVT_TIMER_OFFSET, LAPIC_SVR_OFFSET,

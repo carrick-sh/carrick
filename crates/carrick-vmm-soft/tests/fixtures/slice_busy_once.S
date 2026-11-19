@@ -33,6 +33,11 @@ _start:
     jz worker
     js fail
 
+#ifdef SYSCALL_POLLER
+    /* Verify that the worker reached the polling syscall and got a TID. */
+    cmpl $0, 16(%r12)
+    jle fail
+#endif
     movl $1, 8(%r12)
 
 join:
@@ -53,6 +58,12 @@ joined:
     ud2
 
 worker:
+#ifdef SYSCALL_POLLER
+    /* gettid is served in ring. Only two CPL3 blocks per poll. */
+    mov $186, %eax
+    syscall
+    mov %eax, 16(%r12)
+#endif
     cmpl $1, 8(%r12)
     jne worker
     xor %edi, %edi

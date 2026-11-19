@@ -42,10 +42,12 @@ vm_free = [
   "carrick-softcpu-x86::softcpu_apic_timer::deadline_written_at_reset_is_ignored",
   "carrick-softcpu-x86::softcpu_apic_timer::deadline_passed_before_enrolment_returns_without_parking",
   "carrick-softcpu-x86::softcpu_idt_delivery::post_return_timer_deferral_leaves_fixed_interrupts_eligible",
+  "carrick-softcpu-x86::softcpu_idt_delivery::timer_latch_survives_repeated_int80_returns",
   "carrick-vmm-soft::soft_hello::production_ring_nanosleep_waits_on_host",
   "carrick-vmm-soft::soft_hello::production_ring_non_last_threads_raw_exit",
   "carrick-vmm-soft::soft_hello::production_ring_slice_starts_after_cpl0_return_preparation",
   "carrick-vmm-soft::soft_hello::production_ring_rearms_slice_when_irq_return_head_is_busy_once",
+  "carrick-vmm-soft::soft_hello::production_ring_slice_preempts_a_syscall_poller",
 ]
 
 [bindings.unresolved]
