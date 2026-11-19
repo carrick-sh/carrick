@@ -1323,41 +1323,47 @@ impl HostIpc {
         number: fd::Fd,
         serve: impl FnOnce(&HostResource) -> R,
     ) -> Result<R, PinnedHostResourceError> {
-        let region = self.region();
-        let authority = region.fd(HostLockWait);
-        let (pin, description) = authority.pin(table, number).map_err(|error| match error {
-            fd::Error::BadFd => PinnedHostResourceError::BadFd,
-            _ => PinnedHostResourceError::Unavailable,
-        })?;
-        let resource = match carrick_el1_abi::ipc::IpcBacking::decode(description.backing) {
-            Some(carrick_el1_abi::ipc::IpcBacking::Host(token)) => self
-                .resources
-                .lock()
-                .live
-                .get(&token.get())
-                .cloned()
-                .ok_or(PinnedHostResourceError::Unavailable),
-            Some(_) => Err(PinnedHostResourceError::InZone),
-            None => Err(PinnedHostResourceError::Unavailable),
-        };
-        let result = resource.map(|resource| serve(&resource));
-        match authority.unpin(pin) {
-            Ok(Some(last)) => {
-                self.release(last.backing)
-                    .map_err(|_| PinnedHostResourceError::Unavailable)?;
-            }
-            Ok(None) => {}
-            Err(_) => return Err(PinnedHostResourceError::Unavailable),
-        }
-        result
+        self.with_host_resource_pin(table, number, |resource, _, _| Ok(serve(resource)))
     }
-    /// [`Self::with_pinned_host_resource`] that also hands `serve` the exact
-    /// pinned description's shared status flags (the guest's `O_NONBLOCK`).
+
+    /// Give the callback the pinned description's shared status flags.
     pub(crate) fn with_pinned_host_description<R>(
         &self,
         table: fd::TableId,
         number: fd::Fd,
         serve: impl FnOnce(&HostResource, fd::StatusFlags) -> R,
+    ) -> Result<R, PinnedHostResourceError> {
+        self.with_host_resource_pin(table, number, |resource, _, flags| {
+            Ok(serve(resource, flags))
+        })
+    }
+
+    pub(crate) fn set_host_nonblock(
+        &self,
+        table: fd::TableId,
+        number: fd::Fd,
+        enable: bool,
+    ) -> Result<(), PinnedHostResourceError> {
+        self.with_host_resource_pin(table, number, |_, pin, _| {
+            self.region()
+                .fd(HostLockWait)
+                .set_pinned_nonblock(pin, enable)
+                .map_err(|error| match error {
+                    fd::Error::BadFd => PinnedHostResourceError::BadFd,
+                    _ => PinnedHostResourceError::Unavailable,
+                })
+        })
+    }
+
+    fn with_host_resource_pin<R>(
+        &self,
+        table: fd::TableId,
+        number: fd::Fd,
+        serve: impl FnOnce(
+            &HostResource,
+            &fd::OfdPin,
+            fd::StatusFlags,
+        ) -> Result<R, PinnedHostResourceError>,
     ) -> Result<R, PinnedHostResourceError> {
         let region = self.region();
         let authority = region.fd(HostLockWait);
@@ -1376,7 +1382,7 @@ impl HostIpc {
             Some(_) => Err(PinnedHostResourceError::InZone),
             None => Err(PinnedHostResourceError::Unavailable),
         };
-        let result = resource.map(|resource| serve(&resource, description.flags));
+        let result = resource.and_then(|resource| serve(&resource, &pin, description.flags));
         match authority.unpin(pin) {
             Ok(Some(last)) => {
                 self.release(last.backing)

@@ -22,46 +22,52 @@ impl<'a> FsView<'a> {
                 follow,
             } => {
                 let path = read_guest_c_string(memory, path_ptr.0)?;
-                if path.is_empty() {
-                    return Err(LINUX_ENOENT);
-                }
-                let resolved = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
-                // Linux resolves the path FIRST for every *xattr syscall: a path
-                // that does not exist is ENOENT, before any attr/namespace check
-                // (oracle: debian:stable arm64 set/get/list/remove on a missing
-                // path all -> errno 2). Without this the request falls through to
-                // the backend, which reports ENOTSUP (in-memory) / ENODATA (host).
-                let exists = if follow {
-                    self.layered_metadata(&resolved)
-                } else {
-                    self.layered_lstat(&resolved)
-                };
-                if exists.is_err() {
-                    return Err(LINUX_ENOENT);
-                }
-                Ok(resolved)
+                self.resolve_xattr_path(&path, follow)
             }
             XattrTarget::Fd(fd) => {
                 let open_file = self.open_file(fd.0).ok_or(LINUX_EBADF)?;
-                let open = crate::kernel::FileDescription::inspect(&open_file.description)
-                    .ok_or(LINUX_ENOTSUP)?;
-                match &*open {
-                    OpenDescription::File { path, .. }
-                    | OpenDescription::Directory { path, .. } => Ok(path.clone()),
-                    // A disk-backed HostFile (the `--fs host` common case, e.g.
-                    // tempfile.mkstemp's fd) carries its guest rootfs path in
-                    // metadata; recover it so f-variant xattr syscalls work
-                    // (CPython's xattr-support probe does os.setxattr(fd, ...)).
-                    OpenDescription::HostFile { metadata, .. } => metadata
-                        .path
-                        .to_str()
-                        .map(str::to_owned)
-                        .ok_or(LINUX_ENOTSUP),
-                    // Pipes/sockets/etc. have no backing file → unsupported.
-                    _ => Err(LINUX_ENOTSUP),
-                }
+                Self::description_xattr_path(&open_file.description)
             }
         }
+    }
+
+    pub(in crate::dispatch) fn resolve_xattr_path(
+        &self,
+        path: &str,
+        follow: bool,
+    ) -> Result<String, LinuxErrno> {
+        if path.is_empty() {
+            return Err(LINUX_ENOENT);
+        }
+        let resolved = self.resolve_at_path(LINUX_AT_FDCWD, path)?;
+        // Resolve existence before operating on the attribute namespace.
+        let exists = if follow {
+            self.layered_metadata(&resolved)
+        } else {
+            self.layered_lstat(&resolved)
+        };
+        if exists.is_err() {
+            return Err(LINUX_ENOENT);
+        }
+        Ok(resolved)
+    }
+
+    pub(in crate::dispatch) fn description_xattr_path(
+        description: &crate::kernel::FileDescription,
+    ) -> Result<String, LinuxErrno> {
+        description
+            .inspect_kind(|open| match open {
+                OpenDescription::File { path, .. } | OpenDescription::Directory { path, .. } => {
+                    Ok(path.clone())
+                }
+                OpenDescription::HostFile { metadata, .. } => metadata
+                    .path
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or(LINUX_ENOTSUP),
+                _ => Err(LINUX_ENOTSUP),
+            })
+            .unwrap_or(Err(LINUX_ENOTSUP))
     }
 
     pub(super) fn setxattr(
@@ -77,11 +83,27 @@ impl<'a> FsView<'a> {
         let follow = target.follow();
         let resolved = self.xattr_target_path(memory, target)?;
         let name = read_guest_c_string(memory, name_ptr.0)?;
-        let flags = i32::try_from(flags).map_err(|_| DispatchError::Errno(LINUX_EINVAL))?;
+        self.set_xattr_bytes(&resolved, &name, flags, follow, || {
+            memory
+                .read_bytes(value_ptr.0, size as usize)
+                .map_err(|_| LINUX_EFAULT)
+        })?;
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    pub(in crate::dispatch) fn set_xattr_bytes<T: AsRef<[u8]>>(
+        &self,
+        resolved: &str,
+        name: &str,
+        flags: u64,
+        follow: bool,
+        read_value: impl FnOnce() -> Result<T, LinuxErrno>,
+    ) -> Result<(), LinuxErrno> {
+        let flags = i32::try_from(flags).map_err(|_| LINUX_EINVAL)?;
         let valid_flags =
             crate::linux_abi::LINUX_XATTR_CREATE | crate::linux_abi::LINUX_XATTR_REPLACE;
         if flags & !valid_flags != 0 || flags == valid_flags {
-            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            return Err(LINUX_EINVAL);
         }
         // Linux restricts the `user.*` namespace to regular files and
         // directories: setxattr(user.*) on a FIFO, char/block device, or socket
@@ -91,7 +113,7 @@ impl<'a> FsView<'a> {
         // stored mode; a plain regular file reports `File` with no device bits.
         // Skipped when the backend can't report a type (e.g. `--fs memory`).
         if name.starts_with("user.") {
-            let regular_or_dir = if let Some(mount) = self.fs.vfs_mounts.resolve(&resolved) {
+            let regular_or_dir = if let Some(mount) = self.fs.vfs_mounts.resolve(resolved) {
                 mount.vfs.lookup(&mount.full_path).ok().map(|metadata| {
                     matches!(
                         metadata.kind,
@@ -102,9 +124,9 @@ impl<'a> FsView<'a> {
                 let stat = self
                     .fs
                     .rootfs_vfs
-                    .dentry_stat(&resolved, follow)
+                    .dentry_stat(resolved, follow)
                     .ok()
-                    .or_else(|| self.fs.rootfs_vfs.overlay.real_stat(&resolved, follow));
+                    .or_else(|| self.fs.rootfs_vfs.overlay.real_stat(resolved, follow));
                 stat.map(|real| {
                     let type_bits = real.mode & LINUX_S_IFMT;
                     matches!(real.kind, RootFsEntryKind::Directory)
@@ -114,28 +136,22 @@ impl<'a> FsView<'a> {
                 })
             };
             if regular_or_dir == Some(false) {
-                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                return Err(LINUX_EPERM);
             }
         }
-        let size = size as usize;
-        let value = memory
-            .read_bytes(value_ptr.0, size)
-            .map_err(|_| DispatchError::Errno(LINUX_EFAULT))?;
+        let value = read_value()?;
         // VFS mounts do not yet expose an xattr operation. Do not fall through
         // to the rootfs overlay: the mounted path is absent there, which
         // misleadingly returned ENODATA ("attribute missing") for setxattr.
         // EOPNOTSUPP is Linux's filesystem-does-not-support-this-namespace
         // result and lets tools such as GNU install skip optional metadata while
         // still applying the requested mode through fchmod.
-        if let Some(mount) = self.fs.vfs_mounts.resolve(&resolved) {
-            return Ok(DispatchOutcome::errno(
-                mount.vfs.setxattr_unsupported_errno(),
-            ));
+        if let Some(mount) = self.fs.vfs_mounts.resolve(resolved) {
+            return Err(mount.vfs.setxattr_unsupported_errno());
         }
         self.fs
             .rootfs_vfs
-            .set_xattr(&resolved, &name, &value, flags, follow)?;
-        Ok(DispatchOutcome::Returned { value: 0 })
+            .set_xattr(resolved, name, value.as_ref(), flags, follow)
     }
 
     pub(super) fn getxattr(
@@ -163,7 +179,7 @@ impl<'a> FsView<'a> {
         let follow = target.follow();
         let resolved = self.xattr_target_path(memory, target)?;
         let name = read_guest_c_string(memory, name_ptr.0)?;
-        let value = self.fs.rootfs_vfs.get_xattr(&resolved, &name, follow)?;
+        let value = self.get_xattr_bytes(&resolved, &name, follow)?;
         // size == 0 is the "tell me how big" probe: return the length without
         // copying anything.
         if size == 0 {
@@ -204,13 +220,7 @@ impl<'a> FsView<'a> {
         }
         let follow = target.follow();
         let resolved = self.xattr_target_path(memory, target)?;
-        let names = self.fs.rootfs_vfs.list_xattr(&resolved, follow)?;
-        // Assemble the NUL-separated, NUL-terminated name list Linux returns.
-        let mut list = Vec::new();
-        for n in &names {
-            list.extend_from_slice(n.as_bytes());
-            list.push(0);
-        }
+        let list = self.list_xattr_bytes(&resolved, follow)?;
         if size == 0 {
             return Ok(DispatchOutcome::returned_len_or_errno(list.len()));
         }
@@ -224,6 +234,30 @@ impl<'a> FsView<'a> {
             buf_addr,
             &list,
         ))
+    }
+
+    pub(in crate::dispatch) fn get_xattr_bytes(
+        &self,
+        resolved: &str,
+        name: &str,
+        follow: bool,
+    ) -> Result<Vec<u8>, LinuxErrno> {
+        self.fs.rootfs_vfs.get_xattr(resolved, name, follow)
+    }
+
+    pub(in crate::dispatch) fn list_xattr_bytes(
+        &self,
+        resolved: &str,
+        follow: bool,
+    ) -> Result<Vec<u8>, LinuxErrno> {
+        let names = self.fs.rootfs_vfs.list_xattr(resolved, follow)?;
+        // Assemble the NUL-separated, NUL-terminated name list Linux returns.
+        let mut list = Vec::new();
+        for n in &names {
+            list.extend_from_slice(n.as_bytes());
+            list.push(0);
+        }
+        Ok(list)
     }
 
     pub(super) fn removexattr(

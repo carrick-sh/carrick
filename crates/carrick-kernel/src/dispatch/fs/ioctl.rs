@@ -31,7 +31,7 @@ pub(crate) fn resolve_tiocspgrp(
     Ok(group_id)
 }
 
-fn linux_termio_bytes(termios: &LinuxTermios) -> [u8; LINUX_TERMIO_SIZE] {
+pub(in crate::dispatch) fn linux_termio_bytes(termios: &LinuxTermios) -> [u8; LINUX_TERMIO_SIZE] {
     let mut cc = [0u8; 8];
     cc.copy_from_slice(&termios.c_cc[..8]);
     let termio = carrick_abi::LinuxTermio {
@@ -84,7 +84,10 @@ fn copyout_termios2<M: CurrentMmMemory>(
     )
 }
 
-fn merge_linux_termio(current: &LinuxTermios, bytes: &[u8]) -> Result<LinuxTermios, LinuxErrno> {
+pub(in crate::dispatch) fn merge_linux_termio(
+    current: &LinuxTermios,
+    bytes: &[u8],
+) -> Result<LinuxTermios, LinuxErrno> {
     let legacy = carrick_abi::LinuxTermio::read_from_bytes(
         bytes
             .get(..core::mem::size_of::<carrick_abi::LinuxTermio>())

@@ -129,6 +129,14 @@ pub enum HostFileOp {
     /// Positional write of staged bytes. `args[0]` is the signed offset,
     /// and `args[1]` is the writer's ring-owned RLIMIT_FSIZE.
     Pwrite = 36,
+    /// Query an extended attribute. The path and name are NUL-delimited.
+    GetXattr = 37,
+    /// Return the filesystem's NUL-delimited attribute names.
+    ListXattr = 38,
+    /// Set an attribute; the path and name delimit the value bytes.
+    SetXattr = 39,
+    /// A Linux request from the native host-description allowlist.
+    Ioctl = 40,
 }
 
 /// A staged user-memory range of a [`HostFileOp::NetSyscall`] record.
@@ -639,6 +647,10 @@ impl HostFileOp {
             34 => Self::Fstatfs,
             35 => Self::Fallocate,
             36 => Self::Pwrite,
+            37 => Self::GetXattr,
+            38 => Self::ListXattr,
+            39 => Self::SetXattr,
+            40 => Self::Ioctl,
             _ => return None,
         })
     }
@@ -670,6 +682,9 @@ impl HostFileOp {
                 | Self::Fchmodat
                 | Self::Fchownat
                 | Self::Statfs
+                | Self::GetXattr
+                | Self::ListXattr
+                | Self::SetXattr
         )
     }
 }
@@ -710,6 +725,11 @@ pub const fn decode_second_path_fd(word: u64) -> Option<Option<i32>> {
 
 const MAGIC: u32 = u32::from_le_bytes(*b"CHFR");
 const VERSION: u16 = 1;
+/// A native xattr record names a descriptor; the encoded pathname is empty.
+pub const XATTR_DESCRIPTOR: u32 = 1;
+/// A path xattr operates on the link itself.
+pub const XATTR_NOFOLLOW: u32 = 2;
+
 /// The Linux 64-bit statfs reply, identical on AArch64 and x86-64.
 pub const STATFS_BYTES: usize = 120;
 

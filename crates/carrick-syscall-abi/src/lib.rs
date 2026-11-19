@@ -10,6 +10,40 @@ pub const LINUX_AARCH64_EPOLL_EVENT_BYTES: u64 = 16;
 /// Packed Linux x86_64 epoll_event wire stride.
 pub const LINUX_X8664_EPOLL_EVENT_BYTES: u64 = 12;
 
+// Linux terminal and file-description ioctls, shared by ring staging and the carrier.
+pub const LINUX_TCGETS: u64 = 0x5401;
+pub const LINUX_TCSETS: u64 = 0x5402;
+pub const LINUX_TCSETSW: u64 = 0x5403;
+pub const LINUX_TCSETSF: u64 = 0x5404;
+pub const LINUX_TCGETA: u64 = 0x5405;
+pub const LINUX_TCSETA: u64 = 0x5406;
+pub const LINUX_TCSETAW: u64 = 0x5407;
+pub const LINUX_TCSETAF: u64 = 0x5408;
+pub const LINUX_TCGETS2: u64 = 0x802c_542a;
+pub const LINUX_TCSETS2: u64 = 0x402c_542b;
+pub const LINUX_TCSETSW2: u64 = 0x402c_542c;
+pub const LINUX_TCSETSF2: u64 = 0x402c_542d;
+pub const LINUX_TIOCGWINSZ: u64 = 0x5413;
+pub const LINUX_TIOCSWINSZ: u64 = 0x5414;
+pub const LINUX_FIONREAD: u64 = 0x541B;
+pub const LINUX_FIONBIO: u64 = 0x5421;
+
+/// Size of the Linux kernel-ABI `struct termios` for TCGETS/TCSETS on
+/// aarch64. It's `c_iflag/c_oflag/c_cflag/c_lflag` (4 u32s = 16 bytes)
+/// plus `c_line` (1 byte) and `c_cc[19]` (19 bytes) = **36 bytes**.
+///
+/// The `c_ispeed`/`c_ospeed` fields belong to `struct termios2` (TCGETS2),
+/// a separate ioctl. Writing 44 bytes for TCGETS overflows the
+/// caller's stack-allocated buffer by 8, corrupts the stack canary,
+/// and trips `__stack_chk_fail` later in any glibc program that calls
+/// `isatty()` (which goes through tcgetattr → TCGETS) — i.e. ls, dpkg,
+/// etc. Use [`LINUX_TERMIOS_KERNEL_SIZE`] explicitly for those ioctls.
+pub const LINUX_TERMIOS_KERNEL_SIZE: usize = 36;
+/// Size of the Linux termios2 record, including input and output speeds.
+pub const LINUX_TERMIOS2_SIZE: usize = 44;
+/// Size of the older Linux termio record, including trailing padding.
+pub const LINUX_TERMIO_SIZE: usize = 18;
+
 pub mod ipc;
 mod net;
 pub use net::{
