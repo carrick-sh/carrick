@@ -625,8 +625,10 @@ fn production_ring_rearms_slice_when_irq_return_head_is_busy_once() {
             .expect("50 us per block");
     let released_once = Arc::new(AtomicBool::new(false));
     let timer_irqs_after_hold = Arc::new(AtomicU64::new(0));
+    let user_blocks_before_rearmed_irq = Arc::new(AtomicU64::new(0));
     let setup_released = Arc::clone(&released_once);
     let setup_timer_irqs_after_hold = Arc::clone(&timer_irqs_after_hold);
+    let setup_user_blocks = Arc::clone(&user_blocks_before_rearmed_irq);
 
     let run = run_with_options(
         &elf,
@@ -655,6 +657,12 @@ fn production_ring_rearms_slice_when_irq_return_head_is_busy_once() {
                 // this closure's lifetime; the soft vCPU is stopped between blocks.
                 let zone = unsafe { &*(zone_addr as *const SoftCpl0Zone) };
                 if before_cpl == 3
+                    && after_cpl == 3
+                    && setup_released.load(Ordering::Acquire)
+                    && setup_timer_irqs_after_hold.load(Ordering::Acquire) == 0
+                {
+                    setup_user_blocks.fetch_add(1, Ordering::AcqRel);
+                } else if before_cpl == 3
                     && after_cpl == 0
                     && highest_isr == Some(carrick_x86::interrupts::TIMER_VECTOR)
                 {
@@ -694,6 +702,10 @@ fn production_ring_rearms_slice_when_irq_return_head_is_busy_once() {
                         );
                         held = Some((head, seq));
                     }
+                } else if before_cpl == 0 && after_cpl == 0 && held.is_some() {
+                    // Simulate ~100 us/block host translation/scheduling latency
+                    // across the contended IRQ return path (including rearm_slice -> iretq).
+                    std::thread::sleep(Duration::from_micros(100));
                 } else if before_cpl == 0
                     && after_cpl == 3
                     && let Some((head, seq)) = held.take()
@@ -722,6 +734,11 @@ fn production_ring_rearms_slice_when_irq_return_head_is_busy_once() {
         run.summary()
     );
     assert!(run.failure.is_none(), "{}", run.summary());
+    assert!(
+        user_blocks_before_rearmed_irq.load(Ordering::Acquire) >= 1,
+        "re-armed 1 ms slice retry expired in CPL0 before user instructions retired: {}",
+        run.summary()
+    );
     assert!(
         timer_irqs_after_hold.load(Ordering::Acquire) >= 1,
         "expected re-armed slice timer interrupt after busy-once hold: {}",
