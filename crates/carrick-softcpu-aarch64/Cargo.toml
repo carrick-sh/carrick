@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+carrick-abi = { path = "../carrick-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-softmmu = { path = "../carrick-softmmu" }

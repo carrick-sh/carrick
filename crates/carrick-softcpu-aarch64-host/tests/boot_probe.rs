@@ -1399,12 +1399,14 @@ fn read_initial_stack_auxv(memory: &mut Pages, sp: u64) -> (u64, Vec<u8>, Vec<(u
 #[ignore = "requires production CARRICK_A64_ELF and the pinned arm64 musl rust-std target"]
 fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     use carrick_mem::{
+        elf::plan_elf_load_bytes,
         linux_abi::{
-            LINUX_AT_HWCAP, LINUX_AT_PAGESZ, LINUX_AT_RANDOM, LINUX_AT_SYSINFO_EHDR,
-            LinuxAarch64Hwcap,
+            LINUX_AT_HWCAP, LINUX_AT_HWCAP2, LINUX_AT_PAGESZ, LINUX_AT_RANDOM,
+            LINUX_AT_SYSINFO_EHDR,
         },
-        memory::AddressSpace,
+        memory::{build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso},
     };
+    use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
     use std::process::Command;
 
     let elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
@@ -1431,23 +1433,27 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     std::fs::remove_file(out).expect("remove compiled musl hello");
 
     assert_eq!(field(&user_elf, 16, 2), 2, "musl hello must be ET_EXEC");
-    let image = AddressSpace::load_elf_bytes(&user_elf)
-        .unwrap()
-        // DDI0487G.a FEAT_LSE: LDADD alone does not authorize advertising
-        // ATOMICS. Let libc select its baseline exclusive-load/store path.
-        .without_auxv_hwcap(LinuxAarch64Hwcap::ATOMICS)
-        // No vvar/vDSO pages are mapped in this carrier-root fixture.
-        .with_vdso_auxv(false)
-        .with_linux_initial_stack_at(["musl-hello"], [] as [&str; 0], LINUX_STACK_TOP, 4 * PAGE)
-        .unwrap();
+    let plan = plan_elf_load_bytes(&user_elf).unwrap();
+    // No vvar/vDSO pages are mapped in this carrier-root fixture.
+    let mut auxv = linux_auxv_from_load_plan_with_vdso(&plan, None, false);
+    for entry in &mut auxv {
+        match entry.a_type {
+            LINUX_AT_HWCAP => entry.a_val = GUEST_CPU_PROFILE.hwcap().bits(),
+            LINUX_AT_HWCAP2 => entry.a_val = GUEST_CPU_PROFILE.hwcap2().bits(),
+            _ => {}
+        }
+    }
+    let (stack, sp, _) = build_linux_initial_stack(
+        vec![b"musl-hello".to_vec()],
+        Vec::new(),
+        &auxv,
+        None,
+        LINUX_STACK_TOP,
+        4 * PAGE,
+    )
+    .unwrap();
     let build_guest = || {
         let (mut cpu, mut memory, entry) = enter_carrier_root(&elf, &user_elf);
-        let sp = image.initial_stack_pointer().unwrap();
-        let stack = image
-            .regions()
-            .iter()
-            .find(|r| r.start <= sp && sp < r.end)
-            .unwrap();
         let (offset, bytes) = stack.shared_initialized_bytes();
         memory.load(stack.start + offset, &bytes);
         cpu.sp_el0 = StackPointer(sp);
@@ -1474,11 +1480,15 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
             .find(|(k, _)| *k == LINUX_AT_RANDOM)
             .is_some_and(|(_, v)| *v != 0)
     );
-    assert!(
-        auxv.iter()
-            .find(|(k, _)| *k == LINUX_AT_HWCAP)
-            .is_some_and(|(_, v)| *v & LinuxAarch64Hwcap::ATOMICS.bits() == 0)
-    );
+    for (key, expected) in [
+        (LINUX_AT_HWCAP, GUEST_CPU_PROFILE.hwcap().bits()),
+        (LINUX_AT_HWCAP2, GUEST_CPU_PROFILE.hwcap2().bits()),
+    ] {
+        assert_eq!(
+            auxv.iter().find(|(k, _)| *k == key).map(|(_, val)| *val),
+            Some(expected)
+        );
+    }
     assert!(
         !auxv.iter().any(|(k, _)| *k == LINUX_AT_SYSINFO_EHDR),
         "AT_SYSINFO_EHDR must not be advertised without mapped vDSO pages"

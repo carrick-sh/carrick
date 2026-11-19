@@ -135,6 +135,7 @@ pub struct CpuState {
     x: [RegisterValue; 31],
     pub vectors: [u128; 32],
     local_event: bool,
+    pub(crate) undefined_el0_deliveries: u64,
     pub sp_el0: StackPointer,
     pub sp_el1: StackPointer,
     pub pc: ProgramCounter,

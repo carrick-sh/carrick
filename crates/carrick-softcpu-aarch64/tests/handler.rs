@@ -618,7 +618,6 @@ fn exclusive_ordered_and_lse_accesses_fault_with_alignment_check_disabled() {
         (0xc823_0820, 0x10008, true),  // stxp w3, x0, x2, [x1]
         (0xc8df_fc20, 0x10001, false), // ldar x0, [x1]
         (0xc89f_fc20, 0x10001, true),  // stlr x0, [x1]
-        (0xf822_0020, 0x10001, false), // ldadd x2, x0, [x1]: alignment check is a read
     ] {
         let mut r = Rig::el0();
         r.set(0, 42);
@@ -637,6 +636,12 @@ fn exclusive_ordered_and_lse_accesses_fault_with_alignment_check_disabled() {
         assert!(r.memory.0.is_empty());
         assert!(!r.monitor.is_open());
     }
+    // LSE is withheld at EL0. The EL1 carrier LDADD still checks alignment.
+    let mut rig = Rig::el1();
+    rig.set(1, 0x10001);
+    assert_eq!(rig.run(0xf822_0020), Outcome::Fault);
+    assert_eq!(rig.cpu.el1.esr, Syndrome(0x9600_0021));
+    assert_eq!(rig.cpu.el1.far, VirtualAddress(0x10001));
 }
 
 #[test]

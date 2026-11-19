@@ -193,6 +193,9 @@ pub fn take_exception(cpu: &mut CpuState, exception: Exception) -> ExceptionOutc
     cpu.el1.spsr = origin.save();
     if !matches!(exception, Exception::Irq | Exception::Fiq) {
         cpu.el1.esr = syndrome(exception, origin.el);
+        if origin.el == ExceptionLevel::El0 && cpu.el1.esr.0 >> 26 == 0 {
+            cpu.undefined_el0_deliveries = cpu.undefined_el0_deliveries.wrapping_add(1);
+        }
     }
     // D1.10.5 leaves FAR unknown for other reported exceptions.
     // Keeping the prior value is this profile's deterministic choice.
