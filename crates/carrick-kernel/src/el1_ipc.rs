@@ -580,7 +580,7 @@ impl SocketEpollLockWait<'_> {
                 self.0.resched(placement.slot);
             }
         });
-        carrick_el1::sched::object_wait::deliver_effects_with(
+        carrick_el1::substrate::sched::object_wait::deliver_effects_with(
             zone,
             None,
             waker,
@@ -596,7 +596,7 @@ impl carrick_sched_core::LockWait<carrick_sched_core::ParkedContextWords>
     for SocketEpollLockWait<'_>
 {
     fn wait(&self, attempt: u32) -> bool {
-        carrick_el1_abi::LockWait::wait(&HostLockWait, attempt)
+        <HostLockWait as carrick_el1_abi::LockWait>::wait(&HostLockWait, attempt)
     }
 
     fn complete_object_wake(
