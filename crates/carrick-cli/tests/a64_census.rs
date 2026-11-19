@@ -94,10 +94,10 @@ fn command_rejects_reserved_code_excludes_literals_and_is_deterministic() -> any
             .any(|word| word["span"] == "" && word["address"] == 0x1008)
     );
     assert!(!unknown.iter().any(|word| word["address"] == 0x1008));
-    // A recognized FP computation is deliberately outside this typed decoder.
+    // A recognized LSE atomic is deliberately outside this typed decoder.
     // Strict must reject it even though the classifier has no unknown words.
     let mut typed_gap = fixture();
-    put(&mut typed_gap, 68, 0x1e602800, 4);
+    put(&mut typed_gap, 68, 0xf8208000, 4);
     std::fs::write(&path, typed_gap)?;
     let typed = invoke()?;
     assert_eq!(typed.status.code(), Some(1));
@@ -109,7 +109,7 @@ fn command_rejects_reserved_code_excludes_literals_and_is_deterministic() -> any
             .is_some_and(|words| {
                 words
                     .iter()
-                    .any(|word| word["address"] == 0x1004 && word["encoding"] == "0x1e602800")
+                    .any(|word| word["address"] == 0x1004 && word["encoding"] == "0xf8208000")
             })
     );
     Ok(())
@@ -150,5 +150,49 @@ fn command_exports_all_loader_words_deterministically() -> anyhow::Result<()> {
         exports.push(bytes);
     }
     assert_eq!(exports[0], exports[1]);
+    Ok(())
+}
+
+#[test]
+fn rootfs_census_counts_gaps_in_executable_load_segments() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::create_dir(root.path().join("lib"))?;
+    let mut elf = vec![0; 136];
+    elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    for (offset, value, width) in [
+        (16, 3, 2),
+        (18, 183, 2),
+        (20, 1, 4),
+        (32, 64, 8),
+        (52, 64, 2),
+        (54, 56, 2),
+        (56, 1, 2),
+        (64, 1, 4),
+        (68, 5, 4),
+        (72, 120, 8),
+        (80, 0x1000, 8),
+        (96, 12, 8),
+        (104, 12, 8),
+        (120, 0xd503201f, 4),
+        (124, 0x00000000, 4),
+        (128, 0x4c407000, 4),
+        (132, 0xffffffff, 4),
+    ] {
+        put(&mut elf, offset, value, width);
+    }
+    std::fs::write(root.path().join("lib/libc.so.6"), elf)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .args(["debug", "a64-census", "--strict"])
+        .arg(root.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let file = &report["files"][0];
+    assert_eq!(file["path"], "lib/libc.so.6");
+    assert_eq!(file["executable_words"], 3);
+    assert_eq!(
+        file["unclassified_by_class"]["unallocated_or_unsupported"],
+        1
+    );
     Ok(())
 }
