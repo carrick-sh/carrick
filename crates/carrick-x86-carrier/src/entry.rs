@@ -312,6 +312,13 @@ pub fn cross_owner_grant(cpu: carrick_guest_arch::CpuId, address: UserVa) {
     }
 }
 
+/// End this CPU's user #PF custody when the fault leaves for the scheduler.
+/// Its complete context is already owned by the parked scheduler record and
+/// resumes there, never through this entry frame.
+pub fn leave_user_page_fault(binding: &CpuBinding) {
+    binding.fault_active.store(0, Ordering::Release);
+}
+
 /// Ring the owed-return settlement doorbell on the owner-grant port: the
 /// carrier settles the stopped execution's MM at an exclusion, releases the
 /// record's claim in its epilogue and writes its answer into `record`.
