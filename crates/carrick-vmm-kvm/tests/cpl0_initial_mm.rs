@@ -6158,7 +6158,6 @@ fn native_child_glibc_resolver_calls_answer_as_linux() {
 /// counted ENOSYS, which Go's dial returns unwrapped (`dial udp [::1]:53:
 /// function not implemented`).
 #[test]
-#[ignore = "#2418 item 2: a ring epoll set does not admit a host socket yet"]
 fn native_child_go_netpoller_adds_a_udp_socket_to_epoll() {
     assert_dns_steps_are_linux(&dns_style_udp_steps(false), &[GO_NETPOLL_STEPS]);
 }
