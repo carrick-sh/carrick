@@ -1188,16 +1188,18 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.stage1-tlb" },
   # Typed A64 census and instruction decoder for the test-only soft-CPU lane (#1236).
-  { path = "crates/carrick-softcpu-aarch64/src/lib.rs", contracts = [] },
+  { path = "crates/carrick-softcpu-aarch64/src/lib.rs", contract = "softcpu.a64.el0-fp" },
   # Stage-1 translation of handler accesses and block fetch for the test-only arm64 lane (#2480).
   # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
   { path = "crates/carrick-softcpu-aarch64/src/mmu.rs", contract = "arm.softcpu.stage1-tlb" },
+  { path = "crates/carrick-softcpu-aarch64/src/simd.rs", contract = "softcpu.a64.el0-fp" },
   # Virtual CPU and system registers for the test-only arm64 lane.
-  # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
   { path = "crates/carrick-softcpu-aarch64/src/state.rs", contract = "arm.softcpu.cache-hot-set" },
+  { path = "crates/carrick-softcpu-aarch64/src/state.rs", contract = "softcpu.a64.el0-fp" },
   # Copy-through block splitter and A64 emitter (#1236); pure word translation, nothing executes.
   { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "arm.softcpu.stage1-tlb" },
+  { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64/tests/stage1.rs", contract = "arm.softcpu.stage1-tlb" },
   { path = "crates/carrick-softcpu-x86/examples/scan_unsupported.rs", contracts = [] },
   { path = "crates/carrick-softcpu-x86/src/apic.rs", contract = "x86.softcpu.apic-timer" },
