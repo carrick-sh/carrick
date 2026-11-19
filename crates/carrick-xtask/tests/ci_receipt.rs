@@ -530,6 +530,11 @@ else:
             "#[test]\nfn wait4_rejects_unwritable_rusage_without_writing_status() {}\n",
             None,
         );
+        write_source(
+            &work,
+            "crates/carrick-vmm-kvm/src/lib.rs",
+            "macro_rules! declare_static { () => { static CELL: u8 = 0; }; } declare_static!();",
+        );
         git(&work, &["add", "."]);
         git(&work, &["commit", "-m", "base"]);
         let base_sha = git(&work, &["rev-parse", "HEAD"]);
