@@ -17951,6 +17951,21 @@ fn with_arm_process_host_files<R>(
         &std::sync::Arc<carrick_kernel::kernel::FileTable>,
     ) -> R,
 ) -> (R, Vec<u8>) {
+    with_arm_process_host_files_on(carrick_kernel::dispatch::SyscallDispatcher::new(), body)
+}
+
+#[cfg(test)]
+fn with_arm_process_host_files_on<R>(
+    mut dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    body: impl FnOnce(
+        &mut dyn FnMut(
+            ArmCaller,
+            u64,
+            [u64; 6],
+        ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+        &std::sync::Arc<carrick_kernel::kernel::FileTable>,
+    ) -> R,
+) -> (R, Vec<u8>) {
     use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
     use carrick_personality_linux::dispatch::CompletionRoute;
     use std::sync::Arc;
@@ -17981,7 +17996,6 @@ fn with_arm_process_host_files<R>(
     }
     impl CurrentMmMemory for HostPointerMemory {}
 
-    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
     let context = dispatcher.capture_one_task_context().unwrap();
     let owner: &'static _ = Box::leak(Box::new(context.kernel().ipc().unwrap()));
     let files = context.resources().files();
@@ -18482,6 +18496,155 @@ fn arm_root_host_backed_descriptors_keep_one_owner() {
         "root host-backed descriptors left their one owner:\n{}",
         mismatches.join("\n")
     );
+}
+
+/// A fork child resolves each pathname through its ring descriptor table.
+#[test]
+fn arm_fork_child_resolves_relative_paths_through_dirfds() {
+    use carrick_abi::{
+        LINUX_AT_FDCWD, LINUX_AT_REMOVEDIR, LINUX_O_CREAT, LINUX_O_DIRECTORY, LINUX_O_RDWR,
+    };
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::new().expect("host-file fixture scratch"),
+    ));
+    let (mismatches, _) = with_arm_process_host_files_on(dispatcher, |call, _| {
+        let root = ArmCaller::Root;
+        let dir = GuestUserBuffer::from_bytes(b"/dirfd-witness\0");
+        assert_eq!(
+            call(
+                root,
+                sys::MKDIRAT.raw(),
+                [LINUX_AT_FDCWD, dir.arg(), 0o755, 0, 0, 0]
+            )
+            .1,
+            0
+        );
+        let (_, parent_dirfd) = call(
+            root,
+            sys::OPENAT.raw(),
+            [LINUX_AT_FDCWD, dir.arg(), LINUX_O_DIRECTORY, 0, 0, 0],
+        );
+        assert!(parent_dirfd >= 0, "parent directory open: {parent_dirfd}");
+        let parent_sibling = GuestUserBuffer::from_bytes(b"/dirfd-witness/parent-sibling\0");
+        let (_, parent_file) = call(
+            root,
+            sys::OPENAT.raw(),
+            [
+                LINUX_AT_FDCWD,
+                parent_sibling.arg(),
+                LINUX_O_CREAT | LINUX_O_RDWR,
+                0o600,
+                0,
+                0,
+            ],
+        );
+        assert!(parent_file >= 0, "parent sibling create: {parent_file}");
+        let (_, pid) = call(root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid}");
+        let child = ArmCaller::Child(pid as u32);
+        let mut mismatches = Vec::new();
+        let mut expect = |step, got, want| {
+            if got != want {
+                mismatches.push(format!("{step}: got {got}, want {want}"));
+            }
+        };
+        let (_, dfd) = call(
+            child,
+            sys::OPENAT.raw(),
+            [LINUX_AT_FDCWD, dir.arg(), LINUX_O_DIRECTORY, 0, 0, 0],
+        );
+        assert!(dfd >= 0, "child directory open: {dfd}");
+        let dfd = dfd as u64;
+        let subdir = GuestUserBuffer::from_bytes(b"subdir\0");
+        let file = GuestUserBuffer::from_bytes(b"file\0");
+        let moved = GuestUserBuffer::from_bytes(b"moved\0");
+        let stat = GuestUserBuffer::from_bytes(&[0; 128]);
+
+        expect(
+            "mkdirat",
+            call(
+                child,
+                sys::MKDIRAT.raw(),
+                [dfd, subdir.arg(), 0o755, 0, 0, 0],
+            )
+            .1,
+            0,
+        );
+        let (_, fd) = call(
+            child,
+            sys::OPENAT.raw(),
+            [dfd, file.arg(), LINUX_O_CREAT | LINUX_O_RDWR, 0o600, 0, 0],
+        );
+        expect("openat", fd.min(0), 0);
+        expect(
+            "newfstatat",
+            call(
+                child,
+                sys::NEWFSTATAT.raw(),
+                [dfd, file.arg(), stat.arg(), 0, 0, 0],
+            )
+            .1,
+            0,
+        );
+        let sibling = GuestUserBuffer::from_bytes(b"parent-sibling\0");
+        expect(
+            "parent unlinkat sibling",
+            call(
+                root,
+                sys::UNLINKAT.raw(),
+                [parent_dirfd as u64, sibling.arg(), 0, 0, 0, 0],
+            )
+            .1,
+            0,
+        );
+        let (_, destination) = call(
+            child,
+            sys::OPENAT.raw(),
+            [dfd, subdir.arg(), LINUX_O_DIRECTORY, 0, 0, 0],
+        );
+        expect("openat destination directory", destination.min(0), 0);
+        let destination = if destination < 0 {
+            dfd
+        } else {
+            destination as u64
+        };
+        expect(
+            "renameat",
+            call(
+                child,
+                sys::RENAMEAT.raw(),
+                [dfd, file.arg(), destination, moved.arg(), 0, 0],
+            )
+            .1,
+            0,
+        );
+        expect(
+            "unlinkat file",
+            call(
+                child,
+                sys::UNLINKAT.raw(),
+                [destination, moved.arg(), 0, 0, 0, 0],
+            )
+            .1,
+            0,
+        );
+        expect(
+            "unlinkat directory",
+            call(
+                child,
+                sys::UNLINKAT.raw(),
+                [dfd, subdir.arg(), LINUX_AT_REMOVEDIR, 0, 0, 0],
+            )
+            .1,
+            0,
+        );
+        mismatches
+    });
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 /// #231 parity (pip): CPython opens a script with `fopen` and then marks it

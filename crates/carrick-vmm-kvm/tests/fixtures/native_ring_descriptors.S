@@ -40,7 +40,7 @@ _start:
     call list_directory             /* steps 30-33 */
     xor %edi, %edi
     jmp exit
-#elif defined(CHILD)
+#elif defined(CHILD) || defined(DIRFD)
     mov $-100, %edi                 /* openat(AT_FDCWD, file, O_RDONLY|O_CLOEXEC) */
     lea file(%rip), %rsi
     mov $0x80000, %edx
@@ -68,6 +68,15 @@ _start:
     js exit
     jz child
     mov %rax, %rbx
+#ifdef DIRFD
+    /* The parent removes a sibling while the child walks the same directory. */
+    mov %r13, %rdi
+    lea parent_sibling(%rip), %rsi
+    xor %edx, %edx
+    mov $263, %eax
+    syscall
+    mov %rax, %r15
+#endif
     mov %rbx, %rdi                  /* wait4(pid, &status, 0, NULL) == pid */
     lea status(%rip), %rsi
     xor %edx, %edx
@@ -83,8 +92,85 @@ _start:
     mov status(%rip), %edi
     shr $8, %edi
     and $0xff, %edi
+#ifdef DIRFD
+    jne exit
+    test %r15, %r15
+    jz exit
+    mov $77, %edi
+#endif
     jmp exit
 child:
+#ifdef DIRFD
+    mov %r13, %rdi
+    lea subdir(%rip), %rsi
+    mov $0755, %edx
+    mov $258, %eax                 /* mkdirat */
+    syscall
+    mov $70, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r13, %rdi
+    lea relative_file(%rip), %rsi
+    mov $0x42, %edx
+    mov $0600, %r10d
+    mov $257, %eax                 /* openat */
+    syscall
+    mov $71, %edi
+    test %rax, %rax
+    js exit
+
+    mov %r13, %rdi
+    lea relative_file(%rip), %rsi
+    lea st(%rip), %rdx
+    xor %r10d, %r10d
+    mov $262, %eax                 /* newfstatat */
+    syscall
+    mov $72, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r13, %rdi
+    lea subdir(%rip), %rsi
+    mov $0x10000, %edx
+    xor %r10d, %r10d
+    mov $257, %eax                 /* a distinct destination dirfd */
+    syscall
+    mov $76, %edi
+    test %rax, %rax
+    js exit
+    mov %rax, %r14
+
+    mov %r13, %rdi
+    lea relative_file(%rip), %rsi
+    mov %r14, %rdx
+    lea moved(%rip), %r10
+    mov $264, %eax                 /* renameat */
+    syscall
+    mov $73, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r14, %rdi
+    lea moved(%rip), %rsi
+    xor %edx, %edx
+    mov $263, %eax                 /* unlinkat file */
+    syscall
+    mov $74, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r13, %rdi
+    lea subdir(%rip), %rsi
+    mov $0x200, %edx
+    mov $263, %eax                 /* unlinkat(AT_REMOVEDIR) */
+    syscall
+    mov $75, %edi
+    test %rax, %rax
+    jne exit
+    xor %edi, %edi
+    jmp exit
+#else
     mov %r12, %rdi                  /* read(fd, buf, 64) == 14, "loader library" */
     lea buf(%rip), %rsi
     mov $64, %edx
@@ -154,6 +240,7 @@ child:
     call list_open_directory        /* steps 61-63 */
     xor %edi, %edi
     jmp exit
+#endif
 #endif
 
 #ifdef BAD_FD
@@ -245,6 +332,12 @@ exit:
 file: .asciz FILE_PATH
 #ifndef BAD_FD
 dir: .asciz DIR_PATH
+#endif
+#ifdef DIRFD
+subdir: .asciz "subdir"
+relative_file: .asciz "file"
+moved: .asciz "moved"
+parent_sibling: .asciz "parent-sibling"
 #endif
 empty: .asciz ""
 msg: .ascii "x"
