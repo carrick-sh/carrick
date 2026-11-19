@@ -18691,6 +18691,75 @@ fn arm_fork_child_syncs_and_queries_its_host_file() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
+/// Positional I/O keeps the open description's cursor and vectors scatter.
+#[test]
+fn arm_fork_child_uses_positioned_and_vectored_io() {
+    use carrick_abi::{LINUX_AT_FDCWD, LINUX_O_CREAT, LINUX_O_RDWR};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::new().expect("host-file fixture scratch"),
+    ));
+    let (mismatches, _) = with_arm_process_host_files_on(dispatcher, |call, _| {
+        let (_, pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid}");
+        let child = ArmCaller::Child(pid as u32);
+        let path = GuestUserBuffer::from_bytes(b"/host-file-vectors\0");
+        let (_, fd) = call(
+            child,
+            sys::OPENAT.raw(),
+            [
+                LINUX_AT_FDCWD,
+                path.arg(),
+                LINUX_O_CREAT | LINUX_O_RDWR,
+                0o600,
+                0,
+                0,
+            ],
+        );
+        assert!(fd >= 0, "openat: {fd}");
+        let fd = fd as u64;
+        let data = GuestUserBuffer::from_bytes(b"abcd");
+        let insert = GuestUserBuffer::from_bytes(b"X");
+        let left = GuestUserBuffer::zeroed(2);
+        let right = GuestUserBuffer::zeroed(2);
+        let iov = GuestUserBuffer::from_values(&[left.arg(), 2u64, right.arg(), 2u64]);
+        let appended = GuestUserBuffer::from_values(&[insert.arg(), 1u64, data.arg(), 1u64]);
+        assert_eq!(
+            call(child, sys::WRITE.raw(), [fd, data.arg(), 4, 0, 0, 0]).1,
+            4
+        );
+        assert_eq!(call(child, sys::LSEEK.raw(), [fd, 0, 0, 0, 0, 0]).1, 0);
+        let mut mismatches = Vec::new();
+        for (step, syscall, args, expected) in [
+            ("pwrite64", sys::PWRITE64, [fd, insert.arg(), 1, 1, 0, 0], 1),
+            ("pwritev", sys::PWRITEV, [fd, appended.arg(), 2, 2, 0, 0], 2),
+            ("preadv", sys::PREADV, [fd, iov.arg(), 2, 0, 0, 0], 4),
+            ("position after preadv", sys::LSEEK, [fd, 0, 1, 0, 0, 0], 0),
+            ("readv", sys::READV, [fd, iov.arg(), 2, 0, 0, 0], 4),
+            ("position after readv", sys::LSEEK, [fd, 0, 1, 0, 0, 0], 4),
+        ] {
+            let (_, result) = call(child, syscall.raw(), args);
+            if result != expected {
+                mismatches.push(format!("{step}: got {result}, want {expected}"));
+            }
+            if matches!(syscall, sys::PREADV | sys::READV)
+                && (left.as_bytes() != b"aX" || right.as_bytes() != b"Xa")
+            {
+                mismatches.push(format!(
+                    "{step}: {:?} and {:?}",
+                    left.as_bytes(),
+                    right.as_bytes()
+                ));
+            }
+        }
+        mismatches
+    });
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
 /// #231 parity (pip): CPython opens a script with `fopen` and then marks it
 /// close-on-exec with `ioctl(fd, FIOCLEX)`. A fork child's file is a ring
 /// descriptor the carrier opened for its staged `openat`; on main the ioctl
