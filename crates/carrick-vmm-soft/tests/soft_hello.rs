@@ -105,17 +105,20 @@ impl HelloRun {
 }
 
 fn run_hello(elf: &[u8]) -> HelloRun {
-    run_with_options(elf, None, None)
+    run_with_options(elf, None, None, None)
 }
 
 fn run_with_stdout_patch(elf: &[u8], patch: Option<u8>) -> HelloRun {
-    run_with_options(elf, patch, None)
+    run_with_options(elf, patch, None, None)
 }
+
+type CarrierSetup = Box<dyn FnOnce(&mut SoftCarrier)>;
 
 fn run_with_options(
     elf: &[u8],
     patch: Option<u8>,
     execution_clock: Option<(std::num::NonZeroU64, u64)>,
+    setup: Option<CarrierSetup>,
 ) -> HelloRun {
     let mut run = HelloRun {
         stdout: Vec::new(),
@@ -124,7 +127,7 @@ fn run_with_options(
         exits: Vec::new(),
         failure: None,
     };
-    if let Err(failure) = drive(elf, &mut run, patch, execution_clock) {
+    if let Err(failure) = drive(elf, &mut run, patch, execution_clock, setup) {
         run.failure = Some(failure);
     }
     run
@@ -170,6 +173,7 @@ fn drive(
     run: &mut HelloRun,
     patch: Option<u8>,
     execution_clock: Option<(std::num::NonZeroU64, u64)>,
+    setup: Option<CarrierSetup>,
 ) -> Result<(), String> {
     let mut dispatcher = SyscallDispatcher::default();
     let reporter = carrick_kernel::compat::CompatReporter::default();
@@ -181,6 +185,9 @@ fn drive(
     if let Some((ticks_per_block, worker_blocks)) = execution_clock {
         let ceiling = carrier.trace().blocks.saturating_add(worker_blocks);
         carrier.set_execution_clock(ticks_per_block, ceiling);
+    }
+    if let Some(setup) = setup {
+        setup(&mut carrier);
     }
     let parts = carrier
         .into_worker_parts()
@@ -620,8 +627,145 @@ fn production_ring_slice_starts_after_cpl0_return_preparation() {
     let ticks_per_block =
         std::num::NonZeroU64::new(carrick_vmm_soft::carrier::SOFT_TSC_HZ / 20_000)
             .expect("50 us per block");
-    let run = run_with_options(&elf, None, Some((ticks_per_block, 200_000)));
+    let run = run_with_options(&elf, None, Some((ticks_per_block, 200_000)), None);
     assert!(run.failure.is_none(), "{}", run.summary());
+    assert!(run.stdout.is_empty(), "{}", run.summary());
+    assert_eq!(run.exit, Some(0), "{}", run.summary());
+}
+
+/// Deterministic VM-free "Busy once, then success" witness on the production
+/// CPL0 `signal_irq_return` path: while the worker spins in CPL3 with the
+/// homed leader queued on slot 0 (`queued() == 1`), hold the head record's
+/// claim as `Claim::Queued { slot: 1, seq }` across one user-origin
+/// `TIMER_VECTOR` (`0xe0`) interrupt (the window `steal_from` opens before
+/// `remove_locked`, where `runnable_head(0)` returns `None`), then restore
+/// `Claim::Queued { slot: 0, seq }` on `iretq`. The non-rotating branch must
+/// re-arm the slice timer so the next slice interrupt preempts the polling
+/// worker and runs the queued leader to exit 0.
+#[test]
+fn production_ring_rearms_slice_when_irq_return_head_is_busy_once() {
+    use carrick_sched_core::{Claim, ParkedContextWords, RecordId, SlotId, ZoneTables};
+    use carrick_x86_cpl0_host::cpl0_boot::{Cpl0BootCarrier as _, PRODUCTION_METADATA_GPA};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    type SoftCpl0Zone = ZoneTables<ParkedContextWords>;
+
+    let elf = assemble_static_fixture(
+        "slice-busy-once",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/slice_busy_once.S"
+        ),
+        &[],
+    );
+    let ticks_per_block =
+        std::num::NonZeroU64::new(carrick_vmm_soft::carrier::SOFT_TSC_HZ / 20_000)
+            .expect("50 us per block");
+    let released_once = Arc::new(AtomicBool::new(false));
+    let timer_irqs_after_hold = Arc::new(AtomicU64::new(0));
+    let setup_released = Arc::clone(&released_once);
+    let setup_timer_irqs_after_hold = Arc::clone(&timer_irqs_after_hold);
+
+    let run = run_with_options(
+        &elf,
+        None,
+        Some((ticks_per_block, 200_000)),
+        Some(Box::new(move |carrier| {
+            let ram = Arc::clone(carrier.custody().ram());
+            let zone_bytes = std::mem::size_of::<SoftCpl0Zone>();
+            let zone_pages = zone_bytes.next_multiple_of(4096);
+            let (_, _, window_len) = ram
+                .slot_windows()
+                .into_iter()
+                .find(|(base, _, _)| *base == PRODUCTION_METADATA_GPA)
+                .expect("production metadata window");
+            let zone_gpa = PRODUCTION_METADATA_GPA + (window_len - zone_pages) as u64;
+            let zone_addr = ram
+                .host_ptr(zone_gpa, zone_bytes)
+                .expect("production CPL0 zone backing") as usize;
+            let slot0 = SlotId::new(0);
+            let thief = SlotId::new(1);
+            let mut held: Option<(RecordId, u32)> = None;
+
+            carrier.set_step_observer(Box::new(move |before_cpl, after_cpl, highest_isr| {
+                let _keep_ram_alive = &ram;
+                // SAFETY: `ram` retains the aligned, boot-initialized zone for
+                // this closure's lifetime; the soft vCPU is stopped between blocks.
+                let zone = unsafe { &*(zone_addr as *const SoftCpl0Zone) };
+                if before_cpl == 3
+                    && after_cpl == 0
+                    && highest_isr == Some(carrick_x86::interrupts::TIMER_VECTOR)
+                {
+                    if setup_released.load(Ordering::Acquire) {
+                        setup_timer_irqs_after_hold.fetch_add(1, Ordering::AcqRel);
+                        return;
+                    }
+                    if held.is_none()
+                        && let Some(head) = zone.runnable_head(slot0)
+                        && zone.record(head).home() == Some(slot0)
+                    {
+                        let Claim::Queued { slot, seq } = zone.record(head).claim() else {
+                            panic!("runnable head must carry Queued claim");
+                        };
+                        assert_eq!(slot, slot0);
+                        // SAFETY: `ZoneRecord` is `#[repr(C, align(64))]` with
+                        // `claim: AtomicU64` at byte offset 0.
+                        let claim_word = unsafe {
+                            &*(std::ptr::from_ref(zone.record(head)).cast::<AtomicU64>())
+                        };
+                        claim_word
+                            .compare_exchange(
+                                Claim::Queued { slot: slot0, seq }.encode(),
+                                Claim::Queued { slot: thief, seq }.encode(),
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            )
+                            .expect("hold head claim away from slot 0");
+                        assert!(
+                            zone.runnable_head(slot0).is_none(),
+                            "contended head must make runnable_head return None"
+                        );
+                        assert_ne!(
+                            zone.slot(slot0).queued(),
+                            0,
+                            "slot 0 queue length must stay non-zero across the hold"
+                        );
+                        held = Some((head, seq));
+                    }
+                } else if before_cpl == 0
+                    && after_cpl == 3
+                    && let Some((head, seq)) = held.take()
+                {
+                    // SAFETY: `ZoneRecord` is `#[repr(C, align(64))]` with
+                    // `claim: AtomicU64` at byte offset 0.
+                    let claim_word =
+                        unsafe { &*(std::ptr::from_ref(zone.record(head)).cast::<AtomicU64>()) };
+                    claim_word
+                        .compare_exchange(
+                            Claim::Queued { slot: thief, seq }.encode(),
+                            Claim::Queued { slot: slot0, seq }.encode(),
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .expect("restore head claim to slot 0");
+                    assert_eq!(zone.runnable_head(slot0), Some(head));
+                    setup_released.store(true, Ordering::Release);
+                }
+            }));
+        })),
+    );
+    assert!(
+        released_once.load(Ordering::Acquire),
+        "busy-once hold never engaged: {}",
+        run.summary()
+    );
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert!(
+        timer_irqs_after_hold.load(Ordering::Acquire) >= 1,
+        "expected re-armed slice timer interrupt after busy-once hold: {}",
+        run.summary()
+    );
     assert!(run.stdout.is_empty(), "{}", run.summary());
     assert_eq!(run.exit, Some(0), "{}", run.summary());
 }

@@ -118,6 +118,11 @@ impl SoftRunTrace {
 /// How many recent block RIPs a [`SoftRunTrace`] keeps.
 pub const RECENT_BLOCKS: usize = 512;
 
+/// Observes `(before_cpl, after_cpl, highest_isr_vector)` after each retired
+/// soft block so a deterministic witness can inject an inter-CPU claim window
+/// across one interrupt without modifying the production CPL0 image.
+pub type SoftStepObserver = Box<dyn FnMut(u8, u8, Option<u8>) + Send>;
+
 /// One soft CPU's block loop: runs its [`SoftMachine`] to the next carrier
 /// exit under a block budget and an optional kick, and records the
 /// [`SoftRunTrace`]. The stopped carrier and the worker backend share it.
@@ -125,6 +130,7 @@ pub struct SoftRunner {
     machine: SoftMachine<SoftCarrierMemory>,
     max_blocks: u64,
     trace: SoftRunTrace,
+    step_observer: Option<SoftStepObserver>,
 }
 
 impl SoftRunner {
@@ -134,6 +140,7 @@ impl SoftRunner {
             machine,
             max_blocks,
             trace: SoftRunTrace::default(),
+            step_observer: None,
         }
     }
 
@@ -191,6 +198,7 @@ impl SoftRunner {
                 return None;
             }
             let before = self.machine.context().rip;
+            let before_cpl = self.machine.context().cpl;
             let cr3 = self.machine.context().cr3;
             if self.trace.recent.len() == RECENT_BLOCKS {
                 self.trace.recent.pop_front();
@@ -225,6 +233,10 @@ impl SoftRunner {
                     }
                     if stubs.contains(&rip) && !stubs.contains(&before) {
                         self.trace.deliveries.push((before, rip));
+                    }
+                    if let Some(observer) = self.step_observer.as_mut() {
+                        let ctx = self.machine.context();
+                        observer(before_cpl, ctx.cpl, ctx.lapic().highest_isr_vector());
                     }
                     continue;
                 }
@@ -402,6 +414,12 @@ impl SoftCarrier {
             .machine_mut()
             .set_block_tsc_clock(ticks_per_block);
         self.runner.max_blocks = max_blocks;
+    }
+
+    /// Observe `(before_cpl, after_cpl, highest_isr_vector)` after each soft
+    /// block retired on slot 0.
+    pub fn set_step_observer(&mut self, observer: SoftStepObserver) {
+        self.runner.step_observer = Some(observer);
     }
 
     /// Read `dst.len()` bytes at guest `va` through slot 0's translation in

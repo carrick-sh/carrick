@@ -44,6 +44,7 @@ vm_free = [
   "carrick-vmm-soft::soft_hello::production_ring_nanosleep_waits_on_host",
   "carrick-vmm-soft::soft_hello::production_ring_non_last_threads_raw_exit",
   "carrick-vmm-soft::soft_hello::production_ring_slice_starts_after_cpl0_return_preparation",
+  "carrick-vmm-soft::soft_hello::production_ring_rearms_slice_when_irq_return_head_is_busy_once",
 ]
 
 [bindings.unresolved]
