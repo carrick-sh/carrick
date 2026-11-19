@@ -1,6 +1,27 @@
 //! Terminal native failures retain the exact execution incarnation.
 use carrick_core_abi::{ExecutionBinding, NativeRunFailureReason};
 
+/// Recover the native-service error corresponding to a recorded run failure.
+pub(crate) const fn native_process_error_from_run_failure(
+    reason: NativeRunFailureReason,
+) -> crate::native_process_runtime::NativeProcessError {
+    use crate::native_process_runtime::NativeProcessError as E;
+    use NativeRunFailureReason as R;
+    match reason {
+        R::X86GroupExitCustody => E::GroupExitCustody,
+        R::NativeInvalid => E::Invalid,
+        R::NativeStale => E::Stale,
+        R::NativeExhausted => E::Exhausted,
+        R::NativeFault => E::Fault,
+        R::NativeUnsupported => E::Unsupported,
+        R::NativeBusy => E::Busy,
+        R::NativeQuarantined | R::BirthSettlement | R::ClaimRollback | R::BornEnqueueRefused => {
+            E::Quarantined
+        }
+        R::NativeNoChild => E::NoChild,
+    }
+}
+
 /// VM-free witness of the production terminal completion boundary.
 #[cfg(all(not(target_os = "none"), test))]
 #[derive(Debug)]
