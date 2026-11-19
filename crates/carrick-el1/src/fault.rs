@@ -483,6 +483,93 @@ impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for El1TableMai
     }
 }
 
+/// Apply one claimed descriptor transaction against `words` and `residency`,
+/// running `copy_cow_pages` for `DescriptorOp::CowRepoint` and `invalidate_asid`
+/// before completing the slot receipt.
+///
+/// For `DescriptorOp::CowRepoint`, preclaim overlapping residency rows before
+/// copying or mutating descriptors, commit the retirement only when the repoint
+/// applies, and drop (reopen) the preclaim on refusal or rollback so host-driven
+/// COW never leaves a `GRANT_LIVE` row pointing at retired `split.old` backing.
+pub fn apply_descriptor_txn_slot<W, S, FCopy, FInv>(
+    slot: &DescriptorTxnSlot,
+    mm_key: u64,
+    root: carrick_mmu_core::aarch64::SubstrateGpa,
+    words: &W,
+    residency: &carrick_el1_abi::FrameGrantResidencyTable<S>,
+    copy_cow_pages: FCopy,
+    invalidate_asid: FInv,
+) -> Option<DescriptorReceipt>
+where
+    W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    S: carrick_core_abi::mm::residency::FrameGrantResidencyAccess,
+    FCopy: FnOnce(
+        carrick_mmu_core::aarch64::SubstrateGpa,
+        carrick_mmu_core::aarch64::SubstrateGpa,
+        u64,
+    ) -> Result<(), DescriptorOutcome>,
+    FInv: FnOnce(),
+{
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorOp, DescriptorRefusal, InlineJournal, execute_descriptor_txn, plan_descriptor_op,
+    };
+    let mut journal = InlineJournal::new();
+    let claimed = slot.claim_for_mm(mm_key)?;
+    let outcome = match claimed.txn() {
+        Err(refusal) => DescriptorOutcome::Refused(refusal),
+        Ok(txn) if txn.root != root => DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot),
+        Ok(txn) => {
+            // COW's bytes, live repoint, and predecessor residency release are
+            // one guest operation under the caller's exact-MM editor. Host
+            // custody retains both backing owners until this receipt settles.
+            let cow_retirement = if let DescriptorOp::CowRepoint { va, len, .. } = txn.op {
+                match residency.begin_retire_overlapping(mm_key, va, len) {
+                    Some(retirement) => Some(retirement),
+                    None => {
+                        let receipt = claimed.complete(
+                            DescriptorOutcome::Refused(DescriptorRefusal::Contended),
+                            invalidate_asid,
+                        );
+                        return Some(receipt);
+                    }
+                }
+            } else {
+                None
+            };
+            let copied = if let DescriptorOp::CowRepoint {
+                old_ipa,
+                new_ipa,
+                len,
+                ..
+            } = txn.op
+            {
+                plan_descriptor_op(words, root, txn.op)
+                    .map_err(DescriptorOutcome::Refused)
+                    .and_then(|_| copy_cow_pages(old_ipa, new_ipa, len))
+            } else {
+                Ok(())
+            };
+            let outcome = match copied {
+                Ok(()) => execute_descriptor_txn(words, root, txn, &mut journal).outcome,
+                Err(outcome) => outcome,
+            };
+            if let Some(retirement) = cow_retirement {
+                if matches!(outcome, DescriptorOutcome::Applied(_)) {
+                    let _ = retirement.commit();
+                } else {
+                    drop(retirement);
+                }
+            }
+            outcome
+        }
+    };
+    let receipt = claimed.complete(outcome, invalidate_asid);
+    if let DescriptorOutcome::Indeterminate(refusal) = receipt.outcome {
+        panic!("EL1 descriptor transaction rollback failed: {refusal:?}");
+    }
+    Some(receipt)
+}
+
 #[cfg(target_os = "none")]
 pub struct HardwareDescriptorTxnApplier;
 
@@ -494,10 +581,9 @@ impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
         mm_key: u64,
         ttbr0: u64,
     ) -> Option<DescriptorReceipt> {
-        use carrick_mmu_core::aarch64::descriptor_txn::{
-            DescriptorOp, InlineJournal, PrimaryTableWords, execute_descriptor_txn,
-            plan_descriptor_op,
-        };
+        use carrick_mmu_core::aarch64::SubstrateGpa;
+        use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
+        use carrick_mmu_core::aarch64::descriptor_txn::copy_window::with_cow_copy_aliases;
         let maintenance = El1TableMaintenance { ttbr0 };
         let words = unsafe {
             PrimaryTableWords::new(
@@ -509,70 +595,42 @@ impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
             .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
         }
         .ok()?;
-        let mut journal = InlineJournal::new();
-        let root = carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK);
-        let claimed = slot.claim_for_mm(mm_key)?;
-        let outcome = match claimed.txn() {
-            Err(refusal) => DescriptorOutcome::Refused(refusal),
-            Ok(txn) if txn.root != root => DescriptorOutcome::Refused(
-                carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot,
-            ),
-            Ok(txn) => {
-                // COW's bytes and live repoint are one guest operation under
-                // the caller's exact-MM editor. Host custody retains both
-                // backing owners until this transaction's receipt settles.
-                let copied = if let DescriptorOp::CowRepoint {
-                    old_ipa,
-                    new_ipa,
-                    len,
-                    ..
-                } = txn.op
-                {
-                    plan_descriptor_op(&words, root, txn.op)
-                        .map_err(DescriptorOutcome::Refused)
-                        .and_then(|_| {
-                            use carrick_mmu_core::aarch64::SubstrateGpa;
-                            use carrick_mmu_core::aarch64::descriptor_txn::copy_window::with_cow_copy_aliases;
-                            for offset in (0..len).step_by(4096) {
-                                with_cow_copy_aliases(
-                                    &words,
-                                    root,
-                                    carrick_el1_abi::EL1_COW_COPY_BASE,
-                                    SubstrateGpa(old_ipa.raw() + offset),
-                                    SubstrateGpa(new_ipa.raw() + offset),
-                                    |source, destination| {
-                                        // SAFETY: aliases expose pinned, distinct
-                                        // pages: source RO, destination RW, both
-                                        // kernel-only; revoked before returning.
-                                        unsafe {
-                                            core::ptr::copy_nonoverlapping(
-                                                source as *const u8,
-                                                destination as *mut u8,
-                                                4096,
-                                            );
-                                        }
-                                    },
-                                )?;
+        let root = SubstrateGpa(ttbr0 & TTBR_BADDR_MASK);
+        apply_descriptor_txn_slot(
+            slot,
+            mm_key,
+            root,
+            &words,
+            crate::isa::frame_grant_residency_guest(),
+            |old_ipa, new_ipa, len| {
+                for offset in (0..len).step_by(4096) {
+                    with_cow_copy_aliases(
+                        &words,
+                        root,
+                        carrick_el1_abi::EL1_COW_COPY_BASE,
+                        SubstrateGpa(old_ipa.raw() + offset),
+                        SubstrateGpa(new_ipa.raw() + offset),
+                        |source, destination| {
+                            // SAFETY: aliases expose pinned, distinct pages:
+                            // source RO, destination RW, both kernel-only;
+                            // revoked before returning.
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    source as *const u8,
+                                    destination as *mut u8,
+                                    4096,
+                                );
                             }
-                            Ok(())
-                        })
-                } else {
-                    Ok(())
-                };
-                match copied {
-                    Ok(()) => execute_descriptor_txn(&words, root, txn, &mut journal).outcome,
-                    Err(outcome) => outcome,
+                        },
+                    )?;
                 }
-            }
-        };
-        let receipt = claimed.complete(outcome, || {
-            let mut cpu = crate::substrate::sched::HardwareCpu;
-            crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
-        });
-        if let DescriptorOutcome::Indeterminate(refusal) = receipt.outcome {
-            panic!("EL1 descriptor transaction rollback failed: {refusal:?}");
-        }
-        Some(receipt)
+                Ok(())
+            },
+            || {
+                let mut cpu = crate::substrate::sched::HardwareCpu;
+                crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
+            },
+        )
     }
 }
 
@@ -3755,6 +3813,182 @@ mod tests {
             .unwrap();
             assert_eq!(frames.destination, frames.source);
             assert_eq!(copy.grant(), grant);
+        }
+
+        #[test]
+        fn cow_repoint_descriptor_txn_retires_overlapping_residency_and_refuses_when_pinned() {
+            use carrick_el1_abi::{FrameGrantResidencyIdentity, FrameGrantResidencyTable};
+            use carrick_mmu_core::aarch64::descriptor_txn::{
+                BackingIdentity, CowRepointAccess, DescriptorOp, DescriptorOutcome,
+                DescriptorRefusal, DescriptorTxn, DescriptorTxnId, DescriptorTxnSlot,
+                PrimaryTableWords, TableGrants, TableMaintenance,
+            };
+
+            struct NoBarrier;
+            impl TableMaintenance for NoBarrier {
+                fn publish_barrier(&self) {}
+                fn invalidate_range(&self, _: u64, _: u64) {}
+            }
+
+            let mm = 77u64;
+            let new_ipa = 0x009d_0000_0000u64;
+            let (arena, arm) = armable();
+            let byte_len = arena.words.len() * core::mem::size_of::<AtomicU64>();
+            let words = unsafe {
+                PrimaryTableWords::new(arena.words.as_ptr().cast_mut(), ROOT, byte_len, &NoBarrier)
+            }
+            .unwrap();
+            // Arm COW on the resident writable page at VA (pointing to IPA).
+            let slot = DescriptorTxnSlot::new();
+            assert!(slot.submit(&arm));
+            let residency = std::boxed::Box::new(FrameGrantResidencyTable::new());
+            let arm_receipt = apply_descriptor_txn_slot(
+                &slot,
+                mm,
+                SubstrateGpa(ROOT),
+                &words,
+                &residency,
+                |_, _, _| Ok(()),
+                || {},
+            )
+            .expect("arm receipt");
+            assert!(matches!(arm_receipt.outcome, DescriptorOutcome::Applied(_)));
+            assert!(slot.take_receipt(arm.id).is_some());
+
+            // Publish the pre-COW residency row for (mm, VA -> IPA).
+            let identity = FrameGrantResidencyIdentity {
+                mm_key: mm,
+                semantic_base: VA,
+                physical_ipa: IPA,
+                len: 4096,
+                mapping_id: 11,
+                frame_id: 22,
+                owner_generation: 33,
+                inventory_revision: 44,
+            };
+            assert!(residency.publish(identity).is_some());
+            let row = residency.lookup(mm, VA).expect("live pre-COW row");
+            assert!(residency.record_commit(row));
+
+            let cow_txn = |generation: u64, expected_old_ipa: u64| DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: nz(mm),
+                    generation: nz(generation),
+                },
+                root: SubstrateGpa(ROOT),
+                op: DescriptorOp::CowRepoint {
+                    access: CowRepointAccess::User { writable_pages: 1 },
+                    va: VA,
+                    len: 4096,
+                    old_ipa: SubstrateGpa(expected_old_ipa),
+                    new_ipa: SubstrateGpa(new_ipa),
+                    backing: BackingIdentity {
+                        frame_id: nz(55),
+                        mapping_id: nz(66),
+                        owner_generation: nz(77),
+                        inventory_revision: nz(88),
+                    },
+                },
+                tables: TableGrants::new(&[]).unwrap(),
+            };
+
+            // 1. While a transfer pin holds the overlapping residency row,
+            // CowRepoint must refuse cleanly before touching descriptors.
+            let pin = residency.pin_transfer(row).expect("transfer pin");
+            let pinned_txn = cow_txn(10, IPA);
+            assert!(slot.submit(&pinned_txn));
+            let mut copied = 0usize;
+            let pinned_receipt = apply_descriptor_txn_slot(
+                &slot,
+                mm,
+                SubstrateGpa(ROOT),
+                &words,
+                &residency,
+                |_, _, _| {
+                    copied += 1;
+                    Ok(())
+                },
+                || {},
+            )
+            .expect("pinned refusal receipt");
+            assert_eq!(
+                pinned_receipt.outcome,
+                DescriptorOutcome::Refused(DescriptorRefusal::Contended)
+            );
+            assert_eq!(copied, 0, "pinned CowRepoint must not copy or mutate PTE");
+            assert_eq!(arena.leaf(VA) & 0x0000_FFFF_FFFF_F000, IPA);
+            assert!(slot.take_receipt(pinned_txn.id).is_some());
+            drop(pin);
+
+            // 2. A refused CowRepoint (wrong old_ipa) must reopen its residency
+            // preclaim so the row remains live and pinnable.
+            let wrong_txn = cow_txn(11, IPA + 0x2000);
+            assert!(slot.submit(&wrong_txn));
+            let wrong_receipt = apply_descriptor_txn_slot(
+                &slot,
+                mm,
+                SubstrateGpa(ROOT),
+                &words,
+                &residency,
+                |_, _, _| Ok(()),
+                || {},
+            )
+            .expect("wrong-ipa receipt");
+            assert!(matches!(
+                wrong_receipt.outcome,
+                DescriptorOutcome::Refused(_)
+            ));
+            assert!(slot.take_receipt(wrong_txn.id).is_some());
+            let still_live = residency
+                .lookup(mm, VA)
+                .expect("refused CowRepoint must keep residency row live");
+            drop(
+                residency
+                    .pin_transfer(still_live)
+                    .expect("refused CowRepoint must reopen residency preclaim"),
+            );
+
+            // 3. An applied CowRepoint must atomically retire the overlapping
+            // residency row so host split-inventory retirement never leaves a
+            // stale_backing row in FrameGrantResidencyTable.
+            let epoch_before = residency.retirement_epoch();
+            let good_txn = cow_txn(12, IPA);
+            assert!(slot.submit(&good_txn));
+            let mut copied = 0usize;
+            let mut invalidated = 0usize;
+            let applied_receipt = apply_descriptor_txn_slot(
+                &slot,
+                mm,
+                SubstrateGpa(ROOT),
+                &words,
+                &residency,
+                |old, new, len| {
+                    assert_eq!(old.raw(), IPA);
+                    assert_eq!(new.raw(), new_ipa);
+                    assert_eq!(len, 4096);
+                    copied += 1;
+                    Ok(())
+                },
+                || {
+                    invalidated += 1;
+                },
+            )
+            .expect("applied receipt");
+            assert!(matches!(
+                applied_receipt.outcome,
+                DescriptorOutcome::Applied(_)
+            ));
+            assert_eq!(copied, 1);
+            assert_eq!(invalidated, 1);
+            assert_eq!(arena.leaf(VA) & 0x0000_FFFF_FFFF_F000, new_ipa);
+            assert!(
+                residency.lookup(mm, VA).is_none(),
+                "applied CowRepoint must retire overlapping residency row"
+            );
+            assert!(
+                residency.retirement_epoch() > epoch_before,
+                "applied CowRepoint must advance retirement_epoch"
+            );
         }
     }
 }
