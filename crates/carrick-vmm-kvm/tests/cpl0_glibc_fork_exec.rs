@@ -6,8 +6,6 @@
 #[allow(dead_code)]
 #[path = "common/kvm_pool_fixture.rs"]
 mod kvm_pool_fixture;
-#[path = "../../carrick-cli/tests/fixtures/x86_process_entry.rs"]
-mod x86_process_entry;
 
 #[test]
 fn production_ring_runs_glibc_fork_exec_wait_on_kvm() {
@@ -15,12 +13,25 @@ fn production_ring_runs_glibc_fork_exec_wait_on_kvm() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../carrick-vmm-soft/tests/fixtures");
     let dir = tempfile::tempdir().expect("fixture root");
     let parent = dir.path().join("parent");
-    x86_process_entry::compile_static_fixture(&sources.join("x86_glibc_fork_exec.c"), &parent, &[]);
-    x86_process_entry::compile_static_fixture(
-        &sources.join("x86_fork_exec_child.S"),
-        &dir.path().join("fork-exec-child"),
-        &["-nostdlib"],
-    );
+    let successor = dir.path().join("fork-exec-child");
+    for (source, output, flags) in [
+        ("x86_glibc_fork_exec.c", &parent, &[][..]),
+        ("x86_fork_exec_child.S", &successor, &["-nostdlib"][..]),
+    ] {
+        let build = std::process::Command::new("timeout")
+            .args(["15", "cc", "-static", "-no-pie", "-Wl,--build-id=none"])
+            .args(flags)
+            .arg(sources.join(source))
+            .arg("-o")
+            .arg(output)
+            .output()
+            .expect("compile static fixture");
+        assert!(
+            build.status.success(),
+            "compile {source}: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
 
     let elf = std::fs::read(parent).expect("compiled parent");
     let program =
