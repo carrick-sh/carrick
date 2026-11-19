@@ -1409,6 +1409,12 @@ ci-prebuild-xtask:
 ci-toolchain:
     rustup show active-toolchain
 
+# The soft carrier executes the guest in software and shares its wall-clock
+# watchdog with the native fixture. Run it with the shipped optimizations.
+ci-test-x86-host:
+    cargo test --locked --offline -p carrick-softcpu-x86 -p carrick-softmmu -p carrick-x86-cpl0-host
+    cargo test --locked --offline --release -p carrick-vmm-soft
+
 ci-install-semgrep:
     #!/usr/bin/env bash
     set -euo pipefail
