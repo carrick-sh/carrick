@@ -63,6 +63,16 @@ pub struct FrameGrantResponse {
     pub request: FrameGrantRequest,
 }
 
+/// Result of attempting to publish a prepared grant in its claimed slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameGrantCompletion {
+    Published,
+    SlotNotWorking,
+    StaleRequest,
+    InvalidReady,
+    PublicationDeclined,
+}
+
 /// Host-published bulk first-touch protocol.
 ///
 /// A slot transports a request, never ownership of unpublished leaves. EL1
@@ -181,9 +191,7 @@ impl FrameGrantMailbox {
         let Some(end) = ready.semantic_base.checked_add(ready.len) else {
             return false;
         };
-        ready.mm_key == request.mm_key
-            && ready.request_generation == request.request_generation
-            && ready.semantic_base.is_multiple_of(Self::PAGE_SIZE)
+        ready.semantic_base.is_multiple_of(Self::PAGE_SIZE)
             && ready.physical_ipa.is_multiple_of(Self::PAGE_SIZE)
             && ready.len != 0
             && ready.len <= request.requested_len
@@ -313,21 +321,27 @@ impl FrameGrantMailbox {
         ready: FrameGrantReady,
         publish: impl FnOnce(FrameGrantReady) -> Result<bool, E>,
         commit: impl FnOnce(),
-    ) -> Result<bool, E> {
-        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING
-            || !self
-                .load_request()
-                .is_some_and(|request| Self::ready_is_valid(request, ready))
+    ) -> Result<FrameGrantCompletion, E> {
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING {
+            return Ok(FrameGrantCompletion::SlotNotWorking);
+        }
+        let Some(request) = self.load_request() else {
+            return Ok(FrameGrantCompletion::StaleRequest);
+        };
+        if request.mm_key != ready.mm_key || request.request_generation != ready.request_generation
         {
-            return Ok(false);
+            return Ok(FrameGrantCompletion::StaleRequest);
+        }
+        if !Self::ready_is_valid(request, ready) {
+            return Ok(FrameGrantCompletion::InvalidReady);
         }
         if !publish(ready)? {
-            return Ok(false);
+            return Ok(FrameGrantCompletion::PublicationDeclined);
         }
         commit();
         self.state
             .store(FRAME_GRANT_MAILBOX_IDLE, Ordering::Release);
-        Ok(true)
+        Ok(FrameGrantCompletion::Published)
     }
 
     pub fn publish_refusal(&self, status: u64) -> bool {
