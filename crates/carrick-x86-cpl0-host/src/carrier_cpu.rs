@@ -1063,6 +1063,9 @@ mod tests {
         }
         fn run(&mut self) -> Result<VcpuExit, TrapError> {
             self.image = self.child_image.clone();
+            if self.port == 0 {
+                return Ok(VcpuExit::Kicked);
+            }
             let data = if self.port == carrick_x86::cpl0_entry::FORWARD_PORT {
                 vec![0]
             } else {
@@ -1108,6 +1111,22 @@ mod tests {
         fn set_fs_base(&mut self, _: u64) -> Result<(), TrapError> {
             Err(boundary_error("unused test FS"))
         }
+    }
+    #[test]
+    fn kicked_child_on_root_executor_keeps_its_issued_root() {
+        let root = context(1);
+        let child = context(2);
+        let mut cpu = CarrierCpu::new(ChildRetireIo {
+            image: root.hardware_image(),
+            child_image: child.hardware_image(),
+            port: 0,
+        })
+        .unwrap();
+        cpu.load(root.clone()).unwrap();
+        cpu.register_child_binding(child.binding()).unwrap();
+        let stopped = cpu.run_loaded(root.binding().task()).unwrap();
+        assert_eq!(stopped.exit, CarrierRunExit::Kick);
+        assert_eq!(stopped.state.unwrap().binding(), child.binding());
     }
     #[test]
     fn child_owner_grant_on_root_executor_is_a_physical_boundary() {
