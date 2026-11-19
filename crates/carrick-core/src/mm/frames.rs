@@ -221,6 +221,200 @@ fn authenticate_target<
     })
 }
 
+/// Outcome of one grant-application attempt under the exact MM editor.
+/// `ResidencyCapacity` releases both the descriptor claim (`SUBMITTED`) and
+/// the MM editor without publishing a terminal receipt so the caller can grow
+/// carrier residency storage outside the editor or park on a typed not-now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrantApplyOutcome {
+    Empty,
+    Completed(carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt),
+    ResidencyCapacity { observed_extensions: usize },
+}
+
+/// Owned continuation returned when residency growth is temporarily refused
+/// (metadata allocation pressure, concurrent segment publisher, or full
+/// segment directory). Holds no MM editor or descriptor claim; the submission
+/// remains `SUBMITTED` in the grant slot so the caller can enrol on the next
+/// retirement or metadata progress, probe once via [`Self::ready_to_retry`],
+/// and rerun without returning a fatal error or errno.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidencyGrowthContinuation {
+    pub observed_extensions: usize,
+    pub observed_retirement: u64,
+    pub refusal: ResidencyGrowthRefusal,
+    pub owner_wait: Option<PortalOwnerWait>,
+}
+
+impl ResidencyGrowthContinuation {
+    /// Probe once after enrolling on the next retirement or metadata progress.
+    /// Returns true if a retirement or segment publication already advanced
+    /// past the observed refusal.
+    pub fn ready_to_retry(&self, table: &FrameGrantResidencyTable) -> bool {
+        table.extension_count() > self.observed_extensions
+            || table.retirement_epoch() != self.observed_retirement
+            || (self.refusal == ResidencyGrowthRefusal::Publishing && !table.is_publishing())
+    }
+}
+
+/// Outcome of serving one owner grant with automatic residency growth.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrantServeOutcome {
+    Empty,
+    Completed(carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt),
+    NotNow(ResidencyGrowthContinuation),
+}
+
+/// Attempt to grow residency outside any MM editor; if growth is refused,
+/// package the typed not-now continuation so the caller can probe once for a
+/// racing retirement/publication or park on its wait source.
+#[inline(never)]
+pub fn grow_residency_or_not_now(
+    table: &FrameGrantResidencyTable,
+    allocator: &impl ReservationMetadataAllocator,
+    observed_extensions: usize,
+    observed_retirement: u64,
+    owner_wait: Option<PortalOwnerWait>,
+) -> Result<(), ResidencyGrowthContinuation> {
+    match table.grow(allocator, observed_extensions) {
+        Ok(()) => Ok(()),
+        Err(refusal) => Err(ResidencyGrowthContinuation {
+            observed_extensions,
+            observed_retirement,
+            refusal,
+            owner_wait,
+        }),
+    }
+}
+
+/// Revalidate an owner-selected lazy window and apply its isolated submission,
+/// growing the carrier residency table outside the MM editor when existing
+/// segments are saturated. A refused growth returns a typed
+/// [`GrantServeOutcome::NotNow`] continuation with both the MM editor and
+/// descriptor claim released.
+///
+/// # Safety
+/// `table` must live in the same guest allocator venue as `allocator`: every
+/// published segment address must remain mapped in this venue for the call.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn serve_grant_with_venue<
+    P: PinnedMetadataExtent,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    Venue: OwnerVenue<Context>,
+    B: OwnerGrantMmu,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
+    slot: &carrick_core_abi::PortalGrantSlot,
+    table: &FrameGrantResidencyTable,
+    allocator: &impl ReservationMetadataAllocator,
+    worker: u32,
+    mut apply_in_venue: impl FnMut(
+        GrantTarget<'_, Context>,
+        &FrameGrantResidencyTable<ResidencyRows<'_>>,
+    ) -> Result<GrantApplyOutcome, MmError>,
+) -> Result<GrantServeOutcome, MmError> {
+    let Some(window) = slot.window() else {
+        return Ok(GrantServeOutcome::Empty);
+    };
+    // SAFETY: candidate handle authenticated by `observe_wait` and
+    // `grant_target` below before any descriptor or residency effect.
+    let handle = unsafe {
+        El1MmHandle::from_admitted_owner(
+            window.operation.carrier,
+            window.operation.mm,
+            window.operation.incarnation,
+        )
+    };
+    for attempt in 0..2 {
+        let observed_retirement = table.retirement_epoch();
+        let owner_wait = portal.observe_wait(handle, carrick_core_abi::PortalWaitCause::Metadata)?;
+        let target = grant_target(portal, &window, worker)?;
+        // SAFETY: caller guarantees `table` is in `allocator`'s guest venue.
+        let view = unsafe { table.guest_view() };
+        match apply_in_venue(target, &view)? {
+            GrantApplyOutcome::Completed(receipt) => {
+                return Ok(GrantServeOutcome::Completed(receipt));
+            }
+            GrantApplyOutcome::Empty => return Ok(GrantServeOutcome::Empty),
+            GrantApplyOutcome::ResidencyCapacity {
+                observed_extensions,
+            } => {
+                // Both the descriptor claim and MM editor are released before
+                // asking the carrier metadata allocator for another segment.
+                match grow_residency_or_not_now(
+                    table,
+                    allocator,
+                    observed_extensions,
+                    observed_retirement,
+                    owner_wait,
+                ) {
+                    Ok(()) => continue,
+                    Err(continuation) => {
+                        if attempt == 0 && continuation.ready_to_retry(table) {
+                            continue;
+                        }
+                        return Ok(GrantServeOutcome::NotNow(continuation));
+                    }
+                }
+            }
+        }
+    }
+    let owner_wait = portal.observe_wait(handle, carrick_core_abi::PortalWaitCause::Metadata)?;
+    Ok(GrantServeOutcome::NotNow(ResidencyGrowthContinuation {
+        observed_extensions: table.extension_count(),
+        observed_retirement: table.retirement_epoch(),
+        refusal: ResidencyGrowthRefusal::Publishing,
+        owner_wait,
+    }))
+}
+
+/// Revalidate an owner-selected lazy window and apply its isolated submission
+/// over an existing [`LiveDescriptorWords`] view, growing residency storage
+/// outside the MM editor when needed.
+///
+/// # Safety
+/// `table` must live in the same guest allocator venue as `allocator`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn serve_grant_with_allocator<
+    P: PinnedMetadataExtent,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    Venue: OwnerVenue<Context>,
+    B: OwnerGrantMmu,
+    W: LiveDescriptorWords + ?Sized,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
+    slot: &carrick_core_abi::PortalGrantSlot,
+    words: &W,
+    table: &FrameGrantResidencyTable,
+    allocator: &impl ReservationMetadataAllocator,
+    worker: u32,
+    mut invalidate: impl FnMut(),
+) -> Result<GrantServeOutcome, MmError> {
+    // SAFETY: forwarded from caller.
+    unsafe {
+        serve_grant_with_venue(
+            portal,
+            slot,
+            table,
+            allocator,
+            worker,
+            |target, residency| {
+                Ok(try_apply_grant::<B, _>(
+                    slot,
+                    words,
+                    residency,
+                    target,
+                    &mut invalidate,
+                ))
+            },
+        )
+    }
+}
+
 /// Revalidate an owner-selected lazy window and apply its isolated submission
 /// through the existing descriptor executor. Normal descriptor drains cannot
 /// see the submission before this exact-generation check.
@@ -249,6 +443,19 @@ pub fn serve_grant<
     ))
 }
 
+/// Attempt one grant application under `target`'s MM editor. On residency
+/// capacity exhaustion, releases both the descriptor claim (`SUBMITTED`) and
+/// the MM editor without publishing a terminal refusal receipt.
+pub fn try_apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
+    slot: &carrick_core_abi::PortalGrantSlot,
+    words: &W,
+    residency: &FrameGrantResidencyTable<impl FrameGrantResidencyAccess>,
+    target: GrantTarget<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
+    invalidate: impl FnOnce(),
+) -> GrantApplyOutcome {
+    apply_grant_inner::<B, _>(slot, words, residency, target, invalidate, true)
+}
+
 pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
     slot: &carrick_core_abi::PortalGrantSlot,
     words: &W,
@@ -256,12 +463,29 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
     target: GrantTarget<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     invalidate: impl FnOnce(),
 ) -> Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt> {
+    match apply_grant_inner::<B, _>(slot, words, residency, target, invalidate, false) {
+        GrantApplyOutcome::Completed(receipt) => Some(receipt),
+        GrantApplyOutcome::Empty | GrantApplyOutcome::ResidencyCapacity { .. } => None,
+    }
+}
+
+#[inline(never)]
+fn apply_grant_inner<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
+    slot: &carrick_core_abi::PortalGrantSlot,
+    words: &W,
+    residency: &FrameGrantResidencyTable<impl FrameGrantResidencyAccess>,
+    target: GrantTarget<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
+    invalidate: impl FnOnce(),
+    release_on_capacity: bool,
+) -> GrantApplyOutcome {
     use carrick_mmu_core::aarch64::descriptor_txn::{
         DescriptorOp, DescriptorOutcome, DescriptorRefusal,
     };
     let (window, grant, editor, authenticated) = target.into_parts();
     let mm = window.operation.mm;
-    let claimed = slot.descriptor().claim_for_mm(mm.raw())?;
+    let Some(claimed) = slot.descriptor().claim_for_mm(mm.raw()) else {
+        return GrantApplyOutcome::Empty;
+    };
     use carrick_mmu_core::live_descriptor_words::{GrantRefusalTrace, ObservedDescriptorWords};
 
     let trace_requested = claimed.grant_trace_requested();
@@ -275,12 +499,20 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
         words,
         observe: trace_requested.then_some(&observe as &dyn Fn(_)),
     };
+    enum OutcomeOrCapacity {
+        Terminal(DescriptorOutcome),
+        Capacity(usize),
+    }
     let outcome = (|| {
         let Ok(txn) = claimed.txn() else {
-            return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
+            return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                DescriptorRefusal::BadEncoding,
+            ));
         };
         if !authenticated {
-            return DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot);
+            return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                DescriptorRefusal::StaleRoot,
+            ));
         }
         if let DescriptorOp::Publish { span, access, .. } = txn.op {
             // This reply owns existing fork custody, not a fresh grant. The
@@ -308,7 +540,9 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
                 || !txn.tables.as_slice().is_empty()
                 || !permitted
             {
-                return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
+                return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                    DescriptorRefusal::BadEncoding,
+                ));
             }
             // Another publisher may have made this instruction usable while
             // the owner retained its reply, including at a different output
@@ -327,9 +561,11 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
                     Ok(Some(_))
                 )
             {
-                return DescriptorOutcome::Refused(DescriptorRefusal::Occupied);
+                return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                    DescriptorRefusal::Occupied,
+                ));
             }
-            return B::execute_grant(words, grant.ttbr0, txn);
+            return OutcomeOrCapacity::Terminal(B::execute_grant(words, grant.ttbr0, txn));
         }
         let DescriptorOp::Prepare {
             publication,
@@ -337,7 +573,9 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
             backing,
         } = txn.op
         else {
-            return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
+            return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                DescriptorRefusal::BadEncoding,
+            ));
         };
         if publication.va != window.range.start()
             || publication.len > window.range.len()
@@ -355,7 +593,9 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
             || resident.va != window.fault_page
             || resident.len != 4096
         {
-            return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
+            return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                DescriptorRefusal::BadEncoding,
+            ));
         }
         // The authenticated remapped root may replace a core-typed retired
         // terminal with fresh backing. Never revive its output, or replace a
@@ -363,8 +603,14 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
         for va in (publication.va..publication.va + publication.len).step_by(4096) {
             match grant_page_available::<B, _>(words, grant.ttbr0, va) {
                 Ok(true) => {}
-                Ok(false) => return DescriptorOutcome::Refused(DescriptorRefusal::Occupied),
-                Err(reason) => return DescriptorOutcome::Refused(reason),
+                Ok(false) => {
+                    return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                        DescriptorRefusal::Occupied,
+                    ));
+                }
+                Err(reason) => {
+                    return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(reason));
+                }
             }
         }
         let identity = carrick_core_abi::FrameGrantResidencyIdentity {
@@ -380,14 +626,21 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
         let residency_slot = match residency.try_publish(identity) {
             Ok(slot) => slot,
             Err(FrameGrantResidencyRefusal::InvalidIdentity) => {
-                return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
+                return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                    DescriptorRefusal::BadEncoding,
+                ));
             }
             Err(FrameGrantResidencyRefusal::Overlap) => {
                 // The descriptor walk above ruled out an occupied leaf. A
                 // live overlapping record now indicates mismatched custody.
-                return DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking);
+                return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                    DescriptorRefusal::WrongBacking,
+                ));
             }
             Err(FrameGrantResidencyRefusal::Capacity) => {
+                if release_on_capacity {
+                    return OutcomeOrCapacity::Capacity(residency.published_extensions());
+                }
                 if words.observe_residency_failure() {
                     words.descriptor_diagnostic(
                         carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic::ResidencyRefused {
@@ -399,7 +652,9 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
                         },
                     );
                 }
-                return DescriptorOutcome::Refused(DescriptorRefusal::ResidencyCapacity);
+                return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                    DescriptorRefusal::ResidencyCapacity,
+                ));
             }
         };
         let outcome = B::execute_grant(words, grant.ttbr0, txn);
@@ -415,15 +670,26 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
             }
             residency.retire(residency_slot, identity);
         }
-        outcome
+        OutcomeOrCapacity::Terminal(outcome)
     })();
-    let receipt = claimed.complete_with_grant_trace(
-        outcome,
-        invalidate,
-        trace_requested.then(|| trace.get()),
-    );
-    drop(editor);
-    Some(receipt)
+    match outcome {
+        OutcomeOrCapacity::Capacity(observed_extensions) => {
+            claimed.release_unapplied();
+            drop(editor);
+            GrantApplyOutcome::ResidencyCapacity {
+                observed_extensions,
+            }
+        }
+        OutcomeOrCapacity::Terminal(outcome) => {
+            let receipt = claimed.complete_with_grant_trace(
+                outcome,
+                invalidate,
+                trace_requested.then(|| trace.get()),
+            );
+            drop(editor);
+            GrantApplyOutcome::Completed(receipt)
+        }
+    }
 }
 
 /// Logical leaf references for one physical backing. The backend owns storage
