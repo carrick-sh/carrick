@@ -1479,6 +1479,7 @@ impl Fixture {
             arena_len,
         )
     }
+    #[cfg(test)]
     fn with_identity(
         root_gpa: u64,
         asid: carrick_guest_arch::Asid,
