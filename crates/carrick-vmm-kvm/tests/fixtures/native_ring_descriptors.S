@@ -40,7 +40,7 @@ _start:
     call list_directory             /* steps 30-33 */
     xor %edi, %edi
     jmp exit
-#elif defined(CHILD) || defined(DIRFD)
+#elif defined(CHILD) || defined(DIRFD) || defined(FILEOPS)
     mov $-100, %edi                 /* openat(AT_FDCWD, file, O_RDONLY|O_CLOEXEC) */
     lea file(%rip), %rsi
     mov $0x80000, %edx
@@ -100,7 +100,88 @@ _start:
 #endif
     jmp exit
 child:
-#ifdef DIRFD
+#ifdef FILEOPS
+    mov $-100, %edi                /* open a file writable for allocation */
+    lea file(%rip), %rsi
+    mov $2, %edx
+    xor %r10d, %r10d
+    mov $257, %eax
+    syscall
+    mov $78, %edi
+    test %rax, %rax
+    js exit
+    mov %rax, %r12
+
+    mov %r12, %rdi
+    mov $74, %eax                  /* fsync */
+    syscall
+    mov $79, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r12, %rdi
+    mov $75, %eax                  /* fdatasync */
+    syscall
+    mov $80, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r12, %rdi
+    xor %esi, %esi
+    mov $5, %edx
+    mov $2, %r10d
+    mov $277, %eax                 /* sync_file_range */
+    syscall
+    mov $81, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r12, %rdi
+    mov $306, %eax                 /* syncfs */
+    syscall
+    mov $82, %edi
+    test %rax, %rax
+    jne exit
+
+    lea file(%rip), %rdi
+    lea st(%rip), %rsi
+    mov $137, %eax                 /* statfs */
+    syscall
+    mov $83, %edi
+    test %rax, %rax
+    jne exit
+    cmpq $0, st(%rip)
+    je exit
+
+    mov %r12, %rdi
+    lea st(%rip), %rsi
+    mov $138, %eax                 /* fstatfs */
+    syscall
+    mov $84, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r12, %rdi
+    xor %esi, %esi
+    xor %edx, %edx
+    mov $4096, %r10d
+    mov $285, %eax                 /* fallocate */
+    syscall
+    mov $85, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r12, %rdi
+    xor %esi, %esi
+    mov $2, %edx                   /* SEEK_END */
+    mov $8, %eax
+    syscall
+    mov $86, %edi
+    cmp $4096, %rax
+    jne exit
+    xor %edi, %edi
+    jmp exit
+#elif defined(DIRFD)
     mov %r13, %rdi
     lea subdir(%rip), %rsi
     mov $0755, %edx
