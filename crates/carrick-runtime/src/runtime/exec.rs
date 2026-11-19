@@ -110,7 +110,16 @@ fn prepare_native_exec_image(
         payload,
         descriptor_source,
         |files, target, argv, env| {
-            load_execve_image(&capability.loader, files, target, argv, env, false)
+            let mut loaded =
+                load_execve_image(&capability.loader, files, target, argv, env, false)?;
+            // Native adoption maps this image directly. Publish the run's
+            // calibrated epoch into its private vvar before the carrier maps it.
+            capability
+                .loader
+                .clock
+                .publish_vvar_realtime_offset(&mut loaded.image)
+                .map_err(|_| crate::linux_abi::LINUX_EIO)?;
+            Ok(loaded)
         },
     )
 }
@@ -1394,7 +1403,11 @@ mod tests {
 
         #[cfg(feature = "platform-macos")]
         let elf = synthetic_aarch64_exec();
-        #[cfg(not(feature = "platform-macos"))]
+        #[cfg(any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ))]
         let elf = synthetic_exec(native_guest_elf_machine(), [0; 4]);
 
         let directory = tempfile::tempdir().unwrap();
