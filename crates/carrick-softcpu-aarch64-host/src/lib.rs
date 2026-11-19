@@ -44,6 +44,11 @@ pub struct HostBlockRunner {
 
 impl HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    pub fn publication_work(&self) -> carrick_host_jit::PublicationWork {
+        self.code.publication_work()
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     pub fn new() -> Result<Self, HostError> {
         let frames = FRAME_REGION_BYTES / core::mem::size_of::<BlockFrame>();
         Ok(Self {

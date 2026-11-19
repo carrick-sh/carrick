@@ -224,12 +224,12 @@ fn ldtr_at_el1_is_checked_as_el0_and_aborts_at_the_current_el() {
     // EL1 LDTR from a kernel-only page: permission fault, L3, EC 0x25.
     let mut r = Rig::el1();
     r.set(0, KDATA + 0x40);
-    assert_eq!(r.run(LDTR_X1_X0), Outcome::Continue);
+    assert_eq!(r.run(LDTR_X1_X0), Outcome::Fault);
     r.assert_abort(0x200, 0x9600_000f, KDATA + 0x40);
     // STTR: the same with WnR.
     let mut r = Rig::el1();
     r.set(0, KDATA + 0x48);
-    assert_eq!(r.run(STTR_X1_X0), Outcome::Continue);
+    assert_eq!(r.run(STTR_X1_X0), Outcome::Fault);
     r.assert_abort(0x200, 0x9600_004f, KDATA + 0x48);
     // From a user page with PAN set, LDTR succeeds; an ordinary LDR faults.
     let mut r = Rig::el1();
@@ -239,14 +239,14 @@ fn ldtr_at_el1_is_checked_as_el0_and_aborts_at_the_current_el() {
     assert_eq!(r.run(LDTR_X1_X0), Outcome::Continue);
     assert_eq!((r.get(1), r.cpu.pc.0), (0x77, CODE + 4));
     r.cpu.pc = ProgramCounter(CODE);
-    assert_eq!(r.run(LDR_X1_X0), Outcome::Continue);
+    assert_eq!(r.run(LDR_X1_X0), Outcome::Fault);
     r.assert_abort(0x200, 0x9600_000f, UDATA);
     // UAO=1: LDTR is an ordinary EL1 access, PAN included.
     let mut r = Rig::el1();
     r.cpu.pstate.pan = true;
     r.cpu.pstate.uao = true;
     r.set(0, UDATA);
-    assert_eq!(r.run(LDTR_X1_X0), Outcome::Continue);
+    assert_eq!(r.run(LDTR_X1_X0), Outcome::Fault);
     r.assert_abort(0x200, 0x9600_000f, UDATA);
 }
 
@@ -255,12 +255,12 @@ fn el0_faults_are_lower_el_data_aborts_with_exact_syndromes() {
     // EL0 store to a kernel page: permission L3, write, EC 0x24.
     let mut r = Rig::el0();
     r.set(0, KDATA);
-    assert_eq!(r.run(STR_X1_X0), Outcome::Continue);
+    assert_eq!(r.run(STR_X1_X0), Outcome::Fault);
     r.assert_abort(0x400, 0x9200_004f, KDATA);
     // EL0 load from the unmapped page: translation L3.
     let mut r = Rig::el0();
     r.set(0, HOLE + 8);
-    assert_eq!(r.run(LDR_X1_X0), Outcome::Continue);
+    assert_eq!(r.run(LDR_X1_X0), Outcome::Fault);
     r.assert_abort(0x400, 0x9200_0007, HOLE + 8);
     // EL0 load from a user page succeeds.
     let mut r = Rig::el0();
@@ -277,7 +277,7 @@ fn a_crossing_store_faulting_on_its_second_page_writes_nothing() {
     r.memory.put(UDATA_PA + PAGE - 8, 0x0101_0101_0101_0101);
     r.set(0, UDATA + PAGE - 4);
     r.set(1, u64::MAX);
-    assert_eq!(r.run(STUR_X1_X0), Outcome::Continue);
+    assert_eq!(r.run(STUR_X1_X0), Outcome::Fault);
     // FAR is the lowest address touched in the faulting page.
     r.assert_abort(0x200, 0x9600_0047, HOLE);
     assert_eq!(r.memory.get(UDATA_PA + PAGE - 8), 0x0101_0101_0101_0101);
@@ -334,6 +334,10 @@ fn fetch_from_an_unmapped_page_takes_an_instruction_abort() {
         1,
     );
     assert_eq!(report.stop, Stop::Budget);
+    assert_eq!(report.blocks, 1, "the abort spent one budget step");
+    assert_eq!(report.work.stage1_walks, 1);
+    assert_eq!(report.work.executed_blocks, 0);
+    assert_eq!(report.work.retired_instructions, 0);
     assert_eq!(r.cpu.pc.0, VBAR + 0x200);
     // Instruction abort, current EL: EC 0x21, IFSC translation L3.
     assert_eq!(r.cpu.el1.esr, Syndrome(0x8600_0007));
@@ -403,20 +407,20 @@ mod production {
         // PAN denies the ordinary load from the user page: permission, L3.
         r.cpu.pc = ProgramCounter(CODE);
         r.set(0, user);
-        assert_eq!(r.run(LDR_X1_X0), Outcome::Continue);
+        assert_eq!(r.run(LDR_X1_X0), Outcome::Fault);
         assert_eq!(r.cpu.el1.esr, Syndrome(0x9600_000f));
         assert_eq!(r.cpu.el1.far, VirtualAddress(user));
         // The null guard: an EL1 LDTR (user copy) of address 0 takes a
         // translation fault at L3.
         let mut r = production();
         r.set(0, 0);
-        assert_eq!(r.run(LDTR_X1_X0), Outcome::Continue);
+        assert_eq!(r.run(LDTR_X1_X0), Outcome::Fault);
         assert_eq!(r.cpu.el1.esr, Syndrome(0x9600_0007));
         assert_eq!(r.cpu.el1.far, VirtualAddress(0));
         // An LDTR into the kernel block is checked as EL0: permission, L2.
         let mut r = production();
         r.set(0, kernel);
-        assert_eq!(r.run(LDTR_X1_X0), Outcome::Continue);
+        assert_eq!(r.run(LDTR_X1_X0), Outcome::Fault);
         assert_eq!(r.cpu.el1.esr, Syndrome(0x9600_000e));
     }
 }
@@ -440,12 +444,12 @@ fn el0_dc_zva_zeros_one_translated_block_with_store_faults() {
 
     r.cpu.pc = ProgramCounter(CODE);
     r.set(3, KDATA + 31); // EL0 write permission is denied
-    assert_eq!(r.run(0xd50b_7423), Outcome::Continue);
+    assert_eq!(r.run(0xd50b_7423), Outcome::Fault);
     r.assert_abort(0x400, 0x9200_004f, KDATA + 31);
 
     let mut r = Rig::el0();
     r.set(3, HOLE + 31);
-    assert_eq!(r.run(0xd50b_7423), Outcome::Continue);
+    assert_eq!(r.run(0xd50b_7423), Outcome::Fault);
     assert_eq!(r.cpu.el1.esr, Syndrome(0x6212_dc68)); // DZE trap before translation
     assert_eq!(r.cpu.el1.elr, ProgramCounter(CODE));
 }
@@ -455,7 +459,7 @@ fn el0_ic_ivau_traps_or_translates_with_cache_maintenance_syndrome() {
     // DDI0487G.a IC IVAU, SCTLR_EL1.UCI and ESR_EL1.ISS.CM.
     let mut r = Rig::el0();
     r.set(3, HOLE + 31);
-    assert_eq!(r.run(0xd50b_7523), Outcome::Continue);
+    assert_eq!(r.run(0xd50b_7523), Outcome::Fault);
     assert_eq!(r.cpu.el1.esr, Syndrome(0x6212_dc6a)); // UCI trap before translation
     assert_eq!(r.cpu.el1.elr, ProgramCounter(CODE));
 
@@ -467,7 +471,7 @@ fn el0_ic_ivau_traps_or_translates_with_cache_maintenance_syndrome() {
 
     r.cpu.pc = ProgramCounter(CODE);
     r.set(3, HOLE + 31);
-    assert_eq!(r.run(0xd50b_7523), Outcome::Continue);
+    assert_eq!(r.run(0xd50b_7523), Outcome::Fault);
     r.assert_abort(0x400, 0x9200_0147, HOLE + 31);
 }
 
@@ -480,7 +484,7 @@ fn el0_q_store_crossing_a_stage1_hole_writes_neither_half() {
     r.cpu.write_vector(q31, u128::MAX);
     r.memory.put(UDATA_PA + PAGE - 8, 0x1020_3040_5060_7080);
     r.set(0, address);
-    assert_eq!(r.run(0x3c81_0c1f), Outcome::Continue); // str q31, [x0, #16]!
+    assert_eq!(r.run(0x3c81_0c1f), Outcome::Fault); // str q31, [x0, #16]!
     r.assert_abort(0x400, 0x9200_0047, address + 16);
     assert_eq!(r.get(0), address);
 
@@ -488,7 +492,7 @@ fn el0_q_store_crossing_a_stage1_hole_writes_neither_half() {
     r.cpu.write_vector(q31, u128::MAX);
     r.memory.put(UDATA_PA + PAGE - 8, 0x1020_3040_5060_7080);
     r.set(0, address);
-    assert_eq!(r.run(0x3d80_001f), Outcome::Continue); // str q31, [x0]
+    assert_eq!(r.run(0x3d80_001f), Outcome::Fault); // str q31, [x0]
     r.assert_abort(0x400, 0x9200_0047, HOLE);
     assert_eq!(r.memory.get(UDATA_PA + PAGE - 8), 0x1020_3040_5060_7080);
 }
@@ -500,7 +504,7 @@ fn el0_dc_zva_to_device_memory_raises_alignment_before_writing() {
     r.cpu.el1.mair = SystemValue(0); // AttrIndx=0 selects Device-nGnRnE
     r.memory.put(UDATA_PA, u64::MAX);
     r.set(3, UDATA + 31);
-    assert_eq!(r.run(0xd50b_7423), Outcome::Continue);
+    assert_eq!(r.run(0xd50b_7423), Outcome::Fault);
     r.assert_abort(0x400, 0x9200_0061, UDATA + 31);
     assert_eq!(r.memory.get(UDATA_PA), u64::MAX);
 }
@@ -604,7 +608,7 @@ fn el0_structure_crossing_a_second_page_fault_preserves_state() {
         r.cpu.vectors[0] = u128::MAX;
         r.cpu.vectors[1] = 0x1234;
         let vectors = r.cpu.vectors;
-        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.run(word), Outcome::Fault);
         r.assert_abort(0x400, esr, HOLE);
         assert_eq!(r.get(0), address);
         assert_eq!(r.cpu.vectors, vectors);

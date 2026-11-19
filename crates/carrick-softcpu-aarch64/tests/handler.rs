@@ -193,7 +193,7 @@ fn production_sysreg_writes_update_their_owned_slots() {
 fn msr_at_el0_to_an_el1_register_is_undefined() {
     let mut r = Rig::el0();
     r.set(3, 5);
-    assert_eq!(r.run(0xd5181003), Outcome::Continue); // msr sctlr_el1, x3
+    assert_eq!(r.run(0xd5181003), Outcome::Fault); // msr sctlr_el1, x3
     assert_eq!(r.pc(), VBAR + 0x400);
     assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
     assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
@@ -243,7 +243,7 @@ fn hvc_at_el1_is_a_provider_exit_after_the_instruction() {
 #[test]
 fn brk_and_smc_take_exceptions_at_the_faulting_pc() {
     let mut r = Rig::el1();
-    assert_eq!(r.run(0xd42000e0), Outcome::Continue); // brk #7
+    assert_eq!(r.run(0xd42000e0), Outcome::Fault); // brk #7
     assert_eq!(r.pc(), VBAR + 0x200);
     assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
     assert_eq!(r.cpu.el1.esr, Syndrome((0x3c << 26) | (1 << 25) | 7));
@@ -453,7 +453,7 @@ fn tlbi_is_an_event_at_el1_and_undefined_at_el0() {
     );
     assert_eq!(r.pc(), PC + 4);
     let mut r = Rig::el0();
-    assert_eq!(r.run(0xd508871f), Outcome::Continue);
+    assert_eq!(r.run(0xd508871f), Outcome::Fault);
     assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
 }
 
@@ -475,7 +475,7 @@ fn el0_waits_trap_under_their_own_sctlr_control() {
         let mut r = Rig::el0();
         r.cpu.el1.sctlr = Sctlr(other_enable);
         r.cpu.pstate.nzcv = 0xa;
-        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.run(word), Outcome::Fault);
         assert_eq!(r.pc(), VBAR + 0x400);
         assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
         assert_eq!(r.cpu.el1.esr, Syndrome(esr));
@@ -499,7 +499,7 @@ fn wfe_consumes_a_pending_local_event_before_checking_the_trap() {
         assert_eq!(r.run(word), Outcome::Event(Event::Hint(hint)));
         assert_eq!(r.run(0xd503205f), Outcome::Continue); // WFE consumes the event
         assert_eq!(r.pc(), PC + 8);
-        assert_eq!(r.run(0xd503205f), Outcome::Continue); // WFE traps
+        assert_eq!(r.run(0xd503205f), Outcome::Fault); // WFE traps
         assert_eq!(r.pc(), VBAR + 0x400);
         assert_eq!(r.cpu.el1.elr, ProgramCounter(PC + 8));
         assert_eq!(r.cpu.el1.esr, Syndrome(0x07e0_0001));
@@ -517,7 +517,7 @@ fn higher_el_tlbi_and_at_are_undefined_at_el1() {
         0xd50e_7800, // at s1e3r, x0
     ] {
         let mut r = Rig::el1();
-        assert_eq!(r.run(word), Outcome::Continue, "{word:#010x}");
+        assert_eq!(r.run(word), Outcome::Fault, "{word:#010x}");
         assert_eq!(r.pc(), VBAR + 0x200);
         assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
         assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
@@ -535,7 +535,7 @@ fn el1_ic_iallu_retires_and_el0_ic_iallu_is_undefined() {
         assert_eq!(r.pc(), PC + 4);
 
         let mut r = Rig::el0();
-        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.run(word), Outcome::Fault);
         assert_eq!(r.pc(), VBAR + 0x400);
         assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
         assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
@@ -561,7 +561,7 @@ fn el1_at_requires_a_walk_and_el0_at_is_undefined() {
         assert_eq!(r.cpu.named.par.0, 0x1234_5000 | (1 << 11) | (0b10 << 7));
 
         let mut r = Rig::el0();
-        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.run(word), Outcome::Fault);
         assert_eq!(r.pc(), VBAR + 0x400);
         assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
         assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
@@ -580,7 +580,7 @@ fn strict_scalar_and_pair_alignment_fault_before_memory_or_writeback() {
         r.set(0, 42);
         r.set(1, 0x10001);
         r.set(2, 43);
-        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.run(word), Outcome::Fault);
         assert_eq!(r.pc(), VBAR + 0x200);
         assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
         assert_eq!(r.cpu.el1.far, VirtualAddress(0x10001 + offset));
@@ -624,7 +624,7 @@ fn exclusive_ordered_and_lse_accesses_fault_with_alignment_check_disabled() {
         r.set(1, address);
         r.set(2, 43);
         r.set(3, 44);
-        assert_eq!(r.run(word), Outcome::Continue, "{word:#010x}");
+        assert_eq!(r.run(word), Outcome::Fault, "{word:#010x}");
         assert_eq!(r.pc(), VBAR + 0x400, "{word:#010x}");
         assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
         assert_eq!(r.cpu.el1.far, VirtualAddress(address));
@@ -639,7 +639,7 @@ fn exclusive_ordered_and_lse_accesses_fault_with_alignment_check_disabled() {
     // LSE is withheld at EL0. The EL1 carrier LDADD still checks alignment.
     let mut rig = Rig::el1();
     rig.set(1, 0x10001);
-    assert_eq!(rig.run(0xf822_0020), Outcome::Continue);
+    assert_eq!(rig.run(0xf822_0020), Outcome::Fault);
     assert_eq!(rig.cpu.el1.esr, Syndrome(0x9600_0021));
     assert_eq!(rig.cpu.el1.far, VirtualAddress(0x10001));
 }
@@ -688,7 +688,7 @@ fn uma_allows_daif_immediates_at_el0() {
 
 fn assert_el0_undefined(word: u32) {
     let mut r = Rig::el0();
-    assert_eq!(r.run(word), Outcome::Continue);
+    assert_eq!(r.run(word), Outcome::Fault);
     assert_eq!(r.pc(), VBAR + 0x400);
     assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
     assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
@@ -717,7 +717,7 @@ fn sp_el0_sysreg_access_requires_the_el1_stack_bank() {
         r.cpu.pstate.sp = StackSelect::El0;
         r.cpu.sp_el0 = StackPointer(0x10000);
         r.set(1, 0x11000);
-        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.run(word), Outcome::Fault);
         assert_eq!(r.pc(), VBAR); // current EL with SP_EL0
         assert_eq!(r.cpu.el1.elr, ProgramCounter(PC));
         assert_eq!(r.cpu.el1.esr, Syndrome(0x0200_0000));
@@ -750,7 +750,7 @@ fn el0_reads_virtual_cache_geometry_and_obeys_uct() {
     r.cpu.el1.sctlr = Sctlr(0);
     assert_eq!(r.run(0xd53b_00e5), Outcome::Continue);
     assert_eq!(r.get(5), 0x14); // DZP reflects DZE at EL0
-    assert_eq!(r.run(0xd53b_0026), Outcome::Continue);
+    assert_eq!(r.run(0xd53b_0026), Outcome::Fault);
     assert_eq!(r.cpu.el1.esr, Syndrome(0x6232_c0c1));
     assert_eq!(r.cpu.el1.elr, ProgramCounter(PC + 12));
     assert_eq!(r.pc(), VBAR + 0x400);
@@ -884,7 +884,7 @@ fn el0_ldadd_raises_undefined_before_accessing_memory() {
     rig.memory.put(0x10000, 40);
     rig.set(0, 0x10000);
     rig.set(1, 2);
-    assert_eq!(rig.run(0xf821_0002), Outcome::Continue);
+    assert_eq!(rig.run(0xf821_0002), Outcome::Fault);
     assert_eq!(rig.cpu.el1.esr, Syndrome(0x0200_0000));
     assert_eq!(rig.cpu.el1.elr, ProgramCounter(PC));
     assert_eq!(rig.memory.get(0x10000), 40);
@@ -900,7 +900,7 @@ fn el0_physical_counter_obeys_cntkctl_and_uses_the_virtual_clock() {
     assert_eq!(rig.get(5), 0x2345_6789_abcd_ef00);
 
     rig.cpu.el1.cntkctl = SystemValue(2); // EL0VCTEN does not enable CNTPCT.
-    assert_eq!(rig.run(0xd53b_e025), Outcome::Continue);
+    assert_eq!(rig.run(0xd53b_e025), Outcome::Fault);
     assert_eq!(rig.pc(), VBAR + 0x400);
     assert_eq!(rig.cpu.el1.esr, Syndrome(0x6232_f8a1));
 }

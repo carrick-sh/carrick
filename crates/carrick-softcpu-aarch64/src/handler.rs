@@ -41,6 +41,9 @@ pub struct MemoryFault {
 pub trait GuestMemory {
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault>;
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault>;
+
+    /// Observe an attempted hardware-format stage-1 walk, including faults.
+    fn record_stage1_walk(&mut self) {}
 }
 
 /// The virtual per-CPU exclusive monitor (D1.7 local monitor): a host
@@ -84,8 +87,10 @@ pub enum Event {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// Retired, or delivered as a guest exception; continue at `cpu.pc`.
+    /// Retired; continue at `cpu.pc` (including SVC's exception entry).
     Continue,
+    /// Entered a guest exception without retiring the instruction.
+    Fault,
     Event(Event),
 }
 
@@ -95,7 +100,7 @@ fn next(cpu: &mut CpuState) {
 
 fn undefined(cpu: &mut CpuState) -> Outcome {
     take_exception(cpu, Exception::Unknown);
-    Outcome::Continue
+    Outcome::Fault
 }
 
 fn operand(cpu: &CpuState, r: OperandRegister) -> u64 {
@@ -266,7 +271,7 @@ pub fn execute(
         }
         Instruction::CensusGap(Decoded::Breakpoint { immediate }) => {
             take_exception(cpu, Exception::Brk(immediate.value()));
-            Outcome::Continue
+            Outcome::Fault
         }
         Instruction::ExceptionGeneration(e) => {
             let immediate = Immediate16::new(e.immediate);
@@ -278,7 +283,8 @@ pub fn execute(
                 _ => Exception::Unknown,
             };
             match take_exception(cpu, exception) {
-                ExceptionOutcome::Entered => Outcome::Continue,
+                ExceptionOutcome::Entered if e.kind == ExceptionKind::Svc => Outcome::Continue,
+                ExceptionOutcome::Entered => Outcome::Fault,
                 ExceptionOutcome::ProviderExit(exit) => {
                     next(cpu);
                     Outcome::Event(Event::ProviderExit(exit))
@@ -320,7 +326,7 @@ pub fn execute(
                 && cpu.el1.sctlr.traps_el0_wait(wait)
             {
                 take_exception(cpu, Exception::WaitTrap(wait));
-                return Outcome::Continue;
+                return Outcome::Fault;
             }
             next(cpu);
             Outcome::Event(Event::Hint(h))
@@ -363,7 +369,7 @@ fn enter_memory_exception(cpu: &mut CpuState, exception: Option<Exception>) -> O
     match exception {
         Some(exception) => {
             take_exception(cpu, exception);
-            Outcome::Continue
+            Outcome::Fault
         }
         None => Outcome::Event(Event::Unsupported),
     }
@@ -426,7 +432,7 @@ const LINK: crate::Gpr = match crate::Gpr::new(30) {
 
 fn system_trap(cpu: &mut CpuState, e: SystemAccessException) -> Outcome {
     take_exception(cpu, Exception::SystemAccess(e));
-    Outcome::Continue
+    Outcome::Fault
 }
 
 fn sys_trap(cpu: &mut CpuState, word: u32, rt: OperandRegister) -> Outcome {

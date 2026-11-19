@@ -217,20 +217,52 @@ fn enter(elf: &[u8]) -> (CpuState, Pages) {
     (cpu, memory)
 }
 
+fn print_work(
+    report: &Report<HostError>,
+    publication: carrick_host_jit::PublicationWork,
+    elapsed: std::time::Duration,
+    traced: bool,
+) {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let seconds = elapsed.as_secs_f64();
+    let work = report.work;
+    println!(
+        "engine work ({profile}, syscall trace={traced}) PC={:#x} budget_steps={} {work:?} {publication:?} elapsed_ns={} blocks/s={:.0} instr/s={:.0}",
+        report.pc.0,
+        report.blocks,
+        elapsed.as_nanos(),
+        work.executed_blocks as f64 / seconds,
+        work.retired_instructions as f64 / seconds,
+    );
+}
+
 fn probe(
     cpu: &mut CpuState,
     memory: &mut Pages,
     runner: &mut HostBlockRunner,
     budget: u64,
 ) -> Report<HostError> {
-    run(
+    let before = runner.publication_work();
+    let start = std::time::Instant::now();
+    let report = run(
         cpu,
         &mut ExclusiveMonitor::default(),
         memory,
         runner,
         BlockLimits::default(),
         budget,
-    )
+    );
+    print_work(
+        &report,
+        runner.publication_work().since(before),
+        start.elapsed(),
+        false,
+    );
+    report
 }
 
 #[test]
@@ -634,6 +666,8 @@ fn probe_traced(
     runner: &mut TracingRunner,
     budget: u64,
 ) -> Report<HostError> {
+    let before = runner.inner.publication_work();
+    let start = std::time::Instant::now();
     let report = run(
         cpu,
         &mut ExclusiveMonitor::default(),
@@ -641,6 +675,12 @@ fn probe_traced(
         runner,
         BlockLimits::default(),
         budget,
+    );
+    print_work(
+        &report,
+        runner.inner.publication_work().since(before),
+        start.elapsed(),
+        true,
     );
     runner.finish_pending();
     report
