@@ -1515,7 +1515,7 @@ mod forward_owner_tests {
     #[test]
     fn host_readiness_capture_has_no_guest_syscall_number() {
         let request = ForwardRequest::HostReadiness(HostReadinessRequest {
-            address: 0x1000,
+            address: carrick_guest_arch::KernelVa::new(0x1000),
             count: 1,
             deadline: None,
             sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -2074,7 +2074,7 @@ mod tests {
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         };
         let request = ForwardRequest::HostReadiness(HostReadinessRequest {
-            address: 0x1000,
+            address: carrick_guest_arch::KernelVa::new(0x1000),
             count: 1,
             deadline: None,
             sig_mask: WaitSigMask::Replace(sigmask),
