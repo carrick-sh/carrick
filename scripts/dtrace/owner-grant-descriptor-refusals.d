@@ -18,6 +18,13 @@ carrick*:::frame-grant-residency-refused
         timestamp, pid, tid, arg0, arg1, arg2, arg3, arg4);
 }
 
+carrick*:::frame-grant-residency-census
+/pid == $target || progenyof($target)/
+{
+    printf("RESIDENCY_CENSUS ns=%d pid=%d tid=%d txn=%d live=%d dead_mm=%d stale_backing=%d unapplied=%d unknown=%d\n",
+        timestamp, pid, tid, arg0, arg1, arg2, arg3, arg4, arg5);
+}
+
 carrick*:::descriptor-journal-reserve-failed
 /pid == $target || progenyof($target)/
 {
