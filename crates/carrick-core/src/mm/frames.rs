@@ -377,19 +377,30 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
             owner_generation: backing.owner_generation.get(),
             inventory_revision: backing.inventory_revision.get(),
         };
-        let Some(residency_slot) = residency.publish(identity) else {
-            if words.observe_residency_failure() {
-                words.descriptor_diagnostic(
-                    carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic::ResidencyRefused {
-                        mm_key: identity.mm_key,
-                        va: identity.semantic_base,
-                        len: identity.len,
-                        slots_used: residency.observed_slots_used(),
-                        slots_total: carrick_core_abi::mm::FRAME_GRANT_RESIDENCY_SLOTS,
-                    },
-                );
+        let residency_slot = match residency.try_publish(identity) {
+            Ok(slot) => slot,
+            Err(FrameGrantResidencyRefusal::InvalidIdentity) => {
+                return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
             }
-            return DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity);
+            Err(FrameGrantResidencyRefusal::Overlap) => {
+                // The descriptor walk above ruled out an occupied leaf. A
+                // live overlapping record now indicates mismatched custody.
+                return DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking);
+            }
+            Err(FrameGrantResidencyRefusal::Capacity) => {
+                if words.observe_residency_failure() {
+                    words.descriptor_diagnostic(
+                        carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic::ResidencyRefused {
+                            mm_key: identity.mm_key,
+                            va: identity.semantic_base,
+                            len: identity.len,
+                            slots_used: residency.observed_slots_used(),
+                            slots_total: FRAME_GRANT_RESIDENCY_SLOTS,
+                        },
+                    );
+                }
+                return DescriptorOutcome::Refused(DescriptorRefusal::ResidencyCapacity);
+            }
         };
         let outcome = B::execute_grant(words, grant.ttbr0, txn);
         if let DescriptorOutcome::Applied(_) = outcome {
