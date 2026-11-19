@@ -1724,6 +1724,16 @@ fn boot_and_register(
                 "template xtask lacks admit-job --controller; rebuild template 300",
             ));
         }
+        // The hook's event policy is the template xtask's too (#2580).
+        let events = pve.agent_output(
+            row,
+            &[
+                "/usr/local/bin/carrick-xtask",
+                "ci-scaler",
+                "standing-events",
+            ],
+        )?;
+        template_admits_controller_events(events.exit == GuestExit(0), &events.stdout)?;
     }
     // Re-vet the reserved run now and bind the runner to it: the hook admits
     // this run, attempt, SHA and owner-only dispatch actors. A standing clone that
@@ -2571,6 +2581,19 @@ impl assignment::AssignmentExchange for GuestExchange<'_> {
             _ => Err(ScalerError::External("guest assignment approval")),
         }
     }
+}
+/// The job-start hook runs the template's own xtask, so its event policy must
+/// be the controller's: a template that refuses an event the controller
+/// serves gets the job, kills its runner at set-up, and GitHub reports a lost
+/// job ten minutes later with no log (#2580). `ok` is the probe's exit status;
+/// a template older than the probe has no `standing-events` and fails it.
+fn template_admits_controller_events(ok: bool, stdout: &str) -> Result<(), ScalerError> {
+    if ok && stdout.trim() == crate::ci_scaler::standing_events() {
+        return Ok(());
+    }
+    Err(ScalerError::Guard(
+        "template xtask's job-start events differ from the controller's (ci-scaler standing-events); rebuild template 300",
+    ))
 }
 /// Serve every standing clone's assignment rendezvous (#333): GitHub may
 /// assign a clone any queued job with its labels, not the one it was minted
@@ -3739,6 +3762,35 @@ mod tests {
         assert_eq!(selected.unwrap(), Some(live));
         assert!(ledger.rows.is_empty());
         assert!(Ledger::load(&path).unwrap().served(stale));
+    }
+
+    #[test]
+    fn standing_events_are_push_schedule_and_dispatch_on_main() {
+        // Known answer: the nightly x86 scoreboard is a `schedule` run (#2580).
+        assert_eq!(
+            crate::ci_scaler::standing_events(),
+            "push schedule workflow_dispatch"
+        );
+    }
+
+    #[test]
+    fn template_whose_hook_refuses_a_served_event_is_refused_before_jit() {
+        // The 11-04 template xtask admitted only push and dispatch.
+        for (ok, stdout) in [
+            (true, "push workflow_dispatch\n"),
+            (true, "push schedule workflow_dispatch pull_request\n"),
+            (true, ""),
+            // A template older than the probe: unknown subcommand.
+            (false, ""),
+            (false, "push schedule workflow_dispatch\n"),
+        ] {
+            let error = template_admits_controller_events(ok, stdout).unwrap_err();
+            assert!(
+                error.to_string().contains("rebuild template 300"),
+                "{stdout:?}"
+            );
+        }
+        template_admits_controller_events(true, "push schedule workflow_dispatch\n").unwrap();
     }
 
     #[test]
@@ -5185,6 +5237,7 @@ case "$method:$url" in
       *cloud-init*) body='{"pid":101}' ;;
       *ssh_host_ed25519_key.pub*) body='{"pid":102}' ;;
       *admit-job*--help*) body='{"pid":103}' ;;
+      *standing-events*) body='{"pid":104}' ;;
       *) body='{"pid":100}' ;;
     esac ;;
   GET:*/qemu/*/agent/exec-status?pid=101)
@@ -5193,6 +5246,8 @@ case "$method:$url" in
     body='{"exited":1,"exitcode":0,"out-data":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostKey host\n"}' ;;
   GET:*/qemu/*/agent/exec-status?pid=103)
     body='{"exited":1,"exitcode":0,"out-data":"--controller\n"}' ;;
+  GET:*/qemu/*/agent/exec-status?pid=104)
+    body='{"exited":1,"exitcode":0,"out-data":"push schedule workflow_dispatch\n"}' ;;
   GET:*/qemu/*/agent/exec-status?pid=100)
     body='{"exited":1,"exitcode":0,"out-data":""}' ;;
   GET:*/qemu/*/agent/network-get-interfaces)

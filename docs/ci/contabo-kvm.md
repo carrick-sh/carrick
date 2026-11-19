@@ -8,8 +8,13 @@ it comes from the typed site table in `crates/carrick-xtask/src/ci_scaler/site.r
 A clone that GitHub assigns a job from a run other than the one it was minted
 for admits it only after the controller re-vets that run
 ([willow-pilot.md](willow-pilot.md#actual-assignments-are-re-vetted-333));
-the controller binary in `/root/carrick-ci/bin` carries this, so deploying it
-needs a controller restart, not a template rebuild.
+the controller binary in `/root/carrick-ci/bin` carries the re-vet, so
+deploying it needs a controller restart. The job-start hook's event policy is
+the exception: the hook runs the *template's* xtask, so a change to which
+events `Admission::Standing` admits also needs template 300 rebuilt. Before
+minting a runner the controller compares `ci-scaler standing-events` in the
+clone with its own and refuses a mismatched template (#2580: the 11-04
+template refused `schedule`, so every nightly KVM job was killed at set-up).
 
 The same standing service used to serve GitHub Actions dispatch clones from
 the agent template (9000/9001). Actions dispatch was retired on 2026-11-07:

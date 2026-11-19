@@ -784,6 +784,50 @@ impl Admission {
         }
     }
 }
+/// Every event name the standing admission's identity probe asks about
+/// (#2580). It is wider than what is admitted so that a template admitting
+/// an event the controller would not serve also shows up as a mismatch.
+const PROBED_EVENTS: [&str; 9] = [
+    "push",
+    "schedule",
+    "workflow_dispatch",
+    "pull_request",
+    "pull_request_target",
+    "pull_request_review",
+    "merge_group",
+    "workflow_run",
+    "repository_dispatch",
+];
+/// The events `Admission::Standing` admits for `kernel-runtime.yml` on main,
+/// computed by running the job-start check itself over `PROBED_EVENTS`
+/// (space-separated, in that order). A standing controller compares its own
+/// value with the template xtask's (`ci-scaler standing-events`) before
+/// minting a runner: the job-start hook runs the template's xtask, so a
+/// template older than the controller's policy kills jobs the controller
+/// admitted (#2580: the 11-04 template refused `schedule`, which the
+/// controller admits since 715f3afd4).
+pub fn standing_events() -> String {
+    PROBED_EVENTS
+        .iter()
+        .filter(|event| {
+            Admission::Standing
+                .authorize(&JobContext {
+                    repository: REPOSITORY.into(),
+                    event: (**event).into(),
+                    actor: DISPATCH_OWNER.into(),
+                    triggering_actor: DISPATCH_OWNER.into(),
+                    workflow_ref: format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/main"),
+                    git_ref: "refs/heads/main".into(),
+                    sha: "0".repeat(40),
+                    run_id: 1,
+                    run_attempt: 1,
+                })
+                .is_ok()
+        })
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 fn standing_event_ref(event: &str, branch: &str) -> bool {
     match event {
         "push" | "schedule" | "workflow_dispatch" => branch == "main",
@@ -1260,6 +1304,8 @@ pub enum ScalerAction {
     },
     /// Fail unless the calling (non-root runner) user can open KVM API 12.
     VerifyKvm,
+    /// Print the events this xtask's job-start hook admits on main (#2580).
+    StandingEvents,
     /// Print the agent template's scoped capture sudoers drop-in (#1621).
     CaptureSudoers,
     /// As the agent-template worker account: fail unless sudo admits exactly the scoped
@@ -1357,6 +1403,10 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
         ScalerAction::SweepCloneVolumes { state_dir } => live::sweep_clone_volumes(&state_dir),
         ScalerAction::CheckTemplateRetirement { template } => template_retirement::check(template),
         ScalerAction::VerifyKvm => verify_kvm(),
+        ScalerAction::StandingEvents => {
+            println!("{}", standing_events());
+            Ok(())
+        }
         ScalerAction::CaptureSudoers => {
             print!("{}", capture::SUDOERS);
             Ok(())
