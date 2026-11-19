@@ -481,6 +481,52 @@ fn production_root_exec_retargets_the_loaded_kvm_executor() {
     assert_eq!(witness.saved_identity, witness.successor_identity);
 }
 
+/// A fork child opens the ELF through its ring table and executes it through
+/// the proc fd path while its parent waits for the successor's exit.
+#[test]
+fn production_child_execs_through_its_proc_fd_path() {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let successor = dir.path().join("successor");
+    let marker = kvm_pool_fixture::assemble_fixture("native_exec_marker.S", &[]);
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let caller =
+        kvm_pool_fixture::assemble_fixture("native_fork_exec.S", &[&define, "-DEXEC_FD_PATH"]);
+    let program =
+        carrick_mem::elf::ElfProgram::load(&caller, 62, &|_| None).expect("exec caller ELF");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    // Keep the loaded lane as the root and child's allowed CPU, as in the
+    // native_fork_exec fixture's pathname and errno cases.
+    let outcome =
+        kvm_pool_fixture::try_run_program_with_dispatcher(&program, 32, 1, |_| {}, dispatcher)
+            .map_err(|failure| failure.error)
+            .expect("production fork-child exec");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (0, b"X\n".as_slice()),
+        "the child should run the successor: 38 is ENOSYS, 91 is a setup failure"
+    );
+    assert!(outcome.run.stderr.is_empty());
+    let census = outcome
+        .physical
+        .exec_owner_census()
+        .expect("exec owner census");
+    assert_eq!(
+        (
+            census.reserved,
+            census.sealed,
+            census.adopted,
+            census.settled
+        ),
+        (1, 1, 1, 1),
+        "{census:?}"
+    );
+}
+
 #[test]
 fn production_image_rejects_fixture_syscalls() {
     let production = PathBuf::from(env!("CARRICK_X86_CPL0_IMAGE"));

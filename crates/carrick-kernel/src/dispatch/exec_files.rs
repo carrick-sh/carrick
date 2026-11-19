@@ -3,12 +3,31 @@
 use std::sync::Arc;
 
 use carrick_abi::{LinuxErrno, NsGid, NsUid};
+use carrick_el1_abi::ipc::fd::Fd;
 
 use super::SyscallDispatcher;
 use super::executable_authority::{ExecSource, ExecSourceError};
 
 /// Physical host-file access supplied by the embedding loader.
 pub type ExecHostFileService<'a> = dyn Fn(&str) -> std::io::Result<std::fs::File> + 'a;
+
+/// Resolve a descriptor in the caller's sealed ring table.
+pub type NativeExecFdService<'a> = dyn Fn(Fd) -> Result<ExecSource, LinuxErrno> + 'a;
+
+/// The source selected by the pathname walk. Native descriptor paths retain
+/// the caller's object and are subject to the interpreter's fd-reopen rules.
+pub enum ExecPathSource {
+    Filesystem(ExecSource),
+    NativeDescriptor(ExecSource),
+}
+
+impl ExecPathSource {
+    fn into_source(self) -> ExecSource {
+        match self {
+            Self::Filesystem(source) | Self::NativeDescriptor(source) => source,
+        }
+    }
+}
 
 /// Identity attached by the owner at admission. The host adapter disappears
 /// with host exec ownership; it uses the same file capability implementation.
@@ -127,7 +146,8 @@ impl ExecFiles {
     }
 
     pub fn acquire(&self, path: &str) -> Result<ExecSource, ExecSourceError> {
-        self.acquire_from(path, None)
+        self.acquire_from(path, None, None)
+            .map(ExecPathSource::into_source)
     }
 
     /// The embedding loader supplies physical host-file access for bare-run
@@ -138,15 +158,30 @@ impl ExecFiles {
         path: &str,
         open: &ExecHostFileService<'_>,
     ) -> Result<ExecSource, ExecSourceError> {
-        self.acquire_from(path, Some(open))
+        self.acquire_from(path, Some(open), None)
+            .map(ExecPathSource::into_source)
+    }
+
+    /// Resolve the initial native exec path through the same walker as a
+    /// pathname exec, with access to the caller's own descriptor table.
+    pub fn acquire_native_path(
+        &self,
+        path: &str,
+        host_open: Option<&ExecHostFileService<'_>>,
+        descriptor: &NativeExecFdService<'_>,
+    ) -> Result<ExecPathSource, ExecSourceError> {
+        self.acquire_from(path, host_open, Some(descriptor))
     }
 
     fn acquire_from(
         &self,
         path: &str,
         host_open: Option<&ExecHostFileService<'_>>,
-    ) -> Result<ExecSource, ExecSourceError> {
-        use super::fs::proc_synthetic::{proc_self_fd_number, proc_self_magic_link};
+        native_descriptor: Option<&NativeExecFdService<'_>>,
+    ) -> Result<ExecPathSource, ExecSourceError> {
+        use super::fs::proc_synthetic::{
+            proc_self_fd_number, proc_self_magic_link, rewrite_dev_fd_alias,
+        };
         super::fs::check_path_length(path).map_err(ExecSourceError::Linux)?;
         let path = self.lookup_path(path);
         super::fs::check_path_length(&path).map_err(ExecSourceError::Linux)?;
@@ -163,8 +198,7 @@ impl ExecFiles {
                 .collect::<Vec<_>>()
                 .join("/")
         );
-        normalized =
-            super::fs::proc_synthetic::rewrite_dev_fd_alias(&normalized).unwrap_or(normalized);
+        normalized = rewrite_dev_fd_alias(&normalized).unwrap_or(normalized);
         if let Some(visible) = visible {
             for alias in ["self", "curproc", "this"] {
                 let prefix = format!("/proc/{alias}/");
@@ -191,7 +225,21 @@ impl ExecFiles {
             host_open,
             |candidate| {
                 if self.context.deny_caller_views && is_caller_view(candidate) {
-                    return Some(Err(ExecSourceError::Linux(carrick_abi::LINUX_ENOSYS)));
+                    let absent = || ExecSourceError::Linux(carrick_abi::LINUX_ENOSYS);
+                    let alias = rewrite_dev_fd_alias(candidate);
+                    let path = alias.as_deref().unwrap_or(candidate);
+                    let source = native_descriptor
+                        .zip(proc_self_fd_number(path, None))
+                        .ok_or_else(absent)
+                        .and_then(|(descriptor, fd)| {
+                            acquire_native_descriptor(path, fd, descriptor)
+                        });
+                    return Some(source.and_then(|source| {
+                        require_exec_file(
+                            directory_required,
+                            ExecPathSource::NativeDescriptor(source),
+                        )
+                    }));
                 }
                 // Only the captured thread's directory may select its retained
                 // executable or descriptors; another thread is not this caller.
@@ -218,11 +266,7 @@ impl ExecFiles {
                 };
                 source.map(|source| {
                     source.and_then(|source| {
-                        if directory_required {
-                            Err(ExecSourceError::Linux(carrick_abi::LINUX_ENOTDIR))
-                        } else {
-                            Ok(source)
-                        }
+                        require_exec_file(directory_required, ExecPathSource::Filesystem(source))
                     })
                 })
             },
@@ -255,6 +299,40 @@ impl ExecFiles {
     }
 }
 
+fn acquire_native_descriptor(
+    path: &str,
+    fd: i32,
+    descriptor: &NativeExecFdService<'_>,
+) -> Result<ExecSource, ExecSourceError> {
+    use carrick_abi::{LINUX_EBADF, LINUX_ENOENT};
+    // Proc entries use the decimal spelling of the live descriptor number.
+    if fd < 0
+        || !path
+            .rsplit_once('/')
+            .is_some_and(|(_, leaf)| leaf == fd.to_string())
+    {
+        return Err(ExecSourceError::Linux(LINUX_ENOENT));
+    }
+    descriptor(Fd(fd)).map_err(|errno| {
+        ExecSourceError::Linux(if errno == LINUX_EBADF {
+            LINUX_ENOENT
+        } else {
+            errno
+        })
+    })
+}
+
+fn require_exec_file(
+    directory_required: bool,
+    source: ExecPathSource,
+) -> Result<ExecPathSource, ExecSourceError> {
+    if directory_required {
+        Err(ExecSourceError::Linux(carrick_abi::LINUX_ENOTDIR))
+    } else {
+        Ok(source)
+    }
+}
+
 impl ExecFilesystem {
     fn acquire(
         &self,
@@ -262,8 +340,8 @@ impl ExecFilesystem {
         directory_required: bool,
         proc_caller: Option<super::fs::pathres::RetainedProcCaller>,
         host_open: Option<&ExecHostFileService<'_>>,
-        special: impl Fn(&str) -> Option<Result<ExecSource, ExecSourceError>>,
-    ) -> Result<ExecSource, ExecSourceError> {
+        special: impl Fn(&str) -> Option<Result<ExecPathSource, ExecSourceError>>,
+    ) -> Result<ExecPathSource, ExecSourceError> {
         // A retained magic source is authoritative even in bare-run mode.
         if let Some(source) = special(path) {
             return source;
@@ -301,7 +379,7 @@ impl ExecFilesystem {
                 return Err(ExecSourceError::Linux(carrick_abi::LINUX_ENOTDIR));
             }
             self.acquire_at(&resolved)
-                .map(Ok)
+                .map(|source| Ok(ExecPathSource::Filesystem(source)))
                 .map_err(ExecSourceError::Host)
         };
         match acquire() {
@@ -317,7 +395,9 @@ impl ExecFilesystem {
                 if directory_required && !file.metadata().map_err(ExecSourceError::Host)?.is_dir() {
                     return Err(ExecSourceError::Linux(carrick_abi::LINUX_ENOTDIR));
                 }
-                ExecSource::host(file, path.to_owned()).map_err(ExecSourceError::Host)
+                ExecSource::host(file, path.to_owned())
+                    .map(ExecPathSource::Filesystem)
+                    .map_err(ExecSourceError::Host)
             }
         }
     }
