@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 use assert_cmd::Command;
 use wait_timeout::ChildExt;
 
+#[path = "fixtures/x86_process_entry.rs"]
+mod x86_process_entry;
+
 fn append_tar(builder: &mut tar::Builder<&mut Vec<u8>>, name: &str, bytes: &[u8]) {
     let mut header = tar::Header::new_gnu();
     header.set_size(bytes.len() as u64);
@@ -1897,6 +1900,19 @@ fn host_poll_observation_defers_sigchld_without_retry() {
 #[ignore = "CPL0 startup needs guest rt_sigaction, lifecycle copy, and anonymous mprotect"]
 fn mounted_static_x86_dispatches_libc_startup_calls() {
     compare_mounted_assembly_with_native("x86_dispatch_startup.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_glibc_hello_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("glibc-hello");
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/x86_glibc_hello.c");
+    x86_process_entry::compile_static_fixture(&source, &elf, &[]);
+    compare_mounted_binary_with_native(&elf, b"hello, x86_64 world\n", 0, "glibc-hello");
 }
 
 #[test]
