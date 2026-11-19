@@ -16,6 +16,7 @@ semantic_authority = [
   "Linux x86_64 ELF and System V ABI: PT_LOAD file bytes and zero BSS, user page permissions, 16-byte aligned entry RSP at argc followed by argv, envp and auxv",
   "ELF gABI Program Interpreter and x86-64 psABI process initialization: enter PT_INTERP at its entry; AT_BASE identifies its load bias while AT_ENTRY, AT_PHDR and AT_PHNUM describe the executable",
   "The exact static x86_64 exit_group(7) ELF enters at e_entry and terminates with status 7",
+  "x86-64 System V psABI process-entry register and FP/SSE state: non-stack GPRs clear (notably RDX=0 for no rtld_fini), RFLAGS=0x202 (DF=0), x87 FCW=0x037f, FSW=0, FTW=0, MXCSR=0x1f80, and zeroed ST/XMM/YMM registers with no leaked carrier state",
 ]
 fixture = "carrick-el1::isa::x86::initial_mm::tests; carrick-vmm-kvm::cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven; production_enters_pt_interp_instead_of_executable_entry"
 scale_points = [1, 2, 3]
@@ -93,6 +94,28 @@ caller; its probe admits an initial MM through the same functions. No
 bindings, semantic expectations, structural budgets or acceptance layers
 change. Signed acceptance and runtime-ratio promotion remain
 director-owned.
+
+#2554 / #2555 first user process-entry register and FP/SSE witnesses:
+carrick_x86_boot_iret clears all fifteen non-RSP GPRs before the first user
+IRETQ and CPL0 executes soft-float without modifying FP/SSE/AVX state. Each
+witness binds a specific claim of this contract:
+- carrick-vmm-soft::soft_hello::production_ring_runs_glibc_hello_to_exit_on_soft_cpu
+  binds static glibc startup and clean exit 0 with exact stdout on the
+  production CPL0 ring over the soft CPU (where a leaked RDX previously
+  faulted in glibc's rtld_fini exit path).
+- carrick-vmm-soft::soft_hello::production_ring_clears_first_user_registers_on_soft_cpu
+  binds the first-entry register and FP/SSE/AVX snapshot at _start on the
+  soft CPU (15 non-RSP GPRs = 0, RFLAGS = 0x202, x87 FCW = 0x037f, FSW = 0,
+  FTW = 0, FOP/FIP/FDP = 0, ST0..7 = 0, MXCSR = 0x1f80, XMM0..15 = 0, and
+  YMM0..15 = 0).
+- carrick-cli::x86_kvm_run::mounted_static_x86_glibc_hello_matches_native
+  binds the same static glibc binary matching native stdout and exit 0
+  through the production CLI on KVM.
+- carrick-cli::x86_kvm_run::mounted_static_x86_first_user_entry_registers_and_fp_state_are_clean
+  binds the shared first-entry register and FP/SSE/AVX snapshot through the
+  production CLI on KVM against the native x86_64 Linux oracle, proving the
+  first user instruction sees architected default FP/SSE/AVX state and no
+  leaked carrier vector values.
 """
 
 [bindings]
@@ -117,7 +140,8 @@ embed = [
   "carrick-vmm-kvm::cpl0_initial_mm::production_enters_pt_interp_instead_of_executable_entry",
   "carrick-vmm-kvm::cpl0_boot::cpl0_layout_tests::production_boot_refuses_stale_layout_before_entry",
   "carrick-vmm-kvm::cpl0_boot::cpl0_layout_tests::file_region_published_before_guest_entry",
-  "KVM production CLI: carrick-cli::x86_kvm_run::mounted_static_x86_glibc_hello_matches_native",
+  "carrick-cli::x86_kvm_run::mounted_static_x86_glibc_hello_matches_native",
+  "carrick-cli::x86_kvm_run::mounted_static_x86_first_user_entry_registers_and_fp_state_are_clean",
 ]
 docker = [
   "Native x86 Linux static-ELF behavior is asserted by the exact exit status; Docker oracle and runtime ratio remain director-owned.",
