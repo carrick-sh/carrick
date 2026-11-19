@@ -455,6 +455,30 @@ fn in_zone_objects_never_build_a_host_request() {
     );
 }
 
+/// A request outside the host ioctl allowlist on a host-backed stdio
+/// descriptor is left UNROUTED (a counted ENOSYS), never a served ENOTTY:
+/// TIOCGPGRP, TCSBRK and FIOASYNC are job-control requests a terminal
+/// answers, and ENOTTY would both be wrong and hide the gap from the
+/// ring-first counters.
+#[test]
+fn a_non_allowlisted_ioctl_on_host_stdio_stays_unrouted() {
+    let mut user = memory(b"");
+    for request in [0x540F_u64 /* TIOCGPGRP */, 0x5409 /* TCSBRK */, 0x5452 /* FIOASYNC */] {
+        assert_eq!(
+            run(
+                HostFileCall::Ioctl {
+                    fd: 1,
+                    request,
+                    arg: BASE,
+                },
+                &mut user
+            ),
+            None,
+            "ioctl {request:#x} on host stdout must not be served"
+        );
+    }
+}
+
 /// Linux answers `fstat` on a pipe, an eventfd or an epoll instance from the
 /// object itself: the ring returns the record the dispatcher reports for
 /// that kind (one shared `LinuxStatFields`), never a host request.
