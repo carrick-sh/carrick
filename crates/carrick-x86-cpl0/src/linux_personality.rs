@@ -718,7 +718,52 @@ pub fn handle_user_page_fault_prepared(
             code,
             address,
         } => deliver_page_fault_signal(frame, fpstate, signum, code, address),
+        UserFaultSupply::Contended(cause) => park_contended_user_fault(prep, frame, fpstate, cause),
         UserFaultSupply::Unresolved(reason) => reason,
+    }
+}
+
+fn park_contended_user_fault(
+    prep: &carrick_x86_carrier::entry::PreparedUserPageFault<'_>,
+    frame: &PageFaultStack,
+    fpstate: &XsaveArea,
+    cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
+) -> u64 {
+    use carrick_el1::isa::x86::context;
+    if !native_process::is_admitted() {
+        return 9;
+    }
+    let Some(address) =
+        carrick_el1_abi::ReservationMm::new(prep.task.mm.key.load(Ordering::Acquire))
+            .and_then(anonymous::live_words)
+            .and_then(|words| words.context)
+    else {
+        return 9;
+    };
+    let native = rust_alloc::boxed::Box::new(context::scheduler::NativeContext {
+        frame: context::scheduler::InterruptFrame {
+            gpr: frame.saved_gprs,
+            rip: frame.rip,
+            cs: frame.cs,
+            flags: frame.rflags,
+            rsp: frame.rsp,
+            ss: frame.ss,
+        },
+        address,
+        fs_base: carrick_x86_carrier::native_execution::read_msr(0xc000_0100),
+        gs_base: carrick_x86_carrier::native_execution::read_msr(0xc000_0102),
+        xsave: fpstate.clone(),
+    });
+    let saved = rust_alloc::boxed::Box::new(context::context_words::from_native(&native));
+    drop(native);
+    match anonymous::park_contended_fault(prep.task, prep.slot, cause, &saved) {
+        anonymous::ContendedFault::Parked => {
+            drop(saved);
+            carrick_x86_carrier::entry::leave_user_page_fault(prep.binding);
+            native_execution::schedule(prep.slot)
+        }
+        anonymous::ContendedFault::Rerun => 0,
+        anonymous::ContendedFault::Refused => 9,
     }
 }
 
@@ -733,6 +778,9 @@ pub enum UserFaultSupply {
         code: i32,
         address: UserVa,
     },
+    /// Another owner holds the MM root, editor or gate. This is "not now":
+    /// park on its release and retry the unchanged access.
+    Contended(carrick_sched_core::spaces::notification::SpaceWaitCause),
     /// No owner could supply the access: the #PF entry reports this reason.
     Unresolved(u64),
 }
@@ -786,7 +834,9 @@ fn native_exec_call(
                     restart_native_syscall(frame, ordinal);
                     CompletionRoute::Served
                 }
-                UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
+                UserFaultSupply::Signal { .. }
+                | UserFaultSupply::Contended(_)
+                | UserFaultSupply::Unresolved(_) => {
                     frame.rax = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
                     CompletionRoute::Served
                 }
@@ -983,11 +1033,10 @@ fn supply_user_fault(
             },
             address: fault.address,
         },
-        // This lane has no native-service birth handle, so it cannot mint
-        // an owner wait. Refuse any such mismatched outcome at the boundary.
-        OwnerFaultSupplyOutcome::Wait(_) | OwnerFaultSupplyOutcome::Unavailable => {
-            UserFaultSupply::Unresolved(9)
-        }
+        OwnerFaultSupplyOutcome::Wait(wait) => portal_wait_cause(wait)
+            .map(UserFaultSupply::Contended)
+            .unwrap_or(UserFaultSupply::Unresolved(9)),
+        OwnerFaultSupplyOutcome::Unavailable => UserFaultSupply::Unresolved(9),
         OwnerFaultSupplyOutcome::CowSelected => {
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
@@ -1027,14 +1076,20 @@ fn supply_user_fault(
             UserFaultSupply::Served
         }
         OwnerFaultSupplyOutcome::Selected => {
-            cross_owner_grant(
-                carrick_guest_arch::CpuId::new(binding.cpu_slot),
-                fault.address,
-            );
             let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
                 return UserFaultSupply::Unresolved(9);
             };
-            let Some(window) = grant_slot.window() else {
+            // The carrier crossing publishes a window once. A NotNow rerun
+            // retains that exact submitted window and serves it before the
+            // settlement crossing; crossing first would ask custody to settle
+            // a descriptor receipt that does not exist yet.
+            if grant_slot.window().is_none() {
+                cross_owner_grant(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                    fault.address,
+                );
+            }
+            let Some(_window) = grant_slot.window() else {
                 // No physical backing for a still-authenticated file selection:
                 // EOF/truncation follows Linux backing-fault signal policy.
                 if let Some((generation, selected)) =
@@ -1050,78 +1105,67 @@ fn supply_user_fault(
                 }
                 return UserFaultSupply::Unresolved(9);
             };
-            let Some(carrier) = portal.carrier() else {
+            let Ok(owner) = native_process::portal() else {
                 return UserFaultSupply::Unresolved(9);
             };
-            let Some(index) = spaces.find(mm_key) else {
-                return UserFaultSupply::Unresolved(9);
-            };
-            let mut applied = false;
-            for attempt in 0..2 {
-                let observed_retirement = residency.retirement_epoch();
-                let Ok(mut root) =
-                    roots.lock_in(spaces, index.index(), window.operation.mm, binding.cpu_slot)
-                else {
-                    return UserFaultSupply::Unresolved(9);
-                };
-                let Ok(target) = carrick_core::mm::frames::grant_target_in(
-                    carrier,
-                    &window,
-                    spaces,
+            // SAFETY: the retained residency table and metadata allocator are
+            // the CPL0 guest venue. The shared helper releases its editor and
+            // descriptor claim before growing or returning NotNow.
+            let outcome = unsafe {
+                carrick_core::mm::frames::serve_grant_with_venue(
+                    &owner,
+                    grant_slot,
+                    residency,
+                    &carrick_el1::alloc::GLOBAL_ALLOCATOR,
                     binding.cpu_slot,
-                    &mut root,
-                ) else {
-                    return UserFaultSupply::Unresolved(9);
-                };
-                // SAFETY: `residency` and `GLOBAL_ALLOCATOR` share CPL0's guest venue.
-                let view = unsafe { residency.guest_view() };
-                let outcome = carrick_core::mm::frames::try_apply_grant::<
-                    carrick_mmu_core::x86::owner_mmu::X86Mmu,
-                    _,
-                >(grant_slot, &words, &view, target, || {});
-                drop(root);
-                match outcome {
-                    carrick_core::mm::frames::GrantApplyOutcome::Completed(receipt) => {
-                        applied = matches!(
-                            receipt.outcome,
-                            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(
-                                _
-                            )
-                        );
-                        break;
-                    }
-                    carrick_core::mm::frames::GrantApplyOutcome::Empty => break,
-                    carrick_core::mm::frames::GrantApplyOutcome::ResidencyCapacity {
-                        observed_extensions,
-                    } => {
-                        match carrick_core::mm::frames::grow_residency_or_not_now(
-                            residency,
-                            &carrick_el1::alloc::GLOBAL_ALLOCATOR,
-                            observed_extensions,
-                            observed_retirement,
-                            None,
-                        ) {
-                            Ok(()) => continue,
-                            Err(continuation)
-                                if attempt == 0 && continuation.ready_to_retry(residency) =>
-                            {
-                                continue;
-                            }
-                            Err(_) => break,
-                        }
-                    }
+                    |target, view| {
+                        Ok(carrick_core::mm::frames::try_apply_grant::<
+                            carrick_mmu_core::x86::owner_mmu::X86Mmu,
+                            _,
+                        >(
+                            grant_slot, &words, view, target, || {}
+                        ))
+                    },
+                )
+            };
+            match outcome {
+                Ok(carrick_core::mm::frames::GrantServeOutcome::Completed(receipt))
+                    if matches!(
+                        receipt.outcome,
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
+                    ) =>
+                {
+                    cross_owner_grant(
+                        carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                        fault.address,
+                    );
+                    UserFaultSupply::Served
                 }
-            }
-            cross_owner_grant(
-                carrick_guest_arch::CpuId::new(binding.cpu_slot),
-                fault.address,
-            );
-            if applied {
-                UserFaultSupply::Served
-            } else {
-                UserFaultSupply::Unresolved(9)
+                Ok(carrick_core::mm::frames::GrantServeOutcome::NotNow(_))
+                | Err(carrick_core::mm::transaction::MmError::Busy) => UserFaultSupply::Contended(
+                    carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+                ),
+                Err(carrick_core::mm::transaction::MmError::Wait(wait)) => portal_wait_cause(wait)
+                    .map(UserFaultSupply::Contended)
+                    .unwrap_or(UserFaultSupply::Unresolved(9)),
+                _ => UserFaultSupply::Unresolved(9),
             }
         }
+    }
+}
+
+fn portal_wait_cause(
+    wait: carrick_el1_abi::PortalOwnerWait,
+) -> Option<carrick_sched_core::spaces::notification::SpaceWaitCause> {
+    use carrick_el1_abi::PortalWaitCause;
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    match wait.cause() {
+        PortalWaitCause::Editor => Some(SpaceWaitCause::Editor),
+        PortalWaitCause::Reservations => Some(SpaceWaitCause::Reservations),
+        PortalWaitCause::PendingEdit => Some(SpaceWaitCause::PendingEdit),
+        PortalWaitCause::Gate => Some(SpaceWaitCause::Gate),
+        PortalWaitCause::Metadata => Some(SpaceWaitCause::Metadata),
+        PortalWaitCause::ReservationPool | PortalWaitCause::HostReadiness => None,
     }
 }
 
@@ -1507,9 +1551,9 @@ impl Personality for LinuxPersonality {
                             // The owner refused or could not supply the
                             // access (no reservation names it): never a
                             // carrier abort.
-                            UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
-                                Some(stage.refused())
-                            }
+                            UserFaultSupply::Signal { .. }
+                            | UserFaultSupply::Contended(_)
+                            | UserFaultSupply::Unresolved(_) => Some(stage.refused()),
                         }
                     }
                     None => Some(stage),

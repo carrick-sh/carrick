@@ -688,6 +688,120 @@ impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
     }
 }
 
+/// What a user #PF that met MM contention does next (#2420, folded from
+/// #2263's x86 owner-fault park).
+pub(super) enum ContendedFault {
+    Parked,
+    Rerun,
+    Refused,
+}
+
+/// Park an unchanged user #PF on its MM holder's release. The waiter enrolls
+/// before probing, probes once, and either publishes the saved fault context
+/// or reruns immediately when the release raced enrollment.
+pub(super) fn park_contended_fault(
+    task: &CurrentTask,
+    slot: carrick_sched_core::SlotId,
+    cause: SpaceWaitCause,
+    context: &ParkedContextWords,
+) -> ContendedFault {
+    use carrick_core::wait::{
+        EditWaitOutcome, ObjectParkRequest, coordinate_anonymous_edit_wait,
+        park_object_record_rechecked, space_access,
+    };
+    use carrick_sched_core::Waker;
+    use carrick_sched_core::spaces::EditAdmissionRefusal;
+    if !matches!(
+        cause,
+        SpaceWaitCause::Reservations | SpaceWaitCause::Editor | SpaceWaitCause::Gate
+    ) {
+        return ContendedFault::Refused;
+    }
+    let source = carrick_x86_carrier::native_execution::source(slot);
+    let zone = source.zone;
+    let Some(mm) = carrick_el1_abi::ReservationMm::new(task.mm.key.load(Ordering::Acquire)) else {
+        return ContendedFault::Refused;
+    };
+    let Some(lease) = NonZeroU64::new(mm.raw())
+        .and_then(|key| zone.space_entry(key))
+        .and_then(|entry| entry.live_notifications().ok())
+    else {
+        return ContendedFault::Refused;
+    };
+    let table = shared_x86_cpl0_guest();
+    let (Some(index), Some(owner)) = (
+        zone.spaces.find(mm.raw()),
+        NonZeroU64::new(slot.index() as u64 + 1),
+    ) else {
+        return ContendedFault::Refused;
+    };
+    if !table.admitted(index.index(), mm) {
+        return ContendedFault::Refused;
+    }
+    let access = space_access(zone, slot, crate::native_process::release);
+    let outcome = coordinate_anonymous_edit_wait(
+        &lease,
+        None,
+        || {
+            match table.lock_in(access, index.index(), mm, slot.index() as u32) {
+                Ok(root) => drop(root),
+                Err(carrick_el1::memory::reservations::Refusal::Busy) => {
+                    return Some(Some(SpaceWaitCause::Reservations));
+                }
+                Err(_) => return Some(None),
+            }
+            match zone
+                .spaces
+                .try_begin_edit_cause(index, mm.raw(), owner, access.venue())
+            {
+                Ok(editor) => {
+                    drop(editor);
+                    Some(None)
+                }
+                Err(EditAdmissionRefusal::Editor) => Some(Some(SpaceWaitCause::Editor)),
+                Err(EditAdmissionRefusal::Gate) => Some(Some(SpaceWaitCause::Gate)),
+                Err(EditAdmissionRefusal::Stale) => None,
+            }
+        },
+        |key, snapshot, token| {
+            let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
+            let mut replaced = None;
+            let result = park_object_record_rechecked(
+                zone,
+                slot,
+                request,
+                &|effects| crate::native_process::release(zone, Waker::El1 { slot }, effects),
+                || {
+                    let record = zone
+                        .slot(slot)
+                        .current()
+                        .or_else(|| zone.slot(slot).host_record())
+                        .ok_or(ObjectWaitError::Stale)?;
+                    // SAFETY: the faulting slot owns its current record until
+                    // the park publishes.
+                    let saved = unsafe { zone.record(record).ctx_mut() };
+                    replaced = Some((record, *saved));
+                    *saved = *context;
+                    Ok((record, false))
+                },
+                || lease.key(cause) == key && lease.observe(cause) == snapshot.observed(),
+            );
+            if result.is_err()
+                && let Some((record, previous)) = replaced
+            {
+                // SAFETY: failed publication leaves this slot owning the record.
+                *unsafe { zone.record(record).ctx_mut() } = previous;
+            }
+            result
+        },
+    );
+    match outcome {
+        EditWaitOutcome::Parked(_) => ContendedFault::Parked,
+        EditWaitOutcome::NoConflict | EditWaitOutcome::StaleToken => ContendedFault::Rerun,
+        EditWaitOutcome::Refused => ContendedFault::Refused,
+    }
+}
+
 fn fatal_reservation() -> ! {
     carrick_x86_carrier::entry::fatal_boot()
 }
