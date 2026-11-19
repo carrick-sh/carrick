@@ -2205,7 +2205,7 @@ fn private_file_4k_grants_scale_past_initial_residency<
 
     // Python/pip startup maps shared libraries and C extensions as private file
     // mappings and first-touches > 4,096 distinct 4 KiB pages in one MM.
-    const TOTAL_PAGES: usize = FRAME_GRANT_RESIDENCY_SLOTS + 512;
+    const TOTAL_PAGES: usize = 8192 + 512;
     const L2_TABLES: usize = TOTAL_PAGES / 512;
 
     let mut region = Region::new();
