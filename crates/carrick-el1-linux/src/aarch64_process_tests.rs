@@ -17772,6 +17772,7 @@ fn serve_child_host_file(
     venue: &crate::ipc::IpcVenue<'_>,
     dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
     credentials: &carrick_personality_linux::identity::TaskCredentials,
+    network_caller: Option<(TaskKey, u32)>,
 ) -> Option<i64> {
     use carrick_core_abi::service::ServiceOrigin;
     use carrick_personality_linux::native_host_file::HostFileStage;
@@ -17811,6 +17812,17 @@ fn serve_child_host_file(
             };
             // The production carrier stamps the writer's RLIMIT_FSIZE
             // (`service.rs`); an unstamped write reads as a finite 0.
+            let is_network = carrick_core_abi::host_file::request_parts(&record).is_some_and(
+                |(header, _, _)| header.op == carrick_core_abi::host_file::HostFileOp::NetSyscall,
+            );
+            let record = if is_network {
+                use carrick_personality_linux::native_host_file::{net_caller, stamp_net_caller};
+                let (key, pid) = network_caller.expect("network test supplies the child identity");
+                let caller = net_caller(key, pid, credentials).expect("live child network caller");
+                stamp_net_caller(&record, &caller).expect("stamp child network identity")
+            } else {
+                record
+            };
             let mut record = record.into_vec();
             carrick_personality_linux::native_host_file::stamp_write_file_size_limit::<()>(
                 &mut record,
@@ -17818,23 +17830,19 @@ fn serve_child_host_file(
             )
             .unwrap();
             match dispatcher.serve_native_host_file(&mut record, None) {
-                Ok(_) => {
-                    let parsed = carrick_core_abi::host_file::reply(&record)
-                        .expect("served host-file record must contain a valid reply");
-                    if let Some(out) = output
-                        && !parsed.output.is_empty()
-                    {
-                        // SAFETY: the output names a live GuestUserBuffer.
-                        let dst = unsafe {
-                            core::slice::from_raw_parts_mut(
-                                out.address as *mut u8,
-                                parsed.output.len(),
-                            )
-                        };
-                        dst.copy_from_slice(parsed.output);
-                    }
-                    parsed.result
-                }
+                Ok(_) => carrick_personality_linux::native_host_file::complete(
+                    &record,
+                    output,
+                    &mut |address, bytes| {
+                        use crate::file::UserCopy;
+                        crate::file::ValidatedCopy {
+                            task,
+                            validator: &crate::file::HardwareValidator,
+                        }
+                        .copy_out(address, bytes)
+                    },
+                )
+                .raw(),
                 Err(_) => carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
             }
         }
@@ -18298,12 +18306,20 @@ fn with_arm_process_host_files<R>(
         }
         // A child has no host fallback: a forward is the native host-file
         // venue's request, or nothing (a counted ENOSYS).
+        let key = binding.key;
         let credentials = runtime
-            .task_identity_of_for_test(resolve_child(runtime, pid))
+            .task_identity_of_for_test(key)
             .expect("a live child's task row")
             .0;
-        let ret = serve_child_host_file(&frame, &fixture.task, &venue, &dispatcher, &credentials)
-            .unwrap_or(carrick_syscall_abi::LINUX_ENOSYS.guest_retval());
+        let ret = serve_child_host_file(
+            &frame,
+            &fixture.task,
+            &venue,
+            &dispatcher,
+            &credentials,
+            Some((key, pid)),
+        )
+        .unwrap_or(carrick_syscall_abi::LINUX_ENOSYS.guest_retval());
         (route, ret)
     };
 
@@ -18314,6 +18330,70 @@ fn with_arm_process_host_files<R>(
     #[cfg(not(target_os = "macos"))]
     drop(metadata_scope);
     (result, dispatcher.stdout())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_epoll_ctl_adds_an_inet_socket() {
+    use carrick_abi::{
+        LINUX_AF_INET, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD,
+        LINUX_EPOLLET, LINUX_EPOLLOUT, LINUX_SOCK_DGRAM,
+    };
+    use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
+    use carrick_test_support::GuestUserBuffer;
+
+    with_arm_process_host_dispatch(|call| {
+        let (route, pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid} ({route:?})");
+        let child = ArmCaller::Child(pid as u32);
+        let (_, socket) = call(
+            child,
+            sys::SOCKET.raw(),
+            [LINUX_AF_INET as u64, LINUX_SOCK_DGRAM as u64, 0, 0, 0, 0],
+        );
+        assert!(socket >= 0, "child socket: {socket}");
+        let (route, epoll) = call(child, sys::EPOLL_CREATE1.raw(), [0; 6]);
+        assert_eq!(route, CompletionRoute::Served);
+        assert!(epoll >= 0, "child epoll_create1: {epoll}");
+        let (socket, epoll) = (socket as u64, epoll as u64);
+        let edge = epoll_event_buffer(LINUX_EPOLLOUT | LINUX_EPOLLET, 0x2418);
+        let level = epoll_event_buffer(LINUX_EPOLLOUT, 0x2419);
+        let ctl = |call: &mut dyn FnMut(ArmCaller, u64, [u64; 6]) -> (CompletionRoute, i64),
+                   op,
+                   event| {
+            let (route, result) = call(
+                child,
+                sys::EPOLL_CTL.raw(),
+                [epoll, op, socket, event, 0, 0],
+            );
+            assert_eq!(result, 0, "child epoll_ctl({op}): {route:?}");
+            assert_ne!(route, CompletionRoute::Forward, "child epoll_ctl({op})");
+        };
+        let output = GuestUserBuffer::zeroed(16);
+        let wait = |call: &mut dyn FnMut(ArmCaller, u64, [u64; 6]) -> (CompletionRoute, i64),
+                    count,
+                    cookie: u64| {
+            let (route, result) = call(
+                child,
+                sys::EPOLL_PWAIT.raw(),
+                [epoll, output.arg(), 1, 0, 0, 0],
+            );
+            assert_eq!(result, count, "child epoll_pwait: {route:?}");
+            assert_ne!(route, CompletionRoute::Forward, "child epoll_pwait");
+            if count != 0 {
+                assert_eq!(&output.as_bytes()[..4], &LINUX_EPOLLOUT.to_ne_bytes());
+                assert_eq!(&output.as_bytes()[8..16], &cookie.to_ne_bytes());
+            }
+        };
+        ctl(call, LINUX_EPOLL_CTL_ADD, edge.arg());
+        wait(call, 1, 0x2418);
+        wait(call, 0, 0);
+        ctl(call, LINUX_EPOLL_CTL_MOD, level.arg());
+        wait(call, 1, 0x2419);
+        wait(call, 1, 0x2419);
+        ctl(call, LINUX_EPOLL_CTL_DEL, 0);
+        wait(call, 0, 0);
+    });
 }
 
 #[test]
@@ -22455,6 +22535,7 @@ fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
             &venue,
             &dispatcher,
             &carrick_personality_linux::identity::TaskCredentials::ROOT,
+            None,
         )
         .unwrap_or_else(|| panic!("child syscall {nr} staged nothing"))
     };
