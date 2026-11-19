@@ -1916,6 +1916,40 @@ fn mounted_static_x86_glibc_hello_matches_native() {
 }
 
 #[test]
+fn mounted_static_x86_first_user_entry_registers_and_fp_state_are_clean() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("entry-registers");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../carrick-vmm-soft/tests/fixtures/x86_entry_registers.S");
+    x86_process_entry::compile_static_fixture(&source, &elf, &["-nostdlib"]);
+
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("run native x86 entry register oracle");
+    assert_eq!(native.status.code(), Some(0));
+    assert!(native.stderr.is_empty());
+    x86_process_entry::assert_clean_first_user_entry(&native.stdout, "native x86_64 Linux");
+
+    let run = run_mounted_binary(&elf, "entry-registers", false);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "Carrick stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.stderr.is_empty(),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    x86_process_entry::assert_clean_first_user_entry(&run.stdout, "KVM production CLI");
+}
+
+#[test]
 #[ignore = "musl startup needs CPL0 signal actions and anonymous first-touch backing"]
 fn mounted_static_x86_musl_hello_matches_native() {
     if skip_without_kvm() {

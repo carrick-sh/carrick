@@ -464,17 +464,7 @@ fn production_ring_clears_first_user_registers_on_soft_cpu() {
     let run = run_compiled_entry_fixture("tests/fixtures/x86_entry_registers.S", &["-nostdlib"]);
     assert!(run.failure.is_none(), "{}", run.summary());
     assert_eq!(run.exit, Some(0), "{}", run.summary());
-
-    let registers = [
-        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9", "r10", "r11", "r12", "r13",
-        "r14", "r15", "rflags",
-    ];
-    assert_eq!(run.stdout.len(), registers.len() * 8, "{}", run.summary());
-    for (register, bytes) in registers.into_iter().zip(run.stdout.chunks_exact(8)) {
-        let value = u64::from_le_bytes(bytes.try_into().expect("register width"));
-        let expected = if register == "rflags" { 0x202 } else { 0 };
-        assert_eq!(value, expected, "first user {register} = {value:#x}");
-    }
+    x86_process_entry::assert_clean_first_user_entry(&run.stdout, &run.summary());
 }
 
 /// The bhyve/KVM M2 static musl hello exercises stdio readiness and the
