@@ -158,6 +158,9 @@ child:
 #ifdef EPOLL_HUP_PORT
     jmp epoll_terminal
 #endif
+#ifdef EPOLL_EXCLUSIVE
+    jmp epoll_exclusive
+#endif
 #ifdef EPOLL_WAIT_PORT
     jmp epoll_waiters
 #endif
@@ -1332,6 +1335,65 @@ epoll_waiter_exit:
     mov $SYS_EXIT, %eax
     syscall
     ud2
+#endif
+
+#ifdef EPOLL_EXCLUSIVE
+epoll_exclusive:
+    mov $2, %edi                 /* AF_INET */
+    mov $2, %esi                 /* SOCK_DGRAM */
+    xor %edx, %edx
+    mov $SYS_SOCKET, %eax
+    syscall
+    mov $1, %r15d
+    test %rax, %rax
+    js fail
+    mov %rax, %r12
+    xor %edi, %edi
+    mov $SYS_EPOLL_CREATE1, %eax
+    syscall
+    mov $2, %r15d
+    test %rax, %rax
+    js fail
+    mov %rax, %r13
+    movl $0x10000004, buffer(%rip) /* EXCLUSIVE|OUT */
+    mov $1, %esi                  /* ADD */
+    call exclusive_ctl
+    EXPECT(3, 0)
+    mov $3, %esi                  /* MOD */
+    call exclusive_ctl
+    EXPECT(4, -22)
+    movl $4, buffer(%rip)         /* MOD cannot change an exclusive item */
+    mov $3, %esi
+    call exclusive_ctl
+    EXPECT(7, -22)
+    mov $2, %esi                  /* DEL */
+    call exclusive_ctl
+    EXPECT(5, 0)
+    movl $0x50000004, buffer(%rip) /* EXCLUSIVE|ONESHOT|OUT */
+    mov $1, %esi
+    call exclusive_ctl
+    EXPECT(6, -22)
+    xor %edi, %edi
+    mov $SYS_EPOLL_CREATE1, %eax
+    syscall
+    mov $8, %r15d
+    test %rax, %rax
+    js fail
+    mov %rax, %r12
+    movl $0x10000004, buffer(%rip) /* EXCLUSIVE with an epoll target */
+    mov $1, %esi
+    call exclusive_ctl
+    EXPECT(9, -22)
+    xor %edi, %edi
+    jmp exit
+
+exclusive_ctl:
+    mov %r13, %rdi
+    mov %r12, %rdx
+    lea buffer(%rip), %r10
+    mov $SYS_EPOLL_CTL, %eax
+    syscall
+    ret
 #endif
 
 fail:
