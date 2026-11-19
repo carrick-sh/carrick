@@ -1129,6 +1129,11 @@ mod tests {
         let stopped = cpu.run_loaded(root.binding().task()).unwrap();
         assert_eq!(stopped.exit, CarrierRunExit::Kick);
         assert_eq!(stopped.state.unwrap().binding(), child.binding());
+        let detached = cpu
+            .save_and_detach(root.binding().task())
+            .expect("a kicked child keeps its issued binding during detach");
+        assert_eq!(detached.binding(), child.binding());
+        cpu.audit_idle().expect("detached CPU is neutral");
     }
     #[test]
     fn child_owner_grant_on_root_executor_is_a_physical_boundary() {
