@@ -1206,7 +1206,7 @@ jobs:
         if: steps.compiler-cache.outputs.backend == 'local'
         run: scripts/ci/compiler-cache-start-local.sh
       - name: Software x86 CPU, MMU, and CPL0 host coordinator tests on x86_64
-        run: cargo test --locked --offline -p carrick-softcpu-x86 -p carrick-softmmu -p carrick-x86-cpl0-host -p carrick-vmm-soft
+        run: just ci-test-x86-host
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just ci-cache-finish
