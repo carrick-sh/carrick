@@ -103,14 +103,15 @@ the process's pending close. At the closing member-wait guard it verifies that
 the retained `PendingService` belongs to `self.control`
 (`NativeServiceQuarantine::RetainedServiceControl`,
 `EntryBindingFatalReason::RetainedControlQuarantine`, fatal code 201),
-consumes that service through `resume_service`, retires any installed IPC
-adapter operation and its endpoint `OfdPin` through the shared
-`settle_closing_adapter_operation` helper while preserving the terminal
-`OwnerContinuation` (the same helper backs closed-gate adapter cancellation and
-rejects an impossible adapter token on `ClosingMemberWait::Signal` as
-`NativeServiceQuarantine::SignalWaitAdapter`,
-`EntryBindingFatalReason::SignalWaitAdapterQuarantine`, fatal code 200), and hands
-`NoPending` to the existing lifecycle checkpoint. If `resume_pending_lifecycle`
+consumes that service through `resume_service` and hands `NoPending` to the
+existing lifecycle checkpoint. The checkpoint settles any installed IPC
+operation and its endpoint `OfdPin` through the shared
+`settle_closing_adapter_operation` helper before consuming the terminal
+`OwnerContinuation` and retiring the member. The same helper backs closed-gate
+adapter cancellation and rejects an impossible adapter token on
+`ClosingMemberWait::Signal` as `NativeServiceQuarantine::SignalWaitAdapter`
+(`EntryBindingFatalReason::SignalWaitAdapterQuarantine`, fatal code 200).
+If `resume_pending_lifecycle`
 records a `run_failure`, `settle_retained_service_for_closing_entry` consumes
 `take_run_failure()` and propagates the underlying `NativeProcessError` rather
 than masking or dropping it. The ARM and x86 mmap, CarrierWork, and
@@ -120,6 +121,18 @@ adapter services) pass at the production service-settlement boundary;
 `native_service_duplicate_custody_is_an_invariant_at_bridge_settlement` still
 prove that non-service waits and service custody without terminal authority
 remain quarantined.
+
+The ARM and x86
+`terminal_close_with_retained_adapter_service_resume_checkpoint` witnesses
+wake a claimed adapter service into the normal scheduler checkpoint. The
+`terminal_close_during_contended_adapter_preparation` witnesses close the
+process between observing a live peer's notice and the unpublished request's
+park probe, through `drain_owned_preparation`. On both paths, the operation
+is the pipe endpoint's last reference. Both ISA variants of each path
+failed before the fix with the operation still installed. After the fix
+they require record retirement, the operation and pipe endpoint gone, and
+zero retained service claims. The contention witnesses also require the
+peer's notice to survive and its ticket to complete.
 
 Director confirmation requires signed runs of `el1_fork_cow_resolves_in_guest`,
 `el1_sched_two_processes_share_vcpus`,
