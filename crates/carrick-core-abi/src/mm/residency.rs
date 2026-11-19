@@ -172,7 +172,7 @@ impl Drop for FrameGrantTransferPin<'_> {
 /// retirement. The caller either commits after the descriptor transaction or
 /// drops this token to reopen transfer admission without changing residency.
 pub struct FrameGrantResidencyRetirement<'a> {
-    table: &'a FrameGrantResidencyTable,
+    table: FrameGrantResidencyTable<ResidencyRows<'a>>,
     mm_key: u64,
     start: u64,
     end: u64,
@@ -199,18 +199,18 @@ impl Drop for FrameGrantResidencyRetirement<'_> {
     }
 }
 
-/// Fixed shared open-addressed index. Grants hash by their smallest power-of-two
+/// A shared open-addressed segment. Grants hash by their smallest power-of-two
 /// page-count bucket. A page in a grant lies in its base bucket or the next
 /// bucket, so lookups check those two buckets for each size class. Disjoint
 /// short grants in one 2 MiB window no longer consume one 64-slot chain.
 #[repr(C, align(64))]
 #[derive(Debug)]
-pub struct FrameGrantResidencyTable {
+pub struct ResidencySegment {
     slots: [FrameGrantResidencyRecord; FRAME_GRANT_RESIDENCY_SLOTS],
     dirty: [AtomicU64; FRAME_GRANT_RESIDENCY_SLOTS / 64],
 }
 
-impl FrameGrantResidencyTable {
+impl ResidencySegment {
     const fn initial_slot() -> FrameGrantResidencyRecord {
         FrameGrantResidencyRecord::new()
     }
@@ -219,7 +219,7 @@ impl FrameGrantResidencyTable {
         AtomicU64::new(0)
     }
 
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             slots: [const { Self::initial_slot() }; FRAME_GRANT_RESIDENCY_SLOTS],
             dirty: [const { Self::initial_dirty() }; FRAME_GRANT_RESIDENCY_SLOTS / 64],
@@ -231,7 +231,7 @@ impl FrameGrantResidencyTable {
     /// # Safety
     /// `ptr` must be valid for writes, non-null, aligned to `align_of::<Self>()`,
     /// and point to storage of at least `size_of::<Self>()` bytes.
-    pub unsafe fn init_in_place(ptr: *mut Self) {
+    unsafe fn init_in_place(ptr: *mut Self) {
         // SAFETY: caller guarantees aligned, writable storage for the table.
         // Each record constructor initializes its complete wire image; no
         // reference to partially initialized storage is formed.
@@ -245,6 +245,99 @@ impl FrameGrantResidencyTable {
                 dirty.add(index).write(Self::initial_dirty());
             }
         }
+    }
+}
+
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct FrameGrantResidencyTable<S = ResidencySegment> {
+    storage: S,
+}
+
+impl FrameGrantResidencyTable {
+    pub const fn new() -> Self {
+        Self {
+            storage: ResidencySegment::new(),
+        }
+    }
+
+    /// Initialize in place without materializing a large stack temporary.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for writes, non-null, aligned to `align_of::<Self>()`,
+    /// and point to storage of at least `size_of::<Self>()` bytes.
+    pub unsafe fn init_in_place(ptr: *mut Self) {
+        // SAFETY: the caller owns the table storage, including the bootstrap
+        // segment. No reference to uninitialized storage is formed.
+        unsafe { ResidencySegment::init_in_place(core::ptr::addr_of_mut!((*ptr).storage)) };
+    }
+}
+
+/// Venue-local aliases of the bootstrap and extension storage.
+#[derive(Clone, Copy)]
+pub struct ResidencyRows<'a> {
+    bootstrap: &'a ResidencySegment,
+    extensions: &'a [&'a ResidencySegment],
+}
+
+mod sealed {
+    pub trait ResidencyStorage {
+        fn rows(&self) -> super::ResidencyRows<'_>;
+    }
+}
+
+impl sealed::ResidencyStorage for ResidencySegment {
+    fn rows(&self) -> ResidencyRows<'_> {
+        ResidencyRows {
+            bootstrap: self,
+            extensions: &[],
+        }
+    }
+}
+
+impl sealed::ResidencyStorage for ResidencyRows<'_> {
+    fn rows(&self) -> ResidencyRows<'_> {
+        *self
+    }
+}
+
+impl<'a> ResidencyRows<'a> {
+    fn segments(self) -> impl Iterator<Item = &'a ResidencySegment> {
+        core::iter::once(self.bootstrap).chain(self.extensions.iter().copied())
+    }
+
+    fn segment(self, index: usize) -> Option<&'a ResidencySegment> {
+        match index {
+            0 => Some(self.bootstrap),
+            _ => self.extensions.get(index - 1).copied(),
+        }
+    }
+
+    fn as_table(self) -> FrameGrantResidencyTable<Self> {
+        FrameGrantResidencyTable { storage: self }
+    }
+}
+
+impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
+    fn segments(&self) -> impl Iterator<Item = &ResidencySegment> {
+        self.storage.rows().segments()
+    }
+
+    fn slots(&self) -> impl Iterator<Item = &FrameGrantResidencyRecord> {
+        self.segments().flat_map(|segment| segment.slots.iter())
+    }
+
+    fn slot(&self, index: usize) -> Option<&FrameGrantResidencyRecord> {
+        self.slot_entry(index).map(|(record, _)| record)
+    }
+
+    fn slot_entry(&self, index: usize) -> Option<(&FrameGrantResidencyRecord, &AtomicU64)> {
+        let segment = self
+            .storage
+            .rows()
+            .segment(index / FRAME_GRANT_RESIDENCY_SLOTS)?;
+        let offset = index % FRAME_GRANT_RESIDENCY_SLOTS;
+        Some((&segment.slots[offset], &segment.dirty[offset / 64]))
     }
 
     fn first_slot(mm_key: u64, bucket: u64, class: u32) -> usize {
@@ -287,27 +380,29 @@ impl FrameGrantResidencyTable {
             .next_power_of_two()
             .trailing_zeros();
         let bucket = identity.semantic_base / (GRANT_PAGE_SIZE << class);
-        for probe in 0..GRANT_PROBES {
-            let slot = Self::probe(identity.mm_key, bucket, class, probe);
-            let record = &self.slots[slot];
-            let state = record.state.load(Ordering::Acquire);
-            if !matches!(state & GRANT_STATE_MASK, GRANT_EMPTY | GRANT_RETIRED) {
-                continue;
-            }
-            // Claim the exact reusable epoch we observed. Another MM can
-            // take this slot even while this MM's editor is held.
-            if record
-                .state
-                .compare_exchange(
-                    state,
-                    (state & !GRANT_STATE_MASK).wrapping_add(4) | GRANT_WRITING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                record.publish(identity);
-                return Ok(slot);
+        for (segment_index, segment) in self.segments().enumerate() {
+            for probe in 0..GRANT_PROBES {
+                let slot = Self::probe(identity.mm_key, bucket, class, probe);
+                let record = &segment.slots[slot];
+                let state = record.state.load(Ordering::Acquire);
+                if !matches!(state & GRANT_STATE_MASK, GRANT_EMPTY | GRANT_RETIRED) {
+                    continue;
+                }
+                // Claim the exact reusable epoch we observed. Another MM can
+                // take this slot even while this MM's editor is held.
+                if record
+                    .state
+                    .compare_exchange(
+                        state,
+                        (state & !GRANT_STATE_MASK).wrapping_add(4) | GRANT_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    record.publish(identity);
+                    return Ok(segment_index * FRAME_GRANT_RESIDENCY_SLOTS + slot);
+                }
             }
         }
         Err(FrameGrantResidencyRefusal::Capacity)
@@ -316,8 +411,7 @@ impl FrameGrantResidencyTable {
     /// Diagnostic sample of occupied slots, including in-flight publishers.
     /// Other MMs can change the table during the scan.
     pub fn observed_slots_used(&self) -> usize {
-        self.slots
-            .iter()
+        self.slots()
             .filter(|record| {
                 matches!(
                     record.state.load(Ordering::Relaxed) & GRANT_STATE_MASK,
@@ -335,7 +429,7 @@ impl FrameGrantResidencyTable {
         mut classify: impl FnMut(FrameGrantResidencyIdentity, bool) -> T,
         mut observe: impl FnMut(Option<T>),
     ) {
-        for record in &self.slots {
+        for record in self.slots() {
             let epoch = record.state.load(Ordering::Acquire);
             match epoch & GRANT_STATE_MASK {
                 GRANT_WRITING => observe(None),
@@ -360,41 +454,43 @@ impl FrameGrantResidencyTable {
     /// Guest: find the exact live grant covering a prepared leaf.
     pub fn lookup(&self, mm_key: u64, va: u64) -> Option<FrameGrantResidencyPage> {
         let page = va & !(GRANT_PAGE_SIZE - 1);
-        for class in 0..=EL1_FRAME_GRANT_TARGET_SIZE
-            .div_ceil(GRANT_PAGE_SIZE)
-            .trailing_zeros()
-        {
-            let bucket = page / (GRANT_PAGE_SIZE << class);
-            for candidate in [Some(bucket), (class > 0 && bucket > 0).then(|| bucket - 1)]
-                .into_iter()
-                .flatten()
+        for (segment_index, segment) in self.segments().enumerate() {
+            for class in 0..=EL1_FRAME_GRANT_TARGET_SIZE
+                .div_ceil(GRANT_PAGE_SIZE)
+                .trailing_zeros()
             {
-                for probe in 0..GRANT_PROBES {
-                    let slot = Self::probe(mm_key, candidate, class, probe);
-                    let record = &self.slots[slot];
-                    let epoch = record.state.load(Ordering::Acquire);
-                    match epoch & GRANT_STATE_MASK {
-                        GRANT_EMPTY => break,
-                        GRANT_LIVE => {
-                            let identity = record.identity();
-                            if identity.mm_key == mm_key
-                                && page >= identity.semantic_base
-                                && page - identity.semantic_base < identity.len
-                                && record.state.load(Ordering::Acquire) == epoch
-                            {
-                                let bit =
-                                    ((page - identity.semantic_base) / GRANT_PAGE_SIZE) as usize;
-                                return Some(FrameGrantResidencyPage {
-                                    slot,
-                                    identity,
-                                    expected_ipa: identity.physical_ipa
-                                        + bit as u64 * GRANT_PAGE_SIZE,
-                                    epoch,
-                                    bit,
-                                });
+                let bucket = page / (GRANT_PAGE_SIZE << class);
+                for candidate in [Some(bucket), (class > 0 && bucket > 0).then(|| bucket - 1)]
+                    .into_iter()
+                    .flatten()
+                {
+                    for probe in 0..GRANT_PROBES {
+                        let slot = Self::probe(mm_key, candidate, class, probe);
+                        let record = &segment.slots[slot];
+                        let epoch = record.state.load(Ordering::Acquire);
+                        match epoch & GRANT_STATE_MASK {
+                            GRANT_EMPTY => break,
+                            GRANT_LIVE => {
+                                let identity = record.identity();
+                                if identity.mm_key == mm_key
+                                    && page >= identity.semantic_base
+                                    && page - identity.semantic_base < identity.len
+                                    && record.state.load(Ordering::Acquire) == epoch
+                                {
+                                    let bit = ((page - identity.semantic_base) / GRANT_PAGE_SIZE)
+                                        as usize;
+                                    return Some(FrameGrantResidencyPage {
+                                        slot: segment_index * FRAME_GRANT_RESIDENCY_SLOTS + slot,
+                                        identity,
+                                        expected_ipa: identity.physical_ipa
+                                            + bit as u64 * GRANT_PAGE_SIZE,
+                                        epoch,
+                                        bit,
+                                    });
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -406,7 +502,7 @@ impl FrameGrantResidencyTable {
     /// editor. A racing retirement either closes admission first or observes
     /// this pin and refuses; stale page tokens cannot pin a successor.
     pub fn pin_transfer(&self, page: FrameGrantResidencyPage) -> Option<FrameGrantTransferPin<'_>> {
-        let record = self.slots.get(page.slot)?;
+        let record = self.slot(page.slot)?;
         if record.state.load(Ordering::Acquire) != page.epoch || record.identity() != page.identity
         {
             return None;
@@ -428,7 +524,7 @@ impl FrameGrantResidencyTable {
 
     /// Guest: record a committed VALID leaf before releasing the MM editor.
     pub fn record_commit(&self, page: FrameGrantResidencyPage) -> bool {
-        let Some(record) = self.slots.get(page.slot) else {
+        let Some((record, dirty)) = self.slot_entry(page.slot) else {
             return false;
         };
         if record.state.load(Ordering::Acquire) != page.epoch
@@ -439,7 +535,7 @@ impl FrameGrantResidencyTable {
             return false;
         }
         record.committed[page.bit / 64].fetch_or(1 << (page.bit % 64), Ordering::Release);
-        self.dirty[page.slot / 64].fetch_or(1 << (page.slot % 64), Ordering::Release);
+        dirty.fetch_or(1 << (page.slot % 64), Ordering::Release);
         true
     }
 
@@ -449,7 +545,9 @@ impl FrameGrantResidencyTable {
         let Some(page) = self.lookup(mm_key, va) else {
             return false;
         };
-        let record = &self.slots[page.slot];
+        let Some(record) = self.slot(page.slot) else {
+            return false;
+        };
         record.state.load(Ordering::Acquire) == page.epoch
             && record.identity() == page.identity
             && record.committed[page.bit / 64].load(Ordering::Acquire) & (1 << (page.bit % 64)) != 0
@@ -464,21 +562,30 @@ impl FrameGrantResidencyTable {
         mm_key: u64,
         mut visit: impl FnMut(usize, FrameGrantResidencyIdentity, [u64; 8]) -> core::ops::ControlFlow<B>,
     ) -> core::ops::ControlFlow<B> {
-        for (word_index, word) in self.dirty.iter().enumerate() {
-            let mut pending = word.load(Ordering::Acquire);
-            while pending != 0 {
-                let bit = pending.trailing_zeros() as usize;
-                pending &= pending - 1;
-                let slot = word_index * 64 + bit;
-                let record = &self.slots[slot];
-                let epoch = record.state.load(Ordering::Acquire);
-                if epoch & GRANT_STATE_MASK == GRANT_LIVE {
-                    let identity = record.identity();
-                    if identity.mm_key == mm_key && record.state.load(Ordering::Acquire) == epoch {
-                        let bits =
-                            core::array::from_fn(|i| record.committed[i].load(Ordering::Acquire));
-                        if record.state.load(Ordering::Acquire) == epoch {
-                            visit(slot, identity, bits)?;
+        for (segment_index, segment) in self.segments().enumerate() {
+            for (word_index, word) in segment.dirty.iter().enumerate() {
+                let mut pending = word.load(Ordering::Acquire);
+                while pending != 0 {
+                    let bit = pending.trailing_zeros() as usize;
+                    pending &= pending - 1;
+                    let slot = word_index * 64 + bit;
+                    let record = &segment.slots[slot];
+                    let epoch = record.state.load(Ordering::Acquire);
+                    if epoch & GRANT_STATE_MASK == GRANT_LIVE {
+                        let identity = record.identity();
+                        if identity.mm_key == mm_key
+                            && record.state.load(Ordering::Acquire) == epoch
+                        {
+                            let bits = core::array::from_fn(|i| {
+                                record.committed[i].load(Ordering::Acquire)
+                            });
+                            if record.state.load(Ordering::Acquire) == epoch {
+                                visit(
+                                    segment_index * FRAME_GRANT_RESIDENCY_SLOTS + slot,
+                                    identity,
+                                    bits,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -488,7 +595,7 @@ impl FrameGrantResidencyTable {
     }
 
     pub fn ack_dirty(&self, slot: usize, identity: FrameGrantResidencyIdentity) -> bool {
-        let Some(record) = self.slots.get(slot) else {
+        let Some((record, dirty)) = self.slot_entry(slot) else {
             return false;
         };
         if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE
@@ -496,7 +603,7 @@ impl FrameGrantResidencyTable {
         {
             return false;
         }
-        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
         true
     }
 
@@ -506,7 +613,7 @@ impl FrameGrantResidencyTable {
         slot: usize,
         identity: FrameGrantResidencyIdentity,
     ) -> Option<[u64; 8]> {
-        let record = self.slots.get(slot)?;
+        let record = self.slot(slot)?;
         let epoch = record.state.load(Ordering::Acquire);
         if epoch & GRANT_STATE_MASK != GRANT_LIVE || record.identity() != identity {
             return None;
@@ -517,7 +624,7 @@ impl FrameGrantResidencyTable {
 
     /// Host: retire this exact grant before unmapping or reusing its owner.
     pub fn retire(&self, slot: usize, identity: FrameGrantResidencyIdentity) -> bool {
-        let Some(record) = self.slots.get(slot) else {
+        let Some((record, dirty)) = self.slot_entry(slot) else {
             return false;
         };
         let epoch = record.state.load(Ordering::Acquire);
@@ -544,7 +651,7 @@ impl FrameGrantResidencyTable {
             record.transfer_pins.store(0, Ordering::Release);
             return false;
         }
-        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
         true
     }
 
@@ -559,7 +666,7 @@ impl FrameGrantResidencyTable {
         mut visit: impl FnMut(u64, u64),
     ) {
         let end = start.saturating_add(len);
-        for record in &self.slots {
+        for record in self.slots() {
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK != GRANT_LIVE {
                 continue;
@@ -588,7 +695,7 @@ impl FrameGrantResidencyTable {
         if start >= end {
             return true;
         }
-        for (slot, record) in self.slots.iter().enumerate() {
+        for (slot, record) in self.slots().enumerate() {
             if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE {
                 continue;
             }
@@ -617,7 +724,7 @@ impl FrameGrantResidencyTable {
         if mm_key == 0 || start >= end {
             return None;
         }
-        for record in &self.slots {
+        for record in self.slots() {
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK != GRANT_LIVE {
                 continue;
@@ -650,7 +757,7 @@ impl FrameGrantResidencyTable {
             }
         }
         Some(FrameGrantResidencyRetirement {
-            table: self,
+            table: self.storage.rows().as_table(),
             mm_key,
             start,
             end,
@@ -659,7 +766,7 @@ impl FrameGrantResidencyTable {
     }
 
     fn cancel_retirement(&self, mm_key: u64, start: u64, end: u64) {
-        for record in &self.slots {
+        for record in self.slots() {
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK != GRANT_LIVE {
                 continue;
@@ -681,7 +788,7 @@ impl FrameGrantResidencyTable {
     }
 
     fn commit_retirement(&self, mm_key: u64, start: u64, end: u64) -> bool {
-        for (slot, record) in self.slots.iter().enumerate() {
+        for (slot, record) in self.slots().enumerate() {
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK != GRANT_LIVE {
                 continue;
@@ -744,7 +851,7 @@ impl FrameGrantResidencyTable {
         start: u64,
         end: u64,
     ) -> bool {
-        let Some(record) = self.slots.get(slot) else {
+        let Some((record, dirty)) = self.slot_entry(slot) else {
             return false;
         };
         let state = record.state.load(Ordering::Acquire);
@@ -767,7 +874,7 @@ impl FrameGrantResidencyTable {
         {
             return false;
         }
-        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
         self.publish_retirement_fragments(identity, bits, start, end);
         true
     }
@@ -796,16 +903,16 @@ impl FrameGrantResidencyTable {
                 len: fragment_end - fragment_start,
                 ..identity
             };
-            if let Some(fragment_slot) = self.publish(fragment) {
+            if let Some(fragment_slot) = self.publish(fragment)
+                && let Some((record, dirty)) = self.slot_entry(fragment_slot)
+            {
                 let shift = ((fragment_start - base) / GRANT_PAGE_SIZE) as usize;
                 let count = (fragment.len / GRANT_PAGE_SIZE) as usize;
                 for bit in 0..count {
                     let old_bit = shift + bit;
                     if bits[old_bit / 64] & (1 << (old_bit % 64)) != 0 {
-                        self.slots[fragment_slot].committed[bit / 64]
-                            .fetch_or(1 << (bit % 64), Ordering::Release);
-                        self.dirty[fragment_slot / 64]
-                            .fetch_or(1 << (fragment_slot % 64), Ordering::Release);
+                        record.committed[bit / 64].fetch_or(1 << (bit % 64), Ordering::Release);
+                        dirty.fetch_or(1 << (fragment_slot % 64), Ordering::Release);
                     }
                 }
             }
@@ -971,6 +1078,63 @@ mod tests {
                 .is_some(),
             "suffix survives"
         );
+    }
+
+    #[test]
+    fn extension_slots_share_lookup_dirty_ack_and_retirement() {
+        let bootstrap = table();
+        let extension = table();
+        let aliases = [&extension.storage];
+        let view = ResidencyRows {
+            bootstrap: &bootstrap.storage,
+            extensions: &aliases,
+        }
+        .as_table();
+        let first = identity();
+        for page in 0..=FRAME_GRANT_RESIDENCY_SLOTS {
+            let offset = page as u64 * GRANT_PAGE_SIZE;
+            let row = FrameGrantResidencyIdentity {
+                semantic_base: first.semantic_base + offset,
+                physical_ipa: first.physical_ipa + offset,
+                len: GRANT_PAGE_SIZE,
+                ..first
+            };
+            let slot = view.try_publish(row).expect("space in either segment");
+            let selected = view
+                .lookup(row.mm_key, row.semantic_base)
+                .expect("published");
+            assert_eq!(selected.slot, slot);
+            assert_eq!(
+                slot >= FRAME_GRANT_RESIDENCY_SLOTS,
+                page == FRAME_GRANT_RESIDENCY_SLOTS
+            );
+            assert!(view.record_commit(selected));
+        }
+        let mut count = 0;
+        let _: core::ops::ControlFlow<()> =
+            view.for_each_dirty_mm(first.mm_key, |slot, row, bits| {
+                count += 1;
+                assert_eq!(bits[0], 1);
+                assert!(view.ack_dirty(slot, row));
+                core::ops::ControlFlow::Continue(())
+            });
+        assert_eq!(count, FRAME_GRANT_RESIDENCY_SLOTS + 1);
+        let last_va = first.semantic_base + FRAME_GRANT_RESIDENCY_SLOTS as u64 * GRANT_PAGE_SIZE;
+        let last = view.lookup(first.mm_key, last_va).expect("extension row");
+        let pin = view.pin_transfer(last).expect("exact extension pin");
+        let len = (FRAME_GRANT_RESIDENCY_SLOTS + 1) as u64 * GRANT_PAGE_SIZE;
+        assert!(
+            view.begin_retire_overlapping(first.mm_key, first.semantic_base, len)
+                .is_none()
+        );
+        drop(pin);
+        assert!(
+            view.begin_retire_overlapping(first.mm_key, first.semantic_base, len)
+                .expect("pins released across both segments")
+                .commit()
+        );
+        assert_eq!(view.observed_slots_used(), 0);
+        assert!(view.pin_transfer(last).is_none());
     }
 
     #[test]
