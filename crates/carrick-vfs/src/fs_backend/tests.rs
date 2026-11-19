@@ -1071,7 +1071,7 @@ fn host_fast_open_containment_failure_falls_back_without_serving() {
     b.symlink(outside.path().to_str().unwrap(), "/esc").unwrap();
     assert!(matches!(
         b.fast_open_for_guest(Path::new("esc/leak.txt"), false, false),
-        FastGuestOpen::Missing | FastGuestOpen::Fallback
+        FastGuestOpen::Fallback
     ));
     assert!(
         b.open_raw_fd("/esc/leak.txt", false, false, false)
@@ -1141,170 +1141,6 @@ fn host_fast_open_containment_never_resolves_absolute_symlink_on_host() {
         b.file_contents("/inner/leak.txt").unwrap(),
         b"sandbox bytes"
     );
-}
-
-/// Immutable-lower `open_immutable_file_readonly` and
-/// `RootFsVfs::open_immutable_lower_readonly` must NEVER treat an ancestor
-/// symlink as a proven `Missing` (or serve a stale lower file through it).
-///
-/// Covers both P0 regression shapes on a72e136d0:
-/// 1. Lower `/alias -> <lower_abs>/inner` with `inner/sub` in lower and
-///    `/<lower_abs>/inner/sub/leak.txt` in the sparse upper (no upper symlinks
-///    or whiteouts). `missing_below_contained_ancestor` previously issued a
-///    root-relative multi-component `openat(root_fd, "alias/sub", O_NOFOLLOW)`,
-///    which followed `alias` on the host root into `<lower_abs>/inner/sub`,
-///    passed prefix-only `fd_contained_under`, and returned authoritative
-///    `Missing` (ENOENT) for an existing upper file.
-/// 2. Chained relative symlinks in a single immutable lower (`/a -> b/c`,
-///    `/b/c/d -> ../target`, `/b/target/sub/file.txt`, empty upper):
-///    `dir_fd_for("a/d/sub")` returns `ENOENT` (#2490), and the root-relative
-///    multi-component ancestor probe followed `a/d/sub` inside `lower` and
-///    returned authoritative `Missing` instead of `Fallback`.
-/// 3. Relative lower symlink `/jump -> real` with `/real/sub` in lower and
-///    upper-only + upper-shadowed files under `/real/sub`: must return
-///    `Fallback` (neither `Missing` nor stale lower `Served`).
-#[cfg(target_os = "macos")]
-#[test]
-fn immutable_lower_open_falls_back_through_ancestor_symlinks() {
-    use crate::vfs::RootFsVfs;
-
-    let make_vfs = |lower: &Path, upper: &Path| {
-        let rootfs = RootFs::from_immutable_host_dir(lower).unwrap();
-        let mut overlay = HostFsBackend::from_path(upper).unwrap();
-        overlay.enable_sparse_upper_fast_miss();
-        let mut vfs = RootFsVfs::with_rootfs(rootfs);
-        vfs.set_overlay(Box::new(overlay));
-        vfs
-    };
-
-    // Shape 1: `/alias -> <lower_abs>/inner` in lower, file in sparse upper.
-    {
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("inner/sub")).unwrap();
-        let lower_abs = std::fs::canonicalize(lower.path()).unwrap();
-        std::os::unix::fs::symlink(lower_abs.join("inner"), lower.path().join("alias")).unwrap();
-        let upper_target_dir = upper
-            .path()
-            .join(lower_abs.strip_prefix("/").unwrap())
-            .join("inner/sub");
-        std::fs::create_dir_all(&upper_target_dir).unwrap();
-        std::fs::write(upper_target_dir.join("leak.txt"), b"upper bytes").unwrap();
-
-        let lower_backend = HostFsBackend::from_path(lower.path()).unwrap();
-        assert!(
-            matches!(
-                lower_backend.open_immutable_file_readonly("/alias/sub/leak.txt"),
-                ImmutableHostFileOpen::Fallback
-            ),
-            "absolute host-alias ancestor symlink must fail closed to Fallback, never Missing"
-        );
-        let vfs = make_vfs(lower.path(), upper.path());
-        assert!(
-            matches!(
-                vfs.open_immutable_lower_readonly("/alias/sub/leak.txt"),
-                ImmutableHostFileOpen::Fallback
-            ),
-            "RootFsVfs immutable-lower open must fall back through /alias to serve upper file"
-        );
-    }
-
-    // Shape 2: chained relative symlinks `/a -> b/c`, `/b/c/d -> ../target`,
-    // `/b/target/sub/file.txt` in a single immutable lower (empty upper).
-    {
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("b/c")).unwrap();
-        std::fs::create_dir_all(lower.path().join("b/target/sub")).unwrap();
-        std::fs::write(
-            lower.path().join("b/target/sub/file.txt"),
-            b"chained target bytes",
-        )
-        .unwrap();
-        std::os::unix::fs::symlink("b/c", lower.path().join("a")).unwrap();
-        std::os::unix::fs::symlink("../target", lower.path().join("b/c/d")).unwrap();
-
-        let lower_backend = HostFsBackend::from_path(lower.path()).unwrap();
-        assert!(
-            matches!(
-                lower_backend.open_immutable_file_readonly("/a/d/sub/file.txt"),
-                ImmutableHostFileOpen::Fallback
-            ),
-            "chained relative symlinks in immutable lower must fail closed to Fallback, never Missing"
-        );
-        let vfs = make_vfs(lower.path(), upper.path());
-        assert!(
-            matches!(
-                vfs.open_immutable_lower_readonly("/a/d/sub/file.txt"),
-                ImmutableHostFileOpen::Fallback
-            ),
-            "RootFsVfs immutable-lower open must fall back on chained relative symlinks"
-        );
-    }
-
-    // Shape 3: relative lower symlink `/jump -> real` with `/real/sub` in
-    // lower and upper-only + upper-shadowed files under `/real/sub`.
-    {
-        let lower = tempfile::TempDir::new().unwrap();
-        let upper = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(lower.path().join("real/sub")).unwrap();
-        std::fs::write(lower.path().join("real/sub/shadowed.txt"), b"lower bytes").unwrap();
-        std::os::unix::fs::symlink("real", lower.path().join("jump")).unwrap();
-        std::fs::create_dir_all(upper.path().join("real/sub")).unwrap();
-        std::fs::write(
-            upper.path().join("real/sub/upper_only.txt"),
-            b"upper-only bytes",
-        )
-        .unwrap();
-        std::fs::write(
-            upper.path().join("real/sub/shadowed.txt"),
-            b"upper-shadow bytes",
-        )
-        .unwrap();
-
-        let lower_backend = HostFsBackend::from_path(lower.path()).unwrap();
-        assert!(
-            matches!(
-                lower_backend.open_immutable_file_readonly("/jump/sub/upper_only.txt"),
-                ImmutableHostFileOpen::Fallback
-            ),
-            "missing leaf under relative ancestor symlink must fail closed to Fallback, never Missing"
-        );
-        assert!(
-            matches!(
-                lower_backend.open_immutable_file_readonly("/jump/sub/shadowed.txt"),
-                ImmutableHostFileOpen::Fallback
-            ),
-            "existing leaf under relative ancestor symlink must fail closed to Fallback, never stale lower Served"
-        );
-        let vfs = make_vfs(lower.path(), upper.path());
-        assert!(matches!(
-            vfs.open_immutable_lower_readonly("/jump/sub/upper_only.txt"),
-            ImmutableHostFileOpen::Fallback
-        ));
-        assert!(matches!(
-            vfs.open_immutable_lower_readonly("/jump/sub/shadowed.txt"),
-            ImmutableHostFileOpen::Fallback
-        ));
-
-        // Positive controls: symlink-free paths still serve and prove misses.
-        assert!(matches!(
-            lower_backend.open_immutable_file_readonly("/real/sub/shadowed.txt"),
-            ImmutableHostFileOpen::Served { .. }
-        ));
-        assert!(matches!(
-            lower_backend.open_immutable_file_readonly("/real/sub/absent.txt"),
-            ImmutableHostFileOpen::Missing
-        ));
-        assert!(matches!(
-            lower_backend.open_immutable_file_readonly("/real/no_such_dir/absent.txt"),
-            ImmutableHostFileOpen::Missing
-        ));
-        assert!(matches!(
-            lower_backend.open_immutable_file_readonly("/absent_top.txt"),
-            ImmutableHostFileOpen::Missing
-        ));
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3778,5 +3614,260 @@ mod serial_host {
         let decoded = decode_getattrlist_cmn_name(&buf).expect("valid buffer must decode");
         assert_eq!(decoded, "café".as_bytes());
         assert_ne!(decoded, "cafe\u{0301}".as_bytes());
+    }
+
+    /// Immutable-lower `open_immutable_file_readonly` and
+    /// `RootFsVfs::open_immutable_lower_readonly` must NEVER treat an ancestor
+    /// symlink as a proven `Missing` (or serve a stale lower file through it).
+    ///
+    /// Covers both P0 regression shapes on a72e136d0:
+    /// 1. Lower `/alias -> <lower_abs>/inner` with `inner/sub` in lower and
+    ///    `/<lower_abs>/inner/sub/leak.txt` in the sparse upper (no upper
+    ///    symlinks or whiteouts). `missing_below_contained_ancestor` previously
+    ///    issued a root-relative multi-component
+    ///    `openat(root_fd, "alias/sub", O_NOFOLLOW)`, which followed `alias` on
+    ///    the host root into `<lower_abs>/inner/sub`, passed prefix-only
+    ///    `fd_contained_under`, and returned authoritative `Missing` (ENOENT)
+    ///    for an existing upper file.
+    /// 2. Chained relative symlinks in a single immutable lower (`/a -> b/c`,
+    ///    `/b/c/d -> ../target`, `/b/target/sub/file.txt`, empty upper):
+    ///    `dir_fd_for("a/d/sub")` returns `ENOENT` (#2490), and the
+    ///    root-relative multi-component ancestor probe followed `a/d/sub`
+    ///    inside `lower` and returned authoritative `Missing` instead of
+    ///    `Fallback`.
+    /// 3. Relative lower symlink `/jump -> real` with `/real/sub` in lower and
+    ///    upper-only + upper-shadowed files under `/real/sub`: must return
+    ///    `Fallback` (neither `Missing` nor stale lower `Served`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immutable_lower_open_falls_back_through_ancestor_symlinks() {
+        use crate::vfs::RootFsVfs;
+
+        let make_vfs = |lower: &Path, upper: &Path| {
+            let rootfs = RootFs::from_immutable_host_dir(lower).unwrap();
+            let mut overlay = HostFsBackend::from_path(upper).unwrap();
+            overlay.enable_sparse_upper_fast_miss();
+            let mut vfs = RootFsVfs::with_rootfs(rootfs);
+            vfs.set_overlay(Box::new(overlay));
+            vfs
+        };
+
+        // Shape 1: `/alias -> <lower_abs>/inner` in lower, file in sparse upper.
+        {
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("inner/sub")).unwrap();
+            let lower_abs = std::fs::canonicalize(lower.path()).unwrap();
+            std::os::unix::fs::symlink(lower_abs.join("inner"), lower.path().join("alias"))
+                .unwrap();
+            let upper_target_dir = upper
+                .path()
+                .join(lower_abs.strip_prefix("/").unwrap())
+                .join("inner/sub");
+            std::fs::create_dir_all(&upper_target_dir).unwrap();
+            std::fs::write(upper_target_dir.join("leak.txt"), b"upper bytes").unwrap();
+
+            let lower_backend = HostFsBackend::from_path(lower.path()).unwrap();
+            assert!(
+                matches!(
+                    lower_backend.open_immutable_file_readonly("/alias/sub/leak.txt"),
+                    ImmutableHostFileOpen::Fallback
+                ),
+                "absolute host-alias ancestor symlink must fail closed to Fallback, never Missing"
+            );
+            let vfs = make_vfs(lower.path(), upper.path());
+            assert!(
+                matches!(
+                    vfs.open_immutable_lower_readonly("/alias/sub/leak.txt"),
+                    ImmutableHostFileOpen::Fallback
+                ),
+                "RootFsVfs immutable-lower open must fall back through /alias to serve upper file"
+            );
+        }
+
+        // Shape 2: chained relative symlinks `/a -> b/c`, `/b/c/d -> ../target`,
+        // `/b/target/sub/file.txt` in a single immutable lower (empty upper).
+        {
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("b/c")).unwrap();
+            std::fs::create_dir_all(lower.path().join("b/target/sub")).unwrap();
+            std::fs::write(
+                lower.path().join("b/target/sub/file.txt"),
+                b"chained target bytes",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink("b/c", lower.path().join("a")).unwrap();
+            std::os::unix::fs::symlink("../target", lower.path().join("b/c/d")).unwrap();
+
+            let lower_backend = HostFsBackend::from_path(lower.path()).unwrap();
+            assert!(
+                matches!(
+                    lower_backend.open_immutable_file_readonly("/a/d/sub/file.txt"),
+                    ImmutableHostFileOpen::Fallback
+                ),
+                "chained relative symlinks in immutable lower must fail closed to Fallback, never Missing"
+            );
+            let vfs = make_vfs(lower.path(), upper.path());
+            assert!(
+                matches!(
+                    vfs.open_immutable_lower_readonly("/a/d/sub/file.txt"),
+                    ImmutableHostFileOpen::Fallback
+                ),
+                "RootFsVfs immutable-lower open must fall back on chained relative symlinks"
+            );
+        }
+
+        // Shape 3: relative lower symlink `/jump -> real` with `/real/sub` in
+        // lower and upper-only + upper-shadowed files under `/real/sub`.
+        {
+            let lower = tempfile::TempDir::new().unwrap();
+            let upper = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(lower.path().join("real/sub")).unwrap();
+            std::fs::write(lower.path().join("real/sub/shadowed.txt"), b"lower bytes").unwrap();
+            std::os::unix::fs::symlink("real", lower.path().join("jump")).unwrap();
+            std::fs::create_dir_all(upper.path().join("real/sub")).unwrap();
+            std::fs::write(
+                upper.path().join("real/sub/upper_only.txt"),
+                b"upper-only bytes",
+            )
+            .unwrap();
+            std::fs::write(
+                upper.path().join("real/sub/shadowed.txt"),
+                b"upper-shadow bytes",
+            )
+            .unwrap();
+
+            let lower_backend = HostFsBackend::from_path(lower.path()).unwrap();
+            assert!(
+                matches!(
+                    lower_backend.open_immutable_file_readonly("/jump/sub/upper_only.txt"),
+                    ImmutableHostFileOpen::Fallback
+                ),
+                "missing leaf under relative ancestor symlink must fail closed to Fallback, never Missing"
+            );
+            assert!(
+                matches!(
+                    lower_backend.open_immutable_file_readonly("/jump/sub/shadowed.txt"),
+                    ImmutableHostFileOpen::Fallback
+                ),
+                "existing leaf under relative ancestor symlink must fail closed to Fallback, never stale lower Served"
+            );
+            let vfs = make_vfs(lower.path(), upper.path());
+            assert!(matches!(
+                vfs.open_immutable_lower_readonly("/jump/sub/upper_only.txt"),
+                ImmutableHostFileOpen::Fallback
+            ));
+            assert!(matches!(
+                vfs.open_immutable_lower_readonly("/jump/sub/shadowed.txt"),
+                ImmutableHostFileOpen::Fallback
+            ));
+
+            // Positive controls: symlink-free paths still serve and prove misses.
+            assert!(matches!(
+                lower_backend.open_immutable_file_readonly("/real/sub/shadowed.txt"),
+                ImmutableHostFileOpen::Served { .. }
+            ));
+            assert!(matches!(
+                lower_backend.open_immutable_file_readonly("/real/sub/absent.txt"),
+                ImmutableHostFileOpen::Missing
+            ));
+            assert!(matches!(
+                lower_backend.open_immutable_file_readonly("/real/no_such_dir/absent.txt"),
+                ImmutableHostFileOpen::Missing
+            ));
+            assert!(matches!(
+                lower_backend.open_immutable_file_readonly("/absent_top.txt"),
+                ImmutableHostFileOpen::Missing
+            ));
+        }
+    }
+
+    /// Cross-platform unit proof for `HostFsBackend::resolve_parent_nofollow`:
+    /// every ancestor symlink (absolute host-alias, chained relative, or plain
+    /// relative — both cold and after `dir_fd_for` warms `dir_cache` with
+    /// `via_symlink = true`) and every non-directory ancestor fails closed to
+    /// `NofollowParent::Fallback`, while a missing component beneath a proven
+    /// symlink-free directory chain reports `MissingBelowContainedAncestor`.
+    #[test]
+    fn resolve_parent_nofollow_rejects_ancestor_symlinks_cold_and_warm() {
+        use host::NofollowParent;
+
+        let scratch = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(scratch.path().join("inner/sub")).unwrap();
+        std::fs::create_dir_all(scratch.path().join("b/c")).unwrap();
+        std::fs::create_dir_all(scratch.path().join("b/target/sub")).unwrap();
+        std::fs::create_dir_all(scratch.path().join("real/sub")).unwrap();
+        std::fs::write(scratch.path().join("real/file.txt"), b"x").unwrap();
+
+        let root_abs = std::fs::canonicalize(scratch.path()).unwrap();
+        std::os::unix::fs::symlink(root_abs.join("inner"), scratch.path().join("alias")).unwrap();
+        std::os::unix::fs::symlink("b/c", scratch.path().join("a")).unwrap();
+        std::os::unix::fs::symlink("../target", scratch.path().join("b/c/d")).unwrap();
+        std::os::unix::fs::symlink("real", scratch.path().join("jump")).unwrap();
+
+        let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+
+        // Cold checks across all three symlink shapes + non-directory ancestor.
+        assert!(matches!(
+            backend.resolve_parent_nofollow(Path::new("alias/sub")),
+            NofollowParent::Fallback
+        ));
+        assert!(matches!(
+            backend.resolve_parent_nofollow(Path::new("a/d/sub")),
+            NofollowParent::Fallback
+        ));
+        assert!(matches!(
+            backend.resolve_parent_nofollow(Path::new("jump/sub")),
+            NofollowParent::Fallback
+        ));
+        assert!(matches!(
+            backend.resolve_parent_nofollow(Path::new("real/file.txt/child")),
+            NofollowParent::Fallback
+        ));
+
+        // Warm `dir_cache` through `dir_fd_for` (which follows `jump -> real` and
+        // caches `jump` and `jump/sub` with `via_symlink = true`). The nofollow
+        // walk must still reject both exact and descendant cache hits.
+        assert!(backend.dir_fd_for(Path::new("jump/sub")).is_ok());
+        assert!(matches!(
+            backend.resolve_parent_nofollow(Path::new("jump")),
+            NofollowParent::Fallback
+        ));
+        assert!(matches!(
+            backend.resolve_parent_nofollow(Path::new("jump/sub")),
+            NofollowParent::Fallback
+        ));
+        assert!(matches!(
+            backend.resolve_parent_nofollow(Path::new("jump/sub/missing_dir")),
+            NofollowParent::Fallback
+        ));
+
+        // Symlink-free directories resolve (cold and warm) and prove missing subtrees.
+        let NofollowParent::Dir(root_fd) = backend.resolve_parent_nofollow(Path::new("")) else {
+            panic!("empty parent must resolve to root dirfd");
+        };
+        assert_eq!(
+            host_dir_identity(root_fd.as_raw_fd()).unwrap(),
+            host_dir_identity(backend.root_fd.as_raw_fd()).unwrap()
+        );
+        let NofollowParent::Dir(cold_sub_fd) =
+            backend.resolve_parent_nofollow(Path::new("real/sub"))
+        else {
+            panic!("cold real/sub must resolve to dirfd");
+        };
+        let NofollowParent::Dir(warm_sub_fd) =
+            backend.resolve_parent_nofollow(Path::new("real/sub"))
+        else {
+            panic!("warm real/sub must resolve to dirfd");
+        };
+        assert_eq!(
+            host_dir_identity(cold_sub_fd.as_raw_fd()).unwrap(),
+            host_dir_identity(warm_sub_fd.as_raw_fd()).unwrap()
+        );
+        assert!(matches!(
+            backend.resolve_parent_nofollow(Path::new("real/no_such_dir/deeper")),
+            NofollowParent::MissingBelowContainedAncestor
+        ));
     }
 }
