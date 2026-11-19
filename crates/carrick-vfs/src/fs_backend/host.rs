@@ -2843,8 +2843,8 @@ impl HostFsBackend {
     /// Walks ancestors component-by-component with `O_DIRECTORY | O_NOFOLLOW`
     /// (`resolve_parent_nofollow`) and opens the single leaf with `O_NOFOLLOW`:
     /// any symlink in the ancestor chain or at the leaf, any non-directory
-    /// ancestor, any Unicode alias, or any other doubt fails closed to
-    /// [`ImmutableHostFileOpen::Fallback`].
+    /// ancestor, any Unicode alias, parent traversal, or a terminal directory
+    /// requirement fails closed to [`ImmutableHostFileOpen::Fallback`].
     pub(crate) fn open_immutable_file_readonly(&self, path: &str) -> ImmutableHostFileOpen {
         #[cfg(target_os = "macos")]
         {
@@ -2852,6 +2852,12 @@ impl HostFsBackend {
             use std::os::unix::ffi::OsStrExt as _;
 
             if !self.fast_fs {
+                return ImmutableHostFileOpen::Fallback;
+            }
+            // The layered resolver must traverse the preceding component
+            // before applying "..". A trailing slash or "/." requires a
+            // directory. Normalization would erase both distinctions.
+            if path.ends_with('/') || path.ends_with("/.") || path.split('/').any(|c| c == "..") {
                 return ImmutableHostFileOpen::Fallback;
             }
             let Some(normalized) = normalize(path) else {
