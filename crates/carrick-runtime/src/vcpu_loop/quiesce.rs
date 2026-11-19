@@ -1134,9 +1134,9 @@ where
                 }
             }
             if (memory as &dyn std::any::Any).is::<E>() {
-                if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+                carrick_hal::host_residency::with_host_residency(|table| {
                     table.retire_overlapping(parent_mm_id.raw(), 0, u64::MAX);
-                }
+                });
             }
         }
         let mut inventory_transaction = None;
