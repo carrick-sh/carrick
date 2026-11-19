@@ -40,7 +40,7 @@ _start:
     call list_directory             /* steps 30-33 */
     xor %edi, %edi
     jmp exit
-#elif defined(CHILD) || defined(DIRFD) || defined(FILEOPS)
+#elif defined(CHILD) || defined(DIRFD) || defined(FILEOPS) || defined(VECTORS)
     mov $-100, %edi                 /* openat(AT_FDCWD, file, O_RDONLY|O_CLOEXEC) */
     lea file(%rip), %rsi
     mov $0x80000, %edx
@@ -100,7 +100,96 @@ _start:
 #endif
     jmp exit
 child:
-#ifdef FILEOPS
+#ifdef VECTORS
+    mov $-100, %edi
+    lea file(%rip), %rsi
+    mov $2, %edx
+    xor %r10d, %r10d
+    mov $257, %eax
+    syscall
+    mov $91, %edi
+    test %rax, %rax
+    js exit
+    mov %rax, %r12
+
+    mov %r12, %rdi
+    lea vector_data(%rip), %rsi
+    mov $4, %edx
+    mov $1, %eax
+    syscall
+    mov $92, %edi
+    cmp $4, %rax
+    jne exit
+
+    mov %r12, %rdi
+    lea vector_insert(%rip), %rsi
+    mov $1, %edx
+    mov $1, %r10d
+    mov $18, %eax                  /* pwrite64 */
+    syscall
+    mov $93, %edi
+    cmp $1, %rax
+    jne exit
+
+    mov %r12, %rdi
+    lea write_vectors(%rip), %rsi
+    mov $2, %edx
+    mov $2, %r10d
+    xor %r8d, %r8d
+    mov $296, %eax                 /* pwritev */
+    syscall
+    mov $94, %edi
+    cmp $2, %rax
+    jne exit
+
+    mov %r12, %rdi
+    lea read_vectors(%rip), %rsi
+    mov $2, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    mov $295, %eax                 /* preadv */
+    syscall
+    mov $95, %edi
+    cmp $4, %rax
+    jne exit
+    cmpw $0x5861, buf(%rip)
+    jne exit
+    cmpw $0x6158, buf+8(%rip)
+    jne exit
+
+    mov %r12, %rdi
+    xor %esi, %esi
+    mov $1, %edx
+    mov $8, %eax                   /* preadv and pwrite left cursor at 4 */
+    syscall
+    mov $96, %edi
+    cmp $4, %rax
+    jne exit
+
+    mov %r12, %rdi
+    xor %esi, %esi
+    xor %edx, %edx
+    mov $8, %eax
+    syscall
+    mov $97, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r12, %rdi
+    lea read_vectors(%rip), %rsi
+    mov $2, %edx
+    mov $19, %eax                  /* readv */
+    syscall
+    mov $98, %edi
+    cmp $4, %rax
+    jne exit
+    cmpw $0x5861, buf(%rip)
+    jne exit
+    cmpw $0x6158, buf+8(%rip)
+    jne exit
+    xor %edi, %edi
+    jmp exit
+#elif defined(FILEOPS)
     mov $-100, %edi                /* open a file writable for allocation */
     lea file(%rip), %rsi
     mov $2, %edx
@@ -455,9 +544,17 @@ parent_sibling: .asciz "parent-sibling"
 #endif
 empty: .asciz ""
 msg: .ascii "x"
+#ifdef VECTORS
+vector_data: .ascii "abcd"
+vector_insert: .ascii "X"
+#endif
 .section .data
 .balign 16
 iov: .quad msg, 1
+#ifdef VECTORS
+write_vectors: .quad vector_insert, 1, vector_data, 1
+read_vectors: .quad buf, 2, buf+8, 2
+#endif
 .section .bss
 .balign 64
 status: .skip 8
