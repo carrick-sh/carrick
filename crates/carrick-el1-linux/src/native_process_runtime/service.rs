@@ -2085,6 +2085,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let (request, adapter) = match prepared {
             PreparedService::Request(request, adapter) => (request, adapter),
             PreparedService::NoticeWait(request, holder, adapter) => {
+                #[cfg(test)]
+                {
+                    let hook = super::host_test_support::SERVICE_NOTICE_WAIT_HOOK
+                        .with(|hook| hook.borrow_mut().take());
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
                 return match self.park_notice_wait(
                     &request,
                     holder,

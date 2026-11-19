@@ -93,6 +93,12 @@ pub(super) fn run_service_published_hook(runtime: usize) {
 
 #[cfg(test)]
 std::thread_local! {
+    // Inject the other lane's close between notice contention and the park probe.
+    pub(super) static SERVICE_NOTICE_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+std::thread_local! {
     static RETURN_COPYOUTS: std::cell::RefCell<Option<Vec<(UserVa, usize)>>> = const { std::cell::RefCell::new(None) };
 }
 

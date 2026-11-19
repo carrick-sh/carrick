@@ -846,11 +846,12 @@ fn busy_service_notice_cancellation_wakes_and_retires_for<
 >(
     make_words: fn(AddressContext<RootGpa>) -> C,
     crossing_ordinal: u64,
+    close_during_adapter_admission: bool,
 ) {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
 
-    let fixture = native_exec_fixture_for::<C, B>(make_words);
-    let sibling = add_service_sibling(&fixture, None);
+    let fixture: &'static _ = Box::leak(Box::new(native_exec_fixture_for::<C, B>(make_words)));
+    let sibling = add_service_sibling(fixture, None);
     assert_eq!(fixture.page.live(), 2);
 
     let source = BornInZoneSource {
@@ -1010,8 +1011,37 @@ fn busy_service_notice_cancellation_wakes_and_retires_for<
     fixture
         .task
         .publish_lifecycle(leader_identity.lifecycle_page, leader_identity.control_slot);
-    {
+    let worker_slot = sibling.slot;
+    let worker_task = sibling.task;
+    let close_group = move || {
         let mut service = fixture.service();
+        service.waker_slot = worker_slot;
+        let mut worker = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: worker_slot,
+                },
+                worker_task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            worker.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(worker.take_run_failure().is_none());
+        assert!(worker.take_handoff_receipt().is_some());
+    };
+    if close_during_adapter_admission {
+        let (region, object, _, token) =
+            retained_pipe_read(fixture.zone, fixture.slot, fixture.task);
+        let mut service = fixture.service();
+        service.native_ipc = Some(region);
         let mut leader = fixture
             .runtime
             .enter_registered(
@@ -1023,90 +1053,125 @@ fn busy_service_notice_cancellation_wakes_and_retires_for<
                 &mut service,
             )
             .unwrap();
-        let result = leader.begin_service(
-            ServiceOperation::Crossing {
-                ordinal: carrick_guest_arch::NativeOrdinal::new(crossing_ordinal),
-            },
+        leader.suspend_adapter_operation(
+            token,
+            ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
+                address: UserVa::new(0x10000),
+                access: carrick_guest_arch::Access::Write,
+                present: true,
+            }),
             None,
         );
-        let phase = leader.native_service_phase();
-        let settled = leader.settle_service_exit(result, NativeServiceExit::Bridge);
-        let resumed = crate::dispatch::native_service_completion(settled, phase).unwrap();
-        assert!(matches!(resumed, NativeResume::Left(None)));
-    }
-    assert!(fixture.zone.slot(fixture.slot).current().is_none());
-    assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
-    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 1);
-
-    // The sibling worker on `sibling.slot` calls `exit_group(7)` while the
-    // child's notice is still unconsumed in `fixture.task.service_notice`.
-    {
-        let mut sibling_service = fixture.service();
-        sibling_service.waker_slot = sibling.slot;
-        let mut worker = fixture
-            .runtime
-            .enter_registered(
-                fixture.registry,
-                BornInZoneSource {
-                    zone: fixture.zone,
-                    slot: sibling.slot,
+        super::SERVICE_NOTICE_WAIT_HOOK.with(|hook| {
+            assert!(
+                hook.borrow_mut()
+                    .replace(Box::new(move || {
+                        assert_eq!(
+                            carrick_el1_abi::Lifecycle::gate(fixture.page),
+                            carrick_el1_abi::GateState::Open
+                        );
+                        assert!(
+                            fixture
+                                .zone
+                                .record(fixture.record.id)
+                                .has_adapter_operation()
+                        );
+                        close_group();
+                    }))
+                    .is_none()
+            );
+        });
+        leader.drain_owned_preparation();
+        assert!(
+            !fixture
+                .zone
+                .record(fixture.record.id)
+                .has_adapter_operation(),
+            "the closing adapter preparation must release its OperationToken"
+        );
+        assert!(leader.take_run_failure().is_none());
+        assert!(leader.take_handoff_receipt().is_some());
+        assert!(fixture.zone.live(fixture.record).is_none());
+        assert!(
+            region.observe(object).is_err(),
+            "terminal settlement must release the final pipe endpoint OfdPin"
+        );
+        assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
+    } else {
+        {
+            let mut service = fixture.service();
+            let mut leader = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    source,
+                    fixture.task,
+                    fixture.address,
+                    &(fixture.make_words)(fixture.address),
+                    &mut service,
+                )
+                .unwrap();
+            let result = leader.begin_service(
+                ServiceOperation::Crossing {
+                    ordinal: carrick_guest_arch::NativeOrdinal::new(crossing_ordinal),
                 },
-                sibling.task,
-                fixture.address,
-                &(fixture.make_words)(fixture.address),
-                &mut sibling_service,
-            )
-            .unwrap();
-        assert!(matches!(
-            worker.exit_group(7),
-            LifecycleOutcome::Transferred { .. }
-        ));
-        assert!(worker.take_run_failure().is_none());
-    }
+                None,
+            );
+            let phase = leader.native_service_phase();
+            let settled = leader.settle_service_exit(result, NativeServiceExit::Bridge);
+            let resumed = crate::dispatch::native_service_completion(settled, phase).unwrap();
+            assert!(matches!(resumed, NativeResume::Left(None)));
+        }
+        assert!(fixture.zone.slot(fixture.slot).current().is_none());
+        assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+        assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 1);
 
-    // `cancel_service` must wake the leader off `child_record`'s queue without
-    // disturbing the child's live selector in `fixture.task.service_notice`.
-    let woken_slot = [fixture.slot, sibling.slot]
-        .into_iter()
-        .find(|slot| fixture.zone.slot(*slot).queued() != 0)
-        .expect("cancelling a contended notice wait must wake the parked member");
-    assert_eq!(
-        fixture.zone.switch_in_full(woken_slot).unwrap().record,
-        fixture.record.id
-    );
-    let leader_saved = unsafe { fixture.runtime.record_binding(fixture.record) }
-        .unwrap()
-        .words;
-    {
-        let mut leader_service = fixture.service();
-        leader_service.waker_slot = woken_slot;
-        let mut leader = fixture
-            .runtime
-            .enter_registered(
-                fixture.registry,
-                BornInZoneSource {
-                    zone: fixture.zone,
-                    slot: woken_slot,
-                },
-                fixture.task,
-                fixture.address,
-                &leader_saved,
-                &mut leader_service,
-            )
-            .unwrap();
-        assert!(matches!(
-            leader.resume_checkpoint(|_| Ok(None)).unwrap(),
-            NativeResume::Left(_)
-        ));
+        close_group();
+
+        // `cancel_service` must wake the leader off `child_record`'s queue without
+        // disturbing the child's live selector in `fixture.task.service_notice`.
+        let woken_slot = [fixture.slot, sibling.slot]
+            .into_iter()
+            .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+            .expect("cancelling a contended notice wait must wake the parked member");
+        assert_eq!(
+            fixture.zone.switch_in_full(woken_slot).unwrap().record,
+            fixture.record.id
+        );
+        let leader_saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+            .unwrap()
+            .words;
+        {
+            let mut leader_service = fixture.service();
+            leader_service.waker_slot = woken_slot;
+            let mut leader = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    BornInZoneSource {
+                        zone: fixture.zone,
+                        slot: woken_slot,
+                    },
+                    fixture.task,
+                    fixture.address,
+                    &leader_saved,
+                    &mut leader_service,
+                )
+                .unwrap();
+            assert!(matches!(
+                leader.resume_checkpoint(|_| Ok(None)).unwrap(),
+                NativeResume::Left(_)
+            ));
+        }
+        assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
+        assert!(
+            !fixture
+                .runtime
+                .graph
+                .lock()
+                .has_member_wait(&fixture.record)
+        );
     }
-    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
-    assert!(
-        !fixture
-            .runtime
-            .graph
-            .lock()
-            .has_member_wait(&fixture.record)
-    );
 
     // The child's selector in `fixture.task.service_notice` is untouched and
     // still claims and completes cleanly.
@@ -1149,7 +1214,7 @@ fn arm_busy_service_notice_cancellation_wakes_and_retires() {
     busy_service_notice_cancellation_wakes_and_retires_for::<
         carrick_el1_abi::Aarch64ParkedContext,
         carrick_mmu_core::owner_mmu::Aarch64Mmu,
-    >(arm_words, 222);
+    >(arm_words, 222, false);
 }
 
 #[test]
@@ -1157,7 +1222,23 @@ fn x86_busy_service_notice_cancellation_wakes_and_retires() {
     busy_service_notice_cancellation_wakes_and_retires_for::<
         ParkedContextWords,
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
-    >(words, 9);
+    >(words, 9, false);
+}
+
+#[test]
+fn arm_terminal_close_during_contended_adapter_preparation() {
+    busy_service_notice_cancellation_wakes_and_retires_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, 222, true);
+}
+
+#[test]
+fn x86_terminal_close_during_contended_adapter_preparation() {
+    busy_service_notice_cancellation_wakes_and_retires_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, 9, true);
 }
 
 #[derive(Clone, Copy)]
@@ -1165,26 +1246,27 @@ enum RetainedAdapterClosingEntrant {
     MmapCrossing { ordinal: u64 },
     IrqCarrierWork,
     DrainOwnedPreparation,
+    ResumeCheckpoint,
 }
 
-fn terminal_close_with_retained_adapter_service_entry_for<
-    C: ProcessContext + 'static,
-    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
->(
-    make_words: fn(AddressContext<RootGpa>) -> C,
-    entrant: RetainedAdapterClosingEntrant,
+// The numeric fd is closed before service admission, leaving the read's
+// exact operation as the sole owner of the pipe endpoint.
+fn retained_pipe_read<C: ProcessContext>(
+    zone: &ZoneTables<C>,
+    slot: SlotId,
+    task: &CurrentTask,
+) -> (
+    carrick_el1_abi::ipc::IpcRegion<'static>,
+    carrick_el1_abi::ipc::IpcObjectHandle,
+    carrick_el1_abi::ipc::OfdPin,
+    carrick_sched_core::object_wait::OperationToken,
 ) {
-    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
     use carrick_el1_abi::ipc::{
         IpcBacking, IpcMmKey, IpcOpKind, IpcOperation, IpcTaskKey, IpcUserVa, OfdPin,
         WriteProgress, fd,
     };
 
-    let fixture = native_exec_fixture_for::<C, B>(make_words);
-    let sibling = add_signal_sibling(&fixture, None, false);
-    assert!(fixture.zone.mark_native_owned(sibling.record.id));
-    assert_eq!(fixture.page.live(), 2);
-
+    let binding = crate::common_entry::execution_binding(task);
     let shared = Box::leak(Box::new(std::sync::Arc::new(
         carrick_kernel::el1_ipc::HostIpc::with_limits(
             1 << 20,
@@ -1198,12 +1280,10 @@ fn terminal_close_with_retained_adapter_service_entry_for<
         carrick_el1_abi::ipc::pipe::WaitFor::Writable,
     ] {
         let key = carrick_el1_abi::ipc::object_wait_key(object, lane).unwrap();
-        fixture
-            .zone
-            .bind_object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            })
-            .unwrap();
+        zone.bind_object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        })
+        .unwrap();
     }
     let table = shared.create_table(64, 64).unwrap();
     let reader = shared
@@ -1242,8 +1322,8 @@ fn terminal_close_with_retained_adapter_service_entry_for<
     crate::ipc::settle_native_release(
         &region,
         fd::DeferredRelease::Now(writer_release),
-        Some((fixture.zone, sibling.slot)),
-        sibling.task,
+        Some((zone, slot)),
+        task,
     )
     .unwrap();
 
@@ -1252,20 +1332,47 @@ fn terminal_close_with_retained_adapter_service_entry_for<
         .pin(table, fd::Fd(0))
         .unwrap();
     let raw_pin = pin.into_raw();
-    let sibling_binding = crate::common_entry::execution_binding(sibling.task);
     let raw_ipc_token = region
         .begin_operation(IpcOperation {
             kind: IpcOpKind::PipeRead,
             pin: raw_pin,
             object: object.to_raw(),
-            task: IpcTaskKey(sibling_binding.task.raw()),
-            mm: IpcMmKey(sibling_binding.mm.raw()),
+            task: IpcTaskKey(binding.task.raw()),
+            mm: IpcMmKey(binding.mm.raw()),
             buf: IpcUserVa(0x10000),
             progress: WriteProgress::new(8),
             ..IpcOperation::EMPTY
         })
         .unwrap();
     let token = carrick_el1::substrate::ipc::to_sched_token(raw_ipc_token).unwrap();
+    assert!(
+        region
+            .fd(carrick_sched_core::ShortLockSpin)
+            .close(table, fd::Fd(0))
+            .unwrap()
+            .is_none(),
+        "closing the numeric fd leaves only the retained operation's OfdPin"
+    );
+    assert!(region.observe(object).is_ok());
+    (region, object, OfdPin::from_raw(raw_pin), token)
+}
+
+fn terminal_close_with_retained_adapter_service_entry_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    entrant: RetainedAdapterClosingEntrant,
+) {
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let sibling = add_signal_sibling(&fixture, None, false);
+    assert!(fixture.zone.mark_native_owned(sibling.record.id));
+    assert_eq!(fixture.page.live(), 2);
+
+    let (region, object, pin, token) = retained_pipe_read(fixture.zone, sibling.slot, sibling.task);
+    let sibling_binding = crate::common_entry::execution_binding(sibling.task);
     let token_identity = token.identity();
     let (token_index, token_generation) = (token.index(), token.generation());
 
@@ -1300,15 +1407,6 @@ fn terminal_close_with_retained_adapter_service_entry_for<
         assert!(entry.take_handoff_receipt().is_some());
         assert!(entry.take_run_failure().is_none());
     }
-    assert!(
-        region
-            .fd(carrick_sched_core::ShortLockSpin)
-            .close(table, fd::Fd(0))
-            .unwrap()
-            .is_none(),
-        "closing the numeric fd leaves only the retained operation's OfdPin"
-    );
-    assert!(region.observe(object).is_ok());
     assert!(
         fixture
             .runtime
@@ -1453,6 +1551,18 @@ fn terminal_close_with_retained_adapter_service_entry_for<
             assert!(matches!(resumed, NativeResume::Left(None)));
             assert!(member.take_handoff_receipt().is_none());
         }
+        RetainedAdapterClosingEntrant::ResumeCheckpoint => {
+            let result = member.resume_checkpoint(|_| Ok(None));
+            assert!(
+                !fixture
+                    .zone
+                    .record(sibling.record.id)
+                    .has_adapter_operation(),
+                "the closing checkpoint must release its OperationToken, failure: {:?}",
+                result.as_ref().err()
+            );
+            assert!(matches!(result, Ok(NativeResume::Left(None))));
+        }
         RetainedAdapterClosingEntrant::DrainOwnedPreparation => {
             member.adapter_ready = Some(Box::new(super::super::service::AdapterPreparation {
                 service: ServiceOperation::CarrierWork {
@@ -1511,10 +1621,7 @@ fn terminal_close_with_retained_adapter_service_entry_for<
     assert!(
         region
             .fd(carrick_sched_core::ShortLockSpin)
-            .unpin_filtered(
-                OfdPin::from_raw(raw_pin),
-                crate::ipc::is_zone_releasable_backing,
-            )
+            .unpin_filtered(pin, crate::ipc::is_zone_releasable_backing,)
             .is_err(),
         "a second unpin of the retired OfdPin must fail"
     );
@@ -1620,6 +1727,22 @@ fn x86_terminal_close_with_retained_adapter_service_accepts_drain_owned_preparat
         ParkedContextWords,
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
     >(words, RetainedAdapterClosingEntrant::DrainOwnedPreparation);
+}
+
+#[test]
+fn arm_terminal_close_with_retained_adapter_service_resume_checkpoint() {
+    terminal_close_with_retained_adapter_service_entry_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, RetainedAdapterClosingEntrant::ResumeCheckpoint);
+}
+
+#[test]
+fn x86_terminal_close_with_retained_adapter_service_resume_checkpoint() {
+    terminal_close_with_retained_adapter_service_entry_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, RetainedAdapterClosingEntrant::ResumeCheckpoint);
 }
 
 fn terminal_close_with_retained_service_propagates_lifecycle_run_failure_for<
