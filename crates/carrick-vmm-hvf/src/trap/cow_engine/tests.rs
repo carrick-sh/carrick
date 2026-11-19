@@ -822,6 +822,27 @@ fn guest_lane_replacement_grant_defers_retirement_and_registration() {
     );
 }
 
+/// Owner fault selection has already authenticated the live root node and
+/// EL1 applies the replacement only over an absent or retired descriptor.
+/// Physical preparation must therefore admit the materialized provenance left
+/// by MADV_DONTNEED retirement instead of treating it as an ordinary first
+/// touch and declining the grant.
+#[test]
+fn owner_frame_grant_preparation_accepts_retired_materialized_provenance() {
+    let source = include_str!("../cow_engine.rs");
+    let prepare = fn_body(source, "fn prepare_el1_frame_grant(");
+    assert!(prepare.contains("begin_owner_grant_materialization("));
+    assert!(!prepare.contains("begin_pristine_materialization("));
+    in_order(
+        prepare,
+        &[
+            "begin_owner_grant_materialization(",
+            "publish_frame_grant(",
+            "transition.commit()",
+        ],
+    );
+}
+
 /// Completion retires the predecessor only after re-preparing it against
 /// the live inventory and proving the planned leases, then registers the
 /// grant, under one frame-registry hold the retirement never takes itself.
