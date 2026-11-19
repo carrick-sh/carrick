@@ -80,10 +80,10 @@ pub enum EntryBindingFatalReason {
     OwnedFamilyForward = 62,
     /// A native service refused because the kernel heap could not hold its
     /// storage (#2441).
-    NativeServiceNoMemory = 63,
+    NativeServiceNoMemory = 257,
     /// A native fork refusal whose cause means the owner contradicted its
     /// own state (`NativeForkClass::InvariantViolation`, #2441).
-    NativeForkInvariant = 64,
+    NativeForkInvariant = 256,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -139,10 +139,185 @@ impl EntryBindingFatalReason {
             60 => Some(Self::SwitchInStaleRoot),
             61 => Some(Self::RequeueRefused),
             62 => Some(Self::OwnedFamilyForward),
-            63 => Some(Self::NativeServiceNoMemory),
-            64 => Some(Self::NativeForkInvariant),
+            256 => Some(Self::NativeForkInvariant),
+            257 => Some(Self::NativeServiceNoMemory),
 
             _ => None,
+        }
+    }
+}
+
+// Keep the two code tables next to their decoders so additions preserve
+// the published stage and cause numbers.
+macro_rules! fork_fatal_codes {
+    ($name:ident { $($variant:ident = $raw:literal,)* }) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[repr(u8)]
+        pub enum $name {
+            $($variant = $raw,)*
+        }
+        impl $name {
+            const fn from_raw(raw: u8) -> Option<Self> {
+                match raw {
+                    $($raw => Some(Self::$variant),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+fork_fatal_codes!(NativeForkFatalStage {
+    ParentLifecycleGate = 1,
+    BirthReservation = 2,
+    ParentSpaceEdit = 3,
+    ParentForkReady = 4,
+    ChildLifecycleClaim = 5,
+    ChildControlReset = 6,
+    BirthPublication = 7,
+    PrepareService = 8,
+    ForkFileTable = 9,
+    CommitChildService = 10,
+    MappingCount = 11,
+    SpaceAccess = 12,
+    ParentRoot = 13,
+    ObserveMappings = 14,
+    TransferSequence = 15,
+    Census = 16,
+    PublishRoot = 17,
+    Scratch = 18,
+    Prepare = 19,
+    Publish = 20,
+    Reserve = 21,
+    Commit = 22,
+    Abort = 23,
+    OpenChildSpace = 24,
+    StockCrossing = 25,
+    Entry = 26,
+});
+
+fork_fatal_codes!(NativeForkFatalCause {
+    Busy = 1,
+    GateShut = 2,
+    MmFault = 3,
+    MmUnsupportedExecutableCow = 4,
+    MmStale = 5,
+    MmBusy = 6,
+    MmWait = 7,
+    MmNoMemory = 8,
+    MmMetadataRequired = 9,
+    MmInvalid = 10,
+    MmCore = 11,
+    MmReservationBusy = 12,
+    MmReservationPreparedConflict = 13,
+    MmReservationStale = 14,
+    MmReservationInvalid = 15,
+    MmReservationCollision = 16,
+    MmReservationHole = 17,
+    MmReservationForeignMapping = 18,
+    MmReservationLimit = 19,
+    MmReservationMetadataRequired = 20,
+    MmTableOutOfTables = 21,
+    MmTableBadAddress = 22,
+    MmTableMissingArenaSource = 23,
+    MmTableConflictingArenaSource = 24,
+    MmTableUnresolvedArena = 25,
+    MmTableGicWindowOutput = 26,
+    MmTableMetadataAllocation = 27,
+    MmTableGuestOwnsLiveDescriptors = 28,
+    MmTableCarrickOwnedWindow = 29,
+    ReservationBusy = 30,
+    ReservationPreparedConflict = 31,
+    ReservationStale = 32,
+    ReservationInvalid = 33,
+    ReservationCollision = 34,
+    ReservationHole = 35,
+    ReservationForeignMapping = 36,
+    ReservationLimit = 37,
+    ReservationMetadataRequired = 38,
+    ForkInvalid = 39,
+    ForkNoMemory = 40,
+    ForkBusy = 41,
+    ForkSnapshotMoved = 42,
+    ForkStale = 43,
+    ForkMetadataRequired = 44,
+    ForkCore = 45,
+    ForkOwnerInvalid = 46,
+    ForkOwnerCollision = 47,
+    ForkOwnerHole = 48,
+    ForkOwnerForeignMapping = 49,
+    ForkOwnerLimit = 50,
+    StockReservationInvalid = 51,
+    StockReservationStale = 52,
+    StockReservationCapacity = 53,
+    StockReservationInventory = 54,
+    StockCrossingInvalid = 55,
+    StockCrossingStale = 56,
+    StockCrossingCapacity = 57,
+    StockCrossingInventory = 58,
+    StockCrossingMissingReply = 59,
+    SiblingBirth = 60,
+    MetadataOwed = 61,
+    UntypedStale = 62,
+    UntypedInvalid = 63,
+    UntypedQuarantined = 64,
+});
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeForkFatalDetail {
+    pub stage: NativeForkFatalStage,
+    pub cause: NativeForkFatalCause,
+}
+
+impl fmt::Display for NativeForkFatalDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NativeForkInvariant{:?}{:?}", self.stage, self.cause)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryBindingFatalKind {
+    Reason(EntryBindingFatalReason),
+    NativeFork(NativeForkFatalDetail),
+}
+
+impl From<EntryBindingFatalReason> for EntryBindingFatalKind {
+    fn from(reason: EntryBindingFatalReason) -> Self {
+        Self::Reason(reason)
+    }
+}
+
+impl EntryBindingFatalKind {
+    const fn encode(self) -> u64 {
+        match self {
+            Self::Reason(reason) => reason as u64,
+            Self::NativeFork(detail) => {
+                EntryBindingFatalReason::NativeForkInvariant as u64
+                    | ((detail.stage as u64) << 16)
+                    | ((detail.cause as u64) << 24)
+            }
+        }
+    }
+
+    const fn decode(raw: u64) -> Option<Self> {
+        // x2 keeps the ordinary reason in its low 16 bits. Fork details
+        // use the next two bytes, leaving x3's source coordinates intact.
+        let reason = match EntryBindingFatalReason::from_raw(raw & 0xffff) {
+            Some(reason) => reason,
+            None => return None,
+        };
+        if matches!(reason, EntryBindingFatalReason::NativeForkInvariant) && raw >> 32 == 0 {
+            let Some(stage) = NativeForkFatalStage::from_raw((raw >> 16) as u8) else {
+                return None;
+            };
+            let Some(cause) = NativeForkFatalCause::from_raw((raw >> 24) as u8) else {
+                return None;
+            };
+            Some(Self::NativeFork(NativeForkFatalDetail { stage, cause }))
+        } else if raw >> 16 == 0 {
+            Some(Self::Reason(reason))
+        } else {
+            None
         }
     }
 }
@@ -151,32 +326,32 @@ impl EntryBindingFatalReason {
 /// no pointers or aggregate stack records cross this diagnostic boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EntryBindingFatalDetail {
-    pub reason: EntryBindingFatalReason,
+    pub kind: EntryBindingFatalKind,
     pub line: u32,
     pub column: u32,
 }
 impl EntryBindingFatalDetail {
     #[track_caller]
-    pub fn at_caller(reason: EntryBindingFatalReason) -> Self {
+    pub fn at_caller(kind: impl Into<EntryBindingFatalKind>) -> Self {
         let caller = core::panic::Location::caller();
         Self {
-            reason,
+            kind: kind.into(),
             line: caller.line(),
             column: caller.column(),
         }
     }
     pub const fn encode(self) -> [u64; 2] {
         [
-            self.reason as u64,
+            self.kind.encode(),
             ((self.line as u64) << 32) | self.column as u64,
         ]
     }
     pub const fn decode(reason: u64, location: u64) -> Option<Self> {
-        let Some(reason) = EntryBindingFatalReason::from_raw(reason) else {
+        let Some(kind) = EntryBindingFatalKind::decode(reason) else {
             return None;
         };
         Some(Self {
-            reason,
+            kind,
             line: (location >> 32) as u32,
             column: location as u32,
         })
@@ -186,8 +361,9 @@ struct FatalDetail(Option<u64>, Option<u64>);
 impl fmt::Display for FatalDetail {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Some(raw) => match EntryBindingFatalReason::from_raw(raw) {
-                Some(reason) => write!(f, "reason={reason:?} ")?,
+            Some(raw) => match EntryBindingFatalKind::decode(raw) {
+                Some(EntryBindingFatalKind::Reason(reason)) => write!(f, "reason={reason:?} ")?,
+                Some(EntryBindingFatalKind::NativeFork(detail)) => write!(f, "reason={detail} ")?,
                 None => write!(f, "reason=unknown({raw:#x}) ")?,
             },
             None => f.write_str("reason=unavailable ")?,
@@ -469,7 +645,20 @@ mod tests {
         let reason = 0x0312_0100;
         let location = (9769 << 32) | 9;
         let detail = EntryBindingFatalDetail::decode(reason, location).unwrap();
+        assert_eq!(
+            detail.kind,
+            EntryBindingFatalKind::NativeFork(NativeForkFatalDetail {
+                stage: NativeForkFatalStage::Scratch,
+                cause: NativeForkFatalCause::MmFault,
+            })
+        );
         assert_eq!(detail.encode(), [reason, location]);
+        assert_eq!(
+            EntryBindingFatalDetail::decode(0x0312_0100 | (1 << 32), location),
+            None
+        );
+        assert_eq!(EntryBindingFatalDetail::decode(0xff12_0100, location), None);
+        assert_eq!(EntryBindingFatalDetail::decode(0x03ff_0100, location), None);
         let registers = ArmEntryFatalRegisters {
             reason: Some(reason),
             source_location: Some(location),
@@ -496,7 +685,7 @@ mod tests {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
             for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
                 let detail = EntryBindingFatalDetail {
-                    reason,
+                    kind: reason.into(),
                     line,
                     column,
                 };
