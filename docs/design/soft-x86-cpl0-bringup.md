@@ -517,14 +517,27 @@ PIO exit, a host kick before the deadline, and delivery after the host
 deadline. The production nanosleep witness measures from a child write
 before its ring syscall to another write after it returns. It uses a
 190 ms lower bound and a 10 s upper bound to allow host scheduling and
-translation overhead. Both production witnesses are bound to
-`x86.softcpu.apic-timer`.
+translation overhead. A controlled-clock witness runs a two-thread multi-slice
+raw-exit guest at 50 µs per block under a 200,000-worker-block ceiling. All
+three production witnesses are bound to `x86.softcpu.apic-timer`.
 
-The release host-clock trial measured 299 ms between the nanosleep markers.
-The same trial reached both initial-MM allocation exits for `TWO_LIVE`,
-then hit the existing fixture guest-interval deadline. In the debug trial,
-GDB captured six timer expirations in CPL0 with IF clear and eight
-deliveries to CPL3 RIP `0x4010f9`, the first instruction after clone.
-The native scheduler starts the slice before the CPL0 return path.
-When the slice has already expired on return, the timer can rotate the
-task before it executes that first instruction.
+Before the CPL0 slice-accounting fix, the host-clock trial reached both
+initial-MM allocation exits for `TWO_LIVE`, then stalled on CPL3 RIP
+`0x4010f9`, the first instruction after `clone`. Three x86 CPL0 mechanics
+allowed `TIMER_VECTOR` (`0xe0`) to latch in the edge-triggered xAPIC `IRR`
+with `IF` clear and interrupt the resumed thread before it retired an
+instruction: starting the 2 ms slice before `prepare_parked_resume` and
+CR3/TLS installation, re-arming a 1 ms slice retry in `expire_timers` before
+`signal_irq_return` rotated a slot with a runnable head, and leaving an
+outgoing thread's expired `0xe0` pending in `IRR` when higher-priority
+`RESCHED_VECTOR` (`0xe2`) entered `schedule`. `context_resume::resume_parked`
+now runs a single pre-`iretq` callback on the one return path after context
+validation and CR3/TLS installation so `arm_slice` stamps and arms the 2 ms
+slice immediately before `carrick_x86_resume_iret`; `expire_timers` arms only
+timed-park deadlines; and `schedule` drains any pending xAPIC `IRR` vectors
+after disarming outgoing timers. ARM EL1 already restores its parked frame
+before stamping the level-triggered virtual timer and checks actual slice
+expiry before rotating. With this fix, the controlled-clock witness,
+eight-round `TWO_LIVE`, the 200 ms nanosleep witness, the musl static hello,
+and the KVM `TWO_LIVE` and slice-end witnesses all exit 0 under unchanged
+slice and block budgets.
