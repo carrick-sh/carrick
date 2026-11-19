@@ -12337,7 +12337,7 @@ mod tests {
         assert_eq!(words[leaf].load(Ordering::Acquire) & VALID, 0);
         words[leaf].store(prepared | SW_RETIRED, Ordering::Relaxed);
         assert_eq!(
-            commit(&mut words, ipa, LeafAccess::Read),
+            commit(&mut words, ipa + PT_PAGE, LeafAccess::Read),
             Err(GuestPreparedCommitError::NotPrepared)
         );
         assert_eq!(words[leaf].load(Ordering::Acquire) & VALID, 0);
