@@ -1154,6 +1154,27 @@ impl Drop for PreparedRootGrant {
 }
 
 impl ResidentFrameGrantPlan<'_> {
+    /// Consume this plan and narrow every semantic field to the one span
+    /// selected from live descriptors. This must happen before provenance is
+    /// adopted, backing is prepared, or publication identity is constructed.
+    pub fn narrow_to(
+        mut self,
+        selected: carrick_core::mm::frames::SelectedBackingPlan,
+    ) -> Result<Self, PublishedFrameGrantRefusal> {
+        let range = selected.range();
+        if selected.fault_page() != self.fault_page
+            || range.start() < self.start
+            || range.end() > self.start + self.len
+            || !(range.start() <= self.fault_page && self.fault_page < range.end())
+        {
+            return Err(PublishedFrameGrantRefusal::Identity);
+        }
+        self.start = range.start();
+        self.len = range.len();
+        self.publication.span = range;
+        Ok(self)
+    }
+
     pub fn root_incarnation(&self) -> Option<ReservationIncarnation> {
         self.root_incarnation
     }
