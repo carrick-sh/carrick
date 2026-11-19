@@ -1711,13 +1711,22 @@ impl<'a> FsView<'a> {
                 Err(LINUX_EBADF)
             };
         };
-        let Some(open) = crate::kernel::FileDescription::read_for_io(&open_file.description) else {
-            return Ok(None);
-        };
-        Ok(match &*open {
+        Ok(Self::flush_host_fd(&open_file.description))
+    }
+
+    fn flush_host_fd(description: &crate::kernel::FileDescription) -> Option<HostFdRef> {
+        let open = crate::kernel::FileDescription::read_for_io(description)?;
+        match &*open {
             OpenDescription::HostFile { host_fd, .. } => Some(host_fd.clone()),
             _ => None,
-        })
+        }
+    }
+
+    pub(in crate::dispatch) fn flush_retained_file(
+        &self,
+        fd: &HostFdRef,
+    ) -> Result<(), LinuxErrno> {
+        self.fs.host_io.flush(std::os::fd::AsFd::as_fd(fd))
     }
 
     pub(super) fn host_pipe_read_end_for_pipe_id(&self, pipe_id: u64) -> Option<(i32, HostFd)> {
@@ -1833,20 +1842,45 @@ impl<'a> FsView<'a> {
     /// (e.g. fdatasync02 on `/dev/null`, which carrick serves as a `HostPipe`).
     /// A directory (dir fsync is valid) and synthetic / in-memory files are a
     /// no-op success, so they return false.
-    fn fd_lacks_fsync(&self, fd: i32) -> bool {
-        self.open_file(fd).is_some_and(|of| {
-            ::std::matches!(
-                crate::kernel::FileDescription::inspect(&of.description).as_deref(),
-                Some(
-                    OpenDescription::HostPipe { .. }
-                        | OpenDescription::HostSocket { .. }
-                        | OpenDescription::InMemorySocket { .. }
-                        | OpenDescription::PipeReader { .. }
-                        | OpenDescription::PipeWriter { .. }
-                        | OpenDescription::SyntheticDevice { .. }
-                )
+    fn description_lacks_fsync(description: &crate::kernel::FileDescription) -> bool {
+        ::std::matches!(
+            crate::kernel::FileDescription::inspect(description).as_deref(),
+            Some(
+                OpenDescription::HostPipe { .. }
+                    | OpenDescription::HostSocket { .. }
+                    | OpenDescription::InMemorySocket { .. }
+                    | OpenDescription::PipeReader { .. }
+                    | OpenDescription::PipeWriter { .. }
+                    | OpenDescription::SyntheticDevice { .. }
             )
-        })
+        )
+    }
+
+    /// Prepare a sync operation with only the open description's authority.
+    /// The caller supplies the execution venue for the resulting host flush.
+    pub(in crate::dispatch) fn prepare_file_flush(
+        description: &Arc<crate::kernel::FileDescription>,
+        operation: carrick_core_abi::host_file::HostFileOp,
+    ) -> Result<Option<HostFdRef>, LinuxErrno> {
+        use carrick_core_abi::host_file::HostFileOp;
+        match operation {
+            HostFileOp::Fsync => {
+                crate::el1_delegation::recall_if_delegated(description);
+                if let Some(errno) = description.common().take_writeback_error() {
+                    return Err(errno);
+                }
+                if Self::description_lacks_fsync(description) {
+                    return Err(LINUX_EINVAL);
+                }
+            }
+            HostFileOp::SyncFileRange => {
+                if Self::description_lacks_sync_file_range(description) {
+                    return Err(LINUX_ESPIPE);
+                }
+            }
+            _ => {}
+        }
+        Ok(Self::flush_host_fd(description))
     }
 
     /// Scalar writes stage every guest byte before relinquishing execution.
@@ -2138,226 +2172,14 @@ impl<'a> FsView<'a> {
     define_syscall! {
 
         fn fallocate(this, cx, fd: Fd, mode: u64, offset: u64, len: u64) {
-
-            let fd: Fd = fd;
-            let offset = i64::from_ne_bytes(offset.to_ne_bytes());
-            let length = i64::from_ne_bytes(len.to_ne_bytes());
-            if mode & !LINUX_FALLOC_FL_SUPPORTED != 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            if length <= 0 || offset < 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            // The resulting file size (offset + len) must fit the off_t maximum;
-            // overflowing the max LFS file size is EFBIG on Linux, not the EINVAL
-            // a too-large host ftruncate would yield (fallocate02 cases 7-8 pass
-            // offset/len ≈ LLONG_MAX so offset+len overflows i64).
-            if offset.checked_add(length).is_none() {
-                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-            }
+            let range = Self::validate_fallocate(mode, offset, len)?;
             if is_stdio_fd(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
             }
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            // Only mode-0 (default allocation) is implemented as a real grow;
-            // FALLOC_FL_KEEP_SIZE preallocates without changing the apparent
-            // size, which on a tmpfs/host-backed file is a no-op success.
-            let grow = mode & LINUX_FALLOC_FL_KEEP_SIZE == 0;
-            let new_size = (offset as u64).saturating_add(length as u64);
-            // Snapshot the writeback path/contents in a scope so the borrow
-            // drops before we touch this.fs.rootfs_vfs.overlay (mirrors ftruncate).
-            let writeback: Option<(String, Vec<u8>)>;
-            let outcome: DispatchOutcome;
-            {
-                let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                };
-                match &mut *open {
-                    OpenDescription::File {
-                        path,
-                        contents,
-                        metadata,
-                        writable,
-                        ..
-                    } if grow => {
-                        if !*writable {
-                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                        }
-                        // memfd seals: an allocating (non-KEEP_SIZE) fallocate is
-                        // blocked only by F_SEAL_GROW when it extends the file —
-                        // F_SEAL_WRITE does NOT block a pure grow (memfd_create01
-                        // seals WRITE then grows via fallocate successfully).
-                        let cur_len = match contents.len() {
-                            Ok(l) => l,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                        };
-                        if matches!(
-                            open_file
-                                .description
-                                .common()
-                                .seals()
-                                .and_then(carrick_abi::LinuxMemfdSeals::from_bits),
-                            Some(s) if s.contains(carrick_abi::LinuxMemfdSeals::GROW)
-                        ) && new_size > cur_len
-                        {
-                            return Ok(DispatchOutcome::errno(LINUX_EPERM));
-                        }
-                        if !contents.accepts_len(new_size) {
-                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                        }
-                        if new_size > cur_len {
-                            if let Err(errno) = contents.resize(new_size) {
-                                return Ok(DispatchOutcome::errno(errno));
-                            }
-                            let confirmed_len = match contents.len() {
-                                Ok(l) => l,
-                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                            };
-                            metadata.size = usize::try_from(confirmed_len).unwrap_or(metadata.size);
-                        }
-                        // Sync the grown contents to the overlay backing so a
-                        // later fstat of the path agrees. Anonymous files
-                        // (memfd, O_TMPFILE) have no overlay path to sync.
-                        let writeback_vec = if !is_anon_overlay_path(path) {
-                            let mut vec = vec![0u8; metadata.size];
-                            if let Err(errno) = contents.read_at(0, &mut vec) {
-                                return Ok(DispatchOutcome::errno(errno));
-                            }
-                            Some((path.clone(), vec))
-                        } else {
-                            None
-                        };
-                        writeback = writeback_vec;
-                        outcome = DispatchOutcome::Returned { value: 0 };
-                    }
-                    OpenDescription::File {
-                        contents, writable, ..
-                    } => {
-                        if !*writable {
-                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                        }
-                        // A hole punch modifies content, so F_SEAL_WRITE blocks it
-                        // (memfd_create01 check_mfd_non_writeable). A plain
-                        // KEEP_SIZE preallocate changes nothing and is unaffected.
-                        if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
-                            if let Err(errno) = memfd_seal_write_check(
-                                open_file.description.common().seals(),
-                                0,
-                                0,
-                                0,
-                            ) {
-                                return Ok(DispatchOutcome::errno(errno));
-                            }
-                            // The punched range reads back as zeros; the
-                            // apparent size never changes (KEEP_SIZE is
-                            // mandatory with PUNCH_HOLE).
-                            let cur_len = match contents.len() {
-                                Ok(l) => l,
-                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                            };
-                            let start = (offset as u64).min(cur_len);
-                            let end = (offset as u64).saturating_add(length as u64).min(cur_len);
-                            if end > start {
-                                let zero_chunk = [0u8; 4096];
-                                let mut cur = start;
-                                while cur < end {
-                                    let chunk_len = ((end - cur) as usize).min(zero_chunk.len());
-                                    match contents.write_at(cur, &zero_chunk[..chunk_len]) {
-                                        Ok(0) => break,
-                                        Ok(n) => cur += n as u64,
-                                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                                    }
-                                }
-                            }
-                        }
-                        // KEEP_SIZE: don't change apparent size.
-                        writeback = None;
-                        outcome = DispatchOutcome::Returned { value: 0 };
-                    }
-                    OpenDescription::HostFile {
-                        host_fd, writable, ..
-                    } => {
-                        if !*writable {
-                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                        }
-                        if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
-                            if let Err(errno) =
-                                rw::punch_host_file_hole(host_fd.raw(), offset as u64, length as u64)
-                            {
-                                return Ok(DispatchOutcome::errno(errno));
-                            }
-                        } else if grow {
-                            let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                            if let Err(errno) =
-                                (unsafe { libc::fstat(host_fd.raw(), &mut st) }).host_syscall_errno()
-                            {
-                                return Ok(DispatchOutcome::errno(errno));
-                            }
-                            if new_size > st.st_size as u64 {
-                                if let Err(errno) = (unsafe {
-                                    libc::ftruncate(host_fd.raw(), new_size as libc::off_t)
-                                })
-                                .host_syscall_errno()
-                                {
-                                    return Ok(DispatchOutcome::errno(errno));
-                                }
-                                this.invalidate_dentry_host_fd(host_fd.raw());
-                            }
-                        }
-                        writeback = None;
-                        outcome = DispatchOutcome::Returned { value: 0 };
-                    }
-                    OpenDescription::SyntheticFile { .. } => {
-                        return Ok(DispatchOutcome::errno(LINUX_EROFS));
-                    }
-                    OpenDescription::ProcExecutable { .. } => {
-                        return Ok(DispatchOutcome::errno(LINUX_EROFS));
-                    }
-                    OpenDescription::InMemoryFile {
-                        path,
-                        contents,
-                        writable,
-                        max_size,
-                        ..
-                    } => {
-                        if !*writable {
-                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                        }
-                        if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
-                            let mut data = contents.write();
-                            data.punch_hole(offset as usize, length as usize);
-                            this.fs.rootfs_vfs.notify_inode_changed(path, None);
-                        } else {
-                            if new_size as usize > *max_size {
-                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                            }
-                            let mut data = contents.write();
-                            if (new_size as usize) > data.len() {
-                                data.set_len(new_size as usize);
-                                this.fs.rootfs_vfs.notify_inode_changed(path, None);
-                            }
-                        }
-                        writeback = None;
-                        outcome = DispatchOutcome::Returned { value: 0 };
-                    }
-                    OpenDescription::Directory { .. } => {
-                        return Ok(DispatchOutcome::errno(LINUX_EISDIR));
-                    }
-                    _ => {
-                        return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
-                    }
-                }
-            }
-            if let Some((path, contents)) = writeback {
-                let _ = this
-                    .fs
-                    .rootfs_vfs
-                    .set_file_contents(&path, contents);
-            }
-            Ok(outcome)
-
+            this.allocate_description(&open_file.description, mode, range)
         }
 
         fn ftruncate(this, cx, fd: Fd, length: u64) {
@@ -2381,6 +2203,225 @@ impl<'a> FsView<'a> {
             }
             this.truncate_description(Some(cx.kernel), &open_file.description, length)
         }
+    }
+
+    pub(in crate::dispatch) fn validate_fallocate(
+        mode: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<(i64, i64), LinuxErrno> {
+        let offset = i64::from_ne_bytes(offset.to_ne_bytes());
+        let length = i64::from_ne_bytes(length.to_ne_bytes());
+        if mode & !LINUX_FALLOC_FL_SUPPORTED != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        if length <= 0 || offset < 0 {
+            return Err(LINUX_EINVAL);
+        }
+        // The resulting file size (offset + len) must fit the off_t maximum;
+        // overflowing the max LFS file size is EFBIG on Linux, not the EINVAL
+        // a too-large host ftruncate would yield (fallocate02 cases 7-8 pass
+        // offset/len ≈ LLONG_MAX so offset+len overflows i64).
+        if offset.checked_add(length).is_none() {
+            return Err(LINUX_EFBIG);
+        }
+        Ok((offset, length))
+    }
+
+    pub(in crate::dispatch) fn allocate_description(
+        &self,
+        description: &Arc<crate::kernel::FileDescription>,
+        mode: u64,
+        (offset, length): (i64, i64),
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let this = self;
+        // Only mode-0 (default allocation) is implemented as a real grow;
+        // FALLOC_FL_KEEP_SIZE preallocates without changing the apparent
+        // size, which on a tmpfs/host-backed file is a no-op success.
+        let grow = mode & LINUX_FALLOC_FL_KEEP_SIZE == 0;
+        let new_size = (offset as u64).saturating_add(length as u64);
+        // Snapshot the writeback path/contents in a scope so the borrow
+        // drops before we touch this.fs.rootfs_vfs.overlay (mirrors ftruncate).
+        let writeback: Option<(String, Vec<u8>)>;
+        let outcome: DispatchOutcome;
+        {
+            let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            match &mut *open {
+                OpenDescription::File {
+                    path,
+                    contents,
+                    metadata,
+                    writable,
+                    ..
+                } if grow => {
+                    if !*writable {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    // memfd seals: an allocating (non-KEEP_SIZE) fallocate is
+                    // blocked only by F_SEAL_GROW when it extends the file —
+                    // F_SEAL_WRITE does NOT block a pure grow (memfd_create01
+                    // seals WRITE then grows via fallocate successfully).
+                    let cur_len = match contents.len() {
+                        Ok(l) => l,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
+                    if matches!(
+                        description.common()
+                            .seals()
+                            .and_then(carrick_abi::LinuxMemfdSeals::from_bits),
+                        Some(s) if s.contains(carrick_abi::LinuxMemfdSeals::GROW)
+                    ) && new_size > cur_len
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                    }
+                    if !contents.accepts_len(new_size) {
+                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                    }
+                    if new_size > cur_len {
+                        if let Err(errno) = contents.resize(new_size) {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        let confirmed_len = match contents.len() {
+                            Ok(l) => l,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
+                        metadata.size = usize::try_from(confirmed_len).unwrap_or(metadata.size);
+                    }
+                    // Sync the grown contents to the overlay backing so a
+                    // later fstat of the path agrees. Anonymous files
+                    // (memfd, O_TMPFILE) have no overlay path to sync.
+                    let writeback_vec = if !is_anon_overlay_path(path) {
+                        let mut vec = vec![0u8; metadata.size];
+                        if let Err(errno) = contents.read_at(0, &mut vec) {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        Some((path.clone(), vec))
+                    } else {
+                        None
+                    };
+                    writeback = writeback_vec;
+                    outcome = DispatchOutcome::Returned { value: 0 };
+                }
+                OpenDescription::File {
+                    contents, writable, ..
+                } => {
+                    if !*writable {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    // A hole punch modifies content, so F_SEAL_WRITE blocks it
+                    // (memfd_create01 check_mfd_non_writeable). A plain
+                    // KEEP_SIZE preallocate changes nothing and is unaffected.
+                    if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
+                        if let Err(errno) =
+                            memfd_seal_write_check(description.common().seals(), 0, 0, 0)
+                        {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        // The punched range reads back as zeros; the
+                        // apparent size never changes (KEEP_SIZE is
+                        // mandatory with PUNCH_HOLE).
+                        let cur_len = match contents.len() {
+                            Ok(l) => l,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
+                        let start = (offset as u64).min(cur_len);
+                        let end = (offset as u64).saturating_add(length as u64).min(cur_len);
+                        if end > start {
+                            let zero_chunk = [0u8; 4096];
+                            let mut cur = start;
+                            while cur < end {
+                                let chunk_len = ((end - cur) as usize).min(zero_chunk.len());
+                                match contents.write_at(cur, &zero_chunk[..chunk_len]) {
+                                    Ok(0) => break,
+                                    Ok(n) => cur += n as u64,
+                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                                }
+                            }
+                        }
+                    }
+                    // KEEP_SIZE: don't change apparent size.
+                    writeback = None;
+                    outcome = DispatchOutcome::Returned { value: 0 };
+                }
+                OpenDescription::HostFile {
+                    host_fd, writable, ..
+                } => {
+                    if !*writable {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
+                        if let Err(errno) =
+                            rw::punch_host_file_hole(host_fd.raw(), offset as u64, length as u64)
+                        {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                    } else if grow {
+                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                        if let Err(errno) =
+                            (unsafe { libc::fstat(host_fd.raw(), &mut st) }).host_syscall_errno()
+                        {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        if new_size > st.st_size as u64 {
+                            if let Err(errno) =
+                                (unsafe { libc::ftruncate(host_fd.raw(), new_size as libc::off_t) })
+                                    .host_syscall_errno()
+                            {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            this.invalidate_dentry_host_fd(host_fd.raw());
+                        }
+                    }
+                    writeback = None;
+                    outcome = DispatchOutcome::Returned { value: 0 };
+                }
+                OpenDescription::SyntheticFile { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EROFS));
+                }
+                OpenDescription::ProcExecutable { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EROFS));
+                }
+                OpenDescription::InMemoryFile {
+                    path,
+                    contents,
+                    writable,
+                    max_size,
+                    ..
+                } => {
+                    if !*writable {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
+                        let mut data = contents.write();
+                        data.punch_hole(offset as usize, length as usize);
+                        this.fs.rootfs_vfs.notify_inode_changed(path, None);
+                    } else {
+                        if new_size as usize > *max_size {
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                        let mut data = contents.write();
+                        if (new_size as usize) > data.len() {
+                            data.set_len(new_size as usize);
+                            this.fs.rootfs_vfs.notify_inode_changed(path, None);
+                        }
+                    }
+                    writeback = None;
+                    outcome = DispatchOutcome::Returned { value: 0 };
+                }
+                OpenDescription::Directory { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EISDIR));
+                }
+                _ => {
+                    return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
+                }
+            }
+        }
+        if let Some((path, contents)) = writeback {
+            let _ = this.fs.rootfs_vfs.set_file_contents(&path, contents);
+        }
+        Ok(outcome)
     }
 
     pub(in crate::dispatch) fn truncate_description(
@@ -2559,85 +2600,12 @@ impl<'a> FsView<'a> {
         }
 
         fn fsync(this, cx, fd: Fd) {
-
-            let fd: Fd = fd;
-            if let Some(open_file) = this.open_file(fd.0) {
-                crate::el1_delegation::recall_if_delegated(&open_file.description);
-                if let Some(err) = open_file.description.common().take_writeback_error() {
-                    return Ok(DispatchOutcome::errno(err));
-                }
-            }
-            match this.host_file_fd_for_flush(fd.0) {
-                Ok(Some(host_fd)) => {
-                    if let Err(errno) = this.with_host_wait(cx, || this.fs.host_io.flush(std::os::fd::AsFd::as_fd(&host_fd)))? {
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
-                // Non-HostFile: a pipe/socket/char device has no ->fsync op
-                // (EINVAL); a directory / synthetic / in-memory file is a no-op.
-                Ok(None) if this.fd_lacks_fsync(fd.0) => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
-                Ok(None) => Ok(DispatchOutcome::Returned { value: 0 }),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            }
-
+            this.flush_fd_for_syscall(cx, fd, carrick_core_abi::host_file::HostFileOp::Fsync)
         }
 
-        /// `sync_file_range(fd, offset, nbytes, flags)` (advisory range flush).
-        /// macOS has no equivalent, so it's a validating best-effort flush.
-        /// Validation order matches Linux (LTP sync_file_range01): unknown
-        /// flags / negative offset / negative nbytes (or offset+nbytes
-        /// overflow) → EINVAL; bad fd → EBADF; a pipe/socket/anon fd (no page
-        /// cache range) → ESPIPE; a regular file → best-effort fsync, return 0.
         fn sync_file_range(this, cx, fd: Fd, offset: u64, nbytes: u64, flags: u64) {
-            let fd: Fd = fd;
-            // SYNC_FILE_RANGE_WAIT_BEFORE(1) | WRITE(2) | WAIT_AFTER(4).
-            const VALID_FLAGS: u64 = 0x1 | 0x2 | 0x4;
-            if flags & !VALID_FLAGS != 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            let offset_i = offset as i64;
-            let nbytes_i = nbytes as i64;
-            if offset_i < 0 || nbytes_i < 0 || offset_i.checked_add(nbytes_i).is_none() {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            let Some(open_file) = this.open_file(fd.0) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            // A character device/pipe/socket/eventfd/timerfd/epoll/pidfd/
-            // inotify/signalfd/netlink fd has no page-cache range to sync →
-            // ESPIPE.
-            let is_special = ::std::matches!(
-                crate::kernel::FileDescription::inspect(&open_file.description).as_deref(),
-                Some(
-                    OpenDescription::SyntheticDevice { .. }
-                        | OpenDescription::HostPipe { .. }
-                        | OpenDescription::HostSocket { .. }
-                        | OpenDescription::PipeReader { .. }
-                        | OpenDescription::PipeWriter { .. }
-                        | OpenDescription::EventFd { .. }
-                        | OpenDescription::TimerFd { .. }
-                        | OpenDescription::Epoll { .. }
-                        | OpenDescription::Pidfd { .. }
-                        | OpenDescription::Inotify { .. }
-                        | OpenDescription::Fanotify { .. }
-                        | OpenDescription::SignalFd { .. }
-                        | OpenDescription::FsContext { .. }
-                        | OpenDescription::Mqueue { .. }
-                        | OpenDescription::BpfMap { .. }
-                        | OpenDescription::BpfProg { .. }
-                        | OpenDescription::Netlink { .. }
-                )
-            );
-            if is_special {
-                return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
-            }
-            // Regular / synthetic / in-memory file: best-effort flush a real
-            // host fd; otherwise a no-op (the range-cache effect isn't observable).
-            if let Ok(Some(host_fd)) = this.host_file_fd_for_flush(fd.0) {
-                let _ = this.with_host_wait(cx, || this.fs.host_io.flush(std::os::fd::AsFd::as_fd(&host_fd)))?;
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Self::validate_sync_file_range(offset, nbytes, flags)?;
+            this.flush_fd_for_syscall(cx, fd, carrick_core_abi::host_file::HostFileOp::SyncFileRange)
         }
 
         /// `cachestat(fd, cstat_range, cstat, flags)`: page-cache stats for a
@@ -2710,31 +2678,74 @@ impl<'a> FsView<'a> {
         }
 
         fn fdatasync(this, cx, fd: Fd) {
-
-            let fd: Fd = fd;
-            if let Some(open_file) = this.open_file(fd.0) {
-                crate::el1_delegation::recall_if_delegated(&open_file.description);
-                if let Some(err) = open_file.description.common().take_writeback_error() {
-                    return Ok(DispatchOutcome::errno(err));
-                }
-            }
-            match this.host_file_fd_for_flush(fd.0) {
-                Ok(Some(host_fd)) => {
-                    if let Err(errno) = this.with_host_wait(cx, || this.fs.host_io.flush(std::os::fd::AsFd::as_fd(&host_fd)))? {
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
-                // fdatasync02: /dev/null (a char device) → EINVAL; regular files
-                // flush, directories / synthetic files no-op.
-                Ok(None) if this.fd_lacks_fsync(fd.0) => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
-                Ok(None) => Ok(DispatchOutcome::Returned { value: 0 }),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            }
-
+            this.flush_fd_for_syscall(cx, fd, carrick_core_abi::host_file::HostFileOp::Fsync)
         }
 
+    }
+    pub(in crate::dispatch) fn validate_sync_file_range(
+        offset: u64,
+        length: u64,
+        flags: u64,
+    ) -> Result<(), LinuxErrno> {
+        // SYNC_FILE_RANGE_WAIT_BEFORE(1) | WRITE(2) | WAIT_AFTER(4).
+        const VALID_FLAGS: u64 = 0x1 | 0x2 | 0x4;
+        if flags & !VALID_FLAGS != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        let offset_i = offset as i64;
+        let length_i = length as i64;
+        if offset_i < 0 || length_i < 0 || offset_i.checked_add(length_i).is_none() {
+            return Err(LINUX_EINVAL);
+        }
+        Ok(())
+    }
 
+    fn description_lacks_sync_file_range(description: &crate::kernel::FileDescription) -> bool {
+        ::std::matches!(
+            crate::kernel::FileDescription::inspect(description).as_deref(),
+            Some(
+                OpenDescription::SyntheticDevice { .. }
+                    | OpenDescription::HostPipe { .. }
+                    | OpenDescription::HostSocket { .. }
+                    | OpenDescription::PipeReader { .. }
+                    | OpenDescription::PipeWriter { .. }
+                    | OpenDescription::EventFd { .. }
+                    | OpenDescription::TimerFd { .. }
+                    | OpenDescription::Epoll { .. }
+                    | OpenDescription::Pidfd { .. }
+                    | OpenDescription::Inotify { .. }
+                    | OpenDescription::Fanotify { .. }
+                    | OpenDescription::SignalFd { .. }
+                    | OpenDescription::FsContext { .. }
+                    | OpenDescription::Mqueue { .. }
+                    | OpenDescription::BpfMap { .. }
+                    | OpenDescription::BpfProg { .. }
+                    | OpenDescription::Netlink { .. }
+            )
+        )
+    }
+
+    fn flush_fd_for_syscall<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        fd: Fd,
+        op: carrick_core_abi::host_file::HostFileOp,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        use carrick_core_abi::host_file::HostFileOp;
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(if op == HostFileOp::Fsync && is_stdio_fd(fd.0) {
+                DispatchOutcome::Returned { value: 0 }
+            } else {
+                DispatchOutcome::errno(LINUX_EBADF)
+            });
+        };
+        if let Some(host_fd) = Self::prepare_file_flush(&open_file.description, op)?
+            && let Err(errno) = self.with_host_wait(cx, || self.flush_retained_file(&host_fd))?
+            && op != HostFileOp::SyncFileRange
+        {
+            return Ok(DispatchOutcome::errno(errno));
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 }
 

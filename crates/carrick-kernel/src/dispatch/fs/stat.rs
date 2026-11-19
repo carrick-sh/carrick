@@ -308,34 +308,7 @@ impl<'a> FsView<'a> {
     ) -> Result<DispatchOutcome, DispatchError> {
         let _: fn(&mut M, u64, &LinuxStatfs) -> DispatchOutcome = write_statfs;
         let path = read_guest_c_string(memory, pathname.0)?;
-        // An empty pathname is ENOENT (statfs has no AT_EMPTY_PATH form). glibc
-        // pathconf(path, _PC_LINK_MAX) validates the path via statfs, so
-        // statfs("") must fail rather than succeed and yield LINK_MAX
-        // (pathconf02 empty-string case).
-        if path.is_empty() {
-            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-        }
-        let path = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
-        // statfs(2) follows symlinks; a symlink CYCLE is ELOOP. resolve_at_path
-        // doesn't cap symlink depth, so canonicalize here to surface a cycle as
-        // ELOOP (LTP statfs02/statvfs02). Other resolution errors fall through to
-        // layered_metadata, which reports ENOENT/ENOTDIR/ENAMETOOLONG as before.
-        let path = match self.canonicalize_following(&path) {
-            Ok(resolved) => resolved,
-            Err(e) if e == crate::linux_abi::LINUX_ELOOP => return Ok(DispatchOutcome::errno(e)),
-            Err(_) => path,
-        };
-        // Consult the layered view (overlay/disk first, then rootfs) so
-        // that files the guest created in the overlay are visible here
-        // too — a rootfs-direct lookup would miss them.
-        if let Err(errno) = self.layered_metadata(&path) {
-            return Ok(DispatchOutcome::errno(errno));
-        }
-        let statfs = if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
-            m.vfs.fs_identity().statfs()
-        } else {
-            self.fs.rootfs_vfs.statfs()
-        };
+        let statfs = self.path_statfs(&path)?;
         Ok(super::super::copyout::copyout_record(
             context,
             memory,
@@ -343,6 +316,46 @@ impl<'a> FsView<'a> {
             &statfs,
             DispatchOutcome::Returned { value: 0 },
         ))
+    }
+
+    pub(in crate::dispatch) fn path_statfs(&self, path: &str) -> Result<LinuxStatfs, LinuxErrno> {
+        // An empty pathname is ENOENT (statfs has no AT_EMPTY_PATH form). glibc
+        // pathconf(path, _PC_LINK_MAX) validates the path via statfs, so
+        // statfs("") must fail rather than succeed and yield LINK_MAX
+        // (pathconf02 empty-string case).
+        if path.is_empty() {
+            return Err(LINUX_ENOENT);
+        }
+        let path = self.resolve_at_path(LINUX_AT_FDCWD, path)?;
+        // statfs(2) follows symlinks; a symlink CYCLE is ELOOP. resolve_at_path
+        // doesn't cap symlink depth, so canonicalize here to surface a cycle as
+        // ELOOP (LTP statfs02/statvfs02). Other resolution errors fall through to
+        // layered_metadata, which reports ENOENT/ENOTDIR/ENAMETOOLONG as before.
+        let path = match self.canonicalize_following(&path) {
+            Ok(resolved) => resolved,
+            Err(e) if e == crate::linux_abi::LINUX_ELOOP => return Err(e),
+            Err(_) => path,
+        };
+        // Consult the layered view (overlay/disk first, then rootfs) so
+        // that files the guest created in the overlay are visible here
+        // too — a rootfs-direct lookup would miss them.
+        self.layered_metadata(&path)?;
+        Ok(if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
+            m.vfs.fs_identity().statfs()
+        } else {
+            self.fs.rootfs_vfs.statfs()
+        })
+    }
+
+    pub(in crate::dispatch) fn filesystem_statfs(
+        &self,
+        identity: carrick_vfs::FsIdentity,
+    ) -> LinuxStatfs {
+        if identity == carrick_vfs::FsIdentity::Overlay {
+            self.fs.rootfs_vfs.statfs()
+        } else {
+            identity.statfs()
+        }
     }
 
     fn fstatfs(
@@ -356,11 +369,7 @@ impl<'a> FsView<'a> {
             Ok(record) => record,
             Err(errno) => return DispatchOutcome::errno(errno),
         };
-        let statfs = if record.fs_identity == carrick_vfs::FsIdentity::Overlay {
-            self.fs.rootfs_vfs.statfs()
-        } else {
-            record.fs_identity.statfs()
-        };
+        let statfs = self.filesystem_statfs(record.fs_identity);
         super::super::copyout::copyout_record(
             context,
             memory,
