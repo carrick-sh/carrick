@@ -699,6 +699,23 @@ fn el0_fp_status_survives_an_exit_and_host_controls_are_preserved() {
     let before = host_controls();
     let (report, _) = run_at(&mut cpu, &mut memory);
     assert_eq!(host_controls(), before);
+    assert_eq!(
+        report.stop,
+        Stop::Fetch(VirtualAddress(CODE + 16)),
+        "{report}"
+    );
+    assert_eq!(x(&cpu, 0), 2); // DZC, with division-by-zero trap disabled
+    assert_eq!(x(&cpu, 1), 1 << 22);
+    assert_eq!(cpu.vectors[0] as u64, f64::INFINITY.to_bits());
+
+    // 1.0 + 2^-53 is halfway between two doubles. Guest RMode=+Inf
+    // changes the arithmetic result relative to the default ties-to-even.
+    let mut memory = Flat::default();
+    memory.put_words(CODE, &[0x1e61_2800]); // fadd d0, d0, d1
+    cpu.pc = ProgramCounter(CODE);
+    cpu.vectors[0] = 1.0f64.to_bits() as u128;
+    cpu.vectors[1] = (1023u128 - 53) << 52; // 2^-53
+    let (report, _) = run_at(&mut cpu, &mut memory);
     assert_eq!(report.stop, Stop::Fetch(VirtualAddress(CODE + 4)));
     assert_eq!(cpu.vectors[0] as u64, 1.0f64.to_bits() + 1);
 }
