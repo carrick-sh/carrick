@@ -422,23 +422,49 @@ fn frame_grant_root_matches(
     Some(request.reservation_incarnation) == current
 }
 
-fn publish_frame_grant_refusal(
-    mailbox: &carrick_el1_abi::FrameGrantMailbox,
-    request: carrick_el1_abi::FrameGrantRequest,
-    status: u64,
-) {
-    if !mailbox.publish_refusal(status) {
-        fail_frame_grant_publication(format_args!(
-            "claimed frame-grant request could not publish backend refusal: mm={} generation={} status={}",
-            request.mm_key, request.request_generation, status
-        ));
+enum FrameGrantResponse<T> {
+    Refuse(u64, T),
+    Fail(String),
+}
+
+impl From<u64> for FrameGrantResponse<()> {
+    fn from(status: u64) -> Self {
+        Self::Refuse(status, ())
     }
 }
 
-fn fail_frame_grant_publication(error: impl std::fmt::Display) -> ! {
-    carrick_fatal::carrick_fatal!(
-        "hvpatch::el1_frame_grant",
-        "frame-grant publication failed: {error}"
+fn publish_frame_grant_refusal<T>(
+    mailbox: &carrick_el1_abi::FrameGrantMailbox,
+    request: carrick_el1_abi::FrameGrantRequest,
+    response: impl Into<FrameGrantResponse<T>>,
+) -> T {
+    let result = match response.into() {
+        FrameGrantResponse::Refuse(status, value) if mailbox.publish_refusal(status) => Ok(value),
+        FrameGrantResponse::Refuse(status, _) => Err(format!(
+            "claimed frame-grant request could not publish backend refusal: mm={} generation={} status={}",
+            request.mm_key, request.request_generation, status
+        )),
+        FrameGrantResponse::Fail(error) => Err(error),
+    };
+    result.unwrap_or_else(|error| {
+        carrick_fatal::carrick_fatal!(
+            "hvpatch::el1_frame_grant",
+            "frame-grant publication failed: {error}"
+        )
+    })
+}
+
+/// Funnel an uncertain prepared grant into the same fail-stop authority as
+/// mailbox refusal failure. Its response never returns to the fault handler.
+fn fail_frame_grant_publication<T>(
+    mailbox: &carrick_el1_abi::FrameGrantMailbox,
+    request: carrick_el1_abi::FrameGrantRequest,
+    error: impl std::fmt::Display,
+) -> T {
+    publish_frame_grant_refusal(
+        mailbox,
+        request,
+        FrameGrantResponse::Fail(error.to_string()),
     )
 }
 
@@ -963,7 +989,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                 };
                 let fail_publication = |detail: String| -> ! {
                     record_decision(FrameGrantDecision::FatalPublication);
-                    fail_frame_grant_publication(detail)
+                    fail_frame_grant_publication(mailbox, request, detail)
                 };
                 let decline_publication = |decision| {
                     record_decision(decision);
