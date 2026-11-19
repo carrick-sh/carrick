@@ -1520,22 +1520,25 @@ fn readlink_validates_only_the_bytes_returned_by_the_link() {
 #[test]
 fn a_decoded_call_the_venue_does_not_admit_keeps_its_crossing_output_stage() {
     use crate::crossing::HostCrossingSet;
-    // Initial AT_FDCWD readlinkat keeps its x86 host crossing (#2201).
+    // AT_FDCWD readlinkat keeps its existing route and output preparation.
     let (path, out) = (0x7000_0000u64, 0x7000_1000u64);
     let args = [LINUX_AT_FDCWD as u64, path, out, 64, 0, 0];
     assert!(HostFileCall::decode(crate::crossing::nr::READLINKAT, &args).is_some());
-    assert_eq!(
-        admit_or_cross(
-            HostCrossingSet::X86,
-            carrick_guest_arch::NativeOrdinal::new(267),
-            crate::crossing::nr::READLINKAT,
-            &args,
-            ServiceOrigin::Initial,
-            |_| false,
-            |_, _| 0,
-        ),
-        Err(Some(HostFileStage::PrepareOutput { address: out })),
-    );
+    for origin in [ServiceOrigin::Initial, ServiceOrigin::Descendant] {
+        assert_eq!(
+            admit_or_cross(
+                HostCrossingSet::X86,
+                carrick_guest_arch::NativeOrdinal::new(267),
+                crate::crossing::nr::READLINKAT,
+                &args,
+                origin,
+                |_| false,
+                |_, _| 0,
+            ),
+            Err(Some(HostFileStage::PrepareOutput { address: out })),
+            "{origin:?}"
+        );
+    }
     // Once the page is writable the crossing runs as it is.
     assert_eq!(
         admit_or_cross(
