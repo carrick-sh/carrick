@@ -3273,6 +3273,37 @@ fn complete_poll_copyout<'p, C: carrick_core_abi::EntryContext>(
     }
 }
 
+fn complete_ring_poll_output<'p, C: carrick_core_abi::EntryContext>(
+    process: Option<&mut (dyn lifecycle::ProcessNative<'_, C> + 'p)>,
+    task: &CurrentTask,
+    output: ipc::PollOutput,
+    diagnostic: (&Counters, carrick_syscall_abi::CanonicalNr, [u64; 6], u64),
+) -> FamilyCompletion {
+    match output {
+        ipc::PollOutput::Revents {
+            address,
+            pollfd,
+            result,
+        } => complete_poll_copyout(
+            process,
+            task,
+            carrick_guest_arch::UserVa::new(
+                address.0 + core::mem::offset_of!(crate::file_table::PollFd, revents) as u64,
+            ),
+            &pollfd.revents.to_ne_bytes(),
+            SyscallResult::new(result),
+            diagnostic,
+        ),
+        ipc::PollOutput::Select { spans, result } => {
+            let Some(process) = process else {
+                return FamilyCompletion::Forward;
+            };
+            let outcome = process.complete_copyout_spans(spans, SyscallResult::new(result));
+            carrick_personality_linux::lifecycle::lifecycle_effect(&outcome)
+        }
+    }
+}
+
 fn complete_poll_array<'p, C: carrick_core_abi::EntryContext>(
     process: Option<&mut (dyn lifecycle::ProcessNative<'_, C> + 'p)>,
     task: &CurrentTask,
@@ -3455,6 +3486,11 @@ impl<
         }
     }
     fn may_serve_poll(&self) -> bool {
+        if carrick_personality_linux::dispatch::select_ordinal(self.frame.canonical_ordinal()) {
+            return self.process.as_deref().is_some_and(|process| {
+                !process.is_root_process() && process.owns_descriptor_namespace()
+            });
+        }
         self.frame.may_serve_poll()
     }
     fn may_complete_advisory_mmap_before_work(&self) -> bool {
@@ -3704,6 +3740,16 @@ impl<
         let zone_wait = self.ipc_poll_transfer();
         if zone_wait != FamilyCompletion::Forward {
             return zone_wait;
+        }
+        if carrick_personality_linux::dispatch::select_ordinal(self.frame.canonical_ordinal()) {
+            self.record_refusal(
+                self.frame
+                    .crossing_set()
+                    .refusal_bucket(self.native_number()),
+            );
+            return FamilyCompletion::AccountedComplete(
+                carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+            );
         }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return FamilyCompletion::Forward;
@@ -5196,7 +5242,9 @@ impl<
         };
         let mut output = None;
         let mut sigpipe_owed = false;
-        let disposition = if ordinal.raw() == 73 {
+        let disposition = if ordinal.raw() == 73
+            || carrick_personality_linux::dispatch::select_ordinal(ordinal)
+        {
             ipc::serve_single_zone_ppoll(&mut exec, &mut *self.frame, venue, &mut user, &mut output)
         } else {
             let (disposition, owed) = ipc::serve_ipc_with_signals(
@@ -5220,29 +5268,11 @@ impl<
             return self.ipc_input_wait(request);
         }
         if let Some(output) = output {
-            let bytes = output.pollfd.revents.to_ne_bytes();
-            return complete_poll_copyout(
+            return complete_ring_poll_output(
                 self.process.as_deref_mut(),
                 task,
-                carrick_guest_arch::UserVa::new(
-                    output.address.0
-                        + core::mem::offset_of!(crate::file_table::PollFd, revents) as u64,
-                ),
-                &bytes,
-                SyscallResult::new(output.result),
-                (
-                    self.counters,
-                    ordinal,
-                    [
-                        orig_arg0,
-                        arguments[1],
-                        arguments[2],
-                        arguments[3],
-                        arguments[4],
-                        arguments[5],
-                    ],
-                    pc,
-                ),
+                output,
+                (self.counters, ordinal, arguments, pc),
             );
         }
         if sigpipe_owed {
@@ -6609,18 +6639,10 @@ impl<
                 return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
             }
             if let Some(output) = output {
-                // Readiness is frozen, but fd/events remain caller-owned even
-                // while this task is parked. Publish only the output field.
-                let bytes = output.pollfd.revents.to_ne_bytes();
-                return complete_poll_copyout(
+                return complete_ring_poll_output(
                     self.process.as_deref_mut(),
                     task,
-                    carrick_guest_arch::UserVa::new(
-                        output.address.0
-                            + core::mem::offset_of!(crate::file_table::PollFd, revents) as u64,
-                    ),
-                    &bytes,
-                    SyscallResult::new(output.result),
+                    output,
                     (
                         self.counters,
                         carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
