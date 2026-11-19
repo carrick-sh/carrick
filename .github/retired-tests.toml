@@ -71,3 +71,8 @@ test = "carrick_el1_linux::aarch64_process_tests::arm_glibc_pthread_join_robust_
 reason = "#2109: a registered robust list no longer declines a raw exit to host custody, so the #2124 host-retirement wake witness now reaches host custody through a pending-signal decline, and a twin witnesses the robust exit retiring in ring and waking the join itself."
 replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_glibc_pthread_join_host_retirement_wake_meets_ring_wait"
 pr = 2182
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::thread_sibling_tests::decodes_el0_counter_register_traps"
+reason = "#1236: the EL0 SYS64 read decoder and its witness moved verbatim from carrick-vmm-hvf into carrick-aarch64 (PR #2551) so HVF and the soft aarch64 CPU share one decoder; the witness is unchanged (same assertions) at its new path carrick_aarch64::esr::sys64_tests::decodes_el0_counter_register_traps."
+pr = 2551
