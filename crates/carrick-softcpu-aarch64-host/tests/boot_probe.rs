@@ -329,9 +329,16 @@ fn resident_loop_translates_only_two_blocks() {
         assert_eq!(report.pc, ProgramCounter(PC + 12));
         assert_eq!(report.work.executed_blocks, iterations + 1);
         assert_eq!(report.work.retired_instructions, iterations * 2 + 1);
-        counts.push((report.work.decoded_blocks, report.work.emitted_blocks));
+        let publication = runner.publication_work();
+        counts.push((
+            report.work.decoded_blocks,
+            report.work.emitted_blocks,
+            publication.publications,
+            publication.mprotect_calls,
+            publication.icache_syncs,
+        ));
     }
-    assert_eq!(counts, [(2, 2); 3]);
+    assert_eq!(counts, [(2, 2, 2, 2, 2); 3]);
 }
 
 #[test]
