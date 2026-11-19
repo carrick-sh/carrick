@@ -327,6 +327,36 @@ impl FrameGrantResidencyTable {
             .count()
     }
 
+    /// Diagnose every observed occupied slot. A writing row or a row whose
+    /// epoch changed during classification yields None. Diagnostic results
+    /// must not be used to authorize descriptor or inventory mutations.
+    pub fn inspect_occupied<T>(
+        &self,
+        mut classify: impl FnMut(FrameGrantResidencyIdentity, bool) -> T,
+        mut observe: impl FnMut(Option<T>),
+    ) {
+        for record in &self.slots {
+            let epoch = record.state.load(Ordering::Acquire);
+            match epoch & GRANT_STATE_MASK {
+                GRANT_WRITING => observe(None),
+                GRANT_LIVE => {
+                    let identity = record.identity();
+                    let committed = record
+                        .committed
+                        .iter()
+                        .any(|word| word.load(Ordering::Acquire) != 0);
+                    if record.state.load(Ordering::Acquire) != epoch {
+                        observe(None);
+                        continue;
+                    }
+                    let class = classify(identity, committed);
+                    observe((record.state.load(Ordering::Acquire) == epoch).then_some(class));
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Guest: find the exact live grant covering a prepared leaf.
     pub fn lookup(&self, mm_key: u64, va: u64) -> Option<FrameGrantResidencyPage> {
         let page = va & !(GRANT_PAGE_SIZE - 1);

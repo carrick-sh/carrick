@@ -134,10 +134,25 @@ timestamp. An empty trace provides no evidence about the refusal source.
 |---|---|
 | `hvpatch-owner-grant-descriptor-refused` | Transaction generation, ARM wire operation kind, span VA, span length, refusal code, residency publication. Publication is 1 if this exact grant published before refusal, 0 if it did not, and 2 if no observation was available. |
 | `frame-grant-residency-refused` | MM key, span VA, span length, occupied slots sampled after the failed attempt, total slots. The count includes live and writing slots and can change during sampling. Publication can also refuse an overlap, exhausted probe window, or racing publisher. |
+| `frame-grant-residency-census` | Refusing transaction generation, live, dead MM, stale backing, missing or retired descriptor, and unresolved slot counts. This takes a read-only host snapshot after the guest refusal. |
 | `descriptor-journal-reserve-failed` | ISA, operation kind, live stores, table grants. This fires at the same refusal as plan site 3. |
 | `descriptor-plan-refused` | ISA (1 ARM, 2 x86), site, ISA-specific operation kind, live stores, table grants, refusal code. Site 1 is the walk with its partial counts, 2 is insufficient grants, 3 is journal reserve with the finished plan counts, and 4 is apply with the finished plan counts. |
 
-Refusal code 17 is `JournalCapacity`. ARM operation kinds are 1 Prepare,
+Refusal code 17 is `JournalCapacity`. Code 25 is `ResidencyCapacity`.
+The census requires a published MM and an exact kernel-owned inventory row
+with the same mapping and frame and a covering IPA range. The backend ledger
+and current stage-2 owner directory must agree on the recorded owner generation. It
+checks current stage-1 output across the grant and requires evidence the
+grant applied through a committed bit or a valid matching leaf. A missing
+MM, replaced backing or missing/retired output identifies a candidate for
+lifecycle, unmap/COW or refused-grant rollback investigation, respectively.
+Writing slots, changing editor or gate epochs, rows for another live MM, and
+unreadable or solely prepared outputs count as unresolved. Use the result
+only when the five counts reconcile with sampled occupancy and unresolved
+is zero. Normal retirement follows exact unmap or COW replacement, or whole
+MM exec/exit retirement. Failed descriptor publication retires its exact
+provisional row in the grant transaction.
+ARM operation kinds are 1 Prepare,
 2 Publish, 3 Protect, 4 Retire, 5 CowRepoint, 6 Terminal and 7 MapAlias.
 The x86 digest kinds are 1 Map, 2 Publish, 3 Protect, 4 ArmCow, 5 CowRepoint,
 6 Unmap, 7 Coalesce, 8 Prepare and 9 Retire. The owner grant slot carries guest
