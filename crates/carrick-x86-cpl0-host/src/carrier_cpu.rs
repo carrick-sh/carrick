@@ -741,7 +741,9 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
                     }
                 }
             }
-            CarrierRunExit::SyscallTrap => {
+            // A kick may interrupt a descendant after CPL0 switches CR3 in
+            // zone, without changing the executor's loaded root task.
+            CarrierRunExit::SyscallTrap | CarrierRunExit::Kick => {
                 let root_gpa = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
                     .ok_or_else(|| {
                         self.custody = Custody::Poisoned;
