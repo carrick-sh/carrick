@@ -42,10 +42,10 @@ use carrick_softcpu_aarch64::state::{
     StackPointer, StackSelect, SystemValue, VirtualAddress,
 };
 use carrick_softcpu_aarch64::translate::{
-    BlockExit, BlockFrame, BlockLimits, ExitReason, InstructionClass, TranslatedBlock, frame,
+    BlockExit, BlockLimits, ExitReason, InstructionClass, TranslatedBlock,
 };
 use carrick_softcpu_aarch64::{ExceptionKind, Gpr, OperandRegister};
-use carrick_softcpu_aarch64_host::{HostBlockRunner, HostError};
+use carrick_softcpu_aarch64_host::{HostBlockRunner, HostCode, HostError};
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 use std::collections::{BTreeMap, VecDeque};
@@ -191,6 +191,11 @@ fn assert_sentinel_return(cpu: &CpuState, strict: &Report<HostError>) {
         exit_word, 0,
         "strict probe returned non-zero exit word: {strict}"
     );
+}
+
+fn x(cpu: &CpuState, n: u8) -> u64 {
+    cpu.read_operand(OperandRegister::Gpr(Gpr::new(n).unwrap()))
+        .0
 }
 
 fn set_x(cpu: &mut CpuState, n: u8, v: u64) {
@@ -700,27 +705,33 @@ impl TracingRunner {
 
 impl ExecuteBlock for TracingRunner {
     type Error = HostError;
+    type Code = HostCode;
+
+    fn prepare(&mut self, block: &TranslatedBlock) -> Result<HostCode, HostError> {
+        self.inner.prepare(block)
+    }
 
     fn execute(
         &mut self,
         block: &TranslatedBlock,
-        frame: &mut BlockFrame,
+        code: &HostCode,
+        cpu: &mut CpuState,
     ) -> Result<usize, HostError> {
         let start = block.guest().start().0;
         if start < LINUX_EL0_TRAMPOLINE_BASE {
             if let Some(mut svc) = self.pending_svc.take() {
-                svc.ret = Some(frame.slots[0] as i64);
+                svc.ret = Some(x(cpu, 0) as i64);
                 self.syscalls.push(svc);
             } else if let Some(last) = self.syscalls.last_mut()
                 && last.ret.is_none()
             {
-                last.ret = Some(frame.slots[0] as i64);
+                last.ret = Some(x(cpu, 0) as i64);
             }
         }
-        let exit_idx = self.inner.execute(block, frame)?;
+        let exit_idx = self.inner.execute(block, code, cpu)?;
         if start < LINUX_EL0_TRAMPOLINE_BASE {
-            let sp = frame.slots[(frame::GUEST_SP / 8) as usize];
-            let lr = frame.slots[30];
+            let sp = cpu.sp().0;
+            let lr = x(cpu, 30);
             match block.exits().get(exit_idx).copied() {
                 Some(BlockExit::Continue(target)) => {
                     if let Some(term) = block.guest().terminator()
@@ -747,21 +758,14 @@ impl ExecuteBlock for TracingRunner {
                             pc: ins.pc().0,
                             lr,
                             sp,
-                            nr: frame.slots[8],
-                            args: [
-                                frame.slots[0],
-                                frame.slots[1],
-                                frame.slots[2],
-                                frame.slots[3],
-                                frame.slots[4],
-                                frame.slots[5],
-                            ],
+                            nr: x(cpu, 8),
+                            args: core::array::from_fn(|n| x(cpu, n as u8)),
                             ret: None,
                         });
                     } else if ins.word() & 0xffff_ffe0 == 0xd51b_d040 {
                         // DDI0487G.a C6.2.196: MSR TPIDR_EL0, Xt (S3_3_C13_C0_2).
-                        let rt = (ins.word() & 31) as usize;
-                        let val = if rt == 31 { 0 } else { frame.slots[rt] };
+                        let rt = (ins.word() & 31) as u8;
+                        let val = if rt == 31 { 0 } else { x(cpu, rt) };
                         self.tpidr_writes.push((ins.pc().0, val));
                     }
                 }

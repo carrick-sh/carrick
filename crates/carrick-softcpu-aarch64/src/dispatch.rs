@@ -10,22 +10,29 @@ use crate::handler::{
 use crate::mmu::{self, AccessClass, Stage1Error};
 use crate::state::{CpuState, ExceptionLevel, ProgramCounter, VirtualAddress};
 use crate::translate::{
-    BlockExit, BlockFrame, BlockLimits, CODE_PAGE_BYTES, ExitReason, GuestInstruction,
-    InstructionClass, TranslateError, TranslatedBlock, emit_block, split_block,
+    BlockExit, BlockLimits, CODE_PAGE_BYTES, ExitReason, GuestInstruction, InstructionClass,
+    TranslateError, TranslatedBlock, emit_block, split_block,
 };
 use carrick_guest_arch::{FrameGpa, Gpa};
 use carrick_mmu_core::stage1::LeafAccess;
 use carrick_softmmu::block_cache::BlockCache;
 use core::fmt;
 
-/// Runs one translated block against `frame` and returns its exit index.
-/// The implementation owns executable memory; this crate never executes.
+/// Prepares translated code and runs it against the CPU's architectural state.
+/// The implementation owns executable memory; this crate never executes it.
 pub trait ExecuteBlock {
     type Error;
+    type Code;
+
+    fn prepare(&mut self, block: &TranslatedBlock) -> Result<Self::Code, Self::Error>;
+
+    /// Run the code prepared for `block`, update `cpu` on success, and return the
+    /// index into the block's exit table.
     fn execute(
         &mut self,
         block: &TranslatedBlock,
-        frame: &mut BlockFrame,
+        code: &Self::Code,
+        cpu: &mut CpuState,
     ) -> Result<usize, Self::Error>;
 }
 
@@ -181,9 +188,9 @@ struct CodeIdentity {
     generation: CodeGeneration,
 }
 
-struct ResidentBlock {
-    code: CodeIdentity,
-    block: TranslatedBlock,
+struct ResidentBlock<C> {
+    identity: CodeIdentity,
+    prepared: (TranslatedBlock, C),
 }
 
 struct MeasuredMemory<'a, M> {
@@ -227,7 +234,7 @@ pub fn run<X: ExecuteBlock>(
     };
     // The run borrows one memory owner and one set of block limits. Keeping
     // residency within that borrow also discards code at provider handoffs.
-    let mut cache = BlockCache::<BlockKey, ResidentBlock>::default();
+    let mut cache = BlockCache::<BlockKey, ResidentBlock<X::Code>>::default();
     let stop = loop {
         if blocks >= budget {
             break Stop::Budget;
@@ -262,44 +269,50 @@ pub fn run<X: ExecuteBlock>(
             .code_generation(frame)
             .map(|generation| CodeIdentity { frame, generation });
         let uncached;
-        let block = if let Some(resident) = cache.get(&key).filter(|r| Some(r.code) == code) {
-            &resident.block
-        } else {
-            let Ok(first) = read_word(memory, pa) else {
-                break Stop::Fetch(VirtualAddress(cpu.pc.0));
-            };
-            work.decoded_blocks += 1;
-            let mut fetched_whole_block = true;
-            let guest = split_block(cpu.pc, limits, |pc| {
-                let word = if pc == cpu.pc {
-                    Some(first)
-                } else {
-                    fetch_address(cpu, memory, pc)
-                        .ok()
-                        .and_then(|pa| read_word(memory, pa).ok())
-                };
-                fetched_whole_block &= word.is_some();
-                word
-            });
-            work.emitted_blocks += 1;
-            let block = match emit_block(&guest) {
-                Ok(block) => block,
-                Err(error) => break Stop::Translate(error),
-            };
-            if let Some(code) = code.filter(|_| fetched_whole_block) {
-                &cache.insert(key, ResidentBlock { code, block }).block
+        let (block, executable) =
+            if let Some(resident) = cache.get(&key).filter(|r| Some(r.identity) == code) {
+                &resident.prepared
             } else {
-                uncached = block;
-                &uncached
-            }
-        };
-        let mut frame = BlockFrame::from_cpu(cpu);
+                let Ok(first) = read_word(memory, pa) else {
+                    break Stop::Fetch(VirtualAddress(cpu.pc.0));
+                };
+                work.decoded_blocks += 1;
+                let mut fetched_whole_block = true;
+                let guest = split_block(cpu.pc, limits, |pc| {
+                    let word = if pc == cpu.pc {
+                        Some(first)
+                    } else {
+                        fetch_address(cpu, memory, pc)
+                            .ok()
+                            .and_then(|pa| read_word(memory, pa).ok())
+                    };
+                    fetched_whole_block &= word.is_some();
+                    word
+                });
+                work.emitted_blocks += 1;
+                let block = match emit_block(&guest) {
+                    Ok(block) => block,
+                    Err(error) => break Stop::Translate(error),
+                };
+                let executable = match executor.prepare(&block) {
+                    Ok(code) => code,
+                    Err(error) => break Stop::Execute(error),
+                };
+                let prepared = (block, executable);
+                if let Some(identity) = code.filter(|_| fetched_whole_block) {
+                    &cache
+                        .insert(key, ResidentBlock { identity, prepared })
+                        .prepared
+                } else {
+                    uncached = prepared;
+                    &uncached
+                }
+            };
         work.dispatches += 1;
-        let index = match executor.execute(block, &mut frame) {
+        let index = match executor.execute(block, executable, cpu) {
             Ok(i) => i,
             Err(e) => break Stop::Execute(e),
         };
-        frame.store_to(cpu);
         blocks += 1;
         let Some(exit) = block.exits().get(index).copied() else {
             break Stop::BadExit(index);
@@ -362,7 +375,7 @@ mod tests {
     extern crate std;
     use super::*;
     use crate::state::{ExceptionLevel, StackSelect};
-    use crate::translate::{Terminator, frame};
+    use crate::translate::{BlockFrame, Terminator, frame};
     use crate::{
         AddSubtract, ArithmeticOperand, Branch, Condition, Instruction, MoveWideOperation,
     };
@@ -387,11 +400,19 @@ mod tests {
 
     impl ExecuteBlock for GuestSemantics {
         type Error = &'static str;
+        type Code = ();
+        fn prepare(&mut self, _: &TranslatedBlock) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
         fn execute(
             &mut self,
             block: &TranslatedBlock,
-            f: &mut BlockFrame,
+            _: &(),
+            cpu: &mut CpuState,
         ) -> Result<usize, &'static str> {
+            let mut frame = BlockFrame::from_cpu(cpu);
+            let f = &mut frame;
             let nzcv = (frame::NZCV / 8) as usize;
             for i in block.guest().instructions() {
                 match i.instruction() {
@@ -430,7 +451,7 @@ mod tests {
                     _ => return Err("double: instruction outside its subset"),
                 }
             }
-            Ok(match block.terminator() {
+            let index = match block.terminator() {
                 Terminator::Handler(e) | Terminator::Jump(e) | Terminator::Fallthrough(e) => e,
                 Terminator::Conditional { fallthrough, taken } => {
                     let Some(Instruction::Branch(Branch::Conditional { condition, .. })) =
@@ -446,7 +467,9 @@ mod tests {
                         _ => return Err("double: only EQ/NE"),
                     }
                 }
-            })
+            };
+            frame.store_to(cpu);
+            Ok(index)
         }
     }
 
@@ -454,7 +477,11 @@ mod tests {
     struct WrongExit;
     impl ExecuteBlock for WrongExit {
         type Error = ();
-        fn execute(&mut self, b: &TranslatedBlock, _: &mut BlockFrame) -> Result<usize, ()> {
+        type Code = ();
+        fn prepare(&mut self, _: &TranslatedBlock) -> Result<(), ()> {
+            Ok(())
+        }
+        fn execute(&mut self, b: &TranslatedBlock, _: &(), _: &mut CpuState) -> Result<usize, ()> {
             Ok(b.exits().len())
         }
     }

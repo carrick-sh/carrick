@@ -329,19 +329,23 @@ const fn slot(offset: u32) -> usize {
 }
 
 impl BlockFrame {
-    /// Load the guest registers a block can observe: X0..X30, the current
-    /// banked SP, NZCV, and Q0..Q31.
     pub fn from_cpu(cpu: &CpuState) -> Self {
         let mut f = Self::default();
+        f.load_from(cpu);
+        f
+    }
+
+    /// Load the guest registers a block can observe: X0..X30, the current
+    /// banked SP, NZCV, and Q0..Q31.
+    pub fn load_from(&mut self, cpu: &CpuState) {
         for n in 0..31u8 {
             if let Some(r) = Gpr::new(n) {
-                f.slots[usize::from(n)] = cpu.read_operand(OperandRegister::Gpr(r)).0;
+                self.slots[usize::from(n)] = cpu.read_operand(OperandRegister::Gpr(r)).0;
             }
         }
-        f.vectors = cpu.vectors;
-        f.slots[slot(frame::GUEST_SP)] = cpu.sp().0;
-        f.slots[slot(frame::NZCV)] = u64::from(cpu.pstate.nzcv & 15) << 28;
-        f
+        self.vectors = cpu.vectors;
+        self.slots[slot(frame::GUEST_SP)] = cpu.sp().0;
+        self.slots[slot(frame::NZCV)] = u64::from(cpu.pstate.nzcv & 15) << 28;
     }
     /// Write back what a block may have changed.
     pub fn store_to(&self, cpu: &mut CpuState) {

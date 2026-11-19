@@ -17,3 +17,8 @@ The cache is scoped to one run on one memory owner. Changing the root, ASID
 or exception level selects a separate key. Replacing a frame or a generation
 replaces the cached block for that key. Untracked memory cannot supply a cache
 hit. Production carrier wiring and native release timing remain separate gates.
+
+Each resident translation owns its immutable RX mapping. At all three scales
+the host adapter publishes twice, calls mprotect twice and synchronizes the
+I-cache twice. The dispatcher loads architectural state directly into the
+runner's frame and writes back from that same frame.

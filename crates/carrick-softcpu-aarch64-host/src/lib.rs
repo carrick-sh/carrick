@@ -9,7 +9,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use carrick_softcpu_aarch64::dispatch::ExecuteBlock;
-use carrick_softcpu_aarch64::translate::{BlockFrame, TranslatedBlock};
+use carrick_softcpu_aarch64::state::CpuState;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+use carrick_softcpu_aarch64::translate::BlockFrame;
+use carrick_softcpu_aarch64::translate::TranslatedBlock;
 
 /// Why a block could not be launched on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,14 +29,21 @@ pub enum HostError {
 /// delivered mid-block writes its frame below the engine frame, inside it.
 pub const FRAME_REGION_BYTES: usize = 64 * 1024;
 
-/// Executable bytes for one translated block at a time (a 64-word guest
-/// block emits well under 4 KiB).
-pub const CODE_BYTES: usize = 256 * 1024;
+/// An immutable executable block. Its mapping lives as long as the resident
+/// dispatcher entry, so no later publication can change these instructions.
+pub struct HostCode {
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    _mapping: carrick_host_jit::JitCodeBuffer,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    entry: usize,
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+    _unsupported: core::convert::Infallible,
+}
 
 /// Runs translated blocks natively on a Linux arm64 host.
 pub struct HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    code: carrick_host_jit::JitCodeBuffer,
+    publication: carrick_host_jit::PublicationWork,
     /// The engine frame region: the frame is its last element, so everything
     /// below it is headroom for host signal frames.
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -45,14 +55,14 @@ pub struct HostBlockRunner {
 impl HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     pub fn publication_work(&self) -> carrick_host_jit::PublicationWork {
-        self.code.publication_work()
+        self.publication
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     pub fn new() -> Result<Self, HostError> {
         let frames = FRAME_REGION_BYTES / core::mem::size_of::<BlockFrame>();
         Ok(Self {
-            code: carrick_host_jit::JitCodeBuffer::new(CODE_BYTES).ok_or(HostError::Allocate)?,
+            publication: carrick_host_jit::PublicationWork::default(),
             region: vec![BlockFrame::default(); frames].into_boxed_slice(),
         })
     }
@@ -65,32 +75,61 @@ impl HostBlockRunner {
 
 impl ExecuteBlock for HostBlockRunner {
     type Error = HostError;
+    type Code = HostCode;
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn prepare(&mut self, block: &TranslatedBlock) -> Result<HostCode, HostError> {
+        let words = block.words();
+        #[cfg(target_endian = "little")]
+        // SAFETY: the initialized u32 slice contains contiguous little-endian
+        // instructions. The byte slice borrows exactly the same storage.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(words.as_ptr().cast(), size_of_val(words)) };
+        #[cfg(target_endian = "big")]
+        let little_endian: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        #[cfg(target_endian = "big")]
+        let bytes = little_endian.as_slice();
+        let mut mapping =
+            carrick_host_jit::JitCodeBuffer::new(bytes.len()).ok_or(HostError::Allocate)?;
+        let entry = mapping.publish(bytes);
+        let work = mapping.publication_work();
+        self.publication.publications += work.publications;
+        self.publication.mprotect_calls += work.mprotect_calls;
+        self.publication.icache_syncs += work.icache_syncs;
+        Ok(HostCode {
+            _mapping: mapping,
+            entry: entry.ok_or(HostError::Publish)? as usize,
+        })
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+    fn prepare(&mut self, _block: &TranslatedBlock) -> Result<HostCode, HostError> {
+        Err(HostError::UnsupportedHost)
+    }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     fn execute(
         &mut self,
-        block: &TranslatedBlock,
-        frame: &mut BlockFrame,
+        _block: &TranslatedBlock,
+        code: &HostCode,
+        cpu: &mut CpuState,
     ) -> Result<usize, HostError> {
-        let bytes: Vec<u8> = block.words().iter().flat_map(|w| w.to_le_bytes()).collect();
-        let entry = self.code.publish(&bytes).ok_or(HostError::Publish)?;
         let top = self.region.len() - 1;
-        self.region[top] = frame.clone();
+        self.region[top].load_from(cpu);
         // Derived from the whole region: host signal frames land below `top`.
         let slot = self.region.as_mut_ptr().wrapping_add(top);
-        // SAFETY: `entry` is the RX start of `block.words()`, an AAPCS64
+        // SAFETY: `code.entry` is the RX start of an emitted AAPCS64
         // function (translate::entry_stub/common_exit) that takes the frame
         // in x0, restores x19..x30 and host SP before returning the exit
         // index in x0, and touches no memory but the frame and the region
         // below it (memory words always exit). `slot` is the 16-byte aligned
-        // last frame of the live region, and `self.code` outlives the call.
+        // last frame of the live region, and `code` outlives the call.
         let index = unsafe {
-            let block_fn = core::mem::transmute::<usize, extern "C" fn(*mut BlockFrame) -> u64>(
-                entry as usize,
-            );
+            let block_fn =
+                core::mem::transmute::<usize, extern "C" fn(*mut BlockFrame) -> u64>(code.entry);
             block_fn(slot)
         };
-        frame.clone_from(&self.region[top]);
+        self.region[top].store_to(cpu);
         Ok(index as usize)
     }
 
@@ -98,7 +137,8 @@ impl ExecuteBlock for HostBlockRunner {
     fn execute(
         &mut self,
         _block: &TranslatedBlock,
-        _frame: &mut BlockFrame,
+        _code: &HostCode,
+        _cpu: &mut CpuState,
     ) -> Result<usize, HostError> {
         Err(HostError::UnsupportedHost)
     }
