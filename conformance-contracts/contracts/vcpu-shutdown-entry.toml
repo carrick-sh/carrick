@@ -95,6 +95,7 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::{host_request_during_service_park_yields_then_reparks,host_request_during_owner_wait_park_yields_then_reparks} (#1467: a host claimant interleaving with a running native service park is contention: the record leaves through its owner checkpoint with its exact operation, and the honoured request is handed back, never a carrier fatal; VM-free only)",
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
   "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
+  "carrick-x86-cpl0-host::carrier_cpu::tests::kicked_child_on_root_executor_keeps_its_issued_root (component: a kicked CPU switched to a registered child root captures that child's issued binding; red before #2581 fix; does not qualify KVM container shutdown)",
 ]
 embed = [
   "carrick-vmm-hvf::trap_engine_hvf::shutdown_kick::trap_engine_hvf_shutdown_kick_before_entry",
