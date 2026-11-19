@@ -1885,8 +1885,12 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     let setup = pending.lifecycle_available()
         && matches!(family, Family::Lifecycle(_))
         && matches!(ordinal, 99 | 132 | 135);
+    // Native select owns its park and its output even when the slot owes
+    // work. Let the IPC boundary settle that work, without replaying the
+    // descriptor wait on the carrier.
     let transfer = pending.ipc_available()
-        && matches!(family, Family::Read | Family::Write | Family::EpollWait);
+        && (matches!(family, Family::Read | Family::Write | Family::EpollWait)
+            || (family == Family::Poll && select_ordinal(CanonicalNr::new(ordinal))));
     let owned_descriptor = family == Family::Descriptor && pending.native_descriptor_owner();
     // Identity/resource operations complete synchronously under their owner.
     // Serve them before handing back metadata work; an absent owner still
