@@ -282,12 +282,18 @@ impl NativeSocketEpolls {
         let mut state = self.state.lock();
         let existing = state.keys.get(&key).copied();
         let events = LinuxEpollEvents::from_bits_retain(report.events);
+        match op {
+            LINUX_EPOLL_CTL_ADD => events.validate_add(false)?,
+            LINUX_EPOLL_CTL_MOD => {
+                events.validate_modify(existing.map_or_else(LinuxEpollEvents::empty, |token| {
+                    state.registrations[&token].events
+                }))?
+            }
+            _ => {}
+        }
         let new = match (op, existing) {
             (LINUX_EPOLL_CTL_ADD, Some(_)) => return Err(LINUX_EEXIST),
             (LINUX_EPOLL_CTL_ADD, None) => {
-                if events.contains(LinuxEpollEvents::EXCLUSIVE) {
-                    return Err(LINUX_EINVAL);
-                }
                 owner
                     .bind_socket_epoll_lock(key.epoll)
                     .map_err(|error| ctl_errno(error.into()))?;
@@ -323,9 +329,6 @@ impl NativeSocketEpolls {
                 Some(token)
             }
             (LINUX_EPOLL_CTL_MOD, Some(old)) => {
-                if events.contains(LinuxEpollEvents::EXCLUSIVE) {
-                    return Err(LINUX_EINVAL);
-                }
                 let token = state.generation()?;
                 let description = socket.description();
                 let watch = self.watch(&mut state, token, &description, events)?;

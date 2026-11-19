@@ -4812,10 +4812,12 @@ impl<'a> NetView<'a> {
                     _ => None,
                 })
                 .flatten();
-            let member = target_file
+            let (member, target_is_epoll) = target_file
                 .description
-                .inspect_kind(OpenDescription::zone_epoll_member)
-                .flatten();
+                .inspect_kind(|open| {
+                    (open.zone_epoll_member(), matches!(open, OpenDescription::Epoll { .. }))
+                })
+                .unwrap_or_default();
             if let (Some(zone), Some(member)) = (&zone, &member)
                 && zone.belongs_to(&member.owner)
             {
@@ -4882,6 +4884,11 @@ impl<'a> NetView<'a> {
                             Err(error) => return Ok(DispatchOutcome::from_owner_memory_error(error)
                                 .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
                         };
+                    if let Err(errno) = LinuxEpollEvents::from_bits_retain(event.events)
+                        .validate_add(target_is_epoll)
+                    {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
                     // The kernel rejects ADD of a target that has no ->poll support
                     // (regular files, directories) with EPERM. (LTP epoll_ctl02/05.)
                     if !this.fd_is_epollable(fd) {
@@ -5027,10 +5034,18 @@ impl<'a> NetView<'a> {
                             Err(error) => return Ok(DispatchOutcome::from_owner_memory_error(error)
                                 .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
                         };
-                    let Some(slot) = interest
+                    let slot = interest
                         .get_mut(&fd)
-                        .filter(|slot| epoll_slot_names_current_file(slot, &target_file.description))
-                    else {
+                        .filter(|slot| epoll_slot_names_current_file(slot, &target_file.description));
+                    let previous = slot.as_ref().map_or_else(LinuxEpollEvents::empty, |slot| {
+                        LinuxEpollEvents::from_bits_retain(slot.event.events)
+                    });
+                    if let Err(errno) = LinuxEpollEvents::from_bits_retain(event.events)
+                        .validate_modify(previous)
+                    {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    let Some(slot) = slot else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOENT));
                     };
                     // `register_io` re-arms the filters present in the new mask and

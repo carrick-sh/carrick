@@ -5944,20 +5944,19 @@ impl<
                         Err(error) => return map_fd_error(error),
                     };
                     let result = (|| {
-                        if native_service
-                            && matches!(
-                                IpcBacking::decode(description.backing),
-                                Some(IpcBacking::Host(_))
-                            )
-                        {
+                        let backing = IpcBacking::decode(description.backing);
+                        if native_service && matches!(backing, Some(IpcBacking::Host(_))) {
                             return FamilyCompletion::NativeHostFile;
                         }
-                        let Some((member, kind)) = IpcBacking::decode(description.backing)
-                            .and_then(EpollMember::of_backing)
-                        else {
-                            return FamilyCompletion::Forward;
-                        };
+                        let member = backing.and_then(EpollMember::of_backing);
+                        let nested_epoll =
+                            native_service && matches!(backing, Some(IpcBacking::Epoll { .. }));
                         let op = self.frame.argument(1).unwrap_or(0) as u32 as u64;
+                        if !(member.is_some()
+                            || nested_epoll && op == carrick_abi::LINUX_EPOLL_CTL_ADD)
+                        {
+                            return FamilyCompletion::Forward;
+                        }
                         let mut bytes = [0u8; 16];
                         let data_offset = if self.frame.arm_scheduler() { 8 } else { 4 };
                         let event_bytes = data_offset + 8;
@@ -5981,6 +5980,14 @@ impl<
                                 .try_into()
                                 .unwrap_or_default(),
                         );
+                        let Some((member, kind)) = member else {
+                            return match carrick_abi::LinuxEpollEvents::from_bits_retain(events)
+                                .validate_add(true)
+                            {
+                                Err(errno) => FamilyCompletion::Complete(errno.guest_retval()),
+                                Ok(()) => FamilyCompletion::Forward,
+                            };
+                        };
                         let key = pin.key();
                         let key =
                             (u64::from(key.index) << 32) | (key.generation & u64::from(u32::MAX));
