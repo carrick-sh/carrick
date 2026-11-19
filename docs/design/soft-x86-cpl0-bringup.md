@@ -640,19 +640,36 @@ no captured terminal worker event. Fixtures that deliberately deliver
 signals retain those terminal statuses in the census.
 
 The static glibc build of the same hello prints `hello, x86_64 world\n`
-and reaches the root-exit doorbell `0xd3` with SIGSEGV. The soft block
-trace immediately before the fatal fetch ends at `0x276c89`, whose
-terminator is `call *%rax` at `0x276c8f`. GDB observed CPL3
-`#PF(error=0x14, RIP=CR2=0xd7)` at the destination. The same ELF exits 0
-with the greeting on native Linux. Mounted at `/hello` in the KVM test's
-local empty-image layout, it prints the greeting and exits 139. The bad
-call target's provenance is unresolved in this sweep.
+and reaches the root-exit doorbell `0xd3` with SIGSEGV. On the rebased
+`#2541` CPL0 image, the soft block trace immediately before the fatal
+fetch demangles the initial exit-handler entry in `__run_exit_handlers`
+(`0x276bd8..0x276c0f`: `ror $0x11, %rax; xor %fs:0x30, %rax` with
+`fs_base = 0x31e400`) to `RAX = 0xd7` and executes `call *%rax` at
+`0x276c0f`, raising CPL3 `#PF(error=0x14, RIP=CR2=0xd7)` after block
+`629412`. The same ELF exits 0 with the greeting on native Linux, and
+exits 139 (`SIGSEGV`) on KVM. GDB traced `0xd7` to
+`carrick_x86_carrier::initial_boot::carrier_initial_boot`
+(`0xffffffff800037ee..0xffffffff800037f9`) and `carrick_x86_boot_iret`
+(`0xffffffff8013837c..0xffffffff8013838a`): CPL0 rings
+`X86_INITIAL_RUNNER_READY_PORT` (`0xd7`) via `out %al, (%dx)` and
+executes `push $0x1b; push %rsi; push $0x202; push $0x23; push %rdi;
+swapgs; iretq` without clearing `RDX` or the other general-purpose
+registers (leaving `RDX = 0xd7` plus supervisor addresses in `RAX`,
+`RCX`, `RBP`, and `R8` live at `_start` `0x23b580` on block `428316`).
+Under the System V AMD64 psABI, `%rdx` at `_start` is `rtld_fini` (`0`
+when entered directly from the kernel); `_start` forwards `RDX = 0xd7`
+in `%r9` to `__libc_start_main` (`0x2754f0`), which registers `0xd7` as
+an exit handler. Zeroing the 15 non-`RSP` GPRs in GDB immediately before
+`carrick_x86_boot_iret`'s `iretq` at `0xffffffff8013838a` makes the
+static glibc ELF exit 0 with `hello, x86_64 world\n` (`0xcb -> 0xd3`).
+Clearing initial user GPRs belongs to `carrick-x86-carrier` (shared by
+KVM and soft x86, outside the soft-backend fence).
 
 | Production soft witness | On #2541 | With slot retirement |
 | --- | --- | --- |
 | Static assembly hello | Exit 0, `hello\n` | Exit 0, `hello\n` |
 | Static musl hello | Exit 0, `hello, x86_64 world\n` | Exit 0, `hello, x86_64 world\n` |
-| Static glibc hello | `0xd3`, SIGSEGV after `hello, x86_64 world\n` | Same CPL3 fetch fault at `0xd7` |
+| Static glibc hello | `0xd3`, SIGSEGV after `hello, x86_64 world\n` | Same CPL3 fetch fault at `0xd7` (`carrick_x86_boot_iret` leaves `RDX = 0xd7`) |
 | Forked child stdout | Exit 7, `E` | Exit 7, `E` |
 | Robust raw exit, `TWO_LIVE` | Exit 0, empty stdout | Exit 0, empty stdout |
 | Child entropy and wait | Slot 7 rejected after `0xd6 → 0xcb`, empty stdout | Exit 8, empty stdout |
@@ -662,10 +679,20 @@ call target's provenance is unresolved in this sweep.
 
 The baseline captured 149 assembly and standalone Rust cases and 502
 musl conformance probes. Of those 651 rows, 430 reached an exit code
-and 83 stopped at the retired-slot check. After slot retirement was
-wired in, 68 of those 83 reached an exit code. The other 15 reached a
-different stop. An exit code records where execution ended, including
-fixture-defined refusal or mismatch codes.
+and 83 stopped at the retired-slot check. On the original `#2541`
+pre-host-clock base with slot retirement wired in, 68 of those 83
+reached an exit code and 15 reached another stop. Re-running the full
+651-fixture sweep on the rebased `#2541` base (host-clock APIC deadline
+waits and pre-`iretq` CPL0 slice accounting) with slot retirement brings
+the 83-row cohort to 70 exit codes (`proclife` and `sigtimedwaitintr`
+now exit 0, and `killfault` reaches the 4,000,000-block ceiling instead
+of the 65 s host deadline) and 13 other stops, and brings the full
+651-fixture population to 506 exit codes (`native_sibling_raw_exit`,
+`native_sibling_raw_exit.EDITOR_BUSY_ONCE`, `pagetablegrow`,
+`ptraceinvaliderrno`, `ptracetraceme`, and `traceexecstop` also exit 0,
+with zero 65 s host-deadline stops across all 651 rows). An exit code
+records where execution ended, including fixture-defined refusal or
+mismatch codes.
 
 
 <details>
@@ -1366,7 +1393,7 @@ fixture-defined refusal or mismatch codes.
 | `forkprotectexec` | `fault record: hypervisor operation failed: kernel fault policy refused: reason 0, FaultDoorbellRecord { vector: 6, error_code: 0, rip: 18446744071563412349, cs: 8, rsp: 18446744071841779544, rflags: 65538, saved_rax: 1, cr2: 584116007516 }` | `""` | `doorbell 0xc7 (fault record)` |
 | `forksigwalk` | `block budget exhausted, rip=0xffffffff8014871e cpl=0 cr3=0x4872000 blocks=4000000` | `""` | `doorbell 0xd2` |
 | `futexforkwakegroups` | `exit 0` | `"grandchild_fork_ok=true\nfork_ok=true\nchild_exit_ok=false\n"` | `doorbell 0xd3` |
-| `killfault` | `host deadline (65 s, status 124)` | `uncaptured` | — |
+| `killfault` | `block budget exhausted, rip=0xffffffff801832e0 cpl=0 cr3=0x4878000 blocks=4000000` | `""` | `doorbell 0xd8` |
 | `killgroup` | `exit 0` | `"child_caught_group_kill0=\0\n"` | `doorbell 0xd3` |
 | `killreap` | `block budget exhausted, rip=0xffffffff8001a366 cpl=0 cr3=0x4872000 blocks=4000000` | `""` | `doorbell 0xd1` |
 | `killrt` | `exit 0` | `"rt_code=-1 rt_value=0xcafe correct=1\n"` | `doorbell 0xd3` |
@@ -1390,7 +1417,7 @@ fixture-defined refusal or mismatch codes.
 | `pidnsorphanreap` | `exit 0` | `"reaped_two=true\nreaped_direct_child=true\nreaped_orphan_grandchild=true\n"` | `doorbell 0xd3` |
 | `pidnswait` | `exit 0` | `"both_children_alive=true\nforeign_pid_esrch=true\nwait_a_eq_fork_a=true\nwait_b_eq_fork_b=true\nchildren_distinct=true\n"` | `doorbell 0xd3` |
 | `procladder_epollmgr` | `exit 0` | `"mgr_forked_all=true\nmgr_children_ok=false\n"` | `doorbell 0xd3` |
-| `proclife` | `block budget exhausted, rip=0xffffffff80133190 cpl=0 cr3=0x487e000 blocks=4000000` | `"exit_normal reaped_match=true ifexited=true exitstatus=42 not_signaled=true\nexit_signalled reaped_match=true ifsignaled=true termsig=15 not_exited=true\nexecve_true ifexited=true exitstatus_match=false\nexecve_false ifexited=true exitstatus_match=false\n"` | `doorbell 0xd6` |
+| `proclife` | `exit 0` | `"exit_normal reaped_match=true ifexited=true exitstatus=42 not_signaled=true\nexit_signalled reaped_match=true ifsignaled=true termsig=15 not_exited=true\nexecve_true ifexited=true exitstatus_match=false\nexecve_false ifexited=true exitstatus_match=false\nwnohang first_zero=true final_match=true exitstatus=7\npgroup setpgid=ERR:1\nsession sid_pos=true setsid_failed_eperm=true\n"` | `doorbell 0xd3` |
 | `procpeerdir` | `exit 0` | `"peer_access=false\npeer_is_dir=false\npeer_opendir=false\npeer_task_dir=false\npeer_task_lists_leader=false\npeer_stat_file=false\npeer_in_proc=false\nself_numeric_dir=false\ndead_pid_enoent=true\n"` | `doorbell 0xd3` |
 | `ptraceattach` | `exit 0` | `"attach_nondumpable_eperm=false\n"` | `doorbell 0xd3` |
 | `ptracekillcont` | `exit 0` | `"kill_plain_ok=false\nkill_plain_ptrace_errno=0\nkill_plain_final_errno=38\nkill_plain_cleanup_no_child=false\nkill_plain_cleanup_rc=-1\nkill_plain_cleanup_errno=38\nkill_handler_ok=false\nkill_handler_ptrace_errno=0\nkill_handler_final_errno=38\nkill_handler_cleanup_no_child=false\nkill_handler_cleanup_rc=-1\nkill_handler_cleanup_errno=38\ncont_plain_ok=false\ncont_plain_ptrace_errno=0\ncont_plain_final_errno=38\ncont_plain_cleanup_no_child=false\ncont_plain_cleanup_rc=-1\ncont_plain_cleanup_errno=38\ncont_handler_ok=false\ncont_handler_ptrace_errno=0\ncont_handler_final_errno=38\ncont_handler_cleanup_no_child=false\ncont_handler_cleanup_rc=-1\ncont_handler_cleanup_errno=38\n"` | `doorbell 0xd3` |
@@ -1402,7 +1429,7 @@ fixture-defined refusal or mismatch codes.
 | `setpgidparentgroup` | `exit 0` | `"child_joins_parent_group=true\n"` | `doorbell 0xd3` |
 | `sigbadstack` | `exit 0` | `"child_killed_by_signal=true\nchild_wtermsig_sigsegv=true\n"` | `doorbell 0xd3` |
 | `signalexit` | `exit 0` | `"sigterm_wifsignaled=true\nsigterm_wtermsig_matches=true\nsigkill_wifsignaled=true\nsigkill_wtermsig_matches=true\nclean_exit_not_signalled=true\nclean_exit_status_zero=true\n"` | `doorbell 0xd3` |
-| `sigtimedwaitintr` | `block budget exhausted, rip=0xffffffff80132cbc cpl=0 cr3=0x4873000 blocks=4000000` | `"eintr_on_caught_nonset=true\nhandler_ran=true\nwaitset_signum_ok=true\nwaitset_si_code_is_user=true\nwaitset_si_pid_is_child=true\neagain_on_timeout=true\nsigchld_ignored_no_eintr=true\nrt_signum_ok=true\nrt_si_signo_ok=true\nrt_si_code_is_user=true\nrt_si_pid_is_child=true\n"` | `doorbell 0xd2` |
+| `sigtimedwaitintr` | `exit 0` | `"eintr_on_caught_nonset=true\nhandler_ran=true\nwaitset_signum_ok=true\nwaitset_si_code_is_user=true\nwaitset_si_pid_is_child=true\neagain_on_timeout=true\nsigchld_ignored_no_eintr=true\nrt_signum_ok=true\nrt_si_signo_ok=true\nrt_si_code_is_user=true\nrt_si_pid_is_child=true\nbad_info_efault=true\nhandler_total_ok=true\n"` | `doorbell 0xd3` |
 | `sysvmsg` | `exit 0` | `"msgget_ok=true\nsend_recv_roundtrip=true\nqnum_after_send_is_1=true\nqnum_after_recv_is_0=true\nproc_sysvipc_msg_present=false\nproc_sysvipc_msg_live_queue=false\ntype_selective_recv=true\nxprocess_send_recv=true\nipc_rmid_ok=true\n"` | `doorbell 0xd3` |
 | `sysvmsgwake` | `exit 0` | `"nowait_empty_enomsg=true\nnowait_full_eagain=true\nfork_reader_wakes_sender=true\nrmid_wakes_receiver=false\n"` | `doorbell 0xd3` |
 | `usernsisolation` | `exit 0` | `"parent_before_uid_map=err=38\nparent_before_gid_map=err=38\nparent_before_setgroups=err=38\nchild_unshare_newuser_rc=-38\nchild_exit=0\nparent_after_uid_map=err=38\nparent_after_gid_map=err=38\nparent_after_setgroups=err=38\n"` | `doorbell 0xd3` |
