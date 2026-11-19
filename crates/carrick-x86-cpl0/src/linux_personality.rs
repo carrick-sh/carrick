@@ -836,9 +836,12 @@ fn native_exec_call(
                     restart_native_syscall(frame, ordinal);
                     CompletionRoute::Served
                 }
-                UserFaultSupply::Signal { .. }
-                | UserFaultSupply::Contended(_)
-                | UserFaultSupply::Unresolved(_) => {
+                UserFaultSupply::Contended(cancelled) => {
+                    let _: carrick_sched_core::spaces::notification::SpaceWaitCause = cancelled;
+                    frame.rax = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
+                    CompletionRoute::Served
+                }
+                UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
                     frame.rax = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
                     CompletionRoute::Served
                 }
@@ -1554,9 +1557,14 @@ impl Personality for LinuxPersonality {
                             // The owner refused or could not supply the
                             // access (no reservation names it): never a
                             // carrier abort.
-                            UserFaultSupply::Signal { .. }
-                            | UserFaultSupply::Contended(_)
-                            | UserFaultSupply::Unresolved(_) => Some(stage.refused()),
+                            UserFaultSupply::Contended(cancelled) => {
+                                let _: carrick_sched_core::spaces::notification::SpaceWaitCause =
+                                    cancelled;
+                                Some(stage.refused())
+                            }
+                            UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
+                                Some(stage.refused())
+                            }
                         }
                     }
                     None => Some(stage),
