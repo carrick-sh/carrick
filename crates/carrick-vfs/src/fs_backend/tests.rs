@@ -3616,6 +3616,49 @@ mod serial_host {
         assert_ne!(decoded, "cafe\u{0301}".as_bytes());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immutable_lower_open_defers_parent_and_directory_semantics() {
+        let (backend, _scratch) = host_backend();
+        backend
+            .set_file_contents("/real/file.txt", vec![1])
+            .unwrap();
+        backend.make_dir("/nested/subdir").unwrap();
+        backend.symlink("nested/subdir", "/link").unwrap();
+        backend.set_file_contents("/regular", vec![2]).unwrap();
+
+        reset_test_host_openat_count();
+        assert!(matches!(
+            backend.open_immutable_file_readonly("/real/file.txt"),
+            ImmutableHostFileOpen::Served { .. }
+        ));
+        assert!(test_host_openat_count() > 0);
+
+        for path in [
+            "/link/../real/file.txt",
+            "/missing/../real/file.txt",
+            "/regular/../real/file.txt",
+            "/real/file.txt/",
+            "/real/file.txt/.",
+        ] {
+            reset_test_host_openat_count();
+            reset_test_host_stat_count();
+            assert!(
+                matches!(
+                    backend.open_immutable_file_readonly(path),
+                    ImmutableHostFileOpen::Fallback
+                ),
+                "immutable lower must defer {path} to the resolver"
+            );
+            assert_eq!(
+                test_host_openat_count(),
+                0,
+                "attempted host open for {path}"
+            );
+            assert_eq!(test_host_stat_count(), 0, "attempted host stat for {path}");
+        }
+    }
+
     /// Immutable-lower `open_immutable_file_readonly` and
     /// `RootFsVfs::open_immutable_lower_readonly` must NEVER treat an ancestor
     /// symlink as a proven `Missing` (or serve a stale lower file through it).
