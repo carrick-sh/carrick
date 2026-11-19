@@ -25,5 +25,5 @@ vm_free = [
 ]
 
 [bindings.unresolved]
-embed = "The signed HVF embed lane uses hardware AArch64 execution. The native software translator witness belongs on a Linux AArch64 runner."
+embed_structural = "The signed HVF embed lane uses hardware AArch64 execution. The native software translator witness belongs on a Linux AArch64 runner."
 docker = "ARM execution on the worker requires a native AArch64 host. No cached native arm64 Docker rootfs is present on the x86 worker."
