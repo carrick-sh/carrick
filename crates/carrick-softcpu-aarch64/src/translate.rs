@@ -22,6 +22,8 @@ use alloc::vec::Vec;
 pub enum CopyKind {
     /// The guest word runs unchanged.
     Verbatim,
+    /// Use a plain NOP so host CPU extensions cannot execute a guest hint.
+    NoOperation,
     /// The word names SP; it runs against a scratch register holding guest SP.
     StackPointer,
     /// ADR/ADRP: the guest PC is known, so Rd is loaded with an immediate.
@@ -99,6 +101,7 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
         | Instruction::Barrier(_)
         | Instruction::CensusGap(Decoded::VariableShift { .. } | Decoded::OneSource { .. })
         | Instruction::Hint(Hint::Nop | Hint::Yield) => InstructionClass::Copy(CopyKind::Verbatim),
+        Instruction::CompatibilityHint => InstructionClass::Copy(CopyKind::NoOperation),
         Instruction::Address(_) => InstructionClass::Copy(CopyKind::PcRelative),
         Instruction::Hint(hint) => InstructionClass::Exit(ExitReason::Hint(hint)),
         Instruction::ScalarMemory(_)
@@ -777,6 +780,7 @@ pub fn emit_block(guest: &GuestBlock) -> Result<TranslatedBlock, TranslateError>
     for i in &guest.instructions {
         match i.class {
             InstructionClass::Copy(CopyKind::Verbatim) => e.words.push(i.word),
+            InstructionClass::Copy(CopyKind::NoOperation) => e.words.push(0xd503_201f),
             InstructionClass::Copy(CopyKind::StackPointer) => {
                 let s = scratch_for(i.word);
                 let (word, writes) =
