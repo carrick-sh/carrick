@@ -26,6 +26,14 @@ pub use prepared::ClaimedPreparedCopy;
 pub use stock::{PrivateStockPlan, STOCK_OBSERVATIONS, StockExclusions, StockPolicy};
 pub use storage::ResolvedReservationNodes;
 
+/// Placement authority available for a private anonymous advisory hint.
+pub enum AnonymousHintVenue {
+    /// A ring-only MM can use its allocation layout without a raw crossing.
+    Ring,
+    /// Host VMA and aperture checks authorized this optional outside range.
+    Host { external: Option<ReservationRange> },
+}
+
 /// One prepared image mapping. The caller retains every referenced backing
 /// until the unpublished MM is adopted or its physical rollback settles.
 #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
@@ -2598,6 +2606,38 @@ impl<
     ) -> Result<Decision, Refusal> {
         Policy::mmap(self, placement, GuestLen::new(len), prot)
     }
+    /// Settle a private anonymous hint through this MM's allocation owner.
+    /// A host-authorized external placement takes precedence over relocation.
+    pub fn mmap_with_advisory_hint(
+        &mut self,
+        placement: Placement,
+        len: u64,
+        prot: ReservationProtection,
+        venue: AnonymousHintVenue,
+    ) -> Result<Decision, Refusal> {
+        if let AnonymousHintVenue::Host {
+            external: Some(range),
+        } = venue
+        {
+            match self.prepare_external_anonymous(range, prot) {
+                Err(Refusal::Collision | Refusal::ForeignMapping | Refusal::Hole) => {}
+                result => return result,
+            }
+        }
+        match self.mmap(placement, len, prot) {
+            Err(Refusal::ForeignMapping) if matches!(placement, Placement::Hint(_)) => {
+                match self.mmap(Placement::Anywhere, len, prot) {
+                    // The host still has an alias-gap search outside this layout.
+                    Err(Refusal::Limit) if matches!(venue, AnonymousHintVenue::Host { .. }) => {
+                        Err(Refusal::ForeignMapping)
+                    }
+                    result => result,
+                }
+            }
+            result => result,
+        }
+    }
+
     /// Map `len` bytes privately from a retained host byte source.
     pub fn mmap_private_file(
         &mut self,

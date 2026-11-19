@@ -4,6 +4,7 @@
 .global _start
 .text
 _start:
+#ifndef EXEC_SUCCESSOR
     mov $57, %eax
     syscall
     test %eax, %eax
@@ -33,6 +34,7 @@ _start:
     jmp exit
 
 child:
+#endif
     mov $0x10000000, %edi
     call reserve
     mov %rax, %r14
@@ -43,6 +45,11 @@ child:
     cmpb $51, (%r14)
     jne failure
     mov %r14, %rdi
+    call release
+
+    movabs $0x200000000, %rdi
+    call reserve
+    mov %rax, %rdi
     call release
 
     /* The next advisory hint collides with the still-live anonymous range. */
@@ -90,6 +97,9 @@ reserve:
     ret
 mmap_errno:
     neg %eax
+#ifdef EXEC_SUCCESSOR
+    add $100, %eax
+#endif
     mov %eax, %edi
     jmp exit
 writable:

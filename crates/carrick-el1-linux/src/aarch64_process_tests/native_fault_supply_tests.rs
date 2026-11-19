@@ -397,19 +397,6 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             residency: &residency,
         };
         let mut call = |nr, args: [u64; 6]| {
-            let mut invocation = carrick_el1::memory::AnonymousCall::new(
-                carrick_core::CallOrdinal::from_raw(nr),
-                args,
-                0,
-                fixture.slot,
-                UserVa::new(0x40004),
-            );
-            let mut venue = FixtureAnonymousVenue {
-                call: &mut invocation,
-                fixture,
-                counters: &counters,
-                editor: &mut editor,
-            };
             frame.x[8] = nr;
             frame.x[..6].copy_from_slice(&args);
             let route = loan_call_with_anonymous(
@@ -419,15 +406,21 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                 &mut cpu,
                 &mut service,
                 &counters,
-                Some(&mut venue),
+                Some(&mut editor),
             );
             assert_eq!(counters.forwarded[nr as usize].load(Ordering::Relaxed), 0);
-            assert_eq!(
-                route,
-                carrick_personality_linux::dispatch::CompletionRoute::Served
+            use carrick_personality_linux::dispatch::CompletionRoute;
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "nr={nr} args={args:?} route={route:?}"
             );
+            if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+                work.settled();
+            }
+            let _ = fixture.task.linux.take_served_boundary();
             frame.x[0] as i64
         };
+        fixture.task.linux.mark_pending_host_work();
         for hint in [0x10000000, 0x200000000, 0x1000000000000000, 0] {
             let mapped = call(222, [hint, LENGTH, 0, 0x4022, u64::MAX, 0]);
             assert!(
@@ -1132,6 +1125,7 @@ struct FixtureAnonymousVenue<'a, 'words> {
     fixture: &'static Fixture,
     counters: &'a carrick_el1_abi::Counters,
     editor: &'a mut FixtureMapping<'words>,
+    origin: carrick_core_abi::service::ServiceOrigin,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1159,7 +1153,10 @@ impl carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
             crate::sched::object_wait::space_access(self.fixture.zone, self.fixture.slot),
             self.fixture.region.table(),
             self.editor,
-            None,
+            carrick_el1::memory::NativeMapping {
+                file: None,
+                origin: self.origin,
+            },
         ) {
             DelegatedAnonymous::Served => {
                 DelegatedStep::Served(SyscallResult::new(self.call.result().0 as i64))
@@ -1215,7 +1212,7 @@ fn loan_call_with_anonymous(
     cpu: &mut crate::sched::FakeCpu,
     service: &mut Aarch64NativeProcessService<'static, &'static TestStockCrossing>,
     counters: &carrick_el1_abi::Counters,
-    anonymous: Option<&mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue>,
+    editor: Option<&mut FixtureMapping<'_>>,
 ) -> carrick_personality_linux::dispatch::CompletionRoute {
     let current = fixture.zone.slot(fixture.slot).current().unwrap();
     let identity = fixture.zone.record(current).identity();
@@ -1264,6 +1261,27 @@ fn loan_call_with_anonymous(
         control,
         service,
         |process| {
+            use carrick_core_abi::service::ServiceOrigin;
+            use carrick_personality_linux::pending_anonymous::PendingAnonymousVenue;
+            let mut invocation = carrick_el1::memory::AnonymousCall::new(
+                carrick_core::CallOrdinal::from_raw(frame.x[8]),
+                frame.x[..6].try_into().unwrap(),
+                0,
+                fixture.slot,
+                UserVa::new(frame.elr),
+            );
+            let origin = if process.is_root_process() {
+                ServiceOrigin::Initial
+            } else {
+                ServiceOrigin::Descendant
+            };
+            let mut venue = editor.map(|editor| FixtureAnonymousVenue {
+                call: &mut invocation,
+                fixture,
+                counters,
+                editor,
+                origin,
+            });
             let route = crate::dispatch::dispatch_syscall_with_native(
                 frame,
                 counters,
@@ -1285,7 +1303,9 @@ fn loan_call_with_anonymous(
                     zone: fixture.zone,
                     slot: fixture.slot,
                 }),
-                anonymous,
+                venue
+                    .as_mut()
+                    .map(|venue| venue as &mut dyn PendingAnonymousVenue),
                 |_| core::ptr::null_mut(),
             );
             assert!(
@@ -5544,6 +5564,7 @@ fn native_owner_code_range(whole: bool) {
             fixture,
             counters: &counters,
             editor: &mut editor,
+            origin: carrick_core_abi::service::ServiceOrigin::Initial,
         };
         let before = counters.served[nr as usize].load(Ordering::Relaxed);
         let route = fixture

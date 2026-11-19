@@ -690,7 +690,7 @@ impl Frames {
                 "anonymous munmap",
                 entry
                     + self.required("::dispatch::dispatch_syscall::")?
-                    + self.required("::serve_delegated_anonymous::")?
+                    + self.required("::serve_delegated_anonymous_for_origin::")?
                     + self.maximum("::protect_existing_el1_private_pages::")
                     + descriptors,
             ),
@@ -865,7 +865,7 @@ mod tests {
             "x::settle_native_descriptor_reply::h0",
             "x::setup_arm_signal_frame::h0",
             "x::restore_live_arm_signal_frame::h0",
-            "x::serve_delegated_anonymous::h0",
+            "x::serve_delegated_anonymous_for_origin::h0",
             "x::serve_grant_hw::h0",
             "x::serve_backing_maintenance_hw::h0",
         ] {

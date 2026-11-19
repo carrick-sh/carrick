@@ -1,5 +1,6 @@
 // CPL0 binding of the shared Linux anonymous reservation owner and native
 // descriptor editor. Physical returns remain journaled for owner settlement.
+use carrick_core_abi::service::ServiceOrigin;
 use carrick_el1::memory::reservations::{X86Cpl0Zone, shared_x86_cpl0_guest};
 use carrick_el1::memory::{AnonymousCall, AnonymousCallView};
 use carrick_el1::memory::{X86AnonymousDecode, classify_anonymous_range};
@@ -29,6 +30,7 @@ pub(super) struct X86AnonymousVenue<'a> {
     saved: ParkedContextWords,
     handoff: Option<carrick_el1_abi::EntryHandoffReceipt<ParkedContextWords>>,
     retry: bool,
+    origin: ServiceOrigin,
 }
 impl<'a> X86AnonymousVenue<'a> {
     pub(super) fn new(
@@ -38,6 +40,7 @@ impl<'a> X86AnonymousVenue<'a> {
         return_pc: u64,
         source: BornInZoneSource<'static, ParkedContextWords>,
         saved: ParkedContextWords,
+        origin: ServiceOrigin,
     ) -> Option<Self> {
         let frame = crate::anonymous_call(*call, slot, UserVa::new(return_pc))?;
         Some(Self {
@@ -47,6 +50,7 @@ impl<'a> X86AnonymousVenue<'a> {
             saved,
             handoff: None,
             retry: false,
+            origin,
         })
     }
     pub(super) fn take_retry(&mut self) -> bool {
@@ -247,7 +251,10 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
             carrick_core::wait::space_access(zone, slot, crate::native_process::release),
             shared_x86_cpl0_guest(),
             &mut editor,
-            file,
+            carrick_el1::memory::NativeMapping {
+                file,
+                origin: self.origin,
+            },
         ) {
             carrick_el1::memory::DelegatedAnonymous::Served => {
                 // A parked edit's token outlives its wake; the replay owns it.
@@ -319,7 +326,7 @@ impl X86AnonymousVenue<'_> {
             EditWaitOutcome, ObjectParkRequest, coordinate_anonymous_edit_wait,
             park_object_record_rechecked, space_access,
         };
-        use carrick_el1::memory::{ReservationDisposition, decide_reservation_syscall};
+        use carrick_el1::memory::{ReservationDisposition, decide_reservation_syscall_for_origin};
         use carrick_sched_core::Waker;
         let zone = self.source.zone;
         let slot = self.source.slot;
@@ -338,6 +345,7 @@ impl X86AnonymousVenue<'_> {
         // Take the retained operation only now that this call is an anonymous
         // edit: any other syscall's operation (a timed poll's park) stays on
         // its record for the call's own owner to resume.
+        let origin = self.origin;
         let resumed = zone
             .slot(slot)
             .current()
@@ -382,7 +390,7 @@ impl X86AnonymousVenue<'_> {
                     }
                     Err(_) => return None,
                 };
-                match decide_reservation_syscall(frame, task, &mut root, None) {
+                match decide_reservation_syscall_for_origin(frame, task, &mut root, None, origin) {
                     ReservationDisposition::Unavailable(
                         carrick_el1::memory::reservations::Refusal::PreparedConflict,
                     ) => return Some(Some(SpaceWaitCause::PreparedOverlap)),

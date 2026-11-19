@@ -3189,6 +3189,13 @@ impl<
     fn may_serve_poll(&self) -> bool {
         self.frame.may_serve_poll()
     }
+    fn may_complete_advisory_mmap_before_work(&self) -> bool {
+        self.service_origin() == carrick_core_abi::service::ServiceOrigin::Descendant
+            && memory::may_complete_advisory_mmap_before_work(
+                self.frame.argument(3).unwrap_or(0),
+                self.frame.argument(2).unwrap_or(0),
+            )
+    }
     fn native_descriptor_owner(&self) -> bool {
         matches!(
             self.native_descriptor_namespace(),
@@ -3799,15 +3806,7 @@ impl<
     fn record_refusal(&self, bucket: usize) {
         self.counters.record_refusal(
             carrick_guest_arch::NativeOrdinal::new(bucket as u64),
-            if self
-                .process
-                .as_deref()
-                .is_some_and(|process| !process.is_root_process())
-            {
-                carrick_core_abi::service::ServiceOrigin::Descendant
-            } else {
-                carrick_core_abi::service::ServiceOrigin::Initial
-            },
+            self.service_origin(),
             carrick_el1_abi::RefusalVenue::Ring,
         );
     }
@@ -4137,6 +4136,7 @@ impl<
                 &take.orphans,
             );
         }
+        let origin = self.service_origin();
         let file = take.matched;
         match memory::serve_delegated_mapping(
             match self.frame.arm_frame() {
@@ -4151,7 +4151,7 @@ impl<
             access,
             memory::reservations::shared_guest(),
             &mut memory::HardwareAnonymousEditor,
-            file,
+            memory::NativeMapping { file, origin },
         ) {
             memory::DelegatedAnonymous::Contended(cause) => DelegatedStep::Contended(cause),
             memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
@@ -4235,6 +4235,7 @@ impl<
         &mut self,
         cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
     ) -> Option<FamilyCompletion> {
+        let origin = self.service_origin();
         let slot = self.frame.slot()?;
         let task = self.current_tasks.get(self.frame.task_index())?;
         let zone = self.zone.as_mut()?;
@@ -4245,6 +4246,7 @@ impl<
                 self.frame.arm_frame()?,
                 memory::reservations::shared_guest(),
                 cause,
+                origin,
             )?
         };
         Some(
@@ -4515,6 +4517,19 @@ impl<
     Context: DispatchContext,
 > El1PendingFamilies<'_, '_, F, C, U, G, Context>
 {
+    fn service_origin(&self) -> carrick_core_abi::service::ServiceOrigin {
+        use carrick_core_abi::service::ServiceOrigin;
+        if self
+            .process
+            .as_deref()
+            .is_some_and(|process| !process.is_root_process())
+        {
+            ServiceOrigin::Descendant
+        } else {
+            ServiceOrigin::Initial
+        }
+    }
+
     fn native_descriptor_namespace(&self) -> NativeDescriptorNamespace {
         let native = self
             .process

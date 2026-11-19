@@ -10559,6 +10559,7 @@ fn arm_caught_signal_returns_then_reexecutes_parked_anonymous_edit() {
             &mut frame,
             fixture.region.table(),
             SpaceWaitCause::Reservations,
+            carrick_core_abi::service::ServiceOrigin::Initial,
         ),
         Some(Served::Idle)
     );
@@ -10986,6 +10987,7 @@ fn arm_terminal_entries_release_parked_anonymous_edit() {
                 &mut frame,
                 fixture.region.table(),
                 SpaceWaitCause::Reservations,
+                carrick_core_abi::service::ServiceOrigin::Initial,
             ),
             Some(Served::Idle),
             "terminal={terminal:?}"

@@ -5,6 +5,7 @@ use carrick_core::wait::{
     EditWaitOutcome, EditWaitTarget, OperationResumePc, coordinate_anonymous_edit_wait,
     coordinate_prepared_edit_wait,
 };
+use carrick_core_abi::service::ServiceOrigin;
 use carrick_el1::memory::reservations::SharedReservations;
 use carrick_el1::substrate::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1_abi::{ReservationMm, ReservationRange, TrapFrame};
@@ -111,12 +112,14 @@ pub fn park_anonymous_edit<C: ThreadCpu, U: UserWord>(
     frame: &mut TrapFrame,
     table: &SharedReservations,
     initial_cause: SpaceWaitCause,
+    origin: ServiceOrigin,
 ) -> Option<Served> {
     park_anonymous_edit_with_allocator(
         sched,
         frame,
         table,
         initial_cause,
+        origin,
         &carrick_el1::alloc::GLOBAL_ALLOCATOR,
         None,
     )
@@ -138,6 +141,7 @@ pub fn park_settling_anonymous_edit<C: ThreadCpu, U: UserWord>(
         frame,
         table,
         SpaceWaitCause::Reservations,
+        ServiceOrigin::Descendant,
         &carrick_el1::alloc::GLOBAL_ALLOCATOR,
         Some(ring),
     )
@@ -148,6 +152,7 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
     frame: &mut TrapFrame,
     table: &SharedReservations,
     _initial_cause: SpaceWaitCause,
+    origin: ServiceOrigin,
     metadata: &impl carrick_core::mm::reservation::ReservationMetadataAllocator,
     settle: Option<&dyn Fn(&mut carrick_el1_abi::ReturnSettlementDoorbell)>,
 ) -> Option<Served> {
@@ -192,8 +197,11 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
                 }
                 Err(_) => return None,
             };
-            use carrick_el1::memory::{ReservationDisposition, decide_reservation_syscall};
-            let decision = decide_reservation_syscall(frame, task, &mut root, None);
+            use carrick_el1::memory::{
+                ReservationDisposition, decide_reservation_syscall_for_origin,
+            };
+            let decision =
+                decide_reservation_syscall_for_origin(frame, task, &mut root, None, origin);
             match decision {
                 ReservationDisposition::Unavailable(
                     carrick_el1::memory::reservations::Refusal::PreparedConflict,
