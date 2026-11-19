@@ -1527,6 +1527,22 @@ mod tests {
             Some((table, 3)),
             "selected in the caller's own table"
         );
+        for spelling in ["/proc/self/fd/3", "/dev/fd/3"] {
+            let served = prepare_native_exec_image(
+                &capability,
+                &sealed_with_table(
+                    native_exec_payload(ExecCall::Execve, spelling),
+                    "/tmp",
+                    Some(table),
+                ),
+                |selected, fd| {
+                    assert_eq!((selected, fd), (table, 3));
+                    Ok(opened.clone())
+                },
+            )
+            .map(|loaded| loaded.source.resolved_path().to_owned());
+            assert_eq!(served, Ok(absolute.clone()), "opened object for {spelling}");
+        }
         // A closed descriptor is EBADF, as Linux reports it.
         assert_eq!(
             prepare_native_exec_image(&capability, &payload(Some(table)), |_, _| {
@@ -1977,5 +1993,37 @@ mod tests {
         .expect("fexecve loads the open file");
         assert_eq!(asked, Some((table, 3)));
         assert_eq!(by_descriptor.entry().entry.raw(), 0x401000);
+
+        for spelling in ["/proc/self/fd/3", "/dev/fd/3"] {
+            let image = prepare_native_x86_exec_image(
+                &capability,
+                &x86_exec_payload(ExecCall::Execve, spelling, &[b"opened"], Some(table)),
+                |selected, fd| {
+                    assert_eq!((selected, fd), (table, 3));
+                    Ok(ExecSource::host(
+                        std::fs::File::open(&opened).unwrap(),
+                        opened.to_str().unwrap().to_owned(),
+                    )
+                    .unwrap())
+                },
+            )
+            .expect("execve of an fd path loads the open file");
+            assert_eq!(image.entry().entry.raw(), 0x401000);
+        }
+        for (spelling, errno) in [
+            ("/proc/self/fd/9", carrick_abi::LINUX_ENOENT),
+            ("/proc/self/fd/3/", carrick_abi::LINUX_ENOTDIR),
+            ("/proc/self/exe", carrick_abi::LINUX_ENOSYS),
+        ] {
+            let result = prepare_native_x86_exec_image(
+                &capability,
+                &x86_exec_payload(ExecCall::Execve, spelling, &[b"opened"], Some(table)),
+                |selected, fd| {
+                    assert_eq!((selected, fd), (table, 9));
+                    Err(carrick_abi::LINUX_EBADF)
+                },
+            );
+            assert_eq!(result.map(|_| ()), Err(errno), "{spelling}");
+        }
     }
 }
