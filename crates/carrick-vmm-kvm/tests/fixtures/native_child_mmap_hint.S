@@ -38,6 +38,8 @@ child:
     mov $0x10000000, %edi
     call reserve
     mov %rax, %r14
+    mov $5, %edx
+    call protect
     call writable
     cmpb $0, (%r14)
     jne failure
@@ -103,9 +105,10 @@ mmap_errno:
     mov %eax, %edi
     jmp exit
 writable:
+    mov $3, %edx
+protect:
     mov %r14, %rdi
     mov $4096, %esi
-    mov $3, %edx
     mov $10, %eax
     syscall
     test %eax, %eax

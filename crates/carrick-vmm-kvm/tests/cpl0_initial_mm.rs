@@ -180,7 +180,7 @@ fn serial_host_native_exec_successor_advisory_mmap_stays_in_ring() {
         outcome.run.exit_code,
         0,
         "exec successor: mmap errno plus 100. mmap served={}, refused={}, anonymous leaves={:?}",
-        load(&counters.served[9]),
+        load(&counters.served[222]),
         load(&counters.refused[9]),
         counters.anonymous_leaves.each_ref().map(load),
     );
