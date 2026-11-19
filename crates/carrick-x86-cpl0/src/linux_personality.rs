@@ -1051,37 +1051,68 @@ fn supply_user_fault(
                 }
                 return UserFaultSupply::Unresolved(9);
             };
+            let Some(carrier) = portal.carrier() else {
+                return UserFaultSupply::Unresolved(9);
+            };
             let Some(index) = spaces.find(mm_key) else {
                 return UserFaultSupply::Unresolved(9);
             };
-            let Ok(mut root) =
-                roots.lock_in(spaces, index.index(), window.operation.mm, binding.cpu_slot)
-            else {
-                return UserFaultSupply::Unresolved(9);
-            };
-            let Ok(target) = carrick_core::mm::frames::grant_target_in(
-                match portal.carrier() {
-                    Some(carrier) => carrier,
-                    None => return UserFaultSupply::Unresolved(9),
-                },
-                &window,
-                spaces,
-                binding.cpu_slot,
-                &mut root,
-            ) else {
-                return UserFaultSupply::Unresolved(9);
-            };
-            let receipt = carrick_core::mm::frames::apply_grant::<
-                carrick_mmu_core::x86::owner_mmu::X86Mmu,
-                _,
-            >(grant_slot, &words, residency, target, || {});
-            drop(root);
-            let applied = receipt.is_some_and(|receipt| {
-                matches!(
-                    receipt.outcome,
-                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
-                )
-            });
+            let mut applied = false;
+            for attempt in 0..2 {
+                let observed_retirement = residency.retirement_epoch();
+                let Ok(mut root) =
+                    roots.lock_in(spaces, index.index(), window.operation.mm, binding.cpu_slot)
+                else {
+                    return UserFaultSupply::Unresolved(9);
+                };
+                let Ok(target) = carrick_core::mm::frames::grant_target_in(
+                    carrier,
+                    &window,
+                    spaces,
+                    binding.cpu_slot,
+                    &mut root,
+                ) else {
+                    return UserFaultSupply::Unresolved(9);
+                };
+                // SAFETY: `residency` and `GLOBAL_ALLOCATOR` share CPL0's guest venue.
+                let view = unsafe { residency.guest_view() };
+                let outcome = carrick_core::mm::frames::try_apply_grant::<
+                    carrick_mmu_core::x86::owner_mmu::X86Mmu,
+                    _,
+                >(grant_slot, &words, &view, target, || {});
+                drop(root);
+                match outcome {
+                    carrick_core::mm::frames::GrantApplyOutcome::Completed(receipt) => {
+                        applied = matches!(
+                            receipt.outcome,
+                            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(
+                                _
+                            )
+                        );
+                        break;
+                    }
+                    carrick_core::mm::frames::GrantApplyOutcome::Empty => break,
+                    carrick_core::mm::frames::GrantApplyOutcome::ResidencyCapacity {
+                        observed_extensions,
+                    } => {
+                        match carrick_core::mm::frames::grow_residency_or_not_now(
+                            residency,
+                            &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+                            observed_extensions,
+                            observed_retirement,
+                            None,
+                        ) {
+                            Ok(()) => continue,
+                            Err(continuation)
+                                if attempt == 0 && continuation.ready_to_retry(residency) =>
+                            {
+                                continue;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
