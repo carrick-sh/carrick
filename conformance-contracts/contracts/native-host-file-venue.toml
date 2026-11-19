@@ -33,7 +33,11 @@ dispatcher's syscalls byte for byte and prove the in-zone routing.
 and description cores. Initial tasks keep their existing host-task route;
 Write admission and inherited redirected-description custody are unchanged.
 There is no new host task, named-description index, lock or lifetime owner.
-Paired paths carry two NUL-delimited names. At lengths 1 and 4095, aligned
+Relative paths through host-backed directories carry the caller's dirfd.
+The carrier pins each distinct relative operand in the caller's ring table
+and reuses the filesystem resolver under the caller's credentials and root.
+An absolute operand ignores its dirfd. Paired paths carry two NUL-delimited
+names and independently identify the destination directory when needed. At lengths 1 and 4095, aligned
 and mixed-alignment staging requires at most four page-bounded input copies,
 at most 8192 copied bytes and at most 8191 encoded input bytes, with no
 output preparation. These deterministic unit assertions are not a signed

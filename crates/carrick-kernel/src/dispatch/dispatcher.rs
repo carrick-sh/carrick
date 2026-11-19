@@ -1408,6 +1408,10 @@ impl NetCrossSubsystem for SyscallDispatcher {
 
 /// Subsystem view for filesystem operations.
 pub struct FsView<'a> {
+    /// The path operands of one native host-file request, pinned by its
+    /// carrier. This authority is available only to pathname resolution.
+    pub(in crate::dispatch) native_path_bases:
+        [Option<(carrick_fd_core::Fd, Arc<crate::kernel::FileDescription>)>; 2],
     pub(in crate::dispatch) resolve_observations:
         std::cell::RefCell<Vec<Vec<carrick_vfs::fs_resolve_cache::CoherenceStamp>>>,
     pub(in crate::dispatch) fs: &'a fs::FsState,
@@ -2365,6 +2369,7 @@ impl SyscallDispatcher {
     #[inline]
     pub fn fs_view(&self) -> FsView<'_> {
         FsView {
+            native_path_bases: [None, None],
             resolve_observations: std::cell::RefCell::default(),
             fs: &self.fs,
             file_authority: &self.file_authority,

@@ -11507,6 +11507,7 @@ impl FsViewFixture {
 
     fn view(&self) -> FsView<'_> {
         FsView {
+            native_path_bases: [None, None],
             resolve_observations: std::cell::RefCell::default(),
             fs: &self.fs,
             file_authority: &self.file_authority,

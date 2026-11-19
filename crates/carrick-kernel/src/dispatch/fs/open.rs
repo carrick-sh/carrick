@@ -1021,8 +1021,8 @@ impl<'a> FsView<'a> {
         if fd < 0 {
             return None; // AT_FDCWD and friends
         }
-        let open_file = self.open_file(fd)?;
-        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
+        let description = self.path_base_description(carrick_fd_core::Fd(fd))?;
+        let open = crate::kernel::FileDescription::inspect(&description)?;
         match &*open {
             OpenDescription::Directory {
                 path,

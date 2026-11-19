@@ -658,11 +658,31 @@ pub struct HostFileHeader {
     /// The caller's ring descriptor table: the `fd-core` raw table id words
     /// (authority, index, generation).
     pub table: [u64; 3],
+    /// Descriptor operand or the first pathname's base.
     pub fd: i32,
     /// Operation-specific flags (for example `AT_*` flags).
     pub flags: u32,
     /// Operation-specific scalar arguments.
     pub args: [u64; 4],
+}
+
+/// Rename and link encode the second pathname's descriptor in `args[0]`.
+/// Zero denotes the caller's cwd. Other words carry the 32-bit fd plus one,
+/// leaving descriptor zero distinguishable from the default.
+pub const fn encode_second_path_fd(fd: Option<i32>) -> u64 {
+    match fd {
+        None => 0,
+        Some(fd) => fd as u32 as u64 + 1,
+    }
+}
+
+/// Decode the second path base. The outer option validates the wire word.
+pub const fn decode_second_path_fd(word: u64) -> Option<Option<i32>> {
+    match word.checked_sub(1) {
+        None => Some(None),
+        Some(fd) if fd <= u32::MAX as u64 => Some(Some(fd as i32)),
+        Some(_) => None,
+    }
 }
 
 const MAGIC: u32 = u32::from_le_bytes(*b"CHFR");

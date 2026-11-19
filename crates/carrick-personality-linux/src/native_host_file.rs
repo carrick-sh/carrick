@@ -342,6 +342,25 @@ impl HostFileCall {
         self.uses_child_mutation_venue() || matches!(self, Self::Socket(_))
     }
 
+    /// Mutations with a directory operand from the CPL0 ring table.
+    fn uses_ring_path_base(self) -> bool {
+        match self {
+            Self::Mkdirat { dirfd, .. }
+            | Self::Unlinkat { dirfd, .. }
+            | Self::Symlinkat { dirfd, .. }
+            | Self::Utimensat { dirfd, .. }
+            | Self::Fchmodat { dirfd, .. }
+            | Self::Fchownat { dirfd, .. } => dirfd != LINUX_AT_FDCWD,
+            Self::Renameat {
+                olddirfd, newdirfd, ..
+            }
+            | Self::Linkat {
+                olddirfd, newdirfd, ..
+            } => olddirfd != LINUX_AT_FDCWD || newdirfd != LINUX_AT_FDCWD,
+            _ => false,
+        }
+    }
+
     /// Whether the CPL0 venue stages this decoded call for `origin`.
     /// `delegated(fd)` says whether the carrier's file table delegates `fd` to
     /// a host object (the run's stdio streams).
@@ -358,8 +377,8 @@ impl HostFileCall {
     ///   follow the descriptor: one the root's `openat` installed lives in
     ///   the ring namespace and the host task has nothing under its number
     ///   (#2157 B1, #231).
-    /// - `readlinkat` is not staged here: the root's keeps its host crossing,
-    ///   and a descendant's is the native file family's (#1862).
+    /// - A root's cwd-relative `readlinkat` keeps its host crossing.
+    ///   A directory operand follows the ring descriptor it names.
     /// - A child's host network calls and its polls of host objects are
     ///   staged (#231); the initial task keeps its routes for both.
     pub fn admitted_for(self, origin: ServiceOrigin, delegated: impl FnOnce(i32) -> bool) -> bool {
@@ -374,7 +393,12 @@ impl HostFileCall {
             {
                 !delegated(fd)
             }
-            call if call.child_venue_only() => origin != ServiceOrigin::Initial,
+            Self::Readlinkat { dirfd, .. } => {
+                origin != ServiceOrigin::Initial || dirfd.0 != LINUX_AT_FDCWD
+            }
+            call if call.child_venue_only() => {
+                origin != ServiceOrigin::Initial || call.uses_ring_path_base()
+            }
             // A descendant's descriptor lives in its ring namespace.
             Self::Fchmod { .. } | Self::Fchown { .. } => true,
             Self::Openat { .. }
@@ -954,18 +978,18 @@ impl Staging<'_, '_> {
         (self.namespace.resolve)(fd)
     }
 
-    /// Route a path call's `dirfd`. A relative path through a descriptor
-    /// other than `AT_FDCWD` needs that directory as the base, which a
-    /// later slice serves; until then it is a counted ENOSYS, never a guess.
-    fn path_base(&mut self, dirfd: i32, path: &[u8]) -> Option<Option<HostFileStage>> {
+    /// Keep a relative path's directory operand in the record. The
+    /// carrier pins that directory in the caller's ring table at service
+    /// time. Absolute paths must ignore even an invalid descriptor.
+    fn path_base(&mut self, dirfd: i32, path: &[u8]) -> Option<Result<i32, HostFileStage>> {
         if dirfd == LINUX_AT_FDCWD || path.first() == Some(&b'/') {
-            return Some(None);
+            return Some(Ok(LINUX_AT_FDCWD));
         }
-        Some(Some(match self.descriptor(dirfd)? {
-            NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_ENOTDIR),
-            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
-            NativeDescriptor::HostBacked { .. } => errno(carrick_syscall_abi::LINUX_ENOSYS),
-        }))
+        Some(match self.descriptor(dirfd)? {
+            NativeDescriptor::InZone(_) => Err(errno(carrick_syscall_abi::LINUX_ENOTDIR)),
+            NativeDescriptor::Absent => Err(errno(carrick_syscall_abi::LINUX_EBADF)),
+            NativeDescriptor::HostBacked { .. } => Ok(dirfd),
+        })
     }
 
     fn path_input(
@@ -973,7 +997,7 @@ impl Staging<'_, '_> {
         user: &mut dyn HostFileUser,
         dirfd: i32,
         address: u64,
-    ) -> Option<Result<Vec<u8>, HostFileStage>> {
+    ) -> Option<Result<(i32, Vec<u8>), HostFileStage>> {
         let path = match copy_path(user, address) {
             Path::Bytes(path) => path,
             Path::Stage(stage) => return Some(Err(stage)),
@@ -981,10 +1005,7 @@ impl Staging<'_, '_> {
         if path.is_empty() {
             return Some(Err(errno(carrick_syscall_abi::LINUX_ENOENT)));
         }
-        if let Some(answer) = self.path_base(dirfd, &path)? {
-            return Some(Err(answer));
-        }
-        Some(Ok(path))
+        Some(self.path_base(dirfd, &path)?.map(|base| (base, path)))
     }
 
     /// Stage `fstat`/`statx` of a descriptor (`AT_EMPTY_PATH` or `fstat`).
@@ -1285,17 +1306,26 @@ fn stage_call(
             if old.is_empty() || new.is_empty() {
                 return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
             }
-            if let Some(answer) = staging.path_base(olddirfd, &old)? {
-                return Some(answer);
-            }
-            if let Some(answer) = staging.path_base(newdirfd, &new)? {
-                return Some(answer);
-            }
+            let olddirfd = match staging.path_base(olddirfd, &old)? {
+                Ok(base) => base,
+                Err(answer) => return Some(answer),
+            };
+            let newdirfd = match staging.path_base(newdirfd, &new)? {
+                Ok(base) => base,
+                Err(answer) => return Some(answer),
+            };
             staging.request(
                 HostFileOp::Renameat,
-                LINUX_AT_FDCWD,
+                olddirfd,
                 flags as u32,
-                [0; 4],
+                [
+                    host_file::encode_second_path_fd(
+                        (newdirfd != LINUX_AT_FDCWD).then_some(newdirfd),
+                    ),
+                    0,
+                    0,
+                    0,
+                ],
                 &path_pair(&old, &new),
                 None,
             )
@@ -1304,13 +1334,13 @@ fn stage_call(
             if (length as i64) < 0 {
                 return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
             }
-            let path = match staging.path_input(user, LINUX_AT_FDCWD, path)? {
-                Ok(path) => path,
+            let (dirfd, path) = match staging.path_input(user, LINUX_AT_FDCWD, path)? {
+                Ok(resolved) => resolved,
                 Err(stage) => return Some(stage),
             };
             staging.request(
                 HostFileOp::Truncate,
-                LINUX_AT_FDCWD,
+                dirfd,
                 0,
                 [length, 0, 0, 0],
                 &path,
@@ -1369,13 +1399,13 @@ fn stage_call(
             if flags & !carrick_syscall_abi::LINUX_AT_SYMLINK_NOFOLLOW != 0 {
                 return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
             }
-            let path = match staging.path_input(user, dirfd, path)? {
-                Ok(path) => path,
+            let (dirfd, path) = match staging.path_input(user, dirfd, path)? {
+                Ok(resolved) => resolved,
                 Err(stage) => return Some(stage),
             };
             staging.request(
                 HostFileOp::Fchmodat,
-                LINUX_AT_FDCWD,
+                dirfd,
                 flags as u32,
                 [mode & CHMOD_MODE_BITS, 0, 0, 0],
                 &path,
@@ -1414,12 +1444,13 @@ fn stage_call(
                 b"" => return Some(errno(carrick_syscall_abi::LINUX_ENOENT)),
                 _ => path,
             };
-            if let Some(answer) = staging.path_base(dirfd, &path)? {
-                return Some(answer);
-            }
+            let dirfd = match staging.path_base(dirfd, &path)? {
+                Ok(base) => base,
+                Err(answer) => return Some(answer),
+            };
             staging.request(
                 HostFileOp::Fchownat,
-                LINUX_AT_FDCWD,
+                dirfd,
                 (flags & carrick_syscall_abi::LINUX_AT_SYMLINK_NOFOLLOW) as u32,
                 ids,
                 &path,
@@ -1485,44 +1516,30 @@ fn stage_call(
                     }
                 });
             }
-            let path = match staging.path_input(user, dirfd, path)? {
-                Ok(path) => path,
+            let (dirfd, path) = match staging.path_input(user, dirfd, path)? {
+                Ok(resolved) => resolved,
                 Err(stage) => return Some(stage),
             };
-            staging.request(
-                HostFileOp::Utimensat,
-                LINUX_AT_FDCWD,
-                flags,
-                words,
-                &path,
-                None,
-            )
+            staging.request(HostFileOp::Utimensat, dirfd, flags, words, &path, None)
         }
         HostFileCall::Mkdirat { dirfd, path, mode } => {
-            let path = match staging.path_input(user, dirfd, path)? {
-                Ok(path) => path,
+            let (dirfd, path) = match staging.path_input(user, dirfd, path)? {
+                Ok(resolved) => resolved,
                 Err(stage) => return Some(stage),
             };
-            staging.request(
-                HostFileOp::Mkdirat,
-                LINUX_AT_FDCWD,
-                0,
-                [mode, 0, 0, 0],
-                &path,
-                None,
-            )
+            staging.request(HostFileOp::Mkdirat, dirfd, 0, [mode, 0, 0, 0], &path, None)
         }
         HostFileCall::Unlinkat { dirfd, path, flags } => {
             if flags & !carrick_syscall_abi::LINUX_AT_REMOVEDIR != 0 {
                 return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
             }
-            let path = match staging.path_input(user, dirfd, path)? {
-                Ok(path) => path,
+            let (dirfd, path) = match staging.path_input(user, dirfd, path)? {
+                Ok(resolved) => resolved,
                 Err(stage) => return Some(stage),
             };
             staging.request(
                 HostFileOp::Unlinkat,
-                LINUX_AT_FDCWD,
+                dirfd,
                 flags as u32,
                 [0; 4],
                 &path,
@@ -1541,13 +1558,13 @@ fn stage_call(
                 Path::Bytes(target) => target,
                 Path::Stage(stage) => return Some(stage),
             };
-            let path = match staging.path_input(user, dirfd, path)? {
-                Ok(path) => path,
+            let (dirfd, path) = match staging.path_input(user, dirfd, path)? {
+                Ok(resolved) => resolved,
                 Err(stage) => return Some(stage),
             };
             staging.request(
                 HostFileOp::Symlinkat,
-                LINUX_AT_FDCWD,
+                dirfd,
                 0,
                 [0; 4],
                 &path_pair(&target, &path),
@@ -1585,17 +1602,26 @@ fn stage_call(
                     carrick_syscall_abi::LINUX_ENOENT
                 }));
             }
-            if let Some(answer) = staging.path_base(olddirfd, &old)? {
-                return Some(answer);
-            }
-            if let Some(answer) = staging.path_base(newdirfd, &new)? {
-                return Some(answer);
-            }
+            let olddirfd = match staging.path_base(olddirfd, &old)? {
+                Ok(base) => base,
+                Err(answer) => return Some(answer),
+            };
+            let newdirfd = match staging.path_base(newdirfd, &new)? {
+                Ok(base) => base,
+                Err(answer) => return Some(answer),
+            };
             staging.request(
                 HostFileOp::Linkat,
-                LINUX_AT_FDCWD,
+                olddirfd,
                 flags as u32,
-                [0; 4],
+                [
+                    host_file::encode_second_path_fd(
+                        (newdirfd != LINUX_AT_FDCWD).then_some(newdirfd),
+                    ),
+                    0,
+                    0,
+                    0,
+                ],
                 &path_pair(&old, &new),
                 None,
             )
@@ -1615,12 +1641,13 @@ fn stage_call(
                 Path::Bytes(path) => path,
                 Path::Stage(stage) => return Some(stage),
             };
-            if let Some(answer) = staging.path_base(dirfd.0, &path)? {
-                return Some(answer);
-            }
+            let dirfd = match staging.path_base(dirfd.0, &path)? {
+                Ok(base) => base,
+                Err(answer) => return Some(answer),
+            };
             staging.request(
                 HostFileOp::Readlinkat,
-                LINUX_AT_FDCWD,
+                dirfd,
                 0,
                 [0; 4],
                 &path,
@@ -1643,12 +1670,13 @@ fn stage_call(
             if path.is_empty() {
                 return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
             }
-            if let Some(answer) = staging.path_base(dirfd, &path)? {
-                return Some(answer);
-            }
+            let dirfd = match staging.path_base(dirfd, &path)? {
+                Ok(base) => base,
+                Err(answer) => return Some(answer),
+            };
             staging.request(
                 HostFileOp::Openat,
-                LINUX_AT_FDCWD,
+                dirfd,
                 0,
                 [flags, mode, 0, 0],
                 &path,
@@ -1674,12 +1702,13 @@ fn stage_call(
                     carrick_syscall_abi::LINUX_ENOENT
                 }));
             }
-            if let Some(answer) = staging.path_base(dirfd, &path)? {
-                return Some(answer);
-            }
+            let dirfd = match staging.path_base(dirfd, &path)? {
+                Ok(base) => base,
+                Err(answer) => return Some(answer),
+            };
             staging.request(
                 HostFileOp::Faccessat,
-                LINUX_AT_FDCWD,
+                dirfd,
                 flags as u32,
                 [mode, 0, 0, 0],
                 &path,
@@ -1706,13 +1735,14 @@ fn stage_call(
                     return staging.descriptor_stat(HostFileOp::Fstat, dirfd, 0, [0; 4], output);
                 }
             }
-            if let Some(answer) = staging.path_base(dirfd, &path)? {
-                return Some(answer);
-            }
+            let dirfd = match staging.path_base(dirfd, &path)? {
+                Ok(base) => base,
+                Err(answer) => return Some(answer),
+            };
             let path: &[u8] = if path.is_empty() { b"." } else { &path };
             staging.request(
                 HostFileOp::Newfstatat,
-                LINUX_AT_FDCWD,
+                dirfd,
                 flags as u32,
                 [0; 4],
                 path,
@@ -1745,13 +1775,14 @@ fn stage_call(
                     );
                 }
             }
-            if let Some(answer) = staging.path_base(dirfd, &path)? {
-                return Some(answer);
-            }
+            let dirfd = match staging.path_base(dirfd, &path)? {
+                Ok(base) => base,
+                Err(answer) => return Some(answer),
+            };
             let path: &[u8] = if path.is_empty() { b"." } else { &path };
             staging.request(
                 HostFileOp::Statx,
-                LINUX_AT_FDCWD,
+                dirfd,
                 flags as u32,
                 [mask, 0, 0, 0],
                 path,

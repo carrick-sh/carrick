@@ -628,8 +628,8 @@ fn path_calls_stage_the_path_and_need_path_authority() {
     assert_eq!(view.header().args[0], 0o2_000_000);
     assert_eq!(view.input(), b"/etc/ld.so.cache");
 
-    // A relative path through an in-zone or absent dirfd is answered in ring;
-    // through a host directory it is a later slice (counted ENOSYS).
+    // An in-zone or absent dirfd is answered in ring. A host-backed
+    // descriptor is carried with the request for the carrier to pin.
     let mut relative = memory(b"libc.so.6\0");
     let openat = |dirfd| HostFileCall::Openat {
         dirfd,
@@ -645,10 +645,10 @@ fn path_calls_stage_the_path_and_need_path_authority() {
         run(openat(9), &mut relative),
         returned(carrick_syscall_abi::LINUX_EBADF)
     );
-    assert_eq!(
-        run(openat(3), &mut relative),
-        returned(carrick_syscall_abi::LINUX_ENOSYS)
-    );
+    let (mut relative_record, _, _) = request(run(openat(3), &mut relative));
+    let relative_view = HostFileRequestView::parse(&mut relative_record).unwrap();
+    assert_eq!(relative_view.header().fd, 3);
+    assert_eq!(relative_view.input(), b"libc.so.6");
     let mut empty = memory(b"\0");
     assert_eq!(
         run(openat(LINUX_AT_FDCWD), &mut empty),
@@ -1520,27 +1520,22 @@ fn readlink_validates_only_the_bytes_returned_by_the_link() {
 #[test]
 fn a_decoded_call_the_venue_does_not_admit_keeps_its_crossing_output_stage() {
     use crate::crossing::HostCrossingSet;
-    // The venue decodes readlinkat (the native file family serves it) but
-    // never admits it, so the root's keeps its x86 host crossing. That
-    // crossing still needs its untouched output page prepared first (#2201).
+    // Initial AT_FDCWD readlinkat keeps its x86 host crossing (#2201).
     let (path, out) = (0x7000_0000u64, 0x7000_1000u64);
     let args = [LINUX_AT_FDCWD as u64, path, out, 64, 0, 0];
     assert!(HostFileCall::decode(crate::crossing::nr::READLINKAT, &args).is_some());
-    for origin in [ServiceOrigin::Initial, ServiceOrigin::Descendant] {
-        assert_eq!(
-            admit_or_cross(
-                HostCrossingSet::X86,
-                carrick_guest_arch::NativeOrdinal::new(267),
-                crate::crossing::nr::READLINKAT,
-                &args,
-                origin,
-                |_| false,
-                |_, _| 0,
-            ),
-            Err(Some(HostFileStage::PrepareOutput { address: out })),
-            "{origin:?}"
-        );
-    }
+    assert_eq!(
+        admit_or_cross(
+            HostCrossingSet::X86,
+            carrick_guest_arch::NativeOrdinal::new(267),
+            crate::crossing::nr::READLINKAT,
+            &args,
+            ServiceOrigin::Initial,
+            |_| false,
+            |_, _| 0,
+        ),
+        Err(Some(HostFileStage::PrepareOutput { address: out })),
+    );
     // Once the page is writable the crossing runs as it is.
     assert_eq!(
         admit_or_cross(
