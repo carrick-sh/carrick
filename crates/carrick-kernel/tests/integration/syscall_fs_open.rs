@@ -1280,13 +1280,10 @@ fn openat_through_absolute_dir_symlink_never_serves_the_host_path() {
     );
 }
 
-/// Dispatcher-level witness for the immutable-lower fast open path
-/// (`try_immutable_lower_absolute_open` -> `open_immutable_lower_readonly` ->
-/// `open_immutable_file_readonly`).
+/// Dispatcher-level witness for resolving symlinks in an immutable lower.
 ///
-/// Using a real-directory `..` prefix (`/d/../...`) skips `try_dentry_fast_open`
-/// while entering `try_immutable_lower_absolute_open` directly. When the
-/// immutable lower has an ancestor symlink:
+/// A real-directory `..` prefix (`/d/../...`) makes both fast paths defer
+/// to the layered resolver. When the immutable lower has an ancestor symlink:
 /// 1. `/alias -> <lower_abs>/inner` with `/<lower_abs>/inner/sub/leak.txt` in
 ///    the sparse upper,
 /// 2. chained relative symlinks `/a -> b/c`, `/b/c/d -> ../target`,
