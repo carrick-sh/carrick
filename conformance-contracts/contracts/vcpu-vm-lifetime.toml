@@ -46,7 +46,7 @@ vm_free = [
   "carrick-vmm-hvf::trap::vcpu_topology::tests::a_create_after_the_first_run_is_a_violation",
   "carrick-vmm-hvf::trap::vcpu_topology::tests::a_destroy_while_the_topology_runs_is_a_violation_at_every_site",
   "carrick-vmm-hvf::trap::vcpu_topology::tests::the_retired_initial_runner_hand_off_violates_the_topology",
-  "carrick-vmm-hvf::staged_cpu::tests::a_staged_root_starts_at_the_el0_entry_trampoline",
+  "carrick-aarch64::staged_cpu::tests::a_staged_root_starts_at_the_el0_entry_trampoline",
   "carrick-conformance-contract::personality_boundary::tests::executable_publication_has_one_neutral_owner",
   "carrick-core-abi::executable_publication::{tests::publication_is_bounded_and_acknowledges_cancellation_before_reuse,layout_manifest::portal_executable_publication,layout_manifest::portal_executable_slot}",
   "carrick-el1-abi::mm_portal::layout_manifest::mm_portal_slots (neutral executable-publication ownership move only: retained wire sizes, offsets, bounded single-flight acknowledgment and cancellation/reuse; existing semantic and work bindings above remain required, no broader or signed acceptance claim)",

@@ -7,12 +7,9 @@
 //! vCPU. A staged CPU has never run, so stage-1 TLB maintenance requested
 //! during bring-up is recorded and owed to that first live executor.
 
-#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
-
-use carrick_aarch64::{Aarch64VcpuSnapshot, OwedStage1Maintenance, Stage1Maintenance};
 use carrick_hal::{Reg, SysReg, TrapError};
 
-use crate::trap::GuestMappingPlan;
+use crate::vmm::{Aarch64VcpuSnapshot, OwedStage1Maintenance, Stage1Maintenance};
 
 /// `PSTATE` of a root before its first instruction: EL1h with `DAIF` masked, the
 /// state the EL0-entry trampoline's `eret` leaves from.
@@ -22,9 +19,23 @@ pub(crate) const ROOT_EL0_ENTRY_SPSR: u64 = 0x3c0;
 /// `CNTKCTL_EL1.EL0VCTEN | EL0PCTEN`: EL0 reads the counters without trapping.
 pub(crate) const EL0_COUNTER_ACCESS: u64 = (1 << 1) | (1 << 0);
 
+/// Boot fields for the root's first-instruction register file.
+pub struct RootBootFields {
+    /// User-mode entry point.
+    pub entry: u64,
+    /// Initial EL0 stack pointer.
+    pub initial_stack_pointer: Option<u64>,
+    /// Entry PC of the EL1 trampoline that returns to EL0.
+    pub el0_trampoline_entry: Option<u64>,
+    /// Exception vector base for VBAR_EL1.
+    pub el1_vectors_base: Option<u64>,
+    /// Stage-1 page-table root used for both TTBRs.
+    pub stage1_page_tables_base: Option<u64>,
+}
+
 /// The registers of a task that owns no vCPU yet.
 #[derive(Debug, Clone)]
-pub(crate) struct StagedCpu {
+pub struct StagedCpu {
     snapshot: Aarch64VcpuSnapshot,
     owed: OwedStage1Maintenance,
 }
@@ -36,7 +47,7 @@ fn unsupported(what: &str) -> TrapError {
 impl StagedCpu {
     /// The root's first-instruction register file, programmed from `plan`
     /// exactly as a freshly created vCPU would be before its first run.
-    pub(crate) fn initial_root(plan: &GuestMappingPlan) -> Self {
+    pub fn initial_root(plan: &RootBootFields) -> Self {
         use carrick_hal::GuestArch as _;
         let boot = carrick_hal::Aarch64GuestArch::bootstrap_sysregs();
         let (elr_el1, spsr_el1) = match plan.el0_trampoline_entry {
@@ -77,15 +88,15 @@ impl StagedCpu {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> Aarch64VcpuSnapshot {
+    pub fn snapshot(&self) -> Aarch64VcpuSnapshot {
         self.snapshot.clone()
     }
 
-    pub(crate) fn restore(&mut self, snapshot: &Aarch64VcpuSnapshot) {
+    pub fn restore(&mut self, snapshot: &Aarch64VcpuSnapshot) {
         self.snapshot = snapshot.clone();
     }
 
-    pub(crate) fn get_reg(&self, reg: Reg) -> Result<u64, TrapError> {
+    pub fn get_reg(&self, reg: Reg) -> Result<u64, TrapError> {
         let s = &self.snapshot;
         Ok(match reg {
             Reg::X(n) => *s
@@ -102,7 +113,7 @@ impl StagedCpu {
         })
     }
 
-    pub(crate) fn set_reg(&mut self, reg: Reg, value: u64) -> Result<(), TrapError> {
+    pub fn set_reg(&mut self, reg: Reg, value: u64) -> Result<(), TrapError> {
         let s = &mut self.snapshot;
         let slot = match reg {
             Reg::X(n) => s
@@ -138,7 +149,7 @@ impl StagedCpu {
         })
     }
 
-    pub(crate) fn get_sys_reg(&self, reg: SysReg) -> Result<u64, TrapError> {
+    pub fn get_sys_reg(&self, reg: SysReg) -> Result<u64, TrapError> {
         let s = &self.snapshot;
         Ok(match reg {
             SysReg::Sctlr => s.sctlr,
@@ -155,7 +166,7 @@ impl StagedCpu {
         })
     }
 
-    pub(crate) fn set_sys_reg(&mut self, reg: SysReg, value: u64) -> Result<(), TrapError> {
+    pub fn set_sys_reg(&mut self, reg: SysReg, value: u64) -> Result<(), TrapError> {
         if reg == SysReg::Sctlr {
             self.snapshot.sctlr = value;
             return Ok(());
@@ -164,7 +175,7 @@ impl StagedCpu {
         Ok(())
     }
 
-    pub(crate) fn get_vreg(&self, n: u32) -> Result<u128, TrapError> {
+    pub fn get_vreg(&self, n: u32) -> Result<u128, TrapError> {
         self.snapshot
             .vregs
             .get(n as usize)
@@ -172,7 +183,7 @@ impl StagedCpu {
             .ok_or_else(|| TrapError::Hypervisor(format!("vreg index {n} out of range")))
     }
 
-    pub(crate) fn set_vreg(&mut self, n: u32, value: u128) -> Result<(), TrapError> {
+    pub fn set_vreg(&mut self, n: u32, value: u128) -> Result<(), TrapError> {
         let slot = self
             .snapshot
             .vregs
@@ -182,42 +193,42 @@ impl StagedCpu {
         Ok(())
     }
 
-    pub(crate) fn fpcr(&self) -> u64 {
+    pub fn fpcr(&self) -> u64 {
         u64::from(self.snapshot.fpcr)
     }
 
-    pub(crate) fn set_fpcr(&mut self, value: u64) {
+    pub fn set_fpcr(&mut self, value: u64) {
         self.snapshot.fpcr = value as u32;
     }
 
-    pub(crate) fn fpsr(&self) -> u64 {
+    pub fn fpsr(&self) -> u64 {
         u64::from(self.snapshot.fpsr)
     }
 
-    pub(crate) fn set_fpsr(&mut self, value: u64) {
+    pub fn set_fpsr(&mut self, value: u64) {
         self.snapshot.fpsr = value as u32;
     }
 
-    pub(crate) fn actlr_el1(&self) -> u64 {
+    pub fn actlr_el1(&self) -> u64 {
         self.snapshot.actlr_el1
     }
 
-    pub(crate) fn set_actlr_el1(&mut self, value: u64) {
+    pub fn set_actlr_el1(&mut self, value: u64) {
         self.snapshot.actlr_el1 = value;
     }
 
     /// The packed process/thread identity used by the EL0 vDSO.
-    pub(crate) fn stamp_guest_thread_id(&mut self, packed: u64) {
+    pub fn stamp_guest_thread_id(&mut self, packed: u64) {
         self.snapshot.tpidrro_el0 = packed;
     }
 
     /// Record maintenance this CPU cannot run: nothing has executed with its
     /// translations, so the first live executor that loads it discharges it.
-    pub(crate) fn owe(&mut self, maintenance: Stage1Maintenance) {
+    pub fn owe(&mut self, maintenance: Stage1Maintenance) {
         self.owed.record(maintenance);
     }
 
-    pub(crate) fn take_owed(&mut self) -> OwedStage1Maintenance {
+    pub fn take_owed(&mut self) -> OwedStage1Maintenance {
         std::mem::take(&mut self.owed)
     }
 }
@@ -226,17 +237,13 @@ impl StagedCpu {
 mod tests {
     use super::*;
 
-    fn plan() -> GuestMappingPlan {
-        GuestMappingPlan {
-            arm_ring_first: Default::default(),
+    fn plan() -> RootBootFields {
+        RootBootFields {
             entry: 0x40_1000,
             initial_stack_pointer: Some(0xff_ffff_e000),
             el0_trampoline_entry: Some(0x2d_0000_0000),
             el1_vectors_base: Some(carrick_mem::memory::LINUX_EL1_VECTORS_BASE),
             stage1_page_tables_base: Some(0x9a_0000_0000),
-            ro_spans: Vec::new(),
-            rw_spans: Vec::new(),
-            mappings: Vec::new(),
         }
     }
 

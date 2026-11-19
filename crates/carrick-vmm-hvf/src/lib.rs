@@ -72,7 +72,7 @@ pub mod hvpatch_probe_support;
 pub mod metadata_grant;
 pub mod signal_arrival;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod staged_cpu;
+use carrick_aarch64::staged_cpu;
 pub mod syscall_mailbox;
 pub mod thread;
 pub mod threaded_impl;
