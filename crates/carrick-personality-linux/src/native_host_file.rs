@@ -377,8 +377,8 @@ impl HostFileCall {
     ///   follow the descriptor: one the root's `openat` installed lives in
     ///   the ring namespace and the host task has nothing under its number
     ///   (#2157 B1, #231).
-    /// - A root's cwd-relative `readlinkat` keeps its host crossing.
-    ///   A directory operand follows the ring descriptor it names.
+    /// - `readlinkat(AT_FDCWD, ...)` keeps its existing route. A directory
+    ///   operand follows the ring descriptor it names.
     /// - A child's host network calls and its polls of host objects are
     ///   staged (#231); the initial task keeps its routes for both.
     pub fn admitted_for(self, origin: ServiceOrigin, delegated: impl FnOnce(i32) -> bool) -> bool {
@@ -393,9 +393,7 @@ impl HostFileCall {
             {
                 !delegated(fd)
             }
-            Self::Readlinkat { dirfd, .. } => {
-                origin != ServiceOrigin::Initial || dirfd.0 != LINUX_AT_FDCWD
-            }
+            Self::Readlinkat { dirfd, .. } => dirfd.0 != LINUX_AT_FDCWD,
             call if call.child_venue_only() => {
                 origin != ServiceOrigin::Initial || call.uses_ring_path_base()
             }
