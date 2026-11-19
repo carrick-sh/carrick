@@ -626,7 +626,7 @@ impl Drop for IrqGuard {
 /// Guest syscall replay or a return through another task is forbidden.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[track_caller]
-pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> ! {
+pub fn fatal_entry_binding(reason: impl Into<carrick_el1_abi::EntryBindingFatalKind>) -> ! {
     let [reason, location] = carrick_el1_abi::EntryBindingFatalDetail::at_caller(reason).encode();
     // SAFETY: this runs at EL1. HVC #3 is the image's fatal boundary, with
     // the established panic sentinel and no guest return/result publication.
@@ -644,7 +644,7 @@ pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> 
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[track_caller]
-pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> ! {
+pub fn fatal_entry_binding(reason: impl Into<carrick_el1_abi::EntryBindingFatalKind>) -> ! {
     let _ = reason;
     crate::isa::x86::fatal_entry_binding()
 }
