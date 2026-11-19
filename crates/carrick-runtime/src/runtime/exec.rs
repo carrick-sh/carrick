@@ -91,37 +91,13 @@ impl NativeExecCapability {
     }
 }
 
-/// Native exec serves ring-owned fork children. Their cwd, umask and
-/// credentials live in their ring task row, and the ring owner seals them
-/// into the payload as the caller's access context, so the service resolves
-/// and checks access with exactly the caller's authority (#1392). The
-/// capability holds no per-child executable or descriptor table, so a path
-/// into the caller-relative `/proc` and `/dev/fd` views (also when reached
-/// through a symlink) is refused, and so is `execveat` of a real directory
-/// descriptor.
-fn native_child_exec_path_is_served(resolved: &str) -> bool {
-    ![
-        "/proc",
-        "/dev/fd",
-        "/dev/stdin",
-        "/dev/stdout",
-        "/dev/stderr",
-    ]
-    .iter()
-    .any(|prefix| {
-        resolved
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-    })
-}
-
 /// `descriptor_source` selects the object behind a descriptor in the
 /// caller's ring table (the table its ring owner sealed into the request):
 /// `SyscallDispatcher::native_descriptor_exec_source` (#1530).
 fn prepare_native_exec_image(
     capability: &NativeExecCapability,
     payload: &[u8],
-    descriptor_source: impl FnOnce(
+    descriptor_source: impl Fn(
         [u64; 3],
         i32,
     ) -> Result<
@@ -146,7 +122,7 @@ fn prepare_native_exec_image(
 pub(crate) fn prepare_native_x86_exec_image(
     capability: &NativeExecCapability,
     payload: &[u8],
-    descriptor_source: impl FnOnce(
+    descriptor_source: impl Fn(
         [u64; 3],
         i32,
     ) -> Result<
@@ -186,7 +162,7 @@ pub(crate) fn load_native_x86_exec(
 fn prepare_native_exec<R>(
     capability: &NativeExecCapability,
     payload: &[u8],
-    descriptor_source: impl FnOnce(
+    descriptor_source: impl Fn(
         [u64; 3],
         i32,
     ) -> Result<
@@ -215,6 +191,10 @@ fn prepare_native_exec<R>(
         carrick_abi::NsUid::new(access.ids.fsuid),
         carrick_abi::NsGid::new(access.ids.fsgid),
     );
+    let descriptor = |fd: carrick_el1_abi::ipc::fd::Fd| {
+        let table = view.table().ok_or(crate::linux_abi::LINUX_ENOSYS)?;
+        descriptor_source(table, fd.0)
+    };
     let path = core::str::from_utf8(view.path()).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
     let path = match view.call() {
         carrick_core_abi::service::ExecCall::Execve => path.to_owned(),
@@ -234,8 +214,7 @@ fn prepare_native_exec<R>(
                 // fexecve: `dirfd` is the executable's own descriptor, in the
                 // caller's ring table, and Linux runs the open file, never
                 // its name. Without a sealed table it is unrouted.
-                let table = view.table().ok_or(crate::linux_abi::LINUX_ENOSYS)?;
-                let source = descriptor_source(table, dirfd)?;
+                let source = descriptor(carrick_el1_abi::ipc::fd::Fd(dirfd))?;
                 let argv = view.argv().map(<[u8]>::to_vec).collect();
                 let env = view.envp().map(<[u8]>::to_vec).collect();
                 return load(
@@ -256,12 +235,17 @@ fn prepare_native_exec<R>(
             }
         }
     };
-    if !native_child_exec_path_is_served(&files.resolve_path(&path)) {
-        return Err(crate::linux_abi::LINUX_ENOSYS);
-    }
     let argv = view.argv().map(<[u8]>::to_vec).collect();
     let env = view.envp().map(<[u8]>::to_vec).collect();
-    load(&files, ExecTarget::Path(&path), argv, env)
+    load(
+        &files,
+        ExecTarget::NativePath {
+            path: &path,
+            descriptor: &descriptor,
+        },
+        argv,
+        env,
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -534,6 +518,11 @@ fn finalize_native_guest_exec_base(
 pub(crate) enum ExecTarget<'a> {
     /// A path the caller named, resolved under its access.
     Path(&'a str),
+    /// A native caller's path can resolve through its sealed ring table.
+    NativePath {
+        path: &'a str,
+        descriptor: &'a carrick_kernel::dispatch::exec_files::NativeExecFdService<'a>,
+    },
     /// An open descriptor's own object (`execveat(fd, "", AT_EMPTY_PATH)`,
     /// #1530). Linux runs the open file, never its name: nothing may
     /// re-resolve it by path. `spelling` is the guest-visible program name,
@@ -621,6 +610,25 @@ fn resolve_exec_target<'a>(
             acquire_source(path).map_err(exec_source_errno)?,
             false,
         ),
+        ExecTarget::NativePath { path, descriptor } => {
+            use carrick_kernel::dispatch::exec_files::ExecPathSource;
+            #[cfg(feature = "platform-macos")]
+            let open = |path: &str| std::fs::File::open(path);
+            #[cfg(feature = "platform-macos")]
+            let host_open: Option<
+                &carrick_kernel::dispatch::exec_files::ExecHostFileService<'_>,
+            > = Some(&open);
+            #[cfg(not(feature = "platform-macos"))]
+            let host_open = None;
+            let source = files
+                .acquire_native_path(path, host_open, descriptor)
+                .map_err(exec_source_errno)?;
+            let (source, descriptor) = match source {
+                ExecPathSource::Filesystem(source) => (source, false),
+                ExecPathSource::NativeDescriptor(source) => (source, true),
+            };
+            (files.resolve_path(path), source, descriptor)
+        }
         ExecTarget::Descriptor { spelling, source } => (spelling, source, true),
     };
     let argv = if argv.is_empty() {
@@ -655,9 +663,9 @@ fn resolve_exec_target<'a>(
         if !head.starts_with(b"#!") {
             break;
         }
-        // An fexecve'd script's interpreter would reopen the script by name
-        // (Linux passes `/dev/fd/N`, which a native exec cannot serve):
-        // unrouted, never a re-resolution of the path (#1530).
+        // A native descriptor script requires the interpreter to reopen it
+        // through the caller's descriptor table. That open is unrouted
+        // (#1537). Keep the predecessor until the interpreter can do so.
         if descriptor {
             return Err(crate::linux_abi::LINUX_ENOSYS);
         }
@@ -1511,9 +1519,9 @@ mod tests {
         std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::rename(&replacement, &path).unwrap();
 
-        let mut asked = None;
+        let asked = std::cell::Cell::new(None);
         let served = prepare_native_exec_image(&capability, &payload(Some(table)), |t, fd| {
-            asked = Some((t, fd));
+            asked.set(Some((t, fd)));
             Ok(opened.clone())
         })
         .map(|loaded| loaded.source.resolved_path().to_owned());
@@ -1523,7 +1531,7 @@ mod tests {
             "fexecve runs the opened image, never the replacement at its path"
         );
         assert_eq!(
-            asked,
+            asked.get(),
             Some((table, 3)),
             "selected in the caller's own table"
         );
@@ -1571,7 +1579,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             prepare_native_exec_image(&capability, &payload(Some(table)), |_, _| {
-                Ok(script_source)
+                Ok(script_source.clone())
             })
             .map(|_| ()),
             Err(crate::linux_abi::LINUX_ENOSYS)
@@ -1981,31 +1989,33 @@ mod tests {
             flags: carrick_abi::LINUX_AT_EMPTY_PATH as u32,
         };
         let table = [7, 8, 9];
-        let mut asked = None;
+        let asked = std::cell::Cell::new(None);
         let by_descriptor = prepare_native_x86_exec_image(
             &capability,
             &x86_exec_payload(fexecve, "", &[b"opened"], Some(table)),
             |t, fd| {
-                asked = Some((t, fd));
-                Ok(source)
+                asked.set(Some((t, fd)));
+                Ok(source.clone())
             },
         )
         .expect("fexecve loads the open file");
-        assert_eq!(asked, Some((table, 3)));
+        assert_eq!(asked.get(), Some((table, 3)));
         assert_eq!(by_descriptor.entry().entry.raw(), 0x401000);
 
+        std::fs::remove_file(&opened).unwrap();
+        let resolve = |selected, fd| {
+            assert_eq!(selected, table);
+            match fd {
+                3 => Ok(source.clone()),
+                9 => Err(carrick_abi::LINUX_EBADF),
+                _ => panic!("unexpected descriptor {fd}"),
+            }
+        };
         for spelling in ["/proc/self/fd/3", "/dev/fd/3"] {
             let image = prepare_native_x86_exec_image(
                 &capability,
                 &x86_exec_payload(ExecCall::Execve, spelling, &[b"opened"], Some(table)),
-                |selected, fd| {
-                    assert_eq!((selected, fd), (table, 3));
-                    Ok(ExecSource::host(
-                        std::fs::File::open(&opened).unwrap(),
-                        opened.to_str().unwrap().to_owned(),
-                    )
-                    .unwrap())
-                },
+                resolve,
             )
             .expect("execve of an fd path loads the open file");
             assert_eq!(image.entry().entry.raw(), 0x401000);
@@ -2013,15 +2023,13 @@ mod tests {
         for (spelling, errno) in [
             ("/proc/self/fd/9", carrick_abi::LINUX_ENOENT),
             ("/proc/self/fd/3/", carrick_abi::LINUX_ENOTDIR),
+            ("/proc/self/fd/03", carrick_abi::LINUX_ENOENT),
             ("/proc/self/exe", carrick_abi::LINUX_ENOSYS),
         ] {
             let result = prepare_native_x86_exec_image(
                 &capability,
                 &x86_exec_payload(ExecCall::Execve, spelling, &[b"opened"], Some(table)),
-                |selected, fd| {
-                    assert_eq!((selected, fd), (table, 9));
-                    Err(carrick_abi::LINUX_EBADF)
-                },
+                resolve,
             );
             assert_eq!(result.map(|_| ()), Err(errno), "{spelling}");
         }

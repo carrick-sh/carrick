@@ -24,7 +24,12 @@ vm_free = [
   "carrick-kernel::dispatch::executable_authority::tests::retained_host_source_rechecks_execute_mode_on_exact_object",
   "carrick-kernel::dispatch::executable_authority::tests::proc_exe_fd_keeps_original_source_after_process_exec_identity_changes",
   "carrick-runtime::runtime::exec::tests",
+  "carrick-runtime::runtime::exec::tests::{native_child_fexecve_executes_the_open_file_not_its_path,native_child_x86_exec_loads_its_successor_through_the_shared_loader} (native proc and dev fd paths select the sealed ring descriptor and survive rename or unlink)",
   "carrick-runtime::runtime::exec::tests::native_child_exec_prepares_the_native_guest_machine_through_the_production_entry (#1093 S3: the native guest machine (EM_X86_64 on an x86_64 host) prepares through prepare_native_exec_image with no Rosetta redirect; the other ISA's ELF is ENOEXEC)",
+]
+
+embed = [
+  "KVM: carrick-vmm-kvm::cpl0_entry::production_child_execs_through_its_proc_fd_path (a fork child opens the ELF through its ring table and uses its proc fd path; the parent collects the successor's exit, with one receipt reserved, sealed, adopted and settled)",
 ]
 
 [bindings.unresolved]
