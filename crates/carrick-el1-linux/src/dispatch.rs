@@ -1245,7 +1245,7 @@ use carrick_personality_linux::native_host_file::NativeDescriptor;
 
 pub(crate) fn observe_exec_fault(fault: carrick_el1_abi::NativeExecFault) {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    carrick_el1::isa::aarch64::cross_hvc_exec_fault(fault);
+    carrick_el1::isa::aarch64::cross_hvc_exec_fault(fault.words());
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
     let _ = fault;
 }

@@ -69,8 +69,7 @@ pub fn cross_hvc_native_diagnostic(record: &carrick_el1_abi::NativeDiagnostic) {
 }
 
 /// Failure-only observation; no physical service or user memory access.
-pub fn cross_hvc_exec_fault(fault: carrick_el1_abi::NativeExecFault) {
-    let [decision, address, index] = fault.words();
+pub fn cross_hvc_exec_fault([decision, address, index]: [u64; 3]) {
     // SAFETY: HVC transfers scalar observations and resumes the same lane.
     unsafe {
         core::arch::asm!("hvc #6",
