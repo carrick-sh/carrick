@@ -2194,14 +2194,22 @@ fn private_file_4k_grants_scale_past_initial_residency<
 >(
     x86: bool,
     backend: B,
+    provision_extensions: bool,
 ) {
     use carrick_core::mm::frames::{select_backing_window, serve_grant};
-    use carrick_core_abi::{FRAME_GRANT_RESIDENCY_SLOTS, PortalGrantSlot};
+    use carrick_core_abi::{
+        FRAME_GRANT_RESIDENCY_SLOTS, FrameGrantResidencyTable, PortalGrantSlot,
+    };
+    use carrick_el1_abi::{
+        EL1_BOOTSTRAP_METADATA_OFFSET, EL1_BOOTSTRAP_METADATA_SIZE,
+        EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+    };
     use carrick_mmu_core::aarch64::descriptor_txn::{
         BackingIdentity, DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
         TableGrants,
     };
     use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+    use carrick_test_support::TestEl1Region;
 
     // Python/pip startup maps shared libraries and C extensions as private file
     // mappings and first-touches > 4,096 distinct 4 KiB pages in one MM.
@@ -2271,7 +2279,32 @@ fn private_file_4k_grants_scale_past_initial_residency<
         }
     }
     let live = tables.live(&CallerInvalidatesAsid);
-    let residency = residency();
+    let mut storage = TestEl1Region::zeroed();
+    let storage_base = storage.as_mut_ptr();
+    // SAFETY: the fixture owns an aligned region spanning both ABI offsets.
+    let table = unsafe {
+        let address = storage_base
+            .add(EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize)
+            .cast::<FrameGrantResidencyTable>();
+        FrameGrantResidencyTable::init_in_place(address);
+        &*address
+    };
+    let allocator = carrick_el1::alloc::MetadataStorage::new();
+    if provision_extensions {
+        // SAFETY: the bootstrap metadata extent is inside this same region.
+        let bootstrap = unsafe { storage_base.add(EL1_BOOTSTRAP_METADATA_OFFSET as usize) };
+        allocator
+            .admit_bootstrap_region(bootstrap as u64, EL1_BOOTSTRAP_METADATA_SIZE as usize)
+            .unwrap();
+        for index in 0..(TOTAL_PAGES - 1) / FRAME_GRANT_RESIDENCY_SLOTS {
+            table
+                .grow(&allocator, index)
+                .expect("allocate residency segment");
+        }
+    }
+    // SAFETY: fixture allocation uses its ambient address and stays mapped
+    // until both the directory and its window transactions are finished.
+    let residency = unsafe { table.guest_view() };
     let handle = portal.admitted_handle(mm, 0).unwrap();
     let wire = PortalGrantSlot::new();
 
@@ -2294,7 +2327,7 @@ fn private_file_4k_grants_scale_past_initial_residency<
                 carrick_core::mm::transaction::SelectionVenues {
                     prepared: &mut NoopPreparedResolver,
                     cow: &mut NoopCowResolver,
-                    residency: &residency,
+                    residency: table,
                     slot: 0,
                 },
             )
@@ -2430,6 +2463,7 @@ fn arm_private_file_4k_grants_scale_past_initial_residency() {
     private_file_4k_grants_scale_past_initial_residency(
         false,
         carrick_mmu_core::owner_mmu::Aarch64Mmu,
+        false,
     );
 }
 
@@ -2438,6 +2472,27 @@ fn x86_private_file_4k_grants_scale_past_initial_residency() {
     private_file_4k_grants_scale_past_initial_residency(
         true,
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
+        false,
+    );
+}
+
+// These witnesses isolate the shared descriptor owner. Platform first-touch
+// admission still needs to provision extensions before entering that owner.
+#[test]
+fn arm_private_file_grants_apply_across_provisioned_residency_segments() {
+    private_file_4k_grants_scale_past_initial_residency(
+        false,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+        true,
+    );
+}
+
+#[test]
+fn x86_private_file_grants_apply_across_provisioned_residency_segments() {
+    private_file_4k_grants_scale_past_initial_residency(
+        true,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+        true,
     );
 }
 
