@@ -691,6 +691,8 @@ pub fn signal_irq_return(
                 fatal_boot();
             }
             suspended = true;
+        } else if source.zone.slot(slot).queued() != 0 {
+            native_execution::rearm_slice(source.zone, slot);
         }
     }
     if suspended {

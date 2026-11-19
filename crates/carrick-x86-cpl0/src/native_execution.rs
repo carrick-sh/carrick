@@ -272,9 +272,9 @@ fn settle_current_work(current: &carrick_el1_abi::CurrentTask) {
 }
 
 /// Consume the shared timer claim; hardware only supplies a counter interrupt.
-/// A user-origin interrupt with a runnable head rotates in
-/// [`crate::linux_personality::signal_irq_return`] and arms the next slice
-/// immediately before `iretq`.
+/// A user-origin interrupt rotates in [`crate::linux_personality::signal_irq_return`]
+/// when a runnable head is available (arming the next slice immediately before
+/// `iretq`), or re-arms the ongoing slice there when queued work is contended.
 pub fn expire_signal_timer(slot: SlotId) {
     if native_process::is_admitted() {
         expire_timers(slot);
@@ -312,6 +312,23 @@ fn expire_timers(slot: SlotId) {
 /// a thread that never parks, such as a syscall poller, keeps the queued
 /// one off this CPU indefinitely (#2306).
 fn arm_slice(zone: &'static carrick_el1::memory::reservations::X86Cpl0Zone, slot: SlotId) {
+    program_slice(zone, slot, true);
+}
+
+/// Re-arm `slot`'s ongoing slice across a non-rotating user-origin interrupt
+/// while work remains queued (matching ARM's `Sched::program_timer(true)`).
+pub(crate) fn rearm_slice(
+    zone: &'static carrick_el1::memory::reservations::X86Cpl0Zone,
+    slot: SlotId,
+) {
+    program_slice(zone, slot, false);
+}
+
+fn program_slice(
+    zone: &'static carrick_el1::memory::reservations::X86Cpl0Zone,
+    slot: SlotId,
+    restart: bool,
+) {
     use carrick_guest_arch::{CounterTick, Deadline, InterruptBackend};
     if zone.slot(slot).queued() == 0 {
         return;
@@ -321,7 +338,9 @@ fn arm_slice(zone: &'static carrick_el1::memory::reservations::X86Cpl0Zone, slot
     let slice_ticks = ticks(&mut backend, carrick_sched_core::PREEMPT_SLICE_NS);
     let retry_ticks = ticks(&mut backend, TIMER_RETRY_NS);
     let now = backend.counter().unwrap_or_else(|_| fatal_boot()).raw();
-    zone.slot(slot).restart_slice(now);
+    if restart {
+        zone.slot(slot).restart_slice(now);
+    }
     let deadline = with_slice(zone, slot, now, slice_ticks, retry_ticks, timer_deadline);
     backend
         .arm_timer(deadline.map(|ticks| Deadline(CounterTick::new(ticks))))
@@ -329,7 +348,7 @@ fn arm_slice(zone: &'static carrick_el1::memory::reservations::X86Cpl0Zone, slot
 }
 
 /// `deadline`, or the running thread's slice end when that is earlier. A
-/// slice already over is retried shortly rather than at once.
+/// deadline already past is retried shortly rather than at once.
 fn with_slice(
     zone: &carrick_el1::memory::reservations::X86Cpl0Zone,
     slot: SlotId,
@@ -338,13 +357,17 @@ fn with_slice(
     retry_ticks: u64,
     deadline: Option<u64>,
 ) -> Option<u64> {
-    let Some(mut slice_end) = zone.slice_end(slot, now, slice_ticks) else {
-        return deadline;
+    let want = match zone.slice_end(slot, now, slice_ticks) {
+        Some(slice_end) => Some(deadline.map_or(slice_end, |deadline| deadline.min(slice_end))),
+        None => deadline,
     };
-    if slice_end <= now {
-        slice_end = now.saturating_add(retry_ticks);
-    }
-    Some(deadline.map_or(slice_end, |deadline| deadline.min(slice_end)))
+    want.map(|cval| {
+        if cval <= now {
+            now.saturating_add(retry_ticks)
+        } else {
+            cval
+        }
+    })
 }
 
 /// A retried deadline: one millisecond.
