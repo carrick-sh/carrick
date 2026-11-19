@@ -463,7 +463,11 @@ fn in_zone_objects_never_build_a_host_request() {
 #[test]
 fn a_non_allowlisted_ioctl_on_host_stdio_stays_unrouted() {
     let mut user = memory(b"");
-    for request in [0x540F_u64 /* TIOCGPGRP */, 0x5409 /* TCSBRK */, 0x5452 /* FIOASYNC */] {
+    for request in [
+        0x540F_u64, /* TIOCGPGRP */
+        0x5409,     /* TCSBRK */
+        0x5452,     /* FIOASYNC */
+    ] {
         assert_eq!(
             run(
                 HostFileCall::Ioctl {
