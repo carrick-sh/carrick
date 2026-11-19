@@ -137,6 +137,22 @@ child:
     mov $108, %edi
     cmp $-25, %rax
     jne exit
+    lea pipe_fds(%rip), %rdi
+    xor %esi, %esi
+    mov $293, %eax                 /* pipe2 */
+    syscall
+    mov $109, %edi
+    test %rax, %rax
+    jne exit
+
+    mov pipe_fds(%rip), %edi
+    mov $0x5401, %esi              /* TCGETS on an in-zone pipe */
+    lea buf(%rip), %rdx
+    mov $16, %eax
+    syscall
+    mov $110, %edi
+    cmp $-25, %rax
+    jne exit
     xor %edi, %edi
     jmp exit
 #elif defined(XATTRS)
@@ -597,6 +613,10 @@ empty: .asciz ""
 msg: .ascii "x"
 #ifdef HOST_IOCTL
 enabled: .long 1
+.pushsection .bss
+.p2align 2
+pipe_fds: .skip 8
+.popsection
 #endif
 #ifdef XATTRS
 xattr_name: .asciz "user.witness"

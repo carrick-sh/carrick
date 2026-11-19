@@ -9,7 +9,7 @@
 schema_version = 1
 id = "kernel.native.host-file-venue"
 title = "Native processes cross to the host only for host files, through the dispatcher's own path"
-guest_surfaces = ["syscall:read", "syscall:pread64", "syscall:lseek", "syscall:getdents64", "syscall:fstat", "syscall:newfstatat", "syscall:statx", "syscall:openat", "syscall:faccessat", "syscall:write", "syscall:writev", "syscall:chdir", "syscall:getcwd", "syscall:execve", "syscall:mkdirat", "syscall:unlinkat", "syscall:symlinkat", "syscall:linkat", "syscall:renameat", "syscall:renameat2", "syscall:utimensat", "syscall:truncate", "syscall:ftruncate", "syscall:fsync", "syscall:fdatasync", "syscall:sync_file_range", "syscall:syncfs", "syscall:statfs", "syscall:fstatfs", "syscall:fallocate", "syscall:pwrite64", "syscall:pwritev", "syscall:readv", "syscall:preadv"]
+guest_surfaces = ["syscall:read", "syscall:pread64", "syscall:lseek", "syscall:getdents64", "syscall:fstat", "syscall:newfstatat", "syscall:statx", "syscall:openat", "syscall:faccessat", "syscall:write", "syscall:writev", "syscall:chdir", "syscall:getcwd", "syscall:execve", "syscall:mkdirat", "syscall:unlinkat", "syscall:symlinkat", "syscall:linkat", "syscall:renameat", "syscall:renameat2", "syscall:utimensat", "syscall:truncate", "syscall:ftruncate", "syscall:fsync", "syscall:fdatasync", "syscall:sync_file_range", "syscall:syncfs", "syscall:statfs", "syscall:fstatfs", "syscall:fallocate", "syscall:pwrite64", "syscall:pwritev", "syscall:readv", "syscall:preadv", "syscall:ioctl", "syscall:getxattr", "syscall:listxattr", "syscall:setxattr"]
 semantic_authority = ["man 2 read", "man 2 pread", "man 2 lseek", "man 2 getdents64", "man 2 fstat", "man 2 statx", "man 2 openat", "man 2 pipe", "man 2 mkdirat", "man 2 unlinkat", "man 2 symlinkat", "man 2 linkat", "man 2 renameat2", "man 2 utimensat", "man 2 truncate", "owner decision on #231, #894 and #937"]
 fixture = "unit:native_reads_equal_the_dispatchers_own_syscalls"
 scale_points = [1, 4095]
@@ -57,6 +57,13 @@ Positional writes use the same description lock and positioned write core
 as host-served calls. Reads gather into one bounded carrier reply and the
 ring scatters it into the staged iovecs. Positional reads and writes leave
 the shared descriptor position intact.
+
+Native host ioctl accepts Linux terminal attribute and window-size requests,
+FIONBIO and FIONREAD. Each accepted request crosses with a fixed-size layout.
+FIONBIO changes one bit of the pinned open description's status word, shared
+by dup and fork. Unlisted host requests return ENOTTY. Xattr records carry
+the caller's path or pinned descriptor and use the existing VFS xattr
+operations. A zero-size get or list returns the required byte count.
 
 #671 R1c neutral CPL0 boot extraction: the helper boundary preserves the
 existing descriptor writes and ordering. Existing Linux/KVM bindings run:
@@ -142,6 +149,8 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_fork_child_resolves_relative_paths_through_dirfds",
   "carrick-el1-linux::aarch64_process_tests::arm_fork_child_syncs_and_queries_its_host_file",
   "carrick-el1-linux::aarch64_process_tests::arm_fork_child_uses_positioned_and_vectored_io",
+  "carrick-el1-linux::aarch64_process_tests::arm_fork_child_uses_host_file_xattrs",
+  "carrick-el1-linux::aarch64_process_tests::arm_fork_child_uses_allowlisted_host_ioctls",
   "carrick-personality-linux::native_host_file::tests::in_zone_fstat_is_answered_in_ring_with_the_shared_record",
   "carrick-personality-linux::native_host_file::tests::in_zone_objects_never_build_a_host_request",
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd",
@@ -162,6 +171,8 @@ embed = [
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_resolves_relative_paths_through_dirfds",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_syncs_and_queries_its_host_file",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_uses_positioned_and_vectored_io",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_uses_host_file_xattrs",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_uses_allowlisted_host_ioctls",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_cwd_is_inherited_and_isolated (native Linux control and directory-specific marker bytes)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_two_live_processes_keep_distinct_cwds (native Linux control and directory-specific marker bytes)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_reads_the_injected_resolv_conf_over_the_images (#2418: x86 witness of the shared carrier read; the root reads the injected nameserver, never the image's, then end of file; red: exit 11, -38 ENOSYS)",

@@ -2635,6 +2635,22 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         Self::set_ofd_flags(self.ofd(pin.key.index)?, flags)
     }
 
+    /// FIONBIO mutates one flag on the pinned open description. A concurrent
+    /// F_SETFL can update the whole word without losing unrelated flags.
+    pub fn set_pinned_nonblock(&self, pin: &OfdPin, enable: bool) -> Result<(), Error> {
+        self.check_pin(pin)?;
+        let mode = &self.ofd(pin.key.index)?.mode;
+        if mode.load(Ordering::Acquire) & MODE_ACCESS == 3 {
+            return Err(Error::BadFd);
+        }
+        if enable {
+            mode.fetch_or(MODE_NONBLOCK, Ordering::AcqRel);
+        } else {
+            mode.fetch_and(!MODE_NONBLOCK, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
     /// Add host-owned close-time work to this exact open description. Effects
     /// are sticky for the incarnation: retaining an unnecessary host close is
     /// safe, while clearing one before every numeric alias closes would lose

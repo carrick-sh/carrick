@@ -102,10 +102,39 @@ pub struct NativeNamespace<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadlinkSize(pub i32);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum XattrOperand {
+    Path { address: u64, follow: bool },
+    Description(i32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum XattrCall {
+    Get {
+        name: u64,
+        output: u64,
+        size: u64,
+    },
+    List {
+        output: u64,
+        size: u64,
+    },
+    Set {
+        name: u64,
+        value: u64,
+        size: u64,
+        flags: u64,
+    },
+}
+
 /// A host-file call the native venue knows, decoded from canonical
 /// arguments. Pointers are still untrusted user addresses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostFileCall {
+    Xattr {
+        operand: XattrOperand,
+        call: XattrCall,
+    },
     Fsync {
         fd: i32,
     },
@@ -288,6 +317,7 @@ pub enum HostFileCall {
     Ioctl {
         fd: i32,
         request: u64,
+        arg: u64,
     },
     /// A private file mapping (`mmap` without `MAP_ANONYMOUS`/`MAP_SHARED`).
     MapPrivate(NativeMapKey),
@@ -437,6 +467,11 @@ impl HostFileCall {
             {
                 !delegated(fd)
             }
+            Self::Xattr { operand, .. } => match operand {
+                XattrOperand::Path { .. } => origin != ServiceOrigin::Initial,
+                XattrOperand::Description(fd) => origin != ServiceOrigin::Initial || !delegated(fd),
+            },
+            Self::Ioctl { fd, .. } => origin != ServiceOrigin::Initial || !delegated(fd),
             Self::Pwrite64 { fd, .. } | Self::Pwritev { fd, .. } | Self::Readv { fd, .. } => {
                 origin != ServiceOrigin::Initial || !delegated(fd)
             }
@@ -500,6 +535,51 @@ impl HostFileCall {
         use crate::crossing::nr;
         let fd = args[0] as i32;
         Some(match canonical {
+            c if c == nr::GETXATTR || c == nr::LGETXATTR || c == nr::FGETXATTR => Self::Xattr {
+                operand: if c == nr::FGETXATTR {
+                    XattrOperand::Description(fd)
+                } else {
+                    XattrOperand::Path {
+                        address: args[0],
+                        follow: c != nr::LGETXATTR,
+                    }
+                },
+                call: XattrCall::Get {
+                    name: args[1],
+                    output: args[2],
+                    size: args[3],
+                },
+            },
+            c if c == nr::LISTXATTR || c == nr::LLISTXATTR || c == nr::FLISTXATTR => Self::Xattr {
+                operand: if c == nr::FLISTXATTR {
+                    XattrOperand::Description(fd)
+                } else {
+                    XattrOperand::Path {
+                        address: args[0],
+                        follow: c != nr::LLISTXATTR,
+                    }
+                },
+                call: XattrCall::List {
+                    output: args[1],
+                    size: args[2],
+                },
+            },
+            c if c == nr::SETXATTR || c == nr::LSETXATTR || c == nr::FSETXATTR => Self::Xattr {
+                operand: if c == nr::FSETXATTR {
+                    XattrOperand::Description(fd)
+                } else {
+                    XattrOperand::Path {
+                        address: args[0],
+                        follow: c != nr::LSETXATTR,
+                    }
+                },
+                call: XattrCall::Set {
+                    name: args[1],
+                    value: args[2],
+                    size: args[3],
+                    flags: args[4],
+                },
+            },
             c if c == nr::PWRITE64 => Self::Pwrite64 {
                 fd,
                 buf: args[1],
@@ -694,7 +774,8 @@ impl HostFileCall {
             },
             c if c == nr::IOCTL => Self::Ioctl {
                 fd,
-                request: args[1],
+                request: u64::from(args[1] as u32),
+                arg: args[2],
             },
             c if c == nr::CHDIR => Self::Chdir { path: args[0] },
             c if c == nr::FCHDIR => Self::Fchdir { fd },
@@ -956,6 +1037,36 @@ fn is_terminal_request(request: u64) -> bool {
     (request & 0xff00) == 0x5400
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostIoctl {
+    Get(usize),
+    Set(usize),
+}
+
+// Only these Linux requests can cross as a native host file ioctl. The carrier
+// checks the same table and translates the request and layout before using libc.
+pub fn host_ioctl(request: u64) -> Option<HostIoctl> {
+    use carrick_syscall_abi::{
+        LINUX_FIONBIO, LINUX_FIONREAD, LINUX_TCGETA, LINUX_TCGETS, LINUX_TCGETS2, LINUX_TCSETA,
+        LINUX_TCSETAF, LINUX_TCSETAW, LINUX_TCSETS, LINUX_TCSETS2, LINUX_TCSETSF, LINUX_TCSETSF2,
+        LINUX_TCSETSW, LINUX_TCSETSW2, LINUX_TERMIO_SIZE, LINUX_TERMIOS_KERNEL_SIZE,
+        LINUX_TERMIOS2_SIZE, LINUX_TIOCGWINSZ, LINUX_TIOCSWINSZ,
+    };
+    Some(match request {
+        LINUX_TCGETS => HostIoctl::Get(LINUX_TERMIOS_KERNEL_SIZE),
+        LINUX_TCGETS2 => HostIoctl::Get(LINUX_TERMIOS2_SIZE),
+        LINUX_TCGETA => HostIoctl::Get(LINUX_TERMIO_SIZE),
+        LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => HostIoctl::Set(LINUX_TERMIOS_KERNEL_SIZE),
+        LINUX_TCSETS2 | LINUX_TCSETSW2 | LINUX_TCSETSF2 => HostIoctl::Set(LINUX_TERMIOS2_SIZE),
+        LINUX_TCSETA | LINUX_TCSETAW | LINUX_TCSETAF => HostIoctl::Set(LINUX_TERMIO_SIZE),
+        LINUX_TIOCGWINSZ => HostIoctl::Get(8),
+        LINUX_TIOCSWINSZ => HostIoctl::Set(8),
+        LINUX_FIONREAD => HostIoctl::Get(4),
+        LINUX_FIONBIO => HostIoctl::Set(4),
+        _ => return None,
+    })
+}
+
 enum Path {
     Bytes(Vec<u8>),
     Stage(HostFileStage),
@@ -1119,6 +1230,82 @@ impl Staging<'_, '_> {
                 self.request(op, fd, flags, args, &[], Some(output))
             }
         })
+    }
+
+    fn xattr(
+        &mut self,
+        operand: XattrOperand,
+        call: XattrCall,
+        user: &mut dyn HostFileUser,
+    ) -> Option<HostFileStage> {
+        let (fd, flags, mut input) = match operand {
+            XattrOperand::Description(fd) => match self.descriptor(fd)? {
+                NativeDescriptor::Absent
+                | NativeDescriptor::HostBacked {
+                    access: DescriptionAccess::Path,
+                } => {
+                    return Some(errno(carrick_syscall_abi::LINUX_EBADF));
+                }
+                NativeDescriptor::InZone(_) => {
+                    return Some(errno(carrick_syscall_abi::LINUX_EOPNOTSUPP));
+                }
+                NativeDescriptor::HostBacked { .. } => {
+                    (fd, host_file::XATTR_DESCRIPTOR, Vec::new())
+                }
+            },
+            XattrOperand::Path { address, follow } => {
+                let (base, path) = match self.path_input(user, LINUX_AT_FDCWD, address)? {
+                    Ok(resolved) => resolved,
+                    Err(stage) => return Some(stage),
+                };
+                (
+                    base,
+                    if follow { 0 } else { host_file::XATTR_NOFOLLOW },
+                    path,
+                )
+            }
+        };
+        input.push(0);
+        let (op, name, output) = match call {
+            XattrCall::List { output, size } => (HostFileOp::ListXattr, None, Some((output, size))),
+            XattrCall::Get { name, output, size } => {
+                (HostFileOp::GetXattr, Some(name), Some((output, size)))
+            }
+            XattrCall::Set { name, .. } => (HostFileOp::SetXattr, Some(name), None),
+        };
+        if let Some(name) = name {
+            match copy_path(user, name) {
+                Path::Bytes(name) => input.extend_from_slice(&name),
+                Path::Stage(stage) => return Some(stage),
+            }
+            input.push(0);
+        }
+        let mut args = [0; 4];
+        if let XattrCall::Set {
+            value, size, flags, ..
+        } = call
+        {
+            if size > HOST_FILE_CHUNK_BYTES as u64 {
+                return Some(errno(carrick_syscall_abi::LINUX_E2BIG));
+            }
+            args[0] = flags;
+            if let Err(address) = gather_user(user, &mut input, value, size as usize) {
+                return Some(HostFileStage::Fault {
+                    address,
+                    access: Access::Read,
+                });
+            }
+        }
+        Some(self.request(
+            op,
+            fd,
+            flags,
+            args,
+            &input,
+            output.and_then(|(address, size)| {
+                (size > 0).then(|| HostFileOutput::bytes(address, chunk(size)))
+            }),
+        ))
     }
 
     /// A descriptor operation that shares the carrier's file-description core.
@@ -1398,9 +1585,12 @@ pub fn stage(
     user: &mut dyn HostFileUser,
 ) -> Option<HostFileStage> {
     let staged = stage_call(call, namespace, user)?;
-    // readlink has no consumptive effect. Its reply length, not bufsiz,
-    // determines which pages the retained ring copyout must prepare.
-    if matches!(call, HostFileCall::Readlinkat { .. }) {
+    // These queries have no consumptive effect. The retained ring copyout
+    // prepares only the bytes the carrier actually returned.
+    if matches!(
+        call,
+        HostFileCall::Readlinkat { .. } | HostFileCall::Ioctl { .. } | HostFileCall::Xattr { .. }
+    ) {
         return Some(staged);
     }
     if let HostFileStage::Request {
@@ -1487,6 +1677,7 @@ fn stage_call(
 ) -> Option<HostFileStage> {
     let mut staging = Staging { namespace };
     Some(match call {
+        HostFileCall::Xattr { operand, call } => return staging.xattr(operand, call, user),
         HostFileCall::Pwrite64 {
             fd,
             buf,
@@ -2190,12 +2381,40 @@ fn stage_call(
                 Some(HostFileOutput::bytes(dirp, chunk(count))),
             ),
         },
-        HostFileCall::Ioctl { fd, request } => match staging.descriptor(fd)? {
+        HostFileCall::Ioctl { fd, request, arg } => match staging.descriptor(fd)? {
             NativeDescriptor::InZone(
                 InZoneKind::Pipe(_) | InZoneKind::Stream(_) | InZoneKind::EventFd,
-            ) if is_terminal_request(request) => errno(carrick_syscall_abi::LINUX_ENOTTY),
-            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
-            // Other requests, and host-backed terminals, keep their route.
+            ) if is_terminal_request(request)
+                && !matches!(
+                    request,
+                    carrick_syscall_abi::LINUX_FIONREAD | carrick_syscall_abi::LINUX_FIONBIO
+                ) =>
+            {
+                errno(carrick_syscall_abi::LINUX_ENOTTY)
+            }
+            NativeDescriptor::Absent
+            | NativeDescriptor::HostBacked {
+                access: DescriptionAccess::Path,
+            } => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { .. } => {
+                let Some(shape) = host_ioctl(request) else {
+                    return Some(errno(carrick_syscall_abi::LINUX_ENOTTY));
+                };
+                let mut bytes = [0; carrick_syscall_abi::LINUX_TERMIOS2_SIZE];
+                let (input, output): (&[u8], _) = match shape {
+                    HostIoctl::Get(len) => (&[], Some(HostFileOutput::bytes(arg, len))),
+                    HostIoctl::Set(len) => {
+                        if !user.copy_in(&mut bytes[..len], arg) {
+                            return Some(HostFileStage::Fault {
+                                address: arg,
+                                access: Access::Read,
+                            });
+                        }
+                        (&bytes[..len], None)
+                    }
+                };
+                staging.request(HostFileOp::Ioctl, fd, 0, [request, 0, 0, 0], input, output)
+            }
             _ => return None,
         },
         HostFileCall::MapPrivate(key) => match staging.descriptor(key.fd)? {

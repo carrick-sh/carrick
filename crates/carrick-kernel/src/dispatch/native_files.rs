@@ -16,7 +16,7 @@ use std::sync::Arc;
 use carrick_abi::{LINUX_AT_FDCWD, LinuxOpenFlags};
 use carrick_core_abi::host_file::{AccessContext, HostFileHeader, HostFileOp, HostFileRequestView};
 use carrick_el1_abi::ipc::fd;
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use super::resources::NativeFsAuthority;
 use super::{DispatchOutcome, SyscallDispatcher};
@@ -493,37 +493,49 @@ impl SyscallDispatcher {
             if header.op == HostFileOp::Readlinkat {
                 authority.executable = executable;
             }
-            // Carrick's VFS names paths as UTF-8; any other byte string is
-            // not served rather than altered.
-            let path = std::str::from_utf8(path).map_err(|_| NativeHostFileRefusal)?;
-            let capacity = view.output_capacity();
             if matches!(
                 header.op,
-                HostFileOp::Fchdir | HostFileOp::Fchmod | HostFileOp::Fchown
+                HostFileOp::GetXattr | HostFileOp::ListXattr | HostFileOp::SetXattr
             ) {
-                // A descriptor call with the caller's authority: no path.
-                if !path.is_empty() {
-                    return Err(NativeHostFileRefusal);
-                }
                 super::resources::with_native_fs_scope(&authority, || {
-                    if header.op == HostFileOp::Fchdir {
-                        self.serve_native_fchdir(owner, table, header)
-                    } else {
-                        self.serve_native_descriptor_attr(owner, table, header)
-                    }
+                    self.serve_native_xattr(owner, table, header, path, view.output_capacity())
                 })
                 .ok_or(NativeHostFileRefusal)?
-            } else if path.is_empty() {
-                // The descriptor form of a path call (`statx(fd, "",
-                // AT_EMPTY_PATH)`): it names the caller's descriptor, which
-                // lives in its ring table, never a host fd table (#1503).
-                self.serve_native_empty_path(owner, table, header, capacity)
             } else {
-                super::resources::with_native_fs_scope(&authority, || {
-                    self.serve_native_path_request(owner, table, header, path, capacity)
-                })
-                .ok_or(NativeHostFileRefusal)?
+                // Carrick's VFS names paths as UTF-8; any other byte string is
+                // not served rather than altered.
+                let path = std::str::from_utf8(path).map_err(|_| NativeHostFileRefusal)?;
+                let capacity = view.output_capacity();
+                if matches!(
+                    header.op,
+                    HostFileOp::Fchdir | HostFileOp::Fchmod | HostFileOp::Fchown
+                ) {
+                    // A descriptor call with the caller's authority: no path.
+                    if !path.is_empty() {
+                        return Err(NativeHostFileRefusal);
+                    }
+                    super::resources::with_native_fs_scope(&authority, || {
+                        if header.op == HostFileOp::Fchdir {
+                            self.serve_native_fchdir(owner, table, header)
+                        } else {
+                            self.serve_native_descriptor_attr(owner, table, header)
+                        }
+                    })
+                    .ok_or(NativeHostFileRefusal)?
+                } else if path.is_empty() {
+                    // The descriptor form of a path call (`statx(fd, "",
+                    // AT_EMPTY_PATH)`): it names the caller's descriptor, which
+                    // lives in its ring table, never a host fd table (#1503).
+                    self.serve_native_empty_path(owner, table, header, capacity)
+                } else {
+                    super::resources::with_native_fs_scope(&authority, || {
+                        self.serve_native_path_request(owner, table, header, path, capacity)
+                    })
+                    .ok_or(NativeHostFileRefusal)?
+                }
             }
+        } else if header.op == HostFileOp::Ioctl {
+            self.serve_native_ioctl(owner, table, header, view.input(), view.output_capacity())
         } else if header.op == HostFileOp::Poll {
             match self.serve_native_poll(
                 owner,
@@ -1099,6 +1111,10 @@ impl SyscallDispatcher {
             }
             HostFileOp::MapPrivate => self.native_map_source(description),
             HostFileOp::Openat
+            | HostFileOp::GetXattr
+            | HostFileOp::ListXattr
+            | HostFileOp::SetXattr
+            | HostFileOp::Ioctl
             | HostFileOp::Statfs
             | HostFileOp::Faccessat
             | HostFileOp::Newfstatat
@@ -1229,6 +1245,231 @@ impl SyscallDispatcher {
                 non_file_errno.map_or(Served::Refused, Served::errno)
             }
             Err(PinnedHostResourceError::Unavailable) => Served::Refused,
+        }
+    }
+
+    fn serve_native_xattr(
+        &self,
+        owner: &Arc<HostIpc>,
+        table: fd::TableId,
+        header: HostFileHeader,
+        input: &[u8],
+        capacity: usize,
+    ) -> Served {
+        use carrick_core_abi::host_file::{XATTR_DESCRIPTOR, XATTR_NOFOLLOW};
+        let split = |input: &[u8]| input.iter().position(|&byte| byte == 0);
+        let Some(path_len) = split(input) else {
+            return Served::Refused;
+        };
+        let (path, payload) = (&input[..path_len], &input[path_len + 1..]);
+        let follow = header.flags & XATTR_NOFOLLOW == 0;
+        let fs = self.fs_view();
+        let serve = |path: Result<String, carrick_abi::LinuxErrno>| {
+            let resolved = match path {
+                Ok(path) => path,
+                Err(errno) => return Served::errno(errno),
+            };
+            let bytes = if header.op == HostFileOp::ListXattr && payload.is_empty() {
+                fs.list_xattr_bytes(&resolved, follow)
+            } else if let Some(name_len) = split(payload) {
+                let (name, value) = (&payload[..name_len], &payload[name_len + 1..]);
+                let Ok(name) = std::str::from_utf8(name) else {
+                    return Served::errno(carrick_abi::LINUX_EINVAL);
+                };
+                match header.op {
+                    HostFileOp::GetXattr if value.is_empty() => {
+                        fs.get_xattr_bytes(&resolved, name, follow)
+                    }
+                    HostFileOp::SetXattr => {
+                        return match fs.set_xattr_bytes(
+                            &resolved,
+                            name,
+                            header.args[0],
+                            follow,
+                            || Ok(value),
+                        ) {
+                            Ok(()) => Served::value(0),
+                            Err(errno) => Served::errno(errno),
+                        };
+                    }
+                    _ => return Served::Refused,
+                }
+            } else {
+                return Served::Refused;
+            };
+            match bytes {
+                Ok(bytes) if capacity == 0 => Served::value(bytes.len() as i64),
+                Ok(bytes) if bytes.len() <= capacity => Served::Reply(bytes.len() as i64, bytes),
+                Ok(_) => Served::errno(carrick_abi::LINUX_ERANGE),
+                Err(errno) => Served::errno(errno),
+            }
+        };
+        if header.flags == XATTR_DESCRIPTOR && path.is_empty() {
+            let unsupported = carrick_abi::LINUX_EOPNOTSUPP;
+            self.with_native_description(
+                owner,
+                table,
+                fd::Fd(header.fd),
+                Some(unsupported),
+                || Served::errno(unsupported),
+                |description| serve(super::FsView::description_xattr_path(description)),
+            )
+        } else if header.flags & !XATTR_NOFOLLOW == 0 {
+            serve(fs.resolve_xattr_path(&carrick_vfs::pathcodec::encode_bytes(path), follow))
+        } else {
+            Served::Refused
+        }
+    }
+
+    fn serve_native_ioctl(
+        &self,
+        owner: &Arc<HostIpc>,
+        table: fd::TableId,
+        header: HostFileHeader,
+        input: &[u8],
+        capacity: usize,
+    ) -> Served {
+        use carrick_abi::{LINUX_EBADF, LINUX_ENOTTY, LINUX_FIONBIO, LINUX_FIONREAD};
+        use carrick_personality_linux::native_host_file::{HostIoctl, host_ioctl};
+
+        let request = header.args[0];
+        match host_ioctl(request) {
+            Some(HostIoctl::Get(want)) if input.is_empty() && capacity == want => {}
+            Some(HostIoctl::Set(want)) if input.len() == want && capacity == 0 => {}
+            Some(_) => return Served::Refused,
+            None => return Served::errno(LINUX_ENOTTY),
+        }
+        let fd = fd::Fd(header.fd);
+        if request == LINUX_FIONBIO {
+            let Ok(bytes) = <[u8; 4]>::try_from(input) else {
+                return Served::Refused;
+            };
+            return match owner.set_host_nonblock(table, fd, i32::from_le_bytes(bytes) != 0) {
+                Ok(()) => Served::value(0),
+                Err(PinnedHostResourceError::BadFd) => Served::errno(LINUX_EBADF),
+                Err(PinnedHostResourceError::InZone) => Served::errno(LINUX_ENOTTY),
+                Err(PinnedHostResourceError::Unavailable) => Served::Refused,
+            };
+        }
+        let serve = |descriptor: &crate::kernel::FileDescription| {
+            if let Some(stream) = duplicated_stdio_stream(descriptor) {
+                return Self::native_ioctl_fd(stream, request, input);
+            }
+            let open = descriptor.inspect_kind(|kind| {
+                use super::fd_table::OpenDescription;
+                match kind {
+                    OpenDescription::HostPipe { host_fd, .. }
+                    | OpenDescription::HostFile { host_fd, .. }
+                    | OpenDescription::HostSocket { host_fd, .. } => {
+                        Some(Self::native_ioctl_fd(host_fd.raw(), request, input))
+                    }
+                    _ => None,
+                }
+            });
+            open.flatten().unwrap_or_else(|| {
+                if request == LINUX_FIONREAD {
+                    Served::Reply(0, 0i32.to_le_bytes().to_vec())
+                } else {
+                    Served::errno(LINUX_ENOTTY)
+                }
+            })
+        };
+        let result = owner.with_pinned_host_resource(table, fd, |resource| {
+            if let Some(stdio) = resource.downcast_ref::<ImplicitHostStdio>() {
+                return Self::native_ioctl_fd(stdio.fd.0, request, input);
+            }
+            if let Some(open) = resource.downcast_ref::<NativeOpenFile>() {
+                return serve(&open.description);
+            }
+            if let Some(hold) = resource.downcast_ref::<crate::kernel::objects::IpcPhysicalHold>() {
+                return hold
+                    .retain_io()
+                    .map_or(Served::Refused, |lease| serve(lease.description()));
+            }
+            Served::errno(LINUX_ENOTTY)
+        });
+        match result {
+            Ok(served) => served,
+            Err(PinnedHostResourceError::BadFd) => Served::errno(LINUX_EBADF),
+            Err(PinnedHostResourceError::InZone) => Served::errno(LINUX_ENOTTY),
+            Err(PinnedHostResourceError::Unavailable) => Served::Refused,
+        }
+    }
+
+    fn native_ioctl_fd(fd: i32, request: u64, input: &[u8]) -> Served {
+        use super::fs::ioctl::{linux_termio_bytes, merge_linux_termio};
+        use crate::host_tty;
+        use carrick_abi::{
+            LINUX_ENOTTY, LINUX_FIONREAD, LINUX_TCGETA, LINUX_TCGETS, LINUX_TCGETS2, LINUX_TCSETA,
+            LINUX_TCSETAF, LINUX_TCSETAW, LINUX_TERMIOS_KERNEL_SIZE, LINUX_TERMIOS2_SIZE,
+            LINUX_TIOCGWINSZ, LINUX_TIOCSWINSZ, LinuxTermios, LinuxWinsize,
+        };
+
+        if request == LINUX_FIONREAD {
+            let mut available: libc::c_int = 0;
+            // SAFETY: the resource pin keeps fd open, and available is valid for this ioctl.
+            let result = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut available) };
+            return if result == -1 {
+                Served::errno(crate::host_to_linux_errno(carrick_portable::errno()))
+            } else {
+                Served::Reply(0, available.to_le_bytes().to_vec())
+            };
+        }
+        let Some(termios) = host_tty::get_host_termios(fd) else {
+            return Served::errno(LINUX_ENOTTY);
+        };
+        match request {
+            LINUX_TCGETS => {
+                Served::Reply(0, termios.as_bytes()[..LINUX_TERMIOS_KERNEL_SIZE].to_vec())
+            }
+            LINUX_TCGETS2 => Served::Reply(0, termios.as_bytes().to_vec()),
+            LINUX_TCGETA => Served::Reply(0, linux_termio_bytes(&termios).to_vec()),
+            LINUX_TIOCGWINSZ => host_tty::get_host_winsize(fd).map_or_else(
+                || Served::errno(LINUX_ENOTTY),
+                |size| Served::Reply(0, size.as_bytes().to_vec()),
+            ),
+            LINUX_TIOCSWINSZ => {
+                let Ok(size) = LinuxWinsize::read_from_bytes(input) else {
+                    return Served::Refused;
+                };
+                let size = libc::winsize {
+                    ws_row: size.ws_row,
+                    ws_col: size.ws_col,
+                    ws_xpixel: size.ws_xpixel,
+                    ws_ypixel: size.ws_ypixel,
+                };
+                // SAFETY: fd is a live terminal and size has the host ioctl layout.
+                let result = host_tty::with_sigttou_blocked(true, || unsafe {
+                    libc::ioctl(fd, libc::TIOCSWINSZ, &size)
+                });
+                if result == -1 {
+                    Served::errno(crate::host_to_linux_errno(carrick_portable::errno()))
+                } else {
+                    Served::value(0)
+                }
+            }
+            _ => {
+                let updated = if matches!(request, LINUX_TCSETA | LINUX_TCSETAW | LINUX_TCSETAF) {
+                    match merge_linux_termio(&termios, input) {
+                        Ok(termios) => termios,
+                        Err(errno) => return Served::errno(errno),
+                    }
+                } else {
+                    let mut padded = [0; LINUX_TERMIOS2_SIZE];
+                    padded[..input.len()].copy_from_slice(input);
+                    let Ok(termios) = LinuxTermios::read_from_bytes(&padded) else {
+                        return Served::Refused;
+                    };
+                    termios
+                };
+                if host_tty::with_sigttou_blocked(true, || {
+                    host_tty::set_host_termios_tracking(fd, &updated)
+                }) {
+                    Served::value(0)
+                } else {
+                    Served::errno(crate::host_to_linux_errno(carrick_portable::errno()))
+                }
+            }
         }
     }
 

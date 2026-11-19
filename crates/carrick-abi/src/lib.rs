@@ -582,18 +582,6 @@ impl LinuxWinsize {
     }
 }
 
-/// Size of the Linux kernel-ABI `struct termios` for TCGETS/TCSETS on
-/// aarch64. It's `c_iflag/c_oflag/c_cflag/c_lflag` (4 u32s = 16 bytes)
-/// plus `c_line` (1 byte) and `c_cc[19]` (19 bytes) = **36 bytes**.
-///
-/// The `c_ispeed`/`c_ospeed` fields belong to `struct termios2` (TCGETS2),
-/// a separate ioctl. Writing 44 bytes for TCGETS overflows the
-/// caller's stack-allocated buffer by 8, corrupts the stack canary,
-/// and trips `__stack_chk_fail` later in any glibc program that calls
-/// `isatty()` (which goes through tcgetattr → TCGETS) — i.e. ls, dpkg,
-/// etc. Use [`LINUX_TERMIOS_KERNEL_SIZE`] explicitly for those ioctls.
-pub const LINUX_TERMIOS_KERNEL_SIZE: usize = 36;
-
 /// `c_cflag` character-size mask, from Linux's asm-generic `termbits.h`
 /// (`CSIZE` = `0o000060`; the values inside it are CS5 = `0`, CS6 = `0o000020`,
 /// CS7 = `0o000040`, CS8 = `0o000060`). aarch64 uses the asm-generic table, so
@@ -3688,31 +3676,6 @@ pub const LINUX_PTRACE_POKEDATA: u64 = 5;
 pub const LINUX_PTRACE_POKEUSER: u64 = 6;
 pub const LINUX_PTRACE_ATTACH: u64 = 16;
 pub const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
-pub const LINUX_TCGETS: u64 = 0x5401;
-pub const LINUX_TCSETS: u64 = 0x5402;
-pub const LINUX_TCSETSW: u64 = 0x5403;
-pub const LINUX_TCSETSF: u64 = 0x5404;
-pub const LINUX_TCGETA: u64 = 0x5405;
-pub const LINUX_TCSETA: u64 = 0x5406;
-pub const LINUX_TCSETAW: u64 = 0x5407;
-pub const LINUX_TCSETAF: u64 = 0x5408;
-// termios2 variants. glibc-aarch64 implements tcgetattr/tcsetattr (and thus
-// isatty(3), which goes through tcgetattr) via these — NOT the legacy
-// TCGETS/TCSETS above — so it can carry an arbitrary baud rate (BOTHER) in the
-// c_ispeed/c_ospeed tail. musl still uses the legacy 36-byte TCGETS, which is
-// why a musl-only probe suite never exercised these. The request codes encode a
-// 44-byte payload (`_IOR/_IOW('T', 0x2A..0x2D, struct termios2)`); the struct is
-// [`LinuxTermios`] in full (44 bytes), vs the 36-byte [`LINUX_TERMIOS_KERNEL_SIZE`]
-// prefix used by TCGETS.
-pub const LINUX_TCGETS2: u64 = 0x802c_542a;
-pub const LINUX_TCSETS2: u64 = 0x402c_542b;
-pub const LINUX_TCSETSW2: u64 = 0x402c_542c;
-pub const LINUX_TCSETSF2: u64 = 0x402c_542d;
-/// Size of the older Linux `struct termio` payload used by TCGETA.
-pub const LINUX_TERMIO_SIZE: usize = 18;
-/// Size of the Linux kernel-ABI `struct termios2` (TCGETS2/TCSETS2): the full
-/// [`LinuxTermios`] including the `c_ispeed`/`c_ospeed` tail = **44 bytes**.
-pub const LINUX_TERMIOS2_SIZE: usize = 44;
 // Line-discipline control ioctls (tty_ioctl(4)). glibc maps the tc* helpers
 // onto these: tcdrain → TCSBRK(arg=1), tcsendbreak(dur!=0) → TCSBRKP,
 // tcflush → TCFLSH(queue), tcflow → TCXONC(action).
@@ -3745,14 +3708,10 @@ pub const LINUX_TCIOFLUSH: u64 = 2;
 pub const LINUX_TIOCSCTTY: u64 = 0x540E;
 pub const LINUX_TIOCGPGRP: u64 = 0x540F;
 pub const LINUX_TIOCSPGRP: u64 = 0x5410;
-pub const LINUX_TIOCGWINSZ: u64 = 0x5413;
-pub const LINUX_TIOCSWINSZ: u64 = 0x5414;
 pub const LINUX_TIOCGPTN: u64 = 0x8004_5430;
 pub const LINUX_TIOCSPTLCK: u64 = 0x4004_5431;
-pub const LINUX_FIONREAD: u64 = 0x541B;
 pub const LINUX_FIOCLEX: u64 = 0x5451;
 pub const LINUX_FIONCLEX: u64 = 0x5450;
-pub const LINUX_FIONBIO: u64 = 0x5421;
 pub const LINUX_TIOCNOTTY: u64 = 0x5422;
 pub const LINUX_TIOCGSID: u64 = 0x5429;
 pub const LINUX_TIOCSIG: u64 = 0x4004_5436;
