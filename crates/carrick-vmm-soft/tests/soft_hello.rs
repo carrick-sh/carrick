@@ -604,19 +604,18 @@ fn production_ring_nanosleep_waits_on_host() {
 
 /// Deterministic VM-free slice-start witness on the production CPL0 entry
 /// point: at 50 us per block (100,000 ticks at 2 GHz, or 40 blocks per 2 ms
-/// slice), starting the slice before the ~140-block CPL0 return preparation or
-/// arming a 1 ms retry before rotation expires in CPL0 before user instructions
-/// retire; starting the slice immediately before the 1-block IRET stub lets all
-/// two-live rounds complete inside 200,000 worker blocks.
+/// slice), starting the slice before the ~140-block CPL0 return preparation,
+/// arming a 1 ms retry before rotation, or leaving an expired xAPIC timer IRR
+/// vector latched across scheduler entry expires in CPL0 before user
+/// instructions retire; starting the slice immediately before the IRET stub
+/// lets the two-thread worker retire its multi-slice user loop and raw exit
+/// inside 200,000 worker blocks.
 #[test]
 fn production_ring_slice_starts_after_cpl0_return_preparation() {
     let elf = assemble_static_fixture(
         "slice-return",
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../carrick-vmm-kvm/tests/fixtures/native_robust_raw_exit.S"
-        ),
-        &["-DTWO_LIVE"],
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/slice_return.S"),
+        &[],
     );
     let ticks_per_block =
         std::num::NonZeroU64::new(carrick_vmm_soft::carrier::SOFT_TSC_HZ / 20_000)

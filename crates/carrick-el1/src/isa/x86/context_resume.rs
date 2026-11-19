@@ -77,23 +77,28 @@ unsafe extern "C" {
 /// Install and return a complete parked context on the current physical CPU.
 /// Scheduler record selection, claim ownership and CurrentTask binding belong
 /// to the caller. This function publishes the native address member through
-/// the same X86Backend installation used by ordinary CPL0 entry.
+/// the same X86Backend installation used by ordinary CPL0 entry, then runs
+/// `before_iret` immediately prior to restoring extended/GPR state and `iretq`.
 ///
 /// # Safety
 /// The caller runs at CPL0 with IF masked and kernel GS active, owns the exact
 /// on-CPU record and has bound CurrentTask to it. The expected root retains all
-/// executing supervisor code, stack, binding and context storage. Bootstrap
-/// qualified 48-bit addressing, standard 832-byte XSAVE and XCR0=7 on this CPU.
+/// executing supervisor code, stack, binding and context storage, and
+/// `before_iret` must preserve the installed CR3, TLS and IF-masked kernel GS
+/// state. Bootstrap qualified 48-bit addressing, standard 832-byte XSAVE and
+/// XCR0=7 on this CPU.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub unsafe fn resume_parked(
     words: ParkedContextWords,
     expected: AddressContext<RootGpa>,
+    before_iret: impl FnOnce(),
 ) -> Result<core::convert::Infallible, ArchError> {
     use carrick_guest_arch::MmuBackend;
     let context = prepare_parked_resume(words, expected)?;
     super::super::X86Backend.install_context(context.address)?;
     scheduler::write_tls(scheduler::NativeTlsRegister::Fs, context.fs_base);
     scheduler::write_tls(scheduler::NativeTlsRegister::UserGs, context.gs_base);
+    before_iret();
     // SAFETY: preparation authenticated the complete IRET/MSR/XSAVE image;
     // the caller retains its root and supervisor stack through this return.
     unsafe { carrick_x86_resume_iret(&context.frame, &context.xsave) }
