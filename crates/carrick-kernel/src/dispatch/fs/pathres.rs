@@ -429,6 +429,22 @@ impl<'a> FsView<'a> {
         Ok(resolved)
     }
 
+    /// The description that anchors a path lookup. A carrier must resolve
+    /// the caller's ring descriptor before calling the shared resolver.
+    pub(super) fn path_base_description(
+        &self,
+        fd: carrick_fd_core::Fd,
+    ) -> Option<Arc<crate::kernel::FileDescription>> {
+        if super::super::resources::in_native_fs_scope() {
+            self.native_path_bases
+                .iter()
+                .flatten()
+                .find_map(|(number, description)| (*number == fd).then(|| Arc::clone(description)))
+        } else {
+            self.open_file(fd.0).map(|file| file.description)
+        }
+    }
+
     /// The lexical absolute form of a guest input path (anchor + path, ".."
     /// collapsed), WITHOUT existence/symlink resolution — used to run the DAC
     /// search-permission walk on a path whose full resolution already failed.
@@ -444,11 +460,8 @@ impl<'a> FsView<'a> {
         } else if dirfd == LINUX_AT_FDCWD {
             (fs_context.cwd(), path)
         } else {
-            match crate::kernel::FileDescription::inspect(
-                &self.open_file(dirfd as i32)?.description,
-            )
-            .as_deref()
-            {
+            let description = self.path_base_description(carrick_fd_core::Fd(dirfd as i32))?;
+            match crate::kernel::FileDescription::inspect(&description).as_deref() {
                 Some(OpenDescription::Directory { path: dir, .. }) => (dir.clone(), path),
                 _ => return None,
             }
@@ -579,10 +592,9 @@ impl<'a> FsView<'a> {
         } else if dirfd == LINUX_AT_FDCWD {
             (fs_context.cwd(), path)
         } else {
-            match self.open_file(dirfd as i32).as_ref() {
-                Some(open_file) => {
-                    match crate::kernel::FileDescription::inspect(&open_file.description).as_deref()
-                    {
+            match self.path_base_description(carrick_fd_core::Fd(dirfd as i32)) {
+                Some(description) => {
+                    match crate::kernel::FileDescription::inspect(&description).as_deref() {
                         Some(OpenDescription::Directory {
                             path: dir,
                             trusted_host_dir,
@@ -613,7 +625,11 @@ impl<'a> FsView<'a> {
                 // non-directory, so a relative path can't be anchored to it →
                 // ENOTDIR; only a genuinely-invalid fd is EBADF (statx03 uses
                 // dfd=1 → ENOTDIR, dfd=-1 → EBADF).
-                None if self.fd_is_valid(dirfd as i32) => return Err(LINUX_ENOTDIR),
+                None if !super::super::resources::in_native_fs_scope()
+                    && self.fd_is_valid(dirfd as i32) =>
+                {
+                    return Err(LINUX_ENOTDIR);
+                }
                 None => return Err(LINUX_EBADF),
             }
         };

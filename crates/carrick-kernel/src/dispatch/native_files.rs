@@ -516,7 +516,7 @@ impl SyscallDispatcher {
                 self.serve_native_empty_path(owner, table, header, capacity)
             } else {
                 super::resources::with_native_fs_scope(&authority, || {
-                    self.serve_native_path(owner, table, header, path, capacity)
+                    self.serve_native_path_request(owner, table, header, path, capacity)
                 })
                 .ok_or(NativeHostFileRefusal)?
             }
@@ -1061,7 +1061,8 @@ impl SyscallDispatcher {
         self.with_native_description(
             owner,
             table,
-            header,
+            fd::Fd(header.fd),
+            None,
             || Served::errno(carrick_abi::LINUX_ENOTDIR),
             |description| {
                 let target = match fs.fchdir_target(description) {
@@ -1097,7 +1098,8 @@ impl SyscallDispatcher {
         self.with_native_description(
             owner,
             table,
-            header,
+            fd::Fd(header.fd),
+            None,
             || Served::value(0),
             |description| {
                 served_mutation(if header.op == HostFileOp::Fchmod {
@@ -1119,11 +1121,12 @@ impl SyscallDispatcher {
         &self,
         owner: &Arc<HostIpc>,
         table: fd::TableId,
-        header: HostFileHeader,
+        number: fd::Fd,
+        non_file_errno: Option<carrick_abi::LinuxErrno>,
         stdio: impl FnOnce() -> Served,
         served: impl FnOnce(&Arc<crate::kernel::FileDescription>) -> Served,
     ) -> Served {
-        match owner.with_pinned_host_resource(table, fd::Fd(header.fd), |resource| {
+        match owner.with_pinned_host_resource(table, number, |resource| {
             if resource.downcast_ref::<ImplicitHostStdio>().is_some() {
                 return stdio();
             }
@@ -1136,13 +1139,80 @@ impl SyscallDispatcher {
                     None => Served::Refused,
                 };
             }
-            Served::Refused
+            non_file_errno.map_or(Served::Refused, Served::errno)
         }) {
             Ok(served) => served,
             Err(PinnedHostResourceError::BadFd) => Served::errno(carrick_abi::LINUX_EBADF),
-            Err(PinnedHostResourceError::InZone | PinnedHostResourceError::Unavailable) => {
-                Served::Refused
+            Err(PinnedHostResourceError::InZone) => {
+                non_file_errno.map_or(Served::Refused, Served::errno)
             }
+            Err(PinnedHostResourceError::Unavailable) => Served::Refused,
+        }
+    }
+
+    fn serve_native_path_request(
+        &self,
+        owner: &Arc<HostIpc>,
+        table: fd::TableId,
+        mut header: HostFileHeader,
+        path: &str,
+        capacity: usize,
+    ) -> Served {
+        let first_path = match header.op {
+            HostFileOp::Renameat | HostFileOp::Linkat | HostFileOp::Symlinkat => {
+                let Some((first, second)) = native_path_pair(path) else {
+                    return Served::Refused;
+                };
+                if header.op == HostFileOp::Symlinkat {
+                    second
+                } else {
+                    first
+                }
+            }
+            _ => path,
+        };
+        let base = |number, name: &str| {
+            (number != LINUX_AT_FDCWD as i32 && !name.starts_with('/')).then_some(fd::Fd(number))
+        };
+        let first = base(header.fd, first_path);
+        header.fd = first.map_or(LINUX_AT_FDCWD as i32, |fd| fd.0);
+        let second = if matches!(header.op, HostFileOp::Renameat | HostFileOp::Linkat) {
+            let Some(second_fd) =
+                carrick_core_abi::host_file::decode_second_path_fd(header.args[0])
+            else {
+                return Served::Refused;
+            };
+            let (_, second_path) = native_path_pair(path).expect("validated paired path");
+            base(second_fd.unwrap_or(LINUX_AT_FDCWD as i32), second_path)
+        } else {
+            None
+        };
+        let run = |first_base, second_base| {
+            let mut fs = self.fs_view();
+            fs.native_path_bases = [first_base, second_base];
+            self.serve_native_path(owner, table, header, (path, capacity), fs, second)
+        };
+        let with_second = |first_base| match second.filter(|second| Some(*second) != first) {
+            Some(number) => self.with_native_description(
+                owner,
+                table,
+                number,
+                Some(carrick_abi::LINUX_ENOTDIR),
+                || Served::errno(carrick_abi::LINUX_ENOTDIR),
+                |description| run(first_base, Some((number, Arc::clone(description)))),
+            ),
+            None => run(first_base, None),
+        };
+        match first {
+            Some(number) => self.with_native_description(
+                owner,
+                table,
+                number,
+                Some(carrick_abi::LINUX_ENOTDIR),
+                || Served::errno(carrick_abi::LINUX_ENOTDIR),
+                |description| with_second(Some((number, Arc::clone(description)))),
+            ),
+            None => with_second(None),
         }
     }
 
@@ -1151,10 +1221,12 @@ impl SyscallDispatcher {
         owner: &Arc<HostIpc>,
         table: fd::TableId,
         header: HostFileHeader,
-        path: &str,
-        capacity: usize,
+        (path, capacity): (&str, usize),
+        fs: super::FsView<'_>,
+        second: Option<fd::Fd>,
     ) -> Served {
-        let fs = self.fs_view();
+        let dirfd = header.fd as i64 as u64;
+        let second_dirfd = second.map_or(LINUX_AT_FDCWD, |fd| fd.0 as i64 as u64);
         match header.op {
             HostFileOp::Renameat => {
                 let Some((old, new)) = native_path_pair(path) else {
@@ -1173,9 +1245,9 @@ impl SyscallDispatcher {
                 match fs.rename_paths(
                     None,
                     super::fs::directory::RenameAtRequest {
-                        olddirfd: LINUX_AT_FDCWD,
+                        olddirfd: dirfd,
                         oldpath: old,
-                        newdirfd: LINUX_AT_FDCWD,
+                        newdirfd: second_dirfd,
                         newpath: new,
                         flags,
                         target_tid: None,
@@ -1193,10 +1265,10 @@ impl SyscallDispatcher {
                 }
                 let nofollow = flags != 0;
                 let served = if header.op == HostFileOp::Fchmodat {
-                    fs.chmod_path(None, LINUX_AT_FDCWD, path, header.args[0], nofollow)
+                    fs.chmod_path(None, dirfd, path, header.args[0], nofollow)
                 } else {
                     let (uid, gid) = super::FsView::chown_id_args(header.args[0], header.args[1]);
-                    fs.chown_path(None, LINUX_AT_FDCWD, path, uid, gid, nofollow)
+                    fs.chown_path(None, dirfd, path, uid, gid, nofollow)
                 };
                 match served {
                     Ok(outcome) => served_mutation(outcome),
@@ -1222,8 +1294,7 @@ impl SyscallDispatcher {
                     return Served::errno(carrick_abi::LINUX_EINVAL);
                 };
                 let flags = header.flags & !carrick_core_abi::host_file::UTIMENS_NULL_TIMES;
-                match fs.set_path_times(None, LINUX_AT_FDCWD, path, atime, mtime, u64::from(flags))
-                {
+                match fs.set_path_times(None, dirfd, path, atime, mtime, u64::from(flags)) {
                     Ok(outcome) => served_mutation(outcome),
                     Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
                     Err(_) => Served::Refused,
@@ -1233,14 +1304,7 @@ impl SyscallDispatcher {
                 let Some((old, new)) = native_path_pair(path) else {
                     return Served::Refused;
                 };
-                match fs.link_paths(
-                    None,
-                    LINUX_AT_FDCWD,
-                    old,
-                    LINUX_AT_FDCWD,
-                    new,
-                    u64::from(header.flags),
-                ) {
+                match fs.link_paths(None, dirfd, old, second_dirfd, new, u64::from(header.flags)) {
                     Ok(outcome) => served_mutation(outcome),
                     Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
                     Err(_) => Served::Refused,
@@ -1250,7 +1314,7 @@ impl SyscallDispatcher {
                 let Some((target, path)) = native_path_pair(path) else {
                     return Served::Refused;
                 };
-                match fs.symlink_path(None, target, LINUX_AT_FDCWD, path) {
+                match fs.symlink_path(None, target, dirfd, path) {
                     Ok(outcome) => served_mutation(outcome),
                     Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
                     Err(_) => Served::Refused,
@@ -1262,7 +1326,7 @@ impl SyscallDispatcher {
                 }
                 match fs.unlink_path(
                     None,
-                    LINUX_AT_FDCWD,
+                    dirfd,
                     path,
                     u64::from(header.flags) & carrick_abi::LINUX_AT_REMOVEDIR != 0,
                 ) {
@@ -1271,19 +1335,16 @@ impl SyscallDispatcher {
                     Err(_) => Served::Refused,
                 }
             }
-            HostFileOp::Mkdirat => {
-                match fs.mkdir_path(None, LINUX_AT_FDCWD, path, header.args[0]) {
-                    Ok(outcome) => served_mutation(outcome),
-                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
-                    Err(_) => Served::Refused,
-                }
-            }
+            HostFileOp::Mkdirat => match fs.mkdir_path(None, dirfd, path, header.args[0]) {
+                Ok(outcome) => served_mutation(outcome),
+                Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                Err(_) => Served::Refused,
+            },
             HostFileOp::Readlinkat => {
-                if let Err(errno) = fs.readlink_trailing_slash(fd::Fd(LINUX_AT_FDCWD as i32), path)
-                {
+                if let Err(errno) = fs.readlink_trailing_slash(fd::Fd(header.fd), path) {
                     return Served::errno(errno);
                 }
-                let resolved = match fs.resolve_at_path(LINUX_AT_FDCWD, path) {
+                let resolved = match fs.resolve_at_path(dirfd, path) {
                     Ok(path) => path,
                     Err(errno) => return Served::errno(errno),
                 };
@@ -1304,7 +1365,7 @@ impl SyscallDispatcher {
                 {
                     return Served::errno(carrick_abi::LINUX_EINVAL);
                 }
-                let resolved = match fs.resolve_at_path(LINUX_AT_FDCWD, path) {
+                let resolved = match fs.resolve_at_path(dirfd, path) {
                     Ok(resolved) => resolved,
                     Err(errno) => return Served::errno(errno),
                 };
@@ -1343,7 +1404,7 @@ impl SyscallDispatcher {
                 {
                     return native_chdir_lookup(&fs, path);
                 }
-                match fs.path_stat_record_for(None, LINUX_AT_FDCWD, path, flags) {
+                match fs.path_stat_record_for(None, dirfd, path, flags) {
                     Ok(record) => Served::Reply(0, native_stat_bytes(header.op, &record)),
                     // A caller-relative synthetic answer: unrouted.
                     Err(super::DispatchError::Errno(errno))
@@ -1364,12 +1425,10 @@ impl SyscallDispatcher {
                     refused: false,
                 };
                 let reporter = crate::compat::CompatReporter::default();
-                // The ring stages a cwd-relative or absolute path with
-                // AT_FDCWD; the caller's cwd is the scope's.
                 let opened = fs.open_with_sink(
                     &mut super::fs::OpenSink::Native(&mut native),
                     super::fs::OpenAtArgs {
-                        dirfd: LINUX_AT_FDCWD,
+                        dirfd,
                         path,
                         flags,
                         mode: header.args[1],
