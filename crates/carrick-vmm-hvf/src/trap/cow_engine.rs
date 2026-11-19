@@ -4336,6 +4336,11 @@ impl HvfTaskState {
             })
         };
         drop(registry);
+        if !guest_lane {
+            carrick_hal::host_residency::with_host_residency(|table| {
+                table.retire_overlapping(identity.mm, span.va, span.len as u64);
+            });
+        }
         let scope = CowInventoryLifecycleScope {
             custody,
             identity: self.cow_identity,
