@@ -1,3 +1,6 @@
+# #2441 records terminal frame-grant outcomes in vcpu_loop/signal.rs
+# at the existing host first-touch boundary. The refusal, fault-signal
+# delivery and owner wait decisions retain their existing bindings.
 # #2306: wait_query parks pre-reap status-copy OwnerWait via the existing
 # owner-service continuation. The host fixture gains a status-copy refusal
 # and a real fork/exit/wait witness under kernel.memory.owner-wait.
