@@ -87,8 +87,7 @@ impl<'a> FsView<'a> {
             memory
                 .read_bytes(value_ptr.0, size as usize)
                 .map_err(|_| LINUX_EFAULT)
-        })?;
-        Ok(DispatchOutcome::Returned { value: 0 })
+        })
     }
 
     pub(in crate::dispatch) fn set_xattr_bytes<T: AsRef<[u8]>>(
@@ -98,12 +97,12 @@ impl<'a> FsView<'a> {
         flags: u64,
         follow: bool,
         read_value: impl FnOnce() -> Result<T, LinuxErrno>,
-    ) -> Result<(), LinuxErrno> {
+    ) -> Result<DispatchOutcome, DispatchError> {
         let flags = i32::try_from(flags).map_err(|_| LINUX_EINVAL)?;
         let valid_flags =
             crate::linux_abi::LINUX_XATTR_CREATE | crate::linux_abi::LINUX_XATTR_REPLACE;
         if flags & !valid_flags != 0 || flags == valid_flags {
-            return Err(LINUX_EINVAL);
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
         }
         // Linux restricts the `user.*` namespace to regular files and
         // directories: setxattr(user.*) on a FIFO, char/block device, or socket
@@ -136,7 +135,7 @@ impl<'a> FsView<'a> {
                 })
             };
             if regular_or_dir == Some(false) {
-                return Err(LINUX_EPERM);
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
         }
         let value = read_value()?;
@@ -147,11 +146,14 @@ impl<'a> FsView<'a> {
         // result and lets tools such as GNU install skip optional metadata while
         // still applying the requested mode through fchmod.
         if let Some(mount) = self.fs.vfs_mounts.resolve(resolved) {
-            return Err(mount.vfs.setxattr_unsupported_errno());
+            return Ok(DispatchOutcome::errno(
+                mount.vfs.setxattr_unsupported_errno(),
+            ));
         }
         self.fs
             .rootfs_vfs
-            .set_xattr(resolved, name, value.as_ref(), flags, follow)
+            .set_xattr(resolved, name, value.as_ref(), flags, follow)?;
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn getxattr(

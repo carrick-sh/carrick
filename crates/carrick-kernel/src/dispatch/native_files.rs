@@ -1285,8 +1285,9 @@ impl SyscallDispatcher {
                             follow,
                             || Ok(value),
                         ) {
-                            Ok(()) => Served::value(0),
-                            Err(errno) => Served::errno(errno),
+                            Ok(outcome) => served_mutation(outcome),
+                            Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                            Err(_) => Served::Refused,
                         };
                     }
                     _ => return Served::Refused,
