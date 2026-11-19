@@ -1180,6 +1180,8 @@ dns:
 /* The real host peer closes with SO_LINGER(1, 0). HUP and ERR must be
  * reported even though the guest requested neither bit. */
 epoll_terminal:
+    /* Force the copyout page into this child before the wait parks. */
+    movl $0, epoll_reset_output(%rip)
     mov $2, %edi
     mov $1, %esi
     xor %edx, %edx
@@ -1216,15 +1218,15 @@ epoll_terminal:
     syscall
     EXPECT(5, 1)
     mov %r13, %rdi
-    lea buffer(%rip), %rsi
+    lea epoll_reset_output(%rip), %rsi
     mov $1, %edx
     mov $5000, %r10d
     mov $SYS_EPOLL_WAIT, %eax
     syscall
     EXPECT(6, 1)
-    mov buffer(%rip), %eax
+    mov epoll_reset_output(%rip), %eax
     EXPECT(7, 0x18)             /* EPOLLERR | EPOLLHUP */
-    mov buffer+4(%rip), %rax
+    mov epoll_reset_output+4(%rip), %rax
     EXPECT(8, 0x2419)
     xor %edi, %edi
     jmp exit
@@ -1272,10 +1274,21 @@ epoll_waiters:
     syscall
     EXPECT(5, 1)
 
-    lea epoll_stack_a_top(%rip), %rsi
-    call epoll_spawn
-    lea epoll_stack_b_top(%rip), %rsi
-    call epoll_spawn
+    movl $0, epoll_out_a(%rip)
+    movl $0, epoll_out_b(%rip)
+    lea epoll_stack_top(%rip), %rsi
+    mov $0x50f00, %edi            /* CLONE_THREAD and required sharing */
+    xor %edx, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    mov $SYS_CLONE, %eax
+    syscall
+    mov $10, %r15d
+    test %rax, %rax
+    js fail
+    jz epoll_worker
+    lea epoll_out_a(%rip), %r14
+    jmp epoll_worker_wait
 epoll_join:
     mov epoll_completed(%rip), %edx
     cmp $2, %edx
@@ -1315,35 +1328,24 @@ epoll_delete:
     xor %edi, %edi
     jmp exit
 
-epoll_spawn:
-    movb $0, -16(%rsi)           /* Fault in the worker output page. */
-    /* CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM */
-    mov $0x50f00, %edi
-    xor %edx, %edx
-    xor %r10d, %r10d
-    xor %r8d, %r8d
-    mov $SYS_CLONE, %eax
-    syscall
-    mov $10, %r15d
-    test %rax, %rax
-    js fail
-    jz epoll_worker
-    ret
-
 epoll_worker:
-    sub $16, %rsp
+    lea epoll_out_b(%rip), %r14
+epoll_worker_wait:
     mov %r13, %rdi
-    mov %rsp, %rsi
+    mov %r14, %rsi
     mov $1, %edx
     mov $-1, %r10d
     mov $SYS_EPOLL_WAIT, %eax
     syscall
     EXPECT(11, 1)
-    mov (%rsp), %eax
+    mov (%r14), %eax
     EXPECT(12, 1)
-    mov 4(%rsp), %rax
+    mov 4(%r14), %rax
     EXPECT(13, 0x2418)
     lock incl epoll_completed(%rip)
+    lea epoll_out_a(%rip), %rax
+    cmp %r14, %rax
+    je epoll_join
     lea epoll_completed(%rip), %rdi
     mov $129, %esi               /* FUTEX_WAKE_PRIVATE */
     mov $1, %edx
@@ -1379,6 +1381,8 @@ epoll_reset_peer:
 epoll_err_event:
     .long 0x80000000             /* EPOLLET */
     .quad 0x2419
+epoll_reset_output:
+    .zero 12
 epoll_ping_reset:
     .byte 1
 #endif
@@ -1399,12 +1403,13 @@ epoll_join_limit:
 epoll_completed:
     .long 0
 .balign 4096
-epoll_stack_a:
+epoll_stack:
     .zero 4096
-epoll_stack_a_top:
-epoll_stack_b:
-    .zero 4096
-epoll_stack_b_top:
+epoll_stack_top:
+epoll_out_a:
+    .zero 12
+epoll_out_b:
+    .zero 12
 #endif
 .align 8
 #ifdef DNS_PORT
