@@ -707,6 +707,10 @@ impl ExecuteBlock for TracingRunner {
     type Error = HostError;
     type Code = HostCode;
 
+    fn retain_blocks(&self) -> bool {
+        self.inner.retain_blocks()
+    }
+
     fn prepare(&mut self, block: &TranslatedBlock) -> Result<HostCode, HostError> {
         self.inner.prepare(block)
     }

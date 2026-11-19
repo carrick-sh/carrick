@@ -68,6 +68,10 @@ impl ExecuteBlock for Recording {
     type Error = HostError;
     type Code = HostCode;
 
+    fn retain_blocks(&self) -> bool {
+        self.runner.retain_blocks()
+    }
+
     fn prepare(&mut self, block: &TranslatedBlock) -> Result<HostCode, HostError> {
         self.runner.prepare(block)
     }
