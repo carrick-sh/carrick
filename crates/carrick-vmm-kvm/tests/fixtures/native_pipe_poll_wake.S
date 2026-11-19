@@ -39,6 +39,16 @@ _start:
     test %eax, %eax
     jnz fail_pipe
 #endif
+#ifdef USE_PSELECT
+    /* First call sees an already readable pipe. */
+    mov fds+4(%rip), %edi
+    lea byte(%rip), %rsi
+    mov $1, %edx
+    mov $1, %eax
+    syscall
+    cmp $1, %rax
+    jne fail_pipe
+#endif
     mov $57, %eax                  /* fork */
     syscall
     test %eax, %eax
@@ -46,8 +56,21 @@ _start:
 #ifdef CHILD_POLLS
     jz poller
     mov %eax, %r12d
+#ifdef USE_PSELECT
+    mov $57, %eax                  /* fork a sibling writer */
+    syscall
+    test %eax, %eax
+    js fail_fork
+    jz child
+    mov %eax, %r15d
+    jmp wait_for_child
+#else
     jmp child
+#endif
 poller:
+#ifdef USE_PSELECT
+    jmp pselect_reader
+#endif
 #else
     jz child
     mov %eax, %r12d
@@ -173,11 +196,39 @@ wait_for_child:
     cmp %r12d, %eax
     jne fail_wait
     cmpl $0, status(%rip)
+#ifdef USE_PSELECT
+    je 1f
+    movzbl status+1(%rip), %edi
+    test %edi, %edi
+    jz fail_wait
+    jmp exit
+1:
+    mov %r15d, %edi              /* reap the sibling writer as well */
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    cmp %r15d, %eax
     jne fail_wait
+    cmpl $0, status(%rip)
+    jne fail_wait
+#else
+    jne fail_wait
+#endif
     mov $7, %edi
     jmp exit
 child:
-#ifndef NO_CHILD_SLEEP
+#ifdef USE_PSELECT
+    /* The test's stdout sink waits for the reader's real ring park. */
+    mov $1, %edi
+    lea byte(%rip), %rsi
+    mov $1, %edx
+    mov $1, %eax
+    syscall
+    cmp $1, %rax
+    jne child_fail
+#elif !defined(NO_CHILD_SLEEP)
     /* nanosleep({0, 50ms}) so the parent is parked before the write. */
     lea delay(%rip), %rdi
     xor %esi, %esi
@@ -198,10 +249,51 @@ child:
     cmp $1, %rax
     jne child_fail
 #endif
-#ifdef CHILD_POLLS
+#if defined(CHILD_POLLS) && !defined(USE_PSELECT)
     jmp wait_for_child
 #else
     xor %edi, %edi
+    jmp exit
+#endif
+#ifdef USE_PSELECT
+pselect_reader:
+    call pselect_one
+    call pselect_one
+    xor %edi, %edi
+    jmp exit
+
+pselect_one:
+    mov fds(%rip), %ecx
+    mov $1, %r14d
+    shl %cl, %r14
+    mov %r14, read_set(%rip)
+    lea 1(%rcx), %edi
+    lea read_set(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $270, %eax                 /* pselect6(nfds, &set, 0, 0, 0, 0) */
+    syscall
+    test %rax, %rax
+    js pselect_errno
+    cmp $1, %rax
+    jne fail_result
+    cmp %r14, read_set(%rip)
+    jne fail_revents
+    mov fds(%rip), %edi
+    lea received(%rip), %rsi
+    mov $1, %edx
+    xor %eax, %eax
+    syscall
+    cmp $1, %rax
+    jne fail_result
+    cmpb $'x', received(%rip)
+    jne fail_revents
+    ret
+pselect_errno:
+    neg %eax
+    mov %eax, %edi
     jmp exit
 #endif
 child_fail:
@@ -247,6 +339,7 @@ byte: .byte 'x'
 .balign 4096
 fds: .space 8
 pfd: .space 8
+read_set: .space 8
 status: .space 8
 poll_result: .space 8
 received: .space 1

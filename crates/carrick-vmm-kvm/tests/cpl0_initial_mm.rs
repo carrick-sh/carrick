@@ -5409,6 +5409,85 @@ fn zone_exec_status_pipe_reports_child_exec_failure_then_eof() {
     );
 }
 
+/// The writer's stdout sink releases its next guest instruction only after
+/// the native child's second pselect6 enrols in the ring.
+#[test]
+fn native_child_pselect6_wakes_on_sibling_pipe_write() {
+    use carrick_kernel::dispatch::{PipedOutput, StdioSink, SyscallDispatcher};
+    use carrick_sched_core::{CarrierZoneWake, Claim, ParkedContextWords, RecordId};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
+    use std::time::{Duration, Instant};
+
+    type Zone = Arc<dyn CarrierZoneWake<ParkedContextWords>>;
+    struct WaitForReader {
+        zone: Arc<OnceLock<Zone>>,
+        parked: Arc<AtomicBool>,
+    }
+    impl std::io::Write for WaitForReader {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let zone = self.zone.get().expect("carrier zone").zone();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if (1..).map_while(RecordId::from_raw).any(|id| {
+                    let record = zone.record(id);
+                    matches!(record.claim(), Claim::Parked { .. })
+                        && record.has_adapter_operation()
+                        && record
+                            .object_wait_census()
+                            .is_some_and(|wait| wait.queue != 0)
+                }) {
+                    self.parked.store(true, Ordering::Release);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            // A missing park fails the witness even if the reader happens to
+            // return after this write. Let an ENOSYS child be reaped normally.
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let elf = native_exit_fixture_with_flags(
+        "native_pipe_poll_wake.S",
+        &["-DUSE_PSELECT", "-DCHILD_POLLS"],
+    );
+    let program = carrick_mem::elf::ElfProgram::load(&elf, ELF_X86_64_MACHINE, &|_| None)
+        .expect("pselect6 fixture");
+    let zone = Arc::new(OnceLock::new());
+    let parked = Arc::new(AtomicBool::new(false));
+    let dispatcher = SyscallDispatcher::default();
+    dispatcher.set_stdio_sink(StdioSink::Piped {
+        stdout: PipedOutput::memory(Box::new(WaitForReader {
+            zone: Arc::clone(&zone),
+            parked: Arc::clone(&parked),
+        })),
+        stderr: PipedOutput::memory(Box::new(std::io::sink())),
+    });
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        256,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |carrier| {
+            assert!(
+                zone.set(carrier.carrier_zone_wake().expect("carrier wake domain"))
+                    .is_ok()
+            );
+        },
+        dispatcher,
+    )
+    .expect("pselect6 run");
+    assert_eq!(outcome.run.exit_code, 7, "child select: {:?}", outcome.run);
+    assert!(
+        parked.load(Ordering::Acquire),
+        "child pselect6 never parked"
+    );
+}
+
 /// Director follow-up: reverse the existing peers so a fork child owns the
 /// blocked poll and read, while its live parent produces the exact byte.
 #[test]
