@@ -1319,6 +1319,8 @@ struct ForwardExecution {
     cpu: carrick_guest_arch::CpuId,
     binding: carrick_el1_abi::ExecutionBinding,
     leader_task: carrick_el1_abi::EntryTaskKey,
+    #[cfg(test)]
+    stopped_birth: Option<carrick_core::terminal::ThreadBirthIdentity>,
     context: AddressContext<RootGpa>,
 }
 
@@ -1349,6 +1351,15 @@ impl ForwardExecution {
 
     fn with_leader_task(mut self, leader_task: carrick_el1_abi::EntryTaskKey) -> Self {
         self.leader_task = leader_task;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_stopped_birth(
+        mut self,
+        birth: Option<carrick_core::terminal::ThreadBirthIdentity>,
+    ) -> Self {
+        self.stopped_birth = birth;
         self
     }
 
@@ -1383,6 +1394,8 @@ fn admit_forward_execution(
         cpu,
         binding,
         leader_task: binding.task,
+        #[cfg(test)]
+        stopped_birth: None,
         context,
     })
 }
@@ -1659,6 +1672,23 @@ mod forward_execution_tests {
         assert!(
             err.to_string().contains("TaskIdMismatch"),
             "unexpected error: {err:?}"
+        );
+
+        // A host-published birth identifies a live nonleader by its thread
+        // key, process incarnation, and thread serial, even when its visible
+        // namespace PID names the process leader instead.
+        let birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            sibling_binding.task,
+            carrick_core_abi::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(77).unwrap(),
+            ),
+            sibling_binding.thread_generation,
+        )
+        .unwrap();
+        let issued_sibling = sibling_admitted.with_stopped_birth(Some(birth));
+        assert_eq!(
+            issued_sibling.authenticate_typed(carrier_binding(context, 12)),
+            Ok(())
         );
     }
 }
