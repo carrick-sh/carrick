@@ -1070,6 +1070,7 @@ dependencies = [
  "carrick-guest-arch",
  "carrick-mem",
  "carrick-mmu-core",
+ "carrick-softmmu",
 ]
 
 [[package]]
@@ -1077,6 +1078,7 @@ name = "carrick-softcpu-aarch64-host"
 version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
+ "carrick-guest-arch",
  "carrick-host-jit",
  "carrick-mem",
  "carrick-softcpu-aarch64",
