@@ -60,6 +60,13 @@ pub struct FrameGrantResidencyPage {
     bit: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameGrantResidencyRefusal {
+    InvalidIdentity,
+    Overlap,
+    Capacity,
+}
+
 /// One grant's identity and 512 per-page residency bits. `GRANT_LIVE` is
 /// published last; retirement removes it first. All callers changing leaves
 /// or bits hold the exact-MM editor, including the host mutation pause.
@@ -254,8 +261,17 @@ impl FrameGrantResidencyTable {
     /// Host: publish an authenticated grant while the exact-MM mutation guard
     /// excludes a guest editor. Failure leaves ordinary host first touch live.
     pub fn publish(&self, identity: FrameGrantResidencyIdentity) -> Option<usize> {
+        self.try_publish(identity).ok()
+    }
+
+    /// Publish without collapsing invalid identity, overlap and probe capacity
+    /// into the same refusal. The caller holds this MM's editor.
+    pub fn try_publish(
+        &self,
+        identity: FrameGrantResidencyIdentity,
+    ) -> Result<usize, FrameGrantResidencyRefusal> {
         if !identity.valid() {
-            return None;
+            return Err(FrameGrantResidencyRefusal::InvalidIdentity);
         }
         // All size classes share one table. Check every covered page before
         // admission so unlike classes cannot publish overlapping grants.
@@ -264,47 +280,51 @@ impl FrameGrantResidencyTable {
             .step_by(GRANT_PAGE_SIZE as usize)
         {
             if self.lookup(identity.mm_key, page).is_some() {
-                return None;
+                return Err(FrameGrantResidencyRefusal::Overlap);
             }
         }
         let class = (identity.len / GRANT_PAGE_SIZE)
             .next_power_of_two()
             .trailing_zeros();
         let bucket = identity.semantic_base / (GRANT_PAGE_SIZE << class);
-        let mut available = None;
         for probe in 0..GRANT_PROBES {
             let slot = Self::probe(identity.mm_key, bucket, class, probe);
             let record = &self.slots[slot];
             let state = record.state.load(Ordering::Acquire);
-            if state & GRANT_STATE_MASK == GRANT_LIVE {
-                let prior = record.identity();
-                if prior.mm_key == identity.mm_key
-                    && prior.semantic_base < identity.semantic_base + identity.len
-                    && identity.semantic_base < prior.semantic_base + prior.len
-                {
-                    return None;
-                }
-            } else if state == GRANT_EMPTY {
-                available.get_or_insert(slot);
-                break;
-            } else if state & GRANT_STATE_MASK == GRANT_RETIRED {
-                available.get_or_insert(slot);
+            if !matches!(state & GRANT_STATE_MASK, GRANT_EMPTY | GRANT_RETIRED) {
+                continue;
+            }
+            // Claim the exact reusable epoch we observed. Another MM can
+            // take this slot even while this MM's editor is held.
+            if record
+                .state
+                .compare_exchange(
+                    state,
+                    (state & !GRANT_STATE_MASK).wrapping_add(4) | GRANT_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                record.publish(identity);
+                return Ok(slot);
             }
         }
-        let slot = available?;
-        let record = &self.slots[slot];
-        let state = record.state.load(Ordering::Acquire);
-        record
-            .state
-            .compare_exchange(
-                state,
-                (state & !GRANT_STATE_MASK).wrapping_add(4) | GRANT_WRITING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok()?;
-        record.publish(identity);
-        Some(slot)
+        Err(FrameGrantResidencyRefusal::Capacity)
+    }
+
+    /// Diagnostic sample of occupied slots, including in-flight publishers.
+    /// Other MMs can change the table during the scan.
+    pub fn observed_slots_used(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.state.load(Ordering::Relaxed) & GRANT_STATE_MASK,
+                    GRANT_WRITING | GRANT_LIVE
+                )
+            })
+            .count()
     }
 
     /// Guest: find the exact live grant covering a prepared leaf.
@@ -798,6 +818,57 @@ mod tests {
             owner_generation: 13,
             inventory_revision: 14,
         }
+    }
+
+    #[test]
+    fn full_residency_preserves_live_rows_and_reuses_retired_slots() {
+        let table = table();
+        let first = FrameGrantResidencyIdentity {
+            semantic_base: 0x1000_0000,
+            len: GRANT_PAGE_SIZE,
+            ..identity()
+        };
+        let at = |index: usize| FrameGrantResidencyIdentity {
+            semantic_base: first.semantic_base + index as u64 * GRANT_PAGE_SIZE,
+            physical_ipa: first.physical_ipa + index as u64 * GRANT_PAGE_SIZE,
+            ..first
+        };
+        for index in 0..FRAME_GRANT_RESIDENCY_SLOTS {
+            let identity = at(index);
+            table.try_publish(identity).unwrap();
+            assert!(
+                table.record_commit(
+                    table
+                        .lookup(identity.mm_key, identity.semantic_base)
+                        .unwrap()
+                )
+            );
+        }
+        let wider = FrameGrantResidencyIdentity {
+            len: 2 * GRANT_PAGE_SIZE,
+            ..first
+        };
+        assert_eq!(
+            table.try_publish(wider),
+            Err(FrameGrantResidencyRefusal::Overlap)
+        );
+        let next = at(FRAME_GRANT_RESIDENCY_SLOTS);
+        assert_eq!(
+            table.try_publish(next),
+            Err(FrameGrantResidencyRefusal::Capacity)
+        );
+
+        // These addresses hash to the same probe chain. Retiring the first
+        // exact row makes its slot available to the next request.
+        let stale = table.lookup(first.mm_key, first.semantic_base).unwrap();
+        let retirement = table
+            .begin_retire_overlapping(first.mm_key, first.semantic_base, first.len)
+            .unwrap();
+        assert!(retirement.commit());
+        assert_eq!(table.try_publish(next), Ok(stale.slot));
+        assert!(!table.record_commit(stale));
+        assert!(table.is_guest_committed(first.mm_key, first.semantic_base + GRANT_PAGE_SIZE));
+        assert!(!table.is_guest_committed(next.mm_key, next.semantic_base));
     }
 
     #[test]

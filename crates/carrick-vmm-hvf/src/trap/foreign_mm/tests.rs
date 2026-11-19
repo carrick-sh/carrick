@@ -14023,7 +14023,7 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
             outcome: DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot),
         };
         assert!(
-            pending.settle(&receipt).unwrap(),
+            pending.settle(&receipt, None).unwrap(),
             "a settled stale root permits only a fresh owner selection"
         );
         drop(pending);
@@ -14279,7 +14279,7 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
         "{receipt:?}"
     );
-    assert!(pending.settle(&receipt).unwrap());
+    assert!(pending.settle(&receipt, None).unwrap());
     assert_eq!(
         pins_at_wake.load(std::sync::atomic::Ordering::SeqCst),
         0,
