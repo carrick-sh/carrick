@@ -2701,6 +2701,19 @@ struct UndoJournal {
 }
 
 impl PageTableManager {
+    /// Borrow the authoritative live descriptor image for a read-only walk.
+    /// Returns `None` for a detached software image with no live resolver.
+    pub fn with_live_descriptor_words<R>(
+        &self,
+        f: impl FnOnce(&dyn descriptor_txn::LiveDescriptorWords) -> R,
+    ) -> Option<R> {
+        let resolver = self.resolver.as_deref()?;
+        let words = ArenaTableWords {
+            arenas: &self.arenas,
+            resolver,
+        };
+        Some(f(&words))
+    }
     /// Caller-supplied layout constraints retained by this image.
     pub fn layout(&self) -> PageTableLayoutConfig {
         self.layout
