@@ -615,6 +615,7 @@ pub fn classify(w: u32) -> A64Class {
         0xd503207f => return Wfi,
         0xd503209f | 0xd50320bf => return Sev,
         0xd503203f => return Hint,
+        _ if instruction::compatibility_hint(w) => return Hint,
         _ => {}
     }
     let barrier = w & 0xfffff0ff;
@@ -1155,6 +1156,8 @@ mod instruction {
         PstateImmediate(crate::PstateImmediate),
         CensusGap(Decoded),
         Hint(Hint),
+        /// A HINT alias with architectural NOP semantics on this profile.
+        CompatibilityHint,
         Arithmetic(Arithmetic),
         Branch(Branch),
         ScalarMemory(ScalarMemory),
@@ -1177,7 +1180,7 @@ mod instruction {
 
     /// Arm ARM DDI0487G.a C6.2.92 HINT, C6.2.204 NOP, C6.2.354 YIELD,
     /// C6.2.348 WFE, C6.2.350 WFI, C6.2.238 SEV, C6.2.239 SEVL;
-    /// encoding index C4.1.3, Hints. Extension hints are deliberately unsupported.
+    /// encoding index C4.1.3, Hints.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Hint {
         Nop,
@@ -1212,6 +1215,9 @@ mod instruction {
         };
         if let Some(hint) = hint {
             return Instruction::Hint(hint);
+        }
+        if compatibility_hint(word) {
+            return Instruction::CompatibilityHint;
         }
 
         if let Some(a) = arithmetic(word) {
@@ -1267,6 +1273,19 @@ mod instruction {
             return Instruction::AtomicTransfer(a);
         }
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
+    }
+
+    /// DDI0487 C4.1 HINT variants of pointer authentication and BTI. Both
+    /// features are absent from the guest profile. Other pointer
+    /// authentication encodings still require the extension.
+    pub(super) fn compatibility_hint(word: u32) -> bool {
+        word & 0xffff_ff1f == 0xd503_231f // PAC/AUT, LR forms
+            || word & 0xffff_ff3f == 0xd503_241f // BTI, each target kind
+            || matches!(
+                word,
+                0xd503_20ff // XPACLRI
+                | 0xd503_211f | 0xd503_215f | 0xd503_219f | 0xd503_21df // PAC/AUT, 1716 forms
+            )
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -66,7 +66,7 @@ impl GuestCpuProfile {
             }
             (6, 0) => {
                 (u64::from(self.hwcap.contains(LinuxAarch64Hwcap::CRC32)) << 16)
-                    | (2 * u64::from(self.hwcap.contains(LinuxAarch64Hwcap::ATOMICS)) << 20)
+                    | (u64::from(self.hwcap.contains(LinuxAarch64Hwcap::ATOMICS)) << 21)
             }
             (4, 1) | (6, 1 | 2) => 0, // no extensions in PFR1, ISAR1 or ISAR2
             (0, 0 | 6) if el0 => 0,   // synthetic MIDR and REVIDR
