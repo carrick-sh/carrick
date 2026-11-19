@@ -1,7 +1,6 @@
 //! Level 0 `SoftCpu` execution engine and executable code-buffer management.
 
-use std::collections::{BTreeMap, VecDeque};
-
+use carrick_softmmu::block_cache::BlockCache;
 use carrick_softmmu::{ExtentTable, InventoryTerminal, SoftRequester, SoftSeatError};
 use iced_x86::{Instruction, Mnemonic};
 
@@ -55,7 +54,6 @@ pub enum SoftCpuExit {
 
 pub use carrick_host_jit::JitCodeBuffer;
 
-const TRANSLATION_CACHE_CAPACITY: usize = 1024;
 type BlockKey = (u64, (usize, usize, bool));
 
 struct CachedBlock {
@@ -83,8 +81,7 @@ pub struct SoftCpu {
     cpuid: Box<dyn CpuidAuthority>,
     translations: u64,
     emissions: u64,
-    blocks: BTreeMap<BlockKey, CachedBlock>,
-    block_order: VecDeque<BlockKey>,
+    blocks: BlockCache<BlockKey, CachedBlock>,
     pub max_block_insns: usize,
     pub max_block_span: usize,
 }
@@ -294,8 +291,7 @@ impl SoftCpu {
             cpuid,
             translations: 0,
             emissions: 0,
-            blocks: BTreeMap::new(),
-            block_order: VecDeque::new(),
+            blocks: BlockCache::default(),
             max_block_insns: 64,
             max_block_span: 4096,
         })
@@ -326,7 +322,6 @@ impl SoftCpu {
         // Planning admits x87, CX16 and baseline encodings against this view.
         // Cached plans must not retain either admission or refusal across a change.
         self.blocks.clear();
-        self.block_order.clear();
         self.cpuid = cpuid;
         Ok(())
     }
@@ -524,16 +519,6 @@ impl SoftCpu {
                                 va: rip,
                                 detail: "translation cache publication failed".to_string(),
                             })?;
-                    // Replace stale incarnations under the same key. FIFO eviction
-                    // removes one RX owner between blocks, never the whole hot set.
-                    if !self.blocks.contains_key(&key) {
-                        if self.blocks.len() == TRANSLATION_CACHE_CAPACITY
-                            && let Some(oldest) = self.block_order.pop_front()
-                        {
-                            self.blocks.remove(&oldest);
-                        }
-                        self.block_order.push_back(key);
-                    }
                     let entry = crate::mmu::HostVa::new(entry as usize);
                     self.blocks.insert(
                         key,

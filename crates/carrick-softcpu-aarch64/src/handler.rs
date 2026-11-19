@@ -34,12 +34,25 @@ pub struct MemoryFault {
     pub address: VirtualAddress,
 }
 
+/// Identifies the bytes and backing of one guest-physical code frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeGeneration(pub u64);
+
 /// Guest memory as the handlers see it. Little-endian data. Addresses are
 /// physical: with SCTLR_EL1.M clear they equal the virtual address, with M
 /// set they are the stage-1 output.
 pub trait GuestMemory {
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault>;
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault>;
+
+    /// A generation is supplied only for a fully readable code frame whose
+    /// memory owner tracks all guest and host writes and backing changes.
+    /// The owner must never reuse a generation for changed bytes or backing
+    /// during a run, and must exclude concurrent mutation during dispatch.
+    /// Untracked memory is translated afresh.
+    fn code_generation(&self, _frame: carrick_guest_arch::FrameGpa) -> Option<CodeGeneration> {
+        None
+    }
 
     /// Observe an attempted hardware-format stage-1 walk, including faults.
     fn record_stage1_walk(&mut self) {}
