@@ -1008,10 +1008,7 @@ impl SyscallDispatcher {
                         Ok(range) => range,
                         Err(errno) => return Served::errno(errno),
                     };
-                match self
-                    .fs_view()
-                    .allocate_description(description, mode, range)
-                {
+                match self.fs_view().fallocate(description, mode, range) {
                     Ok(outcome) => served_outcome(outcome, Vec::new()),
                     Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
                     Err(_) => Served::Refused,

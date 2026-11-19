@@ -109,7 +109,7 @@ syscall_table! {
     nr::FLOCK => flock,
     nr::MKNODAT => mknodat,
     nr::FTRUNCATE => ftruncate,
-    nr::FALLOCATE => fallocate,
+    nr::FALLOCATE => fallocate_syscall,
     nr::FACCESSAT => faccessat,
     nr::MKDIRAT => mkdirat,
     nr::UNLINKAT => unlinkat,
@@ -1700,10 +1700,7 @@ impl<'a> FsView<'a> {
     // wrapper the legacy match in `dispatch()` is deleted and the macro
     // table becomes the single authoritative syscall registry.
 
-    pub(in crate::dispatch) fn host_file_fd_for_flush(
-        &self,
-        fd: i32,
-    ) -> Result<Option<HostFdRef>, LinuxErrno> {
+    fn flush_fd_by_number(&self, fd: i32) -> Result<Option<HostFdRef>, LinuxErrno> {
         let Some(open_file) = self.open_file(fd) else {
             return if is_stdio_fd(fd) {
                 Ok(None)
@@ -1711,10 +1708,10 @@ impl<'a> FsView<'a> {
                 Err(LINUX_EBADF)
             };
         };
-        Ok(Self::flush_host_fd(&open_file.description))
+        Ok(Self::host_file_fd_for_flush(&open_file.description))
     }
 
-    fn flush_host_fd(description: &crate::kernel::FileDescription) -> Option<HostFdRef> {
+    fn host_file_fd_for_flush(description: &crate::kernel::FileDescription) -> Option<HostFdRef> {
         let open = crate::kernel::FileDescription::read_for_io(description)?;
         match &*open {
             OpenDescription::HostFile { host_fd, .. } => Some(host_fd.clone()),
@@ -1843,17 +1840,19 @@ impl<'a> FsView<'a> {
     /// A directory (dir fsync is valid) and synthetic / in-memory files are a
     /// no-op success, so they return false.
     fn description_lacks_fsync(description: &crate::kernel::FileDescription) -> bool {
-        ::std::matches!(
-            crate::kernel::FileDescription::inspect(description).as_deref(),
-            Some(
-                OpenDescription::HostPipe { .. }
-                    | OpenDescription::HostSocket { .. }
-                    | OpenDescription::InMemorySocket { .. }
-                    | OpenDescription::PipeReader { .. }
-                    | OpenDescription::PipeWriter { .. }
-                    | OpenDescription::SyntheticDevice { .. }
-            )
-        )
+        description
+            .inspect_kind(|open| {
+                ::std::matches!(
+                    open,
+                    OpenDescription::HostPipe { .. }
+                        | OpenDescription::HostSocket { .. }
+                        | OpenDescription::InMemorySocket { .. }
+                        | OpenDescription::PipeReader { .. }
+                        | OpenDescription::PipeWriter { .. }
+                        | OpenDescription::SyntheticDevice { .. }
+                )
+            })
+            .unwrap_or(false)
     }
 
     /// Prepare a sync operation with only the open description's authority.
@@ -1880,7 +1879,7 @@ impl<'a> FsView<'a> {
             }
             _ => {}
         }
-        Ok(Self::flush_host_fd(description))
+        Ok(Self::host_file_fd_for_flush(description))
     }
 
     /// Scalar writes stage every guest byte before relinquishing execution.
@@ -2171,7 +2170,7 @@ impl<'a> FsView<'a> {
 impl<'a> FsView<'a> {
     define_syscall! {
 
-        fn fallocate(this, cx, fd: Fd, mode: u64, offset: u64, len: u64) {
+        fn fallocate_syscall(this, cx, fd: Fd, mode: u64, offset: u64, len: u64) {
             let range = Self::validate_fallocate(mode, offset, len)?;
             if is_stdio_fd(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
@@ -2179,7 +2178,7 @@ impl<'a> FsView<'a> {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            this.allocate_description(&open_file.description, mode, range)
+            this.fallocate(&open_file.description, mode, range)
         }
 
         fn ftruncate(this, cx, fd: Fd, length: u64) {
@@ -2228,7 +2227,7 @@ impl<'a> FsView<'a> {
         Ok((offset, length))
     }
 
-    pub(in crate::dispatch) fn allocate_description(
+    pub(in crate::dispatch) fn fallocate(
         &self,
         description: &Arc<crate::kernel::FileDescription>,
         mode: u64,
@@ -2583,7 +2582,7 @@ impl<'a> FsView<'a> {
             if !this.fd_is_valid(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
-            let host_fd = this.host_file_fd_for_flush(fd.0)?;
+            let host_fd = this.flush_fd_by_number(fd.0)?;
             if let Some(host_fd) = host_fd
                 && let Err(errno) = this.with_host_wait(cx, || this.fs.host_io.flush(std::os::fd::AsFd::as_fd(&host_fd)))? {
                     return Ok(DispatchOutcome::errno(errno));
@@ -2701,28 +2700,30 @@ impl<'a> FsView<'a> {
     }
 
     fn description_lacks_sync_file_range(description: &crate::kernel::FileDescription) -> bool {
-        ::std::matches!(
-            crate::kernel::FileDescription::inspect(description).as_deref(),
-            Some(
-                OpenDescription::SyntheticDevice { .. }
-                    | OpenDescription::HostPipe { .. }
-                    | OpenDescription::HostSocket { .. }
-                    | OpenDescription::PipeReader { .. }
-                    | OpenDescription::PipeWriter { .. }
-                    | OpenDescription::EventFd { .. }
-                    | OpenDescription::TimerFd { .. }
-                    | OpenDescription::Epoll { .. }
-                    | OpenDescription::Pidfd { .. }
-                    | OpenDescription::Inotify { .. }
-                    | OpenDescription::Fanotify { .. }
-                    | OpenDescription::SignalFd { .. }
-                    | OpenDescription::FsContext { .. }
-                    | OpenDescription::Mqueue { .. }
-                    | OpenDescription::BpfMap { .. }
-                    | OpenDescription::BpfProg { .. }
-                    | OpenDescription::Netlink { .. }
-            )
-        )
+        description
+            .inspect_kind(|open| {
+                ::std::matches!(
+                    open,
+                    OpenDescription::SyntheticDevice { .. }
+                        | OpenDescription::HostPipe { .. }
+                        | OpenDescription::HostSocket { .. }
+                        | OpenDescription::PipeReader { .. }
+                        | OpenDescription::PipeWriter { .. }
+                        | OpenDescription::EventFd { .. }
+                        | OpenDescription::TimerFd { .. }
+                        | OpenDescription::Epoll { .. }
+                        | OpenDescription::Pidfd { .. }
+                        | OpenDescription::Inotify { .. }
+                        | OpenDescription::Fanotify { .. }
+                        | OpenDescription::SignalFd { .. }
+                        | OpenDescription::FsContext { .. }
+                        | OpenDescription::Mqueue { .. }
+                        | OpenDescription::BpfMap { .. }
+                        | OpenDescription::BpfProg { .. }
+                        | OpenDescription::Netlink { .. }
+                )
+            })
+            .unwrap_or(false)
     }
 
     fn flush_fd_for_syscall<M: CurrentMmMemory>(
@@ -2786,7 +2787,7 @@ forward_fs_handlers! {
     flock,
     mknodat,
     ftruncate,
-    fallocate,
+    fallocate_syscall,
     faccessat,
     mkdirat,
     unlinkat,
@@ -3005,7 +3006,7 @@ impl SyscallDispatcher {
 
     #[inline]
     pub(crate) fn host_file_fd_for_flush(&self, fd: i32) -> Result<Option<HostFdRef>, LinuxErrno> {
-        self.fs_view().host_file_fd_for_flush(fd)
+        self.fs_view().flush_fd_by_number(fd)
     }
 
     #[inline]
