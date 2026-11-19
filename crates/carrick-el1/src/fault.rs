@@ -1602,6 +1602,12 @@ fn dispatch_classified_fault<
             Err(GuestPreparedCommitError::RollbackFailed) => {
                 panic!("EL1 prepared-page commit rollback failed")
             }
+            // Retirement can invalidate the descriptor before its residency
+            // row is reclaimed. The admitted owner mapping remains the
+            // authority: continue into fresh backing selection instead of
+            // turning the stale lookup into a terminal fault.
+            Err(GuestPreparedCommitError::NotPrepared)
+                if matches!(supply, FaultSupply::Owner(_)) => {}
             Err(_) if matches!(supply, FaultSupply::Owner(_)) => return Action::Forward,
             Err(_) => {}
         }
