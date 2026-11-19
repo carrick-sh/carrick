@@ -4185,7 +4185,8 @@ fn serial_host_fork_child_uses_allowlisted_host_ioctls() {
     assert_eq!(
         ring_descriptor_run("-DHOST_IOCTL"),
         (0, vec![]),
-        "105 FIONBIO stdout, 106 F_GETFL, 107 unknown ioctl, 108 TCGETS regular file"
+        "105 FIONBIO stdout, 106 F_GETFL, 107 unknown ioctl, 108 TCGETS regular file, \
+         109 pipe2, 110 TCGETS pipe"
     );
 }
 
