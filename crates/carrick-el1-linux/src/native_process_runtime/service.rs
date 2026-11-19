@@ -124,6 +124,11 @@ enum ClosingMemberWait {
     Signal,
 }
 
+enum ClosingAdapterCustody {
+    CancelInstalled,
+    ForbidInstalled(NativeServiceQuarantine),
+}
+
 enum PendingServiceReply {
     Fault(Box<carrick_el1_abi::PortalGrantSlot>),
     Exec(Box<ExecSuccessorManifest>),
@@ -295,7 +300,7 @@ pub(super) struct PendingService<'a> {
     notice_wait: Option<carrick_core_abi::service::ServiceSelector>,
     checkpoints_owner: bool,
     pub(super) claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
-    control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
+    pub(super) control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
 }
 
 impl PendingService<'_> {
@@ -2202,7 +2207,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // longer return; then retire before this entry publishes work.
                 // A wait without terminal authority remains broken custody.
                 if graph.pending.has_exit(&self.key) {
-                    closing_wait = Some(if graph.service_wait(&self.record).is_some() {
+                    closing_wait = Some(if let Some(pending) = graph.service_wait(&self.record) {
+                        if !core::ptr::eq(pending.control.control(), self.control) {
+                            return Err(NativeProcessError::ServiceQuarantined(
+                                NativeServiceQuarantine::RetainedServiceControl,
+                            ));
+                        }
                         ClosingMemberWait::Service
                     } else {
                         graph.remove_signal_wait(&self.record).ok_or(
@@ -2254,6 +2264,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .settle_retained_service_for_closing_entry()
                     .map(PreparedService::Retired),
                 Some(ClosingMemberWait::Signal) => {
+                    self.settle_closing_adapter_operation(ClosingAdapterCustody::ForbidInstalled(
+                        NativeServiceQuarantine::SignalWaitAdapter,
+                    ))?;
                     self.retire_closing_entry().map(PreparedService::Retired)
                 }
                 None => Err(NativeProcessError::Stale),
@@ -2419,15 +2432,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     // retained IPC owner before terminal retirement: the
                     // scheduler deliberately requeues records with operations
                     // still attached, and their endpoint pins must not leak.
-                    if self
-                        .source
-                        .zone
-                        .record(self.record.id)
-                        .has_adapter_operation()
-                    {
-                        self.retire_adapter_result(SyscallResult::new(0))?;
-                        self.adapter_ready = None;
-                    }
+                    self.settle_closing_adapter_operation(ClosingAdapterCustody::CancelInstalled)?;
                     return self.retire_closing_entry().map(PreparedService::Retired);
                 }
                 return Err(error);
@@ -2534,6 +2539,48 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(PreparedService::Request(request, adapter))
     }
 
+    /// Retire or reject an installed IPC adapter operation before terminal
+    /// member retirement. When a closing service continuation already
+    /// published `OwnerContinuation` onto this record, preserve that terminal
+    /// continuation across `retire_adapter_result`'s user-return cleanup so
+    /// `resume_pending_lifecycle` consumes it cleanly.
+    fn settle_closing_adapter_operation(
+        &mut self,
+        custody: ClosingAdapterCustody,
+    ) -> Result<(), NativeProcessError> {
+        let record = self.source.zone.record(self.record.id);
+        if !record.has_adapter_operation() {
+            return Ok(());
+        }
+        match custody {
+            ClosingAdapterCustody::ForbidInstalled(quarantine) => {
+                Err(NativeProcessError::ServiceQuarantined(quarantine))
+            }
+            ClosingAdapterCustody::CancelInstalled => {
+                let continuation = match record.resume_disposition() {
+                    carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(
+                        entry,
+                    ) => Some(entry),
+                    _ => None,
+                };
+                self.retire_adapter_result(SyscallResult::new(0))?;
+                self.adapter_ready = None;
+                if let Some(entry) = continuation {
+                    // SAFETY: this admitted lane still owns the exact closing
+                    // record and restores the terminal continuation published
+                    // by `finish_service` before `resume_pending_lifecycle`.
+                    unsafe {
+                        self.source
+                            .zone
+                            .record(self.record.id)
+                            .publish_owner_continuation(entry);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// A terminal close may wake an exact retained service into a newer SVC
     /// or IRQ frame before the ordinary owner checkpoint consumes the old
     /// service. The old service remains authoritative: finish it once, then
@@ -2549,18 +2596,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 NativeServiceQuarantine::RetainedServiceMissing,
             ))?? {
             NativeResume::NoPending => {}
-            deferred @ NativeResume::Left(_) => return Ok(deferred),
+            deferred @ NativeResume::Left(_) => {
+                if let Some(reason) = self.take_run_failure() {
+                    self.handoff = None;
+                    return Err(
+                        crate::native_run_failure::native_process_error_from_run_failure(reason),
+                    );
+                }
+                return Ok(deferred);
+            }
             _ => {
                 return Err(NativeProcessError::ServiceQuarantined(
                     NativeServiceQuarantine::RetainedServiceUnexpectedResume,
                 ));
             }
         }
-        let outcome =
-            self.resume_pending_lifecycle()
-                .ok_or(NativeProcessError::ServiceQuarantined(
-                    NativeServiceQuarantine::RetainedLifecycleMissing,
-                ))?;
+        self.settle_closing_adapter_operation(ClosingAdapterCustody::CancelInstalled)?;
+        let outcome = self.resume_pending_lifecycle();
+        if let Some(reason) = self.take_run_failure() {
+            self.handoff = None;
+            return Err(crate::native_run_failure::native_process_error_from_run_failure(reason));
+        }
+        let outcome = outcome.ok_or(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::RetainedLifecycleMissing,
+        ))?;
         match outcome {
             LifecycleOutcome::HostCustody => {
                 if !self.yield_terminal_host_custody() {

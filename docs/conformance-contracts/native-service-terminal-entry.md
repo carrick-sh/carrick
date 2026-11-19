@@ -99,10 +99,23 @@ retained-service settlement and one terminal member transaction, with no
 polling, retry, timer, or additional host request.
 
 The correction recognizes only the conjunction of an exact service wait and
-the process's pending close. It consumes that service through `resume_service`
-and hands `NoPending` to the existing lifecycle checkpoint, which consumes the
-old owner continuation before retiring the member. The ARM and x86 mmap and
-CarrierWork bindings pass at the production service-settlement boundary;
+the process's pending close. At the closing member-wait guard it verifies that
+the retained `PendingService` belongs to `self.control`
+(`NativeServiceQuarantine::RetainedServiceControl`,
+`EntryBindingFatalReason::RetainedControlQuarantine`, fatal code 201),
+consumes that service through `resume_service`, retires any installed IPC
+adapter operation and its endpoint `OfdPin` through the shared
+`settle_closing_adapter_operation` helper while preserving the terminal
+`OwnerContinuation` (the same helper backs closed-gate adapter cancellation and
+rejects an impossible adapter token on `ClosingMemberWait::Signal` as
+`NativeServiceQuarantine::SignalWaitAdapter`,
+`EntryBindingFatalReason::SignalWaitAdapterQuarantine`, fatal code 200), and hands
+`NoPending` to the existing lifecycle checkpoint. If `resume_pending_lifecycle`
+records a `run_failure`, `settle_retained_service_for_closing_entry` consumes
+`take_run_failure()` and propagates the underlying `NativeProcessError` rather
+than masking or dropping it. The ARM and x86 mmap, CarrierWork, and
+`drain_owned_preparation` bindings (for both non-adapter and retained IPC
+adapter services) pass at the production service-settlement boundary;
 `native_service_suspended_member_cannot_admit_a_second_bridge` and
 `native_service_duplicate_custody_is_an_invariant_at_bridge_settlement` still
 prove that non-service waits and service custody without terminal authority

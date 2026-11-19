@@ -1774,3 +1774,252 @@ fn x86_terminal_close_with_retained_service_propagates_lifecycle_run_failure() {
         >(words, host_requested);
     }
 }
+
+fn terminal_close_with_signal_wait_rejects_installed_adapter_operation_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let sibling = add_service_sibling(&fixture, None);
+    fixture.runtime.graph.lock().insert_member_wait(
+        sibling.record,
+        MemberWait::Signal(PendingSignalWait {
+            kind: PendingSignalKind::Suspend,
+            channel: Arc::new(WaitChannel {
+                generation: ProcessWake::new(),
+                mm: fixture.address.mm.raw().get(),
+            }),
+            deadline: None,
+        }),
+    );
+    // SAFETY: test-only corruption installing an adapter OperationToken beside
+    // a retained signal wait on the sibling's owned executing record.
+    unsafe {
+        fixture
+            .zone
+            .record(sibling.record.id)
+            .restore_object_operation(
+                carrick_sched_core::object_wait::OperationToken::new(1, 1).unwrap(),
+            )
+    }
+    .unwrap();
+    assert!(
+        fixture
+            .zone
+            .record(sibling.record.id)
+            .has_adapter_operation()
+    );
+
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(root.take_run_failure().is_none());
+    }
+
+    let mut sibling_service = fixture.service();
+    sibling_service.waker_slot = sibling.slot;
+    let mut member = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling.slot,
+            },
+            sibling.task,
+            fixture.address,
+            &(fixture.make_words)(fixture.address),
+            &mut sibling_service,
+        )
+        .unwrap();
+    let result = member.begin_service(
+        carrick_core_abi::service::ServiceOperation::CarrierWork {
+            entry: OwnerEntry::Exception,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
+        },
+        None,
+    );
+    let phase = member.native_service_phase();
+    let settled = member.settle_service_exit(result, NativeServiceExit::CarrierWork);
+    let fatal = crate::dispatch::native_service_completion(settled, phase).err();
+    assert!(member.take_run_failure().is_none());
+    assert!(member.take_handoff_receipt().is_none());
+    assert!(
+        matches!(
+            fatal,
+            Some(crate::dispatch::NativeInvariant::NativeService(
+                carrick_el1_abi::EntryBindingFatalReason::SignalWaitAdapterQuarantine
+            ))
+        ),
+        "expected SignalWaitAdapterQuarantine, got {fatal:?}"
+    );
+}
+
+#[test]
+fn arm_terminal_close_with_signal_wait_rejects_installed_adapter_operation() {
+    terminal_close_with_signal_wait_rejects_installed_adapter_operation_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[test]
+fn x86_terminal_close_with_signal_wait_rejects_installed_adapter_operation() {
+    terminal_close_with_signal_wait_rejects_installed_adapter_operation_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
+
+fn terminal_close_with_foreign_service_control_quarantines_at_member_guard_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
+    use carrick_core_abi::service::ServiceOperation;
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let mut sibling = add_service_sibling(
+        &fixture,
+        Some(ServiceOperation::Crossing {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(64),
+        }),
+    );
+
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(root.take_run_failure().is_none());
+    }
+    assert!(
+        sibling
+            .service_ticket
+            .take()
+            .unwrap()
+            .complete(true)
+            .is_ok()
+    );
+
+    let slot = [fixture.slot, sibling.slot]
+        .into_iter()
+        .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+        .unwrap();
+    assert_eq!(
+        fixture.zone.switch_in_full(slot).unwrap().record,
+        sibling.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+        .unwrap()
+        .words;
+    let mut sibling_service = fixture.service();
+    sibling_service.waker_slot = slot;
+    let mut member = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+
+    {
+        let mut graph = fixture.runtime.graph.lock();
+        let root_key = graph.root_key;
+        let root_control = graph
+            .owner
+            .task(root_key)
+            .unwrap()
+            .native()
+            .resources()
+            .members
+            .iter()
+            .find(|candidate| candidate.record == fixture.record)
+            .unwrap()
+            .control
+            .clone();
+        graph.service_wait_mut(&sibling.record).unwrap().control = root_control;
+    }
+
+    let result = member.begin_service(
+        ServiceOperation::CarrierWork {
+            entry: OwnerEntry::Exception,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
+        },
+        None,
+    );
+    let phase = member.native_service_phase();
+    let settled = member.settle_service_exit(result, NativeServiceExit::CarrierWork);
+    let fatal = crate::dispatch::native_service_completion(settled, phase).err();
+    assert!(member.take_run_failure().is_none());
+    assert!(member.take_handoff_receipt().is_none());
+    assert!(
+        matches!(
+            fatal,
+            Some(crate::dispatch::NativeInvariant::NativeService(
+                carrick_el1_abi::EntryBindingFatalReason::RetainedControlQuarantine
+            ))
+        ),
+        "expected RetainedControlQuarantine, got {fatal:?}"
+    );
+}
+
+#[test]
+fn arm_terminal_close_with_foreign_service_control_quarantines_at_member_guard() {
+    terminal_close_with_foreign_service_control_quarantines_at_member_guard_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[test]
+fn x86_terminal_close_with_foreign_service_control_quarantines_at_member_guard() {
+    terminal_close_with_foreign_service_control_quarantines_at_member_guard_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}

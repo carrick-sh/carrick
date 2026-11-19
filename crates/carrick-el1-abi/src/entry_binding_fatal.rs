@@ -190,6 +190,8 @@ pub enum EntryBindingFatalReason {
     NativeServiceQuarantinedForkAbortLoan = 172,
     NativeServiceQuarantinedForkSettleCustody = 173,
     NativeServiceQuarantinedNoticePublishDuplicate = 174,
+    SignalWaitAdapterQuarantine = 200,
+    RetainedControlQuarantine = 201,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -357,6 +359,8 @@ impl EntryBindingFatalReason {
             172 => Some(Self::NativeServiceQuarantinedForkAbortLoan),
             173 => Some(Self::NativeServiceQuarantinedForkSettleCustody),
             174 => Some(Self::NativeServiceQuarantinedNoticePublishDuplicate),
+            200 => Some(Self::SignalWaitAdapterQuarantine),
+            201 => Some(Self::RetainedControlQuarantine),
 
             _ => None,
         }
@@ -680,7 +684,7 @@ mod tests {
 
     #[test]
     fn fatal_detail_round_trip_and_formatter() {
-        for raw in (1..=48).chain(60..=174) {
+        for raw in (1..=48).chain(60..=174).chain(200..=201) {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
             for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
                 let detail = EntryBindingFatalDetail {
@@ -999,7 +1003,7 @@ mod tests {
             let observed = capture.record.as_mut().unwrap();
             observed.claim = claim;
             observed.claim_after = claim;
-            for reason in (1..=48).chain([60, u64::MAX]) {
+            for reason in (1..=48).chain([60, 200, 201, u64::MAX]) {
                 capture.registers.reason = Some(reason);
                 let text = format!("{capture}");
                 assert!(

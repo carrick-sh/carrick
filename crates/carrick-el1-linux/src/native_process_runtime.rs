@@ -348,6 +348,8 @@ pub enum NativeServiceQuarantine {
     ServicePublishBusy,
     NoticePublishBusy,
     NoticePublishDuplicate,
+    SignalWaitAdapter,
+    RetainedServiceControl,
     NoticeAbortBusy,
     NoticeConsumeBusy,
     ParkCancelBusy,
