@@ -738,3 +738,26 @@ fn musl_simd_copy_decodes_only_allocated_register_forms() {
         );
     }
 }
+
+#[test]
+fn unadvertised_branch_protection_hints_emit_only_plain_nops() {
+    let words = [0xd503_233f, 0xd503_23bf, 0xd503_245f]; // PACIASP, AUTIASP, BTI C
+    let blocks = split_span(ProgramCounter(0), &words, BlockLimits::default());
+    assert_eq!(blocks.len(), 1);
+    let emitted = emit_block(&blocks[0]).unwrap();
+    assert_eq!(emitted.guest().instructions().len(), words.len());
+    assert!(
+        emitted
+            .words()
+            .windows(words.len())
+            .any(|window| window == [0xd503_201f; 3])
+    );
+    for word in words {
+        assert!(!emitted.words().contains(&word));
+    }
+    // RETAA isn't in the backwards-compatible hint space.
+    assert_eq!(
+        class(0xd65f_0bff),
+        InstructionClass::Exit(ExitReason::Undefined)
+    );
+}
