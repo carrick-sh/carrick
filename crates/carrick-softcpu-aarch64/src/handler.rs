@@ -129,6 +129,32 @@ fn is_sctlr(r: SystemRegister) -> bool {
     (r.op0, r.op1, r.crn, r.crm, r.op2) == (3, 0, 1, 0, 0)
 }
 
+fn read_system_register(
+    cpu: &CpuState,
+    register: SystemRegister,
+    rt: OperandRegister,
+) -> Result<SystemValue, SystemAccessException> {
+    if let Some(value) = GUEST_CPU_PROFILE.read_id(register, cpu.pstate.el) {
+        return Ok(value);
+    }
+    // D13.8 CNTPCT_EL0 and CNTKCTL_EL1. Without an EL2 counter offset,
+    // physical and virtual views read the same provider-owned count.
+    if (
+        register.op0,
+        register.op1,
+        register.crn,
+        register.crm,
+        register.op2,
+    ) == (3, 3, 14, 0, 1)
+    {
+        if cpu.pstate.el == ExceptionLevel::El0 && cpu.el1.cntkctl.0 & 1 == 0 {
+            return Err(SystemAccessException::sys64(register, rt, true));
+        }
+        return Ok(cpu.named.cntvct);
+    }
+    cpu.mrs(register, rt)
+}
+
 /// Perform the instruction a block exited on. `cpu.pc` must equal `i.pc()`.
 pub fn execute(
     cpu: &mut CpuState,
@@ -147,10 +173,7 @@ pub fn execute(
             Outcome::Continue
         }
         Instruction::SystemAccess(a) => match a.direction {
-            SystemDirection::Read => match GUEST_CPU_PROFILE
-                .read_id(a.encoding, cpu.pstate.el)
-                .map_or_else(|| cpu.mrs(a.encoding, a.rt), Ok)
-            {
+            SystemDirection::Read => match read_system_register(cpu, a.encoding, a.rt) {
                 Ok(v) => {
                     set_operand(cpu, a.rt, v.0);
                     next(cpu);
