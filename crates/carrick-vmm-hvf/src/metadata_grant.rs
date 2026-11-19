@@ -2503,6 +2503,23 @@ pub(crate) fn handle_metadata_grant_trap(
             .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
             .map_err(|e| TrapError::Hypervisor(format!("read COW supply root: {e}")))?;
         service_native_cow_supply(custody, region, cpu, ttbr0, arg1, arg2)?
+    } else if op == carrick_el1_abi::GRANT_OP_EXEC_FAULT {
+        if request_has_live_vm(custody, generation)
+            && let Some((task, _)) = region.and_then(|region| stopped_records(region, cpu))
+        {
+            let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+            // Diagnostic only. A disagreement with the installed root is
+            // evidence, so do not require root authentication to report it.
+            carrick_observability::probes::hvpatch_exec_efault(
+                arg1,
+                arg2,
+                arg3,
+                binding.mm.raw(),
+                task.root_generation()
+                    .map_or(0, |generation| generation.raw().get()),
+            );
+        }
+        [METADATA_GRANT_SUCCESS, 0, 0, 0]
     } else if op == carrick_el1_abi::GRANT_OP_DIAGNOSTIC {
         service_native_diagnostic(
             custody,

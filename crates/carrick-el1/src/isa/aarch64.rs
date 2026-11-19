@@ -68,6 +68,20 @@ pub fn cross_hvc_native_diagnostic(record: &carrick_el1_abi::NativeDiagnostic) {
     }
 }
 
+/// Failure-only observation; no physical service or user memory access.
+pub fn cross_hvc_exec_fault(fault: carrick_el1_abi::NativeExecFault) {
+    let [decision, address, index] = fault.words();
+    // SAFETY: HVC transfers scalar observations and resumes the same lane.
+    unsafe {
+        core::arch::asm!("hvc #6",
+            inlateout("x0") carrick_el1_abi::GRANT_OP_EXEC_FAULT => _,
+            inlateout("x1") decision => _,
+            inlateout("x2") address => _,
+            inlateout("x3") index => _,
+            options(nostack));
+    }
+}
+
 /// Synchronously discharge a host residency notification without GIC support.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn cross_hvc_residency_kick(slot: carrick_sched_core::SlotId) -> Result<(), ArchError> {

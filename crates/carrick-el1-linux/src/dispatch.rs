@@ -1038,7 +1038,10 @@ fn native_exec_stage(frame: &TrapFrame, task: &CurrentTask) -> Option<NativeExec
 /// What staging a native exec's arguments decided.
 pub enum NativeExecStage {
     Payload(alloc::boxed::Box<[u8]>),
-    Fault(carrick_guest_arch::FaultInfo),
+    Fault(
+        carrick_guest_arch::FaultInfo,
+        carrick_el1_abi::NativeExecFault,
+    ),
     Failed(carrick_syscall_abi::LinuxErrno),
 }
 
@@ -1114,6 +1117,7 @@ enum NativeServiceStage {
     Fault {
         fault: carrick_guest_arch::FaultInfo,
         prefix: Option<StagePrefix>,
+        exec_fault: Option<carrick_el1_abi::NativeExecFault>,
     },
     Return(i64),
     Operation,
@@ -1239,23 +1243,11 @@ fn native_source_releases<C: Copy + Send + Sync + zerocopy::FromZeros>(
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 use carrick_personality_linux::native_host_file::NativeDescriptor;
 
-struct ExecStageCopy<'a, V: file::MemoryValidator> {
-    inner: file::ValidatedCopy<'a, V>,
-    fault: Option<u64>,
-}
-
-impl<V: file::MemoryValidator> file::UserCopy for ExecStageCopy<'_, V> {
-    fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
-        self.inner.copy_out(dst_va, src)
-    }
-
-    fn copy_in(&mut self, dst: &mut [u8], src_va: u64) -> bool {
-        let copied = self.inner.copy_in(dst, src_va);
-        if !copied && self.fault.is_none() {
-            self.fault = Some(src_va);
-        }
-        copied
-    }
+pub(crate) fn observe_exec_fault(fault: carrick_el1_abi::NativeExecFault) {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    carrick_el1::isa::aarch64::cross_hvc_exec_fault(fault);
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    let _ = fault;
 }
 
 pub fn native_exec_stage_request<V: file::MemoryValidator>(
@@ -1263,21 +1255,30 @@ pub fn native_exec_stage_request<V: file::MemoryValidator>(
     validator: &V,
     request: crate::exec_stage::ExecStageRequest,
 ) -> Option<NativeExecStage> {
-    let mut user = ExecStageCopy {
-        inner: file::ValidatedCopy { task, validator },
-        fault: None,
-    };
-    let staged = crate::exec_stage::stage_exec_payload(&mut user, request);
-    Some(match (staged, user.fault) {
+    let mut user = file::ValidatedCopy { task, validator };
+    let mut input = crate::exec_stage::ExecStageInput::new(|bytes: &mut [u8], address| {
+        user.copy_in_diagnosed(bytes, address)
+    });
+    let staged = crate::exec_stage::stage_exec_payload(&mut input, request);
+    Some(match (staged, input.refusal()) {
         (Ok(payload), _) => NativeExecStage::Payload(payload),
-        (Err(errno), Some(address)) if errno == carrick_syscall_abi::LINUX_EFAULT => {
-            NativeExecStage::Fault(carrick_guest_arch::FaultInfo {
-                address: carrick_guest_arch::UserVa::new(address),
-                access: carrick_guest_arch::Access::Read,
-                present: false,
-            })
+        (Err(_), Some((refusal, Some(address)))) => {
+            observe_exec_fault(refusal);
+            NativeExecStage::Fault(
+                carrick_guest_arch::FaultInfo {
+                    address: carrick_guest_arch::UserVa::new(address),
+                    access: carrick_guest_arch::Access::Read,
+                    present: false,
+                },
+                refusal,
+            )
         }
-        (Err(errno), _) => NativeExecStage::Failed(errno),
+        (Err(errno), refusal) => {
+            if let Some((refusal, _)) = refusal {
+                observe_exec_fault(refusal.terminal());
+            }
+            NativeExecStage::Failed(errno)
+        }
     })
 }
 
@@ -1374,6 +1375,7 @@ pub(super) struct NativeServiceBegin {
     )>,
     retry_exec_stage: bool,
     stage_prefix: Option<StagePrefix>,
+    exec_fault: Option<carrick_el1_abi::NativeExecFault>,
     service_wait: Option<carrick_core_abi::PortalOwnerWait>,
 }
 
@@ -1413,9 +1415,10 @@ pub(super) fn native_service_decision(
     let staged = match native_exec_stage(frame, task) {
         Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
         Some(NativeExecStage::Failed(errno)) => NativeServiceStage::Return(errno.guest_retval()),
-        Some(NativeExecStage::Fault(fault)) => NativeServiceStage::Fault {
+        Some(NativeExecStage::Fault(fault, refusal)) => NativeServiceStage::Fault {
             fault,
             prefix: None,
+            exec_fault: Some(refusal),
         },
         // Only an unserved call crosses. A call served with owed host
         // work first settles that work (CarrierWork) and is replayed;
@@ -1476,6 +1479,7 @@ pub(super) fn native_service_decision(
             }) => NativeServiceStage::Fault {
                 fault: native_host_file_fault(address, access),
                 prefix: None,
+                exec_fault: None,
             },
             // Only a host-crossing output stage (x86's strict set) yields
             // these; the same supply and retry applies if one ever arrives.
@@ -1484,6 +1488,7 @@ pub(super) fn native_service_decision(
             }) => NativeServiceStage::Fault {
                 fault: native_host_file_fault(address, carrick_guest_arch::Access::Write),
                 prefix: None,
+                exec_fault: None,
             },
             Some(carrick_personality_linux::native_host_file::HostFileStage::Crossing) => {
                 NativeServiceStage::Operation
@@ -1498,6 +1503,7 @@ pub(super) fn native_service_decision(
             ) => NativeServiceStage::Fault {
                 fault: native_host_file_fault(address, access),
                 prefix: Some((prefix, output)),
+                exec_fault: None,
             },
             Some(carrick_personality_linux::native_host_file::HostFileStage::InRing) => {
                 // An in-zone object the ring does not serve yet never
@@ -1512,6 +1518,7 @@ pub(super) fn native_service_decision(
             None => NativeServiceStage::Operation,
         },
     };
+    let mut exec_fault = None;
     let (operation, exec_payload, host_file, entropy, retry_exec_stage, stage_prefix) = match staged
     {
         NativeServiceStage::Exec(payload) => (None, Some(payload), None, None, false, None),
@@ -1532,7 +1539,12 @@ pub(super) fn native_service_decision(
         NativeServiceStage::Return(result) => {
             return NativeServiceDecision::Reply(result);
         }
-        NativeServiceStage::Fault { fault, prefix } => {
+        NativeServiceStage::Fault {
+            fault,
+            prefix,
+            exec_fault: refusal,
+        } => {
+            exec_fault = refusal;
             // `AT S1E0R` reports an inherited sparse page without taking
             // an EL0 abort. Feed that exact read through the ordinary
             // owner fault selector, retaining the syscall frame for retry.
@@ -1586,6 +1598,7 @@ pub(super) fn native_service_decision(
         entropy,
         retry_exec_stage,
         stage_prefix,
+        exec_fault,
         service_wait,
     }))
 }
@@ -1625,6 +1638,7 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
         entropy,
         retry_exec_stage,
         stage_prefix,
+        exec_fault,
         service_wait,
     } = *begin;
     let exit = if matches!(
@@ -1685,6 +1699,7 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
                     fault,
                     fault_sequence,
                     service_wait,
+                    exec_fault,
                     stage_prefix.map(|(record, output)| {
                         (
                             record,
@@ -6956,7 +6971,7 @@ mod tests {
 
         let payload = match native_exec_stage(&frame, &task).unwrap() {
             NativeExecStage::Payload(payload) => payload,
-            NativeExecStage::Fault(fault) => {
+            NativeExecStage::Fault(fault, _) => {
                 panic!("resident exec payload faulted at {:?}", fault.address)
             }
             NativeExecStage::Failed(errno) => {
@@ -7698,10 +7713,11 @@ mod tests {
             envp: frame.x[2],
         };
         let staged = native_exec_stage_request(&task, &RefusePage(frame.x[1]), request).unwrap();
-        let NativeExecStage::Fault(fault) = staged else {
+        let NativeExecStage::Fault(fault, refusal) = staged else {
             panic!("nonresident argv did not select page supply");
         };
         assert_eq!(fault.address.raw(), frame.x[1]);
+        assert_eq!(refusal.words(), [2 | (2 << 8) | (2 << 32), frame.x[1], 0,]);
         assert_eq!(fault.access, carrick_guest_arch::Access::Read);
         assert!(!fault.present);
     }

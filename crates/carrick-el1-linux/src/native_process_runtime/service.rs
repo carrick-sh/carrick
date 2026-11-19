@@ -236,6 +236,7 @@ enum ServicePayload<'a> {
     Copyin,
     EntropyPreparation(EntropyPreparation),
     StagePrefix(RefusedStagePrefix<'a>),
+    ExecStageFault(carrick_el1_abi::NativeExecFault),
     Copyout(OwnedCopyout<'a>),
     Adapter,
     Exec(Box<[u8]>),
@@ -258,6 +259,7 @@ pub(super) struct PendingService<'a> {
     entropy: Option<(Box<[u8]>, UserVa, bool)>,
     entropy_preparation: Option<EntropyPreparation>,
     stage_prefix: Option<RefusedStagePrefix<'a>>,
+    exec_fault: Option<carrick_el1_abi::NativeExecFault>,
     fault_reply_cancelling: bool,
     /// Zero until the group's first default-fatal signal cancels this exec.
     /// The queue entry may be consumed by a sibling before the service ACK.
@@ -1277,6 +1279,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         fault: carrick_guest_arch::FaultInfo,
         fault_sequence: Option<core::num::NonZeroU64>,
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
+        exec_fault: Option<carrick_el1_abi::NativeExecFault>,
         prefix: Option<(
             Box<[u8]>,
             Option<carrick_personality_linux::native_host_file::HostFileOutput>,
@@ -1293,7 +1296,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     output,
                     call,
                 }),
-                None => ServicePayload::None,
+                None => exec_fault.map_or(ServicePayload::None, ServicePayload::ExecStageFault),
             },
             ServiceCompletion::RetrySyscall,
         )
@@ -2011,12 +2014,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         retry_syscall_after_supply: bool,
     ) -> Result<PreparedService, NativeProcessError> {
         self.service_phase = NativeServicePhase::Payload;
-        let (payload, entropy_preparation, stage_prefix) = match payload {
+        let (payload, entropy_preparation, stage_prefix, exec_fault) = match payload {
             ServicePayload::EntropyPreparation(preparation) => {
-                (ServicePayload::Copyin, Some(preparation), None)
+                (ServicePayload::Copyin, Some(preparation), None, None)
             }
-            ServicePayload::StagePrefix(prefix) => (ServicePayload::None, None, Some(prefix)),
-            payload => (payload, None, None),
+            ServicePayload::StagePrefix(prefix) => (ServicePayload::None, None, Some(prefix), None),
+            ServicePayload::ExecStageFault(fault) => {
+                (ServicePayload::None, None, None, Some(fault))
+            }
+            payload => (payload, None, None, None),
         };
         let copyin = matches!(&payload, ServicePayload::Copyin);
         let (payload, copyout, adapter) = match payload {
@@ -2081,7 +2087,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 | ServicePayload::Adapter
                 | ServicePayload::EntropyPreparation(_)
                 | ServicePayload::ClockSample(_)
-                | ServicePayload::StagePrefix(_),
+                | ServicePayload::StagePrefix(_)
+                | ServicePayload::ExecStageFault(_),
             ) => {
                 return Err(NativeProcessError::Stale);
             }
@@ -2294,6 +2301,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 entropy,
                 entropy_preparation,
                 stage_prefix,
+                exec_fault,
                 fault_reply_cancelling: false,
                 exec_fatal_signal: core::sync::atomic::AtomicU8::new(0),
                 clock_sample,
@@ -3912,9 +3920,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     ServiceResult::Refused
                     | ServiceResult::BackingFault
                     | ServiceResult::Cancelled
-                    | ServiceResult::Failed(_) => Ok(NativeResume::Returned(SyscallResult::new(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    ))),
+                    | ServiceResult::Failed(_) => {
+                        if let Some(fault) = pending.exec_fault {
+                            crate::dispatch::observe_exec_fault(fault.terminal());
+                        }
+                        Ok(NativeResume::Returned(SyscallResult::from_errno(
+                            carrick_syscall_abi::LINUX_EFAULT,
+                        )))
+                    }
                     ServiceResult::Wait(_) | ServiceResult::ExecPrepared(_) => {
                         Err(NativeProcessError::Quarantined)
                     }
@@ -4018,9 +4031,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     Ok(NativeResume::NoPending)
                 }
                 (_, ServiceResult::BackingFault) => Err(NativeProcessError::Quarantined),
-                (ServiceOperation::Exec { .. }, ServiceResult::Failed(failure)) => Ok(
-                    NativeResume::Returned(SyscallResult::new(-i64::from(failure.raw()))),
-                ),
+                (ServiceOperation::Exec { .. }, ServiceResult::Failed(failure)) => {
+                    let result = -i64::from(failure.raw());
+                    if result == carrick_syscall_abi::LINUX_EFAULT.guest_retval() {
+                        use carrick_el1_abi::{
+                            NativeExecFault, NativeExecOperand, NativeExecPrimitive,
+                        };
+                        crate::dispatch::observe_exec_fault(
+                            NativeExecFault::new(
+                                NativeExecOperand::ExecService,
+                                NativeExecPrimitive::Service,
+                                0,
+                                UserVa::new(0),
+                                0,
+                            )
+                            .terminal(),
+                        );
+                    }
+                    Ok(NativeResume::Returned(SyscallResult::new(result)))
+                }
                 (_, ServiceResult::Failed(_)) => Err(NativeProcessError::Quarantined),
                 (ServiceOperation::Fault(fault), ServiceResult::Refused) => {
                     self.force_sigsegv_info(

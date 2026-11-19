@@ -5897,6 +5897,8 @@ mod real {
         /// Address-space provenance: guest PID, ASID, root-slot base and size,
         /// TTBR0. Five scalars keep the complete record reliable on macOS.
         fn hvpatch__guest__address__space(_: i32, _: u32, _: u64, _: u64, _: u64) {}
+        /// Native exec/clone refusal: decision word, VA, index, live MM, root incarnation.
+        fn hvpatch__exec__efault(_: u64, _: u64, _: u64, _: u64, _: u64) {}
         /// Completed Linux syscall service. Args: Linux guest PID, Linux guest
         /// TID, ASID, Linux syscall number, and monotonic duration nanoseconds.
         fn hvpatch__syscall__service__begin(_: i32, _: i32, _: u32, _: u64) {}
@@ -7786,6 +7788,11 @@ mod real {
     #[inline]
     pub fn hvpatch_backing_scrub(total: u64, zeroed: u64, remapped: u64, eligible: u32) {
         carrick_usdt::hvpatch__backing__scrub!(|| (total, zeroed, remapped, eligible));
+    }
+
+    #[inline]
+    pub fn hvpatch_exec_efault(decision: u64, address: u64, index: u64, mm: u64, incarnation: u64) {
+        carrick_usdt::hvpatch__exec__efault!(|| (decision, address, index, mm, incarnation));
     }
 
     /// Resolve service identity only when the begin probe is enabled.
@@ -9903,6 +9910,7 @@ mod stub {
         None
     }
 
+    stub!(hvpatch_exec_efault(decision: u64, address: u64, index: u64, mm: u64, incarnation: u64));
     stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService, args: [u64; 6]) -> Option<std::time::Instant> => None);
     stub!(hvpatch_backing_scrub(total: u64, zeroed: u64, remapped: u64, eligible: u32));
     stub!(hvpatch_mm_maintenance_begin(site: super::HvpatchMmMaintenanceSite, len: u64) -> bool => false);

@@ -1,11 +1,12 @@
 extern crate alloc;
 
-use crate::file::UserCopy;
 use alloc::{boxed::Box, vec::Vec};
 use carrick_core_abi::service::{
     EXEC_ARGUMENT_BYTES_MAX, EXEC_PAYLOAD_HEADER_BYTES, ExecCall, MAX_ARG_STRLEN,
     MAX_EXEC_PATH_BYTES, encode_exec_payload_header,
 };
+use carrick_el1_abi::{CopyRefusalReason, NativeExecFault, NativeExecOperand, NativeExecPrimitive};
+use carrick_guest_arch::UserVa;
 use carrick_syscall_abi::{
     LINUX_E2BIG, LINUX_EFAULT, LINUX_ENAMETOOLONG, LINUX_ENOMEM, LinuxErrno,
 };
@@ -49,6 +50,8 @@ fn reserve(output: &mut Vec<u8>, additional: usize) -> Result<(), LinuxErrno> {
     output.try_reserve(additional).map_err(|_| LINUX_ENOMEM)
 }
 
+type ReadOperand<'a> = dyn FnMut(&mut [u8], u64) -> bool + 'a;
+
 enum CopyStep {
     Copied,
     Terminated(usize),
@@ -56,7 +59,7 @@ enum CopyStep {
 }
 
 fn try_copy_slice(
-    user: &mut impl UserCopy,
+    read: &mut ReadOperand<'_>,
     address: u64,
     len: usize,
     start: usize,
@@ -68,7 +71,7 @@ fn try_copy_slice(
         return Err(err);
     }
     output.resize(slice_start + len, 0);
-    if !user.copy_in(&mut output[slice_start..], address) {
+    if !read(&mut output[slice_start..], address) {
         output.truncate(slice_start);
         return Ok(CopyStep::Fault);
     }
@@ -80,7 +83,7 @@ fn try_copy_slice(
 }
 
 fn narrow_partial_chunk(
-    user: &mut impl UserCopy,
+    read: &mut ReadOperand<'_>,
     address: u64,
     current: u64,
     chunk: usize,
@@ -93,7 +96,7 @@ fn narrow_partial_chunk(
     }
     // Probe one byte first so a fault at `current` itself (bad pointer or
     // unmapped page start) fails in one extra probe instead of log2(chunk).
-    match try_copy_slice(user, current, 1, start, output)? {
+    match try_copy_slice(read, current, 1, start, output)? {
         CopyStep::Terminated(total) => return Ok(Some(total)),
         CopyStep::Fault => {
             output.truncate(start);
@@ -110,7 +113,7 @@ fn narrow_partial_chunk(
             output.truncate(start);
             return Err(LINUX_EFAULT);
         };
-        match try_copy_slice(user, pos, half, start, output)? {
+        match try_copy_slice(read, pos, half, start, output)? {
             CopyStep::Terminated(total) => return Ok(Some(total)),
             CopyStep::Copied => {
                 window -= half;
@@ -131,7 +134,7 @@ fn narrow_partial_chunk(
         output.truncate(start);
         return Err(LINUX_EFAULT);
     };
-    match try_copy_slice(user, pos, 1, start, output)? {
+    match try_copy_slice(read, pos, 1, start, output)? {
         CopyStep::Terminated(total) => Ok(Some(total)),
         CopyStep::Copied => Ok(None),
         CopyStep::Fault => {
@@ -142,7 +145,7 @@ fn narrow_partial_chunk(
 }
 
 fn copy_c_string(
-    user: &mut impl UserCopy,
+    read: &mut ReadOperand<'_>,
     address: u64,
     limit: usize,
     overflow: LinuxErrno,
@@ -158,12 +161,12 @@ fn copy_c_string(
         };
         let page_remaining = 4096 - (current as usize & 4095);
         let chunk = remaining.min(page_remaining).min(256);
-        match try_copy_slice(user, current, chunk, start, output)? {
+        match try_copy_slice(read, current, chunk, start, output)? {
             CopyStep::Terminated(total) => return Ok(total),
             CopyStep::Copied => {}
             CopyStep::Fault => {
                 if let Some(total) =
-                    narrow_partial_chunk(user, address, current, chunk, start, output)?
+                    narrow_partial_chunk(read, address, current, chunk, start, output)?
                 {
                     return Ok(total);
                 }
@@ -174,16 +177,75 @@ fn copy_c_string(
     Err(overflow)
 }
 
-fn copy_pointer(user: &mut impl UserCopy, address: u64) -> Result<u64, LinuxErrno> {
+fn copy_pointer(read: &mut ReadOperand<'_>, address: u64) -> Result<u64, LinuxErrno> {
     let mut raw = [0; 8];
-    if !user.copy_in(&mut raw, address) {
+    if !read(&mut raw, address) {
         return Err(LINUX_EFAULT);
     }
     Ok(u64::from_le_bytes(raw))
 }
 
+pub(crate) struct ExecStageInput<F> {
+    copy: F,
+    first_refusal: Option<u64>,
+    terminal_refusal: Option<NativeExecFault>,
+}
+
+impl<F: FnMut(&mut [u8], u64) -> Result<(), CopyRefusalReason>> ExecStageInput<F> {
+    pub(crate) fn new(copy: F) -> Self {
+        Self {
+            copy,
+            first_refusal: None,
+            terminal_refusal: None,
+        }
+    }
+
+    fn operand<T>(
+        &mut self,
+        operand: NativeExecOperand,
+        index: usize,
+        primitive: NativeExecPrimitive,
+        base: u64,
+        consume: impl FnOnce(&mut ReadOperand<'_>) -> Result<T, LinuxErrno>,
+    ) -> Result<T, LinuxErrno> {
+        let mut last = None;
+        let result = consume(&mut |bytes, address| match (self.copy)(bytes, address) {
+            Ok(()) => true,
+            Err(reason) => {
+                self.first_refusal.get_or_insert(address);
+                last = Some(NativeExecFault::new(
+                    operand,
+                    primitive,
+                    reason.code(),
+                    UserVa::new(address),
+                    index,
+                ));
+                false
+            }
+        });
+        if matches!(result, Err(LINUX_EFAULT)) {
+            self.terminal_refusal = Some(last.unwrap_or_else(|| {
+                NativeExecFault::new(
+                    operand,
+                    NativeExecPrimitive::Address,
+                    0,
+                    UserVa::new(base),
+                    index,
+                )
+            }));
+        }
+        result
+    }
+
+    pub(crate) fn refusal(&self) -> Option<(NativeExecFault, Option<u64>)> {
+        self.terminal_refusal
+            .map(|fault| (fault, self.first_refusal))
+    }
+}
+
 fn stage_vector(
-    user: &mut impl UserCopy,
+    input: &mut ExecStageInput<impl FnMut(&mut [u8], u64) -> Result<(), CopyRefusalReason>>,
+    operand: NativeExecOperand,
     vector: u64,
     output: &mut Vec<u8>,
     accounting: &mut usize,
@@ -193,10 +255,18 @@ fn stage_vector(
     }
     let mut count = 0usize;
     loop {
-        let pointer_address = vector
-            .checked_add((count as u64).checked_mul(8).ok_or(LINUX_EFAULT)?)
-            .ok_or(LINUX_EFAULT)?;
-        let string = copy_pointer(user, pointer_address)?;
+        let string = input.operand(
+            operand,
+            count,
+            NativeExecPrimitive::Pointer,
+            vector,
+            |read| {
+                let pointer_address = vector
+                    .checked_add((count as u64).checked_mul(8).ok_or(LINUX_EFAULT)?)
+                    .ok_or(LINUX_EFAULT)?;
+                copy_pointer(read, pointer_address)
+            },
+        )?;
         if string == 0 {
             return Ok(count);
         }
@@ -207,7 +277,13 @@ fn stage_vector(
         let length_offset = output.len();
         reserve(output, 4)?;
         output.extend_from_slice(&[0; 4]);
-        let length = copy_c_string(user, string, MAX_ARG_STRLEN, LINUX_E2BIG, output)?;
+        let length = input.operand(
+            operand,
+            count,
+            NativeExecPrimitive::String,
+            string,
+            |read| copy_c_string(read, string, MAX_ARG_STRLEN, LINUX_E2BIG, output),
+        )?;
         *accounting = accounting.checked_add(length).ok_or(LINUX_E2BIG)?;
         if *accounting > EXEC_ARGUMENT_BYTES_MAX {
             return Err(LINUX_E2BIG);
@@ -224,24 +300,44 @@ fn stage_vector(
 /// Consume all scattered EL0 pointers while the calling task owns its live
 /// stage-1 translation, producing one request-owned contiguous record. The
 /// returned box is retained by the native service continuation.
-pub fn stage_exec_payload(
-    user: &mut impl UserCopy,
+pub(crate) fn stage_exec_payload(
+    input: &mut ExecStageInput<impl FnMut(&mut [u8], u64) -> Result<(), CopyRefusalReason>>,
     request: ExecStageRequest,
 ) -> Result<Box<[u8]>, LinuxErrno> {
     let mut output = Vec::new();
     reserve(&mut output, EXEC_PAYLOAD_HEADER_BYTES)?;
     output.resize(EXEC_PAYLOAD_HEADER_BYTES, 0);
-    let path_len = copy_c_string(
-        user,
+    let path_len = input.operand(
+        NativeExecOperand::Path,
+        0,
+        NativeExecPrimitive::String,
         request.path,
-        MAX_EXEC_PATH_BYTES,
-        LINUX_ENAMETOOLONG,
-        &mut output,
+        |read| {
+            copy_c_string(
+                read,
+                request.path,
+                MAX_EXEC_PATH_BYTES,
+                LINUX_ENAMETOOLONG,
+                &mut output,
+            )
+        },
     )?;
     // Linux counts both terminating vector pointers even for NULL argv/envp.
     let mut accounting = 16usize;
-    let argc = stage_vector(user, request.argv, &mut output, &mut accounting)?;
-    let envc = stage_vector(user, request.envp, &mut output, &mut accounting)?;
+    let argc = stage_vector(
+        input,
+        NativeExecOperand::Argv,
+        request.argv,
+        &mut output,
+        &mut accounting,
+    )?;
+    let envc = stage_vector(
+        input,
+        NativeExecOperand::Envp,
+        request.envp,
+        &mut output,
+        &mut accounting,
+    )?;
     encode_exec_payload_header(&mut output, request.call, path_len, argc, envc)
         .map_err(|_| LINUX_E2BIG)?;
     Ok(output.into_boxed_slice())
@@ -257,6 +353,18 @@ mod tests {
     use carrick_syscall_abi::{LINUX_E2BIG, LINUX_EFAULT};
     use std::vec;
     use std::vec::Vec;
+
+    fn stage_exec_payload(
+        user: &mut impl UserCopy,
+        request: ExecStageRequest,
+    ) -> Result<Box<[u8]>, LinuxErrno> {
+        let mut input = ExecStageInput::new(|bytes: &mut [u8], address| {
+            user.copy_in(bytes, address)
+                .then_some(())
+                .ok_or(CopyRefusalReason::Validator)
+        });
+        super::stage_exec_payload(&mut input, request)
+    }
 
     const BASE: u64 = 0x10_0000;
 

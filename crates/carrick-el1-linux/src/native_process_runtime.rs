@@ -9714,7 +9714,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                 Err(error) => super::native_fork_refusal::observe_process_error(error),
             };
             match error.failure() {
-                Ok(failure) => return self.fail(failure),
+                Ok(failure) => {
+                    if failure == NativeFailure::Fault {
+                        use carrick_el1_abi::{
+                            NativeExecFault, NativeExecOperand, NativeExecPrimitive,
+                        };
+                        // The fork owner edits mappings and does not read a
+                        // user pointer. Its detailed refusal has its own probe.
+                        crate::dispatch::observe_exec_fault(
+                            NativeExecFault::new(
+                                NativeExecOperand::ForkOwner,
+                                NativeExecPrimitive::Owner,
+                                0,
+                                UserVa::new(0),
+                                0,
+                            )
+                            .terminal(),
+                        );
+                    }
+                    return self.fail(failure);
+                }
                 // A refused fork has published no child: contention reruns it.
                 Err(contention) => match self.retain_syscall(contention) {
                     Ok(None) => continue,

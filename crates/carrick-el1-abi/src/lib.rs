@@ -686,6 +686,9 @@ pub const GRANT_OP_ROOT_FORK_SEED: u64 = 14;
 /// to x3 ([`carrick_core_abi::SettlementDoorbellAnswer::to_words`]).
 /// A physical-service doorbell, never a syscall crossing.
 pub const GRANT_OP_RETURN_SETTLE: u64 = 15;
+/// Record a refused exec/clone operation. The three arguments are scalars
+/// and the carrier never dereferences the reported guest address.
+pub const GRANT_OP_EXEC_FAULT: u64 = 16;
 
 /// Bounded debug rendering of a typed refusal, retained on the stopped EL1 stack.
 #[repr(C, align(64))]
@@ -3131,6 +3134,83 @@ impl CopyRefusalReason {
             Self::OwnerDependency => 8,
             Self::ArmTranslation(fst) => 0x100 | fst as u64,
         }
+    }
+}
+
+/// Operand of a refused native exec or the fork that precedes it.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+#[repr(u8)]
+pub enum NativeExecOperand {
+    Path = 1,
+    Argv = 2,
+    Envp = 3,
+    ForkOwner = 4,
+    ExecService = 5,
+}
+
+/// Operation which refused this operand. String and pointer reads retain
+/// the original copy refusal reason.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+#[repr(u8)]
+pub enum NativeExecPrimitive {
+    String = 1,
+    Pointer = 2,
+    Address = 3,
+    Owner = 4,
+    Service = 5,
+}
+
+/// Failure-only observation. A staging refusal is a candidate for owner
+/// supply. The same record can mark final EFAULT after supply refuses.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct NativeExecFault {
+    decision: u64,
+    address: carrick_guest_arch::UserVa,
+    index: usize,
+}
+
+impl NativeExecFault {
+    pub const fn new(
+        operand: NativeExecOperand,
+        primitive: NativeExecPrimitive,
+        reason: u64,
+        address: carrick_guest_arch::UserVa,
+        index: usize,
+    ) -> Self {
+        Self {
+            decision: operand as u64 | ((primitive as u64) << 8) | (reason << 32),
+            address,
+            index,
+        }
+    }
+
+    pub const fn terminal(self) -> Self {
+        Self {
+            decision: self.decision | (1 << 16),
+            ..self
+        }
+    }
+
+    pub const fn words(self) -> [u64; 3] {
+        [self.decision, self.address.raw(), self.index as u64]
     }
 }
 

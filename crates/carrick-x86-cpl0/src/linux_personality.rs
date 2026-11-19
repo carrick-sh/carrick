@@ -773,7 +773,7 @@ fn native_exec_call(
             frame.rax = errno.guest_retval() as u64;
             return CompletionRoute::Served;
         }
-        Some(NativeExecStage::Fault(fault)) => {
+        Some(NativeExecStage::Fault(fault, _)) => {
             return match supply_syscall_fault(
                 binding,
                 task,

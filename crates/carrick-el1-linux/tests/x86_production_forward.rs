@@ -1224,9 +1224,8 @@ fn x86_child_exec_stages_its_payload_or_faults() {
             ),
             "native {native}: the readable request stages a payload"
         );
-        // An unreadable argument vector is a staging fault the entry
-        // supplies or answers with EFAULT, never a host exit.
-        let bad = ExecStageRequest { argv: 0, ..request };
+        // Staging preserves the operand and primitive when the unreadable
+        // path needs supply or EFAULT from the entry.
         struct Refuse;
         impl carrick_el1_linux::file::MemoryValidator for Refuse {
             fn writable_bytes(&self, _: u64, _: usize) -> usize {
@@ -1236,13 +1235,13 @@ fn x86_child_exec_stages_its_payload_or_faults() {
                 0
             }
         }
-        assert!(
-            matches!(
-                dispatch::native_exec_stage_request(&task, &Refuse, bad),
-                Some(dispatch::NativeExecStage::Fault(_))
-            ),
-            "native {native}: an unreadable argv is a staging fault"
-        );
+        let Some(dispatch::NativeExecStage::Fault(fault, refusal)) =
+            dispatch::native_exec_stage_request(&task, &Refuse, request)
+        else {
+            panic!("native {native}: an unreadable path is a staging fault");
+        };
+        assert_eq!(fault.address.raw(), request.path);
+        assert_eq!(refusal.words(), [1 | (1 << 8) | (2 << 32), request.path, 0]);
     }
 }
 
