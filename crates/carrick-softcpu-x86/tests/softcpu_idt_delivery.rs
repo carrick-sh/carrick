@@ -523,6 +523,15 @@ impl IdtTestRig {
 
 #[test]
 fn timer_latch_survives_repeated_int80_returns() {
+    assert_timer_delivery_after_eight_user_blocks(false);
+}
+
+#[test]
+fn pending_timer_relatch_keeps_original_deferral_window() {
+    assert_timer_delivery_after_eight_user_blocks(true);
+}
+
+fn assert_timer_delivery_after_eight_user_blocks(rearm_pending_timer: bool) {
     use carrick_softcpu_x86::{
         LAPIC_LVT_TIMER_MODE_TSC_DEADLINE, LAPIC_LVT_TIMER_OFFSET, LAPIC_SVR_OFFSET,
         MSR_IA32_TSC_DEADLINE, ManualTscClock, MsrCapabilities,
@@ -563,15 +572,31 @@ fn timer_latch_survives_repeated_int80_returns() {
         assert!(rig.machine.context().lapic().irr_bit(TIMER));
         if user_blocks % 2 == 0 {
             assert_eq!(rig.machine.context().cpl, 0);
-            assert_eq!(rig.machine.step().unwrap(), None); // IRETQ with IF clear
+            let rearm = rearm_pending_timer && user_blocks == 4;
+            if rearm {
+                let ctx = rig.machine.context_mut();
+                assert_eq!(ctx.lapic().timer_fire_count(), 1);
+                // Re-arm with a past deadline while the original latch is pending.
+                let past_deadline = 1;
+                assert!(ctx.now_tsc() > past_deadline);
+                ctx.write_msr(MSR_IA32_TSC_DEADLINE, past_deadline, caps)
+                    .unwrap();
+            }
+            assert_eq!(rig.machine.step().unwrap(), None); // poll and IRETQ with IF clear
+            if rearm {
+                let lapic = rig.machine.context().lapic();
+                assert_eq!(lapic.timer_fire_count(), 2);
+                assert!(lapic.irr_bit(TIMER));
+            }
         }
     }
+    let exit = rig.machine.step().unwrap();
     assert!(
         matches!(
-            rig.machine.step().unwrap(),
+            exit,
             Some(SoftMachineExit::IoOut { port: 0xe0, value, .. }) if value == u32::from(TIMER)
         ),
-        "timer must be recognized at the boundary after eight CPL3 blocks since the latch"
+        "timer must be recognized at the boundary after eight CPL3 blocks since the original latch, got {exit:?}"
     );
     assert!(!rig.machine.context().lapic().irr_bit(TIMER));
 }
