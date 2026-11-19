@@ -435,7 +435,8 @@ fn in_zone_objects_never_build_a_host_request() {
         run(
             HostFileCall::Ioctl {
                 fd: 0,
-                request: 0x5401
+                request: carrick_syscall_abi::LINUX_TCGETS,
+                arg: BASE,
             },
             &mut user
         ),
