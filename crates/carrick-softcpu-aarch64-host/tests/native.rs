@@ -608,3 +608,223 @@ fn native_simd_block_preserves_callee_saved_host_simd() {
     assert_eq!(host_d8, u64::from_le_bytes([0x73; 8]));
     assert_eq!(region[index].vectors[8], u128::from_le_bytes([0xa5; 16]));
 }
+
+#[test]
+fn el0_fp_and_simd_families_match_native() {
+    use core::arch::asm;
+
+    macro_rules! compare {
+        ($word:expr, $native:literal, $vectors:expr) => {{
+            let input: [u128; 2] = $vectors;
+            let mut native_vector = 0u128;
+            let (native_x0, native_flags): (u64, u64);
+            // SAFETY: these fixed instructions use only caller-saved GPRs
+            // and vectors. The memory operands point at local arrays.
+            unsafe {
+                asm!(
+                    "ldp q0, q1, [{input}]",
+                    "mov x0, xzr",
+                    "msr nzcv, xzr",
+                    $native,
+                    "str q0, [{output}]",
+                    "mrs {flags}, nzcv",
+                    "mov {result}, x0",
+                    input = in(reg) input.as_ptr(),
+                    output = in(reg) &mut native_vector,
+                    result = lateout(reg) native_x0,
+                    flags = lateout(reg) native_flags,
+                    out("x0") _, out("v0") _, out("v1") _,
+                );
+            }
+            let mut memory = Flat::default();
+            memory.put_words(CODE, &[$word]);
+            let mut cpu = CpuState::default();
+            cpu.pc = ProgramCounter(CODE);
+            cpu.vectors[..2].copy_from_slice(&input);
+            let (report, _) = run_at(&mut cpu, &mut memory);
+            assert_eq!(report.stop, Stop::Fetch(VirtualAddress(CODE + 4)), "{}", $native);
+            assert_eq!(report.blocks, 1, "{}", $native);
+            assert_eq!(cpu.vectors[0], native_vector, "{}", $native);
+            assert_eq!(x(&cpu, 0), native_x0, "{}", $native);
+            assert_eq!(u64::from(cpu.pstate.nzcv) << 28, native_flags, "{}", $native);
+        }};
+    }
+
+    let floats = [1.5f64.to_bits() as u128, 2.0f64.to_bits() as u128];
+    compare!(0x1e61_2800, "fadd d0, d0, d1", floats);
+    compare!(0x9e78_0000, "fcvtzs x0, d0", floats);
+    compare!(0x1e61_2000, "fcmp d0, d1", floats);
+    compare!(0x4e61_d400, "fadd v0.2d, v0.2d, v1.2d", floats);
+
+    let bytes = [
+        u128::from_le_bytes(core::array::from_fn(|i| (i + 50) as u8)),
+        u128::from_le_bytes(core::array::from_fn(|i| (15 - i) as u8)),
+    ];
+    compare!(0x4e21_8400, "add v0.16b, v0.16b, v1.16b", bytes);
+    compare!(0x4e01_3800, "zip1 v0.16b, v0.16b, v1.16b", bytes);
+    compare!(0x4e01_0000, "tbl v0.16b, {{v0.16b}}, v1.16b", bytes);
+}
+
+#[test]
+fn el0_fp_status_survives_an_exit_and_host_controls_are_preserved() {
+    use core::arch::asm;
+
+    let mut memory = Flat::default();
+    // FDIV D0,D0,D1; ISB; MRS X0,FPSR; MRS X1,FPCR
+    memory.put_words(CODE, &[0x1e61_1800, 0xd503_3fdf, 0xd53b_4420, 0xd53b_4401]);
+    let mut cpu = CpuState::default();
+    cpu.pc = ProgramCounter(CODE);
+    cpu.vectors[0] = 1.0f64.to_bits() as u128;
+    cpu.named.fpcr = SystemValue(1 << 22); // round toward positive infinity
+    let (fpcr_before, fpsr_before, fpcr_after, fpsr_after): (u64, u64, u64, u64);
+    // SAFETY: the four MRS instructions only observe the thread's state.
+    unsafe {
+        asm!("mrs {0}, fpcr", "mrs {1}, fpsr", out(reg) fpcr_before, out(reg) fpsr_before);
+    }
+    let (report, _) = run_at(&mut cpu, &mut memory);
+    // SAFETY: the MRS instructions only observe the thread's state.
+    unsafe {
+        asm!("mrs {0}, fpcr", "mrs {1}, fpsr", out(reg) fpcr_after, out(reg) fpsr_after);
+    }
+    assert_eq!((fpcr_before, fpsr_before), (fpcr_after, fpsr_after));
+    assert_eq!(
+        report.stop,
+        Stop::Fetch(VirtualAddress(CODE + 16)),
+        "{report}"
+    );
+    assert_eq!(x(&cpu, 0), 2); // DZC, with division-by-zero trap disabled
+    assert_eq!(x(&cpu, 1), 1 << 22);
+    assert_eq!(cpu.vectors[0] as u64, f64::INFINITY.to_bits());
+}
+
+#[test]
+fn el0_simd_structure_load_store_matches_native() {
+    use core::arch::asm;
+
+    const DATA: u64 = 0x4000_8000;
+    let input: [u8; 32] = core::array::from_fn(|i| i as u8 + 3);
+    let mut out = [0u8; 32];
+    let mut native_vectors = [0u128; 2];
+    // SAFETY: both structure accesses address 32-byte local arrays.
+    unsafe {
+        asm!(
+            "ld2 {{v0.16b, v1.16b}}, [{input}]",
+            "st2 {{v0.16b, v1.16b}}, [{output}]",
+            "stp q0, q1, [{vectors}]",
+            input = in(reg) input.as_ptr(),
+            output = in(reg) out.as_mut_ptr(),
+            vectors = in(reg) native_vectors.as_mut_ptr(),
+            out("v0") _, out("v1") _, options(nostack, preserves_flags),
+        );
+    }
+    let mut cpu = CpuState::default();
+    cpu.pc = ProgramCounter(CODE);
+    set_x(&mut cpu, 0, DATA);
+    let mut memory = Flat::default();
+    memory.put(DATA, &input);
+    memory.put(DATA + 32, &[0; 32]);
+    // LD2 (post-index by 32); ST2 (no writeback).
+    memory.put_words(CODE, &[0x4cdf_8000, 0x4c00_8000]);
+    let (report, _) = run_at(&mut cpu, &mut memory);
+    assert_eq!(
+        report.stop,
+        Stop::Fetch(VirtualAddress(CODE + 8)),
+        "{report}"
+    );
+    assert_eq!(report.blocks, 2);
+    assert_eq!(x(&cpu, 0), DATA + 32);
+    assert_eq!(cpu.vectors[..2], native_vectors);
+    let mut stored = [0; 32];
+    memory.read(VirtualAddress(DATA + 32), &mut stored).unwrap();
+    assert_eq!(stored, out);
+}
+
+#[test]
+fn el0_crc32_matches_native_on_crc_hosts() {
+    use core::arch::asm;
+    if !std::arch::is_aarch64_feature_detected!("crc") {
+        return;
+    }
+    let input = u64::from_le_bytes(*b"12345678");
+    for word in [0x9ac1_4c02, 0x9ac1_5c02] {
+        let native: u64;
+        // SAFETY: CRC32X and CRC32CX operate only on registers. They are
+        // executed here only after qualifying the host CRC extension.
+        unsafe {
+            if word == 0x9ac1_4c02 {
+                asm!(".inst 0x9ac14c02", in("x0") u64::MAX, in("x1") input, out("x2") native);
+            } else {
+                asm!(".inst 0x9ac15c02", in("x0") u64::MAX, in("x1") input, out("x2") native);
+            }
+        }
+        let mut cpu = CpuState::default();
+        cpu.pc = ProgramCounter(CODE);
+        set_x(&mut cpu, 0, u64::MAX);
+        set_x(&mut cpu, 1, input);
+        let mut memory = Flat::default();
+        memory.put_words(CODE, &[word]);
+        let (report, _) = run_at(&mut cpu, &mut memory);
+        assert_eq!(
+            report.stop,
+            Stop::Fetch(VirtualAddress(CODE + 4)),
+            "{report}"
+        );
+        assert_eq!(x(&cpu, 2), native);
+    }
+}
+
+#[test]
+fn el0_simd_register_offset_pair_and_literal_match_native() {
+    use core::arch::asm;
+
+    const DATA: u64 = 0x4000_8000;
+    let input = [0x0123_4567_89ab_cdefu128, 0xfedc_ba98_7654_3210];
+    let mut native_output = [0u128; 3];
+    let mut scratch = [0u128; 6];
+    scratch[..2].copy_from_slice(&input);
+    // SAFETY: load, store and writeback stay inside the scratch and output
+    // arrays. The literal is embedded in the asm block and skipped by B.
+    unsafe {
+        asm!(
+            "mov x1, #1",
+            "ldr q0, [{base}, x1, lsl #4]",
+            "ldr q1, [{base}]",
+            "stp q0, q1, [{base}, #32]!",
+            "ldp q2, q3, [{base}], #32",
+            "ldr q4, 2f",
+            "b 3f",
+            ".balign 16",
+            "2:",
+            ".quad 0x1020304050607080, 0x1122334455667788",
+            "3:",
+            "stp q2, q3, [{output}]",
+            "str q4, [{output}, #32]",
+            base = inout(reg) scratch.as_mut_ptr() => _,
+            output = in(reg) native_output.as_mut_ptr(),
+            out("x1") _, out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    let mut cpu = CpuState::default();
+    cpu.pc = ProgramCounter(CODE);
+    set_x(&mut cpu, 0, DATA);
+    set_x(&mut cpu, 1, 1);
+    cpu.vectors[1] = input[0];
+    let mut memory = Flat::default();
+    memory.put(DATA + 16, &input[1].to_le_bytes());
+    memory.put(DATA + 32, &[0; 32]);
+    memory.put(
+        CODE + 28,
+        &0x1122_3344_5566_7788_1020_3040_5060_7080u128.to_le_bytes(),
+    );
+    memory.put_words(CODE, &[0x3ce1_7800, 0xad81_0400, 0xacc1_0c02, 0x9c00_0084]);
+    let (report, _) = run_at(&mut cpu, &mut memory);
+    assert_eq!(
+        report.stop,
+        Stop::Fetch(VirtualAddress(CODE + 16)),
+        "{report}"
+    );
+    assert_eq!(report.blocks, 4);
+    assert_eq!(x(&cpu, 0), DATA + 64);
+    assert_eq!(cpu.vectors[2..5], native_output);
+}
