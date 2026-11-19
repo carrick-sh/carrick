@@ -1159,3 +1159,618 @@ fn x86_busy_service_notice_cancellation_wakes_and_retires() {
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
     >(words, 9);
 }
+
+#[derive(Clone, Copy)]
+enum RetainedAdapterClosingEntrant {
+    MmapCrossing { ordinal: u64 },
+    IrqCarrierWork,
+    DrainOwnedPreparation,
+}
+
+fn terminal_close_with_retained_adapter_service_entry_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    entrant: RetainedAdapterClosingEntrant,
+) {
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    use carrick_el1_abi::ipc::{
+        IpcBacking, IpcMmKey, IpcOpKind, IpcOperation, IpcTaskKey, IpcUserVa, OfdPin,
+        WriteProgress, fd,
+    };
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let sibling = add_signal_sibling(&fixture, None, false);
+    assert!(fixture.zone.mark_native_owned(sibling.record.id));
+    assert_eq!(fixture.page.live(), 2);
+
+    let shared = Box::leak(Box::new(std::sync::Arc::new(
+        carrick_kernel::el1_ipc::HostIpc::with_limits(
+            1 << 20,
+            carrick_el1_abi::ipc::IpcLimits::ZONE,
+        )
+        .unwrap(),
+    )));
+    let object = shared.create_pipe(65536).unwrap();
+    for lane in [
+        carrick_el1_abi::ipc::pipe::WaitFor::Readable,
+        carrick_el1_abi::ipc::pipe::WaitFor::Writable,
+    ] {
+        let key = carrick_el1_abi::ipc::object_wait_key(object, lane).unwrap();
+        fixture
+            .zone
+            .bind_object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+    }
+    let table = shared.create_table(64, 64).unwrap();
+    let reader = shared
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: carrick_el1_abi::ipc::pipe::End::Reader,
+            }
+            .encode(),
+            fd::AccessMode::ReadOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    reader.install(table, fd::Fd(0), false).unwrap();
+    drop(reader);
+    let writer = shared
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: carrick_el1_abi::ipc::pipe::End::Writer,
+            }
+            .encode(),
+            fd::AccessMode::WriteOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    writer.install(table, fd::Fd(1), false).unwrap();
+    drop(writer);
+
+    let region = shared.region();
+    let writer_release = region
+        .fd(carrick_sched_core::ShortLockSpin)
+        .close(table, fd::Fd(1))
+        .unwrap()
+        .unwrap();
+    crate::ipc::settle_native_release(
+        &region,
+        fd::DeferredRelease::Now(writer_release),
+        Some((fixture.zone, sibling.slot)),
+        sibling.task,
+    )
+    .unwrap();
+
+    let (pin, _) = region
+        .fd(carrick_sched_core::ShortLockSpin)
+        .pin(table, fd::Fd(0))
+        .unwrap();
+    let raw_pin = pin.into_raw();
+    let sibling_binding = crate::common_entry::execution_binding(sibling.task);
+    let raw_ipc_token = region
+        .begin_operation(IpcOperation {
+            kind: IpcOpKind::PipeRead,
+            pin: raw_pin,
+            object: object.to_raw(),
+            task: IpcTaskKey(sibling_binding.task.raw()),
+            mm: IpcMmKey(sibling_binding.mm.raw()),
+            buf: IpcUserVa(0x10000),
+            progress: WriteProgress::new(8),
+            ..IpcOperation::EMPTY
+        })
+        .unwrap();
+    let token = carrick_el1::substrate::ipc::to_sched_token(raw_ipc_token).unwrap();
+    let token_identity = token.identity();
+    let (token_index, token_generation) = (token.index(), token.generation());
+
+    {
+        let mut sibling_service = fixture.service();
+        sibling_service.waker_slot = sibling.slot;
+        sibling_service.native_ipc = Some(region);
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: sibling.slot,
+                },
+                sibling.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut sibling_service,
+            )
+            .unwrap();
+        entry.suspend_adapter_operation(
+            token,
+            ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
+                address: UserVa::new(0x10000),
+                access: carrick_guest_arch::Access::Write,
+                present: true,
+            }),
+            None,
+        );
+        entry.drain_owned_preparation();
+        assert!(entry.take_handoff_receipt().is_some());
+        assert!(entry.take_run_failure().is_none());
+    }
+    assert!(
+        region
+            .fd(carrick_sched_core::ShortLockSpin)
+            .close(table, fd::Fd(0))
+            .unwrap()
+            .is_none(),
+        "closing the numeric fd leaves only the retained operation's OfdPin"
+    );
+    assert!(region.observe(object).is_ok());
+    assert!(
+        fixture
+            .runtime
+            .graph
+            .lock()
+            .has_member_wait(&sibling.record),
+        "the sibling must hold a retained adapter backing-supply service"
+    );
+    assert!(
+        fixture
+            .zone
+            .record(sibling.record.id)
+            .has_adapter_operation(),
+        "the parked adapter service must retain the pipe OperationToken"
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 1);
+
+    let notice = sibling.task.service_notice.take().unwrap().unwrap();
+    let service_key =
+        carrick_sched_core::object_wait::ObjectWaitKey::native_service(sibling.record).unwrap();
+    let ticket = {
+        let _queue = fixture
+            .zone
+            .object_wait(service_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+        // SAFETY: the fixture retains this exact member and its service queue.
+        unsafe {
+            ServiceCell::claim_notice(
+                &sibling.control.service,
+                notice,
+                NonZeroU64::MIN,
+                fixture.zone.record(sibling.record.id).identity(),
+            )
+        }
+        .unwrap()
+    };
+
+    let leader_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    {
+        let mut service = fixture.service();
+        service.native_ipc = Some(region);
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                leader_source,
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(root.take_run_failure().is_none());
+        assert!(root.take_handoff_receipt().is_some());
+    }
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::gate(fixture.page),
+        carrick_el1_abi::GateState::Closed
+    );
+
+    {
+        let queue = fixture
+            .zone
+            .object_wait(service_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+        assert!(ticket.complete(false).is_ok());
+        queue
+            .notify_object(sibling.slot, &mut WakeEffects::default())
+            .unwrap();
+    }
+
+    let slot = [fixture.slot, sibling.slot]
+        .into_iter()
+        .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+        .expect("the cancelled adapter service wakes its exact member");
+    assert_eq!(
+        fixture.zone.switch_in_full(slot).unwrap().record,
+        sibling.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+        .unwrap()
+        .words;
+    let mut sibling_service = fixture.service();
+    sibling_service.waker_slot = slot;
+    sibling_service.native_ipc = Some(region);
+    let mut member = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+    match entrant {
+        RetainedAdapterClosingEntrant::MmapCrossing { ordinal } => {
+            let result = member.begin_service(
+                ServiceOperation::Crossing {
+                    ordinal: carrick_guest_arch::NativeOrdinal::new(ordinal),
+                },
+                None,
+            );
+            let phase = member.native_service_phase();
+            let settled = member.settle_service_exit(result, NativeServiceExit::Bridge);
+            let resumed = crate::dispatch::native_service_completion(settled, phase)
+                .unwrap_or_else(|fatal| {
+                    panic!("terminal retained-adapter mmap entry became {fatal:?}")
+                });
+            assert!(matches!(resumed, NativeResume::Left(None)));
+            assert!(member.take_handoff_receipt().is_none());
+        }
+        RetainedAdapterClosingEntrant::IrqCarrierWork => {
+            let result = member.begin_service(
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Exception,
+                    demand: carrick_core_abi::service::CarrierDemand::Work,
+                },
+                None,
+            );
+            let phase = member.native_service_phase();
+            let settled = member.settle_service_exit(result, NativeServiceExit::CarrierWork);
+            let resumed = crate::dispatch::native_service_completion(settled, phase)
+                .unwrap_or_else(|fatal| {
+                    panic!("terminal retained-adapter IRQ entry became {fatal:?}")
+                });
+            assert!(matches!(resumed, NativeResume::Left(None)));
+            assert!(member.take_handoff_receipt().is_none());
+        }
+        RetainedAdapterClosingEntrant::DrainOwnedPreparation => {
+            member.adapter_ready = Some(Box::new(super::super::service::AdapterPreparation {
+                service: ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                    demand: carrick_core_abi::service::CarrierDemand::Work,
+                },
+                sequence: None,
+                identity: token_identity,
+            }));
+            member.drain_owned_preparation();
+            assert!(member.take_handoff_receipt().is_some());
+            assert!(member.adapter_ready.is_none());
+        }
+    }
+    assert!(member.take_run_failure().is_none());
+    drop(member);
+
+    assert!(fixture.zone.live(sibling.record).is_none());
+    assert!(
+        !fixture
+            .zone
+            .record(sibling.record.id)
+            .has_object_operation()
+    );
+    assert!(
+        !fixture
+            .zone
+            .record(sibling.record.id)
+            .has_adapter_operation()
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
+    assert!(
+        !fixture
+            .runtime
+            .graph
+            .lock()
+            .has_member_wait(&sibling.record)
+    );
+    assert!(sibling.task.service_notice.take().unwrap().is_none());
+
+    let replay_token =
+        carrick_sched_core::object_wait::OperationToken::new(token_index, token_generation)
+            .unwrap();
+    let replay_ipc = carrick_el1::substrate::ipc::from_sched_token(replay_token).unwrap();
+    assert!(
+        region.operation(&replay_ipc).is_err(),
+        "the IPC operation record must be retired"
+    );
+    assert!(
+        region.observe(object).is_err()
+            && region
+                .lock(object, &carrick_sched_core::ShortLockSpin)
+                .is_err(),
+        "terminal settlement must release the final pipe endpoint OfdPin"
+    );
+    assert!(
+        region
+            .fd(carrick_sched_core::ShortLockSpin)
+            .unpin_filtered(
+                OfdPin::from_raw(raw_pin),
+                crate::ipc::is_zone_releasable_backing,
+            )
+            .is_err(),
+        "a second unpin of the retired OfdPin must fail"
+    );
+    assert!(matches!(
+        crate::ipc::retire_native_operation(
+            &region,
+            fixture.zone,
+            slot,
+            sibling.task,
+            sibling_binding,
+            carrick_sched_core::object_wait::OperationToken::new(token_index, token_generation)
+                .unwrap(),
+        ),
+        Err(NativeProcessError::Stale)
+    ));
+
+    let leader_slot = [fixture.slot, sibling.slot]
+        .into_iter()
+        .find(|candidate| fixture.zone.slot(*candidate).queued() != 0)
+        .expect("retiring the sibling must wake the closing leader");
+    assert_eq!(
+        fixture.zone.switch_in_full(leader_slot).unwrap().record,
+        fixture.record.id
+    );
+    let leader_saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut leader_service = fixture.service();
+    leader_service.waker_slot = leader_slot;
+    leader_service.native_ipc = Some(region);
+    let mut leader = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: leader_slot,
+            },
+            fixture.task,
+            fixture.address,
+            &leader_saved,
+            &mut leader_service,
+        )
+        .unwrap();
+    assert!(matches!(
+        leader.resume_checkpoint(|_| Ok(None)).unwrap(),
+        NativeResume::Left(Some(status)) if status == LinuxWaitStatus::exited(7)
+    ));
+}
+
+#[test]
+fn arm_terminal_close_with_retained_adapter_service_accepts_mmap_entry() {
+    terminal_close_with_retained_adapter_service_entry_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        arm_words,
+        RetainedAdapterClosingEntrant::MmapCrossing { ordinal: 222 },
+    );
+}
+
+#[test]
+fn x86_terminal_close_with_retained_adapter_service_accepts_mmap_entry() {
+    terminal_close_with_retained_adapter_service_entry_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(
+        words,
+        RetainedAdapterClosingEntrant::MmapCrossing { ordinal: 9 },
+    );
+}
+
+#[test]
+fn arm_terminal_close_with_retained_adapter_service_accepts_irq_carrier_work() {
+    terminal_close_with_retained_adapter_service_entry_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, RetainedAdapterClosingEntrant::IrqCarrierWork);
+}
+
+#[test]
+fn x86_terminal_close_with_retained_adapter_service_accepts_irq_carrier_work() {
+    terminal_close_with_retained_adapter_service_entry_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, RetainedAdapterClosingEntrant::IrqCarrierWork);
+}
+
+#[test]
+fn arm_terminal_close_with_retained_adapter_service_accepts_drain_owned_preparation() {
+    terminal_close_with_retained_adapter_service_entry_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        arm_words,
+        RetainedAdapterClosingEntrant::DrainOwnedPreparation,
+    );
+}
+
+#[test]
+fn x86_terminal_close_with_retained_adapter_service_accepts_drain_owned_preparation() {
+    terminal_close_with_retained_adapter_service_entry_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, RetainedAdapterClosingEntrant::DrainOwnedPreparation);
+}
+
+fn terminal_close_with_retained_service_propagates_lifecycle_run_failure_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    host_requested: bool,
+) {
+    use carrick_core_abi::service::ServiceOperation;
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let mut sibling = add_service_sibling(
+        &fixture,
+        Some(ServiceOperation::Crossing {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(64),
+        }),
+    );
+
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(root.take_run_failure().is_none());
+    }
+    assert!(
+        sibling
+            .service_ticket
+            .take()
+            .unwrap()
+            .complete(true)
+            .is_ok()
+    );
+
+    let slot = [fixture.slot, sibling.slot]
+        .into_iter()
+        .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+        .unwrap();
+    assert_eq!(
+        fixture.zone.switch_in_full(slot).unwrap().record,
+        sibling.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+        .unwrap()
+        .words;
+    let mut sibling_service = fixture.service();
+    sibling_service.waker_slot = slot;
+    let mut member = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+
+    if host_requested {
+        assert_eq!(
+            fixture.zone.claim_for_host(
+                sibling.record,
+                None,
+                carrick_sched_core::Handback::Control,
+                &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            ),
+            carrick_sched_core::HostClaim::El1Held { slot }
+        );
+    }
+    let root_key = fixture.runtime.graph.lock().root_key;
+    let removed_task = fixture
+        .runtime
+        .graph
+        .lock()
+        .owner
+        .tasks_mut()
+        .remove(&root_key.id)
+        .unwrap();
+
+    let result = member.begin_service(
+        ServiceOperation::CarrierWork {
+            entry: OwnerEntry::Exception,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
+        },
+        None,
+    );
+    let phase = member.native_service_phase();
+    let settled = member.settle_service_exit(result, NativeServiceExit::CarrierWork);
+    let fatal = crate::dispatch::native_service_completion(settled, phase).err();
+    let run_failure = member.take_run_failure();
+    let receipt = member.take_handoff_receipt();
+    drop(member);
+    fixture
+        .runtime
+        .graph
+        .lock()
+        .owner
+        .tasks_mut()
+        .insert(root_key.id, removed_task);
+
+    assert!(run_failure.is_none());
+    assert!(receipt.is_none());
+    assert!(
+        matches!(
+            fatal,
+            Some(crate::dispatch::NativeInvariant::NativeService(
+                carrick_el1_abi::EntryBindingFatalReason::NativeServiceCompleteStale
+            ))
+        ),
+        "expected NativeServiceCompleteStale propagation (host_requested={host_requested}), got {fatal:?}"
+    );
+}
+
+#[test]
+fn arm_terminal_close_with_retained_service_propagates_lifecycle_run_failure() {
+    for host_requested in [true, false] {
+        terminal_close_with_retained_service_propagates_lifecycle_run_failure_for::<
+            carrick_el1_abi::Aarch64ParkedContext,
+            carrick_mmu_core::owner_mmu::Aarch64Mmu,
+        >(arm_words, host_requested);
+    }
+}
+
+#[test]
+fn x86_terminal_close_with_retained_service_propagates_lifecycle_run_failure() {
+    for host_requested in [true, false] {
+        terminal_close_with_retained_service_propagates_lifecycle_run_failure_for::<
+            ParkedContextWords,
+            carrick_mmu_core::x86::owner_mmu::X86Mmu,
+        >(words, host_requested);
+    }
+}
