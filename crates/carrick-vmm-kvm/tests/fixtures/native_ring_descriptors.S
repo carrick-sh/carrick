@@ -40,7 +40,7 @@ _start:
     call list_directory             /* steps 30-33 */
     xor %edi, %edi
     jmp exit
-#elif defined(CHILD) || defined(DIRFD) || defined(FILEOPS) || defined(VECTORS)
+#elif defined(CHILD) || defined(DIRFD) || defined(FILEOPS) || defined(VECTORS) || defined(XATTRS) || defined(HOST_IOCTL)
     mov $-100, %edi                 /* openat(AT_FDCWD, file, O_RDONLY|O_CLOEXEC) */
     lea file(%rip), %rsi
     mov $0x80000, %edx
@@ -100,7 +100,91 @@ _start:
 #endif
     jmp exit
 child:
-#ifdef VECTORS
+#ifdef HOST_IOCTL
+    mov $1, %edi
+    mov $0x5421, %esi              /* FIONBIO on stdout */
+    lea enabled(%rip), %rdx
+    mov $16, %eax
+    syscall
+    mov $105, %edi
+    test %rax, %rax
+    jne exit
+
+    mov $1, %edi
+    mov $3, %esi                   /* fcntl(F_GETFL) observes O_NONBLOCK */
+    mov $72, %eax
+    syscall
+    mov $106, %edi
+    test %rax, %rax
+    js exit
+    test $0x800, %eax
+    jz exit
+
+    mov $1, %edi
+    mov $0xdead, %esi              /* host resource, unlisted request */
+    xor %edx, %edx
+    mov $16, %eax
+    syscall
+    mov $107, %edi
+    cmp $-25, %rax
+    jne exit
+
+    mov %r12, %rdi
+    mov $0x5401, %esi              /* TCGETS on a regular file */
+    lea buf(%rip), %rdx
+    mov $16, %eax
+    syscall
+    mov $108, %edi
+    cmp $-25, %rax
+    jne exit
+    xor %edi, %edi
+    jmp exit
+#elif defined(XATTRS)
+    lea file(%rip), %rdi
+    xor %esi, %esi
+    xor %edx, %edx
+    mov $194, %eax                 /* listxattr size query, empty */
+    syscall
+    mov $101, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r12, %rdi
+    lea xattr_name(%rip), %rsi
+    lea xattr_value(%rip), %rdx
+    mov $5, %r10d
+    xor %r8d, %r8d
+    mov $190, %eax                 /* fsetxattr */
+    syscall
+    mov $102, %edi
+    test %rax, %rax
+    jne exit
+
+    lea file(%rip), %rdi
+    lea xattr_name(%rip), %rsi
+    lea buf(%rip), %rdx
+    mov $5, %r10d
+    mov $191, %eax                 /* getxattr */
+    syscall
+    mov $103, %edi
+    cmp $5, %rax
+    jne exit
+    cmpl $0x656e776f, buf(%rip)    /* "owne" */
+    jne exit
+    cmpb $0x64, buf+4(%rip)       /* "d" */
+    jne exit
+
+    mov %r12, %rdi
+    lea buf(%rip), %rsi
+    mov $64, %edx
+    mov $196, %eax                 /* flistxattr */
+    syscall
+    mov $104, %edi
+    cmp $13, %rax
+    jne exit
+    xor %edi, %edi
+    jmp exit
+#elif defined(VECTORS)
     mov $-100, %edi
     lea file(%rip), %rsi
     mov $2, %edx
@@ -511,6 +595,13 @@ parent_sibling: .asciz "parent-sibling"
 #endif
 empty: .asciz ""
 msg: .ascii "x"
+#ifdef HOST_IOCTL
+enabled: .long 1
+#endif
+#ifdef XATTRS
+xattr_name: .asciz "user.witness"
+xattr_value: .ascii "owned"
+#endif
 #ifdef VECTORS
 vector_data: .ascii "abcd"
 vector_insert: .ascii "X"

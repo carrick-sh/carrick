@@ -4055,6 +4055,10 @@ fn ring_descriptor_run(mode: &str) -> (i32, Vec<(usize, u64)>) {
         assert!(!sibling.exists(), "the native parent removed its sibling");
         std::fs::write(&sibling, []).expect("parent's sibling file for Carrick");
     }
+    if mode == "-DXATTRS" {
+        std::fs::remove_file(&path).expect("detach the native control's xattrs");
+        std::fs::write(&path, b"loader library").expect("new Carrick fixture file");
+    }
     if matches!(mode, "-DFILEOPS" | "-DVECTORS") {
         std::fs::write(&path, b"loader library").expect("reset native control's file");
     }
@@ -4161,6 +4165,26 @@ fn serial_host_fork_child_uses_positioned_and_vectored_io() {
         (0, vec![]),
         "91 open, 92 seed bytes, 93 pwrite64, 94 pwritev, 95 preadv, \
          96 positional cursor, 97 rewind, 98 readv"
+    );
+}
+
+/// A native fork child reads an xattr back through its filesystem name.
+#[test]
+fn serial_host_fork_child_uses_host_file_xattrs() {
+    assert_eq!(
+        ring_descriptor_run("-DXATTRS"),
+        (0, vec![]),
+        "101 listxattr empty, 102 fsetxattr, 103 getxattr, 104 flistxattr"
+    );
+}
+
+/// Host-backed implicit stdio updates its guest OFD flags through FIONBIO.
+#[test]
+fn serial_host_fork_child_uses_allowlisted_host_ioctls() {
+    assert_eq!(
+        ring_descriptor_run("-DHOST_IOCTL"),
+        (0, vec![]),
+        "105 FIONBIO stdout, 106 F_GETFL, 107 unknown ioctl, 108 TCGETS regular file"
     );
 }
 
