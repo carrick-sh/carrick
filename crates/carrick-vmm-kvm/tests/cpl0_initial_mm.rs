@@ -5787,6 +5787,21 @@ fn native_child_go_netpoller_adds_a_udp_socket_to_epoll() {
     assert_dns_steps_are_linux(&dns_style_udp_steps(false), &[GO_NETPOLL_STEPS]);
 }
 
+#[test]
+fn native_child_epoll_ctl_validates_exclusive_on_host_socket() {
+    let elf = native_exit_fixture_with_flags(
+        "native_child_inet.S",
+        &[
+            "-DTCP_PORT=0",
+            "-DUDP_PORT=0",
+            "-DTCP_NB_PORT=0",
+            "-DEPOLL_EXCLUSIVE",
+        ],
+    );
+    let outcome = run_exec_fixture(&elf, 128);
+    assert_eq!(outcome.run.exit_code, 0, "{:?}", outcome.run);
+}
+
 /// A real UDP peer supplies a datagram after two fork-related native
 /// threads release their execution lanes into the inherited epoll's queue.
 #[test]

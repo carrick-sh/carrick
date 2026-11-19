@@ -18341,7 +18341,7 @@ fn with_arm_process_host_files<R>(
 fn serial_host_native_child_epoll_ctl_adds_an_inet_socket() {
     use carrick_abi::{
         LINUX_AF_INET, LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD,
-        LINUX_EPOLLET, LINUX_EPOLLOUT, LINUX_SOCK_DGRAM,
+        LINUX_EPOLLET, LINUX_EPOLLEXCLUSIVE, LINUX_EPOLLONESHOT, LINUX_EPOLLOUT, LINUX_SOCK_DGRAM,
     };
     use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
     use carrick_test_support::GuestUserBuffer;
@@ -18389,6 +18389,44 @@ fn serial_host_native_child_epoll_ctl_adds_an_inet_socket() {
                 assert_eq!(&output.as_bytes()[8..16], &cookie.to_ne_bytes());
             }
         };
+        let exclusive = epoll_event_buffer(LINUX_EPOLLOUT | LINUX_EPOLLEXCLUSIVE, 0x2420);
+        let invalid = epoll_event_buffer(
+            LINUX_EPOLLOUT | LINUX_EPOLLEXCLUSIVE | LINUX_EPOLLONESHOT,
+            0,
+        );
+        ctl(call, LINUX_EPOLL_CTL_ADD, exclusive.arg());
+        let (route, result) = call(
+            child,
+            sys::EPOLL_CTL.raw(),
+            [epoll, LINUX_EPOLL_CTL_MOD, socket, exclusive.arg(), 0, 0],
+        );
+        assert_ne!(route, CompletionRoute::Forward);
+        assert_eq!(result, carrick_syscall_abi::LINUX_EINVAL.guest_retval());
+        let (route, result) = call(
+            child,
+            sys::EPOLL_CTL.raw(),
+            [epoll, LINUX_EPOLL_CTL_MOD, socket, level.arg(), 0, 0],
+        );
+        assert_ne!(route, CompletionRoute::Forward);
+        assert_eq!(result, carrick_syscall_abi::LINUX_EINVAL.guest_retval());
+        wait(call, 1, 0x2420);
+        ctl(call, LINUX_EPOLL_CTL_DEL, 0);
+        let (route, result) = call(
+            child,
+            sys::EPOLL_CTL.raw(),
+            [epoll, LINUX_EPOLL_CTL_ADD, socket, invalid.arg(), 0, 0],
+        );
+        assert_ne!(route, CompletionRoute::Forward);
+        assert_eq!(result, carrick_syscall_abi::LINUX_EINVAL.guest_retval());
+        let (_, nested) = call(child, sys::EPOLL_CREATE1.raw(), [0; 6]);
+        assert!(nested >= 0);
+        let (route, result) = call(
+            child,
+            sys::EPOLL_CTL.raw(),
+            [epoll, LINUX_EPOLL_CTL_ADD, nested as u64, exclusive.arg(), 0, 0],
+        );
+        assert_ne!(route, CompletionRoute::Forward);
+        assert_eq!(result, carrick_syscall_abi::LINUX_EINVAL.guest_retval());
         ctl(call, LINUX_EPOLL_CTL_ADD, edge.arg());
         wait(call, 1, 0x2418);
         wait(call, 0, 0);
