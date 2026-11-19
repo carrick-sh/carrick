@@ -422,7 +422,8 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                 #[cfg(target_arch = "aarch64")]
                 let maintenance = carrick_el1::isa::arm_edit::El1TableMaintenance { ttbr0: root };
                 #[cfg(target_arch = "aarch64")]
-                let words = current_mm_words(ttbr, root, &maintenance).map_err(|_| MmError::Invalid)?;
+                let words =
+                    current_mm_words(ttbr, root, &maintenance).map_err(|_| MmError::Invalid)?;
                 Ok(try_apply_grant::<NativePortalMmu, _>(
                     slot,
                     &words,

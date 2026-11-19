@@ -443,6 +443,28 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         })
     }
 
+    /// Publish a carrier-wide `SpaceWaitCause::Metadata` wake to every
+    /// currently live address space so waiters parked on metadata capacity or
+    /// residency growth re-probe once new capacity arrives.
+    pub fn notify_metadata_waiters(&self, venue: SpaceReleaseVenue<'_, C>) {
+        for raw in 0..super::ADDRESS_SPACES {
+            let Some(index) = SpaceIndex::from_index(raw) else {
+                continue;
+            };
+            let Some(mm) = NonZeroU64::new(self.spaces.key(index)) else {
+                continue;
+            };
+            let entry = SpaceEntryHandle {
+                zone: self,
+                index,
+                mm,
+            };
+            if let Ok(lease) = entry.live_notifications() {
+                venue.publish(lease.reserve(SpaceWaitCause::Metadata));
+            }
+        }
+    }
+
     /// Bind while the root's admission guard excludes publication/retirement.
     /// All cause pins are acquired before ACTIVE publication; refusal unwinds
     /// every acquired pin, leaving no admitted source.

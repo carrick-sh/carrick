@@ -948,6 +948,7 @@ pub(crate) fn record_el1_region_host_ptr(ptr: usize) {
 
 /// Retire the pointer while its owning host mapping is still mapped.
 pub(crate) fn clear_el1_region_host_ptr_if(expected: usize) {
+    carrick_hal::host_residency::clear_host_residency_resolver(expected);
     let _ = EL1_REGION_HOST_PTR.compare_exchange(
         expected,
         0,

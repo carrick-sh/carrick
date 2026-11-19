@@ -2702,14 +2702,16 @@ fn residency_growth_refused_once_then_succeeds<B: carrick_mmu_core::owner_mmu::O
     // 4,097th grant while allocator refuses: typed NotNow, no terminal receipt,
     // descriptor claim released back to SUBMITTED so host withdrawal or retry works.
     let (window_4096, txn_4096) = submit_page(FRAME_GRANT_RESIDENCY_SLOTS);
-    let first = unsafe {
-        serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {})
-    }
-    .unwrap();
+    let first =
+        unsafe { serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {}) }
+            .unwrap();
     let GrantServeOutcome::NotNow(continuation) = first else {
         panic!("expected typed NotNow when growth is refused, got {first:?}");
     };
-    assert_eq!(continuation.refusal, ResidencyGrowthRefusal::MetadataRequired);
+    assert_eq!(
+        continuation.refusal,
+        ResidencyGrowthRefusal::MetadataRequired
+    );
     assert_eq!(continuation.observed_extensions, 0);
     assert!(!continuation.ready_to_retry(table));
     assert!(wire.take_receipt(window_4096, &txn_4096).is_none());
@@ -2720,10 +2722,9 @@ fn residency_growth_refused_once_then_succeeds<B: carrick_mmu_core::owner_mmu::O
 
     // Unblock metadata allocation: retry grows extension 0 and applies grant 4,096.
     allocator.refuse_next.set(false);
-    let retried = unsafe {
-        serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {})
-    }
-    .unwrap();
+    let retried =
+        unsafe { serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {}) }
+            .unwrap();
     let GrantServeOutcome::Completed(receipt) = retried else {
         panic!("expected Applied after metadata became available, got {retried:?}");
     };
@@ -2749,14 +2750,16 @@ fn residency_growth_refused_once_then_succeeds<B: carrick_mmu_core::owner_mmu::O
         assert!(wire.take_receipt(window, &txn).is_some());
     }
     let (window_8192, txn_8192) = submit_page(FRAME_GRANT_RESIDENCY_SLOTS * 2);
-    let second = unsafe {
-        serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {})
-    }
-    .unwrap();
+    let second =
+        unsafe { serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {}) }
+            .unwrap();
     let GrantServeOutcome::NotNow(cont_retire) = second else {
         panic!("expected typed NotNow at second segment saturation, got {second:?}");
     };
-    assert_eq!(cont_retire.refusal, ResidencyGrowthRefusal::MetadataRequired);
+    assert_eq!(
+        cont_retire.refusal,
+        ResidencyGrowthRefusal::MetadataRequired
+    );
     assert!(!cont_retire.ready_to_retry(table));
 
     let mut host_resolved = Box::new(ResolvedResidencyTable::new());
@@ -2783,10 +2786,9 @@ fn residency_growth_refused_once_then_succeeds<B: carrick_mmu_core::owner_mmu::O
             .commit()
     );
     assert!(cont_retire.ready_to_retry(table));
-    let applied_after_retire = unsafe {
-        serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {})
-    }
-    .unwrap();
+    let applied_after_retire =
+        unsafe { serve_grant_with_allocator(&portal, &wire, &live, table, &allocator, 0, || {}) }
+            .unwrap();
     let GrantServeOutcome::Completed(receipt) = applied_after_retire else {
         panic!("expected Applied after retirement freed slot, got {applied_after_retire:?}");
     };

@@ -329,7 +329,8 @@ pub unsafe fn serve_grant_with_venue<
     };
     for attempt in 0..2 {
         let observed_retirement = table.retirement_epoch();
-        let owner_wait = portal.observe_wait(handle, carrick_core_abi::PortalWaitCause::Metadata)?;
+        let owner_wait =
+            portal.observe_wait(handle, carrick_core_abi::PortalWaitCause::Metadata)?;
         let target = grant_target(portal, &window, worker)?;
         // SAFETY: caller guarantees `table` is in `allocator`'s guest venue.
         let view = unsafe { table.guest_view() };
