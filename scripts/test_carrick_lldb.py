@@ -265,6 +265,27 @@ class CarrickLldbHelperTests(unittest.TestCase):
             "EL1GRANT_IPA tid=72001 ipa=0x0000004012345000",
         )
 
+    def test_eventring_formats_frame_grant_terminal_failures(self):
+        outcomes = {
+            5: "error/prepare",
+            6: "refused/publish-unsupported",
+            7: "refused/publish descriptor_refusal=Occupied",
+            8: "refused/descriptor descriptor_refusal=Occupied",
+            9: "rolled-back/descriptor descriptor_refusal=Occupied",
+            10: "refused/mailbox-slot",
+            11: "refused/mailbox-stale",
+            12: "refused/mailbox-ready",
+            13: "fatal/publication",
+        }
+        for code, outcome in outcomes.items():
+            with self.subTest(code=code):
+                detail = 9 if code in (7, 8, 9) else 0
+                packed = code | (3 << 4) | (306 << 8) | (detail << 24)
+                self.assertEqual(
+                    self._fmt(70, 72003, 3118, packed),
+                    f"EL1GRANT_DECISION tid=72003 generation=3118 decision={outcome} prot=0x3 pages=306",
+                )
+
     def test_eventring_formats_first_touch(self):
         packed = 4 | (3 << 3) | (2 << 5) | (3 << 7)
         self.assertEqual(
