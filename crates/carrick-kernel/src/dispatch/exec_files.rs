@@ -307,9 +307,9 @@ fn acquire_native_descriptor(
     use carrick_abi::{LINUX_EBADF, LINUX_ENOENT};
     // Proc entries use the decimal spelling of the live descriptor number.
     if fd < 0
-        || !path
+        || path
             .rsplit_once('/')
-            .is_some_and(|(_, leaf)| leaf == fd.to_string())
+            .is_none_or(|(_, leaf)| leaf != fd.to_string())
     {
         return Err(ExecSourceError::Linux(LINUX_ENOENT));
     }
