@@ -7206,40 +7206,45 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 PendingCloseOperation::Exit { status, entry } => Some((status, entry)),
                 PendingCloseOperation::Exec(_) => None,
             });
-        if let Some((status, entry)) = owner_exit {
-            // SAFETY: this exact record is selected by the execution owner;
-            // the same checkpoint serves in-zone and host re-entry.
-            unsafe {
-                self.source
-                    .zone
-                    .record(self.record.id)
-                    .consume_owner_continuation();
-            }
-            return Some(match self.exit_with_status(status, entry) {
-                Ok(outcome) => outcome,
-                Err(error) => self.run_failed(error.run_failure_reason()),
-            });
-        }
         let record = self.source.zone.record(self.record.id);
         let continuation = matches!(
             record.resume_disposition(),
             carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
         );
-        if continuation {
-            // SAFETY: this exact record is selected by the execution owner;
-            // a losing exit_group caller retires its record instead of
-            // returning to EL0.
-            unsafe {
-                record.consume_owner_continuation();
-            }
-        }
         // Process close requests every member's exit. A ring-born member
         // that was runnable (queued, not parked in a wait) has no host
         // thread to honour that request: its next selection is the only
         // point that can retire it, so it must not return to EL0.
-        if (continuation || (self.control.host_exit_requested() && !record.has_adapter_operation()))
-            && let Some(status) = self.pending_close_status()
+        let member_exit = if owner_exit.is_none()
+            && (continuation
+                || (self.control.host_exit_requested() && !record.has_adapter_operation()))
         {
+            self.pending_close_status()
+        } else {
+            None
+        };
+        // A cancelled service can leave both a terminal continuation and an
+        // installed IPC operation. Release the operation and its endpoint
+        // pin before either closing caller gives up this record.
+        if (owner_exit.is_some() || member_exit.is_some())
+            && let Err(error) = self
+                .settle_closing_adapter_operation(service::ClosingAdapterCustody::CancelInstalled)
+        {
+            return Some(self.run_failed(retention_failure(error).run_failure_reason()));
+        }
+        if continuation || owner_exit.is_some() {
+            // SAFETY: this exact record is selected by the execution owner.
+            unsafe {
+                record.consume_owner_continuation();
+            }
+        }
+        if let Some((status, entry)) = owner_exit {
+            return Some(match self.exit_with_status(status, entry) {
+                Ok(outcome) => outcome,
+                Err(error) => self.run_failed(error.run_failure_reason()),
+            });
+        }
+        if let Some(status) = member_exit {
             return Some(match self.retire_closing_member(status) {
                 Ok(outcome) => outcome,
                 Err(error) => self.run_failed(error.run_failure_reason()),
