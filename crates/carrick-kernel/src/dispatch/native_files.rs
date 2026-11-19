@@ -3227,7 +3227,11 @@ mod tests {
                 (&b""[..], FDCWD as u64, -2),
                 (&b"."[..], FDCWD as u64, -17),
                 (&b"bad-fd"[..], 999, -9),
-                (&b"not-dir"[..], 1, -38),
+                (
+                    &b"not-dir"[..],
+                    1,
+                    carrick_abi::LINUX_ENOTDIR.guest_retval(),
+                ),
             ] {
                 assert_eq!(mkdir(path, dirfd), expected, "{upper:?}: {path:?}");
             }
