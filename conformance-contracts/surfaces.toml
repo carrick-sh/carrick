@@ -1177,6 +1177,11 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64/src/exception.rs", contracts = [] },
   # Copy-through exit handlers for the test-only arm64 lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.cache-hot-set" },
+  { path = "crates/carrick-softcpu-aarch64/src/cpu_profile.rs", contract = "softcpu.a64.el0-fp" },
+  { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "softcpu.a64.el0-fp" },
+  # Virtual exception entry and return for the test-only arm64 lane.
+  # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
+  { path = "crates/carrick-softcpu-aarch64/src/exception.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "softcpu.a64.el0-fp" },
   # Typed A64 census and instruction decoder for the test-only soft-CPU lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/lib.rs", contract = "softcpu.a64.el0-fp" },

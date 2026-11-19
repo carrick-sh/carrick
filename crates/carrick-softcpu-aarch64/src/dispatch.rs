@@ -11,7 +11,7 @@ use crate::mmu::{self, AccessClass, Stage1Error};
 use crate::state::{CpuState, ExceptionLevel, ProgramCounter, VirtualAddress};
 use crate::translate::{
     BlockExit, BlockLimits, CODE_PAGE_BYTES, ExitReason, GuestInstruction, InstructionClass,
-    TranslateError, TranslatedBlock, emit_block, split_block,
+    TranslateError, TranslatedBlock, emit_block, split_block_at_level,
 };
 use carrick_guest_arch::{FrameGpa, Gpa};
 use carrick_mmu_core::stage1::LeafAccess;
@@ -82,6 +82,7 @@ pub struct Report<E> {
     /// Budget steps, including instruction aborts taken before a launch.
     pub blocks: u64,
     pub work: RunWork,
+    pub undefined_el0_deliveries: u64,
     pub pc: ProgramCounter,
     pub stop: Stop<E>,
 }
@@ -90,8 +91,8 @@ impl<E: fmt::Debug> fmt::Display for Report<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "boots to PC={:#x} after {} blocks / ",
-            self.pc.0, self.blocks
+            "boots to PC={:#x} after {} blocks (EL0 undefined deliveries: {}) / ",
+            self.pc.0, self.blocks, self.undefined_el0_deliveries
         )?;
         match self.stop {
             Stop::Budget => write!(f, "stops at the block budget"),
@@ -241,6 +242,7 @@ pub fn run<X: ExecuteBlock>(
     // residency within that borrow also discards code at provider handoffs.
     let mut cache = BlockCache::<BlockKey, ResidentBlock<X::Code>>::default();
     let retain_blocks = executor.retain_blocks();
+    let initial_undefined = cpu.undefined_el0_deliveries;
     let stop = loop {
         if blocks >= budget {
             break Stop::Budget;
@@ -288,7 +290,7 @@ pub fn run<X: ExecuteBlock>(
                 };
                 work.decoded_blocks += 1;
                 let mut fetched_whole_block = true;
-                let guest = split_block(cpu.pc, limits, |pc| {
+                let guest = split_block_at_level(cpu.pc, limits, cpu.pstate.el, |pc| {
                     let word = if pc == cpu.pc {
                         Some(first)
                     } else {
@@ -371,6 +373,7 @@ pub fn run<X: ExecuteBlock>(
     Report {
         blocks,
         work,
+        undefined_el0_deliveries: cpu.undefined_el0_deliveries.wrapping_sub(initial_undefined),
         pc: cpu.pc,
         stop,
     }
@@ -606,6 +609,24 @@ mod tests {
     }
 
     #[test]
+    fn report_counts_each_el0_undefined_delivery_once_per_run() {
+        let mut cpu = el1();
+        cpu.pstate.el = ExceptionLevel::El0;
+        cpu.pstate.sp = StackSelect::El0;
+        let mut memory = Flat::default();
+        // Masked LSE instruction. The EL1 vector executes an unrelated
+        // provider exit, which must not affect the EL0 counter.
+        memory.code(ENTRY, &[0xf821_0002]);
+        memory.code(VBAR + 0x400, &[0xd400_0002]);
+        let first = go(&mut cpu, &mut memory, &mut GuestSemantics, 4);
+        assert_eq!(first.undefined_el0_deliveries, 1);
+        assert_eq!(cpu.el1.elr, ProgramCounter(ENTRY));
+        assert_eq!(cpu.el1.esr.0, 0x0200_0000);
+        let second = go(&mut cpu, &mut memory, &mut GuestSemantics, 4);
+        assert_eq!(second.undefined_el0_deliveries, 0);
+    }
+
+    #[test]
     fn loop_svc_vector_and_hvc_reach_the_provider_exit() {
         let mut m = Flat::default();
         // movz x0, #3 ; loop: subs x0, x0, #1 ; b.ne loop ; svc #0
@@ -648,7 +669,7 @@ mod tests {
         assert_eq!(r.stop, Stop::Fetch(VirtualAddress(ENTRY)));
         assert_eq!(
             std::format!("{r}"),
-            "boots to PC=0x4000 after 0 blocks / fails at: instruction fetch from 0x4000"
+            "boots to PC=0x4000 after 0 blocks (EL0 undefined deliveries: 0) / fails at: instruction fetch from 0x4000"
         );
 
         let mut m = Flat::default();
@@ -658,7 +679,7 @@ mod tests {
         let r = go(&mut cpu, &mut m, &mut GuestSemantics, 10);
         assert_eq!(
             std::format!("{r}"),
-            "boots to PC=0x4004 after 1 blocks / fails at: SCTLR_EL1.M enable at \
+            "boots to PC=0x4004 after 1 blocks (EL0 undefined deliveries: 0) / fails at: SCTLR_EL1.M enable at \
              PC=0x4004 (word 0xd5181000, value 0x1)"
         );
         assert_eq!(cpu.el1.sctlr.0, 0);

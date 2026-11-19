@@ -537,6 +537,7 @@ pub enum A64Class {
     Hint,
     SimdFpLoadStore,
     SimdFpCompute,
+    Crc32,
 }
 
 /// Classify only encoding leaves whose reserved fields are checked below.
@@ -752,6 +753,9 @@ pub fn classify(w: u32) -> A64Class {
     // Atomic memory operations: LDADD..LDUMIN and SWP, excluding reserved opcodes.
     if w & 0x3f200c00 == 0x38200000 && (w >> 12) & 15 <= 8 {
         return LseAtomic;
+    }
+    if instruction::crc32(w).is_some() {
+        return A64Class::Crc32;
     }
     if simd::decode(w).is_some() {
         return SimdFpCompute;
@@ -1161,6 +1165,7 @@ mod instruction {
         Address(Address),
         Multiply(Multiply),
         Divide(Divide),
+        Crc32(Crc32),
         AtomicTransfer(AtomicTransfer),
         ConditionalSelect(ConditionalSelect),
         ConditionalCompare(ConditionalCompare),
@@ -1251,10 +1256,50 @@ mod instruction {
         if let Some(d) = divide(word) {
             return Instruction::Divide(d);
         }
+        if let Some(crc) = crc32(word) {
+            return Instruction::Crc32(crc);
+        }
         if let Some(a) = atomic_transfer(word) {
             return Instruction::AtomicTransfer(a);
         }
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CrcPolynomial {
+        Ieee,
+        Castagnoli,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Crc32 {
+        pub destination: OperandRegister,
+        pub accumulator: OperandRegister,
+        pub data: OperandRegister,
+        pub size: MemorySize,
+        pub polynomial: CrcPolynomial,
+    }
+
+    /// DDI0487 C4.1 Data-processing (2 source), CRC32 and CRC32C.
+    pub(super) fn crc32(word: u32) -> Option<Crc32> {
+        if word & 0x7fe0_e000 != 0x1ac0_4000 {
+            return None;
+        }
+        let scale = (word >> 10) & 3;
+        if (word >> 31 == 1) != (scale == 3) {
+            return None;
+        }
+        Some(Crc32 {
+            destination: OperandRegister::field(word, false),
+            accumulator: OperandRegister::field(word >> 5, false),
+            data: OperandRegister::field(word >> 16, false),
+            size: MemorySize::scale(scale)?,
+            polynomial: if word & (1 << 12) == 0 {
+                CrcPolynomial::Ieee
+            } else {
+                CrcPolynomial::Castagnoli
+            },
+        })
     }
 
     /// Transfer size in bytes (including the SIMD 128-bit form).
@@ -2521,14 +2566,16 @@ mod instruction {
 pub use instruction::{
     AddImmediate, AddSubtract, Address, AddressBase, Arithmetic, ArithmeticOperand, AtomicTransfer,
     AtomicTransferKind, Bitfield, BitfieldOperation, Branch, CompareImmediate, CompareOperand,
-    Condition, ConditionalCompare, ConditionalSelect, Divide, Extend, Gpr, Hint, Instruction,
-    Logical, LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress, MemoryIndex,
-    MemoryOffset, MemoryOperation, MemoryRegister, MemorySize, MoveWide, MoveWideOperation,
-    Multiply, MultiplyKind, Nzcv, OperandRegister, PairMemory, PcOffset, RegisterBranch,
-    ScalarMemory, SelectOperation, ShiftAmount, SimdCopy, StructureLayout, StructureMemory,
-    StructureWriteback, VectorRegister, decode_instruction,
+    Condition, ConditionalCompare, ConditionalSelect, Crc32, CrcPolynomial, Divide, Extend, Gpr,
+    Hint, Instruction, Logical, LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress,
+    MemoryIndex, MemoryOffset, MemoryOperation, MemoryRegister, MemorySize, MoveWide,
+    MoveWideOperation, Multiply, MultiplyKind, Nzcv, OperandRegister, PairMemory, PcOffset,
+    RegisterBranch, ScalarMemory, SelectOperation, ShiftAmount, SimdCopy, StructureLayout,
+    StructureMemory, StructureWriteback, VectorRegister, decode_instruction,
 };
 
+mod cpu_profile;
+pub use cpu_profile::{GUEST_CPU_PROFILE, GuestCpuProfile};
 pub mod dispatch;
 pub mod exception;
 pub mod handler;
