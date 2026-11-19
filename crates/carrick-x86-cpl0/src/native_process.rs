@@ -732,25 +732,37 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 },
             );
             let result = if let Some(receipt) = retained {
-                Ok(Some(receipt))
+                Ok(carrick_core::mm::frames::GrantServeOutcome::Completed(
+                    receipt,
+                ))
             } else {
-                carrick_core::mm::frames::serve_grant(
-                    &owner,
-                    reply,
-                    &words,
-                    residency,
-                    self.worker(),
-                    || {},
-                )
+                // SAFETY: `residency` and `GLOBAL_ALLOCATOR` share CPL0's guest venue.
+                unsafe {
+                    carrick_core::mm::frames::serve_grant_with_allocator(
+                        &owner,
+                        reply,
+                        &words,
+                        residency,
+                        &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+                        self.worker(),
+                        || {},
+                    )
+                }
             };
             match result {
-                Ok(receipt) => Some(receipt.is_some_and(|receipt| {
+                Ok(carrick_core::mm::frames::GrantServeOutcome::Completed(receipt)) => Some(
                     matches!(receipt.outcome,
                     carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
                     | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
                         carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied
-                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot))
-                })),
+                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot)),
+                ),
+                Ok(carrick_core::mm::frames::GrantServeOutcome::Empty) => Some(false),
+                Ok(carrick_core::mm::frames::GrantServeOutcome::NotNow(continuation)) => {
+                    return Err(MmError::Wait(
+                        continuation.owner_wait.unwrap_or(editor_wait),
+                    ));
+                }
                 // The shared pending owner retains this reply while it parks on
                 // the exact producer, including resumption on another CPU.
                 Err(MmError::Wait(wait)) => return Err(MmError::Wait(wait)),
