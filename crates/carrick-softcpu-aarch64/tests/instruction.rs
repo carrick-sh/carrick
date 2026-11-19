@@ -15,10 +15,17 @@ fn baseline_hints_are_typed() {
 
 #[test]
 fn unsupported_hint_extensions_fail_shut() {
-    for word in [0xd50320df, 0xd50320ff, 0xd503211f, 0xd503241f, 0xd503201e] {
+    for word in [0xd50320df, 0xd503201e, 0xd503243f] {
         assert_eq!(
             decode_instruction(word),
             Instruction::Unallocated,
+            "{word:08x}"
+        );
+    }
+    for word in [0xd50320ff, 0xd503211f, 0xd503241f] {
+        assert_eq!(
+            decode_instruction(word),
+            Instruction::CompatibilityHint,
             "{word:08x}"
         );
     }
