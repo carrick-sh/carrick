@@ -268,26 +268,28 @@ root_script:
     SYS SYS_mkdirat
     EXPECT 62, -17
 #ifdef RING_DIRFD
-    /* A relative path through it needs that directory as the base, which the
-     * shared path staging does not serve yet: the ring's counted ENOSYS,
-     * never the path resolved against another descriptor (this fixture runs
-     * under carrick only; native Linux creates the directory). */
+    /* The relative operands use the directory held by the ring table. */
     mov %r14, %rdi
-    AT_PATH %rsi, member
+    AT_PATH %rsi, ring_subdir
     mov $0755, %edx
     SYS SYS_mkdirat
-    EXPECT 63, -ENOSYS
+    EXPECT 63, 0
     mov %r14, %rdi
-    AT_PATH %rsi, member
-    xor %edx, %edx
-    SYS SYS_unlinkat
-    EXPECT 64, -ENOSYS
-    mov %r14, %rdi
-    AT_PATH %rsi, member
+    AT_PATH %rsi, ring_link
     lea 4096(%r13), %rdx
     mov $16, %r10d
     SYS SYS_readlinkat
-    EXPECT 65, -ENOSYS
+    EXPECT 65, 1
+    cmpb $'f', 4096(%r13)
+    je 7f
+    mov $66, %edi
+    jmp fail
+7:
+    mov %r14, %rdi
+    AT_PATH %rsi, ring_subdir
+    mov $AT_REMOVEDIR, %edx
+    SYS SYS_unlinkat
+    EXPECT 64, 0
 #endif
     mov $AT_FDCWD, %edi
     AT_PATH %rsi, file
@@ -330,4 +332,8 @@ member: .asciz "f"
 root_path: .asciz "/"
 link: .asciz "b1dir/l"
 link_target: .asciz "f"
+#ifdef RING_DIRFD
+ring_subdir: .asciz "new-child"
+ring_link: .asciz "l"
+#endif
 data: .ascii "abcd"
