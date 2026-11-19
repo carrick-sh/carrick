@@ -4172,7 +4172,7 @@ bitflags! {
     /// `epoll_event.events` interest/readiness bits. The wire word stays a raw
     /// `u32` in [`LinuxEpollEvent`]; convert with `from_bits_retain` at the
     /// read/write seam — Linux epoll ACCEPTS unknown event bits (they are
-    /// simply never reported), so no site may reject on unknown bits.
+    /// simply never reported) except in combination with EPOLLEXCLUSIVE.
     #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxEpollEvents: u32 {
         const IN = LINUX_EPOLLIN;
@@ -4654,6 +4654,30 @@ impl LinuxPollEvents {
 }
 
 impl LinuxEpollEvents {
+    /// Validate the EPOLLEXCLUSIVE restrictions on ADD (epoll_ctl(2)).
+    pub const fn validate_add(self, target_is_epoll: bool) -> Result<(), LinuxErrno> {
+        let allowed = Self::EXCLUSIVE
+            .union(Self::IN)
+            .union(Self::OUT)
+            .union(Self::WAKEUP)
+            .union(Self::ET)
+            .union(Self::ERR)
+            .union(Self::HUP);
+        if self.contains(Self::EXCLUSIVE) && (target_is_epoll || self.bits() & !allowed.bits() != 0)
+        {
+            return Err(LINUX_EINVAL);
+        }
+        Ok(())
+    }
+
+    /// A MOD can neither set EPOLLEXCLUSIVE nor change an exclusive interest.
+    pub const fn validate_modify(self, previous: Self) -> Result<(), LinuxErrno> {
+        if self.union(previous).contains(Self::EXCLUSIVE) {
+            return Err(LINUX_EINVAL);
+        }
+        Ok(())
+    }
+
     /// The poll spelling of this readiness. Bits with no poll encoding
     /// (ET, ONESHOT, EXCLUSIVE, WAKEUP) are dropped.
     pub const fn to_poll(self) -> LinuxPollEvents {

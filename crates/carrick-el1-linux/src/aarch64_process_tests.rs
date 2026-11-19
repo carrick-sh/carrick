@@ -18459,7 +18459,14 @@ fn serial_host_native_child_epoll_ctl_adds_an_inet_socket() {
         let (route, result) = call(
             child,
             sys::EPOLL_CTL.raw(),
-            [epoll, LINUX_EPOLL_CTL_ADD, nested as u64, exclusive.arg(), 0, 0],
+            [
+                epoll,
+                LINUX_EPOLL_CTL_ADD,
+                nested as u64,
+                exclusive.arg(),
+                0,
+                0,
+            ],
         );
         assert_ne!(route, CompletionRoute::Forward);
         assert_eq!(result, carrick_syscall_abi::LINUX_EINVAL.guest_retval());
