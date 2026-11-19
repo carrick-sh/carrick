@@ -503,16 +503,14 @@ executing, halted, or stopped in the carrier. The timebase is local to
 the single-vCPU soft carrier.
 
 An APIC deadline can pass while a slow soft CPL0 return executes with IF
-clear. The APIC latches the timer in IRR at expiry. The CPU first recognizes
-it after IRETQ or SYSRET restores an interruptible CPL3 context. To let
-the resumed task make progress, the soft CPU excludes timer-only requests
-from recognition during the first eight retired user blocks after each
-return. Intel specifies external interrupt recognition at instruction
-boundaries. The soft CPU checks at translated block boundaries, so one
-block gives the task a chance to execute its first instruction and seven
-more cover short branch sequences on slow hosts. The eighth completed block
-ends the window, as checked by the injected slow-return witness. A synchronous
-exit from user execution also ends the window before running its handler.
+clear. The APIC latches the timer in IRR at expiry and records an eight-user-block
+recognition window for that vector. Intel specifies external interrupt
+recognition at instruction boundaries. The soft CPU checks at translated block
+boundaries and applies the window only while executing CPL3. Each CPL3 block
+counts, including a block that enters the kernel through a syscall, software
+interrupt or fault. Later returns and expirations that coalesce into the same
+pending bit leave the original window in place. The timer becomes eligible at
+the first boundary after eight CPL3 blocks from the latch.
 
 Timers follow the usual IF, interrupt-shadow, and APIC priority rules
 outside that window, including at CPL0 and on HLT wakeup. Fixed interrupts
@@ -542,9 +540,12 @@ contended-head witness holds slot 0's queued head claim away from slot 0 across
 one user-origin `0xe0` interrupt (`runnable_head` returns `None` while
 `queued() != 0`) before restoring it on `iretq`. It injects host latency in
 the CPL0 return and checks that the re-armed interrupt arrives after eight
-user blocks. The IDT witness checks that a lower-priority fixed interrupt,
-or one sharing the timer vector, can still arrive immediately. These
-witnesses are bound to `x86.softcpu.apic-timer`.
+user blocks. One IDT witness checks that a lower-priority fixed interrupt,
+or one sharing the timer vector, can still arrive immediately. A second IDT
+witness runs an `int 0x80` loop across repeated IRETQ returns and checks the
+exact eight-block boundary. The production-ring poller calls `gettid` every
+two user blocks and can finish only after its queued leader runs on the same
+slot and releases it. These witnesses are bound to `x86.softcpu.apic-timer`.
 
 Before the CPL0 slice-accounting fix, the host-clock trial reached both
 initial-MM allocation exits for `TWO_LIVE`, then stalled on CPL3 RIP

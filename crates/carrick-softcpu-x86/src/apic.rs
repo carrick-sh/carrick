@@ -489,24 +489,26 @@ impl ApicNode {
     ///
     /// Returns `true` if the vector was accepted into `IRR` (`SVR[8] == 1` and `vector >= 16`).
     pub fn inject_interrupt(&self, vector: u8) -> bool {
-        self.latch_interrupt(vector, false)
+        self.latch_interrupt(vector, false).is_some()
     }
 
-    fn latch_interrupt(&self, vector: u8, timer: bool) -> bool {
+    /// Returns whether the source bit was newly set, or `None` for a refused vector.
+    fn latch_interrupt(&self, vector: u8, timer: bool) -> Option<bool> {
         if !self.software_enabled() {
-            return false;
+            return None;
         }
         if vector < LAPIC_MIN_VALID_VECTOR {
             self.esr_pending
                 .fetch_or(LAPIC_ESR_RECEIVE_ILLEGAL_VECTOR, Ordering::AcqRel);
             self.kick();
-            return false;
+            return None;
         }
         let word = usize::from(vector >> 5);
         let bit = (vector & 31) + if timer { 32 } else { 0 };
-        self.irr[word].fetch_or(1u64 << bit, Ordering::AcqRel);
+        let mask = 1u64 << bit;
+        let previous = self.irr[word].fetch_or(mask, Ordering::AcqRel);
         self.kick();
-        true
+        Some(previous & mask == 0)
     }
 
     /// Sets the kick flag and notifies the enrolled interrupt waiter.
@@ -546,28 +548,28 @@ impl ApicNode {
     /// Returns the highest-priority pending vector in `IRR` (`16..=255`), if any.
     #[must_use]
     pub fn highest_irr_vector(&self) -> Option<u8> {
-        self.highest_eligible_irr_vector(true)
+        self.highest_eligible_irr_vector(|_| true)
     }
 
-    fn irr_word(&self, idx: usize, include_timer: bool) -> u32 {
+    fn irr_word(&self, idx: usize) -> u32 {
         let sources = self.irr[idx].load(Ordering::Acquire);
-        sources as u32
-            | if include_timer {
-                (sources >> 32) as u32
-            } else {
-                0
-            }
+        sources as u32 | (sources >> 32) as u32
     }
 
-    fn highest_eligible_irr_vector(&self, include_timer: bool) -> Option<u8> {
-        for idx in (0..8).rev() {
-            let word = self.irr_word(idx, include_timer);
-            if word != 0 {
-                let bit = 31 - word.leading_zeros();
-                let vec = u8::try_from(idx * 32 + bit as usize).unwrap_or(0);
-                if vec >= LAPIC_MIN_VALID_VECTOR {
-                    return Some(vec);
+    fn highest_eligible_irr_vector(&self, timer_eligible: impl Fn(u8) -> bool) -> Option<u8> {
+        for (idx, sources) in self.irr.iter().enumerate().rev() {
+            let sources = sources.load(Ordering::Acquire);
+            let fixed = sources as u32;
+            let mut pending = fixed | (sources >> 32) as u32;
+            while pending != 0 {
+                let bit = 31 - pending.leading_zeros();
+                let mask = 1u32 << bit;
+                let vector = ((idx as u8) << 5) | bit as u8;
+                if vector >= LAPIC_MIN_VALID_VECTOR && (fixed & mask != 0 || timer_eligible(vector))
+                {
+                    return Some(vector);
                 }
+                pending &= !mask;
             }
         }
         None
@@ -751,6 +753,11 @@ impl ApicCluster {
     }
 }
 
+// SoftMachine recognizes interrupts at translated block boundaries. Allow an
+// expired timer eight CPL3 blocks of progress, even if a slow kernel return
+// spent the whole slice with IF clear. Each timer source owns its own bound.
+const TIMER_GRACE_USER_BLOCKS: u64 = 8;
+
 /// Per-vCPU local xAPIC register file and timer state.
 #[derive(Debug)]
 pub struct LocalApic {
@@ -777,6 +784,8 @@ pub struct LocalApic {
     timer_target_tsc: u64,
     timer_period_tsc: u64,
     timer_armed: bool,
+    user_blocks: u64,
+    timer_eligible_at: [u64; 256],
     delivered_count: u64,
     eoi_count: u64,
     ipi_sent_count: u64,
@@ -827,6 +836,8 @@ impl Clone for LocalApic {
             timer_target_tsc: self.timer_target_tsc,
             timer_period_tsc: self.timer_period_tsc,
             timer_armed: self.timer_armed,
+            user_blocks: self.user_blocks,
+            timer_eligible_at: self.timer_eligible_at,
             delivered_count: self.delivered_count,
             eoi_count: self.eoi_count,
             ipi_sent_count: self.ipi_sent_count,
@@ -869,6 +880,8 @@ impl LocalApic {
             timer_target_tsc: 0,
             timer_period_tsc: 0,
             timer_armed: false,
+            user_blocks: 0,
+            timer_eligible_at: [0; 256],
             delivered_count: 0,
             eoi_count: 0,
             ipi_sent_count: 0,
@@ -995,7 +1008,7 @@ impl LocalApic {
     pub fn irr_bit(&self, vector: u8) -> bool {
         let word = usize::from(vector >> 5);
         let mask = 1u32 << (vector & 31);
-        (self.node.irr_word(word, true) & mask) != 0
+        (self.node.irr_word(word) & mask) != 0
     }
 
     /// Returns `true` if the `vector` bit is set in `ISR`.
@@ -1066,6 +1079,10 @@ impl LocalApic {
         apic_hw_enabled && self.software_enabled() && self.node.has_pending_irr()
     }
 
+    pub(crate) fn account_user_block(&mut self) {
+        self.user_blocks = self.user_blocks.saturating_add(1);
+    }
+
     /// Accepts the highest-priority deliverable interrupt from `IRR`, moving it to `ISR`.
     pub fn accept_interrupt(&mut self, apic_hw_enabled: bool) -> Option<u8> {
         self.accept_eligible_interrupt(apic_hw_enabled, true)
@@ -1074,12 +1091,14 @@ impl LocalApic {
     pub(crate) fn accept_eligible_interrupt(
         &mut self,
         apic_hw_enabled: bool,
-        include_timer: bool,
+        bypass_timer_grace: bool,
     ) -> Option<u8> {
         if !apic_hw_enabled || !self.software_enabled() {
             return None;
         }
-        let vec = self.node.highest_eligible_irr_vector(include_timer)?;
+        let vec = self.node.highest_eligible_irr_vector(|vector| {
+            bypass_timer_grace || self.user_blocks >= self.timer_eligible_at[usize::from(vector)]
+        })?;
         if (vec >> 4) <= (self.ppr() >> 4) {
             return None;
         }
@@ -1162,8 +1181,14 @@ impl LocalApic {
             LapicTimerMode::Reserved => return false,
         }
         self.timer_fire_count = self.timer_fire_count.saturating_add(1);
-        if (self.lvt_timer & LAPIC_LVT_MASKED) == 0 {
-            self.node.latch_interrupt(self.lvt_timer as u8, true);
+        let vector = self.lvt_timer as u8;
+        if (self.lvt_timer & LAPIC_LVT_MASKED) == 0
+            && self.node.latch_interrupt(vector, true) == Some(true)
+        {
+            // Periodic expirations can coalesce into this source bit. Only a
+            // new latch starts a window so coalescing cannot postpone delivery.
+            self.timer_eligible_at[usize::from(vector)] =
+                self.user_blocks.saturating_add(TIMER_GRACE_USER_BLOCKS);
         }
         true
     }
@@ -1244,7 +1269,7 @@ impl LocalApic {
             }
             offset if (0x200..=0x270).contains(&offset) && (offset & 0x0f) == 0 => {
                 let idx = usize::from((offset - LAPIC_IRR_BASE_OFFSET) >> 4);
-                self.node.irr_word(idx, true)
+                self.node.irr_word(idx)
             }
             LAPIC_ESR_OFFSET => self.esr | self.esr_write_pending,
             LAPIC_LVT_CMCI_OFFSET => self.lvt_cmci,

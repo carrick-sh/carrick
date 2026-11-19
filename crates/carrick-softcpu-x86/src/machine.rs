@@ -19,12 +19,6 @@ use crate::emit::EmitError;
 use crate::mmu::{SoftMmuMemory, is_canonical_va, read_system_bytes, write_idt_stack_frame};
 use crate::privileged::load_gdt_code_or_data_descriptor;
 
-// The Intel SDM places external interrupt recognition at instruction boundaries.
-// SoftMachine checks at block boundaries. Eight blocks give a slow return a few
-// chances to retire CPL3 instructions even when the slice deadline passed with
-// IF clear during the return stub.
-const POST_RETURN_USER_BLOCKS: u8 = 8;
-
 const RFLAGS_TF: u64 = 1 << 8;
 const RFLAGS_IF: u64 = 1 << 9;
 const RFLAGS_NT: u64 = 1 << 14;
@@ -69,7 +63,6 @@ pub struct SoftMachine<M: SoftMmuMemory> {
     mem: M,
     hlt_wait_timeout: Option<Duration>,
     wait_for_armed_timer: bool,
-    post_return_blocks_left: u8,
 }
 
 impl<M: SoftMmuMemory> SoftMachine<M> {
@@ -81,7 +74,6 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
             mem,
             hlt_wait_timeout: None,
             wait_for_armed_timer: false,
-            post_return_blocks_left: 0,
         })
     }
 
@@ -93,7 +85,6 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
             mem,
             hlt_wait_timeout: None,
             wait_for_armed_timer: false,
-            post_return_blocks_left: 0,
         }
     }
 
@@ -216,13 +207,13 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
         let ctx = self.cpu.context();
         // IRR still latches at the deadline. Apply the grace only at CPU recognition
         // in CPL3. CPL0 and HLT must handle a ready timer at the usual boundary.
-        let include_timer = self.post_return_blocks_left == 0 || ctx.cpl != 3 || ctx.halted;
+        let bypass_timer_grace = ctx.cpl != 3 || ctx.halted;
         if (ctx.rflags & RFLAGS_IF) != 0
             && !ctx.interrupt_shadow
             && let Some(vector) = self
                 .cpu
                 .context_mut()
-                .accept_eligible_apic_interrupt(include_timer)
+                .accept_eligible_apic_interrupt(bypass_timer_grace)
         {
             self.cpu.context_mut().halted = false;
             let _ = self.cpu.apic_node().take_kick();
@@ -248,14 +239,11 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
 
         let cpl_before = self.cpu.context().cpl;
         let exit = self.cpu.step_block(&mut self.mem)?;
-        self.post_return_blocks_left = match (cpl_before, self.cpu.context().cpl, &exit) {
-            (3, 3, SoftCpuExit::Continue { .. }) => self.post_return_blocks_left.saturating_sub(1),
-            // IRETQ or SYSRET entered user mode. The return block ran in the kernel.
-            (_, 3, SoftCpuExit::Continue { .. }) => POST_RETURN_USER_BLOCKS,
-            // Synchronous exits end the window, even if an
-            // exception or software interrupt will use a same-CPL handler.
-            _ => 0,
-        };
+        if cpl_before == 3 {
+            // A block ending in a syscall, software interrupt or fault also
+            // consumes the budget. Kernel execution and user returns cannot reload it.
+            self.cpu.context_mut().lapic.account_user_block();
+        }
         if let Some(clock) = self.cpu.context().msrs().clock() {
             clock.account_block();
         }
