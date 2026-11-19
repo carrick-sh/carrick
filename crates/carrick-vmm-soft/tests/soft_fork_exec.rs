@@ -10,6 +10,7 @@ mod x86_process_entry;
 
 use carrick_guest_mem::GuestMemory as _;
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
+use carrick_kernel::dispatch::resources::HostRootResources;
 use carrick_kernel::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
 use carrick_mem::elf::ElfProgram;
 use carrick_vmm_soft::{SoftBootImage, SoftCarrier, publish_worker_backings};
@@ -22,6 +23,8 @@ use carrick_x86_cpl0_host::cpl0_boot::{
 const MAX_BLOCKS: u64 = 4_000_000;
 const MAX_EXITS: usize = 256;
 const SUCCESSOR_PATH: &[u8] = b"/fork-exec-child";
+// The ROOT_FORK_SEED_PORT in carrick-core-abi's x86 service protocol.
+const ROOT_FORK_SEED_PORT: u16 = 0xd9;
 
 fn compile_fixture(name: &str, flags: &[&str]) -> Vec<u8> {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -56,6 +59,7 @@ fn run_fork_exec(
     let root = dispatcher
         .capture_one_task_context()
         .map_err(|error| format!("issued root {error:?}"))?;
+    let root_resources = HostRootResources::capture(&root);
     let parent =
         ElfProgram::load(parent, 62, &|_| None).map_err(|error| format!("parent ELF {error:?}"))?;
     let image = carrick_mem::x86_initial_image::prepare_x86_elf(&parent)
@@ -146,6 +150,12 @@ fn run_fork_exec(
                 boundaries.push(format!("forward {number:#x}={value}"));
                 lease
                     .complete_forward(task, token, value)
+                    .map_err(|error| error.to_string())?;
+            }
+            CarrierRunExit::PhysicalDoorbell { port, .. } if port == ROOT_FORK_SEED_PORT => {
+                boundaries.push(format!("port {port:#x}"));
+                lease
+                    .service_root_fork_seed(Some(task), |record| root_resources.seed_fork(record))
                     .map_err(|error| error.to_string())?;
             }
             CarrierRunExit::PhysicalDoorbell { port, .. } => {
