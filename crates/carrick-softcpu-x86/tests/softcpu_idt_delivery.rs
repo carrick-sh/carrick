@@ -522,6 +522,65 @@ impl IdtTestRig {
 }
 
 #[test]
+fn post_return_timer_deferral_leaves_fixed_interrupts_eligible() {
+    use carrick_softcpu_x86::{
+        LAPIC_LVT_TIMER_MODE_TSC_DEADLINE, LAPIC_LVT_TIMER_OFFSET, LAPIC_SVR_OFFSET,
+        MSR_IA32_TSC_DEADLINE, ManualTscClock, MsrCapabilities,
+    };
+    use std::sync::Arc;
+
+    const TIMER: u8 = 0xe0;
+    for fixed in [0xd0, TIMER] {
+        let mut rig = IdtTestRig::new();
+        let clock = Arc::new(ManualTscClock::new(1));
+        rig.machine.set_clock(clock.clone());
+        rig.write_kernel_code(&[0x48, 0xcf]); // iretq
+        rig.write_user_code(&[0xeb, 0xfe]); // jmp .
+        let frame = [
+            USER_CODE_VA,
+            0x2b,
+            RFLAGS_IF | 2,
+            USER_STACK_VA + 0xff0,
+            0x23,
+        ];
+        let frame_gpa = rig.stack_frame.raw() + 0xe00;
+        for (index, word) in frame.into_iter().enumerate() {
+            rig.machine
+                .mem_mut()
+                .write_gpa(frame_gpa + (index as u64) * 8, &word.to_le_bytes());
+        }
+        rig.enter_cpl0_rsp(CODE_VA, STACK_VA + 0xe00, 0);
+        let ctx = rig.machine.context_mut();
+        ctx.lapic_mmio_write(LAPIC_SVR_OFFSET, &0x1ffu32.to_le_bytes());
+        ctx.lapic_mmio_write(
+            LAPIC_LVT_TIMER_OFFSET,
+            &(LAPIC_LVT_TIMER_MODE_TSC_DEADLINE | u32::from(TIMER)).to_le_bytes(),
+        );
+        let caps = MsrCapabilities::from_cpuid(&GuestCpuidView::default());
+        ctx.write_msr(MSR_IA32_TSC_DEADLINE, 2, caps).unwrap();
+
+        assert_eq!(rig.machine.step().unwrap(), None);
+        assert_eq!(rig.machine.context().cpl, 3);
+        clock.set(2);
+        rig.machine.inject_interrupt(fixed);
+        assert!(matches!(
+            rig.machine.step().unwrap(),
+            Some(SoftMachineExit::IoOut { port: 0xe0, value, .. }) if value == u32::from(fixed)
+        ));
+        assert_eq!(rig.machine.context().lapic().irr_bit(TIMER), fixed != TIMER);
+        if fixed != TIMER {
+            // The fixed interrupt entered CPL0 through an interrupt gate.
+            // Restore IF and check that the pending timer can nest immediately.
+            rig.machine.context_mut().rflags |= RFLAGS_IF;
+            assert!(matches!(
+                rig.machine.step().unwrap(),
+                Some(SoftMachineExit::IoOut { port: 0xe0, value, .. }) if value == u32::from(TIMER)
+            ));
+        }
+    }
+}
+
+#[test]
 fn idt_gate_types_present_and_dpl_checks_match_sdm() {
     let mut rig = IdtTestRig::new();
 

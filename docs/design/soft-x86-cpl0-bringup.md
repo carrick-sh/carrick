@@ -498,9 +498,28 @@ deadlines share that timebase, including the guest's TSC offset. An
 interruptible HLT with an eligible timer enrolls on the APIC node until
 the corresponding host deadline or an earlier notification. The host
 wait translates the deadline using the monotonic anchor because the
-block floor stays fixed while parked. Interrupt delivery follows IF,
-interrupt shadow and APIC priority. The timebase is local to the
-single-vCPU soft carrier.
+block floor stays fixed while parked. The same host anchor applies while
+executing, halted, or stopped in the carrier. The timebase is local to
+the single-vCPU soft carrier.
+
+An APIC deadline can pass while a slow soft CPL0 return executes with IF
+clear. The APIC latches the timer in IRR at expiry. The CPU first recognizes
+it after IRETQ or SYSRET restores an interruptible CPL3 context. To let
+the resumed task make progress, the soft CPU excludes timer-only requests
+from recognition during the first eight retired user blocks after each
+return. Intel specifies external interrupt recognition at instruction
+boundaries. The soft CPU checks at translated block boundaries, so one
+block gives the task a chance to execute its first instruction and seven
+more cover short branch sequences on slow hosts. The eighth completed block
+ends the window, as checked by the injected slow-return witness. A synchronous
+exit from user execution also ends the window before running its handler.
+
+Timers follow the usual IF, interrupt-shadow, and APIC priority rules
+outside that window, including at CPL0 and on HLT wakeup. Fixed interrupts
+remain eligible throughout. The IRR register still exposes the combined
+timer and fixed pending bits, and acceptance of a shared vector clears
+both sources. This policy applies to the soft CPU alone.
+[Intel SDM, Vol. 3](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
 
 The same in-tree `TWO_LIVE` fixture exits 0 on KVM, where hardware executes
 the resume path directly. Intel VMX describes a
@@ -516,13 +535,16 @@ non-last raw exits and their clear-child-tid joins under the existing
 PIO exit, a host kick before the deadline, and delivery after the host
 deadline. The production nanosleep witness measures from a child write
 before its ring syscall to another write after it returns. It uses a
-190 ms lower bound and a 10 s upper bound to allow host scheduling and
+200 ms lower bound and a 10 s upper bound to allow host scheduling and
 translation overhead. A controlled-clock witness runs a two-thread multi-slice
 raw-exit guest at 50 µs per block under a 200,000-worker-block ceiling, and a
 contended-head witness holds slot 0's queued head claim away from slot 0 across
 one user-origin `0xe0` interrupt (`runnable_head` returns `None` while
-`queued() != 0`) before restoring it on `iretq`. All four production witnesses
-are bound to `x86.softcpu.apic-timer`.
+`queued() != 0`) before restoring it on `iretq`. It injects host latency in
+the CPL0 return and checks that the re-armed interrupt arrives after eight
+user blocks. The IDT witness checks that a lower-priority fixed interrupt,
+or one sharing the timer vector, can still arrive immediately. These
+witnesses are bound to `x86.softcpu.apic-timer`.
 
 Before the CPL0 slice-accounting fix, the host-clock trial reached both
 initial-MM allocation exits for `TWO_LIVE`, then stalled on CPL3 RIP

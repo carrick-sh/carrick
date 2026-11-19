@@ -772,7 +772,13 @@ impl SoftCpuContext {
 
     /// Accepts the highest-priority deliverable interrupt from `IRR` into `ISR`, if any.
     pub fn accept_apic_interrupt(&mut self) -> Option<u8> {
-        let vec = self.lapic.accept_interrupt(self.apic_hw_enabled());
+        self.accept_eligible_apic_interrupt(true)
+    }
+
+    pub(crate) fn accept_eligible_apic_interrupt(&mut self, include_timer: bool) -> Option<u8> {
+        let vec = self
+            .lapic
+            .accept_eligible_interrupt(self.apic_hw_enabled(), include_timer);
         self.cr8 = u64::from(self.lapic.cr8());
         vec
     }

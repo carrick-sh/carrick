@@ -601,10 +601,9 @@ fn production_ring_nanosleep_waits_on_host() {
     };
     let elapsed = *end - *start;
     println!("[production, nanosleep] {elapsed:?} between host markers");
-    // Exclude boot and teardown. Leave 10 ms for block-accounted progress
-    // and give a loaded host 10 s to complete this 200 ms sleep.
+    // Exclude boot and teardown. The markers bracket the full guest wait.
     assert!(
-        (Duration::from_millis(190)..Duration::from_secs(10)).contains(&elapsed),
+        (Duration::from_millis(200)..Duration::from_secs(10)).contains(&elapsed),
         "200 ms nanosleep took {elapsed:?} on the host"
     );
 }
@@ -773,9 +772,10 @@ fn production_ring_rearms_slice_when_irq_return_head_is_busy_once() {
         run.summary()
     );
     assert!(run.failure.is_none(), "{}", run.summary());
-    assert!(
-        user_blocks_before_rearmed_irq.load(Ordering::Acquire) >= 1,
-        "re-armed 1 ms slice retry expired in CPL0 before user instructions retired: {}",
+    assert_eq!(
+        user_blocks_before_rearmed_irq.load(Ordering::Acquire),
+        8,
+        "pending re-armed timer must interrupt at the eight-block post-return boundary: {}",
         run.summary()
     );
     assert!(
