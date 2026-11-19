@@ -2288,7 +2288,7 @@ mod tests {
                 self.descriptor
             ));
             assert_eq!(self.descriptor & 1, 0);
-            assert_eq!(self.descriptor & 0x0000_ffff_ffff_f000, 0x9c45_2c10_00);
+            assert_eq!(self.descriptor & 0x0000_ffff_ffff_f000, 0x009c_452c_1000);
             self.selections += 1;
             Ok(window)
         }
