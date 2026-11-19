@@ -656,6 +656,8 @@ fn tsc_deadline_and_initial_count_timers_with_injectable_clock_and_bounded_hlt()
         assert_eq!(ctx.msrs().read(MSR_IA32_TSC_DEADLINE, caps).unwrap(), 0);
     }
 
+    machine.observe_run();
+
     // Now test bounded HLT wakeup driven by advancing ManualTscClock from a peer thread:
     clock.set(2_000);
     let clock_clone = Arc::clone(&clock);
@@ -686,6 +688,19 @@ fn tsc_deadline_and_initial_count_timers_with_injectable_clock_and_bounded_hlt()
         machine.context().gpr[reg::R14],
         0xffff_ffff_dead_beef,
         "IRETQ from timer ISR must resume at the instruction following HLT"
+    );
+
+    let observed = machine.counters().unwrap();
+    assert_eq!(observed.hlt_waits, 2);
+    assert!(observed.hlt_wall > Duration::ZERO);
+    assert_eq!(
+        machine
+            .context()
+            .lapic()
+            .timer_recognition()
+            .unwrap()
+            .deliveries,
+        1
     );
 
     // Also verify OneShot and Periodic initial-count timer modes on LocalApic:

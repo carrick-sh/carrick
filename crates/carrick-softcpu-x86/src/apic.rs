@@ -556,7 +556,10 @@ impl ApicNode {
         sources as u32 | (sources >> 32) as u32
     }
 
-    fn highest_eligible_irr_vector(&self, timer_eligible: impl Fn(u8) -> bool) -> Option<u8> {
+    fn highest_eligible_irr_vector(
+        &self,
+        mut timer_eligible: impl FnMut(u8) -> bool,
+    ) -> Option<u8> {
         for (idx, sources) in self.irr.iter().enumerate().rev() {
             let sources = sources.load(Ordering::Acquire);
             let fixed = sources as u32;
@@ -758,6 +761,17 @@ impl ApicCluster {
 // spent the whole slice with IF clear. Each timer source owns its own bound.
 const TIMER_GRACE_USER_BLOCKS: u64 = 8;
 
+/// Cumulative observations at the CPU's interrupt recognition boundary.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimerRecognition {
+    /// Timer-sourced IRR entries accepted into ISR.
+    pub deliveries: u64,
+    /// Delivered entries that previously lost at least one recognition boundary.
+    pub deferred_deliveries: u64,
+    /// Block boundaries where the timer would have won without the grace window.
+    pub deferred_blocks: u64,
+}
+
 /// Per-vCPU local xAPIC register file and timer state.
 #[derive(Debug)]
 pub struct LocalApic {
@@ -790,6 +804,8 @@ pub struct LocalApic {
     eoi_count: u64,
     ipi_sent_count: u64,
     timer_fire_count: u64,
+    timer_recognition: Option<TimerRecognition>,
+    deferred_vectors: [u32; 8],
 }
 
 impl Clone for LocalApic {
@@ -842,6 +858,8 @@ impl Clone for LocalApic {
             eoi_count: self.eoi_count,
             ipi_sent_count: self.ipi_sent_count,
             timer_fire_count: self.timer_fire_count,
+            timer_recognition: self.timer_recognition,
+            deferred_vectors: self.deferred_vectors,
         }
     }
 }
@@ -886,6 +904,8 @@ impl LocalApic {
             eoi_count: 0,
             ipi_sent_count: 0,
             timer_fire_count: 0,
+            timer_recognition: None,
+            deferred_vectors: [0; 8],
         }
     }
 
@@ -1043,6 +1063,16 @@ impl LocalApic {
         self.timer_fire_count
     }
 
+    /// Enable observation of timer-sourced IRR entries at CPU recognition.
+    pub fn observe_timer_recognition(&mut self) {
+        self.timer_recognition = Some(TimerRecognition::default());
+        self.deferred_vectors = [0; 8];
+    }
+
+    pub fn timer_recognition(&self) -> Option<TimerRecognition> {
+        self.timer_recognition
+    }
+
     /// Injects a fixed interrupt `vector` into this APIC's `IRR` and kicks any parked waiter.
     pub fn inject_interrupt(&self, vector: u8) -> bool {
         self.node.inject_interrupt(vector)
@@ -1096,9 +1126,25 @@ impl LocalApic {
         if !apic_hw_enabled || !self.software_enabled() {
             return None;
         }
-        let vec = self.node.highest_eligible_irr_vector(|vector| {
-            bypass_timer_grace || self.user_blocks >= self.timer_eligible_at[usize::from(vector)]
-        })?;
+        let mut deferred = None;
+        let eligible = self.node.highest_eligible_irr_vector(|vector| {
+            let allowed = bypass_timer_grace
+                || self.user_blocks >= self.timer_eligible_at[usize::from(vector)];
+            if !allowed && self.timer_recognition.is_some() {
+                deferred.get_or_insert(vector);
+            }
+            allowed
+        });
+        if let Some(vector) = deferred
+            && (vector >> 4) > (self.ppr() >> 4)
+            && let Some(counters) = &mut self.timer_recognition
+        {
+            // The highest vector that would otherwise be delivered is hidden
+            // by grace. A fixed source sharing the IRR bit remains eligible.
+            counters.deferred_blocks += 1;
+            self.deferred_vectors[usize::from(vector >> 5)] |= 1 << (vector & 31);
+        }
+        let vec = eligible?;
         if (vec >> 4) <= (self.ppr() >> 4) {
             return None;
         }
@@ -1106,7 +1152,16 @@ impl LocalApic {
         let mask = 1u32 << (vec & 31);
         // A fixed interrupt and a timer with the same vector share one IRR bit.
         let both_sources = (u64::from(mask) << 32) | u64::from(mask);
-        self.node.irr[word].fetch_and(!both_sources, Ordering::AcqRel);
+        let sources = self.node.irr[word].fetch_and(!both_sources, Ordering::AcqRel);
+        if sources & (u64::from(mask) << 32) != 0
+            && let Some(counters) = &mut self.timer_recognition
+        {
+            counters.deliveries += 1;
+            if self.deferred_vectors[word] & mask != 0 {
+                counters.deferred_deliveries += 1;
+                self.deferred_vectors[word] &= !mask;
+            }
+        }
         self.isr[word] |= mask;
         self.node.priority.store(self.ppr(), Ordering::Release);
         self.delivered_count = self.delivered_count.saturating_add(1);

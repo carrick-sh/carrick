@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
+use carrick_el1_abi::CurrentTask;
 use carrick_guest_arch::{CpuId, RootGpa};
 use carrick_hal::{TrapError, VcpuExit};
 use carrick_softcpu_x86::{ApicNode, MsrIndex, SoftMachineExit};
@@ -20,7 +21,8 @@ use carrick_x86::cpl0_entry::ShootdownTable;
 use carrick_x86::{GuestCpuidView, SegmentDescriptor, SegmentDpl, X86Reg, X86Seg, X86Vcpu};
 use carrick_x86_cpl0_host::carrier_cpu::{CarrierCpuBackend, FixtureWatchdog};
 use carrick_x86_cpl0_host::cpl0_boot::{
-    META_GPA, ProductionMemberCpu, SHOOTDOWN_OFFSET, fail, run_production_member,
+    META_GPA, ProductionMemberCpu, SHOOTDOWN_OFFSET, STRIDE, TASK_OFFSET, fail,
+    run_production_member,
 };
 use carrick_x86_cpl0_host::guest_ram::GuestRam;
 
@@ -106,6 +108,16 @@ impl SoftCpuBackend {
         SoftBootVcpu::new(self.runner.machine_mut().context_mut(), &self.cpuid)
     }
 
+    fn observed_task(ram: &GuestRam, slot: CpuId) -> Option<&CurrentTask> {
+        let ptr = ram.host_ptr(
+            META_GPA + TASK_OFFSET + u64::from(slot.raw()) * STRIDE,
+            size_of::<CurrentTask>(),
+        )?;
+        // SAFETY: boot initialized this aligned record, and ram retains its backing.
+        // The observer reads only published atomics on the running CPU's lane.
+        Some(unsafe { &*ptr.cast::<CurrentTask>() })
+    }
+
     fn require_primary(&self) -> Result<(), TrapError> {
         if self.run.slot != CpuId::new(0) {
             return Err(TrapError::UnsupportedPlatform);
@@ -139,7 +151,14 @@ impl ProductionMemberCpu for SoftCpuBackend {
         self.runner.refresh_memory()?;
         self.runner.admit_current_root()?;
         let kick = self.kick.clone();
-        let exit = self.runner.run(kick.as_ref().map(|kick| &kick.0.pending));
+        let task = self
+            .runner
+            .has_fixture_trace()
+            .then(|| Self::observed_task(&self.run.ram, self.run.slot))
+            .flatten();
+        let exit = self
+            .runner
+            .run_with_task(kick.as_ref().map(|kick| &kick.0.pending), task);
         match exit {
             Some(SoftMachineExit::IoOut {
                 port, size, value, ..
@@ -268,7 +287,15 @@ impl CarrierCpuBackend for SoftCpuBackend {
         let slot = self.run.slot.raw() as usize;
         let actual_run = Arc::clone(&self.run.actual_run);
         let execution = Arc::clone(&self.run.file_execution);
-        run_production_member(self, table, slot, Some(&actual_run[slot]), &execution)
+        let started = self.runner.has_fixture_trace().then(Instant::now);
+        let result = run_production_member(self, table, slot, Some(&actual_run[slot]), &execution);
+        if let Some(started) = started {
+            let elapsed = started.elapsed();
+            let task = Self::observed_task(&ram, self.run.slot);
+            self.runner
+                .record_fixture_exit(self.run.slot, task, &result, elapsed);
+        }
+        result
     }
 
     /// A soft `OUT` exit already advanced RIP past the instruction.

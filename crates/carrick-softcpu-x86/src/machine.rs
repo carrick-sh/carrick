@@ -8,7 +8,7 @@
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::apic::{ApicCluster, ApicNode, MonotonicTscClock, TscClock};
 use crate::context::{SoftCpuContext, SoftSegment, X86Exception, X86ExceptionVector, reg};
@@ -57,12 +57,24 @@ pub enum SoftMachineExit {
     StepBudgetExhausted { steps: usize, rip: u64 },
 }
 
+/// Cumulative observations from the machine's existing block and HLT paths.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MachineCounters {
+    /// Completed CPU block steps, as counted by the block TSC floor.
+    pub blocks: u64,
+    /// Start address offered to the translator, including a faulting block.
+    pub last_fetch: Option<(u64, u8)>,
+    pub hlt_waits: u64,
+    pub hlt_wall: Duration,
+}
+
 /// Self-contained 64-bit x86 (`CPL0` + `CPL3`) virtual machine pairing [`SoftCpu`] with `M: SoftMmuMemory`.
 pub struct SoftMachine<M: SoftMmuMemory> {
     cpu: SoftCpu,
     mem: M,
     hlt_wait_timeout: Option<Duration>,
     wait_for_armed_timer: bool,
+    counters: Option<MachineCounters>,
 }
 
 impl<M: SoftMmuMemory> SoftMachine<M> {
@@ -74,6 +86,7 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
             mem,
             hlt_wait_timeout: None,
             wait_for_armed_timer: false,
+            counters: None,
         })
     }
 
@@ -85,6 +98,7 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
             mem,
             hlt_wait_timeout: None,
             wait_for_armed_timer: false,
+            counters: None,
         }
     }
 
@@ -125,6 +139,19 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
 
     pub fn context_mut(&mut self) -> &mut SoftCpuContext {
         self.cpu.context_mut()
+    }
+
+    /// Start a fresh observational census of block steps, APIC delivery and HLT waits.
+    pub fn observe_run(&mut self) {
+        self.counters = Some(MachineCounters::default());
+        self.cpu
+            .context_mut()
+            .lapic_mut()
+            .observe_timer_recognition();
+    }
+
+    pub const fn counters(&self) -> Option<&MachineCounters> {
+        self.counters.as_ref()
     }
 
     /// Attach an injectable [`TscClock`] for `RDTSC` and APIC timer deadlines.
@@ -234,15 +261,22 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
                 self.hlt_wait_timeout,
                 self.wait_for_armed_timer,
                 host_kicked,
+                &mut self.counters,
             ));
         }
 
         let cpl_before = self.cpu.context().cpl;
+        if let Some(counters) = &mut self.counters {
+            counters.last_fetch = Some((self.cpu.context().rip, cpl_before));
+        }
         let exit = self.cpu.step_block(&mut self.mem)?;
         if cpl_before == 3 {
             // A block ending in a syscall, software interrupt or fault also
             // consumes the budget. Kernel execution and user returns cannot reload it.
             self.cpu.context_mut().lapic.account_user_block();
+        }
+        if let Some(counters) = &mut self.counters {
+            counters.blocks += 1;
         }
         if let Some(clock) = self.cpu.context().msrs().clock() {
             clock.account_block();
@@ -254,6 +288,7 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
             self.hlt_wait_timeout,
             self.wait_for_armed_timer,
             host_kicked,
+            &mut self.counters,
         ))
     }
 
@@ -276,6 +311,7 @@ fn wait_for_apic_event(
     max_wait: Option<Duration>,
     wait_for_armed_timer: bool,
     host_kicked: &dyn Fn() -> bool,
+    counters: &mut Option<MachineCounters>,
 ) {
     let ctx = cpu.context();
     let interruptible = (ctx.rflags & RFLAGS_IF) != 0;
@@ -290,6 +326,7 @@ fn wait_for_apic_event(
     else {
         return;
     };
+    let started = counters.as_ref().map(|_| Instant::now());
     let tsc_hz = ctx.tsc_hz();
     let node = cpu.apic_node();
     let ready = || host_kicked() || (interruptible && ctx.has_deliverable_apic_interrupt());
@@ -297,6 +334,10 @@ fn wait_for_apic_event(
         let _ = clock.wait_until(deadline, tsc_hz, &node, max_wait, &ready);
     } else {
         let _ = node.wait_for_event(max_wait, ready);
+    }
+    if let (Some(counters), Some(started)) = (counters, started) {
+        counters.hlt_waits += 1;
+        counters.hlt_wall += started.elapsed();
     }
 }
 
@@ -319,6 +360,7 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
     hlt_wait_timeout: Option<Duration>,
     wait_for_armed_timer: bool,
     host_kicked: &dyn Fn() -> bool,
+    counters: &mut Option<MachineCounters>,
 ) -> Option<SoftMachineExit> {
     match exit {
         SoftCpuExit::Continue { .. } => None,
@@ -327,7 +369,13 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
             if (cpu.context().rflags & RFLAGS_IF) == 0
                 || !cpu.context().has_deliverable_apic_interrupt()
             {
-                wait_for_apic_event(cpu, hlt_wait_timeout, wait_for_armed_timer, host_kicked);
+                wait_for_apic_event(
+                    cpu,
+                    hlt_wait_timeout,
+                    wait_for_armed_timer,
+                    host_kicked,
+                    counters,
+                );
                 let _ = cpu.poll_apic_timer();
             }
             if (cpu.context().rflags & RFLAGS_IF) != 0

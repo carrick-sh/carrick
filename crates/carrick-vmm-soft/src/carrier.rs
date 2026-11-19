@@ -6,10 +6,14 @@
 //!
 //! M1 is single-vCPU (#2397): only physical slot 0 exists.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use carrick_el1_abi::CurrentTask;
 use carrick_hal::{PhysicalFrameInventory, TrapError, VcpuExit};
 use carrick_softcpu_x86::{
     EmitError, GuestCpuidView, SoftAccessKind, SoftMachine, SoftMachineExit, SoftMemoryFault,
@@ -115,6 +119,205 @@ impl SoftRunTrace {
     }
 }
 
+/// Guest addresses derived from the exact fixture and production ring ELFs.
+pub struct SoftRunMarkers {
+    /// The first worker's spawn begins each round (RBX = 1 in TWO_LIVE).
+    pub spawn: u64,
+    pub irq_return: Range<u64>,
+    pub rearm: u64,
+    pub rotate: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RunPoint {
+    wall: Duration,
+    blocks: u64,
+    jit_emissions: u64,
+    timer: carrick_softcpu_x86::apic::TimerRecognition,
+    rearms: u64,
+    rotations: u64,
+    hlt_waits: u64,
+    hlt_wall: Duration,
+}
+
+impl RunPoint {
+    fn write_since(self, start: Self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let wall_ms = millis(self.wall - start.wall);
+        let blocks = self.blocks - start.blocks;
+        writeln!(
+            out,
+            "wall_ms={wall_ms:.3} blocks={blocks} jit_emissions={} timer={} deferred={} deferred_blocks={} \
+             rearms={} rotations={} hlt_waits={} hlt_ms={:.3}",
+            self.jit_emissions - start.jit_emissions,
+            self.timer.deliveries - start.timer.deliveries,
+            self.timer.deferred_deliveries - start.timer.deferred_deliveries,
+            self.timer.deferred_blocks - start.timer.deferred_blocks,
+            self.rearms - start.rearms,
+            self.rotations - start.rotations,
+            self.hlt_waits - start.hlt_waits,
+            millis(self.hlt_wall - start.hlt_wall),
+        )
+    }
+}
+
+fn millis(wall: Duration) -> f64 {
+    wall.as_secs_f64() * 1000.0
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ObservedThread {
+    task: u64,
+    generation: u64,
+}
+
+impl ObservedThread {
+    fn read(task: &CurrentTask) -> Self {
+        Self {
+            task: task.execution.task.load(Ordering::Acquire),
+            generation: task.mm.thread_generation.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// The fixture's terminal report over the existing [`SoftRunTrace`].
+#[derive(Default)]
+pub struct SoftRunSummary {
+    rounds: Vec<RunPoint>,
+    intervals: Vec<(RunPoint, String)>,
+    last: RunPoint,
+    terminal: Option<String>,
+    user_blocks: BTreeMap<ObservedThread, u64>,
+}
+
+impl std::fmt::Display for SoftRunSummary {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let wall_seconds = self.last.wall.as_secs_f64();
+        let blocks_per_second = if wall_seconds > 0.0 {
+            self.last.blocks as f64 / wall_seconds
+        } else {
+            0.0
+        };
+        writeln!(
+            out,
+            "soft TWO_LIVE rounds_started={} blocks_per_second={blocks_per_second:.0}",
+            self.rounds.len()
+        )?;
+        write!(out, "  total ")?;
+        self.last.write_since(RunPoint::default(), out)?;
+
+        if let Some(&first) = self.rounds.first() {
+            write!(out, "  before round 1 ")?;
+            first.write_since(RunPoint::default(), out)?;
+        }
+        for (index, &start) in self.rounds.iter().enumerate() {
+            let end = self.rounds.get(index + 1).copied().unwrap_or(self.last);
+            write!(out, "  round {} ", index + 1)?;
+            end.write_since(start, out)?;
+        }
+        let mut previous = RunPoint::default();
+        for (index, (end, exit)) in self.intervals.iter().enumerate() {
+            write!(out, "  carrier interval {} {exit} ", index + 1)?;
+            end.write_since(previous, out)?;
+            previous = *end;
+        }
+        for (thread, blocks) in &self.user_blocks {
+            writeln!(
+                out,
+                "  user task={:#x} generation={} blocks={blocks}",
+                thread.task, thread.generation,
+            )?;
+        }
+        if let Some(terminal) = &self.terminal {
+            writeln!(out, "  terminal {terminal}")?;
+        }
+        Ok(())
+    }
+}
+
+struct FixtureTrace {
+    summary: Arc<Mutex<SoftRunSummary>>,
+    markers: SoftRunMarkers,
+    started: Instant,
+    boot_emissions: u64,
+    rearms: u64,
+    rotations: u64,
+    last_observed_block: u64,
+    current_thread: Option<ObservedThread>,
+    user_blocks: u64,
+    thread_blocks: BTreeMap<ObservedThread, u64>,
+}
+
+impl FixtureTrace {
+    fn point(&self, machine: &SoftMachine<SoftCarrierMemory>) -> RunPoint {
+        let counters = machine.counters().copied().unwrap_or_default();
+        RunPoint {
+            wall: self.started.elapsed(),
+            blocks: counters.blocks,
+            jit_emissions: machine.cpu().emission_count() - self.boot_emissions,
+            timer: machine
+                .context()
+                .lapic()
+                .timer_recognition()
+                .unwrap_or_default(),
+            rearms: self.rearms,
+            rotations: self.rotations,
+            hlt_waits: counters.hlt_waits,
+            hlt_wall: counters.hlt_wall,
+        }
+    }
+
+    /// Commit the accumulated blocks when the published user task changes or
+    /// the carrier stops. The hot user loop only increments a local counter.
+    fn flush_user_blocks(&mut self) {
+        if let Some(thread) = self.current_thread {
+            *self.thread_blocks.entry(thread).or_default() += std::mem::take(&mut self.user_blocks);
+        }
+    }
+
+    fn observe_block(
+        &mut self,
+        machine: &SoftMachine<SoftCarrierMemory>,
+        task: Option<&CurrentTask>,
+    ) {
+        let Some(counters) = machine.counters() else {
+            return;
+        };
+        if counters.blocks == self.last_observed_block {
+            return;
+        }
+        self.last_observed_block = counters.blocks;
+        let Some((fetch, cpl)) = counters.last_fetch else {
+            return;
+        };
+        if cpl == 3
+            && let Some(task) = task
+        {
+            let thread = ObservedThread::read(task);
+            if self.current_thread != Some(thread) {
+                self.flush_user_blocks();
+                self.current_thread = Some(thread);
+            }
+            self.user_blocks += 1;
+        }
+        if cpl == 3
+            && fetch == self.markers.spawn
+            && machine.context().gpr[carrick_softcpu_x86::reg::RBX] == 1
+        {
+            if let Ok(mut summary) = self.summary.lock() {
+                // Timestamp immediately after the marked block executes.
+                summary.rounds.push(self.point(machine));
+            }
+        } else if cpl == 0 && self.markers.irq_return.contains(&fetch) {
+            // The marked callees are reached only by their direct calls from
+            // signal_irq_return. Birth enqueue uses the same rotation callee
+            // from elsewhere and must not inflate this count.
+            let next = machine.context().rip;
+            self.rearms += u64::from(next == self.markers.rearm);
+            self.rotations += u64::from(next == self.markers.rotate);
+        }
+    }
+}
+
 /// How many recent block RIPs a [`SoftRunTrace`] keeps.
 pub const RECENT_BLOCKS: usize = 512;
 
@@ -131,6 +334,7 @@ pub struct SoftRunner {
     max_blocks: u64,
     trace: SoftRunTrace,
     step_observer: Option<SoftStepObserver>,
+    fixture_trace: Option<FixtureTrace>,
 }
 
 impl SoftRunner {
@@ -141,6 +345,7 @@ impl SoftRunner {
             max_blocks,
             trace: SoftRunTrace::default(),
             step_observer: None,
+            fixture_trace: None,
         }
     }
 
@@ -154,6 +359,63 @@ impl SoftRunner {
 
     pub fn machine_mut(&mut self) -> &mut SoftMachine<SoftCarrierMemory> {
         &mut self.machine
+    }
+
+    pub(crate) fn has_fixture_trace(&self) -> bool {
+        self.fixture_trace.is_some()
+    }
+
+    pub(crate) fn record_fixture_exit(
+        &mut self,
+        slot: carrick_guest_arch::CpuId,
+        task: Option<&CurrentTask>,
+        result: &Result<VcpuExit, TrapError>,
+        guest_wall: Duration,
+    ) {
+        let Some(fixture) = &mut self.fixture_trace else {
+            return;
+        };
+        let summary = Arc::clone(&fixture.summary);
+        let Ok(mut summary) = summary.lock() else {
+            return;
+        };
+        fixture.flush_user_blocks();
+        summary.user_blocks.clone_from(&fixture.thread_blocks);
+        let point = fixture.point(&self.machine);
+        let interval = match result {
+            Ok(VcpuExit::IoOut { port, data }) => format!("out({port:#x}, {data:02x?})"),
+            Ok(VcpuExit::Halt) => "hlt".to_owned(),
+            Ok(VcpuExit::Kicked) => "kicked".to_owned(),
+            Ok(_) => "other carrier exit".to_owned(),
+            Err(error) => format!("error({error})"),
+        };
+        summary.last = point;
+        summary.intervals.push((
+            point,
+            format!("{interval} guest_ms={:.3}", millis(guest_wall)),
+        ));
+
+        let cpu = self.machine.context();
+        let fetch = self
+            .machine
+            .counters()
+            .and_then(|counters| counters.last_fetch)
+            .map_or_else(
+                || "none".to_owned(),
+                |(rip, cpl)| format!("{rip:#x}/cpl{cpl}"),
+            );
+        let task = task.map(ObservedThread::read);
+        let hot = self.trace.hot_blocks(8);
+        summary.terminal = Some(format!(
+            "rip={:#x} cpl={} IF={} last_fetch={fetch} slot={} task_and_generation={task:?} \
+             budget_blocks={} stop={:?} hot_recent={hot:x?}",
+            cpu.rip,
+            cpu.cpl,
+            (cpu.rflags >> 9) & 1,
+            slot.raw(),
+            self.trace.blocks,
+            self.trace.stop,
+        ));
     }
 
     pub(crate) fn refresh_memory(&mut self) -> Result<(), TrapError> {
@@ -175,6 +437,14 @@ impl SoftRunner {
     /// without one, recorded in [`SoftRunTrace::stop`]; a `kicked` flag
     /// raised before a block stops the run as [`SoftStop::Kicked`].
     pub fn run(&mut self, kicked: Option<&AtomicBool>) -> Option<SoftMachineExit> {
+        self.run_with_task(kicked, None)
+    }
+
+    pub(crate) fn run_with_task(
+        &mut self,
+        kicked: Option<&AtomicBool>,
+        task: Option<&CurrentTask>,
+    ) -> Option<SoftMachineExit> {
         let stubs = DIRECT_VA + carrick_x86::fault_stub_base(LAYOUT)
             ..DIRECT_VA + carrick_x86::fault_tss_base(LAYOUT);
         self.trace.last_exit = None;
@@ -208,6 +478,11 @@ impl SoftRunner {
                 .machine
                 .step_with_kick(&|| kicked.is_some_and(|kick| kick.load(Ordering::Acquire)));
             self.trace.blocks += 1;
+            if step.is_ok()
+                && let Some(fixture) = &mut self.fixture_trace
+            {
+                fixture.observe_block(&self.machine, task);
+            }
             let exit = match step {
                 Err(error) => {
                     self.trace.stop = Some(SoftStop::Emit {
@@ -420,6 +695,25 @@ impl SoftCarrier {
     /// block retired on slot 0.
     pub fn set_step_observer(&mut self, observer: SoftStepObserver) {
         self.runner.step_observer = Some(observer);
+    }
+
+    /// Collect a summary for a marked fixture after initial-MM admission.
+    pub fn observe_fixture(&mut self, markers: SoftRunMarkers) -> Arc<Mutex<SoftRunSummary>> {
+        let summary = Arc::new(Mutex::new(SoftRunSummary::default()));
+        self.runner.machine.observe_run();
+        self.runner.fixture_trace = Some(FixtureTrace {
+            summary: Arc::clone(&summary),
+            markers,
+            started: Instant::now(),
+            boot_emissions: self.runner.machine.cpu().emission_count(),
+            rearms: 0,
+            rotations: 0,
+            last_observed_block: 0,
+            current_thread: None,
+            user_blocks: 0,
+            thread_blocks: BTreeMap::new(),
+        });
+        summary
     }
 
     /// Read `dst.len()` bytes at guest `va` through slot 0's translation in

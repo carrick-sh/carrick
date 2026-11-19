@@ -16,6 +16,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Ok(());
     }
+    println!(
+        "cargo:rustc-env=SOFT_BUILD_PROFILE_DIR={}",
+        std::env::var("PROFILE")?
+    );
+    println!(
+        "cargo:rustc-env=SOFT_BUILD_OPT_LEVEL={}",
+        std::env::var("OPT_LEVEL")?
+    );
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
