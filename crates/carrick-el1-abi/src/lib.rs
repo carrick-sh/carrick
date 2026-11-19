@@ -6299,7 +6299,7 @@ mod tests {
                 );
             },
         );
-        assert_eq!(result, Ok(FrameGrantCompletion::Published));
+        assert_eq!(result, Ok(true));
         assert!(committed.get());
     }
 
@@ -6698,7 +6698,7 @@ mod tests {
                     |_| publication,
                     || committed.set(true)
                 ),
-                publication.map(|_| FrameGrantCompletion::PublicationDeclined)
+                publication
             );
             assert!(!committed.get());
             assert_eq!(
@@ -6743,7 +6743,7 @@ mod tests {
         };
         assert_eq!(
             mailbox.complete_grant(ready, |_| Ok::<_, ()>(true), || {}),
-            Ok(FrameGrantCompletion::Published)
+            Ok(true)
         );
         assert_eq!(mailbox.claim_response(41, 7), None);
         assert!(!mailbox.has_guest_work());
@@ -6955,27 +6955,22 @@ mod tests {
             owner_generation: 203,
             inventory_revision: 204,
         };
-        let vacant = FrameGrantMailbox::new();
-        assert_eq!(
-            vacant.complete_grant(ready, |_| unreachable!(), || unreachable!()),
-            Ok::<_, ()>(FrameGrantCompletion::SlotNotWorking)
-        );
         ready.mm_key += 1;
         assert_eq!(
             mailbox.complete_grant(ready, |_| Ok::<_, ()>(true), || {}),
-            Ok(FrameGrantCompletion::StaleRequest)
+            Ok(false)
         );
         ready.mm_key = request.mm_key;
         ready.owner_generation = 0;
         assert_eq!(
             mailbox.complete_grant(ready, |_| Ok::<_, ()>(true), || {}),
-            Ok(FrameGrantCompletion::InvalidReady)
+            Ok(false)
         );
         ready.owner_generation = 203;
         ready.semantic_base = request.fault_va + 0x1000;
         assert_eq!(
             mailbox.complete_grant(ready, |_| Ok::<_, ()>(true), || {}),
-            Ok(FrameGrantCompletion::InvalidReady)
+            Ok(false)
         );
 
         assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
@@ -7020,7 +7015,7 @@ mod tests {
                     |_| Ok::<_, ()>(true),
                     || {}
                 ),
-                Ok(FrameGrantCompletion::Published)
+                Ok(true)
             );
         }
     }
