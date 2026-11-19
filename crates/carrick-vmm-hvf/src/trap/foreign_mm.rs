@@ -3507,6 +3507,11 @@ fn finish_foreign_cow_publication(
         })
     };
     drop(registry);
+    if host_resolved {
+        carrick_hal::host_residency::with_host_residency(|table| {
+            table.retire_overlapping(runtime.identity.mm, span.va, span.len as u64);
+        });
+    }
     let scope = CowInventoryLifecycleScope {
         custody: &lease.custody,
         identity: Some(runtime.identity),
