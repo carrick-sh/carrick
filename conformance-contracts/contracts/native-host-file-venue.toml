@@ -124,6 +124,7 @@ vm_free = [
   "carrick-kernel::dispatch::native_files::tests::in_zone_pipe_stat_matches_the_dispatchers_pipe_record",
   "carrick-kernel::dispatch::native_files::tests::native_open_read_and_fstat_serve_the_loader_through_one_vfs",
   "carrick-kernel::dispatch::native_files::tests::native_relative_open_resolves_with_the_callers_cwd",
+  "carrick-el1-linux::aarch64_process_tests::arm_fork_child_resolves_relative_paths_through_dirfds",
   "carrick-personality-linux::native_host_file::tests::in_zone_fstat_is_answered_in_ring_with_the_shared_record",
   "carrick-personality-linux::native_host_file::tests::in_zone_objects_never_build_a_host_request",
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd",
@@ -141,6 +142,7 @@ vm_free = [
 embed = [
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_loader_open_close_reopen_uses_one_native_descriptor_namespace (three open/close pairs reuse one ring descriptor; exit 0, seven entries, zero refusals)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_cwd_and_relative_open_agree (native Linux control and directory-specific marker bytes)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_resolves_relative_paths_through_dirfds",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_cwd_is_inherited_and_isolated (native Linux control and directory-specific marker bytes)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_two_live_processes_keep_distinct_cwds (native Linux control and directory-specific marker bytes)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_reads_the_injected_resolv_conf_over_the_images (#2418: x86 witness of the shared carrier read; the root reads the injected nameserver, never the image's, then end of file; red: exit 11, -38 ENOSYS)",

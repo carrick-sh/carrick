@@ -4039,6 +4039,10 @@ fn ring_descriptor_run(mode: &str) -> (i32, Vec<(usize, u64)>) {
     let directory = format!("-DDIR_PATH=\"{}\"", dir.path().display());
     let elf =
         native_exit_fixture_with_flags("native_ring_descriptors.S", &[mode, &file, &directory]);
+    let sibling = dir.path().join("parent-sibling");
+    if mode == "-DDIRFD" {
+        std::fs::write(&sibling, []).expect("parent's sibling file");
+    }
     let oracle = dir.path().join("oracle");
     carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
     let native = std::process::Command::new("timeout")
@@ -4047,6 +4051,10 @@ fn ring_descriptor_run(mode: &str) -> (i32, Vec<(usize, u64)>) {
         .output()
         .expect("bounded native ring descriptor control");
     assert!(native.status.success(), "{mode} native result: {native:?}");
+    if mode == "-DDIRFD" {
+        assert!(!sibling.exists(), "the native parent removed its sibling");
+        std::fs::write(&sibling, []).expect("parent's sibling file for Carrick");
+    }
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     dispatcher.set_fs_backend(Box::new(
         carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
@@ -4117,6 +4125,17 @@ fn serial_host_fork_child_reads_its_inherited_ring_descriptors() {
         "exit is the failed step (38/39 root opens, 40-42 fork and wait, 51 read, \
          52 pread64, 53/54 lseek, 55/56 fstat, 61-63 getdents64); refusals are \
          (x86 nr, count)"
+    );
+}
+
+/// The production CPL0 child uses the inherited directory description.
+#[test]
+fn serial_host_fork_child_resolves_relative_paths_through_dirfds() {
+    assert_eq!(
+        ring_descriptor_run("-DDIRFD"),
+        (0, vec![]),
+        "70 mkdirat, 71 openat, 72 newfstatat, 73 renameat, 74 unlinkat file, \
+         75 unlinkat directory, 76 second directory fd, 77 parent's sibling unlinkat"
     );
 }
 
