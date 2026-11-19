@@ -599,11 +599,10 @@ fn check_target_paths(crate_dir: &Path, manifest: &toml::Value) -> Result<(), Re
 struct TestSourceScan {
     tests: BTreeSet<String>,
     unresolved: Option<&'static str>,
-    /// Directory of the file being visited and the owning crate's root, so a
-    /// `#[path = "…"]` module that stays inside the crate (and is therefore
-    /// already among the scanned files) is not read as an unresolved source.
+    item_generator: Option<&'static str>,
+    /// Directory of the file being visited, used to resolve a literal
+    /// `#[path = "…"]` module against the scanned files.
     file_dir: std::path::PathBuf,
-    crate_root: std::path::PathBuf,
     /// Canonical paths of every `.rs` file the scan reads for this crate.
     scanned: BTreeSet<std::path::PathBuf>,
     /// Nesting depth of inline `mod x { … }` blocks: rustc resolves a nested
@@ -723,7 +722,7 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
         // `global_asm!` and `thread_local!` provably can't: they emit
         // assembly or thread-local statics, never Rust test functions.
         if !is_non_generating_item_macro(&item.mac.path) {
-            self.unresolved = Some("item macro generator");
+            self.item_generator = Some("item macro generator");
         }
         syn::visit::visit_item_macro(self, item);
     }
@@ -780,7 +779,7 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         if let Some(name) = mac.path.segments.last() {
             if name.ident == "macro_rules" {
-                self.unresolved = Some("macro_rules! generator");
+                self.item_generator = Some("macro_rules! generator");
             } else if name.ident == "include" {
                 self.unresolved = Some("include! source");
             }
@@ -789,15 +788,17 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
     }
 }
 
-/// Whether the owning crate contains an attributed test function with this
-/// name. Absence is authoritative only if every Rust source file parses and
-/// there are no unresolved source generators or out-of-tree test targets.
-/// Module paths are conservatively over-approximated: a same-named test in
-/// another module prevents retirement rather than excusing a missing test.
+/// Look for an attributed test function by its final path segment in the
+/// owning crate. If the scan encounters an opaque item macro, fall back to
+/// checking for the literal name anywhere in the crate's scanned Rust source,
+/// including macro arguments and definitions. Any mention, even in a
+/// comment or string, counts as present.
+/// This fallback cannot infer a name synthesized during macro expansion.
+/// Unresolved source paths and parse errors still refuse retirement.
 pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<bool, ReceiptError> {
     use syn::visit::Visit;
     let fn_name = test_path.rsplit("::").next().unwrap_or(test_path);
-    let mut scan = TestSourceScan::default();
+    let mut found = false;
     for crate_dir in candidate_crate_dirs(tree_root)? {
         let manifest = crate_manifest(&crate_dir)?;
         if !crate_matches_bin(&crate_dir, &manifest, bin)? {
@@ -807,14 +808,18 @@ pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<boo
         let mut files = Vec::new();
         let explicit_targets = explicit_target_paths(&manifest);
         collect_rs_files(&crate_dir, &explicit_targets, &crate_dir, &mut files)?;
-        scan.scanned = files.iter().filter_map(|f| f.canonicalize().ok()).collect();
+        let mut scan = TestSourceScan {
+            scanned: files.iter().filter_map(|f| f.canonicalize().ok()).collect(),
+            ..Default::default()
+        };
+        let mut name_mentioned = false;
         for file in files {
             let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
+            name_mentioned |= source.contains(fn_name);
             let syntax = syn::parse_file(&source).map_err(|e| {
                 ReceiptError::Retired(format!("cannot parse '{}': {e}", file.display()))
             })?;
             scan.file_dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
-            scan.crate_root = crate_dir.clone();
             scan.visit_file(&syntax);
             if let Some(reason) = scan.unresolved {
                 return Err(ReceiptError::Retired(format!(
@@ -823,8 +828,9 @@ pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<boo
                 )));
             }
         }
+        found |= scan.tests.contains(fn_name) || (scan.item_generator.is_some() && name_mentioned);
     }
-    Ok(scan.tests.contains(fn_name))
+    Ok(found)
 }
 
 /// The `[package.metadata.carrick.test-lanes]` lane of one test binary; a
@@ -853,8 +859,8 @@ pub struct CrateTestInventory {
     pub crate_name: String,
     /// `(bin, fn name)` of every attributed test, with its declared lane.
     pub tests: BTreeMap<(String, String), String>,
-    /// First source the scanner cannot fully resolve (same refusals as
-    /// `tree_has_test`); tests it generates are not in the inventory.
+    /// First source the scanner cannot fully resolve, including item macros
+    /// whose generated tests are outside the inventory.
     pub unresolved: Option<String>,
 }
 
@@ -1097,15 +1103,13 @@ pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, 
             })?;
             let mut scan = TestSourceScan {
                 scanned: scanned.clone(),
-                crate_root: crate_dir.clone(),
                 file_dir: file.parent().map(Path::to_path_buf).unwrap_or_default(),
                 ..Default::default()
             };
             scan.visit_file(&syntax);
-            // Unlike `tree_has_test`, an inventory has no proof of absence to
-            // protect: a generator can only hide tests, so keep scanning and
-            // report it.
-            if let Some(reason) = scan.unresolved.take() {
+            // Keep scanning and report any source or generator that can
+            // hide tests from the inventory.
+            if let Some(reason) = scan.unresolved.take().or(scan.item_generator) {
                 inventory.unresolved.get_or_insert_with(|| {
                     let relative = file.strip_prefix(tree_root).unwrap_or(&file);
                     format!("{reason} in {}", relative.display())
@@ -1434,6 +1438,12 @@ pub fn diff_with_retired(
         if tree_has_test(candidate_tree, bin, test_path)? {
             return Err(ReceiptError::Retired(format!(
                 "retired test '{}' still exists in candidate source (PR #{})",
+                entry.test, entry.pr
+            )));
+        }
+        if has_started(candidate, bin, test_path) {
+            return Err(ReceiptError::Retired(format!(
+                "retired test '{}' was observed in candidate receipt (PR #{})",
                 entry.test, entry.pr
             )));
         }
