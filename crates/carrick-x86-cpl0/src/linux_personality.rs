@@ -1392,7 +1392,23 @@ impl Personality for LinuxPersonality {
                 anonymous.as_mut().map(|venue| venue as &mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue),
                 cache_lookup,
             );
-            let staged = native.staged.take();
+            let socket_epoll = route == CompletionRoute::NativeService
+                && call.canonical.raw() == carrick_personality_linux::crossing::nr::EPOLL_CTL.raw();
+            let staged = if socket_epoll {
+                ipc.as_ref()
+                    .and_then(|venue| carrick_el1_linux::ipc::native_table(venue, task))
+                    .map(|table| {
+                        carrick_el1_linux::dispatch::stage_native_socket_epoll(
+                            task,
+                            &carrick_el1_linux::file::HardwareValidator,
+                            table,
+                            call.args,
+                            carrick_abi::LinuxGuestAbi::X86_64,
+                        )
+                    })
+            } else {
+                native.staged.take()
+            };
             crossing_operand = native.crossing_operand.take();
             if route == CompletionRoute::NativeService
                 && call.canonical.raw() == carrick_personality_linux::crossing::nr::GETRANDOM.raw()
@@ -1452,7 +1468,7 @@ impl Personality for LinuxPersonality {
             // Staged ahead of the crossing table by the dispatch owner, so a
             // call the strict x86 set refuses (writev) still reaches the
             // retained host-file venue, as ARM stages ahead of its route.
-            if route == CompletionRoute::Forward
+            if (route == CompletionRoute::Forward || socket_epoll)
                 && let Some(stage) = staged
             {
                 use carrick_el1_linux::native_process_runtime::NativeServiceCall;

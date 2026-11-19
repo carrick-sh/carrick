@@ -4,14 +4,12 @@
 //!
 //! # One owner per item
 //!
-//! An epoll instance is an [`IpcObjectKind::Epoll`] object. Every item whose
-//! member is an IPC object (eventfd, pipe end) lives here, in an
-//! [`IpcEpollItem`]; every other item (sockets, files, nested epolls, ...)
-//! lives in the host's interest map, and this record only counts them
-//! ([`IpcRegion::epoll_host_items`]). An item's home is chosen by member type at
-//! `EPOLL_CTL_ADD` and never changes. EL1 serves a wait only while
-//! `host_items == 0`; the host serves a mixed set by harvesting this
-//! record first and its own items second.
+//! An epoll instance is an [`IpcObjectKind::Epoll`] object. Items watching
+//! IPC objects, and native host sockets with carrier-published readiness,
+//! live in [`IpcEpollItem`] and share the same ready list. The legacy host
+//! epoll path keeps its own interest map; this record counts those items
+//! ([`IpcRegion::epoll_host_items`]) and the host harvests both lists
+//! when that legacy map is populated.
 //!
 //! Candid divergence from Linux: Linux keeps one ready list per epoll, in
 //! the order items became ready. A set with both halves has two: the zone
@@ -131,6 +129,9 @@ pub enum EpollMember {
     StreamFirst = 4,
     /// A stream pair's [`StreamEnd::Second`].
     StreamSecond = 5,
+    /// A carrier-owned socket readiness source. Its sampled level is stored
+    /// in the item itself under the epoll lock.
+    HostSocket = 6,
 }
 impl EpollMember {
     const fn from_raw(raw: u32) -> Option<Self> {
@@ -140,6 +141,7 @@ impl EpollMember {
             3 => Some(Self::PipeWriter),
             4 => Some(Self::StreamFirst),
             5 => Some(Self::StreamSecond),
+            6 => Some(Self::HostSocket),
             _ => None,
         }
     }
@@ -148,7 +150,7 @@ impl EpollMember {
         match self {
             Self::StreamFirst => Some(StreamEnd::First),
             Self::StreamSecond => Some(StreamEnd::Second),
-            Self::EventFd | Self::PipeReader | Self::PipeWriter => None,
+            Self::EventFd | Self::PipeReader | Self::PipeWriter | Self::HostSocket => None,
         }
     }
     /// The member a description's backing names, if it is an IPC object.
@@ -215,6 +217,8 @@ pub struct IpcEpollItem {
     live: AtomicU32,
     pub(super) next_free: AtomicU64,
     epoll: AtomicU64,
+    /// Packed member object handle, or the sampled Linux level for a
+    /// carrier socket. Socket publishers write it under the epoll lock.
     member: AtomicU64,
     file_key: AtomicU64,
     data: AtomicU64,
@@ -229,6 +233,30 @@ pub struct IpcEpollItem {
     ready_next: AtomicU32,
     /// The harvest epoch that last reported this item (epoll lock).
     reported_epoch: AtomicU32,
+}
+
+const HOST_SOCKET_BATCH: usize = 32;
+
+impl IpcEpollItem {
+    fn report(&self, level: u32, epoch: u32) -> Option<EpollReport> {
+        let requested = self.events.load(Ordering::Relaxed);
+        let report = level & (requested | events::ALWAYS);
+        if report == 0 || self.flags.load(Ordering::Relaxed) & DISABLED != 0 {
+            return None;
+        }
+        self.reported_epoch.store(epoch, Ordering::Relaxed);
+        if requested & events::ONESHOT != 0 {
+            self.flags.fetch_or(DISABLED, Ordering::AcqRel);
+        }
+        Some(EpollReport {
+            events: report,
+            data: self.data.load(Ordering::Relaxed),
+        })
+    }
+
+    fn is_level_triggered(&self) -> bool {
+        self.events.load(Ordering::Relaxed) & (events::ET | events::ONESHOT) == 0
+    }
 }
 
 const fn pack(object: IpcObjectHandle) -> u64 {
@@ -440,7 +468,8 @@ impl<'a> IpcRegion<'a> {
     }
 
     /// Lock `epoll` and drain its lock-free stack into the ordered list.
-    fn lock_epoll<W: LockWait>(
+    /// Acquire an epoll's ready-list lock for a harvest owned by this caller.
+    pub fn lock_epoll<W: LockWait>(
         &self,
         epoll: IpcObjectHandle,
         wait: &W,
@@ -468,6 +497,9 @@ impl<'a> IpcRegion<'a> {
         data: u64,
         wait: &W,
     ) -> Result<Option<IpcWake>, EpollCtlError> {
+        if kind == EpollMember::HostSocket {
+            return Err(EpollCtlError::Invalid);
+        }
         if events & events::EXCLUSIVE != 0 {
             return Err(EpollCtlError::HostHalf(HostHalfReason::Exclusive));
         }
@@ -486,30 +518,7 @@ impl<'a> IpcRegion<'a> {
         if epoll_guard.find_item(fd, file_key).is_some() {
             return Err(EpollCtlError::Exists);
         }
-        let Some((number, item)) = self.alloc_item() else {
-            return Err(EpollCtlError::HostHalf(HostHalfReason::ItemsExhausted));
-        };
-        item.epoll.store(pack(epoll), Ordering::Relaxed);
-        item.member.store(pack(member), Ordering::Relaxed);
-        item.member_kind.store(kind as u32, Ordering::Relaxed);
-        item.file_key.store(file_key, Ordering::Relaxed);
-        item.fd.store(fd as u32, Ordering::Relaxed);
-        item.events.store(events, Ordering::Relaxed);
-        item.data.store(data, Ordering::Relaxed);
-        item.flags.store(0, Ordering::Relaxed);
-        item.ready_next.store(0, Ordering::Relaxed);
-        item.reported_epoch.store(0, Ordering::Relaxed);
-        item.live.store(1, Ordering::Release);
-        // Interest list (epoll lock), then member list (member lock).
-        let state = epoll_guard.epoll_state()?;
-        let head = state.interest_head;
-        item.interest_prev.store(0, Ordering::Relaxed);
-        item.interest_next.store(head, Ordering::Relaxed);
-        if let Some(next) = self.item(head) {
-            next.interest_prev.store(number, Ordering::Relaxed);
-        }
-        state.interest_head = number;
-        state.zone_items += 1;
+        let (number, item) = epoll_guard.link_item(member, kind, fd, file_key, events, data)?;
         let member_head = member_guard.record.epoll_link.load(Ordering::Relaxed) as u32;
         item.member_prev.store(0, Ordering::Relaxed);
         item.member_next.store(member_head, Ordering::Relaxed);
@@ -531,6 +540,121 @@ impl<'a> IpcRegion<'a> {
         drop(epoll_guard);
         drop(member_guard);
         Ok(wake)
+    }
+
+    /// An epoll that has hosted a socket retires its carrier registrations
+    /// at the backing's final release, even if its last pin returns in ring.
+    pub fn epoll_needs_host_release(&self, object: IpcObjectHandle) -> bool {
+        self.record(object.index()).is_some_and(|record| {
+            record.generation.load(Ordering::Acquire) != u64::from(object.generation())
+                || record.host_flags.load(Ordering::Acquire) & EPOLL_NEEDS_HOST_RELEASE != 0
+        })
+    }
+
+    /// Add a carrier socket's interest to the shared ready list. The carrier
+    /// has enrolled its event source before calling this with its first sample.
+    pub fn epoll_add_host_socket<W: LockWait>(
+        &self,
+        epoll: IpcObjectHandle,
+        fd: fd::Fd,
+        file_key: u64,
+        report: EpollReport,
+        level: u32,
+        wait: &W,
+    ) -> Result<(EpollItemRef, Option<IpcWake>), EpollCtlError> {
+        let mut guard = self.lock_epoll(epoll, wait)?;
+        if guard.find_item(fd.0, file_key).is_some() {
+            return Err(EpollCtlError::Exists);
+        }
+        let (number, item) = guard.link_item(
+            unpack(0),
+            EpollMember::HostSocket,
+            fd.0,
+            file_key,
+            report.events,
+            report.data,
+        )?;
+        guard
+            .record
+            .host_flags
+            .fetch_or(EPOLL_NEEDS_HOST_RELEASE, Ordering::Release);
+        let wake = guard.publish_host_socket(number, item, level, true);
+        Ok((self.item_ref(number).ok_or(IpcError::Corrupt)?, wake))
+    }
+
+    /// Rearm a carrier socket interest, invalidating publications and copy
+    /// receipts that still name the prior registration.
+    pub fn epoll_modify_host_socket<W: LockWait>(
+        &self,
+        epoll: IpcObjectHandle,
+        target: EpollItemRef,
+        report: EpollReport,
+        level: u32,
+        wait: &W,
+    ) -> Result<(EpollItemRef, Option<IpcWake>), EpollCtlError> {
+        let mut guard = self.lock_epoll(epoll, wait)?;
+        let item = self
+            .host_socket_item(epoll, target)
+            .ok_or(EpollCtlError::NotFound)?;
+        let generation = target
+            .generation
+            .checked_add(1)
+            .ok_or(IpcError::ZoneLimit)?;
+        item.generation.store(generation, Ordering::Release);
+        item.events.store(report.events, Ordering::Relaxed);
+        item.data.store(report.data, Ordering::Relaxed);
+        item.flags.fetch_and(!DISABLED, Ordering::Relaxed);
+        let wake = guard.publish_host_socket(target.number, item, level, true);
+        Ok((
+            EpollItemRef {
+                generation,
+                ..target
+            },
+            wake,
+        ))
+    }
+
+    pub fn epoll_delete_host_socket<W: LockWait>(
+        &self,
+        epoll: IpcObjectHandle,
+        target: EpollItemRef,
+        wait: &W,
+    ) -> Result<(), EpollCtlError> {
+        let mut guard = self.lock_epoll(epoll, wait)?;
+        self.host_socket_item(epoll, target)
+            .ok_or(EpollCtlError::NotFound)?;
+        guard.unlink_item(target.number);
+        self.free_item(target.number);
+        Ok(())
+    }
+
+    /// Refresh a host socket's level. Only a host event queues an ET item.
+    /// A readiness sample after guest I/O can clear its level without
+    /// reissuing an edge that a waiter already consumed.
+    pub fn epoll_publish_host_socket<W: LockWait>(
+        &self,
+        epoll: IpcObjectHandle,
+        target: EpollItemRef,
+        level: u32,
+        edge: bool,
+        wait: &W,
+    ) -> Result<Option<IpcWake>, IpcError> {
+        let mut guard = self.lock_epoll(epoll, wait)?;
+        let item = self
+            .host_socket_item(epoll, target)
+            .ok_or(IpcError::Stale)?;
+        Ok(guard.publish_host_socket(target.number, item, level, edge))
+    }
+
+    fn host_socket_item(
+        &self,
+        epoll: IpcObjectHandle,
+        target: EpollItemRef,
+    ) -> Option<&'a IpcEpollItem> {
+        self.live_item(target).filter(|item| {
+            item.epoll.load(Ordering::Relaxed) == pack(epoll)
+                && item.member_kind.load(Ordering::Relaxed) == EpollMember::HostSocket as u32
+        })
     }
 
     /// `EPOLL_CTL_MOD` of the zone item `(fd, file_key)`: new events and
@@ -668,6 +792,10 @@ impl<'a> IpcRegion<'a> {
             // under the member's lock, so once unlinked there nothing pushes
             // it again.
             let item = self.item(number).ok_or(IpcError::Corrupt)?;
+            if item.member_kind.load(Ordering::Relaxed) == EpollMember::HostSocket as u32 {
+                self.free_item(number);
+                continue;
+            }
             let member = unpack(item.member.load(Ordering::Relaxed));
             match self.lock(member, wait) {
                 Ok(guard) => guard.unlink_member_item(number),
@@ -759,52 +887,91 @@ impl<'a> IpcRegion<'a> {
         taken: &mut [EpollItemRef],
         wait: &W,
     ) -> Result<EpollHarvest, IpcError> {
+        let guard = self.lock_epoll(epoll, wait)?;
+        self.epoll_harvest_locked(guard, out, taken, wait)
+    }
+
+    /// Continue a harvest after its caller probed the lock using a
+    /// release-queue observation. No second acquisition for host items.
+    pub fn epoll_harvest_locked<W: LockWait>(
+        &self,
+        mut epoll_guard: IpcObjectGuard<'a>,
+        out: &mut [EpollReport],
+        taken: &mut [EpollItemRef],
+        wait: &W,
+    ) -> Result<EpollHarvest, IpcError> {
+        if !self.same_mapping(&epoll_guard.region) {
+            return Err(IpcError::BadRegion);
+        }
+        let epoll = epoll_guard.handle();
         let limit = out.len().min(taken.len());
         let mut reported = 0;
-        let host_items;
-        let epoch;
-        {
-            let mut guard = self.lock_epoll(epoll, wait)?;
-            let state = guard.epoll_state()?;
-            host_items = state.host_items;
-            state.harvest_epoch = state.harvest_epoch.wrapping_add(1).max(1);
-            epoch = state.harvest_epoch;
-        }
+        let state = epoll_guard.epoll_state()?;
+        let host_items = state.host_items;
+        state.harvest_epoch = state.harvest_epoch.wrapping_add(1).max(1);
+        let epoch = state.harvest_epoch;
+        let mut locked = Some(epoll_guard);
         while reported < limit {
-            // Pop the oldest queued item; the queue token goes with it.
-            let (target, member, kind) = {
-                let mut guard = self.lock_epoll(epoll, wait)?;
-                let Some(number) = guard.pop_ready() else {
-                    break;
-                };
-                let item = self.item(number).ok_or(IpcError::Corrupt)?;
-                if item.reported_epoch.load(Ordering::Relaxed) == epoch {
-                    // Reported by this harvest, then queued again by a
-                    // member publication: it waits at the head for the next
-                    // wait (Linux reports an item once per scan).
-                    guard.prepend_ready(number);
-                    break;
-                }
-                item.flags.fetch_and(!QUEUED, Ordering::AcqRel);
-                if item.flags.load(Ordering::Relaxed) & DISABLED != 0 {
-                    continue;
-                }
-                let kind = EpollMember::from_raw(item.member_kind.load(Ordering::Relaxed))
-                    .ok_or(IpcError::Corrupt)?;
-                (
-                    self.item_ref(number).ok_or(IpcError::Corrupt)?,
-                    unpack(item.member.load(Ordering::Relaxed)),
-                    kind,
-                )
+            let mut guard = match locked.take() {
+                Some(guard) => guard,
+                None => match self.lock_epoll(epoll, wait) {
+                    Ok(guard) => guard,
+                    Err(error) if reported == 0 => return Err(error),
+                    Err(_) => break,
+                },
             };
+            let Some(number) = guard.pop_ready() else {
+                locked = Some(guard);
+                break;
+            };
+            let item = self.item(number).ok_or(IpcError::Corrupt)?;
+            let target = self.item_ref(number).ok_or(IpcError::Corrupt)?;
+            let kind = EpollMember::from_raw(item.member_kind.load(Ordering::Relaxed))
+                .ok_or(IpcError::Corrupt)?;
+            if item.reported_epoch.load(Ordering::Relaxed) == epoch {
+                // Already reported in this scan, then made ready again.
+                guard.prepend_ready(number);
+                locked = Some(guard);
+                break;
+            }
+            if kind == EpollMember::HostSocket {
+                // Keep the socket's level report on the ready list while
+                // another waiter can see it. Neither the sampled level nor
+                // the cookie requires a second object lock. Cap this batch
+                // at the ring's report window so deduplication stays bounded
+                // even for a mixed set with another harvester.
+                if reported >= HOST_SOCKET_BATCH || taken[..reported].contains(&target) {
+                    guard.prepend_ready(number);
+                    locked = Some(guard);
+                    break;
+                }
+                let level = item.member.load(Ordering::Relaxed) as u32;
+                item.flags.fetch_and(!QUEUED, Ordering::Relaxed);
+                if let Some(report) = item.report(level, epoch) {
+                    out[reported] = report;
+                    taken[reported] = target;
+                    reported += 1;
+                    if item.is_level_triggered() {
+                        item.flags.fetch_or(QUEUED, Ordering::Relaxed);
+                        guard.append_ready(number);
+                    }
+                }
+                locked = Some(guard);
+                continue;
+            }
+            item.flags.fetch_and(!QUEUED, Ordering::AcqRel);
+            if item.flags.load(Ordering::Relaxed) & DISABLED != 0 {
+                locked = Some(guard);
+                continue;
+            }
+            let member = unpack(item.member.load(Ordering::Relaxed));
+            drop(guard);
             // The member's level decides, read under its lock alone.
             let level = match self.lock(member, wait) {
                 Ok(mut guard) => guard.member_level(kind)?,
                 // A freed member's release detaches its items.
                 Err(IpcError::Stale) => continue,
-                // Refused by the lock policy (EL1 never waits long for a
-                // host holder): the popped item goes back, unlocked, and
-                // the harvest ends with what it has.
+                // A refused lock puts the item back before ending the scan.
                 Err(error) => {
                     self.requeue_unlocked(epoll, target);
                     if reported == 0 {
@@ -823,53 +990,38 @@ impl<'a> IpcRegion<'a> {
                     break;
                 }
             };
-            let Some(item) = self.live_item(target) else {
-                continue;
-            };
-            let requested = item.events.load(Ordering::Relaxed);
-            let flags = item.flags.load(Ordering::Relaxed);
-            let report = level & (requested | events::ALWAYS);
-            if report == 0 || flags & DISABLED != 0 {
-                continue;
+            if let Some(item) = self.live_item(target)
+                && let Some(report) = item.report(level, epoch)
+            {
+                out[reported] = report;
+                taken[reported] = target;
+                reported += 1;
             }
-            out[reported] = EpollReport {
-                events: report,
-                data: item.data.load(Ordering::Relaxed),
-            };
-            taken[reported] = target;
-            reported += 1;
-            item.reported_epoch.store(epoch, Ordering::Relaxed);
-            if requested & events::ONESHOT != 0 {
-                item.flags.fetch_or(DISABLED, Ordering::AcqRel);
-            }
-            drop(guard);
+            locked = Some(guard);
         }
-        // Level-triggered reports stay ready: queue them again after the
-        // scan, so this harvest reported each at most once.
+        // In-zone level items go back after the scan. Carrier sockets have
+        // already been requeued under the guard used to report them.
         if reported > 0 {
-            let Ok(mut guard) = self.lock_epoll(epoll, wait) else {
-                // Refused: queue the level-triggered reports lock-free.
-                for target in &taken[..reported] {
-                    if self.live_item(*target).is_some_and(|item| {
-                        item.events.load(Ordering::Relaxed) & (events::ET | events::ONESHOT) == 0
-                    }) {
-                        self.requeue_unlocked(epoll, *target);
-                    }
-                }
-                return Ok(EpollHarvest {
-                    reported,
-                    host_items,
-                });
+            let acquired = match locked {
+                Some(guard) => Ok(guard),
+                None => self.lock_epoll(epoll, wait),
             };
+            let mut guard = acquired.ok();
             for target in &taken[..reported] {
                 let Some(item) = self.live_item(*target) else {
                     continue;
                 };
-                let requested = item.events.load(Ordering::Relaxed);
-                if requested & (events::ET | events::ONESHOT) == 0
-                    && item.flags.fetch_or(QUEUED, Ordering::AcqRel) & QUEUED == 0
+                if !item.is_level_triggered()
+                    || item.member_kind.load(Ordering::Relaxed) == EpollMember::HostSocket as u32
                 {
-                    guard.append_ready(target.number);
+                    continue;
+                }
+                if let Some(guard) = &mut guard {
+                    if item.flags.fetch_or(QUEUED, Ordering::AcqRel) & QUEUED == 0 {
+                        guard.append_ready(target.number);
+                    }
+                } else {
+                    self.requeue_unlocked(epoll, *target);
                 }
             }
         }
@@ -1023,14 +1175,22 @@ impl<'a> IpcRegion<'a> {
                     return Ok(count);
                 }
             }
-            for &(_, member, kind, requested) in &batch[..len] {
+            for &(target, member, kind, requested) in &batch[..len] {
                 let Some(kind) = EpollMember::from_raw(kind) else {
                     return Err(IpcError::Corrupt);
                 };
-                let level = match self.lock(IpcObjectHandle::from_raw(member), wait) {
-                    Ok(mut guard) => guard.member_level(kind)?,
-                    Err(IpcError::Stale) => continue,
-                    Err(error) => return Err(error),
+                let level = if kind == EpollMember::HostSocket {
+                    let _guard = self.lock_epoll(epoll, wait)?;
+                    let Some(item) = self.host_socket_item(epoll, target) else {
+                        continue;
+                    };
+                    item.member.load(Ordering::Relaxed) as u32
+                } else {
+                    match self.lock(IpcObjectHandle::from_raw(member), wait) {
+                        Ok(mut guard) => guard.member_level(kind)?,
+                        Err(IpcError::Stale) => continue,
+                        Err(error) => return Err(error),
+                    }
                 };
                 if level & (requested | events::ALWAYS) != 0 {
                     count += 1;
@@ -1157,6 +1317,66 @@ impl<'a> IpcObjectGuard<'a> {
         None
     }
 
+    fn link_item(
+        &mut self,
+        member: IpcObjectHandle,
+        kind: EpollMember,
+        fd: i32,
+        file_key: u64,
+        events: u32,
+        data: u64,
+    ) -> Result<(u32, &'a IpcEpollItem), EpollCtlError> {
+        let region = self.region;
+        let epoll = self.handle();
+        let state = self.epoll_state()?;
+        let Some((number, item)) = region.alloc_item() else {
+            return Err(EpollCtlError::HostHalf(HostHalfReason::ItemsExhausted));
+        };
+        item.epoll.store(pack(epoll), Ordering::Relaxed);
+        item.member.store(pack(member), Ordering::Relaxed);
+        item.member_kind.store(kind as u32, Ordering::Relaxed);
+        item.file_key.store(file_key, Ordering::Relaxed);
+        item.fd.store(fd as u32, Ordering::Relaxed);
+        item.events.store(events, Ordering::Relaxed);
+        item.data.store(data, Ordering::Relaxed);
+        item.flags.store(0, Ordering::Relaxed);
+        item.ready_next.store(0, Ordering::Relaxed);
+        item.reported_epoch.store(0, Ordering::Relaxed);
+        let head = state.interest_head;
+        item.interest_prev.store(0, Ordering::Relaxed);
+        item.interest_next.store(head, Ordering::Relaxed);
+        if let Some(next) = region.item(head) {
+            next.interest_prev.store(number, Ordering::Relaxed);
+        }
+        state.interest_head = number;
+        state.zone_items += 1;
+        item.live.store(1, Ordering::Release);
+        Ok((number, item))
+    }
+
+    fn publish_host_socket(
+        &mut self,
+        number: u32,
+        item: &IpcEpollItem,
+        level: u32,
+        edge: bool,
+    ) -> Option<IpcWake> {
+        item.member.store(u64::from(level), Ordering::Relaxed);
+        let interest = item.events.load(Ordering::Relaxed);
+        if level & (interest | events::ALWAYS) == 0
+            || (!edge && interest & events::ET != 0)
+            || item.flags.load(Ordering::Relaxed) & (DISABLED | QUEUED) != 0
+        {
+            return None;
+        }
+        item.flags.fetch_or(QUEUED, Ordering::Relaxed);
+        self.append_ready(number);
+        Some(self.publish(WakeSet {
+            readers: true,
+            writers: false,
+        }))
+    }
+
     /// Unlink an item from this epoll's interest and ready lists (the stack
     /// was drained by `lock_epoll`).
     fn unlink_item(&mut self, number: u32) {
@@ -1256,6 +1476,7 @@ impl<'a> IpcObjectGuard<'a> {
     pub fn member_level(&mut self, kind: EpollMember) -> Result<u32, IpcError> {
         let readiness = match kind {
             EpollMember::EventFd => self.eventfd()?.readiness(),
+            EpollMember::HostSocket => return Err(IpcError::WrongKind),
             EpollMember::PipeReader => self.pipe()?.readiness(End::Reader),
             EpollMember::PipeWriter => self.pipe()?.readiness(End::Writer),
             EpollMember::StreamFirst | EpollMember::StreamSecond => {
@@ -1353,7 +1574,7 @@ impl<'a> IpcObjectGuard<'a> {
                     (wake.readers && requested & events::READ_SIDE != 0)
                         || (wake.writers && requested & events::WRITE_SIDE != 0)
                 }
-                None => false,
+                Some(EpollMember::HostSocket) | None => false,
             };
             if !interested
                 || item.flags.load(Ordering::Acquire) & DISABLED != 0
@@ -1382,7 +1603,7 @@ impl<'a> IpcObjectGuard<'a> {
             }
             record.read_seq.fetch_add(1, Ordering::Release);
             if record.host_subscribers.load(Ordering::Acquire) != 0 {
-                record.host_wake_owed.store(1, Ordering::Release);
+                record.owe_host_wake();
                 self.region.index_host_wake(epoll.index);
                 host_owed = true;
             }

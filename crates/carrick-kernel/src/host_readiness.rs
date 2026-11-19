@@ -17,7 +17,7 @@
 //! source when the guest's last descriptor closes, so a closed socket never
 //! lingers in the reactor's poll set.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -102,6 +102,12 @@ impl HostReadyWait {
     }
 }
 
+/// A persistent, edge-producing host descriptor on the existing reactor.
+pub(crate) trait HostEventSource: Send + Sync + std::fmt::Debug {
+    fn poll_fd(&self) -> std::os::fd::RawFd;
+    fn host_event(&self, fd_ready: bool);
+}
+
 /// The reactor's table of native members' host-readiness waits, held under
 /// the wait service's state lock. Every row contributes pollfds (or only a
 /// deadline), so a reactor cycle visits exactly the rows it polls.
@@ -109,6 +115,8 @@ impl HostReadyWait {
 pub(crate) struct HostReadyWaits {
     waits: BTreeMap<HostReadyKey, HostReadyWait>,
     next_serial: u64,
+    producers: BTreeMap<HostReadinessSource, Weak<dyn HostEventSource>>,
+    pending_producers: BTreeSet<HostReadinessSource>,
 }
 
 impl HostReadyWaits {
@@ -163,6 +171,32 @@ impl HostReadyWaits {
                 *nearest = Some(nearest.map_or(deadline, |current| current.min(deadline)));
             }
         }
+    }
+
+    pub(crate) fn event_sources(
+        &mut self,
+        pollfds: &mut Vec<libc::pollfd>,
+        mut append: impl FnMut(Arc<dyn HostEventSource>),
+    ) {
+        self.producers.retain(|_, producer| {
+            let Some(producer) = producer.upgrade() else {
+                return false;
+            };
+            pollfds.push(libc::pollfd {
+                fd: producer.poll_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            append(producer);
+            true
+        });
+    }
+
+    pub(crate) fn take_pending_producers(&mut self) -> Vec<Arc<dyn HostEventSource>> {
+        std::mem::take(&mut self.pending_producers)
+            .into_iter()
+            .filter_map(|source| self.producers.get(&source).and_then(Weak::upgrade))
+            .collect()
     }
 
     /// Take the waits that `fired` (by key and serial) or whose deadline
@@ -265,6 +299,36 @@ impl HostReadinessReactor {
             true
         });
         true
+    }
+
+    pub(crate) fn watch_events(
+        &self,
+        source: HostReadinessSource,
+        producer: Arc<dyn HostEventSource>,
+    ) -> bool {
+        let Some(service) = self.service() else {
+            return false;
+        };
+        service.change_host_ready_waits(&mut |waits| {
+            waits.producers.insert(source, Arc::downgrade(&producer));
+            true
+        });
+        true
+    }
+
+    pub(crate) fn schedule_event(&self, source: HostReadinessSource) {
+        if let Some(service) = self.service() {
+            service.change_host_ready_waits(&mut |waits| waits.pending_producers.insert(source));
+        }
+    }
+
+    pub(crate) fn forget_events(&self, source: HostReadinessSource) {
+        if let Some(service) = self.service() {
+            service.change_host_ready_waits(&mut |waits| {
+                waits.pending_producers.remove(&source);
+                waits.producers.remove(&source).is_some()
+            });
+        }
     }
 
     /// Drop every host-readiness wait on `source`.

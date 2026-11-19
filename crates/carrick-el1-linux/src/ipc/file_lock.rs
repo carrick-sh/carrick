@@ -727,7 +727,9 @@ fn drop_hold<E: IpcExecution>(
     if let Some(pin) = pin {
         let release = region
             .fd(EL1_WAIT)
-            .unpin_filtered(pin, super::is_zone_releasable_backing)
+            .unpin_filtered(pin, |description| {
+                super::can_release_backing_in_ring(region, description)
+            })
             .unwrap_or_else(|_| {
                 crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
             });
