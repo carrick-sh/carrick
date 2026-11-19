@@ -329,3 +329,124 @@ unsafe impl SoftMmuMemory for SoftCarrierMemory {
         &mut self.extents
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Production `SoftCarrierMemory::refresh` retirement witnesses (#2546
+    //! review P0): skipping the extent removal or its reclaim in `refresh`
+    //! must fail a test, not leave the suite green.
+    #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
+    use super::*;
+
+    /// A page-aligned 4 KiB host page standing in for a registered backing.
+    #[repr(C, align(4096))]
+    struct HostPages<const N: usize>([[u8; 4096]; N]);
+
+    const ROOT_GPA: u64 = 0x10_0000;
+    const CHILD_GPA: u64 = 0x20_0000;
+
+    fn slot<const N: usize>(
+        index: u32,
+        gpa: u64,
+        host: &mut Box<HostPages<N>>,
+        backing: &Arc<BackingExtent>,
+    ) -> RetainedSlot {
+        RetainedSlot {
+            region: CarrierMemoryRegion {
+                slot: index,
+                flags: 0,
+                guest_phys_addr: gpa,
+                memory_size: (N * 4096) as u64,
+                userspace_addr: host.0.as_mut_ptr() as u64,
+            },
+            backing: Arc::clone(backing),
+        }
+    }
+
+    fn publish(vm: &SoftVm, slots: impl IntoIterator<Item = (u32, RetainedSlot)>) {
+        vm.slots().retained = Some(Arc::new(slots.into_iter().collect()));
+    }
+
+    #[test]
+    fn refresh_retires_a_slot_and_installs_a_replacement_at_the_same_gpa() {
+        let vm = SoftVm::new();
+        let mut root_host = Box::new(HostPages::<2>([[0; 4096]; 2]));
+        let mut child_host = Box::new(HostPages::<1>([[0; 4096]; 1]));
+        let mut replacement_host = Box::new(HostPages::<1>([[0; 4096]; 1]));
+        let root_backing = Arc::new(
+            BackingExtent::private(FrameGpa::new(ROOT_GPA), 2 * 4096).expect("root backing"),
+        );
+        let child_backing = Arc::new(
+            BackingExtent::private(FrameGpa::new(CHILD_GPA), 4096).expect("child backing"),
+        );
+        let replacement_backing = Arc::new(
+            BackingExtent::private(FrameGpa::new(CHILD_GPA), 4096).expect("replacement backing"),
+        );
+        publish(
+            &vm,
+            [
+                (0, slot(0, ROOT_GPA, &mut root_host, &root_backing)),
+                (1, slot(1, CHILD_GPA, &mut child_host, &child_backing)),
+            ],
+        );
+        let mut memory = SoftCarrierMemory::new(&vm, ROOT_GPA).expect("soft memory");
+        assert!(memory.extents().lookup_span(CHILD_GPA, 4096).is_some());
+        let probe = [0x5a_u8; 8];
+        memory
+            .write_host_bytes(FrameGpa::new(CHILD_GPA), BOOT_GENERATION, &probe)
+            .expect("the live slot accepts an authenticated write");
+        assert_eq!(child_host.0[0][..8], probe);
+
+        // Retire the child slot: the root slot stays registered unchanged.
+        publish(&vm, [(0, slot(0, ROOT_GPA, &mut root_host, &root_backing))]);
+        assert!(memory.refresh().expect("refresh retires the slot"));
+        assert!(
+            memory.extents().lookup_span(CHILD_GPA, 4096).is_none(),
+            "the retired slot's extent must be removed"
+        );
+        assert_eq!(
+            memory.extents().pending_identities(),
+            0,
+            "the retirement must be reclaimed in the CPU's own domain"
+        );
+        assert!(
+            memory
+                .write_host_bytes(FrameGpa::new(CHILD_GPA), BOOT_GENERATION, &probe)
+                .is_err(),
+            "an access to the retired GPA must fault"
+        );
+        assert!(
+            memory.extents().lookup_span(ROOT_GPA, 4096).is_some(),
+            "an unrelated slot survives the retirement"
+        );
+
+        // A replacement registered at the same GPA installs and reads back.
+        publish(
+            &vm,
+            [
+                (0, slot(0, ROOT_GPA, &mut root_host, &root_backing)),
+                (
+                    1,
+                    slot(1, CHILD_GPA, &mut replacement_host, &replacement_backing),
+                ),
+            ],
+        );
+        assert!(memory.refresh().expect("refresh installs the replacement"));
+        assert!(memory.extents().lookup_span(CHILD_GPA, 4096).is_some());
+        let fresh = [0xc3_u8; 8];
+        memory
+            .write_host_bytes(FrameGpa::new(CHILD_GPA), BOOT_GENERATION, &fresh)
+            .expect("the replacement accepts an authenticated write");
+        assert_eq!(
+            replacement_host.0[0][..8],
+            fresh,
+            "the replacement backing is read and written through the new placement"
+        );
+        assert_eq!(
+            child_host.0[0][..8],
+            probe,
+            "the retired backing is untouched"
+        );
+    }
+}
