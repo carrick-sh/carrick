@@ -1164,10 +1164,11 @@ surfaces = [
   # arm64 host launch for the aarch64 copy-through engine (#1236); a test-only execution lane, no guest-visible product path yet.
   { path = "crates/carrick-softcpu-aarch64-host/src/lib.rs", contracts = [] },
   # Copy-through dispatcher over the ExecuteBlock seam (#1236), driven by the test-only arm64 lane.
-  { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contracts = [] },
+  { path = "crates/carrick-softcpu-aarch64/src/cpu_profile.rs", contract = "softcpu.a64.el0-fp" },
+  { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "softcpu.a64.el0-fp" },
   # Virtual exception entry and return for the test-only arm64 lane.
   # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
-  { path = "crates/carrick-softcpu-aarch64/src/exception.rs", contracts = [] },
+  { path = "crates/carrick-softcpu-aarch64/src/exception.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "softcpu.a64.el0-fp" },
   # Typed A64 census and instruction decoder for the test-only soft-CPU lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/lib.rs", contract = "softcpu.a64.el0-fp" },

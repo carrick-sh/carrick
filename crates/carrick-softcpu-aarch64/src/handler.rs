@@ -18,10 +18,11 @@ use crate::state::{
 };
 use crate::translate::GuestInstruction;
 use crate::{
-    AtomicTransferKind, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, Extend, Hint,
-    IcOperation, Immediate16, Instruction, MemoryAddress, MemoryIndex, MemoryOperation,
-    MemoryRegister, MemorySize, OperandRegister, PstateField, RegisterBranch, StructureLayout,
-    StructureMemory, StructureWriteback, SystemDirection, SystemRegister, TlbiOperation, Width,
+    AtomicTransferKind, Barrier, BarrierKind, Branch, Crc32, CrcPolynomial, Decoded, ExceptionKind,
+    Extend, GUEST_CPU_PROFILE, Hint, IcOperation, Immediate16, Instruction, MemoryAddress,
+    MemoryIndex, MemoryOperation, MemoryRegister, MemorySize, OperandRegister, PstateField,
+    RegisterBranch, StructureLayout, StructureMemory, StructureWriteback, SystemDirection,
+    SystemRegister, TlbiOperation, Width,
 };
 use carrick_mmu_core::aarch64::stage1_walk::Aarch64Fault;
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
@@ -118,9 +119,20 @@ pub fn execute(
     i: &GuestInstruction,
 ) -> Outcome {
     debug_assert_eq!(cpu.pc, i.pc());
+    if !GUEST_CPU_PROFILE.admits(i.instruction(), cpu.pstate.el) {
+        return undefined(cpu);
+    }
     match i.instruction() {
+        Instruction::Crc32(crc) => {
+            execute_crc32(cpu, crc);
+            next(cpu);
+            Outcome::Continue
+        }
         Instruction::SystemAccess(a) => match a.direction {
-            SystemDirection::Read => match cpu.mrs(a.encoding, a.rt) {
+            SystemDirection::Read => match GUEST_CPU_PROFILE
+                .read_id(a.encoding, cpu.pstate.el)
+                .map_or_else(|| cpu.mrs(a.encoding, a.rt), Ok)
+            {
                 Ok(v) => {
                     set_operand(cpu, a.rt, v.0);
                     next(cpu);
@@ -305,6 +317,23 @@ pub fn execute(
             finish_memory(cpu, result)
         }
     }
+}
+
+// DDI0487 CRC32 pseudocode, using reflected polynomials and the operand
+// in little-endian byte order. The architectural accumulator is uncomplemented.
+fn execute_crc32(cpu: &mut CpuState, crc: Crc32) {
+    let mut value = operand(cpu, crc.accumulator) as u32;
+    let polynomial = match crc.polynomial {
+        CrcPolynomial::Ieee => 0xedb8_8320,
+        CrcPolynomial::Castagnoli => 0x82f6_3b78,
+    };
+    let mut data = operand(cpu, crc.data);
+    for _ in 0..8 * crc.size.bytes() {
+        let bit = (value ^ data as u32) & 1;
+        value = (value >> 1) ^ (polynomial & 0u32.wrapping_sub(bit));
+        data >>= 1;
+    }
+    set_operand(cpu, crc.destination, u64::from(value));
 }
 
 fn enter_memory_exception(cpu: &mut CpuState, exception: Option<Exception>) -> Outcome {
