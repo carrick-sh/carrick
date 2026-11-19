@@ -1808,6 +1808,62 @@ fn el1_sched_pipe_pingpong_stays_in_guest() {
     }
 }
 
+/// The peer sends only after the native child's epoll wait releases its
+/// execution lane. This exercises host delivery through the kqueue reactor.
+#[test]
+fn el1_native_child_host_epoll_wakes_parked_waiter() {
+    use carrick_el1_abi::{Claim, RecordId};
+    use std::time::Instant;
+
+    let _guard = common::guest_lock();
+    let carrier = carrier_or_fail();
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let port = peer.local_addr().unwrap().port().to_string();
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(|| {
+            let mut ping = [0; 8];
+            let (count, child) = peer.recv_from(&mut ping).expect("native child UDP ping");
+            assert_eq!(count, ping.len());
+            let tid = u64::from_ne_bytes(ping);
+            let zone = carrick_kernel::el1_zone::zone().expect("guest scheduler zone");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let parked = (1..).map_while(RecordId::from_raw).any(|id| {
+                    let record = zone.record(id);
+                    matches!(record.claim(), Claim::Parked { .. })
+                        && record.identity().tid == tid
+                        && record.has_adapter_operation()
+                        && record
+                            .object_wait_census()
+                            .is_some_and(|wait| wait.queue != 0)
+                });
+                if parked {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "child never parked on its epoll");
+                std::thread::yield_now();
+            }
+            assert_eq!(peer.send_to(b"r", child).unwrap(), 1);
+        });
+        let measured = run_fixture(
+            &carrier,
+            &["native-host-epoll", &port],
+            Duration::from_secs(30),
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        sender
+            .join()
+            .expect("peer supplied host readiness after the park");
+        assert!(
+            !measured.forwarded_syscalls.iter().any(|(nr, _)| *nr == 22),
+            "native epoll wait crossed the ring: {}",
+            describe(&measured)
+        );
+    });
+}
+
 /// Contract `kernel.el1.epoll-zone`, structural part: an eventfd round trip
 /// through an epoll whose set holds only in-zone objects (libuv's
 /// MessagePort shape: post the peer's eventfd, block in `epoll_wait` on your
