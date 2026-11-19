@@ -764,6 +764,26 @@ impl ExtentTable {
             .get(&frame_gpa.raw())
             .map_or(0, |&(_, generation)| generation)
     }
+
+    /// Invalidate translated code for a page already written through stopped
+    /// physical custody. Untouched code and data-only pages keep their stamps.
+    pub fn invalidate_host_written_page(
+        &mut self,
+        page: FrameGpa,
+        owner: OwnerGeneration,
+    ) -> Result<(), HostWriteError> {
+        if self.is_terminal() {
+            return Err(HostWriteError::Terminal);
+        }
+        let frame = self
+            .authenticate(Stage1Gpa::new(page.raw()), PAGE_SIZE_4K, owner)
+            .ok_or(HostWriteError::Owner)?;
+        if self.is_code_page(frame) && self.on_code_page_write(frame, &mut []).is_none() {
+            self.make_terminal();
+            return Err(HostWriteError::GenerationExhausted);
+        }
+        Ok(())
+    }
     /// Bump `frame_gpa`'s code generation on guest write and flush `write`
     /// planes across `peer_tlbs`. `None` once the frame's generation is
     /// exhausted: the bump is refused (never saturated, which would let a
@@ -972,6 +992,101 @@ pub struct SoftWalkerStats {
     pub page_crossing_accesses: u64,
 }
 
+/// The ISA-neutral result of resolving one access through any
+/// [`Stage1Walker`]: an authenticated RAM page with its host address, or an
+/// MMIO exit. The ISA's binding decides how to fill its TLB from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedLeaf<L> {
+    Ram {
+        leaf: L,
+        frame_gpa: AuthenticatedGpa,
+        host_page: HostVa,
+    },
+    Mmio {
+        gpa: u64,
+        leaf: L,
+    },
+}
+
+/// Why [`resolve_leaf`] produced no translation. `Walk` carries the ISA's
+/// own fault or a descriptor-memory refusal; the rest are inventory and
+/// placement authority failures, never guest translation faults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeafResolveError<F, L> {
+    Walk(WalkError<F>),
+    UnauthenticatedExtent {
+        stage1_gpa: Stage1Gpa,
+        expected_generation: Option<OwnerGeneration>,
+        leaf: L,
+    },
+    Placement {
+        frame_gpa: AuthenticatedGpa,
+        error: PlacementError,
+    },
+}
+
+/// The outcome of [`resolve_leaf`] for walker `W`.
+pub type LeafResolution<W> = Result<
+    ResolvedLeaf<<W as Stage1Walker>::Leaf>,
+    LeafResolveError<<W as Stage1Walker>::Fault, <W as Stage1Walker>::Leaf>,
+>;
+
+/// The one ISA-neutral slow path: walk `va` with `walker` through
+/// `root`'s generation-authenticated descriptor words, screen the output
+/// against the placement's MMIO holes, authenticate the leaf's whole span
+/// against the extent inventory and convert the authenticated frame to its
+/// host page. Each ISA binding (x86 [`SoftWalker::walk_and_fill`], the
+/// AArch64 soft CPU) calls this with its own walker and context, by static
+/// dispatch.
+pub fn resolve_leaf<W: Stage1Walker, M: SoftMmuMemory + ?Sized>(
+    walker: &W,
+    memory: &M,
+    root: RootGpa,
+    context: &W::Context,
+    va: GuestVa,
+    access: Access,
+) -> LeafResolution<W> {
+    let leaf = {
+        let checked = AuthenticatedDescriptorWords::new(memory, root);
+        walker
+            .walk(&checked, context, va, access)
+            .map_err(LeafResolveError::Walk)?
+    };
+    let page_stage1 = Stage1Gpa::from_leaf_page(&leaf);
+    let byte_gpa = leaf.output().raw();
+    if memory.placement().is_mmio_hole(page_stage1.raw())
+        || memory.placement().is_mmio_hole(byte_gpa)
+    {
+        return Ok(ResolvedLeaf::Mmio {
+            gpa: byte_gpa,
+            leaf,
+        });
+    }
+    let frame_gpa =
+        memory
+            .extents()
+            .authenticate_leaf(root, &leaf)
+            .map_err(
+                |expected_generation| LeafResolveError::UnauthenticatedExtent {
+                    stage1_gpa: Stage1Gpa::from_leaf_base(&leaf),
+                    expected_generation,
+                    leaf,
+                },
+            )?;
+    match memory.placement().host(frame_gpa) {
+        Ok(host_page) => Ok(ResolvedLeaf::Ram {
+            leaf,
+            frame_gpa,
+            host_page,
+        }),
+        Err(PlacementError::MmioHole { gpa }) => Ok(ResolvedLeaf::Mmio {
+            gpa: gpa | (va.page_offset() as u64),
+            leaf,
+        }),
+        Err(error) => Err(LeafResolveError::Placement { frame_gpa, error }),
+    }
+}
+
 /// Stage-1 page-table walker binding that enforces x86 hardware permission rules in a single walk
 /// via the [`HardwareWalker`] [`Stage1Walker`] and populates [`SoftTlb`].
 #[derive(Clone, Copy, Debug)]
@@ -1084,85 +1199,68 @@ impl SoftWalker {
             user: effective_mode.cpl.is_user(),
             config: hw_config,
         };
-        let walk_res = {
-            let checked = AuthenticatedDescriptorWords::new(memory, root);
-            HardwareWalker.walk(&checked, &context, va, access)
-        };
-        let leaf = match walk_res {
-            Ok(leaf) => leaf,
-            Err(WalkError::Fault(HardwareFaultClass::NonCanonical)) => {
-                return Err(self.non_canonical_exception(va, access, effective_mode));
-            }
-            Err(WalkError::Refusal(refusal)) => {
-                self.stats.descriptor_load_errors += 1;
-                return Err(SoftTranslationError::DescriptorLoad { va, refusal });
-            }
-            Err(WalkError::Fault(HardwareFaultClass::AdCasRetryExhausted { retries })) => {
-                self.stats.ad_cas_retries_exhausted += 1;
-                return Err(SoftTranslationError::AdCasRetryExhausted { va, retries });
-            }
-            Err(WalkError::Fault(hw_fault)) => {
-                let pf_class = match hw_fault {
-                    HardwareFaultClass::NotPresent => PageFaultClass::NotPresent,
-                    HardwareFaultClass::Reserved => PageFaultClass::ReservedBit,
-                    HardwareFaultClass::Protection => PageFaultClass::Protection,
-                    HardwareFaultClass::CowWrite => PageFaultClass::CowWrite,
-                    HardwareFaultClass::Nx => PageFaultClass::NxProtection,
-                    HardwareFaultClass::Smep => PageFaultClass::SmepProtection,
-                    HardwareFaultClass::Smap => PageFaultClass::SmapProtection,
-                    _ => unreachable!(),
-                };
-                self.stats.page_faults += 1;
-                self.stats.cpu_exceptions += 1;
-                let pf = PageFaultInfo::new(va, access, effective_mode, pf_class, None);
-                return Err(SoftTranslationError::CpuException(
-                    SoftCpuException::PageFault(pf),
-                ));
-            }
-        };
-
-        let page_stage1 = Stage1Gpa::from_leaf_page(&leaf);
-        let byte_gpa = leaf.output.raw();
-        if memory.placement().is_mmio_hole(page_stage1.raw())
-            || memory.placement().is_mmio_hole(byte_gpa)
-        {
-            self.stats.mmio_exits += 1;
-            return Ok(WalkOutcome::Mmio {
-                gpa: byte_gpa,
-                leaf,
-            });
-        }
-
-        let frame_gpa =
-            memory
-                .extents()
-                .authenticate_leaf(root, &leaf)
-                .map_err(
-                    |expected_generation| SoftTranslationError::UnauthenticatedExtent {
+        let (leaf, frame_gpa, host_page) =
+            match resolve_leaf(&HardwareWalker, memory, root, &context, va, access) {
+                Ok(ResolvedLeaf::Ram {
+                    leaf,
+                    frame_gpa,
+                    host_page,
+                }) => (leaf, frame_gpa, host_page),
+                Ok(ResolvedLeaf::Mmio { gpa, leaf }) => {
+                    self.stats.mmio_exits += 1;
+                    return Ok(WalkOutcome::Mmio { gpa, leaf });
+                }
+                Err(LeafResolveError::Walk(WalkError::Fault(HardwareFaultClass::NonCanonical))) => {
+                    return Err(self.non_canonical_exception(va, access, effective_mode));
+                }
+                Err(LeafResolveError::Walk(WalkError::Refusal(refusal))) => {
+                    self.stats.descriptor_load_errors += 1;
+                    return Err(SoftTranslationError::DescriptorLoad { va, refusal });
+                }
+                Err(LeafResolveError::Walk(WalkError::Fault(
+                    HardwareFaultClass::AdCasRetryExhausted { retries },
+                ))) => {
+                    self.stats.ad_cas_retries_exhausted += 1;
+                    return Err(SoftTranslationError::AdCasRetryExhausted { va, retries });
+                }
+                Err(LeafResolveError::Walk(WalkError::Fault(hw_fault))) => {
+                    let pf_class = match hw_fault {
+                        HardwareFaultClass::NotPresent => PageFaultClass::NotPresent,
+                        HardwareFaultClass::Reserved => PageFaultClass::ReservedBit,
+                        HardwareFaultClass::Protection => PageFaultClass::Protection,
+                        HardwareFaultClass::CowWrite => PageFaultClass::CowWrite,
+                        HardwareFaultClass::Nx => PageFaultClass::NxProtection,
+                        HardwareFaultClass::Smep => PageFaultClass::SmepProtection,
+                        HardwareFaultClass::Smap => PageFaultClass::SmapProtection,
+                        _ => unreachable!(),
+                    };
+                    self.stats.page_faults += 1;
+                    self.stats.cpu_exceptions += 1;
+                    let pf = PageFaultInfo::new(va, access, effective_mode, pf_class, None);
+                    return Err(SoftTranslationError::CpuException(
+                        SoftCpuException::PageFault(pf),
+                    ));
+                }
+                Err(LeafResolveError::UnauthenticatedExtent {
+                    stage1_gpa,
+                    expected_generation,
+                    leaf,
+                }) => {
+                    return Err(SoftTranslationError::UnauthenticatedExtent {
                         va,
-                        stage1_gpa: Stage1Gpa::from_leaf_base(&leaf),
+                        stage1_gpa,
                         expected_generation,
                         leaf,
-                    },
-                )?;
-
-        let host_page = match memory.placement().host(frame_gpa) {
-            Ok(host_va) => host_va,
-            Err(PlacementError::MmioHole { gpa }) => {
-                self.stats.mmio_exits += 1;
-                return Ok(WalkOutcome::Mmio {
-                    gpa: gpa | (va.page_offset() as u64),
-                    leaf,
-                });
-            }
-            Err(error) => {
-                return Err(SoftTranslationError::Placement {
-                    va,
-                    frame_gpa,
-                    error,
-                });
-            }
-        };
+                    });
+                }
+                Err(LeafResolveError::Placement { frame_gpa, error }) => {
+                    return Err(SoftTranslationError::Placement {
+                        va,
+                        frame_gpa,
+                        error,
+                    });
+                }
+            };
 
         let was_code_page = memory.is_code_page(frame_gpa);
         let mut invalidated_code_page = false;

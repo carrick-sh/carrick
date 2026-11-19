@@ -5889,3 +5889,141 @@ fn advertised_mmx_fxsave_image_matches_native() {
         }
     }
 }
+
+/// Legacy high-byte registers (AH/CH/DH/BH) cannot be encoded with a REX
+/// prefix (SDM Vol. 2A §2.2.1.2), but the native memory path rebases the
+/// operand on R14. Store, load, read-modify-write, exchange and CMPXCHG
+/// (implicit AL) must keep their architectural results (#671 M1-0: the
+/// CPL0 ring's `user_fault_gate::replace` stores DH).
+#[test]
+fn high_byte_register_memory_operands_survive_the_r14_rebase() {
+    let code = &[
+        0x88, 0x71, 0x10, // mov [rcx+0x10], dh
+        0x8a, 0x79, 0x11, // mov bh, [rcx+0x11]
+        0x02, 0x61, 0x12, // add ah, [rcx+0x12]
+        0x86, 0x71, 0x13, // xchg [rcx+0x13], dh
+        0x0f, 0xb0, 0x79, 0x14, // cmpxchg [rcx+0x14], bh
+        0x0f, 0x05,
+    ];
+    let (mut cpu, mut mem, va) = setup_snippet(code);
+    let data = 0x2000_0000u64;
+    mem.map_range(data, 4096, PagePerms::USER_RW);
+    mem.write_direct(data + 0x10, &[0, 0x5c, 0x30, 0x77, 0x01]);
+    let gpr = &mut cpu.context_mut().gpr;
+    gpr[reg::RCX] = data;
+    gpr[reg::RDX] = 0xab00;
+    gpr[reg::RBX] = 0x1111_1111_1111_1111;
+    gpr[reg::RAX] = 0x2222_2222_2222_2201;
+    step_ok(&mut cpu, &mut mem, sys(va + 16, va + 18));
+    let gpr = cpu.context_mut().gpr;
+    assert_eq!(
+        (gpr[reg::RAX], gpr[reg::RBX], gpr[reg::RDX]),
+        (0x2222_2222_2222_5201, 0x1111_1111_1111_5c11, 0x7700)
+    );
+    assert_eq!(
+        mem.read_direct(data + 0x10, 5).unwrap(),
+        [0xab, 0x5c, 0x30, 0xab, 0x5c]
+    );
+    // CMPXCHG matched AL: its ZF survives the stand-in's MOVs.
+    assert_ne!(cpu.context().rflags & (1 << 6), 0);
+}
+
+/// The high-byte stand-in is chosen after the memory operand is rebased on
+/// R14: the original base and index no longer address anything, so non-REX
+/// CMPXCHG forms whose addressing plus implicit AL name all of RAX..RBX
+/// still encode (#671 M1-3 review P0-2), in 64- and 32-bit address size.
+#[test]
+fn high_byte_cmpxchg_with_a_full_base_index_pair_survives_the_r14_rebase() {
+    let data = 0x2000_0000u64;
+    // (code, rcx, rdx, rbx, offset, stored byte)
+    let cases: [(&[u8], u64, u64, u64, u64, u8); 4] = [
+        // cmpxchg [rcx + rbx], dh
+        (&[0x0f, 0xb0, 0x34, 0x19], data, 0xab00, 0x10, 0x10, 0xab),
+        // cmpxchg [rcx + rdx], bh
+        (&[0x0f, 0xb0, 0x3c, 0x11], data, 0x20, 0x5c00, 0x20, 0x5c),
+        // cmpxchg [rdx + rbx], ch
+        (&[0x0f, 0xb0, 0x2c, 0x1a], 0x7700, data, 0x30, 0x30, 0x77),
+        // cmpxchg [ecx + ebx], dh
+        (
+            &[0x67, 0x0f, 0xb0, 0x34, 0x19],
+            data,
+            0xcd00,
+            0x40,
+            0x40,
+            0xcd,
+        ),
+    ];
+    for (insn, rcx, rdx, rbx, offset, stored) in cases {
+        let mut code = insn.to_vec();
+        code.extend_from_slice(&[0x0f, 0x05]);
+        let (mut cpu, mut mem, va) = setup_snippet(&code);
+        mem.map_range(data, 4096, PagePerms::USER_RW);
+        mem.write_direct(data + offset, &[0x01]);
+        let gpr = &mut cpu.context_mut().gpr;
+        gpr[reg::RCX] = rcx;
+        gpr[reg::RDX] = rdx;
+        gpr[reg::RBX] = rbx;
+        gpr[reg::RAX] = 0x2222_2222_2222_2201;
+        let end = va + insn.len() as u64;
+        step_ok(&mut cpu, &mut mem, sys(end, end + 2));
+        let gpr = cpu.context().gpr;
+        assert_eq!(
+            (gpr[reg::RAX], gpr[reg::RCX], gpr[reg::RDX], gpr[reg::RBX]),
+            (0x2222_2222_2222_2201, rcx, rdx, rbx),
+            "{insn:02x?}"
+        );
+        assert_eq!(
+            mem.read_direct(data + offset, 1).unwrap(),
+            [stored],
+            "{insn:02x?}"
+        );
+        assert_ne!(cpu.context().rflags & (1 << 6), 0, "{insn:02x?} ZF");
+    }
+}
+
+/// A register-only instruction with a high-byte source and an SP
+/// destination virtualizes guest RSP into a host register that must not
+/// need REX (#671 M1-3 review P1): `movzx esp, ah`, then `movsx sp, bh`.
+#[test]
+fn high_byte_source_into_the_stack_pointer_encodes_without_rex() {
+    let code = &[
+        0x0f, 0xb6, 0xe4, // movzx esp, ah
+        0x66, 0x0f, 0xbe, 0xe7, // movsx sp, bh
+        0x0f, 0x05,
+    ];
+    let (mut cpu, mut mem, va) = setup_snippet(code);
+    let gpr = &mut cpu.context_mut().gpr;
+    gpr[reg::RAX] = 0x1234_5600;
+    gpr[reg::RBX] = 0x8000;
+    gpr[reg::RSP] = 0xffff_ffff_ffff_ffff;
+    step_ok(&mut cpu, &mut mem, sys(va + 7, va + 9));
+    let gpr = cpu.context().gpr;
+    assert_eq!(
+        (gpr[reg::RSP], gpr[reg::RAX], gpr[reg::RBX]),
+        (0xff80, 0x1234_5600, 0x8000)
+    );
+}
+
+/// #671 M1-2: an executor worker thread owns a production carrier CPU, so a
+/// stopped soft CPU moves to another host thread and runs a block there.
+/// Red before `SoftCpuContext: Send`: the move does not compile.
+#[test]
+fn stopped_soft_cpu_moves_to_another_host_thread_and_runs() {
+    // mov eax, 39 (getpid); syscall
+    let (cpu, mem, code_va) = setup_snippet(&[0xb8, 39, 0, 0, 0, 0x0f, 0x05]);
+    let (cpu, exit) = std::thread::spawn(move || {
+        let (mut cpu, mut mem) = (cpu, mem);
+        let exit = cpu.step_block(&mut mem).unwrap();
+        (cpu, exit)
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        exit,
+        SoftCpuExit::Syscall {
+            rip: code_va + 5,
+            next_rip: code_va + 7,
+        }
+    );
+    assert_eq!(cpu.context().gpr[reg::RAX], LINUX_SYS_GETPID);
+}

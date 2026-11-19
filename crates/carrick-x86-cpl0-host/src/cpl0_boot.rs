@@ -10,13 +10,19 @@ use crate::carrier_memory::{
     PreparedBacking,
 };
 use crate::guest_ram::{GuestRam, WindowKind};
-use carrick_core_abi::X86_CPL0_INITIAL_EXTENT_GPA;
+use carrick_core_abi::{X86_CPL0_INITIAL_EXTENT_GPA, X86_CPL0_INITIAL_EXTENT_MAX_SIZE};
 use carrick_core_abi::{
     X86_CPL0_INITIAL_EXTENT_VA, X86_INITIAL_BOOT_HEADER_GPA, X86_INITIAL_BOOT_MAGIC,
     X86_INITIAL_BOOT_VERSION, X86InitialBootHeader,
 };
-use carrick_core_abi::{X86_INITIAL_BOOT_LOADED, X86InitialBootGrant, X86InitialBootRequest};
-use carrick_el1::memory::reservations::{LinuxReservationLayout, X86Cpl0Reservations, X86Cpl0Zone};
+use carrick_core_abi::{
+    X86_INITIAL_BOOT_LOADED, X86_INITIAL_BOOT_PORT, X86_INITIAL_MAX_REGIONS,
+    X86_INITIAL_MAX_STRINGS, X86_INITIAL_RUNNER_READY_PORT, X86InitialBootGrant,
+    X86InitialBootRegion, X86InitialBootRequest, X86InitialBootString,
+};
+use carrick_el1::memory::reservations::{
+    LinuxReservationLayout, NoRootWait, X86Cpl0Reservations, X86Cpl0RootReleaseVenue, X86Cpl0Zone,
+};
 use carrick_el1_abi::GuestMmuPublication;
 use carrick_el1_abi::{BlockedMask, Lifecycle};
 use carrick_el1_abi::{
@@ -28,16 +34,17 @@ use carrick_el1_abi::{ReservationMm, ReservationRange};
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGpa, UserVa};
 use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
-use carrick_hal::TrapError;
 use carrick_hal::{FrameCowAuthority, PhysicalFrameInventory};
 #[cfg(test)]
 use carrick_hal::{FrameEventCapacity, FrameInventoryEvent, MemPerms};
 use carrick_hal::{FrameId, FrameLength, MappingGeneration, MappingId};
+use carrick_hal::{TrapError, VcpuExit};
 #[cfg(test)]
 use carrick_kernel::kernel::{FrameInventoryAuthority, MmId, ObjectIdRegistry};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
 use carrick_mmu_core::x86::descriptor_txn::{
-    Access, BackingIdentity, DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, translate_leaf,
+    Access, BackingIdentity, DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, Permissions,
+    translate_leaf,
 };
 use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
 use carrick_sched_core::{SlotId, Waker};
@@ -1288,6 +1295,8 @@ pub mod anonymous_owner;
 
 #[path = "cpl0_exec.rs"]
 pub mod exec_service;
+
+pub mod retained_slots;
 
 #[derive(
     ::core::clone::Clone,
@@ -6052,4 +6061,1137 @@ pub fn prepare_boot(
         ipc_generation,
         kernel_pod_storage,
     })
+}
+
+/// Backend memory registered for a stopped carrier, before CPU creation.
+pub struct BootMemory<M: CarrierMemoryIo> {
+    pub memory: CarrierMemory<M>,
+    pub files: BootstrapFileRegion,
+    pub kernel_region: Option<BackingHandle>,
+    pub initial_extent: Option<(BackingHandle, usize)>,
+}
+
+/// Register `prepared` with a backend carrier VM: the retained bootstrap
+/// windows and IPC backings, the fixture copy windows, the kernel file region
+/// with its fault records, the initial extent and each CPU's file binding.
+/// Shared by every backend; only VM creation and slot registration differ.
+pub fn install_boot_memory<M: CarrierMemoryIo>(
+    vm: M,
+    frame_inventory: &dyn PhysicalFrameInventory,
+    prepared: &PreparedBoot,
+    interrupts: bool,
+    initial_extent_bytes: Option<usize>,
+) -> Result<BootMemory<M>, TrapError> {
+    let PreparedBoot {
+        ram,
+        fixture_copy,
+        table_capacity,
+        ipc_backings,
+        ipc_generation,
+        ..
+    } = prepared;
+    let (fixture_copy, table_capacity, ipc_generation) =
+        (*fixture_copy, *table_capacity, *ipc_generation);
+    let mut memory = CarrierMemory::new(vm).map_err(|e| fail(e.to_string()))?;
+    memory
+        .install_bootstrap(Arc::clone(ram))
+        .map_err(|e| fail(e.to_string()))?;
+    if !ipc_backings.is_empty() {
+        memory
+            .install(ipc_backings)
+            .map_err(|e| fail(e.to_string()))?;
+        let zone = ram
+            .host_ptr(
+                PRODUCTION_METADATA_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("IPC operation slot zone"))?;
+        // SAFETY: the production zone was initialized above and remains
+        // retained; no vCPU has been created or entered.
+        let zone = unsafe { &*zone.cast::<X86Cpl0Zone>() };
+        zone.bind_ipc_operation_slots(
+            ipc_generation.ok_or_else(|| fail("IPC slot generation missing"))?,
+            &carrick_sched_core::BoundedSpin(0),
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+        )
+        .map_err(|e| fail(format!("IPC slot binding: {e:?}")))?;
+    }
+    if fixture_copy {
+        let mut roots = vec![LAYOUT.pml4_base];
+        if interrupts {
+            roots.push(fixture_maps::SECOND_ROOT);
+        }
+        for base in roots {
+            let root = RootGpa::page_aligned(FrameGpa::new(base))
+                .ok_or_else(|| fail("fixture copy root alignment"))?;
+            let mut grants = [root; carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES];
+            for (index, grant) in grants.iter_mut().enumerate() {
+                let pa = base
+                    .checked_add(table_capacity as u64)
+                    .and_then(|pa| pa.checked_add(index as u64 * 4096))
+                    .ok_or_else(|| fail("fixture copy table grant overflow"))?;
+                *grant = RootGpa::page_aligned(FrameGpa::new(pa))
+                    .ok_or_else(|| fail("fixture copy table grant alignment"))?;
+            }
+            carrick_mmu_core::x86::copy_window::provision_cow_copy_window(
+                &memory.words(),
+                root,
+                grants,
+            )
+            .map_err(|reason| fail(format!("fixture private copy branch: {reason:?}")))?;
+        }
+    }
+    let identity = backing_identity(frame_inventory)?;
+    let extent = Arc::new(
+        BackingExtent::private(
+            FrameGpa::new(KERNEL_REGION_GPA),
+            carrick_el1_abi::EL1_REGION_SIZE as usize,
+        )
+        .map_err(|e| fail(e.to_string()))?,
+    );
+    let file_binding = carrick_el1_abi::FileRegionBinding::new(
+        carrick_el1_abi::FileRegionId::from_carrier(memory.identity().nonzero()),
+        carrick_guest_arch::KernelVa::new(X86_CPL0_REGION_BASE),
+        FrameGpa::new(KERNEL_REGION_GPA),
+        carrick_guest_arch::GuestLen::new(carrick_el1_abi::EL1_REGION_SIZE),
+    )
+    .map_err(|e| fail(format!("file region binding: {e:?}")))?;
+    // SAFETY: this fresh private extent covers the complete binding and
+    // has no guest, registration or table users yet. RetainedFileRegion
+    // keeps the same mapping alive through registration destruction.
+    let files = unsafe { BootstrapFileRegion::initialize(Arc::clone(&extent), file_binding) }?;
+    if !ipc_backings.is_empty() {
+        files.publish_ipc_window()?;
+    }
+    let handles = memory
+        .install(&[PreparedBacking { extent, identity }])
+        .map_err(|e| fail(e.to_string()))?;
+    let kernel_region = Some(handles[0]);
+    let initial_extent = if let Some(len) = initial_extent_bytes {
+        let identity = backing_identity(frame_inventory)?;
+        let extent = BackingExtent::private(FrameGpa::new(INITIAL_EXTENT_GPA), len)
+            .map_err(|e| fail(e.to_string()))?;
+        let handles = memory
+            .install(&[PreparedBacking {
+                extent: Arc::new(extent),
+                identity,
+            }])
+            .map_err(|e| fail(e.to_string()))?;
+        Some((handles[0], len))
+    } else {
+        None
+    };
+    memory
+        .initialize_fault_records(FrameGpa::new(KERNEL_REGION_GPA))
+        .map_err(|error| fail(error.to_string()))?;
+    for index in 0..2 {
+        let binding = ram
+            .host_ptr(
+                META_GPA + BINDING_OFFSET + index as u64 * STRIDE,
+                size_of::<CpuBinding>(),
+            )
+            .ok_or_else(|| fail("file CPU binding"))?
+            .cast::<CpuBinding>();
+        // SAFETY: initialized retained binding; vCPUs have not been created.
+        unsafe {
+            (*binding).file_region = file_binding;
+        }
+    }
+    Ok(BootMemory {
+        memory,
+        files,
+        kernel_region,
+        initial_extent,
+    })
+}
+
+/// Size one private retained aperture for the host-staged PT_LOAD bytes,
+/// the boot record, and guest-owned table/data grants. Capacity follows
+/// the submitted image rather than reserving a carrier-wide RAM pool.
+pub fn initial_extent_bytes_for(
+    image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+    argv: &[String],
+    env: &[String],
+) -> Result<usize, TrapError> {
+    const PAGE: usize = 4096;
+    const MAX_BYTES: usize = X86_CPL0_INITIAL_EXTENT_MAX_SIZE as usize;
+    let mut image_pages = 0usize;
+    let mut initialized = 0usize;
+    for region in &image.regions {
+        let pages = usize::try_from((region.end - region.start) / PAGE as u64)
+            .map_err(|_| fail("initial image page count"))?;
+        image_pages = image_pages
+            .checked_add(pages)
+            .ok_or_else(|| fail("initial image pages"))?;
+        initialized = initialized
+            .checked_add(region.file_bytes.len())
+            .ok_or_else(|| fail("initial image bytes"))?;
+    }
+    let strings = argv
+        .iter()
+        .chain(env)
+        .try_fold(0usize, |sum, value| sum.checked_add(value.len()))
+        .ok_or_else(|| fail("initial argv/env bytes"))?;
+    let user_pages = image_pages
+        .checked_add(initial_stack_pages(image, argv, env)?)
+        .ok_or_else(|| fail("initial user pages"))?;
+    let table_pages =
+        initial_table_grant_count(user_pages).ok_or_else(|| fail("initial table grant count"))?;
+    let grants = table_pages
+        .checked_add(user_pages)
+        .ok_or_else(|| fail("initial grant count"))?;
+    let string_count = argv
+        .len()
+        .checked_add(env.len())
+        .ok_or_else(|| fail("initial string count"))?;
+    let region_bytes = image
+        .regions
+        .len()
+        .checked_mul(size_of::<carrick_core_abi::X86InitialBootRegion>())
+        .ok_or_else(|| fail("initial region metadata"))?;
+    let string_bytes = string_count
+        .checked_mul(size_of::<carrick_core_abi::X86InitialBootString>())
+        .ok_or_else(|| fail("initial string metadata"))?;
+    let metadata = size_of::<carrick_core_abi::X86InitialBootRequest>()
+        .checked_add(region_bytes)
+        .and_then(|n| n.checked_add(string_bytes))
+        .and_then(|n| {
+            n.checked_add(grants.checked_mul(size_of::<carrick_core_abi::X86InitialBootGrant>())?)
+        })
+        .and_then(|n| {
+            n.checked_add(
+                user_pages.checked_mul(size_of::<carrick_el1_abi::GuestMmuPublication>())?,
+            )
+        })
+        .and_then(|n| n.checked_add(initialized))
+        .and_then(|n| n.checked_add(strings))
+        .and_then(|n| n.checked_add(PAGE * 8)) // bounded alignment and argv terminators
+        .ok_or_else(|| fail("initial request capacity"))?;
+    let metadata_pages = metadata
+        .checked_add(PAGE - 1)
+        .ok_or_else(|| fail("initial metadata alignment"))?
+        / PAGE;
+    let total_pages = metadata_pages
+        .checked_add(grants)
+        .ok_or_else(|| fail("initial extent pages"))?;
+    let bytes = total_pages
+        .checked_mul(PAGE)
+        .and_then(|bytes| bytes.checked_add(anonymous_owner::prepare_table_working_bytes()?))
+        .ok_or_else(|| fail("initial extent size"))?;
+    if bytes > MAX_BYTES {
+        return Err(fail("initial image exceeds carrier memory budget"));
+    }
+    Ok(bytes)
+}
+
+/// One stopped kernel entry on a carrier CPU: kernel CS/SS, the given GS
+/// base with `KERNEL_GS_BASE` zero, and `RFLAGS` = 2.
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+pub struct KernelEntry {
+    pub rip: u64,
+    pub rdi: u64,
+    pub rsp: u64,
+    pub gs_base: u64,
+}
+
+/// What a stopped CPL0 carrier backend supplies to the shared initial-MM
+/// admission ([`load_guest_mm`]): its custody, and its stopped CPUs' state,
+/// kernel entry and run-to-exit. KVM and the soft carrier implement it.
+pub trait Cpl0BootCarrier {
+    type Memory: CarrierMemoryIo;
+    fn custody(&self) -> &BootstrapCustody<Self::Memory>;
+    fn custody_mut(&mut self) -> &mut BootstrapCustody<Self::Memory>;
+    fn cpu_count(&self) -> usize;
+    fn cpu_gpr(&self, index: usize, reg: X86Reg) -> Result<u64, TrapError>;
+    fn enter_kernel(&mut self, index: usize, entry: KernelEntry) -> Result<(), TrapError>;
+    fn run_cpu(&mut self, index: usize) -> Result<VcpuExit, TrapError>;
+    fn append_debug_state(&self, index: usize, detail: &mut String);
+}
+
+/// The guest MM owner supplies the executable and stack publication here.
+/// This is the sole unbound seam between a stopped production carrier and
+/// EL0 admission; no fixture user page is used as an ELF loader.
+pub fn load_guest_mm<C: Cpl0BootCarrier>(
+    carrier: &mut C,
+    image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+    argv: &[String],
+    env: &[String],
+    limits: InitialReservationLimits,
+) -> Result<(), TrapError> {
+    let (_, extent_len) = carrier
+        .custody()
+        .initial_extent()
+        .ok_or_else(|| fail("initial extent absent"))?;
+    if image.regions.is_empty()
+        || image.regions.len() > X86_INITIAL_MAX_REGIONS
+        || argv.len() + env.len() > X86_INITIAL_MAX_STRINGS
+    {
+        return Err(fail("initial image request population"));
+    }
+    let mut staged = vec![0; size_of::<X86InitialBootRequest>()];
+    let regions_offset = staged.len();
+    staged.resize(
+        regions_offset + image.regions.len() * size_of::<X86InitialBootRegion>(),
+        0,
+    );
+    let strings_offset = staged.len();
+    staged.resize(
+        strings_offset + (argv.len() + env.len()) * size_of::<X86InitialBootString>(),
+        0,
+    );
+    let grants_offset = staged.len();
+    let image_pages: usize = image
+        .regions
+        .iter()
+        .map(|r| ((r.end - r.start) / 4096) as usize)
+        .sum();
+    let data_grants = image_pages
+        .checked_add(initial_stack_pages(image, argv, env)?)
+        .ok_or_else(|| fail("initial data grants"))?;
+    let table_grants =
+        initial_table_grant_count(data_grants).ok_or_else(|| fail("initial table grants"))?;
+    let grant_count = table_grants
+        .checked_add(data_grants)
+        .ok_or_else(|| fail("initial grants"))?;
+    staged.resize(
+        grants_offset + grant_count * size_of::<X86InitialBootGrant>(),
+        0,
+    );
+    let publications_offset = staged.len();
+    staged.resize(
+        publications_offset + data_grants * size_of::<carrick_el1_abi::GuestMmuPublication>(),
+        0,
+    );
+    let mut regions = Vec::with_capacity(image.regions.len());
+    for region in &image.regions {
+        let source_gpa = append_records(&mut staged, region.file_bytes)?;
+        regions.push(X86InitialBootRegion {
+            start: region.start,
+            len: region.end - region.start,
+            initialized_offset: region.initialized_offset,
+            source_gpa,
+            initialized_len: region.file_bytes.len() as u64,
+            permissions: u64::from(region.perms.read)
+                | (u64::from(region.perms.write) << 1)
+                | (u64::from(region.perms.execute) << 2),
+        });
+    }
+    let mut strings = Vec::with_capacity(argv.len() + env.len());
+    for value in argv.iter().chain(env) {
+        if value.as_bytes().contains(&0) {
+            return Err(fail("NUL in initial argv/env"));
+        }
+        let source_gpa = append_records(&mut staged, value.as_bytes())?;
+        strings.push(X86InitialBootString {
+            source_gpa,
+            len: value.len() as u64,
+        });
+    }
+    let frame_offset = staged
+        .len()
+        .checked_add(4095)
+        .ok_or_else(|| fail("initial frame alignment"))?
+        & !4095;
+    if frame_offset
+        .checked_add(grant_count * 4096)
+        .is_none_or(|end| end > extent_len)
+    {
+        return Err(fail("initial extent too small for frame grants"));
+    }
+    let occupied_end = frame_offset
+        .checked_add(grant_count * 4096)
+        .ok_or_else(|| fail("initial occupied physical extent"))?;
+    let prepare_span = anonymous_owner::prepare_table_suffix(extent_len, occupied_end)
+        .ok_or_else(|| fail("initial records/grants overlap Prepare working stock"))?;
+    let (mut inventory, grants) = InitialInventory::stage(
+        carrier.custody().rollback_fault(),
+        Arc::clone(carrier.custody().frame_inventory()),
+        (0..grant_count).map(|index| initial_grant_gpa(frame_offset, index)),
+        table_grants,
+        4096,
+        carrick_hal::GuestFrameOwner {
+            native_mm: MmGeneration::new(
+                NonZeroU64::new(carrier.custody().initial_mm_key())
+                    .ok_or_else(|| fail("initial inventory MM"))?,
+            ),
+            root_generation: ContextGeneration::new(NonZeroU64::MIN),
+        },
+    )?;
+    let outcome = (|| -> Result<(), TrapError> {
+        inventory
+            .publish()
+            .map_err(|error| fail(error.to_string()))?;
+        let (handle, _) = carrier
+            .custody()
+            .initial_extent()
+            .ok_or_else(|| fail("initial extent handle"))?;
+        carrier
+            .custody_mut()
+            .memory_mut()
+            .bind_frame_identities(handle, inventory.frames())
+            .map_err(|error| fail(error.to_string()))?;
+        // The guest editor's no-op invalidation is valid only while this
+        // unpublished root cannot be in any live vCPU TLB. Both vCPUs are
+        // stopped here; reject a reused root before the first descriptor edit.
+        for index in 0..carrier.cpu_count() {
+            if carrier.cpu_gpr(index, X86Reg::Cr3)?
+                == grants
+                    .first()
+                    .ok_or_else(|| fail("initial root grant absent"))?
+                    .gpa
+            {
+                return Err(fail("initial root already live in a vCPU"));
+            }
+        }
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|error| fail(format!("initial random: {error}")))?;
+        let request = X86InitialBootRequest {
+            magic: X86_INITIAL_BOOT_MAGIC,
+            version: X86_INITIAL_BOOT_VERSION,
+            layout_hash: carrick_el1_abi::EL1_ABI_LAYOUT_HASH,
+            region_count: image.regions.len() as u32,
+            executable_region_count: image.executable_region_count as u32,
+            executable_entry: image.executable_entry,
+            interpreter_base: image.interpreter_base,
+            reserved: 0,
+            entry: image.entry,
+            phdr: image.phdr,
+            phent: image.phent,
+            phnum: image.phnum,
+            argc: argv.len() as u16,
+            envc: env.len() as u16,
+            regions_gpa: INITIAL_EXTENT_GPA + regions_offset as u64,
+            strings_gpa: INITIAL_EXTENT_GPA + strings_offset as u64,
+            grants_gpa: INITIAL_EXTENT_GPA + grants_offset as u64,
+            table_grant_count: table_grants as u32,
+            data_grant_count: data_grants as u32,
+            publications_gpa: INITIAL_EXTENT_GPA + publications_offset as u64,
+            publication_capacity: data_grants as u32,
+            publication_count: 0,
+            stack_top: INITIAL_STACK_TOP,
+            stack_size: INITIAL_STACK_SIZE,
+            random,
+            result_root_gpa: 0,
+            result_rsp: 0,
+            result_status: carrick_core_abi::X86_INITIAL_BOOT_PENDING,
+            extent_pages: (extent_len / 4096) as u32,
+            mm_key: carrier.custody().initial_mm_key(),
+            generation: 1,
+            result_table_used: 0,
+            result_data_used: 0,
+            result_initial_break: 0,
+        };
+        staged[..size_of::<X86InitialBootRequest>()].copy_from_slice(record_bytes(&request));
+        staged[regions_offset..strings_offset].copy_from_slice(unsafe {
+            core::slice::from_raw_parts(
+                regions.as_ptr().cast::<u8>(),
+                regions.len() * size_of::<X86InitialBootRegion>(),
+            )
+        });
+        staged[strings_offset..grants_offset].copy_from_slice(unsafe {
+            core::slice::from_raw_parts(
+                strings.as_ptr().cast::<u8>(),
+                strings.len() * size_of::<X86InitialBootString>(),
+            )
+        });
+        staged[grants_offset..publications_offset].copy_from_slice(unsafe {
+            core::slice::from_raw_parts(
+                grants.as_ptr().cast::<u8>(),
+                grants.len() * size_of::<X86InitialBootGrant>(),
+            )
+        });
+        carrier
+            .custody_mut()
+            .memory_mut()
+            .write(FrameGpa::new(INITIAL_EXTENT_GPA), &staged)
+            .map_err(|error| fail(error.to_string()))?;
+        let header = carrier
+            .custody()
+            .ram()
+            .host_ptr(
+                X86_INITIAL_BOOT_HEADER_GPA,
+                size_of::<X86InitialBootHeader>(),
+            )
+            .ok_or_else(|| fail("production image boot header absent"))?;
+        // SAFETY: the fixed image header is retained but may not be aligned
+        // by the byte-oriented RAM window abstraction.
+        let header = unsafe { header.cast::<X86InitialBootHeader>().read_unaligned() };
+        if header.magic != X86_INITIAL_BOOT_MAGIC
+            || header.version != X86_INITIAL_BOOT_VERSION
+            || !(IMAGE_VA..IMAGE_VA + IMAGE_SIZE).contains(&header.entry_va)
+            || !(IMAGE_VA..IMAGE_VA + IMAGE_SIZE).contains(&header.peer_entry_va)
+        {
+            return Err(fail("production image boot header invalid"));
+        }
+        validate_layout_hash(header.layout_hash)?;
+        carrier
+            .custody_mut()
+            .set_peer_entry(carrick_guest_arch::KernelVa::new(header.peer_entry_va));
+        // SAFETY: prepare_boot initialized the retained slot-0 binding.
+        let kernel_stack =
+            unsafe { carrier.custody().metadata::<CpuBinding>(BINDING_OFFSET) }.kernel_stack;
+        carrier.enter_kernel(
+            0,
+            KernelEntry {
+                rip: header.entry_va,
+                rdi: X86_CPL0_INITIAL_EXTENT_VA,
+                rsp: kernel_stack,
+                gs_base: METADATA_VA + BINDING_OFFSET,
+            },
+        )?;
+        let exit = carrier.run_cpu(0)?;
+        if matches!(exit, VcpuExit::Kicked) {
+            return Err(fail("production initial MM cancelled"));
+        }
+        if !matches!(
+            exit,
+            VcpuExit::IoOut {
+                port: X86_INITIAL_BOOT_PORT,
+                ..
+            }
+        ) {
+            let mut detail = "unexpected production initial MM exit".to_owned();
+            carrier.append_debug_state(0, &mut detail);
+            return Err(fail(detail));
+        }
+        if carrier.cpu_gpr(0, X86Reg::Rax)? != X86_CPL0_INITIAL_EXTENT_VA {
+            return Err(fail("production initial MM request pointer"));
+        }
+        let reply = carrier
+            .custody()
+            .memory()
+            .read(
+                FrameGpa::new(INITIAL_EXTENT_GPA),
+                size_of::<X86InitialBootRequest>(),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        // SAFETY: this fixed-size copy is exactly one initialized ABI record.
+        let reply = unsafe {
+            reply
+                .as_ptr()
+                .cast::<X86InitialBootRequest>()
+                .read_unaligned()
+        };
+        if reply.result_status != X86_INITIAL_BOOT_LOADED {
+            return Err(fail(format!(
+                "production initial MM refused: status {}",
+                reply.result_status
+            )));
+        }
+        validate_initial_reply(
+            &request,
+            &reply,
+            grants.len(),
+            grants
+                .first()
+                .ok_or_else(|| fail("initial root grant absent"))?
+                .gpa,
+            image
+                .regions
+                .iter()
+                .take(image.executable_region_count)
+                .map(|region| region.end)
+                .max()
+                .unwrap_or(0),
+        )?;
+        let mm = NonZeroU64::new(reply.mm_key).ok_or_else(|| fail("initial MM key"))?;
+        let generation =
+            NonZeroU64::new(reply.generation).ok_or_else(|| fail("initial MM generation"))?;
+        let root = RootGpa::page_aligned(FrameGpa::new(reply.result_root_gpa))
+            .ok_or_else(|| fail("initial root alignment"))?;
+        let context = AddressContext {
+            root,
+            mm: MmGeneration::new(mm),
+            generation: ContextGeneration::new(generation),
+        };
+        let publication_bytes = carrier
+            .custody()
+            .memory()
+            .read(
+                FrameGpa::new(reply.publications_gpa),
+                reply.publication_count as usize * size_of::<GuestMmuPublication>(),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        let mut publications = Vec::with_capacity(reply.publication_count as usize);
+        for chunk in publication_bytes.chunks_exact(size_of::<GuestMmuPublication>()) {
+            // SAFETY: one complete fixed-layout guest ABI publication was
+            // copied from retained memory while this vCPU is stopped.
+            publications.push(unsafe {
+                chunk
+                    .as_ptr()
+                    .cast::<GuestMmuPublication>()
+                    .read_unaligned()
+            });
+        }
+        let linked_tables = publications.iter().try_fold(1usize, |count, publication| {
+            if publication.revision != GuestMmuPublication::REVISION
+                || publication.outcome != GuestMmuPublication::APPLIED
+                || publication.mm_key != mm.get()
+                || publication.root_gpa != root.address().raw()
+                || publication.generation != generation.get()
+                || publication.span_len != 4096
+            {
+                return None;
+            }
+            count.checked_add(publication.tables_linked as usize)
+        });
+        let linked_tables =
+            linked_tables.ok_or_else(|| fail("initial publication table receipt count"))?;
+        let copy_tables = carrick_mmu_core::x86::copy_window::cow_copy_table_frames(
+            &carrier.custody().memory().words(),
+            root,
+        )
+        .map_err(|_| fail("initial private copy branch"))?;
+        let total_tables = linked_tables
+            .checked_add(copy_tables.len())
+            .ok_or_else(|| fail("initial publication table receipt overflow"))?;
+        if total_tables != reply.result_table_used as usize {
+            return Err(fail("initial publication table receipt count"));
+        }
+        let copy_grants = grants
+            .get(linked_tables..total_tables)
+            .ok_or_else(|| fail("initial copy table grant range"))?;
+        if !copy_tables
+            .iter()
+            .zip(copy_grants)
+            .all(|(table, grant)| table.address().raw() == grant.gpa)
+        {
+            return Err(fail("initial copy table grant identity"));
+        }
+        carrier
+            .custody_mut()
+            .memory_mut()
+            .install_root(mm, context)
+            .map_err(|error| fail(error.to_string()))?;
+        // Descriptor transaction identity names only user mapping tables;
+        // the separately authenticated private branch is not a user edit.
+        let tables: Vec<RootGpa> = grants
+            .get(1..linked_tables)
+            .ok_or_else(|| fail("initial table grant range"))?
+            .iter()
+            .map(|grant| {
+                RootGpa::page_aligned(FrameGpa::new(grant.gpa))
+                    .ok_or_else(|| fail("initial table grant"))
+            })
+            .collect::<Result<_, _>>()?;
+        inventory.expect_publications(publications.len());
+        let mut used_tables = 0usize;
+        for (index, publication) in publications.into_iter().enumerate() {
+            let perms = if let Some(region) = image.regions.iter().find(|region| {
+                region.start <= publication.span_va && publication.span_va < region.end
+            }) {
+                Permissions {
+                    writable: region.perms.write,
+                    executable: region.perms.execute,
+                    user: true,
+                }
+            } else if publication.span_va
+                >= reply
+                    .stack_top
+                    .checked_sub(reply.stack_size)
+                    .ok_or_else(|| fail("initial stack bound"))?
+                && publication.span_va < reply.stack_top
+            {
+                Permissions {
+                    writable: true,
+                    executable: false,
+                    user: true,
+                }
+            } else {
+                return Err(fail("initial publication outside ELF and stack"));
+            };
+            let grant_index = table_grants
+                .checked_add(index)
+                .ok_or_else(|| fail("initial data grant index overflow"))?;
+            let grant = *grants
+                .get(grant_index)
+                .ok_or_else(|| fail("initial data grant absent"))?;
+            let output = FrameGpa::new(grant.gpa);
+            let identity = BackingIdentity {
+                frame_id: NonZeroU64::new(grant.frame_id)
+                    .ok_or_else(|| fail("initial frame identity"))?,
+                mapping_id: NonZeroU64::new(grant.mapping_id)
+                    .ok_or_else(|| fail("initial mapping identity"))?,
+                owner_generation: NonZeroU64::new(grant.owner_generation)
+                    .ok_or_else(|| fail("initial owner generation"))?,
+                inventory_revision: NonZeroU64::new(grant.inventory_revision)
+                    .ok_or_else(|| fail("initial inventory revision"))?,
+            };
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: mm,
+                    generation,
+                },
+                root,
+                // The unpublished builder owns private frames for both
+                // PT_LOAD segments and the initial anonymous stack. Keep
+                // the exact publication operation aligned with that owner.
+                op: DescriptorOp::Prepare {
+                    span: PageSpan::new(publication.span_va, 4096),
+                    output,
+                    permissions: perms,
+                    resident: PageSpan::new(publication.span_va, 4096),
+                    backing: identity,
+                },
+                // The guest grants only the tables linked by this page,
+                // not the unused stock for the rest of the image.
+                tables: tables
+                    .get(
+                        used_tables
+                            ..used_tables
+                                .checked_add(publication.tables_linked as usize)
+                                .ok_or_else(|| fail("initial table receipt overflow"))?,
+                    )
+                    .ok_or_else(|| fail("initial table receipt count"))?,
+            };
+            carrier
+                .custody_mut()
+                .memory_mut()
+                .publish(&txn, publication, &mut inventory)
+                .map_err(|error| fail(error.to_string()))?;
+            used_tables = used_tables
+                .checked_add(publication.tables_linked as usize)
+                .ok_or_else(|| fail("initial table receipt overflow"))?;
+        }
+        publish_production_reservations(
+            carrier.custody_mut(),
+            mm,
+            root,
+            reply.result_initial_break,
+            reply.stack_top,
+            image,
+            limits,
+        )?;
+        inventory.finish()?;
+        carrier.custody_mut().bind_grant_portal()?;
+        let unused = grants
+            .get(reply.result_table_used as usize..table_grants)
+            .ok_or_else(|| fail("initial unused table grants"))?
+            .iter()
+            .map(|grant| {
+                RootGpa::page_aligned(FrameGpa::new(grant.gpa))
+                    .ok_or_else(|| fail("initial unused table alignment"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        carrier.custody_mut().install_fork_stock(root, unused)?;
+        let stock_bytes = carrier
+            .custody()
+            .memory()
+            .read(prepare_span.start(), prepare_span.len().raw() as usize)
+            .map_err(|error| fail(error.to_string()))?;
+        carrier
+            .custody_mut()
+            .seed_prepare_tables(prepare_span, &stock_bytes)?;
+        match carrier.run_cpu(0)? {
+            VcpuExit::IoOut {
+                port: X86_INITIAL_RUNNER_READY_PORT,
+                ..
+            } if carrier.cpu_gpr(0, X86Reg::Rax)? == X86_CPL0_INITIAL_EXTENT_VA => {}
+            VcpuExit::Kicked => return Err(fail("initial runner cancelled")),
+            _ => return Err(fail("initial runner did not install its MM")),
+        }
+        if carrier.cpu_gpr(0, X86Reg::Cr3)? != root.address().raw() {
+            return Err(fail("initial runner installed a different MM"));
+        }
+        Ok(())
+    })();
+    let outcome = match outcome {
+        Err(error) if !inventory.guest_exposed() => match inventory.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(fail(format!(
+                "initial boot rollback: {rollback}; original: {error}"
+            ))),
+        },
+        result => result,
+    };
+    // Retain failed physical custody until the carrier retires; rollback
+    // refusal never consumes its receipt or publishes a ready guest.
+    carrier.custody_mut().retain_initial_inventory(inventory);
+    outcome
+}
+
+fn publish_production_reservations<M: CarrierMemoryIo>(
+    custody: &mut BootstrapCustody<M>,
+    mm_key: NonZeroU64,
+    root: RootGpa,
+    initial_break: u64,
+    stack_top: u64,
+    image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+    limits: InitialReservationLimits,
+) -> Result<(), TrapError> {
+    let layout =
+        initial_reservation_layout(UserVa::new(initial_break), UserVa::new(stack_top), limits)?;
+    let table = custody
+        .ram()
+        .host_ptr(
+            META_GPA + carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET,
+            size_of::<X86Cpl0Reservations>(),
+        )
+        .ok_or_else(|| fail("production reservation backing"))?
+        .cast::<X86Cpl0Reservations>();
+    let zone = custody
+        .ram()
+        .host_ptr(
+            META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+            size_of::<X86Cpl0Zone>(),
+        )
+        .ok_or_else(|| fail("production zone backing"))?
+        .cast::<X86Cpl0Zone>();
+    // SAFETY: both pointers belong to one retained, zeroed and aligned
+    // carrier metadata window. The stopped vCPU cannot race publication.
+    let (table, zone) = unsafe { (&*table, &*zone) };
+    let mm = ReservationMm::new(mm_key.get()).ok_or_else(|| fail("reservation MM key"))?;
+    let index = zone
+        .spaces
+        .publish_closed(mm.raw(), root.address().raw(), 0)
+        .ok_or_else(|| fail("production space publication"))?;
+    table
+        .publish(index.index(), mm, layout)
+        .map_err(|error| fail(format!("production reservation publication: {error:?}")))?;
+    let wake_error = std::cell::RefCell::new(None);
+    let deliver = |zone: &X86Cpl0Zone,
+                   waker: Waker,
+                   owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+        '_,
+        carrick_sched_core::ParkedContextWords,
+    >| {
+        if let Err(error) = unexpected_boot_wake(zone, waker, owned) {
+            *wake_error.borrow_mut() = Some(error);
+        }
+    };
+    let release = SpaceReleaseVenue {
+        zone,
+        waker: Waker::Host,
+        deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(&deliver),
+    };
+    X86Cpl0RootReleaseVenue::new(table, release)
+        .map_err(|error| fail(format!("production root authority: {error:?}")))?
+        .lock(index.index(), mm, &NoRootWait)
+        .and_then(|mut model| {
+            import_x86_image_rows(&mut model, image, stack_top)?;
+            model.finish_import()?;
+            model.insert_opaque(
+                ReservationRange::new(stack_top - INITIAL_STACK_SIZE, stack_top)
+                    .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
+                carrick_el1_abi::ReservationProtection::READ_WRITE,
+                carrick_el1_abi::ReservationNodeFlags::PRIVATE
+                    .union(carrick_el1_abi::ReservationNodeFlags::GROWSDOWN),
+            )
+        })
+        .map_err(|error| fail(format!("production root admission: {error:?}")))?;
+    SpaceAccess::notified(release).open(index);
+    if let Some(error) = wake_error.into_inner() {
+        return Err(error);
+    }
+    let slot = SlotId::new(0);
+    zone.drive_and_publish(
+        slot,
+        1,
+        mm.raw(),
+        Some(0),
+        carrick_sched_core::AffinitySource::UNBOUND,
+    );
+    zone.enter_guest(slot);
+    zone.install_space(slot, mm.raw())
+        .ok_or_else(|| fail("production installed MM"))?;
+    let task = custody.initial_task();
+    let tid = task.map_or(41, |root| root.thread.tid);
+    let serial = task.map_or(101, |root| root.thread.serial);
+    let generation = task.map_or(11, |root| root.thread.generation);
+    let file_table = task.map_or(5, |root| root.thread.file_table);
+    let affinity = task.map_or(3, |root| {
+        if root.thread.affinity == 0 {
+            3
+        } else {
+            root.thread.affinity
+        }
+    });
+    let birth_serial = task
+        .map(|root| root.task.serial)
+        .or_else(|| carrick_sched_core::process::TaskSerial::from_raw_u64(11))
+        .ok_or_else(|| fail("production root birth serial"))?;
+    custody.bind_execution(
+        0,
+        birth_serial,
+        carrick_el1_abi::ExecutionBinding {
+            task: carrick_el1_abi::EntryTaskKey::from_raw(tid),
+            generation: carrick_el1_abi::SnapshotGeneration::from_raw(generation),
+            mm: carrick_el1_abi::EntryMmKey::from_raw(mm.raw()),
+            thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(serial),
+        },
+        file_table,
+    )?;
+    custody.stopped_task(0).publish_visible_pid(tid as u32);
+    zone.current_or_new(
+        slot,
+        carrick_sched_core::ThreadIdentity {
+            tid,
+            serial,
+            mm: mm.raw(),
+            file_table,
+            generation,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity,
+            lifecycle_page: METADATA_VA,
+            control_slot: METADATA_VA + CONTROL_OFFSET,
+        },
+    )
+    .map_err(|_| fail("production scheduler record exhausted"))?;
+    Ok(())
+}
+
+pub fn unexpected_boot_wake(
+    _: &X86Cpl0Zone,
+    _: Waker,
+    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+        '_,
+        carrick_sched_core::ParkedContextWords,
+    >,
+) -> Result<(), TrapError> {
+    let mut handed = false;
+    let (_, effects) = owned.deliver_handbacks(&mut |_| handed = true);
+    if handed || effects != carrick_sched_core::WakeEffects::default() {
+        return Err(fail(
+            "boot-only publication unexpectedly released a live guest waiter",
+        ));
+    }
+    Ok(())
+}
+
+/// The backend operations one production CPU's run admission needs: the
+/// stopped privilege level and interruptibility, a KICK queued to the CPU's
+/// own APIC before reentry, and one guest run.
+pub trait ProductionMemberCpu {
+    /// The stopped CPU's current privilege level (CS.DPL).
+    fn stopped_cpl(&self) -> Result<u8, TrapError>;
+    /// Stopped at CPL3 with interrupts enabled and no interrupt shadow or
+    /// injected event pending.
+    fn stopped_at_interruptible_user(&self) -> Result<bool, TrapError>;
+    /// Queue `KICK_VECTOR` to this CPU's own local APIC, durable across the
+    /// reentry that follows.
+    fn queue_reentry_kick(&mut self) -> Result<(), TrapError>;
+    fn run_guest(&mut self) -> Result<VcpuExit, TrapError>;
+}
+
+/// Run one production CPU under the shared file-execution admission and the
+/// shootdown table's running/ack protocol. A CPU entering with shootdown
+/// debt is kicked so the ring settles that debt before user code resumes.
+pub fn run_production_member<C: ProductionMemberCpu>(
+    cpu: &mut C,
+    table: &ShootdownTable,
+    slot: usize,
+    actual_run: Option<&AtomicU32>,
+    execution: &RwLock<()>,
+) -> Result<VcpuExit, TrapError> {
+    let _running = execution.try_read().map_err(|error| match error {
+        std::sync::TryLockError::WouldBlock => TrapError::ExecutionAdmissionBusy,
+        std::sync::TryLockError::Poisoned(_) => TrapError::ExecutionAdmissionPoisoned,
+    })?;
+    let member = table
+        .members
+        .get(slot)
+        .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+    struct RunningAdmission<'a>(&'a AtomicU32);
+    impl Drop for RunningAdmission<'_> {
+        fn drop(&mut self) {
+            self.0.store(0, Ordering::Release);
+        }
+    }
+    // A sender that observes this release either targets the live vCPU or
+    // races this pre-run scan, which queues its durable MSI before KVM_RUN.
+    member.running.store(1, Ordering::Release);
+    let running_admission = RunningAdmission(&member.running);
+    let cpl = cpu.stopped_cpl()?;
+    let has_debt = table.requests.iter().any(|request| {
+        request.generation.load(Ordering::Acquire) > request.served[slot].load(Ordering::Acquire)
+    });
+    if has_debt {
+        if cpl == 3 && !cpu.stopped_at_interruptible_user()? {
+            return Err(fail("shootdown debt requires interruptible CPL3 reentry"));
+        } else if cpl != 0 && cpl != 3 {
+            return Err(fail("shootdown debt on unsupported CPL reentry"));
+        }
+        cpu.queue_reentry_kick()?;
+    }
+    let actual_guard = actual_run.map(|flag| {
+        flag.store(1, Ordering::Release);
+        RunningAdmission(flag)
+    });
+    let result = cpu.run_guest()?;
+    drop(actual_guard);
+    drop(running_admission);
+    if cpu.stopped_at_interruptible_user()? {
+        // The host may release a sender after this vCPU has stopped, but
+        // leaves `served` behind until native KICK settles debt on reentry.
+        for request in &table.requests {
+            let generation = request.generation.load(Ordering::Acquire);
+            if generation != 0 {
+                request.ack[slot].store(generation, Ordering::Release);
+            }
+        }
+    }
+    Ok(result)
+}
+
+impl<M: CarrierMemoryIo> BootstrapCustody<M> {
+    /// Replace the bootstrap's provisional identity with the exact root
+    /// issued by the shared kernel, before the initial MM is admitted.
+    pub fn bind_initial_task_identity(
+        &mut self,
+        identity: InitialTaskBinding,
+    ) -> Result<(), TrapError> {
+        if self.initial_task().is_some()
+            || self.has_initial_inventory()
+            || self
+                .actual_run()
+                .iter()
+                .any(|flag| flag.load(Ordering::Acquire) != 0)
+            || identity.thread.tid != identity.task.id.raw() as u64
+            || identity.thread.serial == 0
+            || identity.thread.file_table == 0
+            || identity.thread.generation == 0
+            || identity.thread.mm != 0
+            || identity.thread.lifecycle_page != 0
+            || identity.thread.control_slot != 0
+        {
+            return Err(fail("initial task binding requires stopped root admission"));
+        }
+        let tid = u32::try_from(identity.thread.tid)
+            .map_err(|_| fail("initial task TID outside guest ABI"))?;
+        let birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::EntryTaskKey::from_raw(identity.thread.tid),
+            carrick_core_abi::BirthSerial::of_task(identity.task.serial),
+            carrick_core_abi::EntryThreadGeneration::from_raw(identity.thread.serial),
+        )
+        .ok_or_else(|| fail("initial root birth identity"))?;
+        let control = self.stopped_slot(0);
+        control
+            .reset_for_host_birth(BlockedMask(0))
+            .map_err(|_| fail("control slot still owned by graph"))?;
+        if !control.publish_visible_tid(tid) {
+            return Err(fail("initial root control slot identity"));
+        }
+        control.publish_host_birth_identity(birth);
+        let task = self.stopped_task(0);
+        task.set(
+            El1TaskId::from_linux_tid(identity.task.id.raw()),
+            carrick_el1_abi::SnapshotGeneration::from_raw(identity.thread.generation),
+            identity.thread.file_table,
+        );
+        task.mm
+            .thread_generation
+            .store(identity.thread.serial, Ordering::Release);
+        task.publish_visible_pid(tid);
+        self.set_initial_task(identity);
+        Ok(())
+    }
+    pub fn initial_mm_key(&self) -> u64 {
+        self.initial_task()
+            .map_or(INITIAL_MM_KEY, |identity| identity.mm.raw().get())
+    }
+    /// The issued root task's state for the executor hand-off: its binding
+    /// (carrier, task serial, execution generation, initial MM context) over
+    /// `image`, the stopped root CPU, with the resume payload marked.
+    pub fn worker_root_state(
+        &self,
+        image: &carrick_x86::X86VcpuSnapshot,
+    ) -> Result<carrick_x86::arch_context::X86ArchContext, TrapError> {
+        let root = self
+            .initial_task()
+            .ok_or_else(|| fail("worker handoff has no issued root task"))?;
+        let mm = NonZeroU64::new(self.initial_mm_key()).ok_or_else(|| fail("initial MM key"))?;
+        let context = self
+            .memory()
+            .root(mm)
+            .ok_or_else(|| fail("worker handoff has no initial MM"))?;
+        let binding = carrick_hal::guest_arch_binding::GuestArchBinding::x86(
+            carrick_guest_arch::TaskIdentity {
+                carrier: carrick_guest_arch::CarrierGeneration::new(
+                    self.memory().identity().nonzero(),
+                ),
+                task: carrick_guest_arch::TaskSerial::new(
+                    NonZeroU64::new(root.task.serial.raw())
+                        .ok_or_else(|| fail("worker root task serial"))?,
+                ),
+                execution: carrick_guest_arch::ExecutionGeneration::new(
+                    NonZeroU64::new(root.thread.generation)
+                        .ok_or_else(|| fail("worker root execution generation"))?,
+                ),
+            },
+            context,
+        );
+        let mut resume = [0; carrick_hal::threaded::X86_TASK_RESUME_PAYLOAD_LEN];
+        resume[56..64].copy_from_slice(&carrick_hal::threaded::X86_TASK_RESUME_MAGIC.to_le_bytes());
+        carrick_x86::arch_context::X86ArchContext::capture(binding, image, resume)
+    }
+    fn stopped_task(&self, index: usize) -> &CurrentTask {
+        // SAFETY: the stopped bootstrap owns initialized metadata at these offsets.
+        unsafe { self.metadata(TASK_OFFSET + index as u64 * STRIDE) }
+    }
+    fn stopped_slot(&self, index: usize) -> &ThreadControlSlot {
+        // SAFETY: the stopped bootstrap owns initialized metadata at these offsets.
+        unsafe { self.metadata(CONTROL_OFFSET + index as u64 * STRIDE) }
+    }
+    /// Qualify separate exact task/MM owners, even with reused visible IDs.
+    /// All vCPUs are stopped under this exclusively borrowed fixture carrier.
+    pub fn bind_execution(
+        &mut self,
+        index: usize,
+        birth_serial: carrick_sched_core::process::TaskSerial,
+        binding: carrick_el1_abi::ExecutionBinding,
+        file_table: u64,
+    ) -> Result<(), TrapError> {
+        if index >= 2
+            || !binding.issued()
+            || binding.mm.raw() == 0
+            || binding.thread_generation.raw() == 0
+            || file_table == 0
+        {
+            return Err(fail("invalid CPL0 fixture execution binding"));
+        }
+        if index == 0
+            && let Some(root) = self.initial_task()
+            && (birth_serial != root.task.serial
+                || root.thread.tid != binding.task.raw()
+                || root.thread.serial != binding.thread_generation.raw())
+        {
+            return Err(fail(
+                "initial root execution binding mismatches retained birth",
+            ));
+        }
+        let tid = i32::try_from(binding.task.raw()).map_err(|_| fail("fixture task range"))?;
+        let birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            binding.task,
+            carrick_core_abi::BirthSerial::of_task(birth_serial),
+            binding.thread_generation,
+        )
+        .ok_or_else(|| fail("fixture birth identity"))?;
+        let page_offset = index as u64 * 0x4000;
+        let slot_offset = CONTROL_OFFSET + index as u64 * STRIDE;
+        // SAFETY: exclusively stopped fixture vCPUs, initialized retained and
+        // aligned metadata. Neither page/control reference escapes the owner;
+        // each task's fresh page and control slot occupy disjoint metadata.
+        unsafe {
+            *self.metadata_mut(page_offset) = ThreadLifecyclePage::new();
+            *self.metadata_mut(slot_offset) = ThreadControlSlot::new();
+        }
+        if !self.stopped_slot(index).publish_visible_tid(tid as u32) {
+            return Err(fail("fixture visible task publication"));
+        }
+        self.stopped_slot(index).publish_host_birth_identity(birth);
+        let task = self.stopped_task(index);
+        task.set(
+            El1TaskId::from_linux_tid(tid),
+            binding.generation,
+            file_table,
+        );
+        task.mm.key.store(binding.mm.raw(), Ordering::Release);
+        task.mm
+            .thread_generation
+            .store(binding.thread_generation.raw(), Ordering::Release);
+        task.publish_lifecycle(METADATA_VA + page_offset, METADATA_VA + slot_offset);
+        Ok(())
+    }
 }

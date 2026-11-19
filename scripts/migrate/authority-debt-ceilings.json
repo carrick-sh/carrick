@@ -137,6 +137,34 @@
     {
       "family": "build_time",
       "operation": "global:env_var",
+      "owner": "carrick_vmm_soft::build_program::main::CARGO_CFG_TARGET_ARCH",
+      "lane": "build_time",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "global:env_var",
+      "owner": "carrick_vmm_soft::build_program::main::CARGO_CFG_TARGET_OS",
+      "lane": "build_time",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "global:env_var",
+      "owner": "carrick_vmm_soft::build_program::main::CARGO_MANIFEST_DIR",
+      "lane": "build_time",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "global:env_var",
+      "owner": "carrick_vmm_soft::build_program::main::OUT_DIR",
+      "lane": "build_time",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "global:env_var",
       "owner": "carrick_x86_cpl0::build_program::main::CARGO_MANIFEST_DIR",
       "lane": "build_time",
       "ceiling": 1
@@ -171,6 +199,13 @@
     },
     {
       "family": "build_time",
+      "operation": "global:env_var_os",
+      "owner": "carrick_vmm_soft::build_program::main::CARGO",
+      "lane": "build_time",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
       "operation": "std::fs::copy",
       "owner": "carrick_vmm_kvm::build_program::main",
       "lane": "linux_cli",
@@ -181,6 +216,48 @@
       "operation": "std::fs::copy",
       "owner": "carrick_vmm_kvm::build_program::main",
       "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::copy",
+      "owner": "carrick_vmm_soft::build_program::main",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::copy",
+      "owner": "carrick_vmm_soft::build_program::main",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::copy",
+      "owner": "carrick_vmm_soft::build_program::main",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::copy",
+      "owner": "carrick_vmm_soft::build_program::main",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::copy",
+      "owner": "carrick_vmm_soft::build_program::main",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::copy",
+      "owner": "carrick_vmm_soft::build_program::main",
+      "lane": "netbsd_runtime",
       "ceiling": 1
     },
     {

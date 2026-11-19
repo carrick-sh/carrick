@@ -6,3 +6,10 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-mmu-core = { path = "../carrick-mmu-core" }
+
+[dev-dependencies]
+carrick-mem = { path = "../carrick-mem" }

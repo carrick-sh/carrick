@@ -176,3 +176,293 @@ KVM operations. A generic boot provider remains a later extraction, requiring
 its own production caller and evidence; it does not reuse the running snapshot
 protocol. No behavior change, soft-machine work or execution selection is part
 of this slice. Signed HVF and final queue acceptance remain director-owned.
+
+
+### M1-1 status: shared memory installation and initial-MM admission
+
+The neutral boot after `prepare_boot` is now one implementation used by
+both backends. `install_boot_memory`, generic over `CarrierMemoryIo`,
+holds the memory-registration block that `boot_bytes_inner` used to run
+inline: bootstrap windows, IPC backings and slot binding, fixture copy
+windows, kernel file region, fault records, initial extent and CPU file
+bindings. Only VM creation stays in KVM.
+
+The initial-MM admission (`load_guest_mm`,
+`publish_production_reservations`) is generic over `Cpl0BootCarrier`.
+This is the boot-only provider the R4 status anticipated, and it has two
+production callers. It carries only what the admission needs from a
+backend: custody, CPU count, a stopped register read, one `KernelEntry`
+and run-to-exit. KVM implements it with its original sregs/MSR/regs
+ioctl sequence and production run context. The running snapshot protocol
+(`CarrierCpuBackend`) is untouched.
+
+`bind_initial_task_identity`, `bind_execution` and `initial_mm_key` now
+live on `BootstrapCustody`, and `initial_extent_bytes_for` and
+`unexpected_boot_wake` are shared functions. KVM's methods delegate to
+them.
+
+The soft carrier (`carrick-vmm-soft`) implements `CarrierMemoryIo` as
+`SoftVm`, a slot table. Its `SoftMmuMemory` places each registered slot
+as one linear segment (`LinearPlacement::with_segments`). The soft CPU
+therefore translates through the allocations `CarrierMemory` owns; no
+bytes are copied. `SoftCarrier` implements `Cpl0BootCarrier` over one
+`SoftMachine` and authenticates the admitted initial root for soft walks
+before each run.
+
+The probe follows the KVM witnesses' `boot_program_carrier` sequence:
+kernel-issued root, birth source, IPC table map, then
+`bind_initial_task_identity` and `load_guest_mm`. It boots the production
+ring past initial-MM admission. The root runs its `exit_group(7)` syscall
+to the first serviced carrier exit, `WORK_PORT` in `carrick_x86_enter`.
+
+Still concrete per backend: stopped-CPU creation and programming
+(`BootCpuState` is shared; the setters are not), TSC and APIC identity
+publication, MP-state admission, and the peer CPU's start. The soft
+carrier is single-vCPU (#2397), refuses MSI, and does not refresh its
+placement when slots change at run time. Those, the executor
+(`CarrierCpuBackend` over `SoftMachine`) and runtime selection are the
+next slices.
+
+
+### M1-2 status: the soft carrier CPU behind `CarrierCpuBackend`
+
+The production ring now runs a static hello to its exit on soft CPUs.
+`SoftCpuBackend` implements `CarrierCpuBackend` over one `SoftMachine`,
+and the shared custody claims it as `CarrierCpuIo`. Images go through the
+shared `X86Vcpu` snapshot, with a full x87/SSE/AVX XSAVE area. Its runs
+enter through `run_production_member`. That function moved from KVM's
+`run_member` into the shared host, over a small `ProductionMemberCpu`
+trait. It owns the file-execution lease, the shootdown table's
+running/ack protocol and the reentry KICK. A soft kick is a flag checked
+between blocks. A soft `OUT` has already advanced RIP, so pending I/O
+completion has nothing to do. `SoftCpuContext` is `Send`, so executor
+worker threads can own it. Its two raw pointers are per-block borrows that
+`execute`'s guard clears.
+
+`SoftCarrier::into_worker_parts` builds the shared `ProductionWorkerParts`.
+The issued root's state comes from `BootstrapCustody::worker_root_state`,
+which also moved out of KVM. The second physical CPU is a stopped soft CPU
+in slot 1's boot state. M1 is single-vCPU (#2397), so it is never started.
+
+`tests/soft_hello.rs` drives the root lease of the shared
+`ProductionCpuFactory`, as the KVM stopped-worker witnesses in
+`cpl0_initial_mm.rs` do. The run takes four steps:
+
+- initial-MM admission, then the root load;
+- the forwarded `write`, dispatched by the kernel dispatcher;
+- `WORK_PORT`;
+- the exit doorbell.
+
+The guest exits 0 with stdout `hello\n`.
+
+Rust std's startup on the bhyve musl hello fixture polls fds 0-2 through
+`HostReadinessCrossing`. M1-2 found that only the runtime executor's
+host-readiness service answered it (`carrick-runtime`,
+`vcpu_loop/executor/cpl0.rs`), so the soft driver refused it and std
+aborted.
+
+### M1-3 status: review fixes and the shared readiness service
+
+The independent review's findings on #2518 are fixed, each red first:
+
+- **Memory custody.** The soft memory view (`SoftCarrierMemory`) now owns
+  an `Arc` of every backing it places (`SoftBackings`: the bootstrap
+  windows' `GuestRam` and each registered `BackingExtent`). Its
+  constructor is crate-private and `unsafe`, and it refuses a
+  registration the backings do not retain. A soft CPU no longer depends
+  on a carrier's custody for liveness. The witness swaps two carriers'
+  custodies and drops one; before the fix it died with `SIGSEGV`.
+- **JIT high-byte forms.** The high-byte stand-in is chosen after the
+  memory operand is rebased on R14. A virtualized RSP beside a high-byte
+  register is hosted in a legacy register.
+- **Probe rows** each assert their own expected exit.
+- **Setter state.** `SoftBootVcpu` refreshes the TLB mode tag on RFLAGS,
+  recomputes `EFER.LMA` on CR0, and installs the FS/GS descriptor base.
+
+The neutral part of the readiness service moved, as new code, into
+`carrick-x86-cpl0-host::host_readiness`:
+
+- the crossing decode;
+- the host-owned stdio descriptor table;
+- the one-shot host `poll` sample over the task's supervisor batch;
+- the remaining-wait decision.
+
+Parking a waiting task stays with the executor. The soft hello driver
+answers the crossing through it. The runtime executor's delegation to the
+module is a `carrick-runtime` hunk for the director.
+
+The musl hello now boots to: the readiness crossing answered with 0, then
+two `OWNER_GRANT_PORT` (`0xd1`) doorbells. It fails at a fault loop in the
+ring (`dispatch_classified_fault` -> `FaultSupply::editor` ->
+`descriptor_txn::Planner::edit`, once per ~512 soft blocks). The owner
+grants install carrier slots after boot. The soft memory view
+authenticates and places only the slots it saw at boot, so every touch of
+a granted frame faults again. Admitting run-time slots needs the view to
+retain their backings. That means a read of the `CarrierMemory` slot
+backings, which `carrier_memory.rs` does not expose today.
+
+Still open:
+
+- the soft peer CPU's start and the APIC cluster;
+- MSI;
+- placement and extent refresh, with retained backings, when slots
+  change at run time (the musl hello's frontier);
+- soft-walk admission of roots other than the CPU's current CR3;
+- runtime selection (`--vcpu soft`).
+
+### M1-4 status: one build recipe, and the run-time slot refresh design
+
+**Build recipe.** The nested `cargo build -p carrick-x86-cpl0` recipe
+moved out of `carrick-vmm-kvm/build.rs` into `carrick-vmm-kvm/cpl0_build.rs`,
+beside `cpl0_inputs.rs`. Both build scripts `#[path]`-include it and call
+`build_images`. The only parameter is whether `CARRICK_X86_CPL0_TEST_IMAGE`
+is published (KVM yes, soft no). Each build script still reads its own
+cargo environment and passes `std::fs::copy` in. The authority-debt census
+refuses an authority site in a file two build programs compile ("ambiguous
+compilation-target owner"), so the shared file holds none. The same rule
+already refuses `cpl0_inputs.rs`'s `std::fs` sites under `--base` (see the
+PR evidence).
+
+**Run-time slots (the musl hello frontier).** Owner grants
+(`service_anonymous_grant`, via `CarrierMemory::prepare` -> `install`) add
+carrier slots while the CPU is stopped at `OWNER_GRANT_PORT`. `SoftVm`
+records each registration, but `SoftCarrierMemory` placed and
+authenticated only the slots it saw at construction. The refresh reuses
+existing mechanisms and adds none:
+
+1. **Retained backings.** The view may place only memory it retains
+   (`SoftBackings::retains`, the M1-3 custody fix). A granted slot's
+   `Arc<BackingExtent>` lives only in `CarrierMemory`'s private `Slot`
+   table. The additive read-only accessor
+   `CarrierMemory::retained_backings() -> impl Iterator<Item = &Arc<BackingExtent>>`
+   must yield `slot.backing.extent` for every installed slot, bootstrap
+   windows included (their extents retain the `GuestRam`). It must not
+   expose `Slot`, handles or identities. This needs the director's ruling on
+   `carrier_memory.rs`.
+2. **Who feeds it.** The view's `SoftBackings` becomes a shared handle
+   (`Arc<Mutex<..>>`) held by every soft view of the carrier (slot 0 and
+   the peer). After any crossing the custody serves under `with_stopped_io`
+   (owner grant, fork stock, child retire), the soft driver (the
+   `soft_hello` driver now, the runtime's soft executor later) copies the
+   accessor's `Arc`s into that handle. Missing that step fails closed: the
+   refresh refuses an unretained registration rather than placing it.
+3. **Refresh point.** `SoftCpuBackend::run_guest` already calls
+   `admit_current_root` before each run. It first calls a new
+   `SoftCarrierMemory::refresh(&SoftVm)`, which compares the view's placed
+   `CarrierMemoryRegion`s with `SoftVm`'s, keyed by slot. For each new
+   region it checks `retains`, rebuilds the `LinearPlacement` from the full
+   segment list (`LinearPlacement::with_segments`; `SoftVm`'s slot limit is
+   `MAX_PLACEMENT_SEGMENTS`, so it never overflows), and authenticates the
+   extent with `ExtentTable::install(ExtentRecord::new(.., BOOT_GENERATION))`.
+   That is the walker's existing extent authentication, as at boot. A
+   removed or changed slot fails closed for now. Its retirement path is
+   `ExtentTable::remove` with a `SoftRequester` and the seat's
+   `PendingRetirement`/`reclaim`, and that is a later slice (fork-child
+   retirement needs it).
+4. **Flush.** After a refresh that changed anything, the backend calls
+   `SoftCpu::flush_tlb` (the `mov cr3`-style local flush). Old segments keep
+   their host addresses, so cached translations stay valid. The flush is
+   there because the placement object itself was replaced. Additions need no
+   code-page work: `ExtentTable` marks code pages per frame, and no frame of
+   a new extent can have a translated block. Removals clear their span's
+   code pages inside `ExtentTable::remove`.
+
+`soft_hello.rs::production_ring_runs_musl_hello_to_exit_on_soft_cpu`
+(now `#[ignore]`d) becomes the red-first
+witness on the production run path: today it fails at the fault loop, and
+it must pass once the accessor lands. No soft-side code lands before the
+ruling, because a refresh with no production caller would be an unused
+second path.
+
+### M1-5 status: owner-granted slots reach the software MMU
+
+The stopped host service publishes the current slot snapshot under the
+existing custody lock. Each published registration matches the retained
+allocation's GPA, length and host base. Each soft CPU view holds its own
+reference to the snapshot, so subsequent unregisters or custody changes
+cannot free memory the view still addresses. A registration invalidates
+the publication until custody supplies its backing.
+
+Before entering the guest, the soft backend keeps the same walker
+inventory and adds an extent only for each newly installed slot. A new
+snapshot rebuilds placement only when slots were added. The subsequent
+local TLB flush includes instruction fetch. Cached blocks re-authenticate
+their code frames and generations on their next entry. A removed or
+replaced slot still stops the soft carrier pending integration with
+`ExtentTable::remove` and its retirement protocol.
+
+The fixture-independent anonymous-page test exhausted the unchanged
+4,000,000-block budget after two owner grants before the refresh. It now
+prints `hello\n` and exits 0. The separately built musl hello completes
+its startup poll, takes four owner grants, prints
+`hello, x86_64 world\n` and exits 0 through the production soft ring.
+
+### M1-6 status: fork and raw thread exit
+
+The musl hello stays opt-in. Its source and lockfile are in-tree and the
+standalone fixture builds offline with an installed musl Rust target. The
+shared CPL0 build recipe invokes Cargo for the freestanding image and its
+test-support sibling. Embedding the musl user ELF would add a separate build
+invocation and artifact copy to that recipe or the soft build script. That
+build authority is outside this round's scope.
+
+Two existing static assembly fixtures exercise the production soft ring.
+The fork fixture makes the parent wait for its child, which writes `E` and
+exits before the parent reaps it and exits 7. The `TWO_LIVE` fixture holds a
+sibling live while another worker performs raw `exit`, joins both via their
+clear-child-tid words, and exits 0. Direct Linux execution produced both
+expected results. These are diagnostic fixtures for the existing
+`kernel.el1.fork-cow` and `kernel.el1.thread-lifecycle` surfaces.
+
+From the repository root, build and run the raw-exit diagnostic:
+
+```sh
+mkdir -p target/soft-lifecycle
+cc -nostdlib -static -no-pie -Wl,--build-id=none -DTWO_LIVE \
+  crates/carrick-vmm-kvm/tests/fixtures/native_robust_raw_exit.S \
+  -o target/soft-lifecycle/raw-exit
+cargo test --locked -p carrick-vmm-soft --test soft_hello -- \
+  production_ring_non_last_threads_raw_exit --ignored --exact
+```
+
+- Before the fix, fork reached initial MM admission, root load, the
+  root-fork seed doorbell (`0xd9`) and three fork-stock doorbells (`0xd2`).
+  It triple-faulted on the first walk after `install_maintenance_root`
+  selected `0x480b000`, before child stdout. GDB observed
+  `ExtentTable::expected_generation` return `None` for that root. The soft
+  worker hand-off now admits the shared carrier's exact maintenance root
+  into both existing extent inventories before either worker starts. The
+  maintenance root is retained for the carrier lifetime. The same fixture
+  now walks the maintenance root and reaches `install_address_context` for
+  the fork child's CR3 (`0x480c000`). That root has no walker generation, so
+  the next walk still triple-faults before child stdout. Child-root
+  publication and retirement need the shared carrier's authority for the
+  exact adopted root. The stopped slot snapshot currently provides backing
+  placement alone.
+- Raw thread exit boots through initial MM admission, root load and two owner
+  grants (`0xd1`). GDB observed the first `clone` and then 23 consecutive
+  timer interrupts (`0xe0`) at the same user return RIP (`0x4010f9`). The
+  guest interval exceeds the debug watchdog deadline. An optimized host
+  build reaches the unchanged 4,000,000-block limit. Neither run proves
+  worker exit or clear-child-tid completion.
+
+### M1-7 status: fork CR3 and the raw-exit timer
+
+The fork now walks the child's `0x480c000` root. The soft runner admits
+the page selected by the ring's committed MOV CR3 before its next fetch or
+interrupt delivery. A new root must name a full page in an authenticated
+retained extent. The instruction already invalidates the TLB and every
+descriptor in the subsequent walk still goes through extent authentication.
+The fixture serves the child's native stdout request with the shared
+dispatcher and requester record. The regular soft suite assembles the
+in-tree fixture locally. The child writes `E`, the parent reaps it and
+exits 7.
+
+The raw-exit fixture reaches the first clone. GDB observed the kick vector
+`0xe2`, followed by timer vector `0xe0` alternating between the parent
+(positive RAX) and the child (zero RAX) at `0x4010f9`. This is the user
+`test %rax,%rax` immediately after the clone syscall. The APIC latched
+expired deadlines with IF clear inside the CPL0 `arm_tsc_deadline` and
+`prepare_parked_resume` paths. The next return to CPL3 takes the pending
+timer before executing that user instruction. The fixture remains opt-in
+pending a scheduler progress fix.

@@ -15,6 +15,34 @@ fn tlbi_loader_red_witness() {
     assert_ne!(decode_instruction(0xd508831f), Instruction::Unallocated);
 }
 
+#[test]
+fn el0_entry_trampoline_span_is_typed_and_has_no_undefined_word() {
+    let bytes = carrick_mem::memory::el0_trampoline_bytes();
+    assert_loader_vector_spans_typed(&bytes);
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let blocks = translate::split_span(
+        state::ProgramCounter(carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE),
+        &words,
+        translate::BlockLimits::default(),
+    );
+    assert!(!blocks.is_empty());
+    for block in &blocks {
+        for instruction in block.instructions() {
+            assert_ne!(
+                instruction.class(),
+                translate::InstructionClass::Exit(translate::ExitReason::Undefined),
+                "PC={:#x} word={:#010x}",
+                instruction.pc().0,
+                instruction.word()
+            );
+        }
+        translate::emit_block(block).expect("trampoline block translates");
+    }
+}
+
 use std::process::Command;
 fn object(words: &[u32]) -> Vec<u8> {
     let text_end = 64 + 4 * words.len();
@@ -274,8 +302,14 @@ fn sys_space_tlbi_fields_and_names() {
             .unwrap_or("-");
         let d = decode_instruction(w);
         if name == "-" {
-            if !matches!(d, Instruction::CensusGap(Decoded::AddressTranslate { .. })) {
-                assert_eq!(d, Instruction::Unallocated, "{w:08x}");
+            match w & !31 {
+                0xd50b_7420 => assert!(matches!(d, Instruction::DataCacheZero(_))),
+                0xd50b_7520 => assert!(matches!(
+                    d,
+                    Instruction::InstructionCache(carrick_softcpu_aarch64::IcOperation::Ivau(_))
+                )),
+                _ if matches!(d, Instruction::CensusGap(Decoded::AddressTranslate { .. })) => {}
+                _ => assert_eq!(d, Instruction::Unallocated, "{w:08x}"),
             }
             continue;
         }
@@ -360,6 +394,41 @@ fn tlbi_rejects_fixed_opcode_bit_neighbours() {
             !matches!(decode_instruction(word), Instruction::SystemOperation(_)),
             "{word:08x} bit {bit}"
         );
+    }
+}
+
+#[test]
+fn ic_iallu_and_ialluis_require_xzr_and_reject_fixed_bit_neighbours() {
+    // DDI0487G.a C6.2.95: IC IALLUIS (0xd508711f) and IC IALLU (0xd508751f)
+    // require Rt == 31; Rt != 31 and SYSL/fixed-bit neighbours are not IC.
+    assert_eq!(
+        decode_instruction(0xd508_711f),
+        Instruction::InstructionCache(IcOperation::Ialluis)
+    );
+    assert_eq!(
+        decode_instruction(0xd508_751f),
+        Instruction::InstructionCache(IcOperation::Iallu)
+    );
+    for base in [0xd508_7100u32, 0xd508_7500] {
+        for rt in 0..31 {
+            assert_eq!(
+                decode_instruction(base | rt),
+                Instruction::Unallocated,
+                "{:08x}",
+                base | rt
+            );
+        }
+        let exact = base | 31;
+        for bit in 19..32 {
+            let neighbour = exact ^ (1 << bit);
+            assert!(
+                !matches!(
+                    decode_instruction(neighbour),
+                    Instruction::InstructionCache(_)
+                ),
+                "{neighbour:08x} bit {bit}"
+            );
+        }
     }
 }
 

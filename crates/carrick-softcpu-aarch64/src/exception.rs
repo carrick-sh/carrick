@@ -1,9 +1,9 @@
 //! Arm ARM DDI0487G.a D1.10 exception entry / AArch64.TakeException (J1-7877–7878),
 //! D1.11 exception return / AArch64.ExceptionReturn (J1-7951),
-//! SetPSTATEFromPSR (J1-8205–8206), and D13.2.37 ESR_EL1.
+//! SetPSTATEFromPSR (J1-8204–8205), and D13.2.37 ESR_EL1.
 //! Pure virtual transitions; no host exceptions or provider actions.
-//! A3 wiring must enforce restored IL on the next instruction (EC=0x0e)
-//! and apply the configured address size to ELR before fetching after ERET.
+//! Dispatch checks the PC and restored IL before executing the next block.
+//! Address-size checks on ERET belong to the translation regime.
 //! SError ISS=0 is the chosen non-RAS implementation-defined syndrome;
 //! HVC at EL1 is a deliberate provider boundary in this EL0/EL1 profile.
 use crate::state::{
@@ -60,6 +60,12 @@ pub enum DataAccess {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitInstruction {
+    Wfi,
+    Wfe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Exception immediates use the same typed domain as decoded operands.
 /// ```compile_fail
 /// use carrick_softcpu_aarch64::exception::Exception;
@@ -70,6 +76,9 @@ pub enum Exception {
     Hvc(crate::Immediate16),
     Brk(u16),
     Unknown,
+    WaitTrap(WaitInstruction),
+    IllegalExecutionState,
+    PcAlignment,
     SystemAccess(SystemAccessException),
     Irq,
     Fiq,
@@ -81,6 +90,11 @@ pub enum Exception {
     /// ```
     Alignment {
         access: DataAccess,
+        address: VirtualAddress,
+    },
+    /// IC IVAU by VA, reported as a data abort with ISS.CM and WnR set.
+    CacheMaintenanceAbort {
+        status: FaultStatus,
         address: VirtualAddress,
     },
     Abort {
@@ -111,6 +125,13 @@ pub fn syndrome(exception: Exception, origin: ExceptionLevel) -> Syndrome {
         Exception::Svc(i) => (0x15, u64::from(i.value())),
         Exception::Hvc(i) => (0x16, u64::from(i.value())),
         Exception::Brk(i) => (0x3c, u64::from(i)),
+        // WFxTrap and ConditionSyndrome: CV=1, COND=AL in AArch64.
+        Exception::WaitTrap(wait) => (
+            0x01,
+            (0b11110 << 20) | u64::from(wait == WaitInstruction::Wfe),
+        ),
+        Exception::IllegalExecutionState => (0x0e, 0),
+        Exception::PcAlignment => (0x22, 0),
         Exception::SError => (0x2f, 0),
         Exception::Alignment { access, .. } => (
             0x24 + current,
@@ -120,6 +141,9 @@ pub fn syndrome(exception: Exception, origin: ExceptionLevel) -> Syndrome {
                 0
             },
         ),
+        Exception::CacheMaintenanceAbort { status, .. } => {
+            (0x24 + current, status.fsc() | (1 << 8) | (1 << 6))
+        }
         Exception::Abort { access, status, .. } => (
             if access == Access::Fetch {
                 0x20 + current
@@ -170,9 +194,15 @@ pub fn take_exception(cpu: &mut CpuState, exception: Exception) -> ExceptionOutc
     if !matches!(exception, Exception::Irq | Exception::Fiq) {
         cpu.el1.esr = syndrome(exception, origin.el);
     }
-    if let Exception::Abort { address, .. } | Exception::Alignment { address, .. } = exception {
-        cpu.el1.far = address;
-    }
+    // D1.10.5 leaves FAR unknown for other reported exceptions.
+    // Keeping the prior value is this profile's deterministic choice.
+    cpu.el1.far = match exception {
+        Exception::Abort { address, .. }
+        | Exception::CacheMaintenanceAbort { address, .. }
+        | Exception::Alignment { address, .. } => address,
+        Exception::PcAlignment => VirtualAddress(cpu.pc.0),
+        _ => cpu.el1.far,
+    };
     cpu.pstate.el = ExceptionLevel::El1;
     cpu.pstate.sp = StackSelect::El1;
     cpu.pstate.daif = InterruptMasks::ALL;
@@ -188,7 +218,8 @@ pub enum ReturnError {
 }
 /// D1.11 Illegal return events from AArch64 state; AArch64.ExceptionReturn.
 /// Illegal SPSR.M retains current EL/SP, sets IL, restores NZCV/PAN/DAIF and
-/// branches to ELR. ERET at EL0 is undefined and changes no state.
+/// branches to ELR. This profile uses saved UAO for the architecturally
+/// UNKNOWN UAO on illegal return. ERET at EL0 is undefined and changes no state.
 pub fn eret(cpu: &mut CpuState) -> Result<(), ReturnError> {
     if cpu.pstate.el == ExceptionLevel::El0 {
         return Err(ReturnError::UndefinedAtEl0);
@@ -199,8 +230,11 @@ pub fn eret(cpu: &mut CpuState) -> Result<(), ReturnError> {
         cpu.pstate.il = true;
         cpu.pstate.nzcv = ((cpu.el1.spsr.0 >> 28) & 15) as u8;
         cpu.pstate.pan = cpu.el1.spsr.0 & (1 << 22) != 0;
+        cpu.pstate.uao = cpu.el1.spsr.0 & (1 << 23) != 0;
         cpu.pstate.daif = InterruptMasks(((cpu.el1.spsr.0 >> 6) & 15) as u8);
     }
+    // AArch64.ExceptionReturn performs SendEventLocal even on an illegal return.
+    cpu.signal_local_event();
     cpu.pc = cpu.el1.elr;
     Ok(())
 }

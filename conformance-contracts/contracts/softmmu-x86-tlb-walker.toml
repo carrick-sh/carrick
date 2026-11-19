@@ -60,6 +60,43 @@ domain-wide invalidation on `ExtentTable` retirement/replacement that every
 seated soft vCPU serves at block entry (`softmmu.x86.physical-retirement`), and
 invalidates write-plane entries across explicitly supplied TLBs when an
 authenticated frame becomes a code page (cross-vCPU publication is #684).
+
+#671 M1-1 segmented placement: LinearPlacement::with_segments places each
+registered carrier slot as its own linear segment (host = gpa - base +
+host_addr). It refuses empty, unaligned or overlapping segments, a range
+crossing a segment end (SegmentBoundary) and a GPA in a gap
+(OutOfBounds). LinearPlacement::new keeps its single-span behaviour for
+every existing user. host() remains the only GPA-to-host conversion. The
+witness softmmu_contract::segmented_placement_maps_each_slot_and_refuses_gaps_and_boundaries
+was red (missing API) before the change and passes after it. The existing
+bindings below were re-run unchanged (all carrick-softmmu and
+carrick-softcpu-x86 suites pass). No new acceptance is claimed.
+
+#671 M1-5 runtime slots: after an owner grant, the stopped soft carrier
+publishes only registrations whose GPA, extent length and host base match
+retained carrier allocations. It extends the existing walker inventory
+before the next guest entry and invalidates the local read, write and
+execute TLB. Existing slots keep their backing identity. An unchanged
+snapshot bypasses placement and inventory work. The production CPL0
+anonymous-page witness reaches the owner grant, writes a newly backed
+page, reads it via the stdout crossing, and exits within the same block
+budget that the pre-fix fault loop exhausted.
+
+#671 M1-6 maintenance root: both soft worker views admit the
+carrier-published supervisor root before guest entry. The ring can switch
+to it without a carrier exit, so admitting stopped CR3 alone leaves the
+very next walk without an owner generation. This keeps the existing
+extent and page-table authentication for the maintenance walk.
+
+#671 M1 preserves a single executing soft worker. The unused peer is
+retained by the shared factory for custody, but guest entry refuses it
+before it can access backing through a disjoint walker inventory.
+
+#671 M1-7 host writes: the stopped soft worker consumes the physical pages
+touched by CarrierMemory writes before executing another block. Only active
+code generations on those authenticated pages change. The stopped carrier
+witness executes one cached block twice with a single-byte write between
+exits. It returns 7 instead of 9 when the notification is removed.
 """
 
 [bindings]
