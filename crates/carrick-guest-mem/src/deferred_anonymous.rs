@@ -757,6 +757,28 @@ mod tests {
     }
 
     #[test]
+    fn owner_grant_materialization_accepts_a_retired_materialized_page() {
+        let state = DeferredAnonymousState::new();
+        let page = GuestVa::new(0x4000);
+        state.reserve_fresh(page, PAGE as usize).unwrap();
+        state
+            .begin_pristine_materialization(page, PAGE as usize)
+            .unwrap()
+            .expect("fresh page")
+            .commit();
+
+        let transition = state
+            .begin_owner_grant_materialization(page, PAGE as usize)
+            .unwrap()
+            .expect("a retired leaf with retained owner authority must be re-grantable");
+        transition.commit();
+        assert_eq!(
+            state.materialized_within(page, PAGE as usize),
+            [page..GuestVa::new(page.raw() + PAGE)]
+        );
+    }
+
+    #[test]
     fn exact_zero_reads_and_lifecycle() {
         let state = DeferredAnonymousState::new();
         state.reserve_fresh(GuestVa::new(0x1000), 0x2000).unwrap();
