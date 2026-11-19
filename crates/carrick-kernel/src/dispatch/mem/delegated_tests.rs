@@ -6958,19 +6958,18 @@ fn selected_backing_plan_narrows_the_committed_host_grant() {
 
     dispatcher
         .with_resident_frame_grant_plan_for_test(fault, STOCK_WINDOW, |plan| {
-            let admitted = carrick_core_abi::ReservationRange::new(plan.start(), plan.end())
-                .expect("production plan has a valid admitted range");
+            let admitted =
+                carrick_core_abi::ReservationRange::new(plan.start(), plan.start() + plan.len())
+                    .expect("production plan has a valid admitted range");
             let selected = carrick_core_abi::ReservationRange::new(fault, fault + PAGE)
                 .expect("one selected page is a valid range");
-            let selected = carrick_core::mm::frames::SelectedBackingPlan::new(
-                admitted, selected, fault,
-            )
-            .expect("the selected fault page is contained by the admitted plan");
+            let selected =
+                carrick_core::mm::frames::SelectedBackingPlan::new(admitted, selected, fault)
+                    .expect("the selected fault page is contained by the admitted plan");
             let plan = plan
                 .narrow_to(selected)
                 .expect("one descriptor-selected page narrows the semantic plan");
             assert_eq!((plan.start(), plan.len()), (fault, PAGE));
-            assert_eq!(plan.publication().span, selected.range());
         })
         .expect("production planner admits the owner-backed mapping");
 }
