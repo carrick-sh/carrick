@@ -379,13 +379,14 @@ impl FrameGrantResidencyTable {
         // Evaluate the empty table at compile time so debug callers copy one
         // value into their return slot instead of materializing separate
         // `ResidencySegment` and `ResidencyStorage` temporaries on the stack.
-        const EMPTY: FrameGrantResidencyTable = FrameGrantResidencyTable {
-            storage: ResidencyStorage {
-                bootstrap: ResidencySegment::new(),
-                directory: ResidencyDirectory::new(),
-            },
-        };
-        EMPTY
+        const {
+            FrameGrantResidencyTable {
+                storage: ResidencyStorage {
+                    bootstrap: ResidencySegment::new(),
+                    directory: ResidencyDirectory::new(),
+                },
+            }
+        }
     }
 
     /// Initialize in place without materializing a large stack temporary.
