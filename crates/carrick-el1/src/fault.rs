@@ -2264,6 +2264,135 @@ mod tests {
         }
     }
 
+    struct RetiredResidencyResolver {
+        descriptor: u64,
+        selections: usize,
+    }
+
+    impl PreparedPageResolver for RetiredResidencyResolver {
+        fn select_backing_window(
+            &mut self,
+            _root: u64,
+            window: carrick_el1_abi::PortalGrantWindow,
+        ) -> Result<
+            carrick_el1_abi::PortalGrantWindow,
+            carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+        > {
+            assert!(carrick_mmu_core::aarch64::terminal_descriptor_is_retired(
+                self.descriptor
+            ));
+            assert_eq!(self.descriptor & 1, 0);
+            assert_eq!(self.descriptor & 0x0000_ffff_ffff_f000, 0x9c45_2c10_00);
+            self.selections += 1;
+            Ok(window)
+        }
+
+        fn commit_prepared(
+            &mut self,
+            _ttbr0: u64,
+            _va: u64,
+            _expected_ipa: u64,
+            _access: LeafAccess,
+        ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+            assert!(carrick_mmu_core::aarch64::terminal_descriptor_is_retired(
+                self.descriptor
+            ));
+            Err(GuestPreparedCommitError::NotPrepared)
+        }
+    }
+
+    fn retired_leaf_with_stale_residency_selects_fresh_owner_grant(x86: bool) {
+        const MM: u64 = 77;
+        // Keep the production fault offset inside this VM-free fixture's
+        // compact arena; DESCRIPTOR below is the exact hardware leaf.
+        const VA: u64 = 0x6000_1000;
+        // Real pip-install leaf captured on director-mac: invalid, retired,
+        // private, writable, NX, and retaining its old output frame.
+        const DESCRIPTOR: u64 = 0x03e0_009c_452c_1f42;
+        let spaces = published_space(MM, 0x8800_0000);
+        let roots = admitted_root(&spaces, MM, &[(VA, 4096, 3)]);
+        let residency = carrick_el1_abi::FrameGrantResidencyTable::new();
+        residency
+            .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key: MM,
+                semantic_base: VA,
+                physical_ipa: DESCRIPTOR & 0x0000_ffff_ffff_f000,
+                len: 4096,
+                mapping_id: 11,
+                frame_id: 12,
+                owner_generation: 13,
+                inventory_revision: 14,
+            })
+            .unwrap();
+        let task = CurrentTask::new();
+        task.mm.key.store(MM, Ordering::Release);
+        let slots = unsafe {
+            let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<
+                carrick_el1_abi::MmPortalSlots,
+            >());
+            assert!(!ptr.is_null());
+            std::boxed::Box::from_raw(ptr.cast::<carrick_el1_abi::MmPortalSlots>())
+        };
+        assert!(slots.bind_carrier(NonZeroU64::new(9).unwrap()));
+        let supply = OwnerFaultSupply::new(&slots);
+        let mut resolver = RetiredResidencyResolver {
+            descriptor: DESCRIPTOR,
+            selections: 0,
+        };
+        let prepared = Some(PreparedFaultPath::<_> {
+            residency: &residency,
+            resolver: &mut resolver,
+            roots: Some(&roots),
+            file_slots: None,
+        });
+        let action = if x86 {
+            dispatch_x86_fault_with_prepared(
+                carrick_guest_arch::CpuId::new(0),
+                carrick_guest_arch::FaultInfo {
+                    address: carrick_guest_arch::UserVa::new(VA),
+                    access: carrick_guest_arch::Access::Write,
+                    present: false,
+                },
+                &Counters::default(),
+                &task,
+                SpaceAccess::source_free(&spaces),
+                FaultSupply::Owner(&supply),
+                prepared,
+                &mut NoopCowResolver,
+            )
+        } else {
+            dispatch_fault_with_prepared(
+                &mut write_translation_fault(0, VA),
+                &Counters::default(),
+                &[task],
+                SpaceAccess::source_free(&spaces),
+                FaultSupply::Owner(&supply),
+                prepared,
+                &mut NoopCowResolver,
+            )
+        };
+        assert_eq!(action, Action::Forward);
+        assert_eq!(supply.outcome(), OwnerFaultSupplyOutcome::Selected);
+        assert_eq!(resolver.selections, 1);
+        assert!(
+            slots
+                .grant(0)
+                .unwrap()
+                .pending_fault_selection(MM, VA)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn arm_retired_leaf_with_stale_residency_selects_fresh_owner_grant() {
+        retired_leaf_with_stale_residency_selects_fresh_owner_grant(false);
+    }
+
+    #[test]
+    fn x86_retired_leaf_with_stale_residency_selects_fresh_owner_grant() {
+        retired_leaf_with_stale_residency_selects_fresh_owner_grant(true);
+    }
+
     /// Two slots can fault before either host boundary runs. Publication is
     /// scoped to the MM extent, not the slot that happened to request it.
     #[test]
