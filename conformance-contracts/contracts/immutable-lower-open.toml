@@ -1,0 +1,25 @@
+schema_version = 1
+id = "kernel.vfs.immutable-lower-open"
+title = "Immutable-lower open preserves pathname resolution"
+guest_surfaces = ["syscall:openat"]
+semantic_authority = ["man 7 path_resolution"]
+fixture = "openat_immutable_lower_preserves_parent_and_directory_semantics"
+scale_points = [1]
+rationale = "A fast immutable-lower open can commit only a component-contained result. Parent traversal and terminal directory requirements are resolved by the layered path walker. The lower fast lane must decline them before issuing any host opens."
+
+[bindings]
+vm_free = [
+  "carrick-kernel::integration::syscall_fs_open::openat_immutable_lower_preserves_parent_and_directory_semantics",
+  "carrick-vfs::fs_backend::tests::serial_host::immutable_lower_open_defers_parent_and_directory_semantics",
+]
+
+[bindings.unresolved]
+embed_structural = "Signed guest binding pending. The fast open runs only on macOS."
+docker = "Native ARM64 guest differential pending. The VM-free fixture asserts Linux pathname semantics from path_resolution(7)."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "host_backend_calls"
+value = 0
+layers = ["vm-free"]
+rationale = "The host backend counts openat and stat calls for each declined pathname and uses an ordinary regular-file open as a positive control."

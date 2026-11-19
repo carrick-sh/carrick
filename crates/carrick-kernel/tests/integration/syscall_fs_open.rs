@@ -1424,6 +1424,75 @@ fn openat_immutable_lower_serves_existing_files_through_ancestor_symlinks() {
 }
 
 #[test]
+fn openat_immutable_lower_preserves_parent_and_directory_semantics() {
+    use carrick_kernel::linux_abi::{LINUX_ENOENT, LINUX_ENOTDIR, LINUX_O_RDONLY};
+    use carrick_vfs::fs_backend::HostFsBackend;
+
+    let lower = tempfile::TempDir::new().unwrap();
+    let upper = tempfile::TempDir::new().unwrap();
+    for dir in ["real", "nested/real", "nested/subdir"] {
+        std::fs::create_dir_all(lower.path().join(dir)).unwrap();
+    }
+    std::fs::write(lower.path().join("real/file.txt"), b"root bytes").unwrap();
+    std::fs::write(lower.path().join("nested/real/file.txt"), b"target bytes").unwrap();
+    std::fs::write(lower.path().join("regular"), b"file").unwrap();
+    std::os::unix::fs::symlink("nested/subdir", lower.path().join("link")).unwrap();
+
+    let mut overlay = HostFsBackend::from_path(upper.path()).unwrap();
+    overlay.enable_sparse_upper_fast_miss();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(overlay));
+    dispatcher.set_rootfs_layer(RootFs::from_immutable_host_dir(lower.path()).unwrap());
+
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let mut open_and_read = |path: &str| -> Result<Vec<u8>, LinuxErrno> {
+        let path = std::ffi::CString::new(path).unwrap();
+        memory
+            .write_bytes(0x4000, path.as_bytes_with_nul())
+            .unwrap();
+        let mut dispatch = |syscall, args| {
+            dispatcher
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(syscall, SyscallArgs::from(args)),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap()
+        };
+        let fd = match dispatch(56, [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDONLY, 0, 0, 0]) {
+            DispatchOutcome::Returned { value } => value as u64,
+            DispatchOutcome::Errno { errno } => return Err(errno),
+            outcome => panic!("openat({path:?}): {outcome:?}"),
+        };
+        let DispatchOutcome::Returned { value: count } = dispatch(63, [fd, 0x4400, 64, 0, 0, 0])
+        else {
+            panic!("read after openat({path:?}) failed");
+        };
+        assert_eq!(
+            dispatch(57, [fd, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        Ok(memory.read_bytes(0x4400, count as usize).unwrap())
+    };
+
+    // The non-control paths bypass the dentry shortcut. On macOS the
+    // empty sparse upper admits them to the immutable-lower fast open.
+    let cases = [
+        ("/real/file.txt", Ok(b"root bytes".as_slice())),
+        ("/link/../real/file.txt", Ok(b"target bytes".as_slice())),
+        ("/missing/../real/file.txt", Err(LINUX_ENOENT)),
+        ("/regular/../real/file.txt", Err(LINUX_ENOTDIR)),
+        ("/real/file.txt/", Err(LINUX_ENOTDIR)),
+        ("/real/file.txt/.", Err(LINUX_ENOTDIR)),
+    ];
+    let actual = cases.map(|(path, _)| (path, open_and_read(path)));
+    let expected = cases.map(|(path, result)| (path, result.map(<[u8]>::to_vec)));
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
