@@ -1,3 +1,6 @@
+# #2441 records terminal frame-grant outcomes in vcpu_loop/signal.rs
+# at the existing host first-touch boundary. The refusal, fault-signal
+# delivery and owner wait decisions retain their existing bindings.
 # #2306: errno and run-failure conversion moves to NativeFailure; owner
 # contention (NativeContention) parks, retains its syscall or yields at the
 # owner checkpoint. Witnesses are bound below; this contract's settlement,
