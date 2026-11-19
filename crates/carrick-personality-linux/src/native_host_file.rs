@@ -2395,9 +2395,11 @@ fn stage_call(
                 access: DescriptionAccess::Path,
             } => errno(carrick_syscall_abi::LINUX_EBADF),
             NativeDescriptor::HostBacked { .. } => {
-                let Some(shape) = host_ioctl(request) else {
-                    return Some(errno(carrick_syscall_abi::LINUX_ENOTTY));
-                };
+                // A request outside the allowlist is NOT served: ENOTTY would be
+                // the wrong answer for job control (TIOCGPGRP, TCSBRK, FIOASYNC)
+                // on a terminal and would hide the gap from the ring-first
+                // counters. Leave it unrouted: a counted ENOSYS on both sides.
+                let shape = host_ioctl(request)?;
                 let mut bytes = [0; carrick_syscall_abi::LINUX_TERMIOS2_SIZE];
                 let (input, output): (&[u8], _) = match shape {
                     HostIoctl::Get(len) => (&[], Some(HostFileOutput::bytes(arg, len))),

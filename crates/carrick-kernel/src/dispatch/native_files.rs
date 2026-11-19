@@ -1335,7 +1335,9 @@ impl SyscallDispatcher {
             Some(HostIoctl::Get(want)) if input.is_empty() && capacity == want => {}
             Some(HostIoctl::Set(want)) if input.len() == want && capacity == 0 => {}
             Some(_) => return Served::Refused,
-            None => return Served::errno(LINUX_ENOTTY),
+            // Not an allowlisted request: refuse (the guest side leaves it unrouted),
+            // never a served ENOTTY.
+            None => return Served::Refused,
         }
         let fd = fd::Fd(header.fd);
         if request == LINUX_FIONBIO {
