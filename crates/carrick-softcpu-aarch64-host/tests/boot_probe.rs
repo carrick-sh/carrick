@@ -266,6 +266,41 @@ fn probe(
 }
 
 #[test]
+fn resident_loop_translates_only_two_blocks() {
+    const PC: u64 = 0x4000;
+    let mut counts = Vec::new();
+    for iterations in [1, 100, 10_000] {
+        let mut memory = Pages::default();
+        // subs x0, x0, #1; b.ne back to subs; hvc #2.
+        for (index, word) in [0xf100_0400_u32, 0x54ff_ffe1, 0xd400_0042]
+            .into_iter()
+            .enumerate()
+        {
+            memory.load(PC + 4 * index as u64, &word.to_le_bytes());
+        }
+        let mut cpu = CpuState::default();
+        cpu.pstate.el = ExceptionLevel::El1;
+        cpu.pstate.sp = StackSelect::El1;
+        cpu.pc = ProgramCounter(PC);
+        set_x(&mut cpu, 0, iterations);
+        let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
+        let report = probe(&mut cpu, &mut memory, &mut runner, iterations + 2);
+        assert!(matches!(
+            report.stop,
+            Stop::Event {
+                event: Event::ProviderExit(_),
+                ..
+            }
+        ));
+        assert_eq!(report.pc, ProgramCounter(PC + 12));
+        assert_eq!(report.work.executed_blocks, iterations + 1);
+        assert_eq!(report.work.retired_instructions, iterations * 2 + 1);
+        counts.push((report.work.decoded_blocks, report.work.emitted_blocks));
+    }
+    assert_eq!(counts, [(2, 2); 3]);
+}
+
+#[test]
 #[ignore = "requires CARRICK_A64_ELF pointing to the rebuilt production EL1 ELF"]
 fn production_el1_image_boot_probe() {
     let path = std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF");
