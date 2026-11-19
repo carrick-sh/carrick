@@ -5,6 +5,8 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
+use carrick_aarch64::staged_cpu::{RootBootFields, StagedCpu};
+
 use super::*;
 
 #[derive(
@@ -410,7 +412,7 @@ impl HvfVmState {
     /// a persistent executor's vCPU, which restores the staged state.
     pub(crate) fn new_with_plan(
         plan: &GuestMappingPlan,
-    ) -> Result<(HvfVmState, crate::staged_cpu::StagedCpu), TrapError> {
+    ) -> Result<(HvfVmState, StagedCpu), TrapError> {
         let mut pending_creation = None;
         let result = Self::new_with_plan_inner(plan, &mut pending_creation);
         finish_pending_vm_creation(pending_creation, result)
@@ -419,7 +421,7 @@ impl HvfVmState {
     fn new_with_plan_inner(
         plan: &GuestMappingPlan,
         pending_creation: &mut Option<PendingCarrierVmCreation>,
-    ) -> Result<(HvfVmState, crate::staged_cpu::StagedCpu), TrapError> {
+    ) -> Result<(HvfVmState, StagedCpu), TrapError> {
         // Carrier reuse: when this carrier already owns a VM, a new container's
         // root boots INSIDE it. Its image is placed the way `execve_rebuild`
         // places a replacement image (global-frame stage-2 leases + rebased
@@ -708,7 +710,14 @@ impl HvfVmState {
         // The root's first registers (EL0-entry trampoline, stage-1 MMU,
         // FP/SIMD and counter access, vectors, user stack) are programmed as
         // data from the relocated `plan`; see `StagedCpu::initial_root`.
-        let staged = crate::staged_cpu::StagedCpu::initial_root(plan);
+        let plan = &RootBootFields {
+            entry: plan.entry,
+            initial_stack_pointer: plan.initial_stack_pointer,
+            el0_trampoline_entry: plan.el0_trampoline_entry,
+            el1_vectors_base: plan.el1_vectors_base,
+            stage1_page_tables_base: plan.stage1_page_tables_base,
+        };
+        let staged = StagedCpu::initial_root(plan);
         if pending_creation.is_some() {
             commit_pending_creation_before_vcpu_handoff(pending_creation)?;
         }
