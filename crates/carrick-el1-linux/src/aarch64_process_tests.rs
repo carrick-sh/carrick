@@ -17840,21 +17840,18 @@ fn serve_child_host_file(
             .unwrap();
             match dispatcher.serve_native_host_file(&mut record, None) {
                 Ok(_) => {
-                    let parsed = carrick_core_abi::host_file::reply(&record)
-                        .expect("served host-file record must contain a valid reply");
-                    if let Some(out) = output
-                        && !parsed.output.is_empty()
-                    {
-                        // SAFETY: the output names a live GuestUserBuffer.
-                        let dst = unsafe {
-                            core::slice::from_raw_parts_mut(
-                                out.address as *mut u8,
-                                parsed.output.len(),
-                            )
-                        };
-                        dst.copy_from_slice(parsed.output);
-                    }
-                    parsed.result
+                    let mut copy = crate::file::ValidatedCopy {
+                        task,
+                        validator: &crate::file::HardwareValidator,
+                    };
+                    carrick_personality_linux::native_host_file::complete(
+                        &record,
+                        output,
+                        &mut |address, bytes| {
+                            crate::file::UserCopy::copy_out(&mut copy, address, bytes)
+                        },
+                    )
+                    .raw()
                 }
                 Err(_) => carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
             }
