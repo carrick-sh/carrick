@@ -501,7 +501,44 @@ _FRAME_GRANT_DECISIONS = {
     2: "refused/first-touch",
     3: "refused/prepare",
     4: "ready",
+    5: "error/prepare",
+    6: "refused/publish-unsupported",
+    7: "refused/publish",
+    8: "refused/descriptor",
+    9: "rolled-back/descriptor",
+    10: "refused/mailbox-slot",
+    11: "refused/mailbox-stale",
+    12: "refused/mailbox-ready",
+    13: "fatal/publication",
 }
+# Stable wire codes in carrick-mmu-core/src/descriptor_refusal.rs.
+_DESCRIPTOR_REFUSALS = (
+    None,
+    "BadRange",
+    "StaleRoot",
+    "TableOutsidePrimary",
+    "MissingTable",
+    "NotPrivateAnonymous",
+    "PermissionWidening",
+    "CowArmed",
+    "AlreadyValid",
+    "Occupied",
+    "Malformed",
+    "NotPrepared",
+    "WrongBacking",
+    "PermissionDenied",
+    "NotCowArmed",
+    "TablesExhausted",
+    "BadTableGrant",
+    "JournalCapacity",
+    "Contended",
+    "BadEncoding",
+    "WrongMm",
+    "ExcludedOutput",
+    "ReclaimCapacity",
+    "CopyWindowAbsent",
+    "CarrickOwnedWindow",
+)
 _FIRST_TOUCH_RESIDENT = {
     0: "not-reached",
     1: "committed",
@@ -533,10 +570,17 @@ def _format_el1_grant_claim(tid: int, mm: int, packed: int) -> str:
 
 def _format_el1_grant_decision(tid: int, generation: int, packed: int) -> str:
     packed &= 0xFFFFFFFF
-    decision = _FRAME_GRANT_DECISIONS.get(packed & 0xF, "unknown")
+    code = packed & 0xF
+    decision = _FRAME_GRANT_DECISIONS.get(code, "unknown")
+    pages = packed >> 8
+    if code in (7, 8, 9):
+        reason = packed >> 24
+        name = _DESCRIPTOR_REFUSALS[reason] if reason < len(_DESCRIPTOR_REFUSALS) else None
+        decision += f" descriptor_refusal={name or f'unknown({reason})'}"
+        pages &= 0xFFFF
     return (
         f"tid={tid} generation={generation & 0xFFFFFFFF} decision={decision} "
-        f"prot={(packed >> 4) & 0xF:#x} pages={packed >> 8}"
+        f"prot={(packed >> 4) & 0xF:#x} pages={pages}"
     )
 
 

@@ -521,7 +521,7 @@ kind is documented on its constant in `crates/carrick-kernel/src/event_ring.rs`.
 | Record | Where | What it says |
 |---|---|---|
 | `EL1GRANT_CLAIM` + `FAULT_VA` | `resolve_mutating_fault` | host claim of the EL1 frame-grant request: `none` / `response-pending` / `accepted`, access, request generation, fault VA |
-| `EL1GRANT_DECISION` (+ `EL1GRANT_BASE`, `EL1GRANT_IPA`) | same | `plan` (base, pages, prot), `refused/no-plan`, `refused/first-touch`, `refused/prepare`, or `ready` (semantic base, pages, physical IPA) |
+| `EL1GRANT_DECISION` (+ `EL1GRANT_BASE`, `EL1GRANT_IPA`) | same | `plan` (base, pages, prot), `refused/no-plan`, `refused/first-touch`, `refused/prepare`, `error/prepare`, publish or descriptor refusal (with the descriptor reason when available), mailbox refusal (slot, stale request, or invalid Ready), `fatal/publication`, or `ready` (semantic base, pages, physical IPA) |
 | `FIRST_TOUCH` + `FAULT_VA` | same, host first-touch path | resident plan (`committed` / `no-plan` / `arming-denied` / `backend-refused`), grow-down (`committed` / `no-plan` / `protect-failed`), stale stage-1 (`retried` / `not-retried` / `access-unknown`) |
 | `FAULTSIG` + `FAULTSIG_ADDR` / `_PC` / `_LEAF` / `_MBOXES` / `_MBOX` | `binding.rs` fault arms, just before `deliver_fault_signal` | signal, si_code, `fault_requires_mm_mutation`, the live stage-1 walk (`L<level>-valid|invalid-permits|denies`, full terminal descriptor), FAR/ESR/PC, and the non-idle frame-grant mailboxes (count, own slot, bitmask of slots 0–31, and up to 8 `slot=… state=…` rows) |
 | `MMOCC_REFUSE` | `MmOccupancy::install` | the `vCPU slot … already runs address space …` refusal: slot, running MM, requested MM |
