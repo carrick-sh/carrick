@@ -22,3 +22,6 @@ Each resident translation owns its immutable RX mapping. At all three scales
 the host adapter publishes twice, calls mprotect twice and synchronizes the
 I-cache twice. The dispatcher loads architectural state directly into the
 runner's frame and writes back from that same frame.
+
+Set `CARRICK_SOFT_AARCH64_CACHE=0` to disable residency in the Linux ARM64
+runner. Code still passes through the same preparation and execution steps.
