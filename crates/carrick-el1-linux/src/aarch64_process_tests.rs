@@ -18757,6 +18757,128 @@ fn arm_fork_child_uses_positioned_and_vectored_io() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
+/// Path and descriptor xattrs use the same carrier filesystem.
+#[test]
+fn arm_fork_child_uses_host_file_xattrs() {
+    use carrick_abi::{LINUX_AT_FDCWD, LINUX_O_CREAT, LINUX_O_RDWR};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::new().expect("host-file fixture scratch"),
+    ));
+    let (mismatches, _) = with_arm_process_host_files_on(dispatcher, |call, _| {
+        let (_, pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid}");
+        let child = ArmCaller::Child(pid as u32);
+        let path = GuestUserBuffer::from_bytes(b"/host-file-xattrs\0");
+        let (_, fd) = call(
+            child,
+            sys::OPENAT.raw(),
+            [
+                LINUX_AT_FDCWD,
+                path.arg(),
+                LINUX_O_CREAT | LINUX_O_RDWR,
+                0o600,
+                0,
+                0,
+            ],
+        );
+        assert!(fd >= 0, "openat: {fd}");
+        let fd = fd as u64;
+        let name = GuestUserBuffer::from_bytes(b"user.witness\0");
+        let value = GuestUserBuffer::from_bytes(b"owned");
+        let list = GuestUserBuffer::zeroed(32);
+        let read = GuestUserBuffer::zeroed(5);
+        let mut mismatches = Vec::new();
+        for (step, syscall, args, expected) in [
+            (
+                "listxattr empty",
+                sys::LISTXATTR,
+                [path.arg(), 0, 0, 0, 0, 0],
+                0,
+            ),
+            (
+                "fsetxattr",
+                sys::FSETXATTR,
+                [fd, name.arg(), value.arg(), 5, 0, 0],
+                0,
+            ),
+            (
+                "getxattr",
+                sys::GETXATTR,
+                [path.arg(), name.arg(), read.arg(), 5, 0, 0],
+                5,
+            ),
+            (
+                "flistxattr",
+                sys::FLISTXATTR,
+                [fd, list.arg(), 32, 0, 0, 0],
+                13,
+            ),
+        ] {
+            let (_, result) = call(child, syscall.raw(), args);
+            if result != expected {
+                mismatches.push(format!("{step}: got {result}, want {expected}"));
+            }
+        }
+        if read.as_bytes() != b"owned" || !list.as_bytes().starts_with(b"user.witness\0") {
+            mismatches.push("xattr payload differs".into());
+        }
+        mismatches
+    });
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Host-backed implicit stdio accepts only the native file ioctl subset.
+#[test]
+fn arm_fork_child_uses_allowlisted_host_ioctls() {
+    use carrick_abi::{LINUX_ENOTTY, LINUX_FIONBIO, LINUX_O_NONBLOCK, LINUX_TCGETS};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let (mismatches, _) = with_arm_process_host_files_on(
+        carrick_kernel::dispatch::SyscallDispatcher::new(),
+        |call, _| {
+            let (_, pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+            assert!(pid > 0, "clone: {pid}");
+            let child = ArmCaller::Child(pid as u32);
+            let terminal = GuestUserBuffer::zeroed(36);
+            let nonblock = GuestUserBuffer::from_values(&[1i32]);
+            // SAFETY: isatty only probes the live process descriptor.
+            let tcgets = if unsafe { libc::isatty(0) } == 1 {
+                0
+            } else {
+                LINUX_ENOTTY.guest_retval()
+            };
+            let mut mismatches = Vec::new();
+            for (step, fd, request, arg, expected) in [
+                ("TCGETS on stdin", 0, LINUX_TCGETS, terminal.arg(), tcgets),
+                ("FIONBIO on stdout", 1, LINUX_FIONBIO, nonblock.arg(), 0),
+                (
+                    "unlisted ioctl on stdout",
+                    1,
+                    0xdead,
+                    0,
+                    LINUX_ENOTTY.guest_retval(),
+                ),
+            ] {
+                let (_, result) = call(child, sys::IOCTL.raw(), [fd, request, arg, 0, 0, 0]);
+                if result != expected {
+                    mismatches.push(format!("{step}: got {result}, want {expected}"));
+                }
+            }
+            let (_, flags) = call(child, sys::FCNTL.raw(), [1, 3, 0, 0, 0, 0]);
+            if flags < 0 || flags as u64 & LINUX_O_NONBLOCK == 0 {
+                mismatches.push(format!("F_GETFL after FIONBIO: {flags:#x}"));
+            }
+            mismatches
+        },
+    );
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
 /// #231 parity (pip): CPython opens a script with `fopen` and then marks it
 /// close-on-exec with `ioctl(fd, FIOCLEX)`. A fork child's file is a ring
 /// descriptor the carrier opened for its staged `openat`; on main the ioctl
