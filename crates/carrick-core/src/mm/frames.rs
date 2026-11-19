@@ -225,7 +225,13 @@ fn authenticate_target<
 /// `ResidencyCapacity` releases both the descriptor claim (`SUBMITTED`) and
 /// the MM editor without publishing a terminal receipt so the caller can grow
 /// carrier residency storage outside the editor or park on a typed not-now.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum GrantApplyOutcome {
     Empty,
     Completed(carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt),
@@ -238,7 +244,13 @@ pub enum GrantApplyOutcome {
 /// remains `SUBMITTED` in the grant slot so the caller can enrol on the next
 /// retirement or metadata progress, probe once via [`Self::ready_to_retry`],
 /// and rerun without returning a fatal error or errno.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ResidencyGrowthContinuation {
     pub observed_extensions: usize,
     pub observed_retirement: u64,
@@ -258,7 +270,13 @@ impl ResidencyGrowthContinuation {
 }
 
 /// Outcome of serving one owner grant with automatic residency growth.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum GrantServeOutcome {
     Empty,
     Completed(carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt),
