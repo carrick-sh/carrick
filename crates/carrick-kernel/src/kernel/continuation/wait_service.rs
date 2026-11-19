@@ -838,6 +838,7 @@ impl CarrierWaitServiceInner {
             /// A native member's host-readiness wait (#231), by its key and
             /// the serial of the wait the poll set was built from.
             HostReady(crate::host_readiness::HostReadyKey, u64),
+            HostEvent(Arc<dyn crate::host_readiness::HostEventSource>),
             BlockingWrite(
                 ContinuationWakeToken,
                 Arc<Mutex<BlockingWrite>>,
@@ -859,7 +860,7 @@ impl CarrierWaitServiceInner {
             // visited, so a carrier with thousands of tasks parked on futexes,
             // timers and child waits costs the same here as one with none.
             let (mut pollfds, sources, nearest_deadline, registrations, visited) = {
-                let state = inner.state.lock();
+                let mut state = inner.state.lock();
                 let mut pollfds = vec![libc::pollfd {
                     fd: control_fd,
                     events: libc::POLLIN,
@@ -918,6 +919,9 @@ impl CarrierWaitServiceInner {
                         .into_iter()
                         .map(|(key, serial)| FdSource::HostReady(key, serial)),
                 );
+                state.host_ready.event_sources(&mut pollfds, |producer| {
+                    sources.push(FdSource::HostEvent(producer));
+                });
                 // A record lock has no readiness fd: it is retried on a tick, so
                 // its presence alone bounds the poll timeout.
                 if !state.reactor_work.record_locks.is_empty() {
@@ -1022,6 +1026,7 @@ impl CarrierWaitServiceInner {
                     FdSource::Ready(token) => {
                         inner.publish_event(token, ContinuationEvent::Ready);
                     }
+                    FdSource::HostEvent(producer) => producer.host_event(true),
                     FdSource::HostReady(key, serial) => {
                         host_ready_fired.push((key, serial));
                     }
@@ -1061,6 +1066,10 @@ impl CarrierWaitServiceInner {
                         }
                     }
                 }
+            }
+            let producers = inner.state.lock().host_ready.take_pending_producers();
+            for producer in producers {
+                producer.host_event(false);
             }
             let now = Instant::now();
             // A member is notified once, for whichever of its descriptors

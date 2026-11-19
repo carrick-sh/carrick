@@ -537,6 +537,11 @@ impl SyscallDispatcher {
                     });
                 }
             }
+        } else if header.op == HostFileOp::EpollSocketCtl {
+            match self.serve_native_epoll_ctl(owner, table, header) {
+                Ok(()) => Served::Reply(0, Vec::new()),
+                Err(errno) => Served::errno(errno),
+            }
         } else if header.op == HostFileOp::NetSyscall {
             match self.serve_native_net_call(owner, table, header, view.input(), waiter) {
                 super::net::native::NetServed::Reply(result, output) => {
@@ -1039,7 +1044,8 @@ impl SyscallDispatcher {
             | HostFileOp::Fchown
             | HostFileOp::Fchmodat
             | HostFileOp::Fchownat
-            | HostFileOp::NetSyscall => Served::Refused,
+            | HostFileOp::NetSyscall
+            | HostFileOp::EpollSocketCtl => Served::Refused,
         }
     }
 

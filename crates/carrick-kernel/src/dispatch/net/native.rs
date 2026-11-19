@@ -36,6 +36,7 @@ const NATIVE_SOCKET_FD: i32 = 3;
 /// descriptors, as a host fd slot holds one.
 pub(in crate::dispatch) struct NativeNetFile {
     description: parking_lot::Mutex<Arc<crate::kernel::FileDescription>>,
+    ipc: std::sync::Weak<HostIpc>,
     token: crate::host_readiness::HostReadinessToken,
     /// The reactor this socket's waits enrol in, which forgets them when the
     /// ring releases the socket.
@@ -46,12 +47,14 @@ impl NativeNetFile {
     fn new(
         description: Arc<crate::kernel::FileDescription>,
         readiness: Arc<HostReadinessReactor>,
+        owner: &Arc<HostIpc>,
     ) -> Self {
         description.retain_fd_ref();
         Self {
             description: parking_lot::Mutex::new(description),
             token: crate::host_readiness::HostReadinessToken::new(),
             readiness,
+            ipc: Arc::downgrade(owner),
         }
     }
 
@@ -82,6 +85,11 @@ impl Drop for NativeNetFile {
     fn drop(&mut self) {
         // The ring released the last descriptor naming this socket.
         self.readiness.forget(self.token.source());
+        if let Some(owner) = self.ipc.upgrade()
+            && let Some(epolls) = owner.existing_native_socket_epolls()
+        {
+            epolls.forget_socket(&owner, self.source());
+        }
         self.description.get_mut().release_fd_ref();
     }
 }
@@ -678,6 +686,11 @@ impl SyscallDispatcher {
                 _ => created = Some((*number, slot.clone())),
             }
         }
+        if let Some((socket, _)) = socket
+            && let Some(epolls) = owner.existing_native_socket_epolls()
+        {
+            epolls.socket_changed(owner, socket);
+        }
         let served = match ran {
             Ran::Refused => NetServed::Refused,
             Ran::Outcome(DispatchOutcome::Returned { value }) => {
@@ -888,6 +901,7 @@ impl SyscallDispatcher {
             Box::new(NativeNetFile::new(
                 slot.description(),
                 Arc::clone(self.kernel_binding.read().kernel().host_readiness()),
+                owner,
             )),
             fd::AccessMode::ReadWrite,
             flags,

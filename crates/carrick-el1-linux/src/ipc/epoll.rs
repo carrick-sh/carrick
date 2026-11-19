@@ -14,7 +14,8 @@
 //!   temporary mask, as for `rt_sigsuspend`), or by the re-entered call
 //!   before it harvests again. A call that returns without parking never
 //!   changes the mask;
-//! - host-half items (only the host harvests both halves);
+//! - legacy host-half items (only the host harvests both halves). Native
+//!   socket registrations share this list and wake the same Readable lane;
 //! - a finite timeout with nothing ready while another thread's timed
 //!   park holds the slot's timer (a slot's timer has one owner);
 //! - a buffer the reports cannot be copied to, when no native owner retains
@@ -52,22 +53,119 @@
 
 use super::{
     EL1_WAIT, Finish, IpcExecution, IpcRegion, IpcServed, IpcVenue, Parked, UserCopy,
-    argument_word, finish, from_sched_token, leave, linux, mm_key, notify_operation_release, park,
-    park_result, release_pin, retain_native_operation, set_result, snapshot, task_key,
+    argument_word, finish, from_sched_token, leave, linux, mm_key, notify_operation_release,
+    park_key, park_result, release_pin, retain_native_operation, set_result, snapshot, task_key,
     to_sched_token,
 };
 use crate::dispatch::GuestDispatchFrame;
 use carrick_core::mm::transaction::{CopyoutPreparation, CopyoutRequest, OwnedOperationYield};
 use carrick_core_abi::wait::AcceptedWait;
 use carrick_el1_abi::IpcLeave;
-use carrick_el1_abi::ipc::epoll::{EpollItemRef, EpollReport};
+use carrick_el1_abi::ipc::epoll::{EpollHarvest, EpollItemRef, EpollReport};
 use carrick_el1_abi::ipc::fd::{Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::WaitFor;
 use carrick_el1_abi::ipc::{
-    BackingToken, IpcBacking, IpcCounterDeadline, IpcHandback, IpcObjectHandle, IpcOpKind,
-    IpcOpToken, IpcOperation, IpcUserVa, OfdPin, RawIpcObject, RawOfdPin,
+    BackingToken, IpcBacking, IpcCounterDeadline, IpcError, IpcHandback, IpcObjectHandle,
+    IpcOpKind, IpcOpToken, IpcOperation, IpcUserVa, OfdPin, RawIpcObject, RawOfdPin,
 };
 use carrick_guest_arch::CounterTick;
+
+use carrick_sched_core::object_wait::ipc_release::{
+    IpcLockIndex, IpcLockRelease, IpcLockReleaseVenue,
+};
+use carrick_sched_core::object_wait::{ObjectStateSnapshot, ObjectWaitKey};
+
+struct EpollLockRelease<'a, C: carrick_el1_abi::EntryContext> {
+    index: IpcLockIndex,
+    venue: IpcLockReleaseVenue<'a, C>,
+}
+
+impl<C: carrick_el1_abi::EntryContext> IpcLockRelease for EpollLockRelease<'_, C> {
+    fn carrier(&self) -> core::num::NonZeroU64 {
+        self.venue.carrier
+    }
+
+    fn released(&self, index: IpcLockIndex) {
+        if self.index == index {
+            self.venue.released(index);
+        }
+    }
+}
+
+enum Harvest {
+    Ready(EpollHarvest),
+    WaitForRelease(IpcOperation, ObjectWaitKey, ObjectStateSnapshot),
+    Refused,
+}
+
+fn harvest<E: IpcExecution>(
+    sched: &E,
+    region: &IpcRegion<'_>,
+    epoll: IpcObjectHandle,
+    operation: IpcOperation,
+    reports: &mut [EpollReport],
+    taken: &mut [EpollItemRef],
+) -> Harvest {
+    use carrick_sched_core::refusal::{Attempt, ContentionSource, Refusal, ReleaseCause, Settled};
+    let carrier = region.operation_slot_generation();
+    let release = IpcLockIndex::object(epoll.index() as usize)
+        .filter(|_| region.epoll_needs_host_release(epoll))
+        .and_then(|index| {
+            let source = sched.zone().ipc_lock_release_source(index, carrier).ok()?;
+            Some((index, source))
+        });
+    let Some((index, source)) = release else {
+        return region
+            .epoll_harvest(epoll, reports, taken, &EL1_WAIT)
+            .map_or(Harvest::Refused, Harvest::Ready);
+    };
+    let adapter = EpollLockRelease {
+        index,
+        venue: IpcLockReleaseVenue {
+            zone: sched.zone(),
+            carrier,
+            waker: carrick_sched_core::Waker::El1 { slot: sched.slot() },
+            deliver: crate::sched::object_wait::deliver_host_completion,
+        },
+    };
+    let tracked = region
+        .with_lock_release(&adapter)
+        .unwrap_or_else(|_| invalid());
+    match source.contend(|| {
+        match tracked.lock_epoll(epoll, &carrick_sched_core::BoundedSpin(0)) {
+            Ok(guard) => Ok(guard),
+            Err(IpcError::Contended) if region.has_tracked_lock_holder(epoll) => {
+                Err(Attempt::Contended(ReleaseCause::Object))
+            }
+            Err(IpcError::Contended) => {
+                // The failed probe observed a racing release or a legacy
+                // holder. A legacy holder owes no release publication.
+                tracked
+                    .lock_epoll(epoll, &EL1_WAIT)
+                    .map_err(|error| Attempt::Settled(Settled::Guest(error)))
+            }
+            Err(error) => Err(Attempt::Settled(Settled::Guest(error))),
+        }
+    }) {
+        Ok(guard) => tracked
+            .epoll_harvest_locked(guard, reports, taken, &EL1_WAIT)
+            .map_or(Harvest::Refused, Harvest::Ready),
+        // SAFETY: the pinned syscall and the pre-probe revision are passed
+        // directly to its scheduler park below. A raced park returns the
+        // same operation for one immediate rerun. No guard crosses the park.
+        Err(Refusal::Contended(ticket)) => unsafe {
+            ticket.park_and_rerun(operation, |op, enrollment| {
+                Harvest::WaitForRelease(
+                    op,
+                    enrollment.key(),
+                    ObjectStateSnapshot::before_object_probe(enrollment.observed()),
+                )
+            })
+        },
+        Err(Refusal::Invariant(_)) => invalid(),
+        Err(Refusal::Guest(_)) => Harvest::Refused,
+    }
+}
 
 /// `epoll_pwait` on AArch64 (`epoll_wait` is not in its table).
 pub const SYS_EPOLL_PWAIT: usize = 22;
@@ -132,7 +230,7 @@ pub(super) fn resume<E: IpcExecution, M: UserCopy>(
 
 /// Serve a fresh `epoll_pwait` (see the module docs for what forwards), or
 /// the rerun of one that accepted its mask and timeout and then waited for
-/// an operation slot (`admit_output`).
+/// an operation slot (`admit_wait`).
 pub(super) fn serve<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     frame: &mut E::Frame,
@@ -276,14 +374,20 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
         };
         let mut reports = [EpollReport::default(); BATCH];
         let mut taken = [EpollItemRef::default(); BATCH];
-        let harvest = match region.epoll_harvest(
+        let (harvest, lock_wait) = match harvest(
+            sched,
+            region,
             object,
+            op,
             &mut reports[..limit],
             &mut taken[..limit],
-            &EL1_WAIT,
         ) {
-            Ok(harvest) => harvest,
-            Err(_) => {
+            Harvest::Ready(harvest) => (harvest, None),
+            Harvest::WaitForRelease(operation, key, observed) => {
+                op = operation;
+                (EpollHarvest::default(), Some((key, observed)))
+            }
+            Harvest::Refused => {
                 release_pin(sched, OfdPin::from_raw(op.pin), region);
                 return leave(sched, IpcLeave::ObjectBusy, IpcServed::Forward);
             }
@@ -331,7 +435,7 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
                     }
                     *armed = true;
                 }
-                let token = match admit_output(sched, frame, venue, user, op, armed, interrupt) {
+                let token = match admit_wait(sched, frame, venue, user, op, armed, interrupt) {
                     Admitted::Operation(token) => token,
                     Admitted::Parked(served) => return served,
                     Admitted::Rerun => {
@@ -359,23 +463,31 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
             release_pin(sched, OfdPin::from_raw(op.pin), region);
             return returned(frame, harvest.reported as i64);
         }
-        let deadline = match wait {
-            Wait::Poll => {
-                release_pin(sched, OfdPin::from_raw(op.pin), region);
-                return returned(frame, 0);
+        let (key, observed, deadline) = if let Some((key, observed)) = lock_wait {
+            // The lock is short-lived and precedes any readiness decision.
+            // Its wake re-enters the call with the original absolute expiry.
+            if wait == Wait::Poll {
+                op.deadline = IpcCounterDeadline::at(sched.now());
             }
-            Wait::Forever => None,
-            Wait::Until(_) if !sched.may_time_park() => {
-                // Another timed park owns the slot's timer: the host waits
-                // with the deadline (nothing was taken).
+            (key, observed, None)
+        } else {
+            let deadline = match wait {
+                Wait::Poll => {
+                    release_pin(sched, OfdPin::from_raw(op.pin), region);
+                    return returned(frame, 0);
+                }
+                Wait::Forever => None,
+                Wait::Until(_) if !sched.may_time_park() => {
+                    release_pin(sched, OfdPin::from_raw(op.pin), region);
+                    return leave(sched, IpcLeave::EpollTimedWait, IpcServed::Forward);
+                }
+                Wait::Until(deadline) => Some(deadline),
+            };
+            let Some((key, observed)) = super::wait_key(object, WaitFor::Readable).zip(snap) else {
                 release_pin(sched, OfdPin::from_raw(op.pin), region);
-                return leave(sched, IpcLeave::EpollTimedWait, IpcServed::Forward);
-            }
-            Wait::Until(deadline) => Some(deadline),
-        };
-        let Some(snap) = snap else {
-            release_pin(sched, OfdPin::from_raw(op.pin), region);
-            return leave(sched, IpcLeave::ParkRefused, IpcServed::Forward);
+                return leave(sched, IpcLeave::ParkRefused, IpcServed::Forward);
+            };
+            (key, observed, deadline)
         };
         // Armed before the park, whose post-enrollment probe must already see
         // the temporary mask.
@@ -388,25 +500,38 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
             }
             *armed = true;
         }
-        let token = match region.begin_operation(op) {
-            Ok(token) => token,
-            Err(_) => {
-                disarm(user, armed);
-                release_pin(sched, OfdPin::from_raw(op.pin), region);
-                return leave(sched, IpcLeave::NoOperationRecord, IpcServed::Forward);
+        let token = if region.epoll_needs_host_release(object) {
+            match admit_wait(sched, frame, venue, user, op, armed, interrupt) {
+                Admitted::Operation(token) => token,
+                Admitted::Parked(served) => return served,
+                Admitted::Rerun => {
+                    (op, object) = match pin_epoll(sched, frame, venue, wait) {
+                        Ok(pinned) => pinned,
+                        Err(served) => return served,
+                    };
+                    continue;
+                }
+            }
+        } else {
+            match region.begin_operation(op) {
+                Ok(token) => token,
+                Err(_) => {
+                    disarm(user, armed);
+                    release_pin(sched, OfdPin::from_raw(op.pin), region);
+                    return leave(sched, IpcLeave::NoOperationRecord, IpcServed::Forward);
+                }
             }
         };
-        match park(
+        match park_key(
             sched,
             frame,
             region,
             token,
             op,
-            object,
-            WaitFor::Readable,
-            snap,
+            key,
+            observed,
             deadline,
-            &mut || user.interrupt_pending_wait() || interrupt(),
+            Some(&mut || user.interrupt_pending_wait() || interrupt()),
         ) {
             Parked::Done(served) => {
                 *armed = false;
@@ -510,9 +635,9 @@ fn disarm<M: UserCopy>(user: &mut M, armed: &mut bool) {
     }
 }
 
-/// How a refused copy-out's preparation was admitted to the operation arena.
+/// How an epoll wait was admitted to the operation arena.
 enum Admitted {
-    /// The `EpollWait` record the preparation retains (with the pin).
+    /// The `EpollWait` record the continuation retains (with the pin).
     Operation(IpcOpToken),
     /// Parked on the arena's slot release with the pin dropped: the thread
     /// replays the call when a slot returns.
@@ -521,9 +646,8 @@ enum Admitted {
     Rerun,
 }
 
-/// Admit a refused copy-out's preparation as its `EpollWait` record. A full
-/// arena is contention, "not now": never a forward or an errno. No record
-/// holds the call yet (the items are queued again), so the pin is dropped
+/// Admit the continuation as an `EpollWait` record. A full arena is
+/// contention. No record holds the call yet, so the pin is dropped
 /// and the thread parks on the arena's slot release (`admit_operation_wait`,
 /// the source every retirement publishes to) with a replay receipt that
 /// owns nothing; the scheduler re-runs the call once a slot returns.
@@ -534,7 +658,7 @@ enum Admitted {
 /// operation's absolute expiry is retained by the native owner for the
 /// rerun ([`serve`]), which reads neither argument again. A signal the mask
 /// does not block ends the wait, and the rerun returns EINTR.
-fn admit_output<E: IpcExecution, M: UserCopy>(
+fn admit_wait<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     frame: &mut E::Frame,
     venue: &IpcVenue<'_>,

@@ -244,10 +244,13 @@ impl ZoneEpoll {
         self.owner.service_wake(&wake);
     }
 
-    fn ctl(result: Result<Option<IpcWake>, EpollCtlError>, this: &Self) -> ZoneCtl {
+    pub(super) fn ctl(
+        result: Result<Option<IpcWake>, EpollCtlError>,
+        deliver: impl FnOnce(Option<IpcWake>),
+    ) -> ZoneCtl {
         match result {
             Ok(wake) => {
-                this.deliver(wake);
+                deliver(wake);
                 ZoneCtl::Done
             }
             Err(EpollCtlError::Exists) => ZoneCtl::Exists,
@@ -278,7 +281,7 @@ impl ZoneEpoll {
             data,
             &HostLockWait,
         );
-        Self::ctl(result, self)
+        Self::ctl(result, |wake| self.deliver(wake))
     }
 
     /// `EPOLL_CTL_MOD` of the zone item `(fd, file_key)`.
@@ -291,7 +294,7 @@ impl ZoneEpoll {
             data,
             &HostLockWait,
         );
-        Self::ctl(result, self)
+        Self::ctl(result, |wake| self.deliver(wake))
     }
 
     /// `EPOLL_CTL_DEL` of the zone item `(fd, file_key)`.
@@ -301,7 +304,7 @@ impl ZoneEpoll {
             .region()
             .epoll_delete(self.object, fd, file_key, &HostLockWait)
             .map(|()| None);
-        Self::ctl(result, self)
+        Self::ctl(result, |wake| self.deliver(wake))
     }
 
     /// The host half now has `count` items (EL1 serves only at zero).

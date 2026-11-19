@@ -317,6 +317,16 @@ pub(crate) fn is_zone_releasable_backing(
     )
 }
 
+pub(crate) fn can_release_backing_in_ring(
+    region: &IpcRegion<'_>,
+    description: carrick_el1_abi::ipc::fd::Description,
+) -> bool {
+    match IpcBacking::decode(description.backing) {
+        Some(IpcBacking::Epoll { object }) => !region.epoll_needs_host_release(object),
+        _ => is_zone_releasable_backing(description),
+    }
+}
+
 pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
     region: &IpcRegion<'_>,
     release: carrick_el1_abi::ipc::fd::DeferredRelease,
@@ -925,6 +935,7 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
             EpollMember::EventFd => WaitFor::Readable,
             // Every change to a stream pair wakes both of its lanes.
             EpollMember::StreamFirst | EpollMember::StreamSecond => WaitFor::Readable,
+            EpollMember::HostSocket => unreachable!("not an in-zone poll member"),
         };
         let mut guard = match region.lock(object, &EL1_WAIT) {
             Ok(guard) => guard,
@@ -1411,8 +1422,23 @@ fn admit<E: IpcExecution, M: UserCopy>(
 /// for readers, EPIPE for writers). Only IPC-backed descriptions are ever
 /// pinned in EL1.
 fn release_pin<E: IpcExecution>(sched: &mut E, pin: OfdPin, region: &IpcRegion<'_>) {
-    let Ok(Some(description)) = region.fd(EL1_WAIT).unpin(pin) else {
+    let Ok(release) = region.fd(EL1_WAIT).unpin_filtered(pin, |description| {
+        can_release_backing_in_ring(region, description)
+    }) else {
         return;
+    };
+    let description = match release {
+        carrick_el1_abi::ipc::fd::DeferredRelease::None => return,
+        carrick_el1_abi::ipc::fd::DeferredRelease::Deferred(_) => {
+            let _ = settle_native_release(
+                region,
+                release,
+                Some((sched.zone(), sched.slot())),
+                sched.task(),
+            );
+            return;
+        }
+        carrick_el1_abi::ipc::fd::DeferredRelease::Now(description) => description,
     };
     let Ok(IpcReleased::Object { wake, freed }) =
         region.release_backing(description.backing, &Finish)
@@ -2145,7 +2171,9 @@ pub fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
         .map_err(|_| NativeProcessError::Stale)?;
     let release = region
         .fd(EL1_WAIT)
-        .unpin_filtered(OfdPin::from_raw(op.pin), is_zone_releasable_backing)
+        .unpin_filtered(OfdPin::from_raw(op.pin), |description| {
+            can_release_backing_in_ring(region, description)
+        })
         .map_err(|_| NativeProcessError::Quarantined)?;
     settle_native_release(region, release, Some((zone, slot)), task)
         .map_err(|_| NativeProcessError::Quarantined)?;
@@ -2286,7 +2314,9 @@ fn finish_native<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &Ipc
         });
     let release = region
         .fd(EL1_WAIT)
-        .unpin_filtered(OfdPin::from_raw(op.pin), is_zone_releasable_backing)
+        .unpin_filtered(OfdPin::from_raw(op.pin), |description| {
+            can_release_backing_in_ring(region, description)
+        })
         .unwrap_or_else(|_| {
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
         });
@@ -4334,6 +4364,84 @@ mod tests {
             Ok(2),
             "A's and the forked B's descriptors; the wait's pin dropped"
         );
+    }
+
+    #[test]
+    fn el1_epoll_host_socket_busy_once_then_harvests() {
+        use carrick_el1_abi::ipc::epoll::EpollReport;
+        use carrick_sched_core::object_wait::ipc_release::{IpcLockIndex, IpcLockReleaseVenue};
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let eventfd = w.eventfd(a, 0, EventMode::Counter, NONBLOCK);
+        let (ep, object) = zone_epoll(&w, a, eventfd, 0);
+        let (pipe, _, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let buffer = 0x20_000;
+        w.mem.map(MM, buffer, PAGE);
+        w.mem.map(OTHER_MM, buffer, PAGE);
+        let other = syscall(SYS_READ, pipe, buffer, 16, B_SVC);
+        w.queue(202, OTHER_MM, &other, B_SVC);
+        w.region
+            .epoll_add_host_socket(
+                object,
+                Fd(9),
+                0x2418,
+                EpollReport {
+                    events: EPOLL_IN,
+                    data: 0x2418,
+                },
+                EPOLL_IN,
+                &HostWait,
+            )
+            .unwrap();
+
+        let index = IpcLockIndex::object(object.index() as usize).unwrap();
+        let carrier = w.region.operation_slot_generation();
+        struct ReleaseProbe {
+            carrier: core::num::NonZeroU64,
+            released: core::sync::atomic::AtomicBool,
+        }
+        impl carrick_sched_core::object_wait::ipc_release::IpcLockRelease for ReleaseProbe {
+            fn carrier(&self) -> core::num::NonZeroU64 {
+                self.carrier
+            }
+            fn released(&self, _: IpcLockIndex) {
+                self.released.store(true, Ordering::Release);
+            }
+        }
+        let probe = ReleaseProbe {
+            carrier,
+            released: core::sync::atomic::AtomicBool::new(false),
+        };
+        w.zone
+            .bind_ipc_lock_release(index, carrier, &HostWait, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(&w.zone, owned)
+            })
+            .unwrap();
+        let tracked = w.region.with_lock_release(&probe).unwrap();
+        let held = tracked.lock(object, &HostWait).unwrap();
+
+        // The ready item cannot be read while the carrier owns the lock.
+        // Even timeout zero must transfer the operation, then report it.
+        let mut wait = epoll_pwait(ep, buffer, 1, 0, A_SVC);
+        assert_eq!(w.call(&mut wait), SWITCHED);
+        assert_eq!(wait.elr, B_SVC);
+        drop(held);
+        assert!(probe.released.load(Ordering::Acquire));
+        let venue = IpcLockReleaseVenue {
+            zone: &*w.zone,
+            carrier,
+            waker: carrick_sched_core::Waker::Host,
+            deliver: crate::sched::object_wait::deliver_host_completion,
+        };
+        carrick_sched_core::object_wait::ipc_release::IpcLockRelease::released(&venue, index);
+
+        let mut other = other;
+        assert_eq!(w.call(&mut other), SWITCHED);
+        reenter(&mut other, A_SVC);
+        assert_eq!((w.call(&mut other), other.x[0]), (RETURNED, 1));
+        assert_eq!(w.mem.read(MM, buffer + 8, 8), 0x2418u64.to_ne_bytes());
+        assert_eq!(leaves(&w, IpcLeave::ObjectBusy), 0);
     }
 
     /// A finite timeout with nothing ready parks in the guest; the slot's

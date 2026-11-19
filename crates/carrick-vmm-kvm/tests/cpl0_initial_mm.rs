@@ -5787,6 +5787,118 @@ fn native_child_go_netpoller_adds_a_udp_socket_to_epoll() {
     assert_dns_steps_are_linux(&dns_style_udp_steps(false), &[GO_NETPOLL_STEPS]);
 }
 
+/// A real UDP peer supplies a datagram only after two native threads
+/// release their execution lanes into the ring epoll's same Readable queue.
+#[test]
+fn native_child_host_epoll_wakes_two_parked_waiters() {
+    use std::time::{Duration, Instant};
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp peer");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let port = format!(
+        "-DEPOLL_WAIT_PORT={}",
+        peer.local_addr().unwrap().port().swap_bytes()
+    );
+    let elf = native_exit_fixture_with_flags(
+        "native_child_inet.S",
+        &["-DTCP_PORT=0", "-DUDP_PORT=0", "-DTCP_NB_PORT=0", &port],
+    );
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF");
+    let mut sender = None;
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        256,
+        ROOT_AFFINITY_LOADED,
+        |carrier| {
+            let zone = carrier.carrier_zone_wake().expect("carrier wake domain");
+            sender = Some(std::thread::spawn(move || {
+                let mut ping = [0u8];
+                let (len, client) = peer.recv_from(&mut ping).expect("native child ping");
+                assert_eq!((len, ping), (1, [1]));
+                // A witness-only observation of guest scheduler records.
+                // The application neither probes nor sleeps for readiness.
+                let bound = Instant::now() + Duration::from_secs(4);
+                loop {
+                    let waits = (1..=carrick_sched_core::ZONE_RECORDS).filter_map(|index| {
+                        let id = carrick_sched_core::RecordId::from_raw(index as u32)?;
+                        let record = zone.zone().record(id);
+                        let wait = record.object_wait_census()?;
+                        (record.has_adapter_operation() && wait.queue != 0)
+                            .then_some((wait.queue, wait.generation))
+                    });
+                    let mut counts = std::collections::HashMap::new();
+                    if waits.into_iter().any(|key| {
+                        let count = counts.entry(key).or_insert(0);
+                        *count += 1;
+                        *count == 2
+                    }) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < bound,
+                        "both waits must enrol before the host reply"
+                    );
+                    std::thread::yield_now();
+                }
+                assert_eq!(peer.send_to(b"r", client).unwrap(), 1);
+            }));
+        },
+        carrick_kernel::dispatch::SyscallDispatcher::default(),
+    )
+    .map_err(|failure| failure.error)
+    .expect("run native epoll waiters");
+    assert_eq!(outcome.run.exit_code, 0, "{:?}", outcome.run);
+    sender
+        .unwrap()
+        .join()
+        .expect("host supplied readiness after both parks");
+}
+
+#[test]
+fn native_child_host_epoll_reports_unrequested_hup_and_error() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::time::Duration;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reset peer");
+    let port = format!(
+        "-DEPOLL_HUP_PORT={}",
+        listener.local_addr().unwrap().port().swap_bytes()
+    );
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("native child connected");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut ping = [0];
+        socket
+            .read_exact(&mut ping)
+            .expect("epoll registration is live");
+        assert_eq!(ping, [1]);
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: the peer owns the live TCP descriptor and linger value.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&linger as *const libc::linger).cast(),
+                core::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0);
+    });
+    let elf = native_exit_fixture_with_flags(
+        "native_child_inet.S",
+        &["-DTCP_PORT=0", "-DUDP_PORT=0", "-DTCP_NB_PORT=0", &port],
+    );
+    let outcome = run_exec_fixture(&elf, 128);
+    assert_eq!(outcome.run.exit_code, 0, "{:?}", outcome.run);
+    server.join().expect("TCP peer reset after registration");
+}
+
 /// #2418 item 3: the x86 run root makes the same resolver calls itself.
 /// Its `socket()` is a counted ENOSYS: x86 has no crossing for the socket
 /// family, and the venue serves only a native child's.

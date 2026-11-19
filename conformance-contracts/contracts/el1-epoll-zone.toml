@@ -21,7 +21,7 @@ guest_surfaces = [
 semantic_authority = [
   "man 7 epoll: level-triggered members are reported while ready; edge-triggered members once per new arrival; EPOLLONESHOT disarms after one report until EPOLL_CTL_MOD; an item is removed only when the last descriptor of its open description closes",
   "man 2 epoll_wait / epoll_pwait: timeout 0 returns at once, -1 blocks until an event or a signal, a finite timeout returns 0 when it expires; EINTR when a signal handler interrupts the wait; the sigmask of epoll_pwait replaces the thread mask for exactly the call; EINVAL for maxevents <= 0 or a non-epoll fd, EBADF for a bad epfd, EFAULT for an unwritable events buffer",
-  "man 2 epoll_ctl: EEXIST, ENOENT, EBADF, EINVAL (self add)",
+  "man 2 epoll_ctl: EEXIST, ENOENT, EBADF, EINVAL (self add); ERR and HUP are reported without being requested",
   "man 2 epoll_pwait2: unreadable timeout memory returns EFAULT; a native input owner result must replace the syscall ordinal in the ABI return register",
   "man 7 signal: epoll_wait and epoll_pwait are never restarted after a handler, SA_RESTART or not",
   "man 7 pipe / man 2 eventfd: readiness of the member objects",
@@ -42,6 +42,14 @@ Linux needs no such work: a waiter on an epoll of in-memory objects
 sleeps and is woken by the writer's wake callback. Carrick must do the
 same in the zone: an eventfd round trip between two threads through such
 an epoll costs no host exit in steady state.
+
+Native sockets are real crossings. Their interest, ready list, event cookies
+and waits still live in the shared epoll record. The carrier enrolls the
+host source before sampling it, and publishes only the affected
+registrations through the existing carrier wait service. The reactor needs
+one multiplexer descriptor for the carrier, and socket publications do
+not scan unrelated interests or create a readiness pipe for an in-zone
+object. The eventfd budgets below apply to the all-in-zone fixture.
 """
 
 [bindings]
@@ -51,6 +59,7 @@ vm_free = [
   "carrick-el1-abi::ipc::epoll::tests::{bounded_ready_count_preserves_edges_and_oneshots,ready_count_survives_cursor_replacement_between_batches,ready_count_requires_shared_zone_only_proof}",
   "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::{s1_empty_epoll_skips_owner_preparation,s1_host_epoll_refusals_preserve_edge_and_empty_host_policy}",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_epoll_pwait_sigmask_on_a_ring_epoll_is_never_forwarded (production native-child entry, #1671: two live tasks share one ring epoll; libuv's epoll_pwait with a SIGPROF mask EINVALs on a bad sigsetsize, parks in ring with the initial mask snapshot retained across lost-readiness repark despite buffer overwrite, harvests after buffer unmapping and restores the original mask on completion, and is never forwarded to the host; no signed, EINTR-handler or x86 execution claim)",
+  "carrick-el1-linux::ipc::tests::el1_epoll_host_socket_busy_once_then_harvests",
   "carrick-el1-linux::ipc::tests::el1_epoll_zone_sigmask_wait_arms_while_parked_and_never_forwards_a_native_call",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_pipe_writer_reaches_its_parent (production native-child entry, #1671: epoll_pwait into an events page the ring's copy refuses until the native owner prepares it reports the ET event once with the right bytes, never forwarded (ipc_leaves[EpollCopyOut] 0, forwarded[22] unchanged); an owner-faulted buffer is EFAULT in ring and its report stays queued; no signed or x86 execution claim)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_netpoll_eventfd_wait (production native-child entry, child-created eventfd and epoll, EPOLLIN|EPOLLET ADD/MOD/DEL, timeout-zero readiness, epoll_pwait2 zero/invalid timespec and finite park with retained deadline despite timespec mutation, and inherited eventfd writer wake; zero forwarded calls and released execution capacity, no signed or x86 execution claim)",
@@ -63,6 +72,8 @@ embed = [
   "carrick-vmm-kvm::cpl0_initial_mm::zone_epoll_pwait_blocks_until_child_pipe_write (production CPL0 guest execution; epoll_create1, pipe ADD, parent pwait(-1), child write, packed readiness cookie, no epoll forwarding or ring refusals)",
   "carrick-vmm-kvm::cpl0_initial_mm::zone_epoll_pwait2_bad_timeout_returns_input_owner_fault (production CPL0 guest execution with a real unmapped timeout; EFAULT reaches rax, no forwarding or ring refusal)",
   "carrick-vmm-kvm::cpl0_initial_mm::native_child_go_netpoller_adds_a_udp_socket_to_epoll (#2418 item 2: production CPL0 guest executes legacy epoll_wait on a native child’s ring epoll after EPOLL_CTL_ADD of its own connected loopback UDP socket)",
+  "carrick-vmm-kvm::cpl0_initial_mm::native_child_host_epoll_wakes_two_parked_waiters (#2418 item 2: two guest threads park on one level-triggered ring epoll before the host sends the datagram; both receive the original cookie, DEL removes the report while the socket is readable)",
+  "carrick-vmm-kvm::cpl0_initial_mm::native_child_host_epoll_reports_unrequested_hup_and_error (#2418 item 2: a live TCP peer resets the connection after EPOLL_CTL_ADD; the native child receives ERR|HUP and the original cookie even with neither event requested)",
 ]
 docker = [
   "probe:epollzonepingpong|epollzonetrigger|epollzonetimeout|epollzoneeintr|epollzoneclose|epollzonemixed|epollzonesigmask",
