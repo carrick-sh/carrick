@@ -169,6 +169,7 @@ embed = [
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_loader_open_close_reopen_uses_one_native_descriptor_namespace (three open/close pairs reuse one ring descriptor; exit 0, seven entries, zero refusals)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_cwd_and_relative_open_agree (native Linux control and directory-specific marker bytes)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_resolves_relative_paths_through_dirfds",
+  "KVM CLI root: carrick-cli::x86_kvm_run::mounted_static_x86_ring_held_dirfd_relative_paths_are_a_counted_enosys",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_syncs_and_queries_its_host_file",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_uses_positioned_and_vectored_io",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_child_uses_host_file_xattrs",

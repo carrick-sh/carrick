@@ -2572,17 +2572,20 @@ fn mounted_static_x86_files_crossings_match_native() {
 }
 
 /// A directory the root's staged `openat` holds is the ring's description:
-/// its number names nothing in the root's host task. An absolute path ignores
-/// it (the files witness above); a relative one needs it as the base, which
-/// the shared path staging does not serve yet, so it is the ring's counted
-/// ENOSYS and never resolved against whatever the host task has under the
-/// number (#2157 B1 P0-2). Under carrick only: native Linux resolves it.
+/// its number names nothing in the root's host task. A relative pathname
+/// resolves through that description on both Linux and Carrick (#2216).
+/// The test keeps its historical identity for the gate's receipts.
 #[test]
 fn mounted_static_x86_ring_held_dirfd_relative_paths_are_a_counted_enosys() {
     if skip_without_kvm() {
         return;
     }
-    let run = run_crossing_fixture("x86_b1_files.S", &["-DRING_DIRFD"], true);
+    let fixture = "x86_b1_files.S";
+    let flags = ["-DRING_DIRFD"];
+    let native = run_crossing_fixture(fixture, &flags, false);
+    assert_eq!(native.stdout, b"F\n", "native ring dirfd: {native:?}");
+    assert_eq!(native.status.code(), Some(7));
+    let run = run_crossing_fixture(fixture, &flags, true);
     assert_eq!(
         run.stdout,
         b"F\n",
@@ -2590,7 +2593,7 @@ fn mounted_static_x86_ring_held_dirfd_relative_paths_are_a_counted_enosys() {
         run.status.code(),
         String::from_utf8_lossy(&run.stderr)
     );
-    assert_eq!(run.status.code(), Some(7));
+    assert_eq!(run.status.code(), native.status.code());
     assert!(run.stderr.is_empty(), "{:?}", run.stderr);
 }
 
