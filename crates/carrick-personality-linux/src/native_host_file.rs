@@ -372,10 +372,10 @@ impl HostFileCall {
     /// - A read, seek or `write` of a delegated stdio descriptor keeps its
     ///   host route, which owns the terminal and blocking-read semantics.
     ///   `writev` has no host route, so it is staged for every descriptor.
-    /// - Path mutations stay child-scoped: the initial task keeps its host
-    ///   route. `ftruncate`, `fchmod` and `fchown` name a descriptor, so they
-    ///   follow the descriptor: one the root's `openat` installed lives in
-    ///   the ring namespace and the host task has nothing under its number
+    /// - Cwd-based mutations stay child-scoped. A path mutation naming a
+    ///   directory descriptor follows that descriptor's owner. Descriptor
+    ///   mutations such as `ftruncate`, `fchmod` and `fchown` also follow the
+    ///   descriptor: the root's staged `openat` installs into the ring table
     ///   (#2157 B1, #231).
     /// - `readlinkat(AT_FDCWD, ...)` keeps its existing route. A directory
     ///   operand follows the ring descriptor it names.
@@ -1222,8 +1222,8 @@ pub fn crossing_output_stage(
 /// on its existing route, whether the venue does not know it or does not
 /// admit it for this origin: when that route is a host crossing in `set`,
 /// the answer is its [`crossing_output_stage`], so a declared output is
-/// writable before the crossing runs (a root's `readlinkat`, which the venue
-/// decodes but never admits, #2201).
+/// writable before the crossing runs (such as a root's
+/// `readlinkat(AT_FDCWD, ...)`, #2201).
 pub fn admit_or_cross(
     set: crate::crossing::HostCrossingSet,
     native: carrick_guest_arch::NativeOrdinal,

@@ -4417,7 +4417,8 @@ fn serial_host_fork_child_resolves_relative_paths_through_dirfds() {
         ring_descriptor_run("-DDIRFD"),
         (0, vec![]),
         "70 mkdirat, 71 openat, 72 newfstatat, 73 renameat, 74 unlinkat file, \
-         75 unlinkat directory, 76 second directory fd, 77 parent's sibling unlinkat"
+         75 unlinkat directory, 76 second directory fd, 77 parent's sibling unlinkat, \
+         87 symlinkat, 88 readlinkat, 89 unlinkat symlink"
     );
 }
 
