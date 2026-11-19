@@ -1,0 +1,20 @@
+schema_version = 1
+id = "softcpu.a64.el0-fp"
+title = "Software AArch64 EL0 floating-point instruction admission and state"
+guest_surfaces = ["isa:aarch64", "vmm:soft", "fault:undefined-instruction"]
+semantic_authority = [
+  "Arm ARM DDI0487 C4.1 A64 encoding index and C7 SIMD and floating-point instruction descriptions",
+]
+fixture = "carrick-softcpu-aarch64::el0_fp"
+scale_points = [1]
+structural_budgets = []
+rationale = "Allocated register-only instructions remain one native word within the existing block. Reserved or withheld encodings take the existing guest exception exit. The emitter witness checks both paths without a VM."
+
+[bindings]
+vm_free = [
+  "carrick-softcpu-aarch64::el0_fp::scalar_fp_is_copied_only_for_allocated_single_and_double_encodings",
+]
+
+[bindings.unresolved]
+embed = "The signed HVF embed lane uses hardware AArch64 execution. The native software translator witness belongs on a Linux AArch64 runner."
+docker = "ARM execution on the worker requires a native AArch64 host. No cached native arm64 Docker rootfs is present on the x86 worker."
