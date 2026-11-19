@@ -11,3 +11,5 @@ pub mod cpl0_boot;
 #[cfg(target_arch = "x86_64")]
 mod cpl0_private_witness;
 pub mod guest_ram;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod host_readiness;
