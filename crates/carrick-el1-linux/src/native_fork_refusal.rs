@@ -165,6 +165,127 @@ pub enum NativeForkClass {
 }
 
 impl NativeForkRefusal {
+    fn fatal_detail(self) -> carrick_el1_abi::NativeForkFatalDetail {
+        use carrick_el1_abi::{
+            ForkStockRefusal as Stock, NativeForkFatalCause as Cause, NativeForkFatalStage as Stage,
+        };
+        use carrick_mmu_core::aarch64::PageTableError as Table;
+
+        let stage = match self.stage {
+            NativeForkStage::ParentLifecycleGate { .. } => Stage::ParentLifecycleGate,
+            NativeForkStage::BirthReservation => Stage::BirthReservation,
+            NativeForkStage::ParentSpaceEdit => Stage::ParentSpaceEdit,
+            NativeForkStage::ParentForkReady => Stage::ParentForkReady,
+            NativeForkStage::ChildLifecycleClaim => Stage::ChildLifecycleClaim,
+            NativeForkStage::ChildControlReset => Stage::ChildControlReset,
+            NativeForkStage::BirthPublication => Stage::BirthPublication,
+            NativeForkStage::PrepareService => Stage::PrepareService,
+            NativeForkStage::ForkFileTable => Stage::ForkFileTable,
+            NativeForkStage::CommitChildService => Stage::CommitChildService,
+            NativeForkStage::MappingCount => Stage::MappingCount,
+            NativeForkStage::SpaceAccess => Stage::SpaceAccess,
+            NativeForkStage::ParentRoot => Stage::ParentRoot,
+            NativeForkStage::ObserveMappings => Stage::ObserveMappings,
+            NativeForkStage::TransferSequence => Stage::TransferSequence,
+            NativeForkStage::Census => Stage::Census,
+            NativeForkStage::PublishRoot => Stage::PublishRoot,
+            NativeForkStage::Scratch => Stage::Scratch,
+            NativeForkStage::Prepare => Stage::Prepare,
+            NativeForkStage::Publish => Stage::Publish,
+            NativeForkStage::Reserve => Stage::Reserve,
+            NativeForkStage::Commit => Stage::Commit,
+            NativeForkStage::Abort => Stage::Abort,
+            NativeForkStage::OpenChildSpace => Stage::OpenChildSpace,
+            NativeForkStage::StockCrossing => Stage::StockCrossing,
+            NativeForkStage::Entry => Stage::Entry,
+        };
+        let cause = match self.cause {
+            NativeForkCause::Busy => Cause::Busy,
+            NativeForkCause::GateShut => Cause::GateShut,
+            NativeForkCause::Mm(error) => match error {
+                MmError::Fault => Cause::MmFault,
+                MmError::UnsupportedExecutableCow => Cause::MmUnsupportedExecutableCow,
+                MmError::Stale => Cause::MmStale,
+                MmError::Busy => Cause::MmBusy,
+                MmError::Wait(_) => Cause::MmWait,
+                MmError::NoMemory => Cause::MmNoMemory,
+                MmError::MetadataRequired => Cause::MmMetadataRequired,
+                MmError::Invalid => Cause::MmInvalid,
+                MmError::Core => Cause::MmCore,
+                MmError::Reservation(refusal) => match refusal {
+                    Refusal::Busy => Cause::MmReservationBusy,
+                    Refusal::PreparedConflict => Cause::MmReservationPreparedConflict,
+                    Refusal::Stale => Cause::MmReservationStale,
+                    Refusal::Invalid => Cause::MmReservationInvalid,
+                    Refusal::Collision => Cause::MmReservationCollision,
+                    Refusal::Hole => Cause::MmReservationHole,
+                    Refusal::ForeignMapping => Cause::MmReservationForeignMapping,
+                    Refusal::Limit => Cause::MmReservationLimit,
+                    Refusal::MetadataRequired => Cause::MmReservationMetadataRequired,
+                },
+                MmError::Table(error) => match error {
+                    Table::OutOfTables => Cause::MmTableOutOfTables,
+                    Table::BadAddress => Cause::MmTableBadAddress,
+                    Table::MissingArenaSource => Cause::MmTableMissingArenaSource,
+                    Table::ConflictingArenaSource => Cause::MmTableConflictingArenaSource,
+                    Table::UnresolvedArena(_) => Cause::MmTableUnresolvedArena,
+                    Table::GicWindowOutput => Cause::MmTableGicWindowOutput,
+                    Table::MetadataAllocation => Cause::MmTableMetadataAllocation,
+                    Table::GuestOwnsLiveDescriptors => Cause::MmTableGuestOwnsLiveDescriptors,
+                    Table::CarrickOwnedWindow => Cause::MmTableCarrickOwnedWindow,
+                },
+            },
+            NativeForkCause::Reservation(refusal) => match refusal {
+                Refusal::Busy => Cause::ReservationBusy,
+                Refusal::PreparedConflict => Cause::ReservationPreparedConflict,
+                Refusal::Stale => Cause::ReservationStale,
+                Refusal::Invalid => Cause::ReservationInvalid,
+                Refusal::Collision => Cause::ReservationCollision,
+                Refusal::Hole => Cause::ReservationHole,
+                Refusal::ForeignMapping => Cause::ReservationForeignMapping,
+                Refusal::Limit => Cause::ReservationLimit,
+                Refusal::MetadataRequired => Cause::ReservationMetadataRequired,
+            },
+            NativeForkCause::Fork(error) => match error {
+                ForkError::Invalid => Cause::ForkInvalid,
+                ForkError::NoMemory => Cause::ForkNoMemory,
+                ForkError::Busy => Cause::ForkBusy,
+                ForkError::SnapshotMoved => Cause::ForkSnapshotMoved,
+                ForkError::Stale => Cause::ForkStale,
+                ForkError::MetadataRequired => Cause::ForkMetadataRequired,
+                ForkError::Core => Cause::ForkCore,
+                ForkError::OwnerRefusal(refusal) => match refusal {
+                    ForkOwnerRefusal::Invalid => Cause::ForkOwnerInvalid,
+                    ForkOwnerRefusal::Collision => Cause::ForkOwnerCollision,
+                    ForkOwnerRefusal::Hole => Cause::ForkOwnerHole,
+                    ForkOwnerRefusal::ForeignMapping => Cause::ForkOwnerForeignMapping,
+                    ForkOwnerRefusal::Limit => Cause::ForkOwnerLimit,
+                },
+            },
+            NativeForkCause::StockReservation(refusal) => match refusal {
+                Stock::Invalid => Cause::StockReservationInvalid,
+                Stock::Stale => Cause::StockReservationStale,
+                Stock::Capacity => Cause::StockReservationCapacity,
+                Stock::Inventory => Cause::StockReservationInventory,
+            },
+            NativeForkCause::StockCrossing { reply, .. } => match reply {
+                Some(Stock::Invalid) => Cause::StockCrossingInvalid,
+                Some(Stock::Stale) => Cause::StockCrossingStale,
+                Some(Stock::Capacity) => Cause::StockCrossingCapacity,
+                Some(Stock::Inventory) => Cause::StockCrossingInventory,
+                None => Cause::StockCrossingMissingReply,
+            },
+            NativeForkCause::SiblingBirth { .. } => Cause::SiblingBirth,
+            NativeForkCause::MetadataOwed { .. } => Cause::MetadataOwed,
+            NativeForkCause::Untyped(error) => match error {
+                UntypedInvariant::Stale => Cause::UntypedStale,
+                UntypedInvariant::Invalid => Cause::UntypedInvalid,
+                UntypedInvariant::Quarantined => Cause::UntypedQuarantined,
+            },
+        };
+        carrick_el1_abi::NativeForkFatalDetail { stage, cause }
+    }
+
     /// The one class of this refusal's cause ([`NativeForkClass`]).
     pub fn class(self) -> NativeForkClass {
         use NativeForkClass as Class;
@@ -276,13 +397,12 @@ fn stock_class(refusal: carrick_el1_abi::ForkStockRefusal) -> NativeForkClass {
 
 /// End the run on a fork refusal that broke a kernel invariant
 /// ([`NativeForkClass::InvariantViolation`]): never a guest errno. The
-/// diagnostic names the refusal's stage and cause; the fatal carries the
-/// typed reason `NativeForkInvariant` through the entry-completion sink.
+/// entry-completion sink carries the typed refusal as its fatal detail.
 #[track_caller]
 pub fn invariant_violated(refusal: NativeForkRefusal) -> ! {
     emit(format_args!("{refusal:?}; class=InvariantViolation"));
-    super::dispatch::invalid_completion(super::dispatch::NativeInvariant::NativeService(
-        carrick_el1_abi::EntryBindingFatalReason::NativeForkInvariant,
+    super::dispatch::invalid_completion(super::dispatch::NativeInvariant::NativeFork(
+        refusal.fatal_detail(),
     ))
 }
 

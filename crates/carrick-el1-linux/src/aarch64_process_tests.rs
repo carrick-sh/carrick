@@ -3934,7 +3934,16 @@ fn fork_loan_inventory_reply_is_not_now_then_forks() {
 fn serial_host_fork_loan_invariant_reply_ends_the_run() {
     super::native_process_runtime::host_test_support::fork_refusal_class::fatal_child(
         "aarch64_process_tests::serial_host_fork_loan_invariant_reply_ends_the_run",
-        &["stale", "invalid"],
+        &[
+            (
+                "stale",
+                "NativeForkInvariantStockCrossingStockReservationStale",
+            ),
+            (
+                "invalid",
+                "NativeForkInvariantStockCrossingStockReservationInvalid",
+            ),
+        ],
         None,
         |case| {
             fork_with_refused_loan(match case {

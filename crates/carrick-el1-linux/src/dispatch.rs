@@ -2806,6 +2806,7 @@ impl PhysicalCustodyInvariant {
 pub enum NativeInvariant {
     EntryBinding,
     NativeService(carrick_el1_abi::EntryBindingFatalReason),
+    NativeFork(carrick_el1_abi::NativeForkFatalDetail),
     PhysicalCustody(PhysicalCustodyInvariant),
     MissingNativeFrame,
     RevisionCredit,
@@ -2823,6 +2824,7 @@ impl core::fmt::Debug for NativeInvariant {
             Self::PipeOutput => f.write_str("PipeOutput"),
             Self::OwnedFamilyForward => f.write_str("OwnedFamilyForward"),
             Self::NativeService(error) => f.debug_tuple("NativeService").field(error).finish(),
+            Self::NativeFork(detail) => core::fmt::Display::fmt(detail, f),
             Self::PhysicalCustody(reason) => f
                 .debug_tuple("PhysicalCustody")
                 .field(&reason.as_str())
@@ -2847,6 +2849,7 @@ impl NativeInvariant {
             NativeInvariant::PipeOutput => Fatal::NativeServiceQuarantined,
             NativeInvariant::OwnedFamilyForward => Fatal::OwnedFamilyForward,
             NativeInvariant::NativeService(reason) => *reason,
+            NativeInvariant::NativeFork(_) => Fatal::NativeForkInvariant,
             NativeInvariant::PhysicalCustody(reason) => match reason {
                 PhysicalCustodyInvariant::RootExitRefused => Fatal::RootExitRefused,
                 PhysicalCustodyInvariant::ForkCustodyRefused => Fatal::ForkCustodyRefused,
@@ -2957,7 +2960,12 @@ fn native_service_fatal_reason(
 #[track_caller]
 pub fn invalid_completion(reason: NativeInvariant) -> ! {
     #[cfg(target_os = "none")]
-    carrick_el1::substrate::sched::hw::fatal_entry_binding(reason.fatal_reason());
+    carrick_el1::substrate::sched::hw::fatal_entry_binding(match reason {
+        NativeInvariant::NativeFork(detail) => {
+            carrick_el1_abi::EntryBindingFatalKind::NativeFork(detail)
+        }
+        _ => reason.fatal_reason().into(),
+    });
     #[cfg(not(target_os = "none"))]
     carrick_fatal::carrick_fatal!(
         "el1::entry_completion",

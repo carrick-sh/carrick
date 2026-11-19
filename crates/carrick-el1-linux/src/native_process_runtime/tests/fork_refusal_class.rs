@@ -55,6 +55,7 @@ fn invariant_case(case: &str) -> NativeProcessError {
         ),
         // A Stale prepare or publish is a broken invariant: a parent
         // snapshot another thread moved is `MmError::Busy` at its source.
+        "scratch-fault" => refused(NativeForkStage::Scratch, MmError::Fault),
         "prepare-stale" => refused(NativeForkStage::Prepare, MmError::Stale),
         "publish-stale" => refused(NativeForkStage::Publish, MmError::Stale),
         // An untyped invariant answer from the birth or its MM service, such
@@ -80,7 +81,7 @@ static FATAL_PREPARATIONS: core::sync::atomic::AtomicUsize =
 #[cfg(test)]
 pub(crate) fn fatal_child(
     test: &str,
-    cases: &[&str],
+    cases: &[(&str, &str)],
     preparations: Option<usize>,
     run: impl Fn(&str),
 ) {
@@ -99,7 +100,7 @@ pub(crate) fn fatal_child(
         run(&std::env::var(CASE).unwrap());
         return;
     }
-    for case in cases {
+    for (case, expected_reason) in cases {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture"])
             .env(CHILD, test)
@@ -128,6 +129,13 @@ pub(crate) fn fatal_child(
             "{case}: the broken invariant must end the run: {}",
             std::string::String::from_utf8_lossy(&output.stderr)
         );
+        let stderr = std::string::String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.lines().any(|line| line
+                .strip_prefix("carrick fatal [el1::entry_completion]: native entry invariant: ")
+                == Some(*expected_reason)),
+            "{case}: expected {expected_reason} in the fatal sink, got {stderr}"
+        );
     }
 }
 
@@ -138,16 +146,26 @@ mod serial_host {
     const MODULE: &str =
         "native_process_runtime::host_test_support::fork_refusal_class::serial_host::";
 
+    const INVARIANTS: &[(&str, &str)] = &[
+        ("census-core", "NativeForkInvariantCensusForkCore"),
+        ("scratch-fault", "NativeForkInvariantScratchMmFault"),
+        ("bare-stale", "NativeForkInvariantEntryUntypedStale"),
+        ("bare-invalid", "NativeForkInvariantEntryUntypedInvalid"),
+        (
+            "bare-quarantined",
+            "NativeForkInvariantEntryUntypedQuarantined",
+        ),
+    ];
+    const STALE_PREPARE_OR_PUBLISH: &[(&str, &str)] = &[
+        ("prepare-stale", "NativeForkInvariantPrepareMmStale"),
+        ("publish-stale", "NativeForkInvariantPublishMmStale"),
+    ];
+
     #[test]
     fn fork_invariant_refusal_ends_the_run_x86() {
         fatal_child(
             &std::format!("{MODULE}fork_invariant_refusal_ends_the_run_x86"),
-            &[
-                "census-core",
-                "bare-stale",
-                "bare-invalid",
-                "bare-quarantined",
-            ],
+            INVARIANTS,
             Some(1),
             |case| {
                 fork_invariant_refusal_ends_the_run::<
@@ -162,12 +180,7 @@ mod serial_host {
     fn fork_invariant_refusal_ends_the_run_aarch64() {
         fatal_child(
             &std::format!("{MODULE}fork_invariant_refusal_ends_the_run_aarch64"),
-            &[
-                "census-core",
-                "bare-stale",
-                "bare-invalid",
-                "bare-quarantined",
-            ],
+            INVARIANTS,
             Some(1),
             |case| {
                 fork_invariant_refusal_ends_the_run::<
@@ -186,7 +199,7 @@ mod serial_host {
     fn fork_stale_prepare_or_publish_ends_the_run_without_rerun_x86() {
         fatal_child(
             &std::format!("{MODULE}fork_stale_prepare_or_publish_ends_the_run_without_rerun_x86"),
-            &["prepare-stale", "publish-stale"],
+            STALE_PREPARE_OR_PUBLISH,
             Some(1),
             |case| {
                 fork_invariant_refusal_ends_the_run::<
@@ -203,7 +216,7 @@ mod serial_host {
             &std::format!(
                 "{MODULE}fork_stale_prepare_or_publish_ends_the_run_without_rerun_aarch64"
             ),
-            &["prepare-stale", "publish-stale"],
+            STALE_PREPARE_OR_PUBLISH,
             Some(1),
             |case| {
                 fork_invariant_refusal_ends_the_run::<
