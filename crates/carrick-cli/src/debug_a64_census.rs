@@ -3,12 +3,16 @@
 //! explicitly conservative because it cannot distinguish literal data.
 use anyhow::{Context, Result, ensure};
 use carrick_softcpu_aarch64::{A64Class, Instruction, classify, decode_instruction};
-use goblin::elf::{Elf, header, section_header, sym};
+use carrick_softcpu_aarch64::{
+    state::ProgramCounter,
+    translate::{ExitReason, GuestInstruction, InstructionClass},
+};
+use goblin::elf::{Elf, header, program_header, section_header, sym};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 fn sha(bytes: &[u8]) -> String {
@@ -271,6 +275,11 @@ impl Census {
 }
 
 pub(crate) fn run(input: Option<&Path>, strict: bool, output: Option<&Path>) -> Result<()> {
+    if let Some(root) = input.filter(|path| path.is_dir()) {
+        ensure!(output.is_none(), "loader span export requires an EL1 image");
+        return rootfs_census(root, strict);
+    }
+
     let mut census = Census::default();
     let bytes = if let Some(path) = input {
         std::fs::read(path).with_context(|| format!("read {}", path.display()))?
@@ -303,6 +312,121 @@ pub(crate) fn run(input: Option<&Path>, strict: bool, output: Option<&Path>) -> 
         census.finish()?;
     }
     Ok(())
+}
+
+/// Rootfs mode measures stripped binaries too. Executable segments can
+/// contain padding, ELF headers and literal data, so the raw word population
+/// is an upper bound on static instruction gaps.
+fn rootfs_census(root: &Path, strict: bool) -> Result<()> {
+    let mut candidates = Vec::new();
+    find_user_binaries(root, &mut candidates)?;
+    candidates.sort_unstable();
+    let mut files = Vec::new();
+    let mut total_gaps = 0;
+    for path in candidates {
+        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        if !bytes.starts_with(b"\x7fELF") {
+            continue;
+        }
+        let elf = Elf::parse(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        if elf.header.e_machine != header::EM_AARCH64 || !elf.is_64 || !elf.little_endian {
+            continue;
+        }
+        let mut words = 0;
+        let mut gaps = BTreeMap::<_, u64>::new();
+        for segment in &elf.program_headers {
+            if segment.p_type != program_header::PT_LOAD || !segment.is_executable() {
+                continue;
+            }
+            let start = usize::try_from(segment.p_offset)?;
+            let size = usize::try_from(segment.p_filesz)?;
+            let end = start
+                .checked_add(size)
+                .context("executable segment overflow")?;
+            let data = bytes
+                .get(start..end)
+                .context("truncated executable segment")?;
+            let prefix = segment.p_vaddr.wrapping_neg() as usize & 3;
+            for raw in data.get(prefix..).unwrap_or_default().chunks_exact(4) {
+                let word = u32::from_le_bytes(raw.try_into()?);
+                words += 1;
+                if GuestInstruction::decode_el0(ProgramCounter(0), word).class()
+                    == InstructionClass::Exit(ExitReason::Undefined)
+                {
+                    *gaps.entry(el0_gap_class(word)).or_default() += 1;
+                }
+            }
+        }
+        ensure!(words != 0, "no executable words in {}", path.display());
+        let unclassified: u64 = gaps.values().sum();
+        total_gaps += unclassified;
+        files.push(json!({
+            "path": path.strip_prefix(root)?,
+            "sha256": sha(&bytes),
+            "executable_words": words,
+            "unclassified_words": unclassified,
+            "unclassified_by_class": gaps,
+        }));
+    }
+    ensure!(
+        !files.is_empty(),
+        "no matching AArch64 ELF files in {}",
+        root.display()
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema": "carrick.a64-rootfs-census.v1",
+            "scope": "file-backed executable PT_LOAD words, including possible data; static decode only",
+            "unclassified_words": total_gaps,
+            "files": files,
+        }))?
+    );
+    ensure!(
+        !strict || total_gaps == 0,
+        "A64 rootfs census contains {total_gaps} unclassified words"
+    );
+    Ok(())
+}
+
+fn find_user_binaries(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in
+        std::fs::read_dir(directory).with_context(|| format!("scan {}", directory.display()))?
+    {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            find_user_binaries(&entry.path(), files)?;
+        } else if kind.is_file() && entry.file_name().to_str().is_some_and(user_binary_name) {
+            files.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn user_binary_name(name: &str) -> bool {
+    matches!(
+        name,
+        "libc.so.6" | "ld.so" | "node" | "go" | "compile" | "link" | "python3"
+    ) || name.starts_with("ld-linux-aarch64")
+        || (name.starts_with("libpython") && name.contains(".so"))
+        || name.strip_prefix("python3.").is_some_and(|minor| {
+            !minor.is_empty() && minor.bytes().all(|digit| digit.is_ascii_digit())
+        })
+}
+
+fn el0_gap_class(word: u32) -> &'static str {
+    let op1 = (word >> 25) & 15;
+    match op1 {
+        2 => "sve",
+        7 | 15 => "simd_fp_compute",
+        5 | 13 => "data_processing_register",
+        4 | 6 | 12 | 14 if word & (1 << 26) != 0 => "simd_fp_memory",
+        4 | 6 | 12 | 14 => "memory",
+        8 | 9 => "data_processing_immediate",
+        10 | 11 => "branch_exception_system",
+        _ => "unallocated_or_unsupported",
+    }
 }
 
 fn export_loader_spans(path: &Path, spans: &[u8]) -> Result<()> {
