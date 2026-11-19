@@ -4457,7 +4457,8 @@ fn serial_host_fork_child_uses_host_file_xattrs() {
     assert_eq!(
         ring_descriptor_run("-DXATTRS"),
         (0, vec![]),
-        "101 listxattr empty, 102 fsetxattr, 103 getxattr, 104 flistxattr"
+        "101 listxattr empty, 102 fsetxattr, 103 getxattr length, 104 flistxattr, \
+         111 getxattr on a writable but untouched page, 112 getxattr payload"
     );
 }
 

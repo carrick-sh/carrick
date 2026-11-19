@@ -1583,8 +1583,8 @@ pub fn stage(
     user: &mut dyn HostFileUser,
 ) -> Option<HostFileStage> {
     let staged = stage_call(call, namespace, user)?;
-    // These queries have no consumptive effect. The retained ring copyout
-    // prepares only the bytes the carrier actually returned.
+    // The retained ring copyout for these queries prepares only the bytes
+    // returned by the carrier. Failures and size queries write nothing.
     if matches!(
         call,
         HostFileCall::Readlinkat { .. } | HostFileCall::Ioctl { .. } | HostFileCall::Xattr { .. }
