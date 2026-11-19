@@ -6,6 +6,46 @@ use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 use carrick_mmu_core::owner_mmu::{OwnerGrantMmu, OwnerMmu};
 use carrick_sched_core::SpaceEditor;
 
+/// The one descriptor-authoritative span selected for a frame grant.
+///
+/// Callers must move this value into their semantic plan before adopting
+/// provenance or preparing backing. Keeping the selected range typed avoids
+/// carrying an unnarrowed plan beside a narrowed service request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectedBackingPlan {
+    range: ReservationRange,
+    fault_page: u64,
+}
+
+impl SelectedBackingPlan {
+    /// Authenticate a selected span against the admitted request and its
+    /// page-aligned fault identity. Callers cannot manufacture a plan for a
+    /// neighbouring request or widen it after the descriptor walk.
+    pub fn new(
+        admitted: ReservationRange,
+        range: ReservationRange,
+        fault_page: u64,
+    ) -> Result<Self, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+        use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+        if fault_page & 0xfff != 0
+            || range.start() < admitted.start()
+            || range.end() > admitted.end()
+            || !(range.start() <= fault_page && fault_page < range.end())
+        {
+            return Err(DescriptorRefusal::BadRange);
+        }
+        Ok(Self { range, fault_page })
+    }
+
+    pub fn range(self) -> ReservationRange {
+        self.range
+    }
+
+    pub fn fault_page(self) -> u64 {
+        self.fault_page
+    }
+}
+
 /// Select the contiguous unused part of an admitted window containing the
 /// fault. The caller retains this MM's editor while reading descriptors.
 /// Residency is not a census of inherited live or prepared leaves.
@@ -39,6 +79,16 @@ pub fn select_backing_span<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
     range: ReservationRange,
     fault_page: u64,
 ) -> Result<ReservationRange, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+    select_backing_plan::<B, W>(words, root, range, fault_page).map(SelectedBackingPlan::range)
+}
+
+/// Select the single plan that every later grant phase must consume.
+pub fn select_backing_plan<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: u64,
+    range: ReservationRange,
+    fault_page: u64,
+) -> Result<SelectedBackingPlan, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
     use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
     let mut start = range.start();
     let mut end = range.end();
@@ -67,7 +117,8 @@ pub fn select_backing_span<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
             break;
         }
     }
-    ReservationRange::new(start, end).ok_or(DescriptorRefusal::BadRange)
+    let selected = ReservationRange::new(start, end).ok_or(DescriptorRefusal::BadRange)?;
+    SelectedBackingPlan::new(range, selected, fault_page)
 }
 
 fn grant_page_available<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
