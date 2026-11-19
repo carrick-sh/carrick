@@ -106,6 +106,32 @@ pub struct ReadlinkSize(pub i32);
 /// arguments. Pointers are still untrusted user addresses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostFileCall {
+    Fsync {
+        fd: i32,
+    },
+    Syncfs {
+        fd: i32,
+    },
+    SyncFileRange {
+        fd: i32,
+        offset: u64,
+        length: u64,
+        flags: u64,
+    },
+    Statfs {
+        path: u64,
+        output: u64,
+    },
+    Fstatfs {
+        fd: i32,
+        output: u64,
+    },
+    Fallocate {
+        fd: i32,
+        mode: u64,
+        offset: u64,
+        length: u64,
+    },
     Readlinkat {
         dirfd: carrick_fd_core::Fd,
         path: carrick_guest_arch::UserVa,
@@ -393,6 +419,12 @@ impl HostFileCall {
             {
                 !delegated(fd)
             }
+            Self::Fsync { fd }
+            | Self::Syncfs { fd }
+            | Self::SyncFileRange { fd, .. }
+            | Self::Fstatfs { fd, .. }
+            | Self::Fallocate { fd, .. } => origin != ServiceOrigin::Initial || !delegated(fd),
+            Self::Statfs { .. } => origin != ServiceOrigin::Initial,
             Self::Readlinkat { dirfd, .. } => {
                 origin != ServiceOrigin::Initial || dirfd.0 != LINUX_AT_FDCWD
             }
@@ -447,6 +479,28 @@ impl HostFileCall {
         use crate::crossing::nr;
         let fd = args[0] as i32;
         Some(match canonical {
+            c if c == nr::FSYNC || c == nr::FDATASYNC => Self::Fsync { fd },
+            c if c == nr::SYNCFS => Self::Syncfs { fd },
+            c if c == nr::SYNC_FILE_RANGE => Self::SyncFileRange {
+                fd,
+                offset: args[1],
+                length: args[2],
+                flags: args[3],
+            },
+            c if c == nr::STATFS => Self::Statfs {
+                path: args[0],
+                output: args[1],
+            },
+            c if c == nr::FSTATFS => Self::Fstatfs {
+                fd,
+                output: args[1],
+            },
+            c if c == nr::FALLOCATE => Self::Fallocate {
+                fd,
+                mode: args[1],
+                offset: args[2],
+                length: args[3],
+            },
             c if c == nr::READLINKAT => Self::Readlinkat {
                 dirfd: carrick_fd_core::Fd(args[0] as i32),
                 path: carrick_guest_arch::UserVa::new(args[1]),
@@ -1026,6 +1080,32 @@ impl Staging<'_, '_> {
         })
     }
 
+    /// A descriptor operation that shares the carrier's file-description core.
+    fn file_operation(
+        &mut self,
+        op: HostFileOp,
+        fd: i32,
+        args: [u64; 4],
+        output: Option<HostFileOutput>,
+    ) -> Option<HostFileStage> {
+        Some(match self.descriptor(fd)? {
+            NativeDescriptor::Absent
+            | NativeDescriptor::HostBacked {
+                access: DescriptionAccess::Path,
+            } if op != HostFileOp::Fstatfs => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { .. } => self.request(op, fd, 0, args, &[], output),
+            NativeDescriptor::InZone(_) => match op {
+                HostFileOp::Fsync => errno(carrick_syscall_abi::LINUX_EINVAL),
+                HostFileOp::Fallocate | HostFileOp::SyncFileRange => {
+                    errno(carrick_syscall_abi::LINUX_ESPIPE)
+                }
+                HostFileOp::Syncfs => HostFileStage::Returned(SyscallResult::new(0)),
+                _ => HostFileStage::InRing,
+            },
+        })
+    }
+
     fn write(
         &mut self,
         fd: i32,
@@ -1252,6 +1332,60 @@ fn stage_call(
 ) -> Option<HostFileStage> {
     let mut staging = Staging { namespace };
     Some(match call {
+        HostFileCall::Fsync { fd } => {
+            return staging.file_operation(HostFileOp::Fsync, fd, [0; 4], None);
+        }
+        HostFileCall::Syncfs { fd } => {
+            return staging.file_operation(HostFileOp::Syncfs, fd, [0; 4], None);
+        }
+        HostFileCall::SyncFileRange {
+            fd,
+            offset,
+            length,
+            flags,
+        } => {
+            return staging.file_operation(
+                HostFileOp::SyncFileRange,
+                fd,
+                [offset, length, flags, 0],
+                None,
+            );
+        }
+        HostFileCall::Statfs { path, output } => {
+            let (base, path) = match staging.path_input(user, LINUX_AT_FDCWD, path)? {
+                Ok(resolved) => resolved,
+                Err(stage) => return Some(stage),
+            };
+            staging.request(
+                HostFileOp::Statfs,
+                base,
+                0,
+                [0; 4],
+                &path,
+                Some(HostFileOutput::bytes(output, host_file::STATFS_BYTES)),
+            )
+        }
+        HostFileCall::Fstatfs { fd, output } => {
+            return staging.file_operation(
+                HostFileOp::Fstatfs,
+                fd,
+                [0; 4],
+                Some(HostFileOutput::bytes(output, host_file::STATFS_BYTES)),
+            );
+        }
+        HostFileCall::Fallocate {
+            fd,
+            mode,
+            offset,
+            length,
+        } => {
+            return staging.file_operation(
+                HostFileOp::Fallocate,
+                fd,
+                [mode, offset, length, 0],
+                None,
+            );
+        }
         HostFileCall::Write { fd, buf, count } => {
             return staging.write(fd, user, |user| {
                 let mut input = Vec::with_capacity(chunk(count));

@@ -114,6 +114,18 @@ pub enum HostFileOp {
     /// output segments' written extents ([`NetCall::encode_written`]). The
     /// header `fd` is the descriptor argument (`-1` for `socket`).
     NetSyscall = 28,
+    /// Flush a file's data and metadata for fsync or fdatasync.
+    Fsync = 30,
+    /// Flush the filesystem containing the descriptor.
+    Syncfs = 31,
+    /// Best-effort range flush. The arguments are offset, length and flags.
+    SyncFileRange = 32,
+    /// Query the filesystem of the staged path.
+    Statfs = 33,
+    /// Query the filesystem of the descriptor.
+    Fstatfs = 34,
+    /// Allocate a region of the descriptor. The arguments are mode, offset and length.
+    Fallocate = 35,
 }
 
 /// A staged user-memory range of a [`HostFileOp::NetSyscall`] record.
@@ -617,6 +629,12 @@ impl HostFileOp {
             26 => Self::Fchmodat,
             27 => Self::Fchownat,
             28 => Self::NetSyscall,
+            30 => Self::Fsync,
+            31 => Self::Syncfs,
+            32 => Self::SyncFileRange,
+            33 => Self::Statfs,
+            34 => Self::Fstatfs,
+            35 => Self::Fallocate,
             _ => return None,
         })
     }
@@ -647,6 +665,7 @@ impl HostFileOp {
                 | Self::Fchown
                 | Self::Fchmodat
                 | Self::Fchownat
+                | Self::Statfs
         )
     }
 }
@@ -687,6 +706,9 @@ pub const fn decode_second_path_fd(word: u64) -> Option<Option<i32>> {
 
 const MAGIC: u32 = u32::from_le_bytes(*b"CHFR");
 const VERSION: u16 = 1;
+/// The Linux 64-bit statfs reply, identical on AArch64 and x86-64.
+pub const STATFS_BYTES: usize = 120;
+
 /// Fixed header, including the reply words.
 pub const HOST_FILE_HEADER_BYTES: usize = 96;
 /// Largest data chunk one record carries. Larger transfers are split by the
