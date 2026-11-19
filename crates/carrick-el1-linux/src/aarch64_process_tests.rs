@@ -28,6 +28,7 @@ use super::aarch64_process::{
     Mm, admit_entry, map_resume, observed_entry_address, process_record_for_call, registry,
     resume_selected, with_process_entry,
 };
+#[cfg(test)]
 use super::native_fork_refusal::{NativeForkRefusal, NativeForkStage};
 #[cfg(test)]
 use super::native_process_runtime::{NativeContention, NativeFailure};
