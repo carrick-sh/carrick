@@ -1667,6 +1667,16 @@ impl ClaimedDescriptorTxn<'_> {
         self.slot.receipt_outcome.load(Ordering::Relaxed) == GRANT_TRACE_REQUESTED
     }
 
+    /// Release an unmodified submission back to `SUBMITTED` so the owner can
+    /// unwind its editor, grow carrier metadata or enrol on a typed wait, and
+    /// later reclaim or let the host withdraw the exact submission. Call only
+    /// before writing any descriptor word or publishing residency.
+    pub fn release_unapplied(self) {
+        self.slot
+            .state
+            .store(DESCRIPTOR_TXN_SUBMITTED, Ordering::Release);
+    }
+
     /// Publish EL1's outcome. A malformed submission receives a
     /// `BadEncoding` refusal regardless of `outcome`.
     ///
@@ -3316,6 +3326,23 @@ mod tests {
         assert!(!slot.withdraw(other));
         assert!(slot.withdraw(txn.id));
         assert!(slot.claim_for_mm(7).is_none());
+        assert_eq!(slot.state(), DESCRIPTOR_TXN_IDLE);
+    }
+
+    #[test]
+    fn released_unapplied_claim_can_be_reclaimed_or_withdrawn() {
+        let slot = DescriptorTxnSlot::new();
+        let txn = prepare_txn(5);
+        assert!(slot.submit(&txn));
+        let claimed = slot.claim_for_mm(7).unwrap();
+        assert_eq!(slot.state(), DESCRIPTOR_TXN_GUEST_APPLYING);
+        assert!(!slot.withdraw(txn.id));
+        claimed.release_unapplied();
+        assert_eq!(slot.state(), DESCRIPTOR_TXN_SUBMITTED);
+        let reclaimed = slot.claim_for_mm(7).unwrap();
+        assert_eq!(reclaimed.txn(), Ok(&txn));
+        reclaimed.release_unapplied();
+        assert!(slot.withdraw(txn.id));
         assert_eq!(slot.state(), DESCRIPTOR_TXN_IDLE);
     }
 
