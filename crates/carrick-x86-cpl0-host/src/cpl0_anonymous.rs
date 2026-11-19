@@ -419,6 +419,43 @@ pub(super) enum ChildRelease<'a> {
     Unrun,
 }
 
+fn resolve_cpl0_residency<M: CarrierMemoryIo>(
+    memory: &CarrierMemory<M>,
+) -> Result<
+    carrick_core_abi::mm::residency::ResolvedResidencyTable<
+        carrick_core_abi::mm::residency::NoDynamicResidencyPin,
+    >,
+    TrapError,
+> {
+    // SAFETY: the retained aligned residency table initialized at boot.
+    let table = unsafe {
+        memory.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(FrameGpa::new(
+            KERNEL_REGION_GPA + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+        ))
+    }
+    .map_err(|e| fail(e.to_string()))?;
+    let bootstrap_size = carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize;
+    let bootstrap_ptr = memory
+        .retained_bytes_ptr(FrameGpa::new(ALLOCATOR_GPA), bootstrap_size)
+        .map_err(|e| fail(e.to_string()))?;
+    let mut resolved = carrick_core_abi::mm::residency::ResolvedResidencyTable::new();
+    // SAFETY: `table` and `bootstrap_ptr` belong to this live carrier's
+    // retained RAM and remain mapped while `memory` is borrowed.
+    unsafe {
+        resolved.refresh(
+            table,
+            &carrick_core_abi::mm::residency::NoDynamicResidencyResolver,
+            Some((
+                X86_CPL0_BOOTSTRAP_METADATA_BASE,
+                bootstrap_size,
+                bootstrap_ptr,
+            )),
+        )
+    }
+    .map_err(|e| fail(format!("cpl0 residency extension resolution: {e:?}")))?;
+    Ok(resolved)
+}
+
 /// Release a reclaimed child's carrier-wide state: its frame-inventory rows
 /// and COW residency (shared composition), then its CR3/alias registrations
 /// and the memslots admitted only for it.
@@ -428,23 +465,27 @@ pub(super) fn release_retired_child<M: CarrierMemoryIo>(
     absence: &SlotAbsence,
     release: ChildRelease<'_>,
 ) -> Result<crate::carrier_memory::RetiredChild, TrapError> {
-    // SAFETY: the retained aligned residency table initialized at boot.
-    let residency = unsafe {
-        memory.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(FrameGpa::new(
-            KERNEL_REGION_GPA + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
-        ))
-    }
-    .map_err(|e| fail(e.to_string()))?;
+    let residency = resolve_cpl0_residency(memory)?;
+    let residency_view = residency
+        .view()
+        .ok_or_else(|| fail("cpl0 residency view unavailable"))?;
     let released = match release {
         ChildRelease::Retired { returns, zone } => zone
             .spaces
             .unpublished(absence.mm().raw())
             .is_some_and(|absent| {
-                carrick_hal::fork_stock::release_child_mm(inventory, residency, returns, &absent)
+                carrick_hal::fork_stock::release_child_mm(
+                    inventory,
+                    &residency_view,
+                    returns,
+                    &absent,
+                )
             }),
-        ChildRelease::Unrun => {
-            carrick_hal::fork_stock::release_unrun_child_mm(inventory, residency, absence.mm())
-        }
+        ChildRelease::Unrun => carrick_hal::fork_stock::release_unrun_child_mm(
+            inventory,
+            &residency_view,
+            absence.mm(),
+        ),
     };
     if !released {
         return Err(fail("retired child inventory or residency release"));
@@ -454,8 +495,8 @@ pub(super) fn release_retired_child<M: CarrierMemoryIo>(
         .map_err(|e| fail(e.to_string()))
 }
 
-fn rollback_fork_parent_residency(
-    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+fn rollback_fork_parent_residency<S: carrick_core_abi::mm::residency::FrameGrantResidencyAccess>(
+    residency: &carrick_el1_abi::FrameGrantResidencyTable<S>,
     publications: &[(usize, carrick_el1_abi::FrameGrantResidencyIdentity)],
 ) -> Result<(), TrapError> {
     for &(slot, identity) in publications.iter().rev() {
@@ -1420,17 +1461,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                                 trap_error = Some(fail(e.to_string()));
                                 ForkStockRefusal::Inventory
                             })?;
-                            // SAFETY: same retained kernel region as the original COW pool.
-                            let residency = unsafe {
-                                vm.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(
-                                    FrameGpa::new(
-                                        KERNEL_REGION_GPA
-                                            + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
-                                    ),
-                                )
-                            }
-                            .map_err(|e| {
-                                trap_error = Some(fail(e.to_string()));
+                            let resolved_residency = resolve_cpl0_residency(&vm).map_err(|e| {
+                                trap_error = Some(e);
+                                ForkStockRefusal::Inventory
+                            })?;
+                            let residency = resolved_residency.view().ok_or_else(|| {
+                                trap_error = Some(fail("physical fork residency view"));
                                 ForkStockRefusal::Inventory
                             })?;
                             let parent =
@@ -1498,7 +1534,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 .is_err()
         };
         if refused && !parent_residency.is_empty() {
-            rollback_fork_parent_residency(self.cow_residency()?, &parent_residency)?;
+            let residency = self.cow_residency()?;
+            let view = residency
+                .view()
+                .ok_or_else(|| fail("physical fork rollback residency view"))?;
+            rollback_fork_parent_residency(&view, &parent_residency)?;
         }
         if refused && inventory_published.get() {
             if root_installed.get() {
@@ -1510,12 +1550,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     &absence,
                     ChildRelease::Unrun,
                 )?;
-            } else if !carrick_hal::fork_stock::release_unrun_child_mm(
-                &*frame_inventory,
-                self.cow_residency()?,
-                loan.request.child_mm,
-            ) {
-                return Err(fail("unpublished child inventory rollback"));
+            } else {
+                let residency = self.cow_residency()?;
+                let view = residency
+                    .view()
+                    .ok_or_else(|| fail("unpublished child rollback residency view"))?;
+                if !carrick_hal::fork_stock::release_unrun_child_mm(
+                    &*frame_inventory,
+                    &view,
+                    loan.request.child_mm,
+                ) {
+                    return Err(fail("unpublished child inventory rollback"));
+                }
             }
         }
         if let Some(err) = trap_error {
@@ -1655,14 +1701,15 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         .map_err(|error| fail(error.to_string()))
     }
 
-    fn cow_residency(&self) -> Result<&carrick_el1_abi::FrameGrantResidencyTable, TrapError> {
-        // SAFETY: same retained kernel region as the original COW pool.
-        unsafe {
-            self._vm.retained_record(FrameGpa::new(
-                KERNEL_REGION_GPA + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
-            ))
-        }
-        .map_err(|error| fail(error.to_string()))
+    fn cow_residency(
+        &self,
+    ) -> Result<
+        carrick_core_abi::mm::residency::ResolvedResidencyTable<
+            carrick_core_abi::mm::residency::NoDynamicResidencyPin,
+        >,
+        TrapError,
+    > {
+        resolve_cpl0_residency(&self._vm)
     }
 
     fn supply_cow_grant(
@@ -1725,8 +1772,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             ._vm
             .frame_identity(mm, run.old_ipa)
             .map_err(|error| fail(error.to_string()))?;
-        let resident = self
-            .cow_residency()?
+        let residency = self.cow_residency()?;
+        let residency_view = residency
+            .view()
+            .ok_or_else(|| fail("owner COW source residency view"))?;
+        let resident = residency_view
             .lookup(mm.get(), run.va)
             .ok_or_else(|| fail("owner COW source residency"))?;
         let identity = resident.identity;
@@ -1735,7 +1785,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             || identity.mapping_id != source_identity.mapping_id.get()
             || identity.owner_generation != source_identity.owner_generation.get()
             || identity.inventory_revision != source_identity.inventory_revision.get()
-            || !self.cow_residency()?.is_guest_committed(mm.get(), run.va)
+            || !residency_view.is_guest_committed(mm.get(), run.va)
         {
             return Err(fail("owner COW source custody mismatch"));
         }
@@ -1919,10 +1969,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         ) {
             return Err(fail("owner COW exact completed receipt absent"));
         }
-        match self
-            .cow_residency()?
-            .lookup(receipt.grant.mm_key, receipt.span_va)
-        {
+        let residency = self.cow_residency()?;
+        let residency_view = residency
+            .view()
+            .ok_or_else(|| fail("owner COW replacement residency view"))?;
+        match residency_view.lookup(receipt.grant.mm_key, receipt.span_va) {
             Some(resident) => {
                 if resident.expected_ipa != receipt.new_ipa
                     || resident.identity.frame_id != receipt.grant.backing.frame_id.get()
@@ -1931,9 +1982,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         != receipt.grant.backing.owner_generation.get()
                     || resident.identity.inventory_revision
                         != receipt.grant.backing.inventory_revision.get()
-                    || !self
-                        .cow_residency()?
-                        .is_guest_committed(receipt.grant.mm_key, receipt.span_va)
+                    || !residency_view.is_guest_committed(receipt.grant.mm_key, receipt.span_va)
                 {
                     return Err(fail("owner COW replacement residency identity"));
                 }
