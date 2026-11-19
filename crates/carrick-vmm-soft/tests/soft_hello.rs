@@ -593,6 +593,27 @@ fn production_ring_slice_starts_after_cpl0_return_preparation() {
     assert_eq!(run.exit, Some(0), "{}", run.summary());
 }
 
+/// The worker cannot exit until the queued leader runs on its slot and
+/// writes the release word. Every two CPL3 blocks the worker enters CPL0.
+#[test]
+fn production_ring_slice_preempts_a_syscall_poller() {
+    let elf = assemble_static_fixture(
+        "slice-syscall-poller",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/slice_busy_once.S"
+        ),
+        &["-DSYSCALL_POLLER"],
+    );
+    let ticks_per_block =
+        std::num::NonZeroU64::new(carrick_vmm_soft::carrier::SOFT_TSC_HZ / 20_000)
+            .expect("50 us per block");
+    let run = run_with_options(&elf, None, Some((ticks_per_block, 200_000)), None);
+    assert!(run.failure.is_none(), "{}", run.summary());
+    assert!(run.stdout.is_empty(), "{}", run.summary());
+    assert_eq!(run.exit, Some(0), "{}", run.summary());
+}
+
 /// Deterministic VM-free "Busy once, then success" witness on the production
 /// CPL0 `signal_irq_return` path: while the worker spins in CPL3 with the
 /// homed leader queued on slot 0 (`queued() == 1`), hold the head record's
