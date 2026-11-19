@@ -471,6 +471,11 @@ enum NamedSlot {
     IccEoir1,
     IccSgi1r,
 }
+// This CPU exposes FPCR exception enables as RAZ/WI. Native blocks
+// must not inherit optional host floating-point traps.
+pub(crate) const FPCR_MASK: u64 = 0x07c0_0000;
+pub(crate) const FPSR_MASK: u64 = 0x0800_009f;
+
 impl NamedRegisters {
     fn read(&self, slot: NamedSlot) -> SystemValue {
         match slot {
@@ -479,8 +484,8 @@ impl NamedRegisters {
             NamedSlot::TpidrEl0 => self.tpidrel0,
             NamedSlot::TpidrroEl0 => self.tpidrroel0,
             NamedSlot::Contextidr => self.contextidr,
-            NamedSlot::Fpcr => self.fpcr,
-            NamedSlot::Fpsr => self.fpsr,
+            NamedSlot::Fpcr => SystemValue(self.fpcr.0 & FPCR_MASK),
+            NamedSlot::Fpsr => SystemValue(self.fpsr.0 & FPSR_MASK),
             NamedSlot::Par => self.par,
             NamedSlot::Cntfrq => SystemValue(self.cntfrq.0 & 0xffff_ffff),
             NamedSlot::Cntvct => self.cntvct,
@@ -503,8 +508,8 @@ impl NamedRegisters {
             NamedSlot::Contextidr => self.contextidr = SystemValue(value.0 & 0xffff_ffff),
             // C5.2.7/C5.2.8. This AArch64-only profile exposes baseline
             // FP control/status storage, with AArch32, FP16 and AFP fields RAZ.
-            NamedSlot::Fpcr => self.fpcr = SystemValue(value.0 & 0x07c0_9f00),
-            NamedSlot::Fpsr => self.fpsr = SystemValue(value.0 & 0x0800_009f),
+            NamedSlot::Fpcr => self.fpcr = SystemValue(value.0 & FPCR_MASK),
+            NamedSlot::Fpsr => self.fpsr = SystemValue(value.0 & FPSR_MASK),
             NamedSlot::Par => self.par = value,
             NamedSlot::Cntfrq => self.cntfrq = SystemValue(value.0 & 0xffff_ffff),
             NamedSlot::Cntvct => self.cntvct = value,

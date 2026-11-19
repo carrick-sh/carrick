@@ -23,7 +23,7 @@ fn scalar_fp_is_copied_only_for_allocated_single_and_double_encodings() {
         0x1ee0_2800,
         0x1ea0_2800,
         0x1e60_2018 | 1,
-        0x1e60_3800 | (1 << 14),
+        0x1e60_9800,
     ] {
         assert_eq!(
             GuestInstruction::decode(ProgramCounter(0), word).class(),
