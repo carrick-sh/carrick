@@ -988,6 +988,7 @@ surfaces = [
   { path = "crates/carrick-runtime/src/runtime.rs", contract = "kernel.mm.syscall-code-write" },
   { path = "crates/carrick-runtime/src/runtime.rs", contract = "runtime.image-entrypoint" },
   { path = "crates/carrick-runtime/src/runtime/exec.rs", contract = "kernel.native.host-file-venue" },
+  { path = "crates/carrick-runtime/src/runtime/exec.rs", contract = "kernel.time.realtime-calibration" },
   { path = "crates/carrick-runtime/src/runtime/exec.rs", contract = "process.exec.files" },
   { path = "crates/carrick-runtime/src/runtime/exec.rs", contract = "process.exec.native-exe-link" },
   { path = "crates/carrick-runtime/src/test_hooks.rs", contract = "kernel.vcpu.vm-lifetime" },

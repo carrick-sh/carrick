@@ -56,9 +56,19 @@ fn realtime_calibration_survives_sibling_exec() {
 /// zipfile refused "timestamps before 1980").
 #[test]
 fn realtime_is_calibrated_for_the_first_process() {
+    assert_realtime(["/bin/date", "+%s"]);
+}
+
+#[test]
+fn realtime_is_calibrated_for_the_native_exec_successor() {
+    // The shell remains live in wait while its fork child execs date.
+    assert_realtime(["/bin/sh", "-c", "/bin/date +%s & wait $!"]);
+}
+
+fn assert_realtime<const N: usize>(command: [&str; N]) {
     let result = ContainerBuilder::from_image("docker.io/library/ubuntu:24.04")
         .pull_policy(PullPolicy::Missing)
-        .command(["/bin/date", "+%s"])
+        .command(command)
         .stdout(StdioConfig::Captured)
         .stderr(StdioConfig::Captured)
         .run_blocking()
@@ -75,6 +85,6 @@ fn realtime_is_calibrated_for_the_first_process() {
         .as_secs() as i64;
     assert!(
         (host - guest).abs() < 60,
-        "first-process CLOCK_REALTIME {guest} is not the host's {host}"
+        "guest CLOCK_REALTIME {guest} differs from host {host} for {command:?}"
     );
 }
