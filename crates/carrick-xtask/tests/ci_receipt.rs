@@ -1221,6 +1221,47 @@ fn declared_retired_test_still_in_source_is_refused() {
 }
 
 #[test]
+fn declared_rename_across_a_crate_with_an_unrelated_item_macro() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, candidate) = (dir.path().join("base"), dir.path().join("candidate"));
+    for tree in [&base, &candidate] {
+        write_source(
+            tree,
+            "crates/carrick-vmm-kvm/src/lib.rs",
+            "use std::thread_local; thread_local! { static CELL: u8 = 0; }",
+        );
+    }
+    write_test_tree(
+        &base,
+        "#[test] fn wait4_rejects_unwritable_rusage_without_writing_status() {}",
+        None,
+    );
+    let replacement = "#[test] fn wait4_writes_status_before_unwritable_rusage_efault() {}";
+    let baseline = cpl0_receipt(&[OLD_WAIT4], &[]);
+    let next = cpl0_receipt(&[NEW_WAIT4], &[]);
+
+    write_test_tree(&candidate, replacement, None);
+    let undeclared = diff_trees(&baseline, &next, &base, &candidate).unwrap();
+    assert_eq!(undeclared.new, [format!("missing:{OLD_WAIT4}")]);
+
+    write_test_tree(&candidate, replacement, Some(PR583_RETIRED_TOML));
+    let declared = diff_trees(&baseline, &next, &base, &candidate).unwrap();
+    assert!(declared.new.is_empty(), "{declared:?}");
+    assert!(declared.warnings.is_empty(), "{declared:?}");
+
+    write_source(
+        &candidate,
+        "crates/carrick-vmm-kvm/src/retained.rs",
+        "some_generator!(wait4_rejects_unwritable_rusage_without_writing_status);",
+    );
+    let retained = diff_trees(&baseline, &next, &base, &candidate).unwrap_err();
+    assert!(
+        retained.to_string().contains("still exists in candidate source"),
+        "{retained}"
+    );
+}
+
+#[test]
 fn replaced_by_that_never_started_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (base_tree, cand_tree) = (dir.path().join("base"), dir.path().join("cand"));
