@@ -18,16 +18,35 @@ pub fn select_backing_window<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
     if !window.valid() {
         return Err(DescriptorRefusal::BadRange);
     }
-    let mut start = window.range.start();
-    let mut end = window.range.end();
+    let range = select_backing_span::<B, W>(words, root, window.range, window.fault_page)?;
+    let start = range.start();
+    if let Some(backing) = window.host_backing {
+        window.host_backing = Some(
+            backing
+                .advance(start - window.range.start())
+                .ok_or(DescriptorRefusal::BadRange)?,
+        );
+    }
+    window.range = range;
+    Ok(window)
+}
+
+/// Select the authoritative descriptor-free span containing `fault_page`.
+/// Both host and in-guest planners use this one live-descriptor walk.
+pub fn select_backing_span<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: u64,
+    range: ReservationRange,
+    fault_page: u64,
+) -> Result<ReservationRange, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+    use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+    let mut start = range.start();
+    let mut end = range.end();
     for page in (start..end).step_by(4096) {
         if grant_page_available::<B, _>(words, root, page)? {
             continue;
         }
-        if page == window.fault_page {
-            // Occupancy is not residency: fork also inherits invalid prepared
-            // outputs without a lazy-grant residency row. Only a live walk
-            // under the caller's editor can authorize retrying the instruction.
+        if page == fault_page {
             let root = B::root(root).map_err(|_| DescriptorRefusal::StaleRoot)?;
             return match B::translate(
                 words,
@@ -41,22 +60,14 @@ pub fn select_backing_window<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
                 Err(_) => Err(DescriptorRefusal::Malformed),
             };
         }
-        if page < window.fault_page {
+        if page < fault_page {
             start = page + 4096;
         } else {
             end = page;
             break;
         }
     }
-    if let Some(backing) = window.host_backing {
-        window.host_backing = Some(
-            backing
-                .advance(start - window.range.start())
-                .ok_or(DescriptorRefusal::BadRange)?,
-        );
-    }
-    window.range = ReservationRange::new(start, end).ok_or(DescriptorRefusal::BadRange)?;
-    Ok(window)
+    ReservationRange::new(start, end).ok_or(DescriptorRefusal::BadRange)
 }
 
 fn grant_page_available<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
