@@ -307,7 +307,7 @@ impl crate::exec_successor::X86SuccessorBuild for ServiceExecBuild {
     }
 }
 
-struct Venue;
+pub(super) struct Venue;
 impl OwnerVenue<ParkedContextWords> for Venue {
     fn space_access(
         zone: &ZoneTables<ParkedContextWords>,
@@ -336,7 +336,7 @@ pub(super) fn release(
 ) {
     carrick_el1::substrate::sched::object_wait::deliver_host_completion(effects.zone(), effects);
 }
-type Portal = MmPortal<
+pub(super) type Portal = MmPortal<
     'static,
     GuestMetadataPin,
     LinuxReservationPolicy,
@@ -345,7 +345,7 @@ type Portal = MmPortal<
     X86Mmu,
     ParkedContextWords,
 >;
-fn portal() -> Result<Portal, NativeFailure> {
+pub(super) fn portal() -> Result<Portal, NativeFailure> {
     let layout = carrick_el1::isa::x86_kernel_layout();
     // SAFETY: the boot owner retains the one compact native portal region.
     let slots = unsafe { &*(layout.portal.raw() as *const MmPortalSlots) };
