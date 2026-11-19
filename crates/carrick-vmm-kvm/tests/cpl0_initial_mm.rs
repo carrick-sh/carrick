@@ -4337,7 +4337,7 @@ fn ring_descriptor_run(mode: &str) -> (i32, Vec<(usize, u64)>) {
         assert!(!sibling.exists(), "the native parent removed its sibling");
         std::fs::write(&sibling, []).expect("parent's sibling file for Carrick");
     }
-    if mode == "-DFILEOPS" {
+    if matches!(mode, "-DFILEOPS" | "-DVECTORS") {
         std::fs::write(&path, b"loader library").expect("reset native control's file");
     }
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
@@ -4433,6 +4433,17 @@ fn serial_host_fork_child_syncs_and_queries_its_host_file() {
         (0, vec![]),
         "78 writable openat, 79 fsync, 80 fdatasync, 81 sync_file_range, 82 syncfs, \
          83 statfs, 84 fstatfs, 85 fallocate, 86 allocated file size"
+    );
+}
+
+/// Positional scatter and gather through the production CPL0 ring.
+#[test]
+fn serial_host_fork_child_uses_positioned_and_vectored_io() {
+    assert_eq!(
+        ring_descriptor_run("-DVECTORS"),
+        (0, vec![]),
+        "91 open, 92 seed bytes, 93 pwrite64, 94 pwritev, 95 preadv, \
+         96 positional cursor, 97 rewind, 98 readv"
     );
 }
 
