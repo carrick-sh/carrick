@@ -24,6 +24,11 @@ pub trait ExecuteBlock {
     type Error;
     type Code;
 
+    /// Whether the dispatcher may keep prepared blocks resident.
+    fn retain_blocks(&self) -> bool {
+        true
+    }
+
     fn prepare(&mut self, block: &TranslatedBlock) -> Result<Self::Code, Self::Error>;
 
     /// Run the code prepared for `block`, update `cpu` on success, and return the
@@ -235,6 +240,7 @@ pub fn run<X: ExecuteBlock>(
     // The run borrows one memory owner and one set of block limits. Keeping
     // residency within that borrow also discards code at provider handoffs.
     let mut cache = BlockCache::<BlockKey, ResidentBlock<X::Code>>::default();
+    let retain_blocks = executor.retain_blocks();
     let stop = loop {
         if blocks >= budget {
             break Stop::Budget;
@@ -265,9 +271,13 @@ pub fn run<X: ExecuteBlock>(
         };
         let key = BlockKey::for_cpu(cpu);
         let frame = Gpa::new(pa.raw() & !(CODE_PAGE_BYTES - 1)).to_frame_gpa();
-        let code = memory
-            .code_generation(frame)
-            .map(|generation| CodeIdentity { frame, generation });
+        let code = if retain_blocks {
+            memory
+                .code_generation(frame)
+                .map(|generation| CodeIdentity { frame, generation })
+        } else {
+            None
+        };
         let uncached;
         let (block, executable) =
             if let Some(resident) = cache.get(&key).filter(|r| Some(r.identity) == code) {
