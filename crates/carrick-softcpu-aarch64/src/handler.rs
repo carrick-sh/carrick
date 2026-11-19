@@ -20,8 +20,8 @@ use crate::translate::GuestInstruction;
 use crate::{
     AtomicTransferKind, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, Extend, Hint,
     IcOperation, Immediate16, Instruction, MemoryAddress, MemoryIndex, MemoryOperation,
-    MemoryRegister, MemorySize, OperandRegister, PstateField, RegisterBranch, SystemDirection,
-    SystemRegister, TlbiOperation, Width,
+    MemoryRegister, MemorySize, OperandRegister, PstateField, RegisterBranch, StructureLayout,
+    StructureMemory, StructureWriteback, SystemDirection, SystemRegister, TlbiOperation, Width,
 };
 use carrick_mmu_core::aarch64::stage1_walk::Aarch64Fault;
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
@@ -630,6 +630,82 @@ fn check_alignment(address: u64, bytes: u64, access: DataAccess) -> Result<(), M
     Ok(())
 }
 
+/// A structure instruction touches at most 64 bytes, even if its vector list
+/// wraps from V31 to V0. Stage-1 faults precede any load result or writeback.
+fn structure_access(
+    cpu: &mut CpuState,
+    memory: &mut impl GuestMemory,
+    m: StructureMemory,
+) -> Result<(), MemoryAccessError> {
+    let address = operand(cpu, m.base);
+    let access = data_access(m.operation);
+    let element = usize::from(m.element.bytes());
+    if cpu.el1.sctlr.alignment_check() {
+        check_alignment(address, element as u64, access)?;
+    }
+    let register_count = usize::from(m.register_count);
+    let vector_bytes = usize::from(m.vector_bytes);
+    let lanes = vector_bytes / element;
+    let transfer_lanes = match m.layout {
+        StructureLayout::Sequential | StructureLayout::Interleaved => lanes,
+        StructureLayout::Lane(_) | StructureLayout::Replicate => 1,
+    };
+    let len = register_count * transfer_lanes * element;
+    let mut buffer = [0; 64];
+    let data = DataAccessor {
+        class: AccessClass::Ordinary,
+    };
+    if access == DataAccess::Read {
+        data.read(cpu, memory, address, &mut buffer[..len])?;
+    }
+    for register in 0..register_count {
+        let index = (usize::from(m.first.number()) + register) % cpu.vectors.len();
+        let mut bytes =
+            if access == DataAccess::Write || matches!(m.layout, StructureLayout::Lane(_)) {
+                cpu.vectors[index].to_le_bytes()
+            } else {
+                [0; 16]
+            };
+        let result_lanes = if matches!(m.layout, StructureLayout::Replicate) {
+            lanes
+        } else {
+            transfer_lanes
+        };
+        for lane in 0..result_lanes {
+            let (in_memory, in_vector) = match m.layout {
+                StructureLayout::Sequential => (register * lanes + lane, lane),
+                StructureLayout::Interleaved => (lane * register_count + register, lane),
+                StructureLayout::Lane(index) => (register, usize::from(index)),
+                StructureLayout::Replicate => (register, lane),
+            };
+            let mem = &mut buffer[in_memory * element..][..element];
+            let reg = &mut bytes[in_vector * element..][..element];
+            if access == DataAccess::Read {
+                reg.copy_from_slice(mem);
+            } else {
+                mem.copy_from_slice(reg);
+            }
+        }
+        if access == DataAccess::Read {
+            cpu.vectors[index] = u128::from_le_bytes(bytes);
+        }
+    }
+    if access == DataAccess::Write {
+        data.write(cpu, memory, address, &buffer[..len])?;
+    }
+    match m.writeback {
+        StructureWriteback::None => {}
+        StructureWriteback::TransferBytes => {
+            set_operand(cpu, m.base, address.wrapping_add(len as u64));
+        }
+        StructureWriteback::Register(r) => {
+            let offset = operand(cpu, OperandRegister::Gpr(r));
+            set_operand(cpu, m.base, address.wrapping_add(offset));
+        }
+    }
+    Ok(())
+}
+
 /// Returns Ok(None) when the instruction is not a supported memory form.
 fn memory_operation(
     cpu: &mut CpuState,
@@ -638,6 +714,8 @@ fn memory_operation(
     i: &GuestInstruction,
 ) -> Result<Option<()>, MemoryAccessError> {
     match i.instruction() {
+        Instruction::Prefetch => {}
+        Instruction::StructureMemory(m) => structure_access(cpu, memory, m)?,
         Instruction::ScalarMemory(m) | Instruction::UnprivilegedMemory(m) => {
             let data = DataAccessor {
                 class: if matches!(i.instruction(), Instruction::UnprivilegedMemory(_)) {

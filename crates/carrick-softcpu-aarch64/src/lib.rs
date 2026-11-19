@@ -753,10 +753,11 @@ pub fn classify(w: u32) -> A64Class {
     if w & 0x3f200c00 == 0x38200000 && (w >> 12) & 15 <= 8 {
         return LseAtomic;
     }
-    // SIMD/FP: scalar floating-point two-source arithmetic, single/double.
-    // Wider NEON families intentionally remain Unknown until individually checked.
-    if w & 0xff200c00 == 0x1e200800 && (w >> 22) & 3 < 2 && (w >> 12) & 15 <= 8 {
+    if simd::decode(w).is_some() {
         return SimdFpCompute;
+    }
+    if instruction::structure_memory(w).is_some() {
+        return SimdFpLoadStore;
     }
     Unknown
 }
@@ -1152,6 +1153,8 @@ mod instruction {
         UnprivilegedMemory(ScalarMemory),
         Extract(crate::Extract),
         PairMemory(PairMemory),
+        StructureMemory(StructureMemory),
+        Prefetch,
         Logical(Logical),
         MoveWide(MoveWide),
         Bitfield(Bitfield),
@@ -1217,6 +1220,12 @@ mod instruction {
         }
         if let Some(m) = pair_memory(word) {
             return Instruction::PairMemory(m);
+        }
+        if let Some(m) = structure_memory(word) {
+            return Instruction::StructureMemory(m);
+        }
+        if prefetch(word) {
+            return Instruction::Prefetch;
         }
         if let Some(l) = logical(word) {
             return Instruction::Logical(l);
@@ -1517,6 +1526,113 @@ mod instruction {
                 }
             },
             address: MemoryAddress::Literal(PcOffset((((w << 8) as i32) >> 13) as i64 * 4)),
+        })
+    }
+
+    /// PRFM and PRFUM have implementation-defined effect. This CPU ignores
+    /// prefetch hints without translating or touching the supplied address.
+    fn prefetch(w: u32) -> bool {
+        matches!(w & 0xff00_0000, 0xd800_0000) // literal
+            || matches!(w & 0xffc0_0000, 0xf980_0000) // unsigned offset
+            || matches!(w & 0xffe0_0c00, 0xf880_0000) // unscaled
+            || (w & 0xffe0_0c00 == 0xf8a0_0800 && matches!((w >> 13) & 7, 2 | 3 | 6 | 7))
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StructureLayout {
+        Sequential,
+        Interleaved,
+        Lane(u8),
+        Replicate,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StructureWriteback {
+        None,
+        TransferBytes,
+        Register(Gpr),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct StructureMemory {
+        pub operation: MemoryOperation,
+        pub first: VectorRegister,
+        pub base: OperandRegister,
+        pub layout: StructureLayout,
+        pub writeback: StructureWriteback,
+        pub register_count: u8,
+        pub element: MemorySize,
+        pub vector_bytes: u8,
+    }
+
+    /// DDI0487 C4.1, Advanced SIMD load/store multiple and single structures.
+    pub(super) fn structure_memory(w: u32) -> Option<StructureMemory> {
+        if w & 0xbe00_0000 != 0x0c00_0000 {
+            return None;
+        }
+        let single = w & (1 << 24) != 0;
+        let rm = (w >> 16) & 31;
+        let post_index = w & (1 << 23) != 0;
+        if !post_index && rm != 0 {
+            return None;
+        }
+        let writeback = if !post_index {
+            StructureWriteback::None
+        } else if let Some(r) = Gpr::new(rm as u8) {
+            StructureWriteback::Register(r)
+        } else {
+            StructureWriteback::TransferBytes
+        };
+        let q = (w >> 30) & 1;
+        let load = w & (1 << 22) != 0;
+        let size = (w >> 10) & 3;
+        let (layout, register_count, scale) = if single {
+            let opcode = (w >> 13) & 7;
+            let s = (w >> 12) & 1;
+            let count = 1 + (opcode & 1) * 2 + ((w >> 21) & 1);
+            let lane = (q << 3) | (s << 2) | size;
+            let (layout, scale) = match opcode >> 1 {
+                0 => (StructureLayout::Lane(lane as u8), 0),
+                1 if size & 1 == 0 => (StructureLayout::Lane((lane >> 1) as u8), 1),
+                2 if size == 0 => (StructureLayout::Lane((lane >> 2) as u8), 2),
+                2 if size == 1 && s == 0 => (StructureLayout::Lane(q as u8), 3),
+                3 if load && s == 0 => (StructureLayout::Replicate, size),
+                _ => return None,
+            };
+            (layout, count, scale)
+        } else {
+            if w & (1 << 21) != 0 {
+                return None;
+            }
+            use StructureLayout::{Interleaved, Sequential};
+            let (layout, count) = match (w >> 12) & 15 {
+                0 => (Interleaved, 4),
+                2 => (Sequential, 4),
+                4 => (Interleaved, 3),
+                6 => (Sequential, 3),
+                7 => (Sequential, 1),
+                8 => (Interleaved, 2),
+                10 => (Sequential, 2),
+                _ => return None,
+            };
+            if layout == Interleaved && size == 3 && q == 0 {
+                return None;
+            }
+            (layout, count, size)
+        };
+        Some(StructureMemory {
+            operation: if load {
+                MemoryOperation::Load
+            } else {
+                MemoryOperation::Store
+            },
+            first: VectorRegister((w & 31) as u8),
+            base: OperandRegister::field(w >> 5, true),
+            layout,
+            writeback,
+            register_count: register_count as u8,
+            element: MemorySize::scale(scale)?,
+            vector_bytes: (8 << q) as u8,
         })
     }
 
@@ -2409,7 +2525,8 @@ pub use instruction::{
     Logical, LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress, MemoryIndex,
     MemoryOffset, MemoryOperation, MemoryRegister, MemorySize, MoveWide, MoveWideOperation,
     Multiply, MultiplyKind, Nzcv, OperandRegister, PairMemory, PcOffset, RegisterBranch,
-    ScalarMemory, SelectOperation, ShiftAmount, SimdCopy, VectorRegister, decode_instruction,
+    ScalarMemory, SelectOperation, ShiftAmount, SimdCopy, StructureLayout, StructureMemory,
+    StructureWriteback, VectorRegister, decode_instruction,
 };
 
 pub mod dispatch;
