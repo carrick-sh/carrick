@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use carrick_el1_abi::{
     HostBoundFd, HostObjectBinding, HostReadinessCrossing, HostReadinessEntry, HostReadinessTimeout,
 };
-use carrick_guest_arch::KernelVa;
 use carrick_hal::TrapError;
+use carrick_hal::guest_arch_binding::core_arch::KernelVa;
 use parking_lot::Mutex;
 
 use crate::dispatch::StdioReadiness;
