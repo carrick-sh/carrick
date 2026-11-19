@@ -151,6 +151,38 @@ child:
     test %rax, %rax
     jne exit
 
+    lea moved(%rip), %rdi
+    mov %r14, %rsi
+    lea symlink_name(%rip), %rdx
+    mov $266, %eax                 /* symlinkat */
+    syscall
+    mov $87, %edi
+    test %rax, %rax
+    jne exit
+
+    mov %r14, %rdi
+    lea symlink_name(%rip), %rsi
+    lea buf(%rip), %rdx
+    mov $64, %r10d
+    mov $267, %eax                 /* readlinkat */
+    syscall
+    mov $88, %edi
+    cmp $5, %rax
+    jne exit
+    cmpl $0x65766f6d, buf(%rip)    /* "move" */
+    jne exit
+    cmpb $0x64, buf+4(%rip)       /* "d" */
+    jne exit
+
+    mov %r14, %rdi
+    lea symlink_name(%rip), %rsi
+    xor %edx, %edx
+    mov $263, %eax
+    syscall
+    mov $89, %edi
+    test %rax, %rax
+    jne exit
+
     mov %r14, %rdi
     lea moved(%rip), %rsi
     xor %edx, %edx
@@ -337,6 +369,7 @@ dir: .asciz DIR_PATH
 subdir: .asciz "subdir"
 relative_file: .asciz "file"
 moved: .asciz "moved"
+symlink_name: .asciz "symlink"
 parent_sibling: .asciz "parent-sibling"
 #endif
 empty: .asciz ""

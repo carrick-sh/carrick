@@ -3196,9 +3196,13 @@ impl<
         )
     }
     fn native_host_file(&mut self) -> FamilyCompletion {
-        if self.process.as_deref().is_some_and(|process| {
-            !process.is_root_process() && process.owns_descriptor_namespace()
-        }) {
+        // The ARM entry consumes NativeHostFile directly. CPL0 stages the
+        // same call in its retained host-file venue on a family decline.
+        if self.frame.arm_frame_ref().is_some()
+            && self.process.as_deref().is_some_and(|process| {
+                !process.is_root_process() && process.owns_descriptor_namespace()
+            })
+        {
             FamilyCompletion::NativeHostFile
         } else {
             FamilyCompletion::Forward
