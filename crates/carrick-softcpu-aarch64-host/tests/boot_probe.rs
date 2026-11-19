@@ -706,22 +706,6 @@ fn admit_root_task_with_stdio(memory: &mut Pages) {
     }
 }
 
-fn complete_mailbox_syscall(memory: &mut Pages, return_value: i64) {
-    let mb = LINUX_SYSCALL_MAILBOX_BASE;
-    memory.load(
-        mb + core::mem::offset_of!(Aarch64SyscallMailbox, return_value) as u64,
-        &(return_value as u64).to_le_bytes(),
-    );
-    memory.load(
-        mb + core::mem::offset_of!(Aarch64SyscallMailbox, response_action) as u64,
-        &1u32.to_le_bytes(),
-    );
-    memory.load(
-        mb + core::mem::offset_of!(Aarch64SyscallMailbox, state) as u64,
-        &2u32.to_le_bytes(),
-    );
-}
-
 fn read_cstr(memory: &mut Pages, mut at: u64, max: usize) -> Vec<u8> {
     let mut out = Vec::new();
     while out.len() < max {
@@ -912,10 +896,10 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
         (0, 0x9200_0047, 0)
     );
 
-    // 2. Admitted root task + stdio fds: set_tid_address (96) is still ignored
-    // by __init_tp (-38 without Aarch64NativeProcessService), and
-    // sanitize_standard_fds's ppoll([0, 1, 2], 3, {0, 0}, NULL, 8) (nr=73)
-    // reaches PendingFamilies::poll and forwards cleanly via HVC #2.
+    // Rust's startup checks that stdio is open with a zero-event, zero-timeout
+    // ppoll. Require the guest to observe the result before the probe stops.
+    // A pending mailbox request and a synthetic reply prove neither that the
+    // ring owned the syscall nor that the carrier answered typed readiness.
     let (mut cpu, mut memory, entry, _) = build_guest();
     admit_root_task_with_stdio(&mut memory);
     let mut runner = TracingRunner::new().expect("Linux arm64 host runner");
@@ -951,85 +935,10 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     assert!(memory.read_boot_root);
     assert_ne!(cpu.named.tpidrel0.0, 0);
     assert!(
-        matches!(
-            report.stop,
-            Stop::Event { event: Event::ProviderExit(exit), .. } if exit.immediate.value() == 2
-        ),
-        "{report}"
-    );
-    assert_eq!((state, trap_kind, cpu.el1.esr.0), (1, 1, 0x5600_0000));
-    assert_eq!(
-        (nr, nfds),
-        (73, 3),
-        "expected first carrier crossing to be SYS_ppoll on stdio [0, 1, 2]"
-    );
-    assert_eq!(
         runner
             .syscalls
             .iter()
-            .map(|s| (s.nr, s.ret))
-            .collect::<Vec<_>>(),
-        vec![(96, Some(-38)), (73, None)]
-    );
-
-    // 3. Diagnostic continuation past SYS_ppoll=0: sanitize_standard_fds
-    // succeeds without aborting, and lang_start_internal immediately invokes
-    // signal(SIGPIPE, SIG_IGN) -> rt_sigaction(13, ..., 8) (nr=134). With
-    // CurrentTask[0] issued but shared-carrier ZoneTables / SignalTable absent,
-    // dispatch::dispatch forwards Family::Signal(RtSigaction) via HVC #2
-    // (ForwardReason::FamilyFallback) to the host carrier.
-    complete_mailbox_syscall(&mut memory, 0);
-    let after_ppoll = probe_traced(&mut cpu, &mut memory, &mut runner, 1_000_000);
-    let next_state = read_u32(
-        &mut memory,
-        mb + core::mem::offset_of!(Aarch64SyscallMailbox, state) as u64,
-    );
-    let next_trap = read_u32(
-        &mut memory,
-        mb + core::mem::offset_of!(Aarch64SyscallMailbox, trap_kind) as u64,
-    );
-    let next_nr = read_u64(
-        &mut memory,
-        mb + core::mem::offset_of!(Aarch64SyscallMailbox, native_nr) as u64,
-    );
-    let signum = read_u64(&mut memory, args_off);
-    let sigsetsize = read_u64(&mut memory, args_off + 24);
-    println!(
-        "musl hello after ppoll=0: {after_ppoll}; mailbox state={next_state} trap_kind={next_trap} nr={next_nr} signum={signum} sigsetsize={sigsetsize}",
-    );
-    for (idx, sc) in runner.syscalls.iter().skip(2).enumerate() {
-        println!(
-            "  post-ppoll svc[{}]: pc={:#x} lr={:#x} nr={} args=[{:#x}, {:#x}, {:#x}, {:#x}] -> {:?}",
-            idx + 2,
-            sc.pc,
-            sc.lr,
-            sc.nr,
-            sc.args[0],
-            sc.args[1],
-            sc.args[2],
-            sc.args[3],
-            sc.ret
-        );
-    }
-    assert!(
-        matches!(
-            after_ppoll.stop,
-            Stop::Event { event: Event::ProviderExit(exit), .. } if exit.immediate.value() == 2
-        ),
-        "{after_ppoll}"
-    );
-    assert_eq!((next_state, next_trap, cpu.el1.esr.0), (1, 1, 0x5600_0000));
-    assert_eq!(
-        (next_nr, signum, sigsetsize),
-        (134, 13, 8),
-        "expected post-ppoll carrier crossing to be SYS_rt_sigaction(SIGPIPE, ..., 8)"
-    );
-    assert_eq!(
-        runner
-            .syscalls
-            .iter()
-            .map(|s| (s.nr, s.ret))
-            .collect::<Vec<_>>(),
-        vec![(96, Some(-38)), (73, Some(0)), (134, None)]
+            .any(|call| call.nr == 73 && call.args[1] == 3 && call.ret == Some(0)),
+        "musl startup did not return from ppoll in ring: {report}; mailbox state={state} trap_kind={trap_kind} nr={nr}"
     );
 }
