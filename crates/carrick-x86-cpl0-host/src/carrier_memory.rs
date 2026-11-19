@@ -934,9 +934,14 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
 
     /// Initialize retained boot records before creating any vCPU.
     pub fn initialize_fault_records(&mut self, region: FrameGpa) -> Result<(), MemoryError> {
-        let residency = self.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
-            FrameGpa::new(region.raw() + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET),
-        )?;
+        let slot = self
+            .locate(region, carrick_el1_abi::EL1_REGION_SIZE as usize)
+            .ok_or_else(|| error("fault record region bounds"))?;
+        let base = slot
+            .backing
+            .extent
+            .ptr(region.raw(), carrick_el1_abi::EL1_REGION_SIZE as usize)
+            .ok_or_else(|| error("fault record region backing"))?;
         let ingress = self.record_ptr::<carrick_el1_abi::SharedSignalIngressQueue>(
             FrameGpa::new(region.raw() + carrick_el1_abi::EL1_SIGNAL_INGRESS_OFFSET),
         )?;
@@ -946,7 +951,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         // SAFETY: exclusive boot memory, before CarrierMachine creates vCPUs;
         // both retained records have checked bounds and alignment.
         unsafe {
-            carrick_el1_abi::FrameGrantResidencyTable::init_in_place(residency);
+            carrick_el1_abi::enable_frame_grant_residency_growth(base);
             carrick_el1_abi::SharedSignalIngressQueue::initialize_at(ingress);
             portal.write(carrick_el1_abi::MmPortalSlots::new());
         }
@@ -1691,6 +1696,16 @@ impl<M: CarrierMemoryIo> LiveDescriptorWords for DescriptorWords<'_, M> {
         std::sync::atomic::fence(Ordering::SeqCst);
     }
     fn invalidate_range(&self, _va: u64, _len: u64) {} // Owner's trailing CPL0 drain before any re-entry.
+
+    fn descriptor_diagnostic(
+        &self,
+        event: carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic,
+    ) {
+        carrick_hal::diagnostic_capture::trace_descriptor_diagnostic(
+            carrick_guest_arch::GuestIsa::X86_64,
+            event,
+        );
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

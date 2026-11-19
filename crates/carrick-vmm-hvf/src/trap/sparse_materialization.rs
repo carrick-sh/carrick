@@ -2965,6 +2965,7 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
     fn settle(
         &mut self,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+        trace: Option<carrick_mmu_core::live_descriptor_words::GrantRefusalTrace>,
     ) -> Result<bool, TrapError> {
         use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
         let txn = self.txn.as_ref().unwrap_or_else(|| {
@@ -2982,6 +2983,25 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
                 "grant completion cannot release uncertain descriptor-visible ownership"
             );
         }
+        if let Some(event) = trace.and_then(|trace| trace.event) {
+            carrick_hal::diagnostic_capture::trace_descriptor_diagnostic(
+                carrick_hal::diagnostic_capture::GuestIsa::Aarch64,
+                event,
+            );
+        }
+        if let DescriptorOutcome::Refused(reason) = receipt.outcome {
+            carrick_observability::probes::hvpatch_owner_grant_descriptor_refused(|| {
+                let span = txn.op.span();
+                (
+                    txn.id.generation.get(),
+                    txn.op.kind(),
+                    span.va,
+                    span.len,
+                    u64::from(reason as u8),
+                    trace.map_or(2, |trace| u64::from(trace.residency_published)),
+                )
+            });
+        }
         let applied = matches!(receipt.outcome, DescriptorOutcome::Applied(_));
         // A peer can advance the reservation generation after PREPARE but
         // before this grant takes EL1's editor. The refused transaction has
@@ -2992,6 +3012,12 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
             receipt.outcome,
             DescriptorOutcome::Refused(
                 carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot
+            )
+        );
+        let residency_capacity = matches!(
+            receipt.outcome,
+            DescriptorOutcome::Refused(
+                carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::ResidencyCapacity
             )
         );
         let result = self
@@ -3021,7 +3047,9 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
             }
         }
         self.descriptor_settled = true;
-        if !applied && !stale_root {
+        // Capacity refused before the first descriptor store. Roll back
+        // the speculative backing on drop, and decline the supply normally.
+        if !applied && !stale_root && !residency_capacity {
             return Err(TrapError::Hypervisor(format!(
                 "owner grant descriptor refused: {:?}",
                 receipt.outcome

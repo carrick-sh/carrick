@@ -13875,7 +13875,13 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
     };
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _external = ExternalAliasStateRestore::capture();
-    for retired in [3, 0, 1, 2] {
+    for (retired, reason) in [
+        (3, DescriptorRefusal::StaleRoot),
+        (0, DescriptorRefusal::StaleRoot),
+        (0, DescriptorRefusal::ResidencyCapacity),
+        (1, DescriptorRefusal::StaleRoot),
+        (2, DescriptorRefusal::StaleRoot),
+    ] {
         let _stub = ScopedStage2MapTestStub::enable();
         let transport = CarrierForeignMmTransport::new();
         let installed = install_mm(
@@ -14020,11 +14026,12 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
         let receipt = DescriptorReceipt {
             id: txn.id,
             digest: txn.digest(),
-            outcome: DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot),
+            outcome: DescriptorOutcome::Refused(reason),
         };
-        assert!(
-            pending.settle(&receipt).unwrap(),
-            "a settled stale root permits only a fresh owner selection"
+        assert_eq!(
+            pending.settle(&receipt, None).unwrap(),
+            reason == DescriptorRefusal::StaleRoot,
+            "capacity declines after settlement; a stale root allows fresh selection"
         );
         drop(pending);
         assert!(
@@ -14279,7 +14286,7 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
         "{receipt:?}"
     );
-    assert!(pending.settle(&receipt).unwrap());
+    assert!(pending.settle(&receipt, None).unwrap());
     assert_eq!(
         pins_at_wake.load(std::sync::atomic::Ordering::SeqCst),
         0,
