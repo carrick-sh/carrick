@@ -1249,14 +1249,39 @@ fn declared_rename_across_a_crate_with_an_unrelated_item_macro() {
     assert!(declared.new.is_empty(), "{declared:?}");
     assert!(declared.warnings.is_empty(), "{declared:?}");
 
+    let generated = diff_trees(
+        &baseline,
+        &cpl0_receipt(&[OLD_WAIT4, NEW_WAIT4], &[]),
+        &base,
+        &candidate,
+    )
+    .unwrap_err();
+    assert!(
+        generated
+            .to_string()
+            .contains("was observed in candidate receipt"),
+        "{generated}"
+    );
+
+    let generated_test = concat!(
+        "macro_rules! binding { ($name:ident) => { #[test] fn $name() {} }; } ",
+        "binding!(wait4_rejects_unwritable_rusage_without_writing_status);",
+    );
+    write_test_tree(&base, generated_test, None);
+    let declared = diff_trees(&baseline, &next, &base, &candidate).unwrap();
+    assert!(declared.new.is_empty(), "{declared:?}");
+    assert!(declared.warnings.is_empty(), "{declared:?}");
+
     write_source(
         &candidate,
         "crates/carrick-vmm-kvm/src/retained.rs",
-        "some_generator!(wait4_rejects_unwritable_rusage_without_writing_status);",
+        generated_test,
     );
     let retained = diff_trees(&baseline, &next, &base, &candidate).unwrap_err();
     assert!(
-        retained.to_string().contains("still exists in candidate source"),
+        retained
+            .to_string()
+            .contains("still exists in candidate source"),
         "{retained}"
     );
 }
@@ -1606,17 +1631,12 @@ fn stale_declaration_neither_validates_candidate_nor_excuses_missing_tests() {
     );
 }
 
-fn assert_candidate_scan_refuses(extra_path: &str, extra_source: &str, manifest: Option<&str>) {
+fn candidate_scan_error(extra_path: &str, extra_source: &str, manifest: Option<&str>) -> String {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("base");
     let cand = dir.path().join("cand");
     write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
     write_source(&cand, "crates/example/tests/foo.rs", "");
-    write_source(
-        &cand,
-        "crates/example/kept.rs",
-        "#[test] #[ignore] fn gone() {}",
-    );
     write_source(&cand, extra_path, extra_source);
     if let Some(manifest) = manifest {
         write_source(&cand, "crates/example/Cargo.toml", manifest);
@@ -1628,9 +1648,13 @@ fn assert_candidate_scan_refuses(extra_path: &str, extra_source: &str, manifest:
         &base,
         &cand,
     );
-    let error = result
-        .expect_err("unresolved source excused missing:foo::gone")
-        .to_string();
+    result
+        .expect_err("source scan excused missing:foo::gone")
+        .to_string()
+}
+
+fn assert_candidate_scan_refuses(extra_path: &str, extra_source: &str, manifest: Option<&str>) {
+    let error = candidate_scan_error(extra_path, extra_source, manifest);
     assert!(
         error.contains("cannot resolve") || error.contains("cannot parse"),
         "{error}"
@@ -1639,10 +1663,14 @@ fn assert_candidate_scan_refuses(extra_path: &str, extra_source: &str, manifest:
 
 #[test]
 fn retirement_refuses_macro_generated_tests_anywhere_in_candidate_crate() {
-    assert_candidate_scan_refuses(
+    let error = candidate_scan_error(
         "crates/example/src/lib.rs",
         "macro_rules! binding { ($name:ident) => { #[test] #[ignore] fn $name() {} }; } binding!(gone);",
         None,
+    );
+    assert!(
+        error.contains("still exists in candidate source"),
+        "{error}"
     );
 }
 
@@ -1678,15 +1706,6 @@ fn retirement_accepts_item_macros_which_cannot_generate_tests() {
 }
 
 #[test]
-fn retirement_still_refuses_other_item_macros_named_like_asm() {
-    assert_candidate_scan_refuses(
-        "crates/example/src/lib.rs",
-        "my_crate::global_asm_tests!(gone);",
-        None,
-    );
-}
-
-#[test]
 fn retirement_refuses_path_modules_anywhere_in_candidate_crate() {
     // A `#[path]` target outside the crate root isn't among the scanned
     // files, so it could hide a same-named test: refuse.
@@ -1698,12 +1717,28 @@ fn retirement_refuses_path_modules_anywhere_in_candidate_crate() {
 }
 
 #[test]
-fn retirement_refuses_bare_item_macro_names_that_could_be_rebound() {
-    // `use gen as thread_local` would make a bare `thread_local!` a generator.
-    assert_candidate_scan_refuses(
+fn retirement_still_refuses_other_item_macros_named_like_asm() {
+    let error = candidate_scan_error(
         "crates/example/src/lib.rs",
-        "thread_local! { static CELL: u8 = 0; }",
+        "my_crate::global_asm_tests!(gone);",
         None,
+    );
+    assert!(
+        error.contains("still exists in candidate source"),
+        "{error}"
+    );
+}
+
+#[test]
+fn retirement_refuses_bare_item_macro_names_that_could_be_rebound() {
+    let error = candidate_scan_error(
+        "crates/example/src/lib.rs",
+        "use generators::binding as thread_local; thread_local!(gone);",
+        None,
+    );
+    assert!(
+        error.contains("still exists in candidate source"),
+        "{error}"
     );
 }
 
@@ -1753,7 +1788,7 @@ fn retirement_accepts_path_modules_that_stay_inside_the_crate() {
 fn retirement_refuses_include_anywhere_in_candidate_crate() {
     assert_candidate_scan_refuses(
         "crates/example/src/lib.rs",
-        "include!(\"../kept.rs\");",
+        "include!(\"../kept.rs\"); unrelated_generator!();",
         None,
     );
 }
@@ -1928,12 +1963,20 @@ fn source_scan_skips_symlink_files_and_directories() {
 
 #[test]
 fn retirement_refuses_opaque_item_macros_and_unscanned_target_paths() {
-    for source in [
+    let error = candidate_scan_error(
+        "crates/example/src/lib.rs",
         "use generators::binding; binding!(gone);",
-        "#[cfg_attr(test, path = \"../kept.rs\")] mod kept;",
-    ] {
-        assert_candidate_scan_refuses("crates/example/src/lib.rs", source, None);
-    }
+        None,
+    );
+    assert!(
+        error.contains("still exists in candidate source"),
+        "{error}"
+    );
+    assert_candidate_scan_refuses(
+        "crates/example/src/lib.rs",
+        "#[cfg_attr(test, path = \"../kept.rs\")] mod kept; unrelated_generator!();",
+        None,
+    );
     for (section, path) in [
         ("test", "tests/kept"),
         ("bin", "../kept.rs"),
@@ -3573,7 +3616,7 @@ fn dot_prefixed_targets_never_hide_a_nested_package() {
 fn unparseable_nested_manifest_keeps_its_directory_scanned() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path();
-    write_test_tree(root, "#[test]\nfn kept() {}\n", None);
+    write_test_tree(root, "", None);
     write_source(
         root,
         "crates/carrick-vmm-kvm/fixtures/odd/Cargo.toml",
@@ -3582,11 +3625,12 @@ fn unparseable_nested_manifest_keeps_its_directory_scanned() {
     write_source(
         root,
         "crates/carrick-vmm-kvm/fixtures/odd/main.rs",
-        "macro_rules! gen { () => {}; } gen!();\n",
+        "some_generator!(kept);\n",
     );
-    let error = carrick_xtask::ci_receipt::tree_has_test(root, "cpl0_fork_e2e", "kept")
-        .expect_err("an unparseable nested manifest must not hide its sources");
-    assert!(error.to_string().contains("cannot resolve"), "{error}");
+    assert!(
+        tree_has_test(root, "cpl0_fork_e2e", "kept").unwrap(),
+        "an unparseable nested manifest must not hide its sources"
+    );
 }
 
 #[test]
