@@ -1294,7 +1294,15 @@ impl<'a> MemView<'a> {
                         false
                     }
                 };
-                if !direct {
+                if direct {
+                    carrick_hal::host_residency::with_host_residency(|table| {
+                        table.retire_overlapping(
+                            self.mm_authority().mm_id.raw(),
+                            source.start,
+                            valid_len as u64,
+                        );
+                    });
+                } else {
                     memory
                         .write_bytes_unchecked(source.start, &snapshot.bytes[..valid_len])
                         .map_err(|_| LINUX_ENOMEM)?;
