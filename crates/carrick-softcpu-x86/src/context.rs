@@ -775,10 +775,13 @@ impl SoftCpuContext {
         self.accept_eligible_apic_interrupt(true)
     }
 
-    pub(crate) fn accept_eligible_apic_interrupt(&mut self, include_timer: bool) -> Option<u8> {
+    pub(crate) fn accept_eligible_apic_interrupt(
+        &mut self,
+        bypass_timer_grace: bool,
+    ) -> Option<u8> {
         let vec = self
             .lapic
-            .accept_eligible_interrupt(self.apic_hw_enabled(), include_timer);
+            .accept_eligible_interrupt(self.apic_hw_enabled(), bypass_timer_grace);
         self.cr8 = u64::from(self.lapic.cr8());
         vec
     }
