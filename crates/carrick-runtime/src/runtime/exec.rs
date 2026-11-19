@@ -1388,6 +1388,47 @@ mod tests {
         payload
     }
 
+    #[test]
+    fn native_exec_successor_inherits_realtime_calibration() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        #[cfg(feature = "platform-macos")]
+        let elf = synthetic_aarch64_exec();
+        #[cfg(not(feature = "platform-macos"))]
+        let elf = synthetic_exec(native_guest_elf_machine(), [0; 4]);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("successor");
+        std::fs::write(&path, elf).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // An already running carrier has calibrated its counter before fork.
+        let unix_ns = std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos() as u64;
+        let base = carrick_mem::vdso::set_realtime_off_ns(
+            unix_ns.wrapping_sub(carrick_host::clock::host_clock_uptime_ns()),
+        );
+        let rootfs =
+            carrick_vfs::rootfs::RootFs::from_immutable_host_dir(directory.path()).unwrap();
+        let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+        let capability = capture_native_exec_capability(&dispatcher).unwrap();
+        let payload = sealed(
+            native_exec_payload(carrick_core_abi::service::ExecCall::Execve, "/successor"),
+            0,
+            "/",
+        );
+        let addr =
+            carrick_mem::vdso::LINUX_VVAR_BASE + carrick_mem::vdso::VVAR_OFF_REALTIME_OFF_NS as u64;
+        for delta in [0, 3_600_000_000_000, -3_600_000_000_000] {
+            capability.loader.clock.set_realtime_offset_ns(delta);
+            let loaded = prepare_native_exec_image(&capability, &payload, no_descriptors).unwrap();
+            assert_eq!(
+                read_image_u64(&loaded.image, addr),
+                carrick_mem::vdso::vvar_realtime_off_ns(base, delta),
+                "native exec successor must carry the calibrated realtime word"
+            );
+        }
+    }
+
     /// #1392: a native child's exec resolves under the cwd and checks
     /// access with the ids its own task row carries in the payload, never
     /// the origin task's live (or captured) cwd and credentials. What the

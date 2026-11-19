@@ -11,9 +11,11 @@ rationale = "Without an explicit clock adjustment, sequential vDSO/syscall realt
 [bindings]
 vm_free = [
   "carrick-mem::vdso::tests::realtime_calibration_is_shared_by_existing_and_new_address_spaces",
+  "carrick-runtime::runtime::exec::tests::native_exec_successor_inherits_realtime_calibration",
 ]
 embed = [
   "carrick-embed::realtime_calibration::realtime_calibration_survives_sibling_exec",
+  "carrick-embed::realtime_calibration::realtime_is_calibrated_for_the_native_exec_successor",
 ]
 docker = [
   "ltp:clock_gettime04-with-sibling-exec",
