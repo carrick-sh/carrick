@@ -32,6 +32,7 @@ rationale = "A file-backed PROT_NONE reservation of 0x65ee48 bytes, fixed RX tex
 [bindings]
 vm_free = [
   "carrick-core::x86_acceleration::{arm_private_file_4k_grants_scale_past_initial_residency,x86_private_file_4k_grants_scale_past_initial_residency}; production portal and ISA descriptor transactions must apply 8704 live 4 KiB grants, preserve every committed residency row and release all rows on range retirement (#2420)",
+  "carrick-core::x86_acceleration::{arm_private_file_grants_apply_across_provisioned_residency_segments,x86_private_file_grants_apply_across_provisioned_residency_segments}; isolates the shared descriptor owner with two segments supplied by the real metadata allocator before first touch",
   "carrick-kernel::el1_delegation::tests::serial_host::published_private_source_fault_joins_late_delegation_recall (production late entry and retained source read, no stale bytes during recall)",
   "carrick-hal::fork_stock::tests::private_map_releases_keep_native_source_custody_steady (shared admission, 1024 retained sources, errno 12 and release-before-readmission)",
   "carrick-kernel::kernel::objects::tests::serial_host_ipc_mapping_projection_shares_live_delegation_identity (published projection observes later delegation entry and clearing)",

@@ -236,7 +236,7 @@ pub fn serve_grant<
     portal: &MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
     slot: &carrick_core_abi::PortalGrantSlot,
     words: &W,
-    residency: &FrameGrantResidencyTable,
+    residency: &FrameGrantResidencyTable<impl FrameGrantResidencyAccess>,
     worker: u32,
     invalidate: impl FnOnce(),
 ) -> Result<Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt>, MmError> {
@@ -252,7 +252,7 @@ pub fn serve_grant<
 pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
     slot: &carrick_core_abi::PortalGrantSlot,
     words: &W,
-    residency: &FrameGrantResidencyTable,
+    residency: &FrameGrantResidencyTable<impl FrameGrantResidencyAccess>,
     target: GrantTarget<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     invalidate: impl FnOnce(),
 ) -> Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt> {
@@ -395,7 +395,7 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
                             va: identity.semantic_base,
                             len: identity.len,
                             slots_used: residency.observed_slots_used(),
-                            slots_total: FRAME_GRANT_RESIDENCY_SLOTS,
+                            slots_total: residency.slot_capacity(),
                         },
                     );
                 }
