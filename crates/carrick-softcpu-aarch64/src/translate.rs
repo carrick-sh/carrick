@@ -8,12 +8,13 @@
 //! ADD immediate C6.2.4, MOVZ/MOVK C6.2.193/C6.2.191, B C6.2.26, RET C6.2.219,
 //! MRS/MSR C6.2.194/C6.2.196, B.cond C6.2.25, CBZ C6.2.45, TBZ C6.2.331).
 use crate::state::{
-    CpuState, FPCR_MASK, FPSR_MASK, ProgramCounter, RegisterValue, StackPointer, SystemValue,
+    CpuState, ExceptionLevel, FPCR_MASK, FPSR_MASK, ProgramCounter, RegisterValue, StackPointer,
+    SystemValue,
 };
 use crate::{
-    AddressBase, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, Gpr, Hint, Instruction,
-    LogicalOperand, MemoryAddress, MemoryIndex, MemoryOperation, MemoryRegister, OperandRegister,
-    RegisterBranch, ScalarMemory, decode_instruction,
+    AddressBase, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, GUEST_CPU_PROFILE, Gpr,
+    Hint, Instruction, LogicalOperand, MemoryAddress, MemoryIndex, MemoryOperation, MemoryRegister,
+    OperandRegister, RegisterBranch, ScalarMemory, decode_instruction,
 };
 use alloc::vec::Vec;
 
@@ -32,6 +33,7 @@ pub enum CopyKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
     Memory,
+    RegisterCompute,
     SystemRegister,
     Pstate,
     SystemOperation,
@@ -107,6 +109,7 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
         | Instruction::AtomicAdd(_)
         | Instruction::StructureMemory(_)
         | Instruction::Prefetch => InstructionClass::Exit(ExitReason::Memory),
+        Instruction::Crc32(_) => InstructionClass::Exit(ExitReason::RegisterCompute),
         Instruction::SystemAccess(_) => InstructionClass::Exit(ExitReason::SystemRegister),
         Instruction::PstateImmediate(_) => InstructionClass::Exit(ExitReason::Pstate),
         Instruction::SystemOperation(_)
@@ -172,7 +175,18 @@ impl GuestInstruction {
     }
 
     pub fn decode(pc: ProgramCounter, word: u32) -> Self {
-        let instruction = decode_instruction(word);
+        Self::decode_at_level(pc, word, ExceptionLevel::El1)
+    }
+
+    pub fn decode_el0(pc: ProgramCounter, word: u32) -> Self {
+        Self::decode_at_level(pc, word, ExceptionLevel::El0)
+    }
+
+    fn decode_at_level(pc: ProgramCounter, word: u32, el: ExceptionLevel) -> Self {
+        let mut instruction = decode_instruction(word);
+        if !GUEST_CPU_PROFILE.admits(instruction, el) {
+            instruction = Instruction::Unallocated;
+        }
         Self {
             pc,
             word,
@@ -252,12 +266,13 @@ pub fn split_block(
     limits: BlockLimits,
     fetch: impl FnMut(ProgramCounter) -> Option<u32>,
 ) -> GuestBlock {
-    split_block_for_run(start, limits, false, fetch)
+    split_block_for_run(start, limits, ExceptionLevel::El1, false, fetch)
 }
 
 pub(crate) fn split_block_for_run(
     start: ProgramCounter,
     limits: BlockLimits,
+    el: ExceptionLevel,
     inline_memory: bool,
     mut fetch: impl FnMut(ProgramCounter) -> Option<u32>,
 ) -> GuestBlock {
@@ -273,7 +288,7 @@ pub(crate) fn split_block_for_run(
     let page = start.0 / CODE_PAGE_BYTES;
     while instructions.len() < limits.max_instructions.max(1) && pc.0 / CODE_PAGE_BYTES == page {
         let Some(word) = fetch(pc) else { break };
-        let instruction = GuestInstruction::decode(pc, word);
+        let instruction = GuestInstruction::decode_at_level(pc, word, el);
         instructions.push(instruction);
         if instruction.class.terminates() && !(inline_memory && inline_op(&instruction).is_some()) {
             break;

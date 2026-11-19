@@ -730,7 +730,6 @@ fn musl_simd_copy_decodes_only_allocated_register_forms() {
         0x0e08_0c20, // DUP with Q=0 and a 64-bit element: undefined
         0x0e08_3c01, // UMOV with Q=0 and a 64-bit element: undefined
         0x4e04_3c01, // UMOV with Q=1 and a 32-bit element: undefined
-        0x4e20_1c00, // AND vector, outside this CRT subset
         0x3d80_0000, // STR Q0, [X0] must use guest memory
     ] {
         assert!(

@@ -1192,12 +1192,13 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64-host/src/memory.rs", contract = "arm.softcpu.stage1-tlb" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs", contract = "arm.softcpu.stage1-tlb" },
+  { path = "crates/carrick-softcpu-aarch64/src/cpu_profile.rs", contract = "softcpu.a64.el0-fp" },
   # Copy-through dispatcher over the ExecuteBlock seam (#1236), driven by the test-only arm64 lane.
   { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "arm.softcpu.stage1-tlb" },
+  { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "softcpu.a64.el0-fp" },
   # Virtual exception entry and return for the test-only arm64 lane.
-  # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
-  { path = "crates/carrick-softcpu-aarch64/src/exception.rs", contracts = [] },
+  { path = "crates/carrick-softcpu-aarch64/src/exception.rs", contract = "softcpu.a64.el0-fp" },
   # Copy-through exit handlers for the test-only arm64 lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.stage1-tlb" },

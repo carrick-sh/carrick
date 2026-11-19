@@ -15,6 +15,10 @@ vm_free = [
   "carrick-softcpu-aarch64::el0_fp::scalar_fp_is_copied_only_for_allocated_single_and_double_encodings",
   "carrick-softcpu-aarch64::el0_fp::vector_integer_fp_permute_and_table_admit_only_allocated_forms",
   "carrick-softcpu-aarch64::handler::simd_structures_interleave_replicate_and_commit_only_after_read",
+  "carrick-softcpu-aarch64::handler::el0_crc32_and_crc32c_match_standard_check_values",
+  "carrick-softcpu-aarch64::handler::el0_reads_virtual_cpu_identity_through_the_instruction_handler",
+  "carrick-softcpu-aarch64::handler::el0_ldadd_raises_undefined_before_accessing_memory",
+  "carrick-softcpu-aarch64::dispatch::tests::report_counts_each_el0_undefined_delivery_once_per_run",
 ]
 
 [bindings.unresolved]
