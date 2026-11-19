@@ -4055,6 +4055,9 @@ fn ring_descriptor_run(mode: &str) -> (i32, Vec<(usize, u64)>) {
         assert!(!sibling.exists(), "the native parent removed its sibling");
         std::fs::write(&sibling, []).expect("parent's sibling file for Carrick");
     }
+    if mode == "-DFILEOPS" {
+        std::fs::write(&path, b"loader library").expect("reset native control's file");
+    }
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     dispatcher.set_fs_backend(Box::new(
         carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
@@ -4136,6 +4139,17 @@ fn serial_host_fork_child_resolves_relative_paths_through_dirfds() {
         (0, vec![]),
         "70 mkdirat, 71 openat, 72 newfstatat, 73 renameat, 74 unlinkat file, \
          75 unlinkat directory, 76 second directory fd, 77 parent's sibling unlinkat"
+    );
+}
+
+/// The CPL0 fork child operates on the ring file's pinned description.
+#[test]
+fn serial_host_fork_child_syncs_and_queries_its_host_file() {
+    assert_eq!(
+        ring_descriptor_run("-DFILEOPS"),
+        (0, vec![]),
+        "78 writable openat, 79 fsync, 80 fdatasync, 81 sync_file_range, 82 syncfs, \
+         83 statfs, 84 fstatfs, 85 fallocate, 86 allocated file size"
     );
 }
 
