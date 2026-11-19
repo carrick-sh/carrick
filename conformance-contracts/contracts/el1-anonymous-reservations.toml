@@ -69,7 +69,7 @@ vm_free = [
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest",
-  "carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_advisory_mmap_stays_in_ring (live child mappings, protection edits and isolated stores with the parent alive)",
+  "carrick-vmm-kvm::cpl0_initial_mm::{serial_host_native_child_advisory_mmap_stays_in_ring,serial_host_native_exec_successor_advisory_mmap_stays_in_ring} (live child and exec successor mappings, protection edits and isolated stores with the parent alive)",
   "carrick-vmm-kvm::cpl0_initial_mm::production_full_owed_return_table_parks_on_its_busy_holder_until_release (#1482: 64 slots, eight busy holders, one doorbell and one park until release; zero reruns while held)",
   "carrick-vmm-kvm::cpl0_initial_mm::production_full_owed_return_table_reclaims_exited_fork_holders (#1482 P0-1: 64 owed-return slots held by eight killed and reaped fork children, no later fork; the parent's retirement must reclaim quarantine and finish within the existing exit budget; native Linux exits zero)",
   "carrick-vmm-kvm::cpl0_entry::production_anonymous_release_to_idle_peer_preserves_wake (real KVM pool, ordered remote synthetic holder release; one park, zero handbacks/forwards, exact exit 7)",
