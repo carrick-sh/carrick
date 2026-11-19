@@ -38,6 +38,7 @@ extern crate alloc;
 #[cfg(any(test, feature = "std"))]
 extern crate std;
 
+pub mod block_cache;
 pub mod domains;
 pub mod placement;
 pub mod retirement;

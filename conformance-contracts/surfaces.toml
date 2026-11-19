@@ -1173,7 +1173,7 @@ surfaces = [
   # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
   { path = "crates/carrick-softcpu-aarch64/src/exception.rs", contracts = [] },
   # Copy-through exit handlers for the test-only arm64 lane (#1236).
-  { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contracts = [] },
+  { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.cache-hot-set" },
   # Typed A64 census and instruction decoder for the test-only soft-CPU lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/lib.rs", contracts = [] },
   # Stage-1 translation of handler accesses and block fetch for the test-only arm64 lane (#2480).
@@ -1239,6 +1239,9 @@ surfaces = [
   { path = "crates/carrick-softcpu-x86/tests/softcpu_level0.rs", contract = "x86.softcpu.level0" },
   { path = "crates/carrick-softcpu-x86/tests/softcpu_v3.rs", contract = "x86.cpuid.v3" },
   { path = "crates/carrick-softcpu-x86/tests/softcpu_v3.rs", contract = "x86.softcpu.level0" },
+  { path = "crates/carrick-softmmu/src/block_cache.rs", contract = "arm.softcpu.cache-hot-set" },
+  { path = "crates/carrick-softmmu/src/block_cache.rs", contract = "x86.softcpu.cache-hot-set" },
+  { path = "crates/carrick-softmmu/src/block_cache.rs", contract = "x86.softcpu.cache-smc" },
   { path = "crates/carrick-softmmu/src/domains.rs", contract = "softmmu.x86.physical-retirement" },
   { path = "crates/carrick-softmmu/src/domains.rs", contract = "softmmu.x86.tlb-walker" },
   { path = "crates/carrick-softmmu/src/lib.rs", contract = "softmmu.x86.physical-retirement" },

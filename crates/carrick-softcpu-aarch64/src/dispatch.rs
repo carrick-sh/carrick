@@ -1,17 +1,21 @@
 //! The dispatcher: split and translate the block at `cpu.pc`, run it through
 //! an `ExecuteBlock` (the host launch, implemented outside this crate on an
 //! arm64 host), map the exit index back to a guest exit, run its handler, and
-//! repeat under a block budget. No translation cache in this slice: see
-//! docs/design/soft-aarch64-translator.md, "Cache".
+//! repeat under a block budget. Resident blocks are reused only after checking
+//! the live execute mapping and the memory owner's code generation.
 use crate::exception::{Exception, take_exception};
-use crate::handler::{self, Event, ExclusiveMonitor, GuestMemory, MemoryFault, Outcome};
-use crate::mmu::{self, AccessClass, Stage1Error};
-use crate::state::{CpuState, ProgramCounter, VirtualAddress};
-use crate::translate::{
-    BlockExit, BlockFrame, BlockLimits, ExitReason, GuestInstruction, InstructionClass,
-    TranslateError, TranslatedBlock, emit_block, split_block,
+use crate::handler::{
+    self, CodeGeneration, Event, ExclusiveMonitor, GuestMemory, MemoryFault, Outcome,
 };
+use crate::mmu::{self, AccessClass, Stage1Error};
+use crate::state::{CpuState, ExceptionLevel, ProgramCounter, VirtualAddress};
+use crate::translate::{
+    BlockExit, BlockFrame, BlockLimits, CODE_PAGE_BYTES, ExitReason, GuestInstruction,
+    InstructionClass, TranslateError, TranslatedBlock, emit_block, split_block,
+};
+use carrick_guest_arch::{FrameGpa, Gpa};
 use carrick_mmu_core::stage1::LeafAccess;
+use carrick_softmmu::block_cache::BlockCache;
 use core::fmt;
 
 /// Runs one translated block against `frame` and returns its exit index.
@@ -119,8 +123,8 @@ impl<E: fmt::Debug> fmt::Display for Report<E> {
     }
 }
 
-/// Events the dispatcher absorbs and continues past. There is no translation
-/// cache, so a TLBI has nothing to invalidate; NOP-like hints never stop.
+/// Events the dispatcher absorbs and continues past. Execute permission and
+/// frame identity are rechecked by a live stage-1 translation at every entry.
 fn absorbed(event: Event) -> bool {
     matches!(
         event,
@@ -128,25 +132,58 @@ fn absorbed(event: Event) -> bool {
     )
 }
 
-/// Fetch one instruction word, stage-1 translated when SCTLR_EL1.M is set.
-fn fetch(
+fn fetch_address(
     cpu: &CpuState,
     memory: &mut impl GuestMemory,
     pc: ProgramCounter,
-) -> Result<u32, Option<Stage1Error>> {
-    let pa = mmu::translate(
+) -> Result<Gpa, Stage1Error> {
+    mmu::translate(
         cpu,
         memory,
         pc.0,
         LeafAccess::Execute,
         AccessClass::Ordinary,
     )
-    .map_err(Some)?;
+    .map(Gpa::new)
+}
+
+fn read_word(memory: &mut impl GuestMemory, pa: Gpa) -> Result<u32, MemoryFault> {
     let mut bytes = [0; 4];
-    memory
-        .read(VirtualAddress(pa), &mut bytes)
-        .map_err(|_| None)?;
+    memory.read(VirtualAddress(pa.raw()), &mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct BlockKey {
+    pc: u64,
+    ttbrs: [u64; 2],
+    tcr: u64,
+    sctlr: u64,
+    el1: bool,
+}
+
+impl BlockKey {
+    fn for_cpu(cpu: &CpuState) -> Self {
+        Self {
+            pc: cpu.pc.0,
+            // Both raw TTBRs include their ASID fields. TCR selects the active ASID.
+            ttbrs: [cpu.named.ttbr0.0, cpu.named.ttbr1.0],
+            tcr: cpu.el1.tcr.0,
+            sctlr: cpu.el1.sctlr.0,
+            el1: cpu.pstate.el == ExceptionLevel::El1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CodeIdentity {
+    frame: FrameGpa,
+    generation: CodeGeneration,
+}
+
+struct ResidentBlock {
+    code: CodeIdentity,
+    block: TranslatedBlock,
 }
 
 struct MeasuredMemory<'a, M> {
@@ -161,6 +198,10 @@ impl<M: GuestMemory> GuestMemory for MeasuredMemory<'_, M> {
 
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault> {
         self.inner.write(address, bytes)
+    }
+
+    fn code_generation(&self, frame: FrameGpa) -> Option<CodeGeneration> {
+        self.inner.code_generation(frame)
     }
 
     fn record_stage1_walk(&mut self) {
@@ -184,6 +225,9 @@ pub fn run<X: ExecuteBlock>(
         inner: memory,
         walks: 0,
     };
+    // The run borrows one memory owner and one set of block limits. Keeping
+    // residency within that borrow also discards code at provider handoffs.
+    let mut cache = BlockCache::<BlockKey, ResidentBlock>::default();
     let stop = loop {
         if blocks >= budget {
             break Stop::Budget;
@@ -198,9 +242,9 @@ pub fn run<X: ExecuteBlock>(
         // D5.8: an instruction abort on the block's first word is taken at
         // that PC; later words that fault end the block before them, and
         // fault as the first word of the next block.
-        match fetch(cpu, memory, cpu.pc) {
-            Ok(_) => {}
-            Err(Some(Stage1Error::Abort(fault))) => match mmu::fault_exception(fault) {
+        let pa = match fetch_address(cpu, memory, cpu.pc) {
+            Ok(pa) => pa,
+            Err(Stage1Error::Abort(fault)) => match mmu::fault_exception(fault) {
                 Some(exception) => {
                     // A taken abort spends one budget step, so a vector that
                     // itself faults cannot spin without bound.
@@ -211,37 +255,61 @@ pub fn run<X: ExecuteBlock>(
                 None => break Stop::Fetch(VirtualAddress(cpu.pc.0)),
             },
             Err(_) => break Stop::Fetch(VirtualAddress(cpu.pc.0)),
-        }
-        work.decoded_blocks += 1;
-        let guest = {
-            let cpu = &*cpu;
-            split_block(cpu.pc, limits, |pc| fetch(cpu, memory, pc).ok())
         };
-        if guest.instructions().is_empty() {
-            break Stop::Fetch(VirtualAddress(cpu.pc.0));
-        }
-        work.emitted_blocks += 1;
-        let block = match emit_block(&guest) {
-            Ok(b) => b,
-            Err(e) => break Stop::Translate(e),
+        let key = BlockKey::for_cpu(cpu);
+        let frame = Gpa::new(pa.raw() & !(CODE_PAGE_BYTES - 1)).to_frame_gpa();
+        let code = memory
+            .code_generation(frame)
+            .map(|generation| CodeIdentity { frame, generation });
+        let uncached;
+        let block = if let Some(resident) = cache.get(&key).filter(|r| Some(r.code) == code) {
+            &resident.block
+        } else {
+            let Ok(first) = read_word(memory, pa) else {
+                break Stop::Fetch(VirtualAddress(cpu.pc.0));
+            };
+            work.decoded_blocks += 1;
+            let mut fetched_whole_block = true;
+            let guest = split_block(cpu.pc, limits, |pc| {
+                let word = if pc == cpu.pc {
+                    Some(first)
+                } else {
+                    fetch_address(cpu, memory, pc)
+                        .ok()
+                        .and_then(|pa| read_word(memory, pa).ok())
+                };
+                fetched_whole_block &= word.is_some();
+                word
+            });
+            work.emitted_blocks += 1;
+            let block = match emit_block(&guest) {
+                Ok(block) => block,
+                Err(error) => break Stop::Translate(error),
+            };
+            if let Some(code) = code.filter(|_| fetched_whole_block) {
+                &cache.insert(key, ResidentBlock { code, block }).block
+            } else {
+                uncached = block;
+                &uncached
+            }
         };
         let mut frame = BlockFrame::from_cpu(cpu);
         work.dispatches += 1;
-        let index = match executor.execute(&block, &mut frame) {
+        let index = match executor.execute(block, &mut frame) {
             Ok(i) => i,
             Err(e) => break Stop::Execute(e),
         };
         frame.store_to(cpu);
         blocks += 1;
-        let Some(exit) = block.exits().get(index) else {
+        let Some(exit) = block.exits().get(index).copied() else {
             break Stop::BadExit(index);
         };
         work.executed_blocks += 1;
-        let instructions = guest.instructions().len() as u64;
+        let instructions = block.guest().instructions().len() as u64;
         match exit {
             BlockExit::Continue(pc) => {
                 work.retired_instructions += instructions;
-                cpu.pc = *pc;
+                cpu.pc = pc;
             }
             BlockExit::Handler(i) => {
                 // The generated block retires the prefix before the handler.
@@ -252,10 +320,13 @@ pub fn run<X: ExecuteBlock>(
                     work.memory_exits += 1;
                 }
                 cpu.pc = i.pc();
-                match handler::execute(cpu, monitor, memory, i) {
+                match handler::execute(cpu, monitor, memory, &i) {
                     Outcome::Continue => work.retired_instructions += 1,
                     Outcome::Fault => {}
                     Outcome::Event(event) => {
+                        if matches!(event, Event::Ic(_)) {
+                            cache.clear();
+                        }
                         if matches!(
                             event,
                             Event::ProviderExit(_) | Event::Tlbi(_) | Event::Ic(_) | Event::Hint(_)
@@ -264,7 +335,7 @@ pub fn run<X: ExecuteBlock>(
                         }
                         if !absorbed(event) {
                             break Stop::Event {
-                                instruction: *i,
+                                instruction: i,
                                 event,
                             };
                         }

@@ -21,6 +21,7 @@ use carrick_el1_abi::{
     EL1_STACK_GUARD_TABLES_BASE, El1TaskId, FdMapSlot, HostObjectBinding, SnapshotGeneration,
     TrapFrame, is_el1_stack_guard, stack_slot_top,
 };
+use carrick_guest_arch::FrameGpa;
 use carrick_mem::arch_sysregs::{MAIR_EL1_BOOTSTRAP, SCTLR_EL1_BOOTSTRAP, TCR_EL1_BOOTSTRAP};
 use carrick_mem::memory::{
     Aarch64SyscallMailbox, El1IrqMode, LINUX_CARRIER_MAINT_ROOT_BASE, LINUX_EL0_TRAMPOLINE_BASE,
@@ -33,7 +34,9 @@ use carrick_mem::memory::{
     stage1_hvpatch_page_tables, stage1_identity_page_tables,
 };
 use carrick_softcpu_aarch64::dispatch::{ExecuteBlock, Report, Stop, run};
-use carrick_softcpu_aarch64::handler::{Event, ExclusiveMonitor, GuestMemory, MemoryFault};
+use carrick_softcpu_aarch64::handler::{
+    CodeGeneration, Event, ExclusiveMonitor, GuestMemory, MemoryFault,
+};
 use carrick_softcpu_aarch64::state::{
     CpuState, ExceptionLevel, InterruptMasks, ProgramCounter, RegisterValue, SavedPstate, Sctlr,
     StackPointer, StackSelect, SystemValue, VirtualAddress,
@@ -51,54 +54,85 @@ const PAGE: u64 = 4096;
 const INITIAL_METADATA_END: u64 =
     EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64;
 
+struct PhysicalPage {
+    bytes: [u8; PAGE as usize],
+    generation: u64,
+}
+
+impl PhysicalPage {
+    fn write(&mut self, offset: usize, bytes: &[u8]) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("code generation exhausted");
+        self.bytes[offset..][..bytes.len()].copy_from_slice(bytes);
+    }
+}
+
 /// Page-granular guest physical memory: unbacked pages fault.
 #[derive(Default)]
 struct Pages {
-    pages: BTreeMap<u64, Box<[u8; PAGE as usize]>>,
+    pages: BTreeMap<u64, Box<PhysicalPage>>,
     read_boot_root: bool,
 }
 
 impl Pages {
-    fn map_zero(&mut self, page: u64) {
-        self.pages
-            .entry(page & !(PAGE - 1))
-            .or_insert_with(|| Box::new([0; PAGE as usize]));
-    }
-    fn load(&mut self, at: u64, bytes: &[u8]) {
-        for (i, b) in bytes.iter().enumerate() {
-            let a = at + i as u64;
-            self.map_zero(a);
-            self.pages.get_mut(&(a & !(PAGE - 1))).unwrap()[(a % PAGE) as usize] = *b;
-        }
-    }
-    fn byte(&mut self, a: u64) -> Result<&mut u8, MemoryFault> {
-        self.pages
-            .get_mut(&(a & !(PAGE - 1)))
-            .map(|p| &mut p[(a % PAGE) as usize])
-            .ok_or(MemoryFault {
-                address: VirtualAddress(a),
+    fn map_zero(&mut self, address: u64) -> &mut PhysicalPage {
+        self.pages.entry(address & !(PAGE - 1)).or_insert_with(|| {
+            Box::new(PhysicalPage {
+                bytes: [0; PAGE as usize],
+                generation: 0,
             })
+        })
+    }
+
+    fn load(&mut self, mut at: u64, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let offset = (at % PAGE) as usize;
+            let len = bytes.len().min(PAGE as usize - offset);
+            self.map_zero(at).write(offset, &bytes[..len]);
+            at += len as u64;
+            bytes = &bytes[len..];
+        }
     }
 }
 
 impl GuestMemory for Pages {
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault> {
         for (i, b) in bytes.iter_mut().enumerate() {
-            *b = *self.byte(address.0 + i as u64)?;
+            let a = address.0 + i as u64;
+            let page = self.pages.get(&(a & !(PAGE - 1))).ok_or(MemoryFault {
+                address: VirtualAddress(a),
+            })?;
+            *b = page.bytes[(a % PAGE) as usize];
         }
         if address.0 == LINUX_PAGE_TABLES_BASE && bytes.len() == size_of::<u64>() {
             self.read_boot_root = true;
         }
         Ok(())
     }
+
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault> {
-        for i in 0..bytes.len() as u64 {
-            self.byte(address.0 + i)?;
+        let mut at = address.0;
+        let mut remaining = bytes.len();
+        while remaining != 0 {
+            if !self.pages.contains_key(&(at & !(PAGE - 1))) {
+                return Err(MemoryFault {
+                    address: VirtualAddress(at),
+                });
+            }
+            let len = remaining.min((PAGE - at % PAGE) as usize);
+            at += len as u64;
+            remaining -= len;
         }
-        for (i, b) in bytes.iter().enumerate() {
-            *self.byte(address.0 + i as u64)? = *b;
-        }
+        self.load(address.0, bytes);
         Ok(())
+    }
+
+    fn code_generation(&self, frame: FrameGpa) -> Option<CodeGeneration> {
+        self.pages
+            .get(&frame.raw())
+            .map(|p| CodeGeneration(p.generation))
     }
 }
 
@@ -298,6 +332,42 @@ fn resident_loop_translates_only_two_blocks() {
         counts.push((report.work.decoded_blocks, report.work.emitted_blocks));
     }
     assert_eq!(counts, [(2, 2); 3]);
+}
+
+#[test]
+fn guest_code_write_replaces_the_resident_translation() {
+    const CODE: u64 = 0x4000;
+    const WRITER: u64 = 0x5000;
+    let mut memory = Pages::default();
+    // movz x5, #1; br x3
+    memory.load(CODE, &[0x25, 0x00, 0x80, 0xd2, 0x60, 0x00, 0x1f, 0xd6]);
+    // str w1, [x2]; br x4
+    memory.load(WRITER, &[0x41, 0x00, 0x00, 0xb9, 0x80, 0x00, 0x1f, 0xd6]);
+    let mut cpu = CpuState::default();
+    cpu.pstate.el = ExceptionLevel::El1;
+    cpu.pstate.sp = StackSelect::El1;
+    cpu.pc = ProgramCounter(CODE);
+    set_x(&mut cpu, 1, 0xd400_0042); // hvc #2 overwrites movz
+    set_x(&mut cpu, 2, CODE);
+    set_x(&mut cpu, 3, WRITER);
+    set_x(&mut cpu, 4, CODE);
+    let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
+    let report = probe(&mut cpu, &mut memory, &mut runner, 8);
+    let Stop::Event {
+        instruction,
+        event: Event::ProviderExit(hvc),
+    } = report.stop
+    else {
+        panic!("{report}");
+    };
+    assert_eq!(instruction.pc(), ProgramCounter(CODE));
+    assert_eq!(hvc.immediate.value(), 2);
+    assert_eq!(
+        cpu.read_operand(OperandRegister::Gpr(Gpr::new(5).unwrap())),
+        RegisterValue(1)
+    );
+    assert_eq!(report.work.executed_blocks, 4);
+    assert_eq!(report.work.retired_instructions, 5);
 }
 
 #[test]
