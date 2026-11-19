@@ -18481,6 +18481,93 @@ fn serial_host_native_child_epoll_ctl_adds_an_inet_socket() {
     });
 }
 
+/// A native child's select waits on the inherited pipe while its sibling
+/// retains a live writer. The harness switches to that sibling only after
+/// the child parks, so the wake cannot be an immediate readiness sample.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_pselect6_wakes_on_sibling_pipe_write() {
+    use ArmCaller::Root;
+    use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
+    use carrick_test_support::GuestUserBuffer;
+
+    with_arm_process_host_dispatch(|call| {
+        let pipe = GuestUserBuffer::zeroed(8);
+        assert_eq!(
+            call(Root, sys::PIPE2.raw(), [pipe.arg(), 0, 0, 0, 0, 0]).1,
+            0
+        );
+        let read = u32::from_ne_bytes(pipe.as_bytes()[..4].try_into().unwrap());
+        let write = u32::from_ne_bytes(pipe.as_bytes()[4..].try_into().unwrap());
+        let (_, parent) = call(Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(parent > 0);
+        let parent = ArmCaller::Child(parent as u32);
+        let (_, reader) = call(parent, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(reader > 0);
+        let reader = ArmCaller::Child(reader as u32);
+        call(reader, ARM_RESUME, [0; 6]);
+        let (_, writer) = call(parent, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(writer > 0);
+        let writer = ArmCaller::Child(writer as u32);
+        call(writer, ARM_RESUME, [0; 6]);
+        let byte = GuestUserBuffer::from_bytes(b"x");
+        let buffer = GuestUserBuffer::zeroed(1);
+        let mask = (1u64 << read).to_ne_bytes();
+        let mut read_set = GuestUserBuffer::from_bytes(&mask);
+        let args = [u64::from(read) + 1, read_set.arg(), 0, 0, 0, 0];
+        assert_eq!(
+            call(
+                writer,
+                sys::WRITE.raw(),
+                [write.into(), byte.arg(), 1, 0, 0, 0]
+            )
+            .1,
+            1
+        );
+        let ready = call(reader, sys::PSELECT6.raw(), args);
+        assert_eq!(ready, (CompletionRoute::Served, 1), "ready pipe");
+        assert_eq!(read_set.as_bytes(), &mask);
+        assert_eq!(
+            call(
+                reader,
+                sys::READ.raw(),
+                [read.into(), buffer.arg(), 1, 0, 0, 0]
+            )
+            .1,
+            1,
+        );
+        call(reader, ARM_LEAVE_ON_PARK, [0; 6]);
+        let parked = call(reader, sys::PSELECT6.raw(), args);
+        assert_eq!(
+            parked.0,
+            CompletionRoute::Suspended,
+            "empty pipe: {parked:?}"
+        );
+        assert_eq!(
+            call(reader, ARM_RESUME, [0; 6]).0,
+            CompletionRoute::Suspended
+        );
+        // Another thread could change this memory while the reader is parked.
+        // Resume uses the retained interest and replaces the output once.
+        read_set.as_mut_bytes().fill(0);
+        assert_eq!(
+            call(
+                writer,
+                sys::WRITE.raw(),
+                [write.into(), byte.arg(), 1, 0, 0, 0]
+            )
+            .1,
+            1
+        );
+        let mut result = call(reader, ARM_RESUME, [0; 6]);
+        if result.1 == i64::MIN {
+            result = call(reader, sys::PSELECT6.raw(), args);
+        }
+        assert_eq!(result, (CompletionRoute::Served, 1), "sibling wake");
+        assert_eq!(read_set.as_bytes(), &mask);
+    });
+}
+
 #[test]
 fn arm_root_host_backed_descriptors_keep_one_owner() {
     use carrick_abi::{

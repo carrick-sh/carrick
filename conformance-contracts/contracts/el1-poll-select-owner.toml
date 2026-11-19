@@ -27,7 +27,12 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_prepared_fork_parent_poll_observes_child_pipe_write",
   "carrick-el1-linux::ipc::tests::{production_zone_ppoll_ignores_negative_fd,production_zone_ppoll_events_zero_parks_until_writer_close,production_zone_ppoll_full_writer_with_both_interests_wakes_on_drain,x86_cpl0_zone_poll_parks_until_last_writer_closes}",
   "carrick-el1-linux::aarch64_process_tests::serial_host_zone_poll_output_owner_wait_preserves_ready_answer",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_native_child_pselect6_wakes_on_sibling_pipe_write (native ARM production entry; a ready inherited pipe, then an actual park and sibling write; a concurrent modification of the bitmap does not change the retained interest)",
   "carrick-el1-linux::native_process_runtime::host_test_support::{production_trap_frame_ppoll_retains_completed_output_across_owner_wait,poll_revents_crossing_a_page_retains_partial_copy_and_fault}",
+]
+
+embed = [
+  "carrick-vmm-kvm::cpl0_initial_mm::native_child_pselect6_wakes_on_sibling_pipe_write (production CPL0 guest; a ready pipe and a parked pselect6 on that same pipe; the sibling writes only after the test has observed enrollment)",
 ]
 
 [bindings.unresolved]
