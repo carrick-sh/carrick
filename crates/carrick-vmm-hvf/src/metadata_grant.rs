@@ -321,6 +321,41 @@ fn service_terminal_operation(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn resolve_custody_residency(
+    custody: &crate::trap::CarrierVmCustody,
+    region: RetainedAbiRegion<'_>,
+) -> Option<Box<carrick_el1_abi::ResolvedResidencyTable<HostMetadataExtentPin>>> {
+    let pointer = region.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
+        carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
+    )?;
+    let bootstrap_host =
+        region.record_ptr::<u8>(carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize)?;
+    let bootstrap_host = core::ptr::NonNull::new(bootstrap_host)?;
+    let generation = custody.live_generation()?;
+    let resolver = HostMetadataExtentResolver {
+        custody,
+        generation,
+    };
+    let mut resolved = Box::new(carrick_el1_abi::ResolvedResidencyTable::new());
+    // SAFETY: `pointer` and `bootstrap_host` belong to this retained carrier
+    // region, and `resolver` pins any dynamic extents for the live generation.
+    unsafe {
+        resolved
+            .refresh(
+                &*pointer,
+                &resolver,
+                Some((
+                    carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE,
+                    carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize,
+                    bootstrap_host,
+                )),
+            )
+            .ok()?;
+    }
+    Some(resolved)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn settle_native_exec_predecessor(
     custody: &crate::trap::CarrierVmCustody,
     region: RetainedAbiRegion<'_>,
@@ -343,13 +378,12 @@ fn settle_native_exec_predecessor(
     let Some(inventory) = custody.fork_stock.lock().inventory() else {
         return false;
     };
-    let Some(pointer) = region.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
-        carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
-    ) else {
+    let Some(resolved_residency) = resolve_custody_residency(custody, region) else {
         return false;
     };
-    // SAFETY: initialized atomic ABI record in the retained carrier mapping.
-    let residency = unsafe { &*pointer };
+    let Some(residency) = resolved_residency.view() else {
+        return false;
+    };
     let Some(returns) = retained_reservations(region) else {
         return false;
     };
@@ -367,7 +401,7 @@ fn settle_native_exec_predecessor(
                     .is_some_and(|absent| {
                         carrick_hal::fork_stock::release_child_mm(
                             &*inventory,
-                            residency,
+                            &residency,
                             returns,
                             &absent,
                         )
@@ -481,6 +515,11 @@ pub struct HostMetadataExtentPin {
     _backing: Arc<MetadataBacking>,
 }
 
+// SAFETY: `Arc<MetadataBacking>` retains the stable host mapping until drop;
+// concurrent metadata readers/writers synchronize through atomic ABI fields.
+unsafe impl Send for HostMetadataExtentPin {}
+unsafe impl Sync for HostMetadataExtentPin {}
+
 // SAFETY: the Arc owns the mapped bytes. Normal return checks outstanding pins;
 // VM destruction can remove stage-2 mappings but cannot destroy this host owner.
 unsafe impl PinnedMetadataExtent for HostMetadataExtentPin {
@@ -538,7 +577,11 @@ impl CarrierMetadataAccess {
             carrier,
             generation,
         };
-        access.region().ok()?;
+        let region = access.region().ok()?;
+        carrick_hal::host_residency::install_host_residency_resolver(
+            region.as_ptr() as usize,
+            Arc::new(access.clone()),
+        );
         Some(access)
     }
 
@@ -651,6 +694,17 @@ impl MetadataExtentResolver for CarrierMetadataAccess {
             generation: self.generation,
         }
         .pin(extent)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_hal::host_residency::HostMetadataPinResolver for CarrierMetadataAccess {
+    fn pin_dynamic(
+        &self,
+        extent: MetadataExtent,
+    ) -> Result<carrick_hal::host_residency::DynamicResidencyPin, MetadataResolutionError> {
+        self.pin(extent)
+            .map(carrick_hal::host_residency::DynamicResidencyPin::new)
     }
 }
 
@@ -1675,13 +1729,11 @@ fn reclaim_fork_stock(
     let inventory = stock
         .inventory()
         .ok_or(ForkStockServiceError::OccupancyUnavailable)?;
-    let pointer = region
-        .record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
-            carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
-        )
+    let resolved_residency =
+        resolve_custody_residency(custody, region).ok_or(ForkStockServiceError::InvalidRecord)?;
+    let residency = resolved_residency
+        .view()
         .ok_or(ForkStockServiceError::InvalidRecord)?;
-    // SAFETY: initialized atomic ABI record in the retained carrier mapping.
-    let residency = unsafe { &*pointer };
     let returns = retained_reservations(region).ok_or(ForkStockServiceError::InvalidRecord)?;
     stock.owner.reclaim(
         ledger,
@@ -1706,7 +1758,7 @@ fn reclaim_fork_stock(
                 .is_some_and(|absent| {
                     carrick_hal::fork_stock::release_child_mm(
                         &*inventory,
-                        residency,
+                        &residency,
                         returns,
                         &absent,
                     )

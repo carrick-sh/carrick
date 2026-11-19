@@ -730,7 +730,7 @@ impl MemState {
                     failure = Some(error);
                 }
             }
-            if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            carrick_hal::host_residency::with_host_residency(|table| {
                 table.live_spans_overlapping(
                     root.mm().raw(),
                     window_start,
@@ -748,7 +748,7 @@ impl MemState {
                         }
                     },
                 );
-            }
+            });
             if failure.is_some() {
                 // A malformed observation cannot authorize a host plan.
                 return Ok(None);
@@ -1003,7 +1003,9 @@ impl GrantResidencyPublication {
     /// Retired pages are never temporarily visible in the residency index.
     pub(crate) fn publish(
         self,
-        table: &carrick_el1_abi::FrameGrantResidencyTable,
+        table: &carrick_el1_abi::FrameGrantResidencyTable<
+            impl carrick_el1_abi::FrameGrantResidencyAccess,
+        >,
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
     ) {
         let Self {
@@ -1458,9 +1460,9 @@ impl<'a> MemView<'a> {
             return;
         };
         let authority = self.mem();
-        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+        carrick_hal::host_residency::with_host_residency(|table| {
             table.retire_overlapping(authority.mm_id.raw(), start, len);
-        }
+        });
         // DONTNEED keeps the reservation node incarnation while retiring its
         // residency. A refusal asserting the old resident page must not answer
         // the next first touch of that same node.
