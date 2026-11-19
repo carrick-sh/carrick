@@ -124,7 +124,7 @@ enum ClosingMemberWait {
     Signal,
 }
 
-enum ClosingAdapterCustody {
+pub(super) enum ClosingAdapterCustody {
     CancelInstalled,
     ForbidInstalled(NativeServiceQuarantine),
 }
@@ -2552,7 +2552,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// published `OwnerContinuation` onto this record, preserve that terminal
     /// continuation across `retire_adapter_result`'s user-return cleanup so
     /// `resume_pending_lifecycle` consumes it cleanly.
-    fn settle_closing_adapter_operation(
+    pub(super) fn settle_closing_adapter_operation(
         &mut self,
         custody: ClosingAdapterCustody,
     ) -> Result<(), NativeProcessError> {
@@ -2619,7 +2619,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 ));
             }
         }
-        self.settle_closing_adapter_operation(ClosingAdapterCustody::CancelInstalled)?;
         let outcome = self.resume_pending_lifecycle();
         if let Some(reason) = self.take_run_failure() {
             self.handoff = None;
