@@ -1180,11 +1180,9 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                                 "refused frame grant cannot roll back backing: {error}"
                             ))
                         });
-                    publish_frame_grant_refusal(
-                        mailbox,
-                        request,
-                        carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
-                    );
+                    fail_publication(format!(
+                        "accepted owner frame grant ended without publication: {completed:?}"
+                    ));
                 } else {
                     ring::rec_el1_frame_grant_decision(
                         ring_tid,
