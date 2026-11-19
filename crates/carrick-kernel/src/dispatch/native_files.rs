@@ -32,6 +32,10 @@ const _: () = assert!(
         == carrick_personality_linux::native_host_file::LINUX_STATX_BYTES
 );
 
+const _: () = assert!(
+    core::mem::size_of::<carrick_abi::LinuxStatfs>() == carrick_core_abi::host_file::STATFS_BYTES
+);
+
 /// The carrier refused a staged record; the ring answers counted ENOSYS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeHostFileRefusal;
@@ -904,6 +908,11 @@ impl SyscallDispatcher {
                 // duplicated stream. Writes go to the run's stdio sink, as the
                 // host write path does for the same description (#1410).
                 HostFileOp::Write
+                | HostFileOp::Fsync
+                | HostFileOp::Syncfs
+                | HostFileOp::SyncFileRange
+                | HostFileOp::Fstatfs
+                | HostFileOp::Fallocate
                 | HostFileOp::SetFdTimes
                 | HostFileOp::Ftruncate
                 | HostFileOp::Fstat
@@ -931,6 +940,15 @@ impl SyscallDispatcher {
     /// stdio descriptors run.
     fn serve_native_stdio(&self, header: HostFileHeader, fd: i32, input: &[u8]) -> Served {
         match header.op {
+            HostFileOp::Fsync => Served::errno(carrick_abi::LINUX_EINVAL),
+            HostFileOp::Syncfs => Served::value(0),
+            HostFileOp::Fallocate | HostFileOp::SyncFileRange => {
+                Served::errno(carrick_abi::LINUX_ESPIPE)
+            }
+            HostFileOp::Fstatfs => {
+                let record = super::fs::implicit_stdio_stat_record(self.pty_table(), fd);
+                self.serve_native_fstatfs(record)
+            }
             HostFileOp::Ftruncate => Served::errno(carrick_abi::LINUX_EINVAL),
             HostFileOp::SetFdTimes => match self.native_times(header) {
                 Some([None, None]) => Served::value(0),
@@ -961,6 +979,50 @@ impl SyscallDispatcher {
         capacity: usize,
     ) -> Served {
         match header.op {
+            HostFileOp::Fsync | HostFileOp::Syncfs | HostFileOp::SyncFileRange => {
+                let fs = self.fs_view();
+                if header.op == HostFileOp::SyncFileRange
+                    && let Err(errno) = super::FsView::validate_sync_file_range(
+                        header.args[0],
+                        header.args[1],
+                        header.args[2],
+                    )
+                {
+                    return Served::errno(errno);
+                }
+                match super::FsView::prepare_file_flush(description, header.op) {
+                    Ok(Some(fd)) => match fs.flush_retained_file(&fd) {
+                        Err(errno) if header.op != HostFileOp::SyncFileRange => {
+                            Served::errno(errno)
+                        }
+                        _ => Served::value(0),
+                    },
+                    Ok(None) => Served::value(0),
+                    Err(errno) => Served::errno(errno),
+                }
+            }
+            HostFileOp::Fallocate => {
+                let mode = header.args[0];
+                let range =
+                    match super::FsView::validate_fallocate(mode, header.args[1], header.args[2]) {
+                        Ok(range) => range,
+                        Err(errno) => return Served::errno(errno),
+                    };
+                match self
+                    .fs_view()
+                    .allocate_description(description, mode, range)
+                {
+                    Ok(outcome) => served_outcome(outcome, Vec::new()),
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
+                }
+            }
+            HostFileOp::Fstatfs => {
+                match self.fs_view().description_stat_record(description, None) {
+                    Ok(record) => self.serve_native_fstatfs(record),
+                    Err(errno) => Served::errno(errno),
+                }
+            }
             HostFileOp::Ftruncate => {
                 if (header.args[0] as i64) < 0 {
                     return Served::errno(carrick_abi::LINUX_EINVAL);
@@ -1023,6 +1085,7 @@ impl SyscallDispatcher {
             },
             HostFileOp::MapPrivate => self.native_map_source(description),
             HostFileOp::Openat
+            | HostFileOp::Statfs
             | HostFileOp::Faccessat
             | HostFileOp::Newfstatat
             | HostFileOp::Mkdirat
@@ -1041,6 +1104,11 @@ impl SyscallDispatcher {
             | HostFileOp::Fchownat
             | HostFileOp::NetSyscall => Served::Refused,
         }
+    }
+
+    fn serve_native_fstatfs(&self, record: super::StatRecord) -> Served {
+        let statfs = self.fs_view().filesystem_statfs(record.fs_identity);
+        Served::Reply(0, statfs.as_bytes().to_vec())
     }
 
     /// A ring task's `fchdir` ([`HostFileOp::Fchdir`]): the host task's own
@@ -1227,6 +1295,10 @@ impl SyscallDispatcher {
         let dirfd = header.fd as i64 as u64;
         let second_dirfd = second.map_or(LINUX_AT_FDCWD, |fd| fd.0 as i64 as u64);
         match header.op {
+            HostFileOp::Statfs => match fs.path_statfs(path) {
+                Ok(statfs) => Served::Reply(0, statfs.as_bytes().to_vec()),
+                Err(errno) => Served::errno(errno),
+            },
             HostFileOp::Renameat => {
                 let Some((old, new)) = native_path_pair(path) else {
                     return Served::Refused;
