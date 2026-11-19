@@ -18647,6 +18647,71 @@ fn arm_fork_child_resolves_relative_paths_through_dirfds() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
+/// An open ring file uses the carrier's regular filesystem operations.
+#[test]
+fn arm_fork_child_syncs_and_queries_its_host_file() {
+    use carrick_abi::{LINUX_AT_FDCWD, LINUX_O_CREAT, LINUX_O_RDWR};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_test_support::GuestUserBuffer;
+
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::new().expect("host-file fixture scratch"),
+    ));
+    let (mismatches, _) = with_arm_process_host_files_on(dispatcher, |call, _| {
+        let (_, pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid}");
+        let child = ArmCaller::Child(pid as u32);
+        let path = GuestUserBuffer::from_bytes(b"/host-file-metadata\0");
+        let (_, fd) = call(
+            child,
+            sys::OPENAT.raw(),
+            [
+                LINUX_AT_FDCWD,
+                path.arg(),
+                LINUX_O_CREAT | LINUX_O_RDWR,
+                0o600,
+                0,
+                0,
+            ],
+        );
+        assert!(fd >= 0, "openat: {fd}");
+        let fd = fd as u64;
+        let data = GuestUserBuffer::from_bytes(b"child");
+        assert_eq!(
+            call(child, sys::WRITE.raw(), [fd, data.arg(), 5, 0, 0, 0]).1,
+            5
+        );
+        let statfs =
+            GuestUserBuffer::from_bytes(&[0; core::mem::size_of::<carrick_abi::LinuxStatfs>()]);
+        let mut mismatches = Vec::new();
+        for (step, syscall, args) in [
+            ("fsync", sys::FSYNC, [fd, 0, 0, 0, 0, 0]),
+            ("fdatasync", sys::FDATASYNC, [fd, 0, 0, 0, 0, 0]),
+            ("sync_file_range", sys::SYNC_FILE_RANGE, [fd, 0, 5, 2, 0, 0]),
+            ("syncfs", sys::SYNCFS, [fd, 0, 0, 0, 0, 0]),
+            (
+                "statfs",
+                sys::STATFS,
+                [path.arg(), statfs.arg(), 0, 0, 0, 0],
+            ),
+            ("fstatfs", sys::FSTATFS, [fd, statfs.arg(), 0, 0, 0, 0]),
+            ("fallocate", sys::FALLOCATE, [fd, 0, 0, 4096, 0, 0]),
+        ] {
+            let (route, result) = call(child, syscall.raw(), args);
+            if result != 0 {
+                mismatches.push(format!("{step}: {result} ({route:?})"));
+            }
+        }
+        let (_, size) = call(child, sys::LSEEK.raw(), [fd, 0, 2, 0, 0, 0]);
+        if size != 4096 {
+            mismatches.push(format!("fallocate file size: {size}, want 4096"));
+        }
+        mismatches
+    });
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
 /// #231 parity (pip): CPython opens a script with `fopen` and then marks it
 /// close-on-exec with `ioctl(fd, FIOCLEX)`. A fork child's file is a ring
 /// descriptor the carrier opened for its staged `openat`; on main the ioctl
