@@ -2563,9 +2563,11 @@ impl PublicationContext<'static> {
             binding.identity.linux_pid,
             binding.identity.linux_tid,
         );
-        let page = carrick_el1_abi::frame_grant_residency_host()
-            .and_then(|table| table.lookup(window.operation.mm.raw(), window.fault_page))
-            .ok_or_else(invalid)?;
+        let page = carrick_hal::host_residency::with_host_residency(|table| {
+            table.lookup(window.operation.mm.raw(), window.fault_page)
+        })
+        .flatten()
+        .ok_or_else(invalid)?;
         let identity = page.identity;
         let aliases = alias_registry().lock().overlapping_process_aliases(
             window.fault_page,
@@ -2734,8 +2736,10 @@ impl PublicationContext<'static> {
                     return Ok(TransferPreparation::Pending(wait));
                 }
             }
-            let resident = carrick_el1_abi::frame_grant_residency_host()
-                .and_then(|table| table.lookup(window.operation.mm.raw(), window.fault_page));
+            let resident = carrick_hal::host_residency::with_host_residency(|table| {
+                table.lookup(window.operation.mm.raw(), window.fault_page)
+            })
+            .flatten();
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.fault_page,
                 resident.map_or(0, |page| page.identity.len),
@@ -2778,15 +2782,17 @@ impl PublicationContext<'static> {
             // A committed residency and the matching physical alias authorize
             // only a fresh owner selection, never reuse of this stale window.
             let peer_resident = resident.is_some_and(|page| {
-                carrick_el1_abi::frame_grant_residency_host().is_some_and(|table| {
+                carrick_hal::host_residency::with_host_residency(|table| {
                     table.is_guest_committed(window.operation.mm.raw(), window.fault_page)
-                }) && overlapping.iter().any(|(_, alias)| {
-                    window.fault_page >= alias.start
-                        && window.fault_page < alias.start.saturating_add(alias.size as u64)
-                        && alias.ipa.checked_add(window.fault_page - alias.start)
-                            == Some(page.expected_ipa)
-                        && alias.owner_generation == page.identity.owner_generation
                 })
+                .unwrap_or(false)
+                    && overlapping.iter().any(|(_, alias)| {
+                        window.fault_page >= alias.start
+                            && window.fault_page < alias.start.saturating_add(alias.size as u64)
+                            && alias.ipa.checked_add(window.fault_page - alias.start)
+                                == Some(page.expected_ipa)
+                            && alias.owner_generation == page.identity.owner_generation
+                    })
             });
             return Ok(if peer_resident {
                 TransferPreparation::PeerResident
@@ -2940,9 +2946,10 @@ impl TransferGrantAuthorities {
         mm: std::num::NonZeroU64,
         generation: u64,
     ) -> (u64, u64, u64, u64, u64, u64) {
-        let Some(table) = carrick_el1_abi::frame_grant_residency_host() else {
+        let Some(view) = carrick_hal::host_residency::current_host_residency() else {
             return (generation, 0, 0, 0, 0, 0);
         };
+        let table = view.table();
         let mut counts = [0_u64; 5];
         let zone = carrick_el1_abi::zone_tables();
         table.inspect_occupied(
