@@ -751,6 +751,17 @@ impl ApicCluster {
     }
 }
 
+/// Cumulative observations at the CPU's interrupt recognition boundary.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimerRecognition {
+    /// Timer-sourced IRR entries accepted into ISR.
+    pub deliveries: u64,
+    /// Delivered entries that previously lost at least one recognition boundary.
+    pub deferred_deliveries: u64,
+    /// Block boundaries where the timer would have won without the grace window.
+    pub deferred_blocks: u64,
+}
+
 /// Per-vCPU local xAPIC register file and timer state.
 #[derive(Debug)]
 pub struct LocalApic {
@@ -781,6 +792,8 @@ pub struct LocalApic {
     eoi_count: u64,
     ipi_sent_count: u64,
     timer_fire_count: u64,
+    timer_recognition: Option<TimerRecognition>,
+    deferred_vectors: [u32; 8],
 }
 
 impl Clone for LocalApic {
@@ -831,6 +844,8 @@ impl Clone for LocalApic {
             eoi_count: self.eoi_count,
             ipi_sent_count: self.ipi_sent_count,
             timer_fire_count: self.timer_fire_count,
+            timer_recognition: self.timer_recognition,
+            deferred_vectors: self.deferred_vectors,
         }
     }
 }
@@ -873,6 +888,8 @@ impl LocalApic {
             eoi_count: 0,
             ipi_sent_count: 0,
             timer_fire_count: 0,
+            timer_recognition: None,
+            deferred_vectors: [0; 8],
         }
     }
 
@@ -1030,6 +1047,16 @@ impl LocalApic {
         self.timer_fire_count
     }
 
+    /// Enable observation of timer-sourced IRR entries at CPU recognition.
+    pub fn observe_timer_recognition(&mut self) {
+        self.timer_recognition = Some(TimerRecognition::default());
+        self.deferred_vectors = [0; 8];
+    }
+
+    pub fn timer_recognition(&self) -> Option<TimerRecognition> {
+        self.timer_recognition
+    }
+
     /// Injects a fixed interrupt `vector` into this APIC's `IRR` and kicks any parked waiter.
     pub fn inject_interrupt(&self, vector: u8) -> bool {
         self.node.inject_interrupt(vector)
@@ -1079,7 +1106,21 @@ impl LocalApic {
         if !apic_hw_enabled || !self.software_enabled() {
             return None;
         }
-        let vec = self.node.highest_eligible_irr_vector(include_timer)?;
+        let eligible = self.node.highest_eligible_irr_vector(include_timer);
+        let priorities = (!include_timer && self.timer_recognition.is_some()).then(|| self.ppr());
+        if !include_timer
+            && let Some(counters) = &mut self.timer_recognition
+            && let Some(vector) = self.node.highest_eligible_irr_vector(true)
+            && Some(vector) != eligible
+            && priorities.is_some_and(|ppr| (vector >> 4) > (ppr >> 4))
+        {
+            // The highest vector that would otherwise be delivered is hidden
+            // by the post-return window. A fixed interrupt sharing its IRR
+            // bit remains eligible and does not take this path.
+            counters.deferred_blocks += 1;
+            self.deferred_vectors[usize::from(vector >> 5)] |= 1 << (vector & 31);
+        }
+        let vec = eligible?;
         if (vec >> 4) <= (self.ppr() >> 4) {
             return None;
         }
@@ -1087,7 +1128,16 @@ impl LocalApic {
         let mask = 1u32 << (vec & 31);
         // A fixed interrupt and a timer with the same vector share one IRR bit.
         let both_sources = (u64::from(mask) << 32) | u64::from(mask);
-        self.node.irr[word].fetch_and(!both_sources, Ordering::AcqRel);
+        let sources = self.node.irr[word].fetch_and(!both_sources, Ordering::AcqRel);
+        if sources & (u64::from(mask) << 32) != 0
+            && let Some(counters) = &mut self.timer_recognition
+        {
+            counters.deliveries += 1;
+            if self.deferred_vectors[word] & mask != 0 {
+                counters.deferred_deliveries += 1;
+                self.deferred_vectors[word] &= !mask;
+            }
+        }
         self.isr[word] |= mask;
         self.node.priority.store(self.ppr(), Ordering::Release);
         self.delivered_count = self.delivered_count.saturating_add(1);

@@ -110,13 +110,13 @@ fn run_with_stdout_patch(elf: &[u8], patch: Option<u8>) -> HelloRun {
     run_with_options(elf, patch, None, None)
 }
 
-type CarrierSetup = Box<dyn FnOnce(&mut SoftCarrier)>;
+type CarrierSetup<'a> = Box<dyn FnOnce(&mut SoftCarrier) + 'a>;
 
 fn run_with_options(
     elf: &[u8],
     patch: Option<u8>,
     execution_clock: Option<(std::num::NonZeroU64, u64)>,
-    setup: Option<CarrierSetup>,
+    setup: Option<CarrierSetup<'_>>,
 ) -> HelloRun {
     let mut run = HelloRun {
         stdout: Vec::new(),
@@ -171,7 +171,7 @@ fn drive(
     run: &mut HelloRun,
     patch: Option<u8>,
     execution_clock: Option<(std::num::NonZeroU64, u64)>,
-    setup: Option<CarrierSetup>,
+    setup: Option<CarrierSetup<'_>>,
 ) -> Result<(), String> {
     let mut dispatcher = SyscallDispatcher::default();
     let reporter = carrick_kernel::compat::CompatReporter::default();
@@ -530,6 +530,62 @@ fn production_ring_forked_child_writes_and_is_reaped() {
     assert_eq!(run.exit, Some(7), "{}", run.summary());
 }
 
+/// Resolve the actual compiler-emitted destinations of the two branches in
+/// signal_irq_return. The release image can inline rearm_slice into its caller,
+/// leaving a direct call to program_slice instead.
+fn two_live_markers(fixture: &[u8]) -> carrick_vmm_soft::carrier::SoftRunMarkers {
+    use goblin::elf::Elf;
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+
+    let fixture = Elf::parse(fixture).expect("TWO_LIVE ELF");
+    let spawn = fixture
+        .syms
+        .iter()
+        .find(|symbol| fixture.strtab.get_at(symbol.st_name) == Some("spawn"))
+        .expect("TWO_LIVE spawn label")
+        .st_value;
+    let ring = Elf::parse(PRODUCTION).expect("production CPL0 ELF");
+    let symbols: std::collections::BTreeMap<_, _> = ring
+        .syms
+        .iter()
+        .filter(|symbol| symbol.is_function())
+        .filter_map(|symbol| {
+            let name = rustc_demangle::try_demangle(ring.strtab.get_at(symbol.st_name)?).ok()?;
+            Some((symbol.st_value, (symbol, format!("{name:#}"))))
+        })
+        .collect();
+    let (&start, (irq, _)) = symbols
+        .iter()
+        .find(|(_, (_, name))| name.ends_with("::linux_personality::signal_irq_return"))
+        .expect("production IRQ return symbol");
+    let section = &ring.section_headers[irq.st_shndx];
+    let offset = (section.sh_offset + start - section.sh_addr) as usize;
+    let code = &PRODUCTION[offset..offset + irq.st_size as usize];
+    let targets: Vec<_> = Decoder::with_ip(64, code, start, DecoderOptions::NONE)
+        .into_iter()
+        .filter(|insn| insn.mnemonic() == Mnemonic::Call)
+        .filter_map(|insn| {
+            let target = insn.near_branch_target();
+            symbols
+                .get(&target)
+                .map(|(_, name)| (target, name.as_str()))
+        })
+        .collect();
+    let target = |suffixes: &[&str]| {
+        targets
+            .iter()
+            .find(|(_, name)| suffixes.iter().any(|suffix| name.ends_with(suffix)))
+            .expect("distinct IRQ return branch call in the production image")
+            .0
+    };
+    carrick_vmm_soft::carrier::SoftRunMarkers {
+        spawn,
+        irq_return: start..start + irq.st_size,
+        rearm: target(&["::rearm_slice", "::program_slice"]),
+        rotate: target(&["::requeue_preempted"]),
+    }
+}
+
 #[test]
 fn production_ring_non_last_threads_raw_exit() {
     let elf = assemble_static_fixture(
@@ -540,10 +596,37 @@ fn production_ring_non_last_threads_raw_exit() {
         ),
         &["-DTWO_LIVE"],
     );
-    let run = run_hello(&elf);
-    assert!(run.failure.is_none(), "{}", run.summary());
-    assert!(run.stdout.is_empty(), "{}", run.summary());
-    assert_eq!(run.exit, Some(0), "{}", run.summary());
+    use std::io::Write as _;
+
+    let markers = two_live_markers(&elf);
+    let mut summary = None;
+    let run = run_with_options(
+        &elf,
+        None,
+        None,
+        Some(Box::new(|carrier| {
+            summary = Some(carrier.observe_fixture(markers));
+        })),
+    );
+    let host = format!(
+        "soft JIT=native x86_64 profile_dir={} opt_level={} available_cpus={:?}",
+        env!("SOFT_BUILD_PROFILE_DIR"),
+        env!("SOFT_BUILD_OPT_LEVEL"),
+        std::thread::available_parallelism()
+            .ok()
+            .map(|cpus| cpus.get()),
+    );
+    let diagnostic = summary.map_or_else(
+        || "soft carrier stopped before observation began".to_owned(),
+        |summary| summary.lock().expect("soft summary lock").to_string(),
+    );
+    let report = || format!("{}\n{host}\n{diagnostic}", run.summary());
+    assert!(run.failure.is_none(), "{}", report());
+    assert!(run.stdout.is_empty(), "{}", report());
+    assert_eq!(run.exit, Some(0), "{}", report());
+    // Keep successful evidence in hosted CI, whose libtest invocation
+    // captures println! and only reveals captured stdout on failure.
+    writeln!(std::io::stdout().lock(), "{}", report()).expect("write soft carrier report");
 }
 
 #[test]

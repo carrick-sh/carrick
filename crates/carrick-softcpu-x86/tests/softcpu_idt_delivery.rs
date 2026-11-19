@@ -530,10 +530,13 @@ fn post_return_timer_deferral_leaves_fixed_interrupts_eligible() {
     use std::sync::Arc;
 
     const TIMER: u8 = 0xe0;
-    for fixed in [0xd0, TIMER] {
+    for (fixed, observe) in [(0xd0, false), (TIMER, false), (0xd0, true), (TIMER, true)] {
         let mut rig = IdtTestRig::new();
         let clock = Arc::new(ManualTscClock::new(1));
         rig.machine.set_clock(clock.clone());
+        if observe {
+            rig.machine.observe_run();
+        }
         rig.write_kernel_code(&[0x48, 0xcf]); // iretq
         rig.write_user_code(&[0xeb, 0xfe]); // jmp .
         let frame = [
@@ -577,6 +580,15 @@ fn post_return_timer_deferral_leaves_fixed_interrupts_eligible() {
                 Some(SoftMachineExit::IoOut { port: 0xe0, value, .. }) if value == u32::from(TIMER)
             ));
         }
+        if !observe {
+            continue;
+        }
+        let counters = rig.machine.counters().unwrap();
+        assert_eq!(counters.blocks, if fixed == TIMER { 2 } else { 3 });
+        let timer = rig.machine.context().lapic().timer_recognition().unwrap();
+        assert_eq!(timer.deliveries, 1);
+        assert_eq!(timer.deferred_deliveries, u64::from(fixed != TIMER));
+        assert_eq!(timer.deferred_blocks, u64::from(fixed != TIMER));
     }
 }
 
