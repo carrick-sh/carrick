@@ -18489,7 +18489,11 @@ fn serial_host_native_child_pselect6_wakes_on_sibling_pipe_write() {
             1
         );
         let ready = call(reader, sys::PSELECT6.raw(), args);
-        assert_eq!(ready, (CompletionRoute::Served, 1), "ready pipe");
+        assert_eq!(ready.1, 1, "ready pipe: {ready:?}");
+        assert!(matches!(
+            ready.0,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
         assert_eq!(read_set.as_bytes(), &mask);
         assert_eq!(
             call(
@@ -18527,7 +18531,11 @@ fn serial_host_native_child_pselect6_wakes_on_sibling_pipe_write() {
         if result.1 == i64::MIN {
             result = call(reader, sys::PSELECT6.raw(), args);
         }
-        assert_eq!(result, (CompletionRoute::Served, 1), "sibling wake");
+        assert_eq!(result.1, 1, "sibling wake: {result:?}");
+        assert!(matches!(
+            result.0,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
         assert_eq!(read_set.as_bytes(), &mask);
     });
 }

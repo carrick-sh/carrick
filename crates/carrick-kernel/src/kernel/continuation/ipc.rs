@@ -395,6 +395,13 @@ pub(crate) fn interrupted(
     cause: IpcCause,
     clock: CounterClock,
 ) -> IpcHostOutcome {
+    if op.kind == IpcOpKind::SelectWait {
+        // Host cancellation cannot publish the native frame's fd sets.
+        return IpcHostOutcome::Complete {
+            result: LINUX_EINTR.guest_retval(),
+            sigpipe: false,
+        };
+    }
     if op.kind == IpcOpKind::EpollWait {
         // epoll_wait(2) is never restarted after a handler, SA_RESTART or
         // not, and a stop followed by SIGCONT interrupts it too, with no
@@ -821,6 +828,11 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
     }
     if op.kind == IpcOpKind::PollWait {
         return complete_poll(context, region, token, op, memory, None, wake);
+    }
+    if op.kind == IpcOpKind::SelectWait {
+        // The native frame retains bitmap and timeout destinations, so this
+        // wait cannot transfer completion to the carrier.
+        return Err(IpcError::Corrupt);
     }
     if op.kind == IpcOpKind::EpollWait {
         // A parked zone epoll wait owns no progress: the host runs the

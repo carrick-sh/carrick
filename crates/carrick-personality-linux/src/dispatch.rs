@@ -1348,7 +1348,10 @@ impl ServiceOwner {
     ) -> Family {
         match self {
             Self::Ring(Family::Descriptor) if descriptor_available => Family::Descriptor,
-            Self::Ring(Family::Poll) if ordinal.raw() == carrick_syscall_abi::nr::PPOLL.raw() => {
+            Self::Ring(Family::Poll)
+                if ordinal.raw() == carrick_syscall_abi::nr::PPOLL.raw()
+                    || select_ordinal(ordinal) =>
+            {
                 if poll_available {
                     Family::Poll
                 } else {
@@ -1389,6 +1392,11 @@ pub const fn owner_ordinal(ordinal: CanonicalNr) -> CanonicalNr {
         CARRICK_PRIVATE_X86_DUP2 => nr::DUP3,
         _ => ordinal,
     }
+}
+
+/// The two select entry layouts share readiness ownership.
+pub const fn select_ordinal(ordinal: CanonicalNr) -> bool {
+    owner_ordinal(ordinal).raw() == crate::crossing::nr::PSELECT6.raw()
 }
 
 /// Descriptor ownership is shared by classification and venue admission.
@@ -1489,7 +1497,7 @@ pub const fn service_owner(ordinal: CanonicalNr, allocator_control: u64) -> Serv
     if original.raw() != ordinal.raw() && allocator_control == original.raw() {
         return ServiceOwner::Ring(Family::AllocatorControl);
     }
-    if ordinal.raw() == carrick_syscall_abi::nr::PPOLL.raw() {
+    if ordinal.raw() == carrick_syscall_abi::nr::PPOLL.raw() || select_ordinal(ordinal) {
         return ServiceOwner::Ring(Family::Poll);
     }
     let arm = route_aarch64(ordinal.raw(), allocator_control);
@@ -2923,7 +2931,10 @@ mod service_owner_tests {
                         for poll in [false, true] {
                             let expected = if descriptor && descriptor_ordinal(canonical) {
                                 Family::Descriptor
-                            } else if ordinal == 73 {
+                            } else if ordinal == 73
+                                || select_ordinal(canonical)
+                                    && owner == ServiceOwner::Ring(Family::Poll)
+                            {
                                 if poll { Family::Poll } else { Family::Unported }
                             } else {
                                 match isa {

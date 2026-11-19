@@ -5006,82 +5006,67 @@ fn zone_exec_status_pipe_reports_child_exec_failure_then_eof() {
     );
 }
 
-/// The writer's stdout sink releases its next guest instruction only after
-/// the native child's second pselect6 enrols in the ring.
+/// The sibling writer waits for a datagram before writing the pipe. The
+/// host sends only after observing the reader's production wait enrollment.
 #[test]
 fn native_child_pselect6_wakes_on_sibling_pipe_write() {
-    use carrick_kernel::dispatch::{PipedOutput, StdioSink, SyscallDispatcher};
-    use carrick_sched_core::{CarrierZoneWake, Claim, ParkedContextWords, RecordId};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, OnceLock};
+    use carrick_sched_core::{RecordId, ZONE_RECORDS};
     use std::time::{Duration, Instant};
 
-    type Zone = Arc<dyn CarrierZoneWake<ParkedContextWords>>;
-    struct WaitForReader {
-        zone: Arc<OnceLock<Zone>>,
-        parked: Arc<AtomicBool>,
-    }
-    impl std::io::Write for WaitForReader {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            let zone = self.zone.get().expect("carrier zone").zone();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if (1..).map_while(RecordId::from_raw).any(|id| {
-                    let record = zone.record(id);
-                    matches!(record.claim(), Claim::Parked { .. })
-                        && record.has_adapter_operation()
-                        && record
-                            .object_wait_census()
-                            .is_some_and(|wait| wait.queue != 0)
-                }) {
-                    self.parked.store(true, Ordering::Release);
-                    break;
-                }
-                std::thread::yield_now();
-            }
-            // A missing park fails the witness even if the reader happens to
-            // return after this write. Let an ENOSYS child be reaped normally.
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("select gate peer");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let port = format!(
+        "-DSELECT_GATE_PORT={}",
+        peer.local_addr().unwrap().port().swap_bytes()
+    );
     let elf = native_exit_fixture_with_flags(
         "native_pipe_poll_wake.S",
-        &["-DUSE_PSELECT", "-DCHILD_POLLS"],
+        &["-DUSE_PSELECT", "-DCHILD_POLLS", &port],
     );
     let program = carrick_mem::elf::ElfProgram::load(&elf, ELF_X86_64_MACHINE, &|_| None)
         .expect("pselect6 fixture");
-    let zone = Arc::new(OnceLock::new());
-    let parked = Arc::new(AtomicBool::new(false));
-    let dispatcher = SyscallDispatcher::default();
-    dispatcher.set_stdio_sink(StdioSink::Piped {
-        stdout: PipedOutput::memory(Box::new(WaitForReader {
-            zone: Arc::clone(&zone),
-            parked: Arc::clone(&parked),
-        })),
-        stderr: PipedOutput::memory(Box::new(std::io::sink())),
-    });
+    let mut sender = None;
     let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
         &program,
         256,
         kvm_pool_fixture::ROOT_AFFINITY_ANY,
         |carrier| {
-            assert!(
-                zone.set(carrier.carrier_zone_wake().expect("carrier wake domain"))
-                    .is_ok()
-            );
+            let zone = carrier.carrier_zone_wake().expect("carrier wake domain");
+            sender = Some(std::thread::spawn(move || {
+                let mut pid = [0; 4];
+                let (count, client) = peer.recv_from(&mut pid).expect("sibling writer");
+                assert_eq!(count, pid.len());
+                let tid = u64::from(u32::from_ne_bytes(pid));
+                let deadline = Instant::now() + Duration::from_secs(4);
+                let parked = loop {
+                    let enrolled =
+                        (1..ZONE_RECORDS as u32)
+                            .filter_map(RecordId::from_raw)
+                            .any(|id| {
+                                let record = zone.zone().record(id);
+                                record.identity().tid == tid
+                                    && record.has_adapter_operation()
+                                    && record
+                                        .object_wait_census()
+                                        .is_some_and(|wait| wait.queue != 0)
+                            });
+                    if enrolled || Instant::now() >= deadline {
+                        break enrolled;
+                    }
+                    std::thread::yield_now();
+                };
+                assert_eq!(peer.send_to(b"w", client).unwrap(), 1);
+                parked
+            }));
         },
-        dispatcher,
+        carrick_kernel::dispatch::SyscallDispatcher::default(),
     )
     .expect("pselect6 run");
     assert_eq!(outcome.run.exit_code, 7, "child select: {:?}", outcome.run);
     assert!(
-        parked.load(Ordering::Acquire),
-        "child pselect6 never parked"
+        sender.unwrap().join().unwrap(),
+        "child pselect6 never enrolled"
     );
 }
 
