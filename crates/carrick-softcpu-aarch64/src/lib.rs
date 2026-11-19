@@ -1138,6 +1138,7 @@ mod instruction {
         InstructionCache(crate::IcOperation),
         DataCacheZero(OperandRegister),
         SimdCopy(SimdCopy),
+        SimdCompute(crate::SimdCompute),
         SystemOperation(crate::SystemOperation),
         Barrier(crate::Barrier),
         ExceptionGeneration(crate::ExceptionGeneration),
@@ -1181,6 +1182,9 @@ mod instruction {
         }
         if let Some(copy) = simd_copy(word) {
             return Instruction::SimdCopy(copy);
+        }
+        if let Some(compute) = crate::simd::decode(word) {
+            return Instruction::SimdCompute(compute);
         }
         if let Some(instruction) = crate::closure::decode(word) {
             return instruction;
@@ -2412,5 +2416,7 @@ pub mod dispatch;
 pub mod exception;
 pub mod handler;
 pub mod mmu;
+mod simd;
+pub use simd::SimdCompute;
 pub mod state;
 pub mod translate;

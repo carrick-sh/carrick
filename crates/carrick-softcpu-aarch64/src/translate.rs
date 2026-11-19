@@ -7,7 +7,9 @@
 //! pages (LDP/STP C6.2.130/C6.2.277, LDR/STR immediate C6.2.132/C6.2.278,
 //! ADD immediate C6.2.4, MOVZ/MOVK C6.2.193/C6.2.191, B C6.2.26, RET C6.2.219,
 //! MRS/MSR C6.2.194/C6.2.196, B.cond C6.2.25, CBZ C6.2.45, TBZ C6.2.331).
-use crate::state::{CpuState, ProgramCounter, RegisterValue, StackPointer};
+use crate::state::{
+    CpuState, FPCR_MASK, FPSR_MASK, ProgramCounter, RegisterValue, StackPointer, SystemValue,
+};
 use crate::{
     AddressBase, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, Gpr, Hint, Instruction,
     LogicalOperand, OperandRegister, RegisterBranch, decode_instruction,
@@ -89,6 +91,7 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
         | Instruction::Multiply(_)
         | Instruction::Divide(_)
         | Instruction::SimdCopy(_)
+        | Instruction::SimdCompute(_)
         | Instruction::ConditionalSelect(_)
         | Instruction::ConditionalCompare(_)
         | Instruction::Barrier(_)
@@ -295,7 +298,11 @@ pub mod frame {
     pub const NZCV: u32 = 0x100;
     pub const HOST_SP: u32 = 0x108;
     pub const SCRATCH: u32 = 0x110;
-    pub const SLOTS: usize = 36;
+    pub const FPCR: u32 = 0x118;
+    pub const FPSR: u32 = 0x120;
+    pub const HOST_FPCR: u32 = 0x128;
+    pub const HOST_FPSR: u32 = 0x130;
+    pub const SLOTS: usize = 40;
     /// Guest Q0..Q31, sixteen bytes per register.
     pub const VECTORS: u32 = (SLOTS * 8) as u32;
     pub const BYTES: usize = SLOTS * 8 + 32 * 16;
@@ -344,6 +351,8 @@ impl BlockFrame {
             }
         }
         self.vectors = cpu.vectors;
+        self.slots[slot(frame::FPCR)] = cpu.named.fpcr.0 & FPCR_MASK;
+        self.slots[slot(frame::FPSR)] = cpu.named.fpsr.0 & FPSR_MASK;
         self.slots[slot(frame::GUEST_SP)] = cpu.sp().0;
         self.slots[slot(frame::NZCV)] = u64::from(cpu.pstate.nzcv & 15) << 28;
     }
@@ -358,6 +367,8 @@ impl BlockFrame {
             }
         }
         cpu.vectors = self.vectors;
+        cpu.named.fpcr = SystemValue(self.slots[slot(frame::FPCR)] & FPCR_MASK);
+        cpu.named.fpsr = SystemValue(self.slots[slot(frame::FPSR)] & FPSR_MASK);
         cpu.set_sp(StackPointer(self.slots[slot(frame::GUEST_SP)]));
         cpu.pstate.nzcv = ((self.slots[slot(frame::NZCV)] >> 28) & 15) as u8;
     }
@@ -492,6 +503,18 @@ pub mod encode {
     pub const fn msr_nzcv(rt: u32) -> u32 {
         0xd51b_4200 | rt
     }
+    pub(super) const fn mrs_fpcr(rt: u32) -> u32 {
+        0xd53b_4400 | rt
+    }
+    pub(super) const fn msr_fpcr(rt: u32) -> u32 {
+        0xd51b_4400 | rt
+    }
+    pub(super) const fn mrs_fpsr(rt: u32) -> u32 {
+        0xd53b_4420 | rt
+    }
+    pub(super) const fn msr_fpsr(rt: u32) -> u32 {
+        0xd51b_4420 | rt
+    }
     /// B label, `offset` in bytes from this word.
     pub const fn b(offset: i64) -> u32 {
         0x1400_0000 | (((offset / 4) as u32) & 0x03ff_ffff)
@@ -509,7 +532,7 @@ pub fn entry_stub() -> Vec<u32> {
 }
 
 fn entry_stub_for(simd: bool) -> Vec<u32> {
-    let mut w = Vec::with_capacity(if simd { 47 } else { 27 });
+    let mut w = Vec::with_capacity(if simd { 55 } else { 27 });
     w.push(encode::stp_pre(29, 30, SP, -96));
     for (i, r) in [19, 21, 23, 25, 27].into_iter().enumerate() {
         w.push(encode::stp(r, r + 1, SP, 16 * (i as i32 + 1)));
@@ -525,6 +548,18 @@ fn entry_stub_for(simd: bool) -> Vec<u32> {
     w.push(encode::add_imm(1, SP, 0));
     w.push(encode::str(1, 0, frame::HOST_SP));
     w.push(encode::add_imm(SP, 0, 0));
+    if simd {
+        w.extend([
+            encode::mrs_fpcr(1),
+            encode::str(1, SP, frame::HOST_FPCR),
+            encode::mrs_fpsr(1),
+            encode::str(1, SP, frame::HOST_FPSR),
+            encode::ldr(1, SP, frame::FPCR),
+            encode::msr_fpcr(1),
+            encode::ldr(1, SP, frame::FPSR),
+            encode::msr_fpsr(1),
+        ]);
+    }
     w.push(encode::ldr(1, SP, frame::NZCV));
     w.push(encode::msr_nzcv(1));
     for r in (0..30).step_by(2) {
@@ -552,7 +587,7 @@ pub fn common_exit() -> Vec<u32> {
 }
 
 fn common_exit_for(simd: bool) -> Vec<u32> {
-    let mut w = Vec::with_capacity(if simd { 49 } else { 28 });
+    let mut w = Vec::with_capacity(if simd { 57 } else { 28 });
     for r in (2..30).step_by(2) {
         w.push(encode::stp(r, r + 1, SP, 8 * r as i32));
     }
@@ -568,6 +603,18 @@ fn common_exit_for(simd: bool) -> Vec<u32> {
                 frame::VECTORS as i32 + 16 * r as i32,
             ));
         }
+    }
+    if simd {
+        w.extend([
+            encode::mrs_fpcr(1),
+            encode::str(1, SP, frame::FPCR),
+            encode::mrs_fpsr(1),
+            encode::str(1, SP, frame::FPSR),
+            encode::ldr(1, SP, frame::HOST_FPCR),
+            encode::msr_fpcr(1),
+            encode::ldr(1, SP, frame::HOST_FPSR),
+            encode::msr_fpsr(1),
+        ]);
     }
     w.push(encode::ldr(1, SP, frame::HOST_SP));
     w.push(encode::add_imm(SP, 1, 0));
@@ -694,10 +741,12 @@ pub fn emit_block(guest: &GuestBlock) -> Result<TranslatedBlock, TranslateError>
     if guest.instructions.is_empty() {
         return Err(TranslateError::Empty);
     }
-    let simd = guest
-        .instructions
-        .iter()
-        .any(|i| matches!(i.instruction, Instruction::SimdCopy(_)));
+    let simd = guest.instructions.iter().any(|i| {
+        matches!(
+            i.instruction,
+            Instruction::SimdCopy(_) | Instruction::SimdCompute(_)
+        )
+    });
     let mut e = Emitter {
         words: entry_stub_for(simd),
         exits: Vec::new(),
