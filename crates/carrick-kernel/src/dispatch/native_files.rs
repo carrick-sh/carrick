@@ -1158,31 +1158,30 @@ impl SyscallDispatcher {
         path: &str,
         capacity: usize,
     ) -> Served {
-        let first_path = match header.op {
+        let (first_path, second_path) = match header.op {
             HostFileOp::Renameat | HostFileOp::Linkat | HostFileOp::Symlinkat => {
                 let Some((first, second)) = native_path_pair(path) else {
                     return Served::Refused;
                 };
                 if header.op == HostFileOp::Symlinkat {
-                    second
+                    (second, None)
                 } else {
-                    first
+                    (first, Some(second))
                 }
             }
-            _ => path,
+            _ => (path, None),
         };
         let base = |number, name: &str| {
             (number != LINUX_AT_FDCWD as i32 && !name.starts_with('/')).then_some(fd::Fd(number))
         };
         let first = base(header.fd, first_path);
         header.fd = first.map_or(LINUX_AT_FDCWD as i32, |fd| fd.0);
-        let second = if matches!(header.op, HostFileOp::Renameat | HostFileOp::Linkat) {
+        let second = if let Some(second_path) = second_path {
             let Some(second_fd) =
                 carrick_core_abi::host_file::decode_second_path_fd(header.args[0])
             else {
                 return Served::Refused;
             };
-            let (_, second_path) = native_path_pair(path).expect("validated paired path");
             base(second_fd.unwrap_or(LINUX_AT_FDCWD as i32), second_path)
         } else {
             None
