@@ -182,9 +182,13 @@ child:
     mov $5, %r10d
     mov $191, %eax                 /* getxattr */
     syscall
+    mov $111, %edi
+    cmp $-14, %rax
+    je exit
     mov $103, %edi
     cmp $5, %rax
     jne exit
+    mov $112, %edi
     cmpl $0x656e776f, buf(%rip)    /* "owne" */
     jne exit
     cmpb $0x64, buf+4(%rip)       /* "d" */

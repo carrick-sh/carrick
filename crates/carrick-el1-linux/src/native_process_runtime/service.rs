@@ -3832,7 +3832,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if matches!(request.operation, ServiceOperation::HostFile { .. })
             && matches!(result, ServiceResult::Supplied | ServiceResult::Cancelled)
             && let Some(file) = pending.host_file.as_ref()
-            && file.operation == carrick_core_abi::host_file::HostFileOp::Readlinkat
+            && matches!(
+                file.operation,
+                carrick_core_abi::host_file::HostFileOp::Readlinkat
+                    | carrick_core_abi::host_file::HostFileOp::GetXattr
+                    | carrick_core_abi::host_file::HostFileOp::ListXattr
+                    | carrick_core_abi::host_file::HostFileOp::Ioctl
+            )
             && let Some(destination) = file.output
             && let Some(reply) = carrick_core_abi::host_file::reply(&file.record)
             && reply.result >= 0
