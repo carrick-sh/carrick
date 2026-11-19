@@ -28,6 +28,7 @@ use super::aarch64_process::{
     Mm, admit_entry, map_resume, observed_entry_address, process_record_for_call, registry,
     resume_selected, with_process_entry,
 };
+use super::native_fork_refusal::{NativeForkRefusal, NativeForkStage};
 #[cfg(test)]
 use super::native_process_runtime::{NativeContention, NativeFailure};
 use super::native_process_runtime::{NativeProcessError, NativeProcessRuntime};
@@ -3706,6 +3707,49 @@ fn test_fork_prepared_box_allocation_failure_allows_index_reuse_without_collisio
         .prepare_mm(&fixture.address, &parked, child_mm)
         .expect("second fork reusing the same index must succeed without Collision");
 
+    service.abort_mm(prepared).expect("abort_mm should succeed");
+}
+
+/// #2441: a refusal after the child reservation root is published must retire
+/// that root before the exact MM and `AddressSpaces` slot can be reused. Go's
+/// vfork-style subprocess loop exposes this as a later publish collision.
+#[test]
+fn fork_scratch_refusal_retires_root_before_exact_mm_reuse() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let words = fixture.tables.live(&fixture.maintenance);
+    let initial_stock = [
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ];
+    let crossing = TestStockCrossing::new(&initial_stock);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+    let child_mm = MmGeneration::new(NonZeroU64::new(2).unwrap());
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+
+    assert!(carrick_core::mm::fork::inject_scratch_exhausted_once());
+    assert!(
+        matches!(
+            service
+                .prepare_mm(&fixture.address, &parked, child_mm)
+                .expect_err("the injected scratch refusal must stop the first fork"),
+            NativeProcessError::ForkRefused(NativeForkRefusal {
+                stage: NativeForkStage::Scratch,
+                ..
+            })
+        ),
+        "the first fork must stop at its injected scratch refusal"
+    );
+
+    let prepared = service
+        .prepare_mm(&fixture.address, &parked, child_mm)
+        .expect("the exact MM must be reusable without a root collision");
     service.abort_mm(prepared).expect("abort_mm should succeed");
 }
 
