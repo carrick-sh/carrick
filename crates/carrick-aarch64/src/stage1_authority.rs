@@ -818,6 +818,27 @@ impl Stage1Authority {
         self.inner.lock().manager.as_ref().map(f)
     }
 
+    pub(crate) fn select_frame_grant_span(
+        &self,
+        range: carrick_core_abi::ReservationRange,
+        fault_page: u64,
+    ) -> Result<
+        carrick_core_abi::ReservationRange,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+        self.with_manager(|manager| {
+            manager.with_live_descriptor_words(|words| {
+                carrick_core::mm::frames::select_backing_span::<
+                    carrick_mmu_core::owner_mmu::Aarch64Mmu,
+                    _,
+                >(words, manager.base(), range, fault_page)
+            })
+        })
+        .flatten()
+        .ok_or(DescriptorRefusal::StaleRoot)?
+    }
+
     /// Retire this authority's published physical table capacity after its MM
     /// has stopped. An exact root retirement receipt may retain the primary
     /// for the callback to retire under the same exclusion. The publisher

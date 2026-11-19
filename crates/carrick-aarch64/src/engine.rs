@@ -5760,6 +5760,27 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.prepare_el1_frame_grant(request)
     }
 
+    fn select_el1_frame_grant(
+        &mut self,
+        mut request: carrick_hal::El1FrameGrantRequest,
+    ) -> Result<
+        carrick_hal::El1FrameGrantRequest,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        let end = request
+            .semantic_base
+            .checked_add(request.len)
+            .ok_or(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::BadRange)?;
+        let range = carrick_core_abi::ReservationRange::new(request.semantic_base, end)
+            .ok_or(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::BadRange)?;
+        let selected = self
+            .page_tables
+            .select_frame_grant_span(range, request.fault_va & !0xfff)?;
+        request.semantic_base = selected.start();
+        request.len = selected.len();
+        Ok(request)
+    }
+
     fn roll_back_el1_frame_grant(
         &mut self,
         grant: carrick_hal::threaded::El1FrameGrantRollback,
