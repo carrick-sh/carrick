@@ -1,5 +1,7 @@
 //! Exact live residency and retained grant-window custody for either ISA.
-use crate::{ExtentGrantReceipt, ReservationMetadataAllocator};
+use crate::{
+    ExtentGrantReceipt, MetadataExtent, PinnedMetadataExtent, ReservationMetadataAllocator,
+};
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU64, Ordering};
 pub const FRAME_GRANT_RESIDENCY_SLOTS: usize = 4096;
@@ -391,11 +393,7 @@ impl FrameGrantResidencyTable {
         if index >= self.extension_count() {
             return None;
         }
-        self.storage
-            .directory
-            .entries
-            .get(index)
-            .map(SegmentLocationWire::read)
+        Some(self.storage.directory.entries.get(index)?.read())
     }
 
     /// Publish one segment through the carrier's metadata allocator after
@@ -493,23 +491,111 @@ impl FrameGrantResidencyTable {
         .as_table()
     }
 
-    /// Create a view using already resolved and retained aliases.
+    /// Resolve a dynamic extension through a pin on its exact retained
+    /// extent. The alias may be unrelated to the guest address.
     ///
     /// # Safety
-    /// Each alias at index `i` must refer to this table's published
-    /// `extension_location(i)`, with the pin held for the whole borrow.
-    pub unsafe fn resolved_view<'a>(
+    /// The pin must come from this table's carrier and VM generation. Extent
+    /// tokens identify allocations only within that carrier.
+    pub unsafe fn resolve_extension<'a>(
         &'a self,
-        extensions: &'a [&'a ResidencySegment],
+        index: usize,
+        pin: &'a impl PinnedMetadataExtent,
+    ) -> Option<ResolvedResidencySegment<'a>> {
+        let location = self.extension_location(index)?;
+        let extent = MetadataExtent::new(
+            location.extent.base_va,
+            location.extent.size as u64,
+            location.extent.token,
+        )?;
+        if extent != pin.extent() {
+            return None;
+        }
+        // SAFETY: pin retains this carrier allocator extent, and the directory
+        // published the exact segment base after initialization.
+        unsafe { self.resolve_alias(index, location, pin.host_base()) }
+    }
+
+    /// Resolve an extension inside the carrier's retained bootstrap extent.
+    ///
+    /// # Safety
+    /// `host_base` must map the exact bootstrap extent of this table's carrier
+    /// for the whole borrow.
+    pub unsafe fn resolve_bootstrap_extension(
+        &self,
+        index: usize,
+        guest_base: u64,
+        extent_size: usize,
+        host_base: core::ptr::NonNull<u8>,
+    ) -> Option<ResolvedResidencySegment<'_>> {
+        let location = self.extension_location(index)?;
+        if location.extent
+            != (ExtentGrantReceipt {
+                base_va: guest_base,
+                size: extent_size,
+                token: 0,
+            })
+        {
+            return None;
+        }
+        // SAFETY: caller retains this exact carrier's bootstrap backing.
+        unsafe { self.resolve_alias(index, location, host_base) }
+    }
+
+    unsafe fn resolve_alias(
+        &self,
+        index: usize,
+        location: ResidencySegmentLocation,
+        host_base: core::ptr::NonNull<u8>,
+    ) -> Option<ResolvedResidencySegment<'_>> {
+        let layout = Layout::new::<ResidencySegment>();
+        let offset = location.guest_base.checked_sub(location.extent.base_va)? as usize;
+        if offset.checked_add(layout.size())? > location.extent.size {
+            return None;
+        }
+        // SAFETY: caller retains the whole enclosing extent, and the preceding
+        // bounds check covers the complete initialized segment.
+        let alias = unsafe { host_base.as_ptr().add(offset).cast::<ResidencySegment>() };
+        if !alias.is_aligned() {
+            return None;
+        }
+        Some(ResolvedResidencySegment {
+            table: self,
+            index,
+            // SAFETY: the published exact location is initialized and the
+            // caller retains the matching aligned alias for this borrow.
+            segment: unsafe { &*alias },
+        })
+    }
+
+    /// Create a view from the complete, ordered prefix of retained aliases.
+    /// Reject cross-carrier or out-of-order entries before looking at rows.
+    pub fn resolved_view<'a>(
+        &'a self,
+        extensions: &'a [ResolvedResidencySegment<'a>],
     ) -> Option<FrameGrantResidencyTable<ResidencyRows<'a>>> {
-        (extensions.len() == self.extension_count()).then(|| {
+        if extensions.len() != self.extension_count()
+            || extensions
+                .iter()
+                .enumerate()
+                .any(|(index, alias)| alias.index != index || !core::ptr::eq(alias.table, self))
+        {
+            return None;
+        }
+        Some(
             ResidencyRows {
                 bootstrap: &self.storage.bootstrap,
                 extensions: ResidencyExtensions::Aliases(extensions),
             }
-            .as_table()
-        })
+            .as_table(),
+        )
     }
+}
+
+pub struct ResolvedResidencySegment<'a> {
+    table: &'a FrameGrantResidencyTable,
+    index: usize,
+    segment: &'a ResidencySegment,
 }
 
 /// Venue-local access to the bootstrap and extension storage.
@@ -521,7 +607,7 @@ pub struct ResidencyRows<'a> {
 
 #[derive(Clone, Copy)]
 enum ResidencyExtensions<'a> {
-    Aliases(&'a [&'a ResidencySegment]),
+    Aliases(&'a [ResolvedResidencySegment<'a>]),
     Guest(&'a ResidencyDirectory, usize),
 }
 
@@ -530,6 +616,11 @@ mod sealed {
         fn rows(&self) -> super::ResidencyRows<'_>;
     }
 }
+
+/// Storage accepted by the shared descriptor and retirement owner. The
+/// bootstrap wire record and each retained venue view use the same methods.
+pub trait FrameGrantResidencyAccess: sealed::ResidencyStorage {}
+impl<S: sealed::ResidencyStorage> FrameGrantResidencyAccess for S {}
 
 impl sealed::ResidencyStorage for ResidencyStorage {
     fn rows(&self) -> ResidencyRows<'_> {
@@ -560,7 +651,7 @@ impl<'a> ResidencyRows<'a> {
             return Some(self.bootstrap);
         };
         match self.extensions {
-            ResidencyExtensions::Aliases(entries) => entries.get(index).copied(),
+            ResidencyExtensions::Aliases(entries) => entries.get(index).map(|alias| alias.segment),
             ResidencyExtensions::Guest(directory, count) if index < count => {
                 let location = directory.entries.get(index)?.read();
                 // SAFETY: guest_view requires published allocations to remain
@@ -664,6 +755,11 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             }
         }
         Err(FrameGrantResidencyRefusal::Capacity)
+    }
+
+    /// Number of addressable records in this venue's resolved view.
+    pub fn slot_capacity(&self) -> usize {
+        self.segments().count() * FRAME_GRANT_RESIDENCY_SLOTS
     }
 
     /// Diagnostic sample of occupied slots, including in-flight publishers.
@@ -1342,7 +1438,11 @@ mod tests {
     fn extension_slots_share_lookup_dirty_ack_and_retirement() {
         let bootstrap = table();
         let extension = table();
-        let aliases = [&extension.storage.bootstrap];
+        let aliases = [ResolvedResidencySegment {
+            table: &bootstrap,
+            index: 0,
+            segment: &extension.storage.bootstrap,
+        }];
         let view = ResidencyRows {
             bootstrap: &bootstrap.storage.bootstrap,
             extensions: ResidencyExtensions::Aliases(&aliases),
@@ -1503,6 +1603,34 @@ mod tests {
                 .slot,
             slot
         );
+
+        // The host identifies the same allocator grant and must supply its
+        // retained pin before it can acknowledge or retire this row.
+        struct Pin(MetadataExtent);
+        // SAFETY: TestAllocator retains the published extent throughout the
+        // local pin and view. This fixture's two venues use the same mapping.
+        unsafe impl PinnedMetadataExtent for Pin {
+            fn extent(&self) -> MetadataExtent {
+                self.0
+            }
+            fn host_base(&self) -> core::ptr::NonNull<u8> {
+                core::ptr::NonNull::new(self.0.base() as *mut u8).unwrap()
+            }
+        }
+        let location = table.extension_location(0).unwrap();
+        let extent = location.extent;
+        let pin =
+            Pin(MetadataExtent::new(extent.base_va, extent.size as u64, extent.token).unwrap());
+        let stale =
+            Pin(MetadataExtent::new(extent.base_va, extent.size as u64, extent.token + 1).unwrap());
+        // SAFETY: both pins use the exact test carrier's allocator venue.
+        assert!(unsafe { table.resolve_extension(0, &stale) }.is_none());
+        assert!(table.resolved_view(&[]).is_none());
+        // SAFETY: pin uses the exact test carrier's allocator venue.
+        let aliases = [unsafe { table.resolve_extension(0, &pin) }.unwrap()];
+        let host = table.resolved_view(&aliases).unwrap();
+        assert!(host.retire(slot, pending));
+        assert!(view.lookup(pending.mm_key, pending.semantic_base).is_none());
     }
 
     #[test]
