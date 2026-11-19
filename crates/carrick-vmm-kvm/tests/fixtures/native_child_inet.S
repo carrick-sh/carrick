@@ -118,8 +118,6 @@
 #define SYS_MMAP 9
 #define SYS_MUNMAP 11
 #define DNS_STEPS 33
-#define SYS_CLONE 56
-#define SYS_FUTEX 202
 
 /* Record `mask` in xfails unless %rax == value; continue either way. */
 #define CHECK(mask, value)   \
@@ -1233,8 +1231,8 @@ epoll_terminal:
 #endif
 
 #ifdef EPOLL_WAIT_PORT
-/* The host peer holds the reply until both threads are enrolled in the
- * shared epoll's Readable queue. A level-triggered event must reach both
+/* The host peer holds the reply until both fork related threads are
+ * enrolled in the same inherited epoll's Readable queue. A level-triggered event must reach both
  * waiters without consuming the datagram. DEL must remove it even while
  * the socket is still readable. */
 epoll_waiters:
@@ -1274,36 +1272,37 @@ epoll_waiters:
     syscall
     EXPECT(5, 1)
 
-    movl $0, epoll_out_a(%rip)
-    movl $0, epoll_out_b(%rip)
-    lea epoll_stack_top(%rip), %rsi
-    mov $0x50f00, %edi            /* CLONE_THREAD and required sharing */
-    xor %edx, %edx
-    xor %r10d, %r10d
-    xor %r8d, %r8d
-    mov $SYS_CLONE, %eax
+    mov $SYS_FORK, %eax
     syscall
     mov $10, %r15d
     test %rax, %rax
     js fail
-    jz epoll_worker
-    lea epoll_out_a(%rip), %r14
-    jmp epoll_worker_wait
-epoll_join:
-    mov epoll_completed(%rip), %edx
-    cmp $2, %edx
-    je epoll_delete
-    lea epoll_completed(%rip), %rdi
-    mov $128, %esi               /* FUTEX_WAIT_PRIVATE */
-    lea epoll_join_limit(%rip), %r10
-    mov $SYS_FUTEX, %eax
+    mov %rax, %r14
+    movl $0, epoll_wait_output(%rip)
+    mov %r13, %rdi
+    lea epoll_wait_output(%rip), %rsi
+    mov $1, %edx
+    mov $-1, %r10d
+    mov $SYS_EPOLL_WAIT, %eax
     syscall
-    cmp $-110, %rax
-    je epoll_join_timed_out
-    jmp epoll_join
-epoll_join_timed_out:
+    EXPECT(11, 1)
+    mov epoll_wait_output(%rip), %eax
+    EXPECT(12, 1)
+    mov epoll_wait_output+4(%rip), %rax
+    EXPECT(13, 0x2418)
+    test %r14, %r14
+    jz epoll_waiter_exit
+    mov %r14, %rdi
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $SYS_WAIT4, %eax
+    syscall
     mov $6, %r15d
-    jmp fail
+    cmp %r14, %rax
+    jne fail
+    mov status(%rip), %eax
+    EXPECT(14, 0)
 epoll_delete:
     mov %r13, %rdi
     mov $2, %esi                 /* EPOLL_CTL_DEL */
@@ -1328,29 +1327,7 @@ epoll_delete:
     xor %edi, %edi
     jmp exit
 
-epoll_worker:
-    lea epoll_out_b(%rip), %r14
-epoll_worker_wait:
-    mov %r13, %rdi
-    mov %r14, %rsi
-    mov $1, %edx
-    mov $-1, %r10d
-    mov $SYS_EPOLL_WAIT, %eax
-    syscall
-    EXPECT(11, 1)
-    mov (%r14), %eax
-    EXPECT(12, 1)
-    mov 4(%r14), %rax
-    EXPECT(13, 0x2418)
-    lock incl epoll_completed(%rip)
-    lea epoll_out_a(%rip), %rax
-    cmp %r14, %rax
-    je epoll_join
-    lea epoll_completed(%rip), %rdi
-    mov $129, %esi               /* FUTEX_WAKE_PRIVATE */
-    mov $1, %edx
-    mov $SYS_FUTEX, %eax
-    syscall
+epoll_waiter_exit:
     xor %edi, %edi
     mov $SYS_EXIT, %eax
     syscall
@@ -1397,18 +1374,7 @@ epoll_in:
     .quad 0x2418
 epoll_ping:
     .byte 1
-.align 8
-epoll_join_limit:
-    .quad 10, 0
-epoll_completed:
-    .long 0
-.balign 4096
-epoll_stack:
-    .zero 4096
-epoll_stack_top:
-epoll_out_a:
-    .zero 12
-epoll_out_b:
+epoll_wait_output:
     .zero 12
 #endif
 .align 8

@@ -5787,8 +5787,8 @@ fn native_child_go_netpoller_adds_a_udp_socket_to_epoll() {
     assert_dns_steps_are_linux(&dns_style_udp_steps(false), &[GO_NETPOLL_STEPS]);
 }
 
-/// A real UDP peer supplies a datagram only after two native threads
-/// release their execution lanes into the ring epoll's same Readable queue.
+/// A real UDP peer supplies a datagram after two fork-related native
+/// threads release their execution lanes into the inherited epoll's queue.
 #[test]
 fn native_child_host_epoll_wakes_two_parked_waiters() {
     use std::time::{Duration, Instant};
