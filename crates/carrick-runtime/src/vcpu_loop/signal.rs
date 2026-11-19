@@ -975,6 +975,30 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         None,
                     );
                 };
+                let service = match engine.select_el1_frame_grant(service) {
+                    Ok(service) => service,
+                    Err(
+                        carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied
+                        | carrick_mmu_core::descriptor_refusal::DescriptorRefusal::AlreadyValid,
+                    ) => {
+                        if !mailbox.abandon_unstarted_request(request) {
+                            return Err(TrapError::UnexpectedExit {
+                                reason: "descriptor replan lost its unstarted frame request".into(),
+                            }
+                            .into());
+                        }
+                        return Ok(Ok(true));
+                    }
+                    Err(reason) => {
+                        record_decision(FrameGrantDecision::PublishRefused(reason));
+                        publish_frame_grant_refusal(
+                            mailbox,
+                            request,
+                            carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
+                        );
+                        return Ok(Ok(true));
+                    }
+                };
                 let Some(prepared) = engine.prepare_el1_frame_grant(service).inspect_err(|_| {
                     record_decision(FrameGrantDecision::PrepareError);
                 })?
