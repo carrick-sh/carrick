@@ -837,6 +837,33 @@ fn simd_structures_interleave_replicate_and_commit_only_after_read() {
 }
 
 #[test]
+fn el0_crc32_and_crc32c_match_standard_check_values() {
+    for (double, byte, want) in [
+        (0x9ac1_4c02, 0x1ac1_4042, 0xcbf4_3926u32),
+        (0x9ac1_5c02, 0x1ac1_5042, 0xe306_9283u32),
+    ] {
+        let mut rig = Rig::el0();
+        rig.set(0, u64::from(u32::MAX));
+        rig.set(1, u64::from_le_bytes(*b"12345678"));
+        assert_eq!(rig.run(double), Outcome::Continue);
+        assert_eq!(rig.pc(), PC + 4);
+        rig.set(1, u64::from(b'9'));
+        assert_eq!(rig.run(byte), Outcome::Continue);
+        assert_eq!(rig.get(2), u64::from(!want));
+    }
+}
+
+#[test]
+fn el0_reads_virtual_cpu_identity_through_the_instruction_handler() {
+    let mut rig = Rig::el0();
+    assert_eq!(rig.run(0xd538_0603), Outcome::Continue); // ID_AA64ISAR0_EL1
+    assert_eq!(rig.pc(), PC + 4);
+    assert_eq!(rig.get(3) & (0xff << 16), 1 << 16); // CRC32 present, LSE absent
+    assert_eq!(rig.run(0xd538_0404), Outcome::Continue); // ID_AA64PFR0_EL1
+    assert_eq!(rig.get(4), 0); // scalar FP and Advanced SIMD present
+}
+
+#[test]
 fn prefetch_modes_ignore_unmapped_addresses() {
     let mut rig = Rig::el0();
     for word in [0xd800_0000, 0xf980_0000, 0xf8a1_7800, 0xf89f_f000] {
@@ -844,4 +871,16 @@ fn prefetch_modes_ignore_unmapped_addresses() {
         assert_eq!(rig.run(word), Outcome::Continue);
         assert_eq!(rig.pc(), pc + 4);
     }
+}
+
+#[test]
+fn el0_ldadd_raises_undefined_before_accessing_memory() {
+    let mut rig = Rig::el0();
+    rig.memory.put(0x10000, 40);
+    rig.set(0, 0x10000);
+    rig.set(1, 2);
+    assert_eq!(rig.run(0xf821_0002), Outcome::Fault);
+    assert_eq!(rig.cpu.el1.esr, Syndrome(0x0200_0000));
+    assert_eq!(rig.cpu.el1.elr, ProgramCounter(PC));
+    assert_eq!(rig.memory.get(0x10000), 40);
 }
