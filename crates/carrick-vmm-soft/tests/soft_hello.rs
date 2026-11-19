@@ -660,8 +660,8 @@ fn production_ring_rearms_slice_when_irq_return_head_is_busy_once() {
         &[],
     );
     let ticks_per_block =
-        std::num::NonZeroU64::new(carrick_vmm_soft::carrier::SOFT_TSC_HZ / 20_000)
-            .expect("50 us per block");
+        std::num::NonZeroU64::new(carrick_vmm_soft::carrier::SOFT_TSC_HZ / 500_000)
+            .expect("2 us per block");
     let released_once = Arc::new(AtomicBool::new(false));
     let timer_irqs_after_hold = Arc::new(AtomicU64::new(0));
     let user_blocks_before_rearmed_irq = Arc::new(AtomicU64::new(0));
