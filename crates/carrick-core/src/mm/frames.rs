@@ -395,7 +395,7 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
                             va: identity.semantic_base,
                             len: identity.len,
                             slots_used: residency.observed_slots_used(),
-                            slots_total: FRAME_GRANT_RESIDENCY_SLOTS,
+                            slots_total: residency.active_slots(),
                         },
                     );
                 }

@@ -934,9 +934,14 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
 
     /// Initialize retained boot records before creating any vCPU.
     pub fn initialize_fault_records(&mut self, region: FrameGpa) -> Result<(), MemoryError> {
-        let residency = self.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
-            FrameGpa::new(region.raw() + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET),
-        )?;
+        let slot = self
+            .locate(region, carrick_el1_abi::EL1_REGION_SIZE as usize)
+            .ok_or_else(|| error("fault record region bounds"))?;
+        let base = slot
+            .backing
+            .extent
+            .ptr(region.raw(), carrick_el1_abi::EL1_REGION_SIZE as usize)
+            .ok_or_else(|| error("fault record region backing"))?;
         let ingress = self.record_ptr::<carrick_el1_abi::SharedSignalIngressQueue>(
             FrameGpa::new(region.raw() + carrick_el1_abi::EL1_SIGNAL_INGRESS_OFFSET),
         )?;
@@ -946,7 +951,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         // SAFETY: exclusive boot memory, before CarrierMachine creates vCPUs;
         // both retained records have checked bounds and alignment.
         unsafe {
-            carrick_el1_abi::FrameGrantResidencyTable::init_in_place(residency);
+            carrick_el1_abi::enable_frame_grant_residency_growth(base);
             carrick_el1_abi::SharedSignalIngressQueue::initialize_at(ingress);
             portal.write(carrick_el1_abi::MmPortalSlots::new());
         }

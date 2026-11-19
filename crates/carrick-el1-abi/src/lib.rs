@@ -397,10 +397,32 @@ pub const METADATA_MAILBOX_GUEST_CONSUMING: u32 = 5;
 pub const EL1_FRAME_GRANT_MAILBOX_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x20_000;
 pub const EL1_FRAME_GRANT_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_MAILBOX_OFFSET;
 
-/// Shared residency journal for up to 4096 live bulk grants. It occupies the
-/// otherwise unused tail of the current-task area, after the mailboxes.
+/// Shared residency index head. Additional segments use the reserved tail
+/// between the name cache and scheduler zone.
 pub const EL1_FRAME_GRANT_RESIDENCY_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x30_000;
 pub const EL1_FRAME_GRANT_RESIDENCY_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_RESIDENCY_OFFSET;
+
+/// Cache-line-aligned spill reservation within the same carrier mapping.
+pub const EL1_FRAME_GRANT_RESIDENCY_EXTENSION_OFFSET: u64 =
+    (EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE + 63) & !63;
+
+/// Enable elastic frame residency on a freshly allocated shared ABI region.
+///
+/// # Safety
+/// `base` must be the aligned, zero-filled carrier mapping of
+/// [`EL1_REGION_SIZE`] bytes (except for already initialized boot fields).
+/// The mapping must be retained and this must run before any residency use.
+pub unsafe fn enable_frame_grant_residency_growth(base: *mut u8) {
+    // SAFETY: the ABI checks nonoverlap, alignment and bounds for both
+    // reservations. The caller owns boot publication of the entire mapping.
+    unsafe {
+        FrameGrantResidencyTable::attach_extensions(
+            base,
+            EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
+            EL1_FRAME_GRANT_RESIDENCY_EXTENSION_OFFSET as usize,
+        );
+    }
+}
 
 /// One shared external-signal ingress reservation in either ISA's kernel
 /// region, after the frame residency inventory. The record carries the exact
@@ -1102,6 +1124,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_FRAME_GRANT_MAILBOX_OFFSET,
         EL1_FRAME_GRANT_RESIDENCY_OFFSET,
         FRAME_GRANT_RESIDENCY_SLOTS as u64,
+        EL1_FRAME_GRANT_RESIDENCY_EXTENSION_OFFSET,
+        FRAME_GRANT_RESIDENCY_EXTENSION_BYTES as u64,
         EL1_FRAME_GRANT_TARGET_SIZE,
         EL1_BOOTSTRAP_METADATA_OFFSET,
         EL1_BOOTSTRAP_METADATA_SIZE,
@@ -3792,7 +3816,10 @@ const _: () = assert!(EL1_OBJECT_TABLE_OFFSET + EL1_OBJECT_TABLE_SIZE <= EL1_FD_
 const _: () = assert!(EL1_FD_MAP_OFFSET + EL1_FD_MAP_SIZE <= EL1_CACHE_OFFSET);
 const _: () = assert!(EL1_CACHE_OFFSET + EL1_CACHE_SIZE <= EL1_INOTIFY_TABLE_OFFSET);
 const _: () = assert!(EL1_INOTIFY_TABLE_OFFSET + EL1_INOTIFY_TABLE_SIZE <= EL1_NAME_CACHE_OFFSET);
-const _: () = assert!(EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE <= EL1_ZONE_OFFSET);
+const _: () = assert!(
+    EL1_FRAME_GRANT_RESIDENCY_EXTENSION_OFFSET + FRAME_GRANT_RESIDENCY_EXTENSION_BYTES as u64
+        <= EL1_ZONE_OFFSET
+);
 const _: () = assert!(EL1_ZONE_OFFSET + EL1_ZONE_SIZE <= EL1_REGION_SIZE);
 
 use core::sync::atomic::AtomicUsize;

@@ -2271,10 +2271,21 @@ fn private_file_4k_grants_scale_past_initial_residency<
         }
     }
     let live = tables.live(&CallerInvalidatesAsid);
-    let residency = residency();
+    let mut storage = carrick_test_support::TestEl1Region::zeroed();
+    // SAFETY: this fresh, aligned ABI region remains owned throughout the
+    // witness, using the same attachment as either carrier's boot path.
+    let residency = unsafe {
+        let base = storage.as_mut_ptr();
+        carrick_el1_abi::enable_frame_grant_residency_growth(base);
+        &*base
+            .add(carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize)
+            .cast::<carrick_core_abi::FrameGrantResidencyTable>()
+    };
+    assert_eq!(residency.active_slots(), FRAME_GRANT_RESIDENCY_SLOTS);
     let handle = portal.admitted_handle(mm, 0).unwrap();
     let wire = PortalGrantSlot::new();
 
+    let mut first_pin = None;
     for page_index in 0..TOTAL_PAGES {
         let page_va = VA + page_index as u64 * 4096;
         let page_ipa = IPA + page_index as u64 * 4096;
@@ -2294,7 +2305,7 @@ fn private_file_4k_grants_scale_past_initial_residency<
                 carrick_core::mm::transaction::SelectionVenues {
                     prepared: &mut NoopPreparedResolver,
                     cow: &mut NoopCowResolver,
-                    residency: &residency,
+                    residency,
                     slot: 0,
                 },
             )
@@ -2331,7 +2342,7 @@ fn private_file_4k_grants_scale_past_initial_residency<
             tables: TableGrants::NONE,
         };
         assert!(wire.submit(window, &txn));
-        let receipt = serve_grant(&portal, &wire, &live, &residency, 0, || {})
+        let receipt = serve_grant(&portal, &wire, &live, residency, 0, || {})
             .unwrap()
             .unwrap();
         assert!(wire.take_receipt(window, &txn).is_some());
@@ -2341,7 +2352,19 @@ fn private_file_4k_grants_scale_past_initial_residency<
             residency.observed_slots_used(),
             receipt.outcome
         );
+        if page_index == 0 {
+            first_pin = Some(
+                residency
+                    .pin_transfer(residency.lookup(mm.raw(), VA).unwrap())
+                    .unwrap(),
+            );
+        }
+        if page_index + 1 == FRAME_GRANT_RESIDENCY_SLOTS {
+            assert_eq!(residency.active_slots(), FRAME_GRANT_RESIDENCY_SLOTS);
+        }
     }
+
+    assert_eq!(residency.active_slots(), 2 * FRAME_GRANT_RESIDENCY_SLOTS);
 
     // Every single-page residency record remains live and committed while mapped;
     // neither commit nor a wider candidate window supersedes published slots.
@@ -2368,6 +2391,22 @@ fn private_file_4k_grants_scale_past_initial_residency<
         Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::AlreadyValid)
     );
 
+    // Growth must neither move nor replace the first segment's live pin.
+    assert!(
+        residency
+            .begin_retire_overlapping(mm.raw(), VA, 4096)
+            .is_none()
+    );
+    drop(first_pin);
+    let mut reconciled = 0;
+    let _: core::ops::ControlFlow<()> =
+        residency.for_each_dirty_mm(mm.raw(), |slot, grant, bits| {
+            assert_eq!(bits[0], 1);
+            assert!(residency.ack_dirty(slot, grant));
+            reconciled += 1;
+            core::ops::ControlFlow::Continue(())
+        });
+    assert_eq!(reconciled, TOTAL_PAGES);
     // Explicit munmap retirement releases all slots across every segment.
     let retirement = residency
         .begin_retire_overlapping(mm.raw(), VA, TOTAL_PAGES as u64 * 4096)
