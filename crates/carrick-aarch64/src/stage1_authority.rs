@@ -823,13 +823,13 @@ impl Stage1Authority {
         range: carrick_core_abi::ReservationRange,
         fault_page: u64,
     ) -> Result<
-        carrick_core_abi::ReservationRange,
+        carrick_core::mm::frames::SelectedBackingPlan,
         carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
     > {
         use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
         self.with_manager(|manager| {
             manager.with_live_descriptor_words(|words| {
-                carrick_core::mm::frames::select_backing_span::<
+                carrick_core::mm::frames::select_backing_plan::<
                     carrick_mmu_core::owner_mmu::Aarch64Mmu,
                     _,
                 >(words, manager.base(), range, fault_page)
