@@ -1287,9 +1287,25 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                                 "refused frame grant cannot roll back backing: {error}"
                             ))
                         });
-                    fail_publication(format!(
-                        "accepted owner frame grant ended without publication: {completed:?}"
-                    ));
+                    match completed {
+                        FrameGrantCompletion::PublicationDeclined => {
+                            if !mailbox.release_declined_publication(request) {
+                                fail_publication(
+                                    "rolled-back frame grant lost its exact mailbox claim".into(),
+                                );
+                            }
+                            // Contention and capacity are not terminal. An
+                            // Occupied fault page likewise needs a fresh plan
+                            // from the now-live descriptor image.
+                            return Ok(Ok(true));
+                        }
+                        FrameGrantCompletion::SlotNotWorking
+                        | FrameGrantCompletion::StaleRequest
+                        | FrameGrantCompletion::InvalidReady => fail_publication(format!(
+                            "accepted owner frame grant broke its mailbox invariant: {completed:?}"
+                        )),
+                        FrameGrantCompletion::Published => unreachable!(),
+                    }
                 } else {
                     ring::rec_el1_frame_grant_decision(
                         ring_tid,

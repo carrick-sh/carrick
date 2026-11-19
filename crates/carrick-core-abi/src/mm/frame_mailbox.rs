@@ -379,6 +379,13 @@ impl FrameGrantMailbox {
         self.release_claim(request)
     }
 
+    /// Release a claimed request after every prepared physical and descriptor
+    /// effect was rolled back. A declined publication is "not now": the
+    /// faulting instruction reruns and may publish a freshly planned request.
+    pub fn release_declined_publication(&self, request: FrameGrantRequest) -> bool {
+        self.release_claim(request)
+    }
+
     /// Finish a claimed owner file fault after its descriptor transaction
     /// committed. The faulting page is live, so EL1 will not fault again to
     /// consume a refusal; leaving RESPONSE would strand every later page on
@@ -817,6 +824,39 @@ mod completion_tests {
             mailbox.complete_grant_with_outcome(ready, |_| Ok::<_, ()>(true), || {}),
             Ok(FrameGrantCompletion::Published)
         );
+        assert!(!mailbox.has_guest_work());
+    }
+
+    #[test]
+    fn declined_publication_can_replan_after_rollback() {
+        let mailbox = FrameGrantMailbox::new();
+        let request = FrameGrantRequest {
+            mm_key: 41,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
+            request_generation: 3118,
+            fault_va: 0x0060_0304_1000,
+            requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+            access: 2,
+        };
+        let ready = FrameGrantReady {
+            mm_key: request.mm_key,
+            request_generation: request.request_generation,
+            semantic_base: request.fault_va,
+            physical_ipa: 0x9000_0000,
+            len: 4096,
+            permissions: 3,
+            frame_id: 1,
+            mapping_id: 2,
+            owner_generation: 3,
+            inventory_revision: 4,
+        };
+        assert!(mailbox.try_publish_request(request));
+        assert_eq!(mailbox.claim_request(), Some(request));
+        assert_eq!(
+            mailbox.complete_grant_with_outcome(ready, |_| Ok::<_, ()>(false), || unreachable!()),
+            Ok(FrameGrantCompletion::PublicationDeclined)
+        );
+        assert!(mailbox.release_declined_publication(request));
         assert!(!mailbox.has_guest_work());
     }
 }
