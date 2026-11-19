@@ -27,7 +27,7 @@ use carrick_el1_linux::native_process_runtime::{
     NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
     NativeProcessService,
 };
-use carrick_el1_linux::retired_spaces::{RetiredSpace, RetiredSpaces};
+use carrick_el1_linux::retired_spaces::{RetiredSpace, RetiredSpaces, retire_closed_space};
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, UserVa,
 };
@@ -445,15 +445,25 @@ impl Service {
             .spaces
             .publish_closed(child_mm.raw().get(), loan.request.child_tables.base, 0)
             .ok_or_else(|| abandon(NativeProcessError::Exhausted))?;
-        let free = |error| {
+        let free_space = |error| {
             owner.spaces.free(index);
             abandon(error)
         };
         owner
             .roots
             .publish(index.index(), loan.request.child_mm, layout)
-            .map_err(|e| free(refused(NativeForkStage::PublishRoot, e)))?;
-        let scratch = fork_scratch(loan.request, mapping_count, &count).map_err(free)?;
+            .map_err(|e| free_space(refused(NativeForkStage::PublishRoot, e)))?;
+        let abandon_root = |error, scrub| {
+            if retire_closed_space(owner, loan.request.child_mm, self.worker()).is_err() {
+                // The root or its release owner is still live. Keep the stock
+                // loan quarantined with it rather than making either reusable.
+                NativeProcessError::Quarantined
+            } else {
+                abandon_loan(&loan, scrub, error)
+            }
+        };
+        let scratch = fork_scratch(loan.request, mapping_count, &count)
+            .map_err(|error| abandon_root(error, None))?;
         #[cfg(feature = "test-support")]
         let held_snapshot = crate::test_support::hold_armed_fork_prepare();
         let plan = owner
@@ -463,12 +473,12 @@ impl Service {
                 if held_snapshot {
                     crate::test_support::record_fork_superseded(e);
                 }
-                free(refused(NativeForkStage::Prepare, e))
+                abandon_root(refused(NativeForkStage::Prepare, e), None)
             })?;
         let mut custody = Vec::new();
         custody
             .try_reserve_exact(plan.custody().len())
-            .map_err(|_| free(NativeProcessError::Exhausted))?;
+            .map_err(|_| abandon_root(NativeProcessError::Exhausted, None))?;
         custody.extend(plan.custody().iter().copied().map(PortalForkCustody::words));
         let mut child = match owner.publish_fork(plan, live, self.worker()) {
             Ok(child) => child,
@@ -477,7 +487,6 @@ impl Service {
                 if held_snapshot {
                     crate::test_support::record_fork_superseded(e);
                 }
-                owner.spaces.free(index);
                 // A refused publish may have stored into the loaned tables;
                 // it rolled its parent edits back, so they are unlinked and
                 // are scrubbed before the abort. `Core` means that rollback
@@ -486,10 +495,9 @@ impl Service {
                 if matches!(e, carrick_core::mm::transaction::MmError::Core) {
                     return Err(refused(NativeForkStage::Publish, e));
                 }
-                return Err(abandon_loan(
-                    &loan,
-                    Some(live),
+                return Err(abandon_root(
                     refused(NativeForkStage::Publish, e),
+                    Some(live),
                 ));
             }
         };

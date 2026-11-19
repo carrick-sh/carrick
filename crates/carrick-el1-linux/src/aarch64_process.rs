@@ -38,6 +38,7 @@ use super::native_process_runtime::{
     NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
     NativeProcessService,
 };
+use super::retired_spaces::retire_closed_space;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use carrick_el1::memory::reservations;
 use carrick_el1::memory::reservations::{NativeReservationGeometry, SharedReservations};
@@ -2298,12 +2299,20 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 refused(NativeForkStage::PublishRoot, e),
             ));
         }
+        let abandon_root = |error, scrub| {
+            if retire_closed_space(&owner, loan.request.child_mm, self.worker()).is_err() {
+                // The root or its release owner is still live. Keep the stock
+                // loan quarantined with it rather than making either reusable.
+                NativeProcessError::Quarantined
+            } else {
+                abandon_loan(&self.crossing, self.worker(), &loan, scrub, error)
+            }
+        };
         let scratch =
             match super::native_fork_refusal::fork_scratch(loan.request, mappings.len(), &count) {
                 Ok(scratch) => scratch,
                 Err(e) => {
-                    owner.spaces.free(index);
-                    return Err(abandon_loan(&self.crossing, self.worker(), &loan, None, e));
+                    return Err(abandon_root(e, None));
                 }
             };
         let plan = match owner.prepare_fork(loan.request, scratch, &*live, self.worker()) {
@@ -2338,44 +2347,29 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 };
                 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
                 let alias = None;
-                owner.spaces.free(index);
-                return Err(abandon_loan(
-                    &self.crossing,
-                    self.worker(),
-                    &loan,
-                    None,
+                return Err(abandon_root(
                     super::native_fork_refusal::refused_prepare(e, &loan.request, alias),
+                    None,
                 ));
             }
         };
         let mut custody = Vec::new();
         if custody.try_reserve_exact(plan.custody().len()).is_err() {
-            owner.spaces.free(index);
-            return Err(abandon_loan(
-                &self.crossing,
-                self.worker(),
-                &loan,
-                None,
-                NativeProcessError::Exhausted,
-            ));
+            return Err(abandon_root(NativeProcessError::Exhausted, None));
         }
         custody.extend_from_slice(plan.custody());
         let mut child = match owner.publish_fork(plan, &*live, self.worker()) {
             Ok(child) => child,
             Err(e) => {
-                owner.spaces.free(index);
                 // `Core`: the publish's own rollback failed, so the parent
                 // may still link a loaned page and the loan stays pending.
                 // A broken invariant: the fork entry ends the run on it.
                 if matches!(e, carrick_core::mm::transaction::MmError::Core) {
                     return Err(refused(NativeForkStage::Publish, e));
                 }
-                return Err(abandon_loan(
-                    &self.crossing,
-                    self.worker(),
-                    &loan,
-                    Some(&*live),
+                return Err(abandon_root(
                     refused(NativeForkStage::Publish, e),
+                    Some(&*live),
                 ));
             }
         };
