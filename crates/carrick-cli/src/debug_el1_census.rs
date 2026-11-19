@@ -4,12 +4,17 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-fn collect(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+/// Open a user-specified diagnostic input directory.
+pub(crate) fn collect(directory: &Path) -> Result<std::fs::ReadDir> {
+    std::fs::read_dir(directory)
+        .with_context(|| format!("read census directory {}", directory.display()))
+}
+
+fn collect_json(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for input in inputs {
         if input.is_dir() {
-            let mut entries: Vec<PathBuf> = std::fs::read_dir(input)
-                .with_context(|| format!("read census directory {}", input.display()))?
+            let mut entries: Vec<PathBuf> = collect(input)?
                 .filter_map(|entry| entry.ok().map(|e| e.path()))
                 .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
                 .collect();
@@ -95,7 +100,7 @@ pub(crate) fn run_el1_census(
     json: bool,
     results: Option<&Path>,
 ) -> Result<()> {
-    let files = collect(inputs)?;
+    let files = collect_json(inputs)?;
     if let Some(results) = results {
         return per_suite(&files, results, limit);
     }

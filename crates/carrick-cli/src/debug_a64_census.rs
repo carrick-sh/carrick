@@ -275,14 +275,16 @@ impl Census {
 }
 
 pub(crate) fn run(input: Option<&Path>, strict: bool, output: Option<&Path>) -> Result<()> {
+    let read =
+        |path: &Path| std::fs::read(path).with_context(|| format!("read {}", path.display()));
     if let Some(root) = input.filter(|path| path.is_dir()) {
         ensure!(output.is_none(), "loader span export requires an EL1 image");
-        return rootfs_census(root, strict);
+        return rootfs_census(root, strict, read);
     }
 
     let mut census = Census::default();
     let bytes = if let Some(path) = input {
-        std::fs::read(path).with_context(|| format!("read {}", path.display()))?
+        read(path)?
     } else {
         carrick_el1_image::IMAGE.to_vec()
     };
@@ -317,14 +319,14 @@ pub(crate) fn run(input: Option<&Path>, strict: bool, output: Option<&Path>) -> 
 /// Rootfs mode measures stripped binaries too. Executable segments can
 /// contain padding, ELF headers and literal data, so the raw word population
 /// is an upper bound on static instruction gaps.
-fn rootfs_census(root: &Path, strict: bool) -> Result<()> {
+fn rootfs_census(root: &Path, strict: bool, read: impl Fn(&Path) -> Result<Vec<u8>>) -> Result<()> {
     let mut candidates = Vec::new();
     find_user_binaries(root, &mut candidates)?;
     candidates.sort_unstable();
     let mut files = Vec::new();
     let mut total_gaps = 0;
     for path in candidates {
-        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let bytes = read(&path)?;
         if !bytes.starts_with(b"\x7fELF") {
             continue;
         }
@@ -390,9 +392,7 @@ fn rootfs_census(root: &Path, strict: bool) -> Result<()> {
 }
 
 fn find_user_binaries(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in
-        std::fs::read_dir(directory).with_context(|| format!("scan {}", directory.display()))?
-    {
+    for entry in crate::debug_el1_census::collect(directory)? {
         let entry = entry?;
         let kind = entry.file_type()?;
         if kind.is_dir() {
