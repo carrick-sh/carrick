@@ -1280,6 +1280,149 @@ fn openat_through_absolute_dir_symlink_never_serves_the_host_path() {
     );
 }
 
+/// Dispatcher-level witness for the immutable-lower fast open path
+/// (`try_immutable_lower_absolute_open` -> `open_immutable_lower_readonly` ->
+/// `open_immutable_file_readonly`).
+///
+/// Using a real-directory `..` prefix (`/d/../...`) skips `try_dentry_fast_open`
+/// while entering `try_immutable_lower_absolute_open` directly. When the
+/// immutable lower has an ancestor symlink:
+/// 1. `/alias -> <lower_abs>/inner` with `/<lower_abs>/inner/sub/leak.txt` in
+///    the sparse upper,
+/// 2. chained relative symlinks `/a -> b/c`, `/b/c/d -> ../target`,
+///    `/b/target/sub/file.txt` in a single immutable lower, or
+/// 3. relative symlink `/jump -> real` with `/real/sub` in lower and
+///    upper-only / upper-shadowed files in upper,
+///
+/// `openat(AT_FDCWD, ..., O_RDONLY)` must never return a false `ENOENT` or
+/// serve a stale lower file; it must fall back and serve the exact guest bytes.
+#[test]
+fn openat_immutable_lower_serves_existing_files_through_ancestor_symlinks() {
+    use carrick_vfs::fs_backend::HostFsBackend;
+
+    const LINUX_O_RDONLY: u64 = 0;
+
+    let open_and_read = |dispatcher: &mut SyscallDispatcher, path: &str| -> Vec<u8> {
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        let mut path_c = path.as_bytes().to_vec();
+        path_c.push(0);
+        memory.write_bytes(0x4000, &path_c).unwrap();
+        let opened = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDONLY, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        let DispatchOutcome::Returned { value: fd } = opened else {
+            panic!("openat({path}) should succeed, got {opened:?}");
+        };
+        let read_out = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4400, 64, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        let DispatchOutcome::Returned { value: n } = read_out else {
+            panic!("read({path}) failed: {read_out:?}");
+        };
+        memory.read_bytes(0x4400, n as usize).unwrap()
+    };
+
+    let make_dispatcher = |lower: &std::path::Path, upper: &std::path::Path| {
+        let rootfs = RootFs::from_immutable_host_dir(lower).unwrap();
+        let mut overlay = HostFsBackend::from_path(upper).unwrap();
+        overlay.enable_sparse_upper_fast_miss();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(overlay));
+        dispatcher.set_rootfs_layer(rootfs);
+        dispatcher
+    };
+
+    // Shape 1: `/alias -> <lower_abs>/inner` in lower, file in sparse upper.
+    {
+        let lower = tempfile::TempDir::new().unwrap();
+        let upper = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(lower.path().join("d")).unwrap();
+        std::fs::create_dir_all(lower.path().join("inner/sub")).unwrap();
+        let lower_abs = std::fs::canonicalize(lower.path()).unwrap();
+        std::os::unix::fs::symlink(lower_abs.join("inner"), lower.path().join("alias")).unwrap();
+        let upper_target_dir = upper
+            .path()
+            .join(lower_abs.strip_prefix("/").unwrap())
+            .join("inner/sub");
+        std::fs::create_dir_all(&upper_target_dir).unwrap();
+        std::fs::write(upper_target_dir.join("leak.txt"), b"upper bytes").unwrap();
+
+        let mut dispatcher = make_dispatcher(lower.path(), upper.path());
+        assert_eq!(
+            open_and_read(&mut dispatcher, "/d/../alias/sub/leak.txt"),
+            b"upper bytes"
+        );
+    }
+
+    // Shape 2: chained relative symlinks in a single immutable lower (empty upper).
+    {
+        let lower = tempfile::TempDir::new().unwrap();
+        let upper = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(lower.path().join("d")).unwrap();
+        std::fs::create_dir_all(lower.path().join("b/c")).unwrap();
+        std::fs::create_dir_all(lower.path().join("b/target/sub")).unwrap();
+        std::fs::write(
+            lower.path().join("b/target/sub/file.txt"),
+            b"chained target bytes",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("b/c", lower.path().join("a")).unwrap();
+        std::os::unix::fs::symlink("../target", lower.path().join("b/c/d")).unwrap();
+
+        let mut dispatcher = make_dispatcher(lower.path(), upper.path());
+        assert_eq!(
+            open_and_read(&mut dispatcher, "/d/../a/d/sub/file.txt"),
+            b"chained target bytes"
+        );
+    }
+
+    // Shape 3: relative lower symlink `/jump -> real` with upper-only and
+    // upper-shadowed files under `/real/sub`.
+    {
+        let lower = tempfile::TempDir::new().unwrap();
+        let upper = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(lower.path().join("d")).unwrap();
+        std::fs::create_dir_all(lower.path().join("real/sub")).unwrap();
+        std::fs::write(lower.path().join("real/sub/shadowed.txt"), b"lower bytes").unwrap();
+        std::os::unix::fs::symlink("real", lower.path().join("jump")).unwrap();
+        std::fs::create_dir_all(upper.path().join("real/sub")).unwrap();
+        std::fs::write(
+            upper.path().join("real/sub/upper_only.txt"),
+            b"upper-only bytes",
+        )
+        .unwrap();
+        std::fs::write(
+            upper.path().join("real/sub/shadowed.txt"),
+            b"upper-shadow bytes",
+        )
+        .unwrap();
+
+        let mut dispatcher = make_dispatcher(lower.path(), upper.path());
+        assert_eq!(
+            open_and_read(&mut dispatcher, "/d/../jump/sub/upper_only.txt"),
+            b"upper-only bytes"
+        );
+        assert_eq!(
+            open_and_read(&mut dispatcher, "/d/../jump/sub/shadowed.txt"),
+            b"upper-shadow bytes"
+        );
+    }
+}
+
 #[test]
 fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
