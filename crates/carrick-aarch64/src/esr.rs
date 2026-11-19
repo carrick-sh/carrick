@@ -18,6 +18,86 @@ pub fn el0_debug_signal(esr: u64) -> Option<(i32, i32)> {
     }
 }
 
+pub const AARCH64_SYS64_EXCEPTION_CLASS: u64 = 0x18;
+const AARCH64_ESR_ISS_MASK: u64 = (1 << 25) - 1;
+const AARCH64_SYS64_ISS_DIR_READ: u64 = 0x1;
+pub const AARCH64_SYS64_ISS_RT_SHIFT: u64 = 5;
+const AARCH64_SYS64_ISS_RT_MASK: u64 = 0x1f << AARCH64_SYS64_ISS_RT_SHIFT;
+const AARCH64_SYS64_ISS_CRM_SHIFT: u64 = 1;
+const AARCH64_SYS64_ISS_CRM_MASK: u64 = 0xf << AARCH64_SYS64_ISS_CRM_SHIFT;
+const AARCH64_SYS64_ISS_CRN_SHIFT: u64 = 10;
+const AARCH64_SYS64_ISS_CRN_MASK: u64 = 0xf << AARCH64_SYS64_ISS_CRN_SHIFT;
+const AARCH64_SYS64_ISS_OP1_SHIFT: u64 = 14;
+const AARCH64_SYS64_ISS_OP1_MASK: u64 = 0x7 << AARCH64_SYS64_ISS_OP1_SHIFT;
+const AARCH64_SYS64_ISS_OP2_SHIFT: u64 = 17;
+const AARCH64_SYS64_ISS_OP2_MASK: u64 = 0x7 << AARCH64_SYS64_ISS_OP2_SHIFT;
+const AARCH64_SYS64_ISS_OP0_SHIFT: u64 = 20;
+const AARCH64_SYS64_ISS_OP0_MASK: u64 = 0x3 << AARCH64_SYS64_ISS_OP0_SHIFT;
+const AARCH64_SYS64_ISS_SYS_OP_MASK: u64 = AARCH64_SYS64_ISS_OP0_MASK
+    | AARCH64_SYS64_ISS_OP1_MASK
+    | AARCH64_SYS64_ISS_OP2_MASK
+    | AARCH64_SYS64_ISS_CRN_MASK
+    | AARCH64_SYS64_ISS_CRM_MASK
+    | AARCH64_SYS64_ISS_DIR_READ;
+
+const fn aarch64_sys64_iss_sys_val(op0: u64, op1: u64, op2: u64, crn: u64, crm: u64) -> u64 {
+    (op0 << AARCH64_SYS64_ISS_OP0_SHIFT)
+        | (op1 << AARCH64_SYS64_ISS_OP1_SHIFT)
+        | (op2 << AARCH64_SYS64_ISS_OP2_SHIFT)
+        | (crn << AARCH64_SYS64_ISS_CRN_SHIFT)
+        | (crm << AARCH64_SYS64_ISS_CRM_SHIFT)
+}
+
+pub const AARCH64_SYS64_ISS_SYS_CNTFRQ: u64 =
+    aarch64_sys64_iss_sys_val(3, 3, 0, 14, 0) | AARCH64_SYS64_ISS_DIR_READ;
+pub const AARCH64_SYS64_ISS_SYS_CNTVCT: u64 =
+    aarch64_sys64_iss_sys_val(3, 3, 2, 14, 0) | AARCH64_SYS64_ISS_DIR_READ;
+// CTR_EL0 (Cache Type Register) = op0=3 op1=3 CRn=0 CRm=0 op2=1; DCZID_EL0
+// (Data Cache Zero ID) = op0=3 op1=3 CRn=0 CRm=0 op2=7. glibc 2.41 (Debian
+// trixie / python:3.12-slim) reads CTR_EL0 at startup for the i/d cache line
+// sizes; without SCTLR_EL1.UCT that MRS traps to EL1 (EC=0x18) and, unemulated,
+// became a fatal SIGSEGV. We enable native EL0 access via SCTLR_EL1.UCT/DZE
+// (see trap.rs) AND keep these as the emulate fallback, mirroring CNTVCT.
+pub const AARCH64_SYS64_ISS_SYS_CTR: u64 =
+    aarch64_sys64_iss_sys_val(3, 3, 1, 0, 0) | AARCH64_SYS64_ISS_DIR_READ;
+pub const AARCH64_SYS64_ISS_SYS_DCZID: u64 =
+    aarch64_sys64_iss_sys_val(3, 3, 7, 0, 0) | AARCH64_SYS64_ISS_DIR_READ;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum El0SysRegRead {
+    CntfrqEl0,
+    CntvctEl0,
+    CtrEl0,
+    DczidEl0,
+}
+
+pub fn decode_el0_sys64_read(esr: u64) -> Option<(u8, El0SysRegRead)> {
+    if carrick_hal::aarch64::aarch64_exception_class(esr) != AARCH64_SYS64_EXCEPTION_CLASS {
+        return None;
+    }
+    let iss = esr & AARCH64_ESR_ISS_MASK;
+    let rt = ((iss & AARCH64_SYS64_ISS_RT_MASK) >> AARCH64_SYS64_ISS_RT_SHIFT) as u8;
+    let reg = match iss & AARCH64_SYS64_ISS_SYS_OP_MASK {
+        AARCH64_SYS64_ISS_SYS_CNTFRQ => El0SysRegRead::CntfrqEl0,
+        AARCH64_SYS64_ISS_SYS_CNTVCT => El0SysRegRead::CntvctEl0,
+        AARCH64_SYS64_ISS_SYS_CTR => El0SysRegRead::CtrEl0,
+        AARCH64_SYS64_ISS_SYS_DCZID => El0SysRegRead::DczidEl0,
+        _ => return None,
+    };
+    Some((rt, reg))
+}
+
+// ESR exception-class decode (svc/hvc/maintenance/syscall classifiers, the
+// SVC/HVC class consts, and ExecLevel) live in the shared carrick_hal::aarch64
+// module — imported above. This SHIFT is kept local only for the counter-trap
+// TESTS that synthesize an ESR syndrome (cntfrq/cntvct/dczid), so it is test-only.
+#[cfg(test)]
+const AARCH64_EXCEPTION_CLASS_SHIFT: u64 = 26;
+
+#[cfg(test)]
+#[path = "esr/tests/sys64.rs"]
+mod sys64_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
