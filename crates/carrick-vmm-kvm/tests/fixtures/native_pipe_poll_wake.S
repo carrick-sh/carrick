@@ -220,11 +220,44 @@ wait_for_child:
     jmp exit
 child:
 #ifdef USE_PSELECT
-    /* The test's stdout sink waits for the reader's real ring park. */
-    mov $1, %edi
-    lea byte(%rip), %rsi
-    mov $1, %edx
+    /* The host echoes only once the reader's select has parked. */
+    mov $2, %edi                  /* AF_INET */
+    mov $2, %esi                  /* SOCK_DGRAM */
+    xor %edx, %edx
+    mov $41, %eax
+    syscall
+    test %rax, %rax
+    js child_fail
+    mov %eax, %r13d
+    mov %r13d, %edi
+    lea select_gate_peer(%rip), %rsi
+    mov $16, %edx
+    mov $42, %eax                 /* connect */
+    syscall
+    test %rax, %rax
+    jnz child_fail
+    mov %r12d, reader_pid(%rip)
+    mov %r13d, %edi
+    lea reader_pid(%rip), %rsi
+    mov $4, %edx
     mov $1, %eax
+    syscall
+    cmp $4, %rax
+    jne child_fail
+    mov %r13d, pfd(%rip)
+    movw $1, pfd+4(%rip)
+    movw $0, pfd+6(%rip)
+    lea pfd(%rip), %rdi
+    mov $1, %esi
+    mov $8000, %edx               /* bound fixture cleanup */
+    mov $7, %eax
+    syscall
+    cmp $1, %rax
+    jne child_fail
+    mov %r13d, %edi
+    lea received(%rip), %rsi
+    mov $1, %edx
+    xor %eax, %eax
     syscall
     cmp $1, %rax
     jne child_fail
@@ -335,11 +368,19 @@ zero_ts: .quad 0, 0
 short_ts: .quad 0, 1000000
 long_ts: .quad 5, 0
 byte: .byte 'x'
+#ifdef USE_PSELECT
+.balign 8
+select_gate_peer:
+    .short 2, SELECT_GATE_PORT
+    .byte 127, 0, 0, 1
+    .quad 0
+#endif
 .bss
 .balign 4096
 fds: .space 8
 pfd: .space 8
 read_set: .space 8
+reader_pid: .space 4
 status: .space 8
 poll_result: .space 8
 received: .space 1

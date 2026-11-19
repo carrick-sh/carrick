@@ -768,6 +768,7 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::size_of::<IpcKindState>() as u64,
     KIND_FILE_LOCKS as u64,
     IpcOpKind::FileLockWait as u64,
+    IpcOpKind::SelectWait as u64,
     core::mem::offset_of!(IpcDirectory, file_locks) as u64,
     IPC_OFD_IDENTITIES_OFFSET as u64,
     IPC_FILE_LOCKS_OFFSET as u64,
@@ -841,6 +842,9 @@ pub enum IpcOpKind {
     /// from its original registers, and a signal interrupts it (restartable
     /// under `SA_RESTART`, signal(7)).
     FileLockWait = 11,
+    /// A single-description select wait. It shares the poll readiness owner,
+    /// but only its native syscall frame carries the output bitmap addresses.
+    SelectWait = 12,
 }
 
 impl IpcOpKind {

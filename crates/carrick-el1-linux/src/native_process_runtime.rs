@@ -9642,6 +9642,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         });
         self.finish_output_outcome(result)
     }
+    fn complete_copyout_spans(
+        &mut self,
+        spans: Vec<(UserVa, Vec<u8>)>,
+        result: SyscallResult,
+    ) -> LifecycleOutcome {
+        let result = self.finish_copyout(service::OwnedCopyout {
+            data: service::CopyoutData::Spans(spans),
+            offset: 0,
+            prefix_on_fault: false,
+            result,
+            effect: None,
+        });
+        self.finish_output_outcome(result)
+    }
     fn complete_poll_copyout(
         &mut self,
         fields: Vec<carrick_syscall_abi::PollReventsOutput>,
