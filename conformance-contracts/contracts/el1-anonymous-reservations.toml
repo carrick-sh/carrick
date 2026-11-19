@@ -12,6 +12,7 @@ guest_surfaces = [
 semantic_authority = [
   "committed arm64 memflagmatrix oracle: mmap protection bit 1<<28 is accepted; unrepresented EL1 protection bits retain host decoding",
   "man 2 mmap: MAP_PRIVATE | MAP_ANONYMOUS creates a zero-filled private mapping without file backing",
+  "man 2 mmap: an unusable advisory hint does not prevent a private anonymous allocation elsewhere",
   "man 2 mmap: MAP_FIXED / MAP_FIXED_NOREPLACE place or replace mappings at exact page-aligned addresses",
   "man 2 mmap: MAP_STACK is a hint for thread stacks with no effect on the mapping; Rust std maps its signal stack MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK",
   "man 2 brk: brk changes the location of the program break, allocating or releasing memory at the heap boundary",
@@ -44,6 +45,7 @@ vm_free = [
   "carrick-kernel::dispatch::mem::delegated_tests::{delegated_outside_hint_go_arena_fixed_subranges_keep_owner_authority,delegated_outside_hint_host_demotion_strips_outside_layout_provenance} (Go 64 MiB outside-layout arena reserve + MAP_FIXED sub-range commit/decommit/mprotect/munmap stays owner-admitted across both ISAs and host dispatch; host-served demotions strip PLACED_OUTSIDE_LAYOUT/IMAGE while preserving unclipped owner pieces)",
   "carrick-core::mm::reservation::root::tests::outside_layout_fixed_prepare_retains_owner_provenance_and_admitted_opaque_rejects_it (Prepare within PLACED_OUTSIDE_LAYOUT retains provenance, straddling or IMAGE Prepare forwards, and admitted insert_opaque still refuses PLACED_OUTSIDE_LAYOUT/IMAGE with Invalid)",
   "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::native_owner_noreserve_code_range_writes_and_executes (Linux x86_64 host: native process admission, full Linux dispatch, lazy 256 MiB reservation, resident RWX editor, validated physical backing and host-native generated-code execution; guest instruction execution remains signed-lane evidence)",
+  "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::native_fork_child_advisory_mmap_stays_in_ring (real forked MM and ARM entry, injected physical venue)",
   "carrick-el1::memory::tests::delegated::two_isa_noreserve_code_range_stays_owner_admitted (256 MiB lazy PROT_NONE to RWX subrange; no backing allocation or descriptor edit for untouched pages; instruction execution remains signed-lane evidence)",
   "carrick-core::mm::retirement::nonce_tests::release_record_pin_outcome_classifies_held_premapped_and_predecessor (last requested mapped pin yields neutral ReadyToRetry; premapped safe-point retirement and superseded predecessors retain their existing verdicts)",
   "carrick-thread::physical_retirement::tests (S2b exact-record completion enrollment, release-before-enrollment, identity/reuse control, cancellation, deferred callback publication, typed producer abandonment and revocation of captured callbacks; no native Pending ACK or service-budget claim)",
@@ -67,6 +69,7 @@ vm_free = [
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest",
+  "carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_advisory_mmap_stays_in_ring (live child mappings, protection edits and isolated stores with the parent alive)",
   "carrick-vmm-kvm::cpl0_initial_mm::production_full_owed_return_table_parks_on_its_busy_holder_until_release (#1482: 64 slots, eight busy holders, one doorbell and one park until release; zero reruns while held)",
   "carrick-vmm-kvm::cpl0_initial_mm::production_full_owed_return_table_reclaims_exited_fork_holders (#1482 P0-1: 64 owed-return slots held by eight killed and reaped fork children, no later fork; the parent's retirement must reclaim quarantine and finish within the existing exit budget; native Linux exits zero)",
   "carrick-vmm-kvm::cpl0_entry::production_anonymous_release_to_idle_peer_preserves_wake (real KVM pool, ordered remote synthetic holder release; one park, zero handbacks/forwards, exact exit 7)",
