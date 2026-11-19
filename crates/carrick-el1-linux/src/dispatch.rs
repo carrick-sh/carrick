@@ -8991,16 +8991,21 @@ mod tests {
             }
         }
         let task = CurrentTask::new();
-        let path = b"relative\0";
+        let empty = b"\0";
+        let ordinal = carrick_personality_linux::crossing::nr::FACCESSAT2.raw();
+        let index = ordinal as usize;
         for child in [false, true] {
             let counters = Counters::default();
             let mut frame = TrapFrame {
                 esr: 0x15 << 26,
                 ..TrapFrame::default()
             };
-            frame.x[8] = 56; // openat relative to a host directory
+            // Access by fd with AT_EMPTY_PATH is still unstaged.
+            frame.x[8] = ordinal;
             frame.x[0] = 3;
-            frame.x[1] = path.as_ptr().addr() as u64;
+            frame.x[1] = empty.as_ptr().addr() as u64;
+            frame.x[3] =
+                u64::from(carrick_personality_linux::native_host_file::LINUX_AT_EMPTY_PATH);
             let Some(HostFileStage::Returned(result)) = native_host_file_stage(
                 &frame,
                 &task,
@@ -9016,9 +9021,9 @@ mod tests {
                         access: DescriptionAccess::ReadWrite,
                     })
                 },
-                &mut |_| panic!("openat releases no mappings"),
+                &mut |_| panic!("faccessat2 releases no mappings"),
             ) else {
-                panic!("relative host-dirfd staging must refuse");
+                panic!("descriptor faccessat2 staging must refuse");
             };
             assert_eq!(
                 result.raw(),
@@ -9034,13 +9039,13 @@ mod tests {
                 result.raw()
             );
             let snapshot = counters.copy_snapshot();
-            assert_eq!(snapshot.refused[56].load(Ordering::Relaxed), 1);
+            assert_eq!(snapshot.refused[index].load(Ordering::Relaxed), 1);
             assert_eq!(
-                snapshot.refused_child[56].load(Ordering::Relaxed),
+                snapshot.refused_child[index].load(Ordering::Relaxed),
                 u64::from(child)
             );
-            assert_eq!(snapshot.venue_refused[56].load(Ordering::Relaxed), 0);
-            assert_eq!(snapshot.served[56].load(Ordering::Relaxed), 1);
+            assert_eq!(snapshot.venue_refused[index].load(Ordering::Relaxed), 0);
+            assert_eq!(snapshot.served[index].load(Ordering::Relaxed), 1);
             // Ordinary staging errors are answers, not refusals.
             native_host_file_return(
                 carrick_syscall_abi::LINUX_EBADF.guest_retval(),
@@ -9048,7 +9053,7 @@ mod tests {
                 &counters,
                 || child,
             );
-            assert_eq!(counters.refused[56].load(Ordering::Relaxed), 1);
+            assert_eq!(counters.refused[index].load(Ordering::Relaxed), 1);
         }
     }
 
