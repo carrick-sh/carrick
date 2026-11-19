@@ -140,6 +140,26 @@ const ELF_LOAD_VA: u64 = 0x400000;
 const X86_SYS_WRITE: u8 = 1;
 const X86_SYS_EXIT_GROUP: u8 = 231;
 
+#[test]
+fn serial_host_native_child_advisory_mmap_stays_in_ring() {
+    let elf = native_exit_fixture_with_flags("native_child_mmap_hint.S", &[]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 128, ROOT_AFFINITY_IDLE_PEER)
+        .expect("native fork and anonymous reservation");
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "child mmap errno or fixture stage"
+    );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    assert_eq!(
+        counters.refused[9].load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "x86 native mmap must not be refused"
+    );
+}
+
 // Production child entropy service, including CPL0 entry and host completion.
 #[test]
 fn serial_host_native_child_getrandom_default_returns_eight_bytes() {

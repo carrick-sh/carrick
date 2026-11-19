@@ -1449,8 +1449,18 @@ impl Fixture {
         file_table: u64,
         page: &'static ThreadLifecyclePage,
     ) -> Self {
+        Self::with_page_and_arena(root_gpa, asid, file_table, page, 0x1000_0000)
+    }
+
+    fn with_page_and_arena(
+        root_gpa: u64,
+        asid: carrick_guest_arch::Asid,
+        file_table: u64,
+        page: &'static ThreadLifecyclePage,
+        arena_len: u64,
+    ) -> Self {
         let control = Box::leak(Box::new(ThreadControlSlot::new()));
-        Self::with_identity(
+        Self::with_identity_and_arena(
             root_gpa,
             asid,
             page,
@@ -1466,6 +1476,7 @@ impl Fixture {
                 lifecycle_page: page as *const _ as u64,
                 control_slot: control as *const _ as u64,
             },
+            arena_len,
         )
     }
     fn with_identity(

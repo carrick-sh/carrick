@@ -274,6 +274,7 @@ enum GroupExitCaller {
 #[derive(Clone, Copy, PartialEq)]
 enum ChildStockCase {
     FirstBirth,
+    AdvisoryMmap,
     Reuse,
     Pinned,
     Claimed,
@@ -282,8 +283,25 @@ enum ChildStockCase {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[test]
+fn native_fork_child_advisory_mmap_stays_in_ring() {
+    child_thread_admission(0, 0, ChildStockCase::AdvisoryMmap);
+}
+
+#[cfg(not(target_os = "macos"))]
 fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
-    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    const LENGTH: u64 = 256 * 1024 * 1024;
+    let fixture = Box::leak(Box::new(if case == ChildStockCase::AdvisoryMmap {
+        Fixture::with_page_and_arena(
+            0x10000,
+            asid(1),
+            5,
+            Box::leak(Box::new(ThreadLifecyclePage::new())),
+            LENGTH * 2 + 8192,
+        )
+    } else {
+        Fixture::new(0x10000, asid(1))
+    }));
     let metadata_scope = MetadataScope::new(fixture);
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -291,7 +309,10 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
     crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
-    if case != ChildStockCase::FirstBirth {
+    if !matches!(
+        case,
+        ChildStockCase::FirstBirth | ChildStockCase::AdvisoryMmap
+    ) {
         let mut physical = super::native_retirement_tests::PhysicalStock::new(&fixture.tables);
         physical.metadata_in_el1_window = true;
         physical.bind_lane(
@@ -370,6 +391,56 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     ));
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
     let residency = carrick_el1::cow::test_support::residency_table();
+    if case == ChildStockCase::AdvisoryMmap {
+        let mut editor = FixtureMapping {
+            words,
+            residency: &residency,
+        };
+        let mut call = |nr, args: [u64; 6]| {
+            let mut invocation = carrick_el1::memory::AnonymousCall::new(
+                carrick_core::CallOrdinal::from_raw(nr),
+                args,
+                0,
+                fixture.slot,
+                UserVa::new(0x40004),
+            );
+            let mut venue = FixtureAnonymousVenue {
+                call: &mut invocation,
+                fixture,
+                counters: &counters,
+                editor: &mut editor,
+            };
+            frame.x[8] = nr;
+            frame.x[..6].copy_from_slice(&args);
+            let route = loan_call_with_anonymous(
+                fixture,
+                &fixture.task,
+                &mut frame,
+                &mut cpu,
+                &mut service,
+                &counters,
+                Some(&mut venue),
+            );
+            assert_eq!(counters.forwarded[nr as usize].load(Ordering::Relaxed), 0);
+            assert_eq!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::Served
+            );
+            frame.x[0] as i64
+        };
+        for hint in [0x10000000, 0x200000000, 0x1000000000000000, 0] {
+            let mapped = call(222, [hint, LENGTH, 0, 0x4022, u64::MAX, 0]);
+            assert!(
+                mapped > 0 && mapped % 4096 == 0,
+                "mmap hint {hint:#x}: {mapped}"
+            );
+            assert_eq!(call(226, [mapped as u64, 4096, 3, 0, 0, 0]), 0);
+            assert_eq!(call(226, [mapped as u64, 4096, 5, 0, 0, 0]), 0);
+            assert_eq!(call(215, [mapped as u64, LENGTH, 0, 0, 0, 0]), 0);
+        }
+        assert!(fixture.zone.space_entry(NonZeroU64::MIN).is_some());
+        return;
+    }
     for (nr, args, expected) in [
         (214, [5120, 0, 0, 0, 0, 0], 5120),
         (222, [0, 0x10000, 3, 0x22, u64::MAX, 0], VA + 8192),
@@ -1056,6 +1127,64 @@ impl crate::thread_setup::LifecycleVenue for LoanLifecycle {
 }
 
 #[cfg(not(target_os = "macos"))]
+struct FixtureAnonymousVenue<'a, 'words> {
+    call: &'a mut carrick_el1::memory::AnonymousCall,
+    fixture: &'static Fixture,
+    counters: &'a carrick_el1_abi::Counters,
+    editor: &'a mut FixtureMapping<'words>,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
+    for FixtureAnonymousVenue<'_, '_>
+{
+    fn original_argument0(&self) -> u64 {
+        use carrick_el1::memory::AnonymousCallView;
+        self.call.arguments()[0]
+    }
+
+    fn task_state(&self) -> Option<&carrick_personality_linux::abi::entry::LinuxTaskState> {
+        Some(&self.fixture.task.linux)
+    }
+
+    fn delegated(&mut self) -> carrick_personality_linux::pending_anonymous::DelegatedStep {
+        use carrick_el1::memory::{AnonymousCallView, DelegatedAnonymous};
+        use carrick_personality_linux::{
+            abi::entry::SyscallResult, pending_anonymous::DelegatedStep,
+        };
+        match carrick_el1::memory::serve_delegated_mapping(
+            self.call,
+            self.counters,
+            &self.fixture.task,
+            crate::sched::object_wait::space_access(self.fixture.zone, self.fixture.slot),
+            self.fixture.region.table(),
+            self.editor,
+            None,
+        ) {
+            DelegatedAnonymous::Served => {
+                DelegatedStep::Served(SyscallResult::new(self.call.result().0 as i64))
+            }
+            DelegatedAnonymous::Forward => DelegatedStep::Forward,
+            other => panic!("unexpected delegated mmap outcome: {other:?}"),
+        }
+    }
+
+    fn park_prepared(&mut self) -> Option<carrick_personality_linux::dispatch::FamilyCompletion> {
+        None
+    }
+
+    fn permission(&mut self) -> carrick_personality_linux::pending_anonymous::PermissionStep {
+        panic!("legacy permission")
+    }
+
+    fn retirement(&mut self) -> carrick_personality_linux::pending_anonymous::RetirementStep {
+        panic!("legacy retirement")
+    }
+
+    fn install_result(&mut self, _: carrick_personality_linux::abi::entry::SyscallResult) {}
+}
+
+#[cfg(not(target_os = "macos"))]
 fn loan_call(
     fixture: &'static Fixture,
     frame: &mut carrick_el1_abi::TrapFrame,
@@ -1074,6 +1203,19 @@ fn loan_call_for_task(
     cpu: &mut crate::sched::FakeCpu,
     service: &mut Aarch64NativeProcessService<'static, &'static TestStockCrossing>,
     counters: &carrick_el1_abi::Counters,
+) -> carrick_personality_linux::dispatch::CompletionRoute {
+    loan_call_with_anonymous(fixture, task, frame, cpu, service, counters, None)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn loan_call_with_anonymous(
+    fixture: &'static Fixture,
+    task: &'static CurrentTask,
+    frame: &mut carrick_el1_abi::TrapFrame,
+    cpu: &mut crate::sched::FakeCpu,
+    service: &mut Aarch64NativeProcessService<'static, &'static TestStockCrossing>,
+    counters: &carrick_el1_abi::Counters,
+    anonymous: Option<&mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue>,
 ) -> carrick_personality_linux::dispatch::CompletionRoute {
     let current = fixture.zone.slot(fixture.slot).current().unwrap();
     let identity = fixture.zone.record(current).identity();
@@ -1143,7 +1285,7 @@ fn loan_call_for_task(
                     zone: fixture.zone,
                     slot: fixture.slot,
                 }),
-                None,
+                anonymous,
                 |_| core::ptr::null_mut(),
             );
             assert!(
@@ -5343,7 +5485,7 @@ fn native_owner_whole_code_range_writes_and_executes() {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn native_owner_code_range(whole: bool) {
-    use carrick_el1::memory::{AnonymousCall, AnonymousCallView, DelegatedAnonymous};
+    use carrick_el1::memory::AnonymousCall;
     use carrick_el1_abi::{Counters, InotifyNameCache, ReservationRange, TrapFrame};
     use carrick_mmu_core::aarch64::descriptor_txn::{
         BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
@@ -5352,56 +5494,7 @@ fn native_owner_code_range(whole: bool) {
     use carrick_mmu_core::aarch64::{
         GuestLeafPublication, LeafAccess, SubstrateGpa, terminal_descriptor_permits_el0,
     };
-    use carrick_personality_linux::abi::entry::{LinuxTaskState, SyscallResult};
-    use carrick_personality_linux::dispatch::{CompletionRoute, FamilyCompletion};
-    use carrick_personality_linux::pending_anonymous::{
-        DelegatedStep, PendingAnonymousVenue, PermissionStep, RetirementStep,
-    };
-
-    // The injected venue is physical test scaffolding. Decoding, admission,
-    // proposal, descriptor edits, completion and accounting remain production.
-    struct Venue<'a> {
-        call: AnonymousCall,
-        fixture: &'static Fixture,
-        counters: &'a Counters,
-        editor: FixtureMapping<'a>,
-    }
-    impl PendingAnonymousVenue for Venue<'_> {
-        fn original_argument0(&self) -> u64 {
-            self.call.arguments()[0]
-        }
-        fn task_state(&self) -> Option<&LinuxTaskState> {
-            Some(&self.fixture.task.linux)
-        }
-        fn delegated(&mut self) -> DelegatedStep {
-            match carrick_el1::memory::serve_delegated_mapping(
-                &mut self.call,
-                self.counters,
-                &self.fixture.task,
-                crate::sched::object_wait::space_access(self.fixture.zone, self.fixture.slot),
-                self.fixture.region.table(),
-                &mut self.editor,
-                None,
-            ) {
-                DelegatedAnonymous::Served => {
-                    DelegatedStep::Served(SyscallResult::new(self.call.result().0 as i64))
-                }
-                other => panic!("owner-admitted native mapping left its owner: {other:?}"),
-            }
-        }
-        fn park_prepared(&mut self) -> Option<FamilyCompletion> {
-            None // No retained prepared edit in this uncontended fixture.
-        }
-        fn permission(&mut self) -> PermissionStep {
-            panic!("legacy protection path")
-        }
-        fn retirement(&mut self) -> RetirementStep {
-            panic!("legacy retirement path")
-        }
-        fn install_result(&mut self, _: SyscallResult) {
-            panic!("delegated result")
-        }
-    }
+    use carrick_personality_linux::dispatch::CompletionRoute;
 
     const LENGTH: u64 = 256 * 1024 * 1024;
     const START: u64 = VA + 8192;
@@ -5435,20 +5528,22 @@ fn native_owner_code_range(whole: bool) {
         let mut frame = TrapFrame::default();
         frame.x[8] = nr;
         frame.x[..6].copy_from_slice(&args);
-        let mut venue = Venue {
-            call: AnonymousCall::new(
-                carrick_core::CallOrdinal::from_raw(nr),
-                args,
-                0,
-                fixture.slot,
-                UserVa::new(0x40004),
-            ),
+        let mut call = AnonymousCall::new(
+            carrick_core::CallOrdinal::from_raw(nr),
+            args,
+            0,
+            fixture.slot,
+            UserVa::new(0x40004),
+        );
+        let mut editor = FixtureMapping {
+            words: &words,
+            residency: &residency,
+        };
+        let mut venue = FixtureAnonymousVenue {
+            call: &mut call,
             fixture,
             counters: &counters,
-            editor: FixtureMapping {
-                words: &words,
-                residency: &residency,
-            },
+            editor: &mut editor,
         };
         let before = counters.served[nr as usize].load(Ordering::Relaxed);
         let route = fixture
