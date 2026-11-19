@@ -1078,9 +1078,15 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                                         .into(),
                                 )
                             });
-                            let publication = dispatcher.published_frame_grant_plan(
+                            let publication = dispatcher
+                                .published_frame_grant_plan(
                                     &permit, original, residency_identity, protection, &verified,
-                                ).unwrap_or_else(|refusal| { fail_publication(format!("applied descriptor cannot settle faulting page at 0x{address:x}: {refusal:?}")) });
+                                )
+                                .unwrap_or_else(|refusal| {
+                                    fail_publication(format!(
+                                        "applied descriptor cannot settle faulting page at 0x{address:x}: {refusal:?}"
+                                    ))
+                                });
                             *settled_plan.borrow_mut() = Some(publication);
                             Ok(true)
                         }
@@ -1103,7 +1109,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     }
                 };
                 let completed = mailbox
-                    .complete_grant(
+                    .complete_grant_with_outcome(
                         carrick_el1_abi::FrameGrantReady {
                             mm_key: request.mm_key,
                             request_generation: request.request_generation,
