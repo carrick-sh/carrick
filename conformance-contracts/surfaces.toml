@@ -1201,6 +1201,7 @@ surfaces = [
   # Copy-through exit handlers for the test-only arm64 lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.stage1-tlb" },
+  { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "softcpu.a64.el0-fp" },
   # Typed A64 census and instruction decoder for the test-only soft-CPU lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/lib.rs", contract = "softcpu.a64.el0-fp" },
   # Stage-1 translation of handler accesses and block fetch for the test-only arm64 lane (#2480).

@@ -13,6 +13,8 @@ rationale = "Allocated register-only instructions remain one native word within 
 [bindings]
 vm_free = [
   "carrick-softcpu-aarch64::el0_fp::scalar_fp_is_copied_only_for_allocated_single_and_double_encodings",
+  "carrick-softcpu-aarch64::el0_fp::vector_integer_fp_permute_and_table_admit_only_allocated_forms",
+  "carrick-softcpu-aarch64::handler::simd_structures_interleave_replicate_and_commit_only_after_read",
 ]
 
 [bindings.unresolved]

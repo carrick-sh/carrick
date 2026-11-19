@@ -104,7 +104,9 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
         | Instruction::UnprivilegedMemory(_)
         | Instruction::PairMemory(_)
         | Instruction::AtomicTransfer(_)
-        | Instruction::AtomicAdd(_) => InstructionClass::Exit(ExitReason::Memory),
+        | Instruction::AtomicAdd(_)
+        | Instruction::StructureMemory(_)
+        | Instruction::Prefetch => InstructionClass::Exit(ExitReason::Memory),
         Instruction::SystemAccess(_) => InstructionClass::Exit(ExitReason::SystemRegister),
         Instruction::PstateImmediate(_) => InstructionClass::Exit(ExitReason::Pstate),
         Instruction::SystemOperation(_)
