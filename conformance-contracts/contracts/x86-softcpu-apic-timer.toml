@@ -8,7 +8,7 @@ semantic_authority = [
 ]
 fixture = "carrick-softcpu-x86::softcpu_apic_timer"
 scale_points = [1, 1000, 1000000000]
-rationale = "A periodic timer coalesces missed expirations into one pending vector and computes the next deadline arithmetically, independent of elapsed periods. HLT retains its parked state until an interrupt; waits share the clock used by RDTSC and account for guest TSC writes. The two live CPU fixture sends one ping and one pong through guest MMIO, observes ISR before and after EOI, and resumes both CPUs after HLT. For illegal vectors and IRR blocked by IF, TPR or PPR, the HLT witness permits zero host exits while parked across three successive wait enrollments; only a fresh notification releases each wait. The production soft carrier uses host monotonic time with an executed-block progress floor, bounding host monotonic advance across an active block-execution loop to the retired block floor so host translation and scheduling stalls cannot expire a slice or retry deadline before user instructions retire, while parked HLT waits and stopped intervals advance at full host monotonic rate. A native child requesting a 200 ms ring nanosleep must spend at least 190 ms between host-observed markers. The two-live raw-exit fixture requires both joins and successful exit within the existing four-million-block ceiling."
+rationale = "A periodic timer coalesces missed expirations into one pending vector and computes the next deadline arithmetically, independent of elapsed periods. HLT retains its parked state until an interrupt; waits share the clock used by RDTSC and account for guest TSC writes. The two live CPU fixture sends one ping and one pong through guest MMIO, observes ISR before and after EOI, and resumes both CPUs after HLT. For illegal vectors and IRR blocked by IF, TPR or PPR, the HLT witness permits zero host exits while parked across three successive wait enrollments; only a fresh notification releases each wait. The production soft carrier uses host monotonic time with an executed-block progress floor. A native child requesting a 200 ms ring nanosleep must spend at least 190 ms between host-observed markers. The two-live raw-exit fixture requires both joins and successful exit within the existing four-million-block ceiling."
 
 [[structural_budgets]]
 kind = "upper-bound"
@@ -41,7 +41,6 @@ vm_free = [
   "carrick-softcpu-x86::softcpu_apic_timer::wide_apic_sse_page_crossing_is_gp",
   "carrick-softcpu-x86::softcpu_apic_timer::deadline_written_at_reset_is_ignored",
   "carrick-softcpu-x86::softcpu_apic_timer::deadline_passed_before_enrolment_returns_without_parking",
-  "carrick-softcpu-x86::softcpu_apic_timer::execution_loop_bounds_host_stall_while_hlt_still_waits_on_host",
   "carrick-vmm-soft::soft_hello::production_ring_nanosleep_waits_on_host",
   "carrick-vmm-soft::soft_hello::production_ring_non_last_threads_raw_exit",
   "carrick-vmm-soft::soft_hello::production_ring_slice_starts_after_cpl0_return_preparation",
