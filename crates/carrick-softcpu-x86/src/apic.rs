@@ -436,7 +436,9 @@ pub struct ApicNode {
     priority: AtomicU8,
     ldr: AtomicU32,
     dfr: AtomicU32,
-    irr: [AtomicU32; 8],
+    // Each guest IRR word has external requests in bits 31:0 and timer
+    // requests in bits 63:32. The architectural register merges the sources.
+    irr: [AtomicU64; 8],
     esr_pending: AtomicU32,
     kick_flag: AtomicBool,
     wait_lock: Mutex<u64>,
@@ -463,16 +465,7 @@ impl ApicNode {
             priority: AtomicU8::new(0),
             ldr: AtomicU32::new(0),
             dfr: AtomicU32::new(0xffff_ffff),
-            irr: [
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-            ],
+            irr: [const { AtomicU64::new(0) }; 8],
             esr_pending: AtomicU32::new(0),
             kick_flag: AtomicBool::new(false),
             wait_lock: Mutex::new(0),
@@ -496,6 +489,10 @@ impl ApicNode {
     ///
     /// Returns `true` if the vector was accepted into `IRR` (`SVR[8] == 1` and `vector >= 16`).
     pub fn inject_interrupt(&self, vector: u8) -> bool {
+        self.latch_interrupt(vector, false)
+    }
+
+    fn latch_interrupt(&self, vector: u8, timer: bool) -> bool {
         if !self.software_enabled() {
             return false;
         }
@@ -506,8 +503,8 @@ impl ApicNode {
             return false;
         }
         let word = usize::from(vector >> 5);
-        let mask = 1u32 << (vector & 31);
-        self.irr[word].fetch_or(mask, Ordering::AcqRel);
+        let bit = (vector & 31) + if timer { 32 } else { 0 };
+        self.irr[word].fetch_or(1u64 << bit, Ordering::AcqRel);
         self.kick();
         true
     }
@@ -549,8 +546,22 @@ impl ApicNode {
     /// Returns the highest-priority pending vector in `IRR` (`16..=255`), if any.
     #[must_use]
     pub fn highest_irr_vector(&self) -> Option<u8> {
+        self.highest_eligible_irr_vector(true)
+    }
+
+    fn irr_word(&self, idx: usize, include_timer: bool) -> u32 {
+        let sources = self.irr[idx].load(Ordering::Acquire);
+        sources as u32
+            | if include_timer {
+                (sources >> 32) as u32
+            } else {
+                0
+            }
+    }
+
+    fn highest_eligible_irr_vector(&self, include_timer: bool) -> Option<u8> {
         for idx in (0..8).rev() {
-            let word = self.irr[idx].load(Ordering::Acquire);
+            let word = self.irr_word(idx, include_timer);
             if word != 0 {
                 let bit = 31 - word.leading_zeros();
                 let vec = u8::try_from(idx * 32 + bit as usize).unwrap_or(0);
@@ -984,7 +995,7 @@ impl LocalApic {
     pub fn irr_bit(&self, vector: u8) -> bool {
         let word = usize::from(vector >> 5);
         let mask = 1u32 << (vector & 31);
-        (self.node.irr[word].load(Ordering::Acquire) & mask) != 0
+        (self.node.irr_word(word, true) & mask) != 0
     }
 
     /// Returns `true` if the `vector` bit is set in `ISR`.
@@ -1057,16 +1068,26 @@ impl LocalApic {
 
     /// Accepts the highest-priority deliverable interrupt from `IRR`, moving it to `ISR`.
     pub fn accept_interrupt(&mut self, apic_hw_enabled: bool) -> Option<u8> {
+        self.accept_eligible_interrupt(apic_hw_enabled, true)
+    }
+
+    pub(crate) fn accept_eligible_interrupt(
+        &mut self,
+        apic_hw_enabled: bool,
+        include_timer: bool,
+    ) -> Option<u8> {
         if !apic_hw_enabled || !self.software_enabled() {
             return None;
         }
-        let vec = self.highest_irr_vector()?;
+        let vec = self.node.highest_eligible_irr_vector(include_timer)?;
         if (vec >> 4) <= (self.ppr() >> 4) {
             return None;
         }
         let word = usize::from(vec >> 5);
         let mask = 1u32 << (vec & 31);
-        self.node.irr[word].fetch_and(!mask, Ordering::AcqRel);
+        // A fixed interrupt and a timer with the same vector share one IRR bit.
+        let both_sources = (u64::from(mask) << 32) | u64::from(mask);
+        self.node.irr[word].fetch_and(!both_sources, Ordering::AcqRel);
         self.isr[word] |= mask;
         self.node.priority.store(self.ppr(), Ordering::Release);
         self.delivered_count = self.delivered_count.saturating_add(1);
@@ -1119,24 +1140,12 @@ impl LocalApic {
                 }
                 // Disarm IA32_TSC_DEADLINE upon expiration per SDM Vol. 3A §10.5.4.1.
                 *tsc_deadline_msr = 0;
-                self.timer_fire_count = self.timer_fire_count.saturating_add(1);
-                if self.software_enabled() && (self.lvt_timer & LAPIC_LVT_MASKED) == 0 {
-                    let vector = (self.lvt_timer & 0xff) as u8;
-                    self.node.inject_interrupt(vector);
-                }
-                true
             }
             LapicTimerMode::OneShot => {
                 if !self.timer_armed || now_tsc < self.timer_target_tsc {
                     return false;
                 }
                 self.timer_armed = false;
-                self.timer_fire_count = self.timer_fire_count.saturating_add(1);
-                if self.software_enabled() && (self.lvt_timer & LAPIC_LVT_MASKED) == 0 {
-                    let vector = (self.lvt_timer & 0xff) as u8;
-                    self.node.inject_interrupt(vector);
-                }
-                true
             }
             LapicTimerMode::Periodic => {
                 if !self.timer_armed || now_tsc < self.timer_target_tsc {
@@ -1149,15 +1158,14 @@ impl LocalApic {
                 self.timer_target_tsc = self
                     .timer_target_tsc
                     .saturating_add(periods.saturating_mul(period));
-                self.timer_fire_count = self.timer_fire_count.saturating_add(1);
-                if self.software_enabled() && (self.lvt_timer & LAPIC_LVT_MASKED) == 0 {
-                    let vector = (self.lvt_timer & 0xff) as u8;
-                    self.node.inject_interrupt(vector);
-                }
-                true
             }
-            LapicTimerMode::Reserved => false,
+            LapicTimerMode::Reserved => return false,
         }
+        self.timer_fire_count = self.timer_fire_count.saturating_add(1);
+        if (self.lvt_timer & LAPIC_LVT_MASKED) == 0 {
+            self.node.latch_interrupt(self.lvt_timer as u8, true);
+        }
+        true
     }
 
     #[must_use]
@@ -1236,7 +1244,7 @@ impl LocalApic {
             }
             offset if (0x200..=0x270).contains(&offset) && (offset & 0x0f) == 0 => {
                 let idx = usize::from((offset - LAPIC_IRR_BASE_OFFSET) >> 4);
-                self.node.irr[idx].load(Ordering::Acquire)
+                self.node.irr_word(idx, true)
             }
             LAPIC_ESR_OFFSET => self.esr | self.esr_write_pending,
             LAPIC_LVT_CMCI_OFFSET => self.lvt_cmci,
