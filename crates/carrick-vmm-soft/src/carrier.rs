@@ -171,7 +171,7 @@ struct ObservedThread {
 }
 
 impl ObservedThread {
-    fn read(task: &CurrentTask) -> Self {
+    fn from_current_task(task: &CurrentTask) -> Self {
         Self {
             task: task.execution.task.load(Ordering::Acquire),
             generation: task.mm.thread_generation.load(Ordering::Acquire),
@@ -292,7 +292,7 @@ impl FixtureTrace {
         if cpl == 3
             && let Some(task) = task
         {
-            let thread = ObservedThread::read(task);
+            let thread = ObservedThread::from_current_task(task);
             if self.current_thread != Some(thread) {
                 self.flush_user_blocks();
                 self.current_thread = Some(thread);
@@ -404,7 +404,7 @@ impl SoftRunner {
                 || "none".to_owned(),
                 |(rip, cpl)| format!("{rip:#x}/cpl{cpl}"),
             );
-        let task = task.map(ObservedThread::read);
+        let task = task.map(ObservedThread::from_current_task);
         let hot = self.trace.hot_blocks(8);
         summary.terminal = Some(format!(
             "rip={:#x} cpl={} IF={} last_fetch={fetch} slot={} task_and_generation={task:?} \
