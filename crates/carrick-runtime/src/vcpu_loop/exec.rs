@@ -2208,9 +2208,9 @@ where
                 ));
             };
             if let Some(retired_commit) = retired_commit {
-                if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+                carrick_hal::host_residency::with_host_residency(|table| {
                     table.retire_overlapping(old_mm_id.raw(), 0, u64::MAX);
-                }
+                });
                 super::signal::withdraw_guest_descriptor_work(old_mm_id.raw());
                 if let Err(error) = process
                     .kernel_graph()

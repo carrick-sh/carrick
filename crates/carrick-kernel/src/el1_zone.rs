@@ -438,6 +438,25 @@ impl carrick_el1_abi::MetadataCompletionWake for MetadataCompletionWake {
             });
         drop(queue);
         delivery.deliver();
+        fn deliver_space_wake(
+            zone: &carrick_el1_abi::ZoneTables,
+            _: carrick_sched_core::Waker,
+            effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_el1_abi::Aarch64ParkedContext,
+            >,
+        ) {
+            carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects);
+        }
+        zone.notify_metadata_waiters(
+            carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+                zone,
+                waker: carrick_sched_core::Waker::Host,
+                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                    deliver_space_wake,
+                ),
+            },
+        );
     }
 }
 

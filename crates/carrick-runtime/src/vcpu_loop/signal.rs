@@ -1356,10 +1356,11 @@ pub(super) fn reconcile_guest_frame_commits<E: ThreadedEngine>(
     engine: &E,
     mutation: &carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
 ) -> Result<(), DispatchError> {
-    let Some(table) = carrick_el1_abi::frame_grant_residency_host() else {
+    let Some(view) = carrick_hal::host_residency::current_host_residency() else {
         return Ok(());
     };
-    reconcile_dirty_frame_commits(table, mutation.mm_id().raw(), |pages| {
+    let table = view.table();
+    reconcile_dirty_frame_commits(&table, mutation.mm_id().raw(), |pages| {
         let mut refused = None;
         // One live-root read and one resolution per table arena for the
         // whole grant (`ThreadedEngine::live_el1_grant_pages`).
@@ -1375,7 +1376,9 @@ pub(super) fn reconcile_guest_frame_commits<E: ThreadedEngine>(
 /// A refused adoption must leave the row dirty, whether it needs a retry or
 /// terminates the run. The caller supplies the live-leaf authenticated root step.
 fn reconcile_dirty_frame_commits(
-    table: &carrick_el1_abi::FrameGrantResidencyTable,
+    table: &carrick_el1_abi::FrameGrantResidencyTable<
+        impl carrick_el1_abi::FrameGrantResidencyAccess,
+    >,
     mm_key: u64,
     mut adopt_live: impl FnMut(
         &[(u64, u64)],

@@ -24,25 +24,30 @@ fn retire_anonymous_mapping_backing(
     fixed: bool,
     sparse: bool,
 ) -> Result<(), MemoryError> {
-    retire_anonymous_mapping_backing_with_residency(
-        dispatcher,
-        memory,
-        AnonymousBackingRetirement {
-            address,
-            length,
-            length_usize,
-            fixed,
-            sparse,
-        },
-        carrick_el1_abi::frame_grant_residency_host(),
-    )
+    let request = AnonymousBackingRetirement {
+        address,
+        length,
+        length_usize,
+        fixed,
+        sparse,
+    };
+    if let Some(view) = carrick_hal::host_residency::current_host_residency() {
+        let table = view.table();
+        retire_anonymous_mapping_backing_with_residency(dispatcher, memory, request, Some(&table))
+    } else {
+        retire_anonymous_mapping_backing_with_residency::<carrick_el1_abi::ResidencyStorage>(
+            dispatcher, memory, request, None,
+        )
+    }
 }
 
-fn retire_anonymous_mapping_backing_with_residency(
+fn retire_anonymous_mapping_backing_with_residency<
+    S: carrick_el1_abi::FrameGrantResidencyAccess,
+>(
     dispatcher: &MemView<'_>,
     memory: &mut impl CurrentMmMemory,
     request: AnonymousBackingRetirement,
-    residency: Option<&carrick_el1_abi::FrameGrantResidencyTable>,
+    residency: Option<&carrick_el1_abi::FrameGrantResidencyTable<S>>,
 ) -> Result<(), MemoryError> {
     if request.fixed || request.sparse {
         // The descriptor backend and the grant-window table are one

@@ -8700,6 +8700,13 @@ impl HvfInner {
                         return Ok(exit);
                     }
                     HvcExitOutcome::Maintenance => {
+                        // A portal service call (e.g. serve_grant_hw growing
+                        // residency segments) may have published a metadata
+                        // allocation request before returning OwnerWait(Metadata).
+                        crate::metadata_grant::service_pending_metadata_request(
+                            custody,
+                            vm_generation,
+                        )?;
                         return Ok(Aarch64Exit::MaintenanceDone);
                     }
                     HvcExitOutcome::NotSvc { esr } => {
