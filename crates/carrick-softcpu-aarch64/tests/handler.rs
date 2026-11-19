@@ -889,3 +889,18 @@ fn el0_ldadd_raises_undefined_before_accessing_memory() {
     assert_eq!(rig.cpu.el1.elr, ProgramCounter(PC));
     assert_eq!(rig.memory.get(0x10000), 40);
 }
+
+#[test]
+fn el0_physical_counter_obeys_cntkctl_and_uses_the_virtual_clock() {
+    let mut rig = Rig::el0();
+    rig.cpu.el1.cntkctl = SystemValue(1);
+    rig.cpu.named.cntvct = SystemValue(0x2345_6789_abcd_ef00);
+    assert_eq!(rig.run(0xd53b_e025), Outcome::Continue); // MRS X5, CNTPCT_EL0
+    assert_eq!(rig.pc(), PC + 4);
+    assert_eq!(rig.get(5), 0x2345_6789_abcd_ef00);
+
+    rig.cpu.el1.cntkctl = SystemValue(2); // EL0VCTEN does not enable CNTPCT.
+    assert_eq!(rig.run(0xd53b_e025), Outcome::Fault);
+    assert_eq!(rig.pc(), VBAR + 0x400);
+    assert_eq!(rig.cpu.el1.esr, Syndrome(0x6232_f8a1));
+}
