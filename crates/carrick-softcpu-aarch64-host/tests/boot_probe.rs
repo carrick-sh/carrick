@@ -1792,6 +1792,9 @@ fn production_el1_image_runs_dynamic_glibc_hello() {
     let el1 = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
         .expect("read the production EL1 ELF");
     let hello = std::fs::read(root.join("hello")).expect("read dynamic hello");
+    let compiler = std::fs::read_to_string(root.join("hello.compiler"))
+        .expect("read hello.compiler from scripts/ci/fetch-arm64-cross-libc.sh");
+    let compiler = compiler.lines().next().expect("fixture compiler version");
     let program = ElfProgram::load(&hello, 183, &|path| {
         assert_eq!(path, GLIBC_LOADER);
         let bytes = std::fs::read(root.join(&path[1..])).expect("read fixture loader");
@@ -1892,14 +1895,17 @@ fn production_el1_image_runs_dynamic_glibc_hello() {
         aux(LINUX_AT_HWCAP),
         aux(LINUX_AT_HWCAP2)
     );
-    report_glibc_ifuncs(&program, &mut memory, &replies);
+    report_glibc_ifuncs(&program, &mut memory, &replies, compiler);
 }
 
 fn report_glibc_ifuncs(
     program: &carrick_mem::elf::ElfProgram<'_>,
     memory: &mut Pages,
     replies: &GlibcReplies,
+    compiler: &str,
 ) {
+    use goblin::elf::reloc::R_AARCH64_JUMP_SLOT;
+
     let elf = goblin::elf::Elf::parse(program.executable_bytes).unwrap();
     let (mapped, offset, len) = replies.libc_exec.expect("executable libc mapping");
     for name in ["memcpy", "strlen", "memset"] {
@@ -1907,13 +1913,15 @@ fn report_glibc_ifuncs(
             .pltrelocs
             .iter()
             .find(|rel| {
-                elf.dynsyms
-                    .get(rel.r_sym)
-                    .and_then(|sym| elf.dynstrtab.get_at(sym.st_name))
-                    == Some(name)
+                rel.r_type == R_AARCH64_JUMP_SLOT
+                    && elf
+                        .dynsyms
+                        .get(rel.r_sym)
+                        .and_then(|sym| elf.dynstrtab.get_at(sym.st_name))
+                        == Some(name)
             })
             .unwrap_or_else(|| {
-                panic!("missing {name} PLT relocation in fixture, compile with -fno-builtin")
+                panic!("missing {name} R_AARCH64_JUMP_SLOT in fixture built with {compiler}")
             });
         let target = read_u64(memory, program.executable.load_bias + slot.r_offset);
         assert!(
