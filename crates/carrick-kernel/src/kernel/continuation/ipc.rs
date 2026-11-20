@@ -468,7 +468,7 @@ pub fn finish(
 }
 
 /// Settle a parked or handed-back operation for `cause`. Control actions
-/// retain PollWait's admission; handler interruptions finish it with EINTR.
+/// retain readiness admission; handler interruptions finish it with EINTR.
 pub fn interrupt<M: carrick_guest_mem::CurrentMmMemory>(
     context: &crate::kernel::KernelContext,
     region: &IpcRegion<'_>,
@@ -483,23 +483,27 @@ pub fn interrupt<M: carrick_guest_mem::CurrentMmMemory>(
     if op.mm != mm {
         return Err(IpcError::Stale);
     }
-    if op.kind == IpcOpKind::PollWait {
+    if readiness_wait(op.kind) {
         // A directly claimed ring park may still have handback=None. Once
         // the host owns completion, a copyout refusal must be resumable by
         // complete_handback without losing its decided answer or token.
         op.handback = IpcHandback::Continue;
         region.update_operation(&token, op)?;
-        return complete_poll(context, region, token, op, memory, Some(cause), wake);
+        return complete_readiness(context, region, token, op, memory, Some(cause), wake);
     }
     let op = finish(region, token, wake)?;
     Ok(interrupted(&op, cause, wake.counter()))
 }
 
-/// Complete the admitted single-description poll. Readiness uses the shared
+fn readiness_wait(kind: IpcOpKind) -> bool {
+    matches!(kind, IpcOpKind::PollWait | IpcOpKind::SelectWait)
+}
+
+/// Complete the admitted single-description readiness wait. Readiness uses the shared
 /// IPC member-level primitive, never a numeric-fd lookup or a new relative
 /// timeout. Once decided, the answer and byte cursor stay in the same arena
 /// record through owner-copyout refusals.
-fn complete_poll<M: carrick_guest_mem::CurrentMmMemory>(
+fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
     context: &crate::kernel::KernelContext,
     region: &IpcRegion<'_>,
     token: IpcOpToken,
@@ -510,99 +514,150 @@ fn complete_poll<M: carrick_guest_mem::CurrentMmMemory>(
 ) -> Result<IpcHostOutcome, IpcError> {
     use crate::dispatch::copyout::{self, UserSlot};
     use carrick_abi::PollReventsOutput;
-    use carrick_el1_abi::ipc::{IpcBacking, WriteProgress, epoll::EpollMember};
+    use carrick_el1_abi::ipc::{IpcBacking, IpcUserVa, WriteProgress, epoll::EpollMember};
+    use carrick_el1_linux::ipc::{WaitCopy, poll_wait_lane, select_copies, select_ready};
     use carrick_guest_mem::GuestVa;
+
     let complete = |result| IpcHostOutcome::Complete {
         result,
         sigpipe: false,
     };
+    let select = op.kind == IpcOpKind::SelectWait;
+    let mut bytes = op.value.0.to_ne_bytes();
+    let fd = i32::from_ne_bytes(bytes[..4].try_into().unwrap_or_default());
     if op.progress.len == 0 {
-        if matches!(cause, Some(IpcCause::Signal { .. } | IpcCause::Stop)) {
+        let interrupted = matches!(cause, Some(IpcCause::Signal { .. }))
+            || (!select && cause == Some(IpcCause::Stop));
+        if interrupted && !select {
             finish(region, token, wake)?;
             return Ok(complete(LINUX_EINTR.guest_retval()));
         }
-        let pin = OfdPin::from_raw(op.pin);
-        let description = region.fd(HostIpcWait).pinned(&pin);
-        op.pin = pin.into_raw();
-        let (object, member) = description.map_err(IpcError::Fd).and_then(|d| {
-            IpcBacking::decode(d.backing)
-                .and_then(EpollMember::of_backing)
-                .ok_or(IpcError::Corrupt)
-        })?;
-        if object.to_raw() != op.object {
-            return Err(IpcError::Corrupt);
-        }
-        let mut bytes = op.value.0.to_ne_bytes();
-        let events = i16::from_ne_bytes([bytes[4], bytes[5]]);
-        let mut guard = region.lock(object, &HostIpcWait)?;
-        let level = guard.member_level(member)?;
-        drop(guard);
-        let revents =
-            level as i16 & (events | carrick_abi::LINUX_POLLERR | carrick_abi::LINUX_POLLHUP);
-        if revents == 0 && op.deadline.get().is_none_or(|end| wake.counter().now < end) {
-            let lane = match member {
-                EpollMember::PipeWriter => WaitFor::Writable,
-                EpollMember::EventFd
-                    if events as u16 as u32 & carrick_el1_abi::ipc::epoll::events::WRITE_SIDE
-                        != 0 =>
-                {
-                    WaitFor::Writable
-                }
-                _ => WaitFor::Readable,
+        let clock = wake.counter();
+        let revents = if interrupted || (select && cause == Some(IpcCause::Timeout)) {
+            0
+        } else {
+            let pin = OfdPin::from_raw(op.pin);
+            let description = region.fd(HostIpcWait).pinned(&pin);
+            op.pin = pin.into_raw();
+            let (object, member) = description.map_err(IpcError::Fd).and_then(|description| {
+                IpcBacking::decode(description.backing)
+                    .and_then(EpollMember::of_backing)
+                    .ok_or(IpcError::Corrupt)
+            })?;
+            if object.to_raw() != op.object {
+                return Err(IpcError::Corrupt);
+            }
+            let events = i16::from_ne_bytes([bytes[4], bytes[5]]);
+            let mut guard = region.lock(object, &HostIpcWait)?;
+            let level = guard.member_level(member)?;
+            drop(guard);
+            let revents = if select {
+                select_ready(events, level)
+            } else {
+                level as i16 & (events | carrick_abi::LINUX_POLLERR | carrick_abi::LINUX_POLLHUP)
             };
-            return Ok(IpcHostOutcome::Blocked {
-                token,
-                object,
-                lane,
-                deadline: op.deadline.get(),
-                x0: op.orig_x0,
-                nr: op.nr,
-            });
-        }
-        bytes[6..].copy_from_slice(&revents.to_ne_bytes());
-        op.value = carrick_el1_abi::ipc::IpcEventValue(u64::from_ne_bytes(bytes));
-        op.result = i64::from(revents != 0);
-        op.progress = WriteProgress::new(2);
-        region.update_operation(&token, op)?;
-    }
-    let saved = op.value.0.to_ne_bytes();
-    let field = PollReventsOutput::new(
-        GuestVa::new(op.buf.0),
-        i16::from_ne_bytes([saved[6], saved[7]]),
-    );
-    let (base, bytes) = field.unit().map_err(|_| IpcError::Corrupt)?;
-    while !op.progress.is_complete() {
-        let offset = op.progress.written as usize;
-        let address = base
-            .raw()
-            .checked_add(op.progress.written)
-            .ok_or(IpcError::Corrupt)?;
-        let length = (bytes.len() - offset).min(
-            (carrick_el1::substrate::ipc::USER_COPY_GRANULE
-                - address % carrick_el1::substrate::ipc::USER_COPY_GRANULE) as usize,
-        );
-        let output = match copyout::prepare(context, memory, [Some(UserSlot::new(address, length))])
-        {
-            Ok(output) => output,
-            Err(refusal) => {
-                return Ok(IpcHostOutcome::OwnerMemory {
+            if revents == 0 && op.deadline.get().is_none_or(|end| clock.now < end) {
+                return Ok(IpcHostOutcome::Blocked {
                     token,
-                    outcome: Box::new(refusal.into_outcome()),
+                    object,
+                    lane: poll_wait_lane(member, events),
+                    deadline: op.deadline.get(),
+                    x0: op.orig_x0,
+                    nr: op.nr,
                 });
             }
+            revents
         };
-        let (landed, effect) = output.commit_retaining([&bytes[offset..offset + length]]);
-        if landed.is_err() {
-            drop(effect);
-            finish(region, token, wake)?;
-            return Ok(complete(LINUX_EFAULT.guest_retval()));
+        if select {
+            op.result = if interrupted {
+                LINUX_EINTR.guest_retval()
+            } else {
+                i64::from(revents.count_ones())
+            };
+            op.select.ready = revents;
+            op.park_seq = op
+                .deadline
+                .get()
+                .filter(|_| cause != Some(IpcCause::Timeout))
+                .map_or(0, |end| {
+                    // The ring added a guard tick when converting the relative time.
+                    let ticks = end.saturating_sub(clock.now).saturating_sub(1);
+                    let ns = u128::from(ticks) * u128::from(clock.numer)
+                        / u128::from(clock.denom.max(1));
+                    u64::try_from(ns).unwrap_or(u64::MAX)
+                });
+            let length = select_copies(op.select, op.buf, op.park_seq, fd, op.result)
+                .map(|copy| copy.len as u64)
+                .sum();
+            op.progress = WriteProgress::new(length);
+        } else {
+            bytes[6..].copy_from_slice(&revents.to_ne_bytes());
+            op.value = carrick_el1_abi::ipc::IpcEventValue(u64::from_ne_bytes(bytes));
+            op.result = i64::from(revents != 0);
+            op.progress = WriteProgress::new(2);
         }
-        op.progress.written += length as u64;
-        // As for HostCopy::land below, terminal publication must not pass
-        // the guest write before its retained cursor is published.
-        let updated = region.update_operation(&token, op);
-        drop(effect);
-        updated?;
+        region.update_operation(&token, op)?;
+    }
+    let poll_output = if select {
+        None
+    } else {
+        let field = PollReventsOutput::new(
+            GuestVa::new(op.buf.0),
+            i16::from_ne_bytes([bytes[6], bytes[7]]),
+        );
+        let (base, revents) = field.unit().map_err(|_| IpcError::Corrupt)?;
+        Some(WaitCopy::revents(IpcUserVa(base.raw()), *revents))
+    };
+    let mut offset = op.progress.written as usize;
+    let mut window = Vec::new();
+    let select_output = select
+        .then(|| select_copies(op.select, op.buf, op.park_seq, fd, op.result))
+        .into_iter()
+        .flatten();
+    for copy in select_output.chain(poll_output) {
+        if offset >= copy.len {
+            offset -= copy.len;
+            continue;
+        }
+        while offset < copy.len {
+            let address = copy
+                .address
+                .0
+                .checked_add(offset as u64)
+                .ok_or(IpcError::Corrupt)?;
+            let granule = carrick_el1::substrate::ipc::USER_COPY_GRANULE;
+            let length = (copy.len - offset).min((granule - address % granule) as usize);
+            let output =
+                match copyout::prepare(context, memory, [Some(UserSlot::new(address, length))]) {
+                    Ok(output) => output,
+                    Err(refusal) => {
+                        return Ok(IpcHostOutcome::OwnerMemory {
+                            token,
+                            outcome: Box::new(refusal.into_outcome()),
+                        });
+                    }
+                };
+            let bytes = if let Some(bytes) = copy.literal() {
+                &bytes[offset..offset + length]
+            } else {
+                window.resize(length, 0);
+                copy.fill(offset, &mut window);
+                window.as_slice()
+            };
+            let (landed, effect) = output.commit_retaining([bytes]);
+            if landed.is_err() {
+                drop(effect);
+                finish(region, token, wake)?;
+                return Ok(complete(LINUX_EFAULT.guest_retval()));
+            }
+            offset += length;
+            op.progress.written += length as u64;
+            // Publish cursor progress before terminal publication can pass the write.
+            let updated = region.update_operation(&token, op);
+            drop(effect);
+            updated?;
+        }
+        offset = 0;
     }
     finish(region, token, wake)?;
     Ok(complete(op.result))
@@ -801,7 +856,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
                 sigpipe: true,
             });
         }
-        IpcHandback::Restart if op.kind == IpcOpKind::PollWait => {}
+        IpcHandback::Restart if readiness_wait(op.kind) => {}
         IpcHandback::Restart => {
             let op = finish(region, token, wake)?;
             return Ok(IpcHostOutcome::Restart(IpcRestart::Original {
@@ -819,8 +874,8 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
     if let Some(cause) = signal {
         return interrupt(context, region, token, mm, memory, cause, wake);
     }
-    if op.kind == IpcOpKind::PollWait {
-        return complete_poll(context, region, token, op, memory, None, wake);
+    if readiness_wait(op.kind) {
+        return complete_readiness(context, region, token, op, memory, None, wake);
     }
     if op.kind == IpcOpKind::EpollWait {
         // A parked zone epoll wait owns no progress: the host runs the

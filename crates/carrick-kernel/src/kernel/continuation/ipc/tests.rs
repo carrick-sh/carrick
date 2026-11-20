@@ -1621,6 +1621,72 @@ fn interrupt(
 }
 
 #[test]
+fn select_host_stop_and_resumed_wake_keep_the_wait_owned() {
+    for cause in [Some(IpcCause::Stop), None] {
+        let w = world();
+        let (reader, _, _) = w.pipe();
+        let token = w.operation(reader, IpcOpKind::SelectWait, 0, 72);
+        let mut op = w.region.operation(&token).unwrap();
+        op.handback = IpcHandback::Continue;
+        op.value = carrick_el1_abi::ipc::IpcEventValue(9 << 32 | reader.0 as u64);
+        op.deadline = carrick_el1_abi::ipc::IpcCounterDeadline::at(5_000_000_000);
+        w.region.update_operation(&token, op).unwrap();
+        let outcome = complete_handback(
+            &caller(),
+            w.region,
+            token,
+            MM,
+            &mut memory(&[]),
+            cause,
+            &Clocked {
+                wakes: Wakes::default(),
+                now: 1,
+            },
+        );
+        let Ok(IpcHostOutcome::Blocked {
+            token, deadline, ..
+        }) = outcome
+        else {
+            panic!("{cause:?}: expected the admitted wait back, got {outcome:?}");
+        };
+        assert_eq!(deadline, op.deadline.get());
+        let wakes = Wakes::default();
+        finish(w.region, token, &wakes).unwrap();
+    }
+}
+
+#[test]
+fn select_host_timeout_clears_the_ready_set_and_remaining_time() {
+    let w = world();
+    let (reader, _, _) = w.pipe();
+    let token = w.operation(reader, IpcOpKind::SelectWait, 0, 72);
+    let mut op = w.region.operation(&token).unwrap();
+    op.deadline = carrick_el1_abi::ipc::IpcCounterDeadline::at(5);
+    op.value = carrick_el1_abi::ipc::IpcEventValue(9 << 32 | reader.0 as u64);
+    w.region.update_operation(&token, op).unwrap();
+    let outcome = super::interrupt(
+        &caller(),
+        w.region,
+        token,
+        MM,
+        &mut memory(&[]),
+        IpcCause::Timeout,
+        &Clocked {
+            wakes: Wakes::default(),
+            now: 5,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        IpcHostOutcome::Complete {
+            result: 0,
+            sigpipe: false
+        }
+    );
+}
+
+#[test]
 fn ppoll_completed_answer_survives_owner_copyout_refusal_and_readiness_change() {
     poll_completed_answer_survives_copyout_refusal(false);
 }

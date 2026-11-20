@@ -5006,6 +5006,70 @@ fn zone_exec_status_pipe_reports_child_exec_failure_then_eof() {
     );
 }
 
+/// The sibling writer waits for a datagram before writing the pipe. The
+/// host sends only after observing the reader's production wait enrollment.
+#[test]
+fn native_child_pselect6_wakes_on_sibling_pipe_write() {
+    use carrick_sched_core::{RecordId, ZONE_RECORDS};
+    use std::time::{Duration, Instant};
+
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("select gate peer");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let port = format!(
+        "-DSELECT_GATE_PORT={}",
+        peer.local_addr().unwrap().port().swap_bytes()
+    );
+    let elf = native_exit_fixture_with_flags(
+        "native_pipe_poll_wake.S",
+        &["-DUSE_PSELECT", "-DCHILD_POLLS", &port],
+    );
+    let program = carrick_mem::elf::ElfProgram::load(&elf, ELF_X86_64_MACHINE, &|_| None)
+        .expect("pselect6 fixture");
+    let mut sender = None;
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        256,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |carrier| {
+            let zone = carrier.carrier_zone_wake().expect("carrier wake domain");
+            sender = Some(std::thread::spawn(move || {
+                let mut pid = [0; 4];
+                let (count, client) = peer.recv_from(&mut pid).expect("sibling writer");
+                assert_eq!(count, pid.len());
+                let tid = u64::from(u32::from_ne_bytes(pid));
+                let deadline = Instant::now() + Duration::from_secs(4);
+                let parked = loop {
+                    let enrolled =
+                        (1..ZONE_RECORDS as u32)
+                            .filter_map(RecordId::from_raw)
+                            .any(|id| {
+                                let record = zone.zone().record(id);
+                                record.identity().tid == tid
+                                    && record.has_adapter_operation()
+                                    && record
+                                        .object_wait_census()
+                                        .is_some_and(|wait| wait.queue != 0)
+                            });
+                    if enrolled || Instant::now() >= deadline {
+                        break enrolled;
+                    }
+                    std::thread::yield_now();
+                };
+                assert_eq!(peer.send_to(b"w", client).unwrap(), 1);
+                parked
+            }));
+        },
+        carrick_kernel::dispatch::SyscallDispatcher::default(),
+    )
+    .expect("pselect6 run");
+    assert_eq!(outcome.run.exit_code, 7, "child select: {:?}", outcome.run);
+    assert!(
+        sender.unwrap().join().unwrap(),
+        "child pselect6 never enrolled"
+    );
+}
+
 /// Director follow-up: reverse the existing peers so a fork child owns the
 /// blocked poll and read, while its live parent produces the exact byte.
 #[test]

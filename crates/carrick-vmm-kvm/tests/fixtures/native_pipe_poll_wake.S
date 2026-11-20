@@ -16,6 +16,15 @@
 .global _start
 .text
 _start:
+#ifdef SELECT_TIMEOUT_EOF
+    mov $57, %eax                  /* child owns the only copies of the pipe */
+    syscall
+    test %eax, %eax
+    js fail_fork
+    jz timed_pselect_child
+    mov %eax, %r12d
+    jmp wait_for_child
+#endif
     /* pipe2(fds, O_CLOEXEC) */
     lea fds(%rip), %rdi
     mov $0x80000, %esi
@@ -39,6 +48,16 @@ _start:
     test %eax, %eax
     jnz fail_pipe
 #endif
+#ifdef USE_PSELECT
+    /* First call sees an already readable pipe. */
+    mov fds+4(%rip), %edi
+    lea byte(%rip), %rsi
+    mov $1, %edx
+    mov $1, %eax
+    syscall
+    cmp $1, %rax
+    jne fail_pipe
+#endif
     mov $57, %eax                  /* fork */
     syscall
     test %eax, %eax
@@ -46,8 +65,21 @@ _start:
 #ifdef CHILD_POLLS
     jz poller
     mov %eax, %r12d
+#ifdef USE_PSELECT
+    mov $57, %eax                  /* fork a sibling writer */
+    syscall
+    test %eax, %eax
+    js fail_fork
+    jz child
+    mov %eax, %r15d
+    jmp wait_for_child
+#else
     jmp child
+#endif
 poller:
+#ifdef USE_PSELECT
+    jmp pselect_reader
+#endif
 #else
     jz child
     mov %eax, %r12d
@@ -173,11 +205,74 @@ wait_for_child:
     cmp %r12d, %eax
     jne fail_wait
     cmpl $0, status(%rip)
+#ifdef USE_PSELECT
+    je 1f
+    movzbl status+1(%rip), %edi
+    test %edi, %edi
+    jz fail_wait
+    jmp exit
+1:
+#ifndef SELECT_TIMEOUT_EOF
+    mov %r15d, %edi              /* reap the sibling writer as well */
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    cmp %r15d, %eax
     jne fail_wait
+    cmpl $0, status(%rip)
+    jne fail_wait
+#endif
+#else
+    jne fail_wait
+#endif
     mov $7, %edi
     jmp exit
 child:
-#ifndef NO_CHILD_SLEEP
+#ifdef USE_PSELECT
+    /* The host echoes only once the reader's select has parked. */
+    mov $2, %edi                  /* AF_INET */
+    mov $2, %esi                  /* SOCK_DGRAM */
+    xor %edx, %edx
+    mov $41, %eax
+    syscall
+    test %rax, %rax
+    js child_fail
+    mov %eax, %r13d
+    mov %r13d, %edi
+    lea select_gate_peer(%rip), %rsi
+    mov $16, %edx
+    mov $42, %eax                 /* connect */
+    syscall
+    test %rax, %rax
+    jnz child_fail
+    mov %r12d, reader_pid(%rip)
+    mov %r13d, %edi
+    lea reader_pid(%rip), %rsi
+    mov $4, %edx
+    mov $1, %eax
+    syscall
+    cmp $4, %rax
+    jne child_fail
+    mov %r13d, pfd(%rip)
+    movw $1, pfd+4(%rip)
+    movw $0, pfd+6(%rip)
+    lea pfd(%rip), %rdi
+    mov $1, %esi
+    mov $8000, %edx               /* bound fixture cleanup */
+    mov $7, %eax
+    syscall
+    cmp $1, %rax
+    jne child_fail
+    mov %r13d, %edi
+    lea received(%rip), %rsi
+    mov $1, %edx
+    xor %eax, %eax
+    syscall
+    cmp $1, %rax
+    jne child_fail
+#elif !defined(NO_CHILD_SLEEP)
     /* nanosleep({0, 50ms}) so the parent is parked before the write. */
     lea delay(%rip), %rdi
     xor %esi, %esi
@@ -198,10 +293,112 @@ child:
     cmp $1, %rax
     jne child_fail
 #endif
-#ifdef CHILD_POLLS
+#if defined(CHILD_POLLS) && !defined(USE_PSELECT)
     jmp wait_for_child
 #else
     xor %edi, %edi
+    jmp exit
+#endif
+#ifdef USE_PSELECT
+#ifdef SELECT_TIMEOUT_EOF
+timed_pselect_child:
+    lea fds(%rip), %rdi
+    xor %esi, %esi
+    mov $293, %eax                 /* pipe2 */
+    syscall
+    test %rax, %rax
+    jnz fail_pipe
+    movq $20000000, select_time+8(%rip)
+    call select_call
+    test %rax, %rax
+    jnz fail_result
+    cmpq $0, read_set(%rip)
+    jne fail_revents
+    mov select_time(%rip), %rax
+    or select_time+8(%rip), %rax
+    jnz fail_fields
+    mov fds+4(%rip), %edi
+    mov $3, %eax                   /* close the last writer */
+    syscall
+    test %rax, %rax
+    jnz fail_close
+    call select_call
+    cmp $1, %rax
+    jne fail_result
+    cmp %r14, read_set(%rip)
+    jne fail_revents
+    xor %edi, %edi
+    jmp exit
+#endif
+pselect_reader:
+#ifdef USE_SELECT_TIMEVAL
+    movq $-1, select_time+8(%rip)
+    call select_call
+    cmp $-22, %rax
+    jne fail_result
+#endif
+    call pselect_one
+    call pselect_one
+    xor %edi, %edi
+    jmp exit
+
+pselect_one:
+#ifdef USE_SELECT_TIMEVAL
+    /* 30 seconds encoded entirely in microseconds; Linux normalizes it. */
+    movq $0, select_time(%rip)
+    movq $30000000, select_time+8(%rip)
+#endif
+    call select_call
+    test %rax, %rax
+    js pselect_errno
+    cmp $1, %rax
+    jne fail_result
+    cmp %r14, read_set(%rip)
+    jne fail_revents
+#ifdef USE_SELECT_TIMEVAL
+    cmpq $0, select_time(%rip)
+    jl fail_fields
+    cmpq $30, select_time(%rip)
+    jge fail_fields
+    cmpq $1000000, select_time+8(%rip)
+    jae fail_fields
+#endif
+    mov fds(%rip), %edi
+    lea received(%rip), %rsi
+    mov $1, %edx
+    xor %eax, %eax
+    syscall
+    cmp $1, %rax
+    jne fail_result
+    cmpb $'x', received(%rip)
+    jne fail_revents
+    ret
+
+select_call:
+    mov fds(%rip), %ecx
+    mov $1, %r14d
+    shl %cl, %r14
+    mov %r14, read_set(%rip)
+    lea 1(%rcx), %edi
+    lea read_set(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+#ifdef USE_SELECT_TIMEVAL
+    lea select_time(%rip), %r8
+    mov $23, %eax                  /* select(nfds, &set, 0, 0, &timeval) */
+#else
+#ifdef SELECT_TIMEOUT_EOF
+    lea select_time(%rip), %r8
+#endif
+    mov $270, %eax                 /* pselect6 */
+#endif
+    syscall
+    ret
+pselect_errno:
+    neg %eax
+    mov %eax, %edi
     jmp exit
 #endif
 child_fail:
@@ -243,10 +440,20 @@ zero_ts: .quad 0, 0
 short_ts: .quad 0, 1000000
 long_ts: .quad 5, 0
 byte: .byte 'x'
+#ifdef USE_PSELECT
+.balign 8
+select_gate_peer:
+    .short 2, SELECT_GATE_PORT
+    .byte 127, 0, 0, 1
+    .quad 0
+#endif
 .bss
 .balign 4096
 fds: .space 8
 pfd: .space 8
+read_set: .space 8
+select_time: .space 16
+reader_pid: .space 4
 status: .space 8
 poll_result: .space 8
 received: .space 1

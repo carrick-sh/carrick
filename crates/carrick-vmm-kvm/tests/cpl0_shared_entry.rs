@@ -145,3 +145,97 @@ fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
         );
     }
 }
+
+#[test]
+fn native_child_select_timeval_wakes_on_sibling_pipe_write() {
+    native_child_select_wake("-DUSE_SELECT_TIMEVAL");
+}
+
+#[test]
+fn native_child_pselect6_times_out_then_reports_eof() {
+    let elf = kvm_pool_fixture::assemble_fixture(
+        "native_pipe_poll_wake.S",
+        &[
+            "-DUSE_PSELECT",
+            "-DSELECT_TIMEOUT_EOF",
+            "-DSELECT_GATE_PORT=0",
+        ],
+    );
+    let program =
+        carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("timed select fixture");
+    let outcome = kvm_pool_fixture::try_run_program_with_root_affinity_typed(
+        &program,
+        256,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |_| {},
+    )
+    .unwrap_or_else(|failure| panic!("timed select: {}", failure.error));
+    assert_eq!(outcome.run.exit_code, 7, "timed select: {:?}", outcome.run);
+}
+
+fn native_child_select_wake(variant: &str) {
+    use carrick_sched_core::{RecordId, ZONE_RECORDS};
+    use std::time::{Duration, Instant};
+
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("select gate peer");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set the gate socket deadline");
+    let port = format!(
+        "-DSELECT_GATE_PORT={}",
+        peer.local_addr()
+            .expect("gate socket address")
+            .port()
+            .swap_bytes()
+    );
+    let elf = kvm_pool_fixture::assemble_fixture(
+        "native_pipe_poll_wake.S",
+        &["-DUSE_PSELECT", "-DCHILD_POLLS", variant, &port],
+    );
+    let program =
+        carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("pselect6 fixture");
+    let mut sender = None;
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        256,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |carrier| {
+            let zone = carrier.carrier_zone_wake().expect("carrier wake domain");
+            sender = Some(std::thread::spawn(move || {
+                let mut pid = [0; 4];
+                let (count, client) = peer.recv_from(&mut pid).expect("sibling writer");
+                assert_eq!(count, pid.len());
+                let tid = u64::from(u32::from_ne_bytes(pid));
+                let deadline = Instant::now() + Duration::from_secs(4);
+                let parked = loop {
+                    let enrolled =
+                        (1..ZONE_RECORDS as u32)
+                            .filter_map(RecordId::from_raw)
+                            .any(|id| {
+                                let record = zone.zone().record(id);
+                                record.identity().tid == tid
+                                    && record.has_adapter_operation()
+                                    && record
+                                        .object_wait_census()
+                                        .is_some_and(|wait| wait.queue != 0)
+                            });
+                    if enrolled || Instant::now() >= deadline {
+                        break enrolled;
+                    }
+                    std::thread::yield_now();
+                };
+                assert_eq!(peer.send_to(b"w", client).expect("release gate writer"), 1);
+                parked
+            }));
+        },
+        carrick_kernel::dispatch::SyscallDispatcher::default(),
+    )
+    .expect("pselect6 run");
+    assert_eq!(outcome.run.exit_code, 7, "child select: {:?}", outcome.run);
+    assert!(
+        sender
+            .expect("gate sender")
+            .join()
+            .expect("join gate sender"),
+        "child pselect6 never enrolled"
+    );
+}
