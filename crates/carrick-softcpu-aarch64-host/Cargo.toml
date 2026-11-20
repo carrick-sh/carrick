@@ -13,5 +13,6 @@ carrick-softcpu-aarch64 = { path = "../carrick-softcpu-aarch64" }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dev-dependencies]
 carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-mem = { path = "../carrick-mem" }
