@@ -418,3 +418,18 @@ requires EFAULT with no refusal. Under KVM a native fork leaves both
 processes live, with each process sampling into its own stack and the parent
 reporting both results. Realtime, CPU accounting, vDSO/libc parity and
 x86 absolute deadlines have separate outstanding evidence.
+
+## CPL0 vDSO and absolute monotonic waits
+
+The KVM carrier takes one qualified TSC calibration before root admission.
+The root and each native exec successor install a private vvar page with that
+same calibration and a read-execute vDSO page. The initial MM editor checks
+for the two exact image rows before publishing AT_SYSINFO_EHDR. A fork
+inherits the mapped pages. The published monotonic offset is zero, so the
+raw syscall, the vDSO and absolute monotonic deadlines use TSC nanoseconds.
+
+The KVM witnesses bracket a vDSO monotonic read between two raw samples in
+the root, its fork child and a native exec successor. A separate child
+witness forms a future absolute deadline from a raw sample and checks that
+clock_nanosleep returns at or after it. ARM keeps its existing deadline
+conversion and its native-child timeout witness.

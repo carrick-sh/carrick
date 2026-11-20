@@ -138,6 +138,7 @@ pub struct ExecBuildInputs<'a> {
     pub entry: u64,
     pub executable_entry: u64,
     pub interpreter_base: u64,
+    pub has_vdso: bool,
     pub phdr: u64,
     pub phent: u16,
     pub phnum: u16,
@@ -264,6 +265,11 @@ fn lay_out<'a>(
         executable_entry: inputs.executable_entry,
         interpreter_base: inputs.interpreter_base,
         executable_region_count: inputs.executable_region_count as u32,
+        image_features: if inputs.has_vdso {
+            carrick_core_abi::X86_INITIAL_HAS_VDSO
+        } else {
+            0
+        },
         layout_hash: carrick_el1_abi::EL1_ABI_LAYOUT_HASH,
         ..Default::default()
     };
@@ -411,6 +417,7 @@ impl ExecBuildPlan {
             .ok_or(invalid)?;
         if header.magic != X86_EXEC_BUILD_MAGIC
             || header.version != X86_INITIAL_BOOT_VERSION
+            || header.image_features & !carrick_core_abi::X86_INITIAL_HAS_VDSO != 0
             || header.layout_hash != carrick_el1_abi::EL1_ABI_LAYOUT_HASH
             || header.result_status != X86_INITIAL_BOOT_PENDING
             || header.publication_count != 0
@@ -560,6 +567,7 @@ impl ExecBuildPlan {
                 random: self.header.random,
                 stack_top: self.header.stack_top,
                 stack_size: self.header.stack_size,
+                has_vdso: self.header.image_features & carrick_core_abi::X86_INITIAL_HAS_VDSO != 0,
             },
         };
         let mut frames = ExecBuildFrames {
