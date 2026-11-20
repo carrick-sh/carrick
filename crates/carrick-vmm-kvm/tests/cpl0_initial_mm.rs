@@ -4037,20 +4037,28 @@ fn ring_descriptor_run(mode: &str) -> (i32, Vec<(usize, u64)>) {
     std::fs::write(&path, b"loader library").expect("ring descriptor file");
     let file = format!("-DFILE_PATH=\"{}\"", path.display());
     let directory = format!("-DDIR_PATH=\"{}\"", dir.path().display());
-    let elf =
+    let oracle_elf =
         native_exit_fixture_with_flags("native_ring_descriptors.S", &[mode, &file, &directory]);
     let sibling = dir.path().join("parent-sibling");
     if mode == "-DDIRFD" {
         std::fs::write(&sibling, []).expect("parent's sibling file");
     }
     let oracle = dir.path().join("oracle");
-    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+    carrick_test_support::executable::write_executable_mode(&oracle, &oracle_elf, 0o700);
     let native = std::process::Command::new("timeout")
         .arg("10")
         .arg(&oracle)
         .output()
         .expect("bounded native ring descriptor control");
     assert!(native.status.success(), "{mode} native result: {native:?}");
+    let elf = if mode == "-DHOST_IOCTL" {
+        native_exit_fixture_with_flags(
+            "native_ring_descriptors.S",
+            &[mode, "-DCARRICK_GUEST", &file, &directory],
+        )
+    } else {
+        oracle_elf
+    };
     if mode == "-DDIRFD" {
         assert!(!sibling.exists(), "the native parent removed its sibling");
         std::fs::write(&sibling, []).expect("parent's sibling file for Carrick");
@@ -4180,14 +4188,15 @@ fn serial_host_fork_child_uses_host_file_xattrs() {
     );
 }
 
-/// Host-backed implicit stdio updates its guest OFD flags through FIONBIO.
+/// Host-backed implicit stdio updates its guest OFD flags through FIONBIO;
+/// an unlisted request stays a counted ENOSYS refusal.
 #[test]
 fn serial_host_fork_child_uses_allowlisted_host_ioctls() {
     assert_eq!(
         ring_descriptor_run("-DHOST_IOCTL"),
-        (0, vec![]),
-        "105 FIONBIO stdout, 106 F_GETFL, 107 unknown ioctl, 108 TCGETS regular file, \
-         109 pipe2, 110 TCGETS pipe"
+        (0, vec![(16, 1)]),
+        "105 FIONBIO stdout, 106 F_GETFL, 107 unlisted ioctl ENOSYS, \
+         108 TCGETS regular file, 109 pipe2, 110 TCGETS pipe"
     );
 }
 
