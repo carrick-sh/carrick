@@ -168,7 +168,7 @@ pub struct PreparedFaultPath<
 #[cfg(target_os = "none")]
 pub struct HardwarePreparedResolver;
 
-#[cfg(any(target_os = "none", test))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 const fn hardware_inherited_prepared_supply() -> bool {
     true
 }
