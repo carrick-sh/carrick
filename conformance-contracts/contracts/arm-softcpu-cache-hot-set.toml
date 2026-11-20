@@ -34,6 +34,7 @@ vm_free = [
   "carrick-softcpu-aarch64-host::boot_probe::provider_handoffs_reuse_only_the_current_code_incarnation",
   "carrick-softcpu-aarch64-host::boot_probe::scalar_launcher_leaves_vector_state_in_the_cpu",
   "carrick-softcpu-aarch64-host::boot_probe::wide_resident_working_set_avoids_fifo_republication",
+  "carrick-softcpu-aarch64-host::boot_probe::wide_indirect_dispatch_table_retains_targets_across_passes",
 ]
 [bindings.unresolved]
 embed_structural = "The native ARM64 soft dispatcher witness runs without an embedded soft carrier."

@@ -889,6 +889,88 @@ fn wide_resident_working_set_avoids_fifo_republication() {
 }
 
 #[test]
+fn wide_indirect_dispatch_table_retains_targets_across_passes() {
+    const DISPATCH: u64 = 0x4000;
+    const LATCH: u64 = 0x4010;
+    const TABLE: u64 = 0x5000;
+    const TARGETS: u64 = 128;
+
+    // 0x4000: movz x1, #0            ; target index = 0
+    // 0x4004: add  x2, x3, x1, lsl #3; handler = TABLE + 8 * x1
+    // 0x4008: br   x2
+    // 0x400c: nop
+    // 0x4010: add  x1, x1, #1
+    // 0x4014: subs xzr, x1, #128
+    // 0x4018: b.lo 0x4004            ; -5 words
+    // 0x401c: subs x0, x0, #1
+    // 0x4020: b.ne 0x4000            ; -8 words
+    // 0x4024: hvc  #2
+    let dispatch_words = [
+        0xd280_0001u32,
+        0x8b01_0c62,
+        0xd61f_0040,
+        0xd503_201f,
+        0x9100_0421,
+        0xf102_003f,
+        0x5400_0003 | (((-5i32 as u32) & 0x7ffff) << 5),
+        0xf100_0400,
+        0x5400_0001 | (((-8i32 as u32) & 0x7ffff) << 5),
+        0xd400_0042,
+    ];
+    let mut handler_words = Vec::with_capacity(TARGETS as usize * 2);
+    for k in 0..TARGETS {
+        let handler_pc = TABLE + 8 * k;
+        let branch_pc = handler_pc + 4;
+        let offset_words = ((LATCH as i64 - branch_pc as i64) / 4) as i32;
+        handler_words.push(0x9100_0484); // add x4, x4, #1
+        handler_words.push(0x1400_0000 | ((offset_words as u32) & 0x03ff_ffff)); // b LATCH
+    }
+
+    for passes in [1u64, 10, 100] {
+        let mut runner = HostBlockRunner::new().unwrap().with_chaining(true);
+        let mut memory = Pages::default();
+        load_words(&mut memory, DISPATCH, &dispatch_words);
+        load_words(&mut memory, TABLE, &handler_words);
+        let mut cpu = el1_at(DISPATCH);
+        set_x(&mut cpu, 0, passes);
+        set_x(&mut cpu, 3, TABLE);
+        set_x(&mut cpu, 4, 0);
+        let report = run(
+            &mut cpu,
+            &mut ExclusiveMonitor::default(),
+            &mut memory,
+            &mut runner,
+            BlockLimits::default(),
+            passes * TARGETS * 4 + 16,
+        );
+        assert!(
+            matches!(
+                report.stop,
+                Stop::Event {
+                    event: Event::ProviderExit(exit),
+                    ..
+                } if exit.immediate.value() == 2
+            ),
+            "{report}"
+        );
+        assert_eq!(x(&cpu, 4), passes * TARGETS, "passes={passes}");
+        assert!(
+            report.work.indirect_chain_misses <= TARGETS + 1,
+            "passes={passes} work={:?}",
+            report.work
+        );
+        if passes > 1 {
+            assert_eq!(
+                report.work.indirect_chain_hits + report.work.indirect_chain_misses,
+                passes * TARGETS,
+                "passes={passes} work={:?}",
+                report.work
+            );
+        }
+    }
+}
+
+#[test]
 fn provider_handoffs_reuse_only_the_current_code_incarnation() {
     const PC: u64 = 0x4000;
     let mut runner = HostBlockRunner::new().unwrap();
