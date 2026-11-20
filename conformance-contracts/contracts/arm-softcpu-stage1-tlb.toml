@@ -1,0 +1,24 @@
+schema_version = 1
+id = "arm.softcpu.stage1-tlb"
+title = "Bound stage-1 walks in an AArch64 translated memory loop"
+guest_surfaces = ["isa:aarch64", "vmm:soft"]
+semantic_authority = [
+  "Arm ARM DDI0487G.a D5.4 and D5.8 (stage-1 permissions and faults), D5.10 (TLB maintenance), and C6.2 (LDR, STR, and TLBI).",
+]
+fixture = "carrick-softcpu-aarch64-host::boot_probe"
+scale_points = [1, 100, 10000]
+rationale = "The fixture asserts a maximum of three stage-1 walks, one each for the execute, read and write translations. It checks the copied word and reaches its HVC."
+# The fixture asserts total stage-1 walks directly. The generic meter's
+# softcpu_code_page_walks metric counts only code walks.
+structural_budgets = []
+
+[bindings]
+vm_free = [
+  "carrick-softcpu-aarch64-host::boot_probe::translated_memory_loop_walks_each_page_once",
+  "carrick-softcpu-aarch64::stage1::tlbi_invalidates_a_loaded_translation_before_the_next_load",
+]
+
+[bindings.unresolved]
+embed_structural = "The soft ARM engine currently runs through its host launcher and boot probe memory provider."
+signed = "The soft ARM launcher runs native AArch64 on Linux."
+docker = "A Docker Linux process cannot exercise the privileged stage-1 maintenance fixture. The Arm architecture defines the architectural results."

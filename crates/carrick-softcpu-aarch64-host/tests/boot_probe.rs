@@ -353,6 +353,58 @@ fn resident_loop_translates_only_two_blocks() {
 }
 
 #[test]
+fn translated_memory_loop_walks_each_page_once() {
+    const PC: u64 = LINUX_EL1_KERNEL_BASE;
+    const SOURCE: u64 = PC + PAGE;
+    const DEST: u64 = SOURCE + PAGE;
+    const VALUE: u64 = 0x1122_3344_5566_7788;
+    let mut walks = Vec::new();
+    for iterations in [1, 100, 10_000] {
+        let mut memory = Pages::default();
+        memory.load(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables());
+        // ldr x3, [x1]; str x3, [x2]; subs x0, x0, #1; b.ne to ldr; hvc #2.
+        for (index, word) in [
+            0xf940_0023_u32,
+            0xf900_0043,
+            0xf100_0400,
+            0x54ff_ffa1,
+            0xd400_0042,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            memory.load(PC + 4 * index as u64, &word.to_le_bytes());
+        }
+        memory.load(SOURCE, &VALUE.to_le_bytes());
+        memory.map_zero(DEST);
+        let mut cpu = CpuState::default();
+        cpu.pstate.el = ExceptionLevel::El1;
+        cpu.pstate.sp = StackSelect::El1;
+        cpu.pc = ProgramCounter(PC);
+        cpu.el1.tcr = SystemValue(TCR_EL1_BOOTSTRAP);
+        cpu.named.ttbr0 = SystemValue(LINUX_PAGE_TABLES_BASE);
+        cpu.el1.sctlr = Sctlr(SCTLR_EL1_BOOTSTRAP);
+        set_x(&mut cpu, 0, iterations);
+        set_x(&mut cpu, 1, SOURCE);
+        set_x(&mut cpu, 2, DEST);
+        let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
+        let report = probe(&mut cpu, &mut memory, &mut runner, 3 * iterations + 2);
+        assert!(matches!(
+            report.stop,
+            Stop::Event {
+                event: Event::ProviderExit(_),
+                ..
+            }
+        ));
+        assert_eq!(report.pc, ProgramCounter(PC + 20));
+        assert_eq!(read_u64(&mut memory, DEST), VALUE);
+        assert_eq!(report.work.retired_instructions, 4 * iterations + 1);
+        walks.push(report.work.stage1_walks);
+    }
+    assert_eq!(walks, [3; 3], "one walk per code, load and store page");
+}
+
+#[test]
 fn guest_code_write_replaces_the_resident_translation() {
     const CODE: u64 = 0x4000;
     const WRITER: u64 = 0x5000;
