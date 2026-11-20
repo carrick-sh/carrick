@@ -17,6 +17,8 @@ use carrick_softcpu_aarch64::state::CpuState;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 use carrick_softcpu_aarch64::translate::BlockFrame;
 use carrick_softcpu_aarch64::translate::TranslatedBlock;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+use carrick_softcpu_aarch64::{dispatch::BlockMemory, handler::InlineRam, translate::frame};
 
 /// Why a block could not be launched on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +54,8 @@ pub struct HostBlockRunner {
     retain_blocks: bool,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     retain_stage1: bool,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    inline_memory: bool,
     /// The engine frame region: the frame is its last element, so everything
     /// below it is headroom for host signal frames.
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -75,6 +79,9 @@ impl HostBlockRunner {
                 != Some(std::ffi::OsStr::new("0")),
             retain_stage1: std::env::var_os("CARRICK_SOFT_AARCH64_TLB").as_deref()
                 != Some(std::ffi::OsStr::new("0")),
+            inline_memory: cfg!(target_endian = "little")
+                && std::env::var_os("CARRICK_SOFT_AARCH64_INLINE_MEMORY").as_deref()
+                    != Some(std::ffi::OsStr::new("0")),
             region: vec![BlockFrame::default(); frames].into_boxed_slice(),
         })
     }
@@ -97,6 +104,11 @@ impl ExecuteBlock for HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     fn retain_stage1(&self) -> bool {
         self.retain_stage1
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn inline_memory(&self) -> bool {
+        self.inline_memory
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -132,25 +144,58 @@ impl ExecuteBlock for HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     fn execute(
         &mut self,
-        _block: &TranslatedBlock,
+        block: &TranslatedBlock,
         code: &HostCode,
         cpu: &mut CpuState,
     ) -> Result<usize, HostError> {
+        self.execute_with_memory(block, code, cpu, BlockMemory::default())
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn execute_with_memory(
+        &mut self,
+        _block: &TranslatedBlock,
+        code: &HostCode,
+        cpu: &mut CpuState,
+        mut memory: BlockMemory<'_>,
+    ) -> Result<usize, HostError> {
         let top = self.region.len() - 1;
         self.region[top].load_from(cpu);
+        let (read_ptr, write_ptr) = match &mut memory.ram {
+            InlineRam::None => (0, 0),
+            InlineRam::Separate { read, write } => (
+                read.map_or(0, |page| page.as_ptr() as u64),
+                write
+                    .as_deref_mut()
+                    .map_or(0, |page| page.as_mut_ptr() as u64),
+            ),
+            InlineRam::Shared(page) => {
+                let ptr = page.as_mut_ptr() as u64;
+                (ptr, ptr)
+            }
+        };
+        let slots = &mut self.region[top].slots;
+        slots[frame::INLINE_READ_VA as usize / 8] = memory.read.map_or(0, |va| va.raw());
+        slots[frame::INLINE_WRITE_VA as usize / 8] = memory.write.map_or(0, |va| va.raw());
+        slots[frame::INLINE_READ_PTR as usize / 8] = read_ptr;
+        slots[frame::INLINE_WRITE_PTR as usize / 8] = write_ptr;
         // Derived from the whole region: host signal frames land below `top`.
         let slot = self.region.as_mut_ptr().wrapping_add(top);
         // SAFETY: `code.entry` is the RX start of an emitted AAPCS64
         // function (translate::entry_stub/common_exit) that takes the frame
         // in x0, restores x19..x30 and host SP before returning the exit
-        // index in x0, and touches no memory but the frame and the region
-        // below it (memory words always exit). `slot` is the 16-byte aligned
-        // last frame of the live region, and `code` outlives the call.
+        // index in x0. Inline accesses use only these live RAM loans, after
+        // checking the virtual page tag and natural alignment. A missing
+        // loan (null pointer) exits before transferring bytes. `slot` is the
+        // 16-byte aligned last frame of the live region. Code and all backing
+        // allocations outlive the call.
         let index = unsafe {
             let block_fn =
                 core::mem::transmute::<usize, extern "C" fn(*mut BlockFrame) -> u64>(code.entry);
             block_fn(slot)
         };
+        self.region[top].slots[frame::INLINE_READ_PTR as usize / 8] = 0;
+        self.region[top].slots[frame::INLINE_WRITE_PTR as usize / 8] = 0;
         self.region[top].store_to(cpu);
         Ok(index as usize)
     }
