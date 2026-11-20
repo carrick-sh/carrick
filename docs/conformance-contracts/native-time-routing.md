@@ -469,7 +469,17 @@ and writes the same value if the pointer is present. The KVM witnesses
 bracket each vDSO result with raw calls in the native root and fork child.
 The ARM dispatch witness checks the two null operands in a native child.
 
-CPU-time clocks and times need live native CPU accounting. The native
-process owner has a rusage row and reaping charges, but its running member
-records have no user/system charge path or per-thread CPU totals. The host
-executor's thread ledger does not attribute execution to native members.
+CPU-time clocks and times read live native guest CPU accounting from the
+shared scheduler zone's per-record user/system counter ledger (`ZoneCpuLedger`).
+Each CPU slot records user vs ring-system execution windows against the
+qualified guest counter and closes the window across idle spins, `wfi`/`hlt`,
+parked waits, and synchronous host crossings so blocked time accrues zero CPU
+ticks. Non-last thread exits fold their retired record ticks into the process's
+`NativeResources` total, `CLOCK_THREAD_CPUTIME_ID` and `RUSAGE_THREAD` read the
+calling member's own record ticks, `CLOCK_PROCESS_CPUTIME_ID` and `RUSAGE_SELF`
+sum retired and live members, and reaped children fold into `children_rusage`
+(`wait4`, `getrusage(RUSAGE_CHILDREN)`, and `times` `tms_cutime`/`tms_cstime`).
+The ARM VM-free witnesses verify null/fault validation plus non-zero user,
+system, and reaped-child tick accounting; the KVM witness verifies raw/vDSO
+ordering, two-thread spin + raw `exit`, and two-process user/system + `wait4`
+children accounting against the native Linux x86_64 oracle.

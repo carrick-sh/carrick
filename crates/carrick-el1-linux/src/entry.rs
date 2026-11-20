@@ -85,6 +85,25 @@ pub unsafe extern "C" fn carrick_el1_syscall(
         carrick_el1::fault::serve_host_drain_hw(frame_ref);
         return El1Exit::Served.encode();
     }
+    if let Some(slot) = carrick_el1_abi::SlotId::from_index(frame_ref.slot as usize) {
+        let zone =
+            unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
+        if zone.counter_frequency().is_none()
+            && let Ok(freq) = carrick_guest_arch::InterruptBackend::frequency(
+                &mut carrick_el1::isa::signal_clock(),
+            )
+        {
+            zone.publish_counter_frequency(freq);
+        }
+        let now = carrick_el1::substrate::sched::ThreadCpu::now(
+            &carrick_el1::substrate::sched::HardwareCpu,
+        );
+        zone.cpu_enter_ring(
+            slot,
+            zone.current_record_ref(slot),
+            carrick_sched_core::CounterTick::new(now),
+        );
+    }
     let counters_ref =
         unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
     let mut owner_wait = None;

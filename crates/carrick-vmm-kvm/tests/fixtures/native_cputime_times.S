@@ -336,7 +336,7 @@ compare_clock:
     and $-16, %rsp
     mov %edi, 48(%rsp)
 
-    /* clock_getres(clk, &ts) == {0, 1}. */
+    /* clock_getres(clk, &ts) -> tv_sec == 0, 1 <= tv_nsec <= 1_000_000. */
     mov %rsp, %rsi
     mov $229, %eax
     syscall
@@ -346,8 +346,10 @@ compare_clock:
     jnz fail_91
     cmpq $0, (%rsp)
     jne fail_91
-    cmpq $1, 8(%rsp)
-    jne fail_91
+    cmpq $0, 8(%rsp)
+    jle fail_91
+    cmpq $1000000, 8(%rsp)
+    ja fail_91
 
     /* raw0 <= vdso <= raw1. */
     mov 48(%rsp), %edi

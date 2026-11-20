@@ -241,6 +241,24 @@ impl<
         venue.realtime_counter()
     }
 
+    fn cputime_nanos(&mut self, per_thread: bool) -> Option<u64> {
+        let isa = LifecycleNative::guest_isa(self);
+        let venue = self.process_venue()?;
+        if isa == carrick_guest_arch::GuestIsa::Aarch64 && venue.is_root_process() {
+            return None;
+        }
+        venue.cputime_nanos(per_thread)
+    }
+
+    fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {
+        let isa = LifecycleNative::guest_isa(self);
+        let venue = self.process_venue()?;
+        if isa == carrick_guest_arch::GuestIsa::Aarch64 && venue.is_root_process() {
+            return None;
+        }
+        venue.process_tms()
+    }
+
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
         let diagnostic = crate::file::CopyDiagnostic {
             counters: self.counters,

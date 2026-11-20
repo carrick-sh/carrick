@@ -4,9 +4,9 @@ use crate::abi::entry::SyscallResult;
 use crate::lifecycle::{LifecycleNative, LifecycleOutcome};
 use carrick_guest_arch::{CounterFrequency, CounterTick, UserVa};
 use carrick_syscall_abi::{
-    LINUX_CLOCK_MONOTONIC, LINUX_CLOCK_MONOTONIC_RAW, LINUX_CLOCK_REALTIME,
-    LINUX_CLOCK_REALTIME_COARSE, LINUX_CLOCK_RESOLUTION_NSEC, LINUX_EINVAL,
-    linux_clock_resolution_ns,
+    LINUX_CLOCK_MONOTONIC, LINUX_CLOCK_MONOTONIC_RAW, LINUX_CLOCK_PROCESS_CPUTIME_ID,
+    LINUX_CLOCK_REALTIME, LINUX_CLOCK_REALTIME_COARSE, LINUX_CLOCK_RESOLUTION_NSEC,
+    LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_EINVAL, linux_clock_resolution_ns,
 };
 
 pub(crate) fn clock_getres(native: &mut dyn LifecycleNative<'_>) -> LifecycleOutcome {
@@ -42,8 +42,16 @@ const fn uses_realtime_words(clock: u64) -> bool {
     )
 }
 
+const fn uses_cputime(clock: u64) -> Option<bool> {
+    match clock as i32 as u64 {
+        LINUX_CLOCK_PROCESS_CPUTIME_ID => Some(false),
+        LINUX_CLOCK_THREAD_CPUTIME_ID => Some(true),
+        _ => None,
+    }
+}
+
 pub(crate) const fn serves_clock_gettime(clock: u64) -> bool {
-    uses_realtime_words(clock) || uses_monotonic_counter(clock)
+    uses_realtime_words(clock) || uses_monotonic_counter(clock) || uses_cputime(clock).is_some()
 }
 
 fn counter_nanos(sample: CounterTick, frequency: CounterFrequency) -> u64 {
@@ -66,6 +74,8 @@ pub(crate) fn clock_gettime(native: &mut dyn LifecycleNative<'_>) -> Option<Life
     }
     let mut nanos = if uses_realtime_words(clock) {
         realtime_nanos(native)?
+    } else if let Some(per_thread) = uses_cputime(clock) {
+        native.cputime_nanos(per_thread)?
     } else {
         let (sample, frequency) = native.monotonic_counter()?;
         counter_nanos(sample, frequency)
@@ -117,4 +127,25 @@ pub(crate) fn realtime_alias(
         ([timeval, timezone], SyscallResult::new(0))
     };
     Some(native.finish_time_output(records, result))
+}
+
+pub(crate) fn times(native: &mut dyn LifecycleNative<'_>) -> Option<LifecycleOutcome> {
+    use carrick_syscall_abi::LINUX_CLK_TCK;
+    use zerocopy::IntoBytes;
+
+    let [output, ..] = native.arguments();
+    let (sample, frequency) = native.monotonic_counter()?;
+    let mono_ns = counter_nanos(sample, frequency);
+    let clock_ticks = LINUX_CLK_TCK.saturating_add((mono_ns / 10_000_000) as i64);
+    if output == 0 {
+        return Some(LifecycleOutcome::Returned {
+            result: SyscallResult::new(clock_ticks),
+            work: false,
+        });
+    }
+    let tms = native.process_tms()?;
+    Some(native.finish_time_output(
+        [Some((UserVa::new(output), tms.as_bytes().to_vec())), None],
+        SyscallResult::new(clock_ticks),
+    ))
 }

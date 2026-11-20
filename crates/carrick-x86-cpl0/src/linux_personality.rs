@@ -713,7 +713,16 @@ pub fn handle_user_page_fault_prepared(
     frame: &mut PageFaultStack,
     fpstate: &XsaveArea,
 ) -> u64 {
-    match supply_user_fault(prep) {
+    let zone = unsafe {
+        &*(carrick_el1::isa::x86_kernel_layout().zone.raw()
+            as *const carrick_el1::memory::reservations::X86Cpl0Zone)
+    };
+    if let Ok(now) =
+        carrick_guest_arch::InterruptBackend::counter(&mut carrick_el1::isa::x86::X86Backend)
+    {
+        zone.cpu_enter_ring(prep.slot, zone.current_record_ref(prep.slot), now);
+    }
+    let code = match supply_user_fault(prep) {
         UserFaultSupply::Served => 0,
         UserFaultSupply::Signal {
             signum,
@@ -721,7 +730,14 @@ pub fn handle_user_page_fault_prepared(
             address,
         } => deliver_page_fault_signal(frame, fpstate, signum, code, address),
         UserFaultSupply::Unresolved(reason) => reason,
+    };
+    if code == 0
+        && let Ok(now) =
+            carrick_guest_arch::InterruptBackend::counter(&mut carrick_el1::isa::x86::X86Backend)
+    {
+        zone.cpu_enter_user(prep.slot, zone.current_record_ref(prep.slot), now);
     }
+    code
 }
 
 /// What the owner fault path made of one user access.
