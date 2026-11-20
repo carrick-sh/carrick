@@ -1416,7 +1416,14 @@ mod forward_execution_tests {
         let mm = MmGeneration::new(NonZeroU64::new(302).unwrap());
         let stopped = carrick_el1_abi::EntryTaskKey::from_raw(43);
         let issued = carrick_el1_abi::EntryTaskKey::from_raw(42);
-        assert_eq!(forward_leader_task(None, mm, issued).unwrap(), issued);
+        let leader = forward_leader_task(None, mm, issued).unwrap();
+        assert_eq!(leader, issued);
+        let successor_mm = MmGeneration::new(NonZeroU64::new(303).unwrap());
+        assert_eq!(
+            forward_leader_task(None, successor_mm, issued).unwrap(),
+            issued,
+            "exec successor keeps the predecessor's registered child key"
+        );
         let (binding, context) = execution();
         let sibling = carrick_el1_abi::ExecutionBinding {
             task: stopped,
@@ -1426,7 +1433,7 @@ mod forward_execution_tests {
         let mut admitted =
             admit_forward_execution(cpu, cpu, sibling, context, context.root, context.generation)
                 .unwrap()
-                .with_leader_task(issued);
+                .with_leader_task(leader);
         assert!(matches!(
             admitted.authenticate_typed(carrier_binding(context, 12)),
             Err(ForwardBindingRefusal::TaskIdMismatch { .. })
