@@ -3371,6 +3371,72 @@ fn loaded_lane_child_syscall_trap_hands_task_back_to_host_and_delivers_stdout() 
     );
 }
 
+/// #2635: when root affinity is 1 (CPU 0 only), a forked child that execs a
+/// successor ELF and maps it privately (`HostFileCrossing` -> `capture_forward`
+/// -> `with_retained_forward` -> `complete_forward`) runs on the loaded lane
+/// (`carrier_cpu` `with_stopped_io` / `with_forward_io` / `with_retained_forward`)
+/// with zero idle-peer forwards while the parent waits in CPL0 `wait4`.
+#[test]
+fn loaded_lane_fork_exec_child_retained_host_file_forward_reads_host_file() {
+    let dir = tempfile::tempdir().expect("fork-exec host-read fixture dir");
+    let target = dir.path().join("fork-exec-target");
+    let define = format!("-DEXEC_TARGET_PATH=\"{}\"", target.display());
+    let elf = kvm_pool_fixture::assemble_fixture(
+        "../../../carrick-cli/tests/fixtures/x86_fork_exec_host_read.S",
+        &[&define],
+    );
+    carrick_test_support::executable::write_executable_mode(&target, &elf, 0o700);
+    let program =
+        carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("fork-exec host-read ELF");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        32,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .map_err(|failure| failure.error)
+    .expect("loaded-lane fork-exec child host-file read");
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.run.stdout, b"F");
+    assert!(outcome.run.stderr.is_empty());
+    let (_, host_forwards) = outcome
+        .physical
+        .initial_execution_witness()
+        .expect("loaded-lane execution witness");
+    assert!(
+        host_forwards >= 1,
+        "exec'd child's MAP_PRIVATE host-file read must cross as a retained forward, got {host_forwards}"
+    );
+    assert_eq!(
+        outcome
+            .physical
+            .idle_peer_forward_witness()
+            .expect("idle peer forward witness"),
+        0,
+        "affinity 1 must serve the exec'd child's retained forward on the loaded lane (CPU 0)"
+    );
+    let census = outcome
+        .physical
+        .exec_owner_census()
+        .expect("exec owner census");
+    assert_eq!(
+        (
+            census.reserved,
+            census.sealed,
+            census.adopted,
+            census.settled
+        ),
+        (1, 1, 1, 1),
+        "{census:?}"
+    );
+}
+
 /// Ruling 3 on #542: every idle-lane early return completes the run. With a
 /// zero-exit budget is independent per lane, so the child's first carrier
 /// exit (its `ppoll` host-readiness crossing; since #2157 a child's write is
