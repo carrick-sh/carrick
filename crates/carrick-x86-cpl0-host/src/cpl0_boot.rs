@@ -3576,7 +3576,6 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     peer_entry: Option<carrick_guest_arch::KernelVa>,
     peer_admission: InitialPeerAdmission,
     initial_task: Option<InitialTaskBinding>,
-    prepare_table_stock: Option<anonymous_owner::PrepareTableStock>,
     /// The ISA-neutral fork stock, loans and child quarantine.
     fork_stock: carrick_hal::fork_stock::ForkStock<
         carrick_hal::fork_stock::UntaggedRoots,
@@ -5010,7 +5009,6 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             peer_entry: None,
             peer_admission: InitialPeerAdmission::Cold,
             initial_task: None,
-            prepare_table_stock: None,
             fork_stock,
             maintenance_root: None,
             anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
@@ -5119,18 +5117,6 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     pub fn admit_peer(&mut self) {
         self.0.peer_admission = InitialPeerAdmission::Ready;
     }
-    pub fn seed_prepare_tables(
-        &mut self,
-        span: anonymous_owner::PrepareTableSpan,
-        bytes: &[u8],
-    ) -> Result<(), TrapError> {
-        self.0.prepare_table_stock = Some(
-            anonymous_owner::PrepareTableStock::seed(span, bytes).ok_or_else(|| {
-                fail("Prepare working table suffix is not exclusive zero storage")
-            })?,
-        );
-        Ok(())
-    }
     pub fn actual_run(&self) -> &Arc<[AtomicU32; 2]> {
         &self.0.actual_run
     }
@@ -5178,10 +5164,10 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     }
     pub fn install_fork_stock(
         &mut self,
-        root: RootGpa,
+        context: AddressContext<RootGpa>,
         unused: Vec<RootGpa>,
     ) -> Result<(), TrapError> {
-        self.0.install_fork_stock(root, unused)
+        self.0.install_fork_stock(context, unused)
     }
     pub fn fork_stock_counters(&self) -> carrick_hal::fork_stock::ForkStockCounters {
         self.0.fork_stock_counters()
@@ -6458,7 +6444,7 @@ pub fn load_guest_mm<C: Cpl0BootCarrier>(
     let occupied_end = frame_offset
         .checked_add(grant_count * 4096)
         .ok_or_else(|| fail("initial occupied physical extent"))?;
-    let prepare_span = anonymous_owner::prepare_table_suffix(extent_len, occupied_end)
+    anonymous_owner::prepare_table_suffix(extent_len, occupied_end)
         .ok_or_else(|| fail("initial records/grants overlap Prepare working stock"))?;
     let (mut inventory, grants) = InitialInventory::stage(
         carrier.custody().rollback_fault(),
@@ -6830,15 +6816,7 @@ pub fn load_guest_mm<C: Cpl0BootCarrier>(
                     .ok_or_else(|| fail("initial unused table alignment"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        carrier.custody_mut().install_fork_stock(root, unused)?;
-        let stock_bytes = carrier
-            .custody()
-            .memory()
-            .read(prepare_span.start(), prepare_span.len().raw() as usize)
-            .map_err(|error| fail(error.to_string()))?;
-        carrier
-            .custody_mut()
-            .seed_prepare_tables(prepare_span, &stock_bytes)?;
+        carrier.custody_mut().install_fork_stock(context, unused)?;
         match carrier.run_cpu(0)? {
             VcpuExit::IoOut {
                 port: X86_INITIAL_RUNNER_READY_PORT,
