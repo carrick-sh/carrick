@@ -2495,6 +2495,14 @@ fn native_fork_child_clock_nanosleep_clocks_and_flags_match_linux() {
 }
 
 #[test]
+fn native_fork_child_clock_getres_reaches_time_handler() {
+    let number = carrick_abi::syscall::nr::CLOCK_GETRES;
+    // A null result is allowed for a valid clock. An invalid id still fails.
+    assert_eq!(native_fork_child_time_result(number, 1, 0), (0, 0));
+    assert_eq!(native_fork_child_time_result(number, 12, 0), (-22, 0));
+}
+
+#[test]
 #[ignore = "#1808 slice 3: clock_gettime/adjtimex/clock_adjtime routing"]
 fn native_fork_child_clock_gettime_reaches_time_handler() {
     native_fork_child_time_handler(carrick_abi::syscall::nr::CLOCK_GETTIME);
