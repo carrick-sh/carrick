@@ -1,6 +1,7 @@
 /* Production fork, child nanosleep or clock_nanosleep, and parent wait. The
  * exit status reports 8 for a zero return, 218 for -ENOSYS, 91 for any other
  * answer. Parent and child remain live during the call (#1808).
+ *   CLOCK_GETRES      root and child clock_getres with a writable result
  *   default            nanosleep({0, 1 ms}, &rem): parks, expires, returns 0
  *   SLEEP_ZERO         nanosleep({0, 0}, &rem): 0 without parking
  *   SLEEP_ABSOLUTE     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME,
@@ -9,6 +10,9 @@
 .global _start
 .text
 _start:
+#ifdef CLOCK_GETRES
+    call clock_getres
+#endif
     mov $57, %eax
     syscall
     test %eax, %eax
@@ -30,6 +34,10 @@ _start:
     shr $8, %edi
     jmp exit
 child:
+#ifdef CLOCK_GETRES
+    call clock_getres
+    jmp success
+#else
     sub $32, %rsp
     movq $0, (%rsp)
 #if defined(SLEEP_ZERO)
@@ -57,6 +65,7 @@ child:
     jne failure
     mov $218, %edi
     jmp exit
+#endif
 success:
     mov $8, %edi
     jmp exit
@@ -66,4 +75,29 @@ exit:
     mov $231, %eax
     syscall
     ud2
+#ifdef CLOCK_GETRES
+clock_getres:
+    sub $16, %rsp
+    movq $-1, (%rsp)
+    movq $-1, 8(%rsp)
+    mov $1, %edi
+    mov %rsp, %rsi
+    mov $229, %eax
+    syscall
+    cmp $-38, %rax
+    je clock_refused
+    test %rax, %rax
+    jne failure
+    cmpq $0, (%rsp)
+    jne failure
+    mov 8(%rsp), %rax
+    dec %rax
+    cmp $999999998, %rax
+    ja failure
+    add $16, %rsp
+    ret
+clock_refused:
+    mov $218, %edi
+    jmp exit
+#endif
 .section .note.GNU-stack,"",@progbits
