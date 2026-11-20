@@ -1787,6 +1787,14 @@ fn assert_fixture_sha256(path: &str, bytes: &[u8], expected: &str) {
     assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected, "{path}");
 }
 
+fn read_pinned_fixture(root: &FixtureRoot, path: &str, sha256: &str) -> Vec<u8> {
+    let bytes = root
+        .read(path)
+        .unwrap_or_else(|err| panic!("read fixture {path}: {err}"));
+    assert_fixture_sha256(path, &bytes, sha256);
+    bytes
+}
+
 const GLIBC_LOADER: &str = "/lib/ld-linux-aarch64.so.1";
 const GLIBC_LOADER_SHA256: &str =
     "393ca646b316f6cb31dc82dc72becff344bf6491458f98c07036fea73f1db55e";
@@ -1810,13 +1818,10 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() 
     )
     .expect("utf-8 hello.compiler");
     let compiler = compiler.lines().next().expect("fixture compiler version");
-    let libc = root.read(GLIBC_LIBC).expect("read fixture libc.so.6");
-    assert_fixture_sha256(GLIBC_LIBC, &libc, GLIBC_LIBC_SHA256);
+    read_pinned_fixture(&root, GLIBC_LIBC, GLIBC_LIBC_SHA256);
     let program = carrick_mem::elf::ElfProgram::load(&hello, 183, &|path| {
         assert_eq!(path, GLIBC_LOADER);
-        let bytes = root.read(path).expect("read fixture loader");
-        assert_fixture_sha256(path, &bytes, GLIBC_LOADER_SHA256);
-        Some(bytes)
+        Some(read_pinned_fixture(&root, path, GLIBC_LOADER_SHA256))
     })
     .expect("plan glibc hello and its interpreter");
     let (mut cpu, mut memory) = stage_dynamic(&program, vec![b"/hello".to_vec()], Vec::new());
@@ -1828,18 +1833,43 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() 
     assert_eq!(replies.report_ifuncs(&mut memory, &program), 3);
 }
 
-/// Set CARRICK_A64_PYTHON_ROOT to an extracted linux/arm64 python:3.12-slim
-/// filesystem and CARRICK_A64_ELF to the production EL1 image.
+/// Prepare CARRICK_A64_PYTHON_ROOT with scripts/ci/fetch-arm64-python.sh
+/// and use the production CARRICK_A64_ELF.
 #[test]
+#[ignore = "requires CARRICK_A64_PYTHON_ROOT and CARRICK_A64_ELF"]
 fn production_el1_image_runs_dynamic_cpython() {
-    let Some(root) = std::env::var_os("CARRICK_A64_PYTHON_ROOT") else {
-        return;
-    };
+    let root = std::env::var_os("CARRICK_A64_PYTHON_ROOT").expect("set CARRICK_A64_PYTHON_ROOT");
     let root = FixtureRoot::new(root.into());
+    read_pinned_fixture(
+        &root,
+        "/.carrick-image-manifest.json",
+        "c61cffc3bacb94ed026ff8b45d5114b7693dd0420baca0a1ace0e3d0ce9035fd",
+    );
+    read_pinned_fixture(
+        &root,
+        "/usr/local/lib/libpython3.12.so.1.0",
+        "b47ddc5feba01ab2d2af3384f9ff1f43d569fe9af183e848c948b8c055850279",
+    );
+    read_pinned_fixture(
+        &root,
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "70fa4c4cf57eabeb96097cce47582d02379c4cd1de3db3e98ade4dd7089a1b13",
+    );
     let executable = "/usr/local/bin/python3";
-    let python = root.read(executable).expect("read CPython");
-    let program = carrick_mem::elf::ElfProgram::load(&python, 183, &|path| root.read(path).ok())
-        .expect("plan CPython and its interpreter");
+    let python = read_pinned_fixture(
+        &root,
+        executable,
+        "36727872f3be3469d83c23705431d90ab2b408a0ba1e3008ba3d4dd337b7f481",
+    );
+    let program = carrick_mem::elf::ElfProgram::load(&python, 183, &|path| {
+        assert_eq!(path, GLIBC_LOADER);
+        Some(read_pinned_fixture(
+            &root,
+            path,
+            "1b882eddacd494b060413a8aa4f0a4754ee3f84775e68cecbf8a86092b59cca6",
+        ))
+    })
+    .expect("plan CPython and its interpreter");
     let (mut cpu, mut memory) = stage_dynamic(
         &program,
         vec![
@@ -1853,13 +1883,10 @@ fn production_el1_image_runs_dynamic_cpython() {
     let result = run_dynamic_glibc(&mut cpu, &mut memory, &mut replies, 100_000_000);
     replies.report_ifuncs(&mut memory, &program);
     assert_eq!(result, Ok(0));
-    let version = std::str::from_utf8(&replies.stdout).unwrap();
-    let patch = version
-        .strip_prefix("3.12.")
-        .and_then(|v| v.strip_suffix('\n'));
-    assert!(
-        patch.is_some_and(|v| v.parse::<u32>().is_ok()),
-        "{version:?}"
+    assert_eq!(replies.stdout, b"3.12.16\n");
+    println!(
+        "guest stdout={:?} exit_group(0)",
+        String::from_utf8_lossy(&replies.stdout)
     );
 }
 
