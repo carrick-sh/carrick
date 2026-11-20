@@ -14,6 +14,7 @@ vm_free = [
 embed = [
   "carrick-conformance-next::deferred_anonymous_pristine_scrub_semantics",
   "carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_anonymous_advice_stays_in_ring (live CPL0 root and fork child, resident zero-fill and independent writes)",
+  "carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_anonymous_advice_busy_once_then_succeeds (one editor park, zero syscall refusals, the same resident discard completes)",
 ]
 docker = [
   "same-source fixtures/pristine_scrub.py; pinned native ARM64 cpython-test image; discard-boundary evidence",

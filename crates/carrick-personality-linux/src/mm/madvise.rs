@@ -7,7 +7,11 @@
 //! No coverage lookup or effect occurs before argument validation. All per-VMA
 //! EINVAL checks precede effects; holes are reported only after covered effects.
 
+use super::NodeFlagsPolicy;
 use alloc::vec::Vec;
+use carrick_core::mm::reservation::{Refusal, ReservationGeometry, Reservations};
+use carrick_core_abi::ReservationNodeFlags as Flags;
+use carrick_core_abi::ReservationRange;
 use carrick_guest_arch::{GuestLen, GuestVa};
 use carrick_syscall_abi::{
     LINUX_EINVAL, LINUX_ENOMEM, LINUX_MADV_COLLAPSE, LINUX_MADV_DODUMP, LINUX_MADV_DOFORK,
@@ -62,18 +66,34 @@ impl Advice {
         }
     }
 
-    /// Dump/fork attributes require the host venue until root attribute edits
-    /// exist. This classification does not route or serve any ring calls.
-    pub const fn requires_host_attributes(self) -> bool {
-        matches!(
-            self,
-            Self::DontFork
-                | Self::DoFork
-                | Self::WipeOnFork
-                | Self::KeepOnFork
-                | Self::DontDump
-                | Self::DoDump
-        )
+    /// Dump and fork attributes live on the mapping owner.
+    pub const fn reservation_attribute(
+        self,
+    ) -> Option<(carrick_core_abi::ReservationNodeFlags, bool)> {
+        use carrick_core_abi::ReservationNodeFlags as Flags;
+        match self {
+            Self::DontFork => Some((Flags::DONTFORK, true)),
+            Self::DoFork => Some((Flags::DONTFORK, false)),
+            Self::WipeOnFork => Some((Flags::WIPEONFORK, true)),
+            Self::KeepOnFork => Some((Flags::WIPEONFORK, false)),
+            Self::DontDump => Some((Flags::DONTDUMP, true)),
+            Self::DoDump => Some((Flags::DONTDUMP, false)),
+            _ => None,
+        }
+    }
+
+    fn action(self, class: Class) -> Action {
+        if self.reservation_attribute().is_some() {
+            Action::UpdateAttributes(self)
+        } else if self == Self::DontNeed {
+            match class {
+                Class::PrivateAnonymous => Action::DiscardPrivateAnonymous,
+                Class::PrivateFile => Action::RestorePrivateFile,
+                Class::Shared | Class::Special => Action::None,
+            }
+        } else {
+            Action::None
+        }
     }
 }
 
@@ -85,6 +105,29 @@ pub struct Range {
     pub end: GuestVa,
 }
 impl Range {
+    pub fn from_args(
+        address: GuestVa,
+        length: GuestLen,
+        advice: Advice,
+        page_size: GuestLen,
+    ) -> Result<Self, LinuxErrno> {
+        let page_size = page_size.raw();
+        if !address.raw().is_multiple_of(page_size) || advice == Advice::Unsupported {
+            return Err(LINUX_EINVAL);
+        }
+        // Retain the host handler's size_t admission before endpoint rounding.
+        usize::try_from(length.raw()).map_err(|_| LINUX_ENOMEM)?;
+        let end = address
+            .raw()
+            .checked_add(length.raw())
+            .and_then(|end| end.checked_next_multiple_of(page_size))
+            .ok_or(LINUX_ENOMEM)?;
+        Ok(Self {
+            start: address,
+            end: GuestVa::new(end),
+        })
+    }
+
     pub fn is_empty(self) -> bool {
         self.start == self.end
     }
@@ -102,6 +145,12 @@ pub enum Class {
     Special,
 }
 
+impl Class {
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
 /// A venue's retained segment, including any data needed to apply its effect.
 pub trait Segment {
     fn range(&self) -> Range;
@@ -109,31 +158,89 @@ pub trait Segment {
     fn droppable(&self) -> bool;
 }
 
-/// Coverage observed under the caller's MM authority. Holes are implicit
-/// between segments; lock state also includes locks overlapping those holes,
-/// preserving the existing host locked-range-table check.
+/// Shared streaming admission over ordered, clipped VMA segments. A ring
+/// caller walks its tree without allocating while it holds the MM root.
+pub struct Assessment {
+    cursor: GuestVa,
+    end: GuestVa,
+    contiguous: bool,
+    any_segment: bool,
+    any_droppable: bool,
+    classes: u8,
+}
+impl Assessment {
+    pub fn new(range: Range) -> Self {
+        Self {
+            cursor: range.start,
+            end: range.end,
+            contiguous: true,
+            any_segment: false,
+            any_droppable: false,
+            classes: 0,
+        }
+    }
+
+    pub fn observe(&mut self, range: Range, class: Class, droppable: bool) {
+        self.contiguous &= range.start == self.cursor;
+        self.cursor = range.end;
+        self.any_segment = true;
+        self.any_droppable |= droppable;
+        self.classes |= class.bit();
+    }
+
+    pub fn fully_mapped(&self) -> bool {
+        self.contiguous && self.cursor == self.end
+    }
+
+    /// Pre-effect errors are distinct from the hole verdict returned after
+    /// successful effects on covered mappings.
+    pub fn verdict(
+        &self,
+        advice: Advice,
+        locked: bool,
+    ) -> Result<Result<(), LinuxErrno>, LinuxErrno> {
+        if !self.any_segment {
+            return Err(LINUX_ENOMEM);
+        }
+        let rejected = match advice {
+            Advice::DontNeed => locked,
+            Advice::KeepOnFork => self.any_droppable,
+            Advice::DoFork => self.classes & Class::Special.bit() != 0,
+            Advice::WipeOnFork => self.classes & !Class::PrivateAnonymous.bit() != 0,
+            Advice::Free => self.classes & Class::Shared.bit() != 0,
+            _ => false,
+        };
+        if rejected {
+            return Err(LINUX_EINVAL);
+        }
+        Ok(if self.fully_mapped() {
+            Ok(())
+        } else {
+            Err(LINUX_ENOMEM)
+        })
+    }
+}
+
+/// Coverage observed under the caller's MM authority. Lock state also
+/// includes locks overlapping holes, preserving the host lock-table check.
 pub struct Snapshot<S> {
     pub covered: Vec<S>,
     pub fully_mapped: bool,
     pub any_droppable: bool,
+    assessment: Assessment,
     locked: bool,
 }
 impl<S: Segment> Snapshot<S> {
     pub fn new(range: Range, covered: Vec<S>, locked: bool) -> Self {
-        let mut cursor = range.start;
-        let mut fully_mapped = true;
-        let mut any_droppable = false;
+        let mut assessment = Assessment::new(range);
         for segment in &covered {
-            let next = segment.range();
-            fully_mapped &= next.start == cursor;
-            cursor = next.end;
-            any_droppable |= segment.droppable();
+            assessment.observe(segment.range(), segment.class(), segment.droppable());
         }
-        fully_mapped &= cursor == range.end;
         Self {
             covered,
-            fully_mapped,
-            any_droppable,
+            fully_mapped: assessment.fully_mapped(),
+            any_droppable: assessment.any_droppable,
+            assessment,
             locked,
         }
     }
@@ -179,72 +286,24 @@ pub fn plan<C: Coverage>(
     advice: Advice,
     page_size: GuestLen,
 ) -> Result<Plan<C::Segment>, LinuxErrno> {
-    let page_size = page_size.raw();
-    if !address.raw().is_multiple_of(page_size) || advice == Advice::Unsupported {
-        return Err(LINUX_EINVAL);
-    }
-    if length.raw() == 0 {
+    let range = Range::from_args(address, length, advice, page_size)?;
+    if range.is_empty() {
         return Ok(Plan {
-            range: Range {
-                start: address,
-                end: address,
-            },
+            range,
             advice,
             steps: Vec::new(),
             result: Ok(()),
         });
     }
-    // Retain the host handler's size_t admission before endpoint rounding.
-    usize::try_from(length.raw()).map_err(|_| LINUX_ENOMEM)?;
-    let raw_end = address
-        .raw()
-        .checked_add(length.raw())
-        .ok_or(LINUX_ENOMEM)?;
-    let end = raw_end
-        .checked_next_multiple_of(page_size)
-        .ok_or(LINUX_ENOMEM)?;
-    let range = Range {
-        start: address,
-        end: GuestVa::new(end),
-    };
     coverage.check_range(range)?;
     let snapshot = coverage.snapshot(range);
-    if snapshot.covered.is_empty() {
-        return Err(LINUX_ENOMEM);
-    }
-    // Validate every covered VMA before exposing any executable plan.
-    let rejected = (advice == Advice::DontNeed && snapshot.locked)
-        || (advice == Advice::KeepOnFork && snapshot.any_droppable)
-        || snapshot.covered.iter().any(|segment| match advice {
-            Advice::DoFork => segment.class() == Class::Special,
-            Advice::WipeOnFork => segment.class() != Class::PrivateAnonymous,
-            Advice::Free => segment.class() == Class::Shared,
-            _ => false,
-        });
-    if rejected {
-        return Err(LINUX_EINVAL);
-    }
-    let result = if snapshot.fully_mapped {
-        Ok(())
-    } else {
-        Err(LINUX_ENOMEM)
-    };
+    let result = snapshot.assessment.verdict(advice, snapshot.locked)?;
     let steps = snapshot
         .covered
         .into_iter()
-        .map(|segment| {
-            let action = if advice.requires_host_attributes() {
-                Action::UpdateAttributes(advice)
-            } else if advice == Advice::DontNeed {
-                match segment.class() {
-                    Class::PrivateAnonymous => Action::DiscardPrivateAnonymous,
-                    Class::PrivateFile => Action::RestorePrivateFile,
-                    Class::Shared | Class::Special => Action::None,
-                }
-            } else {
-                Action::None
-            };
-            Step { segment, action }
+        .map(|segment| Step {
+            action: advice.action(segment.class()),
+            segment,
         })
         .collect();
     Ok(Plan {
@@ -253,6 +312,80 @@ pub fn plan<C: Coverage>(
         steps,
         result,
     })
+}
+
+/// An entry-owned plan. Attribute effects stay on the reservation node,
+/// and discards retire backing through the caller's descriptor venue.
+pub enum NativeEffect {
+    Answer(Result<(), LinuxErrno>),
+    Attributes(ReservationRange, Flags, Flags, Result<(), LinuxErrno>),
+    Discard(ReservationRange, Result<(), LinuxErrno>),
+}
+
+#[inline(never)]
+pub fn plan_reservation<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
+    root: &mut Reservations<'_, super::LinuxReservationPolicy, G, C>,
+    address: GuestVa,
+    length: GuestLen,
+    advice: Advice,
+    page_size: GuestLen,
+) -> Result<NativeEffect, Refusal> {
+    let range = match Range::from_args(address, length, advice, page_size) {
+        Err(errno) => return Ok(NativeEffect::Answer(Err(errno))),
+        Ok(range) if range.is_empty() => return Ok(NativeEffect::Answer(Ok(()))),
+        Ok(range) => range,
+    };
+    let Some(span) = ReservationRange::new(range.start.raw(), range.end.raw()) else {
+        return Ok(NativeEffect::Answer(Err(LINUX_ENOMEM)));
+    };
+    let mut assessment = Assessment::new(range);
+    let mut locked = false;
+    let mut foreign = false;
+    root.observe_range(span, &mut |mapping| {
+        let flags = mapping.flags;
+        let class = if flags.root_editable() && mapping.host_backing.is_some() {
+            Class::PrivateFile
+        } else if flags.root_editable()
+            && flags.contains(Flags::ANONYMOUS_PRIVATE)
+            // Imported image bytes have no retained file source for re-fault.
+            && !(flags.contains(Flags::IMAGE) && advice == Advice::DontNeed)
+        {
+            Class::PrivateAnonymous
+        } else {
+            foreign = true;
+            Class::Special
+        };
+        locked |= flags.contains(Flags::LOCKED);
+        assessment.observe(
+            Range {
+                start: GuestVa::new(mapping.range.start().max(span.start())),
+                end: GuestVa::new(mapping.range.end().min(span.end())),
+            },
+            class,
+            false,
+        );
+    })?;
+    if foreign {
+        return Err(Refusal::ForeignMapping);
+    }
+    let result = match assessment.verdict(advice, locked) {
+        Ok(result) => result,
+        Err(errno) => return Ok(NativeEffect::Answer(Err(errno))),
+    };
+    // All covered mappings are private and owned. Retire their backing in
+    // one edit. The planner's hole verdict follows successful effects.
+    if advice == Advice::DontNeed {
+        Ok(NativeEffect::Discard(span, result))
+    } else if let Some((flag, enabled)) = advice.reservation_attribute() {
+        let (set, clear) = if enabled {
+            (flag, Flags::EMPTY)
+        } else {
+            (Flags::EMPTY, flag)
+        };
+        Ok(NativeEffect::Attributes(span, set, clear, result))
+    } else {
+        Ok(NativeEffect::Answer(result))
+    }
 }
 
 #[cfg(test)]

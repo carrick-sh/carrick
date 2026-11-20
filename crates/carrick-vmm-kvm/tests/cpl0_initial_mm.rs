@@ -166,6 +166,29 @@ fn serial_host_native_anonymous_advice_stays_in_ring() {
 }
 
 #[test]
+fn serial_host_native_anonymous_advice_busy_once_then_succeeds() {
+    let elf = native_exit_fixture_with_flags(
+        "native_child_mmap_hint.S",
+        &["-DADVICE", "-DADVICE_BUSY", "-DROOT_ONLY"],
+    );
+    let outcome = kvm_pool_fixture::run_instrumented_pool_fixture(&elf, 192);
+    assert_eq!(
+        outcome.run.exit_code,
+        0,
+        "{}",
+        String::from_utf8_lossy(&outcome.run.stdout)
+    );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    assert_eq!(
+        counters.refused[28].load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+}
+
+#[test]
 fn serial_host_native_anonymous_remap_stays_in_ring() {
     native_anonymous_advice_fixture("-DREMAP");
 }
