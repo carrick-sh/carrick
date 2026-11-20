@@ -1646,9 +1646,15 @@ impl FutexVenue for NativeLane<'_> {
                 )
                 .ok()?;
         }
+        let enrollment = carrick_sched_core::FutexEnrollment {
+            address: wait.address,
+            expected: wait.expected,
+            observed: word,
+            frame: None,
+        };
         if self
             .zone
-            .enqueue(
+            .enqueue_observed(
                 &guard,
                 record,
                 seq,
@@ -1656,6 +1662,7 @@ impl FutexVenue for NativeLane<'_> {
                 key.scheduler_address(),
                 wait.bitset,
                 0,
+                Some(enrollment),
             )
             .is_err()
         {

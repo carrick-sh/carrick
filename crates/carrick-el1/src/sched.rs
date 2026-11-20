@@ -483,8 +483,16 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             }
             return Ok(None);
         }
+        let address = carrick_guest_arch::UserVa::new(uaddr & !3);
+        let enrollment = carrick_sched_core::FutexEnrollment {
+            address,
+            expected,
+            observed: word,
+            frame: carrick_el1_abi::ReservationMm::new(mm)
+                .and_then(|mm| crate::isa::futex_grant_observation(mm, address)),
+        };
         if zone
-            .enqueue(&guard, record, seq, mm, uaddr, bitset, 0)
+            .enqueue_observed(&guard, record, seq, mm, uaddr, bitset, 0, Some(enrollment))
             .is_err()
         {
             zone.cancel_timer_admission(zone.record_ref(record));

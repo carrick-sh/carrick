@@ -587,6 +587,22 @@ pub enum GuestIsa {
     Aarch64,
     X86_64,
 }
+/// Logical frame identity recorded alongside a futex word comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserWordFrame {
+    pub id: core::num::NonZeroU64,
+    pub generation: core::num::NonZeroU64,
+    /// A guest-side grant journal reports the committed mapping. A host
+    /// transfer can attest the exact backing it retained through the load.
+    pub source: UserWordFrameSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserWordFrameSource {
+    CommittedGrant,
+    RetainedCopy,
+}
+
 /// Native entry mechanism, without a syscall personality interpretation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeAbi {

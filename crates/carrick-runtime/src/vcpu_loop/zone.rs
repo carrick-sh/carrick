@@ -32,8 +32,8 @@ use carrick_kernel::el1_zone::HostLockWait;
 fn load_zone_futex_word(
     memory: &impl carrick_guest_mem::CurrentMmMemory,
     address: u64,
-) -> Result<u32, carrick_guest_mem::MemoryError> {
-    memory.atomic_load_user_u32(address)
+) -> Result<(u32, Option<carrick_guest_mem::UserWordFrame>), carrick_guest_mem::MemoryError> {
+    memory.atomic_load_user_u32_with_frame(address)
 }
 
 pub(super) enum OwnerMemoryAction {
@@ -122,7 +122,7 @@ mod futex_word_tests {
 
     #[test]
     fn zone_futex_recheck_uses_owner_aware_atomic_word_load() {
-        assert_eq!(load_zone_futex_word(&OwnerWord, 0x4000).unwrap(), 7);
+        assert_eq!(load_zone_futex_word(&OwnerWord, 0x4000).unwrap(), (7, None));
     }
 }
 
@@ -806,10 +806,10 @@ where
                         errno: crate::linux_abi::LINUX_EFAULT,
                     },
                 )),
-                Ok(word) if word != value => Err(DispatchOutcome::Errno {
+                Ok((word, _)) if word != value => Err(DispatchOutcome::Errno {
                     errno: crate::linux_abi::LINUX_EAGAIN,
                 }),
-                Ok(_) => match zone.alloc_record(identity) {
+                Ok((word, observed_frame)) => match zone.alloc_record(identity) {
                     Err(_) => Err(DispatchOutcome::Errno {
                         errno: crate::linux_abi::LINUX_EAGAIN,
                     }),
@@ -819,8 +819,14 @@ where
                             *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)?
                         };
                         let seq = zone.next_seq(record);
+                        let enrollment = carrick_sched_core::FutexEnrollment {
+                            address: uaddr.guest_address(),
+                            expected: value,
+                            observed: word,
+                            frame: observed_frame,
+                        };
                         if zone
-                            .enqueue(
+                            .enqueue_observed(
                                 &guard,
                                 record,
                                 seq,
@@ -828,6 +834,7 @@ where
                                 uaddr.scheduler_address(),
                                 bitset,
                                 index,
+                                Some(enrollment),
                             )
                             .is_err()
                         {

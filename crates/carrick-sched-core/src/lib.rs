@@ -104,7 +104,7 @@ pub mod refusal;
 pub mod spaces;
 mod x86_context;
 pub use aarch64_context::{AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext};
-pub use carrick_guest_arch::SavedSyscallPc;
+pub use carrick_guest_arch::{GuestIsa, SavedSyscallPc};
 pub use process::{
     Aarch64ThreadPointerRegister, ProcessContext, ThreadContext, ThreadPointerRegister,
     X86ThreadPointerRegister,
@@ -116,19 +116,97 @@ pub use x86_context::{
 /// Syscall registers normalized by the ISA-specific saved-context accessor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SavedSyscallRegisters {
+    pub isa: carrick_guest_arch::GuestIsa,
     pub number: u64,
     pub args: [u64; 6],
     pub pc: u64,
     pub lr: Option<u64>,
 }
 
+/// Actual result of the compare that admitted the wait. The original address
+/// survives a requeue, which may replace the linked wait key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FutexEnrollment {
+    pub address: carrick_guest_arch::UserVa,
+    pub expected: u32,
+    pub observed: u32,
+    pub frame: Option<carrick_guest_arch::UserWordFrame>,
+}
+
+#[repr(C)]
+struct FutexEnrollmentWords {
+    address: AtomicU64,
+    compared: AtomicU64,
+    frame_id: AtomicU64,
+    generation: AtomicU64,
+}
+
+impl FutexEnrollmentWords {
+    // These words are written before linking the entry and copied only under
+    // its current bucket lock. Futex addresses are 4-byte aligned. The low
+    // bits encode sample presence and provenance source, respectively.
+    fn store(&self, enrollment: Option<FutexEnrollment>) {
+        let Some(enrollment) = enrollment else {
+            self.address.store(0, Ordering::Relaxed);
+            return;
+        };
+        let frame = enrollment.frame;
+        self.compared.store(
+            (u64::from(enrollment.expected) << 32) | u64::from(enrollment.observed),
+            Ordering::Relaxed,
+        );
+        self.frame_id
+            .store(frame.map_or(0, |frame| frame.id.get()), Ordering::Relaxed);
+        self.generation.store(
+            frame.map_or(0, |frame| frame.generation.get()),
+            Ordering::Relaxed,
+        );
+        let source = frame.is_some_and(|frame| {
+            frame.source == carrick_guest_arch::UserWordFrameSource::RetainedCopy
+        });
+        self.address.store(
+            enrollment.address.raw() | 1 | (u64::from(source) << 1),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn load(&self) -> Option<FutexEnrollment> {
+        let address = self.address.load(Ordering::Relaxed);
+        if address & 1 == 0 {
+            return None;
+        }
+        let compared = self.compared.load(Ordering::Relaxed);
+        use carrick_guest_arch::{UserWordFrame, UserWordFrameSource};
+        let frame_id = core::num::NonZeroU64::new(self.frame_id.load(Ordering::Relaxed));
+        let generation = core::num::NonZeroU64::new(self.generation.load(Ordering::Relaxed));
+        Some(FutexEnrollment {
+            address: carrick_guest_arch::UserVa::new(address & !3),
+            expected: (compared >> 32) as u32,
+            observed: compared as u32,
+            frame: frame_id
+                .zip(generation)
+                .map(|(id, generation)| UserWordFrame {
+                    id,
+                    generation,
+                    source: if address & 2 == 0 {
+                        UserWordFrameSource::CommittedGrant
+                    } else {
+                        UserWordFrameSource::RetainedCopy
+                    },
+                }),
+        })
+    }
+}
+
 /// Read-only evidence from the first linked futex entry and its record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ParkedFutexSnapshot {
+    pub sequence: u32,
     pub mm: u64,
     pub scheduler_address: u64,
     pub bitset: u32,
     pub deadline_ticks: Option<u64>,
+    pub enrollment: Option<FutexEnrollment>,
     pub registers: SavedSyscallRegisters,
 }
 
@@ -139,6 +217,7 @@ pub trait CensusContext {
 impl CensusContext for ThreadCtx {
     fn syscall_registers(&self) -> SavedSyscallRegisters {
         SavedSyscallRegisters {
+            isa: carrick_guest_arch::GuestIsa::Aarch64,
             number: self.x[8],
             args: [
                 self.x[0], self.x[1], self.x[2], self.x[3], self.x[4], self.x[5],
@@ -1633,6 +1712,8 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     namespace: process::identity_allocator::NamespaceTable,
     /// Hint only; the Held claim is the custody authority. Appended ABI field.
     held_map: [AtomicU64; ZONE_RECORDS.div_ceil(64)],
+    /// Diagnostic samples indexed by the linked entry, without moving shared fields.
+    futex_enrollments: [FutexEnrollmentWords; ZONE_ENTRIES],
 }
 
 /// A fallible acquisition policy for callers that retain work on refusal.
@@ -3184,6 +3265,22 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         bitset: u32,
         index: u32,
     ) -> Result<(), Exhausted> {
+        self.enqueue_observed(guard, record, seq, mm, uaddr, bitset, index, None)
+    }
+
+    /// Link an entry with the compare evidence its caller already holds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_observed(
+        &self,
+        guard: &BucketGuard<'_, C>,
+        record: RecordId,
+        seq: u32,
+        mm: u64,
+        uaddr: u64,
+        bitset: u32,
+        index: u32,
+        enrollment: Option<FutexEnrollment>,
+    ) -> Result<(), Exhausted> {
         let Some(entry_id) = Self::alloc_bit(&self.entry_map, ZONE_ENTRIES) else {
             self.counters.exhausted.fetch_add(1, Ordering::Relaxed);
             return Err(Exhausted);
@@ -3201,6 +3298,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             .store(rec.first_entry.load(Ordering::Relaxed), Ordering::Relaxed);
         rec.first_entry.store(entry_id, Ordering::Relaxed);
         rec.entry_count.fetch_add(1, Ordering::Relaxed);
+        self.futex_enrollments[entry_id as usize].store(enrollment);
         self.link_tail(guard, entry_id);
         Ok(())
     }
@@ -6285,10 +6383,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         // registers, without putting an ISA save area on the EL1 stack.
         let registers = unsafe { (&*record.ctx.get()).syscall_registers() };
         Some(ParkedFutexSnapshot {
+            sequence: seq,
             mm: entry.mm.load(Ordering::Relaxed),
             scheduler_address: entry.uaddr.load(Ordering::Relaxed),
             bitset: entry.bitset.load(Ordering::Relaxed),
             deadline_ticks: record.deadline(),
+            enrollment: self.futex_enrollments[entry_id as usize].load(),
             registers,
         })
     }

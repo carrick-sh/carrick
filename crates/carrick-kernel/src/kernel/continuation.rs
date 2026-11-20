@@ -542,10 +542,14 @@ pub struct ContinuationDiagnostic {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZoneFutexDiagnostic {
+    pub sequence: u32,
     pub mm: u64,
     pub uaddr: u64,
     pub scheduler_address: u64,
+    pub compared_uaddr: Option<u64>,
     pub expected: Option<u32>,
+    pub observed: Option<u32>,
+    pub frame: Option<ZoneFutexFrame>,
     /// Raw Linux operation, including PRIVATE and CLOCK_REALTIME flags.
     pub op: Option<u64>,
     pub bitset: u32,
@@ -556,7 +560,30 @@ pub struct ZoneFutexDiagnostic {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ZoneFutexFrame {
+    pub id: u64,
+    pub generation: u64,
+    pub source: ZoneFutexFrameSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ZoneFutexFrameSource {
+    CommittedGrant,
+    RetainedCopy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ZoneFutexIsa {
+    Aarch64,
+    X86_64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ZoneFutexRegisters {
+    pub isa: ZoneFutexIsa,
     pub syscall_number: u64,
     pub args: [u64; 6],
     pub pc: u64,
@@ -578,10 +605,17 @@ impl From<carrick_sched_core::ParkedFutexSnapshot> for ZoneFutexDiagnostic {
             LINUX_FUTEX_WAIT_BITSET, syscall::nr,
         };
         let frame = wait.registers;
-        let number = if frame.lr.is_some() {
-            Some(carrick_abi::CanonicalNr::new(frame.number))
-        } else {
-            carrick_abi::syscall_x86_64::canonical_x86_64(carrick_abi::NativeNr(frame.number))
+        use carrick_guest_mem::UserWordFrameSource;
+        use carrick_sched_core::GuestIsa;
+        let (isa, number) = match frame.isa {
+            GuestIsa::Aarch64 => (
+                ZoneFutexIsa::Aarch64,
+                Some(carrick_abi::CanonicalNr::new(frame.number)),
+            ),
+            GuestIsa::X86_64 => (
+                ZoneFutexIsa::X86_64,
+                carrick_abi::syscall_x86_64::canonical_x86_64(carrick_abi::NativeNr(frame.number)),
+            ),
         };
         let [_, op, expected, timespec, _, _] = frame.args;
         let scalar = number == Some(nr::FUTEX);
@@ -606,15 +640,33 @@ impl From<carrick_sched_core::ParkedFutexSnapshot> for ZoneFutexDiagnostic {
             None
         };
         Self {
+            sequence: wait.sequence,
             mm: wait.mm,
             uaddr: wait.scheduler_address & !3,
             scheduler_address: wait.scheduler_address,
-            expected: scalar.then_some(expected as u32),
+            compared_uaddr: wait.enrollment.map(|sample| sample.address.raw()),
+            expected: wait
+                .enrollment
+                .map(|sample| sample.expected)
+                .or_else(|| scalar.then_some(expected as u32)),
+            observed: wait.enrollment.map(|sample| sample.observed),
+            frame: wait
+                .enrollment
+                .and_then(|sample| sample.frame)
+                .map(|frame| ZoneFutexFrame {
+                    id: frame.id.get(),
+                    generation: frame.generation.get(),
+                    source: match frame.source {
+                        UserWordFrameSource::CommittedGrant => ZoneFutexFrameSource::CommittedGrant,
+                        UserWordFrameSource::RetainedCopy => ZoneFutexFrameSource::RetainedCopy,
+                    },
+                }),
             op: scalar.then_some(op),
             bitset: wait.bitset,
             timeout,
             deadline_ticks: wait.deadline_ticks,
             registers: ZoneFutexRegisters {
+                isa,
                 syscall_number: frame.number,
                 args: frame.args,
                 pc: frame.pc,
@@ -725,21 +777,33 @@ fn detail_diagnostic(detail: &ContinuationDetail, futex: Option<ZoneFutexDiagnos
             );
             if let Some(futex) = futex {
                 use std::fmt::Write as _;
-                let frame = futex.registers;
+                let ZoneFutexDiagnostic {
+                    sequence,
+                    mm,
+                    uaddr,
+                    scheduler_address: _,
+                    compared_uaddr,
+                    expected,
+                    observed,
+                    frame,
+                    op,
+                    bitset,
+                    timeout,
+                    deadline_ticks,
+                    registers,
+                } = futex;
+                let ZoneFutexRegisters {
+                    syscall_number,
+                    args,
+                    pc,
+                    lr,
+                    ..
+                } = registers;
+                // Graph collection owns the queue and save area only. It has
+                // no execution loan or retained guest mapping for a reread.
                 let _ = write!(
                     detail,
-                    " mm={} uaddr={:#x} op={:?} expected={:?} bitset={:#x} timeout={:?} deadline_ticks={:?} syscall={} args={:x?} pc={:#x} lr={:x?}",
-                    futex.mm,
-                    futex.uaddr,
-                    futex.op,
-                    futex.expected,
-                    futex.bitset,
-                    futex.timeout,
-                    futex.deadline_ticks,
-                    frame.syscall_number,
-                    frame.args,
-                    frame.pc,
-                    frame.lr,
+                    " sequence={sequence} mm={mm} uaddr={uaddr:#x} op={op:?} expected={expected:?} observed={observed:?} compared_uaddr={compared_uaddr:x?} frame={frame:?} reread=unavailable bitset={bitset:#x} timeout={timeout:?} deadline_ticks={deadline_ticks:?} syscall={syscall_number} args={args:x?} pc={pc:#x} lr={lr:x?}",
                 );
             }
             detail
