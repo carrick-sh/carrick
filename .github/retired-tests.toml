@@ -91,3 +91,23 @@ pr = 2564
 test = "carrick_vmm_hvf::staged_cpu::tests::staged_registers_round_trip_through_the_hal_names"
 reason = "#1236: the HAL register round-trip witness for StagedCpu moved unchanged to carrick_aarch64::staged_cpu::tests::staged_registers_round_trip_through_the_hal_names, where it runs on the host unit lane."
 pr = 2564
+
+[[retired]]
+test = "carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::owner_grants_reserve_disjoint_table_stock_before_receipt"
+reason = "#2581: x86 root Prepare now reserves, tracks, and settles descriptor tables through shared ForkStock instead of the removed PrepareTableStock and reserve_table_stock helpers; root table reservation is covered by carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::x86_prepare_candidates_continue_after_twelve_root_table_loans and carrick_hal::fork_stock::tests::registered_root_draws_shared_tables_and_retires_once."
+pr = 2595
+
+[[retired]]
+test = "carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::owner_table_credits_refuse_without_partial_loans"
+reason = "#2581: x86 root Prepare now reserves descriptor tables through shared ForkStock instead of the removed reserve_table_stock helper; atomic reservation refusal and grant-cap bounds live in ForkStock::reserve_native_descriptor_tables and carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::x86_prepare_candidates_continue_after_twelve_root_table_loans."
+pr = 2595
+
+[[retired]]
+test = "carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::owner_table_loans_use_shared_exact_root_plan_before_either_receipt"
+reason = "#2581: x86 root Prepare no longer draws pre-receipt loans from the removed local reserve_table_stock vector; root table planning and reservation now run through shared ForkStock and are covered by carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::x86_prepare_candidates_continue_after_twelve_root_table_loans and carrick_hal::fork_stock::tests::registered_root_draws_shared_tables_and_retires_once."
+pr = 2595
+
+[[retired]]
+test = "carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::prepare_working_stock_is_independent_owned_zero_suffix"
+reason = "#2581: PrepareTableStock was removed when x86 root Prepare moved onto shared ForkStock; root table capacity beyond the former 12-page suffix is now covered by carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::x86_prepare_candidates_continue_after_twelve_root_table_loans and x86_kvm_run::mounted_static_x86_root_maps_sixteen_table_regions."
+pr = 2595
