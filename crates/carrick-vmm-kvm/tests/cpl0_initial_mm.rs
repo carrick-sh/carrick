@@ -344,14 +344,16 @@ fn serial_host_native_child_readlink_exe_is_a_counted_refusal() {
         (
             load(&counters.refused[READLINKAT_X86]),
             load(&counters.refused_child[READLINKAT_X86]),
+            load(&counters.venue_refused[READLINKAT_X86]),
+            load(&counters.venue_refused_child[READLINKAT_X86]),
         ),
-        (1, 1),
-        "the child's readlinkat refusal is counted once, as a descendant's"
+        (0, 0, 1, 1),
+        "the carrier venue counts one descendant refusal for the staged readlinkat"
     );
     assert_eq!(
         load(&counters.served[READLINKAT]),
-        1,
-        "the shared routing hands readlinkat to the native file family once"
+        0,
+        "a staged request refused by the carrier is not counted as served"
     );
     let unrecognized = load(&counters.refused[512]);
     assert_eq!(unrecognized, 0, "readlinkat is a recognized x86 call");

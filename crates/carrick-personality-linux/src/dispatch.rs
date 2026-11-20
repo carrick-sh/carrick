@@ -334,8 +334,8 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     }
     /// Offer an unserved call to the venue's retained host-file staging
     /// before the crossing table can refuse it, as ARM stages ahead of its
-    /// operation route. `true` means the venue retained a staged answer and
-    /// completes it on the `Forward` route without a host crossing.
+    /// operation route. `true` means the venue retained a staged answer
+    /// and owns its completion.
     fn stage_native_host_file(&mut self) -> bool {
         false
     }
@@ -1686,6 +1686,11 @@ fn finish<'a, C: EntryContext + 'a>(
         // Only an unserved, effect-free decline is staged: Handback retains
         // its operation and AccountedForward has already run its family.
         if result == FamilyCompletion::Forward && pending.stage_native_host_file() {
+            // Staged readlink owns its service and copyout. Only an actual
+            // host syscall replay belongs in its forward census.
+            if ordinal == crate::crossing::nr::READLINKAT.raw() {
+                return completion_route(FamilyCompletion::NativeHostFile, false);
+            }
             pending.record_forwarded(ordinal);
             return CompletionRoute::Forward;
         }

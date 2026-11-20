@@ -105,8 +105,7 @@ pub struct NativeDispatch<'a> {
     /// The caller's retained host-file venue; `None` keeps every call on
     /// its existing route.
     pub host_file: Option<HostFileVenue<'a>>,
-    /// The answer staged ahead of the crossing table, completed by the
-    /// caller on the `Forward` route.
+    /// The answer staged ahead of the crossing table, completed by the caller.
     pub staged: Option<carrick_personality_linux::native_host_file::HostFileStage>,
     /// The shared resolver's verdict on the crossing's descriptor operand,
     /// applied to the frame on the `Forward` route.
@@ -1468,7 +1467,10 @@ impl Personality for LinuxPersonality {
             // Staged ahead of the crossing table by the dispatch owner, so a
             // call the strict x86 set refuses (writev) still reaches the
             // retained host-file venue, as ARM stages ahead of its route.
-            if (route == CompletionRoute::Forward || socket_epoll)
+            if (matches!(
+                route,
+                CompletionRoute::Forward | CompletionRoute::NativeService
+            ) || socket_epoll)
                 && let Some(stage) = staged
             {
                 use carrick_el1_linux::native_process_runtime::NativeServiceCall;
@@ -1575,7 +1577,19 @@ impl Personality for LinuxPersonality {
                     );
                     CompletionRoute::Served
                 } else if crosses {
-                    route
+                    // A staged readlink reaches host dispatch only for the
+                    // root when output preparation was refused. The generic
+                    // stage did not account for this replay.
+                    if route == CompletionRoute::NativeService
+                        && origin == carrick_core_abi::service::ServiceOrigin::Initial
+                    {
+                        carrick_personality_linux::dispatch::EntryCounters {
+                            served: &counters.served,
+                            forwarded: &counters.forwarded,
+                        }
+                        .forwarded(call.canonical.raw());
+                    }
+                    CompletionRoute::Forward
                 } else if let Some(result) = result {
                     frame.rax = result as u64;
                     CompletionRoute::Served
