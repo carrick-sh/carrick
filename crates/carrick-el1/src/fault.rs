@@ -405,6 +405,10 @@ impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPage
             _ => Err(GuestPreparedCommitError::NotPrepared),
         }
     }
+
+    fn inherited_prepared_supply(&self) -> bool {
+        true
+    }
 }
 
 /// Read the COW caller's exact root incarnation from its retained record.
