@@ -57,6 +57,15 @@ The HVC fixture checks one emission and publication across 1, 100 and
 The witness also checks a switch to an independent inventory with the same
 frame and numerical generation, followed by a loader write and remap.
 
+## Working-set residency capacity
+
+`DispatchCache` defaults to 32,768 resident translated blocks on AArch64 while
+`BlockCache::default()` retains its 1,024-entry bound for other engines. The
+1,537-block two-page loop witness decodes, emits and publishes 1,537 blocks
+across 1, 10 and 100 iterations; the 1,024-entry FIFO bound previously emitted
+15,361 blocks at 10 iterations. Set `CARRICK_SOFT_AARCH64_WIDE_CACHE=0` to
+revert the AArch64 runner to 1,024 resident blocks.
+
 ## Scalar launches
 
 A scalar launcher and its same-bank successors leave the guest vector

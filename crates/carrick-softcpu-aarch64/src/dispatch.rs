@@ -358,6 +358,10 @@ struct CacheContext {
     inline_memory: bool,
 }
 
+/// Resident translated-block capacity sized for dynamic language working sets
+/// while staying well under Linux's default per-process VMA limit.
+pub const DEFAULT_CODE_CACHE_CAPACITY: usize = 32_768;
+
 /// Bounded executable residency. It holds compiled code only. Native links
 /// and translations are always dropped before the provider can access RAM.
 pub struct DispatchCache<C> {
@@ -365,12 +369,18 @@ pub struct DispatchCache<C> {
     blocks: BlockCache<BlockKey, Arc<ResidentBlock<C>>>,
 }
 
-impl<C> Default for DispatchCache<C> {
-    fn default() -> Self {
+impl<C> DispatchCache<C> {
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             context: None,
-            blocks: BlockCache::default(),
+            blocks: BlockCache::with_capacity(capacity),
         }
+    }
+}
+
+impl<C> Default for DispatchCache<C> {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_CODE_CACHE_CAPACITY)
     }
 }
 

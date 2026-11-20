@@ -4,20 +4,28 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 
-const CAPACITY: usize = 1024;
+pub const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 1024;
 
 /// FIFO eviction bounds resident entries. Replacing an entry keeps its place
 /// in the queue, so repeated changes to one block do not evict its peers.
 pub struct BlockCache<K, V> {
     blocks: BTreeMap<K, V>,
     order: VecDeque<K>,
+    capacity: usize,
 }
 
 impl<K, V> Default for BlockCache<K, V> {
     fn default() -> Self {
+        Self::with_capacity(DEFAULT_BLOCK_CACHE_CAPACITY)
+    }
+}
+
+impl<K, V> BlockCache<K, V> {
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             blocks: BTreeMap::new(),
             order: VecDeque::new(),
+            capacity: capacity.max(1),
         }
     }
 }
@@ -29,7 +37,7 @@ impl<K: Copy + Ord, V> BlockCache<K, V> {
 
     pub fn insert(&mut self, key: K, value: V) -> &V {
         if !self.blocks.contains_key(&key) {
-            if self.blocks.len() == CAPACITY
+            if self.blocks.len() == self.capacity
                 && let Some(oldest) = self.order.pop_front()
             {
                 self.blocks.remove(&oldest);

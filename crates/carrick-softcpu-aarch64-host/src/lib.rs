@@ -19,7 +19,10 @@ use carrick_softcpu_aarch64::translate::BlockFrame;
 use carrick_softcpu_aarch64::translate::TranslatedBlock;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 use carrick_softcpu_aarch64::{
-    dispatch::{BlockMemory, ChainBudget, ChainExit, DispatchCache, ResidentBlock},
+    dispatch::{
+        BlockMemory, ChainBudget, ChainExit, DEFAULT_CODE_CACHE_CAPACITY, DispatchCache,
+        ResidentBlock,
+    },
     handler::InlineRam,
     state::ProgramCounter,
     translate::frame,
@@ -138,6 +141,8 @@ pub struct HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     retain_on_handoff: bool,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    cache_capacity: usize,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     cache: DispatchCache<HostCode>,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     retain_stage1: bool,
@@ -171,6 +176,13 @@ impl HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     pub fn new() -> Result<Self, HostError> {
         let frames = FRAME_REGION_BYTES / core::mem::size_of::<BlockFrame>();
+        let cache_capacity = if std::env::var_os("CARRICK_SOFT_AARCH64_WIDE_CACHE").as_deref()
+            == Some(std::ffi::OsStr::new("0"))
+        {
+            carrick_softmmu::block_cache::DEFAULT_BLOCK_CACHE_CAPACITY
+        } else {
+            DEFAULT_CODE_CACHE_CAPACITY
+        };
         Ok(Self {
             publication: carrick_host_jit::PublicationWork::default(),
             vector_frame_bytes: 0,
@@ -181,7 +193,8 @@ impl HostBlockRunner {
                 != Some(std::ffi::OsStr::new("0")),
             retain_on_handoff: std::env::var_os("CARRICK_SOFT_AARCH64_HANDOFF_CACHE").as_deref()
                 != Some(std::ffi::OsStr::new("0")),
-            cache: DispatchCache::default(),
+            cache_capacity,
+            cache: DispatchCache::with_capacity(cache_capacity),
             retain_stage1: std::env::var_os("CARRICK_SOFT_AARCH64_TLB").as_deref()
                 != Some(std::ffi::OsStr::new("0")),
             inline_memory: cfg!(target_endian = "little")
@@ -218,7 +231,10 @@ impl ExecuteBlock for HostBlockRunner {
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     fn take_code_cache(&mut self) -> DispatchCache<HostCode> {
-        core::mem::take(&mut self.cache)
+        core::mem::replace(
+            &mut self.cache,
+            DispatchCache::with_capacity(self.cache_capacity),
+        )
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
