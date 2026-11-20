@@ -1,8 +1,7 @@
-/* Production fork; the child asks readlinkat(AT_FDCWD, "/proc/self/exe")
- * (x86 nr 267). x86 MM custody retains no executable yet (#1903), so the
- * CPL0 lane refuses the native executable-link service as a counted ENOSYS. The child exits 218 for -ENOSYS with its buffer
- * untouched, 92 if the refusal wrote the buffer, 91 for any other answer;
- * the parent reaps it and exits with the child's status.
+/* Production fork in the raw carrier fixture, which has no executable
+ * authority. The child exits 218 for -ENOSYS with its buffer untouched,
+ * 92 if a refusal wrote its buffer, or 91 for another answer. The parent
+ * reaps the child and exits with its status.
  */
 .global _start
 .text
