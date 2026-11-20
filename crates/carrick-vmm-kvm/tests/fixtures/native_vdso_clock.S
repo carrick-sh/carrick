@@ -63,6 +63,14 @@ found:
     jmp exit
 child:
     call compare_samples
+#if defined(SUCCESSOR_PATH) && !defined(EXEC_SUCCESSOR)
+    lea successor(%rip), %rdi
+    lea successor_argv(%rip), %rsi
+    xor %edx, %edx
+    mov $59, %eax
+    syscall
+    jmp failure
+#endif
     mov $8, %edi
     jmp exit
 missing:
@@ -127,6 +135,12 @@ compare_samples:
     call compare_counter
     mov $4, %edi
     call compare_counter
+#ifdef REALTIME_GETTIME
+    xor %edi, %edi
+    call compare_counter
+    call compare_coarse
+    call report_epoch
+#endif
     jmp compare_realtime_and_resolution
 
 compare_counter:
@@ -159,6 +173,109 @@ after_first:
 ordered:
     add $56, %rsp
     ret
+
+#ifdef REALTIME_GETTIME
+/* The vDSO falls back to the syscall for CLOCK_REALTIME_COARSE. Bracket
+ * that value with high-resolution vDSO samples rounded to the coarse tick. */
+compare_coarse:
+    sub $56, %rsp
+    xor %edi, %edi
+    mov %rsp, %rsi
+    call *%r14
+    test %rax, %rax
+    jne failure
+    mov $5, %edi
+    lea 16(%rsp), %rsi
+    call raw_counter
+    xor %edi, %edi
+    lea 32(%rsp), %rsi
+    call *%r14
+    test %rax, %rax
+    jne failure
+
+    mov $5, %edi
+    /* Use a separate pair of slots for clock_getres. */
+    sub $16, %rsp
+    mov %rsp, %rsi
+    mov $229, %eax
+    syscall
+    test %rax, %rax
+    jne failure
+    cmpq $0, (%rsp)
+    jne failure
+    mov 8(%rsp), %r8
+    add $16, %rsp
+    test %r8, %r8
+    jz failure
+
+    mov (%rsp), %rax
+    cmp 16(%rsp), %rax
+    ja failure
+    jb coarse_upper
+    mov 8(%rsp), %rax
+    xor %edx, %edx
+    div %r8
+    imul %r8, %rax
+    cmp 24(%rsp), %rax
+    ja failure
+coarse_upper:
+    mov 32(%rsp), %rax
+    cmp 16(%rsp), %rax
+    jb failure
+    ja coarse_resolution
+    mov 40(%rsp), %rax
+    cmp 24(%rsp), %rax
+    jb failure
+coarse_resolution:
+    mov 24(%rsp), %rax
+    cmp $999999999, %rax
+    ja failure
+    xor %edx, %edx
+    div %r8
+    test %rdx, %rdx
+    jne failure
+    add $56, %rsp
+    ret
+/* With an unshifted TSC monotonic clock, subtracting the published
+ * realtime offset must put a raw realtime sample inside the monotonic
+ * bracket. Emit the verified offset for the cross-MM equality check. */
+report_epoch:
+    sub $56, %rsp
+    mov $1, %edi
+    mov %rsp, %rsi
+    call raw_counter
+    xor %edi, %edi
+    lea 16(%rsp), %rsi
+    call raw_counter
+    mov $1, %edi
+    lea 32(%rsp), %rsi
+    call raw_counter
+    movabs $0x2e00000010, %r8
+    mov (%r8), %r8
+    imul $1000000000, 16(%rsp), %rax
+    add 24(%rsp), %rax
+    sub %r8, %rax
+    imul $1000000000, (%rsp), %rcx
+    add 8(%rsp), %rcx
+    cmp %rcx, %rax
+    jb failure
+    imul $1000000000, 32(%rsp), %rcx
+    add 40(%rsp), %rcx
+    cmp %rcx, %rax
+    ja failure
+#ifdef SUCCESSOR_PATH
+    mov %r8, 48(%rsp)
+    lea 48(%rsp), %rsi
+    mov $8, %edx
+    mov $1, %edi
+    mov $1, %eax
+    syscall
+    cmp $8, %rax
+    jne failure
+#endif
+    add $56, %rsp
+    ret
+#endif
 
 compare_realtime_and_resolution:
     sub $56, %rsp
@@ -203,4 +320,9 @@ gettime_symbol:
     .asciz "__vdso_clock_gettime"
 getres_symbol:
     .asciz "__vdso_clock_getres"
+#if defined(SUCCESSOR_PATH) && !defined(EXEC_SUCCESSOR)
+successor: .asciz SUCCESSOR_PATH
+.balign 8
+successor_argv: .quad successor, 0
+#endif
 .section .note.GNU-stack,"",@progbits
