@@ -8,6 +8,10 @@
 //! macOS arm64 (MAP_JIT and `pthread_jit_write_protect_np`) is a later slice.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod memory;
+
+pub use memory::SoftMemory;
+
 use carrick_softcpu_aarch64::dispatch::ExecuteBlock;
 use carrick_softcpu_aarch64::state::CpuState;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
