@@ -262,6 +262,17 @@ type ChildBindingMap = std::collections::BTreeMap<RootGpa, ChildBindingRecord>;
 pub struct CarrierChildBindings(std::sync::Arc<std::sync::Mutex<ChildBindingMap>>);
 
 impl CarrierChildBindings {
+    pub(crate) fn entry_task(
+        &self,
+        root: RootGpa,
+    ) -> Result<Option<carrick_el1_abi::EntryTaskKey>, TrapError> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| boundary_error("child binding authority poisoned"))?
+            .get(&root)
+            .and_then(|(_, key)| *key))
+    }
     fn get(&self, root: RootGpa) -> Result<Option<GuestArchBinding>, TrapError> {
         Ok(self
             .0
@@ -320,6 +331,9 @@ pub struct CarrierCpu<I: CarrierCpuIo> {
 }
 
 impl<I: CarrierCpuIo> CarrierCpu<I> {
+    pub(crate) fn child_binding_authority(&self) -> CarrierChildBindings {
+        self.child_bindings.clone()
+    }
     pub fn new(io: I) -> Result<Self, TrapError> {
         Self::new_with_children(io, CarrierChildBindings::default())
     }
@@ -619,6 +633,30 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             .map_err(|_| boundary_error("child binding authority poisoned"))?
             .get(&root)
             .and_then(|(_, key)| *key))
+    }
+    pub(crate) fn rebind_child_successor(
+        &mut self,
+        successor: GuestArchBinding,
+        predecessor: Option<RootGpa>,
+        root_successor: bool,
+    ) -> Result<(), TrapError> {
+        let issued = predecessor
+            .map(|root| self.registered_child_entry_task(root))
+            .transpose()?
+            .flatten();
+        if let Some(issued) = issued {
+            self.register_child_binding_with_entry_task(successor, issued)?;
+        } else if root_successor {
+            self.register_child_binding(successor)?;
+        } else {
+            return Err(boundary_error(
+                "exec child successor has no issued entry key",
+            ));
+        }
+        if let Some(root) = predecessor {
+            self.unregister_child_binding(root)?;
+        }
+        Ok(())
     }
     pub fn unregister_child_binding(
         &mut self,
@@ -1485,8 +1523,23 @@ mod tests {
             peer.registered_child_entry_task(root).unwrap(),
             Some(issued)
         );
-        owner.unregister_child_binding(root).unwrap();
+        let successor = context(3).binding();
+        let successor_root = successor.context().root;
+        owner
+            .rebind_child_successor(successor, Some(root), false)
+            .unwrap();
         assert_eq!(peer.registered_child_entry_task(root).unwrap(), None);
+        assert_eq!(
+            peer.registered_child_entry_task(successor_root).unwrap(),
+            Some(issued),
+            "exec successor retains the predecessor's issued key"
+        );
+        assert!(
+            owner
+                .rebind_child_successor(context(4).binding(), None, false)
+                .is_err()
+        );
+        owner.unregister_child_binding(successor_root).unwrap();
     }
 
     #[test]

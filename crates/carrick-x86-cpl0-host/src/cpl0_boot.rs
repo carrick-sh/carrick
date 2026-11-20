@@ -1,7 +1,7 @@
 //! Shared CPL0 carrier and its retained guest-MM/metadata backing.
 //! Hardware fixtures and the initial production process use the same image;
 //! fixture observation ports remain separate from the production transport.
-use crate::carrier_cpu::FixtureWatchdog;
+use crate::carrier_cpu::{CarrierChildBindings, FixtureWatchdog};
 use crate::carrier_cpu::{
     CarrierCpu, CarrierCpuDebug, CarrierCpuIo, CarrierRootBinding, CarrierRunExit,
 };
@@ -1319,15 +1319,15 @@ struct ForwardExecution {
     cpu: carrick_guest_arch::CpuId,
     binding: carrick_el1_abi::ExecutionBinding,
     leader_task: carrick_el1_abi::EntryTaskKey,
+    stopped_birth: Option<carrick_core::terminal::ThreadBirthIdentity>,
     context: AddressContext<RootGpa>,
 }
 
 impl ForwardExecution {
     /// Authenticate the CR3-registered carrier binding against the execution
     /// the stopped CPU's own lifecycle record names: the address context, the
-    /// execution generation, and the process leader task key must match. A
-    /// `CLONE_VM` sibling sharing the root's `CR3` and `INITIAL` generation has
-    /// a distinct stopped `binding.task` from `leader_task` and is refused.
+    /// execution generation, and the issued entry key must match. A `CLONE_VM`
+    /// sibling may use its own key only with a matching host-published birth.
     fn authenticate_typed(
         &self,
         binding: carrick_hal::guest_arch_binding::GuestArchBinding,
@@ -1338,7 +1338,10 @@ impl ForwardExecution {
         if binding.task().execution.raw().get() != self.binding.generation.raw() {
             return Err(ForwardBindingRefusal::GenerationMismatch);
         }
-        if self.binding.task != self.leader_task {
+        let issued_sibling = self.stopped_birth.is_some_and(|birth| {
+            birth.task() == self.binding.task && birth.thread() == self.binding.thread_generation
+        });
+        if self.binding.task != self.leader_task && !issued_sibling {
             return Err(ForwardBindingRefusal::TaskIdMismatch {
                 stopped: self.binding.task,
                 expected: self.leader_task,
@@ -1383,6 +1386,7 @@ fn admit_forward_execution(
         cpu,
         binding,
         leader_task: binding.task,
+        stopped_birth: None,
         context,
     })
 }
@@ -1412,9 +1416,31 @@ mod forward_execution_tests {
         let mm = MmGeneration::new(NonZeroU64::new(302).unwrap());
         let stopped = carrick_el1_abi::EntryTaskKey::from_raw(43);
         let issued = carrick_el1_abi::EntryTaskKey::from_raw(42);
+        assert_eq!(forward_leader_task(None, mm, issued).unwrap(), issued);
+        let (binding, context) = execution();
+        let sibling = carrick_el1_abi::ExecutionBinding {
+            task: stopped,
+            ..binding
+        };
+        let cpu = carrick_guest_arch::CpuId::new(1);
+        let mut admitted =
+            admit_forward_execution(cpu, cpu, sibling, context, context.root, context.generation)
+                .unwrap()
+                .with_leader_task(issued);
+        assert!(matches!(
+            admitted.authenticate_typed(carrier_binding(context, 12)),
+            Err(ForwardBindingRefusal::TaskIdMismatch { .. })
+        ));
+        admitted.stopped_birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            stopped,
+            carrick_core_abi::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(77).unwrap(),
+            ),
+            sibling.thread_generation,
+        );
         assert_eq!(
-            forward_leader_task(None, mm, stopped).unwrap(),
-            issued
+            admitted.authenticate_typed(carrier_binding(context, 12)),
+            Ok(())
         );
     }
 
@@ -1917,25 +1943,20 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
     /// Resolve and authenticate the exact guest task stopped on the idle peer.
     /// The physical peer slot itself is never a task identity.
     pub fn idle_peer_task(&mut self) -> Result<carrick_guest_arch::TaskIdentity, TrapError> {
+        let children = self.cpu.child_binding_authority();
         let mut custody = self
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
         let execution = self.cpu.with_idle_peer_io(|io| {
             let slot = carrick_guest_arch::CpuId::new(1);
-            Ok(ForwardVenue::new(&mut custody, StoppedCpuLease { cpu: slot, io })?.execution)
+            Ok(
+                ForwardVenue::new(&mut custody, StoppedCpuLease { cpu: slot, io }, &children)?
+                    .execution,
+            )
         })?;
         drop(custody);
         let binding = self.cpu.registered_task_binding(execution.context.root)?;
-        if let Some(issued) = self
-            .cpu
-            .registered_child_entry_task(execution.context.root)?
-            && execution.binding.task != issued
-        {
-            return Err(fail(
-                "idle peer child entry key differs from fork settlement",
-            ));
-        }
         execution.authenticate(binding, "idle peer forward binding mismatch")?;
         Ok(binding.task())
     }
@@ -2209,10 +2230,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             retire_result?;
         }
         if let Some((successor, predecessor)) = exec_rebind {
-            self.cpu.register_child_binding(successor)?;
-            if let Some(root) = predecessor {
-                self.cpu.unregister_child_binding(root)?;
-            }
+            let root_successor = custody
+                .initial_task
+                .is_some_and(|initial| initial.mm == successor.context().mm);
+            self.cpu
+                .rebind_child_successor(successor, predecessor, root_successor)?;
         }
         if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
@@ -2279,6 +2301,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
+        let children = self.cpu.child_binding_authority();
         self.cpu.with_forward_io(task, |io, active_binding| {
             let address = io.get_gpr(X86Reg::Rax)?;
             let stack_end = checked_stack_end(custody.binding(slot).kernel_stack)
@@ -2293,7 +2316,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             // SAFETY: guest execution stopped after the exact frame publication; no
             // guest instruction runs while this copy is made.
             let frame = unsafe { *ptr };
-            let mut venue = ForwardVenue::new(&mut custody, StoppedCpuLease { cpu: slot, io })?;
+            let mut venue =
+                ForwardVenue::new(&mut custody, StoppedCpuLease { cpu: slot, io }, &children)?;
             let execution = venue.execution;
             execution.authenticate(active_binding, "forward capture MM binding mismatch")?;
             let result = forward(&mut venue, &frame)?;
@@ -2333,12 +2357,13 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
+        let children = self.cpu.child_binding_authority();
         self.cpu.with_forward_io(task, |io, active_binding| {
             let lease = StoppedCpuLease {
                 cpu: token.slot,
                 io,
             };
-            let current = ForwardVenue::new(&mut custody, lease)?.execution;
+            let current = ForwardVenue::new(&mut custody, lease, &children)?.execution;
             if current.binding != token.execution.binding
                 || current.context != token.execution.context
             {
@@ -2380,12 +2405,13 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
+        let children = self.cpu.child_binding_authority();
         self.cpu.with_forward_io(task, |io, active_binding| {
             let lease = StoppedCpuLease {
                 cpu: token.slot,
                 io,
             };
-            let mut venue = ForwardVenue::new(&mut custody, lease)?;
+            let mut venue = ForwardVenue::new(&mut custody, lease, &children)?;
             venue
                 .execution
                 .authenticate(active_binding, "retained forward MM binding changed")?;
@@ -2628,10 +2654,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             retire_result?;
         }
         if let Some((successor, predecessor)) = exec_rebind {
-            self.cpu.register_child_binding(successor)?;
-            if let Some(root) = predecessor {
-                self.cpu.unregister_child_binding(root)?;
-            }
+            let root_successor = custody
+                .initial_task
+                .is_some_and(|initial| initial.mm == successor.context().mm);
+            self.cpu
+                .rebind_child_successor(successor, predecessor, root_successor)?;
         }
         if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
@@ -3710,12 +3737,29 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     pub fn binding(&self, cpu: carrick_guest_arch::CpuId) -> &CpuBinding {
         self.metadata(BINDING_OFFSET + u64::from(cpu.raw()) * STRIDE)
     }
+
+    fn stopped_birth(
+        &self,
+        cpu: carrick_guest_arch::CpuId,
+    ) -> Option<carrick_core::terminal::ThreadBirthIdentity> {
+        let address = self.task(cpu).metadata.control_slot.load(Ordering::Acquire);
+        let offset = address.checked_sub(METADATA_VA)?;
+        let end = offset.checked_add(size_of::<ThreadControlSlot>() as u64)?;
+        if end > EL1_BOOTSTRAP_METADATA_SIZE
+            || !offset.is_multiple_of(align_of::<ThreadControlSlot>() as u64)
+        {
+            return None;
+        }
+        self.metadata::<ThreadControlSlot>(offset)
+            .host_birth_identity()
+    }
 }
 
 impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
     fn new(
         custody: &'a mut Cpl0HostCustody<Mem>,
         lease: StoppedCpuLease<'a, M>,
+        children: &CarrierChildBindings,
     ) -> Result<Self, TrapError> {
         let cpu = lease.cpu;
         let task = custody.task(cpu);
@@ -3732,8 +3776,19 @@ impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
             NonZeroU64::new(native.mm_owner_generation.load(Ordering::Acquire))
                 .ok_or_else(|| fail("stopped forward address incarnation"))?,
         );
-        let leader_task = forward_leader_task(custody.initial_task, context.mm, binding.task)?;
-        let execution = admit_forward_execution(
+        let issued = if custody
+            .initial_task
+            .is_some_and(|initial| initial.mm == context.mm)
+        {
+            binding.task
+        } else {
+            children
+                .entry_task(context.root)?
+                .ok_or_else(|| fail("child forward root has no issued entry key"))?
+        };
+        let leader_task = forward_leader_task(custody.initial_task, context.mm, issued)?;
+        let birth = custody.stopped_birth(cpu);
+        let mut execution = admit_forward_execution(
             cpu,
             carrick_guest_arch::CpuId::new(native.cpu_slot),
             binding,
@@ -3742,6 +3797,7 @@ impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
             generation,
         )?
         .with_leader_task(leader_task);
+        execution.stopped_birth = birth;
         Ok(Self {
             custody,
             lease,
