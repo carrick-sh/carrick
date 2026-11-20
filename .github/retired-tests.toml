@@ -111,3 +111,14 @@ pr = 2595
 test = "carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::prepare_working_stock_is_independent_owned_zero_suffix"
 reason = "#2581: PrepareTableStock was removed when x86 root Prepare moved onto shared ForkStock; root table capacity beyond the former 12-page suffix is now covered by carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::x86_prepare_candidates_continue_after_twelve_root_table_loans and x86_kvm_run::mounted_static_x86_root_maps_sixteen_table_regions."
 pr = 2595
+
+[[retired]]
+test = "carrick_personality_linux::sleep::tests::absolute_monotonic_epoch_is_defined_only_on_arm"
+reason = "#2028: clock reads and absolute monotonic waits now share an epoch on both ISAs. The existing ARM future-deadline witness and the new CPL0 future-deadline witness exercise the production paths."
+pr = 2618
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_absolute_clock_nanosleep_is_refused"
+reason = "#2028: a CPL0 child's expired monotonic deadline now succeeds. The replacement checks immediate success, and a separate future-deadline witness checks that the wait reaches its deadline."
+replaced_by = "cpl0_initial_mm::serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero"
+pr = 2618
