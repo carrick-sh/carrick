@@ -78,6 +78,17 @@ pub fn pin_images(suites: &mut [Suite], path: Option<&Path>) -> anyhow::Result<(
 }
 
 pub fn parse(suite: &Suite, raw: &Raw) -> SuiteResult {
+    let mut parsed = parse_by_kind(suite, raw);
+    // A run killed by a signal (the harness reports a negative exit code, and
+    // it did not hit its deadline) is a carrick crash for EVERY suite kind,
+    // however complete its output looked: never a `diff`.
+    if raw.exit_code < 0 && !raw.timed_out {
+        parsed.result = SuiteOutcome::None;
+    }
+    parsed
+}
+
+fn parse_by_kind(suite: &Suite, raw: &Raw) -> SuiteResult {
     if suite.verdict == VerdictKind::Shell {
         // The shell smoke row is one workload. Transcript hashes include
         // host diagnostics, and a killed command never reported an outcome.
@@ -271,19 +282,20 @@ fn unstable<'a>(reports: &'a [SuiteReport]) -> Vec<Unstable<'a>> {
                     .collect(),
             );
         }
-        // On a deadline or crash we only know that the suite did not finish.
-        // Missing trailing assertions from that sample are not test outcomes.
-        if rows.iter().any(|row| !finished(row.carrick.result)) {
-            record(
-                None,
-                rows.iter()
-                    .map(|row| Sample {
-                        run_id: &row.carrick_run_id,
-                        outcome: Observation::Suite(row.verdict),
-                    })
-                    .collect(),
-            );
-        }
+        // The suite-verdict series is recorded whenever the samples' verdicts
+        // differ: a suite that did not finish in one sample (a deadline or a
+        // crash: missing trailing assertions are not test outcomes), AND a
+        // suite whose verdict flips between samples that all finished with the
+        // same per-test pairs (`record` drops identical series).
+        record(
+            None,
+            rows.iter()
+                .map(|row| Sample {
+                    run_id: &row.carrick_run_id,
+                    outcome: Observation::Suite(row.verdict),
+                })
+                .collect(),
+        );
     }
     changed
 }
@@ -337,4 +349,105 @@ pub fn write_receipt(
         path.display()
     );
     Ok(!unstable.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parsers::Totals;
+
+    fn report(run_id: &str, verdict: Verdict) -> SuiteReport {
+        SuiteReport {
+            name: "planted".into(),
+            ecosystem: "node".into(),
+            tier: "smoke".into(),
+            verdict,
+            gating: false,
+            carrick: crate::verdict::SideSummary {
+                result: SuiteOutcome::Failure,
+                totals: Totals::default(),
+            },
+            docker: crate::verdict::SideSummary {
+                result: SuiteOutcome::Success,
+                totals: Totals::default(),
+            },
+            perf: None,
+            timeout_kind: None,
+            deadline: None,
+            confirmation: None,
+            new_diffs: vec![],
+            known_diffs: vec![],
+            carrick_run_id: run_id.into(),
+            docker_run_id: String::new(),
+            carrick_argv: vec![],
+            docker_argv: vec![],
+            pairs: BTreeMap::new(),
+        }
+    }
+
+    /// Review P0 on #2601: a suite verdict that flips between samples that
+    /// all FINISHED (same per-test pairs) was missing from `unstable`.
+    #[test]
+    fn a_suite_verdict_that_flips_between_finished_samples_is_unstable() {
+        let reports = [
+            report("run-a", Verdict::Match),
+            report("run-b", Verdict::Diff),
+        ];
+        let changed = unstable(&reports);
+        assert_eq!(changed.len(), 1, "the verdict series must be recorded");
+        assert!(changed[0].test.is_none());
+        let same = [
+            report("run-a", Verdict::Diff),
+            report("run-b", Verdict::Diff),
+        ];
+        assert!(unstable(&same).is_empty(), "identical verdicts are stable");
+    }
+
+    /// Review P0 on #2601: a signal-killed run with complete output was a
+    /// `diff`; every kind must report a crash (result None), deadline aside.
+    #[test]
+    fn a_signal_killed_run_with_complete_output_is_a_crash_for_every_kind() {
+        let complete = "TAP version 13\n1..1\nok 1 - done\n";
+        for kind in [VerdictKind::Tap, VerdictKind::Shell] {
+            let verdict = if kind == VerdictKind::Tap {
+                "tap"
+            } else {
+                "shell"
+            };
+            let suite: Suite = toml::from_str(&format!(
+                r#"
+name = "planted"
+ecosystem = "node"
+image = "localhost:5005/fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+cmd = ["planted"]
+verdict = "{verdict}"
+tier = "smoke"
+weight = "light"
+timeout_s = 1
+carrick_flags = ["--fs", "host"]
+"#
+            ))
+            .unwrap();
+            let killed = Raw {
+                stdout: complete.into(),
+                stderr: String::new(),
+                exit_code: -9,
+                timed_out: false,
+            };
+            assert_eq!(
+                parse(&suite, &killed).result,
+                SuiteOutcome::None,
+                "{kind:?}"
+            );
+            let deadline = Raw {
+                timed_out: true,
+                ..killed
+            };
+            assert_ne!(
+                parse(&suite, &deadline).result,
+                SuiteOutcome::None,
+                "a deadline is not a crash: {kind:?}"
+            );
+        }
+    }
 }
