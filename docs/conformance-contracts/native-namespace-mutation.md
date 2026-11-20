@@ -189,3 +189,8 @@ in mkdir(2), rmdir(2), unlink(2), rename(2), link(2), symlink(2) and readlink(2)
 The entry lowering only reshapes a fixed set of register operands. Each legacy
 operation reaches the same owner and has the same dispatch and mutation
 budget as its canonical form.
+
+The run root reads the ordinary symlink. On CPL0 the fork child still gets a
+counted ENOSYS on the canonical readlinkat call. The child witness checks this
+existing owner boundary with both spellings while requiring Docker parity
+for all six namespace mutations.

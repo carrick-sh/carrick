@@ -146,6 +146,28 @@ pub fn normalize_legacy_attr(
     })
 }
 
+/// Lower legacy x86 operands to the existing canonical syscall owners.
+pub fn normalize_legacy(
+    native: crate::NativeNr,
+    args: [u64; 6],
+) -> Option<(crate::CanonicalNr, [u64; 6])> {
+    use crate::{CanonicalNr, LINUX_AT_FDCWD, LINUX_AT_REMOVEDIR};
+
+    let at = LINUX_AT_FDCWD;
+    let [first, second, third, ..] = args;
+    Some(match native.raw() {
+        21 => normalize_access(args),
+        82 => (CanonicalNr(38), [at, first, at, second, 0, 0]), // renameat
+        83 => (CanonicalNr(34), [at, first, second, 0, 0, 0]),  // mkdirat
+        84 => (CanonicalNr(35), [at, first, LINUX_AT_REMOVEDIR, 0, 0, 0]), // unlinkat
+        86 => (CanonicalNr(37), [at, first, at, second, 0, 0]), // linkat without following symlinks
+        87 => (CanonicalNr(35), [at, first, 0, 0, 0, 0]),       // unlinkat
+        88 => (CanonicalNr(36), [first, at, second, 0, 0, 0]),  // symlinkat
+        89 => (CanonicalNr(78), [at, first, second, third, 0, 0]), // readlinkat
+        _ => return normalize_legacy_attr(native.raw(), args),
+    })
+}
+
 /// The full x86_64 syscall table — the WHOLE x86_64 Linux ABI (numbers 0..454).
 ///
 /// Sources for x86_64 numbers (cited per-entry in inline comments):
@@ -355,18 +377,8 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(80, "chdir", 49),
     // x86_64=81 fchdir → canonical fchdir=50 (SAME name+shape)
     direct(81, "fchdir", 50),
-    // x86_64=82 rename: LEGACY (asm-generic has renameat=38). rename(old,new) vs
-    // renameat(odfd,old,ndfd,new) → LEFT OUT. (see deferred block)
-    // x86_64=83 mkdir: LEGACY. Normalized in x8664_arch::normalize_syscall to
-    // mkdirat(AT_FDCWD, path, mode).
-    // x86_64=84 rmdir: LEGACY (asm-generic has unlinkat=35 w/ AT_REMOVEDIR) →
-    // LEFT OUT. (see deferred block)
-    // x86_64=85 creat: LEGACY x86_64-only (asm-generic uses openat) → LEFT OUT.
-    // x86_64=86 link: LEGACY (asm-generic has linkat=37) → LEFT OUT.
-    // x86_64=87 unlink: LEGACY (asm-generic has unlinkat=35) → LEFT OUT.
-    // x86_64=88 symlink: LEGACY (asm-generic has symlinkat=36) → LEFT OUT.
-    // x86_64=89 readlink: LEGACY (asm-generic has readlinkat=78) → normalized
-    // in x8664_arch::normalize_syscall as readlinkat(AT_FDCWD, path, buf, size).
+    // x86_64=82..84 and 86..89: lowered to *at forms by normalize_legacy.
+    // x86_64=85 creat: normalized to openat by the host path.
     // x86_64=90 chmod: LEGACY (asm-generic has fchmodat=53). Normalized in
     // normalize_legacy_attr by both ring entry and x8664_arch::normalize_syscall.
     // x86_64=91 fchmod → canonical fchmod=52 (SAME name+shape)
@@ -921,13 +933,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     //   23  select      → pselect6(72):   timeval→timespec; no sigmask arg
     //   33  dup2        → dup3(24):       dup2(fd,fd)=success no-op vs dup3 EINVAL; no flags arg
     //   78  getdents    → getdents64(61): 32-bit linux_dirent vs 64-bit linux_dirent64
-    //   82  rename      → renameat(38):   prepend AT_FDCWD to both paths
-    //   83  mkdir       → mkdirat(34):    prepend AT_FDCWD
-    //   84  rmdir       → unlinkat(35):   prepend AT_FDCWD; set AT_REMOVEDIR
     //   85  creat       → openat(56):     flags=O_CREAT|O_WRONLY|O_TRUNC; prepend AT_FDCWD
-    //   86  link        → linkat(37):     prepend AT_FDCWD to both; flags=0
-    //   87  unlink      → unlinkat(35):   prepend AT_FDCWD; flags=0
-    //   88  symlink     → symlinkat(36):  insert AT_FDCWD before newpath
     //   132 utime       → utimensat(88):  utimbuf→timespec[2]; prepend AT_FDCWD
     //   133 mknod       → mknodat(33):    prepend AT_FDCWD
     //   201 time        → (no successor):  asm-generic libc uses clock_gettime/gettimeofday

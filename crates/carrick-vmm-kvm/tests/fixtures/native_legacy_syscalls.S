@@ -73,6 +73,16 @@ steps:
     je 1f
     mov $99, %eax
 1:  record
+#ifdef CHILD
+    /* The child's canonical readlinkat owner currently refuses this call. */
+    mov $267, %eax
+    mov $-100, %rdi
+    lea sym(%rip), %rsi
+    lea buf(%rip), %rdx
+    mov $16, %r10d
+    syscall
+    record
+#endif
 
     mov $1, %eax                    /* write the entire report */
     mov $1, %edi
