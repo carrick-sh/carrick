@@ -127,7 +127,97 @@ fn signed_gate_restores_the_trusted_base_fixture_artifact() {
         .iter()
         .filter_map(|s| s["with"]["name"].as_str())
         .collect::<Vec<_>>();
-    assert!(published.contains(&"signed-fixtures-${{ github.sha }}"));
+    assert!(published.contains(&"signed-fixtures-${{ steps.target.outputs.sha }}"));
+}
+
+/// Fixtures-only dispatch (#1207) runs the target commit's own code, so it
+/// must never produce a run the signed gate trusts as main's fixture
+/// publisher: it refuses `refs/heads/main` and runs only from a branch, and
+/// every other job stays skipped.
+#[test]
+fn fixtures_only_dispatch_refuses_main_and_runs_nothing_else() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = fs::read_to_string(root.join(".github/workflows/kernel-runtime.yml")).unwrap();
+    let docs = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
+    let workflow = &docs[0];
+    assert_eq!(
+        workflow["on"]["workflow_dispatch"]["inputs"]["fixtures_sha"]["default"].as_str(),
+        Some("")
+    );
+    let jobs = workflow["jobs"].as_hash().unwrap();
+    let producer = &workflow["jobs"]["signed-fixtures"];
+    let gate = producer["if"].as_str().unwrap();
+    // The one clause that admits fixtures-only mode also refuses main.
+    let clauses = gate
+        .split("||")
+        .filter(|c| c.contains("inputs.fixtures_sha != ''"))
+        .collect::<Vec<_>>();
+    assert_eq!(clauses.len(), 1, "{gate}");
+    assert!(
+        clauses[0].contains("github.ref != 'refs/heads/main'"),
+        "fixtures-only mode must refuse main: {gate}"
+    );
+    assert!(clauses[0].contains("github.actor == 'tjfontaine'"));
+    assert!(clauses[0].contains("github.triggering_actor == 'tjfontaine'"));
+    // Defense in depth: the pin step refuses main and validates the SHA
+    // before checkout, reading the input only through env.
+    let steps = producer["steps"].as_vec().unwrap();
+    let pin = &steps[0];
+    assert_eq!(pin["id"].as_str(), Some("target"));
+    let script = pin["run"].as_str().unwrap();
+    assert!(script.contains(r#"[ "$GITHUB_REF" != refs/heads/main ]"#));
+    assert!(script.contains("^[0-9a-f]{40}$"));
+    assert!(
+        !script.contains("inputs."),
+        "input reaches the script via env only"
+    );
+    assert_eq!(
+        steps[1]["uses"].as_str(),
+        Some("actions/checkout@v4"),
+        "the pin precedes checkout"
+    );
+    assert_eq!(
+        steps[1]["with"]["ref"].as_str(),
+        Some("${{ steps.target.outputs.sha }}")
+    );
+    // Every other job is off in fixtures-only mode: guarded directly, gated
+    // on the scoreboard pin (itself guarded), or push-only.
+    for (name, job) in jobs {
+        let name = name.as_str().unwrap();
+        if name == "signed-fixtures" || name == "trusted-hardware-ok" {
+            continue;
+        }
+        let cond = job["if"].as_str().unwrap_or_default();
+        assert!(
+            cond.contains("inputs.fixtures_sha == ''")
+                || cond.contains("needs.scoreboard-target.result == 'success'")
+                || (cond.contains("github.event_name == 'push'")
+                    && !cond.contains("workflow_dispatch")),
+            "{name} could run in fixtures-only mode: {cond}"
+        );
+    }
+    // A branch dispatch is never accepted as main's fixture publisher.
+    let sha = "1d0a11b06c9fdea55ddefb48e9c0a357a11f1322";
+    let run = |branch: &str| {
+        serde_json::json!({
+            "path": ".github/workflows/kernel-runtime.yml",
+            "head_branch": branch,
+            "head_sha": sha,
+            "event": "workflow_dispatch",
+            "repository": {"full_name": "carrick-sh/carrick"},
+            "head_repository": {"full_name": "carrick-sh/carrick"},
+            "actor": {"login": "tjfontaine"},
+            "triggering_actor": {"login": "tjfontaine"},
+        })
+    };
+    assert!(carrick_xtask::signed_gate::trusted_fixture_run(
+        &run("main"),
+        sha
+    ));
+    assert!(!carrick_xtask::signed_gate::trusted_fixture_run(
+        &run("ci/fixtures-for-pr-head"),
+        sha
+    ));
 }
 
 /// The required check must fail on any skipped or failed dependency, while

@@ -40,8 +40,10 @@ on:
       # lets a PR whose fixture inputs differ from main's get a CI-published
       # bundle for its head (the m4 signed job's `--fixtures-run <run id>`).
       # Every other job is skipped, including all self-hosted lanes, and the
-      # R2 relay upload is skipped. The job runs on a hosted runner, so a
-      # `--ref <branch>` dispatch works for this mode.
+      # R2 relay upload is skipped. It runs only from a `--ref <branch>`
+      # dispatch and refuses `refs/heads/main`: the signed gate trusts a main
+      # run of this workflow as main's own fixture publisher
+      # (`trusted_fixture_run`), and this mode runs the target's code.
       fixtures_sha:
         description: "Fixtures only: the exact 40-hex commit SHA to publish signed-fixtures-<sha> for (empty = normal dispatch)"
         type: string
@@ -122,7 +124,7 @@ jobs:
           vars.CARRICK_SELF_HOSTED == 'true' &&
           (github.event_name != 'workflow_dispatch' ||
            (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '' && inputs.fixtures_sha == '') ||
-           (github.repository == 'carrick-sh/carrick' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '' && inputs.fixtures_sha != '')) }}
+           (github.repository == 'carrick-sh/carrick' && github.ref != 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '' && inputs.fixtures_sha != '')) }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     permissions:
@@ -131,6 +133,7 @@ jobs:
       bundle-name: ${{ steps.bundle.outputs.name }}
       bundle-sha256: ${{ steps.bundle.outputs.sha256 }}
       bundle-parts: ${{ steps.bundle.outputs.parts }}
+      sha: ${{ steps.target.outputs.sha }}
     steps:
       # The commit the bundle is for: the pushed/dispatched commit, or the
       # validated `fixtures_sha` in fixtures-only mode. The input reaches
@@ -145,6 +148,11 @@ jobs:
             printf 'sha=%s\nfixtures_only=false\n' "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Never on main: a main run is trusted as main's fixture publisher.
+          [ "$GITHUB_REF" != refs/heads/main ] || {
+            echo "::error title=Fixtures-only target refused::dispatch fixtures-only mode with --ref <branch>, never main"
+            exit 1
+          }
           [[ "$FIXTURES_SHA" =~ ^[0-9a-f]{40}$ ]] || {
             echo "::error title=Fixtures-only target refused::fixtures_sha must be a full lowercase 40-hex commit SHA"
             exit 1
@@ -357,7 +365,7 @@ jobs:
         if: ${{ steps.relay.outcome != 'success' }}
         uses: actions/download-artifact@v4
         with:
-          name: signed-fixtures-${{ github.sha }}
+          name: signed-fixtures-${{ needs.signed-fixtures.outputs.sha }}
           path: target/fixtures/incoming
 
       - name: Verify fixture archive transport digest

@@ -1857,7 +1857,7 @@ printf '%s\n' "$1" > "$FIXTURE_TEST_CLEANED"
     write_exec(&p.bin, "just", br#"#!/bin/sh
 case "$1" in
     fixtures-publish)
-        [ "$2" = "$GITHUB_SHA" ] || exit 94
+        [ "$2" = "$TARGET_SHA" ] || exit 94
         "$FIXTURE_TEST_XTASK" fixtures verify --manifest "$FIXTURE_TEST_MANIFEST" --sha "$2" || exit $?
         mkdir -p "target/fixtures/published/$2"
         cp "$FIXTURE_TEST_ARCHIVE" "target/fixtures/published/$2/bundle.tar.gz"
@@ -1887,6 +1887,8 @@ esac
             .current_dir(&p.checkout)
             .args(["-e", "-c", script])
             .env("GITHUB_SHA", &sha)
+            // A push run pins its own commit as the fixture target.
+            .env("TARGET_SHA", &sha)
             .env("GITHUB_RUN_ID", "fixture-workflow-test")
             .env("GITHUB_RUN_ATTEMPT", "1")
             .env("FIXTURE_TEST_ARCHIVE", &p.archive)
@@ -1907,6 +1909,14 @@ esac
                 .contains("needs.signed-fixtures.result == 'success'")
         );
         let publish = step(producer, "Publish exact-SHA fixture bundle");
+        assert_eq!(
+            publish["env"]["TARGET_SHA"].as_str(),
+            Some("${{ steps.target.outputs.sha }}")
+        );
+        assert_eq!(
+            producer["outputs"]["sha"].as_str(),
+            Some("${{ steps.target.outputs.sha }}")
+        );
         let out = run(publish["run"].as_str().unwrap());
         assert!(
             out.status.success(),
@@ -1970,12 +1980,17 @@ esac
         );
         assert_eq!(
             upload["with"]["name"].as_str(),
-            Some("signed-fixtures-${{ github.sha }}")
+            Some("signed-fixtures-${{ steps.target.outputs.sha }}")
         );
-        assert_eq!(download["with"]["name"], upload["with"]["name"]);
+        // The consumer downloads the producer's pinned target, which on the
+        // push and schedule runs it serves is the run's own commit.
+        assert_eq!(
+            download["with"]["name"].as_str(),
+            Some("signed-fixtures-${{ needs.signed-fixtures.outputs.sha }}")
+        );
         assert_eq!(
             upload["with"]["path"].as_str(),
-            Some("target/fixtures/published/${{ github.sha }}/*.tar.gz")
+            Some("target/fixtures/published/${{ steps.target.outputs.sha }}/*.tar.gz")
         );
         assert_eq!(upload["with"]["if-no-files-found"].as_str(), Some("error"));
         assert_eq!(
