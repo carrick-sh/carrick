@@ -4306,6 +4306,7 @@ fn production_fork_waits_while_sibling_fork_holds_birth_reservation() {
 fn legacy_syscalls_run(flags: &[&str], expected: &[u8], expected_refusals: &[(usize, u64)]) {
     let work = tempfile::tempdir().expect("legacy syscall test directory");
     std::fs::write(work.path().join("file"), b"file").expect("regular file");
+    std::fs::write(work.path().join("created"), b"truncate me").expect("creat target");
     std::os::unix::fs::symlink("file", work.path().join("sym")).expect("symlink");
     let work_path = format!("-DWORK_PATH=\"{}\"", work.path().display());
     let mut defines = vec![work_path.as_str()];
@@ -4342,26 +4343,67 @@ fn legacy_syscalls_run(flags: &[&str], expected: &[u8], expected_refusals: &[(us
         (0, expected, expected_refusals),
         "(exit, syscall results, counted refusals)"
     );
-    assert_eq!(
-        std::fs::read_link(work.path().join("new-sym")).unwrap(),
-        std::path::Path::new("file")
-    );
-    for removed in ["dir", "hard", "moved"] {
-        assert!(!work.path().join(removed).exists(), "{removed}");
+    if flags.contains(&"-DNAMESPACE") {
+        assert_eq!(
+            std::fs::read_link(work.path().join("new-sym")).unwrap(),
+            std::path::Path::new("file")
+        );
+        if flags.contains(&"-DCHILD") {
+            assert!(!work.path().join("fifo").exists());
+            assert!(!work.path().join("fifo-at").exists());
+        } else {
+            use std::os::unix::fs::FileTypeExt;
+            assert!(
+                std::fs::metadata(work.path().join("fifo"))
+                    .unwrap()
+                    .file_type()
+                    .is_fifo()
+            );
+        }
+        for removed in ["dir", "hard", "moved"] {
+            assert!(!work.path().join(removed).exists(), "{removed}");
+        }
+    } else if !flags.contains(&"-DIPC") {
+        assert_eq!(
+            std::fs::metadata(work.path().join("created"))
+                .unwrap()
+                .len(),
+            0
+        );
     }
 }
 
 #[test]
 fn serial_host_root_legacy_namespace_syscalls_match_linux() {
-    legacy_syscalls_run(&[], &[0, 0, 0, 0, 0, 0, 4], &[]);
+    legacy_syscalls_run(&["-DNAMESPACE"], &[0, 0, 0, 0, 0, 0, 4, 0], &[]);
 }
 
 #[test]
 fn serial_host_fork_child_legacy_namespace_syscalls_use_canonical_owners() {
-    // Both spellings of readlink hit the existing counted child refusal.
+    // The readlinkat and mknodat owners still refuse these child calls.
     legacy_syscalls_run(
-        &["-DCHILD"],
-        &[0, 0, 0, 0, 0, 0, 38, 38],
-        &[(89, 1), (267, 1)],
+        &["-DNAMESPACE", "-DCHILD"],
+        &[0, 0, 0, 0, 0, 0, 38, 38, 38, 38],
+        &[(89, 1), (133, 1), (259, 1), (267, 1)],
     );
+}
+
+#[test]
+fn serial_host_root_legacy_metadata_syscalls_match_linux() {
+    legacy_syscalls_run(&[], &[40, 20, 0, 0, 0, 8, 0, 10, 0], &[]);
+}
+
+#[test]
+fn serial_host_fork_child_legacy_metadata_syscalls_match_linux() {
+    legacy_syscalls_run(&["-DCHILD"], &[40, 20, 0, 0, 0, 8, 0, 10, 0], &[]);
+}
+
+#[test]
+fn serial_host_root_legacy_ipc_syscalls_match_linux() {
+    legacy_syscalls_run(&["-DIPC"], &[0, b'f', 3], &[]);
+}
+
+#[test]
+fn serial_host_fork_child_legacy_ipc_syscalls_match_linux() {
+    legacy_syscalls_run(&["-DIPC", "-DCHILD"], &[0, b'f', 3], &[]);
 }

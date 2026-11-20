@@ -36,6 +36,8 @@ vm_free = [
 ]
 embed = [
   "carrick-embed::wait_process_group",
+  "KVM production: carrick-vmm-kvm::cpl0_entry::serial_host_root_legacy_metadata_syscalls_match_linux",
+  "KVM production: carrick-vmm-kvm::cpl0_entry::serial_host_fork_child_legacy_metadata_syscalls_match_linux",
 ]
 docker = [
   "probe:kernelidentity",

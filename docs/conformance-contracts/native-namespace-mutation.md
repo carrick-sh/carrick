@@ -184,13 +184,19 @@ rebasing this slice.
 
 The static CPL0 fixture runs raw x86 namespace syscalls as the initial task
 and as a fork child. It checks results against the same fixture on x86 Docker
-Linux and requires zero refused calls. The Linux path semantics are documented
+Linux. The Linux path semantics are documented
 in mkdir(2), rmdir(2), unlink(2), rename(2), link(2), symlink(2) and readlink(2).
 The entry lowering only reshapes a fixed set of register operands. Each legacy
 operation reaches the same owner and has the same dispatch and mutation
 budget as its canonical form.
 
-The run root reads the ordinary symlink. On CPL0 the fork child still gets a
-counted ENOSYS on the canonical readlinkat call. The child witness checks this
-existing owner boundary with both spellings while requiring Docker parity
-for all six namespace mutations.
+The run root reads the ordinary symlink and creates a FIFO. On CPL0 the fork
+child still gets counted ENOSYS for the canonical readlinkat and mknodat calls.
+The child witness checks these existing owner boundaries with both spellings
+while requiring Docker parity for the six namespace mutations.
+
+The same fixture also binds the legacy open, creat, stat and lstat forms to
+`kernel.native.host-file-venue`, getpgrp to `kernel.wait.process-group`, and
+the pipe and eventfd constructors to `kernel.el1.ipc-fd-authority`. These
+cases compare Linux result bytes, require zero refusals, and assert relevant
+outputs. The fixture runs each batch as the run root and as a fork child.
