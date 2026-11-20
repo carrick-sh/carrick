@@ -1483,34 +1483,29 @@ impl HostIpc {
         number: fd::Fd,
         serve: impl FnOnce(&HostResource) -> R,
     ) -> Result<R, PinnedHostResourceError> {
-        let region = self.region();
-        let authority = region.fd(HostLockWait);
-        let (pin, description) = authority.pin(table, number).map_err(|error| match error {
-            fd::Error::BadFd => PinnedHostResourceError::BadFd,
-            _ => PinnedHostResourceError::Unavailable,
-        })?;
-        let resource = match carrick_el1_abi::ipc::IpcBacking::decode(description.backing) {
-            Some(carrick_el1_abi::ipc::IpcBacking::Host(token)) => self
-                .resources
-                .lock()
-                .live
-                .get(&token.get())
-                .cloned()
-                .ok_or(PinnedHostResourceError::Unavailable),
-            Some(_) => Err(PinnedHostResourceError::InZone),
-            None => Err(PinnedHostResourceError::Unavailable),
-        };
-        let result = resource.map(|resource| serve(&resource));
-        match authority.unpin(pin) {
-            Ok(Some(last)) => {
-                self.release(last.backing)
-                    .map_err(|_| PinnedHostResourceError::Unavailable)?;
-            }
-            Ok(None) => {}
-            Err(_) => return Err(PinnedHostResourceError::Unavailable),
-        }
-        result
+        self.with_pinned_host_resource_token(table, number, |_, resource| serve(resource))
     }
+
+    pub(crate) fn with_pinned_host_resource_token<R>(
+        &self,
+        table: fd::TableId,
+        number: fd::Fd,
+        serve: impl FnOnce(HostResourceToken, &HostResource) -> R,
+    ) -> Result<R, PinnedHostResourceError> {
+        self.with_pinned_ofd(table, number, |_, description| {
+            match carrick_el1_abi::ipc::IpcBacking::decode(description.backing) {
+                Some(carrick_el1_abi::ipc::IpcBacking::Host(token)) => {
+                    let resource = self
+                        .host_resource(token)
+                        .ok_or(PinnedHostResourceError::Unavailable)?;
+                    Ok(serve(token, &resource))
+                }
+                Some(_) => Err(PinnedHostResourceError::InZone),
+                None => Err(PinnedHostResourceError::Unavailable),
+            }
+        })?
+    }
+
     /// [`Self::with_pinned_host_resource`] that also hands `serve` the exact
     /// pinned description's shared status flags (the guest's `O_NONBLOCK`).
     pub(crate) fn with_pinned_host_description<R>(
@@ -1638,6 +1633,13 @@ impl HostIpc {
                 .live
                 .remove(&token.get())
                 .ok_or(IpcError::Stale)?;
+            if resource
+                .downcast_ref::<crate::kernel::objects::ImplicitHostStdio>()
+                .is_some()
+                && let Some(epolls) = self.existing_native_socket_epolls()
+            {
+                epolls.forget_stdio(self, token);
+            }
             drop(resource);
         }
         Ok(released)

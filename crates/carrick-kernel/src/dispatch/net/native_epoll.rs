@@ -1,10 +1,10 @@
 //! Host readiness producer for a native ring epoll. The shared IPC record
 //! owns delivery, one-shot state and the wait. The carrier multiplexes only
-//! real host sockets, always in edge mode so a level-ready socket cannot
+//! real host descriptors, always in edge mode so a level-ready descriptor cannot
 //! spin the reactor. The ring reapplies its own level/edge policy.
 
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -44,14 +44,25 @@ impl std::fmt::Debug for NativeSocketEpolls {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Membership {
     epoll: IpcObjectHandle,
-    socket: HostReadinessSource,
+    source: MemberSource,
     number: fd::Fd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum MemberSource {
+    Socket(HostReadinessSource),
+    Stdio(carrick_el1_abi::ipc::HostResourceToken),
+}
+
+enum EpollWatchTarget {
+    Socket(Arc<FileDescription>),
+    Stdio(carrick_el1_abi::HostBoundFd),
 }
 
 impl std::hash::Hash for Membership {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.epoll.hash(state);
-        self.socket.hash(state);
+        self.source.hash(state);
         self.number.0.hash(state);
     }
 }
@@ -59,7 +70,7 @@ impl std::hash::Hash for Membership {
 struct Registration {
     key: Membership,
     item: EpollItemRef,
-    description: Arc<FileDescription>,
+    description: Option<Arc<FileDescription>>,
     watch: Watch,
     events: LinuxEpollEvents,
 }
@@ -73,7 +84,7 @@ struct State {
     mux: Box<dyn EventMultiplexer>,
     registrations: HashMap<u64, Registration>,
     keys: HashMap<Membership, u64>,
-    sockets: HashMap<HostReadinessSource, HashSet<u64>>,
+    sources: HashMap<MemberSource, HashSet<u64>>,
     epolls: HashMap<IpcObjectHandle, HashSet<u64>>,
     next: u64,
 }
@@ -99,7 +110,7 @@ impl State {
     fn insert(&mut self, token: u64, registration: Registration) {
         let key = registration.key;
         self.keys.insert(key, token);
-        self.sockets.entry(key.socket).or_default().insert(token);
+        self.sources.entry(key.source).or_default().insert(token);
         self.epolls.entry(key.epoll).or_default().insert(token);
         self.registrations.insert(token, registration);
     }
@@ -108,7 +119,7 @@ impl State {
         let registration = self.registrations.remove(&token)?;
         let key = registration.key;
         self.keys.remove(&key);
-        remove_index(&mut self.sockets, key.socket, token);
+        remove_index(&mut self.sources, key.source, token);
         remove_index(&mut self.epolls, key.epoll, token);
         Some(registration)
     }
@@ -127,9 +138,26 @@ impl State {
         registration: &Registration,
         edge: bool,
     ) -> Option<carrick_el1_abi::ipc::IpcWake> {
-        let level = registration
-            .description
-            .readiness(registration.events, NO_READINESS_CONTEXT);
+        let level = if let Some(description) = &registration.description {
+            description.readiness(registration.events, NO_READINESS_CONTEXT)
+        } else {
+            let fd = registration.watch.host.as_ref()?;
+            let requested = registration.events.bits() as i16;
+            let mut pollfd = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: super::host_poll_interest(requested),
+                revents: 0,
+            };
+            // SAFETY: the registration owns the polled descriptor.
+            if unsafe { libc::poll(&mut pollfd, 1, 0) } <= 0 {
+                LinuxEpollEvents::empty()
+            } else {
+                LinuxEpollEvents::from_bits_retain(super::linux_poll_revents(
+                    pollfd.revents,
+                    requested,
+                ) as u16 as u32)
+            }
+        };
         match owner.socket_epoll_region().and_then(|region| {
             region.epoll_publish_host_socket(
                 registration.key.epoll,
@@ -214,7 +242,7 @@ impl NativeSocketEpolls {
                 mux,
                 registrations: HashMap::new(),
                 keys: HashMap::new(),
-                sockets: HashMap::new(),
+                sources: HashMap::new(),
                 epolls: HashMap::new(),
                 next: 1,
             }),
@@ -253,6 +281,38 @@ impl NativeSocketEpolls {
         Ok(Watch { host, _zone: zone })
     }
 
+    fn watch_target(
+        self: &Arc<Self>,
+        state: &mut State,
+        token: u64,
+        target: EpollWatchTarget,
+        events: LinuxEpollEvents,
+    ) -> Result<(Watch, Option<Arc<FileDescription>>), LinuxErrno> {
+        match target {
+            EpollWatchTarget::Socket(description) => {
+                let watch = self.watch(state, token, &description, events)?;
+                Ok((watch, Some(description)))
+            }
+            EpollWatchTarget::Stdio(fd) => {
+                // SAFETY: fcntl duplicates the route's descriptor, returning
+                // a new descriptor owned by this registration on success.
+                let duplicate = unsafe { libc::fcntl(fd.raw(), libc::F_DUPFD_CLOEXEC, 0) };
+                if duplicate < 0 {
+                    return Err(io_errno(std::io::Error::last_os_error()));
+                }
+                let fd = unsafe { OwnedFd::from_raw_fd(duplicate) };
+                state.bind(fd.as_raw_fd(), token, events)?;
+                Ok((
+                    Watch {
+                        host: Some(fd),
+                        _zone: None,
+                    },
+                    None,
+                ))
+            }
+        }
+    }
+
     fn unwatch(state: &mut State, watch: &Watch) {
         if let Some(fd) = &watch.host {
             let _ = state.mux.deregister(fd.as_raw_fd());
@@ -271,7 +331,7 @@ impl NativeSocketEpolls {
         self: &Arc<Self>,
         owner: &HostIpc,
         key: Membership,
-        socket: &NativeNetFile,
+        target: EpollWatchTarget,
         file: fd::OfdKey,
         op: u64,
         report: EpollReport,
@@ -298,8 +358,7 @@ impl NativeSocketEpolls {
                     .bind_socket_epoll_lock(key.epoll)
                     .map_err(|error| ctl_errno(error.into()))?;
                 let token = state.generation()?;
-                let description = socket.description();
-                let watch = self.watch(&mut state, token, &description, events)?;
+                let (watch, description) = self.watch_target(&mut state, token, target, events)?;
                 let file_key =
                     (u64::from(file.index) << 32) | (file.generation & u64::from(u32::MAX));
                 let item = match region.epoll_add_host_socket(
@@ -330,8 +389,7 @@ impl NativeSocketEpolls {
             }
             (LINUX_EPOLL_CTL_MOD, Some(old)) => {
                 let token = state.generation()?;
-                let description = socket.description();
-                let watch = self.watch(&mut state, token, &description, events)?;
+                let (watch, description) = self.watch_target(&mut state, token, target, events)?;
                 let item = state.registrations[&old].item;
                 let item = match region.epoll_modify_host_socket(
                     key.epoll,
@@ -393,8 +451,39 @@ impl NativeSocketEpolls {
     }
 
     pub(crate) fn forget_socket(&self, owner: &HostIpc, socket: HostReadinessSource) {
+        self.forget_source(owner, MemberSource::Socket(socket));
+    }
+
+    pub(crate) fn forget_stdio(
+        &self,
+        owner: &HostIpc,
+        token: carrick_el1_abi::ipc::HostResourceToken,
+    ) {
+        self.forget_source(owner, MemberSource::Stdio(token));
+    }
+
+    /// Refresh level state after the guest consumes host stdio capacity.
+    pub(in crate::dispatch) fn stdio_changed(
+        &self,
+        owner: &HostIpc,
+        token: carrick_el1_abi::ipc::HostResourceToken,
+    ) {
+        let state = self.state.lock();
+        let Some(tokens) = state.sources.get(&MemberSource::Stdio(token)) else {
+            return;
+        };
+        let wakes: Vec<_> = tokens
+            .iter()
+            .filter_map(|token| state.registrations.get(token))
+            .filter_map(|registration| state.sample(owner, registration, false))
+            .collect();
+        drop(state);
+        owner.deliver_socket_epoll_wakes(wakes);
+    }
+
+    fn forget_source(&self, owner: &HostIpc, source: MemberSource) {
         let mut state = self.state.lock();
-        let Some(tokens) = state.sockets.remove(&socket) else {
+        let Some(tokens) = state.sources.remove(&source) else {
             return;
         };
         let Ok(region) = owner.socket_epoll_region() else {
@@ -414,7 +503,7 @@ impl NativeSocketEpolls {
 
     pub(super) fn socket_changed(self: &Arc<Self>, owner: &HostIpc, socket: &NativeNetFile) {
         let mut state = self.state.lock();
-        let Some(tokens) = state.sockets.get(&socket.source()) else {
+        let Some(tokens) = state.sources.get(&MemberSource::Socket(socket.source())) else {
             return;
         };
         let description = socket.description();
@@ -422,7 +511,10 @@ impl NativeSocketEpolls {
         let mut wakes = Vec::new();
         for token in tokens {
             let registration = &state.registrations[&token];
-            let replaced = !Arc::ptr_eq(&registration.description, &description);
+            let replaced = registration
+                .description
+                .as_ref()
+                .is_some_and(|previous| !Arc::ptr_eq(previous, &description));
             let token = if replaced {
                 let events = registration.events;
                 let Ok(next) = state.generation() else {
@@ -435,7 +527,7 @@ impl NativeSocketEpolls {
                     Self::unwatch(&mut state, &watch);
                     continue;
                 };
-                registration.description = description.clone();
+                registration.description = Some(description.clone());
                 registration.watch = watch;
                 state.insert(next, registration);
                 next
@@ -527,7 +619,7 @@ impl super::SyscallDispatcher {
         header: carrick_core_abi::host_file::HostFileHeader,
     ) -> Result<(), LinuxErrno> {
         let [op, target, data, _] = header.args;
-        let target = fd::Fd(target as i32);
+        let target_number = fd::Fd(target as i32);
         let epfd = fd::Fd(header.fd);
         let report = EpollReport {
             events: header.flags,
@@ -539,28 +631,66 @@ impl super::SyscallDispatcher {
                     return Err(LINUX_EINVAL);
                 };
                 owner
-                    .with_pinned_ofd(table, target, |file, description| {
+                    .with_pinned_ofd(table, target_number, |file, description| {
                         let Some(IpcBacking::Host(token)) = IpcBacking::decode(description.backing)
                         else {
                             return Err(LINUX_EPERM);
                         };
                         let resource = owner.host_resource(token).ok_or(LINUX_EBADF)?;
-                        let socket = resource
-                            .downcast_ref::<NativeNetFile>()
-                            .ok_or(LINUX_EPERM)?;
                         let reactor =
                             Arc::clone(self.kernel_binding.read().kernel().host_readiness());
-                        let epolls = owner.native_socket_epolls(&reactor)?;
-                        let key = Membership {
-                            epoll: object,
-                            socket: socket.source(),
-                            number: target,
+                        let control = |source, target| {
+                            let epolls = owner.native_socket_epolls(&reactor)?;
+                            let key = Membership {
+                                epoll: object,
+                                source,
+                                number: target_number,
+                            };
+                            epolls.control(owner, key, target, file, op, report)
                         };
-                        epolls.control(owner, key, socket, file, op, report)
+                        if let Some(socket) = resource.downcast_ref::<NativeNetFile>() {
+                            return control(
+                                MemberSource::Socket(socket.source()),
+                                EpollWatchTarget::Socket(socket.description()),
+                            );
+                        }
+                        let stdio = resource
+                            .downcast_ref::<crate::kernel::objects::ImplicitHostStdio>()
+                            .ok_or(LINUX_EPERM)?;
+                        use crate::dispatch::StdioReadiness;
+                        self.fs_view()
+                            .io
+                            .with_stdio_readiness(stdio.fd.0, |source| {
+                                let Some(StdioReadiness::Host(fd)) = source else {
+                                    return Err(LINUX_EPERM);
+                                };
+                                check_stdio_target(fd)?;
+                                control(MemberSource::Stdio(token), EpollWatchTarget::Stdio(fd))
+                            })
                     })
                     .map_err(pin_errno)?
             })
             .map_err(pin_errno)?
+    }
+}
+
+/// Kqueue can report readiness for regular files. Linux refuses their
+/// registration, including when the descriptor is inherited as stdio.
+fn check_stdio_target(fd: carrick_el1_abi::HostBoundFd) -> Result<(), LinuxErrno> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes the supplied writable storage on success.
+    if unsafe { libc::fstat(fd.raw(), stat.as_mut_ptr()) } != 0 {
+        return Err(io_errno(std::io::Error::last_os_error()));
+    }
+    let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+    // Linux's /dev/null and other unpollable character devices may also
+    // appear ready in poll. Admit the real terminal device class here.
+    if matches!(kind, libc::S_IFIFO | libc::S_IFSOCK)
+        || (kind == libc::S_IFCHR && unsafe { libc::isatty(fd.raw()) } == 1)
+    {
+        Ok(())
+    } else {
+        Err(LINUX_EPERM)
     }
 }
 

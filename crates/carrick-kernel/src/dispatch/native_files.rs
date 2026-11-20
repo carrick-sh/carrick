@@ -571,22 +571,35 @@ impl SyscallDispatcher {
                 super::net::native::NetServed::Refused => Served::Refused,
             }
         } else {
-            match owner.with_pinned_host_resource(table, fd::Fd(header.fd), |resource| {
-                match host_root.and_then(|root| self.host_root_projection(root, header, resource)) {
-                    Some(description) => self.serve_native_open_file(
-                        header,
-                        &description,
-                        view.input(),
-                        view.output_capacity(),
-                    ),
-                    None => self.serve_native_resource(
-                        header,
-                        resource,
-                        view.input(),
-                        view.output_capacity(),
-                    ),
-                }
-            }) {
+            match owner.with_pinned_host_resource_token(
+                table,
+                fd::Fd(header.fd),
+                |token, resource| {
+                    let served = match host_root
+                        .and_then(|root| self.host_root_projection(root, header, resource))
+                    {
+                        Some(description) => self.serve_native_open_file(
+                            header,
+                            &description,
+                            view.input(),
+                            view.output_capacity(),
+                        ),
+                        None => self.serve_native_resource(
+                            header,
+                            resource,
+                            view.input(),
+                            view.output_capacity(),
+                        ),
+                    };
+                    if header.op == HostFileOp::Write
+                        && resource.downcast_ref::<ImplicitHostStdio>().is_some()
+                        && let Some(epolls) = owner.existing_native_socket_epolls()
+                    {
+                        epolls.stdio_changed(owner, token);
+                    }
+                    served
+                },
+            ) {
                 Ok(served) => served,
                 // Closed after the ring staged the call: the descriptor is gone.
                 Err(PinnedHostResourceError::BadFd) => Served::errno(carrick_abi::LINUX_EBADF),

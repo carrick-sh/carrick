@@ -588,18 +588,30 @@ impl RuntimeIo {
     }
 
     pub(in crate::dispatch) fn stdio_readiness(&self, fd: i32) -> Option<StdioReadiness> {
+        self.with_stdio_readiness(fd, |readiness| readiness)
+    }
+
+    pub(in crate::dispatch) fn with_stdio_readiness<T>(
+        &self,
+        fd: i32,
+        use_source: impl FnOnce(Option<StdioReadiness>) -> T,
+    ) -> T {
         match fd {
-            0 => carrick_el1_abi::HostBoundFd::new(0).map(StdioReadiness::Host),
-            1 | 2 => match self.route() {
-                StdioRoute::Captured => Some(StdioReadiness::AlwaysWritable),
-                StdioRoute::Inherit => {
-                    carrick_el1_abi::HostBoundFd::new(fd).map(StdioReadiness::Host)
-                }
-                StdioRoute::Piped { stdout, stderr } => {
-                    Some(if fd == 1 { stdout } else { stderr }.readiness())
-                }
-            },
-            _ => None,
+            0 => use_source(carrick_el1_abi::HostBoundFd::new(0).map(StdioReadiness::Host)),
+            1 | 2 => {
+                let route = self.route();
+                let readiness = match &route {
+                    StdioRoute::Captured => Some(StdioReadiness::AlwaysWritable),
+                    StdioRoute::Inherit => {
+                        carrick_el1_abi::HostBoundFd::new(fd).map(StdioReadiness::Host)
+                    }
+                    StdioRoute::Piped { stdout, stderr } => {
+                        Some(if fd == 1 { stdout } else { stderr }.readiness())
+                    }
+                };
+                use_source(readiness)
+            }
+            _ => use_source(None),
         }
     }
 

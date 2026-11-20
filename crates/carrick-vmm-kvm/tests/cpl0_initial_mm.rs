@@ -5068,10 +5068,13 @@ fn native_child_readiness_wait_fixture(extra_flags: &[&str]) {
 
     let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("select gate peer");
     peer.set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+        .expect("bound the peer receive");
     let port = format!(
         "-DSELECT_GATE_PORT={}",
-        peer.local_addr().unwrap().port().swap_bytes()
+        peer.local_addr()
+            .expect("bound loopback address")
+            .port()
+            .swap_bytes()
     );
     let mut flags = vec!["-DUSE_PSELECT", "-DCHILD_POLLS", &port];
     flags.extend_from_slice(extra_flags);
@@ -5110,14 +5113,20 @@ fn native_child_readiness_wait_fixture(extra_flags: &[&str]) {
                     }
                     std::thread::yield_now();
                 };
-                assert_eq!(peer.send_to(b"w", client).unwrap(), 1);
+                assert_eq!(
+                    peer.send_to(b"w", client).expect("release the guest wake"),
+                    1
+                );
                 parked
             }));
         },
         carrick_kernel::dispatch::SyscallDispatcher::default(),
     )
     .expect("pselect6 run");
-    let enrolled = sender.unwrap().join().unwrap();
+    let enrolled = sender
+        .expect("configured host peer")
+        .join()
+        .expect("host peer finished");
     assert_eq!(
         outcome.run.exit_code, 7,
         "child readiness: {:?}",

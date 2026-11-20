@@ -44,7 +44,6 @@ pub(super) struct Binding {
     owner: Arc<HostIpc>,
     map: IpcTableMapBinding,
     file_table: FileTableId,
-    stdio: Vec<HostDescription>,
     explicit_stdio: [bool; 3],
     closed_stdio: [bool; 3],
     stdio_cloexec: [bool; 3],
@@ -102,34 +101,10 @@ impl Binding {
             owner,
             map,
             file_table,
-            stdio: Vec::with_capacity(3),
             explicit_stdio: [false; 3],
             closed_stdio,
             stdio_cloexec,
         };
-        for number in 0..3 {
-            let token = binding
-                .owner
-                .retain_host_resource(Box::new(ImplicitHostStdio {
-                    file_table,
-                    fd: fd::Fd(number),
-                }))?;
-            let backing = IpcBacking::Host(token).encode();
-            let description = match binding.owner.admit_description(fd::Description::new(
-                backing,
-                fd::AccessMode::ReadWrite,
-                fd::StatusFlags::default(),
-            )) {
-                Ok(description) => description,
-                Err(error) => {
-                    binding.owner.release(backing).unwrap_or_else(|_| {
-                        carrick_fatal!("ipc::table", "stdio admission rollback failed")
-                    });
-                    return Err(error);
-                }
-            };
-            binding.stdio.push(description);
-        }
         for (&number, slot) in slots.iter() {
             binding.install_slot(number, slot)?;
         }
@@ -204,11 +179,32 @@ impl Binding {
         if closed {
             self.close(number as i32)
         } else {
-            self.table.replace(
-                fd::Fd(number as i32),
-                &self.stdio[number].flags(),
-                self.stdio_cloexec[number],
-            )
+            let fd = fd::Fd(number as i32);
+            let token = self
+                .owner
+                .retain_host_resource(Box::new(ImplicitHostStdio {
+                    file_table: self.file_table,
+                    fd,
+                }))?;
+            let backing = IpcBacking::Host(token).encode();
+            let description = match self.owner.admit_description(fd::Description::new(
+                backing,
+                fd::AccessMode::ReadWrite,
+                fd::StatusFlags::default(),
+            )) {
+                Ok(description) => description,
+                Err(error) => {
+                    self.owner
+                        .release(backing)
+                        .map_err(AdmissionError::ObjectRollbackInvariant)?;
+                    return Err(error);
+                }
+            };
+            // The installed slot, forks and dup aliases own the description.
+            // A permanent host stock pin would keep epoll interests alive
+            // after the last guest descriptor closes.
+            self.table
+                .replace(fd, &description.flags(), self.stdio_cloexec[number])
         }
     }
 

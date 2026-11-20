@@ -18565,6 +18565,7 @@ fn serial_host_native_child_epoll_ctl_classifies_stdio() {
     use carrick_test_support::GuestUserBuffer;
 
     let (_reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    #[allow(clippy::disallowed_methods)] // Read-only regular-file fixture.
     let regular = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
     let sink = StdioSink::Piped {
         stdout: PipedOutput::host(writer).unwrap(),
@@ -18662,6 +18663,7 @@ fn native_child_mixed_readiness_wakes_on_sibling(use_ppoll: bool) {
         call(writer, ARM_RESUME, [0; 6]);
         let (_, socket) = call(reader, sys::SOCKET.raw(), [2, 2, 0, 0, 0, 0]);
         assert!((0..64).contains(&socket), "child socket: {socket}");
+        #[allow(clippy::disallowed_methods)] // Private loopback fixture endpoint.
         let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut address = [0; 16];
         address[..2].copy_from_slice(&2u16.to_ne_bytes());

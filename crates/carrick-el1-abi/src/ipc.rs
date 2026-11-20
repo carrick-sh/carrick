@@ -269,7 +269,7 @@ pub struct RawIpcObject {
 /// Opaque identity of a host-backed resource (a description that is not a
 /// migrated IPC object). Interpreted only by the host venue; never a host fd
 /// number EL1 could act on.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct HostResourceToken(u64);
 impl HostResourceToken {
     /// Largest encodable token.
