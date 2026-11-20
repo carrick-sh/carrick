@@ -6894,16 +6894,21 @@ fn production_grant_ignores_stale_host_residency(access: u64) {
     } else {
         base + 4 * PAGE
     };
-    let request = dispatcher
-        .with_resident_frame_grant_plan_for_test(fault, STOCK_WINDOW, |plan| {
+    let request = super::super::mm_mutation::test_support::with_permit(
+        dispatcher.mm_mutation_coordinator(),
+        |permit| {
+            let plan = dispatcher
+                .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
+                .expect("production selector must acquire the delegated root")
+                .expect("stale host residency must not suppress the semantic plan");
             SyscallDispatcher::el1_frame_grant_request(
                 &plan,
                 dispatcher.mm_authority().mm_id.raw(),
                 fault,
                 access,
             )
-        })
-        .expect("stale host residency must not suppress the semantic plan");
+        },
+    );
     assert_eq!(request.fault_va, fault);
     assert_eq!(request.access, access);
     assert!((request.semantic_base..request.semantic_base + request.len).contains(&fault));
