@@ -210,6 +210,13 @@ pub mod nr {
     pub const PRLIMIT64: CanonicalNr = CanonicalNr(261);
 }
 
+/// Address of Carrick's fixed vvar page in a Linux guest MM.
+pub const LINUX_VVAR_BASE: u64 = 0x2E_0000_0000;
+/// Byte offset of the vDSO counter frequency in Hz (little-endian u64).
+pub const VVAR_OFF_FREQ: usize = 8;
+/// Byte offset of the vDSO realtime offset in ns (little-endian u64).
+pub const VVAR_OFF_REALTIME_OFF_NS: usize = 16;
+
 /// Linux `clockid_t` values (`include/uapi/linux/time.h`). Shared by the
 /// host dispatcher and the ring sleep owner so both classify one clock set.
 pub const LINUX_CLOCK_REALTIME: u64 = 0;

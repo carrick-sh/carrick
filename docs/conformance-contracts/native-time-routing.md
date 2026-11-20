@@ -443,3 +443,21 @@ changes from ENOSYS with one refusal to EFAULT with no refusal when the
 output is null. On x86 the raw syscall and vDSO samples are ordered in the
 native root, fork child, and exec successor. The x86 fixture detects ENOSYS
 before comparing the results.
+
+
+### Native CPL0 realtime reads
+
+The clock_gettime(2) realtime and realtime-coarse reads use the current MM's
+calibrated vvar words. The syscall converts the same TSC used by the vDSO
+and adds the published offset. Coarse realtime truncates that result to the
+grid reported by clock_getres. Each read uses one fixed-size vvar copy and
+the existing retained timespec output. ARM realtime still needs the admitted
+clock policy and successor calibration tracked by #2571.
+
+The KVM evidence brackets a vDSO realtime read with raw syscall reads,
+bounds the coarse result using high-resolution samples, and relates a raw
+realtime read to raw monotonic brackets using the published offset. Within
+one run it compares that verified offset across the native root, fork child,
+and exec successor. Both witnesses exited with the ENOSYS marker before the
+fix. They passed under the exclusive KVM lease with the prior seven clock
+witnesses on the candidate.

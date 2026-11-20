@@ -230,6 +230,39 @@ impl<
         venue.monotonic_counter()
     }
 
+    fn realtime_counter(
+        &mut self,
+    ) -> Option<(
+        carrick_guest_arch::CounterTick,
+        carrick_guest_arch::CounterFrequency,
+        u64,
+    )> {
+        use carrick_syscall_abi::{LINUX_VVAR_BASE, VVAR_OFF_FREQ, VVAR_OFF_REALTIME_OFF_NS};
+
+        // CPL0 publishes a calibrated vvar only for a native clock domain.
+        // ARM still requires the container policy and exec calibration to be
+        // bound to the admitted MM before ring can sample its realtime.
+        if LifecycleNative::guest_isa(self) != carrick_guest_arch::GuestIsa::X86_64 {
+            return None;
+        }
+        let task = self.current_tasks.get(self.frame.task_index())?;
+        let mut copy = crate::file::ValidatedCopy {
+            task,
+            validator: &crate::file::HardwareValidator,
+        };
+        const OFFSET: usize = VVAR_OFF_REALTIME_OFF_NS - VVAR_OFF_FREQ;
+        let mut words = [0; OFFSET + size_of::<u64>()];
+        copy.copy_in_diagnosed(&mut words, LINUX_VVAR_BASE + VVAR_OFF_FREQ as u64)
+            .ok()?;
+        let (sample, hardware_frequency) = self.monotonic_counter()?;
+        let frequency = u64::from_le_bytes(words[..8].try_into().ok()?);
+        if frequency != hardware_frequency.raw().get() {
+            return None;
+        }
+        let offset = u64::from_le_bytes(words[OFFSET..].try_into().ok()?);
+        Some((sample, hardware_frequency, offset))
+    }
+
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
         let diagnostic = crate::file::CopyDiagnostic {
             counters: self.counters,

@@ -619,6 +619,12 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn monotonic_counter(&mut self) -> Option<(CounterTick, CounterFrequency)> {
         None
     }
+    /// The current MM's calibrated frequency and realtime offset, sampled
+    /// with the same counter as its vDSO. Absent when the venue has no
+    /// calibrated native vvar clock.
+    fn realtime_counter(&mut self) -> Option<(CounterTick, CounterFrequency, u64)> {
+        None
+    }
     /// Resume an input before any syscall effect has been committed.
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
     /// Retain a completed setup operation's original output after `NotYet`.
