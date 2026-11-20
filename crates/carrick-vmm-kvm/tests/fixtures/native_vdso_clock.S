@@ -181,6 +181,9 @@ compare_samples:
     call compare_counter
     call compare_realtime_offset
 #endif
+#ifdef REALTIME_ALIASES_WITNESS
+    call compare_realtime_aliases
+#endif
     jmp compare_realtime_and_resolution
 
 compare_counter:
@@ -310,9 +313,81 @@ compare_realtime_offset:
     add $56, %rsp
     ret
 #endif
+#ifdef REALTIME_ALIASES_WITNESS
+compare_realtime_aliases:
+    sub $56, %rsp
+#ifndef LEGACY_TIME_WITNESS
+    lea gettimeofday_symbol(%rip), %r10
+    mov $20, %r11d
+    call find_symbol
+    mov %rax, 48(%rsp)
+    mov %rsp, %rdi
+    lea 16(%rsp), %rsi
+    movq $-1, (%rsi)
+    mov $96, %eax
+    syscall
+    call check_raw_result
+    cmpq $0, 16(%rsp)
+    jne failure
+    cmpq $999999, 8(%rsp)
+    ja failure
+    lea 16(%rsp), %rdi
+    xor %esi, %esi
+    call *48(%rsp)
+    test %rax, %rax
+    jne failure
+    lea 32(%rsp), %rdi
+    xor %esi, %esi
+    mov $96, %eax
+    syscall
+    call check_raw_result
+    imulq $1000000, (%rsp), %rax
+    add 8(%rsp), %rax
+    imulq $1000000, 16(%rsp), %rdx
+    add 24(%rsp), %rdx
+    cmp %rax, %rdx
+    jb failure
+    imulq $1000000, 32(%rsp), %rax
+    add 40(%rsp), %rax
+    cmp %rax, %rdx
+    ja failure
+#else
+    lea time_symbol(%rip), %r10
+    mov $12, %r11d
+    call find_symbol
+    mov %rax, 48(%rsp)
+    mov %rsp, %rdi
+    mov $201, %eax
+    syscall
+    cmp $-38, %rax
+    je clock_unserved
+    cmp $1600000000, %rax
+    jb failure
+    cmp (%rsp), %rax
+    jne failure
+    xor %edi, %edi
+    call *48(%rsp)
+    mov %rax, 16(%rsp)
+    xor %edi, %edi
+    mov $201, %eax
+    syscall
+    cmp $-38, %rax
+    je clock_unserved
+    cmp (%rsp), %rax
+    jb failure
+    mov 16(%rsp), %rdx
+    cmp (%rsp), %rdx
+    jb failure
+    cmp %rax, %rdx
+    ja failure
+#endif
+    add $56, %rsp
+    ret
+#endif
 raw_counter:
     mov $228, %eax
     syscall
+check_raw_result:
     cmp $-38, %rax
     je clock_unserved
     test %rax, %rax
@@ -323,6 +398,12 @@ gettime_symbol:
     .asciz "__vdso_clock_gettime"
 getres_symbol:
     .asciz "__vdso_clock_getres"
+#ifdef REALTIME_ALIASES_WITNESS
+gettimeofday_symbol:
+    .asciz "__vdso_gettimeofday"
+time_symbol:
+    .asciz "__vdso_time"
+#endif
 #ifdef SUCCESSOR_PATH
 successor: .asciz SUCCESSOR_PATH
 .balign 8
