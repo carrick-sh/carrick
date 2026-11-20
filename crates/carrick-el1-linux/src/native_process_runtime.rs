@@ -195,13 +195,13 @@ fn request_signal_reschedule<'a, C: ProcessContext, S: NativeProcessService<'a, 
     }
 }
 
-fn publish_signal_channel<'a, C: ProcessContext, S: NativeProcessService<'a, C>>(
+fn publish_signal_channel_counted<'a, C: ProcessContext, S: NativeProcessService<'a, C>>(
     zone: &'a ZoneTables<C>,
     slot: SlotId,
     service: &mut S,
     channel: &Arc<WaitChannel>,
     #[cfg(test)] probe: Option<&(dyn Fn(u32) + Sync)>,
-) -> Result<(), NativeFailure> {
+) -> Result<u32, NativeFailure> {
     let address = WaitChannel::address(channel);
     let guard = zone.short_lock(
         ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
@@ -216,7 +216,7 @@ fn publish_signal_channel<'a, C: ProcessContext, S: NativeProcessService<'a, C>>
         .publish()
         .map_err(|_| NativeFailure::Exhausted)?;
     let mut effects = WakeEffects::default();
-    zone.wake_placed(
+    let woken = zone.wake_placed(
         &guard,
         channel.mm,
         address,
@@ -228,7 +228,25 @@ fn publish_signal_channel<'a, C: ProcessContext, S: NativeProcessService<'a, C>>
     );
     drop(guard);
     service.wake_effects(effects);
-    Ok(())
+    Ok(woken)
+}
+
+fn publish_signal_channel<'a, C: ProcessContext, S: NativeProcessService<'a, C>>(
+    zone: &'a ZoneTables<C>,
+    slot: SlotId,
+    service: &mut S,
+    channel: &Arc<WaitChannel>,
+    #[cfg(test)] probe: Option<&(dyn Fn(u32) + Sync)>,
+) -> Result<(), NativeFailure> {
+    publish_signal_channel_counted(
+        zone,
+        slot,
+        service,
+        channel,
+        #[cfg(test)]
+        probe,
+    )
+    .map(|_| ())
 }
 
 fn owned_control<'a>(
@@ -320,6 +338,42 @@ pub enum NativeProcessError {
     NoChild,
 }
 impl NativeProcessError {
+    /// Map this service error and last phase to its diagnostic fatal reason.
+    pub fn entry_binding_fatal_reason(
+        &self,
+        phase: NativeServicePhase,
+    ) -> carrick_el1_abi::EntryBindingFatalReason {
+        use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+        match self {
+            Self::Invalid => Fatal::NativeServiceInvalid,
+            Self::Stale => match phase {
+                NativeServicePhase::Unspecified => Fatal::NativeServiceStale,
+                NativeServicePhase::Capability => Fatal::NativeServiceCapStale,
+                NativeServicePhase::Payload => Fatal::NativeServicePayloadStale,
+                NativeServicePhase::Member => Fatal::NativeServiceMemberStale,
+                NativeServicePhase::Birth => Fatal::NativeServiceBirthStale,
+                NativeServicePhase::Mm => Fatal::NativeServiceMmStale,
+                NativeServicePhase::Bind => Fatal::NativeServiceBindStale,
+                NativeServicePhase::Publication => Fatal::NativeServicePublishStale,
+                NativeServicePhase::Notice => Fatal::NativeServiceNoticeStale,
+                NativeServicePhase::Park => Fatal::NativeServiceParkStale,
+                NativeServicePhase::Completion => Fatal::NativeServiceCompleteStale,
+                NativeServicePhase::Settlement => Fatal::NativeServiceSettleStale,
+            },
+            Self::Exhausted => Fatal::NativeServiceExhausted,
+            Self::Fault => Fatal::NativeServiceFault,
+            Self::Unsupported => Fatal::NativeServiceUnsupported,
+            Self::GroupExitCustody => Fatal::NativeServiceGroupExit,
+            Self::Busy => Fatal::NativeServiceBusy,
+            Self::Quarantined => Fatal::NativeServiceQuarantined,
+            Self::NoChild => Fatal::NativeServiceNoChild,
+            Self::OwnerWait(_) => Fatal::NativeServiceOwnerWait,
+            Self::ForkRefused(refusal) => refusal
+                .error()
+                .entry_binding_fatal_reason(NativeServicePhase::Unspecified),
+        }
+    }
+
     /// Preserve owner contention and preparation requests on every ISA.
     pub fn from_user_write(
         failure: carrick_core::mm::transaction::UserWriteError<NativeProcessError>,
@@ -1285,6 +1339,7 @@ struct PendingWait {
     observed: Option<TaskWakeGeneration>,
     /// A contended `WNOHANG` wait reruns as `WNOHANG` once released.
     nohang: bool,
+    signal_wake_recorded: core::sync::atomic::AtomicBool,
     channel: Arc<WaitChannel>,
 }
 #[derive(Clone, Copy)]
@@ -1638,6 +1693,21 @@ impl<'a> PendingTable<'a> {
             PendingState::ChildWait(pending) => Some(pending),
             _ => unreachable!(),
         }
+    }
+    fn mark_signal_wake_child_wait(&self, key: &TaskKey) -> bool {
+        let mut marked = false;
+        for (row_key, state) in &self.rows {
+            if let (
+                PendingKey::ChildWait(process, _),
+                PendingState::ChildWait(PendingChildContinuation::Wait(pending)),
+            ) = (row_key, state.as_ref())
+                && process == key
+                && !pending.signal_wake_recorded.swap(true, Ordering::Relaxed)
+            {
+                marked = true;
+            }
+        }
+        marked
     }
     pub(super) fn remove_member_child_waits(&mut self, key: &TaskKey, control: usize) {
         self.rows.retain(|row_key, _| {
@@ -2883,6 +2953,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             }
         }
         let interrupt = signals.has_deliverable(member.record, blocked);
+        let child_wait_target = interrupt
+            .then_some(member.process)
+            .filter(|target| graph.pending.mark_signal_wake_child_wait(target));
         let ipc_channels = if interrupt {
             graph.pending.ipc_channels(&member.process)
         } else {
@@ -2905,7 +2978,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             request_signal_reschedule(zone, service, wake_record);
         }
         if let Some(channel) = channel {
-            publish_signal_channel(
+            let woken = publish_signal_channel_counted(
                 zone,
                 publishing_slot,
                 service,
@@ -2913,6 +2986,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 #[cfg(test)]
                 None,
             )?;
+            if let Some(parent_key) = child_wait_target
+                && woken > 0
+            {
+                carrick_el1_abi::emit_native_child_lifecycle(
+                    carrick_el1_abi::NativeChildLifecycleEvent::ParentWake {
+                        parent: parent_key,
+                        reason: carrick_el1_abi::NativeParentWakeReason::Signal,
+                        woken,
+                    },
+                );
+            }
         }
         Ok(true)
     }
@@ -5062,6 +5146,34 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         self.key != self.runtime.graph.lock().root_key
     }
 
+    pub const fn task_key(&self) -> TaskKey {
+        self.key
+    }
+
+    #[inline(never)]
+    pub fn record_entry_binding_fatal(&self, reason: carrick_el1_abi::EntryBindingFatalReason) {
+        if self.is_fork_child() {
+            carrick_el1_abi::emit_native_child_lifecycle(
+                carrick_el1_abi::NativeChildLifecycleEvent::Exit {
+                    task: self.key,
+                    reason: carrick_el1_abi::NativeChildTerminalReason::EntryBindingFatal(reason),
+                },
+            );
+        }
+    }
+
+    #[inline(never)]
+    fn record_child_run_failure(&self, reason: carrick_core_abi::NativeRunFailureReason) {
+        if self.is_fork_child() {
+            carrick_el1_abi::emit_native_child_lifecycle(
+                carrick_el1_abi::NativeChildLifecycleEvent::Exit {
+                    task: self.key,
+                    reason: carrick_el1_abi::NativeChildTerminalReason::NativeRunFailure(reason),
+                },
+            );
+        }
+    }
+
     /// Saved words owned by this admitted member, before executor handback.
     pub fn resume_context(&self) -> &C {
         &self.words
@@ -5254,6 +5366,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.run_failure.take()
     }
     fn run_failed(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> LifecycleOutcome {
+        self.record_child_run_failure(reason);
         self.discard_rerun_answers();
         self.run_failure = Some(reason);
         if let Some(record) = self
@@ -5344,6 +5457,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.current.linux.mark_native_signal_work();
         }
         let interrupt = signals.has_deliverable(record, blocked);
+        let child_wait_target = interrupt
+            .then_some(target_key)
+            .filter(|target| graph.pending.mark_signal_wake_child_wait(target));
         let ipc_channels = if interrupt {
             graph.pending.ipc_channels(&target_key)
         } else {
@@ -5358,8 +5474,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.interrupt_signal_record(record);
         }
         if let Some(channel) = channel {
-            self.publish_channel(&channel)
+            let woken = self
+                .publish_channel_counted(&channel)
                 .map_err(|e| carrick_syscall_abi::LinuxErrno::new(-e.errno() as i32))?;
+            if let Some(parent_key) = child_wait_target
+                && woken > 0
+            {
+                carrick_el1_abi::emit_native_child_lifecycle(
+                    carrick_el1_abi::NativeChildLifecycleEvent::ParentWake {
+                        parent: parent_key,
+                        reason: carrick_el1_abi::NativeParentWakeReason::Signal,
+                        woken,
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -5369,7 +5497,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     // wait (`UserReturn`) wakes with `-EINTR` on deliverable signal arrival.
     fn interrupt_signal_record(&mut self, record: RecordRef) {
         if let Err(error) = self.interrupt_member_record(record) {
-            self.run_failure = Some(error.run_failure_reason());
+            let reason = error.run_failure_reason();
+            self.record_child_run_failure(reason);
+            self.run_failure = Some(reason);
         }
     }
 
@@ -5551,6 +5681,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         status: UserVa,
         nohang: bool,
         output: PendingWaitOutput,
+        signal_wake_recorded: bool,
     ) -> Result<LifecycleOutcome, NativeFailure> {
         let mut rescan = None;
         loop {
@@ -5685,6 +5816,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             continue;
                         }
                     };
+                    if let WaitSelection::Exited(zombie) = &consumed.selection {
+                        carrick_el1_abi::emit_native_child_lifecycle(
+                            carrick_el1_abi::NativeChildLifecycleEvent::Reaped {
+                                caller: self.key,
+                                child: zombie.key,
+                                status: zombie.status,
+                            },
+                        );
+                    }
                     let result = match (&consumed.selection, output) {
                         (WaitSelection::Exited(_), PendingWaitOutput::WaitId { .. }) => 0,
                         (WaitSelection::Exited(zombie), PendingWaitOutput::Wait4 { rusage }) => {
@@ -5760,11 +5900,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             output,
                             observed: Some(precheck.wake_generation()),
                             nohang: false,
+                            signal_wake_recorded: core::sync::atomic::AtomicBool::new(
+                                signal_wake_recorded,
+                            ),
                             channel,
                         }),
                     )? {
                         ContinuationPark::Rescan => continue,
                         ContinuationPark::Interrupted => {
+                            if !signal_wake_recorded {
+                                carrick_el1_abi::emit_native_child_lifecycle(
+                                    carrick_el1_abi::NativeChildLifecycleEvent::ParentWake {
+                                        parent: self.key,
+                                        reason: carrick_el1_abi::NativeParentWakeReason::Signal,
+                                        woken: 1,
+                                    },
+                                );
+                            }
                             return Ok(returned(carrick_syscall_abi::LINUX_EINTR.guest_retval()));
                         }
                         ContinuationPark::Parked => {}
@@ -5803,12 +5955,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 output,
                 observed: Some(observed),
                 nohang,
+                signal_wake_recorded: core::sync::atomic::AtomicBool::new(false),
                 channel,
             }),
         )?;
         Ok(match parked {
             ContinuationPark::Rescan => ContendedWait::Rescan,
             ContinuationPark::Interrupted => {
+                carrick_el1_abi::emit_native_child_lifecycle(
+                    carrick_el1_abi::NativeChildLifecycleEvent::ParentWake {
+                        parent: self.key,
+                        reason: carrick_el1_abi::NativeParentWakeReason::Signal,
+                        woken: 1,
+                    },
+                );
                 ContendedWait::Done(returned(carrick_syscall_abi::LINUX_EINTR.guest_retval()))
             }
             ContinuationPark::Parked => ContendedWait::Done(LifecycleOutcome::Transferred {
@@ -6418,6 +6578,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             pending.status,
                             pending.nohang,
                             pending.output,
+                            pending.signal_wake_recorded.load(Ordering::Relaxed),
                         ) {
                             Ok(outcome) => outcome,
                             Err(error) => self.fail(error),
@@ -7047,7 +7208,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
     fn publish_channel(&mut self, channel: &Arc<WaitChannel>) -> Result<(), NativeFailure> {
-        publish_signal_channel(
+        self.publish_channel_counted(channel).map(|_| ())
+    }
+    fn publish_channel_counted(
+        &mut self,
+        channel: &Arc<WaitChannel>,
+    ) -> Result<u32, NativeFailure> {
+        publish_signal_channel_counted(
             self.source.zone,
             self.source.slot,
             self.service,
@@ -7318,8 +7485,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
         let record = self.source.zone.record(self.record.id);
         let host_owned = !record.is_native_owned() && record.requires_native_entry();
-        let resumed = self.resume_owned_checkpoint()?;
-        self.finish_host_resume(resumed, host_owned, checkpoint)
+        let resumed = match self.resume_owned_checkpoint() {
+            Ok(resumed) => resumed,
+            Err(reason) => {
+                self.record_child_run_failure(reason);
+                return Err(reason);
+            }
+        };
+        let result = self.finish_host_resume(resumed, host_owned, checkpoint);
+        if let Err(reason) = result {
+            self.record_child_run_failure(reason);
+        }
+        result
     }
 
     // Physical reply application has returned before final signal/service
@@ -8346,6 +8523,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             graph.pending.remove_exit(&self.key);
             (page, file_table, resources, published)
         };
+        if !root_exit {
+            let reason = if wait_status.is_signaled() {
+                carrick_el1_abi::NativeChildTerminalReason::Signaled {
+                    status: wait_status,
+                }
+            } else {
+                carrick_el1_abi::NativeChildTerminalReason::Exited {
+                    status: wait_status,
+                }
+            };
+            carrick_el1_abi::emit_native_child_lifecycle(
+                carrick_el1_abi::NativeChildLifecycleEvent::Exit {
+                    task: self.key,
+                    reason,
+                },
+            );
+        }
         let record = self
             .source
             .zone
@@ -8419,7 +8613,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if let Some(probe) = self.exit_notification_probe {
             probe();
         }
-        let (channels, autoreaped_receipt, notified) = {
+        let (parent_for_wake, channels, autoreaped_receipt, notified) = {
             let mut graph = self.runtime.graph.lock();
             // Keep readiness and current-parent selection in one graph
             // projection: an adopter parked on this pending receipt owns
@@ -8438,22 +8632,39 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // A vfork child's exit releases its suspended parent (exit_mm
             // before exit_notify): remove the release row before publishing.
             let vfork_parent = graph.vfork_parents.remove(&self.key);
-            let mut channels = Vec::new();
-            for key in [parent, published.adopter, vfork_parent]
-                .into_iter()
-                .flatten()
+            let mut channels: Vec<(Arc<WaitChannel>, Option<TaskKey>)> = Vec::new();
+            for (key, is_exit_parent) in [
+                parent.map(|k| (k, true)),
+                published.adopter.map(|k| (k, false)),
+                vfork_parent.map(|k| (k, false)),
+            ]
+            .into_iter()
+            .flatten()
             {
                 if let Some(channel) = graph
                     .owner
                     .task(key)
                     .ok()
                     .and_then(|row| row.native().resources().channel.clone())
-                    && !channels.iter().any(|other| Arc::ptr_eq(other, &channel))
+                    && !channels
+                        .iter()
+                        .any(|(other, _)| Arc::ptr_eq(other, &channel))
                 {
-                    channels.push(channel);
+                    channels.push((channel, is_exit_parent.then_some(key)));
                 }
             }
             let autoreaped_receipt = graph.owner.publish_exit_retirement(published.retirement);
+            if !root_exit
+                && autoreaped_receipt.is_none()
+                && let Some(parent_key) = parent
+            {
+                carrick_el1_abi::emit_native_child_lifecycle(
+                    carrick_el1_abi::NativeChildLifecycleEvent::ZombiePublished {
+                        child: self.key,
+                        parent: parent_key,
+                    },
+                );
+            }
             // Hold a delivery failure until the guard is released: automatic
             // removal custody is disposed outside graph custody on every path.
             let notified = target.map_or(Ok(()), |target| {
@@ -8498,11 +8709,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .map(|_| ())
                     .map_err(|_| NativeFailure::Stale)
             });
-            (channels, autoreaped_receipt, notified)
+            (parent, channels, autoreaped_receipt, notified)
         };
         notified?;
-        for channel in channels {
-            self.publish_channel(&channel)?;
+        let mut parent_wake_emitted = false;
+        for (channel, notify_parent) in channels {
+            let woken = self.publish_channel_counted(&channel)?;
+            if !root_exit && let Some(parent_key) = notify_parent {
+                parent_wake_emitted = true;
+                carrick_el1_abi::emit_native_child_lifecycle(
+                    carrick_el1_abi::NativeChildLifecycleEvent::ParentWake {
+                        parent: parent_key,
+                        reason: if woken > 0 {
+                            carrick_el1_abi::NativeParentWakeReason::ChildExit
+                        } else {
+                            carrick_el1_abi::NativeParentWakeReason::None
+                        },
+                        woken,
+                    },
+                );
+            }
+        }
+        if !root_exit
+            && !parent_wake_emitted
+            && let Some(parent_key) = parent_for_wake
+        {
+            carrick_el1_abi::emit_native_child_lifecycle(
+                carrick_el1_abi::NativeChildLifecycleEvent::ParentWake {
+                    parent: parent_key,
+                    reason: carrick_el1_abi::NativeParentWakeReason::None,
+                    woken: 0,
+                },
+            );
         }
         drop(autoreaped_receipt);
         if root_exit {
@@ -9270,6 +9508,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             unrow(self.runtime);
             return Err(NativeProcessError::Quarantined);
         }
+        carrick_el1_abi::emit_native_child_lifecycle(
+            carrick_el1_abi::NativeChildLifecycleEvent::ForkCreated {
+                parent: self.key,
+                child: child_key,
+                flags: carrick_el1_abi::NativeChildForkFlags {
+                    exit_signal: 17,
+                    vfork,
+                    child_settid: child_tid.set,
+                    child_cleartid: child_tid.clear,
+                },
+            },
+        );
         Ok(visible.get())
     }
 }
@@ -9747,6 +9997,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             _status,
             _options.contains(LinuxWaitOptions::WNOHANG),
             PendingWaitOutput::Wait4 { rusage: _rusage },
+            false,
         ) {
             Ok(outcome) => outcome,
             Err(error) => self.fail(error),
@@ -9769,6 +10020,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             PendingWaitOutput::WaitId {
                 nowait: options.contains(LinuxWaitOptions::WNOWAIT),
             },
+            false,
         ) {
             Ok(outcome) => outcome,
             Err(error) => self.fail(error),
@@ -9953,6 +10205,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         if let Err(error) = published {
             // The sole pending-exit wake cannot be retried or discarded. The
             // active clone lane reports typed run failure before guest return.
+            self.record_child_run_failure(
+                carrick_core_abi::NativeRunFailureReason::BirthSettlement,
+            );
             self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
             return Err(error.errno());
         }
@@ -11602,7 +11857,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
         });
 
-        let mut wake_channels = Vec::new();
+        let mut wake_channels: Vec<(Arc<WaitChannel>, Option<TaskKey>)> = Vec::new();
         let mut interrupts = Vec::new();
         let mut fatal_signal_work = signal == carrick_signal_core::policy::Signal::KILL;
         for (target_key, target_signals, _) in targets {
@@ -11630,16 +11885,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     },
                 );
             }
-            if interrupts.len() != before {
-                wake_channels.extend(graph.pending.ipc_channels(&target_key));
+            let target_interrupted = interrupts.len() != before;
+            if target_interrupted {
+                wake_channels.extend(
+                    graph
+                        .pending
+                        .ipc_channels(&target_key)
+                        .into_iter()
+                        .map(|ch| (ch, None)),
+                );
             }
+            let child_wait_target = target_interrupted
+                .then_some(target_key)
+                .filter(|target| graph.pending.mark_signal_wake_child_wait(target));
             if let Some(channel) = graph
                 .owner
                 .task(target_key)
                 .ok()
                 .and_then(|t| t.native().resources().channel.clone())
             {
-                wake_channels.push(channel);
+                wake_channels.push((channel, child_wait_target));
             }
         }
         drop(graph);
@@ -11649,9 +11914,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         for record in interrupts {
             self.interrupt_signal_record(record);
         }
-        for channel in wake_channels {
-            self.publish_channel(&channel)
+        for (channel, child_wait_target) in wake_channels {
+            let woken = self
+                .publish_channel_counted(&channel)
                 .map_err(|error| carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32))?;
+            if let Some(parent_key) = child_wait_target
+                && woken > 0
+            {
+                carrick_el1_abi::emit_native_child_lifecycle(
+                    carrick_el1_abi::NativeChildLifecycleEvent::ParentWake {
+                        parent: parent_key,
+                        reason: carrick_el1_abi::NativeParentWakeReason::Signal,
+                        woken,
+                    },
+                );
+            }
         }
         Ok(())
     }

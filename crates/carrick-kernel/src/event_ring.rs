@@ -77,6 +77,16 @@ pub const ALIAS_DISPATCH: u8 = 91;
 pub const ALIAS_INSTALL: u8 = 92;
 pub const ALIAS_END: u8 = 93;
 
+// Native child lifecycle transitions (#2620): always-on ring records emitted
+// from the single neutral owner in `carrick-el1-linux` (plus pre-abort carrier
+// sinks) and routed to `RingSelect::Lifecycle`.
+pub const NATIVE_CHILD_FORK: u8 = 94;
+pub const NATIVE_CHILD_EXEC: u8 = 95;
+pub const NATIVE_CHILD_EXIT: u8 = 96;
+pub const NATIVE_CHILD_ZOMBIE: u8 = 97;
+pub const NATIVE_CHILD_WAKE: u8 = 98;
+pub const NATIVE_CHILD_REAP: u8 = 99;
+
 // Event kinds.
 pub const BIND: u8 = 1;
 pub const LISTEN: u8 = 2;
@@ -1121,6 +1131,229 @@ pub fn rec_mm_occupancy_refused(slot: usize, running_mm: u64, requested_mm: u64)
         low32(requested_mm),
     );
 }
+
+fn record_and_probe_native_child_lifecycle(event: carrick_el1_abi::NativeChildLifecycleEvent) {
+    use carrick_el1_abi::NativeChildLifecycleEvent as E;
+    match event {
+        E::ForkCreated {
+            parent,
+            child,
+            flags,
+        } => {
+            let packed_flags = u32::from(flags.pack_u16());
+            let c = (packed_flags
+                | (((parent.serial.raw() as u32) & 0xff) << 16)
+                | (((child.serial.raw() as u32) & 0xff) << 24)) as i32;
+            rec(NATIVE_CHILD_FORK, parent.id.raw(), child.id.raw(), c);
+            carrick_observability::probes::native_child_fork(
+                parent.id.raw() as u64,
+                parent.serial.raw(),
+                child.id.raw() as u64,
+                child.serial.raw(),
+                u64::from(packed_flags),
+            );
+        }
+        E::Exec { task, outcome } => {
+            let detail = outcome.detail_i32();
+            rec(
+                NATIVE_CHILD_EXEC,
+                task.id.raw(),
+                task.serial.raw() as u32 as i32,
+                detail,
+            );
+            carrick_observability::probes::native_child_exec(
+                task.id.raw() as u64,
+                task.serial.raw(),
+                u32::from(outcome.succeeded()),
+                detail,
+            );
+        }
+        E::Exit { task, reason } => {
+            let (class, code, wstatus) = reason.parts();
+            rec(
+                NATIVE_CHILD_EXIT,
+                task.id.raw(),
+                task.serial.raw() as u32 as i32,
+                reason.pack_i32(),
+            );
+            carrick_observability::probes::native_child_exit(
+                task.id.raw() as u64,
+                task.serial.raw(),
+                u32::from(class),
+                u32::from(code),
+                u32::from(wstatus),
+            );
+        }
+        E::ZombiePublished { child, parent } => {
+            let c = ((((child.serial.raw() as u32) & 0xffff) << 16)
+                | ((parent.serial.raw() as u32) & 0xffff)) as i32;
+            rec(NATIVE_CHILD_ZOMBIE, child.id.raw(), parent.id.raw(), c);
+            carrick_observability::probes::native_child_zombie(
+                child.id.raw() as u64,
+                child.serial.raw(),
+                parent.id.raw() as u64,
+                parent.serial.raw(),
+            );
+        }
+        E::ParentWake {
+            parent,
+            reason,
+            woken,
+        } => {
+            let c = (u32::from(reason as u8) | (woken.min(0x00ff_ffff) << 8)) as i32;
+            rec(
+                NATIVE_CHILD_WAKE,
+                parent.id.raw(),
+                parent.serial.raw() as u32 as i32,
+                c,
+            );
+            carrick_observability::probes::native_child_wake(
+                parent.id.raw() as u64,
+                parent.serial.raw(),
+                u32::from(reason as u8),
+                woken,
+            );
+        }
+        E::Reaped {
+            caller,
+            child,
+            status,
+        } => {
+            let wstatus = (status.raw() as u32) & 0xffff;
+            let c = (wstatus
+                | (((caller.serial.raw() as u32) & 0xff) << 16)
+                | (((child.serial.raw() as u32) & 0xff) << 24)) as i32;
+            rec(NATIVE_CHILD_REAP, caller.id.raw(), child.id.raw(), c);
+            carrick_observability::probes::native_child_reap(
+                caller.id.raw() as u64,
+                caller.serial.raw(),
+                child.id.raw() as u64,
+                child.serial.raw(),
+                wstatus,
+            );
+        }
+    }
+}
+
+fn sink_native_child_lifecycle(event: carrick_el1_abi::NativeChildLifecycleEvent) {
+    drain_pending_native_child_queues();
+    record_and_probe_native_child_lifecycle(event);
+}
+
+fn drain_pending_native_child_queues() {
+    if let Some(ring) = carrick_el1_abi::native_child_lifecycle_host() {
+        while let Some(event) = ring.pop() {
+            record_and_probe_native_child_lifecycle(event);
+        }
+    }
+    let fallback = carrick_el1_abi::host_fallback_native_child_lifecycle();
+    while let Some(event) = fallback.pop() {
+        record_and_probe_native_child_lifecycle(event);
+    }
+}
+
+/// Install the host sink/flush hooks and drain any queued native-child
+/// lifecycle events from the shared guest aperture and host fallback ring.
+pub fn flush_native_child_lifecycle() {
+    carrick_el1_abi::register_native_child_lifecycle_host_hooks(
+        sink_native_child_lifecycle,
+        drain_pending_native_child_queues,
+    );
+    drain_pending_native_child_queues();
+}
+
+/// Record one typed native-child lifecycle event directly into the lifecycle
+/// ring and fire its matching USDT probe.
+pub fn rec_native_child_lifecycle(event: carrick_el1_abi::NativeChildLifecycleEvent) {
+    flush_native_child_lifecycle();
+    record_and_probe_native_child_lifecycle(event);
+}
+
+/// Decoded projection of a native-child lifecycle `EventRecord` (`94..=99`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodedNativeChildRecord {
+    Fork {
+        parent_id: i32,
+        parent_serial_low8: u8,
+        child_id: i32,
+        child_serial_low8: u8,
+        flags: carrick_el1_abi::NativeChildForkFlags,
+    },
+    Exec {
+        task_id: i32,
+        task_serial_low32: u32,
+        outcome: carrick_el1_abi::NativeChildExecOutcome,
+    },
+    Exit {
+        task_id: i32,
+        task_serial_low32: u32,
+        reason: Option<carrick_el1_abi::NativeChildTerminalReason>,
+        raw_packed: i32,
+    },
+    Zombie {
+        child_id: i32,
+        child_serial_low16: u16,
+        parent_id: i32,
+        parent_serial_low16: u16,
+    },
+    Wake {
+        parent_id: i32,
+        parent_serial_low32: u32,
+        reason: Option<carrick_el1_abi::NativeParentWakeReason>,
+        woken: u32,
+    },
+    Reap {
+        caller_id: i32,
+        caller_serial_low8: u8,
+        child_id: i32,
+        child_serial_low8: u8,
+        wstatus: u16,
+    },
+}
+
+pub fn decode_native_child_record(record: EventRecord) -> Option<DecodedNativeChildRecord> {
+    let cu = record.c as u32;
+    match record.kind {
+        NATIVE_CHILD_FORK => Some(DecodedNativeChildRecord::Fork {
+            parent_id: record.a,
+            parent_serial_low8: ((cu >> 16) & 0xff) as u8,
+            child_id: record.b,
+            child_serial_low8: ((cu >> 24) & 0xff) as u8,
+            flags: carrick_el1_abi::NativeChildForkFlags::unpack_u16((cu & 0xffff) as u16),
+        }),
+        NATIVE_CHILD_EXEC => Some(DecodedNativeChildRecord::Exec {
+            task_id: record.a,
+            task_serial_low32: record.b as u32,
+            outcome: carrick_el1_abi::NativeChildExecOutcome::from_detail_i32(record.c),
+        }),
+        NATIVE_CHILD_EXIT => Some(DecodedNativeChildRecord::Exit {
+            task_id: record.a,
+            task_serial_low32: record.b as u32,
+            reason: carrick_el1_abi::NativeChildTerminalReason::unpack_i32(record.c),
+            raw_packed: record.c,
+        }),
+        NATIVE_CHILD_ZOMBIE => Some(DecodedNativeChildRecord::Zombie {
+            child_id: record.a,
+            child_serial_low16: (cu >> 16) as u16,
+            parent_id: record.b,
+            parent_serial_low16: (cu & 0xffff) as u16,
+        }),
+        NATIVE_CHILD_WAKE => Some(DecodedNativeChildRecord::Wake {
+            parent_id: record.a,
+            parent_serial_low32: record.b as u32,
+            reason: carrick_el1_abi::NativeParentWakeReason::from_raw((cu & 0xff) as u8),
+            woken: cu >> 8,
+        }),
+        NATIVE_CHILD_REAP => Some(DecodedNativeChildRecord::Reap {
+            caller_id: record.a,
+            caller_serial_low8: ((cu >> 16) & 0xff) as u8,
+            child_id: record.b,
+            child_serial_low8: ((cu >> 24) & 0xff) as u8,
+            wstatus: (cu & 0xffff) as u16,
+        }),
+        _ => None,
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventRecord {
     pub logical_index: u64,
@@ -1163,7 +1396,7 @@ pub enum RingReadError {
 }
 
 const fn known_kind(kind: u8) -> bool {
-    (kind >= BIND && kind <= LAST_KIND) || (kind >= ALIAS_MUTATION && kind <= ALIAS_END)
+    (kind >= BIND && kind <= LAST_KIND) || (kind >= ALIAS_MUTATION && kind <= NATIVE_CHILD_REAP)
 }
 
 fn read_slot_after(
@@ -1246,6 +1479,9 @@ pub fn drain_recent_high_rate(max: usize) -> Vec<Result<EventRecord, RingReadErr
 }
 
 fn drain_ring(ring: RingSelect, max: usize) -> Vec<Result<EventRecord, RingReadError>> {
+    if matches!(ring, RingSelect::Lifecycle) {
+        flush_native_child_lifecycle();
+    }
     let (slots, idx) = ring_storage(ring);
     let total = idx.load(Ordering::Acquire);
     let window = max.min(N) as u64;
@@ -1880,6 +2116,85 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
             "ALIAS    coordinator={:#x} tid={c} end",
             ((a as u32 as u64) << 32) | (b as u32 as u64)
         ),
+        NATIVE_CHILD_FORK => {
+            let cu = c as u32;
+            format!(
+                "NCHILD_FORK parent={a}#{} child={b}#{} exit_sig={} flags={:#04x}",
+                (cu >> 16) & 0xff,
+                (cu >> 24) & 0xff,
+                cu & 0xff,
+                (cu >> 8) & 0xff,
+            )
+        }
+        NATIVE_CHILD_EXEC => {
+            let serial = b as u32;
+            if c == 0 {
+                format!("NCHILD_EXEC task={a}#{serial} outcome=ok")
+            } else if c > 0 {
+                format!("NCHILD_EXEC task={a}#{serial} outcome=refused errno={c}")
+            } else {
+                format!("NCHILD_EXEC task={a}#{serial} outcome=refused reason=past_no_return")
+            }
+        }
+        NATIVE_CHILD_EXIT => {
+            let serial = b as u32;
+            let cu = c as u32;
+            let wstatus = cu & 0xffff;
+            let class = (cu >> 16) & 0xff;
+            let code = (cu >> 24) & 0xff;
+            match carrick_el1_abi::NativeChildTerminalReason::unpack_i32(c) {
+                Some(carrick_el1_abi::NativeChildTerminalReason::Exited { .. }) => format!(
+                    "NCHILD_EXIT task={a}#{serial} reason=exited exit_code={code} wstatus={wstatus:#06x}"
+                ),
+                Some(carrick_el1_abi::NativeChildTerminalReason::Signaled { .. }) => format!(
+                    "NCHILD_EXIT task={a}#{serial} reason=signaled signal={code} wstatus={wstatus:#06x}"
+                ),
+                Some(carrick_el1_abi::NativeChildTerminalReason::NativeRunFailure(reason)) => {
+                    format!(
+                        "NCHILD_EXIT task={a}#{serial} reason=run_failure/{reason:?} code={code} wstatus={wstatus:#06x}"
+                    )
+                }
+                Some(carrick_el1_abi::NativeChildTerminalReason::EntryBindingFatal(reason)) => {
+                    format!(
+                        "NCHILD_EXIT task={a}#{serial} reason=entry_fatal/{reason:?} code={code} wstatus={wstatus:#06x}"
+                    )
+                }
+                Some(carrick_el1_abi::NativeChildTerminalReason::CarrierFatal(kind)) => format!(
+                    "NCHILD_EXIT task={a}#{serial} reason=carrier_fatal/{} code={code} wstatus={wstatus:#06x}",
+                    kind.as_str()
+                ),
+                None => format!(
+                    "NCHILD_EXIT task={a}#{serial} reason=unknown({class}) code={code} wstatus={wstatus:#06x}"
+                ),
+            }
+        }
+        NATIVE_CHILD_ZOMBIE => {
+            let cu = c as u32;
+            format!(
+                "NCHILD_ZOMBIE child={a}#{} parent={b}#{}",
+                cu >> 16,
+                cu & 0xffff,
+            )
+        }
+        NATIVE_CHILD_WAKE => {
+            let serial = b as u32;
+            let cu = c as u32;
+            let wake = carrick_el1_abi::NativeParentWakeReason::from_raw((cu & 0xff) as u8)
+                .map_or("unknown", |r| r.as_str());
+            format!(
+                "NCHILD_WAKE parent={a}#{serial} wake={wake} woken={}",
+                cu >> 8
+            )
+        }
+        NATIVE_CHILD_REAP => {
+            let cu = c as u32;
+            format!(
+                "NCHILD_REAP caller={a}#{} child={b}#{} wstatus={:#06x}",
+                (cu >> 16) & 0xff,
+                (cu >> 24) & 0xff,
+                cu & 0xffff,
+            )
+        }
         _ => String::new(),
     }
 }
@@ -2953,7 +3268,7 @@ mod tests {
             SCHED_BUDGET,
             SCHED_DEADLINE,
         ];
-        for kind in (BIND..=LAST_KIND).chain(ALIAS_MUTATION..=ALIAS_END) {
+        for kind in (BIND..=LAST_KIND).chain(ALIAS_MUTATION..=NATIVE_CHILD_REAP) {
             let expected = if high_rate.contains(&kind) {
                 RingSelect::HighRate
             } else {
@@ -2985,6 +3300,12 @@ mod tests {
             FAULTSIG,
             EL1GRANT_CLAIM,
             ALIAS_MUTATION,
+            NATIVE_CHILD_FORK,
+            NATIVE_CHILD_EXEC,
+            NATIVE_CHILD_EXIT,
+            NATIVE_CHILD_ZOMBIE,
+            NATIVE_CHILD_WAKE,
+            NATIVE_CHILD_REAP,
         ] {
             assert_eq!(ring_for_kind(kind), RingSelect::Lifecycle);
         }
@@ -2993,6 +3314,107 @@ mod tests {
                 .into_iter()
                 .filter_map(Result::ok)
                 .all(|event| is_high_rate(event.kind))
+        );
+    }
+
+    #[test]
+    fn native_child_lifecycle_records_round_trip_all_six_kinds_and_fatal_reasons() {
+        use carrick_el1_abi::{
+            EntryBindingFatalReason, NativeCarrierFatalKind, NativeChildExecOutcome,
+            NativeChildForkFlags, NativeChildLifecycleEvent, NativeChildTerminalReason,
+            NativeParentWakeReason,
+        };
+        use carrick_personality_linux::lifecycle::LinuxWaitStatus;
+        use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
+
+        let parent = TaskKey {
+            id: TaskId::from_registry_allocation(std::num::NonZeroI32::new(71001).unwrap()),
+            serial: TaskSerial::from_registry_allocation(std::num::NonZeroU64::new(3).unwrap()),
+        };
+        let child = TaskKey {
+            id: TaskId::from_registry_allocation(std::num::NonZeroI32::new(71002).unwrap()),
+            serial: TaskSerial::from_registry_allocation(std::num::NonZeroU64::new(4).unwrap()),
+        };
+        let fatal_child = TaskKey {
+            id: TaskId::from_registry_allocation(std::num::NonZeroI32::new(71003).unwrap()),
+            serial: TaskSerial::from_registry_allocation(std::num::NonZeroU64::new(5).unwrap()),
+        };
+
+        let events = [
+            NativeChildLifecycleEvent::ForkCreated {
+                parent,
+                child,
+                flags: NativeChildForkFlags {
+                    exit_signal: 17,
+                    vfork: true,
+                    child_settid: false,
+                    child_cleartid: true,
+                },
+            },
+            NativeChildLifecycleEvent::Exec {
+                task: child,
+                outcome: NativeChildExecOutcome::Succeeded,
+            },
+            NativeChildLifecycleEvent::Exit {
+                task: child,
+                reason: NativeChildTerminalReason::Exited {
+                    status: LinuxWaitStatus::exited(7),
+                },
+            },
+            NativeChildLifecycleEvent::ZombiePublished { child, parent },
+            NativeChildLifecycleEvent::ParentWake {
+                parent,
+                reason: NativeParentWakeReason::ChildExit,
+                woken: 1,
+            },
+            NativeChildLifecycleEvent::Reaped {
+                caller: parent,
+                child,
+                status: LinuxWaitStatus::exited(7),
+            },
+            NativeChildLifecycleEvent::Exit {
+                task: fatal_child,
+                reason: NativeChildTerminalReason::EntryBindingFatal(
+                    EntryBindingFatalReason::NativeServiceQuarantined,
+                ),
+            },
+            NativeChildLifecycleEvent::Exit {
+                task: fatal_child,
+                reason: NativeChildTerminalReason::CarrierFatal(
+                    NativeCarrierFatalKind::NativeServiceHostError,
+                ),
+            },
+        ];
+
+        for ev in events {
+            carrick_el1_abi::emit_native_child_lifecycle(ev);
+        }
+
+        let drained: Vec<EventRecord> = drain_recent(N)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|rec| {
+                (NATIVE_CHILD_FORK..=NATIVE_CHILD_REAP).contains(&rec.kind)
+                    && (rec.a == 71001 || rec.a == 71002 || rec.a == 71003)
+            })
+            .collect();
+        assert_eq!(drained.len(), 8);
+        let texts: Vec<String> = drained
+            .iter()
+            .map(|r| decode(r.kind, r.a, r.b, r.c))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "NCHILD_FORK parent=71001#3 child=71002#4 exit_sig=17 flags=0x05",
+                "NCHILD_EXEC task=71002#4 outcome=ok",
+                "NCHILD_EXIT task=71002#4 reason=exited exit_code=7 wstatus=0x0700",
+                "NCHILD_ZOMBIE child=71002#4 parent=71001#3",
+                "NCHILD_WAKE parent=71001#3 wake=child_exit woken=1",
+                "NCHILD_REAP caller=71001#3 child=71002#4 wstatus=0x0700",
+                "NCHILD_EXIT task=71003#5 reason=entry_fatal/NativeServiceQuarantined code=36 wstatus=0x0000",
+                "NCHILD_EXIT task=71003#5 reason=carrier_fatal/native_service_host_error code=2 wstatus=0x0000",
+            ]
         );
     }
 }

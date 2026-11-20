@@ -940,6 +940,9 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         let ingress = self.record_ptr::<carrick_el1_abi::SharedSignalIngressQueue>(
             FrameGpa::new(region.raw() + carrick_el1_abi::EL1_SIGNAL_INGRESS_OFFSET),
         )?;
+        let lifecycle = self.record_ptr::<carrick_el1_abi::SharedNativeChildLifecycleRing>(
+            FrameGpa::new(region.raw() + carrick_el1_abi::EL1_NATIVE_CHILD_LIFECYCLE_OFFSET),
+        )?;
         let portal = self.record_ptr::<carrick_el1_abi::MmPortalSlots>(FrameGpa::new(
             region.raw() + carrick_el1_abi::EL1_MM_PORTAL_OFFSET,
         ))?;
@@ -948,6 +951,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         unsafe {
             carrick_el1_abi::FrameGrantResidencyTable::init_in_place(residency);
             carrick_el1_abi::SharedSignalIngressQueue::initialize_at(ingress);
+            carrick_el1_abi::SharedNativeChildLifecycleRing::initialize_at(lifecycle);
             portal.write(carrick_el1_abi::MmPortalSlots::new());
         }
         Ok(())

@@ -2081,6 +2081,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let mut pending_exec = None;
         let mut exec_rebind = None;
         let (exit, register_child, unregister_child) = self.cpu.with_idle_peer_io(|io| {
+            custody.drain_native_child_lifecycle();
             let lease = StoppedCpuLease {
                 cpu: carrick_guest_arch::CpuId::new(1),
                 io,
@@ -2499,6 +2500,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let mut pending_exec = None;
         let mut exec_rebind = None;
         let (exit, register_child, unregister_child) = self.cpu.with_stopped_io(task, |io| {
+            custody.drain_native_child_lifecycle();
             let lease = StoppedCpuLease { cpu: slot, io };
             match production_port(*port) {
                 Some(ProductionPort::OwnerGrant) => {
@@ -3575,6 +3577,7 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
 
 impl<M: CarrierMemoryIo> Drop for Cpl0HostCustody<M> {
     fn drop(&mut self) {
+        self.drain_native_child_lifecycle();
         self.birth_live.retire();
         // Unwind the inventory first. Its destructor only records a refused
         // retirement; this carrier observer chooses the existing fail-stop.
@@ -3643,6 +3646,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // SAFETY: the retained owner initialized each aligned record before
         // publication. Callers access atomic metadata or their stopped lane.
         unsafe { &*self.metadata_base.as_ptr().add(offset as usize).cast::<T>() }
+    }
+
+    pub fn drain_native_child_lifecycle(&self) {
+        let ring: &carrick_el1_abi::SharedNativeChildLifecycleRing =
+            self.metadata(carrick_el1_abi::EL1_NATIVE_CHILD_LIFECYCLE_OFFSET);
+        carrick_el1_abi::drain_native_child_lifecycle_ring(ring);
     }
 
     pub fn task(&self, cpu: carrick_guest_arch::CpuId) -> &CurrentTask {

@@ -920,9 +920,16 @@ fn publish_el1_region_host_ptr(mapping: &GuestMapping, host: *mut u8) {
             host.add(carrick_el1_abi::EL1_SIGNAL_INGRESS_OFFSET as usize)
                 .cast::<carrick_el1_abi::SharedSignalIngressQueue>()
         };
+        let lifecycle = unsafe {
+            host.add(carrick_el1_abi::EL1_NATIVE_CHILD_LIFECYCLE_OFFSET as usize)
+                .cast::<carrick_el1_abi::SharedNativeChildLifecycleRing>()
+        };
         // SAFETY: the mapped region covers the checked ABI reservation and
         // no consumer can access it until the pointer is published below.
-        unsafe { carrick_el1_abi::SharedSignalIngressQueue::initialize_at(ingress) };
+        unsafe {
+            carrick_el1_abi::SharedSignalIngressQueue::initialize_at(ingress);
+            carrick_el1_abi::SharedNativeChildLifecycleRing::initialize_at(lifecycle);
+        }
         let counters_ptr = unsafe { host.add(carrick_el1_abi::EL1_COUNTERS_OFFSET as usize) };
         record_el1_counters_host_ptr(counters_ptr as usize);
         EL1_REGION_HOST_PTR.store(host as usize, std::sync::atomic::Ordering::Release);
