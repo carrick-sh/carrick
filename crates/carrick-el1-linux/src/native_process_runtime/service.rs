@@ -29,7 +29,7 @@ pub(super) fn bind_member_service<C: ProcessContext>(
             record,
             mm,
         })
-        .map_err(service_protocol_error)
+        .map_err(|error| service_protocol_error(error, NativeServiceQuarantine::ServiceBindBusy))
 }
 
 fn bind_member_service_queue<C: ProcessContext>(
@@ -100,7 +100,33 @@ impl CallerAccessFailure {
 
 enum PreparedService {
     Request(ServiceRequest, bool),
+    NoticeWait(
+        ServiceRequest,
+        carrick_core_abi::service::ServiceSelector,
+        bool,
+    ),
     Retired(NativeResume),
+}
+
+enum NoticeParkOutcome {
+    Resumed(NativeResume),
+    Published(bool),
+}
+
+enum NoticeFinishOutcome {
+    Resumed(NativeResume),
+    Published(bool),
+    Held(carrick_core_abi::service::ServiceSelector, bool),
+}
+
+enum ClosingMemberWait {
+    Service,
+    Signal,
+}
+
+pub(super) enum ClosingAdapterCustody {
+    CancelInstalled,
+    ForbidInstalled(NativeServiceQuarantine),
 }
 
 enum PendingServiceReply {
@@ -271,8 +297,10 @@ pub(super) struct PendingService<'a> {
     carrier_continuation: Option<CarrierContinuation>,
     request: ServiceRequest,
     pub(super) wait: Option<carrick_core_abi::PortalOwnerWait>,
+    notice_wait: Option<carrick_core_abi::service::ServiceSelector>,
+    checkpoints_owner: bool,
     pub(super) claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
-    control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
+    pub(super) control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
 }
 
 impl PendingService<'_> {
@@ -644,10 +672,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         {
             return Ok(());
         }
-        control
-            .service
-            .cancel(request.identity)
-            .map_err(service_protocol_error)?;
+        control.service.cancel(request.identity).map_err(|error| {
+            service_protocol_error(error, NativeServiceQuarantine::ServiceCancelBusy)
+        })?;
         let wait = self
             .graph
             .lock()
@@ -721,10 +748,63 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 drop(queue);
             }
         } else {
-            guard
-                .notify_object(slot, &mut effects)
-                .map_err(|_| NativeFailure::Quarantined)?;
-            drop(guard);
+            let notice_wait = self
+                .graph
+                .lock()
+                .service_wait(&record)
+                .and_then(|pending| pending.notice_wait);
+            if let Some(holder) = notice_wait {
+                drop(guard);
+                let Some(holder_key) = ObjectWaitKey::native_service(holder.record) else {
+                    return Ok(());
+                };
+                let Ok(queue) = self.zone.object_wait(
+                    holder_key,
+                    &carrick_sched_core::ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                ) else {
+                    return Ok(());
+                };
+                if self
+                    .graph
+                    .lock()
+                    .service_wait(&record)
+                    .is_some_and(|pending| {
+                        pending.request == request && pending.notice_wait == Some(holder)
+                    })
+                {
+                    let operation = if adapter {
+                        let census = self
+                            .zone
+                            .record(record.id)
+                            .object_wait_census()
+                            .ok_or(NativeFailure::Stale)?;
+                        OperationToken::new(census.operation, census.operation_generation)
+                    } else {
+                        OperationToken::new(
+                            u64::from(record.id.raw()),
+                            request.identity.sequence.get(),
+                        )
+                    }
+                    .ok_or(NativeFailure::Stale)?;
+                    let owned =
+                        queue.wake_owner_operation(record, &operation, slot, Handback::Resumed);
+                    drop(queue);
+                    if let Some(owned) = owned {
+                        let (_, wake) = owned.into_parts();
+                        effects = wake;
+                    }
+                } else {
+                    drop(queue);
+                }
+            } else {
+                guard
+                    .notify_object(slot, &mut effects)
+                    .map_err(|_| NativeFailure::Quarantined)?;
+                drop(guard);
+            }
         }
         service.wake_effects(effects);
         Ok(())
@@ -945,6 +1025,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 | NativeProcessError::Stale
                 | NativeProcessError::Quarantined,
             ) => return result,
+            Err(NativeProcessError::ServiceQuarantined(_)) => return result,
             // The wrapper was decoded above; another wrapper is a codec invariant.
             Err(NativeProcessError::ForkRefused(_)) => return Err(NativeProcessError::Invalid),
             Err(
@@ -971,7 +1052,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // deferred preparation is not failed execution authentication.
             let result = self.yield_service_checkpoint()?;
             self.take_handoff_receipt()
-                .ok_or(NativeProcessError::Quarantined)?;
+                .ok_or(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::HandoffAuthentication,
+                ))?;
             return Ok(result);
         }
         Ok(result)
@@ -1019,7 +1102,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceCompletion::OwnerCheckpoint,
         )?;
         if matches!(outcome, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ReturnWorkHandoff,
+            ));
         }
         Ok(outcome)
     }
@@ -1118,13 +1203,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // lease rather than looping inside this one.
                 if !matches!(self.begin_return_work()?, NativeResume::Left(_)) {
                     let _ = self.take_pending_signal_delivery();
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::SignalReturnWork,
+                    ));
                 }
                 Ok(())
             }
             Ok(_) => {
                 let _ = self.take_pending_signal_delivery();
-                Err(NativeProcessError::Quarantined)
+                Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::SignalDeferralOutcome,
+                ))
             }
             Err(error) => {
                 let _ = self.take_pending_signal_delivery();
@@ -1148,7 +1237,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let installed = OperationToken::new(census.operation, census.operation_generation)
             .ok_or(NativeProcessError::Stale)?;
         if installed.identity() != identity {
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::AdapterOperationIdentity,
+            ));
         }
         self.begin_service_inner(
             operation,
@@ -1265,7 +1356,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 progress: carrick_core::Served::Idle,
                 result: SyscallResult::new(0),
             }),
-            _ => Err(NativeProcessError::Quarantined),
+            _ => Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ServiceOutcome,
+            )),
         }
     }
 
@@ -1737,7 +1830,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<NativeResume, NativeProcessError> {
         let result = result?;
         if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::HandoffAuthentication,
+            ));
         }
         Ok(result)
     }
@@ -1985,9 +2080,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             owner_wait,
             payload,
             completion.retries_syscall(),
+            completion.checkpoints_owner(),
         )?;
         let (request, adapter) = match prepared {
             PreparedService::Request(request, adapter) => (request, adapter),
+            PreparedService::NoticeWait(request, holder, adapter) => {
+                #[cfg(test)]
+                {
+                    let hook = super::host_test_support::SERVICE_NOTICE_WAIT_HOOK
+                        .with(|hook| hook.borrow_mut().take());
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                return match self.park_notice_wait(
+                    &request,
+                    holder,
+                    adapter || completion.checkpoints_owner(),
+                )? {
+                    NoticeParkOutcome::Resumed(result) => Ok(result),
+                    NoticeParkOutcome::Published(defer_completion) => {
+                        self.park_published_notice(&request, defer_completion)
+                    }
+                };
+            }
             PreparedService::Retired(result) => return Ok(result),
         };
         if let Some(wait) = owner_wait {
@@ -2009,6 +2125,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
         payload: ServicePayload<'a>,
         retry_syscall_after_supply: bool,
+        checkpoints_owner: bool,
     ) -> Result<PreparedService, NativeProcessError> {
         self.service_phase = NativeServicePhase::Payload;
         let (payload, entropy_preparation, stage_prefix) = match payload {
@@ -2087,38 +2204,80 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         };
         self.service_phase = NativeServicePhase::Member;
-        let (page, control, mm) = {
-            let graph = self.runtime.graph.lock();
+        let mut closing_wait = None;
+        let member = {
+            let mut graph = self.runtime.graph.lock();
             if graph.has_member_wait(&self.record) {
-                // IPC keeps its separately retained operation on refusal.
-                // A bridge owns the executing exact member and cannot also
-                // have an outstanding suspended operation on that member.
-                return Err(
-                    if adapter
-                        || (matches!(operation, ServiceOperation::CarrierWork { .. })
-                            && self.retains_adapter_under(&graph))
-                    {
-                        NativeProcessError::Busy
+                // Process close can wake an exact retained service or signal
+                // wait directly into an already captured SVC or IRQ entry.
+                // Settle a service; discard a signal wait whose syscall can no
+                // longer return; then retire before this entry publishes work.
+                // A wait without terminal authority remains broken custody.
+                if graph.pending.has_exit(&self.key) {
+                    closing_wait = Some(if let Some(pending) = graph.service_wait(&self.record) {
+                        if !core::ptr::eq(pending.control.control(), self.control) {
+                            return Err(NativeProcessError::ServiceQuarantined(
+                                NativeServiceQuarantine::RetainedServiceControl,
+                            ));
+                        }
+                        ClosingMemberWait::Service
                     } else {
-                        NativeProcessError::Quarantined
-                    },
-                );
+                        graph.remove_signal_wait(&self.record).ok_or(
+                            NativeProcessError::ServiceQuarantined(
+                                NativeServiceQuarantine::RetainedSignalWaitMissing,
+                            ),
+                        )?;
+                        ClosingMemberWait::Signal
+                    });
+                    None
+                } else {
+                    // IPC keeps its separately retained operation on refusal.
+                    // A bridge owns the executing exact member and cannot also
+                    // have an outstanding suspended operation on that member.
+                    return Err(
+                        if adapter
+                            || (matches!(operation, ServiceOperation::CarrierWork { .. })
+                                && self.retains_adapter_under(&graph))
+                        {
+                            NativeProcessError::Busy
+                        } else {
+                            NativeProcessError::ServiceQuarantined(
+                                NativeServiceQuarantine::MemberWaitInstalled,
+                            )
+                        },
+                    );
+                }
+            } else {
+                let resources = graph
+                    .owner
+                    .task(self.key)
+                    .map_err(|_| NativeProcessError::Stale)?
+                    .native()
+                    .resources();
+                let member = resources
+                    .members
+                    .iter()
+                    .find(|member| {
+                        member.record == self.record
+                            && core::ptr::eq(member.control.control(), self.control)
+                    })
+                    .ok_or(NativeProcessError::Stale)?;
+                Some((resources.page, member.control.clone(), resources.mm.clone()))
             }
-            let resources = graph
-                .owner
-                .task(self.key)
-                .map_err(|_| NativeProcessError::Stale)?
-                .native()
-                .resources();
-            let member = resources
-                .members
-                .iter()
-                .find(|member| {
-                    member.record == self.record
-                        && core::ptr::eq(member.control.control(), self.control)
-                })
-                .ok_or(NativeProcessError::Stale)?;
-            (resources.page, member.control.clone(), resources.mm.clone())
+        };
+        let Some((page, control, mm)) = member else {
+            return match closing_wait {
+                Some(ClosingMemberWait::Service) => self
+                    .settle_retained_service_for_closing_entry()
+                    .map(PreparedService::Retired),
+                Some(ClosingMemberWait::Signal) => {
+                    self.settle_closing_adapter_operation(ClosingAdapterCustody::ForbidInstalled(
+                        NativeServiceQuarantine::SignalWaitAdapter,
+                    ))?;
+                    self.retire_closing_entry().map(PreparedService::Retired)
+                }
+                None => Err(NativeProcessError::Stale),
+            };
         };
         self.service_phase = NativeServicePhase::Birth;
         let birth =
@@ -2157,9 +2316,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     control
                         .service
                         .bound_birth(self.key, self.binding.thread_generation, self.record)
-                        .map_err(service_protocol_error)?
+                        .map_err(|error| {
+                            service_protocol_error(
+                                error,
+                                NativeServiceQuarantine::ServiceBirthReadBusy,
+                            )
+                        })?
                 }
-                Err(error) => return Err(service_protocol_error(error).into()),
+                Err(error) => {
+                    return Err(service_protocol_error(
+                        error,
+                        NativeServiceQuarantine::ServiceBirthProbeBusy,
+                    )
+                    .into());
+                }
             };
         self.service_phase = NativeServicePhase::Unspecified;
         let exec_successor = matches!(operation, ServiceOperation::Exec { .. })
@@ -2208,8 +2378,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             })
             .transpose()?;
         // Claim acquisition refuses only on counter overflow, not contention.
-        let claim = carrick_core::terminal::NativeServiceClaim::acquire(page)
-            .map_err(|_| NativeProcessError::Quarantined)?;
+        let claim = carrick_core::terminal::NativeServiceClaim::acquire(page).map_err(|_| {
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ClaimOverflow)
+        })?;
         self.service_phase = NativeServicePhase::Publication;
         let mut closing = false;
         let published = {
@@ -2218,7 +2389,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // Close publishes its gate and pending operation under this
                 // lock. A terminal gate without that owner is broken custody.
                 closing = graph.pending.has_exit(&self.key);
-                Err(NativeProcessError::Quarantined)
+                Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::ClosedGateNoExitRow,
+                ))
             } else if graph.has_member_wait(&self.record) {
                 Err(
                     if adapter
@@ -2227,14 +2400,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     {
                         NativeProcessError::Busy
                     } else {
-                        NativeProcessError::Quarantined
+                        NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::MemberWaitInstalled,
+                        )
                     },
                 )
             } else if let Some(wait) = owner_wait {
                 self.control
                     .service
                     .begin_owner_wait(birth, self.binding.generation, operation, wait)
-                    .map_err(|error| service_protocol_error(error).into())
+                    .map_err(|error| {
+                        service_protocol_error(error, NativeServiceQuarantine::OwnerWaitPublishBusy)
+                            .into()
+                    })
             } else {
                 self.control
                     .service
@@ -2245,7 +2423,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         fault_sequence,
                         reply.as_ref().map(PendingServiceReply::address),
                     )
-                    .map_err(|error| service_protocol_error(error).into())
+                    .map_err(|error| {
+                        service_protocol_error(error, NativeServiceQuarantine::ServicePublishBusy)
+                            .into()
+                    })
             }
         };
         let request = match published {
@@ -2258,15 +2439,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     // retained IPC owner before terminal retirement: the
                     // scheduler deliberately requeues records with operations
                     // still attached, and their endpoint pins must not leak.
-                    if self
-                        .source
-                        .zone
-                        .record(self.record.id)
-                        .has_adapter_operation()
-                    {
-                        self.retire_adapter_result(SyscallResult::new(0))?;
-                        self.adapter_ready = None;
-                    }
+                    self.settle_closing_adapter_operation(ClosingAdapterCustody::CancelInstalled)?;
                     return self.retire_closing_entry().map(PreparedService::Retired);
                 }
                 return Err(error);
@@ -2305,6 +2478,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 carrier_continuation,
                 request,
                 wait: owner_wait,
+                notice_wait: None,
+                checkpoints_owner,
                 claim,
                 control,
             })),
@@ -2336,44 +2511,138 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Ok(PreparedService::Request(request, adapter));
         }
         self.service_phase = NativeServicePhase::Notice;
-        if let Err(error) = self
+        match self
             .current
             .service_notice
-            .publish(request.identity.into())
-            .map_err(service_protocol_error)
+            .publish_or_observe(request.identity.into())
         {
-            let key =
-                ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
-            let guard = self
-                .source
-                .zone
-                .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                })
-                .map_err(|_| NativeProcessError::Quarantined)?;
-            // SAFETY: notice publication failed, so no transport can hold
-            // this identity. The queue also excludes concurrent cancellation.
-            unsafe { self.control.service.abort_unpublished(request.identity) }
-                .map_err(service_protocol_error)?;
-            {
-                self.control
-                    .service
-                    .consume(request.identity)
-                    .map_err(service_protocol_error)?;
-                drop(guard);
-                let pending = self
-                    .runtime
-                    .graph
-                    .lock()
-                    .remove_service_wait(&self.record)
-                    .ok_or(NativeProcessError::Quarantined)?;
-                self.release_service_claim(pending.claim)?;
-                return Err(error.into());
+            Ok(()) => {}
+            Err(carrick_core_abi::service::ServiceNoticeBusy::Held(holder)) => {
+                if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {
+                    pending.notice_wait = Some(holder);
+                    return Ok(PreparedService::NoticeWait(request, holder, adapter));
+                }
+                return self.abort_unpublished_service(request, NativeProcessError::Stale);
+            }
+            Err(carrick_core_abi::service::ServiceNoticeBusy::Duplicate(_)) => {
+                return self.abort_unpublished_service(
+                    request,
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::NoticePublishDuplicate,
+                    ),
+                );
+            }
+            Err(carrick_core_abi::service::ServiceNoticeBusy::Corrupt) => {
+                return self.abort_unpublished_service(
+                    request,
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::NoticePublishBusy,
+                    ),
+                );
             }
         }
         #[cfg(test)]
         super::host_test_support::run_service_published_hook(self.runtime as *const _ as usize);
         Ok(PreparedService::Request(request, adapter))
+    }
+
+    /// Retire or reject an installed IPC adapter operation before terminal
+    /// member retirement. When a closing service continuation already
+    /// published `OwnerContinuation` onto this record, preserve that terminal
+    /// continuation across `retire_adapter_result`'s user-return cleanup so
+    /// `resume_pending_lifecycle` consumes it cleanly.
+    pub(super) fn settle_closing_adapter_operation(
+        &mut self,
+        custody: ClosingAdapterCustody,
+    ) -> Result<(), NativeProcessError> {
+        let record = self.source.zone.record(self.record.id);
+        if !record.has_adapter_operation() {
+            return Ok(());
+        }
+        match custody {
+            ClosingAdapterCustody::ForbidInstalled(quarantine) => {
+                Err(NativeProcessError::ServiceQuarantined(quarantine))
+            }
+            ClosingAdapterCustody::CancelInstalled => {
+                let continuation = match record.resume_disposition() {
+                    carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(
+                        entry,
+                    ) => Some(entry),
+                    _ => None,
+                };
+                self.retire_adapter_result(SyscallResult::new(0))?;
+                self.adapter_ready = None;
+                if let Some(entry) = continuation {
+                    // SAFETY: this admitted lane still owns the exact closing
+                    // record and restores the terminal continuation published
+                    // by `finish_service` before `resume_pending_lifecycle`.
+                    unsafe {
+                        self.source
+                            .zone
+                            .record(self.record.id)
+                            .publish_owner_continuation(entry);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// A terminal close may wake an exact retained service into a newer SVC
+    /// or IRQ frame before the ordinary owner checkpoint consumes the old
+    /// service. The old service remains authoritative: finish it once, then
+    /// retire through the existing close transaction without publishing the
+    /// newer operation.
+    #[inline(never)]
+    fn settle_retained_service_for_closing_entry(
+        &mut self,
+    ) -> Result<NativeResume, NativeProcessError> {
+        match self
+            .resume_service()
+            .ok_or(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::RetainedServiceMissing,
+            ))?? {
+            NativeResume::NoPending => {}
+            deferred @ NativeResume::Left(_) => {
+                if let Some(reason) = self.take_run_failure() {
+                    self.handoff = None;
+                    return Err(
+                        crate::native_run_failure::native_process_error_from_run_failure(reason),
+                    );
+                }
+                return Ok(deferred);
+            }
+            _ => {
+                return Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::RetainedServiceUnexpectedResume,
+                ));
+            }
+        }
+        let outcome = self.resume_pending_lifecycle();
+        if let Some(reason) = self.take_run_failure() {
+            self.handoff = None;
+            return Err(crate::native_run_failure::native_process_error_from_run_failure(reason));
+        }
+        let outcome = outcome.ok_or(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::RetainedLifecycleMissing,
+        ))?;
+        match outcome {
+            LifecycleOutcome::HostCustody => {
+                if !self.yield_terminal_host_custody() {
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::RetainedHostCustody,
+                    ));
+                }
+                Ok(NativeResume::Left(None))
+            }
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            } if self.handoff.is_some() => Ok(NativeResume::Left(self.take_root_exit())),
+            _ => Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::RetainedLifecycleOutcome,
+            )),
+        }
     }
 
     fn has_adapter_operation(&self) -> bool {
@@ -2394,7 +2663,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.source.slot,
                 self.source.zone.record(self.record.id).identity(),
             )
-            .map_err(|_| NativeProcessError::Quarantined)?
+            .map_err(|_| {
+                NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::AdapterOperationTake,
+                )
+            })?
             .ok_or(NativeProcessError::Stale)?;
             Ok(token)
         } else {
@@ -2417,7 +2690,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.source.zone.record(self.record.id).identity(),
                 operation,
             )
-            .map_err(|_| NativeProcessError::Quarantined)?;
+            .map_err(|_| {
+                NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::AdapterOperationRestore,
+                )
+            })?;
         }
         Ok(())
     }
@@ -2437,7 +2714,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // These queues are bound as guest-owned queues at birth. A host
         // continuation domain may not take over a native member's operation.
         if zone.completion_enabled(key) {
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::HostCompletionQueue,
+            ));
         }
         let adapter = self.has_adapter_operation();
         let token = self.take_preparation_operation(request)?;
@@ -2491,7 +2770,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     || self.runtime.graph.lock().pending.has_exit(&self.key))
                     && let Err(error) = self.control.service.cancel(request.identity)
                 {
-                    failure = Some(service_protocol_error(error));
+                    failure = Some(service_protocol_error(
+                        error,
+                        NativeServiceQuarantine::ParkCancelBusy,
+                    ));
                     return Err(ObjectWaitError::Stale);
                 }
                 if defer_completion {
@@ -2502,7 +2784,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         }
                         Ok(false) | Err(ServiceError::Busy) => {}
                         Err(error) => {
-                            failure = Some(service_protocol_error(error));
+                            failure = Some(service_protocol_error(
+                                error,
+                                NativeServiceQuarantine::ParkReadyBusy,
+                            ));
                             return Err(ObjectWaitError::Stale);
                         }
                     }
@@ -2525,7 +2810,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         }
                         Err(ServiceError::Busy) => {}
                         Err(error) => {
-                            failure = Some(service_protocol_error(error));
+                            failure = Some(service_protocol_error(
+                                error,
+                                NativeServiceQuarantine::ParkConsumeBusy,
+                            ));
                             return Err(ObjectWaitError::Stale);
                         }
                     }
@@ -2557,7 +2845,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return Ok(self.yield_service_checkpoint_as(entry)?);
                 }
                 if error != ObjectWaitError::Changed && failure.is_none() {
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ParkRefused,
+                    ));
                 }
                 None
             }
@@ -2578,7 +2868,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 ),
             };
         }
-        let mut parked = parked.ok_or(NativeProcessError::Quarantined)?;
+        let mut parked = parked.ok_or(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::ParkResultMissing,
+        ))?;
         self.handoff = parked.take_receipt();
         Ok(NativeResume::Left(None))
     }
@@ -2592,7 +2884,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.source.zone.record(self.record.id).identity(),
             operation,
         )
-        .map_err(|_| NativeProcessError::Quarantined)
+        .map_err(|_| {
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::RetainOperation)
+        })
     }
 
     /// Whether a host requester holds this lane's exact running record: its
@@ -2667,7 +2961,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .zone
                     .requeue_preempted(self.source.slot, self.record.id);
                 if !requeue.is_queued() {
-                    return Err(NativeFailure::Quarantined);
+                    return Err(NativeFailure::ServiceQuarantined(
+                        NativeServiceQuarantine::RequeueRefused,
+                    ));
                 }
                 self.source.zone.clear_current(self.source.slot);
                 self.yield_receipt_race();
@@ -2679,14 +2975,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     &carrick_sched_core::ShortLockSpin,
                 );
                 if release != carrick_sched_core::CurrentRelease::Requeued {
-                    return Err(NativeFailure::Quarantined);
+                    return Err(NativeFailure::ServiceQuarantined(
+                        NativeServiceQuarantine::ReleaseRefused,
+                    ));
                 }
                 // From here the queued record may already be the host's (#1467):
                 // the requeue itself, not a later claim read, is the publication.
                 self.yield_receipt_race();
                 carrick_core::entry::publish_handoff_yield(start, release)
             };
-        self.handoff = Some(receipt.ok_or(NativeFailure::Quarantined)?);
+        self.handoff = Some(receipt.ok_or(NativeFailure::ServiceQuarantined(
+            NativeServiceQuarantine::HandoffReceipt,
+        ))?);
         Ok(NativeResume::Left(None))
     }
 
@@ -2717,17 +3017,57 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 _ => return Some(Err(NativeProcessError::Stale)),
             }
         }
-        let wait = self
-            .runtime
-            .graph
-            .lock()
-            .service_wait(&self.record)
-            .and_then(|pending| pending.wait);
-        Some(if wait.is_some() {
+        let (wait, notice_wait, checkpoints_owner, adapter) =
+            self.runtime.graph.lock().service_wait(&self.record).map_or(
+                (None, None, false, false),
+                |pending| {
+                    (
+                        pending.wait,
+                        pending.notice_wait,
+                        pending.checkpoints_owner,
+                        pending.adapter,
+                    )
+                },
+            );
+        Some(if notice_wait.is_some() {
+            match self.finish_notice_wait(&request, adapter || checkpoints_owner) {
+                Ok(NoticeFinishOutcome::Resumed(result)) => Ok(result),
+                Ok(NoticeFinishOutcome::Published(defer_completion)) => {
+                    self.park_published_notice(&request, defer_completion)
+                }
+                Ok(NoticeFinishOutcome::Held(holder, defer_completion)) => {
+                    match self.park_notice_wait(&request, holder, defer_completion) {
+                        Ok(NoticeParkOutcome::Resumed(result)) => Ok(result),
+                        Ok(NoticeParkOutcome::Published(defer_completion)) => {
+                            self.park_published_notice(&request, defer_completion)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        } else if wait.is_some() {
             self.finish_owner_wait(&request)
         } else {
             self.park_service(&request, false)
         })
+    }
+
+    /// Park a request that won publication after waiting for a peer's notice.
+    /// The earlier carrier exit was consumed draining that peer, so this
+    /// publication owns the next host-work ring when parking leaves no runner.
+    #[inline(never)]
+    fn park_published_notice(
+        &mut self,
+        request: &ServiceRequest,
+        defer_completion: bool,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let physical_checkpoint = self.service.native_service_doorbell();
+        let resumed = self.park_service(request, physical_checkpoint || defer_completion)?;
+        if matches!(resumed, NativeResume::Left(_)) {
+            self.current.linux.mark_pending_host_work();
+        }
+        Ok(resumed)
     }
 
     #[inline(never)]
@@ -2846,7 +3186,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             Err((_, operation)) => {
                 self.restore_preparation_operation(operation)?;
-                Err(NativeProcessError::Quarantined)
+                Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::OwnerWaitParkRefused,
+                ))
             }
         }
     }
@@ -2866,7 +3208,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .control
             .service
             .finish_owner_wait(request.identity)
-            .map_err(service_protocol_error)?;
+            .map_err(|error| {
+                service_protocol_error(error, NativeServiceQuarantine::OwnerWaitFinishBusy)
+            })?;
         // Remove the phase under the service queue before cancellation observes IDLE.
         let pending = self
             .runtime
@@ -2876,6 +3220,316 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok_or(NativeProcessError::Stale)?;
         drop(queue);
         self.finish_service(request, result, pending)
+    }
+
+    #[inline(never)]
+    fn abort_unpublished_service<T>(
+        &mut self,
+        request: ServiceRequest,
+        error: NativeProcessError,
+    ) -> Result<T, NativeProcessError> {
+        let key = ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
+        let guard = self
+            .source
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .map_err(|_| {
+                NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::DuplicateNoticeQueue,
+                )
+            })?;
+        // SAFETY: notice publication failed, so no transport can hold
+        // this identity. The queue also excludes concurrent cancellation.
+        unsafe { self.control.service.abort_unpublished(request.identity) }
+            .map_err(|err| service_protocol_error(err, NativeServiceQuarantine::NoticeAbortBusy))?;
+        self.control
+            .service
+            .consume(request.identity)
+            .map_err(|err| {
+                service_protocol_error(err, NativeServiceQuarantine::NoticeConsumeBusy)
+            })?;
+        let pending = self
+            .runtime
+            .graph
+            .lock()
+            .remove_service_wait(&self.record)
+            .ok_or(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::DuplicateNoticeCleanup,
+            ))?;
+        drop(guard);
+        self.release_service_claim(pending.claim)?;
+        Err(error)
+    }
+
+    #[inline(never)]
+    fn cancel_unpublished_service(
+        &mut self,
+        request: &ServiceRequest,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let key = ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
+        let guard = self
+            .source
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .map_err(|_| NativeProcessError::Stale)?;
+        // SAFETY: this identity never published a notice into `service_notice`,
+        // so no carrier ticket exists; `guard` excludes `cancel_service`.
+        unsafe { self.control.service.abort_unpublished(request.identity) }
+            .map_err(|err| service_protocol_error(err, NativeServiceQuarantine::NoticeAbortBusy))?;
+        let result = self
+            .control
+            .service
+            .consume(request.identity)
+            .map_err(|err| {
+                service_protocol_error(err, NativeServiceQuarantine::NoticeConsumeBusy)
+            })?;
+        let pending = self
+            .runtime
+            .graph
+            .lock()
+            .remove_service_wait(&self.record)
+            .ok_or(NativeProcessError::Stale)?;
+        drop(guard);
+        self.finish_service(request, result, pending)
+    }
+
+    fn service_owner_entry(&self, request: &ServiceRequest) -> OwnerEntry {
+        match request.operation {
+            _ if self
+                .runtime
+                .graph
+                .lock()
+                .service_wait(&self.record)
+                .is_some_and(|pending| pending.retry_syscall_after_supply) =>
+            {
+                OwnerEntry::Syscall
+            }
+            ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => OwnerEntry::Exception,
+            ServiceOperation::Crossing { .. }
+            | ServiceOperation::Exec { .. }
+            | ServiceOperation::HostFile { .. }
+            | ServiceOperation::Entropy { .. }
+            | ServiceOperation::Clock { .. } => OwnerEntry::Syscall,
+            ServiceOperation::CarrierWork { entry, .. } => entry,
+        }
+    }
+
+    fn should_cancel_unpublished(
+        &mut self,
+        identity: carrick_core_abi::service::ServiceIdentity,
+    ) -> bool {
+        if self.control.service.cancel_queued(identity) {
+            return true;
+        }
+        let (interruptible, exec, output_cancelled) =
+            self.runtime.graph.lock().service_wait(&self.record).map_or(
+                (false, false, false),
+                |pending| {
+                    (
+                        pending.signal_interruptible(),
+                        matches!(pending.request.operation, ServiceOperation::Exec { .. }),
+                        (pending.copyout.is_some() || pending.copyin)
+                            && pending.claim.cancellation().is_some(),
+                    )
+                },
+            );
+        output_cancelled
+            || (interruptible && self.signal_interrupts_current())
+            || (exec && self.latch_default_terminating_exec_signal())
+            || self.runtime.graph.lock().pending.has_exit(&self.key)
+    }
+
+    /// Park an unpublished service request on the live peer currently holding
+    /// this slot's `service_notice` (#2532). Probing `publish_or_observe` once
+    /// under `holder`'s native-service queue lock closes the race with the
+    /// carrier's `take` + `complete` + `notify_object` without nesting two
+    /// members' native-service queue locks.
+    #[inline(never)]
+    fn park_notice_wait(
+        &mut self,
+        request: &ServiceRequest,
+        holder: carrick_core_abi::service::ServiceSelector,
+        defer_completion: bool,
+    ) -> Result<NoticeParkOutcome, NativeProcessError> {
+        self.service_phase = NativeServicePhase::Park;
+        use carrick_core_abi::service::ServiceNoticeBusy;
+        use carrick_sched_core::object_wait::ObjectWaitError;
+        let zone = self.source.zone;
+        let holder_key =
+            ObjectWaitKey::native_service(holder.record).ok_or(NativeProcessError::Stale)?;
+        if zone.completion_enabled(holder_key) {
+            return self.abort_unpublished_service(
+                *request,
+                NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::HostCompletionQueue,
+                ),
+            );
+        }
+        let token = self.take_preparation_operation(request)?;
+        let entry = self.service_owner_entry(request);
+        let mut save_context_ran = false;
+        let mut cancelled = false;
+        let mut published = false;
+        let mut holder_changed = false;
+        let mut failure = None;
+        let parked = carrick_core::wait::park_object_record(
+            zone,
+            self.source.slot,
+            carrick_core::wait::ObjectParkRequest::owner(
+                holder_key,
+                token,
+                entry,
+                // SAFETY: `save_context` probes `service_notice` and sticky
+                // cancellation under `holder_key`'s queue lock, which the
+                // carrier holds to complete `holder` and `notify_object` after
+                // draining `service_notice`.
+                unsafe { carrick_core::wait::OwnerProbeUnderQueueLock::for_save_context_probe() },
+            ),
+            &|_| {},
+            || {
+                save_context_ran = true;
+                if self.should_cancel_unpublished(request.identity) {
+                    cancelled = true;
+                    return Err(ObjectWaitError::Changed);
+                }
+                match self
+                    .current
+                    .service_notice
+                    .publish_or_observe(request.identity.into())
+                {
+                    Ok(()) => {
+                        published = true;
+                        Err(ObjectWaitError::Changed)
+                    }
+                    Err(ServiceNoticeBusy::Held(live)) if live == holder => {
+                        // SAFETY: this slot still owns the exact OnCpu record.
+                        unsafe {
+                            *zone.record(self.record.id).ctx_mut() = *self.words;
+                        }
+                        Ok((self.record.id, false))
+                    }
+                    Err(ServiceNoticeBusy::Held(_)) => {
+                        holder_changed = true;
+                        Err(ObjectWaitError::Changed)
+                    }
+                    Err(ServiceNoticeBusy::Duplicate(_)) => {
+                        failure = Some(NativeServiceQuarantine::NoticePublishDuplicate);
+                        Err(ObjectWaitError::Stale)
+                    }
+                    Err(ServiceNoticeBusy::Corrupt) => {
+                        failure = Some(NativeServiceQuarantine::NoticePublishBusy);
+                        Err(ObjectWaitError::Stale)
+                    }
+                }
+            },
+        );
+        match parked {
+            Ok(mut parked) => {
+                self.handoff = parked.take_receipt();
+                // Parking this contender can remove the final runnable
+                // member while the holder's notice is waiting for carrier
+                // intake. Force the idle boundary to drain that notice and
+                // wake both parked members through the holder's release.
+                self.current.linux.mark_pending_host_work();
+                Ok(NoticeParkOutcome::Resumed(NativeResume::Left(None)))
+            }
+            Err((error, operation)) => {
+                if let Some(reason) = failure {
+                    self.restore_preparation_operation(operation)?;
+                    return self.abort_unpublished_service(
+                        *request,
+                        NativeProcessError::ServiceQuarantined(reason),
+                    );
+                }
+                if cancelled {
+                    self.restore_preparation_operation(operation)?;
+                    return self
+                        .cancel_unpublished_service(request)
+                        .map(NoticeParkOutcome::Resumed);
+                }
+                if published {
+                    if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record)
+                    {
+                        pending.notice_wait = None;
+                    }
+                    self.restore_preparation_operation(operation)?;
+                    #[cfg(test)]
+                    super::host_test_support::run_service_published_hook(
+                        self.runtime as *const _ as usize,
+                    );
+                    return Ok(NoticeParkOutcome::Published(defer_completion));
+                }
+                let holder_retired = !save_context_ran && error == ObjectWaitError::Stale;
+                let host_contended = error == ObjectWaitError::Occupied
+                    && !holder_changed
+                    && self.host_requested_current();
+                if holder_changed || holder_retired || host_contended {
+                    self.retain_record_operation(operation)?;
+                    return Ok(NoticeParkOutcome::Resumed(
+                        self.yield_service_checkpoint_as(entry)?,
+                    ));
+                }
+                self.restore_preparation_operation(operation)?;
+                Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::ParkRefused,
+                ))
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn finish_notice_wait(
+        &mut self,
+        request: &ServiceRequest,
+        defer_completion: bool,
+    ) -> Result<NoticeFinishOutcome, NativeProcessError> {
+        self.service_phase = NativeServicePhase::Notice;
+        use carrick_core_abi::service::ServiceNoticeBusy;
+        if self.should_cancel_unpublished(request.identity) {
+            return self
+                .cancel_unpublished_service(request)
+                .map(NoticeFinishOutcome::Resumed);
+        }
+        match self
+            .current
+            .service_notice
+            .publish_or_observe(request.identity.into())
+        {
+            Ok(()) => {
+                if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {
+                    pending.notice_wait = None;
+                } else {
+                    return Err(NativeProcessError::Stale);
+                }
+                #[cfg(test)]
+                super::host_test_support::run_service_published_hook(
+                    self.runtime as *const _ as usize,
+                );
+                Ok(NoticeFinishOutcome::Published(defer_completion))
+            }
+            Err(ServiceNoticeBusy::Held(holder)) => {
+                if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {
+                    pending.notice_wait = Some(holder);
+                } else {
+                    return Err(NativeProcessError::Stale);
+                }
+                Ok(NoticeFinishOutcome::Held(holder, defer_completion))
+            }
+            Err(ServiceNoticeBusy::Duplicate(_)) => self.abort_unpublished_service(
+                *request,
+                NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::NoticePublishDuplicate,
+                ),
+            ),
+            Err(ServiceNoticeBusy::Corrupt) => self.abort_unpublished_service(
+                *request,
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::NoticePublishBusy),
+            ),
+        }
     }
 
     /// Publish the already-installed successor through the graph, registry,
@@ -3313,7 +3967,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             match result {
                 Ok(prepared) => prepared,
-                Err(_) => return Err(NativeProcessError::Quarantined),
+                Err(_) => {
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ExecAdoption,
+                    ));
+                }
             }
         };
         let Some(successor_slot) = pending.exec_successor.as_ref() else {
@@ -3416,9 +4074,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .slot(self.source.slot)
             .current()
             .or_else(|| zone.slot(self.source.slot).host_record())
-            .ok_or(NativeProcessError::Quarantined)?;
-        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
-            .ok_or(NativeProcessError::Quarantined)?;
+            .ok_or(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::WaitRecordMissing,
+            ))?;
+        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record).ok_or(
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::WaitHandoffStart),
+        )?;
         let address = WaitChannel::address(channel);
         let guard = zone.short_lock(
             ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
@@ -3448,7 +4109,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         let sequence = zone.next_seq(record);
         zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
-            .map_err(|_| NativeProcessError::Quarantined)?;
+            .map_err(|_| {
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::WaitEnqueue)
+            })?;
         // SAFETY: this entry still owns the current record through the guarded
         // park publication.
         unsafe {
@@ -3461,7 +4124,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             &guard,
             carrick_el1_abi::EntryRecordGeneration(sequence),
         )
-        .ok_or(NativeProcessError::Quarantined)?;
+        .ok_or(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::WaitHandoffReceipt,
+        ))?;
         drop(guard);
         zone.clear_current(self.source.slot);
         self.handoff = Some(receipt);
@@ -3533,7 +4198,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.source.slot,
             self.source.zone.record(self.record.id).identity(),
         )
-        .map_err(|_| NativeProcessError::Quarantined)?
+        .map_err(|_| {
+            NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::AdapterResultOperationTake,
+            )
+        })?
         .ok_or(NativeProcessError::Stale)?;
         let (region, _) = self
             .service
@@ -3587,7 +4256,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<NativeResume, NativeProcessError> {
         self.service_phase = NativeServicePhase::Completion;
         if pending.request != *request {
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::CompletionRequestMismatch,
+            ));
         }
         let retry_syscall_after_supply = pending.retry_syscall_after_supply;
         let exiting = self.runtime.graph.lock().pending.has_exit(&self.key)
@@ -3608,7 +4279,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     let next = self.prepare_fault_repark(request, pending, wait)?;
                     return self.park_owner_wait(&next, wait);
                 }
-                Err(_) => return Err(NativeProcessError::Quarantined),
+                Err(_) => {
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::FaultReplyCancellation,
+                    ));
+                }
             }
         }
         if pending.fault_reply_cancelling {
@@ -3723,7 +4398,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 request.operation,
                 wait,
             )
-            .map_err(service_protocol_error)?;
+            .map_err(|error| {
+                service_protocol_error(error, NativeServiceQuarantine::WaitCompletionBusy)
+            })?;
         pending.request = next;
         pending.wait = Some(wait);
         self.runtime
@@ -3907,7 +4584,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     if result != ServiceResult::Cancelled {
                         self.retain_thread_stock_reply(
                             carrick_core_abi::service::CarrierWorkReply::for_result(demand, result)
-                                .ok_or(NativeProcessError::Quarantined)?,
+                                .ok_or(NativeProcessError::ServiceQuarantined(
+                                    NativeServiceQuarantine::ThreadStockReply,
+                                ))?,
                         );
                     }
                     return Ok(NativeResume::RetrySyscall);
@@ -3924,7 +4603,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
                     ))),
                     ServiceResult::Wait(_) | ServiceResult::ExecPrepared(_) => {
-                        Err(NativeProcessError::Quarantined)
+                        Err(NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::RelativeFutexReply,
+                        ))
                     }
                 };
             }
@@ -3934,9 +4615,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .clock_sample
                         .take()
                         .ok_or(NativeProcessError::Stale)?;
-                    match carrick_core_abi::clock::parse_reply(&*sample.record)
-                        .map_err(|_| NativeProcessError::Quarantined)?
-                    {
+                    match carrick_core_abi::clock::parse_reply(&*sample.record).map_err(|_| {
+                        NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::ClockReplyDecode,
+                        )
+                    })? {
                         carrick_core_abi::clock::ClockReply::Sample(Ok((seconds, nanos))) => {
                             let mut bytes = Vec::with_capacity(16);
                             bytes.extend_from_slice(&seconds.to_le_bytes());
@@ -3958,16 +4641,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 errno.raw().get(),
                             ))))
                         }
-                        _ => Err(NativeProcessError::Quarantined),
+                        _ => Err(NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::ClockReplyVariant,
+                        )),
                     }
                 }
                 // An admitted resource may not disappear or produce an unrelated reply.
-                (ServiceOperation::Clock { .. }, _) => Err(NativeProcessError::Quarantined),
-                (_, ServiceResult::Wait(_)) => Err(NativeProcessError::Quarantined),
+                (ServiceOperation::Clock { .. }, _) => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::ClockOperationResult,
+                )),
+                (_, ServiceResult::Wait(_)) => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::UnexpectedWaitResult,
+                )),
                 (
                     ServiceOperation::CarrierWork { .. },
-                    ServiceResult::Supplied | ServiceResult::Cancelled,
+                    ServiceResult::Supplied | ServiceResult::Cancelled | ServiceResult::Refused,
                 ) => {
+                    // CarrierWork is a demand captured from this lane's
+                    // already-committed boundary, not a new guest operation.
+                    // Another executor may drain the work before physical
+                    // intake, so refusal is the same bounded completion as an
+                    // empty supply: the retained continuation remains the
+                    // sole authority for the syscall result or parked owner.
                     match pending.carrier_continuation {
                         // Committed bytes/results survive readiness and cancellation.
                         Some(CarrierContinuation::Completed(result)) => {
@@ -3980,15 +4675,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             // No scheduling scalar can complete this operation.
                             Ok(NativeResume::NoPending)
                         }
-                        _ => Err(NativeProcessError::Quarantined),
+                        _ => Err(NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::CarrierContinuation,
+                        )),
                     }
-                }
-                (ServiceOperation::CarrierWork { .. }, ServiceResult::Refused) => {
-                    Err(NativeProcessError::Quarantined)
                 }
                 (ServiceOperation::Entropy { .. }, ServiceResult::Supplied) => {
                     // Supplied requires a valid reply in the retained entropy record.
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::EntropyReplyMissing,
+                    ))
                 }
                 (ServiceOperation::Entropy { .. }, ServiceResult::Cancelled) => {
                     Ok(NativeResume::Returned(SyscallResult::from_errno(
@@ -4025,11 +4721,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .map_err(|_| NativeProcessError::Fault)?;
                     Ok(NativeResume::NoPending)
                 }
-                (_, ServiceResult::BackingFault) => Err(NativeProcessError::Quarantined),
+                (_, ServiceResult::BackingFault) => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::UnexpectedBackingFault,
+                )),
                 (ServiceOperation::Exec { .. }, ServiceResult::Failed(failure)) => Ok(
                     NativeResume::Returned(SyscallResult::new(-i64::from(failure.raw()))),
                 ),
-                (_, ServiceResult::Failed(_)) => Err(NativeProcessError::Quarantined),
+                (_, ServiceResult::Failed(_)) => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::UnexpectedFailureResult,
+                )),
                 (ServiceOperation::Fault(fault), ServiceResult::Refused) => {
                     self.force_sigsegv_info(
                         carrick_signal_core::policy::SigBlockMask::blocking_all_of(
@@ -4072,7 +4772,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 (ServiceOperation::Crossing { .. }, ServiceResult::Supplied) => {
                     // No generic host syscall dispatcher owns native semantics.
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::CrossingSupplied,
+                    ))
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Supplied)
                 | (ServiceOperation::HostFile { .. }, ServiceResult::Cancelled)
@@ -4139,7 +4841,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Supplied) => {
                     // Supplied without a reply is a transport violation.
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::HostFileReplyMissing,
+                    ))
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Refused) => {
                     // The venue does not serve this exact request: counted
@@ -4156,17 +4860,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     Ok(NativeResume::RetrySyscall)
                 }
                 (ServiceOperation::Exception(_), ServiceResult::Supplied) => {
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ExceptionSupplied,
+                    ))
                 }
                 (ServiceOperation::Exec { .. }, ServiceResult::Supplied) => {
                     // The successor adoption route consumes successful preparation
                     // before this ordinary syscall-return mapping is reachable.
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ExecSupplied,
+                    ))
                 }
                 (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(_)) => {
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ExecPreparedConsumed,
+                    ))
                 }
-                (_, ServiceResult::ExecPrepared(_)) => Err(NativeProcessError::Quarantined),
+                (_, ServiceResult::ExecPrepared(_)) => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::UnexpectedExecPrepared,
+                )),
                 (ServiceOperation::Exec { .. }, ServiceResult::Refused) => {
                     Ok(NativeResume::Returned(SyscallResult::new(
                         carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
@@ -4174,7 +4886,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 (ServiceOperation::Exec { .. }, ServiceResult::Cancelled) => {
                     // Cancelled execs retire above before an old-image return.
-                    Err(NativeProcessError::Quarantined)
+                    Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ExecCancelled,
+                    ))
                 }
             }
         })();
@@ -4206,7 +4920,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     progress: carrick_core::Served::Idle,
                     ..
                 }) => Ok(NativeResume::Left(None)),
-                _ => Err(NativeProcessError::Quarantined),
+                _ => Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::CompletionLifecycleOutcome,
+                )),
             };
         }
         completed
@@ -4220,14 +4936,17 @@ fn entropy_copy_fault(committed: usize) -> NativeResume {
     })
 }
 
-pub(super) fn service_protocol_error(error: ServiceError) -> NativeFailure {
+pub(super) fn service_protocol_error(
+    error: ServiceError,
+    busy: NativeServiceQuarantine,
+) -> NativeFailure {
     match error {
         // All callers either own the exact executing member before transport
         // publication, or hold its native-service queue. The transport takes
         // that same queue for claim and acknowledgment. Expected not-ready
         // consumption is handled before this mapper; a failed transition here
         // means duplicate/mismatched custody, not a releasable resource.
-        ServiceError::Busy => NativeFailure::Quarantined,
+        ServiceError::Busy => NativeFailure::ServiceQuarantined(busy),
         ServiceError::Stale => NativeFailure::Stale,
         ServiceError::Exhausted => NativeFailure::Exhausted,
     }

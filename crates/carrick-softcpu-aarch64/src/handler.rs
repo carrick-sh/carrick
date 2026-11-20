@@ -6,7 +6,7 @@
 //! LDXR/STXR, LDADD, BR/BLR/RET, MSR immediate), D1.10/D1.11 exception entry
 //! and return (via `exception`), and D13.2 register access (via `state`).
 //! Data alignment is checked before translation; with SCTLR_EL1.M set every
-//! access translates through the stage-1 walker (`mmu`) and its faults are
+//! access uses stage-1 translation (`mmu`) and its faults are
 //! taken as EL1 data aborts.
 use crate::exception::{
     DataAccess, Exception, ExceptionOutcome, ProviderExit, WaitInstruction, eret, take_exception,
@@ -23,6 +23,7 @@ use crate::{
     MemoryRegister, MemorySize, OperandRegister, PstateField, RegisterBranch, SystemDirection,
     SystemRegister, TlbiOperation, Width,
 };
+use carrick_guest_arch::{FrameGpa, Gpa, GuestVa};
 use carrick_mmu_core::aarch64::stage1_walk::Aarch64Fault;
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
 
@@ -38,6 +39,19 @@ pub struct MemoryFault {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodeGeneration(pub u64);
 
+/// Direct RAM loans for one native block. The second page may be the same
+/// physical backing as the first, even when the virtual addresses differ.
+#[derive(Default)]
+pub enum InlineRam<'a> {
+    #[default]
+    None,
+    Separate {
+        read: Option<&'a [u8; PAGE as usize]>,
+        write: Option<&'a mut [u8; PAGE as usize]>,
+    },
+    Shared(&'a mut [u8; PAGE as usize]),
+}
+
 /// Guest memory as the handlers see it. Little-endian data. Addresses are
 /// physical: with SCTLR_EL1.M clear they equal the virtual address, with M
 /// set they are the stage-1 output.
@@ -45,13 +59,55 @@ pub trait GuestMemory {
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault>;
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault>;
 
+    /// Borrow direct-access RAM for this block only. Writable loans must
+    /// exclude code-tracked frames and memory with provider side effects.
+    fn inline_ram(&mut self, _read: Option<FrameGpa>, _write: Option<FrameGpa>) -> InlineRam<'_> {
+        InlineRam::None
+    }
+
     /// A generation is supplied only for a fully readable code frame whose
     /// memory owner tracks all guest and host writes and backing changes.
     /// The owner must never reuse a generation for changed bytes or backing
     /// during a run, and must exclude concurrent mutation during dispatch.
     /// Untracked memory is translated afresh.
-    fn code_generation(&self, _frame: carrick_guest_arch::FrameGpa) -> Option<CodeGeneration> {
+    fn code_generation(&self, _frame: FrameGpa) -> Option<CodeGeneration> {
         None
+    }
+
+    /// Invalidate all resident translations for this frame, including aliases.
+    /// False asks the dispatcher to discard its cache when the provider
+    /// cannot revoke a physical code identity.
+    fn invalidate_code_frame(&mut self, _frame: FrameGpa) -> Result<bool, MemoryFault> {
+        Ok(false)
+    }
+
+    /// Activate tracking for a frame before publishing a resident block.
+    /// Owners that already track every frame can return the current generation.
+    fn mark_code_page(&mut self, frame: FrameGpa) -> Option<CodeGeneration> {
+        self.code_generation(frame)
+    }
+
+    /// Whether this provider serves one local stage-1 seat for the duration
+    /// of a dispatcher run. Shared providers must leave this disabled until
+    /// their external invalidations are delivered before translation reuse.
+    fn stage1_is_local(&self) -> bool {
+        false
+    }
+
+    /// Translate a single-page access with stage 1 enabled. The dispatcher
+    /// wrapper may reuse successful walks within the current run.
+    #[doc(hidden)]
+    fn translate_stage1(
+        &mut self,
+        cpu: &CpuState,
+        va: GuestVa,
+        access: LeafAccess,
+        class: AccessClass,
+    ) -> Result<Gpa, Stage1Error>
+    where
+        Self: Sized,
+    {
+        mmu::walk(cpu, self, va.raw(), access, class).map(|leaf| Gpa::from_frame_gpa(leaf.output()))
     }
 
     /// Observe an attempted hardware-format stage-1 walk, including faults.
@@ -82,6 +138,8 @@ pub enum Event {
     ProviderExit(ProviderExit),
     Tlbi(TlbiOperation),
     Ic(IcOperation),
+    /// The physical owner has invalidated the translated frame generation.
+    IcFrame(FrameGpa),
     Hint(Hint),
     /// MSR SCTLR_EL1 would set M under a TCR_EL1 the stage-1 walker does
     /// not admit. Not retired.
@@ -191,9 +249,15 @@ pub fn execute(
                     LeafAccess::Read,
                     AccessClass::Ordinary,
                 ) {
-                    Ok(_) => {
+                    Ok(pa) => {
+                        let frame = FrameGpa::new(pa & !(PAGE - 1));
+                        let event = match memory.invalidate_code_frame(frame) {
+                            Ok(true) => Event::IcFrame(frame),
+                            Ok(false) => Event::Ic(op),
+                            Err(fault) => return Outcome::Event(Event::MemoryFault(fault)),
+                        };
                         next(cpu);
-                        Outcome::Event(Event::Ic(op))
+                        Outcome::Event(event)
                     }
                     Err(Stage1Error::Abort(fault)) => enter_memory_exception(
                         cpu,

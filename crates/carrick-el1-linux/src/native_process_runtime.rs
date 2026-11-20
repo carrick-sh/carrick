@@ -306,6 +306,130 @@ pub(crate) fn native_entry_owned(
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
 )]
+pub enum NativeServiceQuarantine {
+    HandoffAuthentication,
+    MemberWaitInstalled,
+    ClaimOverflow,
+    ClosedGateNoExitRow,
+    DuplicateNoticeQueue,
+    DuplicateNoticeCleanup,
+    RetainedServiceMissing,
+    RetainedServiceUnexpectedResume,
+    RetainedSignalWaitMissing,
+    RetainedLifecycleMissing,
+    RetainedHostCustody,
+    RetainedLifecycleOutcome,
+    AdapterOperationTake,
+    AdapterOperationRestore,
+    HostCompletionQueue,
+    ParkRefused,
+    ParkResultMissing,
+    RetainOperation,
+    RequeueRefused,
+    ReleaseRefused,
+    HandoffReceipt,
+    ExecPayloadOwnerWait,
+    HostFileOwnerWait,
+    RetryExecStageOperation,
+    MissingOperation,
+    IpcOperationToken,
+    IpcOperationBinding,
+    IpcOperationUnpin,
+    IpcOperationRelease,
+    IpcProgressOverflow,
+    ClosingStatusMissing,
+    ClosingHostCustody,
+    ClosingLifecycleOutcome,
+    ServiceBindBusy,
+    ServiceCancelBusy,
+    ServiceBirthReadBusy,
+    ServiceBirthProbeBusy,
+    OwnerWaitPublishBusy,
+    ServicePublishBusy,
+    NoticePublishBusy,
+    NoticePublishDuplicate,
+    SignalWaitAdapter,
+    RetainedServiceControl,
+    NoticeAbortBusy,
+    NoticeConsumeBusy,
+    ParkCancelBusy,
+    ParkReadyBusy,
+    ParkConsumeBusy,
+    OwnerWaitFinishBusy,
+    WaitCompletionBusy,
+    ServiceRecordRebindBusy,
+    ReturnWorkHandoff,
+    SignalReturnWork,
+    SignalDeferralOutcome,
+    AdapterOperationIdentity,
+    ServiceOutcome,
+    OwnerWaitParkRefused,
+    ExecAdoption,
+    WaitRecordMissing,
+    WaitHandoffStart,
+    WaitEnqueue,
+    WaitHandoffReceipt,
+    AdapterResultOperationTake,
+    CompletionRequestMismatch,
+    FaultReplyCancellation,
+    ThreadStockReply,
+    RelativeFutexReply,
+    ClockReplyDecode,
+    ClockReplyVariant,
+    ClockOperationResult,
+    UnexpectedWaitResult,
+    CarrierContinuation,
+    CarrierWorkRefused,
+    EntropyReplyMissing,
+    UnexpectedBackingFault,
+    UnexpectedFailureResult,
+    CrossingSupplied,
+    HostFileReplyMissing,
+    ExceptionSupplied,
+    ExecSupplied,
+    ExecPreparedConsumed,
+    UnexpectedExecPrepared,
+    ExecCancelled,
+    CompletionLifecycleOutcome,
+    UserWriteMmCore,
+    BirthControlResetUnclaim,
+    BirthAffinityUnclaim,
+    BirthVisibleTidUnclaim,
+    BirthRecordUnclaim,
+    ForkPublicationAbort,
+    BirthReservationRelease,
+    BirthMmSettle,
+    ChildGraphLookup,
+    ChildRegistryRegistration,
+    ChildNativeOwnership,
+    ChildRequeue,
+    SignalCompletionRoute,
+    ForkLoanScrub,
+    ForkLoanAbort,
+    ExecPredecessorMm,
+    ExecSuccessorMm,
+    ExecPredecessorSpace,
+    ExecSuccessorSpace,
+    ExecPredecessorGrant,
+    ExecIdleRoot,
+    ExecSuccessorGrant,
+    ExecPortal,
+    ExecRetiredSpaceDrain,
+    ForkPublishCore,
+    ForkInvalidRootAbort,
+    ForkReserveAbort,
+    ForkAbortScrub,
+    ForkAbortLoan,
+    ForkSettleCustody,
+}
+
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum NativeProcessError {
     Invalid,
     Stale,
@@ -317,6 +441,7 @@ pub enum NativeProcessError {
     GroupExitCustody,
     Busy,
     Quarantined,
+    ServiceQuarantined(NativeServiceQuarantine),
     NoChild,
 }
 impl NativeProcessError {
@@ -330,7 +455,9 @@ impl NativeProcessError {
             UserWriteError::Owner(MmError::Busy) | UserWriteError::Busy => NativeProcessError::Busy,
             UserWriteError::Owner(MmError::Stale) => NativeProcessError::Stale,
             UserWriteError::Owner(MmError::Invalid) => NativeProcessError::Invalid,
-            UserWriteError::Owner(MmError::Core) => NativeProcessError::Quarantined,
+            UserWriteError::Owner(MmError::Core) => {
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::UserWriteMmCore)
+            }
             UserWriteError::Owner(MmError::UnsupportedExecutableCow)
             | UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
             UserWriteError::Owner(_) | UserWriteError::Fault => NativeProcessError::Fault,
@@ -352,6 +479,7 @@ impl NativeProcessError {
             Self::Unsupported => Ok(NativeFailure::Unsupported),
             Self::GroupExitCustody => Ok(NativeFailure::GroupExitCustody),
             Self::Quarantined => Ok(NativeFailure::Quarantined),
+            Self::ServiceQuarantined(reason) => Ok(NativeFailure::ServiceQuarantined(reason)),
             Self::NoChild => Ok(NativeFailure::NoChild),
             Self::OwnerWait(wait) => Err(NativeContention {
                 owner_wait: Some(wait),
@@ -378,6 +506,7 @@ pub enum NativeFailure {
     Unsupported,
     GroupExitCustody,
     Quarantined,
+    ServiceQuarantined(NativeServiceQuarantine),
     NoChild,
 }
 impl NativeFailure {
@@ -389,7 +518,7 @@ impl NativeFailure {
             Self::Exhausted => R::NativeExhausted,
             Self::Fault => R::NativeFault,
             Self::Unsupported => R::NativeUnsupported,
-            Self::Quarantined => R::NativeQuarantined,
+            Self::Quarantined | Self::ServiceQuarantined(_) => R::NativeQuarantined,
             Self::NoChild => R::NativeNoChild,
             Self::GroupExitCustody => R::X86GroupExitCustody,
         }
@@ -400,7 +529,7 @@ impl NativeFailure {
             Self::Exhausted => -11,
             Self::Fault => -14,
             Self::Unsupported | Self::GroupExitCustody => -38,
-            Self::Quarantined => -5,
+            Self::Quarantined | Self::ServiceQuarantined(_) => -5,
             Self::NoChild => -10,
         }
     }
@@ -415,6 +544,7 @@ impl From<NativeFailure> for NativeProcessError {
             NativeFailure::Unsupported => Self::Unsupported,
             NativeFailure::GroupExitCustody => Self::GroupExitCustody,
             NativeFailure::Quarantined => Self::Quarantined,
+            NativeFailure::ServiceQuarantined(reason) => Self::ServiceQuarantined(reason),
             NativeFailure::NoChild => Self::NoChild,
         }
     }
@@ -2450,7 +2580,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             control
                 .service
                 .prepare_record_rebind(process, binding.thread_generation, old_record, reference)
-                .map_err(service::service_protocol_error)?
+                .map_err(|error| {
+                    service::service_protocol_error(
+                        error,
+                        NativeServiceQuarantine::ServiceRecordRebindBusy,
+                    )
+                })?
         } else {
             None
         };
@@ -7071,40 +7206,45 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 PendingCloseOperation::Exit { status, entry } => Some((status, entry)),
                 PendingCloseOperation::Exec(_) => None,
             });
-        if let Some((status, entry)) = owner_exit {
-            // SAFETY: this exact record is selected by the execution owner;
-            // the same checkpoint serves in-zone and host re-entry.
-            unsafe {
-                self.source
-                    .zone
-                    .record(self.record.id)
-                    .consume_owner_continuation();
-            }
-            return Some(match self.exit_with_status(status, entry) {
-                Ok(outcome) => outcome,
-                Err(error) => self.run_failed(error.run_failure_reason()),
-            });
-        }
         let record = self.source.zone.record(self.record.id);
         let continuation = matches!(
             record.resume_disposition(),
             carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
         );
-        if continuation {
-            // SAFETY: this exact record is selected by the execution owner;
-            // a losing exit_group caller retires its record instead of
-            // returning to EL0.
-            unsafe {
-                record.consume_owner_continuation();
-            }
-        }
         // Process close requests every member's exit. A ring-born member
         // that was runnable (queued, not parked in a wait) has no host
         // thread to honour that request: its next selection is the only
         // point that can retire it, so it must not return to EL0.
-        if (continuation || (self.control.host_exit_requested() && !record.has_adapter_operation()))
-            && let Some(status) = self.pending_close_status()
+        let member_exit = if owner_exit.is_none()
+            && (continuation
+                || (self.control.host_exit_requested() && !record.has_adapter_operation()))
         {
+            self.pending_close_status()
+        } else {
+            None
+        };
+        // A cancelled service can leave both a terminal continuation and an
+        // installed IPC operation. Release the operation and its endpoint
+        // pin before either closing caller gives up this record.
+        if (owner_exit.is_some() || member_exit.is_some())
+            && let Err(error) = self
+                .settle_closing_adapter_operation(service::ClosingAdapterCustody::CancelInstalled)
+        {
+            return Some(self.run_failed(retention_failure(error).run_failure_reason()));
+        }
+        if continuation || owner_exit.is_some() {
+            // SAFETY: this exact record is selected by the execution owner.
+            unsafe {
+                record.consume_owner_continuation();
+            }
+        }
+        if let Some((status, entry)) = owner_exit {
+            return Some(match self.exit_with_status(status, entry) {
+                Ok(outcome) => outcome,
+                Err(error) => self.run_failed(error.run_failure_reason()),
+            });
+        }
+        if let Some(status) = member_exit {
             return Some(match self.retire_closing_member(status) {
                 Ok(outcome) => outcome,
                 Err(error) => self.run_failed(error.run_failure_reason()),
@@ -7191,13 +7331,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub(super) fn retire_closing_entry(&mut self) -> Result<NativeResume, NativeProcessError> {
         let status = self
             .pending_close_status()
-            .ok_or(NativeProcessError::Quarantined)?;
+            .ok_or(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ClosingStatusMissing,
+            ))?;
         let outcome = self.retire_closing_member(status)?;
         match outcome {
             LifecycleOutcome::HostCustody => {
                 // An adopted host member retires on its exact host owner.
                 if !self.yield_terminal_host_custody() {
-                    return Err(NativeProcessError::Quarantined);
+                    return Err(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::ClosingHostCustody,
+                    ));
                 }
                 Ok(NativeResume::Left(None))
             }
@@ -7205,7 +7349,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 progress: carrick_core::Served::Idle,
                 ..
             } if self.handoff.is_some() => Ok(NativeResume::Left(self.take_root_exit())),
-            _ => Err(NativeProcessError::Quarantined),
+            _ => Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ClosingLifecycleOutcome,
+            )),
         }
     }
 
@@ -8931,18 +9077,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 )
                 .is_err()
             {
-                page.unclaim(claim)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
+                page.unclaim(claim).map_err(|_| {
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::BirthControlResetUnclaim,
+                    )
+                })?;
                 return Err(busy(NativeForkStage::ChildControlReset));
             }
             if control.set_affinity(parent_affinity).is_err() {
-                page.unclaim(claim)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
+                page.unclaim(claim).map_err(|_| {
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::BirthAffinityUnclaim,
+                    )
+                })?;
                 return Err(NativeProcessError::Invalid);
             }
             if !control.publish_visible_tid(visible.get()) {
-                page.unclaim(claim)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
+                page.unclaim(claim).map_err(|_| {
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::BirthVisibleTidUnclaim,
+                    )
+                })?;
                 return Err(NativeProcessError::Invalid);
             }
             let born = page
@@ -8964,7 +9119,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     let (_, claim) = refusal.into_parts();
                     match page.unclaim(claim) {
                         Ok(_) => NativeProcessError::Invalid,
-                        Err(_) => NativeProcessError::Quarantined,
+                        Err(_) => NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::BirthRecordUnclaim,
+                        ),
                     }
                 })?;
             page.publish(born)
@@ -9179,7 +9336,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }
                     Err(prepared) => {
                         self.service.quarantine_fork(*prepared);
-                        return Err(NativeProcessError::Quarantined);
+                        return Err(NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::ForkPublicationAbort,
+                        ));
                     }
                 };
                 return Err(error);
@@ -9194,11 +9353,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .is_err()
         {
             self.service.quarantine_born(published.born);
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::BirthReservationRelease,
+            ));
         }
         if let Err((_, born)) = self.service.settle_mm(published.born) {
             self.service.quarantine_born(born);
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::BirthMmSettle,
+            ));
         }
         let child_mm = self
             .runtime
@@ -9206,7 +9369,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .lock()
             .owner
             .task(child_key)
-            .map_err(|_| NativeProcessError::Quarantined)?
+            .map_err(|_| {
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ChildGraphLookup)
+            })?
             .native()
             .resources()
             .mm
@@ -9253,11 +9418,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .is_err()
         {
             unrow(self.runtime);
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ChildRegistryRegistration,
+            ));
         }
         if !self.source.zone.mark_native_owned(record) {
             unrow(self.runtime);
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ChildNativeOwnership,
+            ));
         }
         // The child's only owner is this queue entry: a refusal would leave
         // the published child on no run queue (#1100).
@@ -9268,7 +9437,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .is_queued()
         {
             unrow(self.runtime);
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ChildRequeue,
+            ));
         }
         Ok(visible.get())
     }

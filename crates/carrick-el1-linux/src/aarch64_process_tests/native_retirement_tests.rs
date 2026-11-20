@@ -1221,7 +1221,10 @@ fn two_live_processes_reauthenticate_birth_settlement_after_parent_generation_mo
         let settled = service.settle_mm(born);
         if move_generation {
             let (error, retained) = settled.expect_err("production refuses the stale loan");
-            assert_eq!(error, NativeProcessError::Quarantined);
+            assert_eq!(
+                error,
+                NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::ForkSettleCustody,)
+            );
             let physical = crossing.physical.as_ref().unwrap().lock().unwrap();
             let live = physical.execution(0).unwrap();
             assert_eq!(

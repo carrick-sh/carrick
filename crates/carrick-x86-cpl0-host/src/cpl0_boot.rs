@@ -3126,6 +3126,31 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(())
     }
 
+    /// Route one hardware interrupt to a stopped production CPU. The IRQ is
+    /// pending before its next KVM entry; no scheduler or service state is
+    /// changed by the fixture.
+    pub fn fixture_inject_irq(
+        &self,
+        slot: carrick_guest_arch::CpuId,
+        vector: u8,
+    ) -> Result<(), TrapError> {
+        if slot.raw() >= 2 {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        custody
+            ._vm
+            .vm()
+            .signal_msi(
+                carrick_x86::interrupts::LAPIC_BASE as u32 | (slot.raw() << 12),
+                u32::from(vector),
+            )
+            .map_err(|error| fail(format!("fixture IRQ injection: {error}")))
+    }
+
     pub fn user_fault_state(&self, index: usize) -> Result<(u64, u64, u64, u64, u64), TrapError> {
         if index >= 2 {
             return Err(fail("unknown CPL0 task"));

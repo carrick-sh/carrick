@@ -1082,6 +1082,7 @@ dependencies = [
  "carrick-host-jit",
  "carrick-mem",
  "carrick-softcpu-aarch64",
+ "carrick-softmmu",
 ]
 
 [[package]]

@@ -33,9 +33,12 @@ use carrick_mem::memory::{
     el1_vectors_bytes_mailbox_clock, stage1_carrier_maintenance_page_tables,
     stage1_hvpatch_page_tables, stage1_identity_page_tables,
 };
-use carrick_softcpu_aarch64::dispatch::{ExecuteBlock, Report, Stop, run};
+use carrick_softcpu_aarch64::dispatch::{
+    BlockMemory, CHAIN_QUANTUM, ChainBudget, ChainExit, ExecuteBlock, Report, ResidentBlock,
+    RunControl, Stop, run, run_controlled,
+};
 use carrick_softcpu_aarch64::handler::{
-    CodeGeneration, Event, ExclusiveMonitor, GuestMemory, MemoryFault,
+    CodeGeneration, Event, ExclusiveMonitor, GuestMemory, InlineRam, MemoryFault,
 };
 use carrick_softcpu_aarch64::state::{
     CpuState, ExceptionLevel, InterruptMasks, ProgramCounter, RegisterValue, SavedPstate, Sctlr,
@@ -45,67 +48,57 @@ use carrick_softcpu_aarch64::translate::{
     BlockExit, BlockLimits, ExitReason, InstructionClass, TranslatedBlock,
 };
 use carrick_softcpu_aarch64::{ExceptionKind, Gpr, OperandRegister};
-use carrick_softcpu_aarch64_host::{HostBlockRunner, HostCode, HostError};
+use carrick_softcpu_aarch64_host::{HostBlockRunner, HostCode, HostError, SoftMemory};
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 const PAGE: u64 = 4096;
 const INITIAL_METADATA_END: u64 =
     EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64;
 
-struct PhysicalPage {
-    bytes: [u8; PAGE as usize],
-    generation: u64,
-}
-
-impl PhysicalPage {
-    fn write(&mut self, offset: usize, bytes: &[u8]) {
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .expect("code generation exhausted");
-        self.bytes[offset..][..bytes.len()].copy_from_slice(bytes);
-    }
-}
-
-/// Page-granular guest physical memory: unbacked pages fault.
-#[derive(Default)]
+/// Fixture instrumentation and loader helpers around the production RAM owner.
 struct Pages {
-    pages: BTreeMap<u64, Box<PhysicalPage>>,
+    memory: SoftMemory,
     read_boot_root: bool,
 }
 
+impl Default for Pages {
+    fn default() -> Self {
+        Self {
+            memory: SoftMemory::new().expect("physical inventory"),
+            read_boot_root: false,
+        }
+    }
+}
+
 impl Pages {
-    fn map_zero(&mut self, address: u64) -> &mut PhysicalPage {
-        self.pages.entry(address & !(PAGE - 1)).or_insert_with(|| {
-            Box::new(PhysicalPage {
-                bytes: [0; PAGE as usize],
-                generation: 0,
-            })
-        })
+    fn map_zero(&mut self, address: u64) {
+        self.memory
+            .map_zero(FrameGpa::new(address & !(PAGE - 1)))
+            .expect("fixture page");
     }
 
-    fn load(&mut self, mut at: u64, mut bytes: &[u8]) {
-        while !bytes.is_empty() {
-            let offset = (at % PAGE) as usize;
-            let len = bytes.len().min(PAGE as usize - offset);
-            self.map_zero(at).write(offset, &bytes[..len]);
-            at += len as u64;
-            bytes = &bytes[len..];
+    fn load(&mut self, at: u64, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            let first = at & !(PAGE - 1);
+            let last = (at + bytes.len() as u64 - 1) & !(PAGE - 1);
+            for page in (first..=last).step_by(PAGE as usize) {
+                self.map_zero(page);
+            }
+            self.write(VirtualAddress(at), bytes)
+                .expect("fixture bytes");
         }
     }
 }
 
 impl GuestMemory for Pages {
+    fn stage1_is_local(&self) -> bool {
+        self.memory.stage1_is_local()
+    }
+
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault> {
-        for (i, b) in bytes.iter_mut().enumerate() {
-            let a = address.0 + i as u64;
-            let page = self.pages.get(&(a & !(PAGE - 1))).ok_or(MemoryFault {
-                address: VirtualAddress(a),
-            })?;
-            *b = page.bytes[(a % PAGE) as usize];
-        }
+        self.memory.read(address, bytes)?;
         if address.0 == LINUX_PAGE_TABLES_BASE && bytes.len() == size_of::<u64>() {
             self.read_boot_root = true;
         }
@@ -113,26 +106,23 @@ impl GuestMemory for Pages {
     }
 
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault> {
-        let mut at = address.0;
-        let mut remaining = bytes.len();
-        while remaining != 0 {
-            if !self.pages.contains_key(&(at & !(PAGE - 1))) {
-                return Err(MemoryFault {
-                    address: VirtualAddress(at),
-                });
-            }
-            let len = remaining.min((PAGE - at % PAGE) as usize);
-            at += len as u64;
-            remaining -= len;
-        }
-        self.load(address.0, bytes);
-        Ok(())
+        self.memory.write(address, bytes)
+    }
+
+    fn inline_ram(&mut self, read: Option<FrameGpa>, write: Option<FrameGpa>) -> InlineRam<'_> {
+        self.memory.inline_ram(read, write)
+    }
+
+    fn invalidate_code_frame(&mut self, frame: FrameGpa) -> Result<bool, MemoryFault> {
+        self.memory.invalidate_code_frame(frame)
+    }
+
+    fn mark_code_page(&mut self, frame: FrameGpa) -> Option<CodeGeneration> {
+        self.memory.mark_code_page(frame)
     }
 
     fn code_generation(&self, frame: FrameGpa) -> Option<CodeGeneration> {
-        self.pages
-            .get(&frame.raw())
-            .map(|p| CodeGeneration(p.generation))
+        self.memory.code_generation(frame)
     }
 }
 
@@ -256,6 +246,14 @@ fn enter(elf: &[u8]) -> (CpuState, Pages) {
     (cpu, memory)
 }
 
+fn assert_same_execution(a: &Report<HostError>, b: &Report<HostError>) {
+    assert_eq!(a.stop, b.stop);
+    assert_eq!(a.pc, b.pc);
+    assert_eq!(a.blocks, b.blocks);
+    assert_eq!(a.work.executed_blocks, b.work.executed_blocks);
+    assert_eq!(a.work.retired_instructions, b.work.retired_instructions);
+}
+
 fn print_work(
     report: &Report<HostError>,
     publication: carrick_host_jit::PublicationWork,
@@ -304,6 +302,30 @@ fn probe(
     report
 }
 
+fn check_chain_differential(
+    mut fixture: impl FnMut() -> (CpuState, Pages),
+    budget: u64,
+    mut check: impl FnMut(&Report<HostError>, &mut Pages),
+) {
+    let mut previous = None;
+    // Benchmark repetitions alternate which mode goes first, to distribute
+    // host warmup and fixture setup effects across both sides.
+    let first = std::env::var_os("CARRICK_TEST_CHAIN_FIRST").is_some();
+    for enabled in [first, !first] {
+        let (mut cpu, mut memory) = fixture();
+        let mut runner = HostBlockRunner::new().unwrap().with_chaining(enabled);
+        println!("production differential: chain={enabled}");
+        let report = probe(&mut cpu, &mut memory, &mut runner, budget);
+        check(&report, &mut memory);
+        if let Some((before, state)) = &previous {
+            assert_same_execution(before, &report);
+            assert_eq!(&cpu, state);
+        } else {
+            previous = Some((report, cpu));
+        }
+    }
+}
+
 #[test]
 fn resident_loop_translates_only_two_blocks() {
     const PC: u64 = 0x4000;
@@ -334,6 +356,12 @@ fn resident_loop_translates_only_two_blocks() {
         assert_eq!(report.pc, ProgramCounter(PC + 12));
         assert_eq!(report.work.executed_blocks, iterations + 1);
         assert_eq!(report.work.retired_instructions, iterations * 2 + 1);
+        assert!(
+            !runner.chain_blocks()
+                || report.work.dispatches <= 4 + iterations.div_ceil(CHAIN_QUANTUM),
+            "resident branch loop launched {} times for {iterations} iterations",
+            report.work.dispatches,
+        );
         let publication = runner.publication_work();
         counts.push((
             report.work.decoded_blocks,
@@ -344,6 +372,424 @@ fn resident_loop_translates_only_two_blocks() {
         ));
     }
     assert_eq!(counts, [(2, 2, 2, 2, 2); 3]);
+}
+
+#[test]
+fn translated_memory_loop_walks_each_page_once() {
+    const PC: u64 = LINUX_EL1_KERNEL_BASE;
+    const SOURCE: u64 = PC + PAGE;
+    const DEST: u64 = SOURCE + PAGE;
+    const VALUE: u64 = 0x1122_3344_5566_7788;
+    let mut work = Vec::new();
+    for iterations in [1, 100, 10_000] {
+        let mut memory = Pages::default();
+        memory.load(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables());
+        // ldr x3, [x1]; str x3, [x2]; subs x0, x0, #1; b.ne to ldr; hvc #2.
+        for (index, word) in [
+            0xf940_0023_u32,
+            0xf900_0043,
+            0xf100_0400,
+            0x54ff_ffa1,
+            0xd400_0042,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            memory.load(PC + 4 * index as u64, &word.to_le_bytes());
+        }
+        memory.load(SOURCE, &VALUE.to_le_bytes());
+        memory.map_zero(DEST);
+        let mut cpu = CpuState::default();
+        cpu.pstate.el = ExceptionLevel::El1;
+        cpu.pstate.sp = StackSelect::El1;
+        cpu.pc = ProgramCounter(PC);
+        cpu.el1.tcr = SystemValue(TCR_EL1_BOOTSTRAP);
+        cpu.named.ttbr0 = SystemValue(LINUX_PAGE_TABLES_BASE);
+        cpu.el1.sctlr = Sctlr(SCTLR_EL1_BOOTSTRAP);
+        set_x(&mut cpu, 0, iterations);
+        set_x(&mut cpu, 1, SOURCE);
+        set_x(&mut cpu, 2, DEST);
+        let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
+        let report = probe(&mut cpu, &mut memory, &mut runner, 3 * iterations + 2);
+        assert!(matches!(
+            report.stop,
+            Stop::Event {
+                event: Event::ProviderExit(_),
+                ..
+            }
+        ));
+        assert_eq!(report.pc, ProgramCounter(PC + 20));
+        assert_eq!(read_u64(&mut memory, DEST), VALUE);
+        assert_eq!(report.work.retired_instructions, 4 * iterations + 1);
+        if runner.chain_blocks() {
+            assert!(report.work.dispatches <= 4 + iterations.div_ceil(CHAIN_QUANTUM));
+        } else {
+            assert_eq!(report.work.dispatches, report.work.executed_blocks);
+        }
+        work.push((report.work.stage1_walks, report.work.memory_exits));
+    }
+    assert_eq!(work, [(3, 2); 3]);
+}
+
+fn load_words(memory: &mut Pages, pc: u64, words: &[u32]) {
+    for (index, word) in words.iter().enumerate() {
+        memory.load(pc + 4 * index as u64, &word.to_le_bytes());
+    }
+}
+
+fn el1_at(pc: u64) -> CpuState {
+    let mut cpu = CpuState::default();
+    cpu.pstate.el = ExceptionLevel::El1;
+    cpu.pstate.sp = StackSelect::El1;
+    cpu.pc = ProgramCounter(pc);
+    cpu
+}
+
+#[test]
+fn indirect_call_and_direct_back_edge_share_a_resident_chain() {
+    const CALLER: u64 = 0x4000;
+    const CALLEE: u64 = 0x5008;
+    const ITERATIONS: u64 = 10_000;
+    let mut previous = None;
+    for enabled in [false, true] {
+        let mut memory = Pages::default();
+        // mov x30, x4; blr x30 (target must be read before writing LR).
+        load_words(&mut memory, CALLER, &[0xaa04_03fe, 0xd63f_03c0]);
+        // subs x0, x0, #1; b.ne caller; hvc #2.
+        let displacement = ((CALLER as i64 - (CALLEE + 4) as i64) / 4) as u32;
+        let bne = 0x5400_0001 | ((displacement & 0x7ffff) << 5);
+        load_words(&mut memory, CALLEE, &[0xf100_0400, bne, 0xd400_0042]);
+        let mut cpu = el1_at(CALLER);
+        set_x(&mut cpu, 0, ITERATIONS);
+        set_x(&mut cpu, 4, CALLEE);
+        let mut runner = HostBlockRunner::new().unwrap().with_chaining(enabled);
+        let report = probe(&mut cpu, &mut memory, &mut runner, 2 * ITERATIONS + 1);
+        assert!(matches!(
+            report.stop,
+            Stop::Event {
+                event: Event::ProviderExit(_),
+                ..
+            }
+        ));
+        assert_eq!(x(&cpu, 30), CALLER + 8);
+        assert_eq!(x(&cpu, 0), 0);
+        assert_eq!(report.work.executed_blocks, 2 * ITERATIONS + 1);
+        assert_eq!(report.work.retired_instructions, 4 * ITERATIONS + 1);
+        if let Some((before, state)) = &previous {
+            assert_same_execution(before, &report);
+            assert_eq!(&cpu, state);
+            assert!(report.work.dispatches <= 4 + (2 * ITERATIONS).div_ceil(CHAIN_QUANTUM));
+        } else {
+            previous = Some((report, cpu));
+        }
+    }
+}
+
+#[test]
+fn guest_store_unlinks_a_chained_to_code_frame() {
+    const CALLER: u64 = 0x4000;
+    const TARGET: u64 = 0x5000;
+    const WRITER: u64 = 0x6000;
+    let mut memory = Pages::default();
+    use carrick_softcpu_aarch64::translate::encode::b;
+    load_words(&mut memory, CALLER, &[b(TARGET as i64 - CALLER as i64)]);
+    // add x5, x5, #1; b writer.
+    load_words(
+        &mut memory,
+        TARGET,
+        &[0x9100_04a5, b(WRITER as i64 - (TARGET + 4) as i64)],
+    );
+    // str w1, [x2]; b caller. Both caller and target have already run.
+    load_words(
+        &mut memory,
+        WRITER,
+        &[0xb900_0041, b(CALLER as i64 - (WRITER + 4) as i64)],
+    );
+    let mut cpu = el1_at(CALLER);
+    set_x(&mut cpu, 1, 0xd400_0042);
+    set_x(&mut cpu, 2, TARGET);
+    let mut runner = HostBlockRunner::new().unwrap().with_chaining(true);
+    let report = probe(&mut cpu, &mut memory, &mut runner, 8);
+    assert!(
+        matches!(
+            report.stop,
+            Stop::Event { instruction, event: Event::ProviderExit(_) }
+                if instruction.pc() == ProgramCounter(TARGET)
+        ),
+        "{report}"
+    );
+    // The old ADD retires once before the store and never again.
+    assert_eq!(x(&cpu, 5), 1);
+    assert_eq!(report.work.executed_blocks, 6);
+    assert_eq!(report.work.dispatches, 5);
+    assert_eq!(
+        memory.code_generation(FrameGpa::new(TARGET & !(PAGE - 1))),
+        Some(CodeGeneration(2))
+    );
+}
+
+struct RequestAtLaunch<'a> {
+    inner: HostBlockRunner,
+    control: &'a RunControl,
+    request: Option<fn(&RunControl)>,
+}
+
+impl ExecuteBlock for RequestAtLaunch<'_> {
+    type Error = HostError;
+    type Code = HostCode;
+
+    fn chain_blocks(&self) -> bool {
+        true
+    }
+
+    fn link_block(&mut self, resident: &std::sync::Arc<ResidentBlock<HostCode>>) {
+        self.inner.link_block(resident);
+    }
+
+    fn unlink(&mut self, frame: Option<FrameGpa>) {
+        self.inner.unlink(frame);
+    }
+
+    fn prepare(&mut self, block: &TranslatedBlock) -> Result<HostCode, HostError> {
+        self.inner.prepare(block)
+    }
+
+    fn execute(
+        &mut self,
+        block: &TranslatedBlock,
+        code: &HostCode,
+        cpu: &mut CpuState,
+    ) -> Result<usize, HostError> {
+        self.inner.execute(block, code, cpu)
+    }
+
+    fn execute_chain(
+        &mut self,
+        block: &TranslatedBlock,
+        code: &HostCode,
+        cpu: &mut CpuState,
+        memory: BlockMemory<'_>,
+        budget: ChainBudget<'_>,
+    ) -> Result<ChainExit<HostCode>, HostError> {
+        // Raise the request after the initial dispatcher check. The native
+        // self edge is already linked, so skipping its check spends a quantum.
+        if let Some(request) = self.request.take() {
+            request(self.control);
+        }
+        self.inner.execute_chain(block, code, cpu, memory, budget)
+    }
+}
+
+#[test]
+fn native_back_edge_services_pending_kick_and_timer_irq() {
+    const LOOP: u64 = 0x4000;
+    const VBAR: u64 = 0x8000;
+    const IRQ_VECTOR: u64 = VBAR + 0x280; // Current EL with SP_EL1.
+    for (request, kick) in [
+        (RunControl::kick as fn(&RunControl), true),
+        (RunControl::request_irq, false),
+    ] {
+        let control = RunControl::default();
+        let mut runner = RequestAtLaunch {
+            inner: HostBlockRunner::new().unwrap(),
+            control: &control,
+            request: Some(request),
+        };
+        let mut memory = Pages::default();
+        // add x5, x5, #1; b to add.
+        load_words(&mut memory, LOOP, &[0x9100_04a5, 0x17ff_ffff]);
+        load_words(&mut memory, IRQ_VECTOR, &[0xd400_0042]);
+        let mut cpu = el1_at(LOOP);
+        cpu.el1.vbar = VirtualAddress(VBAR);
+        let report = run_controlled(
+            &mut cpu,
+            &mut ExclusiveMonitor::default(),
+            &mut memory,
+            &mut runner,
+            BlockLimits::default(),
+            CHAIN_QUANTUM + 1,
+            &control,
+        );
+        assert_eq!(x(&cpu, 5), 1);
+        if kick {
+            assert_eq!(report.stop, Stop::Kicked);
+            assert_eq!(report.pc, ProgramCounter(LOOP));
+            assert_eq!((report.blocks, report.work.retired_instructions), (1, 2));
+        } else {
+            assert!(matches!(
+                report.stop,
+                Stop::Event {
+                    event: Event::ProviderExit(_),
+                    ..
+                }
+            ));
+            assert_eq!(cpu.el1.elr, ProgramCounter(LOOP));
+            assert_eq!(report.pc, ProgramCounter(IRQ_VECTOR + 4));
+            assert_eq!((report.blocks, report.work.retired_instructions), (2, 3));
+        }
+    }
+}
+
+#[test]
+fn chain_stops_on_exact_step_budget() {
+    const LOOP: u64 = 0x4000;
+    for budget in [0, 1, CHAIN_QUANTUM, CHAIN_QUANTUM + 1] {
+        let mut memory = Pages::default();
+        load_words(&mut memory, LOOP, &[0x9100_04a5, 0x17ff_ffff]); // add x5, x5, #1; b to add.
+        let mut cpu = el1_at(LOOP);
+        let mut runner = HostBlockRunner::new().unwrap().with_chaining(true);
+        let report = probe(&mut cpu, &mut memory, &mut runner, budget);
+        assert_eq!(report.stop, Stop::Budget);
+        assert_eq!(report.pc, ProgramCounter(LOOP));
+        assert_eq!(x(&cpu, 5), budget);
+        assert_eq!(report.blocks, budget);
+        assert_eq!(report.work.executed_blocks, budget);
+        assert_eq!(report.work.retired_instructions, budget * 2);
+        assert_eq!(report.work.dispatches, budget.div_ceil(CHAIN_QUANTUM));
+    }
+}
+
+#[test]
+fn marking_code_revokes_the_inline_store_loan() {
+    const WRITER: u64 = LINUX_EL1_KERNEL_BASE;
+    const TARGET: u64 = WRITER + PAGE;
+    let mut memory = Pages::default();
+    memory.load(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables());
+    // str w1, [x2]; movz w1, #0x42; movk w1, #0xd400, lsl #16; br x2.
+    for (index, word) in [0xb900_0041_u32, 0x5280_0841, 0x72ba_8001, 0xd61f_0040]
+        .into_iter()
+        .enumerate()
+    {
+        memory.load(WRITER + 4 * index as u64, &word.to_le_bytes());
+    }
+    memory.load(TARGET, &0xd61f_0060_u32.to_le_bytes()); // br x3.
+    let mut cpu = CpuState::default();
+    cpu.pstate.el = ExceptionLevel::El1;
+    cpu.pstate.sp = StackSelect::El1;
+    cpu.pc = ProgramCounter(WRITER);
+    cpu.el1.tcr = SystemValue(TCR_EL1_BOOTSTRAP);
+    cpu.named.ttbr0 = SystemValue(LINUX_PAGE_TABLES_BASE);
+    cpu.el1.sctlr = Sctlr(SCTLR_EL1_BOOTSTRAP);
+    set_x(&mut cpu, 1, 0xd61f_0060);
+    set_x(&mut cpu, 2, TARGET);
+    set_x(&mut cpu, 3, WRITER);
+    let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
+    let report = probe(&mut cpu, &mut memory, &mut runner, 8);
+    let Stop::Event {
+        instruction,
+        event: Event::ProviderExit(hvc),
+    } = report.stop
+    else {
+        panic!("{report}");
+    };
+    assert_eq!(instruction.pc(), ProgramCounter(TARGET));
+    assert_eq!(hvc.immediate.value(), 2);
+    assert_eq!(report.work.memory_exits, 2);
+    assert_eq!(
+        memory.code_generation(FrameGpa::new(TARGET)),
+        Some(CodeGeneration(2))
+    );
+}
+
+#[test]
+fn ic_ivau_recompiles_only_the_target_code_frame() {
+    const DRIVER: u64 = 0x4000;
+    const TARGET: u64 = 0x5000;
+    const PEER: u64 = 0x6000;
+    let mut memory = Pages::default();
+    // blr x0; blr x1; ic ivau, x0; blr x0; blr x1; hvc #2.
+    for (index, word) in [
+        0xd63f_0000_u32,
+        0xd63f_0020,
+        0xd50b_7520,
+        0xd63f_0000,
+        0xd63f_0020,
+        0xd400_0042,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        memory.load(DRIVER + 4 * index as u64, &word.to_le_bytes());
+    }
+    for pc in [TARGET, PEER] {
+        memory.load(pc, &0xd65f_03c0_u32.to_le_bytes()); // ret
+    }
+    let mut cpu = CpuState::default();
+    cpu.pstate.el = ExceptionLevel::El1;
+    cpu.pstate.sp = StackSelect::El1;
+    cpu.pc = ProgramCounter(DRIVER);
+    set_x(&mut cpu, 0, TARGET);
+    set_x(&mut cpu, 1, PEER);
+    let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
+    let report = probe(&mut cpu, &mut memory, &mut runner, 10);
+    assert!(matches!(
+        report.stop,
+        Stop::Event {
+            event: Event::ProviderExit(_),
+            ..
+        }
+    ));
+    assert_eq!(report.work.retired_instructions, 10);
+    assert_eq!(report.work.emitted_blocks, 9);
+    assert_eq!(
+        memory.code_generation(FrameGpa::new(TARGET)),
+        Some(CodeGeneration(2))
+    );
+    assert_eq!(
+        memory.code_generation(FrameGpa::new(PEER)),
+        Some(CodeGeneration(1))
+    );
+}
+
+#[test]
+fn remap_and_exec_loader_write_advance_code_incarnations() {
+    const PC: u64 = 0x4000;
+    let frame = FrameGpa::new(PC);
+    let mut memory = SoftMemory::new().expect("physical inventory");
+    memory.map_zero(frame).unwrap();
+    let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
+    let mut run_at_entry = |memory: &mut SoftMemory| {
+        let mut cpu = CpuState::default();
+        cpu.pstate.el = ExceptionLevel::El1;
+        cpu.pstate.sp = StackSelect::El1;
+        cpu.pc = ProgramCounter(PC);
+        run(
+            &mut cpu,
+            &mut ExclusiveMonitor::default(),
+            memory,
+            &mut runner,
+            BlockLimits::default(),
+            2,
+        )
+    };
+    for generation in 1..=3 {
+        let word = 0xd400_0002_u32 | (generation as u32) << 5;
+        memory
+            .write(VirtualAddress(PC), &word.to_le_bytes())
+            .unwrap();
+        let report = run_at_entry(&mut memory);
+        let Stop::Event {
+            event: Event::ProviderExit(hvc),
+            ..
+        } = report.stop
+        else {
+            panic!("{report}");
+        };
+        assert_eq!(u64::from(hvc.immediate.value()), generation);
+        assert_eq!(
+            memory.code_generation(frame),
+            Some(CodeGeneration(generation))
+        );
+        if generation == 1 {
+            memory.unmap_frame(frame).unwrap();
+            assert_eq!(memory.code_generation(frame), None);
+            assert_eq!(
+                run_at_entry(&mut memory).stop,
+                Stop::Fetch(VirtualAddress(PC))
+            );
+            memory.map_zero(frame).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -363,6 +809,7 @@ fn guest_code_write_replaces_the_resident_translation() {
     set_x(&mut cpu, 2, CODE);
     set_x(&mut cpu, 3, WRITER);
     set_x(&mut cpu, 4, CODE);
+    assert_eq!(memory.code_generation(FrameGpa::new(CODE)), None);
     let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
     let report = probe(&mut cpu, &mut memory, &mut runner, 8);
     let Stop::Event {
@@ -380,6 +827,11 @@ fn guest_code_write_replaces_the_resident_translation() {
     );
     assert_eq!(report.work.executed_blocks, 4);
     assert_eq!(report.work.retired_instructions, 5);
+    assert_eq!(report.work.emitted_blocks, 4);
+    assert_eq!(
+        memory.code_generation(FrameGpa::new(CODE)),
+        Some(CodeGeneration(2))
+    );
 }
 
 #[test]
@@ -596,6 +1048,14 @@ fn production_el1_image_boots_past_trampoline_to_first_guest_hvc() {
     const BUDGET: u64 = 1_000_000;
 
     let (mut cpu, mut memory, user_entry) = enter_carrier_root(&elf, USER_HELLO_ELF);
+    check_chain_differential(
+        || {
+            let (cpu, memory, _) = enter_carrier_root(&elf, USER_HELLO_ELF);
+            (cpu, memory)
+        },
+        BUDGET,
+        |report, memory| check_forwarded_write_exit(report, memory, user_entry).unwrap(),
+    );
     let boot_pc = cpu.pc.0;
     let report = probe(&mut cpu, &mut memory, &mut runner, BUDGET);
     println!("carrier boot probe from {boot_pc:#x} (user ELF entry {user_entry:#x}): {report}");
@@ -711,6 +1171,14 @@ impl ExecuteBlock for TracingRunner {
         self.inner.retain_blocks()
     }
 
+    fn retain_stage1(&self) -> bool {
+        self.inner.retain_stage1()
+    }
+
+    fn inline_memory(&self) -> bool {
+        self.inner.inline_memory()
+    }
+
     fn prepare(&mut self, block: &TranslatedBlock) -> Result<HostCode, HostError> {
         self.inner.prepare(block)
     }
@@ -720,6 +1188,16 @@ impl ExecuteBlock for TracingRunner {
         block: &TranslatedBlock,
         code: &HostCode,
         cpu: &mut CpuState,
+    ) -> Result<usize, HostError> {
+        self.execute_with_memory(block, code, cpu, BlockMemory::default())
+    }
+
+    fn execute_with_memory(
+        &mut self,
+        block: &TranslatedBlock,
+        code: &HostCode,
+        cpu: &mut CpuState,
+        memory: BlockMemory<'_>,
     ) -> Result<usize, HostError> {
         let start = block.guest().start().0;
         if start < LINUX_EL0_TRAMPOLINE_BASE {
@@ -732,7 +1210,7 @@ impl ExecuteBlock for TracingRunner {
                 last.ret = Some(x(cpu, 0) as i64);
             }
         }
-        let exit_idx = self.inner.execute(block, code, cpu)?;
+        let exit_idx = self.inner.execute_with_memory(block, code, cpu, memory)?;
         if start < LINUX_EL0_TRAMPOLINE_BASE {
             let sp = cpu.sp().0;
             let lr = x(cpu, 30);
@@ -773,7 +1251,7 @@ impl ExecuteBlock for TracingRunner {
                         self.tpidr_writes.push((ins.pc().0, val));
                     }
                 }
-                None => {}
+                Some(BlockExit::Indirect) | None => {}
             }
         }
         Ok(exit_idx)
@@ -953,17 +1431,17 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     std::fs::remove_file(out).expect("remove compiled musl hello");
 
     assert_eq!(field(&user_elf, 16, 2), 2, "musl hello must be ET_EXEC");
+    let image = AddressSpace::load_elf_bytes(&user_elf)
+        .unwrap()
+        // DDI0487G.a FEAT_LSE: LDADD alone does not authorize advertising
+        // ATOMICS. Let libc select its baseline exclusive-load/store path.
+        .without_auxv_hwcap(LinuxAarch64Hwcap::ATOMICS)
+        // No vvar/vDSO pages are mapped in this carrier-root fixture.
+        .with_vdso_auxv(false)
+        .with_linux_initial_stack_at(["musl-hello"], [] as [&str; 0], LINUX_STACK_TOP, 4 * PAGE)
+        .unwrap();
     let build_guest = || {
         let (mut cpu, mut memory, entry) = enter_carrier_root(&elf, &user_elf);
-        let image = AddressSpace::load_elf_bytes(&user_elf)
-            .unwrap()
-            // DDI0487G.a FEAT_LSE: LDADD alone does not authorize advertising
-            // ATOMICS. Let libc select its baseline exclusive-load/store path.
-            .without_auxv_hwcap(LinuxAarch64Hwcap::ATOMICS)
-            // No vvar/vDSO pages are mapped in this carrier-root fixture.
-            .with_vdso_auxv(false)
-            .with_linux_initial_stack_at(["musl-hello"], [] as [&str; 0], LINUX_STACK_TOP, 4 * PAGE)
-            .unwrap();
         let sp = image.initial_stack_pointer().unwrap();
         let stack = image
             .regions()
@@ -1076,6 +1554,39 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     // by __init_tp (-38 without Aarch64NativeProcessService), and
     // sanitize_standard_fds's ppoll([0, 1, 2], 3, {0, 0}, NULL, 8) (nr=73)
     // reaches PendingFamilies::poll and forwards cleanly via HVC #2.
+    check_chain_differential(
+        || {
+            let (cpu, mut memory, _, _) = build_guest();
+            admit_root_task_with_stdio(&mut memory);
+            (cpu, memory)
+        },
+        1_000_000,
+        |report, memory| {
+            assert!(
+                matches!(
+                    report.stop,
+                    Stop::Event { event: Event::ProviderExit(exit), .. } if exit.immediate.value() == 2
+                ),
+                "{report}"
+            );
+            let args = mb + core::mem::offset_of!(Aarch64SyscallMailbox, args) as u64;
+            assert_eq!(
+                read_u32(
+                    memory,
+                    mb + core::mem::offset_of!(Aarch64SyscallMailbox, state) as u64
+                ),
+                1
+            );
+            assert_eq!(
+                read_u64(
+                    memory,
+                    mb + core::mem::offset_of!(Aarch64SyscallMailbox, native_nr) as u64
+                ),
+                73
+            );
+            assert_eq!(read_u64(memory, args + 8), 3);
+        },
+    );
     let (mut cpu, mut memory, entry, _) = build_guest();
     admit_root_task_with_stdio(&mut memory);
     let mut runner = TracingRunner::new().expect("Linux arm64 host runner");

@@ -1,11 +1,11 @@
 schema_version = 1
 id = "arm.softcpu.cache-hot-set"
-title = "Bound translation work for resident AArch64 guest blocks"
+title = "Bound translation and dispatch work for resident AArch64 guest blocks"
 guest_surfaces = ["isa:aarch64", "vmm:soft"]
-semantic_authority = ["Arm ARM DDI0487G.a C6.2 instruction semantics for SUBS, B.cond and HVC."]
+semantic_authority = ["Arm ARM DDI0487G.a C6.2 instruction semantics for SUBS, direct and register branches, and HVC.", "Arm ARM DDI0487G.a D1.10 asynchronous exception entry and PSTATE masks."]
 fixture = "carrick-softcpu-aarch64-host::boot_probe"
 scale_points = [1, 100, 10000]
-rationale = "The unchanged loop body and its HVC exit occupy two resident translations."
+rationale = "The unchanged loop body and its HVC exit occupy two resident translations. Native launches are bounded in the fixture by four cold launches plus one launch per 256 iterations."
 
 [[structural_budgets]]
 kind = "upper-bound"
@@ -24,7 +24,13 @@ rationale = "Each of the two resident blocks is emitted once."
 [bindings]
 vm_free = [
   "carrick-softcpu-aarch64-host::boot_probe::resident_loop_translates_only_two_blocks",
+  "carrick-softcpu-aarch64-host::boot_probe::indirect_call_and_direct_back_edge_share_a_resident_chain",
+  "carrick-softcpu-aarch64-host::boot_probe::guest_store_unlinks_a_chained_to_code_frame",
+  "carrick-softcpu-aarch64-host::boot_probe::native_back_edge_services_pending_kick_and_timer_irq",
+  "carrick-softcpu-aarch64-host::boot_probe::chain_stops_on_exact_step_budget",
   "carrick-softcpu-aarch64-host::boot_probe::guest_code_write_replaces_the_resident_translation",
+  "carrick-softcpu-aarch64-host::boot_probe::ic_ivau_recompiles_only_the_target_code_frame",
+  "carrick-softcpu-aarch64-host::boot_probe::remap_and_exec_loader_write_advance_code_incarnations",
 ]
 [bindings.unresolved]
 embed_structural = "The native ARM64 soft dispatcher witness runs without an embedded soft carrier."

@@ -2670,6 +2670,7 @@ fn child_futex<'a>(
                         })
                         .unwrap();
                     assert!(ticket.complete(true).is_ok());
+                    true
                 },
             )));
         }

@@ -777,8 +777,28 @@ impl From<ServiceIdentity> for ServiceSelector {
     }
 }
 
+/// Why [`ServiceNotice::publish_or_observe`] refused to publish `selector`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceNoticeBusy {
+    /// The slot's notice already names this publisher's own scheduler record:
+    /// duplicate lane custody, never another live publisher's contention.
+    Duplicate(ServiceSelector),
+    /// Another live record's unconsumed selector currently holds the slot's
+    /// notice. Observation performs zero stores, so concurrent host `take`
+    /// never observes a spurious busy word.
+    Held(ServiceSelector),
+    /// Occupied notice words failed `ServiceSelector` decoding.
+    Corrupt,
+}
+
+const NOTICE_WRITING: u64 = u64::MAX;
+const NOTICE_TAKING: u64 = 1 << 62;
+
 /// One producer per execution lane. Publication is followed by an owned park
-/// and exit; the host consumes the notice before admitting that lane again.
+/// and exit, or by an in-ring switch to a runnable peer when `resume_checkpoint`
+/// parks `begin_return_work` before host intake; a peer that contends on an
+/// occupied notice observes its holder without mutating the word and parks on
+/// that holder's native-service release.
 /// A notice is not a second task owner and contains no dereferenceable pointer.
 #[repr(C)]
 #[derive(Debug)]
@@ -799,7 +819,7 @@ impl ServiceNotice {
     }
     pub fn publish(&self, selector: ServiceSelector) -> Result<(), ServiceError> {
         self.record
-            .compare_exchange(0, u64::MAX, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(0, NOTICE_WRITING, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| ServiceError::Busy)?;
         self.incarnation
             .store(selector.record.incarnation, Ordering::Relaxed);
@@ -811,16 +831,77 @@ impl ServiceNotice {
             .store(u64::from(selector.record.id.raw()) + 1, Ordering::Release);
         Ok(())
     }
+    /// Publish `selector` when the slot's notice is empty, or observe the
+    /// current holder with zero stores so concurrent carrier `take` is never
+    /// disturbed.
+    pub fn publish_or_observe(&self, selector: ServiceSelector) -> Result<(), ServiceNoticeBusy> {
+        for _ in 0..2 {
+            if self.publish(selector).is_ok() {
+                return Ok(());
+            }
+            let r1 = self.record.load(Ordering::Acquire);
+            if r1 == 0 {
+                continue;
+            }
+            if r1 == NOTICE_WRITING {
+                return Err(ServiceNoticeBusy::Corrupt);
+            }
+            let raw_record = r1 & !NOTICE_TAKING;
+            if raw_record == 0 || raw_record > u64::from(u32::MAX) + 1 {
+                return Err(ServiceNoticeBusy::Corrupt);
+            }
+            let incarnation = self.incarnation.load(Ordering::Acquire);
+            let execution = self.execution.load(Ordering::Acquire);
+            let sequence = self.sequence.load(Ordering::Acquire);
+            core::sync::atomic::fence(Ordering::Acquire);
+            let r2 = self.record.load(Ordering::Acquire);
+            if r2 == 0 {
+                continue;
+            }
+            if r2 == NOTICE_WRITING {
+                return Err(ServiceNoticeBusy::Corrupt);
+            }
+            if (r2 & !NOTICE_TAKING) != raw_record {
+                continue;
+            }
+            let Some(id) = raw_record
+                .checked_sub(1)
+                .and_then(|raw| u32::try_from(raw).ok())
+                .and_then(carrick_sched_core::RecordId::from_raw)
+            else {
+                return Err(ServiceNoticeBusy::Corrupt);
+            };
+            let Some(sequence) = NonZeroU64::new(sequence) else {
+                return Err(ServiceNoticeBusy::Corrupt);
+            };
+            let holder = ServiceSelector {
+                record: RecordRef { id, incarnation },
+                execution: SnapshotGeneration::from_raw(execution),
+                sequence,
+            };
+            return if holder.record.id == selector.record.id {
+                Err(ServiceNoticeBusy::Duplicate(holder))
+            } else {
+                Err(ServiceNoticeBusy::Held(holder))
+            };
+        }
+        Err(ServiceNoticeBusy::Corrupt)
+    }
     pub fn take(&self) -> Result<Option<ServiceSelector>, ServiceError> {
         let record = self.record.load(Ordering::Acquire);
         if record == 0 {
             return Ok(None);
         }
-        if record == u64::MAX {
+        if record == NOTICE_WRITING || record & NOTICE_TAKING != 0 {
             return Err(ServiceError::Busy);
         }
         self.record
-            .compare_exchange(record, u64::MAX, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                record,
+                record | NOTICE_TAKING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .map_err(|_| ServiceError::Busy)?;
         let selector = (|| {
             Some(ServiceSelector {
@@ -1903,6 +1984,12 @@ impl ServiceCell {
         self.lock_exact(state, identity)?;
         self.state.store(CANCELLED, Ordering::Release);
         Ok(())
+    }
+
+    /// Observe sticky cancellation queued against an unpublished request
+    /// without mutating the cell or nesting two members' wait-queue locks.
+    pub fn cancel_queued(&self, identity: ServiceIdentity) -> bool {
+        self.state.load(Ordering::Acquire) == CANCEL_QUEUED && self.same(identity)
     }
 
     /// Observe an acknowledged exact request without consuming completion.
@@ -3491,5 +3578,60 @@ mod tests {
         assert_eq!(ticket.request().operation, operation);
         assert!(ticket.complete(true).is_ok());
         assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Supplied));
+    }
+
+    #[test]
+    fn service_notice_publish_or_observe_classifies_held_duplicate_and_corrupt() {
+        let notice = ServiceNotice::new();
+        let first = ServiceSelector {
+            record: birth(1, 3).record,
+            execution: SnapshotGeneration::INITIAL,
+            sequence: NonZeroU64::new(5).unwrap(),
+        };
+        let second = ServiceSelector {
+            record: birth(2, 4).record,
+            execution: SnapshotGeneration::INITIAL,
+            sequence: NonZeroU64::new(9).unwrap(),
+        };
+        let same_record_later = ServiceSelector {
+            record: RecordRef {
+                id: first.record.id,
+                incarnation: first.record.incarnation + 1,
+            },
+            execution: SnapshotGeneration::INITIAL,
+            sequence: NonZeroU64::new(6).unwrap(),
+        };
+        assert_eq!(notice.publish_or_observe(first), Ok(()));
+        let before = notice.record.load(Ordering::Acquire);
+        assert_eq!(
+            notice.publish_or_observe(second),
+            Err(ServiceNoticeBusy::Held(first))
+        );
+        // Observation must not touch `record`, so concurrent `take` never
+        // observes a spurious busy word.
+        assert_eq!(notice.record.load(Ordering::Acquire), before);
+        assert_eq!(
+            notice.publish_or_observe(same_record_later),
+            Err(ServiceNoticeBusy::Duplicate(first))
+        );
+        // Even while `take` holds NOTICE_TAKING, `publish_or_observe` still
+        // observes the exact live holder without spinning or corrupting `take`.
+        notice
+            .record
+            .store(before | NOTICE_TAKING, Ordering::Release);
+        assert_eq!(
+            notice.publish_or_observe(second),
+            Err(ServiceNoticeBusy::Held(first))
+        );
+        assert_eq!(notice.take(), Err(ServiceError::Busy));
+        notice.record.store(before, Ordering::Release);
+        assert_eq!(notice.take(), Ok(Some(first)));
+        assert_eq!(notice.publish_or_observe(second), Ok(()));
+        assert_eq!(notice.take(), Ok(Some(second)));
+        notice.record.store(NOTICE_WRITING, Ordering::Release);
+        assert_eq!(
+            notice.publish_or_observe(first),
+            Err(ServiceNoticeBusy::Corrupt)
+        );
     }
 }

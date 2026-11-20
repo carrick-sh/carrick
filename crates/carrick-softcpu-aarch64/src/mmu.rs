@@ -1,14 +1,13 @@
 //! Stage-1 translation for the copy-through engine: once SCTLR_EL1.M is set,
-//! every handler data access and every block fetch translates through the
-//! one AArch64 walker, `carrick_mmu_core::aarch64::stage1_walk::Aarch64Walker`
+//! handler data accesses and block fetches share the
+//! AArch64 walker, `carrick_mmu_core::aarch64::stage1_walk::Aarch64Walker`
 //! (Arm ARM DDI0487G.a D5), over descriptors read from guest physical memory.
 //! A walker fault is an architectural abort taken to EL1 (D1.10, ESR/FAR via
 //! `exception::syndrome`); a descriptor read the memory cannot serve, or a
 //! TCR_EL1 the walker does not admit, is a provider stop, never a guest fault.
 //!
 //! With M clear, the address is used untranslated (D5.2.9 flat mapping).
-//! There is no translation cache in this slice, so TTBR/TCR/SCTLR writes
-//! and TLBI need no invalidation here.
+//! The dispatcher can cache successful translations during a single run.
 use core::cell::RefCell;
 
 use carrick_guest_arch::GuestVa;
@@ -30,6 +29,46 @@ use crate::state::{CpuState, ExceptionLevel, VirtualAddress};
 pub enum AccessClass {
     Ordinary,
     Unprivileged,
+}
+
+/// The raw stage-1 register set. Both TTBRs include their ASID fields,
+/// and TCR selects the active ASID and address geometry.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Stage1Registers {
+    ttbrs: [u64; 2],
+    tcr: u64,
+    sctlr: u64,
+}
+
+impl Stage1Registers {
+    pub(crate) fn for_cpu(cpu: &CpuState) -> Self {
+        Self {
+            ttbrs: [cpu.named.ttbr0.0, cpu.named.ttbr1.0],
+            tcr: cpu.el1.tcr.0,
+            sctlr: cpu.el1.sctlr.0,
+        }
+    }
+}
+
+/// Permission inputs outside the stage-1 system registers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PermissionMode {
+    el: ExceptionLevel,
+    pan: bool,
+    uao: bool,
+    class: AccessClass,
+}
+
+impl PermissionMode {
+    pub(crate) fn for_access(cpu: &CpuState, access: LeafAccess, class: AccessClass) -> Self {
+        let data = access != LeafAccess::Execute;
+        Self {
+            el: cpu.pstate.el,
+            pan: data && cpu.pstate.pan,
+            uao: data && cpu.pstate.uao,
+            class,
+        }
+    }
 }
 
 /// Why an access produced no physical address.
@@ -93,7 +132,9 @@ pub fn translate(
     if !enabled(cpu) {
         return Ok(va);
     }
-    Ok(walk(cpu, memory, va, access, class)?.output().raw())
+    memory
+        .translate_stage1(cpu, GuestVa::new(va), access, class)
+        .map(|pa| pa.raw())
 }
 
 /// D13.2.103 `PAR_EL1` bit 11 is RES1 in both 64-bit formats (`F=0` and `F=1`).

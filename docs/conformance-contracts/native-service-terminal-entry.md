@@ -45,11 +45,32 @@ pretending that yielding can repair them. The member-row binding
 zero notices and claims when an executing member incorrectly retains a
 suspended signal row.
 
-The notice is per execution lane, not per process: `native_service_idle`
-returns `Action::Idle` directly to the host. Both the loaded and idle paths in
-`vcpu_loop::executor::backend` take the lane's native service notice before
-another guest entry. An occupied notice at publication therefore cannot be a
-sibling's legitimate outstanding work.
+The notice is per execution lane (`CurrentTask.service_notice`), not per
+process. While `native_service_idle` returns `Action::Idle` directly to the
+host, `NativeProcessEntry::resume_checkpoint` can park a resumed `host_owned`
+member in `begin_return_work` (publishing its `ServiceSelector` into the slot's
+`service_notice` and returning `NativeResume::Left(None)`) while
+`Sched::run_ready` immediately switches in another runnable member on that same
+vCPU slot before host `take_worker_native_service` drains `service_notice`.
+When that switched-in peer enters an unserved crossing (such as a 4 KiB
+teardown `mmap` SVC) or owes IRQ/served `CarrierWork`, `service_notice` holds
+another live record's unconsumed selector. That cross-member collision is
+contention ("not now"), never a broken invariant: `publish_or_observe` observes
+the live holder with zero stores (`Held(holder)`), keeps the caller's already
+published `PendingService`, enrols on `ObjectWaitKey::native_service(holder.record)`,
+probes once under that queue lock, releases execution capacity, and reruns
+notice publication when woken. Parking the contender rings the slot's
+host-work doorbell because that park can remove the last runnable record while
+the holder's notice still awaits carrier intake. The EL1 idle boundary then
+exits so carrier intake can take the holder notice.
+A `service_notice` word that already names the
+publisher's own `RecordId` remains broken duplicate lane custody and fails
+closed with `NativeServiceQuarantine::NoticePublishDuplicate`
+(`EntryBindingFatalReason::NativeServiceQuarantinedNoticePublishDuplicate`).
+All other 14 `service_protocol_error` sites operate on the per-member
+`ServiceCell` under exclusive executing-member ownership or under
+`ObjectWaitKey::native_service(self.record)` exclusion and remain true
+protocol invariants.
 
 Claim, cancellation, completion and owner-wait transitions serialize on the
 same native-service queue. A cell CAS refusal under that exclusion is likewise
@@ -64,6 +85,58 @@ cannot acquire invariant status merely because it returned Busy.
 The exec successor population checks already cancel the prepared successor or
 terminate the losing image when validation fails. They do not escape through
 bridge settlement and are unchanged here.
+
+Issue #2532 covers the terminal case that the duplicate-custody rule must not
+mask. A process close can cancel a member's retained service and wake its exact
+record while an already captured mmap SVC or IRQ CarrierWork entry still owns
+that execution lane. The member row is then legitimate old-service custody,
+and the pending process close is authoritative. The four VM-free bindings
+`{arm,x86}_terminal_close_with_retained_service_accepts_{mmap_entry,irq_carrier_work}`
+use two live members, one retained service ticket, the production group-close
+cancellation, and the production service begin/settlement boundary. Before the
+correction all four fail with exact `NativeServiceQuarantined`: the early
+member-wait check precedes the closed-gate/pending-close check added for #1575.
+The required outcome consumes the retained service claim, publishes no second
+notice, and retires the member through the existing close authority. A member
+wait without a pending close remains quarantined. Work stays bounded to one
+retained-service settlement and one terminal member transaction, with no
+polling, retry, timer, or additional host request.
+
+The correction recognizes only the conjunction of an exact service wait and
+the process's pending close. At the closing member-wait guard it verifies that
+the retained `PendingService` belongs to `self.control`
+(`NativeServiceQuarantine::RetainedServiceControl`,
+`EntryBindingFatalReason::RetainedControlQuarantine`, fatal code 201),
+consumes that service through `resume_service` and hands `NoPending` to the
+existing lifecycle checkpoint. The checkpoint settles any installed IPC
+operation and its endpoint `OfdPin` through the shared
+`settle_closing_adapter_operation` helper before consuming the terminal
+`OwnerContinuation` and retiring the member. The same helper backs closed-gate
+adapter cancellation and rejects an impossible adapter token on
+`ClosingMemberWait::Signal` as `NativeServiceQuarantine::SignalWaitAdapter`
+(`EntryBindingFatalReason::SignalWaitAdapterQuarantine`, fatal code 200).
+If `resume_pending_lifecycle`
+records a `run_failure`, `settle_retained_service_for_closing_entry` consumes
+`take_run_failure()` and propagates the underlying `NativeProcessError` rather
+than masking or dropping it. The ARM and x86 mmap, CarrierWork, and
+`drain_owned_preparation` bindings (for both non-adapter and retained IPC
+adapter services) pass at the production service-settlement boundary;
+`native_service_suspended_member_cannot_admit_a_second_bridge` and
+`native_service_duplicate_custody_is_an_invariant_at_bridge_settlement` still
+prove that non-service waits and service custody without terminal authority
+remain quarantined.
+
+The ARM and x86
+`terminal_close_with_retained_adapter_service_resume_checkpoint` witnesses
+wake a claimed adapter service into the normal scheduler checkpoint. The
+`terminal_close_during_contended_adapter_preparation` witnesses close the
+process between observing a live peer's notice and the unpublished request's
+park probe, through `drain_owned_preparation`. On both paths, the operation
+is the pipe endpoint's last reference. Both ISA variants of each path
+failed before the fix with the operation still installed. After the fix
+they require record retirement, the operation and pipe endpoint gone, and
+zero retained service claims. The contention witnesses also require the
+peer's notice to survive and its ticket to complete.
 
 Director confirmation requires signed runs of `el1_fork_cow_resolves_in_guest`,
 `el1_sched_two_processes_share_vcpus`,

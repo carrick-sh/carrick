@@ -93,6 +93,12 @@ pub(super) fn run_service_published_hook(runtime: usize) {
 
 #[cfg(test)]
 std::thread_local! {
+    // Inject the other lane's close between notice contention and the park probe.
+    pub(super) static SERVICE_NOTICE_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+std::thread_local! {
     static RETURN_COPYOUTS: std::cell::RefCell<Option<Vec<(UserVa, usize)>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -358,14 +364,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn native_service_doorbell(&mut self) -> bool {
         #[cfg(test)]
         {
-            ENTROPY_DOORBELL.with(|hook| {
-                if let Some(hook) = hook.borrow_mut().as_mut() {
-                    hook();
-                    true
-                } else {
-                    false
-                }
-            })
+            ENTROPY_DOORBELL.with(|hook| hook.borrow_mut().as_mut().is_some_and(|hook| hook()))
         }
         #[cfg(not(test))]
         {
@@ -1812,11 +1811,19 @@ pub struct NativeServiceCapacityFixture<C: ProcessContext + 'static = ParkedCont
         carrick_core_abi::service::ServiceTicket<&'static carrick_core_abi::service::ServiceCell>,
     >,
     children: usize,
+    hold_notice: bool,
+    parked_count: usize,
 }
 
 impl NativeServiceCapacityFixture {
     pub fn new(children: usize) -> Self {
         Self::new_with_rusage(children, UserVa::new(0))
+    }
+
+    pub fn new_with_held_notice(children: usize) -> Self {
+        let mut fixture = Self::new(children);
+        fixture.hold_notice = true;
+        fixture
     }
 
     fn new_with_rusage(children: usize, rusage: UserVa) -> Self {
@@ -2015,6 +2022,8 @@ impl<C: ProcessContext + 'static> NativeServiceCapacityFixture<C> {
             fixture,
             pending: Vec::new(),
             children,
+            hold_notice: false,
+            parked_count: 0,
         }
     }
 
@@ -2101,6 +2110,10 @@ impl NativeServiceCapacityFixture {
         ));
         assert!(entry.take_handoff_receipt().is_some());
         assert!(fixture.zone.slot(fixture.slot).current().is_none());
+        if self.hold_notice {
+            self.parked_count += 1;
+            return Some(self.parked_count);
+        }
         let notice = fixture.task.service_notice.take().unwrap().unwrap();
         let queue = fixture
             .zone
@@ -2123,7 +2136,88 @@ impl NativeServiceCapacityFixture {
     }
 
     pub fn outstanding(&self) -> usize {
-        self.pending.len()
+        if self.hold_notice {
+            self.parked_count
+        } else {
+            self.pending.len()
+        }
+    }
+
+    pub fn acknowledge_contended_and_retire(&mut self) {
+        use carrick_core_abi::service::ServiceCell;
+        assert_eq!(self.parked_count, self.children);
+        let fixture = &self.fixture;
+        let mut completed = 0usize;
+        while completed < self.children {
+            let notice = fixture.task.service_notice.take().unwrap().unwrap();
+            let holder = notice.record;
+            let identity = fixture.zone.record(holder.id).identity();
+            let queue = fixture
+                .zone
+                .object_wait(
+                    carrick_sched_core::object_wait::ObjectWaitKey::native_service(holder).unwrap(),
+                    &carrick_sched_core::ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                )
+                .unwrap();
+            // SAFETY: the real native owner retains this exact control allocation.
+            let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+            let ticket = unsafe {
+                ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, identity)
+            }
+            .unwrap();
+            assert!(ticket.complete(true).is_ok());
+            queue
+                .notify_object(fixture.slot, &mut WakeEffects::default())
+                .unwrap();
+            drop(queue);
+
+            while let Some((record, address, words)) = self.select() {
+                let mut service = fixture.service();
+                let mut entry = fixture
+                    .runtime
+                    .enter_registered(
+                        fixture.registry,
+                        BornInZoneSource {
+                            zone: fixture.zone,
+                            slot: fixture.slot,
+                        },
+                        fixture.task,
+                        address,
+                        &words,
+                        &mut service,
+                    )
+                    .unwrap();
+                match entry.resume_checkpoint(|_| Ok(None)).unwrap() {
+                    NativeResume::Returned(result) if record == fixture.record => {
+                        // The first exiting child wakes the parent's `wait4`
+                        // onto this same slot with the reaped child PID.
+                        assert!(result.raw() >= 7002);
+                        let waiting = fixture.runtime.graph.lock().has_member_wait(&record);
+                        assert!(!waiting);
+                        assert!(matches!(
+                            entry.exit_group(0),
+                            LifecycleOutcome::Transferred { .. }
+                        ));
+                    }
+                    NativeResume::Returned(result) => {
+                        assert_eq!(result.raw(), words.syscall_return() as i64);
+                        let waiting = fixture.runtime.graph.lock().has_member_wait(&record);
+                        assert!(!waiting);
+                        assert!(matches!(
+                            entry.exit_group(0),
+                            LifecycleOutcome::Transferred { .. }
+                        ));
+                        completed += 1;
+                    }
+                    NativeResume::Left(None) => {}
+                    _ => panic!("unexpected resume"),
+                }
+            }
+        }
+        assert!(fixture.task.service_notice.take().unwrap().is_none());
     }
 
     pub fn acknowledge_and_retire(&mut self) {
@@ -2392,6 +2486,9 @@ fn arm_words(address: AddressContext<RootGpa>) -> carrick_el1_abi::Aarch64Parked
     carrick_el1_abi::Aarch64ParkedContext::from_parts(native, address)
 }
 
+#[cfg(test)]
+mod terminal_entry_tests;
+
 /// These are corrupt custody, not a sibling holding a releasable resource.
 /// Drive the same begin/settle pair as arm_native_service_exit: an exact
 /// member may have only one cell, pending row and execution-lane notice.
@@ -2454,12 +2551,17 @@ fn native_service_duplicate_custody_is_an_invariant_at_bridge_settlement() {
             fixture.control.service.consume(request.identity).unwrap();
         }
         let result = entry.begin_service(operation, None);
+        let expected = if occupied_notice {
+            NativeServiceQuarantine::NoticePublishDuplicate
+        } else {
+            NativeServiceQuarantine::ServiceBindBusy
+        };
         assert!(
             matches!(
                 entry.settle_service_exit(result, NativeServiceExit::Bridge),
-                Err(NativeProcessError::Quarantined)
+                Err(NativeProcessError::ServiceQuarantined(reason)) if reason == expected
             ),
-            "duplicate custody must not report transient Busy (notice={occupied_notice})"
+            "duplicate custody must report its exact site (notice={occupied_notice})"
         );
         assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
         assert!(
@@ -2520,7 +2622,7 @@ fn native_service_suspended_member_cannot_admit_a_second_bridge() {
         .expect("a second bridge cannot own a suspended member");
     assert_eq!(
         fatal.fatal_reason(),
-        carrick_el1_abi::EntryBindingFatalReason::NativeServiceQuarantined
+        carrick_el1_abi::EntryBindingFatalReason::NativeServiceQuarantinedMemberWaitInstalled
     );
     assert!(fixture.task.service_notice.take().unwrap().is_none());
     assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
@@ -9766,7 +9868,9 @@ fn native_service_exit_missing_unowned_receipt_remains_an_invariant() {
         .unwrap();
     assert!(matches!(
         entry.settle_service_exit(Ok(NativeResume::Left(None)), NativeServiceExit::Bridge),
-        Err(NativeProcessError::Quarantined)
+        Err(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::HandoffAuthentication
+        ))
     ));
     assert!(matches!(
         entry.settle_service_exit(Err(NativeProcessError::Busy), NativeServiceExit::Bridge),
@@ -11421,13 +11525,13 @@ fn entropy_service_preparation_busy_retries_before_generation() {
 #[cfg(test)]
 std::thread_local! {
     static ENTROPY_PREPARE_BUSY_ONCE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
-    static ENTROPY_DOORBELL: core::cell::RefCell<Option<Box<dyn FnMut()>>> = const { core::cell::RefCell::new(None) };
+    static ENTROPY_DOORBELL: core::cell::RefCell<Option<Box<dyn FnMut() -> bool>>> = const { core::cell::RefCell::new(None) };
 }
 
 /// Answer the Physical carrier's native-service doorbell with `hook`, or
 /// restore the unanswered doorbell with `None`.
-#[cfg(all(test, not(target_os = "macos")))]
-pub(crate) fn on_service_doorbell(hook: Option<Box<dyn FnMut()>>) {
+#[cfg(test)]
+pub(crate) fn on_service_doorbell(hook: Option<Box<dyn FnMut() -> bool>>) {
     ENTROPY_DOORBELL.with(|slot| *slot.borrow_mut() = hook);
 }
 
@@ -11503,6 +11607,7 @@ fn entropy_physical_checkpoint(busy: bool) {
                 })
                 .unwrap();
             assert!(ticket.complete(true).is_ok());
+            true
         }))
     });
     take_signal_copies();
