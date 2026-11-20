@@ -515,6 +515,10 @@ fn busy_service_notice_parks_and_reruns_once_for<
         0,
         "contended notice wait must enrol on holder release rather than requeue to poll"
     );
+    assert!(
+        fixture.task.linux.has_pending_host_work(),
+        "with both members parked and nothing runnable, the occupied notice must force the vCPU to the carrier"
+    );
 
     // Host intake consumes Process 1's preserved notice, completes its ticket,
     // and notifies Process 1's service queue, waking both Process 1 and Process 2.
