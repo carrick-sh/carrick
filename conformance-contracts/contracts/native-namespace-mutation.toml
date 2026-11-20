@@ -70,6 +70,8 @@ vm_free = [
   "carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_chmod_chown_on_ring_files_matches_native",
   "carrick-personality-linux::native_host_file::tests::chmod_and_chown_stage_their_records_with_the_callers_authority",
   "carrick-personality-linux::native_host_file::tests::chmod_and_chown_answer_linux_errors_in_ring",
+  "carrick-vmm-kvm::cpl0_entry::serial_host_root_legacy_namespace_syscalls_match_linux",
+  "carrick-vmm-kvm::cpl0_entry::serial_host_fork_child_legacy_namespace_syscalls_match_linux",
 ]
 
 [bindings.unresolved]
