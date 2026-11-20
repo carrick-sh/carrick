@@ -214,6 +214,22 @@ impl<
     Context: super::dispatch::DispatchContext,
 > LifecycleNative<'a> for El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
+    fn monotonic_counter(
+        &mut self,
+    ) -> Option<(
+        carrick_guest_arch::CounterTick,
+        carrick_guest_arch::CounterFrequency,
+    )> {
+        let isa = LifecycleNative::guest_isa(self);
+        let venue = self.process_venue()?;
+        // The ARM root can still have an embedder-controlled ClockDomain.
+        // Keep its legacy dispatch until that domain is available in ring.
+        if isa == carrick_guest_arch::GuestIsa::Aarch64 && venue.is_root_process() {
+            return None;
+        }
+        venue.monotonic_counter()
+    }
+
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
         let diagnostic = crate::file::CopyDiagnostic {
             counters: self.counters,

@@ -403,3 +403,18 @@ valid clock with a null destination and an invalid clock ID. The x86 KVM
 witness checks a writable timespec in the root and its fork child. Clock
 samples, CPU accounting, and x86 vDSO publication still need their own
 execution evidence.
+
+## Monotonic syscall samples (#2028)
+
+The native syscall reads the admitted execution venue's typed counter and
+frequency and retains one timespec in the exact-MM copyout owner. The ARM
+descendant uses the counter that the ARM vDSO reads. The x86 root and
+descendant use the qualified guest TSC. The ARM root still reaches its
+existing container clock policy, including embedder-controlled modes.
+
+On the ARM production dispatch path, the fork child formerly returned
+ENOSYS and counted one refusal for a null monotonic result. The witness
+requires EFAULT with no refusal. Under KVM a native fork leaves both
+processes live, with each process sampling into its own stack and the parent
+reporting both results. Realtime, CPU accounting, vDSO/libc parity and
+x86 absolute deadlines have separate outstanding evidence.
