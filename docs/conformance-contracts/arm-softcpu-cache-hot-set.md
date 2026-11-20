@@ -68,3 +68,27 @@ arrives after the dispatcher has checked the pending flag, and a cross-page
 guest store that revokes a warm link. The production carrier fixtures compare
 chain on/off with identical initial state through the first HVC for EL1 boot
 and static musl hello. No signed embed or Docker binding is registered.
+
+### R4f evidence
+
+The launch-bound assertion first failed at 100 iterations on the inline-memory
+base, with 101 dispatches against a limit of five. Disabling frame unlinking
+made the guest-write witness spend its budget running stale code. Disabling
+the native pending check delayed the kick from the first back-edge to block
+256. Both witnesses pass with the checks in place.
+
+Ten interleaved off/on pairs used one release AArch64 runner under QEMU user
+mode on the same x86-64 worker. The table shows median throughput and exact
+counts for the two modes.
+
+| Fixture | Dispatches off → on | Executed blocks | Retired instructions | Blocks/s off → on | Instructions/s off → on |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Memory loop, 10,000 iterations | 10,003 → 43 | 10,003 | 40,001 | 628,001 → 8,385,668 | 2,511,313 → 33,533,448 |
+| Production EL1 to first guest HVC | 1,947 → 910 | 1,947 | 5,597 | 28,265 → 27,054 | 81,253 → 77,773 |
+| Static musl hello to first carrier call | 7,926 → 3,986 | 7,926 | 20,308 | 47,626 → 42,427 | 122,026 → 108,707 |
+
+The memory loop still has three stage-1 walks, two memory exits and four
+publications in each mode. The EL1 and musl fixtures retain their register
+state and first carrier exits, including the forwarded write and ppoll
+mailboxes. QEMU shows a large hot-loop gain alongside lower throughput on
+both production fixtures. Native ARM64 release throughput is unmeasured.
