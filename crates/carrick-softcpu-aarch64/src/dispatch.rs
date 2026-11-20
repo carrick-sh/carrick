@@ -372,7 +372,15 @@ pub fn run<X: ExecuteBlock>(
                 }
                 cpu.pc = i.pc();
                 match handler::execute(cpu, monitor, memory, &i) {
-                    Outcome::Continue => work.retired_instructions += 1,
+                    Outcome::Continue => {
+                        work.retired_instructions += 1;
+                        // A flat access bypasses the TLB. Drop the previous
+                        // regime now, even if the guest later restores its
+                        // exact register values before re-enabling stage 1.
+                        if memory.tlb.is_some() && !mmu::enabled(cpu) {
+                            memory.tlb = None;
+                        }
+                    }
                     Outcome::Fault => {}
                     Outcome::Event(event) => {
                         match event {

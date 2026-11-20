@@ -18,8 +18,10 @@ A second dispatcher witness loads the same VA under two TTBR0/ASID values,
 then sets PAN and checks that the ordinary load aborts. A hit is tagged by
 both raw TTBRs, TCR, SCTLR, VA page, access plane, EL and the applicable
 PAN/UAO and access class. A regime change or TLBI clears the local cache.
-The dispatcher drops it at every provider handoff. AT and DC ZVA still use
-the walker for their required leaf attributes.
+The dispatcher drops it when stage 1 is disabled and at every provider
+handoff. The disable witness switches roots in flat mode, restores the
+original registers and observes new code and data walks after re-enabling
+stage 1. AT and DC ZVA still use the walker for their required leaf attributes.
 
 The fast result is a guest physical address. The memory provider still
 checks backing for every access. Cache use requires the provider to own the
