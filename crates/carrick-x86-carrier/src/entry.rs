@@ -410,9 +410,31 @@ pub(crate) fn doorbell(port: u16, frame: &NativeFrame) {
     write_port(port, frame, admit_exit());
 }
 
+pub(crate) fn current_slot_and_zone() -> Option<(
+    carrick_sched_core::SlotId,
+    &'static carrick_el1::memory::reservations::X86Cpl0Zone,
+    carrick_guest_arch::CounterTick,
+)> {
+    use carrick_guest_arch::InterruptBackend;
+    let binding = carrick_el1::isa::x86::context::current_cpu_binding()?;
+    let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))?;
+    let now = carrick_el1::isa::x86::X86Backend.counter().ok()?;
+    let zone = unsafe {
+        &*(carrick_el1::isa::x86_kernel_layout().zone.raw()
+            as *const carrick_el1::memory::reservations::X86Cpl0Zone)
+    };
+    Some((slot, zone, now))
+}
+
 /// Forward an unhandled Linux syscall to the host through the declared forward port.
 pub fn forward_to_host(frame: &NativeFrame) {
+    if let Some((slot, zone, now)) = current_slot_and_zone() {
+        zone.cpu_leave_slot(slot, now);
+    }
     doorbell(FORWARD_PORT, frame);
+    if let Some((slot, zone, now)) = current_slot_and_zone() {
+        zone.cpu_enter_ring(slot, zone.current_record_ref(slot), now);
+    }
 }
 
 /// Notify the host of completed work through the declared work port.
@@ -686,6 +708,16 @@ pub fn carrier_enter<P: Personality>(
     if binding.entries.load(Ordering::Acquire) == 0 {
         user_fault_gate::install_persistent();
     }
+    if let Some((slot, zone, now)) = current_slot_and_zone() {
+        if zone.counter_frequency().is_none()
+            && let Ok(freq) = carrick_guest_arch::InterruptBackend::frequency(
+                &mut carrick_el1::isa::x86::X86Backend,
+            )
+        {
+            zone.publish_counter_frequency(freq);
+        }
+        zone.cpu_enter_ring(slot, zone.current_record_ref(slot), now);
+    }
 
     // SAFETY: bootstrap retains these supervisor-only records until the
     // VM/vCPUs retire; each binding names its issued current task.
@@ -802,5 +834,8 @@ pub fn carrier_validate_return<P: Personality>(frame: &mut NativeFrame, xsave: &
     if carrick_el1::isa::x86::interrupt::check_user_return_generation().is_err() {
         doorbell(FATAL_PORT, frame);
         halt();
+    }
+    if let Some((slot, zone, now)) = current_slot_and_zone() {
+        zone.cpu_enter_user(slot, zone.current_record_ref(slot), now);
     }
 }

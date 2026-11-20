@@ -140,6 +140,11 @@ pub unsafe fn carrier_receive_irq<P: Personality>(
         }
         crate::entry::halt();
     }
+    if frame.cs & 3 == 3
+        && let Some((slot, zone, now)) = crate::entry::current_slot_and_zone()
+    {
+        zone.cpu_enter_ring(slot, zone.current_record_ref(slot), now);
+    }
     if vector == u32::from(interrupts::TIMER_VECTOR) {
         let binding = carrick_el1::isa::x86::context::current_cpu_binding()
             .unwrap_or_else(|| crate::entry::halt());
@@ -164,5 +169,10 @@ pub unsafe fn carrier_receive_irq<P: Personality>(
             );
         }
         crate::entry::halt();
+    }
+    if frame.cs & 3 == 3
+        && let Some((slot, zone, now)) = crate::entry::current_slot_and_zone()
+    {
+        zone.cpu_enter_user(slot, zone.current_record_ref(slot), now);
     }
 }

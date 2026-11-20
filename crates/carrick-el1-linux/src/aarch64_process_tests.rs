@@ -2551,7 +2551,294 @@ fn native_fork_child_cputime_and_times_reach_time_handler() {
     let (ticks, refusals) = native_fork_child_time_result(times, 0, 0);
     assert!(ticks > 0, "native child times(NULL) returned {ticks}");
     assert_eq!(refusals, 0);
-    assert_eq!(native_fork_child_time_result(times, 1, 0), (-14, 0));
+    assert_eq!(
+        native_fork_child_time_result(times, carrick_guest_arch::USER_CEILING, 0),
+        (-14, 0)
+    );
+}
+
+#[test]
+fn native_fork_child_cputime_and_times_account_user_system_and_children() {
+    use carrick_guest_arch::CounterTick;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let task = CurrentTask::new();
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let crossing = TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000, 0x28000, 0x29000,
+        0x2a000, 0x2b000, 0x2c000, 0x2d000, 0x2e000, 0x2f000,
+    ]);
+    let mut root_service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let LifecycleOutcome::Returned { result, .. } = runtime
+        .enter(source, &fixture.task, parked, &mut root_service)
+        .unwrap()
+        .fork(ProcessForkChildTid::NONE)
+    else {
+        panic!("root fork must return child");
+    };
+    let parent_key = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let parent = runtime.task_binding(parent_key).unwrap();
+    let child_key = runtime
+        .namespace_child_key(parent_key, result.raw() as u32)
+        .unwrap();
+    let child = runtime.task_binding(child_key).unwrap();
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent.record.id)
+            .is_queued()
+    );
+
+    // Fork a grandchild from the native child, charge it 40 ms user + 15 ms system,
+    // exit it, and reap it so child's children_rusage is populated.
+    activate(source, &task, &child);
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        &task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let LifecycleOutcome::Returned {
+        result: grandchild_pid,
+        ..
+    } = runtime
+        .enter(source, &task, child.words, &mut child_service)
+        .unwrap()
+        .fork(ProcessForkChildTid::NONE)
+    else {
+        panic!("child fork must return grandchild");
+    };
+    let grandchild_key = runtime
+        .namespace_child_key(child_key, grandchild_pid.raw() as u32)
+        .unwrap();
+    let grandchild = runtime.task_binding(grandchild_key).unwrap();
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child.record.id)
+            .is_queued()
+    );
+
+    let hz = carrick_guest_arch::CounterFrequency::new(NonZeroU64::new(1_000_000_000).unwrap());
+    fixture.zone.publish_counter_frequency(hz);
+    let activate_target = |target: &super::native_process_runtime::NativeRecordBinding<
+        AddressContext<RootGpa>,
+        Aarch64ParkedContext,
+    >| {
+        loop {
+            let switched = fixture.zone.switch_in_full(fixture.slot).unwrap();
+            if switched.record == target.record.id {
+                break;
+            }
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(fixture.slot, switched.record)
+                    .is_queued()
+            );
+        }
+        fixture
+            .zone
+            .install_space(fixture.slot, target.address.mm.raw().get())
+            .unwrap();
+        let identity = fixture.zone.record(target.record.id).identity();
+        task.set(
+            El1TaskId::from_linux_tid(target.key.id.raw()),
+            carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+            identity.file_table,
+        );
+        task.mm
+            .key
+            .store(target.address.mm.raw().get(), Ordering::Release);
+        task.mm
+            .thread_generation
+            .store(identity.serial, Ordering::Release);
+        task.publish_visible_pid(target.visible_pid);
+        task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+    };
+
+    activate_target(&grandchild);
+    fixture.zone.cpu_enter_user(
+        fixture.slot,
+        Some(grandchild.record),
+        CounterTick::new(100_000_000),
+    );
+    fixture.zone.cpu_enter_ring(
+        fixture.slot,
+        Some(grandchild.record),
+        CounterTick::new(140_000_000),
+    );
+    fixture
+        .zone
+        .cpu_leave_slot(fixture.slot, CounterTick::new(155_000_000));
+    *crossing.zone.lock().unwrap() = Some(fixture.zone);
+    *crossing.child.lock().unwrap() = Some((
+        super::common_entry::execution_binding(&task),
+        grandchild.address,
+    ));
+    let mut grandchild_service = Aarch64NativeProcessService::with_crossing(
+        &task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let _ = runtime
+        .enter(source, &task, grandchild.words, &mut grandchild_service)
+        .unwrap()
+        .exit_group(0);
+
+    activate_target(&child);
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        &task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let reaped = runtime
+        .enter(source, &task, child.words, &mut child_service)
+        .unwrap()
+        .wait4(
+            ProcessWaitPid::from_syscall_argument(grandchild_pid.raw() as u64),
+            UserVa::new(0),
+            LinuxWaitOptions::empty(),
+            UserVa::new(0),
+        );
+    assert!(matches!(
+        reaped,
+        LifecycleOutcome::Returned { result, .. } if result.raw() == grandchild_pid.raw()
+    ));
+
+    // Charge child 35 ms user + 22 ms system (57 ms own CPU total).
+    fixture.zone.cpu_enter_user(
+        fixture.slot,
+        Some(child.record),
+        CounterTick::new(200_000_000),
+    );
+    fixture.zone.cpu_enter_ring(
+        fixture.slot,
+        Some(child.record),
+        CounterTick::new(235_000_000),
+    );
+    fixture.zone.cpu_enter_ring(
+        fixture.slot,
+        Some(child.record),
+        CounterTick::new(257_000_000),
+    );
+
+    let mut entry = runtime
+        .enter(source, &task, child.words, &mut child_service)
+        .unwrap();
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+
+    for clock in [
+        carrick_syscall_abi::LINUX_CLOCK_PROCESS_CPUTIME_ID,
+        carrick_syscall_abi::LINUX_CLOCK_THREAD_CPUTIME_ID,
+    ] {
+        let mut ts = [0u64; 2];
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
+            slot: fixture.slot.index() as u64,
+            ..Default::default()
+        };
+        frame.x[8] = carrick_abi::syscall::nr::CLOCK_GETTIME.raw();
+        frame.x[0] = clock;
+        frame.x[1] = ts.as_mut_ptr() as u64;
+        let route = super::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None,
+            Some(&fixture),
+            Some(&mut entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(frame.x[0], 0);
+        assert_eq!(ts, [0, 57_000_000]);
+    }
+
+    let mut tms = carrick_syscall_abi::LinuxTms::zeroed();
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        slot: fixture.slot.index() as u64,
+        ..Default::default()
+    };
+    frame.x[8] = carrick_abi::syscall::nr::TIMES.raw();
+    frame.x[0] = core::ptr::addr_of_mut!(tms) as u64;
+    let route = super::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+        None,
+        Some(&fixture),
+        Some(&mut entry),
+        Some(source),
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert!(matches!(
+        route,
+        CompletionRoute::Served | CompletionRoute::WithWork
+    ));
+    assert_eq!(frame.x[0] as i64, 125);
+    assert_eq!({ tms.tms_utime }, 3);
+    assert_eq!({ tms.tms_stime }, 2);
+    assert_eq!({ tms.tms_cutime }, 4);
+    assert_eq!({ tms.tms_cstime }, 1);
 }
 
 #[test]

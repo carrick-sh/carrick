@@ -1678,37 +1678,6 @@ impl LinuxRlimit {
     ::zerocopy::Immutable,
     ::zerocopy::Unaligned,
 )]
-pub struct LinuxTms {
-    pub tms_utime: i64,
-    pub tms_stime: i64,
-    pub tms_cutime: i64,
-    pub tms_cstime: i64,
-}
-
-impl LinuxTms {
-    pub const fn zeroed() -> Self {
-        Self {
-            tms_utime: 0,
-            tms_stime: 0,
-            tms_cutime: 0,
-            tms_cstime: 0,
-        }
-    }
-}
-
-#[repr(C, packed)]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-)]
 pub struct LinuxRusage {
     pub ru_utime: LinuxTimeval,
     pub ru_stime: LinuxTimeval,
@@ -3395,7 +3364,6 @@ mod linux_resource_tests {
 pub const LINUX_RUSAGE_SELF: i32 = 0;
 pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
 pub const LINUX_RUSAGE_THREAD: i32 = 1;
-pub const LINUX_CLK_TCK: i64 = 100;
 pub const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 pub const LINUX_PROC_SUPER_MAGIC: i64 = 0x9fa0;
 pub const LINUX_PIPEFS_MAGIC: i64 = 0x50495045;

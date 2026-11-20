@@ -22,6 +22,9 @@ use crate::native_process;
 pub fn schedule(slot: SlotId) -> ! {
     let source = carrick_x86_carrier::native_execution::source(slot);
     let current = task();
+    if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
+        source.zone.cpu_leave_slot(slot, now);
+    }
     #[cfg(feature = "test-support")]
     crate::anonymous::release_injected_edit_wait(source, current);
     #[cfg(feature = "test-support")]
@@ -51,9 +54,16 @@ pub fn schedule(slot: SlotId) -> ! {
         if let Some(selected) = source.zone.take_idle_work(slot) {
             source.zone.leave_idle(slot);
             let record = source.zone.record_ref(selected.record);
+            if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
+                source.zone.cpu_bind_record(slot, record, now);
+            }
             let runtime = native_process::runtime_for_record(source.zone, record);
             // SAFETY: switch_in_full transferred this exact record to this slot.
             let Some(mut state) = (unsafe { runtime.record_binding(record) }) else {
+                if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend)
+                {
+                    source.zone.cpu_leave_slot(slot, now);
+                }
                 source.zone.clear_current(slot);
                 continue;
             };
@@ -166,6 +176,11 @@ pub fn schedule(slot: SlotId) -> ! {
                         words.set_syscall_return(result.raw() as u64)
                     }
                     carrick_el1_linux::native_process_runtime::NativeResume::Left(root_exit) => {
+                        if let Ok(now) =
+                            carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend)
+                        {
+                            source.zone.cpu_leave_slot(slot, now);
+                        }
                         if let Some(status) = root_exit {
                             publish_root_exit(current, status.to_termination_status());
                         }
@@ -255,6 +270,10 @@ pub fn schedule(slot: SlotId) -> ! {
                 }
             }
             if suspended {
+                if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend)
+                {
+                    source.zone.cpu_leave_slot(slot, now);
+                }
                 #[cfg(feature = "test-support")]
                 crate::anonymous::release_injected_edit_wait(source, current);
                 settle_current_work(current);
@@ -262,11 +281,22 @@ pub fn schedule(slot: SlotId) -> ! {
             }
             carrick_x86_carrier::native_execution::migrate(slot);
             let zone = source.zone;
-            match unsafe { context::resume_parked(words, state.address, || arm_slice(zone, slot)) }
-            {
+            match unsafe {
+                context::resume_parked(words, state.address, || {
+                    if let Ok(now) =
+                        carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend)
+                    {
+                        zone.cpu_enter_user(slot, Some(record), now);
+                    }
+                    arm_slice(zone, slot);
+                })
+            } {
                 Ok(never) => match never {},
                 Err(_) => fatal_boot(),
             }
+        }
+        if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
+            source.zone.cpu_leave_slot(slot, now);
         }
         settle_current_work(current);
         leave_space(source);
