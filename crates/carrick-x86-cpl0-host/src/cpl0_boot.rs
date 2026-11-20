@@ -1407,6 +1407,17 @@ mod design_doc_tests {
 mod forward_execution_tests {
     use super::*;
 
+    #[test]
+    fn child_forward_rule_uses_issued_entry_key() {
+        let mm = MmGeneration::new(NonZeroU64::new(302).unwrap());
+        let stopped = carrick_el1_abi::EntryTaskKey::from_raw(43);
+        let issued = carrick_el1_abi::EntryTaskKey::from_raw(42);
+        assert_eq!(
+            forward_leader_task(None, mm, stopped).unwrap(),
+            issued
+        );
+    }
+
     /// #2142: after a root `execve`, the forward leader rule names the run
     /// root's TID for the successor MM only; the predecessor MM is no longer
     /// the root's, and a stale predecessor cannot rebind it again.
