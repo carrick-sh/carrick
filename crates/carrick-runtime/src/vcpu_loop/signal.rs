@@ -1407,6 +1407,10 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             selected,
                             request.mm_key,
                         ) {
+                            PublicationNextAction::Published => fail_publication(
+                                "non-published frame grant reached the published policy action"
+                                    .into(),
+                            ),
                             PublicationNextAction::ParkOnMmRelease { mm_key } => {
                                 if mm_key != request.mm_key {
                                     fail_publication(
