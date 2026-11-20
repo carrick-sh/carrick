@@ -12,6 +12,7 @@ pub mod mm;
 pub mod sched;
 pub mod signal;
 pub mod sleep;
+mod time;
 
 pub mod pending_file;
 

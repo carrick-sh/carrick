@@ -3714,6 +3714,15 @@ impl<
         }
         Some(self)
     }
+    fn time_native(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::lifecycle::LifecycleNative<'a>> {
+        let binding = carrick_personality_linux::lifecycle::LifecycleNative::binding(self)?;
+        if self.process.as_deref()?.binding() != binding {
+            return None;
+        }
+        Some(self)
+    }
     fn signal_native(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::signal::SignalNative<'a>> {
