@@ -458,3 +458,18 @@ realtime puts it between two raw monotonic samples and that the offset
 survives fork and exec. The ARM VM-free witness checks null-output routing
 with a live parent and child. ARM exec-successor calibration is tracked
 separately by #2571.
+
+### Realtime aliases
+
+The native gettimeofday and x86 time calls use the same realtime sample as
+clock_gettime. Gettimeofday converts to microseconds and accepts a null
+timeval or timezone. When both are present, exact-MM copyout retains its
+position across the two records. Syscall 201 returns the sampled seconds
+and writes the same value if the pointer is present. The KVM witnesses
+bracket each vDSO result with raw calls in the native root and fork child.
+The ARM dispatch witness checks the two null operands in a native child.
+
+CPU-time clocks and times need live native CPU accounting. The native
+process owner has a rusage row and reaping charges, but its running member
+records have no user/system charge path or per-thread CPU totals. The host
+executor's thread ledger does not attribute execution to native members.
