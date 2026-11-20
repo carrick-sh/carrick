@@ -903,7 +903,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     fault_kind: Option<carrick_mmu_core::aarch64::Stage1FaultKind>,
     tid: carrick_kernel::kernel::LinuxTid,
     mutation: &mut carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
-) -> Result<Result<bool, carrick_kernel::dispatch::mem::ReservationBusy>, RuntimeError> {
+) -> Result<Result<bool, carrick_el1_abi::PortalOwnerWait>, RuntimeError> {
     use carrick_observability::probes::HvpatchFirstTouchDeliverReason as DeliverReason;
     let notify_first_touch_deliver = |reason: DeliverReason| {
         crate::probes::hvpatch_first_touch_deliver(address, reason, tid.raw());
@@ -925,7 +925,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         Ok(()) => {}
         Err(DispatchError::ReservationBusy(busy)) => {
             cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
-            return Ok(Err(busy));
+            return Ok(Err(busy.wait));
         }
         Err(error) => return Err(error.into()),
     }
@@ -1000,7 +1000,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             }
                             .into());
                         }
-                        return Ok(Err(busy));
+                        return Ok(Err(busy.wait));
                     }
                 };
                 let Some(plan) = planned else {
@@ -1171,6 +1171,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     record_decision(FrameGrantDecision::FatalPublication);
                     fail_frame_grant_publication(mailbox, request, detail)
                 };
+                let publication_decline = std::cell::Cell::new(None);
                 let decline_publication = |decision| -> Result<bool, TrapError> {
                     record_decision(decision);
                     Ok(false)
@@ -1224,9 +1225,17 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             Ok::<bool, TrapError>(true)
                         }
                         El1FrameGrantPublished::Unsupported => {
+                            publication_decline.set(Some(
+                                carrick_core::mm::frames::PublicationDecline::unsupported(),
+                            ));
                             decline_publication(FrameGrantDecision::PublishUnsupported)
                         }
                         El1FrameGrantPublished::Refused(reason) => {
+                            publication_decline.set(Some(
+                                carrick_core::mm::frames::PublicationDecline::from_descriptor(
+                                    reason,
+                                ),
+                            ));
                             decline_publication(FrameGrantDecision::PublishRefused(reason))
                         }
                         // Keep the physical producer inside this bounded
@@ -1256,9 +1265,15 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                                 Err(GuestPublishError::NotApplied { outcome, .. }) => {
                                     let decision = match outcome {
                                         CleanRefusal::Refused(reason) => {
+                                            publication_decline.set(Some(
+                                                carrick_core::mm::frames::PublicationDecline::from_descriptor(reason),
+                                            ));
                                             FrameGrantDecision::DescriptorRefused(reason)
                                         }
                                         CleanRefusal::RolledBack(reason) => {
+                                            publication_decline.set(Some(
+                                                carrick_core::mm::frames::PublicationDecline::from_descriptor(reason),
+                                            ));
                                             FrameGrantDecision::DescriptorRolledBack(reason)
                                         }
                                     };
@@ -1362,15 +1377,58 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         });
                     match completed {
                         FrameGrantCompletion::PublicationDeclined => {
-                            if !mailbox.release_declined_publication(request) {
+                            use carrick_core::mm::frames::{PublicationDecline, PublicationNotNow};
+                            match publication_decline.take().unwrap_or_else(|| {
                                 fail_publication(
-                                    "rolled-back frame grant lost its exact mailbox claim".into(),
-                                );
+                                    "declined frame grant lost its typed refusal".into(),
+                                )
+                            }) {
+                                PublicationDecline::NotNow(PublicationNotNow::Contended) => {
+                                    if !mailbox.release_declined_publication(request) {
+                                        fail_publication(
+                                            "rolled-back frame grant lost its exact mailbox claim"
+                                                .into(),
+                                        );
+                                    }
+                                    let wait = dispatcher
+                                        .frame_grant_release_wait(&permit)
+                                        .unwrap_or_else(|error| {
+                                            fail_publication(format!(
+                                                "contended frame grant lost its MM release source: {error:?}"
+                                            ))
+                                        });
+                                    return Ok(Err(wait));
+                                }
+                                PublicationDecline::NotNow(PublicationNotNow::Capacity(_)) => {
+                                    // Capacity without a proven growth or a
+                                    // smaller retained plan is terminal for
+                                    // this request. Publishing the refusal is
+                                    // bounded and cannot livelock the fault.
+                                    publish_frame_grant_refusal(
+                                        mailbox,
+                                        request,
+                                        carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
+                                    );
+                                    return Ok(Ok(true));
+                                }
+                                PublicationDecline::InheritedPrepared => {
+                                    if !mailbox.release_declined_publication(request) {
+                                        fail_publication(
+                                            "inherited frame grant lost its exact mailbox claim"
+                                                .into(),
+                                        );
+                                    }
+                                    return Ok(Ok(true));
+                                }
+                                PublicationDecline::Terminal(_) => {
+                                    publish_frame_grant_refusal(
+                                        mailbox,
+                                        request,
+                                        carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
+                                    );
+                                    return Ok(Ok(true));
+                                }
                             }
-                            // Contention and capacity are not terminal. An
-                            // Occupied fault page likewise needs a fresh plan
-                            // from the now-live descriptor image.
-                            return Ok(Ok(true));
                         }
                         FrameGrantCompletion::SlotNotWorking
                         | FrameGrantCompletion::StaleRequest
@@ -1408,7 +1466,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         let permit = mutation.host_alias_permit();
         let plan = match dispatcher.resident_fault_plan(&permit, address) {
             Ok(plan) => plan,
-            Err(busy) => return Ok(Err(busy)),
+            Err(busy) => return Ok(Err(busy.wait)),
         };
         if let Some(plan) = plan {
             let page = plan.page();
