@@ -2731,6 +2731,12 @@ jobs:
           root=$(mktemp -d "$RUNNER_TEMP/soft-a64-glibc.XXXXXX")
           scripts/ci/fetch-arm64-cross-libc.sh "$root"
           printf 'CARRICK_A64_DYN_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+      - name: Export pinned arm64 CPython fixture
+        if: ${{ !cancelled() }}
+        run: |
+          root=$(mktemp -d "$RUNNER_TEMP/soft-a64-python.XXXXXX")
+          scripts/ci/fetch-arm64-python.sh "$root"
+          printf 'CARRICK_A64_PYTHON_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
       - name: Production EL1 image boot probe
         if: ${{ !cancelled() }}
         run: |
@@ -2748,7 +2754,7 @@ jobs:
           export CARRICK_LLVM_OBJDUMP="$sysroot/lib/rustlib/$host/bin/llvm-objdump"
           # The loader-span census witness needs the span file that only
           # `just a64-census-gate` exports; the A64 census gate job runs it.
-          CARRICK_A64_ELF="$PWD/$elf" cargo test -p carrick-softcpu-aarch64 -p carrick-softcpu-aarch64-host --tests \
+          CARRICK_A64_ELF="$PWD/$elf" cargo test --release -p carrick-softcpu-aarch64 -p carrick-softcpu-aarch64-host --tests \
             -- --ignored --nocapture \
             --skip generated_loader_vector_spans_are_typed \
             --skip production_loader_vector_spans_split_and_translate_with_no_undefined_word \
