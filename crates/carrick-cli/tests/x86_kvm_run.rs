@@ -28,10 +28,17 @@ fn append_tar(builder: &mut tar::Builder<&mut Vec<u8>>, name: &str, bytes: &[u8]
 }
 
 fn empty_image_archive() -> Vec<u8> {
+    image_archive_with_executable(None)
+}
+
+fn image_archive_with_executable(executable: Option<&std::path::Path>) -> Vec<u8> {
     let mut layer = Vec::new();
     {
         let mut tar = tar::Builder::new(&mut layer);
         append_tar(&mut tar, ".keep", b"");
+        if let Some(executable) = executable {
+            tar.append_path_with_name(executable, "successor").unwrap();
+        }
         tar.finish().unwrap();
     }
     let config = br#"{"architecture":"amd64","os":"linux","config":{"Cmd":["/hello"]}}"#;
@@ -700,6 +707,27 @@ fn mounted_static_x86_thread_exit_clears_and_wakes_clear_tid() {
 #[test]
 fn mounted_static_x86_raise_uses_set_tid_address_returned_tid() {
     compare_mounted_assembly_with_native("x86_clear_tid_raise.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_native_executable_link_follows_fork_and_exec() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("exe-link");
+    let successor = dir.path().join("successor");
+    let fixture = "x86_native_executable_link.S";
+    compile_assembly(fixture, &elf);
+    compile_assembly_with_flags(fixture, &successor, &["-DSUCCESSOR"]);
+    let archive = image_archive_with_executable(Some(&successor));
+    let (guest, _) = run_mounted_binary_in_archive(&elf, "native-exe-link", false, &archive);
+    assert_eq!(
+        guest.status.code(),
+        Some(7),
+        "executable link: exit 218 is child ENOSYS, 219 is root ENOSYS,          220 is successor ENOSYS, 93 is exec failure, 94 is length/content,          95 is truncation; stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
 }
 
 #[test]
@@ -2104,9 +2132,18 @@ fn run_mounted_binary_with_capture(
     run_id: &str,
     json: bool,
 ) -> (std::process::Output, Option<std::path::PathBuf>) {
+    run_mounted_binary_in_archive(elf, run_id, json, &empty_image_archive())
+}
+
+fn run_mounted_binary_in_archive(
+    elf: &std::path::Path,
+    run_id: &str,
+    json: bool,
+    image_archive: &[u8],
+) -> (std::process::Output, Option<std::path::PathBuf>) {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("image.tar");
-    std::fs::write(&archive, empty_image_archive()).unwrap();
+    std::fs::write(&archive, image_archive).unwrap();
     let cli = assert_cmd::cargo::cargo_bin("carrick");
     let home = dir.path().join("home");
     let load = Command::new(&cli)
