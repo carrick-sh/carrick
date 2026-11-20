@@ -362,7 +362,15 @@ impl Cpl0Carrier {
         argv: &[String],
         env: &[String],
     ) -> Result<usize, TrapError> {
-        carrick_x86_cpl0_host::cpl0_boot::initial_extent_bytes_for(image, argv, env)
+        use carrick_mem::vdso::{X86NativeVvar, x8664_vdso_image_bytes};
+        let vdso = x8664_vdso_image_bytes();
+        let vvar = [0; X86NativeVvar::BYTE_LEN];
+        let sized = image.clone().with_vdso(&vvar, &vdso);
+        carrick_x86_cpl0_host::cpl0_boot::initial_extent_bytes_for(
+            sized.as_ref().unwrap_or(image),
+            argv,
+            env,
+        )
     }
     pub fn physical_slot_count(&self) -> usize {
         self.custody.memory().slot_count()
@@ -746,7 +754,50 @@ impl Cpl0Carrier {
         env: &[String],
         limits: InitialReservationLimits,
     ) -> Result<(), TrapError> {
-        carrick_x86_cpl0_host::cpl0_boot::load_guest_mm(self, image, argv, env, limits)
+        self.load_guest_mm_for_clock(image, argv, env, limits, Some(0))
+    }
+
+    /// Map the fast path only for a native clock domain. The supplied
+    /// realtime delta is owned by the already admitted container clock.
+    pub fn load_guest_mm_for_clock(
+        &mut self,
+        image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+        argv: &[String],
+        env: &[String],
+        limits: InitialReservationLimits,
+        native_realtime_delta: Option<i64>,
+    ) -> Result<(), TrapError> {
+        let vvar = native_realtime_delta.and_then(|delta| self.calibrate_vvar(delta));
+        let vdso = carrick_mem::vdso::x8664_vdso_image_bytes();
+        let vvar_bytes = vvar.map(carrick_mem::vdso::X86NativeVvar::bytes);
+        let with_vdso = vvar_bytes
+            .as_ref()
+            .and_then(|vvar| image.clone().with_vdso(vvar, &vdso).ok())
+            .filter(|image| image.regions.len() <= carrick_core_abi::X86_INITIAL_MAX_REGIONS);
+        carrick_x86_cpl0_host::cpl0_boot::load_guest_mm(
+            self,
+            with_vdso.as_ref().unwrap_or(image),
+            argv,
+            env,
+            limits,
+        )?;
+        self.custody
+            .set_clock_vvar(vvar.filter(|_| with_vdso.is_some()));
+        Ok(())
+    }
+
+    fn calibrate_vvar(&self, delta: i64) -> Option<carrick_mem::vdso::X86NativeVvar> {
+        let freq = NonZeroU64::new(self.binding(0).tsc_hz.load(Ordering::Acquire))?;
+        let tsc = self.cpus[0]
+            .read_msr(carrick_x86::vdso::MSR_IA32_TSC)
+            .ok()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        let wall_ns = u64::try_from(now.as_nanos()).ok()?;
+        Some(carrick_mem::vdso::X86NativeVvar::new(
+            freq, tsc, wall_ns, delta,
+        ))
     }
 
     /// Resume the published initial MM through the existing shared Linux

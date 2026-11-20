@@ -854,7 +854,7 @@ pub fn validate_initial_reply(
         || reply.executable_entry != request.executable_entry
         || reply.interpreter_base != request.interpreter_base
         || reply.executable_region_count != request.executable_region_count
-        || reply.reserved != request.reserved
+        || reply.image_features != request.image_features
         || reply.phdr != request.phdr
         || reply.phent != request.phent
         || reply.phnum != request.phnum
@@ -910,6 +910,7 @@ pub fn initial_stack_pages(
         random: [0; 16],
         stack_top: INITIAL_STACK_TOP,
         stack_size: INITIAL_STACK_SIZE,
+        has_vdso: image.has_vdso,
     })
     .map_err(|error| fail(format!("initial stack sizing: {error:?}")))?;
     // The guest owner backs the configured bootstrap stack, including its
@@ -4391,6 +4392,7 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     pub(crate) ram: Arc<GuestRam>,
     birth_live: BirthSourceRevocation,
     initial_extent: Option<(BackingHandle, usize)>,
+    pub(crate) clock_vvar: Option<carrick_mem::vdso::X86NativeVvar>,
     _kernel_region: Option<BackingHandle>,
     files: RetainedFileRegion,
     frame_inventory: Arc<dyn PhysicalFrameInventory>,
@@ -5847,6 +5849,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             ram,
             birth_live: BirthSourceRevocation::new(),
             initial_extent,
+            clock_vvar: None,
             _kernel_region: kernel_region,
             files: files.0,
             frame_inventory,
@@ -5953,6 +5956,10 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     pub fn rollback_fault(&self) -> Arc<carrick_hal::physical_grants::PhysicalGrantRollback> {
         Arc::clone(&self.0.initial_rollback_fault)
     }
+    pub fn set_clock_vvar(&mut self, clock_vvar: Option<carrick_mem::vdso::X86NativeVvar>) {
+        self.0.clock_vvar = clock_vvar;
+    }
+
     pub fn initial_extent(&self) -> Option<(BackingHandle, usize)> {
         self.0.initial_extent
     }
@@ -7353,7 +7360,11 @@ pub fn load_guest_mm<C: Cpl0BootCarrier>(
             executable_region_count: image.executable_region_count as u32,
             executable_entry: image.executable_entry,
             interpreter_base: image.interpreter_base,
-            reserved: 0,
+            image_features: if image.has_vdso {
+                carrick_core_abi::X86_INITIAL_HAS_VDSO
+            } else {
+                0
+            },
             entry: image.entry,
             phdr: image.phdr,
             phent: image.phent,
