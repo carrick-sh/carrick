@@ -24,7 +24,7 @@ use crate::{
     RegisterBranch, StructureLayout, StructureMemory, StructureWriteback, SystemDirection,
     SystemRegister, TlbiOperation, Width,
 };
-use carrick_guest_arch::{Gpa, GuestVa};
+use carrick_guest_arch::{FrameGpa, Gpa, GuestVa};
 use carrick_mmu_core::aarch64::stage1_walk::Aarch64Fault;
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
 
@@ -52,8 +52,14 @@ pub trait GuestMemory {
     /// The owner must never reuse a generation for changed bytes or backing
     /// during a run, and must exclude concurrent mutation during dispatch.
     /// Untracked memory is translated afresh.
-    fn code_generation(&self, _frame: carrick_guest_arch::FrameGpa) -> Option<CodeGeneration> {
+    fn code_generation(&self, _frame: FrameGpa) -> Option<CodeGeneration> {
         None
+    }
+
+    /// Activate tracking for a frame before publishing a resident block.
+    /// Owners that already track every frame can return the current generation.
+    fn mark_code_page(&mut self, frame: FrameGpa) -> Option<CodeGeneration> {
+        self.code_generation(frame)
     }
 
     /// Whether this provider serves one local stage-1 seat for the duration

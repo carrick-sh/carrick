@@ -337,7 +337,15 @@ pub fn run<X: ExecuteBlock>(
                     Err(error) => break Stop::Execute(error),
                 };
                 let prepared = (block, executable);
-                if let Some(identity) = code.filter(|_| fetched_whole_block) {
+                let identity = if retain_blocks && fetched_whole_block {
+                    memory
+                        .inner
+                        .mark_code_page(frame)
+                        .map(|generation| CodeIdentity { frame, generation })
+                } else {
+                    None
+                };
+                if let Some(identity) = identity {
                     &cache
                         .insert(key, ResidentBlock { identity, prepared })
                         .prepared

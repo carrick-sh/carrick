@@ -46,11 +46,11 @@ use carrick_softcpu_aarch64::translate::{
     BlockExit, BlockLimits, ExitReason, InstructionClass, TranslatedBlock,
 };
 use carrick_softcpu_aarch64::{ExceptionKind, Gpr, OperandRegister};
-use carrick_softcpu_aarch64_host::{HostBlockRunner, HostCode, HostError};
+use carrick_softcpu_aarch64_host::{HostBlockRunner, HostCode, HostError, SoftMemory};
 use core::mem::offset_of;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 #[path = "fixtures/dynamic_root.rs"]
 mod dynamic_root;
@@ -60,62 +60,48 @@ const PAGE: u64 = 4096;
 const INITIAL_METADATA_END: u64 =
     EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64;
 
-struct PhysicalPage {
-    bytes: [u8; PAGE as usize],
-    generation: u64,
-}
-
-impl PhysicalPage {
-    fn write(&mut self, offset: usize, bytes: &[u8]) {
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .expect("code generation exhausted");
-        self.bytes[offset..][..bytes.len()].copy_from_slice(bytes);
-    }
-}
-
-/// Page-granular guest physical memory: unbacked pages fault.
-#[derive(Default)]
+/// Fixture instrumentation and loader helpers around the production RAM owner.
 struct Pages {
-    pages: BTreeMap<u64, Box<PhysicalPage>>,
+    memory: SoftMemory,
     read_boot_root: bool,
 }
 
+impl Default for Pages {
+    fn default() -> Self {
+        Self {
+            memory: SoftMemory::new().expect("physical inventory"),
+            read_boot_root: false,
+        }
+    }
+}
+
 impl Pages {
-    fn map_zero(&mut self, address: u64) -> &mut PhysicalPage {
-        self.pages.entry(address & !(PAGE - 1)).or_insert_with(|| {
-            Box::new(PhysicalPage {
-                bytes: [0; PAGE as usize],
-                generation: 0,
-            })
-        })
+    fn map_zero(&mut self, address: u64) {
+        self.memory
+            .map_zero(FrameGpa::new(address & !(PAGE - 1)))
+            .expect("fixture page");
     }
 
-    fn load(&mut self, mut at: u64, mut bytes: &[u8]) {
-        while !bytes.is_empty() {
-            let offset = (at % PAGE) as usize;
-            let len = bytes.len().min(PAGE as usize - offset);
-            self.map_zero(at).write(offset, &bytes[..len]);
-            at += len as u64;
-            bytes = &bytes[len..];
+    fn load(&mut self, at: u64, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            let first = at & !(PAGE - 1);
+            let last = (at + bytes.len() as u64 - 1) & !(PAGE - 1);
+            for page in (first..=last).step_by(PAGE as usize) {
+                self.map_zero(page);
+            }
+            self.write(VirtualAddress(at), bytes)
+                .expect("fixture bytes");
         }
     }
 }
 
 impl GuestMemory for Pages {
     fn stage1_is_local(&self) -> bool {
-        true
+        self.memory.stage1_is_local()
     }
 
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault> {
-        for (i, b) in bytes.iter_mut().enumerate() {
-            let a = address.0 + i as u64;
-            let page = self.pages.get(&(a & !(PAGE - 1))).ok_or(MemoryFault {
-                address: VirtualAddress(a),
-            })?;
-            *b = page.bytes[(a % PAGE) as usize];
-        }
+        self.memory.read(address, bytes)?;
         if address.0 == LINUX_PAGE_TABLES_BASE && bytes.len() == size_of::<u64>() {
             self.read_boot_root = true;
         }
@@ -123,26 +109,15 @@ impl GuestMemory for Pages {
     }
 
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault> {
-        let mut at = address.0;
-        let mut remaining = bytes.len();
-        while remaining != 0 {
-            if !self.pages.contains_key(&(at & !(PAGE - 1))) {
-                return Err(MemoryFault {
-                    address: VirtualAddress(at),
-                });
-            }
-            let len = remaining.min((PAGE - at % PAGE) as usize);
-            at += len as u64;
-            remaining -= len;
-        }
-        self.load(address.0, bytes);
-        Ok(())
+        self.memory.write(address, bytes)
+    }
+
+    fn mark_code_page(&mut self, frame: FrameGpa) -> Option<CodeGeneration> {
+        self.memory.mark_code_page(frame)
     }
 
     fn code_generation(&self, frame: FrameGpa) -> Option<CodeGeneration> {
-        self.pages
-            .get(&frame.raw())
-            .map(|p| CodeGeneration(p.generation))
+        self.memory.code_generation(frame)
     }
 }
 

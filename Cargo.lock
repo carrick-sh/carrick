@@ -1086,6 +1086,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-softcpu-aarch64",
+ "carrick-softmmu",
  "goblin",
 ]
 
