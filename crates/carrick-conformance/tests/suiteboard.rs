@@ -1,5 +1,3 @@
-#![cfg(target_os = "linux")]
-
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
@@ -154,4 +152,49 @@ carrick_flags = ["--fs", "host"]
     {
         assert_eq!(sample["run_id"], row["carrick_run_id"]);
     }
+}
+
+#[test]
+fn suiteboard_arm64_plan() {
+    let directory = tempfile::tempdir().unwrap();
+    let pins = directory.path().join("images.toml");
+    let digest = "a".repeat(64);
+    fs::write(
+        &pins,
+        format!(
+            r#"
+"localhost:5050/cpython-test:3.12.13" = "localhost:5050/cpython-test@sha256:{digest}"
+"localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0" = "localhost:5005/carrick-nodejs-conformance@sha256:{digest}"
+"#
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-conformance"))
+        .args([
+            "--lane",
+            "hvf",
+            "--slice",
+            "py-fs",
+            "--slice",
+            "node-libuv",
+            "--require-cached-oracle",
+            "--dry-run",
+            "--suiteboard-images",
+        ])
+        .arg(pins)
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan = String::from_utf8(output.stdout).unwrap();
+    assert!(plan.contains("--platform linux/arm64"));
+    assert!(plan.contains("# cpython-posix "));
+    assert!(plan.contains("# node-libuv "));
+    assert!(plan.contains(&format!("carrick-nodejs-conformance@sha256:{digest}")));
+    assert!(!plan.contains("# cpython-subprocess "));
+    assert!(!plan.contains("# node-v8-smoke "));
 }
