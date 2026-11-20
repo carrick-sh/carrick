@@ -1448,10 +1448,10 @@ fn native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there() {
             peer.service_idle_peer_doorbell_with_host_file(
                 &exit,
                 |_, _| {},
-                &mut |origin, _, record| {
+                &mut |origin, _, executable, record| {
                     assert_eq!(origin, carrick_core_abi::service::ServiceOrigin::Descendant);
                     let served = dispatcher
-                        .serve_native_host_file(record, None)
+                        .serve_native_host_file(record, executable)
                         .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
                     marker = true;
                     Ok(served.into_reply())
@@ -2341,10 +2341,10 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
             peer.service_idle_peer_doorbell_with_host_file(
                 &exit,
                 |_, _| {},
-                &mut |origin, _, record| {
+                &mut |origin, _, executable, record| {
                     assert_eq!(origin, carrick_core_abi::service::ServiceOrigin::Descendant);
                     let served = dispatcher
-                        .serve_native_host_file(record, None)
+                        .serve_native_host_file(record, executable)
                         .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
                     served_marker = true;
                     Ok(served.into_reply())

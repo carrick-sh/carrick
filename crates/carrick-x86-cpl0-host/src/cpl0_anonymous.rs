@@ -660,7 +660,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         Ok((physical, unsafe { record.assume_init() }))
     }
 
-    fn sources_mut(
+    pub(super) fn sources_mut(
         &mut self,
         context: AddressContext<RootGpa>,
     ) -> Result<&mut carrick_hal::fork_stock::ForkHostBackingCustody, TrapError> {
@@ -1210,18 +1210,19 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let inventory_published = std::cell::Cell::new(false);
         let root_installed = std::cell::Cell::new(false);
         let mut parent_residency = Vec::new();
-        // Frame-only forks (including the raw hardware bootstrap fixture)
-        // have no byte-source authority to authenticate or retain.
-        let parent_sources = if wire.chunks_exact(32).any(|row| {
+        let has_host_backing = wire.chunks_exact(32).any(|row| {
             matches!(
                 decode_fork_custody(row),
                 Some(PortalForkCustody::HostBacking { .. })
             )
-        }) {
-            self.sources_mut(execution.context)?.clone()
-        } else {
-            Default::default()
-        };
+        });
+        // The raw hardware bootstrap has no initial task to seed and needs
+        // source custody only when its fork record actually names a backing.
+        let sources = (self.initial_task.is_some() || has_host_backing)
+            .then(|| self.sources_mut(execution.context))
+            .transpose()?;
+        let executable = sources.as_deref().and_then(|sources| sources.executable());
+        let parent_sources = sources.as_deref().filter(|_| has_host_backing).cloned();
         let refused = {
             let vm = std::cell::RefCell::new(&mut self._vm);
             self.fork_stock
@@ -1251,6 +1252,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             ),
                         };
                         let mut inherited_sources = carrick_hal::fork_stock::ForkHostBackingCustody::default();
+                        if let Some(executable) = executable {
+                            inherited_sources.bind_executable(executable);
+                        }
                         let mut edges = Vec::new();
                         let mut spans = std::collections::BTreeSet::new();
                         for words in wire.chunks_exact(32) {
@@ -1260,7 +1264,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             })?;
                             if let PortalForkCustody::HostBacking { handle, generation } = selected {
                                 let identity = carrick_el1_abi::HostBackingIdentity::new(handle, generation, 0);
-                                let source = parent_sources.retain(identity, || None).ok_or(ForkStockRefusal::Invalid)?;
+                                let source = parent_sources
+                                    .as_ref()
+                                    .and_then(|sources| sources.retain(identity, || None))
+                                    .ok_or(ForkStockRefusal::Invalid)?;
                                 inherited_sources.inherit(source);
                                 continue;
                             }

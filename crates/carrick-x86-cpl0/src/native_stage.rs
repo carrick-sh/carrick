@@ -408,11 +408,8 @@ mod tests {
         );
     }
 
-    /// readlinkat (x86_64 267) decodes as the native file family's call,
-    /// which this venue never admits: the root's keeps its host crossing, so
-    /// its untouched output page is prepared first, then the same call
-    /// crosses (#2201 with #1862). Nothing here stages it as a host-file
-    /// request.
+    /// The root's cwd readlink keeps its host crossing, so its untouched
+    /// output page is prepared before that crossing (#2201).
     #[test]
     fn a_root_readlinkat_prepares_its_output_then_crosses() {
         let (path, out) = (0x7000_0000u64, 0x7000_1000u64);
@@ -425,33 +422,34 @@ mod tests {
     }
 
     #[test]
-    fn a_child_readlinkat_prepares_untouched_output_then_keeps_the_family_route() {
-        let (path, out) = (0x7000_0000u64, 0x7000_1000u64);
-        let call = decode_x86_64(267, [!99u64, path, out, 64, 0, 0], 0x8000);
+    fn child_readlinkat_stages_the_request_before_preparing_output() {
+        let path = b"/proc/self/exe\0";
+        let out = 0x7000_1000;
+        let call = decode_x86_64(267, [!99u64, path.as_ptr() as u64, out, 64, 0, 0], 0x8000);
         let task = CurrentTask::new();
-        fn stage(
-            validator: &impl MemoryValidator,
-            call: &CanonicalCall,
-            task: &CurrentTask,
-        ) -> Option<HostFileStage> {
-            stage_call(
-                call,
-                task,
-                validator,
-                CHILD,
-                |_| false,
-                || Some(([3, 4, 5], |_| None)),
-            )
-        }
-        assert_eq!(
-            stage(&Untouched, &call, &task),
-            Some(HostFileStage::PrepareOutput { address: out })
+        let stage = stage_call(
+            &call,
+            &task,
+            &Untouched,
+            CHILD,
+            |_| false,
+            || Some(([3, 4, 5], |_| None)),
         );
-        assert_eq!(stage(&Resident, &call, &task), None);
+        let Some(HostFileStage::Request {
+            record,
+            output: Some(output),
+            ..
+        }) = stage
+        else {
+            panic!("expected retained readlink request, got {stage:?}");
+        };
+        let (header, input, _) = carrick_core_abi::host_file::request_parts(&record).unwrap();
         assert_eq!(
-            carrick_personality_linux::dispatch::route_x86(78, 0),
-            carrick_personality_linux::dispatch::Family::NativeHostFile,
+            header.op,
+            carrick_core_abi::host_file::HostFileOp::Readlinkat
         );
+        assert_eq!(input, b"/proc/self/exe");
+        assert_eq!(output.address, out);
     }
 
     #[test]
