@@ -113,24 +113,45 @@ pub use x86_context::{
     ParkedContextWords, X86_XSAVE_BYTES, signal_return_flags, valid_user_return_words,
 };
 
-/// Scalar register observation used only by an explicit scheduler census.
+/// Syscall registers normalized by the ISA-specific saved-context accessor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SavedSyscallRegisters {
+    pub number: u64,
+    pub args: [u64; 6],
+    pub pc: u64,
+    pub lr: Option<u64>,
+}
+
+/// Read-only evidence from the first linked futex entry and its record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParkedFutexSnapshot {
+    pub mm: u64,
+    pub scheduler_address: u64,
+    pub bitset: u32,
+    pub deadline_ticks: Option<u64>,
+    pub registers: SavedSyscallRegisters,
+}
+
 pub trait CensusContext {
-    fn saved_pc(&self) -> u64;
+    fn syscall_registers(&self) -> SavedSyscallRegisters;
 }
 
 impl CensusContext for ThreadCtx {
-    fn saved_pc(&self) -> u64 {
-        self.pc
+    fn syscall_registers(&self) -> SavedSyscallRegisters {
+        SavedSyscallRegisters {
+            number: self.x[8],
+            args: [
+                self.x[0], self.x[1], self.x[2], self.x[3], self.x[4], self.x[5],
+            ],
+            pc: self.pc,
+            lr: Some(self.x[30]),
+        }
     }
 }
+
 impl CensusContext for Aarch64ParkedContext {
-    fn saved_pc(&self) -> u64 {
-        self.native.pc
-    }
-}
-impl CensusContext for ParkedContextWords {
-    fn saved_pc(&self) -> u64 {
-        self.frame[15]
+    fn syscall_registers(&self) -> SavedSyscallRegisters {
+        self.native.syscall_registers()
     }
 }
 
@@ -6228,13 +6249,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         ParkedContextRead::NotParked
     }
 
-    /// Read the first futex entry and the saved PC without claiming or waking
-    /// the record. This is bounded: a busy bucket or changed record is unavailable.
-    fn parked_wait_census(&self, reference: RecordRef) -> Option<(u64, u64, u64)>
+    /// Read the first futex entry and its saved registers without claiming or
+    /// waking the record. A busy bucket or changed record is unavailable.
+    pub fn parked_futex_snapshot(&self, reference: RecordRef) -> Option<ParkedFutexSnapshot>
     where
         C: CensusContext,
     {
-        let record = self.record(reference.id);
+        let record = self.records.get(reference.id.raw() as usize)?;
         let entry_id = record.first_entry.load(Ordering::Acquire);
         if entry_id == NIL || entry_id as usize >= ZONE_ENTRIES {
             return None;
@@ -6260,14 +6281,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         // lock. Guest wake/requeue needs that lock; a host transfer must unlink
         // ALL entries before publishing Host or retiring/reusing the record.
         // Thus even a concurrent Parked -> Transferring CAS cannot permit a
-        // context writer until this guard drops. Borrow only one scalar; do
-        // not copy an ISA save area onto the EL1 stack.
-        let pc = unsafe { (&*record.ctx.get()).saved_pc() };
-        Some((
-            entry.mm.load(Ordering::Relaxed),
-            entry.uaddr.load(Ordering::Relaxed),
-            pc,
-        ))
+        // context writer until this guard drops. Copy only diagnostic
+        // registers, without putting an ISA save area on the EL1 stack.
+        let registers = unsafe { (&*record.ctx.get()).syscall_registers() };
+        Some(ParkedFutexSnapshot {
+            mm: entry.mm.load(Ordering::Relaxed),
+            scheduler_address: entry.uaddr.load(Ordering::Relaxed),
+            bitset: entry.bitset.load(Ordering::Relaxed),
+            deadline_ticks: record.deadline(),
+            registers,
+        })
     }
 
     /// A census of every live slot and every record in use, for a
@@ -6389,11 +6412,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 identity.control_slot
             )?;
             if matches!(claim, Claim::Parked { .. }) {
-                match self.parked_wait_census(reference) {
-                    Some((mm, address, pc)) => writeln!(
+                match self.parked_futex_snapshot(reference) {
+                    Some(wait) => writeln!(
                         out,
-                        "zone record {index} parked: first_wait_mm={mm} first_wait_address={address:#x} resume={:?} saved_pc={pc:#x}",
-                        record.resume_disposition()
+                        "zone record {index} parked: first_wait_mm={} first_wait_address={:#x} resume={:?} saved_pc={:#x}",
+                        wait.mm,
+                        wait.scheduler_address,
+                        record.resume_disposition(),
+                        wait.registers.pc
                     )?,
                     None => writeln!(
                         out,

@@ -152,12 +152,16 @@ fn parked_census_refuses_a_busy_bucket_without_claiming_the_record() {
     assert_eq!(zone.record_ref(record), reference);
     assert_eq!(zone.record(record).claim(), Claim::Parked { seq: 1 });
     drop(guard);
-    assert_eq!(zone.parked_wait_census(reference), Some((MM, 0x7000, 0)));
+    let wait = zone.parked_futex_snapshot(reference).unwrap();
+    assert_eq!(
+        (wait.mm, wait.scheduler_address, wait.registers.pc),
+        (MM, 0x7000, 0)
+    );
     wake(&zone, 0x7000, 1, Waker::Host);
     zone.free_record(record);
     let replacement = park(&zone, 42, 0x9000);
     assert_eq!(replacement, record);
-    assert!(zone.parked_wait_census(reference).is_none());
+    assert!(zone.parked_futex_snapshot(reference).is_none());
 }
 
 fn wake(zone: &ZoneTables, uaddr: u64, count: u32, waker: Waker) -> Vec<RecordId> {
