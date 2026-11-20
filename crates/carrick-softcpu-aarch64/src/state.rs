@@ -32,6 +32,10 @@ pub enum StackSelect {
 pub struct InterruptMasks(pub u8);
 impl InterruptMasks {
     pub const ALL: Self = Self(15);
+
+    pub const fn irq_masked(self) -> bool {
+        self.0 & 2 != 0
+    }
 }
 /// D1.6 PSTATE; C5.2.17 SPSR_EL1 bit layout. SS is outside this profile.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

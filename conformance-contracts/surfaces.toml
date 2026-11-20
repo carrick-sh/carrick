@@ -1194,7 +1194,7 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64/src/mmu.rs", contract = "arm.softcpu.stage1-tlb" },
   # Virtual CPU and system registers for the test-only arm64 lane.
   # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
-  { path = "crates/carrick-softcpu-aarch64/src/state.rs", contracts = [] },
+  { path = "crates/carrick-softcpu-aarch64/src/state.rs", contract = "arm.softcpu.cache-hot-set" },
   # Copy-through block splitter and A64 emitter (#1236); pure word translation, nothing executes.
   { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "arm.softcpu.stage1-tlb" },

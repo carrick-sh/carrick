@@ -7,8 +7,8 @@ provider exit. The Arm ARM defines the instruction semantics. At 1, 100 and
 The test checks the exit PC and the retired instructions as well as the work
 counts. QEMU user mode can run the same binary on x86_64.
 
-The dispatcher rechecks execute permission and the guest-physical code frame
-on every entry. The memory owner provides the frame's generation. The probe
+On each dispatcher lookup, the dispatcher rechecks execute permission and the
+guest-physical code frame. The memory owner provides the frame's generation. The probe
 owner bumps it for guest stores and host loads. The self-modifying witness
 executes a block, overwrites it from a different code page, then requires the
 replacement HVC at the original PC with no stale dispatch.
@@ -40,3 +40,31 @@ advances that generation again. The synthetic lifecycle fixture observes the
 unmapped fetch failure and verifies that subsequent HVCs match the replacement
 images. The dispatcher cache is scoped to a single run, and the witness works
 at the launcher boundary without an ARM soft VMM lifecycle registration.
+
+## Native branch chains
+
+The direct and register branch exits share a tagged table of resident host
+entries. The native path keeps guest registers live across a hit and branches
+past the next block's host prologue. A link is installed only after a fetch
+and generation check in the current TTBR/ASID/EL regime. The table borrows
+one local stage-1 seat and pins the immutable mappings during a launch.
+TLBI and regime changes clear the table. Guest writes to tracked code and
+IC IVAU unlink every alias of the changed physical frame. Writable inline RAM
+loans exclude tracked code, and launcher unmaps and exec writes happen outside
+the run, after all links have been dropped.
+
+Every native edge, including each back-edge, checks for a host kick or an
+unmasked IRQ request. A caller can assert the IRQ request when its timer is
+due. The dispatcher delivers it at the next block boundary. In the absence of
+earlier exits, the dispatcher regains control after 256 blocks or the remaining
+step budget, whichever is smaller. The dispatch budget for the direct loop is
+four cold launches plus one per 256 iterations. Both modes retain exact
+retirement counts and the same provider exit. Use
+`CARRICK_SOFT_AARCH64_CHAIN=0` for the single-block launch path.
+
+The native fixture covers direct and indirect chaining, BLR reading LR before
+overwriting it, retirement at the exact step limit, a back-edge request that
+arrives after the dispatcher has checked the pending flag, and a cross-page
+guest store that revokes a warm link. The production carrier fixtures compare
+chain on/off with identical initial state through the first HVC for EL1 boot
+and static musl hello. No signed embed or Docker binding is registered.

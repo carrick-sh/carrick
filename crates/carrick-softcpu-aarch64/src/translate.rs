@@ -339,7 +339,22 @@ pub mod frame {
     pub const INLINE_READ_PTR: u32 = 0x128;
     pub const INLINE_WRITE_VA: u32 = 0x130;
     pub const INLINE_WRITE_PTR: u32 = 0x138;
-    pub const SLOTS: usize = 40;
+    pub const CHAIN_TABLE: u32 = 0x140;
+    pub const CHAIN_REMAINING: u32 = 0x148;
+    pub const CHAIN_RETIRED: u32 = 0x150;
+    pub const CHAIN_LAST: u32 = 0x158;
+    pub const CHAIN_TARGET: u32 = 0x160;
+    pub const CHAIN_EXIT: u32 = 0x168;
+    pub const CHAIN_PENDING: u32 = 0x170;
+    pub const CHAIN_POLL_MASK: u32 = 0x178;
+    pub const CHAIN_X2: u32 = 0x180;
+    pub const SLOTS: usize = 50;
+
+    pub const CHAIN_INDEX_BITS: u32 = 6;
+    pub const CHAIN_SLOTS: usize = 1 << CHAIN_INDEX_BITS;
+    pub const LINK_PC: u32 = 0;
+    pub const LINK_ENTRY: u32 = 8;
+    pub const LINK_SHIFT: u32 = 4;
     /// Guest Q0..Q31, sixteen bytes per register.
     pub const VECTORS: u32 = (SLOTS * 8) as u32;
     pub const BYTES: usize = SLOTS * 8 + 32 * 16;
@@ -412,6 +427,8 @@ impl BlockFrame {
 pub enum BlockExit {
     /// Every instruction up to here retired; continue at this guest PC.
     Continue(ProgramCounter),
+    /// A register branch retired with the next guest PC in CHAIN_TARGET.
+    Indirect,
     /// The instruction at `pc` did not run; its handler performs it.
     Handler(GuestInstruction),
 }
@@ -448,6 +465,8 @@ pub struct TranslatedBlock {
     exits: Vec<BlockExit>,
     terminator: Terminator,
     inline_memory: bool,
+    linked_entry: Option<usize>,
+    simd: bool,
 }
 
 impl TranslatedBlock {
@@ -466,6 +485,16 @@ impl TranslatedBlock {
 
     pub fn has_inline_memory(&self) -> bool {
         self.inline_memory
+    }
+
+    /// Offset in bytes to the entry that inherits the current guest
+    /// registers, frame and host return address.
+    pub fn linked_entry(&self) -> Option<usize> {
+        self.linked_entry
+    }
+
+    pub fn uses_simd(&self) -> bool {
+        self.simd
     }
 
     pub fn terminator(&self) -> Terminator {
@@ -556,6 +585,21 @@ pub mod encode {
     /// B label, `offset` in bytes from this word.
     pub const fn b(offset: i64) -> u32 {
         0x1400_0000 | (((offset / 4) as u32) & 0x03ff_ffff)
+    }
+    pub(super) const fn br(rn: u32) -> u32 {
+        0xd61f_0000 | (rn << 5)
+    }
+    pub(super) const fn ldar_b(rt: u32, rn: u32) -> u32 {
+        0x08df_fc00 | (rn << 5) | rt
+    }
+    pub(super) const fn and(rd: u32, rn: u32, rm: u32) -> u32 {
+        0x8a00_0000 | (rm << 16) | (rn << 5) | rd
+    }
+    pub(super) const fn sub_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
+        0xd100_0000 | (imm12 << 10) | (rn << 5) | rd
+    }
+    pub(super) const fn add_shift(rd: u32, rn: u32, rm: u32, shift: u32) -> u32 {
+        add(rd, rn, rm) | (shift << 10)
     }
     /// RET (X30).
     pub const RET: u32 = 0xd65f_03c0;
@@ -736,6 +780,8 @@ struct Emitter {
     exits: Vec<BlockExit>,
     /// Positions of the `b common` words to patch.
     sites: Vec<usize>,
+    chain_sites: Vec<usize>,
+    chaining: bool,
 }
 
 impl Emitter {
@@ -747,6 +793,107 @@ impl Emitter {
         self.sites.push(self.words.len());
         self.words.push(0);
         index
+    }
+
+    fn continuation(&mut self, pc: ProgramCounter) -> usize {
+        if !self.chaining {
+            return self.exit(BlockExit::Continue(pc));
+        }
+        let index = self.chain_site(BlockExit::Continue(pc));
+        self.words.extend(materialize(0, pc.0));
+        self.branch_to_chain(index);
+        index
+    }
+
+    fn indirect(&mut self, i: &GuestInstruction) -> Result<usize, TranslateError> {
+        let Instruction::Branch(Branch::Register { op, rn }) = i.instruction else {
+            return Err(TranslateError::Encoding(i.word));
+        };
+        let index = self.chain_site(BlockExit::Indirect);
+        // ORR X0, XZR, Xn (MOV). Read the target before writing LR for BLR X30.
+        self.words.push(match rn {
+            OperandRegister::Zr => 0xaa1f_03e0,
+            OperandRegister::Gpr(r) => 0xaa00_03e0 | (u32::from(r.number()) << 16),
+            OperandRegister::Sp => return Err(TranslateError::Encoding(i.word)),
+        });
+        if op == RegisterBranch::Call {
+            self.words.extend(materialize(30, i.pc.0.wrapping_add(4)));
+        }
+        self.branch_to_chain(index);
+        Ok(index)
+    }
+
+    fn chain_site(&mut self, exit: BlockExit) -> usize {
+        let index = self.exits.len();
+        self.exits.push(exit);
+        self.words.push(encode::stp(0, 1, SP, 0));
+        index
+    }
+
+    fn branch_to_chain(&mut self, index: usize) {
+        self.words.push(encode::movz(1, index as u16, 0));
+        self.words.push(encode::str(1, SP, frame::CHAIN_EXIT));
+        self.chain_sites.push(self.words.len());
+        self.words.push(0);
+    }
+
+    /// X0 is the guest target PC; guest X0/X1 are already spilled. All
+    /// checks preserve NZCV. A hit branches over the target's host prologue.
+    /// A miss, pending event, or exhausted quantum takes the normal epilogue.
+    fn chain_tail(&mut self, instructions: u32) {
+        use encode::*;
+        let words = &mut self.words;
+        words.extend([
+            str(0, SP, frame::CHAIN_TARGET),
+            str(2, SP, frame::CHAIN_X2),
+            ldr(2, SP, frame::CHAIN_TABLE),
+        ]);
+        let no_table = words.len();
+        words.extend([
+            0, // CBZ X2, stop
+            ldr(1, SP, frame::CHAIN_PENDING),
+            ldar_b(1, 1),
+            ldr(2, SP, frame::CHAIN_POLL_MASK),
+            and(1, 1, 2),
+        ]);
+        let pending = words.len();
+        words.extend([0, ldr(1, SP, frame::CHAIN_REMAINING)]);
+        let no_budget = words.len();
+        words.extend([
+            0, // CBZ X1, stop
+            ubfx(1, 0, 2, frame::CHAIN_INDEX_BITS),
+            ldr(2, SP, frame::CHAIN_TABLE),
+            add_shift(2, 2, 1, frame::LINK_SHIFT),
+            ldr(1, 2, frame::LINK_PC),
+            eor(1, 1, 0),
+        ]);
+        let mismatch = words.len();
+        words.extend([0, ldr(1, 2, frame::LINK_ENTRY)]);
+        let empty = words.len();
+        words.extend([
+            0, // CBZ X1, stop
+            ubfx(0, 0, 2, frame::CHAIN_INDEX_BITS),
+            str(0, SP, frame::CHAIN_LAST),
+            ldr(2, SP, frame::CHAIN_REMAINING),
+            sub_imm(2, 2, 1),
+            str(2, SP, frame::CHAIN_REMAINING),
+            ldr(2, SP, frame::CHAIN_RETIRED),
+            add_imm(2, 2, instructions),
+            str(2, SP, frame::CHAIN_RETIRED),
+            ldr(2, SP, frame::CHAIN_X2),
+            br(1),
+        ]);
+        let stop = words.len();
+        for (at, register, nonzero) in [
+            (no_table, 2, false),
+            (pending, 1, true),
+            (no_budget, 1, false),
+            (mismatch, 1, true),
+            (empty, 1, false),
+        ] {
+            words[at] = cbz(register, nonzero, stop - at);
+        }
+        words.extend([ldr(2, SP, frame::CHAIN_X2), ldr(0, SP, frame::CHAIN_EXIT)]);
     }
 
     fn inline_memory(
@@ -831,6 +978,13 @@ impl Emitter {
 
 /// Translate a guest block into host words. Pure and deterministic.
 pub fn emit_block(guest: &GuestBlock) -> Result<TranslatedBlock, TranslateError> {
+    emit_block_for_run(guest, false)
+}
+
+pub(crate) fn emit_block_for_run(
+    guest: &GuestBlock,
+    chaining: bool,
+) -> Result<TranslatedBlock, TranslateError> {
     if guest.instructions.is_empty() {
         return Err(TranslateError::Empty);
     }
@@ -842,7 +996,10 @@ pub fn emit_block(guest: &GuestBlock) -> Result<TranslatedBlock, TranslateError>
         words: entry_stub_for(simd),
         exits: Vec::new(),
         sites: Vec::new(),
+        chain_sites: Vec::new(),
+        chaining,
     };
+    let body = e.words.len();
     let mut terminator = None;
     let mut inline_memory = false;
     for i in &guest.instructions {
@@ -878,6 +1035,9 @@ pub fn emit_block(guest: &GuestBlock) -> Result<TranslatedBlock, TranslateError>
                         .extend(materialize(rd, base.wrapping_add(a.offset.bytes() as u64)));
                 }
             }
+            InstructionClass::Branch(BranchKind::Indirect(_)) if chaining => {
+                terminator = Some(Terminator::Jump(e.indirect(i)?));
+            }
             InstructionClass::Exit(_) | InstructionClass::Branch(BranchKind::Indirect(_)) => {
                 terminator = Some(Terminator::Handler(e.exit(BlockExit::Handler(*i))));
             }
@@ -886,36 +1046,52 @@ pub fn emit_block(guest: &GuestBlock) -> Result<TranslatedBlock, TranslateError>
                 if link {
                     e.words.extend(materialize(30, i.pc.0.wrapping_add(4)));
                 }
-                terminator = Some(Terminator::Jump(e.exit(BlockExit::Continue(target))));
+                terminator = Some(Terminator::Jump(e.continuation(target)));
             }
             InstructionClass::Branch(BranchKind::Conditional) => {
                 let target = branch_target(i).ok_or(TranslateError::Encoding(i.word))?;
-                let taken_offset = 4 * (1 + EXIT_SITE_WORDS as i64);
-                e.words.push(
-                    relocate_conditional(i, taken_offset)
-                        .ok_or(TranslateError::Encoding(i.word))?,
-                );
-                let fallthrough =
-                    e.exit(BlockExit::Continue(ProgramCounter(i.pc.0.wrapping_add(4))));
-                let taken = e.exit(BlockExit::Continue(target));
+                let conditional = e.words.len();
+                e.words.push(0);
+                let fallthrough = e.continuation(ProgramCounter(i.pc.0.wrapping_add(4)));
+                let taken_offset = 4 * (e.words.len() - conditional) as i64;
+                e.words[conditional] = relocate_conditional(i, taken_offset)
+                    .ok_or(TranslateError::Encoding(i.word))?;
+                let taken = e.continuation(target);
                 terminator = Some(Terminator::Conditional { fallthrough, taken });
             }
         }
     }
     let terminator = match terminator {
         Some(t) => t,
-        None => Terminator::Fallthrough(e.exit(BlockExit::Continue(guest.next_pc()))),
+        None => Terminator::Fallthrough(e.continuation(guest.next_pc())),
     };
+    if !e.chain_sites.is_empty() {
+        let chain = e.words.len();
+        for site in core::mem::take(&mut e.chain_sites) {
+            e.words[site] = encode::b(4 * (chain as i64 - site as i64));
+        }
+        e.chain_tail(guest.instructions.len() as u32);
+    }
     let common = e.words.len();
     e.words.extend(common_exit_for(simd));
     for site in core::mem::take(&mut e.sites) {
         e.words[site] = encode::b(4 * (common as i64 - site as i64));
     }
+    let linked_entry = chaining.then(|| {
+        let entry = e.words.len();
+        e.words.extend([
+            encode::ldp(0, 1, SP, 0),
+            encode::b(4 * (body as i64 - entry as i64 - 1)),
+        ]);
+        entry * size_of::<u32>()
+    });
     Ok(TranslatedBlock {
         guest: guest.clone(),
         words: e.words,
         exits: e.exits,
         terminator,
         inline_memory,
+        linked_entry,
+        simd,
     })
 }
