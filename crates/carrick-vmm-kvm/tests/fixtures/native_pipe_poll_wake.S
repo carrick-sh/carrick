@@ -12,7 +12,12 @@
  * cleared to 0 before the child closes.
  * -DFINITE_TIMEOUT: poll uses 1 ms, ppoll {0, 1ms}; with the child sleeping
  * 50ms the call must time out (0, revents cleared). -DFINITE_TIMEOUT_LONG:
- * the same finite calls with 5 s, so a prompt writer close wins (1, POLLHUP). */
+ * the same finite calls with 5 s, so a prompt writer close wins (1, POLLHUP).
+ * -DSELECT_CAUGHT_SIGNAL: the sibling sends SIGUSR1 after a timed pselect6
+ * parks. The reader checks EINTR, the handler count, and the remaining time.
+ * -DSELECT_STOP_CONT: the sibling sends SIGSTOP after that same gate. The
+ * parent must reap a WUNTRACED stop event before sending SIGCONT and writing
+ * the readiness byte. The reader requires a successful timed pselect6. */
 .global _start
 .text
 _start:
@@ -72,6 +77,46 @@ _start:
     js fail_fork
     jz child
     mov %eax, %r15d
+#ifdef SELECT_CAUGHT_SIGNAL
+    /* The signaler has a bounded gate wait even if the reader is suspended. */
+    mov %r15d, %edi
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    cmp %r15d, %eax
+    jne fail_wait
+    cmpl $0, status(%rip)
+    jne child_fail
+#endif
+#ifdef SELECT_STOP_CONT
+    mov %r12d, %edi
+    lea status(%rip), %rsi
+    mov $2, %edx                  /* WUNTRACED */
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    cmp %r12d, %eax
+    jne fail_wait
+    cmpl $0x137f, status(%rip)     /* WIFSTOPPED with WSTOPSIG == SIGSTOP */
+    jne fail_stop
+
+    mov %r12d, %edi
+    mov $18, %esi                 /* SIGCONT */
+    mov $62, %eax
+    syscall
+    test %rax, %rax
+    jnz fail_continue
+
+    mov fds+4(%rip), %edi
+    lea byte(%rip), %rsi
+    mov $1, %edx
+    mov $1, %eax
+    syscall
+    cmp $1, %rax
+    jne fail_pipe
+#endif
     jmp wait_for_child
 #else
     jmp child
@@ -212,7 +257,7 @@ wait_for_child:
     jz fail_wait
     jmp exit
 1:
-#ifndef SELECT_TIMEOUT_EOF
+#if !defined(SELECT_TIMEOUT_EOF) && !defined(SELECT_CAUGHT_SIGNAL)
     mov %r15d, %edi              /* reap the sibling writer as well */
     lea status(%rip), %rsi
     xor %edx, %edx
@@ -248,6 +293,29 @@ child:
     test %rax, %rax
     jnz child_fail
     mov %r12d, reader_pid(%rip)
+    call select_gate_wait
+#ifdef SELECT_CAUGHT_SIGNAL
+    mov %r12d, %edi
+    mov $10, %esi                 /* kill(reader, SIGUSR1) */
+    mov $62, %eax
+    syscall
+    test %rax, %rax
+    jnz child_fail
+    call select_gate_wait         /* require the reader to retire */
+    xor %edi, %edi
+    jmp exit
+#elif defined(SELECT_STOP_CONT)
+    mov %r12d, %edi
+    mov $19, %esi                 /* kill(reader, SIGSTOP) */
+    mov $62, %eax
+    syscall
+    test %rax, %rax
+    jnz child_fail
+    xor %edi, %edi
+    jmp exit
+#endif
+    jmp wake_pipe
+select_gate_wait:
     mov %r13d, %edi
     lea reader_pid(%rip), %rsi
     mov $4, %edx
@@ -272,6 +340,9 @@ child:
     syscall
     cmp $1, %rax
     jne child_fail
+    cmpb $'w', received(%rip)
+    jne child_fail
+    ret
 #elif !defined(NO_CHILD_SLEEP)
     /* nanosleep({0, 50ms}) so the parent is parked before the write. */
     lea delay(%rip), %rdi
@@ -279,6 +350,7 @@ child:
     mov $35, %eax
     syscall
 #endif
+wake_pipe:
     mov fds+4(%rip), %edi
 #ifdef WAKE_BY_CLOSE
     mov $3, %eax                   /* close(fds[1]): the last writer */
@@ -300,6 +372,7 @@ child:
     jmp exit
 #endif
 #ifdef USE_PSELECT
+
 #ifdef SELECT_TIMEOUT_EOF
 timed_pselect_child:
     lea fds(%rip), %rdi
@@ -331,6 +404,16 @@ timed_pselect_child:
     jmp exit
 #endif
 pselect_reader:
+#ifdef SELECT_CAUGHT_SIGNAL
+    mov $10, %edi                  /* rt_sigaction(SIGUSR1, &action, NULL, 8) */
+    lea signal_action(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax
+    syscall
+    test %rax, %rax
+    jnz fail_sigaction
+#endif
 #ifdef USE_SELECT_TIMEVAL
     movq $-1, select_time+8(%rip)
     call select_call
@@ -338,9 +421,35 @@ pselect_reader:
     jne fail_result
 #endif
     call pselect_one
+#ifdef SELECT_CAUGHT_SIGNAL
+    movq $8, select_time(%rip)
+    call select_call
+    cmp $-4, %rax                  /* raw pselect6 returns -EINTR */
+    jne fail_result
+    cmpl $1, signal_count(%rip)    /* handler returned through rt_sigreturn */
+    jne fail_handler
+    call check_select_remaining
+#elif defined(SELECT_STOP_CONT)
+    movq $8, select_time(%rip)
     call pselect_one
+    call check_select_remaining
+#else
+    call pselect_one
+#endif
     xor %edi, %edi
     jmp exit
+
+#if defined(SELECT_CAUGHT_SIGNAL) || defined(SELECT_STOP_CONT)
+check_select_remaining:
+    cmpq $8, select_time(%rip)
+    jae fail_fields
+    cmpq $1000000000, select_time+8(%rip)
+    jae fail_fields
+    mov select_time(%rip), %rax
+    or select_time+8(%rip), %rax
+    jz fail_fields
+    ret
+#endif
 
 pselect_one:
 #ifdef USE_SELECT_TIMEVAL
@@ -389,7 +498,7 @@ select_call:
     lea select_time(%rip), %r8
     mov $23, %eax                  /* select(nfds, &set, 0, 0, &timeval) */
 #else
-#ifdef SELECT_TIMEOUT_EOF
+#if defined(SELECT_TIMEOUT_EOF) || defined(SELECT_CAUGHT_SIGNAL) || defined(SELECT_STOP_CONT)
     lea select_time(%rip), %r8
 #endif
     mov $270, %eax                 /* pselect6 */
@@ -399,6 +508,29 @@ select_call:
 pselect_errno:
     neg %eax
     mov %eax, %edi
+    jmp exit
+#endif
+#ifdef SELECT_CAUGHT_SIGNAL
+select_signal_handler:
+    incl signal_count(%rip)
+    ret
+select_signal_restorer:
+    mov $15, %eax                  /* rt_sigreturn */
+    syscall
+    ud2
+fail_sigaction:
+    mov $19, %edi
+    jmp exit
+fail_handler:
+    mov $20, %edi
+    jmp exit
+#endif
+#ifdef SELECT_STOP_CONT
+fail_stop:
+    mov $21, %edi
+    jmp exit
+fail_continue:
+    mov $22, %edi
     jmp exit
 #endif
 child_fail:
@@ -440,6 +572,12 @@ zero_ts: .quad 0, 0
 short_ts: .quad 0, 1000000
 long_ts: .quad 5, 0
 byte: .byte 'x'
+#ifdef SELECT_CAUGHT_SIGNAL
+.balign 8
+signal_action:
+    .quad select_signal_handler, 0x04000000 /* SA_RESTORER */
+    .quad select_signal_restorer, 0
+#endif
 #ifdef USE_PSELECT
 .balign 8
 select_gate_peer:
@@ -454,6 +592,7 @@ pfd: .space 8
 read_set: .space 8
 select_time: .space 16
 reader_pid: .space 4
+signal_count: .space 4
 status: .space 8
 poll_result: .space 8
 received: .space 1
