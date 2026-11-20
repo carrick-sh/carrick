@@ -677,6 +677,11 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             zone.unswitch(slot, switched.record);
             return LoadResult::NeedsHost;
         }
+        zone.cpu_bind_record(
+            slot,
+            zone.record_ref(switched.record),
+            carrick_sched_core::CounterTick::new(self.cpu.now()),
+        );
         // SAFETY: switch_in_full made the record OnCpu on this slot.
         let ctx = unsafe { rec.ctx_mut() };
         publish_identity(self.task, rec.identity());
@@ -699,6 +704,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             // x0, rather than installing the scheduler's wake result.
             ResumeAction::RetrySavedSyscall | ResumeAction::RetrySyscall => None,
             ResumeAction::Left => {
+                zone.cpu_leave_slot(slot, carrick_sched_core::CounterTick::new(self.cpu.now()));
                 self.leave_space();
                 return LoadResult::Left;
             }
@@ -808,6 +814,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         zone.counters
             .el1_idle_entries
             .fetch_add(1, Ordering::Relaxed);
+        zone.cpu_leave_slot(slot, carrick_sched_core::CounterTick::new(self.cpu.now()));
         zone.slot(slot).set_sgi_target(self.cpu.own_sgi_target());
         zone.enter_idle(slot, false);
         let spin_until = self.cpu.now().saturating_add(self.ticks(IDLE_SPIN_NS));
@@ -1287,12 +1294,43 @@ impl El1Exit {
     ) -> Self {
         use carrick_el1_abi::Action;
         match action {
-            Action::Served => Self::Served,
-            Action::Forward => Self::Forward,
-            Action::ServedWithWork => Self::ServedWithWork,
-            Action::HostCustody => Self::HostCustody,
+            Action::Served => {
+                if let Some(slot) = slot {
+                    zone.cpu_enter_user(
+                        slot,
+                        zone.current_record_ref(slot),
+                        carrick_sched_core::CounterTick::new(cpu.now()),
+                    );
+                }
+                Self::Served
+            }
+            Action::Forward => {
+                if let Some(slot) = slot {
+                    zone.cpu_leave_slot(slot, carrick_sched_core::CounterTick::new(cpu.now()));
+                }
+                Self::Forward
+            }
+            Action::ServedWithWork => {
+                if let Some(slot) = slot {
+                    zone.cpu_enter_user(
+                        slot,
+                        zone.current_record_ref(slot),
+                        carrick_sched_core::CounterTick::new(cpu.now()),
+                    );
+                }
+                Self::ServedWithWork
+            }
+            Action::HostCustody => {
+                if let Some(slot) = slot {
+                    zone.cpu_leave_slot(slot, carrick_sched_core::CounterTick::new(cpu.now()));
+                }
+                Self::HostCustody
+            }
             Action::Idle => match slot {
-                Some(slot) => Self::Idle(leave_space(zone, slot, cpu)),
+                Some(slot) => {
+                    zone.cpu_leave_slot(slot, carrick_sched_core::CounterTick::new(cpu.now()));
+                    Self::Idle(leave_space(zone, slot, cpu))
+                }
                 None => idle_exit_without_slot(),
             },
         }

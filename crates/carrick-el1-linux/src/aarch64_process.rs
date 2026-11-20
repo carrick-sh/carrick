@@ -1929,6 +1929,26 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     fn exec_open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
         self.crossing.open_table()
     }
+    #[cfg(not(target_os = "none"))]
+    fn signal_frequency(
+        &mut self,
+    ) -> Result<carrick_guest_arch::CounterFrequency, crate::native_process_runtime::NativeFailure>
+    {
+        let fallback = match NonZeroU64::new(1_000_000_000) {
+            Some(hz) => hz,
+            None => NonZeroU64::MIN,
+        };
+        Ok(self
+            .zone
+            .counter_frequency()
+            .unwrap_or_else(|| carrick_guest_arch::CounterFrequency::new(fallback)))
+    }
+    #[cfg(not(target_os = "none"))]
+    fn signal_now(
+        &mut self,
+    ) -> Result<carrick_guest_arch::CounterTick, crate::native_process_runtime::NativeFailure> {
+        Ok(self.zone.latest_cpu_tick())
+    }
     #[inline(never)]
     fn apply_fault_reply(
         &mut self,

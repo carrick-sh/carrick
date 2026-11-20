@@ -261,6 +261,39 @@ impl LinuxTimezone {
     }
 }
 
+#[repr(C, packed)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+)]
+pub struct LinuxTms {
+    pub tms_utime: i64,
+    pub tms_stime: i64,
+    pub tms_cutime: i64,
+    pub tms_cstime: i64,
+}
+
+impl LinuxTms {
+    pub const fn zeroed() -> Self {
+        Self {
+            tms_utime: 0,
+            tms_stime: 0,
+            tms_cutime: 0,
+            tms_cstime: 0,
+        }
+    }
+}
+
+pub const LINUX_CLK_TCK: i64 = 100;
+
 /// Linux `clockid_t` values (`include/uapi/linux/time.h`). Shared by the
 /// host dispatcher and the ring sleep owner so both classify one clock set.
 pub const LINUX_CLOCK_REALTIME: u64 = 0;
