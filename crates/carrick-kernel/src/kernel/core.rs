@@ -1448,6 +1448,7 @@ impl Kernel {
         &self,
         source: Arc<dyn carrick_hal::birth_serial::BirthSerialSource>,
     ) -> Result<(), KernelError> {
+        crate::event_ring::flush_native_child_lifecycle();
         self.ids.bind_namespace_source(source.clone())?;
         self.object_ids.bind_initial_birth_source(source)?;
         Ok(())
@@ -1455,6 +1456,7 @@ impl Kernel {
     pub fn bootstrap_root(
         bootstrap: RootBootstrap,
     ) -> Result<(Arc<Self>, KernelContext), KernelError> {
+        crate::event_ring::flush_native_child_lifecycle();
         let (ids, task_claim) = IdRegistry::with_root(bootstrap.task_id)?;
         let leader_claim = ids.claim_task_leader_thread(bootstrap.task_id)?;
         let process_group_id = ProcessGroupId::from_leader(bootstrap.task_id);

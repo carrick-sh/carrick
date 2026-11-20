@@ -1060,7 +1060,11 @@ pub(super) fn finish_native_service(
     service: carrick_vmm_hvf::metadata_grant::NativeService,
     kernel: &carrick_kernel::kernel::Kernel,
 ) -> Result<(), TrapError> {
-    let effects = if matches!(
+    carrick_kernel::event_ring::flush_native_child_lifecycle();
+    let birth = service.request().identity.birth;
+    let descendant_task = (birth.origin == carrick_core_abi::service::ServiceOrigin::Descendant)
+        .then_some(birth.process);
+    let outcome: Result<carrick_sched_core::WakeEffects, TrapError> = if matches!(
         service.request().operation,
         carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
     ) {
@@ -1071,24 +1075,23 @@ pub(super) fn finish_native_service(
             &service.request(),
             doorbell,
         );
-        service.acknowledge_work(reply)?
+        service.acknowledge_work(reply)
     } else if matches!(
         service.request().operation,
         carrick_core_abi::service::ServiceOperation::Exec { .. }
     ) {
-        service.prepare_exec()?
+        service.prepare_exec()
     } else if matches!(
         service.request().operation,
         carrick_core_abi::service::ServiceOperation::HostFile { .. }
     ) {
-        service.serve_host_file()?
+        service.serve_host_file()
     } else if matches!(
         service.request().operation,
         carrick_core_abi::service::ServiceOperation::Entropy { .. }
     ) {
-        service.serve_entropy(|record| {
-            carrick_kernel::dispatch::serve_native_entropy(record).is_ok()
-        })?
+        service
+            .serve_entropy(|record| carrick_kernel::dispatch::serve_native_entropy(record).is_ok())
     } else {
         service.supply(|zone, _waker, effects| {
             carrick_sched_core::LockWait::complete_object_wake(
@@ -1096,7 +1099,22 @@ pub(super) fn finish_native_service(
                 zone,
                 effects,
             );
-        })?
+        })
+    };
+    carrick_kernel::event_ring::flush_native_child_lifecycle();
+    let effects = match outcome {
+        Ok(effects) => effects,
+        Err(error) => {
+            if let Some(task) = descendant_task {
+                carrick_el1_abi::emit_carrier_fatal_if_unrecorded(
+                    task,
+                    carrick_el1_abi::NativeChildTerminalReason::CarrierFatal(
+                        carrick_el1_abi::NativeCarrierFatalKind::NativeServiceHostError,
+                    ),
+                );
+            }
+            return Err(error);
+        }
     };
     for target in effects.sgi_slots() {
         carrick_kernel::el1_zone::resched_slot(target);

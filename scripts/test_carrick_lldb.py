@@ -381,6 +381,139 @@ class CarrickLldbHelperTests(unittest.TestCase):
             "ALIAS coordinator=0x123400005678 tid=42 end",
         )
 
+    def test_cmd_eventring_decodes_synthetic_native_child_lifecycle_ring(self):
+        import struct
+
+        class FakeSBError:
+            def Success(self):
+                return True
+
+            def GetCString(self):
+                return ""
+
+        sys.modules["lldb"].SBError = FakeSBError
+
+        idx_addr = 0x100000
+        ring_addr = 0x200000
+        ring_bytes = bytearray(PLUGIN._EVENTRING_N * PLUGIN._EVENTRING_SLOT_BYTES)
+
+        def write_slot(gi: int, kind: int, a: int, b: int, c: int):
+            gen = PLUGIN._eventring_complete_generation(gi)
+            lo = (a & 0xFFFFFFFF) | ((b & 0xFFFFFFFF) << 32)
+            hi = (c & 0xFFFFFFFF) | ((kind & 0xFF) << 32)
+            off = (gi % PLUGIN._EVENTRING_N) * PLUGIN._EVENTRING_SLOT_BYTES
+            struct.pack_into("<3Q", ring_bytes, off, gen, lo, hi)
+
+        # Six ordered lifecycle transitions + two terminal fatal child exits + NCHILD_LOST.
+        write_slot(0, 94, 1, 2, 17 | (0x05 << 8) | (1 << 16) | (2 << 24))
+        write_slot(1, 95, 2, 2, 0)
+        write_slot(2, 96, 2, 2, 0x0700 | (1 << 16) | (7 << 24))
+        write_slot(3, 97, 2, 1, (2 << 16) | 1)
+        write_slot(4, 98, 1, 1, 1 | (1 << 8))
+        write_slot(5, 99, 1, 2, 0x0700 | (1 << 16) | (2 << 24))
+        write_slot(6, 96, 3, 5, (4 << 16) | (36 << 24))
+        write_slot(7, 96, 4, 6, (5 << 16) | (2 << 24))
+        write_slot(8, 100, 4, 6, 14 | (402 << 8) | (3 << 24))
+        total = 9
+        raw_idx = total.to_bytes(8, "little")
+
+        class FakeVar:
+            def __init__(self, name, addr):
+                self._name = name
+                self._addr = addr
+
+            def GetName(self):
+                return self._name
+
+            def GetLoadAddress(self):
+                return self._addr
+
+        class FakeVarList:
+            def __init__(self, items):
+                self._items = items
+
+            def GetSize(self):
+                return len(self._items)
+
+            def GetValueAtIndex(self, idx):
+                return self._items[idx]
+
+        class FakeProcess:
+            def IsValid(self):
+                return True
+
+            def GetProcessID(self):
+                return 4242
+
+            def ReadMemory(self, addr, size, _err):
+                if addr == idx_addr and size == 8:
+                    return bytes(raw_idx)
+                if addr == ring_addr and size == len(ring_bytes):
+                    return bytes(ring_bytes)
+                raise AssertionError(f"unexpected memory read {addr:#x} len={size}")
+
+        class FakeTarget:
+            modules = []
+
+            def IsValid(self):
+                return True
+
+            def GetProcess(self):
+                return FakeProcess()
+
+            def FindGlobalVariables(self, name, _limit):
+                table = {
+                    "IDX": ("carrick_kernel::event_ring::IDX", idx_addr),
+                    "RING": ("carrick_kernel::event_ring::RING", ring_addr),
+                }
+                if name in table:
+                    full_name, addr = table[name]
+                    return FakeVarList([FakeVar(full_name, addr)])
+                return FakeVarList([])
+
+        class FakeExeCtx:
+            def GetTarget(self):
+                return FakeTarget()
+
+            def GetProcess(self):
+                return FakeProcess()
+
+        class FakeDebugger:
+            def GetSelectedTarget(self):
+                return FakeTarget()
+
+        class FakeResult:
+            def __init__(self):
+                self.messages = []
+                self.error = None
+
+            def AppendMessage(self, msg):
+                self.messages.append(msg)
+
+            def SetError(self, err):
+                self.error = err
+
+        res = FakeResult()
+        PLUGIN.cmd_eventring(FakeDebugger(), "9", FakeExeCtx(), res, {})
+        self.assertIsNone(res.error)
+        self.assertEqual(len(res.messages), 1)
+        lines = res.messages[0].splitlines()
+        self.assertIn("total=9  showing=9  start=0  oldest=0  errors=0", lines[0])
+        self.assertEqual(
+            lines[1:],
+            [
+                "     0 NCHILD_FORK parent=1#1 child=2#2 exit_sig=17 flags=0x05",
+                "     1 NCHILD_EXEC task=2#2 outcome=ok",
+                "     2 NCHILD_EXIT task=2#2 reason=exited exit_code=7 wstatus=0x0700",
+                "     3 NCHILD_ZOMBIE child=2#2 parent=1#1",
+                "     4 NCHILD_WAKE parent=1#1 wake=child_exit woken=1",
+                "     5 NCHILD_REAP caller=1#1 child=2#2 wstatus=0x0700",
+                "     6 NCHILD_EXIT task=3#5 reason=entry_fatal/NativeServiceQuarantined code=36 wstatus=0x0000",
+                "     7 NCHILD_EXIT task=4#6 reason=carrier_fatal/native_service_host_error code=2 wstatus=0x0000",
+                "     8 NCHILD_LOST task=4#6 reason=host_lost_adoption site=host_service_head_adoption_lost(402) detail=0x03",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

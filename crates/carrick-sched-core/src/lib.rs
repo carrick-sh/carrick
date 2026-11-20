@@ -3037,6 +3037,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// The executor of `slot`, stopped at an exit, frees the records on its
     /// run queue whose threads the host retired while EL1 held them.
     pub fn sweep_cancelled(&self, slot: SlotId) -> usize {
+        self.sweep_cancelled_observed(slot, |_, _, _| {})
+    }
+
+    /// Like [`Self::sweep_cancelled`], invoking `observed(record_id, identity, is_native_owned)`
+    /// before retiring each cancelled queued record.
+    pub fn sweep_cancelled_observed(
+        &self,
+        slot: SlotId,
+        mut observed: impl FnMut(RecordId, ThreadIdentity, bool),
+    ) -> usize {
         let Some(guard) = self.slot_lock(slot, &SpinForever) else {
             return 0;
         };
@@ -3056,10 +3066,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 && let Some(transfer) =
                     self.begin_host_transfer(self.record_ref(record), Claim::Queued { slot, seq })
             {
+                let identity = rec.identity();
+                let native_owned = rec.is_native_owned();
                 self.remove_locked(&guard, record);
                 rec.retire_terminal_metadata_operation();
                 rec.handback
                     .store(Handback::Cancelled as u32, Ordering::Release);
+                observed(record, identity, native_owned);
                 transfer.retire();
                 freed += 1;
             }

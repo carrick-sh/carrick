@@ -1925,11 +1925,31 @@ fn probe_zone_runnable(
         if let Some(running) = scheduler.adopt_zone_handback(registration, record)? {
             return Ok(ZoneProbe::Consumed(Some(running)));
         }
+        if zone
+            .live(record)
+            .is_some_and(|rec| matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. }))
+        {
+            carrick_kernel::el1_zone::record_native_record_lost(
+                zone,
+                record,
+                carrick_el1_abi::NativeChildLostReason::HostLostAdoption,
+                carrick_el1_abi::NativeChildLostSite::HostPendingAdoptionLost,
+            );
+        }
         zone.counters
             .lost_adoptions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    zone.sweep_cancelled(slot);
+    zone.sweep_cancelled_observed(slot, |record_id, identity, native_owned| {
+        if native_owned {
+            carrick_kernel::el1_zone::record_native_identity_lost(
+                identity,
+                carrick_el1_abi::NativeChildLostReason::HostStaleServiceFree,
+                carrick_el1_abi::NativeChildLostSite::HostSweepCancelled,
+                u64::from(record_id.raw()),
+            );
+        }
+    });
     carrick_kernel::el1_zone::hand_back_wanted(slot);
     if registration.is_spare() {
         // No guest CPU runs this vCPU: nothing queued on it is this
@@ -1974,12 +1994,27 @@ fn probe_zone_runnable(
             // loads it, exactly as the thread it took off its vCPU.
             let taken = scheduler.adopt_zone_handback(registration, record)?;
             if taken.is_none() {
+                if zone
+                    .live(record)
+                    .is_some_and(|rec| matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. }))
+                {
+                    carrick_kernel::el1_zone::record_native_record_lost(
+                        zone,
+                        record,
+                        carrick_el1_abi::NativeChildLostReason::HostLostAdoption,
+                        carrick_el1_abi::NativeChildLostSite::HostServiceHeadAdoptionLost,
+                    );
+                }
                 zone.counters
                     .lost_adoptions
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return Ok(ZoneProbe::Consumed(taken));
         }
+        let native_identity = zone
+            .live(record)
+            .filter(|rec| rec.is_native_owned())
+            .map(|rec| rec.identity());
         let key = carrick_kernel::el1_zone::service_key(record);
         let taken = match key {
             Some((thread, generation)) => {
@@ -1989,6 +2024,14 @@ fn probe_zone_runnable(
             None => None,
         };
         if taken.is_none() {
+            if let Some(identity) = native_identity {
+                carrick_kernel::el1_zone::record_native_identity_lost(
+                    identity,
+                    carrick_el1_abi::NativeChildLostReason::HostStaleServiceFree,
+                    carrick_el1_abi::NativeChildLostSite::HostStaleServiceFree,
+                    u64::from(record.id.raw()),
+                );
+            }
             zone.counters
                 .stale_services
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

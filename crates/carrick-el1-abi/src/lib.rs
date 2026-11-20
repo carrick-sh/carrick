@@ -413,6 +413,18 @@ pub const EL1_SIGNAL_INGRESS_RESERVED_SIZE: u64 = 0x4000;
 pub const EL1_SIGNAL_INGRESS_BASE: u64 = EL1_REGION_BASE + EL1_SIGNAL_INGRESS_OFFSET;
 pub const X86_CPL0_SIGNAL_INGRESS_BASE: u64 = X86_CPL0_REGION_BASE + EL1_SIGNAL_INGRESS_OFFSET;
 
+/// Shared lock-free native-child lifecycle diagnostic ring in either ISA's
+/// kernel region, immediately after the external-signal ingress reservation.
+/// Zero-initialized by backing allocation; in-ring transitions publish without
+/// VM exits and host boundaries drain into the carrier event ring + USDT.
+pub const EL1_NATIVE_CHILD_LIFECYCLE_OFFSET: u64 =
+    EL1_SIGNAL_INGRESS_OFFSET + EL1_SIGNAL_INGRESS_RESERVED_SIZE;
+pub const EL1_NATIVE_CHILD_LIFECYCLE_RESERVED_SIZE: u64 = 0x4000;
+pub const EL1_NATIVE_CHILD_LIFECYCLE_BASE: u64 =
+    EL1_REGION_BASE + EL1_NATIVE_CHILD_LIFECYCLE_OFFSET;
+pub const X86_CPL0_NATIVE_CHILD_LIFECYCLE_BASE: u64 =
+    X86_CPL0_REGION_BASE + EL1_NATIVE_CHILD_LIFECYCLE_OFFSET;
+
 /// Guest VA/IPA base of the 2 MiB AArch64 kernel control window (L1 index 180).
 pub const AARCH64_KERNEL_CONTROL_BASE: u64 =
     carrick_mmu_core::aarch64::owner_fork::KERNEL_CONTROL_BASE;
@@ -1074,6 +1086,11 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_SIGNAL_INGRESS_OFFSET,
         EL1_SIGNAL_INGRESS_RESERVED_SIZE,
         SIGNAL_INGRESS_CAPACITY as u64,
+        EL1_NATIVE_CHILD_LIFECYCLE_OFFSET,
+        EL1_NATIVE_CHILD_LIFECYCLE_RESERVED_SIZE,
+        NATIVE_CHILD_LIFECYCLE_CAPACITY as u64,
+        core::mem::size_of::<SharedNativeChildLifecycleRing>() as u64,
+        core::mem::align_of::<SharedNativeChildLifecycleRing>() as u64,
         MM_PORTAL_PROTOCOL,
         MM_TRANSFER_LAYOUT_HASH,
         MM_PORTAL_BIND_ESR,
@@ -3784,6 +3801,19 @@ const _: () = assert!(
         .is_multiple_of(core::mem::align_of::<SharedSignalIngressQueue>() as u64)
 );
 const _: () = assert!(EL1_SIGNAL_INGRESS_OFFSET.is_multiple_of(64));
+const _: () = ::core::assert!(
+    EL1_NATIVE_CHILD_LIFECYCLE_OFFSET + EL1_NATIVE_CHILD_LIFECYCLE_RESERVED_SIZE
+        <= EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE
+);
+const _: () = ::core::assert!(
+    core::mem::size_of::<SharedNativeChildLifecycleRing>() as u64
+        <= EL1_NATIVE_CHILD_LIFECYCLE_RESERVED_SIZE
+);
+const _: () = ::core::assert!(
+    EL1_NATIVE_CHILD_LIFECYCLE_OFFSET
+        .is_multiple_of(core::mem::align_of::<SharedNativeChildLifecycleRing>() as u64)
+);
+const _: () = ::core::assert!(EL1_NATIVE_CHILD_LIFECYCLE_OFFSET.is_multiple_of(64));
 const _: () =
     assert!(EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE <= EL1_BOOTSTRAP_METADATA_OFFSET);
 const _: () =
@@ -4140,6 +4170,896 @@ pub fn signal_ingress_host() -> Option<&'static SharedSignalIngressQueue> {
     Some(unsafe {
         &*((ptr + EL1_SIGNAL_INGRESS_OFFSET as usize) as *const SharedSignalIngressQueue)
     })
+}
+
+pub const NATIVE_CHILD_LIFECYCLE_CAPACITY: usize = 128;
+
+/// Cheap summary of clone/fork flags carried into `NativeProcessEntry::fork_publish`.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct NativeChildForkFlags {
+    pub exit_signal: u8,
+    pub vfork: bool,
+    pub child_settid: bool,
+    pub child_cleartid: bool,
+}
+
+impl NativeChildForkFlags {
+    pub const fn pack_u16(self) -> u16 {
+        (self.exit_signal as u16)
+            | ((self.vfork as u16) << 8)
+            | ((self.child_settid as u16) << 9)
+            | ((self.child_cleartid as u16) << 10)
+    }
+
+    pub const fn unpack_u16(raw: u16) -> Self {
+        Self {
+            exit_signal: (raw & 0xff) as u8,
+            vfork: (raw & (1 << 8)) != 0,
+            child_settid: (raw & (1 << 9)) != 0,
+            child_cleartid: (raw & (1 << 10)) != 0,
+        }
+    }
+}
+
+/// Outcome of a native child `execve` / `execveat` transition.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum NativeChildExecOutcome {
+    Succeeded,
+    RefusedErrno(i32),
+    PastNoReturn,
+}
+
+impl NativeChildExecOutcome {
+    pub const fn succeeded(self) -> bool {
+        ::core::matches!(self, Self::Succeeded)
+    }
+
+    pub const fn detail_i32(self) -> i32 {
+        match self {
+            Self::Succeeded => 0,
+            Self::RefusedErrno(errno) => {
+                if errno > 0 {
+                    errno
+                } else if errno < 0 {
+                    -errno
+                } else {
+                    22
+                }
+            }
+            Self::PastNoReturn => -1,
+        }
+    }
+
+    pub const fn from_detail_i32(detail: i32) -> Self {
+        if detail == 0 {
+            Self::Succeeded
+        } else if detail < 0 {
+            Self::PastNoReturn
+        } else {
+            Self::RefusedErrno(detail)
+        }
+    }
+}
+
+/// Carrier-level fatal subkind recorded before a carrier abort path terminates
+/// or unwinds a native child execution lane.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+#[repr(u8)]
+pub enum NativeCarrierFatalKind {
+    El1Panic = 1,
+    NativeServiceHostError = 2,
+    Cpl0FatalPort = 3,
+    GuestAtEl1 = 4,
+}
+
+impl NativeCarrierFatalKind {
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::El1Panic),
+            2 => Some(Self::NativeServiceHostError),
+            3 => Some(Self::Cpl0FatalPort),
+            4 => Some(Self::GuestAtEl1),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::El1Panic => "el1_panic",
+            Self::NativeServiceHostError => "native_service_host_error",
+            Self::Cpl0FatalPort => "cpl0_fatal_port",
+            Self::GuestAtEl1 => "guest_at_el1",
+        }
+    }
+}
+
+/// Terminal reason for a native child exit record, covering normal exits,
+/// terminating signals, in-ring run/invariant fatals, and carrier fatals.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum NativeChildTerminalReason {
+    Exited {
+        status: carrick_personality_linux::lifecycle::LinuxWaitStatus,
+    },
+    Signaled {
+        status: carrick_personality_linux::lifecycle::LinuxWaitStatus,
+    },
+    NativeRunFailure(carrick_core_abi::NativeRunFailureReason),
+    EntryBindingFatal(EntryBindingFatalReason),
+    CarrierFatal(NativeCarrierFatalKind),
+}
+
+impl NativeChildTerminalReason {
+    /// `(reason_class, reason_code, wait_status_u16)` scalar decomposition.
+    pub const fn parts(self) -> (u8, u8, u16) {
+        match self {
+            Self::Exited { status } => {
+                let raw = status.raw() as u16;
+                (1, ((raw >> 8) & 0xff) as u8, raw)
+            }
+            Self::Signaled { status } => {
+                let raw = status.raw() as u16;
+                (2, (raw & 0x7f) as u8, raw)
+            }
+            Self::NativeRunFailure(reason) => (3, reason as u8, 0),
+            Self::EntryBindingFatal(reason) => (4, reason as u8, 0),
+            Self::CarrierFatal(kind) => (5, kind as u8, 0),
+        }
+    }
+
+    pub const fn pack_i32(self) -> i32 {
+        let (class, code, wstatus) = self.parts();
+        ((wstatus as u32) | ((class as u32) << 16) | ((code as u32) << 24)) as i32
+    }
+
+    pub fn unpack_i32(packed: i32) -> Option<Self> {
+        use carrick_personality_linux::lifecycle::LinuxWaitStatus;
+        let bits = packed as u32;
+        let wstatus = (bits & 0xffff) as u16;
+        let class = ((bits >> 16) & 0xff) as u8;
+        let code = ((bits >> 24) & 0xff) as u8;
+        match class {
+            1 => Some(Self::Exited {
+                status: LinuxWaitStatus::exited(((wstatus >> 8) & 0xff) as u8),
+            }),
+            2 => Some(Self::Signaled {
+                status: LinuxWaitStatus::signaled((wstatus & 0x7f) as u8, (wstatus & 0x80) != 0),
+            }),
+            3 => carrick_core_abi::NativeRunFailureReason::from_raw(u64::from(code))
+                .map(Self::NativeRunFailure),
+            4 => EntryBindingFatalReason::from_raw(u64::from(code)).map(Self::EntryBindingFatal),
+            5 => NativeCarrierFatalKind::from_raw(code).map(Self::CarrierFatal),
+            _ => None,
+        }
+    }
+}
+
+/// Cause of a waiting parent wake (or non-wake when no waiter was enrolled).
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+#[repr(u8)]
+pub enum NativeParentWakeReason {
+    ChildExit = 1,
+    Signal = 2,
+    None = 3,
+}
+
+impl NativeParentWakeReason {
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::ChildExit),
+            2 => Some(Self::Signal),
+            3 => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChildExit => "child_exit",
+            Self::Signal => "signal",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Typed reason why a native child task, member, or scheduler record was
+/// removed, retired, yielded to host custody, rolled back, or dropped.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+#[repr(u8)]
+pub enum NativeChildLostReason {
+    ProcessExitPublish = 1,
+    ExitAutoreap = 2,
+    WaitReap = 3,
+    RegistryUnregisterProcess = 4,
+    RegistryUnregisterMember = 5,
+    HostReceiptFold = 6,
+    RegistryRehomeReplace = 7,
+    ThreadRawExit = 8,
+    ClosingMemberRetire = 9,
+    RunFailureRetire = 10,
+    HostCustodyYield = 11,
+    BirthRollback = 12,
+    BirthQuarantine = 13,
+    HostLostAdoption = 14,
+    HostStaleServiceFree = 15,
+}
+
+impl NativeChildLostReason {
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::ProcessExitPublish),
+            2 => Some(Self::ExitAutoreap),
+            3 => Some(Self::WaitReap),
+            4 => Some(Self::RegistryUnregisterProcess),
+            5 => Some(Self::RegistryUnregisterMember),
+            6 => Some(Self::HostReceiptFold),
+            7 => Some(Self::RegistryRehomeReplace),
+            8 => Some(Self::ThreadRawExit),
+            9 => Some(Self::ClosingMemberRetire),
+            10 => Some(Self::RunFailureRetire),
+            11 => Some(Self::HostCustodyYield),
+            12 => Some(Self::BirthRollback),
+            13 => Some(Self::BirthQuarantine),
+            14 => Some(Self::HostLostAdoption),
+            15 => Some(Self::HostStaleServiceFree),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessExitPublish => "process_exit_publish",
+            Self::ExitAutoreap => "exit_autoreap",
+            Self::WaitReap => "wait_reap",
+            Self::RegistryUnregisterProcess => "registry_unregister_process",
+            Self::RegistryUnregisterMember => "registry_unregister_member",
+            Self::HostReceiptFold => "host_receipt_fold",
+            Self::RegistryRehomeReplace => "registry_rehome_replace",
+            Self::ThreadRawExit => "thread_raw_exit",
+            Self::ClosingMemberRetire => "closing_member_retire",
+            Self::RunFailureRetire => "run_failure_retire",
+            Self::HostCustodyYield => "host_custody_yield",
+            Self::BirthRollback => "birth_rollback",
+            Self::BirthQuarantine => "birth_quarantine",
+            Self::HostLostAdoption => "host_lost_adoption",
+            Self::HostStaleServiceFree => "host_stale_service_free",
+        }
+    }
+}
+
+/// Exact caller site ID for a `NativeChildLifecycleEvent::Removed` (`NCHILD_LOST`) record.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+#[repr(u16)]
+pub enum NativeChildLostSite {
+    OwnerPublishExit = 101,
+    OwnerExitAutoreap = 102,
+    OwnerConsumeWait4 = 103,
+    OwnerConsumeWaitId = 104,
+    RegistryUnregisterProcess = 201,
+    RegistryUnregisterMember = 202,
+    RegistryFoldHostReceipts = 203,
+    RegistryRehome = 204,
+    RegistryRegisterReplace = 205,
+    RegistryExecSuccessor = 206,
+    EntryRunFailedRetire = 301,
+    EntryRetireThreadCurrent = 302,
+    EntryRetireThreadIdentity = 303,
+    EntryRetireClosingMember = 304,
+    EntryLosingCloseRelease = 305,
+    EntryUserReturnHostCustody = 306,
+    EntryClosingHostCustody = 307,
+    ForkRollbackPrepareMm = 308,
+    ForkRollbackReserve = 309,
+    ForkRollbackPublishPreCommit = 310,
+    ForkQuarantinePublishAbort = 311,
+    ForkQuarantinePostCommit = 312,
+    HostPendingAdoptionLost = 401,
+    HostServiceHeadAdoptionLost = 402,
+    HostStaleServiceFree = 403,
+    HostCurrentHandbackRetired = 404,
+    HostSweepCancelled = 405,
+    HostZoneCancelFree = 406,
+    HostZoneUnplacedFree = 407,
+}
+
+impl NativeChildLostSite {
+    pub const fn raw(self) -> u16 {
+        self as u16
+    }
+
+    pub const fn from_raw(raw: u16) -> Option<Self> {
+        match raw {
+            101 => Some(Self::OwnerPublishExit),
+            102 => Some(Self::OwnerExitAutoreap),
+            103 => Some(Self::OwnerConsumeWait4),
+            104 => Some(Self::OwnerConsumeWaitId),
+            201 => Some(Self::RegistryUnregisterProcess),
+            202 => Some(Self::RegistryUnregisterMember),
+            203 => Some(Self::RegistryFoldHostReceipts),
+            204 => Some(Self::RegistryRehome),
+            205 => Some(Self::RegistryRegisterReplace),
+            206 => Some(Self::RegistryExecSuccessor),
+            301 => Some(Self::EntryRunFailedRetire),
+            302 => Some(Self::EntryRetireThreadCurrent),
+            303 => Some(Self::EntryRetireThreadIdentity),
+            304 => Some(Self::EntryRetireClosingMember),
+            305 => Some(Self::EntryLosingCloseRelease),
+            306 => Some(Self::EntryUserReturnHostCustody),
+            307 => Some(Self::EntryClosingHostCustody),
+            308 => Some(Self::ForkRollbackPrepareMm),
+            309 => Some(Self::ForkRollbackReserve),
+            310 => Some(Self::ForkRollbackPublishPreCommit),
+            311 => Some(Self::ForkQuarantinePublishAbort),
+            312 => Some(Self::ForkQuarantinePostCommit),
+            401 => Some(Self::HostPendingAdoptionLost),
+            402 => Some(Self::HostServiceHeadAdoptionLost),
+            403 => Some(Self::HostStaleServiceFree),
+            404 => Some(Self::HostCurrentHandbackRetired),
+            405 => Some(Self::HostSweepCancelled),
+            406 => Some(Self::HostZoneCancelFree),
+            407 => Some(Self::HostZoneUnplacedFree),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerPublishExit => "owner_publish_exit",
+            Self::OwnerExitAutoreap => "owner_exit_autoreap",
+            Self::OwnerConsumeWait4 => "owner_consume_wait4",
+            Self::OwnerConsumeWaitId => "owner_consume_waitid",
+            Self::RegistryUnregisterProcess => "registry_unregister_process",
+            Self::RegistryUnregisterMember => "registry_unregister_member",
+            Self::RegistryFoldHostReceipts => "registry_fold_host_receipts",
+            Self::RegistryRehome => "registry_rehome",
+            Self::RegistryRegisterReplace => "registry_register_replace",
+            Self::RegistryExecSuccessor => "registry_exec_successor",
+            Self::EntryRunFailedRetire => "entry_run_failed_retire",
+            Self::EntryRetireThreadCurrent => "entry_retire_thread_current",
+            Self::EntryRetireThreadIdentity => "entry_retire_thread_identity",
+            Self::EntryRetireClosingMember => "entry_retire_closing_member",
+            Self::EntryLosingCloseRelease => "entry_losing_close_release",
+            Self::EntryUserReturnHostCustody => "entry_user_return_host_custody",
+            Self::EntryClosingHostCustody => "entry_closing_host_custody",
+            Self::ForkRollbackPrepareMm => "fork_rollback_prepare_mm",
+            Self::ForkRollbackReserve => "fork_rollback_reserve",
+            Self::ForkRollbackPublishPreCommit => "fork_rollback_publish_pre_commit",
+            Self::ForkQuarantinePublishAbort => "fork_quarantine_publish_abort",
+            Self::ForkQuarantinePostCommit => "fork_quarantine_post_commit",
+            Self::HostPendingAdoptionLost => "host_pending_adoption_lost",
+            Self::HostServiceHeadAdoptionLost => "host_service_head_adoption_lost",
+            Self::HostStaleServiceFree => "host_stale_service_free",
+            Self::HostCurrentHandbackRetired => "host_current_handback_retired",
+            Self::HostSweepCancelled => "host_sweep_cancelled",
+            Self::HostZoneCancelFree => "host_zone_cancel_free",
+            Self::HostZoneUnplacedFree => "host_zone_unplaced_free",
+        }
+    }
+}
+
+/// One typed native-child lifecycle event emitted from the neutral owner.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum NativeChildLifecycleEvent {
+    ForkCreated {
+        parent: carrick_sched_core::process::TaskKey,
+        child: carrick_sched_core::process::TaskKey,
+        flags: NativeChildForkFlags,
+    },
+    Exec {
+        task: carrick_sched_core::process::TaskKey,
+        outcome: NativeChildExecOutcome,
+    },
+    Exit {
+        task: carrick_sched_core::process::TaskKey,
+        reason: NativeChildTerminalReason,
+    },
+    ZombiePublished {
+        child: carrick_sched_core::process::TaskKey,
+        parent: carrick_sched_core::process::TaskKey,
+    },
+    ParentWake {
+        parent: carrick_sched_core::process::TaskKey,
+        reason: NativeParentWakeReason,
+        woken: u32,
+    },
+    Reaped {
+        caller: carrick_sched_core::process::TaskKey,
+        child: carrick_sched_core::process::TaskKey,
+        status: carrick_personality_linux::lifecycle::LinuxWaitStatus,
+    },
+    Removed {
+        task: carrick_sched_core::process::TaskKey,
+        reason: NativeChildLostReason,
+        site: NativeChildLostSite,
+        detail: u64,
+    },
+}
+
+#[repr(C, align(64))]
+pub struct NativeChildLifecycleSlot {
+    generation: AtomicU64,
+    tag: AtomicU64,
+    k0_id: AtomicU64,
+    k0_serial: AtomicU64,
+    k1_id: AtomicU64,
+    k1_serial: AtomicU64,
+    aux: AtomicU64,
+    _pad: AtomicU64,
+}
+
+impl NativeChildLifecycleSlot {
+    pub const fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            tag: AtomicU64::new(0),
+            k0_id: AtomicU64::new(0),
+            k0_serial: AtomicU64::new(0),
+            k1_id: AtomicU64::new(0),
+            k1_serial: AtomicU64::new(0),
+            aux: AtomicU64::new(0),
+            _pad: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for NativeChildLifecycleSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Lock-free, zero-initialized MPMC ring for native-child lifecycle events.
+#[repr(C, align(64))]
+pub struct NativeChildLifecycleRing<const N: usize> {
+    write_seq: AtomicU64,
+    read_seq: AtomicU64,
+    _pad: [u64; 6],
+    slots: [NativeChildLifecycleSlot; N],
+}
+
+pub type SharedNativeChildLifecycleRing = NativeChildLifecycleRing<NATIVE_CHILD_LIFECYCLE_CAPACITY>;
+
+impl<const N: usize> NativeChildLifecycleRing<N> {
+    pub const fn new() -> Self {
+        ::core::assert!(N.is_power_of_two());
+        Self {
+            write_seq: AtomicU64::new(0),
+            read_seq: AtomicU64::new(0),
+            _pad: [0; 6],
+            slots: [const { NativeChildLifecycleSlot::new() }; N],
+        }
+    }
+
+    /// Zero-initialize at `ptr` during exclusive boot setup.
+    ///
+    /// # Safety
+    /// `ptr` must be valid, writable, and aligned for `Self`.
+    pub unsafe fn initialize_at(ptr: *mut Self) {
+        ::core::assert!(N.is_power_of_two());
+        // SAFETY: all-zeros is the exact empty representation of `Self`.
+        unsafe { ptr.write_bytes(0, 1) };
+    }
+
+    pub fn emit(&self, event: NativeChildLifecycleEvent) {
+        let (tag, k0_id, k0_serial, k1_id, k1_serial, aux) = encode_lifecycle_event(event);
+        let idx = self.write_seq.fetch_add(1, Ordering::Relaxed);
+        let slot = &self.slots[(idx as usize) & (N - 1)];
+        slot.generation
+            .store(idx.wrapping_mul(2).wrapping_add(1), Ordering::Release);
+        slot.tag.store(tag, Ordering::Relaxed);
+        slot.k0_id.store(k0_id, Ordering::Relaxed);
+        slot.k0_serial.store(k0_serial, Ordering::Relaxed);
+        slot.k1_id.store(k1_id, Ordering::Relaxed);
+        slot.k1_serial.store(k1_serial, Ordering::Relaxed);
+        slot.aux.store(aux, Ordering::Relaxed);
+        slot.generation
+            .store(idx.wrapping_mul(2).wrapping_add(2), Ordering::Release);
+    }
+
+    pub fn pop(&self) -> Option<NativeChildLifecycleEvent> {
+        for _ in 0..N {
+            let write = self.write_seq.load(Ordering::Acquire);
+            let read = self.read_seq.load(Ordering::Acquire);
+            if read >= write {
+                return None;
+            }
+            if write.saturating_sub(read) > N as u64 {
+                let _ = self.read_seq.compare_exchange(
+                    read,
+                    write - N as u64,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                continue;
+            }
+            let slot = &self.slots[(read as usize) & (N - 1)];
+            let expected = read.wrapping_mul(2).wrapping_add(2);
+            let mut g1 = slot.generation.load(Ordering::Acquire);
+            if g1 < expected {
+                for _ in 0..16 {
+                    core::hint::spin_loop();
+                    g1 = slot.generation.load(Ordering::Acquire);
+                    if g1 >= expected {
+                        break;
+                    }
+                }
+                if g1 < expected {
+                    return None;
+                }
+            }
+            if g1 != expected {
+                continue;
+            }
+            let tag = slot.tag.load(Ordering::Relaxed);
+            let k0_id = slot.k0_id.load(Ordering::Relaxed);
+            let k0_serial = slot.k0_serial.load(Ordering::Relaxed);
+            let k1_id = slot.k1_id.load(Ordering::Relaxed);
+            let k1_serial = slot.k1_serial.load(Ordering::Relaxed);
+            let aux = slot.aux.load(Ordering::Relaxed);
+            core::sync::atomic::fence(Ordering::Acquire);
+            let g2 = slot.generation.load(Ordering::Acquire);
+            if g2 != expected {
+                continue;
+            }
+            if self
+                .read_seq
+                .compare_exchange(read, read + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                && let Some(event) =
+                    decode_lifecycle_event(tag, k0_id, k0_serial, k1_id, k1_serial, aux)
+            {
+                return Some(event);
+            }
+        }
+        None
+    }
+}
+
+impl<const N: usize> Default for NativeChildLifecycleRing<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn encode_lifecycle_event(event: NativeChildLifecycleEvent) -> (u64, u64, u64, u64, u64, u64) {
+    match event {
+        NativeChildLifecycleEvent::ForkCreated {
+            parent,
+            child,
+            flags,
+        } => (
+            1,
+            parent.id.raw() as u32 as u64,
+            parent.serial.raw(),
+            child.id.raw() as u32 as u64,
+            child.serial.raw(),
+            u64::from(flags.pack_u16()),
+        ),
+        NativeChildLifecycleEvent::Exec { task, outcome } => (
+            2,
+            task.id.raw() as u32 as u64,
+            task.serial.raw(),
+            u64::from(outcome.succeeded()),
+            0,
+            outcome.detail_i32() as u32 as u64,
+        ),
+        NativeChildLifecycleEvent::Exit { task, reason } => (
+            3,
+            task.id.raw() as u32 as u64,
+            task.serial.raw(),
+            0,
+            0,
+            reason.pack_i32() as u32 as u64,
+        ),
+        NativeChildLifecycleEvent::ZombiePublished { child, parent } => (
+            4,
+            child.id.raw() as u32 as u64,
+            child.serial.raw(),
+            parent.id.raw() as u32 as u64,
+            parent.serial.raw(),
+            0,
+        ),
+        NativeChildLifecycleEvent::ParentWake {
+            parent,
+            reason,
+            woken,
+        } => (
+            5,
+            parent.id.raw() as u32 as u64,
+            parent.serial.raw(),
+            u64::from(reason as u8),
+            0,
+            u64::from(woken),
+        ),
+        NativeChildLifecycleEvent::Reaped {
+            caller,
+            child,
+            status,
+        } => (
+            6,
+            caller.id.raw() as u32 as u64,
+            caller.serial.raw(),
+            child.id.raw() as u32 as u64,
+            child.serial.raw(),
+            status.raw() as u32 as u64,
+        ),
+        NativeChildLifecycleEvent::Removed {
+            task,
+            reason,
+            site,
+            detail,
+        } => (
+            7,
+            task.id.raw() as u32 as u64,
+            task.serial.raw(),
+            u64::from(reason as u8),
+            u64::from(site.raw()),
+            detail,
+        ),
+    }
+}
+
+pub fn task_key_from_record_identity(
+    id_raw: u64,
+    serial_raw: u64,
+) -> Option<carrick_sched_core::process::TaskKey> {
+    decode_task_key(id_raw, serial_raw)
+}
+
+#[inline(never)]
+pub fn emit_native_child_lost(
+    task: carrick_sched_core::process::TaskKey,
+    reason: NativeChildLostReason,
+    site: NativeChildLostSite,
+    detail: u64,
+) {
+    emit_native_child_lifecycle(NativeChildLifecycleEvent::Removed {
+        task,
+        reason,
+        site,
+        detail,
+    });
+}
+
+fn decode_task_key(id_raw: u64, serial_raw: u64) -> Option<carrick_sched_core::process::TaskKey> {
+    let id = core::num::NonZeroI32::new(id_raw as i32)
+        .filter(|v| v.get() > 0)
+        .map(carrick_sched_core::process::TaskId::from_registry_allocation)?;
+    let serial = core::num::NonZeroU64::new(serial_raw)
+        .map(carrick_sched_core::process::TaskSerial::from_registry_allocation)?;
+    Some(carrick_sched_core::process::TaskKey { id, serial })
+}
+
+fn decode_lifecycle_event(
+    tag: u64,
+    k0_id: u64,
+    k0_serial: u64,
+    k1_id: u64,
+    k1_serial: u64,
+    aux: u64,
+) -> Option<NativeChildLifecycleEvent> {
+    use carrick_personality_linux::lifecycle::LinuxWaitStatus;
+    match tag {
+        1 => Some(NativeChildLifecycleEvent::ForkCreated {
+            parent: decode_task_key(k0_id, k0_serial)?,
+            child: decode_task_key(k1_id, k1_serial)?,
+            flags: NativeChildForkFlags::unpack_u16(aux as u16),
+        }),
+        2 => Some(NativeChildLifecycleEvent::Exec {
+            task: decode_task_key(k0_id, k0_serial)?,
+            outcome: if k1_id != 0 {
+                NativeChildExecOutcome::Succeeded
+            } else {
+                NativeChildExecOutcome::from_detail_i32(aux as u32 as i32)
+            },
+        }),
+        3 => Some(NativeChildLifecycleEvent::Exit {
+            task: decode_task_key(k0_id, k0_serial)?,
+            reason: NativeChildTerminalReason::unpack_i32(aux as u32 as i32)?,
+        }),
+        4 => Some(NativeChildLifecycleEvent::ZombiePublished {
+            child: decode_task_key(k0_id, k0_serial)?,
+            parent: decode_task_key(k1_id, k1_serial)?,
+        }),
+        5 => Some(NativeChildLifecycleEvent::ParentWake {
+            parent: decode_task_key(k0_id, k0_serial)?,
+            reason: NativeParentWakeReason::from_raw(k1_id as u8)?,
+            woken: aux as u32,
+        }),
+        6 => {
+            let raw_wstatus = aux as u32 as i32;
+            let status = if (raw_wstatus & 0x7f) == 0 {
+                LinuxWaitStatus::exited(((raw_wstatus >> 8) & 0xff) as u8)
+            } else {
+                LinuxWaitStatus::signaled((raw_wstatus & 0x7f) as u8, (raw_wstatus & 0x80) != 0)
+            };
+            Some(NativeChildLifecycleEvent::Reaped {
+                caller: decode_task_key(k0_id, k0_serial)?,
+                child: decode_task_key(k1_id, k1_serial)?,
+                status,
+            })
+        }
+        7 => Some(NativeChildLifecycleEvent::Removed {
+            task: decode_task_key(k0_id, k0_serial)?,
+            reason: NativeChildLostReason::from_raw(k1_id as u8)?,
+            site: NativeChildLostSite::from_raw(k1_serial as u16)?,
+            detail: aux,
+        }),
+        _ => None,
+    }
+}
+
+/// Host view of the retained native-child lifecycle ring in the EL1 aperture.
+pub fn native_child_lifecycle_host() -> Option<&'static SharedNativeChildLifecycleRing> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: the region owner keeps this mapping alive until it clears the
+    // aperture pointer; all ring fields are atomic and zero-valid.
+    Some(unsafe {
+        &*((ptr + EL1_NATIVE_CHILD_LIFECYCLE_OFFSET as usize)
+            as *const SharedNativeChildLifecycleRing)
+    })
+}
+
+#[cfg(not(target_os = "none"))]
+static HOST_FALLBACK_NATIVE_CHILD_LIFECYCLE: NativeChildLifecycleRing<1024> =
+    NativeChildLifecycleRing::new();
+#[cfg(not(target_os = "none"))]
+static HOST_NATIVE_CHILD_SINK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(target_os = "none"))]
+static HOST_NATIVE_CHILD_FLUSH: AtomicUsize = AtomicUsize::new(0);
+static LAST_FATAL_EXIT_TASK: AtomicU64 = AtomicU64::new(0);
+
+/// Emit a carrier-side terminal exit record for `task` only if an in-ring
+/// fatal exit has not just been recorded for `task.id`.
+#[cfg(not(target_os = "none"))]
+pub fn emit_carrier_fatal_if_unrecorded(
+    task: carrick_sched_core::process::TaskKey,
+    reason: NativeChildTerminalReason,
+) {
+    flush_native_child_lifecycle_to_host();
+    let tid = task.id.raw() as u32 as u64;
+    if LAST_FATAL_EXIT_TASK.swap(tid, Ordering::AcqRel) != tid {
+        emit_native_child_lifecycle(NativeChildLifecycleEvent::Exit { task, reason });
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn host_fallback_native_child_lifecycle() -> &'static NativeChildLifecycleRing<1024> {
+    &HOST_FALLBACK_NATIVE_CHILD_LIFECYCLE
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn register_native_child_lifecycle_host_hooks(
+    sink: fn(NativeChildLifecycleEvent),
+    flush: fn(),
+) {
+    HOST_NATIVE_CHILD_FLUSH.store(flush as usize, Ordering::Release);
+    HOST_NATIVE_CHILD_SINK.store(sink as usize, Ordering::Release);
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn flush_native_child_lifecycle_to_host() {
+    let raw = HOST_NATIVE_CHILD_FLUSH.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: only `register_native_child_lifecycle_host_hooks` writes `raw`
+        // from a valid `fn()` pointer.
+        let flush: fn() = unsafe { core::mem::transmute(raw) };
+        flush();
+    }
+}
+
+/// Drain every ready event from `ring` into the registered host sink (or into
+/// the host fallback buffer if the kernel sink is not yet installed).
+#[cfg(not(target_os = "none"))]
+pub fn drain_native_child_lifecycle_ring<const N: usize>(ring: &NativeChildLifecycleRing<N>) {
+    let raw = HOST_NATIVE_CHILD_SINK.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: only `register_native_child_lifecycle_host_hooks` writes `raw`
+        // from a valid `fn(NativeChildLifecycleEvent)` pointer.
+        let sink: fn(NativeChildLifecycleEvent) = unsafe { core::mem::transmute(raw) };
+        while let Some(event) = ring.pop() {
+            sink(event);
+        }
+    } else {
+        while let Some(event) = ring.pop() {
+            HOST_FALLBACK_NATIVE_CHILD_LIFECYCLE.emit(event);
+        }
+    }
+}
+
+/// Emit one native-child lifecycle event without allocating or causing a VM exit.
+#[inline(never)]
+pub fn emit_native_child_lifecycle(event: NativeChildLifecycleEvent) {
+    if let NativeChildLifecycleEvent::Exit { task, reason } = event
+        && ::core::matches!(
+            reason,
+            NativeChildTerminalReason::NativeRunFailure(_)
+                | NativeChildTerminalReason::EntryBindingFatal(_)
+                | NativeChildTerminalReason::CarrierFatal(_)
+        )
+    {
+        LAST_FATAL_EXIT_TASK.store(task.id.raw() as u32 as u64, Ordering::Release);
+    }
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        // SAFETY: EL1_NATIVE_CHILD_LIFECYCLE_BASE is mapped inside the kernel-only
+        // EL1 ABI region and its layout is checked in EL1_ABI_LAYOUT_HASH.
+        let ring =
+            unsafe { &*(EL1_NATIVE_CHILD_LIFECYCLE_BASE as *const SharedNativeChildLifecycleRing) };
+        ring.emit(event);
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        // SAFETY: X86_CPL0_NATIVE_CHILD_LIFECYCLE_BASE is mapped inside the
+        // CPL0 supervisor metadata region and checked in EL1_ABI_LAYOUT_HASH.
+        let ring = unsafe {
+            &*(X86_CPL0_NATIVE_CHILD_LIFECYCLE_BASE as *const SharedNativeChildLifecycleRing)
+        };
+        ring.emit(event);
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let raw = HOST_NATIVE_CHILD_SINK.load(Ordering::Acquire);
+        if raw != 0 {
+            // SAFETY: only `register_native_child_lifecycle_host_hooks` writes
+            // `raw` from a valid `fn(NativeChildLifecycleEvent)` pointer.
+            let sink: fn(NativeChildLifecycleEvent) = unsafe { core::mem::transmute(raw) };
+            sink(event);
+        } else {
+            HOST_FALLBACK_NATIVE_CHILD_LIFECYCLE.emit(event);
+        }
+    }
 }
 
 /// Guest view of the shared metadata mailbox. Call only while executing in

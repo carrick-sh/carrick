@@ -1013,51 +1013,61 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if !self.retains_ipc_operation(exit) {
             return self.finish_service_handoff(result);
         }
-        let result = result.map_err(|error| match error {
-            NativeProcessError::ForkRefused(refusal) => refusal.error(),
-            error => error,
-        });
-        let result = match result {
-            Ok(NativeResume::RetrySyscall) => self.yield_service_checkpoint()?,
-            Ok(result) => result,
-            Err(
-                NativeProcessError::Invalid
-                | NativeProcessError::Stale
-                | NativeProcessError::Quarantined,
-            ) => return result,
-            Err(NativeProcessError::ServiceQuarantined(_)) => return result,
-            // The wrapper was decoded above; another wrapper is a codec invariant.
-            Err(NativeProcessError::ForkRefused(_)) => return Err(NativeProcessError::Invalid),
-            Err(
-                NativeProcessError::Busy
-                | NativeProcessError::Exhausted
-                | NativeProcessError::OwnerWait(_)
-                | NativeProcessError::GroupExitCustody,
-            ) => {
-                // The same IPC owner reselects preparation at its checkpoint,
-                // including enrollment on an explicit owner dependency. No
-                // user result or fresh syscall may replace the retained token.
-                self.yield_service_checkpoint()?
+        let settled = (|| -> Result<NativeResume, NativeProcessError> {
+            let result = result.map_err(|error| match error {
+                NativeProcessError::ForkRefused(refusal) => refusal.error(),
+                error => error,
+            });
+            let result = match result {
+                Ok(NativeResume::RetrySyscall) => self.yield_service_checkpoint()?,
+                Ok(result) => result,
+                Err(
+                    NativeProcessError::Invalid
+                    | NativeProcessError::Stale
+                    | NativeProcessError::Quarantined,
+                ) => return result,
+                Err(NativeProcessError::ServiceQuarantined(_)) => return result,
+                // The wrapper was decoded above; another wrapper is a codec invariant.
+                Err(NativeProcessError::ForkRefused(_)) => {
+                    return Err(NativeProcessError::Invalid);
+                }
+                Err(
+                    NativeProcessError::Busy
+                    | NativeProcessError::Exhausted
+                    | NativeProcessError::OwnerWait(_)
+                    | NativeProcessError::GroupExitCustody,
+                ) => {
+                    // The same IPC owner reselects preparation at its checkpoint,
+                    // including enrollment on an explicit owner dependency. No
+                    // user result or fresh syscall may replace the retained token.
+                    self.yield_service_checkpoint()?
+                }
+                Err(NativeProcessError::Fault) => {
+                    self.retire_adapter_failure(NativeFailure::Fault)?
+                }
+                Err(NativeProcessError::Unsupported) => {
+                    self.retire_adapter_failure(NativeFailure::Unsupported)?
+                }
+                Err(NativeProcessError::NoChild) => {
+                    self.retire_adapter_failure(NativeFailure::NoChild)?
+                }
+            };
+            if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
+                // The operation is still installed: an empty receipt after a
+                // deferred preparation is not failed execution authentication.
+                let result = self.yield_service_checkpoint()?;
+                self.take_handoff_receipt()
+                    .ok_or(NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::HandoffAuthentication,
+                    ))?;
+                return Ok(result);
             }
-            Err(NativeProcessError::Fault) => self.retire_adapter_failure(NativeFailure::Fault)?,
-            Err(NativeProcessError::Unsupported) => {
-                self.retire_adapter_failure(NativeFailure::Unsupported)?
-            }
-            Err(NativeProcessError::NoChild) => {
-                self.retire_adapter_failure(NativeFailure::NoChild)?
-            }
-        };
-        if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
-            // The operation is still installed: an empty receipt after a
-            // deferred preparation is not failed execution authentication.
-            let result = self.yield_service_checkpoint()?;
-            self.take_handoff_receipt()
-                .ok_or(NativeProcessError::ServiceQuarantined(
-                    NativeServiceQuarantine::HandoffAuthentication,
-                ))?;
-            return Ok(result);
+            Ok(result)
+        })();
+        if let Err(error) = &settled {
+            self.record_entry_binding_fatal(error.entry_binding_fatal_reason(self.service_phase));
         }
-        Ok(result)
+        settled
     }
 
     #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -1403,22 +1413,32 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // descriptor `execveat` names in the caller's ring table (#1530).
         let access = match self.caller_access(call) {
             Ok(access) => access,
-            Err(failure) => return Ok(failure.into_resume()),
+            Err(failure) => {
+                let resume = failure.into_resume();
+                if let NativeResume::Returned(result) = resume {
+                    self.record_child_exec(carrick_el1_abi::NativeChildExecOutcome::RefusedErrno(
+                        (-result.raw()) as i32,
+                    ));
+                }
+                return Ok(resume);
+            }
         };
         let mut sealed = payload.into_vec();
         if let Err(error) =
             carrick_core_abi::service::seal_exec_payload_access(&mut sealed, &access, table)
         {
-            return Ok(NativeResume::Returned(SyscallResult::from_errno(
-                match error {
-                    carrick_core_abi::service::ExecPayloadError::TooLarge => {
-                        carrick_syscall_abi::LINUX_E2BIG
-                    }
-                    carrick_core_abi::service::ExecPayloadError::Invalid => {
-                        carrick_syscall_abi::LINUX_EINVAL
-                    }
-                },
-            )));
+            let errno = match error {
+                carrick_core_abi::service::ExecPayloadError::TooLarge => {
+                    carrick_syscall_abi::LINUX_E2BIG
+                }
+                carrick_core_abi::service::ExecPayloadError::Invalid => {
+                    carrick_syscall_abi::LINUX_EINVAL
+                }
+            };
+            self.record_child_exec(carrick_el1_abi::NativeChildExecOutcome::RefusedErrno(
+                (-errno.guest_retval()) as i32,
+            ));
+            return Ok(NativeResume::Returned(SyscallResult::from_errno(errno)));
         }
         let payload = sealed.into_boxed_slice();
         self.service_phase = NativeServicePhase::Capability;
@@ -1828,13 +1848,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         result: Result<NativeResume, NativeProcessError>,
     ) -> Result<NativeResume, NativeProcessError> {
-        let result = result?;
-        if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
-            return Err(NativeProcessError::ServiceQuarantined(
-                NativeServiceQuarantine::HandoffAuthentication,
-            ));
+        let settled = (|| -> Result<NativeResume, NativeProcessError> {
+            let result = result?;
+            if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
+                return Err(NativeProcessError::ServiceQuarantined(
+                    NativeServiceQuarantine::HandoffAuthentication,
+                ));
+            }
+            Ok(result)
+        })();
+        if let Err(error) = &settled {
+            self.record_entry_binding_fatal(error.entry_binding_fatal_reason(self.service_phase));
         }
-        Ok(result)
+        settled
     }
 
     /// Stage a native entropy call through the same owner on every ISA.
@@ -3651,6 +3677,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         row.dumpable = 1;
         graph.pending.remove_process_child_waits(&self.key);
 
+        let is_child = self.key != graph.root_key;
+        let replaced_key = old_key != validated.new_key;
         member.address = successor.address;
         let _ = state.members.remove(&old_key);
         state
@@ -3665,6 +3693,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             (validated.new_key.carrier, self.key),
             (validated.new_group, vec![validated.new_key]),
         );
+        if is_child && replaced_key {
+            carrick_el1_abi::emit_native_child_lost(
+                self.key,
+                carrick_el1_abi::NativeChildLostReason::RegistryRehomeReplace,
+                carrick_el1_abi::NativeChildLostSite::RegistryExecSuccessor,
+                u64::from(self.record.id.raw()),
+            );
+        }
 
         // SAFETY: validation above proved this exact predecessor identity and
         // the closed process owns the sole live member.
@@ -3856,6 +3892,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// fatal `SIGKILL` already won, yield to that winner's terminal status.
     #[inline(never)]
     fn exec_past_no_return(&mut self) -> NativeResume {
+        self.record_child_exec(carrick_el1_abi::NativeChildExecOutcome::PastNoReturn);
         let lost_race = {
             let graph = self.runtime.graph.lock();
             graph.pending.has_exit(&self.key)
@@ -4153,10 +4190,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // converted into process closing and must never resurrect the
             // predecessor gate.
             if settled.retract_exec_cancellation(page).is_err() {
+                self.record_child_exec(carrick_el1_abi::NativeChildExecOutcome::PastNoReturn);
                 return Ok(self.retire_lost_exec_race());
             }
             page.reopen_after_exec_binding()
                 .map_err(|_| NativeProcessError::Stale)?;
+            self.record_child_exec(carrick_el1_abi::NativeChildExecOutcome::Succeeded);
         }
         result
     }
@@ -4724,9 +4763,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 (_, ServiceResult::BackingFault) => Err(NativeProcessError::ServiceQuarantined(
                     NativeServiceQuarantine::UnexpectedBackingFault,
                 )),
-                (ServiceOperation::Exec { .. }, ServiceResult::Failed(failure)) => Ok(
-                    NativeResume::Returned(SyscallResult::new(-i64::from(failure.raw()))),
-                ),
+                (ServiceOperation::Exec { .. }, ServiceResult::Failed(failure)) => {
+                    self.record_child_exec(carrick_el1_abi::NativeChildExecOutcome::RefusedErrno(
+                        failure.raw() as i32,
+                    ));
+                    Ok(NativeResume::Returned(SyscallResult::new(-i64::from(
+                        failure.raw(),
+                    ))))
+                }
                 (_, ServiceResult::Failed(_)) => Err(NativeProcessError::ServiceQuarantined(
                     NativeServiceQuarantine::UnexpectedFailureResult,
                 )),
@@ -4880,6 +4924,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     NativeServiceQuarantine::UnexpectedExecPrepared,
                 )),
                 (ServiceOperation::Exec { .. }, ServiceResult::Refused) => {
+                    self.record_child_exec(carrick_el1_abi::NativeChildExecOutcome::RefusedErrno(
+                        (-carrick_syscall_abi::LINUX_ENOSYS.guest_retval()) as i32,
+                    ));
                     Ok(NativeResume::Returned(SyscallResult::new(
                         carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
                     )))

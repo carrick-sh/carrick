@@ -527,6 +527,10 @@ where
                         parked_context(ctx, &ctx_state, zone.record(current).identity())?
                 };
                 let current_ref = zone.record_ref(current);
+                let current_native = zone
+                    .record(current)
+                    .is_native_owned()
+                    .then(|| zone.record(current).identity());
                 match zone.handback_current(slot, current) {
                     CurrentHandback::HandedBack => {
                         zone.counters
@@ -534,7 +538,16 @@ where
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         owe_adoption(current_ref);
                     }
-                    CurrentHandback::Retired => {}
+                    CurrentHandback::Retired => {
+                        if let Some(identity) = current_native {
+                            carrick_kernel::el1_zone::record_native_identity_lost(
+                                identity,
+                                carrick_el1_abi::NativeChildLostReason::HostStaleServiceFree,
+                                carrick_el1_abi::NativeChildLostSite::HostCurrentHandbackRetired,
+                                u64::from(current.raw()),
+                            );
+                        }
+                    }
                     CurrentHandback::Lost => {
                         return Err(RuntimeError::Configuration(format!(
                             "EL1 zone slot {slot:?} switched-in record {current:?} was not on the slot"

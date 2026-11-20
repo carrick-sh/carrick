@@ -5401,6 +5401,43 @@ mod native_owned_range_probe_abi {
     }
 }
 
+#[cfg(test)]
+mod native_child_lifecycle_probe_abi {
+    #[test]
+    fn native_child_lifecycle_provider_and_stub_keep_scalar_shapes_within_five_args() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn native__child__fork(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
+            "fn native__child__exec(_: u64, _: u64, _: u32, _: i32) {}",
+            "fn native__child__exit(_: u64, _: u64, _: u32, _: u32, _: u32) {}",
+            "fn native__child__zombie(_: u64, _: u64, _: u64, _: u64) {}",
+            "fn native__child__wake(_: u64, _: u64, _: u32, _: u32) {}",
+            "fn native__child__reap(_: u64, _: u64, _: u64, _: u64, _: u32) {}",
+            "fn native__child__lost(_: u64, _: u64, _: u32, _: u32, _: u64) {}",
+            "stub!(native_child_fork(parent_id: u64, parent_serial: u64, child_id: u64, child_serial: u64, flags: u64));",
+            "stub!(native_child_exec(task_id: u64, task_serial: u64, succeeded: u32, detail: i32));",
+            "stub!(native_child_exit(task_id: u64, task_serial: u64, reason_class: u32, reason_code: u32, wait_status: u32));",
+            "stub!(native_child_zombie(child_id: u64, child_serial: u64, parent_id: u64, parent_serial: u64));",
+            "stub!(native_child_wake(parent_id: u64, parent_serial: u64, wake_reason: u32, woken: u32));",
+            "stub!(native_child_reap(caller_id: u64, caller_serial: u64, child_id: u64, child_serial: u64, wait_status: u32));",
+            "stub!(native_child_lost(task_id: u64, task_serial: u64, reason: u32, site: u32, detail: u64));",
+        ] {
+            assert!(
+                source.contains(declaration),
+                "missing native-child lifecycle probe declaration {declaration:?}"
+            );
+        }
+        // Call the exported wrappers to verify stub/real signature parity.
+        super::native_child_fork(1, 1, 2, 1, 17);
+        super::native_child_exec(2, 1, 1, 0);
+        super::native_child_exit(2, 1, 1, 0, 0);
+        super::native_child_zombie(2, 1, 1, 1);
+        super::native_child_wake(1, 1, 1, 1);
+        super::native_child_reap(1, 1, 2, 1, 0);
+        super::native_child_lost(2, 1, 1, 101, 0);
+    }
+}
+
 #[cfg(carrick_usdt_probes)]
 mod real {
     //! THEORY OF OPERATION
@@ -6562,6 +6599,29 @@ mod real {
         /// configured subrange. Kept separate because macOS DTrace drops a sixth
         /// USDT argument at some probe sites.
         fn guest__mem__subcount(_: u32, _: u64, _: u64, _: u64) {}
+        /// Native child fork created in ring: parent TaskKey (id, serial),
+        /// child TaskKey (id, serial), and packed `NativeChildForkFlags`.
+        fn native__child__fork(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Native child exec transition: TaskKey (id, serial), succeeded (1/0),
+        /// and Linux errno (>0) or -1 for past-no-return cancellation.
+        fn native__child__exec(_: u64, _: u64, _: u32, _: i32) {}
+        /// Native child exit / terminal fatal transition: TaskKey (id, serial),
+        /// reason class (1=exited, 2=signaled, 3=run_failure, 4=entry_fatal,
+        /// 5=carrier_fatal), reason code, and Linux wait_status (0 if none).
+        fn native__child__exit(_: u64, _: u64, _: u32, _: u32, _: u32) {}
+        /// Native child zombie published to parent: child TaskKey (id, serial)
+        /// and parent TaskKey (id, serial).
+        fn native__child__zombie(_: u64, _: u64, _: u64, _: u64) {}
+        /// Waiting parent wake (or non-wake at child exit): parent TaskKey
+        /// (id, serial), wake_reason (1=child_exit, 2=signal, 3=none), woken.
+        fn native__child__wake(_: u64, _: u64, _: u32, _: u32) {}
+        /// Native child reaped by wait4/waitid: caller TaskKey (id, serial),
+        /// child TaskKey (id, serial), and Linux wait_status.
+        fn native__child__reap(_: u64, _: u64, _: u64, _: u64, _: u32) {}
+        /// Native child task, member, or scheduler record removed, retired,
+        /// yielded, rolled back, or dropped: TaskKey (id, serial), typed
+        /// `NativeChildLostReason`, caller `NativeChildLostSite`, and detail.
+        fn native__child__lost(_: u64, _: u64, _: u32, _: u32, _: u64) {}
     }
 
     #[inline(always)]
@@ -9418,6 +9478,84 @@ mod real {
         carrick_usdt::signal__restart__decision!(|| (tid, signum, syscall_nr, retval, predicates));
     }
 
+    #[inline(always)]
+    pub fn native_child_fork(
+        parent_id: u64,
+        parent_serial: u64,
+        child_id: u64,
+        child_serial: u64,
+        flags: u64,
+    ) {
+        carrick_usdt::native__child__fork!(|| (
+            parent_id,
+            parent_serial,
+            child_id,
+            child_serial,
+            flags,
+        ));
+    }
+
+    #[inline(always)]
+    pub fn native_child_exec(task_id: u64, task_serial: u64, succeeded: u32, detail: i32) {
+        carrick_usdt::native__child__exec!(|| (task_id, task_serial, succeeded, detail));
+    }
+
+    #[inline(always)]
+    pub fn native_child_exit(
+        task_id: u64,
+        task_serial: u64,
+        reason_class: u32,
+        reason_code: u32,
+        wait_status: u32,
+    ) {
+        carrick_usdt::native__child__exit!(|| (
+            task_id,
+            task_serial,
+            reason_class,
+            reason_code,
+            wait_status,
+        ));
+    }
+
+    #[inline(always)]
+    pub fn native_child_zombie(
+        child_id: u64,
+        child_serial: u64,
+        parent_id: u64,
+        parent_serial: u64,
+    ) {
+        carrick_usdt::native__child__zombie!(
+            || (child_id, child_serial, parent_id, parent_serial,)
+        );
+    }
+
+    #[inline(always)]
+    pub fn native_child_wake(parent_id: u64, parent_serial: u64, wake_reason: u32, woken: u32) {
+        carrick_usdt::native__child__wake!(|| (parent_id, parent_serial, wake_reason, woken));
+    }
+
+    #[inline(always)]
+    pub fn native_child_reap(
+        caller_id: u64,
+        caller_serial: u64,
+        child_id: u64,
+        child_serial: u64,
+        wait_status: u32,
+    ) {
+        carrick_usdt::native__child__reap!(|| (
+            caller_id,
+            caller_serial,
+            child_id,
+            child_serial,
+            wait_status,
+        ));
+    }
+
+    #[inline(always)]
+    pub fn native_child_lost(task_id: u64, task_serial: u64, reason: u32, site: u32, detail: u64) {
+        carrick_usdt::native__child__lost!(|| (task_id, task_serial, reason, site, detail));
+    }
+
     pub fn register_dtrace_probes() -> Result<(), super::ProbeRegistrationError> {
         // Install the compat reporter's per-event probe hook so every recorded
         // CompatEvent fires its DTrace probe. compat lives in the neutral
@@ -10102,6 +10240,13 @@ mod stub {
 
     stub!(native_x86_xstate_edge(probe: NativeX86XstateProbe));
     stub!(native_x86_xstate(probe: NativeX86XstateProbe));
+    stub!(native_child_fork(parent_id: u64, parent_serial: u64, child_id: u64, child_serial: u64, flags: u64));
+    stub!(native_child_exec(task_id: u64, task_serial: u64, succeeded: u32, detail: i32));
+    stub!(native_child_exit(task_id: u64, task_serial: u64, reason_class: u32, reason_code: u32, wait_status: u32));
+    stub!(native_child_zombie(child_id: u64, child_serial: u64, parent_id: u64, parent_serial: u64));
+    stub!(native_child_wake(parent_id: u64, parent_serial: u64, wake_reason: u32, woken: u32));
+    stub!(native_child_reap(caller_id: u64, caller_serial: u64, child_id: u64, child_serial: u64, wait_status: u32));
+    stub!(native_child_lost(task_id: u64, task_serial: u64, reason: u32, site: u32, detail: u64));
 
     pub fn with_fork_footprint_class_probe<F>(_emit: F)
     where

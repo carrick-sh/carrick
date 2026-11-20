@@ -57,7 +57,7 @@ std::thread_local! {
 }
 
 /// Refuse the next Physical fork preparations, in order.
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 pub(crate) fn fail_prepare_mm(errors: &[NativeProcessError]) {
     PREPARE_MM_ERRORS.with(|queue| *queue.borrow_mut() = errors.iter().copied().collect());
 }
