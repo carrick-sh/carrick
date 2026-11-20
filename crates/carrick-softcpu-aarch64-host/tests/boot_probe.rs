@@ -879,6 +879,8 @@ fn provider_handoffs_reuse_only_the_current_code_incarnation() {
     // A new owner may have the original owner's numerical page generation.
     let mut other = Pages::default();
     load_words(&mut other, PC, &[0xd400_00a2]); // hvc #5
+    let frame = FrameGpa::new(PC);
+    assert_eq!(other.mark_code_page(frame), memory.code_generation(frame));
     assert_eq!(resume(&mut other, 5), 1);
     assert_eq!(resume(&mut memory, 2), 1);
 
