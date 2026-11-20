@@ -725,21 +725,26 @@ fn detail_diagnostic(detail: &ContinuationDetail, futex: Option<ZoneFutexDiagnos
             );
             if let Some(futex) = futex {
                 use std::fmt::Write as _;
-                let frame = futex.registers;
+                let ZoneFutexDiagnostic {
+                    mm,
+                    uaddr,
+                    op,
+                    expected,
+                    bitset,
+                    timeout,
+                    deadline_ticks,
+                    registers,
+                    ..
+                } = futex;
+                let ZoneFutexRegisters {
+                    syscall_number,
+                    args,
+                    pc,
+                    lr,
+                } = registers;
                 let _ = write!(
                     detail,
-                    " mm={} uaddr={:#x} op={:?} expected={:?} bitset={:#x} timeout={:?} deadline_ticks={:?} syscall={} args={:x?} pc={:#x} lr={:x?}",
-                    futex.mm,
-                    futex.uaddr,
-                    futex.op,
-                    futex.expected,
-                    futex.bitset,
-                    futex.timeout,
-                    futex.deadline_ticks,
-                    frame.syscall_number,
-                    frame.args,
-                    frame.pc,
-                    frame.lr,
+                    " mm={mm} uaddr={uaddr:#x} op={op:?} expected={expected:?} bitset={bitset:#x} timeout={timeout:?} deadline_ticks={deadline_ticks:?} syscall={syscall_number} args={args:x?} pc={pc:#x} lr={lr:x?}",
                 );
             }
             detail
