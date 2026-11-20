@@ -4,9 +4,9 @@ use crate::abi::entry::SyscallResult;
 use crate::lifecycle::{LifecycleNative, LifecycleOutcome};
 use carrick_guest_arch::{CounterFrequency, CounterTick, UserVa};
 use carrick_syscall_abi::{
-    LINUX_CLOCK_MONOTONIC, LINUX_CLOCK_MONOTONIC_RAW, LINUX_CLOCK_REALTIME,
-    LINUX_CLOCK_REALTIME_COARSE, LINUX_CLOCK_RESOLUTION_NSEC, LINUX_EINVAL,
-    linux_clock_resolution_ns,
+    LINUX_CLOCK_MONOTONIC, LINUX_CLOCK_MONOTONIC_RAW, LINUX_CLOCK_PROCESS_CPUTIME_ID,
+    LINUX_CLOCK_REALTIME, LINUX_CLOCK_REALTIME_COARSE, LINUX_CLOCK_RESOLUTION_NSEC,
+    LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_EINVAL, linux_clock_resolution_ns,
 };
 
 pub(crate) fn clock_getres(native: &mut dyn LifecycleNative<'_>) -> LifecycleOutcome {
@@ -42,8 +42,15 @@ const fn uses_realtime_words(clock: u64) -> bool {
     )
 }
 
+const fn uses_cputime_accounting(clock: u64) -> bool {
+    matches!(
+        clock as i32 as u64,
+        LINUX_CLOCK_PROCESS_CPUTIME_ID | LINUX_CLOCK_THREAD_CPUTIME_ID
+    )
+}
+
 pub(crate) const fn serves_clock_gettime(clock: u64) -> bool {
-    uses_realtime_words(clock) || uses_monotonic_counter(clock)
+    uses_realtime_words(clock) || uses_monotonic_counter(clock) || uses_cputime_accounting(clock)
 }
 
 fn counter_nanos(sample: CounterTick, frequency: CounterFrequency) -> u64 {
@@ -55,7 +62,7 @@ pub(crate) fn clock_gettime(native: &mut dyn LifecycleNative<'_>) -> Option<Life
     use carrick_syscall_abi::LINUX_EFAULT;
 
     let [clock, output, ..] = native.arguments();
-    if !serves_clock_gettime(clock) {
+    if native.declines_time_family() || !serves_clock_gettime(clock) {
         return None;
     }
     if output == 0 {
@@ -64,13 +71,18 @@ pub(crate) fn clock_gettime(native: &mut dyn LifecycleNative<'_>) -> Option<Life
             work: false,
         });
     }
+    let clock_id = clock as i32 as u64;
     let mut nanos = if uses_realtime_words(clock) {
         realtime_nanos(native)?
+    } else if clock_id == LINUX_CLOCK_PROCESS_CPUTIME_ID {
+        native.process_cputime_nanos()?
+    } else if clock_id == LINUX_CLOCK_THREAD_CPUTIME_ID {
+        native.thread_cputime_nanos()?
     } else {
         let (sample, frequency) = native.monotonic_counter()?;
         counter_nanos(sample, frequency)
     };
-    if clock as i32 as u64 == LINUX_CLOCK_REALTIME_COARSE {
+    if clock_id == LINUX_CLOCK_REALTIME_COARSE {
         nanos -= nanos % LINUX_CLOCK_RESOLUTION_NSEC as u64;
     }
     Some(native.finish_signal_output(
@@ -91,6 +103,10 @@ pub(crate) fn realtime_alias(
 ) -> Option<LifecycleOutcome> {
     use carrick_syscall_abi::{CARRICK_PRIVATE_X86_TIME, LinuxTimeval, LinuxTimezone};
     use zerocopy::IntoBytes;
+
+    if native.declines_time_family() {
+        return None;
+    }
 
     let [first, second, ..] = native.arguments();
     let (records, result) = if ordinal == CARRICK_PRIVATE_X86_TIME {
@@ -117,4 +133,16 @@ pub(crate) fn realtime_alias(
         ([timeval, timezone], SyscallResult::new(0))
     };
     Some(native.finish_time_output(records, result))
+}
+
+pub(crate) fn times(native: &mut dyn LifecycleNative<'_>) -> Option<LifecycleOutcome> {
+    use zerocopy::IntoBytes;
+
+    if native.declines_time_family() {
+        return None;
+    }
+    let [output, ..] = native.arguments();
+    let (clock, tms) = native.process_times()?;
+    let record = (output != 0).then(|| (UserVa::new(output), tms.as_bytes().to_vec()));
+    Some(native.finish_time_output([record, None], SyscallResult::new(clock)))
 }

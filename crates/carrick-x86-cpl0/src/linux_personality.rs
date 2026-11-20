@@ -687,6 +687,7 @@ pub fn signal_irq_return(
             }
             // IRQ entry owns this running/home record: a refusal is a broken
             // invariant, never contention (#1100).
+            with_admitted_slot_zone(slot, |zone, now| zone.close_slot_cpu(slot, now));
             if !source.zone.requeue_preempted(slot, record).is_queued() {
                 fatal_boot();
             }
@@ -698,6 +699,32 @@ pub fn signal_irq_return(
     if suspended {
         native_execution::schedule(slot);
     }
+}
+
+fn with_admitted_slot_zone(
+    slot: SlotId,
+    f: impl FnOnce(
+        &carrick_el1::memory::reservations::X86Cpl0Zone,
+        carrick_guest_arch::CounterTick,
+    ),
+) {
+    let Some(binding) = carrick_el1::isa::x86::context::current_cpu_binding() else {
+        return;
+    };
+    if binding.task_address == 0 {
+        return;
+    }
+    // SAFETY: the active CPU binding names this CPU's retained CurrentTask.
+    let task = unsafe { &*(binding.task_address as *const CurrentTask) };
+    if task.mm.key.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let Ok(now) =
+        carrick_guest_arch::InterruptBackend::counter(&mut carrick_el1::isa::x86::X86Backend)
+    else {
+        return;
+    };
+    f(carrick_x86_carrier::native_execution::source(slot).zone, now);
 }
 
 pub fn handle_user_page_fault(frame: &mut PageFaultStack, fpstate: &XsaveArea) -> u64 {
@@ -713,7 +740,8 @@ pub fn handle_user_page_fault_prepared(
     frame: &mut PageFaultStack,
     fpstate: &XsaveArea,
 ) -> u64 {
-    match supply_user_fault(prep) {
+    with_admitted_slot_zone(prep.slot, |zone, now| zone.note_ring_entry(prep.slot, now));
+    let outcome = match supply_user_fault(prep) {
         UserFaultSupply::Served => 0,
         UserFaultSupply::Signal {
             signum,
@@ -721,7 +749,13 @@ pub fn handle_user_page_fault_prepared(
             address,
         } => deliver_page_fault_signal(frame, fpstate, signum, code, address),
         UserFaultSupply::Unresolved(reason) => reason,
+    };
+    if outcome == 0 {
+        with_admitted_slot_zone(prep.slot, |zone, now| zone.note_user_entry(prep.slot, now));
+    } else {
+        with_admitted_slot_zone(prep.slot, |zone, now| zone.close_slot_cpu(prep.slot, now));
     }
+    outcome
 }
 
 /// What the owner fault path made of one user access.
@@ -1664,6 +1698,14 @@ impl Personality for LinuxPersonality {
 
     fn on_timer(&mut self, slot: SlotId) {
         native_execution::expire_signal_timer(slot);
+    }
+
+    fn on_ring_entry(&mut self, slot: SlotId) {
+        with_admitted_slot_zone(slot, |zone, now| zone.note_ring_entry(slot, now));
+    }
+
+    fn on_ring_exit_to_user(&mut self, slot: SlotId) {
+        with_admitted_slot_zone(slot, |zone, now| zone.note_user_entry(slot, now));
     }
 
     fn has_pending_host_work(&mut self, task: &CurrentTask) -> bool {

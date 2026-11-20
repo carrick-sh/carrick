@@ -538,6 +538,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// leaves the caller's host handoff intact, so its execution capacity can
     /// be released without sending a native child to a host-task adopter.
     pub fn run_ready(&mut self, frame: &mut TrapFrame) -> Option<Served> {
+        self.zone
+            .close_slot_cpu(self.slot, carrick_guest_arch::CounterTick::new(self.cpu.now()));
         if let Some(served) = self.enforce_affinity(frame, CpuExitCause::Svc) {
             return Some(served);
         }
@@ -660,6 +662,11 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// ([`Self::service_exit`]), which loads it.
     fn load(&mut self, frame: &mut TrapFrame, switched: SwitchedIn) -> LoadResult {
         let (zone, slot) = (self.zone, self.slot);
+        zone.open_slot_system(
+            slot,
+            switched.record,
+            carrick_guest_arch::CounterTick::new(self.cpu.now()),
+        );
         let rec = zone.record(switched.record);
         // Paired with the affinity writer's claim inspection: no admission
         // may miss both the narrowed mask and the exact running-slot prompt.
@@ -667,6 +674,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if zone.current_affinity_excludes_cpu(slot) {
             // The frame still belongs to the previous task. Requeue the
             // target's saved context without saving these old registers.
+            zone.close_slot_cpu(slot, carrick_guest_arch::CounterTick::new(self.cpu.now()));
             zone.unswitch(slot, switched.record);
             let mut effects = WakeEffects::default();
             zone.migrate_queued(slot, &mut effects);
@@ -674,6 +682,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return LoadResult::NeedsHost;
         }
         if !self.enter_space(rec.identity().mm, rec.has_native_execution_owner()) {
+            zone.close_slot_cpu(slot, carrick_guest_arch::CounterTick::new(self.cpu.now()));
             zone.unswitch(slot, switched.record);
             return LoadResult::NeedsHost;
         }
@@ -699,6 +708,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             // x0, rather than installing the scheduler's wake result.
             ResumeAction::RetrySavedSyscall | ResumeAction::RetrySyscall => None,
             ResumeAction::Left => {
+                zone.close_slot_cpu(slot, carrick_guest_arch::CounterTick::new(self.cpu.now()));
                 self.leave_space();
                 return LoadResult::Left;
             }
@@ -805,6 +815,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// its timed park) or host work arrives.
     pub fn idle(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
         let (zone, slot) = (self.zone, self.slot);
+        zone.close_slot_cpu(slot, carrick_guest_arch::CounterTick::new(self.cpu.now()));
         zone.counters
             .el1_idle_entries
             .fetch_add(1, Ordering::Relaxed);
@@ -1072,6 +1083,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let Ok(prev) = self.current_record() else {
             return false;
         };
+        zone.close_slot_cpu(slot, carrick_guest_arch::CounterTick::new(self.cpu.now()));
         // SAFETY: `prev` holds the running thread (a fresh home record, or
         // the switched-in OnCpu one): this vCPU is its only owner.
         self.cpu
@@ -1108,6 +1120,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         // the switched-in OnCpu one): this vCPU is its only owner.
         self.cpu
             .save(frame, unsafe { zone.record(prev).ctx_mut() }, exit);
+        zone.close_slot_cpu(slot, carrick_guest_arch::CounterTick::new(self.cpu.now()));
         match zone.switch_in_full(slot) {
             Some(switched) => {
                 if !requeue_owned(zone, slot, prev) {
@@ -1131,6 +1144,12 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 // from its queue). Keep running `prev`.
                 if fresh {
                     zone.discard_unpublished(slot, prev);
+                } else {
+                    zone.open_slot_system(
+                        slot,
+                        prev,
+                        carrick_guest_arch::CounterTick::new(self.cpu.now()),
+                    );
                 }
                 (
                     true,
@@ -1286,13 +1305,37 @@ impl El1Exit {
         cpu: &mut impl ThreadCpu,
     ) -> Self {
         use carrick_el1_abi::Action;
+        let now = carrick_guest_arch::CounterTick::new(cpu.now());
         match action {
-            Action::Served => Self::Served,
-            Action::Forward => Self::Forward,
-            Action::ServedWithWork => Self::ServedWithWork,
-            Action::HostCustody => Self::HostCustody,
+            Action::Served => {
+                if let Some(slot) = slot {
+                    zone.note_user_entry(slot, now);
+                }
+                Self::Served
+            }
+            Action::Forward => {
+                if let Some(slot) = slot {
+                    zone.close_slot_cpu(slot, now);
+                }
+                Self::Forward
+            }
+            Action::ServedWithWork => {
+                if let Some(slot) = slot {
+                    zone.close_slot_cpu(slot, now);
+                }
+                Self::ServedWithWork
+            }
+            Action::HostCustody => {
+                if let Some(slot) = slot {
+                    zone.close_slot_cpu(slot, now);
+                }
+                Self::HostCustody
+            }
             Action::Idle => match slot {
-                Some(slot) => Self::Idle(leave_space(zone, slot, cpu)),
+                Some(slot) => {
+                    zone.close_slot_cpu(slot, now);
+                    Self::Idle(leave_space(zone, slot, cpu))
+                }
                 None => idle_exit_without_slot(),
             },
         }

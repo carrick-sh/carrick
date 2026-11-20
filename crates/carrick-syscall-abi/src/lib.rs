@@ -261,6 +261,56 @@ impl LinuxTimezone {
     }
 }
 
+pub const LINUX_CLK_TCK: i64 = 100;
+
+#[repr(C, packed)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+)]
+pub struct LinuxTms {
+    pub tms_utime: i64,
+    pub tms_stime: i64,
+    pub tms_cutime: i64,
+    pub tms_cstime: i64,
+}
+
+impl LinuxTms {
+    pub const fn zeroed() -> Self {
+        Self {
+            tms_utime: 0,
+            tms_stime: 0,
+            tms_cutime: 0,
+            tms_cstime: 0,
+        }
+    }
+
+    pub const fn from_rusage_micros(
+        user_us: u64,
+        system_us: u64,
+        child_user_us: u64,
+        child_system_us: u64,
+    ) -> Self {
+        const fn to_ticks(us: u64) -> i64 {
+            (us / (1_000_000 / LINUX_CLK_TCK as u64)) as i64
+        }
+        Self {
+            tms_utime: to_ticks(user_us),
+            tms_stime: to_ticks(system_us),
+            tms_cutime: to_ticks(child_user_us),
+            tms_cstime: to_ticks(child_system_us),
+        }
+    }
+}
+
 /// Linux `clockid_t` values (`include/uapi/linux/time.h`). Shared by the
 /// host dispatcher and the ring sleep owner so both classify one clock set.
 pub const LINUX_CLOCK_REALTIME: u64 = 0;

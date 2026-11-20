@@ -1612,6 +1612,54 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     namespace: process::identity_allocator::NamespaceTable,
     /// Hint only; the Held claim is the custody authority. Appended ABI field.
     held_map: [AtomicU64; ZONE_RECORDS.div_ceil(64)],
+    /// Per-slot seqlock (even = stable, odd = updating) for lock-free cross-CPU
+    /// sampling of in-flight user/system counter windows. Appended ABI field.
+    slot_cpu_seq: [AtomicU64; ZONE_SLOTS],
+    /// Record index charged by `slot`'s open counter window, or zero when idle.
+    slot_charge_record: [AtomicU64; ZONE_SLOTS],
+    /// Incarnation authenticating `slot_charge_record` against record reuse.
+    slot_charge_incarnation: [AtomicU64; ZONE_SLOTS],
+    /// Non-zero counter tick (`tick.max(1)`) when `slot` entered user mode.
+    slot_user_since: [AtomicU64; ZONE_SLOTS],
+    /// Non-zero counter tick (`tick.max(1)`) when `slot` entered ring execution.
+    slot_system_since: [AtomicU64; ZONE_SLOTS],
+    /// Ticks accumulated on `slot` before `current_or_new` bound a home record.
+    slot_pending_user_ticks: [AtomicU64; ZONE_SLOTS],
+    slot_pending_system_ticks: [AtomicU64; ZONE_SLOTS],
+    /// Cumulative counter ticks flushed to each record in its current incarnation.
+    record_user_ticks: [AtomicU64; ZONE_RECORDS],
+    record_system_ticks: [AtomicU64; ZONE_RECORDS],
+}
+
+/// User and ring counter ticks attributed to a zone record or thread group.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CpuTickUsage {
+    pub user: u64,
+    pub system: u64,
+}
+
+impl CpuTickUsage {
+    pub const ZERO: Self = Self { user: 0, system: 0 };
+
+    pub const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            user: self.user.saturating_add(other.user),
+            system: self.system.saturating_add(other.system),
+        }
+    }
+
+    pub fn user_nanos(self, frequency: carrick_guest_arch::CounterFrequency) -> u64 {
+        (u128::from(self.user) * 1_000_000_000 / u128::from(frequency.raw().get())) as u64
+    }
+
+    pub fn system_nanos(self, frequency: carrick_guest_arch::CounterFrequency) -> u64 {
+        (u128::from(self.system) * 1_000_000_000 / u128::from(frequency.raw().get())) as u64
+    }
+
+    pub fn total_nanos(self, frequency: carrick_guest_arch::CounterFrequency) -> u64 {
+        let total = u128::from(self.user) + u128::from(self.system);
+        (total * 1_000_000_000 / u128::from(frequency.raw().get())) as u64
+    }
 }
 
 /// A fallible acquisition policy for callers that retain work on refusal.
@@ -2546,6 +2594,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         record.deadline.store(0, Ordering::Relaxed);
         record.object.reset_completion_flags();
         record.native_owned.store(0, Ordering::Relaxed);
+        self.record_user_ticks[id.index()].store(0, Ordering::Relaxed);
+        self.record_system_ticks[id.index()].store(0, Ordering::Relaxed);
         record.claim.store(Claim::Free.encode(), Ordering::Release);
         Ok(id)
     }
@@ -3080,6 +3130,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return;
         }
         self.timers.cancel_record(id);
+        self.record_user_ticks[id.index()].store(0, Ordering::Release);
+        self.record_system_ticks[id.index()].store(0, Ordering::Release);
         record.claim.store(Claim::Free.encode(), Ordering::Release);
         if record.advance_incarnation() {
             Self::free_bit(&self.record_map, id.raw());
@@ -3103,6 +3155,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if !record.cas(current, next) {
             return;
         }
+        self.record_user_ticks[id.index()].store(0, Ordering::Release);
+        self.record_system_ticks[id.index()].store(0, Ordering::Release);
         if record.advance_incarnation() {
             Self::free_bit(&self.record_map, id.raw());
         }
@@ -4369,6 +4423,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// EL1: the record the running thread parks into (or is preempted into).
     /// The host-loaded thread (no record switched in) gets a new home record
     /// for `identity`; a switched-in thread uses its own.
+    #[inline(never)]
     pub fn current_or_new(
         &self,
         slot: SlotId,
@@ -4379,12 +4434,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             Some(record) => Ok(record),
             None => {
                 let record = self.alloc_record(identity)?;
+                let reference = self.record_ref(record);
                 self.record(record)
                     .home
                     .store(slot.plus_one(), Ordering::Release);
                 self.slot(slot)
                     .host_record
                     .store(record.raw(), Ordering::Release);
+                self.adopt_slot_pending_cpu(slot, reference);
                 Ok(record)
             }
         }
@@ -4461,8 +4518,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// never published (a park or preemption that could not complete).
     pub fn discard_unpublished(&self, slot: SlotId, record: RecordId) {
         let s = self.slot(slot);
-        if s.host_record.load(Ordering::Acquire) == record.raw() {
+        let was_home = s.host_record.load(Ordering::Acquire) == record.raw();
+        if was_home {
             s.host_record.store(NIL, Ordering::Release);
+            let reference = self.record_ref(record);
+            let carry = self.take_record_cpu_ticks(reference);
+            self.return_slot_pending_cpu(slot, reference, carry);
         }
         self.record(record).home.store(0, Ordering::Release);
         self.free_record(record);
@@ -5175,6 +5236,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         // preempt it at the first tick, and a slot whose threads all need
         // their executor would then turn over without progress.
         s.queued_since.store(0, Ordering::Release);
+        self.reset_slot_cpu(slot);
         true
     }
 
@@ -5525,6 +5587,286 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             }
             self.kick_peers_of_away_owner(self.record(id), placement.slot, effects);
         });
+    }
+
+    fn with_slot_cpu_write(&self, slot: SlotId, f: impl FnOnce(&Self, usize)) {
+        let s = slot.index();
+        let seq = self.slot_cpu_seq[s].fetch_add(1, Ordering::AcqRel) + 1;
+        debug_assert_eq!(seq & 1, 1);
+        f(self, s);
+        self.slot_cpu_seq[s].store(seq.wrapping_add(1), Ordering::Release);
+    }
+
+    fn active_slot_charge_record(&self, slot: SlotId, s: usize) -> Option<RecordRef> {
+        let raw_id = self.slot_charge_record[s].load(Ordering::Acquire);
+        if let Some(id) = u32::try_from(raw_id).ok().and_then(RecordId::from_raw) {
+            let inc = self.slot_charge_incarnation[s].load(Ordering::Acquire);
+            if self.record(id).incarnation() == inc {
+                return Some(RecordRef {
+                    id,
+                    incarnation: inc,
+                });
+            }
+        }
+        let id = self
+            .slot(slot)
+            .current()
+            .or_else(|| self.slot(slot).host_record())?;
+        let reference = self.record_ref(id);
+        self.slot_charge_incarnation[s].store(reference.incarnation, Ordering::Relaxed);
+        self.slot_charge_record[s].store(u64::from(reference.id.raw()), Ordering::Release);
+        Some(reference)
+    }
+
+    fn flush_slot_user_locked(&self, slot: SlotId, s: usize, now_raw: u64) {
+        let since = self.slot_user_since[s].load(Ordering::Acquire);
+        if since == 0 {
+            return;
+        }
+        let delta = now_raw.saturating_sub(since);
+        if delta != 0 {
+            if let Some(target) = self.active_slot_charge_record(slot, s) {
+                if self.record(target.id).incarnation() == target.incarnation {
+                    self.record_user_ticks[target.id.index()].fetch_add(delta, Ordering::AcqRel);
+                }
+            } else {
+                self.slot_pending_user_ticks[s].fetch_add(delta, Ordering::AcqRel);
+            }
+        }
+        self.slot_user_since[s].store(0, Ordering::Release);
+    }
+
+    fn flush_slot_system_locked(&self, slot: SlotId, s: usize, now_raw: u64) {
+        let since = self.slot_system_since[s].load(Ordering::Acquire);
+        if since == 0 {
+            return;
+        }
+        let delta = now_raw.saturating_sub(since);
+        if delta != 0 {
+            if let Some(target) = self.active_slot_charge_record(slot, s) {
+                if self.record(target.id).incarnation() == target.incarnation {
+                    self.record_system_ticks[target.id.index()].fetch_add(delta, Ordering::AcqRel);
+                }
+            } else {
+                self.slot_pending_system_ticks[s].fetch_add(delta, Ordering::AcqRel);
+            }
+        }
+        self.slot_system_since[s].store(0, Ordering::Release);
+    }
+
+    #[inline(never)]
+    fn adopt_slot_pending_cpu(&self, slot: SlotId, reference: RecordRef) {
+        self.with_slot_cpu_write(slot, |zone, s| {
+            let user = zone.slot_pending_user_ticks[s].swap(0, Ordering::AcqRel);
+            let system = zone.slot_pending_system_ticks[s].swap(0, Ordering::AcqRel);
+            if zone.record(reference.id).incarnation() == reference.incarnation {
+                if user != 0 {
+                    zone.record_user_ticks[reference.id.index()].fetch_add(user, Ordering::AcqRel);
+                }
+                if system != 0 {
+                    zone.record_system_ticks[reference.id.index()]
+                        .fetch_add(system, Ordering::AcqRel);
+                }
+                zone.slot_charge_incarnation[s].store(reference.incarnation, Ordering::Relaxed);
+                zone.slot_charge_record[s].store(u64::from(reference.id.raw()), Ordering::Release);
+            }
+        });
+    }
+
+    fn return_slot_pending_cpu(&self, slot: SlotId, reference: RecordRef, carry: CpuTickUsage) {
+        self.with_slot_cpu_write(slot, |zone, s| {
+            if carry.user != 0 {
+                zone.slot_pending_user_ticks[s].fetch_add(carry.user, Ordering::AcqRel);
+            }
+            if carry.system != 0 {
+                zone.slot_pending_system_ticks[s].fetch_add(carry.system, Ordering::AcqRel);
+            }
+            if zone.slot_charge_record[s].load(Ordering::Acquire) == u64::from(reference.id.raw())
+                && zone.slot_charge_incarnation[s].load(Ordering::Acquire) == reference.incarnation
+            {
+                zone.slot_charge_record[s].store(0, Ordering::Release);
+                zone.slot_charge_incarnation[s].store(0, Ordering::Relaxed);
+            }
+        });
+    }
+
+    fn reset_slot_cpu(&self, slot: SlotId) {
+        self.with_slot_cpu_write(slot, |zone, s| {
+            zone.slot_charge_record[s].store(0, Ordering::Release);
+            zone.slot_charge_incarnation[s].store(0, Ordering::Relaxed);
+            zone.slot_user_since[s].store(0, Ordering::Release);
+            zone.slot_system_since[s].store(0, Ordering::Release);
+            zone.slot_pending_user_ticks[s].store(0, Ordering::Release);
+            zone.slot_pending_system_ticks[s].store(0, Ordering::Release);
+        });
+    }
+
+    /// Close any open ring interval on `slot` and begin an attributed user window.
+    pub fn note_user_entry(&self, slot: SlotId, now: CounterTick) {
+        let now_raw = now.raw().max(1);
+        self.with_slot_cpu_write(slot, |zone, s| {
+            zone.flush_slot_system_locked(slot, s, now_raw);
+            let _ = zone.active_slot_charge_record(slot, s);
+            if zone.slot_user_since[s].load(Ordering::Acquire) == 0 {
+                zone.slot_user_since[s].store(now_raw, Ordering::Release);
+            }
+        });
+    }
+
+    /// Close any open user interval on `slot` and begin an attributed ring window.
+    pub fn note_ring_entry(&self, slot: SlotId, now: CounterTick) {
+        let now_raw = now.raw().max(1);
+        self.with_slot_cpu_write(slot, |zone, s| {
+            zone.flush_slot_user_locked(slot, s, now_raw);
+            let _ = zone.active_slot_charge_record(slot, s);
+            if zone.slot_system_since[s].load(Ordering::Acquire) == 0 {
+                zone.slot_system_since[s].store(now_raw, Ordering::Release);
+            }
+        });
+    }
+
+    /// Flush any prior `slot` window, bind `record`, and open a ring window.
+    pub fn open_slot_system(&self, slot: SlotId, record: RecordId, now: CounterTick) {
+        let now_raw = now.raw().max(1);
+        let reference = self.record_ref(record);
+        self.with_slot_cpu_write(slot, |zone, s| {
+            zone.flush_slot_user_locked(slot, s, now_raw);
+            zone.flush_slot_system_locked(slot, s, now_raw);
+            zone.slot_charge_incarnation[s].store(reference.incarnation, Ordering::Relaxed);
+            zone.slot_charge_record[s].store(u64::from(reference.id.raw()), Ordering::Release);
+            zone.slot_system_since[s].store(now_raw, Ordering::Release);
+        });
+    }
+
+    /// Flush any open user or ring window on `slot` and detach its charged record.
+    pub fn close_slot_cpu(&self, slot: SlotId, now: CounterTick) {
+        let now_raw = now.raw().max(1);
+        self.with_slot_cpu_write(slot, |zone, s| {
+            zone.flush_slot_user_locked(slot, s, now_raw);
+            zone.flush_slot_system_locked(slot, s, now_raw);
+            zone.slot_charge_record[s].store(0, Ordering::Release);
+            zone.slot_charge_incarnation[s].store(0, Ordering::Relaxed);
+        });
+    }
+
+    /// Flushed counter ticks on `record` without sampling an open slot window.
+    pub fn committed_record_cpu_ticks(&self, record: RecordRef) -> CpuTickUsage {
+        let rec = self.record(record.id);
+        if rec.incarnation() != record.incarnation {
+            return CpuTickUsage::ZERO;
+        }
+        let idx = record.id.index();
+        let usage = CpuTickUsage {
+            user: self.record_user_ticks[idx].load(Ordering::Acquire),
+            system: self.record_system_ticks[idx].load(Ordering::Acquire),
+        };
+        if rec.incarnation() == record.incarnation {
+            usage
+        } else {
+            CpuTickUsage::ZERO
+        }
+    }
+
+    /// Atomically drain `record`'s flushed ticks before re-homing or retirement.
+    pub fn take_record_cpu_ticks(&self, record: RecordRef) -> CpuTickUsage {
+        let rec = self.record(record.id);
+        if rec.incarnation() != record.incarnation {
+            return CpuTickUsage::ZERO;
+        }
+        let idx = record.id.index();
+        let user = self.record_user_ticks[idx].swap(0, Ordering::AcqRel);
+        let system = self.record_system_ticks[idx].swap(0, Ordering::AcqRel);
+        if rec.incarnation() == record.incarnation {
+            CpuTickUsage { user, system }
+        } else {
+            CpuTickUsage::ZERO
+        }
+    }
+
+    /// Sample `record`'s committed ticks plus any in-flight window on its slot.
+    pub fn sample_record_cpu_ticks(&self, record: RecordRef, now: CounterTick) -> CpuTickUsage {
+        #[inline]
+        fn relax() {
+            #[cfg(all(test, feature = "loom"))]
+            loom::thread::yield_now();
+            #[cfg(not(all(test, feature = "loom")))]
+            core::hint::spin_loop();
+        }
+
+        let idx = record.id.index();
+        let rec = self.record(record.id);
+        let now_raw = now.raw();
+        loop {
+            if rec.incarnation() != record.incarnation {
+                return CpuTickUsage::ZERO;
+            }
+            let claim_slot = match rec.claim() {
+                Claim::OnCpu { slot, .. } | Claim::OnCpuRequested { slot, .. } => Some(slot),
+                _ => None,
+            };
+            let mut slots = [None; 3];
+            let mut count = 0;
+            for candidate in [claim_slot, rec.last_slot(), rec.home()].into_iter().flatten() {
+                if !slots[..count].contains(&Some(candidate)) {
+                    slots[count] = Some(candidate);
+                    count += 1;
+                }
+            }
+            let mut seqs = [0_u64; 3];
+            let mut busy = false;
+            for i in 0..count {
+                let Some(slot) = slots[i] else {
+                    continue;
+                };
+                let seq = self.slot_cpu_seq[slot.index()].load(Ordering::Acquire);
+                if seq & 1 != 0 {
+                    busy = true;
+                    break;
+                }
+                seqs[i] = seq;
+            }
+            if busy {
+                relax();
+                continue;
+            }
+            let mut usage = CpuTickUsage {
+                user: self.record_user_ticks[idx].load(Ordering::Acquire),
+                system: self.record_system_ticks[idx].load(Ordering::Acquire),
+            };
+            for slot in slots.into_iter().take(count).flatten() {
+                let s = slot.index();
+                if self.slot_charge_record[s].load(Ordering::Acquire) == u64::from(record.id.raw())
+                    && self.slot_charge_incarnation[s].load(Ordering::Acquire) == record.incarnation
+                {
+                    let user_since = self.slot_user_since[s].load(Ordering::Acquire);
+                    if user_since != 0 {
+                        usage.user = usage.user.saturating_add(now_raw.saturating_sub(user_since));
+                    }
+                    let sys_since = self.slot_system_since[s].load(Ordering::Acquire);
+                    if sys_since != 0 {
+                        usage.system =
+                            usage.system.saturating_add(now_raw.saturating_sub(sys_since));
+                    }
+                }
+            }
+            fence(Ordering::Acquire);
+            let mut consistent = rec.incarnation() == record.incarnation;
+            if consistent {
+                for i in 0..count {
+                    let Some(slot) = slots[i] else {
+                        continue;
+                    };
+                    if self.slot_cpu_seq[slot.index()].load(Ordering::Acquire) != seqs[i] {
+                        consistent = false;
+                        break;
+                    }
+                }
+            }
+            if consistent {
+                return usage;
+            }
+            relax();
+        }
     }
 
     /// Native handbacks never borrow an unchecked default slot. Host-backed

@@ -121,5 +121,9 @@ pub trait Personality: PersonalityAbi<Kernel> + 'static + Default {
 
     fn on_timer(&mut self, _slot: carrick_sched_core::SlotId) {}
 
+    fn on_ring_entry(&mut self, _slot: carrick_sched_core::SlotId) {}
+
+    fn on_ring_exit_to_user(&mut self, _slot: carrick_sched_core::SlotId) {}
+
     fn on_boot() {}
 }

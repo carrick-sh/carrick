@@ -214,6 +214,14 @@ impl<
     Context: super::dispatch::DispatchContext,
 > LifecycleNative<'a> for El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
+    fn declines_time_family(&self) -> bool {
+        LifecycleNative::guest_isa(self) == carrick_guest_arch::GuestIsa::Aarch64
+            && self
+                .process
+                .as_deref()
+                .is_some_and(|venue| venue.is_root_process())
+    }
+
     fn monotonic_counter(
         &mut self,
     ) -> Option<(
@@ -239,6 +247,33 @@ impl<
             return None;
         }
         venue.realtime_counter()
+    }
+
+    fn process_cputime_nanos(&mut self) -> Option<u64> {
+        let isa = LifecycleNative::guest_isa(self);
+        let venue = self.process_venue()?;
+        if isa == carrick_guest_arch::GuestIsa::Aarch64 && venue.is_root_process() {
+            return None;
+        }
+        venue.process_cputime_nanos()
+    }
+
+    fn thread_cputime_nanos(&mut self) -> Option<u64> {
+        let isa = LifecycleNative::guest_isa(self);
+        let venue = self.process_venue()?;
+        if isa == carrick_guest_arch::GuestIsa::Aarch64 && venue.is_root_process() {
+            return None;
+        }
+        venue.thread_cputime_nanos()
+    }
+
+    fn process_times(&mut self) -> Option<(i64, carrick_syscall_abi::LinuxTms)> {
+        let isa = LifecycleNative::guest_isa(self);
+        let venue = self.process_venue()?;
+        if isa == carrick_guest_arch::GuestIsa::Aarch64 && venue.is_root_process() {
+            return None;
+        }
+        venue.process_times()
     }
 
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
@@ -882,6 +917,9 @@ impl<
             return self
                 .process_venue()
                 .is_some_and(|venue| venue.retire_thread_current(record, retirement));
+        }
+        if let Some(venue) = self.process_venue() {
+            venue.snapshot_retiring_thread_cpu(record);
         }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;

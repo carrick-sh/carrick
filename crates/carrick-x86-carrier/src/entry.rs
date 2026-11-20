@@ -693,6 +693,9 @@ pub fn carrier_enter<P: Personality>(
     let mut arch = carrick_el1::isa::x86::kernel_arch();
     let mut decode_cx = CallContext::new(&mut arch, frame);
     let mut personality = P::default();
+    if let Some(slot) = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot)) {
+        personality.on_ring_entry(slot);
+    }
     let call = match personality.decode(&mut decode_cx) {
         Ok(call) => call,
         Err(_) => {
@@ -795,5 +798,10 @@ pub fn carrier_validate_return<P: Personality>(frame: &mut NativeFrame, xsave: &
     if carrick_el1::isa::x86::interrupt::check_user_return_generation().is_err() {
         doorbell(FATAL_PORT, frame);
         halt();
+    }
+    if let Some(binding) = carrick_el1::isa::x86::context::current_cpu_binding()
+        && let Some(slot) = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
+    {
+        personality.on_ring_exit_to_user(slot);
     }
 }

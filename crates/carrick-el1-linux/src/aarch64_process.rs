@@ -623,6 +623,20 @@ fn admit_entry_runtime(
         };
         return Ok((runtime, address));
     }
+    let runtime = admit_fresh_arm_root(source, task, native, ttbr0, page, control, address)?;
+    Ok((runtime, address))
+}
+
+#[inline(never)]
+fn admit_fresh_arm_root(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
+    address: Mm,
+) -> Result<Arc<Runtime>, NativeProcessError> {
     let words = Aarch64ParkedContext::from_register(
         *native,
         ttbr0,
@@ -633,7 +647,7 @@ fn admit_entry_runtime(
         source, task, page, control, address, address, words,
     )?);
     REGISTRY.register_root(runtime.clone(), source, task, address)?;
-    Ok((runtime, address))
+    Ok(runtime)
 }
 
 /// Unpublished admission custody is scoped to this call: a home left in a
@@ -2055,6 +2069,20 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     /// (`TrapError::NativeRootExit`), which ends every host and zone thread.
     fn root_exit_ends_run(&self) -> bool {
         true
+    }
+
+    #[cfg(not(target_os = "none"))]
+    fn signal_frequency(
+        &mut self,
+    ) -> Result<carrick_guest_arch::CounterFrequency, NativeFailure> {
+        Ok(carrick_guest_arch::CounterFrequency::new(
+            NonZeroU64::new(1_000_000_000).ok_or(NativeFailure::Invalid)?,
+        ))
+    }
+
+    #[cfg(not(target_os = "none"))]
+    fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeFailure> {
+        Ok(carrick_guest_arch::CounterTick::new(1_000_000))
     }
 
     /// The host-served root's live cwd and root, read once by the root

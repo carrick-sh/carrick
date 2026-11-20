@@ -68,6 +68,36 @@ fn make_zone() -> Arc<Box<ZoneTables>> {
         init!(idle_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(queued_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(held_map, core::array::from_fn(|_| AtomicU64::new(0)));
+        init!(slot_cpu_seq, core::array::from_fn(|_| AtomicU64::new(0)));
+        init!(
+            slot_charge_record,
+            core::array::from_fn(|_| AtomicU64::new(0))
+        );
+        init!(
+            slot_charge_incarnation,
+            core::array::from_fn(|_| AtomicU64::new(0))
+        );
+        init!(slot_user_since, core::array::from_fn(|_| AtomicU64::new(0)));
+        init!(
+            slot_system_since,
+            core::array::from_fn(|_| AtomicU64::new(0))
+        );
+        init!(
+            slot_pending_user_ticks,
+            core::array::from_fn(|_| AtomicU64::new(0))
+        );
+        init!(
+            slot_pending_system_ticks,
+            core::array::from_fn(|_| AtomicU64::new(0))
+        );
+        init!(
+            record_user_ticks,
+            core::array::from_fn(|_| AtomicU64::new(0))
+        );
+        init!(
+            record_system_ticks,
+            core::array::from_fn(|_| AtomicU64::new(0))
+        );
         init!(completion_consumer, AtomicU32::new(0));
         init!(online_cpus, AtomicU64::new(0));
         init!(

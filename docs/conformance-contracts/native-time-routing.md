@@ -469,7 +469,23 @@ and writes the same value if the pointer is present. The KVM witnesses
 bracket each vDSO result with raw calls in the native root and fork child.
 The ARM dispatch witness checks the two null operands in a native child.
 
-CPU-time clocks and times need live native CPU accounting. The native
-process owner has a rusage row and reaping charges, but its running member
-records have no user/system charge path or per-thread CPU totals. The host
-executor's thread ledger does not attribute execution to native members.
+### CPU-time clocks and process times
+
+`ZoneTables` accounts user and ring counter intervals per slot under a
+single-writer per-slot seqlock and flushes completed intervals into
+incarnation-authenticated per-record totals. Pre-record ticks on an initial
+slot transfer when `current_or_new` binds the home record and return to the
+slot if `discard_unpublished` drops an unpublished home. Both x86 CPL0 and ARM
+EL1 open and close slot windows at user/ring transitions, scheduler switches
+and idle parking without charging idle HLT/WFI time.
+
+`NativeMember` retains a per-member carry across record re-homing and drains a
+retiring thread's record before `free_record` advances its incarnation, so a
+joining sibling woken by `CLONE_CHILD_CLEARTID` never observes a CPU-time dip.
+Member removal folds retired ticks into `NativeResources`, feeding
+`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`, `times(2)`, `getrusage`
+(`RUSAGE_SELF` and `RUSAGE_THREAD`), and `wait4` child `rusage`. The ARM
+dispatch witnesses verify null-operand routing for CPU-time clocks and
+`times(NULL)` in a native fork child; the KVM witnesses verify advancing CPU
+clocks, sibling raw-`exit` fold-in, `times` ticks, and reaped child
+`tms_cutime`/`tms_cstime`.

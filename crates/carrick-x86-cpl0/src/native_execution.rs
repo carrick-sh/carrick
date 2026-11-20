@@ -21,6 +21,9 @@ use crate::native_process;
 pub fn schedule(slot: SlotId) -> ! {
     let source = carrick_x86_carrier::native_execution::source(slot);
     let current = task();
+    if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
+        source.zone.close_slot_cpu(slot, now);
+    }
     #[cfg(feature = "test-support")]
     crate::anonymous::release_injected_edit_wait(source, current);
     #[cfg(feature = "test-support")]
@@ -29,6 +32,9 @@ pub fn schedule(slot: SlotId) -> ! {
     crate::test_support::release_birth_on_park(source);
     settle_current_work(current);
     loop {
+        if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
+            source.zone.close_slot_cpu(slot, now);
+        }
         #[cfg(feature = "test-support")]
         crate::test_support::hold_idle_scan(slot);
         #[cfg(feature = "test-support")]
@@ -45,10 +51,17 @@ pub fn schedule(slot: SlotId) -> ! {
         }
         if let Some(selected) = source.zone.take_idle_work(slot) {
             source.zone.leave_idle(slot);
+            if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
+                source.zone.open_slot_system(slot, selected.record, now);
+            }
             let record = source.zone.record_ref(selected.record);
             let runtime = native_process::runtime_for_record(source.zone, record);
             // SAFETY: switch_in_full transferred this exact record to this slot.
             let Some(mut state) = (unsafe { runtime.record_binding(record) }) else {
+                if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend)
+                {
+                    source.zone.close_slot_cpu(slot, now);
+                }
                 source.zone.clear_current(slot);
                 continue;
             };
@@ -234,8 +247,16 @@ pub fn schedule(slot: SlotId) -> ! {
             }
             carrick_x86_carrier::native_execution::migrate(slot);
             let zone = source.zone;
-            match unsafe { context::resume_parked(words, state.address, || arm_slice(zone, slot)) }
-            {
+            match unsafe {
+                context::resume_parked(words, state.address, || {
+                    arm_slice(zone, slot);
+                    if let Ok(now) =
+                        carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend)
+                    {
+                        zone.note_user_entry(slot, now);
+                    }
+                })
+            } {
                 Ok(never) => match never {},
                 Err(_) => fatal_boot(),
             }

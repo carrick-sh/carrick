@@ -507,6 +507,7 @@ pub fn carrier_initial_boot<P: Personality>(request_va: u64) -> ! {
     unsafe {
         core::arch::asm!("out dx, al", in("dx") X86_INITIAL_RUNNER_READY_PORT, in("rax") request_va, options(nostack, preserves_flags));
     }
+    P::default().on_ring_exit_to_user(carrick_sched_core::SlotId::new(0));
     // SAFETY: after host acknowledgement, the exact MM is published and the
     // user selectors/entry/stack came from the guest-owned image transaction.
     unsafe { carrick_x86_boot_iret(entry, stack) }

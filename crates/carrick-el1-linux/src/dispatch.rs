@@ -724,6 +724,16 @@ pub fn dispatch_entry(
     owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
 ) -> Action {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    if !(frame.esr == 0 && frame.elr == 0)
+        && let Some(slot) = SlotId::from_index(frame.slot as usize)
+    {
+        // SAFETY: the EL1 zone tables are fixed image-lifetime ABI storage.
+        let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+        let now =
+            carrick_guest_arch::CounterTick::new(sched::ThreadCpu::now(&sched::HardwareCpu));
+        zone.note_ring_entry(slot, now);
+    }
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     if matches!(frame.esr, 0xfffc..=0xfffe) {
         return arm_signal_user_return(frame);
     }
@@ -2477,6 +2487,8 @@ where
     if frame.elr == 0 {
         return sched.serve_idle_entry(frame);
     }
+    let now = carrick_guest_arch::CounterTick::new(sched.cpu.now());
+    sched.zone.note_ring_entry(slot, now);
     sched.serve_irq(frame)
 }
 
@@ -2712,7 +2724,7 @@ pub fn dispatch_syscall_with_native<'a, 'ipc, F, C, U, G, Context>(
     open_table: &'a [DelegatedOpenFile],
     inotify_table: &'a [DelegatedInotify],
     name_cache: &'a InotifyNameCache,
-    zone: Option<Zone<'a, C, U>>,
+    mut zone: Option<Zone<'a, C, U>>,
     ipc: Option<&'a ipc::IpcVenue<'ipc>>,
     lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
     process: Option<&'a mut dyn lifecycle::ProcessNative<'ipc, Context>>,
@@ -2729,6 +2741,10 @@ where
     G: GuestDispatchFrame,
     Context: DispatchContext + 'a,
 {
+    if let (Some(zone), Some(slot)) = (zone.as_mut(), frame.slot()) {
+        let now = carrick_guest_arch::CounterTick::new(zone.cpu.now());
+        zone.tables.note_ring_entry(slot, now);
+    }
     let ordinal = frame.canonical_ordinal().raw();
     if let (Some(arm), Some(task)) = (frame.arm_frame_ref(), current_tasks.get(frame.task_index()))
     {

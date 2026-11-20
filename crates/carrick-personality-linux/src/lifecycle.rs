@@ -280,6 +280,16 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
         None
     }
+    fn process_cputime_nanos(&mut self) -> Option<u64> {
+        None
+    }
+    fn thread_cputime_nanos(&mut self) -> Option<u64> {
+        None
+    }
+    fn process_times(&mut self) -> Option<(i64, carrick_syscall_abi::LinuxTms)> {
+        None
+    }
+    fn snapshot_retiring_thread_cpu(&mut self, _record: RecordRef) {}
     /// Native scheduler publication belongs to the admitted process execution
     /// owner, which also delivers architecture-specific wake effects.
     fn native_futex(
@@ -638,6 +648,9 @@ impl From<carrick_sched_core::Requeue> for BornEnqueue {
 /// ISA hooks acquire retained metadata and move real native context. They do
 /// not route, validate clone flags, lower errno or publish entry completion.
 pub trait LifecycleNative<'a>: UserCopy {
+    fn declines_time_family(&self) -> bool {
+        false
+    }
     fn monotonic_counter(&mut self) -> Option<(CounterTick, CounterFrequency)> {
         None
     }
@@ -645,6 +658,16 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
         None
     }
+    fn process_cputime_nanos(&mut self) -> Option<u64> {
+        None
+    }
+    fn thread_cputime_nanos(&mut self) -> Option<u64> {
+        None
+    }
+    fn process_times(&mut self) -> Option<(i64, carrick_syscall_abi::LinuxTms)> {
+        None
+    }
+    fn snapshot_retiring_thread_cpu(&mut self, _record: RecordRef) {}
     /// Resume an input before any syscall effect has been committed.
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
     /// Retain a completed setup operation's original output after `NotYet`.

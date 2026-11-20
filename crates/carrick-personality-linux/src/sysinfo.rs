@@ -261,7 +261,7 @@ pub trait ProcessSysinfoVenue {
     ) -> Result<LinuxRlimit, i64>;
     fn umask(&mut self, mask: u32) -> u32;
     fn sysinfo(&self) -> LinuxSysinfo;
-    fn getrusage(&self, who: i32) -> Result<LinuxRusage, i64>;
+    fn getrusage(&mut self, who: i32) -> Result<LinuxRusage, i64>;
     /// The caller's visible cwd ([`crate::task_fs::TaskFs::getcwd`]), or
     /// `None` when this venue does not own the caller's cwd: a host-served
     /// root keeps its host cwd (a #1393(a) `RootOnly` row), and an escaped
@@ -609,7 +609,7 @@ mod tests {
         fn sysinfo(&self) -> LinuxSysinfo {
             LinuxSysinfo::default_info()
         }
-        fn getrusage(&self, _who: i32) -> Result<LinuxRusage, i64> {
+        fn getrusage(&mut self, _who: i32) -> Result<LinuxRusage, i64> {
             Ok(LinuxRusage::zeroed())
         }
     }

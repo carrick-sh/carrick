@@ -5413,3 +5413,78 @@ fn held_affinity_placement_on_an_away_owner_kicks_live_peers() {
     assert!(effects.sgi_slots().any(|slot| slot == THIRD));
     assert!(zone.take_resched(THIRD));
 }
+
+#[test]
+fn slot_cpu_ticks_follow_home_adoption_discard_and_retirement() {
+    let zone = zone();
+    assert!(zone.reset_slot(SLOT));
+
+    // Initial boot runs user code before any home record exists.
+    zone.note_user_entry(SLOT, CounterTick::new(100));
+    zone.note_ring_entry(SLOT, CounterTick::new(350));
+
+    let first = zone
+        .current_or_new(
+            SLOT,
+            ThreadIdentity {
+                tid: 1,
+                serial: 1,
+                mm: MM,
+                generation: 1,
+                ..ThreadIdentity::default()
+            },
+        )
+        .unwrap();
+    let first_ref = zone.record_ref(first);
+    assert_eq!(
+        zone.sample_record_cpu_ticks(first_ref, CounterTick::new(400)),
+        CpuTickUsage {
+            user: 250,
+            system: 50,
+        }
+    );
+
+    // Discarding an unpublished home record returns its pending ticks to the slot.
+    zone.close_slot_cpu(SLOT, CounterTick::new(420));
+    zone.discard_unpublished(SLOT, first);
+    assert_eq!(
+        zone.sample_record_cpu_ticks(first_ref, CounterTick::new(500)),
+        CpuTickUsage::ZERO,
+        "a freed incarnation never leaks ticks"
+    );
+
+    let second = zone
+        .current_or_new(
+            SLOT,
+            ThreadIdentity {
+                tid: 1,
+                serial: 1,
+                mm: MM,
+                generation: 1,
+                ..ThreadIdentity::default()
+            },
+        )
+        .unwrap();
+    let second_ref = zone.record_ref(second);
+    zone.open_slot_system(SLOT, second, CounterTick::new(500));
+    zone.note_user_entry(SLOT, CounterTick::new(530));
+    assert_eq!(
+        zone.sample_record_cpu_ticks(second_ref, CounterTick::new(600)),
+        CpuTickUsage {
+            user: 250 + 70,
+            system: 70 + 30,
+        }
+    );
+    zone.close_slot_cpu(SLOT, CounterTick::new(610));
+    assert_eq!(
+        zone.take_record_cpu_ticks(second_ref),
+        CpuTickUsage {
+            user: 330,
+            system: 100,
+        }
+    );
+    assert_eq!(
+        zone.committed_record_cpu_ticks(second_ref),
+        CpuTickUsage::ZERO
+    );
+}
