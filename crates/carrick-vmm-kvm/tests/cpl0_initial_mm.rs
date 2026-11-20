@@ -775,8 +775,10 @@ fn native_parked_exec_linux_oracle(case: &str, expected: &str) {
         .expect("run native Linux oracle");
     assert!(
         oracle.status.success(),
-        "{}",
-        String::from_utf8_lossy(&oracle.stderr)
+        "native Linux oracle ({case}) failed with status={:?} stdout={:?} stderr={:?}",
+        oracle.status.code(),
+        String::from_utf8_lossy(&oracle.stdout),
+        String::from_utf8_lossy(&oracle.stderr),
     );
     assert_eq!(oracle.stdout, expected.as_bytes(), "native Linux oracle");
 }
@@ -789,20 +791,31 @@ fn parked_exec_signal_witness(flag: &str, stdout: &[u8]) {
     let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
     let elf = native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define, flag]);
     let outcome = run_exec_fixture_with_stock_pressure(&elf, &marker, 256);
+    let stock = outcome
+        .physical
+        .fork_stock_counters()
+        .expect("stock census");
+    let exec_census = outcome
+        .physical
+        .exec_owner_census()
+        .expect("exec owner census");
     assert!(
-        outcome
-            .physical
-            .fork_stock_counters()
-            .expect("stock census")
-            .successor_table_refusals
-            > 0,
-        "the signal must reach a parked exec: exit={}, stdout={:?}, stderr={:?}",
+        stock.successor_table_refusals > 0,
+        "the signal must reach a parked exec ({flag}): exit={}, stdout={:?}, stderr={:?}, stock={stock:?}, exec_census={exec_census:?}",
         outcome.run.exit_code,
         outcome.run.stdout,
         outcome.run.stderr
     );
-    assert_eq!(outcome.run.exit_code, 0, "parked signal/wait4 result");
-    assert_eq!(outcome.run.stdout, stdout, "successor execution marker");
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "parked signal/wait4 result ({flag}): stdout={:?}, stderr={:?}, stock={stock:?}, exec_census={exec_census:?}",
+        outcome.run.stdout, outcome.run.stderr
+    );
+    assert_eq!(
+        outcome.run.stdout, stdout,
+        "successor execution marker ({flag}): exit={}, stderr={:?}, stock={stock:?}, exec_census={exec_census:?}",
+        outcome.run.exit_code, outcome.run.stderr
+    );
 }
 
 /// Run the production CPL0 root, which execs `path` and exits with the
