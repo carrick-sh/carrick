@@ -46,6 +46,14 @@ pub struct X86InitialRegion<'a> {
 }
 
 impl<'a> X86InitialImage<'a> {
+    /// The advertised vDSO address, from the same overlay the editor maps.
+    pub fn vdso_base(&self) -> Option<u64> {
+        self.regions
+            .last()
+            .filter(|_| self.has_vdso)
+            .map(|region| region.start)
+    }
+
     /// Overlay the privately initialized vvar and vDSO regions. Refuse a
     /// conflicting ELF row before the host seals the image for the editor.
     pub fn with_vdso(

@@ -910,7 +910,7 @@ pub fn initial_stack_pages(
         random: [0; 16],
         stack_top: INITIAL_STACK_TOP,
         stack_size: INITIAL_STACK_SIZE,
-        has_vdso: image.has_vdso,
+        vdso: image.vdso_base().map(UserVa::new),
     })
     .map_err(|error| fail(format!("initial stack sizing: {error:?}")))?;
     // The guest owner backs the configured bootstrap stack, including its
