@@ -51,6 +51,7 @@ pub fn edit_x86_anonymous(
 
 const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
+const SYS_MREMAP: u64 = 216;
 const SYS_MMAP: u64 = 222;
 const SYS_MPROTECT: u64 = 226;
 const SYS_MADVISE: u64 = 233;
@@ -408,6 +409,56 @@ fn decide_reservation_effect<
                 model.mprotect(range, prot)
             }
         }
+        SYS_MREMAP => {
+            use carrick_guest_arch::{GuestLen, GuestVa};
+            use carrick_personality_linux::mm::mremap::mremap_request;
+            let [address, old_size, new_size, flags, target, _] = frame.arguments();
+            let request = match mremap_request(
+                GuestLen::new(PAGE_SIZE),
+                GuestVa::new(address),
+                GuestLen::new(old_size),
+                GuestLen::new(new_size),
+                flags,
+                GuestVa::new(target),
+            ) {
+                Ok(request) => request,
+                Err(errno) => return ReservationDisposition::Return(errno.guest_retval()),
+            };
+            if request.dontunmap || request.move_fixed || request.old_size.raw() == 0 {
+                return ReservationDisposition::Forward;
+            }
+            let Some(source) = address
+                .checked_add(request.old_size.raw())
+                .and_then(|end| ReservationRange::new(address, end))
+            else {
+                return ReservationDisposition::Return(
+                    carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                );
+            };
+            if model.prepared_overlaps(source) {
+                return ReservationDisposition::Unavailable(Refusal::PreparedConflict);
+            }
+            use carrick_el1_abi::ReservationNodeFlags as Flags;
+            let mut unavailable = false;
+            let grows = request.new_size.raw() > request.old_size.raw();
+            if let Err(refusal) = model.observe_range(source, &mut |mapping| {
+                let flags = mapping.flags;
+                unavailable |= !flags.contains(Flags::ANONYMOUS_PRIVATE)
+                    || flags.contains(Flags::IMAGE)
+                    || (grows && flags.contains(Flags::LOCKED));
+            }) {
+                return ReservationDisposition::Unavailable(refusal);
+            }
+            if unavailable {
+                return ReservationDisposition::Forward;
+            }
+            let target = if request.may_move {
+                reservations::MoveTarget::MayMove
+            } else {
+                reservations::MoveTarget::InPlace
+            };
+            model.mremap(source, request.new_size.raw(), target)
+        }
         SYS_MADVISE => {
             use carrick_guest_arch::{GuestLen, GuestVa};
             use carrick_personality_linux::mm::madvise::{Advice, NativeEffect, plan_reservation};
@@ -454,6 +505,9 @@ fn decide_reservation_effect<
         }),
         Err(Refusal::Collision) => ReservationDisposition::Return(-17),
         Err(Refusal::Invalid) => ReservationDisposition::Return(-EINVAL),
+        Err(Refusal::Hole) if nr == SYS_MREMAP => {
+            ReservationDisposition::Return(carrick_syscall_abi::LINUX_EFAULT.guest_retval())
+        }
         Err(Refusal::Hole | Refusal::Limit) => ReservationDisposition::Return(-ENOMEM),
         Err(Refusal::ForeignMapping) => ReservationDisposition::Forward,
         Err(
@@ -1650,20 +1704,44 @@ fn serve_delegated_anonymous_for_origin<
         };
     editor.bind_operation(request.sequence);
     let (va, len) = (request.range.start(), request.range.len());
-    if request.operation == carrick_el1_abi::ReservationOperation::Move {
-        return refuse(pending, &mut model, Leave::RootDeclined);
-    }
-    use carrick_el1_abi::ReservationOperation::{Decommit, Discard, Prepare, Protect, Retire};
+    use carrick_el1_abi::ReservationOperation::{
+        Decommit, Discard, Move, Prepare, Protect, Retire,
+    };
     let root = carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0);
     let address = carrick_guest_arch::UserVa::new(va);
     let length = carrick_guest_arch::GuestLen::new(len);
-    let backing = if request.operation == Discard {
-        editor.sparse_backing(root, address, length)
-    } else {
-        editor.backing(root, address, length)
-    };
+    if let Some(source) = request.source {
+        // Moving an untouched reservation is a metadata edit. Resident
+        // relocation also needs to transfer backing ownership between VAs.
+        use carrick_guest_arch::{GuestLen, UserVa};
+        match editor
+            .sparse_backing(
+                root,
+                UserVa::new(source.start()),
+                GuestLen::new(source.len()),
+            )
+            .summary
+        {
+            RangeBacking::Empty => {}
+            RangeBacking::Retired => {
+                let _ = pending.cancel(&mut model);
+                return DelegatedAnonymous::Settle(SettlementNeed::after_release(
+                    model,
+                    _editor_guard,
+                ));
+            }
+            _ => return refuse(pending, &mut model, Leave::RootDeclined),
+        }
+    }
+    let backing =
+        if request.operation == Discard || (nr == SYS_MREMAP && request.operation == Retire) {
+            editor.sparse_backing(root, address, length)
+        } else {
+            editor.backing(root, address, length)
+        };
     let run = match (request.operation, backing.runs()) {
         (Discard, [(start, _), .., (_, end)]) => Some((*start, *end - *start)),
+        (Retire, [(start, _), .., (_, end)]) if nr == SYS_MREMAP => Some((*start, *end - *start)),
         (_, []) => None,
         (_, [(start, end)]) => Some((*start, *end - *start)),
         _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
@@ -1705,6 +1783,9 @@ fn serve_delegated_anonymous_for_origin<
         (_, RangeBacking::Retired, _) => {
             let _ = pending.cancel(&mut model);
             return DelegatedAnonymous::Settle(SettlementNeed::after_release(model, _editor_guard));
+        }
+        (Move, RangeBacking::Prepared | RangeBacking::Private, _) => {
+            return refuse(pending, &mut model, Leave::RootDeclined);
         }
         (_, RangeBacking::Empty, _) | (_, _, None) => None,
         // The permission editor is the descriptor step of an mprotect and
@@ -1752,7 +1833,7 @@ fn serve_delegated_anonymous_for_origin<
             // The journal slot first: after the descriptor step the commit
             // must not fail for lack of room. For advice, leave the lazy
             // prefix and suffix out of the return journal.
-            let return_range = if request.operation == Discard {
+            let return_range = if request.operation == Discard || nr == SYS_MREMAP {
                 carrick_el1_abi::ReservationRange::new(start, start + run_len)
                     .unwrap_or(request.range)
             } else {
@@ -1825,7 +1906,7 @@ fn serve_delegated_anonymous_for_origin<
 }
 
 /// The admitted root that owns syscall `nr` when it is a delegated MM's
-/// anonymous `brk`/`mmap`/`munmap`/`mprotect`/`madvise` (`None`: the MM keeps the
+/// anonymous `brk`/`mmap`/`munmap`/`mprotect`/`madvise`/`mremap` (`None`: the MM keeps the
 /// paths it had before admission).
 pub fn delegated_anonymous_root<
     G: ReservationGeometry,
@@ -1841,7 +1922,7 @@ pub fn delegated_anonymous_root<
 )> {
     if !matches!(
         nr,
-        SYS_BRK | SYS_MUNMAP | SYS_MMAP | SYS_MPROTECT | SYS_MADVISE
+        SYS_BRK | SYS_MUNMAP | SYS_MREMAP | SYS_MMAP | SYS_MPROTECT | SYS_MADVISE
     ) {
         return None;
     }

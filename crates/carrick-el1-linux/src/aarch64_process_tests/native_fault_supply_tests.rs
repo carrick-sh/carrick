@@ -477,7 +477,9 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             let remap = if case == ChildStockCase::AdvisoryRemap {
                 let result = call(216, [va, 4096, 8192, 1, 0, 0]);
                 println!("mremap {}", errno(result));
-                if result > 0 && result != mapped {
+                if result > 0 {
+                    assert_ne!(result, mapped, "the adjoining reservation blocks growth");
+                    assert_eq!(call(226, [va, 4096, 3, 0, 0, 0]), -12, "source retired");
                     assert_eq!(call(215, [result as u64, 8192, 0, 0, 0, 0]), 0);
                 }
                 Some(result)

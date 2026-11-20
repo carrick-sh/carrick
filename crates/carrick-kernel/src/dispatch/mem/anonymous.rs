@@ -2436,12 +2436,12 @@ impl MemView<'_> {
         let root = self.mem().lock().delegated_root().cloned();
         if let Some(root) = root {
             let request = match super::mmap::mremap_request(
-                self.linux_page_size(),
-                old_address.0,
-                old_size,
-                new_size,
+                carrick_core_abi::GuestLen::new(self.linux_page_size()),
+                GuestVa::new(old_address.0),
+                carrick_core_abi::GuestLen::new(old_size),
+                carrick_core_abi::GuestLen::new(new_size),
                 flags,
-                new_address.0,
+                GuestVa::new(new_address.0),
             ) {
                 Ok(request) => request,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -2483,6 +2483,8 @@ impl MemView<'_> {
             move_fixed,
             dontunmap,
         } = request;
+        let (old_address, new_address) = (old_address.raw(), new_address.raw());
+        let (old_size, new_size) = (old_size.raw(), new_size.raw());
         let layout = self.mem().lock().layout;
         let Some(old_end) = old_address.checked_add(old_size).filter(|_| old_size != 0) else {
             return Ok(None);
