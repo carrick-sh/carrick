@@ -4,6 +4,20 @@ set -eu
 # Known-answer CLI fixture. The harness passes the suite name in trailing argv.
 case "$*" in
   *fixture-hang*) exec sleep 30 ;;
+  # Planted signal kill: COMPLETE, passing output, then the process dies by
+  # SIGKILL (review P0 on #2601: this was classified diff, not a crash).
+  *fixture-signal*)
+    printf 'TAP version 13\n1..1\nok 1 - complete before the kill\n'
+    kill -9 $$ ;;
+  # Planted suite-verdict flip with every sample finished and identical
+  # per-test pairs: the exit status alone differs between samples (review P0
+  # on #2601: such a suite was missing from `unstable`).
+  *fixture-exitflip*)
+    printf 'TAP version 13\n1..1\nok 1 - same on every sample\n'
+    printf '%s\n' 'CARRICK_SYSCALL_CENSUS {"refusal_evidence":{"schema":1,"isa":"x86_64","complete":true,"rows":[]}}' >&2
+    if [ -e "$CARRICK_SUITEBOARD_FIXTURE_STATE.flip" ]; then exit 1; fi
+    touch "$CARRICK_SUITEBOARD_FIXTURE_STATE.flip"
+    exit 0 ;;
 esac
 
 printf 'TAP version 13\n1..3\nnot ok 1 - planted failure\nok 2 - planted skip # SKIP fixture\n'
