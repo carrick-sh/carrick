@@ -315,7 +315,11 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
         random: request.random,
         stack_top: request.stack_top,
         stack_size: request.stack_size,
-        has_vdso: request.image_features & carrick_core_abi::X86_INITIAL_HAS_VDSO != 0,
+        vdso: if request.image_features & carrick_core_abi::X86_INITIAL_HAS_VDSO != 0 {
+            Some(image_regions.last()?.start)
+        } else {
+            None
+        },
     };
     let source_root = carrick_el1::isa::x86::hardware_live_root().ok()?;
     if source_root.address().raw() != 0x60_0000 {

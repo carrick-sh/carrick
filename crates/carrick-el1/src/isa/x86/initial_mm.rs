@@ -71,7 +71,7 @@ pub struct InitialStackSpec<'a> {
     pub random: [u8; 16],
     pub stack_top: u64,
     pub stack_size: u64,
-    pub has_vdso: bool,
+    pub vdso: Option<UserVa>,
 }
 
 /// Only the initialized tail is serialized. The MM owner supplies private
@@ -139,7 +139,7 @@ pub fn build_initial_stack(
         })
         .ok_or(InitialMmError::StackTooLarge)?;
     let execfn = spec.argv.first().copied().unwrap_or(b"");
-    let auxv_count = 19 + usize::from(spec.has_vdso);
+    let auxv_count = 19 + usize::from(spec.vdso.is_some());
     let pointer_words = 1usize
         .checked_add(spec.argv.len())
         .and_then(|sum| sum.checked_add(1 + spec.envp.len() + 1))
@@ -204,11 +204,8 @@ pub fn build_initial_stack(
         (AuxvTag::Hwcap2 as u64, 0),
         (AuxvTag::Execfn as u64, execfn),
     ];
-    if spec.has_vdso {
-        auxv.push((
-            AuxvTag::SysinfoEhdr as u64,
-            carrick_syscall_abi::vdso::LINUX_VDSO_BASE,
-        ));
+    if let Some(vdso) = spec.vdso {
+        auxv.push((AuxvTag::SysinfoEhdr as u64, vdso.raw()));
     }
     auxv.push((AuxvTag::Null as u64, 0));
     let occupied = pointer_words
@@ -400,25 +397,23 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     generation: NonZeroU64,
     image: &InitialImageSpec<'_>,
 ) -> Result<InitialMmImage, InitialMmError> {
-    if image.stack.has_vdso {
-        use carrick_syscall_abi::vdso::{
-            LINUX_VDSO_BASE, LINUX_VDSO_SIZE, LINUX_VVAR_BASE, LINUX_VVAR_SIZE,
+    if let Some(vdso) = image.stack.vdso {
+        let [.., data, code] = image.regions else {
+            return Err(InitialMmError::InvalidRange);
         };
-        for (start, length, executable) in [
-            (LINUX_VVAR_BASE, LINUX_VVAR_SIZE, false),
-            (LINUX_VDSO_BASE, LINUX_VDSO_SIZE, true),
-        ] {
-            if !image.regions.iter().any(|region| {
-                region.start.raw() == start
-                    && region.len.raw() == length
-                    && region.initialized_offset.raw() == 0
-                    && region.initialized.len.raw() != 0
-                    && region.perms.readable
-                    && !region.perms.writable
-                    && region.perms.executable == executable
-            }) {
-                return Err(InitialMmError::InvalidRange);
-            }
+        if code.start != vdso
+            || ![(data, false), (code, true)]
+                .into_iter()
+                .all(|(row, executable)| {
+                    row.len.raw() == PAGE
+                        && row.initialized_offset.raw() == 0
+                        && row.initialized.len.raw() != 0
+                        && row.perms.readable
+                        && !row.perms.writable
+                        && row.perms.executable == executable
+                })
+        {
+            return Err(InitialMmError::InvalidRange);
         }
     }
     let stack = build_initial_stack(&image.stack)?;
@@ -797,7 +792,7 @@ pub(crate) mod tests {
             random: [0x11; 16],
             stack_top: 0x7fff_0000,
             stack_size: 0x4000,
-            has_vdso: false,
+            vdso: None,
         }
     }
 
@@ -1104,7 +1099,7 @@ pub(crate) mod tests {
             random: [0x5a; 16],
             stack_top: 0x7fff_0000,
             stack_size: 0x4000,
-            has_vdso: false,
+            vdso: None,
         };
         let words = TestWords::new();
         let mut frames = TestFrames::new();
@@ -1272,7 +1267,7 @@ pub(crate) mod tests {
             random: [0x5a; 16],
             stack_top: 0x7fff_0000,
             stack_size: 0x4000,
-            has_vdso: false,
+            vdso: None,
         };
         let stack = build_initial_stack(&spec).unwrap();
         let word = |va: u64| {
