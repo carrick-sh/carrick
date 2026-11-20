@@ -34,7 +34,7 @@ on:
         description: "Scoreboard only (required with a branch): the exact 40-hex head SHA you reviewed"
         type: string
         default: ''
-      # Fixtures-only mode (#2356): an owner dispatch naming any commit in
+      # Fixtures-only mode (#1207): an owner dispatch naming any commit in
       # this repository runs only `signed-fixtures`, at that commit, and
       # uploads `signed-fixtures-<sha>`, exactly as a push to main does. It
       # lets a PR whose fixture inputs differ from main's get a CI-published
