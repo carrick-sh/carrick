@@ -1006,7 +1006,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         fail_frame_grant_publication(
                             mailbox,
                             request,
-                            "descriptor selector returned an invalid span".into(),
+                            "descriptor selector returned an invalid span".to_owned(),
                         )
                     });
                 let admitted = carrick_core_abi::ReservationRange::new(
@@ -1015,7 +1015,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         fail_frame_grant_publication(
                             mailbox,
                             request,
-                            "semantic plan overflowed before descriptor selection".into(),
+                            "semantic plan overflowed before descriptor selection".to_owned(),
                         )
                     }),
                 )
@@ -1023,7 +1023,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     fail_frame_grant_publication(
                         mailbox,
                         request,
-                        "semantic plan was invalid before descriptor selection".into(),
+                        "semantic plan was invalid before descriptor selection".to_owned(),
                     )
                 });
                 let selected = carrick_core::mm::frames::SelectedBackingPlan::new(
@@ -1064,7 +1064,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     record_decision(FrameGrantDecision::FatalPublication);
                     fail_frame_grant_publication(mailbox, request, detail)
                 };
-                let decline_publication = |decision| {
+                let decline_publication = |decision| -> Result<bool, TrapError> {
                     record_decision(decision);
                     Ok(false)
                 };
