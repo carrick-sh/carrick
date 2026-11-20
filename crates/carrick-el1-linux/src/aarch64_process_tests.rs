@@ -17938,6 +17938,21 @@ fn with_arm_process_host_files<R>(
         &std::sync::Arc<carrick_kernel::kernel::FileTable>,
     ) -> R,
 ) -> (R, Vec<u8>) {
+    with_arm_process_host_stdio(carrick_kernel::dispatch::StdioSink::Captured, body)
+}
+
+#[cfg(test)]
+fn with_arm_process_host_stdio<R>(
+    sink: carrick_kernel::dispatch::StdioSink,
+    body: impl FnOnce(
+        &mut dyn FnMut(
+            ArmCaller,
+            u64,
+            [u64; 6],
+        ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+        &std::sync::Arc<carrick_kernel::kernel::FileTable>,
+    ) -> R,
+) -> (R, Vec<u8>) {
     use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
     use carrick_personality_linux::dispatch::CompletionRoute;
     use std::sync::Arc;
@@ -17969,6 +17984,7 @@ fn with_arm_process_host_files<R>(
     impl CurrentMmMemory for HostPointerMemory {}
 
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    dispatcher.set_stdio_sink(sink);
     let context = dispatcher.capture_one_task_context().unwrap();
     let wait_service = carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::new(
         carrick_kernel::kernel::Scheduler::new(Arc::clone(context.kernel())),
@@ -18537,6 +18553,187 @@ fn serial_host_native_child_pselect6_wakes_on_sibling_pipe_write() {
             CompletionRoute::Served | CompletionRoute::WithWork
         ));
         assert_eq!(read_set.as_bytes(), &mask);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_epoll_ctl_classifies_stdio() {
+    use carrick_abi::{LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLLOUT};
+    use carrick_kernel::dispatch::{PipedOutput, StdioSink};
+    use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
+    use carrick_test_support::GuestUserBuffer;
+
+    let (_reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let regular = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+    let sink = StdioSink::Piped {
+        stdout: PipedOutput::host(writer).unwrap(),
+        stderr: PipedOutput::host(regular).unwrap(),
+    };
+    with_arm_process_host_stdio(sink, |call, _| {
+        let (_, pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0, "clone: {pid}");
+        let child = ArmCaller::Child(pid as u32);
+        let (_, epoll) = call(child, sys::EPOLL_CREATE1.raw(), [0; 6]);
+        assert!(epoll >= 0);
+        let epoll = epoll as u64;
+        let event = epoll_event_buffer(LINUX_EPOLLOUT, 2588);
+        let ctl = |op, fd, address| [epoll, op, fd, address, 0, 0];
+        let regular = call(
+            child,
+            sys::EPOLL_CTL.raw(),
+            ctl(LINUX_EPOLL_CTL_ADD, 2, event.arg()),
+        );
+        assert_ne!(regular.0, CompletionRoute::Forward);
+        assert_eq!(regular.1, carrick_abi::LINUX_EPERM.guest_retval());
+        let stream = call(
+            child,
+            sys::EPOLL_CTL.raw(),
+            ctl(LINUX_EPOLL_CTL_ADD, 1, event.arg()),
+        );
+        assert_ne!(stream.0, CompletionRoute::Forward);
+        assert_eq!(stream.1, 0, "stream registration: {stream:?}");
+        let output = GuestUserBuffer::zeroed(16);
+        assert_eq!(
+            call(
+                child,
+                sys::EPOLL_PWAIT.raw(),
+                [epoll, output.arg(), 1, 0, 0, 0]
+            )
+            .1,
+            1
+        );
+        assert_eq!(&output.as_bytes()[..4], &LINUX_EPOLLOUT.to_ne_bytes());
+        assert_eq!(&output.as_bytes()[8..], &2588u64.to_ne_bytes());
+        assert_eq!(
+            call(child, sys::EPOLL_CTL.raw(), ctl(LINUX_EPOLL_CTL_DEL, 1, 0)).1,
+            0
+        );
+        assert_eq!(
+            call(
+                child,
+                sys::EPOLL_PWAIT.raw(),
+                [epoll, output.arg(), 1, 0, 0, 0]
+            )
+            .1,
+            0
+        );
+    });
+}
+
+/// Both syscalls must enroll a native child before its sibling writes to
+/// the ring pipe. The second descriptor is a quiet native host socket.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_mixed_pselect6_wakes_on_sibling() {
+    native_child_mixed_readiness_wakes_on_sibling(false);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_mixed_masked_ppoll_wakes_on_sibling() {
+    native_child_mixed_readiness_wakes_on_sibling(true);
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_child_mixed_readiness_wakes_on_sibling(use_ppoll: bool) {
+    use ArmCaller::Root;
+    use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
+    use carrick_test_support::GuestUserBuffer;
+
+    with_arm_process_host_dispatch(|call| {
+        let pipe = GuestUserBuffer::zeroed(8);
+        assert_eq!(
+            call(Root, sys::PIPE2.raw(), [pipe.arg(), 0, 0, 0, 0, 0]).1,
+            0
+        );
+        let read = i32::from_ne_bytes(pipe.as_bytes()[..4].try_into().unwrap());
+        let write = u32::from_ne_bytes(pipe.as_bytes()[4..].try_into().unwrap());
+        let (_, parent) = call(Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(parent > 0);
+        let parent = ArmCaller::Child(parent as u32);
+        let (_, reader) = call(parent, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(reader > 0);
+        let reader = ArmCaller::Child(reader as u32);
+        call(reader, ARM_RESUME, [0; 6]);
+        let (_, writer) = call(parent, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(writer > 0);
+        let writer = ArmCaller::Child(writer as u32);
+        call(writer, ARM_RESUME, [0; 6]);
+        let (_, socket) = call(reader, sys::SOCKET.raw(), [2, 2, 0, 0, 0, 0]);
+        assert!((0..64).contains(&socket), "child socket: {socket}");
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut address = [0; 16];
+        address[..2].copy_from_slice(&2u16.to_ne_bytes());
+        address[2..4].copy_from_slice(&peer.local_addr().unwrap().port().to_be_bytes());
+        address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        let address = GuestUserBuffer::from_bytes(&address);
+        assert_eq!(
+            call(
+                reader,
+                sys::CONNECT.raw(),
+                [socket as u64, address.arg(), 16, 0, 0, 0]
+            )
+            .1,
+            0
+        );
+
+        let mask = GuestUserBuffer::from_bytes(&0u64.to_ne_bytes());
+        let mut fds = [0; 16];
+        for (entry, fd) in fds.chunks_exact_mut(8).zip([read, socket as i32]) {
+            entry[..4].copy_from_slice(&fd.to_ne_bytes());
+            entry[4..6].copy_from_slice(&1i16.to_ne_bytes());
+            entry[6..].copy_from_slice(&0x5a5ai16.to_ne_bytes());
+        }
+        let fds = GuestUserBuffer::from_bytes(&fds);
+        let bits = GuestUserBuffer::from_bytes(&((1u64 << read) | (1u64 << socket)).to_ne_bytes());
+        let (nr, args) = if use_ppoll {
+            (sys::PPOLL.raw(), [fds.arg(), 2, 0, mask.arg(), 8, 0])
+        } else {
+            (
+                sys::PSELECT6.raw(),
+                [
+                    socket.max(i64::from(read)) as u64 + 1,
+                    bits.arg(),
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        call(reader, ARM_LEAVE_ON_PARK, [0; 6]);
+        let parked = call(reader, nr, args);
+        assert_eq!(
+            parked.0,
+            CompletionRoute::Suspended,
+            "mixed syscall {nr}: {parked:?}"
+        );
+        assert_eq!(
+            call(reader, ARM_RESUME, [0; 6]).0,
+            CompletionRoute::Suspended
+        );
+        let byte = GuestUserBuffer::from_bytes(b"x");
+        assert_eq!(
+            call(
+                writer,
+                sys::WRITE.raw(),
+                [write.into(), byte.arg(), 1, 0, 0, 0]
+            )
+            .1,
+            1
+        );
+        let mut ready = call(reader, ARM_RESUME, [0; 6]);
+        if ready.1 == i64::MIN {
+            ready = call(reader, nr, args);
+        }
+        assert_eq!(ready.1, 1, "mixed syscall {nr} sibling wake: {ready:?}");
+        if use_ppoll {
+            assert_eq!(&fds.as_bytes()[6..8], &1i16.to_ne_bytes());
+            assert_eq!(&fds.as_bytes()[14..16], &0i16.to_ne_bytes());
+        } else {
+            assert_eq!(bits.as_bytes(), &(1u64 << read).to_ne_bytes());
+        }
     });
 }
 

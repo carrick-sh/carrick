@@ -18,6 +18,67 @@
 .global _start
 .text
 _start:
+#ifdef EPOLL_STDIO
+    mov $57, %eax                  /* native fork child owns the epoll */
+    syscall
+    test %eax, %eax
+    js fail_fork
+    jz stdio_epoll
+    mov %eax, %r12d
+    jmp wait_for_child
+stdio_epoll:
+    mov $291, %eax                 /* epoll_create1(0) */
+    xor %edi, %edi
+    syscall
+    test %eax, %eax
+    js fail_pipe
+    mov %eax, %r13d
+    mov $2, %edx                   /* regular stderr: EPERM */
+    call stdio_add
+    cmp $-1, %rax
+    jne fail_result
+    mov $1, %edx                   /* socket stdout: writable */
+    call stdio_add
+    test %rax, %rax
+    jnz fail_result
+    call stdio_wait
+    cmp $1, %rax
+    jne fail_result
+    cmpl $4, epoll_event(%rip)
+    jne fail_revents
+    cmpq $2588, epoll_event+4(%rip)
+    jne fail_fields
+    mov %r13d, %edi
+    mov $2, %esi                   /* EPOLL_CTL_DEL */
+    mov $1, %edx
+    xor %r10d, %r10d
+    mov $233, %eax
+    syscall
+    test %rax, %rax
+    jnz fail_result
+    call stdio_wait
+    test %rax, %rax
+    jnz fail_result
+    xor %edi, %edi
+    jmp exit
+stdio_add:
+    mov %r13d, %edi
+    mov $1, %esi                   /* EPOLL_CTL_ADD */
+    lea stdio_interest(%rip), %r10
+    mov $233, %eax
+    syscall
+    ret
+stdio_wait:
+    mov %r13d, %edi
+    lea epoll_event(%rip), %rsi
+    mov $1, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    xor %r9d, %r9d
+    mov $281, %eax                 /* epoll_pwait, zero timeout */
+    syscall
+    ret
+#endif
 #ifdef SELECT_TIMEOUT_EOF
     mov $57, %eax                  /* child owns the only copies of the pipe */
     syscall
@@ -67,7 +128,7 @@ _start:
 #ifdef CHILD_POLLS
     jz poller
     mov %eax, %r12d
-#ifdef USE_PSELECT
+#if defined(USE_PSELECT) && !defined(MIXED_HOST_WAKE)
     mov $57, %eax                  /* fork a sibling writer */
     syscall
     test %eax, %eax
@@ -87,6 +148,8 @@ _start:
     cmpl $0, status(%rip)
     jne child_fail
 #endif
+    jmp wait_for_child
+#elif defined(MIXED_HOST_WAKE)
     jmp wait_for_child
 #else
     jmp child
@@ -227,7 +290,7 @@ wait_for_child:
     jz fail_wait
     jmp exit
 1:
-#if !defined(SELECT_TIMEOUT_EOF) && !defined(SELECT_CAUGHT_SIGNAL)
+#if !defined(SELECT_TIMEOUT_EOF) && !defined(SELECT_CAUGHT_SIGNAL) && !defined(MIXED_HOST_WAKE)
     mov %r15d, %edi              /* reap the sibling writer as well */
     lea status(%rip), %rsi
     xor %edx, %edx
@@ -365,6 +428,23 @@ timed_pselect_child:
     jmp exit
 #endif
 pselect_reader:
+#ifdef MIXED_READY
+    mov $2, %edi                  /* AF_INET */
+    mov $2, %esi                  /* SOCK_DGRAM */
+    xor %edx, %edx
+    mov $41, %eax
+    syscall
+    test %eax, %eax
+    js pselect_errno
+    mov %eax, %r13d
+    mov %r13d, %edi
+    lea select_gate_peer(%rip), %rsi
+    mov $16, %edx
+    mov $42, %eax
+    syscall
+    test %rax, %rax
+    js pselect_errno
+#endif
 #ifdef SELECT_CAUGHT_SIGNAL
     mov $10, %edi                  /* rt_sigaction(SIGUSR1, &action, NULL, 8) */
     lea signal_action(%rip), %rsi
@@ -375,13 +455,16 @@ pselect_reader:
     test %rax, %rax
     jnz fail_sigaction
 #endif
-#ifdef USE_SELECT_TIMEVAL
+#if defined(USE_SELECT_TIMEVAL) && !defined(MIXED_READY)
     movq $-1, select_time+8(%rip)
     call select_call
     cmp $-22, %rax
     jne fail_result
 #endif
     call pselect_one
+#ifdef MIXED_HOST_WAKE
+    movb $1, host_phase(%rip)
+#endif
 #ifdef SELECT_CAUGHT_SIGNAL
     movq $8, select_time(%rip)
     call select_call
@@ -397,7 +480,40 @@ pselect_reader:
     or select_time+8(%rip), %rax
     jz fail_fields
 #else
+#ifdef MIXED_HOST_WAKE
+    mov $186, %eax                 /* gettid */
+    syscall
+    mov %eax, reader_pid(%rip)
+    mov %r13d, %edi
+    lea reader_pid(%rip), %rsi
+    mov $4, %edx
+    mov $1, %eax
+    syscall
+    cmp $4, %rax
+    jne fail_result
+#endif
     call pselect_one
+#endif
+#ifdef MIXED_READY
+    /* Both sources are quiet after the gated pipe byte was drained. */
+    movq $0, select_time(%rip)
+    movq $1000000, select_time+8(%rip)
+#ifdef USE_SELECT_TIMEVAL
+    movq $1000, select_time+8(%rip)
+#endif
+    call select_call
+    test %rax, %rax
+    js pselect_errno
+    jnz fail_result
+#ifdef MIXED_PPOLL
+    cmpw $0, pfd+6(%rip)
+    jne fail_revents
+    cmpw $0, pfd+14(%rip)
+    jne fail_revents
+#else
+    cmpq $0, read_set(%rip)
+    jne fail_revents
+#endif
 #endif
     xor %edi, %edi
     jmp exit
@@ -413,8 +529,19 @@ pselect_one:
     js pselect_errno
     cmp $1, %rax
     jne fail_result
+#ifdef MIXED_HOST_WAKE
+    cmpb $0, host_phase(%rip)
+    jne verify_socket
+#endif
+#ifdef MIXED_PPOLL
+    cmpw $1, pfd+6(%rip)
+    jne fail_revents
+    cmpw $0, pfd+14(%rip)
+    jne fail_revents
+#else
     cmp %r14, read_set(%rip)
     jne fail_revents
+#endif
 #ifdef USE_SELECT_TIMEVAL
     cmpq $0, select_time(%rip)
     jl fail_fields
@@ -433,12 +560,62 @@ pselect_one:
     cmpb $'x', received(%rip)
     jne fail_revents
     ret
+#ifdef MIXED_HOST_WAKE
+verify_socket:
+#ifdef MIXED_PPOLL
+    cmpw $0, pfd+6(%rip)
+    jne fail_revents
+    cmpw $1, pfd+14(%rip)
+    jne fail_revents
+#else
+    xor %eax, %eax
+    bts %r13, %rax
+    cmp %rax, read_set(%rip)
+    jne fail_revents
+#endif
+    mov %r13d, %edi
+    lea received(%rip), %rsi
+    mov $1, %edx
+    xor %eax, %eax
+    syscall
+    cmp $1, %rax
+    jne fail_result
+    cmpb $'w', received(%rip)
+    jne fail_revents
+    ret
+#endif
 
 select_call:
+#ifdef MIXED_PPOLL
+    mov fds(%rip), %eax
+    mov %eax, pfd(%rip)
+    movw $1, pfd+4(%rip)
+    movw $0x5a5a, pfd+6(%rip)
+    mov %r13d, pfd+8(%rip)
+    movw $1, pfd+12(%rip)
+    movw $0x5a5a, pfd+14(%rip)
+    lea pfd(%rip), %rdi
+    mov $2, %esi
+    xor %edx, %edx
+    cmpq $0, select_time+8(%rip)
+    je 1f
+    lea select_time(%rip), %rdx
+1:
+    lea ppoll_mask(%rip), %r10
+    mov $8, %r8d
+    mov $271, %eax
+    syscall
+    ret
+#else
     mov fds(%rip), %ecx
     mov $1, %r14d
     shl %cl, %r14
     mov %r14, read_set(%rip)
+#ifdef MIXED_READY
+    bts %r13, read_set(%rip)
+    cmp %r13d, %ecx
+    cmovb %r13d, %ecx
+#endif
     lea 1(%rcx), %edi
     lea read_set(%rip), %rsi
     xor %edx, %edx
@@ -451,11 +628,17 @@ select_call:
 #else
 #if defined(SELECT_TIMEOUT_EOF) || defined(SELECT_CAUGHT_SIGNAL)
     lea select_time(%rip), %r8
+#elif defined(MIXED_READY)
+    cmpq $0, select_time+8(%rip)
+    je 1f
+    lea select_time(%rip), %r8
+1:
 #endif
     mov $270, %eax                 /* pselect6 */
 #endif
     syscall
     ret
+#endif
 pselect_errno:
     neg %eax
     mov %eax, %edi
@@ -508,6 +691,10 @@ exit:
     ud2
 .data
 .balign 16
+#ifdef EPOLL_STDIO
+stdio_interest: .long 4
+                .quad 2588
+#endif
 interest: .long 1
           .quad 0x1671
 delay: .quad 0, 50000000
@@ -531,7 +718,14 @@ select_gate_peer:
 .bss
 .balign 4096
 fds: .space 8
-pfd: .space 8
+pfd: .space 16
+#ifdef MIXED_PPOLL
+ppoll_mask: .space 8
+#endif
+#ifdef MIXED_HOST_WAKE
+host_phase: .space 1
+.balign 8
+#endif
 read_set: .space 8
 select_time: .space 16
 reader_pid: .space 4

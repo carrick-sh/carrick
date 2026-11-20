@@ -1430,6 +1430,113 @@ fn native_host_epoll_child(port: u16) -> i32 {
     0
 }
 
+fn native_mixed_host_readiness(port: u16, ppoll: bool) -> i32 {
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return 1;
+    }
+    if child == 0 {
+        let result = native_mixed_host_readiness_child(port, ppoll);
+        unsafe { libc::_exit(result) }
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(child, &mut status, 0) } != child {
+        return 2;
+    }
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        3
+    }
+}
+
+fn native_mixed_host_readiness_child(port: u16, ppoll: bool) -> i32 {
+    let mut pipe = [-1; 2];
+    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return 4;
+    }
+    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if socket < 0 || socket as usize >= libc::FD_SETSIZE {
+        return 5;
+    }
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        },
+        sin_zero: [0; 8],
+    };
+    let tid = (unsafe { libc::syscall(libc::SYS_gettid) } as u64).to_ne_bytes();
+    if unsafe {
+        libc::connect(
+            socket,
+            (&raw const address).cast(),
+            std::mem::size_of_val(&address) as _,
+        )
+    } != 0
+        || unsafe { libc::write(socket, tid.as_ptr().cast(), tid.len()) } != tid.len() as isize
+    {
+        return 6;
+    }
+    let wait = |timeout: *mut libc::timespec| {
+        if ppoll {
+            let mut fds = [pipe[0], socket].map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0x5a5a,
+            });
+            let mask = 0u64;
+            let ready = unsafe {
+                libc::syscall(
+                    libc::SYS_ppoll,
+                    fds.as_mut_ptr(),
+                    fds.len(),
+                    timeout,
+                    &mask,
+                    8,
+                )
+            };
+            (ready, fds[0].revents, fds[1].revents)
+        } else {
+            let mut read_set: libc::fd_set = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::FD_SET(pipe[0], &mut read_set);
+                libc::FD_SET(socket, &mut read_set);
+            }
+            let ready = unsafe {
+                libc::syscall(
+                    libc::SYS_pselect6,
+                    socket.max(pipe[0]) + 1,
+                    &mut read_set,
+                    0,
+                    0,
+                    timeout,
+                    0,
+                )
+            };
+            let pipe_ready = unsafe { libc::FD_ISSET(pipe[0], &read_set) };
+            let socket_ready = unsafe { libc::FD_ISSET(socket, &read_set) };
+            (ready, i16::from(pipe_ready), i16::from(socket_ready))
+        }
+    };
+    if wait(std::ptr::null_mut()) != (1, 0, libc::POLLIN) {
+        return 7;
+    }
+    let mut byte = 0u8;
+    if unsafe { libc::read(socket, (&raw mut byte).cast(), 1) } != 1 || byte != b'r' {
+        return 8;
+    }
+    let mut timeout = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    if wait(&mut timeout) != (0, 0, 0) {
+        return 9;
+    }
+    0
+}
+
 /// `epoll-pingpong <iters>`: libuv's MessagePort shape. Two threads, each
 /// with its own epoll over its own eventfd; A posts B's eventfd and blocks in
 /// `epoll_wait` until B posts A's. Every turn is an eventfd write, an
@@ -3834,6 +3941,9 @@ fn main() {
         ),
         "pipe-pingpong" => pipe_pingpong(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000)),
         "native-host-epoll" => native_host_epoll(args[2].parse().expect("UDP peer port")),
+        "native-mixed-host-readiness" => {
+            native_mixed_host_readiness(args[2].parse().expect("UDP peer port"), args[3] == "ppoll")
+        }
         "epoll-pingpong" => {
             epoll_pingpong(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000))
         }

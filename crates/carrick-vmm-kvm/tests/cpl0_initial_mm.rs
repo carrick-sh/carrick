@@ -5010,6 +5010,59 @@ fn zone_exec_status_pipe_reports_child_exec_failure_then_eof() {
 /// host sends only after observing the reader's production wait enrollment.
 #[test]
 fn native_child_pselect6_wakes_on_sibling_pipe_write() {
+    native_child_readiness_wait_fixture(&[]);
+}
+
+#[test]
+fn native_child_epoll_ctl_classifies_stdio() {
+    use carrick_kernel::dispatch::{PipedOutput, StdioSink, SyscallDispatcher};
+
+    let (_reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let regular = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+    let dispatcher = SyscallDispatcher::default();
+    dispatcher.set_stdio_sink(StdioSink::Piped {
+        stdout: PipedOutput::host(writer).unwrap(),
+        stderr: PipedOutput::host(regular).unwrap(),
+    });
+    let elf = native_exit_fixture_with_flags("native_pipe_poll_wake.S", &["-DEPOLL_STDIO"]);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, ELF_X86_64_MACHINE, &|_| None).unwrap();
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        256,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |_| {},
+        dispatcher,
+    )
+    .expect("stdio epoll run");
+    assert_eq!(outcome.run.exit_code, 7, "stdio epoll: {:?}", outcome.run);
+}
+
+#[test]
+fn native_child_mixed_pselect6_wakes_on_sibling_pipe_write() {
+    native_child_readiness_wait_fixture(&["-DMIXED_READY"]);
+}
+
+#[test]
+fn native_child_mixed_select_wakes_on_sibling_pipe_write() {
+    native_child_readiness_wait_fixture(&["-DMIXED_READY", "-DUSE_SELECT_TIMEVAL"]);
+}
+
+#[test]
+fn native_child_mixed_masked_ppoll_wakes_on_sibling_pipe_write() {
+    native_child_readiness_wait_fixture(&["-DMIXED_READY", "-DMIXED_PPOLL"]);
+}
+
+#[test]
+fn native_child_mixed_pselect6_wakes_on_host_datagram() {
+    native_child_readiness_wait_fixture(&["-DMIXED_READY", "-DMIXED_HOST_WAKE"]);
+}
+
+#[test]
+fn native_child_mixed_masked_ppoll_wakes_on_host_datagram() {
+    native_child_readiness_wait_fixture(&["-DMIXED_READY", "-DMIXED_HOST_WAKE", "-DMIXED_PPOLL"]);
+}
+
+fn native_child_readiness_wait_fixture(extra_flags: &[&str]) {
     use carrick_sched_core::{RecordId, ZONE_RECORDS};
     use std::time::{Duration, Instant};
 
@@ -5020,10 +5073,9 @@ fn native_child_pselect6_wakes_on_sibling_pipe_write() {
         "-DSELECT_GATE_PORT={}",
         peer.local_addr().unwrap().port().swap_bytes()
     );
-    let elf = native_exit_fixture_with_flags(
-        "native_pipe_poll_wake.S",
-        &["-DUSE_PSELECT", "-DCHILD_POLLS", &port],
-    );
+    let mut flags = vec!["-DUSE_PSELECT", "-DCHILD_POLLS", &port];
+    flags.extend_from_slice(extra_flags);
+    let elf = native_exit_fixture_with_flags("native_pipe_poll_wake.S", &flags);
     let program = carrick_mem::elf::ElfProgram::load(&elf, ELF_X86_64_MACHINE, &|_| None)
         .expect("pselect6 fixture");
     let mut sender = None;
@@ -5035,7 +5087,9 @@ fn native_child_pselect6_wakes_on_sibling_pipe_write() {
             let zone = carrier.carrier_zone_wake().expect("carrier wake domain");
             sender = Some(std::thread::spawn(move || {
                 let mut pid = [0; 4];
-                let (count, client) = peer.recv_from(&mut pid).expect("sibling writer");
+                let Ok((count, client)) = peer.recv_from(&mut pid) else {
+                    return false;
+                };
                 assert_eq!(count, pid.len());
                 let tid = u64::from(u32::from_ne_bytes(pid));
                 let deadline = Instant::now() + Duration::from_secs(4);
@@ -5063,11 +5117,13 @@ fn native_child_pselect6_wakes_on_sibling_pipe_write() {
         carrick_kernel::dispatch::SyscallDispatcher::default(),
     )
     .expect("pselect6 run");
-    assert_eq!(outcome.run.exit_code, 7, "child select: {:?}", outcome.run);
-    assert!(
-        sender.unwrap().join().unwrap(),
-        "child pselect6 never enrolled"
+    let enrolled = sender.unwrap().join().unwrap();
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "child readiness: {:?}",
+        outcome.run
     );
+    assert!(enrolled, "child readiness wait never enrolled");
 }
 
 /// Director follow-up: reverse the existing peers so a fork child owns the

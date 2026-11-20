@@ -1812,6 +1812,20 @@ fn el1_sched_pipe_pingpong_stays_in_guest() {
 /// execution lane. This exercises host delivery through the kqueue reactor.
 #[test]
 fn el1_native_child_host_epoll_wakes_parked_waiter() {
+    native_child_host_datagram_wait("native-host-epoll", "", 22);
+}
+
+#[test]
+fn el1_native_child_mixed_pselect6_wakes_on_host_datagram() {
+    native_child_host_datagram_wait("native-mixed-host-readiness", "pselect6", 72);
+}
+
+#[test]
+fn el1_native_child_mixed_masked_ppoll_wakes_on_host_datagram() {
+    native_child_host_datagram_wait("native-mixed-host-readiness", "ppoll", 73);
+}
+
+fn native_child_host_datagram_wait(mode: &str, variant: &str, ordinal: usize) {
     use carrick_el1_abi::{Claim, RecordId};
     use std::time::Instant;
 
@@ -1842,23 +1856,25 @@ fn el1_native_child_host_epoll_wakes_parked_waiter() {
                 if parked {
                     break;
                 }
-                assert!(Instant::now() < deadline, "child never parked on its epoll");
+                assert!(
+                    Instant::now() < deadline,
+                    "child never parked in {mode} {variant}"
+                );
                 std::thread::yield_now();
             }
             assert_eq!(peer.send_to(b"r", child).unwrap(), 1);
         });
-        let measured = run_fixture(
-            &carrier,
-            &["native-host-epoll", &port],
-            Duration::from_secs(30),
-        );
+        let measured = run_fixture(&carrier, &[mode, &port, variant], Duration::from_secs(30));
         assert!(measured.result.success(), "{}", describe(&measured));
         sender
             .join()
             .expect("peer supplied host readiness after the park");
         assert!(
-            !measured.forwarded_syscalls.iter().any(|(nr, _)| *nr == 22),
-            "native epoll wait crossed the ring: {}",
+            !measured
+                .forwarded_syscalls
+                .iter()
+                .any(|(nr, _)| *nr == ordinal),
+            "native wait crossed the ring in {mode} {variant}: {}",
             describe(&measured)
         );
     });
