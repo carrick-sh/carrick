@@ -16,3 +16,5 @@ carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-mem = { path = "../carrick-mem" }
+carrick-mmu-core = { path = "../carrick-mmu-core" }
+goblin.workspace = true
