@@ -469,6 +469,14 @@ fn read_u64(memory: &mut Pages, at: u64) -> u64 {
 /// its `svc #0` through the mailbox/EL1 vector hook into `carrick_el1_syscall`,
 /// and reach the first guest-visible carrier exit (`HVC #2`).
 fn enter_carrier_root(el1_elf: &[u8], user_elf: &[u8]) -> (CpuState, Pages, u64) {
+    let mut user_memory = Pages::default();
+    let user_entry = load_elf(user_elf, &mut user_memory);
+    let (cpu, mut memory) = enter_carrier(el1_elf, user_entry);
+    memory.pages.append(&mut user_memory.pages);
+    (cpu, memory, user_entry)
+}
+
+fn enter_carrier(el1_elf: &[u8], user_entry: u64) -> (CpuState, Pages) {
     let mut memory = Pages::default();
     for page in (LINUX_EL1_KERNEL_BASE..LINUX_EL1_KERNEL_BASE + LINUX_EL1_KERNEL_SIZE)
         .step_by(PAGE as usize)
@@ -492,7 +500,6 @@ fn enter_carrier_root(el1_elf: &[u8], user_elf: &[u8]) -> (CpuState, Pages, u64)
     }
 
     let _el1_entry = load_elf(el1_elf, &mut memory);
-    let user_entry = load_elf(user_elf, &mut memory);
     memory.load(LINUX_EL0_TRAMPOLINE_BASE, &el0_trampoline_bytes());
     memory.load(
         LINUX_EL1_VECTORS_BASE,
@@ -532,7 +539,7 @@ fn enter_carrier_root(el1_elf: &[u8], user_elf: &[u8]) -> (CpuState, Pages, u64)
     cpu.named.ttbr1 = SystemValue(root.ttbr1);
     cpu.el1.sctlr = Sctlr(root.sctlr);
     cpu.el1.cntkctl = SystemValue(root.cntkctl_el1);
-    (cpu, memory, user_entry)
+    (cpu, memory)
 }
 
 fn check_forwarded_write_exit(
@@ -731,8 +738,8 @@ impl ExecuteBlock for TracingRunner {
         code: &HostCode,
         cpu: &mut CpuState,
     ) -> Result<usize, HostError> {
-        let start = block.guest().start().0;
-        if start < LINUX_EL0_TRAMPOLINE_BASE {
+        let user = cpu.pstate.el == ExceptionLevel::El0;
+        if user {
             if let Some(mut svc) = self.pending_svc.take() {
                 svc.ret = Some(x(cpu, 0) as i64);
                 self.syscalls.push(svc);
@@ -743,7 +750,7 @@ impl ExecuteBlock for TracingRunner {
             }
         }
         let exit_idx = self.inner.execute(block, code, cpu)?;
-        if start < LINUX_EL0_TRAMPOLINE_BASE {
+        if user {
             let sp = cpu.sp().0;
             let lr = x(cpu, 30);
             match block.exits().get(exit_idx).copied() {
@@ -1211,5 +1218,91 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
             .map(|s| (s.nr, s.ret))
             .collect::<Vec<_>>(),
         vec![(96, Some(-38)), (73, Some(0)), (134, None)]
+    );
+}
+
+/// Set CARRICK_A64_DYN_ROOT to a fixture root containing `hello` and its
+/// PT_INTERP. See the draft PR for the Debian cross-toolchain build command.
+#[test]
+fn production_el1_image_runs_dynamic_glibc_hello() {
+    use carrick_mem::{
+        elf::{ElfProgram, LoadPlan},
+        linux_abi::{LINUX_AT_HWCAP, LINUX_AT_HWCAP2},
+        memory::{build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso},
+    };
+    use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
+
+    let Some(root) = std::env::var_os("CARRICK_A64_DYN_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let el1 = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
+        .expect("read the production EL1 ELF");
+    let hello = std::fs::read(root.join("hello")).expect("read dynamic hello");
+    let program = ElfProgram::load(&hello, 183, &|path| {
+        assert_eq!(path, "/lib/ld-linux-aarch64.so.1");
+        std::fs::read(root.join(&path[1..])).ok()
+    })
+    .expect("plan glibc hello and its interpreter");
+    let interpreter = program.interpreter.as_ref().expect("dynamic fixture");
+    let (mut cpu, mut memory) = enter_carrier(&el1, program.entry());
+
+    fn map_plan(memory: &mut Pages, plan: &LoadPlan, bytes: &[u8]) {
+        for segment in &plan.segments {
+            let start = segment.virtual_address;
+            let end = start + segment.memory_size;
+            for page in (start & !(PAGE - 1)..end).step_by(PAGE as usize) {
+                memory.map_zero(page);
+            }
+            let offset = segment.file_offset as usize;
+            memory.load(start, &bytes[offset..offset + segment.file_size as usize]);
+        }
+    }
+    map_plan(&mut memory, &program.executable, &hello);
+    map_plan(&mut memory, &interpreter.plan, &interpreter.bytes);
+
+    let mut auxv =
+        linux_auxv_from_load_plan_with_vdso(&program.executable, program.interpreter_base(), false);
+    for entry in &mut auxv {
+        match entry.a_type {
+            LINUX_AT_HWCAP => entry.a_val = GUEST_CPU_PROFILE.hwcap().bits(),
+            LINUX_AT_HWCAP2 => entry.a_val = GUEST_CPU_PROFILE.hwcap2().bits(),
+            _ => {}
+        }
+    }
+    let (stack, sp, _) = build_linux_initial_stack(
+        vec![b"/hello".to_vec()],
+        Vec::new(),
+        &auxv,
+        None,
+        LINUX_STACK_TOP,
+        8 * PAGE,
+    )
+    .unwrap();
+    let (offset, bytes) = stack.shared_initialized_bytes();
+    for page in (stack.start..LINUX_STACK_TOP).step_by(PAGE as usize) {
+        memory.map_zero(page);
+    }
+    memory.load(stack.start + offset, &bytes);
+    cpu.sp_el0 = StackPointer(sp);
+    admit_root_task_with_stdio(&mut memory);
+
+    let mut runner = TracingRunner::new().unwrap();
+    let report = probe_traced(&mut cpu, &mut memory, &mut runner, 1_000_000);
+    println!(
+        "dynamic {report}; ESR={:#x} ELR={:#x} FAR={:#x}",
+        cpu.el1.esr.0, cpu.el1.elr.0, cpu.el1.far.0
+    );
+    for svc in &runner.syscalls {
+        println!(
+            "  svc {} @ {:#x} {:x?} -> {:?}",
+            svc.nr, svc.pc, svc.args, svc.ret
+        );
+    }
+    assert_eq!(report.undefined_el0_deliveries, 0);
+    assert_eq!(
+        runner.syscalls.last().map(|svc| svc.nr),
+        Some(94),
+        "hello must reach exit_group"
     );
 }
