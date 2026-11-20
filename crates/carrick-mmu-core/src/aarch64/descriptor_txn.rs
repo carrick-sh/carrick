@@ -1092,6 +1092,24 @@ pub trait DescriptorJournal {
     fn clear(&mut self);
 }
 
+impl<J: DescriptorJournal + ?Sized> DescriptorJournal for &mut J {
+    fn reserve(&mut self, entries: usize) -> bool {
+        (**self).reserve(entries)
+    }
+
+    fn push(&mut self, entry: JournalEntry) -> bool {
+        (**self).push(entry)
+    }
+
+    fn entries(&self) -> &[JournalEntry] {
+        (**self).entries()
+    }
+
+    fn clear(&mut self) {
+        (**self).clear();
+    }
+}
+
 /// Inline storage for small transactions with fallible heap spill.
 #[derive(Debug, Default)]
 pub struct InlineJournal {
@@ -1912,15 +1930,15 @@ enum Loc {
     Fresh(Option<u64>),
 }
 
-struct Executor<'a, W: ?Sized, J: ?Sized> {
-    words: &'a W,
+struct Executor<'a> {
+    words: &'a dyn LiveDescriptorWords,
     op: DescriptorOp,
     start: u64,
     end: u64,
     apply: bool,
     grants: &'a [u64],
     grants_used: usize,
-    journal: &'a mut J,
+    journal: &'a mut dyn DescriptorJournal,
     planned_live_stores: usize,
     /// Primary arena base (the root): bounds which tables are spare.
     root: u64,
@@ -1931,7 +1949,7 @@ struct Executor<'a, W: ?Sized, J: ?Sized> {
     reclaimed: ReclaimedTables,
 }
 
-impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_, W, J> {
+impl Executor<'_> {
     /// Visit the in-range entries of a live table. Returns whether the table
     /// is now reclaimable: a reclaiming op, a reclaimable level, a spare page,
     /// and every entry reclaimable by the shared predicate, judged on the
@@ -2598,7 +2616,7 @@ fn validate_op(op: &DescriptorOp) -> Result<(), DescriptorRefusal> {
     }
 }
 
-fn roll_back<W: LiveDescriptorWords + ?Sized>(words: &W, journal: &[JournalEntry]) -> bool {
+fn roll_back(words: &dyn LiveDescriptorWords, journal: &[JournalEntry]) -> bool {
     for entry in journal.iter().rev() {
         if words.compare_exchange(entry.pa, entry.after, entry.before) != Ok(true) {
             return false;
@@ -2623,14 +2641,11 @@ pub struct DescriptorPlan {
     pub reclaimed_tables: usize,
 }
 
-fn plan_validated<W>(
-    words: &W,
+fn plan_validated(
+    words: &dyn LiveDescriptorWords,
     root: u64,
     op: DescriptorOp,
-) -> Result<DescriptorPlan, DescriptorRefusal>
-where
-    W: LiveDescriptorWords + ?Sized,
-{
+) -> Result<DescriptorPlan, DescriptorRefusal> {
     let span = op.span();
     let end = span.end().ok_or(DescriptorRefusal::BadRange)?;
     let mut no_journal = SliceJournal::new(&mut []);
@@ -2683,7 +2698,7 @@ where
     if root == 0 || !root.is_multiple_of(PT_PAGE) {
         return Err(DescriptorRefusal::StaleRoot);
     }
-    plan_validated(words, root, op)
+    plan_validated(&words, root, op)
 }
 
 /// Apply one descriptor operation to the live graph rooted at `root`.
@@ -2706,6 +2721,17 @@ where
     W: LiveDescriptorWords + ?Sized,
     J: DescriptorJournal + ?Sized,
 {
+    let mut journal_ref = journal;
+    execute_descriptor_op_dyn(&words, root, op, tables, &mut journal_ref)
+}
+
+fn execute_descriptor_op_dyn(
+    words: &dyn LiveDescriptorWords,
+    root: SubstrateGpa,
+    op: DescriptorOp,
+    tables: &TableGrants,
+    journal: &mut dyn DescriptorJournal,
+) -> DescriptorOutcome {
     if let Err(refusal) = validate_op(&op) {
         return DescriptorOutcome::Refused(refusal);
     }
@@ -2759,7 +2785,7 @@ where
         apply: true,
         grants: tables.as_slice(),
         grants_used: 0,
-        journal: &mut *journal,
+        journal,
         planned_live_stores: 0,
         root,
         reclaim_budget: op.reclaim_budget(),
