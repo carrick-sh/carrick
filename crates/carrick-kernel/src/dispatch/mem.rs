@@ -2622,6 +2622,14 @@ impl SyscallDispatcher {
             .resident_frame_grant_plan(permit, address, max_len)
     }
 
+    #[inline]
+    pub fn frame_grant_release_wait(
+        &self,
+        permit: &super::mm_mutation::HostAliasPermit<'_>,
+    ) -> Result<carrick_el1_abi::PortalOwnerWait, carrick_el1::memory::reservations::Refusal> {
+        self.mem_view().frame_grant_release_wait(permit)
+    }
+
     /// Revalidate an already prepared grant under its original alias exclusion.
     pub fn published_frame_grant_plan<'permit>(
         &self,
