@@ -280,6 +280,12 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
         None
     }
+    fn cputime_nanos(&mut self, _per_thread: bool) -> Option<u64> {
+        None
+    }
+    fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {
+        None
+    }
     /// Native scheduler publication belongs to the admitted process execution
     /// owner, which also delivers architecture-specific wake effects.
     fn native_futex(
@@ -643,6 +649,12 @@ pub trait LifecycleNative<'a>: UserCopy {
     }
     /// Sample the counter and the caller’s published vvar calibration.
     fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
+        None
+    }
+    fn cputime_nanos(&mut self, _per_thread: bool) -> Option<u64> {
+        None
+    }
+    fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {
         None
     }
     /// Resume an input before any syscall effect has been committed.

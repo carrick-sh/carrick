@@ -98,6 +98,7 @@ mod timer_index;
 
 mod aarch64_context;
 pub mod completion_queue;
+pub mod cpu_time;
 pub mod object_wait;
 pub mod occupancy;
 pub mod refusal;
@@ -105,6 +106,7 @@ pub mod spaces;
 mod x86_context;
 pub use aarch64_context::{AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext};
 pub use carrick_guest_arch::{GuestIsa, SavedSyscallPc};
+pub use cpu_time::CpuTickPair;
 pub use process::{
     Aarch64ThreadPointerRegister, ProcessContext, ThreadContext, ThreadPointerRegister,
     X86ThreadPointerRegister,
@@ -1714,6 +1716,8 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     held_map: [AtomicU64; ZONE_RECORDS.div_ceil(64)],
     /// Diagnostic samples indexed by the linked entry, without moving shared fields.
     futex_enrollments: [FutexEnrollmentWords; ZONE_ENTRIES],
+    /// Per-record and per-slot user/system guest CPU tick ledger. Appended ABI field.
+    cpu_ledger: cpu_time::ZoneCpuLedger,
 }
 
 /// A fallible acquisition policy for callers that retain work on refusal.
@@ -2524,6 +2528,66 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
+    /// The record currently running on `slot`, if any.
+    #[inline]
+    pub fn current_record_ref(&self, slot: SlotId) -> Option<RecordRef> {
+        self.slot(slot).current().map(|id| self.record_ref(id))
+    }
+
+    #[inline]
+    pub fn publish_counter_frequency(&self, frequency: carrick_guest_arch::CounterFrequency) {
+        self.cpu_ledger.publish_frequency(frequency);
+    }
+
+    #[inline]
+    pub fn counter_frequency(&self) -> Option<carrick_guest_arch::CounterFrequency> {
+        self.cpu_ledger.frequency()
+    }
+
+    #[inline]
+    pub fn latest_cpu_tick(&self) -> CounterTick {
+        self.cpu_ledger.latest_tick()
+    }
+
+    #[inline]
+    pub fn cpu_enter_ring(&self, slot: SlotId, record: Option<RecordRef>, tick: CounterTick) {
+        self.cpu_ledger.enter_ring(slot, record, tick);
+    }
+
+    #[inline]
+    pub fn cpu_enter_user(&self, slot: SlotId, record: Option<RecordRef>, tick: CounterTick) {
+        self.cpu_ledger.enter_user(slot, record, tick);
+    }
+
+    #[inline]
+    pub fn cpu_bind_record(&self, slot: SlotId, record: RecordRef, tick: CounterTick) {
+        self.cpu_ledger.bind_record(slot, record, tick);
+    }
+
+    #[inline]
+    pub fn cpu_adopt_unadmitted(&self, slot: SlotId, record: RecordRef) {
+        self.cpu_ledger.adopt_unadmitted(slot, record);
+    }
+
+    #[inline]
+    pub fn cpu_leave_slot(&self, slot: SlotId, tick: CounterTick) {
+        self.cpu_ledger.leave_slot(slot, tick);
+    }
+
+    #[inline]
+    pub fn sample_record_cpu_ticks(
+        &self,
+        record: RecordRef,
+        now: Option<CounterTick>,
+    ) -> CpuTickPair {
+        self.cpu_ledger.sample_record(record, now)
+    }
+
+    #[inline]
+    pub fn ratchet_record_cpu_ns(&self, record: RecordRef, nanos: u64) -> u64 {
+        self.cpu_ledger.ratchet_record_nanos(record, nanos)
+    }
+
     /// The record `r` names, if that incarnation is still live.
     pub fn live(&self, r: RecordRef) -> Option<&ZoneRecord<C>> {
         let record = self.record(r.id);
@@ -2648,6 +2712,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         record.deadline.store(0, Ordering::Relaxed);
         record.object.reset_completion_flags();
         record.native_owned.store(0, Ordering::Relaxed);
+        self.cpu_ledger.reset_record(id, record.incarnation());
         record.claim.store(Claim::Free.encode(), Ordering::Release);
         Ok(id)
     }

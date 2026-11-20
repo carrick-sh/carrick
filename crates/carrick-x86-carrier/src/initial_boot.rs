@@ -507,6 +507,21 @@ pub fn carrier_initial_boot<P: Personality>(request_va: u64) -> ! {
     unsafe {
         core::arch::asm!("out dx, al", in("dx") X86_INITIAL_RUNNER_READY_PORT, in("rax") request_va, options(nostack, preserves_flags));
     }
+    {
+        use carrick_guest_arch::InterruptBackend;
+        let mut backend = carrick_el1::isa::x86::X86Backend;
+        let zone = unsafe {
+            &*(carrick_el1::isa::x86_kernel_layout().zone.raw()
+                as *const carrick_el1::memory::reservations::X86Cpl0Zone)
+        };
+        if let Ok(freq) = backend.frequency() {
+            zone.publish_counter_frequency(freq);
+        }
+        if let Ok(now) = backend.counter() {
+            let slot = carrick_sched_core::SlotId::new(0);
+            zone.cpu_enter_user(slot, zone.current_record_ref(slot), now);
+        }
+    }
     // SAFETY: after host acknowledgement, the exact MM is published and the
     // user selectors/entry/stack came from the guest-owned image transaction.
     unsafe { carrick_x86_boot_iret(entry, stack) }
