@@ -5,6 +5,8 @@
  *   MONOTONIC_GETTIME   root and child monotonic samples, with nibble results
  *   default            nanosleep({0, 1 ms}, &rem): parks, expires, returns 0
  *   SLEEP_ZERO         nanosleep({0, 0}, &rem): 0 without parking
+ *   SLEEP_FUTURE_ABSOLUTE: sleep until a deadline sampled by the child
+ *                         and check that return does not precede it.
  *   SLEEP_ABSOLUTE     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME,
  *                      {0, 1}, NULL): the deadline has passed, 0 at once
  */
@@ -51,6 +53,38 @@ child:
 #elif defined(MONOTONIC_GETTIME)
     call clock_gettime
     jmp exit
+#elif defined(SLEEP_FUTURE_ABSOLUTE)
+    sub $32, %rsp
+    mov %rsp, %rsi
+    call read_monotonic
+    cmpq $999999999, 8(%rsp)
+    ja failure
+    addq $30000000, 8(%rsp)
+    cmpq $1000000000, 8(%rsp)
+    jb 1f
+    subq $1000000000, 8(%rsp)
+    incq (%rsp)
+1:
+    mov $1, %edi
+    mov $1, %esi
+    mov %rsp, %rdx
+    xor %r10d, %r10d
+    mov $230, %eax
+    syscall
+    cmp $-38, %rax
+    je sleep_refused
+    test %rax, %rax
+    jne failure
+    lea 16(%rsp), %rsi
+    call read_monotonic
+    mov 16(%rsp), %rax
+    cmp (%rsp), %rax
+    ja success
+    jb failure
+    mov 24(%rsp), %rax
+    cmp 8(%rsp), %rax
+    jae success
+    jmp failure
 #else
     sub $32, %rsp
     movq $0, (%rsp)
@@ -139,6 +173,18 @@ monotonic_return:
 #endif
 #ifdef CLOCK_GETRES
 clock_refused:
+    mov $218, %edi
+    jmp exit
+#endif
+#ifdef SLEEP_FUTURE_ABSOLUTE
+read_monotonic:
+    mov $1, %edi
+    mov $228, %eax
+    syscall
+    test %rax, %rax
+    jne failure
+    ret
+sleep_refused:
     mov $218, %edi
     jmp exit
 #endif
