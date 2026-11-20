@@ -1,14 +1,14 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
+use carrick_test_support::executable::write_executable;
 use serde_json::Value;
 
 #[test]
 fn suiteboard_known_answer() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = directory.path().join("fixture-carrick");
-    fs::write(
+    write_executable(
         &fixture,
         r#"#!/bin/sh
 case "$*" in
@@ -24,9 +24,7 @@ fi
 printf '%s\n' 'CARRICK_SYSCALL_CENSUS {"refusal_evidence":{"schema":1,"isa":"x86_64","complete":true,"rows":[]}}' >&2
 exit 1
 "#,
-    )
-    .unwrap();
-    fs::set_permissions(&fixture, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let manifest = directory.path().join("suites.toml");
     let cache = directory.path().join("oracle.jsonl");
     let results = directory.path().join("observations.jsonl");
