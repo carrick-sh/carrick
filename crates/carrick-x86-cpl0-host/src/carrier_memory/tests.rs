@@ -1,30 +1,5 @@
+use super::test_support::TestMemoryIo;
 use super::*;
-use std::collections::HashMap;
-use std::sync::Mutex;
-#[derive(Default)]
-struct TestMemoryIo {
-    regions: Mutex<HashMap<u32, CarrierMemoryRegion>>,
-}
-impl CarrierMemoryIo for TestMemoryIo {
-    fn carrier_slot_limit(&self) -> Result<u32, carrick_hal::OsError> {
-        Ok(512)
-    }
-    unsafe fn set_user_memory_region(
-        &self,
-        region: CarrierMemoryRegion,
-    ) -> Result<(), carrick_hal::OsError> {
-        let mut regions = self.regions.lock().unwrap();
-        if region.memory_size == 0 {
-            regions.remove(&region.slot);
-        } else {
-            regions.insert(region.slot, region);
-        }
-        Ok(())
-    }
-    fn signal_msi(&self, _: u32, _: u32) -> Result<(), carrick_hal::OsError> {
-        Err(carrick_hal::OsError::new("unused test MSI"))
-    }
-}
 #[test]
 fn retained_backings_follow_committed_slot_installs() {
     let mut memory =

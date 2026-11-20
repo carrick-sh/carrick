@@ -1405,7 +1405,466 @@ mod design_doc_tests {
 
 #[cfg(test)]
 mod forward_execution_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use crate::carrier_cpu::tests::{TestIo, context_with_root};
+    use crate::carrier_memory::test_support::{MemoryTestIo, TestMemoryIo};
+    use carrick_hal::guest_arch_binding::GuestArchBinding;
+
+    struct ForwardVenueFixture {
+        _authority: Arc<FrameInventoryAuthority>,
+        custody: BootstrapCustody<MemoryTestIo>,
+        cpu: CarrierCpu<TestIo>,
+        children: CarrierChildBindings,
+        root_binding: GuestArchBinding,
+    }
+
+    impl ForwardVenueFixture {
+        fn new() -> Self {
+            let nz = |v| NonZeroU64::new(v).unwrap();
+            let mut ram = GuestRam::new();
+            ram.add_window(0, 0x2_0000, WindowKind::Private).unwrap();
+            let zone_end =
+                carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize + size_of::<X86Cpl0Zone>();
+            let meta_bytes = ((zone_end + 4095) & !4095).max(META_LEN as usize);
+            ram.add_window(META_GPA, meta_bytes, WindowKind::Private)
+                .unwrap();
+            // SAFETY: fresh private metadata window with no live vCPU or shared
+            // reader; offsets match `prepare_boot` and static layout assertions.
+            unsafe {
+                let controls = ram
+                    .host_ptr(
+                        META_GPA + carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_OFFSET,
+                        carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_SIZE as usize,
+                    )
+                    .unwrap()
+                    .cast::<ThreadControlSlot>();
+                for index in 0..=carrick_el1_abi::THREAD_POOL_ENTRIES {
+                    controls.add(index).write(ThreadControlSlot::new());
+                }
+                for index in 0..2 {
+                    let offset = index as u64 * STRIDE;
+                    ram.host_ptr(
+                        META_GPA + CONTROL_OFFSET + offset,
+                        size_of::<ThreadControlSlot>(),
+                    )
+                    .unwrap()
+                    .cast::<ThreadControlSlot>()
+                    .write(ThreadControlSlot::new());
+                    ram.host_ptr(META_GPA + TASK_OFFSET + offset, size_of::<CurrentTask>())
+                        .unwrap()
+                        .cast::<CurrentTask>()
+                        .write(CurrentTask::new());
+                    ram.host_ptr(META_GPA + BINDING_OFFSET + offset, size_of::<CpuBinding>())
+                        .unwrap()
+                        .cast::<CpuBinding>()
+                        .write(bootstrap_cpu_binding(index, 0));
+                }
+            }
+            let ram = Arc::new(ram);
+            let mut memory =
+                CarrierMemory::new(MemoryTestIo::new(TestMemoryIo::default())).unwrap();
+            memory.install_bootstrap(Arc::clone(&ram)).unwrap();
+            let authority = Arc::new(FrameInventoryAuthority::new());
+            let frame_inventory = authority.physical_projection(Arc::new(ObjectIdRegistry::new()));
+            let extent = Arc::new(
+                BackingExtent::private(
+                    FrameGpa::new(KERNEL_REGION_GPA),
+                    carrick_el1_abi::EL1_REGION_SIZE as usize,
+                )
+                .unwrap(),
+            );
+            let file_binding = carrick_el1_abi::FileRegionBinding::new(
+                carrick_el1_abi::FileRegionId::from_carrier(memory.identity().nonzero()),
+                carrick_guest_arch::KernelVa::new(X86_CPL0_REGION_BASE),
+                FrameGpa::new(KERNEL_REGION_GPA),
+                carrick_guest_arch::GuestLen::new(carrick_el1_abi::EL1_REGION_SIZE),
+            )
+            .unwrap();
+            // SAFETY: fresh private extent retained by `files` inside `BootstrapCustody`.
+            let files =
+                unsafe { BootstrapFileRegion::initialize(Arc::clone(&extent), file_binding) }
+                    .unwrap();
+            let mut custody =
+                BootstrapCustody::new(memory, ram, None, None, files, frame_inventory, Vec::new())
+                    .unwrap();
+            let root_gpa = RootGpa::page_aligned(FrameGpa::new(0x2000)).unwrap();
+            let initial_mm = MmGeneration::new(nz(INITIAL_MM_KEY));
+            let initial = InitialTaskBinding {
+                task: carrick_sched_core::process::TaskKey {
+                    id: carrick_sched_core::process::TaskId::from_registry_allocation(
+                        core::num::NonZeroI32::new(41).unwrap(),
+                    ),
+                    serial: carrick_sched_core::process::TaskSerial::from_raw_u64(7).unwrap(),
+                },
+                thread: carrick_sched_core::ThreadIdentity {
+                    tid: 41,
+                    serial: 101,
+                    generation: 11,
+                    file_table: 5,
+                    ..Default::default()
+                },
+                mm: initial_mm,
+            };
+            custody.bind_initial_task_identity(initial).unwrap();
+            custody
+                .memory_mut()
+                .install_root(
+                    initial_mm.raw(),
+                    AddressContext {
+                        root: root_gpa,
+                        mm: initial_mm,
+                        generation: ContextGeneration::new(nz(1)),
+                    },
+                )
+                .unwrap();
+            custody
+                .bind_execution(
+                    0,
+                    initial.task.serial,
+                    carrick_el1_abi::ExecutionBinding {
+                        task: carrick_el1_abi::EntryTaskKey::from_raw(41),
+                        generation: carrick_el1_abi::SnapshotGeneration::from_raw(11),
+                        mm: carrick_el1_abi::EntryMmKey::from_raw(INITIAL_MM_KEY),
+                        thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+                    },
+                    5,
+                )
+                .unwrap();
+            let root_state = custody
+                .worker_root_state(&context_with_root(1, root_gpa).hardware_image())
+                .unwrap();
+            let root_binding = root_state.binding();
+            let cpu = CarrierCpu::new(TestIo {
+                image: root_state.hardware_image(),
+            })
+            .unwrap();
+            let children = cpu.child_binding_authority();
+            Self {
+                _authority: authority,
+                custody,
+                cpu,
+                children,
+                root_binding,
+            }
+        }
+
+        fn install_child_mm(
+            &mut self,
+            root_pa: u64,
+            mm_raw: u64,
+            ctx_gen: u64,
+            task_serial: u64,
+            exec_gen: u64,
+        ) -> GuestArchBinding {
+            let nz = |v| NonZeroU64::new(v).unwrap();
+            let context = AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(root_pa)).unwrap(),
+                mm: MmGeneration::new(nz(mm_raw)),
+                generation: ContextGeneration::new(nz(ctx_gen)),
+            };
+            self.custody
+                .memory_mut()
+                .install_root(nz(mm_raw), context)
+                .unwrap();
+            GuestArchBinding::x86(
+                carrick_guest_arch::TaskIdentity {
+                    carrier: self.root_binding.task().carrier,
+                    task: carrick_guest_arch::TaskSerial::new(nz(task_serial)),
+                    execution: carrick_guest_arch::ExecutionGeneration::new(nz(exec_gen)),
+                },
+                context,
+            )
+        }
+
+        fn stop_child_on_peer(
+            &mut self,
+            arch_binding: GuestArchBinding,
+            entry_key: carrick_el1_abi::EntryTaskKey,
+            thread_serial: u64,
+        ) {
+            let birth_serial = carrick_sched_core::process::TaskSerial::from_raw_u64(
+                arch_binding.task().task.raw().get(),
+            )
+            .unwrap();
+            self.custody
+                .bind_execution(
+                    1,
+                    birth_serial,
+                    carrick_el1_abi::ExecutionBinding {
+                        task: entry_key,
+                        generation: carrick_el1_abi::SnapshotGeneration::from_raw(
+                            arch_binding.task().execution.raw().get(),
+                        ),
+                        mm: carrick_el1_abi::EntryMmKey::from_raw(
+                            arch_binding.context().mm.raw().get(),
+                        ),
+                        thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(
+                            thread_serial,
+                        ),
+                    },
+                    6,
+                )
+                .unwrap();
+            self.custody
+                .0
+                .binding(carrick_guest_arch::CpuId::new(1))
+                .mm_owner_generation
+                .store(
+                    arch_binding.context().generation.raw().get(),
+                    Ordering::Release,
+                );
+        }
+
+        fn stop_clone_vm_sibling_on_peer(
+            &mut self,
+            arch_binding: GuestArchBinding,
+            leader_key: carrick_el1_abi::EntryTaskKey,
+            sibling_key: carrick_el1_abi::EntryTaskKey,
+            sibling_serial: u64,
+        ) {
+            self.stop_child_on_peer(arch_binding, leader_key, 102);
+            let page_offset = 0x4000u64;
+            let sibling_slot_offset = carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_OFFSET;
+            let sibling_tid = u32::try_from(sibling_key.raw()).unwrap();
+            let birth_serial = carrick_sched_core::process::TaskSerial::from_raw_u64(
+                arch_binding.task().task.raw().get(),
+            )
+            .unwrap();
+            // SAFETY: stopped bootstrap metadata initialized in `new`/`stop_child_on_peer`
+            // at disjoint offsets (`0x4000` lifecycle page vs `0xb000` pool control slot).
+            let (page, sibling_control): (&ThreadLifecyclePage, &ThreadControlSlot) = unsafe {
+                (
+                    self.custody.metadata(page_offset),
+                    self.custody.metadata(sibling_slot_offset),
+                )
+            };
+            let entry = page
+                .stock_with_control(
+                    0,
+                    carrick_el1_abi::EntryIdentity {
+                        tid: sibling_tid,
+                        visible_tid: sibling_tid,
+                        thread_serial: sibling_serial,
+                        birth: carrick_core_abi::BirthSerial::of_task(birth_serial),
+                        uid_credit: 0,
+                    },
+                    Some(carrick_guest_arch::KernelVa::new(
+                        METADATA_VA + sibling_slot_offset,
+                    )),
+                )
+                .unwrap();
+            sibling_control
+                .reset_for_birth(BlockedMask(0), 0, entry)
+                .unwrap();
+            assert!(sibling_control.publish_visible_tid(sibling_tid));
+            page.thread_born().unwrap();
+            let task = self.custody.stopped_task(1);
+            task.set(
+                El1TaskId::from_linux_tid(sibling_tid as i32),
+                carrick_el1_abi::SnapshotGeneration::from_raw(
+                    arch_binding.task().execution.raw().get(),
+                ),
+                6,
+            );
+            task.mm
+                .key
+                .store(arch_binding.context().mm.raw().get(), Ordering::Release);
+            task.mm
+                .thread_generation
+                .store(sibling_serial, Ordering::Release);
+            task.publish_lifecycle(METADATA_VA + page_offset, METADATA_VA + sibling_slot_offset);
+        }
+
+        fn enter_venue(
+            &mut self,
+            slot: u32,
+            cr3_root: RootGpa,
+        ) -> Result<ForwardExecution, TrapError> {
+            let mut io = TestIo {
+                image: context_with_root(1, cr3_root).hardware_image(),
+            };
+            let lease = StoppedCpuLease {
+                cpu: carrick_guest_arch::CpuId::new(slot),
+                io: &mut io,
+            };
+            ForwardVenue::new(&mut self.custody.0, lease, &self.children)
+                .map(|venue| venue.execution)
+        }
+    }
+
+    #[test]
+    fn forward_venue_refuses_mismatched_child_entry_key() {
+        let mut fx = ForwardVenueFixture::new();
+        let root_exec = fx
+            .enter_venue(0, fx.root_binding.context().root)
+            .expect("issued root task enters forward venue");
+        assert_eq!(root_exec.authenticate_typed(fx.root_binding), Ok(()));
+
+        let child = fx.install_child_mm(0x7000, 302, 2, 12, 22);
+        let issued = carrick_el1_abi::EntryTaskKey::from_raw(42);
+        fx.cpu
+            .register_child_binding_with_entry_task(child, issued)
+            .unwrap();
+
+        fx.stop_child_on_peer(child, issued, 102);
+        let matching = fx.enter_venue(1, child.context().root).unwrap();
+        assert_eq!(matching.authenticate_typed(child), Ok(()));
+
+        let mismatched = carrick_el1_abi::EntryTaskKey::from_raw(45);
+        fx.stop_child_on_peer(child, mismatched, 105);
+        let execution = fx.enter_venue(1, child.context().root).unwrap();
+        assert_eq!(
+            execution.authenticate_typed(child),
+            Err(ForwardBindingRefusal::TaskIdMismatch {
+                stopped: mismatched,
+                expected: issued,
+            })
+        );
+        assert!(
+            execution
+                .authenticate(child, "forward capture MM binding mismatch")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn forward_venue_admits_child_exec_successor_only_with_carried_key() {
+        let mut fx = ForwardVenueFixture::new();
+        let predecessor = fx.install_child_mm(0x7000, 302, 2, 12, 22);
+        let issued = carrick_el1_abi::EntryTaskKey::from_raw(42);
+        fx.cpu
+            .register_child_binding_with_entry_task(predecessor, issued)
+            .unwrap();
+
+        let successor = predecessor
+            .exec_successor(fx.install_child_mm(0x8000, 303, 3, 12, 23))
+            .unwrap();
+        fx.cpu
+            .rebind_child_successor(successor, Some(predecessor.context().root), false)
+            .unwrap();
+
+        fx.stop_child_on_peer(successor, issued, 202);
+        let admitted = fx.enter_venue(1, successor.context().root).unwrap();
+        assert_eq!(admitted.authenticate_typed(successor), Ok(()));
+
+        let other = carrick_el1_abi::EntryTaskKey::from_raw(45);
+        fx.stop_child_on_peer(successor, other, 203);
+        let wrong_key = fx.enter_venue(1, successor.context().root).unwrap();
+        assert_eq!(
+            wrong_key.authenticate_typed(successor),
+            Err(ForwardBindingRefusal::TaskIdMismatch {
+                stopped: other,
+                expected: issued,
+            })
+        );
+
+        fx.stop_child_on_peer(predecessor, issued, 102);
+        let retired_predecessor = fx
+            .enter_venue(1, predecessor.context().root)
+            .err()
+            .expect("retired predecessor root has no issued entry key");
+        assert!(
+            retired_predecessor
+                .to_string()
+                .contains("child forward root has no issued entry key")
+        );
+    }
+
+    #[test]
+    fn forward_venue_refuses_unregistered_child_root() {
+        let mut fx = ForwardVenueFixture::new();
+        let unregistered = fx.install_child_mm(0x9000, 304, 2, 14, 24);
+        assert_eq!(
+            fx.children.entry_task(unregistered.context().root).unwrap(),
+            None
+        );
+
+        fx.stop_child_on_peer(
+            unregistered,
+            carrick_el1_abi::EntryTaskKey::from_raw(42),
+            102,
+        );
+        let err = fx
+            .enter_venue(1, unregistered.context().root)
+            .err()
+            .expect("unregistered child root must be refused");
+        assert!(
+            err.to_string()
+                .contains("child forward root has no issued entry key"),
+            "unexpected error: {err}"
+        );
+
+        fx.cpu.register_child_binding(unregistered).unwrap();
+        assert_eq!(
+            fx.children.entry_task(unregistered.context().root).unwrap(),
+            None
+        );
+        let keyless_err = fx
+            .enter_venue(1, unregistered.context().root)
+            .err()
+            .expect("keyless child root must be refused");
+        assert!(
+            keyless_err
+                .to_string()
+                .contains("child forward root has no issued entry key"),
+            "unexpected error: {keyless_err}"
+        );
+    }
+
+    #[test]
+    fn forward_venue_refuses_clone_vm_sibling_on_child_root() {
+        let mut fx = ForwardVenueFixture::new();
+        let child = fx.install_child_mm(0x7000, 302, 2, 12, 22);
+        let issued = carrick_el1_abi::EntryTaskKey::from_raw(42);
+        let sibling = carrick_el1_abi::EntryTaskKey::from_raw(43);
+        fx.cpu
+            .register_child_binding_with_entry_task(child, issued)
+            .unwrap();
+
+        fx.stop_clone_vm_sibling_on_peer(child, issued, sibling, 103);
+        let execution = fx.enter_venue(1, child.context().root).unwrap();
+        assert_eq!(
+            execution.authenticate_typed(child),
+            Err(ForwardBindingRefusal::TaskIdMismatch {
+                stopped: sibling,
+                expected: issued,
+            })
+        );
+        assert_eq!(execution.binding.task, sibling);
+        assert_eq!(execution.leader_task, issued);
+
+        // Even if the sibling's own control slot carries a matching birth
+        // record, no host-issued authority for this child root authorizes it.
+        let sibling_slot_offset = carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_OFFSET;
+        let birth_serial =
+            carrick_sched_core::process::TaskSerial::from_raw_u64(child.task().task.raw().get())
+                .unwrap();
+        let self_birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            sibling,
+            carrick_core_abi::BirthSerial::of_task(birth_serial),
+            carrick_core_abi::EntryThreadGeneration::from_raw(103),
+        )
+        .unwrap();
+        // SAFETY: stopped bootstrap metadata at the pool control-slot offset.
+        unsafe {
+            *fx.custody.metadata_mut(sibling_slot_offset) = ThreadControlSlot::new();
+            let sibling_control: &ThreadControlSlot = fx.custody.metadata(sibling_slot_offset);
+            sibling_control
+                .reset_for_host_birth(BlockedMask(0))
+                .unwrap();
+            assert!(sibling_control.publish_visible_tid(43));
+            sibling_control.publish_host_birth_identity(self_birth);
+        }
+        let execution_with_slot_birth = fx.enter_venue(1, child.context().root).unwrap();
+        assert_eq!(
+            execution_with_slot_birth.authenticate_typed(child),
+            Err(ForwardBindingRefusal::TaskIdMismatch {
+                stopped: sibling,
+                expected: issued,
+            })
+        );
+    }
 
     #[test]
     fn child_forward_rule_uses_issued_entry_key() {
@@ -5704,6 +6163,39 @@ pub struct PreparedBoot {
     pub kernel_pod_storage: Vec<anonymous_owner::KernelPodStorage>,
 }
 
+fn bootstrap_cpu_binding(index: usize, scheduler_witness: u64) -> CpuBinding {
+    let offset = index as u64 * STRIDE;
+    CpuBinding {
+        kernel_stack: DIRECT_VA + carrick_el1_abi::x86_cpl0_kernel_stack_end_gpa(index)
+            - carrick_el1_abi::X86_CPL0_KERNEL_STACK_TOP_RESERVE,
+        user_stack: 0,
+        self_address: METADATA_VA + BINDING_OFFSET + offset,
+        task_address: METADATA_VA + TASK_OFFSET + offset,
+        counters_address: METADATA_VA + COUNTERS_OFFSET,
+        entry_kick: AtomicU32::new(0),
+        return_kick: AtomicU32::new(0),
+        entries: AtomicU64::new(0),
+        publications: AtomicU64::new(0),
+        completions: AtomicU64::new(0),
+        captured_stack: AtomicU64::new(0),
+        scheduler_witness: AtomicU64::new(scheduler_witness),
+        cpu_slot: index as u32,
+        tsc_hz: AtomicU64::new(0),
+        wake_routes_address: METADATA_VA + ROUTES_OFFSET,
+        apic_timer_hz: AtomicU64::new(0),
+        pending_irqs: AtomicU32::new(0),
+        shootdown_table_address: METADATA_VA + SHOOTDOWN_OFFSET,
+        fault_active: AtomicU64::new(0),
+        fault_frame: AtomicU64::new(0),
+        fault_address: AtomicU64::new(0),
+        fault_reason: AtomicU64::new(0),
+        mm_owner_generation: AtomicU64::new(1),
+        last_seen_generation: AtomicU64::new(0),
+        stdio_table_admitted: AtomicU64::new(0),
+        file_region: carrick_el1_abi::FileRegionBinding::UNPUBLISHED,
+    }
+}
+
 /// Prepare retained RAM and bindings before backend memory registration.
 pub fn prepare_boot(
     frame_inventory: &dyn PhysicalFrameInventory,
@@ -6105,39 +6597,12 @@ pub fn prepare_boot(
                 .host_ptr(META_GPA + BINDING_OFFSET + offset, size_of::<CpuBinding>())
                 .ok_or_else(|| fail("CPU binding backing"))?
                 .cast::<CpuBinding>();
-            binding.write(CpuBinding {
-                kernel_stack: DIRECT_VA + carrick_el1_abi::x86_cpl0_kernel_stack_end_gpa(index)
-                    - carrick_el1_abi::X86_CPL0_KERNEL_STACK_TOP_RESERVE,
-                user_stack: 0,
-                self_address: METADATA_VA + BINDING_OFFSET + offset,
-                task_address: METADATA_VA + TASK_OFFSET + offset,
-                counters_address: METADATA_VA + COUNTERS_OFFSET,
-                entry_kick: AtomicU32::new(0),
-                return_kick: AtomicU32::new(0),
-                entries: AtomicU64::new(0),
-                publications: AtomicU64::new(0),
-                completions: AtomicU64::new(0),
-                captured_stack: AtomicU64::new(0),
-                scheduler_witness: AtomicU64::new(if fixture_image && interrupts && index == 0 {
-                    carrick_x86::cpl0_scheduler::PROGRESS_STATE
-                } else {
-                    0
-                }),
-                cpu_slot: index as u32,
-                tsc_hz: AtomicU64::new(0),
-                wake_routes_address: METADATA_VA + ROUTES_OFFSET,
-                apic_timer_hz: AtomicU64::new(0),
-                pending_irqs: AtomicU32::new(0),
-                shootdown_table_address: METADATA_VA + SHOOTDOWN_OFFSET,
-                fault_active: AtomicU64::new(0),
-                fault_frame: AtomicU64::new(0),
-                fault_address: AtomicU64::new(0),
-                fault_reason: AtomicU64::new(0),
-                mm_owner_generation: AtomicU64::new(1),
-                last_seen_generation: AtomicU64::new(0),
-                stdio_table_admitted: AtomicU64::new(0),
-                file_region: carrick_el1_abi::FileRegionBinding::UNPUBLISHED,
-            });
+            let witness = if fixture_image && interrupts && index == 0 {
+                carrick_x86::cpl0_scheduler::PROGRESS_STATE
+            } else {
+                0
+            };
+            binding.write(bootstrap_cpu_binding(index, witness));
         }
     }
     let ram = Arc::new(ram);
