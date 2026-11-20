@@ -49,3 +49,31 @@ host during measurement.
 With the TLB opt-out, the EL1 trampoline took 5,547 walks and reached the
 same HVC. The rates measure the soft dispatcher in QEMU. Native ARM timing,
 the production carrier lifecycle, and the Python wall budget remain open.
+
+## R4d code-generation authority
+
+The ARM host RAM owner uses the softmmu extent inventory to authenticate
+frames. It marks a fully fetched code frame when its first translated block
+becomes resident. Both guest and loader writes advance the generation of
+marked frames before modifying their backing. The existing self-modifying
+probe reaches HVC after overwriting its first instruction and emits four
+blocks. The frame goes from unmarked to generation one at activation and
+to generation two after the store. Locally suppressing the bump left the
+old block resident and exhausted the eight-block budget.
+
+Five interleaved A/B pairs under QEMU user mode used the same release EL1
+image on Debian x86_64, pinned to CPU 0. The binaries counted structural
+work, and the musl probe also traced syscalls. Other verification work
+was active. Counts were identical in both builds.
+
+| Probe | Walks | Memory exits | Blocks/s before → after | Instructions/s before → after |
+|---|---:|---:|---:|---:|
+| Memory loop, 10,000 iterations | 3 | 20,000 | 841,260 → 762,707 | 1,121,671 → 1,016,935 |
+| EL1 trampoline to first HVC | 72 | 1,495 | 22,973 → 30,792 | 44,377 → 59,480 |
+| Static musl hello to first carrier call | 127 | 4,827 | 27,946 → 30,254 | 55,134 → 59,688 |
+
+The probes run the production dispatcher, launcher and EL1 image against
+the new memory owner. Carrier registration, inline memory, IC IVAU
+generation updates, lifecycle invalidation, and branch chaining still
+need separate proof. Native release timing and the Python wall budget
+remain open.
