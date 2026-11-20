@@ -209,10 +209,8 @@ action:
 #endif
 #ifdef SLEEP_CLOCK_TABLE
 /* Rows: clock, flags, expected rax. The register's upper half is not part
- * of clockid_t; Linux reads only TIMER_ABSTIME. x86 CPL0 has no guest
- * monotonic epoch, so every absolute deadline keeps the counted ENOSYS
- * refusal (-38), as do clocks the ring cannot measure (process and
- * per-thread CPU clocks, ALARM). */
+ * of clockid_t and Linux reads only TIMER_ABSTIME. The zero monotonic
+ * deadline has passed. The other absolute clocks keep their refusal. */
 table:
     .quad 0, 0, 0
     .quad 1, 0, 0
@@ -221,9 +219,9 @@ table:
     .quad 0x100000001, 0, 0
     .quad 1, 2, 0
     .quad 1, 0xfffffffe, 0
-    .quad 1, 1, -38
+    .quad 1, 1, 0
     .quad 7, 1, -38
-    .quad 1, 3, -38
+    .quad 1, 3, 0
     .quad 0, 1, -38
     .quad 11, 1, -38
     .quad 2, 0, -38
