@@ -11,13 +11,15 @@ use crate::mmu::{self, AccessClass, PermissionMode, Stage1Error, Stage1Registers
 use crate::state::{CpuState, ExceptionLevel, ProgramCounter, VirtualAddress};
 use crate::translate::{
     BlockExit, BlockLimits, CODE_PAGE_BYTES, ExitReason, GuestInstruction, InstructionClass,
-    TranslateError, TranslatedBlock, emit_block, split_block_for_run,
+    Terminator, TranslateError, TranslatedBlock, emit_block_for_run, split_block_for_run,
 };
+use alloc::{sync::Arc, vec::Vec};
 use carrick_guest_arch::{FrameGpa, Gpa, GuestVa};
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
 use carrick_softmmu::block_cache::BlockCache;
 use carrick_softmmu::physical_tlb::PhysicalTlb;
 use core::fmt;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Permission-checked virtual page tags and RAM loans, live for one launch.
 #[derive(Default)]
@@ -25,6 +27,61 @@ pub struct BlockMemory<'a> {
     pub read: Option<GuestVa>,
     pub write: Option<GuestVa>,
     pub ram: InlineRam<'a>,
+}
+
+/// Checkpoint bound even for a path with no pending event or helper exit.
+pub const CHAIN_QUANTUM: u64 = 256;
+
+/// Asynchronous requests for a single run seat. A timer provider asserts the
+/// IRQ request when its deadline is reached; the dispatcher owns delivery.
+#[derive(Default)]
+pub struct RunControl(AtomicU8);
+
+impl RunControl {
+    const KICK: u8 = 1;
+    const IRQ: u8 = 2;
+
+    pub fn kick(&self) {
+        self.0.fetch_or(Self::KICK, Ordering::Release);
+    }
+
+    pub fn request_irq(&self) {
+        self.0.fetch_or(Self::IRQ, Ordering::Release);
+    }
+
+    fn take(&self, mask: u8) -> bool {
+        self.0.load(Ordering::Acquire) & mask != 0
+            && self.0.fetch_and(!mask, Ordering::AcqRel) & mask != 0
+    }
+}
+
+/// The remaining guest step budget and the requests this launch can service.
+pub struct ChainBudget<'a> {
+    pub steps: u64,
+    pub pending: &'a AtomicU8,
+    pub poll_mask: u8,
+}
+
+/// Exit of the final block. The intermediate successful edges have already
+/// retired their entire blocks and spent one step apiece.
+pub struct ChainExit<C> {
+    pub exit: usize,
+    pub last: Option<Arc<ResidentBlock<C>>>,
+    pub preceding_blocks: u64,
+    pub preceding_instructions: u64,
+    pub indirect_target: ProgramCounter,
+}
+
+impl<C> ChainExit<C> {
+    pub fn single(exit: usize, pc: ProgramCounter) -> Self {
+        Self {
+            exit,
+            last: None,
+            preceding_blocks: 0,
+            preceding_instructions: 0,
+            indirect_target: pc,
+        }
+    }
 }
 
 /// Prepares translated code and runs it against the CPU's architectural state.
@@ -57,6 +114,29 @@ pub trait ExecuteBlock {
         self.execute(block, code, cpu)
     }
 
+    fn chain_blocks(&self) -> bool {
+        false
+    }
+
+    /// The dispatcher admits links only after checking the current execute
+    /// translation and code generation. All admitted links share one regime.
+    fn link_block(&mut self, _resident: &Arc<ResidentBlock<Self::Code>>) {}
+
+    /// Revoke links to a frame, or all links at a regime or TLBI boundary.
+    fn unlink(&mut self, _frame: Option<FrameGpa>) {}
+
+    fn execute_chain(
+        &mut self,
+        block: &TranslatedBlock,
+        code: &Self::Code,
+        cpu: &mut CpuState,
+        memory: BlockMemory<'_>,
+        _budget: ChainBudget<'_>,
+    ) -> Result<ChainExit<Self::Code>, Self::Error> {
+        let exit = self.execute_with_memory(block, code, cpu, memory)?;
+        Ok(ChainExit::single(exit, cpu.pc))
+    }
+
     fn prepare(&mut self, block: &TranslatedBlock) -> Result<Self::Code, Self::Error>;
 
     /// Run the code prepared for `block`, update `cpu` on success, and return the
@@ -72,6 +152,8 @@ pub trait ExecuteBlock {
 /// Why `run` returned. `cpu` holds the exact state at that point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop<E> {
+    /// A host request interrupted execution at a guest block boundary.
+    Kicked,
     /// The block budget was spent; `cpu.pc` is the next block.
     Budget,
     /// The first word of a block could not be fetched.
@@ -93,7 +175,7 @@ pub struct RunWork {
     pub retired_instructions: u64,
     /// Host launch attempts.
     pub dispatches: u64,
-    /// Host launches that returned a valid exit index.
+    /// Guest blocks that ran to a valid exit, including native chain edges.
     pub executed_blocks: u64,
     /// Calls to split and decode a block.
     pub decoded_blocks: u64,
@@ -123,6 +205,7 @@ impl<E: fmt::Debug> fmt::Display for Report<E> {
             self.pc.0, self.blocks, self.undefined_el0_deliveries
         )?;
         match self.stop {
+            Stop::Kicked => write!(f, "stops at a host kick"),
             Stop::Budget => write!(f, "stops at the block budget"),
             Stop::Fetch(a) => write!(f, "fails at: instruction fetch from {:#x}", a.0),
             Stop::Event {
@@ -219,9 +302,19 @@ struct CodeIdentity {
     generation: CodeGeneration,
 }
 
-struct ResidentBlock<C> {
+pub struct ResidentBlock<C> {
     identity: CodeIdentity,
     prepared: (TranslatedBlock, C),
+}
+
+impl<C> ResidentBlock<C> {
+    pub fn frame(&self) -> FrameGpa {
+        self.identity.frame
+    }
+
+    pub fn prepared(&self) -> (&TranslatedBlock, &C) {
+        (&self.prepared.0, &self.prepared.1)
+    }
 }
 
 struct MeasuredMemory<'a, M> {
@@ -231,6 +324,8 @@ struct MeasuredMemory<'a, M> {
     tlb: Option<PhysicalTlb<Stage1Registers, PermissionMode>>,
     last_read: Option<GuestVa>,
     last_write: Option<GuestVa>,
+    code_writes: Option<Vec<FrameGpa>>,
+    code_write_failed: bool,
 }
 
 impl<M: GuestMemory> MeasuredMemory<'_, M> {
@@ -275,7 +370,24 @@ impl<M: GuestMemory> GuestMemory for MeasuredMemory<'_, M> {
     }
 
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault> {
-        self.inner.write(address, bytes)
+        if let Some(frames) = &mut self.code_writes
+            && !bytes.is_empty()
+            && let Some(last) = address.0.checked_add(bytes.len() as u64 - 1)
+        {
+            // Only tracked pages can have links. Notify after the owner has
+            // handled the write and while no emitted code is running.
+            let first = address.0 & !(CODE_PAGE_BYTES - 1);
+            let last = last & !(CODE_PAGE_BYTES - 1);
+            frames.extend(
+                (first..=last)
+                    .step_by(CODE_PAGE_BYTES as usize)
+                    .map(FrameGpa::new)
+                    .filter(|frame| self.inner.code_generation(*frame).is_some()),
+            );
+        }
+        let result = self.inner.write(address, bytes);
+        self.code_write_failed |= result.is_err();
+        result
     }
 
     fn code_generation(&self, frame: FrameGpa) -> Option<CodeGeneration> {
@@ -283,7 +395,9 @@ impl<M: GuestMemory> GuestMemory for MeasuredMemory<'_, M> {
     }
 
     fn invalidate_code_frame(&mut self, frame: FrameGpa) -> Result<bool, MemoryFault> {
-        self.inner.invalidate_code_frame(frame)
+        let result = self.inner.invalidate_code_frame(frame);
+        self.code_write_failed |= result.is_err();
+        result
     }
 
     fn translate_stage1(
@@ -331,25 +445,62 @@ pub fn run<X: ExecuteBlock>(
     limits: BlockLimits,
     budget: u64,
 ) -> Report<X::Error> {
+    run_controlled(
+        cpu,
+        monitor,
+        memory,
+        executor,
+        limits,
+        budget,
+        &RunControl::default(),
+    )
+}
+
+/// Like [`run`], with asynchronous requests serviced at block boundaries.
+/// Masked IRQs remain pending across calls until the guest unblocks them.
+pub fn run_controlled<X: ExecuteBlock>(
+    cpu: &mut CpuState,
+    monitor: &mut ExclusiveMonitor,
+    memory: &mut impl GuestMemory,
+    executor: &mut X,
+    limits: BlockLimits,
+    budget: u64,
+    control: &RunControl,
+) -> Report<X::Error> {
+    let retain_blocks = executor.retain_blocks();
+    let retain_stage1 = executor.retain_stage1() && memory.stage1_is_local();
+    let chaining = retain_blocks && retain_stage1 && executor.chain_blocks();
+    let mut chain_regime = None;
+    if chaining {
+        executor.unlink(None);
+    }
     let mut blocks = 0;
     let mut work = RunWork::default();
     let memory = &mut MeasuredMemory {
-        retain_stage1: executor.retain_stage1() && memory.stage1_is_local(),
+        retain_stage1,
         inner: memory,
         walks: 0,
         tlb: None,
         last_read: None,
         last_write: None,
+        code_writes: chaining.then(Vec::new),
+        code_write_failed: false,
     };
     let inline_memory = memory.retain_stage1 && executor.inline_memory();
     // The run borrows one memory owner and one set of block limits. Keeping
     // residency within that borrow also discards code at provider handoffs.
-    let mut cache = BlockCache::<BlockKey, ResidentBlock<X::Code>>::default();
-    let retain_blocks = executor.retain_blocks();
+    let mut cache = BlockCache::<BlockKey, Arc<ResidentBlock<X::Code>>>::default();
     let initial_undefined = cpu.undefined_el0_deliveries;
     let stop = loop {
         if blocks >= budget {
             break Stop::Budget;
+        }
+        if control.take(RunControl::KICK) {
+            break Stop::Kicked;
+        }
+        if !cpu.pstate.daif.irq_masked() && control.take(RunControl::IRQ) {
+            monitor.clear();
+            take_exception(cpu, Exception::Irq);
         }
         // DDI0487G.a D1.12.4: PC alignment precedes instruction aborts
         // and illegal execution state, so both checks precede block fetch.
@@ -376,6 +527,15 @@ pub fn run<X: ExecuteBlock>(
             Err(_) => break Stop::Fetch(VirtualAddress(cpu.pc.0)),
         };
         let key = BlockKey::for_cpu(cpu);
+        if chaining {
+            let regime = BlockKey { pc: 0, ..key };
+            if chain_regime
+                .replace(regime)
+                .is_some_and(|previous| previous != regime)
+            {
+                executor.unlink(None);
+            }
+        }
         let frame = Gpa::new(pa.raw() & !(CODE_PAGE_BYTES - 1)).to_frame_gpa();
         let code = if retain_blocks {
             memory
@@ -385,65 +545,107 @@ pub fn run<X: ExecuteBlock>(
             None
         };
         let uncached;
-        let (block, executable) =
-            if let Some(resident) = cache.get(&key).filter(|r| Some(r.identity) == code) {
-                &resident.prepared
-            } else {
-                let Ok(first) = read_word(memory, pa) else {
-                    break Stop::Fetch(VirtualAddress(cpu.pc.0));
-                };
-                work.decoded_blocks += 1;
-                let mut fetched_whole_block = true;
-                let guest =
-                    split_block_for_run(cpu.pc, limits, cpu.pstate.el, inline_memory && mmu::enabled(cpu), |pc| {
-                        let word = if pc == cpu.pc {
-                            Some(first)
-                        } else {
-                            fetch_address(cpu, memory, pc)
-                                .ok()
-                                .and_then(|pa| read_word(memory, pa).ok())
-                        };
-                        fetched_whole_block &= word.is_some();
-                        word
-                    });
-                work.emitted_blocks += 1;
-                let block = match emit_block(&guest) {
-                    Ok(block) => block,
-                    Err(error) => break Stop::Translate(error),
-                };
-                let executable = match executor.prepare(&block) {
-                    Ok(code) => code,
-                    Err(error) => break Stop::Execute(error),
-                };
-                let prepared = (block, executable);
-                let identity = if retain_blocks && fetched_whole_block {
-                    memory
-                        .inner
-                        .mark_code_page(frame)
-                        .map(|generation| CodeIdentity { frame, generation })
-                } else {
-                    None
-                };
-                if let Some(identity) = identity {
-                    &cache
-                        .insert(key, ResidentBlock { identity, prepared })
-                        .prepared
-                } else {
-                    uncached = prepared;
-                    &uncached
-                }
-            };
-        work.dispatches += 1;
-        let inline_ram = if block.has_inline_memory() {
-            memory.inline_ram(cpu, frame, monitor)
+        let cached = cache.get(&key);
+        let (resident, (block, executable)) = if let Some(resident) =
+            cached.filter(|r| Some(r.identity) == code)
+        {
+            (Some(resident), resident.prepared())
         } else {
-            BlockMemory::default()
+            if chaining && let Some(stale) = cached {
+                executor.unlink(Some(stale.identity.frame));
+            }
+            let Ok(first) = read_word(memory, pa) else {
+                break Stop::Fetch(VirtualAddress(cpu.pc.0));
+            };
+            work.decoded_blocks += 1;
+            let mut fetched_whole_block = true;
+            let guest =
+                split_block_for_run(cpu.pc, limits, cpu.pstate.el, inline_memory && mmu::enabled(cpu), |pc| {
+                    let word = if pc == cpu.pc {
+                        Some(first)
+                    } else {
+                        fetch_address(cpu, memory, pc)
+                            .ok()
+                            .and_then(|pa| read_word(memory, pa).ok())
+                    };
+                    fetched_whole_block &= word.is_some();
+                    word
+                });
+            work.emitted_blocks += 1;
+            let block = match emit_block_for_run(&guest, chaining) {
+                Ok(block) => block,
+                Err(error) => break Stop::Translate(error),
+            };
+            let executable = match executor.prepare(&block) {
+                Ok(code) => code,
+                Err(error) => break Stop::Execute(error),
+            };
+            let prepared = (block, executable);
+            let identity = if retain_blocks && fetched_whole_block {
+                memory
+                    .inner
+                    .mark_code_page(frame)
+                    .map(|generation| CodeIdentity { frame, generation })
+            } else {
+                None
+            };
+            if let Some(identity) = identity {
+                let resident = cache.insert(key, Arc::new(ResidentBlock { identity, prepared }));
+                (Some(resident), resident.prepared())
+            } else {
+                uncached = prepared;
+                (None, (&uncached.0, &uncached.1))
+            }
         };
-        let index = match executor.execute_with_memory(block, executable, cpu, inline_ram) {
-            Ok(i) => i,
+        if chaining && let Some(resident) = resident {
+            executor.link_block(resident);
+        }
+        work.dispatches += 1;
+        // Every successor inherits these loans. The memory owner refuses
+        // writable loans to all tracked code, including other linked pages.
+        let chain_exit = chaining && !matches!(block.terminator(), Terminator::Handler(_));
+        let inline_ram =
+            if block.has_inline_memory() || (chain_exit && inline_memory && mmu::enabled(cpu)) {
+                memory.inline_ram(cpu, frame, monitor)
+            } else {
+                BlockMemory::default()
+            };
+        let result = if chain_exit {
+            let poll_mask = RunControl::KICK
+                | if cpu.pstate.daif.irq_masked() {
+                    0
+                } else {
+                    RunControl::IRQ
+                };
+            executor.execute_chain(
+                block,
+                executable,
+                cpu,
+                inline_ram,
+                ChainBudget {
+                    steps: if resident.is_some() {
+                        (budget - blocks).min(CHAIN_QUANTUM)
+                    } else {
+                        1
+                    },
+                    pending: &control.0,
+                    poll_mask,
+                },
+            )
+        } else {
+            executor
+                .execute_with_memory(block, executable, cpu, inline_ram)
+                .map(|exit| ChainExit::single(exit, cpu.pc))
+        };
+        let result = match result {
+            Ok(result) => result,
             Err(e) => break Stop::Execute(e),
         };
-        blocks += 1;
+        blocks += 1 + result.preceding_blocks;
+        work.executed_blocks += result.preceding_blocks;
+        work.retired_instructions += result.preceding_instructions;
+        let block = result.last.as_ref().map_or(block, |last| last.prepared().0);
+        let index = result.exit;
         let Some(exit) = block.exits().get(index).copied() else {
             break Stop::BadExit(index);
         };
@@ -454,6 +656,10 @@ pub fn run<X: ExecuteBlock>(
                 work.retired_instructions += instructions;
                 cpu.pc = pc;
             }
+            BlockExit::Indirect => {
+                work.retired_instructions += instructions;
+                cpu.pc = result.indirect_target;
+            }
             BlockExit::Handler(i) => {
                 // The generated block retires the prefix before the handler.
                 work.retired_instructions += i.pc().0.wrapping_sub(block.guest().start().0) / 4;
@@ -463,7 +669,16 @@ pub fn run<X: ExecuteBlock>(
                     work.memory_exits += 1;
                 }
                 cpu.pc = i.pc();
-                match handler::execute(cpu, monitor, memory, &i) {
+                let outcome = handler::execute(cpu, monitor, memory, &i);
+                if let Some(frames) = &mut memory.code_writes {
+                    for frame in frames.drain(..) {
+                        executor.unlink(Some(frame));
+                    }
+                    if core::mem::take(&mut memory.code_write_failed) {
+                        executor.unlink(None);
+                    }
+                }
+                match outcome {
                     Outcome::Continue => {
                         work.retired_instructions += 1;
                         // A flat access bypasses the TLB. Drop the previous
@@ -476,8 +691,17 @@ pub fn run<X: ExecuteBlock>(
                     Outcome::Fault => {}
                     Outcome::Event(event) => {
                         match event {
-                            Event::Ic(_) => cache.clear(),
+                            Event::Ic(_) => {
+                                cache.clear();
+                                if chaining {
+                                    executor.unlink(None);
+                                }
+                            }
+                            Event::IcFrame(frame) if chaining => executor.unlink(Some(frame)),
                             Event::Tlbi(_) => {
+                                if chaining {
+                                    executor.unlink(None);
+                                }
                                 // One local seat. A full flush also covers every
                                 // cached 4 KiB subpage of a large stage-1 leaf.
                                 if let Some(tlb) = &mut memory.tlb {
@@ -507,6 +731,9 @@ pub fn run<X: ExecuteBlock>(
             }
         }
     };
+    if chaining {
+        executor.unlink(None);
+    }
     work.stage1_walks = memory.walks;
     Report {
         blocks,

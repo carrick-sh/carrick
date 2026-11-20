@@ -18,7 +18,14 @@ use carrick_softcpu_aarch64::state::CpuState;
 use carrick_softcpu_aarch64::translate::BlockFrame;
 use carrick_softcpu_aarch64::translate::TranslatedBlock;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-use carrick_softcpu_aarch64::{dispatch::BlockMemory, handler::InlineRam, translate::frame};
+use carrick_softcpu_aarch64::{
+    dispatch::{BlockMemory, ChainBudget, ChainExit, ResidentBlock},
+    handler::InlineRam,
+    state::ProgramCounter,
+    translate::frame,
+};
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+use std::sync::Arc;
 
 /// Why a block could not be launched on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,8 +49,80 @@ pub struct HostCode {
     _mapping: carrick_host_jit::JitCodeBuffer,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     entry: usize,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    linked: Option<(ProgramCounter, usize)>,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    simd: bool,
     #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
     _unsupported: core::convert::Infallible,
+}
+
+// SAFETY: HostCode is constructed only after publishing its private mapping.
+// It exposes no mutable access. Readers may run its immutable instructions
+// concurrently, with separate frames, and the mapping lives through each call.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+unsafe impl Sync for HostCode {}
+
+/// Only the runner writes these records. Emitted code reads a tag and branches
+/// to the linked entry, while the parallel owner slot pins its RX mapping.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct NativeLink {
+    pc: u64,
+    entry: usize,
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+const _: () = {
+    assert!(size_of::<NativeLink>() == 1 << frame::LINK_SHIFT);
+    assert!(core::mem::offset_of!(NativeLink, pc) == frame::LINK_PC as usize);
+    assert!(core::mem::offset_of!(NativeLink, entry) == frame::LINK_ENTRY as usize);
+};
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+struct LinkBank {
+    native: [NativeLink; frame::CHAIN_SLOTS],
+    owners: [Option<Arc<ResidentBlock<HostCode>>>; frame::CHAIN_SLOTS],
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+impl LinkBank {
+    fn new() -> Self {
+        Self {
+            native: [NativeLink::default(); frame::CHAIN_SLOTS],
+            owners: core::array::from_fn(|_| None),
+        }
+    }
+
+    fn link(&mut self, pc: u64, entry: usize, resident: &Arc<ResidentBlock<HostCode>>) {
+        let index = ((pc / 4) as usize) & (frame::CHAIN_SLOTS - 1);
+        if self.owners[index]
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, resident))
+        {
+            return;
+        }
+        self.native[index] = NativeLink { pc, entry };
+        self.owners[index] = Some(Arc::clone(resident));
+    }
+
+    fn unlink(&mut self, frame: Option<carrick_guest_arch::FrameGpa>) {
+        if frame.is_none() {
+            self.native.fill(NativeLink::default());
+            self.owners.fill(None);
+        } else {
+            for (link, owner) in self.native.iter_mut().zip(&mut self.owners) {
+                if owner
+                    .as_ref()
+                    .is_some_and(|owner| Some(owner.frame()) == frame)
+                {
+                    *link = NativeLink::default();
+                    *owner = None;
+                }
+            }
+        }
+    }
 }
 
 /// Runs translated blocks natively on a Linux arm64 host.
@@ -56,6 +135,12 @@ pub struct HostBlockRunner {
     retain_stage1: bool,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     inline_memory: bool,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    chain_blocks: bool,
+    /// SIMD and scalar blocks have different host stack layouts. A launch
+    /// can only inherit an entry from the bank matching its cold prologue.
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    links: Box<[LinkBank; 2]>,
     /// The engine frame region: the frame is its last element, so everything
     /// below it is headroom for host signal frames.
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -82,8 +167,18 @@ impl HostBlockRunner {
             inline_memory: cfg!(target_endian = "little")
                 && std::env::var_os("CARRICK_SOFT_AARCH64_INLINE_MEMORY").as_deref()
                     != Some(std::ffi::OsStr::new("0")),
+            chain_blocks: std::env::var_os("CARRICK_SOFT_AARCH64_CHAIN").as_deref()
+                != Some(std::ffi::OsStr::new("0")),
+            links: Box::new(core::array::from_fn(|_| LinkBank::new())),
             region: vec![BlockFrame::default(); frames].into_boxed_slice(),
         })
+    }
+
+    /// Override the environment setting for an explicit on/off differential.
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    pub fn with_chaining(mut self, enabled: bool) -> Self {
+        self.chain_blocks = enabled;
+        self
     }
 
     #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
@@ -112,6 +207,26 @@ impl ExecuteBlock for HostBlockRunner {
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn chain_blocks(&self) -> bool {
+        self.chain_blocks
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn link_block(&mut self, resident: &Arc<ResidentBlock<HostCode>>) {
+        let (_, code) = resident.prepared();
+        if let Some((pc, entry)) = code.linked {
+            self.links[usize::from(code.simd)].link(pc.0, entry, resident);
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn unlink(&mut self, frame: Option<carrick_guest_arch::FrameGpa>) {
+        for bank in self.links.as_mut() {
+            bank.unlink(frame);
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     fn prepare(&mut self, block: &TranslatedBlock) -> Result<HostCode, HostError> {
         let words = block.words();
         #[cfg(target_endian = "little")]
@@ -130,9 +245,14 @@ impl ExecuteBlock for HostBlockRunner {
         self.publication.publications += work.publications;
         self.publication.mprotect_calls += work.mprotect_calls;
         self.publication.icache_syncs += work.icache_syncs;
+        let entry = entry.ok_or(HostError::Publish)? as usize;
         Ok(HostCode {
             _mapping: mapping,
-            entry: entry.ok_or(HostError::Publish)? as usize,
+            entry,
+            linked: block
+                .linked_entry()
+                .map(|offset| (block.guest().start(), entry + offset)),
+            simd: block.uses_simd(),
         })
     }
 
@@ -157,8 +277,44 @@ impl ExecuteBlock for HostBlockRunner {
         _block: &TranslatedBlock,
         code: &HostCode,
         cpu: &mut CpuState,
-        mut memory: BlockMemory<'_>,
+        memory: BlockMemory<'_>,
     ) -> Result<usize, HostError> {
+        Ok(self.launch(code, cpu, memory, None).exit)
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn execute_chain(
+        &mut self,
+        _block: &TranslatedBlock,
+        code: &HostCode,
+        cpu: &mut CpuState,
+        memory: BlockMemory<'_>,
+        budget: ChainBudget<'_>,
+    ) -> Result<ChainExit<HostCode>, HostError> {
+        Ok(self.launch(code, cpu, memory, Some(budget)))
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+    fn execute(
+        &mut self,
+        _block: &TranslatedBlock,
+        _code: &HostCode,
+        _cpu: &mut CpuState,
+    ) -> Result<usize, HostError> {
+        Err(HostError::UnsupportedHost)
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+impl HostBlockRunner {
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn launch(
+        &mut self,
+        code: &HostCode,
+        cpu: &mut CpuState,
+        mut memory: BlockMemory<'_>,
+        budget: Option<ChainBudget<'_>>,
+    ) -> ChainExit<HostCode> {
         let top = self.region.len() - 1;
         self.region[top].load_from(cpu);
         let (read_ptr, write_ptr) = match &mut memory.ram {
@@ -175,6 +331,17 @@ impl ExecuteBlock for HostBlockRunner {
             }
         };
         let slots = &mut self.region[top].slots;
+        let bank = &self.links[usize::from(code.simd)];
+        let mut remaining = 0;
+        if let Some(budget) = &budget {
+            slots[frame::CHAIN_LAST as usize / 8] = u64::MAX;
+            slots[frame::CHAIN_RETIRED as usize / 8] = 0;
+            remaining = budget.steps.saturating_sub(1);
+            slots[frame::CHAIN_TABLE as usize / 8] = bank.native.as_ptr() as u64;
+            slots[frame::CHAIN_REMAINING as usize / 8] = remaining;
+            slots[frame::CHAIN_PENDING as usize / 8] = core::ptr::from_ref(budget.pending) as u64;
+            slots[frame::CHAIN_POLL_MASK as usize / 8] = u64::from(budget.poll_mask);
+        }
         slots[frame::INLINE_READ_VA as usize / 8] = memory.read.map_or(0, |va| va.raw());
         slots[frame::INLINE_WRITE_VA as usize / 8] = memory.write.map_or(0, |va| va.raw());
         slots[frame::INLINE_READ_PTR as usize / 8] = read_ptr;
@@ -188,7 +355,11 @@ impl ExecuteBlock for HostBlockRunner {
         // checking the virtual page tag and natural alignment. A missing
         // loan (null pointer) exits before transferring bytes. `slot` is the
         // 16-byte aligned last frame of the live region. Code and all backing
-        // allocations outlive the call.
+        // allocations outlive the call. A linked entry inherits this same
+        // frame, RAM loans and ABI prologue. The immutable bank can only
+        // name published entries of the same SIMD mode and pins each mapping
+        // for the entire call. The pending byte is loaded with LDARB while
+        // the AtomicU8 borrow is live.
         let index = unsafe {
             let block_fn =
                 core::mem::transmute::<usize, extern "C" fn(*mut BlockFrame) -> u64>(code.entry);
@@ -197,20 +368,25 @@ impl ExecuteBlock for HostBlockRunner {
         self.region[top].slots[frame::INLINE_READ_PTR as usize / 8] = 0;
         self.region[top].slots[frame::INLINE_WRITE_PTR as usize / 8] = 0;
         self.region[top].store_to(cpu);
-        Ok(index as usize)
-    }
-
-    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
-    fn execute(
-        &mut self,
-        _block: &TranslatedBlock,
-        _code: &HostCode,
-        _cpu: &mut CpuState,
-    ) -> Result<usize, HostError> {
-        Err(HostError::UnsupportedHost)
+        let slots = &mut self.region[top].slots;
+        if budget.is_some() {
+            let last = bank
+                .owners
+                .get(slots[frame::CHAIN_LAST as usize / 8] as usize);
+            slots[frame::CHAIN_TABLE as usize / 8] = 0;
+            slots[frame::CHAIN_PENDING as usize / 8] = 0;
+            ChainExit {
+                exit: index as usize,
+                last: last.and_then(Clone::clone),
+                preceding_blocks: remaining - slots[frame::CHAIN_REMAINING as usize / 8],
+                preceding_instructions: slots[frame::CHAIN_RETIRED as usize / 8],
+                indirect_target: ProgramCounter(slots[frame::CHAIN_TARGET as usize / 8]),
+            }
+        } else {
+            ChainExit::single(index as usize, cpu.pc)
+        }
     }
 }
-
 #[cfg(all(test, not(all(target_arch = "aarch64", target_os = "linux"))))]
 mod tests {
     use super::*;
