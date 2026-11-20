@@ -355,6 +355,21 @@ SHA. Transfer the archive intact: Actions artifacts discard ordinary file
 permissions, while the tar envelope retains guest executable modes. The
 publisher never replaces an existing artifact with different bytes.
 
+Every push to main publishes `signed-fixtures-<sha>` from
+`kernel-runtime.yml`'s `signed-fixtures` job. For any other commit in this
+repository, such as the head of a PR that changes fixture inputs, the owner
+dispatches that job alone (#1207):
+
+```sh
+gh workflow run kernel-runtime.yml -R carrick-sh/carrick --ref main -f fixtures_sha=<40-hex sha>
+```
+
+Only `signed-fixtures` runs, at that commit, on the hosted ARM Linux
+publisher. Every test lane, receipt, gate and the R2 relay upload is skipped.
+The run's `signed-fixtures-<sha>` artifact is what the m4 signed job's
+`--fixtures-run <run id>` consumes. It is independent fixture evidence for the
+owner exception in [the Signed gate doc](ci/signed-gate.md), not a gate pass.
+
 After checkout and cleanup, download the same-run, exact-SHA artifact to the
 Mac. Both restore and acceptance belong inside one exclusive admission:
 
