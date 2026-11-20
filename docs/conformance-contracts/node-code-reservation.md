@@ -172,3 +172,27 @@ range outside the layout requires a proof against the host reservations as
 well as the currently published stage-1 leaves. The regression witnesses
 check successful page-aligned reservations and independent process stores.
 A signed parity run is still required to verify the npm row.
+
+## Advice on hinted reservations (#1846)
+
+The ARM native-child witness and the live CPL0 root and fork fixtures
+identify an errno 38 from `madvise` after successful `mmap` and `mprotect`.
+The Linux advice planner shares argument validation, range coverage and
+attribute classification between host dispatch and the in-ring reservation
+owner. Assessment visits overlapping VMA rows and needs no temporary
+allocation in the ring. Advice that only changes a hint leaves backing
+alone. Dump and fork attributes stay with the reservation node.
+
+The existing anonymous retirement transaction clears private backing for
+`MADV_DONTNEED`, leaving the reservation's access and attributes intact.
+The return journal covers the backed span, with lazy outer pages omitted.
+The CPL0 guest verifies a store followed by zero-fill and independent stores
+in the parent and child. Its instrumented companion holds the editor once
+and requires exactly one park before successful discard. The ARM fixture
+runs the native dispatch through the real fork owner and synthetic
+descriptor words. Signed ARM hardware and the npm row still need an
+exact-head run on the director's Mac.
+
+The separate remap witnesses keep the forced relocation of a one-page
+read/write window over an occupied following address. On CPL0, a successful
+relocation must carry the written byte and zero-fill the extension.

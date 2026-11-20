@@ -1,5 +1,6 @@
 //! Resident private-anonymous memory operations served inside guest EL1.
 
+mod madvise;
 pub mod reservations;
 
 use carrick_core::mm::reservation::{AnonymousHintVenue, ReservationGeometry};
@@ -53,6 +54,7 @@ const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
 const SYS_MMAP: u64 = 222;
 const SYS_MPROTECT: u64 = 226;
+const SYS_MADVISE: u64 = 233;
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
 const PROT_EXEC: u64 = 4;
@@ -152,6 +154,7 @@ pub struct PendingReservationSyscall {
     elr: u64,
     syscall: u64,
     args: [u64; 6],
+    result_errno: Option<carrick_syscall_abi::LinuxErrno>,
 }
 impl PendingReservationSyscall {
     pub fn request(&self) -> carrick_el1_abi::ReservationRequest {
@@ -204,6 +207,9 @@ impl PendingReservationSyscall {
             Some(slot) => model.complete_deferring_return(completion, slot)?,
             None => model.complete(completion)?,
         };
+        let result = self
+            .result_errno
+            .map_or(result, |errno| errno.guest_retval() as u64);
         frame.set_result(carrick_guest_arch::NativeReturnWord(result));
         Ok(())
     }
@@ -286,6 +292,33 @@ pub fn decide_reservation_syscall_for_origin<
     file: Option<carrick_el1_abi::HostBackingIdentity>,
     service_origin: ServiceOrigin,
 ) -> ReservationDisposition {
+    decide_reservation_effect(
+        frame,
+        current,
+        model,
+        file,
+        service_origin,
+        AdviceEdit::Probe,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum AdviceEdit {
+    Probe,
+    Commit,
+}
+
+fn decide_reservation_effect<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    frame: &(impl AnonymousCallView + ?Sized),
+    current: &CurrentTask,
+    model: &mut ReservationModel<'_, G, C>,
+    file: Option<carrick_el1_abi::HostBackingIdentity>,
+    service_origin: ServiceOrigin,
+    advice_edit: AdviceEdit,
+) -> ReservationDisposition {
     use carrick_el1_abi::{ReservationProtection, ReservationRange};
     use reservations::{Decision, Placement, Refusal};
     let Some(origin) = ReservationOrigin::capture(current) else {
@@ -295,6 +328,7 @@ pub fn decide_reservation_syscall_for_origin<
         return ReservationDisposition::Unavailable(Refusal::Stale);
     }
     let nr = frame.canonical().raw();
+    let mut result_errno = None;
     let result = match nr {
         SYS_BRK => model.brk(frame.arguments()[0]),
         SYS_MMAP => {
@@ -375,16 +409,49 @@ pub fn decide_reservation_syscall_for_origin<
                 model.mprotect(range, prot)
             }
         }
+        SYS_MADVISE => {
+            use carrick_guest_arch::{GuestLen, GuestVa};
+            use carrick_personality_linux::mm::madvise::Advice;
+            match madvise::plan(
+                model,
+                GuestVa::new(frame.arguments()[0]),
+                GuestLen::new(frame.arguments()[1]),
+                Advice::from_guest_arg(frame.arguments()[2]),
+                GuestLen::new(PAGE_SIZE),
+            ) {
+                Ok(madvise::Effect::Answer(answer)) => {
+                    return ReservationDisposition::Return(
+                        answer.err().map_or(0, |errno| errno.guest_retval()),
+                    );
+                }
+                Ok(madvise::Effect::Attributes(range, set, clear, answer)) => {
+                    result_errno = answer.err();
+                    match advice_edit {
+                        AdviceEdit::Commit => model.advise_flags(range, set, clear),
+                        AdviceEdit::Probe => model.probe_advice_edit(range).map(|_| ()),
+                    }
+                    .map(|()| Decision::Complete(0))
+                }
+                Ok(madvise::Effect::Discard(range, answer)) => {
+                    result_errno = answer.err();
+                    model.discard_range(range)
+                }
+                Err(refusal) => Err(refusal),
+            }
+        }
         _ => return ReservationDisposition::Forward,
     };
     match result {
-        Ok(Decision::Complete(value)) => ReservationDisposition::Return(value as i64),
+        Ok(Decision::Complete(value)) => ReservationDisposition::Return(
+            result_errno.map_or(value as i64, |errno| errno.guest_retval()),
+        ),
         Ok(Decision::Work(request)) => ReservationDisposition::Work(PendingReservationSyscall {
             request,
             origin,
             elr: frame.return_address().raw(),
             syscall: nr,
             args: frame.arguments(),
+            result_errno,
         }),
         Err(Refusal::Collision) => ReservationDisposition::Return(-17),
         Err(Refusal::Invalid) => ReservationDisposition::Return(-EINVAL),
@@ -705,6 +772,24 @@ pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
     va: u64,
     len: u64,
 ) -> Stage1Backing {
+    classify_anonymous_backing::<A>(read, root, va, len, BackingExtent::Runs)
+}
+
+#[derive(Clone, Copy)]
+pub enum BackingExtent {
+    /// Track separate runs for editors that require a contiguous range.
+    Runs,
+    /// Track their hull for retirement, which can skip absent descriptors.
+    Sparse,
+}
+
+pub fn classify_anonymous_backing<A: AnonymousDescriptorDecode>(
+    read: &dyn Fn(u64) -> Option<u64>,
+    root: u64,
+    va: u64,
+    len: u64,
+    extent: BackingExtent,
+) -> Stage1Backing {
     use carrick_mmu_core::aarch64::El1PrivateLeafState;
     const SPANS: [u64; 4] = [1 << 39, 1 << 30, 1 << 21, PAGE_SIZE];
     let malformed = Stage1Backing::foreign(ForeignBacking::Malformed);
@@ -749,7 +834,11 @@ pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
                 }
                 El1PrivateLeafState::Malformed => return malformed,
             }
-            backing.push(cursor, next.min(end));
+            if matches!(extent, BackingExtent::Sparse) && backing.count != 0 {
+                backing.runs[0].1 = next.min(end);
+            } else {
+                backing.push(cursor, next.min(end));
+            }
             if backing.summary == RangeBacking::Foreign {
                 return Stage1Backing::foreign(ForeignBacking::TooManyRuns);
             }
@@ -979,6 +1068,14 @@ pub trait AnonymousBackingProbe {
         va: carrick_guest_arch::UserVa,
         len: carrick_guest_arch::GuestLen,
     ) -> Stage1Backing;
+    fn sparse_backing(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Stage1Backing {
+        self.backing(root, va, len)
+    }
     /// `[start, end)` of the live first-touch grant of exactly `mm_key`
     /// that prepared `va`, if any: stock this MM may hand to a new mapping.
     fn stock_span(
@@ -1003,12 +1100,13 @@ impl<T> AnonymousDescriptorEditor for T where
 pub struct HardwareAnonymousEditor;
 
 #[cfg(target_os = "none")]
-impl AnonymousBackingProbe for HardwareAnonymousEditor {
-    fn backing(
+impl HardwareAnonymousEditor {
+    fn classify(
         &mut self,
         ttbr0: carrick_guest_arch::AddressSpaceRegister,
         va: carrick_guest_arch::UserVa,
         len: carrick_guest_arch::GuestLen,
+        extent: BackingExtent,
     ) -> Stage1Backing {
         let ttbr0 = ttbr0.raw();
         let va = va.raw();
@@ -1038,7 +1136,28 @@ impl AnonymousBackingProbe for HardwareAnonymousEditor {
                 )
             })
         };
-        classify_stage1_range(&read, root, va, len)
+        classify_anonymous_backing::<ArmAnonymousDecode>(&read, root, va, len, extent)
+    }
+}
+
+#[cfg(target_os = "none")]
+impl AnonymousBackingProbe for HardwareAnonymousEditor {
+    fn backing(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Stage1Backing {
+        self.classify(root, va, len, BackingExtent::Runs)
+    }
+
+    fn sparse_backing(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Stage1Backing {
+        self.classify(root, va, len, BackingExtent::Sparse)
     }
 
     fn stock_span(
@@ -1406,12 +1525,13 @@ fn serve_delegated_anonymous_for_origin<
         }
         Err(_) => return forward(Leave::RootUnavailableStale),
     };
-    let decision = decide_reservation_syscall_for_origin(
+    let decision = decide_reservation_effect(
         frame,
         current,
         &mut model,
         mapping.file,
         mapping.origin,
+        AdviceEdit::Commit,
     );
     // Node exhaustion is a metadata-capacity request, not a refusal of the
     // Linux operation. Both ISAs use the same allocator and reservation bank
@@ -1452,12 +1572,13 @@ fn serve_delegated_anonymous_for_origin<
             }
             Err(_) => return forward(Leave::RootUnavailableStale),
         };
-        decide_reservation_syscall_for_origin(
+        decide_reservation_effect(
             frame,
             current,
             &mut model,
             mapping.file,
             mapping.origin,
+            AdviceEdit::Commit,
         )
     } else {
         decision
@@ -1533,19 +1654,21 @@ fn serve_delegated_anonymous_for_origin<
     if request.operation == carrick_el1_abi::ReservationOperation::Move {
         return refuse(pending, &mut model, Leave::RootDeclined);
     }
-    let backing = editor.backing(
-        carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
-        carrick_guest_arch::UserVa::new(va),
-        carrick_guest_arch::GuestLen::new(len),
-    );
-    // One editor call is one all-or-nothing step: a range whose backing is
-    // split into several runs by holes goes to the host.
-    let run = match backing.runs() {
-        [] => None,
-        [(start, end)] => Some((*start, *end - *start)),
+    use carrick_el1_abi::ReservationOperation::{Decommit, Discard, Prepare, Protect, Retire};
+    let root = carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0);
+    let address = carrick_guest_arch::UserVa::new(va);
+    let length = carrick_guest_arch::GuestLen::new(len);
+    let backing = if request.operation == Discard {
+        editor.sparse_backing(root, address, length)
+    } else {
+        editor.backing(root, address, length)
+    };
+    let run = match (request.operation, backing.runs()) {
+        (Discard, [(start, _), .., (_, end)]) => Some((*start, *end - *start)),
+        (_, []) => None,
+        (_, [(start, end)]) => Some((*start, *end - *start)),
         _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
     };
-    use carrick_el1_abi::ReservationOperation::{Decommit, Prepare, Protect, Retire};
     // A fresh mapping into a root hole over this MM's first-touch stock
     // adopts it: zero backing EL1 never exposed, re-permissioned for the
     // mapping and committed on first touch; any rest of the range has no
@@ -1623,14 +1746,20 @@ fn serve_delegated_anonymous_for_origin<
             }
         }
         (
-            Retire | Prepare | Decommit,
+            Retire | Prepare | Decommit | Discard,
             RangeBacking::Private | RangeBacking::Prepared,
             Some((start, run_len)),
         ) => {
             // The journal slot first: after the descriptor step the commit
-            // must not fail for lack of room. The whole range is owed; its
-            // pages without a terminal have nothing to return.
-            let Ok(slot) = model.reserve_return(request.range) else {
+            // must not fail for lack of room. For advice, leave the lazy
+            // prefix and suffix out of the return journal.
+            let return_range = if request.operation == Discard {
+                carrick_el1_abi::ReservationRange::new(start, start + run_len)
+                    .unwrap_or(request.range)
+            } else {
+                request.range
+            };
+            let Ok(slot) = model.reserve_return(return_range) else {
                 // This root's share or the shared table is full: settling
                 // (and, for a full table, draining its holders) makes room.
                 let _ = pending.cancel(&mut model);
@@ -1697,7 +1826,7 @@ fn serve_delegated_anonymous_for_origin<
 }
 
 /// The admitted root that owns syscall `nr` when it is a delegated MM's
-/// anonymous `brk`/`mmap`/`munmap`/`mprotect` (`None`: the MM keeps the
+/// anonymous `brk`/`mmap`/`munmap`/`mprotect`/`madvise` (`None`: the MM keeps the
 /// paths it had before admission).
 pub fn delegated_anonymous_root<
     G: ReservationGeometry,
@@ -1711,7 +1840,10 @@ pub fn delegated_anonymous_root<
     carrick_el1_abi::ReservationMm,
     carrick_sched_core::spaces::SpaceIndex,
 )> {
-    if !matches!(nr, SYS_BRK | SYS_MUNMAP | SYS_MMAP | SYS_MPROTECT) {
+    if !matches!(
+        nr,
+        SYS_BRK | SYS_MUNMAP | SYS_MMAP | SYS_MPROTECT | SYS_MADVISE
+    ) {
         return None;
     }
     let mm_key = current.mm.key.load(Ordering::Acquire);

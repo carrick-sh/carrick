@@ -220,7 +220,8 @@ impl<'a> MemView<'a> {
             ReservationOperation::Retire => (range.end(), range.start()),
             ReservationOperation::Protect
             | ReservationOperation::Move
-            | ReservationOperation::Decommit => {
+            | ReservationOperation::Decommit
+            | ReservationOperation::Discard => {
                 // Not a break proposal: leave the root as it was.
                 root.with_root(|model| model.refuse(request))
                     .map_err(super::anonymous::root_refusal)?;
