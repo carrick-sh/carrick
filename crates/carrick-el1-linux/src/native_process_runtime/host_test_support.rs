@@ -14094,3 +14094,291 @@ pub(crate) fn outcome_kind(outcome: &LifecycleOutcome) -> std::string::String {
         LifecycleOutcome::Transferred { .. } => "Transferred".into(),
     }
 }
+
+#[cfg(test)]
+#[test]
+fn native_arm_pselect6_host_settlement() {
+    for cause in [
+        carrick_kernel::kernel::continuation::ipc::IpcCause::Timeout,
+        carrick_kernel::kernel::continuation::ipc::IpcCause::Signal { restart: true },
+        carrick_kernel::kernel::continuation::ipc::IpcCause::Stop,
+    ] {
+        native_arm_pselect6_handback(Some(cause), false);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn native_arm_pselect6_no_slot_wake() {
+    native_arm_pselect6_handback(None, false);
+}
+
+#[cfg(test)]
+#[test]
+fn native_arm_pselect6_no_slot_wake_reports_eof() {
+    native_arm_pselect6_handback(None, true);
+}
+
+#[cfg(test)]
+fn native_arm_pselect6_handback(
+    cause: Option<carrick_kernel::kernel::continuation::ipc::IpcCause>,
+    eof: bool,
+) {
+    use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags};
+    use carrick_el1_abi::ipc::{
+        End, HostResourceToken, IpcBacking, IpcError, IpcHandback, IpcRegion, IpcWake,
+    };
+    use carrick_guest_mem::GuestMemory;
+    use carrick_kernel::kernel::continuation::ipc::{
+        self, CounterClock, HostIpcWait, IpcCause, IpcHostOutcome, IpcHostServices,
+        ZoneHostServices,
+    };
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_sched_core::{Handback, HostClaim};
+    use carrick_test_support::GuestUserBuffer;
+
+    struct ClockedServices(ZoneHostServices, u64);
+    impl IpcHostServices for ClockedServices {
+        fn operation_slot_released(&self, region: &IpcRegion<'_>) {
+            self.0.operation_slot_released(region);
+        }
+        fn validate_region(&self, region: &IpcRegion<'_>) -> Result<(), IpcError> {
+            self.0.validate_region(region)
+        }
+        fn release_host(&self, token: HostResourceToken) -> Result<(), IpcError> {
+            self.0.release_host(token)
+        }
+        fn wake(&self, wake: IpcWake) {
+            self.0.wake(wake);
+        }
+        fn counter(&self) -> CounterClock {
+            CounterClock {
+                now: self.1,
+                numer: 1,
+                denom: 1,
+            }
+        }
+    }
+
+    let capacity = NativeServiceCapacityFixture::new_for::<carrick_mmu_core::owner_mmu::Aarch64Mmu>(
+        1, arm_words,
+    );
+    let fixture = &capacity.fixture;
+    let (record, address, words) = capacity.select().unwrap();
+    let member = fixture.zone.record(record.id);
+    let admitted = member.identity();
+    // This host fixture keeps its control block outside the EL1 metadata
+    // aperture. The scheduler reads the unbound affinity in that venue.
+    let projected = crate::sched::identity_of(fixture.task, admitted.affinity);
+    assert_eq!(
+        projected,
+        ThreadIdentity {
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            ..admitted
+        }
+    );
+    // SAFETY: the test owns the only slot and the selected OnCpu record.
+    assert!(unsafe { member.rebind_owned(admitted, projected) });
+
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner = Box::leak(Box::new(context.kernel().ipc().unwrap()));
+    let region = owner.region();
+    let table =
+        carrick_kernel::el1_ipc::HostTable::create(std::sync::Arc::clone(owner), 64, 64).unwrap();
+    let object = owner.create_pipe(65_536).unwrap();
+    let fd = region.fd(HostIpcWait);
+    for (end, access) in [
+        (End::Reader, AccessMode::ReadOnly),
+        (End::Writer, AccessMode::WriteOnly),
+    ] {
+        fd.open(
+            table.id(),
+            Fd(0),
+            Description::new(
+                IpcBacking::Pipe { object, end }.encode(),
+                access,
+                StatusFlags::default(),
+            ),
+            false,
+        )
+        .unwrap();
+    }
+    let completion = |_: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+        '_,
+        carrick_el1_abi::Aarch64ParkedContext,
+    >| { panic!("unexpected owned completion effect") };
+    let key = ipc::wait_key(object, carrick_el1_abi::ipc::pipe::WaitFor::Readable).unwrap();
+    fixture
+        .zone
+        .bind_object_wait(key, &HostIpcWait, &completion)
+        .unwrap();
+
+    // This scope owns the only table mapping used by the call.
+    let map = unsafe {
+        &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<
+            carrick_el1_abi::ipc_tables::IpcTableMap,
+        >())
+        .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    map.publish(
+        fixture.task.linux.file_table.load(Ordering::Acquire),
+        table.id().to_raw(),
+    )
+    .unwrap();
+    let tables = Box::leak(Box::new(crate::ipc::MapTables(map)));
+    let venue = crate::ipc::IpcVenue { region, tables };
+
+    let args = GuestUserBuffer::from_value([1_u64, 5, 0]);
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        elr: 0x4000,
+        ..Default::default()
+    };
+    frame.x[..6].copy_from_slice(&[1, args.arg(), 0, 0, args.arg() + 8, 0]);
+    frame.x[8] = carrick_personality_linux::crossing::nr::PSELECT6.raw();
+    let mut service = fixture.service();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &words,
+            &mut service,
+        )
+        .unwrap();
+    assert!(!entry.is_root_process());
+    assert!(fixture.zone.record(record.id).is_native_owned());
+    fixture.task.linux.mark_pending_host_work();
+    let mut cpu = crate::sched::FakeCpu {
+        freq: 1_000_000_000,
+        ..Default::default()
+    };
+    let route = crate::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        &carrick_el1_abi::Counters::new(),
+        core::slice::from_ref(fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &carrick_el1_abi::InotifyNameCache::new(),
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        Some(&venue),
+        None,
+        Some(&mut *entry),
+        Some(source),
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert_eq!(
+        route,
+        CompletionRoute::Suspended,
+        "pselect6 returned {}",
+        frame.x[0] as i64
+    );
+    drop(entry);
+    let parked = fixture.zone.record(record.id);
+    assert!(matches!(
+        parked.claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    if let Some(cause) = cause {
+        let handback = match cause {
+            IpcCause::Timeout => Handback::Timeout,
+            IpcCause::Signal { .. } => Handback::Signal,
+            IpcCause::Stop => Handback::GroupStop,
+            IpcCause::Control => unreachable!(),
+        };
+        assert!(matches!(
+            fixture
+                .zone
+                .claim_for_host(record, None, handback, &HostIpcWait, &completion),
+            HostClaim::Claimed
+        ));
+    } else {
+        if eof {
+            table.close(Fd(1)).unwrap();
+        }
+        fixture.zone.leave_guest(fixture.slot, &HostIpcWait);
+        let object = region.lock(object, &HostIpcWait).unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(key, &HostIpcWait, &completion)
+            .unwrap();
+        let mut handed = None;
+        let report = queue
+            .notify_object_host(&mut |record| handed = Some(record), &mut |_| {
+                panic!("no slot can admit this waiter")
+            })
+            .unwrap();
+        assert_eq!(report.handed, 1);
+        assert_eq!(handed, Some(record));
+        assert_eq!(parked.handback(), Some(Handback::Resumed));
+        drop(queue);
+        drop(object);
+    }
+
+    // SAFETY: host claim or NoSlot transfer detached the whole registration.
+    let token = unsafe { parked.take_object_operation() }
+        .and_then(ipc::from_sched_token)
+        .unwrap();
+    let mut op = region.operation(&token).unwrap();
+    let end = op.deadline.get().unwrap();
+    let clock = ClockedServices(
+        ZoneHostServices::new(context.kernel()).unwrap(),
+        if cause == Some(IpcCause::Timeout) {
+            end
+        } else {
+            end - 4_000_000_001
+        },
+    );
+    let mut memory =
+        carrick_kernel::dispatch::LinearMemory::new(args.arg(), args.as_bytes().to_vec());
+    let outcome = if let Some(cause) = cause {
+        ipc::interrupt(&context, &region, token, op.mm, &mut memory, cause, &clock)
+    } else {
+        op.handback = IpcHandback::Continue;
+        region.update_operation(&token, op).unwrap();
+        ipc::complete_handback(&context, &region, token, op.mm, &mut memory, None, &clock)
+    };
+    let expected = match cause {
+        Some(IpcCause::Timeout) => (0, [0_u64, 0, 0]),
+        Some(IpcCause::Signal { .. }) => (-4, [1, 4, 0]),
+        None if eof => (1, [1, 4, 0]),
+        _ => {
+            let Ok(IpcHostOutcome::Blocked {
+                token, deadline, ..
+            }) = outcome
+            else {
+                panic!("{cause:?} must preserve the wait: {outcome:?}");
+            };
+            assert_eq!(deadline, Some(end));
+            assert_eq!(memory.read_bytes(args.arg(), 24).unwrap(), args.as_bytes());
+            ipc::finish(&region, token, &clock).unwrap();
+            return;
+        }
+    };
+    assert_eq!(
+        outcome,
+        Ok(IpcHostOutcome::Complete {
+            result: expected.0,
+            sigpipe: false
+        })
+    );
+    assert_eq!(
+        memory.read_bytes(args.arg(), 24).unwrap(),
+        expected.1.map(u64::to_ne_bytes).concat()
+    );
+}
