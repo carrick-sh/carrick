@@ -790,3 +790,50 @@ Moved from `AGENTS.md` (#2118). The oracle is native arm64 Docker Linux; skills:
 ### Host unit/integration test wiring
 
 - Ungated tests are not tests: `carrick-cli` has no lib target, and in-file `mod tests` required explicit `--bin carrick` wiring in `just test` to run.
+
+## Language suite census
+
+`carrick-conformance --slice` selects `py-fs`, `py-proc`, `go-os`,
+`smoke` (language smoke rows), or `node-libuv`. Repeat the flag to select
+their union. The existing `--suite` and `--ecosystem` filters further
+restrict the selection. Each sample runs the same selection at its manifest
+deadlines. Node uses line 24, and the in-image Node core runner uses two jobs.
+
+Publish the suite images as OCI fixtures and put their digest references in
+a platform-specific TOML file. The quoted keys are the original image tags
+from `scripts/conformance/suites.toml`. For example, map
+`"localhost:5050/cpython-test:3.12.13"` to
+`"localhost:5050/cpython-test@sha256:<published digest>"`. Use the same pins
+for the oracle and Carrick on that platform.
+
+During the declared Docker-only window on the oracle host, hold the site's
+host-wide lease and fill the census cache. Use `hvf` to select the arm64
+oracle on a native arm64 Docker host, and `kvm-local` on the native amd64
+oracle host. The repository's `just lease` command only protects the local
+VM. Site admission must exclude guest work across the physical host.
+
+```sh
+just lease docker target/debug/carrick-conformance --oracle-fill --lane kvm-local \
+  --suiteboard-images suiteboard-amd64.toml \
+  --slice py-fs --slice py-proc --slice go-os --slice smoke --slice node-libuv
+```
+
+For the census, run the harness from the checkout of the tested artifact's
+build commit. Run in a separate Carrick-only window under the gate lease.
+Use the signed artifact on macOS and the KVM artifact built from the same
+commit on amd64. The Linux example uses the pinned images and its cached
+oracle.
+
+```sh
+just lease gate target/debug/carrick-conformance --lane kvm-local \
+  --suiteboard-images suiteboard-amd64.toml --require-cached-oracle \
+  --slice py-fs --slice py-proc --slice go-os --slice smoke --slice node-libuv \
+  --runs 5 --jsonl target/conformance/suiteboard-amd64.jsonl
+```
+
+The JSONL has one row per suite per sample. A deadline produces `hung` and
+keeps the outcomes already observed. The adjacent `.suiteboard.json` receipt
+records artifact identity, populations, and the run IDs and outcomes behind
+each unstable result. Oracle populations count each cached suite once.
+A nonzero run status flags divergences, hangs, or instability. A cache miss
+exits before starting Carrick and names the missing rows.

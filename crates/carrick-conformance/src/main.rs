@@ -18,6 +18,7 @@ mod images;
 use carrick_conformance::lane;
 use carrick_conformance::manifest;
 mod matrix;
+mod suiteboard;
 use carrick_conformance::oracle;
 use carrick_conformance::parsers;
 use carrick_conformance::verdict;
@@ -27,7 +28,7 @@ use crate::closure::{ClosurePolicy, validate_closure_reports, validate_closure_s
 use crate::manifest::{Ecosystem, Manifest, Suite, Tier, Weight};
 use crate::verdict::{
     Baseline, CarrickRunFacts, ConfirmReason, PerfSummary, SerialConfirmation, SideSummary,
-    SuiteReport, Verdict, classify, classify_closure,
+    SuiteReport, Verdict, classify, classify_closure, classify_suiteboard,
 };
 use clap::Parser as _;
 use std::path::{Path, PathBuf};
@@ -111,6 +112,16 @@ struct Args {
     /// Filter to these ecosystems (repeatable): cpython|go|node|ltp.
     #[arg(long)]
     ecosystem: Vec<String>,
+    /// Select named language census slices (repeatable, union).
+    #[arg(long, value_enum)]
+    slice: Vec<suiteboard::Slice>,
+    /// Run N independent census samples with the declared suite deadlines.
+    /// Census runs require cached Docker oracles and write a suiteboard receipt.
+    #[arg(long)]
+    runs: Option<std::num::NonZeroUsize>,
+    /// TOML mapping from manifest image tags to published digest references.
+    #[arg(long)]
+    suiteboard_images: Option<PathBuf>,
     /// Filter to these suite names (repeatable).
     #[arg(long)]
     suite: Vec<String>,
@@ -273,13 +284,10 @@ struct Args {
     )]
     carrick_serial_confirm_budget_s: u64,
     /// Parser profile for `--oracle-fill`: `closure` (the assertion-exact
-    /// profile the closure gate keys on) or `regression`.
-    ///
-    /// A fill now writes BOTH profile rows from the one container it runs, each
-    /// admitted by its own cacheability rule, so this flag no longer decides
-    /// which row exists — it selects which parse the REPORT uses, and which row
-    /// is invalidated up front and required to come back (the other is a bonus
-    /// its own rule may legitimately refuse).
+    /// profile the closure gate keys on), `regression`, or `suiteboard`.
+    /// Legacy fills write both legacy profiles and require the named one to
+    /// be cacheable. A suiteboard fill writes only the suiteboard profile.
+    /// A slice selection chooses the suiteboard profile automatically.
     #[arg(long, default_value = "closure")]
     oracle_fill_profile: String,
 }
@@ -378,6 +386,33 @@ fn main() -> ExitCode {
 
 fn run() -> anyhow::Result<ExitCode> {
     let mut args = Args::parse();
+    let suiteboard = args.is_suiteboard();
+    if suiteboard {
+        anyhow::ensure!(
+            !args.closure
+                && !args.bless
+                && args.bless_from.is_none()
+                && !args.refresh_oracle
+                && args.flake_retries == 0
+                && args.shard.is_none()
+                && args.merge_shards.is_empty()
+                && !args.generate_suites
+                && args.seed_oracle.is_none()
+                && !args.check_matrix
+                && !args.render_matrix
+                && args.oracle == lane::OracleBackend::Docker
+                && matches!(args.lane.as_str(), "hvf" | "kvm-local"),
+            "suiteboard requires a local HVF/KVM lane and conflicts with gate, retry and artifact maintenance modes"
+        );
+        anyhow::ensure!(
+            !args.oracle_fill || (args.runs.is_none() && !args.require_cached_oracle),
+            "suiteboard oracle fill conflicts with --runs and --require-cached-oracle"
+        );
+    }
+    anyhow::ensure!(
+        !args.require_cached_oracle || (!args.oracle_fill && !args.refresh_oracle),
+        "--require-cached-oracle conflicts with --oracle-fill and --refresh-oracle"
+    );
     if args.oracle == lane::OracleBackend::Native {
         if args.oracle_cache == Path::new(lane::OracleBackend::Docker.cache_path()) {
             args.oracle_cache = args.oracle.cache_path().into();
@@ -511,14 +546,37 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 
     let tier = parse_tier(&args.tier)?;
+    let suites = manifest.suite;
     let skip_key = amd64_bringup_key(docker_platform, &args.lane);
     let mut selected = select(
-        &manifest.suite,
+        &suites,
         tier,
         &args.ecosystem,
         &args.suite,
-        skip_key,
+        if args.slice.is_empty() {
+            skip_key
+        } else {
+            None
+        },
     );
+    if !args.slice.is_empty() {
+        for slice in &args.slice {
+            anyhow::ensure!(
+                selected.iter().any(|suite| slice.contains(suite)),
+                "no suites match slice {slice:?} and the requested filters"
+            );
+        }
+        selected.retain(|suite| args.slice.iter().any(|slice| slice.contains(suite)));
+    }
+    if suiteboard {
+        anyhow::ensure!(!selected.is_empty(), "suiteboard selected no suites");
+        suiteboard::pin_images(&mut selected, args.suiteboard_images.as_deref())?;
+    } else {
+        anyhow::ensure!(
+            args.suiteboard_images.is_none(),
+            "--suiteboard-images requires suiteboard mode"
+        );
+    }
     if args.closure {
         validate_closure_selection(&selected)?;
     }
@@ -621,7 +679,17 @@ fn run() -> anyhow::Result<ExitCode> {
             .collect();
         header.identity.native_images_hash = Some(shard::hash(&serde_json::to_vec(&images)?));
     }
-    if args.oracle_fill {
+    if args.oracle_fill && (!suiteboard || !args.dry_run) {
+        if suiteboard {
+            anyhow::ensure!(
+                matches!(
+                    (docker_platform, std::env::consts::ARCH),
+                    (lane::DockerPlatform::LinuxAmd64, "x86_64")
+                        | (lane::DockerPlatform::LinuxArm64, "aarch64")
+                ),
+                "suiteboard oracle fill requires a native {docker_platform:?} Docker host"
+            );
+        }
         return oracle_fill(&args, &selected, docker_platform, &oracle_context);
     }
     // Transparency: a bring-up lane silently dropping not-yet-applicable
@@ -630,9 +698,9 @@ fn run() -> anyhow::Result<ExitCode> {
     if let Some(key) = skip_key
         && args.ecosystem.is_empty()
         && args.suite.is_empty()
+        && args.slice.is_empty()
     {
-        let skipped: Vec<&Suite> = manifest
-            .suite
+        let skipped: Vec<&Suite> = suites
             .iter()
             .filter(|s| {
                 (tier == Tier::Full || s.tier == Tier::Smoke) && !applies_to_lane(s, Some(key))
@@ -668,7 +736,11 @@ fn run() -> anyhow::Result<ExitCode> {
                 &format!("conf-{}-cN", std::process::id()),
                 &lane,
                 args.carrick_fast_timeout_s,
-                args.carrick_timeout_cap_s,
+                if suiteboard {
+                    Some(0)
+                } else {
+                    args.carrick_timeout_cap_s
+                },
             );
             let d = oracle_context.argv(
                 s,
@@ -682,21 +754,6 @@ fn run() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Binary preflight (abort on unsigned/missing; warn on stale). The local-binary
-    // checks (codesign, exists) are HVF-only — the KVM binary lives in the guest and
-    // is validated by the lima preflight instead.
-    if lane.is_lima_kvm() {
-        preflight_kvm(&lane, &args.carrick_bin)?;
-    } else if matches!(lane, lane::Lane::KvmLocal(_)) {
-        preflight_kvm_local(&args.carrick_bin)?;
-    } else if matches!(lane, lane::Lane::BhyveLocal(_)) {
-        preflight_bhyve_local(&args.carrick_bin)?;
-    } else if matches!(lane, lane::Lane::NvmmLocal(_)) {
-        preflight_nvmm_local(&args.carrick_bin)?;
-    } else {
-        preflight(&args.carrick_bin)?;
-    }
-
     // Load the shared baseline, then UNION the lane's overlay onto it (a no-op
     // when the overlay is absent/empty). A divergence is "expected" iff it
     // matches the shared baseline OR the overlay. The overlay path is LANE-
@@ -708,7 +765,7 @@ fn run() -> anyhow::Result<ExitCode> {
         .baseline_overlay
         .clone()
         .or_else(|| lane_overlay_path(&args.baseline, &args.lane));
-    let baseline = if args.closure {
+    let baseline = if args.closure || suiteboard {
         None
     } else {
         Some(match &overlay_path {
@@ -716,7 +773,9 @@ fn run() -> anyhow::Result<ExitCode> {
             None => load_baseline(&args.baseline),
         })
     };
-    let classification = if args.closure {
+    let classification = if suiteboard {
+        ClassificationPolicy::Suiteboard
+    } else if args.closure {
         ClassificationPolicy::Closure
     } else {
         ClassificationPolicy::Baseline(
@@ -725,7 +784,12 @@ fn run() -> anyhow::Result<ExitCode> {
                 .ok_or_else(|| anyhow::anyhow!("regular run requires a baseline"))?,
         )
     };
-    let (parser_mode, oracle_profile) = if args.closure {
+    let (parser_mode, oracle_profile) = if suiteboard {
+        (
+            parsers::ParseMode::Closure,
+            oracle::ParserProfile::SuiteboardV1,
+        )
+    } else if args.closure {
         (
             parsers::ParseMode::Closure,
             oracle::ParserProfile::ClosureV3,
@@ -744,17 +808,6 @@ fn run() -> anyhow::Result<ExitCode> {
     // `target/release/carrick` underneath a running gate. Absent for the lima
     // KVM lane, whose binary lives in the guest.
     let carrick_binary_sha256 = binary_identity(&args.carrick_bin).ok();
-
-    // Image-freshness guard: re-pull carrick's copy of any selected image whose
-    // registry digest moved, SERIALLY before the parallel carrick phase, so
-    // carrick and docker run identical bytes (see images.rs). Skipped on request.
-    if !args.no_image_refresh && args.oracle == lane::OracleBackend::Docker {
-        let imgs: Vec<String> = selected.iter().map(|s| s.image.clone()).collect();
-        let refreshed = images::refresh_stale_images(&imgs, &carrick_bin, &lane);
-        if refreshed > 0 {
-            eprintln!("image-guard: re-pulled {refreshed} stale image(s)");
-        }
-    }
 
     // Bless a FINISHED run without repeating it: the bless is a pure function of
     // a full run's reports. Guarded by a completeness check so a truncated or
@@ -803,11 +856,24 @@ fn run() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let suites_per_run = selected.len();
+    let runs = args.runs.map_or(1, std::num::NonZeroUsize::get);
+    if runs > 1 {
+        let n = suites_per_run
+            .checked_mul(runs)
+            .ok_or_else(|| anyhow::anyhow!("suiteboard population overflow"))?;
+        selected = selected.into_iter().cycle().take(n).collect();
+    }
     let n = selected.len();
+    let timeout_cap_s = if suiteboard {
+        Some(0)
+    } else {
+        args.carrick_timeout_cap_s
+    };
     let workers = worker_count(args.workers);
     let cpython_workers = cpython_worker_count(args.cpython_workers, workers);
     let lanes = SchedulerLanes::new(cpython_workers);
-    let fail_fast = FailFast::new(args.force, args.max_gating);
+    let fail_fast = FailFast::new(args.force || suiteboard, args.max_gating);
     if !fail_fast.force {
         eprintln!(
             "fail-fast: abort after more than {} gating verdict(s) (use --force for exhaustive)",
@@ -836,9 +902,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 .iter()
                 .filter(|suite| match oracle_profile {
                     oracle::ParserProfile::Regression => cache.invalidate(suite, docker_platform),
-                    oracle::ParserProfile::ClosureV3 => {
-                        cache.invalidate_for_profile(suite, docker_platform, oracle_profile)
-                    }
+                    _ => cache.invalidate_for_profile(suite, docker_platform, oracle_profile),
                 })
                 .count();
             if invalidated > 0 {
@@ -853,7 +917,7 @@ fn run() -> anyhow::Result<ExitCode> {
                         cache.get(s, docker_platform),
                         cache.get_elapsed_ms(s, docker_platform),
                     ),
-                    oracle::ParserProfile::ClosureV3 => (
+                    _ => (
                         cache.get_for_profile(s, docker_platform, oracle_profile),
                         cache.get_elapsed_ms_for_profile(s, docker_platform, oracle_profile),
                     ),
@@ -865,36 +929,76 @@ fn run() -> anyhow::Result<ExitCode> {
     // mid-run. Naming every miss at once makes a determinant-field change
     // (which invalidates the whole cache) obvious instead of looking like a
     // broken runner.
-    if args.require_cached_oracle {
-        if args.refresh_oracle {
-            eprintln!("--require-cached-oracle conflicts with --refresh-oracle");
-            std::process::exit(2);
-        }
-        let missing: Vec<&str> = selected
+    if args.require_cached_oracle || suiteboard {
+        let missing: std::collections::BTreeSet<_> = selected
             .iter()
             .zip(&cached)
             .filter(|(_, hit)| hit.is_none())
             .map(|(suite, _)| suite.name.as_str())
             .collect();
         if !missing.is_empty() {
-            eprintln!(
-                "--require-cached-oracle: {} of {n} selected suite(s) have no cached oracle for \
-                 platform {docker_platform:?}; this lane cannot run docker. Re-bless the cache on \
-                 a box with the images (`--refresh-oracle`) and commit it.",
-                missing.len()
-            );
             for id in &missing {
                 eprintln!("  uncached: {id}");
             }
-            std::process::exit(2);
+            anyhow::bail!(
+                "--require-cached-oracle: {} selected suite(s) have no cached oracle for {}; fill on the oracle host with --oracle-fill",
+                missing.len(),
+                docker_platform.as_str()
+            );
         }
-        eprintln!("oracle: all {n} selected suite(s) cached; running carrick-only");
+        eprintln!("oracle: all {suites_per_run} selected suite(s) cached; running carrick-only");
+    }
+
+    // Binary preflight (abort on unsigned/missing; warn on stale). The local-binary
+    // checks (codesign, exists) are HVF-only — the KVM binary lives in the guest and
+    // is validated by the lima preflight instead.
+    if lane.is_lima_kvm() {
+        preflight_kvm(&lane, &args.carrick_bin)?;
+    } else if matches!(lane, lane::Lane::KvmLocal(_)) {
+        preflight_kvm_local(&args.carrick_bin)?;
+    } else if matches!(lane, lane::Lane::BhyveLocal(_)) {
+        preflight_bhyve_local(&args.carrick_bin)?;
+    } else if matches!(lane, lane::Lane::NvmmLocal(_)) {
+        preflight_nvmm_local(&args.carrick_bin)?;
+    } else {
+        preflight(&args.carrick_bin)?;
+    }
+
+    let board_identity = suiteboard
+        .then(|| suiteboard::Identity::capture(&args.carrick_bin, &lane))
+        .transpose()?;
+    let board_path = args.results_path().with_extension("suiteboard.json");
+    let run_prefix = if suiteboard {
+        format!(
+            "sb-{pid}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis()
+        )
+    } else {
+        format!("conf-{pid}")
+    };
+    if suiteboard && board_path.exists() {
+        std::fs::remove_file(&board_path)?;
+    }
+    // Image-freshness guard: re-pull carrick's copy of any selected image whose
+    // registry digest moved, SERIALLY before the parallel carrick phase, so
+    // carrick and docker run identical bytes (see images.rs). Skipped on request.
+    if !args.no_image_refresh && args.oracle == lane::OracleBackend::Docker {
+        let imgs: Vec<String> = selected.iter().map(|s| s.image.clone()).collect();
+        let refreshed = images::refresh_stale_images(&imgs, &carrick_bin, &lane);
+        if refreshed > 0 {
+            eprintln!("image-guard: re-pulled {refreshed} stale image(s)");
+        }
     }
 
     if let Some(header) = &shard_header {
         shard::write_header(&args.results_path(), header)?;
     }
-    let stream = Mutex::new(std::fs::File::create(args.results_path()).ok());
+    if let Some(parent) = args.results_path().parent() {
+        std::fs::create_dir_all(parent)?; // nosemgrep
+    }
+    let stream = Mutex::new(Some(std::fs::File::create(args.results_path())?));
     let streamed_reports = Mutex::new(Vec::new());
     let fail_fast_stop = AtomicBool::new(false);
     let phase1_gating = AtomicUsize::new(0);
@@ -924,76 +1028,81 @@ fn run() -> anyhow::Result<ExitCode> {
         args.carrick_fast_timeout_s, args.carrick_timeout_cap_s
     );
     let all_indices: Vec<usize> = (0..n).collect();
-    let carrick_outs = fan_out_scheduled_with_stop(
-        &all_indices,
-        &selected,
-        workers,
-        &lanes,
-        || fail_fast_stop.load(Ordering::SeqCst),
-        |i| {
-            let s = &selected[i];
-            // Zero-pad the index so no run-id is a prefix of another (c01 vs c10);
-            // kill.sh anchors on the proctitle "carrick:<id>:" delimiter too, but a
-            // collision-free id is defense in depth against any unanchored grep.
-            let run_id = format!("conf-{pid}-c{i:02}");
-            let out = engine::run_carrick(
+    let run_suite = |i: usize| {
+        let s = &selected[i];
+        // Zero-pad the index so no run-id is a prefix of another (c01 vs c10);
+        // kill.sh anchors on the proctitle "carrick:<id>:" delimiter too, but a
+        // collision-free id is defense in depth against any unanchored grep.
+        let run_id = format!("{run_prefix}-c{i:02}");
+        let out = engine::run_carrick(
+            s,
+            &carrick_bin,
+            &run_id,
+            &lane,
+            args.carrick_fast_timeout_s,
+            timeout_cap_s,
+            timeout_elapsed[i],
+        );
+        eprintln!("  [carrick] {}", s.name);
+        // Stream this suite's report NOW if its oracle is cached (the common
+        // case). Un-cached suites still need docker (Phase 2) and are emitted
+        // only by the final authoritative write.
+        if let Some(res) = cached.get(i).and_then(|c| c.as_ref()) {
+            let docker = DockerSide {
+                served_ordinals: cache.served_ordinals(s, docker_platform, oracle_profile),
+                result: res.clone(),
+                run_id: "<cached>".to_string(),
+                argv: oracle_context.argv(s, "<cached>", docker_platform)?,
+                elapsed_ms: cached_verdict_elapsed[i],
+                timed_out: false,
+            };
+            let cout = out.as_ref().ok();
+            let rep = build_report(
                 s,
-                &carrick_bin,
-                &run_id,
-                &lane,
-                args.carrick_fast_timeout_s,
-                args.carrick_timeout_cap_s,
-                timeout_elapsed[i],
+                cout,
+                &docker,
+                classification,
+                lane.emits_syscall_census(),
             );
-            eprintln!("  [carrick] {}", s.name);
-            // Stream this suite's report NOW if its oracle is cached (the common
-            // case). Un-cached suites still need docker (Phase 2) and are emitted
-            // only by the final authoritative write.
-            if let Some(res) = cached.get(i).and_then(|c| c.as_ref()) {
-                let docker = DockerSide {
-                    served_ordinals: cache.served_ordinals(s, docker_platform, oracle_profile),
-                    result: res.clone(),
-                    run_id: "<cached>".to_string(),
-                    argv: oracle_context.argv(s, "<cached>", docker_platform)?,
-                    elapsed_ms: cached_verdict_elapsed[i],
-                    timed_out: false,
-                };
-                let cout = out.as_ref().ok();
-                let rep = build_report(
-                    s,
-                    cout,
-                    &docker,
-                    classification,
-                    lane.emits_syscall_census(),
-                );
-                if rep.gating {
-                    let gating = phase1_gating.fetch_add(1, Ordering::SeqCst) + 1;
-                    if fail_fast.should_abort(gating)
-                        && !fail_fast_stop.swap(true, Ordering::SeqCst)
-                    {
-                        eprintln!(
-                            "fail-fast: stopping phase 1 after {gating} gating verdict(s) \
-                         (max {}, use --force for exhaustive)",
-                            fail_fast.max_gating
-                        );
-                    }
+            if rep.gating {
+                let gating = phase1_gating.fetch_add(1, Ordering::SeqCst) + 1;
+                if fail_fast.should_abort(gating) && !fail_fast_stop.swap(true, Ordering::SeqCst) {
+                    eprintln!(
+                        "fail-fast: stopping phase 1 after {gating} gating verdict(s) \
+                 (max {}, use --force for exhaustive)",
+                        fail_fast.max_gating
+                    );
                 }
-                if let Ok(line) = serde_json::to_string(&rep)
-                    && let Ok(mut guard) = stream.lock()
-                    && let Some(f) = guard.as_mut()
-                {
-                    use std::io::Write as _;
-                    let _ = writeln!(f, "{line}");
-                    let _ = f.flush();
-                }
-                streamed_reports
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(rep);
             }
-            out
-        },
-    );
+            if let Ok(line) = serde_json::to_string(&rep)
+                && let Ok(mut guard) = stream.lock()
+                && let Some(f) = guard.as_mut()
+            {
+                use std::io::Write as _;
+                let _ = writeln!(f, "{line}");
+                let _ = f.flush();
+            }
+            streamed_reports
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(rep);
+        }
+        out
+    };
+    let mut carrick_outs = Vec::with_capacity(n);
+    for indices in all_indices.chunks(suites_per_run) {
+        if let Some(identity) = &board_identity {
+            identity.verify(&args.carrick_bin)?;
+        }
+        carrick_outs.extend(fan_out_scheduled_with_stop(
+            indices,
+            &selected,
+            workers,
+            &lanes,
+            || fail_fast_stop.load(Ordering::SeqCst),
+            run_suite,
+        ));
+    }
     drop(stream);
     if fail_fast_stop.load(Ordering::SeqCst) {
         let reports = streamed_reports
@@ -1019,7 +1128,7 @@ fn run() -> anyhow::Result<ExitCode> {
         std::collections::BTreeMap::new();
     // Closure preserves the first observation at the declared concurrency.
     // Serial recovery is diagnostic evidence, never proof of parity.
-    if !args.closure {
+    if !args.closure && !suiteboard {
         let mut load_facts: std::collections::BTreeMap<
             usize,
             (ConfirmReason, u64, u64, Option<engine::TimeoutKind>),
@@ -1214,7 +1323,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 );
                 let (regression, closure) = match oracle_profile {
                     oracle::ParserProfile::Regression => (res.clone(), other),
-                    oracle::ParserProfile::ClosureV3 => (other, res.clone()),
+                    _ => (other, res.clone()),
                 };
                 cache.insert_fresh_both_profiles(
                     s,
@@ -1380,6 +1489,23 @@ fn run() -> anyhow::Result<ExitCode> {
     write_reports(&args.results_path(), &reports)?;
     print_summary(&reports);
 
+    if let Some(identity) = board_identity {
+        identity.verify(&args.carrick_bin)?;
+        let unstable = suiteboard::write_receipt(
+            &board_path,
+            &args.lane,
+            docker_platform,
+            runs,
+            identity,
+            &reports,
+        )?;
+        return Ok(if unstable || reports.iter().any(|report| report.gating) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+
     if args.closure {
         match validate_closure_reports(&selected, &reports) {
             Ok(()) => {
@@ -1500,6 +1626,7 @@ struct DockerSide {
 
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
 enum ClassificationPolicy<'a> {
+    Suiteboard,
     Closure,
     Baseline(&'a Baseline),
 }
@@ -1511,7 +1638,7 @@ fn build_report(
     policy: ClassificationPolicy<'_>,
     census_required: bool,
 ) -> SuiteReport {
-    let (c_raw, c_timed, c_runid, c_argv, c_elapsed_ms) = match cout {
+    let (mut c_raw, mut c_timed, c_runid, c_argv, c_elapsed_ms) = match cout {
         Some(o) => (
             o.raw(),
             o.timed_out,
@@ -1543,7 +1670,12 @@ fn build_report(
         })
     });
 
+    if matches!(policy, ClassificationPolicy::Suiteboard) && suiteboard::inner_deadline(s, &c_raw) {
+        c_timed = true;
+        c_raw.timed_out = true;
+    }
     let c_res = match policy {
+        ClassificationPolicy::Suiteboard => suiteboard::parse(s, &c_raw),
         ClassificationPolicy::Closure => {
             parsers::parse_for_mode(verdict_kind(s), &c_raw, parsers::ParseMode::Closure)
         }
@@ -1556,6 +1688,7 @@ fn build_report(
         result: &c_res,
     };
     let mut cl = match policy {
+        ClassificationPolicy::Suiteboard => classify_suiteboard(&c_res, d_res),
         ClassificationPolicy::Closure => classify_closure(s, facts(), d_res, docker.timed_out),
         ClassificationPolicy::Baseline(baseline) => classify(s, facts(), d_res, baseline),
     };
@@ -1575,7 +1708,9 @@ fn build_report(
         )
     {
         cl.gating = true;
-        cl.verdict = Verdict::Incomplete;
+        if cl.verdict != Verdict::Hung {
+            cl.verdict = Verdict::Incomplete;
+        }
         cl.new_diffs.push(format!("syscall census: {error}"));
     }
 
@@ -1634,8 +1769,9 @@ fn parse_oracle_fill_profile(name: &str) -> anyhow::Result<oracle::ParserProfile
     match name {
         "closure" => Ok(oracle::ParserProfile::ClosureV3),
         "regression" => Ok(oracle::ParserProfile::Regression),
+        "suiteboard" => Ok(oracle::ParserProfile::SuiteboardV1),
         other => anyhow::bail!(
-            "unknown --oracle-fill-profile {other:?} (expected `closure` or `regression`)"
+            "unknown --oracle-fill-profile {other:?} (expected `closure`, `regression`, or `suiteboard`)"
         ),
     }
 }
@@ -1665,16 +1801,20 @@ fn oracle_fill(
     }
     // Filling the whole surface must be a deliberate `--refresh-oracle` run,
     // never a side effect of this flag.
-    if args.ecosystem.is_empty() && args.suite.is_empty() {
-        anyhow::bail!("--oracle-fill requires an explicit --suite/--ecosystem selection");
+    if args.ecosystem.is_empty() && args.suite.is_empty() && args.slice.is_empty() {
+        anyhow::bail!("--oracle-fill requires an explicit --suite/--ecosystem/--slice selection");
     }
     if selected.is_empty() {
         anyhow::bail!("--oracle-fill selected no suites");
     }
-    let profile = parse_oracle_fill_profile(&args.oracle_fill_profile)?;
+    let profile = if args.is_suiteboard() {
+        oracle::ParserProfile::SuiteboardV1
+    } else {
+        parse_oracle_fill_profile(&args.oracle_fill_profile)?
+    };
     let parser_mode = match profile {
-        oracle::ParserProfile::ClosureV3 => parsers::ParseMode::Closure,
         oracle::ParserProfile::Regression => parsers::ParseMode::Regression,
+        _ => parsers::ParseMode::Closure,
     };
 
     let pid = std::process::id();
@@ -1709,6 +1849,35 @@ fn oracle_fill(
             continue;
         }
         let raw = out.raw();
+        if profile == oracle::ParserProfile::SuiteboardV1 {
+            let hung = suiteboard::inner_deadline(suite, &raw);
+            let res = suiteboard::parse(suite, &raw);
+            let stored = cache.insert_fresh_for_profile(
+                suite,
+                docker_platform,
+                profile,
+                res,
+                Some(out.elapsed_ms),
+                hung,
+            );
+            if stored {
+                eprintln!(
+                    "  [oracle {:?}] {}: {} ms ({})",
+                    args.oracle, suite.name, out.elapsed_ms, out.run_id
+                );
+            } else {
+                failures.push(format!(
+                    "{}: {}",
+                    suite.name,
+                    if hung {
+                        "oracle hung"
+                    } else {
+                        "cache refused the fresh oracle"
+                    }
+                ));
+            }
+            continue;
+        }
         let res = parsers::parse_for_mode(verdict_kind(suite), &raw, parser_mode);
         let other = parsers::parse_for_mode(
             verdict_kind(suite),
@@ -1735,7 +1904,7 @@ fn oracle_fill(
         );
         let (regression, closure) = match profile {
             oracle::ParserProfile::Regression => (res, other),
-            oracle::ParserProfile::ClosureV3 => (other, res),
+            _ => (other, res),
         };
         let (stored_regression, stored_closure) = cache.insert_fresh_both_profiles(
             suite,
@@ -1749,7 +1918,7 @@ fn oracle_fill(
         // is a bonus that its own cacheability rule may legitimately refuse.
         let stored_named = match profile {
             oracle::ParserProfile::Regression => stored_regression,
-            oracle::ParserProfile::ClosureV3 => stored_closure,
+            _ => stored_closure,
         };
         if !stored_named {
             failures.push(format!(
@@ -1864,10 +2033,23 @@ fn bless_target(lane: &str) -> Result<BlessTarget, String> {
 /// cover every suite yet, so ORACLE_FAIL there is an expected coverage gap, not a
 /// bless blocker. Pure (no IO) so the guard is unit-tested directly.
 impl Args {
+    fn is_suiteboard(&self) -> bool {
+        !self.slice.is_empty()
+            || self.runs.is_some()
+            || (self.oracle_fill && self.oracle_fill_profile == "suiteboard")
+    }
+
     /// This run's results path: `--jsonl` when given, else a default keyed on
     /// lane/tier/filtering so runs cannot clobber each other.
     fn results_path(&self) -> PathBuf {
         self.jsonl.clone().unwrap_or_else(|| {
+            if self.is_suiteboard() {
+                return engine::raw_dir().join(format!(
+                    "suiteboard-{}-{}.jsonl",
+                    self.lane,
+                    std::process::id()
+                ));
+            }
             let tier = parse_tier(&self.tier).unwrap_or(Tier::Full);
             let filtered = !self.ecosystem.is_empty() || !self.suite.is_empty();
             let mut path = default_results_path(&self.lane, tier, filtered);
@@ -1928,9 +2110,11 @@ fn bless_blocks(target: BlessTarget, verdict: Verdict) -> bool {
         // A BUDGET_KILL has no measured result at all, so there is nothing to
         // bless — and unlike a starved timeout it is not a measurement waiver:
         // the operator's deadline cut it off, not a busy box.
-        Verdict::Incomplete | Verdict::Timeout | Verdict::BudgetKill | Verdict::CarrickCrash => {
-            true
-        }
+        Verdict::Incomplete
+        | Verdict::Hung
+        | Verdict::Timeout
+        | Verdict::BudgetKill
+        | Verdict::CarrickCrash => true,
         Verdict::OracleFail => matches!(target, BlessTarget::SharedBaseline),
         Verdict::Match | Verdict::Diff | Verdict::Regression | Verdict::New => false,
     }

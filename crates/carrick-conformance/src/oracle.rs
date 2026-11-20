@@ -47,6 +47,8 @@ struct OracleKey<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     parser_profile: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_s: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     oracle_backend: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     kernel: Option<&'a str>,
@@ -126,6 +128,7 @@ fn parser_fingerprint(verdict: VerdictKind) -> Option<&'static str> {
 pub enum ParserProfile {
     Regression,
     ClosureV3,
+    SuiteboardV1,
 }
 
 impl ParserProfile {
@@ -133,6 +136,7 @@ impl ParserProfile {
         match self {
             Self::Regression => None,
             Self::ClosureV3 => Some("closure-v3"),
+            Self::SuiteboardV1 => Some("suiteboard-v1"),
         }
     }
 }
@@ -174,6 +178,7 @@ pub fn oracle_key_with_identity(
         verdict: suite.verdict,
         parser: parser_fingerprint(suite.verdict),
         parser_profile: profile.determinant(),
+        timeout_s: (profile == ParserProfile::SuiteboardV1).then_some(suite.timeout_s),
         oracle_backend: native.map(|_| crate::native::BACKEND_ID),
         kernel: native.map(|(kernel, _)| kernel),
         image_digest: native.map(|(_, digest)| digest),
@@ -337,7 +342,7 @@ impl OracleCache {
             Some(identity) => oracle_key_with_identity(suite, platform, profile, Some(identity)),
             None => match profile {
                 ParserProfile::Regression => oracle_key(suite, platform),
-                ParserProfile::ClosureV3 => oracle_key_for_profile(suite, platform, profile),
+                _ => oracle_key_for_profile(suite, platform, profile),
             },
         }
     }
@@ -401,7 +406,7 @@ impl OracleCache {
             }
             result.ids = ids;
         }
-        if profile == ParserProfile::ClosureV3 && !result.is_strict_closure_success() {
+        if profile != ParserProfile::Regression && !is_cacheable_for_profile(profile, &result) {
             return None;
         }
         Some(result)
@@ -735,7 +740,7 @@ fn is_closure_cacheable(result: &SuiteResult) -> bool {
 
 fn is_cacheable_for_profile(profile: ParserProfile, result: &SuiteResult) -> bool {
     match profile {
-        ParserProfile::Regression => is_cacheable(result),
+        ParserProfile::Regression | ParserProfile::SuiteboardV1 => is_cacheable(result),
         ParserProfile::ClosureV3 => is_closure_cacheable(result),
     }
 }

@@ -24,6 +24,7 @@ pub enum Verdict {
     New,
     CarrickCrash,
     Timeout,
+    Hung,
     /// Cut off at the operator's Carrick-only diagnostic budget, BELOW the
     /// suite's own declaration. Non-gating (it proves nothing about
     /// correctness) and bless-blocking (there is no measured result to bless);
@@ -42,6 +43,7 @@ impl Verdict {
             Verdict::New => "NEW",
             Verdict::CarrickCrash => "CARRICK_CRASH",
             Verdict::Timeout => "TIMEOUT",
+            Verdict::Hung => "HUNG",
             Verdict::BudgetKill => "BUDGET_KILL",
             Verdict::OracleFail => "ORACLE_FAIL",
         }
@@ -281,6 +283,24 @@ pub fn classify_closure(
         return Classification::exact_match(carrick, docker);
     }
     Classification::incomplete_or_diff(carrick, docker)
+}
+
+/// Census preserves assertion outcomes even when the suite hits its deadline.
+pub fn classify_suiteboard(carrick: &SuiteResult, oracle: &SuiteResult) -> Classification {
+    let mut classified = Classification::incomplete_or_diff(carrick, oracle);
+    classified.verdict = match carrick.result {
+        SuiteOutcome::Truncated => Verdict::Hung,
+        SuiteOutcome::None | SuiteOutcome::Empty => Verdict::CarrickCrash,
+        SuiteOutcome::Success if carrick.ids.is_empty() => Verdict::Incomplete,
+        SuiteOutcome::Success
+            if classified.new_diffs.is_empty() && oracle.result == SuiteOutcome::Success =>
+        {
+            Verdict::Match
+        }
+        SuiteOutcome::Success | SuiteOutcome::Failure => Verdict::Diff,
+    };
+    classified.gating = classified.verdict != Verdict::Match;
+    classified
 }
 
 /// Rewrite carrick-only assertion ids onto docker-only ids that share the same

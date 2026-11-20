@@ -23,6 +23,7 @@ else
   touch "$0.sampled"
   printf 'ok 3 - planted flake\n'
 fi
+printf '%s\n' 'CARRICK_SYSCALL_CENSUS {"refusal_evidence":{"schema":1,"isa":"x86_64","complete":true,"rows":[]}}' >&2
 exit 1
 "#,
     )
@@ -39,16 +40,17 @@ exit 1
 [[suite]]
 name = "{name}"
 ecosystem = "node"
-image = "localhost:5005/fixture:v1"
+image = "localhost:5005/fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 cmd = ["{name}"]
 verdict = "tap"
-tier = "full"
+tier = "smoke"
 weight = "light"
 timeout_s = 1
+carrick_flags = ["--fs", "host"]
 "#
         ));
         let key = format!(
-            r#"{{"docker_platform":"linux/amd64","image":"localhost:5005/fixture:v1","cmd":["{name}"],"docker_flags":[],"entrypoint":null,"bind_mounts":[],"env":[],"workdir":null,"verdict":"tap","parser_profile":"suiteboard-v1","timeout_s":1}}"#
+            r#"{{"docker_platform":"linux/amd64","image":"localhost:5005/fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000","cmd":["{name}"],"docker_flags":[],"entrypoint":null,"bind_mounts":[],"env":[],"workdir":null,"verdict":"tap","parser_profile":"suiteboard-v1","timeout_s":1}}"#
         );
         rows.push_str(
             &serde_json::json!({
@@ -74,6 +76,8 @@ timeout_s = 1
             .args([
                 "--lane",
                 "kvm-local",
+                "--slice",
+                "smoke",
                 "--runs",
                 "2",
                 "--require-cached-oracle",
