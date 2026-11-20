@@ -13,9 +13,8 @@
 //! (headers, .dynsym, .dynstr, .hash, .gnu.version, .gnu.version_d, .dynamic) is
 //! hand-built below — no build-time toolchain dependency.
 
-/// Guest VA of the vvar (timekeeping) data page. The embedded code loads this
-/// with a single `movz x9, #0x2E, lsl #32`, so it MUST match the asm.
-pub const LINUX_VVAR_BASE: u64 = 0x2E_0000_0000;
+pub use carrick_abi::{LINUX_VVAR_BASE, VVAR_OFF_FREQ, VVAR_OFF_REALTIME_OFF_NS};
+
 /// Guest VA of the vDSO code/ELF page (one 64 KiB slot above vvar). This is the
 /// value published in `AT_SYSINFO_EHDR`.
 pub const LINUX_VDSO_BASE: u64 = 0x2E_0001_0000;
@@ -26,8 +25,6 @@ pub const LINUX_VDSO_SIZE: u64 = 0x1000;
 /// Byte offsets into the vvar data page (little-endian u64s). carrick fills
 /// these; the vDSO code reads them.
 pub const VVAR_OFF_SEQ: usize = 0; // seqlock (even = stable) — reserved
-pub const VVAR_OFF_FREQ: usize = 8; // CNTFRQ_EL0 in Hz
-pub const VVAR_OFF_REALTIME_OFF_NS: usize = 16; // wall_ns - monotonic_ns
 /// RNG generation the userspace getrandom blob reads (P2). carrick stamps each
 /// process's host PID here (unique per process), and re-stamps a forked child's
 /// PID in rebuild_vcpu_after_fork — so a child's generation never matches the

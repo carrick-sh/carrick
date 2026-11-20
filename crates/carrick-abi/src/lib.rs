@@ -103,6 +103,13 @@
 
 pub use carrick_syscall_abi::*;
 
+/// Fixed guest address of the Carrick vDSO timekeeping page.
+pub const LINUX_VVAR_BASE: u64 = 0x2E_0000_0000;
+/// Offset of the little-endian counter frequency word in vvar.
+pub const VVAR_OFF_FREQ: usize = 8;
+/// Offset of the little-endian realtime base word in vvar.
+pub const VVAR_OFF_REALTIME_OFF_NS: usize = 16;
+
 use ::zerocopy::{Immutable, IntoBytes};
 use bitflags::bitflags;
 
