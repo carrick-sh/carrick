@@ -1,5 +1,5 @@
 schema = "carrick.conformance-exemption.v1"
-base = "a61ca8bedb47ae17d06a3110dc05698cbb2c0a7c"
+base = "12ceec5c7a2882e06afd78b882f9aa41690f6a6b"
 head = "edd1aa6be7a6f3b9b9b2b80331cce61b2db7b12d"
 contracts = [
   "kernel.el1.anonymous-first-touch",
