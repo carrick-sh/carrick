@@ -25,3 +25,25 @@ The fast result is a guest physical address. The memory provider still
 checks backing for every access. Cache use requires the provider to own the
 local stage-1 seat while dispatch runs. The Linux arm64 launcher enables
 the TLB by default and accepts the exact opt-out `CARRICK_SOFT_AARCH64_TLB=0`.
+
+## R4c evidence
+
+At 1, 100, and 10,000 iterations the memory loop walks 3 pages on each
+run. It decodes, emits and publishes 4 blocks at every scale. The 10,000
+iteration run takes 20,000 memory exits.
+
+The rates below are medians from five same-host interleaved pairs of
+counter-enabled AArch64 release binaries in QEMU user mode on Debian x86_64,
+pinned to CPU 0. Both variants use the same EL1 image and GNU cross linker.
+The musl probe includes syscall tracing. Other verification jobs ran on the
+host during measurement.
+
+| Probe | Stage-1 walks before → after | Blocks/s before → after | Instructions/s before → after |
+|---|---:|---:|---:|
+| Memory loop, 10,000 iterations | 50,002 → 3 | 183,437 → 543,853 | 244,581 → 725,132 |
+| EL1 trampoline to first HVC | 5,547 → 72 | 19,713 → 22,820 | 38,078 → 44,080 |
+| Static musl hello to first carrier call | 19,078 → 127 | 33,743 → 44,659 | 66,571 → 88,109 |
+
+With the TLB opt-out, the EL1 trampoline took 5,547 walks and reached the
+same HVC. The rates measure the soft dispatcher in QEMU. Native ARM timing,
+the production carrier lifecycle, and the Python wall budget remain open.
