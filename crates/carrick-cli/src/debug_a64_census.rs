@@ -7,7 +7,7 @@ use carrick_softcpu_aarch64::{
     state::ProgramCounter,
     translate::{ExitReason, GuestInstruction, InstructionClass},
 };
-use goblin::elf::{Elf, header, program_header, section_header, sym};
+use goblin::elf::{Elf, header, section_header, sym};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -182,17 +182,7 @@ impl Census {
                 if symbol.st_shndx != index {
                     continue;
                 }
-                let Some(name) = elf.strtab.get_at(symbol.st_name) else {
-                    continue;
-                };
-                let kind = if name == "$x" || name.starts_with("$x.") {
-                    Some(true)
-                } else if name == "$d" || name.starts_with("$d.") {
-                    Some(false)
-                } else {
-                    None
-                };
-                if let Some(code) = kind {
+                if let Some(code) = elf.strtab.get_at(symbol.st_name).and_then(mapping_kind) {
                     ensure!(
                         (start..end).contains(&symbol.st_value),
                         "mapping symbol outside section"
@@ -316,9 +306,179 @@ pub(crate) fn run(input: Option<&Path>, strict: bool, output: Option<&Path>) -> 
     Ok(())
 }
 
-/// Rootfs mode measures stripped binaries too. Executable segments can
-/// contain padding, ELF headers and literal data, so the raw word population
-/// is an upper bound on static instruction gaps.
+// Rootfs mode uses mapping symbols when available and sized functions and
+// .eh_frame FDEs elsewhere. Without mapping symbols, the enclosing function
+// range cannot distinguish inline code from embedded data.
+#[derive(Default)]
+struct El0Spans {
+    mapped_bytes: u64,
+    function_bytes: u64,
+    unmapped_bytes: u64,
+    data_bytes: u64,
+}
+
+impl El0Spans {
+    fn walk(
+        bytes: &[u8],
+        elf: &Elf<'_>,
+        mut visit: impl FnMut(u64, &[u8]) -> Result<()>,
+    ) -> Result<Self> {
+        let fde_ranges = unwind_ranges(bytes, elf)?;
+        let mut coverage = Self::default();
+        for (index, section) in elf.section_headers.iter().enumerate() {
+            if section.sh_flags & u64::from(section_header::SHF_EXECINSTR) == 0
+                || section.sh_type != section_header::SHT_PROGBITS
+                || section.sh_size == 0
+            {
+                continue;
+            }
+            let start = section.sh_addr;
+            let end = start
+                .checked_add(section.sh_size)
+                .context("section overflow")?;
+            let file_start = usize::try_from(section.sh_offset)?;
+            let file_end = usize::try_from(
+                section
+                    .sh_offset
+                    .checked_add(section.sh_size)
+                    .context("section offset overflow")?,
+            )?;
+            let data = bytes
+                .get(file_start..file_end)
+                .context("truncated executable section")?;
+            let mut mappings = BTreeMap::new();
+            let mut functions = Vec::new();
+            for (symbols, strings) in [(&elf.syms, &elf.strtab), (&elf.dynsyms, &elf.dynstrtab)] {
+                for symbol in symbols.iter().filter(|symbol| symbol.st_shndx == index) {
+                    if let Some(kind) = strings.get_at(symbol.st_name).and_then(mapping_kind) {
+                        ensure!(
+                            (start..=end).contains(&symbol.st_value),
+                            "mapping symbol outside section"
+                        );
+                        if let Some(previous) = mappings.insert(symbol.st_value, kind) {
+                            ensure!(previous == kind, "conflicting mapping symbols");
+                        }
+                    }
+                    if matches!(symbol.st_type(), sym::STT_FUNC | sym::STT_GNU_IFUNC)
+                        && symbol.st_size > 0
+                    {
+                        let lo = symbol.st_value;
+                        let hi = lo
+                            .checked_add(symbol.st_size)
+                            .context("function size overflow")?;
+                        ensure!(
+                            lo >= start && hi <= end,
+                            "function outside executable section"
+                        );
+                        functions.push(lo..hi);
+                    }
+                }
+            }
+
+            let mapping_start = mappings.first_key_value().map_or(end, |(&at, _)| at);
+            functions.extend(
+                fde_ranges
+                    .iter()
+                    .filter(|range| range.start >= start && range.end <= end)
+                    .cloned(),
+            );
+            for range in &mut functions {
+                range.end = range.end.min(mapping_start);
+            }
+
+            let mut instruction_bytes = |lo: u64, hi: u64| -> Result<u64> {
+                // Range metadata can include sub-word data at a code boundary.
+                // Count only complete, naturally aligned instruction words.
+                let padding = lo.wrapping_neg() & 3;
+                let Some(lo) = lo.checked_add(padding) else {
+                    return Ok(0);
+                };
+                let hi = hi & !3;
+                if lo >= hi {
+                    return Ok(0);
+                }
+                visit(
+                    lo,
+                    &data[usize::try_from(lo - start)?..usize::try_from(hi - start)?],
+                )?;
+                Ok(hi - lo)
+            };
+
+            functions.sort_unstable_by_key(|range| range.start);
+            let mut function_bytes = 0;
+            let mut emitted_end = start;
+            for range in functions {
+                if range.end > emitted_end && range.start < range.end {
+                    function_bytes += instruction_bytes(range.start.max(emitted_end), range.end)?;
+                    emitted_end = range.end;
+                }
+            }
+            coverage.function_bytes += function_bytes;
+            coverage.unmapped_bytes += mapping_start - start - function_bytes;
+
+            let mut mapped = mappings.into_iter().peekable();
+            while let Some((lo, code)) = mapped.next() {
+                let hi = mapped.peek().map_or(end, |&(at, _)| at);
+                if code {
+                    let count = instruction_bytes(lo, hi)?;
+                    coverage.mapped_bytes += count;
+                    coverage.unmapped_bytes += hi - lo - count;
+                } else {
+                    coverage.data_bytes += hi - lo;
+                }
+            }
+        }
+        Ok(coverage)
+    }
+}
+
+fn mapping_kind(name: &str) -> Option<bool> {
+    if name == "$x" || name.starts_with("$x.") {
+        Some(true)
+    } else if name == "$d" || name.starts_with("$d.") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn unwind_ranges(bytes: &[u8], elf: &Elf<'_>) -> Result<Vec<std::ops::Range<u64>>> {
+    use gimli::{BaseAddresses, CieOrFde, EhFrame, LittleEndian, UnwindSection};
+    let section = |name| {
+        elf.section_headers
+            .iter()
+            .find(|header| elf.shdr_strtab.get_at(header.sh_name) == Some(name))
+    };
+    let Some(header) = section(".eh_frame") else {
+        return Ok(Vec::new());
+    };
+    let offset = usize::try_from(header.sh_offset)?;
+    let end = offset
+        .checked_add(usize::try_from(header.sh_size)?)
+        .context(".eh_frame overflow")?;
+    let data = bytes.get(offset..end).context("truncated .eh_frame")?;
+    let mut frame = EhFrame::new(data, LittleEndian);
+    frame.set_address_size(8);
+    let mut bases = BaseAddresses::default().set_eh_frame(header.sh_addr);
+    if let Some(text) = section(".text") {
+        bases = bases.set_text(text.sh_addr);
+    }
+    if let Some(got) = section(".got") {
+        bases = bases.set_got(got.sh_addr);
+    }
+    let mut ranges = Vec::new();
+    let mut entries = frame.entries(&bases);
+    while let Some(entry) = entries.next()? {
+        if let CieOrFde::Fde(partial) = entry {
+            let fde = partial.parse(EhFrame::cie_from_offset)?;
+            let start = fde.initial_address();
+            let end = start.checked_add(fde.len()).context("FDE range overflow")?;
+            ranges.push(start..end);
+        }
+    }
+    Ok(ranges)
+}
+
 fn rootfs_census(root: &Path, strict: bool, read: impl Fn(&Path) -> Result<Vec<u8>>) -> Result<()> {
     let mut candidates = Vec::new();
     find_user_binaries(root, &mut candidates)?;
@@ -334,40 +494,42 @@ fn rootfs_census(root: &Path, strict: bool, read: impl Fn(&Path) -> Result<Vec<u
         if elf.header.e_machine != header::EM_AARCH64 || !elf.is_64 || !elf.little_endian {
             continue;
         }
-        let mut words = 0;
         let mut gaps = BTreeMap::<_, u64>::new();
-        for segment in &elf.program_headers {
-            if segment.p_type != program_header::PT_LOAD || !segment.is_executable() {
-                continue;
-            }
-            let start = usize::try_from(segment.p_offset)?;
-            let size = usize::try_from(segment.p_filesz)?;
-            let end = start
-                .checked_add(size)
-                .context("executable segment overflow")?;
-            let data = bytes
-                .get(start..end)
-                .context("truncated executable segment")?;
-            let prefix = segment.p_vaddr.wrapping_neg() as usize & 3;
-            for raw in data.get(prefix..).unwrap_or_default().chunks_exact(4) {
+        let mut withheld = BTreeMap::<_, u64>::new();
+        let coverage = El0Spans::walk(&bytes, &elf, |address, code| {
+            for (index, raw) in code.chunks_exact(4).enumerate() {
                 let word = u32::from_le_bytes(raw.try_into()?);
-                words += 1;
-                if GuestInstruction::decode_el0(ProgramCounter(0), word).class()
+                let pc = ProgramCounter(address + index as u64 * 4);
+                if GuestInstruction::decode_el0(pc, word).class()
                     == InstructionClass::Exit(ExitReason::Undefined)
                 {
-                    *gaps.entry(el0_gap_class(word)).or_default() += 1;
+                    if let Some(extension) = withheld_encoding_space(word) {
+                        *withheld.entry(extension).or_default() += 1;
+                    } else {
+                        *gaps.entry(el0_gap_class(word)).or_default() += 1;
+                    }
                 }
             }
-        }
-        ensure!(words != 0, "no executable words in {}", path.display());
+            Ok(())
+        })
+        .with_context(|| format!("instruction ranges in {}", path.display()))?;
+        let words = (coverage.mapped_bytes + coverage.function_bytes) / 4;
+        ensure!(words != 0, "no instruction ranges in {}", path.display());
         let unclassified: u64 = gaps.values().sum();
         total_gaps += unclassified;
         files.push(json!({
             "path": path.strip_prefix(root)?,
             "sha256": sha(&bytes),
             "executable_words": words,
+            "coverage": {
+                "mapping_symbol_words": coverage.mapped_bytes / 4,
+                "function_range_words": coverage.function_bytes / 4,
+                "mapped_data_bytes": coverage.data_bytes,
+                "uncovered_executable_section_bytes": coverage.unmapped_bytes,
+            },
             "unclassified_words": unclassified,
             "unclassified_by_class": gaps,
+            "withheld_by_profile": withheld,
         }));
     }
     ensure!(
@@ -378,9 +540,10 @@ fn rootfs_census(root: &Path, strict: bool, read: impl Fn(&Path) -> Result<Vec<u
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "schema": "carrick.a64-rootfs-census.v1",
-            "scope": "file-backed executable PT_LOAD words, including possible data; static decode only",
+            "schema": "carrick.a64-rootfs-census.v2",
+            "scope": "AArch64 mapping symbols and sized function/FDE ranges in executable sections. Function/FDE ranges may contain inline data when mapping symbols are stripped. Uncovered bytes are omitted; no reachability is inferred.",
             "unclassified_words": total_gaps,
+            "withheld_scope": "Rejected words in encoding spaces reserved for extensions withheld by the guest profile",
             "files": files,
         }))?
     );
@@ -413,6 +576,55 @@ fn user_binary_name(name: &str) -> bool {
         || name.strip_prefix("python3.").is_some_and(|minor| {
             !minor.is_empty() && minor.bytes().all(|digit| digit.is_ascii_digit())
         })
+}
+
+// Diagnostic labels for extension encoding spaces from the Arm A64 index.
+// Called only after the baseline decoder rejects the word. These masks do
+// not establish that every encoding in the extension space is allocated.
+fn withheld_encoding_space(word: u32) -> Option<&'static str> {
+    if word & 0x9e00_0000 == 0x8000_0000 || (word & 0xffff_f8ff == 0xd503_407f && word & 0x600 != 0)
+    {
+        return Some("sme");
+    }
+    if word & 0x1e00_0000 == 0x0400_0000 {
+        return Some("sve_sme");
+    }
+
+    // Atomic memory operations (LDADD through SWP) and compare-and-swap.
+    let cas = word & 0x3fa0_7c00 == 0x08a0_7c00;
+    let casp = word & 0xbfa0_7c00 == 0x0820_7c00;
+    let atomic_rmw = word & 0x3f20_0c00 == 0x3820_0000 && (word >> 12) & 15 <= 8;
+    if cas || casp || atomic_rmw {
+        return Some("lse");
+    }
+
+    // CPY* and SET*: load/store memory copy and set.
+    if word & 0xfb20_0c00 == 0x1900_0400 {
+        return Some("mops");
+    }
+
+    // Load/store allocation tags, IRG/GMI, and DC GVA/GZVA.
+    if word & 0xff20_0000 == 0xd920_0000
+        || matches!(word & 0xffe0_fc00, 0x9ac0_1000 | 0x9ac0_1400)
+        || matches!(word & 0xffff_ffe0, 0xd50b_7460 | 0xd50b_7480)
+    {
+        return Some("mte");
+    }
+    if matches!(word & 0xffff_ffe0, 0xd50b_7740 | 0xd52b_7720 | 0xd52b_7760) {
+        return Some("gcs");
+    }
+    // AES and SHA1/SHA256 have dedicated Advanced SIMD encoding groups.
+    if matches!(
+        word & 0xff3e_0c00,
+        0x4e28_0800 | 0x5e28_0800
+    ) || word & 0xff20_0c00 == 0x5e00_0000
+        || word & 0xff00_0000 == 0xce00_0000 // SHA3/SHA512/SM3/SM4
+        || word & 0xbfe0_fc00 == 0x0ee0_e000
+    // PMULL/PMULL2 with 64-bit elements
+    {
+        return Some("crypto");
+    }
+    None
 }
 
 fn el0_gap_class(word: u32) -> &'static str {
