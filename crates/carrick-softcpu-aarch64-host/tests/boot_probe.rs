@@ -337,7 +337,7 @@ fn translated_memory_loop_walks_each_page_once() {
     const SOURCE: u64 = PC + PAGE;
     const DEST: u64 = SOURCE + PAGE;
     const VALUE: u64 = 0x1122_3344_5566_7788;
-    let mut walks = Vec::new();
+    let mut work = Vec::new();
     for iterations in [1, 100, 10_000] {
         let mut memory = Pages::default();
         memory.load(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables());
@@ -378,9 +378,13 @@ fn translated_memory_loop_walks_each_page_once() {
         assert_eq!(report.pc, ProgramCounter(PC + 20));
         assert_eq!(read_u64(&mut memory, DEST), VALUE);
         assert_eq!(report.work.retired_instructions, 4 * iterations + 1);
-        walks.push(report.work.stage1_walks);
+        work.push((
+            report.work.stage1_walks,
+            report.work.memory_exits,
+            report.work.dispatches,
+        ));
     }
-    assert_eq!(walks, [3; 3], "one walk per code, load and store page");
+    assert_eq!(work, [(3, 2, 4), (3, 2, 103), (3, 2, 10_003)]);
 }
 
 #[test]
