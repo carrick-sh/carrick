@@ -3077,6 +3077,9 @@ fn x86_native_child_lifecycle_records_six_transitions_and_terminal_fatal_exit() 
             &self,
             mm: carrick_core_abi::ReservationMm,
         ) -> Result<Box<dyn ExecSuccessorSlot + 'a>, NativeProcessError> {
+            if self.quarantine_exec {
+                return Err(NativeProcessError::Quarantined);
+            }
             let index = self
                 .zone
                 .spaces

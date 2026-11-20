@@ -1826,7 +1826,6 @@ fn arm_native_service_exit(
     );
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
-    let mut fork_child_key = None;
     let (result, phase) = super::aarch64_process::with_process_entry(
         carrick_el1_abi::BornInZoneSource { zone, slot },
         task,
@@ -1836,7 +1835,6 @@ fn arm_native_service_exit(
         control,
         &mut service,
         |process| {
-            fork_child_key = process.is_fork_child().then_some(process.task_key());
             begin_native_service(
                 process,
                 frame.x[8],
@@ -1859,19 +1857,8 @@ fn arm_native_service_exit(
     // Keep entry admission separate from dispatch/settlement: these source
     // locations and the exact error survive the existing fatal transport.
     .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
-    let result = native_service_completion(result, phase).unwrap_or_else(|reason| {
-        if let Some(child_key) = fork_child_key {
-            carrick_el1_abi::emit_native_child_lifecycle(
-                carrick_el1_abi::NativeChildLifecycleEvent::Exit {
-                    task: child_key,
-                    reason: carrick_el1_abi::NativeChildTerminalReason::EntryBindingFatal(
-                        reason.fatal_reason(),
-                    ),
-                },
-            );
-        }
-        invalid_completion(reason)
-    });
+    let result = native_service_completion(result, phase)
+        .unwrap_or_else(|reason| invalid_completion(reason));
     Some(match result {
         NativeResume::Left(None) => native_service_idle(zone, slot, &mut sched::HardwareCpu),
         result => native_service_user_return(frame, operation, result, arm_signal_user_return),

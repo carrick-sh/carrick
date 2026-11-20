@@ -4175,7 +4175,14 @@ pub fn signal_ingress_host() -> Option<&'static SharedSignalIngressQueue> {
 pub const NATIVE_CHILD_LIFECYCLE_CAPACITY: usize = 128;
 
 /// Cheap summary of clone/fork flags carried into `NativeProcessEntry::fork_publish`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct NativeChildForkFlags {
     pub exit_signal: u8,
     pub vfork: bool,
@@ -4202,7 +4209,13 @@ impl NativeChildForkFlags {
 }
 
 /// Outcome of a native child `execve` / `execveat` transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum NativeChildExecOutcome {
     Succeeded,
     RefusedErrno(i32),
@@ -4243,7 +4256,13 @@ impl NativeChildExecOutcome {
 
 /// Carrier-level fatal subkind recorded before a carrier abort path terminates
 /// or unwinds a native child execution lane.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u8)]
 pub enum NativeCarrierFatalKind {
     El1Panic = 1,
@@ -4275,7 +4294,13 @@ impl NativeCarrierFatalKind {
 
 /// Terminal reason for a native child exit record, covering normal exits,
 /// terminating signals, in-ring run/invariant fatals, and carrier fatals.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum NativeChildTerminalReason {
     Exited {
         status: carrick_personality_linux::lifecycle::LinuxWaitStatus,
@@ -4334,7 +4359,13 @@ impl NativeChildTerminalReason {
 }
 
 /// Cause of a waiting parent wake (or non-wake when no waiter was enrolled).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u8)]
 pub enum NativeParentWakeReason {
     ChildExit = 1,
@@ -4362,7 +4393,13 @@ impl NativeParentWakeReason {
 }
 
 /// One typed native-child lifecycle event emitted from the neutral owner.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum NativeChildLifecycleEvent {
     ForkCreated {
         parent: carrick_sched_core::process::TaskKey,
@@ -4690,17 +4727,14 @@ static HOST_NATIVE_CHILD_FLUSH: AtomicUsize = AtomicUsize::new(0);
 static LAST_FATAL_EXIT_TASK: AtomicU64 = AtomicU64::new(0);
 
 /// Emit a carrier-side terminal exit record for `task` only if an in-ring
-/// fatal exit has not just been recorded for `task.id`.
+/// fatal exit has not just been recorded for `(task.id, task.serial)`.
 #[cfg(not(target_os = "none"))]
 pub fn emit_carrier_fatal_if_unrecorded(
     task: carrick_sched_core::process::TaskKey,
     reason: NativeChildTerminalReason,
 ) {
     flush_native_child_lifecycle_to_host();
-    let tid = task.id.raw() as u32 as u64;
-    if LAST_FATAL_EXIT_TASK.swap(tid, Ordering::AcqRel) != tid {
-        emit_native_child_lifecycle(NativeChildLifecycleEvent::Exit { task, reason });
-    }
+    emit_native_child_lifecycle(NativeChildLifecycleEvent::Exit { task, reason });
 }
 
 #[cfg(not(target_os = "none"))]
@@ -4758,7 +4792,10 @@ pub fn emit_native_child_lifecycle(event: NativeChildLifecycleEvent) {
                 | NativeChildTerminalReason::CarrierFatal(_)
         )
     {
-        LAST_FATAL_EXIT_TASK.store(task.id.raw() as u32 as u64, Ordering::Release);
+        let key = ((task.serial.raw() as u64) << 32) | (task.id.raw() as u32 as u64);
+        if LAST_FATAL_EXIT_TASK.swap(key, Ordering::AcqRel) == key {
+            return;
+        }
     }
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
