@@ -58,7 +58,7 @@ impl RunControl {
 /// The remaining guest step budget and the requests this launch can service.
 pub struct ChainBudget<'a> {
     pub steps: u64,
-    pub pending: &'a AtomicU8,
+    pub pending: Option<&'a AtomicU8>,
     pub poll_mask: u8,
 }
 
@@ -444,15 +444,7 @@ pub fn run<X: ExecuteBlock>(
     limits: BlockLimits,
     budget: u64,
 ) -> Report<X::Error> {
-    run_controlled(
-        cpu,
-        monitor,
-        memory,
-        executor,
-        limits,
-        budget,
-        &RunControl::default(),
-    )
+    run_inner(cpu, monitor, memory, executor, limits, budget, None)
 }
 
 /// Like [`run`], with asynchronous requests serviced at block boundaries.
@@ -465,6 +457,26 @@ pub fn run_controlled<X: ExecuteBlock>(
     limits: BlockLimits,
     budget: u64,
     control: &RunControl,
+) -> Report<X::Error> {
+    run_inner(
+        cpu,
+        monitor,
+        memory,
+        executor,
+        limits,
+        budget,
+        Some(control),
+    )
+}
+
+fn run_inner<X: ExecuteBlock>(
+    cpu: &mut CpuState,
+    monitor: &mut ExclusiveMonitor,
+    memory: &mut impl GuestMemory,
+    executor: &mut X,
+    limits: BlockLimits,
+    budget: u64,
+    control: Option<&RunControl>,
 ) -> Report<X::Error> {
     let retain_blocks = executor.retain_blocks();
     let retain_stage1 = executor.retain_stage1() && memory.stage1_is_local();
@@ -493,12 +505,14 @@ pub fn run_controlled<X: ExecuteBlock>(
         if blocks >= budget {
             break Stop::Budget;
         }
-        if control.take(RunControl::KICK) {
-            break Stop::Kicked;
-        }
-        if !cpu.pstate.daif.irq_masked() && control.take(RunControl::IRQ) {
-            monitor.clear();
-            take_exception(cpu, Exception::Irq);
+        if let Some(control) = control {
+            if control.take(RunControl::KICK) {
+                break Stop::Kicked;
+            }
+            if !cpu.pstate.daif.irq_masked() && control.take(RunControl::IRQ) {
+                monitor.clear();
+                take_exception(cpu, Exception::Irq);
+            }
         }
         // DDI0487G.a D1.12.4: PC alignment precedes instruction aborts
         // and illegal execution state, so both checks precede block fetch.
@@ -626,7 +640,7 @@ pub fn run_controlled<X: ExecuteBlock>(
                     } else {
                         1
                     },
-                    pending: &control.0,
+                    pending: control.map(|control| &control.0),
                     poll_mask,
                 },
             )

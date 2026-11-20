@@ -96,7 +96,7 @@ impl LinkBank {
     }
 
     fn link(&mut self, pc: u64, entry: usize, resident: &Arc<ResidentBlock<HostCode>>) {
-        let index = ((pc / 4) as usize) & (frame::CHAIN_SLOTS - 1);
+        let index = frame::chain_slot(pc);
         if self.owners[index]
             .as_ref()
             .is_some_and(|owner| Arc::ptr_eq(owner, resident))
@@ -339,7 +339,9 @@ impl HostBlockRunner {
             remaining = budget.steps.saturating_sub(1);
             slots[frame::CHAIN_TABLE as usize / 8] = bank.native.as_ptr() as u64;
             slots[frame::CHAIN_REMAINING as usize / 8] = remaining;
-            slots[frame::CHAIN_PENDING as usize / 8] = core::ptr::from_ref(budget.pending) as u64;
+            slots[frame::CHAIN_PENDING as usize / 8] = budget
+                .pending
+                .map_or(0, |pending| core::ptr::from_ref(pending) as u64);
             slots[frame::CHAIN_POLL_MASK as usize / 8] = u64::from(budget.poll_mask);
         }
         slots[frame::INLINE_READ_VA as usize / 8] = memory.read.map_or(0, |va| va.raw());

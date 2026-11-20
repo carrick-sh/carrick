@@ -352,6 +352,12 @@ pub mod frame {
 
     pub const CHAIN_INDEX_BITS: u32 = 6;
     pub const CHAIN_SLOTS: usize = 1 << CHAIN_INDEX_BITS;
+    // Fold virtual page bits into the index so equal page offsets can coexist.
+    pub const CHAIN_PAGE_XOR_SHIFT: u32 = 10;
+
+    pub const fn chain_slot(pc: u64) -> usize {
+        (((pc ^ (pc >> CHAIN_PAGE_XOR_SHIFT)) >> 2) as usize) & (CHAIN_SLOTS - 1)
+    }
     pub const LINK_PC: u32 = 0;
     pub const LINK_ENTRY: u32 = 8;
     pub const LINK_SHIFT: u32 = 4;
@@ -556,6 +562,9 @@ pub mod encode {
     }
     pub(super) const fn eor(rd: u32, rn: u32, rm: u32) -> u32 {
         0xca00_0000 | (rm << 16) | (rn << 5) | rd
+    }
+    pub(super) const fn eor_lsr(rd: u32, rn: u32, rm: u32, shift: u32) -> u32 {
+        eor(rd, rn, rm) | (1 << 22) | (shift << 10)
     }
     pub(super) const fn add(rd: u32, rn: u32, rm: u32) -> u32 {
         0x8b00_0000 | (rm << 16) | (rn << 5) | rd
@@ -841,7 +850,9 @@ impl Emitter {
     /// checks preserve NZCV. A hit branches over the target's host prologue.
     /// A miss, pending event, or exhausted quantum takes the normal epilogue.
     fn chain_tail(&mut self, instructions: u32) {
-        use encode::*;
+        use encode::{
+            add_imm, add_shift, and, br, cbz, eor, eor_lsr, ldar_b, ldr, str, sub_imm, ubfx,
+        };
         let words = &mut self.words;
         words.extend([
             str(0, SP, frame::CHAIN_TARGET),
@@ -851,18 +862,8 @@ impl Emitter {
         let no_table = words.len();
         words.extend([
             0, // CBZ X2, stop
-            ldr(1, SP, frame::CHAIN_PENDING),
-            ldar_b(1, 1),
-            ldr(2, SP, frame::CHAIN_POLL_MASK),
-            and(1, 1, 2),
-        ]);
-        let pending = words.len();
-        words.extend([0, ldr(1, SP, frame::CHAIN_REMAINING)]);
-        let no_budget = words.len();
-        words.extend([
-            0, // CBZ X1, stop
-            ubfx(1, 0, 2, frame::CHAIN_INDEX_BITS),
-            ldr(2, SP, frame::CHAIN_TABLE),
+            eor_lsr(1, 0, 0, frame::CHAIN_PAGE_XOR_SHIFT),
+            ubfx(1, 1, 2, frame::CHAIN_INDEX_BITS),
             add_shift(2, 2, 1, frame::LINK_SHIFT),
             ldr(1, 2, frame::LINK_PC),
             eor(1, 1, 0),
@@ -870,8 +871,22 @@ impl Emitter {
         let mismatch = words.len();
         words.extend([0, ldr(1, 2, frame::LINK_ENTRY)]);
         let empty = words.len();
+        words.extend([0, ldr(2, SP, frame::CHAIN_REMAINING)]);
+        let no_budget = words.len();
+        words.extend([0, ldr(2, SP, frame::CHAIN_PENDING)]);
+        let no_control = words.len();
         words.extend([
-            0, // CBZ X1, stop
+            0, // CBZ X2, commit
+            ldar_b(2, 2),
+            ldr(0, SP, frame::CHAIN_POLL_MASK),
+            and(2, 2, 0),
+        ]);
+        let pending = words.len();
+        words.extend([0, ldr(0, SP, frame::CHAIN_TARGET)]);
+        let commit = words.len();
+        words[no_control] = cbz(2, false, commit - no_control);
+        words.extend([
+            eor_lsr(0, 0, 0, frame::CHAIN_PAGE_XOR_SHIFT),
             ubfx(0, 0, 2, frame::CHAIN_INDEX_BITS),
             str(0, SP, frame::CHAIN_LAST),
             ldr(2, SP, frame::CHAIN_REMAINING),
@@ -886,10 +901,10 @@ impl Emitter {
         let stop = words.len();
         for (at, register, nonzero) in [
             (no_table, 2, false),
-            (pending, 1, true),
-            (no_budget, 1, false),
             (mismatch, 1, true),
             (empty, 1, false),
+            (no_budget, 2, false),
+            (pending, 2, true),
         ] {
             words[at] = cbz(register, nonzero, stop - at);
         }
