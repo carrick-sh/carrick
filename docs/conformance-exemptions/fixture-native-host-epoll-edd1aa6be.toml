@@ -1,0 +1,16 @@
+schema = "carrick.conformance-exemption.v1"
+base = "a61ca8bedb47ae17d06a3110dc05698cbb2c0a7c"
+head = "edd1aa6be7a6f3b9b9b2b80331cce61b2db7b12d"
+contracts = [
+  "kernel.el1.anonymous-first-touch",
+  "kernel.el1.fault-entry",
+  "kernel.el1.futex-handoff",
+  "kernel.el1.guest-run-queue",
+  "kernel.el1.guest-scheduler",
+  "kernel.el1.metadata-allocation",
+  "kernel.mm.address-space-occupancy",
+]
+paths = [
+  "fixtures/embed-el1-sched/src/main.rs",
+]
+rationale = "The diff only adds a new native-host-epoll subcommand function and one new dispatch arm to the el1-sched fixture binary; it is reached only when the harness passes that subcommand name and a UDP port, and no existing subcommand, shared helper, syscall, scheduler or memory path changes, so no guest-visible behavior or work unit of the listed contracts changes. The live witness for this subcommand is carried by the PR that serves epoll_ctl on host sockets (#2561, test el1_native_child_host_epoll_wakes_parked_waiter), and the fixture-input change itself takes the owner-exception route in docs/ci/signed-gate.md (issue #2612)."
