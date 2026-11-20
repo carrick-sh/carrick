@@ -292,11 +292,9 @@ fn serial_host_native_child_clock_nanosleep_clocks_and_flags_match_linux() {
     );
 }
 
-/// #1862 single lane: x86 MM custody retains no executable yet (#1903), so
-/// a production x86 fork child's `readlinkat(AT_FDCWD, "/proc/self/exe")`
-/// routes to the shared native file family and the CPL0 lane refuses it as
-/// a counted ENOSYS: never forwarded to the host, never answered with the
-/// host's path, and the output buffer untouched (fixture exit 218).
+/// The raw KVM fixture supplies no executable custody. The child's staged
+/// readlinkat must be counted as ENOSYS without forwarding or touching the
+/// output buffer. The CLI integration witness covers the retained executable.
 #[test]
 fn serial_host_native_child_readlink_exe_is_a_counted_refusal() {
     const TEST: &str = "serial_host_native_child_readlink_exe_is_a_counted_refusal";
