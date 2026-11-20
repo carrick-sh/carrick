@@ -1802,8 +1802,9 @@ const GLIBC_LIBC_SHA256: &str = "ce67859ef338d8558a7fd7cff9a1effe5677ff9f7eea906
 /// Engine witness: dynamic glibc hello runs on the soft CPU through the
 /// production EL1 vectors and trap path (`CARRICK_A64_ELF`) against a pinned
 /// `CARRICK_A64_DYN_ROOT` (`scripts/ci/fetch-arm64-cross-libc.sh`).
-/// HVC #2 replies come from a test fixture (GlibcReplies), not from the
-/// production carrick-kernel / carrick-personality-linux dispatch.
+/// HVC #2 replies come from a test fixture (`DynamicRoot` in
+/// `tests/fixtures/dynamic_root.rs`), not from the production
+/// carrick-kernel / carrick-personality-linux dispatch.
 #[test]
 #[ignore = "requires CARRICK_A64_DYN_ROOT and CARRICK_A64_ELF"]
 fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() {
@@ -1831,11 +1832,15 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() 
     assert_eq!(replies.report_ifuncs(&mut memory, &program), 3);
 }
 
-/// Prepare CARRICK_A64_PYTHON_ROOT with scripts/ci/fetch-arm64-python.sh
-/// and use the production CARRICK_A64_ELF.
+/// Engine witness: CPython 3.12.16 runs through the production EL1 vectors and
+/// trap path (`CARRICK_A64_ELF`) with fixture syscall replies against a pinned
+/// `CARRICK_A64_PYTHON_ROOT` (`scripts/ci/fetch-arm64-python.sh`).
+/// 523 of 545 syscalls (`brk`, `mmap`, `mprotect`, files, clocks, `futex`,
+/// signals) are answered by `tests/fixtures/dynamic_root.rs`, not by the
+/// production carrick-kernel / carrick-personality-linux dispatch.
 #[test]
 #[ignore = "requires CARRICK_A64_PYTHON_ROOT and CARRICK_A64_ELF"]
-fn production_el1_image_runs_dynamic_cpython() {
+fn soft_cpu_runs_dynamic_cpython_through_el1_vectors_with_fixture_replies() {
     let root = std::env::var_os("CARRICK_A64_PYTHON_ROOT").expect("set CARRICK_A64_PYTHON_ROOT");
     let root = FixtureRoot::new(root.into());
     read_pinned_fixture(
