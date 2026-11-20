@@ -152,6 +152,11 @@ fn native_child_select_timeval_wakes_on_sibling_pipe_write() {
 }
 
 #[test]
+fn native_child_pselect6_interrupts_parked_wait_and_runs_handler() {
+    native_child_select_wake("-DSELECT_CAUGHT_SIGNAL");
+}
+
+#[test]
 fn native_child_pselect6_times_out_then_reports_eof() {
     let elf = kvm_pool_fixture::assemble_fixture(
         "native_pipe_poll_wake.S",
@@ -169,12 +174,13 @@ fn native_child_pselect6_times_out_then_reports_eof() {
         kvm_pool_fixture::ROOT_AFFINITY_ANY,
         |_| {},
     )
-    .unwrap_or_else(|failure| panic!("timed select: {}", failure.error));
+    .map_err(|failure| failure.error)
+    .expect("timed select run");
     assert_eq!(outcome.run.exit_code, 7, "timed select: {:?}", outcome.run);
 }
 
 fn native_child_select_wake(variant: &str) {
-    use carrick_sched_core::{RecordId, ZONE_RECORDS};
+    use carrick_sched_core::{Claim, RecordId, ZONE_RECORDS};
     use std::time::{Duration, Instant};
 
     let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("select gate peer");
@@ -193,6 +199,7 @@ fn native_child_select_wake(variant: &str) {
     );
     let program =
         carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("pselect6 fixture");
+    let caught_signal = variant == "-DSELECT_CAUGHT_SIGNAL";
     let mut sender = None;
     let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
         &program,
@@ -207,30 +214,48 @@ fn native_child_select_wake(variant: &str) {
                 let tid = u64::from(u32::from_ne_bytes(pid));
                 let deadline = Instant::now() + Duration::from_secs(4);
                 let parked = loop {
-                    let enrolled =
-                        (1..ZONE_RECORDS as u32)
-                            .filter_map(RecordId::from_raw)
-                            .any(|id| {
-                                let record = zone.zone().record(id);
-                                record.identity().tid == tid
-                                    && record.has_adapter_operation()
-                                    && record
-                                        .object_wait_census()
-                                        .is_some_and(|wait| wait.queue != 0)
-                            });
-                    if enrolled || Instant::now() >= deadline {
+                    let enrolled = (1..ZONE_RECORDS as u32)
+                        .filter_map(RecordId::from_raw)
+                        .find(|id| {
+                            let record = zone.zone().record(*id);
+                            record.identity().tid == tid
+                                && matches!(record.claim(), Claim::Parked { .. })
+                                && record.has_adapter_operation()
+                                && record
+                                    .object_wait_census()
+                                    .is_some_and(|wait| wait.queue != 0)
+                        });
+                    if enrolled.is_some() || Instant::now() >= deadline {
                         break enrolled;
                     }
                     std::thread::yield_now();
                 };
                 assert_eq!(peer.send_to(b"w", client).expect("release gate writer"), 1);
-                parked
+                if let Some(id) = parked.filter(|_| caught_signal) {
+                    let (count, sender) = peer.recv_from(&mut pid).expect("signal sent");
+                    assert_eq!((count, sender), (pid.len(), client));
+                    assert_eq!(u64::from(u32::from_ne_bytes(pid)), tid);
+                    let record = zone.zone().record(id);
+                    let deadline = Instant::now() + Duration::from_secs(4);
+                    let stalled = loop {
+                        let claim = record.claim();
+                        if claim == Claim::Free || record.identity().tid != tid {
+                            break None;
+                        }
+                        if Instant::now() >= deadline {
+                            break Some((claim, record.handback(), record.object_wait_census()));
+                        }
+                        std::thread::yield_now();
+                    };
+                    let reply = if stalled.is_none() { b"w" } else { b"e" };
+                    assert_eq!(peer.send_to(reply, client).expect("settle signal gate"), 1);
+                    assert_eq!(stalled, None, "signal left the select reader suspended");
+                }
+                parked.is_some()
             }));
         },
         carrick_kernel::dispatch::SyscallDispatcher::default(),
-    )
-    .expect("pselect6 run");
-    assert_eq!(outcome.run.exit_code, 7, "child select: {:?}", outcome.run);
+    );
     assert!(
         sender
             .expect("gate sender")
@@ -238,4 +263,8 @@ fn native_child_select_wake(variant: &str) {
             .expect("join gate sender"),
         "child pselect6 never enrolled"
     );
+    let outcome = outcome
+        .map_err(|failure| failure.error)
+        .expect("pselect6 run");
+    assert_eq!(outcome.run.exit_code, 7, "child select: {:?}", outcome.run);
 }
