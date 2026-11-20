@@ -1468,9 +1468,7 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
             LINUX_AT_HWCAP, LINUX_AT_HWCAP2, LINUX_AT_PAGESZ, LINUX_AT_RANDOM,
             LINUX_AT_SYSINFO_EHDR,
         },
-        memory::{
-            LINUX_STACK_SIZE, build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso,
-        },
+        memory::{build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso},
     };
     use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
     use std::process::Command;
