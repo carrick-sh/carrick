@@ -47,6 +47,77 @@ pub enum PublicationTerminal {
     PublishUnsupported,
 }
 
+/// The non-successful mailbox completion presented to the shared publication
+/// policy.  The carrier translates the wire completion into this type, then
+/// only executes the returned action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationCompletion {
+    Declined(Option<PublicationDecline>),
+    SlotNotWorking,
+    StaleRequest,
+    InvalidReady,
+}
+
+/// A broken mailbox invariant.  These are the only publication completions
+/// that are fatal; descriptor refusals remain typed policy outcomes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationInvariant {
+    MissingDecline,
+    SlotNotWorking,
+    StaleRequest,
+    InvalidReady,
+}
+
+/// The one ISA-neutral next action for a refused frame-grant publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationNextAction {
+    Fatal(PublicationInvariant),
+    ParkOnMmRelease { mm_key: u64 },
+    RerunWith(SelectedBackingPlan),
+    ReplanInheritedPrepared,
+    TerminalRefusal(PublicationTerminal),
+}
+
+/// Decide a refused publication without performing carrier work.
+///
+/// Capacity gets at most one strictly smaller attempt because a one-page plan
+/// has no fallback.  Contention retains the MM identity needed by the owned
+/// continuation, and deterministic answers never become instruction reruns.
+pub fn publication_next_action(
+    completion: PublicationCompletion,
+    selected: SelectedBackingPlan,
+    mm_key: u64,
+) -> PublicationNextAction {
+    let decline = match completion {
+        PublicationCompletion::Declined(Some(decline)) => decline,
+        PublicationCompletion::Declined(None) => {
+            return PublicationNextAction::Fatal(PublicationInvariant::MissingDecline);
+        }
+        PublicationCompletion::SlotNotWorking => {
+            return PublicationNextAction::Fatal(PublicationInvariant::SlotNotWorking);
+        }
+        PublicationCompletion::StaleRequest => {
+            return PublicationNextAction::Fatal(PublicationInvariant::StaleRequest);
+        }
+        PublicationCompletion::InvalidReady => {
+            return PublicationNextAction::Fatal(PublicationInvariant::InvalidReady);
+        }
+    };
+    match decline {
+        PublicationDecline::NotNow(PublicationNotNow::Contended) => {
+            PublicationNextAction::ParkOnMmRelease { mm_key }
+        }
+        PublicationDecline::NotNow(PublicationNotNow::Capacity(reason)) => selected
+            .capacity_fallback()
+            .map(PublicationNextAction::RerunWith)
+            .unwrap_or(PublicationNextAction::TerminalRefusal(
+                PublicationTerminal::Descriptor(reason),
+            )),
+        PublicationDecline::InheritedPrepared => PublicationNextAction::ReplanInheritedPrepared,
+        PublicationDecline::Terminal(refusal) => PublicationNextAction::TerminalRefusal(refusal),
+    }
+}
+
 impl PublicationDecline {
     pub fn from_descriptor(
         reason: carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
