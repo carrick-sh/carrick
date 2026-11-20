@@ -146,24 +146,82 @@ pub fn normalize_legacy_attr(
     })
 }
 
+/// Convert an x86_64 `open`/`openat` flags word to the canonical (asm-generic)
+/// layout. The low O_* bits (O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK,
+/// O_CLOEXEC, O_TMPFILE, ...) are identical across the two ABIs and pass
+/// through; only four high bits differ and form two swapped pairs:
+///   x86 O_DIRECT(0x4000)    <-> asm-generic O_DIRECT(0x10000)
+///   x86 O_DIRECTORY(0x10000)<-> asm-generic O_DIRECTORY(0x4000)
+///   x86 O_LARGEFILE(0x8000) <-> asm-generic O_LARGEFILE(0x20000)
+///   x86 O_NOFOLLOW(0x20000) <-> asm-generic O_NOFOLLOW(0x8000)
+/// Without this, an x86 guest's O_DIRECTORY is misread as O_DIRECT (open of a
+/// file then never ENOTDIRs) and O_NOFOLLOW as O_LARGEFILE (symlink follow/
+/// create misbehaves). Derived from the libc per-arch constants + oracle strace.
+pub fn translate_x86_open_flags(flags: u64) -> u64 {
+    const X86_O_DIRECT: u64 = 0x4000;
+    const X86_O_LARGEFILE: u64 = 0x8000;
+    const X86_O_DIRECTORY: u64 = 0x10000;
+    const X86_O_NOFOLLOW: u64 = 0x20000;
+    const CANON_O_DIRECTORY: u64 = 0x4000;
+    const CANON_O_NOFOLLOW: u64 = 0x8000;
+    const CANON_O_DIRECT: u64 = 0x10000;
+    const CANON_O_LARGEFILE: u64 = 0x20000;
+    let mut out = flags & !(X86_O_DIRECT | X86_O_LARGEFILE | X86_O_DIRECTORY | X86_O_NOFOLLOW);
+    if flags & X86_O_DIRECT != 0 {
+        out |= CANON_O_DIRECT;
+    }
+    if flags & X86_O_DIRECTORY != 0 {
+        out |= CANON_O_DIRECTORY;
+    }
+    if flags & X86_O_LARGEFILE != 0 {
+        out |= CANON_O_LARGEFILE;
+    }
+    if flags & X86_O_NOFOLLOW != 0 {
+        out |= CANON_O_NOFOLLOW;
+    }
+    out
+}
+
 /// Lower legacy x86 operands to the existing canonical syscall owners.
 pub fn normalize_legacy(
     native: crate::NativeNr,
     args: [u64; 6],
 ) -> Option<(crate::CanonicalNr, [u64; 6])> {
-    use crate::{CanonicalNr, LINUX_AT_FDCWD, LINUX_AT_REMOVEDIR};
+    use crate::{
+        CARRICK_PRIVATE_X86_NEWFSTATAT, CanonicalNr, LINUX_AT_FDCWD, LINUX_AT_REMOVEDIR,
+        LINUX_AT_SYMLINK_NOFOLLOW,
+    };
+
+    const OPENAT: CanonicalNr = CanonicalNr(56);
+    const X86_NEWFSTATAT: CanonicalNr = CanonicalNr(CARRICK_PRIVATE_X86_NEWFSTATAT);
+    const CREAT_OPEN_FLAGS: u64 = 0o1101; // O_CREAT | O_WRONLY | O_TRUNC
 
     let at = LINUX_AT_FDCWD;
     let [first, second, third, ..] = args;
     Some(match native.raw() {
+        2 => (
+            OPENAT,
+            [at, first, translate_x86_open_flags(second), third, 0, 0],
+        ),
+        // The *at owner writes the x86-64 stat layout.
+        4 => (X86_NEWFSTATAT, [at, first, second, 0, 0, 0]),
+        6 => (
+            X86_NEWFSTATAT,
+            [at, first, second, LINUX_AT_SYMLINK_NOFOLLOW, 0, 0],
+        ),
         21 => normalize_access(args),
+        22 => (CanonicalNr(59), [first, 0, 0, 0, 0, 0]), // pipe2
         82 => (CanonicalNr(38), [at, first, at, second, 0, 0]), // renameat
-        83 => (CanonicalNr(34), [at, first, second, 0, 0, 0]),  // mkdirat
+        83 => (CanonicalNr(34), [at, first, second, 0, 0, 0]), // mkdirat
         84 => (CanonicalNr(35), [at, first, LINUX_AT_REMOVEDIR, 0, 0, 0]), // unlinkat
+        85 => (OPENAT, [at, first, CREAT_OPEN_FLAGS, second, 0, 0]),
         86 => (CanonicalNr(37), [at, first, at, second, 0, 0]), // linkat without following symlinks
         87 => (CanonicalNr(35), [at, first, 0, 0, 0, 0]),       // unlinkat
         88 => (CanonicalNr(36), [first, at, second, 0, 0, 0]),  // symlinkat
         89 => (CanonicalNr(78), [at, first, second, third, 0, 0]), // readlinkat
+        111 => (crate::nr::GETPGID, [0; 6]),                    // getpgid(0)
+        133 => (CanonicalNr(33), [at, first, second, third, 0, 0]), // mknodat
+        284 => (CanonicalNr(19), [first, 0, 0, 0, 0, 0]),       // eventfd2
         _ => return normalize_legacy_attr(native.raw(), args),
     })
 }
@@ -187,19 +245,14 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(0, "read", 63),
     // x86_64=1 (syscalls(2)/filippo) → canonical write=64
     direct(1, "write", 64),
-    // x86_64=2 open: LEGACY x86_64-only (asm-generic has openat=56 only). Arg
-    // shape differs (open(path,flags,mode) vs openat(dfd,path,flags,mode)) →
-    // LEFT OUT, needs a normalize shim. (see deferred block below)
+    // x86_64=2 open: lowered to openat by normalize_legacy.
     // x86_64=3 (syscalls(2)/filippo) → canonical close=57
     direct(3, "close", 57),
-    // x86_64=4 stat: LEGACY (asm-generic has newfstatat=79) with x86_64's
-    // 144-byte struct stat layout. Normalized in x8664_arch::normalize_syscall
-    // to a private dispatcher shim that writes LinuxX8664Stat.
+    // x86_64=4 stat: lowered to x86 newfstatat by normalize_legacy.
     // x86_64=5 fstat: LEGACY. Normalized in x8664_arch::normalize_syscall to a
     // private dispatcher shim that writes LinuxX8664Stat.
     private(5, "fstat", crate::CARRICK_PRIVATE_X86_FSTAT),
-    // x86_64=6 lstat: LEGACY. Normalized in x8664_arch::normalize_syscall to a
-    // private dispatcher shim that writes LinuxX8664Stat with AT_SYMLINK_NOFOLLOW.
+    // x86_64=6 lstat: lowered to x86 newfstatat with AT_SYMLINK_NOFOLLOW.
     // x86_64=7 (syscalls(2)/filippo) → canonical ppoll=73.
     // musl calls poll(fds, n, 0) at startup to probe fd validity (non-blocking).
     // NOTE: poll(fds,n,timeout_ms) vs ppoll(fds,n,*timespec,*sigmask,size) is a
@@ -237,8 +290,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(20, "writev", 66),
     // x86_64=21 access: LEGACY (asm-generic has faccessat=48). Normalized in
     // normalize_access by both ring entry and x8664_arch::normalize_syscall.
-    // x86_64=22 pipe: LEGACY (asm-generic has pipe2=59). Handled in
-    // x8664_arch::normalize_syscall as pipe2(fd, flags=0).
+    // x86_64=22 pipe: lowered to pipe2 by normalize_legacy.
     // x86_64=23 select: LEGACY (asm-generic has pselect6=72). DIFFERENT shape →
     // LEFT OUT. (see deferred block)
     // x86_64=24 sched_yield → canonical sched_yield=124 (SAME name+shape)
@@ -369,7 +421,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=77 ftruncate → canonical ftruncate=46 (SAME name+shape)
     direct(77, "ftruncate", 46),
     // x86_64=78 getdents: LEGACY (asm-generic has getdents64=61). Old getdents
-    // returns the 32-bit linux_dirent layout, getdents64 the 64-bit one →
+    // uses the linux_dirent layout with d_type at the end of the record →
     // DIFFERENT struct → LEFT OUT. (see deferred block)
     // x86_64=79 getcwd → canonical getcwd=17 (SAME name+shape)
     direct(79, "getcwd", 17),
@@ -378,7 +430,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=81 fchdir → canonical fchdir=50 (SAME name+shape)
     direct(81, "fchdir", 50),
     // x86_64=82..84 and 86..89: lowered to *at forms by normalize_legacy.
-    // x86_64=85 creat: normalized to openat by the host path.
+    // x86_64=85 creat: lowered to openat by normalize_legacy.
     // x86_64=90 chmod: LEGACY (asm-generic has fchmodat=53). Normalized in
     // normalize_legacy_attr by both ring entry and x8664_arch::normalize_syscall.
     // x86_64=91 fchmod → canonical fchmod=52 (SAME name+shape)
@@ -421,9 +473,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(109, "setpgid", 154),
     // x86_64=110 getppid → canonical getppid=173 (SAME name+shape)
     direct(110, "getppid", 173),
-    // x86_64=111 getpgrp: LEGACY x86_64-only, NO asm-generic equivalent
-    // (asm-generic uses getpgid(0)). SHIMMED in x8664_arch::normalize_syscall →
-    // getpgid(0); glibc emits the raw getpgrp syscall, so it can't be LEFT OUT.
+    // x86_64=111 getpgrp: lowered to getpgid(0) by normalize_legacy.
     // x86_64=112 setsid → canonical setsid=157 (SAME name+shape)
     direct(112, "setsid", 157),
     // x86_64=113 setreuid → canonical setreuid=145 (SAME name+shape)
@@ -467,7 +517,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(131, "sigaltstack", 132),
     // x86_64=132 utime: LEGACY x86_64-only (asm-generic has utimensat=88).
     // utime(path, *utimbuf) vs utimensat(dfd,path,*timespec[2],flags) → LEFT OUT.
-    // x86_64=133 mknod: LEGACY (asm-generic has mknodat=33) → LEFT OUT.
+    // x86_64=133 mknod: lowered to mknodat by normalize_legacy.
     // x86_64=134 uselib: obsolete x86_64-only, NO asm-generic equivalent → Unknown.
     // x86_64=135 personality → canonical personality=92 (SAME name+shape)
     direct(135, "personality", 92),
@@ -756,8 +806,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // signalfd(fd,*mask,sizemask) vs signalfd4(fd,*mask,sizemask,flags) → LEFT OUT.
     // x86_64=283 timerfd_create → canonical timerfd_create=85 (SAME name+shape)
     direct(283, "timerfd_create", 85),
-    // x86_64=284 eventfd: LEGACY (asm-generic has eventfd2=19).
-    // eventfd(count) vs eventfd2(count,flags) → DIFFERENT arity → LEFT OUT.
+    // x86_64=284 eventfd: lowered to eventfd2 by normalize_legacy.
     // x86_64=285 fallocate → canonical fallocate=47 (SAME name+shape)
     direct(285, "fallocate", 47),
     // x86_64=286 timerfd_settime → canonical timerfd_settime=86 (SAME name+shape)
@@ -929,29 +978,24 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // per-syscall arg-translation shim in x8664_arch::normalize_syscall (deferred,
     // oracle-gated). All numbers from syscalls(2)/filippo/OSDev.
     //
-    //   2   open        → openat(56):     prepend AT_FDCWD; (path,flags,mode)→(dfd,path,flags,mode)
     //   23  select      → pselect6(72):   timeval→timespec; no sigmask arg
     //   33  dup2        → dup3(24):       dup2(fd,fd)=success no-op vs dup3 EINVAL; no flags arg
-    //   78  getdents    → getdents64(61): 32-bit linux_dirent vs 64-bit linux_dirent64
-    //   85  creat       → openat(56):     flags=O_CREAT|O_WRONLY|O_TRUNC; prepend AT_FDCWD
+    //   78  getdents    → getdents64(61): linux_dirent vs linux_dirent64 record layout
     //   132 utime       → utimensat(88):  utimbuf→timespec[2]; prepend AT_FDCWD
-    //   133 mknod       → mknodat(33):    prepend AT_FDCWD
     //   201 time        → (no successor):  asm-generic libc uses clock_gettime/gettimeofday
     //   213 epoll_create→ epoll_create1(20): size arg dropped; flags=0
     //   235 utimes      → utimensat(88):  timeval[2]→timespec[2]; prepend AT_FDCWD
     //   253 inotify_init→ inotify_init1(26): append flags=0
     //   261 futimesat   → utimensat(88):  timeval[2]→timespec[2]
     //   282 signalfd    → signalfd4(74):  append flags=0
-    //   284 eventfd     → eventfd2(19):   append flags=0
     //   7   poll        → ppoll(73):      timeout_ms→*timespec; (the Direct above is
     //                                     a bring-up convenience, NOT a faithful shim)
     //
     // Now shimmed in normalize_syscall (above): 34 pause → ppoll(NULL,0,NULL);
-    // 37 alarm → private alarm shim; 111 getpgrp → getpgid(0); 232 epoll_wait →
+    // 37 alarm → private alarm shim; 232 epoll_wait →
     // epoll_pwait(…, NULL, 0); 213 epoll_create → epoll_create1(0); 253
-    // inotify_init → inotify_init1(0); 282 signalfd → signalfd4(…, 0); 284
-    // eventfd → eventfd2(…, 0). (Each was an ENOSYS that TBROK'd a whole test
-    // family at setup.) normalize_legacy_attr (ring entry and normalize_syscall):
+    // inotify_init → inotify_init1(0); 282 signalfd → signalfd4(…, 0).
+    // normalize_legacy_attr (ring entry and normalize_syscall):
     // 90 chmod → fchmodat(AT_FDCWD, …); 92 chown → fchownat(AT_FDCWD, …, 0); 94
     // lchown → fchownat(AT_FDCWD, …, AT_SYMLINK_NOFOLLOW).
     // Also LEFT OUT (no asm-generic equivalent AT ALL → honest -ENOSYS, NOT a

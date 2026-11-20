@@ -22,6 +22,7 @@
 use crate::guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallRemap, SyscallTable};
 use crate::trap::RawSyscall;
 use crate::{RegAccess, TrapError};
+use carrick_abi::syscall_x86_64::translate_x86_open_flags;
 use carrick_abi::{CanonicalNr, NativeNr};
 use carrick_guest_mem::{CurrentMmMemory, X8664SyscallFrame};
 
@@ -850,22 +851,12 @@ const X86_NR_ALARM: u64 = 37;
 /// x86-64 `time(2)` (syscalls(2)). Desugars to a private dispatcher shim
 /// because asm-generic has no canonical `time(time_t *)` syscall.
 const X86_NR_TIME: u64 = 201;
-/// x86-64 `stat(2)` (syscalls(2)). It follows paths like
-/// `newfstatat(AT_FDCWD, path, flags=0)` but writes x86_64's legacy stat
-/// layout, so it normalizes to a private dispatcher shim.
-const X86_NR_STAT: u64 = 4;
 /// x86-64 `fstat(2)` (syscalls(2)). It shares fd lookup semantics with
 /// canonical `fstat` but writes x86_64's legacy stat layout.
 const X86_NR_FSTAT: u64 = 5;
-/// x86-64 `lstat(2)` (syscalls(2)). It is `stat` with
-/// `AT_SYMLINK_NOFOLLOW`, but writes x86_64's legacy stat layout.
-const X86_NR_LSTAT: u64 = 6;
 /// x86-64 `newfstatat(2)` (syscalls(2)). Its args match canonical
 /// `newfstatat`, but it writes x86_64's legacy stat layout.
 const X86_NR_NEWFSTATAT: u64 = 262;
-/// x86-64 `pipe(2)` (syscalls(2)). Desugars to canonical `pipe2(2)` with
-/// flags=0 because asm-generic only exposes `pipe2`.
-const X86_NR_PIPE: u64 = 22;
 /// x86-64 `pipe2(2)` (syscalls(2)). SAME name+shape as canonical pipe2, but the
 /// `flags` word carries O_DIRECT at the x86 bit (0x4000) — translate it like
 /// open's flags, else the handler's allowed-flag mask EINVALs the request.
@@ -903,77 +894,12 @@ const CANONICAL_INOTIFY_INIT1: u64 = 26;
 const X86_NR_SIGNALFD: u64 = 282;
 /// Canonical (asm-generic / aarch64) `signalfd4` number.
 const CANONICAL_SIGNALFD4: u64 = 74;
-/// x86-64 `eventfd(2)` (284). LEGACY — asm-generic has only `eventfd2`.
-/// `eventfd(initval)` → `eventfd2(initval, flags=0)`.
-const X86_NR_EVENTFD: u64 = 284;
-/// Canonical (asm-generic / aarch64) `eventfd2` number.
-const CANONICAL_EVENTFD2: u64 = 19;
-/// x86-64 `getpgrp(2)` (syscalls(2)). LEGACY x86_64-only — asm-generic has NO
-/// `getpgrp`, only `getpgid(2)` (POSIX defines `getpgrp()` == `getpgid(0)`).
-/// glibc emits the raw `getpgrp` syscall, whereas musl implements `getpgrp()` as
-/// `getpgid(0)`; without this shim every glibc `getpgrp()` ENOSYS'd and returned
-/// -1, so the guest read a bogus process-group id (probes proclife/killtarget/
-/// setpgidparentgroup: `getpgrp()<=0` → setpgid/kill(-pgid) then failed).
-/// Desugars to `getpgid(0)`.
-const X86_NR_GETPGRP: u64 = 111;
-/// Canonical (asm-generic / aarch64) `getpgid` number — the target for x86
-/// `getpgrp` (getpgid(0)).
-const CANONICAL_GETPGID: u64 = 155;
-/// x86-64 `open(2)` (syscalls(2)). asm-generic only exposes `openat`; canonical
-/// 2 is `io_submit`, so a table fallthrough would mis-dispatch. Desugars to
-/// `openat(AT_FDCWD, path, flags, mode)`.
-const X86_NR_OPEN: u64 = 2;
-/// x86-64 `creat(2)` (syscalls(2)). No asm-generic creat; lowers to
-/// `openat(AT_FDCWD, path, O_CREAT|O_WRONLY|O_TRUNC, mode)`. Canonical 85 is
-/// `timerfd_create`, so it MUST be handled pre-table.
-const X86_NR_CREAT: u64 = 85;
-/// Canonical (asm-generic / aarch64) `openat` number (shared by open + creat).
-const CANONICAL_OPENAT: u64 = 56;
 /// x86-64 `openat(2)` (syscalls(2)). Canonical openat IS 56 (same name+shape),
 /// but x86_64 and asm-generic disagree on four high O_* flag bits, so openat's
 /// flags word must be translated (NOT a bare table Direct).
 const X86_NR_OPENAT: u64 = 257;
+const CANONICAL_OPENAT: u64 = 56;
 
-/// Convert an x86_64 `open`/`openat` flags word to the canonical (asm-generic)
-/// layout. The low O_* bits (O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK,
-/// O_CLOEXEC, O_TMPFILE, ...) are identical across the two ABIs and pass
-/// through; only four high bits differ and form two swapped pairs:
-///   x86 O_DIRECT(0x4000)    <-> asm-generic O_DIRECT(0x10000)
-///   x86 O_DIRECTORY(0x10000)<-> asm-generic O_DIRECTORY(0x4000)
-///   x86 O_LARGEFILE(0x8000) <-> asm-generic O_LARGEFILE(0x20000)
-///   x86 O_NOFOLLOW(0x20000) <-> asm-generic O_NOFOLLOW(0x8000)
-/// Without this, an x86 guest's O_DIRECTORY is misread as O_DIRECT (open of a
-/// file then never ENOTDIRs) and O_NOFOLLOW as O_LARGEFILE (symlink follow/
-/// create misbehaves). Derived from the libc per-arch constants + oracle strace.
-fn translate_x86_open_flags(flags: u64) -> u64 {
-    const X86_O_DIRECT: u64 = 0x4000;
-    const X86_O_LARGEFILE: u64 = 0x8000;
-    const X86_O_DIRECTORY: u64 = 0x10000;
-    const X86_O_NOFOLLOW: u64 = 0x20000;
-    const CANON_O_DIRECTORY: u64 = 0x4000;
-    const CANON_O_NOFOLLOW: u64 = 0x8000;
-    const CANON_O_DIRECT: u64 = 0x10000;
-    const CANON_O_LARGEFILE: u64 = 0x20000;
-    let mut out = flags & !(X86_O_DIRECT | X86_O_LARGEFILE | X86_O_DIRECTORY | X86_O_NOFOLLOW);
-    if flags & X86_O_DIRECT != 0 {
-        out |= CANON_O_DIRECT;
-    }
-    if flags & X86_O_DIRECTORY != 0 {
-        out |= CANON_O_DIRECTORY;
-    }
-    if flags & X86_O_LARGEFILE != 0 {
-        out |= CANON_O_LARGEFILE;
-    }
-    if flags & X86_O_NOFOLLOW != 0 {
-        out |= CANON_O_NOFOLLOW;
-    }
-    out
-}
-/// x86-64 `mknod(2)` (syscalls(2)). Desugars to
-/// `mknodat(AT_FDCWD, path, mode, dev)` — NO flags arg.
-const X86_NR_MKNOD: u64 = 133;
-/// Canonical (asm-generic / aarch64) `mknodat` number.
-const CANONICAL_MKNODAT: u64 = 33;
 /// `SIGCHLD` exit-signal (signal(7)); the low byte of the clone flags word.
 const LINUX_SIGCHLD: u64 = 17;
 /// `CLONE_VM` (clone(2)).
@@ -1120,28 +1046,6 @@ impl X8664GuestArch {
                 args: [args[0], args[1], args[2], 0, 0, 0],
             });
         }
-        if x86_number == X86_NR_EVENTFD {
-            // eventfd(initval) → eventfd2(initval, flags=0).
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_EVENTFD2),
-                args: [args[0], 0, 0, 0, 0, 0],
-            });
-        }
-        if x86_number == X86_NR_GETPGRP {
-            // getpgrp() == getpgid(0) (POSIX). asm-generic has no getpgrp; route
-            // it to canonical getpgid with pid=0 so the guest reads its own
-            // process-group id instead of ENOSYS (-1).
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_GETPGID),
-                args: [0, 0, 0, 0, 0, 0],
-            });
-        }
         if x86_number == X86_NR_DUP2 {
             return SyscallNorm::Plain(RawSyscall {
                 current_guest_sp: None,
@@ -1180,30 +1084,12 @@ impl X8664GuestArch {
                 args,
             });
         }
-        if x86_number == X86_NR_STAT {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_STAT),
-                args: [args[0], args[1], 0, 0, 0, 0],
-            });
-        }
         if x86_number == X86_NR_FSTAT {
             return SyscallNorm::Plain(RawSyscall {
                 current_guest_sp: None,
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
                 native_number: NativeNr(x86_number),
                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_FSTAT),
-                args: [args[0], args[1], 0, 0, 0, 0],
-            });
-        }
-        if x86_number == X86_NR_LSTAT {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_LSTAT),
                 args: [args[0], args[1], 0, 0, 0, 0],
             });
         }
@@ -1214,15 +1100,6 @@ impl X8664GuestArch {
                 native_number: NativeNr(x86_number),
                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT),
                 args: [args[0], args[1], args[2], args[3], 0, 0],
-            });
-        }
-        if x86_number == X86_NR_PIPE {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_PIPE2),
-                args: [args[0], 0, 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_PIPE2 {
@@ -1245,28 +1122,6 @@ impl X8664GuestArch {
                 args: [args[0], flags, 0, 0, 0, 0],
             });
         }
-        // ── Legacy x86_64-only fs syscalls → their asm-generic *at canonicals.
-        // These run BEFORE the table-remap fallthrough so their (different)
-        // x86_64 numbers never reach the table (where some collide with unrelated
-        // canonical syscalls: 2=io_submit, 85=timerfd_create, 87=timerfd_gettime).
-        // open/openat/creat → openat(56), translating the x86 O_* flag bits.
-        if x86_number == X86_NR_OPEN {
-            // open(path, flags, mode) → openat(AT_FDCWD, path, flags, mode).
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_OPENAT),
-                args: [
-                    carrick_abi::LINUX_AT_FDCWD,
-                    args[0],
-                    translate_x86_open_flags(args[1]),
-                    args[2],
-                    0,
-                    0,
-                ],
-            });
-        }
         if x86_number == X86_NR_OPENAT {
             // openat(dirfd, path, flags, mode) — same shape as canonical openat,
             // but the x86 flags word needs the O_* bit translation.
@@ -1283,37 +1138,6 @@ impl X8664GuestArch {
                     0,
                     0,
                 ],
-            });
-        }
-        if x86_number == X86_NR_CREAT {
-            // creat(path, mode) == openat(AT_FDCWD, path, O_CREAT|O_WRONLY|O_TRUNC,
-            // mode). The flags word is SYNTHESIZED (creat has no flags arg); mode
-            // (args[1]) lands in the openat MODE slot (a3), not the flags slot.
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_OPENAT),
-                args: [
-                    carrick_abi::LINUX_AT_FDCWD,
-                    args[0],
-                    carrick_abi::LINUX_O_CREAT
-                        | carrick_abi::LINUX_O_WRONLY
-                        | carrick_abi::LINUX_O_TRUNC,
-                    args[1],
-                    0,
-                    0,
-                ],
-            });
-        }
-        // mknod → mknodat(33): NO flags arg (4 args).
-        if x86_number == X86_NR_MKNOD {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_MKNODAT),
-                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
             });
         }
         // NOTE: x86_64 utime(132)/utimes(235) also need normalization (to
@@ -1890,8 +1714,11 @@ mod normalize_tests {
         // selected without weakening canonical newfstatat.
         match X8664GuestArch::normalize_syscall(&frame(4, [0x1000, 0x2000, 0xAA, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_STAT);
-                assert_eq!(rs.args, [0x1000, 0x2000, 0, 0, 0, 0]);
+                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT);
+                assert_eq!(
+                    rs.args,
+                    [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0x2000, 0, 0, 0]
+                );
             }
             _ => panic!("stat must be Plain"),
         }
@@ -1916,8 +1743,18 @@ mod normalize_tests {
         // AT_SYMLINK_NOFOLLOW but writes x86_64's 144-byte struct stat.
         match X8664GuestArch::normalize_syscall(&frame(6, [0x1000, 0x2000, 0xAA, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_LSTAT);
-                assert_eq!(rs.args, [0x1000, 0x2000, 0, 0, 0, 0]);
+                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT);
+                assert_eq!(
+                    rs.args,
+                    [
+                        carrick_abi::LINUX_AT_FDCWD,
+                        0x1000,
+                        0x2000,
+                        carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW,
+                        0,
+                        0
+                    ]
+                );
             }
             _ => panic!("lstat must be Plain"),
         }
