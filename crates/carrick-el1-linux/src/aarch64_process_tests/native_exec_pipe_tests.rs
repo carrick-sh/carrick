@@ -3416,3 +3416,603 @@ fn serial_host_child_of_an_execed_root_execs_through_the_installed_capability() 
     drop(root);
     drop(dispatcher);
 }
+
+#[test]
+fn arm_native_child_lifecycle_records_six_transitions_and_terminal_fatal_exit() {
+    use carrick_core_abi::service::{
+        ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
+        ServiceCell, ServiceFailureCode,
+    };
+    use carrick_el1_abi::{
+        EntryBindingFatalReason, NativeChildExecOutcome, NativeChildTerminalReason,
+        NativeParentWakeReason,
+    };
+    use carrick_kernel::event_ring::{
+        DecodedNativeChildRecord, NATIVE_CHILD_EXEC, NATIVE_CHILD_EXIT, NATIVE_CHILD_FORK,
+        NATIVE_CHILD_REAP, NATIVE_CHILD_WAKE, NATIVE_CHILD_ZOMBIE, decode_native_child_record,
+        drain_recent,
+    };
+
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    let launch_root = dispatcher.capture_one_task_context().unwrap();
+    let installed = carrick_kernel::dispatch::exec_files::native_exec_capability(&launch_root);
+    let task_serial = launch_root.task().key().serial.raw();
+    let root_pid_raw = 88_401u32;
+    let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let fixture = Box::leak(Box::new(Fixture::with_identity(
+        0x10000,
+        asid(1),
+        page,
+        control,
+        ThreadIdentity {
+            tid: u64::from(root_pid_raw),
+            serial: 901,
+            mm: 1,
+            file_table: launch_root.resources().files().id().raw(),
+            generation: task_serial,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: page as *const _ as u64,
+            control_slot: control as *const _ as u64,
+        },
+    )));
+    let counters = carrick_el1_abi::Counters::new();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&pages);
+    crossing.installed_exec_capability = Some(installed);
+    *crossing.root_cwd.lock().unwrap() = b"/".to_vec();
+    let words = fixture.tables.live(&fixture.maintenance);
+    let runtime = Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            parked,
+        )
+        .unwrap(),
+    );
+    let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
+    registry
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let mut fork_service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let parent = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(root_pid_raw as i32)
+            .unwrap(),
+        serial: TaskSerial::from_raw_u64(task_serial).unwrap(),
+    };
+
+    // 1. Fork child 1 through the production service owner.
+    let (child, child_visible_pid) = {
+        let mut entry = runtime
+            .enter(source, &fixture.task, parked, &mut fork_service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("fork must return");
+        };
+        assert!(result.raw() > 0);
+        let pid = result.raw() as u32;
+        (runtime.namespace_child_key(parent, pid).unwrap(), pid)
+    };
+    let child_binding = runtime.task_binding(child).unwrap();
+    let parent_binding = runtime.task_binding(parent).unwrap();
+    // SAFETY: fixture exclusively owns the stopped parent record.
+    unsafe {
+        *fixture.zone.record(parent_binding.record.id).ctx_mut() = parent_binding.words;
+    }
+
+    // Parent parks in blocking wait4(-1) before child 1 execs and exits.
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                parent_binding.address,
+                &parent_binding.words,
+                &mut fork_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::MAX),
+                UserVa::new(0),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0),
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+
+    // 2. Child 1 runs execve and commits successor adoption.
+    activate_target(source, &fixture.task, &child_binding);
+    let mut service = Physical {
+        zone: fixture.zone,
+        page: fixture.page,
+        controls: &[],
+        copies: Vec::new(),
+        tid_words: BTreeMap::new(),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        waker_slot: fixture.slot,
+        on_signal_clock: None,
+    };
+    let make_exec_payload = |path: &[u8]| {
+        let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
+        payload.extend_from_slice(path);
+        carrick_core_abi::service::encode_exec_payload_header(
+            &mut payload,
+            carrick_core_abi::service::ExecCall::Execve,
+            path.len(),
+            0,
+            0,
+        )
+        .unwrap();
+        payload.into_boxed_slice()
+    };
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                child_binding.address,
+                &child_binding.words,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_service(
+                make_exec_payload(b"/bin/child1\0"),
+                None,
+                NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), &counters),
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let selector = fixture.task.service_notice.take().unwrap().unwrap();
+    let member = fixture.zone.record(selector.record.id).identity();
+    // SAFETY: production fork's live record retains its control slot.
+    let child_control = unsafe { &*(member.control_slot as *const ThreadControlSlot) };
+    // SAFETY: consume exact published service ticket once.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(&child_control.service, selector, NonZeroU64::MIN, member)
+    }
+    .unwrap();
+    let identity = ticket.request().identity;
+    // SAFETY: service owner retains reply record until acknowledgment.
+    let manifest =
+        unsafe { &mut *(ticket.reply_address().unwrap().raw() as *mut ExecSuccessorManifest) };
+    let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(91).unwrap()).unwrap();
+    *manifest = manifest
+        .seal(
+            identity,
+            receipt,
+            ExecSuccessorBacking {
+                root: RootGpa::page_aligned(FrameGpa::new(0xb00000)).unwrap(),
+                asid: asid(103),
+                asid_generation: NonZeroU64::new(105).unwrap(),
+            },
+            ExecSuccessorEntry {
+                entry: UserVa::new(0x400000),
+                stack_pointer: UserVa::new(0x7ffff000),
+            },
+        )
+        .unwrap();
+    assert!(
+        ticket
+            .publish_exec_prepared(receipt, (), |_, ()| {})
+            .is_ok()
+    );
+    let queue = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector.record)
+                .unwrap(),
+            &ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        )
+        .unwrap();
+    let mut effects = WakeEffects::default();
+    queue.notify_object(fixture.slot, &mut effects).unwrap();
+    drop(queue);
+    service.wake_effects(effects);
+
+    let selected = activate_target(source, &fixture.task, &child_binding);
+    assert_eq!(selected.record, child_binding.record.id);
+    // SAFETY: fixture owns selected child's exact record.
+    let saved = unsafe { runtime.record_binding(child_binding.record) }
+        .unwrap()
+        .words;
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                child_binding.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.resume_checkpoint(|_| Ok(None)),
+            Ok(NativeResume::NoPending)
+        ));
+    }
+
+    // 3-5. Child 1 calls exit_group(42) through production ARM dispatch ->
+    // emits EXIT, ZOMBIE, and WAKE(ChildExit, woken=1).
+    if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    let _ = fixture.task.linux.take_served_boundary();
+    let post_exec_binding = runtime.task_binding(child).unwrap();
+    {
+        let mut cpu = crate::sched::FakeCpu::default();
+        // SAFETY: zero is valid empty name-cache state.
+        let names = unsafe {
+            &*std::alloc::alloc_zeroed(
+                std::alloc::Layout::new::<carrick_el1_abi::InotifyNameCache>(),
+            )
+            .cast::<carrick_el1_abi::InotifyNameCache>()
+        };
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
+            elr: 0x400004,
+            slot: u64::from(fixture.slot.raw()),
+            ..Default::default()
+        };
+        frame.x[8] = 94; // ARM64 SYS_exit_group
+        frame.x[0] = 42;
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                post_exec_binding.address,
+                &post_exec_binding.words,
+                &mut service,
+            )
+            .unwrap();
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(fixture),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert!(
+            matches!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::Served
+                    | carrick_personality_linux::dispatch::CompletionRoute::WithWork
+                    | carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            ),
+            "expected child exit_group to complete in ring, got {route:?}"
+        );
+    }
+
+    // 6. Activate woken parent and resume its wait4(-1) -> reaps child 1.
+    if fixture.zone.slot(fixture.slot).current() != Some(parent_binding.record.id) {
+        activate_target(source, &fixture.task, &parent_binding);
+    } else {
+        fixture.task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(parent.id.raw()),
+            carrick_el1_abi::SnapshotGeneration::from_raw(task_serial),
+            launch_root.resources().files().id().raw(),
+        );
+        fixture
+            .task
+            .mm
+            .key
+            .store(parent_binding.address.mm.raw().get(), Ordering::Release);
+        fixture
+            .task
+            .mm
+            .thread_generation
+            .store(901, Ordering::Release);
+        fixture.task.publish_visible_pid(root_pid_raw);
+        fixture.task.publish_lifecycle(
+            fixture.page as *const _ as u64,
+            fixture.control as *const _ as u64,
+        );
+    }
+    // SAFETY: fixture exclusively owns the parent record.
+    let parent_saved = unsafe { runtime.record_binding(parent_binding.record) }
+        .unwrap()
+        .words;
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                parent_binding.address,
+                &parent_saved,
+                &mut fork_service,
+            )
+            .unwrap();
+        let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+        assert!(
+            matches!(resumed, NativeResume::Returned(ret) if ret.raw() == i64::from(child_visible_pid)),
+            "expected wait4 to reap child {child_visible_pid}"
+        );
+    }
+
+    let child1_records: Vec<_> = drain_recent(8192)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|rec| {
+            (NATIVE_CHILD_FORK..=NATIVE_CHILD_REAP).contains(&rec.kind)
+                && (rec.a == parent.id.raw() || rec.a == child.id.raw())
+        })
+        .collect();
+    let kinds: Vec<u8> = child1_records.iter().map(|r| r.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            NATIVE_CHILD_FORK,
+            NATIVE_CHILD_EXEC,
+            NATIVE_CHILD_EXIT,
+            NATIVE_CHILD_ZOMBIE,
+            NATIVE_CHILD_WAKE,
+            NATIVE_CHILD_REAP,
+        ],
+        "expected exact 6 native-child lifecycle kinds in order for fork+exec+exit+wait4"
+    );
+    let decoded: Vec<_> = child1_records
+        .iter()
+        .map(|r| decode_native_child_record(*r).unwrap())
+        .collect();
+    assert!(matches!(
+        decoded[0],
+        DecodedNativeChildRecord::Fork {
+            parent_id,
+            parent_serial_low8,
+            child_id,
+            child_serial_low8,
+            ..
+        } if parent_id == parent.id.raw()
+            && parent_serial_low8 == (parent.serial.raw() as u8)
+            && child_id == child.id.raw()
+            && child_serial_low8 == (child.serial.raw() as u8)
+    ));
+    assert_eq!(
+        decoded[1],
+        DecodedNativeChildRecord::Exec {
+            task_id: child.id.raw(),
+            task_serial_low32: child.serial.raw() as u32,
+            outcome: NativeChildExecOutcome::Succeeded,
+        }
+    );
+    assert_eq!(
+        decoded[2],
+        DecodedNativeChildRecord::Exit {
+            task_id: child.id.raw(),
+            task_serial_low32: child.serial.raw() as u32,
+            reason: Some(NativeChildTerminalReason::Exited {
+                status: LinuxWaitStatus::exited(42),
+            }),
+            raw_packed: NativeChildTerminalReason::Exited {
+                status: LinuxWaitStatus::exited(42),
+            }
+            .pack_i32(),
+        }
+    );
+    assert_eq!(
+        decoded[3],
+        DecodedNativeChildRecord::Zombie {
+            child_id: child.id.raw(),
+            child_serial_low16: child.serial.raw() as u16,
+            parent_id: parent.id.raw(),
+            parent_serial_low16: parent.serial.raw() as u16,
+        }
+    );
+    assert_eq!(
+        decoded[4],
+        DecodedNativeChildRecord::Wake {
+            parent_id: parent.id.raw(),
+            parent_serial_low32: parent.serial.raw() as u32,
+            reason: Some(NativeParentWakeReason::ChildExit),
+            woken: 1,
+        }
+    );
+    assert_eq!(
+        decoded[5],
+        DecodedNativeChildRecord::Reap {
+            caller_id: parent.id.raw(),
+            caller_serial_low8: parent.serial.raw() as u8,
+            child_id: child.id.raw(),
+            child_serial_low8: child.serial.raw() as u8,
+            wstatus: (42u16 << 8),
+        }
+    );
+
+    // 7. Second child: refused exec (ENOENT=2) followed by forced terminal
+    // EntryBindingFatal (NativeServiceQuarantined) before abort.
+    let fatal_child = {
+        let mut entry = runtime
+            .enter(source, &fixture.task, parent_saved, &mut fork_service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("second fork must return");
+        };
+        runtime
+            .namespace_child_key(parent, result.raw() as u32)
+            .unwrap()
+    };
+    let fatal_binding = runtime.task_binding(fatal_child).unwrap();
+    // SAFETY: fixture exclusively owns the stopped parent record.
+    unsafe {
+        *fixture.zone.record(parent_binding.record.id).ctx_mut() = parent_saved;
+    }
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
+    activate_target(source, &fixture.task, &fatal_binding);
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                fatal_binding.address,
+                &fatal_binding.words,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_service(
+                make_exec_payload(b"/no/such/binary\0"),
+                None,
+                NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), &counters),
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let selector2 = fixture.task.service_notice.take().unwrap().unwrap();
+    let member2 = fixture.zone.record(selector2.record.id).identity();
+    // SAFETY: live child control slot.
+    let fatal_control = unsafe { &*(member2.control_slot as *const ThreadControlSlot) };
+    // SAFETY: consume exact published service ticket once.
+    let ticket2 = unsafe {
+        ServiceCell::claim_notice(&fatal_control.service, selector2, NonZeroU64::MIN, member2)
+    }
+    .unwrap();
+    assert!(
+        ticket2
+            .complete_failure(ServiceFailureCode::new(2).unwrap())
+            .is_ok()
+    );
+    let queue2 = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector2.record)
+                .unwrap(),
+            &ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        )
+        .unwrap();
+    let mut effects2 = WakeEffects::default();
+    queue2.notify_object(fixture.slot, &mut effects2).unwrap();
+    drop(queue2);
+    service.wake_effects(effects2);
+    activate_target(source, &fixture.task, &fatal_binding);
+    // SAFETY: fixture owns fatal_child's record.
+    let fatal_saved = unsafe { runtime.record_binding(fatal_binding.record) }
+        .unwrap()
+        .words;
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                fatal_binding.address,
+                &fatal_saved,
+                &mut service,
+            )
+            .unwrap();
+        let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+        assert!(matches!(resumed, NativeResume::Returned(ret) if ret.raw() == -2));
+
+        // Force NativeServiceQuarantined on fatal_child through production service exit:
+        // attempt to settle a Left(None) service exit without a handoff receipt.
+        let settled = entry.settle_service_exit(
+            Ok(NativeResume::Left(None)),
+            crate::native_process_runtime::NativeServiceExit::Bridge,
+        );
+        let invariant =
+            crate::dispatch::native_service_completion(settled, entry.native_service_phase())
+                .err()
+                .expect("unhanded Left(None) must quarantine service exit");
+        assert_eq!(
+            invariant.fatal_reason(),
+            EntryBindingFatalReason::NativeServiceQuarantined
+        );
+    }
+
+    let child2_records: Vec<_> = drain_recent(8192)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|rec| {
+            (NATIVE_CHILD_FORK..=NATIVE_CHILD_REAP).contains(&rec.kind)
+                && (rec.a == fatal_child.id.raw()
+                    || (rec.kind == NATIVE_CHILD_FORK && rec.b == fatal_child.id.raw()))
+        })
+        .map(|r| decode_native_child_record(r).unwrap())
+        .collect();
+    assert_eq!(child2_records.len(), 3, "got {child2_records:?}");
+    assert_eq!(
+        child2_records[1],
+        DecodedNativeChildRecord::Exec {
+            task_id: fatal_child.id.raw(),
+            task_serial_low32: fatal_child.serial.raw() as u32,
+            outcome: NativeChildExecOutcome::RefusedErrno(2),
+        }
+    );
+    assert_eq!(
+        child2_records[2],
+        DecodedNativeChildRecord::Exit {
+            task_id: fatal_child.id.raw(),
+            task_serial_low32: fatal_child.serial.raw() as u32,
+            reason: Some(NativeChildTerminalReason::EntryBindingFatal(
+                EntryBindingFatalReason::NativeServiceQuarantined,
+            )),
+            raw_packed: NativeChildTerminalReason::EntryBindingFatal(
+                EntryBindingFatalReason::NativeServiceQuarantined,
+            )
+            .pack_i32(),
+        }
+    );
+
+    registry.unregister_root_for_test(&runtime);
+    drop(launch_root);
+    drop(dispatcher);
+}

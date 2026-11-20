@@ -2938,3 +2938,1042 @@ fn x86_fioclex_on_a_ring_stream_end_sets_and_clears_cloexec() {
         );
     });
 }
+
+#[test]
+fn x86_native_child_lifecycle_records_six_transitions_and_terminal_fatal_exit() {
+    use carrick_core_abi::service::{
+        ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
+        ServiceCell, ServiceFailureCode,
+    };
+    use carrick_el1_abi::{
+        BornInZoneSource, DelegatedOpenFile, EntryBindingFatalReason, FD_MAP_CAPACITY, FdMapSlot,
+        NativeChildExecOutcome, NativeChildTerminalReason, NativeParentWakeReason,
+        ThreadControlSlot, ThreadLifecyclePage,
+    };
+    use carrick_el1_linux::exec_stage::ExecStageRequest;
+    use carrick_el1_linux::ipc::{IpcVenue, MapTables};
+    use carrick_el1_linux::native_process_runtime::{
+        ExecSuccessorSlot, NativeExecSuccessor, NativeFailure, NativeForkPreparation,
+        NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
+        NativeProcessService, NativeResume, NativeServiceCall,
+    };
+    use carrick_guest_arch::{
+        AddressContext, Asid, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+    };
+    use carrick_hal::birth_serial::test_support::OwnedBirthZone;
+    use carrick_kernel::dispatch::SyscallDispatcher;
+    use carrick_kernel::el1_ipc::HostIpc;
+    use carrick_kernel::event_ring::{
+        DecodedNativeChildRecord, NATIVE_CHILD_EXEC, NATIVE_CHILD_EXIT, NATIVE_CHILD_FORK,
+        NATIVE_CHILD_REAP, NATIVE_CHILD_WAKE, NATIVE_CHILD_ZOMBIE, decode_native_child_record,
+        drain_recent,
+    };
+    use carrick_mmu_core::x86::owner_mmu::X86Mmu;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_personality_linux::lifecycle::LinuxWaitStatus;
+    use carrick_sched_core::{
+        ParkedContextWords, SavedSyscallPc, ShortLockSpin, WakeEffects, X86_XSAVE_BYTES,
+        ZoneTables, object_wait::ObjectWaitKey,
+    };
+    use carrick_test_support::TestEl1Region;
+    use core::num::{NonZeroU16, NonZeroU64};
+    use std::sync::Arc;
+
+    struct X86ExecSlot<'a> {
+        zone: &'a ZoneTables<ParkedContextWords>,
+        index: carrick_sched_core::SpaceIndex,
+        mm: carrick_core_abi::ReservationMm,
+        armed: bool,
+    }
+    impl ExecSuccessorSlot for X86ExecSlot<'_> {
+        fn mm(&self) -> carrick_core_abi::ReservationMm {
+            self.mm
+        }
+        fn root_generation(&self) -> NonZeroU64 {
+            NonZeroU64::MIN
+        }
+        fn prepare_adoption(&self) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+            Ok(unsafe {
+                carrick_core_abi::El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    self.mm,
+                    NonZeroU64::MIN,
+                )
+            })
+        }
+        fn commit(mut self: Box<Self>) {
+            self.armed = false;
+        }
+    }
+    impl Drop for X86ExecSlot<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                self.zone.spaces.free(self.index);
+            }
+        }
+    }
+
+    struct X86LifecycleService<'a> {
+        zone: &'a ZoneTables<ParkedContextWords>,
+        child_pages: [&'a ThreadLifecyclePage; 2],
+        child_controls: [&'a [ThreadControlSlot; 9]; 2],
+        next_child: core::cell::Cell<usize>,
+        task: &'a CurrentTask,
+        owner: Arc<HostIpc>,
+        map: &'a carrick_el1_abi::ipc_tables::IpcTableMap,
+        fd_map: [FdMapSlot; FD_MAP_CAPACITY],
+        opens: [DelegatedOpenFile; 16],
+        next_root_page: u64,
+        quarantine_exec: bool,
+    }
+
+    fn context_words(address: AddressContext<RootGpa>) -> ParkedContextWords {
+        let mut raw = [0u64; 20];
+        // Saved x86 syscall frame encodes SavedSyscallPc::AfterSyscall via non-zero RCX.
+        raw[1] = 0x4002;
+        let mut words = ParkedContextWords::from_parts(raw, address, 0, 0, [0; X86_XSAVE_BYTES]);
+        assert!(matches!(
+            carrick_guest_arch::ProcessContext::saved_syscall_pc(&words),
+            Some(SavedSyscallPc::AtSyscall | SavedSyscallPc::AfterSyscall)
+        ));
+        words.set_syscall_return(0);
+        words
+    }
+
+    impl<'a> NativeProcessService<'a, ParkedContextWords> for X86LifecycleService<'a> {
+        fn vacate_terminal_space(
+            &mut self,
+            _source: BornInZoneSource<'a, ParkedContextWords>,
+        ) -> Result<(), NativeFailure> {
+            Ok(())
+        }
+
+        type Mm = AddressContext<RootGpa>;
+        type PreparedMm = AddressContext<RootGpa>;
+        type Born = AddressContext<RootGpa>;
+
+        fn service_mm_handle(
+            &self,
+            mm: &Self::Mm,
+        ) -> Result<carrick_core_abi::El1MmHandle, NativeFailure> {
+            if self.quarantine_exec {
+                return Err(NativeFailure::Quarantined);
+            }
+            self.zone
+                .spaces
+                .find(mm.mm.raw().get())
+                .ok_or(NativeFailure::Stale)?;
+            Ok(unsafe {
+                carrick_core_abi::El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    carrick_core_abi::ReservationMm::new(mm.mm.raw().get())
+                        .ok_or(NativeFailure::Stale)?,
+                    NonZeroU64::MIN,
+                )
+            })
+        }
+
+        fn prepare_exec_successor_slot(
+            &self,
+            mm: carrick_core_abi::ReservationMm,
+        ) -> Result<Box<dyn ExecSuccessorSlot + 'a>, NativeProcessError> {
+            let index = self
+                .zone
+                .spaces
+                .publish_closed(mm.raw(), 0, 0)
+                .ok_or(NativeProcessError::Exhausted)?;
+            if !self.zone.spaces.mark_initial_bindable(index) {
+                self.zone.spaces.free(index);
+                return Err(NativeProcessError::Stale);
+            }
+            Ok(Box::new(X86ExecSlot {
+                zone: self.zone,
+                index,
+                mm,
+                armed: true,
+            }))
+        }
+
+        fn cancel_exec_successor(
+            &self,
+            _receipt: ExecAdoptionReceipt,
+        ) -> Result<(), NativeFailure> {
+            Ok(())
+        }
+
+        fn adopt_exec_successor(
+            &self,
+            identity: carrick_core_abi::service::ServiceIdentity,
+            receipt: ExecAdoptionReceipt,
+            manifest: &ExecSuccessorManifest,
+        ) -> Result<NativeExecSuccessor<Self::Mm, ParkedContextWords>, NativeProcessError> {
+            let sealed = manifest
+                .open(identity, receipt)
+                .ok_or(NativeProcessError::Stale)?;
+            let address = AddressContext {
+                root: sealed.root,
+                mm: MmGeneration::new(NonZeroU64::new(sealed.successor_mm.raw()).unwrap()),
+                generation: ContextGeneration::new(sealed.root_generation),
+            };
+            let ttbr = (u64::from(sealed.asid.raw()) << 48) | sealed.root.address().raw();
+            let index = self
+                .zone
+                .spaces
+                .find(sealed.successor_mm.raw())
+                .ok_or(NativeProcessError::Stale)?;
+            if !self
+                .zone
+                .spaces
+                .bind_initial_root(index, sealed.successor_mm.raw(), ttbr, ttbr)
+            {
+                return Err(NativeProcessError::Stale);
+            }
+            Ok(NativeExecSuccessor {
+                mm: address,
+                address,
+                words: Box::new(context_words(address)),
+            })
+        }
+
+        fn finish_exec_successor(
+            &self,
+            predecessor: AddressContext<RootGpa>,
+            successor: AddressContext<RootGpa>,
+            _effects: carrick_el1_abi::ExecCommitEffects,
+        ) -> Result<(), NativeProcessError> {
+            let old = self
+                .zone
+                .spaces
+                .find(predecessor.mm.raw().get())
+                .ok_or(NativeProcessError::Stale)?;
+            let new = self
+                .zone
+                .spaces
+                .find(successor.mm.raw().get())
+                .ok_or(NativeProcessError::Stale)?;
+            let slot = (0..carrick_sched_core::ZONE_SLOTS)
+                .filter_map(SlotId::from_index)
+                .find(|s| self.zone.installed_space(*s) == predecessor.mm.raw().get())
+                .ok_or(NativeProcessError::Stale)?;
+            self.zone.spaces.close(old);
+            self.zone.release_space(slot);
+            self.zone
+                .space_entry(predecessor.mm.raw())
+                .ok_or(NativeProcessError::Stale)?
+                .retire_entry(
+                    carrick_el1_linux::sched::object_wait::space_access(self.zone, slot)
+                        .venue()
+                        .ok_or(NativeProcessError::Stale)?,
+                );
+            self.zone.spaces.open(new);
+            self.zone
+                .install_space(slot, successor.mm.raw().get())
+                .ok_or(NativeProcessError::Stale)?;
+            Ok(())
+        }
+
+        fn exec_ipc_binding(
+            &self,
+        ) -> Option<(
+            carrick_el1_abi::ipc::IpcRegion<'_>,
+            &carrick_el1_abi::ipc_tables::IpcTableMap,
+        )> {
+            Some((self.owner.region(), self.map))
+        }
+
+        fn exec_fd_map(&self) -> &[FdMapSlot] {
+            &self.fd_map
+        }
+
+        fn exec_open_table(&self) -> &[DelegatedOpenFile] {
+            &self.opens
+        }
+
+        fn root_fork_seed(
+            &mut self,
+            _capability: carrick_core_abi::service::ExecCapabilityId,
+        ) -> Result<carrick_el1_linux::native_process_runtime::RootFsSeed, NativeProcessError>
+        {
+            Ok(
+                carrick_el1_linux::native_process_runtime::RootFsSeed::Seeded(
+                    carrick_personality_linux::task_fs::TaskFs::default(),
+                ),
+            )
+        }
+
+        fn prepare_mm(
+            &mut self,
+            parent: &Self::Mm,
+            _: &ParkedContextWords,
+            child: MmGeneration,
+        ) -> Result<Self::PreparedMm, NativeProcessError> {
+            assert_ne!(child, parent.mm);
+            let gpa = self.next_root_page;
+            self.next_root_page += 0x1000;
+            let address = AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(gpa)).unwrap(),
+                mm: child,
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            };
+            self.zone
+                .spaces
+                .publish_closed(child.raw().get(), address.root.address().raw(), 0)
+                .ok_or(NativeProcessError::Exhausted)?;
+            Ok(address)
+        }
+
+        fn prepared_mm(&self, p: &Self::PreparedMm) -> Self::Mm {
+            *p
+        }
+
+        fn prepared_context(&self, p: &Self::PreparedMm) -> AddressContext<RootGpa> {
+            *p
+        }
+
+        fn child_lifecycle(&self, _: &Self::PreparedMm) -> NativeLifecycleResources<'a> {
+            let idx = self.next_child.get();
+            self.next_child.set(idx + 1);
+            NativeLifecycleResources {
+                page: self.child_pages[idx],
+                controls: self.child_controls[idx],
+            }
+        }
+
+        fn commit_mm(
+            &mut self,
+            p: Self::PreparedMm,
+        ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
+            Ok(p)
+        }
+
+        fn abort_mm(
+            &mut self,
+            _: Self::PreparedMm,
+        ) -> Result<(), (NativeProcessError, Self::PreparedMm)> {
+            Ok(())
+        }
+
+        fn settle_mm(&mut self, b: Self::Born) -> Result<(), (NativeProcessError, Self::Born)> {
+            self.zone
+                .spaces
+                .open(self.zone.spaces.find(b.mm.raw().get()).unwrap());
+            Ok(())
+        }
+
+        fn copy_status(
+            &mut self,
+            _: &Self::Mm,
+            _: UserVa,
+            _: LinuxWaitStatus,
+        ) -> Result<(), NativeProcessError> {
+            Ok(())
+        }
+
+        fn quarantine_prepared(&mut self, _: Self::PreparedMm) {
+            panic!("unexpected quarantine");
+        }
+        fn quarantine_fork(
+            &mut self,
+            _: NativeForkPreparation<'a, Self::Mm, Self::PreparedMm, ParkedContextWords>,
+        ) {
+            panic!("unexpected fork quarantine");
+        }
+        fn quarantine_born(&mut self, _: Self::Born) {
+            panic!("unexpected quarantine");
+        }
+        fn retire_mm(&mut self, _: Self::Mm) {}
+        fn wake_effects(&mut self, _: WakeEffects) {}
+        fn request_ingress_producer_boundary(&mut self) {}
+        fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
+            issued
+        }
+        fn fork_fd_table(
+            &mut self,
+            parent_table: u64,
+            child_table: u64,
+        ) -> Result<(), NativeProcessError> {
+            carrick_el1_linux::file_table::fork_native_namespace(
+                &self.fd_map,
+                &self.opens,
+                Some((self.owner.region(), self.map)),
+                parent_table,
+                child_table,
+            )
+        }
+        fn retire_fd_table(&mut self, table: u64) {
+            carrick_el1_linux::file_table::retire_native_namespace(
+                &self.fd_map,
+                &self.opens,
+                Some((self.owner.region(), self.map)),
+                table,
+                self.task,
+            )
+            .unwrap();
+        }
+    }
+
+    let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+    let zone = unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+        assert!(!ptr.is_null());
+        Box::from_raw(ptr)
+    };
+    let zone_owner: &'static Arc<ZoneTables<ParkedContextWords>> =
+        Box::leak(Box::new(Arc::from(zone)));
+    let zone: &'static ZoneTables<ParkedContextWords> = zone_owner;
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    context
+        .kernel()
+        .bind_initial_birth_source(Arc::new(OwnedBirthZone::new(Arc::clone(zone_owner))))
+        .unwrap();
+    let owner: &'static _ = Box::leak(Box::new(context.kernel().ipc().unwrap()));
+    let files = context.resources().files();
+    let root_table_key = files.id().raw();
+
+    let region: &'static _ = Box::leak(Box::new(TestEl1Region::zeroed()));
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    files.publish_ipc(Arc::clone(owner), map).unwrap();
+    let tables: &'static _ = Box::leak(Box::new(MapTables(map)));
+    let venue = IpcVenue {
+        region: owner.region(),
+        tables,
+    };
+
+    let min_idx = drain_recent(8192)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|r| r.logical_index + 1)
+        .max()
+        .unwrap_or(0);
+
+    let parent = context.task().key();
+    let root_pid_raw = parent.id.raw();
+    let root_serial = parent.serial;
+    let root_thread = context.thread().key();
+    let generation = carrick_el1_abi::SnapshotGeneration::INITIAL;
+    let registry = Box::leak(Box::new(NativeProcessRegistry::<
+        AddressContext<RootGpa>,
+        ParkedContextWords,
+    >::new()));
+    let page: &'static ThreadLifecyclePage = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let control: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
+    let child_page1: &'static ThreadLifecyclePage = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let child_page2: &'static ThreadLifecyclePage = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let child_controls1: &'static [ThreadControlSlot; 9] =
+        Box::leak(Box::new(core::array::from_fn(|_| ThreadControlSlot::new())));
+    let child_controls2: &'static [ThreadControlSlot; 9] =
+        Box::leak(Box::new(core::array::from_fn(|_| ThreadControlSlot::new())));
+    let tasks: &'static [CurrentTask; 2] =
+        Box::leak(Box::new([CurrentTask::new(), CurrentTask::new()]));
+    let [task, peer_task] = tasks;
+    task.set(
+        El1TaskId::from_linux_tid(root_pid_raw),
+        generation,
+        root_table_key,
+    );
+    task.mm.key.store(1, Ordering::Release);
+    task.mm
+        .thread_generation
+        .store(root_thread.serial.raw(), Ordering::Release);
+    task.publish_visible_pid(root_pid_raw as u32);
+    task.publish_lifecycle(page as *const _ as u64, control as *const _ as u64);
+    control.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::EntryTaskKey::from_raw(root_pid_raw as u64),
+            carrick_core_abi::BirthSerial::of_task(root_serial),
+            carrick_core_abi::EntryThreadGeneration::from_raw(root_thread.serial.raw()),
+        )
+        .unwrap(),
+    );
+    let address = AddressContext {
+        root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+        mm: MmGeneration::new(NonZeroU64::MIN),
+        generation: ContextGeneration::new(NonZeroU64::MIN),
+    };
+    let slot = SlotId::new(0);
+    let peer_slot = SlotId::new(1);
+    let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+    zone.spaces.open(space);
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, 1, Some(0), 1);
+    zone.enter_guest(slot);
+    zone.install_space(slot, 1).unwrap();
+    zone.drive(peer_slot, 2);
+    zone.publish_slot(peer_slot, 1, Some(1), 2);
+    zone.enter_guest(peer_slot);
+    let root_record = zone
+        .current_or_new(
+            slot,
+            carrick_el1_abi::ThreadIdentity {
+                tid: root_pid_raw as u64,
+                serial: root_thread.serial.raw(),
+                mm: 1,
+                file_table: root_table_key,
+                generation: generation.raw(),
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 3,
+                lifecycle_page: page as *const _ as u64,
+                control_slot: control as *const _ as u64,
+            },
+        )
+        .unwrap();
+    let source = BornInZoneSource { zone, slot };
+    let peer_source = BornInZoneSource {
+        zone,
+        slot: peer_slot,
+    };
+    let mut service: Box<X86LifecycleService<'static>> = Box::new(X86LifecycleService {
+        zone,
+        child_pages: [child_page1, child_page2],
+        child_controls: [child_controls1, child_controls2],
+        next_child: core::cell::Cell::new(0),
+        task: peer_task,
+        owner: Arc::clone(owner),
+        map,
+        fd_map: core::array::from_fn(|_| FdMapSlot::default()),
+        opens: core::array::from_fn(|_| DelegatedOpenFile::new()),
+        next_root_page: 0x20_000,
+        quarantine_exec: false,
+    });
+    carrick_el1_linux::file_table::admit_stdio(
+        &service.fd_map,
+        &service.opens,
+        &[],
+        root_table_key,
+        [true; 3],
+    );
+    zone.mm_issuer().observe_existing(address.mm);
+
+    let root_words = context_words(address);
+    let runtime = Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
+            source, task, page, control, address, address, root_words,
+        )
+        .unwrap(),
+    );
+    registry
+        .register_root(runtime.clone(), source, task, address)
+        .unwrap();
+
+    let counters = Counters::new();
+    let names = InotifyNameCache::new();
+    let isa_unsupported = AtomicU64::new(0);
+    let dispatch_x86 = |caller_source: BornInZoneSource<'static, ParkedContextWords>,
+                        caller_task: &'static CurrentTask,
+                        caller_addr: AddressContext<RootGpa>,
+                        caller_words: &ParkedContextWords,
+                        svc: &mut X86LifecycleService<'static>,
+                        native_nr: u64,
+                        args: [u64; 6]| {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                caller_source,
+                caller_task,
+                caller_addr,
+                caller_words,
+                svc,
+            )
+            .unwrap();
+        let decoded = decode_x86_64(native_nr, args, 0x7fff_0000);
+        let mut frame = X86Frame {
+            native: decoded.native,
+            canonical: decoded.canonical,
+            args,
+            rax: native_nr,
+            isa_unsupported: &isa_unsupported,
+        };
+        let route = dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(caller_task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            None::<dispatch::Zone<'_, NoCpu, sched::HardwareUserWord>>,
+            Some(&venue),
+            None,
+            Some(&mut *entry),
+            Some(caller_source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        (route, frame.rax as i64)
+    };
+
+    // 1. Root clones child 1 via x86_64 SYS_clone (56).
+    let (clone_route, child_pid) = dispatch_x86(
+        source,
+        task,
+        address,
+        &root_words,
+        &mut service,
+        56,
+        [17, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(clone_route, CompletionRoute::Served);
+    assert!(child_pid > 0, "x86 clone returned {child_pid}");
+    if let Some(doorbell) = task.linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
+    let _ = task.linux.take_served_boundary();
+    let child = runtime
+        .namespace_child_key(parent, child_pid as u32)
+        .unwrap();
+
+    // Migrate child 1 to peer_slot and park parent in x86_64 SYS_wait4 (61).
+    assert!(zone.enter_idle(peer_slot, true));
+    let mut effects = WakeEffects::default();
+    assert_eq!(zone.migrate_queued(slot, &mut effects), 1);
+    zone.leave_idle(peer_slot);
+
+    // SAFETY: stopped fixture owns parent record.
+    unsafe {
+        *zone.record(root_record).ctx_mut() = root_words;
+    }
+    let (wait_route, _) = dispatch_x86(
+        source,
+        task,
+        address,
+        &root_words,
+        &mut service,
+        61,
+        [u64::MAX, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(wait_route, CompletionRoute::Suspended);
+
+    // Activate child 1 on peer_slot.
+    let selected = zone.switch_in_full(peer_slot).unwrap();
+    let child_record = zone.record_ref(selected.record);
+    let state = unsafe { runtime.record_binding(child_record) }.unwrap();
+    let identity = zone.record(selected.record).identity();
+    zone.install_space(peer_slot, state.address.mm.raw().get())
+        .unwrap();
+    peer_task.set(
+        El1TaskId::from_linux_tid(i32::try_from(identity.tid).unwrap()),
+        carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+        identity.file_table,
+    );
+    peer_task
+        .mm
+        .key
+        .store(state.address.mm.raw().get(), Ordering::Release);
+    peer_task
+        .mm
+        .thread_generation
+        .store(identity.serial, Ordering::Release);
+    peer_task.publish_visible_pid(child_pid as u32);
+    peer_task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+
+    // 2. Stage x86_64 SYS_execve (59) through production native_exec_stage_request
+    // and begin_exec_call (exactly as carrick-x86-cpl0/src/linux_personality.rs does).
+    let stage_x86_exec = |path_cstr: &[u8]| {
+        let arg = b"child\0";
+        let argv: [u64; 2] = [arg.as_ptr() as u64, 0];
+        let envp: [u64; 1] = [0];
+        let exec_call = decode_x86_64(
+            59,
+            [
+                path_cstr.as_ptr() as u64,
+                argv.as_ptr() as u64,
+                envp.as_ptr() as u64,
+                0,
+                0,
+                0,
+            ],
+            0x7fff_0000,
+        );
+        let req =
+            ExecStageRequest::from_canonical(exec_call.canonical.raw(), exec_call.args).unwrap();
+        let Some(dispatch::NativeExecStage::Payload(payload)) =
+            dispatch::native_exec_stage_request(peer_task, &ResidentUser, req)
+        else {
+            panic!("expected staged x86 exec payload");
+        };
+        payload
+    };
+    {
+        let payload = stage_x86_exec(b"/bin/x86-child\0");
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                peer_source,
+                peer_task,
+                state.address,
+                &state.words,
+                &mut *service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_call(
+                payload,
+                None,
+                NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(59), &counters),
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+    }
+    let selector = peer_task.service_notice.take().unwrap().unwrap();
+    let member = zone.record(selector.record.id).identity();
+    let child_control = unsafe { &*(member.control_slot as *const ThreadControlSlot) };
+    let ticket = unsafe {
+        ServiceCell::claim_notice(&child_control.service, selector, NonZeroU64::MIN, member)
+    }
+    .unwrap();
+    let req_identity = ticket.request().identity;
+    let manifest =
+        unsafe { &mut *(ticket.reply_address().unwrap().raw() as *mut ExecSuccessorManifest) };
+    let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(71).unwrap()).unwrap();
+    *manifest = manifest
+        .seal(
+            req_identity,
+            receipt,
+            ExecSuccessorBacking {
+                root: RootGpa::page_aligned(FrameGpa::new(0x90_000)).unwrap(),
+                asid: Asid::from_registry_allocation(NonZeroU16::new(83).unwrap()),
+                asid_generation: NonZeroU64::new(85).unwrap(),
+            },
+            ExecSuccessorEntry {
+                entry: UserVa::new(0x40_0000),
+                stack_pointer: UserVa::new(0x7fff_f000),
+            },
+        )
+        .unwrap();
+    assert!(
+        ticket
+            .publish_exec_prepared(receipt, (), |_, ()| {})
+            .is_ok()
+    );
+    let queue = zone
+        .object_wait(
+            ObjectWaitKey::native_service(selector.record).unwrap(),
+            &ShortLockSpin,
+            &|owned| {
+                carrick_el1_linux::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            },
+        )
+        .unwrap();
+    let mut exec_effects = WakeEffects::default();
+    queue.notify_object(peer_slot, &mut exec_effects).unwrap();
+    drop(queue);
+
+    let reselected = zone.switch_in_full(peer_slot).unwrap();
+    assert_eq!(reselected.record, child_record.id);
+    let saved_child = unsafe { runtime.record_binding(child_record) }
+        .unwrap()
+        .words;
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                peer_source,
+                peer_task,
+                state.address,
+                &saved_child,
+                &mut *service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.resume_checkpoint(|_| Ok(None)),
+            Ok(NativeResume::NoPending)
+        ));
+    }
+
+    // 3-5. Child 1 exits via x86_64 SYS_exit_group (231, status=42).
+    if let Some(work) = peer_task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    let _ = peer_task.linux.take_served_boundary();
+    let post_exec_state = unsafe { runtime.record_binding(child_record) }.unwrap();
+    peer_task
+        .mm
+        .key
+        .store(post_exec_state.address.mm.raw().get(), Ordering::Release);
+    let (exit_route, _) = dispatch_x86(
+        peer_source,
+        peer_task,
+        post_exec_state.address,
+        &post_exec_state.words,
+        &mut service,
+        231,
+        [42, 0, 0, 0, 0, 0],
+    );
+    assert!(
+        matches!(
+            exit_route,
+            CompletionRoute::Suspended | CompletionRoute::Served | CompletionRoute::WithWork
+        ),
+        "expected x86 child exit_group to complete in ring, got {exit_route:?}"
+    );
+
+    // 6. Parent wakes on slot 0 (or peer_slot) and reaps child 1.
+    if zone.runnable_head(slot).is_none() && zone.runnable_head(peer_slot).is_some() {
+        assert!(zone.enter_idle(slot, true));
+        let mut mig = WakeEffects::default();
+        assert_eq!(zone.migrate_queued(peer_slot, &mut mig), 1);
+        zone.leave_idle(slot);
+    }
+    let parent_selected = zone.switch_in_full(slot).unwrap();
+    assert_eq!(parent_selected.record, root_record);
+    zone.install_space(slot, 1).unwrap();
+    let parent_saved = unsafe { runtime.record_binding(zone.record_ref(root_record)) }
+        .unwrap()
+        .words;
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                task,
+                address,
+                &parent_saved,
+                &mut *service,
+            )
+            .unwrap();
+        let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+        assert!(
+            matches!(resumed, NativeResume::Returned(ret) if ret.raw() == child_pid),
+            "expected x86 wait4 to reap {child_pid}"
+        );
+    }
+
+    let child1_records: Vec<_> = drain_recent(8192)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|rec| {
+            rec.logical_index >= min_idx
+                && (NATIVE_CHILD_FORK..=NATIVE_CHILD_REAP).contains(&rec.kind)
+                && (rec.a == parent.id.raw() || rec.a == child.id.raw())
+        })
+        .collect();
+    let kinds: Vec<u8> = child1_records.iter().map(|r| r.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            NATIVE_CHILD_FORK,
+            NATIVE_CHILD_EXEC,
+            NATIVE_CHILD_EXIT,
+            NATIVE_CHILD_ZOMBIE,
+            NATIVE_CHILD_WAKE,
+            NATIVE_CHILD_REAP,
+        ],
+        "expected exact 6 native-child lifecycle kinds in order on x86"
+    );
+    let decoded: Vec<_> = child1_records
+        .iter()
+        .map(|r| decode_native_child_record(*r).unwrap())
+        .collect();
+    assert_eq!(
+        decoded[1],
+        DecodedNativeChildRecord::Exec {
+            task_id: child.id.raw(),
+            task_serial_low32: child.serial.raw() as u32,
+            outcome: NativeChildExecOutcome::Succeeded,
+        }
+    );
+    assert_eq!(
+        decoded[2],
+        DecodedNativeChildRecord::Exit {
+            task_id: child.id.raw(),
+            task_serial_low32: child.serial.raw() as u32,
+            reason: Some(NativeChildTerminalReason::Exited {
+                status: LinuxWaitStatus::exited(42),
+            }),
+            raw_packed: NativeChildTerminalReason::Exited {
+                status: LinuxWaitStatus::exited(42),
+            }
+            .pack_i32(),
+        }
+    );
+    assert_eq!(
+        decoded[4],
+        DecodedNativeChildRecord::Wake {
+            parent_id: parent.id.raw(),
+            parent_serial_low32: parent.serial.raw() as u32,
+            reason: Some(NativeParentWakeReason::ChildExit),
+            woken: 1,
+        }
+    );
+    assert_eq!(
+        decoded[5],
+        DecodedNativeChildRecord::Reap {
+            caller_id: parent.id.raw(),
+            caller_serial_low8: parent.serial.raw() as u8,
+            child_id: child.id.raw(),
+            child_serial_low8: child.serial.raw() as u8,
+            wstatus: (42u16 << 8),
+        }
+    );
+
+    // 7. Second x86 child: refused exec (ENOENT=2) then forced terminal fatal
+    // reason (EntryBindingFatal::NativeServiceQuarantined) on x86 begin_exec_call.
+    let (clone2_route, child2_pid) = dispatch_x86(
+        source,
+        task,
+        address,
+        &parent_saved,
+        &mut service,
+        56,
+        [17, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(clone2_route, CompletionRoute::Served);
+    assert!(child2_pid > 0);
+    let fatal_child = runtime
+        .namespace_child_key(parent, child2_pid as u32)
+        .unwrap();
+    assert!(zone.enter_idle(peer_slot, true));
+    let mut mig2 = WakeEffects::default();
+    assert_eq!(zone.migrate_queued(slot, &mut mig2), 1);
+    zone.leave_idle(peer_slot);
+    let sel2 = zone.switch_in_full(peer_slot).unwrap();
+    let child2_rec = zone.record_ref(sel2.record);
+    let state2 = unsafe { runtime.record_binding(child2_rec) }.unwrap();
+    let id2 = zone.record(sel2.record).identity();
+    zone.install_space(peer_slot, state2.address.mm.raw().get())
+        .unwrap();
+    peer_task.set(
+        El1TaskId::from_linux_tid(i32::try_from(id2.tid).unwrap()),
+        carrick_el1_abi::SnapshotGeneration::from_raw(id2.generation),
+        id2.file_table,
+    );
+    peer_task
+        .mm
+        .key
+        .store(state2.address.mm.raw().get(), Ordering::Release);
+    peer_task
+        .mm
+        .thread_generation
+        .store(id2.serial, Ordering::Release);
+    peer_task.publish_visible_pid(child2_pid as u32);
+    peer_task.publish_lifecycle(id2.lifecycle_page, id2.control_slot);
+
+    {
+        let payload = stage_x86_exec(b"/no/such/x86-bin\0");
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                peer_source,
+                peer_task,
+                state2.address,
+                &state2.words,
+                &mut *service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_call(
+                payload,
+                None,
+                NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(59), &counters),
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+    }
+    let selector2 = peer_task.service_notice.take().unwrap().unwrap();
+    let member2 = zone.record(selector2.record.id).identity();
+    let ctrl2 = unsafe { &*(member2.control_slot as *const ThreadControlSlot) };
+    let ticket2 =
+        unsafe { ServiceCell::claim_notice(&ctrl2.service, selector2, NonZeroU64::MIN, member2) }
+            .unwrap();
+    assert!(
+        ticket2
+            .complete_failure(ServiceFailureCode::new(2).unwrap())
+            .is_ok()
+    );
+    let queue2 = zone
+        .object_wait(
+            ObjectWaitKey::native_service(selector2.record).unwrap(),
+            &ShortLockSpin,
+            &|owned| {
+                carrick_el1_linux::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            },
+        )
+        .unwrap();
+    let mut eff2 = WakeEffects::default();
+    queue2.notify_object(peer_slot, &mut eff2).unwrap();
+    drop(queue2);
+    let resel2 = zone.switch_in_full(peer_slot).unwrap();
+    assert_eq!(resel2.record, child2_rec.id);
+    let saved2 = unsafe { runtime.record_binding(child2_rec) }.unwrap().words;
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                peer_source,
+                peer_task,
+                state2.address,
+                &saved2,
+                &mut *service,
+            )
+            .unwrap();
+        let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+        assert!(matches!(resumed, NativeResume::Returned(ret) if ret.raw() == -2));
+    }
+    // Force NativeServiceQuarantined on x86 begin_exec_call (which linux_personality
+    // routes straight into fatal_boot()).
+    service.quarantine_exec = true;
+    {
+        let payload = stage_x86_exec(b"/bin/quarantined\0");
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                peer_source,
+                peer_task,
+                state2.address,
+                &saved2,
+                &mut *service,
+            )
+            .unwrap();
+        let err = entry
+            .begin_exec_call(
+                payload,
+                None,
+                NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(59), &counters),
+            )
+            .err()
+            .expect("quarantined MM handle must fail x86 begin_exec_call");
+        assert!(matches!(err, NativeProcessError::Quarantined));
+    }
+
+    let child2_records: Vec<_> = drain_recent(8192)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|rec| {
+            rec.logical_index >= min_idx
+                && (NATIVE_CHILD_FORK..=NATIVE_CHILD_REAP).contains(&rec.kind)
+                && (rec.a == fatal_child.id.raw()
+                    || (rec.kind == NATIVE_CHILD_FORK && rec.b == fatal_child.id.raw()))
+        })
+        .map(|r| decode_native_child_record(r).unwrap())
+        .collect();
+    assert_eq!(child2_records.len(), 3, "got {child2_records:?}");
+    assert_eq!(
+        child2_records[1],
+        DecodedNativeChildRecord::Exec {
+            task_id: fatal_child.id.raw(),
+            task_serial_low32: fatal_child.serial.raw() as u32,
+            outcome: NativeChildExecOutcome::RefusedErrno(2),
+        }
+    );
+    assert_eq!(
+        child2_records[2],
+        DecodedNativeChildRecord::Exit {
+            task_id: fatal_child.id.raw(),
+            task_serial_low32: fatal_child.serial.raw() as u32,
+            reason: Some(NativeChildTerminalReason::EntryBindingFatal(
+                EntryBindingFatalReason::NativeServiceQuarantined,
+            )),
+            raw_packed: NativeChildTerminalReason::EntryBindingFatal(
+                EntryBindingFatalReason::NativeServiceQuarantined,
+            )
+            .pack_i32(),
+        }
+    );
+}
