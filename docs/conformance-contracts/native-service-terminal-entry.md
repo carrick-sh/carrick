@@ -59,10 +59,10 @@ contention ("not now"), never a broken invariant: `publish_or_observe` observes
 the live holder with zero stores (`Held(holder)`), keeps the caller's already
 published `PendingService`, enrols on `ObjectWaitKey::native_service(holder.record)`,
 probes once under that queue lock, releases execution capacity, and reruns
-notice publication when woken. Every successful notice publication rings the
-slot's host-work doorbell as part of the same owner operation. Thus, when the
-holder and its contender are both parked and the slot has no runnable record,
-the EL1 idle boundary still exits so carrier intake can take the holder notice.
+notice publication when woken. Parking the contender rings the slot's
+host-work doorbell because that park can remove the last runnable record while
+the holder's notice still awaits carrier intake. The EL1 idle boundary then
+exits so carrier intake can take the holder notice.
 A `service_notice` word that already names the
 publisher's own `RecordId` remains broken duplicate lane custody and fails
 closed with `NativeServiceQuarantine::NoticePublishDuplicate`
