@@ -263,6 +263,31 @@ pub const LINUX_CLOCK_TAI: u64 = 11;
 pub const LINUX_CLOCK_CPU_WHICH_MASK: u32 = 0b011;
 pub const LINUX_CLOCK_CPU_PERTHREAD: u32 = 0b100;
 pub const LINUX_CLOCK_FD: u32 = 0b011;
+/// The syscall resolution and the coarse clock grid, also used by the ARM vDSO.
+pub const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
+
+/// Carrick's clock resolution. Dynamic CPU clocks retain the legacy
+/// dispatcher's clock-ID classification on both entry paths.
+pub const fn linux_clock_resolution_ns(clock_id: i32) -> Option<i64> {
+    match clock_id as u64 {
+        LINUX_CLOCK_REALTIME
+        | LINUX_CLOCK_MONOTONIC
+        | LINUX_CLOCK_PROCESS_CPUTIME_ID
+        | LINUX_CLOCK_THREAD_CPUTIME_ID
+        | LINUX_CLOCK_MONOTONIC_RAW
+        | LINUX_CLOCK_REALTIME_COARSE
+        | LINUX_CLOCK_MONOTONIC_COARSE
+        | LINUX_CLOCK_BOOTTIME
+        | LINUX_CLOCK_REALTIME_ALARM
+        | LINUX_CLOCK_BOOTTIME_ALARM
+        | LINUX_CLOCK_TAI => Some(LINUX_CLOCK_RESOLUTION_NSEC),
+        _ if clock_id < 0 && (clock_id as u32) & LINUX_CLOCK_CPU_WHICH_MASK != LINUX_CLOCK_FD => {
+            Some(LINUX_CLOCK_RESOLUTION_NSEC)
+        }
+        _ => None,
+    }
+}
+
 /// `clock_nanosleep`/`timer_settime` absolute-deadline flag.
 pub const LINUX_TIMER_ABSTIME: u64 = 0x1;
 

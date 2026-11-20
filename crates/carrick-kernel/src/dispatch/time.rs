@@ -371,25 +371,15 @@ impl SyscallDispatcher {
         }
 
         fn clock_getres(this, cx, clock_id: u64, address: GuestPtr) {
-            let memory = &mut *cx.memory;
-            let container = cx.kernel.task().container();
-            if linux_clock_duration(container.clock(), clock_id).is_none() {
+            let Some(resolution) = carrick_abi::linux_clock_resolution_ns(clock_id as i32) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
+            };
             if address.0 == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             Ok(super::copyout::copyout_record(
-                cx.kernel,                memory,
-                address.0,
-                // Resolution is host-kernel-dependent and NOT a host-portable
-                // invariant: a CONFIG_HIGH_RES_TIMERS kernel reports 1ns, but a
-                // low-res kernel (e.g. Docker Desktop's LinuxKit VM at
-                // CONFIG_HZ=1000) reports TICK_NSEC = 1ms. carrick reports the
-                // 1ms stand-in (LINUX_CLOCK_RESOLUTION_NSEC), which is what the
-                // Docker oracle on these hosts actually returns; the clockgetres
-                // probe asserts only rc==0 + tv_sec==0 (sub-second resolution).
-                &LinuxTimespec::new(0, linux_clock_getres_nsec(clock_id)),
+                cx.kernel, cx.memory, address.0,
+                &LinuxTimespec::new(0, resolution),
                 DispatchOutcome::Returned { value: 0 },
             ))
         }
