@@ -17,6 +17,48 @@ pub struct SelectedBackingPlan {
     fault_page: u64,
 }
 
+/// A publication refusal that may be retried only after an observed change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationNotNow {
+    /// Another MM owner holds the authority needed by this publication.
+    Contended,
+    /// A bounded store must grow, or the next plan must be strictly smaller.
+    Capacity(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
+}
+
+/// The exhaustive disposition of a descriptor publication refusal.
+///
+/// This type prevents the host lane from treating every refusal as an
+/// instruction rerun. Only `NotNow` may retain an owned continuation;
+/// deterministic refusals are terminal for the request, while an occupied
+/// fault page must use the inherited-Prepared supply path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationDecline {
+    NotNow(PublicationNotNow),
+    InheritedPrepared,
+    Terminal(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
+}
+
+impl PublicationDecline {
+    pub fn from_descriptor(
+        reason: carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    ) -> Self {
+        use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+        match reason {
+            DescriptorRefusal::Contended => Self::NotNow(PublicationNotNow::Contended),
+            DescriptorRefusal::TablesExhausted
+            | DescriptorRefusal::JournalCapacity
+            | DescriptorRefusal::ResidencyCapacity => {
+                Self::NotNow(PublicationNotNow::Capacity(reason))
+            }
+            DescriptorRefusal::Occupied | DescriptorRefusal::AlreadyValid => {
+                Self::InheritedPrepared
+            }
+            _ => Self::Terminal(reason),
+        }
+    }
+}
+
 #[cfg(test)]
 mod publication_decline_tests {
     use super::{PublicationDecline, PublicationNotNow};
