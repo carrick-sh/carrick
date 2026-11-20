@@ -2528,6 +2528,8 @@ fn mounted_x86_exec_child_allowlisted_crossings_class_witness() {
         (11, "listxattr", "#2590 / #2241"),
         (12, "llistxattr", "#2590 / #2241"),
         (13, "flistxattr", "#2590 / #2241"),
+        // PR #2590 / #2241: HostFileOp::Statfs (carrick-core-abi + carrick-kernel, outside #2581 R17 fence).
+        (43, "statfs", "#2590 / #2241"),
         (44, "fstatfs", "#2590 / #2241"),
         (47, "fallocate", "#2590 / #2241"),
         (65, "readv", "#2590 / #2241"),
