@@ -143,7 +143,7 @@ impl Identity {
             dof_carrick: None,
         };
         if matches!(lane, crate::lane::Lane::Hvf) {
-            let signature = command_text("codesign", &["-dv"], Some(bin))?;
+            let signature = command_text("codesign", &["-d", "--verbose=4"], Some(bin))?;
             artifact.cdhash = Some(
                 signature
                     .lines()
