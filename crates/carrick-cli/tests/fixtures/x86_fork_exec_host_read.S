@@ -3,8 +3,8 @@
 .global _start
 .text
 _start:
-    cmpq $1, (%rsp)
-    jne reader
+    cmpq $2, (%rsp)
+    jae reader
     mov $57, %eax
     syscall
     test %eax, %eax
@@ -75,7 +75,11 @@ exit:
     ud2
 
 .section .rodata
+#ifdef EXEC_TARGET_PATH
+path: .asciz EXEC_TARGET_PATH
+#else
 path: .asciz "/hello"
+#endif
 marker: .asciz "child"
 .balign 8
 argv: .quad path, marker, 0
