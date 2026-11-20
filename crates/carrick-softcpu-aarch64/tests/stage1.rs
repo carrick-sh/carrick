@@ -363,6 +363,81 @@ fn fetch_from_an_unmapped_page_takes_an_instruction_abort() {
     assert_eq!(r.cpu.pc.0, VBAR + 0x400);
 }
 
+/// Every block in the fixture ends at a real handler or an unconditional
+/// continuation. Only the host instruction launch is substituted.
+struct SingleExit;
+impl ExecuteBlock for SingleExit {
+    type Error = ();
+    type Code = ();
+
+    fn prepare(&mut self, block: &TranslatedBlock) -> Result<(), ()> {
+        assert_eq!(block.exits().len(), 1);
+        Ok(())
+    }
+
+    fn execute(&mut self, _: &TranslatedBlock, _: &(), _: &mut CpuState) -> Result<usize, ()> {
+        Ok(0)
+    }
+}
+
+#[test]
+fn tlbi_invalidates_a_loaded_translation_before_the_next_load() {
+    let mut r = Rig::el1();
+    let l3 = ROOT_A + 3 * PAGE;
+    // Give the guest a writable alias for the descriptor page. KDATA is
+    // index 1, so [x2] is the live KDATA descriptor.
+    r.memory
+        .put(l3 + 3 * 8, l3 | LEAF_PAGE | AF | AP_EL1_RW | UXN);
+    r.memory.put(KDATA_PA, 0xfeed);
+    r.set(0, KDATA);
+    r.set(2, HOLE + 8);
+    let code = [
+        LDR_X1_X0,
+        0xf900_005f, // str xzr, [x2] (invalidate KDATA descriptor)
+        0xd503_3a9f, // dsb ishst
+        0xd508_871f, // tlbi vmalle1
+        0xd503_3b9f, // dsb ish
+        0xd503_3fdf, // isb
+        0xf940_0004, // ldr x4, [x0] (must fault)
+        0xd400_0042, // hvc #2 (only reached with a stale hit)
+    ];
+    for (index, word) in code.into_iter().enumerate() {
+        r.memory
+            .write(
+                VirtualAddress(CODE_PA + 4 * index as u64),
+                &word.to_le_bytes(),
+            )
+            .unwrap();
+    }
+    r.memory
+        .write(
+            VirtualAddress(CODE_PA + 0xa00),
+            &0xd400_0062_u32.to_le_bytes(),
+        )
+        .unwrap(); // HVC #3 at the current-EL SPx abort vector
+    let report = run(
+        &mut r.cpu,
+        &mut r.monitor,
+        &mut r.memory,
+        &mut SingleExit,
+        BlockLimits::default(),
+        16,
+    );
+    assert!(matches!(
+        report.stop,
+        Stop::Event {
+            event: Event::ProviderExit(_),
+            ..
+        }
+    ));
+    assert_eq!(r.get(1), 0xfeed);
+    assert_eq!(r.get(4), 0);
+    assert_eq!(r.cpu.el1.esr, Syndrome(0x9600_0007));
+    assert_eq!(r.cpu.el1.far, VirtualAddress(KDATA));
+    assert_eq!(r.cpu.el1.elr, ProgramCounter(CODE + 24));
+    assert_eq!(report.pc, ProgramCounter(VBAR + 0x204));
+}
+
 mod production {
     use super::*;
     use carrick_mem::arch_sysregs::{SCTLR_EL1_BOOTSTRAP, TCR_EL1_BOOTSTRAP};
