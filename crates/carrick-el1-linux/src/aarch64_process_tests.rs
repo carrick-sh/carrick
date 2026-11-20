@@ -2533,6 +2533,26 @@ fn native_fork_child_realtime_clocks_reach_time_handler() {
 }
 
 #[test]
+fn native_fork_child_cputime_and_times_reach_time_handler() {
+    let clock_gettime = carrick_abi::syscall::nr::CLOCK_GETTIME;
+    for clock in [
+        carrick_syscall_abi::LINUX_CLOCK_PROCESS_CPUTIME_ID,
+        carrick_syscall_abi::LINUX_CLOCK_THREAD_CPUTIME_ID,
+    ] {
+        assert_eq!(
+            native_fork_child_time_result(clock_gettime, clock, 0),
+            (-14, 0),
+            "native child clock_gettime({clock}, NULL)"
+        );
+    }
+    let times = carrick_abi::syscall::nr::TIMES;
+    let (ticks, refusals) = native_fork_child_time_result(times, 0, 0);
+    assert!(ticks > 0, "native child times(NULL) returned {ticks}");
+    assert_eq!(refusals, 0);
+    assert_eq!(native_fork_child_time_result(times, 1, 0), (-14, 0));
+}
+
+#[test]
 #[ignore = "#1808 slice 3: clock_gettime/adjtimex/clock_adjtime routing"]
 fn native_fork_child_clock_adjtime_reaches_time_handler() {
     native_fork_child_time_handler(carrick_abi::syscall::nr::CLOCK_ADJTIME);
