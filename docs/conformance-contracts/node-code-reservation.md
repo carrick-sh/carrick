@@ -196,3 +196,11 @@ exact-head run on the director's Mac.
 The separate remap witnesses keep the forced relocation of a one-page
 read/write window over an occupied following address. On CPL0, a successful
 relocation must carry the written byte and zero-fill the extension.
+
+The reservation owner can grow a private anonymous mapping in place and
+relocate an untouched mapping when growth is blocked. The ring and host
+reuse the same Linux argument decoder. A lazy relocation retires the
+source reservation in its destination proposal. The live CPL0 fixture
+checks that the old address has no VMA, preserved bytes for in-place
+growth, and zero-fill on the extension. Resident relocation still needs a
+descriptor and backing transfer through the exact MM owner.

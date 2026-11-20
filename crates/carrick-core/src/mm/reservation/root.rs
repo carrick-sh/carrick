@@ -2829,8 +2829,8 @@ impl<
     /// prepares a same-size destination and keeps the source. Every created
     /// node carries the source's protection and attributes. Growing a
     /// `LOCKED` source is subject to `RLIMIT_MEMLOCK`, which this root does
-    /// not hold: the host venue admits it before proposing (the EL1 decoder
-    /// forwards `mremap`).
+    /// not hold: the host venue admits growth of locked mappings before
+    /// proposing it.
     pub fn mremap(
         &mut self,
         source: ReservationRange,

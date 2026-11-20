@@ -193,6 +193,16 @@ fn serial_host_native_anonymous_remap_stays_in_ring() {
     native_anonymous_advice_fixture("-DREMAP");
 }
 
+#[test]
+fn serial_host_native_anonymous_remap_in_place() {
+    native_anonymous_advice_fixture("-DREMAP_IN_PLACE");
+}
+
+#[test]
+fn serial_host_native_anonymous_remap_lazy() {
+    native_anonymous_advice_fixture("-DREMAP_LAZY");
+}
+
 fn native_anonymous_advice_fixture(mode: &str) {
     let runs = [&[mode, "-DROOT_ONLY"][..], &[mode][..]].map(|flags| {
         let elf = native_exit_fixture_with_flags("native_child_mmap_hint.S", flags);
@@ -219,6 +229,11 @@ fn native_anonymous_advice_fixture(mode: &str) {
         assert_eq!(load(&counters.served[233]), 4 * (index as u64 + 1));
         assert_eq!(load(&counters.forwarded[233]), 0);
         assert_eq!(load(&counters.refused[28]), 0);
+        if mode != "-DADVICE" {
+            assert_eq!(load(&counters.served[216]), index as u64 + 1);
+            assert_eq!(load(&counters.forwarded[216]), 0);
+            assert_eq!(load(&counters.refused[25]), 0);
+        }
     }
 }
 

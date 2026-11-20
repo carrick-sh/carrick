@@ -1,3 +1,6 @@
+#if defined(REMAP_IN_PLACE) || defined(REMAP_LAZY)
+#define REMAP
+#endif
 /* Both live processes independently reserve the same advisory ranges.
  * The child exits with the mmap errno on failure (38 on the original ring).
  */
@@ -13,9 +16,15 @@ _start:
     mov %eax, %r13d
     mov $0x10000000, %edi
     call reserve
+#if (defined(ADVICE) || defined(REMAP)) && !defined(REMAP_IN_PLACE)
+    cmp $0x10000000, %rax
+    jne failure
+#endif
     mov %rax, %r14
     call writable
+#ifndef REMAP_LAZY
     movb $37, (%r14)
+#endif
 #if defined(ADVICE) || defined(REMAP)
     push %r14
 #endif
@@ -28,8 +37,10 @@ _start:
     syscall
     cmp %r13d, %eax
     jne failure
+#ifndef REMAP_LAZY
     cmpb $37, (%r14)
     jne failure
+#endif
     mov (%rsp), %edi
     test $127, %edi
     jnz failure
@@ -48,15 +59,21 @@ child:
 #endif
     mov $0x10000000, %edi
     call reserve
+#if (defined(ADVICE) || defined(REMAP)) && !defined(REMAP_IN_PLACE)
+    cmp $0x10000000, %rax
+    jne failure
+#endif
     mov %rax, %r14
     mov $5, %edx
     call protect
     call writable
+#ifndef REMAP_LAZY
     cmpb $0, (%r14)
     jne failure
     movb $51, (%r14)
     cmpb $51, (%r14)
     jne failure
+#endif
 #if defined(ADVICE) || defined(REMAP)
     jmp advice
 #endif
@@ -99,6 +116,9 @@ failure:
     jmp exit
 
 reserve:
+#ifdef REMAP_IN_PLACE
+    xor %edi, %edi
+#endif
     mov $0x10000000, %esi
     xor %edx, %edx
     mov $0x4022, %r10d
@@ -178,38 +198,74 @@ advice:
     cmp $1, %eax
     jne failure
 #endif
+#ifndef REMAP_LAZY
     cmpb $0, (%r14)
     jne failure
+#endif
 1:
+#ifndef REMAP_LAZY
     movb $73, (%r14)
+#endif
     advise MADV_FREE, 8, 4096
     advise MADV_DONTDUMP, 16, 4096
     advise MADV_HUGEPAGE, 14, 4096
 #ifdef REMAP
+#ifdef REMAP_IN_PLACE
+    lea 4096(%r14), %rdi
+    mov $0xffff000, %esi
+    mov $11, %eax
+    syscall
+    report munmap_tail
+#endif
     mov %r14, %rdi
     mov $4096, %esi
     mov $8192, %edx
+#ifdef REMAP_IN_PLACE
+    xor %r10d, %r10d
+#else
     mov $1, %r10d
+#endif
     mov $25, %eax
     syscall
     report mremap
     test %rax, %rax
     js 2f
+#ifdef REMAP_LAZY
+    cmpb $0, (%rax)
+#else
     cmpb $73, (%rax)
+#endif
     jne failure
     cmpb $0, 4096(%rax)
     jne failure
     cmp %r14, %rax
-    je 2f
-    mov %rax, %rdi
+#ifdef REMAP_IN_PLACE
+    jne failure
+    jmp 2f
+#else
+    je failure
+    mov %rax, %r15
+    mov %r14, %rdi
+    mov $4096, %esi
+    mov $3, %edx
+    mov $10, %eax
+    syscall
+    cmp $-12, %rax
+    jne failure
+    mov %r15, %rdi
     mov $8192, %esi
     mov $11, %eax
     syscall
     report munmap_moved
+#endif
 2:
 #endif
     mov %r14, %rdi
+#ifdef REMAP_IN_PLACE
+    mov $8192, %esi
+#else
     mov $0x10000000, %esi
+#endif
     mov $11, %eax
     syscall
     report munmap
