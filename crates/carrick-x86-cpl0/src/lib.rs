@@ -808,7 +808,7 @@ mod anonymous_refusal_tests {
     fn selected_owner_waits_park_instead_of_reaching_ud2() {
         let source = include_str!("linux_personality.rs");
         assert!(
-            source.contains("UserFaultSupply::OwnerWait(wait)"),
+            source.contains("UserFaultSupply::TypedRelease(wait)"),
             "the Selected arm must retain the typed owner wait through parking"
         );
         assert!(
