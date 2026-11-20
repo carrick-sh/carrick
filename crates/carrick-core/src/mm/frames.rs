@@ -52,6 +52,7 @@ pub enum PublicationTerminal {
 /// only executes the returned action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationCompletion {
+    Published,
     Declined(Option<PublicationDecline>),
     SlotNotWorking,
     StaleRequest,
@@ -71,6 +72,7 @@ pub enum PublicationInvariant {
 /// The one ISA-neutral next action for a refused frame-grant publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationNextAction {
+    Published,
     Fatal(PublicationInvariant),
     ParkOnMmRelease { mm_key: u64 },
     RerunWith(SelectedBackingPlan),
@@ -89,6 +91,7 @@ pub fn publication_next_action(
     mm_key: u64,
 ) -> PublicationNextAction {
     let decline = match completion {
+        PublicationCompletion::Published => return PublicationNextAction::Published,
         PublicationCompletion::Declined(Some(decline)) => decline,
         PublicationCompletion::Declined(None) => {
             return PublicationNextAction::Fatal(PublicationInvariant::MissingDecline);
