@@ -2268,6 +2268,30 @@ fn empty_native_descriptor_demand_does_not_touch_unrelated_stock() {
 }
 
 #[test]
+fn registered_root_draws_shared_tables_and_retires_once() {
+    let mut stock = stock(UntaggedRoots, 24, 1);
+    let root = parent();
+    // SAFETY: this fixture owns the admitted root incarnation.
+    let owner = unsafe {
+        El1MmHandle::from_admitted_owner(CARRIER, mm(PARENT_MM), NonZeroU64::MIN)
+    };
+    stock.register_root(owner, root.context.root).unwrap();
+    let before = stock.table_stock().len();
+    let reservation = stock
+        .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root.context.root, 13)
+        .unwrap();
+    assert_eq!(stock.table_stock().len(), before - 13);
+    stock.cancel_native_descriptor_tables(&mut NoTableLedger, reservation);
+    assert_eq!(stock.table_stock().len(), before);
+    stock.retire_exited_root(owner.mm());
+    stock.retire_exited_root(owner.mm());
+    assert!(stock.register_root(owner, root.context.root).is_err());
+    assert_eq!(stock.reclaim(&mut NoTableLedger, mm(999), absent, |_| true, |_| true, |_| true).unwrap(), 1);
+    assert_eq!(stock.reclaim(&mut NoTableLedger, mm(999), absent, |_| true, |_| true, |_| true).unwrap(), 0);
+    stock.register_root(owner, root.context.root).unwrap();
+}
+
+#[test]
 fn many_native_backing_supplies_return_unused_tables_across_two_children() {
     use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
 
