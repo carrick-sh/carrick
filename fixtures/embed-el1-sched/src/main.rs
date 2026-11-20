@@ -1355,6 +1355,81 @@ fn epoll_take(c: EpollEventfd) -> bool {
     unsafe { libc::read(c.efd, (&mut value as *mut u64).cast(), 8) == 8 }
 }
 
+/// Fork a native child and wait for a datagram from the signed host harness.
+fn native_host_epoll(port: u16) -> i32 {
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return 1;
+    }
+    if child == 0 {
+        // The parent's wait status is the result of the child's assertions.
+        let result = native_host_epoll_child(port);
+        unsafe { libc::_exit(result) }
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(child, &mut status, 0) } != child {
+        return 2;
+    }
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        3
+    }
+}
+
+fn native_host_epoll_child(port: u16) -> i32 {
+    const COOKIE: u64 = 0x2418_cafe_f00d;
+    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    let epoll = unsafe { libc::epoll_create1(0) };
+    if socket < 0 || epoll < 0 {
+        return 4;
+    }
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        },
+        sin_zero: [0; 8],
+    };
+    if unsafe {
+        libc::connect(
+            socket,
+            (&raw const address).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    } != 0
+    {
+        return 5;
+    }
+    let mut interest = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: COOKIE,
+    };
+    if unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, socket, &mut interest) } != 0 {
+        return 6;
+    }
+    let tid = (unsafe { libc::syscall(libc::SYS_gettid) } as u64).to_ne_bytes();
+    if unsafe { libc::write(socket, tid.as_ptr().cast(), tid.len()) } != tid.len() as isize {
+        return 7;
+    }
+    let mut event = libc::epoll_event { events: 0, u64: 0 };
+    if unsafe { libc::epoll_wait(epoll, &mut event, 1, -1) } != 1
+        || event.events != libc::EPOLLIN as u32
+        || event.u64 != COOKIE
+    {
+        return 8;
+    }
+    if unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_DEL, socket, std::ptr::null_mut()) } != 0 {
+        return 9;
+    }
+    // The socket is still readable, but its report must have been removed.
+    if unsafe { libc::epoll_wait(epoll, &mut event, 1, 0) } != 0 {
+        return 10;
+    }
+    0
+}
+
 /// `epoll-pingpong <iters>`: libuv's MessagePort shape. Two threads, each
 /// with its own epoll over its own eventfd; A posts B's eventfd and blocks in
 /// `epoll_wait` until B posts A's. Every turn is an eventfd write, an
@@ -3758,6 +3833,7 @@ fn main() {
             args.get(4).and_then(|n| n.parse().ok()).unwrap_or(128),
         ),
         "pipe-pingpong" => pipe_pingpong(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000)),
+        "native-host-epoll" => native_host_epoll(args[2].parse().expect("UDP peer port")),
         "epoll-pingpong" => {
             epoll_pingpong(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000))
         }
