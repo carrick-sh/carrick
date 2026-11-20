@@ -5,7 +5,6 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <pthread.h>
-#include <sched.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -42,18 +41,6 @@ static int listener(void) {
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     int two = strcmp(argv[1], "two") == 0;
-    /* Sender and target share one CPU: the target cannot run between the
-     * caught and fatal kill(2) calls merely because the host has spare CPUs. */
-    cpu_set_t allowed, one_cpu;
-    if (sched_getaffinity(0, sizeof(allowed), &allowed)) return 13;
-    int cpu = -1;
-    for (int index = 0; index < CPU_SETSIZE; ++index) {
-        if (CPU_ISSET(index, &allowed)) { cpu = index; break; }
-    }
-    if (cpu < 0) return 14;
-    CPU_ZERO(&one_cpu);
-    CPU_SET(cpu, &one_cpu);
-    if (sched_setaffinity(0, sizeof(one_cpu), &one_cpu)) return 15;
     int report[2], tids[2];
     if (pipe(report) || pipe(tids)) return 3;
     int notify = listener();
@@ -86,7 +73,16 @@ int main(int argc, char **argv) {
     if (two) {
         if (syscall(SYS_tgkill, child, sibling_tid, SIGTERM)) return 9;
     } else {
-        if (kill(child, SIGUSR1) || kill(child, SIGTERM)) return 11;
+        /* SECCOMP_RET_USER_NOTIF sleeps interruptibly: unblocked caught SIGUSR1
+         * wakes the target onto the runqueue, and single-CPU affinity does not
+         * stop preemptive scheduling between two separate kill(2) syscalls.
+         * Hold the target in job-control stop after execve reaches seccomp so
+         * both SIGUSR1 and SIGTERM are pending before SIGCONT runs delivery. */
+        int stopped = 0;
+        if (kill(child, SIGSTOP)) return 10;
+        if (waitpid(child, &stopped, WUNTRACED) != child) return 13;
+        if (!WIFSTOPPED(stopped) || WSTOPSIG(stopped) != SIGSTOP) return 14;
+        if (kill(child, SIGUSR1) || kill(child, SIGTERM) || kill(child, SIGCONT)) return 11;
     }
     int status;
     if (waitpid(child, &status, 0) != child) return 12;
