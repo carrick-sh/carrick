@@ -721,12 +721,25 @@ fn mounted_static_x86_native_executable_link_follows_fork_and_exec() {
     compile_assembly(fixture, &elf);
     compile_assembly_with_flags(fixture, &successor, &["-DSUCCESSOR"]);
     let archive = image_archive_with_executable(Some(&successor));
-    let (guest, _) = run_mounted_binary_in_archive(&elf, "native-exe-link", false, &archive);
+    let (guest, _) = run_mounted_binary_in_archive(&elf, "native-exe-link", true, &archive);
     assert_eq!(
         guest.status.code(),
         Some(7),
-        "executable link: exit 218 is child ENOSYS, 219 is root ENOSYS,          220 is successor ENOSYS, 93 is exec failure, 94 is length/content,          95 is truncation; stderr: {}",
+        concat!(
+            "executable link: exit 218 is child ENOSYS, 219 is root ENOSYS, ",
+            "220 is successor ENOSYS, 93 is exec failure, 94 is length/content, ",
+            "95 is truncation. Stderr: {}"
+        ),
         String::from_utf8_lossy(&guest.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&guest.stdout).unwrap();
+    assert_eq!(
+        report["report"]["execution_witness"]["backend"],
+        "kvm-x86-cpl0"
+    );
+    assert_eq!(
+        report["report"]["execution_witness"]["host_forwards"], 6,
+        "only the root's three pairs of readlinks cross host dispatch"
     );
 }
 

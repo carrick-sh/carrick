@@ -32,10 +32,17 @@ accessed. The output allocation is bounded by the existing 64 KiB record
 budget and the caller's positive signed buffer size. There is no polling,
 new wait queue, host-task syscall fallback, or crossing allowlist change.
 
-Non-`/` roots and foreign or other proc/fd magic links remain counted
-refusals. Ordinary symlinks use the same VFS implementation. The x86 decoder
-already desugars `readlink` to `readlinkat`; the x86 carrier has no native exec
-custody yet and supplies no executable identity. That remains seam #1903.
+The ring stamps the caller's validated namespace PID on readlink requests.
+The shared owner recognizes both `/proc/self/exe` and the caller's numeric
+`/proc/<pid>/exe`. Non-`/` roots and other tasks' proc/fd magic links
+remain counted refusals. Ordinary symlinks use the same VFS implementation.
+
+The CPL0 carrier takes the initial executable in the existing root fork
+seed. A fork copies the reference from the parent's authenticated custody.
+The x86 exec loader retains the resolved source through preparation and
+moves it into the successor's custody on adoption. Both CPL0 service
+transports supply the exact committed MM's executable to the shared host-file
+owner. Cwd-based readlink from the host-served root keeps its existing route.
 
 ## Evidence
 
@@ -102,3 +109,19 @@ macOS/AArch64-gated; this worker cannot execute the new guest cases or the
 binding-removal experiment. Their signed green and mutation red results
 remain **unverified**, as does the native arm64 Docker bless. Do not count
 Linux fixture controls or a cross-check as either result.
+
+
+## x86 production lifecycle
+
+The CLI KVM witness runs a root and fork child with the same executable,
+then replaces the child with an executable from the image. The child and
+successor read both self and numeric proc links. The parent verifies its own
+path before the fork, while the child is live, and after reap. Each spelling
+checks length, exact bytes, and the unchanged sentinel after a short copy.
+The KVM run receipt counts only the root's readlinks in host dispatch.
+
+On the #2590 stack base the witness reached the child and returned errno 38
+after the root succeeded. Legacy x86 syscall 89 is tracked by #2624. The
+descendant's `/proc/self` directory descriptor was optional and its
+open/close prerequisite failed on this stack. The lifecycle witness uses
+`AT_FDCWD`.

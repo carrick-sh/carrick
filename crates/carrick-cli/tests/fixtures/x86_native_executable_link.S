@@ -5,19 +5,20 @@
 _start:
 #ifdef SUCCESSOR
     mov $220, %r13d
-    call check_link
+    call check_self_link
+    call check_numeric_link
     mov $7, %edi
     jmp exit
 #else
     mov $219, %r13d
-    call check_link
+    call check_self_link
     mov $57, %eax                 /* fork */
     syscall
     test %eax, %eax
     js process_failure
     jz child
     mov %eax, %r12d
-    call check_link
+    call check_self_link
     mov %r12d, %edi
     lea status(%rip), %rsi
     xor %edx, %edx
@@ -29,11 +30,15 @@ _start:
     mov status(%rip), %edi
     test $127, %edi
     jnz process_failure
-    shr $8, %edi
+    mov %edi, %r15d
+    shr $8, %r15d
+    call check_self_link
+    mov %r15d, %edi
     jmp exit
 child:
     mov $218, %r13d
-    call check_link
+    call check_self_link
+    call check_numeric_link
     lea successor(%rip), %rdi
     lea successor_argv(%rip), %rsi
     xor %edx, %edx
@@ -45,6 +50,33 @@ process_failure:
     mov $92, %edi
     jmp exit
 #endif
+
+check_self_link:
+    lea proc_exe(%rip), %r14
+    jmp check_link
+
+/* Write decimal getpid() backwards before the fixed "/exe" suffix. */
+check_numeric_link:
+    mov $39, %eax                 /* getpid */
+    syscall
+    test %eax, %eax
+    jle wrong_link
+    lea numeric_suffix(%rip), %r14
+    mov $10, %ecx
+1:
+    xor %edx, %edx
+    div %ecx
+    add $'0', %dl
+    dec %r14
+    mov %dl, (%r14)
+    test %eax, %eax
+    jne 1b
+    sub $6, %r14
+    mov %r14, %rdi
+    lea proc_exe(%rip), %rsi
+    mov $6, %ecx
+    rep movsb
+    jmp check_link
 
 check_link:
     lea buffer(%rip), %rdx
@@ -78,7 +110,7 @@ check_link:
 
 readlink_exe:
     mov $-100, %rdi               /* AT_FDCWD */
-    lea proc_exe(%rip), %rsi
+    mov %r14, %rsi
     mov $267, %eax                /* readlinkat */
     syscall
     cmp $-38, %rax
@@ -112,6 +144,10 @@ successor_argv: .quad successor, 0
 #else
 .set expected_len, 6
 #endif
+
+.data
+.space 16
+numeric_suffix: .asciz "/exe"
 
 .bss
 .balign 4096
