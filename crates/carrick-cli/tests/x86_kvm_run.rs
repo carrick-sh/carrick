@@ -1915,6 +1915,21 @@ fn mounted_static_x86_glibc_hello_matches_native() {
     compare_mounted_binary_with_native(&elf, b"hello, x86_64 world\n", 0, "glibc-hello");
 }
 
+/// Root Prepare must borrow more than twelve linked tables from shared stock
+/// through the real container entry point.
+#[test]
+fn mounted_static_x86_root_maps_sixteen_table_regions() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("root-tables");
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/x86_root_tables.c");
+    x86_process_entry::compile_static_fixture(&source, &elf, &[]);
+    compare_mounted_binary_with_native(&elf, b"ROOT_TABLES_OK\n", 0, "root-tables");
+}
+
 #[test]
 #[ignore = "musl startup needs CPL0 signal actions and anonymous first-touch backing"]
 fn mounted_static_x86_musl_hello_matches_native() {
