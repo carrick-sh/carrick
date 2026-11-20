@@ -42,9 +42,9 @@ host during measurement.
 
 | Probe | Stage-1 walks before → after | Blocks/s before → after | Instructions/s before → after |
 |---|---:|---:|---:|
-| Memory loop, 10,000 iterations | 50,002 → 3 | 183,437 → 543,853 | 244,581 → 725,132 |
-| EL1 trampoline to first HVC | 5,547 → 72 | 19,713 → 22,820 | 38,078 → 44,080 |
-| Static musl hello to first carrier call | 19,078 → 127 | 33,743 → 44,659 | 66,571 → 88,109 |
+| Memory loop, 10,000 iterations | 50,002 → 3 | 236,618 → 860,691 | 315,488 → 1,147,578 |
+| EL1 trampoline to first HVC | 5,547 → 72 | 26,556 → 27,482 | 51,297 → 53,086 |
+| Static musl hello to first carrier call | 19,078 → 127 | 27,152 → 44,700 | 53,569 → 88,189 |
 
 With the TLB opt-out, the EL1 trampoline took 5,547 walks and reached the
 same HVC. The rates measure the soft dispatcher in QEMU. Native ARM timing,
