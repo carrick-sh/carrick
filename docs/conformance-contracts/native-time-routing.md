@@ -387,3 +387,19 @@ The earlier clock-resource sleep subscription (`NativeSleep`, the
 `SleepArm`/`SleepCancel` wire operations and the host `TimerHub` thread) is
 removed: it was a second timer owner with no production caller. The clock
 record keeps its sample and timex operations for slice 3.
+
+## Clock resolution in ring (#2028)
+
+ARM and x86 native entries use the same clock ID and resolution policy for
+`clock_getres`. A supported clock with a null destination succeeds. A
+writable destination receives one timespec through the existing owned
+copyout continuation, which retains the bytes across a memory-owner wait.
+The query takes no clock sample and makes no host syscall. The reported
+resolution follows Carrick's existing Linux policy, including the ARM
+vDSO's coarse clock grid.
+
+The ARM VM-free witness keeps the fork parent and child live and checks a
+valid clock with a null destination and an invalid clock ID. The x86 KVM
+witness checks a writable timespec in the root and its fork child. Clock
+samples, CPU accounting, and x86 vDSO publication still need their own
+execution evidence.
