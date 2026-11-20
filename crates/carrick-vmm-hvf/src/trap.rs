@@ -8542,6 +8542,7 @@ impl HvfInner {
                         })?;
                     // Runtime propagates this named error through carrier cleanup;
                     // the CLI's existing run-failure convention is exit 125.
+                    carrick_el1_abi::flush_native_child_lifecycle_to_host();
                     return Err(TrapError::NativeRunFailure {
                         reason: reason.as_str(),
                         crossings,
@@ -8589,6 +8590,35 @@ impl HvfInner {
                             publication_detail: vcpu.get_reg(Reg::X3).unwrap_or(0),
                         },
                     };
+                    carrick_el1_abi::flush_native_child_lifecycle_to_host();
+                    if let Some(diag) = diagnostic.as_ref() {
+                        let raw_task = diag.loaded.task.raw();
+                        if raw_task > 1
+                            && let Some(id) =
+                                core::num::NonZeroI32::new(raw_task as i32).filter(|v| v.get() > 0)
+                        {
+                            let serial_raw =
+                                diag.record.map(|r| r.identity.serial).unwrap_or(1).max(1);
+                            if let Some(serial) = core::num::NonZeroU64::new(serial_raw) {
+                                let task_key = carrick_sched_core::process::TaskKey {
+                                    id: carrick_sched_core::process::TaskId::from_registry_allocation(id),
+                                    serial: carrick_sched_core::process::TaskSerial::from_registry_allocation(serial),
+                                };
+                                let fatal_reason = diag
+                                    .registers
+                                    .reason
+                                    .and_then(carrick_el1_abi::EntryBindingFatalReason::from_raw)
+                                    .map(carrick_el1_abi::NativeChildTerminalReason::EntryBindingFatal)
+                                    .unwrap_or(carrick_el1_abi::NativeChildTerminalReason::CarrierFatal(
+                                        carrick_el1_abi::NativeCarrierFatalKind::El1Panic,
+                                    ));
+                                carrick_el1_abi::emit_carrier_fatal_if_unrecorded(
+                                    task_key,
+                                    fatal_reason,
+                                );
+                            }
+                        }
+                    }
                     carrick_fatal!("el1", "{report}");
                 }
                 if is_stage1_cow_write_fault(esr_el1) {

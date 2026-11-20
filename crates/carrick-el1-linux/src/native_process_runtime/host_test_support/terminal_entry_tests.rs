@@ -2162,3 +2162,684 @@ fn x86_terminal_close_with_foreign_service_control_quarantines_at_member_guard()
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
     >(words);
 }
+
+static NATIVE_CHILD_LIFECYCLE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static NATIVE_CHILD_LIFECYCLE_CAPTURED: std::sync::Mutex<
+    Vec<carrick_el1_abi::NativeChildLifecycleEvent>,
+> = std::sync::Mutex::new(Vec::new());
+
+fn capture_native_child_lifecycle_event(event: carrick_el1_abi::NativeChildLifecycleEvent) {
+    NATIVE_CHILD_LIFECYCLE_CAPTURED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(event);
+}
+
+fn noop_native_child_lifecycle_flush() {}
+
+fn native_child_lifecycle_records_six_transitions_and_terminal_fatal_exit_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    root_tid: u64,
+    exec_ordinal: u64,
+    use_x86_exec_call: bool,
+) {
+    use carrick_el1_abi::{
+        EntryBindingFatalReason, NativeChildExecOutcome, NativeChildForkFlags,
+        NativeChildLifecycleEvent, NativeChildLostReason, NativeChildLostSite,
+        NativeChildTerminalReason, NativeParentWakeReason,
+    };
+    use carrick_personality_linux::lifecycle::LinuxWaitStatus;
+
+    let _serial = NATIVE_CHILD_LIFECYCLE_TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    carrick_el1_abi::register_native_child_lifecycle_host_hooks(
+        capture_native_child_lifecycle_event,
+        noop_native_child_lifecycle_flush,
+    );
+    while let Some(ev) = carrick_el1_abi::host_fallback_native_child_lifecycle().pop() {
+        capture_native_child_lifecycle_event(ev);
+    }
+    NATIVE_CHILD_LIFECYCLE_CAPTURED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+
+    let fixture = NativeSignalFixture::<C>::with_identity_for::<B>(
+        true,
+        move |_| {
+            (
+                ExecutionBinding {
+                    task: carrick_core_abi::EntryTaskKey::from_raw(root_tid),
+                    generation: carrick_core_abi::SnapshotGeneration::INITIAL,
+                    mm: carrick_core_abi::EntryMmKey::from_raw(1),
+                    thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(1),
+                },
+                carrick_core_abi::EntryTaskKey::from_raw(root_tid),
+                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_registry_allocation(
+                    NonZeroU64::new(root_tid).unwrap(),
+                )),
+                5,
+            )
+        },
+        make_words,
+    );
+    let capacity = NativeServiceCapacityFixture::from_fixture_rusage(fixture, 1, UserVa::new(0));
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let root_key = fixture.runtime.graph.lock().root_key;
+
+    // 1. Select forked child 1 and run it through exec intake.
+    let (child1_record, child1_pre_addr, child1_saved) = capacity.select().unwrap();
+    let child1_identity = fixture.zone.record(child1_record.id).identity();
+    let child1_control = unsafe { &*(child1_identity.control_slot as *const ThreadControlSlot) };
+    let child1_key = fixture
+        .registry
+        .state
+        .lock()
+        .members
+        .values()
+        .find(|member| member.record == child1_record)
+        .unwrap()
+        .process;
+    assert_ne!(child1_key, root_key);
+    {
+        let mut service = fixture.service();
+        let mut child1 = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                child1_pre_addr,
+                &child1_saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child1.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+        let counters = carrick_el1_abi::Counters::new();
+        let call = crate::native_process_runtime::NativeServiceCall::new(
+            carrick_guest_arch::NativeOrdinal::new(exec_ordinal),
+            &counters,
+        );
+        if use_x86_exec_call {
+            let resumed = child1
+                .begin_exec_call(test_exec_payload(b"/bin/static"), None, call)
+                .unwrap();
+            assert!(matches!(resumed, NativeResume::Left(None)));
+        } else {
+            let result = child1.begin_exec_service(test_exec_payload(b"/bin/static"), None, call);
+            let phase = child1.native_service_phase();
+            let settled = child1.settle_service_exit(result, NativeServiceExit::Bridge);
+            let resumed = crate::dispatch::native_service_completion(settled, phase).unwrap();
+            assert!(matches!(resumed, NativeResume::Left(None)));
+        }
+    }
+
+    // 2. Host seals child 1's exec successor; child 1 adopts it (`Exec(Succeeded)`) and exits(7).
+    publish_test_exec_reply_for(
+        fixture,
+        fixture.task,
+        child1_control,
+        fixture.slot,
+        301,
+        0x180_0000,
+        false,
+    );
+    let (resumed_record, resumed_pre_addr, resumed_saved) = capacity.select().unwrap();
+    assert_eq!(resumed_record, child1_record);
+    {
+        let mut service = fixture.service();
+        let mut child1 = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                resumed_pre_addr,
+                &resumed_saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child1.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+    }
+    let child1_post_addr = fixture.runtime.task_binding(child1_key).unwrap().address;
+    fixture
+        .task
+        .publish_root_generation(child1_post_addr.generation);
+    {
+        let mut service = fixture.service();
+        let mut child1 = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                child1_post_addr,
+                &(fixture.make_words)(child1_post_addr),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child1.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(child1.take_handoff_receipt().is_some());
+    }
+
+    // 3. Parent wakes from `wait4(-1)` (`ParentWake`), reaps child 1 (`Reaped`), and forks child 2.
+    let (parent_record, parent_addr, parent_saved) = capacity.select().unwrap();
+    assert_eq!(parent_record, fixture.record);
+    {
+        let mut service = fixture.service();
+        let mut parent = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                parent_addr,
+                &parent_saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            parent.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::Returned(res) if res.raw() == i64::from(child1_key.id.raw())
+        ));
+    }
+    {
+        let mut fork_service = fixture.service();
+        fork_service.page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+        fork_service.controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        })));
+        let mut parent = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                parent_addr,
+                &(fixture.make_words)(parent_addr),
+                &mut fork_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            parent.fork(ProcessForkChildTid::NONE),
+            LifecycleOutcome::Returned { result, .. } if result.raw() > 0
+        ));
+    }
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, fixture.record.id)
+            .is_queued()
+    );
+    fixture.zone.clear_current(fixture.slot);
+
+    // 4. Child 2 runs and hits a terminal service-handoff fatal (`EntryBindingFatal`).
+    let (child2_record, child2_addr, child2_saved) = capacity.select().unwrap();
+    assert_ne!(child2_record, fixture.record);
+    let child2_key = fixture
+        .registry
+        .state
+        .lock()
+        .members
+        .values()
+        .find(|member| member.record == child2_record)
+        .unwrap()
+        .process;
+    assert_ne!(child2_key, root_key);
+    assert_ne!(child2_key, child1_key);
+    {
+        let mut service = fixture.service();
+        let mut child2 = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                child2_addr,
+                &child2_saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child2.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+        let settled =
+            child2.settle_service_exit(Ok(NativeResume::Left(None)), NativeServiceExit::Bridge);
+        let fatal =
+            crate::dispatch::native_service_completion(settled, child2.native_service_phase())
+                .err()
+                .expect("unreceipted Left must fail handoff authentication");
+        assert_eq!(
+            fatal.fatal_reason(),
+            EntryBindingFatalReason::NativeServiceQuarantinedHandoffAuthentication
+        );
+    }
+
+    let captured_all: Vec<NativeChildLifecycleEvent> = NATIVE_CHILD_LIFECYCLE_CAPTURED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
+    let relevant: Vec<NativeChildLifecycleEvent> = captured_all
+        .iter()
+        .copied()
+        .filter(|ev| match ev {
+            NativeChildLifecycleEvent::ForkCreated { parent, child, .. } => {
+                *parent == root_key || *child == child1_key || *child == child2_key
+            }
+            NativeChildLifecycleEvent::Exec { task, .. }
+            | NativeChildLifecycleEvent::Exit { task, .. } => {
+                *task == child1_key || *task == child2_key
+            }
+            NativeChildLifecycleEvent::ZombiePublished { child, parent } => {
+                *child == child1_key || *parent == root_key
+            }
+            NativeChildLifecycleEvent::ParentWake { parent, .. } => *parent == root_key,
+            NativeChildLifecycleEvent::Reaped { caller, child, .. } => {
+                *caller == root_key || *child == child1_key
+            }
+            NativeChildLifecycleEvent::Removed { .. } => false,
+        })
+        .collect();
+
+    assert_eq!(
+        relevant,
+        vec![
+            NativeChildLifecycleEvent::ForkCreated {
+                parent: root_key,
+                child: child1_key,
+                flags: NativeChildForkFlags {
+                    exit_signal: 17,
+                    vfork: false,
+                    child_settid: false,
+                    child_cleartid: false,
+                },
+            },
+            NativeChildLifecycleEvent::Exec {
+                task: child1_key,
+                outcome: NativeChildExecOutcome::Succeeded,
+            },
+            NativeChildLifecycleEvent::Exit {
+                task: child1_key,
+                reason: NativeChildTerminalReason::Exited {
+                    status: LinuxWaitStatus::exited(7),
+                },
+            },
+            NativeChildLifecycleEvent::ZombiePublished {
+                child: child1_key,
+                parent: root_key,
+            },
+            NativeChildLifecycleEvent::ParentWake {
+                parent: root_key,
+                reason: NativeParentWakeReason::ChildExit,
+                woken: 1,
+            },
+            NativeChildLifecycleEvent::Reaped {
+                caller: root_key,
+                child: child1_key,
+                status: LinuxWaitStatus::exited(7),
+            },
+            NativeChildLifecycleEvent::ForkCreated {
+                parent: root_key,
+                child: child2_key,
+                flags: NativeChildForkFlags {
+                    exit_signal: 17,
+                    vfork: false,
+                    child_settid: false,
+                    child_cleartid: false,
+                },
+            },
+            NativeChildLifecycleEvent::Exit {
+                task: child2_key,
+                reason: NativeChildTerminalReason::EntryBindingFatal(
+                    EntryBindingFatalReason::NativeServiceQuarantinedHandoffAuthentication,
+                ),
+            },
+        ]
+    );
+
+    let child1_removals: Vec<(NativeChildLostReason, NativeChildLostSite)> = captured_all
+        .iter()
+        .filter_map(|ev| match ev {
+            NativeChildLifecycleEvent::Removed {
+                task, reason, site, ..
+            } if *task == child1_key => Some((*reason, *site)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        child1_removals,
+        vec![
+            (
+                NativeChildLostReason::RegistryRehomeReplace,
+                NativeChildLostSite::RegistryExecSuccessor,
+            ),
+            (
+                NativeChildLostReason::ProcessExitPublish,
+                NativeChildLostSite::OwnerPublishExit,
+            ),
+            (
+                NativeChildLostReason::RegistryUnregisterProcess,
+                NativeChildLostSite::RegistryUnregisterProcess,
+            ),
+            (
+                NativeChildLostReason::WaitReap,
+                NativeChildLostSite::OwnerConsumeWait4,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn arm_native_child_lifecycle_records_six_transitions_and_terminal_fatal_exit() {
+    native_child_lifecycle_records_six_transitions_and_terminal_fatal_exit_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, 91001, 221, false);
+}
+
+#[test]
+fn x86_native_child_lifecycle_records_six_transitions_and_terminal_fatal_exit() {
+    native_child_lifecycle_records_six_transitions_and_terminal_fatal_exit_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, 92001, 59, true);
+}
+
+fn native_child_lost_records_rollback_autoreap_run_failure_and_host_yield_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    root_tid: u64,
+) {
+    use carrick_el1_abi::{NativeChildLifecycleEvent, NativeChildLostReason, NativeChildLostSite};
+    use carrick_signal_core::policy::{Action, Disposition, Signal};
+
+    let _serial = NATIVE_CHILD_LIFECYCLE_TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    carrick_el1_abi::register_native_child_lifecycle_host_hooks(
+        capture_native_child_lifecycle_event,
+        noop_native_child_lifecycle_flush,
+    );
+    while let Some(ev) = carrick_el1_abi::host_fallback_native_child_lifecycle().pop() {
+        capture_native_child_lifecycle_event(ev);
+    }
+    NATIVE_CHILD_LIFECYCLE_CAPTURED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+
+    let fixture = NativeSignalFixture::<C>::with_identity_for::<B>(
+        true,
+        move |_| {
+            (
+                ExecutionBinding {
+                    task: carrick_core_abi::EntryTaskKey::from_raw(root_tid),
+                    generation: carrick_core_abi::SnapshotGeneration::INITIAL,
+                    mm: carrick_core_abi::EntryMmKey::from_raw(1),
+                    thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(1),
+                },
+                carrick_core_abi::EntryTaskKey::from_raw(root_tid),
+                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_registry_allocation(
+                    NonZeroU64::new(root_tid).unwrap(),
+                )),
+                5,
+            )
+        },
+        make_words,
+    );
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+
+    // 1. Pre-commit fork rollback (`BirthRollback` / `ForkRollbackPrepareMm`) before `from_fixture_rusage`.
+    super::fail_prepare_mm(&[NativeProcessError::Invalid]);
+    {
+        let mut fork_service = fixture.service();
+        fork_service.page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+        fork_service.controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        })));
+        let mut parent = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut fork_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            parent.fork(ProcessForkChildTid::NONE),
+            LifecycleOutcome::Returned { result, .. } if result.raw() < 0
+        ));
+    }
+
+    // 2. Fork three live children via `NativeServiceCapacityFixture` and install `SIG_IGN` on `SIGCHLD`.
+    let capacity = NativeServiceCapacityFixture::from_fixture_rusage(fixture, 3, UserVa::new(0));
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let root_key = fixture.runtime.graph.lock().root_key;
+    {
+        let graph = fixture.runtime.graph.lock();
+        graph
+            .owner
+            .task(root_key)
+            .unwrap()
+            .native()
+            .resources()
+            .signals
+            .install_action(
+                root_key,
+                Signal::CHLD,
+                Action {
+                    disposition: Disposition::Ignore,
+                    ..Action::default()
+                },
+            )
+            .unwrap();
+    }
+
+    // 3. First child exercises `user_return_host_custody` (`HostCustodyYield`).
+    let (child_yield_ref, child_yield_addr, child_yield_saved) = capacity.select().unwrap();
+    let child_yield_key = fixture
+        .registry
+        .state
+        .lock()
+        .members
+        .values()
+        .find(|m| m.record == child_yield_ref)
+        .unwrap()
+        .process;
+    assert_ne!(child_yield_key, root_key);
+    {
+        let mut service = fixture.service();
+        let mut child_yield = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                child_yield_addr,
+                &child_yield_saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child_yield.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+        assert_eq!(
+            child_yield.user_return_host_custody(),
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended
+        );
+        assert!(child_yield.take_handoff_receipt().is_some());
+    }
+    fixture.zone.release_space(fixture.slot);
+    assert!(fixture.zone.take_service_head(fixture.slot).is_some());
+
+    // 4. Second child exercises `run_failed` (`RunFailureRetire`).
+    let (child_fail_ref, child_fail_addr, child_fail_saved) = capacity.select().unwrap();
+    let child_fail_key = fixture
+        .registry
+        .state
+        .lock()
+        .members
+        .values()
+        .find(|m| m.record == child_fail_ref)
+        .unwrap()
+        .process;
+    assert_ne!(child_fail_key, root_key);
+    {
+        let mut service = fixture.service();
+        let mut child_fail = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                child_fail_addr,
+                &child_fail_saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child_fail.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+        child_fail.set_calling_tid(999_999);
+        assert!(matches!(
+            child_fail.exit_group(9),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert_eq!(
+            child_fail.take_run_failure(),
+            Some(carrick_core_abi::NativeRunFailureReason::NativeStale)
+        );
+        assert!(child_fail.take_handoff_receipt().is_some());
+    }
+    fixture.zone.release_space(fixture.slot);
+
+    // 5. Third child exits under SIG_IGN (`ProcessExitPublish`, `RegistryUnregisterProcess`, `ExitAutoreap`).
+    let (child_auto_ref, child_auto_addr, child_auto_saved) = capacity.select().unwrap();
+    let child_auto_key = fixture
+        .registry
+        .state
+        .lock()
+        .members
+        .values()
+        .find(|m| m.record == child_auto_ref)
+        .unwrap()
+        .process;
+    assert_ne!(child_auto_key, root_key);
+    {
+        let mut service = fixture.service();
+        let mut child_auto = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                child_auto_addr,
+                &child_auto_saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child_auto.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+        assert!(matches!(
+            child_auto.exit_group(0),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(child_auto.take_handoff_receipt().is_some());
+    }
+
+    let removals: Vec<(TaskKey, NativeChildLostReason, NativeChildLostSite)> =
+        NATIVE_CHILD_LIFECYCLE_CAPTURED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|ev| match ev {
+                NativeChildLifecycleEvent::Removed {
+                    task, reason, site, ..
+                } => Some((*task, *reason, *site)),
+                _ => None,
+            })
+            .collect();
+
+    assert!(
+        removals.iter().any(|(_, reason, site)| {
+            *reason == NativeChildLostReason::BirthRollback
+                && *site == NativeChildLostSite::ForkRollbackPrepareMm
+        }),
+        "expected BirthRollback/ForkRollbackPrepareMm in {removals:?}"
+    );
+    assert!(
+        removals.contains(&(
+            child_auto_key,
+            NativeChildLostReason::ExitAutoreap,
+            NativeChildLostSite::OwnerExitAutoreap,
+        )),
+        "expected ExitAutoreap for {child_auto_key:?} in {removals:?}"
+    );
+    assert!(
+        removals.contains(&(
+            child_yield_key,
+            NativeChildLostReason::HostCustodyYield,
+            NativeChildLostSite::EntryUserReturnHostCustody,
+        )),
+        "expected HostCustodyYield for {child_yield_key:?} in {removals:?}"
+    );
+    assert!(
+        removals.contains(&(
+            child_fail_key,
+            NativeChildLostReason::RunFailureRetire,
+            NativeChildLostSite::EntryRunFailedRetire,
+        )),
+        "expected RunFailureRetire for {child_fail_key:?} in {removals:?}"
+    );
+}
+
+#[test]
+fn arm_native_child_lost_records_rollback_autoreap_run_failure_and_host_yield() {
+    native_child_lost_records_rollback_autoreap_run_failure_and_host_yield_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, 93001);
+}
+
+#[test]
+fn x86_native_child_lost_records_rollback_autoreap_run_failure_and_host_yield() {
+    native_child_lost_records_rollback_autoreap_run_failure_and_host_yield_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, 94001);
+}

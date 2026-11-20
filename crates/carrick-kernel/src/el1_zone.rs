@@ -649,6 +649,41 @@ pub fn host_resume_ready(record: RecordRef) -> bool {
         .is_some_and(|zone| zone.host_resume_readiness(record) == Some(true))
 }
 
+/// Emit `NCHILD_LOST` when a native-owned `ZoneTables` record is dropped or
+/// freed on a host path outside `NativeProcessRuntime::exit_with_status`.
+pub fn record_native_identity_lost(
+    identity: carrick_sched_core::ThreadIdentity,
+    reason: carrick_el1_abi::NativeChildLostReason,
+    site: carrick_el1_abi::NativeChildLostSite,
+    detail: u64,
+) {
+    if let Some(task) =
+        carrick_el1_abi::task_key_from_record_identity(identity.tid, identity.serial)
+    {
+        crate::event_ring::rec_native_child_lifecycle(
+            carrick_el1_abi::NativeChildLifecycleEvent::Removed {
+                task,
+                reason,
+                site,
+                detail,
+            },
+        );
+    }
+}
+
+pub fn record_native_record_lost(
+    zone: &ZoneTables,
+    record: RecordRef,
+    reason: carrick_el1_abi::NativeChildLostReason,
+    site: carrick_el1_abi::NativeChildLostSite,
+) {
+    if let Some(rec) = zone.live(record)
+        && rec.is_native_owned()
+    {
+        record_native_identity_lost(rec.identity(), reason, site, u64::from(record.id.raw()));
+    }
+}
+
 /// Retire a parked thread whose host continuation is gone: free a record
 /// the host could claim, or flag one EL1 holds so its slot discards it.
 pub fn cancel(record: RecordRef) {
@@ -660,6 +695,12 @@ pub fn cancel(record: RecordRef) {
     }) {
         HostClaim::Claimed | HostClaim::AlreadyHost => {
             if zone.live(record).is_some() {
+                record_native_record_lost(
+                    zone,
+                    record,
+                    carrick_el1_abi::NativeChildLostReason::HostStaleServiceFree,
+                    carrick_el1_abi::NativeChildLostSite::HostZoneCancelFree,
+                );
                 zone.free_record(record.id);
             }
         }
@@ -1301,6 +1342,12 @@ pub fn place_service(
     if deliver_placement(zone.place_from_host(record)) {
         return true;
     }
+    record_native_record_lost(
+        zone,
+        zone.record_ref(record),
+        carrick_el1_abi::NativeChildLostReason::HostStaleServiceFree,
+        carrick_el1_abi::NativeChildLostSite::HostZoneUnplacedFree,
+    );
     zone.free_record(record);
     false
 }
@@ -1321,6 +1368,14 @@ pub fn take_unplaced_service(
         return None;
     }
     let key = service_key(record);
+    if key.is_none() {
+        record_native_record_lost(
+            zone,
+            record,
+            carrick_el1_abi::NativeChildLostReason::HostStaleServiceFree,
+            carrick_el1_abi::NativeChildLostSite::HostZoneUnplacedFree,
+        );
+    }
     zone.free_record(record.id);
     key
 }
@@ -1526,6 +1581,12 @@ pub fn drain_to_host(slot: SlotId) {
     let mut handed = Vec::new();
     zone.drain_slot(slot, &mut |record, discard| {
         if discard {
+            record_native_record_lost(
+                zone,
+                record,
+                carrick_el1_abi::NativeChildLostReason::HostStaleServiceFree,
+                carrick_el1_abi::NativeChildLostSite::HostZoneUnplacedFree,
+            );
             zone.free_record(record.id);
         } else {
             handed.push(record);

@@ -120,6 +120,7 @@ fn deliver_boundary_wakes(
     served: bool,
     doorbell: Option<carrick_el1_abi::HostWorkDoorbell>,
 ) {
+    crate::event_ring::flush_native_child_lifecycle();
     let pending = doorbell.is_some();
     if let Some(slot) = doorbell
         .as_ref()

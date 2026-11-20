@@ -577,6 +577,214 @@ def _format_fault_signal_mailboxes(tid: int, packed: int, mask: int) -> str:
     )
 
 
+_NATIVE_RUN_FAILURE_REASONS = {
+    1: "X86GroupExitCustody",
+    2: "NativeInvalid",
+    3: "NativeStale",
+    4: "NativeExhausted",
+    5: "NativeFault",
+    6: "NativeUnsupported",
+    7: "NativeBusy",
+    8: "NativeQuarantined",
+    9: "NativeNoChild",
+    10: "BirthSettlement",
+    11: "ClaimRollback",
+    12: "BornEnqueueRefused",
+}
+
+_ENTRY_BINDING_FATAL_REASONS = {
+    1: "EntryBinding",
+    2: "PhysicalCustody",
+    3: "MissingNativeFrame",
+    4: "RevisionCredit",
+    5: "SignalNumber",
+    6: "ProcessGraph",
+    7: "HostRescheduleKick",
+    8: "HostWorkForward",
+    9: "CpuStackSlot",
+    10: "ArchitectureFatal",
+    11: "RunFailureReturned",
+    12: "ResidencyLayout",
+    13: "RootExitRefused",
+    14: "ForkCustodyRefused",
+    15: "AffinityTopologyMissing",
+    16: "NamespaceIdentityRange",
+    17: "NamespaceIdentityLost",
+    18: "ExitCustodyLost",
+    19: "ExitPublicationLost",
+    20: "ExitReleaseLost",
+    21: "RegistryEpochExhausted",
+    22: "BirthPayloadMismatch",
+    23: "ProcessGroupCollision",
+    24: "ProcessGroupIndexLost",
+    25: "SessionCollision",
+    26: "SessionIndexLost",
+    27: "AutoreapAccountingLost",
+    28: "NativeServiceInvalid",
+    29: "NativeServiceStale",
+    30: "NativeServiceExhausted",
+    31: "NativeServiceFault",
+    32: "NativeServiceOwnerWait",
+    33: "NativeServiceUnsupported",
+    34: "NativeServiceGroupExit",
+    35: "NativeServiceBusy",
+    36: "NativeServiceQuarantined",
+    37: "NativeServiceNoChild",
+    38: "NativeServiceCapStale",
+    39: "NativeServicePayloadStale",
+    40: "NativeServiceMemberStale",
+    41: "NativeServiceBirthStale",
+    42: "NativeServiceMmStale",
+    43: "NativeServiceBindStale",
+    44: "NativeServicePublishStale",
+    45: "NativeServiceNoticeStale",
+    46: "NativeServiceParkStale",
+    47: "NativeServiceSettleStale",
+    48: "NativeServiceCompleteStale",
+    60: "SwitchInStaleRoot",
+    61: "RequeueRefused",
+    62: "OwnedFamilyForward",
+}
+
+_NATIVE_CARRIER_FATAL_KINDS = {
+    1: "el1_panic",
+    2: "native_service_host_error",
+    3: "cpl0_fatal_port",
+    4: "guest_at_el1",
+}
+
+_NATIVE_PARENT_WAKE_REASONS = {
+    1: "child_exit",
+    2: "signal",
+    3: "none",
+}
+
+
+def _format_native_child_fork(parent_id: int, child_id: int, packed: int) -> str:
+    cu = packed & 0xFFFFFFFF
+    return (
+        f"parent={parent_id}#{(cu >> 16) & 0xFF} "
+        f"child={child_id}#{(cu >> 24) & 0xFF} "
+        f"exit_sig={cu & 0xFF} flags={(cu >> 8) & 0xFF:#04x}"
+    )
+
+
+def _format_native_child_exec(task_id: int, serial: int, detail: int) -> str:
+    ser = serial & 0xFFFFFFFF
+    if detail == 0:
+        return f"task={task_id}#{ser} outcome=ok"
+    if detail > 0:
+        return f"task={task_id}#{ser} outcome=refused errno={detail}"
+    return f"task={task_id}#{ser} outcome=refused reason=past_no_return"
+
+
+def _format_native_child_exit(task_id: int, serial: int, packed: int) -> str:
+    ser = serial & 0xFFFFFFFF
+    cu = packed & 0xFFFFFFFF
+    wstatus = cu & 0xFFFF
+    cls = (cu >> 16) & 0xFF
+    code = (cu >> 24) & 0xFF
+    if cls == 1:
+        return f"task={task_id}#{ser} reason=exited exit_code={code} wstatus={wstatus:#06x}"
+    if cls == 2:
+        return f"task={task_id}#{ser} reason=signaled signal={code} wstatus={wstatus:#06x}"
+    if cls == 3 and code in _NATIVE_RUN_FAILURE_REASONS:
+        name = _NATIVE_RUN_FAILURE_REASONS[code]
+        return f"task={task_id}#{ser} reason=run_failure/{name} code={code} wstatus={wstatus:#06x}"
+    if cls == 4 and code in _ENTRY_BINDING_FATAL_REASONS:
+        name = _ENTRY_BINDING_FATAL_REASONS[code]
+        return f"task={task_id}#{ser} reason=entry_fatal/{name} code={code} wstatus={wstatus:#06x}"
+    if cls == 5 and code in _NATIVE_CARRIER_FATAL_KINDS:
+        name = _NATIVE_CARRIER_FATAL_KINDS[code]
+        return f"task={task_id}#{ser} reason=carrier_fatal/{name} code={code} wstatus={wstatus:#06x}"
+    return f"task={task_id}#{ser} reason=unknown({cls}) code={code} wstatus={wstatus:#06x}"
+
+
+def _format_native_child_zombie(child_id: int, parent_id: int, packed: int) -> str:
+    cu = packed & 0xFFFFFFFF
+    return f"child={child_id}#{cu >> 16} parent={parent_id}#{cu & 0xFFFF}"
+
+
+def _format_native_child_wake(parent_id: int, serial: int, packed: int) -> str:
+    ser = serial & 0xFFFFFFFF
+    cu = packed & 0xFFFFFFFF
+    wake = _NATIVE_PARENT_WAKE_REASONS.get(cu & 0xFF, "unknown")
+    return f"parent={parent_id}#{ser} wake={wake} woken={cu >> 8}"
+
+
+def _format_native_child_reap(caller_id: int, child_id: int, packed: int) -> str:
+    cu = packed & 0xFFFFFFFF
+    return (
+        f"caller={caller_id}#{(cu >> 16) & 0xFF} "
+        f"child={child_id}#{(cu >> 24) & 0xFF} "
+        f"wstatus={cu & 0xFFFF:#06x}"
+    )
+
+
+_NATIVE_CHILD_LOST_REASONS = {
+    1: "process_exit_publish",
+    2: "exit_autoreap",
+    3: "wait_reap",
+    4: "registry_unregister_process",
+    5: "registry_unregister_member",
+    6: "host_receipt_fold",
+    7: "registry_rehome_replace",
+    8: "thread_raw_exit",
+    9: "closing_member_retire",
+    10: "run_failure_retire",
+    11: "host_custody_yield",
+    12: "birth_rollback",
+    13: "birth_quarantine",
+    14: "host_lost_adoption",
+    15: "host_stale_service_free",
+}
+
+_NATIVE_CHILD_LOST_SITES = {
+    101: "owner_publish_exit",
+    102: "owner_exit_autoreap",
+    103: "owner_consume_wait4",
+    104: "owner_consume_waitid",
+    201: "registry_unregister_process",
+    202: "registry_unregister_member",
+    203: "registry_fold_host_receipts",
+    204: "registry_rehome",
+    205: "registry_register_replace",
+    206: "registry_exec_successor",
+    301: "entry_run_failed_retire",
+    302: "entry_retire_thread_current",
+    303: "entry_retire_thread_identity",
+    304: "entry_retire_closing_member",
+    305: "entry_losing_close_release",
+    306: "entry_user_return_host_custody",
+    307: "entry_closing_host_custody",
+    308: "fork_rollback_prepare_mm",
+    309: "fork_rollback_reserve",
+    310: "fork_rollback_publish_pre_commit",
+    311: "fork_quarantine_publish_abort",
+    312: "fork_quarantine_post_commit",
+    401: "host_pending_adoption_lost",
+    402: "host_service_head_adoption_lost",
+    403: "host_stale_service_free",
+    404: "host_current_handback_retired",
+    405: "host_sweep_cancelled",
+    406: "host_zone_cancel_free",
+    407: "host_zone_unplaced_free",
+}
+
+
+def _format_native_child_lost(task_id: int, serial_raw: int, packed: int) -> str:
+    cu = packed & 0xFFFFFFFF
+    reason_raw = cu & 0xFF
+    site_raw = (cu >> 8) & 0xFFFF
+    detail_low8 = (cu >> 24) & 0xFF
+    reason = _NATIVE_CHILD_LOST_REASONS.get(reason_raw, "unknown")
+    site = _NATIVE_CHILD_LOST_SITES.get(site_raw, "unknown")
+    return (
+        f"task={task_id}#{serial_raw & 0xFFFFFFFF} "
+        f"reason={reason} site={site}({site_raw}) detail={detail_low8:#04x}"
+    )
+
+
 # kind -> (name, formatter(a, b, c))
 _EVENTRING_KINDS = {
     1: ("BIND", lambda a, b, c: f"gfd={a} hfd={b} pathhash={c & 0xffffffff:#010x}"),
@@ -709,6 +917,13 @@ _EVENTRING_KINDS = {
     91: ("ALIAS", lambda a, b, c: f"coordinator={(((a & 0xffffffff) << 32) | (b & 0xffffffff)):#x} tid={c} begin=dispatch"),
     92: ("ALIAS", lambda a, b, c: f"coordinator={(((a & 0xffffffff) << 32) | (b & 0xffffffff)):#x} tid={c} begin=install"),
     93: ("ALIAS", lambda a, b, c: f"coordinator={(((a & 0xffffffff) << 32) | (b & 0xffffffff)):#x} tid={c} end"),
+    94: ("NCHILD_FORK", _format_native_child_fork),
+    95: ("NCHILD_EXEC", _format_native_child_exec),
+    96: ("NCHILD_EXIT", _format_native_child_exit),
+    97: ("NCHILD_ZOMBIE", _format_native_child_zombie),
+    98: ("NCHILD_WAKE", _format_native_child_wake),
+    99: ("NCHILD_REAP", _format_native_child_reap),
+    100: ("NCHILD_LOST", _format_native_child_lost),
     50: ("HVPSETTLE", lambda a, b, c: f"tid={a} gen={b} step={c}"),
     51: ("EPOWNER", lambda a, b, c: f"owner={a} target={b} reg_fd={c}"),
     52: ("EPWAKE", lambda a, b, c: f"owner={a} source={b} depth={c}"),

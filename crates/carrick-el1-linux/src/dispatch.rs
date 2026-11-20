@@ -2896,7 +2896,6 @@ impl NativeInvariant {
 
 /// Encode before constructing the fatal envelope: an OwnerWait contains a
 /// dependency, which must not enlarge every EL1 invariant's by-value frame.
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn native_service_invariant(
     error: super::native_process_runtime::NativeProcessError,
 ) -> NativeInvariant {
@@ -2918,8 +2917,7 @@ pub(crate) fn native_service_completion(
 
 /// A stale dispatch identifies the last actual owner entered, rather than
 /// implying that every stale refusal came from the service birth cell.
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn native_service_invariant_at(
+pub(crate) fn native_service_invariant_at(
     error: super::native_process_runtime::NativeProcessError,
     phase: super::native_process_runtime::NativeServicePhase,
 ) -> NativeInvariant {
@@ -2945,7 +2943,6 @@ fn native_service_invariant_at(
 }
 
 /// Preserve the refused operation's error without changing refusal policy.
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn native_service_fatal_reason(
     error: super::native_process_runtime::NativeProcessError,
 ) -> carrick_el1_abi::EntryBindingFatalReason {
