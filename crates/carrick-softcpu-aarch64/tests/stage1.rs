@@ -45,6 +45,10 @@ impl Physical {
 }
 
 impl GuestMemory for Physical {
+    fn stage1_is_local(&self) -> bool {
+        true
+    }
+
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault> {
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = *self.byte(address.0 + i as u64)?;
@@ -363,6 +367,14 @@ fn fetch_from_an_unmapped_page_takes_an_instruction_abort() {
     assert_eq!(r.cpu.pc.0, VBAR + 0x400);
 }
 
+fn write_guest_words(memory: &mut Physical, pa: u64, code: &[u32]) {
+    for (index, word) in code.iter().enumerate() {
+        memory
+            .write(VirtualAddress(pa + 4 * index as u64), &word.to_le_bytes())
+            .unwrap();
+    }
+}
+
 /// Every block in the fixture ends at a real handler or an unconditional
 /// continuation. Only the host instruction launch is substituted.
 struct SingleExit;
@@ -401,20 +413,9 @@ fn tlbi_invalidates_a_loaded_translation_before_the_next_load() {
         0xf940_0004, // ldr x4, [x0] (must fault)
         0xd400_0042, // hvc #2 (only reached with a stale hit)
     ];
-    for (index, word) in code.into_iter().enumerate() {
-        r.memory
-            .write(
-                VirtualAddress(CODE_PA + 4 * index as u64),
-                &word.to_le_bytes(),
-            )
-            .unwrap();
-    }
-    r.memory
-        .write(
-            VirtualAddress(CODE_PA + 0xa00),
-            &0xd400_0062_u32.to_le_bytes(),
-        )
-        .unwrap(); // HVC #3 at the current-EL SPx abort vector
+    write_guest_words(&mut r.memory, CODE_PA, &code);
+    // HVC #3 at the current-EL SPx abort vector.
+    write_guest_words(&mut r.memory, CODE_PA + 0xa00, &[0xd400_0062]);
     let report = run(
         &mut r.cpu,
         &mut r.monitor,
@@ -436,6 +437,62 @@ fn tlbi_invalidates_a_loaded_translation_before_the_next_load() {
     assert_eq!(r.cpu.el1.far, VirtualAddress(KDATA));
     assert_eq!(r.cpu.el1.elr, ProgramCounter(CODE + 24));
     assert_eq!(report.pc, ProgramCounter(VBAR + 0x204));
+    assert_eq!(report.work.stage1_walks, 5);
+}
+
+#[test]
+fn dispatcher_tlb_checks_ttbr_asid_and_pan_after_a_hit() {
+    let mut r = Rig::el1();
+    const ROOT_B_OFFSET: u64 = 0x10_0000;
+    r.memory.put(UDATA_PA, 0x1111);
+    r.memory.put(UDATA_PA + ROOT_B_OFFSET, 0x2222);
+    r.set(0, UDATA);
+    r.set(2, ROOT_B | (5 << 48));
+    write_guest_words(
+        &mut r.memory,
+        CODE_PA,
+        &[
+            LDR_X1_X0,
+            0xd518_2002, // msr ttbr0_el1, x2
+            0xd400_0042, // HVC #2 if fetch reuses the old execute mapping
+        ],
+    );
+    write_guest_words(
+        &mut r.memory,
+        CODE_PA + ROOT_B_OFFSET + 8,
+        &[
+            0xf940_0004, // ldr x4, [x0] under root B
+            0xd500_419f, // msr pan, #1
+            0xf940_0005, // ldr x5, [x0] (must fault under PAN)
+            0xd400_0042, // HVC #2 if the ordinary load reuses the old permission
+        ],
+    );
+    write_guest_words(
+        &mut r.memory,
+        CODE_PA + ROOT_B_OFFSET + 0xa00,
+        &[0xd400_0062],
+    );
+    let report = run(
+        &mut r.cpu,
+        &mut r.monitor,
+        &mut r.memory,
+        &mut SingleExit,
+        BlockLimits::default(),
+        16,
+    );
+    assert!(matches!(
+        report.stop,
+        Stop::Event {
+            event: Event::ProviderExit(_),
+            ..
+        }
+    ));
+    assert_eq!([r.get(1), r.get(4), r.get(5)], [0x1111, 0x2222, 0]);
+    assert_eq!(r.cpu.el1.esr, Syndrome(0x9600_000f));
+    assert_eq!(r.cpu.el1.far, VirtualAddress(UDATA));
+    assert_eq!(r.cpu.el1.elr, ProgramCounter(CODE + 16));
+    assert_eq!(report.pc, ProgramCounter(VBAR + 0x204));
+    assert_eq!(report.work.stage1_walks, 5);
 }
 
 mod production {

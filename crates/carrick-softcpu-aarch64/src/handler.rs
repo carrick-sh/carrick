@@ -6,7 +6,7 @@
 //! LDXR/STXR, LDADD, BR/BLR/RET, MSR immediate), D1.10/D1.11 exception entry
 //! and return (via `exception`), and D13.2 register access (via `state`).
 //! Data alignment is checked before translation; with SCTLR_EL1.M set every
-//! access translates through the stage-1 walker (`mmu`) and its faults are
+//! access uses stage-1 translation (`mmu`) and its faults are
 //! taken as EL1 data aborts.
 use crate::exception::{
     DataAccess, Exception, ExceptionOutcome, ProviderExit, WaitInstruction, eret, take_exception,
@@ -24,6 +24,7 @@ use crate::{
     RegisterBranch, StructureLayout, StructureMemory, StructureWriteback, SystemDirection,
     SystemRegister, TlbiOperation, Width,
 };
+use carrick_guest_arch::{Gpa, GuestVa};
 use carrick_mmu_core::aarch64::stage1_walk::Aarch64Fault;
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
 
@@ -53,6 +54,29 @@ pub trait GuestMemory {
     /// Untracked memory is translated afresh.
     fn code_generation(&self, _frame: carrick_guest_arch::FrameGpa) -> Option<CodeGeneration> {
         None
+    }
+
+    /// Whether this provider serves one local stage-1 seat for the duration
+    /// of a dispatcher run. Shared providers must leave this disabled until
+    /// their external invalidations are delivered before translation reuse.
+    fn stage1_is_local(&self) -> bool {
+        false
+    }
+
+    /// Translate a single-page access with stage 1 enabled. The dispatcher
+    /// wrapper may reuse successful walks within the current run.
+    #[doc(hidden)]
+    fn translate_stage1(
+        &mut self,
+        cpu: &CpuState,
+        va: GuestVa,
+        access: LeafAccess,
+        class: AccessClass,
+    ) -> Result<Gpa, Stage1Error>
+    where
+        Self: Sized,
+    {
+        mmu::walk(cpu, self, va.raw(), access, class).map(|leaf| Gpa::from_frame_gpa(leaf.output()))
     }
 
     /// Observe an attempted hardware-format stage-1 walk, including faults.

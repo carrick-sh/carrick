@@ -2,20 +2,21 @@
 //! an `ExecuteBlock` (the host launch, implemented outside this crate on an
 //! arm64 host), map the exit index back to a guest exit, run its handler, and
 //! repeat under a block budget. Resident blocks are reused only after checking
-//! the live execute mapping and the memory owner's code generation.
+//! the current execute translation and the memory owner's code generation.
 use crate::exception::{Exception, take_exception};
 use crate::handler::{
     self, CodeGeneration, Event, ExclusiveMonitor, GuestMemory, MemoryFault, Outcome,
 };
-use crate::mmu::{self, AccessClass, Stage1Error};
+use crate::mmu::{self, AccessClass, PermissionMode, Stage1Error, Stage1Registers};
 use crate::state::{CpuState, ExceptionLevel, ProgramCounter, VirtualAddress};
 use crate::translate::{
     BlockExit, BlockLimits, CODE_PAGE_BYTES, ExitReason, GuestInstruction, InstructionClass,
     TranslateError, TranslatedBlock, emit_block, split_block_at_level,
 };
-use carrick_guest_arch::{FrameGpa, Gpa};
-use carrick_mmu_core::stage1::LeafAccess;
+use carrick_guest_arch::{FrameGpa, Gpa, GuestVa};
+use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
 use carrick_softmmu::block_cache::BlockCache;
+use carrick_softmmu::physical_tlb::PhysicalTlb;
 use core::fmt;
 
 /// Prepares translated code and runs it against the CPU's architectural state.
@@ -26,6 +27,11 @@ pub trait ExecuteBlock {
 
     /// Whether the dispatcher may keep prepared blocks resident.
     fn retain_blocks(&self) -> bool {
+        true
+    }
+
+    /// Whether to cache stage-1 translations on providers with a local seat.
+    fn retain_stage1(&self) -> bool {
         true
     }
 
@@ -136,8 +142,7 @@ impl<E: fmt::Debug> fmt::Display for Report<E> {
     }
 }
 
-/// Events the dispatcher absorbs and continues past. Execute permission and
-/// frame identity are rechecked by a live stage-1 translation at every entry.
+/// Events the dispatcher absorbs and continues past.
 fn absorbed(event: Event) -> bool {
     matches!(
         event,
@@ -169,9 +174,7 @@ fn read_word(memory: &mut impl GuestMemory, pa: Gpa) -> Result<u32, MemoryFault>
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct BlockKey {
     pc: u64,
-    ttbrs: [u64; 2],
-    tcr: u64,
-    sctlr: u64,
+    registers: Stage1Registers,
     el1: bool,
 }
 
@@ -179,10 +182,7 @@ impl BlockKey {
     fn for_cpu(cpu: &CpuState) -> Self {
         Self {
             pc: cpu.pc.0,
-            // Both raw TTBRs include their ASID fields. TCR selects the active ASID.
-            ttbrs: [cpu.named.ttbr0.0, cpu.named.ttbr1.0],
-            tcr: cpu.el1.tcr.0,
-            sctlr: cpu.el1.sctlr.0,
+            registers: Stage1Registers::for_cpu(cpu),
             el1: cpu.pstate.el == ExceptionLevel::El1,
         }
     }
@@ -202,6 +202,8 @@ struct ResidentBlock<C> {
 struct MeasuredMemory<'a, M> {
     inner: &'a mut M,
     walks: u64,
+    retain_stage1: bool,
+    tlb: Option<PhysicalTlb<Stage1Registers, PermissionMode>>,
 }
 
 impl<M: GuestMemory> GuestMemory for MeasuredMemory<'_, M> {
@@ -215,6 +217,28 @@ impl<M: GuestMemory> GuestMemory for MeasuredMemory<'_, M> {
 
     fn code_generation(&self, frame: FrameGpa) -> Option<CodeGeneration> {
         self.inner.code_generation(frame)
+    }
+
+    fn translate_stage1(
+        &mut self,
+        cpu: &CpuState,
+        va: GuestVa,
+        access: LeafAccess,
+        class: AccessClass,
+    ) -> Result<Gpa, Stage1Error> {
+        let mode = PermissionMode::for_access(cpu, access, class);
+        if self.retain_stage1 {
+            let tlb = self.tlb.get_or_insert_with(PhysicalTlb::default);
+            if let Some(pa) = tlb.probe(Stage1Registers::for_cpu(cpu), va, access, mode) {
+                return Ok(pa);
+            }
+        }
+        let leaf = mmu::walk(cpu, self, va.raw(), access, class)?;
+        let pa = Gpa::from_frame_gpa(leaf.output());
+        if let Some(tlb) = &mut self.tlb {
+            tlb.fill(va, access, mode, pa);
+        }
+        Ok(pa)
     }
 
     fn record_stage1_walk(&mut self) {
@@ -235,8 +259,10 @@ pub fn run<X: ExecuteBlock>(
     let mut blocks = 0;
     let mut work = RunWork::default();
     let memory = &mut MeasuredMemory {
+        retain_stage1: executor.retain_stage1() && memory.stage1_is_local(),
         inner: memory,
         walks: 0,
+        tlb: None,
     };
     // The run borrows one memory owner and one set of block limits. Keeping
     // residency within that borrow also discards code at provider handoffs.
@@ -349,8 +375,16 @@ pub fn run<X: ExecuteBlock>(
                     Outcome::Continue => work.retired_instructions += 1,
                     Outcome::Fault => {}
                     Outcome::Event(event) => {
-                        if matches!(event, Event::Ic(_)) {
-                            cache.clear();
+                        match event {
+                            Event::Ic(_) => cache.clear(),
+                            Event::Tlbi(_) => {
+                                // One local seat. A full flush also covers every
+                                // cached 4 KiB subpage of a large stage-1 leaf.
+                                if let Some(tlb) = &mut memory.tlb {
+                                    tlb.invalidate();
+                                }
+                            }
+                            _ => {}
                         }
                         if matches!(
                             event,

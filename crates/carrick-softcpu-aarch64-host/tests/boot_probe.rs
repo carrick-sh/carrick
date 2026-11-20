@@ -104,6 +104,10 @@ impl Pages {
 }
 
 impl GuestMemory for Pages {
+    fn stage1_is_local(&self) -> bool {
+        true
+    }
+
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault> {
         for (i, b) in bytes.iter_mut().enumerate() {
             let a = address.0 + i as u64;
@@ -792,6 +796,10 @@ impl ExecuteBlock for TracingRunner {
 
     fn retain_blocks(&self) -> bool {
         self.inner.retain_blocks()
+    }
+
+    fn retain_stage1(&self) -> bool {
+        self.inner.retain_stage1()
     }
 
     fn prepare(&mut self, block: &TranslatedBlock) -> Result<HostCode, HostError> {
