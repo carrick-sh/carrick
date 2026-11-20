@@ -1319,8 +1319,6 @@ struct ForwardExecution {
     cpu: carrick_guest_arch::CpuId,
     binding: carrick_el1_abi::ExecutionBinding,
     leader_task: carrick_el1_abi::EntryTaskKey,
-    #[cfg(test)]
-    stopped_birth: Option<carrick_core::terminal::ThreadBirthIdentity>,
     context: AddressContext<RootGpa>,
 }
 
@@ -1385,8 +1383,6 @@ fn admit_forward_execution(
         cpu,
         binding,
         leader_task: binding.task,
-        #[cfg(test)]
-        stopped_birth: None,
         context,
     })
 }
@@ -1430,21 +1426,10 @@ mod forward_execution_tests {
             ..binding
         };
         let cpu = carrick_guest_arch::CpuId::new(1);
-        let mut admitted =
+        let admitted =
             admit_forward_execution(cpu, cpu, sibling, context, context.root, context.generation)
                 .unwrap()
                 .with_leader_task(leader);
-        assert!(matches!(
-            admitted.authenticate_typed(carrier_binding(context, 12)),
-            Err(ForwardBindingRefusal::TaskIdMismatch { .. })
-        ));
-        admitted.stopped_birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
-            stopped,
-            carrick_core_abi::BirthSerial::of_task(
-                carrick_sched_core::process::TaskSerial::from_raw_u64(77).unwrap(),
-            ),
-            sibling.thread_generation,
-        );
         assert!(matches!(
             admitted.authenticate_typed(carrier_binding(context, 12)),
             Err(ForwardBindingRefusal::TaskIdMismatch { .. })
