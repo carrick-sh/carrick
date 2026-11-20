@@ -12,9 +12,9 @@ use crate::state::{
     SystemValue,
 };
 use crate::{
-    AddressBase, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, GUEST_CPU_PROFILE, Gpr, Hint, Instruction,
-    LogicalOperand, MemoryAddress, MemoryIndex, MemoryOperation, MemoryRegister, OperandRegister,
-    RegisterBranch, ScalarMemory, decode_instruction,
+    AddressBase, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, GUEST_CPU_PROFILE, Gpr,
+    Hint, Instruction, LogicalOperand, MemoryAddress, MemoryIndex, MemoryOperation, MemoryRegister,
+    OperandRegister, RegisterBranch, ScalarMemory, decode_instruction,
 };
 use alloc::vec::Vec;
 

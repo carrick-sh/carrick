@@ -53,7 +53,7 @@ use carrick_softcpu_aarch64_host::{HostBlockRunner, HostCode, HostError, SoftMem
 use core::mem::offset_of;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 #[path = "fixtures/dynamic_root.rs"]
 mod dynamic_root;
@@ -1173,6 +1173,7 @@ struct TracingRunner {
     pending_svc: Option<RetiredSyscall>,
     tpidr_writes: Vec<(u64, u64)>,
     first_el0_fault: Option<El0Fault>,
+    chain: bool,
 }
 
 impl TracingRunner {
@@ -1184,6 +1185,7 @@ impl TracingRunner {
             pending_svc: None,
             tpidr_writes: Vec::new(),
             first_el0_fault: None,
+            chain: false,
         })
     }
 
@@ -1230,6 +1232,44 @@ impl ExecuteBlock for TracingRunner {
         cpu: &mut CpuState,
         memory: BlockMemory<'_>,
     ) -> Result<usize, HostError> {
+        self.trace_entry(cpu);
+        let exit = self.inner.execute_with_memory(block, code, cpu, memory)?;
+        self.trace_exit(cpu, block, exit);
+        Ok(exit)
+    }
+
+    fn chain_blocks(&self) -> bool {
+        self.chain && self.inner.chain_blocks()
+    }
+
+    fn link_block(&mut self, resident: &std::sync::Arc<ResidentBlock<HostCode>>) {
+        self.inner.link_block(resident);
+    }
+
+    fn unlink(&mut self, frame: Option<FrameGpa>) {
+        self.inner.unlink(frame);
+    }
+
+    fn execute_chain(
+        &mut self,
+        block: &TranslatedBlock,
+        code: &HostCode,
+        cpu: &mut CpuState,
+        memory: BlockMemory<'_>,
+        budget: ChainBudget<'_>,
+    ) -> Result<ChainExit<HostCode>, HostError> {
+        self.trace_entry(cpu);
+        let exit = self.inner.execute_chain(block, code, cpu, memory, budget)?;
+        // A chain stays within its admitted EL. A syscall or any other
+        // handler is observable as the last exit, before the handler runs.
+        let last = exit.last.as_ref().map_or(block, |last| last.prepared().0);
+        self.trace_exit(cpu, last, exit.exit);
+        Ok(exit)
+    }
+}
+
+impl TracingRunner {
+    fn trace_entry(&mut self, cpu: &CpuState) {
         let user = cpu.pstate.el == ExceptionLevel::El0;
         // Arm D1.10: 0x400 is the synchronous vector from lower EL in AArch64.
         // Record before the vector runs and HVC overwrites ESR_EL1.
@@ -1250,8 +1290,10 @@ impl ExecuteBlock for TracingRunner {
                 last.ret = Some(x(cpu, 0) as i64);
             }
         }
-        let exit_idx = self.inner.execute_with_memory(block, code, cpu, memory)?;
-        if user {
+    }
+
+    fn trace_exit(&mut self, cpu: &CpuState, block: &TranslatedBlock, exit_idx: usize) {
+        if cpu.pstate.el == ExceptionLevel::El0 {
             let sp = cpu.sp().0;
             let lr = x(cpu, 30);
             match block.exits().get(exit_idx).copied() {
@@ -1294,7 +1336,6 @@ impl ExecuteBlock for TracingRunner {
                 Some(BlockExit::Indirect) | None => {}
             }
         }
-        Ok(exit_idx)
     }
 }
 
@@ -1939,6 +1980,7 @@ fn run_dynamic_glibc(
 ) -> Result<u64, String> {
     use carrick_mem::linux_abi::syscall::lookup_aarch64;
     let mut runner = TracingRunner::new().unwrap();
+    runner.chain = true;
     let mut blocks = 0;
     let mut work = RunWork::default();
     let mut undefined = 0;
@@ -2052,7 +2094,7 @@ fn run_dynamic_glibc(
     };
     let elapsed = started.elapsed().as_secs_f64();
     replies.report_opens();
-    println!("engine work={work:?}");
+    println!("engine work={work:?} {:?}", runner.inner.publication_work());
     for (nr, count) in &counts {
         let name = lookup_aarch64(*nr).map_or("unknown", |call| call.name);
         let mailbox = forwarded.get(nr).copied().unwrap_or(0);
@@ -2063,7 +2105,7 @@ fn run_dynamic_glibc(
         work.retired_instructions,
         undefined,
         counts.values().sum::<u64>(),
-        blocks as f64 / elapsed,
+        work.executed_blocks as f64 / elapsed,
         work.retired_instructions as f64 / elapsed
     );
     println!(

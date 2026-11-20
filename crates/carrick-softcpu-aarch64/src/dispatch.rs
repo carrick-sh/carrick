@@ -573,8 +573,12 @@ fn run_inner<X: ExecuteBlock>(
             };
             work.decoded_blocks += 1;
             let mut fetched_whole_block = true;
-            let guest =
-                split_block_for_run(cpu.pc, limits, cpu.pstate.el, inline_memory && mmu::enabled(cpu), |pc| {
+            let guest = split_block_for_run(
+                cpu.pc,
+                limits,
+                cpu.pstate.el,
+                inline_memory && mmu::enabled(cpu),
+                |pc| {
                     let word = if pc == cpu.pc {
                         Some(first)
                     } else {
@@ -584,7 +588,8 @@ fn run_inner<X: ExecuteBlock>(
                     };
                     fetched_whole_block &= word.is_some();
                     word
-                });
+                },
+            );
             work.emitted_blocks += 1;
             let block = match emit_block_for_run(&guest, chaining) {
                 Ok(block) => block,
