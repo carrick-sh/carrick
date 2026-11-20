@@ -436,16 +436,118 @@ fn busy_service_notice_parks_and_reruns_once_for<
 ) {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
 
-    let capacity = NativeServiceCapacityFixture::<C>::new_for::<B>(2, make_words);
-    let fixture = &capacity.fixture;
+    let mut fixture = native_exec_fixture_for::<C, B>(make_words);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
     };
+    // Rehome the root as a host-owned member, as happens after a host boundary.
+    let identity = fixture.zone.record(fixture.record.id).identity();
+    fixture
+        .zone
+        .discard_unpublished(fixture.slot, fixture.record.id);
+    let record = fixture.zone.current_or_new(fixture.slot, identity).unwrap();
+    fixture.record = fixture.zone.record_ref(record);
+    fixture.control.bind_zone_record(fixture.record);
+    fixture
+        .registry
+        .rehome_entry(
+            source,
+            fixture.task,
+            fixture.address,
+            fixture.page,
+            fixture.control,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(!fixture.zone.record(record).is_native_owned());
 
-    // Process 1 publishes a real CarrierWork notice on the shared slot and
-    // parks before the host takes `fixture.task.service_notice`.
-    let (holder_record, holder_addr, holder_words) = capacity.select().unwrap();
+    // wait4 leaves the host-owned root with a native checkpoint. One child
+    // exits to wake that checkpoint and the other remains live as the peer.
+    let capacity = NativeServiceCapacityFixture::from_fixture_rusage(fixture, 2, UserVa::new(0));
+    let fixture = &capacity.fixture;
+    let (_, child_addr, child_words) = capacity.select().unwrap();
+    let child_pid = fixture.task.visible_pid().unwrap();
+    {
+        let mut service = fixture.service();
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                child_addr,
+                &child_words,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.exit_group(0),
+            LifecycleOutcome::Transferred { .. }
+        ));
+    }
+    let select_holder = || {
+        let mut selected = capacity.select().unwrap();
+        if selected.0 != fixture.record {
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(fixture.slot, selected.0.id)
+                    .is_queued()
+            );
+            selected = capacity.select().unwrap();
+        }
+        assert_eq!(selected.0, fixture.record);
+        assert_eq!(fixture.zone.slot(fixture.slot).queued(), 1);
+        selected
+    };
+    let complete_holder_notice = || {
+        let doorbell = fixture.task.linux.take_host_work_doorbell();
+        let holder_record = fixture.record;
+        let notice = fixture
+            .task
+            .service_notice
+            .take()
+            .unwrap()
+            .expect("holder notice must remain intact until carrier intake");
+        assert_eq!(notice.record, holder_record);
+        let identity = fixture.zone.record(holder_record.id).identity();
+        let key =
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(holder_record).unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+        // SAFETY: the fixture retains the exact member while its service queue is held.
+        let ticket = unsafe {
+            ServiceCell::claim_notice(&fixture.control.service, notice, NonZeroU64::MIN, identity)
+        }
+        .unwrap();
+        assert_eq!(
+            ticket.request().operation,
+            ServiceOperation::CarrierWork {
+                entry: OwnerEntry::Syscall,
+                demand: carrick_core_abi::service::CarrierDemand::Work,
+            }
+        );
+        assert!(ticket.complete(true).is_ok());
+        queue
+            .notify_object(
+                fixture.slot,
+                &mut carrick_sched_core::WakeEffects::default(),
+            )
+            .unwrap();
+        if let Some(doorbell) = doorbell {
+            doorbell.settled();
+        }
+    };
+
+    // Complete a first service to leave the host-owned holder with a retained
+    // operation and a native resume checkpoint. The wait4 wake alone only
+    // retains the lifecycle call, without a native service operation.
+    let (_, holder_addr, holder_words) = select_holder();
     {
         let mut service = fixture.service();
         let mut holder = fixture
@@ -461,8 +563,9 @@ fn busy_service_notice_parks_and_reruns_once_for<
             .unwrap();
         assert!(matches!(
             holder.resume_checkpoint(|_| Ok(None)).unwrap(),
-            NativeResume::NoPending
+            NativeResume::Returned(result) if result.raw() == i64::from(child_pid)
         ));
+        holder.words.set_syscall_return(u64::from(child_pid));
         let result = holder.begin_service(
             ServiceOperation::CarrierWork {
                 entry: OwnerEntry::Syscall,
@@ -470,13 +573,56 @@ fn busy_service_notice_parks_and_reruns_once_for<
             },
             None,
         );
-        let phase = holder.native_service_phase();
-        let settled = holder.settle_service_exit(result, NativeServiceExit::CarrierWork);
-        let resumed = crate::dispatch::native_service_completion(settled, phase)
-            .unwrap_or_else(|fatal| panic!("holder service entry became {fatal:?}"));
-        assert!(matches!(resumed, NativeResume::Left(None)));
+        assert!(matches!(
+            holder
+                .settle_service_exit(result, NativeServiceExit::CarrierWork)
+                .unwrap(),
+            NativeResume::Left(None)
+        ));
+    }
+    complete_holder_notice();
+    let (holder_record, holder_addr, holder_words) = select_holder();
+    assert!(
+        fixture
+            .zone
+            .record(holder_record.id)
+            .requires_native_entry()
+    );
+    {
+        let mut service = fixture.service();
+        let mut holder = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                holder_addr,
+                &holder_words,
+                &mut service,
+            )
+            .unwrap();
+        // The signal checkpoint observes carrier work. The resume path
+        // publishes it and parks the holder before the carrier takes it.
+        let mut checked_return = false;
+        assert!(matches!(
+            holder
+                .resume_checkpoint(|entry| {
+                    checked_return = true;
+                    assert_eq!(entry.words.syscall_return(), u64::from(child_pid));
+                    entry.defer_signal_return_for_work();
+                    Ok(None)
+                })
+                .unwrap(),
+            NativeResume::Left(None)
+        ));
+        assert!(checked_return);
     }
     assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    assert!(matches!(
+        fixture.zone.record(holder_record.id).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    assert!(!fixture.task.linux.has_pending_host_work());
 
     // Process 2 is selected on the same slot before host intake and enters its
     // own native service while Process 1's notice still occupies the lane cell.
@@ -516,37 +662,10 @@ fn busy_service_notice_parks_and_reruns_once_for<
         "contended notice wait must enrol on holder release rather than requeue to poll"
     );
 
-    // Host intake consumes Process 1's preserved notice, completes its ticket,
-    // and notifies Process 1's service queue, waking both Process 1 and Process 2.
-    let holder_notice = fixture
-        .task
-        .service_notice
-        .take()
-        .unwrap()
-        .expect("holder notice must remain intact across contended entry");
-    assert_eq!(holder_notice.record, holder_record);
-    {
-        let identity = fixture.zone.record(holder_record.id).identity();
-        let key =
-            carrick_sched_core::object_wait::ObjectWaitKey::native_service(holder_record).unwrap();
-        let queue = fixture
-            .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            })
-            .unwrap();
-        // SAFETY: the fixture retains this exact member and its service queue.
-        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
-        let ticket = unsafe {
-            ServiceCell::claim_notice(&control.service, holder_notice, NonZeroU64::MIN, identity)
-        }
-        .unwrap();
-        assert!(ticket.complete(true).is_ok());
-        let mut effects = carrick_sched_core::WakeEffects::default();
-        queue.notify_object(fixture.slot, &mut effects).unwrap();
-    }
+    // Carrier intake completes the holder's preserved request and wakes both records.
+    complete_holder_notice();
 
-    // Drain the two woken records: Process 1 returns from CarrierWork, and
+    // Drain the two woken records: Process 1 returns to its host owner, and
     // Process 2 publishes its retained sequence-1 request once and parks on its
     // own service queue.
     let mut holder_resumed = false;
@@ -567,12 +686,17 @@ fn busy_service_notice_parks_and_reruns_once_for<
             .unwrap();
         let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
         if record == holder_record {
-            assert!(matches!(resumed, NativeResume::Returned(result) if result.raw() == 0));
-            let _ = fixture.zone.release_current(
-                fixture.slot,
-                record.id,
-                &carrick_sched_core::ShortLockSpin,
-            );
+            assert!(matches!(resumed, NativeResume::Left(None)));
+            assert!(!fixture.zone.record(record.id).requires_native_entry());
+            let doorbell = fixture.task.linux.take_host_work_doorbell().unwrap();
+            fixture.zone.take_host_wanted(fixture.slot, &mut |wanted| {
+                assert_eq!(wanted, holder_record)
+            });
+            assert!(matches!(
+                fixture.zone.record(record.id).claim(),
+                carrick_sched_core::Claim::Host { .. }
+            ));
+            doorbell.settled();
             holder_resumed = true;
         } else {
             assert_eq!(record, contender_record);
