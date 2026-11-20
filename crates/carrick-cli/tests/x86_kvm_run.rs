@@ -2371,6 +2371,31 @@ fn mounted_static_x86_forked_child_stdout_matches_native_while_parent_waits() {
     compare_mounted_assembly_with_native("x86_forked_child_stdout.S", b"E");
 }
 
+/// A forked child execs the mounted ELF and reads its host-backed header
+/// while the root remains alive in wait4.
+#[test]
+fn mounted_x86_fork_exec_child_reads_host_file() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("fork-exec-read");
+    compile_assembly("x86_fork_exec_host_read.S", &elf);
+    let guest = run_mounted_binary(&elf, "fork-exec-host-read", false);
+    assert_eq!(
+        guest.stdout,
+        b"F",
+        "{}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(
+        guest.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 #[test]
 fn mounted_static_x86_signal_thread_identity_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_thread_identity.S", b"T\n");
