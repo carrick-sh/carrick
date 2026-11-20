@@ -3345,6 +3345,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             address,
             length,
             carrick_el1_abi::PortalTransferIntent::UserRead,
+            None,
         )
     }
     fn read_owner_bytes_with_intent(
@@ -3352,6 +3353,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         address: u64,
         length: usize,
         intent: carrick_el1_abi::PortalTransferIntent,
+        frame: Option<&mut Option<carrick_guest_mem::UserWordFrame>>,
     ) -> Result<Vec<u8>, MemoryError> {
         let handle = self.protections.owner().ok_or(MemoryError::Unsupported)?;
         if handle.mm().raw() != self.mm_generation {
@@ -3373,11 +3375,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             },
         )
         .ok_or(MemoryError::OutOfBounds { address, length })?;
-        self.continue_owner_read(transfer)
+        self.continue_owner_read(transfer, frame)
     }
     fn continue_owner_read(
         &self,
         mut transfer: crate::user_transfer::OwnedUserTransfer,
+        mut frame: Option<&mut Option<carrick_guest_mem::UserWordFrame>>,
     ) -> Result<Vec<u8>, MemoryError> {
         if self.protections.owner() != Some(transfer.target_handle()) {
             return Err(MemoryError::HostMap(
@@ -3401,19 +3404,20 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         };
         loop {
             use crate::user_transfer::TransferProgress;
-            let progress = match transfer.advance(self, custody.as_ref(), slots) {
-                Ok(progress) => progress,
-                Err(error) => {
-                    carrick_observability::probes::hvpatch_el1_host_read_progress(
-                        address,
-                        length as u64,
-                        transfer.offset() as u64,
-                        8,
-                        0,
-                    );
-                    return Err(MemoryError::HostMap(error.to_string()));
-                }
-            };
+            let progress =
+                match transfer.advance(self, custody.as_ref(), slots, frame.as_deref_mut()) {
+                    Ok(progress) => progress,
+                    Err(error) => {
+                        carrick_observability::probes::hvpatch_el1_host_read_progress(
+                            address,
+                            length as u64,
+                            transfer.offset() as u64,
+                            8,
+                            0,
+                        );
+                        return Err(MemoryError::HostMap(error.to_string()));
+                    }
+                };
             let class = match &progress {
                 TransferProgress::Complete => 0,
                 TransferProgress::Advanced => 1,
@@ -3663,13 +3667,22 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     }
 }
 
-impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
-    fn atomic_load_user_u32(&self, address: u64) -> Result<u32, MemoryError> {
+impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
+    fn atomic_load_user_u32_inner(
+        &self,
+        address: u64,
+        frame: Option<&mut Option<carrick_guest_mem::UserWordFrame>>,
+    ) -> Result<u32, MemoryError> {
         if self.protections.owner().is_some() {
             // The selected transfer retains the exact owner through its one
             // aligned word copy. This is the only venue for an owner-private
             // page that deliberately has no host task mapping.
-            let bytes = self.read_owner_bytes(address, size_of::<u32>())?;
+            let bytes = self.read_owner_bytes_with_intent(
+                address,
+                size_of::<u32>(),
+                carrick_el1_abi::PortalTransferIntent::UserRead,
+                frame,
+            )?;
             return Ok(u32::from_ne_bytes(bytes.try_into().map_err(|_| {
                 MemoryError::OutOfBounds {
                     address,
@@ -3678,6 +3691,21 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             })?));
         }
         self.vm.atomic_load_user_u32(address)
+    }
+}
+
+impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
+    fn atomic_load_user_u32(&self, address: u64) -> Result<u32, MemoryError> {
+        self.atomic_load_user_u32_inner(address, None)
+    }
+
+    fn atomic_load_user_u32_with_frame(
+        &self,
+        address: u64,
+    ) -> Result<(u32, Option<carrick_guest_mem::UserWordFrame>), MemoryError> {
+        let mut frame = None;
+        let word = self.atomic_load_user_u32_inner(address, Some(&mut frame))?;
+        Ok((word, frame))
     }
 
     fn atomic_compare_exchange_user_u32(
@@ -3767,6 +3795,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 range.address(),
                 range.len() as usize,
                 carrick_el1_abi::PortalTransferIntent::CarrickInternalRead,
+                None,
             )
         } else {
             self.read_bytes_raw(range.address(), range.len() as usize)
@@ -3801,7 +3830,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                     "read continuation already consumed or belongs to another backend".into(),
                 )
             })?;
-        self.continue_owner_read(transfer)
+        self.continue_owner_read(transfer, None)
     }
 
     fn caller_el1_call(&mut self) -> Option<&mut dyn carrick_guest_mem::CallerEl1Call> {
@@ -8958,7 +8987,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             return Err(TrapError::UnsupportedPlatform);
         }
         loop {
-            match transfer.advance(self, custody.as_ref(), slots)? {
+            match transfer.advance(self, custody.as_ref(), slots, None)? {
                 crate::user_transfer::TransferProgress::Complete => {
                     return Ok(transfer.into_bytes());
                 }
@@ -9826,7 +9855,7 @@ mod transfer_service_tests {
         .unwrap();
         let held = engine.vcpu.borrow_mut();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            transfer.advance(&engine, &custody, &slots)
+            transfer.advance(&engine, &custody, &slots, None)
         }));
         assert!(result.is_ok(), "advance must refuse checked CPU admission");
         assert!(result.unwrap().is_err());

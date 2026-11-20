@@ -230,7 +230,10 @@ fn native_misaligned_realtime_bitset_futex_x86_is_einval() {
     }
 }
 
-fn episode<C: ProcessContext + 'static, B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
+fn episode<
+    C: ProcessContext + carrick_sched_core::CensusContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
     make: impl Fn(AddressContext<RootGpa>) -> C,
     mapping: bool,
     timed: bool,
@@ -366,6 +369,11 @@ fn episode<C: ProcessContext + 'static, B: carrick_mmu_core::owner_mmu::OwnerFor
     assert!(entry.take_run_failure().is_none());
     assert!(entry.take_handoff_receipt().is_some());
     assert_eq!(copy.loads, 1 + usize::from(!mapping));
+    let park = zone.parked_futex_snapshot(fixture.record).unwrap();
+    let compared = park.enrollment.unwrap();
+    assert_eq!(compared.address, UserVa::new(0x1000));
+    assert_eq!(compared.expected, copy.word);
+    assert_eq!(compared.observed, copy.word);
     if timed {
         assert_eq!(
             zone.timer_deadline(fixture.slot),

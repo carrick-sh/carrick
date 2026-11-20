@@ -187,8 +187,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
                     .run_failed(carrick_core_abi::NativeRunFailureReason::NativeStale),
             );
         }
+        let enrollment = carrick_sched_core::FutexEnrollment {
+            address: wait.address,
+            expected: wait.expected,
+            observed: word,
+            frame: carrick_el1::isa::futex_grant_observation(wait.mm, wait.address),
+        };
         if zone
-            .enqueue(
+            .enqueue_observed(
                 &guard,
                 record,
                 sequence,
@@ -196,6 +202,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
                 key.scheduler_address(),
                 wait.bitset,
                 0,
+                Some(enrollment),
             )
             .is_err()
         {

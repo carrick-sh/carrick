@@ -472,6 +472,7 @@ impl OwnedUserTransfer {
         engine: &Aarch64EngineCore<V>,
         custody: &C,
         slots: &MmPortalSlots,
+        observed_frame: Option<&mut Option<carrick_guest_mem::UserWordFrame>>,
     ) -> Result<TransferProgress, TrapError> {
         let error = |message: &str| TrapError::Hypervisor(format!("UserTransfer: {message}"));
         if self.offset == self.bytes.len() {
@@ -580,6 +581,19 @@ impl OwnedUserTransfer {
         });
         if completion.operation != operation || completion.retained != pin.identity() {
             return Err(error("completion identity mismatch"));
+        }
+        if completion.errno == 0
+            && completion.completed as usize == self.bytes.len()
+            && self.offset == 0
+            && let Some(frame) = observed_frame
+        {
+            *frame = completion.retained.owner.map(|(id, generation)| {
+                carrick_guest_mem::UserWordFrame {
+                    id,
+                    generation,
+                    source: carrick_guest_mem::UserWordFrameSource::RetainedCopy,
+                }
+            });
         }
         self.offset += completion.completed as usize;
         match completion.errno {
