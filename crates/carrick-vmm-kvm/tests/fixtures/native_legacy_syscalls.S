@@ -1,6 +1,6 @@
 /* One byte per raw syscall: errno on failure, or a normalized result.
  * WORK_PATH contains "file" (regular) and "sym" (points to "file").
- * CHILD runs the same calls after fork.
+ * CHILD runs the same calls after fork; NAMESPACE and IPC select the batch.
  * Set unused argument registers to nonzero values to exercise ABI lowering. */
 .global _start
 .text
@@ -54,6 +54,7 @@ steps:
     jne failed
     lea report(%rip), %r15
 
+#ifdef NAMESPACE
     legacy 83, dir, 0700            /* mkdir */
     record
     legacy 84, dir                  /* rmdir */
@@ -83,6 +84,87 @@ steps:
     syscall
     record
 #endif
+    legacy 133, fifo, 0010600, 0   /* mknod creates a FIFO */
+    record
+#ifdef CHILD
+    mov $259, %eax                 /* mknodat canonical control */
+    mov $-100, %rdi
+    lea fifo_at(%rip), %rsi
+    mov $0010600, %edx
+    xor %r10d, %r10d
+    syscall
+    record
+#endif
+#elif defined(IPC)
+    legacy 22, buf, -1              /* pipe must ignore the second register */
+    record
+    test %rax, %rax
+    jne 1f
+    mov buf(%rip), %eax
+    cmp buf+4(%rip), %eax
+    je failed
+    mov buf+4(%rip), %edi          /* write a byte to the pipe */
+    mov $1, %eax
+    lea file(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne failed
+    mov buf(%rip), %edi            /* read it using the returned read end */
+    xor %eax, %eax
+    lea buf+8(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne failed
+    movzbl buf+8(%rip), %eax
+    record
+1:
+    legacy 284, 3, -1               /* eventfd must ignore the second register */
+    test %rax, %rax
+    js 1f
+    mov %eax, %edi
+    xor %eax, %eax
+    lea buf(%rip), %rsi
+    mov $8, %edx
+    syscall
+    cmp $8, %rax
+    jne failed
+    mov buf(%rip), %rax
+1:  record
+#else
+    legacy 2, sym, 0x20000          /* open: O_NOFOLLOW */
+    record
+    legacy 2, file, 0x10000        /* O_DIRECTORY rejects a regular file */
+    call close_and_record
+    legacy 2, dot, 0x10000          /* open: O_DIRECTORY */
+    call close_and_record
+    legacy 85, created, 0600       /* creat */
+    call close_and_record
+    legacy 4, sym, buf              /* stat follows the link */
+    record
+    mov buf+24(%rip), %eax          /* x86 st_mode, S_IFMT >> 12 */
+    shr $12, %eax
+    and $15, %eax
+    record
+    legacy 6, sym, buf              /* lstat reports the link */
+    record
+    mov buf+24(%rip), %eax
+    shr $12, %eax
+    and $15, %eax
+    record
+    legacy 111, -1                  /* getpgrp() == getpgid(0) */
+    test %rax, %rax
+    js 1f
+    mov %rax, %rbx
+    mov $121, %eax
+    xor %edi, %edi
+    syscall
+    cmp %rbx, %rax
+    setne %al
+    movzbl %al, %eax
+1:  record
+#endif
 
     mov $1, %eax                    /* write the entire report */
     mov $1, %edi
@@ -95,6 +177,17 @@ steps:
     xor %edi, %edi
     jmp exit
 
+#if !defined(NAMESPACE) && !defined(IPC)
+close_and_record:
+    test %rax, %rax
+    js 1f
+    mov %rax, %rdi
+    mov $3, %eax
+    syscall
+1:  record
+    ret
+#endif
+
 failed:
     mov $100, %edi
 exit:
@@ -103,12 +196,16 @@ exit:
 
 .section .rodata
 work:    .asciz WORK_PATH
+dot:     .asciz "."
 file:    .asciz "file"
 sym:     .asciz "sym"
 dir:     .asciz "dir"
 hard:    .asciz "hard"
 moved:   .asciz "moved"
 new_sym: .asciz "new-sym"
+created: .asciz "created"
+fifo:    .asciz "fifo"
+fifo_at: .asciz "fifo-at"
 
 .bss
 .balign 8

@@ -77,6 +77,8 @@ vm_free = [
 embed = [
   "carrick-vmm-kvm::cpl0_initial_mm::root_fcntl_redirect_restore_preserves_one_description_owner",
   "carrick-cli::x86_kvm_run::mounted_root_fcntl_redirect_restore_preserves_host_description_owner",
+  "KVM production: carrick-vmm-kvm::cpl0_entry::serial_host_root_legacy_ipc_syscalls_match_linux",
+  "KVM production: carrick-vmm-kvm::cpl0_entry::serial_host_fork_child_legacy_ipc_syscalls_match_linux",
 ]
 
 [bindings.unresolved]
