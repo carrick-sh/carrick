@@ -14,6 +14,7 @@
 // Test helpers outside #[test] fns fail loudly on malformed fixtures.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use carrick_aarch64::staged_cpu::{RootBootFields, StagedCpu};
 use carrick_el1_abi::{
     ContextGeneration, CurrentTask, DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE,
     DELEGATED_STATE_GUEST, DelegatedOpenFile, EL1_CURRENT_TASKS_BASE, EL1_DYNAMIC_METADATA_BASE,
@@ -901,7 +902,6 @@ fn production_el1_image_boot_probe() {
 
 const USER_HELLO_ELF: &[u8] =
     include_bytes!("../../carrick-vmm-kvm/fixtures/hello-aarch64/hello-aarch64");
-const ROOT_EL0_ENTRY_SPSR: u64 = 0x3c0;
 
 fn read_u32(memory: &mut Pages, at: u64) -> u32 {
     let mut b = [0u8; 4];
@@ -958,22 +958,32 @@ fn enter_carrier_root(el1_elf: &[u8], user_elf: &[u8]) -> (CpuState, Pages, u64)
         &stage1_carrier_maintenance_page_tables(),
     );
 
+    let root = StagedCpu::initial_root(&RootBootFields {
+        entry: user_entry,
+        initial_stack_pointer: Some(LINUX_STACK_TOP - 16),
+        el0_trampoline_entry: Some(LINUX_EL0_TRAMPOLINE_BASE),
+        el1_vectors_base: Some(LINUX_EL1_VECTORS_BASE),
+        stage1_page_tables_base: Some(LINUX_PAGE_TABLES_BASE),
+    })
+    .snapshot();
     let mut cpu = CpuState::default();
     cpu.pstate.el = ExceptionLevel::El1;
     cpu.pstate.sp = StackSelect::El1;
     cpu.pstate.daif = InterruptMasks::ALL;
-    cpu.sp_el0 = StackPointer(LINUX_STACK_TOP - 16);
+    assert_eq!(cpu.pstate.save().0, root.pstate);
+    cpu.sp_el0 = StackPointer(root.sp_el0);
+    // The persistent executor supplies this slot-local stack after staging.
     cpu.sp_el1 = StackPointer(LINUX_SYSCALL_MAILBOX_BASE);
-    cpu.pc = ProgramCounter(LINUX_EL0_TRAMPOLINE_BASE);
-    cpu.el1.elr = ProgramCounter(user_entry);
-    cpu.el1.spsr = SavedPstate(ROOT_EL0_ENTRY_SPSR);
-    cpu.el1.vbar = VirtualAddress(LINUX_EL1_VECTORS_BASE);
-    cpu.el1.mair = SystemValue(MAIR_EL1_BOOTSTRAP);
-    cpu.el1.tcr = SystemValue(TCR_EL1_BOOTSTRAP);
-    cpu.named.ttbr0 = SystemValue(LINUX_PAGE_TABLES_BASE);
-    cpu.named.ttbr1 = SystemValue(LINUX_PAGE_TABLES_BASE);
-    cpu.el1.sctlr = Sctlr(SCTLR_EL1_BOOTSTRAP);
-    cpu.el1.cntkctl = SystemValue(3);
+    cpu.pc = ProgramCounter(root.pc);
+    cpu.el1.elr = ProgramCounter(root.elr_el1);
+    cpu.el1.spsr = SavedPstate(root.spsr_el1);
+    cpu.el1.vbar = VirtualAddress(root.vbar);
+    cpu.el1.mair = SystemValue(root.mair);
+    cpu.el1.tcr = SystemValue(root.tcr);
+    cpu.named.ttbr0 = SystemValue(root.ttbr0);
+    cpu.named.ttbr1 = SystemValue(root.ttbr1);
+    cpu.el1.sctlr = Sctlr(root.sctlr);
+    cpu.el1.cntkctl = SystemValue(root.cntkctl_el1);
     (cpu, memory, user_entry)
 }
 
