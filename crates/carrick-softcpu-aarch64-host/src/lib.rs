@@ -130,6 +130,8 @@ pub struct HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     publication: carrick_host_jit::PublicationWork,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    vector_frame_bytes: u64,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     retain_blocks: bool,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     retain_on_handoff: bool,
@@ -160,10 +162,16 @@ impl HostBlockRunner {
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    pub fn vector_frame_bytes(&self) -> u64 {
+        self.vector_frame_bytes
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     pub fn new() -> Result<Self, HostError> {
         let frames = FRAME_REGION_BYTES / core::mem::size_of::<BlockFrame>();
         Ok(Self {
             publication: carrick_host_jit::PublicationWork::default(),
+            vector_frame_bytes: 0,
             retain_blocks: std::env::var_os("CARRICK_SOFT_AARCH64_CACHE").as_deref()
                 != Some(std::ffi::OsStr::new("0")),
             retain_on_handoff: std::env::var_os("CARRICK_SOFT_AARCH64_HANDOFF_CACHE").as_deref()
@@ -391,6 +399,7 @@ impl HostBlockRunner {
         self.region[top].slots[frame::INLINE_READ_PTR as usize / 8] = 0;
         self.region[top].slots[frame::INLINE_WRITE_PTR as usize / 8] = 0;
         self.region[top].store_to(cpu);
+        self.vector_frame_bytes += 2 * size_of_val(&cpu.vectors) as u64;
         let slots = &mut self.region[top].slots;
         if budget.is_some() {
             let last = bank

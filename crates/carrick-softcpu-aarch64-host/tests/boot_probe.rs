@@ -809,6 +809,29 @@ fn remap_and_exec_loader_write_advance_code_incarnations() {
 }
 
 #[test]
+fn scalar_launcher_leaves_vector_state_in_the_cpu() {
+    const PC: u64 = 0x4000;
+    let mut runner = HostBlockRunner::new().unwrap();
+    let mut memory = Pages::default();
+    let mut cpu = el1_at(PC);
+    cpu.vectors.fill(0x5a);
+    let expected = cpu.vectors;
+
+    // nop; hvc #2. The scalar host entry has no vector loads or stores.
+    load_words(&mut memory, PC, &[0xd503_201f, 0xd400_0042]);
+    let report = probe(&mut cpu, &mut memory, &mut runner, 1);
+    assert!(matches!(
+        report.stop,
+        Stop::Event {
+            event: Event::ProviderExit(_),
+            ..
+        }
+    ));
+    assert_eq!(cpu.vectors, expected);
+    assert_eq!(runner.vector_frame_bytes(), 0);
+}
+
+#[test]
 fn provider_handoffs_reuse_only_the_current_code_incarnation() {
     const PC: u64 = 0x4000;
     let mut runner = HostBlockRunner::new().unwrap();
@@ -2199,7 +2222,11 @@ fn run_dynamic_glibc(
     };
     let elapsed = started.elapsed().as_secs_f64();
     replies.report_opens();
-    println!("engine work={work:?} {:?}", runner.inner.publication_work());
+    println!(
+        "engine work={work:?} {:?} vector_frame_bytes={}",
+        runner.inner.publication_work(),
+        runner.inner.vector_frame_bytes(),
+    );
     if profile {
         println!("QEMU or native host phase timings {phases:?}");
     }
