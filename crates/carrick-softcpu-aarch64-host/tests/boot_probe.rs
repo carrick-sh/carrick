@@ -805,6 +805,51 @@ fn remap_and_exec_loader_write_advance_code_incarnations() {
 }
 
 #[test]
+fn provider_handoffs_reuse_only_the_current_code_incarnation() {
+    const PC: u64 = 0x4000;
+    let mut runner = HostBlockRunner::new().unwrap();
+    let mut memory = Pages::default();
+    let mut cpu = el1_at(PC);
+
+    let mut resume = |memory: &mut Pages, immediate: u16| {
+        cpu.pc = ProgramCounter(PC);
+        let report = probe(&mut cpu, memory, &mut runner, 1);
+        let Stop::Event {
+            event: Event::ProviderExit(exit),
+            ..
+        } = report.stop
+        else {
+            panic!("{report}");
+        };
+        assert_eq!(exit.immediate.value(), immediate);
+        report.work.emitted_blocks
+    };
+
+    load_words(&mut memory, PC, &[0xd400_0042]); // hvc #2
+    assert_eq!(resume(&mut memory, 2), 1);
+    let mut emits = 1;
+    let mut handoffs = 1;
+    for scale in [1, 100, 10_000] {
+        for _ in handoffs..scale {
+            emits += resume(&mut memory, 2);
+        }
+        handoffs = scale;
+        assert_eq!(emits, 1, "one resident block across {scale} handoffs");
+    }
+
+    load_words(&mut memory, PC, &[0xd400_0062]); // hvc #3
+    assert_eq!(resume(&mut memory, 3), 1);
+    memory.unmap(PC);
+    load_words(&mut memory, PC, &[0xd400_0082]); // hvc #4
+    assert_eq!(resume(&mut memory, 4), 1);
+
+    // A new owner may have the original owner's numerical page generation.
+    let mut other = Pages::default();
+    load_words(&mut other, PC, &[0xd400_00a2]); // hvc #5
+    assert_eq!(resume(&mut other, 5), 1);
+}
+
+#[test]
 fn guest_code_write_replaces_the_resident_translation() {
     const CODE: u64 = 0x4000;
     const WRITER: u64 = 0x5000;
@@ -1994,6 +2039,7 @@ fn run_dynamic_glibc(
     let mut monitor = ExclusiveMonitor::default();
     let started = std::time::Instant::now();
     let profile = std::env::var_os("CARRICK_A64_PHASE_PROFILE").as_deref() == Some("1".as_ref());
+    let mut next_profile_sample = 1_000_000;
     let result = loop {
         let report = if profile {
             run_profiled(
@@ -2036,6 +2082,10 @@ fn run_dynamic_glibc(
         phases.publish_ns += report.phases.publish_ns;
         phases.launch_ns += report.phases.launch_ns;
         phases.handler_ns += report.phases.handler_ns;
+        if profile && blocks >= next_profile_sample {
+            println!("engine profile after {blocks} budget steps: {work:?} {phases:?}");
+            next_profile_sample = blocks.saturating_mul(2);
+        }
         undefined += report.undefined_el0_deliveries;
         runner.finish_pending();
         for svc in &runner.syscalls[traced..] {

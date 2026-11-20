@@ -1057,6 +1057,7 @@ mod tests {
                 emitted_blocks: 1,
                 stage1_walks: 0,
                 memory_exits: 1,
+                ..RunWork::default()
             }
         );
 
