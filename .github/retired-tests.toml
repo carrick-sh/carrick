@@ -91,3 +91,9 @@ pr = 2564
 test = "carrick_vmm_hvf::staged_cpu::tests::staged_registers_round_trip_through_the_hal_names"
 reason = "#1236: the HAL register round-trip witness for StagedCpu moved unchanged to carrick_aarch64::staged_cpu::tests::staged_registers_round_trip_through_the_hal_names, where it runs on the host unit lane."
 pr = 2564
+
+[[retired]]
+test = "carrick_x86_cpl0::native_stage::tests::a_child_readlinkat_prepares_untouched_output_then_keeps_the_family_route"
+reason = "#2581: descendant readlinkat retains its request before preparing output. The replacement checks that the native file owner receives the path and destination."
+replaced_by = "carrick_x86_cpl0::native_stage::tests::child_readlinkat_stages_the_request_before_preparing_output"
+pr = 2630
