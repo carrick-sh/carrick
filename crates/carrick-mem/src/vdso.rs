@@ -13,29 +13,44 @@
 //! (headers, .dynsym, .dynstr, .hash, .gnu.version, .gnu.version_d, .dynamic) is
 //! hand-built below — no build-time toolchain dependency.
 
-/// Guest VA of the vvar (timekeeping) data page. The embedded code loads this
-/// with a single `movz x9, #0x2E, lsl #32`, so it MUST match the asm.
-pub const LINUX_VVAR_BASE: u64 = 0x2E_0000_0000;
-/// Guest VA of the vDSO code/ELF page (one 64 KiB slot above vvar). This is the
-/// value published in `AT_SYSINFO_EHDR`.
-pub const LINUX_VDSO_BASE: u64 = 0x2E_0001_0000;
-/// Page sizes reserved for each region.
-pub const LINUX_VVAR_SIZE: u64 = 0x1000;
-pub const LINUX_VDSO_SIZE: u64 = 0x1000;
+pub use carrick_syscall_abi::vdso::{
+    LINUX_VDSO_BASE, LINUX_VDSO_SIZE, LINUX_VVAR_BASE, LINUX_VVAR_SIZE, VVAR_OFF_FREQ,
+    VVAR_OFF_MONOTONIC_OFF_NS, VVAR_OFF_REALTIME_OFF_NS, VVAR_OFF_RNG_GENERATION, VVAR_OFF_SEQ,
+};
 
-/// Byte offsets into the vvar data page (little-endian u64s). carrick fills
-/// these; the vDSO code reads them.
-pub const VVAR_OFF_SEQ: usize = 0; // seqlock (even = stable) — reserved
-pub const VVAR_OFF_FREQ: usize = 8; // CNTFRQ_EL0 in Hz
-pub const VVAR_OFF_REALTIME_OFF_NS: usize = 16; // wall_ns - monotonic_ns
-/// RNG generation the userspace getrandom blob reads (P2). carrick stamps each
-/// process's host PID here (unique per process), and re-stamps a forked child's
-/// PID in rebuild_vcpu_after_fork — so a child's generation never matches the
-/// snapshot it COW-inherited from its parent, forcing a reseed (no keystream
-/// reuse across fork). See docs/archive/vdso-getrandom-design.md.
-pub const VVAR_OFF_RNG_GENERATION: usize = 24;
-/// x86_64 vDSO only: `CLOCK_MONOTONIC` offset from guest TSC nanoseconds.
-pub const VVAR_OFF_MONOTONIC_OFF_NS: usize = 32;
+/// The TSC calibration retained by a native x86 carrier. Its monotonic epoch
+/// is TSC nanoseconds, the epoch already used by the in-ring syscall.
+#[derive(Clone, Copy, Debug)]
+pub struct X86NativeVvar {
+    frequency: core::num::NonZeroU64,
+    realtime_offset: u64,
+}
+
+impl X86NativeVvar {
+    pub const BYTE_LEN: usize = VVAR_OFF_MONOTONIC_OFF_NS + size_of::<u64>();
+
+    pub fn new(
+        frequency: core::num::NonZeroU64,
+        tsc: u64,
+        wall_ns: u64,
+        realtime_delta: i64,
+    ) -> Self {
+        let counter_ns = (u128::from(tsc) * 1_000_000_000 / u128::from(frequency.get())) as u64;
+        Self {
+            frequency,
+            realtime_offset: vvar_realtime_off_ns(wall_ns.wrapping_sub(counter_ns), realtime_delta),
+        }
+    }
+
+    pub fn bytes(self) -> [u8; Self::BYTE_LEN] {
+        let mut bytes = [0; Self::BYTE_LEN];
+        bytes[VVAR_OFF_FREQ..VVAR_OFF_FREQ + size_of::<u64>()]
+            .copy_from_slice(&self.frequency.get().to_le_bytes());
+        bytes[VVAR_OFF_REALTIME_OFF_NS..VVAR_OFF_REALTIME_OFF_NS + size_of::<u64>()]
+            .copy_from_slice(&self.realtime_offset.to_le_bytes());
+        bytes
+    }
+}
 
 /// The single shared definition of the guest's `CLOCK_REALTIME` base offset
 /// (`unix_ns - uptime_ns`), so the userspace vDSO fast path (which adds
@@ -139,7 +154,7 @@ const VDSO_CODE: &[u8] = &[
 /// Minimal x86_64 vDSO code. Generated from hand-written assembly and checked in
 /// as bytes so normal builds do not depend on an assembler. Offsets:
 /// `__vdso_clock_gettime` @ 0x00, `__vdso_clock_getres` @ 0x74,
-/// `__vdso_gettimeofday` @ 0xa2, `__vdso_time` @ 0xaa.
+/// `__vdso_gettimeofday` @ 0xa2, `__vdso_time` @ 0x106.
 ///
 /// The clock fast path reads the fixed carrick vvar page:
 /// - `VVAR_OFF_FREQ`: guest TSC Hz
@@ -147,8 +162,8 @@ const VDSO_CODE: &[u8] = &[
 /// - `VVAR_OFF_MONOTONIC_OFF_NS`: monotonic offset from TSC nanoseconds
 ///
 /// Unsupported clocks and zero frequency fall back to the real x86_64 syscalls
-/// (`clock_gettime`=228, `clock_getres`=229). `gettimeofday` and `time` are
-/// syscall stubs for now; the Go-build hot path is `clock_gettime`.
+/// (`clock_gettime`=228, `clock_getres`=229). The vDSO also uses the realtime
+/// offset in its gettimeofday and time fast paths.
 const X8664_VDSO_CODE: &[u8] = &[
     0x48, 0x85, 0xf6, 0x74, 0x0f, 0x83, 0xff, 0x00, 0x74, 0x12, 0x83, 0xff, 0x01, 0x74, 0x1c, 0x83,
     0xff, 0x04, 0x74, 0x17, 0xb8, 0xe4, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc3, 0x49, 0xbb, 0x10, 0x00,
@@ -433,6 +448,14 @@ pub fn x8664_vdso_image_bytes() -> Vec<u8> {
         w64(&mut buf, o + 8, *val);
     }
     buf[off_code..off_code + X8664_VDSO_CODE.len()].copy_from_slice(X8664_VDSO_CODE);
+    // The immediate in "movq $1, 8(%rsi)" in __vdso_clock_getres.
+    // The published resolution comes from the same ABI constant as the syscall.
+    const CLOCK_GETRES_NSEC_IMMEDIATE: usize = X8664_SYM_CLOCK_GETRES as usize + 0x27;
+    w32(
+        &mut buf,
+        off_code + CLOCK_GETRES_NSEC_IMMEDIATE,
+        VDSO_CLOCK_RESOLUTION_NS as u32,
+    );
     buf[off_shstrtab..off_shstrtab + shstr.len()].copy_from_slice(&shstr);
 
     const SHT_STRTAB: u32 = 3;

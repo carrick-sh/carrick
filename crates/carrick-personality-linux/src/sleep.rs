@@ -8,13 +8,10 @@
 //! publication wakes the parked member. This module owns only the Linux
 //! argument contract: clock classification and `timespec` validation.
 //!
-//! Clock domains in ring: a relative sleep measures the guest counter whatever
-//! its clock id, as POSIX requires for relative sleeps. An absolute deadline is
-//! served only where the guest can observe the counter's epoch as its
-//! `CLOCK_MONOTONIC` ([`absolute_monotonic_epoch`]), and only for the
-//! monotonic clocks. An absolute `CLOCK_REALTIME`/`CLOCK_TAI` deadline needs a
-//! realtime authority that follows `clock_settime`; until one exists (#1981)
-//! it stays unserved: the call keeps its counted ENOSYS crossing refusal.
+//! An absolute monotonic wait uses the same guest counter epoch as
+//! `clock_gettime(CLOCK_MONOTONIC)`. ARM also projects its BOOTTIME through
+//! that epoch. An absolute REALTIME or TAI deadline needs to follow
+//! `clock_settime` and remains unserved (#1981).
 
 use crate::abi::entry::SyscallResult;
 use crate::signal::{SignalNative, SignalOutcome};
@@ -40,8 +37,10 @@ pub enum SleepCall {
 /// The time base an absolute deadline is expressed in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SleepClock {
-    /// `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME`.
+    /// The guest execution counter epoch.
     Monotonic,
+    /// On ARM the vDSO projects BOOTTIME through the same epoch.
+    Boottime,
     /// `CLOCK_REALTIME` and `CLOCK_TAI`: settable wall time.
     Realtime,
 }
@@ -90,7 +89,8 @@ pub fn sleep_clock(clock_id: u64) -> ClockClass {
     }
     match id as u64 {
         LINUX_CLOCK_REALTIME | LINUX_CLOCK_TAI => ClockClass::Sleeps(SleepClock::Realtime),
-        LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_BOOTTIME => ClockClass::Sleeps(SleepClock::Monotonic),
+        LINUX_CLOCK_MONOTONIC => ClockClass::Sleeps(SleepClock::Monotonic),
+        LINUX_CLOCK_BOOTTIME => ClockClass::Sleeps(SleepClock::Boottime),
         LINUX_CLOCK_PROCESS_CPUTIME_ID
         | LINUX_CLOCK_REALTIME_ALARM
         | LINUX_CLOCK_BOOTTIME_ALARM => ClockClass::Unserved,
@@ -100,22 +100,6 @@ pub fn sleep_clock(clock_id: u64) -> ClockClass {
         | LINUX_CLOCK_MONOTONIC_COARSE => ClockClass::Refused(LINUX_EOPNOTSUPP),
         _ => ClockClass::Refused(LINUX_EINVAL),
     }
-}
-
-/// Whether `isa`'s guests can observe the counter epoch an absolute
-/// monotonic deadline is compared against.
-///
-/// ARM: the vDSO's `CLOCK_MONOTONIC` is the guest counter divided by its
-/// frequency, with no offset (`carrick-mem` vDSO), the same domain the ring
-/// sleep measures. x86 CPL0: the counter is raw RDTSC
-/// (`carrick-el1/src/isa/x86/interrupt.rs`, `X86Backend::counter`), the
-/// initial stack publishes no `AT_SYSINFO_EHDR`
-/// (`carrick-el1/src/isa/x86/initial_mm.rs`, `build_initial_stack`), and a
-/// child's `clock_gettime` is not served in ring, so no guest-visible
-/// monotonic epoch is tied to that counter. x86 absolute sleeps stay
-/// unserved until one is defined.
-pub const fn absolute_monotonic_epoch(isa: GuestIsa) -> bool {
-    matches!(isa, GuestIsa::Aarch64)
 }
 
 /// Validate one copied Linux 64-bit `timespec` and return its nanoseconds.
@@ -192,8 +176,12 @@ pub fn invoke(
         ClockClass::Unserved => return None,
         ClockClass::Refused(errno) => return returned(errno.guest_retval()),
     };
-    if absolute && (clock == SleepClock::Realtime || !absolute_monotonic_epoch(isa)) {
-        return None;
+    if absolute {
+        match clock {
+            SleepClock::Realtime => return None,
+            SleepClock::Boottime if isa == GuestIsa::X86_64 => return None,
+            SleepClock::Monotonic | SleepClock::Boottime => {}
+        }
     }
     // As the host dispatcher: page zero is never a guest timespec.
     if request == 0 {
@@ -245,7 +233,7 @@ mod tests {
             (4, Refused(LINUX_EOPNOTSUPP)),
             (5, Refused(LINUX_EOPNOTSUPP)),
             (6, Refused(LINUX_EOPNOTSUPP)),
-            (7, Sleeps(SleepClock::Monotonic)),
+            (7, Sleeps(SleepClock::Boottime)),
             (8, Unserved),
             (9, Unserved),
             (10, Refused(LINUX_EINVAL)),
@@ -264,12 +252,6 @@ mod tests {
         ] {
             assert_eq!(sleep_clock(clock), class, "clock {clock:#x}");
         }
-    }
-
-    #[test]
-    fn absolute_monotonic_epoch_is_defined_only_on_arm() {
-        assert!(absolute_monotonic_epoch(GuestIsa::Aarch64));
-        assert!(!absolute_monotonic_epoch(GuestIsa::X86_64));
     }
 
     #[test]
