@@ -405,7 +405,16 @@ impl SyscallDispatcher {
             )
         })
         .unwrap_or_else(|never| match never {});
-        self.serve_native_host_file_with_authority(&owner, record, Some(&resources), None, None)
+        let executable = carrick_core_abi::host_file::request_parts(record)
+            .filter(|(header, _, _)| header.op == HostFileOp::Readlinkat)
+            .and_then(|_| self.root_executable_seed());
+        self.serve_native_host_file_with_authority(
+            &owner,
+            record,
+            Some(&resources),
+            executable,
+            None,
+        )
     }
 
     /// The transient filesystem authority of one path crossing, built from
@@ -1680,7 +1689,8 @@ impl SyscallDispatcher {
                     Ok(path) => path,
                     Err(errno) => return Served::errno(errno),
                 };
-                match fs.readlink_path_target(&resolved) {
+                let visible_self = u32::try_from(header.args[0]).ok().filter(|&pid| pid != 0);
+                match fs.readlink_path_target(&resolved, visible_self) {
                     Ok(target) => {
                         let mut bytes = carrick_vfs::pathcodec::decode_to_bytes(&target);
                         bytes.truncate(capacity);

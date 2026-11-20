@@ -451,8 +451,9 @@ impl HostFileCall {
     ///   mutations such as `ftruncate`, `fchmod` and `fchown` also follow the
     ///   descriptor: the root's staged `openat` installs into the ring table
     ///   (#2157 B1, #231).
-    /// - `readlinkat(AT_FDCWD, ...)` keeps its existing route. A directory
-    ///   operand follows the ring descriptor it names.
+    /// - The initial task's cwd-based readlink keeps its existing route.
+    ///   Descendants stage readlink through their own executable custody.
+    ///   A directory operand follows the ring descriptor it names.
     /// - A child's host network calls and its polls of host objects are
     ///   staged (#231); the initial task keeps its routes for both.
     pub fn admitted_for(self, origin: ServiceOrigin, delegated: impl FnOnce(i32) -> bool) -> bool {
@@ -481,7 +482,9 @@ impl HostFileCall {
             | Self::Fstatfs { fd, .. }
             | Self::Fallocate { fd, .. } => origin != ServiceOrigin::Initial || !delegated(fd),
             Self::Statfs { .. } => origin != ServiceOrigin::Initial,
-            Self::Readlinkat { dirfd, .. } => dirfd.0 != LINUX_AT_FDCWD,
+            Self::Readlinkat { dirfd, .. } => {
+                origin != ServiceOrigin::Initial || dirfd.0 != LINUX_AT_FDCWD
+            }
             call if call.child_venue_only() => {
                 origin != ServiceOrigin::Initial || call.uses_ring_path_base()
             }

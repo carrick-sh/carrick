@@ -78,6 +78,7 @@ pub struct X86ExecImage {
     env: Vec<Vec<u8>>,
     stack_pointer: u64,
     demand: ImageFrameDemand,
+    executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
 }
 
 impl X86ExecImage {
@@ -162,7 +163,17 @@ impl X86ExecImage {
             env,
             stack_pointer: stack.rsp,
             demand,
+            executable: None,
         })
+    }
+
+    /// Retain the loader's executable through parking, cancellation and adoption.
+    pub fn with_executable(
+        mut self,
+        executable: Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>,
+    ) -> Self {
+        self.executable = Some(executable);
+        self
     }
 
     /// The image as boot's loader describes one, borrowing these bytes.
@@ -1326,7 +1337,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }
         let preparation = adoption.data;
         let X86ExecPreparation {
-            request,
+            mut request,
             tables,
             mut data,
             build,
@@ -1354,15 +1365,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 request.root_generation,
             )
         };
+        let mut sources = carrick_hal::fork_stock::ForkHostBackingCustody::default();
+        if let Some(executable) = request.image.executable.take() {
+            sources.bind_executable(executable);
+        }
         let replaced = self
             .fork_stock
-            .replace_child_for_exec_with_tables(
-                execution,
-                handle,
-                backing.root,
-                carrick_hal::fork_stock::ForkHostBackingCustody::default(),
-                used,
-            )
+            .replace_child_for_exec_with_tables(execution, handle, backing.root, sources, used)
             .map_err(|(error, _)| fail(format!("exec successor stock custody: {error:?}")))?;
         self.exec_predecessors.push(replaced);
         // The data extent is now the successor's: its frames are published.
