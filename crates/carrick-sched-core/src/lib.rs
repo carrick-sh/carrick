@@ -3080,6 +3080,20 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         freed
     }
 
+    /// Diagnostic projection of a native-owned record's `ThreadIdentity` for
+    /// `NCHILD_LOST` accounting before freeing `record`.
+    pub fn native_owned_identity(&self, record: RecordRef) -> Option<ThreadIdentity> {
+        let rec = self.live(record)?;
+        rec.is_native_owned().then(|| rec.identity())
+    }
+
+    /// Diagnostic projection of a native-owned record that remains stranded in
+    /// `Claim::Host` after host handback adoption returns `None`.
+    pub fn native_owned_host_claim_identity(&self, record: RecordRef) -> Option<ThreadIdentity> {
+        let rec = self.live(record)?;
+        (rec.is_native_owned() && matches!(rec.claim(), Claim::Host { .. })).then(|| rec.identity())
+    }
+
     /// Free a record its owner is done with (the host after loading it, or a
     /// party that allocated it and never published a park).
     pub fn free_record(&self, id: RecordId) {

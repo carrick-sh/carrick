@@ -677,10 +677,8 @@ pub fn record_native_record_lost(
     reason: carrick_el1_abi::NativeChildLostReason,
     site: carrick_el1_abi::NativeChildLostSite,
 ) {
-    if let Some(rec) = zone.live(record)
-        && rec.is_native_owned()
-    {
-        record_native_identity_lost(rec.identity(), reason, site, u64::from(record.id.raw()));
+    if let Some(identity) = zone.native_owned_identity(record) {
+        record_native_identity_lost(identity, reason, site, u64::from(record.id.raw()));
     }
 }
 

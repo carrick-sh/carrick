@@ -1925,15 +1925,12 @@ fn probe_zone_runnable(
         if let Some(running) = scheduler.adopt_zone_handback(registration, record)? {
             return Ok(ZoneProbe::Consumed(Some(running)));
         }
-        if zone
-            .live(record)
-            .is_some_and(|rec| matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. }))
-        {
-            carrick_kernel::el1_zone::record_native_record_lost(
-                zone,
-                record,
+        if let Some(identity) = zone.native_owned_host_claim_identity(record) {
+            carrick_kernel::el1_zone::record_native_identity_lost(
+                identity,
                 carrick_el1_abi::NativeChildLostReason::HostLostAdoption,
                 carrick_el1_abi::NativeChildLostSite::HostPendingAdoptionLost,
+                u64::from(record.id.raw()),
             );
         }
         zone.counters
@@ -1994,15 +1991,12 @@ fn probe_zone_runnable(
             // loads it, exactly as the thread it took off its vCPU.
             let taken = scheduler.adopt_zone_handback(registration, record)?;
             if taken.is_none() {
-                if zone
-                    .live(record)
-                    .is_some_and(|rec| matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. }))
-                {
-                    carrick_kernel::el1_zone::record_native_record_lost(
-                        zone,
-                        record,
+                if let Some(identity) = zone.native_owned_host_claim_identity(record) {
+                    carrick_kernel::el1_zone::record_native_identity_lost(
+                        identity,
                         carrick_el1_abi::NativeChildLostReason::HostLostAdoption,
                         carrick_el1_abi::NativeChildLostSite::HostServiceHeadAdoptionLost,
+                        u64::from(record.id.raw()),
                     );
                 }
                 zone.counters
@@ -2011,10 +2005,7 @@ fn probe_zone_runnable(
             }
             return Ok(ZoneProbe::Consumed(taken));
         }
-        let native_identity = zone
-            .live(record)
-            .filter(|rec| rec.is_native_owned())
-            .map(|rec| rec.identity());
+        let native_identity = zone.native_owned_identity(record);
         let key = carrick_kernel::el1_zone::service_key(record);
         let taken = match key {
             Some((thread, generation)) => {
