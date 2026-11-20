@@ -810,6 +810,110 @@ pub(super) fn park_contended_fault(
     }
 }
 
+/// Park a fault continuation on the exact object queue named by a typed owner
+/// receipt. Unlike an MM-only contention cause, this also preserves the
+/// carrier reservation-pool and member host-readiness queue identities.
+pub(super) fn park_owner_fault_wait(
+    task: &CurrentTask,
+    slot: carrick_sched_core::SlotId,
+    wait: carrick_el1_abi::PortalOwnerWait,
+    context: &ParkedContextWords,
+) -> ContendedFault {
+    use carrick_core::wait::{ObjectParkRequest, park_object_record_rechecked};
+    use carrick_el1_abi::PortalWaitCause;
+    use carrick_sched_core::Waker;
+    use carrick_sched_core::object_wait::{
+        ObjectStateSnapshot, ObjectWaitError, ObjectWaitKey, OperationToken,
+    };
+
+    let source = carrick_x86_carrier::native_execution::source(slot);
+    let zone = source.zone;
+    let Some(mm) = carrick_el1_abi::ReservationMm::new(task.mm.key.load(Ordering::Acquire)) else {
+        return ContendedFault::Refused;
+    };
+    if wait.handle().mm() != mm {
+        return ContendedFault::Refused;
+    }
+    let record = match zone
+        .slot(slot)
+        .current()
+        .or_else(|| zone.slot(slot).host_record())
+    {
+        Some(record) => record,
+        None => return ContendedFault::Refused,
+    };
+    let (key, snapshot) = match wait.cause() {
+        PortalWaitCause::ReservationPool => {
+            let key = ObjectWaitKey::reservation_pool(wait.handle().carrier());
+            // SAFETY: the carrier receipt sampled this exact pool queue before
+            // the failed non-consuming probe.
+            let snapshot =
+                unsafe { ObjectStateSnapshot::taken_under_owner_state_lock(key, wait.revision()) };
+            (key, snapshot)
+        }
+        PortalWaitCause::HostReadiness => {
+            let Some(key) = ObjectWaitKey::native_host_ready(record) else {
+                return ContendedFault::Refused;
+            };
+            // SAFETY: HostReadiness receipts carry this member queue's epoch,
+            // sampled before the carrier found its object not ready.
+            let snapshot =
+                unsafe { ObjectStateSnapshot::taken_under_owner_state_lock(key, wait.revision()) };
+            (key, snapshot)
+        }
+        _ => {
+            let Ok(enrollment) =
+                carrick_core_abi::wait::PortalWaitEnrollment::for_owner(zone, wait.handle(), wait)
+            else {
+                return ContendedFault::Refused;
+            };
+            (enrollment.key(), enrollment.observed_snapshot())
+        }
+    };
+    let Some(token) = OperationToken::prepared_edit(key) else {
+        return ContendedFault::Refused;
+    };
+    let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
+    let mut replaced = None;
+    let result = park_object_record_rechecked(
+        zone,
+        slot,
+        request,
+        &|effects| crate::native_process::release(zone, Waker::El1 { slot }, effects),
+        || {
+            let current = zone
+                .slot(slot)
+                .current()
+                .or_else(|| zone.slot(slot).host_record())
+                .ok_or(ObjectWaitError::Stale)?;
+            // SAFETY: the faulting slot owns its current record until this
+            // publication commits.
+            let saved = unsafe { zone.record(current).ctx_mut() };
+            replaced = Some((current, *saved));
+            *saved = *context;
+            Ok((current, false))
+        },
+        || task.mm.key.load(Ordering::Acquire) == mm.raw(),
+    );
+    match result {
+        Ok(_) => ContendedFault::Parked,
+        Err((ObjectWaitError::Changed, _)) => {
+            if let Some((record, previous)) = replaced {
+                // SAFETY: failed publication leaves this slot owning record.
+                *unsafe { zone.record(record).ctx_mut() } = previous;
+            }
+            ContendedFault::Rerun
+        }
+        Err(_) => {
+            if let Some((record, previous)) = replaced {
+                // SAFETY: failed publication leaves this slot owning record.
+                *unsafe { zone.record(record).ctx_mut() } = previous;
+            }
+            ContendedFault::Refused
+        }
+    }
+}
+
 fn fatal_reservation() -> ! {
     carrick_x86_carrier::entry::fatal_boot()
 }

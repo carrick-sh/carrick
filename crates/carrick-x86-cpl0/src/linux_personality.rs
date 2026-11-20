@@ -721,7 +721,54 @@ pub fn handle_user_page_fault_prepared(
             address,
         } => deliver_page_fault_signal(frame, fpstate, signum, code, address),
         UserFaultSupply::Contended(cause) => park_contended_user_fault(prep, frame, fpstate, cause),
+        UserFaultSupply::OwnerWait(wait) => {
+            park_owner_waiting_user_fault(prep, frame, fpstate, wait)
+        }
         UserFaultSupply::Unresolved(reason) => reason,
+    }
+}
+
+fn park_owner_waiting_user_fault(
+    prep: &carrick_x86_carrier::entry::PreparedUserPageFault<'_>,
+    frame: &PageFaultStack,
+    fpstate: &XsaveArea,
+    wait: carrick_el1_abi::PortalOwnerWait,
+) -> u64 {
+    use carrick_el1::isa::x86::context;
+    if !native_process::is_admitted() {
+        return 9;
+    }
+    let Some(address) =
+        carrick_el1_abi::ReservationMm::new(prep.task.mm.key.load(Ordering::Acquire))
+            .and_then(anonymous::live_words)
+            .and_then(|words| words.context)
+    else {
+        return 9;
+    };
+    let native = rust_alloc::boxed::Box::new(context::scheduler::NativeContext {
+        frame: context::scheduler::InterruptFrame {
+            gpr: frame.saved_gprs,
+            rip: frame.rip,
+            cs: frame.cs,
+            flags: frame.rflags,
+            rsp: frame.rsp,
+            ss: frame.ss,
+        },
+        address,
+        fs_base: carrick_x86_carrier::native_execution::read_msr(0xc000_0100),
+        gs_base: carrick_x86_carrier::native_execution::read_msr(0xc000_0102),
+        xsave: fpstate.clone(),
+    });
+    let saved = rust_alloc::boxed::Box::new(context::context_words::from_native(&native));
+    drop(native);
+    match anonymous::park_owner_fault_wait(prep.task, prep.slot, wait, &saved) {
+        anonymous::ContendedFault::Parked => {
+            drop(saved);
+            carrick_x86_carrier::entry::leave_user_page_fault(prep.binding);
+            native_execution::schedule(prep.slot)
+        }
+        anonymous::ContendedFault::Rerun => 0,
+        anonymous::ContendedFault::Refused => 9,
     }
 }
 
@@ -783,6 +830,9 @@ pub enum UserFaultSupply {
     /// Another owner holds the MM root, editor or gate. This is "not now":
     /// park on its release and retry the unchanged access.
     Contended(carrick_sched_core::spaces::notification::SpaceWaitCause),
+    /// A typed owner receipt names either an MM release, the carrier
+    /// reservation pool, or this member's host-readiness queue.
+    OwnerWait(carrick_el1_abi::PortalOwnerWait),
     /// No owner could supply the access: the #PF entry reports this reason.
     Unresolved(u64),
 }
@@ -837,16 +887,26 @@ fn native_exec_call(
                     restart_native_syscall(frame, ordinal);
                     CompletionRoute::Served
                 }
-                UserFaultSupply::Contended(cause) => match anonymous::park_contended_fault(
-                    task, slot, cause, saved,
-                ) {
-                    anonymous::ContendedFault::Parked => CompletionRoute::Suspended,
-                    anonymous::ContendedFault::Rerun => {
-                        restart_native_syscall(frame, ordinal);
-                        CompletionRoute::Served
+                UserFaultSupply::Contended(cause) => {
+                    match anonymous::park_contended_fault(task, slot, cause, saved) {
+                        anonymous::ContendedFault::Parked => CompletionRoute::Suspended,
+                        anonymous::ContendedFault::Rerun => {
+                            restart_native_syscall(frame, ordinal);
+                            CompletionRoute::Served
+                        }
+                        anonymous::ContendedFault::Refused => fatal_boot(),
                     }
-                    anonymous::ContendedFault::Refused => fatal_boot(),
-                },
+                }
+                UserFaultSupply::OwnerWait(wait) => {
+                    match anonymous::park_owner_fault_wait(task, slot, wait, saved) {
+                        anonymous::ContendedFault::Parked => CompletionRoute::Suspended,
+                        anonymous::ContendedFault::Rerun => {
+                            restart_native_syscall(frame, ordinal);
+                            CompletionRoute::Served
+                        }
+                        anonymous::ContendedFault::Refused => fatal_boot(),
+                    }
+                }
                 UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
                     frame.rax = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
                     CompletionRoute::Served
@@ -1044,9 +1104,7 @@ fn supply_user_fault(
             },
             address: fault.address,
         },
-        OwnerFaultSupplyOutcome::Wait(wait) => portal_wait_cause(wait)
-            .map(UserFaultSupply::Contended)
-            .unwrap_or(UserFaultSupply::Unresolved(9)),
+        OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::OwnerWait(wait),
         OwnerFaultSupplyOutcome::Unavailable => UserFaultSupply::Unresolved(9),
         OwnerFaultSupplyOutcome::CowSelected => {
             cross_owner_grant(
@@ -1156,27 +1214,14 @@ fn supply_user_fault(
                 | Err(carrick_core::mm::transaction::MmError::Busy) => UserFaultSupply::Contended(
                     carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
                 ),
-                Err(carrick_core::mm::transaction::MmError::Wait(wait)) => portal_wait_cause(wait)
-                    .map(UserFaultSupply::Contended)
-                    .unwrap_or(UserFaultSupply::Unresolved(9)),
-                _ => UserFaultSupply::Unresolved(9),
+                Err(carrick_core::mm::transaction::MmError::Wait(wait)) => {
+                    UserFaultSupply::OwnerWait(wait)
+                }
+                _ => UserFaultSupply::Contended(
+                    carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+                ),
             }
         }
-    }
-}
-
-fn portal_wait_cause(
-    wait: carrick_el1_abi::PortalOwnerWait,
-) -> Option<carrick_sched_core::spaces::notification::SpaceWaitCause> {
-    use carrick_el1_abi::PortalWaitCause;
-    use carrick_sched_core::spaces::notification::SpaceWaitCause;
-    match wait.cause() {
-        PortalWaitCause::Editor => Some(SpaceWaitCause::Editor),
-        PortalWaitCause::Reservations => Some(SpaceWaitCause::Reservations),
-        PortalWaitCause::PendingEdit => Some(SpaceWaitCause::PendingEdit),
-        PortalWaitCause::Gate => Some(SpaceWaitCause::Gate),
-        PortalWaitCause::Metadata => Some(SpaceWaitCause::Metadata),
-        PortalWaitCause::ReservationPool | PortalWaitCause::HostReadiness => None,
     }
 }
 
@@ -1567,6 +1612,14 @@ impl Personality for LinuxPersonality {
                             // carrier abort.
                             UserFaultSupply::Contended(cause) => {
                                 match anonymous::park_contended_fault(task, slot, cause, &words) {
+                                    anonymous::ContendedFault::Parked => parked = true,
+                                    anonymous::ContendedFault::Rerun => retry = true,
+                                    anonymous::ContendedFault::Refused => fatal_boot(),
+                                }
+                                None
+                            }
+                            UserFaultSupply::OwnerWait(wait) => {
+                                match anonymous::park_owner_fault_wait(task, slot, wait, &words) {
                                     anonymous::ContendedFault::Parked => parked = true,
                                     anonymous::ContendedFault::Rerun => retry = true,
                                     anonymous::ContendedFault::Refused => fatal_boot(),
