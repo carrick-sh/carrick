@@ -839,3 +839,29 @@ fn el0_simd_register_offset_pair_and_literal_match_native() {
     assert_eq!(x(&cpu, 0), DATA + 64);
     assert_eq!(cpu.vectors[2..5], native[4..7]);
 }
+
+#[test]
+fn el0_chkfeat_matches_native_with_no_features_requested() {
+    // A zero request selects no features, even on a host with FEAT_CHK.
+    let mut native = [u128::MAX];
+    native_leaf(
+        &[
+            0xd280_0010, // mov x16, #0
+            0xd503_251f, // chkfeat x16
+            0xf900_0010, // str x16, [x0]
+            0xd65f_03c0, // ret
+        ],
+        &mut native,
+    );
+    for input in [0, 0x1234_5678_9abc_def0] {
+        let mut memory = Flat::default();
+        memory.put_words(CODE, &[0xd503_251f]);
+        let mut cpu = CpuState::default();
+        cpu.pc = ProgramCounter(CODE);
+        set_x(&mut cpu, 16, input);
+        let (report, _) = run_at(&mut cpu, &mut memory);
+        assert_eq!(report.stop, Stop::Fetch(VirtualAddress(CODE + 4)));
+        assert_eq!(report.undefined_el0_deliveries, 0);
+        assert_eq!(x(&cpu, 16) ^ input, native[0] as u64);
+    }
+}
