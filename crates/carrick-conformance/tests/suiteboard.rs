@@ -144,48 +144,76 @@ carrick_flags = ["--fs", "host"]
 }
 
 #[test]
-fn suiteboard_arm64_plan() {
+fn suiteboard_resolves_platform_image_pins() {
     let directory = tempfile::tempdir().unwrap();
     let pins = directory.path().join("images.toml");
-    let digest = "a".repeat(64);
-    fs::write(
-        &pins,
-        format!(
-            r#"
-"localhost:5050/cpython-test:3.12.13" = "localhost:5050/cpython-test@sha256:{digest}"
-"localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0" = "localhost:5005/carrick-nodejs-conformance@sha256:{digest}"
+    let tag = "localhost:5050/cpython-test:3.12.13";
+    let repository = "localhost:5050/cpython-test";
+    let amd64 = format!("{repository}@sha256:{}", "a".repeat(64));
+    let arm64 = format!("{repository}@sha256:{}", "b".repeat(64));
+    let dry_run = |lane: &str| {
+        Command::new(env!("CARGO_BIN_EXE_carrick-conformance"))
+            .args([
+                "--lane",
+                lane,
+                "--slice",
+                "py-fs",
+                "--require-cached-oracle",
+                "--dry-run",
+                "--suiteboard-images",
+            ])
+            .arg(&pins)
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .output()
+            .unwrap()
+    };
+    let write_pins = |arm64_pin: &str| {
+        fs::write(
+            &pins,
+            format!(
+                r#"
+["linux/amd64"]
+"{tag}" = "{amd64}"
+["linux/arm64"]
+{arm64_pin}
 "#
-        ),
-    )
-    .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_carrick-conformance"))
-        .args([
-            "--lane",
-            "hvf",
-            "--slice",
-            "py-fs",
-            "--slice",
-            "node-libuv",
-            "--require-cached-oracle",
-            "--dry-run",
-            "--suiteboard-images",
-        ])
-        .arg(pins)
-        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
-        .output()
+            ),
+        )
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let plan = String::from_utf8(output.stdout).unwrap();
-    assert!(plan.contains("--platform linux/arm64"));
-    assert!(plan.contains("# cpython-posix "));
-    assert!(plan.contains("# node-libuv "));
-    assert!(plan.contains(&format!("carrick-nodejs-conformance@sha256:{digest}")));
-    assert!(!plan.contains("# cpython-subprocess "));
-    assert!(!plan.contains("# node-v8-smoke "));
+    };
+
+    write_pins(&format!(r#""{tag}" = "{arm64}""#));
+    for (lane, platform, image) in [
+        ("kvm-local", "linux/amd64", &amd64),
+        ("hvf", "linux/arm64", &arm64),
+    ] {
+        let output = dry_run(lane);
+        assert!(
+            output.status.success(),
+            "{lane}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let plan = String::from_utf8(output.stdout).unwrap();
+        assert!(plan.contains(&format!("--platform {platform}")));
+        assert!(plan.contains("# cpython-posix "));
+        assert!(!plan.contains("# cpython-subprocess "));
+        assert!(!plan.contains(tag));
+        assert_eq!(
+            plan.matches(image).count(),
+            plan.matches("# cpython-").count() * 2
+        );
+    }
+
+    for arm64_pin in [String::new(), format!(r#""{tag}" = "{tag}""#)] {
+        write_pins(&arm64_pin);
+        let output = dry_run("hvf");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("linux/arm64"), "{stderr}");
+        assert!(stderr.contains(tag), "{stderr}");
+        assert!(stderr.contains("sha256"), "{stderr}");
+    }
 }
 
 /// The two planted behaviours of the review of #2601, through the real CLI:
