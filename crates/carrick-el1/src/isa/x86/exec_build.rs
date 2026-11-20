@@ -888,6 +888,7 @@ mod tests {
             entry: 0x40_0000,
             executable_entry: 0x40_0000,
             interpreter_base: 0,
+            has_vdso: false,
             phdr: 0x40_0040,
             phent: 56,
             phnum: 1,
