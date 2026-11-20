@@ -1636,6 +1636,26 @@ impl<'a> MemView<'a> {
         }))
     }
 
+    /// Sample the admitted MM's reservation/editor release source before a
+    /// contended descriptor publication drops its mutation authority. The
+    /// runtime parks the owned fault continuation on this observation and
+    /// probes once on enrollment, exactly like a contended root acquisition.
+    pub(crate) fn frame_grant_release_wait(
+        &self,
+        permit: &super::mm_mutation::HostAliasPermit<'_>,
+    ) -> Result<carrick_el1_abi::PortalOwnerWait, carrick_el1::memory::reservations::Refusal> {
+        if permit.mm() != self.mem().mm_id {
+            return Err(carrick_el1::memory::reservations::Refusal::Stale);
+        }
+        let root = self
+            .mem()
+            .lock()
+            .delegated_root()
+            .cloned()
+            .ok_or(carrick_el1::memory::reservations::Refusal::Stale)?;
+        root.observe_release()
+    }
+
     pub(crate) fn published_frame_grant_plan<'permit>(
         &self,
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
