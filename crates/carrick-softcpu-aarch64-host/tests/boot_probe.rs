@@ -1759,11 +1759,22 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     );
 }
 
-/// Set CARRICK_A64_DYN_ROOT to a fixture root containing `hello` and its
-/// `lib/ld-linux-aarch64.so.1` and `lib/libc.so.6` from the same sysroot. Build
-/// `hello` from `fixtures/glibc_hello.c` using `aarch64-linux-gnu-gcc -O1
-/// -fno-builtin -Wl,-rpath,/lib` and use the production `CARRICK_A64_ELF`.
+fn assert_fixture_sha256(path: &str, bytes: &[u8], expected: &str) {
+    use sha2::{Digest, Sha256};
+
+    assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected, "{path}");
+}
+
+const GLIBC_LOADER: &str = "/lib/ld-linux-aarch64.so.1";
+const GLIBC_LOADER_SHA256: &str =
+    "393ca646b316f6cb31dc82dc72becff344bf6491458f98c07036fea73f1db55e";
+const GLIBC_LIBC: &str = "/lib/libc.so.6";
+const GLIBC_LIBC_SHA256: &str = "ce67859ef338d8558a7fd7cff9a1effe5677ff9f7eea90641a2c051c51fab7ac";
+
+/// Prepare CARRICK_A64_DYN_ROOT with scripts/ci/fetch-arm64-cross-libc.sh
+/// and use the production CARRICK_A64_ELF.
 #[test]
+#[ignore = "requires CARRICK_A64_DYN_ROOT and CARRICK_A64_ELF"]
 fn production_el1_image_runs_dynamic_glibc_hello() {
     use carrick_mem::{
         elf::{ElfProgram, LoadPlan},
@@ -1776,18 +1787,20 @@ fn production_el1_image_runs_dynamic_glibc_hello() {
     };
     use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
 
-    let Some(root) = std::env::var_os("CARRICK_A64_DYN_ROOT") else {
-        return;
-    };
+    let root = std::env::var_os("CARRICK_A64_DYN_ROOT").expect("set CARRICK_A64_DYN_ROOT");
     let root = std::path::PathBuf::from(root);
     let el1 = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
         .expect("read the production EL1 ELF");
     let hello = std::fs::read(root.join("hello")).expect("read dynamic hello");
     let program = ElfProgram::load(&hello, 183, &|path| {
-        assert_eq!(path, "/lib/ld-linux-aarch64.so.1");
-        std::fs::read(root.join(&path[1..])).ok()
+        assert_eq!(path, GLIBC_LOADER);
+        let bytes = std::fs::read(root.join(&path[1..])).expect("read fixture loader");
+        assert_fixture_sha256(path, &bytes, GLIBC_LOADER_SHA256);
+        Some(bytes)
     })
     .expect("plan glibc hello and its interpreter");
+    let libc = std::fs::read(root.join(&GLIBC_LIBC[1..])).expect("read fixture libc.so.6");
+    assert_fixture_sha256(GLIBC_LIBC, &libc, GLIBC_LIBC_SHA256);
     let interpreter = program.interpreter.as_ref().expect("dynamic fixture");
     let (mut cpu, mut memory) = enter_carrier(&el1, program.entry());
 
@@ -1860,7 +1873,7 @@ fn production_el1_image_runs_dynamic_glibc_hello() {
 
     let mut runner = TracingRunner::new().unwrap();
     let mut replies = GlibcReplies {
-        libc: std::fs::read(root.join("lib/libc.so.6")).expect("read fixture libc.so.6"),
+        libc,
         libc_cursor: None,
         next_map: carrick_mem::memory::LINUX_MMAP_BASE,
         program_break: carrick_mem::memory::LINUX_HEAP_BASE,
