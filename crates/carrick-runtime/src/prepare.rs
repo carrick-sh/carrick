@@ -110,7 +110,7 @@ mod initial_x86_forward_tests {
         assert_eq!(classify(62, 0), InitialForwardClass::Refuse("unclassified"));
         assert_eq!(classify(57, 0), InitialForwardClass::Refuse("unclassified"));
         // Legacy paths use the crossing policy of their canonical owners.
-        for legacy in [21, 82, 83, 84, 86, 87, 88, 89, 90, 92, 94] {
+        for legacy in [2, 21, 82, 83, 84, 85, 86, 87, 88, 89, 90, 92, 94, 133] {
             assert_eq!(
                 classify(legacy, 0),
                 InitialForwardClass::Host("host_crossing")
