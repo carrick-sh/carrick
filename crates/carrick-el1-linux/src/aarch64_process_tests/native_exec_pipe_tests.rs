@@ -579,6 +579,35 @@ fn fork_exec_probe_copy(
     );
 }
 
+struct PublishedLifecycle;
+impl crate::thread_setup::LifecycleVenue for PublishedLifecycle {
+    fn thread<'b>(
+        &'b self,
+        task: &'b CurrentTask,
+    ) -> Option<crate::thread_setup::LifecycleThread<'b>> {
+        let (page, slot) = task.lifecycle_refs()?;
+        Some(crate::thread_setup::LifecycleThread { page, slot })
+    }
+    fn born_slot(
+        &self,
+        page: &ThreadLifecyclePage,
+        entry: carrick_el1_abi::EntryRef,
+    ) -> Option<&ThreadControlSlot> {
+        let address = page.control_address(entry)?;
+        // SAFETY: the production native stock retains the control allocation.
+        Some(unsafe { &*(address as *const ThreadControlSlot) })
+    }
+}
+
+// The physical adapter borrows the syscall counters for retained service
+// tickets. Bind that lifetime once while borrowing the adapter per call.
+fn bind_dispatch_probe<'a, F>(_: &'a carrick_el1_abi::Counters, probe: F) -> F
+where
+    F: FnMut(&mut Physical<'a, Aarch64ParkedContext>, u64, u64, u64, u64, u64) -> u64,
+{
+    probe
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fork_exec_probe_copy_alignment(
     futex: Option<u64>,
@@ -791,6 +820,415 @@ fn fork_exec_probe_copy_alignment(
         waker_slot: carrick_sched_core::SlotId::new(0),
         on_signal_clock: None,
     };
+    let venue = crate::ipc::IpcVenue {
+        region: owner.region(),
+        tables: &tables,
+    };
+    let mut memory = carrick_test_support::GuestUserBuffer::zeroed(1024);
+    memory.as_mut_bytes()[128..130].copy_from_slice(b"1\n");
+    memory.as_mut_bytes()[256..260].copy_from_slice(b"2\n3\n");
+    for (index, word) in [memory.arg() + 128, 2, memory.arg() + 256, 4]
+        .into_iter()
+        .enumerate()
+    {
+        memory.as_mut_bytes()[index * 8..index * 8 + 8].copy_from_slice(&word.to_ne_bytes());
+    }
+    if readlink {
+        let path = b"/proc/self/exe\0";
+        memory.as_mut_bytes()[..path.len()].copy_from_slice(path);
+    }
+    let mut cpu = crate::sched::FakeCpu::default();
+    assert_eq!(fixture.slot.raw(), 0);
+    // SAFETY: zero is the valid empty name-cache state; retained by fixture.
+    let names = unsafe {
+        &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_el1_abi::InotifyNameCache>())
+            .cast::<carrick_el1_abi::InotifyNameCache>()
+    };
+    let mut probe = bind_dispatch_probe(&counters, |service, nr, fd, address, count, extra| {
+        if readlink && let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+            work.settled();
+        }
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
+            elr: 0x400004,
+            slot: u64::from(fixture.slot.raw()),
+            ..Default::default()
+        };
+        frame.x[8] = nr;
+        frame.x[0] = fd;
+        frame.x[1] = address;
+        frame.x[2] = count;
+        frame.x[3] = extra;
+        let selected = fixture.zone.slot(fixture.slot).current().unwrap();
+        // SAFETY: fixture retains this selected live record.
+        let binding = unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
+        // Physical records owner copies rather than writing host memory. Bind
+        // this call's live GuestUserBuffer output and apply only the bytes the
+        // production owner actually delivered, never a synthesized result.
+        let output = metadata.and(match nr {
+            59 => Some((fd, 8usize)),
+            80 => Some((address, core::mem::size_of::<carrick_abi::LinuxStat>())),
+            79 => Some((count, core::mem::size_of::<carrick_abi::LinuxStat>())),
+            29 if address == carrick_abi::LINUX_FIONREAD => Some((count, 4)),
+            63 => Some((address, count as usize)),
+            _ => None,
+        });
+        if metadata.is_some() {
+            let _ = crate::native_process_runtime::host_test_support::take_signal_copies();
+        }
+        if let Some((address, 4)) = output {
+            service
+                .tid_words
+                .insert((binding.address.mm.raw().get(), address), 0);
+        }
+        // This schedule's deliberate copy fault means unmapped input, not
+        // first-touch backing. Qualify the physical owner too: it must refuse
+        // preparation, rather than falsely report these bad iovecs readable.
+        service.prepare_copy_error = crate::file::SIMULATE_COPY_FAULT
+            .with(|fault| fault.load(Ordering::Relaxed))
+            .then_some(NativeProcessError::Fault);
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                binding.address,
+                &binding.words,
+                service,
+            )
+            .unwrap_or_else(|error| panic!("native entry nr={nr}, fd={fd}: {error:?}"));
+        let served_before = counters.served[nr as usize].load(Ordering::Relaxed);
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            if metadata.is_some() {
+                crossing.fd_map()
+            } else {
+                &[]
+            },
+            &[],
+            if metadata.is_some() {
+                crossing.open_table()
+            } else {
+                &[]
+            },
+            &[],
+            names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            Some(&venue),
+            Some(&PublishedLifecycle),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        if readlink && nr == 78 {
+            assert_eq!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::NativeService,
+                "readlinkat entry return: {}",
+                frame.x[0] as i64,
+            );
+
+            // The carrier service follows the shared family's exact handoff.
+            // Drive the production staging/continuation entry used by the SVC exit.
+            struct Resident;
+            impl crate::file::MemoryValidator for Resident {
+                fn readable_bytes(&self, _: u64, len: usize) -> usize {
+                    len
+                }
+                fn writable_bytes(&self, _: u64, len: usize) -> usize {
+                    len
+                }
+            }
+            let raw = map.lookup(child_table).unwrap();
+            let stage = crate::dispatch::native_host_file_stage(
+                &frame,
+                &fixture.task,
+                &Resident,
+                [raw.authority, raw.index, raw.generation],
+                carrick_core_abi::service::ServiceOrigin::Descendant,
+                |_| panic!("absolute readlink does not inspect a descriptor"),
+                &mut |_| 0usize,
+            )
+            .expect("readlink is a native file operation");
+            if let carrick_personality_linux::native_host_file::HostFileStage::Returned(result) =
+                stage
+            {
+                return result.raw() as u64;
+            }
+            let carrick_personality_linux::native_host_file::HostFileStage::Request {
+                record,
+                output,
+                resolves_path,
+                map,
+                chdir,
+            } = stage
+            else {
+                panic!("readlink must stage through the native venue");
+            };
+            assert!(matches!(
+                entry.begin_host_file_service(
+                    record,
+                    output,
+                    resolves_path,
+                    map,
+                    chdir,
+                    NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(nr), &counters)
+                ),
+                Ok(NativeResume::Left(None))
+            ));
+            assert!(entry.take_handoff_receipt().is_some());
+            drop(entry);
+            let selector = fixture.task.service_notice.take().unwrap().unwrap();
+            let member = fixture.zone.record(selector.record.id).identity();
+            // SAFETY: the fixture retains this live member and its service record.
+            let control = unsafe { &*(member.control_slot as *const ThreadControlSlot) };
+            let ticket = unsafe {
+                ServiceCell::claim_notice(&control.service, selector, NonZeroU64::MIN, member)
+            }
+            .unwrap();
+            let request = ticket.request();
+            let carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } =
+                request.operation
+            else {
+                panic!("host file ticket");
+            };
+            // The physical test adapter retains a real CurrentExecutable in
+            // the same neutral MM custody consumed by the production carrier.
+            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+            dispatcher
+                .capture_one_task_context()
+                .unwrap()
+                .kernel()
+                .ipc()
+                .unwrap();
+            let mut custody = carrick_hal::fork_stock::ForkHostBackingCustody::default();
+            // Test-only physical backing: retain a real file object without
+            // asking the native child to perform a host-root pathname open.
+            #[allow(clippy::disallowed_methods)]
+            let image = std::fs::File::open("Cargo.toml").unwrap();
+            custody.bind_executable(
+                dispatcher.retain_native_executable(
+                    carrick_kernel::dispatch::executable_authority::ExecSource::host(
+                        image,
+                        "/bin/pipe-writer".into(),
+                    )
+                    .unwrap(),
+                ),
+            );
+            // SAFETY: the service ticket retains the exact staged buffer through ACK.
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(
+                    payload.address().raw() as *mut u8,
+                    payload.length().raw() as usize,
+                )
+            };
+            let served = dispatcher.serve_native_host_file(bytes, custody.executable());
+            if served.is_err() {
+                // The physical adapter owns the carrier side of this ticket.
+                counters.record_refusal(
+                    payload.ordinal(),
+                    request.identity.birth.origin,
+                    carrick_el1_abi::RefusalVenue::Carrier,
+                );
+            }
+            assert!(ticket.complete(served.is_ok()).is_ok());
+            fixture
+                .zone
+                .object_wait(
+                    carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector.record)
+                        .unwrap(),
+                    &ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                )
+                .unwrap()
+                .notify_object(fixture.slot, &mut Default::default())
+                .unwrap();
+            let successor = unsafe { runtime.record_binding(child_binding.record) }.unwrap();
+            activate_target(source, &fixture.task, &successor);
+            let selected = fixture.zone.slot(fixture.slot).current().unwrap();
+            let binding =
+                unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
+            service.child_copy_error = copy_error;
+            let mut entry = runtime
+                .enter_registered(
+                    registry,
+                    source,
+                    &fixture.task,
+                    binding.address,
+                    &binding.words,
+                    service,
+                )
+                .unwrap();
+            if copy_error == Some(NativeProcessError::Busy) {
+                assert!(matches!(
+                    entry.resume_checkpoint(|_| Ok(None)).unwrap(),
+                    NativeResume::Left(None)
+                ));
+                // resume_checkpoint authenticates and consumes its handoff.
+                drop(entry);
+                assert!(
+                    crate::native_process_runtime::host_test_support::take_signal_copies()
+                        .is_empty()
+                );
+                service.child_copy_error = None;
+                let selector = fixture.task.service_notice.take().unwrap().unwrap();
+                let member = fixture.zone.record(selector.record.id).identity();
+                // SAFETY: the fixture retains this exact parked member.
+                let control = unsafe { &*(member.control_slot as *const ThreadControlSlot) };
+                let ticket = unsafe {
+                    ServiceCell::claim_notice(&control.service, selector, NonZeroU64::MIN, member)
+                }
+                .unwrap();
+                assert!(matches!(
+                    ticket.request().operation,
+                    carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
+                ));
+                assert!(ticket.complete(true).is_ok());
+                fixture
+                    .zone
+                    .object_wait(
+                        carrick_sched_core::object_wait::ObjectWaitKey::native_service(
+                            selector.record,
+                        )
+                        .unwrap(),
+                        &ShortLockSpin,
+                        &|owned| {
+                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                        },
+                    )
+                    .unwrap()
+                    .notify_object(fixture.slot, &mut Default::default())
+                    .unwrap();
+                activate_target(source, &fixture.task, &successor);
+                entry = runtime
+                    .enter_registered(
+                        registry,
+                        source,
+                        &fixture.task,
+                        successor.address,
+                        &successor.words,
+                        service,
+                    )
+                    .unwrap();
+            }
+            let NativeResume::Returned(result) = entry.resume_checkpoint(|_| Ok(None)).unwrap()
+            else {
+                panic!("readlink reply");
+            };
+            return result.raw() as u64;
+        }
+        if route == carrick_personality_linux::dispatch::CompletionRoute::Forward {
+            let (page, _) = fixture.task.lifecycle_refs().unwrap();
+            let owner = registry.thread_group_owner(
+                fixture.zone,
+                page,
+                fixture.task.visible_pid().unwrap(),
+            );
+            assert_eq!(
+                crate::dispatch::native_unstaged_exit(
+                    &mut frame,
+                    &fixture.task.linux,
+                    carrick_el1_abi::Action::Forward,
+                    || owner,
+                    &counters,
+                ),
+                crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served)
+            );
+            assert_eq!(
+                frame.x[0] as i64, -38,
+                "unclaimed native child receives errno 38"
+            );
+            assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 1);
+            assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 1);
+            if readlink {
+                return frame.x[0];
+            }
+        }
+        drop(entry);
+        if metadata.is_some() {
+            assert_eq!(
+                counters.served[nr as usize].load(Ordering::Relaxed),
+                served_before + 1,
+                "metadata syscall {nr} must record a completed ring call, route {route:?}"
+            );
+        }
+        if let Some((destination, length)) = output {
+            let mut copies = crate::native_process_runtime::host_test_support::take_signal_copies();
+            if length == 4 {
+                let word = service.tid_words[&(binding.address.mm.raw().get(), destination)];
+                copies.push((UserVa::new(destination), word.to_ne_bytes().to_vec()));
+            }
+            for (at, bytes) in copies {
+                assert!(at.raw() >= destination);
+                assert!(at.raw() + bytes.len() as u64 <= destination + length as u64);
+                // SAFETY: exercise owns this exact live GuestUserBuffer until
+                // the call returns, and the assertions bound every copied byte.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        at.raw() as *mut u8,
+                        bytes.len(),
+                    );
+                }
+            }
+        }
+        // Completed in-ring I/O can still owe native return-event work.
+        // This fixture checks committed results and pipe bytes below, without
+        // modelling the carrier's return transport. Neither route replays I/O.
+        assert!(
+            matches!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::Served
+                    | carrick_personality_linux::dispatch::CompletionRoute::WithWork
+            ),
+            "production native dispatch: {route:?}, nr={nr}, result={}",
+            frame.x[0] as i64
+        );
+        frame.x[0]
+    });
+    let check_numeric_link = |call: &mut dyn FnMut(u64, u64, u64, u64, u64) -> u64,
+                              parent_link: bool| {
+        let get_pid = if parent_link { 173 } else { 172 }; // getppid or getpid
+        let pid = call(get_pid, 0, 0, 0, 0) as i64;
+        assert!(pid > 0, "guest identity syscall {get_pid}: {pid}");
+        let path = carrick_test_support::GuestUserBuffer::from_bytes(
+            format!("/proc/{pid}/exe\0").as_bytes(),
+        );
+        let output = memory.arg() + 512;
+        let refused = || counters.venue_refused_child[78].load(Ordering::Relaxed);
+        let before = refused();
+        let result = call(78, (-100i64) as u64, path.arg(), output, 128) as i64;
+        let copies = crate::native_process_runtime::host_test_support::take_signal_copies();
+        if parent_link {
+            assert_eq!(result, -38, "child must refuse /proc/{pid}/exe");
+            assert_eq!(refused(), before + 1, "one descendant venue refusal");
+            assert!(copies.is_empty(), "a refusal leaves the output untouched");
+        } else {
+            assert_eq!(result, 16, "own numeric /proc/{pid}/exe");
+            assert_eq!(refused(), before);
+            assert_eq!(
+                copies,
+                vec![(UserVa::new(output), b"/bin/pipe-writer".to_vec())]
+            );
+        }
+        assert_eq!(counters.forwarded[78].load(Ordering::Relaxed), 0);
+    };
+    if readlink && copy_error.is_none() && !clock {
+        let mut call =
+            |nr, fd, address, count, extra| probe(&mut service, nr, fd, address, count, extra);
+        check_numeric_link(&mut call, false);
+        check_numeric_link(&mut call, true);
+    }
+
     let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
     payload.extend_from_slice(b"/bin/pipe-writer\0");
     carrick_core_abi::service::encode_exec_payload_header(
@@ -926,368 +1364,11 @@ fn fork_exec_probe_copy_alignment(
         registry.unregister_root_for_test(&runtime);
         return;
     }
-    let venue = crate::ipc::IpcVenue {
-        region: owner.region(),
-        tables: &tables,
-    };
-    let mut memory = carrick_test_support::GuestUserBuffer::zeroed(1024);
-    memory.as_mut_bytes()[128..130].copy_from_slice(b"1\n");
-    memory.as_mut_bytes()[256..260].copy_from_slice(b"2\n3\n");
-    for (index, word) in [memory.arg() + 128, 2, memory.arg() + 256, 4]
-        .into_iter()
-        .enumerate()
-    {
-        memory.as_mut_bytes()[index * 8..index * 8 + 8].copy_from_slice(&word.to_ne_bytes());
+    let mut call_full =
+        |nr, fd, address, count, extra| probe(&mut service, nr, fd, address, count, extra);
+    if readlink && copy_error.is_none() && !clock {
+        check_numeric_link(&mut call_full, false);
     }
-    if readlink {
-        if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
-            work.settled();
-        }
-        let path = b"/proc/self/exe\0";
-        memory.as_mut_bytes()[..path.len()].copy_from_slice(path);
-    }
-    let mut cpu = crate::sched::FakeCpu::default();
-    assert_eq!(fixture.slot.raw(), 0);
-    // SAFETY: zero is the valid empty name-cache state; retained by fixture.
-    let names = unsafe {
-        &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_el1_abi::InotifyNameCache>())
-            .cast::<carrick_el1_abi::InotifyNameCache>()
-    };
-    let mut call_full = |nr, fd, address, count, extra| {
-        let mut frame = carrick_el1_abi::TrapFrame {
-            esr: 0x15 << 26,
-            elr: 0x400004,
-            slot: u64::from(fixture.slot.raw()),
-            ..Default::default()
-        };
-        frame.x[8] = nr;
-        frame.x[0] = fd;
-        frame.x[1] = address;
-        frame.x[2] = count;
-        frame.x[3] = extra;
-        let selected = fixture.zone.slot(fixture.slot).current().unwrap();
-        // SAFETY: fixture retains this selected live record.
-        let binding = unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
-        // Physical records owner copies rather than writing host memory. Bind
-        // this call's live GuestUserBuffer output and apply only the bytes the
-        // production owner actually delivered, never a synthesized result.
-        let output = metadata.and(match nr {
-            59 => Some((fd, 8usize)),
-            80 => Some((address, core::mem::size_of::<carrick_abi::LinuxStat>())),
-            79 => Some((count, core::mem::size_of::<carrick_abi::LinuxStat>())),
-            29 if address == carrick_abi::LINUX_FIONREAD => Some((count, 4)),
-            63 => Some((address, count as usize)),
-            _ => None,
-        });
-        if metadata.is_some() {
-            let _ = crate::native_process_runtime::host_test_support::take_signal_copies();
-        }
-        if let Some((address, 4)) = output {
-            service
-                .tid_words
-                .insert((binding.address.mm.raw().get(), address), 0);
-        }
-        // This schedule's deliberate copy fault means unmapped input, not
-        // first-touch backing. Qualify the physical owner too: it must refuse
-        // preparation, rather than falsely report these bad iovecs readable.
-        service.prepare_copy_error = crate::file::SIMULATE_COPY_FAULT
-            .with(|fault| fault.load(Ordering::Relaxed))
-            .then_some(NativeProcessError::Fault);
-        let mut entry = runtime
-            .enter_registered(
-                registry,
-                source,
-                &fixture.task,
-                binding.address,
-                &binding.words,
-                &mut service,
-            )
-            .unwrap_or_else(|error| panic!("native entry nr={nr}, fd={fd}: {error:?}"));
-        let served_before = counters.served[nr as usize].load(Ordering::Relaxed);
-        let route = crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            if metadata.is_some() {
-                crossing.fd_map()
-            } else {
-                &[]
-            },
-            &[],
-            if metadata.is_some() {
-                crossing.open_table()
-            } else {
-                &[]
-            },
-            &[],
-            names,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            Some(&venue),
-            None,
-            Some(&mut *entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
-        if readlink && route == carrick_personality_linux::dispatch::CompletionRoute::NativeService
-        {
-            // The carrier service follows the shared family's exact handoff.
-            // Drive the production staging/continuation entry used by the SVC exit.
-            struct Resident;
-            impl crate::file::MemoryValidator for Resident {
-                fn readable_bytes(&self, _: u64, len: usize) -> usize {
-                    len
-                }
-                fn writable_bytes(&self, _: u64, len: usize) -> usize {
-                    len
-                }
-            }
-            let raw = map.lookup(child_table).unwrap();
-            let stage = crate::dispatch::native_host_file_stage(
-                &frame,
-                &fixture.task,
-                &Resident,
-                [raw.authority, raw.index, raw.generation],
-                carrick_core_abi::service::ServiceOrigin::Descendant,
-                |_| panic!("absolute readlink does not inspect a descriptor"),
-                &mut |_| 0usize,
-            )
-            .expect("readlink is a native file operation");
-            if let carrick_personality_linux::native_host_file::HostFileStage::Returned(result) =
-                stage
-            {
-                return result.raw() as u64;
-            }
-            let carrick_personality_linux::native_host_file::HostFileStage::Request {
-                record,
-                output,
-                resolves_path,
-                map,
-                chdir,
-            } = stage
-            else {
-                panic!("readlink must stage through the native venue");
-            };
-            assert!(matches!(
-                entry.begin_host_file_service(
-                    record,
-                    output,
-                    resolves_path,
-                    map,
-                    chdir,
-                    NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(nr), &counters)
-                ),
-                Ok(NativeResume::Left(None))
-            ));
-            assert!(entry.take_handoff_receipt().is_some());
-            drop(entry);
-            let selector = fixture.task.service_notice.take().unwrap().unwrap();
-            let member = fixture.zone.record(selector.record.id).identity();
-            // SAFETY: the fixture retains this live member and its service record.
-            let control = unsafe { &*(member.control_slot as *const ThreadControlSlot) };
-            let ticket = unsafe {
-                ServiceCell::claim_notice(&control.service, selector, NonZeroU64::MIN, member)
-            }
-            .unwrap();
-            let carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } =
-                ticket.request().operation
-            else {
-                panic!("host file ticket");
-            };
-            // The physical test adapter retains a real CurrentExecutable in
-            // the same neutral MM custody consumed by the production carrier.
-            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
-            dispatcher
-                .capture_one_task_context()
-                .unwrap()
-                .kernel()
-                .ipc()
-                .unwrap();
-            let mut custody = carrick_hal::fork_stock::ForkHostBackingCustody::default();
-            // Test-only physical backing: retain a real file object without
-            // asking the native child to perform a host-root pathname open.
-            #[allow(clippy::disallowed_methods)]
-            let image = std::fs::File::open("Cargo.toml").unwrap();
-            custody.bind_executable(
-                dispatcher.retain_native_executable(
-                    carrick_kernel::dispatch::executable_authority::ExecSource::host(
-                        image,
-                        "/bin/pipe-writer".into(),
-                    )
-                    .unwrap(),
-                ),
-            );
-            // SAFETY: the service ticket retains the exact staged buffer through ACK.
-            let bytes = unsafe {
-                core::slice::from_raw_parts_mut(
-                    payload.address().raw() as *mut u8,
-                    payload.length().raw() as usize,
-                )
-            };
-            dispatcher
-                .serve_native_host_file(bytes, custody.executable())
-                .unwrap();
-            assert!(ticket.complete(true).is_ok());
-            fixture
-                .zone
-                .object_wait(
-                    carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector.record)
-                        .unwrap(),
-                    &ShortLockSpin,
-                    &|owned| {
-                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                    },
-                )
-                .unwrap()
-                .notify_object(fixture.slot, &mut Default::default())
-                .unwrap();
-            let successor = unsafe { runtime.record_binding(child_binding.record) }.unwrap();
-            activate_target(source, &fixture.task, &successor);
-            let selected = fixture.zone.slot(fixture.slot).current().unwrap();
-            let binding =
-                unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
-            service.child_copy_error = copy_error;
-            let mut entry = runtime
-                .enter_registered(
-                    registry,
-                    source,
-                    &fixture.task,
-                    binding.address,
-                    &binding.words,
-                    &mut service,
-                )
-                .unwrap();
-            if copy_error == Some(NativeProcessError::Busy) {
-                assert!(matches!(
-                    entry.resume_checkpoint(|_| Ok(None)).unwrap(),
-                    NativeResume::Left(None)
-                ));
-                // resume_checkpoint authenticates and consumes its handoff.
-                drop(entry);
-                assert!(
-                    crate::native_process_runtime::host_test_support::take_signal_copies()
-                        .is_empty()
-                );
-                service.child_copy_error = None;
-                let selector = fixture.task.service_notice.take().unwrap().unwrap();
-                let member = fixture.zone.record(selector.record.id).identity();
-                // SAFETY: the fixture retains this exact parked member.
-                let control = unsafe { &*(member.control_slot as *const ThreadControlSlot) };
-                let ticket = unsafe {
-                    ServiceCell::claim_notice(&control.service, selector, NonZeroU64::MIN, member)
-                }
-                .unwrap();
-                assert!(matches!(
-                    ticket.request().operation,
-                    carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
-                ));
-                assert!(ticket.complete(true).is_ok());
-                fixture
-                    .zone
-                    .object_wait(
-                        carrick_sched_core::object_wait::ObjectWaitKey::native_service(
-                            selector.record,
-                        )
-                        .unwrap(),
-                        &ShortLockSpin,
-                        &|owned| {
-                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                        },
-                    )
-                    .unwrap()
-                    .notify_object(fixture.slot, &mut Default::default())
-                    .unwrap();
-                activate_target(source, &fixture.task, &successor);
-                entry = runtime
-                    .enter_registered(
-                        registry,
-                        source,
-                        &fixture.task,
-                        successor.address,
-                        &successor.words,
-                        &mut service,
-                    )
-                    .unwrap();
-            }
-            let NativeResume::Returned(result) = entry.resume_checkpoint(|_| Ok(None)).unwrap()
-            else {
-                panic!("readlink reply");
-            };
-            return result.raw() as u64;
-        }
-        if route == carrick_personality_linux::dispatch::CompletionRoute::Forward {
-            let (page, _) = fixture.task.lifecycle_refs().unwrap();
-            let owner = registry.thread_group_owner(
-                fixture.zone,
-                page,
-                fixture.task.visible_pid().unwrap(),
-            );
-            assert_eq!(
-                crate::dispatch::native_unstaged_exit(
-                    &mut frame,
-                    &fixture.task.linux,
-                    carrick_el1_abi::Action::Forward,
-                    || owner,
-                    &counters,
-                ),
-                crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served)
-            );
-            assert_eq!(
-                frame.x[0] as i64, -38,
-                "unclaimed native child receives errno 38"
-            );
-            assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 1);
-            assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 1);
-            if readlink {
-                return frame.x[0];
-            }
-        }
-        drop(entry);
-        if metadata.is_some() {
-            assert_eq!(
-                counters.served[nr as usize].load(Ordering::Relaxed),
-                served_before + 1,
-                "metadata syscall {nr} must record a completed ring call, route {route:?}"
-            );
-        }
-        if let Some((destination, length)) = output {
-            let mut copies = crate::native_process_runtime::host_test_support::take_signal_copies();
-            if length == 4 {
-                let word = service.tid_words[&(binding.address.mm.raw().get(), destination)];
-                copies.push((UserVa::new(destination), word.to_ne_bytes().to_vec()));
-            }
-            for (at, bytes) in copies {
-                assert!(at.raw() >= destination);
-                assert!(at.raw() + bytes.len() as u64 <= destination + length as u64);
-                // SAFETY: exercise owns this exact live GuestUserBuffer until
-                // the call returns, and the assertions bound every copied byte.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        at.raw() as *mut u8,
-                        bytes.len(),
-                    );
-                }
-            }
-        }
-        // Completed in-ring I/O can still owe native return-event work.
-        // This fixture checks committed results and pipe bytes below, without
-        // modelling the carrier's return transport. Neither route replays I/O.
-        assert!(
-            matches!(
-                route,
-                carrick_personality_linux::dispatch::CompletionRoute::Served
-                    | carrick_personality_linux::dispatch::CompletionRoute::WithWork
-            ),
-            "production native dispatch: {route:?}, nr={nr}, result={}",
-            frame.x[0] as i64
-        );
-        frame.x[0]
-    };
     if readlink {
         assert_eq!(
             call_full(78, (-100i64) as u64, memory.arg(), memory.arg() + 512, 128) as i64,
@@ -2330,26 +2411,7 @@ fn child_futex<'a>(
     assert!(runtime.task_binding(child).is_some());
     drop(entry);
 
-    struct Venue;
-    impl crate::thread_setup::LifecycleVenue for Venue {
-        fn thread<'b>(
-            &'b self,
-            task: &'b CurrentTask,
-        ) -> Option<crate::thread_setup::LifecycleThread<'b>> {
-            let (page, slot) = task.lifecycle_refs()?;
-            Some(crate::thread_setup::LifecycleThread { page, slot })
-        }
-        fn born_slot(
-            &self,
-            page: &ThreadLifecyclePage,
-            entry: carrick_el1_abi::EntryRef,
-        ) -> Option<&ThreadControlSlot> {
-            let address = page.control_address(entry)?;
-            // SAFETY: the production native stock retains the control allocation.
-            Some(unsafe { &*(address as *const ThreadControlSlot) })
-        }
-    }
-    let venue = Venue;
+    let venue = PublishedLifecycle;
     let memory = carrick_test_support::GuestUserBuffer::zeroed(8192);
     frame.x[8] = 220;
     frame.x[..5].copy_from_slice(&[
