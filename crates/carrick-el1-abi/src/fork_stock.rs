@@ -9,7 +9,7 @@
 //! across platforms.
 
 use crate::{
-    ExecutionBinding, PortalForkRequest, PortalForkTableArena, PortalOperation,
+    EntryTaskKey, ExecutionBinding, PortalForkRequest, PortalForkTableArena, PortalOperation,
     ReservationGeneration, ReservationMm,
 };
 use carrick_guest_arch::{AddressContext, Asid, KernelVa, RootGpa};
@@ -1031,6 +1031,21 @@ impl ForkStockSettlement {
         )
     }
 
+    /// Publish the entry authority issued for the child by the shared fork owner.
+    pub fn with_child_entry_task(mut self, task: EntryTaskKey) -> Option<Self> {
+        if self.words[0] != ForkStockKind::Commit.word() || task.raw() == 0 {
+            return None;
+        }
+        self.words[12] = task.raw();
+        Some(self)
+    }
+
+    pub fn child_entry_task(&self) -> Option<EntryTaskKey> {
+        (self.words[0] == ForkStockKind::Commit.word())
+            .then(|| EntryTaskKey::from_raw(self.words[12]))
+            .filter(|task| task.raw() != 0)
+    }
+
     fn with_kind(
         kind: ForkStockKind,
         loan: ForkStockLoan,
@@ -1416,7 +1431,14 @@ mod tests {
             child_tables_used: 4096,
             parent_tables_used: 0,
         };
-        let mut record = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
+        let mut record = ForkStockSettlement::commit_reserved(loan, completion)
+            .unwrap()
+            .with_child_entry_task(EntryTaskKey::from_raw(21_954))
+            .unwrap();
+        assert_eq!(
+            record.child_entry_task(),
+            Some(EntryTaskKey::from_raw(21_954))
+        );
         let foreign = ForkStockLoan {
             id: NonZeroU64::new(2).unwrap(),
             ..loan

@@ -1045,7 +1045,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     pub fn service_fork_stock<I: CarrierCpuIo>(
         &mut self,
         lease: &StoppedCpuLease<'_, I>,
-    ) -> Result<Option<GuestArchBinding>, TrapError> {
+    ) -> Result<Option<(GuestArchBinding, carrick_el1_abi::EntryTaskKey)>, TrapError> {
         use carrick_el1_abi::ForkStockExchange;
         let execution = self.physical_execution(lease)?;
         self.drain_fork_quarantine(execution)?;
@@ -1566,7 +1566,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         lease: &StoppedCpuLease<'_, I>,
         execution: GrantExecution,
         address: u64,
-    ) -> Result<Option<GuestArchBinding>, TrapError> {
+    ) -> Result<Option<(GuestArchBinding, carrick_el1_abi::EntryTaskKey)>, TrapError> {
         use carrick_el1_abi::ForkStockSettlement;
         let loan = self
             .fork_stock
@@ -1633,16 +1633,22 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .map_err(|e| fail(e.to_string()))?;
         let child_binding = if let Some(child) = committed_child {
             let carrier = self._vm.identity().nonzero();
+            let entry_task = record
+                .child_entry_task()
+                .ok_or_else(|| fail("physical child entry key missing from settlement"))?;
             let (child_task, child_execution) = record
                 .child_task_identity()
                 .ok_or_else(|| fail("physical child task identity missing from settlement"))?;
-            Some(GuestArchBinding::x86(
-                TaskIdentity {
-                    carrier: carrick_guest_arch::CarrierGeneration::new(carrier),
-                    task: TaskSerial::new(child_task),
-                    execution: ExecutionGeneration::new(child_execution),
-                },
-                child,
+            Some((
+                GuestArchBinding::x86(
+                    TaskIdentity {
+                        carrier: carrick_guest_arch::CarrierGeneration::new(carrier),
+                        task: TaskSerial::new(child_task),
+                        execution: ExecutionGeneration::new(child_execution),
+                    },
+                    child,
+                ),
+                entry_task,
             ))
         } else {
             None

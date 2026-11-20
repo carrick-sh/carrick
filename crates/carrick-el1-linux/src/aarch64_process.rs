@@ -2480,6 +2480,22 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
     }
 
+    fn commit_child(
+        &mut self,
+        prepared: Self::PreparedMm,
+        _child_task: core::num::NonZeroU64,
+        _child_execution: core::num::NonZeroU64,
+        child_entry_task: carrick_core_abi::EntryTaskKey,
+    ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
+        let mut born = self.commit_mm(prepared)?;
+        born.admitted.commit = born
+            .admitted
+            .commit
+            .with_child_entry_task(child_entry_task)
+            .expect("fork owner issued a nonzero entry key");
+        Ok(born)
+    }
+
     fn abort_mm(
         &mut self,
         mut prepared: Self::PreparedMm,

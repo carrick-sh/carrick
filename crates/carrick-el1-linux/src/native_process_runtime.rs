@@ -641,8 +641,9 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         prepared: Self::PreparedMm,
         child_task: core::num::NonZeroU64,
         child_execution: core::num::NonZeroU64,
+        child_entry_task: carrick_core_abi::EntryTaskKey,
     ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
-        let _ = (child_task, child_execution);
+        let _ = (child_task, child_execution, child_entry_task);
         self.commit_mm(prepared)
     }
     fn abort_mm(
@@ -9139,13 +9140,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             permit,
         );
         let child_task = child_key.serial.nonzero();
+        let child_entry_task = carrick_core_abi::EntryTaskKey::from_raw(child_key.id.raw() as u64);
         let child_execution =
             NonZeroU64::new(thread.generation).ok_or(NativeProcessError::Stale)?;
         let result = {
             let mut graph = self.runtime.graph.lock();
             prep.try_publish_with(&mut graph.owner, |prepared| {
                 self.service
-                    .commit_child(prepared, child_task, child_execution)
+                    .commit_child(prepared, child_task, child_execution, child_entry_task)
             })
         };
         let published = match result {
@@ -18625,11 +18627,13 @@ mod tests {
             p: Self::PreparedMm,
             child_task: core::num::NonZeroU64,
             child_execution: core::num::NonZeroU64,
+            child_entry_task: carrick_core_abi::EntryTaskKey,
         ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
             if self.fail_commit {
                 return Err((NativeProcessError::Busy, p));
             }
             self.committed_children.push((child_task, child_execution));
+            assert_ne!(child_entry_task.raw(), 0);
             Ok(p)
         }
 

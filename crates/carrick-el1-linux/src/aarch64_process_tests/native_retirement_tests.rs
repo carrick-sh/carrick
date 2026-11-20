@@ -670,9 +670,13 @@ fn native_backing_release_already_retired_owner_is_clean_absence_without_quarant
         )
         .unwrap();
         stock.reserve(parent_exec, &mut reserve).unwrap();
-        let mut commit =
-            carrick_el1_abi::ForkStockSettlement::commit_reserved(loan, completion).unwrap();
+        let issued = carrick_el1_abi::EntryTaskKey::from_raw(21_954);
+        let mut commit = carrick_el1_abi::ForkStockSettlement::commit_reserved(loan, completion)
+            .unwrap()
+            .with_child_entry_task(issued)
+            .unwrap();
         stock.commit(parent_exec, &mut commit).unwrap();
+        assert_eq!(commit.child_entry_task(), Some(issued));
 
         let physical_owner = carrick_hal::GuestFrameOwner {
             native_mm: MmGeneration::new(NonZeroU64::new(child_mm.raw()).unwrap()),

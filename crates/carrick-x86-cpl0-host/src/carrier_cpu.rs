@@ -258,7 +258,14 @@ enum Custody {
 /// their birth or currently holds the root task's executor lease.
 #[derive(Clone, Default)]
 pub struct CarrierChildBindings(
-    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<RootGpa, GuestArchBinding>>>,
+    std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<
+                RootGpa,
+                (GuestArchBinding, Option<carrick_el1_abi::EntryTaskKey>),
+            >,
+        >,
+    >,
 );
 
 impl CarrierChildBindings {
@@ -268,7 +275,7 @@ impl CarrierChildBindings {
             .lock()
             .map_err(|_| boundary_error("child binding authority poisoned"))?
             .get(&root)
-            .copied())
+            .map(|(binding, _)| *binding))
     }
 }
 
@@ -575,13 +582,50 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             .lock()
             .map_err(|_| boundary_error("child binding authority poisoned"))?;
         let root = binding.context().root;
-        if children.get(&root).is_some_and(|old| *old != binding) {
+        if children.get(&root).is_some_and(|(old, _)| *old != binding) {
             return Err(boundary_error(
                 "live child root already has another binding",
             ));
         }
-        children.insert(root, binding);
+        children.insert(root, (binding, None));
         Ok(())
+    }
+    pub fn register_child_binding_with_entry_task(
+        &mut self,
+        binding: GuestArchBinding,
+        entry_task: carrick_el1_abi::EntryTaskKey,
+    ) -> Result<(), TrapError> {
+        if entry_task.raw() == 0 {
+            return Err(boundary_error("unissued child entry task"));
+        }
+        let mut children = self
+            .child_bindings
+            .0
+            .lock()
+            .map_err(|_| boundary_error("child binding authority poisoned"))?;
+        let root = binding.context().root;
+        if children
+            .get(&root)
+            .is_some_and(|old| *old != (binding, Some(entry_task)))
+        {
+            return Err(boundary_error(
+                "live child root already has another binding",
+            ));
+        }
+        children.insert(root, (binding, Some(entry_task)));
+        Ok(())
+    }
+    pub fn registered_child_entry_task(
+        &self,
+        root: RootGpa,
+    ) -> Result<Option<carrick_el1_abi::EntryTaskKey>, TrapError> {
+        Ok(self
+            .child_bindings
+            .0
+            .lock()
+            .map_err(|_| boundary_error("child binding authority poisoned"))?
+            .get(&root)
+            .and_then(|(_, key)| *key))
     }
     pub fn unregister_child_binding(
         &mut self,
@@ -592,7 +636,8 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             .0
             .lock()
             .map_err(|_| boundary_error("child binding authority poisoned"))?
-            .remove(&root))
+            .remove(&root)
+            .map(|(binding, _)| binding))
     }
     pub fn clear_child_bindings(&mut self) -> Result<(), TrapError> {
         self.child_bindings
@@ -1420,6 +1465,37 @@ mod tests {
         assert_eq!(stopped.state.as_ref().unwrap().binding(), child2.binding());
         assert_ne!(stopped.state.as_ref().unwrap().binding(), child1.binding());
     }
+    #[test]
+    fn child_entry_key_survives_peer_registration_and_retires_with_root() {
+        let bindings = CarrierChildBindings::default();
+        let child = context(2).binding();
+        let root = child.context().root;
+        let issued = carrick_el1_abi::EntryTaskKey::from_raw(21_954);
+        let mut owner = CarrierCpu::new_with_children(
+            TestIo {
+                image: context(1).hardware_image(),
+            },
+            bindings.clone(),
+        )
+        .unwrap();
+        let peer = CarrierCpu::new_with_children(
+            TestIo {
+                image: context(1).hardware_image(),
+            },
+            bindings,
+        )
+        .unwrap();
+        owner
+            .register_child_binding_with_entry_task(child, issued)
+            .unwrap();
+        assert_eq!(
+            peer.registered_child_entry_task(root).unwrap(),
+            Some(issued)
+        );
+        owner.unregister_child_binding(root).unwrap();
+        assert_eq!(peer.registered_child_entry_task(root).unwrap(), None);
+    }
+
     #[test]
     fn save_and_detach_preserves_live_carrier_child_bindings() {
         let root = context(1);
