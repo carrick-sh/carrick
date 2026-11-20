@@ -153,7 +153,13 @@ pub(crate) fn prepare_native_x86_exec_image(
         carrick_kernel::dispatch::executable_authority::ExecSource,
         LinuxErrno,
     >,
-) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage, LinuxErrno> {
+) -> Result<
+    (
+        carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage,
+        carrick_kernel::dispatch::executable_authority::ExecSource,
+    ),
+    LinuxErrno,
+> {
     prepare_native_exec(
         capability,
         payload,
@@ -176,9 +182,10 @@ pub(crate) fn load_native_x86_exec(
         .lock()
         .map_err(|_| crate::linux_abi::LINUX_ENOSYS)?;
     let capability = capture_native_exec_capability(&dispatcher)?;
-    prepare_native_x86_exec_image(&capability, payload, |table, fd| {
+    let (image, source) = prepare_native_x86_exec_image(&capability, payload, |table, fd| {
         dispatcher.native_descriptor_exec_source(table, fd)
-    })
+    })?;
+    Ok(image.with_executable(dispatcher.retain_native_executable(source)))
 }
 
 /// Parse a native child's staged exec request under the caller's sealed
@@ -857,7 +864,13 @@ pub(crate) fn load_x86_exec_image<'a>(
     target: impl Into<ExecTarget<'a>>,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
-) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage, LinuxErrno> {
+) -> Result<
+    (
+        carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage,
+        carrick_kernel::dispatch::executable_authority::ExecSource,
+    ),
+    LinuxErrno,
+> {
     use carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage;
     // No vDSO or trap policy reaches an image the CPL0 build maps.
     let _ = loader;
@@ -874,7 +887,8 @@ pub(crate) fn load_x86_exec_image<'a>(
             error,
         ))
     })?;
-    X86ExecImage::from_program(&program, argv, env)
+    let image = X86ExecImage::from_program(&program, argv, env)?;
+    Ok((image, source))
 }
 
 // Shebang resolution and the signal-death / stop helpers live in the
@@ -1912,6 +1926,7 @@ mod tests {
                 &x86_exec_payload(ExecCall::Execve, path, argv, None),
                 no_descriptors,
             )
+            .map(|(image, _)| image)
         };
 
         let image = load("/bin/successor", &[b"successor"]).expect("a static successor loads");
@@ -1966,7 +1981,7 @@ mod tests {
         };
         let table = [7, 8, 9];
         let mut asked = None;
-        let by_descriptor = prepare_native_x86_exec_image(
+        let (by_descriptor, _) = prepare_native_x86_exec_image(
             &capability,
             &x86_exec_payload(fexecve, "", &[b"opened"], Some(table)),
             |t, fd| {

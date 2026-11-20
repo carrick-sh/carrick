@@ -1821,6 +1821,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             .exec_successor(predecessor, successor, successor_thread_serial)?;
         self.cpu.retarget_loaded_exec(predecessor, successor)?;
         custody.initial_task = Some(initial);
+        custody.initial_sources = None;
         Ok(())
     }
 
@@ -2045,7 +2046,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         self.service_idle_peer_doorbell_with_host_file(
             exit,
             on_work,
-            &mut |_, _, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
+            &mut |_, _, _, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
             &mut refuse_native_exec,
         )
     }
@@ -2063,7 +2064,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         // A carrier without a runtime resource service has no fs authority.
         // Authenticate the synchronous request, then leave its record refused.
         if *port == carrick_core_abi::service::ROOT_FORK_SEED_PORT {
-            self.service_root_fork_seed(None, |_| false)?;
+            self.service_root_fork_seed(None, |_| (false, None))?;
             return Ok(None);
         }
         let file = if *port == OWNER_GRANT_PORT || *port == NATIVE_SERVICE_PORT {
@@ -2191,6 +2192,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
         }
+        let executable = pending_file.as_ref().and_then(|pending| {
+            custody.native_file_executable(pending.ticket.request().identity.birth, &pending.record)
+        });
         drop(custody);
         if let Some(pending) = pending_exec {
             let loaded = exec(&pending.payload);
@@ -2210,6 +2214,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             let served = host_file(
                 pending.ticket.request().identity.birth.origin,
                 pending.ticket.request().identity.birth.record,
+                executable,
                 &mut pending.record,
             );
             let mut custody = self
@@ -2374,7 +2379,12 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
     pub fn service_root_fork_seed(
         &mut self,
         task: Option<carrick_guest_arch::TaskIdentity>,
-        service: impl FnOnce(&mut carrick_core_abi::service::RootForkSeed) -> bool,
+        service: impl FnOnce(
+            &mut carrick_core_abi::service::RootForkSeed,
+        ) -> (
+            bool,
+            Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
+        ),
     ) -> Result<(), TrapError> {
         use carrick_core_abi::service::RootForkSeed;
         use carrick_guest_arch::KernelVa;
@@ -2414,10 +2424,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         if record.requested().is_none() {
             return Err(fail("seed request invalid"));
         }
-        if !service(&mut record) {
+        let (served, executable) = service(&mut record);
+        if !served {
             return Ok(());
         }
-        let custody = self
+        let mut custody = self
             ._custody
             .lock()
             .map_err(|_| fail("seed custody poisoned"))?;
@@ -2426,6 +2437,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             let current = custody.physical_execution(&lease)?;
             if current.context != execution.context || current.binding != execution.binding {
                 return Err(fail("seed execution changed"));
+            }
+            if let Some(executable) = executable {
+                custody
+                    .sources_mut(current.context)?
+                    .bind_executable(executable);
             }
             let pointer = custody.native_service_pointer(
                 current.context,
@@ -2458,7 +2474,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             task,
             exit,
             on_work,
-            &mut |_, _, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
+            &mut |_, _, _, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
             &mut refuse_native_exec,
         )
     }
@@ -2475,7 +2491,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             return Err(fail("physical service requires a doorbell exit"));
         };
         if *port == carrick_core_abi::service::ROOT_FORK_SEED_PORT {
-            self.service_root_fork_seed(Some(task), |_| false)?;
+            self.service_root_fork_seed(Some(task), |_| (false, None))?;
             return Ok(None);
         }
         let slot = self
@@ -2606,6 +2622,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
         }
+        let executable = pending_file.as_ref().and_then(|pending| {
+            custody.native_file_executable(pending.ticket.request().identity.birth, &pending.record)
+        });
         drop(custody);
         if let Some(pending) = pending_exec {
             let loaded = exec(&pending.payload);
@@ -2622,6 +2641,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             let served = host_file(
                 pending.ticket.request().identity.birth.origin,
                 pending.ticket.request().identity.birth.record,
+                executable,
                 &mut pending.record,
             );
             let mut custody = self
@@ -2652,6 +2672,30 @@ fn refuse_native_exec(_: &[u8]) -> Result<exec_service::X86ExecImage, carrick_ab
     Err(carrick_abi::LINUX_ENOSYS)
 }
 
+impl<Mem: CarrierMemoryIo> Cpl0HostCustody<Mem> {
+    /// Retain the executable of the already authenticated stopped service member.
+    /// Both the owner incarnation and the live physical stock entry must agree.
+    fn native_file_executable(
+        &mut self,
+        birth: carrick_core_abi::service::ServiceBirth,
+        record: &[u8],
+    ) -> Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>> {
+        use carrick_core_abi::host_file::{HostFileOp, request_parts};
+        let (header, _, _) = request_parts(record)?;
+        if header.op != HostFileOp::Readlinkat
+            || birth.origin != carrick_core_abi::service::ServiceOrigin::Descendant
+        {
+            return None;
+        }
+        let mm = birth.mm.mm();
+        if self.fork_stock.child_owner(mm) != Some(birth.mm) || self.fork_stock.is_quarantined(mm) {
+            return None;
+        }
+        let root = self.fork_stock.child_root(mm)?;
+        self.fork_stock.child_physical_mut(mm, root)?.executable()
+    }
+}
+
 /// Host-file handler invoked with physical custody and CPU-I/O borrows released.
 /// Serves one native host-file record for the requesting member (its birth
 /// origin and zone record), writing the reply in place or answering a
@@ -2659,6 +2703,7 @@ fn refuse_native_exec(_: &[u8]) -> Result<exec_service::X86ExecImage, carrick_ab
 pub type NativeHostFileService<'a> = dyn FnMut(
         carrick_core_abi::service::ServiceOrigin,
         carrick_el1_abi::RecordRef,
+        Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
         &mut [u8],
     ) -> Result<
         carrick_hal::fork_stock::NativeHostFileReply,

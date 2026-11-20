@@ -1111,7 +1111,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                         native_host_file_server(&self.dispatcher, &root.host_root_resources);
                     if *port == carrick_core_abi::service::ROOT_FORK_SEED_PORT {
                         self.physical.service_root_fork_seed(Some(task), |record| {
-                            root.host_root_resources.seed_fork(record)
+                            root_fork_seed(&self.dispatcher, &root.host_root_resources, record)
                         })?;
                         None
                     } else {
@@ -1180,7 +1180,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                         native_host_file_server(&self.dispatcher, &root.host_root_resources);
                     if port == carrick_core_abi::service::ROOT_FORK_SEED_PORT {
                         self.physical.service_root_fork_seed(None, |record| {
-                            root.host_root_resources.seed_fork(record)
+                            root_fork_seed(&self.dispatcher, &root.host_root_resources, record)
                         })?;
                         None
                     } else {
@@ -2151,6 +2151,24 @@ mod tests {
     }
 }
 
+/// Capture the stopped host root's executable alongside its filesystem seed.
+fn root_fork_seed(
+    dispatcher: &Mutex<SyscallDispatcher>,
+    resources: &carrick_kernel::dispatch::resources::HostRootResources,
+    record: &mut carrick_core_abi::service::RootForkSeed,
+) -> (
+    bool,
+    Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
+) {
+    if !resources.seed_fork(record) {
+        return (false, None);
+    }
+    match dispatcher.lock() {
+        Ok(dispatcher) => (true, dispatcher.root_executable_seed()),
+        Err(_) => (false, None),
+    }
+}
+
 /// Select resource authority independently from native execution custody.
 fn native_host_file_server<'a>(
     dispatcher: &'a Mutex<SyscallDispatcher>,
@@ -2158,12 +2176,13 @@ fn native_host_file_server<'a>(
 ) -> impl FnMut(
     carrick_core_abi::service::ServiceOrigin,
     carrick_el1_abi::RecordRef,
+    Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
     &mut [u8],
 ) -> Result<
     carrick_hal::fork_stock::NativeHostFileReply,
     carrick_hal::fork_stock::NativeHostFileRefused,
 > + 'a {
-    move |origin, requester, record| {
+    move |origin, requester, executable, record| {
         let dispatcher = dispatcher
             .lock()
             .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
@@ -2172,7 +2191,7 @@ fn native_host_file_server<'a>(
                 dispatcher.serve_host_root_file(resources, record)
             }
             carrick_core_abi::service::ServiceOrigin::Descendant => {
-                dispatcher.serve_native_host_file_for(record, None, requester)
+                dispatcher.serve_native_host_file_for(record, executable, requester)
             }
         };
         result

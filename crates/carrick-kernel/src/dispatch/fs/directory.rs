@@ -1116,7 +1116,7 @@ impl<'a> FsView<'a> {
                 // checks see a real target instead of an empty string.
                 t
             } else {
-                match this.readlink_path_target(&path) {
+                match this.readlink_path_target(&path, None) {
                     Ok(target) => target,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
@@ -1885,9 +1885,10 @@ impl super::super::FsView<'_> {
     pub(in crate::dispatch) fn readlink_path_target(
         &self,
         path: &str,
+        visible_self: Option<u32>,
     ) -> Result<String, LinuxErrno> {
         if super::super::resources::in_native_fs_scope() {
-            if path == "/proc/self/exe" {
+            if proc_self_magic_link(path, visible_self) == Some("exe") {
                 return super::super::resources::native_executable()
                     .map(|executable| executable.display_path())
                     .ok_or(LINUX_ENOSYS);

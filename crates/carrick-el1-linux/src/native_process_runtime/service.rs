@@ -1548,16 +1548,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     fn publish_host_file(
         &mut self,
-        record: Box<[u8]>,
+        mut record: Box<[u8]>,
         output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
         map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
         chdir: bool,
         call: NativeServiceCall<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
-        let operation = carrick_core_abi::host_file::request_parts(&record)
-            .ok_or(NativeProcessError::Invalid)?
-            .0
-            .op;
+        let mut view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut record)
+            .map_err(|_| NativeProcessError::Invalid)?;
+        let operation = view.header().op;
+        if operation == carrick_core_abi::host_file::HostFileOp::Readlinkat {
+            // This is the process PID validated for the exact calling task,
+            // used only to recognize the numeric spelling of its self link.
+            view.set_args([u64::from(self.current.visible_pid().unwrap_or(0)), 0, 0, 0]);
+        }
         self.publish_pending_host_file(PendingHostFile {
             call,
             operation,
