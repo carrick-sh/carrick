@@ -256,17 +256,10 @@ enum Custody {
 
 /// Live descendants belong to the carrier, independently of which CPU served
 /// their birth or currently holds the root task's executor lease.
+type ChildBindingRecord = (GuestArchBinding, Option<carrick_el1_abi::EntryTaskKey>);
+type ChildBindingMap = std::collections::BTreeMap<RootGpa, ChildBindingRecord>;
 #[derive(Clone, Default)]
-pub struct CarrierChildBindings(
-    std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::BTreeMap<
-                RootGpa,
-                (GuestArchBinding, Option<carrick_el1_abi::EntryTaskKey>),
-            >,
-        >,
-    >,
-);
+pub struct CarrierChildBindings(std::sync::Arc<std::sync::Mutex<ChildBindingMap>>);
 
 impl CarrierChildBindings {
     fn get(&self, root: RootGpa) -> Result<Option<GuestArchBinding>, TrapError> {

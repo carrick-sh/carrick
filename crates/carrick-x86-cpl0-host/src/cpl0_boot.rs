@@ -1919,12 +1919,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         if let Some(issued) = self
             .cpu
             .registered_child_entry_task(execution.context.root)?
+            && execution.binding.task != issued
         {
-            if execution.binding.task != issued {
-                return Err(fail(
-                    "idle peer child entry key differs from fork settlement",
-                ));
-            }
+            return Err(fail(
+                "idle peer child entry key differs from fork settlement",
+            ));
         }
         execution.authenticate(binding, "idle peer forward binding mismatch")?;
         Ok(binding.task())
