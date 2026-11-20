@@ -25,10 +25,9 @@ tools truncate long files, and an unread rule doesn't bind. Depth lives in
    Wine. Use man pages, specs and the Docker oracle. Permissive prior art
    (FreeBSD linuxulator, gVisor, NetBSD compat, Go runtime) is fine: check its
    LICENSE first. Every brief that points at outside code states this.
-5. **Never run carrick and Docker on the same Mac or in the same VM at the
-   same time.** They starve each other and the verdicts are wrong. Separate VMs
-   on a hypervisor host (hz) need no shared Docker window (owner, 2026-11-20).
-   carrick with carrick, or Docker with Docker, is fine.
+5. **Never run carrick and Docker at once on one Mac or VM.** They starve
+   each other and the verdicts are wrong. Separate hz VMs are fine (owner,
+   2026-11-20).
 6. **Be honest about status.** Carrick is experimental. Coverage is partial
    (`grep -c 'SupportLevel::BringUp' crates/carrick-abi/src/syscall.rs`), and
    there has been no adversarial security review. Never run untrusted code,
