@@ -18,7 +18,12 @@ install -D -m 644 "$lib/ld-linux-aarch64.so.1" "$root/lib/ld-linux-aarch64.so.1"
 install -D -m 644 "$lib/libc.so.6" "$root/lib/libc.so.6"
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-"${CC:-gcc}" -march=armv8-a -O1 -fno-builtin -Wl,-rpath,/lib \
+cc=${CC:-gcc}
+# Ubuntu GCC defaults to _FORTIFY_SOURCE=3 at -O1, which can replace the
+# libc calls even with -fno-builtin. The probe requires direct PLT calls.
+"$cc" -march=armv8-a -O1 -D_FORTIFY_SOURCE=0 -fno-builtin -fplt -fPIE -pie \
+    -Wl,-rpath,/lib \
     -Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1 \
     "$repo/crates/carrick-softcpu-aarch64-host/tests/fixtures/glibc_hello.c" \
     -o "$root/hello"
+"$cc" --version > "$root/hello.compiler"
