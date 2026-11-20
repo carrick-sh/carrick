@@ -73,7 +73,8 @@ impl PublicationDecline {
 
 #[cfg(test)]
 mod publication_decline_tests {
-    use super::{PublicationDecline, PublicationNotNow};
+    use super::{PublicationDecline, PublicationNotNow, SelectedBackingPlan};
+    use carrick_core_abi::ReservationRange;
     use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
 
     #[test]
@@ -117,6 +118,19 @@ mod publication_decline_tests {
             PublicationDecline::Terminal(super::PublicationTerminal::PublishUnsupported),
         );
     }
+
+    #[test]
+    fn capacity_fallback_is_one_strictly_smaller_fault_page() {
+        let admitted = ReservationRange::new(0x4000, 0x8000).unwrap();
+        let selected = SelectedBackingPlan::new(admitted, admitted, 0x6000).unwrap();
+        let fallback = selected.capacity_fallback().unwrap();
+        assert_eq!(
+            fallback.range(),
+            ReservationRange::new(0x6000, 0x7000).unwrap()
+        );
+        assert_eq!(fallback.fault_page(), 0x6000);
+        assert!(fallback.capacity_fallback().is_none());
+    }
 }
 
 impl SelectedBackingPlan {
@@ -137,6 +151,25 @@ impl SelectedBackingPlan {
             return Err(DescriptorRefusal::BadRange);
         }
         Ok(Self { range, fault_page })
+    }
+
+    /// Return the fault page as the one strictly bounded capacity fallback.
+    ///
+    /// A publication venue may use this only after refusing the selected
+    /// multi-page span for capacity.  The returned plan retains the admitted
+    /// fault identity while guaranteeing that the next attempt is smaller;
+    /// a one-page selection has no smaller retry and therefore returns
+    /// `None` instead of permitting an unbounded retry loop.
+    pub fn capacity_fallback(self) -> Option<Self> {
+        const PAGE_SIZE: u64 = 4096;
+        if self.range.len() <= PAGE_SIZE {
+            return None;
+        }
+        let range = ReservationRange::new(self.fault_page, self.fault_page + PAGE_SIZE)?;
+        Some(Self {
+            range,
+            fault_page: self.fault_page,
+        })
     }
 
     pub fn range(self) -> ReservationRange {
