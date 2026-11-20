@@ -5826,7 +5826,7 @@ where
                                 engine,
                                 control,
                                 super::zone::OwnerMemoryAction::Fault,
-                                busy.wait,
+                                busy,
                             );
                         }
                     }
@@ -5935,7 +5935,7 @@ where
                                 engine,
                                 control,
                                 super::zone::OwnerMemoryAction::Fault,
-                                busy.wait,
+                                busy,
                             );
                         }
                     }
