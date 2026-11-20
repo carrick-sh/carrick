@@ -420,6 +420,17 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
             work: false,
         }
     }
+    /// Retain the remaining records and syscall result across owner waits.
+    fn complete_copyout_pair(
+        &mut self,
+        _records: [(UserVa, alloc::vec::Vec<u8>); 2],
+        _result: SyscallResult,
+    ) -> LifecycleOutcome {
+        LifecycleOutcome::Returned {
+            result: SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+            work: false,
+        }
+    }
     /// Retain the completed poll result and its individual output fields.
     fn complete_poll_copyout(
         &mut self,
@@ -644,6 +655,17 @@ pub trait LifecycleNative<'a>: UserCopy {
         bytes: alloc::vec::Vec<u8>,
         work: bool,
     ) -> LifecycleOutcome;
+
+    fn finish_time_output(
+        &mut self,
+        _records: [Option<(UserVa, alloc::vec::Vec<u8>)>; 2],
+        _result: SyscallResult,
+    ) -> LifecycleOutcome {
+        LifecycleOutcome::Returned {
+            result: SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+            work: false,
+        }
+    }
 
     /// Terminal custody loss must never become a guest errno or leave exit parked.
     fn fail_lifecycle(&mut self, reason: NativeRunFailureReason) -> !;

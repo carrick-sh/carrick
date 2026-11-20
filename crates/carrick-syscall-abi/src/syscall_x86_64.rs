@@ -575,8 +575,8 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=200 (syscalls(2)/filippo) → canonical tkill=130.
     // musl calls tkill(tid, SIGABRT) to abort.
     direct(200, "tkill", 130),
-    // x86_64=201 time: legacy x86-only; normalized by X8664GuestArch to the
-    // private time shim (asm-generic has no equivalent table entry).
+    // x86_64=201 time has no asm-generic equivalent.
+    private(201, "time", crate::CARRICK_PRIVATE_X86_TIME),
     // x86_64=202 (syscalls(2)/filippo) → canonical futex=98.
     // pthread mutex/join block on futex.
     direct(202, "futex", 98),

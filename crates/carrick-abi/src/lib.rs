@@ -1391,30 +1391,6 @@ pub const LINUX_SIGEV_SIGNAL: i32 = 0;
 pub const LINUX_SIGEV_NONE: i32 = 1;
 pub const LINUX_SIGEV_THREAD: i32 = 2;
 
-#[repr(C, packed)]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-)]
-pub struct LinuxTimeval {
-    pub tv_sec: i64,
-    pub tv_usec: i64,
-}
-
-impl LinuxTimeval {
-    pub const fn new(tv_sec: i64, tv_usec: i64) -> Self {
-        Self { tv_sec, tv_usec }
-    }
-}
-
 pub const LINUX_TIME_OK: i64 = 0;
 pub const LINUX_TIME_INS: i64 = 1;
 pub const LINUX_TIME_DEL: i64 = 2;
@@ -1567,33 +1543,6 @@ impl LinuxItimerval {
         Self {
             it_interval: LinuxTimeval::new(0, 0),
             it_value: LinuxTimeval::new(0, 0),
-        }
-    }
-}
-
-#[repr(C, packed)]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-)]
-pub struct LinuxTimezone {
-    pub tz_minuteswest: i32,
-    pub tz_dsttime: i32,
-}
-
-impl LinuxTimezone {
-    pub const fn utc() -> Self {
-        Self {
-            tz_minuteswest: 0,
-            tz_dsttime: 0,
         }
     }
 }
