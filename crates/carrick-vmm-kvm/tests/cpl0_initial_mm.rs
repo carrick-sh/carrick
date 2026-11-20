@@ -364,16 +364,46 @@ fn serial_host_native_root_and_child_monotonic_clock_gettime() {
     );
 }
 
-/// x86 CPL0 defines no guest-visible monotonic epoch (no vDSO, a raw RDTSC
-/// counter), so even forkexecstorm's already expired absolute
-/// CLOCK_MONOTONIC deadline keeps the counted ENOSYS refusal (#1808).
 #[test]
-fn serial_host_native_child_absolute_clock_nanosleep_is_refused() {
+fn serial_host_native_root_and_child_vdso_monotonic_matches_raw_clock() {
     native_child_sleep_witness_with_exit(
-        "serial_host_native_child_absolute_clock_nanosleep_is_refused",
+        "serial_host_native_root_and_child_vdso_monotonic_matches_raw_clock",
+        "native_vdso_clock.S",
+        &[],
+        8,
+    );
+}
+
+#[test]
+fn serial_host_native_exec_successor_vdso_monotonic_matches_raw_clock() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let image = native_exit_fixture_with_flags("native_vdso_clock.S", &["-DEXEC_SUCCESSOR=1"]);
+    carrick_test_support::executable::write_executable_mode(&successor, &image, 0o700);
+    let path = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_fork_exec.S", &[&path]);
+    let outcome = run_exec_fixture(&elf, 128);
+    assert_eq!(outcome.run.exit_code, 8, "successor vDSO result");
+}
+
+/// An expired monotonic deadline completes immediately in CPL0.
+#[test]
+fn serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero",
         "native_child_sleep.S",
         &["-DSLEEP_ABSOLUTE=1"],
-        218,
+        8,
+    );
+}
+
+#[test]
+fn serial_host_native_child_absolute_monotonic_clock_nanosleep_reaches_deadline() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_child_absolute_monotonic_clock_nanosleep_reaches_deadline",
+        "native_child_sleep.S",
+        &["-DSLEEP_FUTURE_ABSOLUTE=1"],
+        8,
     );
 }
 
