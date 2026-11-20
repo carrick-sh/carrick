@@ -410,15 +410,19 @@ pub(crate) fn doorbell(port: u16, frame: &NativeFrame) {
     write_port(port, frame, admit_exit());
 }
 
-pub(crate) fn current_slot_and_zone() -> Option<(
+pub fn current_slot_and_zone() -> Option<(
     carrick_sched_core::SlotId,
     &'static carrick_el1::memory::reservations::X86Cpl0Zone,
     carrick_guest_arch::CounterTick,
 )> {
     use carrick_guest_arch::InterruptBackend;
+    table_span::admitted_tables()?;
     let binding = carrick_el1::isa::x86::context::current_cpu_binding()?;
     let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))?;
     let now = carrick_el1::isa::x86::X86Backend.counter().ok()?;
+    // SAFETY: `admitted_tables()` succeeds only after `carrier_initial_boot`
+    // admitted an initial MM over a boot that mapped and zero-initialized
+    // `X86Cpl0Zone` at `x86_kernel_layout().zone`.
     let zone = unsafe {
         &*(carrick_el1::isa::x86_kernel_layout().zone.raw()
             as *const carrick_el1::memory::reservations::X86Cpl0Zone)
