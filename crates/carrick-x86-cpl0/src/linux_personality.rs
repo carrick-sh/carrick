@@ -719,8 +719,8 @@ pub fn handle_user_page_fault_prepared(
             code,
             address,
         } => deliver_page_fault_signal(frame, fpstate, signum, code, address),
-        UserFaultSupply::Contended(cause) => park_contended_user_fault(prep, frame, fpstate, cause),
-        UserFaultSupply::OwnerWait(wait) => {
+        UserFaultSupply::MmRelease(cause) => park_contended_user_fault(prep, frame, fpstate, cause),
+        UserFaultSupply::TypedRelease(wait) => {
             park_owner_waiting_user_fault(prep, frame, fpstate, wait)
         }
         UserFaultSupply::Unresolved(reason) => reason,
@@ -828,10 +828,10 @@ pub enum UserFaultSupply {
     },
     /// Another owner holds the MM root, editor or gate. This is "not now":
     /// park on its release and retry the unchanged access.
-    Contended(carrick_sched_core::spaces::notification::SpaceWaitCause),
+    MmRelease(carrick_sched_core::spaces::notification::SpaceWaitCause),
     /// A typed owner receipt names either an MM release, the carrier
     /// reservation pool, or this member's host-readiness queue.
-    OwnerWait(carrick_el1_abi::PortalOwnerWait),
+    TypedRelease(carrick_el1_abi::PortalOwnerWait),
     /// No owner could supply the access: the #PF entry reports this reason.
     Unresolved(u64),
 }
@@ -886,7 +886,7 @@ fn native_exec_call(
                     restart_native_syscall(frame, ordinal);
                     CompletionRoute::Served
                 }
-                UserFaultSupply::Contended(cause) => {
+                UserFaultSupply::MmRelease(cause) => {
                     match anonymous::park_contended_fault(task, slot, cause, saved) {
                         anonymous::ContendedFault::Parked => CompletionRoute::Suspended,
                         anonymous::ContendedFault::Rerun => {
@@ -896,7 +896,7 @@ fn native_exec_call(
                         anonymous::ContendedFault::Refused => fatal_boot(),
                     }
                 }
-                UserFaultSupply::OwnerWait(wait) => {
+                UserFaultSupply::TypedRelease(wait) => {
                     match anonymous::park_owner_fault_wait(task, slot, wait, saved) {
                         anonymous::ContendedFault::Parked => CompletionRoute::Suspended,
                         anonymous::ContendedFault::Rerun => {
@@ -1108,7 +1108,7 @@ fn supply_user_fault(
             },
             address: fault.address,
         },
-        OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::OwnerWait(wait),
+        OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::TypedRelease(wait),
         OwnerFaultSupplyOutcome::Unavailable => UserFaultSupply::Unresolved(9),
         OwnerFaultSupplyOutcome::CowSelected => {
             cross_owner_grant(
@@ -1215,13 +1215,13 @@ fn supply_user_fault(
                     UserFaultSupply::Served
                 }
                 Ok(carrick_core::mm::frames::GrantServeOutcome::NotNow(_))
-                | Err(carrick_core::mm::transaction::MmError::Busy) => UserFaultSupply::Contended(
+                | Err(carrick_core::mm::transaction::MmError::Busy) => UserFaultSupply::MmRelease(
                     carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
                 ),
                 Err(carrick_core::mm::transaction::MmError::Wait(wait)) => {
-                    UserFaultSupply::OwnerWait(wait)
+                    UserFaultSupply::TypedRelease(wait)
                 }
-                _ => UserFaultSupply::Contended(
+                _ => UserFaultSupply::MmRelease(
                     carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
                 ),
             }
@@ -1635,7 +1635,7 @@ impl Personality for LinuxPersonality {
                             // The owner refused or could not supply the
                             // access (no reservation names it): never a
                             // carrier abort.
-                            UserFaultSupply::Contended(cause) => {
+                            UserFaultSupply::MmRelease(cause) => {
                                 match anonymous::park_contended_fault(task, slot, cause, &words) {
                                     anonymous::ContendedFault::Parked => parked = true,
                                     anonymous::ContendedFault::Rerun => retry = true,
@@ -1643,7 +1643,7 @@ impl Personality for LinuxPersonality {
                                 }
                                 None
                             }
-                            UserFaultSupply::OwnerWait(wait) => {
+                            UserFaultSupply::TypedRelease(wait) => {
                                 match anonymous::park_owner_fault_wait(task, slot, wait, &words) {
                                     anonymous::ContendedFault::Parked => parked = true,
                                     anonymous::ContendedFault::Rerun => retry = true,
