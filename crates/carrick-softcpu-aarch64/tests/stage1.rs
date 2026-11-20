@@ -495,6 +495,54 @@ fn dispatcher_tlb_checks_ttbr_asid_and_pan_after_a_hit() {
     assert_eq!(report.work.stage1_walks, 5);
 }
 
+#[test]
+fn dispatcher_discards_stage1_when_translation_is_disabled() {
+    let mut r = Rig::el1();
+    r.memory.put(KDATA_PA, 0xfeed);
+    r.set(0, KDATA);
+    r.set(2, ROOT_B | (5 << 48));
+    r.set(3, ROOT_A);
+    r.set(4, 1);
+    write_guest_words(
+        &mut r.memory,
+        CODE_PA,
+        &[LDR_X1_X0, 0xd518_101f], // msr sctlr_el1, xzr
+    );
+    r.memory.back(CODE);
+    write_guest_words(
+        &mut r.memory,
+        CODE + 8,
+        &[
+            0xd518_2002, // msr ttbr0_el1, x2 (while M=0)
+            0xd518_2003, // msr ttbr0_el1, x3 (restore the original root)
+            0xd518_1004, // msr sctlr_el1, x4
+        ],
+    );
+    write_guest_words(
+        &mut r.memory,
+        CODE_PA + 20,
+        &[0xf940_0005, 0xd400_0042], // ldr x5, [x0]; hvc #2
+    );
+    let report = run(
+        &mut r.cpu,
+        &mut r.monitor,
+        &mut r.memory,
+        &mut SingleExit,
+        BlockLimits::default(),
+        16,
+    );
+    assert!(matches!(
+        report.stop,
+        Stop::Event {
+            event: Event::ProviderExit(_),
+            ..
+        }
+    ));
+    assert_eq!([r.get(1), r.get(5)], [0xfeed; 2]);
+    assert_eq!(report.pc, ProgramCounter(CODE + 28));
+    assert_eq!(report.work.stage1_walks, 4);
+}
+
 mod production {
     use super::*;
     use carrick_mem::arch_sysregs::{SCTLR_EL1_BOOTSTRAP, TCR_EL1_BOOTSTRAP};
