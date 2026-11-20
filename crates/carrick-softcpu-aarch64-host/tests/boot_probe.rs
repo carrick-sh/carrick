@@ -832,6 +832,63 @@ fn scalar_launcher_leaves_vector_state_in_the_cpu() {
 }
 
 #[test]
+fn wide_resident_working_set_avoids_fifo_republication() {
+    const START: u64 = 0x4000;
+    const CHAIN_BLOCKS: usize = 1_535;
+    const RESIDENT_BLOCKS: u64 = CHAIN_BLOCKS as u64 + 2;
+
+    let mut words = vec![0x1400_0001u32; CHAIN_BLOCKS]; // b +4
+    let back_words = -(CHAIN_BLOCKS as i32 + 1);
+    words.push(0xf100_0400); // subs x0, x0, #1
+    words.push(0x5400_0001 | (((back_words as u32) & 0x7ffff) << 5)); // b.ne START
+    words.push(0xd400_0042); // hvc #2
+    let exit_pc = START + 4 * (words.len() as u64 - 1);
+
+    for iterations in [1u64, 10, 100] {
+        let mut runner = HostBlockRunner::new().unwrap();
+        let mut memory = Pages::default();
+        load_words(&mut memory, START, &words);
+        let mut cpu = el1_at(START);
+        set_x(&mut cpu, 0, iterations);
+        let before = runner.publication_work();
+        let report = run(
+            &mut cpu,
+            &mut ExclusiveMonitor::default(),
+            &mut memory,
+            &mut runner,
+            BlockLimits::default(),
+            iterations * RESIDENT_BLOCKS + 8,
+        );
+        let pub_work = runner.publication_work().since(before);
+        assert!(
+            matches!(
+                report.stop,
+                Stop::Event {
+                    event: Event::ProviderExit(exit),
+                    ..
+                } if exit.immediate.value() == 2
+            ),
+            "{report}"
+        );
+        assert_eq!(cpu.pc, ProgramCounter(exit_pc + 4));
+        assert_eq!(x(&cpu, 0), 0);
+        assert_eq!(
+            report.work.retired_instructions,
+            iterations * RESIDENT_BLOCKS + 1
+        );
+        assert_eq!(
+            report.work.decoded_blocks, RESIDENT_BLOCKS,
+            "scale={iterations}"
+        );
+        assert_eq!(
+            report.work.emitted_blocks, RESIDENT_BLOCKS,
+            "scale={iterations}"
+        );
+        assert_eq!(pub_work.publications, RESIDENT_BLOCKS, "scale={iterations}");
+    }
+}
+
+#[test]
 fn provider_handoffs_reuse_only_the_current_code_incarnation() {
     const PC: u64 = 0x4000;
     let mut runner = HostBlockRunner::new().unwrap();
