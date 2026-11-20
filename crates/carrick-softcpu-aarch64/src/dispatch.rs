@@ -5,19 +5,27 @@
 //! the current execute translation and the memory owner's code generation.
 use crate::exception::{Exception, take_exception};
 use crate::handler::{
-    self, CodeGeneration, Event, ExclusiveMonitor, GuestMemory, MemoryFault, Outcome,
+    self, CodeGeneration, Event, ExclusiveMonitor, GuestMemory, InlineRam, MemoryFault, Outcome,
 };
 use crate::mmu::{self, AccessClass, PermissionMode, Stage1Error, Stage1Registers};
 use crate::state::{CpuState, ExceptionLevel, ProgramCounter, VirtualAddress};
 use crate::translate::{
     BlockExit, BlockLimits, CODE_PAGE_BYTES, ExitReason, GuestInstruction, InstructionClass,
-    TranslateError, TranslatedBlock, emit_block, split_block_at_level,
+    TranslateError, TranslatedBlock, emit_block, split_block_for_run,
 };
 use carrick_guest_arch::{FrameGpa, Gpa, GuestVa};
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
 use carrick_softmmu::block_cache::BlockCache;
 use carrick_softmmu::physical_tlb::PhysicalTlb;
 use core::fmt;
+
+/// Permission-checked virtual page tags and RAM loans, live for one launch.
+#[derive(Default)]
+pub struct BlockMemory<'a> {
+    pub read: Option<GuestVa>,
+    pub write: Option<GuestVa>,
+    pub ram: InlineRam<'a>,
+}
 
 /// Prepares translated code and runs it against the CPU's architectural state.
 /// The implementation owns executable memory; this crate never executes it.
@@ -33,6 +41,20 @@ pub trait ExecuteBlock {
     /// Whether to cache stage-1 translations on providers with a local seat.
     fn retain_stage1(&self) -> bool {
         true
+    }
+
+    fn inline_memory(&self) -> bool {
+        false
+    }
+
+    fn execute_with_memory(
+        &mut self,
+        block: &TranslatedBlock,
+        code: &Self::Code,
+        cpu: &mut CpuState,
+        _memory: BlockMemory<'_>,
+    ) -> Result<usize, Self::Error> {
+        self.execute(block, code, cpu)
     }
 
     fn prepare(&mut self, block: &TranslatedBlock) -> Result<Self::Code, Self::Error>;
@@ -204,6 +226,44 @@ struct MeasuredMemory<'a, M> {
     walks: u64,
     retain_stage1: bool,
     tlb: Option<PhysicalTlb<Stage1Registers, PermissionMode>>,
+    last_read: Option<GuestVa>,
+    last_write: Option<GuestVa>,
+}
+
+impl<M: GuestMemory> MeasuredMemory<'_, M> {
+    fn inline_ram(
+        &mut self,
+        cpu: &CpuState,
+        code_frame: FrameGpa,
+        monitor: &ExclusiveMonitor,
+    ) -> BlockMemory<'_> {
+        let Some(tlb) = self.tlb.as_mut() else {
+            return BlockMemory::default();
+        };
+        let regime = Stage1Registers::for_cpu(cpu);
+        let mut probe = |page, access| {
+            tlb.probe(
+                regime,
+                page,
+                access,
+                PermissionMode::for_access(cpu, access, AccessClass::Ordinary),
+            )
+            .map(Gpa::to_frame_gpa)
+        };
+        let read = self
+            .last_read
+            .and_then(|page| probe(page, LeafAccess::Read));
+        let write = self
+            .last_write
+            .filter(|_| !monitor.is_open())
+            .and_then(|page| probe(page, LeafAccess::Write))
+            .filter(|frame| *frame != code_frame);
+        BlockMemory {
+            read: self.last_read,
+            write: self.last_write,
+            ram: self.inner.inline_ram(read, write),
+        }
+    }
 }
 
 impl<M: GuestMemory> GuestMemory for MeasuredMemory<'_, M> {
@@ -228,6 +288,14 @@ impl<M: GuestMemory> GuestMemory for MeasuredMemory<'_, M> {
     ) -> Result<Gpa, Stage1Error> {
         let mode = PermissionMode::for_access(cpu, access, class);
         if self.retain_stage1 {
+            if class == AccessClass::Ordinary {
+                let page = Some(GuestVa::new(va.raw() & !(CODE_PAGE_BYTES - 1)));
+                match access {
+                    LeafAccess::Read => self.last_read = page,
+                    LeafAccess::Write => self.last_write = page,
+                    LeafAccess::Execute => {}
+                }
+            }
             let tlb = self.tlb.get_or_insert_with(PhysicalTlb::default);
             if let Some(pa) = tlb.probe(Stage1Registers::for_cpu(cpu), va, access, mode) {
                 return Ok(pa);
@@ -263,7 +331,10 @@ pub fn run<X: ExecuteBlock>(
         inner: memory,
         walks: 0,
         tlb: None,
+        last_read: None,
+        last_write: None,
     };
+    let inline_memory = memory.retain_stage1 && executor.inline_memory();
     // The run borrows one memory owner and one set of block limits. Keeping
     // residency within that borrow also discards code at provider handoffs.
     let mut cache = BlockCache::<BlockKey, ResidentBlock<X::Code>>::default();
@@ -316,17 +387,18 @@ pub fn run<X: ExecuteBlock>(
                 };
                 work.decoded_blocks += 1;
                 let mut fetched_whole_block = true;
-                let guest = split_block_at_level(cpu.pc, limits, cpu.pstate.el, |pc| {
-                    let word = if pc == cpu.pc {
-                        Some(first)
-                    } else {
-                        fetch_address(cpu, memory, pc)
-                            .ok()
-                            .and_then(|pa| read_word(memory, pa).ok())
-                    };
-                    fetched_whole_block &= word.is_some();
-                    word
-                });
+                let guest =
+                    split_block_for_run(cpu.pc, limits, cpu.pstate.el, inline_memory && mmu::enabled(cpu), |pc| {
+                        let word = if pc == cpu.pc {
+                            Some(first)
+                        } else {
+                            fetch_address(cpu, memory, pc)
+                                .ok()
+                                .and_then(|pa| read_word(memory, pa).ok())
+                        };
+                        fetched_whole_block &= word.is_some();
+                        word
+                    });
                 work.emitted_blocks += 1;
                 let block = match emit_block(&guest) {
                     Ok(block) => block,
@@ -355,7 +427,12 @@ pub fn run<X: ExecuteBlock>(
                 }
             };
         work.dispatches += 1;
-        let index = match executor.execute(block, executable, cpu) {
+        let inline_ram = if block.has_inline_memory() {
+            memory.inline_ram(cpu, frame, monitor)
+        } else {
+            BlockMemory::default()
+        };
+        let index = match executor.execute_with_memory(block, executable, cpu, inline_ram) {
             Ok(i) => i,
             Err(e) => break Stop::Execute(e),
         };
@@ -372,7 +449,7 @@ pub fn run<X: ExecuteBlock>(
             }
             BlockExit::Handler(i) => {
                 // The generated block retires the prefix before the handler.
-                work.retired_instructions += instructions - 1;
+                work.retired_instructions += i.pc().0.wrapping_sub(block.guest().start().0) / 4;
                 if i.class() == InstructionClass::Exit(ExitReason::Memory)
                     || matches!(i.instruction(), crate::Instruction::DataCacheZero(_))
                 {

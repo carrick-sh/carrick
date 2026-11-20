@@ -12,8 +12,9 @@ use crate::state::{
     SystemValue,
 };
 use crate::{
-    AddressBase, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, GUEST_CPU_PROFILE, Gpr,
-    Hint, Instruction, LogicalOperand, OperandRegister, RegisterBranch, decode_instruction,
+    AddressBase, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, GUEST_CPU_PROFILE, Gpr, Hint, Instruction,
+    LogicalOperand, MemoryAddress, MemoryIndex, MemoryOperation, MemoryRegister, OperandRegister,
+    RegisterBranch, ScalarMemory, decode_instruction,
 };
 use alloc::vec::Vec;
 
@@ -228,6 +229,7 @@ pub const CODE_PAGE_BYTES: u64 = 4096;
 pub struct GuestBlock {
     start: ProgramCounter,
     instructions: Vec<GuestInstruction>,
+    inline_memory: bool,
 }
 
 impl GuestBlock {
@@ -240,8 +242,14 @@ impl GuestBlock {
     }
 
     pub fn terminator(&self) -> Option<&GuestInstruction> {
-        self.instructions.last().filter(|i| i.class.terminates())
+        self.instructions
+            .last()
+            .filter(|i| i.class.terminates() && self.inline_op(i).is_none())
     }
+    fn inline_op(&self, i: &GuestInstruction) -> Option<ScalarMemory> {
+        self.inline_memory.then(|| inline_op(i)).flatten()
+    }
+
     /// The PC after the last instruction of the block.
     pub fn next_pc(&self) -> ProgramCounter {
         ProgramCounter(
@@ -261,13 +269,14 @@ pub fn split_block(
     limits: BlockLimits,
     fetch: impl FnMut(ProgramCounter) -> Option<u32>,
 ) -> GuestBlock {
-    split_block_at_level(start, limits, ExceptionLevel::El1, fetch)
+    split_block_for_run(start, limits, ExceptionLevel::El1, false, fetch)
 }
 
-pub(crate) fn split_block_at_level(
+pub(crate) fn split_block_for_run(
     start: ProgramCounter,
     limits: BlockLimits,
     el: ExceptionLevel,
+    inline_memory: bool,
     mut fetch: impl FnMut(ProgramCounter) -> Option<u32>,
 ) -> GuestBlock {
     let mut instructions = Vec::new();
@@ -275,6 +284,7 @@ pub(crate) fn split_block_at_level(
         return GuestBlock {
             start,
             instructions,
+            inline_memory,
         };
     }
     let mut pc = start;
@@ -283,7 +293,7 @@ pub(crate) fn split_block_at_level(
         let Some(word) = fetch(pc) else { break };
         let instruction = GuestInstruction::decode_at_level(pc, word, el);
         instructions.push(instruction);
-        if instruction.class.terminates() {
+        if instruction.class.terminates() && !(inline_memory && inline_op(&instruction).is_some()) {
             break;
         }
         pc = ProgramCounter(pc.0.wrapping_add(4));
@@ -291,6 +301,28 @@ pub(crate) fn split_block_at_level(
     GuestBlock {
         start,
         instructions,
+        inline_memory,
+    }
+}
+
+// Admit only ordinary unsigned-offset integer loads and stores. Keep
+// atomics, SIMD, signed loads and addressing with writeback on the handler.
+fn inline_op(i: &GuestInstruction) -> Option<ScalarMemory> {
+    match i.instruction {
+        Instruction::ScalarMemory(
+            op @ ScalarMemory {
+                operation: MemoryOperation::Load | MemoryOperation::Store,
+                register: MemoryRegister::Integer { .. },
+                address:
+                    MemoryAddress::Immediate {
+                        index: MemoryIndex::Offset,
+                        unscaled: false,
+                        ..
+                    },
+                ..
+            },
+        ) => Some(op),
+        _ => None,
     }
 }
 
@@ -330,7 +362,11 @@ pub mod frame {
     pub const FPSR: u32 = 0x120;
     pub const HOST_FPCR: u32 = 0x128;
     pub const HOST_FPSR: u32 = 0x130;
-    pub const SLOTS: usize = 40;
+    pub const INLINE_READ_VA: u32 = 0x138;
+    pub const INLINE_READ_PTR: u32 = 0x140;
+    pub const INLINE_WRITE_VA: u32 = 0x148;
+    pub const INLINE_WRITE_PTR: u32 = 0x150;
+    pub const SLOTS: usize = 44;
     /// Guest Q0..Q31, sixteen bytes per register.
     pub const VECTORS: u32 = (SLOTS * 8) as u32;
     pub const BYTES: usize = SLOTS * 8 + 32 * 16;
@@ -442,6 +478,7 @@ pub struct TranslatedBlock {
     words: Vec<u32>,
     exits: Vec<BlockExit>,
     terminator: Terminator,
+    inline_memory: bool,
 }
 
 impl TranslatedBlock {
@@ -456,6 +493,10 @@ impl TranslatedBlock {
 
     pub fn exits(&self) -> &[BlockExit] {
         &self.exits
+    }
+
+    pub fn has_inline_memory(&self) -> bool {
+        self.inline_memory
     }
 
     pub fn terminator(&self) -> Terminator {
@@ -514,6 +555,18 @@ pub mod encode {
     /// ADD Xd|SP, Xn|SP, #imm12 (MOV to or from SP when imm12 = 0).
     pub const fn add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
         0x9100_0000 | (imm12 << 10) | (rn << 5) | rd
+    }
+    pub(super) const fn eor(rd: u32, rn: u32, rm: u32) -> u32 {
+        0xca00_0000 | (rm << 16) | (rn << 5) | rd
+    }
+    pub(super) const fn add(rd: u32, rn: u32, rm: u32) -> u32 {
+        0x8b00_0000 | (rm << 16) | (rn << 5) | rd
+    }
+    pub(super) const fn ubfx(rd: u32, rn: u32, lsb: u32, width: u32) -> u32 {
+        0xd340_0000 | (lsb << 16) | ((lsb + width - 1) << 10) | (rn << 5) | rd
+    }
+    pub(super) const fn cbz(rt: u32, nonzero: bool, words: usize) -> u32 {
+        0xb400_0000 | ((nonzero as u32) << 24) | ((words as u32) << 5) | rt
     }
     /// MOVZ Xd, #imm16, LSL #(16 * hw).
     pub const fn movz(rd: u32, imm16: u16, hw: u32) -> u32 {
@@ -762,6 +815,85 @@ impl Emitter {
         self.words.push(0);
         index
     }
+
+    fn inline_memory(
+        &mut self,
+        i: &GuestInstruction,
+        op: ScalarMemory,
+    ) -> Result<(), TranslateError> {
+        let MemoryAddress::Immediate { base, offset, .. } = op.address else {
+            return Err(TranslateError::Encoding(i.word));
+        };
+        let rn = gpr_number(base).unwrap_or(SP);
+        let rt = i.word & 31;
+        let mut scratches = [9, 10, 11, 12].into_iter().filter(|r| *r != rn && *r != rt);
+        let (Some(address), Some(temp)) = (scratches.next(), scratches.next()) else {
+            return Err(TranslateError::Encoding(i.word));
+        };
+        let store = op.operation == MemoryOperation::Store;
+        let (page_slot, ptr_slot) = if store {
+            (frame::INLINE_WRITE_VA, frame::INLINE_WRITE_PTR)
+        } else {
+            (frame::INLINE_READ_VA, frame::INLINE_READ_PTR)
+        };
+        let w = &mut self.words;
+        w.push(encode::stp(address, temp, SP, frame::SCRATCH as i32));
+        let base_reg = if rn == SP {
+            w.push(encode::ldr(address, SP, frame::GUEST_SP));
+            address
+        } else {
+            rn
+        };
+        let bytes = offset.bytes() as u32;
+        let base_reg = if bytes >= 4096 {
+            w.push(encode::add_imm(address, base_reg, bytes >> 12) | (1 << 22));
+            address
+        } else {
+            base_reg
+        };
+        w.push(encode::add_imm(address, base_reg, bytes & 4095));
+        // Compare the whole virtual page tag, preserving guest NZCV.
+        w.push(encode::ldr(temp, SP, page_slot));
+        w.push(encode::eor(temp, address, temp));
+        w.push(encode::ubfx(temp, temp, 12, 52));
+        let tag_miss = w.len();
+        w.push(0);
+        // Natural alignment also proves the access fits in the borrowed page.
+        let alignment_miss = if op.size.bytes() > 1 {
+            w.push(encode::ubfx(
+                temp,
+                address,
+                0,
+                op.size.bytes().trailing_zeros(),
+            ));
+            let site = w.len();
+            w.push(0);
+            Some(site)
+        } else {
+            None
+        };
+        w.push(encode::ldr(temp, SP, ptr_slot));
+        let ptr_miss = w.len();
+        w.push(0);
+        w.push(encode::ubfx(address, address, 0, 12));
+        w.push(encode::add(address, temp, address));
+        // Reuse the admitted unsigned-offset opcode with the translated base
+        // and immediate zero. Width and Rt (including ZR) remain unchanged.
+        w.push((i.word & !0x003f_ffe0) | (address << 5));
+        w.push(encode::ldp(address, temp, SP, frame::SCRATCH as i32));
+        let skip = w.len();
+        w.push(0);
+        let slow = w.len();
+        w[tag_miss] = encode::cbz(temp, true, slow - tag_miss);
+        if let Some(site) = alignment_miss {
+            w[site] = encode::cbz(temp, true, slow - site);
+        }
+        w[ptr_miss] = encode::cbz(temp, false, slow - ptr_miss);
+        w.push(encode::ldp(address, temp, SP, frame::SCRATCH as i32));
+        self.exit(BlockExit::Handler(*i));
+        self.words[skip] = encode::b(4 * (self.words.len() - skip) as i64);
+        Ok(())
+    }
 }
 
 /// Translate a guest block into host words. Pure and deterministic.
@@ -781,7 +913,13 @@ pub fn emit_block(guest: &GuestBlock) -> Result<TranslatedBlock, TranslateError>
         sites: Vec::new(),
     };
     let mut terminator = None;
+    let mut inline_memory = false;
     for i in &guest.instructions {
+        if let Some(op) = guest.inline_op(i) {
+            e.inline_memory(i, op)?;
+            inline_memory = true;
+            continue;
+        }
         match i.class {
             InstructionClass::Copy(CopyKind::Verbatim) => e.words.push(i.word),
             InstructionClass::Copy(CopyKind::NoOperation) => e.words.push(0xd503_201f),
@@ -848,5 +986,6 @@ pub fn emit_block(guest: &GuestBlock) -> Result<TranslatedBlock, TranslateError>
         words: e.words,
         exits: e.exits,
         terminator,
+        inline_memory,
     })
 }
