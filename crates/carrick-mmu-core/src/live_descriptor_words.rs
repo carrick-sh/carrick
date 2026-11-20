@@ -23,6 +23,36 @@ pub trait LiveDescriptorWords {
     fn descriptor_diagnostic(&self, _event: DescriptorDiagnostic) {}
 }
 
+impl<W: LiveDescriptorWords + ?Sized> LiveDescriptorWords for &W {
+    fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+        (**self).load(pa)
+    }
+
+    fn compare_exchange(&self, pa: u64, current: u64, new: u64) -> Result<bool, DescriptorRefusal> {
+        (**self).compare_exchange(pa, current, new)
+    }
+
+    fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+        (**self).store_unlinked(pa, value)
+    }
+
+    fn publish_barrier(&self) {
+        (**self).publish_barrier();
+    }
+
+    fn invalidate_range(&self, va: u64, len: u64) {
+        (**self).invalidate_range(va, len);
+    }
+
+    fn observe_residency_failure(&self) -> bool {
+        (**self).observe_residency_failure()
+    }
+
+    fn descriptor_diagnostic(&self, event: DescriptorDiagnostic) {
+        (**self).descriptor_diagnostic(event);
+    }
+}
+
 /// Where a descriptor plan stopped. A failed walk reports work counted so far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
