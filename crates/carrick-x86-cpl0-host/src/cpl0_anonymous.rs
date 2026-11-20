@@ -161,61 +161,12 @@ pub fn prepare_table_suffix(extent_bytes: usize, occupied_end: usize) -> Option<
     )
 }
 
-/// Exclusive physical credits for owner-selected Prepare operations. This
-/// capability exposes no mutable vector that the fork stock service can take.
-pub(super) struct PrepareTableStock {
-    span: PrepareTableSpan,
-    pages: Vec<RootGpa>,
-}
-struct PrepareTableLoan {
-    span: PrepareTableSpan,
-    pages: Vec<RootGpa>,
-}
-impl PrepareTableStock {
-    pub fn seed(span: PrepareTableSpan, bytes: &[u8]) -> Option<Self> {
-        if usize::try_from(span.len().raw()).ok()? != prepare_table_working_bytes()?
-            || bytes.len() != usize::try_from(span.len().raw()).ok()?
-            || bytes.iter().any(|byte| *byte != 0)
-        {
-            return None;
-        }
-        let pages = (0..span.page_count())
-            .map(|index| {
-                RootGpa::page_aligned(FrameGpa::new(span.start().raw() + index as u64 * 4096))
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self { span, pages })
-    }
-    fn candidates(&self) -> &[RootGpa] {
-        &self.pages
-    }
-    fn loan(&mut self, required: usize) -> Option<PrepareTableLoan> {
-        Some(PrepareTableLoan {
-            span: self.span,
-            pages: reserve_table_stock(&mut self.pages, required)?,
-        })
-    }
-    fn return_unused(&mut self, loan: PrepareTableLoan, used: usize) -> Result<(), TrapError> {
-        if loan.span != self.span || used > loan.pages.len() {
-            return Err(fail("Prepare table loan custody mismatch"));
-        }
-        self.pages.extend(loan.pages.into_iter().skip(used));
-        Ok(())
-    }
-}
-impl PrepareTableLoan {
-    fn len(&self) -> usize {
-        self.pages.len()
-    }
-}
-
-fn reserve_table_stock(stock: &mut Vec<RootGpa>, required: usize) -> Option<Vec<RootGpa>> {
-    if required > carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS
-        || required > stock.len()
-    {
-        return None;
-    }
-    Some(stock.drain(..required).collect())
+fn prepare_table_candidates(stock: &[RootGpa]) -> Vec<SubstrateGpa> {
+    stock
+        .iter()
+        .take(carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS)
+        .map(|table| SubstrateGpa(table.address().raw()))
+        .collect()
 }
 
 pub(super) struct PendingPrepare {
@@ -225,7 +176,7 @@ pub(super) struct PendingPrepare {
     inventory: InitialInventory,
     handle: BackingHandle,
     execution: GrantExecution,
-    tables: PrepareTableLoan,
+    owner: carrick_el1_abi::El1MmHandle,
 }
 
 impl PendingPrepare {
@@ -843,9 +794,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     /// slot reports no installed MM. The rest become fork table stock.
     pub fn install_fork_stock(
         &mut self,
-        initial_root: RootGpa,
+        context: AddressContext<RootGpa>,
         unused: Vec<RootGpa>,
     ) -> Result<(), TrapError> {
+        let initial_root = context.root;
         let BootForkStock {
             maintenance,
             tables,
@@ -901,7 +853,20 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         self.maintenance_root = Some(maintenance);
         self.fork_stock
             .install(tables, lifecycles)
-            .map_err(|e| fail(format!("fork stock install: {e:?}")))
+            .map_err(|e| fail(format!("fork stock install: {e:?}")))?;
+        let mm = carrick_el1_abi::ReservationMm::new(context.mm.raw().get())
+            .ok_or_else(|| fail("initial root MM"))?;
+        // SAFETY: the boot reply and installed address context admit this exact root.
+        let owner = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                self.fork_stock.carrier(),
+                mm,
+                context.generation.raw(),
+            )
+        };
+        self.fork_stock
+            .register_root(owner, initial_root)
+            .map_err(|e| fail(format!("fork stock root registration: {e:?}")))
     }
 
     /// The retained metadata window holding the fork lifecycle stock.
@@ -2283,10 +2248,27 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     .cancel_prepared(&[pending.handle], &mut pending.inventory)
             }
             .map_err(|error| fail(error.to_string()))?;
-            self.prepare_table_stock
-                .as_mut()
-                .ok_or_else(|| fail("Prepare stock absent on cancellation"))?
-                .return_unused(pending.tables, 0)?;
+            if let Some(receipt) = &receipt {
+                self.fork_stock
+                    .settle_native_descriptor_tables(
+                        &mut NoTableLedger,
+                        pending.owner,
+                        pending.execution.context.root,
+                        receipt,
+                    )
+                    .map_err(|error| {
+                        fail(format!("Prepare table refusal settlement: {error:?}"))
+                    })?;
+            } else {
+                self.fork_stock
+                    .cancel_submitted_native_descriptor_tables(
+                        &mut NoTableLedger,
+                        pending.owner,
+                        pending.execution.context.root,
+                        pending.txn.id.generation,
+                    )
+                    .map_err(|error| fail(format!("Prepare table withdrawal: {error:?}")))?;
+            }
             return Ok(false);
         }
         let receipt = receipt.ok_or_else(|| fail("owner grant applied receipt absent"))?;
@@ -2326,14 +2308,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 },
             )?;
         }
-        let used = publication.tables_linked as usize;
-        if pending.txn.tables.len() != pending.tables.len() || used > pending.tables.len() {
-            return Err(fail("owner grant table receipt"));
-        }
-        self.prepare_table_stock
-            .as_mut()
-            .ok_or_else(|| fail("Prepare table stock absent at settlement"))?
-            .return_unused(pending.tables, used)?;
+        self.fork_stock
+            .settle_native_descriptor_tables(
+                &mut NoTableLedger,
+                pending.owner,
+                pending.execution.context.root,
+                &receipt,
+            )
+            .map_err(|error| fail(format!("Prepare table settlement: {error:?}")))?;
         // Retained stage-2 custody now belongs to the live guest graph.
         let _retained = pending.handle;
         Ok(true)
@@ -2420,9 +2402,21 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         {
             return Err(fail("owner grant selection identity"));
         }
-        if self.prepare_table_stock.is_none() {
-            return Err(fail("Prepare table stock absent"));
+        if window.operation.mm.raw() != mm.get()
+            || window.operation.incarnation != context.generation.raw()
+            || window.operation.carrier != self.fork_stock.carrier()
+        {
+            return Err(fail("Prepare table owner differs from stopped root"));
         }
+        // SAFETY: the retained portal selection and stopped context agree on
+        // the admitted MM, incarnation and carrier; ForkStock checks its root.
+        let owner = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                window.operation.carrier,
+                window.operation.mm,
+                window.operation.incarnation,
+            )
+        };
         let bytes = match (window.host_backing, file) {
             (Some(_), Some(file)) if file.execution.matches(execution) && file.window == window => {
                 file.bytes
@@ -2492,15 +2486,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .map_err(|error| fail(error.to_string()))?;
         let handle = handles[0];
         let grant = grants[0];
-        let tables: Vec<_> = self
-            .prepare_table_stock
-            .as_ref()
-            .ok_or_else(|| fail("Prepare table stock absent"))?
-            .candidates()
-            .iter()
-            .take(carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS)
-            .map(|table| SubstrateGpa(table.address().raw()))
-            .collect();
+        let tables = prepare_table_candidates(self.fork_stock.table_stock());
         let mut txn = WireTxn {
             id: DescriptorTxnId {
                 mm_key: mm,
@@ -2564,40 +2550,59 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 return Err(error);
             }
         };
-        let owned_tables = match self
-            .prepare_table_stock
-            .as_mut()
-            .and_then(|stock| stock.loan(required))
-        {
-            Some(owned) => owned,
-            None => {
+        let owned_tables = match self.fork_stock.reserve_native_descriptor_tables(
+            &mut NoTableLedger,
+            owner,
+            root,
+            required,
+        ) {
+            Ok(owned) => owned,
+            Err(error) => {
                 unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
                     .map_err(|error| fail(error.to_string()))?;
                 return Err(fail(format!(
-                    "owner grant physical table credit exhausted: cpu={} mm={} required={required} available={}",
+                    "owner grant physical table credit refused: {error:?}; cpu={} mm={} required={required} available={}",
                     execution.cpu.raw(),
                     mm,
-                    self.prepare_table_stock
-                        .as_ref()
-                        .map_or(0, |stock| stock.candidates().len())
+                    self.fork_stock.table_stock().len()
                 )));
             }
         };
-        txn.tables = TableGrants::new(&tables[..required])
-            .ok_or_else(|| fail("owner exact table credit encoding"))?;
+        txn.tables = owned_tables.descriptor_tables();
         let admission = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
             self._vm.admit_guest_edit(native)
         });
-        if !matches!(admission, Ok(Ok(()))) || !reply.submit(window, &txn) {
+        if !matches!(admission, Ok(Ok(()))) {
             // SAFETY: the vCPU is stopped, and no descriptor submission was
             // admitted. The fresh extent has never been guest-visible.
             unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
                 .map_err(|error| fail(error.to_string()))?;
-            self.prepare_table_stock
-                .as_mut()
-                .ok_or_else(|| fail("Prepare stock absent on rollback"))?
-                .return_unused(owned_tables, 0)?;
+            self.fork_stock
+                .cancel_native_descriptor_tables(&mut NoTableLedger, owned_tables);
             return Err(fail("owner grant admission refused"));
+        }
+        if let Err(error) =
+            self.fork_stock
+                .track_native_descriptor_tables(&mut NoTableLedger, owned_tables, txn)
+        {
+            unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
+                .map_err(|error| fail(error.to_string()))?;
+            return Err(fail(format!(
+                "Prepare table transaction tracking: {error:?}"
+            )));
+        }
+        if !reply.submit(window, &txn) {
+            unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
+                .map_err(|error| fail(error.to_string()))?;
+            self.fork_stock
+                .cancel_submitted_native_descriptor_tables(
+                    &mut NoTableLedger,
+                    owner,
+                    root,
+                    txn.id.generation,
+                )
+                .map_err(|error| fail(format!("Prepare table submit cancellation: {error:?}")))?;
+            return Err(fail("owner grant submission refused"));
         }
         inventory.expected = 1;
         // Once submitted, guest descriptor publication may have happened even
@@ -2611,7 +2616,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             inventory,
             handle,
             execution,
-            tables: owned_tables,
+            owner,
         }))
     }
 }
@@ -2752,7 +2757,40 @@ mod custody_tests {
     use carrick_el1_abi::{
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
-    use carrick_mmu_core::x86::descriptor_txn::Permissions;
+    #[test]
+    fn x86_prepare_candidates_continue_after_twelve_root_table_loans() {
+        use carrick_hal::fork_stock::{ForkStock, UntaggedRoots};
+
+        let carrier = NonZeroU64::MIN;
+        let mm = carrick_el1_abi::ReservationMm::new(301).unwrap();
+        let root = RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap();
+        // SAFETY: this test owns the admitted initial root and its incarnation.
+        let owner = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(carrier, mm, NonZeroU64::MIN)
+        };
+        let mut stock = ForkStock::<UntaggedRoots>::new(carrier, None, UntaggedRoots);
+        stock
+            .install(
+                (1..=24)
+                    .map(|page| RootGpa::page_aligned(FrameGpa::new(page * 4096)).unwrap())
+                    .collect(),
+                Vec::new(),
+            )
+            .unwrap();
+        stock.register_root(owner, root).unwrap();
+        let mut loans = Vec::new();
+        for _ in 0..13 {
+            let offered = prepare_table_candidates(stock.table_stock());
+            assert!(!offered.is_empty());
+            loans.push(
+                stock
+                    .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root, 1)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(loans.len(), 13);
+        assert_eq!(stock.table_stock().len(), 11);
+    }
     #[test]
     fn native_backing_editor_exclusion_busy_once_then_success() {
         let layout = std::alloc::Layout::new::<X86Cpl0Zone>();
@@ -3070,167 +3108,6 @@ mod custody_tests {
         let mut foreign = admitted;
         foreign.context.mm = MmGeneration::new(NonZeroU64::new(303).unwrap());
         assert!(!admitted.matches(foreign));
-    }
-    #[test]
-    fn prepare_working_stock_is_independent_owned_zero_suffix() {
-        let working = prepare_table_working_bytes().unwrap();
-        assert_eq!(working, 2 * 6 * 4096);
-        let span = prepare_table_suffix(0x20000, 0x10000).unwrap();
-        assert_eq!(
-            span.start().raw(),
-            INITIAL_EXTENT_GPA + 0x20000 - working as u64
-        );
-        assert_eq!(span.end().raw(), INITIAL_EXTENT_GPA + 0x20000);
-        assert_eq!(span.page_count(), 12);
-        assert!(prepare_table_suffix(0x20000, 0x20000 - working + 4096).is_none());
-        assert!(prepare_table_suffix(0x20001, 0x10000).is_none());
-        assert!(prepare_table_suffix(working - 4096, 0).is_none());
-        let mut bytes = vec![0; working];
-        let mut stock = PrepareTableStock::seed(span, &bytes).unwrap();
-        let first = stock.loan(6).unwrap();
-        let second = stock.loan(6).unwrap();
-        assert!(stock.loan(1).is_none());
-        assert!(first.pages.iter().all(|page| !second.pages.contains(page)));
-        stock.return_unused(first, 0).unwrap();
-        stock.return_unused(second, 2).unwrap();
-        assert_eq!(stock.candidates().len(), 10);
-        bytes[4096] = 1;
-        assert!(PrepareTableStock::seed(span, &bytes).is_none());
-        assert!(PrepareTableStock::seed(span, &bytes[..working - 1]).is_none());
-    }
-    #[test]
-    fn owner_grants_reserve_disjoint_table_stock_before_receipt() {
-        let mut stock: Vec<_> = (1..=8)
-            .map(|n| RootGpa::page_aligned(FrameGpa::new(n * 4096)).unwrap())
-            .collect();
-        let first = reserve_table_stock(&mut stock, 3).unwrap();
-        let second = reserve_table_stock(&mut stock, 3).unwrap();
-        assert!(
-            !second.is_empty(),
-            "the second MM must own pending table credits"
-        );
-        assert_eq!(first.len(), 3);
-        assert_eq!(second.len(), 3);
-        assert_eq!(stock.len(), 2);
-        assert!(first.iter().all(|frame| !second.contains(frame)));
-    }
-    #[test]
-    fn owner_table_loans_use_shared_exact_root_plan_before_either_receipt() {
-        use carrick_mmu_core::live_descriptor_words::LiveDescriptorWords;
-        use carrick_mmu_core::x86::descriptor_txn::{DescriptorRefusal, plan_descriptor_txn};
-        struct ReadOnlyWords(std::collections::BTreeMap<u64, u64>);
-        impl LiveDescriptorWords for ReadOnlyWords {
-            fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
-                self.0
-                    .get(&pa)
-                    .copied()
-                    .ok_or(DescriptorRefusal::MissingTable)
-            }
-            fn compare_exchange(&self, _: u64, _: u64, _: u64) -> Result<bool, DescriptorRefusal> {
-                panic!("physical table query must not write")
-            }
-            fn store_unlinked(&self, _: u64, _: u64) -> Result<(), DescriptorRefusal> {
-                panic!("physical table query must not write")
-            }
-            fn publish_barrier(&self) {
-                panic!("physical table query must not publish")
-            }
-            fn invalidate_range(&self, _: u64, _: u64) {
-                panic!("physical table query must not invalidate")
-            }
-        }
-        let page = |pa| RootGpa::page_aligned(FrameGpa::new(pa)).unwrap();
-        let mut words = ReadOnlyWords((0x1000..0xa000).step_by(8).map(|pa| (pa, 0)).collect());
-        // Both live roots already have a private PDPT, so each selected
-        // 64-KiB window requires only a PD and a PT.
-        words.0.insert(0x1000, 0x2000 | 7);
-        words.0.insert(0x3000, 0x4000 | 7);
-        let range = carrick_el1_abi::ReservationRange::new(0x4000_0000, 0x4001_0000).unwrap();
-        let backing = carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
-            frame_id: NonZeroU64::MIN,
-            mapping_id: NonZeroU64::MIN,
-            owner_generation: NonZeroU64::MIN,
-            inventory_revision: NonZeroU64::MIN,
-        };
-        let mut stock = (0x5000..0xa000).step_by(4096).map(page).collect::<Vec<_>>();
-        let mut loans = Vec::new();
-        for (mm, root) in [(302, page(0x1000)), (304, page(0x3000))] {
-            let txn = DescriptorTxn {
-                id: DescriptorTxnId {
-                    mm_key: NonZeroU64::new(mm).unwrap(),
-                    generation: NonZeroU64::MIN,
-                },
-                root,
-                op: DescriptorOp::Prepare {
-                    span: PageSpan::new(range.start(), range.len()),
-                    output: FrameGpa::new(0x100000),
-                    permissions: Permissions {
-                        writable: true,
-                        executable: false,
-                        user: true,
-                    },
-                    resident: PageSpan::new(range.start(), 4096),
-                    backing,
-                },
-                tables: &stock,
-            };
-            let plan = plan_descriptor_txn(&words, &txn, root).unwrap();
-            assert_eq!(plan.tables_linked, 2);
-            assert!(plan.words_read <= stock.len() * 512 + 16 * 4 + 8);
-            assert!(matches!(
-                plan_descriptor_txn(&words, &txn, page(0x9000)),
-                Err(DescriptorRefusal::StaleRoot)
-            ));
-            let loan = reserve_table_stock(&mut stock, plan.tables_linked).unwrap();
-            assert_eq!(loan.len(), plan.tables_linked);
-            loans.push(loan);
-        }
-        assert_eq!(stock.len(), 1);
-        assert!(loans[0].iter().all(|page| !loans[1].contains(page)));
-        let invalid = [page(0xa000)];
-        let txn = DescriptorTxn {
-            id: DescriptorTxnId {
-                mm_key: NonZeroU64::new(302).unwrap(),
-                generation: NonZeroU64::MIN,
-            },
-            root: page(0x1000),
-            op: DescriptorOp::Unmap(PageSpan::new(range.start(), 4096)),
-            tables: &invalid,
-        };
-        assert!(matches!(
-            plan_descriptor_txn(&words, &txn, txn.root),
-            Err(DescriptorRefusal::MissingTable)
-        ));
-        words.0.insert(0x9000, 1);
-        let dirty = [page(0x9000)];
-        let dirty_txn = DescriptorTxn {
-            tables: &dirty,
-            ..txn
-        };
-        assert!(matches!(
-            plan_descriptor_txn(&words, &dirty_txn, dirty_txn.root),
-            Err(DescriptorRefusal::BadTableGrant)
-        ));
-    }
-    #[test]
-    fn owner_table_credits_refuse_without_partial_loans() {
-        let page = |n: u64| RootGpa::page_aligned(FrameGpa::new(n * 4096)).unwrap();
-        let mut stock = (1..=2).map(page).collect::<Vec<_>>();
-        let before = stock.clone();
-        assert!(reserve_table_stock(&mut stock, 3).is_none());
-        assert_eq!(stock, before);
-        let mut stock = (1..=16).map(page).collect::<Vec<_>>();
-        let before = stock.clone();
-        assert!(
-            reserve_table_stock(
-                &mut stock,
-                carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS + 1
-            )
-            .is_none()
-        );
-        assert_eq!(stock, before);
-        assert!(reserve_table_stock(&mut stock, 0).unwrap().is_empty());
-        assert_eq!(stock, before);
     }
     #[test]
     fn fork_physical_stock_requires_exact_disjoint_contiguous_capacity() {
