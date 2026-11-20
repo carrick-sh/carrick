@@ -13,7 +13,8 @@ owner bumps it for guest stores and host loads. The self-modifying witness
 executes a block, overwrites it from a different code page, then requires the
 replacement HVC at the original PC with no stale dispatch.
 
-The cache is scoped to one run on one memory owner. Changing the root, ASID
+The cache is scoped to one memory owner and extends across handoffs only
+when that owner supplies its inventory identity. Changing the root, ASID
 or exception level selects a separate key. Replacing a frame or a generation
 replaces the cached block for that key. Untracked memory cannot supply a cache
 hit. Production carrier wiring and native release timing remain separate gates.
