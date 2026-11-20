@@ -85,6 +85,12 @@ impl Pages {
             .expect("fixture page");
     }
 
+    fn unmap(&mut self, page: u64) {
+        self.memory
+            .unmap_frame(FrameGpa::new(page))
+            .expect("retire fixture page");
+    }
+
     fn load(&mut self, at: u64, bytes: &[u8]) {
         if !bytes.is_empty() {
             let first = at & !(PAGE - 1);
@@ -926,10 +932,9 @@ fn read_u64(memory: &mut Pages, at: u64) -> u64 {
 /// its `svc #0` through the mailbox/EL1 vector hook into `carrick_el1_syscall`,
 /// and reach the first guest-visible carrier exit (`HVC #2`).
 fn enter_carrier_root(el1_elf: &[u8], user_elf: &[u8]) -> (CpuState, Pages, u64) {
-    let mut user_memory = Pages::default();
-    let user_entry = load_elf(user_elf, &mut user_memory);
+    let user_entry = field(user_elf, 24, 8);
     let (cpu, mut memory) = enter_carrier(el1_elf, user_entry);
-    memory.pages.append(&mut user_memory.pages);
+    assert_eq!(load_elf(user_elf, &mut memory), user_entry);
     (cpu, memory, user_entry)
 }
 
@@ -1504,9 +1509,7 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
             LINUX_AT_HWCAP, LINUX_AT_HWCAP2, LINUX_AT_PAGESZ, LINUX_AT_RANDOM,
             LINUX_AT_SYSINFO_EHDR,
         },
-        memory::{
-            LINUX_STACK_SIZE, build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso,
-        },
+        memory::{build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso},
     };
     use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
     use std::process::Command;

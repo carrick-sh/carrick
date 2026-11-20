@@ -428,7 +428,7 @@ impl DynamicRoot {
             self.next_map = end;
         }
         for page in (addr..end).step_by(PAGE as usize) {
-            memory.pages.remove(&page);
+            memory.unmap(page);
             memory.map_zero(page);
         }
         if let Some((path, bytes)) = data {
@@ -458,7 +458,7 @@ impl DynamicRoot {
             } else if new_end < old_end {
                 protect(memory, new_end, old_end - new_end, 0);
                 for page in (new_end..old_end).step_by(PAGE as usize) {
-                    memory.pages.remove(&page);
+                    memory.unmap(page);
                 }
             }
             self.program_break = requested;
@@ -624,7 +624,7 @@ impl DynamicRoot {
                 if name == "munmap" {
                     protect(memory, a, b, 0);
                     for page in (a..a + b).step_by(PAGE as usize) {
-                        memory.pages.remove(&page);
+                        memory.unmap(page);
                     }
                 } else {
                     protect(memory, a, b, c);
