@@ -36,3 +36,19 @@ calling the shared Linux initial-stack builder. The baseline advertises
 FP, ASIMD, CRC32 and CPUID. The software dispatcher uses that profile for
 EL0 instruction admission and virtual ID-register reads. Its report counts
 EL0 undefined-instruction exceptions delivered during each bounded run.
+
+## R3b baseline census
+
+Directory mode in `carrick debug a64-census` measures code intervals in
+executable ELF sections. AArch64 mapping symbols distinguish instructions
+from embedded data. In the absence of mappings, sized functions and
+`.eh_frame` FDEs bound the measured intervals. These bounds can still include
+inline data when mapping symbols have been stripped. The report gives the
+number of measured words by source and the number of uncovered executable
+section bytes.
+
+The baseline decoder rejects optional SVE, crypto, LSE and MOPS instructions
+and the profile withholds the corresponding capabilities. The census reports
+rejections in known extension encoding spaces separately from unidentified
+words. CHKFEAT executes as a plain NOP in this profile, as specified for
+CPUs without FEAT_CHK, and never queries native host features.

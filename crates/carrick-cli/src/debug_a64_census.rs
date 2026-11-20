@@ -406,13 +406,16 @@ impl El0Spans {
 
             functions.sort_unstable_by_key(|range| range.start);
             let mut function_bytes = 0;
-            let mut emitted_end = start;
-            for range in functions {
-                if range.end > emitted_end && range.start < range.end {
-                    function_bytes += instruction_bytes(range.start.max(emitted_end), range.end)?;
-                    emitted_end = range.end;
+            let mut merged = start..start;
+            for range in functions.into_iter().filter(|range| !range.is_empty()) {
+                if range.start > merged.end {
+                    function_bytes += instruction_bytes(merged.start, merged.end)?;
+                    merged = range;
+                } else {
+                    merged.end = merged.end.max(range.end);
                 }
             }
+            function_bytes += instruction_bytes(merged.start, merged.end)?;
             coverage.function_bytes += function_bytes;
             coverage.unmapped_bytes += mapping_start - start - function_bytes;
 
