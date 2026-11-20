@@ -1179,6 +1179,8 @@ pub struct ForkStock<T: ChildAddressTags, C = ()> {
     next_loan: NonZeroU64,
     next_exec_predecessor: NonZeroU64,
     children: BTreeMap<MmKey, CommittedChild<T::Tag, C>>,
+    /// An initial root owns descriptor pages without a child lifecycle slot.
+    roots: BTreeMap<MmKey, (carrick_el1_abi::El1MmHandle, RootGpa)>,
     exec_predecessors: BTreeMap<NonZeroU64, ExecPredecessor<T::Tag, C>>,
     /// Table pages each live MM consumed, as a child or as a fork parent.
     committed_tables: BTreeMap<MmKey, Vec<RootGpa>>,
@@ -1211,6 +1213,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             next_loan: NonZeroU64::MIN,
             next_exec_predecessor: NonZeroU64::MIN,
             children: BTreeMap::new(),
+            roots: BTreeMap::new(),
             exec_predecessors: BTreeMap::new(),
             committed_tables: BTreeMap::new(),
             pending_descriptor_tables: BTreeMap::new(),
@@ -1354,6 +1357,32 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         Some(self.children.get(&MmKey::of(mm)?)?.owner)
     }
 
+    /// Admit an issued initial MM to the same table custody as children.
+    /// A retired root cannot be reissued until its tables have been cleared.
+    pub fn register_root(
+        &mut self,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+    ) -> Result<(), ForkStockServiceError> {
+        let key = MmKey::of(owner.mm()).ok_or(ForkStockServiceError::InvalidRecord)?;
+        if owner.carrier() != self.carrier
+            || self.roots.contains_key(&key)
+            || self.children.contains_key(&key)
+            || self.quarantine.contains_key(&key)
+            || self.committed_tables.contains_key(&key)
+        {
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        self.roots.insert(key, (owner, root));
+        Ok(())
+    }
+
+    fn descriptor_owner_matches(&self, owner: carrick_el1_abi::El1MmHandle, root: RootGpa) -> bool {
+        MmKey::of(owner.mm()).and_then(|key| self.roots.get(&key)) == Some(&(owner, root))
+            || (self.child_owner(owner.mm()) == Some(owner)
+                && self.child_root(owner.mm()) == Some(root))
+    }
+
     pub fn child_lifecycle(&self, mm: ReservationMm) -> Option<ForkLifecycleLoan> {
         self.children.get(&MmKey::of(mm)?)?.lifecycle
     }
@@ -1373,8 +1402,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         let mm = owner.mm();
         let key = MmKey::of(mm).ok_or(ForkStockServiceError::StaleExecution)?;
         if count > MAX_TABLE_GRANTS
-            || self.child_owner(mm) != Some(owner)
-            || self.child_root(mm) != Some(root)
+            || !self.descriptor_owner_matches(owner, root)
             || self.quarantine.contains_key(&key)
         {
             return Err(ForkStockServiceError::StaleExecution);
@@ -1471,7 +1499,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         let pending = self
             .pending_descriptor_tables
             .get(&(key, generation.get()))?;
-        (self.child_owner(owner.mm()) == Some(owner) && pending.root == root).then_some(pending.txn)
+        (self.descriptor_owner_matches(owner, root) && pending.root == root).then_some(pending.txn)
     }
 
     /// Settle a submitted reservation from EL1's authenticated receipt. Only
@@ -1492,7 +1520,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             .pending_descriptor_tables
             .get(&pending_key)
             .ok_or(ForkStockServiceError::StaleExecution)?;
-        if self.child_owner(owner.mm()) != Some(owner)
+        if !self.descriptor_owner_matches(owner, root)
             || pending.root != root
             || receipt.id != pending.txn.id
             || receipt.digest != pending.txn.digest()
@@ -1987,7 +2015,17 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                     && child.owner.incarnation() == execution.context.generation.raw()
                     && execution.context.mm.raw().get() == predecessor_mm.raw()
             }
-            None if root_predecessor => execution.context.mm.raw().get() == predecessor_mm.raw(),
+            None if root_predecessor => {
+                execution.context.mm.raw().get() == predecessor_mm.raw()
+                    && self
+                        .roots
+                        .get(&predecessor_key)
+                        .is_none_or(|(owner, root)| {
+                            owner.carrier() == self.carrier
+                                && owner.incarnation() == execution.context.generation.raw()
+                                && *root == execution.context.root
+                        })
+            }
             _ => false,
         };
         if !exact_predecessor
@@ -2041,6 +2079,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             .committed_tables
             .remove(&predecessor_key)
             .unwrap_or_default();
+        self.roots.remove(&predecessor_key);
         tables.extend(self.take_pending_descriptor_tables(predecessor_key));
         let successor_child = CommittedChild {
             owner: successor,
@@ -2911,7 +2950,10 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 .children
                 .get(&key)
                 .map(|child| (child.lifecycle, child.tag));
-            if child.is_none() && !self.committed_tables.contains_key(&key) {
+            if child.is_none()
+                && !self.committed_tables.contains_key(&key)
+                && !self.roots.contains_key(&key)
+            {
                 return Err(ForkStockServiceError::InvalidRecord);
             }
             let pages = self
@@ -2955,6 +2997,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 continue;
             }
             let child = self.children.remove(&key);
+            self.roots.remove(&key);
             if let Some(pages) = self.committed_tables.remove(&key) {
                 for page in &pages {
                     ledger.give_back(*page, mm);
@@ -2985,6 +3028,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     pub fn retire_exited_root(&mut self, mm: ReservationMm) {
         if let Some(key) = MmKey::of(mm) {
             if self.children.contains_key(&key)
+                || self.roots.contains_key(&key)
                 || self
                     .committed_tables
                     .get(&key)
@@ -2995,6 +3039,20 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 self.quarantine.remove(&key);
             }
         }
+    }
+
+    /// Retire an exact issued root or exec successor. A stale generation may
+    /// not quarantine a later owner that reused the same numeric MM.
+    pub fn retire_exited_execution(
+        &mut self,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+    ) -> Result<(), ForkStockServiceError> {
+        if !self.descriptor_owner_matches(owner, root) {
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        self.retire_exited_root(owner.mm());
+        Ok(())
     }
 }
 

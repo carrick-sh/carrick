@@ -2272,23 +2272,104 @@ fn registered_root_draws_shared_tables_and_retires_once() {
     let mut stock = stock(UntaggedRoots, 24, 1);
     let root = parent();
     // SAFETY: this fixture owns the admitted root incarnation.
-    let owner = unsafe {
-        El1MmHandle::from_admitted_owner(CARRIER, mm(PARENT_MM), NonZeroU64::MIN)
-    };
+    let owner =
+        unsafe { El1MmHandle::from_admitted_owner(CARRIER, mm(PARENT_MM), NonZeroU64::MIN) };
     stock.register_root(owner, root.context.root).unwrap();
+    // SAFETY: a distinct admitted generation is used to check retirement auth.
+    let stale = unsafe {
+        El1MmHandle::from_admitted_owner(CARRIER, mm(PARENT_MM), NonZeroU64::new(2).unwrap())
+    };
+    assert!(matches!(
+        stock.retire_exited_execution(stale, root.context.root),
+        Err(ForkStockServiceError::StaleExecution)
+    ));
     let before = stock.table_stock().len();
     let reservation = stock
-        .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root.context.root, 13)
+        .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root.context.root, 7)
         .unwrap();
-    assert_eq!(stock.table_stock().len(), before - 13);
-    stock.cancel_native_descriptor_tables(&mut NoTableLedger, reservation);
-    assert_eq!(stock.table_stock().len(), before);
+    let second = stock
+        .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root.context.root, 7)
+        .unwrap();
+    assert_eq!(stock.table_stock().len(), before - 14);
+    for (generation, reservation) in [(1, reservation), (2, second)] {
+        let txn = backing_txn(
+            owner,
+            root.context.root,
+            generation,
+            reservation.descriptor_tables(),
+        );
+        stock
+            .track_native_descriptor_tables(&mut NoTableLedger, reservation, txn)
+            .unwrap();
+        stock
+            .settle_native_descriptor_tables(
+                &mut NoTableLedger,
+                owner,
+                root.context.root,
+                &applied_backing_receipt(&txn, 7),
+            )
+            .unwrap();
+    }
+    assert_eq!(stock.table_stock().len(), before - 14);
     stock.retire_exited_root(owner.mm());
     stock.retire_exited_root(owner.mm());
     assert!(stock.register_root(owner, root.context.root).is_err());
-    assert_eq!(stock.reclaim(&mut NoTableLedger, mm(999), absent, |_| true, |_| true, |_| true).unwrap(), 1);
-    assert_eq!(stock.reclaim(&mut NoTableLedger, mm(999), absent, |_| true, |_| true, |_| true).unwrap(), 0);
+    assert_eq!(
+        stock
+            .reclaim(
+                &mut NoTableLedger,
+                mm(999),
+                absent,
+                |_| true,
+                |_| true,
+                |_| true
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(stock.table_stock().len(), before);
+    assert_eq!(
+        stock
+            .reclaim(
+                &mut NoTableLedger,
+                mm(999),
+                absent,
+                |_| true,
+                |_| true,
+                |_| true
+            )
+            .unwrap(),
+        0
+    );
     stock.register_root(owner, root.context.root).unwrap();
+}
+
+#[test]
+fn registered_root_and_child_reserve_disjoint_shared_tables() {
+    let mut stock = stock(UntaggedRoots, 40, 1);
+    let root = parent();
+    // SAFETY: this fixture owns the admitted initial MM.
+    let owner =
+        unsafe { El1MmHandle::from_admitted_owner(CARRIER, mm(PARENT_MM), NonZeroU64::MIN) };
+    stock.register_root(owner, root.context.root).unwrap();
+    let granted = loan(&mut stock, root, 302, 1, 1).unwrap();
+    commit(&mut stock, root, granted, 1, 0).unwrap();
+    let child = child_of(granted, 44);
+    let child_owner = stock.child_owner(granted.request.child_mm).unwrap();
+    let root_tables = stock
+        .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root.context.root, 7)
+        .unwrap();
+    let child_tables = stock
+        .reserve_native_descriptor_tables(&mut NoTableLedger, child_owner, child.context.root, 7)
+        .unwrap();
+    assert!(
+        root_tables
+            .pages()
+            .iter()
+            .all(|page| !child_tables.pages().contains(page))
+    );
+    stock.cancel_native_descriptor_tables(&mut NoTableLedger, root_tables);
+    stock.cancel_native_descriptor_tables(&mut NoTableLedger, child_tables);
 }
 
 #[test]
