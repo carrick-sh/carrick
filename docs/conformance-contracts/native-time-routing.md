@@ -443,3 +443,18 @@ changes from ENOSYS with one refusal to EFAULT with no refusal when the
 output is null. On x86 the raw syscall and vDSO samples are ordered in the
 native root, fork child, and exec successor. The x86 fixture detects ENOSYS
 before comparing the results.
+
+### Raw realtime reads
+
+The native syscall reads the caller's mapped vvar calibration through the
+exact-MM copy path, samples the guest counter once, and retains one timespec
+across copyout waits. The vvar publisher owns the realtime base and guest
+adjustment. CLOCK_REALTIME_COARSE rounds the same sample down to the
+millisecond grid. The x86 vDSO delegates COARSE to the syscall.
+
+The KVM witnesses check raw and vDSO ordering in the root, fork child, and
+exec successor. They verify that subtracting the published offset from raw
+realtime puts it between two raw monotonic samples and that the offset
+survives fork and exec. The ARM VM-free witness checks null-output routing
+with a live parent and child. ARM exec-successor calibration is tracked
+separately by #2571.
