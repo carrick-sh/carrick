@@ -46,6 +46,8 @@ pub struct HostBlockRunner {
     publication: carrick_host_jit::PublicationWork,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     retain_blocks: bool,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    retain_stage1: bool,
     /// The engine frame region: the frame is its last element, so everything
     /// below it is headroom for host signal frames.
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -67,6 +69,8 @@ impl HostBlockRunner {
             publication: carrick_host_jit::PublicationWork::default(),
             retain_blocks: std::env::var_os("CARRICK_SOFT_AARCH64_CACHE").as_deref()
                 != Some(std::ffi::OsStr::new("0")),
+            retain_stage1: std::env::var_os("CARRICK_SOFT_AARCH64_TLB").as_deref()
+                != Some(std::ffi::OsStr::new("0")),
             region: vec![BlockFrame::default(); frames].into_boxed_slice(),
         })
     }
@@ -84,6 +88,11 @@ impl ExecuteBlock for HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     fn retain_blocks(&self) -> bool {
         self.retain_blocks
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn retain_stage1(&self) -> bool {
+        self.retain_stage1
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
