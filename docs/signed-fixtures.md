@@ -358,14 +358,19 @@ publisher never replaces an existing artifact with different bytes.
 Every push to main publishes `signed-fixtures-<sha>` from
 `kernel-runtime.yml`'s `signed-fixtures` job. For any other commit in this
 repository, such as the head of a PR that changes fixture inputs, the owner
-dispatches that job alone (#1207):
+dispatches that job alone (#1207), from a branch rather than main:
 
 ```sh
-gh workflow run kernel-runtime.yml -R carrick-sh/carrick --ref main -f fixtures_sha=<40-hex sha>
+gh workflow run kernel-runtime.yml -R carrick-sh/carrick --ref <branch> -f fixtures_sha=<40-hex sha>
 ```
 
 Only `signed-fixtures` runs, at that commit, on the hosted ARM Linux
 publisher. Every test lane, receipt, gate and the R2 relay upload is skipped.
+The mode refuses `--ref main`. The signed gate trusts a main run of this
+workflow as main's own fixture publisher (`trusted_fixture_run`), and this
+mode runs the target commit's code, so it must never produce such a run. Any
+branch carrying this workflow works, for example the PR's own branch once it
+is rebased on main.
 The run's `signed-fixtures-<sha>` artifact is what the m4 signed job's
 `--fixtures-run <run id>` consumes. It is independent fixture evidence for the
 owner exception in [the Signed gate doc](ci/signed-gate.md), not a gate pass.
