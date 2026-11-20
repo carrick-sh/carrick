@@ -433,3 +433,13 @@ the root, its fork child and a native exec successor. A separate child
 witness forms a future absolute deadline from a raw sample and checks that
 clock_nanosleep returns at or after it. ARM keeps its existing deadline
 conversion and its native-child timeout witness.
+
+### Raw monotonic reads
+
+`CLOCK_MONOTONIC_RAW` uses the qualified guest counter and retained timespec
+copyout in the same route as `CLOCK_MONOTONIC`. This follows the clock
+source already used by both vDSOs. The ARM fork-child dispatch witness
+changes from ENOSYS with one refusal to EFAULT with no refusal when the
+output is null. On x86 the raw syscall and vDSO samples are ordered in the
+native root, fork child, and exec successor. The x86 fixture detects ENOSYS
+before comparing the results.
