@@ -43,6 +43,22 @@ impl SoftMemory {
         self.pages.insert(frame, Box::new([0; PAGE_BYTES]));
         Ok(())
     }
+
+    /// Retire one page before releasing its backing. The host launcher owns
+    /// this inventory exclusively and does not register any soft vCPU seats.
+    /// Reinstalling the physical page gets a fresh code incarnation.
+    pub fn unmap_frame(&mut self, frame: FrameGpa) -> Result<(), MemoryFault> {
+        let fault = MemoryFault {
+            address: VirtualAddress(frame.raw()),
+        };
+        if let Some(retirement) = self.extents.remove(frame, None).map_err(|_| fault)? {
+            // There are no seated CPUs, so the domain can complete now.
+            let completion = retirement.pending.try_complete().map_err(|_| fault)?;
+            self.extents.reclaim(&completion);
+            self.pages.remove(&frame);
+        }
+        Ok(())
+    }
 }
 
 fn frame_at(address: u64) -> FrameGpa {
@@ -55,6 +71,9 @@ impl GuestMemory for SoftMemory {
     }
 
     fn read(&mut self, address: VirtualAddress, mut bytes: &mut [u8]) -> Result<(), MemoryFault> {
+        if self.extents.is_terminal() {
+            return Err(MemoryFault { address });
+        }
         let end = address
             .0
             .checked_add(bytes.len() as u64)
@@ -117,6 +136,9 @@ impl GuestMemory for SoftMemory {
     }
 
     fn inline_ram(&mut self, read: Option<FrameGpa>, write: Option<FrameGpa>) -> InlineRam<'_> {
+        if self.extents.is_terminal() {
+            return InlineRam::None;
+        }
         let read = read.filter(|frame| self.pages.contains_key(frame));
         let write = write.filter(|frame| {
             self.pages.contains_key(frame)
@@ -155,6 +177,17 @@ impl GuestMemory for SoftMemory {
                 }
             }
         }
+    }
+
+    fn invalidate_code_frame(&mut self, frame: FrameGpa) -> Result<bool, MemoryFault> {
+        if self.pages.contains_key(&frame) {
+            self.extents
+                .invalidate_host_written_page(frame, OWNER)
+                .map_err(|_| MemoryFault {
+                    address: VirtualAddress(frame.raw()),
+                })?;
+        }
+        Ok(true)
     }
 
     fn mark_code_page(&mut self, frame: FrameGpa) -> Option<CodeGeneration> {
