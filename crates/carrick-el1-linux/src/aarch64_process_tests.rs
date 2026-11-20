@@ -18834,7 +18834,7 @@ fn arm_fork_child_uses_host_file_xattrs() {
 /// Host-backed implicit stdio accepts only the native file ioctl subset.
 #[test]
 fn arm_fork_child_uses_allowlisted_host_ioctls() {
-    use carrick_abi::{LINUX_ENOTTY, LINUX_FIONBIO, LINUX_O_NONBLOCK, LINUX_TCGETS};
+    use carrick_abi::{LINUX_ENOSYS, LINUX_ENOTTY, LINUX_FIONBIO, LINUX_O_NONBLOCK, LINUX_TCGETS};
     use carrick_personality_linux::crossing::nr as sys;
     use carrick_test_support::GuestUserBuffer;
 
@@ -18861,7 +18861,7 @@ fn arm_fork_child_uses_allowlisted_host_ioctls() {
                     1,
                     0xdead,
                     0,
-                    LINUX_ENOTTY.guest_retval(),
+                    LINUX_ENOSYS.guest_retval(),
                 ),
             ] {
                 let (_, result) = call(child, sys::IOCTL.raw(), [fd, request, arg, 0, 0, 0]);

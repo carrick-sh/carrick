@@ -126,7 +126,11 @@ child:
     mov $16, %eax
     syscall
     mov $107, %edi
+#ifdef EXPECT_COUNTED_IOCTL_REFUSAL
+    cmp $-38, %rax
+#else
     cmp $-25, %rax
+#endif
     jne exit
 
     mov %r12, %rdi

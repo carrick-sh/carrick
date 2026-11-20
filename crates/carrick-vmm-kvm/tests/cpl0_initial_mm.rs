@@ -4067,6 +4067,16 @@ fn ring_descriptor_run(mode: &str) -> (i32, Vec<(usize, u64)>) {
         carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
             .expect("host filesystem"),
     ));
+    // The native oracle returns ENOTTY for an unknown request on stdout.
+    // Carrick leaves this request unrouted and counts its refusal.
+    let elf = if mode == "-DHOST_IOCTL" {
+        native_exit_fixture_with_flags(
+            "native_ring_descriptors.S",
+            &[mode, &file, &directory, "-DEXPECT_COUNTED_IOCTL_REFUSAL"],
+        )
+    } else {
+        elf
+    };
     let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
     let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
         &program,
@@ -4185,8 +4195,8 @@ fn serial_host_fork_child_uses_host_file_xattrs() {
 fn serial_host_fork_child_uses_allowlisted_host_ioctls() {
     assert_eq!(
         ring_descriptor_run("-DHOST_IOCTL"),
-        (0, vec![]),
-        "105 FIONBIO stdout, 106 F_GETFL, 107 unknown ioctl, 108 TCGETS regular file, \
+        (0, vec![(16, 1)]),
+        "105 FIONBIO stdout, 106 F_GETFL, 107 counted unknown ioctl, 108 TCGETS regular file, \
          109 pipe2, 110 TCGETS pipe"
     );
 }
