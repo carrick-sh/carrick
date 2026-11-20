@@ -656,6 +656,17 @@ pub trait LifecycleNative<'a>: UserCopy {
         work: bool,
     ) -> LifecycleOutcome;
 
+    fn finish_time_output(
+        &mut self,
+        _records: [Option<(UserVa, alloc::vec::Vec<u8>)>; 2],
+        _result: SyscallResult,
+    ) -> LifecycleOutcome {
+        LifecycleOutcome::Returned {
+            result: SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+            work: false,
+        }
+    }
+
     /// Terminal custody loss must never become a guest errno or leave exit parked.
     fn fail_lifecycle(&mut self, reason: NativeRunFailureReason) -> !;
     fn prepare_thread_birth(&mut self) -> ThreadBirthAdmission {
