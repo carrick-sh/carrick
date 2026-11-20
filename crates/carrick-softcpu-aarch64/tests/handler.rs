@@ -639,7 +639,7 @@ fn exclusive_ordered_and_lse_accesses_fault_with_alignment_check_disabled() {
     // LSE is withheld at EL0. The EL1 carrier LDADD still checks alignment.
     let mut rig = Rig::el1();
     rig.set(1, 0x10001);
-    assert_eq!(rig.run(0xf822_0020), Outcome::Continue);
+    assert_eq!(rig.run(0xf822_0020), Outcome::Fault);
     assert_eq!(rig.cpu.el1.esr, Syndrome(0x9600_0021));
     assert_eq!(rig.cpu.el1.far, VirtualAddress(0x10001));
 }
@@ -884,7 +884,7 @@ fn el0_ldadd_raises_undefined_before_accessing_memory() {
     rig.memory.put(0x10000, 40);
     rig.set(0, 0x10000);
     rig.set(1, 2);
-    assert_eq!(rig.run(0xf821_0002), Outcome::Continue);
+    assert_eq!(rig.run(0xf821_0002), Outcome::Fault);
     assert_eq!(rig.cpu.el1.esr, Syndrome(0x0200_0000));
     assert_eq!(rig.cpu.el1.elr, ProgramCounter(PC));
     assert_eq!(rig.memory.get(0x10000), 40);
@@ -900,7 +900,7 @@ fn el0_physical_counter_obeys_cntkctl_and_uses_the_virtual_clock() {
     assert_eq!(rig.get(5), 0x2345_6789_abcd_ef00);
 
     rig.cpu.el1.cntkctl = SystemValue(2); // EL0VCTEN does not enable CNTPCT.
-    assert_eq!(rig.run(0xd53b_e025), Outcome::Continue);
+    assert_eq!(rig.run(0xd53b_e025), Outcome::Fault);
     assert_eq!(rig.pc(), VBAR + 0x400);
     assert_eq!(rig.cpu.el1.esr, Syndrome(0x6232_f8a1));
 }

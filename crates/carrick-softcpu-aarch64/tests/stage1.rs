@@ -610,7 +610,7 @@ fn el0_structure_crossing_a_second_page_fault_preserves_state() {
         r.cpu.vectors[0] = u128::MAX;
         r.cpu.vectors[1] = 0x1234;
         let vectors = r.cpu.vectors;
-        assert_eq!(r.run(word), Outcome::Continue);
+        assert_eq!(r.run(word), Outcome::Fault);
         r.assert_abort(0x400, esr, HOLE);
         assert_eq!(r.get(0), address);
         assert_eq!(r.cpu.vectors, vectors);
