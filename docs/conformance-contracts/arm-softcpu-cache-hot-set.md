@@ -25,3 +25,18 @@ runner's frame and writes back from that same frame.
 
 Set `CARRICK_SOFT_AARCH64_CACHE=0` to disable residency in the Linux ARM64
 runner. Code still passes through the same preparation and execution steps.
+
+An `IC IVAU` data translation names the physical frame. The launcher-owned
+memory advances that frame's code generation through the extent inventory, so
+resident aliases miss their generation check and unrelated frames stay
+resident. The two-frame fixture goes from ten to nine emissions and checks
+both generations. Whole-cache instructions retain their full flush.
+
+The launcher also exercises physical retirement and exec loader writes.
+Removing a page completes the extent retirement before releasing its backing.
+A later mapping of the same physical address receives a new code generation
+when it is first translated. Rewriting executable bytes through the loader
+advances that generation again. The synthetic lifecycle fixture observes the
+unmapped fetch failure and verifies that subsequent HVCs match the replacement
+images. The dispatcher cache is scoped to a single run, and the witness works
+at the launcher boundary without an ARM soft VMM lifecycle registration.

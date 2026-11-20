@@ -110,6 +110,10 @@ impl GuestMemory for Pages {
         self.memory.inline_ram(read, write)
     }
 
+    fn invalidate_code_frame(&mut self, frame: FrameGpa) -> Result<bool, MemoryFault> {
+        self.memory.invalidate_code_frame(frame)
+    }
+
     fn mark_code_page(&mut self, frame: FrameGpa) -> Option<CodeGeneration> {
         self.memory.mark_code_page(frame)
     }
@@ -475,6 +479,57 @@ fn ic_ivau_recompiles_only_the_target_code_frame() {
         memory.code_generation(FrameGpa::new(PEER)),
         Some(CodeGeneration(1))
     );
+}
+
+#[test]
+fn remap_and_exec_loader_write_advance_code_incarnations() {
+    const PC: u64 = 0x4000;
+    let frame = FrameGpa::new(PC);
+    let mut memory = SoftMemory::new().expect("physical inventory");
+    memory.map_zero(frame).unwrap();
+    let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
+    let mut run_at_entry = |memory: &mut SoftMemory| {
+        let mut cpu = CpuState::default();
+        cpu.pstate.el = ExceptionLevel::El1;
+        cpu.pstate.sp = StackSelect::El1;
+        cpu.pc = ProgramCounter(PC);
+        run(
+            &mut cpu,
+            &mut ExclusiveMonitor::default(),
+            memory,
+            &mut runner,
+            BlockLimits::default(),
+            2,
+        )
+    };
+    for generation in 1..=3 {
+        let word = 0xd400_0002_u32 | (generation as u32) << 5;
+        memory
+            .write(VirtualAddress(PC), &word.to_le_bytes())
+            .unwrap();
+        let report = run_at_entry(&mut memory);
+        let Stop::Event {
+            event: Event::ProviderExit(hvc),
+            ..
+        } = report.stop
+        else {
+            panic!("{report}");
+        };
+        assert_eq!(u64::from(hvc.immediate.value()), generation);
+        assert_eq!(
+            memory.code_generation(frame),
+            Some(CodeGeneration(generation))
+        );
+        if generation == 1 {
+            memory.unmap_frame(frame).unwrap();
+            assert_eq!(memory.code_generation(frame), None);
+            assert_eq!(
+                run_at_entry(&mut memory).stop,
+                Stop::Fetch(VirtualAddress(PC))
+            );
+            memory.map_zero(frame).unwrap();
+        }
+    }
 }
 
 #[test]
