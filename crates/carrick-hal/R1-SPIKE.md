@@ -278,4 +278,25 @@ The probe maps fixture pages RWX, uses one stopped CPU, refuses aliases,
 and supports exact unmap. It does not claim conformance, timing, or
 equivalent HVF machine behavior.
 
+## Verification scope
+
+The static fixture and EL1 image used GNU cross-link tools. The boot probe
+was built with `cargo test --target aarch64-unknown-linux-gnu -p
+carrick-softcpu-aarch64-host --test boot_probe --no-run`, with
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc`
+and `CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_LINKER=aarch64-linux-gnu-ld`.
+It was launched with Debian's `qemu-aarch64 -L /usr/aarch64-linux-gnu`.
+For the existing fixture builder's `rustc` invocation, a VM-local wrapper
+installed the already GNU-linked static musl ELF at the requested `-o`
+path. The GDB breakpoint used the x86 VM's `gdb-multiarch` and the
+runner's user-mode GDB socket. These runs establish execution and transport
+shape. They provide no native performance measurements.
+
+The opt-in HAL arm passed the macOS ARM cross-check with
+`cargo check --locked --target aarch64-apple-darwin -p carrick-hal --features machine-spike`.
+The contract change checker rejects the scratch `hypervisor/machine.rs`
+as an unclassified source path. The spike fence excludes changes to the
+production contract registry. A landing patch must classify its carrier
+surface and bind the appropriate Linux and signed HVF witnesses.
+
 ISA witnesses: arm=crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs::facade_remap_changes_execute_permission_before_dispatch; x86=n/a (AArch64 HVC immediate normalization and physical instruction fetch in crates/carrick-hal/src/hypervisor/machine.rs and crates/carrick-softcpu-aarch64/src/dispatch.rs)
