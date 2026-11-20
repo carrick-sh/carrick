@@ -786,4 +786,21 @@ mod anonymous_refusal_tests {
         assert!(anonymous_call(call, u32::MAX, pc).is_none());
         assert_eq!(anonymous_call(call, 7, pc).unwrap().slot().index(), 7);
     }
+
+    #[test]
+    fn syscall_copy_contention_parks_instead_of_becoming_efault() {
+        let source = include_str!("linux_personality.rs");
+        assert!(
+            source.matches("anonymous::park_contended_fault(").count() >= 3,
+            "#PF, exec staging, and host-file staging must share the MM-release park"
+        );
+        assert!(
+            !source.contains("Some(stage.refused())\n                            }\n                            UserFaultSupply::Signal"),
+            "host-file staging must not classify contention as a refused user copy"
+        );
+        assert!(
+            !source.contains("frame.rax = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;\n                    CompletionRoute::Served\n                }\n                UserFaultSupply::Signal"),
+            "exec staging must not classify contention as EFAULT"
+        );
+    }
 }
