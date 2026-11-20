@@ -16,14 +16,11 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
     if native == 56 {
         args.swap(3, 4);
     }
-    let legacy_attr = carrick_syscall_abi::syscall_x86_64::normalize_legacy_attr(native, args);
-    let canonical = if let Some((canonical, normalized)) = legacy_attr {
-        // Legacy chmod/chown/lchown are fchmodat/fchownat of AT_FDCWD.
-        args = normalized;
-        canonical.raw()
-    } else if native == 21 {
-        // Legacy access has no asm-generic ordinal or matching argument shape.
-        let (canonical, normalized) = carrick_syscall_abi::syscall_x86_64::normalize_access(args);
+    let legacy = carrick_syscall_abi::syscall_x86_64::normalize_legacy(
+        carrick_syscall_abi::NativeNr(native),
+        args,
+    );
+    let canonical = if let Some((canonical, normalized)) = legacy {
         args = normalized;
         canonical.raw()
     } else if native == 33 {

@@ -850,9 +850,6 @@ const X86_NR_ALARM: u64 = 37;
 /// x86-64 `time(2)` (syscalls(2)). Desugars to a private dispatcher shim
 /// because asm-generic has no canonical `time(time_t *)` syscall.
 const X86_NR_TIME: u64 = 201;
-/// x86-64 `access(2)` (syscalls(2)). Desugars to canonical `faccessat(2)` with
-/// `AT_FDCWD` and flags=0 because asm-generic only exposes `faccessat`.
-const X86_NR_ACCESS: u64 = 21;
 /// x86-64 `stat(2)` (syscalls(2)). It follows paths like
 /// `newfstatat(AT_FDCWD, path, flags=0)` but writes x86_64's legacy stat
 /// layout, so it normalizes to a private dispatcher shim.
@@ -875,16 +872,6 @@ const X86_NR_PIPE: u64 = 22;
 const X86_NR_PIPE2: u64 = 293;
 /// Canonical (asm-generic / aarch64) `pipe2` number.
 const CANONICAL_PIPE2: u64 = 59;
-/// x86-64 `readlink(2)` (syscalls(2)). Desugars to canonical `readlinkat(2)`
-/// with `AT_FDCWD` because asm-generic only exposes `readlinkat`.
-const X86_NR_READLINK: u64 = 89;
-/// Canonical (asm-generic / aarch64) `readlinkat` number.
-const CANONICAL_READLINKAT: u64 = 78;
-/// x86-64 `mkdir(2)` (syscalls(2)). Desugars to canonical `mkdirat(2)` with
-/// `AT_FDCWD` because asm-generic only exposes `mkdirat`.
-const X86_NR_MKDIR: u64 = 83;
-/// Canonical (asm-generic / aarch64) `mkdirat` number.
-const CANONICAL_MKDIRAT: u64 = 34;
 /// Canonical (asm-generic / aarch64) `ppoll` number — the target for x86 `pause`
 /// (ppoll(NULL, 0, NULL) = block until a signal).
 const CANONICAL_PPOLL: u64 = 73;
@@ -982,46 +969,11 @@ fn translate_x86_open_flags(flags: u64) -> u64 {
     }
     out
 }
-/// x86-64 `unlink(2)` (syscalls(2)). Desugars to `unlinkat(AT_FDCWD, path, 0)`.
-const X86_NR_UNLINK: u64 = 87;
-/// x86-64 `rmdir(2)` (syscalls(2)). Desugars to
-/// `unlinkat(AT_FDCWD, path, AT_REMOVEDIR)` — same canonical as unlink.
-const X86_NR_RMDIR: u64 = 84;
-/// Canonical (asm-generic / aarch64) `unlinkat` number (shared by unlink+rmdir).
-const CANONICAL_UNLINKAT: u64 = 35;
-/// x86-64 `rename(2)` (syscalls(2)). Desugars to
-/// `renameat(AT_FDCWD, old, AT_FDCWD, new)` — TWO dirfds.
-const X86_NR_RENAME: u64 = 82;
-/// Canonical (asm-generic / aarch64) `renameat` number.
-const CANONICAL_RENAMEAT: u64 = 38;
-/// x86-64 `link(2)` (syscalls(2)). Desugars to
-/// `linkat(AT_FDCWD, old, AT_FDCWD, new, 0)` — TWO dirfds, flags=0.
-const X86_NR_LINK: u64 = 86;
-/// Canonical (asm-generic / aarch64) `linkat` number.
-const CANONICAL_LINKAT: u64 = 37;
-/// x86-64 `symlink(2)` (syscalls(2)). Desugars to
-/// `symlinkat(target, AT_FDCWD, linkpath)` — dirfd is the SECOND arg.
-const X86_NR_SYMLINK: u64 = 88;
-/// Canonical (asm-generic / aarch64) `symlinkat` number.
-const CANONICAL_SYMLINKAT: u64 = 36;
 /// x86-64 `mknod(2)` (syscalls(2)). Desugars to
 /// `mknodat(AT_FDCWD, path, mode, dev)` — NO flags arg.
 const X86_NR_MKNOD: u64 = 133;
 /// Canonical (asm-generic / aarch64) `mknodat` number.
 const CANONICAL_MKNODAT: u64 = 33;
-/// x86-64 `chmod(2)` (syscalls(2)). Desugars to
-/// `fchmodat(AT_FDCWD, path, mode, 0)` (chmod always follows symlinks).
-const X86_NR_CHMOD: u64 = 90;
-/// Canonical (asm-generic / aarch64) `fchmodat` number.
-const CANONICAL_FCHMODAT: u64 = 53;
-/// x86-64 `chown(2)` (syscalls(2)). Desugars to
-/// `fchownat(AT_FDCWD, path, owner, group, 0)`.
-const X86_NR_CHOWN: u64 = 92;
-/// x86-64 `lchown(2)` (syscalls(2)). Desugars to
-/// `fchownat(AT_FDCWD, path, owner, group, AT_SYMLINK_NOFOLLOW)`.
-const X86_NR_LCHOWN: u64 = 94;
-/// Canonical (asm-generic / aarch64) `fchownat` number (shared by chown+lchown).
-const CANONICAL_FCHOWNAT: u64 = 54;
 /// `SIGCHLD` exit-signal (signal(7)); the low byte of the clone flags word.
 const LINUX_SIGCHLD: u64 = 17;
 /// `CLONE_VM` (clone(2)).
@@ -1218,18 +1170,8 @@ impl X8664GuestArch {
             });
         }
         if let Some((number, args)) =
-            carrick_abi::syscall_x86_64::normalize_legacy_attr(x86_number, args)
+            carrick_abi::syscall_x86_64::normalize_legacy(NativeNr(x86_number), args)
         {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number,
-                args,
-            });
-        }
-        if x86_number == X86_NR_ACCESS {
-            let (number, args) = carrick_abi::syscall_x86_64::normalize_access(args);
             return SyscallNorm::Plain(RawSyscall {
                 current_guest_sp: None,
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
@@ -1303,24 +1245,6 @@ impl X8664GuestArch {
                 args: [args[0], flags, 0, 0, 0, 0],
             });
         }
-        if x86_number == X86_NR_READLINK {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_READLINKAT),
-                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
-            });
-        }
-        if x86_number == X86_NR_MKDIR {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_MKDIRAT),
-                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
-            });
-        }
         // ── Legacy x86_64-only fs syscalls → their asm-generic *at canonicals.
         // These run BEFORE the table-remap fallthrough so their (different)
         // x86_64 numbers never reach the table (where some collide with unrelated
@@ -1382,77 +1306,6 @@ impl X8664GuestArch {
                 ],
             });
         }
-        // unlink/rmdir → unlinkat(35), distinguished only by the flags slot.
-        if x86_number == X86_NR_UNLINK {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_UNLINKAT),
-                args: [carrick_abi::LINUX_AT_FDCWD, args[0], 0, 0, 0, 0],
-            });
-        }
-        if x86_number == X86_NR_RMDIR {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_UNLINKAT),
-                args: [
-                    carrick_abi::LINUX_AT_FDCWD,
-                    args[0],
-                    carrick_abi::LINUX_AT_REMOVEDIR,
-                    0,
-                    0,
-                    0,
-                ],
-            });
-        }
-        // rename/link → two-dirfd *at variants (AT_FDCWD in BOTH dirfd slots).
-        if x86_number == X86_NR_RENAME {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_RENAMEAT),
-                args: [
-                    carrick_abi::LINUX_AT_FDCWD,
-                    args[0],
-                    carrick_abi::LINUX_AT_FDCWD,
-                    args[1],
-                    0,
-                    0,
-                ],
-            });
-        }
-        if x86_number == X86_NR_LINK {
-            // flags=0 mirrors link(2) (no AT_SYMLINK_FOLLOW).
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_LINKAT),
-                args: [
-                    carrick_abi::LINUX_AT_FDCWD,
-                    args[0],
-                    carrick_abi::LINUX_AT_FDCWD,
-                    args[1],
-                    0,
-                    0,
-                ],
-            });
-        }
-        // symlink → symlinkat(36): dirfd is the SECOND arg, NOT prepended.
-        if x86_number == X86_NR_SYMLINK {
-            // symlink(target, linkpath) → symlinkat(target, AT_FDCWD, linkpath).
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_SYMLINKAT),
-                args: [args[0], carrick_abi::LINUX_AT_FDCWD, args[1], 0, 0, 0],
-            });
-        }
         // mknod → mknodat(33): NO flags arg (4 args).
         if x86_number == X86_NR_MKNOD {
             return SyscallNorm::Plain(RawSyscall {
@@ -1461,43 +1314,6 @@ impl X8664GuestArch {
                 native_number: NativeNr(x86_number),
                 number: CanonicalNr(CANONICAL_MKNODAT),
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
-            });
-        }
-        // chmod → fchmodat(53), flags=0 (chmod always follows symlinks).
-        if x86_number == X86_NR_CHMOD {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_FCHMODAT),
-                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
-            });
-        }
-        // chown/lchown → fchownat(54), distinguished only by the flags slot.
-        if x86_number == X86_NR_CHOWN {
-            // flags=0: chown FOLLOWS symlinks. owner/group -1 sentinel passes through.
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_FCHOWNAT),
-                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
-            });
-        }
-        if x86_number == X86_NR_LCHOWN {
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_FCHOWNAT),
-                args: [
-                    carrick_abi::LINUX_AT_FDCWD,
-                    args[0],
-                    args[1],
-                    args[2],
-                    carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW,
-                    0,
-                ],
             });
         }
         // NOTE: x86_64 utime(132)/utimes(235) also need normalization (to

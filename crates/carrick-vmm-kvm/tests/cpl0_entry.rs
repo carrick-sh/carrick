@@ -4303,7 +4303,7 @@ fn production_fork_waits_while_sibling_fork_holds_birth_reservation() {
     );
 }
 
-fn legacy_syscalls_run(flags: &[&str], expected: &[u8]) {
+fn legacy_syscalls_run(flags: &[&str], expected: &[u8], expected_refusals: &[(usize, u64)]) {
     let work = tempfile::tempdir().expect("legacy syscall test directory");
     std::fs::write(work.path().join("file"), b"file").expect("regular file");
     std::os::unix::fs::symlink("file", work.path().join("sym")).expect("symlink");
@@ -4339,8 +4339,8 @@ fn legacy_syscalls_run(flags: &[&str], expected: &[u8]) {
             outcome.run.stdout.as_slice(),
             refused.as_slice()
         ),
-        (0, expected, &[][..]),
-        "(exit, Docker Linux syscall results, counted refusals)"
+        (0, expected, expected_refusals),
+        "(exit, syscall results, counted refusals)"
     );
     assert_eq!(
         std::fs::read_link(work.path().join("new-sym")).unwrap(),
@@ -4353,10 +4353,15 @@ fn legacy_syscalls_run(flags: &[&str], expected: &[u8]) {
 
 #[test]
 fn serial_host_root_legacy_namespace_syscalls_match_linux() {
-    legacy_syscalls_run(&[], &[0, 0, 0, 0, 0, 0, 4]);
+    legacy_syscalls_run(&[], &[0, 0, 0, 0, 0, 0, 4], &[]);
 }
 
 #[test]
-fn serial_host_fork_child_legacy_namespace_syscalls_match_linux() {
-    legacy_syscalls_run(&["-DCHILD"], &[0, 0, 0, 0, 0, 0, 4]);
+fn serial_host_fork_child_legacy_namespace_syscalls_use_canonical_owners() {
+    // Both spellings of readlink hit the existing counted child refusal.
+    legacy_syscalls_run(
+        &["-DCHILD"],
+        &[0, 0, 0, 0, 0, 0, 38, 38],
+        &[(89, 1), (267, 1)],
+    );
 }

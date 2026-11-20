@@ -73,12 +73,11 @@ pub(crate) fn classify_initial_x86_forward(
     args: [u64; 6],
 ) -> InitialForwardClass {
     use InitialForwardClass::{Host, Refuse};
-    use carrick_syscall_abi::syscall_x86_64::{canonical_x86_64, normalize_legacy_attr};
-    // Legacy chmod/chown/lchown cross as the fchmodat/fchownat they
-    // normalize to, as the ring classified them.
-    let canonical = normalize_legacy_attr(native.0, args)
+    use carrick_syscall_abi::syscall_x86_64::{canonical_x86_64, normalize_legacy};
+    // Apply crossing policy to the same canonical operation seen by the ring.
+    let canonical = normalize_legacy(native, args)
         .map(|(canonical, _)| canonical)
-        .or_else(|| canonical_x86_64(carrick_syscall_abi::NativeNr(native.0)));
+        .or_else(|| canonical_x86_64(native));
     if !canonical
         .is_some_and(|nr| carrick_personality_linux::crossing::HostCrossingSet::X86.is_allowed(nr))
     {
@@ -110,8 +109,8 @@ mod initial_x86_forward_tests {
         );
         assert_eq!(classify(62, 0), InitialForwardClass::Refuse("unclassified"));
         assert_eq!(classify(57, 0), InitialForwardClass::Refuse("unclassified"));
-        // Legacy chmod, chown and lchown are the fchmodat/fchownat crossings.
-        for legacy in [90, 92, 94] {
+        // Legacy paths use the crossing policy of their canonical owners.
+        for legacy in [21, 82, 83, 84, 86, 87, 88, 89, 90, 92, 94] {
             assert_eq!(
                 classify(legacy, 0),
                 InitialForwardClass::Host("host_crossing")
