@@ -2,6 +2,7 @@
  * Read AT_SYSINFO_EHDR from the initial stack and resolve __vdso_clock_gettime
  * by name. The root and native fork child each bracket a vDSO monotonic
  * sample and a MONOTONIC_RAW sample between raw syscall samples.
+ * Realtime mode also compares the calibration across fork and exec.
  * Exit values: 8 success, 38 ENOSYS, 91 malformed clock, 218 missing auxv.
  */
 .global _start
@@ -22,6 +23,31 @@ aux:
     add $16, %rax
     jmp aux
 found:
+#ifdef CLOCK_REALTIME_WITNESS
+    /* Hold REALTIME - MONOTONIC constant across the fork. */
+    movabs $0x2e00000010, %rdx
+    mov (%rdx), %r13
+    sub 16(%rdx), %r13
+#ifdef EXEC_SUCCESSOR
+    /* The fork child passed the inherited offset as sixteen nonzero nibbles. */
+    mov 16(%rsp), %rdx
+    push %rax
+    xor %r8d, %r8d
+    xor %ecx, %ecx
+read_offset:
+    movzbl (%rdx), %eax
+    dec %eax
+    shl %cl, %rax
+    or %rax, %r8
+    add $4, %ecx
+    inc %rdx
+    cmp $64, %ecx
+    jne read_offset
+    pop %rax
+    cmp %r13, %r8
+    jne failure
+#endif
+#endif
     mov 8(%rax), %r15
     cmp $0, %r15
     je missing
@@ -63,6 +89,27 @@ found:
     jmp exit
 child:
     call compare_samples
+#ifdef SUCCESSOR_PATH
+    lea encoded_offset(%rip), %rdx
+    mov %r13, %rax
+    mov $16, %ecx
+write_offset:
+    mov %al, %r8b
+    and $15, %r8b
+    inc %r8b
+    mov %r8b, (%rdx)
+    inc %rdx
+    shr $4, %rax
+    loop write_offset
+    lea successor(%rip), %rdi
+    lea successor_argv(%rip), %rsi
+    xor %edx, %edx
+    mov $59, %eax
+    syscall
+    neg %eax
+    mov %eax, %edi
+    jmp exit
+#endif
     mov $8, %edi
     jmp exit
 missing:
@@ -127,6 +174,13 @@ compare_samples:
     call compare_counter
     mov $4, %edi
     call compare_counter
+#ifdef CLOCK_REALTIME_WITNESS
+    xor %edi, %edi
+    call compare_counter
+    mov $5, %edi
+    call compare_counter
+    call compare_realtime_offset
+#endif
     jmp compare_realtime_and_resolution
 
 compare_counter:
@@ -190,6 +244,72 @@ compare_realtime_and_resolution:
     jne failure
     add $56, %rsp
     ret
+#ifdef CLOCK_REALTIME_WITNESS
+compare_realtime_offset:
+    movabs $0x2e00000010, %rdx
+    mov (%rdx), %rax
+    sub 16(%rdx), %rax
+    cmp %r13, %rax
+    jne failure
+    /* With the common calibration, subtracting the exact offset from a
+     * raw realtime result puts it between the surrounding raw mono samples. */
+    sub $56, %rsp
+    mov $1, %edi
+    mov %rsp, %rsi
+    call raw_counter
+    xor %edi, %edi
+    lea 16(%rsp), %rsi
+    call raw_counter
+    mov $1, %edi
+    lea 32(%rsp), %rsi
+    call raw_counter
+    imulq $1000000000, 16(%rsp), %rax
+    add 24(%rsp), %rax
+    sub %r13, %rax
+    imulq $1000000000, (%rsp), %rdx
+    add 8(%rsp), %rdx
+    cmp %rdx, %rax
+    jb failure
+    imulq $1000000000, 32(%rsp), %rdx
+    add 40(%rsp), %rdx
+    cmp %rdx, %rax
+    ja failure
+    /* The COARSE result lies between the surrounding realtime samples
+     * after their nanosecond fields are rounded down to milliseconds. */
+    xor %edi, %edi
+    mov %rsp, %rsi
+    call raw_counter
+    mov $5, %edi
+    lea 16(%rsp), %rsi
+    call raw_counter
+    xor %edi, %edi
+    lea 32(%rsp), %rsi
+    call raw_counter
+    mov $1000000, %ecx
+    mov 24(%rsp), %rax
+    xor %edx, %edx
+    div %rcx
+    test %rdx, %rdx
+    jne failure
+    imulq $1000, 16(%rsp), %r8
+    add %rax, %r8
+    mov 8(%rsp), %rax
+    xor %edx, %edx
+    div %rcx
+    imulq $1000, (%rsp), %r9
+    add %rax, %r9
+    cmp %r9, %r8
+    jb failure
+    mov 40(%rsp), %rax
+    xor %edx, %edx
+    div %rcx
+    imulq $1000, 32(%rsp), %r9
+    add %rax, %r9
+    cmp %r9, %r8
+    ja failure
+    add $56, %rsp
+    ret
+#endif
 raw_counter:
     mov $228, %eax
     syscall
@@ -203,4 +323,11 @@ gettime_symbol:
     .asciz "__vdso_clock_gettime"
 getres_symbol:
     .asciz "__vdso_clock_getres"
+#ifdef SUCCESSOR_PATH
+successor: .asciz SUCCESSOR_PATH
+.balign 8
+successor_argv: .quad successor, encoded_offset, 0
+.section .bss
+encoded_offset: .space 17
+#endif
 .section .note.GNU-stack,"",@progbits
