@@ -2369,12 +2369,15 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
-        self.cpu.with_stopped_io(task, |io| {
+        self.cpu.with_forward_io(task, |io, active_binding| {
             let lease = StoppedCpuLease {
                 cpu: token.slot,
                 io,
             };
             let mut venue = ForwardVenue::new(&mut custody, lease)?;
+            venue
+                .execution
+                .authenticate(active_binding, "retained forward MM binding changed")?;
             if venue.execution.binding != token.execution.binding
                 || venue.execution.context != token.execution.context
             {
