@@ -34,6 +34,18 @@ on:
         description: "Scoreboard only (required with a branch): the exact 40-hex head SHA you reviewed"
         type: string
         default: ''
+      # Fixtures-only mode (#2356): an owner dispatch naming any commit in
+      # this repository runs only `signed-fixtures`, at that commit, and
+      # uploads `signed-fixtures-<sha>`, exactly as a push to main does. It
+      # lets a PR whose fixture inputs differ from main's get a CI-published
+      # bundle for its head (the m4 signed job's `--fixtures-run <run id>`).
+      # Every other job is skipped, including all self-hosted lanes, and the
+      # R2 relay upload is skipped. The job runs on a hosted runner, so a
+      # `--ref <branch>` dispatch works for this mode.
+      fixtures_sha:
+        description: "Fixtures only: the exact 40-hex commit SHA to publish signed-fixtures-<sha> for (empty = normal dispatch)"
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -59,7 +71,7 @@ jobs:
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && inputs.scoreboard_branch != '' &&
           github.repository == 'carrick-sh/carrick' && github.ref == 'refs/heads/main' &&
-          github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' }}
+          github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.fixtures_sha == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -108,15 +120,49 @@ jobs:
     if: >-
       ${{ !cancelled() &&
           vars.CARRICK_SELF_HOSTED == 'true' &&
-          (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) }}
+          (github.event_name != 'workflow_dispatch' ||
+           (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '' && inputs.fixtures_sha == '') ||
+           (github.repository == 'carrick-sh/carrick' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '' && inputs.fixtures_sha != '')) }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
+    permissions:
+      contents: read
     outputs:
       bundle-name: ${{ steps.bundle.outputs.name }}
       bundle-sha256: ${{ steps.bundle.outputs.sha256 }}
       bundle-parts: ${{ steps.bundle.outputs.parts }}
     steps:
+      # The commit the bundle is for: the pushed/dispatched commit, or the
+      # validated `fixtures_sha` in fixtures-only mode. The input reaches
+      # this script only through env and is checked before any checkout.
+      - name: Pin the fixture target commit
+        id: target
+        env:
+          FIXTURES_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.fixtures_sha || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FIXTURES_SHA" ]; then
+            printf 'sha=%s\nfixtures_only=false\n' "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$FIXTURES_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error title=Fixtures-only target refused::fixtures_sha must be a full lowercase 40-hex commit SHA"
+            exit 1
+          }
+          printf 'sha=%s\nfixtures_only=true\n' "$FIXTURES_SHA" >> "$GITHUB_OUTPUT"
+          printf '## Fixtures-only target\n\n- Commit: `%s`\n- Workflow from `%s` at `%s`\n' \
+            "$FIXTURES_SHA" "$GITHUB_REF" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          # A fixtures-only target is not yet main code: keep the token out of it.
+          persist-credentials: ${{ steps.target.outputs.fixtures_only != 'true' }}
+
+      - name: Verify the checkout is the target commit
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
 
       - name: Verify native ARM Linux publisher
         run: |
@@ -142,16 +188,20 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Publish exact-SHA fixture bundle
-        run: just fixtures-publish "$GITHUB_SHA"
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: just fixtures-publish "$TARGET_SHA"
 
       # The archive basename is the manifest digest, not the archive digest.
       # Pass transport identity through the trusted publisher, never the relay.
       - name: Record fixture archive transport identity
         id: bundle
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          bundles=(target/fixtures/published/"$GITHUB_SHA"/*.tar.gz)
+          bundles=(target/fixtures/published/"$TARGET_SHA"/*.tar.gz)
           test "${#bundles[@]}" -eq 1
           digest=$(sha256sum "${bundles[0]}")
           bytes=$(wc -c < "${bundles[0]}")
@@ -162,7 +212,8 @@ jobs:
       - name: Upload fixture parts to R2
         if: >-
           ${{ github.repository == 'carrick-sh/carrick' &&
-              (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+              (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' &&
+              steps.target.outputs.fixtures_only != 'true' }}
         # R2 is an accelerator; GitHub remains available if publication fails.
         continue-on-error: true
         env:
@@ -175,8 +226,8 @@ jobs:
       - name: Upload exact-SHA fixture bundle
         uses: actions/upload-artifact@v4
         with:
-          name: signed-fixtures-${{ github.sha }}
-          path: target/fixtures/published/${{ github.sha }}/*.tar.gz
+          name: signed-fixtures-${{ steps.target.outputs.sha }}
+          path: target/fixtures/published/${{ steps.target.outputs.sha }}/*.tar.gz
           if-no-files-found: error
           compression-level: 0
 
@@ -194,7 +245,7 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.signed-fixtures.result == 'success' &&
           ((github.event_name == 'schedule' && github.ref == 'refs/heads/main') ||
-           (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) }}
+           (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '' && inputs.fixtures_sha == '')) }}
     needs: [signed-fixtures]
     runs-on: [self-hosted, macOS, ARM64, carrick-hvf]
     concurrency:
@@ -718,7 +769,7 @@ jobs:
           vars.CARRICK_SELF_HOSTED_FULL_CONFORMANCE == 'true' &&
           github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
           github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' &&
-          inputs.scoreboard_branch == '' }}
+          inputs.scoreboard_branch == '' && inputs.fixtures_sha == '' }}
     needs: hvf-kernel
     # Its own label (`ci_scaler::HVF_CLOSURE_LABELS`): the persistent `carrick-hvf`
     # runner never serves it, so the 24-hour closure can never occupy the main-push runner.
@@ -799,7 +850,7 @@ jobs:
     if: >-
       ${{ !cancelled() &&
           vars.CARRICK_SELF_HOSTED_KVM == 'true' && github.event_name != 'schedule' &&
-          (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) }}
+          (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '' && inputs.fixtures_sha == '')) }}
     runs-on: [self-hosted, Linux, X64, willow-kvm]
     timeout-minutes: 90
     steps:
@@ -879,7 +930,7 @@ jobs:
     if: >-
       ${{ !cancelled() && vars.CARRICK_SELF_HOSTED_KVM == 'true' && github.ref == 'refs/heads/main' &&
           (github.event_name == 'schedule' ||
-           (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) }}
+           (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '' && inputs.fixtures_sha == '')) }}
     runs-on: [self-hosted, Linux, X64, willow-kvm]
     continue-on-error: true
     timeout-minutes: 75
@@ -974,7 +1025,7 @@ jobs:
     if: >-
       ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.hvf-kernel.result != 'skipped' &&
           (github.event_name == 'schedule' ||
-           (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) }}
+           (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '' && inputs.fixtures_sha == '')) }}
     needs: [hvf-kernel]
     runs-on: [self-hosted, macOS, ARM64, carrick-hvf]
     # The lease wait limit (HOST_LEASE_WAIT_LIMIT, 60 min) plus checkout, the
@@ -1061,7 +1112,7 @@ jobs:
     if: >-
       ${{ !cancelled() && github.ref == 'refs/heads/main' &&
           (github.event_name == 'schedule' ||
-           (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) &&
+           (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '' && inputs.fixtures_sha == '')) &&
           (needs.hvf-scoreboard-nightly.result != 'skipped' || needs.kvm-scoreboard.result != 'skipped') }}
     needs: [hvf-scoreboard-nightly, kvm-scoreboard]
     runs-on: ubuntu-latest
@@ -1143,7 +1194,7 @@ jobs:
     name: EL1 · native-process tests (Linux ARM64)
     if: >-
       ${{ !cancelled() && github.event_name != 'schedule' &&
-          (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) }}
+          (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '' && inputs.fixtures_sha == '')) }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
@@ -1465,6 +1516,7 @@ jobs:
           SB_HVF: ${{ needs.hvf-scoreboard.result }}
           SB_PUBLISH: ${{ needs.scoreboard-publish.result }}
           SB_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.scoreboard_branch != '' }}
+          FX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.fixtures_sha != '' }}
           FIXTURES: ${{ needs.signed-fixtures.result }}
           HVF: ${{ needs.hvf-kernel.result }}
           HVF_CLOSURE: ${{ needs.hvf-closure.result }}
@@ -1489,6 +1541,18 @@ jobs:
             require hvf-scoreboard "$SB_HVF" success
             require scoreboard-publish "$SB_PUBLISH" success
             for pair in "signed-fixtures:$FIXTURES" "hvf-kernel:$HVF" "hvf-closure:$HVF_CLOSURE" \
+                        "kvm-tests-willow:$KVM" "kvm-gate:$KVM_GATE" \
+                        "el1-native-tests:$EL1N" "el1-native-gate:$EL1N_GATE"; do
+              require "${pair%%:*}" "${pair#*:}" skipped
+            done
+            exit "$failed"
+          fi
+          if [ "$FX_MODE" = true ]; then
+            # Fixtures-only owner dispatch: the bundle for the named commit;
+            # nothing else (no scoreboard, lanes, receipts or gates).
+            require signed-fixtures "$FIXTURES" success
+            for pair in "scoreboard-target:$SB_TARGET" "hvf-scoreboard:$SB_HVF" "scoreboard-publish:$SB_PUBLISH" \
+                        "hvf-kernel:$HVF" "hvf-closure:$HVF_CLOSURE" \
                         "kvm-tests-willow:$KVM" "kvm-gate:$KVM_GATE" \
                         "el1-native-tests:$EL1N" "el1-native-gate:$EL1N_GATE"; do
               require "${pair%%:*}" "${pair#*:}" skipped
