@@ -567,7 +567,11 @@ impl ExecBuildPlan {
                 random: self.header.random,
                 stack_top: self.header.stack_top,
                 stack_size: self.header.stack_size,
-                has_vdso: self.header.image_features & carrick_core_abi::X86_INITIAL_HAS_VDSO != 0,
+                vdso: if self.header.image_features & carrick_core_abi::X86_INITIAL_HAS_VDSO != 0 {
+                    Some(regions.last().ok_or(InitialMmError::InvalidRange)?.start)
+                } else {
+                    None
+                },
             },
         };
         let mut frames = ExecBuildFrames {
