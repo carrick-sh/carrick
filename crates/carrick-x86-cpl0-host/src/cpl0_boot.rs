@@ -1319,8 +1319,6 @@ struct ForwardExecution {
     cpu: carrick_guest_arch::CpuId,
     binding: carrick_el1_abi::ExecutionBinding,
     leader_task: carrick_el1_abi::EntryTaskKey,
-    #[cfg(test)]
-    stopped_birth: Option<carrick_core::terminal::ThreadBirthIdentity>,
     context: AddressContext<RootGpa>,
 }
 
@@ -1351,15 +1349,6 @@ impl ForwardExecution {
 
     fn with_leader_task(mut self, leader_task: carrick_el1_abi::EntryTaskKey) -> Self {
         self.leader_task = leader_task;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_stopped_birth(
-        mut self,
-        birth: Option<carrick_core::terminal::ThreadBirthIdentity>,
-    ) -> Self {
-        self.stopped_birth = birth;
         self
     }
 
@@ -1394,8 +1383,6 @@ fn admit_forward_execution(
         cpu,
         binding,
         leader_task: binding.task,
-        #[cfg(test)]
-        stopped_birth: None,
         context,
     })
 }
@@ -1456,9 +1443,9 @@ mod forward_execution_tests {
         };
         let predecessor = GuestArchBinding::x86(task(1), context(0x7000, 302, 9));
         let successor = GuestArchBinding::x86(task(1), context(0x9000, 303, 10));
-        let no_pid = || None;
+        let issued = carrick_el1_abi::EntryTaskKey::from_raw(41);
         assert_eq!(
-            forward_leader_task(Some(initial), MmGeneration::new(nz(302)), no_pid).unwrap(),
+            forward_leader_task(Some(initial), MmGeneration::new(nz(302)), issued).unwrap(),
             carrick_el1_abi::EntryTaskKey::from_raw(41)
         );
 
@@ -1470,12 +1457,17 @@ mod forward_execution_tests {
         assert_eq!(replaced.thread.serial, 202);
         assert_eq!(replaced.task, initial.task);
         assert_eq!(
-            forward_leader_task(Some(replaced), MmGeneration::new(nz(303)), no_pid).unwrap(),
+            forward_leader_task(Some(replaced), MmGeneration::new(nz(303)), issued).unwrap(),
             carrick_el1_abi::EntryTaskKey::from_raw(41)
         );
         assert!(
-            forward_leader_task(Some(replaced), MmGeneration::new(nz(302)), no_pid).is_err(),
-            "the predecessor MM no longer resolves to the run root"
+            forward_leader_task(
+                Some(replaced),
+                MmGeneration::new(nz(303)),
+                carrick_el1_abi::EntryTaskKey::from_raw(42),
+            )
+            .is_err(),
+            "another task cannot lead the run root"
         );
         assert!(
             replaced
@@ -1672,23 +1664,6 @@ mod forward_execution_tests {
         assert!(
             err.to_string().contains("TaskIdMismatch"),
             "unexpected error: {err:?}"
-        );
-
-        // A host-published birth identifies a live nonleader by its thread
-        // key, process incarnation, and thread serial, even when its visible
-        // namespace PID names the process leader instead.
-        let birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
-            sibling_binding.task,
-            carrick_core_abi::BirthSerial::of_task(
-                carrick_sched_core::process::TaskSerial::from_raw_u64(77).unwrap(),
-            ),
-            sibling_binding.thread_generation,
-        )
-        .unwrap();
-        let issued_sibling = sibling_admitted.with_stopped_birth(Some(birth));
-        assert_eq!(
-            issued_sibling.authenticate_typed(carrier_binding(context, 12)),
-            Ok(())
         );
     }
 }
@@ -1941,6 +1916,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         })?;
         drop(custody);
         let binding = self.cpu.registered_task_binding(execution.context.root)?;
+        if let Some(issued) = self
+            .cpu
+            .registered_child_entry_task(execution.context.root)?
+        {
+            if execution.binding.task != issued {
+                return Err(fail(
+                    "idle peer child entry key differs from fork settlement",
+                ));
+            }
+        }
         execution.authenticate(binding, "idle peer forward binding mismatch")?;
         Ok(binding.task())
     }
@@ -2205,8 +2190,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 }
             }
         })?;
-        if let Some(child_binding) = register_child {
-            self.cpu.register_child_binding(child_binding)?;
+        if let Some((child_binding, entry_task)) = register_child {
+            self.cpu
+                .register_child_binding_with_entry_task(child_binding, entry_task)?;
         }
         if let Some((live_root, retire_result)) = unregister_child {
             self.cpu.unregister_child_binding(live_root)?;
@@ -2620,8 +2606,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 }
             }
         })?;
-        if let Some(child_binding) = register_child {
-            self.cpu.register_child_binding(child_binding)?;
+        if let Some((child_binding, entry_task)) = register_child {
+            self.cpu
+                .register_child_binding_with_entry_task(child_binding, entry_task)?;
         }
         if let Some((live_root, retire_result)) = unregister_child {
             self.cpu.unregister_child_binding(live_root)?;
@@ -3499,19 +3486,23 @@ impl InitialTaskBinding {
 }
 
 /// The process leader a stopped forward must name. The run root leads its
-/// own MM by its issued TID; any other MM is led by its visible pid.
+/// own MM by its issued TID; descendants retain their issued entry key.
 fn forward_leader_task(
     initial: Option<InitialTaskBinding>,
     mm: MmGeneration,
-    visible_pid: impl FnOnce() -> Option<u32>,
+    issued: carrick_el1_abi::EntryTaskKey,
 ) -> Result<carrick_el1_abi::EntryTaskKey, TrapError> {
+    if issued.raw() == 0 {
+        return Err(fail("stopped forward task has no issued entry key"));
+    }
     match initial {
         Some(initial) if mm == initial.mm => {
-            Ok(carrick_el1_abi::EntryTaskKey::from_raw(initial.thread.tid))
+            let root = carrick_el1_abi::EntryTaskKey::from_raw(initial.thread.tid);
+            (issued == root)
+                .then_some(root)
+                .ok_or_else(|| fail("stopped root forward task key mismatch"))
         }
-        _ => Ok(carrick_el1_abi::EntryTaskKey::from_raw(u64::from(
-            visible_pid().ok_or_else(|| fail("stopped forward task has no visible pid"))?,
-        ))),
+        _ => Ok(issued),
     }
 }
 
@@ -3729,8 +3720,7 @@ impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
             NonZeroU64::new(native.mm_owner_generation.load(Ordering::Acquire))
                 .ok_or_else(|| fail("stopped forward address incarnation"))?,
         );
-        let leader_task =
-            forward_leader_task(custody.initial_task, context.mm, || task.visible_pid())?;
+        let leader_task = forward_leader_task(custody.initial_task, context.mm, binding.task)?;
         let execution = admit_forward_execution(
             cpu,
             carrick_guest_arch::CpuId::new(native.cpu_slot),
