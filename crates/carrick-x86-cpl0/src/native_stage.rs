@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn child_readlinkat_stages_the_request_before_preparing_output() {
+    fn a_child_readlinkat_prepares_untouched_output_then_keeps_the_family_route() {
         let path = b"/proc/self/exe\0";
         let out = 0x7000_1000;
         let call = decode_x86_64(267, [!99u64, path.as_ptr() as u64, out, 64, 0, 0], 0x8000);
