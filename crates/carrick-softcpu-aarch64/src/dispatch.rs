@@ -70,6 +70,8 @@ pub struct ChainExit<C> {
     pub preceding_blocks: u64,
     pub preceding_instructions: u64,
     pub indirect_target: ProgramCounter,
+    pub indirect_chain_hits: u64,
+    pub chain_lookup_miss: bool,
 }
 
 impl<C> ChainExit<C> {
@@ -80,6 +82,8 @@ impl<C> ChainExit<C> {
             preceding_blocks: 0,
             preceding_instructions: 0,
             indirect_target: pc,
+            indirect_chain_hits: 0,
+            chain_lookup_miss: false,
         }
     }
 }
@@ -182,8 +186,28 @@ pub struct RunWork {
     /// Calls to emit a decoded block.
     pub emitted_blocks: u64,
     pub stage1_walks: u64,
+    /// Resolved stage-1 translations, excluding probes for inline RAM loans.
+    pub tlb_hits: u64,
+    pub tlb_misses: u64,
+    pub chain_hits: u64,
+    pub chain_misses: u64,
+    pub indirect_chain_hits: u64,
+    pub indirect_chain_misses: u64,
+    /// Invalidations issued to the launcher, including run boundaries.
+    pub chain_unlinks: u64,
     /// Exits into a scalar, pair, atomic or cache-zero memory handler.
     pub memory_exits: u64,
+}
+
+/// Disjoint elapsed host intervals sampled by the profiling entry point.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PhaseWork {
+    pub lookup_ns: u64,
+    pub plan_ns: u64,
+    pub emit_ns: u64,
+    pub publish_ns: u64,
+    pub launch_ns: u64,
+    pub handler_ns: u64,
 }
 
 /// The result of a bounded run.
@@ -192,6 +216,7 @@ pub struct Report<E> {
     /// Budget steps, including instruction aborts taken before a launch.
     pub blocks: u64,
     pub work: RunWork,
+    pub phases: PhaseWork,
     pub undefined_el0_deliveries: u64,
     pub pc: ProgramCounter,
     pub stop: Stop<E>,
@@ -320,6 +345,8 @@ impl<C> ResidentBlock<C> {
 struct MeasuredMemory<'a, M> {
     inner: &'a mut M,
     walks: u64,
+    tlb_hits: u64,
+    tlb_misses: u64,
     retain_stage1: bool,
     tlb: Option<PhysicalTlb<Stage1Registers, PermissionMode>>,
     last_read: Option<GuestVa>,
@@ -419,8 +446,12 @@ impl<M: GuestMemory> GuestMemory for MeasuredMemory<'_, M> {
             }
             let tlb = self.tlb.get_or_insert_with(PhysicalTlb::default);
             if let Some(pa) = tlb.probe(Stage1Registers::for_cpu(cpu), va, access, mode) {
+                self.tlb_hits += 1;
                 return Ok(pa);
             }
+        }
+        if self.retain_stage1 {
+            self.tlb_misses += 1;
         }
         let leaf = mmu::walk(cpu, self, va.raw(), access, class)?;
         let pa = Gpa::from_frame_gpa(leaf.output());
@@ -445,7 +476,7 @@ pub fn run<X: ExecuteBlock>(
     limits: BlockLimits,
     budget: u64,
 ) -> Report<X::Error> {
-    run_inner(cpu, monitor, memory, executor, limits, budget, None)
+    run_inner::<false, X>(cpu, monitor, memory, executor, limits, budget, None, || 0)
 }
 
 /// Like [`run`], with asynchronous requests serviced at block boundaries.
@@ -459,7 +490,7 @@ pub fn run_controlled<X: ExecuteBlock>(
     budget: u64,
     control: &RunControl,
 ) -> Report<X::Error> {
-    run_inner(
+    run_inner::<false, X>(
         cpu,
         monitor,
         memory,
@@ -467,10 +498,25 @@ pub fn run_controlled<X: ExecuteBlock>(
         limits,
         budget,
         Some(control),
+        || 0,
     )
 }
 
-fn run_inner<X: ExecuteBlock>(
+/// Like [`run`], with a monotonic nanosecond clock to attribute host cost.
+pub fn run_profiled<X: ExecuteBlock>(
+    cpu: &mut CpuState,
+    monitor: &mut ExclusiveMonitor,
+    memory: &mut impl GuestMemory,
+    executor: &mut X,
+    limits: BlockLimits,
+    budget: u64,
+    now: impl Fn() -> u64,
+) -> Report<X::Error> {
+    run_inner::<true, X>(cpu, monitor, memory, executor, limits, budget, None, now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_inner<const PROFILE: bool, X: ExecuteBlock>(
     cpu: &mut CpuState,
     monitor: &mut ExclusiveMonitor,
     memory: &mut impl GuestMemory,
@@ -478,20 +524,25 @@ fn run_inner<X: ExecuteBlock>(
     limits: BlockLimits,
     budget: u64,
     control: Option<&RunControl>,
+    now: impl Fn() -> u64,
 ) -> Report<X::Error> {
     let retain_blocks = executor.retain_blocks();
     let retain_stage1 = executor.retain_stage1() && memory.stage1_is_local();
     let chaining = retain_blocks && retain_stage1 && executor.chain_blocks();
     let mut chain_regime = None;
+    let mut work = RunWork::default();
+    let mut phases = PhaseWork::default();
     if chaining {
+        work.chain_unlinks += 1;
         executor.unlink(None);
     }
     let mut blocks = 0;
-    let mut work = RunWork::default();
     let memory = &mut MeasuredMemory {
         retain_stage1,
         inner: memory,
         walks: 0,
+        tlb_hits: 0,
+        tlb_misses: 0,
         tlb: None,
         last_read: None,
         last_write: None,
@@ -526,6 +577,7 @@ fn run_inner<X: ExecuteBlock>(
         // D5.8: an instruction abort on the block's first word is taken at
         // that PC; later words that fault end the block before them, and
         // fault as the first word of the next block.
+        let lookup_started = if PROFILE { now() } else { 0 };
         let pa = match fetch_address(cpu, memory, cpu.pc) {
             Ok(pa) => pa,
             Err(Stage1Error::Abort(fault)) => match mmu::fault_exception(fault) {
@@ -547,6 +599,7 @@ fn run_inner<X: ExecuteBlock>(
                 .replace(regime)
                 .is_some_and(|previous| previous != regime)
             {
+                work.chain_unlinks += 1;
                 executor.unlink(None);
             }
         }
@@ -560,14 +613,19 @@ fn run_inner<X: ExecuteBlock>(
         };
         let uncached;
         let cached = cache.get(&key);
+        if PROFILE {
+            phases.lookup_ns += now() - lookup_started;
+        }
         let (resident, (block, executable)) = if let Some(resident) =
             cached.filter(|r| Some(r.identity) == code)
         {
             (Some(resident), resident.prepared())
         } else {
             if chaining && let Some(stale) = cached {
+                work.chain_unlinks += 1;
                 executor.unlink(Some(stale.identity.frame));
             }
+            let plan_started = if PROFILE { now() } else { 0 };
             let Ok(first) = read_word(memory, pa) else {
                 break Stop::Fetch(VirtualAddress(cpu.pc.0));
             };
@@ -590,15 +648,26 @@ fn run_inner<X: ExecuteBlock>(
                     word
                 },
             );
+            let emit_started = if PROFILE { now() } else { 0 };
+            if PROFILE {
+                phases.plan_ns += emit_started - plan_started;
+            }
             work.emitted_blocks += 1;
             let block = match emit_block_for_run(&guest, chaining) {
                 Ok(block) => block,
                 Err(error) => break Stop::Translate(error),
             };
+            let publish_started = if PROFILE { now() } else { 0 };
+            if PROFILE {
+                phases.emit_ns += publish_started - emit_started;
+            }
             let executable = match executor.prepare(&block) {
                 Ok(code) => code,
                 Err(error) => break Stop::Execute(error),
             };
+            if PROFILE {
+                phases.publish_ns += now() - publish_started;
+            }
             let prepared = (block, executable);
             let identity = if retain_blocks && fetched_whole_block {
                 memory
@@ -629,6 +698,7 @@ fn run_inner<X: ExecuteBlock>(
             } else {
                 BlockMemory::default()
             };
+        let launch_started = if PROFILE { now() } else { 0 };
         let result = if chain_exit {
             let poll_mask = RunControl::KICK
                 | if cpu.pstate.daif.irq_masked() {
@@ -656,10 +726,18 @@ fn run_inner<X: ExecuteBlock>(
                 .execute_with_memory(block, executable, cpu, inline_ram)
                 .map(|exit| ChainExit::single(exit, cpu.pc))
         };
+        if PROFILE {
+            phases.launch_ns += now() - launch_started;
+        }
         let result = match result {
             Ok(result) => result,
             Err(e) => break Stop::Execute(e),
         };
+        work.chain_hits += result.preceding_blocks;
+        work.indirect_chain_hits += result.indirect_chain_hits;
+        if result.chain_lookup_miss {
+            work.chain_misses += 1;
+        }
         blocks += 1 + result.preceding_blocks;
         work.executed_blocks += result.preceding_blocks;
         work.retired_instructions += result.preceding_instructions;
@@ -676,6 +754,7 @@ fn run_inner<X: ExecuteBlock>(
                 cpu.pc = pc;
             }
             BlockExit::Indirect => {
+                work.indirect_chain_misses += u64::from(result.chain_lookup_miss);
                 work.retired_instructions += instructions;
                 cpu.pc = result.indirect_target;
             }
@@ -688,12 +767,18 @@ fn run_inner<X: ExecuteBlock>(
                     work.memory_exits += 1;
                 }
                 cpu.pc = i.pc();
+                let handler_started = if PROFILE { now() } else { 0 };
                 let outcome = handler::execute(cpu, monitor, memory, &i);
+                if PROFILE {
+                    phases.handler_ns += now() - handler_started;
+                }
                 if let Some(frames) = &mut memory.code_writes {
                     for frame in frames.drain(..) {
+                        work.chain_unlinks += 1;
                         executor.unlink(Some(frame));
                     }
                     if core::mem::take(&mut memory.code_write_failed) {
+                        work.chain_unlinks += 1;
                         executor.unlink(None);
                     }
                 }
@@ -713,12 +798,17 @@ fn run_inner<X: ExecuteBlock>(
                             Event::Ic(_) => {
                                 cache.clear();
                                 if chaining {
+                                    work.chain_unlinks += 1;
                                     executor.unlink(None);
                                 }
                             }
-                            Event::IcFrame(frame) if chaining => executor.unlink(Some(frame)),
+                            Event::IcFrame(frame) if chaining => {
+                                work.chain_unlinks += 1;
+                                executor.unlink(Some(frame));
+                            }
                             Event::Tlbi(_) => {
                                 if chaining {
+                                    work.chain_unlinks += 1;
                                     executor.unlink(None);
                                 }
                                 // One local seat. A full flush also covers every
@@ -751,12 +841,16 @@ fn run_inner<X: ExecuteBlock>(
         }
     };
     if chaining {
+        work.chain_unlinks += 1;
         executor.unlink(None);
     }
     work.stage1_walks = memory.walks;
+    work.tlb_hits = memory.tlb_hits;
+    work.tlb_misses = memory.tlb_misses;
     Report {
         blocks,
         work,
+        phases,
         undefined_el0_deliveries: cpu.undefined_el0_deliveries.wrapping_sub(initial_undefined),
         pc: cpu.pc,
         stop,

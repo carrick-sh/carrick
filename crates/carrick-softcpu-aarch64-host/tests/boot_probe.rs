@@ -35,8 +35,8 @@ use carrick_mem::memory::{
     stage1_hvpatch_page_tables, stage1_identity_page_tables,
 };
 use carrick_softcpu_aarch64::dispatch::{
-    BlockMemory, CHAIN_QUANTUM, ChainBudget, ChainExit, ExecuteBlock, Report, ResidentBlock,
-    RunControl, RunWork, Stop, run, run_controlled,
+    BlockMemory, CHAIN_QUANTUM, ChainBudget, ChainExit, ExecuteBlock, PhaseWork, Report,
+    ResidentBlock, RunControl, RunWork, Stop, run, run_controlled, run_profiled,
 };
 use carrick_softcpu_aarch64::handler::{
     CodeGeneration, Event, ExclusiveMonitor, GuestMemory, InlineRam, MemoryFault,
@@ -1986,21 +1986,35 @@ fn run_dynamic_glibc(
     runner.chain = true;
     let mut blocks = 0;
     let mut work = RunWork::default();
+    let mut phases = PhaseWork::default();
     let mut undefined = 0;
     let mut traced = 0;
     let mut counts = BTreeMap::<u64, u64>::new();
     let mut forwarded = BTreeMap::<u64, u64>::new();
     let mut monitor = ExclusiveMonitor::default();
     let started = std::time::Instant::now();
+    let profile = std::env::var_os("CARRICK_A64_PHASE_PROFILE").as_deref() == Some("1".as_ref());
     let result = loop {
-        let report = run(
-            cpu,
-            &mut monitor,
-            memory,
-            &mut runner,
-            BlockLimits::default(),
-            budget - blocks,
-        );
+        let report = if profile {
+            run_profiled(
+                cpu,
+                &mut monitor,
+                memory,
+                &mut runner,
+                BlockLimits::default(),
+                budget - blocks,
+                || started.elapsed().as_nanos() as u64,
+            )
+        } else {
+            run(
+                cpu,
+                &mut monitor,
+                memory,
+                &mut runner,
+                BlockLimits::default(),
+                budget - blocks,
+            )
+        };
         blocks += report.blocks;
         work.retired_instructions += report.work.retired_instructions;
         work.dispatches += report.work.dispatches;
@@ -2009,6 +2023,19 @@ fn run_dynamic_glibc(
         work.emitted_blocks += report.work.emitted_blocks;
         work.stage1_walks += report.work.stage1_walks;
         work.memory_exits += report.work.memory_exits;
+        work.tlb_hits += report.work.tlb_hits;
+        work.tlb_misses += report.work.tlb_misses;
+        work.chain_hits += report.work.chain_hits;
+        work.chain_misses += report.work.chain_misses;
+        work.indirect_chain_hits += report.work.indirect_chain_hits;
+        work.indirect_chain_misses += report.work.indirect_chain_misses;
+        work.chain_unlinks += report.work.chain_unlinks;
+        phases.lookup_ns += report.phases.lookup_ns;
+        phases.plan_ns += report.phases.plan_ns;
+        phases.emit_ns += report.phases.emit_ns;
+        phases.publish_ns += report.phases.publish_ns;
+        phases.launch_ns += report.phases.launch_ns;
+        phases.handler_ns += report.phases.handler_ns;
         undefined += report.undefined_el0_deliveries;
         runner.finish_pending();
         for svc in &runner.syscalls[traced..] {
@@ -2098,6 +2125,9 @@ fn run_dynamic_glibc(
     let elapsed = started.elapsed().as_secs_f64();
     replies.report_opens();
     println!("engine work={work:?} {:?}", runner.inner.publication_work());
+    if profile {
+        println!("QEMU or native host phase timings {phases:?}");
+    }
     for (nr, count) in &counts {
         let name = lookup_aarch64(*nr).map_or("unknown", |call| call.name);
         let mailbox = forwarded.get(nr).copied().unwrap_or(0);

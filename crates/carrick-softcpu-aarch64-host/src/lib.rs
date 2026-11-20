@@ -336,6 +336,8 @@ impl HostBlockRunner {
         if let Some(budget) = &budget {
             slots[frame::CHAIN_LAST as usize / 8] = u64::MAX;
             slots[frame::CHAIN_RETIRED as usize / 8] = 0;
+            slots[frame::CHAIN_INDIRECT_HITS as usize / 8] = 0;
+            slots[frame::CHAIN_MISSED as usize / 8] = 0;
             remaining = budget.steps.saturating_sub(1);
             slots[frame::CHAIN_TABLE as usize / 8] = bank.native.as_ptr() as u64;
             slots[frame::CHAIN_REMAINING as usize / 8] = remaining;
@@ -383,6 +385,8 @@ impl HostBlockRunner {
                 preceding_blocks: remaining - slots[frame::CHAIN_REMAINING as usize / 8],
                 preceding_instructions: slots[frame::CHAIN_RETIRED as usize / 8],
                 indirect_target: ProgramCounter(slots[frame::CHAIN_TARGET as usize / 8]),
+                indirect_chain_hits: slots[frame::CHAIN_INDIRECT_HITS as usize / 8],
+                chain_lookup_miss: slots[frame::CHAIN_MISSED as usize / 8] != 0,
             }
         } else {
             ChainExit::single(index as usize, cpu.pc)

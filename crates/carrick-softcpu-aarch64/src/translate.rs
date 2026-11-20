@@ -375,6 +375,8 @@ pub mod frame {
     pub const CHAIN_PENDING: u32 = 0x188;
     pub const CHAIN_POLL_MASK: u32 = 0x190;
     pub const CHAIN_X2: u32 = 0x198;
+    pub const CHAIN_INDIRECT_HITS: u32 = 0x1a0;
+    pub const CHAIN_MISSED: u32 = 0x1a8;
     pub const SLOTS: usize = 54;
 
     pub const CHAIN_INDEX_BITS: u32 = 6;
@@ -916,9 +918,9 @@ impl Emitter {
     /// X0 is the guest target PC; guest X0/X1 are already spilled. All
     /// checks preserve NZCV. A hit branches over the target's host prologue.
     /// A miss, pending event, or exhausted quantum takes the normal epilogue.
-    fn chain_tail(&mut self, instructions: u32) {
+    fn chain_tail(&mut self, instructions: u32, indirect: bool) {
         use encode::{
-            add_imm, add_shift, and, br, cbz, eor, eor_lsr, ldar_b, ldr, str, sub_imm, ubfx,
+            add_imm, add_shift, and, br, cbz, eor, eor_lsr, ldar_b, ldr, movz, str, sub_imm, ubfx,
         };
         let words = &mut self.words;
         words.extend([
@@ -962,14 +964,22 @@ impl Emitter {
             ldr(2, SP, frame::CHAIN_RETIRED),
             add_imm(2, 2, instructions),
             str(2, SP, frame::CHAIN_RETIRED),
-            ldr(2, SP, frame::CHAIN_X2),
-            br(1),
         ]);
+        if indirect {
+            words.extend([
+                ldr(2, SP, frame::CHAIN_INDIRECT_HITS),
+                add_imm(2, 2, 1),
+                str(2, SP, frame::CHAIN_INDIRECT_HITS),
+            ]);
+        }
+        words.extend([ldr(2, SP, frame::CHAIN_X2), br(1)]);
+        let miss = words.len();
+        words.extend([movz(2, 1, 0), str(2, SP, frame::CHAIN_MISSED)]);
         let stop = words.len();
+        words[mismatch] = cbz(1, true, miss - mismatch);
+        words[empty] = cbz(1, false, miss - empty);
         for (at, register, nonzero) in [
             (no_table, 2, false),
-            (mismatch, 1, true),
-            (empty, 1, false),
             (no_budget, 2, false),
             (pending, 2, true),
         ] {
@@ -1155,7 +1165,8 @@ pub(crate) fn emit_block_for_run(
         for site in core::mem::take(&mut e.chain_sites) {
             e.words[site] = encode::b(4 * (chain as i64 - site as i64));
         }
-        e.chain_tail(guest.instructions.len() as u32);
+        let indirect = e.exits.contains(&BlockExit::Indirect);
+        e.chain_tail(guest.instructions.len() as u32, indirect);
     }
     let common = e.words.len();
     e.words.extend(common_exit_for(simd));
