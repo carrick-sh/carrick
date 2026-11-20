@@ -65,8 +65,7 @@ pub(crate) fn clock_gettime(native: &mut dyn LifecycleNative<'_>) -> Option<Life
         });
     }
     let mut nanos = if uses_realtime_words(clock) {
-        let sample = native.realtime_counter()?;
-        counter_nanos(sample.tick, sample.frequency).wrapping_add(sample.offset_ns)
+        realtime_nanos(native)?
     } else {
         let (sample, frequency) = native.monotonic_counter()?;
         counter_nanos(sample, frequency)
@@ -79,4 +78,43 @@ pub(crate) fn clock_gettime(native: &mut dyn LifecycleNative<'_>) -> Option<Life
         crate::sleep::timespec_bytes(nanos).to_vec(),
         false,
     ))
+}
+
+fn realtime_nanos(native: &mut dyn LifecycleNative<'_>) -> Option<u64> {
+    let sample = native.realtime_counter()?;
+    Some(counter_nanos(sample.tick, sample.frequency).wrapping_add(sample.offset_ns))
+}
+
+pub(crate) fn realtime_alias(
+    ordinal: u64,
+    native: &mut dyn LifecycleNative<'_>,
+) -> Option<LifecycleOutcome> {
+    use carrick_syscall_abi::{CARRICK_PRIVATE_X86_TIME, LinuxTimeval, LinuxTimezone};
+    use zerocopy::IntoBytes;
+
+    let [first, second, ..] = native.arguments();
+    let (records, result) = if ordinal == CARRICK_PRIVATE_X86_TIME {
+        let seconds = (realtime_nanos(native)? / 1_000_000_000) as i64;
+        let output = (first != 0).then(|| (UserVa::new(first), seconds.to_le_bytes().to_vec()));
+        ([output, None], SyscallResult::new(seconds))
+    } else {
+        let timeval = if first != 0 {
+            let nanos = realtime_nanos(native)?;
+            let value = LinuxTimeval::new(
+                (nanos / 1_000_000_000) as i64,
+                (nanos % 1_000_000_000 / 1_000) as i64,
+            );
+            Some((UserVa::new(first), value.as_bytes().to_vec()))
+        } else {
+            None
+        };
+        let timezone = (second != 0).then(|| {
+            (
+                UserVa::new(second),
+                LinuxTimezone::utc().as_bytes().to_vec(),
+            )
+        });
+        ([timeval, timezone], SyscallResult::new(0))
+    };
+    Some(native.finish_time_output(records, result))
 }

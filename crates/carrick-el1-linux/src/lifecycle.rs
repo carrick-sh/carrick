@@ -302,6 +302,28 @@ impl<
         self.run_ready_after_native_transfer(&mut outcome);
         outcome
     }
+    fn finish_time_output(
+        &mut self,
+        records: [Option<(UserVa, alloc::vec::Vec<u8>)>; 2],
+        result: SyscallResult,
+    ) -> LifecycleOutcome {
+        let venue = self.process_venue().unwrap_or_else(|| {
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
+        });
+        let mut outcome = match records {
+            [Some(first), Some(second)] => venue.complete_copyout_spans(alloc::vec![first, second], result),
+            [Some((address, bytes)), None] | [None, Some((address, bytes))] => {
+                venue.complete_copyout(address, bytes, result)
+            }
+            [None, None] => LifecycleOutcome::Returned {
+                result,
+                work: false,
+            },
+        };
+        self.run_ready_after_native_transfer(&mut outcome);
+        outcome
+    }
+
     fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
         match self.frame.crossing_set() {
             carrick_personality_linux::crossing::HostCrossingSet::Aarch64 => {
