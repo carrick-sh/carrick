@@ -354,6 +354,16 @@ fn serial_host_native_root_and_child_clock_getres() {
     );
 }
 
+#[test]
+fn serial_host_native_root_and_child_monotonic_clock_gettime() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_monotonic_clock_gettime",
+        "native_child_sleep.S",
+        &["-DMONOTONIC_GETTIME=1"],
+        0,
+    );
+}
+
 /// x86 CPL0 defines no guest-visible monotonic epoch (no vDSO, a raw RDTSC
 /// counter), so even forkexecstorm's already expired absolute
 /// CLOCK_MONOTONIC deadline keeps the counted ENOSYS refusal (#1808).
@@ -487,7 +497,7 @@ fn native_child_sleep_witness_with_exit(test: &str, fixture: &str, flags: &[&str
     let outcome = run_pool_fixture(&elf, 128);
     assert_eq!(
         outcome.run.exit_code, exit,
-        "child sleep result (218 means ENOSYS; 100 + n is errno n or table row n)"
+        "native time result for {flags:?} (MONOTONIC_GETTIME encodes root and child in separate nibbles; 1 means ENOSYS)"
     );
     assert!(outcome.run.stdout.is_empty());
     assert!(outcome.run.stderr.is_empty());
