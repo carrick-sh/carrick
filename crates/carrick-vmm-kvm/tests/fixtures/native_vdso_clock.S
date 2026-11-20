@@ -1,8 +1,8 @@
 /*
  * Read AT_SYSINFO_EHDR from the initial stack and resolve __vdso_clock_gettime
  * by name. The root and native fork child each bracket a vDSO monotonic
- * sample between two raw syscall samples.
- * Exit values: 8 success, 218 missing auxv, 91 malformed or disagreeing clock.
+ * sample and a MONOTONIC_RAW sample between raw syscall samples.
+ * Exit values: 8 success, 38 ENOSYS, 91 malformed clock, 218 missing auxv.
  */
 .global _start
 .text
@@ -68,6 +68,9 @@ child:
 missing:
     mov $218, %edi
     jmp exit
+clock_unserved:
+    mov $38, %edi
+    jmp exit
 failure:
     mov $91, %edi
 exit:
@@ -120,16 +123,25 @@ have_symbol:
     ret
 
 compare_samples:
-    sub $56, %rsp
-    mov %rsp, %rsi
-    call raw_monotonic
     mov $1, %edi
+    call compare_counter
+    mov $4, %edi
+    call compare_counter
+    jmp compare_realtime_and_resolution
+
+compare_counter:
+    sub $56, %rsp
+    mov %edi, 48(%rsp)
+    mov %rsp, %rsi
+    call raw_counter
+    mov 48(%rsp), %edi
     lea 16(%rsp), %rsi
     call *%r14
     test %rax, %rax
     jne failure
+    mov 48(%rsp), %edi
     lea 32(%rsp), %rsi
-    call raw_monotonic
+    call raw_counter
     mov 16(%rsp), %rax
     cmp (%rsp), %rax
     jb failure
@@ -145,6 +157,11 @@ after_first:
     cmp 40(%rsp), %rdx
     ja failure
 ordered:
+    add $56, %rsp
+    ret
+
+compare_realtime_and_resolution:
+    sub $56, %rsp
     xor %edi, %edi
     mov %rsp, %rsi
     call *%r14
@@ -173,10 +190,11 @@ ordered:
     jne failure
     add $56, %rsp
     ret
-raw_monotonic:
-    mov $1, %edi
+raw_counter:
     mov $228, %eax
     syscall
+    cmp $-38, %rax
+    je clock_unserved
     test %rax, %rax
     jne failure
     ret
