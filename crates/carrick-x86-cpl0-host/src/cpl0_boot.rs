@@ -1319,6 +1319,7 @@ struct ForwardExecution {
     cpu: carrick_guest_arch::CpuId,
     binding: carrick_el1_abi::ExecutionBinding,
     leader_task: carrick_el1_abi::EntryTaskKey,
+    #[cfg(test)]
     stopped_birth: Option<carrick_core::terminal::ThreadBirthIdentity>,
     context: AddressContext<RootGpa>,
 }
@@ -1327,7 +1328,8 @@ impl ForwardExecution {
     /// Authenticate the CR3-registered carrier binding against the execution
     /// the stopped CPU's own lifecycle record names: the address context, the
     /// execution generation, and the issued entry key must match. A `CLONE_VM`
-    /// sibling may use its own key only with a matching host-published birth.
+    /// sibling sharing a child root is refused: its own control slot cannot
+    /// issue authority to forward on that root.
     fn authenticate_typed(
         &self,
         binding: carrick_hal::guest_arch_binding::GuestArchBinding,
@@ -1338,10 +1340,7 @@ impl ForwardExecution {
         if binding.task().execution.raw().get() != self.binding.generation.raw() {
             return Err(ForwardBindingRefusal::GenerationMismatch);
         }
-        let issued_sibling = self.stopped_birth.is_some_and(|birth| {
-            birth.task() == self.binding.task && birth.thread() == self.binding.thread_generation
-        });
-        if self.binding.task != self.leader_task && !issued_sibling {
+        if self.binding.task != self.leader_task {
             return Err(ForwardBindingRefusal::TaskIdMismatch {
                 stopped: self.binding.task,
                 expected: self.leader_task,
@@ -1386,6 +1385,7 @@ fn admit_forward_execution(
         cpu,
         binding,
         leader_task: binding.task,
+        #[cfg(test)]
         stopped_birth: None,
         context,
     })
@@ -1964,6 +1964,15 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         })?;
         drop(custody);
         let binding = self.cpu.registered_task_binding(execution.context.root)?;
+        if let Some(issued) = self
+            .cpu
+            .registered_child_entry_task(execution.context.root)?
+            && execution.binding.task != issued
+        {
+            return Err(fail(
+                "idle peer child entry key differs from fork settlement",
+            ));
+        }
         execution.authenticate(binding, "idle peer forward binding mismatch")?;
         Ok(binding.task())
     }
@@ -3744,22 +3753,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     pub fn binding(&self, cpu: carrick_guest_arch::CpuId) -> &CpuBinding {
         self.metadata(BINDING_OFFSET + u64::from(cpu.raw()) * STRIDE)
     }
-
-    fn stopped_birth(
-        &self,
-        cpu: carrick_guest_arch::CpuId,
-    ) -> Option<carrick_core::terminal::ThreadBirthIdentity> {
-        let address = self.task(cpu).metadata.control_slot.load(Ordering::Acquire);
-        let offset = address.checked_sub(METADATA_VA)?;
-        let end = offset.checked_add(size_of::<ThreadControlSlot>() as u64)?;
-        if end > EL1_BOOTSTRAP_METADATA_SIZE
-            || !offset.is_multiple_of(align_of::<ThreadControlSlot>() as u64)
-        {
-            return None;
-        }
-        self.metadata::<ThreadControlSlot>(offset)
-            .host_birth_identity()
-    }
 }
 
 impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
@@ -3794,8 +3787,7 @@ impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
                 .ok_or_else(|| fail("child forward root has no issued entry key"))?
         };
         let leader_task = forward_leader_task(custody.initial_task, context.mm, issued)?;
-        let birth = custody.stopped_birth(cpu);
-        let mut execution = admit_forward_execution(
+        let execution = admit_forward_execution(
             cpu,
             carrick_guest_arch::CpuId::new(native.cpu_slot),
             binding,
@@ -3804,7 +3796,6 @@ impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
             generation,
         )?
         .with_leader_task(leader_task);
-        execution.stopped_birth = birth;
         Ok(Self {
             custody,
             lease,
