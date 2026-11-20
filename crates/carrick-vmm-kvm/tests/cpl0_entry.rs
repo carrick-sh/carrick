@@ -4302,3 +4302,108 @@ fn production_fork_waits_while_sibling_fork_holds_birth_reservation() {
         "worker fork under a held birth reservation",
     );
 }
+
+fn legacy_syscalls_run(flags: &[&str], expected: &[u8], expected_refusals: &[(usize, u64)]) {
+    let work = tempfile::tempdir().expect("legacy syscall test directory");
+    std::fs::write(work.path().join("file"), b"file").expect("regular file");
+    std::fs::write(work.path().join("created"), b"truncate me").expect("creat target");
+    std::os::unix::fs::symlink("file", work.path().join("sym")).expect("symlink");
+    let work_path = format!("-DWORK_PATH=\"{}\"", work.path().display());
+    let mut defines = vec![work_path.as_str()];
+    defines.extend_from_slice(flags);
+    let elf = kvm_pool_fixture::assemble_fixture("native_legacy_syscalls.S", &defines);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let outcome =
+        kvm_pool_fixture::try_run_program_with_dispatcher(&program, 128, 1, |_| {}, dispatcher)
+            .map_err(|failure| failure.error)
+            .expect("legacy syscall production runtime");
+    assert!(!outcome.run.trap_limit_hit, "{:?}", outcome.run);
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let refused: Vec<_> = counters
+        .refused
+        .iter()
+        .enumerate()
+        .map(|(nr, count)| (nr, count.load(std::sync::atomic::Ordering::Acquire)))
+        .filter(|&(_, count)| count != 0)
+        .collect();
+    assert_eq!(
+        (
+            outcome.run.exit_code,
+            outcome.run.stdout.as_slice(),
+            refused.as_slice()
+        ),
+        (0, expected, expected_refusals),
+        "(exit, syscall results, counted refusals)"
+    );
+    if flags.contains(&"-DNAMESPACE") {
+        assert_eq!(
+            std::fs::read_link(work.path().join("new-sym")).unwrap(),
+            std::path::Path::new("file")
+        );
+        if flags.contains(&"-DCHILD") {
+            assert!(!work.path().join("fifo").exists());
+            assert!(!work.path().join("fifo-at").exists());
+        } else {
+            use std::os::unix::fs::FileTypeExt;
+            assert!(
+                std::fs::metadata(work.path().join("fifo"))
+                    .unwrap()
+                    .file_type()
+                    .is_fifo()
+            );
+        }
+        for removed in ["dir", "hard", "moved"] {
+            assert!(!work.path().join(removed).exists(), "{removed}");
+        }
+    } else if !flags.contains(&"-DIPC") {
+        assert_eq!(
+            std::fs::metadata(work.path().join("created"))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+}
+
+#[test]
+fn serial_host_root_legacy_namespace_syscalls_match_linux() {
+    legacy_syscalls_run(&["-DNAMESPACE"], &[0, 0, 0, 0, 0, 0, 4, 0], &[]);
+}
+
+#[test]
+fn serial_host_fork_child_legacy_namespace_syscalls_use_canonical_owners() {
+    // The readlinkat and mknodat owners still refuse these child calls.
+    legacy_syscalls_run(
+        &["-DNAMESPACE", "-DCHILD"],
+        &[0, 0, 0, 0, 0, 0, 38, 38, 38, 38],
+        &[(89, 1), (133, 1), (259, 1), (267, 1)],
+    );
+}
+
+#[test]
+fn serial_host_root_legacy_metadata_syscalls_match_linux() {
+    legacy_syscalls_run(&[], &[40, 20, 0, 0, 0, 8, 0, 10, 0], &[]);
+}
+
+#[test]
+fn serial_host_fork_child_legacy_metadata_syscalls_match_linux() {
+    legacy_syscalls_run(&["-DCHILD"], &[40, 20, 0, 0, 0, 8, 0, 10, 0], &[]);
+}
+
+#[test]
+fn serial_host_root_legacy_ipc_syscalls_match_linux() {
+    legacy_syscalls_run(&["-DIPC"], &[0, b'f', 3], &[]);
+}
+
+#[test]
+fn serial_host_fork_child_legacy_ipc_syscalls_match_linux() {
+    legacy_syscalls_run(&["-DIPC", "-DCHILD"], &[0, b'f', 3], &[]);
+}
