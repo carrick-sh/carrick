@@ -434,6 +434,56 @@ fn marking_code_revokes_the_inline_store_loan() {
 }
 
 #[test]
+fn ic_ivau_recompiles_only_the_target_code_frame() {
+    const DRIVER: u64 = 0x4000;
+    const TARGET: u64 = 0x5000;
+    const PEER: u64 = 0x6000;
+    let mut memory = Pages::default();
+    // blr x0; blr x1; ic ivau, x0; blr x0; blr x1; hvc #2.
+    for (index, word) in [
+        0xd63f_0000_u32,
+        0xd63f_0020,
+        0xd50b_7520,
+        0xd63f_0000,
+        0xd63f_0020,
+        0xd400_0042,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        memory.load(DRIVER + 4 * index as u64, &word.to_le_bytes());
+    }
+    for pc in [TARGET, PEER] {
+        memory.load(pc, &0xd65f_03c0_u32.to_le_bytes()); // ret
+    }
+    let mut cpu = CpuState::default();
+    cpu.pstate.el = ExceptionLevel::El1;
+    cpu.pstate.sp = StackSelect::El1;
+    cpu.pc = ProgramCounter(DRIVER);
+    set_x(&mut cpu, 0, TARGET);
+    set_x(&mut cpu, 1, PEER);
+    let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
+    let report = probe(&mut cpu, &mut memory, &mut runner, 10);
+    assert!(matches!(
+        report.stop,
+        Stop::Event {
+            event: Event::ProviderExit(_),
+            ..
+        }
+    ));
+    assert_eq!(report.work.retired_instructions, 10);
+    assert_eq!(report.work.emitted_blocks, 9);
+    assert_eq!(
+        memory.code_generation(FrameGpa::new(TARGET)),
+        Some(CodeGeneration(2))
+    );
+    assert_eq!(
+        memory.code_generation(FrameGpa::new(PEER)),
+        Some(CodeGeneration(1))
+    );
+}
+
+#[test]
 fn guest_code_write_replaces_the_resident_translation() {
     const CODE: u64 = 0x4000;
     const WRITER: u64 = 0x5000;
