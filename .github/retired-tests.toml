@@ -126,3 +126,14 @@ pr = 2732
 test = "cpl0_initial_mm::production_static_pie_loads_above_low_stack_and_exits_seven"
 reason = "#2722: the x86 stack is no longer low, so the production static-PIE witness was renamed to cpl0_initial_mm::production_static_pie_loads_at_its_high_base_and_exits_seven (same fixture, same exit 7)."
 pr = 2732
+
+[[retired]]
+test = "carrick_personality_linux::sleep::tests::absolute_monotonic_epoch_is_defined_only_on_arm"
+reason = "#2028: clock reads and absolute monotonic waits now share an epoch on both ISAs. The existing ARM future-deadline witness and the new CPL0 future-deadline witness exercise the production paths."
+pr = 2618
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_absolute_clock_nanosleep_is_refused"
+reason = "#2028: a CPL0 child's expired monotonic deadline now succeeds. The replacement checks immediate success, and a separate future-deadline witness checks that the wait reaches its deadline."
+replaced_by = "cpl0_initial_mm::serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero"
+pr = 2618
