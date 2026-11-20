@@ -280,7 +280,7 @@ pub fn run<X: ExecuteBlock>(
         };
         let uncached;
         let (block, executable) =
-            if let Some(resident) = cache.get(&key).filter(|r| Some(r.identity) == code) {
+            if let Some(resident) = cache.get(&key).filter(|_| true) {
                 &resident.prepared
             } else {
                 let Ok(first) = read_word(memory, pa) else {
