@@ -4,7 +4,6 @@ use crate::manifest::{Ecosystem, Suite, Tier, VerdictKind};
 use crate::parsers::{self, Outcome, ParseMode, Raw, SuiteOutcome, SuiteResult};
 use crate::verdict::{SuiteReport, Verdict};
 use anyhow::{Context as _, ensure};
-use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -114,13 +113,13 @@ pub fn inner_deadline(suite: &Suite, raw: &crate::parsers::Raw) -> bool {
             .any(|line| line.trim_end() == "# carrick-suite-hung")
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 pub struct Identity {
     head: String,
     artifact: Artifact,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 struct Artifact {
     sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,7 +199,7 @@ fn command_text(program: &str, args: &[&str], path: Option<&Path>) -> anyhow::Re
     ))
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, ::serde::Serialize)]
 struct Population {
     suites_started: usize,
     suites_finished: usize,
@@ -211,20 +210,20 @@ fn finished(outcome: SuiteOutcome) -> bool {
     matches!(outcome, SuiteOutcome::Success | SuiteOutcome::Failure)
 }
 
-#[derive(PartialEq, Serialize)]
+#[derive(PartialEq, ::serde::Serialize)]
 #[serde(untagged)]
 enum Observation {
     Test(Outcome),
     Suite(Verdict),
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 struct Sample<'a> {
     run_id: &'a str,
     outcome: Observation,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 struct Unstable<'a> {
     suite: &'a str,
     test: Option<&'a str>,
