@@ -63,6 +63,7 @@ pub enum Family {
     /// Signal-interruptible sleeps, served by the signal wait owner.
     Sleep(crate::sleep::SleepCall),
     ClockGetres,
+    ClockGettime,
     Futex,
     InotifyAdd,
     InotifyRemove,
@@ -585,9 +586,14 @@ fn serve_family<'a, C: EntryContext + 'a>(
                 }
             });
     }
-    if family == Family::ClockGetres {
+    if matches!(family, Family::ClockGetres | Family::ClockGettime) {
         let original = pending.original_argument0();
-        let Some(native) = pending.time_native() else {
+        let outcome = pending.time_native().and_then(|native| match family {
+            Family::ClockGetres => Some(crate::time::clock_getres(native)),
+            Family::ClockGettime => crate::time::clock_gettime(native),
+            _ => unreachable!(),
+        });
+        let Some(outcome) = outcome else {
             return FamilyRun {
                 return_venue: ReturnVenue::Native,
                 completion: FamilyCompletion::Forward,
@@ -595,7 +601,6 @@ fn serve_family<'a, C: EntryContext + 'a>(
                 forward_reason: ForwardReason::Unported,
             };
         };
-        let outcome = crate::time::clock_getres(native);
         let returned = match outcome {
             crate::lifecycle::LifecycleOutcome::Returned { result, .. } => Some((result, original)),
             _ => None,
@@ -680,7 +685,9 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Ipc(_) => FamilyCompletion::Forward,
         Family::NativeService => FamilyCompletion::NativeService,
         Family::NativeHostFile => pending.native_host_file(),
-        Family::Signal(_) | Family::Sleep(_) | Family::ClockGetres => FamilyCompletion::Forward,
+        Family::Signal(_) | Family::Sleep(_) | Family::ClockGetres | Family::ClockGettime => {
+            FamilyCompletion::Forward
+        }
         Family::Futex => {
             let original = pending.original_argument0();
             let completion = pending.futex();
@@ -800,6 +807,7 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
             Family::Sleep(crate::sleep::SleepCall::ClockNanosleep)
         }
         nr if nr == crate::crossing::nr::CLOCK_GETRES.raw() => Family::ClockGetres,
+        nr if nr == crate::crossing::nr::CLOCK_GETTIME.raw() => Family::ClockGettime,
         124 => Family::Sched(SchedCall::Yield),
         93 => Family::Lifecycle(LifecycleCall::Exit),
         129 => Family::Signal(crate::signal::SignalCall::Kill),
@@ -1559,6 +1567,7 @@ pub const fn service_owner(ordinal: CanonicalNr, allocator_control: u64) -> Serv
         | Family::Signal(_)
         | Family::Sleep(_)
         | Family::ClockGetres
+        | Family::ClockGettime
         | Family::Futex
         | Family::InotifyAdd
         | Family::InotifyRemove
@@ -1974,7 +1983,8 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     // Yield has no host replay. Its in-ring result completes before the
     // ordinary pending-work handback, even when no sibling is runnable.
     let owned_yield = family == Family::Sched(SchedCall::Yield);
-    let owned_clock = family == Family::ClockGetres;
+    let owned_clock = family == Family::ClockGetres
+        || (family == Family::ClockGettime && crate::time::is_monotonic(original_argument0));
     // Allocator control has no host implementation: replaying it on the host
     // returns ENOSYS. Serve it in ring so a metadata capacity miss enrolls on
     // the request wait queue and a completed step settles pending work via
