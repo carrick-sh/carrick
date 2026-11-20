@@ -741,7 +741,8 @@ fn musl_simd_copy_decodes_only_allocated_register_forms() {
 
 #[test]
 fn unadvertised_branch_protection_hints_emit_only_plain_nops() {
-    let words = [0xd503_233f, 0xd503_23bf, 0xd503_245f]; // PACIASP, AUTIASP, BTI C
+    // PACIASP, AUTIASP, BTI C, CHKFEAT.
+    let words = [0xd503_233f, 0xd503_23bf, 0xd503_245f, 0xd503_251f];
     let blocks = split_span(ProgramCounter(0), &words, BlockLimits::default());
     assert_eq!(blocks.len(), 1);
     let emitted = emit_block(&blocks[0]).unwrap();
@@ -750,7 +751,7 @@ fn unadvertised_branch_protection_hints_emit_only_plain_nops() {
         emitted
             .words()
             .windows(words.len())
-            .any(|window| window == [0xd503_201f; 3])
+            .any(|window| window == [0xd503_201f; 4])
     );
     for word in words {
         assert!(!emitted.words().contains(&word));

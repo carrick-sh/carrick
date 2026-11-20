@@ -22,6 +22,7 @@ vm_free = [
   "carrick-softcpu-aarch64::handler::el0_ldadd_raises_undefined_before_accessing_memory",
   "carrick-softcpu-aarch64::dispatch::tests::report_counts_each_el0_undefined_delivery_once_per_run",
   "carrick-softcpu-aarch64::translate::unadvertised_branch_protection_hints_emit_only_plain_nops",
+  "carrick-softcpu-aarch64::el0_fp::el0_static_census_admits_baseline_families_and_rejects_extensions",
 ]
 
 [bindings.unresolved]

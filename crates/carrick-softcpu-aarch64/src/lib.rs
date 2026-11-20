@@ -1275,15 +1275,16 @@ mod instruction {
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
     }
 
-    /// DDI0487 C4.1 HINT variants of pointer authentication and BTI. Both
-    /// features are absent from the guest profile. Other pointer
-    /// authentication encodings still require the extension.
+    /// DDI0487 C4.1 HINT variants of pointer authentication, BTI and
+    /// CHKFEAT. These execute as NOP on the guest's baseline CPU. Other
+    /// pointer authentication encodings still require the extension.
     pub(super) fn compatibility_hint(word: u32) -> bool {
         word & 0xffff_ff1f == 0xd503_231f // PAC/AUT, LR forms
             || word & 0xffff_ff3f == 0xd503_241f // BTI, each target kind
             || matches!(
                 word,
-                0xd503_20ff // XPACLRI
+                0xd503_251f // CHKFEAT X16
+                | 0xd503_20ff // XPACLRI
                 | 0xd503_211f | 0xd503_215f | 0xd503_219f | 0xd503_21df // PAC/AUT, 1716 forms
             )
     }
