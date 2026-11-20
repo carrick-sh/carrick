@@ -265,8 +265,19 @@ pub trait CopyoutEffect: Send {
     fn commit(&mut self) -> Result<(), carrick_syscall_abi::LinuxErrno>;
 }
 
+/// A sample and the calibration read from the caller's mapped vvar.
+pub struct RealtimeCounter {
+    pub tick: CounterTick,
+    pub frequency: CounterFrequency,
+    pub offset_ns: u64,
+}
+
 pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
     fn monotonic_counter(&mut self) -> Option<(CounterTick, CounterFrequency)> {
+        None
+    }
+    /// Sample the counter and the caller’s published vvar calibration.
+    fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
         None
     }
     /// Native scheduler publication belongs to the admitted process execution
@@ -628,6 +639,10 @@ impl From<carrick_sched_core::Requeue> for BornEnqueue {
 /// not route, validate clone flags, lower errno or publish entry completion.
 pub trait LifecycleNative<'a>: UserCopy {
     fn monotonic_counter(&mut self) -> Option<(CounterTick, CounterFrequency)> {
+        None
+    }
+    /// Sample the counter and the caller’s published vvar calibration.
+    fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
         None
     }
     /// Resume an input before any syscall effect has been committed.
