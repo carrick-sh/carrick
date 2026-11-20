@@ -193,14 +193,16 @@ runs the native dispatch through the real fork owner and synthetic
 descriptor words. Signed ARM hardware and the npm row still need an
 exact-head run on the director's Mac.
 
-The separate remap witnesses keep the forced relocation of a one-page
-read/write window over an occupied following address. On CPL0, a successful
-relocation must carry the written byte and zero-fill the extension.
+## Remap of native anonymous reservations (#1846)
 
-The reservation owner can grow a private anonymous mapping in place and
-relocate an untouched mapping when growth is blocked. The ring and host
-reuse the same Linux argument decoder. A lazy relocation retires the
-source reservation in its destination proposal. The live CPL0 fixture
-checks that the old address has no VMA, preserved bytes for in-place
-growth, and zero-fill on the extension. Resident relocation still needs a
-descriptor and backing transfer through the exact MM owner.
+The reservation owner grows a private anonymous mapping in place and relocates
+an untouched mapping when growth is blocked. The ring and host share the Linux
+argument decoder. Untouched relocation removes the source in the same owner
+proposal that publishes the destination.
+
+The ARM native fork-child witness drives both successful paths and checks that
+the source address becomes a hole after relocation. The live CPL0 root and
+fork-child witnesses also check byte retention during in-place growth and
+zero-fill for the new pages. Both venues check that the supported remaps stay
+in ring. Resident relocation returns counted ENOSYS pending the descriptor
+and backing ownership transaction tracked in #2611.

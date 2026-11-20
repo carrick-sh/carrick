@@ -189,11 +189,6 @@ fn serial_host_native_anonymous_advice_busy_once_then_succeeds() {
 }
 
 #[test]
-fn serial_host_native_anonymous_remap_stays_in_ring() {
-    native_anonymous_advice_fixture("-DREMAP");
-}
-
-#[test]
 fn serial_host_native_anonymous_remap_in_place() {
     native_anonymous_advice_fixture("-DREMAP_IN_PLACE");
 }

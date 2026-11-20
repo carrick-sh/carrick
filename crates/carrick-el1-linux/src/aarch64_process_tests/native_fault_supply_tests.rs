@@ -491,7 +491,20 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             assert_eq!(protection, 0, "mprotect");
             assert_eq!(unmap, 0, "munmap");
             if let Some(result) = remap {
-                assert!(result > 0, "mremap returned {result}");
+                assert!(result > 0, "untouched relocation returned {result}");
+
+                let mapped = call(222, [0, 8192, 3, 0x4022, u64::MAX, 0]);
+                assert!(mapped > 0, "in-place fixture mmap returned {mapped}");
+                let va = mapped as u64;
+                assert_eq!(call(215, [va + 4096, 4096, 0, 0, 0, 0]), 0);
+                assert_eq!(
+                    call(216, [va, 4096, 8192, 0, 0, 0]),
+                    mapped,
+                    "mremap grows into the adjacent hole in place"
+                );
+                assert_eq!(call(226, [va + 4096, 4096, 3, 0, 0, 0]), 0);
+                assert_eq!(call(215, [va, 8192, 0, 0, 0, 0]), 0);
+                assert_eq!(counters.served[216].load(Ordering::Relaxed), 2);
             }
             assert_eq!(advice_results, [0, 0, 0, 0, -22], "madvise results");
             return;
