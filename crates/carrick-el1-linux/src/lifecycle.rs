@@ -230,6 +230,17 @@ impl<
         venue.monotonic_counter()
     }
 
+    fn realtime_counter(
+        &mut self,
+    ) -> Option<carrick_personality_linux::lifecycle::RealtimeCounter> {
+        let isa = LifecycleNative::guest_isa(self);
+        let venue = self.process_venue()?;
+        if isa == carrick_guest_arch::GuestIsa::Aarch64 && venue.is_root_process() {
+            return None;
+        }
+        venue.realtime_counter()
+    }
+
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
         let diagnostic = crate::file::CopyDiagnostic {
             counters: self.counters,
