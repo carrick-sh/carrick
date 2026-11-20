@@ -854,9 +854,9 @@ fn native_exec_call(
     task: &CurrentTask,
     slot: carrick_sched_core::SlotId,
     request: carrick_el1_linux::exec_stage::ExecStageRequest,
-    ordinal: carrick_guest_arch::NativeOrdinal,
-    saved: &carrick_sched_core::ParkedContextWords,
+    resume: NativeExecResume<'_>,
 ) -> CompletionRoute {
+    let NativeExecResume { ordinal, saved } = resume;
     use carrick_el1_linux::dispatch::NativeExecStage;
     use carrick_el1_linux::native_process_runtime::NativeServiceCall;
     // SAFETY: the admitted CPU binding retains the initialized counter
@@ -938,6 +938,11 @@ fn native_exec_call(
             CompletionRoute::Served
         }
     }
+}
+
+struct NativeExecResume<'a> {
+    ordinal: carrick_guest_arch::NativeOrdinal,
+    saved: &'a carrick_sched_core::ParkedContextWords,
 }
 
 /// How this entry completes a call whose shared service began inline.
@@ -1582,8 +1587,10 @@ impl Personality for LinuxPersonality {
                     task,
                     slot,
                     request,
-                    carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
-                    &words,
+                    NativeExecResume {
+                        ordinal: carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                        saved: &words,
+                    },
                 );
             }
             if let Some(venue) = anonymous.as_mut()
