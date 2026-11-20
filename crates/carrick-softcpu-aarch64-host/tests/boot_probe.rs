@@ -1468,7 +1468,9 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
             LINUX_AT_HWCAP, LINUX_AT_HWCAP2, LINUX_AT_PAGESZ, LINUX_AT_RANDOM,
             LINUX_AT_SYSINFO_EHDR,
         },
-        memory::{build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso},
+        memory::{
+            LINUX_STACK_SIZE, build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso,
+        },
     };
     use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
     use std::process::Command;
@@ -1873,7 +1875,9 @@ fn stage_dynamic(
             LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT, LINUX_AT_PHNUM, LINUX_AT_RANDOM,
             LINUX_AT_SECURE,
         },
-        memory::{build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso},
+        memory::{
+            LINUX_STACK_SIZE, build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso,
+        },
     };
     use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
 
@@ -1908,7 +1912,8 @@ fn stage_dynamic(
     let expected_argc = argv.len() as u64;
     let expected_argv0 = argv[0].clone();
     let (stack, sp, _) =
-        build_linux_initial_stack(argv, envp, &auxv, None, LINUX_STACK_TOP, 8 * PAGE).unwrap();
+        build_linux_initial_stack(argv, envp, &auxv, None, LINUX_STACK_TOP, LINUX_STACK_SIZE)
+            .unwrap();
     let (offset, bytes) = stack.shared_initialized_bytes();
     for page in (stack.start..LINUX_STACK_TOP).step_by(PAGE as usize) {
         memory.map_zero(page);
