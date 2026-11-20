@@ -563,17 +563,27 @@ struct ResolvedExecTarget {
 /// Acquire an exec image source under `files`. The bare-run host-file
 /// fallback is the HVF embedding's physical file service. Other carriers
 /// supply none until their host-file venue serves exec (#1093 S4): the
-/// retained filesystem alone resolves the image.
+/// retained filesystem alone resolves the image. This is the ONE place the
+/// runtime opens a host file for exec (one authority owner): a native exec
+/// that also reaches the caller's descriptor table passes `native`.
 fn acquire_exec_source(
     files: &carrick_kernel::dispatch::exec_files::ExecFiles,
     path: &str,
+    native: Option<&carrick_kernel::dispatch::exec_files::NativeExecFdService<'_>>,
 ) -> Result<
-    carrick_kernel::dispatch::executable_authority::ExecSource,
+    carrick_kernel::dispatch::exec_files::ExecPathSource,
     carrick_kernel::dispatch::executable_authority::ExecSourceError,
 > {
+    use carrick_kernel::dispatch::exec_files::ExecPathSource;
     #[cfg(feature = "platform-macos")]
     {
-        files.acquire_with_host_file_service(path, &|path: &str| std::fs::File::open(path))
+        let open = |path: &str| std::fs::File::open(path);
+        match native {
+            Some(descriptor) => files.acquire_native_path(path, Some(&open), descriptor),
+            None => files
+                .acquire_with_host_file_service(path, &open)
+                .map(ExecPathSource::Filesystem),
+        }
     }
     #[cfg(any(
         feature = "platform-linux",
@@ -581,7 +591,24 @@ fn acquire_exec_source(
         feature = "platform-netbsd"
     ))]
     {
-        files.acquire(path)
+        match native {
+            Some(descriptor) => files.acquire_native_path(path, None, descriptor),
+            None => files.acquire(path).map(ExecPathSource::Filesystem),
+        }
+    }
+}
+
+/// A pathname exec source (no descriptor table): the filesystem source.
+fn acquire_filesystem_exec_source(
+    files: &carrick_kernel::dispatch::exec_files::ExecFiles,
+    path: &str,
+) -> Result<
+    carrick_kernel::dispatch::executable_authority::ExecSource,
+    carrick_kernel::dispatch::executable_authority::ExecSourceError,
+> {
+    use carrick_kernel::dispatch::exec_files::ExecPathSource;
+    match acquire_exec_source(files, path, None)? {
+        ExecPathSource::Filesystem(source) | ExecPathSource::NativeDescriptor(source) => Ok(source),
     }
 }
 
@@ -603,7 +630,7 @@ fn resolve_exec_target<'a>(
     // interpreter (execve03/execve02). Then resolve any `#!` shebang script to
     // its interpreter (shared with the initial entrypoint load via
     // `resolve_shebang`).
-    let acquire_source = |path: &str| acquire_exec_source(files, path);
+    let acquire_source = |path: &str| acquire_filesystem_exec_source(files, path);
     let (abs_path, named_source, descriptor) = match target.into() {
         ExecTarget::Path(path) => (
             files.resolve_path(path),
@@ -612,21 +639,8 @@ fn resolve_exec_target<'a>(
         ),
         ExecTarget::NativePath { path, descriptor } => {
             use carrick_kernel::dispatch::exec_files::ExecPathSource;
-            #[cfg(feature = "platform-macos")]
-            let open = |path: &str| std::fs::File::open(path);
-            #[cfg(feature = "platform-macos")]
-            let host_open: Option<
-                &carrick_kernel::dispatch::exec_files::ExecHostFileService<'_>,
-            > = Some(&open);
-            #[cfg(any(
-                feature = "platform-linux",
-                feature = "platform-freebsd",
-                feature = "platform-netbsd"
-            ))]
-            let host_open = None;
-            let source = files
-                .acquire_native_path(path, host_open, descriptor)
-                .map_err(exec_source_errno)?;
+            let source =
+                acquire_exec_source(files, path, Some(descriptor)).map_err(exec_source_errno)?;
             let (source, descriptor) = match source {
                 ExecPathSource::Filesystem(source) => (source, false),
                 ExecPathSource::NativeDescriptor(source) => (source, true),
@@ -734,7 +748,7 @@ pub(crate) fn load_execve_image<'a>(
         source,
         direct_aarch64,
     } = resolve_exec_target(files, target, argv)?;
-    let acquire_source = |path: &str| acquire_exec_source(files, path);
+    let acquire_source = |path: &str| acquire_filesystem_exec_source(files, path);
 
     // Read the main binary AND resolve its interpreter OVERLAY-FIRST via
     // the retained file capabilities, so execve works for guest-created/overlay binaries
@@ -879,7 +893,10 @@ pub(crate) fn load_x86_exec_image<'a>(
     X86ExecImage::check_arguments(&argv, &env)?;
     let bytes = source.read_all().map_err(host_io_errno)?;
     let program = carrick_mem::elf::ElfProgram::load(&bytes, native_guest_elf_machine(), &|path| {
-        acquire_exec_source(files, path).ok()?.read_all().ok()
+        acquire_filesystem_exec_source(files, path)
+            .ok()?
+            .read_all()
+            .ok()
     })
     .map_err(|error| {
         carrick_kernel::exec_helpers::exec_image_errno(carrick_mem::memory::AddressSpaceError::Elf(
