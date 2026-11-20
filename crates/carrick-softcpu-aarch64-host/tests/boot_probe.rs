@@ -488,8 +488,8 @@ fn indirect_call_and_direct_back_edge_share_a_resident_chain() {
 #[test]
 fn guest_store_unlinks_a_chained_to_code_frame() {
     const CALLER: u64 = 0x4000;
-    const TARGET: u64 = 0x5004;
-    const WRITER: u64 = 0x6008;
+    const TARGET: u64 = 0x5000;
+    const WRITER: u64 = 0x6000;
     let mut memory = Pages::default();
     use carrick_softcpu_aarch64::translate::encode::b;
     load_words(&mut memory, CALLER, &[b(TARGET as i64 - CALLER as i64)]);
