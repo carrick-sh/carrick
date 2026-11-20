@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct NoopKick;
+pub(crate) struct NoopKick;
 
 #[cfg(test)]
 impl carrick_hal::VcpuKickDyn for NoopKick {
@@ -944,7 +944,7 @@ fn audit_image(actual: &X86VcpuSnapshot, expected: &X86VcpuSnapshot) -> Result<(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use carrick_hal::guest_arch_binding::core_arch::*;
@@ -952,7 +952,7 @@ mod tests {
     use std::num::NonZeroU64;
     use std::sync::atomic::AtomicUsize;
 
-    struct UnusedWatchdog;
+    pub(crate) struct UnusedWatchdog;
     impl FixtureWatchdog for UnusedWatchdog {
         fn start() -> Self {
             panic!("unused test watchdog")
@@ -964,8 +964,8 @@ mod tests {
             panic!("unused test watchdog")
         }
     }
-    struct TestIo {
-        image: X86VcpuSnapshot,
+    pub(crate) struct TestIo {
+        pub(crate) image: X86VcpuSnapshot,
     }
     impl sealed::Sealed for TestIo {}
     impl CarrierCpuIo for TestIo {}
@@ -1005,8 +1005,11 @@ mod tests {
             None
         }
 
-        fn get_gpr(&self, _: X86Reg) -> Result<u64, TrapError> {
-            Err(boundary_error("unused test GPR"))
+        fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
+            match reg {
+                X86Reg::Cr3 => Ok(self.image.cr3),
+                _ => Err(boundary_error("unused test GPR")),
+            }
         }
 
         fn read_msr(&self, _: u32) -> Result<u64, TrapError> {
@@ -1025,7 +1028,7 @@ mod tests {
             Err(boundary_error("unused test FS"))
         }
     }
-    fn context_with_root(tag: u64, root: RootGpa) -> X86ArchContext {
+    pub(crate) fn context_with_root(tag: u64, root: RootGpa) -> X86ArchContext {
         let nz = |v| NonZeroU64::new(v).unwrap();
         let binding = GuestArchBinding::x86(
             TaskIdentity {
