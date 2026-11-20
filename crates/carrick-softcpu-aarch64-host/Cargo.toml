@@ -19,3 +19,4 @@ carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 goblin.workspace = true
+sha2.workspace = true

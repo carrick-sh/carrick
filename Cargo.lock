@@ -1089,6 +1089,7 @@ dependencies = [
  "carrick-softcpu-aarch64",
  "carrick-softmmu",
  "goblin",
+ "sha2",
 ]
 
 [[package]]
