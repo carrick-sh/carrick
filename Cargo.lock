@@ -674,6 +674,8 @@ dependencies = [
 name = "carrick-hal"
 version = "0.1.0"
 dependencies = [
+ "applevisor",
+ "applevisor-sys",
  "carrick-abi",
  "carrick-core-abi",
  "carrick-el1-abi",
@@ -688,6 +690,8 @@ dependencies = [
  "carrick-sched-core",
  "carrick-signal-core",
  "carrick-signal-linux",
+ "carrick-softcpu-aarch64",
+ "carrick-softmmu",
  "carrick-test-support",
  "carrick-timer-core",
  "libc",
@@ -1077,11 +1081,19 @@ dependencies = [
 name = "carrick-softcpu-aarch64-host"
 version = "0.1.0"
 dependencies = [
+ "carrick-aarch64",
  "carrick-el1-abi",
+ "carrick-fatal",
  "carrick-guest-arch",
+ "carrick-guest-mem",
+ "carrick-hal",
  "carrick-host-jit",
  "carrick-mem",
+ "carrick-observability",
  "carrick-softcpu-aarch64",
+ "carrick-test-support",
+ "parking_lot",
+ "thiserror",
 ]
 
 [[package]]

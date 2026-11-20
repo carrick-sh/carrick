@@ -12,6 +12,14 @@ carrick-host-jit = { path = "../carrick-host-jit" }
 carrick-softcpu-aarch64 = { path = "../carrick-softcpu-aarch64" }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dev-dependencies]
+carrick-aarch64 = { path = "../carrick-aarch64" }
+carrick-fatal.workspace = true
 carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-hal = { path = "../carrick-hal", features = ["machine-spike"] }
 carrick-mem = { path = "../carrick-mem" }
+carrick-observability = { path = "../carrick-observability" }
+carrick-test-support = { path = "../carrick-test-support" }
+parking_lot.workspace = true
+thiserror.workspace = true

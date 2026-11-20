@@ -43,6 +43,11 @@ pub struct CodeGeneration(pub u64);
 /// set they are the stage-1 output.
 pub trait GuestMemory {
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault>;
+    /// Fetch physical instruction bytes. A stage-2 provider can impose an
+    /// execute permission independent of data reads.
+    fn fetch(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault> {
+        self.read(address, bytes)
+    }
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault>;
 
     /// A generation is supplied only for a fully readable code frame whose

@@ -14,6 +14,7 @@
 // Test helpers outside #[test] fns fail loudly on malformed fixtures.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use carrick_aarch64::staged_cpu::{RootBootFields, StagedCpu};
 use carrick_el1_abi::{
     ContextGeneration, CurrentTask, DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE,
     DELEGATED_STATE_GUEST, DelegatedOpenFile, EL1_CURRENT_TASKS_BASE, EL1_DYNAMIC_METADATA_BASE,
@@ -22,6 +23,7 @@ use carrick_el1_abi::{
     TrapFrame, is_el1_stack_guard, stack_slot_top,
 };
 use carrick_guest_arch::FrameGpa;
+use carrick_hal::hypervisor::machine::{HvVcpu, HvVm, MemPerms, VcpuExit};
 use carrick_mem::arch_sysregs::{MAIR_EL1_BOOTSTRAP, SCTLR_EL1_BOOTSTRAP, TCR_EL1_BOOTSTRAP};
 use carrick_mem::memory::{
     Aarch64SyscallMailbox, El1IrqMode, LINUX_CARRIER_MAINT_ROOT_BASE, LINUX_EL0_TRAMPOLINE_BASE,
@@ -46,14 +48,23 @@ use carrick_softcpu_aarch64::translate::{
 };
 use carrick_softcpu_aarch64::{ExceptionKind, Gpr, OperandRegister};
 use carrick_softcpu_aarch64_host::{HostBlockRunner, HostCode, HostError};
+use carrier_mailbox::{HvfSyscallTransport, MailboxBinding, MailboxSlotAllocator};
 use core::num::NonZeroU64;
+use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 use std::collections::{BTreeMap, VecDeque};
+
+// Compile the unchanged production transport here while the rest of the
+// carrier is still cfg-gated. Keep hardware and OS glue outside this witness.
+#[allow(dead_code)]
+#[path = "../../carrick-vmm-hvf/src/syscall_mailbox.rs"]
+mod carrier_mailbox;
 
 const PAGE: u64 = 4096;
 const INITIAL_METADATA_END: u64 =
     EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64;
 
+#[repr(C, align(64))]
 struct PhysicalPage {
     bytes: [u8; PAGE as usize],
     generation: u64,
@@ -449,7 +460,6 @@ fn production_el1_image_boot_probe() {
 
 const USER_HELLO_ELF: &[u8] =
     include_bytes!("../../carrick-vmm-kvm/fixtures/hello-aarch64/hello-aarch64");
-const ROOT_EL0_ENTRY_SPSR: u64 = 0x3c0;
 
 fn read_u32(memory: &mut Pages, at: u64) -> u32 {
     let mut b = [0u8; 4];
@@ -506,22 +516,31 @@ fn enter_carrier_root(el1_elf: &[u8], user_elf: &[u8]) -> (CpuState, Pages, u64)
         &stage1_carrier_maintenance_page_tables(),
     );
 
+    let root = StagedCpu::initial_root(&RootBootFields {
+        entry: user_entry,
+        initial_stack_pointer: Some(LINUX_STACK_TOP - 16),
+        el0_trampoline_entry: Some(LINUX_EL0_TRAMPOLINE_BASE),
+        el1_vectors_base: Some(LINUX_EL1_VECTORS_BASE),
+        stage1_page_tables_base: Some(LINUX_PAGE_TABLES_BASE),
+    })
+    .snapshot();
     let mut cpu = CpuState::default();
     cpu.pstate.el = ExceptionLevel::El1;
     cpu.pstate.sp = StackSelect::El1;
     cpu.pstate.daif = InterruptMasks::ALL;
-    cpu.sp_el0 = StackPointer(LINUX_STACK_TOP - 16);
+    assert_eq!(cpu.pstate.save().0, root.pstate);
+    cpu.sp_el0 = StackPointer(root.sp_el0);
     cpu.sp_el1 = StackPointer(LINUX_SYSCALL_MAILBOX_BASE);
-    cpu.pc = ProgramCounter(LINUX_EL0_TRAMPOLINE_BASE);
-    cpu.el1.elr = ProgramCounter(user_entry);
-    cpu.el1.spsr = SavedPstate(ROOT_EL0_ENTRY_SPSR);
-    cpu.el1.vbar = VirtualAddress(LINUX_EL1_VECTORS_BASE);
-    cpu.el1.mair = SystemValue(MAIR_EL1_BOOTSTRAP);
-    cpu.el1.tcr = SystemValue(TCR_EL1_BOOTSTRAP);
-    cpu.named.ttbr0 = SystemValue(LINUX_PAGE_TABLES_BASE);
-    cpu.named.ttbr1 = SystemValue(LINUX_PAGE_TABLES_BASE);
-    cpu.el1.sctlr = Sctlr(SCTLR_EL1_BOOTSTRAP);
-    cpu.el1.cntkctl = SystemValue(3);
+    cpu.pc = ProgramCounter(root.pc);
+    cpu.el1.elr = ProgramCounter(root.elr_el1);
+    cpu.el1.spsr = SavedPstate(root.spsr_el1);
+    cpu.el1.vbar = VirtualAddress(root.vbar);
+    cpu.el1.mair = SystemValue(root.mair);
+    cpu.el1.tcr = SystemValue(root.tcr);
+    cpu.named.ttbr0 = SystemValue(root.ttbr0);
+    cpu.named.ttbr1 = SystemValue(root.ttbr1);
+    cpu.el1.sctlr = Sctlr(root.sctlr);
+    cpu.el1.cntkctl = SystemValue(root.cntkctl_el1);
     (cpu, memory, user_entry)
 }
 
@@ -806,6 +825,102 @@ fn probe_traced(
     report
 }
 
+fn probe_facade(
+    cpu: &mut CpuState,
+    memory: &mut Pages,
+    runner: &mut TracingRunner,
+) -> Report<HostError> {
+    let mut machine = HvVm::soft().unwrap();
+    let allocator = std::sync::Arc::new(MailboxSlotAllocator::new());
+    let lease = allocator.allocate().unwrap();
+    let mut mailbox_host = None;
+    for (&ipa, page) in &mut memory.pages {
+        let host = NonNull::from(&mut page.bytes).cast();
+        if ipa == lease.id().guest_address() {
+            mailbox_host = Some(host.cast());
+        }
+        // SAFETY: these distinct boxed pages outlive the machine and are
+        // accessed only through the dispatcher until it is dropped.
+        unsafe {
+            machine.map_memory(
+                FrameGpa::new(ipa),
+                host,
+                PAGE as usize,
+                MemPerms::ReadWriteExec,
+            )
+        }
+        .unwrap();
+    }
+    // SAFETY: the page begins at the 64-aligned struct address and retains
+    // the whole slot until this binding drops. The run and decode are serial.
+    let mut binding =
+        unsafe { MailboxBinding::new(lease, mailbox_host.unwrap(), HvfSyscallTransport::Mailbox) };
+    let mut report = None;
+    let mut monitor = ExclusiveMonitor::default();
+    let mut vcpu = HvVcpu::Soft {
+        cpu,
+        executor: runner,
+        monitor: &mut monitor,
+        report: &mut report,
+    };
+    let exit = vcpu.run(&mut machine, 1_000_000).unwrap();
+    assert!(matches!(exit, VcpuExit::Exception { syndrome, far: 0 }
+        if carrick_hal::aarch64::is_aarch64_hvc_exception(syndrome)
+            && syndrome & 0xffff == 2));
+    let request = binding
+        .decode_request(|| panic!("mailbox mode must not read live registers"))
+        .unwrap();
+    assert_eq!((request.native_nr, request.frame.x1), (73, 3));
+    runner.finish_pending();
+    report.unwrap()
+}
+
+#[test]
+fn facade_remap_changes_execute_permission_before_dispatch() {
+    let mut bytes = [0u8; PAGE as usize];
+    bytes[..4].copy_from_slice(&0xd400_0042u32.to_le_bytes()); // HVC #2
+    let mut machine = HvVm::soft().unwrap();
+    let mut cpu = CpuState::default();
+    cpu.pstate.el = ExceptionLevel::El1;
+    let mut runner = HostBlockRunner::new().unwrap();
+    let mut monitor = ExclusiveMonitor::default();
+    let mut report = None;
+    let mut vcpu = HvVcpu::Soft {
+        cpu: &mut cpu,
+        executor: &mut runner,
+        monitor: &mut monitor,
+        report: &mut report,
+    };
+    let ipa = FrameGpa::new(0);
+    let host = NonNull::from(&mut bytes).cast();
+    // SAFETY: bytes outlives the machine and is exclusively accessed by it.
+    unsafe {
+        machine.map_memory(
+            ipa,
+            host,
+            PAGE as usize,
+            MemPerms {
+                read: true,
+                write: true,
+                exec: false,
+            },
+        )
+    }
+    .unwrap();
+    assert!(vcpu.run(&mut machine, 1).is_err());
+    machine.unmap_memory(ipa, PAGE as usize).unwrap();
+    assert!(vcpu.run(&mut machine, 1).is_err());
+    // SAFETY: same backing and lifetime as above.
+    unsafe { machine.map_memory(ipa, host, PAGE as usize, MemPerms::ReadWriteExec) }.unwrap();
+    assert!(matches!(
+        vcpu.run(&mut machine, 1).unwrap(),
+        VcpuExit::Exception {
+            syndrome: 0x5a00_0002,
+            far: 0
+        }
+    ));
+}
+
 #[repr(C, align(64))]
 struct AlignedRecord<const N: usize>([u8; N]);
 
@@ -1079,7 +1194,7 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     let (mut cpu, mut memory, entry, _) = build_guest();
     admit_root_task_with_stdio(&mut memory);
     let mut runner = TracingRunner::new().expect("Linux arm64 host runner");
-    let report = probe_traced(&mut cpu, &mut memory, &mut runner, 1_000_000);
+    let report = probe_facade(&mut cpu, &mut memory, &mut runner);
     let state = read_u32(
         &mut memory,
         mb + core::mem::offset_of!(Aarch64SyscallMailbox, state) as u64,
@@ -1108,7 +1223,7 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
             sc.pc, sc.lr, sc.nr, sc.args[0], sc.args[1], sc.args[2], sc.args[3], sc.ret
         );
     }
-    assert!(memory.read_boot_root);
+    assert!(report.work.stage1_walks > 0);
     assert_ne!(cpu.named.tpidrel0.0, 0);
     assert!(
         matches!(

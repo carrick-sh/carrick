@@ -11,6 +11,13 @@
 use crate::error::{MemPerms, OsError, Reg, SysReg};
 use carrick_mem::memory::AddressSpace;
 
+#[cfg(all(
+    feature = "machine-spike",
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos")
+))]
+pub mod machine;
+
 pub trait HvVm: Sized {
     type Vcpu: HvVcpu;
     fn create(mem: &AddressSpace) -> Result<Self, OsError>;
@@ -45,6 +52,8 @@ pub enum VcpuExit {
         data: u64,
         len: u8,
     },
+    /// Raw exception exit. On the AArch64 facade spike an HVC uses this exit
+    /// with the immediate in the syndrome and no fault address.
     Exception {
         syndrome: u64,
         far: u64,

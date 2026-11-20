@@ -16,6 +16,7 @@ workspace = true
 # carrier hands it real ones (`SyscallDispatcher::new()`, the example backend).
 # Test-only surface: nothing in a product carrier constructs them.
 test-support = []
+machine-spike = ["dep:applevisor", "dep:applevisor-sys", "dep:carrick-softcpu-aarch64", "dep:carrick-softmmu"]
 
 [dependencies]
 # Pure no_std Linux signal-frame codec; no normal EL1 dependency.
@@ -57,6 +58,14 @@ zerocopy.workspace = true
 # tids (carrick-runtime's Serialize-derived outcomes) keep their wire shape.
 serde.workspace = true
 parking_lot.workspace = true
+
+[target.'cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))'.dependencies]
+carrick-softcpu-aarch64 = { path = "../carrick-softcpu-aarch64", optional = true }
+carrick-softmmu = { path = "../carrick-softmmu", optional = true, features = ["std"] }
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+applevisor = { workspace = true, optional = true }
+applevisor-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 carrick-test-support = { path = "../carrick-test-support" }
