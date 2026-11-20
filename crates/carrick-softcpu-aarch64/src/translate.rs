@@ -432,19 +432,32 @@ impl BlockFrame {
     /// Load the guest registers a block can observe: X0..X30, the current
     /// banked SP, NZCV, and Q0..Q31.
     pub fn load_from(&mut self, cpu: &CpuState) {
+        self.load_for_launch(cpu, true);
+    }
+
+    /// A scalar entry and its same-bank native links cannot observe FP
+    /// controls or the vector file.
+    pub fn load_for_launch(&mut self, cpu: &CpuState, simd: bool) {
         for n in 0..31u8 {
             if let Some(r) = Gpr::new(n) {
                 self.slots[usize::from(n)] = cpu.read_operand(OperandRegister::Gpr(r)).0;
             }
         }
-        self.vectors = cpu.vectors;
-        self.slots[slot(frame::FPCR)] = cpu.named.fpcr.0 & FPCR_MASK;
-        self.slots[slot(frame::FPSR)] = cpu.named.fpsr.0 & FPSR_MASK;
+        if simd {
+            self.vectors = cpu.vectors;
+            self.slots[slot(frame::FPCR)] = cpu.named.fpcr.0 & FPCR_MASK;
+            self.slots[slot(frame::FPSR)] = cpu.named.fpsr.0 & FPSR_MASK;
+        }
         self.slots[slot(frame::GUEST_SP)] = cpu.sp().0;
         self.slots[slot(frame::NZCV)] = u64::from(cpu.pstate.nzcv & 15) << 28;
     }
     /// Write back what a block may have changed.
     pub fn store_to(&self, cpu: &mut CpuState) {
+        self.store_after_launch(cpu, true);
+    }
+
+    /// Write back only the register files transferred on entry.
+    pub fn store_after_launch(&self, cpu: &mut CpuState, simd: bool) {
         for n in 0..31u8 {
             if let Some(r) = Gpr::new(n) {
                 cpu.write_operand(
@@ -453,9 +466,11 @@ impl BlockFrame {
                 );
             }
         }
-        cpu.vectors = self.vectors;
-        cpu.named.fpcr = SystemValue(self.slots[slot(frame::FPCR)] & FPCR_MASK);
-        cpu.named.fpsr = SystemValue(self.slots[slot(frame::FPSR)] & FPSR_MASK);
+        if simd {
+            cpu.vectors = self.vectors;
+            cpu.named.fpcr = SystemValue(self.slots[slot(frame::FPCR)] & FPCR_MASK);
+            cpu.named.fpsr = SystemValue(self.slots[slot(frame::FPSR)] & FPSR_MASK);
+        }
         cpu.set_sp(StackPointer(self.slots[slot(frame::GUEST_SP)]));
         cpu.pstate.nzcv = ((self.slots[slot(frame::NZCV)] >> 28) & 15) as u8;
     }

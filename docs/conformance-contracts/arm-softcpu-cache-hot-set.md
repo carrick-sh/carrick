@@ -56,6 +56,15 @@ The HVC fixture checks one emission and publication across 1, 100 and
 The witness also checks a switch to an independent inventory with the same
 frame and numerical generation, followed by a loader write and remap.
 
+## Scalar launches
+
+A scalar launcher and its same-bank successors leave the guest vector
+registers, FPCR and FPSR in architectural state. The scalar HVC fixture
+preserves all vector values and reduces vector frame traffic from 1,024
+bytes per launch to zero. SIMD launches continue to transfer those
+registers. Set `CARRICK_SOFT_AARCH64_SCALAR_FRAME=0` to measure with the
+full transfer.
+
 ## Native branch chains
 
 The direct and register branch exits share a tagged table of resident host

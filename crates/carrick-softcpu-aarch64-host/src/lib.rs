@@ -132,6 +132,8 @@ pub struct HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     vector_frame_bytes: u64,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    omit_scalar_vector_copy: bool,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     retain_blocks: bool,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     retain_on_handoff: bool,
@@ -172,6 +174,9 @@ impl HostBlockRunner {
         Ok(Self {
             publication: carrick_host_jit::PublicationWork::default(),
             vector_frame_bytes: 0,
+            omit_scalar_vector_copy: std::env::var_os("CARRICK_SOFT_AARCH64_SCALAR_FRAME")
+                .as_deref()
+                != Some(std::ffi::OsStr::new("0")),
             retain_blocks: std::env::var_os("CARRICK_SOFT_AARCH64_CACHE").as_deref()
                 != Some(std::ffi::OsStr::new("0")),
             retain_on_handoff: std::env::var_os("CARRICK_SOFT_AARCH64_HANDOFF_CACHE").as_deref()
@@ -343,7 +348,8 @@ impl HostBlockRunner {
         budget: Option<ChainBudget<'_>>,
     ) -> ChainExit<HostCode> {
         let top = self.region.len() - 1;
-        self.region[top].load_from(cpu);
+        let transfer_vectors = code.simd || !self.omit_scalar_vector_copy;
+        self.region[top].load_for_launch(cpu, transfer_vectors);
         let (read_ptr, write_ptr) = match &mut memory.ram {
             InlineRam::None => (0, 0),
             InlineRam::Separate { read, write } => (
@@ -398,8 +404,10 @@ impl HostBlockRunner {
         };
         self.region[top].slots[frame::INLINE_READ_PTR as usize / 8] = 0;
         self.region[top].slots[frame::INLINE_WRITE_PTR as usize / 8] = 0;
-        self.region[top].store_to(cpu);
-        self.vector_frame_bytes += 2 * size_of_val(&cpu.vectors) as u64;
+        self.region[top].store_after_launch(cpu, transfer_vectors);
+        if transfer_vectors {
+            self.vector_frame_bytes += 2 * size_of_val(&cpu.vectors) as u64;
+        }
         let slots = &mut self.region[top].slots;
         if budget.is_some() {
             let last = bank
