@@ -17,6 +17,50 @@ pub struct SelectedBackingPlan {
     fault_page: u64,
 }
 
+#[cfg(test)]
+mod publication_decline_tests {
+    use super::{PublicationDecline, PublicationNotNow};
+    use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+
+    #[test]
+    fn publication_declines_distinguish_progress_from_terminal_refusals() {
+        assert_eq!(
+            PublicationDecline::from_descriptor(DescriptorRefusal::Contended),
+            PublicationDecline::NotNow(PublicationNotNow::Contended),
+        );
+        for reason in [
+            DescriptorRefusal::TablesExhausted,
+            DescriptorRefusal::JournalCapacity,
+            DescriptorRefusal::ResidencyCapacity,
+        ] {
+            assert_eq!(
+                PublicationDecline::from_descriptor(reason),
+                PublicationDecline::NotNow(PublicationNotNow::Capacity(reason)),
+            );
+        }
+        assert_eq!(
+            PublicationDecline::from_descriptor(DescriptorRefusal::Occupied),
+            PublicationDecline::InheritedPrepared,
+        );
+        for reason in [
+            DescriptorRefusal::StaleRoot,
+            DescriptorRefusal::WrongMm,
+            DescriptorRefusal::Malformed,
+            DescriptorRefusal::BadEncoding,
+            DescriptorRefusal::NotPrivateAnonymous,
+            DescriptorRefusal::PermissionWidening,
+            DescriptorRefusal::CowArmed,
+            DescriptorRefusal::ExcludedOutput,
+            DescriptorRefusal::CarrickOwnedWindow,
+        ] {
+            assert_eq!(
+                PublicationDecline::from_descriptor(reason),
+                PublicationDecline::Terminal(reason),
+            );
+        }
+    }
+}
+
 impl SelectedBackingPlan {
     /// Authenticate a selected span against the admitted request and its
     /// page-aligned fault identity. Callers cannot manufacture a plan for a
