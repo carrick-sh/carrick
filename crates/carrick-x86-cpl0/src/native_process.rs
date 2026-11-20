@@ -373,6 +373,7 @@ pub(super) struct Born {
     prepared: Prepared,
     child_task: u64,
     child_execution: u64,
+    child_entry_task: carrick_core_abi::EntryTaskKey,
 }
 pub(super) struct Service {
     task: &'static CurrentTask,
@@ -999,19 +1000,14 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         }
     }
     fn commit_mm(&mut self, p: Prepared) -> Result<Box<Born>, (NativeProcessError, Prepared)> {
-        let child_task = p.address.mm.raw().get();
-        let child_execution = carrick_core_abi::SnapshotGeneration::INITIAL.raw();
-        self.commit_child(
-            p,
-            NonZeroU64::new(child_task).unwrap_or(NonZeroU64::MIN),
-            NonZeroU64::new(child_execution).unwrap_or(NonZeroU64::MIN),
-        )
+        Err((NativeProcessError::Invalid, p))
     }
     fn commit_child(
         &mut self,
         mut p: Prepared,
         child_task: core::num::NonZeroU64,
         child_execution: core::num::NonZeroU64,
+        child_entry_task: carrick_core_abi::EntryTaskKey,
     ) -> Result<Box<Born>, (NativeProcessError, Prepared)> {
         let result = portal()
             .map_err(NativeProcessError::from)
@@ -1045,6 +1041,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 prepared: p,
                 child_task: child_task.get(),
                 child_execution: child_execution.get(),
+                child_entry_task,
             })),
             Err(e) => Err((e, p)),
         }
@@ -1369,7 +1366,8 @@ fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<B
         p.child.completion(),
         born.child_task,
         born.child_execution,
-    ) else {
+    )
+    .and_then(|settlement| settlement.with_child_entry_task(born.child_entry_task)) else {
         return Err((NativeProcessError::Stale, born));
     };
     // SAFETY: exact completion record remains owned across the stopped crossing;
