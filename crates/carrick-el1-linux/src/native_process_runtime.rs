@@ -9462,6 +9462,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn is_root_process(&self) -> bool {
         NativeProcessEntry::is_root_process(self)
     }
+
+    fn monotonic_counter(
+        &mut self,
+    ) -> Option<(
+        carrick_guest_arch::CounterTick,
+        carrick_guest_arch::CounterFrequency,
+    )> {
+        let frequency = self.service.signal_frequency().ok()?;
+        let now = self.service.signal_now().ok()?;
+        Some((now, frequency))
+    }
     fn owns_descriptor_namespace(&self) -> bool {
         self.source.zone.record(self.record.id).is_native_owned()
     }

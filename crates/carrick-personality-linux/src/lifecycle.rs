@@ -216,7 +216,7 @@ use crate::thread::{
 use carrick_core::Served;
 use carrick_core_abi::EntryMmKey;
 use carrick_core_abi::ExecutionBinding;
-use carrick_guest_arch::UserVa;
+use carrick_guest_arch::{CounterFrequency, CounterTick, UserVa};
 use carrick_sched_core::{RecordRef, ThreadIdentity};
 use core::sync::atomic::Ordering;
 
@@ -266,6 +266,9 @@ pub trait CopyoutEffect: Send {
 }
 
 pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
+    fn monotonic_counter(&mut self) -> Option<(CounterTick, CounterFrequency)> {
+        None
+    }
     /// Native scheduler publication belongs to the admitted process execution
     /// owner, which also delivers architecture-specific wake effects.
     fn native_futex(
@@ -613,6 +616,9 @@ impl From<carrick_sched_core::Requeue> for BornEnqueue {
 /// ISA hooks acquire retained metadata and move real native context. They do
 /// not route, validate clone flags, lower errno or publish entry completion.
 pub trait LifecycleNative<'a>: UserCopy {
+    fn monotonic_counter(&mut self) -> Option<(CounterTick, CounterFrequency)> {
+        None
+    }
     /// Resume an input before any syscall effect has been committed.
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
     /// Retain a completed setup operation's original output after `NotYet`.
