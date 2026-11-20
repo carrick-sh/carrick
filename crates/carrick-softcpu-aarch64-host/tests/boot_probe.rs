@@ -425,6 +425,7 @@ fn guest_code_write_replaces_the_resident_translation() {
     set_x(&mut cpu, 2, CODE);
     set_x(&mut cpu, 3, WRITER);
     set_x(&mut cpu, 4, CODE);
+    assert_eq!(memory.code_generation(FrameGpa::new(CODE)), None);
     let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
     let report = probe(&mut cpu, &mut memory, &mut runner, 8);
     let Stop::Event {
@@ -442,6 +443,11 @@ fn guest_code_write_replaces_the_resident_translation() {
     );
     assert_eq!(report.work.executed_blocks, 4);
     assert_eq!(report.work.retired_instructions, 5);
+    assert_eq!(report.work.emitted_blocks, 4);
+    assert_eq!(
+        memory.code_generation(FrameGpa::new(CODE)),
+        Some(CodeGeneration(2))
+    );
 }
 
 #[test]
