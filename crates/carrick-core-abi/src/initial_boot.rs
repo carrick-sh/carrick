@@ -3,7 +3,7 @@
 //! supervisor direct alias. No host pointer crosses this record.
 
 pub const X86_INITIAL_BOOT_MAGIC: u64 = u64::from_le_bytes(*b"CXRUN001");
-pub const X86_INITIAL_BOOT_VERSION: u32 = 7;
+pub const X86_INITIAL_BOOT_VERSION: u32 = 8;
 pub const X86_INITIAL_BOOT_HEADER_GPA: u64 = 0x10_1000;
 pub const X86_INITIAL_BOOT_PORT: u16 = 0xc6;
 /// Physical stop after the initial MM is installed, before entering EL0.
@@ -35,6 +35,9 @@ pub struct X86InitialBootHeader {
     pub peer_entry_va: u64,
     pub layout_hash: u64,
 }
+
+/// Both time pages are present in the image and may be advertised through auxv.
+pub const X86_INITIAL_HAS_VDSO: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -73,7 +76,7 @@ pub struct X86InitialBootRequest {
     pub interpreter_base: u64,
     /// The region prefix belonging to the executable, excluding PT_INTERP.
     pub executable_region_count: u32,
-    pub reserved: u32,
+    pub image_features: u32,
     /// Shared host/guest layout fingerprint authenticated before publication.
     pub layout_hash: u64,
 }

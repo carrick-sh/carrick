@@ -68,6 +68,7 @@ struct ExecRegion {
 pub struct X86ExecImage {
     regions: Vec<ExecRegion>,
     executable_region_count: usize,
+    has_vdso: bool,
     entry: u64,
     executable_entry: u64,
     interpreter_base: u64,
@@ -105,6 +106,40 @@ impl X86ExecImage {
     ) -> Result<Self, LinuxErrno> {
         Self::check_arguments(&argv, &env)?;
         let image = prepare_x86_elf(program).map_err(|_| LINUX_ENOEXEC)?;
+        let (stack_pointer, demand) = Self::image_placement(&image, &argv, &env)?;
+        Ok(Self {
+            regions: image
+                .regions
+                .iter()
+                .map(|region| ExecRegion {
+                    start: region.start,
+                    end: region.end,
+                    initialized_offset: region.initialized_offset,
+                    file_bytes: region.file_bytes.to_vec(),
+                    perms: region.perms,
+                })
+                .collect(),
+            executable_region_count: image.executable_region_count,
+            has_vdso: false,
+            entry: image.entry,
+            executable_entry: image.executable_entry,
+            interpreter_base: image.interpreter_base,
+            phdr: image.phdr,
+            phent: image.phent,
+            phnum: image.phnum,
+            argv,
+            env,
+            stack_pointer,
+            demand,
+            executable: None,
+        })
+    }
+
+    fn image_placement(
+        image: &X86InitialImage<'_>,
+        argv: &[Vec<u8>],
+        env: &[Vec<u8>],
+    ) -> Result<(u64, ImageFrameDemand), LinuxErrno> {
         let argv_bytes: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
         let env_bytes: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
         // The stack pointer does not depend on AT_RANDOM's bytes, only on
@@ -121,12 +156,13 @@ impl X86ExecImage {
             random: [0; 16],
             stack_top: INITIAL_STACK_TOP,
             stack_size: INITIAL_STACK_SIZE,
+            has_vdso: image.has_vdso,
         })
         .map_err(|error| match error {
             InitialMmError::StackTooLarge => LINUX_ENOSYS,
             _ => LINUX_ENOEXEC,
         })?;
-        let rows = x86_image_rows(&image);
+        let rows = x86_image_rows(image);
         let stack_row = ImageStack {
             top: UserVa::new(INITIAL_STACK_TOP),
             size: carrick_guest_arch::GuestLen::new(INITIAL_STACK_SIZE),
@@ -140,31 +176,37 @@ impl X86ExecImage {
         )
         .map_err(|_| LINUX_ENOEXEC)?;
         let demand = image_frame_demand(&rows, stack_row).ok_or(LINUX_ENOEXEC)?;
-        Ok(Self {
-            regions: image
-                .regions
-                .iter()
-                .map(|region| ExecRegion {
-                    start: region.start,
-                    end: region.end,
-                    initialized_offset: region.initialized_offset,
-                    file_bytes: region.file_bytes.to_vec(),
-                    perms: region.perms,
-                })
-                .collect(),
-            executable_region_count: image.executable_region_count,
-            entry: image.entry,
-            executable_entry: image.executable_entry,
-            interpreter_base: image.interpreter_base,
-            phdr: image.phdr,
-            phent: image.phent,
-            phnum: image.phnum,
-            argv,
-            env,
-            stack_pointer: stack.rsp,
-            demand,
-            executable: None,
-        })
+        Ok((stack.rsp, demand))
+    }
+
+    fn attach_vdso(&mut self, clock: carrick_mem::vdso::X86NativeVvar) -> Result<(), LinuxErrno> {
+        let base = self.regions.len();
+        if self.has_vdso || base + 2 > carrick_core_abi::X86_INITIAL_MAX_REGIONS {
+            return Ok(());
+        }
+        let vvar = clock.bytes();
+        let vdso = carrick_mem::vdso::x8664_vdso_image_bytes();
+        let Ok(image) = self.initial_image().with_vdso(&vvar, &vdso) else {
+            // An ELF can occupy those addresses. It still executes without
+            // advertising the overlay in its auxiliary vector.
+            return Ok(());
+        };
+        let (stack_pointer, demand) = Self::image_placement(&image, &self.argv, &self.env)?;
+        let [vvar, vdso] = &image.regions[base..] else {
+            return Err(LINUX_ENOEXEC);
+        };
+        let regions = [vvar, vdso].map(|region| ExecRegion {
+            start: region.start,
+            end: region.end,
+            initialized_offset: region.initialized_offset,
+            file_bytes: region.file_bytes.to_vec(),
+            perms: region.perms,
+        });
+        self.regions.extend(regions);
+        self.has_vdso = true;
+        self.stack_pointer = stack_pointer;
+        self.demand = demand;
+        Ok(())
     }
 
     /// Retain the loader's executable through parking, cancellation and adoption.
@@ -197,6 +239,7 @@ impl X86ExecImage {
                 })
                 .collect(),
             executable_region_count: self.executable_region_count,
+            has_vdso: self.has_vdso,
         }
     }
 
@@ -228,6 +271,7 @@ impl X86ExecImage {
             entry: self.entry,
             executable_entry: self.executable_entry,
             interpreter_base: self.interpreter_base,
+            has_vdso: self.has_vdso,
             phdr: self.phdr,
             phent: self.phent,
             phnum: self.phnum,
@@ -868,10 +912,15 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         &mut self,
         cpu: carrick_guest_arch::CpuId,
         receipt: ExecAdoptionReceipt,
-        request: X86ExecRequest,
+        mut request: X86ExecRequest,
         wake: StockReleaseWake,
         random: [u8; 16],
     ) -> Result<X86ExecStage, TrapError> {
+        if let Some(clock) = self.clock_vvar
+            && let Err(errno) = request.image.attach_vdso(clock)
+        {
+            return Ok(X86ExecStage::Refused(errno));
+        }
         let ram = Arc::clone(&self.ram);
         let (roots, zone) = Self::exec_tables(&ram)?;
         let mut frames = CarrierExecFrames {
