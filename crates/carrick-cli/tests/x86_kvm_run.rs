@@ -2619,7 +2619,82 @@ fn mounted_static_x86_xattr_crossings_match_native() {
 
 #[test]
 fn mounted_static_x86_xattr_crossings_in_a_fork_child_refuse_in_ring() {
-    forked_child_crossings_refuse_in_ring("x86_b1_xattr.S");
+    if skip_without_kvm() {
+        return;
+    }
+    let fixture = "x86_b1_xattr.S";
+    let native = run_crossing_fixture(fixture, &["-DCHILD", "-DNATIVE_ORACLE"], false);
+    assert_eq!(native.stdout, b"F\n", "native child xattr: {native:?}");
+    assert_eq!(native.status.code(), Some(7));
+
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("xattr-child");
+    compile_assembly_with_flags(fixture, &elf, &["-DCHILD"]);
+    let archive = dir.path().join("image.tar");
+    std::fs::write(&archive, empty_image_archive()).unwrap();
+    let cli = assert_cmd::cargo::cargo_bin("carrick");
+    let home = dir.path().join("home");
+    let census_dir = dir.path().join("census");
+    let load = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .env("CARRICK_HOME", &home)
+        .args(["load", "--input", archive.to_str().unwrap()])
+        .output()
+        .expect("load local xattr image");
+    assert!(
+        load.status.success(),
+        "load stderr: {}",
+        String::from_utf8_lossy(&load.stderr)
+    );
+    let scoped_run_id = match std::env::var("CARRICK_RUN_ID") {
+        Ok(scope) => format!("{scope}-x86-kvm-xattr-child-test"),
+        Err(_) => "x86-kvm-xattr-child-test".to_owned(),
+    };
+    let run = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .env("CARRICK_HOME", &home)
+        .env("CARRICK_RUN_ID", &scoped_run_id)
+        .env("CARRICK_EL1_CENSUS", &census_dir)
+        .args([
+            "run",
+            "--platform",
+            "linux/amd64",
+            "--pull",
+            "never",
+            "--volume",
+            &format!("{}:/hello:ro", elf.display()),
+            "x86-kvm-hello:latest",
+        ])
+        .output()
+        .expect("run child xattr crossing witness");
+    assert_eq!(
+        run.stdout,
+        b"F\n",
+        "{fixture} child: exit {:?}; stderr: {}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.status.code(), Some(7), "{fixture} child");
+    assert!(run.stderr.is_empty(), "{fixture} child: {:?}", run.stderr);
+    let census_files: Vec<_> = std::fs::read_dir(&census_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(census_files.len(), 1);
+    let census: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&census_files[0]).unwrap()).unwrap();
+    assert_eq!(census["refusal_evidence"]["complete"], true);
+    assert_eq!(
+        census["refusal_evidence"]["rows"],
+        serde_json::json!([{
+            "nr": 197,
+            "caller": "native_child",
+            "refused": 2,
+            "venue_refused": 0,
+            "allowlisted": true,
+        }]),
+        "only the two unrouted removexattr calls refuse in ring: {census}"
+    );
 }
 
 /// #2107: the mounted CLI root must share the host file authority, even
