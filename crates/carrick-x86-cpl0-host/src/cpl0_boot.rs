@@ -1445,10 +1445,10 @@ mod forward_execution_tests {
             ),
             sibling.thread_generation,
         );
-        assert_eq!(
+        assert!(matches!(
             admitted.authenticate_typed(carrier_binding(context, 12)),
-            Ok(())
-        );
+            Err(ForwardBindingRefusal::TaskIdMismatch { .. })
+        ));
     }
 
     /// #2142: after a root `execve`, the forward leader rule names the run
