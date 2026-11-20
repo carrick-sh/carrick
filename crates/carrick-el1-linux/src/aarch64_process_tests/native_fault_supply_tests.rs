@@ -275,6 +275,8 @@ enum GroupExitCaller {
 enum ChildStockCase {
     FirstBirth,
     AdvisoryMmap,
+    AdvisoryAdvice,
+    AdvisoryRemap,
     Reuse,
     Pinned,
     Claimed,
@@ -289,19 +291,38 @@ fn native_fork_child_advisory_mmap_stays_in_ring() {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[test]
+fn native_fork_child_advice_stays_in_ring() {
+    child_thread_admission(0, 0, ChildStockCase::AdvisoryAdvice);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_fork_child_remap_stays_in_ring() {
+    child_thread_admission(0, 0, ChildStockCase::AdvisoryRemap);
+}
+
+#[cfg(not(target_os = "macos"))]
 fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     const LENGTH: u64 = 256 * 1024 * 1024;
-    let fixture = Box::leak(Box::new(if case == ChildStockCase::AdvisoryMmap {
-        Fixture::with_page_and_arena(
-            0x10000,
-            asid(1),
-            5,
-            Box::leak(Box::new(ThreadLifecyclePage::new())),
-            LENGTH * 2 + 8192,
-        )
-    } else {
-        Fixture::new(0x10000, asid(1))
-    }));
+    let fixture = Box::leak(Box::new(
+        if matches!(
+            case,
+            ChildStockCase::AdvisoryMmap
+                | ChildStockCase::AdvisoryAdvice
+                | ChildStockCase::AdvisoryRemap
+        ) {
+            Fixture::with_page_and_arena(
+                0x10000,
+                asid(1),
+                5,
+                Box::leak(Box::new(ThreadLifecyclePage::new())),
+                LENGTH * 2 + 8192,
+            )
+        } else {
+            Fixture::new(0x10000, asid(1))
+        },
+    ));
     let metadata_scope = MetadataScope::new(fixture);
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -311,7 +332,10 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     if !matches!(
         case,
-        ChildStockCase::FirstBirth | ChildStockCase::AdvisoryMmap
+        ChildStockCase::FirstBirth
+            | ChildStockCase::AdvisoryMmap
+            | ChildStockCase::AdvisoryAdvice
+            | ChildStockCase::AdvisoryRemap
     ) {
         let mut physical = super::native_retirement_tests::PhysicalStock::new(&fixture.tables);
         physical.metadata_in_el1_window = true;
@@ -391,7 +415,12 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     ));
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
     let residency = carrick_el1::cow::test_support::residency_table();
-    if case == ChildStockCase::AdvisoryMmap {
+    if matches!(
+        case,
+        ChildStockCase::AdvisoryMmap
+            | ChildStockCase::AdvisoryAdvice
+            | ChildStockCase::AdvisoryRemap
+    ) {
         let mut editor = FixtureMapping {
             words,
             residency: &residency,
@@ -408,6 +437,11 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                 &counters,
                 Some(&mut editor),
             );
+            if case != ChildStockCase::AdvisoryMmap
+                && route == carrick_personality_linux::dispatch::CompletionRoute::Forward
+            {
+                return -38;
+            }
             assert_eq!(counters.forwarded[nr as usize].load(Ordering::Relaxed), 0);
             use carrick_personality_linux::dispatch::CompletionRoute;
             assert!(
@@ -420,6 +454,46 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             let _ = fixture.task.linux.take_served_boundary();
             frame.x[0] as i64
         };
+        if case != ChildStockCase::AdvisoryMmap {
+            let mapped = call(222, [0x10000000, LENGTH, 0, 0x4022, u64::MAX, 0]);
+            let errno = |result: i64| -result.min(0);
+            println!("mmap {}", errno(mapped));
+            assert!(mapped > 0);
+            let va = mapped as u64;
+            let protection = call(226, [va, 4096, 3, 0, 0, 0]);
+            println!("mprotect {}", errno(protection));
+            let advice_results = [
+                ("MADV_DONTNEED", LENGTH, 4),
+                ("MADV_FREE", 4096, 8),
+                ("MADV_DONTDUMP", 4096, 16),
+                ("MADV_HUGEPAGE", 4096, 14),
+                ("MADV_INVALID", 4096, u64::MAX),
+            ]
+            .map(|(name, len, advice)| {
+                let result = call(233, [va, len, advice, 0, 0, 0]);
+                println!("{name} {}", errno(result));
+                result
+            });
+            let remap = if case == ChildStockCase::AdvisoryRemap {
+                let result = call(216, [va, 4096, 8192, 1, 0, 0]);
+                println!("mremap {}", errno(result));
+                if result > 0 && result != mapped {
+                    assert_eq!(call(215, [result as u64, 8192, 0, 0, 0, 0]), 0);
+                }
+                Some(result)
+            } else {
+                None
+            };
+            let unmap = call(215, [va, LENGTH, 0, 0, 0, 0]);
+            println!("munmap {}", errno(unmap));
+            assert_eq!(protection, 0, "mprotect");
+            assert_eq!(unmap, 0, "munmap");
+            if let Some(result) = remap {
+                assert!(result > 0, "mremap returned {result}");
+            }
+            assert_eq!(advice_results, [0, 0, 0, 0, -22], "madvise results");
+            return;
+        }
         fixture.task.linux.mark_pending_host_work();
         for hint in [0x10000000, 0x200000000, 0x1000000000000000, 0] {
             let mapped = call(222, [hint, LENGTH, 0, 0x4022, u64::MAX, 0]);
@@ -1162,7 +1236,8 @@ impl carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
                 DelegatedStep::Served(SyscallResult::new(self.call.result().0 as i64))
             }
             DelegatedAnonymous::Forward => DelegatedStep::Forward,
-            other => panic!("unexpected delegated mmap outcome: {other:?}"),
+            DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
+            other => panic!("unexpected delegated anonymous outcome: {other:?}"),
         }
     }
 

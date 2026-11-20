@@ -4,7 +4,7 @@
 .global _start
 .text
 _start:
-#ifndef EXEC_SUCCESSOR
+#if !defined(EXEC_SUCCESSOR) && !defined(ROOT_ONLY)
     mov $57, %eax
     syscall
     test %eax, %eax
@@ -16,6 +16,9 @@ _start:
     mov %rax, %r14
     call writable
     movb $37, (%r14)
+#if defined(ADVICE) || defined(REMAP)
+    push %r14
+#endif
     sub $16, %rsp
     mov %rsp, %rsi
     mov %r13d, %edi
@@ -31,7 +34,15 @@ _start:
     test $127, %edi
     jnz failure
     shr $8, %edi
+#if defined(ADVICE) || defined(REMAP)
+    test %edi, %edi
+    jnz exit
+    add $16, %rsp
+    pop %r14
+    jmp advice
+#else
     jmp exit
+#endif
 
 child:
 #endif
@@ -46,6 +57,9 @@ child:
     movb $51, (%r14)
     cmpb $51, (%r14)
     jne failure
+#if defined(ADVICE) || defined(REMAP)
+    jmp advice
+#endif
     mov %r14, %rdi
     call release
 
@@ -121,4 +135,108 @@ release:
     test %eax, %eax
     jnz failure
     ret
+#if defined(ADVICE) || defined(REMAP)
+/* Run all steps even on red. r12 keeps the first errno for the test harness. */
+.macro report name
+    lea .Lname\@(%rip), %rsi
+    mov $(.Lend\@ - .Lname\@), %edx
+    call report_errno
+    .pushsection .rodata
+.Lname\@:
+    .ascii "\name "
+.Lend\@:
+    .popsection
+.endm
+
+.macro advise name, value, size
+    mov %r14, %rdi
+    mov $\size, %esi
+    mov $\value, %edx
+    mov $28, %eax
+    syscall
+    report \name
+.endm
+
+advice:
+    xor %r12d, %r12d
+    xor %eax, %eax
+    report mmap
+    report mprotect
+    advise MADV_DONTNEED, 4, 0x10000000
+    test %rax, %rax
+    js 1f
+    cmpb $0, (%r14)
+    jne failure
+1:
+    movb $73, (%r14)
+    advise MADV_FREE, 8, 4096
+    advise MADV_DONTDUMP, 16, 4096
+    advise MADV_HUGEPAGE, 14, 4096
+#ifdef REMAP
+    mov %r14, %rdi
+    mov $4096, %esi
+    mov $8192, %edx
+    mov $1, %r10d
+    mov $25, %eax
+    syscall
+    report mremap
+    test %rax, %rax
+    js 2f
+    cmpb $73, (%rax)
+    jne failure
+    cmpb $0, 4096(%rax)
+    jne failure
+    cmp %r14, %rax
+    je 2f
+    mov %rax, %rdi
+    mov $8192, %esi
+    mov $11, %eax
+    syscall
+    report munmap_moved
+2:
+#endif
+    mov %r14, %rdi
+    mov $0x10000000, %esi
+    mov $11, %eax
+    syscall
+    report munmap
+    mov %r12d, %edi
+    jmp exit
+
+report_errno:
+    push %rax
+    mov $1, %eax
+    mov $1, %edi
+    syscall
+    mov (%rsp), %rax
+    xor %edi, %edi
+    test %rax, %rax
+    jns 3f
+    neg %eax
+    mov %eax, %edi
+    test %r12d, %r12d
+    cmovz %eax, %r12d
+3:
+    sub $16, %rsp
+    lea 15(%rsp), %rsi
+    movb $10, (%rsi)
+    mov %edi, %eax
+    mov $10, %ecx
+4:
+    xor %edx, %edx
+    div %ecx
+    add $48, %dl
+    dec %rsi
+    mov %dl, (%rsi)
+    test %eax, %eax
+    jnz 4b
+    lea 16(%rsp), %rdx
+    sub %rsi, %rdx
+    mov $1, %eax
+    mov $1, %edi
+    syscall
+    add $16, %rsp
+    pop %rax
+    ret
+#endif
 .section .note.GNU-stack,"",@progbits

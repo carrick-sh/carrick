@@ -161,6 +161,45 @@ fn serial_host_native_child_advisory_mmap_stays_in_ring() {
 }
 
 #[test]
+fn serial_host_native_anonymous_advice_stays_in_ring() {
+    native_anonymous_advice_fixture("-DADVICE");
+}
+
+#[test]
+fn serial_host_native_anonymous_remap_stays_in_ring() {
+    native_anonymous_advice_fixture("-DREMAP");
+}
+
+fn native_anonymous_advice_fixture(mode: &str) {
+    let runs = [&[mode, "-DROOT_ONLY"][..], &[mode][..]].map(|flags| {
+        let elf = native_exit_fixture_with_flags("native_child_mmap_hint.S", flags);
+        try_run_pool_fixture_with_root_affinity(&elf, 192, ROOT_AFFINITY_IDLE_PEER)
+            .expect("native anonymous advice")
+    });
+    for (index, outcome) in runs.iter().enumerate() {
+        let venue = if index == 0 { "root" } else { "fork" };
+        println!("{venue}:\n{}", String::from_utf8_lossy(&outcome.run.stdout));
+    }
+    assert_eq!(
+        runs.each_ref().map(|outcome| outcome.run.exit_code),
+        [0, 0],
+        "{mode}"
+    );
+    for (index, outcome) in runs.iter().enumerate() {
+        let counters = outcome
+            .physical
+            .syscall_counters()
+            .expect("stopped counters");
+        let load = |counter: &std::sync::atomic::AtomicU64| {
+            counter.load(std::sync::atomic::Ordering::Acquire)
+        };
+        assert_eq!(load(&counters.served[233]), 4 * (index as u64 + 1));
+        assert_eq!(load(&counters.forwarded[233]), 0);
+        assert_eq!(load(&counters.refused[28]), 0);
+    }
+}
+
+#[test]
 fn serial_host_native_exec_successor_advisory_mmap_stays_in_ring() {
     let directory = tempfile::tempdir().expect("successor directory");
     let successor = directory.path().join("successor");
