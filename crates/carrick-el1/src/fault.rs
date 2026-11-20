@@ -168,6 +168,11 @@ pub struct PreparedFaultPath<
 #[cfg(target_os = "none")]
 pub struct HardwarePreparedResolver;
 
+#[cfg(any(target_os = "none", test))]
+const fn hardware_inherited_prepared_supply() -> bool {
+    true
+}
+
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub(crate) fn hardware_live_ttbr() -> u64 {
     crate::isa::aarch64::hardware_live_ttbr()
@@ -254,7 +259,7 @@ impl PreparedPageResolver for HardwarePreparedResolver {
         Ok(outcome)
     }
     fn inherited_prepared_supply(&self) -> bool {
-        true
+        hardware_inherited_prepared_supply()
     }
 }
 
@@ -1789,6 +1794,11 @@ mod tests {
         EL1_FRAME_GRANT_TARGET_SIZE, FRAME_GRANT_ERR_DENIED, FrameGrantMailbox, FrameGrantReady,
     };
     use carrick_sched_core::AddressSpaces;
+
+    #[test]
+    fn arm_hardware_resolver_supplies_inherited_prepared_fault_pages() {
+        assert!(hardware_inherited_prepared_supply());
+    }
 
     #[test]
     fn cow_caller_receives_exact_parked_root_incarnation() {
