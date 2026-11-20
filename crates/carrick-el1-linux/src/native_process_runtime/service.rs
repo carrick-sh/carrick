@@ -391,6 +391,7 @@ pub(super) struct OwnedCopyout<'a> {
 
 pub(super) enum CopyoutData {
     Bytes { address: UserVa, bytes: Vec<u8> },
+    Pair(Box<[(UserVa, Vec<u8>); 2]>),
     Poll(Vec<carrick_syscall_abi::PollReventsOutput>),
 }
 
@@ -398,6 +399,7 @@ impl CopyoutData {
     fn len(&self) -> usize {
         match self {
             Self::Bytes { bytes, .. } => bytes.len(),
+            Self::Pair(records) => records[0].1.len() + records[1].1.len(),
             Self::Poll(fields) => fields.len() * 2,
         }
     }
@@ -410,6 +412,20 @@ impl CopyoutData {
                     .checked_add(offset as u64)
                     .ok_or(NativeProcessError::Fault)?;
                 (UserVa::new(address), &bytes[offset..])
+            }
+            Self::Pair(records) => {
+                let first_len = records[0].1.len();
+                let (index, within) = if offset < first_len {
+                    (0, offset)
+                } else {
+                    (1, offset - first_len)
+                };
+                let (address, bytes) = &records[index];
+                let address = address
+                    .raw()
+                    .checked_add(within as u64)
+                    .ok_or(NativeProcessError::Fault)?;
+                (UserVa::new(address), &bytes[within..])
             }
             Self::Poll(fields) => {
                 let (address, bytes) = fields[offset / 2]
@@ -1073,7 +1089,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let previous_prepared_offset = prepared_offset.take();
             let (address, bytes) = output.data.unit(output.offset)?;
             let count = bytes.len();
-            if matches!(output.data, CopyoutData::Poll(_))
+            if matches!(output.data, CopyoutData::Poll(_) | CopyoutData::Pair(_))
                 && !carrick_guest_arch::lower_half_range(address.raw(), count as u64)
             {
                 return Err(NativeProcessError::Fault);
