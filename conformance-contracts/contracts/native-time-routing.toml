@@ -9,8 +9,8 @@
 schema_version = 1
 id = "kernel.time.native-routing"
 title = "Native fork children reach the shared time service"
-guest_surfaces = ["syscall:clock_gettime", "syscall:clock_getres", "syscall:gettimeofday", "syscall:time", "syscall:clock_adjtime", "syscall:adjtimex", "syscall:nanosleep", "syscall:clock_nanosleep"]
-semantic_authority = ["man 2 clock_gettime", "man 2 clock_getres", "man 2 gettimeofday", "man 2 time", "man 2 clock_adjtime", "man 2 adjtimex", "man 2 nanosleep", "man 2 clock_nanosleep", "native Linux x86_64 null-pointer syscall oracle"]
+guest_surfaces = ["syscall:clock_gettime", "syscall:clock_getres", "syscall:gettimeofday", "syscall:time", "syscall:times", "syscall:clock_adjtime", "syscall:adjtimex", "syscall:nanosleep", "syscall:clock_nanosleep"]
+semantic_authority = ["man 2 clock_gettime", "man 2 clock_getres", "man 2 gettimeofday", "man 2 time", "man 2 times", "man 2 clock_adjtime", "man 2 adjtimex", "man 2 nanosleep", "man 2 clock_nanosleep", "native Linux x86_64 null-pointer syscall oracle"]
 fixture = "native-fork-child-time-handler"
 scale_points = [2]
 structural_budgets = []
@@ -23,6 +23,7 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_clock_gettime_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_monotonic_raw_clock_gettime_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_realtime_clocks_reach_time_handler",
+  "carrick-el1-linux::aarch64_process_tests::native_fork_child_cputime_and_times_reach_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_gettimeofday_accepts_null_outputs",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_clock_nanosleep_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_absolute_clock_nanosleep_reaches_time_handler",
@@ -58,7 +59,7 @@ vm_free = [
 [bindings.unresolved]
 # Slice 3 witnesses remain in source with an explicit #1808 ignore reason.
 vm_free = "Other clock IDs and adjtimex/clock_adjtime remain outstanding. Absolute CLOCK_REALTIME/TAI child sleeps keep the counted ENOSYS refusal until a durable realtime authority exists (#1981)."
-kvm = "Executing x86 bindings: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_root_and_child_clock_getres and carrick-vmm-kvm::cpl0_initial_mm::{serial_host_native_root_and_child_monotonic_clock_gettime, serial_host_native_root_and_child_vdso_monotonic_matches_raw_clock, serial_host_native_exec_successor_vdso_monotonic_matches_raw_clock, serial_host_native_root_and_child_vdso_realtime_matches_raw_clock, serial_host_native_exec_successor_vdso_realtime_matches_raw_clock, serial_host_native_root_and_child_gettimeofday_matches_vdso, serial_host_native_root_and_child_time_matches_vdso, serial_host_native_child_nanosleep_returns_zero, serial_host_native_child_zero_nanosleep_returns_zero, serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero, serial_host_native_child_absolute_monotonic_clock_nanosleep_reaches_deadline, serial_host_native_child_clock_nanosleep_clocks_and_flags_match_linux} and carrick-vmm-kvm::cpl0_entry::{serial_host_native_child_sleep_deadline_crossing_between_checks_returns_zero, serial_host_native_child_sleep_eintr_writes_the_remainder, serial_host_native_child_sleep_eintr_retains_a_busy_remainder, serial_host_native_child_sleep_eintr_writes_a_cow_remainder}; serial_host_native_child_sleep_eintr_writes_a_lazy_remainder is ignored on #1984 (fails before #1836 too). Requires real KVM; the contract evaluator has no registered KVM observation layer."
+kvm = "Executing x86 bindings: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_root_and_child_clock_getres and carrick-vmm-kvm::cpl0_initial_mm::{serial_host_native_root_and_child_monotonic_clock_gettime, serial_host_native_root_and_child_vdso_monotonic_matches_raw_clock, serial_host_native_exec_successor_vdso_monotonic_matches_raw_clock, serial_host_native_root_and_child_vdso_realtime_matches_raw_clock, serial_host_native_exec_successor_vdso_realtime_matches_raw_clock, serial_host_native_root_and_child_gettimeofday_matches_vdso, serial_host_native_root_and_child_time_matches_vdso, serial_host_native_root_and_child_cputime_and_times, serial_host_native_child_nanosleep_returns_zero, serial_host_native_child_zero_nanosleep_returns_zero, serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero, serial_host_native_child_absolute_monotonic_clock_nanosleep_reaches_deadline, serial_host_native_child_clock_nanosleep_clocks_and_flags_match_linux} and carrick-vmm-kvm::cpl0_entry::{serial_host_native_child_sleep_deadline_crossing_between_checks_returns_zero, serial_host_native_child_sleep_eintr_writes_the_remainder, serial_host_native_child_sleep_eintr_retains_a_busy_remainder, serial_host_native_child_sleep_eintr_writes_a_cow_remainder}; serial_host_native_child_sleep_eintr_writes_a_lazy_remainder is ignored on #1984 (fails before #1836 too). Requires real KVM; the contract evaluator has no registered KVM observation layer."
 embed_structural = "UNRUN: retained clock-output work meters have no signed binding yet. Sleep does no per-tick work: one timer node per parked sleeper."
 embed = "UNRUN (director): carrick-conformance-next forkexecstorm_witness case_forkexecstorm_ready_child_at_expired_deadline under the signed recipe, original pipeline syscall census and paired signed populations."
 docker = "UNRUN: native Linux x86_64 null-pointer checks are supplementary evidence, not the declared ARM64 Docker oracle."
