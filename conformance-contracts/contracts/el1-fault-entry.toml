@@ -43,6 +43,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-kernel::dispatch::mem::delegated_tests::{arm_read_production_publication_decline_then_success_is_bounded,x86_write_production_publication_decline_then_success_is_bounded}; production delegated-root selectors drive the shared publication policy through one MM-release park or one-page capacity fallback to success, inherited-Prepared replan, and bounded deterministic refusal (#2420)",
   "carrick-el1::fault::tests::{arm_retired_leaf_with_stale_residency_selects_fresh_owner_grant,x86_retired_leaf_with_stale_residency_selects_fresh_owner_grant}; a write translation fault on the exact captured retired-private leaf encoding must bypass a stale residency row and select fresh owner backing (#2420)",
   "carrick-el1-abi::tests (trap_frame_layout_and_offsets, counters_abi_layout)",
   "carrick-el1::fault::tests (dispatch_fault_increments_counter_and_forwards)",
