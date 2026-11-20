@@ -1085,8 +1085,10 @@ dependencies = [
  "carrick-guest-arch",
  "carrick-host-jit",
  "carrick-mem",
+ "carrick-mmu-core",
  "carrick-softcpu-aarch64",
  "carrick-softmmu",
+ "goblin",
 ]
 
 [[package]]
