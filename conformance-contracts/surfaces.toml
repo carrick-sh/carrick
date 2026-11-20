@@ -42,6 +42,7 @@ surfaces = [
   { path = "crates/carrick-cli/tests/x86_kvm_run.rs", contract = "diagnostics.syscall-refusal" },
   { path = "crates/carrick-cli/tests/x86_kvm_run.rs", contract = "kernel.el1.fault-entry" },
   { path = "crates/carrick-cli/tests/x86_kvm_run.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-cli/tests/x86_kvm_run.rs", contract = "process.exec.custody" },
   { path = "crates/carrick-cli/tests/x86_kvm_run.rs", contract = "runtime.image-entrypoint" },
   { path = "crates/carrick-cli/tests/x86_kvm_run.rs", contract = "x86.carrier.cli-run" },
   { path = "crates/carrick-conformance-next/tests/directory_copyout.rs", contract = "kernel.fs.directory-copyout" },

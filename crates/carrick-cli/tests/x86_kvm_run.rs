@@ -288,6 +288,179 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
     );
 }
 
+/// The host file `path` resolves to, and its bytes, for copying a host
+/// program and its loader into a test image at the same absolute path.
+fn host_image_file(path: &str) -> (String, Vec<u8>) {
+    (
+        path.trim_start_matches('/').to_owned(),
+        std::fs::read(path).expect("read host executable or shared object"),
+    )
+}
+
+/// The shared objects `ldd` names for `program`, as absolute paths.
+fn host_shared_objects(program: &str) -> Vec<String> {
+    let ldd = Command::new("ldd")
+        .timeout(Duration::from_secs(5))
+        .arg(program)
+        .output()
+        .expect("ldd");
+    assert!(ldd.status.success(), "ldd {program}: {ldd:?}");
+    String::from_utf8_lossy(&ldd.stdout)
+        .lines()
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find(|word| word.starts_with('/'))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// #2142: x86 `node-version` scoreboard row (`node:22-slim`) stops at the
+/// run root's exec: the image entrypoint `docker-entrypoint.sh` runs under
+/// `/bin/sh`, whose `exec "$@"` is the root's `execve` of `node`. On main it
+/// fails `exec: node: Function not implemented` (ENOSYS, exit 126). Here
+/// `/bin/sh` is the host's dynamically linked shell with its own loader and
+/// libc, and `node` is a static stand-in that prints its arguments and exits
+/// 7, so the witness needs no registry and isolates the exec.
+#[test]
+#[ignore = "#2142: root exec is still refused by the native service"]
+fn node_entrypoint_shell_execs_node_from_the_run_root() {
+    check_node_entrypoint_root_exec(false);
+}
+
+/// The shell's exec is of a script, which must enter the interpreter with
+/// Linux's rewritten argv through the same root exec path.
+#[test]
+#[ignore = "#2142: root exec is still refused by the native service"]
+fn node_entrypoint_shell_execs_a_script_from_the_run_root() {
+    check_node_entrypoint_root_exec(true);
+}
+
+fn check_node_entrypoint_root_exec(exec_script: bool) {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let node = dir.path().join("node");
+    compile_assembly("x86_entrypoint_argv.S", &node);
+    let node_bytes = std::fs::read(&node).unwrap();
+    let entrypoint = b"#!/bin/sh\nset -e\nexec \"$@\"\n";
+    // Native Linux oracle: the same shell, entrypoint and stand-in.
+    let script = dir.path().join("docker-entrypoint.sh");
+    std::fs::write(&script, entrypoint).unwrap();
+    let mut files = vec![host_image_file("/bin/sh")];
+    let (command, native_expected, guest_expected) = if exec_script {
+        let wrapper = dir.path().join("node-wrapper");
+        let native_script = format!("#!{} --script\n", node.display());
+        carrick_test_support::executable::write_executable(&wrapper, native_script.as_bytes());
+        files.push((
+            "usr/local/bin/node-wrapper".to_owned(),
+            b"#!/usr/local/bin/node --script\n".to_vec(),
+        ));
+        (
+            "node-wrapper",
+            format!("--script\n{}\n--version\n", wrapper.display()),
+            "--script\n/usr/local/bin/node-wrapper\n--version\n",
+        )
+    } else {
+        ("node", "--version\n".to_owned(), "--version\n")
+    };
+    let native = Command::new("/bin/sh")
+        .timeout(Duration::from_secs(5))
+        .env("PATH", dir.path())
+        .arg(&script)
+        .args([command, "--version"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        (native.status.code(), native.stdout.as_slice()),
+        (Some(7), native_expected.as_bytes()),
+        "native oracle: {native:?}"
+    );
+    files.extend(
+        host_shared_objects("/bin/sh")
+            .iter()
+            .map(|path| host_image_file(path)),
+    );
+    files.push(("usr/local/bin/node".to_owned(), node_bytes));
+    files.push((
+        "usr/local/bin/docker-entrypoint.sh".to_owned(),
+        entrypoint.to_vec(),
+    ));
+    let mut layer = Vec::new();
+    {
+        let mut tar = tar::Builder::new(&mut layer);
+        let mut tmp = tar::Header::new_gnu();
+        tmp.set_entry_type(tar::EntryType::Directory);
+        tmp.set_size(0);
+        tmp.set_mode(0o1777);
+        tmp.set_cksum();
+        tar.append_data(&mut tmp, "tmp/", std::io::empty()).unwrap();
+        for (name, contents) in &files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, name, contents.as_slice())
+                .unwrap();
+        }
+        tar.finish().unwrap();
+    }
+    let config = br#"{"architecture":"amd64","os":"linux","config":{"Env":["PATH=/usr/local/bin:/usr/bin:/bin"],"Entrypoint":["docker-entrypoint.sh"],"Cmd":["node"]}}"#;
+    let manifest =
+        br#"[{"Config":"config.json","RepoTags":["x86-node-exec:latest"],"Layers":["layer.tar"]}]"#;
+    let mut archive = Vec::new();
+    {
+        let mut tar = tar::Builder::new(&mut archive);
+        append_tar(&mut tar, "manifest.json", manifest);
+        append_tar(&mut tar, "config.json", config);
+        append_tar(&mut tar, "layer.tar", &layer);
+        tar.finish().unwrap();
+    }
+    let archive_path = dir.path().join("image.tar");
+    std::fs::write(&archive_path, archive).unwrap();
+    let cli = assert_cmd::cargo::cargo_bin("carrick");
+    let home = dir.path().join("home");
+    let load = Command::new(&cli)
+        .timeout(Duration::from_secs(10))
+        .env("CARRICK_HOME", &home)
+        .args(["load", "--input", archive_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(load.status.success(), "load: {load:?}");
+    let run = Command::new(&cli)
+        .timeout(Duration::from_secs(30))
+        .env("CARRICK_HOME", &home)
+        .env("CARRICK_RUN_ID", format!("issue-2142-entrypoint-{command}"))
+        .args([
+            "run",
+            "--platform",
+            "linux/amd64",
+            "--pull",
+            "never",
+            "--rm",
+            "-w",
+            "/tmp",
+            "x86-node-exec:latest",
+            command,
+            "--version",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        (run.status.code(), run.stdout.as_slice()),
+        (Some(7), guest_expected.as_bytes()),
+        "the entrypoint shell must exec {command} from the run root; 126 with \
+         `Function not implemented` is the ENOSYS refusal; stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
 #[test]
 fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
     let present = std::path::Path::new("/dev/kvm").exists();
