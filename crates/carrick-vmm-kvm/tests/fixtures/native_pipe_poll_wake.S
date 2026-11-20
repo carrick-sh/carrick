@@ -16,6 +16,15 @@
 .global _start
 .text
 _start:
+#ifdef SELECT_TIMEOUT_EOF
+    mov $57, %eax                  /* child owns the only copies of the pipe */
+    syscall
+    test %eax, %eax
+    js fail_fork
+    jz timed_pselect_child
+    mov %eax, %r12d
+    jmp wait_for_child
+#endif
     /* pipe2(fds, O_CLOEXEC) */
     lea fds(%rip), %rdi
     mov $0x80000, %esi
@@ -203,6 +212,7 @@ wait_for_child:
     jz fail_wait
     jmp exit
 1:
+#ifndef SELECT_TIMEOUT_EOF
     mov %r15d, %edi              /* reap the sibling writer as well */
     lea status(%rip), %rsi
     xor %edx, %edx
@@ -213,6 +223,7 @@ wait_for_child:
     jne fail_wait
     cmpl $0, status(%rip)
     jne fail_wait
+#endif
 #else
     jne fail_wait
 #endif
@@ -289,13 +300,81 @@ child:
     jmp exit
 #endif
 #ifdef USE_PSELECT
+#ifdef SELECT_TIMEOUT_EOF
+timed_pselect_child:
+    lea fds(%rip), %rdi
+    xor %esi, %esi
+    mov $293, %eax                 /* pipe2 */
+    syscall
+    test %rax, %rax
+    jnz fail_pipe
+    movq $20000000, select_time+8(%rip)
+    call select_call
+    test %rax, %rax
+    jnz fail_result
+    cmpq $0, read_set(%rip)
+    jne fail_revents
+    mov select_time(%rip), %rax
+    or select_time+8(%rip), %rax
+    jnz fail_fields
+    mov fds+4(%rip), %edi
+    mov $3, %eax                   /* close the last writer */
+    syscall
+    test %rax, %rax
+    jnz fail_close
+    call select_call
+    cmp $1, %rax
+    jne fail_result
+    cmp %r14, read_set(%rip)
+    jne fail_revents
+    xor %edi, %edi
+    jmp exit
+#endif
 pselect_reader:
+#ifdef USE_SELECT_TIMEVAL
+    movq $-1, select_time+8(%rip)
+    call select_call
+    cmp $-22, %rax
+    jne fail_result
+#endif
     call pselect_one
     call pselect_one
     xor %edi, %edi
     jmp exit
 
 pselect_one:
+#ifdef USE_SELECT_TIMEVAL
+    /* 30 seconds encoded entirely in microseconds; Linux normalizes it. */
+    movq $0, select_time(%rip)
+    movq $30000000, select_time+8(%rip)
+#endif
+    call select_call
+    test %rax, %rax
+    js pselect_errno
+    cmp $1, %rax
+    jne fail_result
+    cmp %r14, read_set(%rip)
+    jne fail_revents
+#ifdef USE_SELECT_TIMEVAL
+    cmpq $0, select_time(%rip)
+    jl fail_fields
+    cmpq $30, select_time(%rip)
+    jge fail_fields
+    cmpq $1000000, select_time+8(%rip)
+    jae fail_fields
+#endif
+    mov fds(%rip), %edi
+    lea received(%rip), %rsi
+    mov $1, %edx
+    xor %eax, %eax
+    syscall
+    cmp $1, %rax
+    jne fail_result
+    cmpb $'x', received(%rip)
+    jne fail_revents
+    ret
+
+select_call:
     mov fds(%rip), %ecx
     mov $1, %r14d
     shl %cl, %r14
@@ -306,23 +385,16 @@ pselect_one:
     xor %r10d, %r10d
     xor %r8d, %r8d
     xor %r9d, %r9d
-    mov $270, %eax                 /* pselect6(nfds, &set, 0, 0, 0, 0) */
+#ifdef USE_SELECT_TIMEVAL
+    lea select_time(%rip), %r8
+    mov $23, %eax                  /* select(nfds, &set, 0, 0, &timeval) */
+#else
+#ifdef SELECT_TIMEOUT_EOF
+    lea select_time(%rip), %r8
+#endif
+    mov $270, %eax                 /* pselect6 */
+#endif
     syscall
-    test %rax, %rax
-    js pselect_errno
-    cmp $1, %rax
-    jne fail_result
-    cmp %r14, read_set(%rip)
-    jne fail_revents
-    mov fds(%rip), %edi
-    lea received(%rip), %rsi
-    mov $1, %edx
-    xor %eax, %eax
-    syscall
-    cmp $1, %rax
-    jne fail_result
-    cmpb $'x', received(%rip)
-    jne fail_revents
     ret
 pselect_errno:
     neg %eax
@@ -380,6 +452,7 @@ select_gate_peer:
 fds: .space 8
 pfd: .space 8
 read_set: .space 8
+select_time: .space 16
 reader_pid: .space 4
 status: .space 8
 poll_result: .space 8
