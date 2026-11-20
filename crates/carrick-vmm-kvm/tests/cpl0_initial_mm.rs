@@ -344,6 +344,16 @@ fn serial_host_native_child_zero_nanosleep_returns_zero() {
     );
 }
 
+#[test]
+fn serial_host_native_root_and_child_clock_getres() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_clock_getres",
+        "native_child_sleep.S",
+        &["-DCLOCK_GETRES=1"],
+        8,
+    );
+}
+
 /// x86 CPL0 defines no guest-visible monotonic epoch (no vDSO, a raw RDTSC
 /// counter), so even forkexecstorm's already expired absolute
 /// CLOCK_MONOTONIC deadline keeps the counted ENOSYS refusal (#1808).
