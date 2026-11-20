@@ -7009,7 +7009,7 @@ fn production_publication_policy_is_bounded(access: u64) {
             assert_eq!(
                 publication_next_action(
                     PublicationCompletion::Declined(Some(PublicationDecline::NotNow(
-                        PublicationNotNow::Contended,
+                        PublicationNotNow::MmRelease,
                     ))),
                     selected,
                     request.mm_key,

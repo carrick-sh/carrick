@@ -11,17 +11,29 @@ use carrick_sched_core::SpaceEditor;
 /// Callers must move this value into their semantic plan before adopting
 /// provenance or preparing backing. Keeping the selected range typed avoids
 /// carrying an unnarrowed plan beside a narrowed service request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct SelectedBackingPlan {
     range: ReservationRange,
     fault_page: u64,
 }
 
 /// A publication refusal that may be retried only after an observed change.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum PublicationNotNow {
     /// Another MM owner holds the authority needed by this publication.
-    Contended,
+    MmRelease,
     /// A bounded store must grow, or the next plan must be strictly smaller.
     Capacity(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
 }
@@ -32,7 +44,13 @@ pub enum PublicationNotNow {
 /// instruction rerun. Only `NotNow` may retain an owned continuation;
 /// deterministic refusals are terminal for the request, while an occupied
 /// fault page must use the inherited-Prepared supply path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum PublicationDecline {
     NotNow(PublicationNotNow),
     InheritedPrepared,
@@ -41,7 +59,13 @@ pub enum PublicationDecline {
 
 /// A deterministic publication refusal. Repeating the same request cannot
 /// change this answer, so the fault entry must publish a terminal outcome.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum PublicationTerminal {
     Descriptor(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
     PublishUnsupported,
@@ -50,7 +74,13 @@ pub enum PublicationTerminal {
 /// The non-successful mailbox completion presented to the shared publication
 /// policy.  The carrier translates the wire completion into this type, then
 /// only executes the returned action.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum PublicationCompletion {
     Published,
     Declined(Option<PublicationDecline>),
@@ -61,7 +91,13 @@ pub enum PublicationCompletion {
 
 /// A broken mailbox invariant.  These are the only publication completions
 /// that are fatal; descriptor refusals remain typed policy outcomes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum PublicationInvariant {
     MissingDecline,
     SlotNotWorking,
@@ -70,7 +106,13 @@ pub enum PublicationInvariant {
 }
 
 /// The one ISA-neutral next action for a refused frame-grant publication.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum PublicationNextAction {
     Published,
     Fatal(PublicationInvariant),
@@ -107,7 +149,7 @@ pub fn publication_next_action(
         }
     };
     match decline {
-        PublicationDecline::NotNow(PublicationNotNow::Contended) => {
+        PublicationDecline::NotNow(PublicationNotNow::MmRelease) => {
             PublicationNextAction::ParkOnMmRelease { mm_key }
         }
         PublicationDecline::NotNow(PublicationNotNow::Capacity(reason)) => selected
@@ -127,7 +169,7 @@ impl PublicationDecline {
     ) -> Self {
         use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
         match reason {
-            DescriptorRefusal::Contended => Self::NotNow(PublicationNotNow::Contended),
+            DescriptorRefusal::Contended => Self::NotNow(PublicationNotNow::MmRelease),
             DescriptorRefusal::TablesExhausted
             | DescriptorRefusal::JournalCapacity
             | DescriptorRefusal::ResidencyCapacity => {
@@ -155,7 +197,7 @@ mod publication_decline_tests {
     fn publication_declines_distinguish_progress_from_terminal_refusals() {
         assert_eq!(
             PublicationDecline::from_descriptor(DescriptorRefusal::Contended),
-            PublicationDecline::NotNow(PublicationNotNow::Contended),
+            PublicationDecline::NotNow(PublicationNotNow::MmRelease),
         );
         for reason in [
             DescriptorRefusal::TablesExhausted,
