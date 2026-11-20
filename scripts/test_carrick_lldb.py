@@ -130,6 +130,44 @@ class CarrickLldbHelperTests(unittest.TestCase):
             f"addr={address:#018x} outcome=timed-out",
         )
 
+    def test_eventring_decodes_shared_zone_futex_slots(self):
+        import struct
+
+        mm = 0xABCDE12345
+        key = 0x13789ABCDE1
+        incarnation = 0x123456789AB
+        records = [
+            (2, 1 | (3 << 32), mm, key, 41 | (7 << 32), 99, incarnation, 2 | (0x109 << 32)),
+            (2, 2, mm, key, 42, 100, 3 | (1 << 32), 0),
+            (2, 3 | (3 << 32), mm, key, 41, 99, incarnation, 2 | (1 << 32)),
+            (2, 4 | (3 << 32), mm, key, 42, 100, key + 4, 1 | (2 << 32)),
+        ]
+        raw = b"".join(struct.pack("<8Q", *record) for record in records)
+        lines = PLUGIN._zone_futex_event_lines(raw, raw, 0, len(records))
+        self.assertEqual(
+            lines,
+            [
+                f"     0 FUTEX_WAIT mm={mm} addr={key - 1:#x} key={key:#x} "
+                f"tid=41 serial=99 record=3#{incarnation} armed_seq=2 op=0x109 val=7",
+                f"     1 FUTEX_WAKE mm={mm} addr={key - 1:#x} key={key:#x} "
+                "tid=42 serial=100 requested=3 woken=1",
+                f"     2 FUTEX_COMPLETE mm={mm} addr={key - 1:#x} key={key:#x} "
+                f"tid=41 serial=99 record=3#{incarnation} armed_seq=2 outcome=woken",
+                f"     3 FUTEX_REQUEUE mm={mm} addr={key - 1:#x} key={key:#x} "
+                f"tid=42 serial=100 to_key={key + 4:#x} requested=3 woken=1 moved=2",
+            ],
+        )
+
+        after = bytearray(raw)
+        struct.pack_into("<Q", after, 64, 3)
+        self.assertIn("ERROR    TORN", PLUGIN._zone_futex_event_lines(raw, after, 1, 1)[0])
+        for reason, name in [(2, "timeout"), (3, "signal")]:
+            outcome = bytearray(raw)
+            struct.pack_into("<Q", outcome, 2 * 64 + 56, 2 | (reason << 32))
+            self.assertIn(
+                f"outcome={name}", PLUGIN._zone_futex_event_lines(outcome, outcome, 2, 1)[0]
+            )
+
     def test_eventring_formats_hvpatch_thread_teardown_phase(self):
         self.assertEqual(
             PLUGIN._EVENTRING_KINDS[26][1](56172, 56099, 3),
@@ -347,6 +385,7 @@ class CarrickLldbHelperTests(unittest.TestCase):
         self.assertEqual(parse("--high-rate 8192"), ("high-rate", 8192, None))
         self.assertEqual(parse("--sched 10:5"), ("high-rate", 5, 10))
         self.assertEqual(parse("7 --sched"), ("high-rate", 7, None))
+        self.assertEqual(parse("--futex 10:5"), ("futex", 5, 10))
         for bad in ("0", "-3", "x", "1 2", "--sched 1:0"):
             with self.assertRaises(ValueError):
                 parse(bad)

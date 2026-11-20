@@ -91,6 +91,7 @@ pub const TIMER_INDEX_PROTOCOL: u64 = 2;
 pub const HOST_RESCHEDULE_TARGET: u64 = 1 << 63;
 pub mod affinity;
 pub mod affinity_source;
+pub mod futex_events;
 pub use affinity_source::AffinitySource;
 pub mod process;
 pub use carrick_guest_arch::{CounterTick, NativeReturnWord};
@@ -1612,6 +1613,7 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     namespace: process::identity_allocator::NamespaceTable,
     /// Hint only; the Held claim is the custody authority. Appended ABI field.
     held_map: [AtomicU64; ZONE_RECORDS.div_ceil(64)],
+    pub futex_events: futex_events::FutexEvents,
 }
 
 /// A fallible acquisition policy for callers that retain work on refusal.

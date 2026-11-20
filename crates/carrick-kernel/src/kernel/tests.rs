@@ -1737,11 +1737,22 @@ mod futex_queue_authority {
             op: u64,
             value: u64,
         ) -> DispatchOutcome {
+            self.futex_at(thread, tid, WORD, op, value)
+        }
+
+        fn futex_at(
+            &mut self,
+            thread: &super::super::KernelContext,
+            tid: ThreadId,
+            address: u64,
+            op: u64,
+            value: u64,
+        ) -> DispatchOutcome {
             crate::dispatch::futex::dispatch_threaded_futex(
                 thread,
                 &self.clock,
                 &self.shared,
-                SyscallRequest::new(98, SyscallArgs::from([WORD, op, value, 0, 0, 0])),
+                SyscallRequest::new(98, SyscallArgs::from([address, op, value, 0, 0, 0])),
                 &mut self.memory,
                 &self.reporter,
                 &self.futex,
@@ -1903,6 +1914,96 @@ mod futex_queue_authority {
         pub(super) fn parked(&self, record: RecordId) -> bool {
             matches!(self.zone.record(record).claim(), Claim::Parked { .. })
         }
+    }
+
+    #[test]
+    fn zone_futex_event_history_matches_wake_and_exposes_unmatched_enrolment() {
+        use carrick_sched_core::futex_events::FutexEventKind;
+
+        let mut f = Fixture::new(9391);
+        crate::el1_zone::with_test_zone(f.zone, || {
+            f.assert_two_live_threads();
+            let root = f.root.retain_exact();
+            let sibling = f.sibling.retain_exact();
+            let op = LINUX_FUTEX_WAIT;
+            let wake = LINUX_FUTEX_WAKE;
+            let mm = root.shared().mm_id().raw();
+            let waiter = root.thread().key();
+            let waker = sibling.thread().key();
+            f.write_word(7);
+
+            let wake_at = |f: &mut Fixture, address| {
+                let tid = f.sibling_tid;
+                match f.futex_at(&sibling, tid, address, wake, 3) {
+                    DispatchOutcome::ZoneFutexWoken { value, .. } => value,
+                    other => panic!("expected zone wake, got {other:?}"),
+                }
+            };
+            assert_eq!(wake_at(&mut f, WORD), 0);
+            let outcome = f.futex(&root, f.root_tid, op, 7);
+            let first = f.host_park(&root, outcome);
+            let first = f.zone.record_ref(first);
+            assert_eq!(wake_at(&mut f, WORD + 4), 0);
+            assert!(f.parked(first.id));
+            assert_eq!(wake_at(&mut f, WORD), 1);
+            assert!(!f.parked(first.id));
+            let outcome = f.futex(&root, f.root_tid, op, 7);
+            let unmatched = f.host_park(&root, outcome);
+            assert!(f.parked(unmatched));
+
+            let ring = &f.zone.futex_events;
+            let records: Vec<_> = (0..ring.next()).map(|i| ring.read(i).unwrap()).collect();
+            let kinds: Vec<_> = records.iter().map(|r| r[0] as u32).collect();
+            let [wait, wake, complete] = [
+                FutexEventKind::Wait as u32,
+                FutexEventKind::Wake as u32,
+                FutexEventKind::Complete as u32,
+            ];
+            assert_eq!(kinds, [wake, wait, wake, complete, wake, wait]);
+            let packed = |lo: u32, hi: u32| u64::from(lo) | (u64::from(hi) << 32);
+            let key = WORD | 1; // Shared operation on this private anonymous word.
+            assert_eq!(
+                records[0][..6],
+                [
+                    u64::from(wake),
+                    mm,
+                    key,
+                    waker.tid.raw() as u64,
+                    waker.serial.raw(),
+                    3
+                ]
+            );
+            assert_eq!(
+                records[1],
+                [
+                    packed(wait, first.id.raw()),
+                    mm,
+                    key,
+                    packed(waiter.tid.raw() as u32, 7),
+                    waiter.serial.raw(),
+                    first.incarnation,
+                    packed(1, op as u32),
+                ]
+            );
+            assert_eq!(records[2][2], key + 4);
+            assert_eq!(records[2][5], 3);
+            assert_eq!(
+                records[3],
+                [
+                    packed(complete, first.id.raw()),
+                    mm,
+                    key,
+                    waiter.tid.raw() as u64,
+                    waiter.serial.raw(),
+                    first.incarnation,
+                    packed(1, 1),
+                ]
+            );
+            assert_eq!(records[4][2], key);
+            assert_eq!(records[4][5], packed(3, 1));
+            assert_eq!(records[5][0], packed(wait, unmatched.raw()));
+            assert_eq!(records[5][2], key);
+        });
     }
 
     #[test]
