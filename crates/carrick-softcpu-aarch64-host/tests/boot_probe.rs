@@ -1771,11 +1771,14 @@ const GLIBC_LOADER_SHA256: &str =
 const GLIBC_LIBC: &str = "/lib/libc.so.6";
 const GLIBC_LIBC_SHA256: &str = "ce67859ef338d8558a7fd7cff9a1effe5677ff9f7eea90641a2c051c51fab7ac";
 
-/// Prepare CARRICK_A64_DYN_ROOT with scripts/ci/fetch-arm64-cross-libc.sh
-/// and use the production CARRICK_A64_ELF.
+/// Engine witness: dynamic glibc hello runs on the soft CPU through the
+/// production EL1 vectors and trap path (`CARRICK_A64_ELF`) against a pinned
+/// `CARRICK_A64_DYN_ROOT` (`scripts/ci/fetch-arm64-cross-libc.sh`).
+/// HVC #2 replies come from a test fixture (GlibcReplies), not from the
+/// production carrick-kernel / carrick-personality-linux dispatch.
 #[test]
 #[ignore = "requires CARRICK_A64_DYN_ROOT and CARRICK_A64_ELF"]
-fn production_el1_image_runs_dynamic_glibc_hello() {
+fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() {
     use carrick_mem::{
         elf::{ElfProgram, LoadPlan},
         linux_abi::{
@@ -2049,8 +2052,11 @@ fn run_dynamic_glibc(
     result
 }
 
-/// Single-process responses for this loader fixture. This owns only test pages
-/// and a read-only libc fixture. No guest pathname is used to open a host file.
+/// Single-process test fixture for this loader witness. HVC #2 replies come
+/// from a test fixture (GlibcReplies), not from the production
+/// carrick-kernel / carrick-personality-linux dispatch. This owns only test
+/// pages and a read-only libc fixture; no guest pathname is used to open a
+/// host file.
 struct GlibcReplies {
     libc: Vec<u8>,
     libc_cursor: Option<usize>,
