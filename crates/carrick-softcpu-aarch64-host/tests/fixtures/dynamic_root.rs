@@ -1,4 +1,7 @@
-//! Read-only startup fixtures for the production EL1 boot probe.
+//! Read-only test fixture answering `HVC #2` syscalls (`brk`, `mmap`,
+//! `mprotect`, `munmap`, files, clocks, `futex`, signals) for the soft-CPU
+//! engine witnesses in `boot_probe.rs`. Replies here do not come from the
+//! production `carrick-kernel` / `carrick-personality-linux` dispatch.
 use super::{PAGE, Pages, bind_host_fixture_fd, read_cstr};
 use carrick_el1_abi::{
     DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE, HostBoundFd, HostObjectBinding,
@@ -111,6 +114,8 @@ struct Mapping {
     path: PathBuf,
 }
 
+/// Test-side `HVC #2` syscall responder for single-task startup witnesses
+/// (answers 523 of CPython 3.12.16's 545 syscalls, not the production kernel).
 pub(super) struct DynamicRoot {
     root: FixtureRoot,
     executable: &'static str,
