@@ -337,7 +337,7 @@ pub(crate) fn linux_clock_duration(
 }
 
 /// A COARSE clock reading: its base clock truncated down to a multiple of the
-/// COARSE resolution `clock_getres` reports ([`linux_clock_getres_nsec`]).
+/// COARSE resolution `clock_getres` reports.
 ///
 /// clock_gettime(2) defines the COARSE clocks as faster, less precise
 /// versions of their base clocks; Linux advances them once per tick.
@@ -353,7 +353,7 @@ pub(crate) fn linux_clock_duration(
 const _: () = assert!(1_000_000_000 % LINUX_CLOCK_RESOLUTION_NSEC == 0);
 
 pub(crate) fn linux_coarse_duration(fine: Duration) -> Duration {
-    let resolution = linux_clock_getres_nsec(LINUX_CLOCK_MONOTONIC_COARSE).unsigned_abs();
+    let resolution = LINUX_CLOCK_RESOLUTION_NSEC.unsigned_abs();
     let subsec = u64::from(fine.subsec_nanos());
     let truncated = subsec - subsec % resolution.max(1);
     Duration::new(fine.as_secs(), u32::try_from(truncated).unwrap_or(0))
@@ -371,45 +371,6 @@ pub(super) fn linux_clock_nanosleep_now(
         return Err(LINUX_EOPNOTSUPP);
     }
     linux_clock_duration(clock, clock_id).ok_or(LINUX_EINVAL)
-}
-
-/// Linux clock_getres resolution in nanoseconds, selected per clock id.
-///
-/// The exact value is NOT a host-portable invariant: a CONFIG_HIGH_RES_TIMERS
-/// kernel reports 1ns for the hrtimer-backed clocks, but a low-res kernel —
-/// e.g. Docker Desktop's LinuxKit VM at CONFIG_HZ=1000 — reports TICK_NSEC =
-/// 1ms for ALL of them (verified live: clock_getres on REALTIME/MONOTONIC/
-/// MONOTONIC_RAW/BOOTTIME returns tv_nsec==1000000 under `gcc:13` linux/arm64).
-/// carrick therefore reports the 1ms stand-in (LINUX_CLOCK_RESOLUTION_NSEC),
-/// which matches the Docker oracle on these hosts. The clockgetres probe
-/// asserts only the portable invariant (rc==0, tv_sec==0). The per-clock match
-/// is retained so a future CONFIG_HZ/hrtimer-aware value can be wired in here
-/// without re-plumbing the call site. Only clocks `linux_clock_duration`
-/// returns Some for reach this (clock_getres rejects unknown ids with EINVAL
-/// before the write).
-pub(super) fn linux_clock_getres_nsec(clock_id: u64) -> i64 {
-    match clock_id {
-        // hrtimer-backed hi-res clocks (1ns on a CONFIG_HIGH_RES_TIMERS
-        // kernel) and the posix CPU clocks. The 1ms stand-in is what the
-        // low-res Docker host kernels actually report; the value is not
-        // probe-asserted, so this stays host-portable.
-        LINUX_CLOCK_REALTIME
-        | LINUX_CLOCK_MONOTONIC
-        | LINUX_CLOCK_MONOTONIC_RAW
-        | LINUX_CLOCK_BOOTTIME
-        | LINUX_CLOCK_REALTIME_ALARM
-        | LINUX_CLOCK_BOOTTIME_ALARM
-        | LINUX_CLOCK_TAI
-        | LINUX_CLOCK_PROCESS_CPUTIME_ID
-        | LINUX_CLOCK_THREAD_CPUTIME_ID => LINUX_CLOCK_RESOLUTION_NSEC,
-        // COARSE clocks report TICK_NSEC (CONFIG_HZ-dependent, NOT
-        // host-portable). Same 1ms stand-in, which is also the grid COARSE
-        // readings are truncated to (`linux_coarse_duration`, and the vDSO's
-        // `CLOCK_COARSE_RES_NS`). The absolute value is not probe-asserted;
-        // `clockcoarsevdso` asserts the vDSO and the syscall agree on it.
-        LINUX_CLOCK_REALTIME_COARSE | LINUX_CLOCK_MONOTONIC_COARSE => LINUX_CLOCK_RESOLUTION_NSEC,
-        _ => LINUX_CLOCK_RESOLUTION_NSEC,
-    }
 }
 
 pub(super) fn linux_clock_is_known(clock_id: u64) -> bool {
@@ -793,8 +754,8 @@ mod coarse_clock_tests {
             LINUX_CLOCK_BOOTTIME,
         ] {
             assert_eq!(
-                linux_clock_getres_nsec(id),
-                carrick_mem::vdso::VDSO_CLOCK_RESOLUTION_NS,
+                carrick_abi::linux_clock_resolution_ns(id as i32),
+                Some(carrick_mem::vdso::VDSO_CLOCK_RESOLUTION_NS),
                 "clock {id}"
             );
         }
@@ -804,7 +765,7 @@ mod coarse_clock_tests {
     /// the reported resolution, never round up.
     #[test]
     fn coarse_duration_truncates_to_the_reported_resolution() {
-        let res = linux_clock_getres_nsec(LINUX_CLOCK_MONOTONIC_COARSE) as u128;
+        let res = LINUX_CLOCK_RESOLUTION_NSEC as u128;
         let mut previous = Duration::ZERO;
         for ns in [
             0u64,
