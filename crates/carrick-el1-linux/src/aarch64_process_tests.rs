@@ -2518,6 +2518,12 @@ fn native_fork_child_monotonic_raw_clock_gettime_reaches_time_handler() {
 }
 
 #[test]
+fn native_fork_child_gettimeofday_accepts_null_outputs() {
+    let number = carrick_abi::syscall::nr::GETTIMEOFDAY;
+    assert_eq!(native_fork_child_time_result(number, 0, 0), (0, 0));
+}
+
+#[test]
 fn native_fork_child_realtime_clocks_reach_time_handler() {
     let number = carrick_abi::syscall::nr::CLOCK_GETTIME;
     for clock in [
