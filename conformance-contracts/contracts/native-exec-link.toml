@@ -5,7 +5,7 @@
 schema_version = 1
 id = "process.exec.native-exe-link"
 title = "Native exec successors read their own executable link"
-guest_surfaces = ["syscall:execve", "syscall:readlinkat", "proc:self/exe"]
+guest_surfaces = ["syscall:execve", "syscall:readlinkat", "proc:self/exe", "proc:caller-pid/exe"]
 semantic_authority = ["proc_pid_exe(5): /proc/pid/exe names the executed program", "readlinkat(2): truncate without a terminating NUL"]
 fixture = "Real native fork and exec service adoption, then production readlinkat dispatch while the parent remains live"
 scale_points = [1]
@@ -35,6 +35,7 @@ vm_free = [
 ]
 
 [bindings.unresolved]
+kvm = "Executing x86 production binding carrick-cli::x86_kvm_run::mounted_static_x86_native_executable_link_follows_fork_and_exec. Real KVM is required. The contract evaluator has no registered KVM observation layer."
 embed_structural = "Director: exact signed artifact must demonstrate one retained readlink service and no host syscall replay."
 observation = "The VM-free dispatch witness asserts zero forwarded calls; no WorkObservation schema exists for executable custody."
 ecosystem = "Director: signed real go-build row on this exact head; this worker has no HVF"
