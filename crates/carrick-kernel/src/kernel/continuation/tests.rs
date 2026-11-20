@@ -4905,6 +4905,51 @@ mod serial_host {
     use super::*;
 
     #[test]
+    fn zone_futex_detail_reports_saved_registers() {
+        use carrick_el1_abi::{Aarch64ParkedContext, ThreadCtx, ThreadIdentity, ZoneTables};
+        use carrick_sched_core::BoundedSpin;
+
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        // SAFETY: the test region initializes the zone exactly as the carrier
+        // does and outlives the scoped test binding below.
+        let zone = unsafe {
+            &*region
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .cast::<ZoneTables>()
+        };
+        crate::el1_zone::with_test_zone(zone, || {
+            let record = zone.alloc_record(ThreadIdentity {
+                tid: 1, serial: 2, mm: 3, file_table: 4, generation: 5,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1, lifecycle_page: 0, control_slot: 0,
+            }).unwrap();
+            let mut frame = ThreadCtx::ZERO;
+            frame.x[8] = carrick_abi::syscall::nr::FUTEX.raw();
+            frame.x[..6].copy_from_slice(&[0x4000, 137, 7, 0x5000, 0, 0x80]);
+            frame.pc = 0x6000;
+            frame.x[30] = 0x7000;
+            // SAFETY: the test has exclusive custody of the unpublished record.
+            unsafe {
+                *zone.record(record).ctx_mut() =
+                    Aarch64ParkedContext::from_register(frame, 0x1000, 3, 1);
+            }
+            let seq = zone.next_seq(record);
+            let guard = zone.lock(
+                ZoneTables::bucket_of_with_context(3, 0x4000), &BoundedSpin(0),
+            ).unwrap();
+            zone.enqueue(&guard, record, seq, 3, 0x4000, 0x80, 0).unwrap();
+            zone.publish_park(record, seq);
+            drop(guard);
+            let wait = ZoneWait::new(zone.record_ref(record), seq);
+            let detail = detail_diagnostic(&ContinuationDetail::Zone(wait));
+            assert!(detail.contains("uaddr=0x4000"), "{detail}");
+            assert!(detail.contains("syscall=98"), "{detail}");
+            assert!(detail.contains("pc=0x6000"), "{detail}");
+        });
+    }
+
+    #[test]
     fn deferred_fault_completion_keeps_two_live_threads_out_of_host_load() {
         fault_completion_to_host(true);
     }
