@@ -1,0 +1,9 @@
+# Published fixture manifest digests from the native builds.
+# amd64 bundle: https://github.com/carrick-sh/carrick/issues/2596#issuecomment-7030122756
+["linux/amd64"]
+"localhost:5050/cpython-test:3.12.13" = "localhost:5050/cpython-test@sha256:1878ffa3daacec75109c87b601e9b3c141564b9da20410ca116508771be5aaec"
+"localhost:5005/carrick-go-conformance:1.24" = "localhost:5005/carrick-go-conformance@sha256:60f4226940ab6bb0e1c9cddca466a0b3666d1d6f4b68ff3adb1db2bb09ec33df"
+"localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0" = "localhost:5005/carrick-nodejs-conformance@sha256:00a8f3ad27d63491e9c628e2073bbd593b791f49b17486dcb9caba4f97c20b0d"
+
+["linux/arm64"]
+# Fill after publishing the native arm64 fixture bundle.

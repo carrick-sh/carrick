@@ -119,7 +119,7 @@ struct Args {
     /// Census runs require cached Docker oracles and write a suiteboard receipt.
     #[arg(long)]
     runs: Option<std::num::NonZeroUsize>,
-    /// TOML mapping from manifest image tags to published digest references.
+    /// Platform tables mapping manifest image tags to published digest references.
     #[arg(long)]
     suiteboard_images: Option<PathBuf>,
     /// Filter to these suite names (repeatable).
@@ -570,7 +570,11 @@ fn run() -> anyhow::Result<ExitCode> {
     }
     if suiteboard {
         anyhow::ensure!(!selected.is_empty(), "suiteboard selected no suites");
-        suiteboard::pin_images(&mut selected, args.suiteboard_images.as_deref())?;
+        suiteboard::pin_images(
+            &mut selected,
+            args.suiteboard_images.as_deref(),
+            docker_platform,
+        )?;
     } else {
         anyhow::ensure!(
             args.suiteboard_images.is_none(),

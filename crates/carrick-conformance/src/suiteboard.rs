@@ -1,5 +1,6 @@
 //! Baseline-free language suite census receipts.
 
+use crate::argv::DockerPlatform;
 use crate::manifest::{Ecosystem, Suite, Tier, VerdictKind};
 use crate::parsers::{self, Outcome, ParseMode, Raw, SuiteOutcome, SuiteResult};
 use crate::verdict::{SuiteReport, Verdict};
@@ -52,27 +53,43 @@ impl Slice {
 }
 
 /// Bind both engines and their cache key to the same fixture image.
-pub fn pin_images(suites: &mut [Suite], path: Option<&Path>) -> anyhow::Result<()> {
-    let pins: BTreeMap<String, String> = match path {
-        Some(path) => toml::from_str(&std::fs::read_to_string(path)?)?, // nosemgrep
+pub fn pin_images(
+    suites: &mut [Suite],
+    path: Option<&Path>,
+    platform: DockerPlatform,
+) -> anyhow::Result<()> {
+    let platform = platform.as_str();
+    let pins: BTreeMap<String, BTreeMap<String, String>> = match path {
+        Some(path) => {
+            let display = path.display();
+            let text = std::fs::read_to_string(path) // nosemgrep
+                .with_context(|| format!("read suiteboard image pins from {display}"))?;
+            toml::from_str(&text)
+                .with_context(|| format!("parse suiteboard image pins in {display}"))?
+        }
         None => BTreeMap::new(),
     };
+    let platform_pins = pins.get(platform);
     for suite in suites {
-        if let Some(reference) = pins.get(&suite.image) {
-            suite.image.clone_from(reference);
-        }
+        let pin = platform_pins.and_then(|pins| pins.get(&suite.image));
+        let reference = pin.unwrap_or(&suite.image);
         ensure!(
-            suite
-                .image
-                .rsplit_once("@sha256:")
+            reference
+                .split_once("@sha256:")
                 .is_some_and(|(name, digest)| !name.is_empty()
+                    && !name.contains('@')
                     && digest.len() == 64
                     && digest
                         .bytes()
                         .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))),
-            "{} requires a sha256 image reference (set --suiteboard-images after publishing fixtures)",
-            suite.name
+            "{} ({}) on {platform} requires a repo@sha256:<digest> reference. Publish the fixture \
+             and add its pin under [\"{platform}\"] in the --suiteboard-images file.",
+            suite.name,
+            suite.image
         );
+        if let Some(pin) = pin {
+            suite.image.clone_from(pin);
+        }
     }
     Ok(())
 }
