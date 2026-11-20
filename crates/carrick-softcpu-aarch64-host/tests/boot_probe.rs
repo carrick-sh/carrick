@@ -321,6 +321,11 @@ fn resident_loop_translates_only_two_blocks() {
         assert_eq!(report.pc, ProgramCounter(PC + 12));
         assert_eq!(report.work.executed_blocks, iterations + 1);
         assert_eq!(report.work.retired_instructions, iterations * 2 + 1);
+        assert!(
+            report.work.dispatches <= 4 + iterations.div_ceil(256),
+            "resident branch loop launched {} times for {iterations} iterations",
+            report.work.dispatches,
+        );
         let publication = runner.publication_work();
         counts.push((
             report.work.decoded_blocks,
