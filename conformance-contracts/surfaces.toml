@@ -1170,6 +1170,7 @@ surfaces = [
   # arm64 host launch for the aarch64 copy-through engine (#1236); a test-only execution lane, no guest-visible product path yet.
   { path = "crates/carrick-softcpu-aarch64-host/src/lib.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64-host/src/lib.rs", contract = "arm.softcpu.stage1-tlb" },
+  { path = "crates/carrick-softcpu-aarch64-host/src/memory.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs", contract = "arm.softcpu.stage1-tlb" },
   # Copy-through dispatcher over the ExecuteBlock seam (#1236), driven by the test-only arm64 lane.
@@ -1259,6 +1260,7 @@ surfaces = [
   { path = "crates/carrick-softmmu/src/placement.rs", contract = "softmmu.x86.tlb-walker" },
   { path = "crates/carrick-softmmu/src/retirement.rs", contract = "softmmu.x86.physical-retirement" },
   { path = "crates/carrick-softmmu/src/tlb.rs", contract = "softmmu.x86.tlb-walker" },
+  { path = "crates/carrick-softmmu/src/walker.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softmmu/src/walker.rs", contract = "softmmu.x86.physical-retirement" },
   { path = "crates/carrick-softmmu/src/walker.rs", contract = "softmmu.x86.tlb-walker" },
   { path = "crates/carrick-softmmu/test-support/retirement_unit.rs", contract = "softmmu.x86.physical-retirement" },

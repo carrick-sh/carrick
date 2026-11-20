@@ -629,6 +629,22 @@ impl ExtentTable {
             .then_some(AuthenticatedGpa::from_authenticated_raw(page_gpa))
     }
 
+    /// Authenticate a whole physical frame from the memory owner's inventory.
+    pub fn authenticate_frame(
+        &self,
+        frame: FrameGpa,
+        expected_generation: OwnerGeneration,
+    ) -> Option<AuthenticatedGpa> {
+        if self.is_terminal() || !frame.raw().is_multiple_of(PAGE_SIZE_4K) {
+            return None;
+        }
+        self.authenticate(
+            Stage1Gpa::new(frame.raw()),
+            PAGE_SIZE_4K,
+            expected_generation,
+        )
+    }
+
     pub(crate) fn authenticate_table_frame(
         &self,
         table: Stage1Gpa,
