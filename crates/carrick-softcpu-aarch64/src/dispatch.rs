@@ -16,6 +16,7 @@ use crate::translate::{
 use alloc::{sync::Arc, vec::Vec};
 use carrick_guest_arch::{FrameGpa, Gpa, GuestVa};
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
+use carrick_softmmu::ExtentTableId;
 use carrick_softmmu::block_cache::BlockCache;
 use carrick_softmmu::physical_tlb::PhysicalTlb;
 use core::fmt;
@@ -98,6 +99,13 @@ pub trait ExecuteBlock {
     fn retain_blocks(&self) -> bool {
         true
     }
+
+    /// Move the launcher's code cache into a dispatch while it owns RAM.
+    fn take_code_cache(&mut self) -> DispatchCache<Self::Code> {
+        DispatchCache::default()
+    }
+
+    fn return_code_cache(&mut self, _cache: DispatchCache<Self::Code>) {}
 
     /// Whether to cache stage-1 translations on providers with a local seat.
     fn retain_stage1(&self) -> bool {
@@ -342,6 +350,30 @@ impl<C> ResidentBlock<C> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CacheContext {
+    domain: ExtentTableId,
+    limits: BlockLimits,
+    chaining: bool,
+    inline_memory: bool,
+}
+
+/// Bounded executable residency. It holds compiled code only. Native links
+/// and translations are always dropped before the provider can access RAM.
+pub struct DispatchCache<C> {
+    context: Option<CacheContext>,
+    blocks: BlockCache<BlockKey, Arc<ResidentBlock<C>>>,
+}
+
+impl<C> Default for DispatchCache<C> {
+    fn default() -> Self {
+        Self {
+            context: None,
+            blocks: BlockCache::default(),
+        }
+    }
+}
+
 struct MeasuredMemory<'a, M> {
     inner: &'a mut M,
     walks: u64,
@@ -550,9 +582,22 @@ fn run_inner<const PROFILE: bool, X: ExecuteBlock>(
         code_write_failed: false,
     };
     let inline_memory = memory.retain_stage1 && executor.inline_memory();
-    // The run borrows one memory owner and one set of block limits. Keeping
-    // residency within that borrow also discards code at provider handoffs.
-    let mut cache = BlockCache::<BlockKey, Arc<ResidentBlock<X::Code>>>::default();
+    let context = if retain_blocks {
+        memory.inner.code_cache_domain().map(|domain| CacheContext {
+            domain,
+            limits,
+            chaining,
+            inline_memory,
+        })
+    } else {
+        None
+    };
+    let mut residency = executor.take_code_cache();
+    if context.is_none() || residency.context != context {
+        residency.blocks.clear();
+    }
+    residency.context = context;
+    let cache = &mut residency.blocks;
     let initial_undefined = cpu.undefined_el0_deliveries;
     let stop = loop {
         if blocks >= budget {
@@ -843,6 +888,9 @@ fn run_inner<const PROFILE: bool, X: ExecuteBlock>(
     if chaining {
         work.chain_unlinks += 1;
         executor.unlink(None);
+    }
+    if context.is_some() {
+        executor.return_code_cache(residency);
     }
     work.stage1_walks = memory.walks;
     work.tlb_hits = memory.tlb_hits;

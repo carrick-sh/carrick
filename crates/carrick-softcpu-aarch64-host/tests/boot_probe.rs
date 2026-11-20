@@ -35,8 +35,8 @@ use carrick_mem::memory::{
     stage1_hvpatch_page_tables, stage1_identity_page_tables,
 };
 use carrick_softcpu_aarch64::dispatch::{
-    BlockMemory, CHAIN_QUANTUM, ChainBudget, ChainExit, ExecuteBlock, PhaseWork, Report,
-    ResidentBlock, RunControl, RunWork, Stop, run, run_controlled, run_profiled,
+    BlockMemory, CHAIN_QUANTUM, ChainBudget, ChainExit, DispatchCache, ExecuteBlock, PhaseWork,
+    Report, ResidentBlock, RunControl, RunWork, Stop, run, run_controlled, run_profiled,
 };
 use carrick_softcpu_aarch64::handler::{
     CodeGeneration, Event, ExclusiveMonitor, GuestMemory, InlineRam, MemoryFault,
@@ -105,6 +105,10 @@ impl Pages {
 }
 
 impl GuestMemory for Pages {
+    fn code_cache_domain(&self) -> Option<carrick_softmmu::ExtentTableId> {
+        self.memory.code_cache_domain()
+    }
+
     fn stage1_is_local(&self) -> bool {
         self.memory.stage1_is_local()
     }
@@ -813,7 +817,19 @@ fn provider_handoffs_reuse_only_the_current_code_incarnation() {
 
     let mut resume = |memory: &mut Pages, immediate: u16| {
         cpu.pc = ProgramCounter(PC);
-        let report = probe(&mut cpu, memory, &mut runner, 1);
+        let before = runner.publication_work();
+        let report = run(
+            &mut cpu,
+            &mut ExclusiveMonitor::default(),
+            memory,
+            &mut runner,
+            BlockLimits::default(),
+            1,
+        );
+        assert_eq!(
+            report.work.emitted_blocks,
+            runner.publication_work().since(before).publications
+        );
         let Stop::Event {
             event: Event::ProviderExit(exit),
             ..
@@ -837,16 +853,17 @@ fn provider_handoffs_reuse_only_the_current_code_incarnation() {
         assert_eq!(emits, 1, "one resident block across {scale} handoffs");
     }
 
+    // A new owner may have the original owner's numerical page generation.
+    let mut other = Pages::default();
+    load_words(&mut other, PC, &[0xd400_00a2]); // hvc #5
+    assert_eq!(resume(&mut other, 5), 1);
+    assert_eq!(resume(&mut memory, 2), 1);
+
     load_words(&mut memory, PC, &[0xd400_0062]); // hvc #3
     assert_eq!(resume(&mut memory, 3), 1);
     memory.unmap(PC);
     load_words(&mut memory, PC, &[0xd400_0082]); // hvc #4
     assert_eq!(resume(&mut memory, 4), 1);
-
-    // A new owner may have the original owner's numerical page generation.
-    let mut other = Pages::default();
-    load_words(&mut other, PC, &[0xd400_00a2]); // hvc #5
-    assert_eq!(resume(&mut other, 5), 1);
 }
 
 #[test]
@@ -1252,6 +1269,14 @@ impl ExecuteBlock for TracingRunner {
 
     fn retain_blocks(&self) -> bool {
         self.inner.retain_blocks()
+    }
+
+    fn take_code_cache(&mut self) -> DispatchCache<HostCode> {
+        self.inner.take_code_cache()
+    }
+
+    fn return_code_cache(&mut self, cache: DispatchCache<HostCode>) {
+        self.inner.return_code_cache(cache);
     }
 
     fn retain_stage1(&self) -> bool {

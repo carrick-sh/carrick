@@ -66,6 +66,10 @@ fn frame_at(address: u64) -> FrameGpa {
 }
 
 impl GuestMemory for SoftMemory {
+    fn code_cache_domain(&self) -> Option<carrick_softmmu::ExtentTableId> {
+        Some(self.extents.identity())
+    }
+
     fn stage1_is_local(&self) -> bool {
         true
     }

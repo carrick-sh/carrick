@@ -19,7 +19,7 @@ use carrick_softcpu_aarch64::translate::BlockFrame;
 use carrick_softcpu_aarch64::translate::TranslatedBlock;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 use carrick_softcpu_aarch64::{
-    dispatch::{BlockMemory, ChainBudget, ChainExit, ResidentBlock},
+    dispatch::{BlockMemory, ChainBudget, ChainExit, DispatchCache, ResidentBlock},
     handler::InlineRam,
     state::ProgramCounter,
     translate::frame,
@@ -132,6 +132,10 @@ pub struct HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     retain_blocks: bool,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    retain_on_handoff: bool,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    cache: DispatchCache<HostCode>,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     retain_stage1: bool,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     inline_memory: bool,
@@ -162,6 +166,9 @@ impl HostBlockRunner {
             publication: carrick_host_jit::PublicationWork::default(),
             retain_blocks: std::env::var_os("CARRICK_SOFT_AARCH64_CACHE").as_deref()
                 != Some(std::ffi::OsStr::new("0")),
+            retain_on_handoff: std::env::var_os("CARRICK_SOFT_AARCH64_HANDOFF_CACHE").as_deref()
+                != Some(std::ffi::OsStr::new("0")),
+            cache: DispatchCache::default(),
             retain_stage1: std::env::var_os("CARRICK_SOFT_AARCH64_TLB").as_deref()
                 != Some(std::ffi::OsStr::new("0")),
             inline_memory: cfg!(target_endian = "little")
@@ -194,6 +201,18 @@ impl ExecuteBlock for HostBlockRunner {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     fn retain_blocks(&self) -> bool {
         self.retain_blocks
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn take_code_cache(&mut self) -> DispatchCache<HostCode> {
+        core::mem::take(&mut self.cache)
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn return_code_cache(&mut self, cache: DispatchCache<HostCode>) {
+        if self.retain_on_handoff {
+            self.cache = cache;
+        }
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]

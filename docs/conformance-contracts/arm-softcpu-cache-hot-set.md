@@ -38,8 +38,23 @@ A later mapping of the same physical address receives a new code generation
 when it is first translated. Rewriting executable bytes through the loader
 advances that generation again. The synthetic lifecycle fixture observes the
 unmapped fetch failure and verifies that subsequent HVCs match the replacement
-images. The dispatcher cache is scoped to a single run, and the witness works
-at the launcher boundary without an ARM soft VMM lifecycle registration.
+images. The witness works at the launcher boundary without an ARM soft VMM
+lifecycle registration.
+
+## Provider handoffs
+
+The launcher retains bounded compiled code across provider exits when RAM
+supplies its extent inventory identity. Each run rebuilds its stage-1
+translations and native links. It revalidates the execute mapping and
+physical code generation before installing any link or reusing code. A
+different inventory, block limit, chaining mode or inline-memory mode
+starts with an empty cache. Use `CARRICK_SOFT_AARCH64_HANDOFF_CACHE=0` to
+discard residency at every handoff.
+
+The HVC fixture checks one emission and publication across 1, 100 and
+10,000 handoffs. The pre-fix witness emitted 100 blocks at the second scale.
+The witness also checks a switch to an independent inventory with the same
+frame and numerical generation, followed by a loader write and remap.
 
 ## Native branch chains
 
