@@ -5,7 +5,7 @@ use carrick_el1_abi::{
 };
 use carrick_mem::{
     linux_abi::*,
-    memory::{LINUX_HEAP_BASE, LINUX_MMAP_BASE},
+    memory::{LINUX_HEAP_BASE, LINUX_MMAP_BASE, LINUX_STACK_SIZE},
 };
 use carrick_softcpu_aarch64::state::VirtualAddress;
 use std::{
@@ -702,7 +702,7 @@ impl DynamicRoot {
             "rseq" => Ok(LINUX_ENOSYS.guest_retval()),
             "prlimit64" if a == 0 && c == 0 => {
                 let limit = match b {
-                    LINUX_RLIMIT_STACK => LinuxRlimit::new(8 * 1024 * 1024, u64::MAX),
+                    LINUX_RLIMIT_STACK => LinuxRlimit::new(LINUX_STACK_SIZE, u64::MAX),
                     LINUX_RLIMIT_NOFILE => {
                         LinuxRlimit::new(u64::from(FD_LIMIT), u64::from(FD_LIMIT))
                     }
