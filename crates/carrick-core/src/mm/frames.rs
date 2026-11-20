@@ -36,7 +36,15 @@ pub enum PublicationNotNow {
 pub enum PublicationDecline {
     NotNow(PublicationNotNow),
     InheritedPrepared,
-    Terminal(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
+    Terminal(PublicationTerminal),
+}
+
+/// A deterministic publication refusal. Repeating the same request cannot
+/// change this answer, so the fault entry must publish a terminal outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationTerminal {
+    Descriptor(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
+    PublishUnsupported,
 }
 
 impl PublicationDecline {
@@ -54,8 +62,12 @@ impl PublicationDecline {
             DescriptorRefusal::Occupied | DescriptorRefusal::AlreadyValid => {
                 Self::InheritedPrepared
             }
-            _ => Self::Terminal(reason),
+            _ => Self::Terminal(PublicationTerminal::Descriptor(reason)),
         }
+    }
+
+    pub const fn unsupported() -> Self {
+        Self::Terminal(PublicationTerminal::PublishUnsupported)
     }
 }
 
@@ -97,9 +109,13 @@ mod publication_decline_tests {
         ] {
             assert_eq!(
                 PublicationDecline::from_descriptor(reason),
-                PublicationDecline::Terminal(reason),
+                PublicationDecline::Terminal(super::PublicationTerminal::Descriptor(reason)),
             );
         }
+        assert_eq!(
+            PublicationDecline::unsupported(),
+            PublicationDecline::Terminal(super::PublicationTerminal::PublishUnsupported),
+        );
     }
 }
 
