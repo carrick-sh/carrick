@@ -2174,25 +2174,22 @@ fn native_host_file_server<'a>(
     dispatcher: &'a Mutex<SyscallDispatcher>,
     resources: &'a carrick_kernel::dispatch::resources::HostRootResources,
 ) -> impl FnMut(
-    carrick_core_abi::service::ServiceOrigin,
-    carrick_el1_abi::RecordRef,
-    Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
+    carrick_vmm_kvm::cpl0_boot::NativeHostFileCaller,
     &mut [u8],
 ) -> Result<
     carrick_hal::fork_stock::NativeHostFileReply,
     carrick_hal::fork_stock::NativeHostFileRefused,
 > + 'a {
-    move |origin, requester, executable, record| {
+    move |caller, record| {
         let dispatcher = dispatcher
             .lock()
             .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
-        let result = match origin {
+        let result = match caller.birth.origin {
             carrick_core_abi::service::ServiceOrigin::Initial => {
                 dispatcher.serve_host_root_file(resources, record)
             }
-            carrick_core_abi::service::ServiceOrigin::Descendant => {
-                dispatcher.serve_native_host_file_for(record, executable, requester)
-            }
+            carrick_core_abi::service::ServiceOrigin::Descendant => dispatcher
+                .serve_native_host_file_for(record, caller.executable, caller.birth.record),
         };
         result
             .map(carrick_kernel::dispatch::native_files::NativeHostFileServed::into_reply)

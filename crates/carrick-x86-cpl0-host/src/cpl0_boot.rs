@@ -2046,7 +2046,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         self.service_idle_peer_doorbell_with_host_file(
             exit,
             on_work,
-            &mut |_, _, _, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
+            &mut |_, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
             &mut refuse_native_exec,
         )
     }
@@ -2212,9 +2212,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         }
         if let Some(mut pending) = pending_file {
             let served = host_file(
-                pending.ticket.request().identity.birth.origin,
-                pending.ticket.request().identity.birth.record,
-                executable,
+                NativeHostFileCaller {
+                    birth: pending.ticket.request().identity.birth,
+                    executable,
+                },
                 &mut pending.record,
             );
             let mut custody = self
@@ -2474,7 +2475,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             task,
             exit,
             on_work,
-            &mut |_, _, _, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
+            &mut |_, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
             &mut refuse_native_exec,
         )
     }
@@ -2639,9 +2640,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         }
         if let Some(mut pending) = pending_file {
             let served = host_file(
-                pending.ticket.request().identity.birth.origin,
-                pending.ticket.request().identity.birth.record,
-                executable,
+                NativeHostFileCaller {
+                    birth: pending.ticket.request().identity.birth,
+                    executable,
+                },
                 &mut pending.record,
             );
             let mut custody = self
@@ -2696,14 +2698,18 @@ impl<Mem: CarrierMemoryIo> Cpl0HostCustody<Mem> {
     }
 }
 
+/// Caller authority retained before releasing the stopped carrier custody.
+pub struct NativeHostFileCaller {
+    pub birth: carrick_core_abi::service::ServiceBirth,
+    pub executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
+}
+
 /// Host-file handler invoked with physical custody and CPU-I/O borrows released.
 /// Serves one native host-file record for the requesting member (its birth
 /// origin and zone record), writing the reply in place or answering a
 /// host-readiness wait.
 pub type NativeHostFileService<'a> = dyn FnMut(
-        carrick_core_abi::service::ServiceOrigin,
-        carrick_el1_abi::RecordRef,
-        Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
+        NativeHostFileCaller,
         &mut [u8],
     ) -> Result<
         carrick_hal::fork_stock::NativeHostFileReply,
