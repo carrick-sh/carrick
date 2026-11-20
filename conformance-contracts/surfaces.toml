@@ -1173,37 +1173,23 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64-host/src/memory.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64-host/src/memory.rs", contract = "arm.softcpu.stage1-tlb" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs", contract = "arm.softcpu.cache-hot-set" },
-  { path = "crates/carrick-softcpu-aarch64/src/cpu_profile.rs", contract = "softcpu.a64.el0-fp" },
-  # Copy-through dispatcher over the ExecuteBlock seam (#1236), driven by the test-only arm64 lane.
-  { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "arm.softcpu.cache-hot-set" },
-  { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs", contract = "arm.softcpu.stage1-tlb" },
-  # Copy-through dispatcher over the ExecuteBlock seam (#1236), driven by the test-only arm64 lane.
+  { path = "crates/carrick-softcpu-aarch64/src/cpu_profile.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "arm.softcpu.stage1-tlb" },
-  # Virtual exception entry and return for the test-only arm64 lane.
+  { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64/src/exception.rs", contract = "softcpu.a64.el0-fp" },
-  # Copy-through exit handlers for the test-only arm64 lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.cache-hot-set" },
-  { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.stage1-tlb" },
-  # Typed A64 census and instruction decoder for the test-only soft-CPU lane (#1236).
+  { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64/src/lib.rs", contract = "softcpu.a64.el0-fp" },
-  # Stage-1 translation of handler accesses and block fetch for the test-only arm64 lane (#2480).
-  # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
-  { path = "crates/carrick-softcpu-aarch64/src/mmu.rs", contracts = [] },
-  { path = "crates/carrick-softcpu-aarch64/src/simd.rs", contract = "softcpu.a64.el0-fp" },
-  { path = "crates/carrick-softcpu-aarch64/src/state.rs", contract = "softcpu.a64.el0-fp" },
-  # Copy-through block splitter and A64 emitter (#1236); pure word translation, nothing executes.
-  { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "arm.softcpu.cache-hot-set" },
-  { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64/src/mmu.rs", contract = "arm.softcpu.stage1-tlb" },
-  # Virtual CPU and system registers for the test-only arm64 lane.
-  # The director registers the real ARM soft-CPU contract when A3 makes it guest-visible.
+  { path = "crates/carrick-softcpu-aarch64/src/simd.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64/src/state.rs", contract = "arm.softcpu.cache-hot-set" },
-  # Copy-through block splitter and A64 emitter (#1236); pure word translation, nothing executes.
+  { path = "crates/carrick-softcpu-aarch64/src/state.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "arm.softcpu.stage1-tlb" },
+  { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "softcpu.a64.el0-fp" },
   { path = "crates/carrick-softcpu-aarch64/tests/stage1.rs", contract = "arm.softcpu.stage1-tlb" },
   { path = "crates/carrick-softcpu-x86/examples/scan_unsupported.rs", contracts = [] },
   { path = "crates/carrick-softcpu-x86/src/apic.rs", contract = "x86.softcpu.apic-timer" },
