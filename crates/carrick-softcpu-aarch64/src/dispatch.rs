@@ -167,7 +167,10 @@ impl<E: fmt::Debug> fmt::Display for Report<E> {
 fn absorbed(event: Event) -> bool {
     matches!(
         event,
-        Event::Tlbi(_) | Event::Ic(_) | Event::Hint(crate::Hint::Sev | crate::Hint::Sevl)
+        Event::Tlbi(_)
+            | Event::Ic(_)
+            | Event::IcFrame(_)
+            | Event::Hint(crate::Hint::Sev | crate::Hint::Sevl)
     )
 }
 
@@ -276,6 +279,10 @@ impl<M: GuestMemory> GuestMemory for MeasuredMemory<'_, M> {
 
     fn code_generation(&self, frame: FrameGpa) -> Option<CodeGeneration> {
         self.inner.code_generation(frame)
+    }
+
+    fn invalidate_code_frame(&mut self, frame: FrameGpa) -> Result<bool, MemoryFault> {
+        self.inner.invalidate_code_frame(frame)
     }
 
     fn translate_stage1(
@@ -479,7 +486,11 @@ pub fn run<X: ExecuteBlock>(
                         }
                         if matches!(
                             event,
-                            Event::ProviderExit(_) | Event::Tlbi(_) | Event::Ic(_) | Event::Hint(_)
+                            Event::ProviderExit(_)
+                                | Event::Tlbi(_)
+                                | Event::Ic(_)
+                                | Event::IcFrame(_)
+                                | Event::Hint(_)
                         ) {
                             work.retired_instructions += 1;
                         }

@@ -25,6 +25,8 @@ rationale = "Each of the two resident blocks is emitted once."
 vm_free = [
   "carrick-softcpu-aarch64-host::boot_probe::resident_loop_translates_only_two_blocks",
   "carrick-softcpu-aarch64-host::boot_probe::guest_code_write_replaces_the_resident_translation",
+  "carrick-softcpu-aarch64-host::boot_probe::ic_ivau_recompiles_only_the_target_code_frame",
+  "carrick-softcpu-aarch64-host::boot_probe::remap_and_exec_loader_write_advance_code_incarnations",
 ]
 [bindings.unresolved]
 embed_structural = "The native ARM64 soft dispatcher witness runs without an embedded soft carrier."

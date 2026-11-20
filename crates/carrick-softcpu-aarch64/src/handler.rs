@@ -74,6 +74,13 @@ pub trait GuestMemory {
         None
     }
 
+    /// Invalidate all resident translations for this frame, including aliases.
+    /// False asks the dispatcher to discard its cache when the provider
+    /// cannot revoke a physical code identity.
+    fn invalidate_code_frame(&mut self, _frame: FrameGpa) -> Result<bool, MemoryFault> {
+        Ok(false)
+    }
+
     /// Activate tracking for a frame before publishing a resident block.
     /// Owners that already track every frame can return the current generation.
     fn mark_code_page(&mut self, frame: FrameGpa) -> Option<CodeGeneration> {
@@ -131,6 +138,8 @@ pub enum Event {
     ProviderExit(ProviderExit),
     Tlbi(TlbiOperation),
     Ic(IcOperation),
+    /// The physical owner has invalidated the translated frame generation.
+    IcFrame(FrameGpa),
     Hint(Hint),
     /// MSR SCTLR_EL1 would set M under a TCR_EL1 the stage-1 walker does
     /// not admit. Not retired.
@@ -240,9 +249,15 @@ pub fn execute(
                     LeafAccess::Read,
                     AccessClass::Ordinary,
                 ) {
-                    Ok(_) => {
+                    Ok(pa) => {
+                        let frame = FrameGpa::new(pa & !(PAGE - 1));
+                        let event = match memory.invalidate_code_frame(frame) {
+                            Ok(true) => Event::IcFrame(frame),
+                            Ok(false) => Event::Ic(op),
+                            Err(fault) => return Outcome::Event(Event::MemoryFault(fault)),
+                        };
                         next(cpu);
-                        Outcome::Event(Event::Ic(op))
+                        Outcome::Event(event)
                     }
                     Err(Stage1Error::Abort(fault)) => enter_memory_exception(
                         cpu,
