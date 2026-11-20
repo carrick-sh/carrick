@@ -19,8 +19,8 @@ use carrick_el1_abi::{
     ContextGeneration, CurrentTask, DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE,
     DELEGATED_STATE_GUEST, DelegatedOpenFile, EL1_CURRENT_TASKS_BASE, EL1_DYNAMIC_METADATA_BASE,
     EL1_DYNAMIC_METADATA_EXTENT_SIZE, EL1_FD_MAP_BASE, EL1_OPEN_FILE_TABLE_BASE,
-    EL1_STACK_GUARD_TABLES_BASE, El1TaskId, FdMapSlot, HostBoundFd, HostObjectBinding,
-    SnapshotGeneration, TrapFrame, is_el1_stack_guard, stack_slot_top,
+    EL1_STACK_GUARD_TABLES_BASE, El1TaskId, FdMapSlot, HostObjectBinding, SnapshotGeneration,
+    TrapFrame, is_el1_stack_guard, stack_slot_top,
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_mem::arch_sysregs::{MAIR_EL1_BOOTSTRAP, SCTLR_EL1_BOOTSTRAP, TCR_EL1_BOOTSTRAP};
@@ -34,7 +34,7 @@ use carrick_mem::memory::{
     el1_vectors_bytes_mailbox_clock, stage1_carrier_maintenance_page_tables,
     stage1_hvpatch_page_tables, stage1_identity_page_tables,
 };
-use carrick_softcpu_aarch64::dispatch::{ExecuteBlock, Report, Stop, run};
+use carrick_softcpu_aarch64::dispatch::{ExecuteBlock, Report, RunWork, Stop, run};
 use carrick_softcpu_aarch64::handler::{
     CodeGeneration, Event, ExclusiveMonitor, GuestMemory, MemoryFault,
 };
@@ -51,6 +51,10 @@ use core::mem::offset_of;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 use std::collections::{BTreeMap, VecDeque};
+
+#[path = "fixtures/dynamic_root.rs"]
+mod dynamic_root;
+use dynamic_root::{DynamicRoot, FixtureRoot};
 
 const PAGE: u64 = 4096;
 const INITIAL_METADATA_END: u64 =
@@ -880,11 +884,18 @@ fn admit_root_task_with_stdio(memory: &mut Pages) {
         (1u32, (DELEGATED_FLAG_WRITABLE, HostObjectBinding::STDOUT)),
         (2u32, (DELEGATED_FLAG_WRITABLE, HostObjectBinding::STDERR)),
     ] {
-        bind_host_fixture_fd(memory, fd, flags, binding);
+        bind_host_fixture_fd(memory, fd, flags, binding, false);
     }
 }
 
-fn bind_host_fixture_fd(memory: &mut Pages, fd: u32, flags: u32, binding: HostObjectBinding) {
+fn bind_host_fixture_fd(
+    memory: &mut Pages,
+    fd: u32,
+    flags: u32,
+    binding: HostObjectBinding,
+    cloexec: bool,
+) {
+    use carrick_mem::linux_abi::LINUX_FD_CLOEXEC;
     let handle = fd + 1;
     load_abi_record::<DelegatedOpenFile, { core::mem::size_of::<DelegatedOpenFile>() }>(
         memory,
@@ -900,8 +911,17 @@ fn bind_host_fixture_fd(memory: &mut Pages, fd: u32, flags: u32, binding: HostOb
         memory,
         EL1_FD_MAP_BASE + u64::from(fd) * core::mem::size_of::<FdMapSlot>() as u64,
         |slot| {
-            slot.set(1, fd, handle, 1);
+            let fd_flags = if cloexec { LINUX_FD_CLOEXEC as u32 } else { 0 };
+            slot.set_with_flags(1, fd, handle, 1, fd_flags);
         },
+    );
+}
+
+fn unbind_host_fixture_fd(memory: &mut Pages, fd: u32) {
+    load_abi_record::<FdMapSlot, { size_of::<FdMapSlot>() }>(
+        memory,
+        EL1_FD_MAP_BASE + u64::from(fd) * size_of::<FdMapSlot>() as u64,
+        FdMapSlot::clear,
     );
 }
 
@@ -1252,26 +1272,19 @@ fn production_el1_image_runs_dynamic_glibc_hello() {
     let Some(root) = std::env::var_os("CARRICK_A64_DYN_ROOT") else {
         return;
     };
-    let root = std::path::PathBuf::from(root);
-    let hello = std::fs::read(root.join("hello")).expect("read dynamic hello");
+    let root = FixtureRoot::new(root.into());
+    let hello = root.read("/hello").expect("read dynamic hello");
     let program = carrick_mem::elf::ElfProgram::load(&hello, 183, &|path| {
         assert_eq!(path, "/lib/ld-linux-aarch64.so.1");
-        std::fs::read(root.join(&path[1..])).ok()
+        root.read(path).ok()
     })
     .expect("plan glibc hello and its interpreter");
     let (mut cpu, mut memory) = stage_dynamic(&program, vec![b"/hello".to_vec()], Vec::new());
-    let mut replies = GlibcReplies {
-        libc: std::fs::read(root.join("lib/libc.so.6")).expect("read fixture libc.so.6"),
-        libc_cursor: None,
-        next_map: carrick_mem::memory::LINUX_MMAP_BASE,
-        program_break: carrick_mem::memory::LINUX_HEAP_BASE,
-        stdout: Vec::new(),
-        libc_exec: None,
-    };
+    let mut replies = DynamicRoot::new(root, "/hello");
     let result = run_dynamic_glibc(&mut cpu, &mut memory, &mut replies, 1_000_000);
     assert_eq!(result, Ok(0));
     assert_eq!(replies.stdout, b"dynamic glibc hello\n");
-    report_glibc_ifuncs(&program, &mut memory, &replies);
+    assert_eq!(replies.report_ifuncs(&mut memory, &program), 3);
 }
 
 /// Set CARRICK_A64_PYTHON_ROOT to an extracted linux/arm64 python:3.12-slim
@@ -1281,13 +1294,11 @@ fn production_el1_image_runs_dynamic_cpython() {
     let Some(root) = std::env::var_os("CARRICK_A64_PYTHON_ROOT") else {
         return;
     };
-    let root = std::path::PathBuf::from(root);
+    let root = FixtureRoot::new(root.into());
     let executable = "/usr/local/bin/python3";
-    let python = std::fs::read(root.join(&executable[1..])).expect("read CPython");
-    let program = carrick_mem::elf::ElfProgram::load(&python, 183, &|path| {
-        std::fs::read(root.join(&path[1..])).ok()
-    })
-    .expect("plan CPython and its interpreter");
+    let python = root.read(executable).expect("read CPython");
+    let program = carrick_mem::elf::ElfProgram::load(&python, 183, &|path| root.read(path).ok())
+        .expect("plan CPython and its interpreter");
     let (mut cpu, mut memory) = stage_dynamic(
         &program,
         vec![
@@ -1297,15 +1308,9 @@ fn production_el1_image_runs_dynamic_cpython() {
         ],
         vec![b"HOME=/tmp".to_vec()],
     );
-    let mut replies = GlibcReplies {
-        libc: std::fs::read(root.join("lib/aarch64-linux-gnu/libc.so.6")).unwrap(),
-        libc_cursor: None,
-        next_map: carrick_mem::memory::LINUX_MMAP_BASE,
-        program_break: carrick_mem::memory::LINUX_HEAP_BASE,
-        stdout: Vec::new(),
-        libc_exec: None,
-    };
+    let mut replies = DynamicRoot::new(root, executable);
     let result = run_dynamic_glibc(&mut cpu, &mut memory, &mut replies, 100_000_000);
+    replies.report_ifuncs(&mut memory, &program);
     assert_eq!(result, Ok(0));
     let version = std::str::from_utf8(&replies.stdout).unwrap();
     let patch = version
@@ -1410,52 +1415,20 @@ fn stage_dynamic(
     (cpu, memory)
 }
 
-fn report_glibc_ifuncs(
-    program: &carrick_mem::elf::ElfProgram<'_>,
-    memory: &mut Pages,
-    replies: &GlibcReplies,
-) {
-    let elf = goblin::elf::Elf::parse(program.executable_bytes).unwrap();
-    let (mapped, offset, len) = replies.libc_exec.expect("executable libc mapping");
-    for name in ["memcpy", "strlen", "memset"] {
-        let slot = elf
-            .pltrelocs
-            .iter()
-            .find(|rel| {
-                elf.dynsyms
-                    .get(rel.r_sym)
-                    .and_then(|sym| elf.dynstrtab.get_at(sym.st_name))
-                    == Some(name)
-            })
-            .unwrap_or_else(|| {
-                panic!("missing {name} PLT relocation in fixture, compile with -fno-builtin")
-            });
-        let target = read_u64(memory, program.executable.load_bias + slot.r_offset);
-        assert!(
-            (mapped..mapped + len).contains(&target),
-            "unresolved {name}: {target:#x}"
-        );
-        println!(
-            "IFUNC {name}: guest={target:#x} libc file offset={:#x} word={:#010x}",
-            target - mapped + offset,
-            read_u32(memory, target)
-        );
-    }
-}
-
 fn run_dynamic_glibc(
     cpu: &mut CpuState,
     memory: &mut Pages,
-    replies: &mut GlibcReplies,
+    replies: &mut DynamicRoot,
     budget: u64,
 ) -> Result<u64, String> {
     use carrick_mem::linux_abi::syscall::lookup_aarch64;
     let mut runner = TracingRunner::new().unwrap();
     let mut blocks = 0;
-    let mut instructions = 0;
+    let mut work = RunWork::default();
     let mut undefined = 0;
     let mut traced = 0;
     let mut counts = BTreeMap::<u64, u64>::new();
+    let mut forwarded = BTreeMap::<u64, u64>::new();
     let mut monitor = ExclusiveMonitor::default();
     let started = std::time::Instant::now();
     let result = loop {
@@ -1468,7 +1441,13 @@ fn run_dynamic_glibc(
             budget - blocks,
         );
         blocks += report.blocks;
-        instructions += report.work.retired_instructions;
+        work.retired_instructions += report.work.retired_instructions;
+        work.dispatches += report.work.dispatches;
+        work.executed_blocks += report.work.executed_blocks;
+        work.decoded_blocks += report.work.decoded_blocks;
+        work.emitted_blocks += report.work.emitted_blocks;
+        work.stage1_walks += report.work.stage1_walks;
+        work.memory_exits += report.work.memory_exits;
         undefined += report.undefined_el0_deliveries;
         runner.finish_pending();
         for svc in &runner.syscalls[traced..] {
@@ -1478,6 +1457,9 @@ fn run_dynamic_glibc(
                 svc.nr, svc.pc, svc.args, svc.ret
             );
             *counts.entry(svc.nr).or_default() += 1;
+            if name == "close" && svc.ret == Some(0) {
+                replies.retire_ring_close(svc.args[0]);
+            }
         }
         traced = runner.syscalls.len();
         println!(
@@ -1492,7 +1474,8 @@ fn run_dynamic_glibc(
                 .ok()
                 .map(|()| u32::from_le_bytes(bytes));
             break Err(format!(
-                "EL0 sync fault ELR={pc:#x} ESR={esr:#x} FAR={far:#x} word={word:08x?}: {report}"
+                "EL0 sync fault image={:?} ELR={pc:#x} ESR={esr:#x} FAR={far:#x} word={word:08x?}: {report}",
+                replies.image_at(pc)
             ));
         }
         if report.undefined_el0_deliveries != 0 {
@@ -1505,7 +1488,11 @@ fn run_dynamic_glibc(
             ..
         } = report.stop
         else {
-            break Err(format!("EL1 boot probe stopped: {report}"));
+            break Err(format!(
+                "EL1 boot probe stopped at PC={:#x} image={:?}: {report}",
+                report.pc.0,
+                replies.image_at(report.pc.0)
+            ));
         };
         if exit.immediate.value() != 2 {
             break Err(format!("unexpected provider exit: {report}"));
@@ -1534,6 +1521,7 @@ fn run_dynamic_glibc(
             break Err(format!("unexpected mailbox for EL0 SVC {svc:?}: {report}"));
         }
         let name = lookup_aarch64(nr).map_or("unknown", |call| call.name);
+        *forwarded.entry(nr).or_default() += 1;
         // exit_group is terminal: the mailbox request supplies its status.
         if name == "exit_group" {
             break Ok(args[0]);
@@ -1543,230 +1531,28 @@ fn run_dynamic_glibc(
                 println!("    synthetic {nr} {name} -> {value} ({value:#x})");
                 complete_mailbox_syscall(memory, value);
             }
-            Err(error) => break Err(error),
+            Err(error) => break Err(format!("{error}, nr={nr} PC={:#x}", svc.pc)),
         }
     };
     let elapsed = started.elapsed().as_secs_f64();
+    replies.report_opens();
+    println!("engine work={work:?}");
+    for (nr, count) in &counts {
+        let name = lookup_aarch64(*nr).map_or("unknown", |call| call.name);
+        let mailbox = forwarded.get(nr).copied().unwrap_or(0);
+        println!("syscall {nr:3} {name:16} total={count:3} mailbox={mailbox:3}");
+    }
     println!(
-        "dynamic result={result:?} blocks={blocks} retired={instructions} undefined={} syscalls={counts:?} elapsed={elapsed:.6}s blocks/s={:.0} instr/s={:.0}",
+        "dynamic result={result:?} blocks={blocks} retired={} undefined={} syscalls={} elapsed={elapsed:.6}s blocks/s={:.0} instr/s={:.0}",
+        work.retired_instructions,
         undefined,
+        counts.values().sum::<u64>(),
         blocks as f64 / elapsed,
-        instructions as f64 / elapsed
+        work.retired_instructions as f64 / elapsed
     );
     println!(
         "guest stdout={:?}",
         String::from_utf8_lossy(&replies.stdout)
     );
     result
-}
-
-/// Single-process responses for this loader fixture. This owns only test pages
-/// and a read-only libc fixture. No guest pathname is used to open a host file.
-struct GlibcReplies {
-    libc: Vec<u8>,
-    libc_cursor: Option<usize>,
-    next_map: u64,
-    program_break: u64,
-    stdout: Vec<u8>,
-    libc_exec: Option<(u64, u64, u64)>,
-}
-
-impl GlibcReplies {
-    const FD: u64 = 3;
-    const MAX_MAPPING: u64 = 16 * 1024 * 1024;
-
-    fn brk(&mut self, memory: &mut Pages, requested: u64) -> i64 {
-        use carrick_mem::memory::LINUX_HEAP_BASE;
-        if (LINUX_HEAP_BASE..=LINUX_HEAP_BASE + Self::MAX_MAPPING).contains(&requested) {
-            for page in
-                (self.program_break.next_multiple_of(PAGE)..requested).step_by(PAGE as usize)
-            {
-                memory.map_zero(page);
-            }
-            for page in
-                (requested.next_multiple_of(PAGE)..self.program_break).step_by(PAGE as usize)
-            {
-                memory.pages.remove(&page);
-            }
-            self.program_break = requested;
-        }
-        self.program_break as i64
-    }
-
-    fn protect(memory: &mut Pages, addr: u64, len: u64, prot: u64) {
-        use carrick_mem::linux_abi::{LINUX_PROT_EXEC, LINUX_PROT_WRITE};
-        use carrick_mem::memory::{AARCH64_LINUX_PAGE_TABLE_LAYOUT, LINUX_PAGE_TABLES_SIZE};
-        use carrick_mmu_core::aarch64::PageTableManager;
-
-        assert!(addr.is_multiple_of(PAGE) && len != 0 && len <= Self::MAX_MAPPING);
-        let mut raw = vec![0; LINUX_PAGE_TABLES_SIZE as usize];
-        memory
-            .read(VirtualAddress(LINUX_PAGE_TABLES_BASE), &mut raw)
-            .unwrap();
-        let mut tables =
-            PageTableManager::new(raw, LINUX_PAGE_TABLES_BASE, AARCH64_LINUX_PAGE_TABLE_LAYOUT);
-        let len = len.next_multiple_of(PAGE) as usize;
-        let exec = prot & LINUX_PROT_EXEC != 0;
-        match prot {
-            0 => tables.set_prot_none(addr, len, None),
-            p if p & LINUX_PROT_WRITE != 0 => tables.set_rw(addr, len, exec, None),
-            _ => tables.set_readonly(addr, len, exec, None),
-        }
-        .unwrap();
-        memory.load(
-            LINUX_PAGE_TABLES_BASE,
-            &tables.into_occupied_bytes().unwrap(),
-        );
-    }
-
-    fn mmap(&mut self, memory: &mut Pages, args: [u64; 6]) -> i64 {
-        use carrick_mem::linux_abi::{LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_PROT_EXEC};
-        use carrick_mem::memory::LINUX_MMAP_BASE;
-        let [hint, len, prot, flags, fd, offset] = args;
-        assert!((1..=Self::MAX_MAPPING).contains(&len));
-        assert!(offset.is_multiple_of(PAGE));
-        let len = len.next_multiple_of(PAGE);
-        let addr = if flags & LINUX_MAP_FIXED != 0 {
-            assert!(hint >= LINUX_MMAP_BASE && hint + len <= self.next_map);
-            hint
-        } else {
-            let addr = self.next_map;
-            self.next_map += len;
-            assert!(self.next_map <= LINUX_MMAP_BASE + Self::MAX_MAPPING);
-            addr
-        };
-        assert!(addr.is_multiple_of(PAGE));
-        for page in (addr..addr + len).step_by(PAGE as usize) {
-            memory.pages.remove(&page);
-            memory.map_zero(page);
-        }
-        if flags & LINUX_MAP_ANONYMOUS == 0 {
-            assert_eq!(fd, Self::FD);
-            assert!(self.libc_cursor.is_some());
-            let offset = offset as usize;
-            let end = (offset + len as usize).min(self.libc.len());
-            memory.load(addr, &self.libc[offset..end]);
-            if prot & LINUX_PROT_EXEC != 0 {
-                self.libc_exec = Some((addr, offset as u64, len));
-            }
-        }
-        Self::protect(memory, addr, len, prot);
-        addr as i64
-    }
-
-    fn open(&mut self, memory: &mut Pages, path: u64) -> i64 {
-        use carrick_mem::linux_abi::LINUX_ENOENT;
-        let name = read_cstr(memory, path, 256);
-        println!("  openat path={}", String::from_utf8_lossy(&name));
-        if name != b"/lib/libc.so.6" {
-            return LINUX_ENOENT.guest_retval();
-        }
-        assert!(self.libc_cursor.replace(0).is_none());
-        bind_host_fixture_fd(
-            memory,
-            Self::FD as u32,
-            DELEGATED_FLAG_READABLE,
-            HostObjectBinding::from_host_fd(HostBoundFd::new(Self::FD as i32).unwrap()),
-        );
-        Self::FD as i64
-    }
-
-    fn read(&mut self, memory: &mut Pages, args: [u64; 6], positional: bool) -> i64 {
-        let [fd, buf, count, offset, ..] = args;
-        assert_eq!(fd, Self::FD);
-        let cursor = self.libc_cursor.as_mut().expect("open libc fd");
-        let start = if positional { offset as usize } else { *cursor };
-        let data = self.libc.get(start..).unwrap_or_default();
-        let bytes = &data[..data.len().min(count as usize)];
-        memory.write(VirtualAddress(buf), bytes).unwrap();
-        if !positional {
-            *cursor += bytes.len();
-        }
-        bytes.len() as i64
-    }
-
-    /// Return an error for an unlisted syscall, preserving the first blocker
-    /// rather than making the loader guess from a synthetic ENOSYS.
-    fn reply(&mut self, memory: &mut Pages, name: &str, args: [u64; 6]) -> Result<i64, String> {
-        use carrick_mem::linux_abi::{
-            KernelAbi, LINUX_ENOENT, LINUX_ENOSYS, LINUX_RLIMIT_STACK, LINUX_S_IFREG, LinuxRlimit,
-            LinuxStat, LinuxStatFields,
-        };
-
-        let [a, b, c, d, ..] = args;
-        let result = match name {
-            "brk" => self.brk(memory, a),
-            "mmap" => self.mmap(memory, args),
-            "mprotect" => {
-                Self::protect(memory, a, b, c);
-                0
-            }
-            "munmap" => {
-                Self::protect(memory, a, b, 0);
-                for page in (a..a + b).step_by(PAGE as usize) {
-                    memory.pages.remove(&page);
-                }
-                0
-            }
-            "faccessat" => {
-                assert_eq!(read_cstr(memory, b, 256), b"/etc/ld.so.preload");
-                LINUX_ENOENT.guest_retval()
-            }
-            "openat" => self.open(memory, b),
-            "read" | "pread64" => self.read(memory, args, name == "pread64"),
-            "fstat" => {
-                assert_eq!(a, Self::FD);
-                assert!(self.libc_cursor.is_some());
-                let fields = LinuxStatFields {
-                    size: self.libc.len() as u64,
-                    ..LinuxStatFields::synthetic(b"/lib/libc.so.6", LINUX_S_IFREG | 0o555)
-                };
-                memory
-                    .write(
-                        VirtualAddress(b),
-                        LinuxStat::from_fields(&fields).abi_bytes(),
-                    )
-                    .unwrap();
-                0
-            }
-            "close" => {
-                assert_eq!(a, Self::FD);
-                assert!(self.libc_cursor.take().is_some());
-                0
-            }
-            "set_tid_address" => 1,
-            "set_robust_list" => 0,
-            "rseq" => LINUX_ENOSYS.guest_retval(),
-            "prlimit64" => {
-                assert_eq!((a, b, c), (0, LINUX_RLIMIT_STACK, 0));
-                memory
-                    .write(
-                        VirtualAddress(d),
-                        LinuxRlimit::new(8 * 1024 * 1024, u64::MAX).abi_bytes(),
-                    )
-                    .unwrap();
-                0
-            }
-            "getrandom" => {
-                assert!(b <= 256);
-                memory
-                    .write(VirtualAddress(a), &[0x9d; 256][..b as usize])
-                    .unwrap();
-                b as i64
-            }
-            "write" => {
-                assert!(matches!(a, 1 | 2) && c <= 4096);
-                let mut bytes = vec![0; c as usize];
-                memory.read(VirtualAddress(b), &mut bytes).unwrap();
-                if a == 1 {
-                    self.stdout.extend_from_slice(&bytes);
-                } else {
-                    println!("  stderr: {}", String::from_utf8_lossy(&bytes));
-                }
-                c as i64
-            }
-            _ => return Err(format!("unlisted mailbox syscall {name} {args:x?}")),
-        };
-        Ok(result)
-    }
 }
