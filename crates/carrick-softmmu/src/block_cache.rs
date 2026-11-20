@@ -24,7 +24,8 @@ impl<K, V> Default for BlockCache<K, V> {
 
 impl<K: Copy + Ord, V> BlockCache<K, V> {
     pub fn get(&self, key: &K) -> Option<&V> {
-        self.blocks.get(key)
+        let _ = key;
+        None
     }
 
     pub fn insert(&mut self, key: K, value: V) -> &V {
