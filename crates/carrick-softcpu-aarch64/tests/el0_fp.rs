@@ -50,3 +50,70 @@ fn vector_integer_fp_permute_and_table_admit_only_allocated_forms() {
         );
     }
 }
+
+#[test]
+fn el0_static_census_admits_baseline_families_and_rejects_extensions() {
+    use InstructionClass::{Copy, Exit};
+    for (name, word, expected) in [
+        ("chkfeat x16", 0xd503_251f, Copy(CopyKind::NoOperation)),
+        ("fadd d0, d0, d1", 0x1e61_2800, Copy(CopyKind::Verbatim)),
+        (
+            "add v0.16b, v0.16b, v1.16b",
+            0x4e21_8400,
+            Copy(CopyKind::Verbatim),
+        ),
+        ("ld1 {v0.16b}, [x0]", 0x4c40_7000, Exit(ExitReason::Memory)),
+        ("ldr q0, [x0]", 0x3dc0_0000, Exit(ExitReason::Memory)),
+        (
+            "prfm pldl1keep, [x0]",
+            0xf980_0000,
+            Exit(ExitReason::Memory),
+        ),
+        ("ldxr x0, [x1]", 0xc85f_7c20, Exit(ExitReason::Memory)),
+        ("stlxr w2, x0, [x1]", 0xc802_fc20, Exit(ExitReason::Memory)),
+        (
+            "crc32x w2, w0, x1",
+            0x9ac1_4c02,
+            Exit(ExitReason::RegisterCompute),
+        ),
+        ("extr x0, x0, x1, #1", 0x93c1_0400, Copy(CopyKind::Verbatim)),
+        ("clz x0, x0", 0xdac0_1000, Copy(CopyKind::Verbatim)),
+        (
+            "isb",
+            0xd503_3fdf,
+            Exit(ExitReason::InstructionSynchronization),
+        ),
+        (
+            "mrs x0, nzcv",
+            0xd53b_4200,
+            Exit(ExitReason::SystemRegister),
+        ),
+        ("ptrue p0.b", 0x2518_e3e0, Exit(ExitReason::Undefined)),
+        (
+            "aese v0.16b, v0.16b",
+            0x4e28_4800,
+            Exit(ExitReason::Undefined),
+        ),
+        (
+            "ldadd x0, x0, [x1]",
+            0xf820_0020,
+            Exit(ExitReason::Undefined),
+        ),
+        (
+            "casa x0, x1, [x2]",
+            0xc8e0_7c41,
+            Exit(ExitReason::Undefined),
+        ),
+        (
+            "cpyfp [x3]!, [x1]!, x2!",
+            0x1901_0443,
+            Exit(ExitReason::Undefined),
+        ),
+    ] {
+        assert_eq!(
+            GuestInstruction::decode_el0(ProgramCounter(0x1000), word).class(),
+            expected,
+            "{name} ({word:08x})",
+        );
+    }
+}
