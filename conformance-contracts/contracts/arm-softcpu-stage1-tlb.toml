@@ -17,6 +17,7 @@ vm_free = [
   "carrick-softcpu-aarch64-host::boot_probe::translated_memory_loop_walks_each_page_once",
   "carrick-softcpu-aarch64::stage1::tlbi_invalidates_a_loaded_translation_before_the_next_load",
   "carrick-softcpu-aarch64::stage1::dispatcher_tlb_checks_ttbr_asid_and_pan_after_a_hit",
+  "carrick-softcpu-aarch64::stage1::dispatcher_discards_stage1_when_translation_is_disabled",
 ]
 
 [bindings.unresolved]
