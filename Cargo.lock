@@ -410,7 +410,6 @@ dependencies = [
  "carrick-coordinator",
  "carrick-kernel-arena",
  "carrick-spec",
- "carrick-test-support",
  "clap",
  "libc",
  "regex",

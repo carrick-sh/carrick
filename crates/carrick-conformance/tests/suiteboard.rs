@@ -1,30 +1,16 @@
 use std::fs;
 use std::process::Command;
 
-use carrick_test_support::executable::write_executable;
 use serde_json::Value;
 
 #[test]
 fn suiteboard_known_answer() {
     let directory = tempfile::tempdir().unwrap();
-    let fixture = directory.path().join("fixture-carrick");
-    write_executable(
-        &fixture,
-        r#"#!/bin/sh
-case "$*" in
-  *fixture-hang*) exec sleep 30 ;;
-esac
-printf 'TAP version 13\n1..3\nnot ok 1 - planted failure\nok 2 - planted skip # SKIP fixture\n'
-if [ -e "$0.sampled" ]; then
-  printf 'not ok 3 - planted flake\n'
-else
-  touch "$0.sampled"
-  printf 'ok 3 - planted flake\n'
-fi
-printf '%s\n' 'CARRICK_SYSCALL_CENSUS {"refusal_evidence":{"schema":1,"isa":"x86_64","complete":true,"rows":[]}}' >&2
-exit 1
-"#,
-    );
+    let fixture = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/suiteboard-carrick"
+    ));
+    let state = directory.path().join("sampled");
     let manifest = directory.path().join("suites.toml");
     let cache = directory.path().join("oracle.jsonl");
     let results = directory.path().join("observations.jsonl");
@@ -80,7 +66,8 @@ carrick_flags = ["--fs", "host"]
             ])
             .args(["--no-image-refresh", "--workers", "2"])
             .arg("--carrick-bin")
-            .arg(&fixture)
+            .arg(fixture)
+            .env("CARRICK_SUITEBOARD_FIXTURE_STATE", &state)
             .arg("--manifest")
             .arg(&manifest)
             .arg("--oracle-cache")
@@ -96,7 +83,7 @@ carrick_flags = ["--fs", "host"]
     assert_eq!(missing.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("uncached: fixture-hang"), "{stderr}");
     assert!(!results.exists());
-    assert!(!fixture.with_extension("sampled").exists());
+    assert!(!state.exists());
 
     // The CLI's live KVM preflight requires the device even though this
     // fixture exercises only the host command runner and never opens it.

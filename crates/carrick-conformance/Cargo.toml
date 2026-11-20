@@ -29,6 +29,3 @@ tempfile.workspace = true
 carrick-coordinator = { path = "../carrick-coordinator" }
 carrick-spec = { path = "../carrick-spec" }
 carrick-kernel-arena = { path = "../carrick-kernel-arena" }
-
-[dev-dependencies]
-carrick-test-support = { path = "../carrick-test-support" }
