@@ -126,7 +126,11 @@ child:
     mov $16, %eax
     syscall
     mov $107, %edi
-    cmp $-25, %rax
+#ifdef EXPECT_UNROUTED_IOCTL
+    cmp $-38, %rax                 /* Carrick counts this unrouted request */
+#else
+    cmp $-25, %rax                 /* native pipe stdout rejects it */
+#endif
     jne exit
 
     mov %r12, %rdi
