@@ -529,6 +529,13 @@ fn busy_service_notice_parks_and_reruns_once_for<
         .unwrap()
         .expect("holder notice must remain intact across contended entry");
     assert_eq!(holder_notice.record, holder_record);
+    if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
+    assert!(
+        !fixture.task.linux.has_pending_host_work(),
+        "carrier intake must consume the ring raised for the holder's notice"
+    );
     {
         let identity = fixture.zone.record(holder_record.id).identity();
         let key =
@@ -586,6 +593,11 @@ fn busy_service_notice_parks_and_reruns_once_for<
     }
     assert!(holder_resumed && contender_published);
     assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+    assert!(
+        fixture.task.linux.has_pending_host_work(),
+        "the contender's rerun publication and park must ring the carrier"
+    );
 
     // Host intake now consumes Process 2's retained sequence-1 notice and
     // completes it.
