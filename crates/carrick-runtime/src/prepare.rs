@@ -2006,7 +2006,20 @@ impl PreparedRun {
                         address: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::As),
                         data: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::Data),
                     };
-                    machine.load_guest_mm(&image, &argv, &env, limits)?;
+                    let container = root_context.task().container();
+                    let clock = container.clock();
+                    let native_realtime_delta = (!clock.is_frozen()
+                        && !clock.is_scaled()
+                        && !clock.is_deterministic()
+                        && carrick_kernel::vdso_policy::raw_clock_fast_path_allowed_for_debug())
+                    .then(|| clock.realtime_offset_ns());
+                    machine.load_guest_mm_for_clock(
+                        &image,
+                        &argv,
+                        &env,
+                        limits,
+                        native_realtime_delta,
+                    )?;
                     run_prepared_kvm_pool_with_debug(
                         machine,
                         root_context,

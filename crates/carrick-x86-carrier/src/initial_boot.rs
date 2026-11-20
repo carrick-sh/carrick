@@ -154,11 +154,11 @@ impl InitialFrameSource for GrantedFrames<'_> {
 fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     if request.magic != X86_INITIAL_BOOT_MAGIC
         || request.version != X86_INITIAL_BOOT_VERSION
+        || request.image_features & !carrick_core_abi::X86_INITIAL_HAS_VDSO != 0
         || request.layout_hash != carrick_el1_abi::EL1_ABI_LAYOUT_HASH
         || request.region_count == 0
         || request.executable_region_count == 0
         || request.executable_region_count > request.region_count
-        || request.reserved != 0
         || request.region_count as usize > X86_INITIAL_MAX_REGIONS
         || usize::from(request.argc) + usize::from(request.envc) > X86_INITIAL_MAX_STRINGS
         || request.extent_pages == 0
@@ -315,6 +315,7 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
         random: request.random,
         stack_top: request.stack_top,
         stack_size: request.stack_size,
+        has_vdso: request.image_features & carrick_core_abi::X86_INITIAL_HAS_VDSO != 0,
     };
     let source_root = carrick_el1::isa::x86::hardware_live_root().ok()?;
     if source_root.address().raw() != 0x60_0000 {

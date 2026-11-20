@@ -18,7 +18,7 @@ pub enum X86InitialImageError {
 
 /// An ELF load description. The guest MM owner builds the stack, allocates
 /// frames, writes descriptors and publishes its exact edit receipts.
-#[derive(::core::fmt::Debug)]
+#[derive(Clone, ::core::fmt::Debug)]
 pub struct X86InitialImage<'a> {
     /// Initial RIP, at the interpreter when PT_INTERP is present.
     pub entry: u64,
@@ -31,17 +31,59 @@ pub struct X86InitialImage<'a> {
     pub regions: Vec<X86InitialRegion<'a>>,
     /// Executable regions precede interpreter regions; only these set brk.
     pub executable_region_count: usize,
+    pub has_vdso: bool,
 }
 
 /// A page-rounded PT_LOAD description borrowing only initialized file bytes.
 /// The guest's zeroed frame grants supply every BSS and padding byte.
-#[derive(::core::fmt::Debug)]
+#[derive(Clone, ::core::fmt::Debug)]
 pub struct X86InitialRegion<'a> {
     pub start: u64,
     pub end: u64,
     pub initialized_offset: u64,
     pub file_bytes: &'a [u8],
     pub perms: SegmentPerms,
+}
+
+impl<'a> X86InitialImage<'a> {
+    /// Overlay the privately initialized vvar and vDSO regions. Refuse a
+    /// conflicting ELF row before the host seals the image for the editor.
+    pub fn with_vdso(
+        mut self,
+        vvar: &'a [u8],
+        vdso: &'a [u8],
+    ) -> Result<Self, X86InitialImageError> {
+        use crate::vdso::{LINUX_VDSO_BASE, LINUX_VDSO_SIZE, LINUX_VVAR_BASE, LINUX_VVAR_SIZE};
+
+        for (start, length, file_bytes, execute) in [
+            (LINUX_VVAR_BASE, LINUX_VVAR_SIZE, vvar, false),
+            (LINUX_VDSO_BASE, LINUX_VDSO_SIZE, vdso, true),
+        ] {
+            let end = start + length;
+            if file_bytes.is_empty()
+                || file_bytes.len() as u64 > length
+                || self
+                    .regions
+                    .iter()
+                    .any(|region| region.start < end && start < region.end)
+            {
+                return Err(X86InitialImageError::InvalidRegion);
+            }
+            self.regions.push(X86InitialRegion {
+                start,
+                end,
+                initialized_offset: 0,
+                file_bytes,
+                perms: SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute,
+                },
+            });
+        }
+        self.has_vdso = true;
+        Ok(self)
+    }
 }
 
 /// Describe the executable and interpreter from the shared ELF loader.
@@ -91,6 +133,7 @@ pub fn prepare_x86_elf<'a>(
         phnum: plan.program_header_count,
         regions,
         executable_region_count,
+        has_vdso: false,
     })
 }
 
