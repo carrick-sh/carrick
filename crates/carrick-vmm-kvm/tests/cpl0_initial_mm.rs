@@ -348,6 +348,26 @@ fn serial_host_native_root_and_child_time_matches_vdso() {
 }
 
 #[test]
+fn serial_host_native_root_and_child_cputime_clocks_advance() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_cputime_clocks_advance",
+        "native_vdso_clock.S",
+        &["-DCPUTIME_WITNESS=1"],
+        8,
+    );
+}
+
+#[test]
+fn serial_host_native_root_and_child_times_accounts_self_and_reaped_child() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_times_accounts_self_and_reaped_child",
+        "native_vdso_clock.S",
+        &["-DTIMES_WITNESS=1"],
+        8,
+    );
+}
+
+#[test]
 fn serial_host_native_exec_successor_vdso_monotonic_matches_raw_clock() {
     let directory = tempfile::tempdir().expect("successor directory");
     let successor = directory.path().join("successor");

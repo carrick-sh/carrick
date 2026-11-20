@@ -73,6 +73,49 @@ read_offset:
     jz child
     mov %eax, %r12d
     call compare_samples
+#ifdef TIMES_WITNESS
+    sub $208, %rsp
+    mov %rsp, %rdi
+    xor %eax, %eax
+    mov $26, %ecx
+    rep stosq
+    mov %r12d, %edi
+    mov %rsp, %rsi
+    xor %edx, %edx
+    lea 16(%rsp), %r10
+    mov $61, %eax
+    syscall
+    cmp %r12d, %eax
+    jne failure
+    mov (%rsp), %edi
+    test $127, %edi
+    jnz failure
+    shr $8, %edi
+    cmp $8, %edi
+    jne exit
+    /* wait4 rusage: ru_utime + ru_stime >= 20,000 us. */
+    imulq $1000000, 16(%rsp), %rax
+    add 24(%rsp), %rax
+    imulq $1000000, 32(%rsp), %rdx
+    add 40(%rsp), %rdx
+    add %rdx, %rax
+    cmp $20000, %rax
+    jb failure
+    /* Parent times(2) after reap: tms_cutime + tms_cstime >= 2 ticks. */
+    lea 160(%rsp), %rdi
+    mov $100, %eax
+    syscall
+    cmp $-38, %rax
+    je clock_unserved
+    test %rax, %rax
+    jle failure
+    mov 176(%rsp), %rax
+    add 184(%rsp), %rax
+    cmp $2, %rax
+    jl failure
+    mov $8, %edi
+    jmp exit
+#else
     sub $16, %rsp
     mov %r12d, %edi
     mov %rsp, %rsi
@@ -87,6 +130,7 @@ read_offset:
     jnz failure
     shr $8, %edi
     jmp exit
+#endif
 child:
     call compare_samples
 #ifdef SUCCESSOR_PATH
@@ -183,6 +227,12 @@ compare_samples:
 #endif
 #ifdef REALTIME_ALIASES_WITNESS
     call compare_realtime_aliases
+#endif
+#ifdef CPUTIME_WITNESS
+    call compare_cputime
+#endif
+#ifdef TIMES_WITNESS
+    call compare_times
 #endif
     jmp compare_realtime_and_resolution
 
@@ -382,6 +432,250 @@ compare_realtime_aliases:
     ja failure
 #endif
     add $56, %rsp
+    ret
+#endif
+#ifdef CPUTIME_WITNESS
+compare_cputime:
+    mov $2, %edi
+    call compare_counter
+    mov $3, %edi
+    call compare_counter
+    mov $2, %edi
+    xor %esi, %esi
+    mov $228, %eax
+    syscall
+    cmp $-14, %rax
+    jne failure
+    mov $3, %edi
+    xor %esi, %esi
+    mov $228, %eax
+    syscall
+    cmp $-14, %rax
+    jne failure
+    push %rbp
+    sub $64, %rsp
+    mov $2, %edi
+    mov %rsp, %rsi
+    call raw_counter
+    imulq $1000000000, (%rsp), %rax
+    add 8(%rsp), %rax
+    mov %rax, 16(%rsp)
+    mov $3, %edi
+    mov %rsp, %rsi
+    call raw_counter
+    imulq $1000000000, (%rsp), %rax
+    add 8(%rsp), %rax
+    mov %rax, 24(%rsp)
+    movl $400000, 32(%rsp)
+    mov $1, %r8
+cputime_leader_spin:
+    mov $2048, %ecx
+1:  imul $1664525, %r8, %r8
+    add $1013904223, %r8
+    dec %ecx
+    jnz 1b
+    mov $3, %edi
+    mov %rsp, %rsi
+    call raw_counter
+    imulq $1000000000, (%rsp), %rax
+    add 8(%rsp), %rax
+    cmp 24(%rsp), %rax
+    jb failure
+    sub 24(%rsp), %rax
+    cmp $5000000, %rax
+    jae cputime_leader_advanced
+    decl 32(%rsp)
+    jnz cputime_leader_spin
+    jmp failure
+cputime_leader_advanced:
+    mov $2, %edi
+    mov %rsp, %rsi
+    call raw_counter
+    imulq $1000000000, (%rsp), %rax
+    add 8(%rsp), %rax
+    cmp 16(%rsp), %rax
+    jb failure
+    sub 16(%rsp), %rax
+    cmp $5000000, %rax
+    jb failure
+    /* Spawn a thread that spins >= 20ms and calls raw SYS_exit(60). */
+    xor %edi, %edi
+    mov $0x3000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js failure
+    mov %rax, %rbp
+    mov $2, %edi
+    mov %rsp, %rsi
+    call raw_counter
+    imulq $1000000000, (%rsp), %rax
+    add 8(%rsp), %rax
+    mov %rax, 16(%rsp)
+    mov $3, %edi
+    mov %rsp, %rsi
+    call raw_counter
+    imulq $1000000000, (%rsp), %rax
+    add 8(%rsp), %rax
+    mov %rax, 24(%rsp)
+    movl $1, 0x2000(%rbp)
+    mov $0x00350f00, %edi
+    lea 0x1ff0(%rbp), %rsi
+    lea 0x2000(%rbp), %rdx
+    mov %rdx, %r10
+    xor %r8d, %r8d
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js failure
+    jz cputime_worker
+cputime_join:
+    mov 0x2000(%rbp), %edx
+    test %edx, %edx
+    jz cputime_joined
+    lea 0x2000(%rbp), %rdi
+    xor %esi, %esi
+    xor %r10d, %r10d
+    mov $202, %eax
+    syscall
+    jmp cputime_join
+cputime_joined:
+    mov $3, %edi
+    mov %rsp, %rsi
+    call raw_counter
+    imulq $1000000000, (%rsp), %r8
+    add 8(%rsp), %r8
+    cmp 24(%rsp), %r8
+    jb failure
+    sub 24(%rsp), %r8
+    mov $2, %edi
+    mov %rsp, %rsi
+    call raw_counter
+    imulq $1000000000, (%rsp), %r9
+    add 8(%rsp), %r9
+    cmp 16(%rsp), %r9
+    jb failure
+    sub 16(%rsp), %r9
+    lea 15000000(%r8), %rax
+    cmp %rax, %r9
+    jb failure
+    mov %rbp, %rdi
+    mov $0x3000, %esi
+    mov $11, %eax
+    syscall
+    test %rax, %rax
+    jne failure
+    add $64, %rsp
+    pop %rbp
+    ret
+cputime_worker:
+    sub $32, %rsp
+    mov $3, %edi
+    mov %rsp, %rsi
+    mov $228, %eax
+    syscall
+    test %rax, %rax
+    jne worker_fail
+    imulq $1000000000, (%rsp), %rax
+    add 8(%rsp), %rax
+    cmp $10000000, %rax
+    ja worker_fail
+    mov %rax, 16(%rsp)
+    movl $500000, 24(%rsp)
+    mov $1, %r8
+cputime_worker_spin:
+    mov $2048, %ecx
+2:  imul $1664525, %r8, %r8
+    add $1013904223, %r8
+    dec %ecx
+    jnz 2b
+    mov $3, %edi
+    mov %rsp, %rsi
+    mov $228, %eax
+    syscall
+    test %rax, %rax
+    jne worker_fail
+    imulq $1000000000, (%rsp), %rax
+    add 8(%rsp), %rax
+    cmp 16(%rsp), %rax
+    jb worker_fail
+    sub 16(%rsp), %rax
+    cmp $20000000, %rax
+    jae cputime_worker_done
+    decl 24(%rsp)
+    jnz cputime_worker_spin
+worker_fail:
+    mov $91, %edi
+    mov $231, %eax
+    syscall
+    ud2
+cputime_worker_done:
+    xor %edi, %edi
+    mov $60, %eax
+    syscall
+    ud2
+#endif
+#ifdef TIMES_WITNESS
+compare_times:
+    sub $80, %rsp
+    xor %edi, %edi
+    mov $100, %eax
+    syscall
+    cmp $-38, %rax
+    je clock_unserved
+    test %rax, %rax
+    jle failure
+    mov $-1, %rdi
+    mov $100, %eax
+    syscall
+    cmp $-14, %rax
+    jne failure
+    mov %rsp, %rdi
+    mov $100, %eax
+    syscall
+    test %rax, %rax
+    jle failure
+    mov %rax, 64(%rsp)
+    cmpq $0, 16(%rsp)
+    jne failure
+    cmpq $0, 24(%rsp)
+    jne failure
+    movl $600000, 72(%rsp)
+    mov $1, %r9
+times_spin:
+    mov $4096, %ecx
+3:  imul $1664525, %r9, %r9
+    add $1013904223, %r9
+    dec %ecx
+    jnz 3b
+    lea 32(%rsp), %rdi
+    mov $100, %eax
+    syscall
+    test %rax, %rax
+    jle failure
+    cmp 64(%rsp), %rax
+    jl failure
+    mov 32(%rsp), %rdx
+    cmp 0(%rsp), %rdx
+    jl failure
+    mov 40(%rsp), %rcx
+    cmp 8(%rsp), %rcx
+    jl failure
+    add %rcx, %rdx
+    mov 0(%rsp), %r8
+    add 8(%rsp), %r8
+    sub %r8, %rdx
+    cmp $3, %rdx
+    jge times_advanced
+    decl 72(%rsp)
+    jnz times_spin
+    jmp failure
+times_advanced:
+    add $80, %rsp
     ret
 #endif
 raw_counter:
