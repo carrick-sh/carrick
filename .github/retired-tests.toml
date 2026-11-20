@@ -91,3 +91,14 @@ pr = 2564
 test = "carrick_vmm_hvf::staged_cpu::tests::staged_registers_round_trip_through_the_hal_names"
 reason = "#1236: the HAL register round-trip witness for StagedCpu moved unchanged to carrick_aarch64::staged_cpu::tests::staged_registers_round_trip_through_the_hal_names, where it runs on the host unit lane."
 pr = 2564
+
+[[retired]]
+test = "carrick_personality_linux::sleep::tests::absolute_monotonic_epoch_is_defined_only_on_arm"
+reason = "#2028: clock reads and absolute monotonic waits now share an epoch on both ISAs. The existing ARM future-deadline witness and the new CPL0 future-deadline witness exercise the production paths."
+pr = 2618
+
+[[retired]]
+test = "cpl0_initial_mm::serial_host_native_child_absolute_clock_nanosleep_is_refused"
+reason = "#2028: a CPL0 child's expired monotonic deadline now succeeds. The replacement checks immediate success, and a separate future-deadline witness checks that the wait reaches its deadline."
+replaced_by = "cpl0_initial_mm::serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero"
+pr = 2618
