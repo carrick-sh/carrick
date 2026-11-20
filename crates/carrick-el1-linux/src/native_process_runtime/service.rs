@@ -2100,8 +2100,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 )? {
                     NoticeParkOutcome::Resumed(result) => Ok(result),
                     NoticeParkOutcome::Published(defer_completion) => {
-                        let physical_checkpoint = self.service.native_service_doorbell();
-                        self.park_service(&request, physical_checkpoint || defer_completion)
+                        self.park_published_notice(&request, defer_completion)
                     }
                 };
             }
@@ -3034,15 +3033,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             match self.finish_notice_wait(&request, adapter || checkpoints_owner) {
                 Ok(NoticeFinishOutcome::Resumed(result)) => Ok(result),
                 Ok(NoticeFinishOutcome::Published(defer_completion)) => {
-                    let physical_checkpoint = self.service.native_service_doorbell();
-                    self.park_service(&request, physical_checkpoint || defer_completion)
+                    self.park_published_notice(&request, defer_completion)
                 }
                 Ok(NoticeFinishOutcome::Held(holder, defer_completion)) => {
                     match self.park_notice_wait(&request, holder, defer_completion) {
                         Ok(NoticeParkOutcome::Resumed(result)) => Ok(result),
                         Ok(NoticeParkOutcome::Published(defer_completion)) => {
-                            let physical_checkpoint = self.service.native_service_doorbell();
-                            self.park_service(&request, physical_checkpoint || defer_completion)
+                            self.park_published_notice(&request, defer_completion)
                         }
                         Err(error) => Err(error),
                     }
@@ -3054,6 +3051,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         } else {
             self.park_service(&request, false)
         })
+    }
+
+    /// Park a request that won publication after waiting for a peer's notice.
+    /// The earlier carrier exit was consumed draining that peer, so this
+    /// publication owns the next host-work ring when parking leaves no runner.
+    #[inline(never)]
+    fn park_published_notice(
+        &mut self,
+        request: &ServiceRequest,
+        defer_completion: bool,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let physical_checkpoint = self.service.native_service_doorbell();
+        let resumed = self.park_service(request, physical_checkpoint || defer_completion)?;
+        if matches!(resumed, NativeResume::Left(_)) {
+            self.current.linux.mark_pending_host_work();
+        }
+        Ok(resumed)
     }
 
     #[inline(never)]
