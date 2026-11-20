@@ -379,13 +379,18 @@ pub mod frame {
     pub const CHAIN_MISSED: u32 = 0x1a8;
     pub const SLOTS: usize = 54;
 
-    pub const CHAIN_INDEX_BITS: u32 = 6;
+    pub const LEGACY_CHAIN_INDEX_BITS: u32 = 6;
+    pub const CHAIN_INDEX_BITS: u32 = 12;
     pub const CHAIN_SLOTS: usize = 1 << CHAIN_INDEX_BITS;
     // Fold virtual page bits into the index so equal page offsets can coexist.
     pub const CHAIN_PAGE_XOR_SHIFT: u32 = 10;
 
+    pub const fn chain_slot_for(pc: u64, index_bits: u32) -> usize {
+        (((pc ^ (pc >> CHAIN_PAGE_XOR_SHIFT)) >> 2) as usize) & ((1usize << index_bits) - 1)
+    }
+
     pub const fn chain_slot(pc: u64) -> usize {
-        (((pc ^ (pc >> CHAIN_PAGE_XOR_SHIFT)) >> 2) as usize) & (CHAIN_SLOTS - 1)
+        chain_slot_for(pc, CHAIN_INDEX_BITS)
     }
     pub const LINK_PC: u32 = 0;
     pub const LINK_ENTRY: u32 = 8;
@@ -933,7 +938,7 @@ impl Emitter {
     /// X0 is the guest target PC; guest X0/X1 are already spilled. All
     /// checks preserve NZCV. A hit branches over the target's host prologue.
     /// A miss, pending event, or exhausted quantum takes the normal epilogue.
-    fn chain_tail(&mut self, instructions: u32, indirect: bool) {
+    fn chain_tail(&mut self, instructions: u32, indirect: bool, index_bits: u32) {
         use encode::{
             add_imm, add_shift, and, br, cbz, eor, eor_lsr, ldar_b, ldr, movz, str, sub_imm, ubfx,
         };
@@ -947,7 +952,7 @@ impl Emitter {
         words.extend([
             0, // CBZ X2, stop
             eor_lsr(1, 0, 0, frame::CHAIN_PAGE_XOR_SHIFT),
-            ubfx(1, 1, 2, frame::CHAIN_INDEX_BITS),
+            ubfx(1, 1, 2, index_bits),
             add_shift(2, 2, 1, frame::LINK_SHIFT),
             ldr(1, 2, frame::LINK_PC),
             eor(1, 1, 0),
@@ -971,7 +976,7 @@ impl Emitter {
         words[no_control] = cbz(2, false, commit - no_control);
         words.extend([
             eor_lsr(0, 0, 0, frame::CHAIN_PAGE_XOR_SHIFT),
-            ubfx(0, 0, 2, frame::CHAIN_INDEX_BITS),
+            ubfx(0, 0, 2, index_bits),
             str(0, SP, frame::CHAIN_LAST),
             ldr(2, SP, frame::CHAIN_REMAINING),
             sub_imm(2, 2, 1),
@@ -1085,13 +1090,14 @@ impl Emitter {
 
 /// Translate a guest block into host words. Pure and deterministic.
 pub fn emit_block(guest: &GuestBlock) -> Result<TranslatedBlock, TranslateError> {
-    emit_block_for_run(guest, false)
+    emit_block_for_run(guest, None)
 }
 
 pub(crate) fn emit_block_for_run(
     guest: &GuestBlock,
-    chaining: bool,
+    chain_bits: Option<u32>,
 ) -> Result<TranslatedBlock, TranslateError> {
+    let chaining = chain_bits.is_some();
     if guest.instructions.is_empty() {
         return Err(TranslateError::Empty);
     }
@@ -1175,13 +1181,15 @@ pub(crate) fn emit_block_for_run(
         Some(t) => t,
         None => Terminator::Fallthrough(e.continuation(guest.next_pc())),
     };
-    if !e.chain_sites.is_empty() {
+    if let Some(bits) = chain_bits
+        && !e.chain_sites.is_empty()
+    {
         let chain = e.words.len();
         for site in core::mem::take(&mut e.chain_sites) {
             e.words[site] = encode::b(4 * (chain as i64 - site as i64));
         }
         let indirect = e.exits.contains(&BlockExit::Indirect);
-        e.chain_tail(guest.instructions.len() as u32, indirect);
+        e.chain_tail(guest.instructions.len() as u32, indirect, bits);
     }
     let common = e.words.len();
     e.words.extend(common_exit_for(simd));

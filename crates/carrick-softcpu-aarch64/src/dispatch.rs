@@ -130,6 +130,10 @@ pub trait ExecuteBlock {
         false
     }
 
+    fn chain_index_bits(&self) -> u32 {
+        crate::translate::frame::CHAIN_INDEX_BITS
+    }
+
     /// The dispatcher admits links only after checking the current execute
     /// translation and code generation. All admitted links share one regime.
     fn link_block(&mut self, _resident: &Arc<ResidentBlock<Self::Code>>) {}
@@ -354,7 +358,7 @@ impl<C> ResidentBlock<C> {
 struct CacheContext {
     domain: ExtentTableId,
     limits: BlockLimits,
-    chaining: bool,
+    chain_bits: Option<u32>,
     inline_memory: bool,
 }
 
@@ -571,6 +575,7 @@ fn run_inner<const PROFILE: bool, X: ExecuteBlock>(
     let retain_blocks = executor.retain_blocks();
     let retain_stage1 = executor.retain_stage1() && memory.stage1_is_local();
     let chaining = retain_blocks && retain_stage1 && executor.chain_blocks();
+    let chain_bits = chaining.then(|| executor.chain_index_bits());
     let mut chain_regime = None;
     let mut work = RunWork::default();
     let mut phases = PhaseWork::default();
@@ -596,7 +601,7 @@ fn run_inner<const PROFILE: bool, X: ExecuteBlock>(
         memory.inner.code_cache_domain().map(|domain| CacheContext {
             domain,
             limits,
-            chaining,
+            chain_bits,
             inline_memory,
         })
     } else {
@@ -708,7 +713,7 @@ fn run_inner<const PROFILE: bool, X: ExecuteBlock>(
                 phases.plan_ns += emit_started - plan_started;
             }
             work.emitted_blocks += 1;
-            let block = match emit_block_for_run(&guest, chaining) {
+            let block = match emit_block_for_run(&guest, chain_bits) {
                 Ok(block) => block,
                 Err(error) => break Stop::Translate(error),
             };

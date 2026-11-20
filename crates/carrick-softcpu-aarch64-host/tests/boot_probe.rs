@@ -954,19 +954,17 @@ fn wide_indirect_dispatch_table_retains_targets_across_passes() {
             "{report}"
         );
         assert_eq!(x(&cpu, 4), passes * TARGETS, "passes={passes}");
-        assert!(
-            report.work.indirect_chain_misses <= TARGETS + 1,
+        assert_eq!(
+            report.work.indirect_chain_misses, TARGETS,
             "passes={passes} work={:?}",
             report.work
         );
-        if passes > 1 {
-            assert_eq!(
-                report.work.indirect_chain_hits + report.work.indirect_chain_misses,
-                passes * TARGETS,
-                "passes={passes} work={:?}",
-                report.work
-            );
-        }
+        assert!(
+            report.work.dispatches
+                <= (TARGETS + 6) + report.work.executed_blocks.div_ceil(CHAIN_QUANTUM),
+            "passes={passes} work={:?}",
+            report.work
+        );
     }
 }
 
@@ -1479,6 +1477,10 @@ impl ExecuteBlock for TracingRunner {
 
     fn chain_blocks(&self) -> bool {
         self.chain && self.inner.chain_blocks()
+    }
+
+    fn chain_index_bits(&self) -> u32 {
+        self.inner.chain_index_bits()
     }
 
     fn link_block(&mut self, resident: &std::sync::Arc<ResidentBlock<HostCode>>) {

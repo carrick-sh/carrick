@@ -85,44 +85,62 @@ const _: () = {
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 struct LinkBank {
-    native: [NativeLink; frame::CHAIN_SLOTS],
-    owners: [Option<Arc<ResidentBlock<HostCode>>>; frame::CHAIN_SLOTS],
+    native: Box<[NativeLink]>,
+    owners: Box<[Option<Arc<ResidentBlock<HostCode>>>]>,
+    populated: Vec<u16>,
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 impl LinkBank {
     fn new() -> Self {
         Self {
-            native: [NativeLink::default(); frame::CHAIN_SLOTS],
-            owners: core::array::from_fn(|_| None),
+            native: vec![NativeLink::default(); frame::CHAIN_SLOTS].into_boxed_slice(),
+            owners: vec![None; frame::CHAIN_SLOTS].into_boxed_slice(),
+            populated: Vec::new(),
         }
     }
 
-    fn link(&mut self, pc: u64, entry: usize, resident: &Arc<ResidentBlock<HostCode>>) {
-        let index = frame::chain_slot(pc);
-        if self.owners[index]
-            .as_ref()
-            .is_some_and(|owner| Arc::ptr_eq(owner, resident))
-        {
-            return;
+    fn link(
+        &mut self,
+        pc: u64,
+        entry: usize,
+        index_bits: u32,
+        resident: &Arc<ResidentBlock<HostCode>>,
+    ) {
+        let index = frame::chain_slot_for(pc, index_bits);
+        if let Some(owner) = &self.owners[index] {
+            if Arc::ptr_eq(owner, resident) {
+                return;
+            }
+        } else {
+            self.populated.push(index as u16);
         }
         self.native[index] = NativeLink { pc, entry };
         self.owners[index] = Some(Arc::clone(resident));
     }
 
     fn unlink(&mut self, frame: Option<carrick_guest_arch::FrameGpa>) {
-        if frame.is_none() {
-            self.native.fill(NativeLink::default());
-            self.owners.fill(None);
-        } else {
-            for (link, owner) in self.native.iter_mut().zip(&mut self.owners) {
-                if owner
+        if let Some(target) = frame {
+            let native = &mut self.native;
+            let owners = &mut self.owners;
+            self.populated.retain(|&idx| {
+                let i = usize::from(idx);
+                if owners[i]
                     .as_ref()
-                    .is_some_and(|owner| Some(owner.frame()) == frame)
+                    .is_some_and(|owner| owner.frame() == target)
                 {
-                    *link = NativeLink::default();
-                    *owner = None;
+                    native[i] = NativeLink::default();
+                    owners[i] = None;
+                    false
+                } else {
+                    true
                 }
+            });
+        } else {
+            for idx in self.populated.drain(..) {
+                let i = usize::from(idx);
+                self.native[i] = NativeLink::default();
+                self.owners[i] = None;
             }
         }
     }
@@ -150,6 +168,8 @@ pub struct HostBlockRunner {
     inline_memory: bool,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     chain_blocks: bool,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    chain_index_bits: u32,
     /// SIMD and scalar blocks have different host stack layouts. A launch
     /// can only inherit an entry from the bank matching its cold prologue.
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -202,6 +222,13 @@ impl HostBlockRunner {
                     != Some(std::ffi::OsStr::new("0")),
             chain_blocks: std::env::var_os("CARRICK_SOFT_AARCH64_CHAIN").as_deref()
                 != Some(std::ffi::OsStr::new("0")),
+            chain_index_bits: if std::env::var_os("CARRICK_SOFT_AARCH64_WIDE_CHAIN").as_deref()
+                == Some(std::ffi::OsStr::new("0"))
+            {
+                frame::LEGACY_CHAIN_INDEX_BITS
+            } else {
+                frame::CHAIN_INDEX_BITS
+            },
             links: Box::new(core::array::from_fn(|_| LinkBank::new())),
             region: vec![BlockFrame::default(); frames].into_boxed_slice(),
         })
@@ -260,10 +287,15 @@ impl ExecuteBlock for HostBlockRunner {
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn chain_index_bits(&self) -> u32 {
+        self.chain_index_bits
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     fn link_block(&mut self, resident: &Arc<ResidentBlock<HostCode>>) {
         let (_, code) = resident.prepared();
         if let Some((pc, entry)) = code.linked {
-            self.links[usize::from(code.simd)].link(pc.0, entry, resident);
+            self.links[usize::from(code.simd)].link(pc.0, entry, self.chain_index_bits, resident);
         }
     }
 

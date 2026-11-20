@@ -78,8 +78,12 @@ full transfer.
 ## Native branch chains
 
 The direct and register branch exits share a tagged table of resident host
-entries. The native path keeps guest registers live across a hit and branches
-past the next block's host prologue. A link is installed only after a fetch
+entries. Each bank holds 4,096 direct-mapped slots with sparse active-slot
+unlinking; set `CARRICK_SOFT_AARCH64_WIDE_CHAIN=0` to revert to the 64-slot
+table. The 128-target indirect dispatch witness retains all 128 linked targets
+across 1, 10 and 100 passes after warm-up, whereas 64 slots missed all 1,280
+indirect transfers at 10 passes. The native path keeps guest registers live
+across a hit and branches past the next block's host prologue. A link is installed only after a fetch
 and generation check in the current TTBR/ASID/EL regime. The table borrows
 one local stage-1 seat and pins the immutable mappings during a launch.
 TLBI and regime changes clear the table. Guest writes to tracked code and
