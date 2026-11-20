@@ -803,4 +803,25 @@ mod anonymous_refusal_tests {
             "exec staging must not classify contention as EFAULT"
         );
     }
+
+    #[test]
+    fn selected_owner_waits_park_instead_of_reaching_ud2() {
+        let source = include_str!("linux_personality.rs");
+        assert!(
+            source.contains("UserFaultSupply::OwnerWait(wait)"),
+            "the Selected arm must retain the typed owner wait through parking"
+        );
+        assert!(
+            !source.contains(
+                "PortalWaitCause::ReservationPool | PortalWaitCause::HostReadiness => None"
+            ),
+            "reservation-pool and host-readiness receipts name real object queues"
+        );
+        assert!(
+            !source.contains(
+                "Err(carrick_core::mm::transaction::MmError::Wait(wait)) => portal_wait_cause(wait)"
+            ),
+            "a typed owner wait must not collapse to Unresolved(9)"
+        );
+    }
 }
