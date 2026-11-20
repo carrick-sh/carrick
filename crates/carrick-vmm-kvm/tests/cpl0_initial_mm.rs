@@ -4335,6 +4335,38 @@ fn production_file_report(elf: &[u8]) -> FileMetadataReport {
     (outcome.run.exit_code, outcome.run.stdout.clone(), refused)
 }
 
+fn check_x86_open_and_pipe_flags(flags: &[&str]) {
+    let (linux, carrick) = ring_file_fixture_run("native_open_pipe_flags.S", flags, |dir, name| {
+        let file = dir.join(format!("{name}-file"));
+        let link = dir.join(format!("{name}-link"));
+        std::fs::write(&file, b"file").expect("regular file");
+        std::os::unix::fs::symlink(&file, &link).expect("symlink to regular file");
+        vec![
+            format!("-DDIR_PATH=\"{}\"", dir.display()),
+            format!("-DFILE_PATH=\"{}\"", file.display()),
+            format!("-DLINK_PATH=\"{}\"", link.display()),
+        ]
+    });
+    let expected = (0, vec![20, 40, 0, 0, 0, 1, 1, 1, 1], vec![]);
+    assert_eq!(linux, expected, "native x86 Linux openat and pipe2");
+    assert_eq!(
+        carrick, expected,
+        "(exit, [ENOTDIR, ELOOP, directory open, directory O_DIRECT, pipe2, \
+         read CLOEXEC, read NONBLOCK without DIRECT, write CLOEXEC, \
+         write NONBLOCK without DIRECT], refusals)"
+    );
+}
+
+#[test]
+fn serial_host_root_x86_open_and_pipe_flags_match_linux() {
+    check_x86_open_and_pipe_flags(&[]);
+}
+
+#[test]
+fn serial_host_fork_child_x86_open_and_pipe_flags_match_linux() {
+    check_x86_open_and_pipe_flags(&["-DCHILD"]);
+}
+
 /// Steps 1-5 of `native_file_metadata.S` (open, FIOCLEX, F_GETFD, FIONCLEX,
 /// F_GETFD) and whether any `ioctl` (x86 16) was refused.
 fn cloexec_steps(report: &FileMetadataReport) -> (i32, Vec<u8>, bool) {
