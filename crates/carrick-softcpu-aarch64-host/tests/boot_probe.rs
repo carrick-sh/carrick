@@ -1249,8 +1249,81 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
 /// -fno-builtin -Wl,-rpath,/lib` and use the production `CARRICK_A64_ELF`.
 #[test]
 fn production_el1_image_runs_dynamic_glibc_hello() {
+    let Some(root) = std::env::var_os("CARRICK_A64_DYN_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let hello = std::fs::read(root.join("hello")).expect("read dynamic hello");
+    let program = carrick_mem::elf::ElfProgram::load(&hello, 183, &|path| {
+        assert_eq!(path, "/lib/ld-linux-aarch64.so.1");
+        std::fs::read(root.join(&path[1..])).ok()
+    })
+    .expect("plan glibc hello and its interpreter");
+    let (mut cpu, mut memory) = stage_dynamic(&program, vec![b"/hello".to_vec()], Vec::new());
+    let mut replies = GlibcReplies {
+        libc: std::fs::read(root.join("lib/libc.so.6")).expect("read fixture libc.so.6"),
+        libc_cursor: None,
+        next_map: carrick_mem::memory::LINUX_MMAP_BASE,
+        program_break: carrick_mem::memory::LINUX_HEAP_BASE,
+        stdout: Vec::new(),
+        libc_exec: None,
+    };
+    let result = run_dynamic_glibc(&mut cpu, &mut memory, &mut replies, 1_000_000);
+    assert_eq!(result, Ok(0));
+    assert_eq!(replies.stdout, b"dynamic glibc hello\n");
+    report_glibc_ifuncs(&program, &mut memory, &replies);
+}
+
+/// Set CARRICK_A64_PYTHON_ROOT to an extracted linux/arm64 python:3.12-slim
+/// filesystem and CARRICK_A64_ELF to the production EL1 image.
+#[test]
+fn production_el1_image_runs_dynamic_cpython() {
+    let Some(root) = std::env::var_os("CARRICK_A64_PYTHON_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let executable = "/usr/local/bin/python3";
+    let python = std::fs::read(root.join(&executable[1..])).expect("read CPython");
+    let program = carrick_mem::elf::ElfProgram::load(&python, 183, &|path| {
+        std::fs::read(root.join(&path[1..])).ok()
+    })
+    .expect("plan CPython and its interpreter");
+    let (mut cpu, mut memory) = stage_dynamic(
+        &program,
+        vec![
+            executable.as_bytes().to_vec(),
+            b"-c".to_vec(),
+            b"import sys; print(sys.version.split()[0])".to_vec(),
+        ],
+        vec![b"HOME=/tmp".to_vec()],
+    );
+    let mut replies = GlibcReplies {
+        libc: std::fs::read(root.join("lib/aarch64-linux-gnu/libc.so.6")).unwrap(),
+        libc_cursor: None,
+        next_map: carrick_mem::memory::LINUX_MMAP_BASE,
+        program_break: carrick_mem::memory::LINUX_HEAP_BASE,
+        stdout: Vec::new(),
+        libc_exec: None,
+    };
+    let result = run_dynamic_glibc(&mut cpu, &mut memory, &mut replies, 100_000_000);
+    assert_eq!(result, Ok(0));
+    let version = std::str::from_utf8(&replies.stdout).unwrap();
+    let patch = version
+        .strip_prefix("3.12.")
+        .and_then(|v| v.strip_suffix('\n'));
+    assert!(
+        patch.is_some_and(|v| v.parse::<u32>().is_ok()),
+        "{version:?}"
+    );
+}
+
+fn stage_dynamic(
+    program: &carrick_mem::elf::ElfProgram<'_>,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> (CpuState, Pages) {
     use carrick_mem::{
-        elf::{ElfProgram, LoadPlan},
+        elf::LoadPlan,
         linux_abi::{
             LINUX_AT_BASE, LINUX_AT_ENTRY, LINUX_AT_EXECFN, LINUX_AT_HWCAP, LINUX_AT_HWCAP2,
             LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT, LINUX_AT_PHNUM, LINUX_AT_RANDOM,
@@ -1260,18 +1333,8 @@ fn production_el1_image_runs_dynamic_glibc_hello() {
     };
     use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
 
-    let Some(root) = std::env::var_os("CARRICK_A64_DYN_ROOT") else {
-        return;
-    };
-    let root = std::path::PathBuf::from(root);
     let el1 = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
         .expect("read the production EL1 ELF");
-    let hello = std::fs::read(root.join("hello")).expect("read dynamic hello");
-    let program = ElfProgram::load(&hello, 183, &|path| {
-        assert_eq!(path, "/lib/ld-linux-aarch64.so.1");
-        std::fs::read(root.join(&path[1..])).ok()
-    })
-    .expect("plan glibc hello and its interpreter");
     let interpreter = program.interpreter.as_ref().expect("dynamic fixture");
     let (mut cpu, mut memory) = enter_carrier(&el1, program.entry());
 
@@ -1286,7 +1349,7 @@ fn production_el1_image_runs_dynamic_glibc_hello() {
             memory.load(start, &bytes[offset..offset + segment.file_size as usize]);
         }
     }
-    map_plan(&mut memory, &program.executable, &hello);
+    map_plan(&mut memory, &program.executable, program.executable_bytes);
     map_plan(&mut memory, &interpreter.plan, &interpreter.bytes);
 
     let mut auxv =
@@ -1298,15 +1361,10 @@ fn production_el1_image_runs_dynamic_glibc_hello() {
             _ => {}
         }
     }
-    let (stack, sp, _) = build_linux_initial_stack(
-        vec![b"/hello".to_vec()],
-        Vec::new(),
-        &auxv,
-        None,
-        LINUX_STACK_TOP,
-        8 * PAGE,
-    )
-    .unwrap();
+    let expected_argc = argv.len() as u64;
+    let expected_argv0 = argv[0].clone();
+    let (stack, sp, _) =
+        build_linux_initial_stack(argv, envp, &auxv, None, LINUX_STACK_TOP, 8 * PAGE).unwrap();
     let (offset, bytes) = stack.shared_initialized_bytes();
     for page in (stack.start..LINUX_STACK_TOP).step_by(PAGE as usize) {
         memory.map_zero(page);
@@ -1314,8 +1372,8 @@ fn production_el1_image_runs_dynamic_glibc_hello() {
     memory.load(stack.start + offset, &bytes);
     cpu.sp_el0 = StackPointer(sp);
     let (argc, argv0, auxv) = read_initial_stack_auxv(&mut memory, sp);
-    assert_eq!(argc, 1);
-    assert_eq!(argv0, b"/hello");
+    assert_eq!(argc, expected_argc);
+    assert_eq!(argv0, expected_argv0);
     let aux = |key| auxv.iter().find(|(tag, _)| *tag == key).unwrap().1;
     assert_eq!(
         aux(LINUX_AT_PHDR),
@@ -1335,35 +1393,21 @@ fn production_el1_image_runs_dynamic_glibc_hello() {
     assert_eq!(aux(LINUX_AT_SECURE), 0);
     assert_eq!(aux(LINUX_AT_HWCAP), GUEST_CPU_PROFILE.hwcap().bits());
     assert_eq!(aux(LINUX_AT_HWCAP2), GUEST_CPU_PROFILE.hwcap2().bits());
-    assert_eq!(read_cstr(&mut memory, aux(LINUX_AT_EXECFN), 16), b"/hello");
+    assert_eq!(
+        read_cstr(&mut memory, aux(LINUX_AT_EXECFN), 128),
+        expected_argv0
+    );
     memory
         .read(VirtualAddress(aux(LINUX_AT_RANDOM)), &mut [0; 16])
         .unwrap();
-
-    admit_root_task_with_stdio(&mut memory);
-
-    let mut runner = TracingRunner::new().unwrap();
-    let mut replies = GlibcReplies {
-        libc: std::fs::read(root.join("lib/libc.so.6")).expect("read fixture libc.so.6"),
-        libc_cursor: None,
-        next_map: carrick_mem::memory::LINUX_MMAP_BASE,
-        program_break: carrick_mem::memory::LINUX_HEAP_BASE,
-        stdout: Vec::new(),
-        libc_exec: None,
-    };
-    let result = run_dynamic_glibc(&mut cpu, &mut memory, &mut runner, &mut replies);
-    assert_eq!(result, Ok(0));
-    assert_eq!(replies.stdout, b"dynamic glibc hello\n");
-    println!(
-        "guest stdout={:?} exit_group(0)",
-        String::from_utf8_lossy(&replies.stdout)
-    );
     println!(
         "auxv HWCAP={:#x} HWCAP2={:#x}",
         aux(LINUX_AT_HWCAP),
         aux(LINUX_AT_HWCAP2)
     );
-    report_glibc_ifuncs(&program, &mut memory, &replies);
+
+    admit_root_task_with_stdio(&mut memory);
+    (cpu, memory)
 }
 
 fn report_glibc_ifuncs(
@@ -1402,11 +1446,11 @@ fn report_glibc_ifuncs(
 fn run_dynamic_glibc(
     cpu: &mut CpuState,
     memory: &mut Pages,
-    runner: &mut TracingRunner,
     replies: &mut GlibcReplies,
+    budget: u64,
 ) -> Result<u64, String> {
     use carrick_mem::linux_abi::syscall::lookup_aarch64;
-    const BUDGET: u64 = 1_000_000;
+    let mut runner = TracingRunner::new().unwrap();
     let mut blocks = 0;
     let mut instructions = 0;
     let mut undefined = 0;
@@ -1419,9 +1463,9 @@ fn run_dynamic_glibc(
             cpu,
             &mut monitor,
             memory,
-            runner,
+            &mut runner,
             BlockLimits::default(),
-            BUDGET - blocks,
+            budget - blocks,
         );
         blocks += report.blocks;
         instructions += report.work.retired_instructions;
@@ -1508,6 +1552,10 @@ fn run_dynamic_glibc(
         undefined,
         blocks as f64 / elapsed,
         instructions as f64 / elapsed
+    );
+    println!(
+        "guest stdout={:?}",
+        String::from_utf8_lossy(&replies.stdout)
     );
     result
 }
