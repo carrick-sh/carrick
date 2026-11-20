@@ -4919,11 +4919,19 @@ mod serial_host {
                 .cast::<ZoneTables>()
         };
         crate::el1_zone::with_test_zone(zone, || {
-            let record = zone.alloc_record(ThreadIdentity {
-                tid: 1, serial: 2, mm: 3, file_table: 4, generation: 5,
-                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
-                affinity: 1, lifecycle_page: 0, control_slot: 0,
-            }).unwrap();
+            let record = zone
+                .alloc_record(ThreadIdentity {
+                    tid: 1,
+                    serial: 2,
+                    mm: 3,
+                    file_table: 4,
+                    generation: 5,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 1,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
             let mut frame = ThreadCtx::ZERO;
             frame.x[8] = carrick_abi::syscall::nr::FUTEX.raw();
             frame.x[..6].copy_from_slice(&[0x4000, 137, 7, 0x5000, 0, 0x80]);
@@ -4935,14 +4943,40 @@ mod serial_host {
                     Aarch64ParkedContext::from_register(frame, 0x1000, 3, 1);
             }
             let seq = zone.next_seq(record);
-            let guard = zone.lock(
-                ZoneTables::bucket_of_with_context(3, 0x4000), &BoundedSpin(0),
-            ).unwrap();
-            zone.enqueue(&guard, record, seq, 3, 0x4000, 0x80, 0).unwrap();
+            let guard = zone
+                .lock(
+                    ZoneTables::bucket_of_with_context(3, 0x4000),
+                    &BoundedSpin(0),
+                )
+                .unwrap();
+            zone.enqueue(&guard, record, seq, 3, 0x4000, 0x80, 0)
+                .unwrap();
             zone.publish_park(record, seq);
             drop(guard);
-            let wait = ZoneWait::new(zone.record_ref(record), seq);
-            let detail = detail_diagnostic(&ContinuationDetail::Zone(wait));
+            let (_kernel, context) = bootstrap(15_392);
+            let generation = publish(&context, 0x4000);
+            let continuation = BlockedContinuation::from_zone_park(
+                capture(&context, generation),
+                ZoneWait::new(zone.record_ref(record), seq),
+                Some(Duration::from_secs(1)),
+            );
+            let diagnostic = continuation.diagnostic();
+            let detail = diagnostic.detail;
+            let fields = serde_json::to_value(diagnostic.zone_futex.unwrap()).unwrap();
+            assert_eq!(fields["mm"], 3);
+            assert_eq!(fields["uaddr"], 0x4000);
+            assert_eq!(fields["bitset"], 0x80);
+            assert_eq!(fields["expected"], 7);
+            assert_eq!(fields["op"], 137);
+            assert_eq!(fields["timeout"]["kind"], "absolute-monotonic");
+            assert_eq!(fields["timeout"]["timespec"], 0x5000);
+            assert_eq!(fields["registers"]["syscall_number"], 98);
+            assert_eq!(
+                fields["registers"]["args"],
+                serde_json::json!([0x4000, 137, 7, 0x5000, 0, 0x80])
+            );
+            assert_eq!(fields["registers"]["pc"], 0x6000);
+            assert_eq!(fields["registers"]["lr"], 0x7000);
             assert!(detail.contains("uaddr=0x4000"), "{detail}");
             assert!(detail.contains("syscall=98"), "{detail}");
             assert!(detail.contains("pc=0x6000"), "{detail}");

@@ -22,7 +22,7 @@ use super::objects::{
     TaskLifecycle, TaskPendingSignals, TaskRef, ThreadKey, ThreadRef, ThreadSignalState, Zombie,
 };
 
-pub const KERNEL_SNAPSHOT_V1_SCHEMA: u16 = 6;
+pub const KERNEL_SNAPSHOT_V1_SCHEMA: u16 = 7;
 const MAX_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

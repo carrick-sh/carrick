@@ -534,7 +534,94 @@ pub struct ContinuationDiagnostic {
     pub family: &'static str,
     pub detail: String,
     pub deadline_ms_remaining: Option<i64>,
+    pub zone_futex: Option<ZoneFutexDiagnostic>,
     pub registration: Option<ContinuationRegistrationDiagnostic>,
+}
+
+/// Guest-visible fields copied out of a parked record under its bucket lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZoneFutexDiagnostic {
+    pub mm: u64,
+    pub uaddr: u64,
+    pub scheduler_address: u64,
+    pub expected: Option<u32>,
+    /// Raw Linux operation, including PRIVATE and CLOCK_REALTIME flags.
+    pub op: Option<u64>,
+    pub bitset: u32,
+    pub timeout: Option<ZoneFutexTimeout>,
+    pub deadline_ticks: Option<u64>,
+    pub registers: ZoneFutexRegisters,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZoneFutexRegisters {
+    pub syscall_number: u64,
+    pub args: [u64; 6],
+    pub pc: u64,
+    pub lr: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ZoneFutexTimeout {
+    Relative { timespec: u64 },
+    AbsoluteMonotonic { timespec: u64 },
+    AbsoluteRealtime { timespec: u64 },
+}
+
+impl From<carrick_sched_core::ParkedFutexSnapshot> for ZoneFutexDiagnostic {
+    fn from(wait: carrick_sched_core::ParkedFutexSnapshot) -> Self {
+        use carrick_abi::{
+            LINUX_FUTEX_CLOCK_REALTIME, LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_WAIT,
+            LINUX_FUTEX_WAIT_BITSET, syscall::nr,
+        };
+        let frame = wait.registers;
+        let number = if frame.lr.is_some() {
+            Some(carrick_abi::CanonicalNr::new(frame.number))
+        } else {
+            carrick_abi::syscall_x86_64::canonical_x86_64(carrick_abi::NativeNr(frame.number))
+        };
+        let [_, op, expected, timespec, _, _] = frame.args;
+        let scalar = number == Some(nr::FUTEX);
+        let timeout = if timespec == 0 {
+            None
+        } else if scalar && op & LINUX_FUTEX_CMD_MASK == LINUX_FUTEX_WAIT {
+            Some(ZoneFutexTimeout::Relative { timespec })
+        } else if (scalar && op & LINUX_FUTEX_CMD_MASK == LINUX_FUTEX_WAIT_BITSET)
+            || number == Some(nr::FUTEX_WAITV)
+        {
+            let realtime = if scalar {
+                op & LINUX_FUTEX_CLOCK_REALTIME != 0
+            } else {
+                frame.args[4] == carrick_abi::LINUX_CLOCK_REALTIME as u64
+            };
+            if realtime {
+                Some(ZoneFutexTimeout::AbsoluteRealtime { timespec })
+            } else {
+                Some(ZoneFutexTimeout::AbsoluteMonotonic { timespec })
+            }
+        } else {
+            None
+        };
+        Self {
+            mm: wait.mm,
+            uaddr: wait.scheduler_address & !3,
+            scheduler_address: wait.scheduler_address,
+            expected: scalar.then_some(expected as u32),
+            op: scalar.then_some(op),
+            bitset: wait.bitset,
+            timeout,
+            deadline_ticks: wait.deadline_ticks,
+            registers: ZoneFutexRegisters {
+                syscall_number: frame.number,
+                args: frame.args,
+                pc: frame.pc,
+                lr: frame.lr,
+            },
+        }
+    }
 }
 
 /// The wait-service side of a parked continuation: the registration the
@@ -624,17 +711,39 @@ fn fd_authority_diagnostic(authority: &WaitFdAuthority) -> String {
     }
 }
 
-fn detail_diagnostic(detail: &ContinuationDetail) -> String {
+fn detail_diagnostic(detail: &ContinuationDetail, futex: Option<ZoneFutexDiagnostic>) -> String {
     match detail {
         ContinuationDetail::Futex { wait, index } => {
             format!("futex addr={:#x} index={index:?}", wait.addr)
         }
-        ContinuationDetail::Zone(wait) => format!(
-            "zone record={}#{} armed_seq={}",
-            wait.record.id.raw(),
-            wait.record.incarnation,
-            wait.armed_seq
-        ),
+        ContinuationDetail::Zone(wait) => {
+            let mut detail = format!(
+                "zone record={}#{} armed_seq={}",
+                wait.record.id.raw(),
+                wait.record.incarnation,
+                wait.armed_seq
+            );
+            if let Some(futex) = futex {
+                use std::fmt::Write as _;
+                let frame = futex.registers;
+                let _ = write!(
+                    detail,
+                    " mm={} uaddr={:#x} op={:?} expected={:?} bitset={:#x} timeout={:?} deadline_ticks={:?} syscall={} args={:x?} pc={:#x} lr={:x?}",
+                    futex.mm,
+                    futex.uaddr,
+                    futex.op,
+                    futex.expected,
+                    futex.bitset,
+                    futex.timeout,
+                    futex.deadline_ticks,
+                    frame.syscall_number,
+                    frame.args,
+                    frame.pc,
+                    frame.lr,
+                );
+            }
+            detail
+        }
         ContinuationDetail::SharedFutex {
             generation, value, ..
         } => format!("shared-futex addr={:#x} value={value}", generation.addr),
@@ -1949,10 +2058,17 @@ impl BlockedContinuation {
     pub fn diagnostic(&self) -> ContinuationDiagnostic {
         let state = self.state();
         let now = Instant::now();
+        let zone_futex = match &state.detail {
+            ContinuationDetail::Zone(wait) => crate::el1_zone::zone()
+                .and_then(|zone| zone.parked_futex_snapshot(wait.record))
+                .map(ZoneFutexDiagnostic::from),
+            _ => None,
+        };
         ContinuationDiagnostic {
             id: state.id.raw(),
             family: self.family().wire_name(),
-            detail: detail_diagnostic(&state.detail),
+            detail: detail_diagnostic(&state.detail, zone_futex),
+            zone_futex,
             deadline_ms_remaining: state.deadline.map(|deadline| {
                 i64::try_from(deadline.saturating_duration_since(now).as_millis())
                     .unwrap_or(i64::MAX)

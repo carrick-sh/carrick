@@ -22,7 +22,7 @@ use super::super::snapshot::{
 /// Request schema tag. A client that sends anything else is refused.
 pub const KERNEL_DEBUG_REQUEST_SCHEMA: &str = "carrick.kernel-debug-request.v1";
 /// Response schema tag. A client that receives anything else fails closed.
-pub const KERNEL_DEBUG_RESPONSE_SCHEMA: &str = "carrick.kernel-debug-snapshot.v2";
+pub const KERNEL_DEBUG_RESPONSE_SCHEMA: &str = "carrick.kernel-debug-snapshot.v3";
 
 /// One selectable table. The names are the CLI's `--table` vocabulary and are
 /// part of the wire contract; renaming one is a schema change.
@@ -297,6 +297,8 @@ pub struct DebugContinuationRow {
     pub id: u64,
     pub family: String,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_futex: Option<crate::kernel::continuation::ZoneFutexDiagnostic>,
     pub deadline_ms_remaining: Option<i64>,
     pub registration: Option<DebugContinuationRegistrationRow>,
 }
@@ -1559,6 +1561,7 @@ fn continuation_row(
         id: diagnostic.id,
         family: diagnostic.family.to_owned(),
         detail: diagnostic.detail.clone(),
+        zone_futex: diagnostic.zone_futex,
         deadline_ms_remaining: diagnostic.deadline_ms_remaining,
         registration: diagnostic.registration.as_ref().map(|registration| {
             DebugContinuationRegistrationRow {
