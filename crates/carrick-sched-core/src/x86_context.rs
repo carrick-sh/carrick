@@ -177,6 +177,7 @@ impl crate::CensusContext for ParkedContextWords {
     fn syscall_registers(&self) -> crate::SavedSyscallRegisters {
         let f = &self.frame;
         crate::SavedSyscallRegisters {
+            isa: carrick_guest_arch::GuestIsa::X86_64,
             number: f[10],                                 // RAX
             args: [f[14], f[13], f[12], f[7], f[9], f[8]], // RDI, RSI, RDX, R10, R8, R9
             pc: f[15],                                     // RIP

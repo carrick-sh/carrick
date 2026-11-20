@@ -4949,8 +4949,18 @@ mod serial_host {
                     &BoundedSpin(0),
                 )
                 .unwrap();
-            zone.enqueue(&guard, record, seq, 3, 0x4000, 0x80, 0)
-                .unwrap();
+            zone.enqueue_observed(
+                &guard,
+                record,
+                seq,
+                3,
+                0x4000,
+                0x80,
+                0,
+                Some(futex_compare_sample()),
+            )
+            .unwrap();
+            zone.set_deadline(record, 900);
             zone.publish_park(record, seq);
             drop(guard);
             let (_kernel, context) = bootstrap(15_392);
@@ -4967,6 +4977,15 @@ mod serial_host {
             assert_eq!(fields["uaddr"], 0x4000);
             assert_eq!(fields["bitset"], 0x80);
             assert_eq!(fields["expected"], 7);
+            assert_eq!(fields["observed"], 7);
+            assert_eq!(fields["compared_uaddr"], 0x4000);
+            assert_eq!(
+                fields["frame"],
+                serde_json::json!({
+                    "id": 41, "generation": 49, "source": "retained-copy"
+                })
+            );
+            assert_eq!(fields["deadline_ticks"], 900);
             assert_eq!(fields["op"], 137);
             assert_eq!(fields["timeout"]["kind"], "absolute-monotonic");
             assert_eq!(fields["timeout"]["timespec"], 0x5000);
@@ -4980,7 +4999,93 @@ mod serial_host {
             assert!(detail.contains("uaddr=0x4000"), "{detail}");
             assert!(detail.contains("syscall=98"), "{detail}");
             assert!(detail.contains("pc=0x6000"), "{detail}");
+            assert!(detail.contains("observed=Some(7)"), "{detail}");
+            assert!(detail.contains("reread=unavailable"), "{detail}");
         });
+    }
+
+    fn futex_compare_sample() -> carrick_sched_core::FutexEnrollment {
+        use carrick_guest_arch::{UserVa, UserWordFrame, UserWordFrameSource};
+        use std::num::NonZeroU64;
+        use std::sync::atomic::AtomicU32;
+
+        let word = AtomicU32::new(7);
+        carrick_sched_core::FutexEnrollment {
+            address: UserVa::new(0x4000),
+            expected: 7,
+            observed: word.load(Ordering::Acquire),
+            frame: Some(UserWordFrame {
+                id: NonZeroU64::new(41).unwrap(),
+                generation: NonZeroU64::new(49).unwrap(),
+                source: UserWordFrameSource::RetainedCopy,
+            }),
+        }
+    }
+
+    #[test]
+    fn zone_futex_detail_reports_x86_registers() {
+        use carrick_sched_core::{BoundedSpin, ParkedContextWords, ThreadIdentity, ZoneTables};
+
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        // SAFETY: this aligned, zeroed region outlives the test zone, and
+        // every zero byte is valid in an unoccupied ZoneTables.
+        let zone = unsafe { &*region.as_ptr().cast::<ZoneTables<ParkedContextWords>>() };
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 1,
+                serial: 2,
+                mm: 3,
+                file_table: 4,
+                generation: 5,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        // SAFETY: the fixture retains exclusive custody before publication.
+        let frame = unsafe { zone.record(record).ctx_mut() };
+        frame.frame = [
+            0, 0, 0, 0, 0, 0, 0, 0x5000, 6, 5, 202, 0, 7, 128, 0x4000, 0x6000, 0, 0, 0, 0,
+        ];
+        let seq = zone.next_seq(record);
+        let guard = zone
+            .lock(
+                ZoneTables::<ParkedContextWords>::bucket_of_with_context(3, 0x4000),
+                &BoundedSpin(0),
+            )
+            .unwrap();
+        zone.enqueue_observed(
+            &guard,
+            record,
+            seq,
+            3,
+            0x4000,
+            u32::MAX,
+            0,
+            Some(futex_compare_sample()),
+        )
+        .unwrap();
+        zone.publish_park(record, seq);
+        drop(guard);
+        let snapshot = zone.parked_futex_snapshot(zone.record_ref(record)).unwrap();
+        let diagnostic = ZoneFutexDiagnostic::from(snapshot);
+        let wait = ZoneWait::new(zone.record_ref(record), seq);
+        // This fixture uses an x86 carrier zone, separate from the ARM global.
+        wait.mark_consumed();
+        let detail = detail_diagnostic(&ContinuationDetail::Zone(wait), Some(diagnostic));
+        let fields = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(fields["observed"], 7);
+        assert_eq!(fields["timeout"]["kind"], "relative");
+        assert_eq!(fields["registers"]["syscall_number"], 202);
+        assert_eq!(
+            fields["registers"]["args"],
+            serde_json::json!([0x4000, 128, 7, 0x5000, 5, 6])
+        );
+        assert_eq!(fields["registers"]["pc"], 0x6000);
+        assert!(fields["registers"]["lr"].is_null());
+        assert!(detail.contains("syscall=202"), "{detail}");
+        assert!(detail.contains("observed=Some(7)"), "{detail}");
     }
 
     #[test]

@@ -97,6 +97,32 @@ pub fn frame_grant_residency_guest() -> &'static carrick_el1_abi::FrameGrantResi
     unsafe { &*(venues.residency.raw() as *const carrick_el1_abi::FrameGrantResidencyTable) }
 }
 
+/// The committed grant recorded for this futex page at enrollment. A
+/// successful futex load can also use a page outside the grant journal.
+pub fn futex_grant_observation(
+    mm: carrick_el1_abi::ReservationMm,
+    address: carrick_guest_arch::UserVa,
+) -> Option<carrick_guest_arch::UserWordFrame> {
+    #[cfg(target_os = "none")]
+    {
+        let residency = frame_grant_residency_guest();
+        let page = residency.lookup(mm.raw(), address.raw())?;
+        let words = residency.committed_words(page.slot, page.identity)?;
+        let bit = ((address.raw() - page.identity.semantic_base)
+            / carrick_core_abi::GRANT_PAGE_SIZE) as usize;
+        if words[bit / 64] & (1 << (bit % 64)) != 0 {
+            return Some(carrick_guest_arch::UserWordFrame {
+                id: core::num::NonZeroU64::new(page.identity.frame_id)?,
+                generation: core::num::NonZeroU64::new(page.identity.owner_generation)?,
+                source: carrick_guest_arch::UserWordFrameSource::CommittedGrant,
+            });
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = (mm, address);
+    None
+}
+
 /// ISA-neutral view of the one retained external-signal ingress queue.
 #[cfg(target_os = "none")]
 pub fn signal_ingress_guest() -> &'static carrick_el1_abi::SharedSignalIngressQueue {

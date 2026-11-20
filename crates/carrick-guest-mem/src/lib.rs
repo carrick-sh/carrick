@@ -172,7 +172,7 @@ pub enum PrivateFileSource {
 /// `u64`s in mapping signatures like `map_aliased(va, gpa, len)` — a va↔gpa
 /// transposition is page-aligned on both sides, so alignment guards cannot
 /// catch it; only the type can.
-pub use carrick_guest_arch::GuestVa;
+pub use carrick_guest_arch::{GuestVa, UserWordFrame, UserWordFrameSource};
 
 /// A contiguous range of guest virtual addresses `[start, start + len)`.
 #[derive(
@@ -511,6 +511,15 @@ pub trait GuestMemory {
     fn atomic_load_user_u32(&self, address: u64) -> Result<u32, MemoryError> {
         let _ = address;
         Err(MemoryError::Unsupported)
+    }
+
+    /// The same load, with the logical frame identity when the admitted
+    /// copy supplies it. Diagnostic callers must tolerate absent provenance.
+    fn atomic_load_user_u32_with_frame(
+        &self,
+        address: u64,
+    ) -> Result<(u32, Option<carrick_guest_arch::UserWordFrame>), MemoryError> {
+        self.atomic_load_user_u32(address).map(|word| (word, None))
     }
 
     /// Compare-exchange one aligned 32-bit user word. Success is acquire/release;
