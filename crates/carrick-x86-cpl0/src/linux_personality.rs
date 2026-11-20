@@ -805,6 +805,7 @@ fn native_exec_call(
     slot: carrick_sched_core::SlotId,
     request: carrick_el1_linux::exec_stage::ExecStageRequest,
     ordinal: carrick_guest_arch::NativeOrdinal,
+    saved: &carrick_sched_core::ParkedContextWords,
 ) -> CompletionRoute {
     use carrick_el1_linux::dispatch::NativeExecStage;
     use carrick_el1_linux::native_process_runtime::NativeServiceCall;
@@ -835,11 +836,16 @@ fn native_exec_call(
                     restart_native_syscall(frame, ordinal);
                     CompletionRoute::Served
                 }
-                UserFaultSupply::Contended(cancelled) => {
-                    let _: carrick_sched_core::spaces::notification::SpaceWaitCause = cancelled;
-                    frame.rax = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
-                    CompletionRoute::Served
-                }
+                UserFaultSupply::Contended(cause) => match anonymous::park_contended_fault(
+                    task, slot, cause, saved,
+                ) {
+                    anonymous::ContendedFault::Parked => CompletionRoute::Suspended,
+                    anonymous::ContendedFault::Rerun => {
+                        restart_native_syscall(frame, ordinal);
+                        CompletionRoute::Served
+                    }
+                    anonymous::ContendedFault::Refused => fatal_boot(),
+                },
                 UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
                     frame.rax = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
                     CompletionRoute::Served
@@ -1532,6 +1538,7 @@ impl Personality for LinuxPersonality {
                     slot,
                     request,
                     carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                    &words,
                 );
             }
             if let Some(venue) = anonymous.as_mut()
@@ -1564,6 +1571,7 @@ impl Personality for LinuxPersonality {
                 // EOF) completes without it: EFAULT, or the short write of
                 // the bytes gathered before it, as Linux's user copy does.
                 let mut retry = false;
+                let mut parked = false;
                 let mut crosses = false;
                 let stage = match stage.fault() {
                     Some((address, access)) => {
@@ -1575,10 +1583,13 @@ impl Personality for LinuxPersonality {
                             // The owner refused or could not supply the
                             // access (no reservation names it): never a
                             // carrier abort.
-                            UserFaultSupply::Contended(cancelled) => {
-                                let _: carrick_sched_core::spaces::notification::SpaceWaitCause =
-                                    cancelled;
-                                Some(stage.refused())
+                            UserFaultSupply::Contended(cause) => {
+                                match anonymous::park_contended_fault(task, slot, cause, &words) {
+                                    anonymous::ContendedFault::Parked => parked = true,
+                                    anonymous::ContendedFault::Rerun => retry = true,
+                                    anonymous::ContendedFault::Refused => fatal_boot(),
+                                }
+                                None
                             }
                             UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
                                 Some(stage.refused())
@@ -1653,7 +1664,9 @@ impl Personality for LinuxPersonality {
                         Some(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
                     }
                 };
-                route = if retry {
+                route = if parked {
+                    CompletionRoute::Suspended
+                } else if retry {
                     restart_native_syscall(
                         frame,
                         carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
