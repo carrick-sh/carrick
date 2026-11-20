@@ -7,7 +7,7 @@ semantic_authority = [
 ]
 fixture = "carrick-softcpu-aarch64-host::boot_probe"
 scale_points = [1, 100, 10000]
-rationale = "The fixture asserts a maximum of three stage-1 walks, one each for the execute, read and write translations. It checks the copied word and reaches its HVC."
+rationale = "The fixture asserts a maximum of three stage-1 walks, one each for the execute, read and write translations. The fixture checks the copied word and its HVC, and bounds handler exits to two while the read and write loans warm."
 # The fixture asserts total stage-1 walks directly. The generic meter's
 # softcpu_code_page_walks metric counts only code walks.
 structural_budgets = []
@@ -15,6 +15,7 @@ structural_budgets = []
 [bindings]
 vm_free = [
   "carrick-softcpu-aarch64-host::boot_probe::translated_memory_loop_walks_each_page_once",
+  "carrick-softcpu-aarch64-host::boot_probe::marking_code_revokes_the_inline_store_loan",
   "carrick-softcpu-aarch64::stage1::tlbi_invalidates_a_loaded_translation_before_the_next_load",
   "carrick-softcpu-aarch64::stage1::dispatcher_tlb_checks_ttbr_asid_and_pan_after_a_hit",
   "carrick-softcpu-aarch64::stage1::dispatcher_discards_stage1_when_translation_is_disabled",

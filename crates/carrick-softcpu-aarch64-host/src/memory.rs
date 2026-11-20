@@ -1,6 +1,6 @@
 //! Single-owner physical RAM for the AArch64 soft dispatcher.
 use carrick_guest_arch::FrameGpa;
-use carrick_softcpu_aarch64::handler::{CodeGeneration, GuestMemory, MemoryFault};
+use carrick_softcpu_aarch64::handler::{CodeGeneration, GuestMemory, InlineRam, MemoryFault};
 use carrick_softcpu_aarch64::state::VirtualAddress;
 use carrick_softmmu::{
     ExtentRecord, ExtentTable, GenerationExhausted, OwnerGeneration, PAGE_SIZE_4K,
@@ -114,6 +114,47 @@ impl GuestMemory for SoftMemory {
             at += len as u64;
         }
         Ok(())
+    }
+
+    fn inline_ram(&mut self, read: Option<FrameGpa>, write: Option<FrameGpa>) -> InlineRam<'_> {
+        let read = read.filter(|frame| self.pages.contains_key(frame));
+        let write = write.filter(|frame| {
+            self.pages.contains_key(frame)
+                && self
+                    .extents
+                    .authenticate_frame(*frame, OWNER)
+                    .is_some_and(|page| !self.extents.is_code_page(page))
+        });
+        match (read, write) {
+            (Some(r), Some(w)) if r == w => self
+                .pages
+                .get_mut(&w)
+                .map_or(InlineRam::None, |page| InlineRam::Shared(page)),
+            (Some(r), Some(w)) => {
+                let mut range = self.pages.range_mut(r.min(w)..=r.max(w));
+                let (Some((_, lo)), Some((_, hi))) = (range.next(), range.next_back()) else {
+                    return InlineRam::None;
+                };
+                let (read, write) = if r < w { (lo, hi) } else { (hi, lo) };
+                InlineRam::Separate {
+                    read: Some(read),
+                    write: Some(write),
+                }
+            }
+            (read, write) => {
+                if let Some(w) = write {
+                    InlineRam::Separate {
+                        read: None,
+                        write: self.pages.get_mut(&w).map(Box::as_mut),
+                    }
+                } else {
+                    InlineRam::Separate {
+                        read: read.and_then(|r| self.pages.get(&r)).map(Box::as_ref),
+                        write: None,
+                    }
+                }
+            }
+        }
     }
 
     fn mark_code_page(&mut self, frame: FrameGpa) -> Option<CodeGeneration> {

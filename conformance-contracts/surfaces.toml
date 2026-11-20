@@ -1171,6 +1171,7 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64-host/src/lib.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64-host/src/lib.rs", contract = "arm.softcpu.stage1-tlb" },
   { path = "crates/carrick-softcpu-aarch64-host/src/memory.rs", contract = "arm.softcpu.cache-hot-set" },
+  { path = "crates/carrick-softcpu-aarch64-host/src/memory.rs", contract = "arm.softcpu.stage1-tlb" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs", contract = "arm.softcpu.stage1-tlb" },
   # Copy-through dispatcher over the ExecuteBlock seam (#1236), driven by the test-only arm64 lane.
@@ -1192,6 +1193,7 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64/src/state.rs", contracts = [] },
   # Copy-through block splitter and A64 emitter (#1236); pure word translation, nothing executes.
   { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "arm.softcpu.cache-hot-set" },
+  { path = "crates/carrick-softcpu-aarch64/src/translate.rs", contract = "arm.softcpu.stage1-tlb" },
   { path = "crates/carrick-softcpu-aarch64/tests/stage1.rs", contract = "arm.softcpu.stage1-tlb" },
   { path = "crates/carrick-softcpu-x86/examples/scan_unsupported.rs", contracts = [] },
   { path = "crates/carrick-softcpu-x86/src/apic.rs", contract = "x86.softcpu.apic-timer" },

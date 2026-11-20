@@ -33,9 +33,9 @@ use carrick_mem::memory::{
     el1_vectors_bytes_mailbox_clock, stage1_carrier_maintenance_page_tables,
     stage1_hvpatch_page_tables, stage1_identity_page_tables,
 };
-use carrick_softcpu_aarch64::dispatch::{ExecuteBlock, Report, Stop, run};
+use carrick_softcpu_aarch64::dispatch::{BlockMemory, ExecuteBlock, Report, Stop, run};
 use carrick_softcpu_aarch64::handler::{
-    CodeGeneration, Event, ExclusiveMonitor, GuestMemory, MemoryFault,
+    CodeGeneration, Event, ExclusiveMonitor, GuestMemory, InlineRam, MemoryFault,
 };
 use carrick_softcpu_aarch64::state::{
     CpuState, ExceptionLevel, InterruptMasks, ProgramCounter, RegisterValue, SavedPstate, Sctlr,
@@ -104,6 +104,10 @@ impl GuestMemory for Pages {
 
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault> {
         self.memory.write(address, bytes)
+    }
+
+    fn inline_ram(&mut self, read: Option<FrameGpa>, write: Option<FrameGpa>) -> InlineRam<'_> {
+        self.memory.inline_ram(read, write)
     }
 
     fn mark_code_page(&mut self, frame: FrameGpa) -> Option<CodeGeneration> {
@@ -379,6 +383,48 @@ fn translated_memory_loop_walks_each_page_once() {
         ));
     }
     assert_eq!(work, [(3, 2, 4), (3, 2, 103), (3, 2, 10_003)]);
+}
+
+#[test]
+fn marking_code_revokes_the_inline_store_loan() {
+    const WRITER: u64 = LINUX_EL1_KERNEL_BASE;
+    const TARGET: u64 = WRITER + PAGE;
+    let mut memory = Pages::default();
+    memory.load(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables());
+    // str w1, [x2]; movz w1, #0x42; movk w1, #0xd400, lsl #16; br x2.
+    for (index, word) in [0xb900_0041_u32, 0x5280_0841, 0x72ba_8001, 0xd61f_0040]
+        .into_iter()
+        .enumerate()
+    {
+        memory.load(WRITER + 4 * index as u64, &word.to_le_bytes());
+    }
+    memory.load(TARGET, &0xd61f_0060_u32.to_le_bytes()); // br x3.
+    let mut cpu = CpuState::default();
+    cpu.pstate.el = ExceptionLevel::El1;
+    cpu.pstate.sp = StackSelect::El1;
+    cpu.pc = ProgramCounter(WRITER);
+    cpu.el1.tcr = SystemValue(TCR_EL1_BOOTSTRAP);
+    cpu.named.ttbr0 = SystemValue(LINUX_PAGE_TABLES_BASE);
+    cpu.el1.sctlr = Sctlr(SCTLR_EL1_BOOTSTRAP);
+    set_x(&mut cpu, 1, 0xd61f_0060);
+    set_x(&mut cpu, 2, TARGET);
+    set_x(&mut cpu, 3, WRITER);
+    let mut runner = HostBlockRunner::new().expect("Linux arm64 host runner");
+    let report = probe(&mut cpu, &mut memory, &mut runner, 8);
+    let Stop::Event {
+        instruction,
+        event: Event::ProviderExit(hvc),
+    } = report.stop
+    else {
+        panic!("{report}");
+    };
+    assert_eq!(instruction.pc(), ProgramCounter(TARGET));
+    assert_eq!(hvc.immediate.value(), 2);
+    assert_eq!(report.work.memory_exits, 2);
+    assert_eq!(
+        memory.code_generation(FrameGpa::new(TARGET)),
+        Some(CodeGeneration(2))
+    );
 }
 
 #[test]
@@ -756,6 +802,10 @@ impl ExecuteBlock for TracingRunner {
         self.inner.retain_stage1()
     }
 
+    fn inline_memory(&self) -> bool {
+        self.inner.inline_memory()
+    }
+
     fn prepare(&mut self, block: &TranslatedBlock) -> Result<HostCode, HostError> {
         self.inner.prepare(block)
     }
@@ -765,6 +815,16 @@ impl ExecuteBlock for TracingRunner {
         block: &TranslatedBlock,
         code: &HostCode,
         cpu: &mut CpuState,
+    ) -> Result<usize, HostError> {
+        self.execute_with_memory(block, code, cpu, BlockMemory::default())
+    }
+
+    fn execute_with_memory(
+        &mut self,
+        block: &TranslatedBlock,
+        code: &HostCode,
+        cpu: &mut CpuState,
+        memory: BlockMemory<'_>,
     ) -> Result<usize, HostError> {
         let start = block.guest().start().0;
         if start < LINUX_EL0_TRAMPOLINE_BASE {
@@ -777,7 +837,7 @@ impl ExecuteBlock for TracingRunner {
                 last.ret = Some(x(cpu, 0) as i64);
             }
         }
-        let exit_idx = self.inner.execute(block, code, cpu)?;
+        let exit_idx = self.inner.execute_with_memory(block, code, cpu, memory)?;
         if start < LINUX_EL0_TRAMPOLINE_BASE {
             let sp = cpu.sp().0;
             let lr = x(cpu, 30);

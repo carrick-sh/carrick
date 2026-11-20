@@ -77,3 +77,19 @@ the new memory owner. Carrier registration, inline memory, IC IVAU
 generation updates, lifecycle invalidation, and branch chaining still
 need separate proof. Native release timing and the Python wall budget
 remain open.
+
+### Inline scalar memory
+
+The translated loop now bounds memory-handler exits to two and dispatches to
+`iterations + 3` across 1, 100 and 10,000 iterations. The existing read and
+write misses warm separate access planes. The launcher borrows plain RAM only
+for that native block, using the current TLB regime and permission mode. The
+emitted integer unsigned-offset load/store checks the whole VA page tag and
+natural alignment. Missing backing, code write protection and unsupported
+addressing modes use the existing memory handler. There is no signed or
+Docker binding for this launcher.
+
+The code-activation fixture keeps a write translation warm while the destination
+becomes executable. The next store must use the generation-bumping handler
+and the next dispatch must see the replacement instruction. Set
+`CARRICK_SOFT_AARCH64_INLINE_MEMORY=0` to keep scalar memory at block exits.

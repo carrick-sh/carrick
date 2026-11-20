@@ -39,12 +39,31 @@ pub struct MemoryFault {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodeGeneration(pub u64);
 
+/// Direct RAM loans for one native block. The second page may be the same
+/// physical backing as the first, even when the virtual addresses differ.
+#[derive(Default)]
+pub enum InlineRam<'a> {
+    #[default]
+    None,
+    Separate {
+        read: Option<&'a [u8; PAGE as usize]>,
+        write: Option<&'a mut [u8; PAGE as usize]>,
+    },
+    Shared(&'a mut [u8; PAGE as usize]),
+}
+
 /// Guest memory as the handlers see it. Little-endian data. Addresses are
 /// physical: with SCTLR_EL1.M clear they equal the virtual address, with M
 /// set they are the stage-1 output.
 pub trait GuestMemory {
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault>;
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault>;
+
+    /// Borrow direct-access RAM for this block only. Writable loans must
+    /// exclude code-tracked frames and memory with provider side effects.
+    fn inline_ram(&mut self, _read: Option<FrameGpa>, _write: Option<FrameGpa>) -> InlineRam<'_> {
+        InlineRam::None
+    }
 
     /// A generation is supplied only for a fully readable code frame whose
     /// memory owner tracks all guest and host writes and backing changes.
