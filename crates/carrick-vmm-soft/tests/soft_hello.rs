@@ -342,9 +342,13 @@ fn drive(
                         // The fork fixture's native host-file record is the
                         // child's stdout write. Use the dispatcher that owns
                         // the requesting ring task's retained file resources.
-                        &mut |_, requester, executable, record| {
+                        &mut |caller, record| {
                             dispatcher
-                                .serve_native_host_file_for(record, executable, requester)
+                                .serve_native_host_file_for(
+                                    record,
+                                    caller.executable,
+                                    caller.birth.record,
+                                )
                                 .map(|reply| reply.into_reply())
                                 .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)
                         },
