@@ -3,7 +3,9 @@
 use crate::abi::entry::SyscallResult;
 use crate::lifecycle::{LifecycleNative, LifecycleOutcome};
 use carrick_guest_arch::UserVa;
-use carrick_syscall_abi::{LINUX_EINVAL, linux_clock_resolution_ns};
+use carrick_syscall_abi::{
+    LINUX_CLOCK_MONOTONIC, LINUX_CLOCK_MONOTONIC_RAW, LINUX_EINVAL, linux_clock_resolution_ns,
+};
 
 pub(crate) fn clock_getres(native: &mut dyn LifecycleNative<'_>) -> LifecycleOutcome {
     let [clock, output, ..] = native.arguments();
@@ -24,18 +26,21 @@ pub(crate) fn clock_getres(native: &mut dyn LifecycleNative<'_>) -> LifecycleOut
     }
 }
 
-pub(crate) const fn is_monotonic(clock: u64) -> bool {
-    clock as i32 == carrick_syscall_abi::LINUX_CLOCK_MONOTONIC as i32
+pub(crate) const fn uses_monotonic_counter(clock: u64) -> bool {
+    matches!(
+        clock as i32 as u64,
+        LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_MONOTONIC_RAW
+    )
 }
 
-/// Until the other samples have ring authorities, only the monotonic clock
-/// is available here. An absent counter leaves the existing venue decision
-/// in charge of the syscall.
+/// Both vDSOs derive MONOTONIC and MONOTONIC_RAW from the same guest
+/// counter. Other clocks and venues without a qualified counter keep
+/// their existing venue decision.
 pub(crate) fn clock_gettime(native: &mut dyn LifecycleNative<'_>) -> Option<LifecycleOutcome> {
     use carrick_syscall_abi::LINUX_EFAULT;
 
     let [clock, output, ..] = native.arguments();
-    if !is_monotonic(clock) {
+    if !uses_monotonic_counter(clock) {
         return None;
     }
     if output == 0 {
