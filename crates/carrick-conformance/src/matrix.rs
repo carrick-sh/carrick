@@ -94,7 +94,7 @@ pub fn render(reports: &[SuiteReport]) -> String {
 /// Display order for the per-ecosystem verdict counts. `headline` FILTERS over
 /// this array, so a verdict missing from it vanishes from the counts without any
 /// error — `every_verdict_appears_in_the_headline_order` is the tripwire.
-const HEADLINE_ORDER: [Verdict; 9] = [
+const HEADLINE_ORDER: [Verdict; 10] = [
     Verdict::Match,
     Verdict::Incomplete,
     Verdict::Diff,
@@ -102,6 +102,7 @@ const HEADLINE_ORDER: [Verdict; 9] = [
     Verdict::Regression,
     Verdict::CarrickCrash,
     Verdict::Timeout,
+    Verdict::Hung,
     Verdict::BudgetKill,
     Verdict::OracleFail,
 ];
@@ -143,6 +144,7 @@ mod tests {
             Verdict::New,
             Verdict::CarrickCrash,
             Verdict::Timeout,
+            Verdict::Hung,
             Verdict::BudgetKill,
             Verdict::OracleFail,
         ];
@@ -155,6 +157,7 @@ mod tests {
                 | Verdict::New
                 | Verdict::CarrickCrash
                 | Verdict::Timeout
+                | Verdict::Hung
                 | Verdict::BudgetKill
                 | Verdict::OracleFail => {}
             }

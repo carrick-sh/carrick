@@ -208,14 +208,15 @@ run_logged() {
   tmp="$(mktemp "/tmp/nodejs-${name}.XXXXXX.log")"
   start="$(date +%s)"
   set +e
-  timeout -s KILL "$timeout_s" "$@" >"$tmp" 2>&1
+  LC_ALL=C timeout --verbose -s KILL "$timeout_s" "$@" >"$tmp" 2>&1
   rc=$?
   set -e
   end="$(date +%s)"
   if [[ "$rc" -eq 0 ]]; then
     status="PASS"
-  elif [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+  elif grep -q '^timeout: sending signal KILL to command ' "$tmp"; then
     status="TIMEOUT"
+    printf '%s\n' '# carrick-suite-hung'
   else
     status="FAIL"
   fi
@@ -237,7 +238,7 @@ libuv_test_bin() {
 }
 
 run_node_core() {
-  local args=(python3 tools/test.py --shell "$node_bin" --progress tap)
+  local args=(python3 tools/test.py --shell "$node_bin" --progress tap -j 2)
   [[ -z "$filter" ]] || args+=("$filter")
   (cd "$node_src" && run_logged node-core "${args[@]}")
 }
