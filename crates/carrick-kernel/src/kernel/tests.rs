@@ -1798,14 +1798,29 @@ mod futex_queue_authority {
                 .read_bytes(uaddr.guest_address().raw(), 4)
                 .expect("word");
             assert_eq!(u32::from_ne_bytes(word.try_into().expect("u32")), value);
-            Self::enqueue_locked(
+            let record = Self::enqueue_locked(
                 &guard,
                 queue,
                 thread,
                 uaddr.scheduler_address(),
                 bitset,
                 index,
-            )
+            );
+            let op = if uaddr.guest_address().raw() == uaddr.scheduler_address() {
+                LINUX_FUTEX_WAIT | LinuxFutexFlags::PRIVATE.bits()
+            } else {
+                LINUX_FUTEX_WAIT
+            };
+            let request =
+                SyscallRequest::new(98, SyscallArgs::from([WORD, op, u64::from(value), 0, 0, 0]));
+            crate::event_ring::publish_zone_futex_park(
+                self.zone,
+                record,
+                self.zone.next_seq(record),
+                request,
+                value,
+            );
+            record
         }
 
         /// EL1's park of a thread it serves a `FUTEX_WAIT` for, in the queue
@@ -1833,7 +1848,9 @@ mod futex_queue_authority {
                     &HostLockWait,
                 )
                 .expect("bucket lock");
-            Self::enqueue_locked(&guard, queue, thread, address, bitset, 0)
+            let record = Self::enqueue_locked(&guard, queue, thread, address, bitset, 0);
+            self.zone.publish_park(record, self.zone.next_seq(record));
+            record
         }
 
         fn enqueue_locked(
@@ -1862,7 +1879,6 @@ mod futex_queue_authority {
             let seq = zone.next_seq(record);
             zone.enqueue(guard, record, seq, queue.key(), uaddr, bitset, index)
                 .expect("enqueue");
-            zone.publish_park(record, seq);
             record
         }
 
@@ -2210,8 +2226,11 @@ impl FutexQueueAuthorityHostLane {
         retiring: &super::KernelContext,
         futex: &crate::thread::FutexTable,
     ) -> crate::el1_zone::ZoneWake {
-        crate::el1_zone::FutexQueueAuthority::of_mm(retiring.shared().mm_id())
-            .wake_child_tid(futex, futex_queue_authority::WORD)
+        crate::el1_zone::FutexQueueAuthority::of_mm(retiring.shared().mm_id()).wake_child_tid(
+            futex,
+            futex_queue_authority::WORD,
+            retiring.thread().key(),
+        )
     }
 }
 

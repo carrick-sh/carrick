@@ -165,9 +165,10 @@ fn wake_persistent_child_tid(
     futex: &FutexTable,
     address: u64,
     mm: carrick_kernel::kernel::MmId,
+    exiting: carrick_kernel::kernel::ThreadKey,
 ) {
-    let woken =
-        carrick_kernel::el1_zone::FutexQueueAuthority::of_mm(mm).wake_child_tid(futex, address);
+    let woken = carrick_kernel::el1_zone::FutexQueueAuthority::of_mm(mm)
+        .wake_child_tid(futex, address, exiting);
     zone::publish_zone_handbacks(kernel, &woken.handed);
 }
 
@@ -1283,7 +1284,13 @@ where
             return Ok(retire());
         };
         let result = clear.retire_and_wake(engine, retire, || {
-            wake_persistent_child_tid(kernel, &self.futex, clear.clear.address().raw(), clear.mm);
+            wake_persistent_child_tid(
+                kernel,
+                &self.futex,
+                clear.clear.address().raw(),
+                clear.mm,
+                clear.context.thread().key(),
+            );
         })?;
         if result.is_ok()
             && let Some(clear) = self.child_tid_clear.take()
@@ -1344,6 +1351,7 @@ where
                         &self.futex,
                         clear.clear.address().raw(),
                         clear.mm,
+                        clear.context.thread().key(),
                     )
                 },
             );
@@ -1472,6 +1480,7 @@ where
                         &self.futex,
                         clear.clear.address().raw(),
                         clear.mm,
+                        clear.context.thread().key(),
                     );
                 }) {
                     Ok(Ok(retired)) => {

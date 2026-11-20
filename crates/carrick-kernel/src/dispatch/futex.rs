@@ -331,6 +331,7 @@ pub(crate) fn dispatch_threaded_futex(
         && let Some(queue) = queue.zone()
     {
         return dispatch_zone_futex(
+            context,
             clock,
             request,
             memory,
@@ -590,6 +591,7 @@ pub(crate) fn dispatch_threaded_futex(
 /// happened; `word` is the value read at the top (0 if unreadable for a wake).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_zone_futex(
+    context: &crate::kernel::KernelContext,
     clock: &crate::kernel::container::ClockDomain,
     request: SyscallRequest,
     memory: &mut impl CurrentMmMemory,
@@ -625,7 +627,7 @@ pub(crate) fn dispatch_zone_futex(
     };
     match command {
         LINUX_FUTEX_WAKE => {
-            let woken = queue.wake(key, bitset, value);
+            let woken = queue.wake(key, bitset, value, context.thread().key());
             DispatchOutcome::ZoneFutexWoken {
                 value: i64::from(woken.count),
                 woken: woken.handed,
@@ -707,10 +709,21 @@ pub(crate) fn dispatch_zone_futex(
                 }
             });
             match result {
-                Ok((woken, moved)) => DispatchOutcome::ZoneFutexWoken {
-                    value: woken.len() as i64 + i64::from(moved),
-                    woken,
-                },
+                Ok((woken, moved)) => {
+                    let actor = crate::el1_zone::futex_actor(context.thread().key());
+                    queue.tables().futex_events.requeue(
+                        queue.event_key(key),
+                        actor,
+                        key2.scheduler_address(),
+                        woken.len() as u32,
+                        moved,
+                        value,
+                    );
+                    DispatchOutcome::ZoneFutexWoken {
+                        value: woken.len() as i64 + i64::from(moved),
+                        woken,
+                    }
+                }
                 Err(refusal) => *refusal,
             }
         }

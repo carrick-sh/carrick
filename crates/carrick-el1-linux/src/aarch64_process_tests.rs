@@ -7502,7 +7502,15 @@ fn glibc_pthread_join_meets_ring_wait(how: JoinedExit) {
                 carrick_kernel::el1_zone::FutexQueueAuthority::of_mm(
                     carrick_kernel::kernel::MmId::from_raw_u64(1).unwrap(),
                 )
-                .wake_child_tid(&carrick_kernel::thread::FutexTable::new(), tid_word)
+                .wake_child_tid(
+                    &carrick_kernel::thread::FutexTable::new(),
+                    tid_word,
+                    carrick_kernel::kernel::ThreadKey::from_zone_identity(
+                        42,
+                        std::num::NonZeroU64::new(102).unwrap(),
+                    )
+                    .unwrap(),
+                )
             });
             assert_eq!(
                 wake.count, 1,

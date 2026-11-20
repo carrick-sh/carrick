@@ -93,6 +93,7 @@ pub mod affinity;
 pub mod affinity_source;
 pub mod futex_events;
 pub use affinity_source::AffinitySource;
+use futex_events::{FutexActor, FutexCompletion, FutexEnrollment, FutexKey};
 pub mod process;
 pub use carrick_guest_arch::{CounterTick, NativeReturnWord};
 mod timer_index;
@@ -836,6 +837,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         }
     }
 
+    fn futex_actor(&self) -> FutexActor {
+        FutexActor {
+            tid: self.tid.load(Ordering::Relaxed) as u32,
+            serial: self.serial.load(Ordering::Relaxed),
+        }
+    }
+
     /// The affinity mask of this thread.
     pub fn affinity_source(&self) -> AffinitySource {
         let guest = self.affinity_source.load(Ordering::Acquire);
@@ -1206,6 +1214,17 @@ pub struct ZoneEntry {
     index: AtomicU32,
     mm: AtomicU64,
     uaddr: AtomicU64,
+    // Uses tail padding. Internal waits share these buckets without tracing.
+    traced_futex: AtomicU32,
+}
+
+impl ZoneEntry {
+    fn futex_key(&self) -> FutexKey {
+        FutexKey {
+            mm: self.mm.load(Ordering::Relaxed),
+            scheduler_address: self.uaddr.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// A futex hash bucket: a lock and a doubly linked FIFO of entries.
@@ -3176,6 +3195,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         entry.uaddr.store(uaddr, Ordering::Relaxed);
         entry.bitset.store(bitset, Ordering::Relaxed);
         entry.index.store(index, Ordering::Relaxed);
+        entry.traced_futex.store(0, Ordering::Relaxed);
         let rec = self.record(record);
         entry
             .sibling
@@ -3184,6 +3204,41 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         rec.entry_count.fetch_add(1, Ordering::Relaxed);
         self.link_tail(guard, entry_id);
         Ok(())
+    }
+
+    /// Capture the exact queue key before publishing a guest futex park.
+    /// The caller holds the entry's bucket and owns the unpublished record.
+    pub fn prepare_futex_enrollment(
+        &self,
+        record: RecordId,
+        seq: u32,
+        op: u32,
+        val: u32,
+    ) -> FutexEnrollment {
+        let rec = self.record(record);
+        let entry = self.entry(rec.first_entry.load(Ordering::Relaxed));
+        let key = entry.futex_key();
+        entry.traced_futex.store(1, Ordering::Relaxed);
+        FutexEnrollment {
+            key,
+            actor: rec.futex_actor(),
+            park: self.record_ref(record),
+            seq,
+            op,
+            val,
+        }
+    }
+
+    fn complete_futex_entry(&self, entry: &ZoneEntry, record: RecordRef, why: FutexCompletion) {
+        if entry.traced_futex.load(Ordering::Relaxed) != 0 {
+            self.futex_events.complete(
+                entry.futex_key(),
+                self.record(record.id).futex_actor(),
+                record,
+                entry.seq.load(Ordering::Relaxed),
+                why,
+            );
+        }
     }
 
     /// The sequence number of `record`'s next park.
@@ -3397,6 +3452,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     }
                     Waker::El1 { slot } => {
                         self.claim_for_el1(record, seq, index, slot, effects, || {
+                            self.complete_futex_entry(entry, identity, FutexCompletion::Woken);
                             self.unlink(guard, cursor);
                             self.drop_entry(self.record(record), cursor);
                         })
@@ -3417,6 +3473,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 };
                 if claimed {
                     if matches!(waker, Waker::Host) {
+                        self.complete_futex_entry(entry, identity, FutexCompletion::Woken);
                         self.unlink(guard, cursor);
                         self.drop_entry(self.record(record), cursor);
                     }
@@ -3450,6 +3507,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         effects: &mut WakeEffects,
     ) -> bool {
         self.hand_parked_to_host(record, seq, index, effects, || {
+            self.complete_futex_entry(
+                self.entry(entry_id),
+                self.record_ref(record),
+                FutexCompletion::Woken,
+            );
             self.unlink(guard, entry_id);
             self.drop_entry(self.record(record), entry_id);
         })
@@ -3880,6 +3942,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 return false;
             }
             let claimed = self.claim_for_el1(record.id, seq, result, waker, effects, || {
+                self.complete_futex_entry(entry, record, FutexCompletion::Signal);
                 self.unlink(&guard, entry_id);
                 self.drop_entry(rec, entry_id);
                 // A published consumer may immediately re-park with a new timer.
@@ -3950,12 +4013,17 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
     ) {
         self.unlink_object(record, wait, completion);
-        self.unlink_entries(record, wait);
+        self.unlink_entries(record, wait, None);
     }
 
     /// Unlink and free every futex queue entry of `record` (the futex half
     /// of [`Self::unlink_all`]), with the same ownership rule.
-    fn unlink_entries(&self, record: RecordId, wait: &impl LockWait<C>) {
+    fn unlink_entries(
+        &self,
+        record: RecordId,
+        wait: &impl LockWait<C>,
+        futex_completion: Option<FutexCompletion>,
+    ) {
         let rec = self.record(record);
         loop {
             let entry_id = rec.first_entry.load(Ordering::Acquire);
@@ -3967,7 +4035,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 continue;
             };
             // Requeue may have moved it between reading and locking.
-            if self.entry(entry_id).bucket.load(Ordering::Relaxed) as usize == guard.bucket {
+            let entry = self.entry(entry_id);
+            if entry.bucket.load(Ordering::Relaxed) as usize == guard.bucket {
+                if let Some(why) = futex_completion {
+                    self.complete_futex_entry(entry, self.record_ref(record), why);
+                }
                 self.unlink(&guard, entry_id);
                 self.drop_entry(rec, entry_id);
             }
@@ -4769,7 +4841,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 self.mark_woken(rec, 0);
             }
         }
-        self.unlink_all(park.record.id, wait, completion);
+        self.unlink_object(park.record.id, wait, completion);
+        self.unlink_entries(park.record.id, wait, Some(FutexCompletion::Timeout));
         self.counters.el1_timeouts.fetch_add(1, Ordering::Relaxed);
         transfer.publish()
     }
@@ -4874,6 +4947,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return Ok(false);
         }
         self.mark_woken(rec, result);
+        self.complete_futex_entry(
+            self.entry(entry_id),
+            ticket.record,
+            FutexCompletion::Timeout,
+        );
         self.unlink(&guard, entry_id);
         self.drop_entry(rec, entry_id);
         self.push_locked(&slot_guard, record, None);
@@ -5838,6 +5916,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 let outcome = if place && rec.entry_count() == 1 {
                     self.place_in_guest(record, from, None, &SpinForever, |rec| {
                         self.mark_woken(rec, index);
+                        self.complete_futex_entry(
+                            entry,
+                            self.record_ref(record),
+                            FutexCompletion::Woken,
+                        );
                         self.unlink(guard, cursor);
                         self.drop_entry(rec, cursor);
                     })
@@ -5870,6 +5953,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     }
                 };
                 if claimed {
+                    self.complete_futex_entry(
+                        entry,
+                        self.record_ref(record),
+                        FutexCompletion::Woken,
+                    );
                     self.unlink(guard, cursor);
                     self.drop_entry(rec, cursor);
                     done += 1;
@@ -6036,7 +6124,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     }
                     if let Some(transfer) = self.begin_host_transfer(r, claim) {
                         rec.handback.store(kind as u32, Ordering::Release);
-                        self.unlink_all(r.id, wait, completion);
+                        let futex_completion = match kind {
+                            Handback::Woken => Some(FutexCompletion::Woken),
+                            Handback::Signal => Some(FutexCompletion::Signal),
+                            Handback::Timeout => Some(FutexCompletion::Timeout),
+                            _ => None,
+                        };
+                        self.unlink_object(r.id, wait, completion);
+                        self.unlink_entries(r.id, wait, futex_completion);
                         if let Some(counter) = self.counters.host_claims.get(kind as usize) {
                             counter.fetch_add(1, Ordering::Relaxed);
                         }

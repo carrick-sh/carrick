@@ -2295,7 +2295,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             // A woken `futex_waitv` park still has entries on its other
             // futexes' buckets ([`ZoneTables::hand_waitv_to_host`]); no
             // bucket lock is held here. Object waiters have none.
-            self.unlink_entries(RecordId(id), wait);
+            self.unlink_entries(RecordId(id), wait, None);
             if let Some(record) = self.completion_transfer(RecordId(id)).publish() {
                 handed(record);
             }

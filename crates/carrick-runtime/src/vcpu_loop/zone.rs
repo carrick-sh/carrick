@@ -836,7 +836,9 @@ where
                                 errno: crate::linux_abi::LINUX_EAGAIN,
                             })
                         } else {
-                            zone.publish_park(record, seq);
+                            carrick_kernel::event_ring::publish_zone_futex_park(
+                                zone, record, seq, request, value,
+                            );
                             Ok((record, seq))
                         }
                     }

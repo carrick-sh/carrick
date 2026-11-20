@@ -567,6 +567,25 @@ fn rec_futex(kind: u8, address: u64, detail: i32) {
     );
 }
 
+/// Publish a host futex park and record the same queue key as its native
+/// guest counterpart. The caller still holds the wait bucket across both.
+pub fn publish_zone_futex_park(
+    zone: &carrick_el1_abi::ZoneTables,
+    record: carrick_el1_abi::RecordId,
+    seq: u32,
+    request: crate::dispatch::SyscallRequest,
+    value: u32,
+) {
+    let op = if request.number == carrick_abi::syscall::nr::FUTEX_WAITV {
+        carrick_sched_core::futex_events::WAITV_OP
+    } else {
+        request.arg(1) as u32
+    };
+    let enrollment = zone.prepare_futex_enrollment(record, seq, op, value);
+    zone.publish_park(record, seq);
+    zone.futex_events.enrolled(enrollment);
+}
+
 /// Record entry into a process-private futex wait without allocation or a
 /// syscall. The guest tid lets LLDB join the address to a sleeping host thread.
 #[inline]

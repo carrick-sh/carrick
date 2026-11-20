@@ -431,7 +431,12 @@ capture (`gbhang4`) whose single ring held 8192 `SCHED_DISPATCH` /
 `SCHED_BUDGET` / `EPWAIT` records from one tid and nothing else. A spin now
 fills only the high-rate ring. `carrick eventring` reads the lifecycle ring
 and `carrick eventring --high-rate` (alias `--sched`) reads the other.
-`carrick debug lldb-run` captures both in full. Its live kernel capture
+`carrick eventring --futex` reads the latest 1024 zone futex records, including
+operations served inside the guest. Join an enrollment to its wake by MM and
+tagged key, and to its completion by record ID, incarnation, and park sequence.
+An untimed kernel continuation can show `armed_seq=0` even though the zone
+record has a park sequence. `carrick debug lldb-run` captures all three rings
+in full. Its live kernel capture
 leaves `<run-id>.kernel-debug.json` for a coherent snapshot. When a held
 authority such as a wedge's MM mutation coordinator refuses the snapshot, it
 leaves `.kernel-debug.degraded.json` instead: per-task and per-thread state

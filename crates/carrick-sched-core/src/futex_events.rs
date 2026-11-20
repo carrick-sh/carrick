@@ -4,6 +4,22 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::RecordRef;
 
 pub const CAPACITY: usize = 1024;
+pub const WAITV_OP: u32 = u32::MAX;
+
+// The debugger reads the pointer from the stopped carrier and follows it
+// while the original metadata backing is retained.
+#[cfg(not(target_os = "none"))]
+static FUTEX_EVENTS_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(target_os = "none"))]
+pub fn publish_host_address(address: usize) {
+    FUTEX_EVENTS_ADDR.store(address, Ordering::Release);
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn clear_host_address(address: usize) {
+    let _ = FUTEX_EVENTS_ADDR.compare_exchange(address, 0, Ordering::AcqRel, Ordering::Relaxed);
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FutexKey {
@@ -34,8 +50,18 @@ pub enum FutexCompletion {
     Signal = 3,
 }
 
+/// A park's payload, captured while its bucket and unpublished record are owned.
+pub struct FutexEnrollment {
+    pub(crate) key: FutexKey,
+    pub(crate) actor: FutexActor,
+    pub(crate) park: RecordRef,
+    pub(crate) seq: u32,
+    pub(crate) op: u32,
+    pub(crate) val: u32,
+}
+
 // Layout is consumed by scripts/carrick_lldb.py.
-#[repr(C)]
+#[repr(C, align(64))]
 struct Slot {
     generation: AtomicU64,
     words: [AtomicU64; 7],
@@ -89,19 +115,19 @@ impl FutexEvents {
         slot.generation.store(busy + 1, Ordering::Release);
     }
 
-    pub fn wait(
-        &self,
-        key: FutexKey,
-        actor: FutexActor,
-        park: RecordRef,
-        seq: u32,
-        op: u32,
-        val: u32,
-    ) {
-        self.park_event(FutexEventKind::Wait, key, actor, park, seq, op, val);
+    pub fn enrolled(&self, wait: FutexEnrollment) {
+        self.park_event(
+            FutexEventKind::Wait,
+            wait.key,
+            wait.actor,
+            wait.park,
+            wait.seq,
+            wait.op,
+            wait.val,
+        );
     }
 
-    pub fn complete(
+    pub(crate) fn complete(
         &self,
         key: FutexKey,
         actor: FutexActor,
@@ -154,11 +180,12 @@ impl FutexEvents {
         ]);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn requeue(
         &self,
         key: FutexKey,
         actor: FutexActor,
-        to: FutexKey,
+        to_scheduler_address: u64,
         woken: u32,
         moved: u32,
         requested: u32,
@@ -169,7 +196,7 @@ impl FutexEvents {
             key.scheduler_address,
             u64::from(actor.tid),
             actor.serial,
-            to.scheduler_address,
+            to_scheduler_address,
             pair(woken, moved),
         ]);
     }
@@ -178,3 +205,8 @@ impl FutexEvents {
 fn pair(lo: u32, hi: u32) -> u64 {
     u64::from(lo) | (u64::from(hi) << 32)
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<Slot>() == 64);
+    assert!(core::mem::offset_of!(FutexEvents, slots) == 64);
+};

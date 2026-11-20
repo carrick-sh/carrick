@@ -5,6 +5,7 @@ use carrick_guest_arch::CounterTick;
 use carrick_personality_linux::sched::{
     FutexCall, FutexFrequency, FutexVenue, FutexWait, MmFutexKey, RelativeFutexWait,
 };
+use carrick_sched_core::futex_events::{FutexActor, FutexKey};
 use core::cell::{Cell, RefCell};
 
 /// Whether `address` is a private anonymous mapping of the admitted MM.
@@ -51,6 +52,7 @@ struct Adapter<'e, 'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<
     copy: RefCell<&'e mut dyn UserCopy>,
     refusal: Cell<Option<CopyOutcome>>,
     shared: bool,
+    op: u32,
     mapping_refusal: Option<LifecycleOutcome>,
     now: CounterTick,
     frequency: FutexFrequency,
@@ -213,18 +215,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
             return Some(returned(carrick_syscall_abi::LINUX_EINTR.guest_retval()));
         }
         zone.set_deadline(record, wait.deadline.map_or(0, CounterTick::raw));
+        let enrollment = zone.prepare_futex_enrollment(record, sequence, self.op, wait.expected);
         let receipt = carrick_core::entry::publish_handoff_park(
             start,
             &guard,
             carrick_core_abi::EntryRecordGeneration(sequence),
         );
-        drop(guard);
         let Some(receipt) = receipt else {
+            drop(guard);
             return Some(
                 self.entry
                     .run_failed(carrick_core_abi::NativeRunFailureReason::NativeStale),
             );
         };
+        zone.futex_events.enrolled(enrollment);
+        drop(guard);
         self.entry.handoff = Some(receipt);
         zone.clear_current(slot);
         zone.counters.el1_parks.fetch_add(1, Ordering::Relaxed);
@@ -268,6 +273,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             },
             &mut [],
             &mut effects,
+        );
+        zone.futex_events.wake(
+            FutexKey {
+                mm: mm.raw(),
+                scheduler_address: key.scheduler_address(),
+            },
+            FutexActor {
+                tid: self.binding.task.raw() as u32,
+                serial: self.binding.thread_generation.raw(),
+            },
+            limit,
+            count,
         );
         drop(guard);
         self.service.wake_effects(effects);
@@ -323,6 +340,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         mut call: FutexCall,
         copy: &mut dyn UserCopy,
     ) -> Option<LifecycleOutcome> {
+        let op = call.args[1] as u32;
         let shared = call.shared_private_candidate();
         if let Some(candidate) = shared {
             call = candidate;
@@ -346,6 +364,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             copy: RefCell::new(copy),
             refusal: Cell::new(None),
             shared: shared.is_some(),
+            op,
             mapping_refusal: None,
             now,
             frequency,

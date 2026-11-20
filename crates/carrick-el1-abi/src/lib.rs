@@ -3799,9 +3799,22 @@ use core::sync::atomic::AtomicUsize;
 
 static EL1_REGION_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(not(target_os = "none"))]
+fn futex_history_address(region: usize) -> usize {
+    region + EL1_ZONE_OFFSET as usize + core::mem::offset_of!(ZoneTables, futex_events)
+}
+
 /// Record the host virtual address of the mapped EL1 region.
 pub fn record_el1_region_host_ptr(ptr: usize) {
-    EL1_REGION_HOST_PTR.store(ptr, Ordering::Release);
+    let previous = EL1_REGION_HOST_PTR.swap(ptr, Ordering::AcqRel);
+    #[cfg(not(target_os = "none"))]
+    if ptr != 0 {
+        carrick_sched_core::futex_events::publish_host_address(futex_history_address(ptr));
+    } else if previous != 0 {
+        carrick_sched_core::futex_events::clear_host_address(futex_history_address(previous));
+    }
+    #[cfg(target_os = "none")]
+    let _ = previous;
 }
 
 /// Read the host virtual address of the mapped EL1 region.
@@ -3812,9 +3825,14 @@ pub fn get_el1_region_host_ptr() -> usize {
 /// Clear a retired aperture only if it is still the published mapping.
 /// A late drop of an old VM cannot revoke a successor VM's aperture.
 pub fn clear_el1_region_host_ptr_if(expected: usize) -> bool {
-    EL1_REGION_HOST_PTR
+    let cleared = EL1_REGION_HOST_PTR
         .compare_exchange(expected, 0, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+        .is_ok();
+    #[cfg(not(target_os = "none"))]
+    if cleared && expected != 0 {
+        carrick_sched_core::futex_events::clear_host_address(futex_history_address(expected));
+    }
+    cleared
 }
 
 /// Shared aperture control word.

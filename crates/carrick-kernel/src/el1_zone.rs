@@ -734,7 +734,12 @@ impl FutexQueueAuthority {
     /// in-zone exit did not wake (EL1's wake is all or nothing, so a
     /// declined in-zone exit woke nobody). The caller hands back
     /// `handed`.
-    pub fn wake_child_tid(self, futex: &crate::thread::FutexTable, address: u64) -> ZoneWake {
+    pub fn wake_child_tid(
+        self,
+        futex: &crate::thread::FutexTable,
+        address: u64,
+        exiting: crate::kernel::ThreadKey,
+    ) -> ZoneWake {
         let wake = match self.0 {
             FutexQueueVenue::Zone(queue) => queue.wake(
                 match carrick_personality_linux::sched::MmFutexKey::shared_private(
@@ -750,6 +755,7 @@ impl FutexQueueAuthority {
                 },
                 carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
                 carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
+                exiting,
             ),
             FutexQueueVenue::Table => ZoneWake {
                 count: futex.wake(
@@ -773,6 +779,15 @@ pub struct ZoneFutexQueue {
     mm: crate::kernel::MmId,
 }
 
+pub(crate) fn futex_actor(
+    thread: crate::kernel::ThreadKey,
+) -> carrick_sched_core::futex_events::FutexActor {
+    carrick_sched_core::futex_events::FutexActor {
+        tid: thread.tid.raw() as u32,
+        serial: thread.serial.raw(),
+    }
+}
+
 impl ZoneFutexQueue {
     pub const fn tables(self) -> &'static ZoneTables {
         self.tables
@@ -788,12 +803,23 @@ impl ZoneFutexQueue {
         self.mm.raw()
     }
 
+    pub(crate) fn event_key(
+        self,
+        uaddr: carrick_personality_linux::sched::MmFutexKey,
+    ) -> carrick_sched_core::futex_events::FutexKey {
+        carrick_sched_core::futex_events::FutexKey {
+            mm: self.key(),
+            scheduler_address: uaddr.scheduler_address(),
+        }
+    }
+
     /// Host `FUTEX_WAKE(_BITSET)` on this queue.
-    pub fn wake(
+    pub(crate) fn wake(
         self,
         uaddr: carrick_personality_linux::sched::MmFutexKey,
         bitset: u32,
         count: u32,
+        thread: crate::kernel::ThreadKey,
     ) -> ZoneWake {
         wake(
             self.tables,
@@ -801,6 +827,7 @@ impl ZoneFutexQueue {
             uaddr.scheduler_address(),
             bitset,
             count,
+            Some(futex_actor(thread)),
         )
     }
 
@@ -851,7 +878,7 @@ pub fn wake_exit_wait_channel(
     address: std::num::NonZeroU64,
 ) -> Option<u32> {
     let zone = zone()?;
-    let woken = wake(zone, mm.raw(), address.get(), u32::MAX, u32::MAX);
+    let woken = wake(zone, mm.raw(), address.get(), u32::MAX, u32::MAX, None);
     hand_back(&woken.handed);
     Some(woken.count)
 }
@@ -912,13 +939,27 @@ pub fn publish_owner_physical_release(
 /// Host `FUTEX_WAKE(_BITSET)` on a zone process: wake up to `count` waiters
 /// of `(mm, uaddr)` matching `bitset`. Guest futexes reach it only through
 /// [`ZoneFutexQueue::wake`].
-fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> ZoneWake {
+fn wake(
+    zone: &ZoneTables,
+    mm: u64,
+    uaddr: u64,
+    bitset: u32,
+    count: u32,
+    actor: Option<carrick_sched_core::futex_events::FutexActor>,
+) -> ZoneWake {
+    let key = carrick_sched_core::futex_events::FutexKey {
+        mm,
+        scheduler_address: uaddr,
+    };
     let mut wake = ZoneWake::default();
     let mut placements = Vec::new();
     let mut transfers = Vec::new();
     {
         let Some(guard) = zone.lock(ZoneTables::bucket_of_with_context(mm, uaddr), &HostLockWait)
         else {
+            if let Some(actor) = actor {
+                zone.futex_events.wake(key, actor, count, 0);
+            }
             return wake;
         };
         wake.count = zone.wake_host(
@@ -931,6 +972,9 @@ fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> Zone
             &mut |transfer| transfers.push(transfer),
             &mut |placement| placements.push(placement),
         );
+        if let Some(actor) = actor {
+            zone.futex_events.wake(key, actor, count, wake.count);
+        }
     }
     for placement in placements {
         deliver_placement(Some(placement));

@@ -22,7 +22,7 @@ Commands
     carrick where                        # one-line situational dump
     carrick guest-processes              # summarize guest PID/TID host threads
     carrick guest-threads [pid]          # list guest threads, optionally by PID
-    carrick eventring [count|start:count]# decode ring (default: last 128)
+    carrick eventring [--high-rate|--futex] [count|start:count]
     carrick el1-counters                 # ARM mapped syscall counters
     carrick mach-exceptions              # correlate DSR Mach exception ports
 
@@ -36,6 +36,7 @@ import json
 import os
 import re
 import shlex
+import struct
 import ctypes
 from typing import Any, Optional
 
@@ -386,12 +387,14 @@ _EVENTRING_SLOT_BYTES = 24  # generation + lo + hi (three u64 cells)
 _EVENTRING_DEFAULT_COUNT = 128
 
 
-def _eventring_complete_generation(logical_index: int) -> int:
-    return ((logical_index // _EVENTRING_N) * 2) + 2
+def _eventring_complete_generation(logical_index: int, capacity: int = _EVENTRING_N) -> int:
+    return ((logical_index // capacity) * 2) + 2
 
 
-def _eventring_slot_error(logical_index: int, before: int, after: int) -> Optional[str]:
-    expected = _eventring_complete_generation(logical_index)
+def _eventring_slot_error(
+    logical_index: int, before: int, after: int, capacity: int = _EVENTRING_N
+) -> Optional[str]:
+    expected = _eventring_complete_generation(logical_index, capacity)
     if before > expected:
         return f"OVERWRITTEN expected_gen={expected} observed_gen={before}"
     if before == expected - 1:
@@ -928,8 +931,49 @@ _EVENTRING_RINGS = {
     "lifecycle": ("RING", "IDX"),
     "high-rate": ("SCHED_RING", "SCHED_IDX"),
 }
+# Shared ZoneTables history. Geometry and packing mirror sched-core::futex_events.
+_ZONE_FUTEX_CAPACITY = 1024
+_ZONE_FUTEX_SLOT = struct.Struct("<8Q")
+
+
+def _zone_futex_event_lines(before_ring, after_ring, start, count):
+    lines = []
+    mask32 = 0xFFFFFFFF
+    for index in range(start, start + count):
+        offset = (index % _ZONE_FUTEX_CAPACITY) * _ZONE_FUTEX_SLOT.size
+        before, tag, mm, key, actor, serial, extra, detail = _ZONE_FUTEX_SLOT.unpack_from(
+            before_ring, offset
+        )
+        after = int.from_bytes(after_ring[offset : offset + 8], "little")
+        error = _eventring_slot_error(index, before, after, _ZONE_FUTEX_CAPACITY)
+        if error:
+            lines.append(f"{index:6} ERROR    {error}")
+            continue
+        kind, record = tag & mask32, tag >> 32
+        tid, val = actor & mask32, actor >> 32
+        lo, hi = detail & mask32, detail >> 32
+        identity = f"mm={mm} addr={key & ~3:#x} key={key:#x} tid={tid} serial={serial}"
+        if kind == 1:
+            op = "waitv" if hi == mask32 else f"{hi:#x}"
+            text = f"FUTEX_WAIT {identity} record={record}#{extra} armed_seq={lo} op={op} val={val}"
+        elif kind == 2:
+            text = f"FUTEX_WAKE {identity} requested={extra & mask32} woken={extra >> 32}"
+        elif kind == 3:
+            outcome = {1: "woken", 2: "timeout", 3: "signal"}.get(hi)
+            text = (
+                f"FUTEX_COMPLETE {identity} record={record}#{extra} armed_seq={lo} outcome={outcome}"
+                if outcome else f"ERROR    UNKNOWN outcome={hi}"
+            )
+        elif kind == 4:
+            text = f"FUTEX_REQUEUE {identity} to_key={extra:#x} requested={record} woken={lo} moved={hi}"
+        else:
+            text = f"ERROR    UNKNOWN kind={kind}"
+        lines.append(f"{index:6} {text}")
+    return lines
+
+
 _EVENTRING_USAGE = (
-    "usage: carrick eventring [--high-rate|--sched] [positive-count|start:positive-count]"
+    "usage: carrick eventring [--high-rate|--sched|--futex] [positive-count|start:positive-count]"
 )
 
 
@@ -942,6 +986,8 @@ def _parse_eventring_args(command: str):
     for token in command.split():
         if token in ("--high-rate", "--sched"):
             ring = "high-rate"
+        elif token == "--futex":
+            ring = "futex"
         else:
             rest.append(token)
     if len(rest) > 1:
@@ -960,11 +1006,12 @@ def _parse_eventring_args(command: str):
 
 
 def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
-    """carrick eventring [--high-rate] [COUNT|START:COUNT] — decode an event ring.
+    """carrick eventring [--high-rate|--futex] [COUNT|START:COUNT] — decode an event ring.
 
     The default is the lifecycle ring (fork/exec/fd/wait/signal/fault/grant).
     `--high-rate` (alias `--sched`) reads the separate per-dispatch scheduler
-    and per-poll epoll/eventfd/futex ring, which a spinning guest fills."""
+    and per-poll epoll/eventfd/futex ring. `--futex` reads the shared zone
+    history, including syscalls served entirely by the guest scheduler."""
     target = exe_ctx.GetTarget() or debugger.GetSelectedTarget()
     if not target or not target.IsValid():
         result.SetError("no target; `lldb <binary>` (attach) or `lldb -c <core> <binary>`")
@@ -982,32 +1029,46 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
         message = str(error)
         result.SetError(message if message.startswith(("usage", "eventring")) else _EVENTRING_USAGE)
         return
-    ring_symbol, idx_symbol = _EVENTRING_RINGS[ring_name]
-    idx_addr = _static_load_addr(target, f"carrick_kernel::event_ring::{idx_symbol}")
-    ring_addr = _static_load_addr(target, f"carrick_kernel::event_ring::{ring_symbol}")
-    if idx_addr is None or ring_addr is None:
-        result.SetError(
-            f"event_ring {ring_symbol}/{idx_symbol} symbols not found — the binary "
-            "must retain symbols (release keeps them unless explicitly stripped), "
-            "and a binary older than the ring split has no high-rate ring."
-        )
-        return
     err = lldb.SBError()
+    if ring_name == "futex":
+        pointer = _static_load_addr(target, "carrick_sched_core::futex_events::FUTEX_EVENTS_ADDR")
+        if pointer is None:
+            result.AppendMessage("shared futex event ring symbol not found")
+            return
+        raw_pointer = process.ReadMemory(pointer, 8, err)
+        idx_addr = int.from_bytes(raw_pointer, "little") if err.Success() else 0
+        if not idx_addr:
+            result.AppendMessage("shared futex event ring is unavailable in this carrier")
+            return
+        ring_addr = idx_addr + _ZONE_FUTEX_SLOT.size  # the index has its own cache line
+        capacity, slot_size = _ZONE_FUTEX_CAPACITY, _ZONE_FUTEX_SLOT.size
+    else:
+        capacity, slot_size = _EVENTRING_N, _EVENTRING_SLOT_BYTES
+        ring_symbol, idx_symbol = _EVENTRING_RINGS[ring_name]
+        idx_addr = _static_load_addr(target, f"carrick_kernel::event_ring::{idx_symbol}")
+        ring_addr = _static_load_addr(target, f"carrick_kernel::event_ring::{ring_symbol}")
+        if idx_addr is None or ring_addr is None:
+            result.SetError(
+                f"event_ring {ring_symbol}/{idx_symbol} symbols not found — the binary "
+                "must retain symbols (release keeps them unless explicitly stripped), "
+                "and a binary older than the ring split has no high-rate ring."
+            )
+            return
     raw_idx = process.ReadMemory(idx_addr, 8, err)
     if not err.Success():
         result.SetError(f"read IDX @ {_fmt_hex(idx_addr)} failed: {err.GetCString()}")
         return
     total = int.from_bytes(raw_idx, "little")
-    oldest = max(0, total - _EVENTRING_N)
+    oldest = max(0, total - capacity)
     if requested_start is None:
-        count = min(total, _EVENTRING_N, requested)
+        count = min(total, capacity, requested)
         start = total - count
     else:
         start = max(requested_start, oldest)
         count = min(requested, max(0, total - start))
     # Two bulk snapshots validate slot generations around payload reads. A core
     # is stable; a live target can change between reads and is reported TORN.
-    ring_bytes = _EVENTRING_N * _EVENTRING_SLOT_BYTES
+    ring_bytes = capacity * slot_size
     raw_ring = process.ReadMemory(ring_addr, ring_bytes, err)
     if not err.Success():
         result.SetError(f"read RING @ {_fmt_hex(ring_addr)} failed: {err.GetCString()}")
@@ -1024,6 +1085,11 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
         f"# carrick event ring ({ring_name})  pid={pid}  total={total}  "
         f"showing={count}  start={start}  oldest={oldest}"
     ]
+    if ring_name == "futex":
+        lines = _zone_futex_event_lines(raw_ring, raw_ring_after, start, count)
+        out[0] += f"  errors={sum(' ERROR    ' in line for line in lines)}"
+        result.AppendMessage("\n".join(out + lines))
+        return
     errors = 0
     for k in range(count):
         gi = start + k

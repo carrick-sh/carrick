@@ -2463,6 +2463,7 @@ impl<'a> ProcView<'a> {
             {
                 let clock = Arc::clone(cx.kernel.task().container().clock());
                 return Ok(super::futex::dispatch_zone_futex(
+                    cx.kernel,
                     &clock,
                     SyscallRequest::new(98, args),
                     memory,

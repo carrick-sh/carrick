@@ -961,14 +961,14 @@ fn modified_memory_core_command(path: &Path) -> String {
     )
 }
 
-fn lldb_eventring_capture_commands() -> [&'static str; 2] {
+fn lldb_eventring_capture_commands() -> [&'static str; 3] {
     // The interactive plugin defaults to a concise 128-event tail. Deadline
-    // captures preserve both whole fixed rings: the lifecycle ring (fork,
-    // exec, fd, wait, fault, grant) and the separate high-rate ring a
-    // scheduler or epoll spin fills.
+    // captures preserve the full lifecycle, high-rate, and shared zone
+    // futex histories.
     [
         "carrick eventring 8192",
         "carrick eventring --high-rate 8192",
+        "carrick eventring --futex 1024",
     ]
 }
 
@@ -1441,7 +1441,8 @@ mod tests {
             lldb_eventring_capture_commands(),
             [
                 "carrick eventring 8192",
-                "carrick eventring --high-rate 8192"
+                "carrick eventring --high-rate 8192",
+                "carrick eventring --futex 1024",
             ]
         );
     }

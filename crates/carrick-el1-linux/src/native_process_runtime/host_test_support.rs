@@ -12508,6 +12508,17 @@ fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
         matches!(zone.record(records[0].id).claim(), Claim::Parked { .. }),
         "nonmatching mask must stay asleep"
     );
+    let history = &zone.futex_events;
+    assert_eq!(history.next(), 3);
+    for (index, woken) in [1, 1, 0].into_iter().enumerate() {
+        let event = history.read(index as u64).expect("native futex wake");
+        assert_eq!(
+            event[0],
+            carrick_sched_core::futex_events::FutexEventKind::Wake as u64
+        );
+        assert_eq!(event[1..5], [1, 0x1000, 41, 101]);
+        assert_eq!(event[5], 1 | (woken << 32));
+    }
 }
 
 #[cfg(test)]

@@ -100,6 +100,7 @@ carrick guest-threads
 carrick guest-threads <guest-pid>
 carrick eventring 8192
 carrick eventring --high-rate 8192
+carrick eventring --futex 1024
 thread backtrace all
 image lookup -s CARRICK_LAST_FATAL
 p CARRICK_LAST_FATAL

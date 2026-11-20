@@ -477,6 +477,16 @@ fn busy_once_episode<C: ProcessContext + 'static, B: carrick_mmu_core::owner_mmu
     assert!(entry.take_run_failure().is_none());
     assert!(entry.take_handoff_receipt().is_some());
     assert_eq!(copy.loads, 1);
+    let history = &zone.futex_events;
+    assert_eq!(history.next(), 1, "a mapping retry enrols only once");
+    let event = history.read(0).expect("native futex enrollment");
+    assert_eq!(
+        event[0] as u32,
+        carrick_sched_core::futex_events::FutexEventKind::Wait as u32
+    );
+    assert_eq!(event[1..5], [1, 0x1001, 41, 101]);
+    assert_eq!(event[5], fixture.record.incarnation);
+    assert_eq!(event[6] >> 32, 0, "retain the original shared futex op");
     FUTEX_MAPPING.with(|slot| slot.set(None));
 }
 

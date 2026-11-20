@@ -3388,6 +3388,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionWorkerParts<M, Mem> {
             custody,
             root_state,
         } = self;
+        carrick_sched_core::futex_events::publish_host_address(custody.futex_history_address());
         let debug_cpus: [Arc<CarrierCpuDebug>; 2] =
             std::array::from_fn(|_| Arc::new(CarrierCpuDebug::default()));
         (
@@ -3575,6 +3576,7 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
 
 impl<M: CarrierMemoryIo> Drop for Cpl0HostCustody<M> {
     fn drop(&mut self) {
+        carrick_sched_core::futex_events::clear_host_address(self.futex_history_address());
         self.birth_live.retire();
         // Unwind the inventory first. Its destructor only records a refused
         // retirement; this carrier observer chooses the existing fail-stop.
@@ -3604,6 +3606,12 @@ pub struct ForwardVenue<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
 }
 
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
+    fn futex_history_address(&self) -> usize {
+        self.metadata_base.as_ptr().addr()
+            + carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize
+            + core::mem::offset_of!(X86Cpl0Zone, futex_events)
+    }
+
     pub fn ipc_table_map(
         &self,
     ) -> Result<Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking>, TrapError> {

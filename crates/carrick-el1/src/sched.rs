@@ -4,6 +4,7 @@ use carrick_el1_abi::{
     GIC_SPURIOUS_INTID, GIC_VTIMER_INTID, RecordId, SlotId, ThreadIdentity, TrapFrame, Waker,
     ZoneTables,
 };
+use carrick_sched_core::futex_events::{FutexActor, FutexKey};
 use carrick_sched_core::{
     IDLE_SPIN_NS, PREEMPT_SLICE_NS, ShortLockSpin, SwitchedIn, WakeEffects, WakeMechanics,
     WakerQueue, YieldTurn,
@@ -362,6 +363,19 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             &mut [],
             &mut effects,
         );
+        let binding = carrick_core::entry::binding(&self.task.execution, &self.task.mm);
+        zone.futex_events.wake(
+            FutexKey {
+                mm,
+                scheduler_address: uaddr,
+            },
+            FutexActor {
+                tid: binding.task.raw() as u32,
+                serial: binding.thread_generation.raw(),
+            },
+            count,
+            n,
+        );
         drop(guard);
         effects.apply(zone, slot, before, self);
         frame.x[0] = u64::from(n);
@@ -505,6 +519,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return Ok(Some(Served::Returned { switched: false }));
         }
         zone.set_deadline(record, deadline.unwrap_or(0));
+        let enrollment = zone.prepare_futex_enrollment(record, seq, frame.x[1] as u32, expected);
         let receipt = carrick_core::entry::publish_handoff_park(
             start,
             &guard,
@@ -517,6 +532,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             }
             return Ok(None);
         }
+        zone.futex_events.enrolled(enrollment);
         drop(guard);
         self.record_handoff(receipt);
         zone.clear_current(slot);
