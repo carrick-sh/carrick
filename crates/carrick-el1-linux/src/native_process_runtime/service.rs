@@ -2512,11 +2512,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Ok(PreparedService::Request(request, adapter));
         }
         self.service_phase = NativeServicePhase::Notice;
-        match self
-            .current
-            .service_notice
-            .publish_or_observe(request.identity.into())
-        {
+        match self.publish_service_notice(request.identity.into()) {
             Ok(()) => {}
             Err(carrick_core_abi::service::ServiceNoticeBusy::Held(holder)) => {
                 if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {
@@ -3329,6 +3325,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             || self.runtime.graph.lock().pending.has_exit(&self.key)
     }
 
+    /// Publish a physical service notice and its host-exit doorbell as one
+    /// operation. The owner may park with no runnable peer immediately after
+    /// publication, so carrier intake cannot depend on a later scheduler turn.
+    fn publish_service_notice(
+        &self,
+        selector: carrick_core_abi::service::ServiceSelector,
+    ) -> Result<(), carrick_core_abi::service::ServiceNoticeBusy> {
+        self.current.service_notice.publish_or_observe(selector)?;
+        self.current.linux.mark_pending_host_work();
+        Ok(())
+    }
+
     /// Park an unpublished service request on the live peer currently holding
     /// this slot's `service_notice` (#2532). Probing `publish_or_observe` once
     /// under `holder`'s native-service queue lock closes the race with the
@@ -3382,11 +3390,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     cancelled = true;
                     return Err(ObjectWaitError::Changed);
                 }
-                match self
-                    .current
-                    .service_notice
-                    .publish_or_observe(request.identity.into())
-                {
+                match self.publish_service_notice(request.identity.into()) {
                     Ok(()) => {
                         published = true;
                         Err(ObjectWaitError::Changed)
@@ -3475,11 +3479,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .cancel_unpublished_service(request)
                 .map(NoticeFinishOutcome::Resumed);
         }
-        match self
-            .current
-            .service_notice
-            .publish_or_observe(request.identity.into())
-        {
+        match self.publish_service_notice(request.identity.into()) {
             Ok(()) => {
                 if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {
                     pending.notice_wait = None;
