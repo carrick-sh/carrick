@@ -852,7 +852,7 @@ pub(super) fn park_owner_fault_wait(
             (key, snapshot)
         }
         PortalWaitCause::HostReadiness => {
-            let Some(key) = ObjectWaitKey::native_host_ready(record) else {
+            let Some(key) = ObjectWaitKey::native_host_ready(zone.record_ref(record)) else {
                 return ContendedFault::Refused;
             };
             // SAFETY: HostReadiness receipts carry this member queue's epoch,
