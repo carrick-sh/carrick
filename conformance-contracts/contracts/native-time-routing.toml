@@ -21,6 +21,7 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_nanosleep_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_clock_getres_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_clock_gettime_reaches_time_handler",
+  "carrick-el1-linux::aarch64_process_tests::native_fork_child_monotonic_raw_clock_gettime_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_clock_nanosleep_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_absolute_clock_nanosleep_reaches_time_handler",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_clock_requires_retained_payload_before_service_publication",

@@ -2509,6 +2509,13 @@ fn native_fork_child_clock_gettime_reaches_time_handler() {
 }
 
 #[test]
+fn native_fork_child_monotonic_raw_clock_gettime_reaches_time_handler() {
+    let number = carrick_abi::syscall::nr::CLOCK_GETTIME;
+    let clock = carrick_syscall_abi::LINUX_CLOCK_MONOTONIC_RAW;
+    assert_eq!(native_fork_child_time_result(number, clock, 0), (-14, 0));
+}
+
+#[test]
 #[ignore = "#1808 slice 3: clock_gettime/adjtimex/clock_adjtime routing"]
 fn native_fork_child_clock_adjtime_reaches_time_handler() {
     native_fork_child_time_handler(carrick_abi::syscall::nr::CLOCK_ADJTIME);
