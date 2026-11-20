@@ -6,9 +6,12 @@
  *   (none)  the run root performs every call; each returns its native
  *           Linux result and the value or list it writes. Expected stdout
  *           "F\n", exit 7.
- *   CHILD   a forked child owns no host task: a path call is a counted ENOSYS
- *           in ring and leaves no host effect (the parent proves the file
- *           still carries no attribute); a closed descriptor is EBADF. */
+ *   CHILD   a forked child, whose cwd the root's fork seeded (#2155): the
+ *           native host-file venue serves setxattr, getxattr and listxattr
+ *           against that cwd (ENOENT on the absent file, then exact value and
+ *           list bytes on a created file, read back by the parent before
+ *           cleanup); removexattr has no child route and stays a counted
+ *           ENOSYS in ring; a closed descriptor is EBADF. */
 #include "x86_b1_common.h"
 
 .equ SYS_openat, 257
@@ -29,6 +32,7 @@
 .equ O_RDWR_CREAT, 0x42
 .equ ENODATA, 61
 .equ LIST_LEN, 14 /* "user.k\0user.l\0" */
+.equ SINGLE_LIST_LEN, 7 /* "user.k\0" */
 
 #ifdef CHILD
 child_script:
@@ -38,32 +42,112 @@ child_script:
     mov $2, %r10d
     xor %r8d, %r8d
     SYS SYS_setxattr
-    EXPECT 11, -ENOSYS
+    EXPECT 11, -2
     PATH %rdi, file
     PATH %rsi, name_k
     PATH %rdx, scratch
     mov $16, %r10d
     SYS SYS_getxattr
-    EXPECT 12, -ENOSYS
+    EXPECT 12, -2
     PATH %rdi, file
     PATH %rsi, scratch
     mov $64, %edx
     SYS SYS_listxattr
-    EXPECT 13, -ENOSYS
+    EXPECT 13, -2
     PATH %rdi, file
     PATH %rsi, name_k
     SYS SYS_removexattr
+#ifdef NATIVE_ORACLE
+    EXPECT 14, -2
+#else
     EXPECT 14, -ENOSYS
-    jmp child_done
-
-parent_script:
-    /* The child's setxattr never reached the host: the file is absent. */
+#endif
+    mov $AT_FDCWD, %edi
+    PATH %rsi, file
+    mov $O_RDWR_CREAT, %edx
+    mov $0644, %r10d
+    SYS SYS_openat
+    EXPECT_OK 15
+    mov %rax, %rdi
+    SYS SYS_close
+    EXPECT 16, 0
+    PATH %rdi, file
+    PATH %rsi, name_k
+    PATH %rdx, value_k
+    mov $2, %r10d
+    xor %r8d, %r8d
+    SYS SYS_setxattr
+    EXPECT 17, 0
     PATH %rdi, file
     PATH %rsi, name_k
     PATH %rdx, scratch
     mov $16, %r10d
     SYS SYS_getxattr
-    EXPECT 21, -2
+    EXPECT 18, 2
+    cmpw $0x3156, scratch(%rip) /* "V1" */
+    je 1f
+    mov $19, %edi
+    jmp fail
+1:
+    movq $0, scratch(%rip)
+    PATH %rdi, file
+    PATH %rsi, scratch
+    mov $64, %edx
+    SYS SYS_listxattr
+    EXPECT 20, SINGLE_LIST_LEN
+    cmpl $0x72657375, scratch(%rip) /* "user" */
+    jne 2f
+    cmpl $0x006b2e72, scratch+3(%rip) /* "r.k\0" */
+    je 3f
+2:
+    mov $21, %edi
+    jmp fail
+3:
+    PATH %rdi, file
+#ifdef NATIVE_ORACLE
+    PATH %rsi, name_l
+    SYS SYS_removexattr
+    EXPECT 22, -ENODATA
+#else
+    PATH %rsi, name_k
+    SYS SYS_removexattr
+    EXPECT 22, -ENOSYS
+#endif
+    /* A closed descriptor is the ring's own EBADF, never a crossing. */
+    mov $2, %edi
+    SYS SYS_close
+    EXPECT 26, 0
+    mov $2, %edi
+    PATH %rsi, name_k
+    PATH %rdx, scratch
+    mov $16, %r10d
+    SYS SYS_fgetxattr
+    EXPECT 27, -9
+    mov $2, %edi
+    PATH %rsi, scratch
+    mov $64, %edx
+    SYS SYS_flistxattr
+    EXPECT 28, -9
+    jmp child_done
+
+parent_script:
+    movq $0, scratch(%rip)
+    PATH %rdi, file
+    PATH %rsi, name_k
+    PATH %rdx, scratch
+    mov $16, %r10d
+    SYS SYS_getxattr
+    EXPECT 23, 2
+    cmpw $0x3156, scratch(%rip) /* "V1" */
+    je 4f
+    mov $24, %edi
+    jmp fail
+4:
+    mov $AT_FDCWD, %edi
+    PATH %rsi, file
+    xor %edx, %edx
+    SYS SYS_unlinkat
+    EXPECT 25, 0
     jmp pass
 #else
 root_script:
