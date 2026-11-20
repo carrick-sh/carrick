@@ -799,12 +799,32 @@ their union. The existing `--suite` and `--ecosystem` filters further
 restrict the selection. Each sample runs the same selection at its manifest
 deadlines. Node uses line 24, and the in-image Node core runner uses two jobs.
 
-Publish the suite images as OCI fixtures and put their digest references in
-a platform-specific TOML file. The quoted keys are the original image tags
-from `scripts/conformance/suites.toml`. For example, map
-`"localhost:5050/cpython-test:3.12.13"` to
-`"localhost:5050/cpython-test@sha256:<published digest>"`. Use the same pins
-for the oracle and Carrick on that platform.
+Use [suiteboard-images.toml](../scripts/conformance/suiteboard-images.toml)
+for both the oracle and Carrick. The lane selects the `["linux/amd64"]` or
+`["linux/arm64"]` table. The amd64 pins identify the OCI archives delivered
+through the fixture bundle (#2356). The arm64 table is empty pending its
+native build. A suite with no SHA-256 digest reference for the selected
+platform is refused before either engine starts.
+For a custom pins file, put any existing flat tag-to-digest mappings under
+the table for the platform that produced them.
+
+To fill the arm64 table, build the CPython, Go, and Node images on the native
+arm64 fixture builder under the site's Docker admission. Run this for each
+Dockerfile directory, with a separate archive path for each image.
+
+```sh
+just lease docker docker buildx build --platform linux/arm64 --provenance=false \
+  --output "type=oci,dest=$archive" "$directory"
+```
+
+Inspect the archive with `skopeo inspect oci-archive:<archive>` and check
+that it reports Linux arm64. Import it into the fixture registry with
+`skopeo copy --preserve-digests` and verify that the published manifest
+digest matches the archive. Add each mapping under `["linux/arm64"]`, using
+the original tag from `suites.toml` as the quoted key and
+`"repo@sha256:<published digest>"` as the value. Run the census command below
+with `--lane hvf --dry-run` in place of `--lane kvm-local` to check the
+resolved arm64 references before filling the oracle cache.
 
 During the declared Docker-only window on the oracle host, hold the site's
 host-wide lease and fill the census cache. Use `hvf` to select the arm64
@@ -814,7 +834,7 @@ VM. Site admission must exclude guest work across the physical host.
 
 ```sh
 just lease docker target/debug/carrick-conformance --oracle-fill --lane kvm-local \
-  --suiteboard-images suiteboard-amd64.toml \
+  --suiteboard-images scripts/conformance/suiteboard-images.toml \
   --slice py-fs --slice py-proc --slice go-os --slice smoke --slice node-libuv
 ```
 
@@ -826,7 +846,7 @@ oracle.
 
 ```sh
 just lease gate target/debug/carrick-conformance --lane kvm-local \
-  --suiteboard-images suiteboard-amd64.toml --require-cached-oracle \
+  --suiteboard-images scripts/conformance/suiteboard-images.toml --require-cached-oracle \
   --slice py-fs --slice py-proc --slice go-os --slice smoke --slice node-libuv \
   --runs 5 --jsonl target/conformance/suiteboard-amd64.jsonl
 ```
