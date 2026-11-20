@@ -1220,16 +1220,7 @@ impl SyscallDispatcher {
         {
             return Ok(());
         }
-        if let Some(host_off_ns) = crate::vdso::realtime_off_ns() {
-            let word = crate::vdso::vvar_realtime_off_ns(host_off_ns, clock.realtime_offset_ns());
-            match memory.write_bytes_unchecked(
-                crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_REALTIME_OFF_NS as u64,
-                &word.to_le_bytes(),
-            ) {
-                Ok(()) | Err(MemoryError::OutOfBounds { .. }) => {}
-                Err(error) => return Err(error),
-            }
-        }
+        clock.publish_vvar_realtime_offset(memory)?;
         authority
             .vvar_realtime_epoch
             .store(epoch, std::sync::atomic::Ordering::Release);

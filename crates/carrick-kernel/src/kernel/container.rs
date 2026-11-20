@@ -469,13 +469,8 @@ impl Drop for DeterministicWaiterSubscription {
     }
 }
 
-/// The vvar `VVAR_OFF_REALTIME_OFF_NS` word for a domain: the vDSO computes
-/// `realtime_ns = CNTVCT/freq + word` with u64 wrapping arithmetic, so a
-/// negative offset must be stored in its two's-complement representation.
-pub fn vvar_realtime_word(base_realtime_ns: u64, offset_ns: i64) -> u64 {
-    base_realtime_ns.wrapping_add(offset_ns as u64)
-}
-
+/// Compatibility name for the shared vvar realtime-word computation.
+pub use crate::vdso::vvar_realtime_off_ns as vvar_realtime_word;
 pub use carrick_time_core::AdjtimexState;
 
 /// The container's time authority. Supports standard system time tracking
@@ -1108,7 +1103,7 @@ impl ClockDomain {
     /// the VMM has calibrated the base (no vDSO in this lane / unit tests).
     pub fn vvar_realtime_off_ns(&self) -> Option<u64> {
         crate::vdso::realtime_off_ns()
-            .map(|base| vvar_realtime_word(base, self.realtime_offset_ns()))
+            .map(|base| crate::vdso::vvar_realtime_off_ns(base, self.realtime_offset_ns()))
     }
 
     /// Publish this domain's realtime word into the calling process's vvar
