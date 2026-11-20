@@ -1926,7 +1926,8 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     // ordinary pending-work handback, even when no sibling is runnable.
     let owned_yield = family == Family::Sched(SchedCall::Yield);
     let owned_clock = family == Family::ClockGetres
-        || (family == Family::ClockGettime && crate::time::is_monotonic(original_argument0));
+        || (family == Family::ClockGettime
+            && crate::time::uses_monotonic_counter(original_argument0));
     // Allocator control has no host implementation: replaying it on the host
     // returns ENOSYS. Serve it in ring so a metadata capacity miss enrolls on
     // the request wait queue and a completed step settles pending work via
