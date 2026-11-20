@@ -426,6 +426,49 @@ fn serial_host_native_root_and_child_time_matches_vdso() {
 }
 
 #[test]
+fn serial_host_native_root_and_child_cputime_and_times() {
+    const TEST: &str = "serial_host_native_root_and_child_cputime_and_times";
+    const CHILD: &str = "CARRICK_CPUTIME_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "15"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, TEST)
+            .output()
+            .expect("bounded native cputime witness");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = native_exit_fixture_with_flags("native_cputime_times.S", &[]);
+    let directory = tempfile::tempdir().expect("oracle directory");
+    let oracle = directory.path().join("native_cputime_times");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+    let linux_status = std::process::Command::new(&oracle)
+        .status()
+        .expect("run native Linux oracle");
+    assert_eq!(
+        linux_status.code(),
+        Some(8),
+        "native Linux oracle exit code for native_cputime_times.S"
+    );
+    let outcome = run_pool_fixture(&elf, 512);
+    assert_eq!(
+        outcome.run.exit_code, 8,
+        "native cputime/times result (38 means ENOSYS)"
+    );
+    assert!(outcome.run.stdout.is_empty());
+    assert!(outcome.run.stderr.is_empty());
+}
+
+#[test]
 fn serial_host_native_exec_successor_vdso_monotonic_matches_raw_clock() {
     let directory = tempfile::tempdir().expect("successor directory");
     let successor = directory.path().join("successor");
