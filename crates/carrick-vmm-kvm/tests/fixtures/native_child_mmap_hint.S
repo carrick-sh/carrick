@@ -162,9 +162,22 @@ advice:
     xor %eax, %eax
     report mmap
     report mprotect
+#ifdef ADVICE_BUSY
+    /* The instrumented image holds the editor until the advice parks. */
+    movabs $0xfffffffffffffe11, %rax
+    syscall
+    test %eax, %eax
+    jne failure
+#endif
     advise MADV_DONTNEED, 4, 0x10000000
     test %rax, %rax
     js 1f
+#ifdef ADVICE_BUSY
+    movabs $0xfffffffffffffe13, %rax
+    syscall
+    cmp $1, %eax
+    jne failure
+#endif
     cmpb $0, (%r14)
     jne failure
 1:

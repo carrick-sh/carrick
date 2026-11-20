@@ -5792,4 +5792,25 @@ fn native_owner_code_range(whole: bool) {
         let run: unsafe extern "C" fn() -> u32 = core::mem::transmute(backing.0);
         assert_eq!(run(), 42);
     }
+
+    assert_eq!(invoke(233, [protect_start, protect_len, 4, 0, 0, 0]), 0);
+    assert_eq!(
+        carrick_mmu_core::aarch64::el1_private_leaf_state(leaf(
+            &words,
+            fixture_ttbr0(fixture),
+            CODE
+        )),
+        carrick_mmu_core::aarch64::El1PrivateLeafState::Retired
+    );
+    let mut root = portal.root(mm, 0).unwrap();
+    let page = ReservationRange::new(CODE, CODE + 4096).unwrap();
+    let mut protections = Vec::new();
+    root.observe_range(page, &mut |mapping| {
+        protections.push(mapping.protection.bits())
+    })
+    .unwrap();
+    assert_eq!(protections, [7], "discard preserves access");
+    let mut returns = Vec::new();
+    root.observe_deferred_returns(&mut |owed| returns.push(owed.range));
+    assert_eq!(returns, [page], "lazy outer pages do not enter the journal");
 }

@@ -125,6 +125,8 @@ pub enum ReservationOperation {
     Move = 4,
     /// Revoke access and return backing while preserving the reservation.
     Decommit = 5,
+    /// Return backing without changing the mapped range or its attributes.
+    Discard = 6,
 }
 
 /// The generation is the *current* committed root revision. The pending
