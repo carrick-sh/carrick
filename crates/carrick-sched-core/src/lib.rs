@@ -1734,6 +1734,9 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     futex_enrollments: [FutexEnrollmentWords; ZONE_ENTRIES],
     /// Per-record and per-slot user/system guest CPU tick ledger. Appended ABI field.
     cpu_ledger: cpu_time::ZoneCpuLedger,
+    /// The carrier's `CLOCK_REALTIME` minus counter nanoseconds, the same word
+    /// it stamps into vvar pages. Zero until calibrated. Appended ABI field.
+    realtime_offset_ns: AtomicU64,
 }
 
 /// A fallible acquisition policy for callers that retain work on refusal.
@@ -2558,6 +2561,20 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     #[inline]
     pub fn counter_frequency(&self) -> Option<carrick_guest_arch::CounterFrequency> {
         self.cpu_ledger.frequency()
+    }
+
+    /// Publish the carrier's realtime calibration. The ring reads only this
+    /// word, never a user mapping, for the syscall `CLOCK_REALTIME`.
+    #[inline]
+    pub fn publish_realtime_offset(&self, offset_ns: u64) {
+        self.realtime_offset_ns.store(offset_ns, Ordering::Release);
+    }
+
+    /// The published realtime calibration, or `None` before the carrier
+    /// calibrated one (a Unix-epoch nanosecond delta is never zero).
+    #[inline]
+    pub fn realtime_offset(&self) -> Option<u64> {
+        Some(self.realtime_offset_ns.load(Ordering::Acquire)).filter(|offset| *offset != 0)
     }
 
     #[inline]
