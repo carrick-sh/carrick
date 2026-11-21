@@ -1006,6 +1006,10 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         }
         let (child, address) =
             self.prepare_loaned(&owner, loan, &live, layout, mappings.len(), count, child_mm)?;
+        // The parent root is published fork-pending and write-protected
+        // from here until the commit; no graph or registry lock is held.
+        #[cfg(feature = "test-support")]
+        crate::test_support::hold_armed_fork_commit();
         Ok(Prepared {
             loan,
             child,
