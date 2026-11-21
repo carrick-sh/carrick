@@ -2762,7 +2762,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 != Some(carrick_el1_abi::X86FaultDisposition::PolicyDeclined)
         {
             return Err(fail(format!(
-                "kernel fault policy refused: reason {reason}, {record:?}"
+                "kernel fault policy refused: reason {reason:#x}, {record:x?}"
             )));
         }
         Ok(record)

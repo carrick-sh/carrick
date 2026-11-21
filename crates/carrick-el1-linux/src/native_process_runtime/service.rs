@@ -5006,6 +5006,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     NativeServiceQuarantine::UnexpectedFailureResult,
                 )),
                 (ServiceOperation::Fault(fault), ServiceResult::Refused) => {
+                    crate::native_diagnostic::fault_refused(fault, self.key);
                     self.force_sigsegv_info(
                         carrick_signal_core::policy::SigBlockMask::blocking_all_of(
                             carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),

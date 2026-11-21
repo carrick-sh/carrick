@@ -137,7 +137,7 @@ pub fn handle_cow_outcome(
         Err(crate::cow::CowError::Internal) => {
             panic!("EL1 COW internal invariant violation")
         }
-        Err(crate::cow::CowError::Refused) => return CowResolution::Refused,
+        Err(crate::cow::CowError::Refused) => return CowResolution::Refused(None),
     };
     *completion = match outcome {
         crate::cow::GuestCowOutcome::Resolved(completion) => Some(completion),
@@ -147,7 +147,7 @@ pub fn handle_cow_outcome(
         crate::cow::GuestCowOutcome::Declined(carrick_el1_abi::CowDecline::PoolEmpty) => {
             CowResolution::NeedsSupply
         }
-        crate::cow::GuestCowOutcome::Declined(_) => CowResolution::Refused,
+        crate::cow::GuestCowOutcome::Declined(reason) => CowResolution::Refused(Some(reason)),
         _ => CowResolution::Resolved,
     }
 }
@@ -1108,10 +1108,80 @@ pub enum OwnerFaultSupplyOutcome {
     CowSelected,
 }
 
+/// The branch of the shared fault policy that left a fault to its forwarding
+/// venue. It changes no verdict: an owner supply records the last deciding
+/// branch so the failure-only diagnostic of either ISA can name it (#2668).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FaultVerdict {
+    /// No branch below decided (a served fault, or a supply with no owner).
+    #[default]
+    Undecided,
+    NoTask,
+    NoMm,
+    /// The MM has no published address-space slot, or no editor owner word.
+    NoSpace,
+    /// The reservation root was held; the supply carries the wait.
+    RootBusy,
+    /// The root maps the page without this access.
+    RootDeclined,
+    /// The root has no mapping at the page.
+    RootUnmapped,
+    /// No admitted root answers for this MM.
+    RootUnavailable,
+    EditorBusy,
+    /// The COW classifier or repoint declined the armed write.
+    CowRefused(Option<carrick_el1_abi::CowDecline>),
+    /// The COW needs a replacement frame and none could be selected.
+    CowSupplyUnselected,
+    /// A protection fault the root permits and no resolver here serves.
+    ProtectionForwarded,
+    NotTranslation,
+    PreparedCommitRefused,
+    /// The first-touch window selector found a root hole or a limit.
+    WindowHole,
+    WindowRefused,
+    BackingWindowRefused,
+    /// The selection could not be built or published (root, editor, slot).
+    SelectionUnavailable,
+    /// A supply window was published for the host; not a refusal.
+    Selected,
+}
+
+impl FaultVerdict {
+    /// A stable nonzero word for the diagnostic record: the branch in the
+    /// low byte, a COW decline reason plus one in the next.
+    #[must_use]
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::Undecided => 0x01,
+            Self::NoTask => 0x02,
+            Self::NoMm => 0x03,
+            Self::NoSpace => 0x04,
+            Self::RootBusy => 0x05,
+            Self::RootDeclined => 0x06,
+            Self::RootUnmapped => 0x07,
+            Self::RootUnavailable => 0x08,
+            Self::EditorBusy => 0x09,
+            Self::CowRefused(None) => 0x0a,
+            Self::CowRefused(Some(reason)) => 0x0a | ((reason as u64 + 1) << 8),
+            Self::CowSupplyUnselected => 0x0b,
+            Self::ProtectionForwarded => 0x0c,
+            Self::NotTranslation => 0x0d,
+            Self::PreparedCommitRefused => 0x0e,
+            Self::WindowHole => 0x0f,
+            Self::WindowRefused => 0x10,
+            Self::BackingWindowRefused => 0x11,
+            Self::SelectionUnavailable => 0x12,
+            Self::Selected => 0x13,
+        }
+    }
+}
+
 pub struct OwnerFaultSupply<'a> {
     handle: Option<carrick_el1_abi::El1MmHandle>,
     pub slots: &'a carrick_el1_abi::MmPortalSlots,
     outcome: core::cell::Cell<OwnerFaultSupplyOutcome>,
+    verdict: core::cell::Cell<FaultVerdict>,
 }
 impl<'a> OwnerFaultSupply<'a> {
     pub fn new(slots: &'a carrick_el1_abi::MmPortalSlots) -> Self {
@@ -1119,6 +1189,7 @@ impl<'a> OwnerFaultSupply<'a> {
             handle: None,
             slots,
             outcome: core::cell::Cell::new(OwnerFaultSupplyOutcome::Unavailable),
+            verdict: core::cell::Cell::new(FaultVerdict::Undecided),
         }
     }
     pub fn with_handle(mut self, handle: carrick_el1_abi::El1MmHandle) -> Self {
@@ -1127,6 +1198,10 @@ impl<'a> OwnerFaultSupply<'a> {
     }
     pub fn outcome(&self) -> OwnerFaultSupplyOutcome {
         self.outcome.get()
+    }
+    /// The last deciding branch of this dispatch (diagnostic only).
+    pub fn verdict(&self) -> FaultVerdict {
+        self.verdict.get()
     }
 }
 #[derive(Clone, Copy)]
@@ -1235,6 +1310,12 @@ impl<'s> FaultSupply<'s> {
     fn decline(self) {
         if let Some(owner) = self.owner() {
             owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
+        }
+    }
+
+    fn note(self, verdict: FaultVerdict) {
+        if let Some(owner) = self.owner() {
+            owner.verdict.set(verdict);
         }
     }
 }
@@ -1429,16 +1510,20 @@ fn dispatch_classified_fault<
     counters.fault_taken.fetch_add(1, Ordering::Relaxed);
     if fault == FaultClass::WritePermission {
         let Some(task) = current_task else {
+            supply.note(FaultVerdict::NoTask);
             return Action::Forward;
         };
         let mm_key = task.mm.key.load(Ordering::Acquire);
         if mm_key == 0 {
+            supply.note(FaultVerdict::NoMm);
             return Action::Forward;
         };
         let Some(index) = spaces.find(mm_key) else {
+            supply.note(FaultVerdict::NoSpace);
             return Action::Forward;
         };
         let Some(owner) = NonZeroU64::new(slot + 1) else {
+            supply.note(FaultVerdict::NoSpace);
             return Action::Forward;
         };
         if supply.owner().is_some() {
@@ -1462,17 +1547,23 @@ fn dispatch_classified_fault<
             {
                 RootFaultAdmission::Allowed => {}
                 RootFaultAdmission::Busy => {
+                    supply.note(FaultVerdict::RootBusy);
                     return Action::Forward;
                 }
                 RootFaultAdmission::Declined => {
                     supply.decline();
+                    supply.note(FaultVerdict::RootDeclined);
                     return Action::Forward;
                 }
                 RootFaultAdmission::Unmapped if supply.is_owner() => {
                     supply.decline();
+                    supply.note(FaultVerdict::RootUnmapped);
                     return Action::Forward;
                 }
-                _ if supply.is_owner() => return Action::Forward,
+                _ if supply.is_owner() => {
+                    supply.note(FaultVerdict::RootUnavailable);
+                    return Action::Forward;
+                }
                 _ => {}
             }
         }
@@ -1482,13 +1573,18 @@ fn dispatch_classified_fault<
         // holds the editor only for one compound copy and repoint.
         let Some(_editor) = supply.editor(spaces, index, mm_key, owner) else {
             cow_resolver.editor_busy();
+            supply.note(FaultVerdict::EditorBusy);
             return Action::Forward;
         };
         let grant = _editor.grant();
         match cow_resolver.resolve_cow_outcome(grant.ttbr0, mm_key, far) {
             CowResolution::Resolved => return Action::Served,
-            CowResolution::Refused => return Action::Forward,
+            CowResolution::Refused(reason) => {
+                supply.note(FaultVerdict::CowRefused(reason));
+                return Action::Forward;
+            }
             CowResolution::NeedsSupply => {
+                supply.note(FaultVerdict::CowSupplyUnselected);
                 if let FaultSupply::Owner(owner) = supply {
                     let selected = (|| {
                         let roots = prepared.as_ref()?.roots?;
@@ -1520,6 +1616,7 @@ fn dispatch_classified_fault<
                     })();
                     if selected.is_some() {
                         owner.outcome.set(OwnerFaultSupplyOutcome::CowSelected);
+                        supply.note(FaultVerdict::Selected);
                     }
                 }
             }
@@ -1550,9 +1647,16 @@ fn dispatch_classified_fault<
                 })
                 .unwrap_or(RootFaultAdmission::Busy)
             {
-                RootFaultAdmission::Declined => supply.decline(),
-                RootFaultAdmission::Unmapped if supply.is_owner() => supply.decline(),
-                _ => {}
+                RootFaultAdmission::Declined => {
+                    supply.decline();
+                    supply.note(FaultVerdict::RootDeclined);
+                }
+                RootFaultAdmission::Unmapped if supply.is_owner() => {
+                    supply.decline();
+                    supply.note(FaultVerdict::RootUnmapped);
+                }
+                RootFaultAdmission::Busy => supply.note(FaultVerdict::RootBusy),
+                _ => supply.note(FaultVerdict::ProtectionForwarded),
             }
         }
         return Action::Forward;
@@ -1562,13 +1666,16 @@ fn dispatch_classified_fault<
         grant_access: access,
     } = fault
     else {
+        supply.note(FaultVerdict::NotTranslation);
         return Action::Forward;
     };
     let Some(task) = current_task else {
+        supply.note(FaultVerdict::NoTask);
         return Action::Forward;
     };
     let mm_key = task.mm.key.load(Ordering::Acquire);
     if mm_key == 0 {
+        supply.note(FaultVerdict::NoMm);
         return Action::Forward;
     }
 
@@ -1599,27 +1706,36 @@ fn dispatch_classified_fault<
         {
             RootFaultAdmission::Declined => {
                 supply.decline();
+                supply.note(FaultVerdict::RootDeclined);
                 return Action::Forward;
             }
             RootFaultAdmission::Unmapped => {
                 if supply.is_owner() {
                     supply.decline();
                 }
+                supply.note(FaultVerdict::RootUnmapped);
                 return Action::Forward;
             }
             RootFaultAdmission::Busy => {
+                supply.note(FaultVerdict::RootBusy);
                 return Action::Forward;
             }
-            RootFaultAdmission::Unavailable => return Action::Forward,
+            RootFaultAdmission::Unavailable => {
+                supply.note(FaultVerdict::RootUnavailable);
+                return Action::Forward;
+            }
             _ => {}
         }
         let Some(index) = spaces.find(mm_key) else {
+            supply.note(FaultVerdict::NoSpace);
             return Action::Forward;
         };
         let Some(owner) = NonZeroU64::new(slot + 1) else {
+            supply.note(FaultVerdict::NoSpace);
             return Action::Forward;
         };
         let Some(_editor) = supply.editor(spaces, index, mm_key, owner) else {
+            supply.note(FaultVerdict::EditorBusy);
             return Action::Forward;
         };
         let grant = _editor.grant();
@@ -1652,13 +1768,18 @@ fn dispatch_classified_fault<
             // turning the stale lookup into a terminal fault.
             Err(GuestPreparedCommitError::NotPrepared)
                 if matches!(supply, FaultSupply::Owner(_)) => {}
-            Err(_) if matches!(supply, FaultSupply::Owner(_)) => return Action::Forward,
+            Err(_) if matches!(supply, FaultSupply::Owner(_)) => {
+                supply.note(FaultVerdict::PreparedCommitRefused);
+                return Action::Forward;
+            }
             Err(_) => {}
         }
     }
 
     if let FaultSupply::Owner(owner) = supply {
         let mut retry = false;
+        // Any `?` below that names no branch of its own leaves this verdict.
+        supply.note(FaultVerdict::SelectionUnavailable);
         let selected = (|| {
             let roots = prepared.as_ref()?.roots?;
             let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
@@ -1682,9 +1803,13 @@ fn dispatch_classified_fault<
                     | crate::memory::reservations::Refusal::Limit,
                 ) => {
                     owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
+                    supply.note(FaultVerdict::WindowHole);
                     return None;
                 }
-                Err(_) => return None,
+                Err(_) => {
+                    supply.note(FaultVerdict::WindowRefused);
+                    return None;
+                }
             };
             let path = prepared.as_mut()?;
             let window = match path
@@ -1724,7 +1849,10 @@ fn dispatch_classified_fault<
                     retry = true;
                     return None;
                 }
-                Err(_) => return None,
+                Err(_) => {
+                    supply.note(FaultVerdict::BackingWindowRefused);
+                    return None;
+                }
             };
             let slot = owner.slots.grant(slot as usize)?;
             slot.publish_fault_selection(window.operation.sequence.get(), window)
@@ -1735,6 +1863,7 @@ fn dispatch_classified_fault<
         }
         if selected.is_some() {
             owner.outcome.set(OwnerFaultSupplyOutcome::Selected);
+            supply.note(FaultVerdict::Selected);
         }
         return Action::Forward;
     }

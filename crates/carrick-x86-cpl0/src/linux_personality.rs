@@ -1143,7 +1143,11 @@ fn supply_user_fault(
             address: fault.address,
         },
         OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::TypedRelease(wait),
-        OwnerFaultSupplyOutcome::Unavailable => UserFaultSupply::Unresolved(9),
+        // Reason 9 in the low byte; the shared policy's deciding branch
+        // above it, so the host's refusal line names it (#2668).
+        OwnerFaultSupplyOutcome::Unavailable => {
+            UserFaultSupply::Unresolved(9 | (supply.verdict().code() << 8))
+        }
         OwnerFaultSupplyOutcome::CowSelected => {
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
@@ -1188,7 +1192,10 @@ fn supply_user_fault(
                         address: fault.address,
                     },
                     OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::TypedRelease(wait),
-                    _ => UserFaultSupply::Unresolved(9),
+                    // The rerun after the COW supply: bit 24 marks it (#2668).
+                    _ => {
+                        UserFaultSupply::Unresolved(9 | (supply.verdict().code() << 8) | (1 << 24))
+                    }
                 };
             }
             #[cfg(feature = "test-support")]

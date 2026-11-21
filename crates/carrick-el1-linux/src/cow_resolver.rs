@@ -73,7 +73,7 @@ impl CowResolver for HardwareCowResolver {
                 )
             });
         let Ok(outcome) = outcome else {
-            return CowResolution::Refused;
+            return CowResolution::Refused(None);
         };
         handle_cow_outcome(outcome, &mut self.completion)
     }
@@ -368,6 +368,20 @@ pub fn dispatch_fault(
                     return parked;
                 }
                 continue;
+            }
+            if action == Action::Forward
+                && matches!(
+                    supply.outcome(),
+                    OwnerFaultSupplyOutcome::PolicyDeclined | OwnerFaultSupplyOutcome::Unavailable
+                )
+                && (native || supply.outcome() == OwnerFaultSupplyOutcome::PolicyDeclined)
+            {
+                crate::native_diagnostic::fault_verdict(
+                    frame,
+                    task.mm.key.load(Ordering::Acquire),
+                    native,
+                    supply.verdict(),
+                );
             }
             let mut declined_wait = None;
             let action = settle_declined_owner_fault(venue, task, action, supply.outcome(), || {

@@ -609,7 +609,7 @@ impl<
                             words,
                         )?;
                     }
-                    CowResolution::Refused => return Err(MmError::Core),
+                    CowResolution::Refused(_) => return Err(MmError::Core),
                     CowResolution::NeedsSupply => {
                         let mut root = self.root(continuation.handle.mm(), slot)?;
                         return Ok(TransferStep::CowSupply(
