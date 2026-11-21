@@ -337,7 +337,13 @@ pub fn space_access<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
 }
 
 /// What became of a switched-in record its address space refused to run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum RetainedDeferral {
     /// It waits on the refusal's release with its settled wait untouched;
     /// the slot no longer holds it.
