@@ -2156,6 +2156,10 @@ impl ThreadLifecyclePage {
     }
 }
 impl Lifecycle for ThreadLifecyclePage {
+    fn stock_order(&self, entry: EntryRef) -> Option<u64> {
+        // Both stock owners issue thread serials in order.
+        self.identity(entry).map(|identity| identity.thread_serial)
+    }
     fn terminal_notification(&self) -> Option<carrick_core::terminal::TerminalNotification> {
         let (mm, address) = self.exit_wait()?;
         Some(carrick_core::terminal::TerminalNotification {
