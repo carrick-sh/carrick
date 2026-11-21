@@ -473,6 +473,34 @@ impl Drop for DeterministicWaiterSubscription {
 pub use crate::vdso::vvar_realtime_off_ns as vvar_realtime_word;
 pub use carrick_time_core::AdjtimexState;
 
+/// The carrier's ring copy of the guest realtime word: the zone word ring
+/// `clock_gettime(CLOCK_REALTIME)`, `gettimeofday` and x86 `time` add to the
+/// guest counter. The word is carrier-wide and a carrier runs one container,
+/// so a carrier binds exactly that container's [`ClockDomain`] once, and the
+/// domain re-publishes the word on every change of its realtime offset.
+pub struct RingRealtimeWord {
+    /// The carrier's delta-free calibration (`unix_ns - counter_ns`).
+    host_off_ns: u64,
+    publish: Box<dyn Fn(u64) + Send + Sync>,
+}
+
+impl RingRealtimeWord {
+    pub fn new(host_off_ns: u64, publish: impl Fn(u64) + Send + Sync + 'static) -> Self {
+        Self {
+            host_off_ns,
+            publish: Box::new(publish),
+        }
+    }
+}
+
+impl std::fmt::Debug for RingRealtimeWord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RingRealtimeWord")
+            .field("host_off_ns", &self.host_off_ns)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The container's time authority. Supports standard system time tracking
 /// plus embedder-controlled modes (`Offset`, `Frozen`, `Scaled`, and
 /// `Deterministic`).
@@ -498,6 +526,10 @@ pub struct ClockDomain {
     clock_changes: Arc<Mutex<ClockChangeState>>,
     waiters: Arc<Mutex<DeterministicWaiters>>,
     adjtimex: Mutex<AdjtimexState>,
+    /// The carrier's ring realtime word, published under `clock_changes`
+    /// with every offset store so the ring never serves a moved clock's old
+    /// value after the change returns.
+    ring_realtime: OnceLock<RingRealtimeWord>,
 }
 
 impl Default for ClockDomain {
@@ -527,6 +559,7 @@ impl ClockDomain {
             })),
             waiters: Arc::new(Mutex::new(DeterministicWaiters::default())),
             adjtimex: Mutex::new(AdjtimexState::default()),
+            ring_realtime: OnceLock::new(),
         }
     }
 
@@ -671,6 +704,7 @@ impl ClockDomain {
         let callbacks = self.begin_clock_change(|| {
             self.realtime_offset_ns.store(delta_ns, Ordering::SeqCst);
             self.epoch.fetch_add(1, Ordering::Release);
+            self.publish_ring_realtime();
         });
         self.finish_clock_change(callbacks);
         Ok(())
@@ -701,6 +735,7 @@ impl ClockDomain {
                 }
             }
             self.epoch.fetch_add(1, Ordering::Release);
+            self.publish_ring_realtime();
         });
         self.finish_clock_change(callbacks);
         Ok(())
@@ -743,6 +778,7 @@ impl ClockDomain {
             self.realtime_offset_ns
                 .store(current.saturating_add(delta), Ordering::SeqCst);
             self.epoch.fetch_add(1, Ordering::Release);
+            self.publish_ring_realtime();
         }
         request.apply_fields(&mut discipline);
         let value = request.write_reply(&discipline, self.realtime_now(), output);
@@ -1101,9 +1137,38 @@ impl ClockDomain {
 
     /// The vvar realtime word this domain wants published, or `None` before
     /// the VMM has calibrated the base (no vDSO in this lane / unit tests).
+    /// A bound carrier's own calibration wins over the process-wide one.
     pub fn vvar_realtime_off_ns(&self) -> Option<u64> {
-        crate::vdso::realtime_off_ns()
+        self.ring_realtime
+            .get()
+            .map(|word| word.host_off_ns)
+            .or_else(crate::vdso::realtime_off_ns)
             .map(|base| crate::vdso::vvar_realtime_off_ns(base, self.realtime_offset_ns()))
+    }
+
+    /// Bind the carrier's ring realtime word to this domain and publish the
+    /// current offset into it. Every later offset change re-publishes it
+    /// before the change returns. A second binding is refused: the word
+    /// serves one container.
+    pub fn bind_ring_realtime(&self, word: RingRealtimeWord) -> Result<(), RingRealtimeWord> {
+        let _changes = self
+            .clock_changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ring_realtime.set(word)?;
+        self.publish_ring_realtime();
+        Ok(())
+    }
+
+    /// Callers hold `clock_changes`, so publications follow offset stores in
+    /// order.
+    fn publish_ring_realtime(&self) {
+        if let Some(word) = self.ring_realtime.get() {
+            (word.publish)(crate::vdso::vvar_realtime_off_ns(
+                word.host_off_ns,
+                self.realtime_offset_ns(),
+            ));
+        }
     }
 
     /// Publish this domain's realtime word into the calling process's vvar

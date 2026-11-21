@@ -59,7 +59,8 @@ pub use clone_plan::{
 };
 pub use container::{
     AdjtimexState, CarrierScopeId, ClockDomain, Container, ContainerId, LaunchAuthorization,
-    LaunchContext, RegistryContainerId, RunId, SignedDuration, TimeControl, TimeError,
+    LaunchContext, RegistryContainerId, RingRealtimeWord, RunId, SignedDuration, TimeControl,
+    TimeError,
 };
 pub use crash_capture::{
     CrashCaptureAuthority, CrashCaptureGeneration, CrashGenerationExhausted, CrashQuorum,
