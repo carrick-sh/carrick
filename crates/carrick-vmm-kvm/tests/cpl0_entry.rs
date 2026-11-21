@@ -4407,3 +4407,21 @@ fn serial_host_root_legacy_ipc_syscalls_match_linux() {
 fn serial_host_fork_child_legacy_ipc_syscalls_match_linux() {
     legacy_syscalls_run(&["-DIPC", "-DCHILD"], &[0, b'f', 3], &[]);
 }
+
+/// #2579: two live threads on two CPUs fault in one 2 MiB grant window. The
+/// loser's owner-selected window is already prepared and submitted by the
+/// carrier when its serve meets the editor held (Busy). It must settle that
+/// window before it parks: the loser then faults again on the same CPU, on
+/// an unserved page of the same window, and both accesses must succeed with
+/// no `Unresolved` fault and no carrier fatal (`owner grant refused`).
+#[test]
+fn two_live_threads_selected_window_busy_loser_refaults_and_completes() {
+    let elf = kvm_pool_fixture::assemble_fixture("native_selected_busy_loser.S", &[]);
+    let outcome = run_instrumented_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "the Busy loser must settle its submitted window before parking"
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
