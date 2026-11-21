@@ -2907,6 +2907,43 @@ fn production_brk_regrows_over_its_released_pages() {
     );
 }
 
+/// Run `elf` natively: the Linux oracle for a fixture's exit status.
+fn native_oracle_status(elf: &[u8]) -> Option<i32> {
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, elf, 0o755);
+    std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle")
+        .status
+        .code()
+}
+
+/// #2668 (R1): a fork arms the parent's writable-and-executable private page
+/// copy-on-write, and the parent's next store to it must resolve that copy.
+/// The shared COW policy declined every executable armed leaf on the user
+/// fault path (`CowDecline::Executable`), which had no executable publication
+/// step; on x86 the fault then had no owner and the carrier refused it
+/// (`kernel fault policy refused`), on ARM the host refused the fault service
+/// and the parent took SIGSEGV. Two live processes: the child is blocked on a
+/// pipe while the parent stores, and is reaped before the second store.
+#[test]
+fn production_fork_parent_writes_its_rwx_private_page() {
+    let elf = native_exit_fixture("native_fork_parent_rwx_write.S");
+    assert_eq!(native_oracle_status(&elf), Some(0), "native Linux oracle");
+    let outcome =
+        try_run_pool_fixture_with_root_affinity(&elf, 256, kvm_pool_fixture::ROOT_AFFINITY_ANY)
+            .expect("fork parent RWX write run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_fork_parent_rwx_write.S): {:?}",
+        outcome.run
+    );
+}
+
 /// #2359: two clone threads of the root raw-exit at the same moment on the
 /// two CPUs. Each clears its child-tid word through the MM owner while its
 /// sibling's exit can hold that MM's editor. Contention is "not now": the
