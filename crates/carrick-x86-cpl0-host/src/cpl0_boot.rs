@@ -2168,6 +2168,78 @@ mod forward_execution_tests {
             "unexpected error: {err:?}"
         );
     }
+
+    /// #2739: changing the installed slots away from an exec predecessor is
+    /// necessary for reclaim, but it is not authority to consume the adopted
+    /// predecessor before the ring's matching exec settlement arrives.  This
+    /// drives the same BootstrapCustody drain an unrelated work doorbell uses.
+    #[test]
+    fn unrelated_drain_keeps_an_unsettled_root_exec_predecessor() {
+        let mut fixture = ForwardVenueFixture::new();
+        let predecessor = ReservationMm::new(INITIAL_MM_KEY).expect("predecessor MM");
+        let successor = ReservationMm::new(INITIAL_MM_KEY + 1).expect("successor MM");
+        let predecessor_context = fixture.root_binding.context();
+        let execution = carrick_hal::fork_stock::GrantExecution::new(
+            carrick_guest_arch::CpuId::new(0),
+            carrick_el1_abi::ExecutionBinding {
+                task: carrick_el1_abi::EntryTaskKey::from_raw(41),
+                generation: carrick_el1_abi::SnapshotGeneration::from_raw(11),
+                mm: carrick_el1_abi::EntryMmKey::from_raw(predecessor.raw()),
+                thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+            },
+            predecessor_context,
+        );
+        let successor_root = RootGpa::page_aligned(FrameGpa::new(0x3000)).expect("successor root");
+        // SAFETY: this stopped fixture owns both synthetic MMs and uses the
+        // handle only to exercise the production fork-stock adoption path.
+        let successor_owner = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                fixture.custody.0.fork_stock.carrier(),
+                successor,
+                NonZeroU64::new(2).expect("successor generation"),
+            )
+        };
+        let receipt = fixture
+            .custody
+            .0
+            .fork_stock
+            .replace_for_exec_with_tables(
+                carrick_hal::fork_stock::ExecPredecessorForm::Root,
+                execution,
+                successor_owner,
+                successor_root,
+                carrick_hal::fork_stock::ForkHostBackingCustody::default(),
+                Vec::new(),
+            )
+            .map_err(|(error, _)| error)
+            .expect("adopt root exec predecessor");
+        assert_eq!(receipt.predecessor(), predecessor);
+        assert_eq!(receipt.successor(), successor);
+        fixture.custody.0.exec_predecessors.push(receipt);
+
+        let zone =
+            anonymous_owner::retained_cow_zone(&fixture.custody.0.ram).expect("retained zone");
+        assert!(
+            (0..carrick_x86::cpl0_entry::CPL0_CPU_COUNT)
+                .filter_map(|slot| u8::try_from(slot).ok())
+                .all(
+                    |slot| zone.installed_space(carrick_sched_core::SlotId::new(slot))
+                        != predecessor.raw()
+                ),
+            "both stopped slots switched away from the predecessor"
+        );
+
+        fixture
+            .custody
+            .0
+            .settle_exec_predecessors()
+            .expect("unrelated quarantine drain");
+        assert_eq!(
+            fixture.custody.0.exec_predecessors.len(),
+            1,
+            "slot absence cannot spend an unsettled exec predecessor receipt"
+        );
+    }
 }
 
 #[derive(
