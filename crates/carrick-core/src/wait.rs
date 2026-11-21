@@ -336,6 +336,65 @@ pub fn space_access<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
     })
 }
 
+/// What became of a switched-in record its address space refused to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedDeferral {
+    /// It waits on the refusal's release with its settled wait untouched;
+    /// the slot no longer holds it.
+    Parked,
+    /// The release published before the enrolment closed: install again.
+    Rerun,
+    /// The source retired, or a host request won the record's `OnCpu`.
+    Refused,
+}
+
+/// Defer the record switched in on `slot` behind `source`'s release of
+/// `cause` (#2660). Its wait is already over (it was selected to run), but
+/// its address space refused the install: that is "not now". Observe the
+/// release, probe `refused` once, then park the record on the release with
+/// everything it resumes with kept
+/// ([`carrick_sched_core::object_wait::ObjectWaitGuard::park_retained_rechecked`]),
+/// so its next switch-in resumes exactly as this one would have. A release
+/// between the observation and the enrolment reruns instead of sleeping.
+pub fn defer_switched_in_record<C: carrick_core_abi::EntryContext>(
+    zone: &ZoneTables<C>,
+    slot: SlotId,
+    source: &SpaceNotificationLease<'_, C>,
+    cause: SpaceWaitCause,
+    record: RecordId,
+    completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    refused: impl Fn() -> bool,
+) -> RetainedDeferral {
+    if !source.is_live() {
+        return RetainedDeferral::Refused;
+    }
+    let observed = source.observe(cause);
+    if !refused() {
+        return RetainedDeferral::Rerun;
+    }
+    let key = source.key(cause);
+    let guard = if zone.completion_enabled(key) {
+        zone.object_wait_with_completion(key, &ShortLockSpin, completion)
+    } else {
+        zone.object_wait(key, &ShortLockSpin, completion)
+    };
+    let Ok(guard) = guard else {
+        return RetainedDeferral::Refused;
+    };
+    match guard.park_retained_rechecked(observed, record, || {
+        source.is_live() && source.observe(cause) == observed
+    }) {
+        Ok(()) => {
+            drop(guard);
+            zone.clear_current(slot);
+            zone.counters.el1_parks.fetch_add(1, Ordering::Relaxed);
+            RetainedDeferral::Parked
+        }
+        Err(ObjectWaitError::Changed) => RetainedDeferral::Rerun,
+        Err(_) => RetainedDeferral::Refused,
+    }
+}
+
 /// Coordinate a retryable anonymous edit against the exact live MM source.
 /// Observe before the failed predicate probe so a release in the gap is a
 /// Changed result, never a sleeping waiter. `probe` must drop root and editor
