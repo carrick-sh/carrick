@@ -1908,6 +1908,41 @@ fn assert_production_glibc_relocations_and_ifuncs(
 }
 
 /// Engine witness: dynamic glibc hello runs on the soft CPU through the
+/// production EL1 vectors and trap path (`CARRICK_A64_ELF`) against a pinned
+/// `CARRICK_A64_DYN_ROOT` (`scripts/ci/fetch-arm64-cross-libc.sh`).
+/// HVC #2 replies come from a test fixture (`DynamicRoot` in
+/// `tests/fixtures/dynamic_root.rs`), not from the production
+/// carrick-kernel / carrick-personality-linux dispatch. Kept alongside
+/// `soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch` until
+/// `.github/retired-tests.toml` retires the fixture witnesses.
+#[test]
+#[ignore = "requires CARRICK_A64_DYN_ROOT and CARRICK_A64_ELF"]
+fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() {
+    let root = std::env::var_os("CARRICK_A64_DYN_ROOT").expect("set CARRICK_A64_DYN_ROOT");
+    let root = FixtureRoot::new(root.into());
+    let hello = root.read("/hello").expect("read dynamic hello");
+    let compiler = String::from_utf8(
+        root.read("/hello.compiler")
+            .expect("read hello.compiler from scripts/ci/fetch-arm64-cross-libc.sh"),
+    )
+    .expect("utf-8 hello.compiler");
+    let compiler = compiler.lines().next().expect("fixture compiler version");
+    read_pinned_fixture(&root, GLIBC_LIBC, GLIBC_LIBC_SHA256);
+    let program = carrick_mem::elf::ElfProgram::load(&hello, 183, &|path| {
+        assert_eq!(path, GLIBC_LOADER);
+        Some(read_pinned_fixture(&root, path, GLIBC_LOADER_SHA256))
+    })
+    .expect("plan glibc hello and its interpreter");
+    let (mut cpu, mut memory) = stage_dynamic(&program, vec![b"/hello".to_vec()], Vec::new());
+    let mut replies = DynamicRoot::new(root, "/hello");
+    let result = run_dynamic_glibc(&mut cpu, &mut memory, &mut replies, 1_000_000);
+    assert_eq!(result, Ok(0));
+    assert_eq!(replies.stdout, b"dynamic glibc hello\n");
+    assert_glibc_jump_slots(&program, &mut memory, &replies, compiler);
+    assert_eq!(replies.report_ifuncs(&mut memory, &program), 3);
+}
+
+/// Engine witness: dynamic glibc hello runs on the soft CPU through the
 /// production EL1 vectors and trap path (`CARRICK_A64_ELF`) and production
 /// `carrick-kernel` / `carrick-personality-linux` dispatch against a pinned
 /// `CARRICK_A64_DYN_ROOT` (`scripts/ci/fetch-arm64-cross-libc.sh`), with zero
@@ -2181,6 +2216,42 @@ fn stage_dynamic(
 
     admit_root_task_with_stdio(&mut memory);
     (cpu, memory)
+}
+
+fn assert_glibc_jump_slots(
+    program: &carrick_mem::elf::ElfProgram<'_>,
+    memory: &mut Pages,
+    replies: &DynamicRoot,
+    compiler: &str,
+) {
+    use goblin::elf::reloc::R_AARCH64_JUMP_SLOT;
+
+    let elf = goblin::elf::Elf::parse(program.executable_bytes).unwrap();
+    for name in ["memcpy", "strlen", "memset"] {
+        let slot = elf
+            .pltrelocs
+            .iter()
+            .find(|rel| {
+                rel.r_type == R_AARCH64_JUMP_SLOT
+                    && elf
+                        .dynsyms
+                        .get(rel.r_sym)
+                        .and_then(|sym| elf.dynstrtab.get_at(sym.st_name))
+                        == Some(name)
+            })
+            .unwrap_or_else(|| {
+                panic!("missing {name} R_AARCH64_JUMP_SLOT in fixture built with {compiler}")
+            });
+        let target = read_u64(memory, program.executable.load_bias + slot.r_offset);
+        let Some((path, _)) = replies.image_at(target) else {
+            panic!("unresolved {name}: {target:#x}");
+        };
+        assert!(
+            path.ends_with("libc.so.6"),
+            "unexpected {name} target {target:#x} in {}",
+            path.display()
+        );
+    }
 }
 
 fn run_dynamic_glibc(
