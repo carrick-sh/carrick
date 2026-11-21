@@ -96,6 +96,15 @@ pub struct X86CowResolver<'a, W: carrick_mmu_core::aarch64::descriptor_txn::Live
     pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
 }
 
+/// The executable-publication step of a COW repoint on x86. The copy went
+/// through a supervisor alias of the replacement frame, and x86 keeps
+/// instruction fetch coherent with stores to the same physical frame, so no
+/// cache authority has anything to publish before the leaf becomes visible.
+/// (ARM publishes the replacement through the host's I2 authority instead.)
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+const X86_EXECUTABLE_REPLACEMENT_IS_COHERENT: fn(carrick_core_abi::CowGrant, u64, u64) -> bool =
+    |_, _, _| true;
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResolver
     for X86CowResolver<'_, D>
@@ -123,6 +132,10 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
         self.resolve_cow_outcome(root, mm_key, far) == CowResolution::Resolved
     }
 
+    fn executable_publication(&self) -> bool {
+        true
+    }
+
     fn resolve_cow_outcome(&mut self, root: u64, mm_key: u64, far: u64) -> CowResolution {
         let copy_page = |source: u64, destination: u64| {
             // SAFETY: the x86 adapter verified both retained supervisor
@@ -143,7 +156,7 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
                 self.words,
                 carrick_mmu_core::aarch64::SubstrateGpa(root),
             ),
-            publish_executable: None,
+            publish_executable: Some(&X86_EXECUTABLE_REPLACEMENT_IS_COHERENT),
         };
         // SAFETY: dispatch_classified_fault holds this MM's exact editor.
         // resolve_x86_guest_cow authenticates the live CR3 and retained

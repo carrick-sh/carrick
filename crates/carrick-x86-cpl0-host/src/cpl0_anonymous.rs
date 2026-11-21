@@ -1760,7 +1760,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             &self._vm.words(),
             execution.context.root,
             UserVa::new(window.fault_page),
-            false,
+            // x86 instruction fetch is coherent with stores to the frame:
+            // an executable source needs no publication step (#2668).
+            true,
         )
         .map_err(|reason| fail(format!("owner COW source: {reason:?}")))?;
         let leaf = translate_leaf(
