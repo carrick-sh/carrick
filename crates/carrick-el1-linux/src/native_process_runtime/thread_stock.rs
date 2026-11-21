@@ -98,6 +98,11 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
             .settle(page, self.controls)
             .map_err(|_| NativeFailure::Stale)
     }
+    pub(super) fn release_for_close(&self) -> Option<Arc<dyn carrick_core::lifecycle::MemberControlRelease + 'a>> {
+        (!self.waiters.is_empty()).then(|| {
+            Arc::clone(&self.release) as Arc<dyn carrick_core::lifecycle::MemberControlRelease + 'a>
+        })
+    }
 }
 
 pub(super) fn drain_closed<M, C: ProcessContext>(
@@ -530,6 +535,29 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.take_thread_stock_wait()
             .map(|resumed| resumed.unwrap_or(NativeResume::NoPending))
             .map_err(NativeFailure::run_failure_reason)
+    }
+    #[inline(never)]
+    pub(super) fn settle_closing_thread_stock_wait(&mut self) -> Result<bool, NativeFailure> {
+        let continuation = match self.source.zone.record(self.record.id).resume_disposition() {
+            carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(entry) => {
+                Some(entry)
+            }
+            _ => None,
+        };
+        let Some(_) = self.take_thread_stock_wait()? else {
+            return Ok(false);
+        };
+        if let Some(entry) = continuation {
+            // SAFETY: this admitted lane still owns the exact closing record
+            // and restores its terminal continuation for `resume_pending_lifecycle`.
+            unsafe {
+                self.source
+                    .zone
+                    .record(self.record.id)
+                    .publish_owner_continuation(entry);
+            }
+        }
+        Ok(true)
     }
     fn take_thread_stock_wait(&mut self) -> Result<Option<NativeResume>, NativeFailure> {
         let key = {

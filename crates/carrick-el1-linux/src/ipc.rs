@@ -2133,6 +2133,9 @@ pub fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
     operation: carrick_sched_core::object_wait::OperationToken,
 ) -> Result<usize, crate::native_process_runtime::NativeProcessError> {
     use crate::native_process_runtime::{NativeProcessError, NativeServiceQuarantine};
+    if operation.metadata_generation().is_some() {
+        return Ok(0);
+    }
     let token = from_sched_token(operation).ok_or(NativeProcessError::ServiceQuarantined(
         NativeServiceQuarantine::IpcOperationToken,
     ))?;

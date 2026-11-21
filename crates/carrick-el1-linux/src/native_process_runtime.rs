@@ -7450,22 +7450,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // that was runnable (queued, not parked in a wait) has no host
         // thread to honour that request: its next selection is the only
         // point that can retire it, so it must not return to EL0.
-        let member_exit = if owner_exit.is_none()
-            && (continuation
-                || (self.control.host_exit_requested() && !record.has_adapter_operation()))
-        {
-            self.pending_close_status()
-        } else {
-            None
-        };
-        // A cancelled service can leave both a terminal continuation and an
-        // installed IPC operation. Release the operation and its endpoint
-        // pin before either closing caller gives up this record.
+        let member_exit =
+            if owner_exit.is_none() && (continuation || self.control.host_exit_requested()) {
+                self.pending_close_status()
+            } else {
+                None
+            };
+        // A cancelled service or interrupted IPC object wait can leave an
+        // installed operation on the closing record. Settle and release its
+        // token and endpoint pin before either closing caller retires.
         if (owner_exit.is_some() || member_exit.is_some())
-            && let Err(error) = self
-                .settle_closing_adapter_operation(service::ClosingAdapterCustody::CancelInstalled)
+            && let Err(reason) = self.settle_closing_member_operation()
         {
-            return Some(self.run_failed(retention_failure(error).run_failure_reason()));
+            return Some(self.run_failed(reason));
         }
         if continuation || owner_exit.is_some() {
             // SAFETY: this exact record is selected by the execution owner.
@@ -7682,11 +7679,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             membership,
         )
         .map_err(|_| NativeFailure::Quarantined)?;
-        self.runtime
-            .graph
-            .lock()
-            .pending
-            .remove_member_child_waits(&self.key, core::ptr::from_ref(self.control).addr());
+        {
+            let mut graph = self.runtime.graph.lock();
+            graph
+                .pending
+                .remove_member_child_waits(&self.key, core::ptr::from_ref(self.control).addr());
+            let _ = graph.remove_signal_wait(&self.record);
+            let _ = graph.remove_suspend_mask(&self.record);
+        }
         self.record_child_lost(
             carrick_el1_abi::NativeChildLostReason::ClosingMemberRetire,
             carrick_el1_abi::NativeChildLostSite::EntryRetireClosingMember,
@@ -7703,6 +7703,34 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             progress: carrick_core::Served::Idle,
             result: SyscallResult::new(0),
         })
+    }
+
+    #[inline(never)]
+    fn settle_closing_member_operation(
+        &mut self,
+    ) -> Result<(), carrick_core_abi::NativeRunFailureReason> {
+        let has_signal_wait = self
+            .runtime
+            .graph
+            .lock()
+            .pending
+            .member(&self.record)
+            .is_some_and(|state| matches!(state.wait, Some(MemberWait::Signal(_))));
+        if has_signal_wait {
+            return self
+                .settle_closing_adapter_operation(service::ClosingAdapterCustody::ForbidInstalled(
+                    service::NativeServiceQuarantine::SignalWaitAdapter,
+                ))
+                .map_err(|error| retention_failure(error).run_failure_reason());
+        }
+        if self
+            .settle_closing_thread_stock_wait()
+            .map_err(NativeFailure::run_failure_reason)?
+        {
+            return Ok(());
+        }
+        self.settle_closing_adapter_operation(service::ClosingAdapterCustody::CancelInstalled)
+            .map_err(|error| retention_failure(error).run_failure_reason())
     }
 
     /// The ISA execution lane's single checkpoint after selecting a parked
@@ -8548,6 +8576,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     self.interrupt_member_record(record)?;
                 }
             }
+            self.wake_closing_sibling_channels()?;
             // Native exception owners must have their cancellation checkpoint
             // queued before the host can admit its one-shot terminal wake batch.
             page.publish_exit_wait(self.binding.mm, WaitChannel::address(&channel));
@@ -8570,6 +8599,51 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             );
         }
         Ok((page, channel))
+    }
+
+    #[inline(never)]
+    fn wake_closing_sibling_channels(&mut self) -> Result<(), NativeFailure> {
+        let (task_channel, ipc_channels, stock_release) = {
+            let graph = self.runtime.graph.lock();
+            let row = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeFailure::Quarantined)?;
+            let resources = row.native().resources();
+            let task_channel = resources.channel.clone();
+            let ipc_channels = graph.pending.ipc_channels(&self.key);
+            let stock_release = resources
+                .thread_stock
+                .as_ref()
+                .and_then(|stock| stock.release_for_close());
+            (task_channel, ipc_channels, stock_release)
+        };
+        if let Some(channel) = task_channel {
+            publish_signal_channel(
+                self.source.zone,
+                self.source.slot,
+                self.service,
+                &channel,
+                #[cfg(test)]
+                self.publication_wait_probe,
+            )
+            .map_err(|_| NativeFailure::Quarantined)?;
+        }
+        for channel in ipc_channels {
+            publish_signal_channel(
+                self.source.zone,
+                self.source.slot,
+                self.service,
+                &channel,
+                #[cfg(test)]
+                self.publication_wait_probe,
+            )
+            .map_err(|_| NativeFailure::Quarantined)?;
+        }
+        if let Some(release) = stock_release {
+            release.released();
+        }
+        Ok(())
     }
 
     /// Clear and wake the exiting caller's CLONE_CHILD_CLEARTID word once.
