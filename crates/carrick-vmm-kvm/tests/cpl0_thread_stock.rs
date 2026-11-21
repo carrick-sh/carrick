@@ -49,7 +49,10 @@ fn thread_stock(flags: &[&str], test: &str) {
     );
     // Cost: every clone is served in ring, none forwarded to the host.
     assert_eq!(
-        outcome.physical.refusal_count(carrick_abi::NativeNr(56)),
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(56))
+            .expect("clone refusal counter"),
         0,
         "clone must be served in ring"
     );
