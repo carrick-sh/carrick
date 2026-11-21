@@ -4278,8 +4278,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // No delegated-map guard survives this point and no table/object lock
         // crosses graph publication. Native fork owns a private table and the
         // sole-member check above excludes concurrent descriptor mutation.
+        // A fork child's ring-owned namespace, or the x86 run root's
+        // carrier-retained one: the ring allocates the root's descriptors
+        // there too, so it closes their close-on-exec ones in place, and the
+        // carrier's Kernel half keeps the namespace for the successor
+        // (#2142).
+        let root_namespace = self.host_root_retains_filesystem();
         if let Some((region, map)) = self.service.exec_ipc_binding()
-            && let Some(raw) = map.lookup_owned(table_custody.file_table())
+            && let Some(raw) = map.lookup_owned(table_custody.file_table()).or_else(|| {
+                root_namespace
+                    .then(|| map.lookup_retained_binding(table_custody.file_table()))
+                    .flatten()
+            })
         {
             let table = carrick_fd_core::TableId::from_raw(raw);
             if crate::ipc::release_exec_record_locks(

@@ -132,9 +132,9 @@ and scheduler pool remain the entry point; no test helper performs replacement.
 The two child witnesses and
 `native_fork_child_exec_refusals_return_their_errno_to_the_old_image`
 (ENOENT and ENOEXEC from the child's old image) are green with the child
-server. The three root witnesses stay red until root exec lands. The crossing
-allowlist must flip in a separately labelled commit with its server and
-director review. No early errno-only flip is allowed.
+server. The root witnesses are green with the root's server (#2142, below).
+The root's exec takes the native exec service, not a host crossing, so the
+crossing allowlist does not change.
 
 ## Parked exec and signals (#2273)
 
@@ -212,23 +212,58 @@ No production function from those diffs is changed by the witness commit.
 Signed ARM execution, native-arm64 Docker comparison, the x86 scoreboard A/B,
 and the full final-head gates remain required before accepting the exec fix.
 
-## Root exec (#2142): what remains
+## Root exec (#2142)
 
-The root's exec is not the child's. The x86 run root is a ring-native
-process whose filesystem authority, descriptor table, credentials and
-`/proc/self/exe` identity the host Kernel retains (`host_root_retains_filesystem`,
-`encode_caller_access` refuses it ENOSYS). Its exec must therefore commit
-the host Kernel's exec transition (close-on-exec on the host table, the exe
-identity and binfmt argv, the `/proc` generation, the signal reset, the
-ptrace stop) and publish `PendingExecReplacement::cpl0` so the executor
-retargets its loaded root. That is `drive_root_exec`, whose typestate runs
-synchronously in one host call, while the x86 successor is built by the
-ring adopter between the arm and the consuming crossing. Two designs need a
-director ruling before code: an x86 `RootExecVenue` whose `install_image`
-drives a host-entered CPL0 build (boot's pattern, mid-forward), or the
-child's ring path for the root with the driver's neutral steps split across
-the Exec arm, adopt and settle crossings. Until then the root keeps its
-counted ENOSYS and `Execve`/`Execveat` stay `x86 = false` (no early flip).
+The x86 run root is a ring-native process whose filesystem authority,
+credentials and `/proc/self/exe` identity the host Kernel retains
+(`host_root_retains_filesystem`). Its descriptors live in the ring's
+namespace for its host table (`serve_host_root_file`: "descriptor allocation
+belongs exclusively to the ring namespace"). Its exec takes the child's ring
+path, and the host Kernel's half runs at the root's settlement:
+
+- **Claim.** `native_exec_claimed(RootExecServer::NativeService, ..)` claims
+  the root's `execve`/`execveat` on x86. AArch64 passes `HostForward`: its
+  root still forwards to the host's `drive_root_exec`.
+- **Request.** The root's request crosses unsealed. The carrier's loader
+  resolves it under the root's own capability (`NativeExecAuthority::HostRoot`,
+  chosen by the ticket's authenticated origin). ENOENT, ENOEXEC and E2BIG
+  return to the old image before the seal.
+- **Adopt.** The fork stock takes the boot-built predecessor through its root
+  form (`ExecPredecessorForm::Root`). A predecessor an earlier root exec
+  moved into the stock leaves like a child's. The loader's
+  `ExecImageIdentity` rides the exec owner's row as its attachment.
+- **Ring commit.** The ring closes the root's close-on-exec descriptors in
+  its namespace in place (`exec_deferred`), as it does a fork child's.
+- **Settle.** The root's `ExecSettlement::Root` becomes a `RootExecSettled`.
+  The CPU refuses guest entry until the executor has consumed it.
+- **Kernel half.** The executor runs the shared `drive_root_exec` with an x86
+  `RootExecVenue` (`carrick-runtime` `executor/cpl0/root_exec.rs`):
+  - it prepares on the ring-issued MM (`Kernel::adopt_authenticated_exec_mm`);
+  - it hands the root's descriptor namespace to the successor's staged table
+    (`FileTable::hand_ipc_to_exec_successor`), so the ring keeps it;
+  - it commits;
+  - it publishes `PendingExecReplacement::cpl0`. The successor binding
+    carries the ring thread's execution generation, which exec advances.
+
+  The worker then retargets the root before the CPU's next entry. A failure
+  here kills the run with SIGSEGV (past no return).
+- **Owed work.** A native service is never declined for owed host work on
+  x86. That transport has no replay, and the exec would be refused ENOSYS.
+
+Witnesses: `production_root_exec_{replaces_image_and_runs_static_successor,
+of_a_missing_path_is_enoent,of_a_non_elf_file_is_enoexec,twice_runs_the_second_successor,
+with_a_running_sibling_thread_runs_the_successor,closes_only_close_on_exec_descriptors}`.
+The last three also run the fixture natively as the Linux oracle.
+
+What remains (follow-ups):
+- A root exec settled on the idle peer is still handed back unchanged
+  (`ExecSettlement::NotHere`). The ring's handback of that record (R3 of the
+  approved design) is not built. Every witness pins the root to the loaded
+  lane.
+- The boot-built predecessor's frames and tables are not returned on root
+  exec. The root form has no stock custody for them.
+- The host's own `FileTable` for the root mirrors only what the host
+  installed. The ring's namespace stays authoritative, as before exec.
 
 #1903: a native child's `/proc/self/exe` is not served on x86 at all today;
 #2084 owns that readlink. The successor's image is loaded by the shared

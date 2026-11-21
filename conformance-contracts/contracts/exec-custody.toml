@@ -85,13 +85,13 @@ vm_free = [
 ]
 
 # #2235: the fork-child bindings are green with the x86 child server; the
-# #2142 root bindings stay red until root exec lands. No signed-ARM
+# #2142 root bindings are green with the root's server. No signed-ARM
 # promotion is claimed by either.
 embed = [
   "KVM carrier fixture (not signed): carrick-vmm-kvm::cpl0_initial_mm::production_exec_service_stages_parks_and_reruns_a_successor (#1093 S4c c: on a booted production carrier the host Exec service reserves from the carrier's own fork stock, frame inventory and CPL0 tables, releases whole, parks behind a stock holder with nothing reserved and its wake enrolled, is woken by the holder's return on another thread within 5 s and then stages; run under just lease gate with CARRICK_REQUIRE_KVM=1)",
   "KVM production (#2235, green): carrick-vmm-kvm::cpl0_initial_mm::{native_fork_child_execs_static_successor,native_fork_child_execs_while_parent_keeps_running,native_fork_child_exec_refusals_return_their_errno_to_the_old_image} (a fork child's exec replaces its image through the production CPL0 pool while its parent runs, or returns ENOENT/ENOEXEC to its old image; run under just lease gate with CARRICK_REQUIRE_KVM=1); see docs/conformance-contracts/x86-exec-family.md",
   "KVM production (#2305, green): carrick-vmm-kvm::cpl0_initial_mm::{native_fork_child_execs_static_successor,native_fork_child_exec_refusals_return_their_errno_to_the_old_image,native_fork_child_exec_wakes_after_stock_holder_retires,native_fork_child_exec_killed_while_parked_is_reaped} assert the exec owner's census: one receipt reserved at claim per exec, sealed with that receipt after a park, retired once as adopted, refused or park-cancelled, and settled with the signal reset discharged (red on fe3e085db, green after the neutral owner)",
-  "KVM production (red until #2142): carrick-vmm-kvm::cpl0_initial_mm::{production_root_exec_replaces_image_and_runs_static_successor,production_root_exec_of_a_missing_path_is_enoent,production_root_exec_of_a_non_elf_file_is_enoexec}; see docs/conformance-contracts/x86-exec-family.md",
+  "KVM production (#2142, green): carrick-vmm-kvm::cpl0_initial_mm::{production_root_exec_replaces_image_and_runs_static_successor,production_root_exec_of_a_missing_path_is_enoent,production_root_exec_of_a_non_elf_file_is_enoexec,production_root_exec_twice_runs_the_second_successor,production_root_exec_with_a_running_sibling_thread_runs_the_successor,production_root_exec_closes_only_close_on_exec_descriptors} (the run root's exec replaces its image through the native exec service and the shared drive_root_exec, keeps its descriptor namespace, or returns ENOENT/ENOEXEC to its old image; red with ENOSYS on e432cb9e0; run under just lease gate with CARRICK_REQUIRE_KVM=1); see docs/conformance-contracts/x86-exec-family.md",
 ]
 
 [bindings.unresolved]

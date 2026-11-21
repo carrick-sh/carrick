@@ -1833,6 +1833,22 @@ impl PersistentTaskBinding for Cpl0TaskBinding {
                 )
             })
     }
+
+    /// The carrier settles an x86 exec predecessor's tables and frames at
+    /// its settlement crossing (`settle_exec_predecessors`), so after the
+    /// root's retarget the binding has nothing left to retire. x86 has no
+    /// stage-1 root ticket.
+    fn retire_detached_exec_predecessor(
+        &self,
+        root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+    ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
+        match root_ticket {
+            None => Ok(None),
+            Some(_) => Err(TrapError::Hypervisor(
+                "CPL0 exec predecessor has no stage-1 root to retire".to_owned(),
+            )),
+        }
+    }
 }
 
 pub(crate) type Cpl0TaskBindingDirectory = TaskBindingDirectory<Cpl0TaskBinding>;

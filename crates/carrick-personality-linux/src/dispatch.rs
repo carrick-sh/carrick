@@ -1916,6 +1916,12 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
             Family::Signal(crate::signal::SignalCall::RtSigreturn)
                 | Family::Lifecycle(LifecycleCall::Wait4 | LifecycleCall::WaitId)
         );
+    // x86 has no replay transport for a declined call, and its crossing set
+    // has no host server for a native service (exec, entropy): declining
+    // one for owed work would refuse it. Its own completion boundary
+    // settles that work (#2142).
+    let owned_native_service = family == Family::NativeService
+        && pending.crossing_set() == crate::crossing::HostCrossingSet::X86;
     if pending.host_work()
         && !pending.resumes_operation()
         && !transfer
@@ -1925,6 +1931,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         && !owned_yield
         && !owned_allocator_control
         && !owned_continuation
+        && !owned_native_service
         && !(family == Family::Anonymous(AnonymousCall::Mmap)
             && pending.may_complete_advisory_mmap_before_work())
     {
@@ -2138,6 +2145,43 @@ mod ring_first_tests {
                 1
             );
             assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// #2142: x86 has no replay transport for a declined call and no host
+    /// server for an exec, so owed host work never declines a native
+    /// service there: the exec reaches its owner, as it does without work.
+    /// AArch64 still declines it to the host replay boundary, unchanged.
+    #[test]
+    fn native_exec_with_owed_work_reaches_its_owner_on_x86_only() {
+        for (set, native, route) in [
+            (HostCrossingSet::X86, 59, CompletionRoute::NativeService),
+            (HostCrossingSet::Aarch64, 221, CompletionRoute::WithWork),
+        ] {
+            let ordinal = 221;
+            let refused = [const { AtomicU64::new(0) }; 513];
+            let mut pending = CarrierOwned {
+                set,
+                mutate_forward: false,
+                strict: true,
+                state: crate::abi::entry::LinuxTaskState::new(),
+                native: carrick_syscall_abi::NativeNr(native),
+                admitted: true,
+                result: 42,
+                work: true,
+                handback: false,
+                signal_restore_calls: 0,
+                stages: false,
+                refused: &refused,
+                forwarded: [const { AtomicU64::new(0) }; 512],
+            };
+            assert_eq!(dispatch(ordinal, 42, &mut pending), route, "{set:?}");
+            assert!(
+                refused
+                    .iter()
+                    .all(|count| count.load(Ordering::Relaxed) == 0),
+                "{set:?}: exec is never a counted refusal"
+            );
         }
     }
 

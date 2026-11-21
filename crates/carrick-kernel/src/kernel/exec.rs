@@ -209,6 +209,11 @@ impl PreparedExec {
         self.old_caller.resources().files()
     }
 
+    /// The staged file table the successor installs at commit.
+    pub fn replacement_file_table(&self) -> Arc<FileTable> {
+        self.resources.files()
+    }
+
     /// Cross the external backend's no-return cut. Dropping this preparation
     /// after this point terminates predecessor siblings instead of resuming
     /// them into an authority graph that has already moved forward.
