@@ -138,6 +138,11 @@ vm_free = [
   "carrick-kernel::dispatch::net::send_recv::recvmmsg_tests::recvmmsg_answers_the_count_received_before_a_failing_entry",
   "carrick-el1-linux::dispatch::tests::native_host_file_stage_supplies_a_fork_childs_message_ranges_first",
   "carrick-x86-cpl0::native_stage::tests::descendant_message_calls_supply_their_ranges_before_crossing",
+  "carrick-el1-linux::native_process_runtime::host_test_support::republished_host_file_park_marks_pending_host_work_without_doorbell",
+  "carrick-el1-linux::native_process_runtime::host_test_support::republished_host_file_park_marks_pending_host_work_without_doorbell_on_arm",
+  "carrick-el1-linux::native_process_runtime::host_test_support::republished_host_file_park_skips_host_work_mark_with_physical_doorbell",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_poll_tests::serial_host_arm_fork_exec_child_polls_never_ready_host_socket_twenty_rounds",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_poll_tests::serial_host_arm_fork_exec_child_polls_ready_host_socket_twenty_rounds",
 ]
 embed = [
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_tcp_and_udp_cross_to_the_host_network (fork child: blocking TCP connect/send/recv/shutdown/EOF, UDP sendto + poll + recvfrom, poll timeout, non-blocking connect + poll(POLLOUT) + SO_ERROR, TCP over ::1)",
@@ -145,6 +150,8 @@ embed = [
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_transfers_keep_their_whole_extent (fork child: 65000-byte UDP send and recv whole, 100000-byte UDP send EMSGSIZE with nothing transmitted, a short recv buffer truncates a datagram and discards its rest, a 409600-byte blocking TCP send into a small window returns 409600, a 200000-byte MSG_WAITALL recv returns 200000)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_glibc_resolver_calls_answer_as_linux (fork child against loopback name servers, the Docker oracle's values for the same static fixture: Go's dial (AF_INET6 connect, write, poll, read) and glibc's sendmmsg of A and AAAA (2; msg_len 7 and 10), recvfrom of each answer, sendmsg, recvmsg (namelen 16) and recvmmsg of one, each header on a page the call writes first; then a sendmmsg of two whose second entry is unmapped (1, msg_len 7) and a sendmsg larger than any datagram (EMSGSIZE), as the same fixture answers natively on Linux 6.12 x86_64)",
   "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_child_inet_repoll_after_eintr_waits_its_own_timeout (fork child: a SIGUSR1-interrupted poll is EINTR; the same poll after its deadline passed waits its own timeout; a blocking recvfrom interrupted under SA_RESTART restarts and receives)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_fork_exec_child_polls_never_ready_host_socket_twenty_rounds (#2620 part A x86 twin: parent forks, child execs 20x poll(fd, POLLIN, 50ms) on a never-ready UDP socket then _exit(7), parent wait4(-1) returns 7 within 2s)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::native_fork_exec_child_polls_ready_host_socket_twenty_rounds (#2620 part A x86 readiness twin: parent forks, child execs 20x readiness-woken poll(fd, POLLIN) + recvfrom then _exit(7), parent wait4(-1) returns 7 within 2s)",
 ]
 
 [bindings.unresolved]
