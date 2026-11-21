@@ -22,22 +22,8 @@ pub(crate) fn syscall_edits_stage1(number: u64, arg2: u64) -> bool {
     )
 }
 
-/// Restores the guest-visible `Running` state when a guest-blocking wait ends.
-///
-/// Deliberately owns no borrow of the run state: the blocking arms it wraps
-/// need `&mut self` for `complete_errno`/`complete_returned`, so a guard
-/// holding `&self` could not coexist with them. It carries the identity it
-/// publishes under instead, which is fixed for the life of the thread.
-pub(crate) fn apply_alias_frame_inventory(
-    context: &carrick_kernel::kernel::KernelContext,
-    commit: carrick_hal::FrameInventoryCommit<()>,
-) -> Result<(), carrick_kernel::kernel::FrameInventoryError> {
-    context
-        .kernel()
-        .frame_inventory()
-        .apply(context.shared().mm().id(), commit)
-        .map(|_| ())
-}
+// Shared with every carrier lane (`carrick_kernel::dispatch::carrier_loop`).
+pub(crate) use carrick_kernel::dispatch::carrier_loop::apply_alias_frame_inventory;
 
 /// The alias-install arm's (the guest map-file syscall) fail-closed sink.
 ///
