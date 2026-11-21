@@ -257,6 +257,14 @@ impl<'a> SoftSingleProcessConfig<'a> {
     }
 }
 
+/// Per-reply census of forwarded `HVC #2` syscall completions, recorded at the
+/// completion boundary by whichever responder answered the mailbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Hvc2ReplyCensus {
+    pub fixture_answers: u64,
+    pub production_answers: u64,
+}
+
 /// Outcome and post-exit inspection handle for [`run_single_process`].
 pub struct SoftProcessRun<X = HostBlockRunner>
 where
@@ -267,6 +275,7 @@ where
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub syscalls_dispatched: u64,
+    pub reply_census: Hvc2ReplyCensus,
     /// `(aarch64_nr, syscall_name, count)` refused with `ENOSYS` in EL1 ring or host dispatch.
     pub counted_enosys: Vec<(u64, &'static str, u64)>,
     pub vmas: Vec<VmaSummary>,
@@ -606,6 +615,7 @@ where
         stdout: summary.stdout,
         stderr: summary.stderr,
         syscalls_dispatched: summary.syscalls_dispatched,
+        reply_census: summary.reply_census,
         counted_enosys: summary.counted_enosys,
         vmas: summary.vmas,
         engine,
@@ -630,6 +640,7 @@ where
         stdout: summary.stdout,
         stderr: summary.stderr,
         syscalls_dispatched: summary.syscalls_dispatched,
+        reply_census: summary.reply_census,
         counted_enosys: summary.counted_enosys,
         vmas: summary.vmas,
         engine,
@@ -641,6 +652,7 @@ struct SingleProcessSummary {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     syscalls_dispatched: u64,
+    reply_census: Hvc2ReplyCensus,
     counted_enosys: Vec<(u64, &'static str, u64)>,
     vmas: Vec<VmaSummary>,
 }
@@ -749,6 +761,7 @@ where
     let reporter = CompatReporter::default();
     let mut refused_by_runner = std::collections::BTreeMap::<u64, u64>::new();
     let mut syscalls_dispatched = 0u64;
+    let mut reply_census = Hvc2ReplyCensus::default();
     let max_first_touch_faults = max_syscalls.saturating_mul(16).max(65_536);
     let mut first_touch_faults = 0usize;
     let mut syscall_turns = 0usize;
@@ -789,6 +802,8 @@ where
         let served_boundary = settle_el1_boundary_for(0, dispatcher);
         match served_boundary {
             Some(carrick_el1_abi::ServedBoundary::Completed) => {
+                syscalls_dispatched += 1;
+                reply_census.production_answers += 1;
                 let completed_val = raw.args[0] as i64;
                 engine
                     .complete_syscall(completed_val)
@@ -808,6 +823,7 @@ where
         let nr = raw.number.raw();
         if is_refused_single_process_timer_or_signal_syscall(nr) {
             syscalls_dispatched += 1;
+            reply_census.production_answers += 1;
             *refused_by_runner.entry(nr).or_default() += 1;
             engine
                 .complete_syscall(carrick_abi::LINUX_ENOSYS.guest_retval())
@@ -827,16 +843,19 @@ where
 
         match outcome {
             DispatchOutcome::Returned { value } => {
+                reply_census.production_answers += 1;
                 engine
                     .complete_syscall(value)
                     .map_err(|e| format!("complete_syscall({}): {e}", raw.number.raw()))?;
             }
             DispatchOutcome::Errno { errno } => {
+                reply_census.production_answers += 1;
                 engine
                     .complete_syscall(errno.guest_retval())
                     .map_err(|e| format!("complete_syscall({} errno): {e}", raw.number.raw()))?;
             }
             DispatchOutcome::SchedulerYield => {
+                reply_census.production_answers += 1;
                 engine
                     .complete_syscall(0)
                     .map_err(|e| format!("complete_syscall(sched_yield): {e}"))?;
@@ -845,6 +864,7 @@ where
                 engine
                     .set_memory_model(tso)
                     .map_err(|e| format!("set_memory_model: {e}"))?;
+                reply_census.production_answers += 1;
                 engine
                     .complete_syscall(0)
                     .map_err(|e| format!("complete_syscall(set_memory_model): {e}"))?;
@@ -910,11 +930,13 @@ where
                         Ok(success_retval)
                     })
                     .map_err(|e| format!("MM executor mutation for MapHostAlias: {e}"))??;
+                reply_census.production_answers += 1;
                 engine
                     .complete_syscall(alias_result)
                     .map_err(|e| format!("complete_syscall(MapHostAlias): {e}"))?;
             }
             DispatchOutcome::Exit { code } | DispatchOutcome::ThreadExit { code } => {
+                reply_census.production_answers += 1;
                 return Ok(finish_single_process_summary(
                     engine,
                     dispatcher,
@@ -922,9 +944,11 @@ where
                     &refused_by_runner,
                     code,
                     syscalls_dispatched,
+                    reply_census,
                 ));
             }
             DispatchOutcome::SignalDeath { signum } => {
+                reply_census.production_answers += 1;
                 return Ok(finish_single_process_summary(
                     engine,
                     dispatcher,
@@ -932,6 +956,7 @@ where
                     &refused_by_runner,
                     128 + signum,
                     syscalls_dispatched,
+                    reply_census,
                 ));
             }
             other => {
@@ -955,6 +980,7 @@ fn finish_single_process_summary<X>(
     refused_by_runner: &std::collections::BTreeMap<u64, u64>,
     exit_code: i32,
     syscalls_dispatched: u64,
+    reply_census: Hvc2ReplyCensus,
 ) -> SingleProcessSummary
 where
     X: ExecuteBlock + Send + 'static,
@@ -991,6 +1017,7 @@ where
         stdout: dispatcher.stdout(),
         stderr: dispatcher.stderr(),
         syscalls_dispatched,
+        reply_census,
         counted_enosys,
         vmas,
     }
