@@ -2183,6 +2183,7 @@ fn soft_carrier_publish_retires_a_reused_frames_resident_code() {
 /// child processes with each invalidation removed and print the red/green
 /// matrix for this host.
 #[test]
+#[ignore = "measurement: runs in the --nocapture probe step"]
 fn measure_residency_mutation_matrix() {
     let exe = std::env::current_exe().expect("test binary path");
     for mutation in [
