@@ -86,3 +86,33 @@ pub(crate) fn fault_refused(
         fault.access,
     ));
 }
+
+#[cfg(test)]
+mod tests {
+    /// #2668: the record names the deciding branch and its stable code.
+    #[test]
+    fn fault_verdict_record_names_the_deciding_branch() {
+        super::capture();
+        let frame = carrick_el1_abi::TrapFrame {
+            esr: 0x9200_004f,
+            elr: 0x40_1076,
+            far: 0x4000_0001,
+            ..carrick_el1_abi::TrapFrame::default()
+        };
+        super::fault_verdict(
+            &frame,
+            3,
+            true,
+            carrick_el1::fault::FaultVerdict::CowRefused(Some(
+                carrick_el1_abi::CowDecline::Executable,
+            )),
+        );
+        assert_eq!(
+            super::take(),
+            [
+                "fault-verdict esr=0x9200004f pc=0x401076 far=0x40000001 mm=3 native=true \
+                 code=0x90a verdict=CowRefused(Some(Executable))"
+            ]
+        );
+    }
+}
