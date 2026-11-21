@@ -852,6 +852,9 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         Ok(())
     }
     fn retire_fd_table(&mut self, _table: u64) {}
+    /// Release a thread's host set pin (#2621) at the thread's exit or its
+    /// process's exec or exit ([`crate::ipc::release_retained_pin`]).
+    fn release_host_select_set(&mut self, _pin: carrick_el1_abi::ipc::RawOfdPin) {}
     /// The root exit crossing terminates every remaining thread of the run,
     /// so a root `exit_group` may complete while siblings are still live.
     /// Their census and pool entries stay with the host, which retires them
@@ -1324,6 +1327,10 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     /// Private file byte sources the host-file venue retained for one
     /// record's `mmap`, consumed by that record's next delegated mmap.
     map_stash: BTreeMap<RecordRef, MapStash>,
+    /// Each thread's host set (#2621): the pinned epoll description its
+    /// select sets nest for their host members. Released when the thread
+    /// exits, or when its process execs or exits.
+    host_select_sets: BTreeMap<RecordRef, carrick_el1_abi::ipc::RawOfdPin>,
     /// Consumed on the child's first return to user mode, after its MM split.
     pending_child_tid: Option<UserVa>,
     signals: NativeProcessSignals<'a, carrick_personality_linux::abi::signal::LinuxSiginfo>,
@@ -2635,6 +2642,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             resources.interrupted_child_waits.remove(&old_record);
             resources.map_stash.remove(&old_record);
         }
+        // The same thread on its new record keeps its host set (#2621).
+        if old_record != reference
+            && let Some(pin) = resources.host_select_sets.remove(&old_record)
+        {
+            resources.host_select_sets.entry(reference).or_insert(pin);
+        }
         if old_record != reference {
             if let Some(pending) = resources.pending_signal_deliveries.remove(&old_record)
                 && pending.expected_host == host_identity
@@ -3462,6 +3475,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     resources.interrupted_child_waits.remove(&old_record);
                     resources.pending_signal_deliveries.remove(&old_record);
                     resources.map_stash.remove(&old_record);
+                    // A host set is a table's view, not a thread's state:
+                    // the member's new record keeps it until the process
+                    // execs or exits (#2621).
+                    let new_record = source.zone.record_ref(record);
+                    if old_record != new_record
+                        && let Some(pin) = resources.host_select_sets.remove(&old_record)
+                    {
+                        resources.host_select_sets.entry(new_record).or_insert(pin);
+                    }
                 }
             } else if let Some((retained, pending)) = prepared_member {
                 retained.commit_registration();
@@ -4490,6 +4512,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             interrupted_child_waits: BTreeMap::new(),
             pending_signal_deliveries: BTreeMap::new(),
             map_stash: BTreeMap::new(),
+            host_select_sets: BTreeMap::new(),
             pending_child_tid: None,
             signals,
             _thread_claim: thread_claim,
@@ -5088,7 +5111,9 @@ struct ForkReservation<'a, M> {
 #[derive(Clone, Copy)]
 pub struct NativeServiceCall<'a> {
     ordinal: carrick_guest_arch::NativeOrdinal,
-    counters: &'a carrick_el1_abi::Counters,
+    /// `None` for a record no caller context can refuse (a select set's
+    /// host-set enrolment, #2621): it resolves no path and changes no cwd.
+    counters: Option<&'a carrick_el1_abi::Counters>,
 }
 
 impl<'a> NativeServiceCall<'a> {
@@ -5096,7 +5121,29 @@ impl<'a> NativeServiceCall<'a> {
         ordinal: carrick_guest_arch::NativeOrdinal,
         counters: &'a carrick_el1_abi::Counters,
     ) -> Self {
-        Self { ordinal, counters }
+        Self {
+            ordinal,
+            counters: Some(counters),
+        }
+    }
+
+    /// A call whose record no caller context can refuse.
+    pub fn uncounted(ordinal: carrick_guest_arch::NativeOrdinal) -> Self {
+        Self {
+            ordinal,
+            counters: None,
+        }
+    }
+
+    /// Count a ring refusal of this call.
+    fn record_refusal(
+        &self,
+        origin: carrick_core_abi::service::ServiceOrigin,
+        venue: carrick_el1_abi::RefusalVenue,
+    ) {
+        if let Some(counters) = self.counters {
+            counters.record_refusal(self.ordinal, origin, venue);
+        }
     }
 }
 
@@ -7858,6 +7905,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut member_host_fallback = None;
         let mut cancelled_exec = None;
         let mut refused_exec = None;
+        let mut host_sets = BTreeMap::new();
         let (page, channel, first_close) = {
             let mut graph = self.runtime.graph.lock();
             let upgraded = if matches!(&operation, PendingCloseOperation::Exit { .. })
@@ -7899,6 +7947,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 resources.interrupted_child_waits.clear();
                 resources.pending_signal_deliveries.clear();
                 resources.map_stash.clear();
+                // Exec and exit end every thread's host set (#2621).
+                host_sets = core::mem::take(&mut resources.host_select_sets);
                 let admission = match &operation {
                     PendingCloseOperation::Exit { .. } => {
                         PendingCloseAdmission::Exit(carrick_core::terminal::TerminalCustody::<
@@ -8215,6 +8265,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
         };
         drop(registry_state);
+        for pin in host_sets.into_values() {
+            self.service.release_host_select_set(pin);
+        }
         if let Some(identity) = member_host_fallback {
             let custody = carrick_core::terminal::TerminalCustody::<
                 carrick_core::terminal::Thread,
@@ -9267,6 +9320,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             interrupted_child_waits: BTreeMap::new(),
             pending_signal_deliveries: BTreeMap::new(),
             map_stash: BTreeMap::new(),
+            host_select_sets: BTreeMap::new(),
             pending_child_tid: child_tid.set.then_some(child_tid.address),
             signals,
             _thread_claim: thread_claim,
@@ -9680,6 +9734,43 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         });
         self.finish_output_outcome(result)
     }
+    fn host_select_set(&mut self) -> Option<carrick_el1_abi::ipc::RawOfdPin> {
+        self.runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .ok()?
+            .native()
+            .resources()
+            .host_select_sets
+            .get(&self.record)
+            .copied()
+    }
+    fn retain_host_select_set(&mut self, pin: carrick_el1_abi::ipc::RawOfdPin) -> bool {
+        let mut graph = self.runtime.graph.lock();
+        let Ok(row) = graph.owner.task_mut(self.key) else {
+            return false;
+        };
+        let sets = &mut row.native_mut().resources_mut().host_select_sets;
+        if sets.contains_key(&self.record) {
+            return false;
+        }
+        sets.insert(self.record, pin);
+        true
+    }
+    fn begin_host_set_enrol(
+        &mut self,
+        record: Box<[u8]>,
+        ordinal: carrick_guest_arch::NativeOrdinal,
+    ) -> Option<LifecycleOutcome> {
+        Some(
+            self.cross_host_set_enrol(record, ordinal)
+                .unwrap_or_else(|error| {
+                    self.run_failed(retention_failure(error).run_failure_reason())
+                }),
+        )
+    }
     fn take_map_source(
         &mut self,
         key: carrick_personality_linux::native_host_file::NativeMapKey,
@@ -9809,6 +9900,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     ) -> bool {
         if record != self.record || self.handoff.is_some() {
             return false;
+        }
+        // The exiting thread's host set ends with it (#2621).
+        let host_set = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task_mut(self.key)
+            .ok()
+            .and_then(|row| {
+                row.native_mut()
+                    .resources_mut()
+                    .host_select_sets
+                    .remove(&record)
+            });
+        if let Some(pin) = host_set {
+            self.service.release_host_select_set(pin);
         }
         if let Err(error) = self.service.vacate_terminal_space(self.source) {
             self.run_failure = Some(error.run_failure_reason());

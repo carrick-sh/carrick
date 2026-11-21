@@ -628,3 +628,133 @@ fn a_refused_member_lock_releases_the_epoll_and_keeps_the_item() {
     drop(held);
     assert_eq!(harvest(r, ep, 2).len(), 1, "the edge survived the refusal");
 }
+
+/// A host set item as the carrier enrols it: edge-triggered on every class.
+fn host_set_item(
+    r: &IpcRegion<'_>,
+    host_set: IpcObjectHandle,
+    fd: i32,
+    level: u32,
+) -> EpollItemRef {
+    let report = EpollReport {
+        events: IN | OUT | ET,
+        data: fd as u64,
+    };
+    let (item, _) = r
+        .epoll_add_host_socket(host_set, fd::Fd(fd), 0x2000 + fd as u64, report, 0, &Spin)
+        .unwrap();
+    let _ = r
+        .epoll_publish_host_socket(host_set, item, level, false, &Spin)
+        .unwrap();
+    item
+}
+
+fn probe(r: &IpcRegion<'_>, set: IpcObjectHandle, host_set: IpcObjectHandle) -> Vec<HostSetProbe> {
+    let mut probes = Vec::new();
+    r.epoll_host_members(set, &Spin, |named, probe| {
+        assert_eq!(named, host_set);
+        probes.push(probe);
+    })
+    .unwrap();
+    let guard = r.lock_epoll(host_set, &Spin).unwrap();
+    r.host_set_probe_locked(guard, set, &mut probes).unwrap();
+    probes
+}
+
+/// #2621: a select set's host member reads its level from the task's host
+/// set; a missing item (never enrolled, or retired at its file's last
+/// close) answers `None`, never a stale level.
+#[test]
+fn a_host_set_member_reads_its_level_from_the_host_set() {
+    let r = region();
+    let host_set = r.create_epoll(&Spin).unwrap();
+    let set = r.create_epoll(&Spin).unwrap();
+    let item = host_set_item(r, host_set, 5, OUT);
+    r.epoll_add_host_member(set, host_set, 5, 0x2000 + 5, 0x55, &Spin)
+        .unwrap();
+    r.epoll_add_host_member(set, host_set, 6, 0x2000 + 6, 0x66, &Spin)
+        .unwrap();
+    assert_eq!(
+        r.epoll_add_host_member(set, host_set, 5, 0x2000 + 5, 0, &Spin),
+        Err(EpollCtlError::Exists)
+    );
+    let mut answer = probe(r, set, host_set);
+    answer.sort_by_key(|probe| probe.fd);
+    assert_eq!(
+        answer,
+        [
+            HostSetProbe {
+                fd: 5,
+                file_key: 0x2000 + 5,
+                data: 0x55,
+                level: Some(OUT),
+            },
+            HostSetProbe {
+                fd: 6,
+                file_key: 0x2000 + 6,
+                data: 0x66,
+                level: None,
+            },
+        ]
+    );
+    // The file's last close retires its host-set item.
+    r.epoll_delete_host_socket(host_set, item, &Spin).unwrap();
+    assert!(
+        probe(r, set, host_set)
+            .iter()
+            .all(|probe| probe.level.is_none())
+    );
+    // A host member never reaches a harvest or a member list: destroying
+    // the select set frees it without touching the host set.
+    assert!(harvest(r, set, 4).is_empty());
+    r.epoll_destroy(set, &Spin).unwrap();
+    assert_eq!(r.epoll_zone_items(host_set, &Spin).unwrap(), 0);
+}
+
+/// #2621: a host edge that queues a host-set item wakes the select set the
+/// host set is nested in; a probe takes the queued edge, so the next edge
+/// wakes it again, and a set that ended is forgotten.
+#[test]
+fn a_host_set_edge_wakes_its_nest_parent_once_per_edge() {
+    let r = region();
+    let host_set = r.create_epoll(&Spin).unwrap();
+    let set = r.create_epoll(&Spin).unwrap();
+    let item = host_set_item(r, host_set, 5, 0);
+    r.epoll_add_host_member(set, host_set, 5, 0x2000 + 5, 0, &Spin)
+        .unwrap();
+    // Not nested yet: an edge queues the item but names no parent.
+    let wake = r
+        .epoll_publish_host_socket(host_set, item, IN, true, &Spin)
+        .unwrap()
+        .unwrap();
+    assert!(wake.epolls.is_empty());
+    let parent_seq = r.observe(set).unwrap().read;
+    assert_eq!(probe(r, set, host_set)[0].level, Some(IN));
+    // Nested and drained: the next edge wakes the parent.
+    let wake = r
+        .epoll_publish_host_socket(host_set, item, IN | OUT, true, &Spin)
+        .unwrap()
+        .unwrap();
+    assert_eq!(wake.epolls.iter().collect::<Vec<_>>(), [set]);
+    assert!(r.observe(set).unwrap().read > parent_seq);
+    // Still queued (no probe took it): a second edge owes nothing.
+    assert_eq!(
+        r.epoll_publish_host_socket(host_set, item, IN, true, &Spin)
+            .unwrap(),
+        None
+    );
+    // A sample after guest I/O moves the level without an edge.
+    assert_eq!(
+        r.epoll_publish_host_socket(host_set, item, 0, false, &Spin)
+            .unwrap(),
+        None
+    );
+    assert_eq!(probe(r, set, host_set)[0].level, Some(0));
+    // The parent ended: the next edge wakes no stale handle.
+    r.epoll_destroy(set, &Spin).unwrap();
+    let wake = r
+        .epoll_publish_host_socket(host_set, item, IN, true, &Spin)
+        .unwrap()
+        .unwrap();
+    assert!(wake.epolls.is_empty());
+}

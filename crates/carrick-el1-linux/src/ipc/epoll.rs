@@ -106,6 +106,40 @@ fn harvest<E: IpcExecution>(
     reports: &mut [EpollReport],
     taken: &mut [EpollItemRef],
 ) -> Harvest {
+    match with_locked(sched, region, epoll, operation, |tracked, guard| {
+        tracked.epoll_harvest_locked(guard, reports, taken, &EL1_WAIT)
+    }) {
+        Locked::Done(harvest) => Harvest::Ready(harvest),
+        Locked::WaitForRelease(operation, key, observed) => {
+            Harvest::WaitForRelease(operation, key, observed)
+        }
+        Locked::Refused => Harvest::Refused,
+    }
+}
+
+/// How a ring caller's lock of a zone epoll went ([`with_locked`]).
+pub(super) enum Locked<T> {
+    Done(T),
+    /// The carrier holds it: park `operation` on its release (the key and
+    /// the pre-probe observation), then run the step again.
+    WaitForRelease(IpcOperation, ObjectWaitKey, ObjectStateSnapshot),
+    Refused,
+}
+
+/// Run `step` under `epoll`'s lock. An epoll that holds carrier items is
+/// never spun on while the carrier holds it: contention is "not now", so
+/// the caller parks `operation` on the holder's release and reruns the
+/// step. Any other epoll's lock is a short ring section.
+pub(super) fn with_locked<E: IpcExecution, T>(
+    sched: &E,
+    region: &IpcRegion<'_>,
+    epoll: IpcObjectHandle,
+    operation: IpcOperation,
+    step: impl for<'r> FnOnce(
+        &IpcRegion<'r>,
+        carrick_el1_abi::ipc::IpcObjectGuard<'r>,
+    ) -> Result<T, IpcError>,
+) -> Locked<T> {
     use carrick_sched_core::refusal::{Attempt, ContentionSource, Refusal, ReleaseCause, Settled};
     let carrier = region.operation_slot_generation();
     let release = IpcLockIndex::object(epoll.index() as usize)
@@ -116,8 +150,9 @@ fn harvest<E: IpcExecution>(
         });
     let Some((index, source)) = release else {
         return region
-            .epoll_harvest(epoll, reports, taken, &EL1_WAIT)
-            .map_or(Harvest::Refused, Harvest::Ready);
+            .lock_epoll(epoll, &EL1_WAIT)
+            .and_then(|guard| step(region, guard))
+            .map_or(Locked::Refused, Locked::Done);
     };
     let adapter = EpollLockRelease {
         index,
@@ -147,15 +182,13 @@ fn harvest<E: IpcExecution>(
             Err(error) => Err(Attempt::Settled(Settled::Guest(error))),
         }
     }) {
-        Ok(guard) => tracked
-            .epoll_harvest_locked(guard, reports, taken, &EL1_WAIT)
-            .map_or(Harvest::Refused, Harvest::Ready),
+        Ok(guard) => step(&tracked, guard).map_or(Locked::Refused, Locked::Done),
         // SAFETY: the pinned syscall and the pre-probe revision are passed
         // directly to its scheduler park below. A raced park returns the
         // same operation for one immediate rerun. No guard crosses the park.
         Err(Refusal::Contended(ticket)) => unsafe {
             ticket.park_and_rerun(operation, |op, enrollment| {
-                Harvest::WaitForRelease(
+                Locked::WaitForRelease(
                     op,
                     enrollment.key(),
                     ObjectStateSnapshot::before_object_probe(enrollment.observed()),
@@ -163,7 +196,7 @@ fn harvest<E: IpcExecution>(
             })
         },
         Err(Refusal::Invariant(_)) => invalid(),
-        Err(Refusal::Guest(_)) => Harvest::Refused,
+        Err(Refusal::Guest(_)) => Locked::Refused,
     }
 }
 

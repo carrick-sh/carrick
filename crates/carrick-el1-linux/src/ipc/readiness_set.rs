@@ -25,23 +25,47 @@
 //! single-description protocol exactly; so does a full operation arena
 //! (`super::begin_readiness_operation`).
 //!
+//! A HOST descriptor (a host socket, or a host regular file) has no zone
+//! object to enrol on. Its readiness lives in the calling thread's HOST
+//! SET (#2621): a persistent epoll the native owner retains for the
+//! thread until it exits or execs, holding one carrier item per host
+//! member, enrolled once per open file through the carrier's host-socket
+//! epoll crossing (`HostFileOp::EpollSocketCtl` naming the host set). The
+//! transient set nests it: each host descriptor is one
+//! [`EpollMember::HostSetMember`] item naming the host set, and every probe
+//! reads the members' sampled levels under the host set's lock and makes
+//! the transient set the host set's nest parent, so a carrier edge on any
+//! member wakes the transient set's `Readable` lane: the same park, no
+//! polling. Zone members keep their own items and lanes. The host set
+//! holds carrier items, so its lock is never spun on while the carrier
+//! holds it: the call parks on the holder's release and probes again
+//! ([`super::epoll::with_locked`]).
+//!
+//! A host member the host set holds no item for (its first select, or its
+//! file was closed and reopened) is enrolled before the call answers: the
+//! call releases everything, asks the native owner to cross the enrolment
+//! ([`UserCopy::request_host_set_enrol`]) and runs again from its entry.
+//! The carrier refuses a host kind that is neither a socket nor a regular
+//! file, which leaves the whole call a counted ENOSYS.
+//!
 //! Scope: every selected descriptor must be a zone object an epoll can
-//! hold (pipe ends, eventfds, stream ends). A host-backed descriptor, a
-//! nested epoll, or a member already watched by
-//! [`carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS`] epolls leaves the call
-//! unrouted before any effect, as before; mixed host and zone sets are
-//! #1886's composition.
+//! hold (pipe ends, eventfds, stream ends) or a host descriptor of a fork
+//! descendant (the run root keeps its host route). A nested epoll, a member already watched by
+//! [`carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS`] epolls, or a host
+//! descriptor without a native owner leaves the call unrouted before any
+//! effect.
 
 extern crate alloc;
 
+use super::epoll::{Locked, with_locked};
 use super::{
     Begun, EL1_WAIT, IpcExecution, IpcServed, IpcVenue, Parked, PollOutput, SELECT_INTERESTS,
-    SelectReady, UserCopy, begin_readiness_operation, finish, mm_key, native_select_output, park,
-    poll_result, release_pin, select_ready, snapshot, task_key,
+    SelectReady, UserCopy, begin_readiness_operation, finish, mm_key, native_select_output,
+    park_key, poll_result, release_pin, select_ready, snapshot, task_key,
 };
 use crate::dispatch::GuestDispatchFrame;
 use alloc::vec::Vec;
-use carrick_el1_abi::ipc::epoll::{EpollItemRef, EpollMember, EpollReport, events};
+use carrick_el1_abi::ipc::epoll::{EpollItemRef, EpollMember, EpollReport, HostSetProbe, events};
 use carrick_el1_abi::ipc::fd::{
     AccessMode, Description, Error as FdError, Fd, StatusFlags, TableId,
 };
@@ -51,6 +75,7 @@ use carrick_el1_abi::ipc::{
     IpcRegion, IpcSelectOutput, IpcUserVa, OfdPin,
 };
 use carrick_sched_core::LockWait;
+use carrick_sched_core::object_wait::{ObjectStateSnapshot, ObjectWaitKey};
 use carrick_syscall_abi::LinuxErrno;
 
 /// One transient item's `data` word: the descriptor, the select classes it
@@ -234,7 +259,7 @@ pub(super) fn serve<E: IpcExecution, M: UserCopy>(
 ) -> IpcServed {
     let region = &venue.region;
     loop {
-        let (pin, epoll) = match build(sched, region, table, &call) {
+        let (pin, epoll) = match build(sched, region, user, table, &call) {
             Ok(built) => built,
             Err(Build::Errno(errno)) => return poll_result(frame, errno.guest_retval()),
             Err(Build::Unrouted) => return IpcServed::Forward,
@@ -301,13 +326,35 @@ pub(super) fn resume<E: IpcExecution, M: UserCopy>(
     })
 }
 
-/// Make the transient epoll and enrol every selected descriptor on it.
-fn build<E: IpcExecution>(
+/// The calling thread's host set: the one its native owner retains, or a
+/// new one it retains from now on. `None`: no native owner retains one.
+fn host_set<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     region: &IpcRegion<'_>,
-    table: TableId,
-    call: &SetCall,
-) -> Result<(OfdPin, IpcObjectHandle), Build> {
+    user: &mut M,
+) -> Option<IpcObjectHandle> {
+    if let Some(raw) = user.host_select_set() {
+        let pin = OfdPin::from_raw(raw);
+        let description = region.fd(EL1_WAIT).pinned(&pin);
+        let _ = pin.into_raw();
+        return match IpcBacking::decode(description.ok()?.backing)? {
+            IpcBacking::Epoll { object } => Some(object),
+            _ => None,
+        };
+    }
+    let (pin, epoll) = new_epoll(region).ok()?;
+    let raw = pin.into_raw();
+    if user.retain_host_select_set(raw) {
+        Some(epoll)
+    } else {
+        // Unretained: this release destroys it.
+        release_pin(sched, OfdPin::from_raw(raw), region);
+        None
+    }
+}
+
+/// An epoll whose only reference is the returned pinned description.
+fn new_epoll(region: &IpcRegion<'_>) -> Result<(OfdPin, IpcObjectHandle), Build> {
     let epoll = loop {
         let seen = region.object_count();
         match region.create_epoll(&EL1_WAIT) {
@@ -321,19 +368,29 @@ fn build<E: IpcExecution>(
         }
     };
     let backing = IpcBacking::Epoll { object: epoll }.encode();
-    let authority = region.fd(EL1_WAIT);
-    let pin = match authority.create_pinned(Description::new(
+    match region.fd(EL1_WAIT).create_pinned(Description::new(
         backing,
         AccessMode::ReadWrite,
         StatusFlags::default(),
     )) {
-        Ok(pin) => pin,
+        Ok(pin) => Ok((pin, epoll)),
         Err(_) => {
             let _ = region.release_backing(backing, &super::Finish);
-            return Err(Build::Unrouted);
+            Err(Build::Unrouted)
         }
-    };
-    match enrol(sched, region, table, call, epoll) {
+    }
+}
+
+/// Make the transient epoll and enrol every selected descriptor on it.
+fn build<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    region: &IpcRegion<'_>,
+    user: &mut M,
+    table: TableId,
+    call: &SetCall,
+) -> Result<(OfdPin, IpcObjectHandle), Build> {
+    let (pin, epoll) = new_epoll(region)?;
+    match enrol(sched, region, user, table, call, epoll) {
         Ok(()) => Ok((pin, epoll)),
         Err(refused) => {
             // The description's final release destroys the epoll and
@@ -344,15 +401,17 @@ fn build<E: IpcExecution>(
     }
 }
 
-fn enrol<E: IpcExecution>(
+fn enrol<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     region: &IpcRegion<'_>,
+    user: &mut M,
     table: TableId,
     call: &SetCall,
     epoll: IpcObjectHandle,
 ) -> Result<(), Build> {
     let authority = region.fd(EL1_WAIT);
     let words = call.layout.words as usize;
+    let mut hosts = None;
     for index in 0..words {
         let mut any = call.sets[index] | call.sets[words + index] | call.sets[2 * words + index];
         while any != 0 {
@@ -379,36 +438,140 @@ fn enrol<E: IpcExecution>(
             };
             let key = pin.key();
             let file_key = (u64::from(key.index) << 32) | (key.generation & u64::from(u32::MAX));
-            let added = IpcBacking::decode(description.backing)
-                .and_then(EpollMember::of_backing)
-                .map(|(member, kind)| {
-                    region.epoll_add(
-                        epoll,
-                        member,
-                        kind,
-                        fd,
-                        file_key,
-                        select_events(interest),
-                        SetWord {
-                            fd,
-                            interest,
-                            ready: 0,
-                        }
-                        .to_raw(),
-                        &EL1_WAIT,
-                    )
-                });
+            let word = SetWord {
+                fd,
+                interest,
+                ready: 0,
+            }
+            .to_raw();
+            let backing = IpcBacking::decode(description.backing);
             // The item holds the member by generation; its last close
             // detaches the item, as for any epoll.
             release_pin(sched, pin, region);
+            let added = match backing {
+                // The run root keeps its host route for a host descriptor:
+                // the call stays unrouted, as before #2621.
+                Some(IpcBacking::Host(_))
+                    if user.service_origin()
+                        != carrick_core_abi::service::ServiceOrigin::Descendant =>
+                {
+                    false
+                }
+                Some(IpcBacking::Host(_)) => {
+                    // A host member reads its level from the thread's host
+                    // set, made once per call.
+                    let host_set = match hosts {
+                        Some(host_set) => host_set,
+                        None => host_set(sched, region, user).ok_or(Build::Unrouted)?,
+                    };
+                    hosts = Some(host_set);
+                    region
+                        .epoll_add_host_member(epoll, host_set, fd, file_key, word, &EL1_WAIT)
+                        .is_ok()
+                }
+                backing => {
+                    backing
+                        .and_then(EpollMember::of_backing)
+                        .is_some_and(|(member, kind)| {
+                            region
+                                .epoll_add(
+                                    epoll,
+                                    member,
+                                    kind,
+                                    fd,
+                                    file_key,
+                                    select_events(interest),
+                                    word,
+                                    &EL1_WAIT,
+                                )
+                                .is_ok()
+                        })
+                }
+            };
             // An already-ready member queued its item on an epoll nobody
             // waits on yet: the harvest below reports it.
-            if !matches!(added, Some(Ok(_))) {
+            if !added {
                 return Err(Build::Unrouted);
             }
         }
     }
     Ok(())
+}
+
+/// What one probe of a set's host members found.
+enum HostProbe {
+    /// The host members' select classes (empty: none is ready).
+    Ready(Vec<SelectReady>),
+    /// The host set holds no item for this member: enrol it.
+    Missing {
+        host_set: IpcObjectHandle,
+        fd: i32,
+    },
+    /// The carrier holds the host set: park on its release, then probe again.
+    WaitForRelease(IpcOperation, ObjectWaitKey, ObjectStateSnapshot),
+    Refused,
+}
+
+/// Read the set's host members' levels from the host set they name, and
+/// nest the host set in this set (see the module docs).
+fn probe_hosts<E: IpcExecution>(
+    sched: &E,
+    region: &IpcRegion<'_>,
+    epoll: IpcObjectHandle,
+    op: IpcOperation,
+) -> HostProbe {
+    let mut probes = Vec::new();
+    let mut named = None;
+    let mut refused = false;
+    if region
+        .epoll_host_members(epoll, &EL1_WAIT, |host_set, probe| {
+            refused |= named.replace(host_set).is_some_and(|seen| seen != host_set)
+                || probes.try_reserve(1).is_err();
+            if !refused {
+                probes.push(probe);
+            }
+        })
+        .is_err()
+        || refused
+    {
+        return HostProbe::Refused;
+    }
+    let Some(host_set) = named else {
+        return HostProbe::Ready(Vec::new());
+    };
+    match with_locked(sched, region, host_set, op, |tracked, guard| {
+        tracked.host_set_probe_locked(guard, epoll, &mut probes)
+    }) {
+        Locked::Done(()) => {}
+        Locked::WaitForRelease(op, key, observed) => {
+            return HostProbe::WaitForRelease(op, key, observed);
+        }
+        Locked::Refused => return HostProbe::Refused,
+    }
+    let mut ready = Vec::new();
+    for HostSetProbe {
+        fd, data, level, ..
+    } in probes
+    {
+        let Some(level) = level else {
+            return HostProbe::Missing { host_set, fd };
+        };
+        let word = SetWord::from_raw(data);
+        let classes = select_ready(
+            word.interest,
+            level & (select_events(word.interest) | events::ALWAYS),
+        );
+        if classes != 0 {
+            if ready.try_reserve(1).is_err() {
+                return HostProbe::Refused;
+            }
+            ready.push(SelectReady {
+                fd: word.fd,
+                ready: classes,
+            });
+        }
+    }
+    HostProbe::Ready(ready)
 }
 
 /// Probe and park until the set answers, its deadline passes or a signal
@@ -422,7 +585,7 @@ fn wait<E: IpcExecution, M: UserCopy>(
     user: &mut M,
     output: &mut Option<PollOutput>,
     keep_sigmask: &mut bool,
-    op: IpcOperation,
+    mut op: IpcOperation,
     mut token: Option<IpcOpToken>,
     sigmask: &mut Option<u64>,
 ) -> Option<IpcServed> {
@@ -432,35 +595,67 @@ fn wait<E: IpcExecution, M: UserCopy>(
         None => release_pin(sched, OfdPin::from_raw(op.pin), region),
     };
     loop {
-        // Before the harvest: an item queued after it moves this snapshot.
+        // Before every probe: an item queued (or a host edge published)
+        // after it moves this snapshot.
         let snap = snapshot(sched, epoll, WaitFor::Readable);
-        let ready = match harvest_ready(region, epoll, &EL1_WAIT) {
-            Ok(ready) => ready,
-            Err(_) => {
+        // The host members first: a host set the carrier holds is waited
+        // for before any zone report is taken.
+        let (hosts, lock_wait) = match probe_hosts(sched, region, epoll, op) {
+            HostProbe::Ready(hosts) => (hosts, None),
+            HostProbe::Missing { host_set, fd } => {
+                // Enrol it, then run the exact call again.
+                retire(sched, token, &op);
+                let _ = user.request_host_set_enrol(host_set.to_word(), fd);
+                return Some(IpcServed::Forward);
+            }
+            HostProbe::WaitForRelease(back, key, observed) => {
+                op = back;
+                (Vec::new(), Some((key, observed)))
+            }
+            HostProbe::Refused => {
                 retire(sched, token, &op);
                 return Some(IpcServed::Forward);
             }
         };
         let deadline = op.deadline;
-        if !ready.is_empty() || deadline.get().is_some_and(|end| sched.now() >= end) {
-            retire(sched, token, &op);
-            let result = ready
-                .iter()
-                .map(|entry| i64::from(entry.ready.count_ones()))
-                .sum();
-            return Some(
-                match native_select_output(op.select, op.buf, sched, &ready, deadline, result) {
-                    Ok(answer) => {
-                        *output = Some(answer);
-                        poll_result(frame, result)
-                    }
-                    Err(errno) => poll_result(frame, errno.guest_retval()),
-                },
-            );
-        }
-        let Some(snap) = snap else {
-            retire(sched, token, &op);
-            return Some(IpcServed::Forward);
+        let (key, snap, park_deadline) = if let Some((key, observed)) = lock_wait {
+            // The lock is short-lived and precedes any readiness decision.
+            // Its wake probes again with the original absolute expiry.
+            (key, observed, None)
+        } else {
+            let mut ready = match harvest_ready(region, epoll, &EL1_WAIT) {
+                Ok(ready) => ready,
+                Err(_) => {
+                    retire(sched, token, &op);
+                    return Some(IpcServed::Forward);
+                }
+            };
+            if ready.try_reserve(hosts.len()).is_err() {
+                retire(sched, token, &op);
+                return Some(IpcServed::Forward);
+            }
+            ready.extend(hosts);
+            if !ready.is_empty() || deadline.get().is_some_and(|end| sched.now() >= end) {
+                retire(sched, token, &op);
+                let result = ready
+                    .iter()
+                    .map(|entry| i64::from(entry.ready.count_ones()))
+                    .sum();
+                return Some(
+                    match native_select_output(op.select, op.buf, sched, &ready, deadline, result) {
+                        Ok(answer) => {
+                            *output = Some(answer);
+                            poll_result(frame, result)
+                        }
+                        Err(errno) => poll_result(frame, errno.guest_retval()),
+                    },
+                );
+            }
+            let (Some(snap), Some(key)) = (snap, super::wait_key(epoll, WaitFor::Readable)) else {
+                retire(sched, token, &op);
+                return Some(IpcServed::Forward);
+            };
+            (key, snap, deadline.get())
         };
         // Armed once before admission and park, so the post-enrollment
         // probe observes the temporary mask and a retry never re-arms.
@@ -478,17 +673,16 @@ fn wait<E: IpcExecution, M: UserCopy>(
                 Begun::Rerun => return None,
             },
         };
-        match park(
+        match park_key(
             sched,
             frame,
             region,
             admitted,
             op,
-            epoll,
-            WaitFor::Readable,
+            key,
             snap,
-            deadline.get(),
-            &mut || user.interrupt_pending_wait(),
+            park_deadline,
+            Some(&mut || user.interrupt_pending_wait()),
         ) {
             Parked::Done(served) => {
                 *keep_sigmask = true;

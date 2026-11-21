@@ -381,6 +381,20 @@ pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
     }
 }
 
+/// Release a pin a native owner retained outside any call: a thread's host
+/// set (#2621), at the thread's exit or its process's exec or exit. A host
+/// set that held carrier items is released by the carrier (its final
+/// release retires their registrations), as a closed descriptor's is.
+pub fn release_retained_pin(
+    region: &IpcRegion<'_>,
+    pin: carrick_el1_abi::ipc::RawOfdPin,
+    task: &CurrentTask,
+) -> Result<(), carrick_el1_abi::ipc::IpcError> {
+    let release = unpin_in_ring(region, OfdPin::from_raw(pin))
+        .map_err(|_| carrick_el1_abi::ipc::IpcError::Stale)?;
+    settle_native_release::<carrick_sched_core::ThreadCtx>(region, release, None, task)
+}
+
 /// Tables resolved through the host-published [`IpcTableMap`], keyed by the
 /// running task's host file table (which an EL1 switch-in updates): a table
 /// with no entry is not served.
@@ -806,6 +820,51 @@ fn read_select_interest(
     })
 }
 
+/// A select naming one HOST descriptor (apt's connect wait,
+/// `pselect6(s + 1, NULL, {s}, ...)`) is served by the set owner, as every
+/// set with a host member is (#2621): its readiness lives in the thread's
+/// host set, never on a zone object's lane.
+fn host_single_to_set<W: LockWait>(
+    interest: SelectInterest,
+    authority: &carrick_el1_abi::ipc::IpcFdAuthority<'_, W>,
+    table: TableId,
+    words: u32,
+    user: &impl UserCopy,
+) -> SelectInterest {
+    let SelectInterest::One(pollfd) = interest else {
+        return interest;
+    };
+    // The run root keeps its host route for a host descriptor.
+    if user.service_origin() != carrick_core_abi::service::ServiceOrigin::Descendant {
+        return SelectInterest::One(pollfd);
+    }
+    let host = authority
+        .get(table, Fd(pollfd.fd))
+        .is_ok_and(|description| {
+            matches!(
+                IpcBacking::decode(description.backing),
+                Some(IpcBacking::Host(_))
+            )
+        });
+    let words = words as usize;
+    let mut sets = alloc::vec::Vec::new();
+    if !host
+        || sets
+            .try_reserve_exact(words * SELECT_INTERESTS.len())
+            .is_err()
+    {
+        return SelectInterest::One(pollfd);
+    }
+    sets.resize(words * SELECT_INTERESTS.len(), 0);
+    let (index, bit) = (pollfd.fd as usize / 64, pollfd.fd as usize % 64);
+    for (set, interest) in SELECT_INTERESTS.into_iter().enumerate() {
+        if pollfd.events & interest != 0 {
+            sets[set * words + index] |= 1 << bit;
+        }
+    }
+    SelectInterest::Many(sets)
+}
+
 /// Linux select readiness classes, including EOF as readable and a
 /// pending pipe error as writable. Returns one bit per ready set.
 pub fn select_ready(requested: i16, level: u32) -> i16 {
@@ -1214,7 +1273,11 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 let Ok(capacity) = authority.backing_capacity(table) else {
                     return IpcServed::Forward;
                 };
-                match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user) {
+                match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user).map(
+                    |interest| {
+                        host_single_to_set(interest, &authority, table, layout.words, &*user)
+                    },
+                ) {
                     Ok(SelectInterest::One(decoded)) => pollfd = decoded,
                     Ok(SelectInterest::None) => return IpcServed::Forward,
                     Ok(SelectInterest::Many(sets)) => {
@@ -1317,7 +1380,11 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 let Ok(capacity) = authority.backing_capacity(table) else {
                     return IpcServed::Forward;
                 };
-                match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user) {
+                match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user).map(
+                    |interest| {
+                        host_single_to_set(interest, &authority, table, layout.words, &*user)
+                    },
+                ) {
                     Ok(SelectInterest::One(decoded)) => pollfd = decoded,
                     Ok(SelectInterest::None) => return IpcServed::Forward,
                     Ok(SelectInterest::Many(sets)) => {

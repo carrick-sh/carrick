@@ -2841,6 +2841,11 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         )
         .unwrap_or_else(|_| fatal());
     }
+    fn release_host_select_set(&mut self, pin: carrick_el1_abi::ipc::RawOfdPin) {
+        if let Some((region, _)) = self.crossing.ipc_binding() {
+            super::ipc::release_retained_pin(&region, pin, self.task).unwrap_or_else(|_| fatal());
+        }
+    }
 }
 
 pub fn cross_root_exit<X: ForkStockCrossing>(

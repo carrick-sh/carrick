@@ -275,6 +275,10 @@ pub(crate) struct OwnerCopy<'a, 'p, 'ipc, U, C: carrick_core_abi::EntryContext> 
         Option<&'a mut (dyn carrick_personality_linux::lifecycle::ProcessNative<'ipc, C> + 'p)>,
     pub wait: Option<carrick_core::mm::transaction::CopyoutRequest>,
     pub input_wait: Option<carrick_core::user_copy::GuestCopyRequest>,
+    /// A select set's host member to enrol before the call runs again
+    /// (#2621): its host set's object handle word and the descriptor. The
+    /// entry crosses it after the owner returned `Forward`.
+    pub host_enrol: Option<(u64, i32)>,
 }
 impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, '_, '_, U, C> {
     fn service_origin(&self) -> carrick_core_abi::service::ServiceOrigin {
@@ -362,6 +366,21 @@ impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, 
     }
     fn take_accepted_epoll_wait(&mut self) -> Option<carrick_core_abi::wait::AcceptedWait> {
         self.owner.as_deref_mut()?.take_accepted_epoll_wait()
+    }
+    fn host_select_set(&mut self) -> Option<carrick_el1_abi::ipc::RawOfdPin> {
+        self.owner.as_deref_mut()?.host_select_set()
+    }
+    fn retain_host_select_set(&mut self, pin: carrick_el1_abi::ipc::RawOfdPin) -> bool {
+        self.owner
+            .as_deref_mut()
+            .is_some_and(|owner| owner.retain_host_select_set(pin))
+    }
+    fn request_host_set_enrol(&mut self, set: u64, fd: i32) -> bool {
+        if self.owner.is_none() {
+            return false;
+        }
+        self.host_enrol = Some((set, fd));
+        true
     }
 }
 

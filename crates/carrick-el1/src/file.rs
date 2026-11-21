@@ -413,6 +413,28 @@ pub trait UserCopy {
         false
     }
 
+    /// The calling thread's host set (#2621): the raw pin of the epoll
+    /// description its select sets nest for their host members, retained
+    /// by the native owner until the thread exits or execs. `None`: none
+    /// yet, or no native owner.
+    fn host_select_set(&mut self) -> Option<carrick_el1_abi::ipc::RawOfdPin> {
+        None
+    }
+
+    /// Give the native owner the calling thread's new host set pin. `false`:
+    /// no native owner retains one (the caller releases the pin).
+    fn retain_host_select_set(&mut self, _pin: carrick_el1_abi::ipc::RawOfdPin) -> bool {
+        false
+    }
+
+    /// Ask the native owner to enrol descriptor `fd` in the host set `set`
+    /// (its IPC object handle word), then run the exact call again. The
+    /// caller has released everything it held and returns `Forward`.
+    /// `false`: no native owner (the call stays unrouted).
+    fn request_host_set_enrol(&mut self, _set: u64, _fd: i32) -> bool {
+        false
+    }
+
     /// Copy `src` to the user buffer at `dst_va`.
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool;
     /// Fill `dst` from the user buffer at `src_va`.

@@ -191,6 +191,18 @@ impl IpcObjectHandle {
             generation: raw.generation,
         }
     }
+    /// One word for a record field that names an object: the index in the
+    /// high half, the generation in the low half.
+    pub const fn to_word(self) -> u64 {
+        ((self.index as u64) << 32) | self.generation as u64
+    }
+    /// Rebuild from [`Self::to_word`]; every use still checks the generation.
+    pub const fn from_word(word: u64) -> Self {
+        Self {
+            index: (word >> 32) as u32,
+            generation: word as u32,
+        }
+    }
 }
 
 /// The shared queue identity for one readiness direction of an IPC incarnation.
