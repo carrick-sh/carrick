@@ -48,6 +48,7 @@ const A64_NOP: u32 = 0xd503_201f;
 
 const NR_OPENAT: u64 = 56;
 const NR_CLOSE: u64 = 57;
+const NR_PIPE2: u64 = 59;
 const NR_READ: u64 = 63;
 const NR_WRITE: u64 = 64;
 const NR_FSTAT: u64 = 80;
@@ -796,6 +797,66 @@ impl ExecuteBlock for SequenceHvc2Executor {
             Terminator::Conditional { .. } => Err("unexpected conditional terminator".to_owned()),
         }
     }
+}
+
+/// A kernel-raised `SIGPIPE` with its default disposition must take its
+/// default action (terminate) at the guest's return from `write`, never be
+/// left pending while the guest runs on (#2696).
+#[test]
+fn soft_single_process_pending_kernel_sigpipe_takes_default_death() {
+    let _test_guard = lock_soft_carrier_test();
+    let calls = vec![
+        (NR_PIPE2, [DATA_VA + 0x400, 0, 0, 0, 0, 0]),
+        (NR_CLOSE, [3, 0, 0, 0, 0, 0]),
+        (NR_WRITE, [4, DATA_VA, 1, 0, 0, 0]),
+        (NR_EXIT_GROUP, [0; 6]),
+    ];
+    let code_words = vec![A64_SVC_0; calls.len()];
+    let elf = build_witness_elf(&code_words, &[(0, b"x")]);
+
+    let mailbox_slot = Arc::new(AtomicPtr::new(null_mut()));
+    let returns = Arc::new(Mutex::new(Vec::new()));
+    let executor = SequenceHvc2Executor {
+        mailbox: Arc::clone(&mailbox_slot),
+        calls,
+        returns: Arc::clone(&returns),
+        next_seq: 1,
+    };
+    let config = SoftSingleProcessConfig::new(&elf, "/sigpipe-default");
+    let mb_for_setup = Arc::clone(&mailbox_slot);
+    let run = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
+        let mut vec_stub = [0u8; 8];
+        vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+        vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+        engine
+            .backend()
+            .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+            .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+        let ptr = engine
+            .backend()
+            .host_ptr(
+                LINUX_SYSCALL_MAILBOX_BASE,
+                AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+        mb_for_setup.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+        Ok(())
+    })
+    .expect("SIGPIPE run should end in signal death through the production kernel");
+
+    let pipe_fds = run
+        .engine
+        .read_bytes(DATA_VA + 0x400, 8)
+        .expect("read pipe2 descriptors");
+    assert_eq!(pipe_fds, [3, 0, 0, 0, 4, 0, 0, 0]);
+    assert_eq!(
+        run.exit_code,
+        128 + carrick_abi::LINUX_SIGPIPE,
+        "default SIGPIPE must terminate the process at the write's return"
+    );
+    assert_eq!(run.terminating_fault, None);
+    assert_eq!(*returns.lock().expect("lock returns"), vec![0, 0]);
+    assert_eq!(run.syscalls_dispatched, 3);
 }
 
 #[test]
