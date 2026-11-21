@@ -1,6 +1,11 @@
 /* Production fork-child exec witness. The successor is a real static ELF.
  * Exit with the exec errno if replacement returns; parent propagates status. */
 .global _start
+#ifdef EXEC_FD_CLOEXEC
+.equ exec_fd_flags, 0x80000 /* O_CLOEXEC */
+#else
+.equ exec_fd_flags, 0
+#endif
 .text
 _start:
     mov $57, %eax
@@ -26,7 +31,7 @@ child:
     /* Open with the child's ring table and give the path a fixed fd. */
     mov $-100, %edi
     lea successor(%rip), %rsi
-    xor %edx, %edx
+    mov $exec_fd_flags, %edx
     mov $257, %eax
     syscall
     test %eax, %eax
@@ -35,11 +40,21 @@ child:
     mov $43, %esi
     cmp %esi, %edi
     je have_fd
+    mov $exec_fd_flags, %edx
     mov $292, %eax
     syscall
     cmp $43, %eax
     jne failure
 have_fd:
+#ifdef EXEC_FD_CLOEXEC
+    /* Verify the descriptor named by fd_path still has FD_CLOEXEC. */
+    mov $43, %edi
+    mov $1, %esi /* F_GETFD */
+    mov $72, %eax
+    syscall
+    cmp $1, %eax /* FD_CLOEXEC */
+    jne failure
+#endif
     lea fd_path(%rip), %rdi
 #else
     lea successor(%rip), %rdi

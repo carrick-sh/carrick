@@ -490,8 +490,12 @@ fn production_child_execs_through_its_proc_fd_path() {
     let marker = kvm_pool_fixture::assemble_fixture("native_exec_marker.S", &[]);
     carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
     let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
-    let caller =
-        kvm_pool_fixture::assemble_fixture("native_fork_exec.S", &[&define, "-DEXEC_FD_PATH"]);
+    check_child_exec_through_proc_fd(&[&define, "-DEXEC_FD_PATH"]);
+    check_child_exec_through_proc_fd(&[&define, "-DEXEC_FD_PATH", "-DEXEC_FD_CLOEXEC"]);
+}
+
+fn check_child_exec_through_proc_fd(defines: &[&str]) {
+    let caller = kvm_pool_fixture::assemble_fixture("native_fork_exec.S", defines);
     let program =
         carrick_mem::elf::ElfProgram::load(&caller, 62, &|_| None).expect("exec caller ELF");
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
@@ -508,7 +512,7 @@ fn production_child_execs_through_its_proc_fd_path() {
     assert_eq!(
         (outcome.run.exit_code, outcome.run.stdout.as_slice()),
         (0, b"X\n".as_slice()),
-        "the child should run the successor: 38 is ENOSYS, 91 is a setup failure"
+        "{defines:?}: the child should run the successor (38=ENOSYS, 91=setup failure)"
     );
     assert!(outcome.run.stderr.is_empty());
     let census = outcome
