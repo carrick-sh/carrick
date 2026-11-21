@@ -1091,6 +1091,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         let copied = self.copy_user_bytes(mm, address, bytes);
         #[cfg(feature = "test-support")]
         if copied.is_ok() {
+            crate::test_support::hold_armed_owned_publication(bytes);
             crate::test_support::record_owned_copy_done();
         }
         copied
