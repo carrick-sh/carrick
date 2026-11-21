@@ -30,7 +30,7 @@ pub fn schedule(slot: SlotId) -> ! {
     #[cfg(feature = "test-support")]
     crate::test_support::release_fork_commit_on_park(source);
     settle_current_work(current);
-    loop {
+    'schedule: loop {
         #[cfg(feature = "test-support")]
         crate::test_support::hold_idle_scan(slot);
         #[cfg(feature = "test-support")]
@@ -61,41 +61,35 @@ pub fn schedule(slot: SlotId) -> ! {
             if source.zone.installed_space(slot) != mm_raw {
                 leave_space(source);
             }
-            if source.zone.install_space(slot, mm_raw).is_none() {
+            // A raised Gate (the host's exclusion of this MM) refuses the
+            // install: this is "not now". Enrol on the Gate's release, probe
+            // once, and either park the record or rerun the install.
+            let mut metadata_consumed = false;
+            while source.zone.install_space(slot, mm_raw).is_none() {
                 if source.zone.spaces.find(mm_raw).is_none() {
                     fatal_boot();
                 }
-                let rec = source.zone.record(selected.record);
-                // SAFETY: switch_in_full gave this slot exclusive ownership of
-                // `selected.record`; consuming a metadata token leaves no
-                // semantic operation behind if we re-park on `Gate`.
-                let can_park_gate = selected.result.is_none()
-                    && unsafe { rec.consume_metadata_operation() || !rec.has_object_operation() };
-                if can_park_gate {
-                    current.mm.key.store(mm_raw, Ordering::Release);
-                    match crate::anonymous::park_contended_fault(
-                        current,
-                        slot,
-                        carrick_sched_core::spaces::notification::SpaceWaitCause::Gate,
-                        &state.words,
-                    ) {
-                        crate::anonymous::ContendedFault::Parked => continue,
-                        crate::anonymous::ContendedFault::Rerun => {}
-                        crate::anonymous::ContendedFault::Refused => fatal_boot(),
-                    }
-                    if source.zone.install_space(slot, mm_raw).is_none() {
+                match park_on_gate(
+                    source,
+                    current,
+                    slot,
+                    selected,
+                    mm_raw,
+                    metadata_consumed,
+                    &mut state.words,
+                ) {
+                    GatePark::Parked => continue 'schedule,
+                    GatePark::Rerun { metadata } => metadata_consumed |= metadata,
+                    GatePark::Held => {
+                        // An adapter or edit operation is pending: its wait
+                        // state cannot ride an object park unchanged, so the
+                        // record goes back to its queue as it is (#2660).
                         if !source.zone.unswitch(slot, selected.record) {
                             fatal_boot();
                         }
                         core::hint::spin_loop();
-                        continue;
+                        continue 'schedule;
                     }
-                } else {
-                    if !source.zone.unswitch(slot, selected.record) {
-                        fatal_boot();
-                    }
-                    core::hint::spin_loop();
-                    continue;
                 }
             }
             settle_current_work(current);
@@ -217,7 +211,10 @@ pub fn schedule(slot: SlotId) -> ! {
                                 state = replaced;
                             }
                             Some(_) => {
-                                if !metadata_resume && let Some(result) = selected.result {
+                                if !metadata_resume
+                                    && !metadata_consumed
+                                    && let Some(result) = selected.result
+                                {
                                     words.set_syscall_return(result);
                                 }
                             }
@@ -426,4 +423,51 @@ fn ticks(backend: &mut x86::X86Backend, ns: u64) -> u64 {
         .raw()
         .get();
     u64::try_from(u128::from(hz) * u128::from(ns) / 1_000_000_000).unwrap_or(u64::MAX)
+}
+
+/// What a switched-in record does when its MM's Gate refuses the install.
+enum GatePark {
+    /// The record waits on the Gate's release; this CPU schedules again.
+    Parked,
+    /// The release raced the enrolment: install again. `metadata` records a
+    /// consumed metadata wait, whose resume must keep the context's RAX.
+    Rerun { metadata: bool },
+    /// A pending adapter or edit operation cannot ride an object park.
+    Held,
+}
+
+/// Park a switched-in record on its MM's Gate release. Its pending wake rides
+/// in the parked context: a metadata wait is consumed (the saved context is
+/// its replay), and a wake result is folded into the return word, which the
+/// Gate park's metadata resume leaves untouched.
+#[inline(never)]
+fn park_on_gate(
+    source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+    current: &'static carrick_el1_abi::CurrentTask,
+    slot: SlotId,
+    selected: carrick_sched_core::SwitchedIn,
+    mm: u64,
+    metadata_consumed: bool,
+    words: &mut carrick_sched_core::ParkedContextWords,
+) -> GatePark {
+    let rec = source.zone.record(selected.record);
+    // SAFETY: switch_in_full gave this slot exclusive ownership of the record.
+    let metadata = metadata_consumed || unsafe { rec.consume_metadata_operation() };
+    if !metadata && rec.has_object_operation() {
+        return GatePark::Held;
+    }
+    if !metadata && let Some(result) = selected.result {
+        words.set_syscall_return(result);
+    }
+    current.mm.key.store(mm, Ordering::Release);
+    match crate::anonymous::park_contended_fault(
+        current,
+        slot,
+        carrick_sched_core::spaces::notification::SpaceWaitCause::Gate,
+        words,
+    ) {
+        crate::anonymous::ContendedFault::Parked => GatePark::Parked,
+        crate::anonymous::ContendedFault::Rerun => GatePark::Rerun { metadata },
+        crate::anonymous::ContendedFault::Refused => fatal_boot(),
+    }
 }
