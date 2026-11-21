@@ -2122,6 +2122,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "ringclockchild": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "case_ring_clock_child_raw_syscalls"
+  },
   "rlimitasdata": {
     "class": "conformance",
     "excluded": false,
