@@ -1393,17 +1393,17 @@ fn dispatch_classified_fault<
     counters.fault_taken.fetch_add(1, Ordering::Relaxed);
     if fault == FaultClass::WritePermission {
         let Some(task) = current_task else {
-            return Action::Forward;
+            { PROBE_SITE.store(1396, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
         };
         let mm_key = task.mm.key.load(Ordering::Acquire);
         if mm_key == 0 {
-            return Action::Forward;
+            { PROBE_SITE.store(1400, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
         };
         let Some(index) = spaces.find(mm_key) else {
-            return Action::Forward;
+            { PROBE_SITE.store(1403, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
         };
         let Some(owner) = NonZeroU64::new(slot + 1) else {
-            return Action::Forward;
+            { PROBE_SITE.store(1406, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
         };
         if supply.owner().is_some() {
             match supply
@@ -1426,15 +1426,15 @@ fn dispatch_classified_fault<
             {
                 RootFaultAdmission::Allowed => {}
                 RootFaultAdmission::Busy => {
-                    return Action::Forward;
+                    { PROBE_SITE.store(1429, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
                 }
                 RootFaultAdmission::Declined => {
                     supply.decline();
-                    return Action::Forward;
+                    { PROBE_SITE.store(1433, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
                 }
                 RootFaultAdmission::Unmapped if supply.is_owner() => {
                     supply.decline();
-                    return Action::Forward;
+                    { PROBE_SITE.store(1437, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
                 }
                 _ if supply.is_owner() => return Action::Forward,
                 _ => {}
@@ -1446,7 +1446,7 @@ fn dispatch_classified_fault<
         // holds the editor only for one compound copy and repoint.
         let Some(_editor) = supply.editor(spaces, index, mm_key, owner) else {
             cow_resolver.editor_busy();
-            return Action::Forward;
+            { PROBE_SITE.store(1449, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
         };
         let grant = _editor.grant();
         match cow_resolver.resolve_cow_outcome(grant.ttbr0, mm_key, far) {
@@ -1454,28 +1454,35 @@ fn dispatch_classified_fault<
             CowResolution::Refused => return Action::Forward,
             CowResolution::NeedsSupply => {
                 if let FaultSupply::Owner(owner) = supply {
+                    PROBE_SITE.store(if owner.handle.is_some() { 7100 } else { 7000 }, core::sync::atomic::Ordering::Relaxed);
                     let selected = (|| {
+                        PROBE_SITE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         let roots = prepared.as_ref()?.roots?;
+                        PROBE_SITE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
+                        PROBE_SITE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         let mut root = supply.contend(spaces, mm_key, || {
                             match roots.lock_in(spaces, index.index(), mm, slot as u32) {
                                 Err(crate::memory::reservations::Refusal::Busy) => Err(carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations),
                                 result => Ok(result.ok()),
                             }
                         }).flatten()?;
+                        PROBE_SITE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         let operation = carrick_el1_abi::PortalOperation {
                             carrier: owner.slots.carrier()?,
                             mm,
                             incarnation: NonZeroU64::new(root.incarnation().raw())?,
                             sequence: root.next_transfer_sequence().ok()?,
                         };
+                        PROBE_SITE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         let window = carrick_core::mm::fault::select_cow_supply_window(
                             &mut root,
                             operation,
                             carrick_guest_arch::UserVa::new(far),
                             None,
                         )
-                        .ok()?;
+                        .map_err(|e| { PROBE_SITE.fetch_add(10 * (match e { carrick_core::mm::transaction::MmError::Stale => 1, carrick_core::mm::transaction::MmError::Busy => 2, carrick_core::mm::transaction::MmError::Fault => 3, carrick_core::mm::transaction::MmError::Invalid => 4, _ => 5 }), core::sync::atomic::Ordering::Relaxed); }).ok()?;
+                        PROBE_SITE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         drop(root);
                         owner
                             .slots
@@ -1487,9 +1494,10 @@ fn dispatch_classified_fault<
                         owner.outcome.set(OwnerFaultSupplyOutcome::CowSelected);
                     }
                 }
+                return Action::Forward;
             }
         }
-        return Action::Forward;
+        { PROBE_SITE.store(1492, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
     }
 
     if let FaultClass::Protection(access) = fault {
@@ -1520,21 +1528,21 @@ fn dispatch_classified_fault<
                 _ => {}
             }
         }
-        return Action::Forward;
+        { PROBE_SITE.store(1523, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
     }
     let FaultClass::Translation {
         access: prepared_access,
         grant_access: access,
     } = fault
     else {
-        return Action::Forward;
+        { PROBE_SITE.store(1530, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
     };
     let Some(task) = current_task else {
-        return Action::Forward;
+        { PROBE_SITE.store(1533, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
     };
     let mm_key = task.mm.key.load(Ordering::Acquire);
     if mm_key == 0 {
-        return Action::Forward;
+        { PROBE_SITE.store(1537, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
     }
 
     if let Some(page) = prepared
@@ -1564,28 +1572,28 @@ fn dispatch_classified_fault<
         {
             RootFaultAdmission::Declined => {
                 supply.decline();
-                return Action::Forward;
+                { PROBE_SITE.store(1567, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
             }
             RootFaultAdmission::Unmapped => {
                 if supply.is_owner() {
                     supply.decline();
                 }
-                return Action::Forward;
+                { PROBE_SITE.store(1573, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
             }
             RootFaultAdmission::Busy => {
-                return Action::Forward;
+                { PROBE_SITE.store(1576, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
             }
             RootFaultAdmission::Unavailable => return Action::Forward,
             _ => {}
         }
         let Some(index) = spaces.find(mm_key) else {
-            return Action::Forward;
+            { PROBE_SITE.store(1582, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
         };
         let Some(owner) = NonZeroU64::new(slot + 1) else {
-            return Action::Forward;
+            { PROBE_SITE.store(1585, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
         };
         let Some(_editor) = supply.editor(spaces, index, mm_key, owner) else {
-            return Action::Forward;
+            { PROBE_SITE.store(1588, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
         };
         let grant = _editor.grant();
         let path = prepared.as_mut().expect("prepared grant path");
@@ -1706,10 +1714,10 @@ fn dispatch_classified_fault<
         if selected.is_some() {
             owner.outcome.set(OwnerFaultSupplyOutcome::Selected);
         }
-        return Action::Forward;
+        { PROBE_SITE.store(1709, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
     }
     let FaultSupply::Mailbox { mailboxes, .. } = supply else {
-        return Action::Forward;
+        { PROBE_SITE.store(1712, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
     };
     let mailbox = mailboxes.own;
     let incarnation = supply
@@ -1729,13 +1737,13 @@ fn dispatch_classified_fault<
         })
         .unwrap_or(RootMappingIncarnation::Busy);
     if incarnation == RootMappingIncarnation::Busy {
-        return Action::Forward;
+        { PROBE_SITE.store(1732, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
     }
     let mapped = incarnation.mapped();
     // Only refusals cross back to EL1. Successful grants have already
     // published and released their slot on the host, even after migration.
     if consume_refusal(mailboxes, mm_key, far, access, || mapped) {
-        return Action::Forward;
+        { PROBE_SITE.store(1738, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
     }
 
     #[cfg(target_os = "none")]
@@ -1766,7 +1774,7 @@ fn dispatch_classified_fault<
             Ok(true) => return Action::Forward,
             Ok(false) => {}
             Err(crate::memory::reservations::Refusal::Busy) => {
-                return Action::Forward;
+                { PROBE_SITE.store(1769, core::sync::atomic::Ordering::Relaxed); return Action::Forward; }
             }
             Err(_) => {}
         }
@@ -4141,3 +4149,5 @@ mod tests {
         }
     }
 }
+
+pub static PROBE_SITE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);

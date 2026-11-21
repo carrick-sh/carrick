@@ -740,7 +740,7 @@ fn park_owner_waiting_user_fault(
             .and_then(anonymous::live_words)
             .and_then(|words| words.context)
     else {
-        return 9;
+        return 909;
     };
     let native = rust_alloc::boxed::Box::new(context::scheduler::NativeContext {
         frame: context::scheduler::InterruptFrame {
@@ -766,7 +766,7 @@ fn park_owner_waiting_user_fault(
         )
         .is_err()
     {
-        return 9;
+        return 910;
     }
     match anonymous::park_owner_fault_wait(prep.task, prep.slot, wait, &saved) {
         anonymous::ContendedFault::Parked => {
@@ -775,7 +775,7 @@ fn park_owner_waiting_user_fault(
             native_execution::schedule(prep.slot)
         }
         anonymous::ContendedFault::Rerun => 0,
-        anonymous::ContendedFault::Refused => 9,
+        anonymous::ContendedFault::Refused => 913,
     }
 }
 
@@ -791,7 +791,7 @@ fn park_contended_user_fault(
             .and_then(anonymous::live_words)
             .and_then(|words| words.context)
     else {
-        return 9;
+        return 911;
     };
     let native = rust_alloc::boxed::Box::new(context::scheduler::NativeContext {
         frame: context::scheduler::InterruptFrame {
@@ -817,7 +817,7 @@ fn park_contended_user_fault(
         )
         .is_err()
     {
-        return 9;
+        return 912;
     }
     match anonymous::park_contended_fault(prep.task, prep.slot, cause, &saved) {
         anonymous::ContendedFault::Parked => {
@@ -826,7 +826,7 @@ fn park_contended_user_fault(
             native_execution::schedule(prep.slot)
         }
         anonymous::ContendedFault::Rerun => 0,
-        anonymous::ContendedFault::Refused => 9,
+        anonymous::ContendedFault::Refused => 914,
     }
 }
 
@@ -1061,12 +1061,13 @@ fn supply_user_fault(
     let task = prep.task;
     let counters = prep.counters;
     let slot = prep.slot;
+    carrick_el1::fault::PROBE_SITE.store(0, core::sync::atomic::Ordering::Relaxed);
     let mm_key = task.mm.key.load(Ordering::Acquire);
     let Some(reservation_mm) = carrick_el1_abi::ReservationMm::new(mm_key) else {
-        return UserFaultSupply::Unresolved(9);
+        return UserFaultSupply::Unresolved(901);
     };
     let Some(words) = anonymous::live_words(reservation_mm) else {
-        return UserFaultSupply::Unresolved(9);
+        return UserFaultSupply::Unresolved(902);
     };
     let layout = <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
     let Some(venues) = carrick_el1_abi::KernelFaultVenues::derive(layout)
@@ -1094,7 +1095,7 @@ fn supply_user_fault(
         None => carrick_el1::fault::OwnerFaultSupply::new(portal),
     };
     let Some(prepared_mm) = core::num::NonZeroU64::new(mm_key) else {
-        return UserFaultSupply::Unresolved(9);
+        return UserFaultSupply::Unresolved(903);
     };
     // SAFETY: the shared fault owner acquires the exact-MM editor before
     // every prepared commit; InitialWords retains its mapped window.
@@ -1144,7 +1145,7 @@ fn supply_user_fault(
             address: fault.address,
         },
         OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::TypedRelease(wait),
-        OwnerFaultSupplyOutcome::Unavailable => UserFaultSupply::Unresolved(9),
+        OwnerFaultSupplyOutcome::Unavailable => UserFaultSupply::Unresolved(9_040_000 + u64::from(carrick_el1::fault::PROBE_SITE.load(core::sync::atomic::Ordering::Relaxed))),
         OwnerFaultSupplyOutcome::CowSelected => {
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
@@ -1189,7 +1190,7 @@ fn supply_user_fault(
                         address: fault.address,
                     },
                     OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::TypedRelease(wait),
-                    _ => UserFaultSupply::Unresolved(9),
+                    o => UserFaultSupply::Unresolved(9_050_000 + 100_000*(match o { OwnerFaultSupplyOutcome::Unavailable => 1, OwnerFaultSupplyOutcome::Selected => 2, OwnerFaultSupplyOutcome::CowSelected => 3, _ => 4 }) + u64::from(carrick_el1::fault::PROBE_SITE.load(core::sync::atomic::Ordering::Relaxed))),
                 };
             }
             #[cfg(feature = "test-support")]
@@ -1202,7 +1203,7 @@ fn supply_user_fault(
         }
         OwnerFaultSupplyOutcome::Selected => {
             let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
-                return UserFaultSupply::Unresolved(9);
+                return UserFaultSupply::Unresolved(906);
             };
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
@@ -1223,7 +1224,7 @@ fn supply_user_fault(
                             address: fault.address,
                         };
                     }
-                    return UserFaultSupply::Unresolved(9);
+                    return UserFaultSupply::Unresolved(907);
                 }
                 // Preparation met editor exclusion contention on a sibling CPU
                 // and cancelled the selection cleanly; wait on Editor release.
@@ -1236,7 +1237,7 @@ fn supply_user_fault(
                     carrick_guest_arch::CpuId::new(binding.cpu_slot),
                     fault.address,
                 );
-                return UserFaultSupply::Unresolved(9);
+                return UserFaultSupply::Unresolved(908);
             };
             // SAFETY: the retained residency table and metadata allocator are
             // the CPL0 guest venue. The shared helper releases its editor and
