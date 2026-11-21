@@ -39,7 +39,7 @@ call.
 
 ## Witnesses
 
-All three run on the production carrier with production kernel dispatch,
+All four run on the production carrier with production kernel dispatch,
 on x86_64 and on ARM64 hosts.
 
 - `soft_carrier_emits_the_hot_set_once_across_provider_exits` loops
@@ -55,6 +55,20 @@ on x86_64 and on ARM64 hosts.
   `MAP_FIXED` private file mapping over the page. The guest must run the
   file's `svc #3` where the resident block held the `str`.
 
-With the generation check removed from the dispatcher, both rewrite
-witnesses fail: they serve `svc #0` after every rewrite and the old `str`
-after the remap.
+- `soft_carrier_faults_after_munmap_of_resident_code` maps a file page
+  holding `svc #2; b .-4` at a kernel-chosen address, branches into it,
+  runs the loop twice so both blocks are resident across provider exits,
+  then unmaps it. The fetch of the resident `b .-4` must fault with
+  SIGSEGV at its address. (`munmap` of ELF text is refused on the soft
+  carrier today, #2725, so the witness unmaps a file mapping.)
+
+Each rewrite witness is red under a mutation that removes one
+invalidation; the munmap witness is red when a resident block is served
+without re-translating its PC:
+
+| mutation | prot-none | remap | munmap |
+|---|---|---|---|
+| generation compare removed (frame only) | red | red | green |
+| guest-store invalidation removed | red | red | green |
+| `write_gpa_bytes` invalidation removed | red | red | green |
+| resident block served when its PC does not translate | red | green | red |
