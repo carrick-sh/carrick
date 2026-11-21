@@ -4,6 +4,10 @@
  * succeeds, else with the errno of the first failing call (mmap errno + 100
  * when the mmap itself fails, 91 = harness, 92 = wrong memory contents):
  *   1 forked child: 1 GiB reserve, mprotect 1 MiB RW inside, write
+ *   2 RW anonymous page, write code, flip to RX and call it
+ *   3 as 2 with RWX
+ *   4 one mprotect across two adjacent VMAs
+ *   5 4 GiB reserve, commit 64 KiB, write code, flip to RX and call it
  *   6/7 as 1 with a 16 MiB / 256 MiB reserve (size probe)
  *   8 as 1, run in the root (no fork)
  *   10 as 1 with a 4 GiB reserve, committed 3 GiB in
@@ -37,6 +41,13 @@
     syscall
     test %rax, %rax
     js fail
+.endm
+
+.macro WRITE_CODE addr
+    mov \addr, %rdi
+    movl $0x000007bf, (%rdi)      /* mov $7,%edi */
+    movl $0x00e7b800, 4(%rdi)     /* (end of mov $7,%edi) mov $231,%eax */
+    movl $0x050f0000, 8(%rdi)     /* (end of mov) syscall */
 .endm
 
 #if CASE == 6
@@ -118,6 +129,32 @@ child:
     movb $1, (%r15)
     cmpb $0x3c, (%r14)
     jne bad
+#elif CASE == 2 || CASE == 3
+    MMAP $4096, $3, $0x22
+    WRITE_CODE %r15
+#if CASE == 2
+    MPROTECT %r15, $4096, $5
+#else
+    MPROTECT %r15, $4096, $7
+#endif
+    call *%r15
+    jmp success
+#elif CASE == 4
+    MMAP $0x8000, $3, $0x22
+    MPROTECT %r15, $0x4000, $1
+    lea 0x2000(%r15), %r14
+    MPROTECT %r14, $0x4000, $3
+    movb $1, 0x5000(%r15)
+    movb $1, 0x2000(%r15)
+    jmp success
+#elif CASE == 5
+    MMAP $0x100000000, $0, $0x4022
+    lea 0x10000(%r15), %r14
+    MPROTECT %r14, $0x10000, $3
+    WRITE_CODE %r14
+    MPROTECT %r14, $0x10000, $5
+    call *%r14
+    jmp success
 #else
     MMAP $RESERVE, $0, $0x4022
     mov $COMMIT_AT, %r14
@@ -129,6 +166,9 @@ child:
     add $4096, %rbx
     cmp %r13, %rbx
     jb 1b
+#endif
+#if CASE >= 2 && CASE <= 5
+success:
 #endif
     mov $7, %edi
     jmp exit
