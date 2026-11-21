@@ -35,8 +35,6 @@
 //!   other argument register is untouched, and the record says what to do
 //!   ([`IpcHandback`]) and carries the original `x0` and syscall number.
 
-extern crate alloc;
-
 use super::sched::{Sched, Served, ThreadCpu, UserWord};
 use crate::dispatch::GuestDispatchFrame;
 use carrick_el1::substrate::file::UserCopy;
@@ -50,12 +48,11 @@ use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
     IpcBacking, IpcCallFlags, IpcError, IpcEventValue, IpcHandback, IpcLockHolder, IpcMmKey,
-    IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation, IpcRegion, IpcReleased, IpcSelectOutput,
-    IpcTaskKey, IpcUserVa, OfdPin, RawOfdPin, RawTableId, WriteProgress,
+    IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation, IpcRegion, IpcReleased, IpcTaskKey,
+    IpcUserVa, OfdPin, RawOfdPin, RawTableId, WriteProgress,
 };
 use carrick_el1_abi::ipc_tables::IpcTableMap;
 use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, IpcLeave};
-use carrick_personality_linux::dispatch::SyscallFrame;
 use carrick_sched_core::object_wait::{ObjectStateSnapshot, ObjectWaitError, OperationToken};
 use carrick_sched_core::{LockWait, ShortLockSpin, WakeEffects};
 use core::sync::atomic::Ordering;
@@ -714,280 +711,20 @@ pub fn serve_ipc_with_signals<E: IpcExecution, M: UserCopy>(
 }
 
 /// A readiness decision is final before output preparation. The native
-/// copyout owner retains these bytes and this result through exact-MM waits.
-pub(crate) enum PollOutput {
-    Revents {
-        address: IpcUserVa,
-        pollfd: crate::file_table::PollFd,
-        result: i64,
-    },
-    Select {
-        spans: alloc::vec::Vec<(carrick_guest_arch::UserVa, alloc::vec::Vec<u8>)>,
-        result: i64,
-    },
-}
-
-const SELECT_INTERESTS: [i16; 3] = [
-    crate::file_table::LINUX_POLLIN,
-    crate::file_table::LINUX_POLLOUT,
-    crate::file_table::LINUX_POLLPRI,
-];
-
-fn read_select_interest(
-    layout: &mut IpcSelectOutput,
-    nfds: usize,
-    user: &mut impl UserCopy,
-) -> Result<Option<crate::file_table::PollFd>, carrick_syscall_abi::LinuxErrno> {
-    use carrick_syscall_abi::LINUX_EFAULT;
-
-    layout.words = nfds.div_ceil(64) as u32;
-    if layout.words == 0 || layout.sets.iter().all(|address| address.0 == 0) {
-        return Ok(None);
-    }
-    let mut bytes = select_output_buffer(layout.words as usize * 8)?;
-    let mut pollfd = crate::file_table::PollFd {
-        fd: -1,
-        events: 0,
-        revents: 0,
-    };
-    for (address, interest) in layout.sets.into_iter().zip(SELECT_INTERESTS) {
-        if address.0 == 0 {
-            continue;
-        }
-        if !user.copy_in(&mut bytes, address.0) {
-            return Err(LINUX_EFAULT);
-        }
-        for (index, word) in bytes.chunks_exact(8).enumerate() {
-            let mut bits = u64::from_ne_bytes(word.try_into().unwrap_or_default());
-            let remaining = nfds - index * 64;
-            if remaining < 64 {
-                bits &= (1_u64 << remaining) - 1;
-            }
-            if bits == 0 {
-                continue;
-            }
-            let fd = (index * 64 + bits.trailing_zeros() as usize) as i32;
-            if !bits.is_power_of_two() || (pollfd.fd >= 0 && pollfd.fd != fd) {
-                return Ok(None);
-            }
-            pollfd.fd = fd;
-            pollfd.events |= interest;
-        }
-    }
-    Ok((pollfd.fd >= 0).then_some(pollfd))
-}
-
-/// Linux select readiness classes, including EOF as readable and a
-/// pending pipe error as writable. Returns one bit per ready set.
-pub fn select_ready(requested: i16, level: u32) -> i16 {
-    use carrick_el1_abi::ipc::epoll::events;
-    const LEVELS: [u32; 3] = [
-        events::RDNORM | events::RDBAND | events::IN | events::HUP | events::ERR,
-        events::WRNORM | events::WRBAND | events::OUT | events::ERR,
-        events::PRI,
-    ];
-    SELECT_INTERESTS
-        .into_iter()
-        .zip(LEVELS)
-        .filter(|&(_, level_mask)| level & level_mask != 0)
-        .fold(0, |ready, (interest, _)| ready | (interest & requested))
-}
-
-pub fn poll_wait_lane(member: carrick_el1_abi::ipc::epoll::EpollMember, events: i16) -> WaitFor {
-    use carrick_el1_abi::ipc::epoll::{EpollMember, events::WRITE_SIDE};
-
-    match member {
-        EpollMember::PipeWriter => WaitFor::Writable,
-        EpollMember::EventFd if events as u16 as u32 & WRITE_SIDE != 0 => WaitFor::Writable,
-        // Every change to a stream pair wakes both of its lanes.
-        _ => WaitFor::Readable,
-    }
-}
-
-/// One Linux select output in publication order. A set is entirely zero
-/// except for the admitted descriptor's bit, so even a large set can be
-/// rendered one copy window at a time.
-pub struct WaitCopy {
+/// copyout owner retains these bytes and this result through exact-MM waits;
+/// it never re-probes a source whose level may have changed meanwhile.
+pub(crate) struct PollOutput {
     pub address: IpcUserVa,
-    pub len: usize,
-    literal: Option<[u8; 16]>,
-    bit: Option<usize>,
+    pub pollfd: crate::file_table::PollFd,
+    pub result: i64,
 }
 
-impl WaitCopy {
-    pub fn revents(address: IpcUserVa, revents: [u8; 2]) -> Self {
-        let mut bytes = [0; 16];
-        bytes[..revents.len()].copy_from_slice(&revents);
-        Self {
-            address,
-            len: revents.len(),
-            literal: Some(bytes),
-            bit: None,
-        }
-    }
-
-    pub fn literal(&self) -> Option<&[u8]> {
-        self.literal.as_ref().map(|bytes| &bytes[..self.len])
-    }
-
-    pub fn fill(&self, offset: usize, output: &mut [u8]) {
-        if let Some(bytes) = &self.literal {
-            output.copy_from_slice(&bytes[offset..offset + output.len()]);
-            return;
-        }
-        output.fill(0);
-        if let Some(bit) = self.bit
-            && let Some(index) = (bit / 8).checked_sub(offset)
-            && let Some(byte) = output.get_mut(index)
-        {
-            *byte = 1 << (bit % 8);
-        }
-    }
-}
-
-/// EINTR writes the remaining time and leaves every input set alone.
-pub fn select_copies(
-    output: IpcSelectOutput,
-    timeout: IpcUserVa,
-    remaining_ns: u64,
-    fd: i32,
-    result: i64,
-) -> impl Iterator<Item = WaitCopy> {
-    let sets = output
-        .sets
-        .into_iter()
-        .zip(SELECT_INTERESTS)
-        .filter(move |(address, _)| result >= 0 && address.0 != 0)
-        .map(move |(address, interest)| WaitCopy {
-            address,
-            len: output.words as usize * 8,
-            literal: None,
-            bit: (output.ready & interest != 0).then_some(fd as usize),
-        });
-    let timeout = (timeout.0 != 0).then(|| {
-        let seconds = (remaining_ns / 1_000_000_000) as i64;
-        let mut fraction = (remaining_ns % 1_000_000_000) as i64;
-        if output.timeval {
-            fraction /= 1_000;
-        }
-        let mut bytes = [0; 16];
-        bytes[..8].copy_from_slice(&seconds.to_ne_bytes());
-        bytes[8..].copy_from_slice(&fraction.to_ne_bytes());
-        WaitCopy {
-            address: timeout,
-            len: bytes.len(),
-            literal: Some(bytes),
-            bit: None,
-        }
-    });
-    sets.chain(timeout)
-}
-
-fn native_select_output<E: IpcExecution>(
-    mut layout: IpcSelectOutput,
-    timeout: IpcUserVa,
-    sched: &E,
-    pollfd: crate::file_table::PollFd,
-    deadline: carrick_el1_abi::ipc::IpcCounterDeadline,
-    result: i64,
-) -> Result<PollOutput, carrick_syscall_abi::LinuxErrno> {
-    use carrick_guest_arch::UserVa;
-    layout.ready = pollfd.revents;
-    let remaining_ns = deadline.get().map_or(0, |end| {
-        let ticks = end.saturating_sub(sched.now()).saturating_sub(1);
-        let frequency = sched.ticks(1_000_000_000).max(1);
-        let ns = u128::from(ticks) * 1_000_000_000 / u128::from(frequency);
-        u64::try_from(ns).unwrap_or(u64::MAX)
-    });
-    let mut spans = alloc::vec::Vec::new();
-    spans
-        .try_reserve_exact(4)
-        .map_err(|_| carrick_abi::LINUX_ENOMEM)?;
-    for copy in select_copies(layout, timeout, remaining_ns, pollfd.fd, result) {
-        let mut bytes = select_output_buffer(copy.len)?;
-        copy.fill(0, &mut bytes);
-        spans.push((UserVa::new(copy.address.0), bytes));
-    }
-    Ok(PollOutput::Select { spans, result })
-}
-
-fn select_output_buffer(
-    len: usize,
-) -> Result<alloc::vec::Vec<u8>, carrick_syscall_abi::LinuxErrno> {
-    let mut bytes = alloc::vec::Vec::new();
-    bytes
-        .try_reserve_exact(len)
-        .map_err(|_| carrick_abi::LINUX_ENOMEM)?;
-    bytes.resize(len, 0);
-    Ok(bytes)
-}
-
-fn poll_result(frame: &mut impl GuestDispatchFrame, value: i64) -> IpcServed {
-    set_result(frame, value as u64);
-    IpcServed::Returned { switched: false }
-}
-
-/// The `sigset_t` pselect6 takes through its `{ss, ss_len}` pair.
-const SELECT_SIGSET_BYTES: u64 = 8;
-
-/// Read pselect6's sixth argument, `{const sigset_t *ss; size_t ss_len}`.
-/// `Ok(None)`: no pair, or a NULL `ss`, leaves the mask alone.
-fn read_select_sigmask(
-    pair_va: u64,
-    user: &mut impl UserCopy,
-) -> Result<Option<u64>, carrick_syscall_abi::LinuxErrno> {
-    use carrick_syscall_abi::{LINUX_EFAULT, LINUX_EINVAL};
-
-    if pair_va == 0 {
-        return Ok(None);
-    }
-    let mut pair = [0u8; 16];
-    if !user.copy_in(&mut pair, pair_va) {
-        return Err(LINUX_EFAULT);
-    }
-    let set_va = u64::from_ne_bytes(pair[..8].try_into().unwrap_or_default());
-    let set_len = u64::from_ne_bytes(pair[8..].try_into().unwrap_or_default());
-    if set_va == 0 {
-        return Ok(None);
-    }
-    if set_len != SELECT_SIGSET_BYTES {
-        return Err(LINUX_EINVAL);
-    }
-    let mut set = [0u8; SELECT_SIGSET_BYTES as usize];
-    if !user.copy_in(&mut set, set_va) {
-        return Err(LINUX_EFAULT);
-    }
-    Ok(Some(u64::from_ne_bytes(set)))
-}
-
-fn select_input_error(
-    frame: &mut impl GuestDispatchFrame,
-    user: &impl UserCopy,
-    errno: carrick_syscall_abi::LinuxErrno,
-) -> IpcServed {
-    if errno == carrick_syscall_abi::LINUX_EFAULT && user.has_copyin_refusal() {
-        IpcServed::Forward
-    } else {
-        poll_result(frame, errno.guest_retval())
-    }
-}
-
-/// Serve a single zone description for poll, ppoll, select and pselect6.
+/// Serve the blocking, one-description zone subset of `poll(2)` / `ppoll(2)`.
 ///
 /// The shared dispatcher handles immediate, host and mixed sets. This owner
 /// exists for the case the host cannot observe: an inherited zone object that
 /// is not ready yet. It retains the exact pollfd bytes, description pin and
 /// absolute deadline in the same operation arena as pipe and epoll waits.
-///
-/// A pselect6 sigmask follows the `epoll_pwait` protocol
-/// (`kernel.el1.epoll-zone`): it is armed in the thread's control slot just
-/// before parking, so the post-enrollment probe already sees it, and a call
-/// that completes without parking never changes the mask. A parked wait (or an
-/// operation-slot contention park) hands the armed mask to its continuation
-/// without touching the thread's control slot after `park` succeeds. A caught
-/// signal's EINTR leaves the mask armed for the signal checkpoint, which runs
-/// the handler under the temporary mask and restores the persistent one; every
-/// other non-parked exit disarms it here.
 pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     frame: &mut E::Frame,
@@ -995,78 +732,26 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
     user: &mut M,
     output: &mut Option<PollOutput>,
 ) -> IpcServed {
-    let mut keep_sigmask = false;
-    let served = serve_zone_readiness(sched, frame, venue, user, output, &mut keep_sigmask);
-    if !keep_sigmask {
-        user.disarm_wait_sigmask();
-    }
-    served
-}
-
-fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
-    sched: &mut E,
-    frame: &mut E::Frame,
-    venue: &IpcVenue<'_>,
-    user: &mut M,
-    output: &mut Option<PollOutput>,
-    keep_sigmask: &mut bool,
-) -> IpcServed {
     use crate::dispatch::PollTimeoutKind;
     use crate::file_table::{LINUX_POLLERR, LINUX_POLLHUP, PollFd};
-    use carrick_core_abi::wait::AcceptedWait;
     use carrick_el1_abi::ipc::epoll::EpollMember;
-    use carrick_guest_arch::CounterTick;
-    use carrick_sched_core::object_wait::OperationToken;
-    use carrick_sched_core::refusal::Refusal;
 
     const POLLFD_BYTES: usize = core::mem::size_of::<PollFd>();
 
-    use carrick_syscall_abi::{LINUX_EBADF, LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL};
-
-    let ordinal = frame.canonical_ordinal();
-    let arg0 = argument_word(frame, 0);
-    let mut select =
-        carrick_personality_linux::dispatch::select_ordinal(ordinal).then(|| IpcSelectOutput {
-            sets: core::array::from_fn(|i| IpcUserVa(argument_word(frame, i + 1))),
-            timeval: ordinal.raw() == carrick_syscall_abi::CARRICK_PRIVATE_X86_SELECT,
-            ..IpcSelectOutput::EMPTY
-        });
     let timeout_kind = frame.poll_timeout_kind();
-    let (timeout_arg, is_timeval) = if let Some(layout) = &select {
-        if (arg0 as i32) < 0 {
-            return poll_result(frame, LINUX_EINVAL.guest_retval());
-        }
-        (argument_word(frame, 4), layout.timeval)
-    } else {
-        let mask_arg = match timeout_kind {
-            PollTimeoutKind::Timespec => argument_word(frame, 3),
-            PollTimeoutKind::Milliseconds => 0,
-        };
-        if !frame.may_serve_poll() || argument_word(frame, 1) != 1 || mask_arg != 0 {
-            return IpcServed::Forward;
-        }
-        (argument_word(frame, 2), false)
+    let mask_arg = match timeout_kind {
+        PollTimeoutKind::Timespec => argument_word(frame, 3),
+        PollTimeoutKind::Milliseconds => 0,
     };
+    if !frame.may_serve_poll() || argument_word(frame, 1) != 1 || mask_arg != 0 {
+        return IpcServed::Forward;
+    }
     let syscall_nr = frame.native_number().raw() as u32;
-    let kind = if select.is_some() {
-        IpcOpKind::SelectWait
-    } else {
-        IpcOpKind::PollWait
-    };
+    let fds_va = argument_word(frame, 0);
+    let timeout_arg = argument_word(frame, 2);
 
     let region = &venue.region;
-    let Some(raw_table) = venue.tables.table_of(sched.task()) else {
-        return IpcServed::Forward;
-    };
-    let table = TableId::from_raw(raw_table);
-    let authority = region.fd(EL1_WAIT);
-    let taken = match sched.take_object_operation() {
-        // The replay receipt of an operation-slot contention park owns no
-        // arena slot: the native owner holds its accepted deadline and mask.
-        Ok(Some(t)) if t.metadata_generation().is_some() => Ok(None),
-        taken => taken,
-    };
-    let resumed = match taken {
+    let resumed = match sched.take_object_operation() {
         Err(_) => return IpcServed::Forward,
         Ok(Some(operation)) => {
             let Some(token) = from_sched_token(operation) else {
@@ -1075,7 +760,7 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
             let Ok(op) = region.operation(&token) else {
                 return IpcServed::Forward;
             };
-            if op.kind != kind
+            if op.kind != IpcOpKind::PollWait
                 || op.task != task_key(sched.task())
                 || op.mm != mm_key(sched.task())
                 || op.nr != syscall_nr
@@ -1087,11 +772,8 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
             let pollfd = PollFd {
                 fd: i32::from_ne_bytes(raw[..4].try_into().unwrap_or_default()),
                 events: i16::from_ne_bytes(raw[4..6].try_into().unwrap_or_default()),
-                revents: 0,
+                revents: i16::from_ne_bytes(raw[6..].try_into().unwrap_or_default()),
             };
-            if let Some(layout) = &mut select {
-                *layout = op.select;
-            }
             let reason = sched
                 .zone()
                 .slot(sched.slot())
@@ -1100,99 +782,71 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
             if reason == Some(carrick_sched_core::Handback::Signal) && user.interrupt_pending_wait()
             {
                 finish(sched, token, region);
-                *keep_sigmask = true;
-                let result = LINUX_EINTR.guest_retval();
-                if let Some(layout) = &select {
-                    match native_select_output(*layout, op.buf, sched, pollfd, op.deadline, result)
-                    {
-                        Ok(answer) => *output = Some(answer),
-                        Err(errno) => return poll_result(frame, errno.guest_retval()),
-                    }
-                }
-                return poll_result(frame, result);
+                set_result(
+                    frame,
+                    carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
+                );
+                return IpcServed::Returned { switched: false };
             }
             Some((pollfd, op.deadline, token, op))
         }
         Ok(None) => None,
     };
 
-    // A resumed or slot-wait-replayed call's mask is already armed; it never
-    // reads sigmask or timeout from user memory again.
-    let mut sigmask = None;
     let (mut pollfd, deadline, mut retained) = if let Some((pollfd, deadline, token, op)) = resumed
     {
         (pollfd, deadline, Some((token, op)))
     } else {
-        let accepted = user.take_accepted_epoll_wait();
         let mut pollfd = PollFd::default();
-        if let Some(accepted) = accepted {
-            let deadline = accepted
-                .deadline
-                .map_or(carrick_el1_abi::ipc::IpcCounterDeadline::NONE, |tick| {
-                    carrick_el1_abi::ipc::IpcCounterDeadline::at(tick.raw())
-                });
-            if user.interrupt_pending_wait() {
-                *keep_sigmask = true;
-                let result = LINUX_EINTR.guest_retval();
-                if let Some(layout) = &select {
-                    match native_select_output(
-                        *layout,
-                        IpcUserVa(timeout_arg),
-                        sched,
-                        pollfd,
-                        deadline,
-                        result,
-                    ) {
-                        Ok(answer) => *output = Some(answer),
-                        Err(errno) => return poll_result(frame, errno.guest_retval()),
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut((&raw mut pollfd).cast::<u8>(), POLLFD_BYTES)
+        };
+        if !user.copy_in(bytes, fds_va) {
+            return IpcServed::Forward;
+        }
+        let deadline = match timeout_kind {
+            PollTimeoutKind::Milliseconds => {
+                let timeout_ms = timeout_arg as i32;
+                if timeout_ms < 0 {
+                    carrick_el1_abi::ipc::IpcCounterDeadline::NONE
+                } else if timeout_ms == 0 {
+                    carrick_el1_abi::ipc::IpcCounterDeadline::at(sched.now())
+                } else {
+                    let duration = u64::try_from(timeout_ms)
+                        .unwrap_or(0)
+                        .saturating_mul(1_000_000);
+                    carrick_el1_abi::ipc::IpcCounterDeadline::at(
+                        sched
+                            .now()
+                            .saturating_add(sched.ticks(duration))
+                            .saturating_add(1),
+                    )
+                }
+            }
+            PollTimeoutKind::Timespec => {
+                if timeout_arg == 0 {
+                    carrick_el1_abi::ipc::IpcCounterDeadline::NONE
+                } else {
+                    let mut timeout = [0u8; 16];
+                    if !user.copy_in(&mut timeout, timeout_arg) {
+                        return IpcServed::Forward;
                     }
-                }
-                return poll_result(frame, result);
-            }
-            if select.is_none() {
-                let bytes = unsafe {
-                    core::slice::from_raw_parts_mut((&raw mut pollfd).cast::<u8>(), POLLFD_BYTES)
-                };
-                if !user.copy_in(bytes, arg0) {
-                    return IpcServed::Forward;
-                }
-            } else if let Some(layout) = &mut select {
-                let Ok(capacity) = authority.backing_capacity(table) else {
-                    return IpcServed::Forward;
-                };
-                match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user) {
-                    Ok(Some(decoded)) => pollfd = decoded,
-                    Ok(None) => return IpcServed::Forward,
-                    Err(errno) => return select_input_error(frame, user, errno),
-                }
-            }
-            (pollfd, deadline, None)
-        } else {
-            let bytes = unsafe {
-                core::slice::from_raw_parts_mut((&raw mut pollfd).cast::<u8>(), POLLFD_BYTES)
-            };
-            if select.is_none() && !user.copy_in(bytes, arg0) {
-                return IpcServed::Forward;
-            }
-            if let Some(layout) = &select
-                && !layout.timeval
-            {
-                match read_select_sigmask(argument_word(frame, 5), user) {
-                    Ok(mask) => sigmask = mask,
-                    Err(errno) => return select_input_error(frame, user, errno),
-                }
-            }
-            let deadline = match timeout_kind {
-                PollTimeoutKind::Milliseconds => {
-                    let timeout_ms = timeout_arg as i32;
-                    if timeout_ms < 0 {
-                        carrick_el1_abi::ipc::IpcCounterDeadline::NONE
-                    } else if timeout_ms == 0 {
+                    let seconds = i64::from_ne_bytes(timeout[..8].try_into().unwrap_or_default());
+                    let nanos = i64::from_ne_bytes(timeout[8..].try_into().unwrap_or_default());
+                    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+                        set_result(
+                            frame,
+                            carrick_syscall_abi::LINUX_EINVAL.guest_retval() as u64,
+                        );
+                        return IpcServed::Returned { switched: false };
+                    }
+                    let duration = u64::try_from(seconds)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(nanos as u64);
+                    if duration == 0 {
                         carrick_el1_abi::ipc::IpcCounterDeadline::at(sched.now())
                     } else {
-                        let duration = u64::try_from(timeout_ms)
-                            .unwrap_or(0)
-                            .saturating_mul(1_000_000);
                         carrick_el1_abi::ipc::IpcCounterDeadline::at(
                             sched
                                 .now()
@@ -1201,56 +855,9 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                         )
                     }
                 }
-                PollTimeoutKind::Timespec => {
-                    if timeout_arg == 0 {
-                        carrick_el1_abi::ipc::IpcCounterDeadline::NONE
-                    } else {
-                        let mut timeout = [0u8; 16];
-                        if !user.copy_in(&mut timeout, timeout_arg) {
-                            return if select.is_some() {
-                                select_input_error(frame, user, LINUX_EFAULT)
-                            } else {
-                                IpcServed::Forward
-                            };
-                        }
-                        let seconds =
-                            i64::from_ne_bytes(timeout[..8].try_into().unwrap_or_default());
-                        let fraction =
-                            i64::from_ne_bytes(timeout[8..].try_into().unwrap_or_default());
-                        if seconds < 0 || fraction < 0 || (!is_timeval && fraction >= 1_000_000_000)
-                        {
-                            return poll_result(frame, LINUX_EINVAL.guest_retval());
-                        }
-                        let nanos =
-                            (fraction as u64).saturating_mul(if is_timeval { 1_000 } else { 1 });
-                        let duration = (seconds as u64)
-                            .saturating_mul(1_000_000_000)
-                            .saturating_add(nanos);
-                        if duration == 0 {
-                            carrick_el1_abi::ipc::IpcCounterDeadline::at(sched.now())
-                        } else {
-                            carrick_el1_abi::ipc::IpcCounterDeadline::at(
-                                sched
-                                    .now()
-                                    .saturating_add(sched.ticks(duration))
-                                    .saturating_add(1),
-                            )
-                        }
-                    }
-                }
-            };
-            if let Some(layout) = &mut select {
-                let Ok(capacity) = authority.backing_capacity(table) else {
-                    return IpcServed::Forward;
-                };
-                match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user) {
-                    Ok(Some(decoded)) => pollfd = decoded,
-                    Ok(None) => return IpcServed::Forward,
-                    Err(errno) => return select_input_error(frame, user, errno),
-                }
             }
-            (pollfd, deadline, None)
-        }
+        };
+        (pollfd, deadline, None)
     };
 
     // Negative pollfds do not name an object. The shared poll body clears
@@ -1259,7 +866,12 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
         return IpcServed::Forward;
     }
 
+    let Some(raw_table) = venue.tables.table_of(sched.task()) else {
+        return IpcServed::Forward;
+    };
+    let table = TableId::from_raw(raw_table);
     let fd = Fd(pollfd.fd);
+    let authority = region.fd(EL1_WAIT);
 
     loop {
         let active = retained.take();
@@ -1281,16 +893,14 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
             match authority.pin(table, fd) {
                 Ok((pin, description)) => (None, Some(pin), description),
                 Err(FdError::BadFd) => {
-                    if select.is_some() {
-                        return poll_result(frame, LINUX_EBADF.guest_retval());
-                    }
                     pollfd.revents = crate::file_table::LINUX_POLLNVAL;
-                    *output = Some(PollOutput::Revents {
-                        address: IpcUserVa(arg0),
+                    *output = Some(PollOutput {
+                        address: IpcUserVa(fds_va),
                         pollfd,
                         result: 1,
                     });
-                    return poll_result(frame, 1);
+                    set_result(frame, 1);
+                    return IpcServed::Returned { switched: false };
                 }
                 Err(FdError::PinRaced(raw)) => {
                     let op = IpcOperation {
@@ -1323,7 +933,21 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
         // progress depends on the writer lane, which a peer drain notifies.
         // An eventfd with both interests cannot have both levels clear; when
         // only output is requested its full counter waits for a read.
-        let lane = poll_wait_lane(member, pollfd.events);
+        let lane = match member {
+            EpollMember::PipeReader => WaitFor::Readable,
+            EpollMember::PipeWriter => WaitFor::Writable,
+            EpollMember::EventFd
+                if pollfd.events as u16 as u32
+                    & carrick_el1_abi::ipc::epoll::events::WRITE_SIDE
+                    != 0 =>
+            {
+                WaitFor::Writable
+            }
+            EpollMember::EventFd => WaitFor::Readable,
+            // Every change to a stream pair wakes both of its lanes.
+            EpollMember::StreamFirst | EpollMember::StreamSecond => WaitFor::Readable,
+            EpollMember::HostSocket => unreachable!("not an in-zone poll member"),
+        };
         let mut guard = match region.lock(object, &EL1_WAIT) {
             Ok(guard) => guard,
             Err(_) => {
@@ -1348,38 +972,21 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
             }
             return IpcServed::Forward;
         };
-        pollfd.revents = if select.is_some() {
-            select_ready(pollfd.events, level)
-        } else {
-            level as i16 & (pollfd.events | LINUX_POLLERR | LINUX_POLLHUP)
-        };
+        pollfd.revents = level as i16 & (pollfd.events | LINUX_POLLERR | LINUX_POLLHUP);
         if pollfd.revents != 0 || deadline.get().is_some_and(|end| sched.now() >= end) {
             drop(guard);
-            let timeout = active
-                .as_ref()
-                .map_or(IpcUserVa(timeout_arg), |(_, op)| op.buf);
+            *output = Some(PollOutput {
+                address: IpcUserVa(fds_va),
+                pollfd,
+                result: i64::from(pollfd.revents != 0),
+            });
             if let Some((token, _)) = active.take() {
                 finish(sched, token, region);
             } else if let Some(pin) = fresh_pin {
                 release_pin(sched, pin, region);
             }
-            let result = if let Some(layout) = &select {
-                let result = i64::from(pollfd.revents.count_ones());
-                match native_select_output(*layout, timeout, sched, pollfd, deadline, result) {
-                    Ok(answer) => *output = Some(answer),
-                    Err(errno) => return poll_result(frame, errno.guest_retval()),
-                }
-                result
-            } else {
-                let result = i64::from(pollfd.revents != 0);
-                *output = Some(PollOutput::Revents {
-                    address: IpcUserVa(arg0),
-                    pollfd,
-                    result,
-                });
-                result
-            };
-            return poll_result(frame, result);
+            set_result(frame, u64::from(pollfd.revents != 0));
+            return IpcServed::Returned { switched: false };
         }
         let Some(snap) = snapshot(sched, object, lane) else {
             drop(guard);
@@ -1392,21 +999,10 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
             return IpcServed::Forward;
         };
         drop(guard);
-        // Armed once before admission/park so the post-enrollment probe
-        // observes the temporary mask and `Parked::Retry` never double-arms.
-        if let Some(mask) = sigmask.take()
-            && !user.arm_wait_sigmask(mask)
-        {
-            if let Some((token, _)) = active.take() {
-                finish(sched, token, region);
-            } else if let Some(pin) = fresh_pin {
-                release_pin(sched, pin, region);
-            }
-            return IpcServed::Forward;
-        }
         let mut raw = [0u8; POLLFD_BYTES];
         raw[..4].copy_from_slice(&pollfd.fd.to_ne_bytes());
         raw[4..6].copy_from_slice(&pollfd.events.to_ne_bytes());
+        raw[6..].copy_from_slice(&pollfd.revents.to_ne_bytes());
         let (token, op) = if let Some((token, mut op)) = active.take() {
             op.object = object.to_raw();
             op.value = carrick_el1_abi::ipc::IpcEventValue(u64::from_ne_bytes(raw));
@@ -1416,99 +1012,26 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
             };
             let op = IpcOperation {
-                kind,
+                kind: IpcOpKind::PollWait,
                 pin: fresh_pin.into_raw(),
                 object: object.to_raw(),
                 task: task_key(sched.task()),
                 mm: mm_key(sched.task()),
-                buf: IpcUserVa(if select.is_some() { timeout_arg } else { arg0 }),
+                buf: IpcUserVa(fds_va),
                 value: carrick_el1_abi::ipc::IpcEventValue(u64::from_ne_bytes(raw)),
-                orig_x0: arg0,
-                select: select.unwrap_or(IpcSelectOutput::EMPTY),
+                orig_x0: fds_va,
                 nr: syscall_nr,
                 deadline,
                 ..IpcOperation::EMPTY
             };
-            let (replay, key, observed) = match region.begin_operation(op) {
-                Ok(token) => (None, None, Ok(token)),
-                Err(IpcError::NoOperations) => {
-                    let zone = sched.zone();
-                    let slot = sched.slot();
-                    let completion =
-                        |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-                            '_,
-                            E::Context,
-                        >| {
-                            crate::sched::object_wait::deliver_completion(zone, slot, owned)
-                        };
-                    match admit_operation_wait(region, zone, op, &completion).result {
-                        Ok(token) => (None, None, Ok(token)),
-                        // SAFETY: the enrollment's key and pre-probe observation go
-                        // directly to this lane's scheduler park below; no guard crosses.
-                        Err(Refusal::Contended(ticket)) => {
-                            let replay = OperationToken::metadata_request(
-                                region.operation_slot_generation().get(),
-                            )
-                            .unwrap_or_else(|| {
-                                crate::dispatch::invalid_completion(
-                                    crate::dispatch::NativeInvariant::EntryBinding,
-                                )
-                            });
-                            let (replay, key, observed) = unsafe {
-                                ticket.park_and_rerun(replay, |replay, enrollment| {
-                                    (replay, enrollment.key(), enrollment.observed())
-                                })
-                            };
-                            (Some(replay), Some(key), Err(Some(observed)))
-                        }
-                        Err(Refusal::Invariant(_) | Refusal::Guest(_)) => (None, None, Err(None)),
-                    }
-                }
-                Err(_) => (None, None, Err(None)),
-            };
-            match observed {
-                Ok(token) => (token, op),
-                Err(None) => {
+            let token = match region.begin_operation(op) {
+                Ok(token) => token,
+                Err(_) => {
                     release_pin(sched, OfdPin::from_raw(op.pin), region);
                     return IpcServed::Forward;
                 }
-                Err(Some(observed)) => {
-                    release_pin(sched, OfdPin::from_raw(op.pin), region);
-                    let accepted = AcceptedWait {
-                        deadline: op.deadline.get().map(CounterTick::new),
-                    };
-                    if !user.retain_accepted_epoll_wait(accepted) {
-                        return IpcServed::Forward;
-                    }
-                    let (Some(replay), Some(key)) = (replay, key) else {
-                        let _ = user.take_accepted_epoll_wait();
-                        return IpcServed::Forward;
-                    };
-                    // SAFETY: observed before the arena probe that found no free slot.
-                    let snapshot = unsafe { ObjectStateSnapshot::before_object_probe(observed) };
-                    match sched.park(
-                        frame,
-                        key,
-                        snapshot,
-                        replay,
-                        None,
-                        Some(&mut || user.interrupt_pending_wait()),
-                    ) {
-                        Ok(served) => {
-                            *keep_sigmask = true;
-                            return served;
-                        }
-                        Err((ObjectWaitError::Changed, _)) => {
-                            let _ = user.take_accepted_epoll_wait();
-                            continue;
-                        }
-                        Err(_) => {
-                            let _ = user.take_accepted_epoll_wait();
-                            return IpcServed::Forward;
-                        }
-                    }
-                }
-            }
+            };
+            (token, op)
         };
         match park(
             sched,
@@ -1522,10 +1045,7 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
             deadline.get(),
             &mut || user.interrupt_pending_wait(),
         ) {
-            Parked::Done(served) => {
-                *keep_sigmask = true;
-                return served;
-            }
+            Parked::Done(served) => return served,
             Parked::Retry(token) => retained = Some((token, op)),
             Parked::Refused(token) => {
                 finish(sched, token, region);
@@ -4184,367 +3704,6 @@ mod tests {
         };
         for token in held {
             finish(&mut sched, token, w.region);
-        }
-    }
-
-    /// #2588: a native child's blocking `pselect6` on a zone pipe that meets
-    /// a full operation arena is contention ("not now"), never Forward/ENOSYS:
-    /// it drops its pin, keeps its armed temporary sigmask and original
-    /// deadline, parks on the arena's slot release (Busy once), and on wake
-    /// parks on the pipe and reports readiness once the pipe is written.
-    #[test]
-    fn pselect6_full_operation_arena_waits_for_a_slot_never_forwards() {
-        let mut w = world();
-        let a = w.table(w.a_tid);
-        let (r1, w1, _) = w.pipe(a, BLOCK);
-        let (r2, w2, _) = w.pipe(a, BLOCK);
-        w.fork_table(a, 202);
-        let va = 0x20000;
-        w.mem.map(MM, va, PAGE);
-        w.mem.map(OTHER_MM, va, PAGE);
-        // B (202) runs once A waits on the arena: B blocks on r2, handing the vCPU back to A.
-        let b_read = syscall(SYS_READ, r2, va, 16, B_SVC);
-        w.queue(202, OTHER_MM, &b_read, B_SVC);
-        let pins = w.host().refcount(a, Fd(r1)).unwrap();
-
-        // Populate pselect6 inputs in A's mapped page:
-        // va + 0x00: readfds (1 << r1)
-        // va + 0x20: timespec {5, 0}
-        // va + 0x40: sigset (1 << (10 - 1))
-        // va + 0x50: sigset_argpack {va + 0x40, 8}
-        let read_bit = (1u64 << r1).to_ne_bytes();
-        w.mem.write(MM, va, &read_bit);
-        let mut ts = [0u8; 16];
-        ts[..8].copy_from_slice(&5i64.to_ne_bytes());
-        w.mem.write(MM, va + 0x20, &ts);
-        let sigusr1 = 1u64 << (10 - 1);
-        w.mem.write(MM, va + 0x40, &sigusr1.to_ne_bytes());
-        let mut pack = [0u8; 16];
-        pack[..8].copy_from_slice(&(va + 0x40).to_ne_bytes());
-        pack[8..].copy_from_slice(&8u64.to_ne_bytes());
-        w.mem.write(MM, va + 0x50, &pack);
-
-        let mut held = Vec::new();
-        while let Ok(token) = w.region.begin_operation(IpcOperation::EMPTY) {
-            held.push(token);
-        }
-        assert_eq!(held.len(), carrick_el1_abi::ipc::IPC_OPERATIONS);
-        let slots = carrick_sched_core::object_wait::ObjectWaitKey::ipc_operation_slots(
-            w.region.operation_slot_generation(),
-        )
-        .index();
-
-        let mut frame = TrapFrame {
-            esr: 0x15 << 26,
-            elr: A_SVC + 4,
-            ..Default::default()
-        };
-        frame.x[0] = (r1 as u64) + 1;
-        frame.x[1] = va;
-        frame.x[4] = va + 0x20;
-        frame.x[5] = va + 0x50;
-        frame.x[8] = 72; // pselect6
-        let a_regs = frame.x;
-
-        let mask = MaskState {
-            armed: Default::default(),
-            arms: Default::default(),
-            accept: Cell::new(true),
-        };
-        let mut cpu = core::mem::take(&mut w.cpu);
-        cpu.now = 1_000;
-        cpu.freq = 1_000_000_000;
-        let mut owner = NativeOwner::new(&w, 0x90000, &mask);
-        let venue = IpcVenue {
-            region: *w.region,
-            tables: &w.tables,
-        };
-        let native = |frame: &mut TrapFrame,
-                      owner: &mut NativeOwner<'_>,
-                      cpu: &mut FakeCpu,
-                      output: &mut Option<PollOutput>| {
-            let mut sched = Sched {
-                handoff: None,
-                zone: &w.zone,
-                slot: SLOT,
-                task: &w.task,
-                cpu,
-                user: &HardwareUserWord,
-                counters: w.counters,
-            };
-            serve_single_zone_ppoll(&mut sched, frame, &venue, owner, output)
-        };
-
-        // Step 1 (Busy once): full operation arena parks A on slot release, never Forwards.
-        let mut out = None;
-        assert_eq!(
-            native(&mut frame, &mut owner, &mut cpu, &mut out),
-            SWITCHED,
-            "a full arena must park pselect6 on slot release instead of forwarding"
-        );
-        assert!(out.is_none());
-        assert_eq!(frame.elr, B_SVC, "A yields execution capacity to B");
-        assert_eq!(w.zone.object_queue_census(slots).unwrap().waiters, 1);
-        assert_eq!(
-            w.host().refcount(a, Fd(r1)),
-            Ok(pins),
-            "pin dropped during slot wait"
-        );
-        assert_eq!(mask.arms.get(), 1, "temporary sigmask armed once");
-        assert_eq!(
-            mask.armed.get(),
-            Some(sigusr1),
-            "temporary sigmask stays armed"
-        );
-        assert!(
-            owner.accepted.is_some(),
-            "accepted deadline retained across slot wait"
-        );
-
-        // Corrupt user timespec and sigmask in memory while A waits, proving the
-        // replay uses the retained deadline and already-armed mask.
-        w.mem.write(MM, va + 0x20, &[0xff; 16]);
-        w.mem.write(MM, va + 0x40, &[0xff; 8]);
-        w.mem.write(MM, va + 0x50, &[0xff; 16]);
-        cpu.now = 2_000_000_000; // 2s elapsed of original 5s deadline
-
-        // Free three arena slots (one for B's read park, one for A's replayed pselect6,
-        // one for C's park when handing the vCPU back to A).
-        {
-            let mut sched = Sched {
-                handoff: None,
-                zone: &w.zone,
-                slot: SLOT,
-                task: &w.task,
-                cpu: &mut cpu,
-                user: &HardwareUserWord,
-                counters: w.counters,
-            };
-            finish(&mut sched, held.pop().unwrap(), w.region);
-            assert_eq!(w.zone.object_queue_census(slots).unwrap().waiters, 0);
-            finish(&mut sched, held.pop().unwrap(), w.region);
-            finish(&mut sched, held.pop().unwrap(), w.region);
-            let mut g = b_read;
-            let mut user = User {
-                task: &w.task,
-                mem: &w.mem,
-            };
-            assert_eq!(serve_ipc(&mut sched, &mut g, &venue, &mut user), SWITCHED);
-            assert_eq!(g.x, a_regs, "A replays its original pselect6 registers");
-            frame = g;
-        }
-
-        // Wake B (202) onto the runqueue by writing 1 byte to w2, so when A
-        // parks on empty r1 below, B runs, drains r2, writes to w1, and parks again.
-        w.mem.write(MM, va + 0x100, b"k");
-        w.mem.write(OTHER_MM, va + 0x100, b"z");
-        {
-            let mut a_wake_b = syscall(SYS_WRITE, w2, va + 0x100, 1, A_SVC);
-            let mut user = User {
-                task: &w.task,
-                mem: &w.mem,
-            };
-            let mut sched = Sched {
-                handoff: None,
-                zone: &w.zone,
-                slot: SLOT,
-                task: &w.task,
-                cpu: &mut cpu,
-                user: &HardwareUserWord,
-                counters: w.counters,
-            };
-            assert_eq!(
-                (
-                    serve_ipc(&mut sched, &mut a_wake_b, &venue, &mut user),
-                    a_wake_b.x[0]
-                ),
-                (RETURNED, 1)
-            );
-        }
-
-        // Step 2: A replays pselect6, keeps the original deadline and armed mask
-        // without re-arming, and parks on the empty pipe r1, switching to B.
-        reenter(&mut frame, A_SVC);
-        assert_eq!(
-            native(&mut frame, &mut owner, &mut cpu, &mut out),
-            SWITCHED,
-            "replayed pselect6 parks on the pipe"
-        );
-        assert_eq!(
-            mask.arms.get(),
-            1,
-            "replay must not double-arm the temporary mask"
-        );
-        assert_eq!(mask.armed.get(), Some(sigusr1));
-
-        // Step 3: B finishes its resumed read on r2, writes 1 byte to w1 (waking A),
-        // and blocks on empty r2 again so A runs.
-        {
-            let mut g = frame;
-            reenter(&mut g, B_SVC);
-            let mut user = User {
-                task: &w.task,
-                mem: &w.mem,
-            };
-            let mut sched = Sched {
-                handoff: None,
-                zone: &w.zone,
-                slot: SLOT,
-                task: &w.task,
-                cpu: &mut cpu,
-                user: &HardwareUserWord,
-                counters: w.counters,
-            };
-            assert_eq!(
-                (serve_ipc(&mut sched, &mut g, &venue, &mut user), g.x[0]),
-                (RETURNED, 1)
-            );
-            let mut b_write = syscall(SYS_WRITE, w1, va + 0x100, 1, B_SVC);
-            assert_eq!(
-                (
-                    serve_ipc(&mut sched, &mut b_write, &venue, &mut user),
-                    b_write.x[0]
-                ),
-                (RETURNED, 1)
-            );
-            let mut b_park = syscall(SYS_READ, r2, va + 0x200, 1, B_SVC);
-            assert_eq!(
-                serve_ipc(&mut sched, &mut b_park, &venue, &mut user),
-                SWITCHED
-            );
-            frame = b_park;
-        }
-
-        reenter(&mut frame, A_SVC);
-        assert_eq!(
-            native(&mut frame, &mut owner, &mut cpu, &mut out),
-            RETURNED,
-            "woken pselect6 completes in ring"
-        );
-        assert_eq!(frame.x[0], 1);
-        assert_eq!(
-            mask.armed.get(),
-            None,
-            "completed pselect6 disarms the temporary mask"
-        );
-        assert_eq!(w.host().refcount(a, Fd(r1)), Ok(pins), "pipe pin released");
-        let Some(PollOutput::Select { spans, result: 1 }) = out else {
-            panic!("expected Select output");
-        };
-        assert_eq!(spans[0].1, read_bit);
-        let rem_sec = i64::from_ne_bytes(spans[1].1[..8].try_into().unwrap());
-        assert!(
-            (2..=3).contains(&rem_sec),
-            "original 5s minus 2s elapsed, got {rem_sec}s"
-        );
-
-        let mut sched = Sched {
-            handoff: None,
-            zone: &w.zone,
-            slot: SLOT,
-            task: &w.task,
-            cpu: &mut cpu,
-            user: &HardwareUserWord,
-            counters: w.counters,
-        };
-        for token in held {
-            finish(&mut sched, token, w.region);
-        }
-    }
-
-    /// #2588: when a native caller's `pselect6` input (`readfds`, `timeout`, or
-    /// `sigmask`) hits a first-touch/COW refusal (`has_copyin_refusal()`), the
-    /// ring must leave `frame.x[0]` (`nfds`) intact and return `Forward` so
-    /// `dispatch.rs`'s `wait_guest_copy` supplies the page and replays the SVC
-    /// with the original `nfds` instead of `-14`.
-    #[test]
-    fn pselect6_first_touch_copyin_preserves_nfds_register_for_replay() {
-        struct FirstTouchCopy<'a> {
-            inner: User<'a>,
-            fault_va: u64,
-            refused: bool,
-        }
-        impl UserCopy for FirstTouchCopy<'_> {
-            fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
-                if src == self.fault_va {
-                    self.refused = true;
-                    return false;
-                }
-                self.inner.copy_in(dst, src)
-            }
-            fn has_copyin_refusal(&self) -> bool {
-                self.refused
-            }
-            fn copy_out(&mut self, at: u64, bytes: &[u8]) -> bool {
-                self.inner.copy_out(at, bytes)
-            }
-        }
-
-        let w = world();
-        let a = w.table(w.a_tid);
-        let (r1, _w1, _) = w.pipe(a, BLOCK);
-        let va = 0x20000;
-        w.mem.map(MM, va, PAGE);
-        w.mem.write(MM, va, &(1u64 << r1).to_ne_bytes());
-        w.mem.write(MM, va + 0x20, &[0u8; 16]);
-        let mut pack = [0u8; 16];
-        pack[..8].copy_from_slice(&(va + 0x40).to_ne_bytes());
-        pack[8..].copy_from_slice(&8u64.to_ne_bytes());
-        w.mem.write(MM, va + 0x50, &pack);
-
-        let venue = IpcVenue {
-            region: *w.region,
-            tables: &w.tables,
-        };
-        let mut cpu = FakeCpu {
-            now: 1_000,
-            freq: 1_000_000_000,
-            ..Default::default()
-        };
-
-        for fault_va in [va, va + 0x20, va + 0x50, va + 0x40] {
-            let nfds = (r1 as u64) + 1;
-            let mut frame = TrapFrame {
-                esr: 0x15 << 26,
-                elr: A_SVC,
-                ..Default::default()
-            };
-            frame.x[0] = nfds;
-            frame.x[1] = va;
-            frame.x[4] = va + 0x20;
-            frame.x[5] = if fault_va >= va + 0x40 { va + 0x50 } else { 0 };
-            frame.x[8] = 72;
-            let mut copy = FirstTouchCopy {
-                inner: User {
-                    task: &w.task,
-                    mem: &w.mem,
-                },
-                fault_va,
-                refused: false,
-            };
-            let mut sched = Sched {
-                handoff: None,
-                zone: &w.zone,
-                slot: SLOT,
-                task: &w.task,
-                cpu: &mut cpu,
-                user: &HardwareUserWord,
-                counters: w.counters,
-            };
-            let mut out = None;
-            let served =
-                serve_single_zone_ppoll(&mut sched, &mut frame, &venue, &mut copy, &mut out);
-            assert!(copy.refused, "must hit fault_va={fault_va:#x}");
-            assert_eq!(
-                served,
-                IpcServed::Forward,
-                "first-touch copy_in at {fault_va:#x} must hand off to wait_guest_copy"
-            );
-            assert_eq!(
-                frame.x[0], nfds,
-                "first-touch copy_in at {fault_va:#x} must not clobber x0 (nfds)"
-            );
-            assert!(out.is_none());
         }
     }
 

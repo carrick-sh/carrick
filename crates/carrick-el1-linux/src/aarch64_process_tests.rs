@@ -12610,17 +12610,6 @@ fn serial_host_native_epoll_pwait_sigmask_on_a_ring_epoll_is_never_forwarded() {
     native_descriptor_witness(None, false, false, false, false, false, true, false);
 }
 
-/// #2588: a native child's pselect6 with a temporary sigmask parks in ring
-/// on an inherited zone pipe under that mask, wakes on a live sibling's write
-/// and restores the persistent mask.
-#[cfg(not(target_os = "macos"))]
-#[test]
-fn serial_host_native_pselect6_sigmask_on_a_zone_pipe_parks_in_ring() {
-    native_descriptor_argument_witness(
-        None, false, false, false, false, false, false, false, None, None, true,
-    );
-}
-
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_netpoll_eventfd_wait() {
@@ -12744,7 +12733,6 @@ fn native_descriptor_witness(
         poll_inherited_pipe,
         None,
         None,
-        false,
     );
 }
 
@@ -12762,7 +12750,6 @@ fn serial_host_native_prepared_fork_parent_ppoll_prepared_pollfd() {
         true,
         None,
         Some(PreparedPollArgument::Pollfd),
-        false,
     );
 }
 
@@ -12780,7 +12767,6 @@ fn serial_host_native_prepared_fork_parent_ppoll_prepared_timeout() {
         true,
         None,
         Some(PreparedPollArgument::Timeout),
-        false,
     );
 }
 
@@ -12808,7 +12794,6 @@ fn serial_host_native_prepared_fork_parent_ppoll_unmapped_argument() {
         true,
         None,
         Some(PreparedPollArgument::Unmapped),
-        false,
     );
 }
 
@@ -12826,7 +12811,6 @@ fn serial_host_native_prepared_fork_parent_ppoll_forbidden_argument() {
         true,
         None,
         Some(PreparedPollArgument::Forbidden),
-        false,
     );
 }
 
@@ -12844,7 +12828,6 @@ fn serial_host_native_prepared_fork_parent_ppoll_shared_eventfd_input() {
         true,
         None,
         Some(PreparedPollArgument::EventfdInput),
-        false,
     );
 }
 
@@ -12974,7 +12957,6 @@ fn native_descriptor_metadata_witness(
         false,
         metadata,
         None,
-        false,
     );
 }
 
@@ -12991,7 +12973,6 @@ fn native_descriptor_argument_witness(
     poll_inherited_pipe: bool,
     metadata: Option<pipe_metadata_tests::Case>,
     prepared_timeout: Option<PreparedPollArgument>,
-    select_sigmask: bool,
 ) {
     use crate::ipc::IpcTables;
     use carrick_abi::{
@@ -14174,127 +14155,6 @@ fn native_descriptor_argument_witness(
                 .iter()
                 .all(|count| count.load(Ordering::Relaxed) == 0)
         );
-        return;
-    }
-
-    if select_sigmask {
-        // #2588: pselect(3) callers pass a temporary sigmask. Two live tasks
-        // share the inherited pipe (fd 3 reads, fd 4 writes): child 0 waits
-        // with the mask while child 1 makes the pipe readable. The call is
-        // served in ring under the shared readiness owner, never forwarded.
-        use carrick_personality_linux::crossing::nr as sys;
-        use carrick_test_support::GuestUserBuffer;
-        let pselect = sys::PSELECT6.raw();
-        let forwarded = || counters.forwarded[pselect as usize].load(Ordering::Relaxed);
-        let sigusr1 = 1u64 << (10 - 1);
-        let mask = GuestUserBuffer::from_bytes(&sigusr1.to_ne_bytes());
-        let pair = |len: u64| GuestUserBuffer::from_value([mask.arg(), len]);
-        let (sized, short) = (pair(8), pair(4));
-        let empty = GuestUserBuffer::from_value([0u64, 8]);
-        let zero = GuestUserBuffer::from_value([0u64, 0]);
-        let read_bit = (1u64 << 3).to_ne_bytes();
-        let mut read_set = GuestUserBuffer::from_bytes(&read_bit);
-        let control = |binding: &super::native_process_runtime::NativeRecordBinding<
-            AddressContext<RootGpa>,
-            Aarch64ParkedContext,
-        >| {
-            let address = fixture
-                .zone
-                .record(binding.record.id)
-                .identity()
-                .control_slot;
-            assert_ne!(address, 0);
-            // SAFETY: the live zone record retains its published control slot.
-            unsafe {
-                &*(address as *const carrick_personality_linux::abi::thread::ThreadControlSlot)
-            }
-        };
-        let (waiter, writer) = (&child_bindings[0], &child_bindings[1]);
-        let waiter_control = control(waiter);
-        let original = waiter_control.blocked();
-        let in_ring = |(route, result): (CompletionRoute, i64)| {
-            assert!(
-                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
-                "pselect6 with a sigmask must be served in ring, got {route:?} ({result}); \
-                 forwarded pselect6 {}",
-                forwarded()
-            );
-            result
-        };
-        // A set size other than sizeof(sigset_t) is EINVAL, in ring.
-        assert_eq!(
-            in_ring(run_binding6(
-                waiter,
-                pselect,
-                [4, read_set.arg(), 0, 0, zero.arg(), short.arg()]
-            )),
-            -22
-        );
-        // A NULL set leaves the mask alone, whatever its size.
-        assert_eq!(
-            in_ring(run_binding6(
-                waiter,
-                pselect,
-                [4, read_set.arg(), 0, 0, zero.arg(), empty.arg()]
-            )),
-            0
-        );
-        // Nothing ready, zero timeout: the set is cleared and the mask is
-        // never changed by a call that does not park.
-        read_set.as_mut_bytes().copy_from_slice(&read_bit);
-        assert_eq!(
-            in_ring(run_binding6(
-                waiter,
-                pselect,
-                [4, read_set.arg(), 0, 0, zero.arg(), sized.arg()]
-            )),
-            0
-        );
-        assert_eq!(read_set.as_bytes(), &[0; 8]);
-        assert_eq!(waiter_control.blocked(), original);
-        assert!(!waiter_control.forwarded_wait_mask_armed());
-
-        // Nothing ready, no timeout: the wait parks in ring under the mask.
-        read_set.as_mut_bytes().copy_from_slice(&read_bit);
-        let wait = [4, read_set.arg(), 0, 0, 0, sized.arg()];
-        task.linux.mark_pending_host_work();
-        let (route, _) = run_binding6(waiter, pselect, wait);
-        assert_eq!(
-            route,
-            CompletionRoute::Suspended,
-            "a zone pipe select with a sigmask must park in ring (forwarded {})",
-            forwarded()
-        );
-        assert!(fixture.zone.record(waiter.record.id).has_object_operation());
-        assert!(waiter_control.forwarded_wait_mask_armed());
-        assert_eq!(waiter_control.blocked().0, sigusr1);
-
-        // The peer task makes the pipe readable; the waiter re-enters the
-        // same call, reports the descriptor and has its persistent mask back.
-        activate_target(source, &task, writer);
-        let payload = GuestUserBuffer::from_bytes(b"peer");
-        assert_eq!(
-            in_ring(run_binding(
-                writer,
-                sys::WRITE.raw(),
-                [4, payload.arg(), 4, 0]
-            )),
-            4
-        );
-        assert!(
-            fixture
-                .zone
-                .requeue_preempted(fixture.slot, writer.record.id)
-                .is_queued()
-        );
-        activate_target(source, &task, waiter);
-        read_set.as_mut_bytes().fill(0);
-        assert_eq!(in_ring(run_binding6(waiter, pselect, wait)), 1);
-        assert_eq!(read_set.as_bytes(), &read_bit);
-        assert!(!fixture.zone.record(waiter.record.id).has_object_operation());
-        assert!(!waiter_control.forwarded_wait_mask_armed());
-        assert_eq!(waiter_control.blocked(), original);
-        assert_eq!(forwarded(), 0);
         return;
     }
 
@@ -18620,231 +18480,6 @@ fn serial_host_native_child_epoll_ctl_adds_an_inet_socket() {
         wait(call, 1, 0x2419);
         ctl(call, LINUX_EPOLL_CTL_DEL, 0);
         wait(call, 0, 0);
-    });
-}
-
-/// A native child's select waits on the inherited pipe while its sibling
-/// retains a live writer. The harness switches to that sibling only after
-/// the child parks, so the wake cannot be an immediate readiness sample.
-#[cfg(not(target_os = "macos"))]
-#[test]
-fn serial_host_native_child_pselect6_wakes_on_sibling_pipe_write() {
-    use ArmCaller::Root;
-    use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
-    use carrick_test_support::GuestUserBuffer;
-
-    with_arm_process_host_dispatch(|call| {
-        let pipe = GuestUserBuffer::zeroed(8);
-        assert_eq!(
-            call(Root, sys::PIPE2.raw(), [pipe.arg(), 0, 0, 0, 0, 0]).1,
-            0
-        );
-        let read = u32::from_ne_bytes(pipe.as_bytes()[..4].try_into().unwrap());
-        let write = u32::from_ne_bytes(pipe.as_bytes()[4..].try_into().unwrap());
-        let (_, parent) = call(Root, 220, [17, 0, 0, 0, 0, 0]);
-        assert!(parent > 0);
-        let parent = ArmCaller::Child(parent as u32);
-        let (_, reader) = call(parent, 220, [17, 0, 0, 0, 0, 0]);
-        assert!(reader > 0);
-        let reader = ArmCaller::Child(reader as u32);
-        call(reader, ARM_RESUME, [0; 6]);
-        let (_, writer) = call(parent, 220, [17, 0, 0, 0, 0, 0]);
-        assert!(writer > 0);
-        let writer = ArmCaller::Child(writer as u32);
-        call(writer, ARM_RESUME, [0; 6]);
-        let byte = GuestUserBuffer::from_bytes(b"x");
-        let buffer = GuestUserBuffer::zeroed(1);
-        let mask = (1u64 << read).to_ne_bytes();
-        let mut read_set = GuestUserBuffer::from_bytes(&mask);
-        let args = [u64::from(read) + 1, read_set.arg(), 0, 0, 0, 0];
-        assert_eq!(
-            call(
-                writer,
-                sys::WRITE.raw(),
-                [write.into(), byte.arg(), 1, 0, 0, 0]
-            )
-            .1,
-            1
-        );
-        let ready = call(reader, sys::PSELECT6.raw(), args);
-        assert_eq!(ready.1, 1, "ready pipe: {ready:?}");
-        assert!(matches!(
-            ready.0,
-            CompletionRoute::Served | CompletionRoute::WithWork
-        ));
-        assert_eq!(read_set.as_bytes(), &mask);
-        assert_eq!(
-            call(
-                reader,
-                sys::READ.raw(),
-                [read.into(), buffer.arg(), 1, 0, 0, 0]
-            )
-            .1,
-            1,
-        );
-        call(reader, ARM_LEAVE_ON_PARK, [0; 6]);
-        let parked = call(reader, sys::PSELECT6.raw(), args);
-        assert_eq!(
-            parked.0,
-            CompletionRoute::Suspended,
-            "empty pipe: {parked:?}"
-        );
-        assert_eq!(
-            call(reader, ARM_RESUME, [0; 6]).0,
-            CompletionRoute::Suspended
-        );
-        // Another thread could change this memory while the reader is parked.
-        // Resume uses the retained interest and replaces the output once.
-        read_set.as_mut_bytes().fill(0);
-        assert_eq!(
-            call(
-                writer,
-                sys::WRITE.raw(),
-                [write.into(), byte.arg(), 1, 0, 0, 0]
-            )
-            .1,
-            1
-        );
-        let mut result = call(reader, ARM_RESUME, [0; 6]);
-        if result.1 == i64::MIN {
-            result = call(reader, sys::PSELECT6.raw(), args);
-        }
-        assert_eq!(result.1, 1, "sibling wake: {result:?}");
-        assert!(matches!(
-            result.0,
-            CompletionRoute::Served | CompletionRoute::WithWork
-        ));
-        assert_eq!(read_set.as_bytes(), &mask);
-    });
-}
-
-/// #2588: a fork child calls `pselect6` on a zone pipe its direct parent
-/// holds: first a zero timeout on the empty pipe returns `0` with cleared
-/// sets, then a blocking `pselect6` parks in ring (releasing the single slot)
-/// until its live parent writes, wakes with `1`, reads the byte, and exits 0.
-#[cfg(not(target_os = "macos"))]
-#[test]
-fn serial_host_native_child_pselect6_wakes_on_parent_pipe_write_and_times_out() {
-    use ArmCaller::Root;
-    use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
-    use carrick_test_support::GuestUserBuffer;
-
-    with_arm_process_host_dispatch(|call| {
-        let (_, parent_pid) = call(Root, 220, [17, 0, 0, 0, 0, 0]);
-        assert!(parent_pid > 0);
-        let parent = ArmCaller::Child(parent_pid as u32);
-        call(parent, ARM_RESUME, [0; 6]);
-        let pipe = GuestUserBuffer::zeroed(8);
-        assert_eq!(
-            call(parent, sys::PIPE2.raw(), [pipe.arg(), 0, 0, 0, 0, 0]).1,
-            0
-        );
-        let read = u32::from_ne_bytes(pipe.as_bytes()[..4].try_into().unwrap());
-        let write = u32::from_ne_bytes(pipe.as_bytes()[4..].try_into().unwrap());
-        let (_, child_pid) = call(parent, 220, [17, 0, 0, 0, 0, 0]);
-        assert!(child_pid > 0);
-        let child = ArmCaller::Child(child_pid as u32);
-        call(child, ARM_RESUME, [0; 6]);
-
-        let mask = (1u64 << read).to_ne_bytes();
-        let mut read_set = GuestUserBuffer::from_bytes(&mask);
-        let zero_ts = GuestUserBuffer::from_value([0u64, 0]);
-
-        // Zero timeout on an empty pipe returns 0 in ring and clears read_set.
-        let timed = call(
-            child,
-            sys::PSELECT6.raw(),
-            [u64::from(read) + 1, read_set.arg(), 0, 0, zero_ts.arg(), 0],
-        );
-        assert_eq!(timed.1, 0, "zero-timeout pselect6: {timed:?}");
-        assert!(matches!(
-            timed.0,
-            CompletionRoute::Served | CompletionRoute::WithWork
-        ));
-        assert_eq!(read_set.as_bytes(), &[0; 8]);
-
-        // Blocking pselect6 under a temporary SIGUSR1 mask parks in ring,
-        // releasing execution capacity so the parent can run on the same slot,
-        // signal SIGUSR1 (held by the temporary mask, never EINTR), and write.
-        let sigusr1 = 1u64 << (10 - 1);
-        let sig_buf = GuestUserBuffer::from_bytes(&sigusr1.to_ne_bytes());
-        let sig_pair = GuestUserBuffer::from_value([sig_buf.arg(), 8]);
-        read_set.as_mut_bytes().copy_from_slice(&mask);
-        let args = [u64::from(read) + 1, read_set.arg(), 0, 0, 0, sig_pair.arg()];
-        call(child, ARM_LEAVE_ON_PARK, [0; 6]);
-        let parked = call(child, sys::PSELECT6.raw(), args);
-        assert_eq!(
-            parked.0,
-            CompletionRoute::Suspended,
-            "blocking child pselect6 must park: {parked:?}"
-        );
-
-        // Parent sends SIGUSR1 while child is parked under the temporary mask:
-        // child stays Suspended rather than waking with EINTR.
-        assert_eq!(
-            call(parent, 129, [child_pid as u64, 10, 0, 0, 0, 0]).1,
-            0,
-            "parent kill(child, SIGUSR1)"
-        );
-        assert_eq!(
-            call(child, ARM_RESUME, [0; 6]).0,
-            CompletionRoute::Suspended,
-            "masked SIGUSR1 must not wake parked pselect6"
-        );
-
-        let byte = GuestUserBuffer::from_bytes(b"p");
-        assert_eq!(
-            call(
-                parent,
-                sys::WRITE.raw(),
-                [write.into(), byte.arg(), 1, 0, 0, 0]
-            )
-            .1,
-            1
-        );
-
-        let mut result = call(child, ARM_RESUME, [0; 6]);
-        if result.1 == i64::MIN {
-            result = call(child, sys::PSELECT6.raw(), args);
-        }
-        assert_eq!(
-            result.1, 1,
-            "parent pipe write wakes child pselect6: {result:?}"
-        );
-        assert!(matches!(
-            result.0,
-            CompletionRoute::Served | CompletionRoute::WithWork
-        ));
-        assert_eq!(read_set.as_bytes(), &mask);
-
-        let buffer = GuestUserBuffer::zeroed(1);
-        assert_eq!(
-            call(
-                child,
-                sys::READ.raw(),
-                [read.into(), buffer.arg(), 1, 0, 0, 0]
-            )
-            .1,
-            1
-        );
-        assert_eq!(buffer.as_bytes(), b"p");
-
-        // Close all write ends (parent and child's inherited copy):
-        // pselect6 on the drained pipe reports readable EOF (1).
-        for holder in [parent, child] {
-            assert_eq!(
-                call(holder, sys::CLOSE.raw(), [write.into(), 0, 0, 0, 0, 0]).1,
-                0
-            );
-        }
-        read_set.as_mut_bytes().copy_from_slice(&mask);
-        let eof = call(child, sys::PSELECT6.raw(), args);
-        assert_eq!(eof.1, 1, "EOF pipe must be readable in select: {eof:?}");
-        assert!(matches!(
-            eof.0,
-            CompletionRoute::Served | CompletionRoute::WithWork
-        ));
-        assert_eq!(read_set.as_bytes(), &mask);
     });
 }
 

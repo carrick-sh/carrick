@@ -406,17 +406,6 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
             work: false,
         }
     }
-    /// Retain the result and disjoint value-result fields in the caller's MM.
-    fn complete_copyout_spans(
-        &mut self,
-        _spans: alloc::vec::Vec<(UserVa, alloc::vec::Vec<u8>)>,
-        _result: SyscallResult,
-    ) -> LifecycleOutcome {
-        LifecycleOutcome::Returned {
-            result: SyscallResult::new(carrick_syscall_abi::LINUX_EFAULT.guest_retval()),
-            work: false,
-        }
-    }
     /// Retain the completed poll result and its individual output fields.
     fn complete_poll_copyout(
         &mut self,

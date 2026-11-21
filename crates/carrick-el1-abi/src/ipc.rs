@@ -730,7 +730,6 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::offset_of!(IpcOperation, handback) as u64,
     core::mem::offset_of!(IpcOperation, result) as u64,
     core::mem::offset_of!(IpcOperation, deadline) as u64,
-    core::mem::offset_of!(IpcOperation, select) as u64,
     IPC_HANDBACK_NR,
     core::mem::size_of::<RawOfdPin>() as u64,
     core::mem::size_of::<RawTableId>() as u64,
@@ -769,7 +768,6 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::size_of::<IpcKindState>() as u64,
     KIND_FILE_LOCKS as u64,
     IpcOpKind::FileLockWait as u64,
-    IpcOpKind::SelectWait as u64,
     core::mem::offset_of!(IpcDirectory, file_locks) as u64,
     IPC_OFD_IDENTITIES_OFFSET as u64,
     IPC_FILE_LOCKS_OFFSET as u64,
@@ -843,9 +841,6 @@ pub enum IpcOpKind {
     /// from its original registers, and a signal interrupts it (restartable
     /// under `SA_RESTART`, signal(7)).
     FileLockWait = 11,
-    /// A single-description select wait. It shares the poll readiness owner,
-    /// but only its native syscall frame carries the output bitmap addresses.
-    SelectWait = 12,
 }
 
 impl IpcOpKind {
@@ -898,25 +893,6 @@ pub struct IpcMmKey(pub u64);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct IpcUserVa(pub u64);
 
-/// Exact output destinations and the settled answer of a native select.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IpcSelectOutput {
-    pub sets: [IpcUserVa; 3],
-    pub words: u32,
-    pub timeval: bool,
-    pub ready: i16,
-}
-
-impl IpcSelectOutput {
-    pub const EMPTY: Self = Self {
-        sets: [IpcUserVa(0); 3],
-        words: 0,
-        timeval: false,
-        ready: 0,
-    };
-}
-
 /// The owned, stack-independent state of one suspended pipe/eventfd
 /// operation (proposed for the read/write adapter and runtime integration).
 /// It owns `pin` (moved in with [`OfdPin::into_raw`]); exactly one
@@ -936,10 +912,8 @@ pub struct IpcOperation {
     pub object: RawIpcObject,
     pub task: IpcTaskKey,
     pub mm: IpcMmKey,
-    /// Byte-transfer buffer, pollfd record, or select timeout destination.
     pub buf: IpcUserVa,
     pub progress: WriteProgress,
-    /// For SelectWait with a decided answer, retained remaining nanoseconds.
     pub park_seq: u64,
     /// An eventfd write's counter value, copied from `buf` before the
     /// operation could block: a resumed write adds this value, never a
@@ -962,7 +936,6 @@ pub struct IpcOperation {
     /// woken rerun takes exactly this lock (fcntl(2) copies its
     /// `struct flock` in once). Unused by other kinds.
     pub lock: fd::record_lock::RawLockRequest,
-    pub select: IpcSelectOutput,
 }
 
 /// The per-call flags of a stream socket transfer (`sendto`/`recvfrom`):
@@ -1072,7 +1045,6 @@ impl IpcOperation {
         result: 0,
         deadline: IpcCounterDeadline::NONE,
         lock: fd::record_lock::RawLockRequest::NONE,
-        select: IpcSelectOutput::EMPTY,
     };
 }
 

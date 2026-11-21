@@ -297,11 +297,7 @@ pub fn transfer_with_io<U: UserCopy>(
             }
         }
         // A readiness or lock wait moves no bytes: it is never transferred.
-        IpcOpKind::None
-        | IpcOpKind::EpollWait
-        | IpcOpKind::PollWait
-        | IpcOpKind::SelectWait
-        | IpcOpKind::FileLockWait => {
+        IpcOpKind::None | IpcOpKind::EpollWait | IpcOpKind::PollWait | IpcOpKind::FileLockWait => {
             return Err(IpcError::Corrupt);
         }
     };

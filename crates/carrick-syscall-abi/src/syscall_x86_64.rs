@@ -291,8 +291,8 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=21 access: LEGACY (asm-generic has faccessat=48). Normalized in
     // normalize_access by both ring entry and x8664_arch::normalize_syscall.
     // x86_64=22 pipe: lowered to pipe2 by normalize_legacy.
-    // Keep the five-argument timeval layout distinct from pselect6.
-    private(23, "select", crate::CARRICK_PRIVATE_X86_SELECT),
+    // x86_64=23 select: LEGACY (asm-generic has pselect6=72). DIFFERENT shape →
+    // LEFT OUT. (see deferred block)
     // x86_64=24 sched_yield → canonical sched_yield=124 (SAME name+shape)
     direct(24, "sched_yield", 124),
     // x86_64=25 mremap → canonical mremap=216 (SAME name+shape)
@@ -978,6 +978,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // per-syscall arg-translation shim in x8664_arch::normalize_syscall (deferred,
     // oracle-gated). All numbers from syscalls(2)/filippo/OSDev.
     //
+    //   23  select      → pselect6(72):   timeval→timespec; no sigmask arg
     //   33  dup2        → dup3(24):       dup2(fd,fd)=success no-op vs dup3 EINVAL; no flags arg
     //   78  getdents    → getdents64(61): linux_dirent vs linux_dirent64 record layout
     //   132 utime       → utimensat(88):  utimbuf→timespec[2]; prepend AT_FDCWD
