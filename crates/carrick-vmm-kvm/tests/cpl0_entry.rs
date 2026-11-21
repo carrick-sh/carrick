@@ -4867,3 +4867,21 @@ die:
     assert_eq!(record.vector, 6);
     assert_eq!(record.cs & 3, 3);
 }
+
+/// #2660: the busy-loser race with both CPUs faulting in the window at once.
+/// The sibling's in-guest first touch may publish a page of the loser's
+/// applied span before the loser's settlement crossing reads it, and the
+/// carrier's exclusions raise the MM's Gate while the other CPU schedules a
+/// record: neither may be a carrier or guest fatal.
+#[test]
+fn two_live_threads_fault_one_window_while_its_busy_loser_settles() {
+    let elf = kvm_pool_fixture::assemble_fixture("native_selected_busy_race.S", &[]);
+    let outcome = run_instrumented_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "both CPUs must complete their faults in the contended window: {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
