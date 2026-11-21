@@ -129,6 +129,16 @@ pub(crate) fn run_el1_census(
             "{}",
             carrick_runtime::el1_census::render_table(&aggregate, limit)
         );
+        // What each refused call asked for: the census counts only numbers.
+        for (file, census) in files.iter().zip(&censuses) {
+            if census.refused_calls.is_empty() {
+                continue;
+            }
+            println!("\n## refused calls: {}", file.display());
+            for call in &census.refused_calls {
+                println!("{}", call.line());
+            }
+        }
     }
     Ok(())
 }

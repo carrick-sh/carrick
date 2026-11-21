@@ -42,6 +42,33 @@ class CarrickLldbHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PLUGIN._syscall_frame_lines(rows[:-1])
 
+    def test_refused_calls_decode_arguments_oldest_first(self):
+        import struct
+        rows = bytearray(64 * 9 * 8)
+        # Logical records 64..66 overwrote rows 0..2; row 3 still holds 3.
+        struct.pack_into("<9Q", rows, 0, 130, 72, 0b101, 5, 0x7000, 0x7080, 0, 0x7100, 0x7200)
+        struct.pack_into("<9Q", rows, 72, 132, 221, 0b010, 0, 0, 0, 0, 0, 0)
+        struct.pack_into("<9Q", rows, 144, 133, 73, 0b101, 0x9000, 2, 0, 0, 8, 0)
+        struct.pack_into("<9Q", rows, 216, 8, 222, 0b100, 0, 4096, 3, 0x22, (1 << 64) - 1, 0)
+        names = {72: "pselect6", 73: "ppoll", 221: "execve", 222: "mmap"}
+        lines = PLUGIN._refused_call_lines(rows, 67, names)
+        self.assertEqual(len(lines), 64)
+        self.assertEqual(lines[0], "REFUSE nr=222(mmap) caller=root venue=ring a0=0x0 a1=0x1000 a2=0x3 a3=0x22 a4=0xffffffffffffffff a5=0x0")
+        self.assertEqual(lines[-3], "REFUSE nr=72(pselect6) caller=child venue=ring a0=0x5 a1=0x7000 a2=0x7080 a3=0x0 a4=0x7100 a5=0x7200 nfds=5")
+        self.assertEqual(lines[-2], "REFUSE nr=221(execve) caller=root venue=carrier args=unretained")
+        # Record 66 is still being written (odd generation): never decoded torn.
+        self.assertEqual(lines[-1], "REFUSE #66 unreadable generation=133")
+        struct.pack_into("<Q", rows, 144, 134)
+        self.assertEqual(
+            PLUGIN._refused_call_lines(rows, 67, names)[-1],
+            "REFUSE nr=73(ppoll) caller=child venue=ring a0=0x9000 a1=0x2 a2=0x0 a3=0x0 a4=0x8 a5=0x0 nfds=2",
+        )
+        self.assertEqual(PLUGIN._refused_call_lines(rows, 0, names), [])
+        self.assertEqual(PLUGIN._syscall_names("aarch64").get(72), "pselect6")
+        self.assertEqual(PLUGIN._syscall_names("x86_64").get(270), "pselect6")
+        with self.assertRaises(ValueError):
+            PLUGIN._refused_call_lines(rows[:-1], 1)
+
     def test_copy_refusals_decode_committed_rows_only(self):
         import struct
         rows = bytearray(16 * 23 * 8)
