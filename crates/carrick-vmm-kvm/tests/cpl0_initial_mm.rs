@@ -2859,6 +2859,44 @@ fn production_initial_stack_grows_below_the_built_pages() {
     );
 }
 
+/// #2716: a kernel copy-out resolves a fork parent's copy-on-write with a
+/// host grant (`prepare_user_write`), and the parent's next user-mode store
+/// to another inherited page needs a grant of its own. The copy-out's
+/// preparation path never rang its settlement crossing, so the host still
+/// held that CPU's grant as pending and read the user fault's supply request
+/// as the missing settlement: it supplied nothing, the rerun found the pool
+/// empty, and the carrier refused the fault (`reason 9`, glibc's first
+/// `printf` after a `read`). Two live processes: the child is blocked on a
+/// pipe while the parent copies and stores, and checks its own pages after.
+#[test]
+fn production_fork_parent_stores_after_a_kernel_copy_on_write() {
+    let elf = native_exit_fixture("native_fork_parent_copyout_then_store.S");
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "native Linux oracle: {:?}",
+        native.status
+    );
+    // The loaded CPU runs the parent through the fork, the copy-out and the
+    // store, so one CPU's grant custody sees all three.
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 256, ROOT_AFFINITY_LOADED)
+        .expect("fork parent copy-out then store run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_fork_parent_copyout_then_store.S): {:?}",
+        outcome.run
+    );
+}
+
 /// #2217: a brk shrink retires its resident pages as an owed return. Before
 /// #1482 nothing on x86 settled it, so regrowing the break over those pages
 /// was refused `Busy`, forwarded and answered ENOSYS; glibc stored that errno
