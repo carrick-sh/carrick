@@ -1,7 +1,8 @@
 /* #2620 part B: V8 aborts in OS::SetPermissions (an mprotect returned
  * non-zero). A forked child performs the mprotect shape named by -DCASE=n
  * and exits 7 when every step succeeds, else with the errno of the first
- * failing call (mmap errno + 100 when the mmap itself fails, 91 = harness):
+ * failing call (mmap errno + 100 when the mmap itself fails, 91 = harness,
+ * 90 = the parent saw the child's write in its own page):
  *   1 1 GiB PROT_NONE|MAP_NORESERVE reserve, mprotect 1 MiB RW inside, write
  *   2 RW anonymous page, write code, mprotect R|X, call it
  *   3 as 2 with R|W|X
@@ -9,34 +10,15 @@
  *   6/7 as 1 with a 16 MiB / 256 MiB reserve (size probe)
  *   8 as 1, run in the root (no fork)
  *   5 4 GiB reserve, commit 64 KiB RW inside, write code, flip R|X, call
+ *   9 the parent maps RW and writes code before the fork; the child flips
+ *     the inherited page R|X and calls it while the parent waits; the
+ *     parent then writes its own copy, which must stay writable
+ *  10 16 MiB PROT_NONE reserve, commit 16 KiB RW and touch it, then commit
+ *     64 KiB RW elsewhere in the reserve, write code there, flip R|X, call
+ *  11 the parent maps RW, writes a marker and makes it R before the fork;
+ *     the child widens the inherited page to RW and overwrites it; the
+ *     parent's marker must be unchanged (the frame stays private)
  * The parent propagates the child's exit status. */
-.global _start
-.text
-_start:
-#if CASE == 8
-    jmp child               /* the run root itself, no fork */
-#endif
-    mov $57, %eax
-    syscall
-    test %eax, %eax
-    js harness
-    jz child
-    mov %eax, %edi
-    lea status(%rip), %rsi
-    xor %edx, %edx
-    xor %r10d, %r10d
-    mov $61, %eax
-    syscall
-    test %eax, %eax
-    js harness
-    mov status(%rip), %edi
-    test $127, %edi
-    jnz harness
-    shr $8, %edi
-    jmp exit
-harness:
-    mov $91, %edi
-    jmp exit
 
 /* rax = mmap(0, rsi, edx prot, r10 flags, -1, 0); r15 = base or exit errno */
 .macro MMAP len, prot, flags
@@ -68,6 +50,53 @@ harness:
     movl $0x00e7b800, 4(%rdi)     /* (end of mov $7,%edi) mov $231,%eax */
     movl $0x050f0000, 8(%rdi)     /* (end of mov) syscall */
 .endm
+
+.global _start
+.text
+_start:
+#if CASE == 8
+    jmp child               /* the run root itself, no fork */
+#endif
+#if CASE == 9
+    MMAP $4096, $3, $0x22
+    WRITE_CODE %r15
+#elif CASE == 11
+    MMAP $4096, $3, $0x22
+    movb $0x5a, (%r15)
+    MPROTECT %r15, $4096, $1
+#endif
+    mov $57, %eax
+    syscall
+    test %eax, %eax
+    js harness
+    jz child
+    mov %eax, %edi
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    test %eax, %eax
+    js harness
+    mov status(%rip), %edi
+    test $127, %edi
+    jnz harness
+    shr $8, %edi
+#if CASE == 9
+    movb $0xc3, (%r15)      /* the parent's own copy is still RW */
+    cmpb $0xc3, (%r15)
+    jne private_lost
+#elif CASE == 11
+    cmpb $0x5a, (%r15)      /* the child's write never reached this frame */
+    jne private_lost
+#endif
+    jmp exit
+harness:
+    mov $91, %edi
+    jmp exit
+private_lost:
+    mov $90, %edi
+    jmp exit
 
 #if CASE == 6
 #define RESERVE 0x1000000
@@ -113,6 +142,26 @@ child:
     WRITE_CODE %r14
     MPROTECT %r14, $0x10000, $5
     call *%r14
+    jmp done
+#elif CASE == 9
+    MPROTECT %r15, $4096, $5
+    call *%r15
+    jmp done
+#elif CASE == 10
+    MMAP $0x1000000, $0, $0x4022
+    MPROTECT %r15, $0x4000, $3
+    movb $1, (%r15)
+    lea 0x10000(%r15), %r14
+    MPROTECT %r14, $0x10000, $3
+    WRITE_CODE %r14
+    MPROTECT %r14, $0x10000, $5
+    call *%r14
+    jmp done
+#elif CASE == 11
+    MPROTECT %r15, $4096, $3
+    movb $0xa5, (%r15)
+    cmpb $0xa5, (%r15)
+    jne harness
     jmp done
 #else
 #error CASE

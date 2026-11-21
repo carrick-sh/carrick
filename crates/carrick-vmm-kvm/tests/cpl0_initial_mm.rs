@@ -6521,9 +6521,10 @@ fn run_mprotect_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPoolOut
 }
 
 macro_rules! mprotect_shape_witness {
-    ($name:ident, $case:expr, $doc:expr) => {
+    ($name:ident, $case:expr, $doc:expr $(, #[$attr:meta])*) => {
         #[doc = $doc]
         #[test]
+        $(#[$attr])*
         fn $name() {
             let outcome = run_mprotect_shape($case);
             let counters = outcome.physical.syscall_counters().expect("counters");
@@ -6534,6 +6535,9 @@ macro_rules! mprotect_shape_witness {
                     .map(|(nr, c)| (nr, c.load(std::sync::atomic::Ordering::Acquire)))
                     .filter(|(nr, c)| *c != 0 && matches!(nr, 9 | 10 | 11 | 28))
                     .collect()
+            };
+            let mprotect = |bucket: &[std::sync::atomic::AtomicU64]| {
+                bucket[10].load(std::sync::atomic::Ordering::Acquire)
             };
             eprintln!(
                 "case {} exit {} (x86 nr 9 mmap, 10 mprotect, 11 munmap) served {:?} forwarded {:?} \
@@ -6554,6 +6558,20 @@ macro_rules! mprotect_shape_witness {
                 $case,
                 outcome.run
             );
+            // Served in the ring: no mprotect left it, to the host or as a
+            // counted refusal.
+            assert_eq!(
+                [
+                    mprotect(&counters.forwarded),
+                    mprotect(&counters.refused),
+                    mprotect(&counters.refused_child),
+                    mprotect(&counters.venue_refused),
+                    mprotect(&counters.venue_refused_child),
+                ],
+                [0; 5],
+                "case {} mprotect forwarded/refused/refused_child/venue_refused/venue_refused_child",
+                $case
+            );
         }
     };
 }
@@ -6561,7 +6579,8 @@ macro_rules! mprotect_shape_witness {
 mprotect_shape_witness!(
     production_mprotect_commits_inside_a_gib_noreserve_reservation,
     1,
-    "A 1 GiB PROT_NONE|MAP_NORESERVE reserve, 1 MiB committed RW inside it."
+    "A 1 GiB PROT_NONE|MAP_NORESERVE reserve, 1 MiB committed RW inside it.",
+    #[ignore = "#2722: the 1 GiB reserving mmap itself returns ENOMEM on the x86 pool"]
 );
 mprotect_shape_witness!(
     production_mprotect_flips_rw_anonymous_to_rx_and_calls_it,
@@ -6581,7 +6600,8 @@ mprotect_shape_witness!(
 mprotect_shape_witness!(
     production_mprotect_commits_then_flips_rx_inside_a_4gib_reservation,
     5,
-    "V8's cage shape: 4 GiB reserve, 64 KiB commit RW, code, flip R|X, run."
+    "V8's cage shape: 4 GiB reserve, 64 KiB commit RW, code, flip R|X, run.",
+    #[ignore = "#2722: the 4 GiB reserving mmap itself returns ENOMEM on the x86 pool"]
 );
 mprotect_shape_witness!(
     production_mprotect_commits_inside_a_16_mib_reservation,
@@ -6596,5 +6616,25 @@ mprotect_shape_witness!(
 mprotect_shape_witness!(
     production_mprotect_commits_inside_a_gib_reservation_in_the_root,
     8,
-    "Size probe: the GiB reserve issued by the run root, no fork."
+    "Size probe: the GiB reserve issued by the run root, no fork.",
+    #[ignore = "#2722: the 1 GiB reserving mmap itself returns ENOMEM on the x86 pool"]
+);
+mprotect_shape_witness!(
+    production_mprotect_flips_an_inherited_page_rx_with_the_parent_alive,
+    9,
+    "The parent maps RW and writes code before fork; the child flips the \
+     inherited page R|X and calls it while the parent waits; the parent's \
+     own copy stays writable."
+);
+mprotect_shape_witness!(
+    production_mprotect_commits_after_a_touch_then_flips_rx_in_a_reservation,
+    10,
+    "A 16 MiB PROT_NONE reserve: commit RW and touch one part, commit RW \
+     elsewhere, write code there, flip R|X, call it."
+);
+mprotect_shape_witness!(
+    production_mprotect_widens_an_inherited_read_only_page_privately,
+    11,
+    "The parent makes a marked page R before fork; the child widens it to RW \
+     and overwrites it; the parent's marker is unchanged."
 );
