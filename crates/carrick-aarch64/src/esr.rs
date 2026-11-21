@@ -87,6 +87,32 @@ pub fn decode_el0_sys64_read(esr: u64) -> Option<(u8, El0SysRegRead)> {
     Some((rt, reg))
 }
 
+/// Decode the stage-1 [`carrick_mmu_core::aarch64::LeafAccess`] direction of an
+/// AArch64 EL0 instruction or data abort `ESR_EL1` caused by a translation
+/// (`FSC = 0x04..=0x07`) or permission (`FSC = 0x0c..=0x0f`) fault.
+///
+/// Returns `None` for alignment, address-size, access-flag, external-abort, or
+/// non-abort exception classes.
+#[must_use]
+pub fn el0_fault_access(esr: u64) -> Option<carrick_mmu_core::aarch64::LeafAccess> {
+    use carrick_mmu_core::aarch64::LeafAccess;
+    const WNR: u64 = 1 << 6;
+    let ec = carrick_hal::aarch64::aarch64_exception_class(esr);
+    let fsc = esr & 0x3f;
+    if !((0x04..=0x07).contains(&fsc) || (0x0c..=0x0f).contains(&fsc)) {
+        return None;
+    }
+    match ec {
+        0x20 | 0x21 => Some(LeafAccess::Execute),
+        0x24 | 0x25 => Some(if esr & WNR != 0 {
+            LeafAccess::Write
+        } else {
+            LeafAccess::Read
+        }),
+        _ => None,
+    }
+}
+
 // ESR exception-class decode (svc/hvc/maintenance/syscall classifiers, the
 // SVC/HVC class consts, and ExecLevel) live in the shared carrick_hal::aarch64
 // module — imported above. This SHIFT is kept local only for the counter-trap
@@ -141,5 +167,19 @@ mod tests {
         assert_eq!(el0_debug_signal(esr(0x20)), None); // instruction abort
         assert_eq!(el0_debug_signal(esr(0x24)), None); // data abort
         assert_eq!(el0_debug_signal(esr(0x00)), None); // unknown
+    }
+
+    #[test]
+    fn decodes_el0_translation_and_permission_fault_access() {
+        use carrick_mmu_core::aarch64::LeafAccess;
+
+        assert_eq!(el0_fault_access(0x9200_0047), Some(LeafAccess::Write));
+        assert_eq!(el0_fault_access(0x9200_0007), Some(LeafAccess::Read));
+        assert_eq!(
+            el0_fault_access(esr(0x20) | 0x0f),
+            Some(LeafAccess::Execute)
+        );
+        assert_eq!(el0_fault_access(esr(0x24) | 0x21), None); // alignment fault
+        assert_eq!(el0_fault_access(esr(0x15)), None); // SVC
     }
 }

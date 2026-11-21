@@ -19,6 +19,7 @@ surfaces = [
   { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.mm.syscall-code-write" },
   { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.vcpu.vm-lifetime" },
   { path = "crates/carrick-aarch64/src/engine.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-aarch64/src/esr.rs", contract = "arm.softcpu.hvc2-kernel-dispatch" },
   { path = "crates/carrick-aarch64/src/mailbox.rs", contract = "arm.softcpu.hvc2-kernel-dispatch" },
   { path = "crates/carrick-aarch64/src/mailbox.rs", contract = "hvpatch.syscall.portal" },
   { path = "crates/carrick-aarch64/src/owed_kick.rs", contract = "kernel.vcpu.kick-el0-boundary" },
