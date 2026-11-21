@@ -2604,28 +2604,6 @@ fn mounted_x86_exec_child_allowlisted_crossings_class_witness() {
     // child on x86_64. When a gap's owning issue/PR lands, the assertion below
     // requires retiring its entry here in the same change.
     const KNOWN_SINGLE_LANE_GAPS: &[(u64, &str, &str)] = &[
-        // PR #2590 / #2241: native host-file venue xattr, sync, allocation and vectored/positioned I/O.
-        (5, "setxattr", "#2590 / #2241"),
-        (6, "lsetxattr", "#2590 / #2241"),
-        (7, "fsetxattr", "#2590 / #2241"),
-        (8, "getxattr", "#2590 / #2241"),
-        (9, "lgetxattr", "#2590 / #2241"),
-        (10, "fgetxattr", "#2590 / #2241"),
-        (11, "listxattr", "#2590 / #2241"),
-        (12, "llistxattr", "#2590 / #2241"),
-        (13, "flistxattr", "#2590 / #2241"),
-        // PR #2590 / #2241: HostFileOp::Statfs (carrick-core-abi + carrick-kernel, outside #2581 R17 fence).
-        (43, "statfs", "#2590 / #2241"),
-        (44, "fstatfs", "#2590 / #2241"),
-        (47, "fallocate", "#2590 / #2241"),
-        (65, "readv", "#2590 / #2241"),
-        (68, "pwrite64", "#2590 / #2241"),
-        (69, "preadv", "#2590 / #2241"),
-        (70, "pwritev", "#2590 / #2241"),
-        (82, "fsync", "#2590 / #2241"),
-        (83, "fdatasync", "#2590 / #2241"),
-        (84, "sync_file_range", "#2590 / #2241"),
-        (267, "syncfs", "#2590 / #2241"),
         // #2637 / #2241: removexattr family stays unrouted for native children.
         (14, "removexattr", "#2637 / #2241"),
         (15, "lremovexattr", "#2637 / #2241"),
@@ -2640,8 +2618,6 @@ fn mounted_x86_exec_child_allowlisted_crossings_class_witness() {
         (72, "pselect6", "#2593 / #2588"),
         // #561: native signal owner signalfd4 in ring.
         (74, "signalfd4", "#561"),
-        // PR #2630 / #2615 / #2590 / #1862: native child readlinkat /proc/self/exe.
-        (78, "readlinkat", "#2630 / #2615 / #2590 / #1862"),
         // #1506: native child timerfd family in ring.
         (85, "timerfd_create", "#1506"),
         (86, "timerfd_settime", "#1506"),
