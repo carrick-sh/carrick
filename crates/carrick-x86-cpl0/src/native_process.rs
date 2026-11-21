@@ -360,6 +360,34 @@ pub(super) fn portal() -> Result<Portal, NativeFailure> {
         zone: Some(zone),
     })
 }
+
+/// Resolve the admitted MM handle for a user or staged-syscall fault on `slot`,
+/// matching ARM's `admitted_fault_mm_handle` so root and child MM contention
+/// records a typed `PortalOwnerWait` rather than falling back to `Unavailable`.
+pub(super) fn admitted_fault_mm_handle(
+    zone: &X86Cpl0Zone,
+    slot: SlotId,
+    task: &CurrentTask,
+    mm: ReservationMm,
+) -> Option<carrick_el1_abi::El1MmHandle> {
+    if let Some(record) = zone
+        .slot(slot)
+        .current()
+        .or_else(|| zone.slot(slot).host_record())
+        && let Some((_, control)) = task.lifecycle_refs()
+        && let Ok(handle) = control.service.bound_mm(
+            zone.record_ref(record),
+            carrick_el1_abi::EntryThreadGeneration::from_raw(zone.record(record).identity().serial),
+        )
+        && handle.mm() == mm
+    {
+        return Some(handle);
+    }
+    portal()
+        .ok()?
+        .admitted_handle(mm, u32::from(slot.raw()))
+        .ok()
+}
 // Every fork MM refusal keeps its stage and owner cause as the shared
 // `NativeForkRefusal` until errno encoding, as on AArch64: owner contention
 // stays "not now" and is never answered as a fault (#2306).

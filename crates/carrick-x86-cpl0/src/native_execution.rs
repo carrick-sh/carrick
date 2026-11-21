@@ -55,13 +55,47 @@ pub fn schedule(slot: SlotId) -> ! {
             let identity = source.zone.record(selected.record).identity();
             // Resuming the MM already installed here needs no detour through
             // the maintenance root (the context install reloads CR3 once).
-            if source.zone.installed_space(slot) != state.address.mm.raw().get() {
+            let mm_raw = state.address.mm.raw().get();
+            if source.zone.installed_space(slot) != mm_raw {
                 leave_space(source);
             }
-            source
-                .zone
-                .install_space(slot, state.address.mm.raw().get())
-                .unwrap_or_else(|| fatal_boot());
+            if source.zone.install_space(slot, mm_raw).is_none() {
+                if source.zone.spaces.find(mm_raw).is_none() {
+                    fatal_boot();
+                }
+                let rec = source.zone.record(selected.record);
+                // SAFETY: switch_in_full gave this slot exclusive ownership of
+                // `selected.record`; consuming a metadata token leaves no
+                // semantic operation behind if we re-park on `Gate`.
+                let can_park_gate = selected.result.is_none()
+                    && unsafe { rec.consume_metadata_operation() || !rec.has_object_operation() };
+                if can_park_gate {
+                    current.mm.key.store(mm_raw, Ordering::Release);
+                    match crate::anonymous::park_contended_fault(
+                        current,
+                        slot,
+                        carrick_sched_core::spaces::notification::SpaceWaitCause::Gate,
+                        &state.words,
+                    ) {
+                        crate::anonymous::ContendedFault::Parked => continue,
+                        crate::anonymous::ContendedFault::Rerun => {}
+                        crate::anonymous::ContendedFault::Refused => fatal_boot(),
+                    }
+                    if source.zone.install_space(slot, mm_raw).is_none() {
+                        if !source.zone.unswitch(slot, selected.record) {
+                            fatal_boot();
+                        }
+                        core::hint::spin_loop();
+                        continue;
+                    }
+                } else {
+                    if !source.zone.unswitch(slot, selected.record) {
+                        fatal_boot();
+                    }
+                    core::hint::spin_loop();
+                    continue;
+                }
+            }
             settle_current_work(current);
             current.set(
                 carrick_el1_abi::El1TaskId::from_linux_tid(
@@ -158,6 +192,15 @@ pub fn schedule(slot: SlotId) -> ! {
                     }
                     carrick_el1_linux::native_process_runtime::NativeResume::NoPending => {
                         // SAFETY: switch_in_full still gives this slot the
+                        // exact record; a resumed fault/metadata wait clears
+                        // its token here and preserves user RAX.
+                        let metadata_resume = unsafe {
+                            source
+                                .zone
+                                .record(selected.record)
+                                .consume_metadata_operation()
+                        };
+                        // SAFETY: switch_in_full still gives this slot the
                         // exact record; its exec commit rewrote the context.
                         match unsafe { runtime.record_binding(record) } {
                             // A committed exec replaced the record's image:
@@ -172,7 +215,7 @@ pub fn schedule(slot: SlotId) -> ! {
                                 state = replaced;
                             }
                             Some(_) => {
-                                if let Some(result) = selected.result {
+                                if !metadata_resume && let Some(result) = selected.result {
                                     words.set_syscall_return(result);
                                 }
                             }
