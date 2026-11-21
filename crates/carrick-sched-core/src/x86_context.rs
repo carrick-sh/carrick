@@ -334,3 +334,33 @@ mod user_entry_tests {
         assert!(!ParkedContextWords::valid_user_entry(1 << 47, 0x7fff_f000));
     }
 }
+
+#[cfg(test)]
+mod saved_syscall_tests {
+    use crate::{CensusContext, GuestIsa, SavedSyscallRegisters};
+
+    #[test]
+    fn saved_syscall_reads_rax_and_the_six_syscall_argument_registers() {
+        let mut words = super::ParkedContextWords::ZERO;
+        // The CPL0 interrupt image's PUSH order, written out independently
+        // of `X86ParkedGpr`: r15 r14 r13 r12 rbp rbx r11 r10 r9 r8 rax rcx
+        // rdx rsi rdi.
+        let (r15, r14, r13, r12, rbp, rbx) = (0xf15, 0xf14, 0xf13, 0xf12, 0xbb0, 0xbb1);
+        let (r11, r10, r9, r8, rax, rcx) = (0x11, 0x10, 0x9, 0x8, 202, 0xcc);
+        let (rdx, rsi, rdi) = (0xd0, 0x51, 0xd1);
+        words.frame[..15].copy_from_slice(&[
+            r15, r14, r13, r12, rbp, rbx, r11, r10, r9, r8, rax, rcx, rdx, rsi, rdi,
+        ]);
+        words.frame[15] = 0x40_1000;
+        assert_eq!(
+            words.syscall_registers(),
+            SavedSyscallRegisters {
+                isa: GuestIsa::X86_64,
+                number: rax,
+                args: [rdi, rsi, rdx, r10, r8, r9],
+                pc: 0x40_1000,
+                lr: None,
+            }
+        );
+    }
+}

@@ -6553,7 +6553,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                         } = wait;
                         writeln!(
                             out,
-                            "zone record {index} parked: first_wait_mm={mm} first_wait_address={address:#x} resume={:?} saved_pc={pc:#x} saved_nr={nr} saved_args={args:#x?}",
+                            "zone record {index} parked: first_wait_mm={mm} first_wait_address={address:#x} resume={:?} saved_pc={pc:#x} saved_nr={nr} saved_args={args:x?}",
                             record.resume_disposition(),
                         )?
                     }
