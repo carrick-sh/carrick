@@ -19,6 +19,8 @@ pub const DEDICATED_PROBE_RUNNERS: &[(&str, &str)] = &[
         "nativeprefixwrite",
         "case_native_prefix_write_child_inherited_file",
     ),
+    // Signed fork-child witness for the ring clock owner (#2618).
+    ("ringclockchild", "case_ring_clock_child_raw_syscalls"),
     ("bridge_compose_client", "conformance_bridge_compose_pair"),
     ("bridge_compose_server", "conformance_bridge_compose_pair"),
     ("bridge_dns_epoll_wake", "conformance_bridge_dns_epoll_wake"),
