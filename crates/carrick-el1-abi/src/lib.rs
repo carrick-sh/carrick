@@ -3327,8 +3327,11 @@ pub struct Counters {
     /// Then the native ordinal, flags (bit 0 descendant caller, bit 1
     /// carrier venue, bit 2 registers retained) and six argument words.
     pub refused_calls: [[AtomicU64; REFUSED_CALL_WORDS]; REFUSED_CALL_RECORDS],
-    /// Next logical refused-call record index; the count ever published.
+    /// Next logical refused-call record index; the count ever claimed.
     pub refused_call_next: AtomicU64,
+    /// Claimed records never written: their row was mid-write by another
+    /// writer, or already held a newer record (a lapped writer).
+    pub refused_call_dropped: AtomicU64,
 }
 
 /// The authority that declined to serve the operation.
@@ -3437,10 +3440,16 @@ impl RefusedCall {
 
 /// Publish one encoded refused call as the next logical record of `rows`.
 /// Generic over the word so the loom model drives this exact protocol.
-/// Returns the logical index the record was published under.
+///
+/// A writer owns its row only after a compare-and-swap moves the row's
+/// generation from an older complete record to its own odd value. A row
+/// another writer is mid-write (odd) or that already holds this or a newer
+/// record (a lapped writer) is never written: the record is counted in
+/// `dropped` instead. Returns the logical index published under.
 fn publish_refused_call_row<A: SeqLockAtomic>(
     rows: &[[A; REFUSED_CALL_WORDS]],
     next: &A,
+    dropped: &A,
     words: [u64; REFUSED_CALL_WORDS - 1],
 ) -> Option<u64> {
     let index = loop {
@@ -3454,7 +3463,29 @@ fn publish_refused_call_row<A: SeqLockAtomic>(
         }
     };
     let row = &rows[(index % rows.len() as u64) as usize];
-    row[0].store(index * 2 + 1, Ordering::Relaxed);
+    let writing = index * 2 + 1;
+    let generation = row[0].load(Ordering::Relaxed);
+    if generation % 2 == 1
+        || generation >= writing
+        || row[0]
+            .compare_exchange(generation, writing, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+    {
+        loop {
+            let count = dropped.load(Ordering::Relaxed);
+            if dropped
+                .compare_exchange(
+                    count,
+                    count.saturating_add(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return None;
+            }
+        }
+    }
     A::release_fence();
     for (target, value) in row[1..].iter().zip(words) {
         target.store(value, Ordering::Relaxed);
@@ -3501,6 +3532,7 @@ impl Counters {
             refused_calls: [const { [const { AtomicU64::new(0) }; REFUSED_CALL_WORDS] };
                 REFUSED_CALL_RECORDS],
             refused_call_next: AtomicU64::new(0),
+            refused_call_dropped: AtomicU64::new(0),
         }
     }
 
@@ -3579,6 +3611,10 @@ impl Counters {
         }
         snapshot.refused_call_next.store(
             self.refused_call_next.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        snapshot.refused_call_dropped.store(
+            self.refused_call_dropped.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         snapshot
@@ -3911,7 +3947,12 @@ impl Counters {
     /// Refusals are a slow path; keep the record out of callers' frames.
     #[inline(never)]
     fn publish_refused_call(&self, call: &RefusedCall) {
-        publish_refused_call_row(&self.refused_calls, &self.refused_call_next, call.encode());
+        publish_refused_call_row(
+            &self.refused_calls,
+            &self.refused_call_next,
+            &self.refused_call_dropped,
+            call.encode(),
+        );
     }
 
     /// The retained refused calls, oldest first. A record being written or
@@ -5890,7 +5931,7 @@ mod tests {
                 + 32 * 16
                 + 1
                 + REFUSED_CALL_RECORDS * REFUSED_CALL_WORDS
-                + 1)
+                + 2)
                 * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
