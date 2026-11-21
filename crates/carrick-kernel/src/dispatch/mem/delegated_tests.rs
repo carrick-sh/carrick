@@ -401,6 +401,24 @@ impl Root {
         }
     }
 
+    /// The carrier zone and MM portal a host owner wait on this root enrols on.
+    pub(in crate::dispatch) fn owner_wait_venue(
+        &self,
+    ) -> crate::dispatch::carrier_loop::OwnerWaitVenue<'_> {
+        crate::dispatch::carrier_loop::OwnerWaitVenue::new(
+            self.carrier.table.zone(),
+            self.carrier.table.portal(),
+        )
+    }
+
+    /// Hold this MM's root as guest EL1 `slot` does.
+    pub(in crate::dispatch) fn lock_el1_slot(&self, slot: u32) -> Reservations<'_> {
+        self.carrier
+            .table
+            .lock_el1(self.carrier.slot(self.mm).unwrap(), self.mm, slot)
+            .unwrap()
+    }
+
     pub(in crate::dispatch) fn lock(&self) -> Reservations<'_> {
         let slot = self.carrier.slot(self.mm).unwrap();
         self.carrier
