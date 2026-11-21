@@ -888,7 +888,6 @@ fn run_exec_fixture_with_stock_pressure(
 
 /// #2142: root exec must replace the production CPL0 image, not return ENOSYS.
 #[test]
-#[ignore = "#2142 root exec: not served by #2273"]
 fn production_root_exec_replaces_image_and_runs_static_successor() {
     let dir = tempfile::tempdir().expect("exec fixture directory");
     let successor = dir.path().join("successor");
@@ -906,7 +905,6 @@ fn production_root_exec_replaces_image_and_runs_static_successor() {
 /// #2142: execve(2) of a missing path fails with ENOENT and the caller keeps
 /// running its old image, which exits with that errno.
 #[test]
-#[ignore = "#2142 root exec: not served by #2273"]
 fn production_root_exec_of_a_missing_path_is_enoent() {
     let dir = tempfile::tempdir().expect("exec fixture directory");
     let outcome = run_root_exec(&dir.path().join("absent"));
@@ -920,7 +918,6 @@ fn production_root_exec_of_a_missing_path_is_enoent() {
 /// #2142: execve(2) of an executable file in no recognized format fails with
 /// ENOEXEC and the caller keeps running its old image.
 #[test]
-#[ignore = "#2142 root exec: not served by #2273"]
 fn production_root_exec_of_a_non_elf_file_is_enoexec() {
     let dir = tempfile::tempdir().expect("exec fixture directory");
     let text = dir.path().join("text");
@@ -930,6 +927,130 @@ fn production_root_exec_of_a_non_elf_file_is_enoexec() {
         (outcome.run.exit_code, outcome.run.stdout.as_slice()),
         (8, b"".as_slice()),
         "a non-ELF exec is ENOEXEC (8); 38 is ENOSYS"
+    );
+}
+
+/// Run `elf` natively on this x86_64 host, the Linux oracle for a root exec
+/// fixture: (exit code, stdout).
+fn root_exec_native_oracle(elf: &[u8]) -> (i32, Vec<u8>) {
+    let dir = tempfile::tempdir().expect("native oracle directory");
+    let binary = dir.path().join("root");
+    carrick_test_support::executable::write_executable_mode(&binary, elf, 0o700);
+    let oracle = std::process::Command::new("timeout")
+        .args(["--kill-after=1", "10"])
+        .arg(&binary)
+        .output()
+        .expect("run native Linux oracle");
+    (oracle.status.code().unwrap_or(-1), oracle.stdout)
+}
+
+/// #2142: a root exec successor that execs again. The first successor is
+/// the root exec fixture itself, now naming the final successor: the run
+/// root replaces its image twice, the second time from an MM the first exec
+/// moved into the fork stock.
+#[test]
+fn production_root_exec_twice_runs_the_second_successor() {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let successor = dir.path().join("successor");
+    carrick_test_support::executable::write_executable_mode(
+        &successor,
+        native_exit_fixture("native_root_exec_successor.S"),
+        0o700,
+    );
+    let relay = dir.path().join("relay");
+    let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
+    carrick_test_support::executable::write_executable_mode(
+        &relay,
+        native_exit_fixture_with_flags("native_root_exec.S", &[&define]),
+        0o700,
+    );
+    let define = format!("-DEXEC_PATH=\"{}\"", relay.display());
+    let elf = native_exit_fixture_with_flags("native_root_exec.S", &[&define]);
+    assert_eq!(
+        root_exec_native_oracle(&elf),
+        (0, b"root-exec-ok\n".to_vec()),
+        "native Linux oracle"
+    );
+    let outcome = run_exec_fixture(&elf, 256);
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (0, b"root-exec-ok\n".as_slice()),
+        "both root execs must run their successors; 38 is ENOSYS: execve refused={} child={} venue_refused={} served={} census={:?}",
+        load(&counters.refused[59]),
+        load(&counters.refused_child[59]),
+        load(&counters.venue_refused[59]),
+        load(&counters.served[221]),
+        outcome.physical.exec_owner_census(),
+    );
+    let census = outcome
+        .physical
+        .exec_owner_census()
+        .expect("exec owner census");
+    assert_eq!(
+        (census.adopted, census.settled),
+        (2, 2),
+        "two root execs adopted and settled: {census:?}"
+    );
+}
+
+/// #2142, two live threads: the run root execs while its second thread is
+/// still running in user mode. Exec ends the sibling, and the successor runs
+/// alone to its own exit status.
+#[test]
+fn production_root_exec_with_a_running_sibling_thread_runs_the_successor() {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let successor = dir.path().join("successor");
+    carrick_test_support::executable::write_executable_mode(
+        &successor,
+        native_exit_fixture("native_root_exec_successor.S"),
+        0o700,
+    );
+    let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_root_exec_sibling.S", &[&define]);
+    assert_eq!(
+        root_exec_native_oracle(&elf),
+        (0, b"root-exec-ok\n".to_vec()),
+        "native Linux oracle"
+    );
+    let outcome = run_exec_fixture(&elf, 512);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (0, b"root-exec-ok\n".as_slice()),
+        "the successor runs once its running sibling is gone; 38 is ENOSYS"
+    );
+    assert!(outcome.run.stderr.is_empty());
+}
+
+/// #2142: the run root's descriptors across exec. The Kernel half closes
+/// the close-on-exec one in the root's host table and moves the root to its
+/// successor table; the ring follows, so the successor sees fd 31 and its
+/// stdout, and not fd 30.
+#[test]
+fn production_root_exec_closes_only_close_on_exec_descriptors() {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let successor = dir.path().join("successor");
+    carrick_test_support::executable::write_executable_mode(
+        &successor,
+        native_exit_fixture("native_root_exec_fds_successor.S"),
+        0o700,
+    );
+    let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_root_exec_fds.S", &[&define]);
+    assert_eq!(
+        root_exec_native_oracle(&elf),
+        (0, b"root-exec-fds-ok\n".to_vec()),
+        "native Linux oracle"
+    );
+    let outcome = run_exec_fixture(&elf, 256);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (0, b"root-exec-fds-ok\n".as_slice()),
+        "3: fd 30 survived exec; 4: fd 31 did not; 38 is ENOSYS"
     );
 }
 
@@ -1457,7 +1578,7 @@ fn native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there() {
                     marker = true;
                     Ok(served.into_reply())
                 },
-                &mut |_| Err(carrick_abi::LINUX_ENOSYS),
+                &mut |_, _| Err(carrick_abi::LINUX_ENOSYS),
             )
             .expect("thread birth service")
             .is_none()
@@ -2353,7 +2474,7 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
                     served_marker = true;
                     Ok(served.into_reply())
                 },
-                &mut |_| Err(carrick_abi::LINUX_ENOSYS),
+                &mut |_, _| Err(carrick_abi::LINUX_ENOSYS),
             )
             .expect("peer authenticated host-file completion")
             .is_none()

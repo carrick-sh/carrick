@@ -209,6 +209,11 @@ impl PreparedExec {
         self.old_caller.resources().files()
     }
 
+    /// The staged file table the successor installs at commit.
+    pub fn replacement_file_table(&self) -> Arc<FileTable> {
+        self.resources.files()
+    }
+
     /// Cross the external backend's no-return cut. Dropping this preparation
     /// after this point terminates predecessor siblings instead of resuming
     /// them into an authority graph that has already moved forward.
@@ -245,9 +250,23 @@ impl Kernel {
         })
     }
 
+    /// Name the replacement MM a carrier's ring issued from the zone word
+    /// this Kernel shares, as the carrier's exec owner authenticated it when
+    /// the ring adopted the sealed successor (#2142). The authenticated MM
+    /// is not `Clone`, so one adoption backs at most one preparation.
+    pub fn adopt_authenticated_exec_mm(
+        &self,
+        authenticated: carrick_hal::exec_owner::AuthenticatedExecMm,
+    ) -> Result<IssuedExecMm, ExecError> {
+        Ok(IssuedExecMm {
+            domain: Arc::clone(self.domain()),
+            mm: MmId::from_raw_u64(authenticated.successor().raw())
+                .ok_or(ExecError::StalePreparation)?,
+        })
+    }
+
     /// Name an MM identity a carrier issued from the zone word this Kernel
-    /// shares. Production authenticates that issue with the sealed exec
-    /// receipt (#2142 R2); until then only tests name one.
+    /// shares, without the exec owner's authentication: tests only.
     #[cfg(any(test, feature = "test-support"))]
     pub fn carrier_issued_exec_mm_for_tests(&self, mm: MmId) -> IssuedExecMm {
         IssuedExecMm {

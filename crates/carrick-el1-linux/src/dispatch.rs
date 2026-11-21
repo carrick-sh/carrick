@@ -536,12 +536,31 @@ where
     )
 }
 
-/// Whether the native exec service owns this exec: only a ring-owned fork
-/// child's. A root or host-loaded task execs through the host, on either ISA.
+/// Who serves the run root's own `execve`/`execveat` on an ISA.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootExecServer {
+    /// The root forwards its exec to the host, which runs the shared root
+    /// exec transaction itself (AArch64 HVF, `drive_root_exec`).
+    HostForward,
+    /// The native exec service serves the root's exec as it does a fork
+    /// child's; the carrier consumes the root's settlement and runs the
+    /// shared root exec transaction there (x86 CPL0, #2142).
+    NativeService,
+}
+
+/// Whether the native exec service owns this exec: a ring-owned fork
+/// child's always, the run root's only where `root` says the native service
+/// serves it. A host-loaded (unowned) task execs through the host.
 pub fn native_exec_claimed(
+    root: RootExecServer,
     owner: impl FnOnce() -> super::native_process_runtime::NativeThreadGroupOwner,
 ) -> bool {
-    owner() == super::native_process_runtime::NativeThreadGroupOwner::ForkChild
+    use super::native_process_runtime::NativeThreadGroupOwner;
+    match owner() {
+        NativeThreadGroupOwner::ForkChild => true,
+        NativeThreadGroupOwner::Root => root == RootExecServer::NativeService,
+        NativeThreadGroupOwner::Unowned => false,
+    }
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -552,15 +571,16 @@ pub(super) fn arm_process_call_claimed(
 ) -> bool {
     use super::native_process_runtime::NativeThreadGroupOwner;
 
-    // Only a ring-owned fork child's execve and execveat are the native
-    // owner's. A root or host-loaded task execs through the host with its own
+    // On AArch64 only a ring-owned fork child's execve and execveat are the
+    // native owner's. A root or host-loaded task execs through the host
+    // (`RootExecServer::HostForward`) with its own
     // live cwd, credentials, executable and descriptor table. A fork child
     // has no host task: its execveat is served by the native exec service,
     // which resolves a named descriptor in the child's ring table (#1530).
     nr == 435
         || (nr == 220 && flags & 0x0001_0000 == 0)
         || match nr {
-            221 | 281 => native_exec_claimed(owner),
+            221 | 281 => native_exec_claimed(RootExecServer::HostForward, owner),
             260 | 93 | 94 | 95 | 58 | 139 => owner() != NativeThreadGroupOwner::Unowned,
             _ => false,
         }
@@ -1363,9 +1383,10 @@ pub fn native_exec_stage_request<V: file::MemoryValidator>(
 }
 
 /// The CPL0 completion of a native-service call no x86 service serves: the
-/// counted ring refusal, attributed to the record's lineage. A fork child's
-/// exec never arrives here: the x86 entry hands it to the native exec
-/// service first (`native_exec_claimed`, #2235). One body for the CPL0
+/// counted ring refusal, attributed to the record's lineage. An exec (a
+/// fork child's, #2235, or the run root's, #2142) never arrives here: the
+/// x86 entry hands it to the native exec service first
+/// (`native_exec_claimed`). One body for the CPL0
 /// target and the host witnesses. Returns the guest return word.
 pub fn settle_unwired_native_service<'a, M: Clone, C: carrick_guest_arch::ProcessContext>(
     registry: &super::native_process_runtime::NativeProcessRegistry<'a, M, C>,

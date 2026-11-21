@@ -1,6 +1,6 @@
 use carrick_hal::guest_arch_binding::{
     GuestArchBinding,
-    core_arch::{FrameGpa, RootGpa, TaskIdentity},
+    core_arch::{FrameGpa, MmGeneration, RootGpa, TaskIdentity},
 };
 use carrick_hal::threaded::X86_TASK_RESUME_PAYLOAD_LEN;
 use carrick_hal::{TrapError, VcpuExit};
@@ -328,6 +328,10 @@ pub struct CarrierCpu<I: CarrierCpuIo> {
     child_bindings: CarrierChildBindings,
     maintenance_root: Option<RootGpa>,
     debug: Option<Arc<CarrierCpuDebug>>,
+    /// The successor MM of a run-root exec this CPU settled whose custody
+    /// move is still owed (#2142). Guest entry is refused until
+    /// [`Self::retarget_loaded_exec`] moves the loaded root to it.
+    root_exec_settling: Option<MmGeneration>,
 }
 
 impl<I: CarrierCpuIo> CarrierCpu<I> {
@@ -351,6 +355,7 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             child_bindings,
             maintenance_root: None,
             debug: None,
+            root_exec_settling: None,
         })
     }
 
@@ -378,6 +383,33 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
     /// shared root binding and this CPU's loaded custody both name the
     /// successor afterwards, or neither changes. The successor's image was
     /// installed by the exec transaction; a later save validates it.
+    /// The loaded run root settled its exec to `successor`: refuse guest
+    /// entry until the root's custody moves there (#2142). Returns the
+    /// stopped CPU's state as the successor's task state: the same CPU, in
+    /// the successor's MM and root generation.
+    pub(crate) fn begin_root_exec_settlement(
+        &mut self,
+        successor: carrick_hal::guest_arch_binding::core_arch::AddressContext<RootGpa>,
+    ) -> Result<carrick_hal::threaded::X86TaskCpuStateV1, TrapError> {
+        let Custody::Loaded { resume, .. } = self.custody else {
+            return Err(boundary_error(
+                "root exec settlement requires the loaded root",
+            ));
+        };
+        let state = carrick_x86::arch_context::task_state_from_snapshot(
+            &self.io.read_image()?,
+            successor.mm,
+            successor.generation,
+            resume,
+        )?;
+        if self.root_exec_settling.replace(successor.mm).is_some() {
+            return Err(boundary_error(
+                "root exec settled twice before its custody moved",
+            ));
+        }
+        Ok(state)
+    }
+
     pub(crate) fn retarget_loaded_exec(
         &mut self,
         predecessor: GuestArchBinding,
@@ -393,8 +425,17 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
                 "exec retarget requires its exact loaded predecessor",
             ));
         }
+        if self
+            .root_exec_settling
+            .is_some_and(|settled| settled != successor.context().mm)
+        {
+            return Err(boundary_error(
+                "exec retarget names another successor than the root settled",
+            ));
+        }
         self.root_binding.replace_exec(predecessor, successor)?;
         *binding = successor;
+        self.root_exec_settling = None;
         if let Some(debug) = &self.debug {
             debug.bound(successor.task());
         }
@@ -712,6 +753,11 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
         if !matches!(self.custody, Custody::Loaded { binding, .. } if binding.task() == task) {
             return Err(boundary_error(
                 "carrier run requires its exact loaded task generation",
+            ));
+        }
+        if self.root_exec_settling.is_some() {
+            return Err(boundary_error(
+                "carrier run refused: the root's exec settlement is not consumed",
             ));
         }
         if let Some(debug) = &self.debug {
@@ -1439,6 +1485,59 @@ pub(crate) mod tests {
             loaded.retarget_loaded_exec(predecessor, successor).is_err(),
             "a retired predecessor cannot retarget again"
         );
+    }
+    /// #2142: a settled root exec refuses guest entry on its CPU until the
+    /// executor moves the root's custody to that exact successor; a
+    /// retarget to another MM is refused and keeps the gate shut.
+    #[test]
+    fn root_exec_settlement_refuses_guest_entry_until_its_retarget() {
+        let nz = |v| NonZeroU64::new(v).unwrap();
+        let root = context(2);
+        let predecessor = root.binding();
+        let successor_context = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x9000)).unwrap(),
+            mm: MmGeneration::new(nz(99)),
+            generation: ContextGeneration::new(nz(98)),
+        };
+        let successor = GuestArchBinding::x86(predecessor.task(), successor_context);
+        let mut cpu = CarrierCpu::new(TestIo {
+            image: context(1).hardware_image(),
+        })
+        .unwrap();
+        cpu.bind_root(CarrierRootBinding::issued(predecessor));
+        assert!(
+            cpu.begin_root_exec_settlement(successor_context).is_err(),
+            "only the loaded root settles an exec"
+        );
+        cpu.load(root.clone()).unwrap();
+        let state = cpu.begin_root_exec_settlement(successor_context).unwrap();
+        assert_eq!(
+            (state.mm_generation(), state.asid_generation()),
+            (99, 98),
+            "the successor's first state names its MM and root generation"
+        );
+        assert!(
+            cpu.begin_root_exec_settlement(successor_context).is_err(),
+            "one root exec settles at a time"
+        );
+        assert!(
+            cpu.run_loaded(predecessor.task()).is_err(),
+            "guest entry waits for the settlement's consumer"
+        );
+        let elsewhere = GuestArchBinding::x86(
+            predecessor.task(),
+            AddressContext {
+                mm: MmGeneration::new(nz(97)),
+                ..successor_context
+            },
+        );
+        assert!(
+            cpu.retarget_loaded_exec(predecessor, elsewhere).is_err(),
+            "the retarget must name the settled successor"
+        );
+        assert!(cpu.run_loaded(predecessor.task()).is_err());
+        cpu.retarget_loaded_exec(predecessor, successor).unwrap();
+        assert!(cpu.root_exec_settling.is_none());
     }
     #[test]
     fn unregistered_forward_cr3_refuses_with_typed_error() {

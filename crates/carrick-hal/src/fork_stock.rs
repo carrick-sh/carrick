@@ -826,6 +826,16 @@ enum ExecPredecessorPhysical<C> {
     Child(C),
 }
 
+/// Which MM an exec replaces: one this stock holds (a fork child's, or a
+/// run root's earlier exec successor), whose lifecycle and control rows and
+/// tables move with it, or the carrier root's boot-built MM, which has none
+/// and leaves no stock tables behind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecPredecessorForm {
+    Child,
+    Root,
+}
+
 /// One-shot identity for settling an exec predecessor after the ring has
 /// switched translation and invalidated the old address tag.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1918,13 +1928,14 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         )
     }
 
-    /// Move one exact live fork child to an exec successor whose tables the
-    /// adopter built from this stock's reserved pages (x86). `tables` are the
-    /// pages the build linked; they become the successor's committed
-    /// tables, returned to the stock when it is reclaimed, exactly as a fork
-    /// child's arena is.
-    pub fn replace_child_for_exec_with_tables(
+    /// Move one exact live fork child, or the authenticated carrier root
+    /// (`predecessor`), to an exec successor whose tables the adopter built
+    /// from this stock's reserved pages (x86). `tables` are the pages the
+    /// build linked; they become the successor's committed tables, returned
+    /// to the stock when it is reclaimed, exactly as a fork child's arena is.
+    pub fn replace_for_exec_with_tables(
         &mut self,
+        predecessor: ExecPredecessorForm,
         execution: GrantExecution,
         successor: carrick_el1_abi::El1MmHandle,
         successor_root: RootGpa,
@@ -1943,7 +1954,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             successor_root,
             successor_tag,
             successor_physical,
-            false,
+            predecessor == ExecPredecessorForm::Root,
             tables,
         )
     }

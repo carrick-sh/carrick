@@ -1641,7 +1641,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 },
             )));
         }
-        let payload = sealed.into_boxed_slice();
+        self.publish_exec(sealed.into_boxed_slice(), call)
+    }
+    /// Begin a staged exec through the same owner on every ISA, for an entry
+    /// whose service settles inline (x86): the copyout drain and handoff
+    /// receipt are this call's, as for [`Self::begin_host_file_call`]. The
+    /// initial host root retains its filesystem custody in the carrier
+    /// (#1714 option A, #2142): its request crosses unsealed and resolves
+    /// under the root's own capability.
+    pub fn begin_exec_call(
+        &mut self,
+        payload: Box<[u8]>,
+        table: Option<[u64; 3]>,
+        call: NativeServiceCall<'_>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let result = if self.host_root_retains_filesystem() {
+            match carrick_core_abi::service::ExecPayloadView::parse(&payload) {
+                Ok(view) if view.access().is_none() => self.publish_exec(payload, call),
+                _ => Ok(NativeResume::Returned(SyscallResult::from_errno(
+                    carrick_syscall_abi::LINUX_EINVAL,
+                ))),
+            }
+        } else {
+            self.begin_exec_service(payload, table, call)
+        };
+        let result = self.drain_copyout(result);
+        self.finish_service_handoff(result)
+    }
+    fn publish_exec(
+        &mut self,
+        payload: Box<[u8]>,
+        call: NativeServiceCall<'_>,
+    ) -> Result<NativeResume, NativeProcessError> {
         self.service_phase = NativeServicePhase::Capability;
         let capability = self
             .runtime
@@ -1665,19 +1696,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServicePayload::Exec(payload),
             ServiceCompletion::Inline,
         )
-    }
-    /// Begin a staged exec through the same owner on every ISA, for an entry
-    /// whose service settles inline (x86): the copyout drain and handoff
-    /// receipt are this call's, as for [`Self::begin_host_file_call`].
-    pub fn begin_exec_call(
-        &mut self,
-        payload: Box<[u8]>,
-        table: Option<[u64; 3]>,
-        call: NativeServiceCall<'_>,
-    ) -> Result<NativeResume, NativeProcessError> {
-        let result = self.begin_exec_service(payload, table, call);
-        let result = self.drain_copyout(result);
-        self.finish_service_handoff(result)
     }
     /// Keep a carrier-retained private-mapping source for this record:
     /// `key` names the exact `mmap` retry that consumes it.
@@ -4255,8 +4273,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // No delegated-map guard survives this point and no table/object lock
         // crosses graph publication. Native fork owns a private table and the
         // sole-member check above excludes concurrent descriptor mutation.
+        // A fork child's ring-owned namespace, or the x86 run root's
+        // carrier-retained one: the ring allocates the root's descriptors
+        // there too, so it closes their close-on-exec ones in place, and the
+        // carrier's Kernel half keeps the namespace for the successor
+        // (#2142).
+        let root_namespace = self.host_root_retains_filesystem();
         if let Some((region, map)) = self.service.exec_ipc_binding()
-            && let Some(raw) = map.lookup_owned(table_custody.file_table())
+            && let Some(raw) = map.lookup_owned(table_custody.file_table()).or_else(|| {
+                root_namespace
+                    .then(|| map.lookup_retained_binding(table_custody.file_table()))
+                    .flatten()
+            })
         {
             let table = carrick_fd_core::TableId::from_raw(raw);
             if crate::ipc::release_exec_record_locks(
