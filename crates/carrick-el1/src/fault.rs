@@ -1318,6 +1318,42 @@ fn consume_served_refusals(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64,
     }
 }
 
+/// Lock the owner root to select physical supply. Selection takes a transfer
+/// sequence, which a fork publication in flight owns until it publishes, so
+/// a sibling's COW or first touch then waits on that publication's
+/// PendingEdit release instead of losing its supply (#2581).
+fn lock_supply_root<
+    'a,
+    G: carrick_core::mm::reservation::ReservationGeometry,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    roots: &'a carrick_core::mm::reservation::SharedReservations<
+        carrick_personality_linux::mm::LinuxReservationPolicy,
+        G,
+    >,
+    spaces: SpaceAccess<'a, Context>,
+    index: usize,
+    mm: carrick_el1_abi::ReservationMm,
+    slot: u64,
+) -> Result<
+    Option<
+        carrick_core::mm::reservation::Reservations<
+            'a,
+            carrick_personality_linux::mm::LinuxReservationPolicy,
+            G,
+            Context,
+        >,
+    >,
+    carrick_sched_core::spaces::notification::SpaceWaitCause,
+> {
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    match roots.lock_in(spaces, index, mm, slot as u32) {
+        Err(crate::memory::reservations::Refusal::Busy) => Err(SpaceWaitCause::Reservations),
+        Ok(root) if root.fork_pending() => Err(SpaceWaitCause::PendingEdit),
+        result => Ok(result.ok()),
+    }
+}
+
 pub fn dispatch_fault_with_prepared<'supply, P: PreparedPageResolver, C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
@@ -1457,16 +1493,11 @@ fn dispatch_classified_fault<
                     let selected = (|| {
                         let roots = prepared.as_ref()?.roots?;
                         let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
-                        let mut root = supply.contend(spaces, mm_key, || {
-                            match roots.lock_in(spaces, index.index(), mm, slot as u32) {
-                                Err(crate::memory::reservations::Refusal::Busy) => Err(carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations),
-                                // A fork in flight write-protected this page and
-                                // owns the transfer sequence until it publishes;
-                                // that publication releases PendingEdit.
-                                Ok(root) if root.fork_pending() => Err(carrick_sched_core::spaces::notification::SpaceWaitCause::PendingEdit),
-                                result => Ok(result.ok()),
-                            }
-                        }).flatten()?;
+                        let mut root = supply
+                            .contend(spaces, mm_key, || {
+                                lock_supply_root(roots, spaces, index.index(), mm, slot)
+                            })
+                            .flatten()?;
                         let operation = carrick_el1_abi::PortalOperation {
                             carrier: owner.slots.carrier()?,
                             mm,
@@ -1635,12 +1666,7 @@ fn dispatch_classified_fault<
             let editor = supply.editor(spaces, index, mm_key, NonZeroU64::new(slot + 1)?)?;
             let mut root = supply
                 .contend(spaces, mm_key, || {
-                    match roots.lock_in(spaces, index.index(), mm, slot as u32) {
-                        Err(crate::memory::reservations::Refusal::Busy) => Err(
-                            carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations,
-                        ),
-                        result => Ok(result.ok()),
-                    }
+                    lock_supply_root(roots, spaces, index.index(), mm, slot)
                 })
                 .flatten()?;
             let window = match carrick_core::mm::fault::select_fault_window(
