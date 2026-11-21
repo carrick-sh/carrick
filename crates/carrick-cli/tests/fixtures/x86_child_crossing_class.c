@@ -336,7 +336,8 @@ static void run_child_crossings(const char *self_path) {
     record(70, 296, "pwritev", sc5(296, fd, (i64)&iov_out, 1, 0, 0));
     off0 = 0;
     record(71, 40, "sendfile", sc4(40, fd2, fd, (i64)&off0, 4));
-    record(72, 270, "pselect6", sc6(270, 0, 0, 0, 0, (i64)&zero_ts, 0));
+    u64 rdset = 1UL << pfd[0];
+    record(72, 270, "pselect6", sc6(270, pfd[0] + 1, (i64)&rdset, 0, 0, (i64)&zero_ts, 0));
     i64 sfd = sc4(289, -1, (i64)&sigmask, 8, NONBLOCK_FLAG);
     record(74, 289, "signalfd4", sfd);
     if (sfd >= 0) sc1(3, sfd);
@@ -440,7 +441,6 @@ static void run_child_crossings(const char *self_path) {
     record(278, 318, "getrandom", sc3(318, (i64)scratch, 16, 0));
     record(281, 322, "execveat", sc5(322, AT_FDCWD, (i64)p_missing, (i64)child_argv, 0, 0));
     record(284, 325, "mlock2", sc3(325, anon, 4096, 0));
-    sc2(150, anon, 4096);
     off0 = 0;
     off0_out = 0;
     record(285, 326, "copy_file_range", sc6(326, fd, (i64)&off0, fd2, (i64)&off0_out, 4, 0));

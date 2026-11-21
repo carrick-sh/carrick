@@ -1,38 +1,41 @@
-# Allowlisted crossings an exec'd native child on x86_64 still refuses with a counted ENOSYS.
+# Allowlisted crossings an exec'd native child on x86_64 does not yet serve like Linux.
 # Decrease-only: see CHILD_CROSSING_GAP_CEILING in tests/x86_kvm_run.rs. Every owner must be OPEN
-# (scripts/check-x86-child-gap-owners.sh). Columns: canonical_nr, name, owner issue.
-14	removexattr	#2708
-15	lremovexattr	#2708
-16	fremovexattr	#2215
-26	inotify_init1	#1089
-51	chroot	#2219
-71	sendfile	#2219
-285	copy_file_range	#2219
-74	signalfd4	#561
-85	timerfd_create	#1506
-86	timerfd_settime	#1506
-87	timerfd_gettime	#1506
-113	clock_gettime	#2618
-114	clock_getres	#2618
-153	times	#2618
-169	gettimeofday	#2618
-227	msync	#2605
-228	mlock	#2605
-229	munlock	#2605
-230	mlockall	#2605
-231	munlockall	#2605
-232	mincore	#2605
-233	madvise	#2605
-284	mlock2	#2605
-436	close_range	#1678
-33	mknodat	#2709
-75	vmsplice	#2711
-76	splice	#2711
-77	tee	#2711
-81	sync	#2710
-213	readahead	#2215
-223	fadvise64	#2215
-286	preadv2	#2712
-287	pwritev2	#2712
-437	openat2	#2218
-72	pselect6	#2606
+# (scripts/check-x86-child-gap-owners.sh).
+# Columns: canonical_nr, name, owner issue, kind.
+#   refusal:    a counted ENOSYS in the census (native_child) for this call.
+#   divergence: served, but the result differs from the native oracle.
+14	removexattr	#2708	refusal
+15	lremovexattr	#2708	refusal
+16	fremovexattr	#2215	refusal
+26	inotify_init1	#1089	refusal
+51	chroot	#2219	refusal
+71	sendfile	#2219	refusal
+285	copy_file_range	#2219	refusal
+74	signalfd4	#561	refusal
+85	timerfd_create	#1506	refusal
+86	timerfd_settime	#1506	refusal
+87	timerfd_gettime	#1506	refusal
+113	clock_gettime	#2618	refusal
+114	clock_getres	#2618	refusal
+153	times	#2618	refusal
+169	gettimeofday	#2618	refusal
+227	msync	#2605	refusal
+228	mlock	#2605	refusal
+229	munlock	#2605	refusal
+230	mlockall	#2605	refusal
+231	munlockall	#2605	refusal
+232	mincore	#2605	refusal
+233	madvise	#2605	refusal
+284	mlock2	#2605	refusal
+436	close_range	#1678	refusal
+33	mknodat	#2709	refusal
+75	vmsplice	#2711	refusal
+76	splice	#2711	refusal
+77	tee	#2711	refusal
+81	sync	#2710	refusal
+213	readahead	#2215	refusal
+223	fadvise64	#2215	refusal
+286	preadv2	#2712	refusal
+287	pwritev2	#2712	refusal
+437	openat2	#2218	refusal
+25	fcntl	#2713	divergence
