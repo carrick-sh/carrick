@@ -1375,12 +1375,18 @@ where
                     HvcImmediateKind::Kick => return Ok(Aarch64Exit::Kicked),
                     HvcImmediateKind::Idle => return Ok(Aarch64Exit::Halt),
                     HvcImmediateKind::MetadataGrant => {
-                        // `SoftStage2` backs the full `EL1_DYNAMIC_METADATA_SIZE`
-                        // window on demand; complete any pending grant request in place.
+                        // Single-process soft bring-up does not run a dynamic
+                        // metadata allocator; fail closed with `ERR_DENIED`
+                        // rather than echoing unallocated request arguments.
                         if let Some(mb) = carrick_el1_abi::metadata_mailbox_host()
-                            && let Some(req) = mb.claim_request()
+                            && mb.claim_request().is_some()
                         {
-                            mb.publish_response(0, req.arg1, req.arg2, req.arg3);
+                            mb.publish_response(
+                                carrick_el1_abi::METADATA_GRANT_ERR_DENIED,
+                                0,
+                                0,
+                                0,
+                            );
                         }
                         continue;
                     }
