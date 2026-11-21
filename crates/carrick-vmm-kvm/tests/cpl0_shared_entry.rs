@@ -145,3 +145,240 @@ fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
         );
     }
 }
+
+#[test]
+fn native_child_select_timeval_wakes_on_sibling_pipe_write() {
+    native_child_select_wake(&["-DUSE_SELECT_TIMEVAL"], default_dispatcher());
+}
+
+/// #2588: apt's shape. A fork child selects with no timeout on a pipe its
+/// live parent writes only after the host observes the child's enrollment.
+#[test]
+fn native_child_pselect6_wakes_on_parent_pipe_write() {
+    native_child_select_wake(&["-DPARENT_WRITES"], default_dispatcher());
+}
+
+/// #2588: the writer is a fork child that makes the pipe its stdout and
+/// execs a static successor, as apt's fetch methods do.
+#[test]
+fn native_child_pselect6_wakes_on_exec_successor_write() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = kvm_pool_fixture::assemble_fixture("native_exec_marker.S", &[]);
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let mut dispatcher = default_dispatcher();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    native_child_select_wake(&["-DEXEC_WRITER", &define], dispatcher);
+}
+
+/// #2588: the reader itself is an exec'd successor whose stdin is the zone
+/// pipe; it parks in `pselect6` until its live parent writes after enrollment,
+/// sees the pipe readable, reads the byte, and exits 0.
+#[test]
+fn native_exec_child_pselect6_wakes_on_parent_pipe_write() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("pselect_successor");
+    let poller_elf = kvm_pool_fixture::assemble_fixture(
+        "native_pipe_poll_wake.S",
+        &[
+            "-DUSE_PSELECT",
+            "-DEXEC_POLLER_SUCCESSOR",
+            "-DSELECT_GATE_PORT=0",
+        ],
+    );
+    carrick_test_support::executable::write_executable_mode(&successor, &poller_elf, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let mut dispatcher = default_dispatcher();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    native_child_select_wake(&["-DPARENT_WRITES", "-DEXEC_POLLER", &define], dispatcher);
+}
+
+/// #2588: two fork children park simultaneously in `pselect6` on separate zone
+/// pipes on the default 2-vCPU KVM pool. Both vCPUs must be released so their
+/// live parent can run, observe both enrollments, write to both pipes, and reap
+/// both children exiting 0.
+#[test]
+fn native_two_children_pselect6_release_default_pool_capacity() {
+    use carrick_sched_core::{RecordId, ZONE_RECORDS};
+    use std::time::{Duration, Instant};
+
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("select gate peer");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set the gate socket deadline");
+    let port = format!(
+        "-DSELECT_GATE_PORT={}",
+        peer.local_addr()
+            .expect("gate socket address")
+            .port()
+            .swap_bytes()
+    );
+    let elf = kvm_pool_fixture::assemble_fixture(
+        "native_pipe_poll_wake.S",
+        &["-DUSE_PSELECT", "-DTWO_POLLERS", &port],
+    );
+    let program =
+        carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("two-poller fixture");
+    let mut sender = None;
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        512,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |carrier| {
+            let zone = carrier.carrier_zone_wake().expect("carrier wake domain");
+            sender = Some(std::thread::spawn(move || {
+                let mut pids = [0u8; 8];
+                let (count, client) = peer.recv_from(&mut pids).expect("parent gate");
+                assert_eq!(count, pids.len());
+                let tid1 = u64::from(u32::from_ne_bytes(pids[..4].try_into().unwrap()));
+                let tid2 = u64::from(u32::from_ne_bytes(pids[4..].try_into().unwrap()));
+                let deadline = Instant::now() + Duration::from_secs(4);
+                let both_parked = loop {
+                    let is_enrolled = |tid| {
+                        (1..ZONE_RECORDS as u32)
+                            .filter_map(RecordId::from_raw)
+                            .any(|id| {
+                                let record = zone.zone().record(id);
+                                record.identity().tid == tid
+                                    && record.has_adapter_operation()
+                                    && record
+                                        .object_wait_census()
+                                        .is_some_and(|wait| wait.queue != 0)
+                            })
+                    };
+                    let ready = is_enrolled(tid1) && is_enrolled(tid2);
+                    if ready || Instant::now() >= deadline {
+                        break ready;
+                    }
+                    std::thread::yield_now();
+                };
+                assert_eq!(peer.send_to(b"w", client).expect("release parent"), 1);
+                both_parked
+            }));
+        },
+        default_dispatcher(),
+    )
+    .expect("two-poller pselect6 run");
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "two-poller select: {:?}",
+        outcome.run
+    );
+    assert!(
+        sender
+            .expect("gate sender")
+            .join()
+            .expect("join gate sender"),
+        "both pselect6 children must be simultaneously enrolled on the 2-vCPU pool"
+    );
+}
+
+/// #2588: pselect6's temporary mask blocks SIGUSR1 for the wait only. The
+/// writer signals the parked reader before writing: the wait reports the
+/// pipe rather than EINTR, the persistent mask comes back, and the pending
+/// signal's handler runs after the call.
+#[test]
+fn native_child_pselect6_sigmask_holds_a_signal_until_the_wait_ends() {
+    native_child_select_wake(&["-DSELECT_SIGMASK"], default_dispatcher());
+}
+
+fn default_dispatcher() -> carrick_kernel::dispatch::SyscallDispatcher {
+    carrick_kernel::dispatch::SyscallDispatcher::default()
+}
+
+#[test]
+fn native_child_pselect6_times_out_then_reports_eof() {
+    let elf = kvm_pool_fixture::assemble_fixture(
+        "native_pipe_poll_wake.S",
+        &[
+            "-DUSE_PSELECT",
+            "-DSELECT_TIMEOUT_EOF",
+            "-DSELECT_GATE_PORT=0",
+        ],
+    );
+    let program =
+        carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("timed select fixture");
+    let outcome = kvm_pool_fixture::try_run_program_with_root_affinity_typed(
+        &program,
+        256,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |_| {},
+    )
+    .unwrap_or_else(|failure| panic!("timed select: {}", failure.error));
+    assert_eq!(outcome.run.exit_code, 7, "timed select: {:?}", outcome.run);
+}
+
+fn native_child_select_wake(
+    variant: &[&str],
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+) {
+    use carrick_sched_core::{RecordId, ZONE_RECORDS};
+    use std::time::{Duration, Instant};
+
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("select gate peer");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set the gate socket deadline");
+    let port = format!(
+        "-DSELECT_GATE_PORT={}",
+        peer.local_addr()
+            .expect("gate socket address")
+            .port()
+            .swap_bytes()
+    );
+    let mut flags = vec!["-DUSE_PSELECT", "-DCHILD_POLLS", port.as_str()];
+    flags.extend_from_slice(variant);
+    let elf = kvm_pool_fixture::assemble_fixture("native_pipe_poll_wake.S", &flags);
+    let program =
+        carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("pselect6 fixture");
+    let mut sender = None;
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        256,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |carrier| {
+            let zone = carrier.carrier_zone_wake().expect("carrier wake domain");
+            sender = Some(std::thread::spawn(move || {
+                let mut pid = [0; 4];
+                let (count, client) = peer.recv_from(&mut pid).expect("sibling writer");
+                assert_eq!(count, pid.len());
+                let tid = u64::from(u32::from_ne_bytes(pid));
+                let deadline = Instant::now() + Duration::from_secs(4);
+                let parked = loop {
+                    let enrolled =
+                        (1..ZONE_RECORDS as u32)
+                            .filter_map(RecordId::from_raw)
+                            .any(|id| {
+                                let record = zone.zone().record(id);
+                                record.identity().tid == tid
+                                    && record.has_adapter_operation()
+                                    && record
+                                        .object_wait_census()
+                                        .is_some_and(|wait| wait.queue != 0)
+                            });
+                    if enrolled || Instant::now() >= deadline {
+                        break enrolled;
+                    }
+                    std::thread::yield_now();
+                };
+                assert_eq!(peer.send_to(b"w", client).expect("release gate writer"), 1);
+                parked
+            }));
+        },
+        dispatcher,
+    )
+    .expect("pselect6 run");
+    assert_eq!(outcome.run.exit_code, 7, "child select: {:?}", outcome.run);
+    assert!(
+        sender
+            .expect("gate sender")
+            .join()
+            .expect("join gate sender"),
+        "child pselect6 never enrolled"
+    );
+}
