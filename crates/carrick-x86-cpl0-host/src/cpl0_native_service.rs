@@ -353,7 +353,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         }
                         match self.prepare_native_backing_grant(execution, window, file, reply)? {
                             Ok(anonymous_owner::BackingPreparation::Prepared(Some(pending))) => {
-                                self.native_backing_pending.insert(address, pending);
+                                self.native_backing_pending.insert(address, *pending);
                                 true
                             }
                             Ok(anonymous_owner::BackingPreparation::Prepared(None)) => false,
