@@ -288,6 +288,139 @@ fn native_child_pselect6_sigmask_holds_a_signal_until_the_wait_ends() {
     native_child_select_wake(&["-DSELECT_SIGMASK"], default_dispatcher());
 }
 
+/// #2621: apt's refused shape on x86. A fork child's
+/// `pselect6(nfds, {A, B}, {W}, NULL, timeout, NULL)` over three zone pipes
+/// answers at once with the write bit, then (W full) parks on every member
+/// until its live parent writes B only: exactly B's read bit, an empty
+/// write set.
+#[test]
+fn native_child_pselect6_multi_fd_wakes_on_one_parent_pipe() {
+    native_multifd_select(&[]);
+}
+
+/// #2621: nothing in the set is ready; a 20 ms pselect6 returns 0 after
+/// its deadline with both sets and the timeout cleared.
+#[test]
+fn native_child_pselect6_multi_fd_times_out() {
+    let elf = kvm_pool_fixture::assemble_fixture(
+        "native_multifd_select.S",
+        &["-DSET_TIMEOUT", "-DSELECT_GATE_PORT=0"],
+    );
+    let program =
+        carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("timed set fixture");
+    let outcome = kvm_pool_fixture::try_run_program_with_root_affinity_typed(
+        &program,
+        256,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |_| {},
+    )
+    .unwrap_or_else(|failure| panic!("timed set: {}", failure.error));
+    assert_eq!(outcome.run.exit_code, 7, "timed set: {:?}", outcome.run);
+}
+
+/// #2621: a caught SIGUSR1 (no SA_RESTART) ends a parked multi-fd wait
+/// with EINTR, after the handler ran. On x86 KVM the detached Signal
+/// handback of ANY parked ring select is never published (#2607, the same
+/// stall for one descriptor), so the poller never returns; the ARM venue
+/// and the host settlement witness the EINTR answer meanwhile.
+#[test]
+#[ignore = "#2607: x86 KVM never publishes a parked ring wait's detached Signal handback"]
+fn native_child_pselect6_multi_fd_signal_interrupts() {
+    native_multifd_select(&["-DSET_EINTR"]);
+}
+
+/// #2621: the pselect6 mask blocks SIGUSR1 across a multi-fd wait; the
+/// parent's write ends it, the persistent mask comes back and the handler
+/// runs after the call.
+#[test]
+fn native_child_pselect6_multi_fd_sigmask_holds_a_signal() {
+    native_multifd_select(&["-DSET_SIGMASK"]);
+}
+
+/// #2621: two fork children park in multi-fd pselect6 at once on the
+/// default 2-vCPU pool; their parent must still run, see both enrolled, and
+/// wake both with one write.
+#[test]
+fn native_two_children_multi_fd_pselect6_release_default_pool_capacity() {
+    native_multifd_select(&["-DTWO_POLLERS"]);
+}
+
+/// Run `native_multifd_select.S`: the parent sends the poller pids through
+/// the gate socket and acts only once every poller is enrolled in a wait.
+fn native_multifd_select(variant: &[&str]) {
+    use carrick_sched_core::{RecordId, ZONE_RECORDS};
+    use std::time::{Duration, Instant};
+
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("select gate peer");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set the gate socket deadline");
+    let port = format!(
+        "-DSELECT_GATE_PORT={}",
+        peer.local_addr()
+            .expect("gate socket address")
+            .port()
+            .swap_bytes()
+    );
+    let mut flags = vec![port.as_str()];
+    flags.extend_from_slice(variant);
+    let elf = kvm_pool_fixture::assemble_fixture("native_multifd_select.S", &flags);
+    let program =
+        carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("multi-fd fixture");
+    let mut sender = None;
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        512,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |carrier| {
+            let zone = carrier.carrier_zone_wake().expect("carrier wake domain");
+            sender = Some(std::thread::spawn(move || {
+                let mut pids = [0u8; 8];
+                let (count, client) = peer.recv_from(&mut pids).expect("parent gate");
+                assert_eq!(count, pids.len());
+                let tids = [&pids[..4], &pids[4..]]
+                    .map(|pid| u64::from(u32::from_ne_bytes(pid.try_into().unwrap())));
+                let deadline = Instant::now() + Duration::from_secs(4);
+                let all_parked = loop {
+                    let is_enrolled = |tid: u64| {
+                        tid == 0
+                            || (1..ZONE_RECORDS as u32)
+                                .filter_map(RecordId::from_raw)
+                                .any(|id| {
+                                    let record = zone.zone().record(id);
+                                    record.identity().tid == tid
+                                        && record.has_adapter_operation()
+                                        && record
+                                            .object_wait_census()
+                                            .is_some_and(|wait| wait.queue != 0)
+                                })
+                    };
+                    let ready = tids.iter().all(|&tid| is_enrolled(tid));
+                    if ready || Instant::now() >= deadline {
+                        break ready;
+                    }
+                    std::thread::yield_now();
+                };
+                assert_eq!(peer.send_to(b"w", client).expect("release parent"), 1);
+                all_parked
+            }));
+        },
+        default_dispatcher(),
+    )
+    .expect("multi-fd pselect6 run");
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "multi-fd select: {:?}",
+        outcome.run
+    );
+    assert!(
+        sender
+            .expect("gate sender")
+            .join()
+            .expect("join gate sender"),
+        "every multi-fd pselect6 poller must be enrolled before the parent acts"
+    );
+}
+
 fn default_dispatcher() -> carrick_kernel::dispatch::SyscallDispatcher {
     carrick_kernel::dispatch::SyscallDispatcher::default()
 }
