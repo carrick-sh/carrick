@@ -148,7 +148,44 @@ fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
 
 #[test]
 fn native_child_select_timeval_wakes_on_sibling_pipe_write() {
-    native_child_select_wake("-DUSE_SELECT_TIMEVAL");
+    native_child_select_wake(&["-DUSE_SELECT_TIMEVAL"], default_dispatcher());
+}
+
+/// #2588: apt's shape. A fork child selects with no timeout on a pipe its
+/// live parent writes only after the host observes the child's enrollment.
+#[test]
+fn native_child_pselect6_wakes_on_parent_pipe_write() {
+    native_child_select_wake(&["-DPARENT_WRITES"], default_dispatcher());
+}
+
+/// #2588: the writer is a fork child that makes the pipe its stdout and
+/// execs a static successor, as apt's fetch methods do.
+#[test]
+fn native_child_pselect6_wakes_on_exec_successor_write() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = kvm_pool_fixture::assemble_fixture("native_exec_marker.S", &[]);
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let mut dispatcher = default_dispatcher();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    native_child_select_wake(&["-DEXEC_WRITER", &define], dispatcher);
+}
+
+/// #2588: pselect6's temporary mask blocks SIGUSR1 for the wait only. The
+/// writer signals the parked reader before writing: the wait reports the
+/// pipe rather than EINTR, the persistent mask comes back, and the pending
+/// signal's handler runs after the call.
+#[test]
+fn native_child_pselect6_sigmask_holds_a_signal_until_the_wait_ends() {
+    native_child_select_wake(&["-DSELECT_SIGMASK"], default_dispatcher());
+}
+
+fn default_dispatcher() -> carrick_kernel::dispatch::SyscallDispatcher {
+    carrick_kernel::dispatch::SyscallDispatcher::default()
 }
 
 #[test]
@@ -173,7 +210,7 @@ fn native_child_pselect6_times_out_then_reports_eof() {
     assert_eq!(outcome.run.exit_code, 7, "timed select: {:?}", outcome.run);
 }
 
-fn native_child_select_wake(variant: &str) {
+fn native_child_select_wake(variant: &[&str], dispatcher: carrick_kernel::dispatch::SyscallDispatcher) {
     use carrick_sched_core::{RecordId, ZONE_RECORDS};
     use std::time::{Duration, Instant};
 
@@ -187,10 +224,9 @@ fn native_child_select_wake(variant: &str) {
             .port()
             .swap_bytes()
     );
-    let elf = kvm_pool_fixture::assemble_fixture(
-        "native_pipe_poll_wake.S",
-        &["-DUSE_PSELECT", "-DCHILD_POLLS", variant, &port],
-    );
+    let mut flags = vec!["-DUSE_PSELECT", "-DCHILD_POLLS", port.as_str()];
+    flags.extend_from_slice(variant);
+    let elf = kvm_pool_fixture::assemble_fixture("native_pipe_poll_wake.S", &flags);
     let program =
         carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("pselect6 fixture");
     let mut sender = None;
@@ -227,7 +263,7 @@ fn native_child_select_wake(variant: &str) {
                 parked
             }));
         },
-        carrick_kernel::dispatch::SyscallDispatcher::default(),
+        dispatcher,
     )
     .expect("pselect6 run");
     assert_eq!(outcome.run.exit_code, 7, "child select: {:?}", outcome.run);

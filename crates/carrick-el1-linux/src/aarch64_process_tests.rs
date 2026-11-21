@@ -12608,6 +12608,17 @@ fn serial_host_native_epoll_pwait_sigmask_on_a_ring_epoll_is_never_forwarded() {
     native_descriptor_witness(None, false, false, false, false, false, true, false);
 }
 
+/// #2588: a native child's pselect6 with a temporary sigmask parks in ring
+/// on an inherited zone pipe under that mask, wakes on a live sibling's write
+/// and restores the persistent mask.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_pselect6_sigmask_on_a_zone_pipe_parks_in_ring() {
+    native_descriptor_argument_witness(
+        None, false, false, false, false, false, false, false, None, None, true,
+    );
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_netpoll_eventfd_wait() {
@@ -12731,6 +12742,7 @@ fn native_descriptor_witness(
         poll_inherited_pipe,
         None,
         None,
+        false,
     );
 }
 
@@ -12748,6 +12760,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_prepared_pollfd() {
         true,
         None,
         Some(PreparedPollArgument::Pollfd),
+        false,
     );
 }
 
@@ -12765,6 +12778,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_prepared_timeout() {
         true,
         None,
         Some(PreparedPollArgument::Timeout),
+        false,
     );
 }
 
@@ -12792,6 +12806,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_unmapped_argument() {
         true,
         None,
         Some(PreparedPollArgument::Unmapped),
+        false,
     );
 }
 
@@ -12809,6 +12824,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_forbidden_argument() {
         true,
         None,
         Some(PreparedPollArgument::Forbidden),
+        false,
     );
 }
 
@@ -12826,6 +12842,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_shared_eventfd_input() {
         true,
         None,
         Some(PreparedPollArgument::EventfdInput),
+        false,
     );
 }
 
@@ -12955,6 +12972,7 @@ fn native_descriptor_metadata_witness(
         false,
         metadata,
         None,
+        false,
     );
 }
 
@@ -12971,6 +12989,7 @@ fn native_descriptor_argument_witness(
     poll_inherited_pipe: bool,
     metadata: Option<pipe_metadata_tests::Case>,
     prepared_timeout: Option<PreparedPollArgument>,
+    select_sigmask: bool,
 ) {
     use crate::ipc::IpcTables;
     use carrick_abi::{
@@ -14153,6 +14172,127 @@ fn native_descriptor_argument_witness(
                 .iter()
                 .all(|count| count.load(Ordering::Relaxed) == 0)
         );
+        return;
+    }
+
+    if select_sigmask {
+        // #2588: pselect(3) callers pass a temporary sigmask. Two live tasks
+        // share the inherited pipe (fd 3 reads, fd 4 writes): child 0 waits
+        // with the mask while child 1 makes the pipe readable. The call is
+        // served in ring under the shared readiness owner, never forwarded.
+        use carrick_personality_linux::crossing::nr as sys;
+        use carrick_test_support::GuestUserBuffer;
+        let pselect = sys::PSELECT6.raw();
+        let forwarded = || counters.forwarded[pselect as usize].load(Ordering::Relaxed);
+        let sigusr1 = 1u64 << (10 - 1);
+        let mask = GuestUserBuffer::from_bytes(&sigusr1.to_ne_bytes());
+        let pair = |len: u64| GuestUserBuffer::from_value([mask.arg(), len]);
+        let (sized, short) = (pair(8), pair(4));
+        let empty = GuestUserBuffer::from_value([0u64, 8]);
+        let zero = GuestUserBuffer::from_value([0u64, 0]);
+        let read_bit = (1u64 << 3).to_ne_bytes();
+        let mut read_set = GuestUserBuffer::from_bytes(&read_bit);
+        let control = |binding: &super::native_process_runtime::NativeRecordBinding<
+            AddressContext<RootGpa>,
+            Aarch64ParkedContext,
+        >| {
+            let address = fixture
+                .zone
+                .record(binding.record.id)
+                .identity()
+                .control_slot;
+            assert_ne!(address, 0);
+            // SAFETY: the live zone record retains its published control slot.
+            unsafe {
+                &*(address as *const carrick_personality_linux::abi::thread::ThreadControlSlot)
+            }
+        };
+        let (waiter, writer) = (&child_bindings[0], &child_bindings[1]);
+        let waiter_control = control(waiter);
+        let original = waiter_control.blocked();
+        let in_ring = |(route, result): (CompletionRoute, i64)| {
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "pselect6 with a sigmask must be served in ring, got {route:?} ({result}); \
+                 forwarded pselect6 {}",
+                forwarded()
+            );
+            result
+        };
+        // A set size other than sizeof(sigset_t) is EINVAL, in ring.
+        assert_eq!(
+            in_ring(run_binding6(
+                waiter,
+                pselect,
+                [4, read_set.arg(), 0, 0, zero.arg(), short.arg()]
+            )),
+            -22
+        );
+        // A NULL set leaves the mask alone, whatever its size.
+        assert_eq!(
+            in_ring(run_binding6(
+                waiter,
+                pselect,
+                [4, read_set.arg(), 0, 0, zero.arg(), empty.arg()]
+            )),
+            0
+        );
+        // Nothing ready, zero timeout: the set is cleared and the mask is
+        // never changed by a call that does not park.
+        read_set.as_mut_bytes().copy_from_slice(&read_bit);
+        assert_eq!(
+            in_ring(run_binding6(
+                waiter,
+                pselect,
+                [4, read_set.arg(), 0, 0, zero.arg(), sized.arg()]
+            )),
+            0
+        );
+        assert_eq!(read_set.as_bytes(), &[0; 8]);
+        assert_eq!(waiter_control.blocked(), original);
+        assert!(!waiter_control.forwarded_wait_mask_armed());
+
+        // Nothing ready, no timeout: the wait parks in ring under the mask.
+        read_set.as_mut_bytes().copy_from_slice(&read_bit);
+        let wait = [4, read_set.arg(), 0, 0, 0, sized.arg()];
+        task.linux.mark_pending_host_work();
+        let (route, _) = run_binding6(waiter, pselect, wait);
+        assert_eq!(
+            route,
+            CompletionRoute::Suspended,
+            "a zone pipe select with a sigmask must park in ring (forwarded {})",
+            forwarded()
+        );
+        assert!(fixture.zone.record(waiter.record.id).has_object_operation());
+        assert!(waiter_control.forwarded_wait_mask_armed());
+        assert_eq!(waiter_control.blocked().0, sigusr1);
+
+        // The peer task makes the pipe readable; the waiter re-enters the
+        // same call, reports the descriptor and has its own mask back.
+        activate_target(source, &task, writer);
+        let payload = GuestUserBuffer::from_bytes(b"peer");
+        assert_eq!(
+            in_ring(run_binding(
+                writer,
+                sys::WRITE.raw(),
+                [4, payload.arg(), 4, 0]
+            )),
+            4
+        );
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, writer.record.id)
+                .is_queued()
+        );
+        activate_target(source, &task, waiter);
+        read_set.as_mut_bytes().fill(0);
+        assert_eq!(in_ring(run_binding6(waiter, pselect, wait)), 1);
+        assert_eq!(read_set.as_bytes(), &read_bit);
+        assert!(!fixture.zone.record(waiter.record.id).has_object_operation());
+        assert!(!waiter_control.forwarded_wait_mask_armed());
+        assert_eq!(waiter_control.blocked(), original);
+        assert_eq!(forwarded(), 0);
         return;
     }
 
