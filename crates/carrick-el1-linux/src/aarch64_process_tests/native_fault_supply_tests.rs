@@ -218,6 +218,13 @@ fn native_fork_child_refills_retires_and_reuses_thread_stock() {
     child_thread_admission(6, 3, ChildStockCase::Reuse);
 }
 
+/// Admit sixteen simultaneous workers through the real ARM clone entry.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_fork_child_admits_sixteen_live_siblings() {
+    child_thread_admission(16, 1, ChildStockCase::Reuse);
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn native_fork_child_waits_for_final_retired_control_pin() {

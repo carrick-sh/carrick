@@ -166,6 +166,7 @@ embed = [
   "carrick-vmm-kvm::cpl0_initial_mm::{production_sibling_raw_exits_clear_tid_under_editor_contention,production_raw_exit_clear_tid_busy_once_reruns_in_ring} (#2359: real KVM production pool; two clone threads raw-exit at once on two CPUs for 32 rounds and every exit retires in ring, plus a busy-once clear-tid copy-out census of 32 refusals and 32 completed reruns on the test image; red on main with a host forward binding mismatch)",
   "carrick-vmm-kvm::cpl0_entry::production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation (#2095: real KVM CPL0 test image; the leader's fork is held inside its birth reservation until the worker's wait4 for an exited child parks, then the release wakes it to reap the zombie without EAGAIN)",
   "carrick-vmm-kvm::cpl0_entry::production_fork_waits_while_sibling_fork_holds_birth_reservation (#2242: real KVM CPL0 test image; the leader's fork is held inside its birth reservation until the worker's own fork parks, then the release wakes it to rerun its fork without EAGAIN)",
+  "carrick-vmm-kvm::cpl0_thread_stock::{root_holds_sixteen_live_threads_then_exit_group,fork_child_holds_sixteen_live_threads_then_exit_group,root_creates_and_joins_twenty_four_threads,fork_child_creates_and_joins_twenty_four_threads,ninth_live_clone_has_bounded_carrier_exits} (#2734: production root and fork child, consecutive tids, live blocked workers, nonfinal raw exit and clear-tid join, group exit, sequential churn, and a bounded ninth-clone workload)",
 ]
 
 # Post-exec process forks use a distinct child lifecycle page and require no
@@ -244,6 +245,7 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::{arm_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation,arm_wait4_reaps_zombie_while_sibling_vfork_holds_birth_reservation} (#2095: a sibling on a second vCPU calls blocking wait4 for an exited child while the forking thread holds its birth reservation inside the stock loan crossing; the wait parks and reaps after the release, and a vfork caller stays suspended)",
   "carrick-el1-linux::native_process_runtime::host_test_support::{reap_refused_by_sibling_birth_parks_then_reaps,host_request_during_wait4_park_yields_then_reparks,host_request_during_vfork_park_yields_then_reparks} (#2095: Busy once, then success for the reap refused by a sibling birth and for a child-wait or vfork park refused by a host request)",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::{arm_fork_waits_while_sibling_fork_holds_birth_reservation,arm_vfork_waits_while_sibling_fork_holds_birth_reservation} (#2242: a sibling on a second vCPU calls fork, or Go's CLONE_VM|CLONE_VFORK|SIGCHLD, while the forking thread holds its birth reservation inside the stock loan crossing; the clone parks, re-enters its exact SVC after the release, and forks instead of returning EAGAIN)",
+  "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::native_fork_child_admits_sixteen_live_siblings (#2734: real ARM syscall entry, sixteen simultaneous native child births)",
 ]
 
 [bindings.unresolved]
