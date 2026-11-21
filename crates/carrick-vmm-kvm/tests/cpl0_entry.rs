@@ -4334,14 +4334,22 @@ fn legacy_syscalls_run(flags: &[&str], expected: &[u8], expected_refusals: &[(us
         .map(|(nr, count)| (nr, count.load(std::sync::atomic::Ordering::Acquire)))
         .filter(|&(_, count)| count != 0)
         .collect();
+    let venue_refused: Vec<_> = counters
+        .venue_refused
+        .iter()
+        .enumerate()
+        .map(|(nr, count)| (nr, count.load(std::sync::atomic::Ordering::Acquire)))
+        .filter(|&(_, count)| count != 0)
+        .collect();
     assert_eq!(
         (
             outcome.run.exit_code,
             outcome.run.stdout.as_slice(),
-            refused.as_slice()
+            refused.as_slice(),
+            venue_refused.as_slice()
         ),
-        (0, expected, expected_refusals),
-        "(exit, syscall results, counted refusals)"
+        (0, expected, expected_refusals, [].as_slice()),
+        "(exit, syscall results, counted refusals, venue refusals)"
     );
     if flags.contains(&"-DNAMESPACE") {
         assert_eq!(
@@ -4380,11 +4388,13 @@ fn serial_host_root_legacy_namespace_syscalls_match_linux() {
 
 #[test]
 fn serial_host_fork_child_legacy_namespace_syscalls_use_canonical_owners() {
-    // The readlinkat and mknodat owners still refuse these child calls.
+    // Legacy readlink (89) and readlinkat (267) are both served by the
+    // canonical readlinkat owner (4 bytes of "file", no refusal of either
+    // kind); the mknod owners still refuse their child calls.
     legacy_syscalls_run(
         &["-DNAMESPACE", "-DCHILD"],
-        &[0, 0, 0, 0, 0, 0, 38, 38, 38, 38],
-        &[(89, 1), (133, 1), (259, 1), (267, 1)],
+        &[0, 0, 0, 0, 0, 0, 4, 4, 38, 38],
+        &[(133, 1), (259, 1)],
     );
 }
 
