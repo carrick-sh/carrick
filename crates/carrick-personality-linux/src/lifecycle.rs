@@ -265,7 +265,7 @@ pub trait CopyoutEffect: Send {
     fn commit(&mut self) -> Result<(), carrick_syscall_abi::LinuxErrno>;
 }
 
-/// A sample and the calibration read from the caller's mapped vvar.
+/// A sample and the carrier's ring-published realtime calibration.
 pub struct RealtimeCounter {
     pub tick: CounterTick,
     pub frequency: CounterFrequency,
@@ -276,7 +276,7 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn monotonic_counter(&mut self) -> Option<(CounterTick, CounterFrequency)> {
         None
     }
-    /// Sample the counter and the caller’s published vvar calibration.
+    /// Sample the counter and the carrier’s ring-published realtime calibration.
     fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
         None
     }
@@ -647,7 +647,7 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn monotonic_counter(&mut self) -> Option<(CounterTick, CounterFrequency)> {
         None
     }
-    /// Sample the counter and the caller’s published vvar calibration.
+    /// Sample the counter and the carrier’s ring-published realtime calibration.
     fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
         None
     }
