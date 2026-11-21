@@ -1561,3 +1561,336 @@ fn soft_sysv_shm_alias_publishes_kernel_frame_inventory() {
         run.frame_inventory
     );
 }
+
+const NR_GETPID: u64 = 172;
+const PROT_EXEC: u64 = 4;
+const MAP_FIXED: u64 = 0x10;
+/// `svc #1` and `svc #2`: Linux ignores the immediate, the decoder keeps it.
+const A64_SVC_1: u32 = 0xd400_0021;
+const A64_SVC_2: u32 = 0xd400_0041;
+const A64_B_BACK_1: u32 = 0x17ff_ffff;
+const A64_B_BACK_2: u32 = 0x17ff_fffe;
+const SCRATCH_OFFSET: u64 = 0x800;
+const PATCH_PATH_OFFSET: u64 = 0x80;
+
+/// How the rewrite witness retires the code page once it has run the
+/// replacement words.
+#[derive(Clone, Copy)]
+enum CodeRetirement {
+    ProtNone,
+    /// A `MAP_FIXED` private file mapping replaces the page's backing.
+    Remap,
+}
+
+#[derive(Clone, Copy)]
+enum ResidencyPlan {
+    /// `svc; b .-4`: `getpid` handoffs, then `exit_group(0)`.
+    Loop { handoffs: u64 },
+    /// `svc; str x2, [x1]; b .-8`: rewrite the `svc` with a guest store,
+    /// then with a host `read`, then retire the page.
+    Rewrite(CodeRetirement),
+}
+
+/// Drives the production carrier with real decode and dispatch. Each
+/// `prepare` is one emitted block; the first word of every `svc` block it
+/// runs records which code incarnation was served.
+struct ResidencyExecutor {
+    bridge: SequenceHvc2Executor,
+    plan: ResidencyPlan,
+    svc_visits: u64,
+    fd: u64,
+    prepared: Arc<std::sync::atomic::AtomicU64>,
+    served: Arc<Mutex<Vec<u32>>>,
+}
+
+impl ResidencyExecutor {
+    fn record(&self, block: &TranslatedBlock) -> Result<(), String> {
+        let word = block
+            .guest()
+            .instructions()
+            .first()
+            .map(|i| i.word())
+            .ok_or("empty svc block")?;
+        self.served
+            .lock()
+            .map_err(|_| "poisoned served".to_owned())?
+            .push(word);
+        Ok(())
+    }
+
+    fn svc(&mut self, cpu: &mut CpuState, block: &TranslatedBlock) -> Result<(), String> {
+        self.record(block)?;
+        self.svc_visits += 1;
+        let visit = self.svc_visits;
+        let (nr, args) = match self.plan {
+            ResidencyPlan::Loop { handoffs } if visit <= handoffs => (NR_GETPID, [0; 6]),
+            ResidencyPlan::Loop { .. } => (NR_EXIT_GROUP, [0; 6]),
+            ResidencyPlan::Rewrite(retire) => match visit {
+                1 => (NR_GETPID, [0; 6]),
+                2 => (
+                    NR_MPROTECT,
+                    [
+                        CODE_VA,
+                        GUEST_PAGE_BYTES,
+                        PROT_READ | PROT_WRITE | PROT_EXEC,
+                        0,
+                        0,
+                        0,
+                    ],
+                ),
+                3 => (
+                    NR_OPENAT,
+                    [AT_FDCWD, DATA_VA + PATCH_PATH_OFFSET, O_CLOEXEC, 0, 0, 0],
+                ),
+                4 => {
+                    let fd = rx(cpu, 0);
+                    if (fd as i64) < 3 {
+                        return Err(format!("openat(/patch) failed: {}", fd as i64));
+                    }
+                    self.fd = fd;
+                    (NR_READ, [fd, CODE_VA, 4, 0, 0, 0])
+                }
+                5 if rx(cpu, 0) == 4 => match retire {
+                    CodeRetirement::ProtNone => {
+                        (NR_MPROTECT, [CODE_VA, GUEST_PAGE_BYTES, 0, 0, 0, 0])
+                    }
+                    CodeRetirement::Remap => (
+                        NR_MMAP,
+                        [
+                            CODE_VA,
+                            GUEST_PAGE_BYTES,
+                            PROT_READ | PROT_EXEC,
+                            MAP_PRIVATE | MAP_FIXED,
+                            self.fd,
+                            0,
+                        ],
+                    ),
+                },
+                5 => return Err(format!("read(/patch) returned {}", rx(cpu, 0) as i64)),
+                _ => {
+                    return Err(format!(
+                        "retired code ran again at visit {visit} (x0={})",
+                        rx(cpu, 0) as i64
+                    ));
+                }
+            },
+        };
+        ScriptedHvc2Executor::set_call(cpu, nr, args);
+        Ok(())
+    }
+
+    fn store(&self, cpu: &mut CpuState) {
+        // After the second `svc` (the RWX mprotect), overwrite the `svc`
+        // word with `svc #1` and keep this store; otherwise write scratch.
+        let (at, value) = match self.plan {
+            ResidencyPlan::Rewrite(_) if self.svc_visits == 2 => (
+                CODE_VA,
+                u64::from(A64_SVC_1) | (u64::from(A64_STR_X2_X1) << 32),
+            ),
+            _ => (DATA_VA + SCRATCH_OFFSET, 0),
+        };
+        wx(cpu, 1, at);
+        wx(cpu, 2, value);
+    }
+}
+
+impl ExecuteBlock for ResidencyExecutor {
+    type Error = String;
+    type Code = ();
+
+    fn prepare(&mut self, _block: &TranslatedBlock) -> Result<(), Self::Error> {
+        self.prepared.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn execute(
+        &mut self,
+        block: &TranslatedBlock,
+        code: &(),
+        cpu: &mut CpuState,
+    ) -> Result<usize, Self::Error> {
+        if cpu.pstate.el != ExceptionLevel::El0 {
+            return self.bridge.execute(block, code, cpu);
+        }
+        match cpu.pc.0 {
+            CODE_VA => self.svc(cpu, block)?,
+            pc if pc == CODE_VA + 4
+                && self.svc_visits == 5
+                && matches!(self.plan, ResidencyPlan::Rewrite(CodeRetirement::Remap)) =>
+            {
+                // Only the remapped file page reaches here: it holds `svc #3`.
+                if (rx(cpu, 0) as i64) != CODE_VA as i64 {
+                    return Err(format!("mmap(MAP_FIXED) returned {}", rx(cpu, 0) as i64));
+                }
+                self.record(block)?;
+                ScriptedHvc2Executor::set_call(cpu, NR_EXIT_GROUP, [7, 0, 0, 0, 0, 0]);
+            }
+            pc if pc == CODE_VA + 4 && matches!(self.plan, ResidencyPlan::Rewrite(_)) => {
+                self.store(cpu);
+            }
+            pc if pc == CODE_VA + 4 || pc == CODE_VA + 8 => {}
+            pc => return Err(format!("unexpected user PC {pc:#x}")),
+        }
+        match block.terminator() {
+            Terminator::Handler(idx) | Terminator::Jump(idx) | Terminator::Fallthrough(idx) => {
+                Ok(idx)
+            }
+            Terminator::Conditional { .. } => Err("unexpected conditional terminator".to_owned()),
+        }
+    }
+}
+
+struct ResidencyRun {
+    run: carrick_softcpu_aarch64_host::SoftProcessRun<ResidencyExecutor>,
+    prepared: u64,
+    served: Vec<u32>,
+}
+
+fn run_residency(
+    plan: ResidencyPlan,
+    rootfs: Option<&std::path::Path>,
+) -> Result<ResidencyRun, String> {
+    let code_words: &[u32] = match plan {
+        ResidencyPlan::Loop { .. } => &[A64_SVC_0, A64_B_BACK_1],
+        ResidencyPlan::Rewrite(_) => &[A64_SVC_0, A64_STR_X2_X1, A64_B_BACK_2],
+    };
+    let elf = build_witness_elf(code_words, &[(PATCH_PATH_OFFSET as usize, b"/patch\0")]);
+    let mailbox = Arc::new(AtomicPtr::new(null_mut()));
+    let prepared = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let served = Arc::new(Mutex::new(Vec::new()));
+    let executor = ResidencyExecutor {
+        bridge: SequenceHvc2Executor {
+            mailbox: Arc::clone(&mailbox),
+            calls: Vec::new(),
+            returns: Arc::new(Mutex::new(Vec::new())),
+            next_seq: 1,
+        },
+        plan,
+        svc_visits: 0,
+        fd: 0,
+        prepared: Arc::clone(&prepared),
+        served: Arc::clone(&served),
+    };
+    let mut config = SoftSingleProcessConfig::new(&elf, "/residency");
+    config.rootfs_dir = rootfs;
+    let run = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
+        let mut vec_stub = [0u8; 8];
+        vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+        vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+        engine
+            .backend()
+            .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+            .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+        let ptr = engine
+            .backend()
+            .host_ptr(
+                LINUX_SYSCALL_MAILBOX_BASE,
+                AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+        mailbox.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+        Ok(())
+    })?;
+    let served = served
+        .lock()
+        .map_err(|_| "poisoned served".to_owned())?
+        .clone();
+    Ok(ResidencyRun {
+        run,
+        prepared: prepared.load(Ordering::Relaxed),
+        served,
+    })
+}
+
+/// The loop's hot set (`svc`, `b .-4`, and the `hvc #2` and `eret` vector
+/// blocks) plus the one-time path to the first `svc`.
+const LOOP_EMISSION_BUDGET: u64 = 9;
+
+#[test]
+fn soft_carrier_emits_the_hot_set_once_across_provider_exits() {
+    let _test_guard = lock_soft_carrier_test();
+    let mut emitted = Vec::new();
+    for handoffs in [10, 100] {
+        let ResidencyRun {
+            run,
+            prepared,
+            served,
+        } = run_residency(ResidencyPlan::Loop { handoffs }, None)
+            .expect("residency witness must finish through the production carrier");
+        assert_eq!(run.exit_code, 0);
+        assert_eq!(run.terminating_fault, None);
+        assert_eq!(
+            run.reply_census,
+            Hvc2ReplyCensus {
+                ring_completed: 0,
+                // The handoffs and the final `exit_group`.
+                kernel_dispatched: handoffs + 1,
+                runner_refused: 0,
+            }
+        );
+        assert_eq!(served.len() as u64, handoffs + 1);
+        println!("handoffs={handoffs} emitted_blocks={prepared}");
+        emitted.push(prepared);
+    }
+    assert!(
+        emitted.iter().all(|&e| e <= LOOP_EMISSION_BUDGET),
+        "the carrier re-emits its hot set at provider exits: emitted {emitted:?} \
+         for 10 and 100 handoffs, budget {LOOP_EMISSION_BUDGET}"
+    );
+}
+
+const A64_SVC_3: u32 = 0xd400_0061;
+
+/// `/patch` begins with the `svc #2` read over the `svc`. The remap maps
+/// its first page, which holds `svc #3` where the resident `str` was.
+fn rewrite_rootfs() -> std::io::Result<tempfile::TempDir> {
+    let temp = tempfile::tempdir()?;
+    let mut patch = vec![0; GUEST_PAGE_BYTES as usize];
+    patch[..4].copy_from_slice(&A64_SVC_2.to_le_bytes());
+    patch[4..8].copy_from_slice(&A64_SVC_3.to_le_bytes());
+    std::fs::write(temp.path().join("patch"), &patch)?;
+    Ok(temp)
+}
+
+#[test]
+fn soft_carrier_serves_rewritten_code_and_faults_after_prot_none() {
+    let _test_guard = lock_soft_carrier_test();
+    let rootfs = rewrite_rootfs().expect("create the /patch rootfs");
+    let ResidencyRun { run, served, .. } = run_residency(
+        ResidencyPlan::Rewrite(CodeRetirement::ProtNone),
+        Some(rootfs.path()),
+    )
+    .expect("residency witness must finish through the production carrier");
+    // A guest store, then a host `read` across a provider exit, replace the
+    // resident `svc` block; neither may serve the earlier incarnation.
+    assert_eq!(
+        served,
+        [A64_SVC_0, A64_SVC_0, A64_SVC_1, A64_SVC_1, A64_SVC_2]
+    );
+    // The fetch at `+4` faults instead of serving the resident `str`.
+    assert_eq!(run.exit_code, 128 + 11);
+    let fault = run.terminating_fault.expect("PROT_NONE fetch must fault");
+    assert_eq!(
+        (fault.signum, fault.fault_addr, fault.elr),
+        (11, CODE_VA + 4, CODE_VA + 4)
+    );
+}
+
+#[test]
+fn soft_carrier_serves_rewritten_code_and_the_remapped_page() {
+    let _test_guard = lock_soft_carrier_test();
+    let rootfs = rewrite_rootfs().expect("create the /patch rootfs");
+    let ResidencyRun { run, served, .. } = run_residency(
+        ResidencyPlan::Rewrite(CodeRetirement::Remap),
+        Some(rootfs.path()),
+    )
+    .expect("residency witness must finish through the production carrier");
+    assert_eq!(
+        served,
+        [
+            A64_SVC_0, A64_SVC_0, A64_SVC_1, A64_SVC_1, A64_SVC_2, A64_SVC_3
+        ]
+    );
+    assert_eq!(run.terminating_fault, None);
+    assert_eq!(run.exit_code, 7);
+}
