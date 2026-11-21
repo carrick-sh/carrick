@@ -446,18 +446,21 @@ before comparing the results.
 
 ### Raw realtime reads
 
-The native syscall reads the caller's mapped vvar calibration through the
-exact-MM copy path, samples the guest counter once, and retains one timespec
-across copyout waits. The vvar publisher owns the realtime base and guest
-adjustment. CLOCK_REALTIME_COARSE rounds the same sample down to the
-millisecond grid. The x86 vDSO delegates COARSE to the syscall.
+The native syscall samples the guest counter at the ring counter frequency,
+adds the carrier's zone-published `realtime_offset_ns`, and retains one
+timespec across copyout waits. It never reads the user vvar mapping, so
+unmapping or replacing the vvar page cannot affect syscall realtime reads.
+CLOCK_REALTIME_COARSE rounds the same sample down to the millisecond grid.
+The x86 vDSO delegates COARSE to the syscall.
 
-The KVM witnesses check raw and vDSO ordering in the root, fork child, and
-exec successor. They verify that subtracting the published offset from raw
-realtime puts it between two raw monotonic samples and that the offset
-survives fork and exec. The ARM VM-free witness checks null-output routing
-with a live parent and child. ARM exec-successor calibration is tracked
-separately by #2571.
+The KVM witnesses check raw root `syscall(228, CLOCK_REALTIME)`, survival of
+root and fork-child realtime reads after unmapping the vvar page, and raw vs
+vDSO ordering in the root, fork child, and exec successor. They verify that
+subtracting the published offset from raw realtime puts it between two raw
+monotonic samples and that the offset survives fork and exec. The ARM VM-free
+witnesses check null-output routing with a live parent and child and exact
+realtime/coarse values from the zone calibration with no mapped vvar. ARM
+native exec-successor vvar calibration landed in #2571.
 
 ### Realtime aliases
 
