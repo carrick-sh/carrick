@@ -6,11 +6,26 @@ use carrick_core::lifecycle::stock::{
 
 pub(super) struct NativeThreadStock<'a, C: ProcessContext> {
     controls: &'a [ThreadControlSlot],
-    identities: StockEntries<NativeClaim<'a>>,
+    identities: StockEntries<StockIdentity<'a>>,
     waiters: Vec<carrick_el1_abi::RecordRef>,
     release: Arc<ControlRelease<'a, C>>,
     namespace_exhausted: bool,
 }
+/// One namespace reservation per stocked birth, held until its final pin drops.
+struct StockIdentity<'a> {
+    namespace: &'a NamespaceTable,
+    number: InternalIdentity,
+}
+
+impl Drop for StockIdentity<'_> {
+    fn drop(&mut self) {
+        self.namespace
+            .with_view(&carrick_sched_core::ShortLockSpin, |namespace| {
+                namespace.release(self.number, ClaimKind::Thread);
+            });
+    }
+}
+
 struct ControlRelease<'a, C: ProcessContext> {
     zone: &'a ZoneTables<C>,
     source: carrick_sched_core::object_wait::ObjectNotificationSource<'a, C>,
@@ -33,26 +48,50 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
     ) -> Result<Self, NativeProcessError> {
         let identities =
             StockEntries::for_fresh_root(page).map_err(|_| NativeProcessError::Invalid)?;
-        let mut stock = Self::new(controls, zone, record)?;
-        stock.identities = identities;
-        Ok(stock)
+        Self::new_with_wait(
+            controls,
+            zone,
+            record,
+            identities,
+            &carrick_sched_core::ShortLockSpin,
+        )
     }
     pub(super) fn new(
         controls: &'a [ThreadControlSlot],
         zone: &'a ZoneTables<C>,
         record: carrick_el1_abi::RecordRef,
     ) -> Result<Self, NativeProcessError> {
-        Self::new_with_wait(controls, zone, record, &carrick_sched_core::ShortLockSpin)
+        Self::new_with_wait(
+            controls,
+            zone,
+            record,
+            StockEntries::default(),
+            &carrick_sched_core::ShortLockSpin,
+        )
     }
     fn new_with_wait(
         controls: &'a [ThreadControlSlot],
         zone: &'a ZoneTables<C>,
         record: carrick_el1_abi::RecordRef,
+        mut identities: StockEntries<StockIdentity<'a>>,
         wait: &impl carrick_sched_core::LockWait<C>,
     ) -> Result<Self, NativeProcessError> {
         use carrick_sched_core::object_wait::{
             MemberReleaseGeneration, MemberReleaseIndex, ObjectWaitError, ObjectWaitKey,
         };
+        // Every retained identity occupies one lifecycle slot. Reserve the
+        // matching storage before any slot or namespace identity is published.
+        let capacity = controls
+            .len()
+            .checked_sub(1)
+            .ok_or(NativeProcessError::Invalid)?;
+        identities
+            .try_reserve_exact(capacity)
+            .map_err(|_| NativeProcessError::Busy)?;
+        let mut waiters = Vec::new();
+        waiters
+            .try_reserve_exact(controls.len())
+            .map_err(|_| NativeProcessError::Busy)?;
         let start = record.id.raw() as usize;
         for index in (start..carrick_sched_core::ZONE_RECORDS).chain(0..start) {
             let index = MemberReleaseIndex::new(index).ok_or(NativeProcessError::Invalid)?;
@@ -70,9 +109,9 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
                 Ok(ticket) => {
                     return Ok(Self {
                         controls,
-                        identities: StockEntries::default(),
+                        identities,
                         namespace_exhausted: false,
-                        waiters: Vec::with_capacity(carrick_el1_abi::THREAD_POOL_ENTRIES + 1),
+                        waiters,
                         release: Arc::new(ControlRelease {
                             zone,
                             source: ticket,
@@ -228,9 +267,9 @@ pub(super) fn replenish<'a, M: Clone, C: ProcessContext>(
                 self.stock.namespace_exhausted = true;
                 return false;
             };
-            let claim = NativeClaim {
+            let claim = StockIdentity {
                 namespace: self.namespace,
-                claims: vec![(number, ClaimKind::Thread)],
+                number,
             };
             let Ok(entry) = self.page.stock_with_control(
                 index,
@@ -681,6 +720,7 @@ mod tests {
                 &controls,
                 &zone,
                 record,
+                StockEntries::default(),
                 &carrick_sched_core::BoundedSpin(0)
             ),
             Err(NativeProcessError::Busy)

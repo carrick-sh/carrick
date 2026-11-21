@@ -99,6 +99,13 @@ impl<I> StockEntries<I> {
         self.settle(page, controls)
     }
 
+    pub fn try_reserve_exact(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), alloc::collections::TryReserveError> {
+        self.identities.try_reserve_exact(additional)
+    }
+
     pub fn insert(&mut self, entry: super::EntryRef, identity: I) {
         self.identities.push((entry, identity));
     }
@@ -161,6 +168,12 @@ impl<I> StockEntries<I> {
                         | super::EntryState::Revoked
                 )
             }) && !controls[index + 1].exit_custody().referenced()
+                // A final pin can drop after settle examined this entry. The
+                // predecessor must still be removed before we reuse its slot.
+                && !self
+                    .identities
+                    .iter()
+                    .any(|(entry, _)| entry.index() == index)
         })
     }
 
