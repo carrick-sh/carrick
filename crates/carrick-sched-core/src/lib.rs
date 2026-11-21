@@ -6452,11 +6452,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             if len == 0 && head == NIL {
                 continue;
             }
+            let tail = bucket.tail.load(Ordering::Relaxed);
+            let locked = bucket.lock.load(Ordering::Relaxed) != 0;
             writeln!(
                 out,
-                "zone futex bucket {index}: head={head} tail={} len={len} locked={}",
-                bucket.tail.load(Ordering::Relaxed),
-                bucket.lock.load(Ordering::Relaxed) != 0,
+                "zone futex bucket {index}: head={head} tail={tail} len={len} locked={locked}",
             )?;
         }
         let c = &self.counters;
