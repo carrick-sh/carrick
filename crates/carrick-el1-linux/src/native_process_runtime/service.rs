@@ -649,7 +649,21 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             let owned = queue.wake_owner_operation(record, &operation, slot, Handback::Signal);
             drop(queue);
             if let Some(owned) = owned {
-                crate::sched::object_wait::deliver_completion(self.zone, slot, owned);
+                // The interrupted waiter of an in-zone object is the ring's
+                // own: publish its exact detached transfer here and place it,
+                // as the anonymous-edit arm above does. A carrier completion
+                // chain is no venue for it: x86 CPL0 drains none (#2620).
+                let mut placed = WakeEffects::default();
+                let (_, effects) = owned.deliver_handbacks(&mut |handed| {
+                    if let Some(carrick_sched_core::NativePlacement::Placed(placement)) =
+                        self.zone.place_native_handback(handed)
+                        && placement.resched
+                    {
+                        placed.request_reschedule(placement.slot);
+                    }
+                });
+                service.wake_effects(effects);
+                service.wake_effects(placed);
             }
             return Ok(());
         };
