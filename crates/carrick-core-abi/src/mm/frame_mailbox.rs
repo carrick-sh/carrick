@@ -63,6 +63,16 @@ pub struct FrameGrantResponse {
     pub request: FrameGrantRequest,
 }
 
+/// Result of attempting to publish a prepared grant in its claimed slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameGrantCompletion {
+    Published,
+    SlotNotWorking,
+    StaleRequest,
+    InvalidReady,
+    PublicationDeclined,
+}
+
 /// Host-published bulk first-touch protocol.
 ///
 /// A slot transports a request, never ownership of unpublished leaves. EL1
@@ -181,9 +191,7 @@ impl FrameGrantMailbox {
         let Some(end) = ready.semantic_base.checked_add(ready.len) else {
             return false;
         };
-        ready.mm_key == request.mm_key
-            && ready.request_generation == request.request_generation
-            && ready.semantic_base.is_multiple_of(Self::PAGE_SIZE)
+        ready.semantic_base.is_multiple_of(Self::PAGE_SIZE)
             && ready.physical_ipa.is_multiple_of(Self::PAGE_SIZE)
             && ready.len != 0
             && ready.len <= request.requested_len
@@ -314,20 +322,38 @@ impl FrameGrantMailbox {
         publish: impl FnOnce(FrameGrantReady) -> Result<bool, E>,
         commit: impl FnOnce(),
     ) -> Result<bool, E> {
-        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING
-            || !self
-                .load_request()
-                .is_some_and(|request| Self::ready_is_valid(request, ready))
+        self.complete_grant_with_outcome(ready, publish, commit)
+            .map(|outcome| outcome == FrameGrantCompletion::Published)
+    }
+
+    /// Same publication protocol, retaining the exact mailbox rejection
+    /// for the host fault handler's event ring.
+    pub fn complete_grant_with_outcome<E>(
+        &self,
+        ready: FrameGrantReady,
+        publish: impl FnOnce(FrameGrantReady) -> Result<bool, E>,
+        commit: impl FnOnce(),
+    ) -> Result<FrameGrantCompletion, E> {
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING {
+            return Ok(FrameGrantCompletion::SlotNotWorking);
+        }
+        let Some(request) = self.load_request() else {
+            return Ok(FrameGrantCompletion::StaleRequest);
+        };
+        if request.mm_key != ready.mm_key || request.request_generation != ready.request_generation
         {
-            return Ok(false);
+            return Ok(FrameGrantCompletion::StaleRequest);
+        }
+        if !Self::ready_is_valid(request, ready) {
+            return Ok(FrameGrantCompletion::InvalidReady);
         }
         if !publish(ready)? {
-            return Ok(false);
+            return Ok(FrameGrantCompletion::PublicationDeclined);
         }
         commit();
         self.state
             .store(FRAME_GRANT_MAILBOX_IDLE, Ordering::Release);
-        Ok(true)
+        Ok(FrameGrantCompletion::Published)
     }
 
     pub fn publish_refusal(&self, status: u64) -> bool {
@@ -350,6 +376,13 @@ impl FrameGrantMailbox {
     /// A root-owner wait releases the vCPU slot; a later fault on its current
     /// slot creates a fresh request rather than retaining this slot across park.
     pub fn abandon_unstarted_request(&self, request: FrameGrantRequest) -> bool {
+        self.release_claim(request)
+    }
+
+    /// Release a claimed request after every prepared physical and descriptor
+    /// effect was rolled back. A declined publication is "not now": the
+    /// faulting instruction reruns and may publish a freshly planned request.
+    pub fn release_declined_publication(&self, request: FrameGrantRequest) -> bool {
         self.release_claim(request)
     }
 
@@ -732,5 +765,98 @@ mod layout_manifest {
             32768,
             64
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn frame_grant_completion_identifies_why_publication_did_not_run() {
+        let mailbox = FrameGrantMailbox::new();
+        let request = FrameGrantRequest {
+            mm_key: 41,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
+            request_generation: 3118,
+            fault_va: 0x0060_0304_1000,
+            requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+            access: 2,
+        };
+        let mut ready = FrameGrantReady {
+            mm_key: request.mm_key,
+            request_generation: request.request_generation,
+            semantic_base: 0x0060_0301_0000,
+            physical_ipa: 0x9000_0000,
+            len: 306 * 4096,
+            permissions: 3,
+            frame_id: 1,
+            mapping_id: 2,
+            owner_generation: 3,
+            inventory_revision: 4,
+        };
+        let without_publication = |ready| {
+            mailbox.complete_grant_with_outcome::<()>(ready, |_| unreachable!(), || unreachable!())
+        };
+        assert_eq!(
+            without_publication(ready),
+            Ok(FrameGrantCompletion::SlotNotWorking)
+        );
+        assert!(mailbox.try_publish_request(request));
+        assert_eq!(mailbox.claim_request(), Some(request));
+        ready.request_generation += 1;
+        assert_eq!(
+            without_publication(ready),
+            Ok(FrameGrantCompletion::StaleRequest)
+        );
+        ready.request_generation = request.request_generation;
+        ready.owner_generation = 0;
+        assert_eq!(
+            without_publication(ready),
+            Ok(FrameGrantCompletion::InvalidReady)
+        );
+        ready.owner_generation = 3;
+        assert_eq!(
+            mailbox.complete_grant_with_outcome(ready, |_| Ok::<_, ()>(false), || unreachable!()),
+            Ok(FrameGrantCompletion::PublicationDeclined)
+        );
+        assert_eq!(
+            mailbox.complete_grant_with_outcome(ready, |_| Ok::<_, ()>(true), || {}),
+            Ok(FrameGrantCompletion::Published)
+        );
+        assert!(!mailbox.has_guest_work());
+    }
+
+    #[test]
+    fn declined_publication_can_replan_after_rollback() {
+        let mailbox = FrameGrantMailbox::new();
+        let request = FrameGrantRequest {
+            mm_key: 41,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
+            request_generation: 3118,
+            fault_va: 0x0060_0304_1000,
+            requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+            access: 2,
+        };
+        let ready = FrameGrantReady {
+            mm_key: request.mm_key,
+            request_generation: request.request_generation,
+            semantic_base: request.fault_va,
+            physical_ipa: 0x9000_0000,
+            len: 4096,
+            permissions: 3,
+            frame_id: 1,
+            mapping_id: 2,
+            owner_generation: 3,
+            inventory_revision: 4,
+        };
+        assert!(mailbox.try_publish_request(request));
+        assert_eq!(mailbox.claim_request(), Some(request));
+        assert_eq!(
+            mailbox.complete_grant_with_outcome(ready, |_| Ok::<_, ()>(false), || unreachable!()),
+            Ok(FrameGrantCompletion::PublicationDeclined)
+        );
+        assert!(mailbox.release_declined_publication(request));
+        assert!(!mailbox.has_guest_work());
     }
 }

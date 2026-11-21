@@ -419,6 +419,43 @@ pub(super) enum ChildRelease<'a> {
     Unrun,
 }
 
+fn resolve_cpl0_residency<M: CarrierMemoryIo>(
+    memory: &CarrierMemory<M>,
+) -> Result<
+    carrick_core_abi::mm::residency::ResolvedResidencyTable<
+        carrick_core_abi::mm::residency::NoDynamicResidencyPin,
+    >,
+    TrapError,
+> {
+    // SAFETY: the retained aligned residency table initialized at boot.
+    let table = unsafe {
+        memory.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(FrameGpa::new(
+            KERNEL_REGION_GPA + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+        ))
+    }
+    .map_err(|e| fail(e.to_string()))?;
+    let bootstrap_size = carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize;
+    let bootstrap_ptr = memory
+        .retained_bytes_ptr(FrameGpa::new(ALLOCATOR_GPA), bootstrap_size)
+        .map_err(|e| fail(e.to_string()))?;
+    let mut resolved = carrick_core_abi::mm::residency::ResolvedResidencyTable::new();
+    // SAFETY: `table` and `bootstrap_ptr` belong to this live carrier's
+    // retained RAM and remain mapped while `memory` is borrowed.
+    unsafe {
+        resolved.refresh(
+            table,
+            &carrick_core_abi::mm::residency::NoDynamicResidencyResolver,
+            Some((
+                X86_CPL0_BOOTSTRAP_METADATA_BASE,
+                bootstrap_size,
+                bootstrap_ptr,
+            )),
+        )
+    }
+    .map_err(|e| fail(format!("cpl0 residency extension resolution: {e:?}")))?;
+    Ok(resolved)
+}
+
 /// Release a reclaimed child's carrier-wide state: its frame-inventory rows
 /// and COW residency (shared composition), then its CR3/alias registrations
 /// and the memslots admitted only for it.
@@ -428,23 +465,27 @@ pub(super) fn release_retired_child<M: CarrierMemoryIo>(
     absence: &SlotAbsence,
     release: ChildRelease<'_>,
 ) -> Result<crate::carrier_memory::RetiredChild, TrapError> {
-    // SAFETY: the retained aligned residency table initialized at boot.
-    let residency = unsafe {
-        memory.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(FrameGpa::new(
-            KERNEL_REGION_GPA + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
-        ))
-    }
-    .map_err(|e| fail(e.to_string()))?;
+    let residency = resolve_cpl0_residency(memory)?;
+    let residency_view = residency
+        .view()
+        .ok_or_else(|| fail("cpl0 residency view unavailable"))?;
     let released = match release {
         ChildRelease::Retired { returns, zone } => zone
             .spaces
             .unpublished(absence.mm().raw())
             .is_some_and(|absent| {
-                carrick_hal::fork_stock::release_child_mm(inventory, residency, returns, &absent)
+                carrick_hal::fork_stock::release_child_mm(
+                    inventory,
+                    &residency_view,
+                    returns,
+                    &absent,
+                )
             }),
-        ChildRelease::Unrun => {
-            carrick_hal::fork_stock::release_unrun_child_mm(inventory, residency, absence.mm())
-        }
+        ChildRelease::Unrun => carrick_hal::fork_stock::release_unrun_child_mm(
+            inventory,
+            &residency_view,
+            absence.mm(),
+        ),
     };
     if !released {
         return Err(fail("retired child inventory or residency release"));
@@ -454,8 +495,8 @@ pub(super) fn release_retired_child<M: CarrierMemoryIo>(
         .map_err(|e| fail(e.to_string()))
 }
 
-fn rollback_fork_parent_residency(
-    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+fn rollback_fork_parent_residency<S: carrick_core_abi::mm::residency::FrameGrantResidencyAccess>(
+    residency: &carrick_el1_abi::FrameGrantResidencyTable<S>,
     publications: &[(usize, carrick_el1_abi::FrameGrantResidencyIdentity)],
 ) -> Result<(), TrapError> {
     for &(slot, identity) in publications.iter().rev() {
@@ -1420,17 +1461,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                                 trap_error = Some(fail(e.to_string()));
                                 ForkStockRefusal::Inventory
                             })?;
-                            // SAFETY: same retained kernel region as the original COW pool.
-                            let residency = unsafe {
-                                vm.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(
-                                    FrameGpa::new(
-                                        KERNEL_REGION_GPA
-                                            + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
-                                    ),
-                                )
-                            }
-                            .map_err(|e| {
-                                trap_error = Some(fail(e.to_string()));
+                            let resolved_residency = resolve_cpl0_residency(&vm).map_err(|e| {
+                                trap_error = Some(e);
+                                ForkStockRefusal::Inventory
+                            })?;
+                            let residency = resolved_residency.view().ok_or_else(|| {
+                                trap_error = Some(fail("physical fork residency view"));
                                 ForkStockRefusal::Inventory
                             })?;
                             let parent =
@@ -1498,7 +1534,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 .is_err()
         };
         if refused && !parent_residency.is_empty() {
-            rollback_fork_parent_residency(self.cow_residency()?, &parent_residency)?;
+            let residency = self.cow_residency()?;
+            let view = residency
+                .view()
+                .ok_or_else(|| fail("physical fork rollback residency view"))?;
+            rollback_fork_parent_residency(&view, &parent_residency)?;
         }
         if refused && inventory_published.get() {
             if root_installed.get() {
@@ -1510,12 +1550,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     &absence,
                     ChildRelease::Unrun,
                 )?;
-            } else if !carrick_hal::fork_stock::release_unrun_child_mm(
-                &*frame_inventory,
-                self.cow_residency()?,
-                loan.request.child_mm,
-            ) {
-                return Err(fail("unpublished child inventory rollback"));
+            } else {
+                let residency = self.cow_residency()?;
+                let view = residency
+                    .view()
+                    .ok_or_else(|| fail("unpublished child rollback residency view"))?;
+                if !carrick_hal::fork_stock::release_unrun_child_mm(
+                    &*frame_inventory,
+                    &view,
+                    loan.request.child_mm,
+                ) {
+                    return Err(fail("unpublished child inventory rollback"));
+                }
             }
         }
         if let Some(err) = trap_error {
@@ -1655,14 +1701,15 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         .map_err(|error| fail(error.to_string()))
     }
 
-    fn cow_residency(&self) -> Result<&carrick_el1_abi::FrameGrantResidencyTable, TrapError> {
-        // SAFETY: same retained kernel region as the original COW pool.
-        unsafe {
-            self._vm.retained_record(FrameGpa::new(
-                KERNEL_REGION_GPA + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
-            ))
-        }
-        .map_err(|error| fail(error.to_string()))
+    fn cow_residency(
+        &self,
+    ) -> Result<
+        carrick_core_abi::mm::residency::ResolvedResidencyTable<
+            carrick_core_abi::mm::residency::NoDynamicResidencyPin,
+        >,
+        TrapError,
+    > {
+        resolve_cpl0_residency(&self._vm)
     }
 
     fn supply_cow_grant(
@@ -1725,8 +1772,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             ._vm
             .frame_identity(mm, run.old_ipa)
             .map_err(|error| fail(error.to_string()))?;
-        let resident = self
-            .cow_residency()?
+        let residency = self.cow_residency()?;
+        let residency_view = residency
+            .view()
+            .ok_or_else(|| fail("owner COW source residency view"))?;
+        let resident = residency_view
             .lookup(mm.get(), run.va)
             .ok_or_else(|| fail("owner COW source residency"))?;
         let identity = resident.identity;
@@ -1735,7 +1785,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             || identity.mapping_id != source_identity.mapping_id.get()
             || identity.owner_generation != source_identity.owner_generation.get()
             || identity.inventory_revision != source_identity.inventory_revision.get()
-            || !self.cow_residency()?.is_guest_committed(mm.get(), run.va)
+            || !residency_view.is_guest_committed(mm.get(), run.va)
         {
             return Err(fail("owner COW source custody mismatch"));
         }
@@ -1919,10 +1969,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         ) {
             return Err(fail("owner COW exact completed receipt absent"));
         }
-        match self
-            .cow_residency()?
-            .lookup(receipt.grant.mm_key, receipt.span_va)
-        {
+        let residency = self.cow_residency()?;
+        let residency_view = residency
+            .view()
+            .ok_or_else(|| fail("owner COW replacement residency view"))?;
+        match residency_view.lookup(receipt.grant.mm_key, receipt.span_va) {
             Some(resident) => {
                 if resident.expected_ipa != receipt.new_ipa
                     || resident.identity.frame_id != receipt.grant.backing.frame_id.get()
@@ -1931,9 +1982,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         != receipt.grant.backing.owner_generation.get()
                     || resident.identity.inventory_revision
                         != receipt.grant.backing.inventory_revision.get()
-                    || !self
-                        .cow_residency()?
-                        .is_guest_committed(receipt.grant.mm_key, receipt.span_va)
+                    || !residency_view.is_guest_committed(receipt.grant.mm_key, receipt.span_va)
                 {
                     return Err(fail("owner COW replacement residency identity"));
                 }
@@ -2122,15 +2171,54 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             return self.settle_cow_grant(index, execution);
         }
         if let Some(PendingGrant::Prepare(pending)) = self.anonymous_pending[index].take() {
+            use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
             let reply = self
                 .grant_portal()?
                 .grant(index)
                 .ok_or_else(|| fail("owner grant slot"))?
                 as *const carrick_el1_abi::PortalGrantSlot;
             // SAFETY: the carrier retains this initialized physical reply.
-            if !self.settle_backing_grant(pending, unsafe { &*reply }, None)? {
-                return Err(fail("owner grant refused"));
+            let reply = unsafe { &*reply };
+            let applied = reply
+                .inspect_receipt(pending.window, &pending.txn)
+                .is_some_and(|receipt| matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+            if applied {
+                if !self.settle_backing_grant(pending, reply, None)? {
+                    return Err(fail("owner grant refused"));
+                }
+                return Ok(());
             }
+            // The guest settles a refused receipt, or a window it could not
+            // serve, before it parks: this CPU's slot is per-CPU custody and
+            // its member may resume elsewhere. The refused or withdrawn
+            // backing is cancelled at this exclusion, or at the MM's next one.
+            let ram = Arc::clone(&self.ram);
+            let zone = retained_cow_zone(&ram)?;
+            let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
+            let delivery = |zone: &X86Cpl0Zone,
+                            waker: Waker,
+                            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_sched_core::ParkedContextWords,
+            >| wake.deliver(zone, waker, owned);
+            let release = SpaceReleaseVenue {
+                zone,
+                waker: Waker::Host,
+                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                    &delivery,
+                ),
+            };
+            match self.settled_pause(release, pending.window.operation.mm)? {
+                Ok((pause, _)) => {
+                    self.settle_backing_grant(pending, reply, Some(&pause))?;
+                    drop(pause);
+                }
+                Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => {
+                    self.settle_backing_grant(pending, reply, None)?;
+                }
+                Err(_) => return Err(fail("owner grant settlement MM changed")),
+            }
+            wake.finish()?;
             return Ok(());
         }
         // Hardware faults and kernel-owned user copies share this crossing.
@@ -2144,7 +2232,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         {
             return self.supply_cow_grant(index, execution, window);
         }
-        let (_, window) = self
+        let (generation, window) = self
             .grant_portal()?
             .grant(index)
             .ok_or_else(|| fail("owner grant slot"))?
@@ -2156,8 +2244,17 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .ok_or_else(|| fail("owner grant slot"))?
             as *const carrick_el1_abi::PortalGrantSlot;
         // SAFETY: the carrier retains this initialized slot across staging.
-        let pending = self.prepare_backing_grant(execution, window, file, unsafe { &*reply })?;
-        self.anonymous_pending[index] = pending.map(PendingGrant::Prepare);
+        let reply = unsafe { &*reply };
+        match self.prepare_native_backing_grant(execution, window, file, reply)? {
+            Ok(pending) => self.anonymous_pending[index] = pending.map(PendingGrant::Prepare),
+            // Another CPU holds this MM's editor: the selection is returned
+            // unserved and its member parks on that editor's release.
+            Err(_wait) => {
+                if !reply.cancel_fault_selection(window, generation) {
+                    return Err(fail("contended owner fault selection changed"));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2228,11 +2325,19 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     ) -> Result<bool, TrapError> {
         use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
         let index = pending.execution.cpu.raw() as usize;
-        let receipt = reply.take_receipt(pending.window, &pending.txn);
+        let (receipt, trace) = reply
+            .take_receipt_with_trace(pending.window, &pending.txn)
+            .map_or((None, None), |(receipt, trace)| (Some(receipt), trace));
         if let Some(receipt) = &receipt
             && (receipt.id != pending.txn.id || receipt.digest != pending.txn.digest())
         {
             return Err(fail("owner grant receipt identity"));
+        }
+        if let Some(event) = trace.and_then(|trace| trace.event) {
+            carrick_hal::diagnostic_capture::trace_descriptor_diagnostic(
+                carrick_guest_arch::GuestIsa::X86_64,
+                event,
+            );
         }
         let undo = match receipt.as_ref().map(|receipt| &receipt.outcome) {
             Some(DescriptorOutcome::Applied(_)) => false,
@@ -2244,17 +2349,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             None => return Err(fail("owner grant receipt absent")),
         };
         if undo {
-            let _proof = exclusion
-                .ok_or_else(|| fail("owner grant refused"))?
-                .proof();
             // The exact withdrawn or rolled-back receipt proves that none of
             // these fresh bytes are named by a guest descriptor.
             pending.inventory.guest_exposed = false;
-            unsafe {
-                self._vm
-                    .cancel_prepared(&[pending.handle], &mut pending.inventory)
-            }
-            .map_err(|error| fail(error.to_string()))?;
             if let Some(receipt) = &receipt {
                 self.fork_stock
                     .settle_native_descriptor_tables(
@@ -2275,6 +2372,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         pending.txn.id.generation,
                     )
                     .map_err(|error| fail(format!("Prepare table withdrawal: {error:?}")))?;
+            }
+            if let Some(pause) = exclusion {
+                self.cancel_withdrawn_backing(pending, pause.proof())?;
+            } else {
+                self.cancelled_backing_pending.push(pending);
             }
             return Ok(false);
         }
@@ -2326,6 +2428,44 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // Retained stage-2 custody now belongs to the live guest graph.
         let _retained = pending.handle;
         Ok(true)
+    }
+
+    /// Cancel a refused or withdrawn backing at an exclusion of its MM.
+    pub(super) fn cancel_withdrawn_backing(
+        &mut self,
+        mut pending: PendingPrepare,
+        excluded: &carrick_el1_abi::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        if excluded.key() != pending.window.operation.mm.raw() {
+            return Err(fail("withdrawn backing exclusion MM mismatch"));
+        }
+        pending.inventory.guest_exposed = false;
+        // SAFETY: `excluded` proves no guest editor of this MM is active, and
+        // the exact withdrawn or refused receipt proved no guest descriptor
+        // ever named `pending.handle`.
+        unsafe {
+            self._vm
+                .cancel_prepared(&[pending.handle], &mut pending.inventory)
+        }
+        .map_err(|error| fail(error.to_string()))
+    }
+
+    /// Cancel every refused or withdrawn backing of the excluded MM that
+    /// was settled while its exclusion was busy.
+    pub(super) fn drain_cancelled_backing_for_excluded(
+        &mut self,
+        excluded: &carrick_el1_abi::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        let mut retained = Vec::new();
+        for pending in core::mem::take(&mut self.cancelled_backing_pending) {
+            if pending.window.operation.mm.raw() == excluded.key() {
+                self.cancel_withdrawn_backing(pending, excluded)?;
+            } else {
+                retained.push(pending);
+            }
+        }
+        self.cancelled_backing_pending = retained;
+        Ok(())
     }
 
     pub(super) fn prepare_native_backing_grant(
@@ -2598,7 +2738,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 "Prepare table transaction tracking: {error:?}"
             )));
         }
-        if !reply.submit(window, &txn) {
+        if !reply.submit_with_trace(
+            window,
+            &txn,
+            carrick_hal::diagnostic_capture::trace_grant_refusals(),
+        ) {
             unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
                 .map_err(|error| fail(error.to_string()))?;
             self.fork_stock

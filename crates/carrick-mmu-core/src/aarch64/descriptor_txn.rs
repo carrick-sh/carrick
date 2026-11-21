@@ -565,7 +565,8 @@ impl DescriptorOp {
         }
     }
 
-    fn kind(&self) -> u64 {
+    /// Wire operation kind, also used by descriptor diagnostics.
+    pub fn kind(&self) -> u64 {
         match self {
             Self::Prepare { .. } => Self::KIND_PREPARE,
             Self::Publish { .. } => Self::KIND_PUBLISH,
@@ -1066,6 +1067,9 @@ impl VerifiedDescriptorReceipt {
 /// address. EL1 implements it over the primary-table alias; tests implement
 /// it over host memory and can inject failures.
 pub use crate::live_descriptor_words::LiveDescriptorWords;
+use crate::live_descriptor_words::{
+    DescriptorDiagnostic, DescriptorPlanRefusalSite, GrantRefusalTrace,
+};
 
 /// One journaled live store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1086,6 +1090,24 @@ pub trait DescriptorJournal {
     fn push(&mut self, entry: JournalEntry) -> bool;
     fn entries(&self) -> &[JournalEntry];
     fn clear(&mut self);
+}
+
+impl<J: DescriptorJournal + ?Sized> DescriptorJournal for &mut J {
+    fn reserve(&mut self, entries: usize) -> bool {
+        (**self).reserve(entries)
+    }
+
+    fn push(&mut self, entry: JournalEntry) -> bool {
+        (**self).push(entry)
+    }
+
+    fn entries(&self) -> &[JournalEntry] {
+        (**self).entries()
+    }
+
+    fn clear(&mut self) {
+        (**self).clear();
+    }
 }
 
 /// Inline storage for small transactions with fallible heap spill.
@@ -1192,6 +1214,7 @@ pub const DESCRIPTOR_TXN_RECEIPT: u32 = 4;
 pub const DESCRIPTOR_TXN_HOST_CONSUMING: u32 = 5;
 
 const OUTCOME_APPLIED: u64 = 1;
+const GRANT_TRACE_REQUESTED: u64 = u64::MAX;
 const OUTCOME_REFUSED: u64 = 2;
 const OUTCOME_ROLLED_BACK: u64 = 3;
 const OUTCOME_INDETERMINATE: u64 = 4;
@@ -1272,6 +1295,10 @@ impl DescriptorTxnSlot {
 
     /// Host: publish one transaction. `false` when the slot is busy.
     pub fn submit(&self, txn: &DescriptorTxn) -> bool {
+        self.submit_with_grant_trace(txn, false)
+    }
+
+    pub fn submit_with_grant_trace(&self, txn: &DescriptorTxn, trace: bool) -> bool {
         if self
             .state
             .compare_exchange(
@@ -1312,6 +1339,10 @@ impl DescriptorTxnSlot {
                 Ordering::Relaxed,
             );
         }
+        self.receipt_outcome.store(
+            if trace { GRANT_TRACE_REQUESTED } else { 0 },
+            Ordering::Relaxed,
+        );
         self.state
             .store(DESCRIPTOR_TXN_SUBMITTED, Ordering::Release);
         true
@@ -1466,7 +1497,7 @@ impl DescriptorTxnSlot {
         })
     }
 
-    fn publish_receipt(&self, receipt: &DescriptorReceipt) {
+    fn publish_receipt(&self, receipt: &DescriptorReceipt, trace: Option<GrantRefusalTrace>) {
         let (outcome, refusal, applied) = match receipt.outcome {
             DescriptorOutcome::Applied(applied) => (OUTCOME_APPLIED, 0, Some(applied)),
             DescriptorOutcome::Refused(r) => (OUTCOME_REFUSED, r as u32, None),
@@ -1498,16 +1529,21 @@ impl DescriptorTxnSlot {
             .store(u64::from(applied.flush_required), Ordering::Relaxed);
         self.receipt_reclaimed_len
             .store(applied.reclaimed.len() as u64, Ordering::Relaxed);
+        // Only a refused outcome uses these words for diagnostics. Reclaim
+        // ownership is decoded exclusively for an applied outcome.
+        let trace = if matches!(
+            receipt.outcome,
+            DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_)
+        ) {
+            trace.map(GrantRefusalTrace::words)
+        } else {
+            None
+        };
+        let payload = trace
+            .as_ref()
+            .map_or_else(|| applied.reclaimed.as_slice(), |words| &words[..]);
         for (index, word) in self.receipt_reclaimed.iter().enumerate() {
-            word.store(
-                applied
-                    .reclaimed
-                    .as_slice()
-                    .get(index)
-                    .copied()
-                    .unwrap_or(0),
-                Ordering::Relaxed,
-            );
+            word.store(payload.get(index).copied().unwrap_or(0), Ordering::Relaxed);
         }
         self.state.store(DESCRIPTOR_TXN_RECEIPT, Ordering::Release);
     }
@@ -1516,6 +1552,21 @@ impl DescriptorTxnSlot {
     /// IDLE. The caller authenticates it with [`DescriptorTxn::verify_receipt`]
     /// against its retained submission.
     pub fn take_receipt(&self, id: DescriptorTxnId) -> Option<DescriptorReceipt> {
+        self.consume_receipt(id, |receipt| receipt)
+    }
+
+    pub fn take_receipt_with_grant_trace(
+        &self,
+        id: DescriptorTxnId,
+    ) -> Option<(DescriptorReceipt, Option<GrantRefusalTrace>)> {
+        self.consume_receipt(id, |receipt| (receipt, self.read_grant_trace(&receipt)))
+    }
+
+    fn consume_receipt<T>(
+        &self,
+        id: DescriptorTxnId,
+        take: impl FnOnce(DescriptorReceipt) -> T,
+    ) -> Option<T> {
         if self.state.load(Ordering::Acquire) != DESCRIPTOR_TXN_RECEIPT
             || self.mm_key.load(Ordering::Relaxed) != id.mm_key.get()
             || self.generation.load(Ordering::Relaxed) != id.generation.get()
@@ -1530,7 +1581,7 @@ impl DescriptorTxnSlot {
                 Ordering::Acquire,
             )
             .ok()?;
-        let receipt = self.read_receipt(id);
+        let receipt = take(self.read_receipt(id));
         self.state.store(DESCRIPTOR_TXN_IDLE, Ordering::Release);
         Some(receipt)
     }
@@ -1545,6 +1596,28 @@ impl DescriptorTxnSlot {
             return None;
         }
         Some(self.read_receipt(id))
+    }
+
+    /// Observe a retained reply before consumption by its serialized owner.
+    pub fn inspect_receipt_with_grant_trace(
+        &self,
+        id: DescriptorTxnId,
+    ) -> Option<(DescriptorReceipt, Option<GrantRefusalTrace>)> {
+        let receipt = self.inspect_receipt(id)?;
+        Some((receipt, self.read_grant_trace(&receipt)))
+    }
+
+    fn read_grant_trace(&self, receipt: &DescriptorReceipt) -> Option<GrantRefusalTrace> {
+        if !matches!(
+            receipt.outcome,
+            DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_)
+        ) || self.receipt_reclaimed[0].load(Ordering::Relaxed) == 0
+        {
+            return None;
+        }
+        GrantRefusalTrace::decode(core::array::from_fn(|i| {
+            self.receipt_reclaimed[i].load(Ordering::Relaxed)
+        }))
     }
 
     fn read_receipt(&self, id: DescriptorTxnId) -> DescriptorReceipt {
@@ -1608,6 +1681,20 @@ impl ClaimedDescriptorTxn<'_> {
             .map_err(|_| DescriptorRefusal::BadEncoding)
     }
 
+    pub fn grant_trace_requested(&self) -> bool {
+        self.slot.receipt_outcome.load(Ordering::Relaxed) == GRANT_TRACE_REQUESTED
+    }
+
+    /// Release an unmodified submission back to `SUBMITTED` so the owner can
+    /// unwind its editor, grow carrier metadata or enrol on a typed wait, and
+    /// later reclaim or let the host withdraw the exact submission. Call only
+    /// before writing any descriptor word or publishing residency.
+    pub fn release_unapplied(self) {
+        self.slot
+            .state
+            .store(DESCRIPTOR_TXN_SUBMITTED, Ordering::Release);
+    }
+
     /// Publish EL1's outcome. A malformed submission receives a
     /// `BadEncoding` refusal regardless of `outcome`.
     ///
@@ -1622,6 +1709,15 @@ impl ClaimedDescriptorTxn<'_> {
         self,
         outcome: DescriptorOutcome,
         invalidate_asid: impl FnOnce(),
+    ) -> DescriptorReceipt {
+        self.complete_with_grant_trace(outcome, invalidate_asid, None)
+    }
+
+    pub fn complete_with_grant_trace(
+        self,
+        outcome: DescriptorOutcome,
+        invalidate_asid: impl FnOnce(),
+        trace: Option<GrantRefusalTrace>,
     ) -> DescriptorReceipt {
         let receipt = match self.txn {
             Ok(txn) => DescriptorReceipt {
@@ -1643,7 +1739,7 @@ impl ClaimedDescriptorTxn<'_> {
         if outcome_requires_invalidation(&receipt.outcome) {
             invalidate_asid();
         }
-        self.slot.publish_receipt(&receipt);
+        self.slot.publish_receipt(&receipt, trace);
         receipt
     }
 }
@@ -1653,6 +1749,7 @@ impl ClaimedDescriptorTxn<'_> {
 pub trait TableMaintenance {
     fn publish_barrier(&self);
     fn invalidate_range(&self, va: u64, len: u64);
+    fn descriptor_diagnostic(&self, _event: DescriptorDiagnostic) {}
 }
 
 /// No-op maintenance for callers that change only terminal permissions or
@@ -1833,15 +1930,15 @@ enum Loc {
     Fresh(Option<u64>),
 }
 
-struct Executor<'a, W: ?Sized, J: ?Sized> {
-    words: &'a W,
+struct Executor<'a> {
+    words: &'a dyn LiveDescriptorWords,
     op: DescriptorOp,
     start: u64,
     end: u64,
     apply: bool,
     grants: &'a [u64],
     grants_used: usize,
-    journal: &'a mut J,
+    journal: &'a mut dyn DescriptorJournal,
     planned_live_stores: usize,
     /// Primary arena base (the root): bounds which tables are spare.
     root: u64,
@@ -1852,7 +1949,7 @@ struct Executor<'a, W: ?Sized, J: ?Sized> {
     reclaimed: ReclaimedTables,
 }
 
-impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_, W, J> {
+impl Executor<'_> {
     /// Visit the in-range entries of a live table. Returns whether the table
     /// is now reclaimable: a reclaiming op, a reclaimable level, a spare page,
     /// and every entry reclaimable by the shared predicate, judged on the
@@ -2519,7 +2616,7 @@ fn validate_op(op: &DescriptorOp) -> Result<(), DescriptorRefusal> {
     }
 }
 
-fn roll_back<W: LiveDescriptorWords + ?Sized>(words: &W, journal: &[JournalEntry]) -> bool {
+fn roll_back(words: &dyn LiveDescriptorWords, journal: &[JournalEntry]) -> bool {
     for entry in journal.iter().rev() {
         if words.compare_exchange(entry.pa, entry.after, entry.before) != Ok(true) {
             return false;
@@ -2544,14 +2641,11 @@ pub struct DescriptorPlan {
     pub reclaimed_tables: usize,
 }
 
-fn plan_validated<W>(
-    words: &W,
+fn plan_validated(
+    words: &dyn LiveDescriptorWords,
     root: u64,
     op: DescriptorOp,
-) -> Result<DescriptorPlan, DescriptorRefusal>
-where
-    W: LiveDescriptorWords + ?Sized,
-{
+) -> Result<DescriptorPlan, DescriptorRefusal> {
     let span = op.span();
     let end = span.end().ok_or(DescriptorRefusal::BadRange)?;
     let mut no_journal = SliceJournal::new(&mut []);
@@ -2570,7 +2664,15 @@ where
         reclaimed_count: 0,
         reclaimed: ReclaimedTables::NONE,
     };
-    plan.visit_live_table(root, 0, 0)?;
+    plan.visit_live_table(root, 0, 0).inspect_err(|&reason| {
+        words.descriptor_diagnostic(DescriptorDiagnostic::PlanRefused {
+            site: DescriptorPlanRefusalSite::Walk,
+            reason,
+            op_kind: op.kind(),
+            live_stores: plan.planned_live_stores,
+            table_grants: plan.grants_used,
+        });
+    })?;
     Ok(DescriptorPlan {
         table_grants: plan.grants_used,
         live_stores: plan.planned_live_stores,
@@ -2596,7 +2698,7 @@ where
     if root == 0 || !root.is_multiple_of(PT_PAGE) {
         return Err(DescriptorRefusal::StaleRoot);
     }
-    plan_validated(words, root, op)
+    plan_validated(&words, root, op)
 }
 
 /// Apply one descriptor operation to the live graph rooted at `root`.
@@ -2619,6 +2721,17 @@ where
     W: LiveDescriptorWords + ?Sized,
     J: DescriptorJournal + ?Sized,
 {
+    let mut journal_ref = journal;
+    execute_descriptor_op_dyn(&words, root, op, tables, &mut journal_ref)
+}
+
+fn execute_descriptor_op_dyn(
+    words: &dyn LiveDescriptorWords,
+    root: SubstrateGpa,
+    op: DescriptorOp,
+    tables: &TableGrants,
+    journal: &mut dyn DescriptorJournal,
+) -> DescriptorOutcome {
     if let Err(refusal) = validate_op(&op) {
         return DescriptorOutcome::Refused(refusal);
     }
@@ -2645,9 +2758,23 @@ where
     let end = span.va + span.len;
     let (grants_needed, live_stores) = (plan.table_grants, plan.live_stores);
     if grants_needed > tables.len() {
+        words.descriptor_diagnostic(DescriptorDiagnostic::PlanRefused {
+            site: DescriptorPlanRefusalSite::TableGrants,
+            reason: DescriptorRefusal::TablesExhausted,
+            op_kind: op.kind(),
+            live_stores,
+            table_grants: grants_needed,
+        });
         return DescriptorOutcome::Refused(DescriptorRefusal::TablesExhausted);
     }
     if !journal.reserve(live_stores) {
+        words.descriptor_diagnostic(DescriptorDiagnostic::PlanRefused {
+            site: DescriptorPlanRefusalSite::JournalReserve,
+            reason: DescriptorRefusal::JournalCapacity,
+            op_kind: op.kind(),
+            live_stores,
+            table_grants: grants_needed,
+        });
         return DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity);
     }
     let mut apply = Executor {
@@ -2658,7 +2785,7 @@ where
         apply: true,
         grants: tables.as_slice(),
         grants_used: 0,
-        journal: &mut *journal,
+        journal,
         planned_live_stores: 0,
         root,
         reclaim_budget: op.reclaim_budget(),
@@ -2692,6 +2819,13 @@ where
             })
         }
         Err(refusal) => {
+            words.descriptor_diagnostic(DescriptorDiagnostic::PlanRefused {
+                site: DescriptorPlanRefusalSite::Apply,
+                reason: refusal,
+                op_kind: op.kind(),
+                live_stores,
+                table_grants: grants_needed,
+            });
             let restored = roll_back(words, journal.entries());
             journal.clear();
             if restored {
@@ -3218,6 +3352,23 @@ mod tests {
         assert!(!slot.withdraw(other));
         assert!(slot.withdraw(txn.id));
         assert!(slot.claim_for_mm(7).is_none());
+        assert_eq!(slot.state(), DESCRIPTOR_TXN_IDLE);
+    }
+
+    #[test]
+    fn released_unapplied_claim_can_be_reclaimed_or_withdrawn() {
+        let slot = DescriptorTxnSlot::new();
+        let txn = prepare_txn(5);
+        assert!(slot.submit(&txn));
+        let claimed = slot.claim_for_mm(7).unwrap();
+        assert_eq!(slot.state(), DESCRIPTOR_TXN_GUEST_APPLYING);
+        assert!(!slot.withdraw(txn.id));
+        claimed.release_unapplied();
+        assert_eq!(slot.state(), DESCRIPTOR_TXN_SUBMITTED);
+        let reclaimed = slot.claim_for_mm(7).unwrap();
+        assert_eq!(reclaimed.txn(), Ok(&txn));
+        reclaimed.release_unapplied();
+        assert!(slot.withdraw(txn.id));
         assert_eq!(slot.state(), DESCRIPTOR_TXN_IDLE);
     }
 
@@ -4342,11 +4493,17 @@ mod tests {
             // A journal that cannot hold the planned stores refuses up front.
             let words = fixture(3);
             let before = words.image();
+            let diagnostic = Cell::new(None);
+            let observe = |event| diagnostic.set(Some(event));
+            let observed = crate::live_descriptor_words::ObservedDescriptorWords {
+                words: &words,
+                observe: Some(&observe),
+            };
             let mut storage = [JournalEntry::default(); 2];
             let mut journal = SliceJournal::new(&mut storage);
             assert_eq!(
                 execute_descriptor_op(
-                    &words,
+                    &observed,
                     SubstrateGpa(ROOT),
                     prepare(4, PageSpan::EMPTY, true),
                     &TableGrants::NONE,
@@ -4355,6 +4512,16 @@ mod tests {
                 DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity)
             );
             assert_eq!(words.image(), before);
+            assert_eq!(
+                diagnostic.get(),
+                Some(DescriptorDiagnostic::PlanRefused {
+                    site: DescriptorPlanRefusalSite::JournalReserve,
+                    reason: DescriptorRefusal::JournalCapacity,
+                    op_kind: DescriptorOp::KIND_PREPARE,
+                    live_stores: 4,
+                    table_grants: 0,
+                })
+            );
         }
 
         #[test]

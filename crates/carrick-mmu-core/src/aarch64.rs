@@ -2465,6 +2465,10 @@ impl<M: descriptor_txn::TableMaintenance + ?Sized> descriptor_txn::LiveDescripto
     fn invalidate_range(&self, va: u64, len: u64) {
         self.maintenance.invalidate_range(va, len);
     }
+
+    fn descriptor_diagnostic(&self, event: crate::live_descriptor_words::DescriptorDiagnostic) {
+        self.maintenance.descriptor_diagnostic(event);
+    }
 }
 
 #[derive(Debug)]
@@ -2697,6 +2701,19 @@ struct UndoJournal {
 }
 
 impl PageTableManager {
+    /// Borrow the authoritative live descriptor image for a read-only walk.
+    /// Returns `None` for a detached software image with no live resolver.
+    pub fn with_live_descriptor_words<R>(
+        &self,
+        f: impl FnOnce(&dyn descriptor_txn::LiveDescriptorWords) -> R,
+    ) -> Option<R> {
+        let resolver = self.resolver.as_deref()?;
+        let words = ArenaTableWords {
+            arenas: &self.arenas,
+            resolver,
+        };
+        Some(f(&words))
+    }
     /// Caller-supplied layout constraints retained by this image.
     pub fn layout(&self) -> PageTableLayoutConfig {
         self.layout

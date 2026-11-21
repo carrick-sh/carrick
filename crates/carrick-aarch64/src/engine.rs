@@ -669,6 +669,15 @@ impl<V: Aarch64Vmm> carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance
             }
         }
     }
+    fn descriptor_diagnostic(
+        &self,
+        event: carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic,
+    ) {
+        carrick_hal::diagnostic_capture::trace_descriptor_diagnostic(
+            carrick_hal::diagnostic_capture::GuestIsa::Aarch64,
+            event,
+        );
+    }
 }
 
 impl<V: Aarch64Vmm> crate::vmm::Stage1Services for EngineStage1Services<'_, V> {
@@ -5719,7 +5728,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused));
             }
         };
-        if !slot.submit(window, grant.transaction()) {
+        if !slot.submit_with_trace(
+            window,
+            grant.transaction(),
+            carrick_hal::diagnostic_capture::trace_grant_refusals(),
+        ) {
             return Err(TrapError::Hypervisor(
                 "owner file fault grant selection was displaced".into(),
             ));
@@ -5732,7 +5745,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             },
             &mut || false,
         );
-        if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
+        if let Some((receipt, trace)) = slot.take_receipt_with_trace(window, grant.transaction()) {
             let refusal = match receipt.outcome {
                 carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(reason)
                 | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::RolledBack(
@@ -5740,7 +5753,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 ) => reason as u32,
                 _ => 0,
             };
-            let settled = grant.settle(&receipt)?;
+            let settled = grant.settle(&receipt, trace)?;
             carrick_observability::probes::hvpatch_el1_file_fault_handoff(
                 window.fault_page,
                 refusal,
@@ -5774,6 +5787,27 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         request: carrick_hal::El1FrameGrantRequest,
     ) -> Result<Option<carrick_hal::threaded::PreparedEl1FrameGrant>, TrapError> {
         self.vm.prepare_el1_frame_grant(request)
+    }
+
+    fn select_el1_frame_grant(
+        &mut self,
+        mut request: carrick_hal::El1FrameGrantRequest,
+    ) -> Result<
+        carrick_hal::El1FrameGrantRequest,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        let end = request
+            .semantic_base
+            .checked_add(request.len)
+            .ok_or(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::BadRange)?;
+        let range = carrick_core_abi::ReservationRange::new(request.semantic_base, end)
+            .ok_or(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::BadRange)?;
+        let selected = self
+            .page_tables
+            .select_frame_grant_span(range, request.fault_va & !0xfff)?;
+        request.semantic_base = selected.range().start();
+        request.len = selected.range().len();
+        Ok(request)
     }
 
     fn roll_back_el1_frame_grant(
@@ -9384,6 +9418,7 @@ mod transfer_service_tests {
         fn settle(
             &mut self,
             _: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+            _: Option<carrick_mmu_core::live_descriptor_words::GrantRefusalTrace>,
         ) -> Result<bool, TrapError> {
             panic!("the contended owner must withdraw before a receipt exists")
         }

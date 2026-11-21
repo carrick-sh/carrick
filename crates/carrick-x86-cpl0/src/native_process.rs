@@ -307,7 +307,7 @@ impl crate::exec_successor::X86SuccessorBuild for ServiceExecBuild {
     }
 }
 
-struct Venue;
+pub(super) struct Venue;
 impl OwnerVenue<ParkedContextWords> for Venue {
     fn space_access(
         zone: &ZoneTables<ParkedContextWords>,
@@ -336,7 +336,7 @@ pub(super) fn release(
 ) {
     carrick_el1::substrate::sched::object_wait::deliver_host_completion(effects.zone(), effects);
 }
-type Portal = MmPortal<
+pub(super) type Portal = MmPortal<
     'static,
     GuestMetadataPin,
     LinuxReservationPolicy,
@@ -345,7 +345,7 @@ type Portal = MmPortal<
     X86Mmu,
     ParkedContextWords,
 >;
-fn portal() -> Result<Portal, NativeFailure> {
+pub(super) fn portal() -> Result<Portal, NativeFailure> {
     let layout = carrick_el1::isa::x86_kernel_layout();
     // SAFETY: the boot owner retains the one compact native portal region.
     let slots = unsafe { &*(layout.portal.raw() as *const MmPortalSlots) };
@@ -359,6 +359,34 @@ fn portal() -> Result<Portal, NativeFailure> {
         nodes: None,
         zone: Some(zone),
     })
+}
+
+/// Resolve the admitted MM handle for a user or staged-syscall fault on `slot`,
+/// matching ARM's `admitted_fault_mm_handle` so root and child MM contention
+/// records a typed `PortalOwnerWait` rather than falling back to `Unavailable`.
+pub(super) fn admitted_fault_mm_handle(
+    zone: &X86Cpl0Zone,
+    slot: SlotId,
+    task: &CurrentTask,
+    mm: ReservationMm,
+) -> Option<carrick_el1_abi::El1MmHandle> {
+    if let Some(record) = zone
+        .slot(slot)
+        .current()
+        .or_else(|| zone.slot(slot).host_record())
+        && let Some((_, control)) = task.lifecycle_refs()
+        && let Ok(handle) = control.service.bound_mm(
+            zone.record_ref(record),
+            carrick_el1_abi::EntryThreadGeneration::from_raw(zone.record(record).identity().serial),
+        )
+        && handle.mm() == mm
+    {
+        return Some(handle);
+    }
+    portal()
+        .ok()?
+        .admitted_handle(mm, u32::from(slot.raw()))
+        .ok()
 }
 // Every fork MM refusal keeps its stage and owner cause as the shared
 // `NativeForkRefusal` until errno encoding, as on AArch64: owner contention
@@ -737,25 +765,37 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 },
             );
             let result = if let Some(receipt) = retained {
-                Ok(Some(receipt))
+                Ok(carrick_core::mm::frames::GrantServeOutcome::Completed(
+                    receipt,
+                ))
             } else {
-                carrick_core::mm::frames::serve_grant(
-                    &owner,
-                    reply,
-                    &words,
-                    residency,
-                    self.worker(),
-                    || {},
-                )
+                // SAFETY: `residency` and `GLOBAL_ALLOCATOR` share CPL0's guest venue.
+                unsafe {
+                    carrick_core::mm::frames::serve_grant_with_allocator(
+                        &owner,
+                        reply,
+                        &words,
+                        residency,
+                        &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+                        self.worker(),
+                        || {},
+                    )
+                }
             };
             match result {
-                Ok(receipt) => Some(receipt.is_some_and(|receipt| {
+                Ok(carrick_core::mm::frames::GrantServeOutcome::Completed(receipt)) => Some(
                     matches!(receipt.outcome,
                     carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
                     | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
                         carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied
-                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot))
-                })),
+                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot)),
+                ),
+                Ok(carrick_core::mm::frames::GrantServeOutcome::Empty) => Some(false),
+                Ok(carrick_core::mm::frames::GrantServeOutcome::NotNow(continuation)) => {
+                    return Err(MmError::Wait(
+                        continuation.owner_wait.unwrap_or(editor_wait),
+                    ));
+                }
                 // The shared pending owner retains this reply while it parks on
                 // the exact producer, including resumption on another CPU.
                 Err(MmError::Wait(wait)) => return Err(MmError::Wait(wait)),

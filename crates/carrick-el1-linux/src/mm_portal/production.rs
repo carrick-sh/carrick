@@ -80,7 +80,7 @@ pub(crate) fn current_mm_words<
     }
 }
 #[cfg(target_os = "none")]
-use carrick_core::mm::frames::apply_grant;
+use carrick_core::mm::frames::{GrantServeOutcome, serve_grant_with_venue, try_apply_grant};
 pub use carrick_core::mm::frames::{GrantTarget, serve_grant};
 
 #[cfg(target_os = "none")]
@@ -389,9 +389,6 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let Some(slot) = slots.grant(frame.slot as usize) else {
         return;
     };
-    let Some(window) = slot.window() else {
-        return;
-    };
     let Some(carrier) = slots.carrier() else {
         return;
     };
@@ -404,57 +401,69 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         nodes: None,
         zone: Some(zone),
     };
-    let target = match grant_target(&portal, &window, u32::from(executor_slot.raw())) {
-        Ok(target) => target,
+    let table = carrick_el1::isa::frame_grant_residency_guest();
+    // SAFETY: `table` and `GLOBAL_ALLOCATOR` share this bare-metal guest venue.
+    let outcome = unsafe {
+        serve_grant_with_venue::<_, _, _, _, NativePortalMmu, _>(
+            &portal,
+            slot,
+            table,
+            &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+            u32::from(executor_slot.raw()),
+            |target, residency| {
+                let root = target.grant().ttbr0;
+                #[cfg(target_arch = "aarch64")]
+                let ttbr: u64;
+                #[cfg(target_arch = "aarch64")]
+                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack));
+                #[cfg(target_arch = "x86_64")]
+                let words = carrick_el1::isa::x86::portal_descriptor_words(root)
+                    .map_err(|_| MmError::Invalid)?;
+                #[cfg(target_arch = "aarch64")]
+                let maintenance = carrick_el1::isa::arm_edit::El1TableMaintenance { ttbr0: root };
+                #[cfg(target_arch = "aarch64")]
+                let words =
+                    current_mm_words(ttbr, root, &maintenance).map_err(|_| MmError::Invalid)?;
+                Ok(try_apply_grant::<NativePortalMmu, _>(
+                    slot,
+                    &words,
+                    residency,
+                    target,
+                    || {
+                        #[cfg(target_arch = "aarch64")]
+                        crate::sched::ThreadCpu::invalidate_asid(
+                            &mut crate::sched::HardwareCpu,
+                            root,
+                        );
+                        #[cfg(target_arch = "x86_64")]
+                        if carrick_el1::isa::x86::portal_invalidate_root(root).is_err() {
+                            carrick_el1::isa::x86::fatal_entry_binding();
+                        }
+                    },
+                ))
+            },
+        )
+    };
+    match outcome {
+        Ok(GrantServeOutcome::Completed(_)) => frame.x[0] = 0,
+        Ok(GrantServeOutcome::Empty) => {}
+        Ok(GrantServeOutcome::NotNow(continuation)) => {
+            frame.x[0] = 11;
+            if let Some(wait) = continuation.owner_wait {
+                frame.x[14] = 3;
+                frame.x[16] = wait.cause().encode();
+                frame.x[17] = wait.revision();
+            }
+        }
         Err(MmError::Wait(wait)) => {
             frame.x[0] = 11;
             frame.x[14] = 3;
             frame.x[16] = wait.cause().encode();
             frame.x[17] = wait.revision();
-            return;
         }
         Err(error) => {
             frame.x[0] = u64::from(error.errno());
-            return;
         }
-    };
-    #[cfg(target_arch = "aarch64")]
-    let ttbr: u64;
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("mrs {}, ttbr0_el1",out(reg)ttbr,options(nomem,nostack));
-    }
-    #[cfg(target_arch = "x86_64")]
-    let words = match carrick_el1::isa::x86::portal_descriptor_words(target.grant().ttbr0) {
-        Ok(words) => words,
-        Err(_) => return,
-    };
-    #[cfg(target_arch = "aarch64")]
-    let maintenance = carrick_el1::isa::arm_edit::El1TableMaintenance {
-        ttbr0: target.grant().ttbr0,
-    };
-    #[cfg(target_arch = "aarch64")]
-    let Ok(words) = current_mm_words(ttbr, target.grant().ttbr0, &maintenance) else {
-        return;
-    };
-    let root = target.grant().ttbr0;
-    if apply_grant::<NativePortalMmu, _>(
-        slot,
-        &words,
-        carrick_el1::isa::frame_grant_residency_guest(),
-        target,
-        || {
-            #[cfg(target_arch = "aarch64")]
-            crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, root);
-            #[cfg(target_arch = "x86_64")]
-            if carrick_el1::isa::x86::portal_invalidate_root(root).is_err() {
-                carrick_el1::isa::x86::fatal_entry_binding();
-            }
-        },
-    )
-    .is_some()
-    {
-        frame.x[0] = 0;
     }
 }
 

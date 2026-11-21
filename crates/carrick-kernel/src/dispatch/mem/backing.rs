@@ -947,9 +947,9 @@ impl<'a> MemView<'a> {
 
     pub(crate) fn commit_host_alias_mmap(&self, commit: HostAliasMmapCommit) {
         let authority = self.mm_authority();
-        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+        carrick_hal::host_residency::with_host_residency(|table| {
             table.retire_overlapping(authority.mm_id.raw(), commit.start, commit.len);
-        }
+        });
         Self::commit_host_alias_mmap_on(&authority, commit);
     }
 
@@ -1184,9 +1184,9 @@ impl<'a> MemView<'a> {
                 });
             }
         }
-        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+        carrick_hal::host_residency::with_host_residency(|table| {
             table.retire_overlapping(self.mm_authority().mm_id.raw(), start, len);
-        }
+        });
         // Retirement marks the range unmapped; the node and its permission
         // remain, and the owner publishes leaves on the next touch.
         memory.release_root_facts(start, length);
@@ -1294,7 +1294,15 @@ impl<'a> MemView<'a> {
                         false
                     }
                 };
-                if !direct {
+                if direct {
+                    carrick_hal::host_residency::with_host_residency(|table| {
+                        table.retire_overlapping(
+                            self.mm_authority().mm_id.raw(),
+                            source.start,
+                            valid_len as u64,
+                        );
+                    });
+                } else {
                     memory
                         .write_bytes_unchecked(source.start, &snapshot.bytes[..valid_len])
                         .map_err(|_| LINUX_ENOMEM)?;
@@ -1448,9 +1456,9 @@ impl<'a> MemView<'a> {
     /// alias too and must retire the same VMA/residency/lock/fault/bus/seal/memfd
     /// state before it removes the attachment and decrements `nattch`.
     pub(crate) fn remove_mapping_metadata(&self, start: u64, len: u64) {
-        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+        carrick_hal::host_residency::with_host_residency(|table| {
             table.retire_overlapping(self.mm_authority().mm_id.raw(), start, len);
-        }
+        });
         remove_mapping_metadata_locked(&mut self.mem().lock(), start, len);
         self.captured_mm()
             .replace_io_uring_mappings(start, len, None);

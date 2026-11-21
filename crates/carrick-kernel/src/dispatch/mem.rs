@@ -1857,7 +1857,8 @@ impl<'a> MemView<'a> {
         let mem_authority_30 = self.mem();
         let mem = mem_authority_30.lock();
         let mm_key = self.mm_authority().mm_id.raw();
-        let guest_residency = carrick_el1_abi::frame_grant_residency_host();
+        let guest_residency_view = carrick_hal::host_residency::current_host_residency();
+        let guest_residency = guest_residency_view.as_ref().map(|view| view.table());
         let zero_reads = mem.deferred_anonymous.snapshot().zero_read_resident;
         // A delegated root's anonymous rows outside the heap are post-exec
         // VMAs exactly like `dynamic_maps` (the heap stays loader-populated).
@@ -1893,6 +1894,7 @@ impl<'a> MemView<'a> {
                     let resident = if in_dynamic {
                         mem.resident.contains(page, owner)
                             || guest_residency
+                                .as_ref()
                                 .is_some_and(|table| table.is_guest_committed(mm_key, page))
                             || zero_reads
                                 .iter()
@@ -1933,6 +1935,7 @@ impl<'a> MemView<'a> {
                     let resident = if in_dynamic {
                         mem.resident.is_resident(page)
                             || guest_residency
+                                .as_ref()
                                 .is_some_and(|table| table.is_guest_committed(mm_key, page))
                             || zero_reads
                                 .iter()
@@ -2617,6 +2620,14 @@ impl SyscallDispatcher {
     ) -> Result<Option<ResidentFrameGrantPlan<'permit>>, ReservationBusy> {
         self.mem_view()
             .resident_frame_grant_plan(permit, address, max_len)
+    }
+
+    #[inline]
+    pub fn frame_grant_release_wait(
+        &self,
+        permit: &super::mm_mutation::HostAliasPermit<'_>,
+    ) -> Result<carrick_el1_abi::PortalOwnerWait, carrick_el1::memory::reservations::Refusal> {
+        self.mem_view().frame_grant_release_wait(permit)
     }
 
     /// Revalidate an already prepared grant under its original alias exclusion.

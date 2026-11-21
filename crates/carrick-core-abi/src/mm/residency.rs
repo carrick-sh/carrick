@@ -1,6 +1,12 @@
 //! Exact live residency and retained grant-window custody for either ISA.
+use crate::{
+    ExtentGrantReceipt, MetadataExtent, MetadataExtentResolver, MetadataResolutionError,
+    PinnedMetadataExtent, ReservationMetadataAllocator,
+};
+use core::alloc::Layout;
 use core::sync::atomic::{AtomicU64, Ordering};
 pub const FRAME_GRANT_RESIDENCY_SLOTS: usize = 4096;
+const MAX_RESIDENCY_EXTENSIONS: usize = 256;
 /// Requested bulk extent: 512 Linux pages, clamped by the supplying adapter
 /// at the exact VMA or alignment edge.
 pub const EL1_FRAME_GRANT_TARGET_SIZE: u64 = 2 * 1024 * 1024;
@@ -58,6 +64,13 @@ pub struct FrameGrantResidencyPage {
     pub expected_ipa: u64,
     epoch: u64,
     bit: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameGrantResidencyRefusal {
+    InvalidIdentity,
+    Overlap,
+    Capacity,
 }
 
 /// One grant's identity and 512 per-page residency bits. `GRANT_LIVE` is
@@ -165,7 +178,7 @@ impl Drop for FrameGrantTransferPin<'_> {
 /// retirement. The caller either commits after the descriptor transaction or
 /// drops this token to reopen transfer admission without changing residency.
 pub struct FrameGrantResidencyRetirement<'a> {
-    table: &'a FrameGrantResidencyTable,
+    table: FrameGrantResidencyTable<ResidencyRows<'a>>,
     mm_key: u64,
     start: u64,
     end: u64,
@@ -182,6 +195,15 @@ impl FrameGrantResidencyRetirement<'_> {
         self.active = false;
         committed
     }
+
+    /// Transfer the active preclaim to an owned host guard that retains the
+    /// same resolved residency view until [`FrameGrantResidencyTable::commit_preclaimed_retirement`]
+    /// or [`FrameGrantResidencyTable::cancel_preclaimed_retirement`] runs.
+    #[must_use]
+    pub fn into_preclaimed_range(mut self) -> (u64, u64, u64) {
+        self.active = false;
+        (self.mm_key, self.start, self.end)
+    }
 }
 impl Drop for FrameGrantResidencyRetirement<'_> {
     fn drop(&mut self) {
@@ -192,18 +214,18 @@ impl Drop for FrameGrantResidencyRetirement<'_> {
     }
 }
 
-/// Fixed shared open-addressed index. Grants hash by their smallest power-of-two
+/// A shared open-addressed segment. Grants hash by their smallest power-of-two
 /// page-count bucket. A page in a grant lies in its base bucket or the next
 /// bucket, so lookups check those two buckets for each size class. Disjoint
 /// short grants in one 2 MiB window no longer consume one 64-slot chain.
 #[repr(C, align(64))]
 #[derive(Debug)]
-pub struct FrameGrantResidencyTable {
+pub struct ResidencySegment {
     slots: [FrameGrantResidencyRecord; FRAME_GRANT_RESIDENCY_SLOTS],
     dirty: [AtomicU64; FRAME_GRANT_RESIDENCY_SLOTS / 64],
 }
 
-impl FrameGrantResidencyTable {
+impl ResidencySegment {
     const fn initial_slot() -> FrameGrantResidencyRecord {
         FrameGrantResidencyRecord::new()
     }
@@ -212,7 +234,7 @@ impl FrameGrantResidencyTable {
         AtomicU64::new(0)
     }
 
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             slots: [const { Self::initial_slot() }; FRAME_GRANT_RESIDENCY_SLOTS],
             dirty: [const { Self::initial_dirty() }; FRAME_GRANT_RESIDENCY_SLOTS / 64],
@@ -224,7 +246,7 @@ impl FrameGrantResidencyTable {
     /// # Safety
     /// `ptr` must be valid for writes, non-null, aligned to `align_of::<Self>()`,
     /// and point to storage of at least `size_of::<Self>()` bytes.
-    pub unsafe fn init_in_place(ptr: *mut Self) {
+    unsafe fn init_in_place(ptr: *mut Self) {
         // SAFETY: caller guarantees aligned, writable storage for the table.
         // Each record constructor initializes its complete wire image; no
         // reference to partially initialized storage is formed.
@@ -238,6 +260,641 @@ impl FrameGrantResidencyTable {
                 dirty.add(index).write(Self::initial_dirty());
             }
         }
+    }
+}
+
+/// The allocator's exact enclosing extent and the segment's address within it.
+/// Both are guest addresses. Host venues must resolve their own retained alias.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidencySegmentLocation {
+    pub guest_base: u64,
+    pub extent: ExtentGrantReceipt,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct SegmentLocationWire {
+    guest_base: AtomicU64,
+    extent_base: AtomicU64,
+    extent_size: AtomicU64,
+    extent_token: AtomicU64,
+}
+
+impl SegmentLocationWire {
+    const fn new() -> Self {
+        Self {
+            guest_base: AtomicU64::new(0),
+            extent_base: AtomicU64::new(0),
+            extent_size: AtomicU64::new(0),
+            extent_token: AtomicU64::new(0),
+        }
+    }
+
+    fn write(&self, location: ResidencySegmentLocation) {
+        self.guest_base
+            .store(location.guest_base, Ordering::Relaxed);
+        self.extent_base
+            .store(location.extent.base_va, Ordering::Relaxed);
+        self.extent_size
+            .store(location.extent.size as u64, Ordering::Relaxed);
+        self.extent_token
+            .store(location.extent.token, Ordering::Relaxed);
+    }
+
+    fn read(&self) -> ResidencySegmentLocation {
+        ResidencySegmentLocation {
+            guest_base: self.guest_base.load(Ordering::Relaxed),
+            extent: ExtentGrantReceipt {
+                base_va: self.extent_base.load(Ordering::Relaxed),
+                size: self.extent_size.load(Ordering::Relaxed) as usize,
+                token: self.extent_token.load(Ordering::Relaxed),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct ResidencyDirectory {
+    publishing: AtomicU64,
+    count: AtomicU64,
+    entries: [SegmentLocationWire; MAX_RESIDENCY_EXTENSIONS],
+    retirement_epoch: AtomicU64,
+    reserved: [u64; 5],
+}
+
+impl ResidencyDirectory {
+    const fn new() -> Self {
+        Self {
+            publishing: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+            entries: [const { SegmentLocationWire::new() }; MAX_RESIDENCY_EXTENSIONS],
+            retirement_epoch: AtomicU64::new(0),
+            reserved: [0; 5],
+        }
+    }
+
+    unsafe fn init_in_place(ptr: *mut Self) {
+        // SAFETY: caller owns the uninitialized directory. Use field writes
+        // to avoid putting the directory on the supervisor stack.
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr).publishing).write(AtomicU64::new(0));
+            core::ptr::addr_of_mut!((*ptr).count).write(AtomicU64::new(0));
+            core::ptr::addr_of_mut!((*ptr).retirement_epoch).write(AtomicU64::new(0));
+            core::ptr::addr_of_mut!((*ptr).reserved).write([0; 5]);
+            let entries = core::ptr::addr_of_mut!((*ptr).entries).cast::<SegmentLocationWire>();
+            for index in 0..MAX_RESIDENCY_EXTENSIONS {
+                entries.add(index).write(SegmentLocationWire::new());
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct ResidencyStorage {
+    bootstrap: ResidencySegment,
+    directory: ResidencyDirectory,
+}
+
+/// The operation must release its MM editor before asking the carrier
+/// allocator to grow. Allocation pressure and a racing publisher are
+/// distinct from a permanently full directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidencyGrowthRefusal {
+    MetadataRequired,
+    Publishing,
+    Full,
+    InvalidExtent,
+}
+
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct FrameGrantResidencyTable<S = ResidencyStorage> {
+    storage: S,
+}
+
+impl FrameGrantResidencyTable {
+    pub const fn new() -> Self {
+        // Evaluate the empty table at compile time so debug callers copy one
+        // value into their return slot instead of materializing separate
+        // `ResidencySegment` and `ResidencyStorage` temporaries on the stack.
+        const {
+            FrameGrantResidencyTable {
+                storage: ResidencyStorage {
+                    bootstrap: ResidencySegment::new(),
+                    directory: ResidencyDirectory::new(),
+                },
+            }
+        }
+    }
+
+    /// Initialize in place without materializing a large stack temporary.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for writes, non-null, aligned to `align_of::<Self>()`,
+    /// and point to storage of at least `size_of::<Self>()` bytes.
+    pub unsafe fn init_in_place(ptr: *mut Self) {
+        // SAFETY: the caller owns the table storage, including the bootstrap
+        // segment and directory. No reference to uninitialized storage is formed.
+        unsafe {
+            ResidencySegment::init_in_place(core::ptr::addr_of_mut!((*ptr).storage.bootstrap));
+            ResidencyDirectory::init_in_place(core::ptr::addr_of_mut!((*ptr).storage.directory));
+        }
+    }
+
+    pub fn extension_count(&self) -> usize {
+        self.storage.directory.count.load(Ordering::Acquire) as usize
+    }
+
+    pub fn extension_location(&self, index: usize) -> Option<ResidencySegmentLocation> {
+        if index >= self.extension_count() {
+            return None;
+        }
+        Some(self.storage.directory.entries.get(index)?.read())
+    }
+
+    /// Publish one segment through the carrier's metadata allocator after
+    /// releasing the MM editor. Once published, the allocation belongs to the
+    /// table for the carrier lifetime and each venue uses its own alias.
+    ///
+    /// Callers must refresh their residency view after this succeeds, even
+    /// when another owner published the requested segment first.
+    pub fn grow(
+        &self,
+        allocator: &impl ReservationMetadataAllocator,
+        observed_extensions: usize,
+    ) -> Result<(), ResidencyGrowthRefusal> {
+        let current = self.extension_count();
+        if current > observed_extensions {
+            return Ok(());
+        }
+        if current == MAX_RESIDENCY_EXTENSIONS {
+            return Err(ResidencyGrowthRefusal::Full);
+        }
+        if current != observed_extensions {
+            return Err(ResidencyGrowthRefusal::InvalidExtent);
+        }
+
+        let layout = Layout::new::<ResidencySegment>();
+        let (ptr, extent) = allocator
+            .allocate_with_extent(layout)
+            .ok_or(ResidencyGrowthRefusal::MetadataRequired)?;
+        let location = ResidencySegmentLocation {
+            guest_base: ptr as u64,
+            extent,
+        };
+        let result = self.append_segment(location, layout, observed_extensions);
+        if !matches!(result, Ok(true)) {
+            allocator.deallocate(ptr, layout);
+        }
+        result.map(|_| ())
+    }
+
+    fn append_segment(
+        &self,
+        location: ResidencySegmentLocation,
+        layout: Layout,
+        expected: usize,
+    ) -> Result<bool, ResidencyGrowthRefusal> {
+        let address = location.guest_base;
+        let extent = location.extent;
+        if address == 0
+            || !address.is_multiple_of(layout.align() as u64)
+            || address < extent.base_va
+            || !address
+                .checked_add(layout.size() as u64)
+                .is_some_and(|end| {
+                    extent
+                        .base_va
+                        .checked_add(extent.size as u64)
+                        .is_some_and(|limit| end <= limit)
+                })
+        {
+            return Err(ResidencyGrowthRefusal::InvalidExtent);
+        }
+
+        // SAFETY: the allocator returned a fresh allocation with this layout.
+        // Initialization happens before publication and outside the append lock.
+        unsafe { ResidencySegment::init_in_place(address as *mut ResidencySegment) };
+        let directory = &self.storage.directory;
+        directory
+            .publishing
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ResidencyGrowthRefusal::Publishing)?;
+        let installed = directory.count.load(Ordering::Relaxed) as usize == expected;
+        if installed {
+            directory.entries[expected].write(location);
+            directory
+                .count
+                .store((expected + 1) as u64, Ordering::Release);
+        }
+        directory.publishing.store(0, Ordering::Release);
+        Ok(installed)
+    }
+
+    /// Resolve published extensions in the allocator's own guest venue. A
+    /// borrowed view sees a fixed prefix, so a caller that drops its editor
+    /// and waits must open a fresh view upon re-entry.
+    ///
+    /// # Safety
+    /// The caller must own the allocator venue that published the addresses.
+    /// Every published allocation must be mapped at its named guest address
+    /// for the entire borrow. Host callers must resolve pinned aliases instead.
+    pub unsafe fn guest_view(&self) -> FrameGrantResidencyTable<ResidencyRows<'_>> {
+        ResidencyRows {
+            bootstrap: &self.storage.bootstrap,
+            directory: &self.storage.directory,
+            extensions: ResidencyExtensions::Guest(&self.storage.directory, self.extension_count()),
+        }
+        .as_table()
+    }
+
+    /// Resolve a dynamic extension through a pin on its exact retained
+    /// extent. The alias may be unrelated to the guest address.
+    ///
+    /// # Safety
+    /// The pin must come from this table's carrier and VM generation. Extent
+    /// tokens identify allocations only within that carrier.
+    pub unsafe fn resolve_extension<'a>(
+        &'a self,
+        index: usize,
+        pin: &'a impl PinnedMetadataExtent,
+    ) -> Option<ResolvedResidencySegment<'a>> {
+        let location = self.extension_location(index)?;
+        let extent = MetadataExtent::new(
+            location.extent.base_va,
+            location.extent.size as u64,
+            location.extent.token,
+        )?;
+        if extent != pin.extent() {
+            return None;
+        }
+        // SAFETY: pin retains this carrier allocator extent, and the directory
+        // published the exact segment base after initialization.
+        unsafe { self.resolve_alias(index, location, pin.host_base()) }
+    }
+
+    /// Resolve an extension inside the carrier's retained bootstrap extent.
+    ///
+    /// # Safety
+    /// `host_base` must map the exact bootstrap extent of this table's carrier
+    /// for the whole borrow.
+    pub unsafe fn resolve_bootstrap_extension(
+        &self,
+        index: usize,
+        guest_base: u64,
+        extent_size: usize,
+        host_base: core::ptr::NonNull<u8>,
+    ) -> Option<ResolvedResidencySegment<'_>> {
+        let location = self.extension_location(index)?;
+        if location.extent
+            != (ExtentGrantReceipt {
+                base_va: guest_base,
+                size: extent_size,
+                token: 0,
+            })
+        {
+            return None;
+        }
+        // SAFETY: caller retains this exact carrier's bootstrap backing.
+        unsafe { self.resolve_alias(index, location, host_base) }
+    }
+
+    unsafe fn resolve_alias(
+        &self,
+        index: usize,
+        location: ResidencySegmentLocation,
+        host_base: core::ptr::NonNull<u8>,
+    ) -> Option<ResolvedResidencySegment<'_>> {
+        let layout = Layout::new::<ResidencySegment>();
+        let offset = location.guest_base.checked_sub(location.extent.base_va)? as usize;
+        if offset.checked_add(layout.size())? > location.extent.size {
+            return None;
+        }
+        // SAFETY: caller retains the whole enclosing extent, and the preceding
+        // bounds check covers the complete initialized segment.
+        let alias = unsafe { host_base.as_ptr().add(offset).cast::<ResidencySegment>() };
+        if !alias.is_aligned() {
+            return None;
+        }
+        Some(ResolvedResidencySegment {
+            table: self,
+            index,
+            // SAFETY: the published exact location is initialized and the
+            // caller retains the matching aligned alias for this borrow.
+            segment: unsafe { &*alias },
+        })
+    }
+
+    /// Create a view from the complete, ordered prefix of retained aliases.
+    /// Reject cross-carrier or out-of-order entries before looking at rows.
+    pub fn resolved_view<'a>(
+        &'a self,
+        extensions: &'a [ResolvedResidencySegment<'a>],
+    ) -> Option<FrameGrantResidencyTable<ResidencyRows<'a>>> {
+        if extensions.len() != self.extension_count()
+            || extensions
+                .iter()
+                .enumerate()
+                .any(|(index, alias)| alias.index != index || !core::ptr::eq(alias.table, self))
+        {
+            return None;
+        }
+        Some(
+            ResidencyRows {
+                bootstrap: &self.storage.bootstrap,
+                directory: &self.storage.directory,
+                extensions: ResidencyExtensions::Aliases(extensions),
+            }
+            .as_table(),
+        )
+    }
+}
+
+pub struct ResolvedResidencySegment<'a> {
+    table: &'a FrameGrantResidencyTable,
+    index: usize,
+    segment: &'a ResidencySegment,
+}
+
+/// Uninhabited pin for bootstrap-only host venues that have no dynamic
+/// metadata extent resolver.
+pub enum NoDynamicResidencyPin {}
+
+// SAFETY: uninhabited; cannot be instantiated.
+unsafe impl PinnedMetadataExtent for NoDynamicResidencyPin {
+    fn extent(&self) -> MetadataExtent {
+        match *self {}
+    }
+
+    fn host_base(&self) -> core::ptr::NonNull<u8> {
+        match *self {}
+    }
+}
+
+/// Resolver for bootstrap-only host venues: rejects dynamic (`token != 0`)
+/// extensions fail-closed while allowing bootstrap (`token == 0`) aliases.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoDynamicResidencyResolver;
+
+impl MetadataExtentResolver for NoDynamicResidencyResolver {
+    type Pin = NoDynamicResidencyPin;
+
+    fn pin(&self, _extent: MetadataExtent) -> Result<Self::Pin, MetadataResolutionError> {
+        Err(MetadataResolutionError::InvalidExtent)
+    }
+}
+
+/// Host-owned retained aliases for every published residency extension.
+/// Mirrors `ResolvedReservationNodes`: refresh before host retirement,
+/// reconciliation, or census; an unchanged extension count does zero
+/// resolution or allocation work. Construct on the host heap, never on an
+/// EL1/CPL0 supervisor stack.
+pub struct ResolvedResidencyTable<P: PinnedMetadataExtent> {
+    table: *const FrameGrantResidencyTable,
+    count: usize,
+    segments: [*const ResidencySegment; MAX_RESIDENCY_EXTENSIONS],
+    pins: [Option<P>; MAX_RESIDENCY_EXTENSIONS],
+}
+
+// SAFETY: once published in the carrier directory, each segment pointer is
+// immutable and retained by either the carrier bootstrap region or `pins[i]`.
+// Access to records uses atomics only; no `&mut` is ever exposed.
+unsafe impl<P: PinnedMetadataExtent + Send> Send for ResolvedResidencyTable<P> {}
+unsafe impl<P: PinnedMetadataExtent + Sync> Sync for ResolvedResidencyTable<P> {}
+
+impl<P: PinnedMetadataExtent> Default for ResolvedResidencyTable<P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P: PinnedMetadataExtent> ResolvedResidencyTable<P> {
+    pub fn new() -> Self {
+        Self {
+            table: core::ptr::null(),
+            count: 0,
+            segments: [core::ptr::null(); MAX_RESIDENCY_EXTENSIONS],
+            pins: core::array::from_fn(|_| None),
+        }
+    }
+
+    pub fn extension_count(&self) -> usize {
+        self.count
+    }
+
+    pub fn table_ptr(&self) -> *const FrameGrantResidencyTable {
+        self.table
+    }
+
+    /// Resolve any extensions published after the cached prefix. Bootstrap
+    /// extensions (`token == 0`) resolve against `bootstrap` (`(guest_base,
+    /// extent_size, host_base)`); dynamic extensions (`token != 0`) are pinned
+    /// through `resolver`.
+    ///
+    /// # Safety
+    /// `table` and (when provided) `bootstrap` must belong to the same live
+    /// carrier as `resolver` and remain mapped for every borrow of `self`.
+    pub unsafe fn refresh<R: MetadataExtentResolver<Pin = P>>(
+        &mut self,
+        table: &FrameGrantResidencyTable,
+        resolver: &R,
+        bootstrap: Option<(u64, usize, core::ptr::NonNull<u8>)>,
+    ) -> Result<(), MetadataResolutionError> {
+        if !self.table.is_null() && !core::ptr::eq(self.table, table) {
+            return Err(MetadataResolutionError::StaleOwner);
+        }
+        let count = table.extension_count();
+        if count > MAX_RESIDENCY_EXTENSIONS || self.count > count {
+            return Err(MetadataResolutionError::StaleOwner);
+        }
+        while self.count < count {
+            let index = self.count;
+            let location = table
+                .extension_location(index)
+                .ok_or(MetadataResolutionError::StaleOwner)?;
+            let (segment_ptr, pin) = if location.extent.token == 0 {
+                let Some((guest_base, extent_size, host_base)) = bootstrap else {
+                    return Err(MetadataResolutionError::InvalidExtent);
+                };
+                // SAFETY: caller retains the exact carrier bootstrap mapping.
+                let resolved = unsafe {
+                    table.resolve_bootstrap_extension(index, guest_base, extent_size, host_base)
+                }
+                .ok_or(MetadataResolutionError::InvalidExtent)?;
+                (resolved.segment as *const ResidencySegment, None)
+            } else {
+                let extent = MetadataExtent::new(
+                    location.extent.base_va,
+                    location.extent.size as u64,
+                    location.extent.token,
+                )
+                .ok_or(MetadataResolutionError::InvalidExtent)?;
+                let pin = resolver.pin(extent)?;
+                // SAFETY: `pin` retains the exact dynamic extent for `table`'s carrier.
+                let resolved = unsafe { table.resolve_extension(index, &pin) }
+                    .ok_or(MetadataResolutionError::InvalidExtent)?;
+                (resolved.segment as *const ResidencySegment, Some(pin))
+            };
+            self.table = table;
+            self.segments[index] = segment_ptr;
+            self.pins[index] = pin;
+            self.count += 1;
+        }
+        self.table = table;
+        Ok(())
+    }
+
+    /// Borrow a view covering the bootstrap segment and every resolved
+    /// extension prefix. Returns `None` before the first `refresh`.
+    pub fn view(&self) -> Option<FrameGrantResidencyTable<ResidencyRows<'_>>> {
+        if self.table.is_null() {
+            return None;
+        }
+        // SAFETY: `refresh` verified `self.table` and every non-null segment
+        // alias in `self.segments[..self.count]`, and caller/pins retain them
+        // for the entire lifetime of `&self`.
+        let table = unsafe { &*self.table };
+        Some(
+            ResidencyRows {
+                bootstrap: &table.storage.bootstrap,
+                directory: &table.storage.directory,
+                extensions: ResidencyExtensions::Resolved(&self.segments[..self.count]),
+            }
+            .as_table(),
+        )
+    }
+
+    /// Borrow a view covering every resolved extension prefix, falling back to
+    /// `fallback`'s bootstrap storage only if `refresh` has never run.
+    pub fn view_or_bootstrap<'a>(
+        &'a self,
+        fallback: &'a FrameGrantResidencyTable,
+    ) -> FrameGrantResidencyTable<ResidencyRows<'a>> {
+        self.view().unwrap_or_else(|| {
+            ResidencyRows {
+                bootstrap: &fallback.storage.bootstrap,
+                directory: &fallback.storage.directory,
+                extensions: ResidencyExtensions::Resolved(&[]),
+            }
+            .as_table()
+        })
+    }
+}
+
+/// Venue-local access to the bootstrap and extension storage.
+#[derive(Clone, Copy)]
+pub struct ResidencyRows<'a> {
+    bootstrap: &'a ResidencySegment,
+    directory: &'a ResidencyDirectory,
+    extensions: ResidencyExtensions<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum ResidencyExtensions<'a> {
+    Aliases(&'a [ResolvedResidencySegment<'a>]),
+    Resolved(&'a [*const ResidencySegment]),
+    Guest(&'a ResidencyDirectory, usize),
+}
+
+mod sealed {
+    pub trait ResidencyStorage {
+        fn rows(&self) -> super::ResidencyRows<'_>;
+    }
+}
+
+/// Storage accepted by the shared descriptor and retirement owner. The
+/// bootstrap wire record and each retained venue view use the same methods.
+pub trait FrameGrantResidencyAccess: sealed::ResidencyStorage {}
+impl<S: sealed::ResidencyStorage> FrameGrantResidencyAccess for S {}
+
+impl sealed::ResidencyStorage for ResidencyStorage {
+    fn rows(&self) -> ResidencyRows<'_> {
+        #[cfg(target_os = "none")]
+        {
+            ResidencyRows {
+                bootstrap: &self.bootstrap,
+                directory: &self.directory,
+                extensions: ResidencyExtensions::Guest(
+                    &self.directory,
+                    self.directory.count.load(Ordering::Acquire) as usize,
+                ),
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            ResidencyRows {
+                bootstrap: &self.bootstrap,
+                directory: &self.directory,
+                extensions: ResidencyExtensions::Aliases(&[]),
+            }
+        }
+    }
+}
+
+impl sealed::ResidencyStorage for ResidencyRows<'_> {
+    fn rows(&self) -> ResidencyRows<'_> {
+        *self
+    }
+}
+
+impl<'a> ResidencyRows<'a> {
+    fn segments(self) -> impl Iterator<Item = &'a ResidencySegment> {
+        let count = match self.extensions {
+            ResidencyExtensions::Aliases(entries) => entries.len(),
+            ResidencyExtensions::Resolved(entries) => entries.len(),
+            ResidencyExtensions::Guest(_, count) => count,
+        };
+        (0..=count).map_while(move |index| self.segment(index))
+    }
+
+    fn segment(self, index: usize) -> Option<&'a ResidencySegment> {
+        let Some(index) = index.checked_sub(1) else {
+            return Some(self.bootstrap);
+        };
+        match self.extensions {
+            ResidencyExtensions::Aliases(entries) => entries.get(index).map(|alias| alias.segment),
+            ResidencyExtensions::Resolved(entries) => entries.get(index).map(|&ptr| {
+                // SAFETY: `ResolvedResidencyTable::refresh` validated each
+                // non-null, aligned segment alias and pins retain it for `'a`.
+                unsafe { &*ptr }
+            }),
+            ResidencyExtensions::Guest(directory, count) if index < count => {
+                let location = directory.entries.get(index)?.read();
+                // SAFETY: guest_view requires published allocations to remain
+                // mapped in the allocator venue for the entire borrowed view.
+                Some(unsafe { &*(location.guest_base as *const ResidencySegment) })
+            }
+            ResidencyExtensions::Guest(_, _) => None,
+        }
+    }
+
+    fn as_table(self) -> FrameGrantResidencyTable<Self> {
+        FrameGrantResidencyTable { storage: self }
+    }
+}
+
+impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
+    fn segments(&self) -> impl Iterator<Item = &ResidencySegment> {
+        self.storage.rows().segments()
+    }
+
+    fn slots(&self) -> impl Iterator<Item = &FrameGrantResidencyRecord> {
+        self.segments().flat_map(|segment| segment.slots.iter())
+    }
+
+    fn slot(&self, index: usize) -> Option<&FrameGrantResidencyRecord> {
+        self.slot_entry(index).map(|(record, _)| record)
+    }
+
+    fn slot_entry(&self, index: usize) -> Option<(&FrameGrantResidencyRecord, &AtomicU64)> {
+        let segment = self
+            .storage
+            .rows()
+            .segment(index / FRAME_GRANT_RESIDENCY_SLOTS)?;
+        let offset = index % FRAME_GRANT_RESIDENCY_SLOTS;
+        Some((&segment.slots[offset], &segment.dirty[offset / 64]))
     }
 
     fn first_slot(mm_key: u64, bucket: u64, class: u32) -> usize {
@@ -254,8 +911,17 @@ impl FrameGrantResidencyTable {
     /// Host: publish an authenticated grant while the exact-MM mutation guard
     /// excludes a guest editor. Failure leaves ordinary host first touch live.
     pub fn publish(&self, identity: FrameGrantResidencyIdentity) -> Option<usize> {
+        self.try_publish(identity).ok()
+    }
+
+    /// Publish without collapsing invalid identity, overlap and probe capacity
+    /// into the same refusal. The caller holds this MM's editor.
+    pub fn try_publish(
+        &self,
+        identity: FrameGrantResidencyIdentity,
+    ) -> Result<usize, FrameGrantResidencyRefusal> {
         if !identity.valid() {
-            return None;
+            return Err(FrameGrantResidencyRefusal::InvalidIdentity);
         }
         // All size classes share one table. Check every covered page before
         // admission so unlike classes cannot publish overlapping grants.
@@ -264,87 +930,155 @@ impl FrameGrantResidencyTable {
             .step_by(GRANT_PAGE_SIZE as usize)
         {
             if self.lookup(identity.mm_key, page).is_some() {
-                return None;
+                return Err(FrameGrantResidencyRefusal::Overlap);
             }
         }
         let class = (identity.len / GRANT_PAGE_SIZE)
             .next_power_of_two()
             .trailing_zeros();
         let bucket = identity.semantic_base / (GRANT_PAGE_SIZE << class);
-        let mut available = None;
-        for probe in 0..GRANT_PROBES {
-            let slot = Self::probe(identity.mm_key, bucket, class, probe);
-            let record = &self.slots[slot];
-            let state = record.state.load(Ordering::Acquire);
-            if state & GRANT_STATE_MASK == GRANT_LIVE {
-                let prior = record.identity();
-                if prior.mm_key == identity.mm_key
-                    && prior.semantic_base < identity.semantic_base + identity.len
-                    && identity.semantic_base < prior.semantic_base + prior.len
-                {
-                    return None;
+        for (segment_index, segment) in self.segments().enumerate() {
+            for probe in 0..GRANT_PROBES {
+                let slot = Self::probe(identity.mm_key, bucket, class, probe);
+                let record = &segment.slots[slot];
+                let state = record.state.load(Ordering::Acquire);
+                if !matches!(state & GRANT_STATE_MASK, GRANT_EMPTY | GRANT_RETIRED) {
+                    continue;
                 }
-            } else if state == GRANT_EMPTY {
-                available.get_or_insert(slot);
-                break;
-            } else if state & GRANT_STATE_MASK == GRANT_RETIRED {
-                available.get_or_insert(slot);
+                // Claim the exact reusable epoch we observed. Another MM can
+                // take this slot even while this MM's editor is held.
+                if record
+                    .state
+                    .compare_exchange(
+                        state,
+                        (state & !GRANT_STATE_MASK).wrapping_add(4) | GRANT_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    record.publish(identity);
+                    return Ok(segment_index * FRAME_GRANT_RESIDENCY_SLOTS + slot);
+                }
             }
         }
-        let slot = available?;
-        let record = &self.slots[slot];
-        let state = record.state.load(Ordering::Acquire);
-        record
-            .state
-            .compare_exchange(
-                state,
-                (state & !GRANT_STATE_MASK).wrapping_add(4) | GRANT_WRITING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok()?;
-        record.publish(identity);
-        Some(slot)
+        Err(FrameGrantResidencyRefusal::Capacity)
+    }
+
+    /// Number of addressable records in this venue's resolved view.
+    pub fn slot_capacity(&self) -> usize {
+        self.segments().count() * FRAME_GRANT_RESIDENCY_SLOTS
+    }
+
+    /// Monotonic count of committed row retirements across every segment.
+    /// Callers sample this before a refused growth or probe and check it once
+    /// after enrolling on progress.
+    pub fn retirement_epoch(&self) -> u64 {
+        self.storage
+            .rows()
+            .directory
+            .retirement_epoch
+            .load(Ordering::Acquire)
+    }
+
+    /// True while another owner is installing a new extension segment.
+    pub fn is_publishing(&self) -> bool {
+        self.storage
+            .rows()
+            .directory
+            .publishing
+            .load(Ordering::Acquire)
+            != 0
+    }
+
+    /// Number of extension segments published in the directory.
+    pub fn published_extensions(&self) -> usize {
+        self.storage.rows().directory.count.load(Ordering::Acquire) as usize
+    }
+
+    /// Diagnostic sample of occupied slots, including in-flight publishers.
+    /// Other MMs can change the table during the scan.
+    pub fn observed_slots_used(&self) -> usize {
+        self.slots()
+            .filter(|record| {
+                matches!(
+                    record.state.load(Ordering::Relaxed) & GRANT_STATE_MASK,
+                    GRANT_WRITING | GRANT_LIVE
+                )
+            })
+            .count()
+    }
+
+    /// Diagnose every observed occupied slot. A writing row or a row whose
+    /// epoch changed during classification yields None. Diagnostic results
+    /// must not be used to authorize descriptor or inventory mutations.
+    pub fn inspect_occupied<T>(
+        &self,
+        mut classify: impl FnMut(FrameGrantResidencyIdentity, bool) -> T,
+        mut observe: impl FnMut(Option<T>),
+    ) {
+        for record in self.slots() {
+            let epoch = record.state.load(Ordering::Acquire);
+            match epoch & GRANT_STATE_MASK {
+                GRANT_WRITING => observe(None),
+                GRANT_LIVE => {
+                    let identity = record.identity();
+                    let committed = record
+                        .committed
+                        .iter()
+                        .any(|word| word.load(Ordering::Acquire) != 0);
+                    if record.state.load(Ordering::Acquire) != epoch {
+                        observe(None);
+                        continue;
+                    }
+                    let class = classify(identity, committed);
+                    observe((record.state.load(Ordering::Acquire) == epoch).then_some(class));
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Guest: find the exact live grant covering a prepared leaf.
     pub fn lookup(&self, mm_key: u64, va: u64) -> Option<FrameGrantResidencyPage> {
         let page = va & !(GRANT_PAGE_SIZE - 1);
-        for class in 0..=EL1_FRAME_GRANT_TARGET_SIZE
-            .div_ceil(GRANT_PAGE_SIZE)
-            .trailing_zeros()
-        {
-            let bucket = page / (GRANT_PAGE_SIZE << class);
-            for candidate in [Some(bucket), (class > 0 && bucket > 0).then(|| bucket - 1)]
-                .into_iter()
-                .flatten()
+        for (segment_index, segment) in self.segments().enumerate() {
+            for class in 0..=EL1_FRAME_GRANT_TARGET_SIZE
+                .div_ceil(GRANT_PAGE_SIZE)
+                .trailing_zeros()
             {
-                for probe in 0..GRANT_PROBES {
-                    let slot = Self::probe(mm_key, candidate, class, probe);
-                    let record = &self.slots[slot];
-                    let epoch = record.state.load(Ordering::Acquire);
-                    match epoch & GRANT_STATE_MASK {
-                        GRANT_EMPTY => break,
-                        GRANT_LIVE => {
-                            let identity = record.identity();
-                            if identity.mm_key == mm_key
-                                && page >= identity.semantic_base
-                                && page - identity.semantic_base < identity.len
-                                && record.state.load(Ordering::Acquire) == epoch
-                            {
-                                let bit =
-                                    ((page - identity.semantic_base) / GRANT_PAGE_SIZE) as usize;
-                                return Some(FrameGrantResidencyPage {
-                                    slot,
-                                    identity,
-                                    expected_ipa: identity.physical_ipa
-                                        + bit as u64 * GRANT_PAGE_SIZE,
-                                    epoch,
-                                    bit,
-                                });
+                let bucket = page / (GRANT_PAGE_SIZE << class);
+                for candidate in [Some(bucket), (class > 0 && bucket > 0).then(|| bucket - 1)]
+                    .into_iter()
+                    .flatten()
+                {
+                    for probe in 0..GRANT_PROBES {
+                        let slot = Self::probe(mm_key, candidate, class, probe);
+                        let record = &segment.slots[slot];
+                        let epoch = record.state.load(Ordering::Acquire);
+                        match epoch & GRANT_STATE_MASK {
+                            GRANT_EMPTY => break,
+                            GRANT_LIVE => {
+                                let identity = record.identity();
+                                if identity.mm_key == mm_key
+                                    && page >= identity.semantic_base
+                                    && page - identity.semantic_base < identity.len
+                                    && record.state.load(Ordering::Acquire) == epoch
+                                {
+                                    let bit = ((page - identity.semantic_base) / GRANT_PAGE_SIZE)
+                                        as usize;
+                                    return Some(FrameGrantResidencyPage {
+                                        slot: segment_index * FRAME_GRANT_RESIDENCY_SLOTS + slot,
+                                        identity,
+                                        expected_ipa: identity.physical_ipa
+                                            + bit as u64 * GRANT_PAGE_SIZE,
+                                        epoch,
+                                        bit,
+                                    });
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -356,7 +1090,7 @@ impl FrameGrantResidencyTable {
     /// editor. A racing retirement either closes admission first or observes
     /// this pin and refuses; stale page tokens cannot pin a successor.
     pub fn pin_transfer(&self, page: FrameGrantResidencyPage) -> Option<FrameGrantTransferPin<'_>> {
-        let record = self.slots.get(page.slot)?;
+        let record = self.slot(page.slot)?;
         if record.state.load(Ordering::Acquire) != page.epoch || record.identity() != page.identity
         {
             return None;
@@ -378,7 +1112,7 @@ impl FrameGrantResidencyTable {
 
     /// Guest: record a committed VALID leaf before releasing the MM editor.
     pub fn record_commit(&self, page: FrameGrantResidencyPage) -> bool {
-        let Some(record) = self.slots.get(page.slot) else {
+        let Some((record, dirty)) = self.slot_entry(page.slot) else {
             return false;
         };
         if record.state.load(Ordering::Acquire) != page.epoch
@@ -389,7 +1123,7 @@ impl FrameGrantResidencyTable {
             return false;
         }
         record.committed[page.bit / 64].fetch_or(1 << (page.bit % 64), Ordering::Release);
-        self.dirty[page.slot / 64].fetch_or(1 << (page.slot % 64), Ordering::Release);
+        dirty.fetch_or(1 << (page.slot % 64), Ordering::Release);
         true
     }
 
@@ -399,7 +1133,9 @@ impl FrameGrantResidencyTable {
         let Some(page) = self.lookup(mm_key, va) else {
             return false;
         };
-        let record = &self.slots[page.slot];
+        let Some(record) = self.slot(page.slot) else {
+            return false;
+        };
         record.state.load(Ordering::Acquire) == page.epoch
             && record.identity() == page.identity
             && record.committed[page.bit / 64].load(Ordering::Acquire) & (1 << (page.bit % 64)) != 0
@@ -414,21 +1150,30 @@ impl FrameGrantResidencyTable {
         mm_key: u64,
         mut visit: impl FnMut(usize, FrameGrantResidencyIdentity, [u64; 8]) -> core::ops::ControlFlow<B>,
     ) -> core::ops::ControlFlow<B> {
-        for (word_index, word) in self.dirty.iter().enumerate() {
-            let mut pending = word.load(Ordering::Acquire);
-            while pending != 0 {
-                let bit = pending.trailing_zeros() as usize;
-                pending &= pending - 1;
-                let slot = word_index * 64 + bit;
-                let record = &self.slots[slot];
-                let epoch = record.state.load(Ordering::Acquire);
-                if epoch & GRANT_STATE_MASK == GRANT_LIVE {
-                    let identity = record.identity();
-                    if identity.mm_key == mm_key && record.state.load(Ordering::Acquire) == epoch {
-                        let bits =
-                            core::array::from_fn(|i| record.committed[i].load(Ordering::Acquire));
-                        if record.state.load(Ordering::Acquire) == epoch {
-                            visit(slot, identity, bits)?;
+        for (segment_index, segment) in self.segments().enumerate() {
+            for (word_index, word) in segment.dirty.iter().enumerate() {
+                let mut pending = word.load(Ordering::Acquire);
+                while pending != 0 {
+                    let bit = pending.trailing_zeros() as usize;
+                    pending &= pending - 1;
+                    let slot = word_index * 64 + bit;
+                    let record = &segment.slots[slot];
+                    let epoch = record.state.load(Ordering::Acquire);
+                    if epoch & GRANT_STATE_MASK == GRANT_LIVE {
+                        let identity = record.identity();
+                        if identity.mm_key == mm_key
+                            && record.state.load(Ordering::Acquire) == epoch
+                        {
+                            let bits = core::array::from_fn(|i| {
+                                record.committed[i].load(Ordering::Acquire)
+                            });
+                            if record.state.load(Ordering::Acquire) == epoch {
+                                visit(
+                                    segment_index * FRAME_GRANT_RESIDENCY_SLOTS + slot,
+                                    identity,
+                                    bits,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -438,7 +1183,7 @@ impl FrameGrantResidencyTable {
     }
 
     pub fn ack_dirty(&self, slot: usize, identity: FrameGrantResidencyIdentity) -> bool {
-        let Some(record) = self.slots.get(slot) else {
+        let Some((record, dirty)) = self.slot_entry(slot) else {
             return false;
         };
         if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE
@@ -446,7 +1191,7 @@ impl FrameGrantResidencyTable {
         {
             return false;
         }
-        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
         true
     }
 
@@ -456,7 +1201,7 @@ impl FrameGrantResidencyTable {
         slot: usize,
         identity: FrameGrantResidencyIdentity,
     ) -> Option<[u64; 8]> {
-        let record = self.slots.get(slot)?;
+        let record = self.slot(slot)?;
         let epoch = record.state.load(Ordering::Acquire);
         if epoch & GRANT_STATE_MASK != GRANT_LIVE || record.identity() != identity {
             return None;
@@ -467,7 +1212,7 @@ impl FrameGrantResidencyTable {
 
     /// Host: retire this exact grant before unmapping or reusing its owner.
     pub fn retire(&self, slot: usize, identity: FrameGrantResidencyIdentity) -> bool {
-        let Some(record) = self.slots.get(slot) else {
+        let Some((record, dirty)) = self.slot_entry(slot) else {
             return false;
         };
         let epoch = record.state.load(Ordering::Acquire);
@@ -494,7 +1239,12 @@ impl FrameGrantResidencyTable {
             record.transfer_pins.store(0, Ordering::Release);
             return false;
         }
-        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        self.storage
+            .rows()
+            .directory
+            .retirement_epoch
+            .fetch_add(1, Ordering::Release);
         true
     }
 
@@ -509,7 +1259,7 @@ impl FrameGrantResidencyTable {
         mut visit: impl FnMut(u64, u64),
     ) {
         let end = start.saturating_add(len);
-        for record in &self.slots {
+        for record in self.slots() {
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK != GRANT_LIVE {
                 continue;
@@ -538,7 +1288,7 @@ impl FrameGrantResidencyTable {
         if start >= end {
             return true;
         }
-        for (slot, record) in self.slots.iter().enumerate() {
+        for (slot, record) in self.slots().enumerate() {
             if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE {
                 continue;
             }
@@ -567,7 +1317,7 @@ impl FrameGrantResidencyTable {
         if mm_key == 0 || start >= end {
             return None;
         }
-        for record in &self.slots {
+        for record in self.slots() {
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK != GRANT_LIVE {
                 continue;
@@ -600,7 +1350,7 @@ impl FrameGrantResidencyTable {
             }
         }
         Some(FrameGrantResidencyRetirement {
-            table: self,
+            table: self.storage.rows().as_table(),
             mm_key,
             start,
             end,
@@ -609,7 +1359,7 @@ impl FrameGrantResidencyTable {
     }
 
     fn cancel_retirement(&self, mm_key: u64, start: u64, end: u64) {
-        for record in &self.slots {
+        for record in self.slots() {
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK != GRANT_LIVE {
                 continue;
@@ -630,8 +1380,21 @@ impl FrameGrantResidencyTable {
         }
     }
 
+    /// Commit a preclaim transferred via [`FrameGrantResidencyRetirement::into_preclaimed_range`]
+    /// on the same resolved view.
+    #[must_use]
+    pub fn commit_preclaimed_retirement(&self, mm_key: u64, start: u64, end: u64) -> bool {
+        self.commit_retirement(mm_key, start, end)
+    }
+
+    /// Cancel a preclaim transferred via [`FrameGrantResidencyRetirement::into_preclaimed_range`]
+    /// on the same resolved view.
+    pub fn cancel_preclaimed_retirement(&self, mm_key: u64, start: u64, end: u64) {
+        self.cancel_retirement(mm_key, start, end);
+    }
+
     fn commit_retirement(&self, mm_key: u64, start: u64, end: u64) -> bool {
-        for (slot, record) in self.slots.iter().enumerate() {
+        for (slot, record) in self.slots().enumerate() {
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK != GRANT_LIVE {
                 continue;
@@ -694,7 +1457,7 @@ impl FrameGrantResidencyTable {
         start: u64,
         end: u64,
     ) -> bool {
-        let Some(record) = self.slots.get(slot) else {
+        let Some((record, dirty)) = self.slot_entry(slot) else {
             return false;
         };
         let state = record.state.load(Ordering::Acquire);
@@ -717,7 +1480,12 @@ impl FrameGrantResidencyTable {
         {
             return false;
         }
-        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        self.storage
+            .rows()
+            .directory
+            .retirement_epoch
+            .fetch_add(1, Ordering::Release);
         self.publish_retirement_fragments(identity, bits, start, end);
         true
     }
@@ -746,16 +1514,16 @@ impl FrameGrantResidencyTable {
                 len: fragment_end - fragment_start,
                 ..identity
             };
-            if let Some(fragment_slot) = self.publish(fragment) {
+            if let Some(fragment_slot) = self.publish(fragment)
+                && let Some((record, dirty)) = self.slot_entry(fragment_slot)
+            {
                 let shift = ((fragment_start - base) / GRANT_PAGE_SIZE) as usize;
                 let count = (fragment.len / GRANT_PAGE_SIZE) as usize;
                 for bit in 0..count {
                     let old_bit = shift + bit;
                     if bits[old_bit / 64] & (1 << (old_bit % 64)) != 0 {
-                        self.slots[fragment_slot].committed[bit / 64]
-                            .fetch_or(1 << (bit % 64), Ordering::Release);
-                        self.dirty[fragment_slot / 64]
-                            .fetch_or(1 << (fragment_slot % 64), Ordering::Release);
+                        record.committed[bit / 64].fetch_or(1 << (bit % 64), Ordering::Release);
+                        dirty.fetch_or(1 << (fragment_slot % 64), Ordering::Release);
                     }
                 }
             }
@@ -798,6 +1566,57 @@ mod tests {
             owner_generation: 13,
             inventory_revision: 14,
         }
+    }
+
+    #[test]
+    fn full_residency_preserves_live_rows_and_reuses_retired_slots() {
+        let table = table();
+        let first = FrameGrantResidencyIdentity {
+            semantic_base: 0x1000_0000,
+            len: GRANT_PAGE_SIZE,
+            ..identity()
+        };
+        let at = |index: usize| FrameGrantResidencyIdentity {
+            semantic_base: first.semantic_base + index as u64 * GRANT_PAGE_SIZE,
+            physical_ipa: first.physical_ipa + index as u64 * GRANT_PAGE_SIZE,
+            ..first
+        };
+        for index in 0..FRAME_GRANT_RESIDENCY_SLOTS {
+            let identity = at(index);
+            table.try_publish(identity).unwrap();
+            assert!(
+                table.record_commit(
+                    table
+                        .lookup(identity.mm_key, identity.semantic_base)
+                        .unwrap()
+                )
+            );
+        }
+        let wider = FrameGrantResidencyIdentity {
+            len: 2 * GRANT_PAGE_SIZE,
+            ..first
+        };
+        assert_eq!(
+            table.try_publish(wider),
+            Err(FrameGrantResidencyRefusal::Overlap)
+        );
+        let next = at(FRAME_GRANT_RESIDENCY_SLOTS);
+        assert_eq!(
+            table.try_publish(next),
+            Err(FrameGrantResidencyRefusal::Capacity)
+        );
+
+        // These addresses hash to the same probe chain. Retiring the first
+        // exact row makes its slot available to the next request.
+        let stale = table.lookup(first.mm_key, first.semantic_base).unwrap();
+        let retirement = table
+            .begin_retire_overlapping(first.mm_key, first.semantic_base, first.len)
+            .unwrap();
+        assert!(retirement.commit());
+        assert_eq!(table.try_publish(next), Ok(stale.slot));
+        assert!(!table.record_commit(stale));
+        assert!(table.is_guest_committed(first.mm_key, first.semantic_base + GRANT_PAGE_SIZE));
+        assert!(!table.is_guest_committed(next.mm_key, next.semantic_base));
     }
 
     #[test]
@@ -873,6 +1692,258 @@ mod tests {
     }
 
     #[test]
+    fn extension_slots_share_lookup_dirty_ack_and_retirement() {
+        let bootstrap = table();
+        let extension = table();
+        let aliases = [ResolvedResidencySegment {
+            table: &bootstrap,
+            index: 0,
+            segment: &extension.storage.bootstrap,
+        }];
+        let view = ResidencyRows {
+            bootstrap: &bootstrap.storage.bootstrap,
+            directory: &bootstrap.storage.directory,
+            extensions: ResidencyExtensions::Aliases(&aliases),
+        }
+        .as_table();
+        let first = identity();
+        for page in 0..=FRAME_GRANT_RESIDENCY_SLOTS {
+            let offset = page as u64 * GRANT_PAGE_SIZE;
+            let row = FrameGrantResidencyIdentity {
+                semantic_base: first.semantic_base + offset,
+                physical_ipa: first.physical_ipa + offset,
+                len: GRANT_PAGE_SIZE,
+                ..first
+            };
+            let slot = view.try_publish(row).expect("space in either segment");
+            let selected = view
+                .lookup(row.mm_key, row.semantic_base)
+                .expect("published");
+            assert_eq!(selected.slot, slot);
+            assert_eq!(
+                slot >= FRAME_GRANT_RESIDENCY_SLOTS,
+                page == FRAME_GRANT_RESIDENCY_SLOTS
+            );
+            assert!(view.record_commit(selected));
+        }
+        let mut count = 0;
+        let _: core::ops::ControlFlow<()> =
+            view.for_each_dirty_mm(first.mm_key, |slot, row, bits| {
+                count += 1;
+                assert_eq!(bits[0], 1);
+                assert!(view.ack_dirty(slot, row));
+                core::ops::ControlFlow::Continue(())
+            });
+        assert_eq!(count, FRAME_GRANT_RESIDENCY_SLOTS + 1);
+        let last_va = first.semantic_base + FRAME_GRANT_RESIDENCY_SLOTS as u64 * GRANT_PAGE_SIZE;
+        let last = view.lookup(first.mm_key, last_va).expect("extension row");
+        let pin = view.pin_transfer(last).expect("exact extension pin");
+        let len = (FRAME_GRANT_RESIDENCY_SLOTS + 1) as u64 * GRANT_PAGE_SIZE;
+        assert!(
+            view.begin_retire_overlapping(first.mm_key, first.semantic_base, len)
+                .is_none()
+        );
+        drop(pin);
+        assert!(
+            view.begin_retire_overlapping(first.mm_key, first.semantic_base, len)
+                .expect("pins released across both segments")
+                .commit()
+        );
+        assert_eq!(view.observed_slots_used(), 0);
+        assert!(view.pin_transfer(last).is_none());
+    }
+
+    #[test]
+    fn allocator_refusal_preserves_rows_and_the_same_growth_can_succeed() {
+        use core::cell::{Cell, RefCell};
+
+        struct TestAllocator {
+            refuse: Cell<bool>,
+            allocations: RefCell<std::vec::Vec<(*mut u8, Layout)>>,
+        }
+        impl Drop for TestAllocator {
+            fn drop(&mut self) {
+                for (address, layout) in self.allocations.get_mut().drain(..) {
+                    // SAFETY: all table views have been dropped. The test
+                    // allocator owns each exact address and allocation layout.
+                    unsafe { std::alloc::dealloc(address, layout) };
+                }
+            }
+        }
+        // SAFETY: each allocation is retained through test teardown and has
+        // an exact enclosing extent receipt.
+        unsafe impl ReservationMetadataAllocator for TestAllocator {
+            fn allocate_with_extent(
+                &self,
+                layout: Layout,
+            ) -> Option<(*mut u8, ExtentGrantReceipt)> {
+                if self.refuse.replace(false) {
+                    return None;
+                }
+                // SAFETY: layout is for a nonempty, aligned residency segment.
+                let ptr = unsafe { std::alloc::alloc(layout) };
+                if ptr.is_null() {
+                    return None;
+                }
+                self.allocations.borrow_mut().push((ptr, layout));
+                Some((
+                    ptr,
+                    ExtentGrantReceipt {
+                        base_va: ptr as u64,
+                        size: layout.size(),
+                        token: 1,
+                    },
+                ))
+            }
+
+            fn deallocate(&self, ptr: *mut u8, layout: Layout) {
+                let mut allocations = self.allocations.borrow_mut();
+                let index = allocations
+                    .iter()
+                    .position(|entry| *entry == (ptr, layout))
+                    .unwrap();
+                allocations.swap_remove(index);
+                // SAFETY: the directory declined the allocation, and the
+                // stored entry proves this allocator retained the same layout.
+                unsafe { std::alloc::dealloc(ptr, layout) };
+            }
+        }
+
+        let allocator = TestAllocator {
+            refuse: Cell::new(true),
+            allocations: RefCell::new(std::vec::Vec::new()),
+        };
+        let table = table();
+        let first = identity();
+        for page in 0..FRAME_GRANT_RESIDENCY_SLOTS {
+            let offset = page as u64 * GRANT_PAGE_SIZE;
+            let row = FrameGrantResidencyIdentity {
+                semantic_base: first.semantic_base + offset,
+                physical_ipa: first.physical_ipa + offset,
+                len: GRANT_PAGE_SIZE,
+                ..first
+            };
+            assert!(table.publish(row).is_some());
+        }
+        let offset = FRAME_GRANT_RESIDENCY_SLOTS as u64 * GRANT_PAGE_SIZE;
+        let pending = FrameGrantResidencyIdentity {
+            semantic_base: first.semantic_base + offset,
+            physical_ipa: first.physical_ipa + offset,
+            len: GRANT_PAGE_SIZE,
+            ..first
+        };
+        assert_eq!(
+            table.try_publish(pending),
+            Err(FrameGrantResidencyRefusal::Capacity)
+        );
+        let observed = table.extension_count();
+        assert_eq!(
+            table.grow(&allocator, observed),
+            Err(ResidencyGrowthRefusal::MetadataRequired)
+        );
+        assert_eq!(table.extension_count(), observed);
+        assert_eq!(table.observed_slots_used(), FRAME_GRANT_RESIDENCY_SLOTS);
+
+        assert_eq!(table.grow(&allocator, observed), Ok(()));
+        assert_eq!(table.grow(&allocator, observed), Ok(()));
+        assert_eq!(table.extension_count(), observed + 1);
+        assert_eq!(allocator.allocations.borrow().len(), 1);
+        // SAFETY: the test allocator returned the same address used by the
+        // guest view and retains its allocations through the last borrow.
+        let view = unsafe { table.guest_view() };
+        let slot = view
+            .try_publish(pending)
+            .expect("pending row fits the new segment");
+        assert!(slot >= FRAME_GRANT_RESIDENCY_SLOTS);
+        assert_eq!(
+            view.lookup(pending.mm_key, pending.semantic_base)
+                .unwrap()
+                .slot,
+            slot
+        );
+
+        // The host identifies the same allocator grant and must supply its
+        // retained pin before it can acknowledge or retire this row.
+        struct Pin(MetadataExtent);
+        // SAFETY: TestAllocator retains the published extent throughout the
+        // local pin and view. This fixture's two venues use the same mapping.
+        unsafe impl PinnedMetadataExtent for Pin {
+            fn extent(&self) -> MetadataExtent {
+                self.0
+            }
+            fn host_base(&self) -> core::ptr::NonNull<u8> {
+                core::ptr::NonNull::new(self.0.base() as *mut u8).unwrap()
+            }
+        }
+        let location = table.extension_location(0).unwrap();
+        let extent = location.extent;
+        let pin =
+            Pin(MetadataExtent::new(extent.base_va, extent.size as u64, extent.token).unwrap());
+        let stale =
+            Pin(MetadataExtent::new(extent.base_va, extent.size as u64, extent.token + 1).unwrap());
+        // SAFETY: both pins use the exact test carrier's allocator venue.
+        assert!(unsafe { table.resolve_extension(0, &stale) }.is_none());
+        assert!(table.resolved_view(&[]).is_none());
+        // SAFETY: pin uses the exact test carrier's allocator venue.
+        let aliases = [unsafe { table.resolve_extension(0, &pin) }.unwrap()];
+        let host = table.resolved_view(&aliases).unwrap();
+        let epoch_before = table.retirement_epoch();
+        assert!(host.retire(slot, pending));
+        assert_eq!(table.retirement_epoch(), epoch_before + 1);
+        assert!(view.lookup(pending.mm_key, pending.semantic_base).is_none());
+
+        // ResolvedResidencyTable caches dynamic pins across refreshes and
+        // retires rows across both bootstrap and dynamic segments.
+        struct Resolver {
+            expected: MetadataExtent,
+            pin_calls: Cell<usize>,
+        }
+        impl MetadataExtentResolver for Resolver {
+            type Pin = Pin;
+            fn pin(&self, extent: MetadataExtent) -> Result<Pin, MetadataResolutionError> {
+                self.pin_calls.set(self.pin_calls.get() + 1);
+                if extent != self.expected {
+                    return Err(MetadataResolutionError::InvalidExtent);
+                }
+                Ok(Pin(extent))
+            }
+        }
+        let resolver = Resolver {
+            expected: MetadataExtent::new(extent.base_va, extent.size as u64, extent.token)
+                .unwrap(),
+            pin_calls: Cell::new(0),
+        };
+        let mut resolved = std::boxed::Box::new(ResolvedResidencyTable::new());
+        // SAFETY: table and resolver belong to this fixture for the whole test.
+        unsafe { resolved.refresh(&table, &resolver, None).unwrap() };
+        assert_eq!(resolved.extension_count(), 1);
+        assert_eq!(resolver.pin_calls.get(), 1);
+        // Unchanged generation performs zero re-pinning.
+        unsafe { resolved.refresh(&table, &resolver, None).unwrap() };
+        assert_eq!(resolver.pin_calls.get(), 1);
+        let host_view = resolved.view().unwrap();
+        let second_slot = view.try_publish(pending).expect("re-publish in extension");
+        assert!(second_slot >= FRAME_GRANT_RESIDENCY_SLOTS);
+        assert_eq!(
+            host_view.observed_slots_used(),
+            FRAME_GRANT_RESIDENCY_SLOTS + 1
+        );
+        let total_len = (FRAME_GRANT_RESIDENCY_SLOTS + 1) as u64 * GRANT_PAGE_SIZE;
+        let epoch_before_bulk = host_view.retirement_epoch();
+        assert!(
+            host_view
+                .begin_retire_overlapping(first.mm_key, first.semantic_base, total_len)
+                .expect("retire across bootstrap and dynamic segments")
+                .commit()
+        );
+        assert_eq!(host_view.observed_slots_used(), 0);
+        assert_eq!(
+            host_view.retirement_epoch(),
+            epoch_before_bulk + (FRAME_GRANT_RESIDENCY_SLOTS + 1) as u64
+        );
+    }
+
+    #[test]
     fn constructors_have_identical_wire_bytes_and_frozen_arm_layout() {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
@@ -887,7 +1958,7 @@ mod tests {
         assert_eq!(core::mem::align_of::<FrameGrantResidencyRecord>(), 64);
         assert_eq!(FrameGrantResidencyRecord::COMMITTED_OFFSET, 72);
         assert_eq!(FrameGrantResidencyRecord::TRANSFER_PINS_OFFSET, 136);
-        assert_eq!(core::mem::size_of::<FrameGrantResidencyTable>(), 786_944);
+        assert_eq!(core::mem::size_of::<FrameGrantResidencyTable>(), 795_200);
         assert_eq!(core::mem::align_of::<FrameGrantResidencyTable>(), 64);
 
         let layout = std::alloc::Layout::new::<FrameGrantResidencyTable>();

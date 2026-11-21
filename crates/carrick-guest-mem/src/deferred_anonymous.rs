@@ -520,6 +520,23 @@ impl DeferredAnonymousState {
         }
         Ok(Some(DeferredAnonymousTransition { state, range }))
     }
+
+    /// Lock an owner-authenticated grant span through physical publication.
+    ///
+    /// Unlike a speculative first touch, an owner grant may replace backing
+    /// that `MADV_DONTNEED` already retired from stage-1. Such a page remains
+    /// in `materialized` until the replacement commits, so requiring pristine
+    /// provenance would strand the live reservation behind its retired leaf.
+    /// The caller must retain the exact-MM reservation decision and descriptor
+    /// transaction; those authorities prove that every page is either absent
+    /// or retired before the new grant can become visible.
+    pub fn begin_owner_grant_materialization(
+        &self,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<DeferredAnonymousTransition<'_>, DeferredAnonymousError> {
+        self.begin_materialization(start, len)
+    }
 }
 
 #[must_use]
@@ -753,6 +770,27 @@ mod tests {
             state.snapshot(),
             before,
             "refusal must not mutate provenance"
+        );
+    }
+
+    #[test]
+    fn owner_grant_materialization_accepts_a_retired_materialized_page() {
+        let state = DeferredAnonymousState::new();
+        let page = GuestVa::new(0x4000);
+        state.reserve_fresh(page, PAGE as usize).unwrap();
+        state
+            .begin_pristine_materialization(page, PAGE as usize)
+            .unwrap()
+            .expect("fresh page")
+            .commit();
+
+        let transition = state
+            .begin_owner_grant_materialization(page, PAGE as usize)
+            .expect("a retired leaf with retained owner authority must be re-grantable");
+        transition.commit();
+        assert_eq!(
+            state.materialized_within(page, PAGE as usize),
+            [page..GuestVa::new(page.raw() + PAGE)]
         );
     }
 

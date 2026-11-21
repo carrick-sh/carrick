@@ -283,7 +283,9 @@ pub const FAULT_VA: u8 = 69;
 /// Host frame-grant decision. `a` is Linux TID, `b` is the low 32 bits of the
 /// request generation, `c` packs the [`FrameGrantDecision`] (bits 3:0), the
 /// Linux protection (bits 7:4) and the span in 4 KiB pages (bits 31:8,
-/// saturating). Plan and Ready decisions are followed by [`EL1GRANT_BASE`];
+/// saturating). Descriptor refusals instead use bits 23:8 for pages and
+/// bits 31:24 for the stable descriptor refusal code.
+/// Plan and Ready decisions are followed by [`EL1GRANT_BASE`];
 /// Ready also by [`EL1GRANT_IPA`].
 pub const EL1GRANT_DECISION: u8 = 70;
 /// Semantic base of a granted/planned span: `a:b` is the VA, `c` the TID.
@@ -852,18 +854,26 @@ pub enum FrameGrantClaimOutcome {
 
 /// Host decision for a claimed frame-grant request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
 pub enum FrameGrantDecision {
     /// A resident plan names the span (base/len/prot follow).
-    PlanFound = 0,
+    PlanFound,
     /// Refused: no resident plan covers the fault.
-    NoPlan = 1,
+    NoPlan,
     /// Refused: the plan's protection denies the faulting access.
-    FirstTouchDenied = 2,
+    FirstTouchDenied,
     /// Refused: the backend could not prepare the grant.
-    PrepareRefused = 3,
-    /// Ready published to EL1 (base/len/IPA follow).
-    Ready = 4,
+    PrepareRefused,
+    /// Descriptor and residency publication finished (base/len/IPA follow).
+    Ready,
+    PrepareError,
+    PublishUnsupported,
+    PublishRefused(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
+    DescriptorRefused(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
+    DescriptorRolledBack(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
+    MailboxSlotNotWorking,
+    MailboxStaleRequest,
+    MailboxInvalidReady,
+    FatalPublication,
 }
 
 /// Host first-touch resident-plan result.
@@ -945,8 +955,27 @@ pub fn rec_el1_frame_grant_claim(
 
 #[inline]
 fn encode_frame_grant_decision(decision: FrameGrantDecision, prot: u64, len: u64) -> i32 {
-    let pages = (len >> 12).min(0x00ff_ffff) as u32;
-    ((decision as u32 & 0xf) | (((prot & 0xf) as u32) << 4) | (pages << 8)) as i32
+    let (code, detail) = match decision {
+        FrameGrantDecision::PlanFound => (0, None),
+        FrameGrantDecision::NoPlan => (1, None),
+        FrameGrantDecision::FirstTouchDenied => (2, None),
+        FrameGrantDecision::PrepareRefused => (3, None),
+        FrameGrantDecision::Ready => (4, None),
+        FrameGrantDecision::PrepareError => (5, None),
+        FrameGrantDecision::PublishUnsupported => (6, None),
+        FrameGrantDecision::PublishRefused(reason) => (7, Some(reason)),
+        FrameGrantDecision::DescriptorRefused(reason) => (8, Some(reason)),
+        FrameGrantDecision::DescriptorRolledBack(reason) => (9, Some(reason)),
+        FrameGrantDecision::MailboxSlotNotWorking => (10, None),
+        FrameGrantDecision::MailboxStaleRequest => (11, None),
+        FrameGrantDecision::MailboxInvalidReady => (12, None),
+        FrameGrantDecision::FatalPublication => (13, None),
+    };
+    let extent = match detail {
+        Some(reason) => ((reason as u32) << 16) | (len >> 12).min(0xffff) as u32,
+        None => (len >> 12).min(0xffffff) as u32,
+    };
+    (code | (((prot & 0xf) as u32) << 4) | (extent << 8)) as i32
 }
 
 /// Record the host's decision for a claimed frame-grant request. `base` is
@@ -1394,6 +1423,15 @@ fn ring_grant_decision_name(code: u32) -> &'static str {
         2 => "refused/first-touch",
         3 => "refused/prepare",
         4 => "ready",
+        5 => "error/prepare",
+        6 => "refused/publish-unsupported",
+        7 => "refused/publish",
+        8 => "refused/descriptor",
+        9 => "rolled-back/descriptor",
+        10 => "refused/mailbox-slot",
+        11 => "refused/mailbox-stale",
+        12 => "refused/mailbox-ready",
+        13 => "fatal/publication",
         _ => "unknown",
     }
 }
@@ -1784,12 +1822,23 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         FAULT_VA => format!("FAULT_VA tid={c} va={:#018x}", join_u64(a, b)),
         EL1GRANT_DECISION => {
             let packed = c as u32;
-            format!(
-                "EL1GRANT_DECISION tid={a} generation={} decision={} prot={:#x} pages={}",
-                b as u32,
-                ring_grant_decision_name(packed & 0xf),
-                (packed >> 4) & 0xf,
+            let code = packed & 0xf;
+            let mut decision = ring_grant_decision_name(code).to_owned();
+            let pages = if matches!(code, 7..=9) {
+                use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+                let reason = packed >> 24;
+                match DescriptorRefusal::from_code(reason) {
+                    Some(reason) => decision.push_str(&format!(" descriptor_refusal={reason:?}")),
+                    None => decision.push_str(&format!(" descriptor_refusal=unknown({reason})")),
+                }
+                (packed >> 8) & 0xffff
+            } else {
                 packed >> 8
+            };
+            format!(
+                "EL1GRANT_DECISION tid={a} generation={} decision={decision} prot={:#x} pages={pages}",
+                b as u32,
+                (packed >> 4) & 0xf,
             )
         }
         EL1GRANT_BASE => format!("EL1GRANT_BASE tid={c} base={:#018x}", join_u64(a, b)),
@@ -2744,6 +2793,41 @@ mod tests {
             "EL1GRANT_DECISION tid=72002 generation=42 decision=refused/no-plan prot=0x0 pages=16777215"
         );
         assert!(latest_companion(EL1GRANT_BASE, tid + 1).is_none());
+    }
+
+    #[test]
+    fn el1_frame_grant_terminal_decisions_round_trip() {
+        use FrameGrantDecision::*;
+        use carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied;
+        let tid = 72_003;
+        for (decision, outcome) in [
+            (PrepareError, "error/prepare"),
+            (PublishUnsupported, "refused/publish-unsupported"),
+            (
+                PublishRefused(Occupied),
+                "refused/publish descriptor_refusal=Occupied",
+            ),
+            (
+                DescriptorRefused(Occupied),
+                "refused/descriptor descriptor_refusal=Occupied",
+            ),
+            (
+                DescriptorRolledBack(Occupied),
+                "rolled-back/descriptor descriptor_refusal=Occupied",
+            ),
+            (MailboxSlotNotWorking, "refused/mailbox-slot"),
+            (MailboxStaleRequest, "refused/mailbox-stale"),
+            (MailboxInvalidReady, "refused/mailbox-ready"),
+            (FatalPublication, "fatal/publication"),
+        ] {
+            rec_el1_frame_grant_decision(tid, 3118, decision, 3, 306 * 4096, None, None);
+            assert_eq!(
+                decoded(latest_event(EL1GRANT_DECISION, tid).expect("terminal decision")),
+                format!(
+                    "EL1GRANT_DECISION tid=72003 generation=3118 decision={outcome} prot=0x3 pages=306"
+                )
+            );
+        }
     }
 
     #[test]

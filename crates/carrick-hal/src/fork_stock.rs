@@ -701,7 +701,9 @@ impl LifecycleWindow {
 /// this release (idempotent: an emptied MM retires nothing again).
 pub fn release_child_mm(
     inventory: &dyn crate::PhysicalFrameInventory,
-    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+    residency: &carrick_el1_abi::FrameGrantResidencyTable<
+        impl carrick_el1_abi::FrameGrantResidencyAccess,
+    >,
     returns: &dyn RetiredReturns,
     absent: &carrick_sched_core::ExcludedEditor<'_>,
 ) -> bool {
@@ -715,7 +717,9 @@ pub fn release_child_mm(
 /// parent's owed returns). Only its inventory and residency rows go.
 pub fn release_unrun_child_mm(
     inventory: &dyn crate::PhysicalFrameInventory,
-    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+    residency: &carrick_el1_abi::FrameGrantResidencyTable<
+        impl carrick_el1_abi::FrameGrantResidencyAccess,
+    >,
     mm: ReservationMm,
 ) -> bool {
     release_mm_memory(inventory, residency, mm)
@@ -723,7 +727,9 @@ pub fn release_unrun_child_mm(
 
 fn release_mm_memory(
     inventory: &dyn crate::PhysicalFrameInventory,
-    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+    residency: &carrick_el1_abi::FrameGrantResidencyTable<
+        impl carrick_el1_abi::FrameGrantResidencyAccess,
+    >,
     mm: ReservationMm,
 ) -> bool {
     let Some(generation) = NonZeroU64::new(mm.raw()).map(carrick_guest_arch::MmGeneration::new)
@@ -1811,7 +1817,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             .pending_descriptor_tables
             .get(&pending_key)
             .ok_or(ForkStockServiceError::StaleExecution)?;
-        if self.child_owner(owner.mm()) != Some(owner) || pending.root != root {
+        if !self.descriptor_owner_matches(owner, root) || pending.root != root {
             return Err(ForkStockServiceError::StaleExecution);
         }
         let pending = self

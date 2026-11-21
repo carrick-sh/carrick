@@ -2563,9 +2563,11 @@ impl PublicationContext<'static> {
             binding.identity.linux_pid,
             binding.identity.linux_tid,
         );
-        let page = carrick_el1_abi::frame_grant_residency_host()
-            .and_then(|table| table.lookup(window.operation.mm.raw(), window.fault_page))
-            .ok_or_else(invalid)?;
+        let page = carrick_hal::host_residency::with_host_residency(|table| {
+            table.lookup(window.operation.mm.raw(), window.fault_page)
+        })
+        .flatten()
+        .ok_or_else(invalid)?;
         let identity = page.identity;
         let aliases = alias_registry().lock().overlapping_process_aliases(
             window.fault_page,
@@ -2734,8 +2736,10 @@ impl PublicationContext<'static> {
                     return Ok(TransferPreparation::Pending(wait));
                 }
             }
-            let resident = carrick_el1_abi::frame_grant_residency_host()
-                .and_then(|table| table.lookup(window.operation.mm.raw(), window.fault_page));
+            let resident = carrick_hal::host_residency::with_host_residency(|table| {
+                table.lookup(window.operation.mm.raw(), window.fault_page)
+            })
+            .flatten();
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.fault_page,
                 resident.map_or(0, |page| page.identity.len),
@@ -2778,15 +2782,17 @@ impl PublicationContext<'static> {
             // A committed residency and the matching physical alias authorize
             // only a fresh owner selection, never reuse of this stale window.
             let peer_resident = resident.is_some_and(|page| {
-                carrick_el1_abi::frame_grant_residency_host().is_some_and(|table| {
+                carrick_hal::host_residency::with_host_residency(|table| {
                     table.is_guest_committed(window.operation.mm.raw(), window.fault_page)
-                }) && overlapping.iter().any(|(_, alias)| {
-                    window.fault_page >= alias.start
-                        && window.fault_page < alias.start.saturating_add(alias.size as u64)
-                        && alias.ipa.checked_add(window.fault_page - alias.start)
-                            == Some(page.expected_ipa)
-                        && alias.owner_generation == page.identity.owner_generation
                 })
+                .unwrap_or(false)
+                    && overlapping.iter().any(|(_, alias)| {
+                        window.fault_page >= alias.start
+                            && window.fault_page < alias.start.saturating_add(alias.size as u64)
+                            && alias.ipa.checked_add(window.fault_page - alias.start)
+                                == Some(page.expected_ipa)
+                            && alias.owner_generation == page.identity.owner_generation
+                    })
             });
             return Ok(if peer_resident {
                 TransferPreparation::PeerResident
@@ -2926,6 +2932,153 @@ impl PublicationContext<'static> {
         Ok(TransferPreparation::Grant(Box::new(pending)))
     }
 }
+enum ResidencyCensusClass {
+    Live,
+    DeadMm,
+    StaleBacking,
+    Unapplied,
+    Unknown,
+}
+
+impl TransferGrantAuthorities {
+    fn residency_census(
+        &self,
+        mm: std::num::NonZeroU64,
+        generation: u64,
+    ) -> (u64, u64, u64, u64, u64, u64) {
+        let Some(view) = carrick_hal::host_residency::current_host_residency() else {
+            return (generation, 0, 0, 0, 0, 0);
+        };
+        let table = view.table();
+        let mut counts = [0_u64; 5];
+        let zone = carrick_el1_abi::zone_tables();
+        table.inspect_occupied(
+            |row, committed| {
+                let Some(zone) = zone else {
+                    return ResidencyCensusClass::Unknown;
+                };
+                let Some(row_mm) = std::num::NonZeroU64::new(row.mm_key) else {
+                    return ResidencyCensusClass::Unknown;
+                };
+                let Some(entry) = zone.space_entry(row_mm) else {
+                    return ResidencyCensusClass::DeadMm;
+                };
+                // The grant carries only the refusing MM's inventory and
+                // stage-1 authority. Never use it to judge another live MM.
+                if row_mm != mm || zone.spaces.active_editor(entry.index()).is_some() {
+                    return ResidencyCensusClass::Unknown;
+                }
+                let Ok(source) = entry.live_notifications() else {
+                    return ResidencyCensusClass::Unknown;
+                };
+                use carrick_sched_core::spaces::notification::SpaceWaitCause;
+                let before = [SpaceWaitCause::Editor, SpaceWaitCause::Gate]
+                    .map(|cause| source.observe(cause));
+                let classification = self.classify_residency_row(row, committed);
+                let after = [SpaceWaitCause::Editor, SpaceWaitCause::Gate]
+                    .map(|cause| source.observe(cause));
+                if before != after
+                    || zone.spaces.active_editor(entry.index()).is_some()
+                    || !source.is_live()
+                {
+                    return ResidencyCensusClass::Unknown;
+                }
+                classification
+            },
+            |class| counts[class.unwrap_or(ResidencyCensusClass::Unknown) as usize] += 1,
+        );
+        let [live, dead_mm, stale_backing, unapplied, unknown] = counts;
+        (generation, live, dead_mm, stale_backing, unapplied, unknown)
+    }
+
+    fn classify_residency_row(
+        &self,
+        row: carrick_el1_abi::FrameGrantResidencyIdentity,
+        committed: bool,
+    ) -> ResidencyCensusClass {
+        let Some(inventory) = self.state.frame_inventory.ledger.try_lock() else {
+            return ResidencyCensusClass::Unknown;
+        };
+        let Some((&key, &extent)) = inventory.extent_containing(row.physical_ipa) else {
+            return ResidencyCensusClass::StaleBacking;
+        };
+        drop(inventory);
+        if extent.mapping.raw() != row.mapping_id
+            || extent.frame.raw() != row.frame_id
+            || extent.stage2_owner.generation != row.owner_generation
+            || row.len > key.1.saturating_sub(row.physical_ipa - key.0)
+        {
+            return ResidencyCensusClass::StaleBacking;
+        }
+        let Some(owners) = self.custody.global_frame_host_owners.try_lock() else {
+            return ResidencyCensusClass::Unknown;
+        };
+        let owner_is_current = owners
+            .get(&(extent.stage2_base, extent.stage2_length))
+            .and_then(GlobalFrameOwnerEntry::live_owner)
+            .is_some_and(|owner| {
+                owner.generation() == row.owner_generation
+                    && owner.host_addr() == extent.stage2_owner.host_addr
+            });
+        drop(owners);
+        if !owner_is_current {
+            return ResidencyCensusClass::StaleBacking;
+        }
+
+        let Some(len) = std::num::NonZeroU64::new(key.1) else {
+            return ResidencyCensusClass::Unknown;
+        };
+        let candidate = (
+            extent.mapping,
+            extent.frame,
+            carrick_guest_mem::Gpa::new(key.0),
+            carrick_hal::FrameLength::from_mapping_extent(len),
+        );
+        match self.authority.retirement_batch_query(&[candidate], &[]) {
+            Ok((live, _)) if live.as_slice() == [true] => {}
+            Ok((live, _)) if live.as_slice() == [false] => {
+                return ResidencyCensusClass::StaleBacking;
+            }
+            _ => return ResidencyCensusClass::Unknown,
+        }
+
+        self.state
+            .page_tables_authority()
+            .with_manager(|manager| {
+                use carrick_mmu_core::aarch64::{
+                    descriptor_is_valid, terminal_descriptor, terminal_descriptor_is_retired,
+                };
+                if !manager.is_live() {
+                    return ResidencyCensusClass::Unknown;
+                }
+                let mut applied = committed;
+                for offset in (0..row.len).step_by(4096) {
+                    let va = row.semantic_base + offset;
+                    let ipa = row.physical_ipa + offset;
+                    let Ok(retained) = manager.try_translate_retained_output(va) else {
+                        return ResidencyCensusClass::Unknown;
+                    };
+                    let Ok(walk) = manager.try_debug_walk(va) else {
+                        return ResidencyCensusClass::Unknown;
+                    };
+                    let leaf = terminal_descriptor(walk);
+                    if retained != Some(ipa) || terminal_descriptor_is_retired(leaf) {
+                        return ResidencyCensusClass::Unapplied;
+                    }
+                    applied |= descriptor_is_valid(leaf);
+                }
+                if applied {
+                    ResidencyCensusClass::Live
+                } else {
+                    // A grant can publish its residency before EL1 has
+                    // applied it. Prepared output alone proves no commit.
+                    ResidencyCensusClass::Unknown
+                }
+            })
+            .unwrap_or(ResidencyCensusClass::Unknown)
+    }
+}
+
 impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
     fn release_destroyed_vm(&mut self) -> Result<(), TrapError> {
         let identity = self
@@ -2965,6 +3118,7 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
     fn settle(
         &mut self,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+        trace: Option<carrick_mmu_core::live_descriptor_words::GrantRefusalTrace>,
     ) -> Result<bool, TrapError> {
         use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
         let txn = self.txn.as_ref().unwrap_or_else(|| {
@@ -2981,6 +3135,34 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
                 "hvpatch::user_transfer",
                 "grant completion cannot release uncertain descriptor-visible ownership"
             );
+        }
+        if let Some(event) = trace.and_then(|trace| trace.event) {
+            if matches!(
+                event,
+                carrick_mmu_core::live_descriptor_words::DescriptorDiagnostic::ResidencyRefused { .. }
+            ) {
+                carrick_observability::probes::frame_grant_residency_census(|| {
+                    self.context
+                        .residency_census(txn.id.mm_key, txn.id.generation.get())
+                });
+            }
+            carrick_hal::diagnostic_capture::trace_descriptor_diagnostic(
+                carrick_hal::diagnostic_capture::GuestIsa::Aarch64,
+                event,
+            );
+        }
+        if let DescriptorOutcome::Refused(reason) = receipt.outcome {
+            carrick_observability::probes::hvpatch_owner_grant_descriptor_refused(|| {
+                let span = txn.op.span();
+                (
+                    txn.id.generation.get(),
+                    txn.op.kind(),
+                    span.va,
+                    span.len,
+                    u64::from(reason as u8),
+                    trace.map_or(2, |trace| u64::from(trace.residency_published)),
+                )
+            });
         }
         let applied = matches!(receipt.outcome, DescriptorOutcome::Applied(_));
         // A peer can advance the reservation generation after PREPARE but

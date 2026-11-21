@@ -308,6 +308,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         release: SpaceReleaseVenue<'_, carrick_sched_core::ParkedContextWords>,
         excluded: &carrick_el1_abi::ExcludedEditor<'_>,
     ) -> Result<PauseSettlement, TrapError> {
+        self.drain_cancelled_backing_for_excluded(excluded)?;
         settle_cow_then_returns(
             &mut Cpl0Exclusion {
                 custody: self,

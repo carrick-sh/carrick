@@ -152,8 +152,10 @@ impl SyscallDispatcher {
     }
 
     fn first_touch_guest_committed(&self, mutation: &MmMutationGuard<'_>, address: u64) -> bool {
-        carrick_el1_abi::frame_grant_residency_host()
-            .is_some_and(|table| table.is_guest_committed(mutation.mm_id().raw(), address))
+        carrick_hal::host_residency::with_host_residency(|table| {
+            table.is_guest_committed(mutation.mm_id().raw(), address)
+        })
+        .unwrap_or(false)
     }
 
     pub fn plan_host_first_touch(
@@ -303,9 +305,9 @@ impl SyscallDispatcher {
             .try_into()
             .map_err(|error| format!("invalid pinned publication snapshot: {error:?}"));
         let publication = self.mem_view().commit_published_frame_grant(plan);
-        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+        carrick_hal::host_residency::with_host_residency(|table| {
             publication.publish(table, residency);
-        }
+        });
     }
 
     /// Serve the EL1 frame grant a host copyout into never-touched memory

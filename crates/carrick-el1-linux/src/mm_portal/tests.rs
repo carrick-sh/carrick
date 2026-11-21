@@ -1288,6 +1288,40 @@ fn untouched_transfer_window(prefix: bool) {
         assert!(residency.lookup(mm.raw(), VA).is_none());
         assert_eq!(tables.words[1536].load(Ordering::Acquire), 0);
     }
+    // Publish a conflicting residency row while leaving the descriptors empty.
+    // The exact grant must identify publication as the refusal source.
+    let span = txn.op.span();
+    let prior = carrick_el1_abi::FrameGrantResidencyIdentity {
+        mm_key: mm.raw(),
+        semantic_base: span.va,
+        physical_ipa: IPA,
+        len: span.len,
+        mapping_id: 9,
+        frame_id: 9,
+        owner_generation: 9,
+        inventory_revision: 9,
+    };
+    let prior_slot = residency.publish(prior).unwrap();
+    assert!(slot.submit_with_trace(window, &txn, true));
+    let refused = serve_grant(&portal, &slot, &words, &residency, 0, || {})
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        refused.outcome,
+        DescriptorOutcome::Refused(
+            carrick_mmu_core::descriptor_refusal::DescriptorRefusal::WrongBacking,
+        )
+    );
+    let (receipt, trace) = slot.take_receipt_with_trace(window, &txn).unwrap();
+    assert_eq!(receipt, refused);
+    assert_eq!(
+        trace,
+        Some(carrick_mmu_core::live_descriptor_words::GrantRefusalTrace {
+            residency_published: false,
+            event: None,
+        })
+    );
+    assert!(residency.retire(prior_slot, prior));
     assert!(slot.submit(window, &txn));
     let receipt = serve_grant(&portal, &slot, &words, &residency, 0, || {})
         .unwrap()

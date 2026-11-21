@@ -1490,12 +1490,11 @@ impl HvfVmState {
         let Some(deferred_state) = self.deferred_anonymous_state() else {
             return decline("frame grant lacks deferred provenance");
         };
-        let transition = match deferred_state.begin_pristine_materialization(
+        let transition = match deferred_state.begin_owner_grant_materialization(
             carrick_guest_mem::GuestVa::new(request.semantic_base),
             semantic_len,
         ) {
-            Ok(Some(transition)) => transition,
-            Ok(None) => return decline("frame grant provenance is not pristine"),
+            Ok(transition) => transition,
             Err(_) => return decline("frame grant provenance transition refused"),
         };
         let replacement_leases: std::collections::BTreeSet<_> = aliases
@@ -4336,6 +4335,11 @@ impl HvfTaskState {
             })
         };
         drop(registry);
+        if !guest_lane {
+            carrick_hal::host_residency::with_host_residency(|table| {
+                table.retire_overlapping(identity.mm, span.va, span.len as u64);
+            });
+        }
         let scope = CowInventoryLifecycleScope {
             custody,
             identity: self.cow_identity,

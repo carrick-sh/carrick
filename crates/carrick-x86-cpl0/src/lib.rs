@@ -155,6 +155,33 @@ mod test_support {
     static EARLY_RELEASE_TASK: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
     static EARLY_RELEASES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// The calling member's next owner-selected grant finds its MM editor
+    /// held when it serves the window the carrier already prepared and
+    /// submitted: the loser of a two-CPU race in one grant window.
+    pub const INJECT_SELECTED_SERVE_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe40;
+    /// Selected-window serves the armed hold refused.
+    pub const INJECT_SELECTED_SERVE_BUSY_CENSUS: u64 = 0xffff_ffff_ffff_fe41;
+    /// Address of the armed member's current task, or 0.
+    static SELECTED_SERVE_BUSY_TASK: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    static SELECTED_SERVE_BUSIES: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    /// Called after the carrier prepared and submitted `task`'s selected
+    /// window, before the guest serves it: hold the editor for exactly the
+    /// armed member's serve. The holder releases once the member parks.
+    pub fn hold_editor_for_selected_serve(task: &carrick_el1_abi::CurrentTask) {
+        let address = task as *const carrick_el1_abi::CurrentTask as u64;
+        if SELECTED_SERVE_BUSY_TASK
+            .compare_exchange(address, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if !carrick_sched_core::spaces::inject_editor_busy_once() {
+                carrick_x86_carrier::entry::fatal_boot();
+            }
+            SELECTED_SERVE_BUSIES.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 
     /// Called before a native member's user-memory access: hold the editor
     /// for exactly the armed member's next acquisition. True when held.
@@ -667,6 +694,13 @@ mod test_support {
             INJECT_EDITOR_RELEASED_BEFORE_PARK_CENSUS => {
                 Some(EARLY_RELEASES.load(Ordering::Acquire))
             }
+            INJECT_SELECTED_SERVE_BUSY_ONCE => SELECTED_SERVE_BUSY_TASK
+                .compare_exchange(0, binding.task_address, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                .then_some(0),
+            INJECT_SELECTED_SERVE_BUSY_CENSUS => {
+                Some(SELECTED_SERVE_BUSIES.load(Ordering::Acquire))
+            }
             INJECT_COW_SETTLE_TIMED_OUT => {
                 Some(u64::from(COW_SETTLE_TIMED_OUT.load(Ordering::Acquire)))
             }
@@ -872,5 +906,43 @@ mod anonymous_refusal_tests {
         let pc = carrick_guest_arch::UserVa::new(0x40004);
         assert!(anonymous_call(call, u32::MAX, pc).is_none());
         assert_eq!(anonymous_call(call, 7, pc).unwrap().slot().index(), 7);
+    }
+
+    #[test]
+    fn syscall_copy_contention_parks_instead_of_becoming_efault() {
+        let source = include_str!("linux_personality.rs");
+        assert!(
+            source.matches("anonymous::park_contended_fault(").count() >= 3,
+            "#PF, exec staging, and host-file staging must share the MM-release park"
+        );
+        assert!(
+            !source.contains("Some(stage.refused())\n                            }\n                            UserFaultSupply::Signal"),
+            "host-file staging must not classify contention as a refused user copy"
+        );
+        assert!(
+            !source.contains("frame.rax = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;\n                    CompletionRoute::Served\n                }\n                UserFaultSupply::Signal"),
+            "exec staging must not classify contention as EFAULT"
+        );
+    }
+
+    #[test]
+    fn selected_owner_waits_park_instead_of_reaching_ud2() {
+        let source = include_str!("linux_personality.rs");
+        assert!(
+            source.contains("UserFaultSupply::TypedRelease(wait)"),
+            "the Selected arm must retain the typed owner wait through parking"
+        );
+        assert!(
+            !source.contains(
+                "PortalWaitCause::ReservationPool | PortalWaitCause::HostReadiness => None"
+            ),
+            "reservation-pool and host-readiness receipts name real object queues"
+        );
+        assert!(
+            !source.contains(
+                "Err(carrick_core::mm::transaction::MmError::Wait(wait)) => portal_wait_cause(wait)"
+            ),
+            "a typed owner wait must not collapse to Unresolved(9)"
+        );
     }
 }

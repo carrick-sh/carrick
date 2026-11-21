@@ -1417,9 +1417,9 @@ where
             );
         }
         if owns_final_mm {
-            if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            carrick_hal::host_residency::with_host_residency(|table| {
                 table.retire_overlapping(terminal_mm.raw(), 0, u64::MAX);
-            }
+            });
             super::signal::withdraw_guest_descriptor_work(terminal_mm.raw());
             let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
                 carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
@@ -5826,7 +5826,7 @@ where
                                 engine,
                                 control,
                                 super::zone::OwnerMemoryAction::Fault,
-                                busy.wait,
+                                busy,
                             );
                         }
                     }
@@ -5935,7 +5935,7 @@ where
                                 engine,
                                 control,
                                 super::zone::OwnerMemoryAction::Fault,
-                                busy.wait,
+                                busy,
                             );
                         }
                     }

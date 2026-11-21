@@ -6868,6 +6868,212 @@ fn delegated_host_stock_keeps_fragmented_window_first_touch() {
     }
 }
 
+/// A stale host residency row is not descriptor authority. The runtime clips
+/// this semantic plan against the live stage-1 image before preparing backing.
+fn production_grant_ignores_stale_host_residency(access: u64) {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base),
+        8 * PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    dispatcher.mem().lock().resident.insert(
+        carrick_vfs::GuestMemoryRange::new(
+            GuestVa::new(base + 3 * PAGE),
+            GuestVa::new(base + 4 * PAGE),
+        )
+        .unwrap(),
+        ResidencyOwner::Host,
+    );
+
+    let fault = if access == 1 {
+        base + 2 * PAGE
+    } else {
+        base + 4 * PAGE
+    };
+    let request = super::super::mm_mutation::test_support::with_permit(
+        dispatcher.mm_mutation_coordinator(),
+        |permit| {
+            let plan = dispatcher
+                .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
+                .expect("production selector must acquire the delegated root")
+                .expect("stale host residency must not suppress the semantic plan");
+            SyscallDispatcher::el1_frame_grant_request(
+                &plan,
+                dispatcher.mm_authority().mm_id.raw(),
+                fault,
+                access,
+            )
+        },
+    );
+    assert_eq!(request.fault_va, fault);
+    assert_eq!(request.access, access);
+    assert!((request.semantic_base..request.semantic_base + request.len).contains(&fault));
+    assert!(
+        (request.semantic_base..request.semantic_base + request.len).contains(&(base + 3 * PAGE)),
+        "access={access}: a residency row incorrectly acted as descriptor authority"
+    );
+}
+
+#[test]
+fn arm_read_plan_ignores_in_node_stale_host_residency() {
+    production_grant_ignores_stale_host_residency(1);
+}
+
+#[test]
+fn x86_write_plan_ignores_in_node_stale_host_residency() {
+    production_grant_ignores_stale_host_residency(2);
+}
+
+/// The descriptor-selected span is the semantic plan that provenance,
+/// publication, residency and stock must all consume.
+#[test]
+fn selected_backing_plan_narrows_the_committed_host_grant() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + 2 * STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base),
+        8 * PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    let fault = base + 4 * PAGE;
+
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(fault, STOCK_WINDOW, |plan| {
+            let admitted =
+                carrick_core_abi::ReservationRange::new(plan.start(), plan.start() + plan.len())
+                    .expect("production plan has a valid admitted range");
+            let selected = carrick_core_abi::ReservationRange::new(fault, fault + PAGE)
+                .expect("one selected page is a valid range");
+            let selected =
+                carrick_core::mm::frames::SelectedBackingPlan::new(admitted, selected, fault)
+                    .expect("the selected fault page is contained by the admitted plan");
+            let plan = plan
+                .narrow_to(selected)
+                .expect("one descriptor-selected page narrows the semantic plan");
+            assert_eq!((plan.start(), plan.len()), (fault, PAGE));
+        })
+        .expect("production planner admits the owner-backed mapping");
+}
+
+/// Drive the shared decline policy from the private delegated-root fixture's
+/// production grant selector.  The access code is the ISA entry's read/write
+/// identity, not a synthetic policy-only input.
+fn production_publication_policy_is_bounded(access: u64) {
+    use carrick_core::mm::frames::{
+        PublicationCompletion, PublicationDecline, PublicationNextAction, PublicationNotNow,
+        PublicationTerminal, SelectedBackingPlan, publication_next_action,
+    };
+    use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + 3 * STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base),
+        8 * PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    let fault = if access == 1 {
+        base + 2 * PAGE
+    } else {
+        base + 5 * PAGE
+    };
+
+    super::super::mm_mutation::test_support::with_permit(
+        dispatcher.mm_mutation_coordinator(),
+        |permit| {
+            let plan = dispatcher
+                .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
+                .expect("production selector must acquire the delegated root")
+                .expect("production selector must admit the mapped fault");
+            let request = SyscallDispatcher::el1_frame_grant_request(
+                &plan,
+                dispatcher.mm_authority().mm_id.raw(),
+                fault,
+                access,
+            );
+            let admitted = carrick_core_abi::ReservationRange::new(
+                request.semantic_base,
+                request.semantic_base + request.len,
+            )
+            .unwrap();
+            let selected = SelectedBackingPlan::new(admitted, admitted, fault).unwrap();
+
+            assert_eq!(
+                publication_next_action(
+                    PublicationCompletion::Declined(Some(PublicationDecline::NotNow(
+                        PublicationNotNow::MmRelease,
+                    ))),
+                    selected,
+                    request.mm_key,
+                ),
+                PublicationNextAction::ParkOnMmRelease {
+                    mm_key: request.mm_key,
+                },
+            );
+            assert_eq!(
+                publication_next_action(PublicationCompletion::Published, selected, request.mm_key,),
+                PublicationNextAction::Published,
+                "one MM-release wake must let the same owned request finish",
+            );
+
+            let fallback = match publication_next_action(
+                PublicationCompletion::Declined(Some(PublicationDecline::NotNow(
+                    PublicationNotNow::Capacity(DescriptorRefusal::TablesExhausted),
+                ))),
+                selected,
+                request.mm_key,
+            ) {
+                PublicationNextAction::RerunWith(fallback) => fallback,
+                other => panic!("capacity must make bounded progress, got {other:?}"),
+            };
+            assert_eq!(fallback.range().len(), PAGE);
+            assert_eq!(fallback.fault_page(), fault);
+            assert_eq!(
+                publication_next_action(PublicationCompletion::Published, fallback, request.mm_key,),
+                PublicationNextAction::Published,
+            );
+            assert_eq!(
+                publication_next_action(
+                    PublicationCompletion::Declined(Some(PublicationDecline::InheritedPrepared)),
+                    selected,
+                    request.mm_key,
+                ),
+                PublicationNextAction::ReplanInheritedPrepared,
+            );
+            assert_eq!(
+                publication_next_action(
+                    PublicationCompletion::Declined(Some(PublicationDecline::Terminal(
+                        PublicationTerminal::Descriptor(DescriptorRefusal::StaleRoot),
+                    ))),
+                    selected,
+                    request.mm_key,
+                ),
+                PublicationNextAction::TerminalRefusal(PublicationTerminal::Descriptor(
+                    DescriptorRefusal::StaleRoot,
+                )),
+            );
+        },
+    );
+}
+
+#[test]
+fn arm_read_production_publication_decline_then_success_is_bounded() {
+    production_publication_policy_is_bounded(1);
+}
+
+#[test]
+fn x86_write_production_publication_decline_then_success_is_bounded() {
+    production_publication_policy_is_bounded(2);
+}
+
 /// Host alias supply already has host mutation admission; extraction must
 /// not add the future native publication freeze to its selection policy.
 #[test]

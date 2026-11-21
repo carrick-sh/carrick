@@ -715,12 +715,6 @@ impl MemState {
                     block_old_host(span.start.raw(), span.end.raw());
                 }
             }
-            for (start, end) in self
-                .resident
-                .within(window_start, window_end, ResidencyOwner::Host)
-            {
-                block_old_host(start, end);
-            }
             for (_, span) in self
                 .prepared_root_grants
                 .iter()
@@ -730,7 +724,7 @@ impl MemState {
                     failure = Some(error);
                 }
             }
-            if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            carrick_hal::host_residency::with_host_residency(|table| {
                 table.live_spans_overlapping(
                     root.mm().raw(),
                     window_start,
@@ -748,7 +742,7 @@ impl MemState {
                         }
                     },
                 );
-            }
+            });
             if failure.is_some() {
                 // A malformed observation cannot authorize a host plan.
                 return Ok(None);
@@ -1003,7 +997,9 @@ impl GrantResidencyPublication {
     /// Retired pages are never temporarily visible in the residency index.
     pub(crate) fn publish(
         self,
-        table: &carrick_el1_abi::FrameGrantResidencyTable,
+        table: &carrick_el1_abi::FrameGrantResidencyTable<
+            impl carrick_el1_abi::FrameGrantResidencyAccess,
+        >,
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
     ) {
         let Self {
@@ -1158,6 +1154,27 @@ impl Drop for PreparedRootGrant {
 }
 
 impl ResidentFrameGrantPlan<'_> {
+    /// Consume this plan and narrow every semantic field to the one span
+    /// selected from live descriptors. This must happen before provenance is
+    /// adopted, backing is prepared, or publication identity is constructed.
+    pub fn narrow_to(
+        mut self,
+        selected: carrick_core::mm::frames::SelectedBackingPlan,
+    ) -> Result<Self, PublishedFrameGrantRefusal> {
+        let range = selected.range();
+        if selected.fault_page() != self.fault_page
+            || range.start() < self.start
+            || range.end() > self.start + self.len
+            || !(range.start() <= self.fault_page && self.fault_page < range.end())
+        {
+            return Err(PublishedFrameGrantRefusal::Identity);
+        }
+        self.start = range.start();
+        self.len = range.len();
+        self.publication.span = range;
+        Ok(self)
+    }
+
     pub fn root_incarnation(&self) -> Option<ReservationIncarnation> {
         self.root_incarnation
     }
@@ -1458,9 +1475,9 @@ impl<'a> MemView<'a> {
             return;
         };
         let authority = self.mem();
-        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+        carrick_hal::host_residency::with_host_residency(|table| {
             table.retire_overlapping(authority.mm_id.raw(), start, len);
-        }
+        });
         // DONTNEED keeps the reservation node incarnation while retiring its
         // residency. A refusal asserting the old resident page must not answer
         // the next first touch of that same node.
@@ -1617,6 +1634,26 @@ impl<'a> MemView<'a> {
             prot: grant.prot.bits(),
             publication,
         }))
+    }
+
+    /// Sample the admitted MM's reservation/editor release source before a
+    /// contended descriptor publication drops its mutation authority. The
+    /// runtime parks the owned fault continuation on this observation and
+    /// probes once on enrollment, exactly like a contended root acquisition.
+    pub(crate) fn frame_grant_release_wait(
+        &self,
+        permit: &super::mm_mutation::HostAliasPermit<'_>,
+    ) -> Result<carrick_el1_abi::PortalOwnerWait, carrick_el1::memory::reservations::Refusal> {
+        if permit.mm() != self.mem().mm_id {
+            return Err(carrick_el1::memory::reservations::Refusal::Stale);
+        }
+        let root = self
+            .mem()
+            .lock()
+            .delegated_root()
+            .cloned()
+            .ok_or(carrick_el1::memory::reservations::Refusal::Stale)?;
+        root.observe_release()
     }
 
     pub(crate) fn published_frame_grant_plan<'permit>(
