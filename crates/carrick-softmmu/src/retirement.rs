@@ -129,6 +129,10 @@ impl<W: ServedWord> SoftDomainHandle<W> {
         })))
     }
 
+    pub(crate) fn nonce(&self) -> core::num::NonZeroU64 {
+        self.table().domain().get()
+    }
+
     pub(crate) fn same_domain(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
