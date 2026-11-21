@@ -1636,22 +1636,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // the caller's own cwd and credentials, which the ring seals into
         // the payload from the caller's task row (#1392), and resolves a
         // descriptor `execveat` names in the caller's ring table (#1530).
-        // The initial host root retains its filesystem custody in the
-        // carrier (#1714 option A): its request crosses unsealed, and the
-        // carrier resolves it with the root's own cwd and credentials, as
-        // it does the root's file calls (#2142).
-        let mut sealed = payload.into_vec();
-        let access = if self.host_root_retains_filesystem() {
-            None
-        } else {
-            match self.caller_access(call) {
-                Ok(access) => Some(access),
-                Err(failure) => return Ok(failure.into_resume()),
-            }
+        let access = match self.caller_access(call) {
+            Ok(access) => access,
+            Err(failure) => return Ok(failure.into_resume()),
         };
-        if let Some(access) = access
-            && let Err(error) =
-                carrick_core_abi::service::seal_exec_payload_access(&mut sealed, &access, table)
+        let mut sealed = payload.into_vec();
+        if let Err(error) =
+            carrick_core_abi::service::seal_exec_payload_access(&mut sealed, &access, table)
         {
             return Ok(NativeResume::Returned(SyscallResult::from_errno(
                 match error {
@@ -1664,7 +1655,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 },
             )));
         }
-        let payload = sealed.into_boxed_slice();
+        self.publish_exec(sealed.into_boxed_slice(), call)
+    }
+    /// Begin a staged exec through the same owner on every ISA, for an entry
+    /// whose service settles inline (x86): the copyout drain and handoff
+    /// receipt are this call's, as for [`Self::begin_host_file_call`]. The
+    /// initial host root retains its filesystem custody in the carrier
+    /// (#1714 option A, #2142): its request crosses unsealed and resolves
+    /// under the root's own capability.
+    pub fn begin_exec_call(
+        &mut self,
+        payload: Box<[u8]>,
+        table: Option<[u64; 3]>,
+        call: NativeServiceCall<'_>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let result = if self.host_root_retains_filesystem() {
+            match carrick_core_abi::service::ExecPayloadView::parse(&payload) {
+                Ok(view) if view.access().is_none() => self.publish_exec(payload, call),
+                _ => Ok(NativeResume::Returned(SyscallResult::from_errno(
+                    carrick_syscall_abi::LINUX_EINVAL,
+                ))),
+            }
+        } else {
+            self.begin_exec_service(payload, table, call)
+        };
+        let result = self.drain_copyout(result);
+        self.finish_service_handoff(result)
+    }
+    fn publish_exec(
+        &mut self,
+        payload: Box<[u8]>,
+        call: NativeServiceCall<'_>,
+    ) -> Result<NativeResume, NativeProcessError> {
         self.service_phase = NativeServicePhase::Capability;
         let capability = self
             .runtime
@@ -1688,19 +1710,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServicePayload::Exec(payload),
             ServiceCompletion::Inline,
         )
-    }
-    /// Begin a staged exec through the same owner on every ISA, for an entry
-    /// whose service settles inline (x86): the copyout drain and handoff
-    /// receipt are this call's, as for [`Self::begin_host_file_call`].
-    pub fn begin_exec_call(
-        &mut self,
-        payload: Box<[u8]>,
-        table: Option<[u64; 3]>,
-        call: NativeServiceCall<'_>,
-    ) -> Result<NativeResume, NativeProcessError> {
-        let result = self.begin_exec_service(payload, table, call);
-        let result = self.drain_copyout(result);
-        self.finish_service_handoff(result)
     }
     /// Keep a carrier-retained private-mapping source for this record:
     /// `key` names the exact `mmap` retry that consumes it.
