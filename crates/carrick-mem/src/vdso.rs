@@ -58,6 +58,11 @@ impl X86NativeVvar {
         }
     }
 
+    /// The realtime word the vvar carries, also published to the ring zone.
+    pub fn realtime_offset(self) -> u64 {
+        self.realtime_offset
+    }
+
     pub fn bytes(self) -> [u8; Self::BYTE_LEN] {
         let mut bytes = [0; Self::BYTE_LEN];
         bytes[VVAR_OFF_FREQ..VVAR_OFF_FREQ + size_of::<u64>()]
