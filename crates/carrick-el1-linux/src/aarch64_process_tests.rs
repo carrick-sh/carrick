@@ -2560,26 +2560,25 @@ fn native_fork_child_realtime_reads_the_zone_calibration() {
         carrick_syscall_abi::LINUX_CLOCK_REALTIME,
         carrick_syscall_abi::LINUX_CLOCK_REALTIME_COARSE,
     ] {
-        let mut ts = [0u64; 2];
-        let result =
-            native_fork_child_time_result_with(number, clock, ts.as_mut_ptr() as u64, |fixture| {
-                fixture
-                    .zone
-                    .publish_counter_frequency(CounterFrequency::new(
-                        NonZeroU64::new(1_000_000_000).unwrap(),
-                    ));
-                fixture.zone.publish_realtime_offset(OFFSET_NS);
-                fixture
-                    .zone
-                    .cpu_leave_slot(fixture.slot, CounterTick::new(TICK));
-            });
+        let ts = carrick_test_support::GuestUserValue::new([0u64; 2]);
+        let result = native_fork_child_time_result_with(number, clock, ts.arg(), |fixture| {
+            fixture
+                .zone
+                .publish_counter_frequency(CounterFrequency::new(
+                    NonZeroU64::new(1_000_000_000).unwrap(),
+                ));
+            fixture.zone.publish_realtime_offset(OFFSET_NS);
+            fixture
+                .zone
+                .cpu_leave_slot(fixture.slot, CounterTick::new(TICK));
+        });
         assert_eq!(result, (0, 0), "native child clock_gettime({clock})");
         let nanos = if clock == carrick_syscall_abi::LINUX_CLOCK_REALTIME {
             123_456_789
         } else {
             123_000_000
         };
-        assert_eq!(ts, [1_700_000_007, nanos], "clock {clock}");
+        assert_eq!(ts.get(), [1_700_000_007, nanos], "clock {clock}");
     }
 }
 
@@ -2820,7 +2819,7 @@ fn native_fork_child_cputime_and_times_account_user_system_and_children() {
         carrick_syscall_abi::LINUX_CLOCK_PROCESS_CPUTIME_ID,
         carrick_syscall_abi::LINUX_CLOCK_THREAD_CPUTIME_ID,
     ] {
-        let mut ts = [0u64; 2];
+        let ts = carrick_test_support::GuestUserValue::new([0u64; 2]);
         let mut frame = carrick_el1_abi::TrapFrame {
             esr: 0x15 << 26,
             slot: fixture.slot.index() as u64,
@@ -2828,7 +2827,7 @@ fn native_fork_child_cputime_and_times_account_user_system_and_children() {
         };
         frame.x[8] = carrick_abi::syscall::nr::CLOCK_GETTIME.raw();
         frame.x[0] = clock;
-        frame.x[1] = ts.as_mut_ptr() as u64;
+        frame.x[1] = ts.arg();
         let route = super::dispatch::dispatch_syscall_with_native(
             &mut frame,
             &counters,
@@ -2851,17 +2850,17 @@ fn native_fork_child_cputime_and_times_account_user_system_and_children() {
             CompletionRoute::Served | CompletionRoute::WithWork
         ));
         assert_eq!(frame.x[0], 0);
-        assert_eq!(ts, [0, 57_000_000]);
+        assert_eq!(ts.get(), [0, 57_000_000]);
     }
 
-    let mut tms = carrick_syscall_abi::LinuxTms::zeroed();
+    let tms = carrick_test_support::GuestUserValue::new(carrick_syscall_abi::LinuxTms::zeroed());
     let mut frame = carrick_el1_abi::TrapFrame {
         esr: 0x15 << 26,
         slot: fixture.slot.index() as u64,
         ..Default::default()
     };
     frame.x[8] = carrick_abi::syscall::nr::TIMES.raw();
-    frame.x[0] = core::ptr::addr_of_mut!(tms) as u64;
+    frame.x[0] = tms.arg();
     let route = super::dispatch::dispatch_syscall_with_native(
         &mut frame,
         &counters,
@@ -2884,6 +2883,7 @@ fn native_fork_child_cputime_and_times_account_user_system_and_children() {
         CompletionRoute::Served | CompletionRoute::WithWork
     ));
     assert_eq!(frame.x[0] as i64, 125);
+    let tms = tms.get();
     assert_eq!({ tms.tms_utime }, 3);
     assert_eq!({ tms.tms_stime }, 2);
     assert_eq!({ tms.tms_cutime }, 4);
