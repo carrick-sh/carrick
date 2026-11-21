@@ -9,6 +9,7 @@
  *   6/7 as 1 with a 16 MiB / 256 MiB reserve (size probe)
  *   8 as 1, run in the root (no fork)
  *   5 4 GiB reserve, commit 64 KiB RW inside, write code, flip R|X, call
+ *  10 as 5 up to the code write, without the R|X flip (the reserve alone)
  *   9 negative control: a 256 TiB PROT_NONE|MAP_NORESERVE reserve is larger
  *     than the 128 TiB user address space and must fail with ENOMEM (exit 7;
  *     8 when it succeeds, else the other errno + 100)
@@ -109,11 +110,14 @@ child:
     movb $1, 0x5000(%r15)
     movb $1, 0x2000(%r15)
     jmp done
-#elif CASE == 5
+#elif CASE == 5 || CASE == 10
     MMAP $0x100000000, $0, $0x4022
     lea 0x10000(%r15), %r14
     MPROTECT %r14, $0x10000, $3
     WRITE_CODE %r14
+#if CASE == 10
+    jmp done
+#endif
     MPROTECT %r14, $0x10000, $5
     call *%r14
     jmp done

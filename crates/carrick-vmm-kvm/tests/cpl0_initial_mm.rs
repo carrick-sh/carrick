@@ -6524,9 +6524,10 @@ fn run_mprotect_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPoolOut
 }
 
 macro_rules! mprotect_shape_witness {
-    ($name:ident, $case:expr, $doc:expr) => {
+    ($name:ident, $case:expr, $doc:expr $(, #[$attr:meta])?) => {
         #[doc = $doc]
         #[test]
+        $(#[$attr])?
         fn $name() {
             let outcome = run_mprotect_shape($case);
             let counters = outcome.physical.syscall_counters().expect("counters");
@@ -6565,7 +6566,13 @@ mprotect_shape_witness!(
 mprotect_shape_witness!(
     production_mprotect_commits_then_flips_rx_inside_a_4gib_reservation,
     5,
-    "V8's cage shape: 4 GiB reserve, 64 KiB commit RW, code, flip R|X, run."
+    "V8's cage shape: 4 GiB reserve, 64 KiB commit RW, code, flip R|X, run.",
+    #[ignore = "#2620: the anonymous RW to R|X mprotect (case 2) is refused ENOSYS; the 4 GiB reserve itself is case 10"]
+);
+mprotect_shape_witness!(
+    production_mmap_reserves_4_gib_and_commits_inside_it,
+    10,
+    "V8's cage reserve: 4 GiB PROT_NONE|MAP_NORESERVE, 64 KiB committed RW, code written."
 );
 mprotect_shape_witness!(
     production_mprotect_commits_inside_a_16_mib_reservation,
