@@ -1059,6 +1059,7 @@ fn fork_exec_probe_copy_alignment(
                     payload.ordinal(),
                     request.identity.birth.origin,
                     carrick_el1_abi::RefusalVenue::Carrier,
+                    carrick_el1_abi::RefusalArguments::Unretained,
                 );
             }
             assert!(ticket.complete(served.is_ok()).is_ok());

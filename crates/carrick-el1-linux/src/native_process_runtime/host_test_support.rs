@@ -13359,6 +13359,7 @@ fn x86_native_exec_completion_claims_the_fork_child_and_refuses_the_root() {
                 fixture.zone,
                 Some(root),
                 NativeOrdinal::new(native),
+                [0; 6],
                 &counters,
             ),
             -38,

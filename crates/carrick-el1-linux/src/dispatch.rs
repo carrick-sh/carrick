@@ -880,12 +880,14 @@ pub fn unclaimed_native_syscall(
 /// same lineage.
 pub fn count_unclaimed_native_refusal(
     ordinal: carrick_guest_arch::NativeOrdinal,
+    arguments: [u64; 6],
     counters: &Counters,
 ) -> carrick_guest_arch::NativeReturnWord {
     counters.record_refusal(
         ordinal,
         carrick_core_abi::service::ServiceOrigin::Descendant,
         carrick_el1_abi::RefusalVenue::Ring,
+        carrick_el1_abi::RefusalArguments::Registers(arguments),
     );
     if let Some(served) = counters.served.get(ordinal.raw() as usize) {
         served.fetch_add(1, Ordering::Relaxed);
@@ -899,6 +901,7 @@ fn refuse_unclaimed_native_syscall(frame: &mut TrapFrame, counters: &Counters) -
     counters.record_futex_refusal(frame);
     frame.x[0] = count_unclaimed_native_refusal(
         carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+        core::array::from_fn(|index| frame.x[index]),
         counters,
     )
     .0;
@@ -1431,6 +1434,7 @@ pub fn settle_unwired_native_service<'a, M: Clone, C: carrick_guest_arch::Proces
     zone: &carrick_sched_core::ZoneTables<C>,
     record: Option<carrick_sched_core::RecordRef>,
     native: carrick_guest_arch::NativeOrdinal,
+    arguments: [u64; 6],
     counters: &Counters,
 ) -> i64 {
     let child = record.is_some_and(|record| registry.record_is_fork_child(zone, record));
@@ -1442,6 +1446,7 @@ pub fn settle_unwired_native_service<'a, M: Clone, C: carrick_guest_arch::Proces
             carrick_core_abi::service::ServiceOrigin::Initial
         },
         carrick_el1_abi::RefusalVenue::Ring,
+        carrick_el1_abi::RefusalArguments::Registers(arguments),
     );
     carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
 }
@@ -1465,6 +1470,7 @@ fn refuse_traced_native_exec(
             carrick_core_abi::service::ServiceOrigin::Initial
         },
         carrick_el1_abi::RefusalVenue::Ring,
+        carrick_el1_abi::RefusalArguments::Registers(core::array::from_fn(|index| frame.x[index])),
     );
     counters.served[nr].fetch_add(1, Ordering::Relaxed);
     frame.x[0] = carrick_syscall_abi::LINUX_EPERM.guest_retval() as u64;
@@ -1477,6 +1483,7 @@ fn refuse_traced_native_exec(
 fn native_host_file_return(
     result: i64,
     ordinal: carrick_guest_arch::NativeOrdinal,
+    arguments: [u64; 6],
     counters: &Counters,
     child: impl FnOnce() -> bool,
 ) -> i64 {
@@ -1489,6 +1496,7 @@ fn native_host_file_return(
                 carrick_core_abi::service::ServiceOrigin::Initial
             },
             carrick_el1_abi::RefusalVenue::Ring,
+            carrick_el1_abi::RefusalArguments::Registers(arguments),
         );
         // The exact readlink family already counted the served handoff.
         if ordinal.raw() != carrick_personality_linux::crossing::nr::READLINKAT.raw()
@@ -1588,6 +1596,7 @@ pub(super) fn native_service_decision(
                 NativeServiceStage::Return(native_host_file_return(
                     result.raw(),
                     carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                    core::array::from_fn(|index| frame.x[index]),
                     counters,
                     child,
                 ))
@@ -1645,6 +1654,7 @@ pub(super) fn native_service_decision(
                 NativeServiceStage::Return(native_host_file_return(
                     carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
                     carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                    core::array::from_fn(|index| frame.x[index]),
                     counters,
                     child,
                 ))
@@ -4190,11 +4200,18 @@ impl<
     fn staged_for_ring_owner(&self) -> bool {
         self.frame.staged_for_ring_owner()
     }
-    fn record_refusal(&self, bucket: usize) {
+    fn record_refusal(&self, bucket: usize, original_argument0: u64) {
         self.counters.record_refusal(
             carrick_guest_arch::NativeOrdinal::new(bucket as u64),
             self.service_origin(),
             carrick_el1_abi::RefusalVenue::Ring,
+            carrick_el1_abi::RefusalArguments::Registers(core::array::from_fn(|index| {
+                if index == 0 {
+                    original_argument0
+                } else {
+                    self.frame.argument(index).unwrap_or(0)
+                }
+            })),
         );
     }
     fn lifecycle_native(
@@ -4559,7 +4576,11 @@ impl<
             // only repeat this answer. Counted ENOSYS, served in ring.
             memory::DelegatedAnonymous::Forward if file.is_some() => {
                 let nr = carrick_personality_linux::native_host_file::LINUX_NR_MMAP.raw() as usize;
-                <Self as PendingFamilies<'_, Context>>::record_refusal(self, nr);
+                <Self as PendingFamilies<'_, Context>>::record_refusal(
+                    self,
+                    nr,
+                    self.frame.argument(0).unwrap_or(0),
+                );
                 self.counters.served[nr].fetch_add(1, Ordering::Relaxed);
                 DelegatedStep::Served(SyscallResult::new(
                     carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
@@ -9413,6 +9434,7 @@ mod tests {
                 native_host_file_return(
                     result.raw(),
                     carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                    core::array::from_fn(|index| frame.x[index]),
                     &counters,
                     || child
                 ),
@@ -9430,6 +9452,7 @@ mod tests {
             native_host_file_return(
                 carrick_syscall_abi::LINUX_EBADF.guest_retval(),
                 carrick_guest_arch::NativeOrdinal::new(56),
+                [0; 6],
                 &counters,
                 || child,
             );

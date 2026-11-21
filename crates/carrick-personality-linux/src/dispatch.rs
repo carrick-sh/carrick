@@ -357,8 +357,10 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn staged_for_ring_owner(&self) -> bool {
         false
     }
-    /// Record a policy refusal together with its caller provenance.
-    fn record_refusal(&self, _bucket: usize) {}
+    /// Record a policy refusal together with its caller provenance and the
+    /// call's arguments. The result is already installed, so the caller
+    /// passes the argument word it may have replaced.
+    fn record_refusal(&self, _bucket: usize, _original_argument0: u64) {}
     fn publish_forward_work(&self, original_argument0: u64) {
         if let Some(task) = self.task_state() {
             // No family ran: after owed work drains the execution owner must
@@ -1775,9 +1777,12 @@ fn finish<'a, C: EntryContext + 'a>(
             pending.record_forwarded(ordinal);
             return CompletionRoute::Forward;
         }
-        if let Some(route) =
-            preflight_host_crossing(ordinal, result == FamilyCompletion::Forward, pending)
-        {
+        if let Some(route) = preflight_host_crossing(
+            ordinal,
+            result == FamilyCompletion::Forward,
+            original_argument0,
+            pending,
+        ) {
             return route;
         }
         let canonical = carrick_syscall_abi::CanonicalNr::new(ordinal);
@@ -1802,6 +1807,7 @@ fn finish<'a, C: EntryContext + 'a>(
                 pending
                     .crossing_set()
                     .refusal_bucket(pending.native_number()),
+                original_argument0,
             );
             if pending.host_work() || pending.return_requires_host_boundary() {
                 if let Some(task) = pending.task_state() {
@@ -1873,6 +1879,7 @@ fn rerun_declined_for_work<'a, C: EntryContext + 'a>(
 fn preflight_host_crossing<'a, C: EntryContext + 'a>(
     ordinal: u64,
     effect_free_decline: bool,
+    original_argument0: u64,
     pending: &mut dyn PendingFamilies<'a, C>,
 ) -> Option<CompletionRoute> {
     match pending.preflight_host_crossing(ordinal) {
@@ -1892,6 +1899,7 @@ fn preflight_host_crossing<'a, C: EntryContext + 'a>(
                 pending
                     .crossing_set()
                     .refusal_bucket(pending.native_number()),
+                original_argument0,
             );
             Some(CompletionRoute::Served)
         }
@@ -1956,7 +1964,9 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         None if family == Family::AllocatorControl => CompletionAuthority::AllocatorDiagnostic,
         None => {
             // No completion authority: nothing ran and nothing reruns.
-            if let Some(route) = preflight_host_crossing(ordinal, false, pending) {
+            if let Some(route) =
+                preflight_host_crossing(ordinal, false, original_argument0, pending)
+            {
                 return route;
             }
             let set = pending.crossing_set();
@@ -1974,6 +1984,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
                     pending
                         .crossing_set()
                         .refusal_bucket(pending.native_number()),
+                    original_argument0,
                 );
                 return CompletionRoute::Served;
             }
@@ -2436,7 +2447,7 @@ mod ring_first_tests {
         fn ring_first_strict(&self) -> bool {
             self.strict
         }
-        fn record_refusal(&self, bucket: usize) {
+        fn record_refusal(&self, bucket: usize, _original_argument0: u64) {
             self.refused[bucket].fetch_add(1, Ordering::Relaxed);
         }
         fn stage_native_host_file(&mut self) -> bool {

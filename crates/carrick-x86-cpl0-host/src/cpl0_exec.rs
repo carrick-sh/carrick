@@ -1351,6 +1351,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 payload.ordinal(),
                 request.identity.birth.origin,
                 carrick_el1_abi::RefusalVenue::Carrier,
+                carrick_el1_abi::RefusalArguments::Unretained,
             );
         }
         let failure = carrick_core_abi::service::ServiceFailureCode::new(errno.get() as u32)
