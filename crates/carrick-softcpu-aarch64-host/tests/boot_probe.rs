@@ -1950,6 +1950,97 @@ fn lock_soft_carrier_test() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+struct HelloDispatchReceipt {
+    exit_code: i32,
+    stdout: Vec<u8>,
+    syscalls_dispatched: u64,
+    census: carrick_softcpu_aarch64_host::Hvc2ReplyCensus,
+    counted_enosys: Vec<(u64, &'static str, u64)>,
+    production_run: Option<carrick_softcpu_aarch64_host::SoftProcessRun>,
+}
+
+fn run_hello_via_hvc2_dispatch(
+    config: &carrick_softcpu_aarch64_host::SoftSingleProcessConfig<'_>,
+) -> Result<HelloDispatchReceipt, String> {
+    use carrick_el1_abi::{Counters, EL1_COUNTERS_BASE};
+    use carrick_mem::{
+        elf::plan_elf_load_bytes,
+        linux_abi::{LINUX_AT_HWCAP, LINUX_AT_HWCAP2, syscall::lookup_aarch64},
+        memory::{build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso},
+    };
+    use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
+
+    let temp_empty_root;
+    let (mut cpu, mut memory, mut replies) = if let Some(root_dir) = config.rootfs_dir {
+        let root = FixtureRoot::new(root_dir.to_path_buf());
+        let program =
+            carrick_mem::elf::ElfProgram::load(config.elf_bytes, 183, &|path| root.read(path).ok())
+                .map_err(|e| format!("load dynamic ELF: {e}"))?;
+        let (cpu, memory) = stage_dynamic(&program, config.argv.clone(), config.envp.clone());
+        let replies = DynamicRoot::new(root, "/hello");
+        (cpu, memory, replies)
+    } else {
+        let el1_elf = config
+            .el1_elf_override
+            .ok_or_else(|| "missing el1_elf_override".to_owned())?;
+        let plan =
+            plan_elf_load_bytes(config.elf_bytes).map_err(|e| format!("plan static ELF: {e}"))?;
+        let mut auxv = linux_auxv_from_load_plan_with_vdso(&plan, None, false);
+        for entry in &mut auxv {
+            match entry.a_type {
+                LINUX_AT_HWCAP => entry.a_val = GUEST_CPU_PROFILE.hwcap().bits(),
+                LINUX_AT_HWCAP2 => entry.a_val = GUEST_CPU_PROFILE.hwcap2().bits(),
+                _ => {}
+            }
+        }
+        let (stack, sp, _) = build_linux_initial_stack(
+            config.argv.clone(),
+            config.envp.clone(),
+            &auxv,
+            None,
+            LINUX_STACK_TOP,
+            4 * PAGE,
+        )
+        .map_err(|e| format!("build initial stack: {e}"))?;
+        let (mut cpu, mut memory, _) = enter_carrier_root(el1_elf, config.elf_bytes);
+        let (offset, bytes) = stack.shared_initialized_bytes();
+        memory.load(stack.start + offset, &bytes);
+        cpu.sp_el0 = StackPointer(sp);
+        admit_root_task_with_stdio(&mut memory);
+        temp_empty_root = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        std::fs::write(temp_empty_root.path().join("musl-hello"), config.elf_bytes)
+            .map_err(|e| format!("stage musl-hello in temp root: {e}"))?;
+        let root = FixtureRoot::new(temp_empty_root.path().to_path_buf());
+        let replies = DynamicRoot::new(root, "/musl-hello");
+        (cpu, memory, replies)
+    };
+
+    let code = run_dynamic_glibc(&mut cpu, &mut memory, &mut replies, 1_000_000)?;
+    let ring_base = EL1_COUNTERS_BASE + offset_of!(Counters, refused) as u64;
+    let venue_base = EL1_COUNTERS_BASE + offset_of!(Counters, venue_refused) as u64;
+    let mut counted_enosys = Vec::new();
+    for nr in 0..512u64 {
+        let r = read_u64(&mut memory, ring_base + nr * 8);
+        let v = read_u64(&mut memory, venue_base + nr * 8);
+        let count = r.saturating_add(v);
+        if count != 0 {
+            let name = lookup_aarch64(nr).map_or("unknown", |call| call.name);
+            counted_enosys.push((nr, name, count));
+        }
+    }
+    Ok(HelloDispatchReceipt {
+        exit_code: code as i32,
+        stdout: replies.stdout,
+        syscalls_dispatched: replies.answered,
+        census: carrick_softcpu_aarch64_host::Hvc2ReplyCensus {
+            fixture_answers: replies.answered,
+            production_answers: 0,
+        },
+        counted_enosys,
+        production_run: None,
+    })
+}
+
 /// Engine witness: dynamic glibc hello runs on the soft CPU through the
 /// production EL1 vectors and trap path (`CARRICK_A64_ELF`) and production
 /// `carrick-kernel` / `carrick-personality-linux` dispatch against a pinned
@@ -1979,7 +2070,6 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch() {
     })
     .expect("plan glibc hello and its interpreter");
 
-    let fixture_answered = 0usize;
     let config = carrick_softcpu_aarch64_host::SoftSingleProcessConfig {
         elf_bytes: &hello,
         executable_path: "/hello",
@@ -1989,17 +2079,34 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch() {
         el1_elf_override: Some(&el1_elf),
         max_syscalls: 4096,
     };
-    let run = carrick_softcpu_aarch64_host::run_single_process(&config)
+    let receipt = run_hello_via_hvc2_dispatch(&config)
         .expect("dynamic glibc hello must complete through production kernel dispatch");
     println!(
-        "glibc hello exit={} syscalls_dispatched={} fixture_answered={fixture_answered} counted_enosys={:?}",
-        run.exit_code, run.syscalls_dispatched, run.counted_enosys
+        "glibc hello exit={} syscalls_dispatched={} census={:?} counted_enosys={:?}",
+        receipt.exit_code, receipt.syscalls_dispatched, receipt.census, receipt.counted_enosys
     );
-    assert_eq!(fixture_answered, 0);
-    assert_eq!(run.exit_code, 0);
-    assert_eq!(run.stdout, b"dynamic glibc hello\n");
-    assert_production_glibc_relocations_and_ifuncs(&program, &libc_bytes, &run, compiler);
-    assert_expected_single_process_enosys(&run.counted_enosys);
+    assert_eq!(
+        receipt.census.fixture_answers, 0,
+        "expected 0 fixture HVC #2 replies, got census={:?} counted_enosys={:?}",
+        receipt.census, receipt.counted_enosys
+    );
+    assert!(
+        receipt.census.production_answers >= 15,
+        "expected real production HVC #2 replies, got census={:?}",
+        receipt.census
+    );
+    assert_eq!(
+        receipt.census.production_answers,
+        receipt.syscalls_dispatched
+    );
+    assert_eq!(receipt.exit_code, 0);
+    assert_eq!(receipt.stdout, b"dynamic glibc hello\n");
+    let run = receipt
+        .production_run
+        .as_ref()
+        .expect("production SoftProcessRun must back glibc relocation and IFUNC inspection");
+    assert_production_glibc_relocations_and_ifuncs(&program, &libc_bytes, run, compiler);
+    assert_expected_single_process_enosys(&receipt.counted_enosys);
 }
 
 /// Engine witness: static musl hello runs to exit on the soft CPU through the
@@ -2048,7 +2155,6 @@ fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
         .expect("read the production EL1 ELF");
     let user_elf = compile_static_musl_hello("full");
 
-    let fixture_answered = 0usize;
     let config = carrick_softcpu_aarch64_host::SoftSingleProcessConfig {
         elf_bytes: &user_elf,
         executable_path: "/musl-hello",
@@ -2058,16 +2164,29 @@ fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
         el1_elf_override: Some(&el1_elf),
         max_syscalls: 4096,
     };
-    let run = carrick_softcpu_aarch64_host::run_single_process(&config)
+    let receipt = run_hello_via_hvc2_dispatch(&config)
         .expect("static musl hello must complete through production kernel dispatch");
     println!(
-        "musl hello exit={} syscalls_dispatched={} fixture_answered={fixture_answered} counted_enosys={:?}",
-        run.exit_code, run.syscalls_dispatched, run.counted_enosys
+        "musl hello exit={} syscalls_dispatched={} census={:?} counted_enosys={:?}",
+        receipt.exit_code, receipt.syscalls_dispatched, receipt.census, receipt.counted_enosys
     );
-    assert_eq!(fixture_answered, 0);
-    assert_eq!(run.exit_code, 0);
-    assert_eq!(run.stdout, b"hello, aarch64 world\n");
-    assert_expected_single_process_enosys(&run.counted_enosys);
+    assert_eq!(
+        receipt.census.fixture_answers, 0,
+        "expected 0 fixture HVC #2 replies, got census={:?} counted_enosys={:?}",
+        receipt.census, receipt.counted_enosys
+    );
+    assert!(
+        receipt.census.production_answers >= 5,
+        "expected real production HVC #2 replies, got census={:?}",
+        receipt.census
+    );
+    assert_eq!(
+        receipt.census.production_answers,
+        receipt.syscalls_dispatched
+    );
+    assert_eq!(receipt.exit_code, 0);
+    assert_eq!(receipt.stdout, b"hello, aarch64 world\n");
+    assert_expected_single_process_enosys(&receipt.counted_enosys);
 }
 
 /// Engine witness: CPython 3.12.16 runs through the production EL1 vectors and
