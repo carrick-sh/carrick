@@ -19039,6 +19039,94 @@ fn serial_host_native_child_pselect6_multi_fd_wakes_on_one_parent_pipe() {
     });
 }
 
+/// #2621: apt's http method shape on ARM. A fork child's non-blocking
+/// `connect` of an AF_INET stream socket to a host loopback listener, then
+/// `pselect6(nfds, {zone pipe}, {host socket}, NULL, 5 s, NULL)` and the
+/// connect wait alone, `pselect6(s + 1, NULL, {s}, NULL, 5 s, NULL)`: each
+/// answers exactly the socket's write bit (the pipe is empty).
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_pselect6_mixes_a_zone_pipe_and_a_host_socket() {
+    use carrick_abi::{LINUX_AF_INET, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM};
+    use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
+    use carrick_test_support::GuestUserBuffer;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp peer");
+    let port = listener.local_addr().expect("tcp peer address").port();
+    with_arm_process_host_dispatch(|call| {
+        let (_, parent_pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(parent_pid > 0);
+        let parent = ArmCaller::Child(parent_pid as u32);
+        call(parent, ARM_RESUME, [0; 6]);
+        let fds = GuestUserBuffer::zeroed(8);
+        assert_eq!(
+            call(parent, sys::PIPE2.raw(), [fds.arg(), 0, 0, 0, 0, 0]).1,
+            0
+        );
+        let [reader, _writer] = fd_pair_of(&fds);
+        let (_, child_pid) = call(parent, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(child_pid > 0);
+        let child = ArmCaller::Child(child_pid as u32);
+        call(child, ARM_RESUME, [0; 6]);
+
+        let (_, socket) = call(
+            child,
+            sys::SOCKET.raw(),
+            [
+                LINUX_AF_INET as u64,
+                (LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert!(socket >= 0, "child socket: {socket}");
+        let socket = socket as u64;
+        let mut address = [0u8; 16];
+        address[..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+        address[2..4].copy_from_slice(&port.to_be_bytes());
+        address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        let address = GuestUserBuffer::from_bytes(&address);
+        let (_, connected) = call(
+            child,
+            sys::CONNECT.raw(),
+            [socket, address.arg(), 16, 0, 0, 0],
+        );
+        assert!(
+            connected == 0 || connected == -115,
+            "non-blocking connect: {connected}"
+        );
+        let _peer = listener.accept().expect("guest connect");
+
+        let bit = |fd: u64| (1u64 << fd).to_ne_bytes();
+        let nfds = reader.max(socket) + 1;
+        let read_set = GuestUserBuffer::from_bytes(&bit(reader));
+        let write_set = GuestUserBuffer::from_bytes(&bit(socket));
+        let timeout = GuestUserBuffer::from_value([5u64, 0]);
+        let mixed = call(
+            child,
+            sys::PSELECT6.raw(),
+            [nfds, read_set.arg(), write_set.arg(), 0, timeout.arg(), 0],
+        );
+        assert_eq!(mixed.1, 1, "mixed zone + host pselect6: {mixed:?}");
+        assert_ne!(mixed.0, CompletionRoute::Forward);
+        assert_eq!(read_set.as_bytes(), &[0; 8]);
+        assert_eq!(write_set.as_bytes(), &bit(socket));
+
+        let write_set = GuestUserBuffer::from_bytes(&bit(socket));
+        let timeout = GuestUserBuffer::from_value([5u64, 0]);
+        let single = call(
+            child,
+            sys::PSELECT6.raw(),
+            [socket + 1, 0, write_set.arg(), 0, timeout.arg(), 0],
+        );
+        assert_eq!(single.1, 1, "host socket connect wait: {single:?}");
+        assert_ne!(single.0, CompletionRoute::Forward);
+        assert_eq!(write_set.as_bytes(), &bit(socket));
+    });
+}
+
 #[test]
 fn arm_root_host_backed_descriptors_keep_one_owner() {
     use carrick_abi::{
