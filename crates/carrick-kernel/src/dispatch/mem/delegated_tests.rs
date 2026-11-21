@@ -7092,6 +7092,478 @@ fn x86_write_production_publication_decline_then_success_is_bounded() {
     production_publication_policy_is_bounded(2);
 }
 
+/// The ARM host lane `resolve_mutating_fault` drives for one EL1 frame-grant
+/// request: the dispatcher's production planner under an MM permit, the
+/// exact mailbox claim, and the production descriptor executor over a live
+/// stage-1 image of the same window, with an EL1-sized fixed journal. A
+/// declined attempt reaches `settle_declined_frame_grant`, the step the HVF
+/// fault handler takes once it has rolled back the attempt's backing.
+mod arm_host_decline {
+    use super::*;
+    use crate::dispatch::carrier_loop::{DeclinedFrameGrantStep, settle_declined_frame_grant};
+    use carrick_core::mm::frames::{
+        PublicationCompletion, PublicationDecline, PublicationTerminal, SelectedBackingPlan,
+    };
+    use carrick_core_abi::{
+        FRAME_GRANT_ERR_DENIED, FRAME_GRANT_MAILBOX_HOST_WORKING, FRAME_GRANT_MAILBOX_IDLE,
+        FRAME_GRANT_MAILBOX_RESPONSE, FrameGrantCompletion, FrameGrantMailbox, FrameGrantReady,
+        FrameGrantRequest,
+    };
+    use carrick_mem::memory::{
+        AARCH64_LINUX_PAGE_TABLE_LAYOUT, LINUX_HVPATCH_GLOBAL_FRAME_BASE, LINUX_PAGE_TABLES_BASE,
+        LINUX_PAGE_TABLES_SIZE, stage1_hvpatch_page_tables,
+    };
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, CallerInvalidatesAsid, DescriptorOp, DescriptorOutcome, DescriptorTxn,
+        DescriptorTxnId, DescriptorTxnSlot, JournalEntry, PageSpan, PrimaryTableWords,
+        SliceJournal, TableGrants, apply_submitted_descriptor_txn,
+    };
+    use carrick_mmu_core::aarch64::{GuestLeafPublication, PageTableManager, SubstrateGpa};
+    use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+    use std::num::NonZeroU64;
+
+    /// EL1 executes each grant against a fixed journal; this one holds
+    /// fewer live stores than the planned window, as a saturated EL1 one does.
+    const JOURNAL_ENTRIES: usize = 4;
+    const WINDOW_PAGES: u64 = 8;
+    const ACCESS_WRITE: u64 = 2;
+
+    fn nz(value: u64) -> NonZeroU64 {
+        NonZeroU64::new(value).unwrap()
+    }
+
+    /// A live stage-1 image whose last-level table covers `window`.
+    struct LiveImage {
+        words: Vec<u64>,
+        generation: u64,
+    }
+
+    impl LiveImage {
+        fn new(window: u64) -> Self {
+            let mut manager = PageTableManager::new(
+                stage1_hvpatch_page_tables(),
+                LINUX_PAGE_TABLES_BASE,
+                AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+            );
+            manager
+                .set_prot_none(window, STOCK_WINDOW as usize, None)
+                .unwrap();
+            let bytes = manager.as_bytes();
+            let mut words = vec![0_u64; LINUX_PAGE_TABLES_SIZE as usize / 8];
+            for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(8)) {
+                *word = u64::from_le_bytes(chunk.try_into().unwrap());
+            }
+            // The window's last-level table is live; its leaves are empty,
+            // as an anonymous mapping's are before its first touch.
+            let mut table = LINUX_PAGE_TABLES_BASE;
+            for shift in [39, 30, 21] {
+                let descriptor = words
+                    [((table - LINUX_PAGE_TABLES_BASE) / 8 + (window >> shift) % 512) as usize];
+                assert_eq!(descriptor & 0b11, 0b11, "a table descriptor");
+                table = descriptor & 0x0000_ffff_ffff_f000;
+            }
+            for page in 0..STOCK_WINDOW / PAGE {
+                words[((table - LINUX_PAGE_TABLES_BASE) / 8 + (window / PAGE) % 512 + page)
+                    as usize] = 0;
+            }
+            Self {
+                words,
+                generation: 0,
+            }
+        }
+
+        /// Run one frame-grant `Prepare` through the descriptor executor, as
+        /// EL1's drain does for the transaction the engine submits.
+        fn prepare(
+            &mut self,
+            mm: u64,
+            root: u64,
+            span: (u64, u64),
+            fault: u64,
+        ) -> DescriptorOutcome {
+            self.generation += 1;
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: nz(mm),
+                    generation: nz(self.generation),
+                },
+                root: SubstrateGpa(root),
+                op: DescriptorOp::Prepare {
+                    publication: GuestLeafPublication {
+                        va: span.0,
+                        ipa: LINUX_HVPATCH_GLOBAL_FRAME_BASE + (span.0 - LINUX_MMAP_BASE),
+                        len: span.1,
+                        writable: true,
+                        executable: false,
+                    },
+                    resident: PageSpan::new(fault, PAGE),
+                    backing: BackingIdentity {
+                        frame_id: nz(1),
+                        mapping_id: nz(2),
+                        owner_generation: nz(3),
+                        inventory_revision: nz(self.generation),
+                    },
+                },
+                tables: TableGrants::NONE,
+            };
+            let slot = DescriptorTxnSlot::new();
+            assert!(slot.submit(&txn));
+            let maintenance = CallerInvalidatesAsid;
+            // SAFETY: the retained word buffer is the whole primary arena.
+            let words = unsafe {
+                PrimaryTableWords::new(
+                    self.words.as_mut_ptr().cast(),
+                    LINUX_PAGE_TABLES_BASE,
+                    LINUX_PAGE_TABLES_SIZE as usize,
+                    &maintenance,
+                )
+            }
+            .unwrap();
+            let mut storage = [JournalEntry::default(); JOURNAL_ENTRIES];
+            apply_submitted_descriptor_txn(
+                &slot,
+                mm,
+                &words,
+                SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+                &mut SliceJournal::new(&mut storage),
+                || {},
+            )
+            .expect("the executor answers its own submission")
+            .outcome
+        }
+
+        /// The live-descriptor replan `select_el1_frame_grant` performs.
+        fn select(&mut self, range: ReservationRange, fault: u64) -> SelectedBackingPlan {
+            let maintenance = CallerInvalidatesAsid;
+            // SAFETY: as in `prepare`.
+            let words = unsafe {
+                PrimaryTableWords::new(
+                    self.words.as_mut_ptr().cast(),
+                    LINUX_PAGE_TABLES_BASE,
+                    LINUX_PAGE_TABLES_SIZE as usize,
+                    &maintenance,
+                )
+            }
+            .unwrap();
+            carrick_core::mm::frames::select_backing_plan::<
+                carrick_mmu_core::owner_mmu::Aarch64Mmu,
+                _,
+            >(&words, LINUX_PAGE_TABLES_BASE, range, fault)
+            .expect("the live image admits a span containing the fault")
+        }
+    }
+
+    fn range_of(plan: &ResidentFrameGrantPlan<'_>) -> ReservationRange {
+        ReservationRange::new(plan.start(), plan.start() + plan.len()).unwrap()
+    }
+
+    fn ready(request: FrameGrantRequest, plan: &ResidentFrameGrantPlan<'_>) -> FrameGrantReady {
+        FrameGrantReady {
+            mm_key: request.mm_key,
+            request_generation: request.request_generation,
+            semantic_base: plan.start(),
+            physical_ipa: LINUX_HVPATCH_GLOBAL_FRAME_BASE + (plan.start() - LINUX_MMAP_BASE),
+            len: plan.len(),
+            permissions: plan.prot(),
+            frame_id: 1,
+            mapping_id: 2,
+            owner_generation: 3,
+            inventory_revision: 4,
+        }
+    }
+
+    /// Claim EL1's request for `fault` exactly as the fault handler does.
+    fn claim(
+        mailbox: &FrameGrantMailbox,
+        mm: u64,
+        incarnation: carrick_el1_abi::ReservationIncarnation,
+        generation: u64,
+        fault: u64,
+    ) -> FrameGrantRequest {
+        assert!(mailbox.try_publish_request(FrameGrantRequest {
+            mm_key: mm,
+            reservation_incarnation: incarnation,
+            request_generation: generation,
+            fault_va: fault,
+            requested_len: STOCK_WINDOW,
+            access: ACCESS_WRITE,
+        }));
+        mailbox
+            .claim_request_for_fault(mm, fault, ACCESS_WRITE)
+            .expect("the faulting vCPU claims its own request")
+    }
+
+    /// Publish through the mailbox: `applied` is the executor's answer.
+    fn complete(
+        mailbox: &FrameGrantMailbox,
+        request: FrameGrantRequest,
+        plan: &ResidentFrameGrantPlan<'_>,
+        applied: bool,
+    ) -> FrameGrantCompletion {
+        mailbox
+            .complete_grant_with_outcome(ready(request, plan), |_| Ok::<_, ()>(applied), || {})
+            .unwrap()
+    }
+
+    fn declined(outcome: DescriptorOutcome) -> PublicationCompletion {
+        match outcome {
+            DescriptorOutcome::Refused(reason) | DescriptorOutcome::RolledBack(reason) => {
+                PublicationCompletion::Declined(Some(PublicationDecline::from_descriptor(reason)))
+            }
+            other => panic!("the executor must decline this publication, got {other:?}"),
+        }
+    }
+
+    /// One mapped 8-page window and the write fault in it.
+    fn mapped(window_index: u64) -> (SyscallDispatcher, Root, u64, u64) {
+        let dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let base = LINUX_MMAP_BASE + 0x80_0000 + window_index * STOCK_WINDOW;
+        root.guest_mmap(
+            Placement::Fixed(base),
+            WINDOW_PAGES * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+        (dispatcher, root, base, base + 2 * PAGE)
+    }
+
+    /// Capacity: the executor refuses the planned window for journal
+    /// capacity; the carrier reruns under the same claim with the fault page
+    /// alone, which the same executor applies, and the mailbox completes.
+    #[test]
+    fn arm_capacity_decline_reruns_with_the_fault_page_and_publishes() {
+        let (dispatcher, root, base, fault) = mapped(8);
+        let mut image = LiveImage::new(base);
+        let mm = dispatcher.mm_authority().mm_id.raw();
+        let mailbox = FrameGrantMailbox::new();
+        super::super::mm_mutation::test_support::with_permit(
+            dispatcher.mm_mutation_coordinator(),
+            |permit| {
+                let plan = dispatcher
+                    .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
+                    .unwrap()
+                    .expect("the production planner admits the mapped fault");
+                assert_eq!(plan.len(), WINDOW_PAGES * PAGE);
+                let request = claim(&mailbox, mm, plan.root_incarnation().unwrap(), 1, fault);
+                let selected = image.select(range_of(&plan), fault);
+                assert_eq!(selected.range(), range_of(&plan));
+                let outcome = image.prepare(
+                    mm,
+                    LINUX_PAGE_TABLES_BASE,
+                    (plan.start(), plan.len()),
+                    fault,
+                );
+                assert_eq!(
+                    outcome,
+                    DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity)
+                );
+                assert_eq!(
+                    complete(&mailbox, request, &plan, false),
+                    FrameGrantCompletion::PublicationDeclined
+                );
+                let step = settle_declined_frame_grant(
+                    &dispatcher,
+                    permit,
+                    &mailbox,
+                    request,
+                    declined(outcome),
+                    selected,
+                    Some(plan),
+                );
+                let Ok(DeclinedFrameGrantStep::RerunWith { plan, selected }) = step else {
+                    panic!("a capacity decline must rerun with a smaller plan");
+                };
+                assert_eq!((plan.start(), plan.len()), (fault, PAGE));
+                assert_eq!(selected.range(), range_of(&plan));
+                assert_eq!(
+                    mailbox.state.load(std::sync::atomic::Ordering::Acquire),
+                    FRAME_GRANT_MAILBOX_HOST_WORKING,
+                    "the rerun keeps the exact claim"
+                );
+                assert!(matches!(
+                    image.prepare(
+                        mm,
+                        LINUX_PAGE_TABLES_BASE,
+                        (plan.start(), plan.len()),
+                        fault
+                    ),
+                    DescriptorOutcome::Applied(_)
+                ));
+                assert_eq!(
+                    complete(&mailbox, request, &plan, true),
+                    FrameGrantCompletion::Published
+                );
+                assert_eq!(
+                    mailbox.state.load(std::sync::atomic::Ordering::Acquire),
+                    FRAME_GRANT_MAILBOX_IDLE
+                );
+            },
+        );
+        drop(root);
+    }
+
+    /// A prepared output already in the window (what a fork child inherits
+    /// from its parent's grant): the executor refuses the planned window as
+    /// occupied; the carrier releases the claim, and the rerun fault's fresh
+    /// plan, narrowed on the live image, publishes without the inherited
+    /// leaves.
+    #[test]
+    fn arm_inherited_prepared_decline_replans_and_the_replan_publishes() {
+        let (dispatcher, root, base, fault) = mapped(9);
+        let mut image = LiveImage::new(base);
+        let mm = dispatcher.mm_authority().mm_id.raw();
+        // The inherited output: two prepared leaves, the second resident.
+        assert!(matches!(
+            image.prepare(
+                mm,
+                LINUX_PAGE_TABLES_BASE,
+                (base + 4 * PAGE, 2 * PAGE),
+                base + 5 * PAGE
+            ),
+            DescriptorOutcome::Applied(_)
+        ));
+        let mailbox = FrameGrantMailbox::new();
+        super::super::mm_mutation::test_support::with_permit(
+            dispatcher.mm_mutation_coordinator(),
+            |permit| {
+                let plan = dispatcher
+                    .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
+                    .unwrap()
+                    .expect("the production planner admits the mapped fault");
+                let incarnation = plan.root_incarnation().unwrap();
+                let request = claim(&mailbox, mm, incarnation, 1, fault);
+                // The selection raced the inherited output: it still names
+                // the whole admitted window.
+                let selected =
+                    SelectedBackingPlan::new(range_of(&plan), range_of(&plan), fault).unwrap();
+                let outcome = image.prepare(
+                    mm,
+                    LINUX_PAGE_TABLES_BASE,
+                    (plan.start(), plan.len()),
+                    fault,
+                );
+                assert!(matches!(
+                    outcome,
+                    DescriptorOutcome::Refused(
+                        DescriptorRefusal::Occupied | DescriptorRefusal::AlreadyValid
+                    )
+                ));
+                assert_eq!(
+                    complete(&mailbox, request, &plan, false),
+                    FrameGrantCompletion::PublicationDeclined
+                );
+                let step = settle_declined_frame_grant(
+                    &dispatcher,
+                    permit,
+                    &mailbox,
+                    request,
+                    declined(outcome),
+                    selected,
+                    Some(plan),
+                );
+                assert!(
+                    matches!(step, Ok(DeclinedFrameGrantStep::Replan)),
+                    "an inherited output must replan, not rerun or refuse"
+                );
+                assert_eq!(
+                    mailbox.state.load(std::sync::atomic::Ordering::Acquire),
+                    FRAME_GRANT_MAILBOX_IDLE,
+                    "the claim is released for the rerun fault's fresh request"
+                );
+
+                // The faulting instruction reruns: a fresh request, a fresh
+                // plan narrowed on the live image, published once.
+                let plan = dispatcher
+                    .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
+                    .unwrap()
+                    .expect("the replanned fault is still admitted");
+                let request = claim(&mailbox, mm, incarnation, 2, fault);
+                let selected = image.select(range_of(&plan), fault);
+                assert_eq!(
+                    selected.range(),
+                    ReservationRange::new(base, base + 4 * PAGE).unwrap(),
+                    "the replan stops before the inherited leaves"
+                );
+                let plan = plan.narrow_to(selected).unwrap();
+                assert!(matches!(
+                    image.prepare(
+                        mm,
+                        LINUX_PAGE_TABLES_BASE,
+                        (plan.start(), plan.len()),
+                        fault
+                    ),
+                    DescriptorOutcome::Applied(_)
+                ));
+                assert_eq!(
+                    complete(&mailbox, request, &plan, true),
+                    FrameGrantCompletion::Published
+                );
+            },
+        );
+        drop(root);
+    }
+
+    /// A deterministic refusal (the executor's live root is not the one the
+    /// transaction names) is answered to EL1 as a typed denial: no rerun, no
+    /// replan and no carrier fatal.
+    #[test]
+    fn arm_terminal_decline_publishes_the_typed_denial() {
+        let (dispatcher, root, base, fault) = mapped(10);
+        let mut image = LiveImage::new(base);
+        let mm = dispatcher.mm_authority().mm_id.raw();
+        let mailbox = FrameGrantMailbox::new();
+        super::super::mm_mutation::test_support::with_permit(
+            dispatcher.mm_mutation_coordinator(),
+            |permit| {
+                let plan = dispatcher
+                    .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
+                    .unwrap()
+                    .expect("the production planner admits the mapped fault");
+                let request = claim(&mailbox, mm, plan.root_incarnation().unwrap(), 1, fault);
+                let selected = image.select(range_of(&plan), fault);
+                let stale_root = LINUX_PAGE_TABLES_BASE + 0x10_0000;
+                let outcome = image.prepare(mm, stale_root, (plan.start(), plan.len()), fault);
+                assert_eq!(
+                    outcome,
+                    DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot)
+                );
+                assert_eq!(
+                    complete(&mailbox, request, &plan, false),
+                    FrameGrantCompletion::PublicationDeclined
+                );
+                let step = settle_declined_frame_grant(
+                    &dispatcher,
+                    permit,
+                    &mailbox,
+                    request,
+                    declined(outcome),
+                    selected,
+                    Some(plan),
+                );
+                assert!(
+                    matches!(
+                        step,
+                        Ok(DeclinedFrameGrantStep::Refused(
+                            PublicationTerminal::Descriptor(DescriptorRefusal::StaleRoot)
+                        ))
+                    ),
+                    "a terminal refusal is typed, never a rerun or a fatal"
+                );
+                let response = mailbox
+                    .response_for_fault(mm, fault, ACCESS_WRITE)
+                    .expect("EL1 finds the refusal answering its fault");
+                assert_eq!(response.status, FRAME_GRANT_ERR_DENIED);
+                assert_eq!(
+                    mailbox.state.load(std::sync::atomic::Ordering::Acquire),
+                    FRAME_GRANT_MAILBOX_RESPONSE
+                );
+            },
+        );
+        drop(root);
+    }
+}
+
 /// Host alias supply already has host mutation admission; extraction must
 /// not add the future native publication freeze to its selection policy.
 #[test]
