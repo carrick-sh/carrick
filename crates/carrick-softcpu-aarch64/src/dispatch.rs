@@ -16,6 +16,7 @@ use crate::translate::{
 use alloc::{sync::Arc, vec::Vec};
 use carrick_guest_arch::{FrameGpa, Gpa, GuestVa};
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
+use carrick_softmmu::ExtentTableId;
 use carrick_softmmu::block_cache::BlockCache;
 use carrick_softmmu::physical_tlb::PhysicalTlb;
 use core::fmt;
@@ -341,6 +342,43 @@ impl<C> ResidentBlock<C> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CacheContext {
+    domain: ExtentTableId,
+    limits: BlockLimits,
+    chaining: bool,
+    inline_memory: bool,
+}
+
+/// Compiled code kept resident across [`run_controlled`] calls, so provider
+/// exits and quanta do not discard the hot set. It holds code only: every
+/// call starts with no stage-1 translations and no native links, and every
+/// reuse rechecks the current execute translation and code generation. Code
+/// survives a call only for memory that names its inventory
+/// ([`GuestMemory::code_cache_domain`]); a different inventory, block limit,
+/// chaining mode or inline-memory mode starts empty.
+pub struct DispatchCache<C> {
+    context: Option<CacheContext>,
+    blocks: BlockCache<BlockKey, Arc<ResidentBlock<C>>>,
+}
+
+impl<C> Default for DispatchCache<C> {
+    fn default() -> Self {
+        Self {
+            context: None,
+            blocks: BlockCache::default(),
+        }
+    }
+}
+
+impl<C> DispatchCache<C> {
+    /// Drop all resident code.
+    pub fn clear(&mut self) {
+        self.context = None;
+        self.blocks.clear();
+    }
+}
+
 struct MeasuredMemory<'a, M> {
     inner: &'a mut M,
     walks: u64,
@@ -473,11 +511,17 @@ pub fn run<X: ExecuteBlock>(
     limits: BlockLimits,
     budget: u64,
 ) -> Report<X::Error> {
-    run_inner(cpu, monitor, memory, executor, limits, budget, None)
+    // A plain run keeps code only for its own duration.
+    let mut cache = DispatchCache::default();
+    run_inner(
+        cpu, monitor, memory, executor, limits, budget, None, &mut cache,
+    )
 }
 
 /// Like [`run`], with asynchronous requests serviced at block boundaries.
 /// Masked IRQs remain pending across calls until the guest unblocks them.
+/// `cache` carries compiled code from one call to the next.
+#[allow(clippy::too_many_arguments)]
 pub fn run_controlled<X: ExecuteBlock>(
     cpu: &mut CpuState,
     monitor: &mut ExclusiveMonitor,
@@ -486,6 +530,7 @@ pub fn run_controlled<X: ExecuteBlock>(
     limits: BlockLimits,
     budget: u64,
     control: &RunControl,
+    cache: &mut DispatchCache<X::Code>,
 ) -> Report<X::Error> {
     run_inner(
         cpu,
@@ -495,9 +540,11 @@ pub fn run_controlled<X: ExecuteBlock>(
         limits,
         budget,
         Some(control),
+        cache,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner<X: ExecuteBlock>(
     cpu: &mut CpuState,
     monitor: &mut ExclusiveMonitor,
@@ -506,6 +553,7 @@ fn run_inner<X: ExecuteBlock>(
     limits: BlockLimits,
     budget: u64,
     control: Option<&RunControl>,
+    residency: &mut DispatchCache<X::Code>,
 ) -> Report<X::Error> {
     let retain_blocks = executor.retain_blocks();
     let retain_stage1 = executor.retain_stage1() && memory.stage1_is_local();
@@ -527,9 +575,21 @@ fn run_inner<X: ExecuteBlock>(
         code_write_failed: false,
     };
     let inline_memory = memory.retain_stage1 && executor.inline_memory();
-    // The run borrows one memory owner and one set of block limits. Keeping
-    // residency within that borrow also discards code at provider handoffs.
-    let mut cache = BlockCache::<BlockKey, Arc<ResidentBlock<X::Code>>>::default();
+    let context = if retain_blocks {
+        memory.inner.code_cache_domain().map(|domain| CacheContext {
+            domain,
+            limits,
+            chaining,
+            inline_memory,
+        })
+    } else {
+        None
+    };
+    if context.is_none() || residency.context != context {
+        residency.blocks.clear();
+    }
+    residency.context = context;
+    let cache = &mut residency.blocks;
     let initial_undefined = cpu.undefined_el0_deliveries;
     let stop = loop {
         if blocks >= budget {
@@ -780,6 +840,10 @@ fn run_inner<X: ExecuteBlock>(
     };
     if chaining {
         executor.unlink(None);
+    }
+    if context.is_none() {
+        // Without an inventory identity the code is not valid past this call.
+        residency.clear();
     }
     work.stage1_walks = memory.walks;
     Report {
