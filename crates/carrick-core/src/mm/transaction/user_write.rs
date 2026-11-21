@@ -189,12 +189,16 @@ impl<
             if venues.slot != slot {
                 return Err(MmError::Stale.into());
             }
-            let step = self.select(&continuation, words, venues)?;
-            match request.as_ref() {
+            let step = self.select(&continuation, words, venues);
+            // The settlement follows every selection, a failed one included:
+            // an earlier supply of this call may still be owed to the venue
+            // (#2716). The selection's own error is the one reported.
+            let settled = match request.as_ref() {
                 Some(request) => venue.settle_completions(request),
                 None => venue.settle_preparation(&target),
-            }
-            .map_err(UserWriteError::Mechanics)?;
+            };
+            let step = step?;
+            settled.map_err(UserWriteError::Mechanics)?;
             match step {
                 TransferStep::CowSupply(window) => {
                     if awaiting_supply_progress {
