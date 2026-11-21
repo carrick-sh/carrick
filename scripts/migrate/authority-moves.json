@@ -240,6 +240,10 @@
     {
       "owner": "carrick_cli::args::debug_a64_census::export_loader_spans",
       "issue": 2501
+    },
+    {
+      "owner": "carrick_cli::debug_zonedump::read_input",
+      "issue": 2646
     }
   ],
   "terminal_custody": []

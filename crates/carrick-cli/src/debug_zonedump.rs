@@ -17,7 +17,6 @@
 //!   `EL1_REGION_SIZE` bytes). The layout comes from `carrick-el1-abi`.
 
 use anyhow::{Context, Result};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// Where the zone state comes from.
@@ -36,7 +35,7 @@ pub(crate) fn run_zonedump(source: ZoneSource<'_>) -> Result<()> {
             render_capture(&capture)?
         }
         ZoneSource::PostMortem(path) => {
-            let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            let bytes = read_input(path)?;
             let capture: carrick_kernel::kernel::debug::PostMortem = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse post-mortem {}", path.display()))?;
             render_capture(&capture)?
@@ -45,6 +44,12 @@ pub(crate) fn run_zonedump(source: ZoneSource<'_>) -> Result<()> {
     };
     print!("{text}");
     Ok(())
+}
+
+/// The one host file read of this diagnostic: a capture or region image the
+/// operator named.
+fn read_input(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("read {}", path.display()))
 }
 
 /// The zone sections of one capture: the HVF zone census, or the
@@ -82,39 +87,45 @@ fn render_capture(capture: &carrick_kernel::kernel::debug::PostMortem) -> Result
     Ok(out)
 }
 
-/// A zeroed heap value of `T`, filled from `len_of::<T>()` bytes of `file`
-/// at `offset`.
+/// A heap value of `T` copied from `size_of::<T>()` bytes of `image` at
+/// `offset`.
 ///
 /// # Safety
 /// `T` must be a shared-memory ABI type for which every byte pattern is a
 /// valid value (atomics and plain words), as the EL1 region's types are:
 /// the guest writes them, and the host already reads them in place.
-unsafe fn read_abi<T>(file: &mut std::fs::File, offset: u64) -> Result<Box<T>> {
+unsafe fn read_abi<T>(image: &[u8], offset: u64) -> Result<Box<T>> {
     let layout = std::alloc::Layout::new::<T>();
     anyhow::ensure!(layout.size() != 0, "zero-sized ABI read");
-    // SAFETY: nonzero layout; zero is a valid T (caller contract).
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    let source = usize::try_from(offset)
+        .ok()
+        .and_then(|start| image.get(start..start.checked_add(layout.size())?))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "read {} bytes at region offset {offset:#x}: image is {} bytes",
+                layout.size(),
+                image.len()
+            )
+        })?;
+    // SAFETY: nonzero layout.
+    let ptr = unsafe { std::alloc::alloc(layout) };
     anyhow::ensure!(!ptr.is_null(), "allocate {} bytes", layout.size());
-    // SAFETY: `ptr` owns `layout.size()` initialized (zero) bytes, and any
-    // byte pattern is a valid T (caller contract).
-    let value = unsafe { Box::from_raw(ptr.cast::<T>()) };
-    // SAFETY: the box's storage is exactly `layout.size()` bytes.
-    let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, layout.size()) };
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(bytes)
-        .with_context(|| format!("read {} bytes at region offset {offset:#x}", layout.size()))?;
-    Ok(value)
+    // SAFETY: `ptr` owns `layout.size()` bytes; the copy initializes all of
+    // them, and any byte pattern is a valid T (caller contract).
+    unsafe {
+        std::ptr::copy_nonoverlapping(source.as_ptr(), ptr, layout.size());
+        Ok(Box::from_raw(ptr.cast::<T>()))
+    }
 }
 
 type CurrentTasks = [carrick_el1_abi::CurrentTask; carrick_el1_abi::EL1_STACK_SLOTS as usize];
 
 /// Decode an ARM EL1 region image through the ABI types.
 fn render_region(path: &Path) -> Result<String> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("open region {}", path.display()))?;
+    let image = read_input(path)?;
     let needed = carrick_el1_abi::EL1_ZONE_OFFSET
         + std::mem::size_of::<carrick_el1_abi::ZoneTables>() as u64;
-    let len = file.metadata()?.len();
+    let len = image.len() as u64;
     anyhow::ensure!(
         len >= needed,
         "region image {} is {len:#x} bytes; the zone ends at {needed:#x} (EL1_ZONE_OFFSET {:#x}), so it is not a whole EL1 region",
@@ -123,10 +134,10 @@ fn render_region(path: &Path) -> Result<String> {
     );
     // SAFETY: both are EL1-region ABI types made of atomics and plain words.
     let zone: Box<carrick_el1_abi::ZoneTables> =
-        unsafe { read_abi(&mut file, carrick_el1_abi::EL1_ZONE_OFFSET)? };
+        unsafe { read_abi(&image, carrick_el1_abi::EL1_ZONE_OFFSET)? };
     // SAFETY: as above.
     let tasks: Box<CurrentTasks> =
-        unsafe { read_abi(&mut file, carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET)? };
+        unsafe { read_abi(&image, carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET)? };
     let mut out = format!("region: {}\n", path.display());
     zone.write_census(&mut out)
         .map_err(|_| anyhow::anyhow!("format the zone census"))?;
@@ -139,7 +150,7 @@ fn render_region(path: &Path) -> Result<String> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
 
     fn bytes_of<T>(value: &T) -> &[u8] {
         // SAFETY: reading the initialized bytes of a live value.
@@ -158,14 +169,10 @@ mod tests {
         let path = dir.path().join("region.bin");
         // A whole region image, sparse except for the two tables.
         let mut file = std::fs::File::create(&path).unwrap();
+        let zeros = vec![0u8; std::mem::size_of::<carrick_el1_abi::ZoneTables>()];
         // SAFETY: zero is the valid empty zone.
-        let zone: Box<carrick_el1_abi::ZoneTables> = unsafe {
-            let mut empty = tempfile::tempfile().unwrap();
-            empty
-                .set_len(std::mem::size_of::<carrick_el1_abi::ZoneTables>() as u64)
-                .unwrap();
-            read_abi(&mut empty, 0).unwrap()
-        };
+        let zone: Box<carrick_el1_abi::ZoneTables> = unsafe { read_abi(&zeros, 0).unwrap() };
+        drop(zeros);
         zone.enter_idle(SlotId::new(2), false);
         let tasks: [carrick_el1_abi::CurrentTask; 2] = [
             carrick_el1_abi::CurrentTask::new(),
