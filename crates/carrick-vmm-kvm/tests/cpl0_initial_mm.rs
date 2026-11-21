@@ -6500,10 +6500,13 @@ fn run_x86_fork_exec_poll_witness(become_ready: bool) {
     );
 }
 
-/// #2620 part B: V8's `OS::SetPermissions` aborts when an `mprotect` returns
-/// non-zero. A forked child performs one V8-shaped protection edit and exits
-/// 7 on success, or with the errno of the first failing call (see
-/// `native_child_mprotect_shapes.S` for the cases).
+/// #2722 (from #2620 part B): V8's cage and Go's heap reserve GiBs of
+/// `PROT_NONE|MAP_NORESERVE` address space and commit inside it. A forked
+/// child (the root, for case 8) performs one shape and exits 7 on success, or
+/// with the errno of the first failing call (see
+/// `native_child_mprotect_shapes.S`). The fixture's anonymous R|X and
+/// cross-VMA cases 2-4 belong to #2620's mprotect widening and are not run
+/// here.
 fn run_mprotect_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let define = format!("-DCASE={case}");
     let elf = native_exit_fixture_with_flags("native_child_mprotect_shapes.S", &[&define]);
@@ -6535,24 +6538,20 @@ macro_rules! mprotect_shape_witness {
                     .filter(|(nr, c)| *c != 0 && matches!(nr, 9 | 10 | 11 | 28))
                     .collect()
             };
-            eprintln!(
-                "case {} exit {} (x86 nr 9 mmap, 10 mprotect, 11 munmap) served {:?} forwarded {:?} \
-                 refused {:?} refused_child {:?} venue_refused {:?} venue_refused_child {:?}",
+            assert_eq!(
+                (outcome.run.exit_code, outcome.run.terminating_signal),
+                (7, None),
+                "case {} child exit (7 = Linux; else the errno) {:?}; x86 nr 9 mmap, 10 mprotect, \
+                 11 munmap: served {:?} forwarded {:?} refused {:?} refused_child {:?} \
+                 venue_refused {:?} venue_refused_child {:?}",
                 $case,
-                outcome.run.exit_code,
+                outcome.run,
                 at(&counters.served),
                 at(&counters.forwarded),
                 at(&counters.refused),
                 at(&counters.refused_child),
                 at(&counters.venue_refused),
                 at(&counters.venue_refused_child),
-            );
-            assert_eq!(
-                (outcome.run.exit_code, outcome.run.terminating_signal),
-                (7, None),
-                "case {} child exit (7 = Linux; else the errno): {:?}",
-                $case,
-                outcome.run
             );
         }
     };
@@ -6562,21 +6561,6 @@ mprotect_shape_witness!(
     production_mprotect_commits_inside_a_gib_noreserve_reservation,
     1,
     "A 1 GiB PROT_NONE|MAP_NORESERVE reserve, 1 MiB committed RW inside it."
-);
-mprotect_shape_witness!(
-    production_mprotect_flips_rw_anonymous_to_rx_and_calls_it,
-    2,
-    "RW anonymous page, code written, mprotect R|X, then executed."
-);
-mprotect_shape_witness!(
-    production_mprotect_makes_rw_anonymous_rwx_and_calls_it,
-    3,
-    "As the R|X flip, with R|W|X."
-);
-mprotect_shape_witness!(
-    production_mprotect_spans_two_adjacent_vmas,
-    4,
-    "One mprotect across the boundary of two adjacent VMAs."
 );
 mprotect_shape_witness!(
     production_mprotect_commits_then_flips_rx_inside_a_4gib_reservation,
@@ -6597,4 +6581,9 @@ mprotect_shape_witness!(
     production_mprotect_commits_inside_a_gib_reservation_in_the_root,
     8,
     "Size probe: the GiB reserve issued by the run root, no fork."
+);
+mprotect_shape_witness!(
+    production_mmap_larger_than_the_user_address_space_is_enomem,
+    9,
+    "Negative control: a 256 TiB reserve exceeds the 128 TiB user VA: ENOMEM."
 );

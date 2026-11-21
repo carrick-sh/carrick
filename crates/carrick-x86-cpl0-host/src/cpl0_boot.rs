@@ -5205,6 +5205,29 @@ mod cpl0_layout_tests {
         assert!(INITIAL_STACK_TOP <= layout.heap.start());
     }
 
+    /// #2722: a low image's mmap arena spans Linux's whole mmap size; a
+    /// stack parked at 2 GiB once clipped it to ~1016 MiB, so a 1 GiB
+    /// `PROT_NONE|MAP_NORESERVE` reserve found no gap.
+    #[test]
+    fn low_image_arena_spans_the_linux_mmap_size_below_the_stack() {
+        let layout = initial_reservation_layout(
+            UserVa::new(0x40_2000),
+            UserVa::new(INITIAL_STACK_TOP),
+            InitialReservationLimits::UNLIMITED,
+        )
+        .unwrap();
+        assert_eq!(layout.heap.start(), 0x40_2000);
+        assert_eq!(layout.arena.start(), INITIAL_ARENA_ALIGNMENT);
+        assert!(
+            layout.arena.len() >= carrick_mem::memory::LINUX_MMAP_SIZE,
+            "arena {:#x}..{:#x} is {} bytes",
+            layout.arena.start(),
+            layout.arena.end(),
+            layout.arena.len()
+        );
+        assert!(layout.arena.end() <= INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION);
+    }
+
     #[test]
     fn low_image_reservations_stop_before_stack_and_retain_launch_limits() {
         let limits = InitialReservationLimits {

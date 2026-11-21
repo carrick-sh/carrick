@@ -9,6 +9,9 @@
  *   6/7 as 1 with a 16 MiB / 256 MiB reserve (size probe)
  *   8 as 1, run in the root (no fork)
  *   5 4 GiB reserve, commit 64 KiB RW inside, write code, flip R|X, call
+ *   9 negative control: a 256 TiB PROT_NONE|MAP_NORESERVE reserve is larger
+ *     than the 128 TiB user address space and must fail with ENOMEM (exit 7;
+ *     8 when it succeeds, else the other errno + 100)
  * The parent propagates the child's exit status. */
 .global _start
 .text
@@ -114,6 +117,21 @@ child:
     MPROTECT %r14, $0x10000, $5
     call *%r14
     jmp done
+#elif CASE == 9
+    xor %edi, %edi
+    mov $0x1000000000000, %rsi
+    xor %edx, %edx
+    mov $0x4022, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    cmp $-12, %rax
+    je done
+    test %rax, %rax
+    js fail_mmap
+    mov $8, %edi
+    jmp exit
 #else
 #error CASE
 #endif
