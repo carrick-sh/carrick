@@ -46,7 +46,9 @@ use carrick_kernel::kernel::exec_transaction::{
     core_file_mappings_from_address_space, proc_maps_from_address_space,
 };
 use carrick_kernel::kernel::identity_page::stamp_identity_page;
-use carrick_kernel::kernel::{FrameInventorySnapshot, Kernel, VmaSummary};
+use carrick_kernel::kernel::{
+    FrameInventorySnapshot, Kernel, VmaSummary, is_default_ignore_signal, is_default_stop_signal,
+};
 use carrick_mem::linux_abi::{
     LINUX_AT_HWCAP2, LINUX_AT_NULL, LinuxAarch64Hwcap, syscall::lookup_aarch64,
 };
@@ -803,6 +805,19 @@ where
         let pre_ctx = dispatcher
             .capture_one_task_context()
             .map_err(|e| format!("capture KernelContext before run: {e}"))?;
+        if let Some(signum) = default_signal_death(dispatcher, &pre_ctx)? {
+            return Ok(finish_single_process_summary(
+                engine,
+                dispatcher,
+                &kernel,
+                reporter,
+                &refused_by_runner,
+                128 + signum,
+                syscalls_dispatched,
+                reply_census,
+                None,
+            ));
+        }
         publish_file_table(&pre_ctx);
         let tid = pre_ctx.thread().key().tid.raw();
         let _ = revalidate_current_task(
@@ -999,6 +1014,31 @@ where
     Err(format!(
         "single-process syscall budget ({max_syscalls}) exhausted after {syscalls_dispatched} dispatches"
     ))
+}
+
+/// Take the Linux default action of a kernel signal left deliverable at the
+/// guest's return boundary (for example `SIGPIPE` from a write to a widowed
+/// pipe). The runner refuses custom handlers, so the disposition is `SIG_DFL`:
+/// default-ignore signals and `SIGCONT` (the process is never stopped) are
+/// discarded, terminating ones end the process, and a stop signal, which has
+/// no job control here, fails the run closed.
+fn default_signal_death(
+    dispatcher: &SyscallDispatcher,
+    context: &carrick_kernel::kernel::KernelContext,
+) -> Result<Option<i32>, String> {
+    let tid = context.thread().registry_id();
+    while let Some(signum) = dispatcher.take_deliverable_pending(context, tid) {
+        if is_default_ignore_signal(signum) || signum == carrick_abi::LINUX_SIGCONT {
+            continue;
+        }
+        if is_default_stop_signal(signum) {
+            return Err(format!(
+                "pending stop signal {signum} has no job control in the single-process soft runner"
+            ));
+        }
+        return Ok(Some(signum));
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
