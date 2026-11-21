@@ -944,6 +944,22 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
                 ))
     }
 
+    /// A queued record a vacating slot hands to the host is woken, unless
+    /// its resumption reads its handback: a preempted or host-runnable
+    /// record, or an object park the ring placed after interrupting it, whose
+    /// operation's rerun ends the wait only on `Signal`/`Timeout` (#2620).
+    fn settle_vacated_handback(&self) {
+        let keep = match self.handback() {
+            Some(Handback::Resumed | Handback::Service) => true,
+            Some(Handback::Signal | Handback::Timeout) => self.has_object_operation(),
+            _ => false,
+        };
+        if !keep {
+            self.handback
+                .store(Handback::Woken as u32, Ordering::Release);
+        }
+    }
+
     fn settle_claimed_handback(&self, kind: Handback) {
         if self.has_object_operation()
             || kind == Handback::Cancelled
@@ -4937,8 +4953,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// The executor of `slot`, at an exit (vCPU stopped): take every record
     /// still queued on the slot. Each becomes host-owned: a woken one with
     /// [`Handback::Woken`], a preempted one with [`Handback::Resumed`], a
-    /// host-runnable one keeps [`Handback::Service`] (all passed to `take`
-    /// with `false`), or, if the host retired its thread meanwhile,
+    /// host-runnable one keeps [`Handback::Service`], an object park the
+    /// ring placed after interrupting it keeps [`Handback::Signal`] or
+    /// [`Handback::Timeout`] (all passed to `take` with `false`), or, if the host retired its thread meanwhile,
     /// [`Handback::Cancelled`] (passed with `true`, for the caller to free).
     /// Each callback receives the incarnation captured before host ownership
     /// was published, so cancellation/reuse cannot retarget its delivery.
@@ -4987,10 +5004,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 }
                 continue;
             }
-            if !matches!(rec.handback(), Some(Handback::Resumed | Handback::Service)) {
-                rec.handback
-                    .store(Handback::Woken as u32, Ordering::Release);
-            }
+            rec.settle_vacated_handback();
             self.counters
                 .reconcile_woken
                 .fetch_add(1, Ordering::Relaxed);
@@ -5785,9 +5799,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     rec.retire_terminal_metadata_operation();
                     rec.handback
                         .store(Handback::Cancelled as u32, Ordering::Release);
-                } else if rec.handback() != Some(Handback::Resumed) {
-                    rec.handback
-                        .store(Handback::Woken as u32, Ordering::Release);
+                } else {
+                    rec.settle_vacated_handback();
                 }
                 moved += 1;
                 if let Some(ready) = transfer.publish() {
