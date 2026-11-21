@@ -2189,6 +2189,9 @@ fn closing_process_retires_object_parked_member_for<
     let fixture = native_exec_fixture_for::<C, B>(make_words);
     let sibling = add_signal_sibling(&fixture, None, false);
     assert!(fixture.zone.mark_native_owned(sibling.record.id));
+    // An unbound thread may run on either CPU, as in production; the shared
+    // sibling fixture pins it to the leader's.
+    fixture.zone.record(sibling.record.id).set_affinity(0b11);
     assert_eq!(fixture.page.live(), 2);
 
     let (region, object, pin, token) = retained_pipe_read(fixture.zone, sibling.slot, sibling.task);
