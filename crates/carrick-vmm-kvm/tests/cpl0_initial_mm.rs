@@ -186,6 +186,36 @@ fn serial_host_native_exec_successor_advisory_mmap_stays_in_ring() {
     );
 }
 
+/// #1846 (V8's `Check failed: 0 == ret`): a live native child's `madvise`
+/// is served in ring. Its inherited written page, a PROT_NONE guard page and
+/// a touched RW page each read zero after `MADV_DONTNEED`; the live parent's
+/// copy is unchanged. A refused `madvise` exits with its errno (38).
+#[test]
+fn serial_host_native_child_madvise_dontneed_stays_in_ring() {
+    let elf = native_exit_fixture_with_flags("native_child_madvise.S", &[]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 256, ROOT_AFFINITY_IDLE_PEER)
+        .expect("native fork and madvise");
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        outcome.run.exit_code,
+        0,
+        "38=madvise refused, 60..69=fixture stage; madvise served={}, refused={}, anonymous leaves={:?}",
+        load(&counters.served[233]),
+        load(&counters.refused[28]),
+        counters.anonymous_leaves.each_ref().map(load),
+    );
+    assert_eq!(
+        load(&counters.refused[28]),
+        0,
+        "x86 native madvise must not be refused"
+    );
+}
+
 // Production child entropy service, including CPL0 entry and host completion.
 #[test]
 fn serial_host_native_child_getrandom_default_returns_eight_bytes() {
@@ -4088,6 +4118,19 @@ fn private_file_path_only_mapping_returns_ebadf() {
 #[test]
 fn private_file_child_first_touch_after_parent_unmap() {
     private_file_fixture_with(true, &["-DCHILD_FIRST_TOUCH"], 0);
+}
+
+/// #1846: `MADV_DONTNEED` over a written private file page discards the
+/// private copy; the next read faults the file's bytes in again.
+#[test]
+fn private_file_dontneed_restores_source_bytes() {
+    private_file_fixture_with(true, &["-DDONTNEED_RESTORES"], 0);
+}
+
+/// #1846: the same discard in a live native child, served in ring.
+#[test]
+fn private_file_child_dontneed_restores_source_bytes() {
+    private_file_fixture_with(true, &["-DCHILD_FIRST_TOUCH", "-DDONTNEED_RESTORES"], 0);
 }
 
 #[test]
