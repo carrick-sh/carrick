@@ -11,13 +11,15 @@ guest_surfaces = [
   "syscall:mprotect",
   "syscall:munmap",
   "syscall:openat",
+  "syscall:shmat",
+  "syscall:shmget",
   "syscall:read",
   "syscall:write",
   "vmm:soft",
 ]
 semantic_authority = [
   "Arm ARM DDI0487G.a D1.10 (exception entry and HVC), D5.4 and D5.8 (stage-1/stage-2 permissions and faults), and D5.10 (TLB maintenance).",
-  "man 2 brk, mmap, mprotect, munmap, openat, fstat, read, write, close, clock_gettime, exit_group.",
+  "man 2 brk, mmap, mprotect, munmap, openat, fstat, read, write, close, clock_gettime, shmget, shmat, exit_group.",
 ]
 fixture = "carrick-softcpu-aarch64-host::soft_dispatch_witness"
 scale_points = [1]
@@ -32,6 +34,7 @@ vm_free = [
   "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_single_process_store_after_mprotect_prot_read_faults_with_segv_accerr",
   "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_single_process_access_after_munmap_faults_with_segv_maperr",
   "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_stage2_enforces_execute_permission_and_extent_code_generations",
+  "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_sysv_shm_alias_publishes_kernel_frame_inventory",
   "carrick-aarch64::esr::tests::decodes_el0_translation_and_permission_fault_access",
   "carrick-aarch64::esr::tests::decodes_el0_abort_stage1_fault_kind",
   "carrick-aarch64::esr::tests::lowers_el0_aborts_and_debug_faults_to_linux_signal_triples",

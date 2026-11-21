@@ -32,8 +32,8 @@ routing from the soft AArch64 CPU (`carrick-softcpu-aarch64` +
   kernel `FrameInventoryAuthority`, the post-publish stage-1
   protection/sharing/`SIGBUS` tail and VMA commit, and the resident +
   `MAP_GROWSDOWN` + stale-stage-1-leaf first-touch sequence. The soft runner
-  calls them; a soft `MAP_SHARED` file `mmap` leaves its alias mapping in the
-  kernel frame inventory. On `ReservationBusy` the soft runner releases its MM
+  calls them; a soft `shmat` alias (a `MapHostAlias` on every host) leaves its
+  mapping in the kernel frame inventory. On `ReservationBusy` the soft runner releases its MM
   mutation lease, enrols on the holder's release through the carrier MM portal
   (`PortalWaitEnrollment::park_host`, which probes once), parks until the
   release hands its zone record back, and reruns: no `yield_now()` polling.
@@ -51,6 +51,7 @@ routing from the soft AArch64 CPU (`carrick-softcpu-aarch64` +
   - `carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_single_process_store_after_mprotect_prot_read_faults_with_segv_accerr`
   - `carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_single_process_access_after_munmap_faults_with_segv_maperr`
   - `carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_stage2_enforces_execute_permission_and_extent_code_generations`
+  - `carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_sysv_shm_alias_publishes_kernel_frame_inventory`
   - `carrick-aarch64::esr::tests::lowers_el0_aborts_and_debug_faults_to_linux_signal_triples`
   - `carrick-aarch64::mailbox::tests::mailbox_slot_round_trips_request_and_response`
   - `carrick-aarch64::mailbox::tests::hvc_immediates_classify_canonically`
