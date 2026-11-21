@@ -261,10 +261,38 @@ impl ServiceParkOutcome {
         }
     }
 
-    fn discharge_for_entry(self, venue: EntryExitVenue, current: &CurrentTask) -> NativeResume {
+    /// Consume at an in-ring scheduler resume. The park already enrolled this
+    /// record, so probe the slot's notice once: a selector carrier intake
+    /// already took needs no ring, and one still published marks pending
+    /// host work so `Sched::idle` exits to intake instead of entering WFI.
+    fn mark_host_work_if_published(
+        self,
+        current: &CurrentTask,
+        record: carrick_sched_core::RecordId,
+    ) -> NativeResume {
+        let (resumed, unannounced) = match self {
+            Self::Announced(resumed) => return resumed,
+            Self::UnannouncedLeftNone(unannounced) => (NativeResume::Left(None), unannounced),
+            Self::UnannouncedLeftSome(status, unannounced) => {
+                (NativeResume::Left(Some(status)), unannounced)
+            }
+        };
+        unannounced.consume();
+        if current.service_notice.names_record(record) {
+            current.linux.mark_pending_host_work();
+        }
+        resumed
+    }
+
+    fn discharge_for_entry(
+        self,
+        venue: EntryExitVenue,
+        current: &CurrentTask,
+        record: carrick_sched_core::RecordId,
+    ) -> NativeResume {
         match venue {
             EntryExitVenue::DirectCarrierExit => self.into_carrier_exit(),
-            EntryExitVenue::SchedulerResume => self.mark_host_work(current),
+            EntryExitVenue::SchedulerResume => self.mark_host_work_if_published(current, record),
         }
     }
 }
@@ -2289,7 +2317,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             PreparedService::Retired(result) => Ok(ServiceParkOutcome::announced(result)),
         }?;
-        Ok(outcome.discharge_for_entry(self.exit_venue, self.current))
+        Ok(outcome.discharge_for_entry(self.exit_venue, self.current, self.record.id))
     }
 
     #[inline(never)]

@@ -387,7 +387,11 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
             fixture.zone.record(member.id).requires_native_entry(),
             "the owned signal-work refusal must survive a concurrent work drain"
         );
-        assert!(!fixture.task.linux.has_pending_host_work());
+        // The drain settled the earlier work, but the deferral then
+        // published its own CarrierWork notice and left into `Sched::idle`.
+        // Without a physical doorbell that notice must ring host work, or
+        // the idle vCPU strands it behind WFI (#2620).
+        assert!(fixture.task.linux.has_pending_host_work());
     }
     let mut cpu = HostResumeCpu {
         inner: cpu,
@@ -473,18 +477,15 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
                 }
             ));
             drop(queue);
-            // The race callback already drained its observed work. Ordinary
-            // delayed carrier settlement consumes the live doorbell here.
-            if defer_race {
-                assert!(!fixture.task.linux.has_pending_host_work());
-            } else {
-                fixture
-                    .task
-                    .linux
-                    .take_host_work_doorbell()
-                    .unwrap()
-                    .settled();
-            }
+            // Delayed carrier settlement consumes the live doorbell here: the
+            // real work's mark, or the deferral notice's ring after the race
+            // callback drained the earlier work.
+            fixture
+                .task
+                .linux
+                .take_host_work_doorbell()
+                .unwrap()
+                .settled();
             ticket
                 .complete(true)
                 .unwrap_or_else(|_| panic!("committed carrier work was cancelled"));

@@ -887,6 +887,12 @@ impl ServiceNotice {
         }
         Err(ServiceNoticeBusy::Corrupt)
     }
+    /// Whether the notice still names `record`'s untaken selector. Zero
+    /// stores: a publisher that parked first probes once here, so a selector
+    /// carrier intake already took (or is taking) needs no further doorbell.
+    pub fn names_record(&self, record: carrick_sched_core::RecordId) -> bool {
+        self.record.load(Ordering::Acquire) == u64::from(record.raw()) + 1
+    }
     pub fn take(&self) -> Result<Option<ServiceSelector>, ServiceError> {
         let record = self.record.load(Ordering::Acquire);
         if record == 0 {
@@ -3633,5 +3639,31 @@ mod tests {
             notice.publish_or_observe(first),
             Err(ServiceNoticeBusy::Corrupt)
         );
+    }
+
+    #[test]
+    fn service_notice_names_record_only_while_untaken() {
+        let notice = ServiceNotice::new();
+        let first = ServiceSelector {
+            record: birth(1, 3).record,
+            execution: SnapshotGeneration::INITIAL,
+            sequence: NonZeroU64::new(5).unwrap(),
+        };
+        let other = birth(2, 4).record.id;
+        assert!(!notice.names_record(first.record.id));
+        notice.publish(first).unwrap();
+        let published = notice.record.load(Ordering::Acquire);
+        assert!(notice.names_record(first.record.id));
+        assert!(!notice.names_record(other));
+        // Probing performs zero stores.
+        assert_eq!(notice.record.load(Ordering::Acquire), published);
+        // A carrier `take` in flight already owns the selector.
+        notice
+            .record
+            .store(published | NOTICE_TAKING, Ordering::Release);
+        assert!(!notice.names_record(first.record.id));
+        notice.record.store(published, Ordering::Release);
+        assert_eq!(notice.take(), Ok(Some(first)));
+        assert!(!notice.names_record(first.record.id));
     }
 }
