@@ -86,6 +86,7 @@ pub use epoll::{SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2};
 mod execution;
 pub use execution::{IpcExecution, NativeIpcExecution};
 mod file_lock;
+pub mod readiness_set;
 pub(crate) use file_lock::{LockCall, serve_file_lock};
 
 /// One Linux syscall argument word from the shared frame.
@@ -733,25 +734,42 @@ const SELECT_INTERESTS: [i16; 3] = [
     crate::file_table::LINUX_POLLPRI,
 ];
 
+/// The descriptors a select call names, decoded once at entry.
+enum SelectInterest {
+    /// No set names a descriptor: the shared body sleeps without a pin.
+    None,
+    /// Exactly one descriptor: the single-description owner.
+    One(crate::file_table::PollFd),
+    /// Several descriptors: the read, write and except bitmaps, `words`
+    /// each, bits at or above `nfds` cleared.
+    Many(alloc::vec::Vec<u64>),
+}
+
 fn read_select_interest(
     layout: &mut IpcSelectOutput,
     nfds: usize,
     user: &mut impl UserCopy,
-) -> Result<Option<crate::file_table::PollFd>, carrick_syscall_abi::LinuxErrno> {
+) -> Result<SelectInterest, carrick_syscall_abi::LinuxErrno> {
     use carrick_syscall_abi::LINUX_EFAULT;
 
     layout.words = nfds.div_ceil(64) as u32;
     if layout.words == 0 || layout.sets.iter().all(|address| address.0 == 0) {
-        return Ok(None);
+        return Ok(SelectInterest::None);
     }
-    let mut bytes = select_output_buffer(layout.words as usize * 8)?;
+    let words = layout.words as usize;
+    let mut bytes = select_output_buffer(words * 8)?;
+    let mut sets = alloc::vec::Vec::new();
+    sets.try_reserve_exact(words * SELECT_INTERESTS.len())
+        .map_err(|_| carrick_abi::LINUX_ENOMEM)?;
     let mut pollfd = crate::file_table::PollFd {
         fd: -1,
         events: 0,
         revents: 0,
     };
-    for (address, interest) in layout.sets.into_iter().zip(SELECT_INTERESTS) {
+    let mut single = true;
+    for address in layout.sets {
         if address.0 == 0 {
+            sets.resize(sets.len() + words, 0);
             continue;
         }
         if !user.copy_in(&mut bytes, address.0) {
@@ -763,18 +781,29 @@ fn read_select_interest(
             if remaining < 64 {
                 bits &= (1_u64 << remaining) - 1;
             }
+            sets.push(bits);
+        }
+    }
+    for (set, interest) in sets.chunks_exact(words).zip(SELECT_INTERESTS) {
+        for (index, &bits) in set.iter().enumerate() {
             if bits == 0 {
                 continue;
             }
             let fd = (index * 64 + bits.trailing_zeros() as usize) as i32;
             if !bits.is_power_of_two() || (pollfd.fd >= 0 && pollfd.fd != fd) {
-                return Ok(None);
+                single = false;
             }
             pollfd.fd = fd;
             pollfd.events |= interest;
         }
     }
-    Ok((pollfd.fd >= 0).then_some(pollfd))
+    Ok(if pollfd.fd < 0 {
+        SelectInterest::None
+    } else if single {
+        SelectInterest::One(pollfd)
+    } else {
+        SelectInterest::Many(sets)
+    })
 }
 
 /// Linux select readiness classes, including EOF as readable and a
@@ -804,17 +833,26 @@ pub fn poll_wait_lane(member: carrick_el1_abi::ipc::epoll::EpollMember, events: 
     }
 }
 
+/// One descriptor of a decided select answer: its number and the
+/// readiness classes (`POLLIN`, `POLLOUT`, `POLLPRI`) it reports.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SelectReady {
+    pub fd: i32,
+    pub ready: i16,
+}
+
 /// One Linux select output in publication order. A set is entirely zero
-/// except for the admitted descriptor's bit, so even a large set can be
-/// rendered one copy window at a time.
-pub struct WaitCopy {
+/// except for the bits of the answer's descriptors, so even a large set can
+/// be rendered one copy window at a time.
+pub struct WaitCopy<'a> {
     pub address: IpcUserVa,
     pub len: usize,
     literal: Option<[u8; 16]>,
-    bit: Option<usize>,
+    ready: &'a [SelectReady],
+    interest: i16,
 }
 
-impl WaitCopy {
+impl WaitCopy<'static> {
     pub fn revents(address: IpcUserVa, revents: [u8; 2]) -> Self {
         let mut bytes = [0; 16];
         bytes[..revents.len()].copy_from_slice(&revents);
@@ -822,10 +860,13 @@ impl WaitCopy {
             address,
             len: revents.len(),
             literal: Some(bytes),
-            bit: None,
+            ready: &[],
+            interest: 0,
         }
     }
+}
 
+impl WaitCopy<'_> {
     pub fn literal(&self) -> Option<&[u8]> {
         self.literal.as_ref().map(|bytes| &bytes[..self.len])
     }
@@ -836,23 +877,28 @@ impl WaitCopy {
             return;
         }
         output.fill(0);
-        if let Some(bit) = self.bit
-            && let Some(index) = (bit / 8).checked_sub(offset)
-            && let Some(byte) = output.get_mut(index)
-        {
-            *byte = 1 << (bit % 8);
+        for entry in self.ready {
+            let Ok(bit) = usize::try_from(entry.fd) else {
+                continue;
+            };
+            if entry.ready & self.interest != 0
+                && let Some(index) = (bit / 8).checked_sub(offset)
+                && let Some(byte) = output.get_mut(index)
+            {
+                *byte |= 1 << (bit % 8);
+            }
         }
     }
 }
 
 /// EINTR writes the remaining time and leaves every input set alone.
-pub fn select_copies(
+pub fn select_copies<'a>(
     output: IpcSelectOutput,
     timeout: IpcUserVa,
     remaining_ns: u64,
-    fd: i32,
+    ready: &'a [SelectReady],
     result: i64,
-) -> impl Iterator<Item = WaitCopy> {
+) -> impl Iterator<Item = WaitCopy<'a>> {
     let sets = output
         .sets
         .into_iter()
@@ -862,7 +908,8 @@ pub fn select_copies(
             address,
             len: output.words as usize * 8,
             literal: None,
-            bit: (output.ready & interest != 0).then_some(fd as usize),
+            ready,
+            interest,
         });
     let timeout = (timeout.0 != 0).then(|| {
         let seconds = (remaining_ns / 1_000_000_000) as i64;
@@ -877,22 +924,22 @@ pub fn select_copies(
             address: timeout,
             len: bytes.len(),
             literal: Some(bytes),
-            bit: None,
+            ready: &[],
+            interest: 0,
         }
     });
     sets.chain(timeout)
 }
 
 fn native_select_output<E: IpcExecution>(
-    mut layout: IpcSelectOutput,
+    layout: IpcSelectOutput,
     timeout: IpcUserVa,
     sched: &E,
-    pollfd: crate::file_table::PollFd,
+    ready: &[SelectReady],
     deadline: carrick_el1_abi::ipc::IpcCounterDeadline,
     result: i64,
 ) -> Result<PollOutput, carrick_syscall_abi::LinuxErrno> {
     use carrick_guest_arch::UserVa;
-    layout.ready = pollfd.revents;
     let remaining_ns = deadline.get().map_or(0, |end| {
         let ticks = end.saturating_sub(sched.now()).saturating_sub(1);
         let frequency = sched.ticks(1_000_000_000).max(1);
@@ -903,7 +950,7 @@ fn native_select_output<E: IpcExecution>(
     spans
         .try_reserve_exact(4)
         .map_err(|_| carrick_abi::LINUX_ENOMEM)?;
-    for copy in select_copies(layout, timeout, remaining_ns, pollfd.fd, result) {
+    for copy in select_copies(layout, timeout, remaining_ns, ready, result) {
         let mut bytes = select_output_buffer(copy.len)?;
         copy.fill(0, &mut bytes);
         spans.push((UserVa::new(copy.address.0), bytes));
@@ -1013,11 +1060,7 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
 ) -> IpcServed {
     use crate::dispatch::PollTimeoutKind;
     use crate::file_table::{LINUX_POLLERR, LINUX_POLLHUP, PollFd};
-    use carrick_core_abi::wait::AcceptedWait;
     use carrick_el1_abi::ipc::epoll::EpollMember;
-    use carrick_guest_arch::CounterTick;
-    use carrick_sched_core::object_wait::OperationToken;
-    use carrick_sched_core::refusal::Refusal;
 
     const POLLFD_BYTES: usize = core::mem::size_of::<PollFd>();
 
@@ -1103,13 +1146,24 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 *keep_sigmask = true;
                 let result = LINUX_EINTR.guest_retval();
                 if let Some(layout) = &select {
-                    match native_select_output(*layout, op.buf, sched, pollfd, op.deadline, result)
-                    {
+                    match native_select_output(*layout, op.buf, sched, &[], op.deadline, result) {
                         Ok(answer) => *output = Some(answer),
                         Err(errno) => return poll_result(frame, errno.guest_retval()),
                     }
                 }
                 return poll_result(frame, result);
+            }
+            if select.is_some() && readiness_set::names_set(region, &op) {
+                return readiness_set::resume(
+                    sched,
+                    frame,
+                    venue,
+                    user,
+                    output,
+                    keep_sigmask,
+                    token,
+                    op,
+                );
             }
             Some((pollfd, op.deadline, token, op))
         }
@@ -1139,7 +1193,7 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                         *layout,
                         IpcUserVa(timeout_arg),
                         sched,
-                        pollfd,
+                        &[],
                         deadline,
                         result,
                     ) {
@@ -1161,8 +1215,28 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                     return IpcServed::Forward;
                 };
                 match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user) {
-                    Ok(Some(decoded)) => pollfd = decoded,
-                    Ok(None) => return IpcServed::Forward,
+                    Ok(SelectInterest::One(decoded)) => pollfd = decoded,
+                    Ok(SelectInterest::None) => return IpcServed::Forward,
+                    Ok(SelectInterest::Many(sets)) => {
+                        let call = readiness_set::SetCall {
+                            layout: *layout,
+                            sets,
+                            timeout: IpcUserVa(timeout_arg),
+                            deadline,
+                            sigmask: None,
+                            arg0,
+                        };
+                        return readiness_set::serve(
+                            sched,
+                            frame,
+                            venue,
+                            user,
+                            output,
+                            keep_sigmask,
+                            table,
+                            call,
+                        );
+                    }
                     Err(errno) => return select_input_error(frame, user, errno),
                 }
             }
@@ -1244,8 +1318,28 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                     return IpcServed::Forward;
                 };
                 match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user) {
-                    Ok(Some(decoded)) => pollfd = decoded,
-                    Ok(None) => return IpcServed::Forward,
+                    Ok(SelectInterest::One(decoded)) => pollfd = decoded,
+                    Ok(SelectInterest::None) => return IpcServed::Forward,
+                    Ok(SelectInterest::Many(sets)) => {
+                        let call = readiness_set::SetCall {
+                            layout: *layout,
+                            sets,
+                            timeout: IpcUserVa(timeout_arg),
+                            deadline,
+                            sigmask: sigmask.take(),
+                            arg0,
+                        };
+                        return readiness_set::serve(
+                            sched,
+                            frame,
+                            venue,
+                            user,
+                            output,
+                            keep_sigmask,
+                            table,
+                            call,
+                        );
+                    }
                     Err(errno) => return select_input_error(frame, user, errno),
                 }
             }
@@ -1365,7 +1459,11 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
             }
             let result = if let Some(layout) = &select {
                 let result = i64::from(pollfd.revents.count_ones());
-                match native_select_output(*layout, timeout, sched, pollfd, deadline, result) {
+                let ready = [SelectReady {
+                    fd: pollfd.fd,
+                    ready: pollfd.revents,
+                }];
+                match native_select_output(*layout, timeout, sched, &ready, deadline, result) {
                     Ok(answer) => *output = Some(answer),
                     Err(errno) => return poll_result(frame, errno.guest_retval()),
                 }
@@ -1429,85 +1527,10 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 deadline,
                 ..IpcOperation::EMPTY
             };
-            let (replay, key, observed) = match region.begin_operation(op) {
-                Ok(token) => (None, None, Ok(token)),
-                Err(IpcError::NoOperations) => {
-                    let zone = sched.zone();
-                    let slot = sched.slot();
-                    let completion =
-                        |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-                            '_,
-                            E::Context,
-                        >| {
-                            crate::sched::object_wait::deliver_completion(zone, slot, owned)
-                        };
-                    match admit_operation_wait(region, zone, op, &completion).result {
-                        Ok(token) => (None, None, Ok(token)),
-                        // SAFETY: the enrollment's key and pre-probe observation go
-                        // directly to this lane's scheduler park below; no guard crosses.
-                        Err(Refusal::Contended(ticket)) => {
-                            let replay = OperationToken::metadata_request(
-                                region.operation_slot_generation().get(),
-                            )
-                            .unwrap_or_else(|| {
-                                crate::dispatch::invalid_completion(
-                                    crate::dispatch::NativeInvariant::EntryBinding,
-                                )
-                            });
-                            let (replay, key, observed) = unsafe {
-                                ticket.park_and_rerun(replay, |replay, enrollment| {
-                                    (replay, enrollment.key(), enrollment.observed())
-                                })
-                            };
-                            (Some(replay), Some(key), Err(Some(observed)))
-                        }
-                        Err(Refusal::Invariant(_) | Refusal::Guest(_)) => (None, None, Err(None)),
-                    }
-                }
-                Err(_) => (None, None, Err(None)),
-            };
-            match observed {
-                Ok(token) => (token, op),
-                Err(None) => {
-                    release_pin(sched, OfdPin::from_raw(op.pin), region);
-                    return IpcServed::Forward;
-                }
-                Err(Some(observed)) => {
-                    release_pin(sched, OfdPin::from_raw(op.pin), region);
-                    let accepted = AcceptedWait {
-                        deadline: op.deadline.get().map(CounterTick::new),
-                    };
-                    if !user.retain_accepted_epoll_wait(accepted) {
-                        return IpcServed::Forward;
-                    }
-                    let (Some(replay), Some(key)) = (replay, key) else {
-                        let _ = user.take_accepted_epoll_wait();
-                        return IpcServed::Forward;
-                    };
-                    // SAFETY: observed before the arena probe that found no free slot.
-                    let snapshot = unsafe { ObjectStateSnapshot::before_object_probe(observed) };
-                    match sched.park(
-                        frame,
-                        key,
-                        snapshot,
-                        replay,
-                        None,
-                        Some(&mut || user.interrupt_pending_wait()),
-                    ) {
-                        Ok(served) => {
-                            *keep_sigmask = true;
-                            return served;
-                        }
-                        Err((ObjectWaitError::Changed, _)) => {
-                            let _ = user.take_accepted_epoll_wait();
-                            continue;
-                        }
-                        Err(_) => {
-                            let _ = user.take_accepted_epoll_wait();
-                            return IpcServed::Forward;
-                        }
-                    }
-                }
+            match begin_readiness_operation(sched, frame, region, user, op, keep_sigmask) {
+                Begun::Operation(token) => (token, op),
+                Begun::Served(served) => return served,
+                Begun::Rerun => continue,
             }
         };
         match park(
@@ -1531,6 +1554,112 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 finish(sched, token, region);
                 return IpcServed::Forward;
             }
+        }
+    }
+}
+
+/// How [`begin_readiness_operation`] left a readiness wait's operation.
+enum Begun {
+    /// The arena admitted it: park on the readiness lane with this token.
+    Operation(IpcOpToken),
+    /// Served without a readiness park (forwarded, or parked on the arena's
+    /// slot release keeping what the call accepted); the pin is released.
+    Served(IpcServed),
+    /// A slot was released before that park: the pin is released and the
+    /// call builds its wait again.
+    Rerun,
+}
+
+/// Admit a poll-family readiness wait into the operation arena. A full
+/// arena is "not now": the caller parks on its slot release and reruns with
+/// the deadline (and armed mask) it accepted, never forwarding. The
+/// operation's pin is released on every path that does not admit it.
+fn begin_readiness_operation<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
+    region: &IpcRegion<'_>,
+    user: &mut M,
+    op: IpcOperation,
+    keep_sigmask: &mut bool,
+) -> Begun {
+    use carrick_core_abi::wait::AcceptedWait;
+    use carrick_guest_arch::CounterTick;
+    use carrick_sched_core::object_wait::OperationToken;
+    use carrick_sched_core::refusal::Refusal;
+
+    let (replay, key, observed) = match region.begin_operation(op) {
+        Ok(token) => (None, None, Ok(token)),
+        Err(IpcError::NoOperations) => {
+            let zone = sched.zone();
+            let slot = sched.slot();
+            let completion =
+                |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, E::Context>| {
+                    crate::sched::object_wait::deliver_completion(zone, slot, owned)
+                };
+            match admit_operation_wait(region, zone, op, &completion).result {
+                Ok(token) => (None, None, Ok(token)),
+                // SAFETY: the enrollment's key and pre-probe observation go
+                // directly to this lane's scheduler park below; no guard crosses.
+                Err(Refusal::Contended(ticket)) => {
+                    let replay =
+                        OperationToken::metadata_request(region.operation_slot_generation().get())
+                            .unwrap_or_else(|| {
+                                crate::dispatch::invalid_completion(
+                                    crate::dispatch::NativeInvariant::EntryBinding,
+                                )
+                            });
+                    let (replay, key, observed) = unsafe {
+                        ticket.park_and_rerun(replay, |replay, enrollment| {
+                            (replay, enrollment.key(), enrollment.observed())
+                        })
+                    };
+                    (Some(replay), Some(key), Err(Some(observed)))
+                }
+                Err(Refusal::Invariant(_) | Refusal::Guest(_)) => (None, None, Err(None)),
+            }
+        }
+        Err(_) => (None, None, Err(None)),
+    };
+    let observed = match observed {
+        Ok(token) => return Begun::Operation(token),
+        Err(None) => {
+            release_pin(sched, OfdPin::from_raw(op.pin), region);
+            return Begun::Served(IpcServed::Forward);
+        }
+        Err(Some(observed)) => observed,
+    };
+    release_pin(sched, OfdPin::from_raw(op.pin), region);
+    let accepted = AcceptedWait {
+        deadline: op.deadline.get().map(CounterTick::new),
+    };
+    if !user.retain_accepted_epoll_wait(accepted) {
+        return Begun::Served(IpcServed::Forward);
+    }
+    let (Some(replay), Some(key)) = (replay, key) else {
+        let _ = user.take_accepted_epoll_wait();
+        return Begun::Served(IpcServed::Forward);
+    };
+    // SAFETY: observed before the arena probe that found no free slot.
+    let snapshot = unsafe { ObjectStateSnapshot::before_object_probe(observed) };
+    match sched.park(
+        frame,
+        key,
+        snapshot,
+        replay,
+        None,
+        Some(&mut || user.interrupt_pending_wait()),
+    ) {
+        Ok(served) => {
+            *keep_sigmask = true;
+            Begun::Served(served)
+        }
+        Err((ObjectWaitError::Changed, _)) => {
+            let _ = user.take_accepted_epoll_wait();
+            Begun::Rerun
+        }
+        Err(_) => {
+            let _ = user.take_accepted_epoll_wait();
+            Begun::Served(IpcServed::Forward)
         }
     }
 }

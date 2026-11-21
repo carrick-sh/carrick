@@ -14103,26 +14103,46 @@ fn native_arm_pselect6_host_settlement() {
         carrick_kernel::kernel::continuation::ipc::IpcCause::Signal { restart: true },
         carrick_kernel::kernel::continuation::ipc::IpcCause::Stop,
     ] {
-        native_arm_pselect6_handback(Some(cause), false);
+        native_arm_pselect6_handback(Some(cause), false, false);
     }
+}
+
+/// #2621: a multi-descriptor select parks on its transient epoll; the host
+/// settles it through the same owner. A timeout clears both sets, a signal
+/// leaves them and writes the remaining time, a stop with nothing ready
+/// keeps the wait (on the epoll's lane), and a stop after the first pipe's
+/// last writer closed decides that pipe alone from the epoll's harvest.
+#[cfg(test)]
+#[test]
+fn native_arm_pselect6_set_host_settlement() {
+    use carrick_kernel::kernel::continuation::ipc::IpcCause;
+    for cause in [
+        IpcCause::Timeout,
+        IpcCause::Signal { restart: true },
+        IpcCause::Stop,
+    ] {
+        native_arm_pselect6_handback(Some(cause), false, true);
+    }
+    native_arm_pselect6_handback(Some(IpcCause::Stop), true, true);
 }
 
 #[cfg(test)]
 #[test]
 fn native_arm_pselect6_no_slot_wake() {
-    native_arm_pselect6_handback(None, false);
+    native_arm_pselect6_handback(None, false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn native_arm_pselect6_no_slot_wake_reports_eof() {
-    native_arm_pselect6_handback(None, true);
+    native_arm_pselect6_handback(None, true, false);
 }
 
 #[cfg(test)]
 fn native_arm_pselect6_handback(
     cause: Option<carrick_kernel::kernel::continuation::ipc::IpcCause>,
     eof: bool,
+    set: bool,
 ) {
     use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags};
     use carrick_el1_abi::ipc::{
@@ -14193,21 +14213,29 @@ fn native_arm_pselect6_handback(
         carrick_kernel::el1_ipc::HostTable::create(std::sync::Arc::clone(owner), 64, 64).unwrap();
     let object = owner.create_pipe(65_536).unwrap();
     let fd = region.fd(HostIpcWait);
-    for (end, access) in [
-        (End::Reader, AccessMode::ReadOnly),
-        (End::Writer, AccessMode::WriteOnly),
-    ] {
-        fd.open(
-            table.id(),
-            Fd(0),
-            Description::new(
-                IpcBacking::Pipe { object, end }.encode(),
-                access,
-                StatusFlags::default(),
-            ),
-            false,
-        )
-        .unwrap();
+    // A set selects the reader of a second pipe as well: fds 0..=3.
+    let pipes = if set {
+        std::vec![object, owner.create_pipe(65_536).unwrap()]
+    } else {
+        std::vec![object]
+    };
+    for object in pipes {
+        for (end, access) in [
+            (End::Reader, AccessMode::ReadOnly),
+            (End::Writer, AccessMode::WriteOnly),
+        ] {
+            fd.open(
+                table.id(),
+                Fd(0),
+                Description::new(
+                    IpcBacking::Pipe { object, end }.encode(),
+                    access,
+                    StatusFlags::default(),
+                ),
+                false,
+            )
+            .unwrap();
+        }
     }
     let completion = |_: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
         '_,
@@ -14234,13 +14262,15 @@ fn native_arm_pselect6_handback(
     let tables = Box::leak(Box::new(crate::ipc::MapTables(map)));
     let venue = crate::ipc::IpcVenue { region, tables };
 
-    let args = GuestUserBuffer::from_value([1_u64, 5, 0]);
+    // readfds (fd 0, or fds 0 and 2), then a {5 s, 0} timeout.
+    let (nfds, readfds) = if set { (3, 0b101) } else { (1, 1) };
+    let args = GuestUserBuffer::from_value([readfds, 5, 0]);
     let mut frame = carrick_el1_abi::TrapFrame {
         esr: 0x15 << 26,
         elr: 0x4000,
         ..Default::default()
     };
-    frame.x[..6].copy_from_slice(&[1, args.arg(), 0, 0, args.arg() + 8, 0]);
+    frame.x[..6].copy_from_slice(&[nfds, args.arg(), 0, 0, args.arg() + 8, 0]);
     frame.x[8] = carrick_personality_linux::crossing::nr::PSELECT6.raw();
     let mut service = fixture.service();
     let mut entry = fixture
@@ -14346,6 +14376,16 @@ fn native_arm_pselect6_handback(
     );
     let mut memory =
         carrick_kernel::dispatch::LinearMemory::new(args.arg(), args.as_bytes().to_vec());
+    if set {
+        assert!(
+            crate::ipc::readiness_set::transient_epoll(&region, &op, HostIpcWait).is_some(),
+            "a set parks on its transient epoll: {op:?}"
+        );
+        if eof {
+            // The first pipe's last writer: its item is queued on the set.
+            table.close(Fd(1)).unwrap();
+        }
+    }
     let outcome = if let Some(cause) = cause {
         ipc::interrupt(&context, &region, token, op.mm, &mut memory, cause, &clock)
     } else {
@@ -14355,8 +14395,8 @@ fn native_arm_pselect6_handback(
     };
     let expected = match cause {
         Some(IpcCause::Timeout) => (0, [0_u64, 0, 0]),
-        Some(IpcCause::Signal { .. }) => (-4, [1, 4, 0]),
-        None if eof => (1, [1, 4, 0]),
+        Some(IpcCause::Signal { .. }) => (-4, [readfds, 4, 0]),
+        None | Some(IpcCause::Stop) if eof => (1, [1, 4, 0]),
         _ => {
             let Ok(IpcHostOutcome::Blocked {
                 token, deadline, ..
