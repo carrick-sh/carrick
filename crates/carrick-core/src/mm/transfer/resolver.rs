@@ -8,7 +8,9 @@ use core::num::NonZeroU64;
 pub enum CowResolution {
     Resolved,
     NeedsSupply,
-    Refused,
+    /// Left to the forwarding venue. The reason is the classifier's decline
+    /// when one decided; `None` when the venue itself was unavailable.
+    Refused(Option<carrick_core_abi::CowDecline>),
 }
 
 pub trait CowResolver {
@@ -22,7 +24,7 @@ pub trait CowResolver {
         if self.resolve_cow(ttbr0, mm_key, far) {
             CowResolution::Resolved
         } else {
-            CowResolution::Refused
+            CowResolution::Refused(None)
         }
     }
     fn take_cow_completion(&mut self) -> Option<carrick_core_abi::CowGrantCompletion> {

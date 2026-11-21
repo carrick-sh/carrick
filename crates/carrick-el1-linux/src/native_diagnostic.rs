@@ -52,3 +52,37 @@ pub(crate) fn signal_terminal(
         ));
     }
 }
+
+/// The shared fault policy left an owner's fault with no supply selected:
+/// the record names the deciding branch before a signal answers it (#2668).
+/// Failure-only: a selected supply or an owner wait never reaches here.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(never)]
+pub(crate) fn fault_verdict(
+    frame: &carrick_el1_abi::TrapFrame,
+    mm: u64,
+    native: bool,
+    verdict: carrick_el1::fault::FaultVerdict,
+) {
+    emit(format_args!(
+        "fault-verdict esr={:#x} pc={:#x} far={:#x} mm={mm} native={native} code={:#x} verdict={verdict:?}",
+        frame.esr,
+        frame.elr,
+        frame.far,
+        verdict.code(),
+    ));
+}
+
+/// The host refused an owner fault service: the ring answers with SIGSEGV.
+#[inline(never)]
+pub(crate) fn fault_refused(
+    fault: carrick_guest_arch::FaultInfo,
+    task: carrick_sched_core::process::TaskKey,
+) {
+    emit(format_args!(
+        "fault-refused far={:#x} present={} access={:?} {task}",
+        fault.address.raw(),
+        fault.present,
+        fault.access,
+    ));
+}
