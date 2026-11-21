@@ -943,7 +943,7 @@ struct AdoptedExecPredecessor {
 /// The x86 carrier's two typed predecessor-custody phases. Generic quarantine
 /// draining can inspect only `release_permitted`; successful exec-owner
 /// settlement is the sole transition out of `adopted`.
-#[derive(Default)]
+#[derive(::core::default::Default)]
 pub(in crate::cpl0_boot) struct ExecPredecessorCustody {
     adopted: Vec<AdoptedExecPredecessor>,
     release_permitted: Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<()>>,
