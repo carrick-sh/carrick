@@ -47,7 +47,7 @@ use carrick_kernel::kernel::exec_transaction::{
 use carrick_kernel::kernel::identity_page::stamp_identity_page;
 use carrick_kernel::kernel::{FrameInventorySnapshot, Kernel, VmaSummary};
 use carrick_mem::linux_abi::{
-    LINUX_AT_HWCAP, LINUX_AT_HWCAP2, LINUX_AT_NULL, syscall::lookup_aarch64,
+    LINUX_AT_HWCAP2, LINUX_AT_NULL, LinuxAarch64Hwcap, syscall::lookup_aarch64,
 };
 use carrick_mem::memory::{AddressSpace, El1IrqMode, LINUX_EL1_KERNEL_BASE, LINUX_EL1_KERNEL_SIZE};
 use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
@@ -393,10 +393,10 @@ impl Drop for El1ApertureScope {
     }
 }
 
-/// Patch `AT_HWCAP` and `AT_HWCAP2` in the initial stack region to match
-/// [`GUEST_CPU_PROFILE`] so glibc/musl IFUNC resolvers select only instructions
-/// admitted by the soft AArch64 CPU profile, returning the updated auxv bytes.
-fn patch_stack_auxv_hwcaps(image: &mut AddressSpace) -> Result<Vec<u8>, String> {
+/// Patch `AT_HWCAP2` in the initial stack region to match [`GUEST_CPU_PROFILE`]
+/// (`AT_HWCAP` is masked up front via [`AddressSpace::without_auxv_hwcap`]),
+/// returning the serialized auxv bytes.
+fn patch_stack_auxv_hwcap2(image: &mut AddressSpace) -> Result<Vec<u8>, String> {
     let Some(sp) = image.initial_stack_pointer() else {
         return Ok(image.linux_auxv_image().to_vec());
     };
@@ -439,16 +439,13 @@ fn patch_stack_auxv_hwcaps(image: &mut AddressSpace) -> Result<Vec<u8>, String> 
     }
 
     let auxv_start = cursor;
-    let hwcap = GUEST_CPU_PROFILE.hwcap().bits();
     let hwcap2 = GUEST_CPU_PROFILE.hwcap2().bits();
     loop {
         let tag = read_u64_at(bytes, cursor)?;
         let val_off = cursor
             .checked_add(8)
             .ok_or_else(|| "initial stack auxv val offset overflow".to_owned())?;
-        if tag == LINUX_AT_HWCAP {
-            bytes[val_off..val_off + 8].copy_from_slice(&hwcap.to_le_bytes());
-        } else if tag == LINUX_AT_HWCAP2 {
+        if tag == LINUX_AT_HWCAP2 {
             bytes[val_off..val_off + 8].copy_from_slice(&hwcap2.to_le_bytes());
         }
         cursor = cursor
@@ -554,6 +551,7 @@ where
     })
     .map_err(|e| format!("load ELF {}: {e}", config.executable_path))?
     .with_vdso_auxv(false)
+    .without_auxv_hwcap(LinuxAarch64Hwcap::all() - GUEST_CPU_PROFILE.hwcap())
     .with_main_file_path(config.executable_path)
     .with_linux_initial_stack_execfn_page_size(
         &argv,
@@ -563,7 +561,7 @@ where
     )
     .map_err(|e| format!("build initial stack: {e}"))?;
 
-    let auxv_bytes = patch_stack_auxv_hwcaps(&mut image)?;
+    let auxv_bytes = patch_stack_auxv_hwcap2(&mut image)?;
     let image = image
         .with_el0_trampoline()
         .and_then(|img| img.with_el1_vectors_mailbox_clock(true, true, El1IrqMode::Gic))
