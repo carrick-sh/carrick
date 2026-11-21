@@ -11,9 +11,10 @@
  * must park on the pending fork's release (never a fatal fault), and land
  * in the parent only: the fork child still reads the old value.
  *
- * FIRST_TOUCH=1: the worker's write is instead the first touch of a page
- * nobody mapped before the fork, so it takes the owner's first-touch
- * supply, not COW; the fork child reads zero there.
+ * FIRST_TOUCH=1: the data page is instead a second mapping nobody touched
+ * before the fork, so the worker's write takes the owner's first-touch
+ * supply, not COW; the fork child reads zero there. (A first touch of the
+ * shared mapping would not do: its window made all four pages resident.)
  *
  * Exit 7: all of that held. 90: the worker's write did not park; 91: the
  * parent lost the worker's write; 92: the fork child saw it; 100 + n: the
@@ -25,10 +26,8 @@
 #define INJECT_RELEASE_HELD_FORK_COMMIT 0xfffffffffffffe30
 #define POLL_LIMIT                      0x10000000
 #ifdef FIRST_TOUCH
-#define DATA                            0x1000
 #define OLD_VALUE                       0
 #else
-#define DATA                            0x3000
 #define OLD_VALUE                       0x11
 #endif
 #define NEW_VALUE                       0x22
@@ -55,13 +54,28 @@ _start:
      * +0x30: i32 worker result
      * +0x40: timespec join timeout = { 5, 0 }
      * +0x50: i32 fork child wait status
-     * +0x1000: the FIRST_TOUCH data page, untouched before the fork
+     * +0x58: u64 address of the data page
      * +0x3000: the data page, resident before the fork
      */
     movq $5, 0x40(%r12)
     movq $0, 0x48(%r12)
-#ifndef FIRST_TOUCH
-    movq $OLD_VALUE, DATA(%r12)
+#ifdef FIRST_TOUCH
+    /* The data page: its own mapping, untouched until the worker writes. */
+    xor %edi, %edi
+    mov $0x1000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    mov %rax, 0x58(%r12)
+#else
+    lea 0x3000(%r12), %rax
+    mov %rax, 0x58(%r12)
+    movq $OLD_VALUE, (%rax)
 #endif
 
     mov $INJECT_HOLD_NEXT_FORK_COMMIT, %rax
@@ -130,7 +144,8 @@ joined:
     mov 0x30(%r12), %edi
     cmp $22, %edi
     jne die
-    cmpq $NEW_VALUE, DATA(%r12)
+    mov 0x58(%r12), %rcx
+    cmpq $NEW_VALUE, (%rcx)
     jne fail_parent_value
     cmpl $0, 0x50(%r12)
     jne fail_child_value
@@ -145,7 +160,8 @@ fork_errno:
 
 fork_child:
     xor %edi, %edi
-    cmpq $OLD_VALUE, DATA(%r12)
+    mov 0x58(%r12), %rcx
+    cmpq $OLD_VALUE, (%rcx)
     je child_exit
     mov $1, %edi
 child_exit:
@@ -172,7 +188,8 @@ held:
     mov %rax, %r14
 
     /* Write the data page while the fork is pending. */
-    movq $NEW_VALUE, DATA(%r12)
+    mov 0x58(%r12), %rcx
+    movq $NEW_VALUE, (%rcx)
 
     mov $INJECT_WAIT_PARK_CENSUS, %rax
     syscall
