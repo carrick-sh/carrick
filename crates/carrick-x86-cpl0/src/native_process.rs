@@ -543,6 +543,15 @@ impl Service {
             Some(Err(carrick_el1_abi::ForkStockRefusal::Inventory)) => {
                 return Err(abort_published(&mut child, NativeProcessError::Busy));
             }
+            Some(Err(carrick_el1_abi::ForkStockRefusal::Residency)) => {
+                // The carrier published nothing for this fork. Abort the
+                // child first: growth must hold no MM editor or loan.
+                let aborted = abort_published(&mut child, NativeProcessError::Busy);
+                if aborted != NativeProcessError::Busy {
+                    return Err(aborted);
+                }
+                return Err(grow_fork_residency());
+            }
             Some(Err(carrick_el1_abi::ForkStockRefusal::Stale)) => {
                 return Err(abort_published(&mut child, NativeProcessError::Stale));
             }
@@ -557,6 +566,39 @@ impl Service {
             generation: ContextGeneration::new(child.completion().child.incarnation()),
         };
         Ok((child, address))
+    }
+}
+
+/// Grow the shared residency table after the carrier refused a fork for
+/// residency rows. `Busy` reruns the fork against the larger table; a
+/// concurrent grower also means "rerun". Only a growth the metadata
+/// allocator cannot serve ends the fork.
+fn grow_fork_residency() -> NativeProcessError {
+    use carrick_core_abi::mm::residency::ResidencyGrowthRefusal;
+    let Some(venues) =
+        carrick_el1_abi::KernelFaultVenues::derive(carrick_el1::isa::x86_kernel_layout())
+            .and_then(carrick_el1_abi::KernelFaultVenues::require_upper_half)
+    else {
+        return NativeProcessError::Stale;
+    };
+    // SAFETY: boot retains the typed shared residency table.
+    let residency =
+        unsafe { &*(venues.residency.raw() as *const carrick_el1_abi::FrameGrantResidencyTable) };
+    match carrick_core::mm::frames::grow_residency_for_fork(
+        residency,
+        &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+    ) {
+        Ok(()) | Err(ResidencyGrowthRefusal::Publishing) => NativeProcessError::Busy,
+        Err(
+            ResidencyGrowthRefusal::MetadataRequired
+            | ResidencyGrowthRefusal::Full
+            | ResidencyGrowthRefusal::InvalidExtent,
+        ) => refused(
+            NativeForkStage::Reserve,
+            carrick_el1_linux::native_fork_refusal::NativeForkCause::StockReservation(
+                carrick_el1_abi::ForkStockRefusal::Residency,
+            ),
+        ),
     }
 }
 

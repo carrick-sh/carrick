@@ -504,6 +504,51 @@ pub(super) fn release_retired_child<M: CarrierMemoryIo>(
         .map_err(|e| fail(e.to_string()))
 }
 
+/// The residency rows one fork publishes: a one-page row in the parent and
+/// in the child for each inherited page no parent grant window covers, and
+/// one child row per covering window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ForkResidencyDemand {
+    rows: usize,
+}
+
+impl ForkResidencyDemand {
+    fn count<S: carrick_core_abi::mm::residency::FrameGrantResidencyAccess>(
+        residency: &carrick_el1_abi::FrameGrantResidencyTable<S>,
+        parent_mm: u64,
+        pages: impl Iterator<Item = u64>,
+    ) -> Self {
+        let mut windows = std::collections::BTreeSet::new();
+        let mut uncovered = 0usize;
+        for va in pages {
+            match residency.lookup(parent_mm, va) {
+                Some(page) => {
+                    windows.insert(page.identity.semantic_base);
+                }
+                None => uncovered += 1,
+            }
+        }
+        Self {
+            rows: uncovered.saturating_mul(2).saturating_add(windows.len()),
+        }
+    }
+
+    /// Admit only when the table stays at most half full with this fork's
+    /// rows. `try_publish` gives up after a bounded probe chain in every
+    /// segment, and measured chains fill at 80% occupancy (#2655), so a
+    /// fuller table would refuse part-way through the fork.
+    fn admitted<S: carrick_core_abi::mm::residency::FrameGrantResidencyAccess>(
+        self,
+        residency: &carrick_el1_abi::FrameGrantResidencyTable<S>,
+    ) -> bool {
+        residency
+            .observed_slots_used()
+            .saturating_add(self.rows)
+            .saturating_mul(2)
+            <= residency.slot_capacity()
+    }
+}
+
 fn rollback_fork_parent_residency<S: carrick_core_abi::mm::residency::FrameGrantResidencyAccess>(
     residency: &carrick_el1_abi::FrameGrantResidencyTable<S>,
     publications: &[(usize, carrick_el1_abi::FrameGrantResidencyIdentity)],
@@ -1377,6 +1422,28 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             }
                             rows.insert(identity.mapping_id, row);
                         }
+                        // Residency admission, before the first carrier side
+                        // effect: a table that cannot hold this fork's rows
+                        // refuses "not now" and the guest grows it.
+                        {
+                            let resolved_residency = resolve_cpl0_residency(&vm).map_err(|e| {
+                                trap_error = Some(e);
+                                ForkStockRefusal::Inventory
+                            })?;
+                            let residency = resolved_residency.view().ok_or_else(|| {
+                                trap_error = Some(fail("physical fork residency view"));
+                                ForkStockRefusal::Inventory
+                            })?;
+                            if !ForkResidencyDemand::count(
+                                &residency,
+                                execution.context.mm.raw().get(),
+                                edges.iter().map(|edge| edge.span().va),
+                            )
+                            .admitted(&residency)
+                            {
+                                return Err(ForkStockRefusal::Residency);
+                            }
+                        }
                         let capacity = FrameEventCapacity::for_event_count(
                             rows.len().checked_mul(2).ok_or_else(|| {
                                 trap_error = Some(fail("physical fork inventory capacity"));
@@ -1493,11 +1560,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                                 },
                             );
                             if parent.is_none() {
-                                let slot = residency.publish(resident).ok_or_else(|| {
-                                    trap_error =
-                                        Some(fail("physical fork source residency capacity"));
-                                    ForkStockRefusal::Inventory
-                                })?;
+                                // A probe chain can fill below the admitted
+                                // load. The rows published so far roll back
+                                // below, and the guest grows the table.
+                                let slot = residency
+                                    .publish(resident)
+                                    .ok_or(ForkStockRefusal::Residency)?;
                                 parent_residency.push((slot, resident));
                                 let page = residency
                                     .lookup(resident.mm_key, edge.span().va)
@@ -1517,11 +1585,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             resident.owner_generation = identity.owner_generation.get();
                             resident.inventory_revision = identity.inventory_revision.get();
                             if resident_windows.insert(resident.semantic_base) {
-                                residency.publish(resident).ok_or_else(|| {
-                                    trap_error =
-                                        Some(fail("physical fork child residency capacity"));
-                                    ForkStockRefusal::Inventory
-                                })?;
+                                residency
+                                    .publish(resident)
+                                    .ok_or(ForkStockRefusal::Residency)?;
                             }
                             let page = residency
                                 .lookup(resident.mm_key, edge.span().va)
@@ -3476,6 +3542,52 @@ mod custody_tests {
         };
         assert!(!exact_cow_receipt(alias, 0x401000, source, &alias_receipt));
     }
+    /// #2655: a fork near the measured `go` shape (3,081 inherited pages
+    /// outside grant windows, 2,006 inside them) needs two rows per outside
+    /// page and one per covering window. One segment refuses it.
+    #[test]
+    fn fork_residency_demand_counts_both_sides_and_admits_at_half_load() {
+        let mut storage = Box::<carrick_el1_abi::FrameGrantResidencyTable>::new_uninit();
+        // SAFETY: typed allocation supplies the complete table's alignment and size.
+        let residency = unsafe {
+            carrick_el1_abi::FrameGrantResidencyTable::init_in_place(storage.as_mut_ptr());
+            storage.assume_init()
+        };
+        let parent = 4u64;
+        let window = |index: u64| carrick_el1_abi::FrameGrantResidencyIdentity {
+            mm_key: parent,
+            semantic_base: 0x4000_0000 + index * 0x20_0000,
+            physical_ipa: 0x1_0000_0000 + index * 0x20_0000,
+            len: 0x20_0000,
+            mapping_id: 100 + index,
+            frame_id: 100 + index,
+            owner_generation: 1,
+            inventory_revision: 1,
+        };
+        for index in 0..15 {
+            residency.publish(window(index)).unwrap();
+        }
+        // 2,006 pages inside the 15 windows, then 3,081 pages outside any.
+        let covered = (0..2006u64).map(|page| 0x4000_0000 + page * 4096);
+        let uncovered = (0..3081u64).map(|page| 0x40_0000 + page * 4096);
+        let demand = ForkResidencyDemand::count(&residency, parent, covered.chain(uncovered));
+        // 2,006 pages span windows 0..=3 only: four child window rows.
+        assert_eq!(demand.rows, 2 * 3081 + 4);
+        assert!(!demand.admitted(&residency));
+        // Another MM's rows never count as this parent's coverage.
+        assert_eq!(
+            ForkResidencyDemand::count(&residency, parent + 1, [0x4000_0000].into_iter()).rows,
+            2
+        );
+        let empty = ForkResidencyDemand::count(&residency, parent, core::iter::empty());
+        assert_eq!(empty.rows, 0);
+        assert!(empty.admitted(&residency));
+        // Exactly half full admits; one more row does not.
+        let half = carrick_el1_abi::FRAME_GRANT_RESIDENCY_SLOTS / 2 - 15;
+        assert!(ForkResidencyDemand { rows: half }.admitted(&residency));
+        assert!(!ForkResidencyDemand { rows: half + 1 }.admitted(&residency));
+    }
+
     #[test]
     fn refused_fork_retires_only_its_new_parent_residency_rows() {
         let mut storage = Box::<carrick_el1_abi::FrameGrantResidencyTable>::new_uninit();

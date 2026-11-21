@@ -872,6 +872,9 @@ pub struct ForkStockCounters {
     pub invalid_refusals: u64,
     /// Loans refused because the issued lifecycle record was not cold.
     pub inventory_refusals: u64,
+    /// Reservations refused because the residency table could not hold the
+    /// fork's rows; the guest grows the table and reruns the fork.
+    pub residency_refusals: u64,
     /// Children retired into quarantine.
     pub quarantined_children: u64,
     /// Child retirements refused with a typed reply (stock stays charged).
@@ -901,6 +904,7 @@ impl ForkStockCounters {
             ("stale_refusal", self.stale_refusals),
             ("invalid_refusal", self.invalid_refusals),
             ("inventory_refusal", self.inventory_refusals),
+            ("residency_refusal", self.residency_refusals),
             ("withdrawn_lifecycle", self.withdrawn_lifecycles),
             ("quarantined_child", self.quarantined_children),
             ("retire_refusal", self.retire_refusals),
@@ -2369,6 +2373,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             ForkStockRefusal::Stale => &mut self.counters.stale_refusals,
             ForkStockRefusal::Invalid => &mut self.counters.invalid_refusals,
             ForkStockRefusal::Inventory => &mut self.counters.inventory_refusals,
+            ForkStockRefusal::Residency => &mut self.counters.residency_refusals,
         };
         *counter = counter.saturating_add(1);
         exchange.refuse(refusal);
@@ -2385,6 +2390,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             ForkStockRefusal::Stale => &mut self.counters.stale_refusals,
             ForkStockRefusal::Invalid => &mut self.counters.invalid_refusals,
             ForkStockRefusal::Inventory => &mut self.counters.inventory_refusals,
+            ForkStockRefusal::Residency => &mut self.counters.residency_refusals,
         };
         *counter = counter.saturating_add(1);
         settlement.refuse(refusal);
