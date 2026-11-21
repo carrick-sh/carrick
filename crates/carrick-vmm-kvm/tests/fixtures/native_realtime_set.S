@@ -8,6 +8,12 @@
  * a served set must move every later read, including the root's after the
  * child's step. Exit values: 8 success, 38 ENOSYS, 91 malformed, 93 a read
  * returned another wall clock, 100+errno settime refused otherwise.
+ *
+ * With -DREQUIRE_UNSERVED=1 the fixture characterises today's x86 lane
+ * (#2700): clock_settime(CLOCK_REALTIME) and settimeofday must both return
+ * ENOSYS in the root and the child, and every ring read must stay on TARGET.
+ * Exit 97 means a set was served: the ring realtime word must then be
+ * re-published by that set, and the unserved witness is obsolete.
  */
 #define TARGET 4102444800
 #define YEAR 31536000
@@ -63,11 +69,28 @@ set_realtime:
     syscall
     cmp $-38, %rax
     je settime_unserved
+#ifdef REQUIRE_UNSERVED
+    test %rax, %rax
+    jz settime_served
+#endif
     test %rax, %rax
     jnz settime_refused
     mov %r14, %r13
     ret
 settime_unserved:
+#ifdef REQUIRE_UNSERVED
+    /* settimeofday({r13 + YEAR, 0}, NULL) is the same container change. */
+    xor %esi, %esi
+    lea sample(%rip), %rdi
+    mov %r14, sample(%rip)
+    movq $0, sample+8(%rip)
+    mov $164, %eax
+    syscall
+    test %rax, %rax
+    jz settime_served
+    cmp $-38, %rax
+    jne settime_refused
+#endif
     mov %r13, %r14
     ret
 
@@ -122,6 +145,9 @@ raw_realtime:
     ja failure
     ret
 
+settime_served:
+    mov $97, %edi
+    jmp exit
 settime_refused:
     neg %eax
     lea 100(%rax), %edi

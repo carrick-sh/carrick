@@ -418,27 +418,68 @@ fn serial_host_native_root_and_child_realtime_survive_an_unmapped_vvar() {
 /// later read, including the root's after the child's step.
 #[test]
 fn serial_host_native_root_and_child_realtime_follow_clock_settime() {
-    const TEST: &str = "serial_host_native_root_and_child_realtime_follow_clock_settime";
+    let Some(exit) = run_bounded_realtime_set_witness(
+        "serial_host_native_root_and_child_realtime_follow_clock_settime",
+        &[],
+    ) else {
+        return;
+    };
+    assert_eq!(
+        exit, 8,
+        "realtime after the domain moved (93 means a ring read kept the load-time wall clock)"
+    );
+}
+
+/// Characterises today's x86 lane (#2700): a root and a native fork child
+/// calling `clock_settime(CLOCK_REALTIME)` (227) and `settimeofday` (164)
+/// both get ENOSYS, and no ring realtime read moves off the container clock.
+/// While no guest can set the clock, a stale ring REALTIME word after a set
+/// cannot be observed; the publish guard is `ClockDomain`'s single writer
+/// (`clock_changes_republish_the_x86_zone_realtime_word`). Exit 97 means a
+/// set was served: serve-side republication then needs its own witness.
+#[test]
+fn serial_host_native_root_and_child_clock_settime_and_settimeofday_are_unserved() {
+    let Some(exit) = run_bounded_realtime_set_witness(
+        "serial_host_native_root_and_child_clock_settime_and_settimeofday_are_unserved",
+        &["-DREQUIRE_UNSERVED=1"],
+    ) else {
+        return;
+    };
+    assert_ne!(
+        exit, 97,
+        "x86 now serves a guest clock set: the ring realtime word must follow it (#2618 P0-1)"
+    );
+    assert_eq!(
+        exit, 8,
+        "both sets ENOSYS and every ring read on the container clock (93 stale, 100+errno refused)"
+    );
+}
+
+/// Run `native_realtime_set.S` with `flags` in a bounded child test process,
+/// with the container clock moved to the fixture's TARGET before load.
+/// Returns the guest exit code inside the child process, for the caller's
+/// assertions, and `None` in the parent once that child passed.
+fn run_bounded_realtime_set_witness(test: &str, flags: &[&str]) -> Option<i32> {
     const CHILD: &str = "CARRICK_SETTIME_WITNESS_CHILD";
-    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
         let output = std::process::Command::new("timeout")
             .args(["--kill-after=1", "15"])
             .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-            .env(CHILD, TEST)
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test)
             .output()
             .expect("bounded native settime witness");
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
             "bounded child witness: {:?}\n{}\n{}",
             output.status,
-            String::from_utf8_lossy(&output.stdout),
+            stdout,
             String::from_utf8_lossy(&output.stderr),
         );
-        return;
+        return None;
     }
-    let elf = native_exit_fixture_with_flags("native_realtime_set.S", &[]);
+    let elf = native_exit_fixture_with_flags("native_realtime_set.S", flags);
     let program = carrick_mem::elf::ElfProgram::load(&elf, ELF_X86_64_MACHINE, &|_| None)
         .expect("ELF program");
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
@@ -463,12 +504,9 @@ fn serial_host_native_root_and_child_realtime_follow_clock_settime() {
     )
     .map_err(|failure| failure.error)
     .expect("settime witness run");
-    assert_eq!(
-        outcome.run.exit_code, 8,
-        "realtime after the domain moved (93 means a ring read kept the load-time wall clock)"
-    );
     assert!(outcome.run.stdout.is_empty());
     assert!(outcome.run.stderr.is_empty());
+    Some(outcome.run.exit_code)
 }
 
 #[test]
