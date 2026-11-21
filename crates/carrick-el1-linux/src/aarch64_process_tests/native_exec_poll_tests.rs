@@ -57,10 +57,27 @@ impl Drop for UnregisterRoot {
     }
 }
 
+fn wfi_kick_bell() -> &'static (std::sync::Mutex<u64>, std::sync::Condvar) {
+    static BELL: std::sync::OnceLock<(std::sync::Mutex<u64>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    BELL.get_or_init(|| {
+        let pair = (std::sync::Mutex::new(0u64), std::sync::Condvar::new());
+        carrick_kernel::el1_zone::register_slot_kicker(Box::new(|_| {
+            if let Some((lock, cvar)) = BELL.get() {
+                let mut epoch = lock.lock().unwrap();
+                *epoch = epoch.wrapping_add(1);
+                cvar.notify_all();
+            }
+        }));
+        pair
+    })
+}
+
 struct ArmWfiCpu<'a> {
     inner: crate::sched::FakeCpu,
     fixture: &'static Fixture,
     service: &'a mut Aarch64NativeProcessService<'static, &'static TestStockCrossing>,
+    on_wfi: &'a mut Option<Box<dyn FnOnce()>>,
     deadline: Instant,
     timed_out_in_wfi: bool,
 }
@@ -140,18 +157,24 @@ impl crate::sched::ThreadCpu for ArmWfiCpu<'_> {
             self.inner.now = self.inner.now.max(cval);
             return;
         }
+        if let Some(trigger) = self.on_wfi.take() {
+            trigger();
+        }
+        let (lock, cvar) = wfi_kick_bell();
+        let mut guard = lock.lock().unwrap();
         while !self.fixture.task.linux.has_pending_host_work()
             && self.fixture.zone.slot(self.fixture.slot).queued() == 0
             && !self.fixture.zone.head_needs_host(self.fixture.slot)
         {
-            if Instant::now() >= self.deadline {
+            let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
                 self.timed_out_in_wfi = true;
                 // Force Sched::idle to unwind cleanly so the assertion below
                 // reports the exact stranded service_notice state.
                 self.fixture.task.linux.mark_pending_host_work();
                 return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
+            };
+            let (next_guard, _) = cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
         }
     }
 
@@ -559,73 +582,77 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
         }
     };
 
-    let run_idle_until_child_or_parent =
-        |round: usize, frame: &mut carrick_el1_abi::TrapFrame| -> bool {
-            loop {
-                let mut arm_service = Aarch64NativeProcessService::with_crossing(
-                    &fixture.task,
-                    fixture.slot,
-                    fixture.zone,
-                    fixture.region.table(),
-                    NonZeroU64::MIN,
-                    crossing,
-                )
-                .with_words(words);
-                let mut cpu = ArmWfiCpu {
-                    inner: crate::sched::FakeCpu {
-                        ttbr: (0x9000, 0x9000),
-                        ..Default::default()
-                    },
-                    fixture,
-                    service: &mut arm_service,
-                    deadline,
-                    timed_out_in_wfi: false,
+    let run_idle_until_child_or_parent = |round: usize,
+                                          frame: &mut carrick_el1_abi::TrapFrame,
+                                          on_wfi: &mut Option<Box<dyn FnOnce()>>|
+     -> bool {
+        loop {
+            let mut arm_service = Aarch64NativeProcessService::with_crossing(
+                &fixture.task,
+                fixture.slot,
+                fixture.zone,
+                fixture.region.table(),
+                NonZeroU64::MIN,
+                crossing,
+            )
+            .with_words(words);
+            let mut cpu = ArmWfiCpu {
+                inner: crate::sched::FakeCpu {
+                    ttbr: (0x9000, 0x9000),
+                    ..Default::default()
+                },
+                fixture,
+                service: &mut arm_service,
+                on_wfi,
+                deadline,
+                timed_out_in_wfi: false,
+            };
+            let action = {
+                let mut sched = crate::sched::Sched {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                    task: &fixture.task,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                    counters,
+                    handoff: None,
                 };
-                let action = {
-                    let mut sched = crate::sched::Sched {
-                        zone: fixture.zone,
-                        slot: fixture.slot,
-                        task: &fixture.task,
-                        cpu: &mut cpu,
-                        user: &crate::sched::HardwareUserWord,
-                        counters,
-                        handoff: None,
-                    };
-                    sched.serve_idle_entry(frame)
-                };
-                if cpu.timed_out_in_wfi {
-                    let stranded = fixture.task.service_notice.take().unwrap();
-                    panic!(
-                        "ARM vCPU hung in WFI before 2s deadline at poll round {round}: \
+                sched.serve_idle_entry(frame)
+            };
+            if cpu.timed_out_in_wfi {
+                let stranded = fixture.task.service_notice.take().unwrap();
+                panic!(
+                    "ARM vCPU hung in WFI before 2s deadline at poll round {round}: \
                          stranded_service_notice={stranded:?}"
-                    );
-                }
-                match action {
-                    carrick_el1_abi::Action::Served => return true,
-                    carrick_el1_abi::Action::Idle => {
-                        drain_carrier_service(round);
-                        if fixture.zone.head_needs_host(fixture.slot) {
-                            return false;
-                        }
-                    }
-                    other => panic!("unexpected idle_entry action {other:?} at round {round}"),
-                }
+                );
             }
-        };
+            match action {
+                carrick_el1_abi::Action::Served => return true,
+                carrick_el1_abi::Action::Idle => {
+                    drain_carrier_service(round);
+                    if fixture.zone.head_needs_host(fixture.slot) {
+                        return false;
+                    }
+                }
+                other => panic!("unexpected idle_entry action {other:?} at round {round}"),
+            }
+        }
+    };
 
     let mut frame = carrick_el1_abi::TrapFrame {
         slot: fixture.slot.index() as u64,
         ..Default::default()
     };
     assert!(
-        run_idle_until_child_or_parent(0, &mut frame),
+        run_idle_until_child_or_parent(0, &mut frame, &mut None),
         "exec successor must be scheduled first"
     );
 
     let child_host_call = |round: usize,
                            frame: &mut carrick_el1_abi::TrapFrame,
                            nr: u64,
-                           args: [u64; 6]|
+                           args: [u64; 6],
+                           mut on_wfi: Option<Box<dyn FnOnce()>>|
      -> i64 {
         frame.esr = 0x15 << 26;
         frame.elr = 0x400004;
@@ -713,7 +740,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
                     crate::dispatch::native_service_idle(fixture.zone, fixture.slot, &mut fake_cpu);
                 drain_carrier_service(round);
                 assert!(
-                    run_idle_until_child_or_parent(round, frame),
+                    run_idle_until_child_or_parent(round, frame, &mut on_wfi),
                     "child must resume from syscall {nr} at round {round}"
                 );
                 frame.x[0] as i64
@@ -736,7 +763,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
     user.as_mut_bytes()[16..20].copy_from_slice(&16u32.to_ne_bytes());
 
     // AArch64 numbers: socket=198, bind=200, getsockname=204, recvfrom=207, ppoll=73, exit=93
-    let sock_fd = child_host_call(0, &mut frame, 198, [2, 2, 0, 0, 0, 0]);
+    let sock_fd = child_host_call(0, &mut frame, 198, [2, 2, 0, 0, 0, 0], None);
     assert!(
         sock_fd >= 0,
         "socket(AF_INET, SOCK_DGRAM, 0) failed: {sock_fd}"
@@ -746,7 +773,8 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
             0,
             &mut frame,
             200,
-            [sock_fd as u64, user.arg(), 16, 0, 0, 0]
+            [sock_fd as u64, user.arg(), 16, 0, 0, 0],
+            None,
         ),
         0,
         "bind(127.0.0.1:0) must succeed"
@@ -756,7 +784,8 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
             0,
             &mut frame,
             204,
-            [sock_fd as u64, user.arg(), user.arg() + 16, 0, 0, 0]
+            [sock_fd as u64, user.arg(), user.arg() + 16, 0, 0, 0],
+            None,
         ),
         0,
         "getsockname must succeed"
@@ -778,13 +807,12 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
         user.as_mut_bytes()[36..38].copy_from_slice(&(libc::POLLIN as i16).to_ne_bytes());
         user.as_mut_bytes()[38..40].copy_from_slice(&0x7fff_i16.to_ne_bytes());
 
-        let writer = sender.as_ref().map(|tx| {
+        let on_wfi: Option<Box<dyn FnOnce()>> = sender.as_ref().map(|tx| {
             let tx = tx.try_clone().unwrap();
             let byte = [b'A' + (round as u8 % 26)];
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(10));
+            Box::new(move || {
                 tx.send_to(&byte, ("127.0.0.1", bound_port)).unwrap();
-            })
+            }) as Box<dyn FnOnce()>
         });
 
         let ready = child_host_call(
@@ -792,10 +820,8 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
             &mut frame,
             73,
             [user.arg() + 32, 1, user.arg() + 48, 0, 8, 0],
+            on_wfi,
         );
-        if let Some(handle) = writer {
-            handle.join().unwrap();
-        }
 
         let revents = i16::from_ne_bytes(user.as_bytes()[38..40].try_into().unwrap());
         if become_ready {
@@ -811,6 +837,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
                 &mut frame,
                 207,
                 [sock_fd as u64, user.arg() + 64, 1, 0, 0, 0],
+                None,
             );
             assert_eq!(got, 1, "round {round}: recvfrom must drain one byte");
             assert_eq!(user.as_bytes()[64], b'A' + (round as u8 % 26));
@@ -895,7 +922,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
     // `Sched::serve_idle_entry` switches the parent in, resumes its `wait4`
     // checkpoint in ring, and returns `Action::Served` with the reaped child.
     assert!(
-        run_idle_until_child_or_parent(POLL_ROUNDS, &mut frame),
+        run_idle_until_child_or_parent(POLL_ROUNDS, &mut frame, &mut None),
         "idle entry must resume the woken parent in wait4(-1)"
     );
     assert_eq!(
