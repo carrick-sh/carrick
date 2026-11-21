@@ -2259,6 +2259,72 @@ fn composed_native_supply_with_prepared(
         assert_ne!(leaf(words, root, neighbor), 0);
         assert_eq!(leaf(words, root, fault_page), 0);
         assert!(residency.lookup(identity.mm, neighbor).is_none());
+        // A sibling's first touch while a fork publication is in flight:
+        // the fork owns the transfer sequence until it publishes, so the
+        // fault waits on PendingEdit instead of losing the supply (#2581).
+        {
+            let index = access.find(identity.mm).unwrap();
+            let mut root = fixture
+                .region
+                .table()
+                .lock_in(access, index.index(), handle.mm(), 7)
+                .unwrap();
+            let request = carrick_el1_abi::PortalForkRequest {
+                operation: carrick_el1_abi::PortalOperation {
+                    carrier: portal.carrier().unwrap(),
+                    mm: handle.mm(),
+                    incarnation: NonZeroU64::new(root.incarnation().raw()).unwrap(),
+                    sequence: root.next_transfer_sequence().unwrap(),
+                },
+                parent_generation: root.generation(),
+                child_mm: ReservationMm::new(handle.mm().raw() + 1).unwrap(),
+                child_tables: carrick_el1_abi::PortalForkTableArena::new(0x800000, 0x200000)
+                    .unwrap(),
+                parent_tables: carrick_el1_abi::PortalForkTableArena::new(0xa00000, 0x200000)
+                    .unwrap(),
+                kernel_control_ipa: 0xc00000,
+            };
+            root.begin_fork_publication(request).unwrap();
+            drop(root);
+            let forking = OwnerFaultSupply::new(portal).with_handle(handle);
+            assert_eq!(
+                carrick_el1::fault::dispatch_fault_with_prepared(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    access,
+                    crate::cow_resolver::native_fault_supply(
+                        true,
+                        carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                        &forking,
+                    ),
+                    Some(carrick_el1::fault::PreparedFaultPath {
+                        residency,
+                        resolver: &mut SelectionWords(words),
+                        roots: Some(fixture.region.table()),
+                        file_slots: Some(portal),
+                    }),
+                    &mut resolver,
+                ),
+                carrick_el1_abi::Action::Forward
+            );
+            let OwnerFaultSupplyOutcome::Wait(wait) = forking.outcome() else {
+                panic!(
+                    "first touch during a fork lost its producer: {:?}",
+                    forking.outcome()
+                );
+            };
+            assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::PendingEdit);
+            assert_eq!(wait.handle(), handle);
+            assert!(!portal.grant(0).unwrap().has_outstanding_for(identity.mm));
+            let mut root = fixture
+                .region
+                .table()
+                .lock_in(access, index.index(), handle.mm(), 7)
+                .unwrap();
+            root.finish_fork_publication(request.operation).unwrap();
+            root.clear_fork_origin();
+        }
         assert_eq!(
             carrick_el1::fault::dispatch_fault_with_prepared(
                 &mut frame,
@@ -2355,6 +2421,7 @@ fn composed_native_supply_with_prepared(
         carrick_el1_abi::PortalWaitCause::Editor,
         carrick_el1_abi::PortalWaitCause::Reservations,
         carrick_el1_abi::PortalWaitCause::Gate,
+        carrick_el1_abi::PortalWaitCause::PendingEdit,
     ] {
         for release_before_enroll in [true, false] {
             let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
@@ -2376,6 +2443,33 @@ fn composed_native_supply_with_prepared(
             if cause == carrick_el1_abi::PortalWaitCause::Gate {
                 access.raise(index);
             }
+            // A fork publication in flight owns this MM's transfer sequence
+            // between root holds; its finish releases PendingEdit (#2581).
+            let fork = (cause == carrick_el1_abi::PortalWaitCause::PendingEdit).then(|| {
+                let mut root = fixture
+                    .region
+                    .table()
+                    .lock_in(access, index.index(), handle.mm(), 7)
+                    .unwrap();
+                let request = carrick_el1_abi::PortalForkRequest {
+                    operation: carrick_el1_abi::PortalOperation {
+                        carrier: portal.carrier().unwrap(),
+                        mm: handle.mm(),
+                        incarnation: NonZeroU64::new(root.incarnation().raw()).unwrap(),
+                        sequence: root.next_transfer_sequence().unwrap(),
+                    },
+                    parent_generation: root.generation(),
+                    child_mm: ReservationMm::new(handle.mm().raw() + 1).unwrap(),
+                    child_tables: carrick_el1_abi::PortalForkTableArena::new(0x800000, 0x200000)
+                        .unwrap(),
+                    parent_tables: carrick_el1_abi::PortalForkTableArena::new(0xa00000, 0x200000)
+                        .unwrap(),
+                    kernel_control_ipa: 0xc00000,
+                };
+                root.begin_fork_publication(request).unwrap();
+                assert!(root.fork_pending());
+                request
+            });
             let busy = OwnerFaultSupply::new(portal).with_handle(handle);
             assert_eq!(
                 carrick_el1::fault::dispatch_fault_with_prepared(
@@ -2403,9 +2497,19 @@ fn composed_native_supply_with_prepared(
             };
             assert_eq!(wait.cause(), cause);
             assert_eq!(wait.handle(), handle);
+            let mut fork = fork;
             let mut release = || {
                 drop(held_editor.take());
                 drop(held_root.take());
+                if let Some(request) = fork.take() {
+                    let mut root = fixture
+                        .region
+                        .table()
+                        .lock_in(access, index.index(), handle.mm(), 7)
+                        .unwrap();
+                    root.finish_fork_publication(request.operation).unwrap();
+                    root.clear_fork_origin();
+                }
                 if cause == carrick_el1_abi::PortalWaitCause::Gate {
                     access.lower(index);
                 }

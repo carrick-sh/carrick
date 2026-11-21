@@ -169,6 +169,15 @@ fn prepare_table_candidates(stock: &[RootGpa]) -> Vec<SubstrateGpa> {
         .collect()
 }
 
+/// What preparing an owner-selected window produced.
+pub(super) enum BackingPreparation {
+    /// Submitted (`Some`), or left pending for its backing-fault signal.
+    Prepared(Option<Box<PendingPrepare>>),
+    /// The read-only plan met another CPU's publication in the selected
+    /// window (the shared policy's inherited-Prepared or MM-release decline).
+    Raced(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
+}
+
 pub(super) struct PendingPrepare {
     peer: crate::cpl0_private_witness::PeerActivity,
     window: PortalGrantWindow,
@@ -2246,10 +2255,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // SAFETY: the carrier retains this initialized slot across staging.
         let reply = unsafe { &*reply };
         match self.prepare_native_backing_grant(execution, window, file, reply)? {
-            Ok(pending) => self.anonymous_pending[index] = pending.map(PendingGrant::Prepare),
-            // Another CPU holds this MM's editor: the selection is returned
-            // unserved and its member parks on that editor's release.
-            Err(_wait) => {
+            Ok(BackingPreparation::Prepared(pending)) => {
+                self.anonymous_pending[index] =
+                    pending.map(|pending| PendingGrant::Prepare(*pending));
+            }
+            // Another CPU holds this MM's editor, or published into this
+            // window after its selection: the selection is returned unserved
+            // and its member reruns the access after that editor's release.
+            Ok(BackingPreparation::Raced(_)) | Err(_) => {
                 if !reply.cancel_fault_selection(window, generation) {
                     return Err(fail("contended owner fault selection changed"));
                 }
@@ -2474,7 +2487,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         window: PortalGrantWindow,
         file: Option<FileSupply>,
         reply: &carrick_el1_abi::PortalGrantSlot,
-    ) -> Result<Result<Option<PendingPrepare>, carrick_core_abi::PortalOwnerWait>, TrapError> {
+    ) -> Result<Result<BackingPreparation, carrick_core_abi::PortalOwnerWait>, TrapError> {
         let ram = Arc::clone(&self.ram);
         let zone = retained_cow_zone(&ram)?;
         let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
@@ -2540,7 +2553,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         window: PortalGrantWindow,
         file: Option<FileSupply>,
         reply: &carrick_el1_abi::PortalGrantSlot,
-    ) -> Result<Option<PendingPrepare>, TrapError> {
+    ) -> Result<BackingPreparation, TrapError> {
         let index = execution.cpu.raw() as usize;
         let context = execution.context;
         let mm = context.mm.raw();
@@ -2591,7 +2604,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             // Leave the authenticated selection pending. The guest observes
             // no backing reply, cancels this exact selection and delivers its
             // normal backing-fault signal; EOF is not a carrier invariant.
-            return Ok(None);
+            return Ok(BackingPreparation::Prepared(None));
         }
         let root = context.root;
         let gpa = self.anonymous_next_gpa;
@@ -2658,7 +2671,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             tables: TableGrants::new(&tables).ok_or_else(|| fail("owner table grant encoding"))?,
         };
         let ram = Arc::clone(&self.ram);
-        let demand = (|| -> Result<usize, TrapError> {
+        let demand = (|| -> Result<
+            Result<usize, carrick_mmu_core::descriptor_refusal::DescriptorRefusal>,
+            TrapError,
+        > {
             let zone = retained_cow_zone(&ram)?;
             let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
             let delivery = |zone: &X86Cpl0Zone,
@@ -2679,16 +2695,41 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             )?;
             let planned = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
                 self._vm.admit_guest_edit(native).map_err(|error| fail(error.to_string()))?;
-                carrick_mmu_core::x86::descriptor_txn::plan_descriptor_txn(&self._vm.words(), native, root)
-                    .map(|plan| plan.tables_linked)
-                    .map_err(|error| fail(format!("owner grant physical table plan refused: {error:?}; cpu={} mm={} root={:#x} window_va={:#x} window_len={:#x} available_tables={}", execution.cpu.raw(), mm, root.address().raw(), window.range.start(), len, tables.len())))
+                Ok(carrick_mmu_core::x86::descriptor_txn::plan_descriptor_txn(&self._vm.words(), native, root)
+                    .map(|plan| plan.tables_linked))
             }).map_err(|error| fail(format!("owner grant table plan projection: {error:?}")));
             drop(pause);
             wake.finish()?;
             planned?
         })();
         let required = match demand {
-            Ok(required) => required,
+            Ok(Ok(required)) => required,
+            Ok(Err(refusal)) => {
+                // Neither the read-only planner nor the release venue made
+                // this fresh backing guest-visible.
+                unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
+                    .map_err(|error| fail(error.to_string()))?;
+                use carrick_core::mm::frames::{PublicationDecline, PublicationNotNow};
+                return match PublicationDecline::from_descriptor(refusal) {
+                    // The other CPU published into this window after it was
+                    // selected: the selection is stale, not the MM. Its
+                    // member reruns the access, whose reselection finds the
+                    // published or inherited-Prepared output.
+                    PublicationDecline::InheritedPrepared
+                    | PublicationDecline::NotNow(PublicationNotNow::MmRelease) => {
+                        Ok(BackingPreparation::Raced(refusal))
+                    }
+                    _ => Err(fail(format!(
+                        "owner grant physical table plan refused: {refusal:?}; cpu={} mm={} root={:#x} window_va={:#x} window_len={:#x} available_tables={}",
+                        execution.cpu.raw(),
+                        mm,
+                        root.address().raw(),
+                        window.range.start(),
+                        len,
+                        tables.len()
+                    ))),
+                };
+            }
             Err(error) => {
                 // Neither the read-only planner nor the release venue made
                 // this fresh backing guest-visible.
@@ -2760,15 +2801,19 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // if the carrier never receives a verifiable completion. Keep physical
         // custody through carrier teardown rather than rolling inventory back.
         inventory.guest_exposed = true;
-        Ok(Some(PendingPrepare {
-            peer: crate::cpl0_private_witness::PeerActivity::observe(&self.actual_run[1 - index]),
-            window,
-            txn,
-            inventory,
-            handle,
-            execution,
-            owner,
-        }))
+        Ok(BackingPreparation::Prepared(Some(Box::new(
+            PendingPrepare {
+                peer: crate::cpl0_private_witness::PeerActivity::observe(
+                    &self.actual_run[1 - index],
+                ),
+                window,
+                txn,
+                inventory,
+                handle,
+                execution,
+                owner,
+            },
+        ))))
     }
 }
 

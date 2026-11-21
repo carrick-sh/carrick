@@ -1204,7 +1204,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
     /// The idle peer's guest wait. It owns no host task lease; see
     /// [`Self::service_syscall_trap`] for what it may serve.
     fn run_idle_lane(&mut self) -> Result<GuestIdleExit, TrapError> {
-        if !self.physical.is_idle_peer_slot() {
+        if !self.physical.is_idle_peer_slot() || self.completion_sent {
             return Ok(GuestIdleExit::Unsupported);
         }
         match self.physical.run_idle_peer()? {
@@ -1268,6 +1268,29 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 Ok(GuestIdleExit::Idle(SettledIdleSlot::admit(
                     self.zone_slot(),
                 )?))
+            }
+            CarrierRunExit::FaultDoorbellWord(first) => {
+                let lane_exited = self
+                    .idle_exits
+                    .fetch_add(1, Ordering::AcqRel)
+                    .checked_add(1)
+                    .ok_or_else(|| TrapError::Hypervisor("KVM exit count overflow".into()))?;
+                if lane_exited > self.max_idle_exits {
+                    return Err(TrapError::Hypervisor(
+                        "idle KVM lane guest exit budget exceeded".into(),
+                    ));
+                }
+                let exited = self
+                    .total_exits
+                    .fetch_add(1, Ordering::AcqRel)
+                    .checked_add(1)
+                    .ok_or_else(|| TrapError::Hypervisor("KVM total exit count overflow".into()))?;
+                let record = self.physical.capture_idle_peer_fault_record(first)?;
+                self.publish_exit(InitialProcessExit::Fault {
+                    record,
+                    exits: exited,
+                })?;
+                Ok(GuestIdleExit::Unsupported)
             }
             CarrierRunExit::Halt => Ok(GuestIdleExit::Unsupported),
             // The production CPL0 lane exposes no zone slot to the host yet,

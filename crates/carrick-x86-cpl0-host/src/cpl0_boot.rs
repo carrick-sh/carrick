@@ -2520,14 +2520,40 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             };
             words.push(word);
         }
-        let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&words)?;
+        self.finish_captured_fault_record(slot, &words)
+    }
+
+    pub fn capture_idle_peer_fault_record(
+        &mut self,
+        first: u32,
+    ) -> Result<carrick_x86::FaultDoorbellRecord, TrapError> {
+        self.cpu.audit_unloaded_peer()?;
+        let mut words = vec![first];
+        while words.len() < carrick_x86::X86_FAULT_RECORD_U32_WORDS {
+            let crate::carrier_cpu::CarrierRunExit::FaultDoorbellWord(word) =
+                self.cpu.run_idle_peer()?
+            else {
+                return Err(fail("fault record interrupted"));
+            };
+            words.push(word);
+        }
+        self.finish_captured_fault_record(carrick_guest_arch::CpuId::new(1), &words)
+    }
+
+    fn finish_captured_fault_record(
+        &self,
+        slot: carrick_guest_arch::CpuId,
+        words: &[u32],
+    ) -> Result<carrick_x86::FaultDoorbellRecord, TrapError> {
+        let record = carrick_x86::FaultDoorbellRecord::from_u32_words(words)?;
         let custody = self
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
         let reason = custody.binding(slot).fault_reason.load(Ordering::Acquire);
-        if carrick_el1_abi::X86FaultDisposition::from_raw(reason)
-            != Some(carrick_el1_abi::X86FaultDisposition::PolicyDeclined)
+        if record.vector == 14
+            && carrick_el1_abi::X86FaultDisposition::from_raw(reason)
+                != Some(carrick_el1_abi::X86FaultDisposition::PolicyDeclined)
         {
             return Err(fail(format!(
                 "kernel fault policy refused: reason {reason}, {record:?}"

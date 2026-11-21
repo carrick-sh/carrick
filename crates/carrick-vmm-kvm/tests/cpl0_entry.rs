@@ -4303,6 +4303,37 @@ fn production_fork_waits_while_sibling_fork_holds_birth_reservation() {
     );
 }
 
+/// #2581: the leader's fork is held after its parent root is published
+/// fork-pending and write-protected, before its commit, while the worker
+/// thread on the other CPU writes a page the fork protected, as Go's
+/// goroutines do around a `fork/exec`. Contention is "not now": the write
+/// parks on the fork publication's release and reruns, never failing with
+/// `kernel fault policy refused: reason 9`; it lands in the parent only.
+/// The worker's park releases the held fork.
+#[test]
+fn production_sibling_write_waits_while_fork_publication_is_pending() {
+    bounded_contention_witness(
+        "production_sibling_write_waits_while_fork_publication_is_pending",
+        "native_fork_pending_cow_contention.S",
+        &[],
+        "sibling write under a pending fork publication",
+    );
+}
+
+/// #2581: as above, but the worker's write is the first touch of a page
+/// nobody mapped before the fork, so it takes the owner's first-touch
+/// supply instead of COW. That supply needs the transfer sequence the
+/// pending fork owns: the write parks on the fork's release and reruns.
+#[test]
+fn production_sibling_first_touch_waits_while_fork_publication_is_pending() {
+    bounded_contention_witness(
+        "production_sibling_first_touch_waits_while_fork_publication_is_pending",
+        "native_fork_pending_cow_contention.S",
+        &["-DFIRST_TOUCH=1"],
+        "sibling first touch under a pending fork publication",
+    );
+}
+
 fn legacy_syscalls_run(flags: &[&str], expected: &[u8], expected_refusals: &[(usize, u64)]) {
     let work = tempfile::tempdir().expect("legacy syscall test directory");
     std::fs::write(work.path().join("file"), b"file").expect("regular file");
@@ -4421,6 +4452,671 @@ fn two_live_threads_selected_window_busy_loser_refaults_and_completes() {
     assert_eq!(
         outcome.run.exit_code, 7,
         "the Busy loser must settle its submitted window before parking: {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+fn compile_static_gas_witness(asm: &str) -> Vec<u8> {
+    let dir = tempfile::tempdir().expect("tempdir for x86 gas witness");
+    let src = dir.path().join("witness.S");
+    let out = dir.path().join("witness");
+    std::fs::write(&src, asm).expect("write witness.S");
+    let compiled = std::process::Command::new("timeout")
+        .args([
+            "10",
+            "cc",
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-Wl,--build-id=none",
+        ])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("compile x86 gas witness");
+    assert!(
+        compiled.status.success(),
+        "assemble failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    std::fs::read(&out).expect("read compiled ELF")
+}
+
+/// #2581: a hardware user #PF on the root MM's lazy anonymous mapping must
+/// enrol on the admitted MM's release queue when the reservation root or
+/// space editor is contended, preserve all user GPRs (including RAX/RCX/R11)
+/// and RIP across the park, consume its metadata wait token on resume so a
+/// subsequent park on the same thread succeeds, and never fail with
+/// `kernel fault policy refused: reason 9`.
+#[test]
+fn production_root_user_fault_busy_once_parks_and_completes() {
+    let asm = r#"
+.global _start
+.text
+_start:
+    /* mmap(NULL, 0x400000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) */
+    xor %edi, %edi
+    mov $0x400000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    mov %rax, %r12
+
+    /* Baseline park census -> %r13 */
+    mov $-493, %rax /* INJECT_WAIT_PARK_CENSUS */
+    syscall
+    mov %rax, %r13
+
+    /* 1. Arm INJECT_ROOT_BUSY_ONCE (-496) before first-touch #PF on block 0. */
+    mov $-496, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_arm_root
+
+    movabs $0x1122334455667788, %rax
+    movabs $0x99aabbccddeeff00, %rcx
+    movabs $0x13579bdf2468ace0, %r11
+    movq $0x5a5a5a5a, (%r12)
+
+    movabs $0x1122334455667788, %rdx
+    cmp %rdx, %rax
+    jne fail_rax_root
+    movabs $0x99aabbccddeeff00, %rdx
+    cmp %rdx, %rcx
+    jne fail_rcx_root
+    movabs $0x13579bdf2468ace0, %rdx
+    cmp %rdx, %r11
+    jne fail_r11_root
+    cmpq $0x5a5a5a5a, (%r12)
+    jne fail_val_root
+
+    mov $-493, %rax /* INJECT_WAIT_PARK_CENSUS */
+    syscall
+    lea 1(%r13), %rdx
+    cmp %rdx, %rax
+    jne fail_census_root
+
+    /* 2. Arm INJECT_EDITOR_BUSY_ONCE (-495) before first-touch #PF on block 1.
+     * Exercises a second fault park on the same thread, proving the first
+     * park consumed its metadata operation token.
+     */
+    mov $-495, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_arm_editor
+
+    movabs $0xfeedfacecafebeef, %rax
+    movq $0x6b6b6b6b, 0x200000(%r12)
+
+    movabs $0xfeedfacecafebeef, %rdx
+    cmp %rdx, %rax
+    jne fail_rax_editor
+    cmpq $0x6b6b6b6b, 0x200000(%r12)
+    jne fail_val_editor
+
+    mov $-493, %rax /* INJECT_WAIT_PARK_CENSUS */
+    syscall
+    lea 2(%r13), %rdx
+    cmp %rdx, %rax
+    jne fail_census_editor
+
+    mov $7, %edi
+    jmp die
+
+fail_mmap:          mov $90, %edi; jmp die
+fail_arm_root:      mov $91, %edi; jmp die
+fail_rax_root:      mov $92, %edi; jmp die
+fail_rcx_root:      mov $93, %edi; jmp die
+fail_r11_root:      mov $94, %edi; jmp die
+fail_val_root:      mov $95, %edi; jmp die
+fail_census_root:   mov $96, %edi; jmp die
+fail_arm_editor:    mov $97, %edi; jmp die
+fail_rax_editor:    mov $98, %edi; jmp die
+fail_val_editor:    mov $99, %edi; jmp die
+fail_census_editor: mov $100, %edi; jmp die
+
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let elf = compile_static_gas_witness(asm);
+    let outcome = run_instrumented_pool_fixture(&elf, 32);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "root user #PF contention must park once and resume intact: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome.physical.refusal_overflow_count().unwrap(),
+        0,
+        "test injection must not enter production refusal accounting"
+    );
+}
+
+/// #2581: two live threads sharing the root MM concurrently first-touch the
+/// same and adjacent anonymous pages across 8 lazy 2 MiB grant blocks, then
+/// synchronize via CLONE_CHILD_CLEARTID + futex_wait and exit cleanly.
+#[test]
+fn two_live_threads_concurrent_root_first_touch_and_futex_complete() {
+    let asm = r#"
+.global _start
+.text
+_start:
+    /* Control + worker stack region: 0x4000 bytes RW anonymous. */
+    xor %edi, %edi
+    mov $0x4000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_ctrl_mmap
+    mov %rax, %r12
+
+    /* Pre-fault control + worker stack pages before starting the race. */
+    movq $0, 0x0000(%r12)
+    movq $0, 0x1000(%r12)
+    movq $0, 0x2000(%r12)
+    movq $0, 0x3000(%r12)
+    /* Join timeout = { 5, 0 } at 0x20(%r12). */
+    movq $5, 0x20(%r12)
+    movq $0, 0x28(%r12)
+
+    /* Lazy 16 MiB anonymous arena (8 x 2 MiB grant windows), untouched. */
+    xor %edi, %edi
+    mov $0x01000000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_arena_mmap
+    mov %rax, %r13
+
+    /* Clone sibling worker thread (CLONE_VM..CLONE_CHILD_CLEARTID|SETTID). */
+    mov $0x013d0f00, %edi
+    lea 0x3ff0(%r12), %rsi
+    mov %r12, %rdx
+    mov %r12, %r10
+    lea 0x100(%r12), %r8
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js fail_clone
+    jz worker_entry
+
+    /* Synchronize with sibling on barrier at 0x08(%r12) so both CPUs fault together. */
+    lock incl 0x08(%r12)
+1:
+    cmpl $2, 0x08(%r12)
+    je 2f
+    pause
+    jmp 1b
+2:
+    xor %ecx, %ecx
+leader_block_loop:
+    cmp $8, %ecx
+    je leader_join
+    mov %rcx, %rax
+    shl $21, %rax
+    add %r13, %rax
+
+    /* Shared pages touched concurrently with worker via atomic add. */
+    lock addq $1, 0x0000(%rax)
+    movq $0xaaaa, 0x1000(%rax)
+    lock addq $1, 0x2000(%rax)
+    lock addq $1, 0x4000(%rax)
+    movq $0xaaaa, 0x5000(%rax)
+    lock addq $1, 0x6000(%rax)
+
+    inc %ecx
+    jmp leader_block_loop
+
+leader_join:
+    mov (%r12), %edx
+    test %edx, %edx
+    jz verify_arena
+    mov %r12, %rdi
+    xor %esi, %esi /* FUTEX_WAIT */
+    lea 0x20(%r12), %r10
+    mov $202, %eax
+    syscall
+    cmp $-110, %rax
+    je fail_join_timeout
+    jmp leader_join
+
+verify_arena:
+    cmpq $77, 0x10(%r12)
+    jne fail_worker_status
+
+    xor %ecx, %ecx
+verify_loop:
+    cmp $8, %ecx
+    je success
+    mov %rcx, %rax
+    shl $21, %rax
+    add %r13, %rax
+
+    cmpq $0x10001, 0x0000(%rax)
+    jne fail_verify_shared
+    cmpq $0xaaaa, 0x1000(%rax)
+    jne fail_verify_leader
+    cmpq $0x10001, 0x2000(%rax)
+    jne fail_verify_shared
+    cmpq $0xbbbb, 0x3000(%rax)
+    jne fail_verify_worker
+    cmpq $0x10001, 0x4000(%rax)
+    jne fail_verify_shared
+    cmpq $0xaaaa, 0x5000(%rax)
+    jne fail_verify_leader
+    cmpq $0x10001, 0x6000(%rax)
+    jne fail_verify_shared
+    cmpq $0xbbbb, 0x7000(%rax)
+    jne fail_verify_worker
+
+    inc %ecx
+    jmp verify_loop
+
+success:
+    mov $7, %edi
+    jmp die
+
+worker_entry:
+    lock incl 0x08(%r12)
+3:
+    cmpl $2, 0x08(%r12)
+    je 4f
+    pause
+    jmp 3b
+4:
+    xor %ecx, %ecx
+worker_block_loop:
+    cmp $8, %ecx
+    je worker_done
+    mov %rcx, %rax
+    shl $21, %rax
+    add %r13, %rax
+
+    lock addq $0x10000, 0x0000(%rax)
+    lock addq $0x10000, 0x2000(%rax)
+    movq $0xbbbb, 0x3000(%rax)
+    lock addq $0x10000, 0x4000(%rax)
+    lock addq $0x10000, 0x6000(%rax)
+    movq $0xbbbb, 0x7000(%rax)
+
+    inc %ecx
+    jmp worker_block_loop
+
+worker_done:
+    movq $77, 0x10(%r12)
+    xor %edi, %edi
+    mov $60, %eax /* raw SYS_exit on non-last thread */
+    syscall
+    ud2
+
+fail_ctrl_mmap:     mov $81, %edi; jmp die
+fail_arena_mmap:    mov $82, %edi; jmp die
+fail_clone:         mov $83, %edi; jmp die
+fail_join_timeout:  mov $84, %edi; jmp die
+fail_worker_status: mov $85, %edi; jmp die
+fail_verify_shared: mov $86, %edi; jmp die
+fail_verify_leader: mov $87, %edi; jmp die
+fail_verify_worker: mov $88, %edi; jmp die
+
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let elf = compile_static_gas_witness(asm);
+    let outcome = run_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "concurrent two-thread root first-touch failed: {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+}
+
+/// #2581: a fault doorbell raised on the idle CPL0 peer (CPU 1) while CPU 0 is
+/// parked in guest wait must capture the 15-word `FaultDoorbellRecord` and
+/// publish `InitialProcessExit::Fault` rather than failing with
+/// `idle CPL0 peer needs a host task handback: FaultDoorbellWord(...)`.
+#[test]
+fn idle_peer_user_fault_doorbell_publishes_fault_record() {
+    let asm = r#"
+.global _start
+.text
+_start:
+    xor %edi, %edi
+    mov $0x3000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    mov %rax, %r12
+
+    movq $0, 0x0000(%r12)
+    movq $0, 0x1000(%r12)
+    movq $0, 0x2000(%r12)
+    movq $5, 0x20(%r12)
+    movq $0, 0x28(%r12)
+
+    /* Clone sibling thread onto idle peer (CPU 1). */
+    mov $0x013d0f00, %edi
+    lea 0x2ff0(%r12), %rsi
+    mov %r12, %rdx
+    mov %r12, %r10
+    lea 0x100(%r12), %r8
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js fail_clone
+    jz sibling_fault
+
+    /* Park leader on CPU 0 in FUTEX_WAIT so sibling runs on idle peer CPU 1. */
+1:
+    mov (%r12), %edx
+    test %edx, %edx
+    jz fail_joined
+    mov %r12, %rdi
+    xor %esi, %esi
+    lea 0x20(%r12), %r10
+    mov $202, %eax
+    syscall
+    jmp 1b
+
+sibling_fault:
+    /* Trigger hardware #UD (vector 6 -> FAULT_DOORBELL_PORT) on idle peer. */
+    ud2
+
+fail_mmap:   mov $91, %edi; jmp die
+fail_clone:  mov $92, %edi; jmp die
+fail_joined: mov $93, %edi; jmp die
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let elf = compile_static_gas_witness(asm);
+    let outcome = run_pool_fixture(&elf, 32);
+    assert_eq!(outcome.run.terminating_signal, Some(libc::SIGILL));
+    assert_eq!(outcome.run.exit_code, 128 + libc::SIGILL);
+    let record = outcome
+        .fault_record
+        .expect("idle peer fault doorbell must publish FaultDoorbellRecord");
+    assert_eq!(record.vector, 6);
+    assert_eq!(record.cs & 3, 3);
+}
+
+/// #2660: a woken member whose MM's Gate (the host's exclusion) refuses its
+/// install in `schedule` is "not now": it parks on the Gate's release and
+/// resumes exactly as the refused switch-in would have, never requeued to
+/// poll the gate. Two live threads; the gate is raised once on each case:
+/// 1. a pipe read woken with its adapter operation still pending, which must
+///    return the written word;
+/// 2. a futex wait woken with its result (0), which must return it.
+///
+/// The injected gate is lowered through the MM's release venue once the
+/// refused record parks on it, or once a scheduler pass finds it requeued
+/// (a poll, counted). Busy once, then success: the census must show both
+/// raises, both parks, and no poll.
+#[test]
+fn production_schedule_gate_refusal_parks_and_resumes_the_woken_wait() {
+    let asm = r#"
+.global _start
+.text
+_start:
+    /* Control + worker stack: 0x4000 bytes RW anonymous. */
+    xor %edi, %edi
+    mov $0x4000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    mov %rax, %r12
+    movq $0, 0x0000(%r12)
+    movq $0, 0x1000(%r12)
+    movq $0, 0x2000(%r12)
+    movq $0, 0x3000(%r12)
+    /* Join timeout = { 5, 0 } at 0x20(%r12). */
+    movq $5, 0x20(%r12)
+    movq $0, 0x28(%r12)
+
+    /* pipe2(0x40(%r12), 0): read end at 0x40, write end at 0x44. */
+    lea 0x40(%r12), %rdi
+    xor %esi, %esi
+    mov $293, %eax
+    syscall
+    test %rax, %rax
+    jnz fail_pipe
+
+    /* Clone the worker thread (CLONE_VM..CLONE_CHILD_CLEARTID|SETTID). */
+    mov $0x013d0f00, %edi
+    lea 0x3ff0(%r12), %rsi
+    mov %r12, %rdx
+    mov %r12, %r10
+    lea 0x100(%r12), %r8
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js fail_clone
+    jz worker
+
+    /* 1. Arm the gate for this member's next switch-in with a pending
+     *    adapter operation, then block in the pipe read. */
+    mov $-446, %rax /* INJECT_GATE_AT_NEXT_OPERATION_SWITCH_IN */
+    syscall
+    test %rax, %rax
+    jnz fail_arm_operation
+    movl $1, 0x30(%r12)
+    mov 0x40(%r12), %edi
+    lea 0x50(%r12), %rsi
+    mov $8, %edx
+    xor %eax, %eax
+    syscall
+    cmp $8, %rax
+    jne fail_read
+    movabs $0x1122334455667788, %rdx
+    cmp %rdx, 0x50(%r12)
+    jne fail_read_value
+
+    /* 2. Arm the gate for this member's next switch-in with a wake result,
+     *    then block in FUTEX_WAIT on 0x38(%r12) == 0. */
+    mov $-445, %rax /* INJECT_GATE_AT_NEXT_RESULT_SWITCH_IN */
+    syscall
+    test %rax, %rax
+    jnz fail_arm_result
+    movl $1, 0x34(%r12)
+futex_wait_loop:
+    lea 0x38(%r12), %rdi
+    xor %esi, %esi /* FUTEX_WAIT */
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $202, %eax
+    syscall
+    cmpl $0, 0x38(%r12)
+    je futex_wait_loop
+    test %rax, %rax
+    jnz fail_futex_result
+
+    /* Join the worker. */
+leader_join:
+    mov (%r12), %edx
+    test %edx, %edx
+    jz census
+    mov %r12, %rdi
+    xor %esi, %esi /* FUTEX_WAIT */
+    lea 0x20(%r12), %r10
+    mov $202, %eax
+    syscall
+    cmp $-110, %rax
+    je fail_join_timeout
+    jmp leader_join
+
+census:
+    cmpq $77, 0x10(%r12)
+    jne fail_worker
+    mov $-444, %rax /* INJECT_GATE_CENSUS */
+    syscall
+    /* raises = 2, polls = 0, parks = 2 */
+    movabs $0x0000000200000002, %rdx
+    cmp %rdx, %rax
+    jne fail_census
+    mov $7, %edi
+    jmp die
+
+worker:
+    /* Every wait for the leader yields its CPU (the leader, CPU 0's root
+     * thread, may run only there) and is bounded: a leader that never parks
+     * or runs fails the run with its claim (INJECT_GATE_TARGET_STATE). */
+    /* 1. Once the leader is parked in its read, write the word. */
+    mov $0x100000, %r15
+1:
+    dec %r15
+    jz worker_timeout
+    cmpl $1, 0x30(%r12)
+    je 2f
+    mov $24, %eax /* sched_yield */
+    syscall
+    jmp 1b
+2:
+    dec %r15
+    jz worker_timeout
+    mov $-443, %rax /* INJECT_GATE_TARGET_PARKED */
+    syscall
+    test %rax, %rax
+    jnz 3f
+    mov $24, %eax /* sched_yield */
+    syscall
+    jmp 2b
+3:
+    movabs $0x1122334455667788, %rax
+    mov %rax, 0x58(%r12)
+    mov 0x44(%r12), %edi
+    lea 0x58(%r12), %rsi
+    mov $8, %edx
+    mov $1, %eax
+    syscall
+    cmp $8, %rax
+    jne worker_fail
+
+    /* 2. Once the leader is parked in its futex wait, wake it. */
+    mov $0x100000, %r15
+4:
+    dec %r15
+    jz worker_timeout
+    cmpl $1, 0x34(%r12)
+    je 5f
+    mov $24, %eax /* sched_yield */
+    syscall
+    jmp 4b
+5:
+    dec %r15
+    jz worker_timeout
+    mov $-443, %rax /* INJECT_GATE_TARGET_PARKED */
+    syscall
+    test %rax, %rax
+    jnz 6f
+    mov $24, %eax /* sched_yield */
+    syscall
+    jmp 5b
+6:
+    movl $1, 0x38(%r12)
+    lea 0x38(%r12), %rdi
+    mov $1, %esi /* FUTEX_WAKE */
+    mov $1, %edx
+    mov $202, %eax
+    syscall
+    cmp $1, %rax
+    jne worker_fail
+    movq $77, 0x10(%r12)
+worker_fail:
+    xor %edi, %edi
+    mov $60, %eax /* raw SYS_exit on a non-last thread */
+    syscall
+    ud2
+worker_timeout:
+    mov $-442, %rax /* INJECT_GATE_TARGET_STATE */
+    syscall
+    mov %eax, %edi
+    jmp die
+
+fail_mmap:          mov $80, %edi; jmp die
+fail_pipe:          mov $81, %edi; jmp die
+fail_clone:         mov $82, %edi; jmp die
+fail_arm_operation: mov $83, %edi; jmp die
+fail_read:          mov $84, %edi; jmp die
+fail_read_value:    mov $85, %edi; jmp die
+fail_arm_result:    mov $86, %edi; jmp die
+fail_futex_result:  mov $87, %edi; jmp die
+fail_join_timeout:  mov $88, %edi; jmp die
+fail_worker:        mov $89, %edi; jmp die
+fail_census:
+    /* 100 + polls: a requeued (polling) refusal is 101 or 102. */
+    shr $16, %rax
+    and $0xffff, %eax
+    lea 100(%rax), %edi
+    jmp die
+
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let elf = compile_static_gas_witness(asm);
+    let outcome = run_instrumented_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "a gate-refused switch-in must park on the gate's release and resume \
+         its woken wait (exit 101/102: it polled the gate instead; 128 and \
+         up: the worker's bounded wait for it ran out): {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// #2660: the busy-loser race with both CPUs faulting in the window at once.
+/// The sibling's in-guest first touch may publish a page of the loser's
+/// applied span before the loser's settlement crossing reads it, and the
+/// carrier's exclusions raise the MM's Gate while the other CPU schedules a
+/// record: neither may be a carrier or guest fatal.
+#[test]
+fn two_live_threads_fault_one_window_while_its_busy_loser_settles() {
+    let elf = kvm_pool_fixture::assemble_fixture("native_selected_busy_race.S", &[]);
+    let outcome = run_instrumented_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "both CPUs must complete their faults in the contended window: {:?}",
         outcome.run
     );
     assert_eq!(outcome.run.terminating_signal, None);

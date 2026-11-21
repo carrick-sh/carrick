@@ -2,6 +2,7 @@
 
 #![cfg(all(target_os = "none", target_arch = "x86_64"))]
 
+use carrick_core::wait::RetainedDeferral;
 use carrick_el1::isa::x86::{self, context};
 use carrick_guest_arch::MmuBackend;
 use carrick_sched_core::SlotId;
@@ -27,14 +28,18 @@ pub fn schedule(slot: SlotId) -> ! {
     crate::test_support::signal_parked_member(source, current);
     #[cfg(feature = "test-support")]
     crate::test_support::release_birth_on_park(source);
+    #[cfg(feature = "test-support")]
+    crate::test_support::release_fork_commit_on_park(source);
     settle_current_work(current);
-    loop {
+    'schedule: loop {
         #[cfg(feature = "test-support")]
         crate::test_support::hold_idle_scan(slot);
         #[cfg(feature = "test-support")]
         if crate::test_support::peer_release_pending(slot) {
             crate::anonymous::release_injected_edit_wait(source, current);
         }
+        #[cfg(feature = "test-support")]
+        crate::test_support::lower_injected_gate(source, slot);
         expire_timers(slot);
         // Drain any APIC timer or reschedule vector latched while IF was masked
         // on the outgoing thread before selecting and preparing the next one;
@@ -53,15 +58,29 @@ pub fn schedule(slot: SlotId) -> ! {
                 continue;
             };
             let identity = source.zone.record(selected.record).identity();
+            #[cfg(feature = "test-support")]
+            crate::test_support::raise_gate_at_switch_in(
+                source,
+                selected,
+                state.address.mm.raw().get(),
+            );
             // Resuming the MM already installed here needs no detour through
             // the maintenance root (the context install reloads CR3 once).
-            if source.zone.installed_space(slot) != state.address.mm.raw().get() {
+            let mm_raw = state.address.mm.raw().get();
+            if source.zone.installed_space(slot) != mm_raw {
                 leave_space(source);
             }
-            source
-                .zone
-                .install_space(slot, state.address.mm.raw().get())
-                .unwrap_or_else(|| fatal_boot());
+            // A raised Gate (the host's exclusion of this MM) refuses the
+            // install: this is "not now". The record's wait is already over,
+            // so it parks on the Gate's release keeping everything it resumes
+            // with, and its next switch-in resumes as this one would have.
+            while source.zone.install_space(slot, mm_raw).is_none() {
+                match park_on_gate(source, slot, selected.record, mm_raw) {
+                    RetainedDeferral::Parked => continue 'schedule,
+                    RetainedDeferral::Rerun => {}
+                    RetainedDeferral::Refused => fatal_boot(),
+                }
+            }
             settle_current_work(current);
             current.set(
                 carrick_el1_abi::El1TaskId::from_linux_tid(
@@ -390,4 +409,39 @@ fn ticks(backend: &mut x86::X86Backend, ns: u64) -> u64 {
         .raw()
         .get();
     u64::try_from(u128::from(hz) * u128::from(ns) / 1_000_000_000).unwrap_or(u64::MAX)
+}
+
+/// Park the record switched in on `slot` on its MM's Gate release. Only a
+/// raised gate refuses a published entry's install; any other refusal (a
+/// closed, re-keyed or rootless entry) is a broken invariant.
+#[inline(never)]
+fn park_on_gate(
+    source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+    slot: SlotId,
+    record: carrick_sched_core::RecordId,
+    mm: u64,
+) -> RetainedDeferral {
+    let zone = source.zone;
+    let Some(index) = zone.spaces.find(mm) else {
+        fatal_boot();
+    };
+    let gate_raised = || zone.spaces.gate(index) != 0;
+    if !gate_raised() && zone.spaces.installed_grant(index, mm).is_none() {
+        fatal_boot();
+    }
+    let Some(lease) = core::num::NonZeroU64::new(mm)
+        .and_then(|key| zone.space_entry(key))
+        .and_then(|entry| entry.live_notifications().ok())
+    else {
+        fatal_boot();
+    };
+    carrick_core::wait::defer_switched_in_record(
+        zone,
+        slot,
+        &lease,
+        carrick_sched_core::spaces::notification::SpaceWaitCause::Gate,
+        record,
+        &|effects| native_process::release(zone, carrick_sched_core::Waker::El1 { slot }, effects),
+        gate_raised,
+    )
 }
