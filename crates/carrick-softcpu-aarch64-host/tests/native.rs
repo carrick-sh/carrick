@@ -608,3 +608,260 @@ fn native_simd_block_preserves_callee_saved_host_simd() {
     assert_eq!(host_d8, u64::from_le_bytes([0x73; 8]));
     assert_eq!(region[index].vectors[8], u128::from_le_bytes([0xa5; 16]));
 }
+
+/// Execute a fixed test leaf directly, bypassing the guest translator.
+/// Each caller supplies words that access only its aligned frame and
+/// preserve the AAPCS64 callee-owned state.
+fn native_leaf(words: &[u32], frame: &mut [u128]) {
+    let code: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let mut jit = JitCodeBuffer::new(code.len()).unwrap();
+    let entry = jit.publish(&code).unwrap();
+    // SAFETY: the fixed instruction leaves obey the calling convention and
+    // stay within the supplied frame. The entry is live until the call ends.
+    let call = unsafe { std::mem::transmute::<usize, extern "C" fn(*mut u128)>(entry as usize) };
+    call(frame.as_mut_ptr());
+}
+
+#[test]
+fn el0_fp_and_simd_families_match_native() {
+    fn compare(name: &str, word: u32, input: [u128; 2]) {
+        let mut native = [input[0], input[1], 0];
+        native_leaf(
+            &[
+                0xaa00_03e8, // mov x8, x0
+                0xad40_0500, // ldp q0, q1, [x8]
+                0xd53b_4409, // mrs x9, fpcr
+                0xd53b_442a, // mrs x10, fpsr
+                0xd51b_441f, // msr fpcr, xzr
+                0xd51b_443f, // msr fpsr, xzr
+                0xd51b_421f, // msr nzcv, xzr
+                0xaa1f_03e0, // mov x0, xzr
+                word,
+                0x3d80_0100, // str q0, [x8]
+                0xd53b_4201, // mrs x1, nzcv
+                0xa902_0500, // stp x0, x1, [x8, #32]
+                0xd51b_4409, // msr fpcr, x9
+                0xd51b_442a, // msr fpsr, x10
+                0xd65f_03c0, // ret
+            ],
+            &mut native,
+        );
+        let mut memory = Flat::default();
+        memory.put_words(CODE, &[word]);
+        let mut cpu = CpuState::default();
+        cpu.pc = ProgramCounter(CODE);
+        cpu.vectors[..2].copy_from_slice(&input);
+        let (report, _) = run_at(&mut cpu, &mut memory);
+        assert_eq!(report.stop, Stop::Fetch(VirtualAddress(CODE + 4)), "{name}");
+        assert_eq!(report.blocks, 1, "{name}");
+        assert_eq!(cpu.vectors[0], native[0], "{name}");
+        assert_eq!(x(&cpu, 0), native[2] as u64, "{name}");
+        assert_eq!(
+            u64::from(cpu.pstate.nzcv) << 28,
+            (native[2] >> 64) as u64,
+            "{name}"
+        );
+    }
+
+    let floats = [1.5f64.to_bits() as u128, 2.0f64.to_bits() as u128];
+    compare("fadd d0, d0, d1", 0x1e61_2800, floats);
+    compare("fcvtzs x0, d0", 0x9e78_0000, floats);
+    compare("fcmp d0, d1", 0x1e61_2000, floats);
+    compare("fadd v0.2d, v0.2d, v1.2d", 0x4e61_d400, floats);
+
+    let bytes = [
+        u128::from_le_bytes(core::array::from_fn(|i| (i + 50) as u8)),
+        u128::from_le_bytes(core::array::from_fn(|i| (15 - i) as u8)),
+    ];
+    compare("add v0.16b, v0.16b, v1.16b", 0x4e21_8400, bytes);
+    compare("zip1 v0.16b, v0.16b, v1.16b", 0x4e01_3800, bytes);
+    compare("tbl v0.16b, {v0.16b}, v1.16b", 0x4e01_0000, bytes);
+}
+
+#[test]
+fn el0_fp_status_survives_an_exit_and_host_controls_are_preserved() {
+    fn host_controls() -> u128 {
+        let mut snapshot = [0];
+        native_leaf(
+            &[0xd53b_4401, 0xd53b_4422, 0xa900_0801, 0xd65f_03c0],
+            &mut snapshot,
+        );
+        snapshot[0]
+    }
+
+    let mut memory = Flat::default();
+    // FDIV D0,D0,D1; ISB; MRS X0,FPSR; MRS X1,FPCR
+    memory.put_words(CODE, &[0x1e61_1800, 0xd503_3fdf, 0xd53b_4420, 0xd53b_4401]);
+    let mut cpu = CpuState::default();
+    cpu.pc = ProgramCounter(CODE);
+    cpu.vectors[0] = 1.0f64.to_bits() as u128;
+    cpu.named.fpcr = SystemValue(1 << 22); // round toward positive infinity
+    let before = host_controls();
+    let (report, _) = run_at(&mut cpu, &mut memory);
+    assert_eq!(host_controls(), before);
+    assert_eq!(
+        report.stop,
+        Stop::Fetch(VirtualAddress(CODE + 16)),
+        "{report}"
+    );
+    assert_eq!(x(&cpu, 0), 2); // DZC, with division-by-zero trap disabled
+    assert_eq!(x(&cpu, 1), 1 << 22);
+    assert_eq!(cpu.vectors[0] as u64, f64::INFINITY.to_bits());
+
+    // 1.0 + 2^-53 is halfway between two doubles. Guest RMode=+Inf
+    // changes the arithmetic result relative to the default ties-to-even.
+    let mut memory = Flat::default();
+    memory.put_words(CODE, &[0x1e61_2800]); // fadd d0, d0, d1
+    cpu.pc = ProgramCounter(CODE);
+    cpu.vectors[0] = 1.0f64.to_bits() as u128;
+    cpu.vectors[1] = (1023u128 - 53) << 52; // 2^-53
+    let (report, _) = run_at(&mut cpu, &mut memory);
+    assert_eq!(report.stop, Stop::Fetch(VirtualAddress(CODE + 4)));
+    assert_eq!(cpu.vectors[0] as u64, 1.0f64.to_bits() + 1);
+}
+
+#[test]
+fn el0_simd_structure_load_store_matches_native() {
+    const DATA: u64 = 0x4000_8000;
+    let input: [u8; 32] = core::array::from_fn(|i| i as u8 + 3);
+    let mut native = [0u128; 6];
+    for (slot, bytes) in native.iter_mut().zip(input.chunks_exact(16)) {
+        *slot = u128::from_le_bytes(bytes.try_into().unwrap());
+    }
+    native_leaf(
+        &[
+            0x4cdf_8000, // ld2 {v0.16b, v1.16b}, [x0], #32
+            0x4c9f_8000, // st2 {v0.16b, v1.16b}, [x0], #32
+            0xad00_0400, // stp q0, q1, [x0]
+            0xd65f_03c0, // ret
+        ],
+        &mut native,
+    );
+    let mut cpu = CpuState::default();
+    cpu.pc = ProgramCounter(CODE);
+    set_x(&mut cpu, 0, DATA);
+    let mut memory = Flat::default();
+    memory.put(DATA, &input);
+    memory.put(DATA + 32, &[0; 32]);
+    // LD2 (post-index by 32); ST2 (no writeback).
+    memory.put_words(CODE, &[0x4cdf_8000, 0x4c00_8000]);
+    let (report, _) = run_at(&mut cpu, &mut memory);
+    assert_eq!(
+        report.stop,
+        Stop::Fetch(VirtualAddress(CODE + 8)),
+        "{report}"
+    );
+    assert_eq!(report.blocks, 2);
+    assert_eq!(x(&cpu, 0), DATA + 32);
+    assert_eq!(cpu.vectors[..2], native[4..6]);
+    let mut stored = [0; 32];
+    memory.read(VirtualAddress(DATA + 32), &mut stored).unwrap();
+    let want: Vec<_> = native[2..4]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    assert_eq!(stored.as_slice(), want);
+}
+
+#[test]
+fn el0_crc32_matches_native_on_crc_hosts() {
+    if !std::arch::is_aarch64_feature_detected!("crc") {
+        return;
+    }
+    let input = u64::from_le_bytes(*b"12345678");
+    for word in [0x9ac1_4c02, 0x9ac1_5c02] {
+        let mut native = [u128::from(u64::MAX) | (u128::from(input) << 64), 0];
+        native_leaf(
+            &[0xaa00_03e8, 0xa940_0500, word, 0xf900_0902, 0xd65f_03c0],
+            &mut native,
+        );
+        let mut cpu = CpuState::default();
+        cpu.pc = ProgramCounter(CODE);
+        set_x(&mut cpu, 0, u64::MAX);
+        set_x(&mut cpu, 1, input);
+        let mut memory = Flat::default();
+        memory.put_words(CODE, &[word]);
+        let (report, _) = run_at(&mut cpu, &mut memory);
+        assert_eq!(
+            report.stop,
+            Stop::Fetch(VirtualAddress(CODE + 4)),
+            "{report}"
+        );
+        assert_eq!(x(&cpu, 2), native[1] as u64);
+    }
+}
+
+#[test]
+fn el0_simd_register_offset_pair_and_literal_match_native() {
+    const DATA: u64 = 0x4000_8000;
+    let input = [0x0123_4567_89ab_cdefu128, 0xfedc_ba98_7654_3210];
+    let mut native = [0u128; 7];
+    native[..2].copy_from_slice(&input);
+    native_leaf(
+        &[
+            0xaa00_03e8, // mov x8, x0
+            0xd280_0021, // mov x1, #1
+            0x3ce1_7800, // ldr q0, [x0, x1, lsl #4]
+            0x3dc0_0001, // ldr q1, [x0]
+            0xad81_0400, // stp q0, q1, [x0, #32]!
+            0xacc1_0c02, // ldp q2, q3, [x0], #32
+            0x9c00_0084, // ldr q4, .+16
+            0xad02_0d02, // stp q2, q3, [x8, #64]
+            0x3d80_1904, // str q4, [x8, #96]
+            0xd65f_03c0, // ret
+            0x5060_7080,
+            0x1020_3040,
+            0x5566_7788,
+            0x1122_3344,
+        ],
+        &mut native,
+    );
+    let mut cpu = CpuState::default();
+    cpu.pc = ProgramCounter(CODE);
+    set_x(&mut cpu, 0, DATA);
+    set_x(&mut cpu, 1, 1);
+    cpu.vectors[1] = input[0];
+    let mut memory = Flat::default();
+    memory.put(DATA + 16, &input[1].to_le_bytes());
+    memory.put(DATA + 32, &[0; 32]);
+    memory.put(
+        CODE + 28,
+        &0x1122_3344_5566_7788_1020_3040_5060_7080u128.to_le_bytes(),
+    );
+    memory.put_words(CODE, &[0x3ce1_7800, 0xad81_0400, 0xacc1_0c02, 0x9c00_0084]);
+    let (report, _) = run_at(&mut cpu, &mut memory);
+    assert_eq!(
+        report.stop,
+        Stop::Fetch(VirtualAddress(CODE + 16)),
+        "{report}"
+    );
+    assert_eq!(report.blocks, 4);
+    assert_eq!(x(&cpu, 0), DATA + 64);
+    assert_eq!(cpu.vectors[2..5], native[4..7]);
+}
+
+#[test]
+fn el0_chkfeat_matches_native_with_no_features_requested() {
+    // A zero request selects no features, even on a host with FEAT_CHK.
+    let mut native = [u128::MAX];
+    native_leaf(
+        &[
+            0xd280_0010, // mov x16, #0
+            0xd503_251f, // chkfeat x16
+            0xf900_0010, // str x16, [x0]
+            0xd65f_03c0, // ret
+        ],
+        &mut native,
+    );
+    for input in [0, 0x1234_5678_9abc_def0] {
+        let mut memory = Flat::default();
+        memory.put_words(CODE, &[0xd503_251f]);
+        let mut cpu = CpuState::default();
+        cpu.pc = ProgramCounter(CODE);
+        set_x(&mut cpu, 16, input);
+        let (report, _) = run_at(&mut cpu, &mut memory);
+        assert_eq!(report.stop, Stop::Fetch(VirtualAddress(CODE + 4)));
+        assert_eq!(report.undefined_el0_deliveries, 0);
+        assert_eq!(x(&cpu, 16) ^ input, native[0] as u64);
+    }
+}

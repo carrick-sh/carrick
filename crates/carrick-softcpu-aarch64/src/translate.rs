@@ -7,11 +7,14 @@
 //! pages (LDP/STP C6.2.130/C6.2.277, LDR/STR immediate C6.2.132/C6.2.278,
 //! ADD immediate C6.2.4, MOVZ/MOVK C6.2.193/C6.2.191, B C6.2.26, RET C6.2.219,
 //! MRS/MSR C6.2.194/C6.2.196, B.cond C6.2.25, CBZ C6.2.45, TBZ C6.2.331).
-use crate::state::{CpuState, ProgramCounter, RegisterValue, StackPointer};
+use crate::state::{
+    CpuState, ExceptionLevel, FPCR_MASK, FPSR_MASK, ProgramCounter, RegisterValue, StackPointer,
+    SystemValue,
+};
 use crate::{
-    AddressBase, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, Gpr, Hint, Instruction,
-    LogicalOperand, MemoryAddress, MemoryIndex, MemoryOperation, MemoryRegister, OperandRegister,
-    RegisterBranch, ScalarMemory, decode_instruction,
+    AddressBase, Barrier, BarrierKind, Branch, Decoded, ExceptionKind, GUEST_CPU_PROFILE, Gpr,
+    Hint, Instruction, LogicalOperand, MemoryAddress, MemoryIndex, MemoryOperation, MemoryRegister,
+    OperandRegister, RegisterBranch, ScalarMemory, decode_instruction,
 };
 use alloc::vec::Vec;
 
@@ -20,6 +23,8 @@ use alloc::vec::Vec;
 pub enum CopyKind {
     /// The guest word runs unchanged.
     Verbatim,
+    /// Use a plain NOP so host CPU extensions cannot execute a guest hint.
+    NoOperation,
     /// The word names SP; it runs against a scratch register holding guest SP.
     StackPointer,
     /// ADR/ADRP: the guest PC is known, so Rd is loaded with an immediate.
@@ -30,6 +35,7 @@ pub enum CopyKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
     Memory,
+    RegisterCompute,
     SystemRegister,
     Pstate,
     SystemOperation,
@@ -90,18 +96,23 @@ pub fn classify_instruction(instruction: Instruction) -> InstructionClass {
         | Instruction::Multiply(_)
         | Instruction::Divide(_)
         | Instruction::SimdCopy(_)
+        | Instruction::SimdCompute(_)
         | Instruction::ConditionalSelect(_)
         | Instruction::ConditionalCompare(_)
         | Instruction::Barrier(_)
         | Instruction::CensusGap(Decoded::VariableShift { .. } | Decoded::OneSource { .. })
         | Instruction::Hint(Hint::Nop | Hint::Yield) => InstructionClass::Copy(CopyKind::Verbatim),
+        Instruction::CompatibilityHint => InstructionClass::Copy(CopyKind::NoOperation),
         Instruction::Address(_) => InstructionClass::Copy(CopyKind::PcRelative),
         Instruction::Hint(hint) => InstructionClass::Exit(ExitReason::Hint(hint)),
         Instruction::ScalarMemory(_)
         | Instruction::UnprivilegedMemory(_)
         | Instruction::PairMemory(_)
         | Instruction::AtomicTransfer(_)
-        | Instruction::AtomicAdd(_) => InstructionClass::Exit(ExitReason::Memory),
+        | Instruction::AtomicAdd(_)
+        | Instruction::StructureMemory(_)
+        | Instruction::Prefetch => InstructionClass::Exit(ExitReason::Memory),
+        Instruction::Crc32(_) => InstructionClass::Exit(ExitReason::RegisterCompute),
         Instruction::SystemAccess(_) => InstructionClass::Exit(ExitReason::SystemRegister),
         Instruction::PstateImmediate(_) => InstructionClass::Exit(ExitReason::Pstate),
         Instruction::SystemOperation(_)
@@ -167,7 +178,18 @@ impl GuestInstruction {
     }
 
     pub fn decode(pc: ProgramCounter, word: u32) -> Self {
-        let instruction = decode_instruction(word);
+        Self::decode_at_level(pc, word, ExceptionLevel::El1)
+    }
+
+    pub fn decode_el0(pc: ProgramCounter, word: u32) -> Self {
+        Self::decode_at_level(pc, word, ExceptionLevel::El0)
+    }
+
+    fn decode_at_level(pc: ProgramCounter, word: u32, el: ExceptionLevel) -> Self {
+        let mut instruction = decode_instruction(word);
+        if !GUEST_CPU_PROFILE.admits(instruction, el) {
+            instruction = Instruction::Unallocated;
+        }
         Self {
             pc,
             word,
@@ -247,12 +269,13 @@ pub fn split_block(
     limits: BlockLimits,
     fetch: impl FnMut(ProgramCounter) -> Option<u32>,
 ) -> GuestBlock {
-    split_block_for_run(start, limits, false, fetch)
+    split_block_for_run(start, limits, ExceptionLevel::El1, false, fetch)
 }
 
 pub(crate) fn split_block_for_run(
     start: ProgramCounter,
     limits: BlockLimits,
+    el: ExceptionLevel,
     inline_memory: bool,
     mut fetch: impl FnMut(ProgramCounter) -> Option<u32>,
 ) -> GuestBlock {
@@ -268,7 +291,7 @@ pub(crate) fn split_block_for_run(
     let page = start.0 / CODE_PAGE_BYTES;
     while instructions.len() < limits.max_instructions.max(1) && pc.0 / CODE_PAGE_BYTES == page {
         let Some(word) = fetch(pc) else { break };
-        let instruction = GuestInstruction::decode(pc, word);
+        let instruction = GuestInstruction::decode_at_level(pc, word, el);
         instructions.push(instruction);
         if instruction.class.terminates() && !(inline_memory && inline_op(&instruction).is_some()) {
             break;
@@ -348,7 +371,11 @@ pub mod frame {
     pub const CHAIN_PENDING: u32 = 0x170;
     pub const CHAIN_POLL_MASK: u32 = 0x178;
     pub const CHAIN_X2: u32 = 0x180;
-    pub const SLOTS: usize = 50;
+    pub const FPCR: u32 = 0x188;
+    pub const FPSR: u32 = 0x190;
+    pub const HOST_FPCR: u32 = 0x198;
+    pub const HOST_FPSR: u32 = 0x1a0;
+    pub const SLOTS: usize = 54;
 
     pub const CHAIN_INDEX_BITS: u32 = 6;
     pub const CHAIN_SLOTS: usize = 1 << CHAIN_INDEX_BITS;
@@ -409,6 +436,8 @@ impl BlockFrame {
             }
         }
         self.vectors = cpu.vectors;
+        self.slots[slot(frame::FPCR)] = cpu.named.fpcr.0 & FPCR_MASK;
+        self.slots[slot(frame::FPSR)] = cpu.named.fpsr.0 & FPSR_MASK;
         self.slots[slot(frame::GUEST_SP)] = cpu.sp().0;
         self.slots[slot(frame::NZCV)] = u64::from(cpu.pstate.nzcv & 15) << 28;
     }
@@ -423,6 +452,8 @@ impl BlockFrame {
             }
         }
         cpu.vectors = self.vectors;
+        cpu.named.fpcr = SystemValue(self.slots[slot(frame::FPCR)] & FPCR_MASK);
+        cpu.named.fpsr = SystemValue(self.slots[slot(frame::FPSR)] & FPSR_MASK);
         cpu.set_sp(StackPointer(self.slots[slot(frame::GUEST_SP)]));
         cpu.pstate.nzcv = ((self.slots[slot(frame::NZCV)] >> 28) & 15) as u8;
     }
@@ -591,6 +622,18 @@ pub mod encode {
     pub const fn msr_nzcv(rt: u32) -> u32 {
         0xd51b_4200 | rt
     }
+    pub(super) const fn mrs_fpcr(rt: u32) -> u32 {
+        0xd53b_4400 | rt
+    }
+    pub(super) const fn msr_fpcr(rt: u32) -> u32 {
+        0xd51b_4400 | rt
+    }
+    pub(super) const fn mrs_fpsr(rt: u32) -> u32 {
+        0xd53b_4420 | rt
+    }
+    pub(super) const fn msr_fpsr(rt: u32) -> u32 {
+        0xd51b_4420 | rt
+    }
     /// B label, `offset` in bytes from this word.
     pub const fn b(offset: i64) -> u32 {
         0x1400_0000 | (((offset / 4) as u32) & 0x03ff_ffff)
@@ -623,7 +666,7 @@ pub fn entry_stub() -> Vec<u32> {
 }
 
 fn entry_stub_for(simd: bool) -> Vec<u32> {
-    let mut w = Vec::with_capacity(if simd { 47 } else { 27 });
+    let mut w = Vec::with_capacity(if simd { 55 } else { 27 });
     w.push(encode::stp_pre(29, 30, SP, -96));
     for (i, r) in [19, 21, 23, 25, 27].into_iter().enumerate() {
         w.push(encode::stp(r, r + 1, SP, 16 * (i as i32 + 1)));
@@ -639,6 +682,18 @@ fn entry_stub_for(simd: bool) -> Vec<u32> {
     w.push(encode::add_imm(1, SP, 0));
     w.push(encode::str(1, 0, frame::HOST_SP));
     w.push(encode::add_imm(SP, 0, 0));
+    if simd {
+        w.extend([
+            encode::mrs_fpcr(1),
+            encode::str(1, SP, frame::HOST_FPCR),
+            encode::mrs_fpsr(1),
+            encode::str(1, SP, frame::HOST_FPSR),
+            encode::ldr(1, SP, frame::FPCR),
+            encode::msr_fpcr(1),
+            encode::ldr(1, SP, frame::FPSR),
+            encode::msr_fpsr(1),
+        ]);
+    }
     w.push(encode::ldr(1, SP, frame::NZCV));
     w.push(encode::msr_nzcv(1));
     for r in (0..30).step_by(2) {
@@ -666,7 +721,7 @@ pub fn common_exit() -> Vec<u32> {
 }
 
 fn common_exit_for(simd: bool) -> Vec<u32> {
-    let mut w = Vec::with_capacity(if simd { 49 } else { 28 });
+    let mut w = Vec::with_capacity(if simd { 57 } else { 28 });
     for r in (2..30).step_by(2) {
         w.push(encode::stp(r, r + 1, SP, 8 * r as i32));
     }
@@ -682,6 +737,18 @@ fn common_exit_for(simd: bool) -> Vec<u32> {
                 frame::VECTORS as i32 + 16 * r as i32,
             ));
         }
+    }
+    if simd {
+        w.extend([
+            encode::mrs_fpcr(1),
+            encode::str(1, SP, frame::FPCR),
+            encode::mrs_fpsr(1),
+            encode::str(1, SP, frame::FPSR),
+            encode::ldr(1, SP, frame::HOST_FPCR),
+            encode::msr_fpcr(1),
+            encode::ldr(1, SP, frame::HOST_FPSR),
+            encode::msr_fpsr(1),
+        ]);
     }
     w.push(encode::ldr(1, SP, frame::HOST_SP));
     w.push(encode::add_imm(SP, 1, 0));
@@ -1003,10 +1070,12 @@ pub(crate) fn emit_block_for_run(
     if guest.instructions.is_empty() {
         return Err(TranslateError::Empty);
     }
-    let simd = guest
-        .instructions
-        .iter()
-        .any(|i| matches!(i.instruction, Instruction::SimdCopy(_)));
+    let simd = guest.instructions.iter().any(|i| {
+        matches!(
+            i.instruction,
+            Instruction::SimdCopy(_) | Instruction::SimdCompute(_)
+        )
+    });
     let mut e = Emitter {
         words: entry_stub_for(simd),
         exits: Vec::new(),
@@ -1025,6 +1094,7 @@ pub(crate) fn emit_block_for_run(
         }
         match i.class {
             InstructionClass::Copy(CopyKind::Verbatim) => e.words.push(i.word),
+            InstructionClass::Copy(CopyKind::NoOperation) => e.words.push(0xd503_201f),
             InstructionClass::Copy(CopyKind::StackPointer) => {
                 let s = scratch_for(i.word);
                 let (word, writes) =

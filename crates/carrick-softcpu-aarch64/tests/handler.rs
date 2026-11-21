@@ -618,7 +618,6 @@ fn exclusive_ordered_and_lse_accesses_fault_with_alignment_check_disabled() {
         (0xc823_0820, 0x10008, true),  // stxp w3, x0, x2, [x1]
         (0xc8df_fc20, 0x10001, false), // ldar x0, [x1]
         (0xc89f_fc20, 0x10001, true),  // stlr x0, [x1]
-        (0xf822_0020, 0x10001, false), // ldadd x2, x0, [x1]: alignment check is a read
     ] {
         let mut r = Rig::el0();
         r.set(0, 42);
@@ -637,6 +636,12 @@ fn exclusive_ordered_and_lse_accesses_fault_with_alignment_check_disabled() {
         assert!(r.memory.0.is_empty());
         assert!(!r.monitor.is_open());
     }
+    // LSE is withheld at EL0. The EL1 carrier LDADD still checks alignment.
+    let mut rig = Rig::el1();
+    rig.set(1, 0x10001);
+    assert_eq!(rig.run(0xf822_0020), Outcome::Fault);
+    assert_eq!(rig.cpu.el1.esr, Syndrome(0x9600_0021));
+    assert_eq!(rig.cpu.el1.far, VirtualAddress(0x10001));
 }
 
 #[test]
@@ -777,4 +782,125 @@ fn el0_vector_scalar_and_pair_memory_transfer_guest_bytes() {
     assert_eq!(r.memory.get(a + 96), 0x0123_4567_89ab_cdef);
     assert_eq!(r.memory.get(a + 104), 0);
     assert_eq!(r.pc(), PC + 24);
+}
+
+#[test]
+fn simd_structures_interleave_replicate_and_commit_only_after_read() {
+    let mut rig = Rig::el0();
+    let data = 0x11000;
+    let values: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+    rig.memory.write(VirtualAddress(data), &values).unwrap();
+    rig.set(0, data);
+
+    // ld2 {v0.16b, v1.16b}, [x0], #32
+    assert_eq!(rig.run(0x4cdf_8000), Outcome::Continue);
+    assert_eq!(rig.pc(), PC + 4);
+    assert_eq!(rig.get(0), data + 32);
+    for i in 0..2 {
+        let want = core::array::from_fn(|lane| values[lane * 2 + i]);
+        assert_eq!(rig.cpu.vectors[i].to_le_bytes(), want);
+    }
+    // st2 {v0.16b, v1.16b}, [x0], x1
+    rig.set(1, 48);
+    assert_eq!(rig.run(0x4c81_8000), Outcome::Continue);
+    let mut stored = [0; 32];
+    rig.memory
+        .read(VirtualAddress(data + 32), &mut stored)
+        .unwrap();
+    assert_eq!(stored, values);
+    assert_eq!(rig.get(0), data + 80);
+
+    // ld1 {v0.b}[5], [x0]
+    let mut expected = rig.cpu.vectors[0].to_le_bytes();
+    expected[5] = values[0];
+    rig.set(0, data);
+    assert_eq!(rig.run(0x0d40_1400), Outcome::Continue);
+    assert_eq!(rig.cpu.vectors[0].to_le_bytes(), expected);
+
+    // ld2r {v0.4s, v1.4s}, [x0], #8
+    assert_eq!(rig.run(0x4dff_c800), Outcome::Continue);
+    assert_eq!(rig.get(0), data + 8);
+    assert_eq!(
+        rig.cpu.vectors[0].to_le_bytes(),
+        [1, 2, 3, 4].repeat(4).as_slice()
+    );
+    assert_eq!(
+        rig.cpu.vectors[1].to_le_bytes(),
+        [5, 6, 7, 8].repeat(4).as_slice()
+    );
+
+    rig.set(0, 0x1fff8);
+    let pc = rig.pc();
+    let before = rig.cpu.vectors;
+    assert!(matches!(
+        rig.run(0x4cdf_8000),
+        Outcome::Event(Event::MemoryFault(_))
+    ));
+    assert_eq!(rig.cpu.vectors, before);
+    assert_eq!(rig.pc(), pc);
+    assert_eq!(rig.get(0), 0x1fff8);
+}
+
+#[test]
+fn el0_crc32_and_crc32c_match_standard_check_values() {
+    for (double, byte, want) in [
+        (0x9ac1_4c02, 0x1ac1_4042, 0xcbf4_3926u32),
+        (0x9ac1_5c02, 0x1ac1_5042, 0xe306_9283u32),
+    ] {
+        let mut rig = Rig::el0();
+        rig.set(0, u64::from(u32::MAX));
+        rig.set(1, u64::from_le_bytes(*b"12345678"));
+        assert_eq!(rig.run(double), Outcome::Continue);
+        assert_eq!(rig.pc(), PC + 4);
+        rig.set(1, u64::from(b'9'));
+        assert_eq!(rig.run(byte), Outcome::Continue);
+        assert_eq!(rig.get(2), u64::from(!want));
+    }
+}
+
+#[test]
+fn el0_reads_virtual_cpu_identity_through_the_instruction_handler() {
+    let mut rig = Rig::el0();
+    assert_eq!(rig.run(0xd538_0603), Outcome::Continue); // ID_AA64ISAR0_EL1
+    assert_eq!(rig.pc(), PC + 4);
+    assert_eq!(rig.get(3) & (0xff << 16), 1 << 16); // CRC32 present, LSE absent
+    assert_eq!(rig.run(0xd538_0404), Outcome::Continue); // ID_AA64PFR0_EL1
+    assert_eq!(rig.get(4), 0); // scalar FP and Advanced SIMD present
+}
+
+#[test]
+fn prefetch_modes_ignore_unmapped_addresses() {
+    let mut rig = Rig::el0();
+    for word in [0xd800_0000, 0xf980_0000, 0xf8a1_7800, 0xf89f_f000] {
+        let pc = rig.pc();
+        assert_eq!(rig.run(word), Outcome::Continue);
+        assert_eq!(rig.pc(), pc + 4);
+    }
+}
+
+#[test]
+fn el0_ldadd_raises_undefined_before_accessing_memory() {
+    let mut rig = Rig::el0();
+    rig.memory.put(0x10000, 40);
+    rig.set(0, 0x10000);
+    rig.set(1, 2);
+    assert_eq!(rig.run(0xf821_0002), Outcome::Fault);
+    assert_eq!(rig.cpu.el1.esr, Syndrome(0x0200_0000));
+    assert_eq!(rig.cpu.el1.elr, ProgramCounter(PC));
+    assert_eq!(rig.memory.get(0x10000), 40);
+}
+
+#[test]
+fn el0_physical_counter_obeys_cntkctl_and_uses_the_virtual_clock() {
+    let mut rig = Rig::el0();
+    rig.cpu.el1.cntkctl = SystemValue(1);
+    rig.cpu.named.cntvct = SystemValue(0x2345_6789_abcd_ef00);
+    assert_eq!(rig.run(0xd53b_e025), Outcome::Continue); // MRS X5, CNTPCT_EL0
+    assert_eq!(rig.pc(), PC + 4);
+    assert_eq!(rig.get(5), 0x2345_6789_abcd_ef00);
+
+    rig.cpu.el1.cntkctl = SystemValue(2); // EL0VCTEN does not enable CNTPCT.
+    assert_eq!(rig.run(0xd53b_e025), Outcome::Fault);
+    assert_eq!(rig.pc(), VBAR + 0x400);
+    assert_eq!(rig.cpu.el1.esr, Syndrome(0x6232_f8a1));
 }

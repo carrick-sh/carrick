@@ -730,7 +730,6 @@ fn musl_simd_copy_decodes_only_allocated_register_forms() {
         0x0e08_0c20, // DUP with Q=0 and a 64-bit element: undefined
         0x0e08_3c01, // UMOV with Q=0 and a 64-bit element: undefined
         0x4e04_3c01, // UMOV with Q=1 and a 32-bit element: undefined
-        0x4e20_1c00, // AND vector, outside this CRT subset
         0x3d80_0000, // STR Q0, [X0] must use guest memory
     ] {
         assert!(
@@ -738,4 +737,28 @@ fn musl_simd_copy_decodes_only_allocated_register_forms() {
             "{word:#x}"
         );
     }
+}
+
+#[test]
+fn unadvertised_branch_protection_hints_emit_only_plain_nops() {
+    // PACIASP, AUTIASP, BTI C, CHKFEAT.
+    let words = [0xd503_233f, 0xd503_23bf, 0xd503_245f, 0xd503_251f];
+    let blocks = split_span(ProgramCounter(0), &words, BlockLimits::default());
+    assert_eq!(blocks.len(), 1);
+    let emitted = emit_block(&blocks[0]).unwrap();
+    assert_eq!(emitted.guest().instructions().len(), words.len());
+    assert!(
+        emitted
+            .words()
+            .windows(words.len())
+            .any(|window| window == [0xd503_201f; 4])
+    );
+    for word in words {
+        assert!(!emitted.words().contains(&word));
+    }
+    // RETAA isn't in the backwards-compatible hint space.
+    assert_eq!(
+        class(0xd65f_0bff),
+        InstructionClass::Exit(ExitReason::Undefined)
+    );
 }

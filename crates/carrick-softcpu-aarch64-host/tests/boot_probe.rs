@@ -14,12 +14,13 @@
 // Test helpers outside #[test] fns fail loudly on malformed fixtures.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use carrick_aarch64::staged_cpu::{RootBootFields, StagedCpu};
 use carrick_el1_abi::{
     ContextGeneration, CurrentTask, DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE,
     DELEGATED_STATE_GUEST, DelegatedOpenFile, EL1_CURRENT_TASKS_BASE, EL1_DYNAMIC_METADATA_BASE,
     EL1_DYNAMIC_METADATA_EXTENT_SIZE, EL1_FD_MAP_BASE, EL1_OPEN_FILE_TABLE_BASE,
-    EL1_STACK_GUARD_TABLES_BASE, El1TaskId, FdMapSlot, HostObjectBinding, SnapshotGeneration,
-    TrapFrame, is_el1_stack_guard, stack_slot_top,
+    EL1_STACK_GUARD_TABLES_BASE, El1TaskId, FdMapSlot, HostBoundFd, HostObjectBinding,
+    SnapshotGeneration, TrapFrame, is_el1_stack_guard, stack_slot_top,
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_mem::arch_sysregs::{MAIR_EL1_BOOTSTRAP, SCTLR_EL1_BOOTSTRAP, TCR_EL1_BOOTSTRAP};
@@ -49,9 +50,10 @@ use carrick_softcpu_aarch64::translate::{
 };
 use carrick_softcpu_aarch64::{ExceptionKind, Gpr, OperandRegister};
 use carrick_softcpu_aarch64_host::{HostBlockRunner, HostCode, HostError, SoftMemory};
+use core::mem::offset_of;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 const PAGE: u64 = 4096;
 const INITIAL_METADATA_END: u64 =
@@ -77,6 +79,12 @@ impl Pages {
         self.memory
             .map_zero(FrameGpa::new(address & !(PAGE - 1)))
             .expect("fixture page");
+    }
+
+    fn unmap(&mut self, address: u64) {
+        self.memory
+            .unmap_frame(FrameGpa::new(address & !(PAGE - 1)))
+            .expect("unmap fixture page");
     }
 
     fn load(&mut self, at: u64, bytes: &[u8]) {
@@ -901,7 +909,6 @@ fn production_el1_image_boot_probe() {
 
 const USER_HELLO_ELF: &[u8] =
     include_bytes!("../../carrick-vmm-kvm/fixtures/hello-aarch64/hello-aarch64");
-const ROOT_EL0_ENTRY_SPSR: u64 = 0x3c0;
 
 fn read_u32(memory: &mut Pages, at: u64) -> u32 {
     let mut b = [0u8; 4];
@@ -921,6 +928,13 @@ fn read_u64(memory: &mut Pages, at: u64) -> u64 {
 /// its `svc #0` through the mailbox/EL1 vector hook into `carrick_el1_syscall`,
 /// and reach the first guest-visible carrier exit (`HVC #2`).
 fn enter_carrier_root(el1_elf: &[u8], user_elf: &[u8]) -> (CpuState, Pages, u64) {
+    let user_entry = field(user_elf, 24, 8);
+    let (cpu, mut memory) = enter_carrier(el1_elf, user_entry);
+    assert_eq!(load_elf(user_elf, &mut memory), user_entry);
+    (cpu, memory, user_entry)
+}
+
+fn enter_carrier(el1_elf: &[u8], user_entry: u64) -> (CpuState, Pages) {
     let mut memory = Pages::default();
     for page in (LINUX_EL1_KERNEL_BASE..LINUX_EL1_KERNEL_BASE + LINUX_EL1_KERNEL_SIZE)
         .step_by(PAGE as usize)
@@ -944,7 +958,6 @@ fn enter_carrier_root(el1_elf: &[u8], user_elf: &[u8]) -> (CpuState, Pages, u64)
     }
 
     let _el1_entry = load_elf(el1_elf, &mut memory);
-    let user_entry = load_elf(user_elf, &mut memory);
     memory.load(LINUX_EL0_TRAMPOLINE_BASE, &el0_trampoline_bytes());
     memory.load(
         LINUX_EL1_VECTORS_BASE,
@@ -958,23 +971,33 @@ fn enter_carrier_root(el1_elf: &[u8], user_elf: &[u8]) -> (CpuState, Pages, u64)
         &stage1_carrier_maintenance_page_tables(),
     );
 
+    let root = StagedCpu::initial_root(&RootBootFields {
+        entry: user_entry,
+        initial_stack_pointer: Some(LINUX_STACK_TOP - 16),
+        el0_trampoline_entry: Some(LINUX_EL0_TRAMPOLINE_BASE),
+        el1_vectors_base: Some(LINUX_EL1_VECTORS_BASE),
+        stage1_page_tables_base: Some(LINUX_PAGE_TABLES_BASE),
+    })
+    .snapshot();
     let mut cpu = CpuState::default();
     cpu.pstate.el = ExceptionLevel::El1;
     cpu.pstate.sp = StackSelect::El1;
     cpu.pstate.daif = InterruptMasks::ALL;
-    cpu.sp_el0 = StackPointer(LINUX_STACK_TOP - 16);
+    assert_eq!(cpu.pstate.save().0, root.pstate);
+    cpu.sp_el0 = StackPointer(root.sp_el0);
+    // The persistent executor supplies this slot-local stack after staging.
     cpu.sp_el1 = StackPointer(LINUX_SYSCALL_MAILBOX_BASE);
-    cpu.pc = ProgramCounter(LINUX_EL0_TRAMPOLINE_BASE);
-    cpu.el1.elr = ProgramCounter(user_entry);
-    cpu.el1.spsr = SavedPstate(ROOT_EL0_ENTRY_SPSR);
-    cpu.el1.vbar = VirtualAddress(LINUX_EL1_VECTORS_BASE);
-    cpu.el1.mair = SystemValue(MAIR_EL1_BOOTSTRAP);
-    cpu.el1.tcr = SystemValue(TCR_EL1_BOOTSTRAP);
-    cpu.named.ttbr0 = SystemValue(LINUX_PAGE_TABLES_BASE);
-    cpu.named.ttbr1 = SystemValue(LINUX_PAGE_TABLES_BASE);
-    cpu.el1.sctlr = Sctlr(SCTLR_EL1_BOOTSTRAP);
-    cpu.el1.cntkctl = SystemValue(3);
-    (cpu, memory, user_entry)
+    cpu.pc = ProgramCounter(root.pc);
+    cpu.el1.elr = ProgramCounter(root.elr_el1);
+    cpu.el1.spsr = SavedPstate(root.spsr_el1);
+    cpu.el1.vbar = VirtualAddress(root.vbar);
+    cpu.el1.mair = SystemValue(root.mair);
+    cpu.el1.tcr = SystemValue(root.tcr);
+    cpu.named.ttbr0 = SystemValue(root.ttbr0);
+    cpu.named.ttbr1 = SystemValue(root.ttbr1);
+    cpu.el1.sctlr = Sctlr(root.sctlr);
+    cpu.el1.cntkctl = SystemValue(root.cntkctl_el1);
+    (cpu, memory)
 }
 
 fn check_forwarded_write_exit(
@@ -1137,12 +1160,20 @@ struct RetiredSyscall {
     ret: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct El0Fault {
+    pc: u64,
+    esr: u64,
+    far: u64,
+}
+
 struct TracingRunner {
     inner: HostBlockRunner,
     branches: VecDeque<RetiredBranch>,
     syscalls: Vec<RetiredSyscall>,
     pending_svc: Option<RetiredSyscall>,
     tpidr_writes: Vec<(u64, u64)>,
+    first_el0_fault: Option<El0Fault>,
 }
 
 impl TracingRunner {
@@ -1153,6 +1184,7 @@ impl TracingRunner {
             syscalls: Vec::new(),
             pending_svc: None,
             tpidr_writes: Vec::new(),
+            first_el0_fault: None,
         })
     }
 
@@ -1199,8 +1231,17 @@ impl ExecuteBlock for TracingRunner {
         cpu: &mut CpuState,
         memory: BlockMemory<'_>,
     ) -> Result<usize, HostError> {
-        let start = block.guest().start().0;
-        if start < LINUX_EL0_TRAMPOLINE_BASE {
+        let user = cpu.pstate.el == ExceptionLevel::El0;
+        // Arm D1.10: 0x400 is the synchronous vector from lower EL in AArch64.
+        // Record before the vector runs and HVC overwrites ESR_EL1.
+        if !user && cpu.pc.0 == cpu.el1.vbar.0 + 0x400 && (cpu.el1.esr.0 >> 26) & 0x3f != 0x15 {
+            self.first_el0_fault.get_or_insert(El0Fault {
+                pc: cpu.el1.elr.0,
+                esr: cpu.el1.esr.0,
+                far: cpu.el1.far.0,
+            });
+        }
+        if user {
             if let Some(mut svc) = self.pending_svc.take() {
                 svc.ret = Some(x(cpu, 0) as i64);
                 self.syscalls.push(svc);
@@ -1211,7 +1252,7 @@ impl ExecuteBlock for TracingRunner {
             }
         }
         let exit_idx = self.inner.execute_with_memory(block, code, cpu, memory)?;
-        if start < LINUX_EL0_TRAMPOLINE_BASE {
+        if user {
             let sp = cpu.sp().0;
             let lr = x(cpu, 30);
             match block.exits().get(exit_idx).copied() {
@@ -1322,26 +1363,29 @@ fn admit_root_task_with_stdio(memory: &mut Pages) {
         (1u32, (DELEGATED_FLAG_WRITABLE, HostObjectBinding::STDOUT)),
         (2u32, (DELEGATED_FLAG_WRITABLE, HostObjectBinding::STDERR)),
     ] {
-        let handle = fd + 1;
-        load_abi_record::<DelegatedOpenFile, { core::mem::size_of::<DelegatedOpenFile>() }>(
-            memory,
-            EL1_OPEN_FILE_TABLE_BASE
-                + u64::from(fd) * core::mem::size_of::<DelegatedOpenFile>() as u64,
-            |open| {
-                open.flags.store(flags, Ordering::Relaxed);
-                open.generation.store(1, Ordering::Relaxed);
-                open.bind_host_object(binding);
-                open.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
-            },
-        );
-        load_abi_record::<FdMapSlot, { core::mem::size_of::<FdMapSlot>() }>(
-            memory,
-            EL1_FD_MAP_BASE + u64::from(fd) * core::mem::size_of::<FdMapSlot>() as u64,
-            |slot| {
-                slot.set(1, fd, handle, 1);
-            },
-        );
+        bind_host_fixture_fd(memory, fd, flags, binding);
     }
+}
+
+fn bind_host_fixture_fd(memory: &mut Pages, fd: u32, flags: u32, binding: HostObjectBinding) {
+    let handle = fd + 1;
+    load_abi_record::<DelegatedOpenFile, { core::mem::size_of::<DelegatedOpenFile>() }>(
+        memory,
+        EL1_OPEN_FILE_TABLE_BASE + u64::from(fd) * core::mem::size_of::<DelegatedOpenFile>() as u64,
+        |open| {
+            open.flags.store(flags, Ordering::Relaxed);
+            open.generation.store(1, Ordering::Relaxed);
+            open.bind_host_object(binding);
+            open.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
+        },
+    );
+    load_abi_record::<FdMapSlot, { core::mem::size_of::<FdMapSlot>() }>(
+        memory,
+        EL1_FD_MAP_BASE + u64::from(fd) * core::mem::size_of::<FdMapSlot>() as u64,
+        |slot| {
+            slot.set(1, fd, handle, 1);
+        },
+    );
 }
 
 fn complete_mailbox_syscall(memory: &mut Pages, return_value: i64) {
@@ -1399,12 +1443,14 @@ fn read_initial_stack_auxv(memory: &mut Pages, sp: u64) -> (u64, Vec<u8>, Vec<(u
 #[ignore = "requires production CARRICK_A64_ELF and the pinned arm64 musl rust-std target"]
 fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     use carrick_mem::{
+        elf::plan_elf_load_bytes,
         linux_abi::{
-            LINUX_AT_HWCAP, LINUX_AT_PAGESZ, LINUX_AT_RANDOM, LINUX_AT_SYSINFO_EHDR,
-            LinuxAarch64Hwcap,
+            LINUX_AT_HWCAP, LINUX_AT_HWCAP2, LINUX_AT_PAGESZ, LINUX_AT_RANDOM,
+            LINUX_AT_SYSINFO_EHDR,
         },
-        memory::AddressSpace,
+        memory::{build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso},
     };
+    use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
     use std::process::Command;
 
     let elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
@@ -1431,23 +1477,27 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
     std::fs::remove_file(out).expect("remove compiled musl hello");
 
     assert_eq!(field(&user_elf, 16, 2), 2, "musl hello must be ET_EXEC");
-    let image = AddressSpace::load_elf_bytes(&user_elf)
-        .unwrap()
-        // DDI0487G.a FEAT_LSE: LDADD alone does not authorize advertising
-        // ATOMICS. Let libc select its baseline exclusive-load/store path.
-        .without_auxv_hwcap(LinuxAarch64Hwcap::ATOMICS)
-        // No vvar/vDSO pages are mapped in this carrier-root fixture.
-        .with_vdso_auxv(false)
-        .with_linux_initial_stack_at(["musl-hello"], [] as [&str; 0], LINUX_STACK_TOP, 4 * PAGE)
-        .unwrap();
+    let plan = plan_elf_load_bytes(&user_elf).unwrap();
+    // No vvar/vDSO pages are mapped in this carrier-root fixture.
+    let mut auxv = linux_auxv_from_load_plan_with_vdso(&plan, None, false);
+    for entry in &mut auxv {
+        match entry.a_type {
+            LINUX_AT_HWCAP => entry.a_val = GUEST_CPU_PROFILE.hwcap().bits(),
+            LINUX_AT_HWCAP2 => entry.a_val = GUEST_CPU_PROFILE.hwcap2().bits(),
+            _ => {}
+        }
+    }
+    let (stack, sp, _) = build_linux_initial_stack(
+        vec![b"musl-hello".to_vec()],
+        Vec::new(),
+        &auxv,
+        None,
+        LINUX_STACK_TOP,
+        4 * PAGE,
+    )
+    .unwrap();
     let build_guest = || {
         let (mut cpu, mut memory, entry) = enter_carrier_root(&elf, &user_elf);
-        let sp = image.initial_stack_pointer().unwrap();
-        let stack = image
-            .regions()
-            .iter()
-            .find(|r| r.start <= sp && sp < r.end)
-            .unwrap();
         let (offset, bytes) = stack.shared_initialized_bytes();
         memory.load(stack.start + offset, &bytes);
         cpu.sp_el0 = StackPointer(sp);
@@ -1474,11 +1524,15 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
             .find(|(k, _)| *k == LINUX_AT_RANDOM)
             .is_some_and(|(_, v)| *v != 0)
     );
-    assert!(
-        auxv.iter()
-            .find(|(k, _)| *k == LINUX_AT_HWCAP)
-            .is_some_and(|(_, v)| *v & LinuxAarch64Hwcap::ATOMICS.bits() == 0)
-    );
+    for (key, expected) in [
+        (LINUX_AT_HWCAP, GUEST_CPU_PROFILE.hwcap().bits()),
+        (LINUX_AT_HWCAP2, GUEST_CPU_PROFILE.hwcap2().bits()),
+    ] {
+        assert_eq!(
+            auxv.iter().find(|(k, _)| *k == key).map(|(_, val)| *val),
+            Some(expected)
+        );
+    }
     assert!(
         !auxv.iter().any(|(k, _)| *k == LINUX_AT_SYSINFO_EHDR),
         "AT_SYSINFO_EHDR must not be advertised without mapped vDSO pages"
@@ -1703,4 +1757,511 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
             .collect::<Vec<_>>(),
         vec![(96, Some(-38)), (73, Some(0)), (134, None)]
     );
+}
+
+fn assert_fixture_sha256(path: &str, bytes: &[u8], expected: &str) {
+    use sha2::{Digest, Sha256};
+
+    assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected, "{path}");
+}
+
+const GLIBC_LOADER: &str = "/lib/ld-linux-aarch64.so.1";
+const GLIBC_LOADER_SHA256: &str =
+    "393ca646b316f6cb31dc82dc72becff344bf6491458f98c07036fea73f1db55e";
+const GLIBC_LIBC: &str = "/lib/libc.so.6";
+const GLIBC_LIBC_SHA256: &str = "ce67859ef338d8558a7fd7cff9a1effe5677ff9f7eea90641a2c051c51fab7ac";
+
+/// Engine witness: dynamic glibc hello runs on the soft CPU through the
+/// production EL1 vectors and trap path (`CARRICK_A64_ELF`) against a pinned
+/// `CARRICK_A64_DYN_ROOT` (`scripts/ci/fetch-arm64-cross-libc.sh`).
+/// HVC #2 replies come from a test fixture (GlibcReplies), not from the
+/// production carrick-kernel / carrick-personality-linux dispatch.
+#[test]
+#[ignore = "requires CARRICK_A64_DYN_ROOT and CARRICK_A64_ELF"]
+fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() {
+    use carrick_mem::{
+        elf::{ElfProgram, LoadPlan},
+        linux_abi::{
+            LINUX_AT_BASE, LINUX_AT_ENTRY, LINUX_AT_EXECFN, LINUX_AT_HWCAP, LINUX_AT_HWCAP2,
+            LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT, LINUX_AT_PHNUM, LINUX_AT_RANDOM,
+            LINUX_AT_SECURE,
+        },
+        memory::{build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso},
+    };
+    use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
+
+    let root = std::env::var_os("CARRICK_A64_DYN_ROOT").expect("set CARRICK_A64_DYN_ROOT");
+    let root = std::path::PathBuf::from(root);
+    let el1 = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
+        .expect("read the production EL1 ELF");
+    let hello = std::fs::read(root.join("hello")).expect("read dynamic hello");
+    let compiler = std::fs::read_to_string(root.join("hello.compiler"))
+        .expect("read hello.compiler from scripts/ci/fetch-arm64-cross-libc.sh");
+    let compiler = compiler.lines().next().expect("fixture compiler version");
+    let program = ElfProgram::load(&hello, 183, &|path| {
+        assert_eq!(path, GLIBC_LOADER);
+        let bytes = std::fs::read(root.join(&path[1..])).expect("read fixture loader");
+        assert_fixture_sha256(path, &bytes, GLIBC_LOADER_SHA256);
+        Some(bytes)
+    })
+    .expect("plan glibc hello and its interpreter");
+    let libc = std::fs::read(root.join(&GLIBC_LIBC[1..])).expect("read fixture libc.so.6");
+    assert_fixture_sha256(GLIBC_LIBC, &libc, GLIBC_LIBC_SHA256);
+    let interpreter = program.interpreter.as_ref().expect("dynamic fixture");
+    let (mut cpu, mut memory) = enter_carrier(&el1, program.entry());
+
+    fn map_plan(memory: &mut Pages, plan: &LoadPlan, bytes: &[u8]) {
+        for segment in &plan.segments {
+            let start = segment.virtual_address;
+            let end = start + segment.memory_size;
+            for page in (start & !(PAGE - 1)..end).step_by(PAGE as usize) {
+                memory.map_zero(page);
+            }
+            let offset = segment.file_offset as usize;
+            memory.load(start, &bytes[offset..offset + segment.file_size as usize]);
+        }
+    }
+    map_plan(&mut memory, &program.executable, &hello);
+    map_plan(&mut memory, &interpreter.plan, &interpreter.bytes);
+
+    let mut auxv =
+        linux_auxv_from_load_plan_with_vdso(&program.executable, program.interpreter_base(), false);
+    for entry in &mut auxv {
+        match entry.a_type {
+            LINUX_AT_HWCAP => entry.a_val = GUEST_CPU_PROFILE.hwcap().bits(),
+            LINUX_AT_HWCAP2 => entry.a_val = GUEST_CPU_PROFILE.hwcap2().bits(),
+            _ => {}
+        }
+    }
+    let (stack, sp, _) = build_linux_initial_stack(
+        vec![b"/hello".to_vec()],
+        Vec::new(),
+        &auxv,
+        None,
+        LINUX_STACK_TOP,
+        8 * PAGE,
+    )
+    .unwrap();
+    let (offset, bytes) = stack.shared_initialized_bytes();
+    for page in (stack.start..LINUX_STACK_TOP).step_by(PAGE as usize) {
+        memory.map_zero(page);
+    }
+    memory.load(stack.start + offset, &bytes);
+    cpu.sp_el0 = StackPointer(sp);
+    let (argc, argv0, auxv) = read_initial_stack_auxv(&mut memory, sp);
+    assert_eq!(argc, 1);
+    assert_eq!(argv0, b"/hello");
+    let aux = |key| auxv.iter().find(|(tag, _)| *tag == key).unwrap().1;
+    assert_eq!(
+        aux(LINUX_AT_PHDR),
+        program.executable.program_header_address.unwrap()
+    );
+    assert_eq!(
+        aux(LINUX_AT_PHENT),
+        u64::from(program.executable.program_header_entry_size)
+    );
+    assert_eq!(
+        aux(LINUX_AT_PHNUM),
+        u64::from(program.executable.program_header_count)
+    );
+    assert_eq!(aux(LINUX_AT_ENTRY), program.executable.entry);
+    assert_eq!(aux(LINUX_AT_BASE), interpreter.plan.load_bias);
+    assert_eq!(aux(LINUX_AT_PAGESZ), PAGE);
+    assert_eq!(aux(LINUX_AT_SECURE), 0);
+    assert_eq!(aux(LINUX_AT_HWCAP), GUEST_CPU_PROFILE.hwcap().bits());
+    assert_eq!(aux(LINUX_AT_HWCAP2), GUEST_CPU_PROFILE.hwcap2().bits());
+    assert_eq!(read_cstr(&mut memory, aux(LINUX_AT_EXECFN), 16), b"/hello");
+    memory
+        .read(VirtualAddress(aux(LINUX_AT_RANDOM)), &mut [0; 16])
+        .unwrap();
+
+    admit_root_task_with_stdio(&mut memory);
+
+    let mut runner = TracingRunner::new().unwrap();
+    let mut replies = GlibcReplies {
+        libc,
+        libc_cursor: None,
+        next_map: carrick_mem::memory::LINUX_MMAP_BASE,
+        program_break: carrick_mem::memory::LINUX_HEAP_BASE,
+        stdout: Vec::new(),
+        libc_exec: None,
+    };
+    let result = run_dynamic_glibc(&mut cpu, &mut memory, &mut runner, &mut replies);
+    assert_eq!(result, Ok(0));
+    assert_eq!(replies.stdout, b"dynamic glibc hello\n");
+    println!(
+        "guest stdout={:?} exit_group(0)",
+        String::from_utf8_lossy(&replies.stdout)
+    );
+    println!(
+        "auxv HWCAP={:#x} HWCAP2={:#x}",
+        aux(LINUX_AT_HWCAP),
+        aux(LINUX_AT_HWCAP2)
+    );
+    report_glibc_ifuncs(&program, &mut memory, &replies, compiler);
+}
+
+fn report_glibc_ifuncs(
+    program: &carrick_mem::elf::ElfProgram<'_>,
+    memory: &mut Pages,
+    replies: &GlibcReplies,
+    compiler: &str,
+) {
+    use goblin::elf::reloc::R_AARCH64_JUMP_SLOT;
+
+    let elf = goblin::elf::Elf::parse(program.executable_bytes).unwrap();
+    let (mapped, offset, len) = replies.libc_exec.expect("executable libc mapping");
+    for name in ["memcpy", "strlen", "memset"] {
+        let slot = elf
+            .pltrelocs
+            .iter()
+            .find(|rel| {
+                rel.r_type == R_AARCH64_JUMP_SLOT
+                    && elf
+                        .dynsyms
+                        .get(rel.r_sym)
+                        .and_then(|sym| elf.dynstrtab.get_at(sym.st_name))
+                        == Some(name)
+            })
+            .unwrap_or_else(|| {
+                panic!("missing {name} R_AARCH64_JUMP_SLOT in fixture built with {compiler}")
+            });
+        let target = read_u64(memory, program.executable.load_bias + slot.r_offset);
+        assert!(
+            (mapped..mapped + len).contains(&target),
+            "unresolved {name}: {target:#x}"
+        );
+        println!(
+            "IFUNC {name}: guest={target:#x} libc file offset={:#x} word={:#010x}",
+            target - mapped + offset,
+            read_u32(memory, target)
+        );
+    }
+}
+
+fn run_dynamic_glibc(
+    cpu: &mut CpuState,
+    memory: &mut Pages,
+    runner: &mut TracingRunner,
+    replies: &mut GlibcReplies,
+) -> Result<u64, String> {
+    use carrick_mem::linux_abi::syscall::lookup_aarch64;
+    const BUDGET: u64 = 1_000_000;
+    let mut blocks = 0;
+    let mut instructions = 0;
+    let mut undefined = 0;
+    let mut traced = 0;
+    let mut counts = BTreeMap::<u64, u64>::new();
+    let mut monitor = ExclusiveMonitor::default();
+    let started = std::time::Instant::now();
+    let result = loop {
+        let report = run(
+            cpu,
+            &mut monitor,
+            memory,
+            runner,
+            BlockLimits::default(),
+            BUDGET - blocks,
+        );
+        blocks += report.blocks;
+        instructions += report.work.retired_instructions;
+        undefined += report.undefined_el0_deliveries;
+        runner.finish_pending();
+        for svc in &runner.syscalls[traced..] {
+            let name = lookup_aarch64(svc.nr).map_or("unknown", |call| call.name);
+            println!(
+                "  svc {} {name} @ {:#x} args={:x?} ret={:?}",
+                svc.nr, svc.pc, svc.args, svc.ret
+            );
+            *counts.entry(svc.nr).or_default() += 1;
+        }
+        traced = runner.syscalls.len();
+        println!(
+            "  {report}; ESR={:#x} ELR={:#x} FAR={:#x}",
+            cpu.el1.esr.0, cpu.el1.elr.0, cpu.el1.far.0
+        );
+        if let Some(El0Fault { pc, esr, far }) = runner.first_el0_fault {
+            // The diagnostic image has identity-mapped guest code.
+            let mut bytes = [0; 4];
+            let word = memory
+                .read(VirtualAddress(pc), &mut bytes)
+                .ok()
+                .map(|()| u32::from_le_bytes(bytes));
+            break Err(format!(
+                "EL0 sync fault ELR={pc:#x} ESR={esr:#x} FAR={far:#x} word={word:08x?}: {report}"
+            ));
+        }
+        if report.undefined_el0_deliveries != 0 {
+            break Err(format!(
+                "EL0 undefined delivery without a traced vector: {report}"
+            ));
+        }
+        let Stop::Event {
+            event: Event::ProviderExit(exit),
+            ..
+        } = report.stop
+        else {
+            break Err(format!("EL1 boot probe stopped: {report}"));
+        };
+        if exit.immediate.value() != 2 {
+            break Err(format!("unexpected provider exit: {report}"));
+        }
+        let mb = LINUX_SYSCALL_MAILBOX_BASE;
+        let state = read_u32(memory, mb + offset_of!(Aarch64SyscallMailbox, state) as u64);
+        let kind = read_u32(
+            memory,
+            mb + offset_of!(Aarch64SyscallMailbox, trap_kind) as u64,
+        );
+        let nr = read_u64(
+            memory,
+            mb + offset_of!(Aarch64SyscallMailbox, native_nr) as u64,
+        );
+        let args = core::array::from_fn(|i| {
+            read_u64(
+                memory,
+                mb + offset_of!(Aarch64SyscallMailbox, args) as u64 + 8 * i as u64,
+            )
+        });
+        println!("  mailbox state={state} kind={kind} nr={nr} args={args:x?}");
+        let Some(svc) = runner.syscalls.last() else {
+            break Err(format!("mailbox without an EL0 SVC: {report}"));
+        };
+        if (state, kind, nr, args) != (1, 1, svc.nr, svc.args) || svc.ret.is_some() {
+            break Err(format!("unexpected mailbox for EL0 SVC {svc:?}: {report}"));
+        }
+        let name = lookup_aarch64(nr).map_or("unknown", |call| call.name);
+        // exit_group is terminal: the mailbox request supplies its status.
+        if name == "exit_group" {
+            break Ok(args[0]);
+        }
+        match replies.reply(memory, name, args) {
+            Ok(value) => {
+                println!("    synthetic {nr} {name} -> {value} ({value:#x})");
+                complete_mailbox_syscall(memory, value);
+            }
+            Err(error) => break Err(error),
+        }
+    };
+    let elapsed = started.elapsed().as_secs_f64();
+    println!(
+        "dynamic result={result:?} blocks={blocks} retired={instructions} undefined={} syscalls={counts:?} elapsed={elapsed:.6}s blocks/s={:.0} instr/s={:.0}",
+        undefined,
+        blocks as f64 / elapsed,
+        instructions as f64 / elapsed
+    );
+    result
+}
+
+/// Single-process test fixture for this loader witness. HVC #2 replies come
+/// from a test fixture (GlibcReplies), not from the production
+/// carrick-kernel / carrick-personality-linux dispatch. This owns only test
+/// pages and a read-only libc fixture; no guest pathname is used to open a
+/// host file.
+struct GlibcReplies {
+    libc: Vec<u8>,
+    libc_cursor: Option<usize>,
+    next_map: u64,
+    program_break: u64,
+    stdout: Vec<u8>,
+    libc_exec: Option<(u64, u64, u64)>,
+}
+
+impl GlibcReplies {
+    const FD: u64 = 3;
+    const MAX_MAPPING: u64 = 16 * 1024 * 1024;
+
+    fn brk(&mut self, memory: &mut Pages, requested: u64) -> i64 {
+        use carrick_mem::memory::LINUX_HEAP_BASE;
+        if (LINUX_HEAP_BASE..=LINUX_HEAP_BASE + Self::MAX_MAPPING).contains(&requested) {
+            for page in
+                (self.program_break.next_multiple_of(PAGE)..requested).step_by(PAGE as usize)
+            {
+                memory.map_zero(page);
+            }
+            for page in
+                (requested.next_multiple_of(PAGE)..self.program_break).step_by(PAGE as usize)
+            {
+                memory.unmap(page);
+            }
+            self.program_break = requested;
+        }
+        self.program_break as i64
+    }
+
+    fn protect(memory: &mut Pages, addr: u64, len: u64, prot: u64) {
+        use carrick_mem::linux_abi::{LINUX_PROT_EXEC, LINUX_PROT_WRITE};
+        use carrick_mem::memory::{AARCH64_LINUX_PAGE_TABLE_LAYOUT, LINUX_PAGE_TABLES_SIZE};
+        use carrick_mmu_core::aarch64::PageTableManager;
+
+        assert!(addr.is_multiple_of(PAGE) && len != 0 && len <= Self::MAX_MAPPING);
+        let mut raw = vec![0; LINUX_PAGE_TABLES_SIZE as usize];
+        memory
+            .read(VirtualAddress(LINUX_PAGE_TABLES_BASE), &mut raw)
+            .unwrap();
+        let mut tables =
+            PageTableManager::new(raw, LINUX_PAGE_TABLES_BASE, AARCH64_LINUX_PAGE_TABLE_LAYOUT);
+        let len = len.next_multiple_of(PAGE) as usize;
+        let exec = prot & LINUX_PROT_EXEC != 0;
+        match prot {
+            0 => tables.set_prot_none(addr, len, None),
+            p if p & LINUX_PROT_WRITE != 0 => tables.set_rw(addr, len, exec, None),
+            _ => tables.set_readonly(addr, len, exec, None),
+        }
+        .unwrap();
+        memory.load(
+            LINUX_PAGE_TABLES_BASE,
+            &tables.into_occupied_bytes().unwrap(),
+        );
+    }
+
+    fn mmap(&mut self, memory: &mut Pages, args: [u64; 6]) -> i64 {
+        use carrick_mem::linux_abi::{LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_PROT_EXEC};
+        use carrick_mem::memory::LINUX_MMAP_BASE;
+        let [hint, len, prot, flags, fd, offset] = args;
+        assert!((1..=Self::MAX_MAPPING).contains(&len));
+        assert!(offset.is_multiple_of(PAGE));
+        let len = len.next_multiple_of(PAGE);
+        let addr = if flags & LINUX_MAP_FIXED != 0 {
+            assert!(hint >= LINUX_MMAP_BASE && hint + len <= self.next_map);
+            hint
+        } else {
+            let addr = self.next_map;
+            self.next_map += len;
+            assert!(self.next_map <= LINUX_MMAP_BASE + Self::MAX_MAPPING);
+            addr
+        };
+        assert!(addr.is_multiple_of(PAGE));
+        for page in (addr..addr + len).step_by(PAGE as usize) {
+            memory.unmap(page);
+            memory.map_zero(page);
+        }
+        if flags & LINUX_MAP_ANONYMOUS == 0 {
+            assert_eq!(fd, Self::FD);
+            assert!(self.libc_cursor.is_some());
+            let offset = offset as usize;
+            let end = (offset + len as usize).min(self.libc.len());
+            memory.load(addr, &self.libc[offset..end]);
+            if prot & LINUX_PROT_EXEC != 0 {
+                self.libc_exec = Some((addr, offset as u64, len));
+            }
+        }
+        Self::protect(memory, addr, len, prot);
+        addr as i64
+    }
+
+    fn open(&mut self, memory: &mut Pages, path: u64) -> i64 {
+        use carrick_mem::linux_abi::LINUX_ENOENT;
+        let name = read_cstr(memory, path, 256);
+        println!("  openat path={}", String::from_utf8_lossy(&name));
+        if name != b"/lib/libc.so.6" {
+            return LINUX_ENOENT.guest_retval();
+        }
+        assert!(self.libc_cursor.replace(0).is_none());
+        bind_host_fixture_fd(
+            memory,
+            Self::FD as u32,
+            DELEGATED_FLAG_READABLE,
+            HostObjectBinding::from_host_fd(HostBoundFd::new(Self::FD as i32).unwrap()),
+        );
+        Self::FD as i64
+    }
+
+    fn read(&mut self, memory: &mut Pages, args: [u64; 6], positional: bool) -> i64 {
+        let [fd, buf, count, offset, ..] = args;
+        assert_eq!(fd, Self::FD);
+        let cursor = self.libc_cursor.as_mut().expect("open libc fd");
+        let start = if positional { offset as usize } else { *cursor };
+        let data = self.libc.get(start..).unwrap_or_default();
+        let bytes = &data[..data.len().min(count as usize)];
+        memory.write(VirtualAddress(buf), bytes).unwrap();
+        if !positional {
+            *cursor += bytes.len();
+        }
+        bytes.len() as i64
+    }
+
+    /// Return an error for an unlisted syscall, preserving the first blocker
+    /// rather than making the loader guess from a synthetic ENOSYS.
+    fn reply(&mut self, memory: &mut Pages, name: &str, args: [u64; 6]) -> Result<i64, String> {
+        use carrick_mem::linux_abi::{
+            KernelAbi, LINUX_ENOENT, LINUX_ENOSYS, LINUX_RLIMIT_STACK, LINUX_S_IFREG, LinuxRlimit,
+            LinuxStat, LinuxStatFields,
+        };
+
+        let [a, b, c, d, ..] = args;
+        let result = match name {
+            "brk" => self.brk(memory, a),
+            "mmap" => self.mmap(memory, args),
+            "mprotect" => {
+                Self::protect(memory, a, b, c);
+                0
+            }
+            "munmap" => {
+                Self::protect(memory, a, b, 0);
+                for page in (a..a + b).step_by(PAGE as usize) {
+                    memory.unmap(page);
+                }
+                0
+            }
+            "faccessat" => {
+                assert_eq!(read_cstr(memory, b, 256), b"/etc/ld.so.preload");
+                LINUX_ENOENT.guest_retval()
+            }
+            "openat" => self.open(memory, b),
+            "read" | "pread64" => self.read(memory, args, name == "pread64"),
+            "fstat" => {
+                assert_eq!(a, Self::FD);
+                assert!(self.libc_cursor.is_some());
+                let fields = LinuxStatFields {
+                    size: self.libc.len() as u64,
+                    ..LinuxStatFields::synthetic(b"/lib/libc.so.6", LINUX_S_IFREG | 0o555)
+                };
+                memory
+                    .write(
+                        VirtualAddress(b),
+                        LinuxStat::from_fields(&fields).abi_bytes(),
+                    )
+                    .unwrap();
+                0
+            }
+            "close" => {
+                assert_eq!(a, Self::FD);
+                assert!(self.libc_cursor.take().is_some());
+                0
+            }
+            "set_tid_address" => 1,
+            "set_robust_list" => 0,
+            "rseq" => LINUX_ENOSYS.guest_retval(),
+            "prlimit64" => {
+                assert_eq!((a, b, c), (0, LINUX_RLIMIT_STACK, 0));
+                memory
+                    .write(
+                        VirtualAddress(d),
+                        LinuxRlimit::new(8 * 1024 * 1024, u64::MAX).abi_bytes(),
+                    )
+                    .unwrap();
+                0
+            }
+            "getrandom" => {
+                assert!(b <= 256);
+                memory
+                    .write(VirtualAddress(a), &[0x9d; 256][..b as usize])
+                    .unwrap();
+                b as i64
+            }
+            "write" => {
+                assert!(matches!(a, 1 | 2) && c <= 4096);
+                let mut bytes = vec![0; c as usize];
+                memory.read(VirtualAddress(b), &mut bytes).unwrap();
+                if a == 1 {
+                    self.stdout.extend_from_slice(&bytes);
+                } else {
+                    println!("  stderr: {}", String::from_utf8_lossy(&bytes));
+                }
+                c as i64
+            }
+            _ => return Err(format!("unlisted mailbox syscall {name} {args:x?}")),
+        };
+        Ok(result)
+    }
 }

@@ -536,7 +536,9 @@ pub enum A64Class {
     Sev,
     Hint,
     SimdFpLoadStore,
+    Prefetch,
     SimdFpCompute,
+    Crc32,
 }
 
 /// Classify only encoding leaves whose reserved fields are checked below.
@@ -613,6 +615,7 @@ pub fn classify(w: u32) -> A64Class {
         0xd503207f => return Wfi,
         0xd503209f | 0xd50320bf => return Sev,
         0xd503203f => return Hint,
+        _ if instruction::compatibility_hint(w) => return Hint,
         _ => {}
     }
     let barrier = w & 0xfffff0ff;
@@ -712,6 +715,9 @@ pub fn classify(w: u32) -> A64Class {
     {
         return Multiply;
     }
+    if instruction::prefetch(w) {
+        return A64Class::Prefetch;
+    }
     // Loads and Stores: literal, pair, unsigned offset, unscaled/pre/post,
     // register offset. Reject reserved opc/size combinations before grouping.
     let v = w & (1 << 26) != 0;
@@ -753,10 +759,14 @@ pub fn classify(w: u32) -> A64Class {
     if w & 0x3f200c00 == 0x38200000 && (w >> 12) & 15 <= 8 {
         return LseAtomic;
     }
-    // SIMD/FP: scalar floating-point two-source arithmetic, single/double.
-    // Wider NEON families intentionally remain Unknown until individually checked.
-    if w & 0xff200c00 == 0x1e200800 && (w >> 22) & 3 < 2 && (w >> 12) & 15 <= 8 {
+    if instruction::crc32(w).is_some() {
+        return A64Class::Crc32;
+    }
+    if simd::decode(w).is_some() {
         return SimdFpCompute;
+    }
+    if instruction::structure_memory(w).is_some() {
+        return SimdFpLoadStore;
     }
     Unknown
 }
@@ -1138,6 +1148,7 @@ mod instruction {
         InstructionCache(crate::IcOperation),
         DataCacheZero(OperandRegister),
         SimdCopy(SimdCopy),
+        SimdCompute(crate::SimdCompute),
         SystemOperation(crate::SystemOperation),
         Barrier(crate::Barrier),
         ExceptionGeneration(crate::ExceptionGeneration),
@@ -1145,18 +1156,23 @@ mod instruction {
         PstateImmediate(crate::PstateImmediate),
         CensusGap(Decoded),
         Hint(Hint),
+        /// A HINT alias with architectural NOP semantics on this profile.
+        CompatibilityHint,
         Arithmetic(Arithmetic),
         Branch(Branch),
         ScalarMemory(ScalarMemory),
         UnprivilegedMemory(ScalarMemory),
         Extract(crate::Extract),
         PairMemory(PairMemory),
+        StructureMemory(StructureMemory),
+        Prefetch,
         Logical(Logical),
         MoveWide(MoveWide),
         Bitfield(Bitfield),
         Address(Address),
         Multiply(Multiply),
         Divide(Divide),
+        Crc32(Crc32),
         AtomicTransfer(AtomicTransfer),
         ConditionalSelect(ConditionalSelect),
         ConditionalCompare(ConditionalCompare),
@@ -1164,7 +1180,7 @@ mod instruction {
 
     /// Arm ARM DDI0487G.a C6.2.92 HINT, C6.2.204 NOP, C6.2.354 YIELD,
     /// C6.2.348 WFE, C6.2.350 WFI, C6.2.238 SEV, C6.2.239 SEVL;
-    /// encoding index C4.1.3, Hints. Extension hints are deliberately unsupported.
+    /// encoding index C4.1.3, Hints.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Hint {
         Nop,
@@ -1182,6 +1198,9 @@ mod instruction {
         if let Some(copy) = simd_copy(word) {
             return Instruction::SimdCopy(copy);
         }
+        if let Some(compute) = crate::simd::decode(word) {
+            return Instruction::SimdCompute(compute);
+        }
         if let Some(instruction) = crate::closure::decode(word) {
             return instruction;
         }
@@ -1196,6 +1215,9 @@ mod instruction {
         };
         if let Some(hint) = hint {
             return Instruction::Hint(hint);
+        }
+        if compatibility_hint(word) {
+            return Instruction::CompatibilityHint;
         }
 
         if let Some(a) = arithmetic(word) {
@@ -1213,6 +1235,12 @@ mod instruction {
         }
         if let Some(m) = pair_memory(word) {
             return Instruction::PairMemory(m);
+        }
+        if let Some(m) = structure_memory(word) {
+            return Instruction::StructureMemory(m);
+        }
+        if prefetch(word) {
+            return Instruction::Prefetch;
         }
         if let Some(l) = logical(word) {
             return Instruction::Logical(l);
@@ -1238,10 +1266,64 @@ mod instruction {
         if let Some(d) = divide(word) {
             return Instruction::Divide(d);
         }
+        if let Some(crc) = crc32(word) {
+            return Instruction::Crc32(crc);
+        }
         if let Some(a) = atomic_transfer(word) {
             return Instruction::AtomicTransfer(a);
         }
         crate::decode(word).map_or(Instruction::Unallocated, Instruction::CensusGap)
+    }
+
+    /// DDI0487 C4.1 HINT variants of pointer authentication, BTI and
+    /// CHKFEAT. These execute as NOP on the guest's baseline CPU. Other
+    /// pointer authentication encodings still require the extension.
+    pub(super) fn compatibility_hint(word: u32) -> bool {
+        word & 0xffff_ff1f == 0xd503_231f // PAC/AUT, LR forms
+            || word & 0xffff_ff3f == 0xd503_241f // BTI, each target kind
+            || matches!(
+                word,
+                0xd503_251f // CHKFEAT X16
+                | 0xd503_20ff // XPACLRI
+                | 0xd503_211f | 0xd503_215f | 0xd503_219f | 0xd503_21df // PAC/AUT, 1716 forms
+            )
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CrcPolynomial {
+        Ieee,
+        Castagnoli,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Crc32 {
+        pub destination: OperandRegister,
+        pub accumulator: OperandRegister,
+        pub data: OperandRegister,
+        pub size: MemorySize,
+        pub polynomial: CrcPolynomial,
+    }
+
+    /// DDI0487 C4.1 Data-processing (2 source), CRC32 and CRC32C.
+    pub(super) fn crc32(word: u32) -> Option<Crc32> {
+        if word & 0x7fe0_e000 != 0x1ac0_4000 {
+            return None;
+        }
+        let scale = (word >> 10) & 3;
+        if (word >> 31 == 1) != (scale == 3) {
+            return None;
+        }
+        Some(Crc32 {
+            destination: OperandRegister::field(word, false),
+            accumulator: OperandRegister::field(word >> 5, false),
+            data: OperandRegister::field(word >> 16, false),
+            size: MemorySize::scale(scale)?,
+            polynomial: if word & (1 << 12) == 0 {
+                CrcPolynomial::Ieee
+            } else {
+                CrcPolynomial::Castagnoli
+            },
+        })
     }
 
     /// Transfer size in bytes (including the SIMD 128-bit form).
@@ -1513,6 +1595,113 @@ mod instruction {
                 }
             },
             address: MemoryAddress::Literal(PcOffset((((w << 8) as i32) >> 13) as i64 * 4)),
+        })
+    }
+
+    /// PRFM and PRFUM have implementation-defined effect. This CPU ignores
+    /// prefetch hints without translating or touching the supplied address.
+    pub(super) fn prefetch(w: u32) -> bool {
+        matches!(w & 0xff00_0000, 0xd800_0000) // literal
+            || matches!(w & 0xffc0_0000, 0xf980_0000) // unsigned offset
+            || matches!(w & 0xffe0_0c00, 0xf880_0000) // unscaled
+            || (w & 0xffe0_0c00 == 0xf8a0_0800 && matches!((w >> 13) & 7, 2 | 3 | 6 | 7))
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StructureLayout {
+        Sequential,
+        Interleaved,
+        Lane(u8),
+        Replicate,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StructureWriteback {
+        None,
+        TransferBytes,
+        Register(Gpr),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct StructureMemory {
+        pub operation: MemoryOperation,
+        pub first: VectorRegister,
+        pub base: OperandRegister,
+        pub layout: StructureLayout,
+        pub writeback: StructureWriteback,
+        pub register_count: u8,
+        pub element: MemorySize,
+        pub vector_bytes: u8,
+    }
+
+    /// DDI0487 C4.1, Advanced SIMD load/store multiple and single structures.
+    pub(super) fn structure_memory(w: u32) -> Option<StructureMemory> {
+        if w & 0xbe00_0000 != 0x0c00_0000 {
+            return None;
+        }
+        let single = w & (1 << 24) != 0;
+        let rm = (w >> 16) & 31;
+        let post_index = w & (1 << 23) != 0;
+        if !post_index && rm != 0 {
+            return None;
+        }
+        let writeback = if !post_index {
+            StructureWriteback::None
+        } else if let Some(r) = Gpr::new(rm as u8) {
+            StructureWriteback::Register(r)
+        } else {
+            StructureWriteback::TransferBytes
+        };
+        let q = (w >> 30) & 1;
+        let load = w & (1 << 22) != 0;
+        let size = (w >> 10) & 3;
+        let (layout, register_count, scale) = if single {
+            let opcode = (w >> 13) & 7;
+            let s = (w >> 12) & 1;
+            let count = 1 + (opcode & 1) * 2 + ((w >> 21) & 1);
+            let lane = (q << 3) | (s << 2) | size;
+            let (layout, scale) = match opcode >> 1 {
+                0 => (StructureLayout::Lane(lane as u8), 0),
+                1 if size & 1 == 0 => (StructureLayout::Lane((lane >> 1) as u8), 1),
+                2 if size == 0 => (StructureLayout::Lane((lane >> 2) as u8), 2),
+                2 if size == 1 && s == 0 => (StructureLayout::Lane(q as u8), 3),
+                3 if load && s == 0 => (StructureLayout::Replicate, size),
+                _ => return None,
+            };
+            (layout, count, scale)
+        } else {
+            if w & (1 << 21) != 0 {
+                return None;
+            }
+            use StructureLayout::{Interleaved, Sequential};
+            let (layout, count) = match (w >> 12) & 15 {
+                0 => (Interleaved, 4),
+                2 => (Sequential, 4),
+                4 => (Interleaved, 3),
+                6 => (Sequential, 3),
+                7 => (Sequential, 1),
+                8 => (Interleaved, 2),
+                10 => (Sequential, 2),
+                _ => return None,
+            };
+            if layout == Interleaved && size == 3 && q == 0 {
+                return None;
+            }
+            (layout, count, size)
+        };
+        Some(StructureMemory {
+            operation: if load {
+                MemoryOperation::Load
+            } else {
+                MemoryOperation::Store
+            },
+            first: VectorRegister((w & 31) as u8),
+            base: OperandRegister::field(w >> 5, true),
+            layout,
+            writeback,
+            register_count: register_count as u8,
+            element: MemorySize::scale(scale)?,
+            vector_bytes: (8 << q) as u8,
         })
     }
 
@@ -2401,16 +2590,21 @@ mod instruction {
 pub use instruction::{
     AddImmediate, AddSubtract, Address, AddressBase, Arithmetic, ArithmeticOperand, AtomicTransfer,
     AtomicTransferKind, Bitfield, BitfieldOperation, Branch, CompareImmediate, CompareOperand,
-    Condition, ConditionalCompare, ConditionalSelect, Divide, Extend, Gpr, Hint, Instruction,
-    Logical, LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress, MemoryIndex,
-    MemoryOffset, MemoryOperation, MemoryRegister, MemorySize, MoveWide, MoveWideOperation,
-    Multiply, MultiplyKind, Nzcv, OperandRegister, PairMemory, PcOffset, RegisterBranch,
-    ScalarMemory, SelectOperation, ShiftAmount, SimdCopy, VectorRegister, decode_instruction,
+    Condition, ConditionalCompare, ConditionalSelect, Crc32, CrcPolynomial, Divide, Extend, Gpr,
+    Hint, Instruction, Logical, LogicalImmediate, LogicalOperand, LogicalOperation, MemoryAddress,
+    MemoryIndex, MemoryOffset, MemoryOperation, MemoryRegister, MemorySize, MoveWide,
+    MoveWideOperation, Multiply, MultiplyKind, Nzcv, OperandRegister, PairMemory, PcOffset,
+    RegisterBranch, ScalarMemory, SelectOperation, ShiftAmount, SimdCopy, StructureLayout,
+    StructureMemory, StructureWriteback, VectorRegister, decode_instruction,
 };
 
+mod cpu_profile;
+pub use cpu_profile::{GUEST_CPU_PROFILE, GuestCpuProfile};
 pub mod dispatch;
 pub mod exception;
 pub mod handler;
 pub mod mmu;
+mod simd;
+pub use simd::SimdCompute;
 pub mod state;
 pub mod translate;
