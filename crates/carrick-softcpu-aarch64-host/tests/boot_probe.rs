@@ -1471,30 +1471,10 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
         memory::{build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso},
     };
     use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
-    use std::process::Command;
 
     let elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
         .expect("read the production EL1 ELF");
-    let fixture =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/musl_hello.rs");
-    let out = std::env::temp_dir().join(format!("carrick-musl-hello-{}", std::process::id()));
-    let status = Command::new("rustc")
-        .args([
-            "--target",
-            "aarch64-unknown-linux-musl",
-            "-C",
-            "relocation-model=static",
-            "-C",
-            "debuginfo=2",
-            "-o",
-        ])
-        .arg(&out)
-        .arg(fixture)
-        .status()
-        .expect("compile static musl hello with the pinned toolchain");
-    assert!(status.success());
-    let user_elf = std::fs::read(&out).expect("read musl hello");
-    std::fs::remove_file(out).expect("remove compiled musl hello");
+    let user_elf = compile_static_musl_hello("probe");
 
     assert_eq!(field(&user_elf, 16, 2), 2, "musl hello must be ET_EXEC");
     let plan = plan_elf_load_bytes(&user_elf).unwrap();
@@ -1982,26 +1962,30 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch() {
 /// production EL1 vectors and trap path (`CARRICK_A64_ELF`) and production
 /// `carrick-kernel` / `carrick-personality-linux` dispatch, with zero `HVC #2`
 /// syscalls answered by the test fixture.
-#[test]
-#[ignore = "requires production CARRICK_A64_ELF and the pinned arm64 musl rust-std target"]
-fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
+fn compile_static_musl_hello(tag: &str) -> Vec<u8> {
     use std::process::Command;
 
-    let el1_elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
-        .expect("read the production EL1 ELF");
     let fixture =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/musl_hello.rs");
-    let out = std::env::temp_dir().join(format!("carrick-musl-hello-full-{}", std::process::id()));
-    let status = Command::new("rustc")
-        .args([
-            "--target",
-            "aarch64-unknown-linux-musl",
-            "-C",
-            "relocation-model=static",
-            "-C",
-            "debuginfo=2",
-            "-o",
-        ])
+    let out = std::env::temp_dir().join(format!("carrick-musl-hello-{tag}-{}", std::process::id()));
+    let mut rustc = Command::new("rustc");
+    rustc.args([
+        "--target",
+        "aarch64-unknown-linux-musl",
+        "-C",
+        "relocation-model=static",
+        "-C",
+        "debuginfo=2",
+    ]);
+    if let Some(linker) = std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER")
+        .or_else(|| std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"))
+    {
+        let mut arg = std::ffi::OsString::from("linker=");
+        arg.push(linker);
+        rustc.arg("-C").arg(arg);
+    }
+    let status = rustc
+        .arg("-o")
         .arg(&out)
         .arg(&fixture)
         .status()
@@ -2009,6 +1993,15 @@ fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
     assert!(status.success());
     let user_elf = std::fs::read(&out).expect("read musl hello");
     std::fs::remove_file(&out).expect("remove compiled musl hello");
+    user_elf
+}
+
+#[test]
+#[ignore = "requires production CARRICK_A64_ELF and the pinned arm64 musl rust-std target"]
+fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
+    let el1_elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
+        .expect("read the production EL1 ELF");
+    let user_elf = compile_static_musl_hello("full");
 
     let fixture_answered = 0usize;
     let config = carrick_softcpu_aarch64_host::SoftSingleProcessConfig {
