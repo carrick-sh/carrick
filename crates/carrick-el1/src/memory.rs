@@ -513,13 +513,10 @@ fn decide_madvise<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::From
 ) -> Result<Result<reservations::Decision, reservations::Refusal>, MadviseRefusal> {
     use carrick_personality_linux::mm::madvise::{self, Action, Advice};
     let advice = Advice::from_guest_arg(arguments[2]);
-    let fork_inheritance = match advice {
-        Advice::DontFork => Some(false),
-        Advice::DoFork => Some(true),
-        Advice::Unsupported => return Err(MadviseRefusal::Unrouted),
-        other if other.requires_host_attributes() => return Err(MadviseRefusal::Unrouted),
-        _ => None,
-    };
+    let attribute = advice.fork_attribute_edit();
+    if advice == Advice::Unsupported || (advice.requires_host_attributes() && attribute.is_none()) {
+        return Err(MadviseRefusal::Unrouted);
+    }
     let coverage = MadviseCoverage {
         model: core::cell::RefCell::new(model),
         owned: core::cell::Cell::new(true),
@@ -545,8 +542,8 @@ fn decide_madvise<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::From
         return Err(MadviseRefusal::Errno(carrick_syscall_abi::LINUX_ENOMEM));
     };
     let model = coverage.model.into_inner();
-    Ok(match fork_inheritance {
-        Some(inherit) => model.change_fork_inheritance(range, inherit),
+    Ok(match attribute {
+        Some((flags, set)) => model.change_attributes(range, flags, set),
         None => model.discard_range(range),
     })
 }
@@ -1686,11 +1683,11 @@ fn serve_delegated_anonymous_for_origin<
         return refuse(pending, &mut model, Leave::RootDeclined);
     }
     use carrick_el1_abi::ReservationOperation::{
-        Decommit, Discard, InheritOnFork, OmitFromFork, Prepare, Protect, Retire,
+        ClearAttributes, Decommit, Discard, Prepare, Protect, Retire, SetAttributes,
     };
-    let backing = if matches!(request.operation, OmitFromFork | InheritOnFork) {
-        // Fork inheritance is a root metadata edit. The parent keeps its
-        // descriptor graph and residency, including live COW leaves.
+    let backing = if matches!(request.operation, SetAttributes | ClearAttributes) {
+        // Attributes are a root metadata edit. The parent keeps its live
+        // descriptors and residency.
         Stage1Backing::of(RangeBacking::Empty)
     } else {
         editor.backing(

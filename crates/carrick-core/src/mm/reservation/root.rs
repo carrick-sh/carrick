@@ -2268,9 +2268,14 @@ impl<
             if n.start >= range.end() {
                 break;
             }
-            // Opaque and attributed nodes are host-owned: forward the edit.
+            // Policy owns the covered node and attribute validation.
             if !Policy::root_editable(&n) {
                 return Err(Refusal::ForeignMapping);
+            }
+            if operation == ReservationOperation::SetAttributes
+                && !Policy::validates_attributes(&n, flags)
+            {
+                return Err(Refusal::Invalid);
             }
             if require_coverage && n.start > cursor {
                 return Err(Refusal::Hole);
@@ -2301,8 +2306,8 @@ impl<
             operation,
             ReservationOperation::Retire
                 | ReservationOperation::Discard
-                | ReservationOperation::OmitFromFork
-                | ReservationOperation::InheritOnFork
+                | ReservationOperation::SetAttributes
+                | ReservationOperation::ClearAttributes
         ) {
             0
         } else {
@@ -2345,8 +2350,8 @@ impl<
             match operation {
                 ReservationOperation::Discard => 0,
                 ReservationOperation::Retire
-                | ReservationOperation::OmitFromFork
-                | ReservationOperation::InheritOnFork => self.splits_needed(range),
+                | ReservationOperation::SetAttributes
+                | ReservationOperation::ClearAttributes => self.splits_needed(range),
                 _ => self.splits_needed(range) + 1,
             }
         };
@@ -2795,25 +2800,29 @@ impl<
         })
     }
 
-    /// Change only fork inheritance for a fully covered private range.
-    pub fn change_fork_inheritance(
+    /// Propose an attribute-only edit over a fully covered editable range.
+    pub fn change_attributes(
         &mut self,
         range: ReservationRange,
-        inherit: bool,
+        flags: ReservationNodeFlags,
+        set: bool,
     ) -> Result<Decision, Refusal> {
+        if !ReservationNodeFlags::ATTRIBUTES.contains(flags) {
+            return Err(Refusal::Invalid);
+        }
         self.proposal(ReservationProposal {
             range,
             protection: ReservationProtection::NONE,
-            operation: if inherit {
-                ReservationOperation::InheritOnFork
+            operation: if set {
+                ReservationOperation::SetAttributes
             } else {
-                ReservationOperation::OmitFromFork
+                ReservationOperation::ClearAttributes
             },
             result: UserVa::new(0),
             policy_value: UserVa::new(self.brk_current()),
             require_coverage: true,
             source: None,
-            flags: ReservationNodeFlags::EMPTY,
+            flags,
         })
     }
 
@@ -2998,8 +3007,8 @@ impl<
             pending.request.operation,
             ReservationOperation::Retire
                 | ReservationOperation::Discard
-                | ReservationOperation::OmitFromFork
-                | ReservationOperation::InheritOnFork
+                | ReservationOperation::SetAttributes
+                | ReservationOperation::ClearAttributes
         );
         let created_backing = if created_flags.contains(ReservationNodeFlags::FILE)
             && matches!(
@@ -3032,16 +3041,16 @@ impl<
         match pending.request.operation {
             // Every node stays as it was; only its backing was retired.
             ReservationOperation::Discard => {}
-            ReservationOperation::OmitFromFork => self.reflag_range(
+            ReservationOperation::SetAttributes => self.reflag_range(
                 range,
-                ReservationNodeFlags::DONTFORK,
+                created_flags,
                 ReservationNodeFlags::EMPTY,
                 &mut spares,
             )?,
-            ReservationOperation::InheritOnFork => self.reflag_range(
+            ReservationOperation::ClearAttributes => self.reflag_range(
                 range,
                 ReservationNodeFlags::EMPTY,
-                ReservationNodeFlags::DONTFORK,
+                created_flags,
                 &mut spares,
             )?,
             // Each covered node keeps its own carried attributes.
