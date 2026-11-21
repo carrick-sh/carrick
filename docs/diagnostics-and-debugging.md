@@ -622,6 +622,13 @@ REFUSE nr=72(pselect6) caller=child venue=ring a0=0x5 a1=0xffffd2a0 a2=0x0 a3=0x
 For `select`/`pselect6` and `poll`/`ppoll` the line adds `nfds`; read the
 sets at the printed pointers from a core of the carrier.
 
+A writer claims its row with a compare-and-swap on the row's generation
+word. A writer that finds its row mid-write by another writer, or already
+holding a newer record (it was lapped by 64 refusals), writes nothing and
+counts the record in `Counters::refused_call_dropped` instead, so a reader
+never accepts a torn row. The census file keeps that count as
+`refused_calls_dropped`, and both decoders print it.
+
 ### Guest address-space mapping: the debug-state JSON
 
 The `mappings`/`gva`/`info` subcommands translate guest VAs back to image /
