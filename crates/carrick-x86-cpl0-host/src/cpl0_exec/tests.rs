@@ -367,13 +367,14 @@ fn exec_service_stages_a_static_successor() {
     let mut fixture = Fixture::new(16);
     let successor_image = image(argv(), vec![b"A=1".to_vec()]).unwrap();
     let demand = successor_image.demand();
-    // Three image pages and the sixteen-page built stack; the root, one
-    // 512 GiB table, the 1 GiB tables of the image and the stack, their
-    // 2 MiB tables, and the COW copy branch.
+    // Three image pages and the sixteen-page built stack; the root, the
+    // 512 GiB, 1 GiB and 2 MiB tables of the image and of the stack (which
+    // sits in its own 512 GiB slot, above every arena), and the COW copy
+    // branch.
     assert_eq!(
         demand,
         ImageFrameDemand {
-            tables: 9,
+            tables: 10,
             data: 19
         }
     );
@@ -398,8 +399,8 @@ fn exec_service_stages_a_static_successor() {
     };
     let successor = ReservationMm::new(SUCCESSOR).unwrap();
     let (_, preparation) = fixture.preparations.staged_for(successor).unwrap();
-    assert_eq!(preparation.tables().len(), 9);
-    assert_eq!(fixture.stock.table_stock().len(), 16 - 9);
+    assert_eq!(preparation.tables().len(), 10);
+    assert_eq!(fixture.stock.table_stock().len(), 16 - 10);
     assert_eq!(
         backing.root,
         preparation.tables()[0],
@@ -535,7 +536,7 @@ fn exec_service_refuses_with_exact_execve_errnos() {
 /// and the rerun stages it.
 #[test]
 fn a_pending_fork_parks_the_exec_until_its_release_wakes_it_then_stages() {
-    let mut fixture = Fixture::new(10);
+    let mut fixture = Fixture::new(11);
     let parent = GrantExecution::new(
         CpuId::new(1),
         ExecutionBinding {
@@ -569,7 +570,7 @@ fn a_pending_fork_parks_the_exec_until_its_release_wakes_it_then_stages() {
         .stock
         .loan(&mut NoTableLedger, parent, &mut exchange, |_| true)
         .unwrap();
-    assert_eq!(fixture.stock.table_stock().len(), 7);
+    assert_eq!(fixture.stock.table_stock().len(), 8);
 
     // The carrier's owner parks the claimed row on the stock's release: the
     // row keeps the receipt reserved at claim.
@@ -582,7 +583,7 @@ fn a_pending_fork_parks_the_exec_until_its_release_wakes_it_then_stages() {
     };
     fixture.preparations.park(receipt, parked, woken).unwrap();
     // Nothing is reserved while the exec waits.
-    assert_eq!(fixture.stock.table_stock().len(), 7);
+    assert_eq!(fixture.stock.table_stock().len(), 8);
     assert_eq!(fixture.stock.counters().successor_table_refusals, 1);
     assert!(fixture.preparations.staged(receipt).is_none());
     assert_eq!(fixture.preparations.parked(), vec![receipt]);

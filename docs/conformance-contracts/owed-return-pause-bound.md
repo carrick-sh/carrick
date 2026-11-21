@@ -45,8 +45,8 @@ It runs `native_owed_return_gib.S` through the real CPL0 carrier, checks the
 Linux-visible result against a native Linux execution, and checks two
 counts: exactly one doorbell, and the maximum owed pages covered under one
 exclusion.
-The fixture loads its ELF above the initial low stack so the production mmap
-arena is not clipped below a GiB by that stack. Two abutting half-GiB
+The fixture loads its ELF at 4 GiB, from when a low initial stack clipped a
+low image's mmap arena below a GiB (#2722); it no longer needs to. Two abutting half-GiB
 retirements, each containing one resident page, must merge into a GiB owed
 extent; reusing its far end then requires settlement. Sparse residency keeps
 the witness cheap without constructing reservation roots in the harness.
