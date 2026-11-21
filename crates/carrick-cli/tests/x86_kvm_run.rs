@@ -2412,6 +2412,213 @@ fn mounted_x86_fork_exec_child_reads_host_file() {
 }
 
 #[test]
+fn mounted_x86_exec_child_allowlisted_crossings_class_witness() {
+    if skip_without_kvm() {
+        return;
+    }
+    let mut expected_allowlist = std::collections::BTreeMap::new();
+    for line in include_str!("../../../docs/design/arm-ring-first-flip.tsv")
+        .lines()
+        .skip(1)
+    {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let nr: u64 = cols[0].parse().unwrap();
+        let name = cols[1];
+        let routing = cols[9];
+        if matches!(routing, "Forward-Allowlist" | "Temporary-forward") {
+            expected_allowlist.insert(nr, name);
+        }
+    }
+    expected_allowlist.insert(93, "exit");
+    expected_allowlist.insert(94, "exit_group");
+
+    let parse_rows = |stdout: &[u8], label: &str| -> Vec<(u64, u64, String, i64)> {
+        let text = std::str::from_utf8(stdout).unwrap_or_else(|e| panic!("{label} utf8: {e}"));
+        let rows: Vec<_> = text
+            .lines()
+            .map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                assert_eq!(parts.len(), 4, "{label} malformed row: {line:?}");
+                (
+                    parts[0].parse::<u64>().unwrap(),
+                    parts[1].parse::<u64>().unwrap(),
+                    parts[2].to_owned(),
+                    parts[3].parse::<i64>().unwrap(),
+                )
+            })
+            .collect();
+        let observed: std::collections::BTreeMap<u64, &str> = rows
+            .iter()
+            .map(|(canon, _, name, _)| (*canon, name.as_str()))
+            .collect();
+        assert_eq!(
+            observed, expected_allowlist,
+            "{label} must exercise every allowlisted crossing in crossing.rs / arm-ring-first-flip.tsv"
+        );
+        rows
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("child-crossing-class");
+    compile_assembly_with_flags(
+        "x86_child_crossing_class.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O2",
+        ],
+    );
+
+    let work = dir.path().join("native-work");
+    std::fs::create_dir(&work).unwrap();
+    let native = Command::new(&elf)
+        .current_dir(&work)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native x86 Linux crossing class oracle");
+    assert_eq!(
+        native.status.code(),
+        Some(7),
+        "native oracle stderr: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        std::fs::read_dir(&work).unwrap().count(),
+        0,
+        "fixture must clean up its scratch directory"
+    );
+    let native_rows = parse_rows(&native.stdout, "native");
+    let native_enosys: Vec<_> = native_rows
+        .iter()
+        .filter(|(_, _, _, ret)| *ret == -(libc::ENOSYS as i64))
+        .collect();
+    assert!(
+        native_enosys.is_empty(),
+        "native Linux returned ENOSYS for allowlisted crossings: {native_enosys:?}"
+    );
+
+    let guest = run_mounted_binary(&elf, "exec-child-crossing-class", false);
+    assert_eq!(
+        guest.status.code(),
+        Some(7),
+        "guest exit {:?}; stderr: {}; stdout: {}",
+        guest.status.code(),
+        String::from_utf8_lossy(&guest.stderr),
+        String::from_utf8_lossy(&guest.stdout),
+    );
+    assert!(
+        guest.stderr.is_empty(),
+        "guest stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    let guest_rows = parse_rows(&guest.stdout, "guest");
+
+    // Explicit decrease-only ratchet of single-lane gaps in an exec'd native
+    // child on x86_64. When a gap's owning issue/PR lands, the assertion below
+    // requires retiring its entry here in the same change.
+    const KNOWN_SINGLE_LANE_GAPS: &[(u64, &str, &str)] = &[
+        // PR #2590 / #2241: native host-file venue xattr, sync, allocation and vectored/positioned I/O.
+        (5, "setxattr", "#2590 / #2241"),
+        (6, "lsetxattr", "#2590 / #2241"),
+        (7, "fsetxattr", "#2590 / #2241"),
+        (8, "getxattr", "#2590 / #2241"),
+        (9, "lgetxattr", "#2590 / #2241"),
+        (10, "fgetxattr", "#2590 / #2241"),
+        (11, "listxattr", "#2590 / #2241"),
+        (12, "llistxattr", "#2590 / #2241"),
+        (13, "flistxattr", "#2590 / #2241"),
+        // PR #2590 / #2241: HostFileOp::Statfs (carrick-core-abi + carrick-kernel, outside #2581 R17 fence).
+        (43, "statfs", "#2590 / #2241"),
+        (44, "fstatfs", "#2590 / #2241"),
+        (47, "fallocate", "#2590 / #2241"),
+        (65, "readv", "#2590 / #2241"),
+        (68, "pwrite64", "#2590 / #2241"),
+        (69, "preadv", "#2590 / #2241"),
+        (70, "pwritev", "#2590 / #2241"),
+        (82, "fsync", "#2590 / #2241"),
+        (83, "fdatasync", "#2590 / #2241"),
+        (84, "sync_file_range", "#2590 / #2241"),
+        (267, "syncfs", "#2590 / #2241"),
+        // #2637 / #2241: removexattr family stays unrouted for native children.
+        (14, "removexattr", "#2637 / #2241"),
+        (15, "lremovexattr", "#2637 / #2241"),
+        (16, "fremovexattr", "#2637 / #2241"),
+        // #1089: CPL0 in-ring inotify binding seam.
+        (26, "inotify_init1", "#1089"),
+        // #2219: chroot, sendfile and copy_file_range crossings.
+        (51, "chroot", "#2219"),
+        (71, "sendfile", "#2219"),
+        (285, "copy_file_range", "#2219"),
+        // PR #2593 / #2588: native child pselect6 in ring.
+        (72, "pselect6", "#2593 / #2588"),
+        // #561: native signal owner signalfd4 in ring.
+        (74, "signalfd4", "#561"),
+        // PR #2630 / #2615 / #2590 / #1862: native child readlinkat /proc/self/exe.
+        (78, "readlinkat", "#2630 / #2615 / #2590 / #1862"),
+        // #1506: native child timerfd family in ring.
+        (85, "timerfd_create", "#1506"),
+        (86, "timerfd_settime", "#1506"),
+        (87, "timerfd_gettime", "#1506"),
+        // PR #2618: native clock/time resolution in ring.
+        (113, "clock_gettime", "#2618"),
+        (114, "clock_getres", "#2618"),
+        (153, "times", "#2618"),
+        (169, "gettimeofday", "#2618"),
+        // PR #2605 / #1846: native anonymous reservation advice and mlock family.
+        (227, "msync", "#2605 / #1846"),
+        (228, "mlock", "#2605 / #1846"),
+        (229, "munlock", "#2605 / #1846"),
+        (230, "mlockall", "#2605 / #1846"),
+        (231, "munlockall", "#2605 / #1846"),
+        (232, "mincore", "#2605 / #1846"),
+        (233, "madvise", "#2605 / #1846"),
+        (284, "mlock2", "#2605 / #1846"),
+        // #1678: native child close_range in ring.
+        (436, "close_range", "#1678"),
+        // #2157 / #1906: unrouted child file/pipe-splice/hint crossings.
+        (33, "mknodat", "#2157 / #1906"),
+        (75, "vmsplice", "#2157 / #1906"),
+        (76, "splice", "#2157 / #1906"),
+        (77, "tee", "#2157 / #1906"),
+        (81, "sync", "#2157 / #1906"),
+        (213, "readahead", "#2157 / #1906"),
+        (223, "fadvise64", "#2157 / #1906"),
+        (286, "preadv2", "#2157 / #1906"),
+        (287, "pwritev2", "#2157 / #1906"),
+        (437, "openat2", "#2157 / #1906"),
+    ];
+
+    let mut unexpected_enosys = Vec::new();
+    let mut newly_served_gaps = Vec::new();
+    for (canon, x86_nr, name, ret) in &guest_rows {
+        let gap = KNOWN_SINGLE_LANE_GAPS
+            .iter()
+            .find(|(gap_canon, gap_name, _)| gap_canon == canon && gap_name == name);
+        if *ret == -(libc::ENOSYS as i64) {
+            if gap.is_none() {
+                unexpected_enosys.push(format!("{name} (canonical={canon}, x86={x86_nr})"));
+            }
+        } else if let Some((_, _, owner_issue)) = gap {
+            newly_served_gaps.push(format!(
+                "{name} (canonical={canon}, x86={x86_nr}, ret={ret}, owner={owner_issue})"
+            ));
+        }
+    }
+    assert!(
+        newly_served_gaps.is_empty(),
+        "known single-lane gaps are now served in an exec'd child; retire them from KNOWN_SINGLE_LANE_GAPS:\n  {}",
+        newly_served_gaps.join("\n  ")
+    );
+    assert!(
+        unexpected_enosys.is_empty(),
+        "exec'd native child returned unexpected ENOSYS on allowlisted crossings ({}):\n  {}",
+        unexpected_enosys.len(),
+        unexpected_enosys.join("\n  ")
+    );
+}
+
+#[test]
 fn mounted_static_x86_signal_thread_identity_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_thread_identity.S", b"T\n");
 }
