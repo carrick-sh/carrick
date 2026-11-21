@@ -466,12 +466,21 @@ The zone word follows the container clock. A carrier binds it to its one
 container's `ClockDomain` after load (`ClockDomain::bind_ring_realtime`), and
 every offset change (`clock_settime`, `settimeofday`, `clock_adjtime` and
 `adjtimex` steps) republishes `vvar_realtime_off_ns(base, delta)` before the
-changing call returns. An exec's vvar stamp only publishes the initial word,
+changing call returns. The offset, its vvar epoch and the bound word live
+in one module-private `GuestRealtime` whose only writer, `commit`, does all
+three under `clock_changes`, so no setter can move the clock and skip the
+publish; `clock_changes_republish_the_{arm,x86}_zone_realtime_word` check
+a real `ZoneTables` of each ISA after a set, a step and an ADJ_SETOFFSET.
+An exec's vvar stamp only publishes the initial word,
 so it cannot reset a moved clock. A second binding is refused: the word is
 carrier-wide. The KVM witness moves the root container's clock after load and
 checks raw REALTIME, REALTIME_COARSE, gettimeofday and time in the root and a
-fork child; x86 guests cannot set the clock themselves yet (`clock_settime`
-is unrouted on x86, #1981). The dispatcher witness drives `clock_settime`
+fork child. Guests cannot set the clock themselves yet: on x86,
+`serial_host_native_root_and_child_clock_settime_and_settimeofday_are_unserved`
+pins `clock_settime(CLOCK_REALTIME)` and `settimeofday` to ENOSYS in a root
+and a fork child with every ring read unmoved, and signed ARM runs show
+the same ENOSYS (#2700, the divergence from the oracle). When a set is
+served, that witness fails with exit 97. The dispatcher witness drives `clock_settime`
 and `clock_adjtime(ADJ_SETOFFSET)` through the production entry against a
 bound word. The signed ARM checks are the `clocksettimevdso` probe
 (`child_shifted raw_shifted`) and `case_ring_clock_child_raw_syscalls`.
