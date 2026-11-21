@@ -39,7 +39,7 @@ call.
 
 ## Witnesses
 
-All four run on the production carrier with production kernel dispatch,
+All six run on the production carrier with production kernel dispatch,
 on x86_64 and on ARM64 hosts.
 
 - `soft_carrier_emits_the_hot_set_once_across_provider_exits` loops
@@ -61,14 +61,36 @@ on x86_64 and on ARM64 hosts.
   then unmaps it. The fetch of the resident `b .-4` must fault with
   SIGSEGV at its address. (`munmap` of ELF text is refused on the soft
   carrier today, #2725, so the witness unmaps a file mapping.)
+- `soft_carrier_serves_new_code_in_a_reused_frame` maps page 0 of `/patch`
+  (`svc #2; br x3`) at a kernel-chosen address and runs it twice, so it
+  is resident. It then unmaps it and maps page 1 (`svc #3; br x3`) at the
+  same address with `MAP_FIXED`. The soft carrier puts the new page in the
+  same physical frame, so this is the only witness where a resident key
+  meets a reused frame. The fetch must serve `svc #3`.
+- `soft_carrier_publish_retires_a_reused_frames_resident_code` runs the
+  same plan, then writes the frame through its raw host pointer, as
+  `repoint_private` seeds an overlay frame, and calls
+  `Aarch64Vmm::publish_user_executable` on it. The frame's code generation
+  must change.
 
 Each rewrite witness is red under a mutation that removes one
 invalidation; the munmap witness is red when a resident block is served
-without re-translating its PC:
+without re-translating its PC. The mutation runs below were on x86_64;
+"n/r" means not run.
 
-| mutation | prot-none | remap | munmap |
-|---|---|---|---|
-| generation compare removed (frame only) | red | red | green |
-| guest-store invalidation removed | red | red | green |
-| `write_gpa_bytes` invalidation removed | red | red | green |
-| resident block served when its PC does not translate | red | green | red |
+| mutation | prot-none | remap | munmap | reuse | publish |
+|---|---|---|---|---|---|
+| generation compare removed (frame only) | red | red | green | red | green |
+| guest-store invalidation removed | red | red | green | n/r | n/r |
+| `write_gpa_bytes` invalidation removed | red | red | green | green | green |
+| `publish_user_executable` invalidation removed | green | green | green | green | red |
+| both of the previous two removed | red | red | green | red | red |
+| resident block served when its PC does not translate | red | green | red | n/r | n/r |
+
+The reuse witness stays green when only one host-side invalidation is
+removed. On the soft carrier the eager private-file fill writes through
+`write_gpa_bytes` and the new leaf is published through
+`publish_user_executable`, so either one advances the generation. The
+publish witness covers the raw-writer case that only
+`publish_user_executable` guards. The audit of raw `host_ptr` writers that
+backs this was done by reading the code; no tool enforces it.
