@@ -23,7 +23,7 @@ use carrick_guest_mem::{GuestMemory, MappingSharing};
 use carrick_hal::posix_timer::PosixArm;
 use carrick_hal::{
     HostSignalBridge, NO_PENDING_SIGNAL, SyscallTrap, ThreadedEngine, TimerCoreBridge,
-    TimerDelivery, TimerFiring, TimerSpecNs,
+    TimerDelivery, TimerFiring, TimerSpecNs, TrapError,
 };
 use carrick_kernel::compat::CompatReporter;
 use carrick_kernel::dispatch::{
@@ -520,6 +520,94 @@ struct SingleProcessSummary {
     vmas: Vec<VmaSummary>,
 }
 
+fn prot_allows_access(prot: u64, access: Option<carrick_mmu_core::aarch64::LeafAccess>) -> bool {
+    use carrick_mmu_core::aarch64::LeafAccess;
+    let flags = LinuxProtFlags::from_bits_truncate(prot);
+    match access {
+        // Any accessible stage-1 leaf in Carrick's lowering is readable.
+        Some(LeafAccess::Read) => {
+            flags.intersects(LinuxProtFlags::READ | LinuxProtFlags::WRITE | LinuxProtFlags::EXEC)
+        }
+        Some(LeafAccess::Write) => flags.contains(LinuxProtFlags::WRITE),
+        Some(LeafAccess::Execute) => flags.contains(LinuxProtFlags::EXEC),
+        None => false,
+    }
+}
+
+enum FirstTouchResolution {
+    Busy,
+    Resolved(bool),
+}
+
+fn try_resolve_single_process_first_touch<X>(
+    engine: &mut SoftAarch64Engine<X>,
+    dispatcher: &mut SyscallDispatcher,
+    syndrome: u64,
+    far: u64,
+) -> Result<bool, String>
+where
+    X: ExecuteBlock + Send + 'static,
+    X::Error: core::fmt::Debug,
+{
+    let Some(access) = carrick_aarch64::esr::el0_fault_access(syndrome) else {
+        return Ok(false);
+    };
+    loop {
+        let step = dispatcher
+            .with_mm_executor_mutation(|disp, mutation| -> Result<FirstTouchResolution, String> {
+                let permit = mutation.host_alias_permit();
+                match disp.resident_fault_plan(&permit, far) {
+                    Err(_busy) => return Ok(FirstTouchResolution::Busy),
+                    Ok(Some(plan)) => {
+                        let page = plan.page();
+                        let prot = plan.prot();
+                        if !prot_allows_access(prot, Some(access)) {
+                            return Ok(FirstTouchResolution::Resolved(false));
+                        }
+                        engine
+                            .protect_range(page, GUEST_PAGE_BYTES as usize, prot)
+                            .map_err(|e| {
+                                format!("first-touch protect_range({page:#x}, prot={prot:#x}): {e}")
+                            })?;
+                        disp.commit_resident_fault(plan);
+                        return Ok(FirstTouchResolution::Resolved(true));
+                    }
+                    Ok(None) => {}
+                }
+
+                if matches!(
+                    access,
+                    carrick_mmu_core::aarch64::LeafAccess::Read
+                        | carrick_mmu_core::aarch64::LeafAccess::Write
+                ) && let Some(plan) = disp.mmap_growdown_fault_plan(&permit, far)
+                {
+                    let rw = (LinuxProtFlags::READ | LinuxProtFlags::WRITE).bits();
+                    engine
+                        .protect_range(plan.start(), plan.len(), rw)
+                        .map_err(|e| {
+                            format!(
+                                "growdown protect_range({:#x}, len={:#x}): {e}",
+                                plan.start(),
+                                plan.len()
+                            )
+                        })?;
+                    disp.commit_mmap_growdown(plan);
+                    return Ok(FirstTouchResolution::Resolved(true));
+                }
+
+                Ok(FirstTouchResolution::Resolved(false))
+            })
+            .map_err(|e| format!("MM executor mutation for first-touch fault: {e}"))??;
+        match step {
+            FirstTouchResolution::Busy => {
+                // Release the MM mutation lease before yielding and rerunning.
+                std::thread::yield_now();
+            }
+            FirstTouchResolution::Resolved(done) => return Ok(done),
+        }
+    }
+}
+
 fn drive_single_process_syscalls<X>(
     engine: &mut SoftAarch64Engine<X>,
     dispatcher: &mut SyscallDispatcher,
@@ -531,8 +619,11 @@ where
 {
     let reporter = CompatReporter::default();
     let mut syscalls_dispatched = 0u64;
+    let max_first_touch_faults = max_syscalls.saturating_mul(16).max(65_536);
+    let mut first_touch_faults = 0usize;
+    let mut syscall_turns = 0usize;
 
-    for _ in 0..max_syscalls {
+    while syscall_turns < max_syscalls {
         let pre_ctx = dispatcher
             .capture_one_task_context()
             .map_err(|e| format!("capture KernelContext before run: {e}"))?;
@@ -544,11 +635,25 @@ where
             pre_ctx.resources().files().id().raw(),
         );
 
-        let Some(mut raw) = engine
-            .next_syscall()
-            .map_err(|e| format!("engine next_syscall failed: {e}"))?
-        else {
-            continue;
+        let mut raw = match engine.next_syscall() {
+            Ok(Some(raw)) => {
+                syscall_turns += 1;
+                raw
+            }
+            Ok(None) => {
+                syscall_turns += 1;
+                continue;
+            }
+            Err(err @ TrapError::EL0Fault { syndrome, far, .. }) => {
+                if first_touch_faults < max_first_touch_faults
+                    && try_resolve_single_process_first_touch(engine, dispatcher, syndrome, far)?
+                {
+                    first_touch_faults += 1;
+                    continue;
+                }
+                return Err(format!("engine next_syscall failed: {err}"));
+            }
+            Err(e) => return Err(format!("engine next_syscall failed: {e}")),
         };
 
         let served_boundary = settle_el1_boundary_for(0, dispatcher);

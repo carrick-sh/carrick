@@ -31,6 +31,7 @@ structural_budgets = []
 vm_free = [
   "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel",
   "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_stage2_enforces_execute_permission_and_extent_code_generations",
+  "carrick-aarch64::esr::tests::decodes_el0_translation_and_permission_fault_access",
   "carrick-aarch64::mailbox::tests::mailbox_slot_round_trips_request_and_response",
   "carrick-aarch64::mailbox::tests::hvc_immediates_classify_canonically",
 ]
