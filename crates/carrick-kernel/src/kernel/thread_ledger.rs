@@ -462,14 +462,31 @@ impl ThreadIdentityPool {
         revoked
     }
 
-    fn push(
-        &self,
-        kernel: &Kernel,
-        state: &RegistryState,
-        task: &TaskRef,
-        credit: NsUid,
-        identity: ThreadIdentity,
-    ) -> bool {
+    fn push(&self, kernel: &Kernel, state: &RegistryState, task: &TaskRef, credit: NsUid) -> bool {
+        let page = task.shared().pending_signals().lifecycle_lease();
+        let mut entries = self.entries.lock();
+        // Only this pool publishes host stock. Hold its lock from slot
+        // selection through publication so concurrent refillers cannot spend
+        // identities on the same slot.
+        let Some(index) = (0..page.entry_count()).find(|&index| {
+            page.state(index).is_some_and(|(_, state)| {
+                matches!(
+                    state,
+                    EntryState::Vacant | EntryState::Reaped | EntryState::Revoked
+                )
+            })
+        }) else {
+            return false;
+        };
+        if entries.try_reserve(1).is_err()
+            || self
+                .published
+                .lock()
+                .try_reserve(entries.len() + 1)
+                .is_err()
+        {
+            return false;
+        }
         let Ok(birth_resources) =
             super::objects::ReservedThreadResources::reserve(kernel.object_ids())
         else {
@@ -484,12 +501,16 @@ impl ThreadIdentityPool {
         let Some(revisions) = task.reserve_thread_revisions(record.revision) else {
             return false;
         };
+        let Ok(identity) = ThreadIdentity::reserve(kernel, task) else {
+            return false;
+        };
         let adoption = match task.thread_adoption_factory() {
             Some(factory) => {
                 let Some(reservation) = factory.reserve(identity.key) else {
                     return false;
                 };
                 if reservation.owner() != task.key() || reservation.thread() != identity.key {
+                    drop(entries);
                     return false;
                 }
                 Some(reservation)
@@ -497,37 +518,25 @@ impl ThreadIdentityPool {
             None => None,
         };
         let control = task.allocate_thread_control(identity.key);
-        let page = control.lifecycle();
         let visible_tid = identity
             .pid_identity
             .as_ref()
             .map_or(identity.key.tid.raw() as u32, |id| id.visible_id());
         if !control.publish_visible_tid(visible_tid) {
+            drop(entries);
             return false;
         }
-        let mut entries = self.entries.lock();
-        if entries.try_reserve(1).is_err()
-            || self
-                .published
-                .lock()
-                .try_reserve(entries.len() + 1)
-                .is_err()
-        {
-            return false;
-        }
-        let Some(entry) = (0..carrick_el1_abi::THREAD_POOL_ENTRIES).find_map(|index| {
-            page.stock(
-                index,
-                carrick_el1_abi::EntryIdentity {
-                    tid: identity.key.tid.raw() as u32,
-                    visible_tid,
-                    thread_serial: identity.key.serial.raw(),
-                    birth: carrick_el1_abi::BirthSerial::of_task(task.key().serial),
-                    uid_credit: u64::from(credit.raw()),
-                },
-            )
-            .ok()
-        }) else {
+        let Ok(entry) = page.stock(
+            index,
+            carrick_el1_abi::EntryIdentity {
+                tid: identity.key.tid.raw() as u32,
+                visible_tid,
+                thread_serial: identity.key.serial.raw(),
+                birth: carrick_el1_abi::BirthSerial::of_task(task.key().serial),
+                uid_credit: u64::from(credit.raw()),
+            },
+        ) else {
+            drop(entries);
             return false;
         };
         if adoption.is_some()
@@ -1037,16 +1046,9 @@ impl ThreadLedger {
                         return false;
                     }
                 }
-                let Ok(identity) = ThreadIdentity::reserve(self.kernel, &self.record.task) else {
-                    return false;
-                };
-                self.record.thread_pool.push(
-                    self.kernel,
-                    self.state,
-                    &self.record.task,
-                    self.uid,
-                    identity,
-                )
+                self.record
+                    .thread_pool
+                    .push(self.kernel, self.state, &self.record.task, self.uid)
             }
         }
         carrick_core::lifecycle::stock::replenish(
@@ -2299,14 +2301,34 @@ mod tests {
             (super::DEFAULT_THREAD_POOL_DEPTH, 0),
             "exactly the demanding process"
         );
-        assert!(
-            root.thread()
-                .control_lease()
-                .lifecycle()
-                .claim_any()
-                .is_ok(),
-            "the ring clone's rerun claims a stocked entry"
+        let page = root.thread().control_lease().lifecycle();
+        let mut claims = Vec::new();
+        for _ in 0..page.entry_count() {
+            if !carrick_core::lifecycle::stock::claimable(&*page) {
+                assert_eq!(
+                    kernel.stock_thread_births_on_demand(&member(&root, 0)),
+                    CarrierWorkReply::Stocked
+                );
+            }
+            claims.push(
+                page.claim_any()
+                    .expect("the rerun claims the stocked entry"),
+            );
+        }
+        let (before, _before_reservation) = kernel.ids().reserve_thread().unwrap();
+        assert_eq!(
+            kernel.stock_thread_births_on_demand(&member(&root, 0)),
+            CarrierWorkReply::Unstockable
         );
+        let (after, _after_reservation) = kernel.ids().reserve_thread().unwrap();
+        assert_eq!(
+            after.raw(),
+            before.raw() + 1,
+            "full stock must not spend a TID"
+        );
+        for claim in claims {
+            page.unclaim(claim).unwrap();
+        }
         kernel.registry().thread_ledger().set_pool_depth_for_test(0);
         assert_eq!(
             kernel.stock_thread_births_on_demand(&member(&peer, 0)),
@@ -2365,11 +2387,10 @@ mod tests {
             .install_thread_adoption_factory(peer_factory)
             .unwrap();
         let before = kernel.ids().counts();
-        let identity = super::ThreadIdentity::reserve(&kernel, root.task()).unwrap();
         let state = kernel.registry().settled().read();
         let pool = &state.tasks.get(&root.task().key().id).unwrap().thread_pool;
         assert!(
-            !pool.push(&kernel, &state, root.task(), NsUid::ROOT, identity),
+            !pool.push(&kernel, &state, root.task(), NsUid::ROOT),
             "failed adoption capacity must leave the guest clone on its host fallback"
         );
         assert_eq!(kernel.ids().counts(), before);
@@ -2377,9 +2398,8 @@ mod tests {
             root.thread().control_lease().lifecycle().claim_any(),
             Err(carrick_el1_abi::TransitionError::PoolEmpty)
         );
-        let identity = super::ThreadIdentity::reserve(&kernel, peer.task()).unwrap();
         let pool = &state.tasks.get(&peer.task().key().id).unwrap().thread_pool;
-        assert!(pool.push(&kernel, &state, peer.task(), NsUid::ROOT, identity));
+        assert!(pool.push(&kernel, &state, peer.task(), NsUid::ROOT));
         assert!(peer.exact_thread_is_live());
     }
 
@@ -2396,11 +2416,10 @@ mod tests {
             )
             .unwrap();
         let before = kernel.ids().counts();
-        let identity = super::ThreadIdentity::reserve(&kernel, root.task()).unwrap();
         kernel.object_ids().exhaust_for_test();
         let state = kernel.registry().settled().read();
         let pool = &state.tasks.get(&root.task().key().id).unwrap().thread_pool;
-        assert!(!pool.push(&kernel, &state, root.task(), NsUid::ROOT, identity));
+        assert!(!pool.push(&kernel, &state, root.task(), NsUid::ROOT));
         assert_eq!(
             root.thread().control_lease().lifecycle().claim_any(),
             Err(carrick_el1_abi::TransitionError::PoolEmpty)

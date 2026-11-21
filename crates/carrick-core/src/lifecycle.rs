@@ -1072,18 +1072,30 @@ pub trait Lifecycle {
         Ok(ClaimedEntry(r))
     }
 
-    /// EL1 clone: claim the first `Reserved` entry ([`Self::claim`]).
-    /// `GateClosed` as soon as the gate refuses a claim; `PoolEmpty` when no
-    /// entry could be claimed (another claimant may have won each one).
+    /// Ordering of issued identities on a page. Layouts without an issuance
+    /// serial can retain slot order.
+    fn stock_order(&self, entry: EntryRef) -> Option<u64> {
+        Some(entry.index() as u64)
+    }
+
+    /// EL1 clone: claim the oldest `Reserved` identity. Reusing a low slot
+    /// must not put a new identity ahead of the standing stock.
     fn claim_any(&self) -> Result<ClaimedEntry, TransitionError> {
-        for index in 0..self.entry_count() {
-            let e = self.entry_word(index).ok_or(TransitionError::NoSuchEntry)?;
-            let (generation, state) = unpack(e.load(Ordering::Acquire));
-            if state != EntryState::Reserved {
-                continue;
-            }
-            let r = EntryRef::new(index as u32, generation);
-            match self.claim(r) {
+        for _ in 0..self.entry_count() {
+            let oldest = (0..self.entry_count())
+                .filter_map(|index| {
+                    let (generation, state) = self.state(index)?;
+                    if state != EntryState::Reserved {
+                        return None;
+                    }
+                    let entry = EntryRef::new(index as u32, generation);
+                    Some((entry, self.stock_order(entry)?))
+                })
+                .min_by_key(|&(_, order)| order);
+            let Some((entry, _)) = oldest else {
+                break;
+            };
+            match self.claim(entry) {
                 Ok(claimed) => return Ok(claimed),
                 Err(closed @ TransitionError::GateClosed(_)) => return Err(closed),
                 Err(_) => {}
