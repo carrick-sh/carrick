@@ -595,58 +595,69 @@ impl<
             _ => LeafAccess::Read,
         };
         let root = B::root(grant.ttbr0).map_err(mmu_error)?;
-        let mut leaf = match translated::<B, W>(words, root, va, access, continuation.intent) {
-            Err(MmError::Fault) if access == LeafAccess::Write => {
-                B::classify_cow(words, root, UserVa::new(va), cow.executable_publication())
-                    .map_err(mmu_error)?;
-                match cow.resolve_cow_outcome(grant.ttbr0, mm, va) {
-                    CowResolution::Resolved => {
-                        #[cfg(target_os = "none")]
-                        cow.finish_resolution(
-                            slot,
-                            continuation.handle,
-                            continuation.fork_sequence(),
-                            words,
-                        )?;
-                    }
-                    CowResolution::Refused(_) => return Err(MmError::Core),
-                    CowResolution::NeedsSupply => {
-                        let mut root = self.root(continuation.handle.mm(), slot)?;
-                        return Ok(TransferStep::CowSupply(
-                            crate::mm::fault::select_cow_supply_window(
-                                &mut root,
-                                carrick_core_abi::PortalOperation {
-                                    carrier: continuation.handle.carrier(),
-                                    mm: continuation.handle.mm(),
-                                    incarnation: continuation.handle.incarnation(),
-                                    sequence: continuation.sequence(),
-                                },
-                                UserVa::new(va),
+        // A write the live leaf refuses is a fork-armed page: resolve its
+        // copy, then translate again. A prepared leaf the fork left to be
+        // armed at residency becomes exactly such a page when it is committed
+        // below, so the same arm serves the translation after the commit
+        // (#2701): one COW path, whichever translation reports the refusal.
+        let mut committed = false;
+        let leaf = loop {
+            let leaf = match translated::<B, W>(words, root, va, access, continuation.intent) {
+                Err(MmError::Fault) if access == LeafAccess::Write => {
+                    B::classify_cow(words, root, UserVa::new(va), cow.executable_publication())
+                        .map_err(mmu_error)?;
+                    match cow.resolve_cow_outcome(grant.ttbr0, mm, va) {
+                        CowResolution::Resolved => {
+                            #[cfg(target_os = "none")]
+                            cow.finish_resolution(
+                                slot,
+                                continuation.handle,
                                 continuation.fork_sequence(),
-                            )?,
-                        ));
+                                words,
+                            )?;
+                        }
+                        CowResolution::Refused(_) => return Err(MmError::Core),
+                        CowResolution::NeedsSupply => {
+                            let mut root = self.root(continuation.handle.mm(), slot)?;
+                            return Ok(TransferStep::CowSupply(
+                                crate::mm::fault::select_cow_supply_window(
+                                    &mut root,
+                                    carrick_core_abi::PortalOperation {
+                                        carrier: continuation.handle.carrier(),
+                                        mm: continuation.handle.mm(),
+                                        incarnation: continuation.handle.incarnation(),
+                                        sequence: continuation.sequence(),
+                                    },
+                                    UserVa::new(va),
+                                    continuation.fork_sequence(),
+                                )?,
+                            ));
+                        }
                     }
+                    translated::<B, W>(words, root, va, access, continuation.intent)?
                 }
-                translated::<B, W>(words, root, va, access, continuation.intent)?
+                result => result?,
+            };
+            if leaf.is_some() || committed {
+                break leaf;
             }
-            result => result?,
+            committed = true;
+            let Some(page) = residency.lookup(mm, va) else {
+                break leaf;
+            };
+            if !matches!(
+                prepared.commit_prepared(
+                    grant.ttbr0,
+                    PageSpan::containing(va).va,
+                    page.expected_ipa,
+                    access,
+                ),
+                Ok(GuestPreparedCommit::Committed | GuestPreparedCommit::AlreadyResident)
+            ) {
+                break leaf;
+            }
+            residency.record_commit(page);
         };
-        if leaf.is_none() {
-            if let Some(page) = residency.lookup(mm, va)
-                && matches!(
-                    prepared.commit_prepared(
-                        grant.ttbr0,
-                        PageSpan::containing(va).va,
-                        page.expected_ipa,
-                        access,
-                    ),
-                    Ok(GuestPreparedCommit::Committed | GuestPreparedCommit::AlreadyResident)
-                )
-            {
-                residency.record_commit(page);
-            }
-            leaf = translated::<B, W>(words, root, va, access, continuation.intent)?;
-        }
         let Some((ipa, executable)) = leaf else {
             // Permission policy was already checked. Reuse the one lazy supply
             // owner receipt; no fault-mailbox transport is consumed by selection.
