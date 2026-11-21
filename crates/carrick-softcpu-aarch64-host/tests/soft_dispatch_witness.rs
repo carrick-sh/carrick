@@ -200,6 +200,11 @@ impl ScriptedHvc2Executor {
         // SAFETY: `ptr` points to the stage-2 `Aarch64SyscallMailbox` slot.
         unsafe {
             let state = (*ptr).state.load(Ordering::Acquire);
+            if state == MailboxState::Idle.raw() {
+                // Non-SVC `legacy_hvc` (`EL0Fault` retry) returns directly via `eret`
+                // without touching `x0` or mailbox state.
+                return Ok(());
+            }
             if state != MailboxState::ResponseReady.raw() {
                 return Err(format!("expected ResponseReady (2) on ERET, got {state}"));
             }
@@ -441,7 +446,9 @@ impl ExecuteBlock for ScriptedHvc2Executor {
             self.step_user_pc(cpu)?;
         } else if cpu.pstate.el == ExceptionLevel::El1 {
             if cpu.pc.0 == LINUX_EL1_VECTORS_BASE + 0x400 {
-                self.publish_mailbox_request(cpu)?;
+                if carrick_hal::aarch64::is_aarch64_svc_exception(cpu.el1.esr.0) {
+                    self.publish_mailbox_request(cpu)?;
+                }
             } else if cpu.pc.0 == LINUX_EL1_VECTORS_BASE + 0x404 {
                 self.consume_mailbox_response(cpu)?;
             }
