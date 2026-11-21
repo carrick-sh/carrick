@@ -4420,7 +4420,8 @@ fn two_live_threads_selected_window_busy_loser_refaults_and_completes() {
     let outcome = run_instrumented_pool_fixture(&elf, 64);
     assert_eq!(
         outcome.run.exit_code, 7,
-        "the Busy loser must settle its submitted window before parking"
+        "the Busy loser must settle its submitted window before parking: {:?}",
+        outcome.run
     );
     assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
