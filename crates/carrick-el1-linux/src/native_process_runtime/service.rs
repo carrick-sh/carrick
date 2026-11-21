@@ -179,6 +179,20 @@ impl Drop for UnannouncedNotice {
     }
 }
 
+/// How an admitted [`NativeProcessEntry`] returns [`NativeResume::Left`] to the
+/// ISA lane when a published service notice parks without a synchronous
+/// service doorbell.
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub(super) enum EntryExitVenue {
+    /// Trap, fault, IRQ, or user-return boundary whose `Left` seals straight
+    /// into `Action::Idle` (`El1Exit::Idle`) without entering `Sched::idle`.
+    DirectCarrierExit,
+    /// In-ring scheduler load (`resume_checkpoint`) whose `Left` returns
+    /// `LoadResult::Left` into `Sched::idle` and therefore requires a host-work
+    /// mark to force carrier intake.
+    SchedulerResume,
+}
+
 /// Outcome of parking a service request. A parked notice without a physical
 /// service doorbell can only be consumed by leaving straight to the carrier or
 /// marking pending host work on the slot.
@@ -198,8 +212,8 @@ impl ServiceParkOutcome {
         Self::Announced(resumed)
     }
 
-    fn from_published_park(resumed: NativeResume, physical_checkpoint: bool) -> Self {
-        if !physical_checkpoint {
+    fn from_published_park(resumed: NativeResume, announced: bool) -> Self {
+        if !announced {
             match resumed {
                 NativeResume::Left(None) => {
                     return Self::UnannouncedLeftNone(UnannouncedNotice::new());
@@ -229,7 +243,7 @@ impl ServiceParkOutcome {
         }
     }
 
-    /// Consume on a continuation or syscall path whose `Left` can return to
+    /// Consume on a continuation or contended rerun whose `Left` can return to
     /// `Sched::idle` without a physical service doorbell.
     fn mark_host_work(self, current: &CurrentTask) -> NativeResume {
         match self {
@@ -244,6 +258,13 @@ impl ServiceParkOutcome {
                 current.linux.mark_pending_host_work();
                 NativeResume::Left(Some(status))
             }
+        }
+    }
+
+    fn discharge_for_entry(self, venue: EntryExitVenue, current: &CurrentTask) -> NativeResume {
+        match venue {
+            EntryExitVenue::DirectCarrierExit => self.into_carrier_exit(),
+            EntryExitVenue::SchedulerResume => self.mark_host_work(current),
         }
     }
 }
@@ -609,36 +630,19 @@ mod exec_comm_tests {
     }
 }
 
-#[derive(::core::clone::Clone, ::core::marker::Copy)]
 enum ServiceCompletion {
-    CarrierExitInline,
-    MarkHostWorkInline,
-    CarrierExitRetrySyscall,
-    MarkHostWorkRetrySyscall,
+    Inline,
+    RetrySyscall,
     OwnerCheckpoint,
 }
 
 impl ServiceCompletion {
-    fn retries_syscall(self) -> bool {
-        matches!(
-            self,
-            Self::CarrierExitRetrySyscall | Self::MarkHostWorkRetrySyscall
-        )
+    fn retries_syscall(&self) -> bool {
+        matches!(self, Self::RetrySyscall)
     }
 
-    fn checkpoints_owner(self) -> bool {
+    fn checkpoints_owner(&self) -> bool {
         matches!(self, Self::OwnerCheckpoint)
-    }
-
-    fn discharge(self, outcome: ServiceParkOutcome, current: &CurrentTask) -> NativeResume {
-        match self {
-            Self::CarrierExitInline | Self::CarrierExitRetrySyscall | Self::OwnerCheckpoint => {
-                outcome.into_carrier_exit()
-            }
-            Self::MarkHostWorkInline | Self::MarkHostWorkRetrySyscall => {
-                outcome.mark_host_work(current)
-            }
-        }
     }
 }
 
@@ -1057,7 +1061,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         None,
                         Some(wait),
                         ServicePayload::Copyout(output),
-                        ServiceCompletion::MarkHostWorkInline,
+                        ServiceCompletion::Inline,
                     );
                 }
                 Err(NativeProcessError::Busy) => {
@@ -1069,7 +1073,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         None,
                         None,
                         ServicePayload::Copyout(output),
-                        ServiceCompletion::MarkHostWorkInline,
+                        ServiceCompletion::Inline,
                     );
                 }
                 Err(NativeProcessError::Unsupported) => {
@@ -1095,7 +1099,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 None,
                                 Some(wait),
                                 ServicePayload::Copyout(output),
-                                ServiceCompletion::MarkHostWorkInline,
+                                ServiceCompletion::Inline,
                             );
                         }
                         Err(NativeProcessError::Busy) => {
@@ -1107,7 +1111,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 None,
                                 None,
                                 ServicePayload::Copyout(output),
-                                ServiceCompletion::MarkHostWorkInline,
+                                ServiceCompletion::Inline,
                             );
                         }
                         Err(NativeProcessError::Unsupported) => {
@@ -1120,7 +1124,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 Some(sequence),
                                 None,
                                 ServicePayload::Copyout(output),
-                                ServiceCompletion::MarkHostWorkRetrySyscall,
+                                ServiceCompletion::RetrySyscall,
                             );
                         }
                         Err(NativeProcessError::Fault) if output.prefix_on_fault => {
@@ -1252,7 +1256,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             fault_sequence,
             None,
             ServicePayload::None,
-            ServiceCompletion::CarrierExitInline,
+            ServiceCompletion::Inline,
         )
     }
     /// A completed host member must retain its exact native return owner even
@@ -1355,7 +1359,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             owner_wait,
             ServicePayload::Copyin,
-            ServiceCompletion::MarkHostWorkInline,
+            ServiceCompletion::Inline,
         );
         match self.finish_service_handoff(result) {
             Ok(NativeResume::Left(status)) => {
@@ -1414,7 +1418,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             sequence,
             None,
             ServicePayload::Adapter,
-            ServiceCompletion::CarrierExitRetrySyscall,
+            ServiceCompletion::RetrySyscall,
         )
     }
     /// Supply the memory a refused guest copy needs (readable for an input,
@@ -1512,7 +1516,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             sequence,
             wait,
             ServicePayload::Copyin,
-            ServiceCompletion::MarkHostWorkRetrySyscall,
+            ServiceCompletion::RetrySyscall,
         )?;
         match result {
             NativeResume::RetrySyscall => Ok(LifecycleOutcome::Redispatch),
@@ -1556,7 +1560,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }),
                 None => ServicePayload::None,
             },
-            ServiceCompletion::CarrierExitRetrySyscall,
+            ServiceCompletion::RetrySyscall,
         )
     }
     pub fn begin_exec_service(
@@ -1610,7 +1614,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             None,
             ServicePayload::Exec(payload),
-            ServiceCompletion::CarrierExitInline,
+            ServiceCompletion::Inline,
         )
     }
     /// Begin a staged exec through the same owner on every ISA, for an entry
@@ -1673,7 +1677,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             None,
             ServicePayload::ClockSample(PendingClockSample { record, output }),
-            ServiceCompletion::CarrierExitInline,
+            ServiceCompletion::Inline,
         )
     }
 
@@ -1858,7 +1862,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             None,
             ServicePayload::HostFile(file),
-            ServiceCompletion::MarkHostWorkInline,
+            ServiceCompletion::Inline,
         )
     }
 
@@ -2061,7 +2065,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         None,
                         None,
                         ServicePayload::Copyin,
-                        ServiceCompletion::MarkHostWorkRetrySyscall,
+                        ServiceCompletion::RetrySyscall,
                     );
                 }
                 Err(NativeProcessError::OwnerWait(wait)) => {
@@ -2073,7 +2077,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         None,
                         Some(wait),
                         ServicePayload::Copyin,
-                        ServiceCompletion::MarkHostWorkRetrySyscall,
+                        ServiceCompletion::RetrySyscall,
                     );
                 }
                 Err(NativeProcessError::Unsupported) => {
@@ -2091,7 +2095,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             flags,
                             requested,
                         }),
-                        ServiceCompletion::MarkHostWorkRetrySyscall,
+                        ServiceCompletion::RetrySyscall,
                     );
                 }
                 Err(error) => return Err(error),
@@ -2116,7 +2120,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 address,
                 empty_fault: requested.raw() != 0 && capacity == 0,
             },
-            ServiceCompletion::MarkHostWorkInline,
+            ServiceCompletion::Inline,
         )
     }
 
@@ -2227,7 +2231,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             Some(wait),
             ServicePayload::None,
-            ServiceCompletion::CarrierExitInline,
+            ServiceCompletion::Inline,
         )
     }
     #[inline(never)]
@@ -2258,6 +2262,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 &request,
                 notice,
                 adapter || completion.checkpoints_owner(),
+                false,
             ),
             PreparedService::NoticeWait(request, holder, adapter) => {
                 #[cfg(test)]
@@ -2276,7 +2281,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     NoticeParkOutcome::Resumed(result) => Ok(ServiceParkOutcome::announced(result)),
                     NoticeParkOutcome::Published(notice, defer_completion) => {
                         let resumed = self
-                            .park_published_notice(&request, notice, defer_completion)?
+                            .park_published_notice(&request, notice, defer_completion, true)?
                             .mark_host_work(self.current);
                         Ok(ServiceParkOutcome::announced(resumed))
                     }
@@ -2284,7 +2289,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             PreparedService::Retired(result) => Ok(ServiceParkOutcome::announced(result)),
         }?;
-        Ok(completion.discharge(outcome, self.current))
+        Ok(outcome.discharge_for_entry(self.exit_venue, self.current))
     }
 
     #[inline(never)]
@@ -3201,13 +3206,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             match self.finish_notice_wait(&request, adapter || checkpoints_owner) {
                 Ok(NoticeFinishOutcome::Resumed(result)) => Ok(result),
                 Ok(NoticeFinishOutcome::Published(notice, defer_completion)) => self
-                    .park_published_notice(&request, notice, defer_completion)
+                    .park_published_notice(&request, notice, defer_completion, true)
                     .map(|outcome| outcome.mark_host_work(self.current)),
                 Ok(NoticeFinishOutcome::Held(holder, defer_completion)) => {
                     match self.park_notice_wait(&request, holder, defer_completion) {
                         Ok(NoticeParkOutcome::Resumed(result)) => Ok(result),
                         Ok(NoticeParkOutcome::Published(notice, defer_completion)) => self
-                            .park_published_notice(&request, notice, defer_completion)
+                            .park_published_notice(&request, notice, defer_completion, true)
                             .map(|outcome| outcome.mark_host_work(self.current)),
                         Err(error) => Err(error),
                     }
@@ -3224,20 +3229,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// Park a request whose selector was just published into `service_notice`.
     /// Callers must explicitly consume the returned [`ServiceParkOutcome`] via
     /// either a direct carrier exit or a host-work mark when no synchronous
-    /// service doorbell exists.
+    /// service doorbell announced this publication.
     #[inline(never)]
     fn park_published_notice(
         &mut self,
         request: &ServiceRequest,
         notice: PublishedNotice,
         defer_completion: bool,
+        contended_rerun: bool,
     ) -> Result<ServiceParkOutcome, NativeProcessError> {
         notice.consume();
         let physical_checkpoint = self.service.native_service_doorbell();
         let resumed = self.park_service(request, physical_checkpoint || defer_completion)?;
         Ok(ServiceParkOutcome::from_published_park(
             resumed,
-            physical_checkpoint,
+            physical_checkpoint && !contended_rerun,
         ))
     }
 
