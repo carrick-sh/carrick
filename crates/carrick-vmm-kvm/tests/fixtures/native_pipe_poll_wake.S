@@ -12,7 +12,16 @@
  * cleared to 0 before the child closes.
  * -DFINITE_TIMEOUT: poll uses 1 ms, ppoll {0, 1ms}; with the child sleeping
  * 50ms the call must time out (0, revents cleared). -DFINITE_TIMEOUT_LONG:
- * the same finite calls with 5 s, so a prompt writer close wins (1, POLLHUP). */
+ * the same finite calls with 5 s, so a prompt writer close wins (1, POLLHUP).
+ * With -DUSE_PSELECT -DCHILD_POLLS the writer is a sibling that writes only
+ * after the host has seen the reader's wait enrolled (SELECT_GATE_PORT).
+ * -DPARENT_WRITES: the reader's parent, itself a fork child the root
+ * reaps, is that writer. -DEXEC_WRITER: the
+ * writer makes the pipe its stdout and execs SUCCESSOR_PATH, which writes
+ * "X\n" (apt's method shape). -DSELECT_SIGMASK: the reader catches SIGUSR1
+ * and selects with a temporary mask blocking it; the writer sends SIGUSR1
+ * before writing. The wait must report the pipe, not EINTR, restore the
+ * empty persistent mask, and then run the handler. */
 .global _start
 .text
 _start:
@@ -58,6 +67,22 @@ _start:
     cmp $1, %rax
     jne fail_pipe
 #endif
+#ifdef PARENT_WRITES
+    mov $57, %eax                  /* the root only reaps the writing parent */
+    syscall
+    test %eax, %eax
+    js fail_fork
+    jz 1f
+    mov %eax, %edi
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    movzbl status+1(%rip), %edi    /* the parent's verdict, 7 on success */
+    jmp exit
+1:
+#endif
     mov $57, %eax                  /* fork */
     syscall
     test %eax, %eax
@@ -66,6 +91,9 @@ _start:
     jz poller
     mov %eax, %r12d
 #ifdef USE_PSELECT
+#ifdef PARENT_WRITES
+    jmp child                      /* the reader's parent is the writer */
+#else
     mov $57, %eax                  /* fork a sibling writer */
     syscall
     test %eax, %eax
@@ -73,6 +101,7 @@ _start:
     jz child
     mov %eax, %r15d
     jmp wait_for_child
+#endif
 #else
     jmp child
 #endif
@@ -212,7 +241,7 @@ wait_for_child:
     jz fail_wait
     jmp exit
 1:
-#ifndef SELECT_TIMEOUT_EOF
+#if !defined(SELECT_TIMEOUT_EOF) && !defined(PARENT_WRITES)
     mov %r15d, %edi              /* reap the sibling writer as well */
     lea status(%rip), %rsi
     xor %edx, %edx
@@ -272,6 +301,29 @@ child:
     syscall
     cmp $1, %rax
     jne child_fail
+#ifdef SELECT_SIGMASK
+    mov %r12d, %edi
+    mov $10, %esi
+    mov $62, %eax                 /* kill(reader, SIGUSR1) while it waits */
+    syscall
+    test %rax, %rax
+    jnz child_fail
+#endif
+#ifdef EXEC_WRITER
+    mov fds+4(%rip), %edi
+    mov $1, %esi
+    xor %edx, %edx
+    mov $292, %eax                /* dup3(fds[1], 1, 0): stdout survives exec */
+    syscall
+    cmp $1, %rax
+    jne child_fail
+    lea successor(%rip), %rdi
+    lea successor_argv(%rip), %rsi
+    xor %edx, %edx
+    mov $59, %eax                 /* execve(SUCCESSOR_PATH) */
+    syscall
+    jmp child_fail
+#endif
 #elif !defined(NO_CHILD_SLEEP)
     /* nanosleep({0, 50ms}) so the parent is parked before the write. */
     lea delay(%rip), %rdi
@@ -293,7 +345,7 @@ child:
     cmp $1, %rax
     jne child_fail
 #endif
-#if defined(CHILD_POLLS) && !defined(USE_PSELECT)
+#if defined(CHILD_POLLS) && (!defined(USE_PSELECT) || defined(PARENT_WRITES))
     jmp wait_for_child
 #else
     xor %edi, %edi
@@ -331,6 +383,16 @@ timed_pselect_child:
     jmp exit
 #endif
 pselect_reader:
+#ifdef SELECT_SIGMASK
+    mov $10, %edi
+    lea usr1_action(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax                  /* rt_sigaction(SIGUSR1, &action, NULL, 8) */
+    syscall
+    test %rax, %rax
+    jnz fail_signal
+#endif
 #ifdef USE_SELECT_TIMEVAL
     movq $-1, select_time+8(%rip)
     call select_call
@@ -339,6 +401,20 @@ pselect_reader:
 #endif
     call pselect_one
     call pselect_one
+#ifdef SELECT_SIGMASK
+    xor %edi, %edi                 /* SIG_BLOCK with no set reads the mask */
+    xor %esi, %esi
+    lea old_mask(%rip), %rdx
+    mov $8, %r10d
+    mov $14, %eax                  /* rt_sigprocmask */
+    syscall
+    test %rax, %rax
+    jnz fail_signal
+    cmpq $0, old_mask(%rip)        /* the persistent mask is back */
+    jne fail_signal
+    cmpl $1, usr1_seen(%rip)       /* the blocked signal ran afterwards */
+    jne fail_handler
+#endif
     xor %edi, %edi
     jmp exit
 
@@ -370,7 +446,13 @@ pselect_one:
     syscall
     cmp $1, %rax
     jne fail_result
+#ifdef EXEC_WRITER
+    movzbl received(%rip), %eax
+    or $0x20, %eax                 /* the successor writes 'X' */
+    cmp $'x', %eax
+#else
     cmpb $'x', received(%rip)
+#endif
     jne fail_revents
     ret
 
@@ -391,6 +473,9 @@ select_call:
 #else
 #ifdef SELECT_TIMEOUT_EOF
     lea select_time(%rip), %r8
+#endif
+#ifdef SELECT_SIGMASK
+    lea usr1_mask_pair(%rip), %r9  /* {&{SIGUSR1}, 8} */
 #endif
     mov $270, %eax                 /* pselect6 */
 #endif
@@ -427,10 +512,25 @@ fail_close:
     jmp exit
 fail_input:
     mov $18, %edi
+    jmp exit
+fail_signal:
+    mov $19, %edi
+    jmp exit
+fail_handler:
+    mov $20, %edi
 exit:
     mov $231, %eax
     syscall
     ud2
+#ifdef SELECT_SIGMASK
+usr1_handler:
+    movl $1, usr1_seen(%rip)
+    ret
+usr1_restorer:
+    mov $15, %eax                  /* rt_sigreturn */
+    syscall
+    ud2
+#endif
 .data
 .balign 16
 interest: .long 1
@@ -447,6 +547,17 @@ select_gate_peer:
     .byte 127, 0, 0, 1
     .quad 0
 #endif
+#ifdef SELECT_SIGMASK
+.balign 8
+usr1_action: .quad usr1_handler, 0x04000000, usr1_restorer, 0 /* SA_RESTORER */
+usr1_mask: .quad 0x200
+usr1_mask_pair: .quad usr1_mask, 8
+#endif
+#ifdef EXEC_WRITER
+successor: .asciz SUCCESSOR_PATH
+.balign 8
+successor_argv: .quad successor, 0
+#endif
 .bss
 .balign 4096
 fds: .space 8
@@ -457,6 +568,9 @@ reader_pid: .space 4
 status: .space 8
 poll_result: .space 8
 received: .space 1
+.balign 8
+old_mask: .space 8
+usr1_seen: .space 4
 
 .balign 16
 epoll_event: .space 12
