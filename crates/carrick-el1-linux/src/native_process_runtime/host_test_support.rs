@@ -13056,14 +13056,19 @@ fn native_zone_poll_signal_before_enrolment_completes_eintr_and_delivers_once() 
         .take_host_work_doorbell()
         .expect("post-enrolment interrupt probe must raise the host-work doorbell")
         .settled();
+    // The ring places its own interrupted waiter: nothing is left on the
+    // carrier's completion chain for a host to publish (#2620).
     let mut handed_back = Vec::new();
     fixture
         .zone
         .take_completion_handbacks(&carrick_sched_core::ShortLockSpin, &mut |record| {
-            assert!(fixture.zone.place_native_handback(record).is_some());
             handed_back.push(record);
         });
-    assert_eq!(handed_back, [fixture.record]);
+    assert!(handed_back.is_empty());
+    assert!(matches!(
+        fixture.zone.record(fixture.record.id).claim(),
+        carrick_sched_core::Claim::Queued { .. }
+    ));
 
     let selected = fixture
         .zone

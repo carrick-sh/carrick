@@ -2162,3 +2162,249 @@ fn x86_terminal_close_with_foreign_service_control_quarantines_at_member_guard()
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
     >(words);
 }
+
+#[derive(Clone, Copy)]
+enum ClosingObjectParkCause {
+    ExitGroup,
+    Abort,
+}
+
+/// #2620 (npm after a V8 fatal): a sibling parked in an in-ring object wait
+/// (the readable lane of a ring pipe, as a ring `epoll_pwait(-1)` parks) while
+/// its leader closes the process. The close interrupts the park; the member
+/// must be placed back in the ring without a carrier round trip, and its next
+/// owner entry must retire it with the close status, settling its operation,
+/// rather than replay the wait.
+fn closing_process_retires_object_parked_member_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    cause: ClosingObjectParkCause,
+) {
+    use carrick_core::wait::{ObjectParkRequest, observe_object, park_object_record};
+    use carrick_el1_abi::ipc::{object_wait_key, pipe::WaitFor};
+    use carrick_sched_core::object_wait::ObjectWaitError;
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let sibling = add_signal_sibling(&fixture, None, false);
+    assert!(fixture.zone.mark_native_owned(sibling.record.id));
+    // An unbound thread may run on either CPU, as in production; the shared
+    // sibling fixture pins it to the leader's.
+    fixture.zone.record(sibling.record.id).set_affinity(0b11);
+    assert_eq!(fixture.page.live(), 2);
+
+    let (region, object, pin, token) = retained_pipe_read(fixture.zone, sibling.slot, sibling.task);
+    let (token_index, token_generation) = (token.index(), token.generation());
+    let key = object_wait_key(object, WaitFor::Readable).unwrap();
+    let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
+        crate::sched::object_wait::deliver_completion(fixture.zone, sibling.slot, effects)
+    };
+    assert_eq!(
+        fixture
+            .zone
+            .slot(sibling.slot)
+            .current()
+            .or_else(|| fixture.zone.slot(sibling.slot).host_record()),
+        Some(sibling.record.id)
+    );
+    let snapshot = observe_object(fixture.zone, sibling.slot, key, &completion).unwrap();
+    // SAFETY: nothing publishes on this fixture's pipe between the
+    // observation and the park; the park revalidates the revision.
+    let snapshot = unsafe {
+        carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(snapshot)
+    };
+    let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
+    let mut parked = park_object_record(fixture.zone, sibling.slot, request, &completion, || {
+        let record = fixture
+            .zone
+            .slot(sibling.slot)
+            .current()
+            .or_else(|| fixture.zone.slot(sibling.slot).host_record())
+            .ok_or(ObjectWaitError::Stale)?;
+        // SAFETY: this fixture owns the selected sibling record until park publishes.
+        *unsafe { fixture.zone.record(record).ctx_mut() } = (fixture.make_words)(fixture.address);
+        Ok((record, false))
+    })
+    .unwrap_or_else(|(error, _)| panic!("the sibling's object park failed: {error:?}"));
+    assert!(parked.matches(fixture.zone, sibling.slot));
+    let _ = parked.take_receipt();
+    assert!(matches!(
+        fixture.zone.record(sibling.record.id).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    assert!(
+        fixture
+            .zone
+            .record(sibling.record.id)
+            .has_adapter_operation()
+    );
+
+    let (status, signaled) = match cause {
+        ClosingObjectParkCause::ExitGroup => (LinuxWaitStatus::exited(7), false),
+        ClosingObjectParkCause::Abort => (LinuxWaitStatus::signaled(6, false), true),
+    };
+    {
+        let mut service = fixture.service();
+        service.native_ipc = Some(region);
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let outcome = if signaled {
+            let abort = carrick_signal_core::policy::Signal::from_number(6).unwrap();
+            root.exit_with_signal(abort).unwrap()
+        } else {
+            root.exit_group(7)
+        };
+        assert!(matches!(outcome, LifecycleOutcome::Transferred { .. }));
+        assert!(root.take_run_failure().is_none());
+        assert!(root.take_handoff_receipt().is_some());
+    }
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::gate(fixture.page),
+        carrick_el1_abi::GateState::Closed
+    );
+
+    // The interrupted member is an in-zone object's waiter: the ring places
+    // it, never the carrier's completion chain (KVM drains no such chain).
+    let claim = fixture.zone.record(sibling.record.id).claim();
+    let carrick_sched_core::Claim::Queued { slot, .. } = claim else {
+        panic!("the close must place the interrupted object waiter in the ring, got {claim:?}");
+    };
+    assert_eq!(
+        fixture.zone.switch_in_full(slot).unwrap().record,
+        sibling.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+        .unwrap()
+        .words;
+    let mut sibling_service = fixture.service();
+    sibling_service.waker_slot = slot;
+    sibling_service.native_ipc = Some(region);
+    let mut member = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+    // The production syscall entry offers retained custody first: a closing
+    // member retires here; `None` would replay its object wait.
+    let retired = member.resume_owned_continuation();
+    assert!(
+        matches!(retired, Some(LifecycleOutcome::Transferred { .. })),
+        "the closing member's entry must retire it, not replay its wait (replayed: {})",
+        retired.is_none()
+    );
+    assert!(member.take_run_failure().is_none());
+    drop(member);
+
+    assert!(fixture.zone.live(sibling.record).is_none());
+    assert!(
+        !fixture
+            .zone
+            .record(sibling.record.id)
+            .has_object_operation()
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
+    let retired_token =
+        carrick_sched_core::object_wait::OperationToken::new(token_index, token_generation)
+            .unwrap();
+    assert!(
+        region
+            .operation(&carrick_el1::substrate::ipc::from_sched_token(retired_token).unwrap())
+            .is_err(),
+        "the retired member's IPC operation must be released"
+    );
+    assert!(
+        region
+            .fd(carrick_sched_core::ShortLockSpin)
+            .unpin_filtered(pin, crate::ipc::is_zone_releasable_backing)
+            .is_err(),
+        "terminal settlement must release the operation's endpoint pin"
+    );
+
+    let leader_slot = [fixture.slot, sibling.slot]
+        .into_iter()
+        .find(|candidate| fixture.zone.slot(*candidate).queued() != 0)
+        .expect("retiring the sibling must wake the closing leader");
+    assert_eq!(
+        fixture.zone.switch_in_full(leader_slot).unwrap().record,
+        fixture.record.id
+    );
+    let leader_saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut leader_service = fixture.service();
+    leader_service.waker_slot = leader_slot;
+    leader_service.native_ipc = Some(region);
+    let mut leader = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: leader_slot,
+            },
+            fixture.task,
+            fixture.address,
+            &leader_saved,
+            &mut leader_service,
+        )
+        .unwrap();
+    let resumed = leader.resume_checkpoint(|_| Ok(None));
+    assert!(
+        matches!(resumed, Ok(NativeResume::Left(Some(got))) if got == status),
+        "the closing leader must finish with {status:?}"
+    );
+}
+
+#[test]
+fn arm_exit_group_retires_object_parked_member() {
+    closing_process_retires_object_parked_member_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, ClosingObjectParkCause::ExitGroup);
+}
+
+#[test]
+fn x86_exit_group_retires_object_parked_member() {
+    closing_process_retires_object_parked_member_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, ClosingObjectParkCause::ExitGroup);
+}
+
+#[test]
+fn arm_abort_retires_object_parked_member() {
+    closing_process_retires_object_parked_member_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, ClosingObjectParkCause::Abort);
+}
+
+#[test]
+fn x86_abort_retires_object_parked_member() {
+    closing_process_retires_object_parked_member_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, ClosingObjectParkCause::Abort);
+}

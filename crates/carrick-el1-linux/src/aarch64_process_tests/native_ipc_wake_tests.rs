@@ -468,9 +468,11 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             call(&mut cpu, &mut frame, &mut || false)
         };
         assert_eq!(served, crate::ipc::IpcServed::Idle);
+        // A signal already pending at enrolment interrupts the park at
+        // once, and the ring places the interrupted waiter itself (#2620).
         assert!(matches!(
             fixture.zone.record(child.record.id).claim(),
-            Claim::Parked { .. } | Claim::Transferring { .. }
+            Claim::Parked { .. } | Claim::Transferring { .. } | Claim::Queued { .. }
         ));
         assert!(
             fixture.zone.slot(fixture.slot).current().is_none(),
@@ -485,11 +487,22 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
         );
     }
     fixture.zone.leave_guest(fixture.slot, &ShortLockSpin);
+    let mut vacated = Vec::new();
     if away {
         assert!(fixture.zone.step_away(
             fixture.slot,
             1,
             &mut |record| {
+                if signal.is_some_and(|case| case.before_enrollment)
+                    && children.iter().any(|child| child.record == record)
+                {
+                    // The ring already placed the child its pending signal
+                    // interrupted (#2620). The carrier's vacate settlement
+                    // (`settle_vacated`) routes it back as a native handback
+                    // once the slot lock is released, below.
+                    vacated.push(record);
+                    return;
+                }
                 assert!(
                     signal.is_none(),
                     "the signal sender stays on its own live driver"
@@ -499,6 +512,9 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             &mut |_| panic!("the fixture has no second driver"),
         ));
         assert!(!fixture.zone.slot(fixture.slot).is_live());
+        for record in vacated {
+            assert!(fixture.zone.place_native_handback(record).is_some());
+        }
     }
     if signal.is_some() {
         let race = if signal.is_some_and(|case| case.eof_race) {
