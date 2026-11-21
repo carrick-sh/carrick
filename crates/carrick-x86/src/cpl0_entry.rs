@@ -308,6 +308,11 @@ impl carrick_guest_arch::SyscallReturnFrame for NativeFrame {
 }
 
 impl NativeFrame {
+    /// The Linux syscall argument registers, in ABI order.
+    pub const fn syscall_arguments(&self) -> [u64; 6] {
+        [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9]
+    }
+
     pub fn snapshot(&self) -> NativeEntrySnapshot<'_, Self> {
         NativeEntrySnapshot {
             isa: GuestIsa::X86_64,

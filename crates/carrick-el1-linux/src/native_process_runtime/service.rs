@@ -1902,6 +1902,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     call.ordinal,
                     carrick_core_abi::service::ServiceOrigin::Initial,
                     carrick_el1_abi::RefusalVenue::Ring,
+                    carrick_el1_abi::RefusalArguments::Unretained,
                 );
                 Ok(NativeResume::Returned(SyscallResult::from_errno(
                     carrick_syscall_abi::LINUX_ENOSYS,
@@ -2261,6 +2262,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         carrick_core_abi::service::ServiceOrigin::Descendant
                     },
                     carrick_el1_abi::RefusalVenue::Ring,
+                    carrick_el1_abi::RefusalArguments::Unretained,
                 );
             }
             CallerAccessFailure(SyscallResult::from_errno(errno))
@@ -2321,8 +2323,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             } else {
                 carrick_core_abi::service::ServiceOrigin::Descendant
             };
-            call.counters
-                .record_refusal(call.ordinal, origin, carrick_el1_abi::RefusalVenue::Ring);
+            call.counters.record_refusal(
+                call.ordinal,
+                origin,
+                carrick_el1_abi::RefusalVenue::Ring,
+                carrick_el1_abi::RefusalArguments::Unretained,
+            );
             return Ok(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS));
         };
         fs.cwd = target;

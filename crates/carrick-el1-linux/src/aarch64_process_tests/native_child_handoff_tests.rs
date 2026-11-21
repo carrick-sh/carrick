@@ -2047,7 +2047,7 @@ fn namespace_baseline(
     service.task = task;
     // AArch64 Linux ordinals, through the production ARM entry (including
     // native_unstaged_exit), not a decoder or an inner staging helper.
-    for (nr, args) in [
+    let calls = [
         (34, [(-100i64) as u64, path.arg(), 0o777, 0]),
         (35, [(-100i64) as u64, path.arg(), 0, 0]),
         (
@@ -2057,7 +2057,11 @@ fn namespace_baseline(
         (36, [other.arg(), (-100i64) as u64, path.arg(), 0]),
         (78, [(-100i64) as u64, path.arg(), output.arg(), 128]),
         (53, [(-100i64) as u64, path.arg(), 0o700, 0]),
-    ] {
+    ];
+    // x4 and x5 are unused by these calls; the refusal record still keeps
+    // every argument register exactly as the child issued it.
+    let registers = |args: [u64; 4]| [args[0], args[1], args[2], args[3], 0xa4a4, 0xa5a5];
+    for (nr, args) in calls {
         for (index, binding) in bindings.iter().enumerate() {
             activate_target(source, task, binding);
             let identity = fixture.zone.record(binding.record.id).identity();
@@ -2070,7 +2074,7 @@ fn namespace_baseline(
                 ..Default::default()
             };
             frame.x[8] = nr;
-            frame.x[..4].copy_from_slice(&args);
+            frame.x[..6].copy_from_slice(&registers(args));
             let mut cpu = crate::sched::FakeCpu::default();
             let grant = fixture
                 .zone
@@ -2158,6 +2162,21 @@ fn namespace_baseline(
         );
         assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 2);
     }
+    // Each counted refusal retained what each live child asked for, in
+    // refusal order: the ordinal, the caller, the venue and x0..x5.
+    let expected: Vec<_> = calls
+        .into_iter()
+        .filter(|(nr, _)| *nr != 78)
+        .flat_map(|(nr, args)| {
+            [carrick_el1_abi::RefusedCall {
+                ordinal: carrick_guest_arch::NativeOrdinal::new(nr),
+                origin: carrick_core_abi::service::ServiceOrigin::Descendant,
+                venue: carrick_el1_abi::RefusalVenue::Ring,
+                arguments: carrick_el1_abi::RefusalArguments::Registers(registers(args)),
+            }; 2]
+        })
+        .collect();
+    assert_eq!(counters.refused_calls().collect::<Vec<_>>(), expected);
 }
 
 struct ForkedChildFutex<T> {
