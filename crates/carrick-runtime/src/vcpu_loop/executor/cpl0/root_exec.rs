@@ -85,15 +85,17 @@ pub(super) fn serve_root_exec(
         submission,
     };
     // The driver awaits nothing: it completes on its first poll.
-    let mut drive = std::pin::pin!(drive_root_exec(
-        &mut venue,
-        Drained::new(Instant::now()),
-        identity,
-    ));
-    match drive
-        .as_mut()
-        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
-    {
+    let polled = {
+        let mut drive = std::pin::pin!(drive_root_exec(
+            &mut venue,
+            Drained::new(Instant::now()),
+            identity,
+        ));
+        drive
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    };
+    match polled {
         std::task::Poll::Ready(result) => {
             result.map_err(|error| TrapError::Hypervisor(format!("CPL0 root exec: {error}")))
         }
@@ -163,7 +165,19 @@ impl<'a, 's> ImageReplacement<Cpl0RootExecVenue<'a, 's>> for Cpl0ImageReplacemen
         Ok(armed)
     }
 
+    /// The ring allocates the root's descriptors in the namespace the
+    /// carrier published for its boot table, and closed their close-on-exec
+    /// ones in place at its commit. The successor's staged table takes that
+    /// namespace over before the commit retires the predecessor's.
     fn publish_mm(&mut self, installed: PreparedExec) -> ExecStep<PreparedExec, RootExecKilled> {
+        installed
+            .old_file_table()
+            .hand_ipc_to_exec_successor(&installed.replacement_file_table())
+            .map_err(|error| {
+                Cpl0RootExecVenue::killed(format!(
+                    "hand the root's descriptor namespace to its successor: {error:?}"
+                ))
+            })?;
         Ok(installed)
     }
 }

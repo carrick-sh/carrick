@@ -2335,6 +2335,15 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             .exec_successor(predecessor, successor, successor_thread_serial)?;
         self.cpu.retarget_loaded_exec(predecessor, successor)?;
         custody.initial_task = Some(initial);
+        // The replaced image's private file sources die with it: the
+        // successor's start empty, under its own address context (#2142).
+        if custody
+            .initial_sources
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == predecessor.context())
+        {
+            custody.initial_sources = None;
+        }
         Ok(())
     }
 

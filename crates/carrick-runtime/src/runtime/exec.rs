@@ -1994,6 +1994,23 @@ mod tests {
         argv: &[&[u8]],
         table: Option<[u64; 3]>,
     ) -> Vec<u8> {
+        seal_task_row(
+            unsealed_x86_exec_payload(call, path, argv),
+            0,
+            "/",
+            None,
+            table,
+        )
+    }
+
+    /// A request as the ring stages it, before any caller access is sealed:
+    /// how the initial host root's request crosses (#2142).
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    fn unsealed_x86_exec_payload(
+        call: carrick_core_abi::service::ExecCall,
+        path: &str,
+        argv: &[&[u8]],
+    ) -> Vec<u8> {
         let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
         payload.extend_from_slice(path.as_bytes());
         payload.push(0);
@@ -2010,7 +2027,92 @@ mod tests {
             0,
         )
         .unwrap();
-        seal_task_row(payload, 0, "/", None, table)
+        payload
+    }
+
+    /// #2142: the x86 run root's exec request crosses unsealed and resolves
+    /// under the root's own capability; a descendant's must carry its sealed
+    /// access, and a sealed request is no root's. The root's load carries
+    /// the identity its successor reports, as the caller named it.
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    #[test]
+    fn x86_root_exec_resolves_under_the_root_capability_only_when_unsealed() {
+        use carrick_core_abi::service::{ExecCall, ServiceOrigin};
+
+        let mut layer = tar::Builder::new(Vec::new());
+        let successor = static_x86_successor();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(successor.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        layer
+            .append_data(&mut header, "bin/successor", successor.as_slice())
+            .unwrap();
+        let rootfs =
+            carrick_vfs::rootfs::RootFs::from_layers([carrick_vfs::rootfs::LayerSource::Tar(
+                layer.into_inner().unwrap(),
+            )])
+            .unwrap();
+        let dispatcher = std::sync::Mutex::new(SyscallDispatcher::with_rootfs(rootfs));
+        let unsealed = unsealed_x86_exec_payload(ExecCall::Execve, "/bin/successor", &[b"run"]);
+        let sealed = x86_exec_payload(ExecCall::Execve, "/bin/successor", &[b"run"], None);
+        let errno = |result: Result<_, LinuxErrno>| result.map(|_| ()).unwrap_err().get();
+
+        let loaded = load_native_x86_exec(&dispatcher, ServiceOrigin::Initial, &unsealed)
+            .expect("the root's unsealed request loads");
+        assert_eq!(loaded.image.entry().entry.raw(), 0x401000);
+        let identity = loaded
+            .root
+            .expect("the root's load carries its Kernel half")
+            .downcast::<X86RootExecLoad>()
+            .expect("the runtime's root load")
+            .identity;
+        assert_eq!(
+            (
+                identity.path.as_str(),
+                identity.argv.as_slice(),
+                identity.command_line.as_str()
+            ),
+            ("/bin/successor", ["run".to_owned()].as_slice(), "run")
+        );
+        assert!(
+            identity.binfmt_argv.is_none(),
+            "x86 takes no Rosetta redirect"
+        );
+
+        assert_eq!(
+            errno(load_native_x86_exec(
+                &dispatcher,
+                ServiceOrigin::Descendant,
+                &unsealed
+            )),
+            38,
+            "a descendant's request without its sealed access is unrouted"
+        );
+        assert_eq!(
+            errno(load_native_x86_exec(
+                &dispatcher,
+                ServiceOrigin::Initial,
+                &sealed
+            )),
+            38,
+            "a sealed request is no root's"
+        );
+        let loaded = load_native_x86_exec(&dispatcher, ServiceOrigin::Descendant, &sealed)
+            .expect("a descendant's sealed request loads");
+        assert!(
+            loaded.root.is_none(),
+            "only the root's load has a Kernel half"
+        );
+        let missing = unsealed_x86_exec_payload(ExecCall::Execve, "/bin/missing", &[b"missing"]);
+        assert_eq!(
+            errno(load_native_x86_exec(
+                &dispatcher,
+                ServiceOrigin::Initial,
+                &missing
+            )),
+            2
+        );
     }
 
     /// #1093 S4c slice c: a native child's exec on the x86 CPL0 carrier
