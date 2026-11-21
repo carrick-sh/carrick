@@ -116,6 +116,7 @@ rustc-demangle.workspace = true
 [dev-dependencies]
 carrick-conformance = { path = "../carrick-conformance" }
 carrick-test-support = { path = "../carrick-test-support" }
+carrick-abi = { path = "../carrick-abi" }
 carrick-xtask = { path = "../carrick-xtask" }
 assert_cmd.workspace = true
 predicates.workspace = true

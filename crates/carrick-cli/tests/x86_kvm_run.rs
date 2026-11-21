@@ -2497,24 +2497,159 @@ fn mounted_x86_fork_exec_child_reads_host_file() {
     );
 }
 
+/// An issue number: a typed owner, checked OPEN by
+/// `scripts/check-x86-child-gap-owners.sh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct IssueNumber(u32);
+
+/// One allowlisted crossing that an exec'd native child still refuses with a
+/// counted ENOSYS on x86_64.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildCrossingGap {
+    /// The canonical (AArch64) syscall number, validated against
+    /// `carrick_abi::syscall`.
+    canonical: u64,
+    name: String,
+    owner: IssueNumber,
+}
+
+/// Count ceiling for the gap table, in the manner of `AuthorityDebtCeilings`:
+/// the table may only fall. Raising it needs a new entry in
+/// `CHILD_CROSSING_GAP_ADMISSIONS` (count, linked issue, reason); the last
+/// entry is the live ceiling. Lowering is automatic: the witness fails while
+/// the table is shorter than the ceiling, so the same change that serves a
+/// crossing removes its row and lowers the ceiling.
+const CHILD_CROSSING_GAP_CEILING: usize = 35;
+const CHILD_CROSSING_GAP_ADMISSIONS: &[(usize, IssueNumber, &str)] = &[(
+    CHILD_CROSSING_GAP_CEILING,
+    IssueNumber(2581),
+    "initial typed ratchet of the exec'd-child crossing gaps",
+)];
+
+fn parse_child_crossing_gaps(text: &str) -> Result<Vec<ChildCrossingGap>, String> {
+    let mut gaps = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let at = |what: &str| format!("gap table line {}: {what}: {line:?}", index + 1);
+        let cols: Vec<&str> = line.split('\t').collect();
+        let [canonical, name, owner] = cols[..] else {
+            return Err(at("want 3 tab-separated columns (canonical, name, owner)"));
+        };
+        let canonical: u64 = canonical
+            .parse()
+            .map_err(|_| at("canonical is not a number"))?;
+        let owner: u32 = owner
+            .strip_prefix('#')
+            .unwrap_or(owner)
+            .parse()
+            .map_err(|_| at("owner is not an issue number"))?;
+        match carrick_abi::syscall::lookup_aarch64(canonical) {
+            Some(syscall) if syscall.name == name => {}
+            other => {
+                return Err(at(&format!(
+                    "canonical number does not name this syscall in carrick-abi: {other:?}"
+                )));
+            }
+        }
+        gaps.push(ChildCrossingGap {
+            canonical,
+            name: name.to_owned(),
+            owner: IssueNumber(owner),
+        });
+    }
+    Ok(gaps)
+}
+
+/// The allowlisted crossings named by the flip table, by canonical number.
+fn parse_flip_allowlist(tsv: &str) -> Result<std::collections::BTreeMap<u64, &str>, String> {
+    let mut lines = tsv.lines();
+    let header: Vec<&str> = lines
+        .next()
+        .ok_or("flip table is empty")?
+        .split('\t')
+        .collect();
+    let column = |name: &str| {
+        header
+            .iter()
+            .position(|col| *col == name)
+            .ok_or_else(|| format!("flip table has no {name:?} column: {header:?}"))
+    };
+    let (nr_col, name_col, routing_col) = (column("nr")?, column("name")?, column("flip_routing")?);
+    let mut allowlist = std::collections::BTreeMap::new();
+    for (index, line) in lines.enumerate() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let field = |col: usize| {
+            cols.get(col)
+                .copied()
+                .ok_or_else(|| format!("flip table row {} is short: {line:?}", index + 2))
+        };
+        if matches!(
+            field(routing_col)?,
+            "Forward-Allowlist" | "Temporary-forward"
+        ) {
+            let nr = field(nr_col)?
+                .parse()
+                .map_err(|_| format!("flip table row {}: bad nr: {line:?}", index + 2))?;
+            allowlist.insert(nr, field(name_col)?);
+        }
+    }
+    Ok(allowlist)
+}
+
+#[test]
+fn child_crossing_gap_table_is_typed_and_ratcheted() {
+    let gaps = parse_child_crossing_gaps(include_str!("fixtures/x86_child_crossing_gaps.tsv"))
+        .unwrap_or_else(|error| panic!("{error}"));
+    let (ceiling, _, _) = *CHILD_CROSSING_GAP_ADMISSIONS.last().expect("admissions");
+    assert_eq!(ceiling, CHILD_CROSSING_GAP_CEILING);
+    assert!(
+        CHILD_CROSSING_GAP_ADMISSIONS
+            .iter()
+            .all(|(_, _, reason)| !reason.is_empty()),
+        "every ceiling admission states its reason"
+    );
+    assert!(
+        gaps.len() <= CHILD_CROSSING_GAP_CEILING,
+        "the gap table grew past its ceiling ({} > {}); a new gap needs a recorded admission in CHILD_CROSSING_GAP_ADMISSIONS",
+        gaps.len(),
+        CHILD_CROSSING_GAP_CEILING
+    );
+    assert_eq!(
+        gaps.len(),
+        CHILD_CROSSING_GAP_CEILING,
+        "the gap table fell below its ceiling: lower CHILD_CROSSING_GAP_CEILING and record the admission"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    assert!(
+        gaps.iter().all(|gap| seen.insert(gap.canonical)),
+        "duplicate gap rows"
+    );
+    assert!(
+        parse_child_crossing_gaps("14\tremovexattr").is_err()
+            && parse_child_crossing_gaps("14\tmkdirat\t1").is_err(),
+        "a malformed or mislabelled row must fail the parse, not panic"
+    );
+    assert!(parse_flip_allowlist("nr\tname\tflip_routing\n1\tx\tForward-Allowlist\n").is_ok());
+    assert!(
+        parse_flip_allowlist("nr\tname\n").is_err(),
+        "missing column"
+    );
+    assert!(
+        parse_flip_allowlist("nr\tname\tflip_routing\n1\tx\n").is_err(),
+        "short row"
+    );
+}
+
 #[test]
 fn mounted_x86_exec_child_allowlisted_crossings_class_witness() {
     if skip_without_kvm() {
         return;
     }
-    let mut expected_allowlist = std::collections::BTreeMap::new();
-    for line in include_str!("../../../docs/design/arm-ring-first-flip.tsv")
-        .lines()
-        .skip(1)
-    {
-        let cols: Vec<&str> = line.split('\t').collect();
-        let nr: u64 = cols[0].parse().unwrap();
-        let name = cols[1];
-        let routing = cols[9];
-        if matches!(routing, "Forward-Allowlist" | "Temporary-forward") {
-            expected_allowlist.insert(nr, name);
-        }
-    }
+    let mut expected_allowlist =
+        parse_flip_allowlist(include_str!("../../../docs/design/arm-ring-first-flip.tsv"))
+            .unwrap_or_else(|error| panic!("{error}"));
     expected_allowlist.insert(93, "exit");
     expected_allowlist.insert(94, "exit_group");
 
@@ -2600,76 +2735,26 @@ fn mounted_x86_exec_child_allowlisted_crossings_class_witness() {
     );
     let guest_rows = parse_rows(&guest.stdout, "guest");
 
-    // Explicit decrease-only ratchet of single-lane gaps in an exec'd native
-    // child on x86_64. When a gap's owning issue/PR lands, the assertion below
-    // requires retiring its entry here in the same change.
-    const KNOWN_SINGLE_LANE_GAPS: &[(u64, &str, &str)] = &[
-        // #2637 / #2241: removexattr family stays unrouted for native children.
-        (14, "removexattr", "#2637 / #2241"),
-        (15, "lremovexattr", "#2637 / #2241"),
-        (16, "fremovexattr", "#2637 / #2241"),
-        // #1089: CPL0 in-ring inotify binding seam.
-        (26, "inotify_init1", "#1089"),
-        // #2219: chroot, sendfile and copy_file_range crossings.
-        (51, "chroot", "#2219"),
-        (71, "sendfile", "#2219"),
-        (285, "copy_file_range", "#2219"),
-        // PR #2593 / #2588: native child pselect6 in ring.
-        (72, "pselect6", "#2593 / #2588"),
-        // #561: native signal owner signalfd4 in ring.
-        (74, "signalfd4", "#561"),
-        // #1506: native child timerfd family in ring.
-        (85, "timerfd_create", "#1506"),
-        (86, "timerfd_settime", "#1506"),
-        (87, "timerfd_gettime", "#1506"),
-        // PR #2618: native clock/time resolution in ring.
-        (113, "clock_gettime", "#2618"),
-        (114, "clock_getres", "#2618"),
-        (153, "times", "#2618"),
-        (169, "gettimeofday", "#2618"),
-        // PR #2605 / #1846: native anonymous reservation advice and mlock family.
-        (227, "msync", "#2605 / #1846"),
-        (228, "mlock", "#2605 / #1846"),
-        (229, "munlock", "#2605 / #1846"),
-        (230, "mlockall", "#2605 / #1846"),
-        (231, "munlockall", "#2605 / #1846"),
-        (232, "mincore", "#2605 / #1846"),
-        (233, "madvise", "#2605 / #1846"),
-        (284, "mlock2", "#2605 / #1846"),
-        // #1678: native child close_range in ring.
-        (436, "close_range", "#1678"),
-        // #2157 / #1906: unrouted child file/pipe-splice/hint crossings.
-        (33, "mknodat", "#2157 / #1906"),
-        (75, "vmsplice", "#2157 / #1906"),
-        (76, "splice", "#2157 / #1906"),
-        (77, "tee", "#2157 / #1906"),
-        (81, "sync", "#2157 / #1906"),
-        (213, "readahead", "#2157 / #1906"),
-        (223, "fadvise64", "#2157 / #1906"),
-        (286, "preadv2", "#2157 / #1906"),
-        (287, "pwritev2", "#2157 / #1906"),
-        (437, "openat2", "#2157 / #1906"),
-    ];
-
+    let gaps = parse_child_crossing_gaps(include_str!("fixtures/x86_child_crossing_gaps.tsv"))
+        .unwrap_or_else(|error| panic!("{error}"));
     let mut unexpected_enosys = Vec::new();
     let mut newly_served_gaps = Vec::new();
     for (canon, x86_nr, name, ret) in &guest_rows {
-        let gap = KNOWN_SINGLE_LANE_GAPS
-            .iter()
-            .find(|(gap_canon, gap_name, _)| gap_canon == canon && gap_name == name);
+        let gap = gaps.iter().find(|gap| gap.canonical == *canon);
         if *ret == -(libc::ENOSYS as i64) {
             if gap.is_none() {
                 unexpected_enosys.push(format!("{name} (canonical={canon}, x86={x86_nr})"));
             }
-        } else if let Some((_, _, owner_issue)) = gap {
+        } else if let Some(gap) = gap {
             newly_served_gaps.push(format!(
-                "{name} (canonical={canon}, x86={x86_nr}, ret={ret}, owner={owner_issue})"
+                "{name} (canonical={canon}, x86={x86_nr}, ret={ret}, owner=#{})",
+                gap.owner.0
             ));
         }
     }
     assert!(
         newly_served_gaps.is_empty(),
-        "known single-lane gaps are now served in an exec'd child; retire them from KNOWN_SINGLE_LANE_GAPS:\n  {}",
+        "known gaps are now served in an exec'd child; retire their rows and lower the ceiling:\n  {}",
         newly_served_gaps.join("\n  ")
     );
     assert!(
