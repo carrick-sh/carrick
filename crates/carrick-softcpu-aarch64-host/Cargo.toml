@@ -8,15 +8,22 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-carrick-guest-arch = { path = "../carrick-guest-arch" }
-carrick-softmmu = { path = "../carrick-softmmu" }
-carrick-host-jit = { path = "../carrick-host-jit" }
-carrick-softcpu-aarch64 = { path = "../carrick-softcpu-aarch64" }
-
-[target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dev-dependencies]
 carrick-aarch64 = { path = "../carrick-aarch64" }
+carrick-abi = { path = "../carrick-abi" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-hal = { path = "../carrick-hal" }
+carrick-host-jit = { path = "../carrick-host-jit" }
+carrick-kernel = { path = "../carrick-kernel" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
+carrick-softcpu-aarch64 = { path = "../carrick-softcpu-aarch64" }
+carrick-softmmu = { path = "../carrick-softmmu", features = ["std"] }
+carrick-vfs = { path = "../carrick-vfs" }
+libc.workspace = true
+
+[dev-dependencies]
 goblin.workspace = true
 sha2.workspace = true
+tempfile.workspace = true

@@ -2509,72 +2509,18 @@ where
                                 ));
                             }
 
-                            let Ok(len_bytes) = usize::try_from(len) else {
-                                return Err(refuse(
-                                    Site::LenOverflow,
-                                    "range length does not fit usize".to_owned(),
-                                    None,
-                                ));
-                            };
-                            // The backend publishes the alias read-only or
-                            // read/write and never executable; PROT_NONE and
-                            // PROT_EXEC are the VMA's own protection,
-                            // published here before the guest can see it.
-                            let exec = carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
-                                .contains(carrick_abi::LinuxProtFlags::EXEC);
-                            if (prot_none || exec)
-                                && let Err(error) = engine.protect_range(
-                                    va.raw(),
-                                    len_bytes,
-                                    if prot_none { 0 } else { prot },
-                                )
-                            {
-                                return Err(refuse(Site::ProtectNone, error.to_string(), None));
-                            }
-                            engine.set_mapping_protection_and_sharing(
-                                va.raw(),
-                                len_bytes,
+                            carrick_kernel::dispatch::carrier_loop::finish_host_alias_stage1_install(
+                                engine,
+                                &kernel.dispatcher,
+                                install,
+                                va,
+                                len,
+                                prot,
                                 prot_none,
-                                !carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
-                                    .contains(carrick_abi::LinuxProtFlags::WRITE),
-                                if shared {
-                                    carrick_guest_mem::MappingSharing::Shared
-                                } else {
-                                    carrick_guest_mem::MappingSharing::Private
-                                },
-                            );
-                            if let Some((bus_start, bus_len)) = install.bus_fault_range() {
-                                let Ok(bus_len) = usize::try_from(bus_len) else {
-                                    return Err(refuse(
-                                        Site::BusFaultLenOverflow,
-                                        format!(
-                                            "bus-fault tail length {bus_len:#x} does not fit usize"
-                                        ),
-                                        None,
-                                    ));
-                                };
-                                if let Err(error) = engine.protect_range(bus_start, bus_len, 0) {
-                                    return Err(refuse(
-                                        Site::BusFaultProtect,
-                                        format!(
-                                            "bus-fault tail {bus_start:#x}+{bus_len:#x}: {error}"
-                                        ),
-                                        None,
-                                    ));
-                                }
-                                engine.set_no_access(bus_start, bus_len, true);
-                            }
-                            if let Err(error) = kernel.dispatcher.commit_host_alias_install(install)
-                            {
-                                return Err(refuse(
-                                    Site::DispatcherCommit,
-                                    format!("{error:?}"),
-                                    None,
-                                ));
-                            }
-                            Ok(DispatchOutcome::Returned {
-                                value: success_retval,
-                            })
+                                shared,
+                                success_retval,
+                            )
+                            .map_err(|failure| refuse(failure.site, failure.message, None))
                         };
                     let mutation = match &mut mm_phase {
                         SyscallMmPhase::Mutation(guard) => guard,

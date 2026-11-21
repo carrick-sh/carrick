@@ -125,6 +125,7 @@ pub(super) struct DynamicRoot {
     program_break: u64,
     exec_maps: Vec<Mapping>,
     opened: BTreeMap<PathBuf, u64>,
+    pub(super) answered: u64,
     pub(super) stdout: Vec<u8>,
     started: Instant,
     signal_actions: BTreeMap<u64, [u8; size_of::<LinuxSigaction>()]>,
@@ -194,6 +195,7 @@ impl DynamicRoot {
             program_break: LINUX_HEAP_BASE,
             exec_maps: Vec::new(),
             opened: BTreeMap::new(),
+            answered: 0,
             stdout: Vec::new(),
             started: Instant::now(),
             signal_actions: BTreeMap::new(),
@@ -726,7 +728,12 @@ impl DynamicRoot {
             "write" => self.write(memory, a, b, c),
             _ => return Err(format!("unlisted mailbox syscall {name} {args:x?}")),
         };
+        self.answered += 1;
         Ok(result.unwrap_or_else(errno))
+    }
+
+    pub(super) fn count_terminal_exit(&mut self) {
+        self.answered += 1;
     }
 
     /// Report resolved IFUNC imports by reading the applied ELF relocations.

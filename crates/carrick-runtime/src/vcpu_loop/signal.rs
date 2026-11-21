@@ -52,93 +52,13 @@ pub(crate) fn partial_write_interrupt_outcome(
 }
 
 // ===================================================================
-// EL0 synchronous-fault translation (moved from runtime/fault.rs; the
-// classifier fns are pure and the delivery fn is generic over the engine).
+// EL0 synchronous-fault translation (`carrick_aarch64::esr` owns the pure
+// AArch64 ESR_EL1 decodes; re-exported here so every runtime fault path
+// resolves unchanged).
 // ===================================================================
-/// Map an EL0 synchronous-fault `ESR_EL1` to the Linux `(signum, si_code)` the
-/// kernel would deliver, or `None` for a class we don't translate (kept fatal).
-pub(crate) fn el0_fault_signal(esr: u64) -> Option<(i32, i32)> {
-    const SIGSEGV: i32 = 11;
-    const SIGBUS: i32 = 7;
-    const SEGV_MAPERR: i32 = 1;
-    const SEGV_ACCERR: i32 = 2;
-    const BUS_ADRALN: i32 = 1;
-    let ec = (esr >> 26) & 0x3f;
-    let dfsc = esr & 0x3f;
-    let segv_code = if (0x0c..=0x0f).contains(&dfsc) {
-        SEGV_ACCERR
-    } else {
-        SEGV_MAPERR
-    };
-    match ec {
-        0x20 | 0x21 => Some((SIGSEGV, segv_code)), // instruction abort
-        0x24 | 0x25 => {
-            if dfsc == 0x21 {
-                Some((SIGBUS, BUS_ADRALN)) // alignment fault
-            } else {
-                Some((SIGSEGV, segv_code))
-            }
-        }
-        _ => None,
-    }
-}
-
-/// The EL0 access direction behind a translation or permission fault
-/// `ESR_EL1`, for authenticating a possibly stale fault against the live
-/// stage-1 leaf. `None` for every other fault class (alignment, access-flag,
-/// address-size, external abort): those never resolve by retry.
-/// The stage-1 fault kind of an EL0 data or instruction abort's syndrome;
-/// `None` for any other exception class or fault status.
-pub(crate) fn el0_fault_kind(esr: u64) -> Option<carrick_mmu_core::aarch64::Stage1FaultKind> {
-    let ec = (esr >> 26) & 0x3f;
-    if !matches!(ec, 0x20 | 0x21 | 0x24 | 0x25) {
-        return None;
-    }
-    carrick_mmu_core::aarch64::Stage1FaultKind::from_fault_status(esr & 0x3f)
-}
-
-pub(crate) fn el0_fault_access(esr: u64) -> Option<carrick_mmu_core::aarch64::LeafAccess> {
-    use carrick_mmu_core::aarch64::LeafAccess;
-    const WNR: u64 = 1 << 6;
-    let ec = (esr >> 26) & 0x3f;
-    let dfsc = esr & 0x3f;
-    if !((0x04..=0x07).contains(&dfsc) || (0x0c..=0x0f).contains(&dfsc)) {
-        return None;
-    }
-    match ec {
-        0x20 | 0x21 => Some(LeafAccess::Execute),
-        0x24 | 0x25 => Some(if esr & WNR != 0 {
-            LeafAccess::Write
-        } else {
-            LeafAccess::Read
-        }),
-        _ => None,
-    }
-}
-
-// `el0_debug_signal` (a pure AArch64 ESR_EL1 architectural fact) moved to
-// `carrick_aarch64::esr`; re-exported so the HVF lowering below and
-// every `el0_debug_signal` call path resolve unchanged.
-pub(crate) use carrick_aarch64::esr::el0_debug_signal;
-
-/// Lower a raw aarch64 `EL0Fault` (raw `ESR_EL1` + `elr`/`far`) to the
-/// ISA-neutral resolved signal triple `(signum, si_code, fault_addr)`, or `None`
-/// for a class we don't translate (kept fatal → caller terminates by SIGSEGV).
-///
-/// This is the aarch64 → [`TrapError::GuestFault`] lowering. It MUST cover BOTH
-/// fault arms so the GuestFault path is byte-identical to the historical
-/// `EL0Fault` path: `el0_debug_signal` (BRK/single-step/HW-bp → SIGTRAP/TRAP_*)
-/// is tried FIRST (so a debug exception carries the faulting PC as `si_addr`),
-/// then `el0_fault_signal` (instruction/data abort → SIGSEGV/SIGBUS, carrying
-/// `FAR_EL1` as `si_addr`). Mapping only `el0_fault_signal` would regress
-/// BRK/single-step SIGTRAP delivery (ptrace, Go TestDebugCall).
-pub(crate) fn lower_el0_fault(esr: u64, elr: u64, far: u64) -> Option<(i32, i32, u64)> {
-    if let Some((signum, si_code)) = el0_debug_signal(esr) {
-        Some((signum, si_code, elr))
-    } else {
-        el0_fault_signal(esr).map(|(signum, si_code)| (signum, si_code, far))
-    }
-}
+#[cfg(test)]
+pub(crate) use carrick_aarch64::esr::{el0_debug_signal, el0_fault_signal};
+pub(crate) use carrick_aarch64::esr::{el0_fault_access, el0_fault_kind, lower_el0_fault};
 
 #[derive(::core::fmt::Debug)]
 pub(crate) enum FaultSignalDisposition {
@@ -343,34 +263,7 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     }
 }
 
-fn apply_first_touch(
-    prot: u64,
-    access: Option<carrick_mmu_core::aarch64::LeafAccess>,
-    protect: impl FnOnce() -> bool,
-    commit: impl FnOnce(),
-) -> Option<bool> {
-    use carrick_mmu_core::aarch64::LeafAccess;
-    let required = match access {
-        // Preserve the current protection lowering: any accessible leaf is
-        // readable, including write-only and execute-only Linux requests.
-        Some(LeafAccess::Read) => {
-            crate::linux_abi::LINUX_PROT_READ
-                | crate::linux_abi::LINUX_PROT_WRITE
-                | crate::linux_abi::LINUX_PROT_EXEC
-        }
-        Some(LeafAccess::Write) => crate::linux_abi::LINUX_PROT_WRITE,
-        Some(LeafAccess::Execute) => crate::linux_abi::LINUX_PROT_EXEC,
-        None => return Some(false),
-    };
-    if prot & required == 0 {
-        return Some(false);
-    }
-    if !protect() {
-        return None;
-    }
-    commit();
-    Some(true)
-}
+use carrick_kernel::dispatch::carrier_loop::apply_first_touch;
 
 #[derive(
     ::core::fmt::Debug,
@@ -1244,108 +1137,72 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
             }
         }
     }
-    let mut first_touch = ring::FirstTouchRecord {
+    use carrick_kernel::dispatch::carrier_loop::{
+        HostGrowdownAttempt, HostResidentAttempt, HostStaleAttempt,
+        resolve_host_first_touch_or_stale,
+    };
+
+    let step = match resolve_host_first_touch_or_stale(
+        dispatcher, engine, mutation, address, access, fault_kind,
+    )? {
+        Ok(step) => step,
+        Err(busy) => return Ok(Err(busy)),
+    };
+
+    let access_code = access.map_or(3, |a| a as u32);
+    let resident = match &step.resident {
+        HostResidentAttempt::NotReached => FirstTouchResident::NotReached,
+        HostResidentAttempt::NoPlan => {
+            notify_first_touch_deliver(DeliverReason::NoPendingEdit);
+            FirstTouchResident::NoPlan
+        }
+        HostResidentAttempt::Committed => FirstTouchResident::Committed,
+        HostResidentAttempt::ArmingDenied => {
+            notify_first_touch_deliver(DeliverReason::ArmingDenies);
+            FirstTouchResident::ArmingDenied
+        }
+        HostResidentAttempt::BackendRefused { page, prot, error } => {
+            crate::probes::resident_fault_protection_error(*page, *prot, error);
+            crate::probes::hvpatch_first_touch_refused(*page, access_code, 1, error);
+            notify_first_touch_deliver(DeliverReason::BackendRefused);
+            FirstTouchResident::BackendRefused
+        }
+    };
+    let growdown = match &step.growdown {
+        HostGrowdownAttempt::NotReached => FirstTouchGrowdown::NotReached,
+        HostGrowdownAttempt::NoPlan => FirstTouchGrowdown::NoPlan,
+        HostGrowdownAttempt::Committed => FirstTouchGrowdown::Committed,
+        HostGrowdownAttempt::ProtectFailed { start, error } => {
+            crate::probes::hvpatch_first_touch_refused(*start, access_code, 2, error);
+            FirstTouchGrowdown::ProtectFailed
+        }
+    };
+    let stale = match step.stale {
+        HostStaleAttempt::NotReached => FirstTouchStale::NotReached,
+        HostStaleAttempt::AccessUnknown => FirstTouchStale::AccessUnknown,
+        HostStaleAttempt::Retried => {
+            if let Some(access) = access {
+                crate::probes::hvpatch_stale_stage1_retry(address, access as u32, tid.raw());
+            }
+            FirstTouchStale::Retried
+        }
+        HostStaleAttempt::NotRetried => {
+            notify_first_touch_deliver(DeliverReason::StaleLeafNotRetried);
+            FirstTouchStale::NotRetried
+        }
+    };
+
+    let first_touch = ring::FirstTouchRecord {
         tid: ring_tid,
         mm_key,
         fault_va: address,
         access: ring_access(access),
-        resident: FirstTouchResident::NotReached,
-        growdown: FirstTouchGrowdown::NotReached,
-        stale: FirstTouchStale::NotReached,
+        resident,
+        growdown,
+        stale,
     };
-    {
-        let permit = mutation.host_alias_permit();
-        let plan = match dispatcher.resident_fault_plan(&permit, address) {
-            Ok(plan) => plan,
-            Err(busy) => return Ok(Err(busy)),
-        };
-        if let Some(plan) = plan {
-            let page = plan.page();
-            let prot = plan.prot();
-            let access_code = access.map_or(3, |a| a as u32);
-            match apply_first_touch(
-                prot,
-                access,
-                || match engine.protect_range(
-                    page,
-                    crate::linux_abi::LINUX_PAGE_SIZE as usize,
-                    prot,
-                ) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        crate::probes::resident_fault_protection_error(page, prot, &error);
-                        crate::probes::hvpatch_first_touch_refused(page, access_code, 1, &error);
-                        false
-                    }
-                },
-                || dispatcher.commit_resident_fault(plan),
-            ) {
-                Some(true) => {
-                    first_touch.resident = FirstTouchResident::Committed;
-                    ring::rec_first_touch(&first_touch);
-                    return Ok(Ok(true));
-                }
-                Some(false) => {
-                    notify_first_touch_deliver(DeliverReason::ArmingDenies);
-                    first_touch.resident = FirstTouchResident::ArmingDenied;
-                    ring::rec_first_touch(&first_touch);
-                    return Ok(Ok(false));
-                }
-                None => {
-                    notify_first_touch_deliver(DeliverReason::BackendRefused);
-                    first_touch.resident = FirstTouchResident::BackendRefused;
-                }
-            }
-        } else {
-            notify_first_touch_deliver(DeliverReason::NoPendingEdit);
-            first_touch.resident = FirstTouchResident::NoPlan;
-        }
-    }
-    {
-        let permit = mutation.host_alias_permit();
-        first_touch.growdown = match dispatcher.mmap_growdown_fault_plan(&permit, address) {
-            None => FirstTouchGrowdown::NoPlan,
-            Some(plan) => {
-                match engine.protect_range(
-                    plan.start(),
-                    plan.len(),
-                    crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
-                ) {
-                    Ok(()) => {
-                        dispatcher.commit_mmap_growdown(plan);
-                        first_touch.growdown = FirstTouchGrowdown::Committed;
-                        ring::rec_first_touch(&first_touch);
-                        return Ok(Ok(true));
-                    }
-                    Err(error) => {
-                        let access_code = access.map_or(3, |a| a as u32);
-                        crate::probes::hvpatch_first_touch_refused(
-                            plan.start(),
-                            access_code,
-                            2,
-                            &error,
-                        );
-                    }
-                }
-                FirstTouchGrowdown::ProtectFailed
-            }
-        };
-    }
-    let (Some(access), Some(fault_kind)) = (access, fault_kind) else {
-        first_touch.stale = FirstTouchStale::AccessUnknown;
-        ring::rec_first_touch(&first_touch);
-        return Ok(Ok(false));
-    };
-    let retried = engine.resolve_stale_stage1_fault(address, access, fault_kind)?;
-    if retried {
-        crate::probes::hvpatch_stale_stage1_retry(address, access as u32, tid.raw());
-        first_touch.stale = FirstTouchStale::Retried;
-    } else {
-        notify_first_touch_deliver(DeliverReason::StaleLeafNotRetried);
-        first_touch.stale = FirstTouchStale::NotRetried;
-    }
     ring::rec_first_touch(&first_touch);
-    Ok(Ok(retried))
+    Ok(Ok(step.resolved))
 }
 
 /// Adopt only guest-marked pages whose current hardware-visible leaf still

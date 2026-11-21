@@ -1471,30 +1471,10 @@ fn production_el1_image_runs_static_musl_hello_to_first_carrier_call() {
         memory::{build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso},
     };
     use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
-    use std::process::Command;
 
     let elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
         .expect("read the production EL1 ELF");
-    let fixture =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/musl_hello.rs");
-    let out = std::env::temp_dir().join(format!("carrick-musl-hello-{}", std::process::id()));
-    let status = Command::new("rustc")
-        .args([
-            "--target",
-            "aarch64-unknown-linux-musl",
-            "-C",
-            "relocation-model=static",
-            "-C",
-            "debuginfo=2",
-            "-o",
-        ])
-        .arg(&out)
-        .arg(fixture)
-        .status()
-        .expect("compile static musl hello with the pinned toolchain");
-    assert!(status.success());
-    let user_elf = std::fs::read(&out).expect("read musl hello");
-    std::fs::remove_file(out).expect("remove compiled musl hello");
+    let user_elf = compile_static_musl_hello("probe");
 
     assert_eq!(field(&user_elf, 16, 2), 2, "musl hello must be ET_EXEC");
     let plan = plan_elf_load_bytes(&user_elf).unwrap();
@@ -1799,12 +1779,142 @@ const GLIBC_LOADER_SHA256: &str =
 const GLIBC_LIBC: &str = "/lib/libc.so.6";
 const GLIBC_LIBC_SHA256: &str = "ce67859ef338d8558a7fd7cff9a1effe5677ff9f7eea90641a2c051c51fab7ac";
 
+/// Without `Aarch64NativeProcessService` (`ThreadLifecyclePage` + `MmPortalSlots`),
+/// EL1 refuses `96` (`set_tid_address`) and `261` (`prlimit64`) in-ring (#2645),
+/// alongside `293` (`rseq`, #1906). No other syscall may surface as `ENOSYS`.
+fn assert_expected_single_process_enosys(counted: &[(u64, &'static str, u64)]) {
+    for &(nr, name, count) in counted {
+        assert!(
+            matches!(nr, 96 | 132 | 134 | 135 | 261 | 293),
+            "unexpected counted ENOSYS ({nr}, {name:?}, count={count}) in single-process production dispatch: {counted:?}"
+        );
+    }
+}
+
+fn assert_production_glibc_relocations_and_ifuncs(
+    program: &carrick_mem::elf::ElfProgram<'_>,
+    libc_bytes: &[u8],
+    run: &carrick_softcpu_aarch64_host::SoftProcessRun,
+    compiler: &str,
+) {
+    use carrick_guest_mem::GuestMemory as _;
+    use goblin::elf::{reloc::R_AARCH64_JUMP_SLOT, sym::STT_GNU_IFUNC};
+    use std::collections::BTreeSet;
+
+    let interpreter = program
+        .interpreter
+        .as_ref()
+        .expect("dynamic glibc interpreter");
+    let exe_ranges: Vec<(u64, u64)> = program
+        .executable
+        .segments
+        .iter()
+        .map(|s| (s.virtual_address, s.virtual_address + s.memory_size))
+        .collect();
+    let interp_ranges: Vec<(u64, u64)> = interpreter
+        .plan
+        .segments
+        .iter()
+        .map(|s| (s.virtual_address, s.virtual_address + s.memory_size))
+        .collect();
+    let overlaps = |ranges: &[(u64, u64)], addr: u64| {
+        ranges
+            .iter()
+            .any(|&(start, end)| (start..end).contains(&addr))
+    };
+
+    let in_libc_exec = |target: u64| -> bool {
+        !overlaps(&exe_ranges, target)
+            && !overlaps(&interp_ranges, target)
+            && run.vmas.iter().any(|vma| {
+                vma.access.executable && (vma.start.raw()..vma.end.raw()).contains(&target)
+            })
+    };
+
+    let read_guest_u64 = |va: u64| -> Option<u64> {
+        let bytes = run.engine.read_bytes(va, 8).ok()?;
+        Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    };
+
+    let elf = goblin::elf::Elf::parse(program.executable_bytes).unwrap();
+    for name in ["memcpy", "strlen", "memset"] {
+        let slot = elf
+            .pltrelocs
+            .iter()
+            .find(|rel| {
+                rel.r_type == R_AARCH64_JUMP_SLOT
+                    && elf
+                        .dynsyms
+                        .get(rel.r_sym)
+                        .and_then(|sym| elf.dynstrtab.get_at(sym.st_name))
+                        == Some(name)
+            })
+            .unwrap_or_else(|| {
+                panic!("missing {name} R_AARCH64_JUMP_SLOT in fixture built with {compiler}")
+            });
+        let target = read_guest_u64(program.executable.load_bias + slot.r_offset)
+            .unwrap_or_else(|| panic!("unreadable {name} GOT slot"));
+        assert!(
+            in_libc_exec(target),
+            "unexpected {name} target {target:#x} outside libc executable VMAs: {:?}",
+            run.vmas
+        );
+    }
+
+    let libc_elf = goblin::elf::Elf::parse(libc_bytes).unwrap();
+    let ifuncs: BTreeSet<&str> = libc_elf
+        .dynsyms
+        .iter()
+        .filter(|sym| sym.st_type() == STT_GNU_IFUNC)
+        .filter_map(|sym| libc_elf.dynstrtab.get_at(sym.st_name))
+        .collect();
+
+    let mut ifunc_count = 0usize;
+    for (label, bytes, bias) in [
+        (
+            "/hello",
+            program.executable_bytes,
+            program.executable.load_bias,
+        ),
+        (
+            GLIBC_LOADER,
+            interpreter.bytes.as_slice(),
+            interpreter.plan.load_bias,
+        ),
+    ] {
+        let img_elf = goblin::elf::Elf::parse(bytes).unwrap();
+        for rel in img_elf.pltrelocs.iter().chain(img_elf.dynrelas.iter()) {
+            let Some(name) = img_elf
+                .dynsyms
+                .get(rel.r_sym)
+                .and_then(|sym| img_elf.dynstrtab.get_at(sym.st_name))
+                .filter(|name| ifuncs.contains(name))
+            else {
+                continue;
+            };
+            let Some(target) = read_guest_u64(bias + rel.r_offset) else {
+                continue;
+            };
+            if in_libc_exec(target) {
+                println!("IFUNC {label} {name}: guest={target:#x}");
+                ifunc_count += 1;
+            }
+        }
+    }
+    assert_eq!(
+        ifunc_count, 3,
+        "expected 3 resolved libc STT_GNU_IFUNC relocations"
+    );
+}
+
 /// Engine witness: dynamic glibc hello runs on the soft CPU through the
 /// production EL1 vectors and trap path (`CARRICK_A64_ELF`) against a pinned
 /// `CARRICK_A64_DYN_ROOT` (`scripts/ci/fetch-arm64-cross-libc.sh`).
 /// HVC #2 replies come from a test fixture (`DynamicRoot` in
 /// `tests/fixtures/dynamic_root.rs`), not from the production
-/// carrick-kernel / carrick-personality-linux dispatch.
+/// carrick-kernel / carrick-personality-linux dispatch. Kept alongside
+/// `soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch` until
+/// `.github/retired-tests.toml` retires the fixture witnesses.
 #[test]
 #[ignore = "requires CARRICK_A64_DYN_ROOT and CARRICK_A64_ELF"]
 fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() {
@@ -1830,6 +1940,185 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() 
     assert_eq!(replies.stdout, b"dynamic glibc hello\n");
     assert_glibc_jump_slots(&program, &mut memory, &replies, compiler);
     assert_eq!(replies.report_ifuncs(&mut memory, &program), 3);
+}
+
+static SOFT_CARRIER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_soft_carrier_test() -> std::sync::MutexGuard<'static, ()> {
+    SOFT_CARRIER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct HelloDispatchReceipt {
+    exit_code: i32,
+    stdout: Vec<u8>,
+    syscalls_dispatched: u64,
+    census: carrick_softcpu_aarch64_host::Hvc2ReplyCensus,
+    counted_enosys: Vec<(u64, &'static str, u64)>,
+    production_run: Option<carrick_softcpu_aarch64_host::SoftProcessRun>,
+}
+
+fn run_hello_via_hvc2_dispatch(
+    config: &carrick_softcpu_aarch64_host::SoftSingleProcessConfig<'_>,
+) -> Result<HelloDispatchReceipt, String> {
+    let run = carrick_softcpu_aarch64_host::run_single_process(config)?;
+    Ok(HelloDispatchReceipt {
+        exit_code: run.exit_code,
+        stdout: run.stdout.clone(),
+        syscalls_dispatched: run.syscalls_dispatched,
+        census: run.reply_census,
+        counted_enosys: run.counted_enosys.clone(),
+        production_run: Some(run),
+    })
+}
+
+/// Engine witness: dynamic glibc hello runs on the soft CPU through the
+/// production EL1 vectors and trap path (`CARRICK_A64_ELF`) and production
+/// `carrick-kernel` / `carrick-personality-linux` dispatch against a pinned
+/// `CARRICK_A64_DYN_ROOT` (`scripts/ci/fetch-arm64-cross-libc.sh`), with zero
+/// `HVC #2` syscalls answered by the test fixture (`DynamicRoot`).
+#[test]
+#[ignore = "requires CARRICK_A64_DYN_ROOT and CARRICK_A64_ELF"]
+fn soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let el1_elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
+        .expect("read the production EL1 ELF");
+    let root_dir = std::path::PathBuf::from(
+        std::env::var_os("CARRICK_A64_DYN_ROOT").expect("set CARRICK_A64_DYN_ROOT"),
+    );
+    let root = FixtureRoot::new(root_dir.clone());
+    let hello = root.read("/hello").expect("read dynamic hello");
+    let compiler = String::from_utf8(
+        root.read("/hello.compiler")
+            .expect("read hello.compiler from scripts/ci/fetch-arm64-cross-libc.sh"),
+    )
+    .expect("utf-8 hello.compiler");
+    let compiler = compiler.lines().next().expect("fixture compiler version");
+    let libc_bytes = read_pinned_fixture(&root, GLIBC_LIBC, GLIBC_LIBC_SHA256);
+    let program = carrick_mem::elf::ElfProgram::load(&hello, 183, &|path| {
+        assert_eq!(path, GLIBC_LOADER);
+        Some(read_pinned_fixture(&root, path, GLIBC_LOADER_SHA256))
+    })
+    .expect("plan glibc hello and its interpreter");
+
+    let config = carrick_softcpu_aarch64_host::SoftSingleProcessConfig {
+        elf_bytes: &hello,
+        executable_path: "/hello",
+        argv: vec![b"/hello".to_vec()],
+        envp: Vec::new(),
+        rootfs_dir: Some(&root_dir),
+        el1_elf_override: Some(&el1_elf),
+        max_syscalls: 4096,
+    };
+    let receipt = run_hello_via_hvc2_dispatch(&config)
+        .expect("dynamic glibc hello must complete through production kernel dispatch");
+    println!(
+        "glibc hello exit={} syscalls_dispatched={} census={:?} counted_enosys={:?}",
+        receipt.exit_code, receipt.syscalls_dispatched, receipt.census, receipt.counted_enosys
+    );
+    assert_eq!(
+        receipt.census.fixture_answers, 0,
+        "expected 0 fixture HVC #2 replies, got census={:?} counted_enosys={:?}",
+        receipt.census, receipt.counted_enosys
+    );
+    assert!(
+        receipt.census.production_answers >= 15,
+        "expected real production HVC #2 replies, got census={:?}",
+        receipt.census
+    );
+    assert_eq!(
+        receipt.census.production_answers,
+        receipt.syscalls_dispatched
+    );
+    assert_eq!(receipt.exit_code, 0);
+    assert_eq!(receipt.stdout, b"dynamic glibc hello\n");
+    let run = receipt
+        .production_run
+        .as_ref()
+        .expect("production SoftProcessRun must back glibc relocation and IFUNC inspection");
+    assert_production_glibc_relocations_and_ifuncs(&program, &libc_bytes, run, compiler);
+    assert_expected_single_process_enosys(&receipt.counted_enosys);
+}
+
+/// Engine witness: static musl hello runs to exit on the soft CPU through the
+/// production EL1 vectors and trap path (`CARRICK_A64_ELF`) and production
+/// `carrick-kernel` / `carrick-personality-linux` dispatch, with zero `HVC #2`
+/// syscalls answered by the test fixture.
+fn compile_static_musl_hello(tag: &str) -> Vec<u8> {
+    use std::process::Command;
+
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/musl_hello.rs");
+    let out = std::env::temp_dir().join(format!("carrick-musl-hello-{tag}-{}", std::process::id()));
+    let mut rustc = Command::new("rustc");
+    rustc.args([
+        "--target",
+        "aarch64-unknown-linux-musl",
+        "-C",
+        "relocation-model=static",
+        "-C",
+        "debuginfo=2",
+    ]);
+    if let Some(linker) = std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER")
+        .or_else(|| std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"))
+    {
+        let mut arg = std::ffi::OsString::from("linker=");
+        arg.push(linker);
+        rustc.arg("-C").arg(arg);
+    }
+    let status = rustc
+        .arg("-o")
+        .arg(&out)
+        .arg(&fixture)
+        .status()
+        .expect("compile static musl hello with the pinned toolchain");
+    assert!(status.success());
+    let user_elf = std::fs::read(&out).expect("read musl hello");
+    std::fs::remove_file(&out).expect("remove compiled musl hello");
+    user_elf
+}
+
+#[test]
+#[ignore = "requires production CARRICK_A64_ELF and the pinned arm64 musl rust-std target"]
+fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let el1_elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
+        .expect("read the production EL1 ELF");
+    let user_elf = compile_static_musl_hello("full");
+
+    let config = carrick_softcpu_aarch64_host::SoftSingleProcessConfig {
+        elf_bytes: &user_elf,
+        executable_path: "/musl-hello",
+        argv: vec![b"/musl-hello".to_vec()],
+        envp: Vec::new(),
+        rootfs_dir: None,
+        el1_elf_override: Some(&el1_elf),
+        max_syscalls: 4096,
+    };
+    let receipt = run_hello_via_hvc2_dispatch(&config)
+        .expect("static musl hello must complete through production kernel dispatch");
+    println!(
+        "musl hello exit={} syscalls_dispatched={} census={:?} counted_enosys={:?}",
+        receipt.exit_code, receipt.syscalls_dispatched, receipt.census, receipt.counted_enosys
+    );
+    assert_eq!(
+        receipt.census.fixture_answers, 0,
+        "expected 0 fixture HVC #2 replies, got census={:?} counted_enosys={:?}",
+        receipt.census, receipt.counted_enosys
+    );
+    assert!(
+        receipt.census.production_answers >= 5,
+        "expected real production HVC #2 replies, got census={:?}",
+        receipt.census
+    );
+    assert_eq!(
+        receipt.census.production_answers,
+        receipt.syscalls_dispatched
+    );
+    assert_eq!(receipt.exit_code, 0);
+    assert_eq!(receipt.stdout, b"hello, aarch64 world\n");
+    assert_expected_single_process_enosys(&receipt.counted_enosys);
 }
 
 /// Engine witness: CPython 3.12.16 runs through the production EL1 vectors and
@@ -1888,8 +2177,9 @@ fn soft_cpu_runs_dynamic_cpython_through_el1_vectors_with_fixture_replies() {
     assert_eq!(result, Ok(0));
     assert_eq!(replies.stdout, b"3.12.16\n");
     println!(
-        "guest stdout={:?} exit_group(0)",
-        String::from_utf8_lossy(&replies.stdout)
+        "guest stdout={:?} exit_group(0) fixture_answered={}",
+        String::from_utf8_lossy(&replies.stdout),
+        replies.answered
     );
 }
 
@@ -2134,6 +2424,7 @@ fn run_dynamic_glibc(
         *forwarded.entry(nr).or_default() += 1;
         // exit_group is terminal: the mailbox request supplies its status.
         if name == "exit_group" {
+            replies.count_terminal_exit();
             break Ok(args[0]);
         }
         match replies.reply(memory, name, args) {
