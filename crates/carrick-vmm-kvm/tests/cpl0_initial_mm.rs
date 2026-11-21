@@ -3213,6 +3213,28 @@ fn production_fork_parent_stores_after_a_kernel_copy_on_write() {
     );
 }
 
+/// #2716 (review P0): the host holds a supplied COW grant as pending on the
+/// CPU that asked for it, so only that CPU's member may ring its settlement.
+/// A sibling's kernel copy that rang it for the MM's completion found nothing
+/// pending on its own CPU and no selection, and the carrier died with `owner
+/// fault selection absent`. Two live threads and two live processes: the
+/// worker is held between its COW completion and its settlement while the
+/// leader `read(2)`s into another copy-on-write page, whose preparation
+/// selects before the leader's CPU has asked the host for anything.
+#[test]
+fn production_sibling_copy_leaves_another_cpus_cow_settlement_alone() {
+    let elf = native_exit_fixture("native_cow_sibling_copy_settle.S");
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .map_err(|failure| failure.error)
+        .expect("sibling copy during a held COW settlement run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "see native_cow_sibling_copy_settle.S for the failed step: {:?}",
+        outcome.run
+    );
+}
+
 /// #2217: a brk shrink retires its resident pages as an owed return. Before
 /// #1482 nothing on x86 settled it, so regrowing the break over those pages
 /// was refused `Busy`, forwarded and answered ENOSYS; glibc stored that errno
