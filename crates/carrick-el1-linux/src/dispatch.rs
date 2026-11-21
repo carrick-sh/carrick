@@ -546,6 +546,32 @@ pub enum RootExecServer {
     /// child's; the carrier consumes the root's settlement and runs the
     /// shared root exec transaction there (x86 CPL0, #2142).
     NativeService,
+    /// The exec'ing root thread holds no root custody: it is not its lane's
+    /// host-loaded home record. Its settlement would reach a lane that
+    /// cannot consume it, past the exec's point of no return, so the exec
+    /// is left unrouted (the counted ENOSYS) until the thread takes the
+    /// root's custody with its TID (#2723).
+    NoCustody,
+}
+
+impl RootExecServer {
+    /// The x86 server of a root thread's exec on a lane whose host-loaded
+    /// home record is `home`, issued by the record EL1 switched in there
+    /// (`running`; none while the host-loaded thread runs unswitched). Only
+    /// the home record holds the root's loaded custody: a home record runs
+    /// on its home lane only, so its exec settles where the carrier can
+    /// consume it. A non-leader root thread, or any thread on the idle
+    /// peer, is no home record.
+    pub fn native_service_for(
+        home: Option<carrick_sched_core::RecordId>,
+        running: Option<carrick_sched_core::RecordId>,
+    ) -> Self {
+        match (home, running) {
+            (Some(_), None) => Self::NativeService,
+            (Some(home), Some(running)) if home == running => Self::NativeService,
+            _ => Self::NoCustody,
+        }
+    }
 }
 
 /// Whether the native exec service owns this exec: a ring-owned fork

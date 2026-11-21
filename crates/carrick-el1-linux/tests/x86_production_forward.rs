@@ -1177,7 +1177,11 @@ fn x86_exec_routes_to_the_native_service_not_unported() {
 fn x86_exec_claim_is_a_fork_child_only() {
     use carrick_el1_linux::dispatch::RootExecServer;
     use carrick_el1_linux::native_process_runtime::NativeThreadGroupOwner as Owner;
-    for root in [RootExecServer::NativeService, RootExecServer::HostForward] {
+    for root in [
+        RootExecServer::NativeService,
+        RootExecServer::HostForward,
+        RootExecServer::NoCustody,
+    ] {
         assert!(dispatch::native_exec_claimed(root, || Owner::ForkChild));
         assert!(!dispatch::native_exec_claimed(root, || Owner::Unowned));
     }
@@ -1189,6 +1193,43 @@ fn x86_exec_claim_is_a_fork_child_only() {
         RootExecServer::HostForward,
         || Owner::Root
     ));
+    assert!(!dispatch::native_exec_claimed(
+        RootExecServer::NoCustody,
+        || Owner::Root
+    ));
+}
+
+// #2142 review P0: the carrier consumes a root exec's settlement only on the
+// lane holding the root's loaded custody, after the exec's point of no
+// return. Only that lane's host-loaded home record holds it, whether it runs
+// unswitched or switched in; a non-leader root thread switched in on that
+// lane, and any thread on the idle peer (no home record), hold none.
+#[test]
+fn x86_root_exec_is_served_only_for_the_custody_holder() {
+    use carrick_el1_linux::dispatch::RootExecServer;
+    use carrick_sched_core::RecordId;
+    let home = RecordId::from_raw(3);
+    let sibling = RecordId::from_raw(4);
+    assert_eq!(
+        RootExecServer::native_service_for(home, None),
+        RootExecServer::NativeService
+    );
+    assert_eq!(
+        RootExecServer::native_service_for(home, home),
+        RootExecServer::NativeService
+    );
+    assert_eq!(
+        RootExecServer::native_service_for(home, sibling),
+        RootExecServer::NoCustody
+    );
+    assert_eq!(
+        RootExecServer::native_service_for(None, sibling),
+        RootExecServer::NoCustody
+    );
+    assert_eq!(
+        RootExecServer::native_service_for(None, None),
+        RootExecServer::NoCustody
+    );
 }
 
 // A claimed x86 child's execve/execveat is staged through the neutral body
