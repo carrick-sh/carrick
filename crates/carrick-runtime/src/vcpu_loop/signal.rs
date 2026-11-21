@@ -83,38 +83,10 @@ pub(crate) fn el0_fault_signal(esr: u64) -> Option<(i32, i32)> {
     }
 }
 
-/// The EL0 access direction behind a translation or permission fault
-/// `ESR_EL1`, for authenticating a possibly stale fault against the live
-/// stage-1 leaf. `None` for every other fault class (alignment, access-flag,
-/// address-size, external abort): those never resolve by retry.
-/// The stage-1 fault kind of an EL0 data or instruction abort's syndrome;
-/// `None` for any other exception class or fault status.
-pub(crate) fn el0_fault_kind(esr: u64) -> Option<carrick_mmu_core::aarch64::Stage1FaultKind> {
-    let ec = (esr >> 26) & 0x3f;
-    if !matches!(ec, 0x20 | 0x21 | 0x24 | 0x25) {
-        return None;
-    }
-    carrick_mmu_core::aarch64::Stage1FaultKind::from_fault_status(esr & 0x3f)
-}
-
-pub(crate) fn el0_fault_access(esr: u64) -> Option<carrick_mmu_core::aarch64::LeafAccess> {
-    use carrick_mmu_core::aarch64::LeafAccess;
-    const WNR: u64 = 1 << 6;
-    let ec = (esr >> 26) & 0x3f;
-    let dfsc = esr & 0x3f;
-    if !((0x04..=0x07).contains(&dfsc) || (0x0c..=0x0f).contains(&dfsc)) {
-        return None;
-    }
-    match ec {
-        0x20 | 0x21 => Some(LeafAccess::Execute),
-        0x24 | 0x25 => Some(if esr & WNR != 0 {
-            LeafAccess::Write
-        } else {
-            LeafAccess::Read
-        }),
-        _ => None,
-    }
-}
+// `el0_fault_kind` and `el0_fault_access` (pure AArch64 ESR_EL1 decodes) moved
+// to `carrick_aarch64::esr`, shared with the soft-CPU single-process runner;
+// re-exported so every fault path here resolves unchanged.
+pub(crate) use carrick_aarch64::esr::{el0_fault_access, el0_fault_kind};
 
 // `el0_debug_signal` (a pure AArch64 ESR_EL1 architectural fact) moved to
 // `carrick_aarch64::esr`; re-exported so the HVF lowering below and
