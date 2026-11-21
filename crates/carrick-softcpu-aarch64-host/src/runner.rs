@@ -525,6 +525,40 @@ where
     out
 }
 
+/// Syscalls the EL1 ring routed, summed over every native ordinal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct El1RouteCensus {
+    /// Completed at EL1 without leaving the guest (`Counters::served`).
+    pub served: u64,
+    /// Forwarded to the host through `HVC #2` (`Counters::forwarded`).
+    pub forwarded: u64,
+}
+
+/// Sample the EL1 ring's served and forwarded totals from `EL1_COUNTERS_BASE`.
+pub fn sample_el1_routes<X>(engine: &SoftAarch64Engine<X>) -> Option<El1RouteCensus>
+where
+    X: ExecuteBlock + Send + 'static,
+    X::Error: core::fmt::Debug,
+{
+    use carrick_aarch64::Aarch64Vmm as _;
+
+    let total = |offset: usize| -> Option<u64> {
+        let bytes = engine
+            .backend()
+            .read_gpa(EL1_COUNTERS_BASE + offset as u64, 512 * 8)
+            .ok()?;
+        Some(bytes.chunks_exact(8).fold(0u64, |sum, word| {
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(word);
+            sum.saturating_add(u64::from_le_bytes(raw))
+        }))
+    };
+    Some(El1RouteCensus {
+        served: total(offset_of!(Counters, served))?,
+        forwarded: total(offset_of!(Counters, forwarded))?,
+    })
+}
+
 /// Run a single-process AArch64 Linux ELF to exit on the native arm64 [`HostBlockRunner`].
 pub fn run_single_process(
     config: &SoftSingleProcessConfig<'_>,
