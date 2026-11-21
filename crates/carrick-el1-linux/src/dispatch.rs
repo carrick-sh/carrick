@@ -3748,20 +3748,19 @@ impl<
         self.ipc_transfer()
     }
     fn poll(&mut self) -> FamilyCompletion {
+        // The zone transfer may write a result into x0; a refused select
+        // below records the nfds the guest passed.
+        let original_argument0 = self.frame.argument(0).unwrap_or(0);
         let zone_wait = self.ipc_poll_transfer();
         if zone_wait != FamilyCompletion::Forward {
             return zone_wait;
         }
         if carrick_personality_linux::dispatch::select_ordinal(self.frame.canonical_ordinal()) {
-            self.counters.record_refusal(
-                carrick_guest_arch::NativeOrdinal::new(
-                    self.frame
-                        .crossing_set()
-                        .refusal_bucket(self.native_number()) as u64,
-                ),
-                self.service_origin(),
-                carrick_el1_abi::RefusalVenue::Ring,
-                carrick_el1_abi::RefusalArguments::Unretained,
+            self.record_refusal(
+                self.frame
+                    .crossing_set()
+                    .refusal_bucket(self.native_number()),
+                original_argument0,
             );
             return FamilyCompletion::AccountedComplete(
                 carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
