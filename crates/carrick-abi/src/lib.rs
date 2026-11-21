@@ -103,6 +103,13 @@
 
 pub use carrick_syscall_abi::*;
 
+/// Fixed guest address of the Carrick vDSO timekeeping page.
+pub const LINUX_VVAR_BASE: u64 = 0x2E_0000_0000;
+/// Offset of the little-endian counter frequency word in vvar.
+pub const VVAR_OFF_FREQ: usize = 8;
+/// Offset of the little-endian realtime base word in vvar.
+pub const VVAR_OFF_REALTIME_OFF_NS: usize = 16;
+
 use ::zerocopy::{Immutable, IntoBytes};
 use bitflags::bitflags;
 
@@ -1372,30 +1379,6 @@ pub const LINUX_SIGEV_SIGNAL: i32 = 0;
 pub const LINUX_SIGEV_NONE: i32 = 1;
 pub const LINUX_SIGEV_THREAD: i32 = 2;
 
-#[repr(C, packed)]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-)]
-pub struct LinuxTimeval {
-    pub tv_sec: i64,
-    pub tv_usec: i64,
-}
-
-impl LinuxTimeval {
-    pub const fn new(tv_sec: i64, tv_usec: i64) -> Self {
-        Self { tv_sec, tv_usec }
-    }
-}
-
 pub const LINUX_TIME_OK: i64 = 0;
 pub const LINUX_TIME_INS: i64 = 1;
 pub const LINUX_TIME_DEL: i64 = 2;
@@ -1552,33 +1535,6 @@ impl LinuxItimerval {
     }
 }
 
-#[repr(C, packed)]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-)]
-pub struct LinuxTimezone {
-    pub tz_minuteswest: i32,
-    pub tz_dsttime: i32,
-}
-
-impl LinuxTimezone {
-    pub const fn utc() -> Self {
-        Self {
-            tz_minuteswest: 0,
-            tz_dsttime: 0,
-        }
-    }
-}
-
 /// The guest's default UTS hostname and NIS domainname. SINGLE SOURCE OF TRUTH:
 /// `uname(2)` nodename/domainname, `/proc/sys/kernel/hostname`, and the
 /// synthesized `/etc/hosts` self-mapping all read from here, so the guest's own
@@ -1706,37 +1662,6 @@ pub struct LinuxRlimit {
 impl LinuxRlimit {
     pub const fn new(rlim_cur: u64, rlim_max: u64) -> Self {
         Self { rlim_cur, rlim_max }
-    }
-}
-
-#[repr(C, packed)]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-)]
-pub struct LinuxTms {
-    pub tms_utime: i64,
-    pub tms_stime: i64,
-    pub tms_cutime: i64,
-    pub tms_cstime: i64,
-}
-
-impl LinuxTms {
-    pub const fn zeroed() -> Self {
-        Self {
-            tms_utime: 0,
-            tms_stime: 0,
-            tms_cutime: 0,
-            tms_cstime: 0,
-        }
     }
 }
 
@@ -3439,7 +3364,6 @@ mod linux_resource_tests {
 pub const LINUX_RUSAGE_SELF: i32 = 0;
 pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
 pub const LINUX_RUSAGE_THREAD: i32 = 1;
-pub const LINUX_CLK_TCK: i64 = 100;
 pub const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 pub const LINUX_PROC_SUPER_MAGIC: i64 = 0x9fa0;
 pub const LINUX_PIPEFS_MAGIC: i64 = 0x50495045;
@@ -3755,7 +3679,6 @@ pub const LINUX_SIG_UNBLOCK: u64 = 1;
 pub const LINUX_SIG_SETMASK: u64 = 2;
 pub const LINUX_BOOTSTRAP_PID: u64 = 1;
 pub const LINUX_MINSIGSTKSZ: u64 = 2048;
-pub const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
 pub const LINUX_ITIMER_REAL: u64 = 0;
 pub const LINUX_ITIMER_VIRTUAL: u64 = 1;
 pub const LINUX_ITIMER_PROF: u64 = 2;

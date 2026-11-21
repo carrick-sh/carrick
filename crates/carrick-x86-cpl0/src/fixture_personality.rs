@@ -467,6 +467,7 @@ impl Personality for FixturePersonality {
                         random: [0x5a; 16],
                         stack_top: 0x7fff_0000,
                         stack_size: 0x4000,
+                        vdso: None,
                     },
                 };
                 let Ok(source_root) = carrick_el1::isa::x86::hardware_live_root() else {

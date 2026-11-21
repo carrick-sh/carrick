@@ -753,6 +753,20 @@ fn run_prepared_kvm_pool_with_debug(
         .map_err(|_| {
             RuntimeError::Configuration("x86 IPC authority already bound a carrier zone".into())
         })?;
+    // The container's clock owns the ring realtime word from here on: every
+    // offset change (clock_settime, settimeofday, adjtimex) re-publishes it.
+    if let Some((host_off, publish)) = machine.ring_realtime_word() {
+        root_context
+            .task()
+            .container()
+            .clock()
+            .bind_ring_realtime(carrick_kernel::kernel::RingRealtimeWord::new(
+                host_off, publish,
+            ))
+            .map_err(|_| {
+                RuntimeError::Configuration("x86 container clock already bound a carrier".into())
+            })?;
+    }
     let census_scope = dispatcher.container().launch().carrier_scope_id.clone();
     let KvmRootPool {
         physical,
@@ -2005,7 +2019,20 @@ impl PreparedRun {
                         address: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::As),
                         data: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::Data),
                     };
-                    machine.load_guest_mm(&image, &argv, &env, limits)?;
+                    let container = root_context.task().container();
+                    let clock = container.clock();
+                    let native_realtime_delta = (!clock.is_frozen()
+                        && !clock.is_scaled()
+                        && !clock.is_deterministic()
+                        && carrick_kernel::vdso_policy::raw_clock_fast_path_allowed_for_debug())
+                    .then(|| clock.realtime_offset_ns());
+                    machine.load_guest_mm_for_clock(
+                        &image,
+                        &argv,
+                        &env,
+                        limits,
+                        native_realtime_delta,
+                    )?;
                     run_prepared_kvm_pool_with_debug(
                         machine,
                         root_context,

@@ -216,7 +216,7 @@ use crate::thread::{
 use carrick_core::Served;
 use carrick_core_abi::EntryMmKey;
 use carrick_core_abi::ExecutionBinding;
-use carrick_guest_arch::UserVa;
+use carrick_guest_arch::{CounterFrequency, CounterTick, UserVa};
 use carrick_sched_core::{RecordRef, ThreadIdentity};
 use core::sync::atomic::Ordering;
 
@@ -265,7 +265,27 @@ pub trait CopyoutEffect: Send {
     fn commit(&mut self) -> Result<(), carrick_syscall_abi::LinuxErrno>;
 }
 
+/// A sample and the carrier's ring-published realtime calibration.
+pub struct RealtimeCounter {
+    pub tick: CounterTick,
+    pub frequency: CounterFrequency,
+    pub offset_ns: u64,
+}
+
 pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
+    fn monotonic_counter(&mut self) -> Option<(CounterTick, CounterFrequency)> {
+        None
+    }
+    /// Sample the counter and the carrier’s ring-published realtime calibration.
+    fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
+        None
+    }
+    fn cputime_nanos(&mut self, _per_thread: bool) -> Option<u64> {
+        None
+    }
+    fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {
+        None
+    }
     /// Native scheduler publication belongs to the admitted process execution
     /// owner, which also delivers architecture-specific wake effects.
     fn native_futex(
@@ -403,6 +423,17 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     ) -> LifecycleOutcome {
         LifecycleOutcome::Returned {
             result: SyscallResult::new(carrick_syscall_abi::LINUX_EFAULT.guest_retval()),
+            work: false,
+        }
+    }
+    /// Retain the remaining records and syscall result across owner waits.
+    fn complete_copyout_pair(
+        &mut self,
+        _records: [(UserVa, alloc::vec::Vec<u8>); 2],
+        _result: SyscallResult,
+    ) -> LifecycleOutcome {
+        LifecycleOutcome::Returned {
+            result: SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
             work: false,
         }
     }
@@ -613,6 +644,19 @@ impl From<carrick_sched_core::Requeue> for BornEnqueue {
 /// ISA hooks acquire retained metadata and move real native context. They do
 /// not route, validate clone flags, lower errno or publish entry completion.
 pub trait LifecycleNative<'a>: UserCopy {
+    fn monotonic_counter(&mut self) -> Option<(CounterTick, CounterFrequency)> {
+        None
+    }
+    /// Sample the counter and the carrier’s ring-published realtime calibration.
+    fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
+        None
+    }
+    fn cputime_nanos(&mut self, _per_thread: bool) -> Option<u64> {
+        None
+    }
+    fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {
+        None
+    }
     /// Resume an input before any syscall effect has been committed.
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
     /// Retain a completed setup operation's original output after `NotYet`.
@@ -623,6 +667,17 @@ pub trait LifecycleNative<'a>: UserCopy {
         bytes: alloc::vec::Vec<u8>,
         work: bool,
     ) -> LifecycleOutcome;
+
+    fn finish_time_output(
+        &mut self,
+        _records: [Option<(UserVa, alloc::vec::Vec<u8>)>; 2],
+        _result: SyscallResult,
+    ) -> LifecycleOutcome {
+        LifecycleOutcome::Returned {
+            result: SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+            work: false,
+        }
+    }
 
     /// Terminal custody loss must never become a guest errno or leave exit parked.
     fn fail_lifecycle(&mut self, reason: NativeRunFailureReason) -> !;

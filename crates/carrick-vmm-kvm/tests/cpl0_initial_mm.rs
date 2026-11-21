@@ -266,16 +266,268 @@ fn serial_host_native_child_zero_nanosleep_returns_zero() {
     );
 }
 
-/// x86 CPL0 defines no guest-visible monotonic epoch (no vDSO, a raw RDTSC
-/// counter), so even forkexecstorm's already expired absolute
-/// CLOCK_MONOTONIC deadline keeps the counted ENOSYS refusal (#1808).
 #[test]
-fn serial_host_native_child_absolute_clock_nanosleep_is_refused() {
+fn serial_host_native_root_and_child_clock_getres() {
     native_child_sleep_witness_with_exit(
-        "serial_host_native_child_absolute_clock_nanosleep_is_refused",
+        "serial_host_native_root_and_child_clock_getres",
+        "native_child_sleep.S",
+        &["-DCLOCK_GETRES=1"],
+        8,
+    );
+}
+
+#[test]
+fn serial_host_native_root_and_child_monotonic_clock_gettime() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_monotonic_clock_gettime",
+        "native_child_sleep.S",
+        &["-DMONOTONIC_GETTIME=1"],
+        0,
+    );
+}
+
+#[test]
+fn serial_host_native_root_and_child_vdso_monotonic_matches_raw_clock() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_vdso_monotonic_matches_raw_clock",
+        "native_vdso_clock.S",
+        &[],
+        8,
+    );
+}
+
+#[test]
+fn serial_host_native_root_and_child_vdso_realtime_matches_raw_clock() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_vdso_realtime_matches_raw_clock",
+        "native_vdso_clock.S",
+        &["-DCLOCK_REALTIME_WITNESS=1"],
+        8,
+    );
+}
+
+/// #2618: the x86 root has no vDSO fallback of its own for a raw
+/// `syscall(228, CLOCK_REALTIME)`; the ring serves it (ENOSYS before).
+#[test]
+fn serial_host_native_root_raw_realtime_clock_gettime() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_raw_realtime_clock_gettime",
+        "native_root_realtime.S",
+        &[],
+        8,
+    );
+}
+
+/// #2618: the syscall realtime clock is carrier calibration, not user
+/// memory. The root unmaps its vvar page, then it and a native fork child
+/// must still read the real wall clock.
+#[test]
+fn serial_host_native_root_and_child_realtime_survive_an_unmapped_vvar() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_realtime_survive_an_unmapped_vvar",
+        "native_root_realtime.S",
+        &["-DUNMAPPED_VVAR=1"],
+        8,
+    );
+}
+
+/// The ring's realtime word follows the container clock after the carrier
+/// published its load-time calibration: the domain is moved to 2100-01-01
+/// after load (the load-time word carries no delta), and raw REALTIME,
+/// REALTIME_COARSE, `gettimeofday` and `time` in the root and in a native
+/// fork child read the moved clock. Each guest then tries `clock_settime`,
+/// which x86 leaves unserved today (#1981); a served set must move every
+/// later read, including the root's after the child's step.
+#[test]
+fn serial_host_native_root_and_child_realtime_follow_clock_settime() {
+    const TEST: &str = "serial_host_native_root_and_child_realtime_follow_clock_settime";
+    const CHILD: &str = "CARRICK_SETTIME_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "15"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, TEST)
+            .output()
+            .expect("bounded native settime witness");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = native_exit_fixture_with_flags("native_realtime_set.S", &[]);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, ELF_X86_64_MACHINE, &|_| None)
+        .expect("ELF program");
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    // The fixture's TARGET: guest realtime is 2100-01-01T00:00:00Z in the
+    // root's container.
+    const TARGET_NS: i128 = 4_102_444_800_000_000_000;
+    let now = std::time::UNIX_EPOCH.elapsed().expect("host realtime");
+    dispatcher
+        .capture_one_task_context()
+        .expect("issued root")
+        .task()
+        .container()
+        .clock()
+        .try_set_realtime_offset_ns((TARGET_NS - now.as_nanos() as i128) as i64)
+        .expect("uncontrolled clock domain");
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        512,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |_| {},
+        dispatcher,
+    )
+    .map_err(|failure| failure.error)
+    .expect("settime witness run");
+    assert_eq!(
+        outcome.run.exit_code, 8,
+        "realtime after the domain moved (93 means a ring read kept the load-time wall clock)"
+    );
+    assert!(outcome.run.stdout.is_empty());
+    assert!(outcome.run.stderr.is_empty());
+}
+
+#[test]
+fn serial_host_native_exec_successor_vdso_realtime_matches_raw_clock() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let image = native_exit_fixture_with_flags(
+        "native_vdso_clock.S",
+        &["-DEXEC_SUCCESSOR=1", "-DCLOCK_REALTIME_WITNESS=1"],
+    );
+    carrick_test_support::executable::write_executable_mode(&successor, &image, 0o700);
+    let path = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags(
+        "native_vdso_clock.S",
+        &[&path, "-DCLOCK_REALTIME_WITNESS=1"],
+    );
+    let outcome = run_exec_fixture(&elf, 128);
+    assert_eq!(
+        outcome.run.exit_code, 8,
+        "root, child and successor realtime"
+    );
+}
+
+#[test]
+fn serial_host_native_root_and_child_gettimeofday_matches_vdso() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_gettimeofday_matches_vdso",
+        "native_vdso_clock.S",
+        &["-DREALTIME_ALIASES_WITNESS=1"],
+        8,
+    );
+}
+
+#[test]
+fn serial_host_native_root_and_child_time_matches_vdso() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_time_matches_vdso",
+        "native_vdso_clock.S",
+        &["-DREALTIME_ALIASES_WITNESS=1", "-DLEGACY_TIME_WITNESS=1"],
+        8,
+    );
+}
+
+#[test]
+fn serial_host_native_root_and_child_cputime_and_times() {
+    const TEST: &str = "serial_host_native_root_and_child_cputime_and_times";
+    const CHILD: &str = "CARRICK_CPUTIME_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "15"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, TEST)
+            .output()
+            .expect("bounded native cputime witness");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = native_exit_fixture_with_flags("native_cputime_times.S", &[]);
+    let directory = tempfile::tempdir().expect("oracle directory");
+    let oracle = directory.path().join("native_cputime_times");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+    let linux_status = std::process::Command::new(&oracle)
+        .status()
+        .expect("run native Linux oracle");
+    assert_eq!(
+        linux_status.code(),
+        Some(8),
+        "native Linux oracle exit code for native_cputime_times.S"
+    );
+    let outcome = run_pool_fixture(&elf, 512);
+    assert_eq!(
+        outcome.run.exit_code, 8,
+        "native cputime/times result (38 means ENOSYS)"
+    );
+    assert!(outcome.run.stdout.is_empty());
+    assert!(outcome.run.stderr.is_empty());
+}
+
+/// A root the scheduler never switched in keeps its CPU-time accounting
+/// across a host crossing: after polling its standard descriptors it burns
+/// CPU, and raw `CLOCK_PROCESS_CPUTIME_ID` and `times` advance.
+#[test]
+fn serial_host_native_root_cputime_survives_a_host_crossing() {
+    let elf = native_exit_fixture_with_flags("native_root_cputime_after_crossing.S", &[]);
+    let directory = tempfile::tempdir().expect("oracle directory");
+    let oracle = directory.path().join("native_root_cputime_after_crossing");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+    let linux_status = std::process::Command::new(&oracle)
+        .status()
+        .expect("run native Linux oracle");
+    assert_eq!(linux_status.code(), Some(8), "native Linux oracle");
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_cputime_survives_a_host_crossing",
+        "native_root_cputime_after_crossing.S",
+        &[],
+        8,
+    );
+}
+
+#[test]
+fn serial_host_native_exec_successor_vdso_monotonic_matches_raw_clock() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let image = native_exit_fixture_with_flags("native_vdso_clock.S", &["-DEXEC_SUCCESSOR=1"]);
+    carrick_test_support::executable::write_executable_mode(&successor, &image, 0o700);
+    let path = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_fork_exec.S", &[&path]);
+    let outcome = run_exec_fixture(&elf, 128);
+    assert_eq!(outcome.run.exit_code, 8, "successor vDSO result");
+}
+
+/// An expired monotonic deadline completes immediately in CPL0.
+#[test]
+fn serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero",
         "native_child_sleep.S",
         &["-DSLEEP_ABSOLUTE=1"],
-        218,
+        8,
+    );
+}
+
+#[test]
+fn serial_host_native_child_absolute_monotonic_clock_nanosleep_reaches_deadline() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_child_absolute_monotonic_clock_nanosleep_reaches_deadline",
+        "native_child_sleep.S",
+        &["-DSLEEP_FUTURE_ABSOLUTE=1"],
+        8,
     );
 }
 
@@ -401,7 +653,7 @@ fn native_child_sleep_witness_with_exit(test: &str, fixture: &str, flags: &[&str
     let outcome = run_pool_fixture(&elf, 128);
     assert_eq!(
         outcome.run.exit_code, exit,
-        "child sleep result (218 means ENOSYS; 100 + n is errno n or table row n)"
+        "native time result for {flags:?} (MONOTONIC_GETTIME encodes root and child in separate nibbles; 1 means ENOSYS)"
     );
     assert!(outcome.run.stdout.is_empty());
     assert!(outcome.run.stderr.is_empty());

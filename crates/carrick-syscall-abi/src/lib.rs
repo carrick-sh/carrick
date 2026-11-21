@@ -244,6 +244,90 @@ pub mod nr {
     pub const PRLIMIT64: CanonicalNr = CanonicalNr(261);
 }
 
+#[repr(C, packed)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+)]
+pub struct LinuxTimeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+impl LinuxTimeval {
+    pub const fn new(tv_sec: i64, tv_usec: i64) -> Self {
+        Self { tv_sec, tv_usec }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+)]
+pub struct LinuxTimezone {
+    pub tz_minuteswest: i32,
+    pub tz_dsttime: i32,
+}
+
+impl LinuxTimezone {
+    pub const fn utc() -> Self {
+        Self {
+            tz_minuteswest: 0,
+            tz_dsttime: 0,
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+)]
+pub struct LinuxTms {
+    pub tms_utime: i64,
+    pub tms_stime: i64,
+    pub tms_cutime: i64,
+    pub tms_cstime: i64,
+}
+
+impl LinuxTms {
+    pub const fn zeroed() -> Self {
+        Self {
+            tms_utime: 0,
+            tms_stime: 0,
+            tms_cutime: 0,
+            tms_cstime: 0,
+        }
+    }
+}
+
+pub const LINUX_CLK_TCK: i64 = 100;
+
 /// Linux `clockid_t` values (`include/uapi/linux/time.h`). Shared by the
 /// host dispatcher and the ring sleep owner so both classify one clock set.
 pub const LINUX_CLOCK_REALTIME: u64 = 0;
@@ -263,6 +347,31 @@ pub const LINUX_CLOCK_TAI: u64 = 11;
 pub const LINUX_CLOCK_CPU_WHICH_MASK: u32 = 0b011;
 pub const LINUX_CLOCK_CPU_PERTHREAD: u32 = 0b100;
 pub const LINUX_CLOCK_FD: u32 = 0b011;
+/// The syscall resolution and the coarse clock grid, also used by the ARM vDSO.
+pub const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
+
+/// Carrick's clock resolution. Dynamic CPU clocks retain the legacy
+/// dispatcher's clock-ID classification on both entry paths.
+pub const fn linux_clock_resolution_ns(clock_id: i32) -> Option<i64> {
+    match clock_id as u64 {
+        LINUX_CLOCK_REALTIME
+        | LINUX_CLOCK_MONOTONIC
+        | LINUX_CLOCK_PROCESS_CPUTIME_ID
+        | LINUX_CLOCK_THREAD_CPUTIME_ID
+        | LINUX_CLOCK_MONOTONIC_RAW
+        | LINUX_CLOCK_REALTIME_COARSE
+        | LINUX_CLOCK_MONOTONIC_COARSE
+        | LINUX_CLOCK_BOOTTIME
+        | LINUX_CLOCK_REALTIME_ALARM
+        | LINUX_CLOCK_BOOTTIME_ALARM
+        | LINUX_CLOCK_TAI => Some(LINUX_CLOCK_RESOLUTION_NSEC),
+        _ if clock_id < 0 && (clock_id as u32) & LINUX_CLOCK_CPU_WHICH_MASK != LINUX_CLOCK_FD => {
+            Some(LINUX_CLOCK_RESOLUTION_NSEC)
+        }
+        _ => None,
+    }
+}
+
 /// `clock_nanosleep`/`timer_settime` absolute-deadline flag.
 pub const LINUX_TIMER_ABSTIME: u64 = 0x1;
 

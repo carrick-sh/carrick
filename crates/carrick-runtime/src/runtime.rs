@@ -724,6 +724,27 @@ fn run_address_space_with_hvf_and_dispatcher(
         {
             let ptr = carrick_vmm_hvf::read_el1_region_host_ptr();
             carrick_kernel::el1_delegation::record_el1_region_host_ptr(ptr);
+            // The engine calibrated the carrier's realtime word at load; the
+            // container's clock owns it from here on, so every offset change
+            // (clock_settime, settimeofday, adjtimex) re-publishes it.
+            if let Some(host_off) = carrick_mem::vdso::realtime_off_ns() {
+                dispatcher
+                    .container()
+                    .clock()
+                    .bind_ring_realtime(carrick_kernel::kernel::RingRealtimeWord::new(
+                        host_off,
+                        |offset_ns| {
+                            if let Some(zone) = carrick_el1_abi::zone_tables() {
+                                zone.publish_realtime_offset(offset_ns);
+                            }
+                        },
+                    ))
+                    .map_err(|_| {
+                        RuntimeError::Configuration(
+                            "container clock already bound a carrier".into(),
+                        )
+                    })?;
+            }
         }
         // Hand the dispatcher the real region list + auxv so /proc/self/maps
         // (regions, bootstrap pages, stack) and /proc/self/auxv reflect the loaded

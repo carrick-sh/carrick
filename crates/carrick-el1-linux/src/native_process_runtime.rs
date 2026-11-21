@@ -1309,6 +1309,12 @@ impl MapStash {
     }
 }
 
+#[derive(Default)]
+struct ProcessCpuState {
+    retired_ticks: carrick_sched_core::CpuTickPair,
+    last_process_cpu_ns: core::sync::atomic::AtomicU64,
+}
+
 pub struct NativeResources<'a, M, C: ProcessContext> {
     _control_custody: carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>,
     zone: &'a ZoneTables<C>,
@@ -1330,7 +1336,74 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     _thread_claim: NativeClaim<'a>,
     channel: Option<Arc<WaitChannel>>,
     usage: TaskRusage,
+    cpu: Box<ProcessCpuState>,
     file_table: u64,
+}
+fn live_cpu_now<C: ProcessContext>(
+    zone: &ZoneTables<C>,
+) -> Option<carrick_guest_arch::CounterTick> {
+    #[cfg(target_os = "none")]
+    {
+        let _ = zone;
+        carrick_guest_arch::InterruptBackend::counter(&mut carrick_el1::isa::signal_clock()).ok()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let tick = zone.latest_cpu_tick();
+        (tick.raw() != 0).then_some(tick)
+    }
+}
+impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
+    #[inline(never)]
+    fn retire_record_cpu(
+        &mut self,
+        record: RecordRef,
+        now: Option<carrick_guest_arch::CounterTick>,
+    ) {
+        let sampled = self.zone.sample_record_cpu_ticks(record, now);
+        self.cpu.retired_ticks = self.cpu.retired_ticks.saturating_add(sampled);
+    }
+
+    #[inline(never)]
+    fn process_cpu_ticks(
+        &self,
+        now: Option<carrick_guest_arch::CounterTick>,
+    ) -> carrick_sched_core::CpuTickPair {
+        let mut total = self.cpu.retired_ticks;
+        for member in &self.members {
+            total = total.saturating_add(self.zone.sample_record_cpu_ticks(member.record, now));
+        }
+        total
+    }
+
+    /// Own `(user, system)` CPU nanoseconds: retired usage and every live
+    /// member sampled at `now`.
+    #[inline(never)]
+    fn process_cpu_nanos(
+        &self,
+        frequency: carrick_guest_arch::CounterFrequency,
+        now: carrick_guest_arch::CounterTick,
+    ) -> (u64, u64) {
+        let ticks = self.process_cpu_ticks(Some(now));
+        let nanos = |time: core::time::Duration| u64::try_from(time.as_nanos()).unwrap_or(u64::MAX);
+        (
+            nanos(self.usage.user_time).saturating_add(ticks.user_nanos(frequency)),
+            nanos(self.usage.system_time).saturating_add(ticks.system_nanos(frequency)),
+        )
+    }
+
+    fn member_rusage(&self, record: RecordRef) -> TaskRusage {
+        let Some(frequency) = self.zone.counter_frequency() else {
+            return TaskRusage::default();
+        };
+        let ticks = self
+            .zone
+            .sample_record_cpu_ticks(record, live_cpu_now(self.zone));
+        TaskRusage {
+            user_time: core::time::Duration::from_nanos(ticks.user_nanos(frequency)),
+            system_time: core::time::Duration::from_nanos(ticks.system_nanos(frequency)),
+        }
+    }
 }
 pub type NativeForkPreparation<'a, M, P, C> = PreparedFork<
     VisibleNamespace,
@@ -1363,7 +1436,24 @@ impl<'a, M: Clone, C: ProcessContext> ProcessResources for NativeResources<'a, M
         self.signals.autoreaps_children()
     }
     fn own_rusage(&self) -> TaskRusage {
-        self.usage
+        let Some(frequency) = self.zone.counter_frequency() else {
+            return self.usage;
+        };
+        let ticks = self.process_cpu_ticks(live_cpu_now(self.zone));
+        TaskRusage {
+            user_time: self
+                .usage
+                .user_time
+                .saturating_add(core::time::Duration::from_nanos(
+                    ticks.user_nanos(frequency),
+                )),
+            system_time: self
+                .usage
+                .system_time
+                .saturating_add(core::time::Duration::from_nanos(
+                    ticks.system_nanos(frequency),
+                )),
+        }
     }
 }
 type Custody<'a, M, C> = RetainedProcessCustody<NativeResources<'a, M, C>>;
@@ -2297,9 +2387,18 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 // its sources stay in the carrier until the MM is torn down.
                 resources.map_stash.remove(record);
                 resources._thread_claim.release_thread(key.task.id().raw());
-                row.native_mut().resources_mut().members.retain(|member| {
-                    member.record != *record && member.thread.id() != key.task.id()
+                let now = live_cpu_now(resources.zone);
+                let mut retired_records = Vec::new();
+                resources.members.retain(|member| {
+                    let keep = member.record != *record && member.thread.id() != key.task.id();
+                    if !keep {
+                        retired_records.push(member.record);
+                    }
+                    keep
                 });
+                for retired_record in retired_records {
+                    resources.retire_record_cpu(retired_record, now);
+                }
             }
         }
         for (_, record, _, control_addr) in &completed {
@@ -2650,10 +2749,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         {
             resources.pending_signal_deliveries.remove(&old_record);
         }
-        if old_record != reference
-            && let Some(projection) = &resources.members[member_index].signal_projection
-        {
-            projection.rehome(reference);
+        if old_record != reference {
+            let now = live_cpu_now(resources.zone);
+            resources.retire_record_cpu(old_record, now);
+            if let Some(projection) = &resources.members[member_index].signal_projection {
+                projection.rehome(reference);
+            }
         }
         resources.members[member_index].record = reference;
         resources.members[member_index].thread = key.task;
@@ -3459,6 +3560,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 member.expected_host = host_identity;
                 if replaced {
                     let resources = row.native_mut().resources_mut();
+                    if old_record != source.zone.record_ref(record) {
+                        let now = live_cpu_now(resources.zone);
+                        resources.retire_record_cpu(old_record, now);
+                    }
                     resources.interrupted_child_waits.remove(&old_record);
                     resources.pending_signal_deliveries.remove(&old_record);
                     resources.map_stash.remove(&old_record);
@@ -4334,6 +4439,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         fired
     }
 
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     pub fn admit_fresh_root<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
         source: BornInZoneSource<'a, C>,
@@ -4476,6 +4582,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 .map_err(|_| NativeProcessError::Busy)?;
             member.signal_projection = Some(signals.project_member(member.record, pending));
         }
+        source
+            .zone
+            .cpu_adopt_unadmitted(source.slot, source.zone.record_ref(record));
         let resources = NativeResources {
             _control_custody: carrick_core::lifecycle::MemberControlCustody::retain(control)
                 .map_err(|_| NativeProcessError::Stale)?,
@@ -4495,6 +4604,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             _thread_claim: thread_claim,
             channel: None,
             usage: TaskRusage::default(),
+            cpu: Box::default(),
             file_table,
         };
         let mut owner = Owner::new();
@@ -9272,6 +9382,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             _thread_claim: thread_claim,
             channel: None,
             usage: TaskRusage::default(),
+            cpu: Box::default(),
             file_table: child_file_table,
         };
         let mut child = GuestTask::new(
@@ -9456,11 +9567,91 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(visible.get())
     }
 }
+impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    NativeProcessEntry<'_, 'a, M, C, S>
+{
+    /// The ring counter frequency and a sample, after publishing the
+    /// frequency the zone CPU ledger converts with.
+    #[inline(never)]
+    fn cpu_clock(
+        &mut self,
+    ) -> Option<(
+        carrick_guest_arch::CounterFrequency,
+        carrick_guest_arch::CounterTick,
+    )> {
+        let frequency = self.service.signal_frequency().ok()?;
+        let now = self.service.signal_now().ok()?;
+        self.source.zone.publish_counter_frequency(frequency);
+        Some((frequency, now))
+    }
+}
+
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<'a, C>
     for NativeProcessEntry<'_, 'a, M, C, S>
 {
     fn is_root_process(&self) -> bool {
         NativeProcessEntry::is_root_process(self)
+    }
+
+    fn monotonic_counter(
+        &mut self,
+    ) -> Option<(
+        carrick_guest_arch::CounterTick,
+        carrick_guest_arch::CounterFrequency,
+    )> {
+        let frequency = self.service.signal_frequency().ok()?;
+        let now = self.service.signal_now().ok()?;
+        Some((now, frequency))
+    }
+    fn cputime_nanos(&mut self, per_thread: bool) -> Option<u64> {
+        let (frequency, now) = self.cpu_clock()?;
+        if per_thread {
+            let ticks = self
+                .source
+                .zone
+                .sample_record_cpu_ticks(self.record, Some(now));
+            let nanos = ticks.total_nanos(frequency);
+            return Some(self.source.zone.ratchet_record_cpu_ns(self.record, nanos));
+        }
+        let graph = self.runtime.graph.lock();
+        let resources = graph.owner.task(self.key).ok()?.native().resources();
+        let (user, system) = resources.process_cpu_nanos(frequency, now);
+        let nanos = user.saturating_add(system);
+        Some(
+            resources
+                .cpu
+                .last_process_cpu_ns
+                .fetch_max(nanos, Ordering::AcqRel)
+                .max(nanos),
+        )
+    }
+    fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {
+        let (frequency, now) = self.cpu_clock()?;
+        let graph = self.runtime.graph.lock();
+        let task = graph.owner.task(self.key).ok()?;
+        let (user, system) = task.native().resources().process_cpu_nanos(frequency, now);
+        let children = task.children_rusage();
+        let ticks = |nanos: u64| (nanos / 10_000_000) as i64;
+        let child =
+            |time: core::time::Duration| ticks(u64::try_from(time.as_nanos()).unwrap_or(u64::MAX));
+        Some(carrick_syscall_abi::LinuxTms {
+            tms_utime: ticks(user),
+            tms_stime: ticks(system),
+            tms_cutime: child(children.user_time),
+            tms_cstime: child(children.system_time),
+        })
+    }
+    fn realtime_counter(
+        &mut self,
+    ) -> Option<carrick_personality_linux::lifecycle::RealtimeCounter> {
+        // The carrier publishes its calibration into the zone; a guest can
+        // unmap or replace its vvar page, so the syscall clock never reads it.
+        let offset_ns = self.source.zone.realtime_offset()?;
+        Some(carrick_personality_linux::lifecycle::RealtimeCounter {
+            tick: self.service.signal_now().ok()?,
+            frequency: self.service.signal_frequency().ok()?,
+            offset_ns,
+        })
     }
     fn owns_descriptor_namespace(&self) -> bool {
         self.source.zone.record(self.record.id).is_native_owned()
@@ -9645,6 +9836,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     ) -> LifecycleOutcome {
         let result = self.finish_copyout(service::OwnedCopyout {
             data: service::CopyoutData::Bytes { address, bytes },
+            offset: 0,
+            prefix_on_fault: false,
+            result,
+            effect: None,
+        });
+        self.finish_output_outcome(result)
+    }
+    fn complete_copyout_pair(
+        &mut self,
+        records: [(UserVa, Vec<u8>); 2],
+        result: SyscallResult,
+    ) -> LifecycleOutcome {
+        let result = self.finish_copyout(service::OwnedCopyout {
+            data: service::CopyoutData::Pair(Box::new(records)),
             offset: 0,
             prefix_on_fault: false,
             result,
@@ -10386,6 +10591,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             });
             for record in &retired {
                 let resources = task.native_mut().resources_mut();
+                let now = live_cpu_now(resources.zone);
+                resources.retire_record_cpu(*record, now);
+                if *record == self.record
+                    && let Some(tick) = now
+                {
+                    self.source.zone.cpu_leave_slot(self.source.slot, tick);
+                }
                 resources.interrupted_child_waits.remove(record);
                 resources.pending_signal_deliveries.remove(record);
             }
@@ -11176,7 +11388,8 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .task(self.key)
             .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
         let usage = match who {
-            0 | 1 => task.native().own_rusage(),
+            0 => task.native().own_rusage(),
+            1 => task.native().resources().member_rusage(self.record),
             -1 => task.children_rusage(),
             _ => return Err(carrick_personality_linux::sysinfo::EINVAL),
         };

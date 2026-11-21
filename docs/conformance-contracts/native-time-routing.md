@@ -387,3 +387,119 @@ The earlier clock-resource sleep subscription (`NativeSleep`, the
 `SleepArm`/`SleepCancel` wire operations and the host `TimerHub` thread) is
 removed: it was a second timer owner with no production caller. The clock
 record keeps its sample and timex operations for slice 3.
+
+## Clock resolution in ring (#2028)
+
+ARM and x86 native entries use the same clock ID and resolution policy for
+`clock_getres`. A supported clock with a null destination succeeds. A
+writable destination receives one timespec through the existing owned
+copyout continuation, which retains the bytes across a memory-owner wait.
+The query takes no clock sample and makes no host syscall. The reported
+resolution follows Carrick's existing Linux policy, including the ARM
+vDSO's coarse clock grid.
+
+The ARM VM-free witness keeps the fork parent and child live and checks a
+valid clock with a null destination and an invalid clock ID. The x86 KVM
+witness checks a writable timespec in the root and its fork child. Clock
+samples, CPU accounting, and x86 vDSO publication still need their own
+execution evidence.
+
+## Monotonic syscall samples (#2028)
+
+The native syscall reads the admitted execution venue's typed counter and
+frequency and retains one timespec in the exact-MM copyout owner. The ARM
+descendant uses the counter that the ARM vDSO reads. The x86 root and
+descendant use the qualified guest TSC. The ARM root still reaches its
+existing container clock policy, including embedder-controlled modes.
+
+On the ARM production dispatch path, the fork child formerly returned
+ENOSYS and counted one refusal for a null monotonic result. The witness
+requires EFAULT with no refusal. Under KVM a native fork leaves both
+processes live, with each process sampling into its own stack and the parent
+reporting both results. Realtime, CPU accounting, vDSO/libc parity and
+x86 absolute deadlines have separate outstanding evidence.
+
+## CPL0 vDSO and absolute monotonic waits
+
+The KVM carrier takes one qualified TSC calibration before root admission.
+The root and each native exec successor install a private vvar page with that
+same calibration and a read-execute vDSO page. The initial MM editor checks
+for the two exact image rows before publishing AT_SYSINFO_EHDR. A fork
+inherits the mapped pages. The published monotonic offset is zero, so the
+raw syscall, the vDSO and absolute monotonic deadlines use TSC nanoseconds.
+
+The KVM witnesses bracket a vDSO monotonic read between two raw samples in
+the root, its fork child and a native exec successor. A separate child
+witness forms a future absolute deadline from a raw sample and checks that
+clock_nanosleep returns at or after it. ARM keeps its existing deadline
+conversion and its native-child timeout witness.
+
+### Raw monotonic reads
+
+`CLOCK_MONOTONIC_RAW` uses the qualified guest counter and retained timespec
+copyout in the same route as `CLOCK_MONOTONIC`. This follows the clock
+source already used by both vDSOs. The ARM fork-child dispatch witness
+changes from ENOSYS with one refusal to EFAULT with no refusal when the
+output is null. On x86 the raw syscall and vDSO samples are ordered in the
+native root, fork child, and exec successor. The x86 fixture detects ENOSYS
+before comparing the results.
+
+### Raw realtime reads
+
+The native syscall samples the guest counter at the ring counter frequency,
+adds the carrier's zone-published `realtime_offset_ns`, and retains one
+timespec across copyout waits. It never reads the user vvar mapping, so
+unmapping or replacing the vvar page cannot affect syscall realtime reads.
+CLOCK_REALTIME_COARSE rounds the same sample down to the millisecond grid.
+The x86 vDSO delegates COARSE to the syscall.
+
+The KVM witnesses check raw root `syscall(228, CLOCK_REALTIME)`, survival of
+root and fork-child realtime reads after unmapping the vvar page, and raw vs
+vDSO ordering in the root, fork child, and exec successor. They verify that
+subtracting the published offset from raw realtime puts it between two raw
+monotonic samples and that the offset survives fork and exec. The ARM VM-free
+witnesses check null-output routing with a live parent and child and exact
+realtime/coarse values from the zone calibration with no mapped vvar. ARM
+native exec-successor vvar calibration landed in #2571.
+
+The zone word follows the container clock. A carrier binds it to its one
+container's `ClockDomain` after load (`ClockDomain::bind_ring_realtime`), and
+every offset change (`clock_settime`, `settimeofday`, `clock_adjtime` and
+`adjtimex` steps) republishes `vvar_realtime_off_ns(base, delta)` before the
+changing call returns. An exec's vvar stamp only publishes the initial word,
+so it cannot reset a moved clock. A second binding is refused: the word is
+carrier-wide. The KVM witness moves the root container's clock after load and
+checks raw REALTIME, REALTIME_COARSE, gettimeofday and time in the root and a
+fork child; x86 guests cannot set the clock themselves yet (`clock_settime`
+is unrouted on x86, #1981). The dispatcher witness drives `clock_settime`
+and `clock_adjtime(ADJ_SETOFFSET)` through the production entry against a
+bound word. The signed ARM checks are the `clocksettimevdso` probe
+(`child_shifted raw_shifted`) and `case_ring_clock_child_raw_syscalls`.
+
+### Realtime aliases
+
+The native gettimeofday and x86 time calls use the same realtime sample as
+clock_gettime. Gettimeofday converts to microseconds and accepts a null
+timeval or timezone. When both are present, exact-MM copyout retains its
+position across the two records. Syscall 201 returns the sampled seconds
+and writes the same value if the pointer is present. The KVM witnesses
+bracket each vDSO result with raw calls in the native root and fork child.
+The ARM dispatch witness checks the two null operands in a native child.
+
+CPU-time clocks and times read live native guest CPU accounting from the
+shared scheduler zone's per-record user/system counter ledger (`ZoneCpuLedger`).
+Each CPU slot records user vs ring-system execution windows against the
+qualified guest counter and closes the window across idle spins, `wfi`/`hlt`,
+parked waits, and synchronous host crossings so blocked time accrues zero CPU
+ticks. A host crossing keeps the slot's record bound (`cross_to_host`):
+it returns to the same thread, which may be an initial root the scheduler
+never switched in and so names no current record on re-entry. The KVM
+witness polls the root's standard descriptors before burning CPU. Non-last thread exits fold their retired record ticks into the process's
+`NativeResources` total, `CLOCK_THREAD_CPUTIME_ID` and `RUSAGE_THREAD` read the
+calling member's own record ticks, `CLOCK_PROCESS_CPUTIME_ID` and `RUSAGE_SELF`
+sum retired and live members, and reaped children fold into `children_rusage`
+(`wait4`, `getrusage(RUSAGE_CHILDREN)`, and `times` `tms_cutime`/`tms_cstime`).
+The ARM VM-free witnesses verify null/fault validation plus non-zero user,
+system, and reaped-child tick accounting; the KVM witness verifies raw/vDSO
+ordering, two-thread spin + raw `exit`, and two-process user/system + `wait4`
+children accounting against the native Linux x86_64 oracle.

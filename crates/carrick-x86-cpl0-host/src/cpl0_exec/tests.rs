@@ -388,6 +388,7 @@ fn exec_service_stages_a_static_successor() {
         random: [0x5a; 16],
         stack_top: INITIAL_STACK_TOP,
         stack_size: INITIAL_STACK_SIZE,
+        vdso: None,
     })
     .unwrap()
     .rsp;

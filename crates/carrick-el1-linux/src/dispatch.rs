@@ -3677,6 +3677,12 @@ impl<
         }
         Some(self)
     }
+    fn time_native(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::lifecycle::LifecycleNative<'a>> {
+        self.process_venue()?;
+        Some(self)
+    }
     fn signal_native(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::signal::SignalNative<'a>> {
@@ -4882,6 +4888,363 @@ impl Drop for PipeOutput<'_> {
     }
 }
 
+#[inline(never)]
+fn serve_ring_pair_constructor<'ipc, Context: DispatchContext>(
+    region: carrick_el1_abi::ipc::IpcRegion<'ipc>,
+    table: carrick_el1_abi::ipc::fd::TableId,
+    pair: IpcPair,
+    create_zone: Option<(&ZoneTables, SlotId)>,
+    process: &mut (dyn lifecycle::ProcessNative<'ipc, Context> + '_),
+) -> FamilyCompletion {
+    use carrick_el1_abi::ipc::{
+        IpcBacking, StreamEnd,
+        fd::{AccessMode, Description, StatusFlags},
+        pipe::End,
+    };
+    let mut claims = match run_with_table_growth(&region, table, |auth| auth.reserve_pair(table)) {
+        Ok(claims) => claims,
+        Err(error) => return error,
+    };
+    let object = loop {
+        let seen = region.object_count();
+        let created = match pair.kind {
+            IpcPairKind::Pipe => region.create_pipe(65536, &NativeFdWait),
+            IpcPairKind::Stream => region.create_stream(&NativeFdWait),
+        };
+        match created {
+            Ok(object) => break object,
+            Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
+                if let Err(error) = region.grow_objects(seen) {
+                    let _ = region.fd(NativeFdWait).cancel_pair(&mut claims);
+                    return map_ipc_error(error);
+                }
+            }
+            Err(error) => {
+                let _ = region.fd(NativeFdWait).cancel_pair(&mut claims);
+                return map_ipc_error(error);
+            }
+        }
+    };
+    let Some(fds) = claims.fds() else {
+        invalid_completion(NativeInvariant::PipeOutput)
+    };
+    let ends = match pair.kind {
+        IpcPairKind::Pipe => [
+            (
+                IpcBacking::Pipe {
+                    object,
+                    end: End::Reader,
+                },
+                AccessMode::ReadOnly,
+            ),
+            (
+                IpcBacking::Pipe {
+                    object,
+                    end: End::Writer,
+                },
+                AccessMode::WriteOnly,
+            ),
+        ],
+        IpcPairKind::Stream => [
+            (
+                IpcBacking::Stream {
+                    object,
+                    end: StreamEnd::First,
+                },
+                AccessMode::ReadWrite,
+            ),
+            (
+                IpcBacking::Stream {
+                    object,
+                    end: StreamEnd::Second,
+                },
+                AccessMode::ReadWrite,
+            ),
+        ],
+    };
+    let mut output = PipeOutput {
+        region,
+        claims: Some(claims),
+        pins: [None, None],
+        backings: ends.map(|(backing, _)| Some(backing.encode())),
+        cloexec: pair.cloexec,
+    };
+    if let Some((zone, _)) = create_zone {
+        for lane in [
+            carrick_el1_abi::ipc::pipe::WaitFor::Readable,
+            carrick_el1_abi::ipc::pipe::WaitFor::Writable,
+        ] {
+            if let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, lane)
+                && zone
+                    .bind_object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })
+                    .is_err()
+            {
+                return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EIO.guest_retval());
+            }
+        }
+    }
+    for (index, (_, access)) in ends.into_iter().enumerate() {
+        let Some(backing) = output.backings[index] else {
+            invalid_completion(NativeInvariant::PipeOutput)
+        };
+        let description = Description::new(
+            backing,
+            access,
+            StatusFlags {
+                nonblock: pair.nonblock,
+                ..StatusFlags::default()
+            },
+        );
+        match run_with_table_growth(&region, table, |auth| auth.create_pinned(description)) {
+            Ok(pin) => {
+                output.pins[index] = Some(pin);
+                output.backings[index] = None;
+            }
+            Err(error) => return error,
+        }
+    }
+    let bytes = fds.into_iter().flat_map(|fd| fd.0.to_ne_bytes()).collect();
+    lifecycle::lifecycle_effect(&process.complete_constructor_output(
+        carrick_guest_arch::UserVa::new(pair.output),
+        bytes,
+        alloc::boxed::Box::new(output),
+    ))
+}
+
+struct RingStreamSocketArgs<'a> {
+    counters: &'a Counters,
+    canonical_ordinal: carrick_syscall_abi::CanonicalNr,
+    args: [u64; 6],
+    pc: u64,
+}
+
+#[inline(never)]
+fn serve_ring_stream_socket<'ipc, Z: carrick_el1_abi::EntryContext>(
+    region: &carrick_el1_abi::ipc::IpcRegion<'_>,
+    task: &CurrentTask,
+    table: carrick_el1_abi::ipc::fd::TableId,
+    call: RingStreamSocketArgs<'_>,
+    zone: Option<(&carrick_sched_core::ZoneTables<Z>, SlotId)>,
+    process: Option<&mut (dyn lifecycle::ProcessNative<'ipc, Z> + '_)>,
+) -> FamilyCompletion {
+    use crate::ipc;
+    use carrick_abi::{
+        LINUX_AF_UNIX, LINUX_EINVAL, LINUX_EISCONN, LINUX_ENOPROTOOPT, LINUX_SHUT_RD,
+        LINUX_SHUT_RDWR, LINUX_SHUT_WR, LINUX_SO_ACCEPTCONN, LINUX_SO_DOMAIN, LINUX_SO_ERROR,
+        LINUX_SO_PROTOCOL, LINUX_SO_RCVBUF, LINUX_SO_SNDBUF, LINUX_SO_TYPE, LINUX_SOCK_STREAM,
+        LINUX_SOL_SOCKET,
+    };
+    use carrick_el1_abi::ipc::{IpcBacking, fd::Fd};
+    use carrick_personality_linux::crossing::nr;
+
+    let fd = Fd(call.args[0] as i32);
+    let ordinal = carrick_personality_linux::dispatch::owner_ordinal(call.canonical_ordinal);
+    let (object, end) = match region.fd(NativeFdWait).get(table, fd) {
+        Ok(description) => match IpcBacking::decode(description.backing) {
+            Some(IpcBacking::Stream { object, end }) => (object, end),
+            _ => return FamilyCompletion::Forward,
+        },
+        Err(error) => return map_fd_error(error),
+    };
+    let errno =
+        |errno: carrick_syscall_abi::LinuxErrno| FamilyCompletion::Complete(errno.guest_retval());
+    let (value, value_at, length_at) = match ordinal {
+        nr::SHUTDOWN => {
+            let (read, write) = match call.args[1] as u32 as i32 {
+                LINUX_SHUT_RD => (true, false),
+                LINUX_SHUT_WR => (false, true),
+                LINUX_SHUT_RDWR => (true, true),
+                _ => return errno(LINUX_EINVAL),
+            };
+            return match region.shutdown_stream(object, end, read, write, &NativeFdWait) {
+                Ok(wake) => {
+                    ipc::notify_native_wake(wake, zone, task);
+                    FamilyCompletion::Complete(0)
+                }
+                Err(error) => map_ipc_error(error),
+            };
+        }
+        nr::GETSOCKOPT => {
+            if call.args[1] as u32 as i32 != LINUX_SOL_SOCKET {
+                return errno(carrick_syscall_abi::LINUX_EOPNOTSUPP);
+            }
+            let value = match call.args[2] as u32 as i32 {
+                LINUX_SO_TYPE => LINUX_SOCK_STREAM,
+                LINUX_SO_DOMAIN => LINUX_AF_UNIX,
+                LINUX_SO_PROTOCOL | LINUX_SO_ERROR | LINUX_SO_ACCEPTCONN => 0,
+                LINUX_SO_SNDBUF | LINUX_SO_RCVBUF => {
+                    carrick_el1_abi::ipc::IPC_STREAM_LANE_BYTES as i32
+                }
+                _ => return errno(LINUX_ENOPROTOOPT),
+            };
+            (value.to_ne_bytes().to_vec(), call.args[3], call.args[4])
+        }
+        nr::GETSOCKNAME | nr::GETPEERNAME => (
+            (LINUX_AF_UNIX as u16).to_ne_bytes().to_vec(),
+            call.args[1],
+            call.args[2],
+        ),
+        nr::SETSOCKOPT => return errno(LINUX_ENOPROTOOPT),
+        nr::CONNECT => return errno(LINUX_EISCONN),
+        nr::LISTEN | nr::ACCEPT | nr::ACCEPT4 => return errno(LINUX_EINVAL),
+        _ => return errno(carrick_syscall_abi::LINUX_EOPNOTSUPP),
+    };
+    let mut copy = file::ValidatedCopy {
+        task,
+        validator: &file::HardwareValidator,
+    };
+    let mut word = [0u8; 4];
+    match carrick_core::user_copy::UserCopy::copy_in(
+        &mut copy,
+        &mut word,
+        carrick_guest_arch::UserVa::new(length_at),
+    ) {
+        lifecycle::CopyOutcome::Done => {}
+        lifecycle::CopyOutcome::Fault => {
+            return errno(carrick_syscall_abi::LINUX_EFAULT);
+        }
+        lifecycle::CopyOutcome::NotYet(request) => {
+            let Some(process) = process else {
+                return FamilyCompletion::Forward;
+            };
+            return lifecycle::lifecycle_effect(&process.wait_guest_copy(request));
+        }
+    }
+    let Ok(room) = usize::try_from(i32::from_ne_bytes(word)) else {
+        return errno(LINUX_EINVAL);
+    };
+    let written = value.len().min(room);
+    if written != 0 {
+        match carrick_core::user_copy::UserCopy::copy_out(
+            &mut copy,
+            carrick_guest_arch::UserVa::new(value_at),
+            &value[..written],
+        ) {
+            lifecycle::CopyOutcome::Done => {}
+            lifecycle::CopyOutcome::Fault => {
+                return errno(carrick_syscall_abi::LINUX_EFAULT);
+            }
+            lifecycle::CopyOutcome::NotYet(request) => {
+                let Some(process) = process else {
+                    return FamilyCompletion::Forward;
+                };
+                return lifecycle::lifecycle_effect(&process.wait_guest_copy(request));
+            }
+        }
+    }
+    let reported = if ordinal == nr::GETSOCKOPT {
+        written
+    } else {
+        value.len()
+    } as u32;
+    complete_poll_copyout(
+        process,
+        task,
+        carrick_guest_arch::UserVa::new(length_at),
+        &reported.to_ne_bytes(),
+        SyscallResult::new(0),
+        (call.counters, call.canonical_ordinal, call.args, call.pc),
+    )
+}
+
+#[inline(never)]
+fn serve_ring_object_create(
+    region: &carrick_el1_abi::ipc::IpcRegion<'_>,
+    table: carrick_el1_abi::ipc::fd::TableId,
+    eventfd: bool,
+    initval: u32,
+    flags: u64,
+    create_zone: Option<(&ZoneTables, SlotId)>,
+) -> FamilyCompletion {
+    use carrick_el1_abi::ipc::{
+        EventMode, IpcBacking,
+        fd::{AccessMode, Fd},
+    };
+    let allowed = carrick_syscall_abi::LINUX_O_CLOEXEC
+        | if eventfd {
+            carrick_abi::LINUX_O_NONBLOCK | carrick_abi::LINUX_EFD_SEMAPHORE
+        } else {
+            0
+        };
+    if flags & !allowed != 0 {
+        return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EINVAL.guest_retval());
+    }
+    let object = loop {
+        let seen = region.object_count();
+        let created = if eventfd {
+            let mode = if flags & carrick_abi::LINUX_EFD_SEMAPHORE != 0 {
+                EventMode::Semaphore
+            } else {
+                EventMode::Counter
+            };
+            region.create_eventfd(initval, mode, &NativeFdWait)
+        } else {
+            region.create_epoll(&NativeFdWait)
+        };
+        match created {
+            Ok(object) => break object,
+            Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
+                if let Err(error) = region.grow_objects(seen) {
+                    return map_ipc_error(error);
+                }
+            }
+            Err(error) => return map_ipc_error(error),
+        }
+    };
+    let backing = if eventfd {
+        IpcBacking::EventFd { object }
+    } else {
+        IpcBacking::Epoll { object }
+    }
+    .encode();
+    if let Some((zone, _)) = create_zone {
+        for lane in [
+            carrick_el1_abi::ipc::pipe::WaitFor::Readable,
+            carrick_el1_abi::ipc::pipe::WaitFor::Writable,
+        ] {
+            if let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, lane)
+                && zone
+                    .bind_object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })
+                    .is_err()
+            {
+                if let Err(error) = region.release_backing(backing, &NativeFdWait) {
+                    return map_ipc_error(error);
+                }
+                return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EIO.guest_retval());
+            }
+        }
+    }
+    let description = carrick_el1_abi::ipc::fd::Description::new(
+        backing,
+        AccessMode::ReadWrite,
+        carrick_el1_abi::ipc::fd::StatusFlags {
+            nonblock: eventfd && flags & carrick_abi::LINUX_O_NONBLOCK != 0,
+            ..Default::default()
+        },
+    );
+    let result = run_with_table_growth(region, table, |auth| {
+        auth.open(
+            table,
+            Fd(0),
+            description,
+            flags & carrick_syscall_abi::LINUX_O_CLOEXEC != 0,
+        )
+    });
+    match result {
+        Ok(fd) => FamilyCompletion::Complete(i64::from(fd.0)),
+        Err(error) => {
+            if let Err(release) = region.release_backing(backing, &NativeFdWait) {
+                return map_ipc_error(release);
+            }
+            error
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum NativeDupTarget {
     Lowest(carrick_el1_abi::ipc::fd::Fd),
@@ -5557,17 +5920,11 @@ impl<
     /// the pair of slots, create the object, bind its wait lanes, create
     /// the two pinned descriptions and publish them only with the
     /// `int[2]` copyout.
-    #[inline(never)]
     fn serve_pair_constructor(
         &mut self,
         table: carrick_el1_abi::ipc::fd::TableId,
         pair: IpcPair,
     ) -> FamilyCompletion {
-        use carrick_el1_abi::ipc::{
-            IpcBacking, StreamEnd,
-            fd::{AccessMode, Description, StatusFlags},
-            pipe::End,
-        };
         let Some(venue) = self.ipc else {
             return FamilyCompletion::Forward;
         };
@@ -5579,121 +5936,7 @@ impl<
         let Some(process) = self.process.as_deref_mut() else {
             return FamilyCompletion::Forward;
         };
-        let mut claims =
-            match run_with_table_growth(&venue.region, table, |auth| auth.reserve_pair(table)) {
-                Ok(claims) => claims,
-                Err(error) => return error,
-            };
-        let object = loop {
-            let seen = venue.region.object_count();
-            let created = match pair.kind {
-                IpcPairKind::Pipe => venue.region.create_pipe(65536, &NativeFdWait),
-                IpcPairKind::Stream => venue.region.create_stream(&NativeFdWait),
-            };
-            match created {
-                Ok(object) => break object,
-                Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
-                    if let Err(error) = venue.region.grow_objects(seen) {
-                        let _ = venue.region.fd(NativeFdWait).cancel_pair(&mut claims);
-                        return map_ipc_error(error);
-                    }
-                }
-                Err(error) => {
-                    let _ = venue.region.fd(NativeFdWait).cancel_pair(&mut claims);
-                    return map_ipc_error(error);
-                }
-            }
-        };
-        let Some(fds) = claims.fds() else {
-            invalid_completion(NativeInvariant::PipeOutput)
-        };
-        let ends = match pair.kind {
-            IpcPairKind::Pipe => [
-                (
-                    IpcBacking::Pipe {
-                        object,
-                        end: End::Reader,
-                    },
-                    AccessMode::ReadOnly,
-                ),
-                (
-                    IpcBacking::Pipe {
-                        object,
-                        end: End::Writer,
-                    },
-                    AccessMode::WriteOnly,
-                ),
-            ],
-            IpcPairKind::Stream => [
-                (
-                    IpcBacking::Stream {
-                        object,
-                        end: StreamEnd::First,
-                    },
-                    AccessMode::ReadWrite,
-                ),
-                (
-                    IpcBacking::Stream {
-                        object,
-                        end: StreamEnd::Second,
-                    },
-                    AccessMode::ReadWrite,
-                ),
-            ],
-        };
-        let mut output = PipeOutput {
-            region: venue.region,
-            claims: Some(claims),
-            pins: [None, None],
-            backings: ends.map(|(backing, _)| Some(backing.encode())),
-            cloexec: pair.cloexec,
-        };
-        if let Some((zone, _)) = create_zone {
-            for lane in [
-                carrick_el1_abi::ipc::pipe::WaitFor::Readable,
-                carrick_el1_abi::ipc::pipe::WaitFor::Writable,
-            ] {
-                if let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, lane)
-                    && zone
-                        .bind_object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                        })
-                        .is_err()
-                {
-                    return FamilyCompletion::Complete(
-                        carrick_syscall_abi::LINUX_EIO.guest_retval(),
-                    );
-                }
-            }
-        }
-        for (index, (_, access)) in ends.into_iter().enumerate() {
-            let Some(backing) = output.backings[index] else {
-                invalid_completion(NativeInvariant::PipeOutput)
-            };
-            let description = Description::new(
-                backing,
-                access,
-                StatusFlags {
-                    nonblock: pair.nonblock,
-                    ..StatusFlags::default()
-                },
-            );
-            match run_with_table_growth(&venue.region, table, |auth| {
-                auth.create_pinned(description)
-            }) {
-                Ok(pin) => {
-                    output.pins[index] = Some(pin);
-                    output.backings[index] = None;
-                }
-                Err(error) => return error,
-            }
-        }
-        let bytes = fds.into_iter().flat_map(|fd| fd.0.to_ne_bytes()).collect();
-        lifecycle::lifecycle_effect(&process.complete_constructor_output(
-            carrick_guest_arch::UserVa::new(pair.output),
-            bytes,
-            alloc::boxed::Box::new(output),
-        ))
+        serve_ring_pair_constructor(venue.region, table, pair, create_zone, process)
     }
 
     /// The socket calls of a ring stream pair's end (#2361), answered in
@@ -5702,20 +5945,8 @@ impl<
     /// resolve, listen, accept or connect again; the ring carries no
     /// ancillary data (`SCM_RIGHTS`, `SCM_CREDENTIALS`), so `sendmsg` and
     /// `recvmsg` are refused with EOPNOTSUPP rather than forwarded.
-    #[inline(never)]
     fn serve_stream_socket(&mut self) -> FamilyCompletion {
-        use crate::ipc;
-        use carrick_abi::{
-            LINUX_AF_UNIX, LINUX_EINVAL, LINUX_EISCONN, LINUX_ENOPROTOOPT, LINUX_SHUT_RD,
-            LINUX_SHUT_RDWR, LINUX_SHUT_WR, LINUX_SO_ACCEPTCONN, LINUX_SO_DOMAIN, LINUX_SO_ERROR,
-            LINUX_SO_PROTOCOL, LINUX_SO_RCVBUF, LINUX_SO_SNDBUF, LINUX_SO_TYPE, LINUX_SOCK_STREAM,
-            LINUX_SOL_SOCKET,
-        };
-        use carrick_el1_abi::ipc::{
-            IpcBacking,
-            fd::{Fd, TableId},
-        };
-        use carrick_personality_linux::crossing::nr;
+        use carrick_el1_abi::ipc::fd::TableId;
         let Some(venue) = self.ipc else {
             return FamilyCompletion::Forward;
         };
@@ -5726,136 +5957,22 @@ impl<
         else {
             return FamilyCompletion::Forward;
         };
-        let table = TableId::from_raw(raw);
-        let fd = Fd(self.frame.argument(0).unwrap_or(0) as i32);
-        let args: [u64; 6] = core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0));
-        let ordinal =
-            carrick_personality_linux::dispatch::owner_ordinal(self.frame.canonical_ordinal());
-        let (object, end) = match venue.region.fd(NativeFdWait).get(table, fd) {
-            Ok(description) => match IpcBacking::decode(description.backing) {
-                Some(IpcBacking::Stream { object, end }) => (object, end),
-                _ => return FamilyCompletion::Forward,
-            },
-            Err(error) => return map_fd_error(error),
+        let zone = self
+            .record_source()
+            .map(|source| (source.zone, source.slot));
+        let call = RingStreamSocketArgs {
+            counters: self.counters,
+            canonical_ordinal: self.frame.canonical_ordinal(),
+            args: core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0)),
+            pc: self.frame.arm_frame_ref().map_or(0, |frame| frame.elr),
         };
-        let errno = |errno: carrick_syscall_abi::LinuxErrno| {
-            FamilyCompletion::Complete(errno.guest_retval())
-        };
-        // The value and its length word: `getsockopt`'s `optval`/`optlen`,
-        // `getsockname`'s `addr`/`addrlen`. The length is read first.
-        let (value, value_at, length_at) = match ordinal {
-            nr::SHUTDOWN => {
-                let (read, write) = match args[1] as u32 as i32 {
-                    LINUX_SHUT_RD => (true, false),
-                    LINUX_SHUT_WR => (false, true),
-                    LINUX_SHUT_RDWR => (true, true),
-                    _ => return errno(LINUX_EINVAL),
-                };
-                let zone = self
-                    .record_source()
-                    .map(|source| (source.zone, source.slot));
-                return match venue
-                    .region
-                    .shutdown_stream(object, end, read, write, &NativeFdWait)
-                {
-                    Ok(wake) => {
-                        ipc::notify_native_wake(wake, zone, task);
-                        FamilyCompletion::Complete(0)
-                    }
-                    Err(error) => map_ipc_error(error),
-                };
-            }
-            nr::GETSOCKOPT => {
-                if args[1] as u32 as i32 != LINUX_SOL_SOCKET {
-                    return errno(carrick_syscall_abi::LINUX_EOPNOTSUPP);
-                }
-                let value = match args[2] as u32 as i32 {
-                    LINUX_SO_TYPE => LINUX_SOCK_STREAM,
-                    LINUX_SO_DOMAIN => LINUX_AF_UNIX,
-                    LINUX_SO_PROTOCOL | LINUX_SO_ERROR | LINUX_SO_ACCEPTCONN => 0,
-                    // The bytes one direction buffers before a writer waits.
-                    LINUX_SO_SNDBUF | LINUX_SO_RCVBUF => {
-                        carrick_el1_abi::ipc::IPC_STREAM_LANE_BYTES as i32
-                    }
-                    _ => return errno(LINUX_ENOPROTOOPT),
-                };
-                (value.to_ne_bytes().to_vec(), args[3], args[4])
-            }
-            // Neither name is bound: just the family, sizeof(sa_family_t).
-            nr::GETSOCKNAME | nr::GETPEERNAME => (
-                (LINUX_AF_UNIX as u16).to_ne_bytes().to_vec(),
-                args[1],
-                args[2],
-            ),
-            nr::SETSOCKOPT => return errno(LINUX_ENOPROTOOPT),
-            nr::CONNECT => return errno(LINUX_EISCONN),
-            nr::LISTEN | nr::ACCEPT | nr::ACCEPT4 => return errno(LINUX_EINVAL),
-            _ => return errno(carrick_syscall_abi::LINUX_EOPNOTSUPP),
-        };
-        let mut copy = file::ValidatedCopy {
+        serve_ring_stream_socket(
+            &venue.region,
             task,
-            validator: &file::HardwareValidator,
-        };
-        let mut word = [0u8; 4];
-        match carrick_core::user_copy::UserCopy::copy_in(
-            &mut copy,
-            &mut word,
-            carrick_guest_arch::UserVa::new(length_at),
-        ) {
-            lifecycle::CopyOutcome::Done => {}
-            lifecycle::CopyOutcome::Fault => {
-                return errno(carrick_syscall_abi::LINUX_EFAULT);
-            }
-            lifecycle::CopyOutcome::NotYet(request) => {
-                let Some(process) = self.process.as_deref_mut() else {
-                    return FamilyCompletion::Forward;
-                };
-                return lifecycle::lifecycle_effect(&process.wait_guest_copy(request));
-            }
-        }
-        let Ok(room) = usize::try_from(i32::from_ne_bytes(word)) else {
-            return errno(LINUX_EINVAL);
-        };
-        // The value is truncated to the caller's room; the length word
-        // then reports what was written (getsockopt(2)) or the full
-        // address length (getsockname(2)). Nothing is consumed before the
-        // final copyout, so a page that is not there yet reruns the call.
-        let written = value.len().min(room);
-        if written != 0 {
-            match carrick_core::user_copy::UserCopy::copy_out(
-                &mut copy,
-                carrick_guest_arch::UserVa::new(value_at),
-                &value[..written],
-            ) {
-                lifecycle::CopyOutcome::Done => {}
-                lifecycle::CopyOutcome::Fault => {
-                    return errno(carrick_syscall_abi::LINUX_EFAULT);
-                }
-                lifecycle::CopyOutcome::NotYet(request) => {
-                    let Some(process) = self.process.as_deref_mut() else {
-                        return FamilyCompletion::Forward;
-                    };
-                    return lifecycle::lifecycle_effect(&process.wait_guest_copy(request));
-                }
-            }
-        }
-        let reported = if ordinal == nr::GETSOCKOPT {
-            written
-        } else {
-            value.len()
-        } as u32;
-        complete_poll_copyout(
+            TableId::from_raw(raw),
+            call,
+            zone,
             self.process.as_deref_mut(),
-            task,
-            carrick_guest_arch::UserVa::new(length_at),
-            &reported.to_ne_bytes(),
-            SyscallResult::new(0),
-            (
-                self.counters,
-                self.frame.canonical_ordinal(),
-                args,
-                self.frame.arm_frame_ref().map_or(0, |frame| frame.elr),
-            ),
         )
     }
 
@@ -5965,106 +6082,16 @@ impl<
             nr if nr == carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw()
                 || nr == carrick_personality_linux::crossing::nr::EVENTFD2.raw() =>
             {
-                use carrick_el1_abi::ipc::{EventMode, IpcBacking};
                 let eventfd = nr == carrick_personality_linux::crossing::nr::EVENTFD2.raw();
                 let flags = self.frame.argument(usize::from(eventfd)).unwrap_or(0) as u32 as u64;
-                let allowed = carrick_syscall_abi::LINUX_O_CLOEXEC
-                    | if eventfd {
-                        carrick_abi::LINUX_O_NONBLOCK | carrick_abi::LINUX_EFD_SEMAPHORE
-                    } else {
-                        0
-                    };
-                if flags & !allowed != 0 {
-                    return FamilyCompletion::Complete(
-                        carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
-                    );
-                }
-                let object = loop {
-                    let seen = venue.region.object_count();
-                    let created = if eventfd {
-                        let mode = if flags & carrick_abi::LINUX_EFD_SEMAPHORE != 0 {
-                            EventMode::Semaphore
-                        } else {
-                            EventMode::Counter
-                        };
-                        venue.region.create_eventfd(
-                            self.frame.argument(0).unwrap_or(0) as u32,
-                            mode,
-                            &NativeFdWait,
-                        )
-                    } else {
-                        venue.region.create_epoll(&NativeFdWait)
-                    };
-                    match created {
-                        Ok(object) => break object,
-                        Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
-                            if let Err(error) = venue.region.grow_objects(seen) {
-                                return map_ipc_error(error);
-                            }
-                        }
-                        Err(error) => return map_ipc_error(error),
-                    }
-                };
-                let backing = if eventfd {
-                    IpcBacking::EventFd { object }
-                } else {
-                    IpcBacking::Epoll { object }
-                }
-                .encode();
-                if let Some((zone, _)) = create_zone {
-                    for lane in [
-                        carrick_el1_abi::ipc::pipe::WaitFor::Readable,
-                        carrick_el1_abi::ipc::pipe::WaitFor::Writable,
-                    ] {
-                        if let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, lane)
-                            && zone
-                                .bind_object_wait(
-                                    key,
-                                    &carrick_sched_core::ShortLockSpin,
-                                    &|owned| {
-                                        crate::sched::object_wait::deliver_host_completion(
-                                            owned.zone(),
-                                            owned,
-                                        )
-                                    },
-                                )
-                                .is_err()
-                        {
-                            if let Err(error) = venue.region.release_backing(backing, &NativeFdWait)
-                            {
-                                return map_ipc_error(error);
-                            }
-                            return FamilyCompletion::Complete(
-                                carrick_syscall_abi::LINUX_EIO.guest_retval(),
-                            );
-                        }
-                    }
-                }
-                let description = carrick_el1_abi::ipc::fd::Description::new(
-                    backing,
-                    AccessMode::ReadWrite,
-                    carrick_el1_abi::ipc::fd::StatusFlags {
-                        nonblock: eventfd && flags & carrick_abi::LINUX_O_NONBLOCK != 0,
-                        ..Default::default()
-                    },
-                );
-                let result = run_with_table_growth(&venue.region, table, |auth| {
-                    auth.open(
-                        table,
-                        Fd(0),
-                        description,
-                        flags & carrick_syscall_abi::LINUX_O_CLOEXEC != 0,
-                    )
-                });
-                match result {
-                    Ok(fd) => FamilyCompletion::Complete(i64::from(fd.0)),
-                    Err(error) => {
-                        if let Err(release) = venue.region.release_backing(backing, &NativeFdWait) {
-                            return map_ipc_error(release);
-                        }
-                        error
-                    }
-                }
+                serve_ring_object_create(
+                    &venue.region,
+                    table,
+                    eventfd,
+                    self.frame.argument(0).unwrap_or(0) as u32,
+                    flags,
+                    create_zone,
+                )
             }
             nr if nr == carrick_personality_linux::crossing::nr::EPOLL_CTL.raw() => {
                 let native_service = self.process.as_deref().is_some_and(|process| {

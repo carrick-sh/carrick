@@ -15,8 +15,8 @@ from typing import Any
 
 
 LIBCS = ("gnu", "musl")
-DEDICATED_SOURCE_COUNT = 25
-DEDICATED_RUNNER_COUNT = 19
+DEDICATED_SOURCE_COUNT = 26
+DEDICATED_RUNNER_COUNT = 20
 SignedScenario = namedtuple("SignedScenario", "package test_target ignored")
 # `ignored` mirrors whether the test carries `#[ignore]`; test-signed.sh keeps
 # `--ignored` as ignored-only selection, so passing it for a plain `#[test]`
@@ -27,6 +27,9 @@ SIGNED_SCENARIO_RUNNERS = {
     ),
     "case_native_prefix_write_child_inherited_file": SignedScenario(
         "carrick-conformance-next", "native_prefix_write", False
+    ),
+    "case_ring_clock_child_raw_syscalls": SignedScenario(
+        "carrick-conformance-next", "ring_clock_child", False
     ),
     "production_rx_poketext_executes_warm_patched_instruction": SignedScenario(
         "carrick-conformance-next", "ptrace_poketext_signed", True

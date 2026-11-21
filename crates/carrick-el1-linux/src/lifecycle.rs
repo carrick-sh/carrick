@@ -69,10 +69,24 @@ impl<
         );
     }
 
-    fn process_venue(&mut self) -> Option<&mut (dyn ProcessNative<'ipc, Context> + 'a)> {
+    /// The current native process venue, if it is bound to the calling task.
+    /// Outlined: its binding comparison is shared by every lifecycle and
+    /// clock call, and the EL1 image is size-bounded.
+    #[inline(never)]
+    pub(crate) fn process_venue(&mut self) -> Option<&mut (dyn ProcessNative<'ipc, Context> + 'a)> {
         let binding = LifecycleNative::binding(self)?;
         let venue = self.process.as_deref_mut()?;
         (venue.binding() == binding).then_some(venue)
+    }
+
+    /// The venue that serves this caller's clocks in ring. The ARM root can
+    /// still have an embedder-controlled ClockDomain, so it keeps its legacy
+    /// dispatch until that domain is available in ring.
+    #[inline(never)]
+    fn clock_venue(&mut self) -> Option<&mut (dyn ProcessNative<'ipc, Context> + 'a)> {
+        let isa = LifecycleNative::guest_isa(self);
+        let venue = self.process_venue()?;
+        (isa != carrick_guest_arch::GuestIsa::Aarch64 || !venue.is_root_process()).then_some(venue)
     }
 
     fn run_ready_after_native_transfer(&mut self, outcome: &mut LifecycleOutcome) {
@@ -214,6 +228,29 @@ impl<
     Context: super::dispatch::DispatchContext,
 > LifecycleNative<'a> for El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
+    fn monotonic_counter(
+        &mut self,
+    ) -> Option<(
+        carrick_guest_arch::CounterTick,
+        carrick_guest_arch::CounterFrequency,
+    )> {
+        self.clock_venue()?.monotonic_counter()
+    }
+
+    fn realtime_counter(
+        &mut self,
+    ) -> Option<carrick_personality_linux::lifecycle::RealtimeCounter> {
+        self.clock_venue()?.realtime_counter()
+    }
+
+    fn cputime_nanos(&mut self, per_thread: bool) -> Option<u64> {
+        self.clock_venue()?.cputime_nanos(per_thread)
+    }
+
+    fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {
+        self.clock_venue()?.process_tms()
+    }
+
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
         let diagnostic = crate::file::CopyDiagnostic {
             counters: self.counters,
@@ -275,6 +312,28 @@ impl<
         self.run_ready_after_native_transfer(&mut outcome);
         outcome
     }
+    fn finish_time_output(
+        &mut self,
+        records: [Option<(UserVa, alloc::vec::Vec<u8>)>; 2],
+        result: SyscallResult,
+    ) -> LifecycleOutcome {
+        let venue = self.process_venue().unwrap_or_else(|| {
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
+        });
+        let mut outcome = match records {
+            [Some(first), Some(second)] => venue.complete_copyout_pair([first, second], result),
+            [Some((address, bytes)), None] | [None, Some((address, bytes))] => {
+                venue.complete_copyout(address, bytes, result)
+            }
+            [None, None] => LifecycleOutcome::Returned {
+                result,
+                work: false,
+            },
+        };
+        self.run_ready_after_native_transfer(&mut outcome);
+        outcome
+    }
+
     fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
         match self.frame.crossing_set() {
             carrick_personality_linux::crossing::HostCrossingSet::Aarch64 => {

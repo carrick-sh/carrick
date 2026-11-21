@@ -154,11 +154,11 @@ impl InitialFrameSource for GrantedFrames<'_> {
 fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     if request.magic != X86_INITIAL_BOOT_MAGIC
         || request.version != X86_INITIAL_BOOT_VERSION
+        || request.image_features & !carrick_core_abi::X86_INITIAL_HAS_VDSO != 0
         || request.layout_hash != carrick_el1_abi::EL1_ABI_LAYOUT_HASH
         || request.region_count == 0
         || request.executable_region_count == 0
         || request.executable_region_count > request.region_count
-        || request.reserved != 0
         || request.region_count as usize > X86_INITIAL_MAX_REGIONS
         || usize::from(request.argc) + usize::from(request.envc) > X86_INITIAL_MAX_STRINGS
         || request.extent_pages == 0
@@ -315,6 +315,11 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
         random: request.random,
         stack_top: request.stack_top,
         stack_size: request.stack_size,
+        vdso: if request.image_features & carrick_core_abi::X86_INITIAL_HAS_VDSO != 0 {
+            Some(image_regions.last()?.start)
+        } else {
+            None
+        },
     };
     let source_root = carrick_el1::isa::x86::hardware_live_root().ok()?;
     if source_root.address().raw() != 0x60_0000 {
@@ -501,6 +506,21 @@ pub fn carrier_initial_boot<P: Personality>(request_va: u64) -> ! {
     // before it publishes the stopped root image to the executor pool.
     unsafe {
         core::arch::asm!("out dx, al", in("dx") X86_INITIAL_RUNNER_READY_PORT, in("rax") request_va, options(nostack, preserves_flags));
+    }
+    {
+        use carrick_guest_arch::InterruptBackend;
+        let mut backend = carrick_el1::isa::x86::X86Backend;
+        let zone = unsafe {
+            &*(carrick_el1::isa::x86_kernel_layout().zone.raw()
+                as *const carrick_el1::memory::reservations::X86Cpl0Zone)
+        };
+        if let Ok(freq) = backend.frequency() {
+            zone.publish_counter_frequency(freq);
+        }
+        if let Ok(now) = backend.counter() {
+            let slot = carrick_sched_core::SlotId::new(0);
+            zone.cpu_enter_user(slot, zone.current_record_ref(slot), now);
+        }
     }
     // SAFETY: after host acknowledgement, the exact MM is published and the
     // user selectors/entry/stack came from the guest-owned image transaction.

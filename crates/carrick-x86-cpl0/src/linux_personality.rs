@@ -712,7 +712,10 @@ pub fn handle_user_page_fault_prepared(
     frame: &mut PageFaultStack,
     fpstate: &XsaveArea,
 ) -> u64 {
-    match supply_user_fault(prep) {
+    if let Some((slot, zone, now)) = carrick_x86_carrier::entry::current_slot_and_zone() {
+        zone.cpu_enter_ring(slot, zone.current_record_ref(slot), now);
+    }
+    let code = match supply_user_fault(prep) {
         UserFaultSupply::Served => 0,
         UserFaultSupply::Signal {
             signum,
@@ -720,7 +723,13 @@ pub fn handle_user_page_fault_prepared(
             address,
         } => deliver_page_fault_signal(frame, fpstate, signum, code, address),
         UserFaultSupply::Unresolved(reason) => reason,
+    };
+    if code == 0
+        && let Some((slot, zone, now)) = carrick_x86_carrier::entry::current_slot_and_zone()
+    {
+        zone.cpu_enter_user(slot, zone.current_record_ref(slot), now);
     }
+    code
 }
 
 /// What the owner fault path made of one user access.
