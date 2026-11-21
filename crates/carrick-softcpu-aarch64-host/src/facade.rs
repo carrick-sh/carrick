@@ -1859,10 +1859,7 @@ where
     fn translated_read_into(&self, va: u64, ipa: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
         self.stage2
             .try_borrow()
-            .map_err(|_| MemoryError::OutOfBounds {
-                address: va,
-                length: dst.len(),
-            })?
+            .map_err(|e| MemoryError::HostMap(e.to_string()))?
             .read_gpa_bytes(ipa, dst)
             .map_err(|_| MemoryError::OutOfBounds {
                 address: va,
@@ -1873,10 +1870,7 @@ where
     fn translated_write(&mut self, va: u64, ipa: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.stage2
             .try_borrow()
-            .map_err(|_| MemoryError::OutOfBounds {
-                address: va,
-                length: bytes.len(),
-            })?
+            .map_err(|e| MemoryError::HostMap(e.to_string()))?
             .write_gpa_bytes(ipa, bytes)
             .map_err(|_| MemoryError::OutOfBounds {
                 address: va,
@@ -1892,10 +1886,7 @@ where
         let mut stage2 = self
             .stage2
             .try_borrow()
-            .map_err(|_| MemoryError::OutOfBounds {
-                address,
-                length: len,
-            })?;
+            .map_err(|e| MemoryError::HostMap(e.to_string()))?;
         zero_range_chunked(address, len, |addr, zeros| {
             stage2
                 .write_gpa_bytes(addr, zeros)
