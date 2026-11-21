@@ -793,7 +793,13 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
     let bound_port = u16::from_be_bytes(user.as_bytes()[2..4].try_into().unwrap());
     assert_ne!(bound_port, 0);
 
-    let sender = become_ready.then(|| UdpSocket::bind("127.0.0.1:0").unwrap());
+    let sender = become_ready.then(|| {
+        use std::os::fd::FromRawFd;
+        // SAFETY: fresh AF_INET datagram descriptor owned solely by this UdpSocket.
+        let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        assert!(raw >= 0, "host test datagram socket");
+        unsafe { UdpSocket::from_raw_fd(raw) }
+    });
     let timeout_ns: i64 = if become_ready {
         500_000_000
     } else {
@@ -804,7 +810,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
 
     for round in 0..POLL_ROUNDS {
         user.as_mut_bytes()[32..36].copy_from_slice(&(sock_fd as i32).to_ne_bytes());
-        user.as_mut_bytes()[36..38].copy_from_slice(&(libc::POLLIN as i16).to_ne_bytes());
+        user.as_mut_bytes()[36..38].copy_from_slice(&libc::POLLIN.to_ne_bytes());
         user.as_mut_bytes()[38..40].copy_from_slice(&0x7fff_i16.to_ne_bytes());
 
         let on_wfi: Option<Box<dyn FnOnce()>> = sender.as_ref().map(|tx| {
@@ -827,7 +833,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
         if become_ready {
             assert_eq!(ready, 1, "round {round}: ready socket ppoll must return 1");
             assert_ne!(
-                revents & (libc::POLLIN as i16),
+                revents & libc::POLLIN,
                 0,
                 "round {round}: revents {revents:#x} must report POLLIN"
             );
