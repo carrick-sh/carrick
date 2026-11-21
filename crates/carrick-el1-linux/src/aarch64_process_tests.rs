@@ -19279,6 +19279,7 @@ fn serial_host_native_child_pselect6_mixes_a_zone_pipe_and_a_host_socket() {
 /// new socket at the same number enrols afresh.
 #[cfg(not(target_os = "macos"))]
 #[test]
+#[allow(clippy::disallowed_methods)] // The witness's own loopback peer.
 fn serial_host_native_child_pselect6_host_set_members() {
     use carrick_abi::{
         LINUX_AF_INET, LINUX_AT_FDCWD, LINUX_O_CREAT, LINUX_O_DIRECTORY, LINUX_O_RDWR,

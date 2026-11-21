@@ -118,6 +118,9 @@ fn harvest<E: IpcExecution>(
 }
 
 /// How a ring caller's lock of a zone epoll went ([`with_locked`]).
+// The release park consumes its operation by value at once, as the epoll
+// harvest's did before this helper was shared.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Locked<T> {
     Done(T),
     /// The carrier holds it: park `operation` on its release (the key and

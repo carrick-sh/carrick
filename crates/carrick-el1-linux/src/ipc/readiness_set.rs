@@ -39,7 +39,7 @@
 //! polling. Zone members keep their own items and lanes. The host set
 //! holds carrier items, so its lock is never spun on while the carrier
 //! holds it: the call parks on the holder's release and probes again
-//! ([`super::epoll::with_locked`]).
+//! (`super::epoll::with_locked`).
 //!
 //! A host member the host set holds no item for (its first select, or its
 //! file was closed and reopened) is enrolled before the call answers: the
