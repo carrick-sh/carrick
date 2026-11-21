@@ -151,6 +151,17 @@ mod test_support {
     pub const INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE: u64 = 0xffff_ffff_ffff_fe2c;
     /// Owner waits the armed hold refused and released before their park.
     pub const INJECT_EDITOR_RELEASED_BEFORE_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe2d;
+    /// Hold the next native fork after its parent root is published
+    /// fork-pending and write-protected, before its commit (#2581), until
+    /// the waiter below parks or releases it.
+    pub const INJECT_HOLD_NEXT_FORK_COMMIT: u64 = 0xffff_ffff_ffff_fe2e;
+    /// 1 once the armed fork commit is held (and the calling member becomes
+    /// the waiter whose park releases it), else 0.
+    pub const INJECT_FORK_COMMIT_HELD: u64 = 0xffff_ffff_ffff_fe2f;
+    /// Release a held fork commit from its waiter's own call; 0 also when
+    /// the waiter's park already released it.
+    pub const INJECT_RELEASE_HELD_FORK_COMMIT: u64 = 0xffff_ffff_ffff_fe30;
+    static FORK_COMMIT_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     /// Address of the armed member's current task, or 0.
     static EARLY_RELEASE_TASK: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
@@ -345,6 +356,53 @@ mod test_support {
             core::hint::spin_loop();
         }
         BIRTH_HOLD.store(0, Ordering::Release);
+    }
+
+    static FORK_COMMIT_WAITER: carrick_el1::lock::SpinLock<Option<carrick_sched_core::RecordRef>> =
+        carrick_el1::lock::SpinLock::new(None);
+
+    /// Called by the native fork before its commit, on the forking member's
+    /// CPU: the parent root is fork-pending and write-protected.
+    pub fn hold_armed_fork_commit() {
+        if FORK_COMMIT_HOLD
+            .compare_exchange(BIRTH_ARMED, BIRTH_HELD, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let mut spins = 0_u64;
+        while FORK_COMMIT_HOLD.load(Ordering::Acquire) == BIRTH_HELD {
+            spins += 1;
+            if spins > BIRTH_HOLD_SPINS {
+                carrick_x86_carrier::entry::fatal_boot();
+            }
+            core::hint::spin_loop();
+        }
+        FORK_COMMIT_HOLD.store(0, Ordering::Release);
+    }
+
+    /// Called on each scheduler entry: the registered waiter has parked, so
+    /// its contended wait is owned by the fork publication's release.
+    pub fn release_fork_commit_on_park(
+        source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+    ) {
+        let waiter = *FORK_COMMIT_WAITER.lock();
+        if let Some(record) = waiter
+            && matches!(
+                source.zone.record(record.id).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            )
+            && FORK_COMMIT_HOLD
+                .compare_exchange(
+                    BIRTH_HELD,
+                    BIRTH_RELEASED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            *FORK_COMMIT_WAITER.lock() = None;
+        }
     }
 
     /// Called on each scheduler entry: the registered waiter has parked, so
@@ -635,6 +693,31 @@ mod test_support {
             INJECT_RELEASE_HELD_BIRTH => {
                 *BIRTH_WAITER.lock() = None;
                 let _ = BIRTH_HOLD.compare_exchange(
+                    BIRTH_HELD,
+                    BIRTH_RELEASED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                Some(0)
+            }
+            INJECT_HOLD_NEXT_FORK_COMMIT => FORK_COMMIT_HOLD
+                .compare_exchange(0, BIRTH_ARMED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                .then_some(0),
+            INJECT_FORK_COMMIT_HELD => {
+                if FORK_COMMIT_HOLD.load(Ordering::Acquire) != BIRTH_HELD {
+                    return Some(0);
+                }
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                let zone = carrick_x86_carrier::native_execution::source(slot).zone;
+                *FORK_COMMIT_WAITER.lock() = Some(zone.record_ref(zone.slot(slot).current()?));
+                Some(1)
+            }
+            INJECT_RELEASE_HELD_FORK_COMMIT => {
+                *FORK_COMMIT_WAITER.lock() = None;
+                let _ = FORK_COMMIT_HOLD.compare_exchange(
                     BIRTH_HELD,
                     BIRTH_RELEASED,
                     Ordering::AcqRel,

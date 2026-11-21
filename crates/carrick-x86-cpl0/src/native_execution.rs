@@ -27,6 +27,8 @@ pub fn schedule(slot: SlotId) -> ! {
     crate::test_support::signal_parked_member(source, current);
     #[cfg(feature = "test-support")]
     crate::test_support::release_birth_on_park(source);
+    #[cfg(feature = "test-support")]
+    crate::test_support::release_fork_commit_on_park(source);
     settle_current_work(current);
     loop {
         #[cfg(feature = "test-support")]
