@@ -504,7 +504,7 @@ impl std::fmt::Debug for RingRealtimeWord {
 /// The guest realtime offset together with everything that must move with
 /// it. The fields are private to this module, so no [`ClockDomain`] path can
 /// store an offset without bumping the vvar epoch and re-publishing the
-/// carrier's ring realtime word: [`GuestRealtime::commit`] is the one writer,
+/// carrier's ring realtime word: `GuestRealtime::commit` is the one writer,
 /// and it takes the held `clock_changes` state as proof of serialization.
 mod guest_realtime {
     use std::sync::OnceLock;
