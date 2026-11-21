@@ -1125,6 +1125,7 @@ mod tests {
                 carrick_guest_arch::NativeOrdinal::new(native),
                 origin,
                 venue,
+                carrick_el1_abi::RefusalArguments::Unretained,
             );
         }
     }
