@@ -220,6 +220,7 @@ fn loom_lapped_refused_call_writer_never_leaves_an_accepted_torn_row() {
     struct Ring {
         rows: [Row; 2],
         next: LoomNameCacheAtomic,
+        dropped: LoomNameCacheAtomic,
     }
     fn record(tag: u64) -> [u64; REFUSED_CALL_WORDS - 1] {
         core::array::from_fn(|word| tag << 8 | word as u64)
@@ -229,19 +230,29 @@ fn loom_lapped_refused_call_writer_never_leaves_an_accepted_torn_row() {
         let ring = Arc::new(Ring {
             rows: Default::default(),
             next: LoomNameCacheAtomic::default(),
+            dropped: LoomNameCacheAtomic::default(),
         });
         let stalled = Arc::clone(&ring);
-        let a = thread::spawn(move || {
-            [
-                publish_refused_call_row(&stalled.rows, &stalled.next, record(0xa))
-                    .map(|index| (index, record(0xa))),
-            ]
-        });
+        let a =
+            thread::spawn(move || {
+                [publish_refused_call_row(
+                    &stalled.rows,
+                    &stalled.next,
+                    &stalled.dropped,
+                    record(0xa),
+                )
+                .map(|index| (index, record(0xa)))]
+            });
         let lapping = Arc::clone(&ring);
         let b = thread::spawn(move || {
             [0xb1, 0xb2].map(|tag| {
-                publish_refused_call_row(&lapping.rows, &lapping.next, record(tag))
-                    .map(|index| (index, record(tag)))
+                publish_refused_call_row(
+                    &lapping.rows,
+                    &lapping.next,
+                    &lapping.dropped,
+                    record(tag),
+                )
+                .map(|index| (index, record(tag)))
             })
         });
         let published: std::vec::Vec<(u64, [u64; REFUSED_CALL_WORDS - 1])> = a
@@ -253,6 +264,11 @@ fn loom_lapped_refused_call_writer_never_leaves_an_accepted_torn_row() {
             .collect();
         let next = ring.next.load(Ordering::Acquire);
         assert_eq!(next, 3);
+        // Every claimed record was either published or counted as dropped.
+        assert_eq!(
+            published.len() as u64 + ring.dropped.load(Ordering::Relaxed),
+            next
+        );
         for index in next - 2..next {
             let Some(words) = read_refused_call_row(&ring.rows, index) else {
                 continue;

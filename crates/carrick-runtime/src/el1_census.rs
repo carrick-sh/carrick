@@ -195,6 +195,10 @@ pub struct Census {
     /// (`Counters::refused_calls`), oldest first; absent in older files.
     #[serde(default)]
     pub refused_calls: Vec<RefusedCallRecord>,
+    /// Refused-call records claimed but never written because a lapped or
+    /// concurrent writer held their row (`Counters::refused_call_dropped`).
+    #[serde(default)]
+    pub refused_calls_dropped: u64,
 }
 
 /// One counted refusal's typed record, as the census file keeps it.
@@ -392,6 +396,9 @@ fn snapshot_counters(
                 .refused_calls()
                 .map(|call| RefusedCallRecord::new(call, isa))
                 .collect()
+        }),
+        refused_calls_dropped: counters.map_or(0, |counters| {
+            counters.refused_call_dropped.load(Ordering::Acquire)
         }),
     }
 }
@@ -913,6 +920,7 @@ mod tests {
             anonymous_leaves: Default::default(),
             rows,
             refused_calls: Vec::new(),
+            refused_calls_dropped: 0,
         }
     }
 
@@ -957,6 +965,14 @@ mod tests {
         assert_eq!(arm.refused_calls[1].name.as_deref(), Some("pipe2"));
         let file: Census = serde_json::from_str(&serde_json::to_string(&x86).unwrap()).unwrap();
         assert_eq!(file.refused_calls, x86.refused_calls);
+        // Records a lapped writer dropped are counted in the census file.
+        assert_eq!(x86.refused_calls_dropped, 0);
+        counters
+            .refused_call_dropped
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        let dropped = snapshot_counters(None, Some(&counters), CensusIsa::X86_64);
+        let file: Census = serde_json::from_str(&serde_json::to_string(&dropped).unwrap()).unwrap();
+        assert_eq!(file.refused_calls_dropped, 3);
     }
 
     #[test]

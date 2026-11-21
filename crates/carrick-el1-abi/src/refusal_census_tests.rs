@@ -158,3 +158,44 @@ fn refused_call_ring_overwrites_its_oldest_records_without_allocating() {
         .store((next - 1) * 2 + 1, Ordering::Relaxed);
     assert_eq!(counters.refused_calls().count(), REFUSED_CALL_RECORDS - 1);
 }
+
+#[test]
+fn refused_call_writer_drops_a_row_another_writer_holds() {
+    use super::{REFUSED_CALL_RECORDS, RefusalArguments, RefusalVenue};
+    use carrick_core_abi::service::ServiceOrigin;
+    let counters = Counters::new();
+    let refuse = |nr| {
+        counters.record_refusal(
+            carrick_guest_arch::NativeOrdinal::new(nr),
+            ServiceOrigin::Initial,
+            RefusalVenue::Ring,
+            RefusalArguments::Registers([nr; 6]),
+        );
+    };
+    refuse(1);
+    // Another writer (logical record 65, a lap ahead) is mid-write on row 1:
+    // the writer of record 1 claims the same row and must not write it.
+    let row = &counters.refused_calls[1];
+    row[0].store(2 * (REFUSED_CALL_RECORDS as u64 + 1) + 1, Ordering::Relaxed);
+    refuse(2);
+    assert_eq!(counters.refused_call_dropped.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.refused[2].load(Ordering::Relaxed), 1);
+    assert_eq!(
+        row[0].load(Ordering::Relaxed),
+        2 * (REFUSED_CALL_RECORDS as u64 + 1) + 1
+    );
+    assert_eq!(row[1].load(Ordering::Relaxed), 0);
+    // A lapped writer: the row already holds a newer complete record.
+    let row = &counters.refused_calls[2];
+    row[0].store(2 * (REFUSED_CALL_RECORDS as u64 + 2) + 2, Ordering::Relaxed);
+    refuse(3);
+    assert_eq!(counters.refused_call_dropped.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        counters
+            .copy_snapshot()
+            .refused_call_dropped
+            .load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(counters.refused_calls().count(), 1);
+}
