@@ -299,6 +299,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         };
         let name_cache = unsafe { &*(EL1_NAME_CACHE_BASE as *const InotifyNameCache) };
         let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+        let cache_lookup = |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8;
         #[cfg(target_arch = "aarch64")]
         let slot = SlotId::from_index(frame.slot as usize);
         #[cfg(target_arch = "aarch64")]
@@ -327,7 +328,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                         user: &sched::HardwareUserWord,
                     }),
                     ipc::guest_venue(frame.slot as u32).as_ref(),
-                    |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
+                    cache_lookup,
                     unowned,
                 );
             };
@@ -366,7 +367,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                                 user: &sched::HardwareUserWord,
                             }),
                             ipc::guest_venue(frame.slot as u32).as_ref(),
-                            |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
+                            cache_lookup,
                             refused(),
                         );
                     }
@@ -392,7 +393,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 &saved.native,
                 ttbr0,
                 &mut service,
-                |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
+                cache_lookup,
             );
             match route {
                 Ok(route) => {
@@ -413,7 +414,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                         user: &sched::HardwareUserWord,
                     }),
                     ipc::guest_venue(frame.slot as u32).as_ref(),
-                    |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
+                    cache_lookup,
                     refused(),
                 ),
             }
@@ -435,7 +436,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     user: &sched::HardwareUserWord,
                 }),
                 ipc::guest_venue(frame.slot as u32).as_ref(),
-                |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
+                cache_lookup,
             )
         }
     }
