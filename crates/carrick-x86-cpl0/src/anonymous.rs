@@ -3,7 +3,7 @@
 use carrick_core_abi::service::ServiceOrigin;
 use carrick_el1::memory::reservations::{X86Cpl0Zone, shared_x86_cpl0_guest};
 use carrick_el1::memory::{AnonymousCall, AnonymousCallView};
-use carrick_el1::memory::{X86AnonymousDecode, classify_anonymous_range};
+use carrick_el1::memory::{BackingExtent, X86AnonymousDecode, classify_anonymous_backing};
 use carrick_el1_abi::BornInZoneSource;
 use carrick_el1_abi::CurrentTask;
 use carrick_guest_arch::{FrameGpa, GuestLen, RootGpa, UserRange, UserVa};
@@ -601,6 +601,23 @@ impl X86AnonymousEditor {
         }
     }
 }
+impl X86AnonymousEditor {
+    fn classify(
+        &self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+        extent: BackingExtent,
+    ) -> carrick_el1::memory::Stage1Backing {
+        classify_anonymous_backing::<X86AnonymousDecode>(
+            &|pa| self.words.load(pa).ok(),
+            root.raw(),
+            va.raw(),
+            len.raw(),
+            extent,
+        )
+    }
+}
 impl carrick_el1::memory::AnonymousBackingProbe for X86AnonymousEditor {
     fn bind_operation(&mut self, sequence: carrick_el1_abi::ReservationSequence) {
         self.sequence = carrick_el1::memory::AnonymousEditGeneration::reservation(sequence);
@@ -611,16 +628,18 @@ impl carrick_el1::memory::AnonymousBackingProbe for X86AnonymousEditor {
         va: carrick_guest_arch::UserVa,
         len: carrick_guest_arch::GuestLen,
     ) -> carrick_el1::memory::Stage1Backing {
-        let root = root.raw();
-        let va = va.raw();
-        let len = len.raw();
-        classify_anonymous_range::<X86AnonymousDecode>(
-            &|pa| self.words.load(pa).ok(),
-            root,
-            va,
-            len,
-        )
+        self.classify(root, va, len, BackingExtent::Runs)
     }
+
+    fn sparse_backing(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> carrick_el1::memory::Stage1Backing {
+        self.classify(root, va, len, BackingExtent::Sparse)
+    }
+
     fn stock_span(
         &mut self,
         mm: carrick_el1_abi::ReservationMm,

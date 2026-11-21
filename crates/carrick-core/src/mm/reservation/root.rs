@@ -174,6 +174,7 @@ const SETTLEMENT_CLAIM_SLOTS: usize = 256;
 #[derive(::core::fmt::Debug)]
 pub struct ReturnSlot {
     index: usize,
+    range: ReservationRange,
     /// Joins the owed extent already in the slot.
     merge: bool,
 }
@@ -2239,11 +2240,13 @@ impl<
             && source.is_none()
             && flags == ReservationNodeFlags::ANONYMOUS_PRIVATE
             && self.outside_authority_cover(range, ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT);
+        let discard = operation == ReservationOperation::Discard;
         let image_edit = matches!(
             operation,
             ReservationOperation::Protect
                 | ReservationOperation::Retire
                 | ReservationOperation::Decommit
+                | ReservationOperation::Discard
         ) && self.image_cover(range);
         if !external_placement && !image_edit && !external_prepare && !self.in_layout(range) {
             return Err(Refusal::ForeignMapping);
@@ -2256,6 +2259,7 @@ impl<
                 | ReservationOperation::Move
                 | ReservationOperation::Protect
                 | ReservationOperation::Decommit
+                | ReservationOperation::Discard
         ) && self.return_owed_within(range)
         {
             return Err(Refusal::Busy);
@@ -2295,41 +2299,46 @@ impl<
                 data += source.len();
             }
         }
-        let added = if operation == ReservationOperation::Retire {
-            0
-        } else {
-            range.len()
-        };
-        let added_data = if Policy::charges_data(ReservationNodeFlags::ANONYMOUS_PRIVATE, prot) {
-            added
-        } else {
-            0
-        };
-        let tree = self.read(self.state().tree);
-        Policy::admits_charges(
-            self.state().layout.policy,
-            Charges {
-                bytes: tree.bytes,
-                data: tree.data,
-                locked: tree.locked,
-            },
-            Charges {
-                bytes,
-                data,
-                locked: 0,
-            },
-            Charges {
-                bytes: added,
-                data: added_data,
-                locked: 0,
-            },
-        )?;
+        if !discard {
+            let added = if operation == ReservationOperation::Retire {
+                0
+            } else {
+                range.len()
+            };
+            let added_data = if Policy::charges_data(ReservationNodeFlags::ANONYMOUS_PRIVATE, prot)
+            {
+                added
+            } else {
+                0
+            };
+            let tree = self.read(self.state().tree);
+            Policy::admits_charges(
+                self.state().layout.policy,
+                Charges {
+                    bytes: tree.bytes,
+                    data: tree.data,
+                    locked: tree.locked,
+                },
+                Charges {
+                    bytes,
+                    data,
+                    locked: 0,
+                },
+                Charges {
+                    bytes: added,
+                    data: added_data,
+                    locked: 0,
+                },
+            )?;
+        }
         let sequence = self.state().sequence.checked_add(1).ok_or(Refusal::Stale)?;
         self.state()
             .generation
             .checked_next()
             .ok_or(Refusal::Stale)?;
-        let needed = if source.is_some() {
+        let needed = if discard {
+            0
+        } else if source.is_some() {
             // Four boundaries plus the destination node; a shared straddler
             // between source and destination may need a split at each.
             5
@@ -2762,6 +2771,22 @@ impl<
         })
     }
 
+    /// Retire backing under the existing edit/return journal, keeping the
+    /// node incarnations, protections and attributes. The caller has already
+    /// validated its mapped segments; holes have no backing to retire.
+    pub fn discard_range(&mut self, range: ReservationRange) -> Result<Decision, Refusal> {
+        self.proposal(ReservationProposal {
+            range,
+            protection: ReservationProtection::NONE,
+            operation: ReservationOperation::Discard,
+            result: UserVa::new(0),
+            policy_value: UserVa::new(self.brk_current()),
+            require_coverage: false,
+            source: None,
+            flags: ReservationNodeFlags::EMPTY,
+        })
+    }
+
     /// Check whether `range` is fully covered by contiguous reservation nodes.
     pub fn is_reserved(&mut self, range: ReservationRange) -> bool {
         let mut cursor = range.start();
@@ -2804,8 +2829,8 @@ impl<
     /// prepares a same-size destination and keeps the source. Every created
     /// node carries the source's protection and attributes. Growing a
     /// `LOCKED` source is subject to `RLIMIT_MEMLOCK`, which this root does
-    /// not hold: the host venue admits it before proposing (the EL1 decoder
-    /// forwards `mremap`).
+    /// not hold: the host venue admits growth of locked mappings before
+    /// proposing it.
     pub fn mremap(
         &mut self,
         source: ReservationRange,
@@ -2927,6 +2952,15 @@ impl<
             || pending.request.generation != self.generation()
         {
             return Err(Refusal::Stale);
+        }
+        if pending.request.operation == ReservationOperation::Discard {
+            self.state_mut().generation = self
+                .state()
+                .generation
+                .checked_next()
+                .ok_or(Refusal::Stale)?;
+            self.state_mut().pending = None;
+            return Ok(pending.result);
         }
         let range = pending.request.range;
         let mut created_flags =
@@ -3116,7 +3150,11 @@ impl<
                         .admitted
                         .store(admitted, Ordering::Relaxed);
                 }
-                return Ok(ReturnSlot { index, merge });
+                return Ok(ReturnSlot {
+                    index,
+                    range,
+                    merge,
+                });
             }
         }
     }
@@ -3217,7 +3255,10 @@ impl<
                     ReservationOperation::Retire
                         | ReservationOperation::Prepare
                         | ReservationOperation::Decommit
-                ) && completion.backing().returned_bytes == 0 =>
+                        | ReservationOperation::Discard
+                ) && completion.backing().returned_bytes == 0
+                    && request.range.start() <= slot.range.start()
+                    && slot.range.end() <= request.range.end() =>
             {
                 request
             }
@@ -3237,7 +3278,7 @@ impl<
                 return Err(refusal);
             }
         };
-        let (range, sequence) = (request.range, request.sequence.raw());
+        let (range, sequence) = (slot.range, request.sequence.raw());
         let entry = &self.table.deferred[slot.index];
         if slot.merge {
             // Abutting or overlapping: one extent, owed until the newer
@@ -3387,6 +3428,9 @@ impl<
     }
     fn host_edit_admitted(&mut self) -> Result<ReservationGeneration, Refusal> {
         self.host_venue = true;
+        self.edit_admitted()
+    }
+    fn edit_admitted(&self) -> Result<ReservationGeneration, Refusal> {
         if !self.state().admitted {
             return Err(Refusal::Stale);
         }
@@ -3451,17 +3495,55 @@ impl<
         set: ReservationNodeFlags,
         clear: ReservationNodeFlags,
     ) -> Result<(), Refusal> {
+        let generation = self.host_edit_admitted()?;
+        self.set_flags_at(range, set, clear, generation, true)
+    }
+
+    /// Check only owner-side dependencies on a parked call's reprobe.
+    pub fn probe_advice_edit(
+        &mut self,
+        range: ReservationRange,
+    ) -> Result<ReservationGeneration, Refusal> {
+        let generation = self.edit_admitted()?;
+        if self.prepared_overlaps(range) {
+            return Err(Refusal::PreparedConflict);
+        }
+        Ok(generation)
+    }
+
+    /// Apply an in-ring attribute edit to the mapped portions of the range.
+    /// Linux advice observes holes separately from its per-mapping effects.
+    pub fn advise_flags(
+        &mut self,
+        range: ReservationRange,
+        set: ReservationNodeFlags,
+        clear: ReservationNodeFlags,
+    ) -> Result<(), Refusal> {
+        let generation = self.probe_advice_edit(range)?;
+        self.set_flags_at(range, set, clear, generation, false)
+    }
+
+    fn set_flags_at(
+        &mut self,
+        range: ReservationRange,
+        set: ReservationNodeFlags,
+        clear: ReservationNodeFlags,
+        generation: ReservationGeneration,
+        require_coverage: bool,
+    ) -> Result<(), Refusal> {
         let attributes = ReservationNodeFlags::ATTRIBUTES;
         if !attributes.contains(set) || !attributes.contains(clear) || set.intersects(clear) {
             return Err(Refusal::Invalid);
         }
-        let generation = self.host_edit_admitted()?;
         let mut cursor = range.start();
         while let Some(n) = self.next(cursor).filter(|n| n.start < range.end()) {
+            if !require_coverage && !Policy::root_editable(&n) {
+                return Err(Refusal::ForeignMapping);
+            }
             if !Policy::validates_attributes(&n, set) {
                 return Err(Refusal::Invalid);
             }
-            if n.start > cursor {
+            if require_coverage && n.start > cursor {
                 return Err(Refusal::Hole);
             }
             cursor = n.end.min(range.end());
@@ -3469,17 +3551,21 @@ impl<
                 break;
             }
         }
-        if cursor != range.end() {
+        if require_coverage && cursor != range.end() {
             return Err(Refusal::Hole);
         }
         let needed = self.splits_needed(range);
-        let mut spares = Spares(self.host_spares(needed)?);
+        let mut spares = Spares(if require_coverage {
+            self.host_spares(needed)?
+        } else {
+            self.allocate_spares(needed)?
+        });
         self.split_at(range.start(), &mut spares)?;
         self.split_at(range.end(), &mut spares)?;
         self.release_spares(spares.0);
         let mut cursor = range.start();
         while cursor < range.end() {
-            let Some(n) = self.next(cursor) else {
+            let Some(n) = self.next(cursor).filter(|n| n.start < range.end()) else {
                 break;
             };
             let flags = Policy::flags(&n).union(set).difference(clear);

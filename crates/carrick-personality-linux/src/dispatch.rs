@@ -31,6 +31,7 @@ pub enum AnonymousCall {
     Mremap,
     Mmap,
     Mprotect,
+    Madvise,
 }
 
 impl AnonymousCall {
@@ -42,6 +43,7 @@ impl AnonymousCall {
             216 => Some(Self::Mremap),
             222 => Some(Self::Mmap),
             226 => Some(Self::Mprotect),
+            233 => Some(Self::Madvise),
             _ => None,
         }
     }

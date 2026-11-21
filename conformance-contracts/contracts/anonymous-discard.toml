@@ -9,9 +9,12 @@ rationale = "A contiguous private anonymous VMA requires one backend discard or 
 [bindings]
 vm_free = [
   "carrick-kernel::dispatch::mem::madvise::tests::readonly_private_anonymous_dontneed_retires_populated_residency",
+  "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::native_fork_child_advice_stays_in_ring (real native ARM dispatch, hinted lazy reservation and advice errno sequence)",
 ]
 embed = [
   "carrick-conformance-next::deferred_anonymous_pristine_scrub_semantics",
+  "carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_anonymous_advice_stays_in_ring (live CPL0 root and fork child, resident zero-fill and independent writes)",
+  "carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_anonymous_advice_busy_once_then_succeeds (one editor park, zero syscall refusals, the same resident discard completes)",
 ]
 docker = [
   "same-source fixtures/pristine_scrub.py; pinned native ARM64 cpython-test image; discard-boundary evidence",

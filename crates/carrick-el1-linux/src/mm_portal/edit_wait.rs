@@ -40,9 +40,10 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
 
     let check_conflict = |root: &mut carrick_el1::memory::reservations::Reservations<'_>| {
         let first = match call {
-            AnonymousCall::Munmap | AnonymousCall::Mremap | AnonymousCall::Mprotect => {
-                rounded(frame.x[0], frame.x[1])
-            }
+            AnonymousCall::Munmap
+            | AnonymousCall::Mremap
+            | AnonymousCall::Mprotect
+            | AnonymousCall::Madvise => rounded(frame.x[0], frame.x[1]),
             AnonymousCall::Mmap if frame.x[3] & (0x10 | 0x100000) != 0 => {
                 rounded(frame.x[0], frame.x[1])
             }

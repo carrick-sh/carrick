@@ -282,7 +282,7 @@ fn hints_and_attributes_preserve_hole_result_and_host_classification() {
         assert_eq!(plan.result, Err(LINUX_ENOMEM));
         assert_eq!(
             plan.steps[0].action,
-            if advice.requires_host_attributes() {
+            if advice.reservation_attribute().is_some() {
                 Action::UpdateAttributes(advice)
             } else {
                 Action::None
