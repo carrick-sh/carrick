@@ -2296,10 +2296,13 @@ impl<
                 data += source.len();
             }
         }
-        // A discard keeps every node as it is: it adds nothing.
+        // Retirement and metadata-only changes add no address or data charge.
         let added = if matches!(
             operation,
-            ReservationOperation::Retire | ReservationOperation::Discard
+            ReservationOperation::Retire
+                | ReservationOperation::Discard
+                | ReservationOperation::OmitFromFork
+                | ReservationOperation::InheritOnFork
         ) {
             0
         } else {
@@ -2341,7 +2344,9 @@ impl<
         } else {
             match operation {
                 ReservationOperation::Discard => 0,
-                ReservationOperation::Retire => self.splits_needed(range),
+                ReservationOperation::Retire
+                | ReservationOperation::OmitFromFork
+                | ReservationOperation::InheritOnFork => self.splits_needed(range),
                 _ => self.splits_needed(range) + 1,
             }
         };
@@ -2790,6 +2795,28 @@ impl<
         })
     }
 
+    /// Change only fork inheritance for a fully covered private range.
+    pub fn change_fork_inheritance(
+        &mut self,
+        range: ReservationRange,
+        inherit: bool,
+    ) -> Result<Decision, Refusal> {
+        self.proposal(ReservationProposal {
+            range,
+            protection: ReservationProtection::NONE,
+            operation: if inherit {
+                ReservationOperation::InheritOnFork
+            } else {
+                ReservationOperation::OmitFromFork
+            },
+            result: UserVa::new(0),
+            policy_value: UserVa::new(self.brk_current()),
+            require_coverage: true,
+            source: None,
+            flags: ReservationNodeFlags::EMPTY,
+        })
+    }
+
     /// Check whether `range` is fully covered by contiguous reservation nodes.
     pub fn is_reserved(&mut self, range: ReservationRange) -> bool {
         let mut cursor = range.start();
@@ -2969,7 +2996,10 @@ impl<
         let discard = pending.request.operation == ReservationOperation::Discard;
         let creates = !matches!(
             pending.request.operation,
-            ReservationOperation::Retire | ReservationOperation::Discard
+            ReservationOperation::Retire
+                | ReservationOperation::Discard
+                | ReservationOperation::OmitFromFork
+                | ReservationOperation::InheritOnFork
         );
         let created_backing = if created_flags.contains(ReservationNodeFlags::FILE)
             && matches!(
@@ -3002,6 +3032,18 @@ impl<
         match pending.request.operation {
             // Every node stays as it was; only its backing was retired.
             ReservationOperation::Discard => {}
+            ReservationOperation::OmitFromFork => self.reflag_range(
+                range,
+                ReservationNodeFlags::DONTFORK,
+                ReservationNodeFlags::EMPTY,
+                &mut spares,
+            )?,
+            ReservationOperation::InheritOnFork => self.reflag_range(
+                range,
+                ReservationNodeFlags::EMPTY,
+                ReservationNodeFlags::DONTFORK,
+                &mut spares,
+            )?,
             // Each covered node keeps its own carried attributes.
             ReservationOperation::Protect | ReservationOperation::Decommit => {
                 self.reprotect_range(range, pending.request.protection, &mut spares)?;
@@ -3511,9 +3553,21 @@ impl<
         }
         let needed = self.splits_needed(range);
         let mut spares = Spares(self.host_spares(needed)?);
-        self.split_at(range.start(), &mut spares)?;
-        self.split_at(range.end(), &mut spares)?;
+        self.reflag_range(range, set, clear, &mut spares)?;
         self.release_spares(spares.0);
+        self.state_mut().generation = generation;
+        Ok(())
+    }
+
+    fn reflag_range(
+        &mut self,
+        range: ReservationRange,
+        set: ReservationNodeFlags,
+        clear: ReservationNodeFlags,
+        spares: &mut Spares,
+    ) -> Result<(), Refusal> {
+        self.split_at(range.start(), spares)?;
+        self.split_at(range.end(), spares)?;
         let mut cursor = range.start();
         while cursor < range.end() {
             let Some(n) = self.next(cursor) else {
@@ -3532,7 +3586,6 @@ impl<
             }
             cursor = n.end.min(range.end());
         }
-        self.state_mut().generation = generation;
         Ok(())
     }
     /// Fork: populate the unadmitted, empty `child` root of the same table

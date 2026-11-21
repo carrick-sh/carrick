@@ -221,7 +221,9 @@ impl<'a> MemView<'a> {
             ReservationOperation::Protect
             | ReservationOperation::Move
             | ReservationOperation::Decommit
-            | ReservationOperation::Discard => {
+            | ReservationOperation::Discard
+            | ReservationOperation::OmitFromFork
+            | ReservationOperation::InheritOnFork => {
                 // Not a break proposal: leave the root as it was.
                 root.with_root(|model| model.refuse(request))
                     .map_err(super::anonymous::root_refusal)?;

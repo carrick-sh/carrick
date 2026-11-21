@@ -447,15 +447,30 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             assert_eq!(call(233, [mapped, CHUNK, 4, 0, 0, 0]), 0, "chunk DONTNEED");
             assert_eq!(call(233, [mapped, CHUNK, 3, 0, 0, 0]), 0, "WILLNEED");
             assert_eq!(call(233, [mapped + 1, 1, 4, 0, 0, 0]), -22, "unaligned");
-            assert_eq!(counters.refused[233].load(Ordering::Relaxed), 0);
             let portal = super::super::aarch64_process::Portal::for_zone(
                 NonZeroU64::MIN,
                 fixture.region.table(),
                 fixture.zone,
             );
+            let mm = ReservationMm::new(identity.mm).unwrap();
+            let dontfork = |address| {
+                portal
+                    .root(mm, 0)
+                    .unwrap()
+                    .mapping(address)
+                    .unwrap()
+                    .flags
+                    .contains(carrick_el1_abi::ReservationNodeFlags::DONTFORK)
+            };
+            assert_eq!(call(233, [guard, 0x1000, 10, 0, 0, 0]), 0, "DONTFORK");
+            assert!(dontfork(guard));
+            assert!(!dontfork(guard + 0x1000));
+            assert_eq!(call(233, [guard, 0x1000, 11, 0, 0, 0]), 0, "DOFORK");
+            assert!(!dontfork(guard));
+            assert_eq!(counters.refused[233].load(Ordering::Relaxed), 0);
             let mut protections = Vec::new();
             portal
-                .root(ReservationMm::new(identity.mm).unwrap(), 0)
+                .root(mm, 0)
                 .unwrap()
                 .observe_range(
                     carrick_el1_abi::ReservationRange::new(mapped, mapped + CHUNK).unwrap(),
