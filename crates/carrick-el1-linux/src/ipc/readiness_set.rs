@@ -23,7 +23,7 @@
 //! description's final release destroys the epoll and unlinks its items.
 //! The deadline, the output layout and the armed mask follow the
 //! single-description protocol exactly; so does a full operation arena
-//! ([`super::begin_readiness_operation`]).
+//! (`super::begin_readiness_operation`).
 //!
 //! Scope: every selected descriptor must be a zone object an epoll can
 //! hold (pipe ends, eventfds, stream ends). A host-backed descriptor, a
