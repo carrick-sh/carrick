@@ -3753,10 +3753,15 @@ impl<
             return zone_wait;
         }
         if carrick_personality_linux::dispatch::select_ordinal(self.frame.canonical_ordinal()) {
-            self.record_refusal(
-                self.frame
-                    .crossing_set()
-                    .refusal_bucket(self.native_number()),
+            self.counters.record_refusal(
+                carrick_guest_arch::NativeOrdinal::new(
+                    self.frame
+                        .crossing_set()
+                        .refusal_bucket(self.native_number()) as u64,
+                ),
+                self.service_origin(),
+                carrick_el1_abi::RefusalVenue::Ring,
+                carrick_el1_abi::RefusalArguments::Unretained,
             );
             return FamilyCompletion::AccountedComplete(
                 carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
