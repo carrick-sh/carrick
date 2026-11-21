@@ -132,6 +132,7 @@ pub(in crate::dispatch) fn regular_file(
             matches!(
                 open,
                 OpenDescription::File { .. }
+                    | OpenDescription::HostFile { .. }
                     | OpenDescription::InMemoryFile { .. }
                     | OpenDescription::SyntheticFile { .. }
                     | OpenDescription::ProcExecutable { .. }

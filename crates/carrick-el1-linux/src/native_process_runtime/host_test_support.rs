@@ -25,6 +25,9 @@ std::thread_local! {
     static SIGNAL_COPY_ERRORS: std::cell::RefCell<std::collections::VecDeque<NativeProcessError>> = const {
         std::cell::RefCell::new(std::collections::VecDeque::new())
     };
+    static HOST_SET_RELEASES: std::cell::RefCell<Vec<carrick_el1_abi::ipc::RawOfdPin>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
     static EXEC_CANCELLATIONS: std::cell::RefCell<Vec<u64>> = const {
         std::cell::RefCell::new(Vec::new())
     };
@@ -200,6 +203,9 @@ impl<C: ProcessContext> Drop for HostExecSlot<'_, C> {
     }
 }
 impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
+    fn release_host_select_set(&mut self, pin: carrick_el1_abi::ipc::RawOfdPin) {
+        HOST_SET_RELEASES.with(|releases| releases.borrow_mut().push(pin));
+    }
     fn vacate_terminal_space(
         &mut self,
         source: carrick_el1_abi::BornInZoneSource<'a, C>,
@@ -4694,6 +4700,125 @@ fn sole_member_exec_closes_admission_before_adopting_successor() {
     assert_eq!(fixture.task.mm.key.load(Ordering::Acquire), 1);
     assert!(fixture.zone.spaces.find(successor_mm.raw()).is_some());
     assert!(fixture.page.exit_wait().is_some());
+    assert!(fixture.page.cancel_host_birth_claim(host_birth).is_some());
+}
+
+/// #2621: a thread's host set is owned by its task's lifecycle: the
+/// process's exit releases it once.
+#[cfg(test)]
+#[test]
+fn exit_group_releases_each_threads_host_set_once() {
+    use carrick_personality_linux::lifecycle::ProcessNative;
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    let pin = carrick_el1_abi::ipc::RawOfdPin {
+        authority: 7,
+        index: 3,
+        generation: 9,
+    };
+    HOST_SET_RELEASES.with(|releases| releases.borrow_mut().clear());
+    assert!(ProcessNative::retain_host_select_set(&mut *entry, pin));
+    assert_eq!(ProcessNative::host_select_set(&mut *entry), Some(pin));
+    assert!(
+        !ProcessNative::retain_host_select_set(&mut *entry, pin),
+        "one host set per thread"
+    );
+    assert!(matches!(
+        entry.exit_group(0),
+        LifecycleOutcome::Transferred { .. }
+    ));
+    assert_eq!(
+        HOST_SET_RELEASES.with(|releases| core::mem::take(&mut *releases.borrow_mut())),
+        [pin]
+    );
+}
+
+/// #2621: an exec ends the calling process's host sets: the successor
+/// image starts with none.
+#[cfg(test)]
+#[test]
+fn exec_releases_each_threads_host_set_once() {
+    use carrick_personality_linux::lifecycle::ProcessNative;
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let pin = carrick_el1_abi::ipc::RawOfdPin {
+        authority: 7,
+        index: 4,
+        generation: 9,
+    };
+    HOST_SET_RELEASES.with(|releases| releases.borrow_mut().clear());
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(ProcessNative::retain_host_select_set(&mut *entry, pin));
+        assert!(matches!(
+            entry.begin_exec_service(
+                test_exec_payload(b"/bin/static"),
+                None,
+                NativeServiceCall::new(
+                    carrick_guest_arch::NativeOrdinal::new(221),
+                    &carrick_el1_abi::Counters::new()
+                )
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let host_birth = fixture.page.reserve_host_birth().unwrap();
+    publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 59, 0x98_0000);
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::Left(None))
+    ));
+    assert_eq!(
+        HOST_SET_RELEASES.with(|releases| core::mem::take(&mut *releases.borrow_mut())),
+        [pin]
+    );
+    assert_eq!(ProcessNative::host_select_set(&mut *entry), None);
     assert!(fixture.page.cancel_host_birth_claim(host_birth).is_some());
 }
 

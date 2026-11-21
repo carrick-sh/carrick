@@ -467,6 +467,14 @@ fn native_child_pselect6_mixed_set_times_out() {
     native_mixed_select("SET_TIMEOUT");
 }
 
+/// #2621: apt's download target on x86: a fork child's
+/// `pselect6(nfds, {pipe, file}, {file}, ...)` with a host regular file is
+/// answered at once with the file's read and write bits.
+#[test]
+fn native_child_pselect6_mixed_set_reports_a_host_regular_file() {
+    native_mixed_select("FILE_SET");
+}
+
 /// Run `native_mixed_select.S`'s `variant` against a loopback TCP peer.
 /// The parent sends the poller pid through the gate socket and acts only
 /// once the host saw the poller enrolled in a wait (and, for the host-side
@@ -498,7 +506,18 @@ fn native_mixed_select(variant: &str) {
     );
     let tcp_port = format!("-DTCP_PORT={}", wire(address.port()));
     let define = format!("-D{variant}");
-    let flags = [gate_port.as_str(), tcp_port.as_str(), define.as_str()];
+    // Under `/tmp`, whose ancestors anyone may search.
+    let scratch = tempfile::tempdir_in("/tmp").expect("select file directory");
+    let file_path = format!(
+        "-DFILE_PATH=\"{}\"",
+        scratch.path().join("select-target").display()
+    );
+    let flags = [
+        gate_port.as_str(),
+        tcp_port.as_str(),
+        define.as_str(),
+        file_path.as_str(),
+    ];
     let elf = kvm_pool_fixture::assemble_fixture("native_mixed_select.S", &flags);
     let program =
         carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("mixed select fixture");
@@ -558,7 +577,15 @@ fn native_mixed_select(variant: &str) {
                 (parked, held)
             }));
         },
-        default_dispatcher(),
+        {
+            // The run's view of the host filesystem, as production's.
+            let mut dispatcher = default_dispatcher();
+            dispatcher.set_fs_backend(Box::new(
+                carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+                    .expect("host filesystem"),
+            ));
+            dispatcher
+        },
     )
     .expect("mixed select run");
     assert_eq!(

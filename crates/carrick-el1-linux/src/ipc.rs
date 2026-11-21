@@ -5489,6 +5489,234 @@ mod tests {
         assert_eq!(leaves(&w, IpcLeave::ObjectBusy), 0);
     }
 
+    /// A fork child's stand-in for #2621's host-set owner: retains the
+    /// thread's host set pin and records each enrolment the set owner asks
+    /// the native owner to cross.
+    struct HostSetOwner<'a> {
+        inner: User<'a>,
+        host_set: Option<carrick_el1_abi::ipc::RawOfdPin>,
+        enrolments: Vec<(u64, i32)>,
+    }
+    impl UserCopy for HostSetOwner<'_> {
+        fn service_origin(&self) -> carrick_core_abi::service::ServiceOrigin {
+            carrick_core_abi::service::ServiceOrigin::Descendant
+        }
+        fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+            self.inner.copy_in(dst, src)
+        }
+        fn copy_out(&mut self, at: u64, bytes: &[u8]) -> bool {
+            self.inner.copy_out(at, bytes)
+        }
+        fn host_select_set(&mut self) -> Option<carrick_el1_abi::ipc::RawOfdPin> {
+            self.host_set
+        }
+        fn retain_host_select_set(&mut self, pin: carrick_el1_abi::ipc::RawOfdPin) -> bool {
+            assert!(
+                self.host_set.replace(pin).is_none(),
+                "one host set per thread"
+            );
+            true
+        }
+        fn request_host_set_enrol(&mut self, set: u64, fd: i32) -> bool {
+            self.enrolments.push((set, fd));
+            true
+        }
+    }
+
+    /// #2621: a fork child's `pselect6(h + 1, NULL, {h}, ...)` on a HOST
+    /// descriptor first asks its owner to enrol `h` in the thread's new host
+    /// set (the exact call then runs again). Once the carrier enrolled it,
+    /// a probe that finds the carrier holding the host set's lock is "not
+    /// now": the call parks on the lock's release (Busy once), yielding the
+    /// vCPU, and the rerun answers the socket's write bit. Never forwarded.
+    #[test]
+    fn pselect6_host_set_busy_once_then_answers() {
+        use carrick_el1_abi::ipc::epoll::{EpollReport, events};
+        use carrick_sched_core::object_wait::ipc_release::{IpcLockIndex, IpcLockReleaseVenue};
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let token = carrick_el1_abi::ipc::HostResourceToken::new(77).unwrap();
+        let host = w
+            .host()
+            .open(
+                a,
+                Fd(0),
+                Description::new(
+                    IpcBacking::Host(token).encode(),
+                    AccessMode::ReadWrite,
+                    BLOCK,
+                ),
+                false,
+            )
+            .unwrap()
+            .0;
+        let (pin, _) = w.host().pin(a, Fd(host)).unwrap();
+        let key = pin.key();
+        let file_key = (u64::from(key.index) << 32) | (key.generation & u64::from(u32::MAX));
+        let _ = w.host().unpin(pin);
+        let (r2, _w2, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.map(OTHER_MM, va, PAGE);
+        let b_read = syscall(SYS_READ, r2, va, 16, B_SVC);
+        w.queue(202, OTHER_MM, &b_read, B_SVC);
+        // va: writefds {host}; va + 0x20: timespec {5, 0}.
+        w.mem.write(MM, va, &(1u64 << host).to_ne_bytes());
+        let mut ts = [0u8; 16];
+        ts[..8].copy_from_slice(&5i64.to_ne_bytes());
+        w.mem.write(MM, va + 0x20, &ts);
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            elr: A_SVC + 4,
+            slot: u64::from(SLOT.raw()),
+            ..Default::default()
+        };
+        frame.x[0] = host as u64 + 1;
+        frame.x[2] = va;
+        frame.x[4] = va + 0x20;
+        frame.x[8] = 72; // pselect6
+        let a_regs = frame.x;
+        let mut cpu = core::mem::take(&mut w.cpu);
+        cpu.now = 1_000;
+        cpu.freq = 1_000_000_000;
+        let mut owner = HostSetOwner {
+            inner: User {
+                task: &w.task,
+                mem: &w.mem,
+            },
+            host_set: None,
+            enrolments: Vec::new(),
+        };
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        let native = |frame: &mut TrapFrame,
+                      owner: &mut HostSetOwner<'_>,
+                      cpu: &mut FakeCpu,
+                      output: &mut Option<PollOutput>| {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            serve_single_zone_ppoll(&mut sched, frame, &venue, owner, output)
+        };
+
+        // 1. Not enrolled: a new host set, one enrolment, the call reruns.
+        let mut out = None;
+        assert_eq!(
+            native(&mut frame, &mut owner, &mut cpu, &mut out),
+            IpcServed::Forward
+        );
+        assert!(out.is_none());
+        let pin = owner.host_set.expect("the thread retains its host set");
+        let held = OfdPin::from_raw(pin);
+        let set = match IpcBacking::decode(w.host().pinned(&held).unwrap().backing) {
+            Some(IpcBacking::Epoll { object }) => object,
+            other => panic!("host set backing {other:?}"),
+        };
+        let _ = held.into_raw();
+        assert_eq!(owner.enrolments, [(set.to_word(), host)]);
+        assert_eq!(frame.x, a_regs, "the exact call runs again");
+
+        // 2. The carrier enrols the socket: writable, the connect done.
+        w.region
+            .epoll_add_host_socket(
+                set,
+                Fd(host),
+                file_key,
+                EpollReport {
+                    events: events::LEVEL_MASK | events::ET,
+                    data: host as u64,
+                },
+                events::OUT | events::WRNORM,
+                &HostWait,
+            )
+            .unwrap();
+        let index = IpcLockIndex::object(set.index() as usize).unwrap();
+        let carrier = w.region.operation_slot_generation();
+        struct ReleaseProbe {
+            carrier: core::num::NonZeroU64,
+            released: core::sync::atomic::AtomicBool,
+        }
+        impl carrick_sched_core::object_wait::ipc_release::IpcLockRelease for ReleaseProbe {
+            fn carrier(&self) -> core::num::NonZeroU64 {
+                self.carrier
+            }
+            fn released(&self, _: IpcLockIndex) {
+                self.released.store(true, Ordering::Release);
+            }
+        }
+        let probe = ReleaseProbe {
+            carrier,
+            released: core::sync::atomic::AtomicBool::new(false),
+        };
+        w.zone
+            .bind_ipc_lock_release(index, carrier, &HostWait, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(&w.zone, owned)
+            })
+            .unwrap();
+        let tracked = w.region.with_lock_release(&probe).unwrap();
+        let lock = tracked.lock(set, &HostWait).unwrap();
+
+        // 3. Busy once: the carrier holds the host set; the call parks on
+        // the lock's release and B runs.
+        let mut out = None;
+        assert_eq!(native(&mut frame, &mut owner, &mut cpu, &mut out), SWITCHED);
+        assert!(out.is_none());
+        assert_eq!(frame.elr, B_SVC, "A yields execution capacity to B");
+        drop(lock);
+        assert!(probe.released.load(Ordering::Acquire));
+        let release = IpcLockReleaseVenue {
+            zone: &*w.zone,
+            carrier,
+            waker: carrick_sched_core::Waker::Host,
+            deliver: crate::sched::object_wait::deliver_host_completion,
+        };
+        carrick_sched_core::object_wait::ipc_release::IpcLockRelease::released(&release, index);
+
+        // 4. B blocks on its empty pipe; A probes once more and answers.
+        let mut g = b_read;
+        let mut user = User {
+            task: &w.task,
+            mem: &w.mem,
+        };
+        {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(serve_ipc(&mut sched, &mut g, &venue, &mut user), SWITCHED);
+        }
+        assert_eq!(g.x, a_regs, "A reruns its pselect6");
+        reenter(&mut g, A_SVC);
+        let mut out = None;
+        assert_eq!(native(&mut g, &mut owner, &mut cpu, &mut out), RETURNED);
+        assert_eq!(g.x[0], 1);
+        let Some(PollOutput::Select { spans, result: 1 }) = out else {
+            panic!("a decided select answer");
+        };
+        let write_set = spans
+            .iter()
+            .find(|(address, _)| address.raw() == va)
+            .expect("the write set");
+        assert_eq!(write_set.1[..8], (1u64 << host).to_ne_bytes());
+        assert_eq!(owner.enrolments.len(), 1, "enrolled once");
+        assert_eq!(host_calls(&w), 0, "never forwarded to the host");
+        assert_eq!(leaves(&w, IpcLeave::ObjectBusy), 0);
+    }
+
     /// A finite timeout with nothing ready parks in the guest; the slot's
     /// timer ends it at the deadline, and the re-entered call harvests once
     /// more and returns 0, never before the timeout, without the host.

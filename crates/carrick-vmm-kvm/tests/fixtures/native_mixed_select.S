@@ -18,6 +18,10 @@
  *      answer is exactly P's read bit.
  *   -DSET_TIMEOUT: a {0, 20 ms} pselect6 on {P, S} returns 0 with the set
  *      and the timeout cleared.
+ *   -DFILE_SET: the poller opens FILE_PATH (a host regular file, created)
+ *      as F, then pselect6(nfds, {P, F}, {F}, NULL, {5 s}, NULL): a regular
+ *      file is always readable and writable, so the answer is 2 with F's
+ *      bit in both sets and P's clear (apt's download target).
  * A select that fails exits with its errno (38: ENOSYS, the refusal);
  * exit 7 = success; every other code names the failed stage. */
 .global _start
@@ -204,6 +208,50 @@ poller:
     jnz fail_connect
     cmpl $0, so_error(%rip)
     jne fail_connect
+#ifdef FILE_SET
+    /* 2. A host regular file beside the zone pipe. */
+    mov $-100, %edi                /* AT_FDCWD */
+    lea file_path(%rip), %rsi
+    mov $0x42, %edx                /* O_RDWR | O_CREAT */
+    mov $0600, %r10d
+    mov $257, %eax                 /* openat */
+    syscall
+    test %rax, %rax
+    js fail_open
+    mov %eax, file_fd(%rip)
+    mov fds_p(%rip), %ecx
+    mov $1, %r14d
+    shl %cl, %r14
+    mov file_fd(%rip), %ecx
+    mov $1, %r15d
+    shl %cl, %r15
+    mov %r14, %rax
+    or %r15, %rax
+    mov %rax, read_set(%rip)
+    mov %r15, write_set(%rip)
+    movq $5, select_time(%rip)
+    movq $0, select_time+8(%rip)
+    mov fds_p(%rip), %edi
+    mov file_fd(%rip), %eax
+    cmp %eax, %edi
+    cmovl %eax, %edi
+    inc %edi
+    lea read_set(%rip), %rsi
+    lea write_set(%rip), %rdx
+    xor %r10d, %r10d
+    lea select_time(%rip), %r8
+    xor %r9d, %r9d
+    mov $270, %eax                 /* pselect6 */
+    syscall
+    test %rax, %rax
+    js fail_errno
+    cmp $2, %rax
+    jne fail_result
+    cmp %r15, read_set(%rip)       /* exactly F's read bit */
+    jne fail_sets
+    cmp %r15, write_set(%rip)      /* and F's write bit */
+    jne fail_sets
+#endif
 #if defined(SOCKET_WAKE) || defined(PIPE_WAKE) || defined(SET_TIMEOUT)
     /* 2. Read interest in both: P empty, nothing sent on S yet. */
     call bits
@@ -287,6 +335,9 @@ fail_connect_result:
     jmp exit
 fail_connect_sets:
     mov $22, %edi
+    jmp exit
+fail_open:
+    mov $23, %edi
 exit:
     mov $231, %eax
     syscall
@@ -303,12 +354,16 @@ tcp_peer:
     .short 2, TCP_PORT
     .byte 127, 0, 0, 1
     .quad 0
+#ifdef FILE_SET
+file_path: .asciz FILE_PATH
+#endif
 .bss
 .balign 8
 fds_p: .space 8
 sock: .space 4
 so_error: .space 4
 so_error_len: .space 4
+file_fd: .space 4
 pfd: .space 8
 read_set: .space 8
 write_set: .space 8
