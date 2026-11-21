@@ -812,7 +812,7 @@ impl MailboxSlot {
                 state,
                 session: self.read_portal_session(),
                 native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).native_nr)),
-                args: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).args)),
+                args: core::ptr::read_volatile(&raw const (*ptr).args),
             })
         }
     }
@@ -919,7 +919,7 @@ impl MailboxSlot {
             let saved = active || pc >= layout.completion;
             let mut registers = Vec::new();
             let (resume_pc, pstate) = if saved {
-                let args = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).args));
+                let args = core::ptr::read_volatile(&raw const (*ptr).args);
                 registers.extend(args.into_iter().enumerate().map(|(i, v)| (i as u32, v)));
                 registers.extend([
                     (
@@ -999,7 +999,7 @@ impl MailboxSlot {
                 )),
                 flags: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).flags)),
                 native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).native_nr)),
-                args: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).args)),
+                args: core::ptr::read_volatile(&raw const (*ptr).args),
                 x8: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).native_nr)),
                 resume_pc: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).resume_pc)),
                 spsr: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).spsr)),
@@ -1026,7 +1026,7 @@ impl MailboxSlot {
             );
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).flags), parked.flags);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).native_nr), parked.native_nr);
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).args), parked.args);
+            core::ptr::write_volatile(&raw mut (*ptr).args, parked.args);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).resume_pc), parked.resume_pc);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).spsr), parked.spsr);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).fp), parked.fp);

@@ -534,11 +534,6 @@ fn prot_allows_access(prot: u64, access: Option<carrick_mmu_core::aarch64::LeafA
     }
 }
 
-enum FirstTouchResolution {
-    Busy,
-    Resolved(bool),
-}
-
 fn try_resolve_single_process_first_touch<X>(
     engine: &mut SoftAarch64Engine<X>,
     dispatcher: &mut SyscallDispatcher,
@@ -554,56 +549,65 @@ where
     };
     loop {
         let step = dispatcher
-            .with_mm_executor_mutation(|disp, mutation| -> Result<FirstTouchResolution, String> {
-                let permit = mutation.host_alias_permit();
-                match disp.resident_fault_plan(&permit, far) {
-                    Err(_busy) => return Ok(FirstTouchResolution::Busy),
-                    Ok(Some(plan)) => {
-                        let page = plan.page();
-                        let prot = plan.prot();
-                        if !prot_allows_access(prot, Some(access)) {
-                            return Ok(FirstTouchResolution::Resolved(false));
+            .with_mm_executor_mutation(
+                |disp,
+                 mutation|
+                 -> Result<
+                    Result<bool, carrick_kernel::dispatch::mem::ReservationBusy>,
+                    String,
+                > {
+                    let permit = mutation.host_alias_permit();
+                    match disp.resident_fault_plan(&permit, far) {
+                        Err(contended) => return Ok(Err(contended)),
+                        Ok(Some(plan)) => {
+                            let page = plan.page();
+                            let prot = plan.prot();
+                            if !prot_allows_access(prot, Some(access)) {
+                                return Ok(Ok(false));
+                            }
+                            engine
+                                .protect_range(page, GUEST_PAGE_BYTES as usize, prot)
+                                .map_err(|e| {
+                                    format!(
+                                        "first-touch protect_range({page:#x}, prot={prot:#x}): {e}"
+                                    )
+                                })?;
+                            disp.commit_resident_fault(plan);
+                            return Ok(Ok(true));
                         }
-                        engine
-                            .protect_range(page, GUEST_PAGE_BYTES as usize, prot)
-                            .map_err(|e| {
-                                format!("first-touch protect_range({page:#x}, prot={prot:#x}): {e}")
-                            })?;
-                        disp.commit_resident_fault(plan);
-                        return Ok(FirstTouchResolution::Resolved(true));
+                        Ok(None) => {}
                     }
-                    Ok(None) => {}
-                }
 
-                if matches!(
-                    access,
-                    carrick_mmu_core::aarch64::LeafAccess::Read
-                        | carrick_mmu_core::aarch64::LeafAccess::Write
-                ) && let Some(plan) = disp.mmap_growdown_fault_plan(&permit, far)
-                {
-                    let rw = (LinuxProtFlags::READ | LinuxProtFlags::WRITE).bits();
-                    engine
-                        .protect_range(plan.start(), plan.len(), rw)
-                        .map_err(|e| {
-                            format!(
-                                "growdown protect_range({:#x}, len={:#x}): {e}",
-                                plan.start(),
-                                plan.len()
-                            )
-                        })?;
-                    disp.commit_mmap_growdown(plan);
-                    return Ok(FirstTouchResolution::Resolved(true));
-                }
+                    if matches!(
+                        access,
+                        carrick_mmu_core::aarch64::LeafAccess::Read
+                            | carrick_mmu_core::aarch64::LeafAccess::Write
+                    ) && let Some(plan) = disp.mmap_growdown_fault_plan(&permit, far)
+                    {
+                        let rw = (LinuxProtFlags::READ | LinuxProtFlags::WRITE).bits();
+                        engine
+                            .protect_range(plan.start(), plan.len(), rw)
+                            .map_err(|e| {
+                                format!(
+                                    "growdown protect_range({:#x}, len={:#x}): {e}",
+                                    plan.start(),
+                                    plan.len()
+                                )
+                            })?;
+                        disp.commit_mmap_growdown(plan);
+                        return Ok(Ok(true));
+                    }
 
-                Ok(FirstTouchResolution::Resolved(false))
-            })
+                    Ok(Ok(false))
+                },
+            )
             .map_err(|e| format!("MM executor mutation for first-touch fault: {e}"))??;
         match step {
-            FirstTouchResolution::Busy => {
+            Ok(done) => return Ok(done),
+            Err(_contended) => {
                 // Release the MM mutation lease before yielding and rerunning.
                 std::thread::yield_now();
             }
-            FirstTouchResolution::Resolved(done) => return Ok(done),
         }
     }
 }
