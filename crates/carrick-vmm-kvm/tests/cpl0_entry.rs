@@ -4320,6 +4320,20 @@ fn production_sibling_write_waits_while_fork_publication_is_pending() {
     );
 }
 
+/// #2581: as above, but the worker's write is the first touch of a page
+/// nobody mapped before the fork, so it takes the owner's first-touch
+/// supply instead of COW. That supply needs the transfer sequence the
+/// pending fork owns: the write parks on the fork's release and reruns.
+#[test]
+fn production_sibling_first_touch_waits_while_fork_publication_is_pending() {
+    bounded_contention_witness(
+        "production_sibling_first_touch_waits_while_fork_publication_is_pending",
+        "native_fork_pending_cow_contention.S",
+        &["-DFIRST_TOUCH=1"],
+        "sibling first touch under a pending fork publication",
+    );
+}
+
 fn legacy_syscalls_run(flags: &[&str], expected: &[u8], expected_refusals: &[(usize, u64)]) {
     let work = tempfile::tempdir().expect("legacy syscall test directory");
     std::fs::write(work.path().join("file"), b"file").expect("regular file");
