@@ -422,6 +422,160 @@ fn native_multifd_select(variant: &[&str]) {
     );
 }
 
+/// #2621: apt's http method connect wait on x86. A fork child's
+/// non-blocking `connect` to a host TCP listener, then
+/// `pselect6(nfds, {zone pipe}, {host socket}, NULL, 5 s, NULL)`: exactly
+/// the socket's write bit.
+#[test]
+fn native_child_pselect6_mixed_set_reports_a_connected_host_socket() {
+    native_mixed_select("CONNECT");
+}
+
+/// #2621: the connect wait alone, `pselect6(s + 1, NULL, {s}, ...)`.
+#[test]
+fn native_child_pselect6_single_host_socket_connect_wait() {
+    native_mixed_select("SINGLE");
+}
+
+/// #2621: the listener's queue is full, so the child's connect stays in
+/// progress and its mixed pselect6 parks; once the host saw it enrolled
+/// it frees the queue, and the connect's completion wakes the set with the
+/// socket's write bit.
+#[test]
+fn native_child_pselect6_mixed_set_wakes_on_a_delayed_connect() {
+    native_mixed_select("CONNECT_DELAYED");
+}
+
+/// #2621: a mixed `{pipe, socket}` read set parks; the host peer sends
+/// after it saw the child enrolled: exactly the socket's read bit.
+#[test]
+fn native_child_pselect6_mixed_set_wakes_on_host_socket_data() {
+    native_mixed_select("SOCKET_WAKE");
+}
+
+/// #2621: the same park ended by the live parent's pipe write: exactly the
+/// pipe's read bit.
+#[test]
+fn native_child_pselect6_mixed_set_wakes_on_the_zone_pipe() {
+    native_mixed_select("PIPE_WAKE");
+}
+
+/// #2621: nothing in a mixed `{pipe, socket}` set is ready: a 20 ms
+/// pselect6 returns 0 with the set and the timeout cleared.
+#[test]
+fn native_child_pselect6_mixed_set_times_out() {
+    native_mixed_select("SET_TIMEOUT");
+}
+
+/// Run `native_mixed_select.S`'s `variant` against a loopback TCP peer.
+/// The parent sends the poller pid through the gate socket and acts only
+/// once the host saw the poller enrolled in a wait (and, for the host-side
+/// variants, after the host acted).
+fn native_mixed_select(variant: &str) {
+    use carrick_sched_core::{RecordId, ZONE_RECORDS};
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    let wire = |port: u16| port.swap_bytes().to_string();
+    let gate = std::net::UdpSocket::bind("127.0.0.1:0").expect("select gate peer");
+    gate.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set the gate socket deadline");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp peer");
+    let address = listener.local_addr().expect("tcp peer address");
+    let delayed = variant == "CONNECT_DELAYED";
+    // A full accept queue: the child's connect stays in progress until
+    // the host accepts this filler connection.
+    let filler = delayed.then(|| {
+        // SAFETY: re-listening a bound, listening socket only resizes its
+        // queue.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        std::net::TcpStream::connect(address).expect("filler connection")
+    });
+    let gate_port = format!(
+        "-DSELECT_GATE_PORT={}",
+        wire(gate.local_addr().expect("gate socket address").port())
+    );
+    let tcp_port = format!("-DTCP_PORT={}", wire(address.port()));
+    let define = format!("-D{variant}");
+    let flags = [gate_port.as_str(), tcp_port.as_str(), define.as_str()];
+    let elf = kvm_pool_fixture::assemble_fixture("native_mixed_select.S", &flags);
+    let program =
+        carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("mixed select fixture");
+    let gated = matches!(variant, "CONNECT_DELAYED" | "SOCKET_WAKE" | "PIPE_WAKE");
+    let mut sender = None;
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        512,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |carrier| {
+            let zone = carrier.carrier_zone_wake().expect("carrier wake domain");
+            let variant = variant.to_owned();
+            sender = Some(std::thread::spawn(move || {
+                // Every peer end lives until the run ends: a closed one would
+                // make the child's socket readable or reset it.
+                let mut held: Vec<Box<dyn std::any::Any + Send>> = vec![Box::new(filler)];
+                let accepted = (!delayed).then(|| listener.accept().expect("guest connect").0);
+                if !gated {
+                    held.extend([Box::new(accepted) as _, Box::new(listener) as _]);
+                    return (true, held);
+                }
+                let mut pid = [0u8; 8];
+                let (count, client) = gate.recv_from(&mut pid).expect("parent gate");
+                assert_eq!(count, pid.len());
+                let tid = u64::from(u32::from_ne_bytes(
+                    pid[..4].try_into().expect("four pid bytes"),
+                ));
+                let deadline = Instant::now() + Duration::from_secs(4);
+                let parked = loop {
+                    let enrolled =
+                        (1..ZONE_RECORDS as u32)
+                            .filter_map(RecordId::from_raw)
+                            .any(|id| {
+                                let record = zone.zone().record(id);
+                                record.identity().tid == tid
+                                    && record.has_adapter_operation()
+                                    && record
+                                        .object_wait_census()
+                                        .is_some_and(|wait| wait.queue != 0)
+                            });
+                    if enrolled || Instant::now() >= deadline {
+                        break enrolled;
+                    }
+                    std::thread::yield_now();
+                };
+                let acted = match variant.as_str() {
+                    "CONNECT_DELAYED" => Some(listener.accept().expect("filler accept").0),
+                    "SOCKET_WAKE" => {
+                        let mut stream = accepted.expect("accepted guest stream");
+                        stream.write_all(b"y").expect("host data");
+                        Some(stream)
+                    }
+                    _ => accepted,
+                };
+                held.extend([Box::new(acted) as _, Box::new(listener) as _]);
+                assert_eq!(gate.send_to(b"w", client).expect("release parent"), 1);
+                (parked, held)
+            }));
+        },
+        default_dispatcher(),
+    )
+    .expect("mixed select run");
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "{variant} mixed select (38 = ENOSYS; see native_mixed_select.S): {:?}",
+        outcome.run
+    );
+    assert!(
+        sender
+            .expect("gate sender")
+            .join()
+            .expect("join gate sender")
+            .0,
+        "{variant}: the poller must be enrolled before the host acts"
+    );
+}
+
 fn default_dispatcher() -> carrick_kernel::dispatch::SyscallDispatcher {
     carrick_kernel::dispatch::SyscallDispatcher::default()
 }
