@@ -75,7 +75,7 @@ steps:
     mov $99, %eax
 1:  record
 #ifdef CHILD
-    /* The child's canonical readlinkat owner currently refuses this call. */
+    /* The child's canonical readlinkat owner serves this call. */
     mov $267, %eax
     mov $-100, %rdi
     lea sym(%rip), %rsi
