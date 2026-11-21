@@ -275,6 +275,7 @@ enum GroupExitCaller {
 enum ChildStockCase {
     FirstBirth,
     AdvisoryMmap,
+    Madvise,
     Reuse,
     Pinned,
     Claimed,
@@ -288,20 +289,32 @@ fn native_fork_child_advisory_mmap_stays_in_ring() {
     child_thread_admission(0, 0, ChildStockCase::AdvisoryMmap);
 }
 
+/// #1846 (V8's `Check failed: 0 == ret`): a live native fork child's
+/// `madvise` is served in ring through the production entry, never refused:
+/// V8's guard page (PROT_NONE, then `MADV_DONTNEED`), hint advice and the
+/// plan's EINVAL. The discard keeps every node's protection.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_fork_child_madvise_stays_in_ring() {
+    child_thread_admission(0, 0, ChildStockCase::Madvise);
+}
+
 #[cfg(not(target_os = "macos"))]
 fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     const LENGTH: u64 = 256 * 1024 * 1024;
-    let fixture = Box::leak(Box::new(if case == ChildStockCase::AdvisoryMmap {
-        Fixture::with_page_and_arena(
-            0x10000,
-            asid(1),
-            5,
-            Box::leak(Box::new(ThreadLifecyclePage::new())),
-            LENGTH * 2 + 8192,
-        )
-    } else {
-        Fixture::new(0x10000, asid(1))
-    }));
+    let fixture = Box::leak(Box::new(
+        if matches!(case, ChildStockCase::AdvisoryMmap | ChildStockCase::Madvise) {
+            Fixture::with_page_and_arena(
+                0x10000,
+                asid(1),
+                5,
+                Box::leak(Box::new(ThreadLifecyclePage::new())),
+                LENGTH * 2 + 8192,
+            )
+        } else {
+            Fixture::new(0x10000, asid(1))
+        },
+    ));
     let metadata_scope = MetadataScope::new(fixture);
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -311,7 +324,7 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     if !matches!(
         case,
-        ChildStockCase::FirstBirth | ChildStockCase::AdvisoryMmap
+        ChildStockCase::FirstBirth | ChildStockCase::AdvisoryMmap | ChildStockCase::Madvise
     ) {
         let mut physical = super::native_retirement_tests::PhysicalStock::new(&fixture.tables);
         physical.metadata_in_el1_window = true;
@@ -391,7 +404,7 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     ));
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
     let residency = carrick_el1::cow::test_support::residency_table();
-    if case == ChildStockCase::AdvisoryMmap {
+    if matches!(case, ChildStockCase::AdvisoryMmap | ChildStockCase::Madvise) {
         let mut editor = FixtureMapping {
             words,
             residency: &residency,
@@ -421,6 +434,51 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             frame.x[0] as i64
         };
         fixture.task.linux.mark_pending_host_work();
+        if case == ChildStockCase::Madvise {
+            const CHUNK: u64 = 0x40000;
+            let mapped = call(222, [0, CHUNK, 0, 0x4022, u64::MAX, 0]);
+            assert!(mapped > 0 && mapped % 4096 == 0, "mmap: {mapped}");
+            let mapped = mapped as u64;
+            let guard = mapped + 0x1000;
+            assert_eq!(call(226, [mapped, CHUNK, 3, 0, 0, 0]), 0);
+            assert_eq!(call(226, [guard, 0x1000, 0, 0, 0, 0]), 0);
+            // The refused call returned -38 (ENOSYS) here.
+            assert_eq!(call(233, [guard, 0x1000, 4, 0, 0, 0]), 0, "guard DONTNEED");
+            assert_eq!(call(233, [mapped, CHUNK, 4, 0, 0, 0]), 0, "chunk DONTNEED");
+            assert_eq!(call(233, [mapped, CHUNK, 3, 0, 0, 0]), 0, "WILLNEED");
+            assert_eq!(call(233, [mapped + 1, 1, 4, 0, 0, 0]), -22, "unaligned");
+            assert_eq!(counters.refused[233].load(Ordering::Relaxed), 0);
+            let portal = super::super::aarch64_process::Portal::for_zone(
+                NonZeroU64::MIN,
+                fixture.region.table(),
+                fixture.zone,
+            );
+            let mut protections = Vec::new();
+            portal
+                .root(ReservationMm::new(identity.mm).unwrap(), 0)
+                .unwrap()
+                .observe_range(
+                    carrick_el1_abi::ReservationRange::new(mapped, mapped + CHUNK).unwrap(),
+                    &mut |mapping| {
+                        protections.push((
+                            mapping.range.start(),
+                            mapping.range.end(),
+                            mapping.protection.bits(),
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                protections,
+                [
+                    (mapped, guard, 3),
+                    (guard, guard + 0x1000, 0),
+                    (guard + 0x1000, mapped + CHUNK, 3)
+                ],
+                "MADV_DONTNEED keeps every node and its protection"
+            );
+            return;
+        }
         for hint in [0x10000000, 0x200000000, 0x1000000000000000, 0] {
             let mapped = call(222, [hint, LENGTH, 0, 0x4022, u64::MAX, 0]);
             assert!(

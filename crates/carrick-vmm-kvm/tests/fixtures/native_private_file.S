@@ -157,6 +157,21 @@ child:
     movb $0x42, (%rax)
     cmpb $0x42, (%rax)
     jne bytes_failed
+#ifdef DONTNEED_RESTORES
+    /* Discarding the written private copy restores the file's bytes. */
+    mov %r13, %rdi
+    mov $4096, %esi
+    mov $4, %edx
+    mov $28, %eax
+    syscall
+    test %rax, %rax
+    jnz advise_failed
+    cmpb $0x41, (%r13)
+    jne bytes_failed
+    cmpb $0x5a, 4095(%r13)
+    jne bytes_failed
+    mov %r13, %rax
+#endif
 #ifndef CHILD_FIRST_TOUCH
     mov %r12d, %edi
     lea original(%rip), %rsi
@@ -196,6 +211,9 @@ child_status_failed:
     jmp report_error
 map_failed:
     mov $32, %ebx
+    jmp report_error
+advise_failed:
+    mov $40, %ebx
     jmp report_error
 bytes_failed:
     mov $33, %edi
