@@ -541,8 +541,9 @@ fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
     assert_eq!(
         run.reply_census,
         Hvc2ReplyCensus {
-            fixture_answers: 0,
-            production_answers: 13,
+            ring_completed: 0,
+            kernel_dispatched: 13,
+            runner_refused: 0,
         }
     );
     assert_eq!(run.terminating_fault, None);
@@ -1481,8 +1482,9 @@ fn soft_sysv_shm_alias_publishes_kernel_frame_inventory() {
     assert_eq!(
         run.reply_census,
         Hvc2ReplyCensus {
-            fixture_answers: 0,
-            production_answers: 3,
+            ring_completed: 0,
+            kernel_dispatched: 3,
+            runner_refused: 0,
         }
     );
     // Sampled at exit; the soft backend does not yet retire alias inventory

@@ -46,7 +46,7 @@ use carrick_mem::memory::{
     stage1_carrier_maintenance_page_tables,
 };
 use carrick_mmu_core::aarch64::PageTableError;
-use carrick_softcpu_aarch64::dispatch::{ExecuteBlock, RunControl, Stop, run_controlled};
+use carrick_softcpu_aarch64::dispatch::{ExecuteBlock, RunControl, RunWork, Stop, run_controlled};
 use carrick_softcpu_aarch64::exception::Syndrome;
 use carrick_softcpu_aarch64::handler::{
     CodeGeneration, Event, ExclusiveMonitor, GuestMemory as SoftGuestMemory, InlineRam, MemoryFault,
@@ -1032,9 +1032,16 @@ pub struct SoftAarch64Vcpu<X> {
     boot_instant: Instant,
     block_quantum: u64,
     max_quanta_per_exit: u64,
+    work: RunWork,
 }
 
 impl<X> SoftAarch64Vcpu<X> {
+    /// Guest-engine work accumulated across every `run` of this vCPU.
+    #[must_use]
+    pub const fn run_work(&self) -> RunWork {
+        self.work
+    }
+
     fn sync_shared_overrides(&mut self) {
         if self.tpidrro_dirty.swap(false, Ordering::AcqRel) {
             self.cpu.named.tpidrroel0 = SystemValue(self.tpidrro_pending.load(Ordering::Acquire));
@@ -1358,6 +1365,7 @@ where
                 self.block_quantum,
                 &self.control,
             );
+            self.work.accumulate(report.work);
             match report.stop {
                 Stop::Budget => continue,
                 Stop::Kicked => return Ok(Aarch64Exit::Kicked),
@@ -1568,6 +1576,7 @@ where
             boot_instant,
             block_quantum: DEFAULT_BLOCK_QUANTUM,
             max_quanta_per_exit: DEFAULT_MAX_QUANTA_PER_EXIT,
+            work: RunWork::default(),
         };
         vcpu.restore(&staged.snapshot())?;
         if vcpu.mailbox.is_some() {
