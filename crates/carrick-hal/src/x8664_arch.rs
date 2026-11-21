@@ -22,7 +22,6 @@
 use crate::guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallRemap, SyscallTable};
 use crate::trap::RawSyscall;
 use crate::{RegAccess, TrapError};
-use carrick_abi::syscall_x86_64::translate_x86_open_flags;
 use carrick_abi::{CanonicalNr, NativeNr};
 use carrick_guest_mem::{CurrentMmMemory, X8664SyscallFrame};
 
@@ -857,12 +856,6 @@ const X86_NR_FSTAT: u64 = 5;
 /// x86-64 `newfstatat(2)` (syscalls(2)). Its args match canonical
 /// `newfstatat`, but it writes x86_64's legacy stat layout.
 const X86_NR_NEWFSTATAT: u64 = 262;
-/// x86-64 `pipe2(2)` (syscalls(2)). SAME name+shape as canonical pipe2, but the
-/// `flags` word carries O_DIRECT at the x86 bit (0x4000) — translate it like
-/// open's flags, else the handler's allowed-flag mask EINVALs the request.
-const X86_NR_PIPE2: u64 = 293;
-/// Canonical (asm-generic / aarch64) `pipe2` number.
-const CANONICAL_PIPE2: u64 = 59;
 /// Canonical (asm-generic / aarch64) `ppoll` number — the target for x86 `pause`
 /// (ppoll(NULL, 0, NULL) = block until a signal).
 const CANONICAL_PPOLL: u64 = 73;
@@ -894,12 +887,6 @@ const CANONICAL_INOTIFY_INIT1: u64 = 26;
 const X86_NR_SIGNALFD: u64 = 282;
 /// Canonical (asm-generic / aarch64) `signalfd4` number.
 const CANONICAL_SIGNALFD4: u64 = 74;
-/// x86-64 `openat(2)` (syscalls(2)). Canonical openat IS 56 (same name+shape),
-/// but x86_64 and asm-generic disagree on four high O_* flag bits, so openat's
-/// flags word must be translated (NOT a bare table Direct).
-const X86_NR_OPENAT: u64 = 257;
-const CANONICAL_OPENAT: u64 = 56;
-
 /// `SIGCHLD` exit-signal (signal(7)); the low byte of the clone flags word.
 const LINUX_SIGCHLD: u64 = 17;
 /// `CLONE_VM` (clone(2)).
@@ -1100,44 +1087,6 @@ impl X8664GuestArch {
                 native_number: NativeNr(x86_number),
                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT),
                 args: [args[0], args[1], args[2], args[3], 0, 0],
-            });
-        }
-        if x86_number == X86_NR_PIPE2 {
-            // pipe2(fildes, flags): O_CLOEXEC/O_NONBLOCK are identical across the
-            // two ABIs and pass through; only O_DIRECT moves (x86 0x4000 →
-            // canonical 0x10000). Reusing translate_x86_open_flags would also swap
-            // O_DIRECTORY/O_LARGEFILE/O_NOFOLLOW, which are not pipe2 flags, so do
-            // the single-bit move directly.
-            const X86_O_DIRECT: u64 = 0x4000;
-            const CANON_O_DIRECT: u64 = 0x10000;
-            let mut flags = args[1] & !X86_O_DIRECT;
-            if args[1] & X86_O_DIRECT != 0 {
-                flags |= CANON_O_DIRECT;
-            }
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_PIPE2),
-                args: [args[0], flags, 0, 0, 0, 0],
-            });
-        }
-        if x86_number == X86_NR_OPENAT {
-            // openat(dirfd, path, flags, mode) — same shape as canonical openat,
-            // but the x86 flags word needs the O_* bit translation.
-            return SyscallNorm::Plain(RawSyscall {
-                current_guest_sp: None,
-                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_OPENAT),
-                args: [
-                    args[0],
-                    args[1],
-                    translate_x86_open_flags(args[2]),
-                    args[3],
-                    0,
-                    0,
-                ],
             });
         }
         // NOTE: x86_64 utime(132)/utimes(235) also need normalization (to
@@ -1392,6 +1341,7 @@ mod normalize_tests {
 
     #[test]
     fn x86_open_flags_translate_to_asm_generic() {
+        use carrick_abi::syscall_x86_64::translate_x86_open_flags;
         // The two swapped high bit-pairs (x86 value -> asm-generic value).
         assert_eq!(translate_x86_open_flags(0x10000), 0x4000); // O_DIRECTORY
         assert_eq!(translate_x86_open_flags(0x4000), 0x10000); // O_DIRECT

@@ -146,10 +146,9 @@ pub fn normalize_legacy_attr(
     })
 }
 
-/// Convert an x86_64 `open`/`openat` flags word to the canonical (asm-generic)
-/// layout. The low O_* bits (O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK,
-/// O_CLOEXEC, O_TMPFILE, ...) are identical across the two ABIs and pass
-/// through; only four high bits differ and form two swapped pairs:
+/// Convert x86_64 O_* flags to the canonical layout. O_CREAT, O_EXCL, O_TRUNC,
+/// O_APPEND, O_NONBLOCK and O_CLOEXEC pass through. The directory bit of
+/// O_TMPFILE moves with O_DIRECTORY. Four bits form two swapped pairs:
 ///   x86 O_DIRECT(0x4000)    <-> asm-generic O_DIRECT(0x10000)
 ///   x86 O_DIRECTORY(0x10000)<-> asm-generic O_DIRECTORY(0x4000)
 ///   x86 O_LARGEFILE(0x8000) <-> asm-generic O_LARGEFILE(0x20000)
@@ -182,7 +181,7 @@ pub fn translate_x86_open_flags(flags: u64) -> u64 {
     out
 }
 
-/// Lower legacy x86 operands to the existing canonical syscall owners.
+/// Lower legacy forms and x86-specific operands to canonical syscall owners.
 pub fn normalize_legacy(
     native: crate::NativeNr,
     args: [u64; 6],
@@ -193,11 +192,12 @@ pub fn normalize_legacy(
     };
 
     const OPENAT: CanonicalNr = CanonicalNr(56);
+    const PIPE2: CanonicalNr = CanonicalNr(59);
     const X86_NEWFSTATAT: CanonicalNr = CanonicalNr(CARRICK_PRIVATE_X86_NEWFSTATAT);
     const CREAT_OPEN_FLAGS: u64 = 0o1101; // O_CREAT | O_WRONLY | O_TRUNC
 
     let at = LINUX_AT_FDCWD;
-    let [first, second, third, ..] = args;
+    let [first, second, third, fourth, ..] = args;
     Some(match native.raw() {
         2 => (
             OPENAT,
@@ -210,9 +210,9 @@ pub fn normalize_legacy(
             [at, first, second, LINUX_AT_SYMLINK_NOFOLLOW, 0, 0],
         ),
         21 => normalize_access(args),
-        22 => (CanonicalNr(59), [first, 0, 0, 0, 0, 0]), // pipe2
+        22 => (PIPE2, [first, 0, 0, 0, 0, 0]),
         82 => (CanonicalNr(38), [at, first, at, second, 0, 0]), // renameat
-        83 => (CanonicalNr(34), [at, first, second, 0, 0, 0]), // mkdirat
+        83 => (CanonicalNr(34), [at, first, second, 0, 0, 0]),  // mkdirat
         84 => (CanonicalNr(35), [at, first, LINUX_AT_REMOVEDIR, 0, 0, 0]), // unlinkat
         85 => (OPENAT, [at, first, CREAT_OPEN_FLAGS, second, 0, 0]),
         86 => (CanonicalNr(37), [at, first, at, second, 0, 0]), // linkat without following symlinks
@@ -221,7 +221,14 @@ pub fn normalize_legacy(
         89 => (CanonicalNr(78), [at, first, second, third, 0, 0]), // readlinkat
         111 => (crate::nr::GETPGID, [0; 6]),                    // getpgid(0)
         133 => (CanonicalNr(33), [at, first, second, third, 0, 0]), // mknodat
-        284 => (CanonicalNr(19), [first, 0, 0, 0, 0, 0]),       // eventfd2
+        257 => (
+            OPENAT,
+            [first, second, translate_x86_open_flags(third), fourth, 0, 0],
+        ),
+        284 => (CanonicalNr(19), [first, 0, 0, 0, 0, 0]), // eventfd2
+        // Only O_DIRECT changes among the accepted pipe2 flags. Swap both
+        // bits so an invalid x86 O_DIRECTORY cannot become canonical O_DIRECT.
+        293 => (PIPE2, [first, translate_x86_open_flags(second), 0, 0, 0, 0]),
         _ => return normalize_legacy_attr(native.raw(), args),
     })
 }
@@ -748,7 +755,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(255, "inotify_rm_watch", 28),
     // x86_64=256 migrate_pages → canonical migrate_pages=238 (SAME name+shape)
     direct(256, "migrate_pages", 238),
-    // x86_64=257 openat → canonical openat=56 (SAME name+shape)
+    // x86_64=257 openat → canonical openat=56 (flags lowered by normalize_legacy)
     direct(257, "openat", 56),
     // x86_64=258 mkdirat → canonical mkdirat=34 (SAME name+shape)
     direct(258, "mkdirat", 34),
@@ -823,7 +830,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(291, "epoll_create1", 20),
     // x86_64=292 dup3 → canonical dup3=24 (SAME name+shape)
     direct(292, "dup3", 24),
-    // x86_64=293 pipe2 → canonical pipe2=59 (SAME name+shape)
+    // x86_64=293 pipe2 → canonical pipe2=59 (flags lowered by normalize_legacy)
     direct(293, "pipe2", 59),
     // x86_64=294 inotify_init1 → canonical inotify_init1=26 (SAME name+shape)
     direct(294, "inotify_init1", 26),
@@ -1043,6 +1050,21 @@ mod tests {
         let e = lookup_x86_64(60).expect("exit must be in the table");
         assert_eq!(e.name, "exit");
         assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(93)));
+    }
+
+    #[test]
+    fn native_pipe2_preserves_common_flags_and_translates_direct_bit() {
+        let common = crate::LINUX_O_CLOEXEC | 0x800; // O_NONBLOCK
+        for (native, canonical) in [
+            (common, common),
+            (common | 0x4000, common | 0x10000), // O_DIRECT
+            (0x10000, 0x4000),                   // O_DIRECTORY remains invalid for pipe2
+        ] {
+            assert_eq!(
+                normalize_legacy(crate::NativeNr(293), [64, native, 2, 3, 4, 5]),
+                Some((crate::CanonicalNr(59), [64, canonical, 0, 0, 0, 0]))
+            );
+        }
     }
 
     #[test]

@@ -79,6 +79,7 @@ embed = [
   "carrick-cli::x86_kvm_run::mounted_root_fcntl_redirect_restore_preserves_host_description_owner",
   "KVM production: carrick-vmm-kvm::cpl0_entry::serial_host_root_legacy_ipc_syscalls_match_linux",
   "KVM production: carrick-vmm-kvm::cpl0_entry::serial_host_fork_child_legacy_ipc_syscalls_match_linux",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::{serial_host_root_x86_open_and_pipe_flags_match_linux,serial_host_fork_child_x86_open_and_pipe_flags_match_linux} (#2628: pipe2 O_CLOEXEC and O_NONBLOCK apply to both ring descriptors)",
 ]
 
 [bindings.unresolved]
