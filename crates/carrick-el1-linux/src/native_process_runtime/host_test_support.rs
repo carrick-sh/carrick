@@ -6941,6 +6941,127 @@ fn a_signal_before_a_native_childs_repoll_is_claimed_answers_eintr_for<
     assert!(!retained, "Linux never restarts an interrupted poll");
 }
 
+/// #2620 part A: when a host-file call resumes from its host-readiness wait and
+/// `continue_host_file` republishes its record via `publish_pending_host_file`,
+/// parking with `NativeResume::Left` on a transport without a physical service
+/// doorbell (`!native_service_doorbell()`) must mark pending host work so an
+/// otherwise-idle vCPU exits to the carrier rather than entering WFI with
+/// `service_notice` stranded.
+#[cfg(test)]
+#[test]
+fn republished_host_file_park_marks_pending_host_work_without_doorbell() {
+    republished_host_file_park_marks_pending_host_work_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, false);
+}
+
+/// [`republished_host_file_park_marks_pending_host_work_without_doorbell`] on the AArch64 owner's context and MMU.
+#[cfg(test)]
+#[test]
+fn republished_host_file_park_marks_pending_host_work_without_doorbell_on_arm() {
+    republished_host_file_park_marks_pending_host_work_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, false);
+}
+
+/// Control for [`republished_host_file_park_marks_pending_host_work_without_doorbell`]:
+/// when the transport has a physical service doorbell (`native_service_doorbell()`
+/// returns `true`), the doorbell itself traps to the carrier, so parking with
+/// `Left` does not raise a second host-work doorbell.
+#[cfg(test)]
+#[test]
+fn republished_host_file_park_skips_host_work_mark_with_physical_doorbell() {
+    republished_host_file_park_marks_pending_host_work_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, true);
+}
+
+#[cfg(test)]
+fn republished_host_file_park_marks_pending_host_work_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    physical_doorbell: bool,
+) {
+    use carrick_personality_linux::native_host_file::HostFileCall;
+    struct ResetDoorbell;
+    impl Drop for ResetDoorbell {
+        fn drop(&mut self) {
+            on_service_doorbell(None);
+        }
+    }
+    let _reset = ResetDoorbell;
+    let pollfd = Box::leak(Box::new([3u8, 0, 0, 0, 1, 0, 0, 0]));
+    let poll = HostFileCall::Ppoll {
+        fds: pollfd.as_ptr() as u64,
+        nfds: 1,
+        timeout: 0,
+        sigmask: 0,
+    };
+    let wait = HostReadyWaitFixture::<C>::new_for::<B>(make_words);
+    let record = wait.begin(poll, 74, false);
+    let fixture = &wait.capacity.fixture;
+    if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
+    wait.answer_wait(record);
+    if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
+    wait.notify_ready(record);
+    assert!(
+        !fixture.task.linux.has_pending_host_work(),
+        "host-readiness wakeup places the record on the run queue without a host-work mark"
+    );
+    let doorbell_rings = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    if physical_doorbell {
+        let rings = doorbell_rings.clone();
+        on_service_doorbell(Some(Box::new(move || {
+            rings.fetch_add(1, Ordering::Relaxed);
+            true
+        })));
+    }
+    let (resumed, published) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+    assert_eq!(resumed, record);
+    assert!(
+        matches!(published, Ok(NativeResume::Left(None))),
+        "republished host-file service must park with Left(None), got {}",
+        resume_name(&published)
+    );
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+    let notice = fixture
+        .task
+        .service_notice
+        .take()
+        .unwrap()
+        .expect("republished host-file request must publish a service notice");
+    assert_eq!(notice.record, record);
+    assert_eq!(notice.sequence.get(), 2);
+    if physical_doorbell {
+        assert_eq!(doorbell_rings.load(Ordering::Relaxed), 1);
+        assert!(
+            !fixture.task.linux.has_pending_host_work(),
+            "a transport with a physical service doorbell must not double-ring pending host work"
+        );
+    } else {
+        assert!(
+            fixture.task.linux.has_pending_host_work(),
+            "republished host-file park without a physical doorbell must mark pending host work"
+        );
+        fixture
+            .task
+            .linux
+            .take_host_work_doorbell()
+            .unwrap()
+            .settled();
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {

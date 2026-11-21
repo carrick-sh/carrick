@@ -14,7 +14,11 @@ serves the run root's host-fd waits; there is no second readiness thread).
 The reactor notifies the queue when the host fd is ready, or when a poll's
 deadline passes, and the member publishes the call's own record again (the
 same staged input, as Linux reads a poll set and a send's bytes once per
-call), which probes once. A signal that interrupts the wait wakes the member
+call), which probes once. On transports without a physical service doorbell
+(ARM EL1, `!native_service_doorbell()`), parking that republished notice with
+`NativeResume::Left` owns a `mark_pending_host_work()` doorbell (#2620 part A)
+so an otherwise-idle vCPU exits `Sched::idle` to carrier intake instead of
+entering WFI with `CurrentTask.service_notice` untaken. A signal that interrupts the wait wakes the member
 from that queue: the call answers EINTR, and a socket call, read or write
 that moved nothing is restarted under `SA_RESTART` by the shared signal
 policy on both ISAs (a poll never is).
