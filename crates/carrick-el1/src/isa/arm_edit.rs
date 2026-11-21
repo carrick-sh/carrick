@@ -59,16 +59,17 @@ pub fn lower_edit_intent(intent: EditIntent<'_, RootGpa>) -> Result<DescriptorTx
             target_ipa: SubstrateGpa(output.raw()),
             backing: backing(source),
         },
-        EditOperation::Protect { permissions } if permissions.user => {
-            DescriptorOp::Protect(GuestPermissionEdit {
-                va: span.va,
-                len: span.len,
-                readable: permissions.readable,
-                writable: permissions.writable,
-                executable: permissions.executable,
-                cow_ceiling: None,
-            })
-        }
+        EditOperation::Protect {
+            permissions,
+            ceiling,
+        } if permissions.user => DescriptorOp::Protect(GuestPermissionEdit {
+            va: span.va,
+            len: span.len,
+            readable: permissions.readable,
+            writable: permissions.writable,
+            executable: permissions.executable,
+            ceiling,
+        }),
         EditOperation::Publish { expected, access } => DescriptorOp::Publish {
             span,
             expected_ipa: SubstrateGpa(expected.raw()),
@@ -230,7 +231,11 @@ mod tests {
             executable: false,
             user: true,
         };
-        let txn = lower_edit_intent(intent(EditOperation::Protect { permissions })).unwrap();
+        let txn = lower_edit_intent(intent(EditOperation::Protect {
+            permissions,
+            ceiling: None,
+        }))
+        .unwrap();
         assert_eq!(txn.root, SubstrateGpa(0x6000));
         assert_eq!(txn.id.mm_key, NonZeroU64::MIN);
         assert_eq!(txn.id.generation, NonZeroU64::MIN);
@@ -243,7 +248,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 executable: false,
-                cow_ceiling: None,
+                ceiling: None,
             })
         );
     }

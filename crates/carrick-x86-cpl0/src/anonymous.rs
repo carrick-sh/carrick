@@ -657,6 +657,7 @@ impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
                     executable: edit.executable,
                     user: edit.readable || edit.writable || edit.executable,
                 },
+                ceiling: edit.ceiling,
             },
         )
         .map_err(|_| carrick_mmu_core::aarch64::GuestPermissionEditError::NotPrivateAnonymous)

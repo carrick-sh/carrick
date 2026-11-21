@@ -126,6 +126,7 @@ fn nx_and_readonly_violations_report_user_instruction_and_write_faults() {
                 executable: false,
                 user: true,
             },
+            ceiling: None,
         },
     )
     .unwrap();
