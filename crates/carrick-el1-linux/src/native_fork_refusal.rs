@@ -99,6 +99,9 @@ impl NativeForkRefusal {
             NativeForkCause::StockReservation(R::Stale) => E::Stale,
             NativeForkCause::StockReservation(R::Capacity) => E::Exhausted,
             NativeForkCause::StockReservation(R::Inventory) => E::Busy,
+            // The fork owner grows the table and answers `Busy` itself. This
+            // cause survives only when that growth was refused for good.
+            NativeForkCause::StockReservation(R::Residency) => E::Exhausted,
             _ => E::Fault,
         }
     }
@@ -287,6 +290,7 @@ mod tests {
             NativeForkCause::StockReservation(R::Stale),
             NativeForkCause::StockReservation(R::Capacity),
             NativeForkCause::StockReservation(R::Inventory),
+            NativeForkCause::StockReservation(R::Residency),
         ] {
             let error = refused(NativeForkStage::Reserve, cause);
             let observed = observe_process_error_with(error, |_| panic!("duplicate refusal"));
@@ -400,6 +404,7 @@ mod tests {
             (R::Stale, NativeProcessError::Stale),
             (R::Capacity, NativeProcessError::Exhausted),
             (R::Inventory, NativeProcessError::Busy),
+            (R::Residency, NativeProcessError::Exhausted),
         ] {
             let diagnostic = refused(
                 NativeForkStage::Reserve,

@@ -188,6 +188,116 @@ impl PublicationDecline {
 }
 
 #[cfg(test)]
+mod fork_residency_growth_tests {
+    use super::grow_residency_for_fork;
+    use carrick_core_abi::{
+        ExtentGrantReceipt, FRAME_GRANT_RESIDENCY_SLOTS, FrameGrantResidencyTable,
+        ReservationMetadataAllocator, ResidencyGrowthRefusal,
+    };
+    use core::alloc::Layout;
+    use core::cell::{Cell, RefCell};
+    use std::{boxed::Box, vec::Vec};
+
+    /// Serves `budget` segment allocations, then refuses.
+    struct Budget {
+        budget: Cell<usize>,
+        allocations: RefCell<Vec<(*mut u8, Layout)>>,
+    }
+    impl Drop for Budget {
+        fn drop(&mut self) {
+            for (address, layout) in self.allocations.get_mut().drain(..) {
+                // SAFETY: every table view is gone; this allocator owns the
+                // exact address and layout.
+                unsafe { std::alloc::dealloc(address, layout) };
+            }
+        }
+    }
+    // SAFETY: each allocation is retained until drop and carries its exact
+    // enclosing extent.
+    unsafe impl ReservationMetadataAllocator for Budget {
+        fn allocate_with_extent(&self, layout: Layout) -> Option<(*mut u8, ExtentGrantReceipt)> {
+            let left = self.budget.get().checked_sub(1)?;
+            self.budget.set(left);
+            // SAFETY: a residency segment layout is nonempty.
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            if ptr.is_null() {
+                return None;
+            }
+            self.allocations.borrow_mut().push((ptr, layout));
+            Some((
+                ptr,
+                ExtentGrantReceipt {
+                    base_va: ptr as u64,
+                    size: layout.size(),
+                    token: 1,
+                },
+            ))
+        }
+        fn deallocate(&self, ptr: *mut u8, layout: Layout) {
+            let mut allocations = self.allocations.borrow_mut();
+            if let Some(index) = allocations.iter().position(|e| *e == (ptr, layout)) {
+                allocations.swap_remove(index);
+                // SAFETY: the stored entry proves this allocator owns it.
+                unsafe { std::alloc::dealloc(ptr, layout) };
+            }
+        }
+    }
+
+    fn table() -> Box<FrameGrantResidencyTable> {
+        let mut storage = Box::<FrameGrantResidencyTable>::new_uninit();
+        // SAFETY: the typed allocation has the table's size and alignment.
+        unsafe {
+            FrameGrantResidencyTable::init_in_place(storage.as_mut_ptr());
+            storage.assume_init()
+        }
+    }
+
+    /// #2655: each refused fork doubles the segments (1, 2, 4, 8), so a fork
+    /// of any size reruns a logarithmic number of times.
+    #[test]
+    fn each_refused_fork_doubles_the_segments() {
+        let table = table();
+        let allocator = Budget {
+            budget: Cell::new(usize::MAX),
+            allocations: RefCell::new(Vec::new()),
+        };
+        for segments in [2usize, 4, 8] {
+            assert_eq!(grow_residency_for_fork(&table, &allocator), Ok(()));
+            assert_eq!(table.extension_count(), segments - 1);
+            // SAFETY: the test allocator's segments stay mapped at their
+            // published addresses for this borrow.
+            let view = unsafe { table.guest_view() };
+            assert_eq!(view.slot_capacity(), segments * FRAME_GRANT_RESIDENCY_SLOTS);
+        }
+    }
+
+    /// Metadata pressure is "not now" only while something was published:
+    /// a partial doubling reruns the fork, an empty one reports the refusal,
+    /// and the same growth succeeds once metadata is back.
+    #[test]
+    fn partial_growth_reruns_and_no_growth_reports_the_refusal() {
+        let table = table();
+        let allocator = Budget {
+            budget: Cell::new(2),
+            allocations: RefCell::new(Vec::new()),
+        };
+        assert_eq!(grow_residency_for_fork(&table, &allocator), Ok(()));
+        assert_eq!(table.extension_count(), 1);
+        // Doubling wants two more; the allocator has one.
+        assert_eq!(grow_residency_for_fork(&table, &allocator), Ok(()));
+        assert_eq!(table.extension_count(), 2);
+        assert_eq!(
+            grow_residency_for_fork(&table, &allocator),
+            Err(ResidencyGrowthRefusal::MetadataRequired)
+        );
+        assert_eq!(table.extension_count(), 2);
+        allocator.budget.set(1);
+        assert_eq!(grow_residency_for_fork(&table, &allocator), Ok(()));
+        assert_eq!(table.extension_count(), 3);
+    }
+}
+
+#[cfg(test)]
 mod publication_decline_tests {
     use super::{PublicationDecline, PublicationNotNow, SelectedBackingPlan};
     use carrick_core_abi::ReservationRange;
@@ -616,6 +726,36 @@ pub fn grow_residency_or_not_now(
             owner_wait,
         }),
     }
+}
+
+/// Grow the residency table for a fork the carrier refused with
+/// `ForkStockRefusal::Residency`. A fork publishes rows for every inherited
+/// page outside a grant window, in the parent and in the child, so its need
+/// scales with the MM, not with one fault. The segment count doubles on each
+/// refusal: a fork of any size reruns a logarithmic number of times, and the
+/// table never holds more than twice the segments its largest fork needed.
+///
+/// The caller holds no MM editor and no descriptor claim. `Ok` means at
+/// least one segment was published (by this caller or a racing owner) and
+/// the fork should rerun; `Err` is the refusal that stopped the first one.
+#[inline(never)]
+pub fn grow_residency_for_fork(
+    table: &FrameGrantResidencyTable,
+    allocator: &impl ReservationMetadataAllocator,
+) -> Result<(), ResidencyGrowthRefusal> {
+    let observed = table.extension_count();
+    // `observed + 1` segments exist, counting the bootstrap segment.
+    let target = observed.saturating_mul(2).saturating_add(1);
+    for index in observed..target {
+        if let Err(refusal) = table.grow(allocator, index) {
+            return if table.extension_count() > observed {
+                Ok(())
+            } else {
+                Err(refusal)
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Revalidate an owner-selected lazy window and apply its isolated submission,

@@ -673,6 +673,10 @@ pub enum ForkStockRefusal {
     Stale,
     Capacity,
     Inventory,
+    /// The carrier's residency table cannot hold the rows this fork
+    /// publishes. Not an error: the guest grows the table through its own
+    /// metadata allocator, outside every MM editor, and reruns the fork.
+    Residency,
 }
 
 /// All words are checked before constructing nonzero semantic domains.
@@ -798,6 +802,7 @@ impl ForkStockExchange {
             ForkStockRefusal::Stale => 2,
             ForkStockRefusal::Capacity => 3,
             ForkStockRefusal::Inventory => 4,
+            ForkStockRefusal::Residency => 5,
         };
         self._reserved = 0;
         self.status = 2;
@@ -837,6 +842,7 @@ impl ForkStockExchange {
                 2 => ForkStockRefusal::Stale,
                 3 => ForkStockRefusal::Capacity,
                 4 => ForkStockRefusal::Inventory,
+                5 => ForkStockRefusal::Residency,
                 _ => return None,
             }),
             _ => return None,
@@ -1173,6 +1179,7 @@ impl ForkStockSettlement {
             ForkStockRefusal::Stale => 2,
             ForkStockRefusal::Capacity => 3,
             ForkStockRefusal::Inventory => 4,
+            ForkStockRefusal::Residency => 5,
         };
         true
     }
@@ -1191,6 +1198,7 @@ impl ForkStockSettlement {
                 2 => ForkStockRefusal::Stale,
                 3 => ForkStockRefusal::Capacity,
                 4 => ForkStockRefusal::Inventory,
+                5 => ForkStockRefusal::Residency,
                 _ => return None,
             }),
             _ => return None,
@@ -1588,6 +1596,19 @@ mod tests {
         assert!(refused.refuse(ForkStockRefusal::Capacity));
         assert_eq!(refused.take(request), Some(Err(ForkStockRefusal::Capacity)));
         assert!(refused.take(request).is_none());
+    }
+
+    /// #2655: the residency refusal keeps its own wire code, so the guest
+    /// can tell "grow the table and rerun" from a capacity `EAGAIN`.
+    #[test]
+    fn residency_refusal_round_trips_as_its_own_reply() {
+        let request = request();
+        let mut refused = ForkStockExchange::new(request).unwrap();
+        assert!(refused.refuse(ForkStockRefusal::Residency));
+        assert_eq!(
+            refused.take(request),
+            Some(Err(ForkStockRefusal::Residency))
+        );
     }
 
     #[test]
