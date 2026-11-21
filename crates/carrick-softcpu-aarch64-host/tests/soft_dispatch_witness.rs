@@ -51,8 +51,12 @@ const NR_CLOSE: u64 = 57;
 const NR_READ: u64 = 63;
 const NR_WRITE: u64 = 64;
 const NR_FSTAT: u64 = 80;
+const NR_TIMERFD_CREATE: u64 = 85;
 const NR_EXIT_GROUP: u64 = 94;
+const NR_SETITIMER: u64 = 103;
 const NR_CLOCK_GETTIME: u64 = 113;
+const NR_TKILL: u64 = 130;
+const NR_RT_SIGACTION: u64 = 134;
 const NR_GETUID: u64 = 174;
 const NR_GETEUID: u64 = 175;
 const NR_BRK: u64 = 214;
@@ -695,5 +699,182 @@ fn soft_stage2_enforces_execute_permission_and_extent_code_generations() {
     assert_ne!(
         after_host_write, gen2,
         "host write_gpa_bytes to tracked code page must bump ExtentTable generation"
+    );
+}
+
+struct SequenceHvc2Executor {
+    mailbox: Arc<AtomicPtr<Aarch64SyscallMailbox>>,
+    calls: Vec<(u64, [u64; 6])>,
+    returns: Arc<Mutex<Vec<i64>>>,
+    next_seq: u64,
+}
+
+impl SequenceHvc2Executor {
+    fn publish_mailbox_request(&mut self, cpu: &CpuState) -> Result<(), String> {
+        let ptr = self.mailbox.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return Err("mailbox pointer was not bound before HVC #2".to_owned());
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        // SAFETY: `ptr` points to the stage-2 `Aarch64SyscallMailbox` slot while
+        // the single soft vCPU is synchronously preparing `HVC #2`.
+        unsafe {
+            core::ptr::write_volatile(&raw mut (*ptr).sequence, seq);
+            core::ptr::write_volatile(&raw mut (*ptr).trap_kind, MailboxTrapKind::Syscall.raw());
+            core::ptr::write_volatile(&raw mut (*ptr).native_nr, rx(cpu, 8));
+            core::ptr::write_volatile(
+                &raw mut (*ptr).args,
+                [
+                    rx(cpu, 0),
+                    rx(cpu, 1),
+                    rx(cpu, 2),
+                    rx(cpu, 3),
+                    rx(cpu, 4),
+                    rx(cpu, 5),
+                ],
+            );
+            core::ptr::write_volatile(&raw mut (*ptr).resume_pc, cpu.el1.elr.0);
+            core::ptr::write_volatile(&raw mut (*ptr).spsr, cpu.el1.spsr.0);
+            core::ptr::write_volatile(&raw mut (*ptr).fp, rx(cpu, 29));
+            core::ptr::write_volatile(&raw mut (*ptr).lr, rx(cpu, 30));
+            core::ptr::write_volatile(&raw mut (*ptr).sp, cpu.sp_el0.0);
+            core::ptr::write_volatile(&raw mut (*ptr).esr, cpu.el1.esr.0);
+            (*ptr)
+                .state
+                .store(MailboxState::RequestReady.raw(), Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn consume_mailbox_response(&self, cpu: &mut CpuState) -> Result<(), String> {
+        let ptr = self.mailbox.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return Err("mailbox pointer was not bound on ERET".to_owned());
+        }
+        // SAFETY: `ptr` points to the stage-2 `Aarch64SyscallMailbox` slot.
+        unsafe {
+            let state = (*ptr).state.load(Ordering::Acquire);
+            if state == MailboxState::Idle.raw() {
+                return Ok(());
+            }
+            if state != MailboxState::ResponseReady.raw() {
+                return Err(format!("expected ResponseReady (2) on ERET, got {state}"));
+            }
+            let retval = core::ptr::read_volatile(&raw const (*ptr).return_value);
+            wx(cpu, 0, retval);
+            (*ptr)
+                .state
+                .store(MailboxState::Idle.raw(), Ordering::Release);
+            self.returns
+                .lock()
+                .map_err(|_| "poisoned returns".to_owned())?
+                .push(retval as i64);
+        }
+        Ok(())
+    }
+}
+
+impl ExecuteBlock for SequenceHvc2Executor {
+    type Error = String;
+    type Code = ();
+
+    fn prepare(&mut self, _block: &TranslatedBlock) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn execute(
+        &mut self,
+        block: &TranslatedBlock,
+        _code: &(),
+        cpu: &mut CpuState,
+    ) -> Result<usize, Self::Error> {
+        if cpu.pstate.el == ExceptionLevel::El0 && (CODE_VA..CODE_VA + 0x1000).contains(&cpu.pc.0) {
+            let step_index = ((cpu.pc.0 - CODE_VA) / 4) as usize;
+            let &(nr, args) = self
+                .calls
+                .get(step_index)
+                .ok_or_else(|| format!("unexpected sequence step {step_index}"))?;
+            ScriptedHvc2Executor::set_call(cpu, nr, args);
+        } else if cpu.pstate.el == ExceptionLevel::El1 {
+            if cpu.pc.0 == LINUX_EL1_VECTORS_BASE + 0x400 {
+                if carrick_hal::aarch64::is_aarch64_svc_exception(cpu.el1.esr.0) {
+                    self.publish_mailbox_request(cpu)?;
+                }
+            } else if cpu.pc.0 == LINUX_EL1_VECTORS_BASE + 0x404 {
+                self.consume_mailbox_response(cpu)?;
+            }
+        }
+        match block.terminator() {
+            Terminator::Handler(idx) | Terminator::Jump(idx) | Terminator::Fallthrough(idx) => {
+                Ok(idx)
+            }
+            Terminator::Conditional { .. } => Err("unexpected conditional terminator".to_owned()),
+        }
+    }
+}
+
+#[test]
+fn soft_single_process_refuses_timer_and_signal_syscalls_with_counted_enosys() {
+    // Prepare a 1-second `itimerval` (`it_value.tv_sec = 1`) at `DATA_VA + 0x300`
+    // so `setitimer` would arm a timer on a null bridge instead of failing validation.
+    let mut itimerval = [0u8; 32];
+    itimerval[16..24].copy_from_slice(&1i64.to_le_bytes());
+    let calls = vec![
+        (NR_TIMERFD_CREATE, [CLOCK_MONOTONIC, 0, 0, 0, 0, 0]),
+        (NR_SETITIMER, [0, DATA_VA + 0x300, 0, 0, 0, 0]),
+        (NR_RT_SIGACTION, [13, 0, DATA_VA + 0x340, 8, 0, 0]),
+        (NR_TKILL, [1, 0, 0, 0, 0, 0]),
+        (NR_EXIT_GROUP, [0; 6]),
+    ];
+    let code_words = vec![A64_SVC_0; calls.len()];
+    let elf = build_witness_elf(&code_words, &[(0x300, &itimerval)]);
+
+    let mailbox_slot = Arc::new(AtomicPtr::new(null_mut()));
+    let returns = Arc::new(Mutex::new(Vec::new()));
+    let executor = SequenceHvc2Executor {
+        mailbox: Arc::clone(&mailbox_slot),
+        calls,
+        returns: Arc::clone(&returns),
+        next_seq: 1,
+    };
+    let config = SoftSingleProcessConfig::new(&elf, "/refuse-timers-signals");
+    let mb_for_setup = Arc::clone(&mailbox_slot);
+    let run = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
+        let mut vec_stub = [0u8; 8];
+        vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+        vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+        engine
+            .backend()
+            .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+            .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+        let ptr = engine
+            .backend()
+            .host_ptr(
+                LINUX_SYSCALL_MAILBOX_BASE,
+                AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+        mb_for_setup.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+        Ok(())
+    })
+    .expect("single-process run should complete cleanly after counted ENOSYS refusals");
+
+    assert_eq!(run.exit_code, 0);
+    let observed_returns = returns.lock().expect("lock returns").clone();
+    let enosys = carrick_abi::LINUX_ENOSYS.guest_retval();
+    assert_eq!(
+        observed_returns,
+        vec![enosys, enosys, enosys, enosys],
+        "timer and signal syscalls must fail closed with -ENOSYS instead of silently succeeding"
+    );
+    assert_eq!(
+        run.counted_enosys,
+        vec![
+            (NR_TIMERFD_CREATE, "timerfd_create", 1),
+            (NR_SETITIMER, "setitimer", 1),
+            (NR_TKILL, "tkill", 1),
+            (NR_RT_SIGACTION, "rt_sigaction", 1),
+        ]
     );
 }
