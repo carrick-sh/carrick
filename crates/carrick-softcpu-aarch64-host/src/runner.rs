@@ -11,6 +11,7 @@ use std::mem::offset_of;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use carrick_abi::{LinuxProtFlags, SigBlockMask, SigSet};
@@ -20,10 +21,9 @@ use carrick_el1_abi::{
 };
 use carrick_guest_arch::ContextGeneration;
 use carrick_guest_mem::{GuestMemory, MappingSharing};
-use carrick_hal::posix_timer::PosixArm;
 use carrick_hal::{
-    HostSignalBridge, NO_PENDING_SIGNAL, SyscallTrap, ThreadedEngine, TimerCoreBridge,
-    TimerDelivery, TimerFiring, TimerSpecNs, TrapError,
+    GuestTimerBridge, HostSignalBridge, NO_PENDING_SIGNAL, PosixTimerSpec, SyscallTrap,
+    ThreadedEngine, TimerDelivery, TimerSpecNs, TrapError,
 };
 use carrick_kernel::compat::CompatReporter;
 use carrick_kernel::dispatch::{
@@ -50,9 +50,15 @@ use carrick_vfs::rootfs::RootFs;
 use crate::HostBlockRunner;
 use crate::facade::{GUEST_PAGE_BYTES, SoftAarch64Engine, SoftAarch64Vmm};
 
-struct SoftHostSignalBridge;
+/// Fail-closed signal bridge for single-process soft-CPU bring-up before
+/// `#2645` wires guest signal delivery: passive pending queries report empty,
+/// and any attempt to publish or arm host signal delivery is counted and refused.
+#[derive(Default)]
+struct RefusingSoftSignalBridge {
+    refused_ops: AtomicU64,
+}
 
-impl HostSignalBridge for SoftHostSignalBridge {
+impl HostSignalBridge for RefusingSoftSignalBridge {
     fn has_unblocked_pending_for(&self, _tid: i32, _block_mask: SigBlockMask) -> bool {
         false
     }
@@ -69,23 +75,35 @@ impl HostSignalBridge for SoftHostSignalBridge {
         NO_PENDING_SIGNAL
     }
 
-    fn publish_pending_for(&self, _tid: i32, _signum: i32) {}
+    fn publish_pending_for(&self, _tid: i32, _signum: i32) {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+    }
 
-    fn publish_process_signal(&self, _signum: i32) {}
+    fn publish_process_signal(&self, _signum: i32) {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+    }
 
     fn last_sender_for(&self, _signum: i32) -> i32 {
         0
     }
 
-    fn raise_for_self(&self, _signum: i32) {}
+    fn raise_for_self(&self, _signum: i32) {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+    }
 
     fn wake_all_waiters(&self) {}
 
-    fn ensure_host_handler(&self, _linux_signum: i32) {}
+    fn ensure_host_handler(&self, _linux_signum: i32) {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+    }
 
-    fn set_host_ignore(&self, _linux_signum: i32) {}
+    fn set_host_ignore(&self, _linux_signum: i32) {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+    }
 
-    fn set_host_default(&self, _linux_signum: i32) {}
+    fn set_host_default(&self, _linux_signum: i32) {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+    }
 
     fn reset_routed_handlers_after_execve(&self, _ignored: SigSet) {}
 
@@ -99,10 +117,13 @@ impl HostSignalBridge for SoftHostSignalBridge {
         _value: i64,
         _target_ns_tid: i32,
     ) -> bool {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
         false
     }
 
-    fn xsig_nudge(&self, _target_host_pid: i32) {}
+    fn xsig_nudge(&self, _target_host_pid: i32) {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+    }
 
     fn xsig_drain_for_self(&self) -> Vec<(i32, i32, i32, u32, i64, i32)> {
         Vec::new()
@@ -117,35 +138,94 @@ impl HostSignalBridge for SoftHostSignalBridge {
     }
 }
 
-struct SoftTimerFiring;
+/// Fail-closed timer bridge for single-process soft-CPU bring-up: implements
+/// [`GuestTimerBridge`] directly without allocating `TimerCoreBridge` slots.
+#[derive(Default)]
+struct RefusingSoftTimerBridge {
+    refused_ops: AtomicU64,
+}
 
-impl TimerFiring for SoftTimerFiring {
-    fn spawn_itimer_fallback(_which: usize, _generation: u64, _spec: TimerSpecNs) {}
+impl GuestTimerBridge for RefusingSoftTimerBridge {
+    fn itimer_arm(&self, _which: usize, _spec: TimerSpecNs, _needs_periodic: bool) -> u64 {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+        0
+    }
 
-    fn spawn_posix_firing(_id: i32, _armed: &PosixArm, _spec: TimerSpecNs) {}
+    fn itimer_disarm(&self, _which: usize) {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+    }
 
-    fn deliver(_signum: i32) {}
+    fn itimer_signum_for(&self, _which: usize) -> i32 {
+        0
+    }
 
-    fn delivery() -> Option<Arc<dyn TimerDelivery>> {
+    fn itimer_spawn_fallback_timer(&self, _which: usize, _generation: u64, _spec: TimerSpecNs) {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn posix_create_with_target_and_value(
+        &self,
+        _clock_id: i32,
+        _signum: i32,
+        _target_tid: Option<i32>,
+        _si_value: i64,
+    ) -> i32 {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+        -1
+    }
+
+    fn posix_arm(&self, _id: i32, _spec: TimerSpecNs) -> Option<PosixTimerSpec> {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
         None
     }
 
-    fn sample_cpu_now() -> Option<u64> {
+    fn posix_remaining(&self, _id: i32) -> Option<TimerSpecNs> {
         None
     }
 
-    fn active_vcpus() -> u64 {
-        1
+    fn posix_getoverrun(&self, _id: i32) -> Option<u32> {
+        None
+    }
+
+    fn posix_seed_overrun(&self, _id: i32, _count: u32) {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn posix_exists(&self, _id: i32) -> bool {
+        false
+    }
+
+    fn posix_clock_id(&self, _id: i32) -> i32 {
+        0
+    }
+
+    fn posix_delete(&self, _id: i32) -> bool {
+        false
+    }
+
+    fn deliver(&self, _signum: i32) {
+        self.refused_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn delivery(&self) -> Option<Arc<dyn TimerDelivery>> {
+        None
     }
 }
 
-/// Construct standalone [`CarrierBridges`] for single-process soft-CPU runs.
-#[must_use]
-pub fn soft_carrier_bridges() -> CarrierBridges {
+fn refusing_soft_bridges() -> CarrierBridges {
     CarrierBridges {
-        host_signal: Arc::new(SoftHostSignalBridge),
-        timers: Arc::new(TimerCoreBridge::<SoftTimerFiring>::new()),
+        host_signal: Arc::new(RefusingSoftSignalBridge::default()),
+        timers: Arc::new(RefusingSoftTimerBridge::default()),
     }
+}
+
+/// Timer and signal syscalls refused with counted `ENOSYS` on the single-process
+/// soft-CPU bring-up runner until `#2645` wires guest signal and timer delivery.
+const fn is_refused_single_process_timer_or_signal_syscall(nr: u64) -> bool {
+    matches!(
+        nr,
+        74 | 85..=87 | 102 | 103 | 107..=111 | 129..=139 | 240 | 408..=411 | 421 | 424
+    )
 }
 
 /// Parameters for launching one single-process AArch64 guest through the
@@ -338,7 +418,7 @@ where
     X::Error: core::fmt::Debug,
     F: FnOnce(&mut SoftAarch64Engine<X>) -> Result<(), String>,
 {
-    let mut dispatcher = SyscallDispatcher::with_bridges(soft_carrier_bridges());
+    let mut dispatcher = SyscallDispatcher::with_bridges(refusing_soft_bridges());
     if let Some(root_dir) = config.rootfs_dir {
         let rootfs = RootFs::from_immutable_host_dir(root_dir).map_err(|e| {
             format!(
@@ -622,6 +702,7 @@ where
     X::Error: core::fmt::Debug,
 {
     let reporter = CompatReporter::default();
+    let mut refused_by_runner = std::collections::BTreeMap::<u64, u64>::new();
     let mut syscalls_dispatched = 0u64;
     let max_first_touch_faults = max_syscalls.saturating_mul(16).max(65_536);
     let mut first_touch_faults = 0usize;
@@ -679,18 +760,25 @@ where
             None => {}
         }
 
-        let kernel_context = dispatcher.capture_one_task_context().map_err(|e| {
-            format!(
-                "capture KernelContext for syscall {}: {e}",
-                raw.number.raw()
-            )
-        })?;
+        let nr = raw.number.raw();
+        if is_refused_single_process_timer_or_signal_syscall(nr) {
+            syscalls_dispatched += 1;
+            *refused_by_runner.entry(nr).or_default() += 1;
+            engine
+                .complete_syscall(carrick_abi::LINUX_ENOSYS.guest_retval())
+                .map_err(|e| format!("complete_syscall({nr} refused ENOSYS): {e}"))?;
+            continue;
+        }
+
+        let kernel_context = dispatcher
+            .capture_one_task_context()
+            .map_err(|e| format!("capture KernelContext for syscall {nr}: {e}"))?;
         let request = SyscallRequest::from_raw(raw);
         syscalls_dispatched += 1;
 
         let outcome = dispatcher
             .dispatch(&kernel_context, request, &mut *engine, &reporter)
-            .map_err(|e| format!("dispatch syscall {} failed: {e}", raw.number.raw()))?;
+            .map_err(|e| format!("dispatch syscall {nr} failed: {e}"))?;
 
         match outcome {
             DispatchOutcome::Returned { value } => {
@@ -782,53 +870,24 @@ where
                     .map_err(|e| format!("complete_syscall(MapHostAlias): {e}"))?;
             }
             DispatchOutcome::Exit { code } | DispatchOutcome::ThreadExit { code } => {
-                let vmas = dispatcher
-                    .vma_snapshot_source()
-                    .snapshot(Instant::now() + Duration::from_secs(1))
-                    .map_or_else(|_| Vec::new(), |snap| snap.vmas);
-                dispatcher.cleanup_sysv_ipc_on_process_exit();
-                let mut counted_enosys = sample_el1_counted_enosys(engine);
-                let report = reporter.finish();
-                for entry in report
-                    .unhandled_syscalls
-                    .iter()
-                    .chain(&report.deferred_syscalls)
-                {
-                    if let Some(existing) = counted_enosys
-                        .iter_mut()
-                        .find(|(n, _, _)| *n == entry.number)
-                    {
-                        existing.2 = existing.2.saturating_add(entry.count);
-                    } else {
-                        let name = lookup_aarch64(entry.number).map_or("unknown", |call| call.name);
-                        counted_enosys.push((entry.number, name, entry.count));
-                    }
-                }
-                counted_enosys.sort_by_key(|(nr, _, _)| *nr);
-                return Ok(SingleProcessSummary {
-                    exit_code: code,
-                    stdout: dispatcher.stdout(),
-                    stderr: dispatcher.stderr(),
+                return Ok(finish_single_process_summary(
+                    engine,
+                    dispatcher,
+                    reporter,
+                    &refused_by_runner,
+                    code,
                     syscalls_dispatched,
-                    counted_enosys,
-                    vmas,
-                });
+                ));
             }
             DispatchOutcome::SignalDeath { signum } => {
-                let vmas = dispatcher
-                    .vma_snapshot_source()
-                    .snapshot(Instant::now() + Duration::from_secs(1))
-                    .map_or_else(|_| Vec::new(), |snap| snap.vmas);
-                dispatcher.cleanup_sysv_ipc_on_process_exit();
-                let counted_enosys = sample_el1_counted_enosys(engine);
-                return Ok(SingleProcessSummary {
-                    exit_code: 128 + signum,
-                    stdout: dispatcher.stdout(),
-                    stderr: dispatcher.stderr(),
+                return Ok(finish_single_process_summary(
+                    engine,
+                    dispatcher,
+                    reporter,
+                    &refused_by_runner,
+                    128 + signum,
                     syscalls_dispatched,
-                    counted_enosys,
-                    vmas,
-                });
+                ));
             }
             other => {
                 return Err(format!(
@@ -842,4 +901,52 @@ where
     Err(format!(
         "single-process syscall budget ({max_syscalls}) exhausted after {syscalls_dispatched} dispatches"
     ))
+}
+
+fn finish_single_process_summary<X>(
+    engine: &SoftAarch64Engine<X>,
+    dispatcher: &mut SyscallDispatcher,
+    reporter: CompatReporter,
+    refused_by_runner: &std::collections::BTreeMap<u64, u64>,
+    exit_code: i32,
+    syscalls_dispatched: u64,
+) -> SingleProcessSummary
+where
+    X: ExecuteBlock + Send + 'static,
+    X::Error: core::fmt::Debug,
+{
+    let vmas = dispatcher
+        .vma_snapshot_source()
+        .snapshot(Instant::now() + Duration::from_secs(1))
+        .map_or_else(|_| Vec::new(), |snap| snap.vmas);
+    dispatcher.cleanup_sysv_ipc_on_process_exit();
+    let mut counted_enosys = sample_el1_counted_enosys(engine);
+    let mut merge_count = |nr: u64, count: u64| {
+        if let Some(existing) = counted_enosys.iter_mut().find(|(n, _, _)| *n == nr) {
+            existing.2 = existing.2.saturating_add(count);
+        } else {
+            let name = lookup_aarch64(nr).map_or("unknown", |call| call.name);
+            counted_enosys.push((nr, name, count));
+        }
+    };
+    let report = reporter.finish();
+    for entry in report
+        .unhandled_syscalls
+        .iter()
+        .chain(&report.deferred_syscalls)
+    {
+        merge_count(entry.number, entry.count);
+    }
+    for (&nr, &count) in refused_by_runner {
+        merge_count(nr, count);
+    }
+    counted_enosys.sort_by_key(|(nr, _, _)| *nr);
+    SingleProcessSummary {
+        exit_code,
+        stdout: dispatcher.stdout(),
+        stderr: dispatcher.stderr(),
+        syscalls_dispatched,
+        counted_enosys,
+        vmas,
+    }
 }
