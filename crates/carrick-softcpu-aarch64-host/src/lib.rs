@@ -18,9 +18,9 @@ pub use facade::{
 };
 pub use memory::SoftMemory;
 pub use runner::{
-    SoftProcessRun, SoftSingleProcessConfig, drive_single_process_engine, run_single_process,
-    run_single_process_with_executor, run_single_process_with_executor_and_setup,
-    sample_el1_counted_enosys,
+    SoftCarrierActiveError, SoftProcessRun, SoftSingleProcessConfig, drive_single_process_engine,
+    run_single_process, run_single_process_with_executor,
+    run_single_process_with_executor_and_setup, sample_el1_counted_enosys,
 };
 
 use carrick_softcpu_aarch64::dispatch::ExecuteBlock;

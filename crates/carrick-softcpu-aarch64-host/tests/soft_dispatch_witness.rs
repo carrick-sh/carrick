@@ -483,8 +483,17 @@ impl ExecuteBlock for ScriptedHvc2Executor {
     }
 }
 
+static SOFT_CARRIER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_soft_carrier_test() -> std::sync::MutexGuard<'static, ()> {
+    SOFT_CARRIER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
+    let _test_guard = lock_soft_carrier_test();
     let temp = tempfile::tempdir().expect("create witness rootfs tempdir");
     std::fs::write(temp.path().join("hello.txt"), FILE_PAYLOAD).expect("write rootfs /hello.txt");
 
@@ -816,6 +825,7 @@ impl ExecuteBlock for SequenceHvc2Executor {
 
 #[test]
 fn soft_single_process_refuses_timer_and_signal_syscalls_with_counted_enosys() {
+    let _test_guard = lock_soft_carrier_test();
     // Prepare a 1-second `itimerval` (`it_value.tv_sec = 1`) at `DATA_VA + 0x300`
     // so `setitimer` would arm a timer on a null bridge instead of failing validation.
     let mut itimerval = [0u8; 32];
@@ -877,4 +887,136 @@ fn soft_single_process_refuses_timer_and_signal_syscalls_with_counted_enosys() {
             (NR_RT_SIGACTION, "rt_sigaction", 1),
         ]
     );
+}
+
+#[test]
+fn soft_carrier_enforces_single_live_aperture_and_compare_clears() {
+    let _test_guard = lock_soft_carrier_test();
+
+    let elf = build_witness_elf(&[A64_SVC_0], &[]);
+    let make_exit_executor = || {
+        let mailbox = Arc::new(AtomicPtr::new(null_mut()));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let exec = SequenceHvc2Executor {
+            mailbox: Arc::clone(&mailbox),
+            calls: vec![(NR_EXIT_GROUP, [0; 6])],
+            returns,
+            next_seq: 1,
+        };
+        (mailbox, exec)
+    };
+    let install_stub_and_bind =
+        |engine: &mut carrick_softcpu_aarch64_host::SoftAarch64Engine<SequenceHvc2Executor>,
+         mailbox: &AtomicPtr<Aarch64SyscallMailbox>|
+         -> Result<(), String> {
+            let mut vec_stub = [0u8; 8];
+            vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+            vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+            engine
+                .backend()
+                .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+                .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+            let ptr = engine
+                .backend()
+                .host_ptr(
+                    LINUX_SYSCALL_MAILBOX_BASE,
+                    AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+                )
+                .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+            mailbox.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+            Ok(())
+        };
+
+    let entered_barrier = Arc::new(std::sync::Barrier::new(2));
+    let release_barrier = Arc::new(std::sync::Barrier::new(2));
+    let carrier1_ptr = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    std::thread::scope(|s| {
+        let entered_for_t2 = Arc::clone(&entered_barrier);
+        let release_for_t2 = Arc::clone(&release_barrier);
+        let ptr_for_t2 = Arc::clone(&carrier1_ptr);
+        let elf_for_t2 = &elf;
+
+        let t2 = s.spawn(move || {
+            struct ReleaseOnDrop(Arc<std::sync::Barrier>);
+            impl Drop for ReleaseOnDrop {
+                fn drop(&mut self) {
+                    self.0.wait();
+                }
+            }
+            entered_for_t2.wait();
+            let _release = ReleaseOnDrop(release_for_t2);
+            let live_ptr = ptr_for_t2.load(Ordering::Acquire);
+            assert_ne!(
+                live_ptr, 0,
+                "carrier 1 must have published its EL1 aperture"
+            );
+
+            // Concurrent second carrier on another thread must fail closed without
+            // overwriting or clearing carrier 1's live EL1 aperture.
+            let (mb2, exec2) = make_exit_executor();
+            let cfg2 = SoftSingleProcessConfig::new(elf_for_t2, "/concurrent-second");
+            let second_res = run_single_process_with_executor_and_setup(&cfg2, exec2, |engine| {
+                install_stub_and_bind(engine, &mb2)
+            });
+            let err = match second_res {
+                Err(err) => err,
+                Ok(run) => panic!(
+                    "second concurrent soft carrier must fail closed, but exited {}",
+                    run.exit_code
+                ),
+            };
+            assert!(
+                err.contains("already active"),
+                "unexpected concurrent soft-carrier refusal message: {err}"
+            );
+            assert_eq!(
+                carrick_el1_abi::get_el1_region_host_ptr(),
+                live_ptr,
+                "concurrent refusal must not clobber carrier 1's published EL1 aperture"
+            );
+
+            // A stale compare-and-clear with a mismatched address must leave carrier 1 intact.
+            assert!(!carrick_el1_abi::clear_el1_region_host_ptr_if(
+                live_ptr ^ 0x1000
+            ));
+            assert_eq!(carrick_el1_abi::get_el1_region_host_ptr(), live_ptr);
+        });
+
+        let (mb1, exec1) = make_exit_executor();
+        let cfg1 = SoftSingleProcessConfig::new(&elf, "/carrier-one");
+        let run1 = run_single_process_with_executor_and_setup(&cfg1, exec1, |engine| {
+            install_stub_and_bind(engine, &mb1)?;
+            let ptr = carrick_el1_abi::get_el1_region_host_ptr();
+            carrier1_ptr.store(ptr, Ordering::Release);
+            entered_barrier.wait();
+            release_barrier.wait();
+            assert_eq!(
+                carrick_el1_abi::get_el1_region_host_ptr(),
+                ptr,
+                "carrier 1's EL1 aperture must still be live before stepping"
+            );
+            Ok(())
+        })
+        .expect("carrier 1 should complete cleanly after concurrent refusal");
+        assert_eq!(run1.exit_code, 0);
+
+        t2.join().expect("concurrent witness thread");
+    });
+
+    assert_eq!(
+        carrick_el1_abi::get_el1_region_host_ptr(),
+        0,
+        "carrier 1 drop must compare-and-clear its own EL1 aperture"
+    );
+
+    // Sequential carrier after carrier 1 dropped must acquire the lease and succeed.
+    let (mb3, exec3) = make_exit_executor();
+    let cfg3 = SoftSingleProcessConfig::new(&elf, "/sequential-third");
+    let run3 = run_single_process_with_executor_and_setup(&cfg3, exec3, |engine| {
+        install_stub_and_bind(engine, &mb3)
+    })
+    .expect("sequential soft carrier after drop must succeed");
+    assert_eq!(run3.exit_code, 0);
+    assert_eq!(carrick_el1_abi::get_el1_region_host_ptr(), 0);
 }
