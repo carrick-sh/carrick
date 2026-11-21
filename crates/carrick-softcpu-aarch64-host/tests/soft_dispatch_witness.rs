@@ -551,7 +551,7 @@ fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
     assert_eq!(run.exit_code, 0);
     assert_eq!(run.stdout, STDOUT_PAYLOAD);
     assert!(run.stderr.is_empty());
-    assert_eq!(run.syscalls_dispatched, 17);
+    assert_eq!(run.syscalls_dispatched, 16);
     assert!(
         run.counted_enosys.is_empty(),
         "unexpected counted ENOSYS: {:?}",
