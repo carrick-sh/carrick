@@ -1181,6 +1181,8 @@ fn supply_user_fault(
             let Ok(owner) = native_process::portal() else {
                 return UserFaultSupply::Unresolved(9);
             };
+            #[cfg(feature = "test-support")]
+            crate::test_support::hold_editor_for_selected_serve(task);
             // SAFETY: the retained residency table and metadata allocator are
             // the CPL0 guest venue. The shared helper releases its editor and
             // descriptor claim before growing or returning NotNow.
