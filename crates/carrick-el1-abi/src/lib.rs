@@ -26,7 +26,9 @@
 
 pub use carrick_guest_arch::ContextGeneration;
 
-use carrick_core_abi::{ExclusiveSeq, OpenLifetime, SeqByteBuf, SeqLockAtomic, SeqWriteGuard};
+use carrick_core_abi::{
+    ExclusiveSeq, OpenLifetime, SeqAtomic, SeqByteBuf, SeqLockAtomic, SeqWriteGuard,
+};
 mod entry_binding_fatal;
 mod panic_report;
 mod stack_overflow;
@@ -3446,6 +3448,50 @@ impl RefusedCall {
     }
 }
 
+/// Publish one encoded refused call as the next logical record of `rows`.
+/// Generic over the word so the loom model drives this exact protocol.
+/// Returns the logical index the record was published under.
+fn publish_refused_call_row<A: SeqLockAtomic>(
+    rows: &[[A; REFUSED_CALL_WORDS]],
+    next: &A,
+    words: [u64; REFUSED_CALL_WORDS - 1],
+) -> Option<u64> {
+    let index = loop {
+        let current = next.load(Ordering::Relaxed);
+        let claimed = current.checked_add(1).filter(|n| *n < u64::MAX / 2)?;
+        if next
+            .compare_exchange(current, claimed, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break current;
+        }
+    };
+    let row = &rows[(index % rows.len() as u64) as usize];
+    row[0].store(index * 2 + 1, Ordering::Relaxed);
+    A::release_fence();
+    for (target, value) in row[1..].iter().zip(words) {
+        target.store(value, Ordering::Relaxed);
+    }
+    row[0].store(index * 2 + 2, Ordering::Release);
+    Some(index)
+}
+
+/// Logical record `index` of `rows`, or `None` when its row is being written
+/// or already holds a later record.
+fn read_refused_call_row<A: SeqAtomic>(
+    rows: &[[A; REFUSED_CALL_WORDS]],
+    index: u64,
+) -> Option<[u64; REFUSED_CALL_WORDS - 1]> {
+    let row = &rows[(index % rows.len() as u64) as usize];
+    let complete = index * 2 + 2;
+    if row[0].load(Ordering::Acquire) != complete {
+        return None;
+    }
+    let words = core::array::from_fn(|i| row[i + 1].load(Ordering::Relaxed));
+    A::acquire_fence();
+    (row[0].load(Ordering::Relaxed) == complete).then_some(words)
+}
+
 impl Counters {
     pub const fn new() -> Self {
         Self {
@@ -3878,21 +3924,7 @@ impl Counters {
     /// Refusals are a slow path; keep the record out of callers' frames.
     #[inline(never)]
     fn publish_refused_call(&self, call: &RefusedCall) {
-        let Ok(index) =
-            self.refused_call_next
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    n.checked_add(1).filter(|next| *next < u64::MAX / 2)
-                })
-        else {
-            return;
-        };
-        let row = &self.refused_calls[(index % REFUSED_CALL_RECORDS as u64) as usize];
-        row[0].store(index * 2 + 1, Ordering::Relaxed);
-        core::sync::atomic::fence(Ordering::Release);
-        for (target, value) in row[1..].iter().zip(call.encode()) {
-            target.store(value, Ordering::Relaxed);
-        }
-        row[0].store(index * 2 + 2, Ordering::Release);
+        publish_refused_call_row(&self.refused_calls, &self.refused_call_next, call.encode());
     }
 
     /// The retained refused calls, oldest first. A record being written or
@@ -3900,14 +3932,7 @@ impl Counters {
     pub fn refused_calls(&self) -> impl Iterator<Item = RefusedCall> + '_ {
         let next = self.refused_call_next.load(Ordering::Acquire);
         (next.saturating_sub(REFUSED_CALL_RECORDS as u64)..next).filter_map(move |index| {
-            let row = &self.refused_calls[(index % REFUSED_CALL_RECORDS as u64) as usize];
-            let complete = index * 2 + 2;
-            if row[0].load(Ordering::Acquire) != complete {
-                return None;
-            }
-            let words = core::array::from_fn(|i| row[i + 1].load(Ordering::Relaxed));
-            core::sync::atomic::fence(Ordering::Acquire);
-            (row[0].load(Ordering::Relaxed) == complete).then(|| RefusedCall::decode(words))
+            read_refused_call_row(&self.refused_calls, index).map(RefusedCall::decode)
         })
     }
 
