@@ -1593,6 +1593,10 @@ enum ResidencyPlan {
     /// `svc; br x3` into a private file mapping holding `svc #2; b .-4`:
     /// run that loop twice, then `munmap` it under its resident blocks.
     Unmap,
+    /// `svc; br x3` into a private file mapping of `/patch` page 0
+    /// (`svc #2; br x3`): run it twice, `munmap` it, then map page 1
+    /// (`svc #3; br x3`) at the same address, which reuses its frame.
+    Reuse,
 }
 
 /// Drives the production carrier with real decode and dispatch. Each
@@ -1656,6 +1660,46 @@ impl ResidencyExecutor {
                 }
                 _ => return Err(format!("the entry svc ran again at visit {visit}")),
             },
+            ResidencyPlan::Reuse => {
+                let mapped = self.mapped.load(Ordering::Relaxed);
+                match visit {
+                    1 => (
+                        NR_OPENAT,
+                        [AT_FDCWD, DATA_VA + PATCH_PATH_OFFSET, O_CLOEXEC, 0, 0, 0],
+                    ),
+                    2 => {
+                        let fd = rx(cpu, 0);
+                        if (fd as i64) < 3 {
+                            return Err(format!("openat(/patch) failed: {}", fd as i64));
+                        }
+                        self.fd = fd;
+                        (
+                            NR_MMAP,
+                            [
+                                0,
+                                GUEST_PAGE_BYTES,
+                                PROT_READ | PROT_EXEC,
+                                MAP_PRIVATE,
+                                fd,
+                                0,
+                            ],
+                        )
+                    }
+                    3 => (NR_MUNMAP, [mapped, GUEST_PAGE_BYTES, 0, 0, 0, 0]),
+                    4 => (
+                        NR_MMAP,
+                        [
+                            mapped,
+                            GUEST_PAGE_BYTES,
+                            PROT_READ | PROT_EXEC,
+                            MAP_PRIVATE | MAP_FIXED,
+                            self.fd,
+                            GUEST_PAGE_BYTES,
+                        ],
+                    ),
+                    _ => return Err(format!("the entry svc ran again at visit {visit}")),
+                }
+            }
             ResidencyPlan::Rewrite(retire) => match visit {
                 1 => (NR_GETPID, [0; 6]),
                 2 => (
@@ -1710,6 +1754,52 @@ impl ResidencyExecutor {
         Ok(())
     }
 
+    /// User blocks of the `Reuse` plan outside the entry `svc`.
+    fn reuse(
+        &mut self,
+        cpu: &mut CpuState,
+        block: &TranslatedBlock,
+        mapped: u64,
+    ) -> Result<(), String> {
+        match cpu.pc.0 {
+            pc if pc == CODE_VA + 4 => match self.svc_visits {
+                // After `openat`, branch back to the `svc` for the `mmap`.
+                1 => wx(cpu, 3, CODE_VA),
+                2 => {
+                    let va = rx(cpu, 0);
+                    if (va as i64) < 0 || va % GUEST_PAGE_BYTES != 0 {
+                        return Err(format!("mmap(/patch) returned {}", va as i64));
+                    }
+                    self.mapped.store(va, Ordering::Relaxed);
+                    wx(cpu, 3, va);
+                }
+                3 if rx(cpu, 0) == 0 => wx(cpu, 3, CODE_VA),
+                3 => return Err(format!("munmap returned {}", rx(cpu, 0) as i64)),
+                4 if rx(cpu, 0) == mapped => wx(cpu, 3, mapped),
+                4 => return Err(format!("mmap(MAP_FIXED) returned {}", rx(cpu, 0) as i64)),
+                visit => return Err(format!("unexpected entry visit {visit}")),
+            },
+            pc if pc == mapped => {
+                self.record(block)?;
+                self.mapped_visits += 1;
+                let (nr, args) = match self.mapped_visits {
+                    1 | 2 => (NR_GETPID, [0; 6]),
+                    // The remapped page: whatever this block serves, stop.
+                    3 => (NR_EXIT_GROUP, [7, 0, 0, 0, 0, 0]),
+                    visit => return Err(format!("mapped svc ran again at visit {visit}")),
+                };
+                ScriptedHvc2Executor::set_call(cpu, nr, args);
+            }
+            pc if pc == mapped + 4 => match self.mapped_visits {
+                1 => wx(cpu, 3, mapped),
+                2 => wx(cpu, 3, CODE_VA),
+                visit => return Err(format!("mapped br x3 ran at visit {visit}")),
+            },
+            pc => return Err(format!("unexpected user PC {pc:#x}")),
+        }
+        Ok(())
+    }
+
     fn store(&self, cpu: &mut CpuState) {
         // After the second `svc` (the RWX mprotect), overwrite the `svc`
         // word with `svc #1` and keep this store; otherwise write scratch.
@@ -1744,6 +1834,17 @@ impl ExecuteBlock for ResidencyExecutor {
             return self.bridge.execute(block, code, cpu);
         }
         let mapped = self.mapped.load(Ordering::Relaxed);
+        if matches!(self.plan, ResidencyPlan::Reuse) && cpu.pc.0 != CODE_VA {
+            self.reuse(cpu, block, mapped)?;
+            return match block.terminator() {
+                Terminator::Handler(idx) | Terminator::Jump(idx) | Terminator::Fallthrough(idx) => {
+                    Ok(idx)
+                }
+                Terminator::Conditional { .. } => {
+                    Err("unexpected conditional terminator".to_owned())
+                }
+            };
+        }
         if matches!(self.plan, ResidencyPlan::Unmap) && cpu.pc.0 != CODE_VA {
             match cpu.pc.0 {
                 // After `openat`, branch back to the `svc` for the `mmap`.
@@ -1828,7 +1929,7 @@ fn run_residency(
     let code_words: &[u32] = match plan {
         ResidencyPlan::Loop { .. } => &[A64_SVC_0, A64_B_BACK_1],
         ResidencyPlan::Rewrite(_) => &[A64_SVC_0, A64_STR_X2_X1, A64_B_BACK_2],
-        ResidencyPlan::Unmap => &[A64_SVC_0, A64_BR_X3],
+        ResidencyPlan::Unmap | ResidencyPlan::Reuse => &[A64_SVC_0, A64_BR_X3],
     };
     let elf = build_witness_elf(code_words, &[(PATCH_PATH_OFFSET as usize, b"/patch\0")]);
     let mailbox = Arc::new(AtomicPtr::new(null_mut()));
@@ -2005,5 +2106,75 @@ fn soft_carrier_faults_after_munmap_of_resident_code() {
     assert_eq!(
         (fault.signum, fault.fault_addr, fault.elr),
         (11, mapped + 4, mapped + 4)
+    );
+}
+
+/// `/patch` for the frame-reuse witness: page 0 holds `svc #2; br x3`,
+/// page 1 holds `svc #3; br x3`.
+fn reuse_rootfs() -> std::io::Result<tempfile::TempDir> {
+    let temp = tempfile::tempdir()?;
+    let page = GUEST_PAGE_BYTES as usize;
+    let mut patch = vec![0; 2 * page];
+    patch[..4].copy_from_slice(&A64_SVC_2.to_le_bytes());
+    patch[4..8].copy_from_slice(&A64_BR_X3.to_le_bytes());
+    patch[page..page + 4].copy_from_slice(&A64_SVC_3.to_le_bytes());
+    patch[page + 4..page + 8].copy_from_slice(&A64_BR_X3.to_le_bytes());
+    std::fs::write(temp.path().join("patch"), &patch)?;
+    Ok(temp)
+}
+
+#[test]
+fn soft_carrier_serves_new_code_in_a_reused_frame() {
+    let _test_guard = lock_soft_carrier_test();
+    let rootfs = reuse_rootfs().expect("create the /patch rootfs");
+    let ResidencyRun { run, served, .. } = run_residency(ResidencyPlan::Reuse, Some(rootfs.path()))
+        .expect("residency witness must finish through the production carrier");
+    // `svc #2` ran twice from page 0, so it is resident. The same address
+    // then maps page 1 into the same frame; the fetch must serve `svc #3`.
+    assert_eq!(
+        served,
+        [
+            A64_SVC_0, A64_SVC_0, A64_SVC_2, A64_SVC_2, A64_SVC_0, A64_SVC_0, A64_SVC_3
+        ]
+    );
+    assert_eq!(run.terminating_fault, None);
+    assert_eq!(run.exit_code, 7);
+}
+
+/// Raw backing writers (`repoint_private` seeds an overlay frame through a
+/// host pointer) do not pass `write_gpa_bytes`; the new code becomes
+/// executable only through `publish_user_executable`, which must retire the
+/// frame's resident incarnation.
+#[test]
+fn soft_carrier_publish_retires_a_reused_frames_resident_code() {
+    let _test_guard = lock_soft_carrier_test();
+    let rootfs = reuse_rootfs().expect("create the /patch rootfs");
+    let ResidencyRun { run, mapped, .. } = run_residency(ResidencyPlan::Reuse, Some(rootfs.path()))
+        .expect("residency witness must finish through the production carrier");
+    assert_eq!(run.exit_code, 7);
+    let vmm = run.engine.backend();
+    let frame = run
+        .engine
+        .page_tables()
+        .with_manager(|manager| manager.translate(mapped))
+        .flatten()
+        .expect("the remapped page still translates after exit");
+    let frame = FrameGpa::new(frame & !(GUEST_PAGE_BYTES - 1));
+    let resident = vmm
+        .code_generation(frame)
+        .expect("borrow soft stage-2")
+        .expect("the remapped `svc #3` frame is a live code page");
+    let host = GuestVmBackend::host_ptr(vmm, frame.raw(), GUEST_PAGE_BYTES as usize)
+        .expect("host backing for the code frame");
+    // SAFETY: the carrier has exited; `host` covers one live 4 KiB frame.
+    unsafe {
+        host.cast::<u32>().write_unaligned(A64_SVC_1);
+    }
+    carrick_aarch64::Aarch64Vmm::publish_user_executable(vmm, frame.raw(), GUEST_PAGE_BYTES)
+        .expect("publish the rewritten frame");
+    assert_ne!(
+        vmm.code_generation(frame).expect("borrow soft stage-2"),
+        Some(resident),
+        "publish_user_executable kept the resident incarnation of a rewritten frame"
     );
 }

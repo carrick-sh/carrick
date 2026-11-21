@@ -24,6 +24,8 @@ vm_free = [
   "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_carrier_serves_rewritten_code_and_faults_after_prot_none",
   "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_carrier_serves_rewritten_code_and_the_remapped_page",
   "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_carrier_faults_after_munmap_of_resident_code",
+  "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_carrier_serves_new_code_in_a_reused_frame",
+  "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_carrier_publish_retires_a_reused_frames_resident_code",
 ]
 [bindings.unresolved]
 embed_structural = "The soft AArch64 carrier runs in carrick-softcpu-aarch64-host test binaries; CLI carrier wiring lands in a later #1236 slice."
