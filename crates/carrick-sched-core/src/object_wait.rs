@@ -1543,7 +1543,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
     /// what it resumes with. Unlike every other park, the record's wait is
     /// already over: its operation token, completion flags, deadline,
     /// handback and result stay exactly as its switch-in found them, and a
-    /// wake only queues it again ([`ZoneTables::mark_woken`]), so its next
+    /// wake only queues it again (`ZoneTables::mark_woken`), so its next
     /// switch-in sees the same resume. A host claim treats it as the woken
     /// thread it is (`settle_claimed_handback`), never as an interrupted wait.
     ///
