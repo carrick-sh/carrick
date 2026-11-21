@@ -3226,6 +3226,98 @@ fn settlement_exclusion_reclaims_all_64_slots_held_by_exited_fork_children() {
     assert_eq!(stock.counters().returned_children, 8);
 }
 
+/// #2142: the x86 run root's exec takes its boot-built predecessor through
+/// the root form with the successor's built tables, which become the
+/// successor's committed tables; the root form refuses a predecessor the
+/// stock already holds, which leaves like a child's: the root's second exec
+/// returns the first successor's tables.
+#[test]
+fn a_root_exec_with_built_tables_moves_into_the_stock_and_execs_again_as_a_child() {
+    let mut stock = stock(UntaggedRoots, 12, 0);
+    let predecessor_mm = mm(PARENT_MM);
+    let predecessor = execution(1, 0, PARENT_MM, 0x80_0000);
+    let reserved = stock.reserve_successor_tables(3).unwrap();
+    let pages = reserved.pages().to_vec();
+    let used = stock.take_built_successor_tables(reserved, 2).unwrap();
+    let first_mm = mm(303);
+    let admitted = |mm| {
+        // SAFETY: this fixture owns the closed successor incarnations.
+        unsafe { El1MmHandle::from_admitted_owner(CARRIER, mm, NonZeroU64::MIN) }
+    };
+    let receipt = stock
+        .replace_for_exec_with_tables(
+            ExecPredecessorForm::Root,
+            predecessor,
+            admitted(first_mm),
+            pages[0],
+            (),
+            used.clone(),
+        )
+        .unwrap();
+    assert_eq!(stock.child_owner(first_mm), Some(admitted(first_mm)));
+    assert_eq!(stock.child_lifecycle(first_mm), None);
+    let cleared = RefCell::new(Vec::new());
+    stock
+        .settle_exec_predecessor(
+            &mut NoTableLedger,
+            receipt,
+            absent(predecessor_mm).unwrap(),
+            |tables| {
+                cleared.borrow_mut().extend_from_slice(tables);
+                true
+            },
+            |_, _| false,
+        )
+        .unwrap();
+    assert!(
+        cleared.borrow().is_empty(),
+        "the boot-built root left no stock tables"
+    );
+
+    let first = execution(1, 0, 303, pages[0].address().raw());
+    let second_mm = mm(304);
+    assert!(
+        stock
+            .replace_for_exec_with_tables(
+                ExecPredecessorForm::Root,
+                first,
+                admitted(second_mm),
+                page(0xa0_0000),
+                (),
+                Vec::new(),
+            )
+            .is_err(),
+        "a predecessor the stock holds is no boot-built root"
+    );
+    let receipt = stock
+        .replace_for_exec_with_tables(
+            ExecPredecessorForm::Child,
+            first,
+            admitted(second_mm),
+            page(0xa0_0000),
+            (),
+            Vec::new(),
+        )
+        .unwrap();
+    stock
+        .settle_exec_predecessor(
+            &mut NoTableLedger,
+            receipt,
+            absent(first_mm).unwrap(),
+            |tables| {
+                cleared.borrow_mut().extend_from_slice(tables);
+                true
+            },
+            |_, _| true,
+        )
+        .unwrap();
+    assert_eq!(
+        *cleared.borrow(),
+        used,
+        "the first successor's built tables return at the second exec"
+    );
+}
+
 /// #2235: an x86 exec successor's tables come from this stock. Adoption
 /// keeps the pages its build linked as the successor's committed tables,
 /// returns the untouched rest at once, and the successor's reclaim returns

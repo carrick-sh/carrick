@@ -826,9 +826,10 @@ enum ExecPredecessorPhysical<C> {
     Child(C),
 }
 
-/// Which task an exec replaces: a fork child, whose lifecycle and control
-/// rows move to the successor, or the carrier root, which has none and whose
-/// boot-built MM leaves no stock tables behind.
+/// Which MM an exec replaces: one this stock holds (a fork child's, or a
+/// run root's earlier exec successor), whose lifecycle and control rows and
+/// tables move with it, or the carrier root's boot-built MM, which has none
+/// and leaves no stock tables behind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecPredecessorForm {
     Child,

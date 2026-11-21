@@ -571,6 +571,36 @@ impl FileTable {
         }
     }
 
+    /// Hand this table's published IPC namespace to `successor`, the table
+    /// an exec staged from it, unchanged: the same shared table under the
+    /// same map key. A ring that allocates the caller's descriptors in that
+    /// namespace (the x86 run root's, #2142) then keeps them across the
+    /// Kernel's table replacement, and closes its close-on-exec ones itself.
+    /// The successor must have no namespace yet; this table publishes none
+    /// afterwards.
+    pub fn hand_ipc_to_exec_successor(&self, successor: &FileTable) -> Result<(), AdmissionError> {
+        if core::ptr::eq(self, successor) {
+            return Err(fd::Error::StaleTable.into());
+        }
+        // The successor is the exec's unpublished staged table: nothing else
+        // holds its IPC mutex, so taking it second cannot invert an order.
+        let mut ours = self.ipc.lock();
+        let mut theirs = successor.ipc.lock();
+        if theirs.is_some() {
+            return Err(fd::Error::StaleTable.into());
+        }
+        match ours.replace(Err(fd::Error::StaleTable.into())) {
+            Some(Ok(binding)) => {
+                *theirs = Some(Ok(binding));
+                Ok(())
+            }
+            previous => {
+                *ours = previous;
+                Err(fd::Error::StaleTable.into())
+            }
+        }
+    }
+
     pub(super) fn retire_ipc(&self) {
         let old = self.ipc.lock().replace(Err(fd::Error::StaleTable.into()));
         drop(old);
@@ -899,6 +929,63 @@ mod tests {
         assert_eq!(
             authority.get(child_id, fd::Fd(3)),
             Err(fd::Error::StaleTable)
+        );
+    }
+
+    /// #2142: the x86 run root's ring allocates its descriptors in the
+    /// namespace published for its Kernel table. An exec hands that exact
+    /// namespace (same shared table, same map key) to the successor's staged
+    /// table before the commit retires the predecessor's, so the ring keeps
+    /// its descriptors, and neither table publishes a second namespace.
+    #[test]
+    fn serial_host_el1_ipc_exec_hands_the_namespace_to_the_successor() {
+        let owner = Arc::new(HostIpc::new(1 << 16).unwrap());
+        let map = map();
+        let (kernel, context) = crate::kernel::Kernel::bootstrap_root(
+            crate::kernel::RootBootstrap::for_reference_model(
+                9130,
+                carrick_hal::ThreadId::synthetic_for_tests(9130),
+                "ipc root exec".into(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let parent = context.resources().files();
+        parent.publish_ipc(Arc::clone(&owner), map).unwrap();
+        let shared = map.lookup(parent.id().raw()).unwrap();
+        let prepared = kernel.prepare_exec(&context, None).unwrap();
+        let successor = prepared.replacement_file_table();
+        assert!(
+            successor
+                .hand_ipc_to_exec_successor(&prepared.old_file_table())
+                .is_err(),
+            "an unpublished table has no namespace to hand"
+        );
+        parent.hand_ipc_to_exec_successor(&successor).unwrap();
+        assert!(
+            parent.hand_ipc_to_exec_successor(&successor).is_err(),
+            "a namespace is handed once"
+        );
+        assert!(parent.publish_ipc(Arc::clone(&owner), map).is_err());
+        drop(parent);
+        let committed = kernel.commit_exec(prepared, None).unwrap();
+        let files = committed.resources().files();
+        assert!(Arc::ptr_eq(&files, &successor));
+        assert_eq!(
+            map.lookup(context.resources().files().id().raw()),
+            Some(shared),
+            "the predecessor's retirement withdraws nothing"
+        );
+        // Republishing to the same owner is the handed namespace, never a
+        // second one under the successor's own key.
+        files.publish_ipc(Arc::clone(&owner), map).unwrap();
+        assert_eq!(map.lookup(files.id().raw()), None);
+        let region = owner.region();
+        let authority = region.fd(crate::el1_zone::HostLockWait);
+        assert!(
+            authority
+                .get(fd::TableId::from_raw(shared), fd::Fd(1))
+                .is_ok()
         );
     }
 
