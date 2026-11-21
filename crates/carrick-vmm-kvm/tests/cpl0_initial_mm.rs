@@ -204,7 +204,7 @@ fn serial_host_native_child_madvise_dontneed_stays_in_ring() {
     assert_eq!(
         outcome.run.exit_code,
         0,
-        "38=madvise refused, 60..69 and 71..73=fixture stage; madvise served={}, refused={}, anonymous leaves={:?}",
+        "38=madvise refused, 60..69 and 71..75=fixture stage; madvise served={}, refused={}, anonymous leaves={:?}",
         load(&counters.served[233]),
         load(&counters.refused[28]),
         counters.anonymous_leaves.each_ref().map(load),
@@ -214,6 +214,7 @@ fn serial_host_native_child_madvise_dontneed_stays_in_ring() {
         0,
         "x86 native madvise must not be refused"
     );
+    assert_eq!(load(&counters.served[233]), 7, "all advice calls ran in ring");
 }
 
 // Production child entropy service, including CPL0 entry and host completion.
