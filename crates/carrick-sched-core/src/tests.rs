@@ -112,7 +112,11 @@ fn parked_census_names_wait_key_resume_owner_and_saved_pc() {
         .unwrap();
     // SAFETY: exclusively owned unpublished record, before park publication.
     unsafe {
-        zone.record(record).ctx_mut().pc = 0x401000;
+        let ctx = zone.record(record).ctx_mut();
+        ctx.pc = 0x401000;
+        ctx.x[8] = 98;
+        ctx.x[0] = address;
+        ctx.x[1] = 0x80;
         zone.record(record)
             .publish_owner_continuation(object_wait::OwnerEntry::Syscall);
     }
@@ -133,6 +137,29 @@ fn parked_census_names_wait_key_resume_owner_and_saved_pc() {
     assert!(
         census.contains("lifecycle_page=0x0 control_slot=0x0"),
         "{census}"
+    );
+    // #2646: the saved syscall number and arguments, the wait queue it is
+    // linked on, and the slot maps are part of the same census.
+    assert!(
+        census.contains("saved_nr=98 saved_args=[\n    0x7000,\n    0x80,"),
+        "{census}"
+    );
+    let bucket = ZoneTables::bucket_of(MM, address);
+    let line = census
+        .lines()
+        .find(|line| line.starts_with(&std::format!("zone futex bucket {bucket}: head=")))
+        .unwrap_or_else(|| panic!("{census}"));
+    assert!(line.ends_with(" len=1 locked=false"), "{line}");
+    assert!(
+        census.contains("zone maps: idle_slots=[] queued_slots=[] held_records=[]"),
+        "{census}"
+    );
+    zone.enter_idle(SLOT, false);
+    let mut idle = std::string::String::new();
+    zone.write_census(&mut idle).unwrap();
+    assert!(
+        idle.contains("zone maps: idle_slots=[3] queued_slots=[]"),
+        "{idle}"
     );
     assert_eq!(zone.record(record).claim(), Claim::Parked { seq: 1 });
     assert_eq!(zone.record(record).entry_count(), 1);

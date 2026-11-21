@@ -1120,6 +1120,27 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         refusals: bool,
     },
+    /// Print one carrier's in-guest scheduler zone: slots with their run
+    /// queues, the idle and queued slot maps, futex buckets and object wait
+    /// queues (head, tail, epoch), every record in use (claim, tid, mm, and
+    /// a parked record's saved syscall number and arguments), and each
+    /// slot's current task and service notice. Use it on a hang.
+    Zonedump {
+        /// A live carrier: its exact `CARRICK_RUN_ID`. Read through the
+        /// run's debug endpoint without stopping it (ARM HVF and x86 KVM).
+        #[arg(long, conflicts_with_all = ["post_mortem", "region"], required_unless_present_any = ["post_mortem", "region"])]
+        run_id: Option<String>,
+        /// A `post-mortem.json` from `carrick debug capture`, `abort` or a
+        /// deadline capture.
+        #[arg(long, conflicts_with = "region")]
+        post_mortem: Option<PathBuf>,
+        /// A raw ARM EL1 region image from its first byte (a cored or
+        /// stopped carrier: lldb `memory read --force --binary` from
+        /// `carrick_el1_abi::EL1_REGION_HOST_PTR` for `EL1_REGION_SIZE`
+        /// bytes), decoded through the `carrick-el1-abi` layout.
+        #[arg(long)]
+        region: Option<PathBuf>,
+    },
     /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
     /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.
     ExecStampCensus {

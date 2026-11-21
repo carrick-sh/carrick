@@ -110,7 +110,7 @@ pub use process::{
     X86ThreadPointerRegister,
 };
 pub use x86_context::{
-    ParkedContextWords, X86_XSAVE_BYTES, signal_return_flags, valid_user_return_words,
+    ParkedContextWords, X86_XSAVE_BYTES, X86ParkedGpr, signal_return_flags, valid_user_return_words,
 };
 
 /// Syscall registers normalized by the ISA-specific saved-context accessor.
@@ -6394,8 +6394,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     /// A census of every live slot and every record in use, for a
-    /// wedge post-mortem (a watchdog, a debug endpoint): what each vCPU slot
-    /// runs and queues, and who owns each parked thread. Values may be torn
+    /// wedge post-mortem (a watchdog, a debug endpoint, `carrick debug
+    /// zonedump`): what each vCPU slot runs and queues, the idle and queued
+    /// slot maps, every nonempty futex bucket and object wait queue (head,
+    /// tail, epoch), and who owns each parked thread with its saved syscall
+    /// number and arguments. Values may be torn
     /// across fields. Parked context observations use a bounded bucket lock;
     /// unavailable observations are explicit, never guessed from live memory.
     pub fn write_census(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result
@@ -6418,7 +6421,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             }
             writeln!(
                 out,
-                "zone slot {index}: state={:?} driver={} away={} mm={} installed={} cpu+1={} current={} host_record={} len={} queue={:?} resched={} timer_cval={}",
+                "zone slot {index}: state={:?} driver={} away={} mm={} installed={} cpu+1={} current={} host_record={} len={} head={} tail={} queue={:?} resched={} timer_cval={}",
                 s.state(),
                 drive & !SLOT_AWAY,
                 drive & SLOT_AWAY != 0,
@@ -6429,9 +6432,31 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 s.current.load(Ordering::Relaxed),
                 s.host_record.load(Ordering::Relaxed),
                 s.len.load(Ordering::Relaxed),
+                s.head.load(Ordering::Relaxed),
+                s.tail.load(Ordering::Relaxed),
                 &queue[..shown],
                 s.resched_owed.load(Ordering::Relaxed),
                 s.timer_cval(),
+            )?;
+        }
+        write!(out, "zone maps: idle_slots=[")?;
+        write_set_bits(out, &self.idle_map)?;
+        write!(out, "] queued_slots=[")?;
+        write_set_bits(out, &self.queued_map)?;
+        write!(out, "] held_records=[")?;
+        write_set_bits(out, &self.held_map)?;
+        writeln!(out, "]")?;
+        for (index, bucket) in self.buckets.iter().enumerate() {
+            let len = bucket.len.load(Ordering::Relaxed);
+            let head = bucket.head.load(Ordering::Relaxed);
+            if len == 0 && head == NIL {
+                continue;
+            }
+            writeln!(
+                out,
+                "zone futex bucket {index}: head={head} tail={} len={len} locked={}",
+                bucket.tail.load(Ordering::Relaxed),
+                bucket.lock.load(Ordering::Relaxed) != 0,
             )?;
         }
         let c = &self.counters;
@@ -6513,14 +6538,25 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             )?;
             if matches!(claim, Claim::Parked { .. }) {
                 match self.parked_futex_snapshot(reference) {
-                    Some(wait) => writeln!(
-                        out,
-                        "zone record {index} parked: first_wait_mm={} first_wait_address={:#x} resume={:?} saved_pc={:#x}",
-                        wait.mm,
-                        wait.scheduler_address,
-                        record.resume_disposition(),
-                        wait.registers.pc
-                    )?,
+                    Some(wait) => {
+                        let ParkedFutexSnapshot {
+                            mm,
+                            scheduler_address: address,
+                            registers:
+                                SavedSyscallRegisters {
+                                    number: nr,
+                                    args,
+                                    pc,
+                                    ..
+                                },
+                            ..
+                        } = wait;
+                        writeln!(
+                            out,
+                            "zone record {index} parked: first_wait_mm={mm} first_wait_address={address:#x} resume={:?} saved_pc={pc:#x} saved_nr={nr} saved_args={args:#x?}",
+                            record.resume_disposition(),
+                        )?
+                    }
                     None => writeln!(
                         out,
                         "zone record {index} parked: wait_key_and_pc=unavailable-busy-or-changed-or-unlinked"
@@ -6565,6 +6601,24 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
         Ok(())
     }
+}
+
+/// The indices of the set bits of a hint bitmap, comma separated.
+fn write_set_bits(out: &mut impl core::fmt::Write, words: &[AtomicU64]) -> core::fmt::Result {
+    let mut first = true;
+    for (word_index, word) in words.iter().enumerate() {
+        let mut bits = word.load(Ordering::Relaxed);
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            if !first {
+                write!(out, ",")?;
+            }
+            first = false;
+            write!(out, "{}", word_index * 64 + bit)?;
+        }
+    }
+    Ok(())
 }
 
 /// Slot-lock spins EL1 allows itself before it gives up on another slot.

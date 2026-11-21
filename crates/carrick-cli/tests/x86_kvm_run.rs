@@ -2248,6 +2248,19 @@ fn run_mounted_binary_in_archive(
         ])
         .arg(&capture_dir)
         .output();
+    // #2646: the same live endpoint serves the zone dump; keep it beside the
+    // capture for the deadline witness.
+    let zonedump = Command::new(&cli)
+        .timeout(Duration::from_secs(4))
+        .args(["debug", "zonedump", "--run-id", &scoped_run_id])
+        .output()
+        .expect("run live KVM zonedump");
+    std::fs::write(capture_dir.join("zonedump.txt"), &zonedump.stdout).expect("keep live zonedump");
+    assert!(
+        zonedump.status.success(),
+        "live zonedump failed: {}",
+        String::from_utf8_lossy(&zonedump.stderr)
+    );
     let endpoint = carrick_kernel::kernel::debug::DebugEndpoint::for_run_id(&scoped_run_id)
         .expect("resolve KVM carrier endpoint");
     let stack_result = endpoint
@@ -2323,7 +2336,30 @@ mod serial_host {
                 .as_array()
                 .is_some_and(|rows| !rows.is_empty())
         );
-        assert!(capture["physical"]["zone_census"].as_str().is_some());
+        let zone_census = capture["physical"]["zone_census"].as_str().unwrap();
+        // #2646: the census names the slot maps and each vCPU's current task.
+        assert!(
+            zone_census.contains("zone maps: idle_slots=["),
+            "{zone_census}"
+        );
+        assert!(
+            zone_census.contains("el1 task slot ") && zone_census.contains(" service_notice="),
+            "{zone_census}"
+        );
+        let live = std::fs::read_to_string(capture_path.with_file_name("zonedump.txt")).unwrap();
+        assert!(live.starts_with("run: "), "{live}");
+        assert!(live.contains("zone maps: idle_slots=["), "{live}");
+        assert!(live.contains("el1 task slot "), "{live}");
+        let cli = assert_cmd::cargo::cargo_bin("carrick");
+        let replay = Command::new(&cli)
+            .timeout(Duration::from_secs(5))
+            .args(["debug", "zonedump", "--post-mortem"])
+            .arg(&capture_path)
+            .output()
+            .expect("zonedump a written post-mortem");
+        assert!(replay.status.success());
+        let replay = String::from_utf8(replay.stdout).unwrap();
+        assert!(replay.contains(zone_census), "{replay}");
         assert!(
             capture["physical"]["vcpus"]
                 .as_array()

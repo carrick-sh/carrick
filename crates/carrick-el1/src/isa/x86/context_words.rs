@@ -80,26 +80,27 @@ pub fn syscall_frame_from_native(
     if context.address != expected || !context.frame.valid_user_return() {
         return Err(ArchError::InvalidContext);
     }
-    let gpr = &context.frame.gpr;
+    use carrick_sched_core::X86ParkedGpr as Gpr;
+    let gpr = |register: Gpr| context.frame.gpr[register as usize];
     Ok(native::NativeFrame {
-        r15: gpr[0],
-        r14: gpr[1],
-        r13: gpr[2],
-        r12: gpr[3],
-        rbp: gpr[4],
-        rbx: gpr[5],
-        r9: gpr[8],
-        r8: gpr[9],
-        r10: gpr[7],
-        rdx: gpr[12],
-        rsi: gpr[13],
-        rdi: gpr[14],
-        rax: gpr[10],
+        r15: gpr(Gpr::R15),
+        r14: gpr(Gpr::R14),
+        r13: gpr(Gpr::R13),
+        r12: gpr(Gpr::R12),
+        rbp: gpr(Gpr::Rbp),
+        rbx: gpr(Gpr::Rbx),
+        r9: gpr(Gpr::R9),
+        r8: gpr(Gpr::R8),
+        r10: gpr(Gpr::R10),
+        rdx: gpr(Gpr::Rdx),
+        rsi: gpr(Gpr::Rsi),
+        rdi: gpr(Gpr::Rdi),
+        rax: gpr(Gpr::Rax),
         rcx: context.frame.rip,
         r11: context.frame.flags,
         rsp: context.frame.rsp,
-        user_rcx: gpr[11],
-        user_r11: gpr[6],
+        user_rcx: gpr(Gpr::Rcx),
+        user_r11: gpr(Gpr::R11),
     })
 }
 

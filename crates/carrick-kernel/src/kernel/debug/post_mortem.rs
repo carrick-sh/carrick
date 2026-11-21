@@ -521,7 +521,11 @@ impl PostMortem {
 
         let zone_census = crate::el1_zone::zone().map(|zone| {
             let mut census = String::new();
-            if zone.write_census(&mut census).is_err() {
+            // Each slot's loaded task and service notice follow the zone, so
+            // one section reads a hung carrier's ring state.
+            if zone.write_census(&mut census).is_err()
+                || carrick_el1_abi::write_current_task_census(&mut census).is_err()
+            {
                 truncated.push(Truncated {
                     section: "zone_census".to_owned(),
                     reason: "scheduler census formatting failed".to_owned(),

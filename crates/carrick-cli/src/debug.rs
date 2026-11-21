@@ -173,6 +173,18 @@ pub(crate) fn run_debug(
                 refusals,
             )?;
         }
+        DebugCommand::Zonedump {
+            run_id,
+            post_mortem,
+            region,
+        } => crate::debug_zonedump::run_zonedump(
+            match (run_id.as_deref(), post_mortem.as_deref(), region.as_deref()) {
+                (Some(run_id), _, _) => crate::debug_zonedump::ZoneSource::Live(run_id),
+                (None, Some(path), _) => crate::debug_zonedump::ZoneSource::PostMortem(path),
+                (None, None, Some(path)) => crate::debug_zonedump::ZoneSource::Region(path),
+                (None, None, None) => bail!("zonedump needs --run-id, --post-mortem or --region"),
+            },
+        )?,
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
             let value = if let Some(hex) = stripped
