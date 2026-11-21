@@ -38,8 +38,10 @@ A later mapping of the same physical address receives a new code generation
 when it is first translated. Rewriting executable bytes through the loader
 advances that generation again. The synthetic lifecycle fixture observes the
 unmapped fetch failure and verifies that subsequent HVCs match the replacement
-images. The dispatcher cache is scoped to a single run, and the witness works
-at the launcher boundary without an ARM soft VMM lifecycle registration.
+images. A plain `run` keeps its cache for that call, and the witness works
+at the launcher boundary without an ARM soft VMM lifecycle registration. The
+soft vCPU keeps code across `run_controlled` calls; see
+[`arm.softcpu.handoff-residency`](arm-softcpu-handoff-residency.md).
 
 ## Native branch chains
 

@@ -46,7 +46,9 @@ use carrick_mem::memory::{
     stage1_carrier_maintenance_page_tables,
 };
 use carrick_mmu_core::aarch64::PageTableError;
-use carrick_softcpu_aarch64::dispatch::{ExecuteBlock, RunControl, Stop, run_controlled};
+use carrick_softcpu_aarch64::dispatch::{
+    DispatchCache, ExecuteBlock, RunControl, Stop, run_controlled,
+};
 use carrick_softcpu_aarch64::exception::Syndrome;
 use carrick_softcpu_aarch64::handler::{
     CodeGeneration, Event, ExclusiveMonitor, GuestMemory as SoftGuestMemory, InlineRam, MemoryFault,
@@ -751,6 +753,14 @@ impl SoftGuestMemory for SoftStage2 {
         true
     }
 
+    /// Every write to guest RAM that can change code advances the frame's
+    /// generation in this inventory: guest stores, `write_gpa_bytes`, and
+    /// `publish_user_executable` for each new EL0-executable leaf. Removing
+    /// execute permission and retiring a window clear the frame as well.
+    fn code_cache_domain(&self) -> Option<carrick_softmmu::ExtentTableId> {
+        Some(self.extents.identity())
+    }
+
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault> {
         self.guest_read_with_access(address, bytes, Stage2AbortAccess::Read)
     }
@@ -1016,10 +1026,13 @@ impl VcpuKick for SoftKickHandle {
 }
 
 /// Soft AArch64 vCPU implementing [`carrick_aarch64::Aarch64Vcpu`].
-pub struct SoftAarch64Vcpu<X> {
+pub struct SoftAarch64Vcpu<X: ExecuteBlock> {
     cpu: CpuState,
     monitor: ExclusiveMonitor,
     executor: X,
+    /// Compiled code kept across `run` calls; `None` under
+    /// `CARRICK_SOFT_AARCH64_HANDOFF_CACHE=0`.
+    code: Option<DispatchCache<X::Code>>,
     stage2: Arc<ExclusiveStage2>,
     control: Arc<RunControl>,
     mailbox: Option<MailboxSlot>,
@@ -1034,7 +1047,7 @@ pub struct SoftAarch64Vcpu<X> {
     max_quanta_per_exit: u64,
 }
 
-impl<X> SoftAarch64Vcpu<X> {
+impl<X: ExecuteBlock> SoftAarch64Vcpu<X> {
     fn sync_shared_overrides(&mut self) {
         if self.tpidrro_dirty.swap(false, Ordering::AcqRel) {
             self.cpu.named.tpidrroel0 = SystemValue(self.tpidrro_pending.load(Ordering::Acquire));
@@ -1345,10 +1358,18 @@ where
     fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
         self.sync_shared_overrides();
         let mut stage2 = self.stage2.try_borrow()?;
+        let mut discarded = DispatchCache::default();
         for _ in 0..self.max_quanta_per_exit {
             let elapsed_ns =
                 u64::try_from(self.boot_instant.elapsed().as_nanos()).unwrap_or(u64::MAX);
             self.cpu.named.cntvct = SystemValue(elapsed_ns);
+            let code = match self.code.as_mut() {
+                Some(code) => code,
+                None => {
+                    discarded.clear();
+                    &mut discarded
+                }
+            };
             let report = run_controlled(
                 &mut self.cpu,
                 &mut self.monitor,
@@ -1357,6 +1378,7 @@ where
                 BlockLimits::default(),
                 self.block_quantum,
                 &self.control,
+                code,
             );
             match report.stop {
                 Stop::Budget => continue,
@@ -1556,6 +1578,9 @@ where
             cpu,
             monitor: ExclusiveMonitor::default(),
             executor,
+            code: (std::env::var_os("CARRICK_SOFT_AARCH64_HANDOFF_CACHE").as_deref()
+                != Some(std::ffi::OsStr::new("0")))
+            .then(DispatchCache::default),
             stage2: Arc::clone(&stage2),
             control: Arc::clone(&control),
             mailbox,

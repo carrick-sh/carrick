@@ -35,8 +35,8 @@ use carrick_mem::memory::{
     stage1_hvpatch_page_tables, stage1_identity_page_tables,
 };
 use carrick_softcpu_aarch64::dispatch::{
-    BlockMemory, CHAIN_QUANTUM, ChainBudget, ChainExit, ExecuteBlock, Report, ResidentBlock,
-    RunControl, RunWork, Stop, run, run_controlled,
+    BlockMemory, CHAIN_QUANTUM, ChainBudget, ChainExit, DispatchCache, ExecuteBlock, Report,
+    ResidentBlock, RunControl, RunWork, Stop, run, run_controlled,
 };
 use carrick_softcpu_aarch64::handler::{
     CodeGeneration, Event, ExclusiveMonitor, GuestMemory, InlineRam, MemoryFault,
@@ -621,6 +621,7 @@ fn native_back_edge_services_pending_kick_and_timer_irq() {
             BlockLimits::default(),
             CHAIN_QUANTUM + 1,
             &control,
+            &mut DispatchCache::default(),
         );
         assert_eq!(x(&cpu, 5), 1);
         if kick {
