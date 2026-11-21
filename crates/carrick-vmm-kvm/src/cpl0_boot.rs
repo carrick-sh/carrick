@@ -265,6 +265,8 @@ impl ProductionRunContext {
 pub struct Cpl0Carrier {
     pub(crate) cpus: [KvmVcpu; 2],
     pub(crate) custody: KvmBootstrapCustody,
+    /// The delta-free realtime calibration published at load, if any.
+    realtime_host_off: Option<u64>,
 }
 
 /// A live holder of two production-zone readiness-lane locks, from
@@ -718,9 +720,11 @@ impl Cpl0Carrier {
             self.production_run_context(1)?,
         ];
         let shared_vm = self.custody.memory().vm().vm_handle();
+        // The clock owner took its ring realtime word before the split.
         let Self {
             cpus: [first, second],
             custody,
+            realtime_host_off: _,
         } = self;
         let children = crate::carrier_cpu::CarrierChildBindings::default();
         let first = KvmCarrierCpu::from_production(
@@ -784,6 +788,8 @@ impl Cpl0Carrier {
         // The syscall clock reads this ring-owned copy, never the user page.
         if let Some(vvar) = vvar {
             self.publish_realtime_offset(vvar.realtime_offset())?;
+            self.realtime_host_off = native_realtime_delta
+                .map(|delta| vvar.realtime_offset().wrapping_sub(delta as u64));
         }
         self.custody
             .set_clock_vvar(vvar.filter(|_| with_vdso.is_some()));
@@ -791,18 +797,19 @@ impl Cpl0Carrier {
     }
 
     fn publish_realtime_offset(&self, offset_ns: u64) -> Result<(), TrapError> {
-        let zone = self
-            .custody
-            .ram()
-            .host_ptr(
-                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
-                size_of::<X86Cpl0Zone>(),
-            )
-            .ok_or_else(|| fail("realtime calibration zone"))?;
-        // SAFETY: the loaded carrier retains the aligned production zone in
-        // its metadata window; the published word is a single atomic.
-        unsafe { &*zone.cast::<X86Cpl0Zone>() }.publish_realtime_offset(offset_ns);
-        Ok(())
+        publish_zone_realtime_offset(self.custody.ram(), offset_ns)
+            .ok_or_else(|| fail("realtime calibration zone"))
+    }
+
+    /// The ring realtime word's owner after load: the delta-free calibration
+    /// and a publisher into this carrier's zone, for the container's clock
+    /// (`ClockDomain::bind_ring_realtime`). `None` without a calibrated clock.
+    pub fn ring_realtime_word(&self) -> Option<(u64, impl Fn(u64) + Send + Sync + 'static)> {
+        let host_off = self.realtime_host_off?;
+        let ram = Arc::clone(self.custody.ram());
+        Some((host_off, move |offset_ns| {
+            let _ = publish_zone_realtime_offset(&ram, offset_ns);
+        }))
     }
 
     fn calibrate_vvar(&self, delta: i64) -> Option<carrick_mem::vdso::X86NativeVvar> {
@@ -1214,6 +1221,7 @@ impl Cpl0Carrier {
                 frame_inventory,
                 kernel_pod_storage,
             )?,
+            realtime_host_off: None,
         })
     }
 
@@ -3309,6 +3317,19 @@ pub fn initial_process_exit(exit: PhysicalProcessExit, exits: usize) -> InitialP
         PhysicalProcessExit::RunFailed(reason) => InitialProcessExit::RunFailed { reason, exits },
     }
 }
+
+/// Store the ring realtime word in the carrier zone held by `ram`.
+fn publish_zone_realtime_offset(ram: &GuestRam, offset_ns: u64) -> Option<()> {
+    let zone = ram.host_ptr(
+        META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+        size_of::<X86Cpl0Zone>(),
+    )?;
+    // SAFETY: `ram` keeps the carrier's metadata window, and the aligned
+    // production zone in it, mapped; the published word is a single atomic.
+    unsafe { &*zone.cast::<X86Cpl0Zone>() }.publish_realtime_offset(offset_ns);
+    Some(())
+}
+
 #[cfg(test)]
 mod root_exit_validation_tests {
     use super::*;

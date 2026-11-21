@@ -8100,6 +8100,98 @@ mod container_clock_tests {
         );
     }
 
+    /// The carrier's ring realtime word follows every guest change of the
+    /// container clock (`clock_settime`, `clock_adjtime` ADJ_SETOFFSET)
+    /// before the syscall returns, and a second container's word is untouched.
+    #[test]
+    fn clock_changes_republish_the_bound_ring_realtime_word() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        const HOST_OFF: u64 = 1_700_000_000_000_000_000;
+        let bind = |dispatcher: &SyscallDispatcher| {
+            let word = Arc::new(AtomicU64::new(0));
+            let sink = Arc::clone(&word);
+            let clock = Arc::clone(
+                dispatcher
+                    .capture_one_task_context()
+                    .expect("task context")
+                    .task()
+                    .container()
+                    .clock(),
+            );
+            clock
+                .bind_ring_realtime(crate::kernel::RingRealtimeWord::new(HOST_OFF, move |w| {
+                    sink.store(w, Ordering::SeqCst)
+                }))
+                .expect("first binding");
+            assert!(
+                clock
+                    .bind_ring_realtime(crate::kernel::RingRealtimeWord::new(HOST_OFF, |_| {}))
+                    .is_err(),
+                "the word serves one container"
+            );
+            (clock, word)
+        };
+        let mut a = SyscallDispatcher::new();
+        let b = SyscallDispatcher::new();
+        let (a_clock, a_word) = bind(&a);
+        let (_, b_word) = bind(&b);
+        assert_eq!(a_word.load(Ordering::SeqCst), HOST_OFF, "bound at offset 0");
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let a_context = a.capture_one_task_context().expect("a context");
+        a_context
+            .task()
+            .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+        let expected = || crate::vdso::vvar_realtime_off_ns(HOST_OFF, a_clock.realtime_offset_ns());
+
+        const AHEAD: Duration = Duration::from_secs(7200);
+        write_timespec(&mut memory, TIMESPEC_ADDR, wall_now() + AHEAD);
+        assert_eq!(
+            a.dispatch(
+                &a_context,
+                SyscallRequest::new(
+                    SYS_CLOCK_SETTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMESPEC_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch clock_settime"),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let moved = a_clock.realtime_offset_ns();
+        assert!(
+            moved.abs_diff(AHEAD.as_nanos() as i64) <= SLACK.as_nanos() as u64,
+            "clock_settime moved the domain by {moved} ns"
+        );
+        assert_eq!(a_word.load(Ordering::SeqCst), expected(), "settime republished");
+
+        let mut step = LinuxTimex::new_read_state(LinuxTimeval::new(-60, 0));
+        step.modes = LINUX_ADJ_SETOFFSET;
+        memory
+            .write_bytes(TIMEX_ADDR, step.abi_bytes())
+            .expect("timex");
+        assert_eq!(
+            a.dispatch(
+                &a_context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch clock_adjtime"),
+            DispatchOutcome::Returned {
+                value: LINUX_TIME_OK
+            }
+        );
+        assert_eq!(a_clock.realtime_offset_ns(), moved - 60_000_000_000);
+        assert_eq!(a_word.load(Ordering::SeqCst), expected(), "adjtime republished");
+        assert_eq!(b_word.load(Ordering::SeqCst), HOST_OFF, "B's word never moved");
+    }
+
     #[test]
     fn clock_settime_moves_only_the_callers_container() {
         let mut a = SyscallDispatcher::new();

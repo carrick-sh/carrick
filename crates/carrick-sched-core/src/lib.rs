@@ -2570,6 +2570,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.realtime_offset_ns.store(offset_ns, Ordering::Release);
     }
 
+    /// Publish the carrier's load-time realtime word unless the container's
+    /// clock owner already published one: a reload (exec) must not replace a
+    /// word that carries a guest clock change.
+    #[inline]
+    pub fn publish_initial_realtime_offset(&self, offset_ns: u64) {
+        let _ = self.realtime_offset_ns.compare_exchange(
+            0,
+            offset_ns,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+
     /// The published realtime calibration, or `None` before the carrier
     /// calibrated one (a Unix-epoch nanosecond delta is never zero).
     #[inline]
