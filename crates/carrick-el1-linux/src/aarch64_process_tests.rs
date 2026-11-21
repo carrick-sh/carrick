@@ -2304,10 +2304,22 @@ fn native_fork_child_time_result(
     argument0: u64,
     argument1: u64,
 ) -> (i64, u64) {
+    native_fork_child_time_result_with(number, argument0, argument1, |_| {})
+}
+
+/// [`native_fork_child_time_result`] after `prepare` publishes carrier state.
+#[cfg(test)]
+fn native_fork_child_time_result_with(
+    number: carrick_abi::CanonicalNr,
+    argument0: u64,
+    argument1: u64,
+    prepare: impl FnOnce(&Fixture),
+) -> (i64, u64) {
     use super::native_process_runtime::NativeThreadGroupOwner;
     use carrick_personality_linux::dispatch::CompletionRoute;
 
     let fixture = Fixture::new(0x10000, asid(1));
+    prepare(&fixture);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -2531,6 +2543,43 @@ fn native_fork_child_realtime_clocks_reach_time_handler() {
         carrick_syscall_abi::LINUX_CLOCK_REALTIME_COARSE,
     ] {
         assert_eq!(native_fork_child_time_result(number, clock, 0), (-14, 0));
+    }
+}
+
+/// #2618: the syscall realtime clock is the carrier's zone calibration on
+/// the ring counter. No vvar is mapped at the guest address here, so a value
+/// derived from user memory could not produce this exact result.
+#[test]
+fn native_fork_child_realtime_reads_the_zone_calibration() {
+    use carrick_guest_arch::{CounterFrequency, CounterTick};
+
+    const OFFSET_NS: u64 = 1_700_000_000_123_456_789;
+    const TICK: u64 = 7_000_000_000;
+    let number = carrick_abi::syscall::nr::CLOCK_GETTIME;
+    for clock in [
+        carrick_syscall_abi::LINUX_CLOCK_REALTIME,
+        carrick_syscall_abi::LINUX_CLOCK_REALTIME_COARSE,
+    ] {
+        let mut ts = [0u64; 2];
+        let result =
+            native_fork_child_time_result_with(number, clock, ts.as_mut_ptr() as u64, |fixture| {
+                fixture
+                    .zone
+                    .publish_counter_frequency(CounterFrequency::new(
+                        NonZeroU64::new(1_000_000_000).unwrap(),
+                    ));
+                fixture.zone.publish_realtime_offset(OFFSET_NS);
+                fixture
+                    .zone
+                    .cpu_leave_slot(fixture.slot, CounterTick::new(TICK));
+            });
+        assert_eq!(result, (0, 0), "native child clock_gettime({clock})");
+        let nanos = if clock == carrick_syscall_abi::LINUX_CLOCK_REALTIME {
+            123_456_789
+        } else {
+            123_000_000
+        };
+        assert_eq!(ts, [1_700_000_007, nanos], "clock {clock}");
     }
 }
 
