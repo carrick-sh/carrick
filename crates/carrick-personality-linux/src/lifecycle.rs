@@ -344,6 +344,28 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn retain_accepted_epoll_wait(&mut self, _wait: carrick_core_abi::wait::AcceptedWait) -> bool {
         false
     }
+    /// The calling thread's host set pin (#2621), retained until the thread
+    /// exits or execs. `None`: none yet, or this venue retains none.
+    fn host_select_set(&mut self) -> Option<carrick_fd_core::RawOfdPin> {
+        None
+    }
+    /// Retain the calling thread's new host set pin. `false`: this venue
+    /// retains none (the caller releases it).
+    fn retain_host_select_set(&mut self, _pin: carrick_fd_core::RawOfdPin) -> bool {
+        false
+    }
+    /// Cross a select set's host-set enrolment (a staged
+    /// `HostFileOp::EpollSocketCtl` record naming the host set) and run the
+    /// exact call `ordinal` again once the carrier enrolled the member; a
+    /// refused or failed enrolment is the call's answer. `None`: this venue
+    /// has no host-file service.
+    fn begin_host_set_enrol(
+        &mut self,
+        _record: alloc::boxed::Box<[u8]>,
+        _ordinal: carrick_guest_arch::NativeOrdinal,
+    ) -> Option<LifecycleOutcome> {
+        None
+    }
     /// A syscall entry begins. Answers retained for the rerun of this
     /// thread's last call (the carrier's thread-stock reply, #1974) belong
     /// to exactly this entry: whatever syscall it is, no later entry sees

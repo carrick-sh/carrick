@@ -1262,6 +1262,27 @@ pub fn stage_native_socket_epoll<V: file::MemoryValidator>(
     }
 }
 
+/// Marshal a select set's host member enrolment (#2621): an
+/// `EPOLL_CTL_ADD` of descriptor `fd` into the calling thread's host set,
+/// named by its object handle word since it has no descriptor.
+pub fn stage_host_set_enrol(table: [u64; 3], set: u64, fd: i32) -> alloc::boxed::Box<[u8]> {
+    use carrick_core_abi::host_file::{
+        EpollSocketSet, HOST_FILE_HEADER_BYTES, HostFileHeader, HostFileOp,
+    };
+    let mut header = HostFileHeader {
+        op: HostFileOp::EpollSocketCtl,
+        table,
+        fd: 0,
+        flags: 0,
+        args: [carrick_abi::LINUX_EPOLL_CTL_ADD, fd as u32 as u64, 0, 0],
+    };
+    EpollSocketSet::HostSet(set).encode(&mut header);
+    let mut record = alloc::vec![0; HOST_FILE_HEADER_BYTES].into_boxed_slice();
+    carrick_core_abi::host_file::encode(&mut record, header, &[], 0)
+        .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    record
+}
+
 /// The owner fault a host-file stage needs supplied before it can retry.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn native_host_file_fault(
@@ -5287,6 +5308,7 @@ impl<
             owner: self.process.as_deref_mut(),
             wait: None,
             input_wait: None,
+            host_enrol: None,
         };
         let mut output = None;
         let mut sigpipe_owed = false;
@@ -5307,6 +5329,7 @@ impl<
             disposition
         };
         let input_wait = user.input_wait.take();
+        let host_enrol = user.host_enrol.take();
         if let Some(receipt) = native_handoff
             && let Some(process) = self.process.as_deref_mut()
         {
@@ -5314,6 +5337,9 @@ impl<
         }
         if let Some(request) = input_wait {
             return self.ipc_input_wait(request);
+        }
+        if let Some((set, fd)) = host_enrol {
+            return self.ipc_host_set_enrol(venue, task, set, fd);
         }
         if let Some(output) = output {
             return complete_ring_poll_output(
@@ -6432,6 +6458,36 @@ impl<
         carrick_personality_linux::lifecycle::lifecycle_effect(&outcome)
     }
 
+    /// Cross a select set's host-set enrolment (#2621) the ring owner asked
+    /// for, then run the exact call again; a refused or failed enrolment is
+    /// the call's answer. Without a native owner the call stays unrouted.
+    #[inline(never)]
+    fn ipc_host_set_enrol(
+        &mut self,
+        venue: &ipc::IpcVenue<'_>,
+        task: &CurrentTask,
+        set: u64,
+        fd: i32,
+    ) -> FamilyCompletion {
+        let Some(table) = ipc::native_table(venue, task) else {
+            return FamilyCompletion::Forward;
+        };
+        let ordinal = self.frame.native_number();
+        let record = stage_host_set_enrol(table, set, fd);
+        let Some(outcome) = self
+            .process
+            .as_deref_mut()
+            .and_then(|process| process.begin_host_set_enrol(record, ordinal))
+        else {
+            return FamilyCompletion::Forward;
+        };
+        if let lifecycle::LifecycleOutcome::Returned { result, .. } = &outcome {
+            self.frame
+                .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
+        }
+        carrick_personality_linux::lifecycle::lifecycle_effect(&outcome)
+    }
+
     fn ipc_transfer(&mut self) -> FamilyCompletion
     where
         F: Fn(u32) -> *mut u8,
@@ -6479,6 +6535,7 @@ impl<
                 owner: self.process.as_deref_mut(),
                 wait: None,
                 input_wait: None,
+                host_enrol: None,
             };
             let (disposition, sigpipe_owed) = ipc::serve_ipc_with_signals(
                 &mut sched,
@@ -6557,6 +6614,7 @@ impl<
                 owner: self.process.as_deref_mut(),
                 wait: None,
                 input_wait: None,
+                host_enrol: None,
             };
             let disposition =
                 ipc::serve_file_lock(&mut sched, frame, venue, &mut user, table, &mut output);
@@ -6597,6 +6655,7 @@ impl<
                 owner: self.process.as_deref_mut(),
                 wait: None,
                 input_wait: None,
+                host_enrol: None,
             };
             let disposition = ipc::serve_file_lock(
                 &mut exec,
@@ -6678,6 +6737,7 @@ impl<
                 owner: self.process.as_deref_mut(),
                 wait: None,
                 input_wait: None,
+                host_enrol: None,
             };
             let mut output = None;
             let disposition =
@@ -6685,6 +6745,9 @@ impl<
             if let Some(request) = user.input_wait.take() {
                 let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
                 return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+            }
+            if let Some((set, fd)) = user.host_enrol.take() {
+                return self.ipc_host_set_enrol(venue, task, set, fd);
             }
             if let Some(output) = output {
                 return complete_ring_poll_output(

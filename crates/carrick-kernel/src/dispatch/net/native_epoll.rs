@@ -2,6 +2,13 @@
 //! owns delivery, one-shot state and the wait. The carrier multiplexes only
 //! real host sockets, always in edge mode so a level-ready socket cannot
 //! spin the reactor. The ring reapplies its own level/edge policy.
+//!
+//! A task's HOST SET (the epoll a select set nests for its host members,
+//! #2621) is enrolled through the same registrations: a socket as for
+//! `epoll_ctl`, every class edge-triggered, and a regular file as an item
+//! whose level is always readable and writable (select(2) on a file with
+//! no poll method), retired at that file's last close. Any other host kind
+//! is refused, so the ring leaves the whole call unrouted.
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -41,20 +48,49 @@ impl std::fmt::Debug for NativeSocketEpolls {
     }
 }
 
+/// What one registration observes: a socket's readiness source, or a host
+/// regular file (by its resource token) that a host set reads as always
+/// ready.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum MemberSource {
+    Socket(HostReadinessSource),
+    File(u64),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Membership {
     epoll: IpcObjectHandle,
-    socket: HostReadinessSource,
+    source: MemberSource,
     number: fd::Fd,
 }
 
 impl std::hash::Hash for Membership {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.epoll.hash(state);
-        self.socket.hash(state);
+        self.source.hash(state);
         self.number.0.hash(state);
     }
 }
+
+/// A host set member the carrier can enrol (see the module docs).
+pub(in crate::dispatch) enum HostSetMember<'a> {
+    Socket(&'a NativeNetFile),
+    /// A regular file: its resource token and description.
+    File(u64, Arc<FileDescription>),
+}
+
+/// The level a host set reports for a regular file: select(2) finds a file
+/// without a poll method always readable and writable.
+const FILE_LEVEL: u32 = carrick_el1_abi::ipc::epoll::events::IN
+    | carrick_el1_abi::ipc::epoll::events::RDNORM
+    | carrick_el1_abi::ipc::epoll::events::OUT
+    | carrick_el1_abi::ipc::epoll::events::WRNORM;
+
+/// What a host set item requests: every class, edge-triggered. The select
+/// set reads the sampled level; only a host edge queues the item and wakes
+/// the set it is nested in.
+const HOST_SET_EVENTS: u32 =
+    carrick_el1_abi::ipc::epoll::events::LEVEL_MASK | carrick_el1_abi::ipc::epoll::events::ET;
 
 struct Registration {
     key: Membership,
@@ -73,7 +109,7 @@ struct State {
     mux: Box<dyn EventMultiplexer>,
     registrations: HashMap<u64, Registration>,
     keys: HashMap<Membership, u64>,
-    sockets: HashMap<HostReadinessSource, HashSet<u64>>,
+    sources: HashMap<MemberSource, HashSet<u64>>,
     epolls: HashMap<IpcObjectHandle, HashSet<u64>>,
     next: u64,
 }
@@ -99,7 +135,7 @@ impl State {
     fn insert(&mut self, token: u64, registration: Registration) {
         let key = registration.key;
         self.keys.insert(key, token);
-        self.sockets.entry(key.socket).or_default().insert(token);
+        self.sources.entry(key.source).or_default().insert(token);
         self.epolls.entry(key.epoll).or_default().insert(token);
         self.registrations.insert(token, registration);
     }
@@ -108,7 +144,7 @@ impl State {
         let registration = self.registrations.remove(&token)?;
         let key = registration.key;
         self.keys.remove(&key);
-        remove_index(&mut self.sockets, key.socket, token);
+        remove_index(&mut self.sources, key.source, token);
         remove_index(&mut self.epolls, key.epoll, token);
         Some(registration)
     }
@@ -214,7 +250,7 @@ impl NativeSocketEpolls {
                 mux,
                 registrations: HashMap::new(),
                 keys: HashMap::new(),
-                sockets: HashMap::new(),
+                sources: HashMap::new(),
                 epolls: HashMap::new(),
                 next: 1,
             }),
@@ -382,6 +418,100 @@ impl NativeSocketEpolls {
         Ok(())
     }
 
+    /// Enrol one host member of a select set in the task's host set `set`
+    /// (#2621). The ring asks only for a descriptor and open file the host
+    /// set has no item for, so a registration of the same member number
+    /// is an earlier open file's: it is replaced.
+    pub(in crate::dispatch) fn enrol_host_set(
+        self: &Arc<Self>,
+        owner: &HostIpc,
+        set: IpcObjectHandle,
+        number: fd::Fd,
+        file: fd::OfdKey,
+        member: HostSetMember<'_>,
+    ) -> Result<(), LinuxErrno> {
+        let report = EpollReport {
+            events: HOST_SET_EVENTS,
+            data: number.0 as u32 as u64,
+        };
+        let socket = match member {
+            HostSetMember::Socket(socket) => socket,
+            HostSetMember::File(token, description) => {
+                return self.enrol_host_set_file(
+                    owner,
+                    set,
+                    number,
+                    file,
+                    token,
+                    description,
+                    report,
+                );
+            }
+        };
+        let key = Membership {
+            epoll: set,
+            source: MemberSource::Socket(socket.source()),
+            number,
+        };
+        if self.state.lock().keys.contains_key(&key) {
+            self.control(owner, key, socket, file, LINUX_EPOLL_CTL_DEL, report)?;
+        }
+        self.control(owner, key, socket, file, LINUX_EPOLL_CTL_ADD, report)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enrol_host_set_file(
+        &self,
+        owner: &HostIpc,
+        set: IpcObjectHandle,
+        number: fd::Fd,
+        file: fd::OfdKey,
+        token: u64,
+        description: Arc<FileDescription>,
+        report: EpollReport,
+    ) -> Result<(), LinuxErrno> {
+        let region = owner
+            .socket_epoll_region()
+            .map_err(|error| ctl_errno(error.into()))?;
+        let key = Membership {
+            epoll: set,
+            source: MemberSource::File(token),
+            number,
+        };
+        let mut state = self.state.lock();
+        if let Some(stale) = state.keys.get(&key).copied()
+            && let Some(registration) = state.retire(stale)
+        {
+            region
+                .epoll_delete_host_socket(set, registration.item, &HostLockWait)
+                .map_err(ctl_errno)?;
+        }
+        owner
+            .bind_socket_epoll_lock(set)
+            .map_err(|error| ctl_errno(error.into()))?;
+        let token = state.generation()?;
+        let file_key = (u64::from(file.index) << 32) | (file.generation & u64::from(u32::MAX));
+        let (item, wake) = region
+            .epoll_add_host_socket(set, number, file_key, report, FILE_LEVEL, &HostLockWait)
+            .map_err(ctl_errno)?;
+        state.insert(
+            token,
+            Registration {
+                key,
+                item,
+                events: LinuxEpollEvents::from_bits_retain(report.events),
+                description,
+                watch: Watch {
+                    host: None,
+                    _zone: None,
+                },
+            },
+        );
+        drop(state);
+        owner.deliver_socket_epoll_wakes(wake);
+        Ok(())
+    }
+
     pub(crate) fn forget_epoll(&self, epoll: IpcObjectHandle) {
         let mut state = self.state.lock();
         let Some(tokens) = state.epolls.remove(&epoll) else {
@@ -393,8 +523,21 @@ impl NativeSocketEpolls {
     }
 
     pub(crate) fn forget_socket(&self, owner: &HostIpc, socket: HostReadinessSource) {
+        self.forget(owner, MemberSource::Socket(socket));
+    }
+
+    /// A host regular file's last close: retire its host set items.
+    pub(crate) fn forget_file(
+        &self,
+        owner: &HostIpc,
+        token: carrick_el1_abi::ipc::HostResourceToken,
+    ) {
+        self.forget(owner, MemberSource::File(token.get()));
+    }
+
+    fn forget(&self, owner: &HostIpc, source: MemberSource) {
         let mut state = self.state.lock();
-        let Some(tokens) = state.sockets.remove(&socket) else {
+        let Some(tokens) = state.sources.remove(&source) else {
             return;
         };
         let Ok(region) = owner.socket_epoll_region() else {
@@ -414,7 +557,7 @@ impl NativeSocketEpolls {
 
     pub(super) fn socket_changed(self: &Arc<Self>, owner: &HostIpc, socket: &NativeNetFile) {
         let mut state = self.state.lock();
-        let Some(tokens) = state.sockets.get(&socket.source()) else {
+        let Some(tokens) = state.sources.get(&MemberSource::Socket(socket.source())) else {
             return;
         };
         let description = socket.description();
@@ -553,7 +696,7 @@ impl super::SyscallDispatcher {
                         let epolls = owner.native_socket_epolls(&reactor)?;
                         let key = Membership {
                             epoll: object,
-                            socket: socket.source(),
+                            source: MemberSource::Socket(socket.source()),
                             number: target,
                         };
                         epolls.control(owner, key, socket, file, op, report)
@@ -561,6 +704,56 @@ impl super::SyscallDispatcher {
                     .map_err(pin_errno)?
             })
             .map_err(pin_errno)?
+    }
+}
+
+impl super::SyscallDispatcher {
+    /// Enrol a select set's host member in the caller's host set, which the
+    /// record names by handle ([`carrick_core_abi::host_file::EpollSocketSet::HostSet`]).
+    /// `None`: a member kind no host set holds (the ring leaves the whole
+    /// call unrouted).
+    pub(in crate::dispatch) fn serve_native_host_set_enrol(
+        &self,
+        owner: &Arc<HostIpc>,
+        table: fd::TableId,
+        header: carrick_core_abi::host_file::HostFileHeader,
+        set: u64,
+    ) -> Option<Result<(), LinuxErrno>> {
+        let set = IpcObjectHandle::from_word(set);
+        // Only a live epoll is a host set.
+        if let Err(error) = owner
+            .socket_epoll_region()
+            .and_then(|region| region.epoll_zone_items(set, &HostLockWait))
+        {
+            return Some(Err(ctl_errno(error.into())));
+        }
+        let target = fd::Fd(header.args[1] as i32);
+        let enrolled = owner.with_pinned_ofd(table, target, |file, description| {
+            let Some(IpcBacking::Host(token)) = IpcBacking::decode(description.backing) else {
+                return None;
+            };
+            let Some(resource) = owner.host_resource(token) else {
+                return Some(Err(LINUX_EBADF));
+            };
+            let member = if let Some(socket) = resource.downcast_ref::<NativeNetFile>() {
+                HostSetMember::Socket(socket)
+            } else {
+                HostSetMember::File(
+                    token.get(),
+                    super::super::native_files::regular_file(&resource)?,
+                )
+            };
+            let reactor = Arc::clone(self.kernel_binding.read().kernel().host_readiness());
+            Some(
+                owner
+                    .native_socket_epolls(&reactor)
+                    .and_then(|epolls| epolls.enrol_host_set(owner, set, target, file, member)),
+            )
+        });
+        match enrolled {
+            Ok(enrolled) => enrolled,
+            Err(error) => Some(Err(pin_errno(error))),
+        }
     }
 }
 

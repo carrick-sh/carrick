@@ -9043,6 +9043,7 @@ fn owner_copyout_never_prepares_under_an_ipc_object_lock() {
         owner: Some(&mut *entry),
         wait: None,
         input_wait: None,
+        host_enrol: None,
     };
     let mut guard = region.lock(object, &wait).unwrap();
     let mut op = IpcOperation {

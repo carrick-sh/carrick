@@ -361,6 +361,9 @@ struct PendingHostFile<'a> {
     /// A chdir lookup: completion stores the named directory as the
     /// caller's cwd.
     chdir: bool,
+    /// A select set's host-set enrolment (#2621): an accepted reply runs
+    /// the exact call again; a failed one is the call's answer.
+    rerun: bool,
     /// The bytes a socket `send`/`recv` moved in its earlier records: the
     /// call's owned continuation across records (#2414).
     transfer: carrick_personality_linux::native_host_file::NetTransfer,
@@ -1874,8 +1877,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_core_abi::host_file::HostFileRequestView::parse(&mut record)
                 .map_err(|_| NativeProcessError::Invalid)?;
             if chdir {
-                call.counters.record_refusal(
-                    call.ordinal,
+                call.record_refusal(
                     carrick_core_abi::service::ServiceOrigin::Initial,
                     carrick_el1_abi::RefusalVenue::Ring,
                 );
@@ -1915,9 +1917,45 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             output,
             map,
             chdir,
+            rerun: false,
             transfer: Default::default(),
             waited: false,
         })
+    }
+
+    /// Cross a select set's host-set enrolment record (#2621) and run the
+    /// exact call `ordinal` again once the carrier enrolled the member. The
+    /// same exact-member retry custody as a guest-copy preparation.
+    pub(super) fn cross_host_set_enrol(
+        &mut self,
+        record: Box<[u8]>,
+        ordinal: carrick_guest_arch::NativeOrdinal,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
+        let result = self.publish_pending_host_file(PendingHostFile {
+            call: NativeServiceCall::uncounted(ordinal),
+            operation: carrick_core_abi::host_file::HostFileOp::EpollSocketCtl,
+            record,
+            output: None,
+            map: None,
+            chdir: false,
+            rerun: true,
+            transfer: Default::default(),
+            waited: false,
+        })?;
+        match result {
+            NativeResume::RetrySyscall => Ok(LifecycleOutcome::Redispatch),
+            NativeResume::Returned(result) => Ok(LifecycleOutcome::Returned {
+                result,
+                work: false,
+            }),
+            NativeResume::Left(None) => Ok(LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            }),
+            _ => Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ServiceOutcome,
+            )),
+        }
     }
 
     /// Publish one record of a host-file call, with the call's retained
@@ -2229,8 +2267,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<Vec<u8>, CallerAccessFailure> {
         self.encode_caller_access().map_err(|errno| {
             if errno == carrick_syscall_abi::LINUX_ENOSYS {
-                call.counters.record_refusal(
-                    call.ordinal,
+                call.record_refusal(
                     if self.is_root_process() {
                         carrick_core_abi::service::ServiceOrigin::Initial
                     } else {
@@ -2297,8 +2334,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             } else {
                 carrick_core_abi::service::ServiceOrigin::Descendant
             };
-            call.counters
-                .record_refusal(call.ordinal, origin, carrick_el1_abi::RefusalVenue::Ring);
+            call.record_refusal(origin, carrick_el1_abi::RefusalVenue::Ring);
             return Ok(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS));
         };
         fs.cwd = target;
@@ -5097,6 +5133,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         return self
                             .complete_chdir(&pending_file.record, pending_file.call)
                             .map(NativeResume::Returned);
+                    }
+                    if pending_file.rerun {
+                        // The member is enrolled: the call runs again and
+                        // finds it in its host set (even after a cancel
+                        // that lost the race, as the exact call is retried
+                        // after whatever cancelled it is delivered).
+                        let answer = carrick_personality_linux::native_host_file::complete(
+                            &pending_file.record,
+                            None,
+                            &mut |_, _| false,
+                        );
+                        return Ok(if answer.raw() < 0 {
+                            NativeResume::Returned(answer)
+                        } else {
+                            NativeResume::RetrySyscall
+                        });
                     }
                     let mut copy_out = |address: u64, bytes: &[u8]| {
                         self.copy_syscall_output(carrick_guest_arch::UserVa::new(address), bytes)

@@ -115,7 +115,8 @@ pub enum HostFileOp {
     /// header `fd` is the descriptor argument (`-1` for `socket`).
     NetSyscall = 28,
     /// A ring epoll's carrier-socket interest. The header names the epoll
-    /// descriptor, op, member number, events and cookie. Waits stay in ring.
+    /// ([`EpollSocketSet`]), op, member number, events and cookie. Waits
+    /// stay in ring.
     EpollSocketCtl = 29,
     /// Flush a file's data and metadata for fsync or fdatasync.
     Fsync = 30,
@@ -706,6 +707,46 @@ pub struct HostFileHeader {
     pub flags: u32,
     /// Operation-specific scalar arguments.
     pub args: [u64; 4],
+}
+
+/// The ring epoll an [`HostFileOp::EpollSocketCtl`] record controls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EpollSocketSet {
+    /// A guest epoll descriptor in the caller's table (`epoll_ctl`).
+    Descriptor(i32),
+    /// A task's host set (a select set's host members), named by its
+    /// packed IPC object handle: it has no descriptor. The carrier enrols
+    /// the member (`args[1]`) once: a socket by its readiness, a regular
+    /// file as always ready; any other kind is refused.
+    HostSet(u64),
+}
+
+impl EpollSocketSet {
+    /// The header `fd` that marks a host set; its handle is in `args[3]`.
+    const HOST_SET_FD: i32 = -1;
+
+    /// Name this epoll in `header`.
+    pub const fn encode(self, header: &mut HostFileHeader) {
+        match self {
+            Self::Descriptor(fd) => {
+                header.fd = fd;
+                header.args[3] = 0;
+            }
+            Self::HostSet(handle) => {
+                header.fd = Self::HOST_SET_FD;
+                header.args[3] = handle;
+            }
+        }
+    }
+
+    /// The epoll `header` names.
+    pub const fn decode(header: &HostFileHeader) -> Self {
+        if header.fd == Self::HOST_SET_FD {
+            Self::HostSet(header.args[3])
+        } else {
+            Self::Descriptor(header.fd)
+        }
+    }
 }
 
 /// Rename and link encode the second pathname's descriptor in `args[0]`.

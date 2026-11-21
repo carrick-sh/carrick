@@ -1644,6 +1644,11 @@ impl HostIpc {
                 .live
                 .remove(&token.get())
                 .ok_or(IpcError::Stale)?;
+            // A regular file's host set items end with its last close; a
+            // socket's end with its resource (`NativeNetFile`'s drop).
+            if let Some(epolls) = self.existing_native_socket_epolls() {
+                epolls.forget_file(self, token);
+            }
             drop(resource);
         }
         Ok(released)

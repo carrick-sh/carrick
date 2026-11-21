@@ -48,12 +48,30 @@
 //! edge-triggered items are queued again only by a later publication;
 //! one-shot items are disabled until `EPOLL_CTL_MOD`.
 //!
+//! # Host sets
+//!
+//! A select(2) set that names a host socket or a host regular file reads
+//! its level from a HOST SET: a per-task epoll holding only carrier items
+//! ([`EpollMember::HostSocket`]), each edge-triggered and enrolled once
+//! per open file. The call's transient set holds one
+//! [`EpollMember::HostSetMember`] item per such descriptor: it names the
+//! host set, the descriptor and its open file, and never sits on a member
+//! list or the ready list. A probe ([`IpcRegion::host_set_probe_locked`])
+//! takes the host set's lock, records the transient set as its NEST
+//! PARENT, drains the host set's ready list and reads each member's
+//! sampled level. A carrier publication that queues a host-set item then
+//! also wakes the nest parent's `Readable` lane, so a parked set wakes on
+//! a host edge with no polling. The parent link is a handle checked by
+//! generation, so a set that ended leaves nothing to unlink.
+//!
 //! # Lock order
 //!
 //! Member object, then epoll object (add, modify, delete, detach). A
 //! publisher holds only the member (the ready stack is lock-free). A
 //! harvest holds only one of the two at a time and never both. Every lock
-//! is an object lock of this region; no lock is held across a park.
+//! is an object lock of this region; no lock is held across a park. A
+//! host-set probe holds only the host set; its publications take no
+//! parent lock (the wake bumps the parent's sequence lock-free).
 
 use super::*;
 
@@ -132,6 +150,10 @@ pub enum EpollMember {
     /// A carrier-owned socket readiness source. Its sampled level is stored
     /// in the item itself under the epoll lock.
     HostSocket = 6,
+    /// A transient select set's host descriptor: `member` names the task's
+    /// host set, whose [`Self::HostSocket`] item for the same descriptor
+    /// and open file carries the level (see the module's host sets).
+    HostSetMember = 7,
 }
 impl EpollMember {
     const fn from_raw(raw: u32) -> Option<Self> {
@@ -142,6 +164,7 @@ impl EpollMember {
             4 => Some(Self::StreamFirst),
             5 => Some(Self::StreamSecond),
             6 => Some(Self::HostSocket),
+            7 => Some(Self::HostSetMember),
             _ => None,
         }
     }
@@ -150,7 +173,11 @@ impl EpollMember {
         match self {
             Self::StreamFirst => Some(StreamEnd::First),
             Self::StreamSecond => Some(StreamEnd::Second),
-            Self::EventFd | Self::PipeReader | Self::PipeWriter | Self::HostSocket => None,
+            Self::EventFd
+            | Self::PipeReader
+            | Self::PipeWriter
+            | Self::HostSocket
+            | Self::HostSetMember => None,
         }
     }
     /// The member a description's backing names, if it is an IPC object.
@@ -200,7 +227,11 @@ pub struct EpollState {
     /// in, so one harvest reports an item at most once even when a member
     /// publication queues it again mid-scan.
     harvest_epoch: u32,
-    _reserved: u32,
+    /// Nonzero while `nest_parent` names a set (see the module's host sets).
+    nested: u32,
+    /// A host set's nest parent (a packed transient set handle): the set
+    /// whose `Readable` lane a queued host item also wakes.
+    nest_parent: u64,
 }
 
 const QUEUED: u32 = 1;
@@ -260,13 +291,10 @@ impl IpcEpollItem {
 }
 
 const fn pack(object: IpcObjectHandle) -> u64 {
-    ((object.index as u64) << 32) | object.generation as u64
+    object.to_word()
 }
 const fn unpack(word: u64) -> IpcObjectHandle {
-    IpcObjectHandle {
-        index: (word >> 32) as u32,
-        generation: word as u32,
-    }
+    IpcObjectHandle::from_word(word)
 }
 
 /// Exact identity of one item: its number and incarnation.
@@ -295,6 +323,28 @@ pub struct EpollItemRef {
 pub struct EpollReport {
     pub events: u32,
     pub data: u64,
+}
+
+/// One host descriptor of a select set, as [`IpcRegion::epoll_host_members`]
+/// reads it from the set's [`EpollMember::HostSetMember`] item and
+/// [`IpcRegion::host_set_probe_locked`] answers it.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct HostSetProbe {
+    pub fd: i32,
+    pub file_key: u64,
+    /// The select set item's data word (the call's own).
+    pub data: u64,
+    /// The host set's sampled level for this descriptor and open file;
+    /// `None` when it holds no item for them (not enrolled yet, or the
+    /// file's last close retired it).
+    pub level: Option<u32>,
 }
 
 /// Why a zone `EPOLL_CTL_ADD` did not take the item. `Exists`/`NotFound`
@@ -497,7 +547,7 @@ impl<'a> IpcRegion<'a> {
         data: u64,
         wait: &W,
     ) -> Result<Option<IpcWake>, EpollCtlError> {
-        if kind == EpollMember::HostSocket {
+        if matches!(kind, EpollMember::HostSocket | EpollMember::HostSetMember) {
             return Err(EpollCtlError::Invalid);
         }
         if events & events::EXCLUSIVE != 0 {
@@ -658,6 +708,88 @@ impl<'a> IpcRegion<'a> {
         })
     }
 
+    /// Add a host descriptor to a transient select set `epoll`: an
+    /// [`EpollMember::HostSetMember`] item naming `host_set`, the
+    /// descriptor `fd`, its open file `file_key` and the call's `data`.
+    /// Under the set's lock only: the item joins no member list.
+    pub fn epoll_add_host_member<W: LockWait>(
+        &self,
+        epoll: IpcObjectHandle,
+        host_set: IpcObjectHandle,
+        fd: i32,
+        file_key: u64,
+        data: u64,
+        wait: &W,
+    ) -> Result<(), EpollCtlError> {
+        let mut guard = self.lock_epoll(epoll, wait)?;
+        if guard.find_item(fd, file_key).is_some() {
+            return Err(EpollCtlError::Exists);
+        }
+        guard.link_item(host_set, EpollMember::HostSetMember, fd, file_key, 0, data)?;
+        Ok(())
+    }
+
+    /// Each host member of the select set `epoll`, with the host set its
+    /// item names (`level` unset; see [`Self::host_set_probe_locked`]).
+    pub fn epoll_host_members<W: LockWait>(
+        &self,
+        epoll: IpcObjectHandle,
+        wait: &W,
+        mut each: impl FnMut(IpcObjectHandle, HostSetProbe),
+    ) -> Result<(), IpcError> {
+        let mut guard = self.lock_epoll(epoll, wait)?;
+        let mut cursor = guard.epoll_state()?.interest_head;
+        while let Some(item) = self.item(cursor) {
+            if item.member_kind.load(Ordering::Relaxed) == EpollMember::HostSetMember as u32 {
+                each(
+                    unpack(item.member.load(Ordering::Relaxed)),
+                    HostSetProbe {
+                        fd: item.fd.load(Ordering::Relaxed) as i32,
+                        file_key: item.file_key.load(Ordering::Relaxed),
+                        data: item.data.load(Ordering::Relaxed),
+                        level: None,
+                    },
+                );
+            }
+            cursor = item.interest_next.load(Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Probe a host set under its lock (`guard`, from [`Self::lock_epoll`]):
+    /// nest it in the select set `parent`, take every queued edge (the probe
+    /// reads levels, and a later edge queues its item again and wakes
+    /// `parent`), and answer each probe's sampled level, `None` for a
+    /// descriptor and open file the host set holds no item for.
+    pub fn host_set_probe_locked(
+        &self,
+        mut guard: IpcObjectGuard<'a>,
+        parent: IpcObjectHandle,
+        probes: &mut [HostSetProbe],
+    ) -> Result<(), IpcError> {
+        if !self.same_mapping(&guard.region) {
+            return Err(IpcError::BadRegion);
+        }
+        let state = guard.epoll_state()?;
+        state.nest_parent = pack(parent);
+        state.nested = 1;
+        while let Some(number) = guard.pop_ready() {
+            if let Some(item) = self.item(number) {
+                item.flags.fetch_and(!QUEUED, Ordering::AcqRel);
+            }
+        }
+        for probe in probes {
+            probe.level = guard
+                .find_item(probe.fd, probe.file_key)
+                .and_then(|number| self.item(number))
+                .filter(|item| {
+                    item.member_kind.load(Ordering::Relaxed) == EpollMember::HostSocket as u32
+                })
+                .map(|item| item.member.load(Ordering::Relaxed) as u32);
+        }
+        Ok(())
+    }
+
     /// `EPOLL_CTL_MOD` of the zone item `(fd, file_key)`: new events and
     /// data, `EPOLLONESHOT` re-armed, readiness re-evaluated (Linux queues a
     /// modified item that is ready now).
@@ -793,7 +925,12 @@ impl<'a> IpcRegion<'a> {
             // under the member's lock, so once unlinked there nothing pushes
             // it again.
             let item = self.item(number).ok_or(IpcError::Corrupt)?;
-            if item.member_kind.load(Ordering::Relaxed) == EpollMember::HostSocket as u32 {
+            // Neither a carrier socket nor a host-set member sits on a
+            // member list: unlinked from the interest list, it is done.
+            if matches!(
+                EpollMember::from_raw(item.member_kind.load(Ordering::Relaxed)),
+                Some(EpollMember::HostSocket | EpollMember::HostSetMember)
+            ) {
                 self.free_item(number);
                 continue;
             }
@@ -1395,10 +1532,31 @@ impl<'a> IpcObjectGuard<'a> {
         }
         item.flags.fetch_or(QUEUED, Ordering::Relaxed);
         self.append_ready(number);
-        Some(self.publish(WakeSet {
+        let mut wake = self.publish(WakeSet {
             readers: true,
             writers: false,
-        }))
+        });
+        // A host set wakes the select set it is nested in. The parent's
+        // lock is not taken: its readers' sequence moves lock-free, as a
+        // member publication moves an epoll's, and the caller notifies its
+        // lane with this wake. A parent that ended fails the generation
+        // check and is forgotten.
+        // SAFETY: the object lock is held; the kind was checked by the caller.
+        let state = unsafe { &mut (*self.record.state.get()).kind_state.counters.epoll };
+        let parent = unpack(state.nest_parent);
+        match self.region.record(parent.index) {
+            Some(record)
+                if state.nested != 0
+                    && record.kind.load(Ordering::Acquire) == KIND_EPOLL
+                    && record.generation.load(Ordering::Acquire)
+                        == u64::from(parent.generation) =>
+            {
+                record.read_seq.fetch_add(1, Ordering::Release);
+                wake.epolls.add(parent);
+            }
+            _ => state.nested = 0,
+        }
+        Some(wake)
     }
 
     /// Unlink an item from this epoll's interest and ready lists (the stack
@@ -1500,7 +1658,9 @@ impl<'a> IpcObjectGuard<'a> {
     pub fn member_level(&mut self, kind: EpollMember) -> Result<u32, IpcError> {
         let readiness = match kind {
             EpollMember::EventFd => self.eventfd()?.readiness(),
-            EpollMember::HostSocket => return Err(IpcError::WrongKind),
+            EpollMember::HostSocket | EpollMember::HostSetMember => {
+                return Err(IpcError::WrongKind);
+            }
             EpollMember::PipeReader => self.pipe()?.readiness(End::Reader),
             EpollMember::PipeWriter => self.pipe()?.readiness(End::Writer),
             EpollMember::StreamFirst | EpollMember::StreamSecond => {
@@ -1598,7 +1758,7 @@ impl<'a> IpcObjectGuard<'a> {
                     (wake.readers && requested & events::READ_SIDE != 0)
                         || (wake.writers && requested & events::WRITE_SIDE != 0)
                 }
-                Some(EpollMember::HostSocket) | None => false,
+                Some(EpollMember::HostSocket | EpollMember::HostSetMember) | None => false,
             };
             if !interested
                 || item.flags.load(Ordering::Acquire) & DISABLED != 0

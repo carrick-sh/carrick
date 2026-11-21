@@ -1405,6 +1405,12 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         )
         .unwrap_or_else(|_| fatal());
     }
+    fn release_host_select_set(&mut self, pin: carrick_el1_abi::ipc::RawOfdPin) {
+        if let Some(venue) = carrick_el1_linux::ipc::guest_venue(self.slot.raw() as u32) {
+            carrick_el1_linux::ipc::release_retained_pin(&venue.region, pin, self.task)
+                .unwrap_or_else(|_| fatal());
+        }
+    }
 }
 
 fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<Born>)> {

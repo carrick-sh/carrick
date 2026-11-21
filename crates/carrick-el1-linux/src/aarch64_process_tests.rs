@@ -18419,70 +18419,106 @@ fn with_arm_process_host_files_on<R>(
             return (route, ret);
         };
         let runtime = runtime.as_ref().unwrap();
-        let binding = runtime.task_binding(resolve_child(runtime, pid)).unwrap();
-        let saved = unsafe { runtime.record_binding(binding.record) }
-            .unwrap()
-            .words;
-        let mut entry = runtime
-            .enter_registered(
-                registry(),
-                source,
-                &fixture.task,
-                binding.address,
-                &saved,
-                &mut service,
-            )
-            .unwrap();
-        let boundary = core::mem::take(&mut leave_on_park);
-        if boundary {
-            fixture.task.linux.mark_pending_host_work();
-        }
-        let route = crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            crossing.fd_map(),
-            &[],
-            crossing.open_table(),
-            &[],
-            &cache,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            Some(&venue),
-            None,
-            Some(&mut *entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
-        drop(entry);
-        if boundary && let Some(work) = fixture.task.linux.take_host_work_doorbell() {
-            work.settled();
-        }
-        if route == CompletionRoute::Suspended {
-            active = None;
-            if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+        // A select set's host-set enrolment (#2621) crosses as a service and
+        // runs the exact call again: the carrier's part is played below.
+        let (route, forward, binding) = loop {
+            let binding = runtime.task_binding(resolve_child(runtime, pid)).unwrap();
+            frame.x[..6].copy_from_slice(&args);
+            frame.x[8] = nr;
+            let saved = unsafe { runtime.record_binding(binding.record) }
+                .unwrap()
+                .words;
+            let mut entry = runtime
+                .enter_registered(
+                    registry(),
+                    source,
+                    &fixture.task,
+                    binding.address,
+                    &saved,
+                    &mut service,
+                )
+                .unwrap();
+            let boundary = core::mem::take(&mut leave_on_park);
+            if boundary {
+                fixture.task.linux.mark_pending_host_work();
+            }
+            let route = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crossing.fd_map(),
+                &[],
+                crossing.open_table(),
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                Some(&venue),
+                None,
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            drop(entry);
+            if boundary && let Some(work) = fixture.task.linux.take_host_work_doorbell() {
                 work.settled();
             }
-        }
-        // The carrier's boundary settles the work a child's call (its own
-        // clone) announced, as it does for the root's, and replays a call
-        // declined for that work.
-        let mut forward = route == CompletionRoute::Forward;
-        if route == CompletionRoute::WithWork {
-            if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
-                work.settled();
+            if route == CompletionRoute::Suspended {
+                active = None;
+                if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+                    work.settled();
+                }
+                if serve_host_set_enrol(fixture, &dispatcher) {
+                    let binding = runtime.task_binding(binding.key).unwrap();
+                    activate_target(source, &fixture.task, &binding);
+                    active = Some(caller);
+                    let saved = unsafe { runtime.record_binding(binding.record) }
+                        .unwrap()
+                        .words;
+                    let mut entry = runtime
+                        .enter_registered(
+                            registry(),
+                            source,
+                            &fixture.task,
+                            binding.address,
+                            &saved,
+                            &mut service,
+                        )
+                        .unwrap();
+                    let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+                    drop(entry);
+                    match resumed {
+                        crate::native_process_runtime::NativeResume::RetrySyscall => continue,
+                        crate::native_process_runtime::NativeResume::Returned(result) => {
+                            return (CompletionRoute::Served, result.raw());
+                        }
+                        _ => panic!("host set enrolment resumed without a retry or an answer"),
+                    }
+                }
             }
-            if let Some(carrick_personality_linux::abi::entry::ServedBoundary::ForwardOriginal {
-                ..
-            }) = fixture.task.linux.take_served_boundary()
-            {
-                forward = true;
+            // The carrier's boundary settles the work a child's call (its own
+            // clone) announced, as it does for the root's, and replays a call
+            // declined for that work.
+            let mut forward = route == CompletionRoute::Forward;
+            if route == CompletionRoute::WithWork {
+                if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+                    work.settled();
+                }
+                if let Some(
+                    carrick_personality_linux::abi::entry::ServedBoundary::ForwardOriginal {
+                        ..
+                    },
+                ) = fixture.task.linux.take_served_boundary()
+                {
+                    forward = true;
+                }
             }
-        }
+            break (route, forward, binding);
+        };
         if !forward && route != CompletionRoute::NativeService {
             return (route, frame.x[0] as i64);
         }
@@ -18512,6 +18548,64 @@ fn with_arm_process_host_files_on<R>(
     #[cfg(not(target_os = "macos"))]
     drop(metadata_scope);
     (result, dispatcher.stdout())
+}
+
+/// Play the carrier for a parked child's published host-set enrolment
+/// (#2621): serve its `EpollSocketCtl` record and complete its service.
+/// `false`: the child parked on something else.
+#[cfg(test)]
+fn serve_host_set_enrol(
+    fixture: &Fixture,
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+) -> bool {
+    use carrick_core_abi::host_file::{EpollSocketSet, HostFileOp, HostFileRequestView};
+    let Ok(Some(selector)) = fixture.task.service_notice.take() else {
+        return false;
+    };
+    let member = fixture.zone.record(selector.record.id).identity();
+    // SAFETY: the fixture retains this live parked member and its service record.
+    let control = unsafe { &*(member.control_slot as *const ThreadControlSlot) };
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &control.service,
+            selector,
+            NonZeroU64::MIN,
+            member,
+        )
+    }
+    .unwrap();
+    let carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } =
+        ticket.request().operation
+    else {
+        panic!("a parked select publishes only its host-set enrolment");
+    };
+    // SAFETY: the ticket retains the exact staged record through its ACK.
+    let record = unsafe {
+        core::slice::from_raw_parts_mut(
+            payload.address().raw() as *mut u8,
+            payload.length().raw() as usize,
+        )
+    };
+    let header = HostFileRequestView::parse(record).unwrap().header();
+    assert_eq!(header.op, HostFileOp::EpollSocketCtl);
+    assert!(matches!(
+        EpollSocketSet::decode(&header),
+        EpollSocketSet::HostSet(_)
+    ));
+    let served = dispatcher.serve_native_host_file(record, None);
+    assert!(ticket.complete(served.is_ok()).is_ok());
+    fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector.record)
+                .unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        )
+        .unwrap()
+        .notify_object(fixture.slot, &mut Default::default())
+        .unwrap();
+    true
 }
 
 #[cfg(not(target_os = "macos"))]

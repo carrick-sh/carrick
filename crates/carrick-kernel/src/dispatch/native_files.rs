@@ -118,6 +118,29 @@ impl NativeOpenFile {
     }
 }
 
+/// A native descriptor's description when it is a regular file the venue
+/// opened (#2621: a select set's host member reads it as always ready).
+/// `None` for every other kind, including a root-inherited hold whose kind
+/// this venue does not own.
+pub(in crate::dispatch) fn regular_file(
+    resource: &HostResource,
+) -> Option<Arc<crate::kernel::FileDescription>> {
+    use super::fd_table::OpenDescription;
+    let file = resource.downcast_ref::<NativeOpenFile>()?;
+    file.description
+        .inspect_kind(|open| {
+            matches!(
+                open,
+                OpenDescription::File { .. }
+                    | OpenDescription::InMemoryFile { .. }
+                    | OpenDescription::SyntheticFile { .. }
+                    | OpenDescription::ProcExecutable { .. }
+            )
+        })
+        .filter(|&regular| regular)
+        .map(|_| Arc::clone(&file.description))
+}
+
 /// Whether a native descriptor's host resource, other than a native network
 /// socket, is a socket (#2414). `Some(false)` only for a proven non-socket:
 /// a venue-opened file, an inherited file, or a stdio stream (whose `fstat`
@@ -563,9 +586,18 @@ impl SyscallDispatcher {
                 }
             }
         } else if header.op == HostFileOp::EpollSocketCtl {
-            match self.serve_native_epoll_ctl(owner, table, header) {
-                Ok(()) => Served::Reply(0, Vec::new()),
-                Err(errno) => Served::errno(errno),
+            let served = match carrick_core_abi::host_file::EpollSocketSet::decode(&header) {
+                carrick_core_abi::host_file::EpollSocketSet::Descriptor(_) => {
+                    Some(self.serve_native_epoll_ctl(owner, table, header))
+                }
+                carrick_core_abi::host_file::EpollSocketSet::HostSet(set) => {
+                    self.serve_native_host_set_enrol(owner, table, header, set)
+                }
+            };
+            match served {
+                Some(Ok(())) => Served::Reply(0, Vec::new()),
+                Some(Err(errno)) => Served::errno(errno),
+                None => Served::Refused,
             }
         } else if header.op == HostFileOp::NetSyscall {
             match self.serve_native_net_call(owner, table, header, view.input(), waiter) {
