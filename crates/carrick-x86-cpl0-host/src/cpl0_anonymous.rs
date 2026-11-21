@@ -172,7 +172,7 @@ fn prepare_table_candidates(stock: &[RootGpa]) -> Vec<SubstrateGpa> {
 /// What preparing an owner-selected window produced.
 pub(super) enum BackingPreparation {
     /// Submitted (`Some`), or left pending for its backing-fault signal.
-    Prepared(Option<PendingPrepare>),
+    Prepared(Option<Box<PendingPrepare>>),
     /// The read-only plan met another CPU's publication in the selected
     /// window (the shared policy's inherited-Prepared or MM-release decline).
     Raced(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
@@ -2256,7 +2256,8 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let reply = unsafe { &*reply };
         match self.prepare_native_backing_grant(execution, window, file, reply)? {
             Ok(BackingPreparation::Prepared(pending)) => {
-                self.anonymous_pending[index] = pending.map(PendingGrant::Prepare);
+                self.anonymous_pending[index] =
+                    pending.map(|pending| PendingGrant::Prepare(*pending));
             }
             // Another CPU holds this MM's editor, or published into this
             // window after its selection: the selection is returned unserved
@@ -2800,15 +2801,19 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // if the carrier never receives a verifiable completion. Keep physical
         // custody through carrier teardown rather than rolling inventory back.
         inventory.guest_exposed = true;
-        Ok(BackingPreparation::Prepared(Some(PendingPrepare {
-            peer: crate::cpl0_private_witness::PeerActivity::observe(&self.actual_run[1 - index]),
-            window,
-            txn,
-            inventory,
-            handle,
-            execution,
-            owner,
-        })))
+        Ok(BackingPreparation::Prepared(Some(Box::new(
+            PendingPrepare {
+                peer: crate::cpl0_private_witness::PeerActivity::observe(
+                    &self.actual_run[1 - index],
+                ),
+                window,
+                txn,
+                inventory,
+                handle,
+                execution,
+                owner,
+            },
+        ))))
     }
 }
 
