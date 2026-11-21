@@ -24,6 +24,12 @@ pub struct CpuTickPair {
     pub system: u64,
 }
 
+#[inline(never)]
+fn ticks_to_nanos(ticks: u64, frequency: CounterFrequency) -> u64 {
+    let hz = u128::from(frequency.raw().get());
+    u64::try_from(u128::from(ticks).saturating_mul(1_000_000_000) / hz).unwrap_or(u64::MAX)
+}
+
 impl CpuTickPair {
     pub const fn saturating_add(self, other: Self) -> Self {
         Self {
@@ -33,20 +39,20 @@ impl CpuTickPair {
     }
 
     pub fn total_nanos(self, frequency: CounterFrequency) -> u64 {
+        if let Some(sum) = self.user.checked_add(self.system) {
+            return ticks_to_nanos(sum, frequency);
+        }
         let hz = u128::from(frequency.raw().get());
         let total = u128::from(self.user).saturating_add(u128::from(self.system));
         u64::try_from(total.saturating_mul(1_000_000_000) / hz).unwrap_or(u64::MAX)
     }
 
     pub fn user_nanos(self, frequency: CounterFrequency) -> u64 {
-        let hz = u128::from(frequency.raw().get());
-        u64::try_from(u128::from(self.user).saturating_mul(1_000_000_000) / hz).unwrap_or(u64::MAX)
+        ticks_to_nanos(self.user, frequency)
     }
 
     pub fn system_nanos(self, frequency: CounterFrequency) -> u64 {
-        let hz = u128::from(frequency.raw().get());
-        u64::try_from(u128::from(self.system).saturating_mul(1_000_000_000) / hz)
-            .unwrap_or(u64::MAX)
+        ticks_to_nanos(self.system, frequency)
     }
 }
 

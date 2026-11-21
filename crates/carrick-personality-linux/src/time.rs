@@ -9,6 +9,7 @@ use carrick_syscall_abi::{
     LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_EINVAL, linux_clock_resolution_ns,
 };
 
+#[inline(never)]
 pub(crate) fn clock_getres(native: &mut dyn LifecycleNative<'_>) -> LifecycleOutcome {
     let [clock, output, ..] = native.arguments();
     let result = match linux_clock_resolution_ns(clock as i32) {
@@ -54,11 +55,13 @@ pub(crate) const fn serves_clock_gettime(clock: u64) -> bool {
     uses_realtime_words(clock) || uses_monotonic_counter(clock) || uses_cputime(clock).is_some()
 }
 
+#[inline(never)]
 fn counter_nanos(sample: CounterTick, frequency: CounterFrequency) -> u64 {
     (u128::from(sample.raw()) * 1_000_000_000 / u128::from(frequency.raw().get())) as u64
 }
 
 /// The native read uses the guest counter and the same realtime offset as the vDSO.
+#[inline(never)]
 pub(crate) fn clock_gettime(native: &mut dyn LifecycleNative<'_>) -> Option<LifecycleOutcome> {
     use carrick_syscall_abi::LINUX_EFAULT;
 
@@ -95,6 +98,7 @@ fn realtime_nanos(native: &mut dyn LifecycleNative<'_>) -> Option<u64> {
     Some(counter_nanos(sample.tick, sample.frequency).wrapping_add(sample.offset_ns))
 }
 
+#[inline(never)]
 pub(crate) fn realtime_alias(
     ordinal: u64,
     native: &mut dyn LifecycleNative<'_>,
@@ -129,6 +133,7 @@ pub(crate) fn realtime_alias(
     Some(native.finish_time_output(records, result))
 }
 
+#[inline(never)]
 pub(crate) fn times(native: &mut dyn LifecycleNative<'_>) -> Option<LifecycleOutcome> {
     use carrick_syscall_abi::LINUX_CLK_TCK;
     use zerocopy::IntoBytes;

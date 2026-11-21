@@ -69,10 +69,24 @@ impl<
         );
     }
 
-    fn process_venue(&mut self) -> Option<&mut (dyn ProcessNative<'ipc, Context> + 'a)> {
+    /// The current native process venue, if it is bound to the calling task.
+    /// Outlined: its binding comparison is shared by every lifecycle and
+    /// clock call, and the EL1 image is size-bounded.
+    #[inline(never)]
+    pub(crate) fn process_venue(&mut self) -> Option<&mut (dyn ProcessNative<'ipc, Context> + 'a)> {
         let binding = LifecycleNative::binding(self)?;
         let venue = self.process.as_deref_mut()?;
         (venue.binding() == binding).then_some(venue)
+    }
+
+    /// The venue that serves this caller's clocks in ring. The ARM root can
+    /// still have an embedder-controlled ClockDomain, so it keeps its legacy
+    /// dispatch until that domain is available in ring.
+    #[inline(never)]
+    fn clock_venue(&mut self) -> Option<&mut (dyn ProcessNative<'ipc, Context> + 'a)> {
+        let isa = LifecycleNative::guest_isa(self);
+        let venue = self.process_venue()?;
+        (isa != carrick_guest_arch::GuestIsa::Aarch64 || !venue.is_root_process()).then_some(venue)
     }
 
     fn run_ready_after_native_transfer(&mut self, outcome: &mut LifecycleOutcome) {
@@ -220,43 +234,21 @@ impl<
         carrick_guest_arch::CounterTick,
         carrick_guest_arch::CounterFrequency,
     )> {
-        let isa = LifecycleNative::guest_isa(self);
-        let venue = self.process_venue()?;
-        // The ARM root can still have an embedder-controlled ClockDomain.
-        // Keep its legacy dispatch until that domain is available in ring.
-        if isa == carrick_guest_arch::GuestIsa::Aarch64 && venue.is_root_process() {
-            return None;
-        }
-        venue.monotonic_counter()
+        self.clock_venue()?.monotonic_counter()
     }
 
     fn realtime_counter(
         &mut self,
     ) -> Option<carrick_personality_linux::lifecycle::RealtimeCounter> {
-        let isa = LifecycleNative::guest_isa(self);
-        let venue = self.process_venue()?;
-        if isa == carrick_guest_arch::GuestIsa::Aarch64 && venue.is_root_process() {
-            return None;
-        }
-        venue.realtime_counter()
+        self.clock_venue()?.realtime_counter()
     }
 
     fn cputime_nanos(&mut self, per_thread: bool) -> Option<u64> {
-        let isa = LifecycleNative::guest_isa(self);
-        let venue = self.process_venue()?;
-        if isa == carrick_guest_arch::GuestIsa::Aarch64 && venue.is_root_process() {
-            return None;
-        }
-        venue.cputime_nanos(per_thread)
+        self.clock_venue()?.cputime_nanos(per_thread)
     }
 
     fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {
-        let isa = LifecycleNative::guest_isa(self);
-        let venue = self.process_venue()?;
-        if isa == carrick_guest_arch::GuestIsa::Aarch64 && venue.is_root_process() {
-            return None;
-        }
-        venue.process_tms()
+        self.clock_venue()?.process_tms()
     }
 
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
