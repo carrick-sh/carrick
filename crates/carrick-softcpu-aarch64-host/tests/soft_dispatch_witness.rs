@@ -20,8 +20,9 @@ use carrick_softcpu_aarch64::state::{CpuState, ExceptionLevel, RegisterValue, Vi
 use carrick_softcpu_aarch64::translate::{Terminator, TranslatedBlock};
 use carrick_softcpu_aarch64::{Gpr, Hint, Instruction, OperandRegister};
 use carrick_softcpu_aarch64_host::{
-    GUEST_PAGE_BYTES, MappingGeometry, SoftSingleProcessConfig, SoftStage2, Stage2Abort,
-    Stage2AbortAccess, Stage2AbortReason, run_single_process_with_executor_and_setup,
+    GUEST_PAGE_BYTES, Hvc2ReplyCensus, MappingGeometry, SoftFaultTermination,
+    SoftSingleProcessConfig, SoftStage2, Stage2Abort, Stage2AbortAccess, Stage2AbortReason,
+    run_single_process_with_executor_and_setup,
 };
 
 const CODE_VA: u64 = 0x0040_0000;
@@ -32,7 +33,6 @@ const MSG_OFFSET: u64 = 0x40;
 const STAT_OFFSET: u64 = 0x100;
 const READ_BUF_OFFSET: u64 = 0x200;
 const TIMESPEC_OFFSET: u64 = 0x300;
-const RLIMIT_OFFSET: u64 = 0x320;
 
 const FILE_PAYLOAD: &[u8] = b"rootfs file payload\n";
 const STDOUT_PAYLOAD: &[u8] = b"facade witness ok\n";
@@ -57,13 +57,10 @@ const NR_SETITIMER: u64 = 103;
 const NR_CLOCK_GETTIME: u64 = 113;
 const NR_TKILL: u64 = 130;
 const NR_RT_SIGACTION: u64 = 134;
-const NR_GETUID: u64 = 174;
-const NR_GETEUID: u64 = 175;
 const NR_BRK: u64 = 214;
 const NR_MUNMAP: u64 = 215;
 const NR_MMAP: u64 = 222;
 const NR_MPROTECT: u64 = 226;
-const NR_PRLIMIT64: u64 = 261;
 
 const AT_FDCWD: u64 = (-100i64) as u64;
 const O_CLOEXEC: u64 = 0x80000;
@@ -72,7 +69,6 @@ const PROT_WRITE: u64 = 2;
 const MAP_PRIVATE: u64 = 2;
 const MAP_ANONYMOUS: u64 = 0x20;
 const CLOCK_MONOTONIC: u64 = 1;
-const RLIMIT_NOFILE: u64 = 7;
 
 fn build_witness_elf(code_words: &[u32], data_init: &[(usize, &[u8])]) -> Vec<u8> {
     let mut elf = vec![0u8; 0x3000];
@@ -374,35 +370,10 @@ impl ScriptedHvc2Executor {
                     [CLOCK_MONOTONIC, DATA_VA + TIMESPEC_OFFSET, 0, 0, 0, 0],
                 );
             }
-            // 16: getuid()
+            // 16: write(1, STDOUT_PAYLOAD, len)
             16 => {
                 if x0 != 0 {
                     return Err(format!("clock_gettime failed: {}", x0 as i64));
-                }
-                Self::set_call(cpu, NR_GETUID, [0; 6]);
-            }
-            // 17: geteuid()
-            17 => {
-                if x0 != 0 {
-                    return Err(format!("getuid returned {}", x0 as i64));
-                }
-                Self::set_call(cpu, NR_GETEUID, [0; 6]);
-            }
-            // 18: prlimit64(0, RLIMIT_NOFILE, 0, rlim_buf)
-            18 => {
-                if x0 != 0 {
-                    return Err(format!("geteuid returned {}", x0 as i64));
-                }
-                Self::set_call(
-                    cpu,
-                    NR_PRLIMIT64,
-                    [0, RLIMIT_NOFILE, 0, DATA_VA + RLIMIT_OFFSET, 0, 0],
-                );
-            }
-            // 19: write(1, STDOUT_PAYLOAD, len)
-            19 => {
-                if x0 != 0 {
-                    return Err(format!("prlimit64 failed: {}", x0 as i64));
                 }
                 Self::set_call(
                     cpu,
@@ -417,8 +388,8 @@ impl ScriptedHvc2Executor {
                     ],
                 );
             }
-            // 20: exit_group(0)
-            20 => {
+            // 17: exit_group(0)
+            17 => {
                 if x0 != STDOUT_PAYLOAD.len() as u64 {
                     return Err(format!("write(stdout) returned {}", x0 as i64));
                 }
@@ -514,11 +485,8 @@ fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
         A64_LDR_X3_X1, // 13: load file-backed alias word through live stage-1 + SoftStage2
         A64_SVC_0,     // 14: close(fd)
         A64_SVC_0,     // 15: clock_gettime(CLOCK_MONOTONIC)
-        A64_SVC_0,     // 16: getuid
-        A64_SVC_0,     // 17: geteuid
-        A64_SVC_0,     // 18: prlimit64(RLIMIT_NOFILE)
-        A64_SVC_0,     // 19: write(1, STDOUT_PAYLOAD)
-        A64_SVC_0,     // 20: exit_group(0)
+        A64_SVC_0,     // 16: write(1, STDOUT_PAYLOAD)
+        A64_SVC_0,     // 17: exit_group(0)
     ];
     let elf = build_witness_elf(
         &code_words,
@@ -564,7 +532,15 @@ fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
     assert_eq!(run.exit_code, 0);
     assert_eq!(run.stdout, STDOUT_PAYLOAD);
     assert!(run.stderr.is_empty());
-    assert_eq!(run.syscalls_dispatched, 16);
+    assert_eq!(run.syscalls_dispatched, 13);
+    assert_eq!(
+        run.reply_census,
+        Hvc2ReplyCensus {
+            fixture_answers: 0,
+            production_answers: 13,
+        }
+    );
+    assert_eq!(run.terminating_fault, None);
     assert!(
         run.counted_enosys.is_empty(),
         "unexpected counted ENOSYS: {:?}",
@@ -579,7 +555,7 @@ fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
         u64::from_le_bytes(FILE_PAYLOAD[..8].try_into().unwrap())
     );
 
-    // Verify kernel-written guest buffers (`fstat`, `read`, `clock_gettime`, `prlimit64`)
+    // Verify kernel-written guest buffers (`fstat`, `read`, `clock_gettime`)
     // through `Aarch64EngineCore<SoftAarch64Vmm>`'s stage-1 `GuestMemory` implementation.
     let read_back = run
         .engine
@@ -604,13 +580,6 @@ fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
         tv_sec > 0 || tv_nsec > 0,
         "expected positive CLOCK_MONOTONIC timespec, got ({tv_sec}, {tv_nsec})"
     );
-
-    let rlim_bytes = run
-        .engine
-        .read_bytes(DATA_VA + RLIMIT_OFFSET, 16)
-        .expect("read prlimit64 RLIMIT_NOFILE");
-    let rlim_cur = u64::from_le_bytes(rlim_bytes[0..8].try_into().unwrap());
-    assert!(rlim_cur >= 64, "expected sane RLIMIT_NOFILE cur={rlim_cur}");
 }
 
 #[test]
@@ -826,19 +795,32 @@ impl ExecuteBlock for SequenceHvc2Executor {
 #[test]
 fn soft_single_process_refuses_timer_and_signal_syscalls_with_counted_enosys() {
     let _test_guard = lock_soft_carrier_test();
-    // Prepare a 1-second `itimerval` (`it_value.tv_sec = 1`) at `DATA_VA + 0x300`
-    // so `setitimer` would arm a timer on a null bridge instead of failing validation.
+    // Prepare a 1-second `itimerval` (`it_value.tv_sec = 1`) at `DATA_VA + 0x300`,
+    // a `SIG_IGN` `sigaction` at `DATA_VA + 0x340`, and a custom user-handler
+    // `sigaction` (`sa_handler = CODE_VA`) at `DATA_VA + 0x380`.
     let mut itimerval = [0u8; 32];
     itimerval[16..24].copy_from_slice(&1i64.to_le_bytes());
+    let mut ign_sigaction = [0u8; 32];
+    ign_sigaction[0..8].copy_from_slice(&carrick_abi::LINUX_SIG_IGN.to_le_bytes());
+    let mut custom_sigaction = [0u8; 32];
+    custom_sigaction[0..8].copy_from_slice(&CODE_VA.to_le_bytes());
     let calls = vec![
+        (NR_RT_SIGACTION, [13, DATA_VA + 0x340, 0, 8, 0, 0]), // SIGPIPE = SIG_IGN -> 0
         (NR_TIMERFD_CREATE, [CLOCK_MONOTONIC, 0, 0, 0, 0, 0]),
         (NR_SETITIMER, [0, DATA_VA + 0x300, 0, 0, 0, 0]),
-        (NR_RT_SIGACTION, [13, 0, DATA_VA + 0x340, 8, 0, 0]),
+        (NR_RT_SIGACTION, [10, DATA_VA + 0x380, 0, 8, 0, 0]), // custom handler -> -ENOSYS
         (NR_TKILL, [1, 0, 0, 0, 0, 0]),
         (NR_EXIT_GROUP, [0; 6]),
     ];
     let code_words = vec![A64_SVC_0; calls.len()];
-    let elf = build_witness_elf(&code_words, &[(0x300, &itimerval)]);
+    let elf = build_witness_elf(
+        &code_words,
+        &[
+            (0x300, &itimerval),
+            (0x340, &ign_sigaction),
+            (0x380, &custom_sigaction),
+        ],
+    );
 
     let mailbox_slot = Arc::new(AtomicPtr::new(null_mut()));
     let returns = Arc::new(Mutex::new(Vec::new()));
@@ -875,8 +857,8 @@ fn soft_single_process_refuses_timer_and_signal_syscalls_with_counted_enosys() {
     let enosys = carrick_abi::LINUX_ENOSYS.guest_retval();
     assert_eq!(
         observed_returns,
-        vec![enosys, enosys, enosys, enosys],
-        "timer and signal syscalls must fail closed with -ENOSYS instead of silently succeeding"
+        vec![0, enosys, enosys, enosys, enosys],
+        "SIG_IGN disposition may succeed, while custom handlers, timers, and signal sends must fail closed with -ENOSYS"
     );
     assert_eq!(
         run.counted_enosys,
@@ -1019,4 +1001,386 @@ fn soft_carrier_enforces_single_live_aperture_and_compare_clears() {
     .expect("sequential soft carrier after drop must succeed");
     assert_eq!(run3.exit_code, 0);
     assert_eq!(carrick_el1_abi::get_el1_region_host_ptr(), 0);
+}
+
+enum NegativeMmCase {
+    StoreAfterMprotectReadOnly,
+    LoadAfterMunmap,
+}
+
+struct NegativeMmExecutor {
+    mailbox: Arc<AtomicPtr<Aarch64SyscallMailbox>>,
+    case: NegativeMmCase,
+    mapped_va: Arc<std::sync::atomic::AtomicU64>,
+    next_seq: u64,
+}
+
+impl NegativeMmExecutor {
+    fn publish_mailbox_request(&mut self, cpu: &CpuState) -> Result<(), String> {
+        let ptr = self.mailbox.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return Err("mailbox pointer was not bound before HVC #2".to_owned());
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        // SAFETY: `ptr` points to the stage-2 `Aarch64SyscallMailbox` slot.
+        unsafe {
+            core::ptr::write_volatile(&raw mut (*ptr).sequence, seq);
+            core::ptr::write_volatile(&raw mut (*ptr).trap_kind, MailboxTrapKind::Syscall.raw());
+            core::ptr::write_volatile(&raw mut (*ptr).native_nr, rx(cpu, 8));
+            core::ptr::write_volatile(
+                &raw mut (*ptr).args,
+                [
+                    rx(cpu, 0),
+                    rx(cpu, 1),
+                    rx(cpu, 2),
+                    rx(cpu, 3),
+                    rx(cpu, 4),
+                    rx(cpu, 5),
+                ],
+            );
+            core::ptr::write_volatile(&raw mut (*ptr).resume_pc, cpu.el1.elr.0);
+            core::ptr::write_volatile(&raw mut (*ptr).spsr, cpu.el1.spsr.0);
+            core::ptr::write_volatile(&raw mut (*ptr).fp, rx(cpu, 29));
+            core::ptr::write_volatile(&raw mut (*ptr).lr, rx(cpu, 30));
+            core::ptr::write_volatile(&raw mut (*ptr).sp, cpu.sp_el0.0);
+            core::ptr::write_volatile(&raw mut (*ptr).esr, cpu.el1.esr.0);
+            (*ptr)
+                .state
+                .store(MailboxState::RequestReady.raw(), Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn consume_mailbox_response(&self, cpu: &mut CpuState) -> Result<(), String> {
+        let ptr = self.mailbox.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return Err("mailbox pointer was not bound on ERET".to_owned());
+        }
+        // SAFETY: `ptr` points to the stage-2 `Aarch64SyscallMailbox` slot.
+        unsafe {
+            let state = (*ptr).state.load(Ordering::Acquire);
+            if state == MailboxState::Idle.raw() {
+                return Ok(());
+            }
+            if state != MailboxState::ResponseReady.raw() {
+                return Err(format!("expected ResponseReady (2) on ERET, got {state}"));
+            }
+            let retval = core::ptr::read_volatile(&raw const (*ptr).return_value);
+            wx(cpu, 0, retval);
+            (*ptr)
+                .state
+                .store(MailboxState::Idle.raw(), Ordering::Release);
+        }
+        Ok(())
+    }
+}
+
+impl ExecuteBlock for NegativeMmExecutor {
+    type Error = String;
+    type Code = ();
+
+    fn prepare(&mut self, _block: &TranslatedBlock) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn execute(
+        &mut self,
+        block: &TranslatedBlock,
+        _code: &(),
+        cpu: &mut CpuState,
+    ) -> Result<usize, Self::Error> {
+        if cpu.pstate.el == ExceptionLevel::El0 && (CODE_VA..CODE_VA + 0x1000).contains(&cpu.pc.0) {
+            let step = (cpu.pc.0 - CODE_VA) / 4;
+            let x0 = rx(cpu, 0);
+            match (&self.case, step) {
+                // 0: mmap(0, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+                (_, 0) => ScriptedHvc2Executor::set_call(
+                    cpu,
+                    NR_MMAP,
+                    [
+                        0,
+                        0x1000,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ],
+                ),
+                // 1: str x2, [x1] into RW mapping
+                (_, 1) => {
+                    if (x0 as i64) <= 0 || !x0.is_multiple_of(GUEST_PAGE_BYTES) {
+                        return Err(format!("mmap failed: {x0:#x}"));
+                    }
+                    self.mapped_va.store(x0, Ordering::Release);
+                    wx(cpu, 1, x0);
+                    wx(cpu, 2, 0xDEAD_BEEF_CAFE_0001);
+                }
+                // 2: mprotect(va, 0x1000, PROT_READ) or munmap(va, 0x1000)
+                (NegativeMmCase::StoreAfterMprotectReadOnly, 2) => {
+                    let va = self.mapped_va.load(Ordering::Acquire);
+                    ScriptedHvc2Executor::set_call(
+                        cpu,
+                        NR_MPROTECT,
+                        [va, 0x1000, PROT_READ, 0, 0, 0],
+                    );
+                }
+                (NegativeMmCase::LoadAfterMunmap, 2) => {
+                    let va = self.mapped_va.load(Ordering::Acquire);
+                    ScriptedHvc2Executor::set_call(cpu, NR_MUNMAP, [va, 0x1000, 0, 0, 0, 0]);
+                }
+                // 3: ldr x3, [x1] under PROT_READ (must succeed), or faulting ldr after munmap
+                (NegativeMmCase::StoreAfterMprotectReadOnly, 3) => {
+                    if x0 != 0 {
+                        return Err(format!("mprotect(PROT_READ) failed: {}", x0 as i64));
+                    }
+                    wx(cpu, 1, self.mapped_va.load(Ordering::Acquire));
+                }
+                (NegativeMmCase::LoadAfterMunmap, 3) => {
+                    if x0 != 0 {
+                        return Err(format!("munmap failed: {}", x0 as i64));
+                    }
+                    wx(cpu, 1, self.mapped_va.load(Ordering::Acquire));
+                }
+                // 4: faulting str x2, [x1] into PROT_READ page (must fault with SEGV_ACCERR)
+                (NegativeMmCase::StoreAfterMprotectReadOnly, 4) => {
+                    if rx(cpu, 3) != 0xDEAD_BEEF_CAFE_0001 {
+                        return Err(format!("unexpected PROT_READ load: {:#x}", rx(cpu, 3)));
+                    }
+                    wx(cpu, 1, self.mapped_va.load(Ordering::Acquire));
+                    wx(cpu, 2, 0xBAD0_BAD0_BAD0_BAD0);
+                }
+                (_, other) => {
+                    return Err(format!(
+                        "guest must not reach step {other} after faulting memory access"
+                    ));
+                }
+            }
+        } else if cpu.pstate.el == ExceptionLevel::El1 {
+            if cpu.pc.0 == LINUX_EL1_VECTORS_BASE + 0x400 {
+                if carrick_hal::aarch64::is_aarch64_svc_exception(cpu.el1.esr.0) {
+                    self.publish_mailbox_request(cpu)?;
+                }
+            } else if cpu.pc.0 == LINUX_EL1_VECTORS_BASE + 0x404 {
+                self.consume_mailbox_response(cpu)?;
+            }
+        }
+        match block.terminator() {
+            Terminator::Handler(idx) | Terminator::Jump(idx) | Terminator::Fallthrough(idx) => {
+                Ok(idx)
+            }
+            Terminator::Conditional { .. } => Err("unexpected conditional terminator".to_owned()),
+        }
+    }
+}
+
+#[test]
+fn soft_single_process_store_after_mprotect_prot_read_faults_with_segv_accerr() {
+    let _test_guard = lock_soft_carrier_test();
+
+    // Stage-2 negative check: demoting a frame to read-only denies guest writes.
+    let mut stage2 = SoftStage2::new().expect("allocate SoftStage2");
+    let frame = 0x2400_0000u64;
+    stage2
+        .map_owned_anonymous(
+            frame,
+            GUEST_PAGE_BYTES,
+            MemPerms {
+                read: true,
+                write: true,
+                exec: false,
+            },
+            false,
+        )
+        .expect("map RW stage-2 page");
+    SoftGuestMemory::write(
+        &mut stage2,
+        VirtualAddress(frame),
+        &0x1234_5678u32.to_le_bytes(),
+    )
+    .expect("write RW stage-2 page");
+    stage2
+        .protect_stage2(
+            frame,
+            GUEST_PAGE_BYTES,
+            MemPerms {
+                read: true,
+                write: false,
+                exec: false,
+            },
+        )
+        .expect("demote stage-2 page to RO");
+    assert!(
+        SoftGuestMemory::write(
+            &mut stage2,
+            VirtualAddress(frame),
+            &0x9999_9999u32.to_le_bytes()
+        )
+        .is_err(),
+        "store to RO stage-2 page must fail"
+    );
+    assert_eq!(
+        stage2.last_abort(),
+        Some(Stage2Abort {
+            gpa: frame,
+            access: Stage2AbortAccess::Write,
+            reason: Stage2AbortReason::PermissionDenied,
+        })
+    );
+
+    // Production stage-1 + kernel dispatch negative check:
+    // 0: mmap(RW), 1: str, 2: mprotect(PROT_READ), 3: ldr (ok), 4: str (SEGV_ACCERR), 5: exit_group
+    let code_words = [
+        A64_SVC_0,
+        A64_STR_X2_X1,
+        A64_SVC_0,
+        A64_LDR_X3_X1,
+        A64_STR_X2_X1,
+        A64_SVC_0,
+    ];
+    let elf = build_witness_elf(&code_words, &[]);
+    let mailbox = Arc::new(AtomicPtr::new(null_mut()));
+    let mapped_va = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let executor = NegativeMmExecutor {
+        mailbox: Arc::clone(&mailbox),
+        case: NegativeMmCase::StoreAfterMprotectReadOnly,
+        mapped_va: Arc::clone(&mapped_va),
+        next_seq: 1,
+    };
+    let config = SoftSingleProcessConfig::new(&elf, "/mprotect-readonly-store");
+    let mb_for_setup = Arc::clone(&mailbox);
+    let run = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
+        let mut vec_stub = [0u8; 8];
+        vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+        vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+        engine
+            .backend()
+            .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+            .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+        let ptr = engine
+            .backend()
+            .host_ptr(
+                LINUX_SYSCALL_MAILBOX_BASE,
+                AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+        mb_for_setup.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+        Ok(())
+    })
+    .expect("store to PROT_READ mapping must terminate with lowered SIGSEGV");
+
+    let anon_va = mapped_va.load(Ordering::Acquire);
+    assert_ne!(anon_va, 0);
+    assert_eq!(run.exit_code, 128 + 11);
+    assert_eq!(
+        run.terminating_fault,
+        Some(SoftFaultTermination {
+            signum: 11, // SIGSEGV
+            si_code: 2, // SEGV_ACCERR
+            fault_addr: anon_va,
+            elr: CODE_VA + 4 * 4,
+            syndrome: 0x9200_004f,
+        })
+    );
+
+    // Read-only memory contents must remain untouched after the blocked store.
+    let preserved = run
+        .engine
+        .read_bytes(anon_va, 8)
+        .expect("read preserved PROT_READ word");
+    assert_eq!(
+        u64::from_le_bytes(preserved.try_into().unwrap()),
+        0xDEAD_BEEF_CAFE_0001
+    );
+}
+
+#[test]
+fn soft_single_process_access_after_munmap_faults_with_segv_maperr() {
+    let _test_guard = lock_soft_carrier_test();
+
+    // Stage-2 negative check: unmapping a frame denies subsequent guest reads with Unmapped.
+    let mut stage2 = SoftStage2::new().expect("allocate SoftStage2");
+    let frame = 0x2500_0000u64;
+    let mut buf = [0u8; 4];
+    stage2
+        .map_owned_anonymous(
+            frame,
+            GUEST_PAGE_BYTES,
+            MemPerms {
+                read: true,
+                write: true,
+                exec: false,
+            },
+            false,
+        )
+        .expect("map RW stage-2 page");
+    stage2
+        .unmap_stage2(frame, GUEST_PAGE_BYTES)
+        .expect("unmap stage-2 page");
+    assert!(
+        SoftGuestMemory::read(&mut stage2, VirtualAddress(frame), &mut buf).is_err(),
+        "load from unmapped stage-2 page must fail"
+    );
+    assert_eq!(
+        stage2.last_abort(),
+        Some(Stage2Abort {
+            gpa: frame,
+            access: Stage2AbortAccess::Read,
+            reason: Stage2AbortReason::Unmapped,
+        })
+    );
+
+    // Production stage-1 + kernel dispatch negative check:
+    // 0: mmap(RW), 1: str, 2: munmap, 3: ldr (SEGV_MAPERR), 4: exit_group
+    let code_words = [
+        A64_SVC_0,
+        A64_STR_X2_X1,
+        A64_SVC_0,
+        A64_LDR_X3_X1,
+        A64_SVC_0,
+    ];
+    let elf = build_witness_elf(&code_words, &[]);
+    let mailbox = Arc::new(AtomicPtr::new(null_mut()));
+    let mapped_va = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let executor = NegativeMmExecutor {
+        mailbox: Arc::clone(&mailbox),
+        case: NegativeMmCase::LoadAfterMunmap,
+        mapped_va: Arc::clone(&mapped_va),
+        next_seq: 1,
+    };
+    let config = SoftSingleProcessConfig::new(&elf, "/munmap-load-fault");
+    let mb_for_setup = Arc::clone(&mailbox);
+    let run = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
+        let mut vec_stub = [0u8; 8];
+        vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+        vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+        engine
+            .backend()
+            .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+            .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+        let ptr = engine
+            .backend()
+            .host_ptr(
+                LINUX_SYSCALL_MAILBOX_BASE,
+                AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+        mb_for_setup.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+        Ok(())
+    })
+    .expect("load from munmapped mapping must terminate with lowered SIGSEGV");
+
+    let anon_va = mapped_va.load(Ordering::Acquire);
+    assert_ne!(anon_va, 0);
+    assert_eq!(run.exit_code, 128 + 11);
+    assert_eq!(
+        run.terminating_fault,
+        Some(SoftFaultTermination {
+            signum: 11, // SIGSEGV
+            si_code: 1, // SEGV_MAPERR
+            fault_addr: anon_va,
+            elr: CODE_VA + 3 * 4,
+            syndrome: 0x9200_0007,
+        })
+    );
 }

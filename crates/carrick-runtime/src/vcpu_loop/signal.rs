@@ -52,65 +52,13 @@ pub(crate) fn partial_write_interrupt_outcome(
 }
 
 // ===================================================================
-// EL0 synchronous-fault translation (moved from runtime/fault.rs; the
-// classifier fns are pure and the delivery fn is generic over the engine).
+// EL0 synchronous-fault translation (`carrick_aarch64::esr` owns the pure
+// AArch64 ESR_EL1 decodes; re-exported here so every runtime fault path
+// resolves unchanged).
 // ===================================================================
-/// Map an EL0 synchronous-fault `ESR_EL1` to the Linux `(signum, si_code)` the
-/// kernel would deliver, or `None` for a class we don't translate (kept fatal).
-pub(crate) fn el0_fault_signal(esr: u64) -> Option<(i32, i32)> {
-    const SIGSEGV: i32 = 11;
-    const SIGBUS: i32 = 7;
-    const SEGV_MAPERR: i32 = 1;
-    const SEGV_ACCERR: i32 = 2;
-    const BUS_ADRALN: i32 = 1;
-    let ec = (esr >> 26) & 0x3f;
-    let dfsc = esr & 0x3f;
-    let segv_code = if (0x0c..=0x0f).contains(&dfsc) {
-        SEGV_ACCERR
-    } else {
-        SEGV_MAPERR
-    };
-    match ec {
-        0x20 | 0x21 => Some((SIGSEGV, segv_code)), // instruction abort
-        0x24 | 0x25 => {
-            if dfsc == 0x21 {
-                Some((SIGBUS, BUS_ADRALN)) // alignment fault
-            } else {
-                Some((SIGSEGV, segv_code))
-            }
-        }
-        _ => None,
-    }
-}
-
-// `el0_fault_kind` and `el0_fault_access` (pure AArch64 ESR_EL1 decodes) moved
-// to `carrick_aarch64::esr`, shared with the soft-CPU single-process runner;
-// re-exported so every fault path here resolves unchanged.
-pub(crate) use carrick_aarch64::esr::{el0_fault_access, el0_fault_kind};
-
-// `el0_debug_signal` (a pure AArch64 ESR_EL1 architectural fact) moved to
-// `carrick_aarch64::esr`; re-exported so the HVF lowering below and
-// every `el0_debug_signal` call path resolve unchanged.
-pub(crate) use carrick_aarch64::esr::el0_debug_signal;
-
-/// Lower a raw aarch64 `EL0Fault` (raw `ESR_EL1` + `elr`/`far`) to the
-/// ISA-neutral resolved signal triple `(signum, si_code, fault_addr)`, or `None`
-/// for a class we don't translate (kept fatal → caller terminates by SIGSEGV).
-///
-/// This is the aarch64 → [`TrapError::GuestFault`] lowering. It MUST cover BOTH
-/// fault arms so the GuestFault path is byte-identical to the historical
-/// `EL0Fault` path: `el0_debug_signal` (BRK/single-step/HW-bp → SIGTRAP/TRAP_*)
-/// is tried FIRST (so a debug exception carries the faulting PC as `si_addr`),
-/// then `el0_fault_signal` (instruction/data abort → SIGSEGV/SIGBUS, carrying
-/// `FAR_EL1` as `si_addr`). Mapping only `el0_fault_signal` would regress
-/// BRK/single-step SIGTRAP delivery (ptrace, Go TestDebugCall).
-pub(crate) fn lower_el0_fault(esr: u64, elr: u64, far: u64) -> Option<(i32, i32, u64)> {
-    if let Some((signum, si_code)) = el0_debug_signal(esr) {
-        Some((signum, si_code, elr))
-    } else {
-        el0_fault_signal(esr).map(|(signum, si_code)| (signum, si_code, far))
-    }
-}
+#[cfg(test)]
+pub(crate) use carrick_aarch64::esr::{el0_debug_signal, el0_fault_signal};
+pub(crate) use carrick_aarch64::esr::{el0_fault_access, el0_fault_kind, lower_el0_fault};
 
 #[derive(::core::fmt::Debug)]
 pub(crate) enum FaultSignalDisposition {

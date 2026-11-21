@@ -87,6 +87,47 @@ pub fn decode_el0_sys64_read(esr: u64) -> Option<(u8, El0SysRegRead)> {
     Some((rt, reg))
 }
 
+/// Map an EL0 synchronous-fault `ESR_EL1` to the Linux `(signum, si_code)` the
+/// kernel would deliver, or `None` for a class we don't translate (kept fatal).
+#[must_use]
+pub fn el0_fault_signal(esr: u64) -> Option<(i32, i32)> {
+    const SIGSEGV: i32 = 11;
+    const SIGBUS: i32 = 7;
+    const SEGV_MAPERR: i32 = 1;
+    const SEGV_ACCERR: i32 = 2;
+    const BUS_ADRALN: i32 = 1;
+    let ec = carrick_hal::aarch64::aarch64_exception_class(esr);
+    let dfsc = esr & 0x3f;
+    let segv_code = if (0x0c..=0x0f).contains(&dfsc) {
+        SEGV_ACCERR
+    } else {
+        SEGV_MAPERR
+    };
+    match ec {
+        0x20 | 0x21 => Some((SIGSEGV, segv_code)), // instruction abort
+        0x24 | 0x25 => {
+            if dfsc == 0x21 {
+                Some((SIGBUS, BUS_ADRALN)) // alignment fault
+            } else {
+                Some((SIGSEGV, segv_code))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Lower a raw AArch64 `EL0Fault` (`ESR_EL1` + `elr`/`far`) to the ISA-neutral
+/// resolved signal triple `(signum, si_code, fault_addr)`, or `None` for an
+/// untranslated class.
+#[must_use]
+pub fn lower_el0_fault(esr: u64, elr: u64, far: u64) -> Option<(i32, i32, u64)> {
+    if let Some((signum, si_code)) = el0_debug_signal(esr) {
+        Some((signum, si_code, elr))
+    } else {
+        el0_fault_signal(esr).map(|(signum, si_code)| (signum, si_code, far))
+    }
+}
+
 /// The stage-1 fault kind of an EL0 data or instruction abort's syndrome;
 /// `None` for any other exception class or fault status.
 #[must_use]
@@ -212,5 +253,25 @@ mod tests {
         );
         assert_eq!(el0_fault_kind(esr(0x24) | 0x21), None); // alignment fault
         assert_eq!(el0_fault_kind(esr(0x15) | 0x07), None); // SVC class
+    }
+
+    #[test]
+    fn lowers_el0_aborts_and_debug_faults_to_linux_signal_triples() {
+        assert_eq!(
+            lower_el0_fault(0x9200_004f, 0x0040_0010, 0x0060_0000_0000),
+            Some((11, 2, 0x0060_0000_0000))
+        );
+        assert_eq!(
+            lower_el0_fault(0x9200_0007, 0x0040_000c, 0x0060_0000_0000),
+            Some((11, 1, 0x0060_0000_0000))
+        );
+        assert_eq!(
+            lower_el0_fault(esr(0x24) | 0x21, 0x0040_0000, 0x0040_1001),
+            Some((7, 1, 0x0040_1001))
+        );
+        assert_eq!(
+            lower_el0_fault(esr(0x3c), 0x0040_0020, 0),
+            Some((SIGTRAP, TRAP_BRKPT, 0x0040_0020))
+        );
     }
 }
