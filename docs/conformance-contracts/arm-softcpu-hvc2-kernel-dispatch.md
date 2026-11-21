@@ -26,6 +26,17 @@ routing from the soft AArch64 CPU (`carrick-softcpu-aarch64` +
   bring-up (`set_tid_address` 96 and `prlimit64` 261 pending `#2645`, `rseq`
   293 per `#1906`, and timer/signal syscalls refused fail-closed with `-ENOSYS`)
   are sampled in `counted_enosys` rather than faked.
+- **Shared host-carrier alias inventory, first touch, and owner wait**:
+  `carrick_kernel::dispatch::carrier_loop` holds the pieces moved out of the
+  `carrick-runtime` vCPU loop: alias `FrameInventoryCommit` publication to the
+  kernel `FrameInventoryAuthority`, the post-publish stage-1
+  protection/sharing/`SIGBUS` tail and VMA commit, and the resident +
+  `MAP_GROWSDOWN` + stale-stage-1-leaf first-touch sequence. The soft runner
+  calls them; a soft `MAP_SHARED` file `mmap` leaves its alias mapping in the
+  kernel frame inventory. On `ReservationBusy` the soft runner releases its MM
+  mutation lease, enrols on the holder's release through the carrier MM portal
+  (`PortalWaitEnrollment::park_host`, which probes once), parks until the
+  release hands its zone record back, and reruns: no `yield_now()` polling.
 - **Stage-1 and stage-2 permission and unmap enforcement**: stores after
   `mprotect(..., PROT_READ)` terminate with `SIGSEGV` (`SEGV_ACCERR`) leaving
   read-only contents intact, and accesses after `munmap` terminate with
@@ -43,6 +54,8 @@ routing from the soft AArch64 CPU (`carrick-softcpu-aarch64` +
   - `carrick-aarch64::esr::tests::lowers_el0_aborts_and_debug_faults_to_linux_signal_triples`
   - `carrick-aarch64::mailbox::tests::mailbox_slot_round_trips_request_and_response`
   - `carrick-aarch64::mailbox::tests::hvc_immediates_classify_canonically`
+  - `carrick-kernel::dispatch::carrier_loop::tests::apply_first_touch_enforces_linux_stage1_access_matrix`
+  - `carrick-kernel::dispatch::carrier_loop::tests::first_touch_busy_root_enrols_once_then_reruns_without_polling`
 - Native Linux `aarch64` (`soft-aarch64-native`):
   - `carrick-softcpu-aarch64-host::boot_probe::soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch`
   - `carrick-softcpu-aarch64-host::boot_probe::soft_cpu_runs_static_musl_hello_through_production_dispatch`
