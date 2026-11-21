@@ -6499,3 +6499,12 @@ fn run_x86_fork_exec_poll_witness(become_ready: bool) {
         "Carrick KVM fork+exec+20x poll+wait4(-1) must finish within 2s, took {elapsed:?}"
     );
 }
+
+#[test]
+fn zz_probe_segv_then_fault() {
+    for flags in [&[][..], &["-DTOUCH_AFTER"][..]] {
+        let elf = native_exit_fixture_with_flags("zz_segv_then_fault.S", flags);
+        let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED);
+        eprintln!("PROBE {flags:?} = {:?}", outcome.map(|o| o.run.exit_code).map_err(|e| format!("{e:?}").chars().take(200).collect::<String>()));
+    }
+}
