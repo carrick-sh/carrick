@@ -2,7 +2,8 @@
  * across fork; the child discards its inherited copy, then reproduces V8's
  * guard page (mprotect PROT_NONE, then MADV_DONTNEED) and discards a touched
  * RW page. A failed madvise exits with its errno (38 on the original ring);
- * other stages exit with their own status, and the parent with the child's.
+ * other stages exit with their own status (71..73: which mprotect failed),
+ * and the parent with the child's.
  */
 .global _start
 .text
@@ -73,28 +74,35 @@ child:
     mov %r14, %rdi
     mov $0x40000, %esi
     mov $3, %edx
+    mov $71, %ebx
     call protect
-    movb $0x42, (%r14)
-    movb $0x42, 0x1000(%r14)
 
-    /* The guard page: PROT_NONE, then MADV_DONTNEED. */
+    /* V8's guard page: PROT_NONE, then MADV_DONTNEED. The chunk is touched
+     * only afterwards: on x86 today, PROT_NONE over a page a first touch
+     * already backed (or prepared) is refused before any madvise, a
+     * separate mprotect gap. */
     lea 0x1000(%r14), %rdi
     mov $0x1000, %esi
     xor %edx, %edx
+    mov $72, %ebx
     call protect
     lea 0x1000(%r14), %rdi
     mov $0x1000, %esi
     mov $4, %edx
     call advise
-    /* Its bytes are gone once it is readable again. */
+    /* It reads zero once it is readable again. */
     lea 0x1000(%r14), %rdi
     mov $0x1000, %esi
     mov $3, %edx
+    mov $73, %ebx
     call protect
     cmpb $0, 0x1000(%r14)
     jne guard_bytes_failed
 
     /* A touched RW page keeps RW and reads zero, then takes new bytes. */
+    movb $0x42, (%r14)
+    cmpb $0x42, (%r14)
+    jne rw_bytes_failed
     mov %r14, %rdi
     mov $0x1000, %esi
     mov $4, %edx
@@ -164,7 +172,7 @@ inherited_bytes_failed:
     mov $65, %edi
     jmp exit
 protect_failed:
-    mov $66, %edi
+    mov %ebx, %edi
     jmp exit
 guard_bytes_failed:
     mov $67, %edi
