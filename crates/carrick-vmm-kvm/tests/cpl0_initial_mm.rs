@@ -7,7 +7,9 @@ use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialT
 #[path = "common/kvm_pool_fixture.rs"]
 mod kvm_pool_fixture;
 use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
-use kvm_pool_fixture::{physical_inventory, run_pool_fixture, run_pool_fixture_with};
+use kvm_pool_fixture::{
+    ROOT_AFFINITY_ANY, physical_inventory, run_pool_fixture, run_pool_fixture_with,
+};
 use std::path::PathBuf;
 
 /// Only CPU 0 (the loaded lane) may schedule the root and its inherited children.
@@ -819,14 +821,30 @@ fn parked_exec_signal_witness(flag: &str, stdout: &[u8]) {
 /// Run the production CPL0 root, which execs `path` and exits with the
 /// refused errno (38 is ENOSYS) if `execve` returns.
 fn run_root_exec(path: &std::path::Path) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    run_root_exec_with_affinity(path, ROOT_AFFINITY_LOADED)
+}
+
+fn run_root_exec_with_affinity(
+    path: &std::path::Path,
+    affinity: u64,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let define = format!("-DEXEC_PATH=\"{}\"", path.display());
     let elf = native_exit_fixture_with_flags("native_root_exec.S", &[&define]);
-    run_exec_fixture(&elf, 128)
+    run_exec_fixture_with_affinity(&elf, 128, affinity)
 }
 
 fn run_exec_fixture(
     elf: &[u8],
     max_exits: usize,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    run_exec_fixture_with_affinity(elf, max_exits, ROOT_AFFINITY_LOADED)
+}
+
+/// Run an exec fixture with the run root schedulable on the `affinity` CPUs.
+fn run_exec_fixture_with_affinity(
+    elf: &[u8],
+    max_exits: usize,
+    affinity: u64,
 ) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("exec caller ELF");
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
@@ -837,7 +855,7 @@ fn run_exec_fixture(
     kvm_pool_fixture::try_run_program_with_dispatcher(
         &program,
         max_exits,
-        ROOT_AFFINITY_LOADED,
+        affinity,
         |_| {},
         dispatcher,
     )
@@ -889,17 +907,54 @@ fn run_exec_fixture_with_stock_pressure(
 /// #2142: root exec must replace the production CPL0 image, not return ENOSYS.
 #[test]
 fn production_root_exec_replaces_image_and_runs_static_successor() {
+    root_exec_replaces_image(ROOT_AFFINITY_LOADED);
+}
+
+/// #2142 review P0: the root may run on the idle peer, which holds no root
+/// custody. A root exec issued there must still run its successor.
+#[test]
+fn production_root_exec_on_the_idle_peer_runs_static_successor() {
+    root_exec_replaces_image(ROOT_AFFINITY_IDLE_PEER);
+}
+
+/// #2142 review P0: production's root affinity (either CPU).
+#[test]
+fn production_root_exec_on_any_cpu_runs_static_successor() {
+    root_exec_replaces_image(ROOT_AFFINITY_ANY);
+}
+
+/// The root's exec(s) adopted and settled on the lane holding the root's
+/// custody: the exec owner handed none back from a lane without it.
+fn assert_root_execs_settled_on_custody_lane(
+    outcome: &carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    execs: u64,
+    affinity: u64,
+) {
+    let census = outcome
+        .physical
+        .exec_owner_census()
+        .expect("exec owner census");
+    assert_eq!(
+        (census.adopted, census.settled, census.handed_back),
+        (execs, execs, 0),
+        "affinity {affinity}: {census:?}"
+    );
+}
+
+fn root_exec_replaces_image(affinity: u64) {
     let dir = tempfile::tempdir().expect("exec fixture directory");
     let successor = dir.path().join("successor");
     let successor_elf = native_exit_fixture("native_root_exec_successor.S");
     carrick_test_support::executable::write_executable_mode(&successor, &successor_elf, 0o700);
-    let outcome = run_root_exec(&successor);
+    let outcome = run_root_exec_with_affinity(&successor, affinity);
     assert_eq!(
         (outcome.run.exit_code, outcome.run.stdout.as_slice()),
         (0, b"root-exec-ok\n".as_slice()),
-        "root exec must run the successor; 38 is ENOSYS"
+        "root exec must run the successor (affinity {affinity}); 38 is ENOSYS; census={:?}",
+        outcome.physical.exec_owner_census(),
     );
     assert!(outcome.run.stderr.is_empty());
+    assert_root_execs_settled_on_custody_lane(&outcome, 1, affinity);
 }
 
 /// #2142: execve(2) of a missing path fails with ENOENT and the caller keeps
@@ -950,6 +1005,20 @@ fn root_exec_native_oracle(elf: &[u8]) -> (i32, Vec<u8>) {
 /// moved into the fork stock.
 #[test]
 fn production_root_exec_twice_runs_the_second_successor() {
+    root_exec_twice(ROOT_AFFINITY_LOADED);
+}
+
+#[test]
+fn production_root_exec_twice_on_the_idle_peer_runs_the_second_successor() {
+    root_exec_twice(ROOT_AFFINITY_IDLE_PEER);
+}
+
+#[test]
+fn production_root_exec_twice_on_any_cpu_runs_the_second_successor() {
+    root_exec_twice(ROOT_AFFINITY_ANY);
+}
+
+fn root_exec_twice(affinity: u64) {
     let dir = tempfile::tempdir().expect("exec fixture directory");
     let successor = dir.path().join("successor");
     carrick_test_support::executable::write_executable_mode(
@@ -971,7 +1040,7 @@ fn production_root_exec_twice_runs_the_second_successor() {
         (0, b"root-exec-ok\n".to_vec()),
         "native Linux oracle"
     );
-    let outcome = run_exec_fixture(&elf, 256);
+    let outcome = run_exec_fixture_with_affinity(&elf, 256, affinity);
     let counters = outcome
         .physical
         .syscall_counters()
@@ -980,7 +1049,7 @@ fn production_root_exec_twice_runs_the_second_successor() {
     assert_eq!(
         (outcome.run.exit_code, outcome.run.stdout.as_slice()),
         (0, b"root-exec-ok\n".as_slice()),
-        "both root execs must run their successors; 38 is ENOSYS: execve refused={} child={} venue_refused={} served={} census={:?}",
+        "both root execs must run their successors (affinity {affinity}); 38 is ENOSYS: execve refused={} child={} venue_refused={} served={} census={:?}",
         load(&counters.refused[59]),
         load(&counters.refused_child[59]),
         load(&counters.venue_refused[59]),
@@ -992,9 +1061,9 @@ fn production_root_exec_twice_runs_the_second_successor() {
         .exec_owner_census()
         .expect("exec owner census");
     assert_eq!(
-        (census.adopted, census.settled),
-        (2, 2),
-        "two root execs adopted and settled: {census:?}"
+        (census.adopted, census.settled, census.handed_back),
+        (2, 2, 0),
+        "two root execs adopted and settled on the root's custody lane: {census:?}"
     );
 }
 
@@ -1003,6 +1072,20 @@ fn production_root_exec_twice_runs_the_second_successor() {
 /// alone to its own exit status.
 #[test]
 fn production_root_exec_with_a_running_sibling_thread_runs_the_successor() {
+    root_exec_with_a_running_sibling(ROOT_AFFINITY_LOADED);
+}
+
+#[test]
+fn production_root_exec_on_the_idle_peer_with_a_running_sibling_runs_the_successor() {
+    root_exec_with_a_running_sibling(ROOT_AFFINITY_IDLE_PEER);
+}
+
+#[test]
+fn production_root_exec_on_any_cpu_with_a_running_sibling_runs_the_successor() {
+    root_exec_with_a_running_sibling(ROOT_AFFINITY_ANY);
+}
+
+fn root_exec_with_a_running_sibling(affinity: u64) {
     let dir = tempfile::tempdir().expect("exec fixture directory");
     let successor = dir.path().join("successor");
     carrick_test_support::executable::write_executable_mode(
@@ -1017,13 +1100,125 @@ fn production_root_exec_with_a_running_sibling_thread_runs_the_successor() {
         (0, b"root-exec-ok\n".to_vec()),
         "native Linux oracle"
     );
-    let outcome = run_exec_fixture(&elf, 512);
+    let outcome = run_exec_fixture_with_affinity(&elf, 512, affinity);
     assert_eq!(
         (outcome.run.exit_code, outcome.run.stdout.as_slice()),
         (0, b"root-exec-ok\n".as_slice()),
-        "the successor runs once its running sibling is gone; 38 is ENOSYS"
+        "the successor runs once its running sibling is gone (affinity {affinity}); 38 is ENOSYS; census={:?}",
+        outcome.physical.exec_owner_census(),
     );
     assert!(outcome.run.stderr.is_empty());
+    assert_root_execs_settled_on_custody_lane(&outcome, 1, affinity);
+}
+
+/// #2142 review P0: a non-leader thread of the run root's group execs. It
+/// inherits the root's affinity but is never its lane's home record, so it
+/// holds no root custody, and on the idle peer it runs on a lane that cannot
+/// consume a root settlement. Its exec stays unrouted, the counted ENOSYS
+/// main gives, before anything is sealed: never a carrier fatal or a kill
+/// past the point of no return. The thread exits alone and the leader exits
+/// with the errno (38). Linux runs the successor with the thread taking the
+/// leader's TID (the oracle); that is #2723's.
+#[test]
+fn production_root_thread_exec_without_custody_is_a_counted_enosys() {
+    root_thread_exec_without_custody(ROOT_AFFINITY_LOADED);
+}
+
+#[test]
+fn production_root_thread_exec_on_the_idle_peer_is_a_counted_enosys() {
+    root_thread_exec_without_custody(ROOT_AFFINITY_IDLE_PEER);
+}
+
+#[test]
+fn production_root_thread_exec_on_any_cpu_is_a_counted_enosys() {
+    root_thread_exec_without_custody(ROOT_AFFINITY_ANY);
+}
+
+fn root_thread_exec_without_custody(affinity: u64) {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let successor = dir.path().join("successor");
+    carrick_test_support::executable::write_executable_mode(
+        &successor,
+        native_exit_fixture("native_root_exec_successor.S"),
+        0o700,
+    );
+    let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_root_exec_from_thread.S", &[&define]);
+    assert_eq!(
+        root_exec_native_oracle(&elf),
+        (0, b"root-exec-ok\n".to_vec()),
+        "native Linux oracle"
+    );
+    let outcome = run_exec_fixture_with_affinity(&elf, 512, affinity);
+    let census = outcome
+        .physical
+        .exec_owner_census()
+        .expect("exec owner census");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (38, b"".as_slice()),
+        "the custody-less thread's exec is unrouted (affinity {affinity}): census={census:?}",
+    );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    kvm_pool_fixture::refusal_count::assert_refused_total(
+        &counters,
+        59,
+        1,
+        0,
+        "the custody-less root thread's execve is the one counted refusal",
+    );
+    assert_eq!(
+        (census.adopted, census.settled, census.handed_back),
+        (0, 0, 0),
+        "nothing is sealed for a custody-less root exec: {census:?}"
+    );
+}
+
+/// #2142 review P0, the `sh -c 'cmd; exec prog'` shape: the root forks a
+/// child that exits, parks in wait4 until it is reaped, then execs. The wait
+/// may resume the root on the idle peer, which holds no root custody.
+#[test]
+fn production_root_fork_wait_exec_runs_the_successor() {
+    root_fork_wait_exec(ROOT_AFFINITY_LOADED);
+}
+
+#[test]
+fn production_root_fork_wait_exec_on_the_idle_peer_runs_the_successor() {
+    root_fork_wait_exec(ROOT_AFFINITY_IDLE_PEER);
+}
+
+#[test]
+fn production_root_fork_wait_exec_on_any_cpu_runs_the_successor() {
+    root_fork_wait_exec(ROOT_AFFINITY_ANY);
+}
+
+fn root_fork_wait_exec(affinity: u64) {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let successor = dir.path().join("successor");
+    carrick_test_support::executable::write_executable_mode(
+        &successor,
+        native_exit_fixture("native_root_exec_successor.S"),
+        0o700,
+    );
+    let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_root_fork_wait_exec.S", &[&define]);
+    assert_eq!(
+        root_exec_native_oracle(&elf),
+        (0, b"root-exec-ok\n".to_vec()),
+        "native Linux oracle"
+    );
+    let outcome = run_exec_fixture_with_affinity(&elf, 512, affinity);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (0, b"root-exec-ok\n".as_slice()),
+        "the reaped child's parent execs its successor (affinity {affinity}); 91: fork or wait failed; 38 is ENOSYS; census={:?}",
+        outcome.physical.exec_owner_census(),
+    );
+    assert!(outcome.run.stderr.is_empty());
+    assert_root_execs_settled_on_custody_lane(&outcome, 1, affinity);
 }
 
 /// #2142: the run root's descriptors across exec. The Kernel half closes
