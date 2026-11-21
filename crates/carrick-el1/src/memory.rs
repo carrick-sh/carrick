@@ -53,6 +53,7 @@ const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
 const SYS_MMAP: u64 = 222;
 const SYS_MPROTECT: u64 = 226;
+const SYS_MADVISE: u64 = 233;
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
 const PROT_EXEC: u64 = 4;
@@ -375,6 +376,10 @@ pub fn decide_reservation_syscall_for_origin<
                 model.mprotect(range, prot)
             }
         }
+        SYS_MADVISE => match decide_madvise(frame.arguments(), model) {
+            Ok(result) => result,
+            Err(disposition) => return disposition,
+        },
         _ => return ReservationDisposition::Forward,
     };
     match result {
@@ -397,6 +402,142 @@ pub fn decide_reservation_syscall_for_origin<
             | Refusal::MetadataRequired),
         ) => ReservationDisposition::Unavailable(error),
     }
+}
+
+/// One root mapping clipped to a `madvise` range, classified for the shared
+/// Linux plan.
+struct MadviseSegment {
+    range: carrick_personality_linux::mm::madvise::Range,
+    class: carrick_personality_linux::mm::madvise::Class,
+}
+impl carrick_personality_linux::mm::madvise::Segment for MadviseSegment {
+    fn range(&self) -> carrick_personality_linux::mm::madvise::Range {
+        self.range
+    }
+    fn class(&self) -> carrick_personality_linux::mm::madvise::Class {
+        self.class
+    }
+    fn droppable(&self) -> bool {
+        false
+    }
+}
+
+/// The admitted root as the plan's coverage. It records whether every byte
+/// of the observed range lies in a node this root edits (private anonymous,
+/// or private file with its retained source): a hole or a host-owned node
+/// leaves the whole call to the refusal path, never to a ring errno.
+struct MadviseCoverage<'r, 'm, G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>
+{
+    model: core::cell::RefCell<&'r mut ReservationModel<'m, G, C>>,
+    owned: core::cell::Cell<bool>,
+}
+impl<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>
+    carrick_personality_linux::mm::madvise::Coverage for MadviseCoverage<'_, '_, G, C>
+{
+    type Segment = MadviseSegment;
+
+    fn check_range(
+        &self,
+        _: carrick_personality_linux::mm::madvise::Range,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        // Ring-owned nodes never hold a venue-reserved page: anything else
+        // is not owned and refuses below.
+        Ok(())
+    }
+    fn snapshot(
+        &self,
+        range: carrick_personality_linux::mm::madvise::Range,
+    ) -> carrick_personality_linux::mm::madvise::Snapshot<MadviseSegment> {
+        use carrick_el1_abi::{ReservationNodeFlags, ReservationRange};
+        use carrick_personality_linux::mm::NodeFlagsPolicy;
+        use carrick_personality_linux::mm::madvise::{Class, Range, Snapshot};
+        #[cfg(target_os = "none")]
+        use rust_alloc::vec::Vec;
+        let mut covered = Vec::new();
+        let mut locked = false;
+        let mut cursor = range.start.raw();
+        let mut owned = true;
+        let observed = ReservationRange::new(range.start.raw(), range.end.raw()).map(|observed| {
+            self.model
+                .borrow_mut()
+                .observe_range(observed, &mut |mapping| {
+                    let start = mapping.range.start().max(range.start.raw());
+                    let end = mapping.range.end().min(range.end.raw());
+                    if start >= end {
+                        return;
+                    }
+                    let file = mapping.flags.contains(ReservationNodeFlags::FILE);
+                    owned &= start == cursor
+                        && mapping.flags.root_editable()
+                        && (!file || mapping.host_backing.is_some());
+                    cursor = end;
+                    locked |= mapping.flags.contains(ReservationNodeFlags::LOCKED);
+                    covered.push(MadviseSegment {
+                        range: Range {
+                            start: carrick_guest_arch::GuestVa::new(start),
+                            end: carrick_guest_arch::GuestVa::new(end),
+                        },
+                        class: if file {
+                            Class::PrivateFile
+                        } else {
+                            Class::PrivateAnonymous
+                        },
+                    });
+                })
+        });
+        self.owned
+            .set(owned && cursor == range.end.raw() && matches!(observed, Some(Ok(()))));
+        Snapshot::new(range, covered, locked)
+    }
+}
+
+/// `madvise(2)` against the caller's admitted root. The shared Linux plan
+/// validates the arguments and classifies the advice. The ring serves a
+/// range only when its own nodes cover all of it: hint advice validates and
+/// returns 0, and `MADV_DONTNEED` retires the range's residency while every
+/// node keeps its protection and attributes. Attribute advice (fork and
+/// dump), advice the plan does not know and any other coverage leave the
+/// whole call unserved (`Err(Forward)`): a counted refusal in a native child.
+#[inline(never)]
+fn decide_madvise<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
+    arguments: [u64; 6],
+    model: &mut ReservationModel<'_, G, C>,
+) -> Result<Result<reservations::Decision, reservations::Refusal>, ReservationDisposition> {
+    use carrick_personality_linux::mm::madvise::{self, Action, Advice};
+    let advice = Advice::from_guest_arg(arguments[2]);
+    if advice == Advice::Unsupported || advice.requires_host_attributes() {
+        return Err(ReservationDisposition::Forward);
+    }
+    let coverage = MadviseCoverage {
+        model: core::cell::RefCell::new(model),
+        owned: core::cell::Cell::new(true),
+    };
+    let plan = madvise::plan(
+        &coverage,
+        carrick_guest_arch::GuestVa::new(arguments[0]),
+        carrick_guest_arch::GuestLen::new(arguments[1]),
+        advice,
+        carrick_guest_arch::GuestLen::new(PAGE_SIZE),
+    );
+    if !coverage.owned.get() {
+        return Err(ReservationDisposition::Forward);
+    }
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(errno) => return Err(ReservationDisposition::Return(-i64::from(errno.get()))),
+    };
+    if let Err(errno) = plan.result {
+        return Err(ReservationDisposition::Return(-i64::from(errno.get())));
+    }
+    if plan.steps.iter().all(|step| step.action == Action::None) {
+        return Ok(Ok(reservations::Decision::Complete(0)));
+    }
+    let Some(range) =
+        carrick_el1_abi::ReservationRange::new(plan.range.start.raw(), plan.range.end.raw())
+    else {
+        return Err(ReservationDisposition::Return(-ENOMEM));
+    };
+    Ok(coverage.model.into_inner().discard_range(range))
 }
 
 /// Result of attempting the bounded EL1 `mprotect` vertical.
@@ -1097,7 +1238,10 @@ pub enum DelegatedAnonymous {
     /// an owed extent, retires over one, or found the owed-return journal
     /// full. No effect occurred and every guard is released; the venue rings
     /// the settlement doorbell (a ring-owned MM) or forwards (a host-served
-    /// one, whose host venue settles first), then reruns the call.
+    /// one, whose host venue settles first), then reruns the call. The one
+    /// effect that precedes it is a committed `MADV_DONTNEED` discard, which
+    /// must settle before its caller resumes: its rerun finds nothing left to
+    /// discard and returns the same result.
     Settle(SettlementNeed),
 }
 
@@ -1545,7 +1689,7 @@ fn serve_delegated_anonymous_for_origin<
         [(start, end)] => Some((*start, *end - *start)),
         _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
     };
-    use carrick_el1_abi::ReservationOperation::{Decommit, Prepare, Protect, Retire};
+    use carrick_el1_abi::ReservationOperation::{Decommit, Discard, Prepare, Protect, Retire};
     // A fresh mapping into a root hole over this MM's first-touch stock
     // adopts it: zero backing EL1 never exposed, re-permissioned for the
     // mapping and committed on first touch; any rest of the range has no
@@ -1623,7 +1767,7 @@ fn serve_delegated_anonymous_for_origin<
             }
         }
         (
-            Retire | Prepare | Decommit,
+            Retire | Prepare | Decommit | Discard,
             RangeBacking::Private | RangeBacking::Prepared,
             Some((start, run_len)),
         ) => {
@@ -1687,6 +1831,13 @@ fn serve_delegated_anonymous_for_origin<
         }
     };
     match completed {
+        // A discard keeps its nodes, so a touch before the owed return
+        // settles would meet the retired terminals. Settle before the caller
+        // resumes; the rerun finds the range empty and completes without
+        // work (MADV_DONTNEED is idempotent), so the result is unchanged.
+        Ok(()) if retired && request.operation == Discard => {
+            DelegatedAnonymous::Settle(SettlementNeed::after_release(model, _editor_guard))
+        }
         Ok(()) => DelegatedAnonymous::Served,
         // The descriptor edit is live but the root refused to commit it.
         Err(refusal) if retired => {
@@ -1697,7 +1848,7 @@ fn serve_delegated_anonymous_for_origin<
 }
 
 /// The admitted root that owns syscall `nr` when it is a delegated MM's
-/// anonymous `brk`/`mmap`/`munmap`/`mprotect` (`None`: the MM keeps the
+/// anonymous `brk`/`mmap`/`munmap`/`mprotect`/`madvise` (`None`: the MM keeps the
 /// paths it had before admission).
 pub fn delegated_anonymous_root<
     G: ReservationGeometry,
@@ -1711,7 +1862,10 @@ pub fn delegated_anonymous_root<
     carrick_el1_abi::ReservationMm,
     carrick_sched_core::spaces::SpaceIndex,
 )> {
-    if !matches!(nr, SYS_BRK | SYS_MUNMAP | SYS_MMAP | SYS_MPROTECT) {
+    if !matches!(
+        nr,
+        SYS_BRK | SYS_MUNMAP | SYS_MMAP | SYS_MPROTECT | SYS_MADVISE
+    ) {
         return None;
     }
     let mm_key = current.mm.key.load(Ordering::Acquire);

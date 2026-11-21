@@ -125,6 +125,9 @@ pub enum ReservationOperation {
     Move = 4,
     /// Revoke access and return backing while preserving the reservation.
     Decommit = 5,
+    /// Return backing while preserving every node, its protection and its
+    /// attributes (`MADV_DONTNEED`): the next touch faults in fresh backing.
+    Discard = 6,
 }
 
 /// The generation is the *current* committed root revision. The pending
