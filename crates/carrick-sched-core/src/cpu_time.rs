@@ -16,6 +16,8 @@ use crate::{RecordId, RecordRef, SlotId, ZONE_RECORDS, ZONE_SLOTS};
 const MODE_OFF: u32 = 0;
 const MODE_USER: u32 = 1;
 const MODE_SYSTEM: u32 = 2;
+/// Bound to a record whose thread is out on a host crossing: charges nothing.
+const MODE_HOST: u32 = 3;
 
 /// Sampled user and system hardware counter ticks for one record or process.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -129,6 +131,14 @@ impl ZoneCpuLedger {
 
     pub fn leave_slot(&self, slot: SlotId, tick: CounterTick) {
         self.transition(slot, None, MODE_OFF, tick);
+    }
+
+    /// Stop charging `slot` while its thread waits on a host crossing, but
+    /// keep the thread's record bound: the crossing returns to the same
+    /// thread, which the next `enter_ring` may not name (an initial root the
+    /// scheduler never switched in has no current record).
+    pub fn cross_to_host(&self, slot: SlotId, tick: CounterTick) {
+        self.transition(slot, None, MODE_HOST, tick);
     }
 
     #[inline(never)]
@@ -328,5 +338,55 @@ impl ZoneCpuLedger {
         row.last_reported_ns
             .fetch_max(nanos, Ordering::AcqRel)
             .max(nanos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use crate::RecordId;
+    use std::boxed::Box;
+
+    fn ledger() -> Box<ZoneCpuLedger> {
+        // SAFETY: all-zero bytes are an empty ledger; every field is atomic.
+        unsafe { Box::<ZoneCpuLedger>::new_zeroed().assume_init() }
+    }
+
+    /// An initial root the scheduler never switched in has no current
+    /// record, so it re-enters the ring after a host crossing naming none.
+    /// The crossing charges nothing and keeps the root's record bound.
+    #[test]
+    fn a_host_crossing_keeps_an_unscheduled_record_bound() {
+        let ledger = ledger();
+        let slot = SlotId::from_index(0).unwrap();
+        let record = RecordRef {
+            id: RecordId::from_raw(1).unwrap(),
+            incarnation: 7,
+        };
+        ledger.reset_record(record.id, record.incarnation);
+        ledger.enter_user(slot, None, CounterTick::new(100));
+        ledger.adopt_unadmitted(slot, record);
+        ledger.enter_ring(slot, None, CounterTick::new(200));
+        ledger.cross_to_host(slot, CounterTick::new(250));
+        ledger.enter_ring(slot, None, CounterTick::new(1_000));
+        ledger.enter_user(slot, None, CounterTick::new(1_010));
+        assert_eq!(
+            ledger.sample_record(record, Some(CounterTick::new(2_010))),
+            CpuTickPair {
+                user: 1_100,
+                system: 60
+            }
+        );
+        // A departure still unbinds: the slot then charges nobody.
+        ledger.leave_slot(slot, CounterTick::new(2_010));
+        ledger.enter_user(slot, None, CounterTick::new(2_020));
+        assert_eq!(
+            ledger.sample_record(record, Some(CounterTick::new(3_020))),
+            CpuTickPair {
+                user: 1_100,
+                system: 60
+            }
+        );
     }
 }

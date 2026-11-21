@@ -432,8 +432,9 @@ pub fn current_slot_and_zone() -> Option<(
 
 /// Forward an unhandled Linux syscall to the host through the declared forward port.
 pub fn forward_to_host(frame: &NativeFrame) {
+    // The crossing returns to this same thread: keep its record bound.
     if let Some((slot, zone, now)) = current_slot_and_zone() {
-        zone.cpu_leave_slot(slot, now);
+        zone.cpu_cross_to_host(slot, now);
     }
     doorbell(FORWARD_PORT, frame);
     if let Some((slot, zone, now)) = current_slot_and_zone() {

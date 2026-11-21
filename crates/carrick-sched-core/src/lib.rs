@@ -2621,6 +2621,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     #[inline]
+    pub fn cpu_cross_to_host(&self, slot: SlotId, tick: CounterTick) {
+        self.cpu_ledger.cross_to_host(slot, tick);
+    }
+
+    #[inline]
     pub fn sample_record_cpu_ticks(
         &self,
         record: RecordRef,
