@@ -42,7 +42,7 @@ use carrick_guest_arch::{ExecutionGeneration, TaskIdentity, TaskSerial};
 use carrick_hal::exec_lock_order::{Exclusive, ExecCrossingOrder};
 use carrick_hal::exec_owner::{
     ExecParkWake, ExecPreparations, ExecRetained, ExecRetireReason, ExecSettleLane,
-    ExecSettleRefusal, ExecSettlement, ParkedProbe, StockParked,
+    ExecSettleRefusal, ExecSettlement, ParkedProbe, SettledExec, StockParked,
 };
 use carrick_hal::fork_stock::GrantExecution;
 use carrick_hal::fork_stock::{
@@ -932,6 +932,64 @@ pub(in crate::cpl0_boot) type NativeExecContinuation = (
 pub(in crate::cpl0_boot) type X86ExecOwner =
     ExecPreparations<X86ExecPreparation<CarrierExecData>, NativeExecContinuation, RootExecLoad>;
 
+/// One fork-stock predecessor receipt that is still owned by an adopted exec.
+/// Its exec-owner receipt binds the physical custody to the exact settlement
+/// that may make it release-permitted; slot absence alone cannot move it.
+struct AdoptedExecPredecessor {
+    adoption: ExecAdoptionReceipt,
+    stock: carrick_hal::fork_stock::ExecPredecessorReceipt<()>,
+}
+
+/// The x86 carrier's two typed predecessor-custody phases. Generic quarantine
+/// draining can inspect only `release_permitted`; successful exec-owner
+/// settlement is the sole transition out of `adopted`.
+#[derive(Default)]
+pub(in crate::cpl0_boot) struct ExecPredecessorCustody {
+    adopted: Vec<AdoptedExecPredecessor>,
+    release_permitted: Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<()>>,
+}
+
+impl ExecPredecessorCustody {
+    pub(in crate::cpl0_boot) fn adopt(
+        &mut self,
+        adoption: ExecAdoptionReceipt,
+        stock: carrick_hal::fork_stock::ExecPredecessorReceipt<()>,
+    ) {
+        debug_assert!(!self.adopted.iter().any(|owned| {
+            owned.adoption == adoption
+                || owned.stock.predecessor() == stock.predecessor()
+                || owned.stock.successor() == stock.successor()
+        }));
+        self.adopted
+            .push(AdoptedExecPredecessor { adoption, stock });
+    }
+
+    /// Spend the exact exec-owner settlement authority once, moving only its
+    /// matching fork-stock receipt into the phase a generic drain may release.
+    pub(in crate::cpl0_boot) fn permit_release(&mut self, settled: SettledExec) -> bool {
+        let Some(index) = self.adopted.iter().position(|owned| {
+            owned.adoption == settled.receipt
+                && owned.stock.predecessor() == settled.predecessor
+                && owned.stock.successor() == settled.successor
+        }) else {
+            return false;
+        };
+        let owned = self.adopted.swap_remove(index);
+        self.release_permitted.push(owned.stock);
+        true
+    }
+
+    #[cfg(test)]
+    pub(in crate::cpl0_boot) fn adopted_len(&self) -> usize {
+        self.adopted.len()
+    }
+
+    #[cfg(test)]
+    pub(in crate::cpl0_boot) fn release_permitted_len(&self) -> usize {
+        self.release_permitted.len()
+    }
+}
+
 /// What the run root's loader resolved for the Kernel's half of its exec
 /// (the executable identity the root's `/proc` reports). The carrier never
 /// reads it: it rides the exec owner's row from the Exec arm through the
@@ -1491,7 +1549,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .fork_stock
             .replace_for_exec_with_tables(form, execution, handle, backing.root, sources, used)
             .map_err(|(error, _)| fail(format!("exec successor stock custody: {error:?}")))?;
-        self.exec_predecessors.push(replaced);
+        self.exec_predecessors.adopt(receipt, replaced);
         // The data extent is now the successor's: its frames are published.
         drop(data);
         Ok(true)
@@ -1682,9 +1740,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let (predecessor, successor, effects) = record
             .request()
             .ok_or_else(|| fail("native exec settlement record"))?;
-        let held = self.exec_predecessors.iter().any(|receipt| {
-            receipt.predecessor() == predecessor && receipt.successor() == successor
-        });
         let route = if successor.raw() == mm.get() {
             self.exec_owner
                 .settle(predecessor, successor, effects, lane)
@@ -1693,8 +1748,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         let mut root = None;
         let known = match route {
-            Ok(ExecSettlement::Child(_)) if held => true,
-            Ok(ExecSettlement::Root(settlement)) if held => {
+            Ok(ExecSettlement::Child(settlement)) => {
+                if !self.exec_predecessors.permit_release(settlement) {
+                    return Err(fail("exec settlement without its predecessor custody"));
+                }
+                true
+            }
+            Ok(ExecSettlement::Root(settlement)) => {
+                if !self.exec_predecessors.permit_release(settlement.settled()) {
+                    return Err(fail("exec settlement without its predecessor custody"));
+                }
                 // The executor consumes the root's settlement: it commits
                 // the Kernel half and moves the root's loaded custody.
                 let (mm, load) = match self.root_exec_load.take() {
@@ -1713,9 +1776,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     state: None,
                 });
                 true
-            }
-            Ok(ExecSettlement::Child(_) | ExecSettlement::Root(_)) => {
-                return Err(fail("exec settlement without its predecessor custody"));
             }
             // Handed back unchanged; the ring's handback is #2142 R3's.
             Ok(ExecSettlement::NotHere) => false,
@@ -1762,10 +1822,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         })
     }
 
-    /// Settle every adopted exec's predecessor no slot still runs: its
+    /// Release every post-settlement exec predecessor no slot still runs: its
     /// tables zeroed back to the stock and its frames, residency and CR3
-    /// released like a reclaimed child's. One whose release cannot run yet
-    /// (its space not yet unpublished) stays for the next drain.
+    /// released like a reclaimed child's. An adopted but unsettled receipt is
+    /// not visible here. One whose release cannot run yet (its space not yet
+    /// unpublished) stays for the next drain.
     pub(in crate::cpl0_boot) fn settle_exec_predecessors(&mut self) -> Result<(), TrapError> {
         let zone = anonymous_owner::retained_cow_zone(&self.ram)?;
         let installed: Vec<u64> = (0..carrick_x86::cpl0_entry::CPL0_CPU_COUNT)
@@ -1775,12 +1836,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let returns = anonymous_owner::retained_reservations(&self.ram)?;
         let inventory = Arc::clone(&self.frame_inventory);
         let zero = [0u8; 4096];
-        for receipt in core::mem::take(&mut self.exec_predecessors) {
+        for receipt in core::mem::take(&mut self.exec_predecessors.release_permitted) {
             let Some(absence) = carrick_hal::fork_stock::SlotAbsence::scan(
                 receipt.predecessor(),
                 installed.iter().copied(),
             ) else {
-                self.exec_predecessors.push(receipt);
+                self.exec_predecessors.release_permitted.push(receipt);
                 continue;
             };
             let memory = std::cell::RefCell::new(&mut self._vm);
@@ -1805,7 +1866,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 },
             );
             if settled.is_err() {
-                self.exec_predecessors.push(receipt);
+                self.exec_predecessors.release_permitted.push(receipt);
             }
         }
         Ok(())
