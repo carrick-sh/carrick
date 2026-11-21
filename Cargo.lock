@@ -1081,15 +1081,22 @@ name = "carrick-softcpu-aarch64-host"
 version = "0.1.0"
 dependencies = [
  "carrick-aarch64",
+ "carrick-abi",
  "carrick-el1-abi",
  "carrick-guest-arch",
+ "carrick-guest-mem",
+ "carrick-hal",
  "carrick-host-jit",
+ "carrick-kernel",
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-softcpu-aarch64",
  "carrick-softmmu",
+ "carrick-vfs",
  "goblin",
+ "libc",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
