@@ -786,66 +786,30 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             // registered live root, not just child retirement. The service
             // independently authenticates its CPL0 binding and generation.
             CarrierRunExit::PhysicalDoorbell { port, .. } => {
-                let root_gpa = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
-                    .ok_or_else(|| {
-                        self.custody = Custody::Poisoned;
-                        boundary_error("unaligned physical crossing CR3")
-                    })?;
-                if root_gpa == binding.context().root
-                    && *port != carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT
-                {
-                    binding
-                } else {
-                    let child = self.child_bindings.get(root_gpa).inspect_err(|_| {
-                        self.custody = Custody::Poisoned;
-                    })?;
-                    match child {
-                        Some(child) => child,
-                        None => {
-                            self.custody = Custody::Poisoned;
-                            return Err(boundary_error(&format!(
-                                "unregistered {} CR3: root {:#x}, port {port:#x}, rip {:#x}",
-                                if *port == carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT {
-                                    "child retire"
-                                } else {
-                                    "physical crossing"
-                                },
-                                root_gpa.address().raw(),
-                                image.rip,
-                            )));
-                        }
-                    }
-                }
+                let retire = *port == carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT;
+                self.stopped_binding(
+                    binding,
+                    &image,
+                    !retire,
+                    if retire {
+                        "child retire"
+                    } else {
+                        "physical crossing"
+                    },
+                )
             }
             // A kick may interrupt a descendant after CPL0 switches CR3 in
-            // zone, without changing the executor's loaded root task.
-            CarrierRunExit::SyscallTrap | CarrierRunExit::Kick => {
-                let root_gpa = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
-                    .ok_or_else(|| {
-                        self.custody = Custody::Poisoned;
-                        boundary_error("unaligned forward CR3")
-                    })?;
-                if root_gpa == binding.context().root {
-                    binding
-                } else {
-                    let child = self.child_bindings.get(root_gpa).inspect_err(|_| {
-                        self.custody = Custody::Poisoned;
-                    })?;
-                    match child {
-                        Some(child) => child,
-                        None => {
-                            self.custody = Custody::Poisoned;
-                            return Err(boundary_error(&format!(
-                                "unregistered forward CR3: root {:#x}, rip {:#x}",
-                                root_gpa.address().raw(),
-                                image.rip,
-                            )));
-                        }
-                    }
-                }
+            // zone, without changing the executor's loaded root task. So may
+            // a user fault: its record is captured from the live child.
+            CarrierRunExit::SyscallTrap
+            | CarrierRunExit::Kick
+            | CarrierRunExit::FaultDoorbellWord(_)
+            | CarrierRunExit::FaultException { .. } => {
+                self.stopped_binding(binding, &image, true, "forward")
             }
-            _ => binding,
-        };
+            _ => Ok(binding),
+        }
+        .inspect_err(|_| self.custody = Custody::Poisoned)?;
         let state = match X86ArchContext::capture(target_binding, &image, resume).map_err(|error| {
                 let context = target_binding.context();
                 boundary_error(&format!(
@@ -870,6 +834,29 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             exit,
         })
     }
+    /// The binding of the task actually stopped in the CPU: the loaded one
+    /// when the live CR3 is its root (and `root_wins`), otherwise the child
+    /// registered for that root. An unregistered root is refused.
+    fn stopped_binding(
+        &self,
+        loaded: GuestArchBinding,
+        image: &X86VcpuSnapshot,
+        root_wins: bool,
+        what: &str,
+    ) -> Result<GuestArchBinding, TrapError> {
+        let root_gpa = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
+            .ok_or_else(|| boundary_error(&format!("unaligned {what} CR3")))?;
+        if root_wins && root_gpa == loaded.context().root {
+            return Ok(loaded);
+        }
+        self.child_bindings.get(root_gpa)?.ok_or_else(|| {
+            boundary_error(&format!(
+                "unregistered {what} CR3: root {:#x}, rip {:#x}",
+                root_gpa.address().raw(),
+                image.rip,
+            ))
+        })
+    }
     pub fn save_and_detach(&mut self, task: TaskIdentity) -> Result<X86ArchContext, TrapError> {
         let (binding, resume, pending_io) = match self.custody {
             Custody::Loaded {
@@ -890,15 +877,7 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             self.io.complete_pending_io()?;
         }
         let image = self.io.read_image()?;
-        let root = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
-            .ok_or_else(|| boundary_error("unaligned detach CR3"))?;
-        let stopped_binding = if root == binding.context().root {
-            binding
-        } else {
-            self.child_bindings
-                .get(root)?
-                .ok_or_else(|| boundary_error("unregistered detach CR3"))?
-        };
+        let stopped_binding = self.stopped_binding(binding, &image, true, "detach")?;
         let saved = X86ArchContext::capture(stopped_binding, &image, resume)?;
         self.io.write_image(&self.neutral)?;
         audit_image(&self.io.read_image()?, &self.neutral)?;
@@ -1602,6 +1581,39 @@ pub(crate) mod tests {
         let stopped = cpu.run_loaded(root.binding().task()).unwrap();
         assert_eq!(stopped.state.as_ref().unwrap().binding(), child.binding());
     }
+    #[test]
+    fn loaded_fault_doorbell_from_a_registered_child_resolves_its_binding() {
+        let root = context(1);
+        let child = context(2);
+        let mut cpu = CarrierCpu::new(ChildRetireIo {
+            image: root.hardware_image(),
+            child_image: child.hardware_image(),
+            port: carrick_x86::FAULT_DOORBELL_PORT,
+        })
+        .unwrap();
+        cpu.load(root.clone()).unwrap();
+        cpu.register_child_binding(child.binding()).unwrap();
+        let stopped = cpu.run_loaded(root.binding().task()).unwrap();
+        assert!(matches!(stopped.exit, CarrierRunExit::FaultDoorbellWord(0)));
+        assert_eq!(stopped.state.as_ref().unwrap().binding(), child.binding());
+    }
+
+    #[test]
+    fn loaded_fault_doorbell_from_an_unregistered_child_root_is_refused() {
+        let root = context(1);
+        let child = context(2);
+        let mut cpu = CarrierCpu::new(ChildRetireIo {
+            image: root.hardware_image(),
+            child_image: child.hardware_image(),
+            port: carrick_x86::FAULT_DOORBELL_PORT,
+        })
+        .unwrap();
+        cpu.load(root.clone()).unwrap();
+        let error = cpu.run_loaded(root.binding().task()).unwrap_err();
+        assert!(error.to_string().contains("unregistered"), "{error}");
+        assert!(cpu.audit_idle().is_err(), "refusal poisons custody");
+    }
+
     struct PendingIo {
         image: X86VcpuSnapshot,
         pending: bool,
