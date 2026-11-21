@@ -19046,6 +19046,7 @@ fn serial_host_native_child_pselect6_multi_fd_wakes_on_one_parent_pipe() {
 /// answers exactly the socket's write bit (the pipe is empty).
 #[cfg(not(target_os = "macos"))]
 #[test]
+#[allow(clippy::disallowed_methods)] // The witness's own loopback peer.
 fn serial_host_native_child_pselect6_mixes_a_zone_pipe_and_a_host_socket() {
     use carrick_abi::{LINUX_AF_INET, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM};
     use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
