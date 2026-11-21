@@ -11,7 +11,14 @@
 //! - `redispatches` / `redispatch_cpu_ns`: continuation resumptions of a
 //!   suspended syscall and their thread CPU time;
 //! - `el1_boundaries`: syscalls EL1 served that still returned through the
-//!   host to deliver pending work.
+//!   host to deliver pending work;
+//! - `refused` / `venue_refused`: counted ENOSYS answered in ring (unrouted,
+//!   or refused by the crossing table) and refusals by the carrier venue, with
+//!   their native-child subsets `refused_child` / `venue_refused_child`.
+//!
+//! `refusal_evidence` keeps the same counters by native ordinal and caller;
+//! [`rank_refusals`] ranks them across runs (`carrick debug el1-census
+//! --refusals`), so a row that ends on ENOSYS names its syscall.
 //!
 //! Emission is opt-in through a nonempty `CARRICK_EL1_CENSUS` destination.
 //! Unset, empty, or exact `0` emits no census and enables no timing hooks.
@@ -143,6 +150,12 @@ pub struct CensusRow {
     pub el1_forwarded: u64,
     pub refused: u64,
     pub venue_refused: u64,
+    /// The native-child subsets of `refused` and `venue_refused` (absent in
+    /// older files).
+    #[serde(default)]
+    pub refused_child: u64,
+    #[serde(default)]
+    pub venue_refused_child: u64,
     pub host_services: u64,
     pub host_cpu_ns: u64,
     pub redispatches: u64,
@@ -192,6 +205,8 @@ fn snapshot_counters(
     // native-indexed; remap only the diagnostic totals when joining these rows.
     let mut refused_by_canonical = vec![0u64; SLOTS];
     let mut venue_by_canonical = vec![0u64; SLOTS];
+    let mut refused_child_by_canonical = vec![0u64; SLOTS];
+    let mut venue_child_by_canonical = vec![0u64; SLOTS];
     if let Some(counters) = counters {
         for native in 0..SLOTS {
             let canonical = match isa {
@@ -211,6 +226,10 @@ fn snapshot_counters(
                 refused_by_canonical[canonical] += counters.refused[native].load(Ordering::Relaxed);
                 venue_by_canonical[canonical] +=
                     counters.venue_refused[native].load(Ordering::Relaxed);
+                refused_child_by_canonical[canonical] +=
+                    counters.refused_child[native].load(Ordering::Relaxed);
+                venue_child_by_canonical[canonical] +=
+                    counters.venue_refused_child[native].load(Ordering::Relaxed);
             }
         }
     }
@@ -230,6 +249,8 @@ fn snapshot_counters(
             el1_forwarded: forwarded,
             refused: refused_by_canonical[index],
             venue_refused: venue_by_canonical[index],
+            refused_child: refused_child_by_canonical[index],
+            venue_refused_child: venue_child_by_canonical[index],
             host_services: TABLE.host_services[index].load(Ordering::Relaxed),
             host_cpu_ns: TABLE.host_cpu_ns[index].load(Ordering::Relaxed),
             redispatches: TABLE.redispatches[index].load(Ordering::Relaxed),
@@ -407,6 +428,8 @@ pub struct AggregateRow {
     pub el1_forwarded: u64,
     pub refused: u64,
     pub venue_refused: u64,
+    pub refused_child: u64,
+    pub venue_refused_child: u64,
     pub host_services: u64,
     pub host_cpu_ns: u64,
     pub redispatches: u64,
@@ -460,6 +483,8 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
             entry.el1_forwarded += row.el1_forwarded;
             entry.refused += row.refused;
             entry.venue_refused += row.venue_refused;
+            entry.refused_child += row.refused_child;
+            entry.venue_refused_child += row.venue_refused_child;
             entry.host_services += row.host_services;
             entry.host_cpu_ns += row.host_cpu_ns;
             entry.redispatches += row.redispatches;
@@ -541,6 +566,152 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
     out
 }
 
+/// One refused syscall for one caller class, summed over several censuses.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RefusalRank {
+    pub isa: carrick_spec::syscall_census::CensusIsa,
+    /// Native ordinal; 512 is the overflow bucket (>= 512 or undecodable).
+    pub native_nr: u64,
+    /// The canonical (asm-generic) number, when the native one maps to one.
+    pub canonical_nr: Option<u64>,
+    pub name: String,
+    pub caller: carrick_spec::syscall_census::CallerClass,
+    /// Counted ENOSYS answered in ring: unrouted, or refused by the
+    /// crossing table.
+    pub unrouted: u64,
+    /// Refusals by the carrier venue.
+    pub carrier: u64,
+    pub allowlisted: bool,
+    /// Runs that refused it.
+    pub runs: usize,
+}
+
+impl RefusalRank {
+    pub fn total(&self) -> u64 {
+        self.unrouted.saturating_add(self.carrier)
+    }
+}
+
+/// Every refusal of several censuses, most refused first.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RefusalRanking {
+    pub runs: usize,
+    /// Runs whose refusal evidence was unreadable or inconsistent; their
+    /// counts are missing, so a short ranking is not a clean one.
+    pub incomplete_runs: usize,
+    /// Every input run had complete refusal evidence.
+    pub complete: bool,
+    pub rows: Vec<RefusalRank>,
+}
+
+fn refusal_name(isa: carrick_spec::syscall_census::CensusIsa, native: u64) -> String {
+    use carrick_spec::syscall_census::CensusIsa;
+    let name = match isa {
+        CensusIsa::Aarch64 => carrick_abi::syscall::lookup_aarch64(native).map(|s| s.name),
+        CensusIsa::X86_64 => {
+            carrick_syscall_abi::syscall_x86_64::lookup_x86_64(native).map(|s| s.name)
+        }
+    };
+    match name {
+        Some(name) => name.to_owned(),
+        None if native >= 512 => "overflow".to_owned(),
+        None => format!("nr{native}"),
+    }
+}
+
+/// Rank the refusal evidence of `censuses` by count, per ISA, native
+/// number and caller class. Fails closed on an empty input.
+pub fn rank_refusals(censuses: &[Census]) -> Result<RefusalRanking, String> {
+    use carrick_spec::syscall_census::{CallerClass, CensusIsa};
+    if censuses.is_empty() {
+        return Err("no census inputs".to_owned());
+    }
+    let isa_key = |isa: CensusIsa| match isa {
+        CensusIsa::Aarch64 => 0u8,
+        CensusIsa::X86_64 => 1,
+    };
+    let caller_key = |caller: CallerClass| match caller {
+        CallerClass::Root => 0u8,
+        CallerClass::NativeChild => 1,
+    };
+    let mut by_key: std::collections::BTreeMap<(u8, u64, u8), RefusalRank> = Default::default();
+    let mut incomplete_runs = 0;
+    for census in censuses {
+        let evidence = &census.refusal_evidence;
+        if !evidence.complete {
+            incomplete_runs += 1;
+        }
+        for row in &evidence.rows {
+            let key = (isa_key(evidence.isa), row.nr, caller_key(row.caller));
+            let entry = by_key.entry(key).or_insert_with(|| RefusalRank {
+                isa: evidence.isa,
+                native_nr: row.nr,
+                canonical_nr: match evidence.isa {
+                    CensusIsa::Aarch64 => (row.nr < 512).then_some(row.nr),
+                    CensusIsa::X86_64 => carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
+                        carrick_abi::NativeNr(row.nr),
+                    )
+                    .map(|nr| nr.raw()),
+                },
+                name: refusal_name(evidence.isa, row.nr),
+                caller: row.caller,
+                unrouted: 0,
+                carrier: 0,
+                allowlisted: row.allowlisted,
+                runs: 0,
+            });
+            entry.unrouted = entry.unrouted.saturating_add(row.refused);
+            entry.carrier = entry.carrier.saturating_add(row.venue_refused);
+            entry.allowlisted |= row.allowlisted;
+            entry.runs += 1;
+        }
+    }
+    let mut rows: Vec<RefusalRank> = by_key.into_values().collect();
+    // Stable within equal totals: ISA, native number, then root before child.
+    rows.sort_by_key(|row| std::cmp::Reverse(row.total()));
+    Ok(RefusalRanking {
+        runs: censuses.len(),
+        incomplete_runs,
+        complete: incomplete_runs == 0,
+        rows,
+    })
+}
+
+/// A Markdown table of the top `limit` refusals.
+pub fn render_refusals(ranking: &RefusalRanking, limit: usize) -> String {
+    let mut out = format!(
+        "runs: {} ({} with incomplete refusal evidence); refused syscalls: {}\n\n",
+        ranking.runs,
+        ranking.incomplete_runs,
+        ranking.rows.len()
+    );
+    out.push_str("| rank | syscall | isa | native nr | canonical nr | caller | unrouted ENOSYS | carrier refused | total | allowlisted |\n");
+    out.push_str("|---:|---|---|---:|---:|---|---:|---:|---:|---|\n");
+    for (index, row) in ranking.rows.iter().take(limit).enumerate() {
+        let isa = match row.isa {
+            carrick_spec::syscall_census::CensusIsa::Aarch64 => "aarch64",
+            carrick_spec::syscall_census::CensusIsa::X86_64 => "x86_64",
+        };
+        let caller = match row.caller {
+            carrick_spec::syscall_census::CallerClass::Root => "root",
+            carrick_spec::syscall_census::CallerClass::NativeChild => "native_child",
+        };
+        out.push_str(&format!(
+            "| {} | {} | {isa} | {} | {} | {caller} | {} | {} | {} | {} |\n",
+            index + 1,
+            row.name,
+            row.native_nr,
+            row.canonical_nr
+                .map_or_else(|| "-".to_owned(), |nr| nr.to_string()),
+            row.unrouted,
+            row.carrier,
+            row.total(),
+            if row.allowlisted { "yes" } else { "no" },
+        ));
+    }
+    out
+}
+
 /// One run's census, summarised.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct RunSummary {
@@ -598,6 +769,8 @@ mod tests {
             el1_forwarded: services,
             refused: 0,
             venue_refused: 0,
+            refused_child: 0,
+            venue_refused_child: 0,
             host_services: services,
             host_cpu_ns: cpu,
             redispatches: 0,
@@ -787,6 +960,102 @@ mod tests {
         let next = snapshot_counters(None, Some(&empty), CensusIsa::X86_64);
         assert!(next.refusal_evidence.rows.is_empty());
         assert!(next.refusal_evidence.check(None).is_ok());
+    }
+
+    fn refuse(
+        counters: &carrick_el1_abi::Counters,
+        native: u64,
+        origin: carrick_core_abi::service::ServiceOrigin,
+        venue: carrick_el1_abi::RefusalVenue,
+        times: usize,
+    ) {
+        for _ in 0..times {
+            counters.record_refusal(
+                carrick_guest_arch::NativeOrdinal::new(native),
+                origin,
+                venue,
+            );
+        }
+    }
+
+    #[test]
+    fn refusal_ranking_names_a_native_child_unrouted_call_first_on_arm() {
+        use carrick_core_abi::service::ServiceOrigin;
+        use carrick_el1_abi::RefusalVenue;
+        use carrick_spec::syscall_census::{CallerClass, CensusIsa};
+        // The ARM HVF lane publishes these same mapped counters; a native
+        // child's unrouted io_pgetevents (292) outranks a root carrier refusal.
+        let first = carrick_el1_abi::Counters::new();
+        refuse(
+            &first,
+            292,
+            ServiceOrigin::Descendant,
+            RefusalVenue::Ring,
+            2,
+        );
+        refuse(&first, 34, ServiceOrigin::Initial, RefusalVenue::Carrier, 1);
+        let second = carrick_el1_abi::Counters::new();
+        refuse(
+            &second,
+            292,
+            ServiceOrigin::Descendant,
+            RefusalVenue::Ring,
+            1,
+        );
+        let censuses = [
+            snapshot_counters(None, Some(&first), CensusIsa::Aarch64),
+            snapshot_counters(None, Some(&second), CensusIsa::Aarch64),
+        ];
+        // The canonical rows carry the child split too.
+        let row = censuses[0].rows.iter().find(|row| row.nr == 292).unwrap();
+        assert_eq!((row.refused, row.refused_child), (2, 2));
+        let ranking = rank_refusals(&censuses).unwrap();
+        assert!(ranking.complete);
+        assert_eq!(ranking.rows.len(), 2);
+        let top = &ranking.rows[0];
+        assert_eq!(top.name, "io_pgetevents");
+        assert_eq!(top.caller, CallerClass::NativeChild);
+        assert_eq!((top.unrouted, top.carrier, top.runs), (3, 0, 2));
+        assert_eq!(top.canonical_nr, Some(292));
+        assert_eq!(ranking.rows[1].name, "mkdirat");
+        assert_eq!(ranking.rows[1].caller, CallerClass::Root);
+        assert_eq!(ranking.rows[1].carrier, 1);
+        let table = render_refusals(&ranking, 10);
+        assert!(
+            table.contains(
+                "| 1 | io_pgetevents | aarch64 | 292 | 292 | native_child | 3 | 0 | 3 | no |"
+            ),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn refusal_ranking_maps_x86_natives_and_flags_incomplete_runs() {
+        use carrick_core_abi::service::ServiceOrigin;
+        use carrick_el1_abi::RefusalVenue;
+        use carrick_spec::syscall_census::CensusIsa;
+        let counters = carrick_el1_abi::Counters::new();
+        refuse(
+            &counters,
+            197,
+            ServiceOrigin::Descendant,
+            RefusalVenue::Ring,
+            2,
+        );
+        let mut broken = snapshot_counters(None, None, CensusIsa::X86_64);
+        assert!(!broken.refusal_evidence.complete);
+        broken.rows = vec![row(1, 1, 1)];
+        let ranking = rank_refusals(&[
+            snapshot_counters(None, Some(&counters), CensusIsa::X86_64),
+            broken,
+        ])
+        .unwrap();
+        assert!(!ranking.complete);
+        assert_eq!(ranking.incomplete_runs, 1);
+        assert_eq!(ranking.rows[0].name, "removexattr");
+        assert_eq!(ranking.rows[0].native_nr, 197);
+        assert_eq!(ranking.rows[0].canonical_nr, Some(14));
+        assert!(rank_refusals(&[]).is_err());
     }
 
     #[test]

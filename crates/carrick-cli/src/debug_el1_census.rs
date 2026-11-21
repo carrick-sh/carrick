@@ -1,5 +1,6 @@
 //! `carrick debug el1-census`: rank one or more EL1 census files (written by
-//! runs with `CARRICK_EL1_CENSUS=<directory>`) by host syscall CPU.
+//! runs with `CARRICK_EL1_CENSUS=<directory>`) by host syscall CPU, or with
+//! `--refusals` by refused syscall.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -99,12 +100,26 @@ pub(crate) fn run_el1_census(
     limit: usize,
     json: bool,
     results: Option<&Path>,
+    refusals: bool,
 ) -> Result<()> {
     let files = collect_json(inputs)?;
     if let Some(results) = results {
         return per_suite(&files, results, limit);
     }
     let censuses = files.iter().map(|f| load(f)).collect::<Result<Vec<_>>>()?;
+    if refusals {
+        let ranking =
+            carrick_runtime::el1_census::rank_refusals(&censuses).map_err(anyhow::Error::msg)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&ranking)?);
+        } else {
+            print!(
+                "{}",
+                carrick_runtime::el1_census::render_refusals(&ranking, limit)
+            );
+        }
+        return Ok(());
+    }
     let aggregate =
         carrick_runtime::el1_census::aggregate(&censuses).map_err(anyhow::Error::msg)?;
     if json {

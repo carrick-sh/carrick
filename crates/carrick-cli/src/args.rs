@@ -1098,7 +1098,8 @@ pub(crate) enum DebugCommand {
     /// Rank EL1 census files (written by runs with
     /// `CARRICK_EL1_CENSUS=<directory>`) by host syscall CPU: for each
     /// syscall class, host services and their thread CPU, continuation
-    /// resumptions, and EL1's served/forwarded counts.
+    /// resumptions, and EL1's served/forwarded counts. `--refusals` ranks
+    /// the refused syscalls instead.
     El1Census {
         /// Census JSON files or directories of them.
         #[arg(required = true)]
@@ -1111,8 +1112,13 @@ pub(crate) enum DebugCommand {
         json: bool,
         /// A conformance results JSONL: print one row per suite (joined by
         /// `carrick_run_id`), slowest ratio to Docker first.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "refusals")]
         results: Option<PathBuf>,
+        /// Rank refused syscalls instead (counted ENOSYS answered in ring and
+        /// carrier refusals), with name, number and caller (root or native
+        /// child), most refused first.
+        #[arg(long)]
+        refusals: bool,
     },
     /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
     /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.
