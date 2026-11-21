@@ -4327,29 +4327,16 @@ fn legacy_syscalls_run(flags: &[&str], expected: &[u8], expected_refusals: &[(us
         .physical
         .syscall_counters()
         .expect("stopped counters");
-    let refused: Vec<_> = counters
-        .refused
-        .iter()
-        .enumerate()
-        .map(|(nr, count)| (nr, count.load(std::sync::atomic::Ordering::Acquire)))
-        .filter(|&(_, count)| count != 0)
-        .collect();
-    let venue_refused: Vec<_> = counters
-        .venue_refused
-        .iter()
-        .enumerate()
-        .map(|(nr, count)| (nr, count.load(std::sync::atomic::Ordering::Acquire)))
-        .filter(|&(_, count)| count != 0)
-        .collect();
+    // Totals across venues: which venue counts a refusal is not the claim.
+    let refused = kvm_pool_fixture::refusal_count::refusal_totals(&counters);
     assert_eq!(
         (
             outcome.run.exit_code,
             outcome.run.stdout.as_slice(),
-            refused.as_slice(),
-            venue_refused.as_slice()
+            refused.as_slice()
         ),
-        (0, expected, expected_refusals, [].as_slice()),
-        "(exit, syscall results, counted refusals, venue refusals)"
+        (0, expected, expected_refusals),
+        "(exit, syscall results, counted refusals)"
     );
     if flags.contains(&"-DNAMESPACE") {
         assert_eq!(

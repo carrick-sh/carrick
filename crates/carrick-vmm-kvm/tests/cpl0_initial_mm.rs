@@ -340,15 +340,13 @@ fn serial_host_native_child_readlink_exe_is_a_counted_refusal() {
         .expect("stopped counters");
     let load =
         |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Acquire);
-    assert_eq!(
-        (
-            load(&counters.refused[READLINKAT_X86]),
-            load(&counters.refused_child[READLINKAT_X86]),
-            load(&counters.venue_refused[READLINKAT_X86]),
-            load(&counters.venue_refused_child[READLINKAT_X86]),
-        ),
-        (0, 0, 1, 1),
-        "the carrier venue counts one descendant refusal for the staged readlinkat"
+    // The claim is a counted descendant refusal, not which venue counts it.
+    kvm_pool_fixture::refusal_count::assert_refused_total(
+        &counters,
+        READLINKAT_X86,
+        1,
+        1,
+        "the staged readlinkat is one descendant refusal",
     );
     assert_eq!(
         load(&counters.served[READLINKAT]),

@@ -5,6 +5,10 @@ use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialT
 mod physical_inventory;
 pub(crate) use physical_inventory::physical_inventory;
 
+#[path = "refusal_count.rs"]
+#[allow(dead_code)]
+pub mod refusal_count;
+
 pub fn run_pool_fixture(
     elf: &[u8],
     max_exits: usize,
