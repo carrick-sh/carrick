@@ -378,7 +378,10 @@ pub fn decide_reservation_syscall_for_origin<
         }
         SYS_MADVISE => match decide_madvise(frame.arguments(), model) {
             Ok(result) => result,
-            Err(disposition) => return disposition,
+            Err(MadviseRefusal::Errno(errno)) => {
+                return ReservationDisposition::Return(-i64::from(errno.get()));
+            }
+            Err(MadviseRefusal::Unrouted) => return ReservationDisposition::Forward,
         },
         _ => return ReservationDisposition::Forward,
     };
@@ -491,23 +494,32 @@ impl<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>
     }
 }
 
+enum MadviseRefusal {
+    Errno(carrick_syscall_abi::LinuxErrno),
+    Unrouted,
+}
+
 /// `madvise(2)` against the caller's admitted root. The shared Linux plan
 /// validates the arguments and classifies the advice. The ring serves a
 /// range only when its own nodes cover all of it: hint advice validates and
 /// returns 0, and `MADV_DONTNEED` retires the range's residency while every
-/// node keeps its protection and attributes. Attribute advice (fork and
-/// dump), advice the plan does not know and any other coverage leave the
-/// whole call unserved (`Err(Forward)`): a counted refusal in a native child.
+/// node keeps its protection and attributes. DONTFORK and DOFORK edit only
+/// fork inheritance. Other attribute advice and unowned coverage leave the
+/// whole call unserved: a counted refusal in a native child.
 #[inline(never)]
 fn decide_madvise<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
     arguments: [u64; 6],
     model: &mut ReservationModel<'_, G, C>,
-) -> Result<Result<reservations::Decision, reservations::Refusal>, ReservationDisposition> {
+) -> Result<Result<reservations::Decision, reservations::Refusal>, MadviseRefusal> {
     use carrick_personality_linux::mm::madvise::{self, Action, Advice};
     let advice = Advice::from_guest_arg(arguments[2]);
-    if advice == Advice::Unsupported || advice.requires_host_attributes() {
-        return Err(ReservationDisposition::Forward);
-    }
+    let fork_inheritance = match advice {
+        Advice::DontFork => Some(false),
+        Advice::DoFork => Some(true),
+        Advice::Unsupported => return Err(MadviseRefusal::Unrouted),
+        other if other.requires_host_attributes() => return Err(MadviseRefusal::Unrouted),
+        _ => None,
+    };
     let coverage = MadviseCoverage {
         model: core::cell::RefCell::new(model),
         owned: core::cell::Cell::new(true),
@@ -520,24 +532,23 @@ fn decide_madvise<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::From
         carrick_guest_arch::GuestLen::new(PAGE_SIZE),
     );
     if !coverage.owned.get() {
-        return Err(ReservationDisposition::Forward);
+        return Err(MadviseRefusal::Unrouted);
     }
-    let plan = match plan {
-        Ok(plan) => plan,
-        Err(errno) => return Err(ReservationDisposition::Return(-i64::from(errno.get()))),
-    };
-    if let Err(errno) = plan.result {
-        return Err(ReservationDisposition::Return(-i64::from(errno.get())));
-    }
+    let plan = plan.map_err(MadviseRefusal::Errno)?;
+    plan.result.map_err(MadviseRefusal::Errno)?;
     if plan.steps.iter().all(|step| step.action == Action::None) {
         return Ok(Ok(reservations::Decision::Complete(0)));
     }
     let Some(range) =
         carrick_el1_abi::ReservationRange::new(plan.range.start.raw(), plan.range.end.raw())
     else {
-        return Err(ReservationDisposition::Return(-ENOMEM));
+        return Err(MadviseRefusal::Errno(carrick_syscall_abi::LINUX_ENOMEM));
     };
-    Ok(coverage.model.into_inner().discard_range(range))
+    let model = coverage.model.into_inner();
+    Ok(match fork_inheritance {
+        Some(inherit) => model.change_fork_inheritance(range, inherit),
+        None => model.discard_range(range),
+    })
 }
 
 /// Result of attempting the bounded EL1 `mprotect` vertical.
@@ -1674,12 +1685,20 @@ fn serve_delegated_anonymous_for_origin<
     if request.operation == carrick_el1_abi::ReservationOperation::Move {
         return refuse(pending, &mut model, Leave::RootDeclined);
     }
-    let backing = editor.backing(
-        carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
-        carrick_guest_arch::UserVa::new(va),
-        carrick_guest_arch::GuestLen::new(len),
-    );
-    use carrick_el1_abi::ReservationOperation::{Decommit, Discard, Prepare, Protect, Retire};
+    use carrick_el1_abi::ReservationOperation::{
+        Decommit, Discard, InheritOnFork, OmitFromFork, Prepare, Protect, Retire,
+    };
+    let backing = if matches!(request.operation, OmitFromFork | InheritOnFork) {
+        // Fork inheritance is a root metadata edit. The parent keeps its
+        // descriptor graph and residency, including live COW leaves.
+        Stage1Backing::of(RangeBacking::Empty)
+    } else {
+        editor.backing(
+            carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+            carrick_guest_arch::UserVa::new(va),
+            carrick_guest_arch::GuestLen::new(len),
+        )
+    };
     if request.operation == Discard && backing.summary == RangeBacking::Empty {
         pending
             .cancel(&mut model)
