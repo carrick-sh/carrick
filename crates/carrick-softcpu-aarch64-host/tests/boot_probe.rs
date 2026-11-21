@@ -1779,16 +1779,36 @@ const GLIBC_LOADER_SHA256: &str =
 const GLIBC_LIBC: &str = "/lib/libc.so.6";
 const GLIBC_LIBC_SHA256: &str = "ce67859ef338d8558a7fd7cff9a1effe5677ff9f7eea90641a2c051c51fab7ac";
 
-/// Without `Aarch64NativeProcessService` (`ThreadLifecyclePage` + `MmPortalSlots`),
-/// EL1 refuses `96` (`set_tid_address`) and `261` (`prlimit64`) in-ring (#2645),
-/// alongside `293` (`rseq`, #1906). No other syscall may surface as `ENOSYS`.
-fn assert_expected_single_process_enosys(counted: &[(u64, &'static str, u64)]) {
-    for &(nr, name, count) in counted {
-        assert!(
-            matches!(nr, 96 | 132 | 134 | 135 | 261 | 293),
-            "unexpected counted ENOSYS ({nr}, {name:?}, count={count}) in single-process production dispatch: {counted:?}"
-        );
-    }
+/// Every `HVC #2` reply came from a production responder (the EL1 ring, the
+/// production `SyscallDispatcher`, or a counted runner refusal): the census
+/// accounts for each dispatched syscall, and the kernel answered at least
+/// `kernel_floor` of them.
+fn assert_production_replies(
+    census: &carrick_softcpu_aarch64_host::Hvc2ReplyCensus,
+    syscalls_dispatched: u64,
+    kernel_floor: u64,
+) {
+    assert_eq!(
+        census.total(),
+        syscalls_dispatched,
+        "every dispatched syscall must have one production reply, got census={census:?}"
+    );
+    assert!(
+        census.kernel_dispatched >= kernel_floor,
+        "expected at least {kernel_floor} production kernel replies, got census={census:?}"
+    );
+}
+
+/// The exact counted `ENOSYS` set `(ordinal, count)` a single-process run
+/// still owes. Decrease-only: a new refusal fails, and a retired one fails
+/// until it is removed from the caller's list.
+#[track_caller]
+fn assert_counted_enosys(counted: &[(u64, &'static str, u64)], known: &[(u64, u64)], what: &str) {
+    let actual: Vec<(u64, u64)> = counted.iter().map(|&(nr, _, count)| (nr, count)).collect();
+    assert_eq!(
+        actual, known,
+        "{what}: counted ENOSYS {counted:?} differs from the known set"
+    );
 }
 
 fn assert_production_glibc_relocations_and_ifuncs(
@@ -2017,20 +2037,7 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch() {
         "glibc hello exit={} syscalls_dispatched={} census={:?} counted_enosys={:?}",
         receipt.exit_code, receipt.syscalls_dispatched, receipt.census, receipt.counted_enosys
     );
-    assert_eq!(
-        receipt.census.fixture_answers, 0,
-        "expected 0 fixture HVC #2 replies, got census={:?} counted_enosys={:?}",
-        receipt.census, receipt.counted_enosys
-    );
-    assert!(
-        receipt.census.production_answers >= 15,
-        "expected real production HVC #2 replies, got census={:?}",
-        receipt.census
-    );
-    assert_eq!(
-        receipt.census.production_answers,
-        receipt.syscalls_dispatched
-    );
+    assert_production_replies(&receipt.census, receipt.syscalls_dispatched, 15);
     assert_eq!(receipt.exit_code, 0);
     assert_eq!(receipt.stdout, b"dynamic glibc hello\n");
     let run = receipt
@@ -2038,7 +2045,8 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch() {
         .as_ref()
         .expect("production SoftProcessRun must back glibc relocation and IFUNC inspection");
     assert_production_glibc_relocations_and_ifuncs(&program, &libc_bytes, run, compiler);
-    assert_expected_single_process_enosys(&receipt.counted_enosys);
+    // `rseq` (293) stays a counted refusal (#1906).
+    assert_counted_enosys(&receipt.counted_enosys, &[(293, 1)], "glibc hello");
 }
 
 /// Engine witness: static musl hello runs to exit on the soft CPU through the
@@ -2102,23 +2110,13 @@ fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
         "musl hello exit={} syscalls_dispatched={} census={:?} counted_enosys={:?}",
         receipt.exit_code, receipt.syscalls_dispatched, receipt.census, receipt.counted_enosys
     );
-    assert_eq!(
-        receipt.census.fixture_answers, 0,
-        "expected 0 fixture HVC #2 replies, got census={:?} counted_enosys={:?}",
-        receipt.census, receipt.counted_enosys
-    );
-    assert!(
-        receipt.census.production_answers >= 5,
-        "expected real production HVC #2 replies, got census={:?}",
-        receipt.census
-    );
-    assert_eq!(
-        receipt.census.production_answers,
-        receipt.syscalls_dispatched
-    );
+    assert_production_replies(&receipt.census, receipt.syscalls_dispatched, 5);
     assert_eq!(receipt.exit_code, 0);
     assert_eq!(receipt.stdout, b"hello, aarch64 world\n");
-    assert_expected_single_process_enosys(&receipt.counted_enosys);
+    // Rust std's stack-overflow guard: `sigaltstack` (132) and its two
+    // `SIGSEGV`/`SIGBUS` handler installs (134) wait on guest signal delivery
+    // in the single-process runner (#2645).
+    assert_counted_enosys(&receipt.counted_enosys, &[(132, 1), (134, 2)], "musl hello");
 }
 
 /// Engine witness: CPython 3.12.16 runs through the production EL1 vectors and
@@ -2132,34 +2130,11 @@ fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
 fn soft_cpu_runs_dynamic_cpython_through_el1_vectors_with_fixture_replies() {
     let root = std::env::var_os("CARRICK_A64_PYTHON_ROOT").expect("set CARRICK_A64_PYTHON_ROOT");
     let root = FixtureRoot::new(root.into());
-    read_pinned_fixture(
-        &root,
-        "/.carrick-image-manifest.json",
-        "c61cffc3bacb94ed026ff8b45d5114b7693dd0420baca0a1ace0e3d0ce9035fd",
-    );
-    read_pinned_fixture(
-        &root,
-        "/usr/local/lib/libpython3.12.so.1.0",
-        "b47ddc5feba01ab2d2af3384f9ff1f43d569fe9af183e848c948b8c055850279",
-    );
-    read_pinned_fixture(
-        &root,
-        "/usr/lib/aarch64-linux-gnu/libc.so.6",
-        "70fa4c4cf57eabeb96097cce47582d02379c4cd1de3db3e98ade4dd7089a1b13",
-    );
-    let executable = "/usr/local/bin/python3";
-    let python = read_pinned_fixture(
-        &root,
-        executable,
-        "36727872f3be3469d83c23705431d90ab2b408a0ba1e3008ba3d4dd337b7f481",
-    );
+    let executable = CPYTHON_EXECUTABLE;
+    let python = read_pinned_cpython(&root);
     let program = carrick_mem::elf::ElfProgram::load(&python, 183, &|path| {
         assert_eq!(path, GLIBC_LOADER);
-        Some(read_pinned_fixture(
-            &root,
-            path,
-            "1b882eddacd494b060413a8aa4f0a4754ee3f84775e68cecbf8a86092b59cca6",
-        ))
+        Some(read_pinned_fixture(&root, path, CPYTHON_LOADER_SHA256))
     })
     .expect("plan CPython and its interpreter");
     let (mut cpu, mut memory) = stage_dynamic(
@@ -2182,6 +2157,115 @@ fn soft_cpu_runs_dynamic_cpython_through_el1_vectors_with_fixture_replies() {
         replies.answered
     );
 }
+
+/// Pinned `python:3.12-slim` arm64 CPython under `CARRICK_A64_PYTHON_ROOT`.
+const CPYTHON_EXECUTABLE: &str = "/usr/local/bin/python3";
+const CPYTHON_LOADER_SHA256: &str =
+    "1b882eddacd494b060413a8aa4f0a4754ee3f84775e68cecbf8a86092b59cca6";
+
+fn read_pinned_cpython(root: &FixtureRoot) -> Vec<u8> {
+    read_pinned_fixture(
+        root,
+        "/.carrick-image-manifest.json",
+        "c61cffc3bacb94ed026ff8b45d5114b7693dd0420baca0a1ace0e3d0ce9035fd",
+    );
+    read_pinned_fixture(
+        root,
+        "/usr/local/lib/libpython3.12.so.1.0",
+        "b47ddc5feba01ab2d2af3384f9ff1f43d569fe9af183e848c948b8c055850279",
+    );
+    read_pinned_fixture(
+        root,
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "70fa4c4cf57eabeb96097cce47582d02379c4cd1de3db3e98ade4dd7089a1b13",
+    );
+    read_pinned_fixture(root, GLIBC_LOADER, CPYTHON_LOADER_SHA256);
+    read_pinned_fixture(
+        root,
+        CPYTHON_EXECUTABLE,
+        "36727872f3be3469d83c23705431d90ab2b408a0ba1e3008ba3d4dd337b7f481",
+    )
+}
+
+/// Engine witness: the same pinned CPython 3.12.16 program as
+/// `soft_cpu_runs_dynamic_cpython_through_el1_vectors_with_fixture_replies`,
+/// with every `HVC #2` syscall answered by the production carrick-kernel /
+/// carrick-personality-linux dispatch and none by the test fixture.
+#[test]
+#[ignore = "requires CARRICK_A64_PYTHON_ROOT and CARRICK_A64_ELF"]
+fn soft_cpu_runs_dynamic_cpython_through_production_dispatch() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let el1_elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
+        .expect("read the production EL1 ELF");
+    let root_dir = std::path::PathBuf::from(
+        std::env::var_os("CARRICK_A64_PYTHON_ROOT").expect("set CARRICK_A64_PYTHON_ROOT"),
+    );
+    let python = read_pinned_cpython(&FixtureRoot::new(root_dir.clone()));
+    let config = carrick_softcpu_aarch64_host::SoftSingleProcessConfig {
+        elf_bytes: &python,
+        executable_path: CPYTHON_EXECUTABLE,
+        argv: vec![
+            CPYTHON_EXECUTABLE.as_bytes().to_vec(),
+            b"-c".to_vec(),
+            b"import sys; print(sys.version.split()[0])".to_vec(),
+        ],
+        envp: vec![b"HOME=/tmp".to_vec()],
+        rootfs_dir: Some(&root_dir),
+        el1_elf_override: Some(&el1_elf),
+        max_syscalls: 4096,
+    };
+    let started = std::time::Instant::now();
+    let run = carrick_softcpu_aarch64_host::run_single_process(&config)
+        .expect("CPython must complete through production kernel dispatch");
+    let elapsed = started.elapsed().as_secs_f64();
+    let work = run.engine.vcpu().run_work();
+    println!(
+        "cpython production dispatch: exit={} syscalls_dispatched={} census={:?} \
+         elapsed={elapsed:.3}s retired_instructions={} executed_blocks={} \
+         decoded_blocks={} dispatches={} instr/s={:.0} blocks/s={:.0}",
+        run.exit_code,
+        run.syscalls_dispatched,
+        run.reply_census,
+        work.retired_instructions,
+        work.executed_blocks,
+        work.decoded_blocks,
+        work.dispatches,
+        work.retired_instructions as f64 / elapsed,
+        work.executed_blocks as f64 / elapsed,
+    );
+    for (nr, name, count) in &run.counted_enosys {
+        println!("cpython counted ENOSYS: nr={nr} name={name} count={count}");
+    }
+    assert_eq!(run.terminating_fault, None);
+    assert_eq!(
+        (run.exit_code, run.stdout.as_slice(), run.stderr.as_slice()),
+        (0, b"3.12.16\n".as_slice(), b"".as_slice())
+    );
+    assert_production_replies(&run.reply_census, run.syscalls_dispatched, 400);
+    assert_counted_enosys(
+        &run.counted_enosys,
+        CPYTHON_COUNTED_ENOSYS,
+        "CPython startup",
+    );
+}
+
+/// Counted `ENOSYS` the production-dispatch CPython startup still owes, each
+/// with the issue that retires it (decrease-only; see `assert_counted_enosys`).
+const CPYTHON_COUNTED_ENOSYS: &[(u64, u64)] = &[
+    // set_tid_address: no in-ring root process owner yet (#2645).
+    (96, 1),
+    // rt_sigaction installing the SIGINT handler: guest signal delivery (#2645).
+    (134, 1),
+    // getuid, geteuid, getgid, getegid: no in-ring root process owner (#2645).
+    (174, 1),
+    (175, 1),
+    (176, 1),
+    (177, 1),
+    // prlimit64: no in-ring root process owner (#2645).
+    (261, 1),
+    // rseq: accepted counted refusal (#1906).
+    (293, 1),
+];
 
 fn stage_dynamic(
     program: &carrick_mem::elf::ElfProgram<'_>,

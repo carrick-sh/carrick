@@ -186,6 +186,30 @@ pub struct RunWork {
     pub memory_exits: u64,
 }
 
+impl RunWork {
+    /// Add another bounded run's work to this running total.
+    pub fn accumulate(&mut self, other: Self) {
+        let Self {
+            retired_instructions,
+            dispatches,
+            executed_blocks,
+            decoded_blocks,
+            emitted_blocks,
+            stage1_walks,
+            memory_exits,
+        } = other;
+        self.retired_instructions = self
+            .retired_instructions
+            .saturating_add(retired_instructions);
+        self.dispatches = self.dispatches.saturating_add(dispatches);
+        self.executed_blocks = self.executed_blocks.saturating_add(executed_blocks);
+        self.decoded_blocks = self.decoded_blocks.saturating_add(decoded_blocks);
+        self.emitted_blocks = self.emitted_blocks.saturating_add(emitted_blocks);
+        self.stage1_walks = self.stage1_walks.saturating_add(stage1_walks);
+        self.memory_exits = self.memory_exits.saturating_add(memory_exits);
+    }
+}
+
 /// The result of a bounded run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Report<E> {

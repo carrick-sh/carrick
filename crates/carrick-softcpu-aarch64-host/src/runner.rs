@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use carrick_abi::{SigBlockMask, SigSet};
+use carrick_abi::syscall::nr;
+use carrick_abi::{CanonicalNr, SigBlockMask, SigSet};
 use carrick_el1_abi::{
     Counters, CurrentTask, EL1_COUNTERS_BASE, EL1_CURRENT_TASKS_OFFSET, EL1_MM_PORTAL_OFFSET,
     El1TaskId, IpcWindow, MmPortalSlots, SnapshotGeneration, clear_current_task_record,
@@ -226,55 +227,74 @@ fn refusing_soft_bridges() -> CarrierBridges {
     }
 }
 
+/// Timer and signal calls that need guest signal or timer delivery, which
+/// the single-process soft runner does not wire yet (`#2645`): each fails
+/// closed with counted `ENOSYS`.
+const SINGLE_PROCESS_REFUSED_TIMER_OR_SIGNAL: [CanonicalNr; 26] = [
+    nr::SIGNALFD4,
+    nr::TIMERFD_CREATE,
+    nr::TIMERFD_SETTIME,
+    nr::TIMERFD_GETTIME,
+    nr::GETITIMER,
+    nr::SETITIMER,
+    nr::TIMER_CREATE,
+    nr::TIMER_GETTIME,
+    nr::TIMER_GETOVERRUN,
+    nr::TIMER_SETTIME,
+    nr::TIMER_DELETE,
+    nr::KILL,
+    nr::TKILL,
+    nr::TGKILL,
+    nr::SIGALTSTACK,
+    nr::RT_SIGSUSPEND,
+    nr::RT_SIGPENDING,
+    nr::RT_SIGTIMEDWAIT,
+    nr::RT_SIGQUEUEINFO,
+    nr::RT_SIGRETURN,
+    nr::RT_TGSIGQUEUEINFO,
+    nr::TIMER_GETTIME64,
+    nr::TIMER_SETTIME64,
+    nr::TIMERFD_GETTIME64,
+    nr::TIMERFD_SETTIME64,
+    nr::PIDFD_SEND_SIGNAL,
+];
+
 /// Determine whether a forwarded timer or signal syscall must fail closed with
 /// counted `ENOSYS` on the single-process soft-CPU bring-up runner before
 /// `#2645` wires guest signal and timer delivery.
 fn should_refuse_single_process_timer_or_signal_syscall<X>(
     engine: &SoftAarch64Engine<X>,
-    nr: u64,
+    number: CanonicalNr,
     args: &[u64; 6],
 ) -> bool
 where
     X: ExecuteBlock + Send + 'static,
     X::Error: core::fmt::Debug,
 {
-    match nr {
-        // `rt_sigaction` (134): `SIG_DFL` (0), `SIG_IGN` (1), and read-only
-        // queries (`new_action == 0`) live purely in `carrick-kernel`'s
-        // `SignalTable` (honored for broken-pipe `SIGPIPE = SIG_IGN` -> `-EPIPE`
-        // and default fault death), whereas installing a custom user handler
-        // (`sa_handler` outside `SIG_DFL`/`SIG_IGN`) requires guest signal frame
-        // delivery and must fail closed with `-ENOSYS`.
-        134 => {
-            let new_action = args[1];
-            if new_action == 0 {
-                return false;
-            }
-            let Ok(bytes) = engine.read_bytes(new_action, 8) else {
-                // Let `SyscallDispatcher::rt_sigaction` surface `-EFAULT`.
-                return false;
-            };
-            let Ok(word) = <[u8; 8]>::try_from(bytes.as_slice()) else {
-                return true;
-            };
-            let sa_handler = u64::from_le_bytes(word);
-            sa_handler != carrick_abi::LINUX_SIG_DFL && sa_handler != carrick_abi::LINUX_SIG_IGN
+    if number == nr::RT_SIGACTION {
+        // `SIG_DFL` (0), `SIG_IGN` (1), and read-only queries
+        // (`new_action == 0`) live purely in `carrick-kernel`'s `SignalTable`
+        // (honored for broken-pipe `SIGPIPE = SIG_IGN` -> `-EPIPE` and default
+        // fault death), whereas installing a custom user handler (`sa_handler`
+        // outside `SIG_DFL`/`SIG_IGN`) requires guest signal frame delivery
+        // and must fail closed with `-ENOSYS`.
+        let new_action = args[1];
+        if new_action == 0 {
+            return false;
         }
-        // `rt_sigprocmask` (135) updates only the in-zone thread signal mask.
-        135 => false,
-        74
-        | 85..=87
-        | 102
-        | 103
-        | 107..=111
-        | 129..=133
-        | 136..=139
-        | 240
-        | 408..=411
-        | 421
-        | 424 => true,
-        _ => false,
+        let Ok(bytes) = engine.read_bytes(new_action, 8) else {
+            // Let `SyscallDispatcher::rt_sigaction` surface `-EFAULT`.
+            return false;
+        };
+        let Ok(word) = <[u8; 8]>::try_from(bytes.as_slice()) else {
+            return true;
+        };
+        let sa_handler = u64::from_le_bytes(word);
+        return sa_handler != carrick_abi::LINUX_SIG_DFL
+            && sa_handler != carrick_abi::LINUX_SIG_IGN;
     }
+    // `rt_sigprocmask` updates only the in-zone thread signal mask.
+    SINGLE_PROCESS_REFUSED_TIMER_OR_SIGNAL.contains(&number)
 }
 
 /// Parameters for launching one single-process AArch64 guest through the
@@ -305,11 +325,24 @@ impl<'a> SoftSingleProcessConfig<'a> {
 }
 
 /// Per-reply census of forwarded `HVC #2` syscall completions, recorded at the
-/// completion boundary by whichever responder answered the mailbox.
+/// completion boundary by whichever production responder answered the mailbox.
+/// The runner has no fixture responder: every reply is one of these sources.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Hvc2ReplyCensus {
-    pub fixture_answers: u64,
-    pub production_answers: u64,
+    /// Served in ring by the EL1 image and completed at the boundary.
+    pub ring_completed: u64,
+    /// Answered by the production `SyscallDispatcher`.
+    pub kernel_dispatched: u64,
+    /// Refused by this runner with counted `ENOSYS`; also in `counted_enosys`.
+    pub runner_refused: u64,
+}
+
+impl Hvc2ReplyCensus {
+    /// Every reply the runner completed, whatever its source.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.ring_completed + self.kernel_dispatched + self.runner_refused
+    }
 }
 
 /// Terminal synchronous EL0 fault lowered to Linux default signal death when
@@ -830,7 +863,7 @@ where
         match served_boundary {
             Some(carrick_el1_abi::ServedBoundary::Completed) => {
                 syscalls_dispatched += 1;
-                reply_census.production_answers += 1;
+                reply_census.ring_completed += 1;
                 let completed_val = raw.args[0] as i64;
                 engine
                     .complete_syscall(completed_val)
@@ -848,9 +881,9 @@ where
         }
 
         let nr = raw.number.raw();
-        if should_refuse_single_process_timer_or_signal_syscall(engine, nr, &raw.args) {
+        if should_refuse_single_process_timer_or_signal_syscall(engine, raw.number, &raw.args) {
             syscalls_dispatched += 1;
-            reply_census.production_answers += 1;
+            reply_census.runner_refused += 1;
             *refused_by_runner.entry(nr).or_default() += 1;
             engine
                 .complete_syscall(carrick_abi::LINUX_ENOSYS.guest_retval())
@@ -870,19 +903,19 @@ where
 
         match outcome {
             DispatchOutcome::Returned { value } => {
-                reply_census.production_answers += 1;
+                reply_census.kernel_dispatched += 1;
                 engine
                     .complete_syscall(value)
                     .map_err(|e| format!("complete_syscall({}): {e}", raw.number.raw()))?;
             }
             DispatchOutcome::Errno { errno } => {
-                reply_census.production_answers += 1;
+                reply_census.kernel_dispatched += 1;
                 engine
                     .complete_syscall(errno.guest_retval())
                     .map_err(|e| format!("complete_syscall({} errno): {e}", raw.number.raw()))?;
             }
             DispatchOutcome::SchedulerYield => {
-                reply_census.production_answers += 1;
+                reply_census.kernel_dispatched += 1;
                 engine
                     .complete_syscall(0)
                     .map_err(|e| format!("complete_syscall(sched_yield): {e}"))?;
@@ -891,7 +924,7 @@ where
                 engine
                     .set_memory_model(tso)
                     .map_err(|e| format!("set_memory_model: {e}"))?;
-                reply_census.production_answers += 1;
+                reply_census.kernel_dispatched += 1;
                 engine
                     .complete_syscall(0)
                     .map_err(|e| format!("complete_syscall(set_memory_model): {e}"))?;
@@ -921,13 +954,13 @@ where
                     prot_none,
                     success_retval,
                 )?;
-                reply_census.production_answers += 1;
+                reply_census.kernel_dispatched += 1;
                 engine
                     .complete_syscall(alias_result)
                     .map_err(|e| format!("complete_syscall(MapHostAlias): {e}"))?;
             }
             DispatchOutcome::Exit { code } | DispatchOutcome::ThreadExit { code } => {
-                reply_census.production_answers += 1;
+                reply_census.kernel_dispatched += 1;
                 return Ok(finish_single_process_summary(
                     engine,
                     dispatcher,
@@ -941,7 +974,7 @@ where
                 ));
             }
             DispatchOutcome::SignalDeath { signum } => {
-                reply_census.production_answers += 1;
+                reply_census.kernel_dispatched += 1;
                 return Ok(finish_single_process_summary(
                     engine,
                     dispatcher,
