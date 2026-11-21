@@ -1013,14 +1013,6 @@ impl VcpuKick for SoftKickHandle {
     }
 }
 
-/// Sibling vCPU materialization payload for `SoftAarch64Vmm`.
-pub struct SoftSiblingBuilder<X> {
-    stage2: Arc<ExclusiveStage2>,
-    protections: Arc<MemoryProtections>,
-    make_executor: Arc<dyn Fn() -> Result<X, TrapError> + Send + Sync>,
-    boot_instant: Instant,
-}
-
 /// Soft AArch64 vCPU implementing [`carrick_aarch64::Aarch64Vcpu`].
 pub struct SoftAarch64Vcpu<X> {
     cpu: CpuState,
@@ -1290,9 +1282,9 @@ where
 
     fn complete_syscall_return(&mut self, return_value: i64) -> Result<(), TrapError> {
         if let Some(mailbox) = self.mailbox.as_mut() {
-            return mailbox
-                .publish_normal_return(return_value)
-                .map_err(|e| TrapError::Hypervisor(e.to_string()));
+            return mailbox.publish_normal_return(return_value).map_err(|e| {
+                TrapError::Hypervisor(format!("aarch64 syscall mailbox protocol error: {e:?}"))
+            });
         }
         self.set_reg(Reg::X(0), return_value as u64)
     }
@@ -1305,7 +1297,9 @@ where
         if let Some(mailbox) = self.mailbox.as_mut() {
             return mailbox
                 .publish_native_signal_return(return_value, restart_eligible)
-                .map_err(|e| TrapError::Hypervisor(e.to_string()));
+                .map_err(|e| {
+                    TrapError::Hypervisor(format!("aarch64 syscall mailbox protocol error: {e:?}"))
+                });
         }
         self.complete_syscall_return(return_value)
     }
@@ -1314,16 +1308,16 @@ where
         let Some(mailbox) = self.mailbox.as_ref() else {
             return Ok(None);
         };
-        mailbox
-            .pending_normal_return()
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+        mailbox.pending_normal_return().map_err(|e| {
+            TrapError::Hypervisor(format!("aarch64 syscall mailbox protocol error: {e:?}"))
+        })
     }
 
     fn prepare_register_resume(&mut self) -> Result<(), TrapError> {
         if let Some(mailbox) = self.mailbox.as_mut() {
-            mailbox
-                .prepare_register_resume()
-                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+            mailbox.prepare_register_resume().map_err(|e| {
+                TrapError::Hypervisor(format!("aarch64 syscall mailbox protocol error: {e:?}"))
+            })?;
         }
         Ok(())
     }
@@ -1403,7 +1397,9 @@ where
                                 }
                                 Ok(None) => {}
                                 Err(err) => {
-                                    return Err(TrapError::Hypervisor(err.to_string()));
+                                    return Err(TrapError::Hypervisor(format!(
+                                        "aarch64 syscall mailbox protocol error: {err:?}"
+                                    )));
                                 }
                             }
                         }
@@ -1484,8 +1480,7 @@ pub struct SoftAarch64Vmm<X = HostBlockRunner> {
     protections: Arc<MemoryProtections>,
     control: Arc<RunControl>,
     next_alias_gpa: u64,
-    make_executor: Arc<dyn Fn() -> Result<X, TrapError> + Send + Sync>,
-    boot_instant: Instant,
+    executor_marker: core::marker::PhantomData<fn() -> X>,
 }
 
 /// Shared AArch64 trap/stage-1 engine parameterized over [`SoftAarch64Vmm`].
@@ -1500,16 +1495,7 @@ impl SoftAarch64Vmm<HostBlockRunner> {
     ) -> Result<SoftAarch64Engine<HostBlockRunner>, TrapError> {
         let executor = HostBlockRunner::new()
             .map_err(|e| TrapError::Hypervisor(format!("HostBlockRunner::new: {e:?}")))?;
-        Self::bring_up_with_executor(
-            image,
-            el1_elf_override,
-            ipc,
-            executor,
-            Arc::new(|| {
-                HostBlockRunner::new()
-                    .map_err(|e| TrapError::Hypervisor(format!("HostBlockRunner::new: {e:?}")))
-            }),
-        )
+        Self::bring_up_with_executor(image, el1_elf_override, ipc, executor)
     }
 }
 
@@ -1523,7 +1509,6 @@ where
         el1_elf_override: Option<&[u8]>,
         ipc: Option<Arc<dyn IpcWindowBacking>>,
         executor: X,
-        make_executor: Arc<dyn Fn() -> Result<X, TrapError> + Send + Sync>,
     ) -> Result<SoftAarch64Engine<X>, TrapError> {
         let stage2 = populate_stage2_for_image(image, el1_elf_override, ipc)?;
         let mailbox_ptr = stage2
@@ -1579,8 +1564,7 @@ where
             protections,
             control,
             next_alias_gpa: SOFT_ALIAS_GPA_BASE,
-            make_executor,
-            boot_instant,
+            executor_marker: core::marker::PhantomData,
         };
         Ok(Aarch64EngineCore::from_parts(vmm, vcpu))
     }
@@ -1787,7 +1771,7 @@ where
     type Vcpu = SoftAarch64Vcpu<X>;
     type AnonymousDiscard = ();
     type KickHandle = SoftKickHandle;
-    type SiblingBuilder = SoftSiblingBuilder<X>;
+    type SiblingBuilder = ();
     type ProcessBuilder = ();
 
     fn publish_user_executable(&self, output: u64, len: u64) -> Result<(), PageTableError> {
@@ -1988,67 +1972,21 @@ where
     }
 
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
-        let executor = (self.make_executor)()?;
-        let mailbox_ptr = self
-            .stage2
-            .try_borrow()?
-            .host_ptr(
-                LINUX_SYSCALL_MAILBOX_BASE,
-                AARCH64_SYSCALL_MAILBOX_SIZE as usize,
-            )
-            .and_then(|p| NonNull::new(p.cast::<Aarch64SyscallMailbox>()));
-        // SAFETY: `mailbox_ptr` points to the live mailbox slot in `self.stage2`.
-        let mailbox = mailbox_ptr.map(|ptr| unsafe { MailboxSlot::new(ptr, 1) });
-        let mut cpu = CpuState::default();
-        cpu.named.cntfrq = SystemValue(DEFAULT_CNTFRQ_HZ);
-        cpu.named.mpidr = SystemValue(MPIDR_AFF0_RES1);
-        Ok(SoftAarch64Vcpu {
-            cpu,
-            monitor: ExclusiveMonitor::default(),
-            executor,
-            stage2: Arc::clone(&self.stage2),
-            control: Arc::clone(&self.control),
-            mailbox,
-            actlr_el1: 0,
-            cpacr_el1: 0,
-            tpidrro_pending: AtomicU64::new(0),
-            tpidrro_dirty: AtomicBool::new(false),
-            sp_pending: AtomicU64::new(0),
-            sp_dirty: AtomicBool::new(false),
-            boot_instant: self.boot_instant,
-            block_quantum: DEFAULT_BLOCK_QUANTUM,
-            max_quanta_per_exit: DEFAULT_MAX_QUANTA_PER_EXIT,
-        })
+        Err(TrapError::Hypervisor(
+            "SoftAarch64Vmm single-process facade does not implement sibling vCPUs (#1236 M2 R1)"
+                .to_owned(),
+        ))
     }
 
     fn execve_rebuild(
         &mut self,
-        vcpu: &mut Self::Vcpu,
-        new_image: &AddressSpace,
+        _vcpu: &mut Self::Vcpu,
+        _new_image: &AddressSpace,
     ) -> Result<(), TrapError> {
-        let new_stage2 = populate_stage2_for_image(new_image, None, None)?;
-        let mailbox_ptr = new_stage2
-            .host_ptr(
-                LINUX_SYSCALL_MAILBOX_BASE,
-                AARCH64_SYSCALL_MAILBOX_SIZE as usize,
-            )
-            .and_then(|p| NonNull::new(p.cast::<Aarch64SyscallMailbox>()));
-        // SAFETY: `mailbox_ptr` points to `new_stage2`'s freshly mapped mailbox slot.
-        vcpu.mailbox = mailbox_ptr.map(|ptr| unsafe { MailboxSlot::new(ptr, 1) });
-        {
-            let mut guard = self.stage2.try_borrow()?;
-            *guard = new_stage2;
-        }
-        self.protections = Arc::new(MemoryProtections::default());
-        self.next_alias_gpa = SOFT_ALIAS_GPA_BASE;
-        let staged = StagedCpu::initial_root(&RootBootFields {
-            entry: new_image.entry(),
-            initial_stack_pointer: new_image.initial_stack_pointer(),
-            el0_trampoline_entry: new_image.el0_trampoline_entry(),
-            el1_vectors_base: new_image.el1_vectors_base(),
-            stage1_page_tables_base: new_image.stage1_page_tables_base(),
-        });
-        vcpu.restore(&staged.snapshot())
+        Err(TrapError::Hypervisor(
+            "SoftAarch64Vmm single-process facade does not implement execve_rebuild (#1236 M2 R1)"
+                .to_owned(),
+        ))
     }
 
     fn kick_handle(&self) -> Self::KickHandle {
@@ -2062,46 +2000,19 @@ where
         _vcpu: &Self::Vcpu,
         _entry: GuestEntryRegs,
     ) -> Result<Self::SiblingBuilder, TrapError> {
-        Ok(SoftSiblingBuilder {
-            stage2: Arc::clone(&self.stage2),
-            protections: Arc::clone(&self.protections),
-            make_executor: Arc::clone(&self.make_executor),
-            boot_instant: self.boot_instant,
-        })
+        Err(TrapError::Hypervisor(
+            "SoftAarch64Vmm single-process facade does not implement sibling threads (#1236 M2 R1)"
+                .to_owned(),
+        ))
     }
 
-    fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
-        let executor = (builder.make_executor)()?;
-        let control = Arc::new(RunControl::default());
-        let mut cpu = CpuState::default();
-        cpu.named.cntfrq = SystemValue(DEFAULT_CNTFRQ_HZ);
-        cpu.named.mpidr = SystemValue(MPIDR_AFF0_RES1);
-        let vcpu = SoftAarch64Vcpu {
-            cpu,
-            monitor: ExclusiveMonitor::default(),
-            executor,
-            stage2: Arc::clone(&builder.stage2),
-            control: Arc::clone(&control),
-            mailbox: None,
-            actlr_el1: 0,
-            cpacr_el1: 0,
-            tpidrro_pending: AtomicU64::new(0),
-            tpidrro_dirty: AtomicBool::new(false),
-            sp_pending: AtomicU64::new(0),
-            sp_dirty: AtomicBool::new(false),
-            boot_instant: builder.boot_instant,
-            block_quantum: DEFAULT_BLOCK_QUANTUM,
-            max_quanta_per_exit: DEFAULT_MAX_QUANTA_PER_EXIT,
-        };
-        let vmm = Self {
-            stage2: builder.stage2,
-            protections: builder.protections,
-            control,
-            next_alias_gpa: SOFT_ALIAS_GPA_BASE,
-            make_executor: builder.make_executor,
-            boot_instant: builder.boot_instant,
-        };
-        Ok((vmm, vcpu))
+    fn materialize_sibling(
+        _builder: Self::SiblingBuilder,
+    ) -> Result<(Self, Self::Vcpu), TrapError> {
+        Err(TrapError::Hypervisor(
+            "SoftAarch64Vmm single-process facade does not implement sibling threads (#1236 M2 R1)"
+                .to_owned(),
+        ))
     }
 
     fn set_guest_sp(&self, vcpu: &Self::Vcpu, sp: u64) -> Result<(), TrapError> {
