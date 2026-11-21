@@ -1486,6 +1486,59 @@ pub(crate) mod tests {
             "a retired predecessor cannot retarget again"
         );
     }
+    /// #2142: a settled root exec refuses guest entry on its CPU until the
+    /// executor moves the root's custody to that exact successor; a
+    /// retarget to another MM is refused and keeps the gate shut.
+    #[test]
+    fn root_exec_settlement_refuses_guest_entry_until_its_retarget() {
+        let nz = |v| NonZeroU64::new(v).unwrap();
+        let root = context(2);
+        let predecessor = root.binding();
+        let successor_context = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x9000)).unwrap(),
+            mm: MmGeneration::new(nz(99)),
+            generation: ContextGeneration::new(nz(98)),
+        };
+        let successor = GuestArchBinding::x86(predecessor.task(), successor_context);
+        let mut cpu = CarrierCpu::new(TestIo {
+            image: context(1).hardware_image(),
+        })
+        .unwrap();
+        cpu.bind_root(CarrierRootBinding::issued(predecessor));
+        assert!(
+            cpu.begin_root_exec_settlement(successor_context).is_err(),
+            "only the loaded root settles an exec"
+        );
+        cpu.load(root.clone()).unwrap();
+        let state = cpu.begin_root_exec_settlement(successor_context).unwrap();
+        assert_eq!(
+            (state.mm_generation(), state.asid_generation()),
+            (99, 98),
+            "the successor's first state names its MM and root generation"
+        );
+        assert!(
+            cpu.begin_root_exec_settlement(successor_context).is_err(),
+            "one root exec settles at a time"
+        );
+        assert!(
+            cpu.run_loaded(predecessor.task()).is_err(),
+            "guest entry waits for the settlement's consumer"
+        );
+        let elsewhere = GuestArchBinding::x86(
+            predecessor.task(),
+            AddressContext {
+                mm: MmGeneration::new(nz(97)),
+                ..successor_context
+            },
+        );
+        assert!(
+            cpu.retarget_loaded_exec(predecessor, elsewhere).is_err(),
+            "the retarget must name the settled successor"
+        );
+        assert!(cpu.run_loaded(predecessor.task()).is_err());
+        cpu.retarget_loaded_exec(predecessor, successor).unwrap();
+        assert!(cpu.root_exec_settling.is_none());
+    }
     #[test]
     fn unregistered_forward_cr3_refuses_with_typed_error() {
         let root = context(1);

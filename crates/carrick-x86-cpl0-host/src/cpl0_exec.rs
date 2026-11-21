@@ -1478,11 +1478,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if let Some(executable) = request.image.executable.take() {
             sources.bind_executable(executable);
         }
-        // The run root's predecessor is its boot-built MM, not a fork
-        // child's: the stock's root form takes it (#2142).
+        // The run root's boot-built MM is no stock child: the stock's root
+        // form takes it (#2142). A root that already exec'd runs a successor
+        // the stock holds, which leaves like a child's.
         let form = match origin {
-            ServiceOrigin::Initial => carrick_hal::fork_stock::ExecPredecessorForm::Root,
-            ServiceOrigin::Descendant => carrick_hal::fork_stock::ExecPredecessorForm::Child,
+            ServiceOrigin::Initial if self.fork_stock.child_owner(predecessor).is_none() => {
+                carrick_hal::fork_stock::ExecPredecessorForm::Root
+            }
+            _ => carrick_hal::fork_stock::ExecPredecessorForm::Child,
         };
         let replaced = self
             .fork_stock
