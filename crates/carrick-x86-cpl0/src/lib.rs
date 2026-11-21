@@ -163,13 +163,13 @@ mod test_support {
     /// Hold the next native fork after its parent root is published
     /// fork-pending and write-protected, before its commit (#2581), until
     /// the waiter below parks or releases it.
-    pub const INJECT_HOLD_NEXT_FORK_COMMIT: u64 = 0xffff_ffff_ffff_fe2e;
+    pub const INJECT_HOLD_NEXT_FORK_COMMIT: u64 = 0xffff_ffff_ffff_fe31;
     /// 1 once the armed fork commit is held (and the calling member becomes
     /// the waiter whose park releases it), else 0.
-    pub const INJECT_FORK_COMMIT_HELD: u64 = 0xffff_ffff_ffff_fe2f;
+    pub const INJECT_FORK_COMMIT_HELD: u64 = 0xffff_ffff_ffff_fe32;
     /// Release a held fork commit from its waiter's own call; 0 also when
     /// the waiter's park already released it.
-    pub const INJECT_RELEASE_HELD_FORK_COMMIT: u64 = 0xffff_ffff_ffff_fe30;
+    pub const INJECT_RELEASE_HELD_FORK_COMMIT: u64 = 0xffff_ffff_ffff_fe33;
     static FORK_COMMIT_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     /// Address of the armed member's current task, or 0.
     static EARLY_RELEASE_TASK: core::sync::atomic::AtomicU64 =
